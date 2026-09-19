@@ -9,10 +9,24 @@
 // same approach Bun and Deno take.
 //
 // Surface: fetch, request, stream, Dispatcher/Agent/Pool/Client/BalancedPool,
-// get/setGlobalDispatcher, errors, interceptors (no-op), and the web globals
-// undici re-exports (Headers/Response/Request/FormData/fetch/...).
+// buildConnector, get/setGlobalDispatcher, errors, interceptors (no-op), and
+// the web globals undici re-exports (Headers/Response/Request/FormData/fetch/...).
 //
 // Supported transport control:
+//  - A `connect` FUNCTION (`new Agent|Pool|Client({ connect(opts, cb) })`, a
+//    custom connector) IS honored, as undici honors it: it is called with
+//    undici's connector parameters ({ host, hostname, protocol, port,
+//    servername, localAddress }) before every connection the request makes,
+//    redirect hops included, and the request goes over the socket it hands
+//    back and nowhere else -- a connector that refuses fails the request with
+//    its error. A `connect` OBJECT carrying socket or TLS options (`ca`,
+//    `checkServerIdentity`, `servername`, `rejectUnauthorized`, `family`,
+//    `localAddress`, `socketPath`, ...) becomes such a function through
+//    buildConnector, as in undici, so those options apply to the
+//    net.connect / tls.connect it makes. An Agent's `factory` is honored the
+//    same way: each origin's dispatcher from it decides that origin's
+//    connections. (See the Dispatcher constructor's _oamConnect bridge and
+//    globalThis.fetch's connector mode.)
 //  - A Dispatcher/Agent with a `connect.lookup` hook IS honored, as undici
 //    honors it: the hook is called before the fetch connects to a host name
 //    -- the first request AND every redirect hop to another host -- and the
@@ -27,10 +41,17 @@
 //    global fetch, undici.fetch, agent.request(), and
 //    undici.request(url, { dispatcher }).
 //
+// Refused, never ignored: a dispatcher whose dispatch() is overridden (a
+// subclass or a patched instance), one built with `interceptors`, and an
+// object that is not one of this shim's dispatchers fail the request with
+// NotSupportedError. oam runs a request itself rather than through
+// dispatch(), so honouring anything that lives there is impossible, and
+// dropping it could skip a policy the application put there.
+//
 // Documented divergences (a shim over fetch cannot honor everything):
-//  - Other connection-level dispatcher options (TLS opts, connection
-//    pooling, keep-alive tuning) are accepted but NOT applied -- oam's fetch
-//    owns the transport beyond the connect.lookup hook.
+//  - Other connection-level dispatcher options (connection pooling,
+//    keep-alive tuning) are accepted but NOT applied -- oam's fetch owns the
+//    transport beyond the connect hooks.
 //  - Mock* (MockAgent/MockPool/...) are minimal stubs: constructible, but
 //    they do not intercept requests.
 
@@ -239,29 +260,150 @@
       return { statusCode, headers, opaque, trailers };
     }
 
+    // ---- connectors -------------------------------------------------------
+    // undici's util.getServerName: the host without its port, '' for an IP
+    // (not a valid server name, RFC 6066).
+    function getServerName(host) {
+      if (!host) return null;
+      let name = String(host);
+      if (name[0] === "[") {
+        name = name.substring(1, name.indexOf("]"));
+      } else {
+        const idx = name.indexOf(":");
+        if (idx !== -1) name = name.substring(0, idx);
+      }
+      return registry.get("net").isIP(name) ? "" : name;
+    }
+
+    // undici's buildConnector (lib/core/connect.js, 6.24.1): a connect
+    // function over net.connect (http:) or tls.connect (https:) with the
+    // given socket and TLS options, calling back once the socket is
+    // connected (and for https, secured) or with the error that stopped it,
+    // including undici's ConnectTimeoutError after `timeout` (10 s by
+    // default). TLS sessions are not cached.
+    function buildConnector(opts) {
+      const { allowH2, maxCachedSessions, socketPath, timeout, session: customSession, ...rest } = opts || {};
+      if (maxCachedSessions != null && (!Number.isInteger(maxCachedSessions) || maxCachedSessions < 0)) {
+        throw new errors.InvalidArgumentError("maxCachedSessions must be a positive integer or zero");
+      }
+      const options = { path: socketPath, ...rest };
+      const connectTimeout = timeout == null ? 10e3 : timeout;
+      const h2 = allowH2 != null ? allowH2 : false;
+      return function connect({ hostname, host, protocol, port, servername, localAddress, httpSocket }, callback) {
+        let socket;
+        if (protocol === "https:") {
+          servername = servername || options.servername || getServerName(host) || null;
+          port = port || 443;
+          const tlsOptions = {
+            highWaterMark: 16384,
+            ...options,
+            servername,
+            localAddress,
+            ALPNProtocols: h2 ? ["http/1.1", "h2"] : ["http/1.1"],
+            port,
+            host: hostname,
+          };
+          if (customSession) tlsOptions.session = customSession;
+          if (httpSocket) tlsOptions.socket = httpSocket;
+          socket = registry.get("tls").connect(tlsOptions);
+        } else {
+          if (httpSocket) throw new errors.InvalidArgumentError("httpSocket can only be sent on TLS update");
+          port = port || 80;
+          const netOptions = { highWaterMark: 64 * 1024, ...options, localAddress, port, host: hostname };
+          if (netOptions.path === undefined) delete netOptions.path;
+          socket = registry.get("net").connect(netOptions);
+        }
+        if (options.keepAlive == null || options.keepAlive) {
+          const delay = options.keepAliveInitialDelay === undefined ? 60e3 : options.keepAliveInitialDelay;
+          socket.setKeepAlive(true, delay);
+        }
+        let timer = null;
+        const clearConnectTimeout = () => {
+          if (timer !== null) {
+            clearTimeout(timer);
+            timer = null;
+          }
+        };
+        if (connectTimeout) {
+          timer = setTimeout(() => {
+            timer = null;
+            socket.destroy(new errors.ConnectTimeoutError(
+              `Connect Timeout Error (attempted address: ${hostname}:${port}, timeout: ${connectTimeout}ms)`,
+            ));
+          }, connectTimeout);
+          if (typeof timer.unref === "function") timer.unref();
+        }
+        socket.setNoDelay(true);
+        socket.once(protocol === "https:" ? "secureConnect" : "connect", function () {
+          queueMicrotask(clearConnectTimeout);
+          if (callback) {
+            const cb = callback;
+            callback = null;
+            cb(null, this);
+          }
+        });
+        socket.on("error", function (err) {
+          queueMicrotask(clearConnectTimeout);
+          if (callback) {
+            const cb = callback;
+            callback = null;
+            cb(err);
+          }
+        });
+        return socket;
+      };
+    }
+
+    // The `connect` keys the lookup route covers: a connect object with only
+    // these keeps the pooled transport and its lookup hook. Any other key --
+    // a socket or TLS option -- makes it a buildConnector connect function,
+    // so the option is applied rather than dropped.
+    const LOOKUP_ROUTE_KEYS = new Set([
+      "lookup", "timeout", "keepAlive", "keepAliveInitialDelay", "maxCachedSessions", "allowH2",
+    ]);
+
     // ---- dispatchers ------------------------------------------------------
     // All dispatchers delegate to request() -- oam's fetch owns the transport,
-    // so connection-level options (pooling, TLS) are accepted and stored but
-    // NOT applied; connect.lookup is the exception, honored by fetch() (not by
-    // request()). See the module-level notes.
+    // so pooling options are accepted and stored but NOT applied; the
+    // connection policy in `connect` is honored by fetch() and request().
+    // See the module-level notes.
     class Dispatcher extends EventEmitter {
       constructor(options) {
         super();
         this._options = options || {};
         this.destroyed = false;
         this.closed = false;
-        // Bridge for connection pinning: oam's globalThis.fetch looks for
-        // `_oamConnectLookup` on a dispatcher passed via init.dispatcher and,
-        // if present, calls it for every host name the fetch connects to and
-        // pins those connections to its addresses (Host + SNI preserved).
-        // This is how a connect.lookup hook -- e.g. the DNS-rebind pin in
-        // @yawlabs/fetch-mcp -- becomes a REAL transport control instead of a
-        // no-op. The hook signature is Node's lookup(hostname, options, cb)
-        // with options { family, hints, all: true } and
-        // cb(null, [{address, family}]).
         const connect = this._options.connect;
-        this._oamConnectLookup =
-          connect && typeof connect.lookup === "function" ? connect.lookup : null;
+        if (connect != null && typeof connect !== "function" && typeof connect !== "object") {
+          throw new errors.InvalidArgumentError("connect must be a function or an object");
+        }
+        // Bridges for oam's globalThis.fetch, which looks them up on the
+        // dispatcher a fetch rides (see policyOf):
+        //  - `_oamConnect`, a connect FUNCTION, is asked for every connection
+        //    the fetch makes and the request goes over the socket it hands
+        //    back (connector mode);
+        //  - `_oamConnectLookup`, a connect.lookup hook, is called for every
+        //    host name the fetch connects to, and those connections are pinned
+        //    to its addresses (Host + SNI preserved). This is how the
+        //    DNS-rebind pin in e.g. @yawlabs/fetch-mcp becomes a REAL
+        //    transport control instead of a no-op. The hook signature is
+        //    Node's lookup(hostname, options, cb) with options
+        //    { family, hints, all: true } and cb(null, [{address, family}]).
+        this._oamConnect = null;
+        this._oamConnectLookup = null;
+        if (typeof connect === "function") {
+          this._oamConnect = connect;
+        } else if (connect && Object.keys(connect).some((key) => !LOOKUP_ROUTE_KEYS.has(key))) {
+          this._oamConnect = buildConnector(connect);
+        } else if (connect && typeof connect.lookup === "function") {
+          this._oamConnectLookup = connect.lookup;
+        }
+        // Dispatch interceptors (undici's `interceptors` option) run inside
+        // dispatch(), which oam does not use: a dispatcher that has them is
+        // refused (policyOf) rather than run without them.
+        const interceptors = this._options.interceptors;
+        this._oamInterceptors = !!interceptors && typeof interceptors === "object" &&
+          Object.keys(interceptors).some((key) => Array.isArray(interceptors[key]) && interceptors[key].length > 0);
       }
       // request(opts, handler?) -- callback form is rare; support the
       // promise form (returns the request() result) which is what fetch and
@@ -298,7 +440,44 @@
       }
     }
 
-    class Agent extends Dispatcher {}
+    // An Agent's `factory(origin, options)` builds the dispatcher each origin's
+    // requests go through, so that dispatcher's connection policy is the one
+    // that applies (undici passes it the agent's options, `connect`
+    // included). Honored as a connector: each connection asks the origin's
+    // dispatcher (made once per origin) for its policy.
+    class Agent extends Dispatcher {
+      constructor(options) {
+        super(options);
+        const factory = this._options.factory;
+        if (factory !== undefined && typeof factory !== "function") {
+          throw new errors.InvalidArgumentError("factory must be a function.");
+        }
+        if (typeof factory === "function") {
+          const { factory: _factory, maxRedirections: _maxRedirections, ...originOptions } = this._options;
+          const byOrigin = new Map();
+          const plain = buildConnector({});
+          this._oamConnectLookup = null;
+          this._oamConnect = function viaFactory(params, cb) {
+            const origin = params.protocol + "//" + params.host;
+            let dispatcher = byOrigin.get(origin);
+            if (dispatcher === undefined) {
+              dispatcher = factory(origin, originOptions);
+              byOrigin.set(origin, dispatcher);
+            }
+            const policy = policyOf(dispatcher);
+            if (policy.refuse) {
+              cb(policy.refuse);
+            } else if (policy.connector) {
+              policy.connector.fn.call(policy.connector.self, params, cb);
+            } else if (typeof dispatcher._oamConnectLookup === "function") {
+              buildConnector({ lookup: dispatcher._oamConnectLookup })(params, cb);
+            } else {
+              plain(params, cb);
+            }
+          };
+        }
+      }
+    }
 
     // Origin-bound dispatchers: resolve opts.path against the origin.
     class Client extends Dispatcher {
@@ -323,6 +502,38 @@
       }
     }
 
+    // The connection policy globalThis.fetch applies for a dispatcher (see
+    // bootstrap.js dispatcherPolicy): `{ connector }` when its `connect` is a
+    // function (or was built into one), `{}` for none, and `{ refuse }` for a
+    // dispatcher oam cannot run as undici would -- its dispatch() overridden
+    // (a subclass, a patched instance or prototype), interceptors, or an
+    // object that is not one of these classes at all (a real undici's, a
+    // hand-rolled `{ dispatch }`). undici would call that dispatch(); oam
+    // sends requests itself, so it refuses them instead of skipping whatever
+    // the dispatch() does.
+    const shimDispatch = Dispatcher.prototype.dispatch;
+    function notHonored(what) {
+      return new errors.NotSupportedError(
+        what + " is not supported on oam: oam sends the request itself and would skip it. " +
+          "Put the connection policy in a `connect` function, which oam calls for every connection",
+      );
+    }
+    function policyOf(dispatcher) {
+      if (!(dispatcher instanceof Dispatcher)) {
+        return { refuse: notHonored("A dispatcher that is not one of oam's undici classes") };
+      }
+      if (dispatcher.dispatch !== shimDispatch) {
+        return { refuse: notHonored("A dispatcher that overrides dispatch()") };
+      }
+      if (dispatcher._oamInterceptors) {
+        return { refuse: notHonored("A dispatcher with interceptors") };
+      }
+      if (typeof dispatcher._oamConnect === "function") {
+        return { connector: { fn: dispatcher._oamConnect, self: dispatcher } };
+      }
+      return {};
+    }
+
     // ---- global dispatcher ------------------------------------------------
     // The holder is a locked global so globalThis.fetch -- which is native and
     // knows nothing about this module -- can read it. node enforces a
@@ -333,6 +544,14 @@
     // `dispatcher` option, and the other four installation forms silently made
     // an UNPINNED request -- an SSRF guard that fails open.
     const holder = globalDispatcherHolder();
+    if (holder.policy === undefined) {
+      Object.defineProperty(holder, "policy", {
+        value: policyOf,
+        writable: false,
+        enumerable: false,
+        configurable: false,
+      });
+    }
     holder.current = new Agent();
     function setGlobalDispatcher(d) {
       if (!d || typeof d.request !== "function") {
@@ -389,6 +608,7 @@
       BalancedPool,
       setGlobalDispatcher,
       getGlobalDispatcher,
+      buildConnector,
       errors,
       interceptors,
       MockAgent,

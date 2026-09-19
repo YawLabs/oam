@@ -1312,6 +1312,42 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
   hop's lookup, so the hook is only ever asked about names the grant covers. Node has no
   `--permission` net grant to compare against.
 
+**A `connect` function, `buildConnector`, and dispatchers oam refuses**
+
+`import 'undici'` is oam's shim, also when the package is installed (the real one does not
+run on oam). A dispatcher's `connect` FUNCTION -- `new Agent|Pool|Client({ connect(opts,
+cb) })`, a custom connector -- is called before every connection a request makes, redirect
+hops included, IP literals too, with undici's parameters (`host`, `hostname`, `protocol`,
+`port`, `servername`, `localAddress`), on all five entry points above plus `Pool` and
+`Client`. The request goes over the socket it hands back and nowhere else: oam's transport
+speaks HTTP over that socket (h2 when it negotiated `h2`), never dials, resolves or proxies
+for it, and fails closed on a hop it was handed no socket for. A connector that refuses or
+throws fails the request with its error; a socket that fails to connect fails it with the
+socket's error. `undici.buildConnector` is undici's own connector over `net.connect` /
+`tls.connect`, and a `connect` OBJECT carrying anything besides `lookup` and the connect
+tuning keys (`timeout`, `keepAlive`, `keepAliveInitialDelay`, `maxCachedSessions`,
+`allowH2`) -- `ca`, `checkServerIdentity`, `servername`, `rejectUnauthorized`, `family`,
+`localAddress`, `socketPath` -- becomes a connect function through it, as in undici, so
+those options apply. An `Agent`'s `factory` is honored the same way: the dispatcher it makes
+for each origin decides that origin's connections. Pinned against Node + undici 6.24.1 by
+`undici_connect_function_decides_every_connection` (e2e). Up to 0.16.2 the function, the
+TLS options and the factory were ignored and oam connected by itself. What differs:
+
+- **Nothing is pooled.** Each connection the function supplies carries one request and is
+  destroyed after it; undici keeps it for the next request to that origin. So the function
+  is called once per request (and per redirect hop), where undici skips it for a pooled
+  connection. TLS sessions are not cached.
+- **Errors on `undici.request` / `agent.request` are wrapped**, as for the lookup hook:
+  `TypeError: fetch failed` with the connector's error as `cause`.
+- **Refused, where undici would run them:** a dispatcher whose `dispatch()` is overridden
+  (a subclass or a patched instance), one built with `interceptors`, and an object that is
+  not one of the shim's dispatchers (a real undici's, a hand-rolled `{ dispatch }`) fail the
+  request with `NotSupportedError` (`UND_ERR_NOT_SUPPORTED`) and nothing is sent. oam sends
+  requests itself rather than through `dispatch()`, so whatever that `dispatch()` does -- a
+  destination check, for one -- could not run; up to 0.16.2 the request was sent without it.
+  The same policy written as a `connect` function works. `http.request` is not affected: it
+  never goes through an undici dispatcher, in Node or here. `compose()` is not provided.
+
 **Redirects**
 
 - **`redirect: 'manual'` and `'error'` are not implemented**: every redirect is followed

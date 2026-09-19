@@ -5005,6 +5005,247 @@ srv.close();
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// A dispatcher's `connect` FUNCTION -- a custom undici connector, the way an
+/// application vets every connection it makes -- is called before each
+/// connection with undici's parameters, and the request goes over the socket
+/// it hands back and nowhere else: a refusal stops the request on every
+/// entry point, a socket to another server carries it there, a redirect asks
+/// again for each hop, a throw or a socket that fails to connect fails the
+/// request with that error. buildConnector is undici's own connector, and a
+/// `connect` object's TLS options (`ca`, `checkServerIdentity`,
+/// `rejectUnauthorized`) apply through it. Up to 0.16.2 the function and the
+/// TLS options were ignored and oam connected by itself. The expected output
+/// is node v22.22.2 + undici 6.24.1's, line for line.
+#[test]
+fn undici_connect_function_decides_every_connection() {
+    let script = write_temp(
+        "undici_connect_fn/main.mjs",
+        &r##"import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
+import * as undici from 'undici';
+
+const hits = [];
+const mk = (tag) => http.createServer((req, res) => {
+  hits.push(`${tag}${req.url} host=${req.headers.host.replace(/:\d+$/, ':P')}`);
+  if (req.url === '/same') { res.writeHead(302, { location: '/final' }); res.end(); return; }
+  if (req.url === '/other') { res.writeHead(302, { location: `http://b.test:${B.address().port}/final` }); res.end(); return; }
+  res.end(`${tag} ${req.url}`);
+});
+const A = mk('A');
+const B = mk('B');
+const S = https.createServer({ key: `__KEY__`, cert: `__CERT__` }, (req, res) => { hits.push(`S${req.url}`); res.end('secure ' + req.url); });
+await new Promise((r) => A.listen(0, '127.0.0.1', r));
+await new Promise((r) => B.listen(0, '127.0.0.1', r));
+await new Promise((r) => S.listen(0, '127.0.0.1', r));
+const port = { 'a.test': A.address().port, 'b.test': B.address().port };
+const PA = port['a.test'];
+const redact = (s) => String(s).replace(/\b\d{4,5}\b/g, 'P');
+
+const guard = Object.assign(new Error('refused by connector'), { code: 'EBLOCKED' });
+const calls = [];
+// A connector that refuses deny.test, and otherwise connects to the server
+// the name stands for (or `to`).
+const connector = (to) => function (opts, cb) {
+  calls.push(`${typeof this} ${redact(JSON.stringify(opts))}`);
+  if (opts.hostname === 'deny.test') { setTimeout(() => cb(guard), 1); return; }
+  const s = net.connect(to || port[opts.hostname] || Number(opts.port), '127.0.0.1');
+  s.once('connect', () => cb(null, s));
+  s.once('error', cb);
+};
+async function probe(name, run) {
+  calls.length = 0; hits.length = 0;
+  let verdict;
+  try {
+    const r = await run();
+    const body = r.body && typeof r.body.text === 'function' ? await r.body.text() : await r.text();
+    verdict = `${r.status ?? r.statusCode} ${body}`;
+  } catch (e) {
+    const cause = e?.cause ?? e;
+    verdict = cause === guard ? 'guarded' : `failed ${cause?.name} ${cause?.code} ${redact(cause?.message)}`;
+  }
+  console.log(name, verdict, JSON.stringify(calls), JSON.stringify(hits));
+}
+
+// Every way a dispatcher is installed asks its connect function.
+const deny = `http://deny.test:${PA}`;
+await probe('fetch-dispatcher', () => fetch(deny + '/1', { dispatcher: new undici.Agent({ connect: connector() }) }));
+const previous = undici.getGlobalDispatcher();
+undici.setGlobalDispatcher(new undici.Agent({ connect: connector() }));
+await probe('global-fetch', () => fetch(deny + '/2'));
+await probe('undici-fetch', () => undici.fetch(deny + '/3'));
+undici.setGlobalDispatcher(previous);
+const agent = new undici.Agent({ connect: connector() });
+await probe('agent-request', () => agent.request({ origin: deny, path: '/4', method: 'GET' }));
+await probe('undici-request', () => undici.request(deny + '/5', { dispatcher: agent }));
+await probe('pool-request', () => new undici.Pool(deny, { connect: connector() }).request({ path: '/6', method: 'GET' }));
+await probe('client-request', () => new undici.Client(deny, { connect: connector() }).request({ path: '/7', method: 'GET' }));
+
+// The parameters, and the socket it hands back carries the request (here to
+// B while the URL names A); a redirect asks again for each hop.
+await probe('elsewhere', () => fetch(`http://a.test:${PA}/x`, { dispatcher: new undici.Agent({ connect: connector(port['b.test']) }) }));
+await probe('redirect-same', () => fetch(`http://a.test:${PA}/same`, { dispatcher: new undici.Agent({ connect: connector() }) }));
+await probe('redirect-other', () => fetch(`http://a.test:${PA}/other`, { dispatcher: new undici.Agent({ connect: connector() }) }));
+await probe('https-params', () => fetch(`https://deny.test/y`, { dispatcher: new undici.Agent({ connect: connector() }) }));
+await probe('ipv6-params', () => fetch(`http://[::1]:${PA}/z`, { dispatcher: new undici.Agent({ connect: function (opts, cb) { calls.push(redact(JSON.stringify(opts))); cb(guard); } }) }));
+
+// A connector that throws, and one handing back a socket still connecting
+// to a port nothing listens on.
+await probe('throws', () => fetch(`http://a.test:${PA}/t`, { dispatcher: new undici.Agent({ connect() { throw guard; } }) }));
+const dead = net.createServer();
+await new Promise((r) => dead.listen(0, '127.0.0.1', r));
+const deadPort = dead.address().port;
+await new Promise((r) => dead.close(r));
+await probe('refused-port', () => fetch(`http://a.test:${PA}/r`, { dispatcher: new undici.Agent({ connect(opts, cb) { cb(null, net.connect(deadPort, '127.0.0.1')); } }) }));
+
+// connect must be a function or an object.
+for (const bad of ['nope', 42]) {
+  try { new undici.Agent({ connect: bad }); console.log('accepted', bad); } catch (e) { console.log('connect', typeof bad, e.name, e.code, e.message); }
+}
+
+// buildConnector: the guard pattern that vets the name, then connects with
+// undici's own connector -- whose TLS options apply.
+const vetted = (build) => new undici.Agent({ connect(opts, cb) {
+  calls.push(opts.hostname);
+  if (opts.hostname !== 'localhost') { cb(guard); return; }
+  build(opts, cb);
+} });
+await probe('built-refused', () => fetch(`http://a.test:${PA}/b1`, { dispatcher: vetted(undici.buildConnector({})) }));
+await probe('built-allowed', () => fetch(`http://localhost:${PA}/b2`, { dispatcher: vetted(undici.buildConnector({})) }));
+await probe('built-tls-ca', () => fetch(`https://localhost:${S.address().port}/b3`, { dispatcher: vetted(undici.buildConnector({ ca: `__CA__` })) }));
+await probe('built-tls-untrusted', () => fetch(`https://localhost:${S.address().port}/b4`, { dispatcher: vetted(undici.buildConnector({})) }));
+
+// A connect object's TLS options apply to the connection.
+const secure = `https://localhost:${S.address().port}`;
+await probe('connect-ca', () => fetch(secure + '/c1', { dispatcher: new undici.Agent({ connect: { ca: `__CA__` } }) }));
+const pin = Object.assign(new Error('pin mismatch'), { code: 'EPIN' });
+await probe('connect-pin', () => fetch(secure + '/c2', { dispatcher: new undici.Agent({ connect: { ca: `__CA__`, checkServerIdentity: () => pin } }) }));
+await probe('connect-insecure', () => fetch(secure + '/c3', { dispatcher: new undici.Agent({ connect: { rejectUnauthorized: false } }) }));
+
+A.close(); B.close(); S.close();
+"##
+        .replace("__CERT__", TLS_TEST_LEAF_CERT)
+        .replace("__KEY__", TLS_TEST_LEAF_KEY)
+        .replace("__CA__", TLS_TEST_CA_CERT),
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "fetch-dispatcher guarded [\"object {\\\"host\\\":\\\"deny.test:P\\\",\\\"hostname\\\":\\\"deny.test\\\",\\\"protocol\\\":\\\"http:\\\",\\\"port\\\":\\\"P\\\",\\\"servername\\\":null,\\\"localAddress\\\":null}\"] []\n\
+         global-fetch guarded [\"object {\\\"host\\\":\\\"deny.test:P\\\",\\\"hostname\\\":\\\"deny.test\\\",\\\"protocol\\\":\\\"http:\\\",\\\"port\\\":\\\"P\\\",\\\"servername\\\":null,\\\"localAddress\\\":null}\"] []\n\
+         undici-fetch guarded [\"object {\\\"host\\\":\\\"deny.test:P\\\",\\\"hostname\\\":\\\"deny.test\\\",\\\"protocol\\\":\\\"http:\\\",\\\"port\\\":\\\"P\\\",\\\"servername\\\":null,\\\"localAddress\\\":null}\"] []\n\
+         agent-request guarded [\"object {\\\"host\\\":\\\"deny.test:P\\\",\\\"hostname\\\":\\\"deny.test\\\",\\\"protocol\\\":\\\"http:\\\",\\\"port\\\":\\\"P\\\",\\\"servername\\\":null,\\\"localAddress\\\":null}\"] []\n\
+         undici-request guarded [\"object {\\\"host\\\":\\\"deny.test:P\\\",\\\"hostname\\\":\\\"deny.test\\\",\\\"protocol\\\":\\\"http:\\\",\\\"port\\\":\\\"P\\\",\\\"servername\\\":null,\\\"localAddress\\\":null}\"] []\n\
+         pool-request guarded [\"object {\\\"host\\\":\\\"deny.test:P\\\",\\\"hostname\\\":\\\"deny.test\\\",\\\"protocol\\\":\\\"http:\\\",\\\"port\\\":\\\"P\\\",\\\"servername\\\":null,\\\"localAddress\\\":null}\"] []\n\
+         client-request guarded [\"object {\\\"host\\\":\\\"deny.test:P\\\",\\\"hostname\\\":\\\"deny.test\\\",\\\"protocol\\\":\\\"http:\\\",\\\"port\\\":\\\"P\\\",\\\"servername\\\":null,\\\"localAddress\\\":null}\"] []\n\
+         elsewhere 200 B /x [\"object {\\\"host\\\":\\\"a.test:P\\\",\\\"hostname\\\":\\\"a.test\\\",\\\"protocol\\\":\\\"http:\\\",\\\"port\\\":\\\"P\\\",\\\"servername\\\":null,\\\"localAddress\\\":null}\"] [\"B/x host=a.test:P\"]\n\
+         redirect-same 200 A /final [\"object {\\\"host\\\":\\\"a.test:P\\\",\\\"hostname\\\":\\\"a.test\\\",\\\"protocol\\\":\\\"http:\\\",\\\"port\\\":\\\"P\\\",\\\"servername\\\":null,\\\"localAddress\\\":null}\",\"object {\\\"host\\\":\\\"a.test:P\\\",\\\"hostname\\\":\\\"a.test\\\",\\\"protocol\\\":\\\"http:\\\",\\\"port\\\":\\\"P\\\",\\\"servername\\\":null,\\\"localAddress\\\":null}\"] [\"A/same host=a.test:P\",\"A/final host=a.test:P\"]\n\
+         redirect-other 200 B /final [\"object {\\\"host\\\":\\\"a.test:P\\\",\\\"hostname\\\":\\\"a.test\\\",\\\"protocol\\\":\\\"http:\\\",\\\"port\\\":\\\"P\\\",\\\"servername\\\":null,\\\"localAddress\\\":null}\",\"object {\\\"host\\\":\\\"b.test:P\\\",\\\"hostname\\\":\\\"b.test\\\",\\\"protocol\\\":\\\"http:\\\",\\\"port\\\":\\\"P\\\",\\\"servername\\\":null,\\\"localAddress\\\":null}\"] [\"A/other host=a.test:P\",\"B/final host=b.test:P\"]\n\
+         https-params guarded [\"object {\\\"host\\\":\\\"deny.test\\\",\\\"hostname\\\":\\\"deny.test\\\",\\\"protocol\\\":\\\"https:\\\",\\\"port\\\":\\\"\\\",\\\"servername\\\":null,\\\"localAddress\\\":null}\"] []\n\
+         ipv6-params guarded [\"{\\\"host\\\":\\\"[::1]:P\\\",\\\"hostname\\\":\\\"::1\\\",\\\"protocol\\\":\\\"http:\\\",\\\"port\\\":\\\"P\\\",\\\"servername\\\":null,\\\"localAddress\\\":null}\"] []\n\
+         throws guarded [] []\n\
+         refused-port failed Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:P [] []\n\
+         connect string InvalidArgumentError UND_ERR_INVALID_ARG connect must be a function or an object\n\
+         connect number InvalidArgumentError UND_ERR_INVALID_ARG connect must be a function or an object\n\
+         built-refused guarded [\"a.test\"] []\n\
+         built-allowed 200 A /b2 [\"localhost\"] [\"A/b2 host=localhost:P\"]\n\
+         built-tls-ca 200 secure /b3 [\"localhost\"] [\"S/b3\"]\n\
+         built-tls-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate [\"localhost\"] []\n\
+         connect-ca 200 secure /c1 [] [\"S/c1\"]\n\
+         connect-pin failed Error EPIN pin mismatch [] []\n\
+         connect-insecure 200 secure /c3 [] [\"S/c3\"]";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// A dispatcher oam cannot run as undici would -- its dispatch() overridden by
+/// a subclass or a patched instance, dispatch interceptors, or an object that
+/// is not one of the shim's dispatchers -- fails the request with
+/// NotSupportedError, on every entry point, and nothing reaches the server.
+/// undici would call that dispatch(); oam sends requests itself, and up to
+/// 0.16.2 it did so WITHOUT it, skipping whatever policy the dispatch() held.
+/// An Agent's `factory` is honored: each origin's dispatcher from it decides
+/// that origin's connections (node: the same lines). http.get never goes
+/// through an undici dispatcher, refused or not, as in node.
+#[test]
+fn undici_dispatchers_oam_cannot_run_are_refused() {
+    let script = write_temp(
+        "undici_refused_dispatchers/main.mjs",
+        r##"import http from 'node:http';
+import net from 'node:net';
+import * as undici from 'undici';
+
+const hits = [];
+const server = http.createServer((req, res) => { hits.push(req.url); res.end('reached ' + req.url); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+const guard = Object.assign(new Error('refused by guard'), { code: 'EBLOCKED' });
+async function probe(name, run) {
+  hits.length = 0;
+  let verdict;
+  try {
+    const r = await run();
+    verdict = `${r.status ?? r.statusCode}`;
+  } catch (e) {
+    const cause = e?.cause ?? e;
+    verdict = cause === guard ? 'guarded' : `failed ${cause?.name} ${cause?.code}`;
+  }
+  console.log(name, verdict, JSON.stringify(hits));
+}
+
+// A subclass whose dispatch() refuses.
+class Guard extends undici.Agent {
+  dispatch(opts, handler) {
+    if (opts.origin && String(opts.origin).includes('127.0.0.1')) throw guard;
+    return super.dispatch(opts, handler);
+  }
+}
+await probe('subclass-fetch', () => fetch(base + '/s1', { dispatcher: new Guard() }));
+await probe('subclass-request', () => undici.request(base + '/s2', { dispatcher: new Guard() }));
+await probe('subclass-own-request', () => new Guard().request({ origin: base, path: '/s3', method: 'GET' }));
+const previous = undici.getGlobalDispatcher();
+undici.setGlobalDispatcher(new Guard());
+await probe('subclass-global', () => fetch(base + '/s4'));
+undici.setGlobalDispatcher(previous);
+const patched = new undici.Agent();
+patched.dispatch = () => { throw guard; };
+await probe('patched-instance', () => fetch(base + '/s5', { dispatcher: patched }));
+// Not one of undici's dispatchers at all.
+await probe('foreign-object', () => fetch(base + '/s6', { dispatcher: { dispatch() { throw guard; } } }));
+// Agent interceptors (the option form).
+const refuseInterceptor = (dispatch) => (opts, handler) => { throw guard; };
+await probe('interceptors', () => fetch(base + '/s7', { dispatcher: new undici.Agent({ interceptors: { Agent: [refuseInterceptor] } }) }));
+// A factory's dispatchers decide their origins' connections.
+const refusing = (opts, cb) => cb(guard);
+await probe('factory-refuses', () => fetch(base + '/f1', { dispatcher: new undici.Agent({ factory: (origin, opts) => new undici.Pool(origin, { ...opts, connect: refusing }) }) }));
+await probe('factory-plain', () => fetch(base + '/f2', { dispatcher: new undici.Agent({ factory: (origin, opts) => new undici.Pool(origin, opts) }) }));
+await probe('factory-gets-connect', () => fetch(base + '/f3', { dispatcher: new undici.Agent({ connect: refusing, factory: (origin, opts) => new undici.Client(origin, opts) }) }));
+// A plain Agent still works.
+await probe('plain-agent', () => fetch(base + '/p1', { dispatcher: new undici.Agent() }));
+await probe('plain-global', () => fetch(base + '/p2'));
+undici.setGlobalDispatcher(new Guard());
+await probe('http-get-with-refused-global', () => new Promise((resolve, reject) => {
+  http.get(base + '/h1', (res) => { res.resume(); res.on('end', () => resolve(res)); }).on('error', reject);
+}));
+server.close();
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "subclass-fetch failed NotSupportedError UND_ERR_NOT_SUPPORTED []\n\
+         subclass-request failed NotSupportedError UND_ERR_NOT_SUPPORTED []\n\
+         subclass-own-request failed NotSupportedError UND_ERR_NOT_SUPPORTED []\n\
+         subclass-global failed NotSupportedError UND_ERR_NOT_SUPPORTED []\n\
+         patched-instance failed NotSupportedError UND_ERR_NOT_SUPPORTED []\n\
+         foreign-object failed NotSupportedError UND_ERR_NOT_SUPPORTED []\n\
+         interceptors failed NotSupportedError UND_ERR_NOT_SUPPORTED []\n\
+         factory-refuses guarded []\n\
+         factory-plain 200 [\"/f2\"]\n\
+         factory-gets-connect guarded []\n\
+         plain-agent 200 [\"/p1\"]\n\
+         plain-global 200 [\"/p2\"]\n\
+         http-get-with-refused-global 200 [\"/h1\"]";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 /// An abort ends a hooked fetch where node ends it. Aborted in the same tick
 /// as fetch(), the first host is still passed to the hook (undici has begun
 /// connecting); aborted while a request is on the wire, the redirect it

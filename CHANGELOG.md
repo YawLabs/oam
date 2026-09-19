@@ -67,6 +67,19 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   socket's `'lookup'` / `'connect'` listeners apply as they do to that socket, a refusal
   fails the session with its own error, and `session.socket` is node's proxy of the
   real socket. `tls.connect({ socket })` also passes `ALPNProtocols` on.
+- **An undici dispatcher's connection policy was ignored.** `import 'undici'` is oam's
+  shim even when the package is installed, and the shim honoured only `connect.lookup`: a
+  `connect` function (`new Agent|Pool|Client({ connect(opts, cb) })`), the TLS options of
+  a `connect` object (`ca`, `checkServerIdentity`, `rejectUnauthorized`, ...), an Agent's
+  `factory`, a dispatcher that overrides `dispatch()`, `interceptors`, and a dispatcher
+  that is not one of the shim's were all skipped, and oam connected by itself. Now the
+  `connect` function is called before every connection -- redirect hops included, on
+  `fetch`, the global dispatcher, `undici.fetch`, `undici.request` and `agent.request` --
+  and the request goes over the socket it returns and nowhere else; a `connect` object's
+  socket and TLS options apply through undici's `buildConnector`, which the shim now
+  exports; a factory's dispatchers decide their origins' connections. A dispatcher oam
+  cannot run as undici would (an overridden `dispatch()`, `interceptors`, a foreign
+  object) fails the request with `NotSupportedError` instead of being skipped.
 
 - **`--allow-net` could be bypassed through an HTTP redirect.** The grant was checked
   only against the URL a script passed to `fetch`, `http.request`, `https.request` or
