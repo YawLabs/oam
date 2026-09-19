@@ -1082,13 +1082,18 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   - A **TLS 1.2 handshake negotiates `ECDHE-RSA-AES256-GCM-SHA384`** where Node's OpenSSL
     prefers `ECDHE-RSA-AES128-GCM-SHA256`: rustls orders AES-256 first. `getCipher()` reports
     it in OpenSSL's spelling either way.
-  - An **`https.createServer` with a range that offers nothing** refuses each handshake with
-    the same alert as `tls.createServer` (the client sees `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`)
-    but does not emit `tlsClientError` for it; that server has no per-connection channel to
-    JS.
   - A **`_server_method` name on a client** (or `_client_method` on a server) is taken as its
     base method here; Node's OpenSSL accepts the name and then fails the handshake with
     `ERR_SSL_CALLED_A_FUNCTION_YOU_SHOULD_NOT_CALL`, a misuse it does not check up front.
+- **A fatal alert from the server fails a client with `EIO`**, except `protocol_version`
+  (`ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`, as in Node). Node names every alert a client
+  receives: `ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL` when the server has none of the
+  offered ALPN protocols, `ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED` when a TLS 1.3 server
+  that requires a client certificate gets none (that alert arrives after `'secureConnect'`).
+  oam's `tls.connect` -- and `https.request` and an `http2.connect` stream over it -- fails
+  with `EIO` and rustls's message instead. The connection is refused either way; only the
+  code differs. (`conformance/cases/145-tls-clients-against-tls-servers.mjs` leaves the
+  client's code out for this reason.)
 - `getPeerCertificate(true)` links `issuerCertificate` only through the certificates the
   peer sent; Node also consults the client's trust store for the issuer of the last one.
 
@@ -1843,6 +1848,10 @@ oam's shared client. What differs:
 - **A plain `Duplex` from `createConnection` is used as it is.** Node wraps a stream that is
   not a socket in its `JSStreamSocket` and hands that wrapper to `'connect'`; oam runs the
   session over the stream itself and hands it on.
+- **A fatal alert after the handshake also ends the session with events.** When a TLS 1.3
+  server refuses a session that sent no client certificate, the pending stream fails and
+  closes as in Node (its code is `EIO`, entry 34), and oam's session then emits `'error'`
+  and `'close'`; Node's session is destroyed and emits neither (measured for 3 s).
 
 _(probed)_ Node v22.22.2 vs oam on Windows: lookup and createConnection guards over h2c, and
 a node-hosted `createSecureServer` for `ca`, `servername`, a refusing lookup, an untrusted
