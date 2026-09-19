@@ -18468,6 +18468,9 @@
           // A socket an earlier request over this (stock) agent left in its
           // pool is reused, as node's addRequest reuses it.
           (!!agent && agentHasFreeSocket(agent, this, opts, host, port)) ||
+          // node sends it to the Unix socket or named pipe, never host:port;
+          // the agent's socket goes where net.connect({path}) goes.
+          !!merged.socketPath ||
           this._rawHost;
         // node dials the target itself unless its own global agent carries
         // the environment proxy (NODE_USE_ENV_PROXY=1): a request oam's
@@ -20707,6 +20710,28 @@
       }
     }
 
+    // node connects a socket given `path` to that Unix domain socket or
+    // Windows named pipe (lib/net.js: `const pipe = !!path`), whatever host
+    // and port also say -- http.request's `socketPath` arrives this way. oam
+    // has no client for either, so the connect fails, on the next tick as a
+    // refused one does, rather than going to host:port, where something else
+    // may be listening. True when it refused.
+    function refusePipeConnect(self, options) {
+      const path = options.path;
+      if (!path) return false;
+      if (typeof path !== "string") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.path", "string", path);
+      }
+      const err = new Error(
+        "The feature connecting to a Unix domain socket or named pipe (the `path` option) " +
+        "is unavailable on the current platform, which is being used to run oam",
+      );
+      err.code = "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM";
+      process.nextTick(() => self.destroy(err));
+      return true;
+    }
+    registry._netRefusePipeConnect = refusePipeConnect;
+
     // `host` is the caller's (net: options.host || 'localhost'). `dial(spec)`
     // starts the native connect: spec null for an IP literal, `{ ips }` for a
     // hook's answer, `{ ticket }` for oam's resolver's. Throws synchronously
@@ -20920,6 +20945,10 @@
         if (typeof args[0] === "object" && args[0] !== null) {
           options = args[0];
           cb = args[1];
+        } else if (typeof args[0] === "string" && !(Number(args[0]) >= 0)) {
+          // node's normalizeArgs: a string that is not a port names a pipe.
+          options = { path: args[0] };
+          cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : undefined;
         } else {
           options = { port: args[0], host: typeof args[1] === "string" ? args[1] : undefined };
           cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : undefined;
@@ -20967,6 +20996,7 @@
           }
           this._startConnect(connecting, host, port).then(openGate);
         };
+        if (refusePipeConnect(this, options)) return this;
         lookupAndConnect(this, options, host, port, dial);
         return this;
       }
@@ -27027,6 +27057,9 @@
       }
       if (callback) socket.once(event, callback);
       socket.connecting = true;
+      // A `path` names a pipe in node, never host:port (see net's
+      // refusePipeConnect).
+      if (registry.get("net") && registry._netRefusePipeConnect(socket, options)) return;
       socket._connectPending = true;
       // Node registers the handle synchronously inside connect(), before the
       // connection exists, and a TLS socket reports as a TCPSocketWrap

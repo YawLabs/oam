@@ -25909,3 +25909,64 @@ show('low', [low.serialNumber, low.toLegacyObject().serialNumber]);
         );
     }
 }
+
+/// node connects a socket given `path` (http.request's `socketPath`) to that
+/// Unix domain socket or named pipe, whatever `host` and `port` say, and
+/// never to host:port. oam has no client for either, so the connect fails
+/// with ERR_FEATURE_UNAVAILABLE_ON_PLATFORM -- and nothing reaches the TCP
+/// listener at host:port. Up to 0.16.2 every one of these connected to it
+/// (http.get sent the whole request there).
+#[test]
+fn a_pipe_path_never_falls_back_to_host_and_port() {
+    let script = write_temp(
+        "pipe_path_refused/main.mjs",
+        r#"import net from 'node:net';
+import tls from 'node:tls';
+import http from 'node:http';
+import https from 'node:https';
+let reached = 0;
+const tcp = net.createServer((c) => { reached++; c.destroy(); });
+await new Promise((r) => tcp.listen(0, '127.0.0.1', r));
+const port = tcp.address().port;
+const pipe = process.platform === 'win32' ? '\\.\pipe\oam-e2e-missing-' + process.pid : '/tmp/oam-e2e-missing-' + process.pid;
+const settle = (s) => new Promise((resolve) => {
+  s.on('connect', () => { resolve('connect'); s.destroy(); });
+  s.on('secureConnect', () => { resolve('secureConnect'); s.destroy(); });
+  s.on('error', (e) => resolve(e.code));
+});
+const request = (mod, o) => new Promise((resolve) => {
+  const q = mod.get(o, (res) => { res.resume(); resolve('response ' + res.statusCode); });
+  q.on('error', (e) => resolve(e.code));
+});
+const out = [];
+out.push('net.connect({path}) ' + await settle(net.connect({ path: pipe, host: '127.0.0.1', port })));
+out.push('net.connect(path) ' + await settle(net.connect(pipe)));
+out.push('net.createConnection(path, cb) ' + await settle(net.createConnection(pipe, () => {})));
+out.push('tls.connect({path}) ' + await settle(tls.connect({ path: pipe, host: '127.0.0.1', port, rejectUnauthorized: false })));
+out.push('http.get({socketPath}) ' + await request(http, { socketPath: pipe, host: '127.0.0.1', port, path: '/x' }));
+out.push('https.get({socketPath}) ' + await request(https, { socketPath: pipe, host: '127.0.0.1', port, path: '/x', rejectUnauthorized: false }));
+out.push('http.get({socketPath}) over a keepAlive agent ' + await request(http, { socketPath: pipe, host: '127.0.0.1', port, agent: new http.Agent({ keepAlive: true }) }));
+let thrown;
+try { net.connect({ path: 7 }); } catch (e) { thrown = e.code; }
+out.push('net.connect({path: 7}) throws ' + thrown);
+await new Promise((r) => setTimeout(r, 200));
+out.push('tcp listener reached ' + reached);
+console.log(out.join('\n'));
+tcp.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "net.connect({path}) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
+         net.connect(path) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
+         net.createConnection(path, cb) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
+         tls.connect({path}) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
+         http.get({socketPath}) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
+         https.get({socketPath}) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
+         http.get({socketPath}) over a keepAlive agent ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
+         net.connect({path: 7}) throws ERR_INVALID_ARG_TYPE\n\
+         tcp listener reached 0"
+    );
+}

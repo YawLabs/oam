@@ -67,6 +67,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `NODE_USE_ENV_PROXY=1` (or `--use-env-proxy` in `NODE_OPTIONS`) is set, and then only
   over node's own global agents, as node does. `fetch` still honours the environment
   proxy.
+- **A `socketPath` or `path` connected to `host:port`.** node connects `http.request`'s
+  `socketPath` and `net.connect` / `tls.connect`'s `path` to that Unix domain socket or
+  named pipe; oam ignored them and connected to `host:port` (by default `localhost:80`),
+  sending the request to whatever listened there. oam has no client for either, so these
+  now fail with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` and nothing is dialled.
 - **TLS options of `https.request` were not applied.** A verifying `https.request` went
   through one shared client that ignored the request's `ca`, client certificate,
   `servername` and `checkServerIdentity`, and `tls.connect` never called a

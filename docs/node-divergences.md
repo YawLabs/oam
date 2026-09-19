@@ -1509,7 +1509,9 @@ one (a subclass that overrides it, or a patched instance or prototype), an
 `dns.lookup`, a wrapped `net.createConnection` / `net.Socket.prototype.connect` (http) or
 `tls.connect` / `tls.TLSSocket.prototype.connect` (https), https with a TLS option oam's own
 client does not apply (`rejectUnauthorized: false`, `ca`, `cert` / `key` / `pfx`,
-`servername`, `checkServerIdentity`, `minVersion` / `maxVersion` / `secureProtocol`), an
+`servername`, `checkServerIdentity`, `minVersion` / `maxVersion` / `secureProtocol`), a
+`socketPath`, a host the URL parser would rewrite (entry 38), a destination oam's client
+would send through the environment proxy where Node would not (entry 38), an
 upgrade, or `'lookup'` / `'connect'` / `'secureConnect'` listeners on `req.socket` when the
 request is dispatched -- at once when nothing listens for `'socket'`, else one turn of the
 loop after it (an immediate, no timer wait), so a listener added after an `await` in an
@@ -1529,8 +1531,9 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   header by Node's rules; `conformance/cases/124-http-agent-keepalive-pool.mjs` pins it.
   What differs: a socket that is not reused because its response said `close` (or was
   destroyed) leaves `agent.sockets` at once, where Node's leaves it in a later loop
-  phase, when its `'close'` arrives (see Sockets below). Not ported: `proxyEnv`
-  (`--use-env-proxy`) and the `'keylog'` relay.
+  phase, when its `'close'` arrives (see Sockets below). Not ported: the `proxyEnv` option
+  (under `NODE_USE_ENV_PROXY=1` the global agents' requests take oam's client and its
+  environment proxy, entry 38) and the `'keylog'` relay.
 - **The wire.** Header names go out lowercased (hyper keeps no original case), and
   `rawHeaders` of the response are lowercased too. A request target byte that hyper's URI
   type refuses (`"`, `<`, `>`, `\`, `^`, `` ` ``, and any byte above 0x7F) is
@@ -1568,6 +1571,11 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   decides "is this https?" by looking for Node's own `node:https:` frame on the stack; oam's
   `https.request` and `https.get` run in frames named `node:https` for it, so a stack
   trace through them shows that name where it used to show `oam:node_compat.js`.
+- **Pipes.** oam has no client for a Unix domain socket or a Windows named pipe, so
+  `net.connect({ path })`, `net.connect(path)`, `tls.connect({ path })` and an http(s)
+  request's `socketPath` fail with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` where Node connects
+  to the pipe; a non-string `path` throws Node's `ERR_INVALID_ARG_TYPE`. Up to 0.16.2 they
+  connected to `host:port` instead (http.request sent the whole request there).
 - **`--permission`.** The request is a `net.connect` / `tls.connect`, and its grant is
   checked as theirs is: `host:port`, and each address a `lookup` hook answers as `addr:port`
   (entry 4).
