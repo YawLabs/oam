@@ -672,7 +672,7 @@ const server = http.createServer(
 server.listen(0, "127.0.0.1", () => console.log("PORT " + server.address().port));
 "#;
 
-/// More connections than the server serves at once.
+/// More connections than oam's servers used to take at once (256).
 const FLOOD: usize = 300;
 
 /// Keep trying a request until one is answered 200 or `deadline` passes.
@@ -807,4 +807,138 @@ fn a_pipelined_request_after_an_unread_body_keeps_its_timeouts() {
         ["HTTP/1.1 200 OK", "HTTP/1.1 408 Request Timeout"],
         "{text:?}"
     );
+}
+
+/// A server with node's default timeouts (headersTimeout 60 s,
+/// keepAliveTimeout 5 s + 1 s) and no maxConnections, as most are run.
+const DEFAULT_SERVER: &str = r#"
+import http from "node:http";
+const server = http.createServer((req, res) => res.end("ok"));
+server.listen(0, "127.0.0.1", () => console.log("PORT " + server.address().port));
+"#;
+
+/// Send one keep-alive request on `stream` and read its answer. False when
+/// the server closed the connection or did not answer.
+fn keep_alive_request(stream: &mut std::net::TcpStream) -> bool {
+    use std::io::{Read, Write};
+    if stream
+        .write_all(b"GET /busy HTTP/1.1\r\nHost: x\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut answer = Vec::new();
+    let mut buf = [0u8; 512];
+    while !answer.ends_with(b"ok") {
+        match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => answer.extend_from_slice(&buf[..n]),
+        }
+    }
+    answer.starts_with(b"HTTP/1.1 200 OK")
+}
+
+/// Keep-alive clients that keep sending requests never go idle, so no
+/// timeout closes them; however many there are, the next client is served
+/// at once, as by node, which takes connections while the OS gives them.
+/// (oam's servers stopped at 256 connections: while these stayed busy every
+/// other client was turned away.)
+#[test]
+fn busy_keep_alive_clients_do_not_lock_the_server_out() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let server = Server::start("busy_flood.mjs", DEFAULT_SERVER, &[], &[]);
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    let mut busy = Vec::new();
+    let mut turned_away = 0;
+    for _ in 0..FLOOD {
+        // A connect error is this process's own limit on open sockets, not
+        // the server's doing: stop there.
+        let Ok(mut stream) = std::net::TcpStream::connect(target) else {
+            break;
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        if keep_alive_request(&mut stream) {
+            busy.push(stream);
+        } else {
+            turned_away += 1;
+        }
+    }
+    assert_eq!(turned_away, 0, "every connection is served");
+    assert!(busy.len() > 256, "{} connections", busy.len());
+    // Keep every one of them busy, a request a second each.
+    let stop = Arc::new(AtomicBool::new(false));
+    let pinger = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                for stream in busy.iter_mut() {
+                    let _ = keep_alive_request(stream);
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            busy
+        })
+    };
+    let waited = served_within(target, Duration::from_secs(3));
+    stop.store(true, Ordering::Relaxed);
+    let busy = pinger.join().unwrap();
+    assert!(
+        waited.is_some(),
+        "a new client must be served while {} others keep the server busy",
+        busy.len()
+    );
+}
+
+/// Silent connections under node's default timeouts (closed only after
+/// headersTimeout, 60 s) do not keep the next client out either.
+#[test]
+fn silent_connections_do_not_keep_the_next_client_waiting() {
+    let server = Server::start("silent_default.mjs", DEFAULT_SERVER, &[], &[]);
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    let silent: Vec<std::net::TcpStream> = (0..FLOOD)
+        .map_while(|_| std::net::TcpStream::connect(target).ok())
+        .collect();
+    assert!(silent.len() > 256, "{} connections", silent.len());
+    assert!(
+        served_within(target, Duration::from_secs(3)).is_some(),
+        "a new client must be served while {} connections say nothing",
+        silent.len()
+    );
+}
+
+/// The same for `http2.createServer`, which has no timeouts at all for
+/// HTTP/2 (node's Http2Server): a new HTTP/2 client gets the server's
+/// SETTINGS frame however many connections sit silent. (There the limit of
+/// 256 locked the server for good.)
+#[test]
+fn silent_connections_do_not_lock_an_http2_server() {
+    use std::io::{Read, Write};
+    let script = r#"
+import http2 from "node:http2";
+const server = http2.createServer((req, res) => res.end("ok"));
+server.listen(0, "127.0.0.1", () => console.log("PORT " + server.address().port));
+"#;
+    let server = Server::start("h2_flood.mjs", script, &[], &[]);
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    let silent: Vec<std::net::TcpStream> = (0..FLOOD)
+        .map_while(|_| std::net::TcpStream::connect(target).ok())
+        .collect();
+    assert!(silent.len() > 256, "{} connections", silent.len());
+    std::thread::sleep(Duration::from_millis(300));
+    let mut client = std::net::TcpStream::connect(target).expect("connect");
+    client
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    // The connection preface: the magic, then an empty SETTINGS frame.
+    client
+        .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+        .unwrap();
+    let mut frame = [0u8; 9];
+    client
+        .read_exact(&mut frame)
+        .expect("the server answers the preface");
+    assert_eq!(frame[3], 4, "a SETTINGS frame: {frame:?}");
 }

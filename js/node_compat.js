@@ -17960,9 +17960,35 @@
       if (server._serverId === null || server._serverId === undefined) return;
       const values = serverTimeoutValues(server);
       const key = values.join(",");
-      if (server._syncedTimeouts === key) return;
-      server._syncedTimeouts = key;
-      natives.httpServerTimeouts(server._serverId, ...values);
+      if (server._syncedTimeouts !== key) {
+        server._syncedTimeouts = key;
+        natives.httpServerTimeouts(server._serverId, ...values);
+      }
+      // net.Server#maxConnections, compared as node compares it
+      // (`connections >= maxConnections`): unset is no limit.
+      const max = server.maxConnections;
+      const limit = max === undefined || max === null ? Infinity : Number(max);
+      if (!Object.is(server[kSyncedMaxConnections], limit)) {
+        server[kSyncedMaxConnections] = limit;
+        natives.httpServerMaxConnections(server._serverId, limit);
+      }
+    }
+
+    const kMaxConnections = Symbol("maxConnections");
+    const kSyncedMaxConnections = Symbol("syncedMaxConnections");
+    // net.Server#maxConnections on a server class: undefined until set (no
+    // limit); set, it reaches the native server at once.
+    function defineMaxConnections(proto) {
+      Object.defineProperty(proto, "maxConnections", {
+        get() {
+          return this[kMaxConnections];
+        },
+        set(value) {
+          this[kMaxConnections] = value;
+          syncServerTimeouts(this);
+        },
+        configurable: true,
+      });
     }
 
     // node's checkConnections: requests not in within headersTimeout /
@@ -18014,6 +18040,20 @@
         meta.requestId === undefined || !server._exchanges
           ? undefined
           : server._exchanges.get(meta.requestId);
+      if (meta.event === "drop") {
+        // net.Server's 'drop': a connection refused under maxConnections,
+        // with node's null-prototype record of its two ends.
+        server.emit("drop", {
+          __proto__: null,
+          localAddress: meta.localAddress,
+          localPort: meta.localPort,
+          localFamily: meta.localFamily,
+          remoteAddress: meta.remoteAddress,
+          remotePort: meta.remotePort,
+          remoteFamily: meta.remoteFamily,
+        });
+        return;
+      }
       if (meta.event === "closed") {
         // The exchange ended without its response (the connection was
         // closed under it): node's abortIncoming -- the request is
@@ -19092,7 +19132,9 @@
       return proxy;
     };
     // The https server shares the parser options and their policy.
+    defineMaxConnections(Server.prototype);
     registry._httpParserOptions = {
+      defineMaxConnections,
       store: storeHTTPOptions,
       policy: serverHeadPolicy,
       timeoutArgs: serverTimeoutArgs,
@@ -21533,6 +21575,8 @@
         return this;
       }
     }
+
+    registry._httpParserOptions.defineMaxConnections(Server.prototype);
 
     function createServer(options, handler) {
       return new Server(options, handler);

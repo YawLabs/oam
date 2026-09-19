@@ -10,14 +10,15 @@
 //! come back either as one full buffer or as a CHANNEL BODY the JS side
 //! pushes chunks into (the SSE/token-streaming path).
 //!
-//! Hardening (after the M2 safety fleet): a per-server CONNECTION CAP
-//! refuses floods, a global RETAINED-BODY BUDGET bounds buffered upload
-//! memory, the streaming push has a STALL TIMEOUT so a half-open client
-//! can't wedge the pump, and close() does a GRACEFUL shutdown (in-flight
-//! requests finish, keep-alive is disabled) instead of resetting live
-//! connections. Every HTTP/1 connection is held to node's server timeouts
-//! (`http_conn`): headersTimeout / requestTimeout, keepAliveTimeout and the
-//! socket timeout.
+//! Hardening (after the M2 safety fleet): a global RETAINED-BODY BUDGET
+//! bounds buffered upload memory, the streaming push has a STALL TIMEOUT so
+//! a half-open client can't wedge the pump, and close() does a GRACEFUL
+//! shutdown (in-flight requests finish, keep-alive is disabled) instead of
+//! resetting live connections. Every HTTP/1 connection is held to node's
+//! server timeouts (`http_conn`): headersTimeout / requestTimeout,
+//! keepAliveTimeout and the socket timeout. Like node's, a server has no
+//! connection limit of its own (a fixed one let a few hundred held
+//! connections keep everyone else out); `server.maxConnections` sets one.
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -27,7 +28,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
-use tokio::sync::{Semaphore, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::http_conn::{CloseReason, ConnWatch, Fired, ServerTimeouts, TimeoutSettings, WatchedIo};
 use crate::http_head::{HeadError, HeadPolicy};
@@ -55,7 +56,7 @@ const DRAIN_BUDGET: usize = 16 * 1024 * 1024; // 16 MB post-cap drain
 /// unread uploads pin N * capacity chunks regardless of how large the
 /// bodies are. The budget is what bounds the AGGREGATE once N itself grows
 /// large. Both are needed: backpressure alone scales with connection count,
-/// and `MAX_CONNECTIONS` alone says nothing about bytes.
+/// and a connection count alone says nothing about bytes.
 const DEFAULT_GLOBAL_BODY_BUDGET: usize = 512 * 1024 * 1024;
 
 /// Parse `OAM_MAX_BODY_BYTES` into the aggregate body budget.
@@ -73,10 +74,10 @@ fn global_body_budget() -> usize {
             .unwrap_or(DEFAULT_GLOBAL_BODY_BUDGET)
     })
 }
-/// Concurrent-connection cap per server. New connections past this are
-/// dropped (refused), not queued — a flood can't spawn unbounded tasks or
-/// buffer unbounded bodies.
-const MAX_CONNECTIONS: usize = 256;
+/// How long an accept loop waits after the OS refused an accept (out of file
+/// descriptors, say) before it tries again, instead of spinning on the
+/// error.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
 /// A single streaming-response chunk that cannot be delivered within this
 /// window means the consumer is gone or wedged (a half-open socket the OS
 /// hasn't reset yet): end the stream so the JS pump never parks forever.
@@ -105,6 +106,10 @@ pub enum ServerEvent {
     Timeout {
         conn_id: u64,
         fired: Fired,
+        conn: ConnAddrs,
+    },
+    /// A connection refused under `server.maxConnections` (node's 'drop').
+    Drop {
         conn: ConnAddrs,
     },
     /// An exchange ended without its response (the connection was closed
@@ -382,6 +387,19 @@ impl HttpState {
             .and_then(|entry| entry.timeouts.clone())
         {
             timeouts.update(headers_ms, request_ms, keep_alive_ms, socket_ms);
+        }
+    }
+
+    /// `server.maxConnections`, as `Number(value)` (infinity when unset).
+    pub fn set_max_connections(&self, server_id: u64, limit: f64) {
+        if let Some(timeouts) = self
+            .servers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&server_id)
+            .and_then(|entry| entry.timeouts.clone())
+        {
+            timeouts.set_max_connections(limit);
         }
     }
 
@@ -786,6 +804,20 @@ fn socket_timed_out(
     }
 }
 
+/// Count an accepted connection against the server's `maxConnections`;
+/// when node would refuse it, drop it and tell JS (node's 'drop').
+fn admit(
+    timeouts: &Arc<ServerTimeouts>,
+    queue: &mpsc::Sender<ServerEvent>,
+    conn: ConnAddrs,
+) -> Option<crate::http_conn::ConnSlot> {
+    let slot = timeouts.admit();
+    if slot.is_none() && timeouts.js_driven() {
+        let _ = queue.try_send(ServerEvent::Drop { conn });
+    }
+    slot
+}
+
 /// node's checkConnections for a server whose connections JS does not
 /// check (`oam.serve`): every `connectionsCheckingInterval`, with the
 /// server's headers / request timeouts.
@@ -930,20 +962,22 @@ pub async fn http_serve(
     let accept_state = state.clone();
     let accept_tcp = tcp;
     let accept_tcp_ids = tcp_ids;
-    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
                 accepted = listener.accept() => {
-                    let Ok((mut stream, peer)) = accepted else { continue };
-                    let Ok(permit) = connections.clone().try_acquire_owned() else {
-                        drop(stream);
+                    let Ok((mut stream, peer)) = accepted else {
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                         continue;
                     };
                     let conn_addrs = ConnAddrs {
                         remote: peer,
                         local: stream.local_addr().ok(),
+                    };
+                    let Some(slot) = admit(&server_timeouts, &queue_tx, conn_addrs) else {
+                        drop(stream);
+                        continue;
                     };
                     // Everything after the accept runs on the connection's
                     // own task. The upgrade peek below waits for the client's
@@ -958,7 +992,7 @@ pub async fn http_serve(
                     let conn_timeouts = Arc::clone(&server_timeouts);
                     let mut conn_shutdown = shutdown_rx.clone();
                     tokio::spawn(async move {
-                        let permit = permit;
+                        let slot = slot;
                         // node's timeouts hold from the accept: a connection
                         // that never sends a byte is answered 408 once
                         // headersTimeout passes, like any other.
@@ -1002,8 +1036,8 @@ pub async fn http_serve(
 
                         if let Some(consume) = upgrade_head {
                             // The upgraded socket leaves node's http timeouts
-                            // (node drops its 'timeout' handling) and, below,
-                            // the connection cap: it belongs to JS.
+                            // (node drops its 'timeout' handling): it belongs
+                            // to JS.
                             drop(registration);
                             let mut head = vec![0u8; consume];
                             if stream.read_exact(&mut head).await.is_err() {
@@ -1036,12 +1070,14 @@ pub async fn http_serve(
                                 }
                                 Err(error) => refuse_raw(&mut stream, error).await,
                             }
-                            drop(permit);
+                            // The upgraded socket no longer counts toward
+                            // maxConnections (node counts it until it closes).
+                            drop(slot);
                             return;
                         }
 
                         // Normal HTTP: hand to hyper.
-                        let _permit = permit;
+                        let _slot = slot;
                         let _registration = registration;
                         let service_queue = conn_queue.clone();
                         let service_watch = Arc::clone(&watch);
@@ -1624,15 +1660,13 @@ pub async fn https_serve(
     }
 
     let accept_state = state.clone();
-    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
                 accepted = listener.accept() => {
-                    let Ok((stream, peer)) = accepted else { continue };
-                    let Ok(permit) = connections.clone().try_acquire_owned() else {
-                        drop(stream);
+                    let Ok((stream, peer)) = accepted else {
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                         continue;
                     };
                     // Taken from the TCP socket before the TLS handshake
@@ -1641,9 +1675,13 @@ pub async fn https_serve(
                         remote: peer,
                         local: stream.local_addr().ok(),
                     };
+                    let Some(slot) = admit(&server_timeouts, &queue_tx, conn_addrs) else {
+                        drop(stream);
+                        continue;
+                    };
                     let Some(conn_acceptor) = acceptor.clone() else {
                         tokio::spawn(async move {
-                            let _permit = permit;
+                            let _slot = slot;
                             crate::tls::refuse_no_protocols(stream).await;
                         });
                         continue;
@@ -1653,7 +1691,7 @@ pub async fn https_serve(
                     let conn_timeouts = Arc::clone(&server_timeouts);
                     let mut conn_shutdown = shutdown_rx.clone();
                     tokio::spawn(async move {
-                        let _permit = permit;
+                        let _slot = slot;
                         // node's handshakeTimeout (120 s by default): a client
                         // that never completes the handshake is dropped (node
                         // also emits 'tlsClientError', which oam does not).
@@ -1784,6 +1822,11 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
             conn.write_meta(&mut meta);
             super::OpOutcome::Json(meta.to_string())
         }
+        Some(ServerEvent::Drop { conn }) => {
+            let mut meta = serde_json::json!({ "event": "drop" });
+            conn.write_meta(&mut meta);
+            super::OpOutcome::Json(meta.to_string())
+        }
         Some(ServerEvent::Closed { request_id }) => super::OpOutcome::Json(
             serde_json::json!({ "event": "closed", "requestId": request_id }).to_string(),
         ),
@@ -1819,6 +1862,12 @@ pub async fn http2_serve(
     let server_id = state.next_id();
     let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    // node's Http2Server has none of the http server's timeouts, but this
+    // server also takes HTTP/1 and has to wait for a client's first bytes
+    // to tell which: until a connection turns out to be HTTP/2, and for
+    // good when it is HTTP/1, it is held to the http server's defaults,
+    // checked here.
+    let server_timeouts = ServerTimeouts::new(TimeoutSettings::default());
     state
         .servers
         .lock()
@@ -1828,40 +1877,59 @@ pub async fn http2_serve(
             ServerEntry {
                 queue: Some(queue_rx),
                 shutdown: Some(shutdown_tx),
-                // node's Http2Server has no headersTimeout / keepAliveTimeout.
-                timeouts: None,
+                timeouts: Some(Arc::clone(&server_timeouts)),
             },
         );
+    tokio::spawn(check_connections(
+        state.clone(),
+        server_id,
+        Arc::clone(&server_timeouts),
+        shutdown_rx.clone(),
+    ));
 
     let accept_state = state.clone();
-    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     tokio::spawn(async move {
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
                 accepted = listener.accept() => {
-                    let Ok((stream, peer)) = accepted else { continue };
-                    let Ok(permit) = connections.clone().try_acquire_owned() else {
-                        drop(stream);
+                    let Ok((stream, peer)) = accepted else {
+                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                         continue;
                     };
                     let conn_addrs = ConnAddrs {
                         remote: peer,
                         local: stream.local_addr().ok(),
                     };
+                    let Some(slot) = admit(&server_timeouts, &queue_tx, conn_addrs) else {
+                        drop(stream);
+                        continue;
+                    };
                     let conn_state = accept_state.clone();
                     let conn_queue = queue_tx.clone();
+                    let conn_timeouts = Arc::clone(&server_timeouts);
                     let mut conn_shutdown = shutdown_rx.clone();
                     tokio::spawn(async move {
-                        let _permit = permit;
+                        let _slot = slot;
+                        let watch =
+                            ConnWatch::new(conn_state.next_id(), server_id, conn_timeouts.clone());
+                        let registration = conn_state.register_conn(Arc::clone(&watch));
                         // Peek the first bytes to detect HTTP/2 prior-knowledge.
                         // The preface is 24 bytes; TCP segmentation may deliver
                         // fewer on the first peek. Retry a few times with a
-                        // short wait before falling back to HTTP/1.1.
+                        // short wait before falling back to HTTP/1.1. A client
+                        // that sends nothing is closed at headersTimeout.
                         let mut peek_buf = [0u8; 24];
                         let mut is_h2 = false;
                         for _ in 0..3u8 {
-                            match stream.peek(&mut peek_buf).await {
+                            let peeked = tokio::select! {
+                                peeked = stream.peek(&mut peek_buf) => peeked,
+                                _ = conn_shutdown.changed() => return,
+                                // Nothing was said: close without an answer
+                                // (the client may speak HTTP/2).
+                                _ = watch.closed(CloseReason::End) => return,
+                            };
+                            match peeked {
                                 Ok(n) if n >= H2_PREFACE.len() => {
                                     is_h2 = peek_buf[..H2_PREFACE.len()] == *H2_PREFACE;
                                     break;
@@ -1880,20 +1948,21 @@ pub async fn http2_serve(
                             }
                         }
 
-                        let io = hyper_util::rt::TokioIo::new(stream);
-                        let service = hyper::service::service_fn(move |req| {
-                            handle_request(
-                                conn_state.clone(),
-                                conn_queue.clone(),
-                                req,
-                                false, // http2: buffered until a later slice
-                                conn_addrs,
-                                policy,
-                                None,
-                            )
-                        });
-
                         if is_h2 {
+                            // HTTP/2: no timeouts, as in node.
+                            drop(registration);
+                            let io = hyper_util::rt::TokioIo::new(stream);
+                            let service = hyper::service::service_fn(move |req| {
+                                handle_request(
+                                    conn_state.clone(),
+                                    conn_queue.clone(),
+                                    req,
+                                    false, // http2: buffered until a later slice
+                                    conn_addrs,
+                                    policy,
+                                    None,
+                                )
+                            });
                             let conn = hyper::server::conn::http2::Builder::new(
                                 hyper_util::rt::TokioExecutor::new(),
                             )
@@ -1913,21 +1982,31 @@ pub async fn http2_serve(
                                 }
                             }
                         } else {
-                            let conn = http1_builder(policy).serve_connection(io, service);
-                            let mut conn = std::pin::pin!(conn);
-                            let mut shutting_down = false;
-                            loop {
-                                tokio::select! {
-                                    result = conn.as_mut() => {
-                                        let _ = result;
-                                        break;
-                                    }
-                                    _ = conn_shutdown.changed(), if !shutting_down => {
-                                        shutting_down = true;
-                                        conn.as_mut().graceful_shutdown();
-                                    }
-                                }
-                            }
+                            let _registration = registration;
+                            let service_queue = conn_queue.clone();
+                            let service_watch = Arc::clone(&watch);
+                            let service = hyper::service::service_fn(move |req| {
+                                handle_request(
+                                    conn_state.clone(),
+                                    service_queue.clone(),
+                                    req,
+                                    false, // http2: buffered until a later slice
+                                    conn_addrs,
+                                    policy,
+                                    Some(Arc::clone(&service_watch)),
+                                )
+                            });
+                            serve_http1(
+                                stream,
+                                watch,
+                                policy,
+                                service,
+                                conn_queue,
+                                false,
+                                conn_addrs,
+                                conn_shutdown,
+                            )
+                            .await;
                         }
                     });
                 }

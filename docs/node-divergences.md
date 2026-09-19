@@ -1492,7 +1492,7 @@ different answer:
 _(probed)_ Node v22.22.2 (default and `--insecure-http-parser`) and oam, the same 90 raw
 request heads over TCP, and 16 chunked bodies.
 
-### 41. The HTTP server's timeouts: what still differs
+### 41. The HTTP server's timeouts and connection count: what still differs
 
 `http` and `https` servers hold every connection to Node's timeouts, with Node's options,
 defaults and validation: `headersTimeout` and `requestTimeout` (checked every
@@ -1501,7 +1501,9 @@ defaults and validation: `headersTimeout` and `requestTimeout` (checked every
 `keepAliveTimeoutBuffer`, `server.timeout` / `server.setTimeout`, `req.setTimeout`,
 `res.setTimeout` and `req.socket.setTimeout` (a `'timeout'` event on the request, the
 response and the server, and the connection destroyed when none of them listens), and
-https's `handshakeTimeout`. What differs:
+https's `handshakeTimeout`. Like Node's, a server takes connections for as long as the OS
+gives them, unless `server.maxConnections` is set: then a connection that arrives while that
+many are open is closed at once and the server emits `'drop'`. What differs:
 
 - There is no `'clientError'` event, so a request timeout is always answered with the
   `408`; Node hands it to a `'clientError'` listener when there is one. A TLS handshake
@@ -1517,8 +1519,13 @@ https's `handshakeTimeout`. What differs:
 - The server properties the timeouts read (`timeout`, `keepAliveTimeout`,
   `keepAliveTimeoutBuffer`, `headersTimeout`, `requestTimeout`) are accessor properties,
   so an assignment reaches the native server at once; in Node they are data properties.
-- `http2.createServer` applies none of these, to its HTTP/2 or HTTP/1 connections (Node's
-  `Http2Server` has none of them either).
+  `maxConnections` is an accessor on the server's prototype (Node: a plain property,
+  absent until set).
+- A socket handed to an `'upgrade'` listener no longer counts toward `maxConnections`;
+  Node counts it until it closes.
+- `http2.createServer` applies none of these to its HTTP/2 connections, as Node's
+  `Http2Server`. The HTTP/1 connections it also takes are held to the `http` server's
+  default timeouts, which cannot be changed there, and it has no `maxConnections`.
 - `oam.serve` uses Node's defaults (60 s, 300 s, 5 s + 1 s, checked every 30 s), with no
   way to change them.
 

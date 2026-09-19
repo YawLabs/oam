@@ -34,7 +34,7 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -90,13 +90,33 @@ impl Default for TimeoutSettings {
     }
 }
 
-/// A server's current settings, shared by its connections.
+/// A server's current settings, shared by its connections: node's timeouts,
+/// and `maxConnections` with the count it is held against.
 pub struct ServerTimeouts {
     headers: AtomicU64,
     request: AtomicU64,
     keep_alive: AtomicU64,
     socket: AtomicU64,
+    /// node's `server.maxConnections` as the number JS compares with
+    /// (`connections >= maxConnections` refuses a new one), stored as f64
+    /// bits: infinity when it is not set, NaN (never refuses) for a value
+    /// that is not a number.
+    max_connections: AtomicU64,
+    /// Connections being served (node's `server._connections`).
+    connections: AtomicUsize,
     fixed: TimeoutSettings,
+}
+
+/// A connection counted against its server's `maxConnections`, uncounted
+/// when dropped.
+pub struct ConnSlot {
+    timeouts: Arc<ServerTimeouts>,
+}
+
+impl Drop for ConnSlot {
+    fn drop(&mut self) {
+        self.timeouts.connections.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 impl ServerTimeouts {
@@ -106,7 +126,31 @@ impl ServerTimeouts {
             request: AtomicU64::new(settings.request_ms),
             keep_alive: AtomicU64::new(settings.keep_alive_ms),
             socket: AtomicU64::new(settings.socket_ms),
+            max_connections: AtomicU64::new(f64::INFINITY.to_bits()),
+            connections: AtomicUsize::new(0),
             fixed: settings,
+        })
+    }
+
+    /// `server.maxConnections`, as `Number(value)` (infinity when unset).
+    pub fn set_max_connections(&self, limit: f64) {
+        self.max_connections
+            .store(limit.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Count a new connection, or `None` when node would refuse it
+    /// (`connections >= maxConnections`). There is no other limit: like
+    /// node's, the server takes connections while the OS gives them.
+    pub fn admit(self: &Arc<Self>) -> Option<ConnSlot> {
+        let limit = f64::from_bits(self.max_connections.load(Ordering::Relaxed));
+        let live = self.connections.fetch_add(1, Ordering::AcqRel);
+        // `>=` is false for NaN, as in JS.
+        if live as f64 >= limit {
+            self.connections.fetch_sub(1, Ordering::AcqRel);
+            return None;
+        }
+        Some(ConnSlot {
+            timeouts: Arc::clone(self),
         })
     }
 
@@ -716,6 +760,36 @@ mod tests {
         w.set_socket_timeout(0);
         let off = tokio::time::timeout(Duration::from_millis(400), w.next_timeout()).await;
         assert!(off.is_err());
+    }
+
+    /// No limit until maxConnections is set; then `connections >= limit`
+    /// refuses, as node compares it, and a slot counts until it drops.
+    #[test]
+    fn max_connections_is_the_only_limit() {
+        let timeouts = ServerTimeouts::new(TimeoutSettings::default());
+        let unlimited: Vec<ConnSlot> = (0..1000).filter_map(|_| timeouts.admit()).collect();
+        assert_eq!(unlimited.len(), 1000);
+        drop(unlimited);
+        timeouts.set_max_connections(2.0);
+        let a = timeouts.admit().expect("first");
+        let b = timeouts.admit().expect("second");
+        assert!(timeouts.admit().is_none(), "2 >= 2 refuses");
+        drop(a);
+        let c = timeouts.admit().expect("a slot came free");
+        assert!(timeouts.admit().is_none());
+        // A fractional limit: 2 >= 1.5 refuses, 1 >= 1.5 does not.
+        timeouts.set_max_connections(1.5);
+        assert!(timeouts.admit().is_none());
+        drop(b);
+        let d = timeouts.admit().expect("1 of 1.5");
+        // NaN (a value that is not a number) never refuses; 0 always does.
+        timeouts.set_max_connections(f64::NAN);
+        assert!(timeouts.admit().is_some());
+        timeouts.set_max_connections(0.0);
+        drop((c, d));
+        assert!(timeouts.admit().is_none());
+        timeouts.set_max_connections(f64::INFINITY);
+        assert!(timeouts.admit().is_some());
     }
 
     #[tokio::test]

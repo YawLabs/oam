@@ -112,7 +112,10 @@ destroy race, key copy). The three design-shaped items are now also FIXED
   layered over the 100MiB per-request cap, plus a 256-slot connection
   semaphore (`MAX_CONNECTIONS`) on the accept loop. Over-budget uploads
   get 503 (413 only on the per-request cap); excess connections are
-  dropped. Remaining gap: request bodies still buffer fully — streaming
+  dropped. (0.16.3 removed the 256-connection semaphore: a few hundred
+  held connections locked every other client out. Node's timeouts close
+  idle and stalled connections instead, and `server.maxConnections` is
+  the opt-in limit, as in Node.) Remaining gap: request bodies still buffer fully — streaming
   request bodies (so a large upload never buffers at all) is the deferred
   follow-up. Until then a reverse proxy with body limits remains the
   belt-and-suspenders deployment. (http_server.rs)

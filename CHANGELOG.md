@@ -118,8 +118,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `headersTimeout`, `requestTimeout`, `keepAliveTimeout`, `server.timeout` and
   `setTimeout` were stored and ignored, and TLS handshakes had no time limit, so a
   connection that sent nothing, stopped part way through a request, or sat idle between
-  requests stayed open for good; enough of them used up the server's connection limit
-  and kept every other client out. They are now enforced as Node enforces them, with
+  requests stayed open for good. They are now enforced as Node enforces them, with
   Node's defaults (60 s for the headers, 300 s for a request, 5 s plus a 1 s buffer
   between requests, 120 s for a TLS handshake): a late request is answered `408` and
   closed, an idle connection is closed, and the socket timeout emits `'timeout'` on the
@@ -127,6 +126,13 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `connectionsCheckingInterval`, `keepAliveTimeoutBuffer`, `handshakeTimeout`,
   `req.setTimeout` and `res.setTimeout` are supported too, and a response whose
   connection is lost before it is sent now emits `'close'`, as in Node.
+- **`http`, `https` and `http2` servers stopped taking connections at 256.** Each server
+  dropped every new connection once 256 were open, so clients holding that many open,
+  idle or busy, kept everyone else out -- for good on `http2.createServer`, whose
+  connections had no timeouts. That limit is gone: as in Node, a server takes
+  connections for as long as the OS gives them. `server.maxConnections` is supported on
+  `http` and `https` servers, with Node's `'drop'` event, and the HTTP/1 connections of
+  `http2.createServer` are held to the `http` server's default timeouts.
 - **One idle connection stopped an `http` server from accepting.** The server waited
   for a new connection's first bytes before accepting the next one, so a connection
   that sent nothing, such as a browser preconnect, kept every later client waiting. Each

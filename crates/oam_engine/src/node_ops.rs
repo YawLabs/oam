@@ -325,6 +325,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // node's server timeouts (headersTimeout, keepAliveTimeout, ...)
         ("httpServerTimeouts", op_http_server_timeouts),
         ("httpServerExpire", op_http_server_expire),
+        ("httpServerMaxConnections", op_http_server_max_connections),
         ("httpConnSetTimeout", op_http_conn_set_timeout),
         ("httpConnDestroy", op_http_conn_destroy),
         // --max-http-header-size / --insecure-http-parser, as the CLI set them
@@ -2526,6 +2527,21 @@ fn op_http_server_timeouts(
     core_runtime!(scope)
         .http()
         .update_timeouts(server_id, ms[0], ms[1], ms[2], ms[3]);
+}
+
+/// `httpServerMaxConnections(serverId, limit)`: node's
+/// `server.maxConnections` as `Number(value)`, infinity when unset (a
+/// connection is refused while `connections >= limit`; NaN never refuses).
+fn op_http_server_max_connections(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let limit = args.get(1).number_value(scope).unwrap_or(f64::INFINITY);
+    core_runtime!(scope)
+        .http()
+        .set_max_connections(server_id, limit);
 }
 
 /// `httpServerExpire(serverId, headersMs, requestMs)`: node's
