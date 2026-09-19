@@ -27014,16 +27014,11 @@
       };
     }
     // Build a native context, or throw what Node throws: OpenSSL's errors
-    // carry `library`, `reason` and `code`; a PKCS#12 bundle's are plain; a
-    // key protection oam cannot open is ERR_FEATURE_UNAVAILABLE_ON_PLATFORM
-    // (a TypeError, as Node's is).
+    // carry `library`, `reason` and `code`; a PKCS#12 bundle's are plain.
     function buildServerContext(options, versions) {
       var built = JSON.parse(natives.tlsServerContext(JSON.stringify(secureContextSpec(options, versions))));
       if (built.error) {
         var failure = built.error;
-        if (failure.code === "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM") {
-          throw nodeTypeError(failure.message, failure.code);
-        }
         var e = new Error(failure.message);
         if (failure.library !== undefined) e.library = failure.library;
         if (failure.reason !== undefined) e.reason = failure.reason;

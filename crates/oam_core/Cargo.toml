@@ -59,6 +59,11 @@ scrypt = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 md-5 = { workspace = true }
+# Triple-DES for the same keys and bundles (Node reads DES-EDE3-CBC legacy
+# PEM keys, PBES2 des-ede3-cbc and PKCS#12's 3DES PBEs). A NEW crate in the
+# graph (RustCrypto `des`, MIT OR Apache-2.0), whose only dependency is
+# `cipher` 0.4, already built for aes and cbc.
+des = { workspace = true }
 # TLS client/server for node:tls and node:https.
 tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }

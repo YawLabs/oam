@@ -3,26 +3,34 @@
 //! fixtures):
 //!
 //! - a `key` is PEM: PKCS#8, PKCS#1 (RSA) or SEC1 (EC), or an encrypted
-//!   form of one -- PKCS#8 `ENCRYPTED PRIVATE KEY` (PBES2: PBKDF2 or scrypt,
-//!   AES-CBC) or a legacy `Proc-Type: 4,ENCRYPTED` key (AES-CBC, OpenSSL's
-//!   EVP_BytesToKey) -- opened with its `passphrase`. A wrong or missing
-//!   passphrase is `ERR_OSSL_BAD_DECRYPT`; a key that cannot be read at all
-//!   is `ERR_OSSL_UNSUPPORTED`.
+//!   form of one -- PKCS#8 `ENCRYPTED PRIVATE KEY` (PBES2: PBKDF2 or scrypt
+//!   with AES-CBC or DES-EDE3-CBC; or PKCS#12's pbeWithSHAAnd3-KeyTripleDES-CBC
+//!   / pbeWithSHAAnd2-KeyTripleDES-CBC, what `openssl pkcs8 -topk8 -v1
+//!   PBE-SHA1-3DES` and OpenSSL 1.x's default write) or a legacy
+//!   `Proc-Type: 4,ENCRYPTED` key (AES-CBC, DES-EDE3-CBC as `openssl rsa
+//!   -des3` writes it, DES-EDE-CBC; OpenSSL's EVP_BytesToKey) -- opened with
+//!   its `passphrase`. A wrong or missing passphrase is
+//!   `ERR_OSSL_BAD_DECRYPT`; a key that cannot be read at all is
+//!   `ERR_OSSL_UNSUPPORTED`.
 //! - a `pfx` is a PKCS#12 bundle: its MAC is checked with the passphrase
 //!   ("mac verify failure" when it does not verify), then its bags are
-//!   opened -- PBES2-protected (OpenSSL 3's default) or not protected at all.
-//!   RC2 and RC4 protection is refused as Node 22 refuses it ("Unsupported
-//!   PKCS12 PFX data").
+//!   opened -- PBES2-protected (OpenSSL 3's default), protected with
+//!   PKCS#12's own triple-DES PBEs (OpenSSL 1.x's default for keys), or not
+//!   protected at all ("bad decrypt" when a bundle without a MAC does not
+//!   open).
 //!
-//! Triple-DES protection -- a legacy `DES-EDE3-CBC` PEM key, PKCS#8 PBES1
-//! with 3DES, a PKCS#12 bag with pbeWithSHAAnd3-KeyTripleDES-CBC -- is one
-//! Node reads and oam does not: it has no DES implementation. Such a key is
-//! refused with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`, never loaded wrong.
+//! What Node 22 refuses, oam refuses the same way: the ciphers OpenSSL 3
+//! keeps in its legacy provider -- single DES (legacy PEM `DES-CBC`, PBES2
+//! des-cbc, the PKCS#5 v1.5 PBES1 schemes), RC2, RC4, Blowfish, CAST5, IDEA,
+//! SEED -- are `ERR_OSSL_EVP_UNSUPPORTED` for a `key` and "Unsupported
+//! PKCS12 PFX data" in a `pfx`, whatever the passphrase.
 //! The ASN.1 read here is BER, which covers DER and the indefinite lengths
 //! and constructed strings some PKCS#12 writers emit.
 
 use super::server::ContextError;
 use aes::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
+// Triple-DES comes from the RustCrypto `des` crate, on the same `cipher`
+// traits as `aes`.
 use hmac::Mac;
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs1KeyDer, PrivatePkcs8KeyDer, PrivateSec1KeyDer,
@@ -38,17 +46,6 @@ pub struct Pkcs12Bundle {
 
 // ------------------------------------------------------------------ errors
 
-fn unavailable(feature: &str) -> ContextError {
-    ContextError {
-        message: format!(
-            "The feature {feature} is unavailable on the current platform, which is being used to run oam"
-        ),
-        code: Some("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM"),
-        library: None,
-        reason: None,
-    }
-}
-
 fn unsupported_pfx() -> ContextError {
     ContextError::plain(
         "Unsupported PKCS12 PFX data",
@@ -58,6 +55,12 @@ fn unsupported_pfx() -> ContextError {
 
 fn mac_verify_failure() -> ContextError {
     ContextError::plain("mac verify failure", None)
+}
+
+/// A bundle without a MAC whose bags do not open with the passphrase:
+/// OpenSSL's cipher error, the reason alone (measured).
+fn pfx_bad_decrypt() -> ContextError {
+    ContextError::plain("bad decrypt", None)
 }
 
 /// OpenSSL's ASN.1 decoder's words for a bundle it cannot parse.
@@ -214,6 +217,10 @@ const OID_AES128_CBC: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 
 const OID_AES192_CBC: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x16];
 const OID_AES256_CBC: &[u8] = &[0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x01, 0x2a];
 const OID_DES_EDE3_CBC: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x03, 0x07];
+/// desCBC (1.3.14.3.2.7) and rc2CBC (1.2.840.113549.3.2): PBES2 schemes
+/// whose ciphers OpenSSL 3 keeps in its legacy provider.
+const OID_DES_CBC: &[u8] = &[0x2b, 0x0e, 0x03, 0x02, 0x07];
+const OID_RC2_CBC: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x03, 0x02];
 /// pkcs-12PbeIds: 1.2.840.113549.1.12.1.{1..6} (RC4-128, RC4-40, 3DES,
 /// 2-key 3DES, RC2-128, RC2-40).
 const OID_PKCS12_PBE_PREFIX: &[u8] = &[0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x0c, 0x01];
@@ -343,23 +350,57 @@ fn digest_output(hash: Hash) -> usize {
 
 // ------------------------------------------------------------- decryption
 
-/// AES-CBC with PKCS#7 padding. None when the padding does not check out --
-/// the wrong key, which is how OpenSSL learns the passphrase was wrong.
-fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Option<Vec<u8>> {
-    match key.len() {
-        16 => cbc::Decryptor::<aes::Aes128>::new_from_slices(key, iv)
-            .ok()?
-            .decrypt_padded_vec_mut::<Pkcs7>(data)
-            .ok(),
-        24 => cbc::Decryptor::<aes::Aes192>::new_from_slices(key, iv)
-            .ok()?
-            .decrypt_padded_vec_mut::<Pkcs7>(data)
-            .ok(),
-        32 => cbc::Decryptor::<aes::Aes256>::new_from_slices(key, iv)
-            .ok()?
-            .decrypt_padded_vec_mut::<Pkcs7>(data)
-            .ok(),
-        _ => None,
+/// The CBC block ciphers keys and bundles are protected with, among those
+/// OpenSSL 3's default provider has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BlockCipher {
+    Aes128,
+    Aes192,
+    Aes256,
+    /// Three-key triple DES (DES-EDE3-CBC).
+    DesEde3,
+    /// Two-key triple DES (DES-EDE-CBC: the third key is the first).
+    DesEde,
+}
+
+impl BlockCipher {
+    fn key_len(self) -> usize {
+        match self {
+            BlockCipher::Aes128 | BlockCipher::DesEde => 16,
+            BlockCipher::Aes192 | BlockCipher::DesEde3 => 24,
+            BlockCipher::Aes256 => 32,
+        }
+    }
+
+    fn iv_len(self) -> usize {
+        match self {
+            BlockCipher::Aes128 | BlockCipher::Aes192 | BlockCipher::Aes256 => 16,
+            BlockCipher::DesEde3 | BlockCipher::DesEde => 8,
+        }
+    }
+}
+
+/// CBC with PKCS#7 padding. None when the key or IV has the wrong length,
+/// or the padding does not check out -- the wrong key, which is how OpenSSL
+/// learns the passphrase was wrong.
+fn cbc_decrypt(cipher: BlockCipher, key: &[u8], iv: &[u8], data: &[u8]) -> Option<Vec<u8>> {
+    macro_rules! decrypt {
+        ($c:ty) => {
+            cbc::Decryptor::<$c>::new_from_slices(key, iv)
+                .ok()?
+                .decrypt_padded_vec_mut::<Pkcs7>(data)
+                .ok()
+        };
+    }
+    if key.len() != cipher.key_len() || iv.len() != cipher.iv_len() {
+        return None;
+    }
+    match cipher {
+        BlockCipher::Aes128 => decrypt!(aes::Aes128),
+        BlockCipher::Aes192 => decrypt!(aes::Aes192),
+        BlockCipher::Aes256 => decrypt!(aes::Aes256),
+        BlockCipher::DesEde3 => decrypt!(des::TdesEde3),
+        BlockCipher::DesEde => decrypt!(des::TdesEde2),
     }
 }
 
@@ -367,41 +408,100 @@ fn aes_cbc_decrypt(key: &[u8], iv: &[u8], data: &[u8]) -> Option<Vec<u8>> {
 enum Refusal {
     /// The password does not open it.
     BadDecrypt,
-    /// An algorithm Node reads and oam cannot (DES); the feature's name.
-    Unavailable(&'static str),
-    /// An algorithm Node 22 refuses too (RC2, RC4, ...).
+    /// A cipher OpenSSL 3 keeps in its legacy provider (DES, RC2, RC4, ...),
+    /// which Node 22 does not load: refused whatever the password.
+    Legacy,
+    /// An algorithm that is not known here.
     Unsupported,
     /// Not a structure that can be read.
     Malformed,
 }
 
+/// A password as each scheme reads it: PBES2 (PBKDF2 or scrypt) and
+/// OpenSSL's legacy PEM KDF take its bytes; PKCS#12's own KDF takes it as a
+/// BMPString -- with its two-byte terminator, or, for a bundle opened with
+/// no password at all, as nothing (OpenSSL's NULL password).
+struct Password {
+    bytes: Vec<u8>,
+    bmp: Vec<u8>,
+}
+
+impl Password {
+    fn new(password: &str) -> Self {
+        Password {
+            bytes: password.as_bytes().to_vec(),
+            bmp: bmp_password(password),
+        }
+    }
+}
+
 /// Decrypt `data` under an AlgorithmIdentifier: PBES2 (PBKDF2 or scrypt
-/// with AES-CBC) with the password as given, or PKCS#12's own PBE ids.
-fn decrypt(algorithm: &Tlv<'_>, data: &[u8], password: &[u8]) -> Result<Vec<u8>, Refusal> {
+/// with AES-CBC or DES-EDE3-CBC), or PKCS#12's own triple-DES PBEs.
+fn decrypt(algorithm: &Tlv<'_>, data: &[u8], password: &Password) -> Result<Vec<u8>, Refusal> {
     let parts = children(algorithm).ok_or(Refusal::Malformed)?;
     let oid = expect(parts.first(), OID).ok_or(Refusal::Malformed)?;
     if oid.content == OID_PBES2 {
         let params = expect(parts.get(1), SEQUENCE).ok_or(Refusal::Malformed)?;
-        return pbes2_decrypt(&params, data, password);
+        return pbes2_decrypt(&params, data, &password.bytes);
     }
     if oid.content.len() == OID_PKCS12_PBE_PREFIX.len() + 1
         && oid.content.starts_with(OID_PKCS12_PBE_PREFIX)
     {
-        return Err(match oid.content[OID_PKCS12_PBE_PREFIX.len()] {
-            3 | 4 => Refusal::Unavailable(
-                "PKCS#12 triple-DES encryption (pbeWithSHAAnd3-KeyTripleDES-CBC)",
-            ),
-            _ => Refusal::Unsupported,
-        });
+        let cipher = match oid.content[OID_PKCS12_PBE_PREFIX.len()] {
+            3 => BlockCipher::DesEde3,
+            4 => BlockCipher::DesEde,
+            // RC4-128, RC4-40, RC2-128, RC2-40.
+            1 | 2 | 5 | 6 => return Err(Refusal::Legacy),
+            _ => return Err(Refusal::Unsupported),
+        };
+        let params = expect(parts.get(1), SEQUENCE).ok_or(Refusal::Malformed)?;
+        return pkcs12_pbe_decrypt(&params, cipher, data, &password.bmp);
     }
     if oid.content.len() == OID_PBES1_PREFIX.len() + 1 && oid.content.starts_with(OID_PBES1_PREFIX)
     {
-        // PKCS#5 v1: DES or RC2.
-        return Err(Refusal::Unavailable(
-            "PKCS#5 v1.5 key encryption (DES or RC2)",
-        ));
+        // PKCS#5 v1.5 PBES1: pbeWith{MD2,MD5,SHA1}And{DES,RC2}-CBC, all of it
+        // single DES or RC2.
+        return Err(match oid.content[OID_PBES1_PREFIX.len()] {
+            1 | 3 | 4 | 6 | 10 | 11 => Refusal::Legacy,
+            _ => Refusal::Unsupported,
+        });
     }
     Err(Refusal::Unsupported)
+}
+
+/// PKCS#12's PBE (RFC 7292 appendix C): the key and IV derived from the
+/// BMPString password with SHA-1 (ids 1 and 2), the salt and iteration count
+/// from `params` (pkcs-12PbeParams).
+fn pkcs12_pbe_decrypt(
+    params: &Tlv<'_>,
+    cipher: BlockCipher,
+    data: &[u8],
+    bmp_password: &[u8],
+) -> Result<Vec<u8>, Refusal> {
+    let fields = children(params).ok_or(Refusal::Malformed)?;
+    let salt = expect(fields.first(), OCTET_STRING).ok_or(Refusal::Malformed)?;
+    let iterations = fields
+        .get(1)
+        .and_then(small_uint)
+        .ok_or(Refusal::Malformed)?;
+    let iterations = u32::try_from(iterations).map_err(|_| Refusal::Malformed)?;
+    let key = pkcs12_kdf_for(
+        Hash::Sha1,
+        bmp_password,
+        salt.content,
+        1,
+        iterations,
+        cipher.key_len(),
+    );
+    let iv = pkcs12_kdf_for(
+        Hash::Sha1,
+        bmp_password,
+        salt.content,
+        2,
+        iterations,
+        cipher.iv_len(),
+    );
+    cbc_decrypt(cipher, &key, &iv, data).ok_or(Refusal::BadDecrypt)
 }
 
 fn pbes2_decrypt(params: &Tlv<'_>, data: &[u8], password: &[u8]) -> Result<Vec<u8>, Refusal> {
@@ -410,13 +510,15 @@ fn pbes2_decrypt(params: &Tlv<'_>, data: &[u8], password: &[u8]) -> Result<Vec<u
     let scheme = expect(parts.get(1), SEQUENCE).ok_or(Refusal::Malformed)?;
     let scheme_parts = children(&scheme).ok_or(Refusal::Malformed)?;
     let scheme_oid = expect(scheme_parts.first(), OID).ok_or(Refusal::Malformed)?;
-    let key_len = match scheme_oid.content {
-        OID_AES128_CBC => 16,
-        OID_AES192_CBC => 24,
-        OID_AES256_CBC => 32,
-        OID_DES_EDE3_CBC => return Err(Refusal::Unavailable("DES-EDE3-CBC key encryption")),
+    let cipher = match scheme_oid.content {
+        OID_AES128_CBC => BlockCipher::Aes128,
+        OID_AES192_CBC => BlockCipher::Aes192,
+        OID_AES256_CBC => BlockCipher::Aes256,
+        OID_DES_EDE3_CBC => BlockCipher::DesEde3,
+        OID_DES_CBC | OID_RC2_CBC => return Err(Refusal::Legacy),
         _ => return Err(Refusal::Unsupported),
     };
+    let key_len = cipher.key_len();
     let iv = expect(scheme_parts.get(1), OCTET_STRING).ok_or(Refusal::Malformed)?;
 
     let kdf_parts = children(&kdf).ok_or(Refusal::Malformed)?;
@@ -480,11 +582,11 @@ fn pbes2_decrypt(params: &Tlv<'_>, data: &[u8], password: &[u8]) -> Result<Vec<u
         }
         _ => return Err(Refusal::Unsupported),
     }
-    aes_cbc_decrypt(&key, iv.content, data).ok_or(Refusal::BadDecrypt)
+    cbc_decrypt(cipher, &key, iv.content, data).ok_or(Refusal::BadDecrypt)
 }
 
 /// An EncryptedPrivateKeyInfo opened with `password`: the PKCS#8 key inside.
-fn decrypt_private_key_info(der: &[u8], password: &[u8]) -> Result<Vec<u8>, Refusal> {
+fn decrypt_private_key_info(der: &[u8], password: &Password) -> Result<Vec<u8>, Refusal> {
     let info = parse(der)
         .filter(|t| t.tag == SEQUENCE)
         .ok_or(Refusal::Malformed)?;
@@ -616,10 +718,26 @@ fn hex_bytes(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// A legacy PEM key's `DEK-Info` cipher: one this reads, or None for one
+/// OpenSSL 3 keeps in its legacy provider (Node refuses those whatever the
+/// passphrase) -- and Err for a name that is neither.
+fn dek_info_cipher(name: &str) -> Result<Option<BlockCipher>, ContextError> {
+    Ok(Some(match name {
+        "AES-128-CBC" => BlockCipher::Aes128,
+        "AES-192-CBC" => BlockCipher::Aes192,
+        "AES-256-CBC" => BlockCipher::Aes256,
+        "DES-EDE3-CBC" => BlockCipher::DesEde3,
+        "DES-EDE-CBC" => BlockCipher::DesEde,
+        "DES-CBC" | "DESX-CBC" | "RC2-CBC" | "RC2-40-CBC" | "RC2-64-CBC" | "BF-CBC"
+        | "CAST5-CBC" | "CAST-CBC" | "IDEA-CBC" | "SEED-CBC" => return Ok(None),
+        _ => return Err(ContextError::unsupported_key()),
+    }))
+}
+
 fn refusal_error(refusal: Refusal) -> ContextError {
     match refusal {
         Refusal::BadDecrypt => ContextError::bad_decrypt(),
-        Refusal::Unavailable(feature) => unavailable(feature),
+        Refusal::Legacy => ContextError::evp_unsupported(),
         Refusal::Unsupported | Refusal::Malformed => ContextError::unsupported_key(),
     }
 }
@@ -631,16 +749,15 @@ pub fn load_private_key(
 ) -> Result<PrivateKeyDer<'static>, ContextError> {
     let text = String::from_utf8_lossy(pem);
     let block = first_key_block(&text).ok_or_else(ContextError::unsupported_key)?;
-    let password = passphrase.map(str::as_bytes);
+    // No passphrase at all: OpenSSL's password callback gives it nothing
+    // (an empty one), and the decryption fails the same way.
+    let password = Password::new(passphrase.unwrap_or(""));
     match block.label.as_str() {
         "PRIVATE KEY" if is_private_key_info(&block.der) => {
             Ok(PrivatePkcs8KeyDer::from(block.der).into())
         }
         "ENCRYPTED PRIVATE KEY" => {
-            // No passphrase at all: OpenSSL's password callback gives it
-            // nothing, and the decryption fails the same way.
-            let plain = decrypt_private_key_info(&block.der, password.unwrap_or(b""))
-                .map_err(refusal_error)?;
+            let plain = decrypt_private_key_info(&block.der, &password).map_err(refusal_error)?;
             Ok(PrivatePkcs8KeyDer::from(plain).into())
         }
         label @ ("RSA PRIVATE KEY" | "EC PRIVATE KEY") => {
@@ -658,21 +775,14 @@ pub fn load_private_key(
                 let (cipher, iv_hex) = dek
                     .split_once(',')
                     .ok_or_else(ContextError::unsupported_key)?;
-                let key_len = match cipher.trim() {
-                    "AES-128-CBC" => 16,
-                    "AES-192-CBC" => 24,
-                    "AES-256-CBC" => 32,
-                    "DES-EDE3-CBC" | "DES-CBC" => {
-                        return Err(unavailable("DES-EDE3-CBC key encryption"));
-                    }
-                    _ => return Err(ContextError::unsupported_key()),
-                };
+                let cipher =
+                    dek_info_cipher(cipher.trim())?.ok_or_else(ContextError::evp_unsupported)?;
                 let iv = hex_bytes(iv_hex.trim()).ok_or_else(ContextError::unsupported_key)?;
-                if iv.len() != 16 {
+                if iv.len() != cipher.iv_len() {
                     return Err(ContextError::unsupported_key());
                 }
-                let key = evp_bytes_to_key(password.unwrap_or(b""), &iv[..8], key_len);
-                aes_cbc_decrypt(&key, &iv, &block.der)
+                let key = evp_bytes_to_key(&password.bytes, &iv[..8], cipher.key_len());
+                cbc_decrypt(cipher, &key, &iv, &block.der)
                     .filter(|plain| is_versioned_sequence(plain))
                     .ok_or_else(ContextError::bad_decrypt)?
             } else {
@@ -713,9 +823,15 @@ fn bmp_password(password: &str) -> Vec<u8> {
     out
 }
 
-/// Check a PFX's MAC with `password` (OpenSSL also accepts, for an empty
-/// password, the MAC made with no password at all).
-fn verify_mac(mac_data: &Tlv<'_>, auth_safe: &[u8], password: &str) -> Result<(), ContextError> {
+/// Check a PFX's MAC with `password`, and say which form of it the MAC was
+/// made with -- the one its bags are then opened with. OpenSSL's
+/// PKCS12_parse: an empty password is tried as no password at all (NULL)
+/// first, then as the empty BMPString.
+fn verify_mac(
+    mac_data: &Tlv<'_>,
+    auth_safe: &[u8],
+    password: &str,
+) -> Result<Vec<u8>, ContextError> {
     let parts = children(mac_data).ok_or_else(malformed_pfx)?;
     let digest_info = expect(parts.first(), SEQUENCE).ok_or_else(malformed_pfx)?;
     let salt = expect(parts.get(1), OCTET_STRING).ok_or_else(malformed_pfx)?;
@@ -738,10 +854,11 @@ fn verify_mac(mac_data: &Tlv<'_>, auth_safe: &[u8], password: &str) -> Result<()
         OID_SHA512 => Hash::Sha512,
         _ => return Err(unsupported_pfx()),
     };
-    let mut candidates = vec![bmp_password(password)];
-    if password.is_empty() {
-        candidates.push(Vec::new());
-    }
+    let candidates = if password.is_empty() {
+        vec![Vec::new(), bmp_password(password)]
+    } else {
+        vec![bmp_password(password)]
+    };
     for candidate in candidates {
         let key = pkcs12_kdf_for(
             hash,
@@ -752,16 +869,26 @@ fn verify_mac(mac_data: &Tlv<'_>, auth_safe: &[u8], password: &str) -> Result<()
             digest_output(hash),
         );
         if hmac_verify(hash, &key, auth_safe, tag.content) {
-            return Ok(());
+            return Ok(candidate);
         }
     }
     Err(mac_verify_failure())
 }
 
+/// A bag or SafeContents that did not open, as Node reports it for a
+/// bundle.
+fn pfx_refusal(refusal: Refusal) -> ContextError {
+    match refusal {
+        Refusal::Legacy | Refusal::Unsupported => unsupported_pfx(),
+        Refusal::BadDecrypt => pfx_bad_decrypt(),
+        Refusal::Malformed => malformed_pfx(),
+    }
+}
+
 /// The bags of one SafeContents.
 fn read_bags(
     safe_contents: &[u8],
-    password: &str,
+    password: &Password,
     bundle: &mut Pkcs12Bundle,
 ) -> Result<(), ContextError> {
     let bags = parse(safe_contents)
@@ -788,14 +915,7 @@ fn read_bags(
             OID_SHROUDED_KEY_BAG => {
                 if bundle.key.is_none() {
                     let der = value_bytes(&value);
-                    let plain =
-                        decrypt_private_key_info(&der, password.as_bytes()).map_err(|refusal| {
-                            match refusal {
-                                Refusal::Unavailable(feature) => unavailable(feature),
-                                Refusal::Unsupported => unsupported_pfx(),
-                                Refusal::BadDecrypt | Refusal::Malformed => mac_verify_failure(),
-                            }
-                        })?;
+                    let plain = decrypt_private_key_info(&der, password).map_err(pfx_refusal)?;
                     bundle.key = Some(PrivatePkcs8KeyDer::from(plain).into());
                 }
             }
@@ -849,9 +969,18 @@ pub fn load_pkcs12(der: &[u8], password: &str) -> Result<Pkcs12Bundle, ContextEr
     // Only password integrity mode (authSafe is `data`); public-key mode
     // (signedData) is not something a server's pfx uses.
     let auth_safe = content_info_data(&auth_safe_info).ok_or_else(unsupported_pfx)?;
-    if let Some(mac_data) = parts.get(2).filter(|t| t.tag == SEQUENCE) {
-        verify_mac(mac_data, &auth_safe, password)?;
-    }
+    // The password the bags are opened with: the form the MAC verified
+    // with; without a MAC, an empty password is no password at all (NULL),
+    // as in OpenSSL's PKCS12_parse.
+    let bmp = match parts.get(2).filter(|t| t.tag == SEQUENCE) {
+        Some(mac_data) => verify_mac(mac_data, &auth_safe, password)?,
+        None if password.is_empty() => Vec::new(),
+        None => bmp_password(password),
+    };
+    let password = Password {
+        bytes: password.as_bytes().to_vec(),
+        bmp,
+    };
     let infos = parse(&auth_safe)
         .filter(|t| t.tag == SEQUENCE)
         .and_then(|t| children(&t))
@@ -866,7 +995,7 @@ pub fn load_pkcs12(der: &[u8], password: &str) -> Result<Pkcs12Bundle, ContextEr
         match kind.content {
             OID_DATA => {
                 let contents = content_info_data(&info).ok_or_else(malformed_pfx)?;
-                read_bags(&contents, password, &mut bundle)?;
+                read_bags(&contents, &password, &mut bundle)?;
             }
             OID_ENCRYPTED_DATA => {
                 // EncryptedData { version, EncryptedContentInfo { type,
@@ -885,15 +1014,8 @@ pub fn load_pkcs12(der: &[u8], password: &str) -> Result<Pkcs12Bundle, ContextEr
                     .filter(|t| t.tag == CONTEXT_0_PRIMITIVE || t.tag == CONTEXT_0)
                     .and_then(octets)
                     .ok_or_else(malformed_pfx)?;
-                let plain =
-                    decrypt(&algorithm, &content, password.as_bytes()).map_err(|refusal| {
-                        match refusal {
-                            Refusal::Unavailable(feature) => unavailable(feature),
-                            Refusal::Unsupported => unsupported_pfx(),
-                            Refusal::BadDecrypt | Refusal::Malformed => mac_verify_failure(),
-                        }
-                    })?;
-                read_bags(&plain, password, &mut bundle)?;
+                let plain = decrypt(&algorithm, &content, &password).map_err(pfx_refusal)?;
+                read_bags(&plain, &password, &mut bundle)?;
             }
             _ => return Err(unsupported_pfx()),
         }
@@ -1200,6 +1322,297 @@ vQ3X/yxmd5kvqhBL+/kVVYKt+nCNBif4OiEhH1Y7BVx++nn3B68o0tz4ujGkCVhBr7ciHEkO9MGZ\
 FRIyKlhZaN7deKk6b3KCpnE0BrRdMSUwIwYJKoZIhvcNAQkVMRYEFAu0P/nWx80ynJU4nJWQeCB4\
 w29NMDEwITAJBgUrDgMCGgUABBS37T1BnrJ+DyZm5AbR8yO+OwohTAQIUrF+Vk8e3TsCAggA";
 
+    // The Triple-DES forms Node reads, and the legacy ones it refuses, made
+    // with OpenSSL 3.5 from the same key and certificate ("hunter2"; the
+    // single-DES, RC4 and Blowfish ones with its legacy provider): `openssl
+    // pkcs8 -topk8 -v2 des3`, `-v1 PBE-SHA1-2DES`, `-v2 des-cbc`, `-v1
+    // PBE-SHA1-DES`, `-v1 PBE-SHA1-RC4-128`; `openssl ec -des-ede-cbc`,
+    // `-des`, `-bf`; `openssl pkcs12 -export` with `-keypbe/-certpbe`
+    // PBE-SHA1-2DES, PBE-SHA1-3DES (with `-nomac`, and with an empty
+    // password), DES-EDE3-CBC (PBES2), PBE-SHA1-RC4-128 for the key, DES-CBC
+    // for the certificates. RSA_CERT is a self-signed RSA-2048 localhost
+    // certificate (2025-2125) and ENC_RSA_TRAD_DES3 its key under
+    // `openssl rsa -traditional -des3`.
+    const RSA_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDOjCCAiKgAwIBAgIUf1VzZQLeHSMvtbWoevGmWX5gK6swDQYJKoZIhvcNAQEL\n\
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI1MDEwMTAwMDAwMFoYDzIxMjUw\n\
+MTAxMDAwMDAwWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEB\n\
+AQUAA4IBDwAwggEKAoIBAQDGp86nCMj9sUkOCDNHNFtrWOpKWk88GdDGl8LyL/Zm\n\
+bpZF5I0uQzuha+i+Iw+bcveNV4I/oEqlsiT0kxZ6DWf2p7rRi2MPAVIyKXeJZ2rS\n\
+2FrTmPEsE5qGQrjtS7xe946+vg18BsW/88d/SriUOs2JlyUPwBCPsczS5h7duSWf\n\
+OryWIdChwd8HL2OdLOhThsJnLykwLb2L313Exa3/BUpAoJLd7IMTKxqfljJ2SDqg\n\
+qeZhJ0owgfmO3HaUWCr1KEO6VinbaNoiG2XgLbt1u7kI9Mxe+Vf774NLxYtC/txx\n\
+X63wAZSJGMxVoeU1u5bHglx4m8VxB+f4Mc+n+uDnhQ9nAgMBAAGjgYEwfzAdBgNV\n\
+HQ4EFgQUISnpzi3j+HUmwVrlbBgKO9+sfCcwHwYDVR0jBBgwFoAUISnpzi3j+HUm\n\
+wVrlbBgKO9+sfCcwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAwGA1UdEwEB\n\
+/wQCMAAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDQYJKoZIhvcNAQELBQADggEBAEj4\n\
+P36dacT99r1ufz4gZbaxQsnJNakKjR0padxYmhBUEMOYS379zI99V5CQgU2HBxsg\n\
+SI7r9mpg1HZMadU3h6jwXMqoB24yQqAsDMvzb9RQJRhmsdDh9OA+s6GD6kQ/A3B4\n\
+7c+TZ1tKb3C4+MT8rXHMwbVCdvRvXZVQEvYqgHXkO3rpxS7plIJYEzp+fJabIE0W\n\
+7+7ZJkdYLKVewrMqBAgTTeon1PpDI3Mm15isrNGVUWUHmRdFTvgGiqPx88fPZgQU\n\
+mD/x+mHTitbbNtAS318UHtGXruOBUR+xNhf6pxe9hi2A+wW4nTv29ZsdoXSfCh38\n\
+fNThpA0GAZlUS/aJE3g=\n\
+-----END CERTIFICATE-----\n";
+
+    const ENC_RSA_TRAD_DES3: &str = "-----BEGIN RSA PRIVATE KEY-----\n\
+Proc-Type: 4,ENCRYPTED\n\
+DEK-Info: DES-EDE3-CBC,46AAEB545508ED53\n\
+\n\
+Ovspc0v14Ml+wwbVpv0j+asHnISUL0GJR1qLG3cikRitgkDFobcz7xR7JzpyChLZ\n\
+hhV/j/q69mmzHEylYCEeMya06bYmYyMXsulCih5VDKljBDJp9PpJpOVGfjNvGugJ\n\
+H6WxHYFEaHrxRtpxhwHCZ0Xw6zejMc0IKQ7WROgHJ8W9OM3ePqCgryWBtyvcPMxB\n\
+s28t8cw34jOjhSGpwR0EmJyTEnS8SkX91cwXmWVmgOhCYrPhTd0se1J+nFdZItwd\n\
+Ru1woqNGWkrkjEtIC/uNY4BAjCyx7y6udJm/TV6l2xKFIaOMPyh2gjRQ+SnSCIst\n\
+yy2cvlQsdj9St/TOWlU8PVew17yQSKnxvUs7uuleMHwSxUz4K7sFS+h5G/BdJU7/\n\
+rw5N+v1/N5InPDbiywaMbV9M8lZCqC43kJB8j4JCRgwC/pQavSXF8m6A2gfFaEvF\n\
+qbhwgr/5DdXXHUfGR1ZFYeSu9TvJx71KTFgfOnUkBaj/aqwRm6LAIMBi2fKBM/gx\n\
+Ozn7w8KT1yOB7KuRALeZv9ceu8nYfI4hH/ikwTSfqcTFEUUZsAe2lUiJHvQ9fyxp\n\
+Og6cUzOvJBLyHeoReLkYiyog4Qw3AqQF5NWOeiTGgaVq9TrFGyi2bkscNfkOwulE\n\
+4BR6P3TTpYELJLCRQVoC3ocHSCST4nDAS7Tw2/DvB76LsWbj9aUSNMMypK76TCMq\n\
+c8ggKYgmKszTeGWf/lerwLelNM2R0vWApM5sZ3TUJAS+w04cNhzLbyp5+HbfT7Aj\n\
+5zYCFZHsYdPuLslXWbgJj80FY6oBbvzpWChnhZSh7vma0w9cingbjiTpiOeppHUJ\n\
+rraKxub0lpczQ2mwvSYP4jUY4xMJ4gz+jAZq6gwsUGMi0dJL02d8wyiPuSek/V6p\n\
+gYJqKTGh0npPBFWpdIMeUdWIhbRPwyf1cO2t3CrSDbVyayi8pZTioGG1948iQxzJ\n\
++bEfXqbgg7QeIRgcgAb1x1jF1gJe1h8krurfdGwQZRel9u96x/BnSCaXP21lpIzZ\n\
+r+P6eFQZ32o9Ms5ft3szYNvJMjCcUVg+66ekCfs+LxNbaBr4p3b06lOL/8Pm1MDL\n\
+gGvcLTRCjojBMU0y8nKSnP6GcQ7w+gv+59IQuYKYTQZSvFSUUU9gN9H3t4gYYMfm\n\
+IkRUv6jWPu9ikKdXNVLAXNvLNnzvalZqOu/q4TUTelYvtYd4ctH8DiFlnyyvg7QQ\n\
+BYC0VT0shb6oosvzHK7qnJfUvvJIFdYY/FhkDzOFhN+NkTTW1f43e37rGrIEylZ6\n\
++y9W5vZEO0PS+/fp7eavAOwDjHYiUOv2tur/tePxoyZ3RgcXKBdM35l4884D4YGK\n\
+U5WTDpoqjQK/jrOMOWeADJWqw0V3+8ldLOMNPCWHxGEDWjCEwYUEKHeQQCw/FIYV\n\
+Zq94PmIsTWzyHj5780lsRhDumOcxSQbVmmcDLGf6wEz8UrD35jpCm0Gj6UPDnkZj\n\
+whl/IY0hwv6Sgu8+bgWNsm8wBJr9odSF5LvBmCusxuIPUU6wl2u01iK7NC+ZWC/c\n\
+NTtYepmISqR6miBpc/UGSkhHXCkMkoNHNnVbBKkpKS5s+azOj8Y9ag==\n\
+-----END RSA PRIVATE KEY-----\n";
+
+    const ENC_TRAD_DES_EDE: &str = "-----BEGIN EC PRIVATE KEY-----\n\
+Proc-Type: 4,ENCRYPTED\n\
+DEK-Info: DES-EDE-CBC,7DD01BED1D39F781\n\
+\n\
+nSV0BqKkdId7aC/nC4ZnZKBUheSMSBGTO9V5Zt3F1UqS5pTI70+BKCZsZh3FPXVK\n\
+uW4xZHg0/0HVt7/ze2xm8L9G8q8iWY3+FFgygOKqMMDEhnYuB4EVFdNFafplcsdB\n\
+2sIP+EE8+1iBG24VTPQUqmAiqotkgq5khof8sf+Nkcs=\n\
+-----END EC PRIVATE KEY-----\n";
+
+    const ENC_PKCS8_PBES2_DES3: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----\n\
+MIHrMFYGCSqGSIb3DQEFDTBJMDEGCSqGSIb3DQEFDDAkBBD9aACEjjKNdZrgKR0K\n\
+ezkHAgIIADAMBggqhkiG9w0CCQUAMBQGCCqGSIb3DQMHBAiEh9vtokF2RwSBkHxG\n\
+VnoOwJGBIajQPEWWAN8CzemN272fEIlmQ8l4/G3pk3k1RQOWkX4H8cPTDHX9AaZG\n\
+1M41J4HRbA6w8Fxy8OMlyB7l0jEU3SXMZfjMGKvHSqsPHm4ts90bj3EjbJsGga9m\n\
+o1HR+/uVpqC2pHbjoQYGrEnKp7Y6MJC93M8C6DezrW4cta0NampF+cMT8mf2dg==\n\
+-----END ENCRYPTED PRIVATE KEY-----\n";
+
+    const ENC_PKCS8_2DES: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----\n\
+MIGxMBwGCiqGSIb3DQEMAQQwDgQIInyAOdpEAsECAggABIGQHIxRKjWcb5ZoLlwi\n\
+JGBUs1ql3RJxK/ULXT+e3M7rAPqjfepcU47/dzlow9HOnb9Ckzd24mPlWoWBNIRi\n\
+fE3u5rHMn1ylnGEr+ht/XRC3wjR+3ErrbmSgn0UdPMo6nicaXqFbnMx1opnz8d6v\n\
+ftNCTVUaRgTfONvO0Ag8att3GtTD6H5pL/pvYPzLgEocX7sn\n\
+-----END ENCRYPTED PRIVATE KEY-----\n";
+
+    const ENC_TRAD_DES: &str = "-----BEGIN EC PRIVATE KEY-----\n\
+Proc-Type: 4,ENCRYPTED\n\
+DEK-Info: DES-CBC,68B04ACA935C95A8\n\
+\n\
+0hWLqyoOsPJQgh3jSCHSg96QE0LAM24j6h4R0X+a8vsFd3yV1QCm0y3PxCNM4Tg9\n\
+lkQg4c00M4W2DAzRIZuZ7pqMLu9Fg9flze+QCooiTpHXq5tkawqqj4Hstycm8hc2\n\
+OImsx90xG5EtczetVVsdzuFyRU+YkGFxaWYJGyf116M=\n\
+-----END EC PRIVATE KEY-----\n";
+
+    const ENC_TRAD_BF: &str = "-----BEGIN EC PRIVATE KEY-----\n\
+Proc-Type: 4,ENCRYPTED\n\
+DEK-Info: BF-CBC,865316BF1D3B275B\n\
+\n\
+C/Xbl59c05g1nsU+K87CBKcUG5t7+zjE1eC0+tfSdS13WOcmL25ZXrqYvVoS1lFj\n\
+4Te4mvIh866moMLojCY9VWASQmXaMy3qO7wSHad1VangIovx+2HPtUDGQT+dAQ7d\n\
+wN5xTslXN3GbKDOhkuycYzC/vegPpKxi/8RVgD2hg/o=\n\
+-----END EC PRIVATE KEY-----\n";
+
+    const ENC_PKCS8_PBES1_DES: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----\n\
+MIGwMBsGCSqGSIb3DQEFCjAOBAhhL5nI8v6y/AICCAAEgZBgYgCJhMKKmqwZGZTb\n\
+8M4FMar8GnmEXLIuRh9nD/ZTGIhR31MrxCpm8cV9Zr8iYD/YKPrpASXnrs1fZTHA\n\
+cjMHgR7o8gw5CckS3VajvLamYBfKxe6uUbz+KOKsjzXoLvtBc8AsfCHBsgscwN6w\n\
+1OllsIg0VXcmbm/t1b9J65GBx95AwyROPdFChNXPTum8B7M=\n\
+-----END ENCRYPTED PRIVATE KEY-----\n";
+
+    const ENC_PKCS8_PBES2_DES: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----\n\
+MIHoMFMGCSqGSIb3DQEFDTBGMDEGCSqGSIb3DQEFDDAkBBDQ5u4JuzsgPqXuWrV1\n\
+p3yYAgIIADAMBggqhkiG9w0CCQUAMBEGBSsOAwIHBAhqi0xMpw6oXASBkII7H2pX\n\
+Oi6LOky+Jr9azWmEZZw7/gjNDlS5g4cXhRU+4G+XK3VpK20LveIJ/n6GxLnFEkMc\n\
+UpdqV9IebQ5fSGuD4zqwqu3EXzM1xLta/pGtrzl3CmNGGxuHUnBGPKFllwi5EEpD\n\
+G1fpgaL4BIhFkrnVRBXZUnKMJpryxEIxIamqQuTn37xn4189BpDuCAoojA==\n\
+-----END ENCRYPTED PRIVATE KEY-----\n";
+
+    const ENC_PKCS8_RC4: &str = "-----BEGIN ENCRYPTED PRIVATE KEY-----\n\
+MIGrMBwGCiqGSIb3DQEMAQEwDgQItUHaSygujMsCAggABIGK2Qky4zUqUqBP2rNT\n\
+eFWML8NSfPkze5ckk3TKYbH6INFUGVsIEGGOo9XN53NoHQhP8KQcsqAW4VuaMHJC\n\
+yZ5FoTJZd97yyKmMRXc92rdigu+eIBxvg8nH+22dc4P5ZdBCBZHvbo1IFqefccd/\n\
+NvcE3LqERfmwpHZeI8OV4JY0+9Z8X9rMc4W7ZHbX\n\
+-----END ENCRYPTED PRIVATE KEY-----\n";
+
+    const PFX_2DES: &str = "MIIFigIBAzCCBVAGCSqGSIb3DQEHAaCCBUEEggU9MIIFOTCCBC8GCSqGSIb3DQEHBqCCBCAwggQc\
+AgEAMIIEFQYJKoZIhvcNAQcBMBwGCiqGSIb3DQEMAQQwDgQIy3yzG4l6NawCAggAgIID6HkL9F1N\
+XzWPqMyMUG8WpWsAyLrnpERMC3K4tKrOgzoUXu4RuNqgm9KZyPSCQxXyCDsHz+a04iW3QgoZvlze\
+UMxa4xLqwvtJS5IzcYJQ+XBqH02T/hZZ8bKiKSA6+BdWU7vbeqyCzm8O2sdRINzFncO5ItIb5JOR\
+Uy22oG5JiTrdi8Q4hf6EwB2gFh/32xcRHRXnjpXZohu1ShvwZ1sRZsfXvm6Mv3NBqc4PWJjMS7Je\
+McgRZJfI45woTa+FuAQlKe8cGWFncTsytdohfJEglklkyx6Ip5bbjkQtSaNcQQ3JCMb80HiPi32L\
+fLEXa7Km/yqeOg7aRZ+Iuw4Vg9GGyIWFMar4VhSpUn+HjazLhhTiCDh06Q10CraAxRkrNYhWSdOB\
+dOeN9bn9W+010i0iqm2zcIBOcjbDGsRwl8E0MFcsy4/9iazChVYxlrzkR3sAsBfmMkgpV1/68Xb+\
+1h5T0x39b/OhP6oqdZkTmINq4RyoiTav5bdBR6tqXwaQR94y6+QcxPZDBVm6fYKzr009eH1teAUj\
+B3x3s0RwKVuwRXai5Vg4l/rnuQkQZZWTZx706X0zNckb2YI5GSfU1tmkNcYsy7HrCs9EO39WBJYr\
+UOQ/Y7kxyEDF8VRT4jL7FaNOkGlsZtMLYBsT23E1drKFpNShDhZvCd32yuw1gxkFEGbDwy5ha0PR\
++iVDya0i/CodaplYRh78jzYwBrg0UgBWpmBpbviV+WjXoS4d3uWM851wbNmAhQiZdYcjWsA4FocJ\
+ZvEIBa0Tk2NVPszpUknhimiqwpDlzgp6az/Z9JkewfbgJXVx5SK6Z8F5z5wxsX5j+uHMBCzSmBNU\
+qzjQgJXvPXVkUIjkQs9Ew0+IoETOcZN6izGWNFAsvDht6CFxA9GExG2boQbNRnjssWE57051idsY\
+oaHHnDrHCy9guZ/sHOKF2mcs9GzaUgyLWcX65ZjguXiAcAS1ImXQ/Emu8Q/C976/Vr0j2jNELnTw\
+bPIzpxRTcAlQnrE4oufV7bMVmDo42VEBW/dr0zyoEZWnJzHiU9Ek5xjoST8PwlyPXO4XCj6SrF4o\
+wYOpvP7neXVVRSOfdMwLOM8RoZfr0+1nfVZKFb7FB1EnRTn2MKpDeUQQT78JeFRbf5cJAaJ17Bpr\
+vnD5fX/pD5OkeT9J49RJFJfAI5v/qjL4xtS2sSvHYucWPlnP0PFiOTGaj7LHb6gpRB6kjJgCGMix\
+GDPZX0wUJ42Hz+T/zLMPk1VM+wa4tCSvaXpt+1rpnWaT+bDcQB8Ve7MA6knAxEo0bHmtFRmDpwIT\
+kYNBFyoKqbEYk2CplmCWw+HXAnzY7AjZHV0wggECBgkqhkiG9w0BBwGggfQEgfEwge4wgesGCyqG\
+SIb3DQEMCgECoIG0MIGxMBwGCiqGSIb3DQEMAQQwDgQI0P2+SJbJr2cCAggABIGQUGEDEbGHFm/h\
+MwwvDSqN2TyYtsUWPZZasUVUMY7dKC56zoIppud9duHGr9tIrNCXS5dlHSg2q0oHd5pbfSkljIJW\
+FFikONOyUkd1g4nScPFratJjUm9N11Mc1u+vV+QNbNB8AOzPp77MCFQkk4h9QFxz6erw4ozQilmP\
+mhlfxnQ3A3sffMmNNkjAOzcOdMk+MSUwIwYJKoZIhvcNAQkVMRYEFAu0P/nWx80ynJU4nJWQeCB4\
+w29NMDEwITAJBgUrDgMCGgUABBRb+PcNjXjKXqQG9UcRdXQWJWn7DgQIzm3nwbPo68cCAggA";
+
+    const PFX_3DES_NOMAC: &str = "MIIFIAIBAzCCBRkGCSqGSIb3DQEHAaCCBQoEggUGMIIFAjCCA/gGCSqGSIb3DQEHAaCCA+kEggPl\
+MIID4TCCAhIGCyqGSIb3DQEMCgEDoIIB2jCCAdYGCiqGSIb3DQEJFgGgggHGBIIBwjCCAb4wggFl\
+oAMCAQICFDsuwSw6s3PtCGc9jVhveYZ14K3eMAoGCCqGSM49BAMCMBoxGDAWBgNVBAMMD29hbSBo\
+MnMgdGVzdCBDQTAgFw0yNTAxMDEwMDAwMDBaGA8yMTI1MDEwMTAwMDAwMFowFDESMBAGA1UEAwwJ\
+bG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEyGUkTjD3DV3JrGpnAEOlTOTcwpEd\
+G49J4M+XaZ8iEZWo7FKbTf6j4rEaFSeQamY38+DEtb1TdChoO7w0aAjtVaOBjDCBiTAaBgNVHREE\
+EzARgglsb2NhbGhvc3SHBH8AAAEwCQYDVR0TBAIwADALBgNVHQ8EBAMCB4AwEwYDVR0lBAwwCgYI\
+KwYBBQUHAwEwHQYDVR0OBBYEFJsZ1FNqz+BcIKF65ApHkcTYAlcnMB8GA1UdIwQYMBaAFDpSKOju\
+LSBTYw+71yVedRVNgy0HMAoGCCqGSM49BAMCA0cAMEQCICLQeX/WiLH/Q/HFwbyb76+WoQee0Suw\
+4ALCFX+bidM3AiATzkdmfsnG3ngcjCh9r7ISn3kdUHWqEB8CSiZZ9KtX6DElMCMGCSqGSIb3DQEJ\
+FTEWBBQLtD/51sfNMpyVOJyVkHggeMNvTTCCAccGCyqGSIb3DQEMCgEDoIIBtjCCAbIGCiqGSIb3\
+DQEJFgGgggGiBIIBnjCCAZowggFBoAMCAQICFB4xd2jvza9kjTBEDVfRjbrpiJY7MAoGCCqGSM49\
+BAMCMBoxGDAWBgNVBAMMD29hbSBoMnMgdGVzdCBDQTAgFw0yNTAxMDEwMDAwMDBaGA8yMTI1MDEw\
+MTAwMDAwMFowGjEYMBYGA1UEAwwPb2FtIGgycyB0ZXN0IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0D\
+AQcDQgAEehH2obcp7iPFS7osVp+homdwWFhXSRKj9RXyxJQgVRf+vUZunw680lT/xlju6rDYQGZs\
+iFVskUCXEIgb+eaJraNjMGEwHQYDVR0OBBYEFDpSKOjuLSBTYw+71yVedRVNgy0HMB8GA1UdIwQY\
+MBaAFDpSKOjuLSBTYw+71yVedRVNgy0HMA8GA1UdEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEG\
+MAoGCCqGSM49BAMCA0cAMEQCIBRQnwgIrs09XBwRe8wEBFcUq1rKHKPHDg+PUusITuL7AiAv08bU\
+sXaErAcg32ic+6sTq4Sc0g+ZQ8FHTTHtxKD/ZTCCAQIGCSqGSIb3DQEHAaCB9ASB8TCB7jCB6wYL\
+KoZIhvcNAQwKAQKggbQwgbEwHAYKKoZIhvcNAQwBAzAOBAil76FKmuQbKQICCAAEgZDnKE9qC/eM\
+Kolc6B/O4pXIO6sIESewbwgiepM7cXsHm9uipMGvr4IJcvW78rWOf4awKjpMsXMPeCIDalzQ1VIS\
+0vbaofrv6E9SBr9r0ey5C5nrOnIYUsR0AJzSaYhFbHAg2iQEtrkSbG2sH7c3ggnOfYK69uMIp+J3\
+EdDaiJZ40yDoDFAwkI6w3g9ANpKZcYMxJTAjBgkqhkiG9w0BCRUxFgQUC7Q/+dbHzTKclTiclZB4\
+IHjDb00=";
+
+    const PFX_PBES2_DES3: &str = "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\
+I9+Gtk8ECIboZqmh3Vg7AgIIAA==";
+
+    const PFX_3DES_EMPTY: &str = "MIIFmgIBAzCCBVAGCSqGSIb3DQEHAaCCBUEEggU9MIIFOTCCBC8GCSqGSIb3DQEHBqCCBCAwggQc\
+AgEAMIIEFQYJKoZIhvcNAQcBMBwGCiqGSIb3DQEMAQMwDgQIKlj83O3wO20CAggAgIID6BFP3elJ\
+h5arbuUflg8VPXjbrs9YoWcWyOZzWqZXw9vO5sRoAqU5UCzwuD87WghyS3GhVk16tTWFOJ+ZQFqI\
+vPJzJ7r2LjU7up5xvuVis14veokjn8pD/WpYZQqAWHUN5/qpTW9a7EbbFF6/44jvfNLlCp3RP111\
+tm2SLOjg3qQLtYit9HQPl/daGMiD1SB0LtSx3fAb3ipGQXLGe6M+evmaE45VJeKehXVXfTA1bFYF\
+02nugVnQBMgq2DrXKDv+LvhLy8S03cdxL9BHg6Zk3hhNWQ0JSqVSlLpspfHmGEY6+JFdbnl1vObx\
+m+xv3Rk6YVcLndEW6VIbxWuCLpetXPQ2vRASB7zWuDYmA4A+v/eRDrlfSMBAKEeS2vLu47/vwEYi\
+9CSozeerUa782naOpUS+T+Kanxd/Mtl+/3ZIApzMZQAd3rvLsSp0ZS1mHa9Y2LQLlYEtFE8s1weW\
+a8/8XsEZMOGdv9V2Lc8R3P4u/BgCIBbKxSe/UxKpZKC+6z+1WVg18NO0cjIrOMKnf+WN1It6e70e\
+nqTURqJfiKGT3t1ib1LbTwLmKcVv348h4y/S/mjLXecOY3IUKPPWFGjqugImLXxCDCUJC8Yx+vbx\
+vPg2N2FxMTV+u1av+6TrKuAiz0GD58sCZe1VAQhGziMSbsE1hvsudDerhSuakIUY7MXWq7phYN8s\
+uG2z3/tgajP8vXG4aGyAb2xt+e+Hb5EKe0PfJdWpXJM6DIt+JWI9b6Wh0D3RvZpcbT4sNE06MxSs\
+/BvdZnOuLoVZ5PAgNjH8Vwn05Yo1F7LZGm6BQ27aZvB9vQmEPt28bbiw+9NEHUWgZ3bG1oTlXuOe\
+Cj4AWbuJabfR0mTd8870PosEt4gNNPWjgWjhdRqeZvYvTEHvyyltc6DDHk0v/1IKNxm5ad54OQR6\
+QXVuLN48L0qf0TvBKQyqhj06PPHpWEgG2XFYN9z8KH8VxBwr2JXc99Jixv7H17lwbtbO+5cDkNE8\
+SfkAJLCvfjCLHaccMx08e8bDw7WcAC1n4ydDD7iYkIRN4oxF7AFn4YM316tr/TJZY63Phzlbsse9\
+/bORrNNveJ/maa/qYIs/VFPjSzqF1gG14TBDQW6Kq5vs6yvjGtgG1WPn/F1qnC91KGm7+G/s5kbH\
+DLqhZHILmvx9PRXLOfr8y/nwzL3fQpt/XH4I5J/KltB3NqgF2HazVmKEsjnFPRj2xKxGGQ0MdTrH\
+E72AtmEpHufmn6DclZ3gaZVTmuVNtcOjyxihD19rmrNNjn06hmKJ3R23X0HwkA6Na+ALGkBxrlDL\
+NySdaWYGPE85CaIi3j1Z9j6dP7Qgx/2KXfswggECBgkqhkiG9w0BBwGggfQEgfEwge4wgesGCyqG\
+SIb3DQEMCgECoIG0MIGxMBwGCiqGSIb3DQEMAQMwDgQI+IRq4BpZX+gCAggABIGQD/fNQOXloJhO\
+LVKduFF7rGRpkQnMqAEWCayqrPvbGnFFeGVQBdnI8u+khAI2VxLsXoUfhYISkPQZVVK+AuX4I2Zz\
+feayNjcPWAZLiPOeY5YbIPUY2/RPuejMH1kqKnXAnX4oB6kgtt1V1jFIT/Z6887KDEaVzc9hKyNs\
+d7DjpKb1vQNq8cmyiYt0G4A8RV5YMSUwIwYJKoZIhvcNAQkVMRYEFAu0P/nWx80ynJU4nJWQeCB4\
+w29NMEEwMTANBglghkgBZQMEAgEFAAQgiqEZZmGaeQpCG8xnn3AzQt3r6xVgJPDfNcuvTJOU9psE\
+CP7IU6qiZftRAgIIAA==";
+
+    const PFX_RC4_KEY: &str = "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\
+KzAm7d7NC+fKsAQIrBzlHPJI1EsCAggA";
+
+    const PFX_DES_CERTS: &str = "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\
+sHru29UzKFvQ6BoECGJ2YEXz/KNcAgIIAA==";
+
     fn b64(text: &str) -> Vec<u8> {
         use base64::Engine;
         base64::engine::general_purpose::STANDARD
@@ -1254,17 +1667,94 @@ w29NMDEwITAJBgUrDgMCGgUABBS37T1BnrJ+DyZm5AbR8yO+OwohTAQIUrF+Vk8e3TsCAggA";
                 );
             }
         }
-        // Triple-DES: read by Node, refused here, never loaded wrong.
-        for pem in [ENC_PKCS8_3DES, ENC_TRAD_DES3] {
-            assert_eq!(
-                code(load_private_key(pem.as_bytes(), Some("hunter2"))),
-                Some("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM")
-            );
-        }
         assert_eq!(
             code(load_private_key(b"not a key", None)),
             Some("ERR_OSSL_UNSUPPORTED")
         );
+    }
+
+    // `openssl enc -des-ede3-cbc` / `-des-ede-cbc` (OpenSSL 3.5) of "oam
+    // triple-DES known answer" under key 0123456789abcdef fedcba9876543210
+    // [89abcdef01234567] and IV 1122334455667788.
+    #[test]
+    fn triple_des_cbc_matches_openssl() {
+        let plain = b"oam triple-DES known answer";
+        let iv = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let key3 = hex_bytes("0123456789abcdeffedcba987654321089abcdef01234567").unwrap();
+        let ede3 =
+            hex_bytes("dd1831dc20e09d6361941aad64320d3ec8bb5db6cebb999b75f8741806d04166").unwrap();
+        assert_eq!(
+            cbc_decrypt(BlockCipher::DesEde3, &key3, &iv, &ede3).as_deref(),
+            Some(&plain[..])
+        );
+        let key2 = hex_bytes("0123456789abcdeffedcba9876543210").unwrap();
+        let ede2 =
+            hex_bytes("2eb4228b63ea1456a477b92fc9bc3ecb61ceaa7266cf9fca5731c526cc32020d").unwrap();
+        assert_eq!(
+            cbc_decrypt(BlockCipher::DesEde, &key2, &iv, &ede2).as_deref(),
+            Some(&plain[..])
+        );
+        // A key or IV of the wrong length is no decryption at all.
+        assert_eq!(cbc_decrypt(BlockCipher::DesEde3, &key2, &iv, &ede3), None);
+        assert_eq!(cbc_decrypt(BlockCipher::DesEde3, &key3, &key2, &ede3), None);
+    }
+
+    #[test]
+    fn triple_des_keys_open_as_node_opens_them() {
+        for (label, pem) in [
+            ("pkcs8 pbeWithSHAAnd3-KeyTripleDES-CBC", ENC_PKCS8_3DES),
+            ("pkcs8 pbeWithSHAAnd2-KeyTripleDES-CBC", ENC_PKCS8_2DES),
+            ("pkcs8 pbes2 des-ede3-cbc", ENC_PKCS8_PBES2_DES3),
+            ("legacy DES-EDE3-CBC", ENC_TRAD_DES3),
+            ("legacy DES-EDE-CBC", ENC_TRAD_DES_EDE),
+        ] {
+            let key = load_private_key(pem.as_bytes(), Some("hunter2"))
+                .unwrap_or_else(|e| panic!("{label}: {e:?}"));
+            assert!(is_server_key(key), "{label}");
+            for passphrase in [Some("nope"), None, Some("")] {
+                assert_eq!(
+                    code(load_private_key(pem.as_bytes(), passphrase)),
+                    Some("ERR_OSSL_BAD_DECRYPT"),
+                    "{label} {passphrase:?}"
+                );
+            }
+        }
+        // `openssl rsa -traditional -des3`: an RSA key, the PKCS#1 form.
+        let rsa = load_private_key(ENC_RSA_TRAD_DES3.as_bytes(), Some("hunter2")).unwrap();
+        assert!(matches!(rsa, PrivateKeyDer::Pkcs1(_)));
+        let provider = rustls::crypto::ring::default_provider();
+        let signing = provider.key_provider.load_private_key(rsa).unwrap();
+        assert!(
+            rustls::sign::CertifiedKey::new(certs(RSA_CERT), signing)
+                .keys_match()
+                .is_ok()
+        );
+        assert_eq!(
+            code(load_private_key(ENC_RSA_TRAD_DES3.as_bytes(), Some("nope"))),
+            Some("ERR_OSSL_BAD_DECRYPT")
+        );
+        // What OpenSSL 3 keeps in its legacy provider Node refuses whatever
+        // the passphrase: single DES (legacy PEM, PBES2, PKCS#5 v1.5 PBES1),
+        // RC4, Blowfish.
+        for (label, pem) in [
+            ("legacy DES-CBC", ENC_TRAD_DES),
+            ("legacy BF-CBC", ENC_TRAD_BF),
+            ("pkcs8 pbeWithSHA1AndDES-CBC", ENC_PKCS8_PBES1_DES),
+            ("pkcs8 pbes2 des-cbc", ENC_PKCS8_PBES2_DES),
+            ("pkcs8 pbeWithSHAAnd128BitRC4", ENC_PKCS8_RC4),
+        ] {
+            for passphrase in [Some("hunter2"), Some("nope"), None] {
+                let error = load_private_key(pem.as_bytes(), passphrase).unwrap_err();
+                assert_eq!(
+                    (error.code, error.message.as_str()),
+                    (
+                        Some("ERR_OSSL_EVP_UNSUPPORTED"),
+                        "error:0308010C:digital envelope routines::unsupported"
+                    ),
+                    "{label} {passphrase:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1275,15 +1765,22 @@ w29NMDEwITAJBgUrDgMCGgUABBS37T1BnrJ+DyZm5AbR8yO+OwohTAQIUrF+Vk8e3TsCAggA";
             ("no mac", PFX_NOMAC, "hunter2"),
             ("no encryption", PFX_NOENC, "hunter2"),
             ("empty password", PFX_NOPASS, ""),
+            ("3des", PFX_3DES, "hunter2"),
+            ("2-key 3des", PFX_2DES, "hunter2"),
+            ("3des, no mac", PFX_3DES_NOMAC, "hunter2"),
+            ("pbes2 des-ede3-cbc", PFX_PBES2_DES3, "hunter2"),
+            ("3des, empty password", PFX_3DES_EMPTY, ""),
         ] {
             let bundle =
                 load_pkcs12(&b64(der), passphrase).unwrap_or_else(|e| panic!("{label}: {e:?}"));
             assert!(is_server_key(bundle.key.unwrap()), "{label}");
             assert_eq!(bundle.certs.first(), certs(CERT).first(), "{label}");
         }
-        // The bundle made with -certfile carries the CA after the leaf.
-        let full = load_pkcs12(&b64(PFX_AES256), "hunter2").unwrap();
-        assert_eq!(full.certs, [certs(CERT), certs(CA)].concat());
+        // The bundles made with -certfile carry the CA after the leaf.
+        for der in [PFX_AES256, PFX_2DES, PFX_PBES2_DES3] {
+            let full = load_pkcs12(&b64(der), "hunter2").unwrap();
+            assert_eq!(full.certs, [certs(CERT), certs(CA)].concat());
+        }
 
         let message = |der: &str, passphrase: &str| {
             load_pkcs12(&b64(der), passphrase)
@@ -1295,17 +1792,25 @@ w29NMDEwITAJBgUrDgMCGgUABBS37T1BnrJ+DyZm5AbR8yO+OwohTAQIUrF+Vk8e3TsCAggA";
         assert_eq!(message(PFX_AES256, ""), mac);
         assert_eq!(message(PFX_NOENC, "nope"), mac);
         assert_eq!(message(PFX_NOPASS, "x"), mac);
-        assert_eq!(
-            message(PFX_LEGACY, "hunter2"),
-            Some((
-                "Unsupported PKCS12 PFX data".to_string(),
-                Some("ERR_CRYPTO_UNSUPPORTED_OPERATION")
-            ))
-        );
-        assert_eq!(
-            message(PFX_3DES, "hunter2").and_then(|(_, code)| code),
-            Some("ERR_FEATURE_UNAVAILABLE_ON_PLATFORM")
-        );
+        assert_eq!(message(PFX_3DES, "nope"), mac);
+        assert_eq!(message(PFX_3DES, ""), mac);
+        assert_eq!(message(PFX_3DES_EMPTY, "hunter2"), mac);
+        // Without a MAC, the wrong passphrase is the cipher's error.
+        let bad_decrypt = Some(("bad decrypt".to_string(), None));
+        for passphrase in ["nope", ""] {
+            assert_eq!(message(PFX_NOMAC, passphrase), bad_decrypt);
+            assert_eq!(message(PFX_3DES_NOMAC, passphrase), bad_decrypt);
+        }
+        // RC2, RC4 and single DES: refused as Node 22 refuses them, once the
+        // MAC says the passphrase is right.
+        let unsupported = Some((
+            "Unsupported PKCS12 PFX data".to_string(),
+            Some("ERR_CRYPTO_UNSUPPORTED_OPERATION"),
+        ));
+        for der in [PFX_LEGACY, PFX_RC4_KEY, PFX_DES_CERTS] {
+            assert_eq!(message(der, "hunter2"), unsupported);
+            assert_eq!(message(der, "nope"), mac);
+        }
         assert!(load_pkcs12(b"garbage", "").is_err());
     }
 }

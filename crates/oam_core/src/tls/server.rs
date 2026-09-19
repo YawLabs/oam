@@ -154,6 +154,18 @@ impl ContextError {
         )
     }
 
+    /// `ERR_OSSL_EVP_UNSUPPORTED`: a key protected with a cipher OpenSSL 3
+    /// keeps in its legacy provider (single DES, RC2, RC4, ...), which Node
+    /// does not load.
+    pub(crate) fn evp_unsupported() -> Self {
+        Self::openssl(
+            "0308010C",
+            "digital envelope routines",
+            "unsupported",
+            "ERR_OSSL_EVP_UNSUPPORTED",
+        )
+    }
+
     /// `ERR_OSSL_BAD_DECRYPT`: an encrypted key with a wrong or missing
     /// passphrase.
     pub(crate) fn bad_decrypt() -> Self {

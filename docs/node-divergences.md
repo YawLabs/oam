@@ -1558,7 +1558,8 @@ it cannot read or that is not its certificate's), handshakes each connection on 
 within `handshakeTimeout`, negotiates `ALPNProtocols` in the server's order, and honours
 `requestCert` / `rejectUnauthorized` / `ca` with Node's verdicts (`authorized`,
 `authorizationError`, a refused client dropped before `'secureConnection'`). `key` may be
-encrypted (PBES2 PKCS#8, AES legacy PEM) and `pfx` a PKCS#12 bundle. `http2.createSecureServer`
+encrypted (PKCS#8 under PBES2 or PKCS#12's triple-DES PBEs, AES or triple-DES legacy PEM) and
+`pfx` a PKCS#12 bundle (PBES2 or triple-DES bags). `http2.createSecureServer`
 is a `tls.Server` offering `h2`: HTTP/2 sessions with `'session'`, `'stream'` and the
 compatibility API, `allowHTTP1`, `'unknownProtocol'` and Node's `403`. `https.createServer`
 is a `tls.Server` too (`ALPNProtocols` `['http/1.1']` by default), and each of its
@@ -1566,12 +1567,12 @@ connections runs the same handshake with its options before it is served as HTTP
 `req.socket` reports the handshake, and a failed one is `'tlsClientError'` and
 `'clientError'`. What differs:
 
-- **Triple-DES key protection is refused.** A legacy PEM key with `DEK-Info: DES-EDE3-CBC`
-  (what `openssl rsa -des3` writes), a PKCS#8 key under PBES1 3DES, and a PKCS#12 bundle
-  whose bags use `pbeWithSHAAnd3-KeyTripleDES-CBC` throw `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`
-  at `createServer()`; Node opens them. oam has no DES implementation. Re-encrypt the key
-  with AES (`openssl pkcs8 -topk8 -v2 aes-256-cbc`, `openssl pkcs12 -export` from OpenSSL
-  3) or pass it unencrypted.
+- **Camellia- and ARIA-protected keys are refused.** A legacy PEM key with `DEK-Info:
+  CAMELLIA-128-CBC` (`openssl rsa -camellia128`) or a PKCS#8 key under PBES2 with Camellia or
+  ARIA throws `ERR_OSSL_UNSUPPORTED` at `createServer()`; Node opens them (OpenSSL 3's
+  default provider has both ciphers). AES and triple DES are read as Node reads them, and the
+  ciphers Node 22 itself refuses (single DES, RC2, RC4, Blowfish, CAST5, IDEA, SEED) are
+  refused with Node's errors.
 - **`SNICallback` and `ALPNCallback` are validated but not called.** The server's own key
   and certificate serve every name, and with `ALPNCallback` no protocol is negotiated.
 - **`createServer()`'s errors carry no `opensslErrorStack`**, and a `pfx` that cannot be
@@ -1612,7 +1613,7 @@ connections runs the same handshake with its options before it is served as HTTP
   with `ERR_OSSL_UNSUPPORTED`.
 
 _(probed)_ Node v22.22.2 and oam as servers for the same real Node clients (tls, https,
-http2, raw TCP): conformance cases 150-154.
+http2, raw TCP): conformance cases 150-155.
 
 ### `err.syscall` on `fs.realpath` and `fs.opendir`
 

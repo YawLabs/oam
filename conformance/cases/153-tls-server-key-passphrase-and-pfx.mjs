@@ -17,8 +17,8 @@
 // (AES-256-CBC, AES-128-CBC); the pair as PKCS#12 bundles (OpenSSL 3's
 // default, with the CA; AES-128 with a SHA-1 MAC; no MAC; no encryption; an
 // empty password; and -legacy, RC2-40, which Node 22 refuses). The
-// passphrase is "hunter2" throughout. Triple-DES-protected keys are left out:
-// Node reads them and oam does not (docs/node-divergences.md).
+// passphrase is "hunter2" throughout. Triple-DES-protected keys and bundles
+// are case 155's.
 import tls from "node:tls";
 import { spawn } from "node:child_process";
 

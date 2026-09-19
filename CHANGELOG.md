@@ -221,13 +221,17 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   (`ERR_SSL_HTTP_REQUEST`, `ERR_SSL_WRONG_VERSION_NUMBER`, ...) without an answer it
   could read.
 - **TLS servers read encrypted keys and PKCS#12 bundles.** `key` may be an encrypted
-  PKCS#8 key (PBES2 with PBKDF2 or scrypt, AES-CBC) or a legacy encrypted PEM key
-  (AES-CBC), opened with `passphrase` or a `{ pem, passphrase }` entry's own; `pfx` is
-  opened as Node opens it, its MAC checked (`mac verify failure`), its PBES2-protected or
-  unprotected bags read, and its other certificates served as the chain and trusted as
-  CAs. The errors are Node's (`ERR_OSSL_BAD_DECRYPT`, `Unsupported PKCS12 PFX data` for an
-  RC2 bundle). Triple-DES-protected keys and bundles, which Node reads, are refused with
-  `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` (divergence 42).
+  PKCS#8 key (PBES2 with PBKDF2 or scrypt and AES-CBC or triple-DES, or PKCS#12's
+  triple-DES PBEs, as `openssl pkcs8 -topk8 -v1 PBE-SHA1-3DES` writes them) or a legacy
+  encrypted PEM key (AES-CBC, or `DES-EDE3-CBC` as `openssl rsa -des3` writes it), opened
+  with `passphrase` or a `{ pem, passphrase }` entry's own; `pfx` is opened as Node opens
+  it, its MAC checked (`mac verify failure`), its bags read whether PBES2-protected,
+  protected with PKCS#12's triple-DES PBEs (OpenSSL 1.x's default) or not at all, and its
+  other certificates served as the chain and trusted as CAs. The errors are Node's
+  (`ERR_OSSL_BAD_DECRYPT`, `bad decrypt` for a bundle without a MAC). What Node 22 no
+  longer reads -- single DES, RC2, RC4, Blowfish -- is refused as Node refuses it:
+  `ERR_OSSL_EVP_UNSUPPORTED` for a key, `Unsupported PKCS12 PFX data` for a bundle.
+  Triple DES comes from the RustCrypto `des` crate, new in the dependency graph.
 - **`http2.Http2ServerRequest` and `http2.Http2ServerResponse` are exported**, and an
   HTTP/2 request's headers include `:authority` and `:scheme` on every oam HTTP/2 server.
 
