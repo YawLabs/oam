@@ -1721,6 +1721,16 @@ async fn dispatch_request(
             }
         }
     }
+    // node's req.url is the request target exactly as the client wrote it
+    // (http/1.x only: an h2 request has no request line). hyper's URI type
+    // rewrites some -- an absolute form's scheme is lowercased and a missing
+    // path gains `/`, a fragment is dropped -- so it is read off the head.
+    // Only a head hyper accepted gets here, so the target is ASCII.
+    let raw_target = req
+        .extensions()
+        .get::<hyper::ext::RawRequestHead>()
+        .and_then(|raw| crate::http_head::request_target(raw.as_bytes()))
+        .map(|target| target.iter().map(|&b| char::from(b)).collect::<String>());
     let (parts, body) = req.into_parts();
     let end_stream =
         parts.version == hyper::Version::HTTP_2 && hyper::body::Body::is_end_stream(&body);
@@ -1789,22 +1799,18 @@ async fn dispatch_request(
         }
         headers.splice(0..0, pseudo);
     }
-    // node's req.url is the request target as the client wrote it. Over
-    // http/1.x that includes the ABSOLUTE form a client of a forward proxy
-    // sends (`GET http://host/p HTTP/1.1`), which a proxy written on this
-    // server reads to know where to send the request. Over h2 the URI is
-    // assembled from the pseudo-headers and node's compat req.url is
+    // Over http/1.x that includes the ABSOLUTE form a client of a forward
+    // proxy sends (`GET http://host/p HTTP/1.1`), which a proxy written on
+    // this server reads to know where to send the request. Over h2 the URI
+    // is assembled from the pseudo-headers and node's compat req.url is
     // `:path` alone.
-    let absolute_form = parts.version != hyper::Version::HTTP_2 && parts.uri.scheme().is_some();
-    let uri = if absolute_form {
-        parts.uri.to_string()
-    } else {
+    let uri = raw_target.unwrap_or_else(|| {
         parts
             .uri
             .path_and_query()
             .map(|pq| pq.as_str().to_string())
             .unwrap_or_else(|| parts.uri.path().to_string())
-    };
+    });
 
     let (tx, rx) = oneshot::channel::<ResponseSpec>();
     state

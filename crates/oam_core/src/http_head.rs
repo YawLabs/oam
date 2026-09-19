@@ -11,14 +11,17 @@
 //! - a second `Content-Length` line, even with the same value;
 //! - any `Transfer-Encoding` coding after `chunked`, in the same header or
 //!   a later one (`chunked, chunked`; `chunked` then `gzip`);
-//! - a line that ends in a bare LF instead of CRLF, anywhere in the head.
+//! - a line that ends in a bare LF instead of CRLF, anywhere in the head;
+//! - for a method other than CONNECT, a request target that is neither
+//!   origin form, `*...` nor absolute form (`abc`, `host:443`, `1http://x`;
+//!   see `is_request_target`).
 //!
 //! and `431 Request Header Fields Too Large` once the head's counted bytes
 //! reach the limit (see [`check_request_head`]).
 //!
 //! `insecureHTTPParser` (the server option, or `--insecure-http-parser`)
-//! lifts every rule above except the duplicate `Content-Length` and the size
-//! limit, which node keeps in that mode too.
+//! lifts every rule above except the duplicate `Content-Length`, the request
+//! target's form and the size limit, which node keeps in that mode too.
 //!
 //! The server (`http_server`) runs [`check_request_head`] on the exact bytes
 //! hyper parsed (hyper hands them over as `hyper::ext::RawRequestHead`,
@@ -172,15 +175,12 @@ pub fn check_request_head(head: &[u8], policy: HeadPolicy) -> Result<(), HeadErr
     let Some(request_line) = lines.next() else {
         return Ok(());
     };
-    let text = strip_eol(request_line);
-    let target = match (
-        text.iter().position(|&b| b == b' '),
-        text.iter().rposition(|&b| b == b' '),
-    ) {
-        (Some(first), Some(last)) if last > first => &text[first + 1..last],
-        _ => &[][..],
-    };
+    let (method, target) = split_request_line(request_line);
     add(target.len())?;
+    // A rule of llhttp's URL parser, which insecureHTTPParser does not lift.
+    if method != b"CONNECT" && !is_request_target(target) {
+        return Err(HeadError::BadRequest("request target form"));
+    }
     if strict && bare_lf(request_line) {
         return Err(HeadError::BadRequest("bare LF line ending"));
     }
@@ -248,6 +248,64 @@ pub fn check_request_head(head: &[u8], policy: HeadPolicy) -> Result<(), HeadErr
         ));
     }
     Ok(())
+}
+
+/// The method and the request target of a request line (with or without its
+/// line ending): what lies before the first space, and between it and the
+/// last one.
+fn split_request_line(line: &[u8]) -> (&[u8], &[u8]) {
+    let text = strip_eol(line);
+    match (
+        text.iter().position(|&b| b == b' '),
+        text.iter().rposition(|&b| b == b' '),
+    ) {
+        (Some(first), Some(last)) if last > first => (&text[..first], &text[first + 1..last]),
+        (Some(first), _) => (&text[..first], &[][..]),
+        _ => (text, &[][..]),
+    }
+}
+
+/// The request target of a head hyper parsed, byte for byte as the client
+/// sent it -- node's `req.url`, which keeps what hyper's URI type rewrites:
+/// the spelling of an absolute-form target (`HTTP://H/P` is not lowercased,
+/// `http://h` gains no `/`), a fragment (`/p#f`), and `*` followed by more.
+pub fn request_target(head: &[u8]) -> Option<&[u8]> {
+    let request_line = head
+        .split_inclusive(|&b| b == b'\n')
+        .find(|l| *l != b"\r\n" && *l != b"\n")?;
+    let (_, target) = split_request_line(request_line);
+    (!target.is_empty()).then_some(target)
+}
+
+/// Whether node's parser (llhttp's URL states) takes `target` as the
+/// request target of a method other than CONNECT (measured on v22.22.2, in
+/// its default and insecure modes alike): origin form (`/...`), anything
+/// that starts with `*`, or absolute form -- a scheme of letters only, then
+/// `://`, then an authority with no `#` in it. hyper's URI type also takes
+/// an authority alone (`host:port`, `abc`, `.`), a scheme that starts with
+/// a digit or holds `+`, `-` or `.`, and a fragment right after the
+/// authority (`http://h#f`); node answers all of them `400`, where oam
+/// handed them to the handler with a `req.url` of `""` or the URI type's
+/// rewrite of the target.
+fn is_request_target(target: &[u8]) -> bool {
+    match target.first() {
+        Some(b'/' | b'*') => true,
+        Some(b) if b.is_ascii_alphabetic() => {
+            let scheme = target
+                .iter()
+                .take_while(|b| b.is_ascii_alphabetic())
+                .count();
+            let Some(rest) = target[scheme..].strip_prefix(b"://") else {
+                return false;
+            };
+            let authority = rest
+                .iter()
+                .position(|&b| b == b'/' || b == b'?')
+                .unwrap_or(rest.len());
+            !rest[..authority].contains(&b'#')
+        }
+        _ => false,
+    }
 }
 
 fn strip_eol(line: &[u8]) -> &[u8] {
@@ -563,6 +621,99 @@ mod tests {
             lenient: false,
         };
         assert_eq!(check(&one(0), zero), Err(HeadError::HeaderOverflow));
+    }
+
+    /// node v22.22.2's verdict on each request target, measured on the raw
+    /// wire (the same in its insecure mode): hyper's URI type takes every
+    /// one of these, so the `400`s below are this check's.
+    #[test]
+    fn request_target_forms_match_node() {
+        let head =
+            |method: &str, target: &str| format!("{method} {target} HTTP/1.1\r\nHost: x\r\n\r\n");
+        for target in [
+            "/",
+            "/p?q=1",
+            "//double",
+            "/#frag",
+            "/p#f?q",
+            "/a?b#c",
+            "*",
+            "*x",
+            "**",
+            "http://h",
+            "http://h/p?q",
+            "HTTP://H/P",
+            "http://h?q",
+            "http://[::1]:8/p",
+            "http://u@h/p",
+            "http://h:x/",
+            "ws://h",
+            "abc://h",
+            "http://h/p?q#f",
+        ] {
+            for policy in [STRICT, LENIENT] {
+                assert_eq!(check(&head("GET", target), policy), Ok(()), "GET {target}");
+            }
+        }
+        for target in [
+            "abc",
+            "a",
+            "1abc",
+            "abc:",
+            "abc:80",
+            "example.test:443",
+            "http:x",
+            ".",
+            "h-t.t+p://x/",
+            "1http://x/",
+            "http://h#f",
+        ] {
+            for policy in [STRICT, LENIENT] {
+                assert_eq!(
+                    check(&head("GET", target), policy),
+                    Err(HeadError::BadRequest("request target form")),
+                    "GET {target}"
+                );
+            }
+            assert!(bad(&head("OPTIONS", target), STRICT), "OPTIONS {target}");
+        }
+        // CONNECT takes any of them (node: 'connect' with req.url as sent).
+        for target in ["h.test:443", "/p", "http://h.test/", "abc"] {
+            assert_eq!(
+                check(&head("CONNECT", target), STRICT),
+                Ok(()),
+                "CONNECT {target}"
+            );
+        }
+    }
+
+    /// `req.url` is the target as sent, whatever hyper's URI type makes of it.
+    #[test]
+    fn request_target_is_the_bytes_as_sent() {
+        let target =
+            |head: &[u8]| request_target(head).map(|t| String::from_utf8_lossy(t).into_owned());
+        assert_eq!(
+            target(b"GET /p?q HTTP/1.1\r\n\r\n").as_deref(),
+            Some("/p?q")
+        );
+        assert_eq!(
+            target(b"GET HTTP://H/P HTTP/1.1\r\nHost: x\r\n\r\n").as_deref(),
+            Some("HTTP://H/P")
+        );
+        assert_eq!(
+            target(b"GET http://h HTTP/1.1\r\n\r\n").as_deref(),
+            Some("http://h")
+        );
+        assert_eq!(
+            target(b"GET /p#f HTTP/1.1\r\n\r\n").as_deref(),
+            Some("/p#f")
+        );
+        assert_eq!(
+            target(b"\r\n\r\nOPTIONS * HTTP/1.1\r\n\r\n").as_deref(),
+            Some("*")
+        );
+        assert_eq!(target(b"GET /p HTTP/1.1\n\n").as_deref(), Some("/p"));
+        assert_eq!(target(b"GET\r\n\r\n"), None);
     }
 
     #[test]
