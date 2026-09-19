@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "296d2ff+wip",
+  "commit": "5ed43d6+wip",
   "oamVersion": "oam 0.16.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 122,
-      "total": 122,
+      "pass": 123,
+      "total": 123,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -160,6 +160,10 @@
         },
         {
           "case": "14-querystring.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "140-http2-connect-lookup-and-create-connection.mjs",
           "status": "pass"
         },
         {
