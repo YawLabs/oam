@@ -26680,3 +26680,71 @@ origin.close(); proxy.close(); agent.destroy?.();
         "stderr: {stderr}"
     );
 }
+
+/// A `path` an agent assigns after the constructor checked it cannot split
+/// the request line. node writes `req.path` verbatim whenever the head is
+/// rendered, so an agent that rewrites it (as http-proxy-agent rewrites it
+/// to absolute form) with a CR or LF in it injects header lines. oam's
+/// hand-written heads -- a CONNECT's, an upgrade's -- refuse such a path
+/// with the constructor's own ERR_UNESCAPED_CHARACTERS and write nothing,
+/// and every other request goes through the bridge, which percent-encodes
+/// what a request target cannot carry (docs/node-divergences.md, entry 43).
+#[test]
+fn a_path_rewritten_after_the_constructor_cannot_split_the_request_line() {
+    let src = r#"
+import http from 'node:http';
+import net from 'node:net';
+const heads = [];
+const srv = net.createServer((s) => {
+  s.on('error', () => {});
+  let b = '';
+  s.on('data', (d) => {
+    b += d.toString('latin1');
+    const i = b.indexOf('\r\n\r\n');
+    if (i === -1 || s.answered) return;
+    s.answered = true;
+    heads.push(b.slice(0, i).split('\r\n').filter((l) => !/^(host|connection|upgrade):/i.test(l)).join(' | '));
+    s.end('HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n');
+  });
+});
+await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const port = srv.address().port;
+class Rewriting extends http.Agent {
+  addRequest(req, opts) {
+    req.path = '/x HTTP/1.1\r\nInjected: 1\r\nX-Y: /y';
+    return super.addRequest(req, opts);
+  }
+}
+for (const [label, extra] of [
+  ['GET', {}],
+  ['upgrade', { headers: { connection: 'upgrade', upgrade: 'x' } }],
+  ['CONNECT', { method: 'CONNECT' }],
+]) {
+  const out = await new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port, path: '/', agent: new Rewriting(), ...extra });
+    req.on('response', (res) => { res.resume(); resolve(`response ${res.statusCode}`); });
+    req.on('connect', (res, socket) => { socket.destroy(); resolve(`connect ${res.statusCode}`); });
+    req.on('upgrade', (res, socket) => { socket.destroy(); resolve(`upgrade ${res.statusCode}`); });
+    req.on('error', (e) => resolve(`error ${e.code}`));
+    req.end();
+  });
+  console.log(`${label}: ${out}`);
+}
+await new Promise((r) => setTimeout(r, 100));
+console.log(`the server saw: ${heads.join(' // ') || 'nothing'}`);
+srv.close();
+"#;
+    let main = write_temp("path-rewritten-after-constructor/main.mjs", src);
+    let out = oam(&["run", main.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "GET: response 200\n\
+         upgrade: error ERR_UNESCAPED_CHARACTERS\n\
+         CONNECT: error ERR_UNESCAPED_CHARACTERS\n\
+         the server saw: GET /x%20HTTP/1.1%0D%0AInjected:%201%0D%0AX-Y:%20/y HTTP/1.1",
+        "stderr: {stderr}"
+    );
+}

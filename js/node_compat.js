@@ -18739,6 +18739,256 @@
       return { headers, raw };
     }
 
+    // node's llhttp on the head of an answer this client reads off a socket
+    // itself -- an upgrade's or a CONNECT's (_upgradeOver); every other
+    // answer is read by hyper through the bridge. Fed the bytes as they
+    // arrive, it refuses what node refuses as soon as the byte that breaks
+    // the head is in, with node's code and reason, and accepts what node
+    // accepts (both measured on v22.22.2:
+    // conformance/cases/158-http-client-hand-read-answer-heads.mjs). The
+    // head's size limit is the caller's.
+    const HEAD_TOKEN_CHARS = (function () {
+      const table = new Uint8Array(256);
+      const marks = "!#$%&'*+-.^_`|~";
+      for (let i = 0; i < marks.length; i++) table[marks.charCodeAt(i)] = 1;
+      for (let c = 0x30; c <= 0x39; c++) table[c] = 1;
+      for (let c = 0x41; c <= 0x5a; c++) table[c] = 1;
+      for (let c = 0x61; c <= 0x7a; c++) table[c] = 1;
+      return table;
+    })();
+    const HEAD_PROTOCOLS = ["HTTP/", "RTSP/", "ICE/"];
+    // The largest Content-Length llhttp holds (a uint64).
+    const HEAD_MAX_LENGTH = "18446744073709551615";
+    const H_PROTOCOL = 0, H_MAJOR = 1, H_DOT = 2, H_MINOR = 3, H_VERSION_END = 4,
+      H_STATUS = 5, H_STATUS_END = 6, H_REASON = 7, H_LINE_LF = 8, H_FIELD_START = 9,
+      H_NAME = 10, H_VALUE_OWS = 11, H_VALUE = 12, H_VALUE_LF = 13, H_HEAD_LF = 14;
+    function headParseError(code, reason) {
+      const err = new Error("Parse Error: " + reason);
+      err.code = code;
+      err.reason = reason;
+      return err;
+    }
+    class HandReadHead {
+      constructor() {
+        this.pos = 0;
+        this.state = H_PROTOCOL;
+        this.protocol = "";
+        this.major = 0;
+        this.minor = 0;
+        this.statusCode = 0;
+        this.statusDigits = 0;
+        this.reasonStart = 0;
+        this.statusMessage = "";
+        this.firstField = true;
+        this.nameStart = 0;
+        this.name = "";
+        // 1: Content-Length, 2: Transfer-Encoding, 0: any other field.
+        this.field = 0;
+        this.valueStart = 0;
+        this.valueEnd = 0;
+        this.lengthDigits = "";
+        this.lengthSpace = false;
+        this.hasLength = false;
+        this.hasEncoding = false;
+        this.pairs = [];
+      }
+      // Reads `buf` (every byte so far; earlier calls read its start) on from
+      // where the last call stopped. Returns the offset just past the head
+      // once it is complete, else -1; throws node's parse error.
+      feed(buf) {
+        for (let i = this.pos; i < buf.length; i++) {
+          const c = buf[i];
+          switch (this.state) {
+            case H_PROTOCOL: {
+              const next = this.protocol + String.fromCharCode(c);
+              if (!HEAD_PROTOCOLS.some((p) => p.startsWith(next))) {
+                throw headParseError("HPE_INVALID_CONSTANT", "Expected HTTP/, RTSP/ or ICE/");
+              }
+              this.protocol = next;
+              if (HEAD_PROTOCOLS.includes(next)) this.state = H_MAJOR;
+              break;
+            }
+            case H_MAJOR:
+              if (c < 0x30 || c > 0x39) throw headParseError("HPE_INVALID_VERSION", "Invalid major version");
+              this.major = c - 0x30;
+              this.state = H_DOT;
+              break;
+            case H_DOT:
+              if (c !== 0x2e) throw headParseError("HPE_INVALID_VERSION", "Expected dot");
+              this.state = H_MINOR;
+              break;
+            case H_MINOR: {
+              if (c < 0x30 || c > 0x39) throw headParseError("HPE_INVALID_VERSION", "Invalid minor version");
+              this.minor = c - 0x30;
+              // HTTP is 0.9, 1.0, 1.1 or 2.0; RTSP and ICE take any digits.
+              const v = this.major * 10 + this.minor;
+              if (this.protocol === "HTTP/" && v !== 9 && v !== 10 && v !== 11 && v !== 20) {
+                throw headParseError("HPE_INVALID_VERSION", "Invalid HTTP version");
+              }
+              this.state = H_VERSION_END;
+              break;
+            }
+            case H_VERSION_END:
+              if (c !== 0x20) throw headParseError("HPE_INVALID_VERSION", "Expected space after version");
+              this.state = H_STATUS;
+              break;
+            case H_STATUS:
+              if (c < 0x30 || c > 0x39) throw headParseError("HPE_INVALID_STATUS", "Invalid status code");
+              this.statusCode = this.statusCode * 10 + (c - 0x30);
+              if (++this.statusDigits === 3) this.state = H_STATUS_END;
+              break;
+            case H_STATUS_END:
+              if (c === 0x20) {
+                this.reasonStart = i + 1;
+                this.state = H_REASON;
+              } else if (c === 0x0d) {
+                this.state = H_LINE_LF;
+              } else {
+                throw headParseError("HPE_INVALID_STATUS", "Invalid response status");
+              }
+              break;
+            case H_REASON:
+              // Any byte but CR and LF, as llhttp reads a reason phrase.
+              if (c === 0x0d) {
+                this.statusMessage = buf.toString("latin1", this.reasonStart, i);
+                this.state = H_LINE_LF;
+              } else if (c === 0x0a) {
+                throw headParseError("HPE_CR_EXPECTED", "Missing expected CR after response line");
+              }
+              break;
+            case H_LINE_LF:
+              if (c !== 0x0a) throw headParseError("HPE_STRICT", "Expected LF after CR");
+              this.state = H_FIELD_START;
+              break;
+            case H_FIELD_START:
+              if (c === 0x0d) {
+                this.state = H_HEAD_LF;
+              } else if (c === 0x20 || c === 0x09) {
+                // A continuation line (obs-fold), refused as node refuses it.
+                throw this.firstField
+                  ? headParseError("HPE_UNEXPECTED_SPACE", "Unexpected space after start line")
+                  : headParseError("HPE_INVALID_HEADER_TOKEN", "Unexpected whitespace after header value");
+              } else if (c === 0x0a) {
+                throw headParseError("HPE_INVALID_HEADER_TOKEN", "Invalid header field char");
+              } else if (HEAD_TOKEN_CHARS[c] === 1) {
+                this.nameStart = i;
+                this.state = H_NAME;
+              } else {
+                throw headParseError("HPE_INVALID_HEADER_TOKEN", "Invalid header token");
+              }
+              break;
+            case H_NAME:
+              if (c === 0x3a) {
+                this.name = buf.toString("latin1", this.nameStart, i);
+                const lower = this.name.toLowerCase();
+                this.field = lower === "content-length" ? 1 : lower === "transfer-encoding" ? 2 : 0;
+                if (this.field === 2 && this.hasLength) {
+                  throw headParseError(
+                    "HPE_INVALID_TRANSFER_ENCODING",
+                    "Transfer-Encoding can't be present with Content-Length",
+                  );
+                }
+                if (this.field === 1 && this.hasEncoding) {
+                  throw headParseError(
+                    "HPE_INVALID_CONTENT_LENGTH",
+                    "Content-Length can't be present with Transfer-Encoding",
+                  );
+                }
+                this.lengthDigits = "";
+                this.lengthSpace = false;
+                this.state = H_VALUE_OWS;
+              } else if (HEAD_TOKEN_CHARS[c] !== 1) {
+                throw headParseError("HPE_INVALID_HEADER_TOKEN", "Invalid header token");
+              }
+              break;
+            case H_VALUE_OWS:
+              if (c === 0x20 || c === 0x09) break;
+              this.valueStart = i;
+              this.valueEnd = i;
+              // A value starts here (an empty one is its line's end).
+              if (c !== 0x0d && c !== 0x0a) {
+                if (this.field === 1 && this.hasLength) {
+                  throw headParseError("HPE_UNEXPECTED_CONTENT_LENGTH", "Duplicate Content-Length");
+                }
+                if (this.field === 2) this.hasEncoding = true;
+              }
+              this.state = H_VALUE;
+              i--;
+              break;
+            case H_VALUE:
+              if (c === 0x0d) {
+                this.state = H_VALUE_LF;
+                break;
+              }
+              if (c === 0x0a) {
+                throw headParseError("HPE_CR_EXPECTED", "Missing expected CR after header value");
+              }
+              // HTAB, SP, VCHAR and obs-text; no other control, no DEL.
+              if (c !== 0x09 && (c < 0x20 || c === 0x7f)) {
+                throw headParseError("HPE_INVALID_HEADER_TOKEN", "Invalid header value char");
+              }
+              if (c !== 0x20 && c !== 0x09) this.valueEnd = i + 1;
+              if (this.field === 1) this._lengthByte(c);
+              break;
+            case H_VALUE_LF:
+              if (c !== 0x0a) throw headParseError("HPE_LF_EXPECTED", "Missing expected LF after header value");
+              if (this.field === 1) {
+                if (this.lengthDigits === "") {
+                  throw headParseError("HPE_INVALID_CONTENT_LENGTH", "Empty Content-Length");
+                }
+                this.hasLength = true;
+              }
+              this.pairs.push([this.name, buf.toString("latin1", this.valueStart, this.valueEnd)]);
+              this.firstField = false;
+              this.state = H_FIELD_START;
+              break;
+            case H_HEAD_LF:
+              if (c !== 0x0a) throw headParseError("HPE_STRICT", "Expected LF after headers");
+              this.pos = i + 1;
+              return i + 1;
+          }
+        }
+        this.pos = buf.length;
+        return -1;
+      }
+      // One byte of a Content-Length value: digits, then only spaces.
+      _lengthByte(c) {
+        if (c >= 0x30 && c <= 0x39 && !this.lengthSpace) {
+          var digits = this.lengthDigits + String.fromCharCode(c);
+          var significant = digits.replace(/^0+(?=.)/, "");
+          if (
+            significant.length > HEAD_MAX_LENGTH.length ||
+            (significant.length === HEAD_MAX_LENGTH.length && significant > HEAD_MAX_LENGTH)
+          ) {
+            throw headParseError("HPE_INVALID_CONTENT_LENGTH", "Content-Length overflow");
+          }
+          this.lengthDigits = digits;
+        } else if (c === 0x20 && this.lengthDigits !== "") {
+          this.lengthSpace = true;
+        } else {
+          throw headParseError("HPE_INVALID_CONTENT_LENGTH", "Invalid character in Content-Length");
+        }
+      }
+    }
+
+    // node hands an upgraded or tunnelled socket to its new owner unflowing
+    // (socketOnData: `socket.readableFlowing = null`): what arrives before
+    // the owner reads it -- one that attaches its 'data' listener after an
+    // await, or a server that speaks first through the tunnel -- waits in
+    // the socket's buffer, and so does the end of the stream. Without this
+    // those bytes were emitted to no listener and lost.
+    function holdForNewOwner(socket) {
+      if (socket.listenerCount("data") > 0) return;
+      if (typeof socket._holdData === "boolean") {
+        // oam's net.Socket: its read loop keeps what arrives until a 'data'
+        // listener, resume() or read() takes it.
+        if (!socket._readableMode) socket._holdData = true;
+      } else if (socket._readableState && "readableFlowing" in socket) {
+        // A stream.Duplex (a TLSSocket, or an agent's own stream).
+        socket.readableFlowing = null;
+      }
+    }
+
     // The fetch path's headers, as they have always been read: through the
     // fetch Headers class (sorted, repeated names combined).
     function fetchPathHeaders(pairs) {
@@ -20248,6 +20498,11 @@
         var bad = null;
         if (!HTTP_TOKEN.test(this.method)) {
           bad = invalidHttpToken("Method", this.method);
+        } else if (INVALID_PATH_REGEX.test(String(this.path))) {
+          // The constructor refused such a `path`; one assigned since (an
+          // agent rewrites it) would split the request line here, where
+          // the bridge percent-encodes it.
+          bad = codes.ERR_UNESCAPED_CHARACTERS("Request path");
         }
         for (var i = 0; bad === null && i < list.length; i++) {
           if (!HTTP_TOKEN.test(list[i][0])) {
@@ -20280,6 +20535,8 @@
           socket.write(headBytes, written);
         }
         var responseBuf = globalThis.Buffer.alloc(0);
+        // The answer's head, read as node's llhttp reads it (HandReadHead).
+        var headReader = new HandReadHead();
         // node's parser gives up on a head past maxHeaderSize (16 KiB by
         // default): a peer that never ends its head cannot grow this buffer
         // without bound. (The raw head is measured here, CRLFs included --
@@ -20289,37 +20546,34 @@
           socket.removeListener("data", onData);
           self._failBeforeResponse(connResetException("socket hang up"));
         };
+        var refuse = function (err) {
+          socket.removeListener("data", onData);
+          socket.removeListener("end", onEnd);
+          self._failBeforeResponse(withParseReason(err));
+          socket.destroy();
+        };
         var onData = function (chunk) {
           var bytes = typeof chunk === "string" ? globalThis.Buffer.from(chunk, "latin1") : chunk;
           responseBuf = globalThis.Buffer.concat([responseBuf, bytes]);
-          var headerEnd = responseBuf.indexOf("\r\n\r\n");
-          if (headerEnd === -1 || headerEnd > maxHeaderSize) {
-            if (responseBuf.length > maxHeaderSize) {
-              socket.removeListener("data", onData);
-              socket.removeListener("end", onEnd);
-              var overflow = new Error("Parse Error: Header overflow");
-              overflow.code = "HPE_HEADER_OVERFLOW";
-              self._failBeforeResponse(withParseReason(overflow));
-              socket.destroy();
-            }
+          var headEnd;
+          try {
+            headEnd = headReader.feed(responseBuf);
+          } catch (err) {
+            refuse(err);
             return;
           }
+          if ((headEnd === -1 ? responseBuf.length : headEnd) > maxHeaderSize) {
+            var overflow = new Error("Parse Error: Header overflow");
+            overflow.code = "HPE_HEADER_OVERFLOW";
+            refuse(overflow);
+            return;
+          }
+          if (headEnd === -1) return;
           socket.removeListener("data", onData);
           socket.removeListener("end", onEnd);
-          var headStr = responseBuf.slice(0, headerEnd).toString("latin1");
-          var remaining = responseBuf.slice(headerEnd + 4);
-          var lines = headStr.split("\r\n");
-          var statusLine = lines[0] || "";
-          var statusMatch = statusLine.match(/^HTTP\/(\d)\.(\d) (\d{3})(?: (.*))?$/);
-          var statusCode = statusMatch ? Number(statusMatch[3]) : 0;
-          var pairs = [];
-          for (var li = 1; li < lines.length; li++) {
-            var colonIdx = lines[li].indexOf(":");
-            if (colonIdx !== -1) {
-              pairs.push([lines[li].slice(0, colonIdx), lines[li].slice(colonIdx + 1).trim()]);
-            }
-          }
-          var parsed = agentPathHeaders(pairs);
+          var remaining = responseBuf.slice(headEnd);
+          var statusCode = headReader.statusCode;
+          var parsed = agentPathHeaders(headReader.pairs);
           // A non-101 answer is read off the socket as the consumer reads
           // it: the socket is paused while the response is full.
           var socketPaused = false;
@@ -20343,8 +20597,10 @@
           });
           res.aborted = false;
           res.statusCode = statusCode;
-          res.statusMessage = statusMatch && statusMatch[4] ? statusMatch[4] : "";
-          res.httpVersion = statusMatch ? statusMatch[1] + "." + statusMatch[2] : "1.1";
+          res.statusMessage = headReader.statusMessage;
+          res.httpVersionMajor = headReader.major;
+          res.httpVersionMinor = headReader.minor;
+          res.httpVersion = headReader.major + "." + headReader.minor;
           res.headers = parsed.headers;
           res.rawHeaders = parsed.raw;
           res.socket = res.connection = socket;
@@ -20371,6 +20627,7 @@
             if (self.listenerCount(event) === 0) {
               socket.destroy();
             } else {
+              holdForNewOwner(socket);
               self.emit(event, res, socket, remaining);
             }
             self.destroyed = true;
