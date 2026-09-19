@@ -338,6 +338,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("http2ServeTls", op_http2_serve_tls),
         // HTTPS server (TLS-wrapped HTTP, same accept/respond ops)
         ("httpsServe", op_https_serve),
+        ("httpsServerTls", op_https_server_tls),
         // TCP sockets (node:net)
         ("tcpConnect", op_tcp_connect),
         ("tcpRead", op_tcp_read),
@@ -2489,7 +2490,7 @@ fn ms_arg(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -> 
 /// headersTimeout, requestTimeout, keepAliveTimeout + keepAliveTimeoutBuffer,
 /// server.timeout, connectionsCheckingInterval, then whether JS runs the
 /// headers / request check and handles socket timeouts (a node:http
-/// server), then the TLS handshakeTimeout. Missing or invalid values are
+/// server). Missing or invalid values are
 /// node's defaults; a caller that passes nothing (oam.serve) gets them all
 /// and the check runs natively.
 fn timeout_args(
@@ -2511,9 +2512,6 @@ fn timeout_args(
         }
     }
     settings.js_driven = args.get(first + 5).is_true();
-    if let Some(ms) = ms_arg(scope, args.get(first + 6)) {
-        settings.handshake_ms = ms;
-    }
     settings
 }
 
@@ -3002,6 +3000,12 @@ fn op_http2_serve_tls(
 
 // ----------------------------------------------------------------- HTTPS
 
+/// httpsServe(host, port, contextId, handshakeMs, requestCert,
+/// rejectUnauthorized, alpnJson, maxHeaderSize, insecureHTTPParser,
+/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs, jsDriven)
+/// -> Promise<{ serverId, port }>: an https server whose connections are
+/// accepted with the secure context `contextId` (`tlsServerContext`, built
+/// at `https.createServer()`) and those options.
 fn op_https_serve(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -3009,43 +3013,53 @@ fn op_https_serve(
 ) {
     let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
     let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
-    let Some(cert_pem) = arg_string(scope, &args, 2) else {
-        throw_type_error(scope, "httpsServe requires cert PEM");
+    let context_id = args.get(2).number_value(scope).unwrap_or(0.0) as u64;
+    // args 3..=6: handshakeTimeout, requestCert, rejectUnauthorized, ALPN.
+    let Some(options) = accept_option_args(scope, &args, 3, "httpsServe") else {
         return;
     };
-    let Some(key_pem) = arg_string(scope, &args, 3) else {
-        throw_type_error(scope, "httpsServe requires key PEM");
-        return;
-    };
-    // Effective minVersion / maxVersion, validated by the JS https layer (#144);
-    // empty means Node's default range.
-    let min_version = arg_string(scope, &args, 4).filter(|s| !s.is_empty());
-    let max_version = arg_string(scope, &args, 5).filter(|s| !s.is_empty());
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
     }
-    let state = core_runtime!(scope).http();
-    // args 6, 7: maxHeaderSize, insecureHTTPParser.
-    let policy = head_policy_args(scope, &args, 6);
-    // args 8..=14: node's server timeouts (8..=13) and the TLS
-    // handshakeTimeout (14).
-    let timeouts = timeout_args(scope, &args, 8);
+    let core = core_runtime!(scope);
+    let Some(context) = oam_core::tls::server::context(&core.tls(), context_id) else {
+        throw_type_error(scope, "httpsServe: the server's secure context is gone");
+        return;
+    };
+    let state = core.http();
+    // args 7, 8: maxHeaderSize, insecureHTTPParser.
+    let policy = head_policy_args(scope, &args, 7);
+    // args 9..=14: node's server timeouts.
+    let timeouts = timeout_args(scope, &args, 9);
+    let tls = std::sync::Arc::new(oam_core::http_server::HttpsTls::new(context, options));
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::http_server::https_serve(
-            state,
-            host,
-            port,
-            cert_pem,
-            key_pem,
-            min_version,
-            max_version,
-            policy,
-            timeouts,
-        ),
+        oam_core::http_server::https_serve(state, host, port, tls, policy, timeouts),
     );
+}
+
+/// httpsServerTls(serverId, contextId, handshakeMs, requestCert,
+/// rejectUnauthorized, alpnJson): what an https server accepts its next
+/// connections with (`server.setSecureContext()`, a changed `requestCert`,
+/// `rejectUnauthorized` or `ALPNProtocols`).
+fn op_https_server_tls(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let context_id = args.get(1).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(options) = accept_option_args(scope, &args, 2, "httpsServerTls") else {
+        return;
+    };
+    let core = core_runtime!(scope);
+    let Some(context) = oam_core::tls::server::context(&core.tls(), context_id) else {
+        throw_type_error(scope, "httpsServerTls: the server's secure context is gone");
+        return;
+    };
+    core.http().set_https_tls(server_id, context, options);
 }
 
 // ------------------------------------------------------------------- TCP
@@ -3430,6 +3444,47 @@ fn op_tls_shutdown(
     crate::ops::spawn_op(scope, &mut rv, oam_core::tls::tls_shutdown(tls, handle));
 }
 
+/// What a TLS server reads off itself for each connection it accepts
+/// (Node's tlsConnectionListener), from four arguments starting at `first`:
+/// handshakeTimeout in ms (120 s by default, validated in JS), requestCert,
+/// rejectUnauthorized, and ALPNProtocols as a JSON list of names (one char
+/// per byte). None, with a TypeError thrown, for a malformed ALPN list.
+fn accept_option_args(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    first: i32,
+    op: &str,
+) -> Option<oam_core::tls::server::AcceptOptions> {
+    let handshake_ms = args.get(first).number_value(scope).unwrap_or(120_000.0);
+    let handshake_timeout =
+        std::time::Duration::from_millis(if handshake_ms.is_finite() && handshake_ms > 0.0 {
+            handshake_ms as u64
+        } else {
+            120_000
+        });
+    let request_cert = args.get(first + 1).is_true();
+    let reject_unauthorized = args.get(first + 2).is_true();
+    let alpn = match arg_string(scope, args, first + 3) {
+        Some(json) => match serde_json::from_str::<Vec<String>>(&json) {
+            Ok(names) => names
+                .iter()
+                .map(|name| name.chars().map(|c| c as u32 as u8).collect())
+                .collect(),
+            Err(e) => {
+                throw_type_error(scope, &format!("{op}: malformed ALPN list: {e}"));
+                return None;
+            }
+        },
+        None => Vec::new(),
+    };
+    Some(oam_core::tls::server::AcceptOptions {
+        request_cert,
+        reject_unauthorized,
+        alpn,
+        handshake_timeout,
+    })
+}
+
 fn op_tls_accept_wrap(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -3437,36 +3492,9 @@ fn op_tls_accept_wrap(
 ) {
     let tcp_handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let context_id = args.get(1).number_value(scope).unwrap_or(0.0) as u64;
-    // Node's handshakeTimeout, in ms (120 s by default, validated in JS).
-    let handshake_ms = args.get(2).number_value(scope).unwrap_or(120_000.0);
-    let handshake_timeout =
-        std::time::Duration::from_millis(if handshake_ms.is_finite() && handshake_ms > 0.0 {
-            handshake_ms as u64
-        } else {
-            120_000
-        });
-    // What Node reads off the server for this connection: requestCert,
-    // rejectUnauthorized, and ALPNProtocols as names (one char per byte).
-    let request_cert = args.get(3).is_true();
-    let reject_unauthorized = args.get(4).is_true();
-    let alpn = match arg_string(scope, &args, 5) {
-        Some(json) => match serde_json::from_str::<Vec<String>>(&json) {
-            Ok(names) => names
-                .iter()
-                .map(|name| name.chars().map(|c| c as u32 as u8).collect())
-                .collect(),
-            Err(e) => {
-                throw_type_error(scope, &format!("tlsAcceptWrap: malformed ALPN list: {e}"));
-                return;
-            }
-        },
-        None => Vec::new(),
-    };
-    let options = oam_core::tls::server::AcceptOptions {
-        request_cert,
-        reject_unauthorized,
-        alpn,
-        handshake_timeout,
+    // args 2..=5: handshakeTimeout, requestCert, rejectUnauthorized, ALPN.
+    let Some(options) = accept_option_args(scope, &args, 2, "tlsAcceptWrap") else {
+        return;
     };
     let core = core_runtime!(scope);
     let tls = core.tls();

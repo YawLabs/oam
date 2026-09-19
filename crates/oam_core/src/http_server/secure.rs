@@ -82,6 +82,7 @@ pub fn http2_serve_tls(
                 queue: Some(queue_rx),
                 shutdown: Some(shutdown_tx),
                 timeouts: Some(Arc::clone(&timeouts)),
+                tls: None,
             },
         );
     let watch = ConnWatch::new(state.next_id(), session_id, Arc::clone(&timeouts));
@@ -107,6 +108,7 @@ pub fn http2_serve_tls(
                     req,
                     true,
                     addrs,
+                    None,
                     policy,
                     Some(Arc::clone(&service_watch)),
                     Upgrades::CloseConnect,
@@ -166,6 +168,7 @@ async fn serve_h2(
             req,
             true,
             addrs,
+            None,
             policy,
             Some(Arc::clone(&service_watch)),
             Upgrades::Serve,

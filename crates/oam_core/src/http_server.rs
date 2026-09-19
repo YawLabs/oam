@@ -110,11 +110,25 @@ pub struct IncomingRequest {
     /// The request has no body: an HTTP/2 request whose HEADERS frame ended
     /// the stream (node's `endAfterHeaders`, END_STREAM in 'stream' flags).
     pub end_stream: bool,
+    /// On an https server: what the connection's TLS handshake settled
+    /// (`HandshakeInfo::to_json`), which `req.socket` reports --
+    /// `authorized`, `authorizationError`, `getPeerCertificate()`,
+    /// `alpnProtocol`, `getProtocol()`, ... Shared by every request on the
+    /// connection.
+    pub tls: Option<Arc<serde_json::Value>>,
 }
 
 /// What a server's accept queue carries to JS.
 pub enum ServerEvent {
     Request(IncomingRequest),
+    /// An https server's connection whose TLS handshake failed (node's
+    /// 'tlsClientError', which the https server passes on as 'clientError'):
+    /// node's code for it, when it has one, and the message.
+    TlsClientError {
+        conn: ConnAddrs,
+        code: Option<String>,
+        message: String,
+    },
     /// A connection's socket timeout expired (node's socket 'timeout'): JS
     /// emits 'timeout' and destroys the connection when nobody listens.
     Timeout {
@@ -311,6 +325,50 @@ struct ServerEntry {
     /// node's timeout settings for the server's connections (none for the
     /// http2 server).
     timeouts: Option<Arc<ServerTimeouts>>,
+    /// An https server's TLS side, which JS replaces for the connections
+    /// accepted from then on (`https_set_tls`).
+    tls: Option<Arc<HttpsTls>>,
+}
+
+/// An https server's TLS side: its secure context (`tls::server`, built at
+/// `https.createServer()`) and what each connection is accepted with --
+/// `requestCert`, `rejectUnauthorized`, the ALPN list, `handshakeTimeout` --
+/// read for every connection, as node's tlsConnectionListener reads them off
+/// the server. `server.setSecureContext()` and a changed option swap it;
+/// connections already accepted keep what they were accepted with.
+pub struct HttpsTls(
+    Mutex<(
+        Arc<crate::tls::server::ServerContext>,
+        crate::tls::server::AcceptOptions,
+    )>,
+);
+
+impl HttpsTls {
+    pub fn new(
+        context: Arc<crate::tls::server::ServerContext>,
+        options: crate::tls::server::AcceptOptions,
+    ) -> Self {
+        HttpsTls(Mutex::new((context, options)))
+    }
+
+    /// What the next connection is accepted with.
+    fn current(
+        &self,
+    ) -> (
+        Arc<crate::tls::server::ServerContext>,
+        crate::tls::server::AcceptOptions,
+    ) {
+        let guard = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (Arc::clone(&guard.0), guard.1.clone())
+    }
+
+    fn replace(
+        &self,
+        context: Arc<crate::tls::server::ServerContext>,
+        options: crate::tls::server::AcceptOptions,
+    ) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = (context, options);
+    }
 }
 
 #[derive(Default)]
@@ -433,6 +491,26 @@ impl HttpState {
             .and_then(|entry| entry.timeouts.clone())
         {
             timeouts.set_upgrade_listener(listening);
+        }
+    }
+
+    /// An https server's new secure context and accept options
+    /// (`server.setSecureContext()`, a changed `requestCert`, ...), for the
+    /// connections it accepts from now on.
+    pub fn set_https_tls(
+        &self,
+        server_id: u64,
+        context: Arc<crate::tls::server::ServerContext>,
+        options: crate::tls::server::AcceptOptions,
+    ) {
+        if let Some(tls) = self
+            .servers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&server_id)
+            .and_then(|entry| entry.tls.clone())
+        {
+            tls.replace(context, options);
         }
     }
 
@@ -1095,6 +1173,7 @@ pub async fn http_serve(
                 queue: Some(queue_rx),
                 shutdown: Some(shutdown_tx),
                 timeouts: Some(Arc::clone(&server_timeouts)),
+                tls: None,
             },
         );
     if !server_timeouts.js_driven() {
@@ -1163,6 +1242,7 @@ pub async fn http_serve(
                                 req,
                                 conn_stream_bodies, // per-server opt-in
                                 conn_addrs,
+                                None,
                                 policy,
                                 Some(Arc::clone(&service_watch)),
                                 upgrades.clone(),
@@ -1206,6 +1286,7 @@ pub async fn http_serve(
                                 conn_id: None,
                                 head: head.to_vec(),
                                 end_stream: false,
+                                tls: None,
                             }))
                             .await;
                     });
@@ -1546,6 +1627,8 @@ async fn handle_request(
     req: hyper::Request<hyper::body::Incoming>,
     stream_request_body: bool,
     conn: ConnAddrs,
+    // An https connection's handshake (IncomingRequest::tls).
+    tls: Option<Arc<serde_json::Value>>,
     policy: HeadPolicy,
     watch: Option<Arc<ConnWatch>>,
     upgrades: Upgrades,
@@ -1564,6 +1647,7 @@ async fn handle_request(
         req,
         stream_request_body,
         conn,
+        tls,
         policy,
         id,
         message_done,
@@ -1582,6 +1666,7 @@ async fn dispatch_request(
     req: hyper::Request<hyper::body::Incoming>,
     stream_request_body: bool,
     conn: ConnAddrs,
+    tls: Option<Arc<serde_json::Value>>,
     policy: HeadPolicy,
     id: u64,
     message_done: MessageDone,
@@ -1766,6 +1851,7 @@ async fn dispatch_request(
             conn_id,
             head: Vec::new(),
             end_stream,
+            tls,
         }))
         .await;
     if sent.is_err() {
@@ -1792,39 +1878,27 @@ async fn dispatch_request(
     }
 }
 
-/// Bind a TLS-wrapped HTTP server. Same as http_serve but each accepted
-/// connection goes through a TLS handshake before reaching hyper. The
-/// request/response lifecycle is identical (shared HttpState, same ops).
+/// Bind an https server: http_serve's request/response lifecycle (shared
+/// HttpState, same accept/respond ops), each accepted connection first taken
+/// through node:tls's server handshake (`tls::server::accept_stream`) with
+/// the server's secure context and options. So `requestCert`,
+/// `rejectUnauthorized` and `ca`, the ALPN list and `handshakeTimeout` hold
+/// exactly as they do for tls.createServer: a client the server refuses
+/// never reaches the HTTP layer. A handshake that fails is reported to JS
+/// (node's 'tlsClientError'); a connection that completes it is served as
+/// HTTP/1.1, its requests carrying what the handshake settled.
 #[allow(clippy::too_many_arguments)]
 pub async fn https_serve(
     state: Arc<HttpState>,
     host: String,
     port: u16,
-    cert_pem: String,
-    key_pem: String,
-    min_version: Option<String>,
-    max_version: Option<String>,
+    // The secure context and accept options, replaceable from JS.
+    tls: Arc<HttpsTls>,
     // maxHeaderSize / insecureHTTPParser for this server.
     policy: HeadPolicy,
-    // node's server timeouts, and the TLS handshakeTimeout.
+    // node's server timeouts.
     timeouts: TimeoutSettings,
 ) -> super::OpOutcome {
-    // The server's minVersion / maxVersion (#144), already validated by the JS
-    // https layer; empty means Node's default range. A range with nothing to
-    // offer still binds -- Node's server does, and fails each handshake -- so
-    // the acceptor is absent and every connection is refused with the alert
-    // the client expects (`refuse_no_protocols`). Node also emits
-    // `tlsClientError` per connection there; this server has no
-    // per-connection channel to JS, so that event is not raised (documented).
-    let acceptor =
-        match crate::tls::protocol_versions(min_version.as_deref(), max_version.as_deref()) {
-            Ok(versions) => match crate::tls::build_server_config(&cert_pem, &key_pem, &versions) {
-                Ok(c) => Some(tokio_rustls::TlsAcceptor::from(c)),
-                Err(e) => return super::OpOutcome::Failed(format!("https tls config: {e}")),
-            },
-            Err(_) => None,
-        };
-
     let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
         Ok(listener) => listener,
         Err(e) => return super::OpOutcome::Failed(format!("listen {host}:{port}: {e}")),
@@ -1844,6 +1918,7 @@ pub async fn https_serve(
                 queue: Some(queue_rx),
                 shutdown: Some(shutdown_tx),
                 timeouts: Some(Arc::clone(&server_timeouts)),
+                tls: Some(Arc::clone(&tls)),
             },
         );
     if !server_timeouts.js_driven() {
@@ -1875,65 +1950,72 @@ pub async fn https_serve(
                         drop(stream);
                         continue;
                     };
-                    let Some(conn_acceptor) = acceptor.clone() else {
-                        tokio::spawn(async move {
-                            let _slot = slot;
-                            crate::tls::refuse_no_protocols(stream).await;
-                        });
-                        continue;
-                    };
+                    // What this connection is accepted with: the server's
+                    // context and options as they are now.
+                    let (context, options) = tls.current();
                     let conn_state = accept_state.clone();
                     let conn_queue = queue_tx.clone();
                     let conn_timeouts = Arc::clone(&server_timeouts);
                     let mut conn_shutdown = shutdown_rx.clone();
+                    // Everything after the accept runs on the connection's
+                    // own task: a client that never finishes its handshake
+                    // holds up no one else.
                     tokio::spawn(async move {
-                        let _slot = slot;
-                        // node's handshakeTimeout (120 s by default): a client
-                        // that never completes the handshake is dropped (node
-                        // also emits 'tlsClientError', which oam does not).
-                        let tls_stream = tokio::select! {
-                            accepted = tokio::time::timeout(
-                                conn_timeouts.handshake(),
-                                conn_acceptor.accept(stream),
-                            ) => match accepted {
-                                Ok(Ok(s)) => s,
-                                // Handshake failed or timed out: drop it.
-                                _ => return,
-                            },
+                        let slot = slot;
+                        let handshake = tokio::select! {
+                            accepted = crate::tls::server::accept_stream(
+                                stream, &context, &options,
+                            ) => accepted,
                             _ = conn_shutdown.changed() => return,
                         };
-                        // node's http timeouts start once the TLS connection
-                        // is up (its http side sees 'secureConnection').
-                        let watch =
-                            ConnWatch::new(conn_state.next_id(), server_id, conn_timeouts.clone());
-                        let _registration = conn_state.register_conn(Arc::clone(&watch));
-                        let js_driven = conn_timeouts.js_driven();
-                        let service_queue = conn_queue.clone();
-                        let service_watch = Arc::clone(&watch);
-                        let service = hyper::service::service_fn(move |req| {
-                            handle_request(
-                                conn_state.clone(),
-                                service_queue.clone(),
-                                req,
-                                false, // TLS: buffered until a later slice
-                                conn_addrs,
-                                policy,
-                                Some(Arc::clone(&service_watch)),
-                                Upgrades::CloseConnect,
-                            )
-                        });
-                        serve_http1(
-                            tls_stream,
-                            watch,
-                            policy,
-                            service,
-                            conn_queue,
-                            js_driven,
-                            conn_addrs,
-                            conn_shutdown,
-                            None,
-                        )
-                        .await;
+                        let refusal = match handshake {
+                            Ok((tls_stream, info)) => {
+                                // node's onServerSocketSecure: a certificate
+                                // that did not verify, under
+                                // rejectUnauthorized, and the socket is
+                                // destroyed before 'secureConnection' (a
+                                // resumed session's; a chain sent in the
+                                // handshake was refused there).
+                                if options.request_cert
+                                    && options.reject_unauthorized
+                                    && !info.authorized
+                                {
+                                    drop(tls_stream);
+                                    Some((
+                                        Some("ECONNRESET".to_string()),
+                                        "socket hang up".to_string(),
+                                    ))
+                                } else {
+                                    serve_https_connection(
+                                        tls_stream,
+                                        info,
+                                        conn_state,
+                                        conn_queue.clone(),
+                                        conn_timeouts,
+                                        server_id,
+                                        conn_addrs,
+                                        policy,
+                                        conn_shutdown,
+                                    )
+                                    .await;
+                                    None
+                                }
+                            }
+                            Err(failed) => Some(failure_parts(failed)),
+                        };
+                        // The connection is gone: it no longer counts
+                        // against maxConnections, and JS hears why (node's
+                        // 'tlsClientError').
+                        drop(slot);
+                        if let Some((code, message)) = refusal {
+                            let _ = conn_queue
+                                .send(ServerEvent::TlsClientError {
+                                    conn: conn_addrs,
+                                    code,
+                                    message,
+                                })
+                                .await;
+                        }
                     });
                 }
             }
@@ -1943,6 +2025,56 @@ pub async fn https_serve(
     super::OpOutcome::Json(
         serde_json::json!({ "serverId": server_id, "port": local_port }).to_string(),
     )
+}
+
+/// One https connection past its handshake, served as HTTP/1.1 until it
+/// ends. node's http timeouts start here (its http side sees
+/// 'secureConnection').
+#[allow(clippy::too_many_arguments)]
+async fn serve_https_connection(
+    tls_stream: tokio_rustls::server::TlsStream<crate::tls::server::ServerIo>,
+    info: crate::tls::server::HandshakeInfo,
+    state: Arc<HttpState>,
+    queue: mpsc::Sender<ServerEvent>,
+    timeouts: Arc<ServerTimeouts>,
+    server_id: u64,
+    conn_addrs: ConnAddrs,
+    policy: HeadPolicy,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let tls_meta = Some(Arc::new(info.to_json()));
+    let watch = ConnWatch::new(state.next_id(), server_id, Arc::clone(&timeouts));
+    let _registration = state.register_conn(Arc::clone(&watch));
+    let js_driven = timeouts.js_driven();
+    let service_queue = queue.clone();
+    let service_watch = Arc::clone(&watch);
+    let service = hyper::service::service_fn(move |req| {
+        handle_request(
+            Arc::clone(&state),
+            service_queue.clone(),
+            req,
+            false, // TLS: buffered until a later slice
+            conn_addrs,
+            tls_meta.clone(),
+            policy,
+            Some(Arc::clone(&service_watch)),
+            Upgrades::CloseConnect,
+        )
+    });
+    serve_http1(
+        tls_stream, watch, policy, service, queue, js_driven, conn_addrs, shutdown, None,
+    )
+    .await;
+}
+
+/// A failed handshake's error as 'tlsClientError' carries it: node's code,
+/// when there is one, and the message.
+fn failure_parts(failed: super::OpOutcome) -> (Option<String>, String) {
+    match failed {
+        super::OpOutcome::NodeFailed { code, message, .. } => (Some(code), message),
+        super::OpOutcome::Failed(message) => (None, message),
+        _ => (None, "TLS handshake failed".to_string()),
+    }
 }
 
 /// Long-poll the next request. Json metadata, or Done when the server
@@ -1998,6 +2130,9 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
             if request.end_stream {
                 meta["endStream"] = serde_json::json!(true);
             }
+            if let Some(tls) = &request.tls {
+                meta["tls"] = serde_json::Value::clone(tls);
+            }
             if let Some(conn_id) = request.conn_id {
                 meta["connectionId"] = serde_json::json!(conn_id);
             }
@@ -2028,6 +2163,19 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
         }
         Some(ServerEvent::Drop { conn }) => {
             let mut meta = serde_json::json!({ "event": "drop" });
+            conn.write_meta(&mut meta);
+            super::OpOutcome::Json(meta.to_string())
+        }
+        Some(ServerEvent::TlsClientError {
+            conn,
+            code,
+            message,
+        }) => {
+            let mut meta = serde_json::json!({
+                "event": "tlsClientError",
+                "code": code,
+                "message": message,
+            });
             conn.write_meta(&mut meta);
             super::OpOutcome::Json(meta.to_string())
         }
@@ -2082,6 +2230,7 @@ pub async fn http2_serve(
                 queue: Some(queue_rx),
                 shutdown: Some(shutdown_tx),
                 timeouts: Some(Arc::clone(&server_timeouts)),
+                tls: None,
             },
         );
     tokio::spawn(check_connections(
@@ -2163,6 +2312,7 @@ pub async fn http2_serve(
                                     req,
                                     false, // http2: buffered until a later slice
                                     conn_addrs,
+                                    None,
                                     policy,
                                     None,
                                     Upgrades::Serve,
@@ -2197,6 +2347,7 @@ pub async fn http2_serve(
                                     req,
                                     false, // http2: buffered until a later slice
                                     conn_addrs,
+                                    None,
                                     policy,
                                     Some(Arc::clone(&service_watch)),
                                     Upgrades::CloseConnect,

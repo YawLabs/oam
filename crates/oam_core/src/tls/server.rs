@@ -1005,19 +1005,19 @@ impl tokio::io::AsyncWrite for ServerIo {
 }
 
 /// Drop a connection whose client certificate was refused, as Node's
-/// server drops it (`socket.destroy()` straight from the handshake): a
-/// client that has already sent something past its handshake -- an HTTP/2
-/// client's preface -- is reset, having data unread on a closed socket; one
-/// that sent nothing sees the connection end.
-fn close_refused_connection(mut stream: tokio_rustls::server::TlsStream<ServerIo>) {
-    let (io, conn) = stream.get_mut();
-    let buffered = conn
-        .process_new_packets()
-        .map(|state| state.plaintext_bytes_to_read() > 0)
-        .unwrap_or(true);
+/// server drops it (`socket.destroy()` straight from the handshake). Node
+/// has read everything the client had sent by then (its TLS layer takes
+/// all the socket holds), so what the client sent right behind its
+/// handshake -- a request, an HTTP/2 preface -- is no reason for a reset:
+/// the connection ends (measured on v22.22.2: a TLS 1.3 client that writes
+/// a request on 'secureConnect' sees 'end', no error). Only bytes still
+/// unread in the socket make the close a reset, as closing over unread
+/// data does in Node.
+fn close_refused_connection(stream: tokio_rustls::server::TlsStream<ServerIo>) {
+    let (io, _) = stream.get_ref();
     let mut probe = [0u8; 1];
     let pending = matches!(io.tcp.try_read(&mut probe), Ok(n) if n > 0);
-    if buffered || pending {
+    if pending {
         let _ = socket2::SockRef::from(&io.tcp).set_linger(Some(std::time::Duration::ZERO));
     }
     drop(stream);
@@ -1037,43 +1037,71 @@ pub struct AcceptOptions {
     pub handshake_timeout: Duration,
 }
 
-/// Accept one TLS connection on an accepted TCP socket with the server's
-/// context: the handshake, bounded by `handshake_timeout` (Node's
-/// `handshakeTimeout`, `ERR_TLS_HANDSHAKE_TIMEOUT` when it runs out), then
-/// Node's verdict on a requested client certificate. Resolves Json {handle,
-/// protocol, cipher, cipherStandardName, alpnProtocol, servername,
-/// authorized, authorizationError, peerCertificates?, localAddr?,
-/// remoteAddr?}; a failed handshake rejects with Node's code for it.
-pub async fn tls_accept(
-    tls_registry: TlsRegistry,
-    tcp_registry: crate::tcp::TcpRegistry,
-    ids: Arc<std::sync::atomic::AtomicU64>,
-    tcp_handle: u64,
-    context: Arc<ServerContext>,
-    options: AcceptOptions,
-) -> OpOutcome {
-    let handshake_timeout = options.handshake_timeout;
-    let Some((reader, writer)) = tcp_registry
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take_halves(tcp_handle)
-    else {
-        return OpOutcome::Failed(format!("tls accept: tcp handle {tcp_handle} is gone"));
-    };
-    let tcp_stream = match reader.reunite(writer) {
-        Ok(s) => s,
-        Err(e) => return OpOutcome::Failed(format!("tls accept: reunite failed: {e}")),
-    };
+/// What a server handshake settled, as Node's server-side TLSSocket reports
+/// it: the version and cipher, the negotiated ALPN protocol and SNI name,
+/// and -- when the server asked for a client certificate -- Node's verdict
+/// on it and the chain the client sent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HandshakeInfo {
+    pub protocol: String,
+    pub cipher: String,
+    pub cipher_standard_name: String,
+    /// `alpnProtocol` (None: nothing negotiated, Node's `false`).
+    pub alpn: Option<String>,
+    /// `servername` (None: the client sent no SNI, Node's `false`).
+    pub servername: Option<String>,
+    /// `authorized`: only ever true when a certificate was requested.
+    pub authorized: bool,
+    /// `authorizationError`: Node's code for a requested certificate that
+    /// did not verify (or was not sent).
+    pub authorization_error: Option<&'static str>,
+    /// The client's chain, leaf first, base64 DER (what
+    /// `getPeerCertificate()` is built from).
+    pub peer_certificates: Option<Vec<String>>,
+}
 
+impl HandshakeInfo {
+    /// The fields as the JS side reads them.
+    pub fn to_json(&self) -> serde_json::Value {
+        let mut info = serde_json::json!({
+            "protocol": self.protocol,
+            "cipher": self.cipher,
+            "cipherStandardName": self.cipher_standard_name,
+            "alpnProtocol": self.alpn,
+            "servername": self.servername,
+            "authorized": self.authorized,
+            "authorizationError": self.authorization_error,
+        });
+        if let Some(chain) = &self.peer_certificates {
+            info["peerCertificates"] = serde_json::Value::from(chain.clone());
+        }
+        info
+    }
+}
+
+/// Run a server handshake on an accepted TCP connection with the server's
+/// context: bounded by `handshake_timeout` (Node's `handshakeTimeout`,
+/// `ERR_TLS_HANDSHAKE_TIMEOUT` when it runs out), then Node's verdict on a
+/// requested client certificate. A failed handshake is Node's error for it
+/// (what a server's 'tlsClientError' carries); the connection has then been
+/// answered and is being closed the way OpenSSL's server closes it.
+///
+/// Shared by the node:tls server (`tls_accept`, which hands the connection
+/// to JS) and the https server (`https_serve`, which serves it natively).
+pub async fn accept_stream(
+    tcp_stream: tokio::net::TcpStream,
+    context: &ServerContext,
+    options: &AcceptOptions,
+) -> Result<(tokio_rustls::server::TlsStream<ServerIo>, HandshakeInfo), OpOutcome> {
     // A server range with nothing to offer fails this connection with Node's
     // per-connection code; the socket is answered with the alert the client
-    // expects, off this op.
+    // expects, off this task.
     let Some(plain) = &context.plain else {
         tokio::spawn(refuse_no_protocols(tcp_stream));
-        return OpOutcome::node_failed(
+        return Err(OpOutcome::node_failed(
             "ERR_SSL_NO_PROTOCOLS_AVAILABLE",
             "no protocols available for the requested TLS version range".to_string(),
-        );
+        ));
     };
     let verdict = Arc::new(VerdictSlot {
         reject: options.request_cert && options.reject_unauthorized,
@@ -1129,7 +1157,7 @@ pub async fn tls_accept(
                 .cipher_suites()
                 .iter()
                 .any(|suite| (0x1301..=0x1305).contains(&u16::from(*suite)));
-        let config = context.config_for(plain, &options, &verdict, !tls13);
+        let config = context.config_for(plain, options, &verdict, !tls13);
         match start.into_stream(config).into_fallible().await {
             Ok(stream) => Ok(stream),
             Err((e, io)) => match verdict.gate() {
@@ -1152,23 +1180,24 @@ pub async fn tls_accept(
             },
         }
     };
-    let tls_stream = match tokio::time::timeout(handshake_timeout, handshake).await {
+    let tls_stream = match tokio::time::timeout(options.handshake_timeout, handshake).await {
         Ok(Ok(stream)) => stream,
-        Ok(Err(failed)) => return failed,
+        Ok(Err(failed)) => return Err(failed),
         Err(_) => {
-            return OpOutcome::node_failed("ERR_TLS_HANDSHAKE_TIMEOUT", "TLS handshake timeout");
+            return Err(OpOutcome::node_failed(
+                "ERR_TLS_HANDSHAKE_TIMEOUT",
+                "TLS handshake timeout",
+            ));
         }
     };
     // A refusal whose queued flight was already out (nothing left to write
-    // after the verdict): the connection still never reaches JS.
+    // after the verdict): the connection still goes no further.
     if verdict.gate() != Gate::Open {
         close_refused_connection(tls_stream);
-        return socket_hang_up();
+        return Err(socket_hang_up());
     }
 
-    let (io, server_conn) = tls_stream.get_ref();
-    let local_addr = io.tcp.local_addr().ok();
-    let remote_addr = io.tcp.peer_addr().ok();
+    let (_, server_conn) = tls_stream.get_ref();
     let protocol = server_conn
         .protocol_version()
         .map(protocol_name)
@@ -1198,6 +1227,52 @@ pub async fn tls_accept(
     } else {
         (false, None)
     };
+    Ok((
+        tls_stream,
+        HandshakeInfo {
+            protocol,
+            cipher,
+            cipher_standard_name,
+            alpn,
+            servername,
+            authorized,
+            authorization_error,
+            peer_certificates,
+        },
+    ))
+}
+
+/// Accept one TLS connection on an accepted TCP socket of a node:tls server
+/// (`accept_stream`) and register it for JS. Resolves Json {handle,
+/// protocol, cipher, cipherStandardName, alpnProtocol, servername,
+/// authorized, authorizationError, peerCertificates?, localAddr?,
+/// remoteAddr?}; a failed handshake rejects with Node's code for it.
+pub async fn tls_accept(
+    tls_registry: TlsRegistry,
+    tcp_registry: crate::tcp::TcpRegistry,
+    ids: Arc<std::sync::atomic::AtomicU64>,
+    tcp_handle: u64,
+    context: Arc<ServerContext>,
+    options: AcceptOptions,
+) -> OpOutcome {
+    let Some((reader, writer)) = tcp_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take_halves(tcp_handle)
+    else {
+        return OpOutcome::Failed(format!("tls accept: tcp handle {tcp_handle} is gone"));
+    };
+    let tcp_stream = match reader.reunite(writer) {
+        Ok(s) => s,
+        Err(e) => return OpOutcome::Failed(format!("tls accept: reunite failed: {e}")),
+    };
+    let (tls_stream, info) = match accept_stream(tcp_stream, &context, &options).await {
+        Ok(accepted) => accepted,
+        Err(failed) => return failed,
+    };
+    let (io, _) = tls_stream.get_ref();
+    let local_addr = io.tcp.local_addr().ok();
+    let remote_addr = io.tcp.peer_addr().ok();
 
     let handle = ids.fetch_add(1, Ordering::Relaxed);
     let (reader, writer) = tokio::io::split(tls_stream);
@@ -1207,19 +1282,8 @@ pub async fn tls_accept(
         guard.writers.insert(handle, TlsWriter::Server(writer));
     }
 
-    let mut payload = serde_json::json!({
-        "handle": handle,
-        "protocol": protocol,
-        "cipher": cipher,
-        "cipherStandardName": cipher_standard_name,
-        "alpnProtocol": alpn,
-        "servername": servername,
-        "authorized": authorized,
-        "authorizationError": authorization_error,
-    });
-    if let Some(chain) = peer_certificates {
-        payload["peerCertificates"] = serde_json::Value::from(chain);
-    }
+    let mut payload = info.to_json();
+    payload["handle"] = serde_json::Value::from(handle);
     if let Some(la) = local_addr {
         payload["localAddr"] = crate::tcp::addr_to_json(la);
     }

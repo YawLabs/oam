@@ -21645,6 +21645,149 @@ process.exit(0);
     );
 }
 
+// A throwaway P-256 CA (valid 2025-2125), the localhost leaf it signed, a
+// client leaf it signed (clientAuth), and a self-signed "rogue" client
+// certificate: conformance case 150's fixtures, for the mutual-TLS tests.
+const MTLS_CA_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBmjCCAUGgAwIBAgIUHjF3aO/Nr2SNMEQNV9GNuumIljswCgYIKoZIzj0EAwIw
+GjEYMBYGA1UEAwwPb2FtIGgycyB0ZXN0IENBMCAXDTI1MDEwMTAwMDAwMFoYDzIx
+MjUwMTAxMDAwMDAwWjAaMRgwFgYDVQQDDA9vYW0gaDJzIHRlc3QgQ0EwWTATBgcq
+hkjOPQIBBggqhkjOPQMBBwNCAAR6EfahtynuI8VLuixWn6GiZ3BYWFdJEqP1FfLE
+lCBVF/69Rm6fDrzSVP/GWO7qsNhAZmyIVWyRQJcQiBv55omto2MwYTAdBgNVHQ4E
+FgQUOlIo6O4tIFNjD7vXJV51FU2DLQcwHwYDVR0jBBgwFoAUOlIo6O4tIFNjD7vX
+JV51FU2DLQcwDwYDVR0TAQH/BAUwAwEB/zAOBgNVHQ8BAf8EBAMCAQYwCgYIKoZI
+zj0EAwIDRwAwRAIgFFCfCAiuzT1cHBF7zAQEVxSrWsoco8cOD49S6whO4vsCIC/T
+xtSxdoSsByDfaJz7qxOrhJzSD5lDwUdNMe3EoP9l
+-----END CERTIFICATE-----"#;
+
+const MTLS_SERVER_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBvjCCAWWgAwIBAgIUOy7BLDqzc+0IZz2NWG95hnXgrd4wCgYIKoZIzj0EAwIw
+GjEYMBYGA1UEAwwPb2FtIGgycyB0ZXN0IENBMCAXDTI1MDEwMTAwMDAwMFoYDzIx
+MjUwMTAxMDAwMDAwWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIB
+BggqhkjOPQMBBwNCAATIZSROMPcNXcmsamcAQ6VM5NzCkR0bj0ngz5dpnyIRlajs
+UptN/qPisRoVJ5BqZjfz4MS1vVN0KGg7vDRoCO1Vo4GMMIGJMBoGA1UdEQQTMBGC
+CWxvY2FsaG9zdIcEfwAAATAJBgNVHRMEAjAAMAsGA1UdDwQEAwIHgDATBgNVHSUE
+DDAKBggrBgEFBQcDATAdBgNVHQ4EFgQUmxnUU2rP4FwgoXrkCkeRxNgCVycwHwYD
+VR0jBBgwFoAUOlIo6O4tIFNjD7vXJV51FU2DLQcwCgYIKoZIzj0EAwIDRwAwRAIg
+ItB5f9aIsf9D8cXBvJvvr5ahB57RK7DgAsIVf5uJ0zcCIBPOR2Z+ycbeeByMKH2v
+shKfeR1QdaoQHwJKJln0q1fo
+-----END CERTIFICATE-----"#;
+
+const MTLS_SERVER_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgQLidYpqFITu5wno8
+Fw5b5Ahrg5eTwH0UqA7RU57egNKhRANCAATIZSROMPcNXcmsamcAQ6VM5NzCkR0b
+j0ngz5dpnyIRlajsUptN/qPisRoVJ5BqZjfz4MS1vVN0KGg7vDRoCO1V
+-----END PRIVATE KEY-----"#;
+
+const MTLS_CLIENT_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBoTCCAUigAwIBAgIUOy7BLDqzc+0IZz2NWG95hnXgrd8wCgYIKoZIzj0EAwIw
+GjEYMBYGA1UEAwwPb2FtIGgycyB0ZXN0IENBMCAXDTI1MDEwMTAwMDAwMFoYDzIx
+MjUwMTAxMDAwMDAwWjAVMRMwEQYDVQQDDApvYW0gY2xpZW50MFkwEwYHKoZIzj0C
+AQYIKoZIzj0DAQcDQgAEulhTChDco8oZzXpPqo3iqtybv/nUXKwS67GiGZ23ra4b
+5Ta8McX1MVv2p0WA1/JYyncszN9kbKwE1oeV0Q0lTKNvMG0wCQYDVR0TBAIwADAL
+BgNVHQ8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwIwHQYDVR0OBBYEFCk7s+uR
+ZEuahksP0Vn6QPqJ+TmIMB8GA1UdIwQYMBaAFDpSKOjuLSBTYw+71yVedRVNgy0H
+MAoGCCqGSM49BAMCA0cAMEQCIFOOnRBbxbAbIOcU15I7xnKlD5QXj7P2ZHQbxax0
+goFxAiBEgrUhNh9pzkHEQGCdqJNAtqjNUURu8GVWs9re4QYI7A==
+-----END CERTIFICATE-----"#;
+
+const MTLS_CLIENT_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgT9C7qt8YZkF23ize
+WR5qGRqTlTsUdSjwsf/UmBhdckihRANCAAS6WFMKENyjyhnNek+qjeKq3Ju/+dRc
+rBLrsaIZnbetrhvlNrwxxfUxW/anRYDX8ljKdyzM32RsrATWh5XRDSVM
+-----END PRIVATE KEY-----"#;
+
+const MTLS_ROGUE_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIIBmTCCAUCgAwIBAgIUGlc1ru8HwNb+Q/Mu7dMCNPfAocswCgYIKoZIzj0EAwIw
+FzEVMBMGA1UEAwwMcm9ndWUgY2xpZW50MCAXDTI1MDEwMTAwMDAwMFoYDzIxMjUw
+MTAxMDAwMDAwWjAXMRUwEwYDVQQDDAxyb2d1ZSBjbGllbnQwWTATBgcqhkjOPQIB
+BggqhkjOPQMBBwNCAAQ9RwUp47J8lOK3t92HA7gbn6/in8YmMNmd1xdfCfmgKTMz
+lDyFz1VM0dwI6KtooNv0ubR8/KmhnJS0yFCugC2Lo2gwZjAdBgNVHQ4EFgQU/7mR
+Dyd3M2+3xDFCFAhtl1mUL9kwHwYDVR0jBBgwFoAU/7mRDyd3M2+3xDFCFAhtl1mU
+L9kwDwYDVR0TAQH/BAUwAwEB/zATBgNVHSUEDDAKBggrBgEFBQcDAjAKBggqhkjO
+PQQDAgNHADBEAiAccfsRWDhnWobD+9J8R2fydTxf4E/ePbkue9NfHCHqcQIgRVGb
+asDZ6pyGf669FP4nlBCxQetAmb5ZvRlSGk6/Cus=
+-----END CERTIFICATE-----"#;
+
+const MTLS_ROGUE_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgkuM3bXg9HbW/PUGA
+46UkXUruDFYrEDyq5MRBWtc1XD6hRANCAAQ9RwUp47J8lOK3t92HA7gbn6/in8Ym
+MNmd1xdfCfmgKTMzlDyFz1VM0dwI6KtooNv0ubR8/KmhnJS0yFCugC2L
+-----END PRIVATE KEY-----"#;
+
+/// An https server that requires a client certificate serves only a client
+/// whose certificate its `ca` signed; a client with none, or with one the CA
+/// did not sign, never reaches the handler, and the server hears why
+/// ('clientError'). Under rejectUnauthorized: false every client is served
+/// and req.socket (and req.client) reports node's verdict. oam's https
+/// server used to ignore requestCert / rejectUnauthorized / ca and serve
+/// every client, with no handshake details on req.socket. The clients here
+/// are oam's own tls.connect, so the test needs no node.
+#[test]
+fn https_server_requires_the_client_certificate_it_asks_for() {
+    let src = r#"import https from 'node:https';
+import tls from 'node:tls';
+const CA = `__CA__`;
+const connect = (port, opts) => new Promise((resolve) => {
+  let data = '';
+  const s = tls.connect({ host: '127.0.0.1', port, servername: 'localhost', rejectUnauthorized: false, ...opts }, () => {
+    s.write('GET /private HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n');
+  });
+  s.setEncoding('utf8');
+  s.on('data', (d) => (data += d));
+  s.on('error', () => {});
+  s.on('close', () => resolve(data ? data.split('\r\n')[0] + ' ' + data.split('\r\n\r\n')[1] : 'refused'));
+  setTimeout(() => s.destroy(), 4000).unref();
+});
+for (const rejectUnauthorized of [true, false]) {
+  const seen = [];
+  const server = https.createServer({ key: `__KEY__`, cert: `__CERT__`, ca: [CA], requestCert: true, rejectUnauthorized }, (req, res) => {
+    const peer = req.socket.getPeerCertificate();
+    seen.push('request authorized=' + req.client.authorized + ' error=' + req.socket.authorizationError + ' peer=' + (peer.subject ? peer.subject.CN : 'none'));
+    res.end(req.socket.authorized ? 'secret' : 'public');
+  });
+  server.on('clientError', (err, socket) => {
+    seen.push('clientError ' + err.code);
+    socket.destroy();
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+  console.log('rejectUnauthorized=' + rejectUnauthorized);
+  console.log('  no certificate: ' + await connect(port, {}));
+  console.log('  the CA certificate: ' + await connect(port, { cert: `__CLIENT_CERT__`, key: `__CLIENT_KEY__` }));
+  console.log('  self-signed certificate: ' + await connect(port, { cert: `__ROGUE_CERT__`, key: `__ROGUE_KEY__` }));
+  await new Promise((r) => setTimeout(r, 100));
+  server.close();
+  for (const line of seen) console.log('  server ' + line);
+}
+"#
+    .replace("__CA__", MTLS_CA_CERT)
+    .replace("__KEY__", MTLS_SERVER_KEY)
+    .replace("__CERT__", MTLS_SERVER_CERT)
+    .replace("__CLIENT_CERT__", MTLS_CLIENT_CERT)
+    .replace("__CLIENT_KEY__", MTLS_CLIENT_KEY)
+    .replace("__ROGUE_CERT__", MTLS_ROGUE_CERT)
+    .replace("__ROGUE_KEY__", MTLS_ROGUE_KEY);
+    let stdout = run_ok("https_mtls.mjs", &src);
+    assert_eq!(
+        stdout.replace("\r\n", "\n").trim_end(),
+        "rejectUnauthorized=true\n  \
+         no certificate: refused\n  \
+         the CA certificate: HTTP/1.1 200 OK secret\n  \
+         self-signed certificate: refused\n  \
+         server clientError ERR_SSL_PEER_DID_NOT_RETURN_A_CERTIFICATE\n  \
+         server request authorized=true error=null peer=oam client\n  \
+         server clientError ECONNRESET\n\
+         rejectUnauthorized=false\n  \
+         no certificate: HTTP/1.1 200 OK public\n  \
+         the CA certificate: HTTP/1.1 200 OK secret\n  \
+         self-signed certificate: HTTP/1.1 200 OK public\n  \
+         server request authorized=false error=UNABLE_TO_GET_ISSUER_CERT peer=none\n  \
+         server request authorized=true error=null peer=oam client\n  \
+         server request authorized=false error=DEPTH_ZERO_SELF_SIGNED_CERT peer=rogue client"
+    );
+}
+
 #[test]
 fn oam_mcp_module_batch_array() {
     use std::io::{BufRead, BufReader, Write};

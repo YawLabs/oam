@@ -180,8 +180,33 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   connected and sent nothing held up every client after it. Each connection is now
   handshaken on its own, bounded by `handshakeTimeout` (120 s by default; the connection
   is closed with `'tlsClientError'` `ERR_TLS_HANDSHAKE_TIMEOUT`).
+- **`https.createServer` never asked for a client certificate either.** It ignored
+  `requestCert`, `rejectUnauthorized` and `ca`, so an https server configured to admit
+  only clients with a certificate its CA signed served every client, with or without
+  one, and `req.socket` had no `authorized` or `getPeerCertificate()` to check. Present
+  since 0.4.0. Each connection now runs the `tls.createServer` handshake above with the
+  server's options: under `rejectUnauthorized` a client with no certificate, or one that
+  does not verify against `ca`, never reaches the `'request'` handler, and without it
+  `req.socket.authorized` / `authorizationError` carry Node's verdict. A failed handshake
+  is `'tlsClientError'`, passed on as `'clientError'` as in Node.
 
 ### Fixed
+
+- **`https.createServer` takes node:tls's server options.** An https server is now a
+  `tls.Server`, as in Node: its secure context is built at `createServer()` (a key it
+  cannot read, one that is not its certificate's, or a wrong `passphrase` throws there
+  instead of failing at `listen()`), `passphrase` and `pfx` are read,
+  `server.setSecureContext()` and a changed `requestCert` / `rejectUnauthorized` /
+  `ALPNProtocols` apply to the connections accepted after them, and `ALPNProtocols`
+  defaults to `['http/1.1']` unless `ALPNProtocols` or `ALPNCallback` is given (a client
+  offering only `h2` gets `no_application_protocol`, as from Node). `req.socket` reports
+  the handshake as Node's `TLSSocket` does (`authorized`, `authorizationError`,
+  `alpnProtocol`, `servername`, `getPeerCertificate([detailed])`,
+  `getPeerX509Certificate()`, `getProtocol()`, `getCipher()`), and `req.client` is
+  `req.socket`, as in Node, on every server. A client that does not speak TLS gets no
+  answer and a `'clientError'` (`ERR_SSL_HTTP_REQUEST`, ...), and a TLS 1.3 client whose
+  certificate a server refuses after it has sent its request now sees the connection end
+  rather than reset, as with Node.
 
 - **TLS servers now negotiate ALPN and report the handshake as Node does.**
   `tls.createServer` honours `ALPNProtocols` (the server's order among what the client

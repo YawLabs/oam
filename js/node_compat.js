@@ -17362,6 +17362,9 @@
         this.socket = socket;
         // node's deprecated alias, the same object.
         this.connection = socket;
+        // and its other name for it (node sets both in the constructor;
+        // mutual-TLS code reads req.client.authorized).
+        this.client = socket;
         this._requestId = meta.requestId;
         // node: empty until a chunked body's trailer section is read, at
         // its end.
@@ -18108,6 +18111,26 @@
         });
         return;
       }
+      if (meta.event === "tlsClientError") {
+        // An https connection whose TLS handshake failed: node's
+        // 'tlsClientError' with its socket (the connection is already
+        // closed; the https server passes the error on as 'clientError').
+        const err = new Error(meta.message);
+        if (meta.code) err.code = meta.code;
+        const socket = registry._tlsServer.serverSocketView(serverSocket(meta), null);
+        // As node's socket is by then: destroyed, unless the handshake ran
+        // out of time (the server destroys that one on the error); and a
+        // connection that closed under its handshake ('socket hang up',
+        // raised from the close) has no addresses left to report.
+        socket.destroyed = meta.code !== "ERR_TLS_HANDSHAKE_TIMEOUT";
+        if (meta.code === "ECONNRESET") {
+          for (const key of ["remoteAddress", "remotePort", "remoteFamily", "localAddress", "localPort", "localFamily"]) {
+            socket[key] = undefined;
+          }
+        }
+        server.emit("tlsClientError", err, socket);
+        return;
+      }
       if (meta.event === "closed") {
         // The exchange ended without its response (the connection was
         // closed under it): node's abortIncoming -- the request is
@@ -18192,7 +18215,7 @@
           req.upgrade = true;
           // node: the upgrade request's socket IS the socket handed
           // to the 'upgrade' listener.
-          req.socket = req.connection = socket;
+          req.socket = req.connection = req.client = socket;
           // What the client sent after the head, already read off the
           // socket: node's `head` argument.
           const head = globalThis.Buffer.from(meta.head || "", "latin1");
@@ -18210,8 +18233,10 @@
         // An upgrade request no listener took is an ordinary one (node).
         req.upgrade = false;
         // The request's socket carries the TCP connection's real
-        // addresses (the accept record); a TLS socket is `encrypted`.
-        if (encrypted) req.socket.encrypted = true;
+        // addresses (the accept record); an https connection's also reports
+        // what its TLS handshake settled, as node's TLSSocket does.
+        if (meta.tls) registry._tlsServer.serverSocketView(req.socket, meta.tls);
+        else if (encrypted) req.socket.encrypted = true;
         // Node's server keeps a request-stream error from becoming
         // an unhandled 'error' that kills the process: a client that
         // hangs up mid-upload, or a body the server sheds under
@@ -21564,43 +21589,105 @@
     }
     let httpsVersionPinWarned = false;
 
-    class Server extends EventEmitter {
+    // Node's https.Server (lib/https.js): a tls.Server whose connections are
+    // served as HTTP/1.1. Its TLS options are node:tls's -- read and
+    // validated by tls.Server, the secure context built at createServer()
+    // (so a bad key throws there), ALPNProtocols defaulting to
+    // ['http/1.1'] -- and each connection is accepted natively with them
+    // (httpsServe runs node:tls's server handshake), so requestCert /
+    // rejectUnauthorized / ca, ALPN and handshakeTimeout hold as they do for
+    // tls.createServer: a client the server refuses never reaches a request
+    // handler. req.socket reports the handshake (authorized,
+    // authorizationError, getPeerCertificate(), ...), and a failed handshake
+    // is 'tlsClientError', which the server passes on as 'clientError'.
+    const tls = registry.get("tls");
+    const kTlsSynced = Symbol("httpsTlsSynced");
+
+    // What the native server accepts connections with: the secure context
+    // and the options Node's tlsConnectionListener reads off the server.
+    function tlsAcceptArgs(server) {
+      var alpn = server.ALPNProtocols;
+      var names = null;
+      if (Array.isArray(alpn)) names = alpn.map(String);
+      else if (ArrayBuffer.isView(alpn)) {
+        names = registry._tlsServer.alpnWireNames(
+          new Uint8Array(alpn.buffer, alpn.byteOffset, alpn.byteLength));
+      }
+      return [
+        server._contextId,
+        Math.min(Math.floor(server._handshakeTimeout), 2147483647),
+        !!server.requestCert,
+        !!server.rejectUnauthorized,
+        names && names.length ? JSON.stringify(names) : undefined,
+      ];
+    }
+
+    // Tell a listening server what its next connections are accepted with,
+    // when that changed.
+    function syncTls(server) {
+      if (server._serverId === null || server._serverId === undefined) return;
+      var args = tlsAcceptArgs(server);
+      var key = JSON.stringify(args);
+      if (server[kTlsSynced] === key) return;
+      server[kTlsSynced] = key;
+      natives.httpsServerTls(server._serverId, ...args);
+    }
+
+    // node's addTlsClientErrorHandler.
+    function onTlsClientError(err, conn) {
+      if (!this.emit("clientError", err, conn)) conn.destroy(err);
+    }
+
+    class Server extends tls.Server {
       constructor(options, handler) {
-        super();
+        // node: ['http/1.1'] unless the caller set ALPNProtocols or an
+        // ALPNCallback (only one of the two may be set).
+        let ALPNProtocols = ["http/1.1"];
         if (typeof options === "function") {
           handler = options;
           options = {};
+        } else if (options === undefined || options === null) {
+          options = {};
+        } else {
+          if (typeof options !== "object" || Array.isArray(options)) {
+            throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+          }
+          if (options.ALPNProtocols || options.ALPNCallback) ALPNProtocols = undefined;
         }
-        this._options = options || {};
+        // node runs storeHTTPOptions first, so its errors win; the values
+        // are stored on the server once it exists.
+        registry._httpParserOptions.store({}, options);
+        super(Object.assign({ noDelay: true, ALPNProtocols }, options));
+        this.httpAllowHalfOpen = false;
         // maxHeaderSize / insecureHTTPParser and the timeouts, validated and
-        // stored as the http server does (node's https.Server runs
-        // storeHTTPOptions too).
-        registry._httpParserOptions.store(this, this._options);
-        var serverVersions = resolveTlsVersions(this._options);
-        this._tlsMin = serverVersions.min;
-        this._tlsMax = serverVersions.max;
-        // tls.Server's handshakeTimeout: a number (node validates the type
-        // only); a falsy one is the 120 s default.
-        var handshakeTimeout = this._options.handshakeTimeout;
-        if (handshakeTimeout !== undefined && typeof handshakeTimeout !== "number") {
-          throw codes.ERR_INVALID_ARG_TYPE(
-            "options.handshakeTimeout",
-            "number",
-            handshakeTimeout,
-          );
-        }
-        // Not enumerable: node keeps it internal.
-        Object.defineProperty(this, "_handshakeTimeoutMs", {
-          value: handshakeTimeout > 0 ? handshakeTimeout : 120000,
-          writable: true,
-          configurable: true,
-        });
+        // stored as the http server does.
+        registry._httpParserOptions.store(this, options);
         registry._httpParserOptions.defineTimeout(this, "timeout", 0);
+        // Read for each connection, as node reads them: a new value reaches
+        // the native server at once, for the connections after it.
+        for (const name of ["requestCert", "rejectUnauthorized", "ALPNProtocols"]) {
+          let current = this[name];
+          Object.defineProperty(this, name, {
+            get() {
+              return current;
+            },
+            set(next) {
+              current = next;
+              syncTls(this);
+            },
+            enumerable: true,
+            configurable: true,
+          });
+        }
         if (handler) this.on("request", handler);
-        this._serverId = null;
-        this._port = null;
-        this._host = null;
-        this.listening = false;
+        this.on("tlsClientError", onTlsClientError);
+        this.maxHeadersCount = null;
+      }
+      // A new context (a certificate rotation) for the connections accepted
+      // from now on.
+      setSecureContext(options) {
+        super.setSecureContext(options);
+        syncTls(this);
       }
       listen(port, host, callback) {
         if (typeof port === "object" && port !== null) {
@@ -21614,24 +21701,22 @@
         }
         if (typeof callback === "function") this.once("listening", callback);
         var hostname = host || "127.0.0.1";
-        var certPem = typeof this._options.cert === "object" && this._options.cert instanceof Uint8Array
-          ? new TextDecoder().decode(this._options.cert) : String(this._options.cert || "");
-        var keyPem = typeof this._options.key === "object" && this._options.key instanceof Uint8Array
-          ? new TextDecoder().decode(this._options.key) : String(this._options.key || "");
         var policy = registry._httpParserOptions.policy(this);
+        var accept = tlsAcceptArgs(this);
         natives.httpsServe(
           hostname,
           port || 0,
-          certPem,
-          keyPem,
-          this._tlsMin,
-          this._tlsMax,
+          ...accept,
           policy.maxHeaderSize,
           policy.insecure,
           ...registry._httpParserOptions.timeoutArgs(this),
-          Math.min(Math.floor(this._handshakeTimeoutMs), 2147483647),
         ).then(
-          (bound) => registry._httpParserOptions.bound(this, bound, hostname, true),
+          (bound) => {
+            this[kTlsSynced] = JSON.stringify(accept);
+            registry._httpParserOptions.bound(this, bound, hostname, true);
+            // Anything changed while the server was binding.
+            syncTls(this);
+          },
           (err) => this.emit("error", typeof err === "string" ? new Error(err) : err),
         );
         return this;
@@ -21656,6 +21741,12 @@
         if (callback) this.once("close", callback);
         return this;
       }
+    }
+    // The native http server has no ref / unref of its own yet: an https
+    // server keeps not offering them rather than inheriting tls.Server's,
+    // which act on a node:net listener this server does not have.
+    for (const name of ["ref", "unref"]) {
+      Object.defineProperty(Server.prototype, name, { value: undefined, writable: true, configurable: true });
     }
 
     registry._httpParserOptions.defineMaxConnections(Server.prototype);
@@ -25772,7 +25863,7 @@
             if (meta.event !== undefined) continue;
             var req = new http.IncomingMessage(meta);
             req.upgrade = false;
-            req.socket = req.connection = socket;
+            req.socket = req.connection = req.client = socket;
             req.on("error", function() {});
             var res = new http.ServerResponse(meta.requestId);
             req.res = res;
@@ -27002,7 +27093,12 @@
         if (options.ALPNProtocols) convertALPNProtocols(options.ALPNProtocols, this);
         this._contextId = null;
         this.setSecureContext(options);
-        this._handshakeTimeout = options.handshakeTimeout || 120 * 1000;
+        // Not enumerable: Node keeps it internal (kHandshakeTimeout).
+        Object.defineProperty(this, "_handshakeTimeout", {
+          value: options.handshakeTimeout || 120 * 1000,
+          writable: true,
+          configurable: true,
+        });
         if (typeof this._handshakeTimeout !== "number") {
           throw codes.ERR_INVALID_ARG_TYPE("options.handshakeTimeout", "number", options.handshakeTimeout);
         }
@@ -27191,6 +27287,48 @@
     function createServer(options, connectionListener) {
       return new Server(options, connectionListener);
     }
+
+    // The TLS side of a socket the https server hands out (req.socket, and
+    // the socket of its 'tlsClientError' / 'clientError'): that server
+    // serves its connections natively, so the object is the http server's
+    // stand-in over the connection, and here it gets what Node's
+    // server-side TLSSocket reports from the handshake -- `encrypted`,
+    // `authorized` / `authorizationError`, `alpnProtocol`, `servername`,
+    // getPeerCertificate() / getPeerX509Certificate(), getProtocol(),
+    // getCipher() -- read the same way TLSSocket reads them. `info` is the
+    // native handshake record, or null for a connection whose handshake
+    // failed.
+    function serverSocketView(socket, info) {
+      info = info || {};
+      socket.encrypted = true;
+      socket.authorized = info.authorized === true;
+      socket.authorizationError = info.authorizationError == null ? null : info.authorizationError;
+      socket.alpnProtocol = info.alpnProtocol == null ? false : info.alpnProtocol;
+      socket.servername = info.servername == null ? false : info.servername;
+      socket._isServer = true;
+      socket._protocol = info.protocol || null;
+      socket._cipher = info.cipher || null;
+      socket._cipherStandardName = info.cipherStandardName || null;
+      socket._peerCertificates = info.peerCertificates || null;
+      socket._peerParsed = null;
+      socket._ephemeralKeyInfo = null;
+      var proto = TLSSocket.prototype;
+      socket.getProtocol = proto.getProtocol;
+      socket.getCipher = proto.getCipher;
+      socket.getEphemeralKeyInfo = proto.getEphemeralKeyInfo;
+      socket.getPeerCertificate = proto.getPeerCertificate;
+      socket.getPeerX509Certificate = proto.getPeerX509Certificate;
+      socket._parsedPeerCert = proto._parsedPeerCert;
+      return socket;
+    }
+
+    // What the https server builds on: its options are node:tls's, read and
+    // validated by tls.Server, and its connections are accepted natively
+    // with the context tls.Server built.
+    registry._tlsServer = {
+      alpnWireNames: alpnWireNames,
+      serverSocketView: serverSocketView,
+    };
 
     return {
       connect,

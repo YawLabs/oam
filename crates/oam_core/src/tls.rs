@@ -16,10 +16,9 @@
 //! Server-side TLS for node:tls servers -- and http2.createSecureServer,
 //! which is one -- is server.rs (the secure context, the per-connection
 //! handshake, Node's client-certificate verdicts) and keys.rs (encrypted
-//! keys, PKCS#12). node:https's server is handled in http_server.rs via
-//! `https_serve` -- it wraps each accepted TCP stream with a TLS
-//! acceptor before handing it to hyper. The request/response lifecycle
-//! is identical to plain HTTP (shared HttpState, same ops).
+//! keys, PKCS#12). node:https's server (`https_serve` in http_server.rs)
+//! runs the same per-connection handshake, then serves the connection with
+//! hyper exactly as a plain HTTP one (shared HttpState, same ops).
 
 use crate::{OpOutcome, node_errno, node_error_code, node_error_message};
 use rustls::CertificateError;
@@ -1483,31 +1482,6 @@ pub fn tls_close(registry: &TlsRegistry, handle: u64) {
     }
 }
 
-/// Build a TLS server config from PEM-encoded cert chain + private key.
-pub fn build_server_config(
-    cert_pem: &str,
-    key_pem: &str,
-    versions: &[&'static rustls::SupportedProtocolVersion],
-) -> Result<Arc<rustls::ServerConfig>, String> {
-    let certs = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("server cert parse: {e}"))?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))
-        .map_err(|e| format!("server key parse: {e}"))?
-        .ok_or("no private key found in server key PEM")?;
-    let config = rustls::ServerConfig::builder_with_protocol_versions(versions)
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| format!("server tls config: {e}"))?;
-    Ok(Arc::new(config))
-}
-
-/// The full TLS 1.2 + 1.3 set -- Node's default range, for callers that do
-/// not (yet) thread `minVersion` / `maxVersion` (the https server).
-pub fn default_protocol_versions() -> Vec<&'static rustls::SupportedProtocolVersion> {
-    vec![&rustls::version::TLS13, &rustls::version::TLS12]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1942,12 +1916,26 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         }
     }
 
+    /// A plain rustls server config for the test certificate (TLS 1.2 and
+    /// 1.3, no client authentication).
+    fn test_server_config() -> Arc<rustls::ServerConfig> {
+        let certs = rustls_pemfile::certs(&mut BufReader::new(CERT.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut BufReader::new(KEY.as_bytes()))
+            .unwrap()
+            .unwrap();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        Arc::new(config)
+    }
+
     /// Accepts N connections; each echoes its first read, waits for the
     /// client to finish (so a second client read can park), then closes.
     async fn echo_server(listener: tokio::net::TcpListener, connections: usize) {
-        let acceptor = tokio_rustls::TlsAcceptor::from(
-            build_server_config(CERT, KEY, &default_protocol_versions()).unwrap(),
-        );
+        let acceptor = tokio_rustls::TlsAcceptor::from(test_server_config());
         for _ in 0..connections {
             let (tcp, _) = listener.accept().await.unwrap();
             let acceptor = acceptor.clone();
