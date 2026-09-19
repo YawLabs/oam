@@ -1578,11 +1578,17 @@ The server applies Node's rules for the framing of a request -- `Content-Length`
 `Transfer-Encoding`, a repeated `Content-Length`, a coding after `chunked`, bare-LF line
 endings and obs-fold are all `400`, on plain and upgrade requests -- and Node's
 `maxHeaderSize` count (`431`), with `insecureHTTPParser` / `--insecure-http-parser`
-relaxing what Node's relaxes. The parser underneath is hyper's, so some heads still get a
-different answer:
+relaxing what Node's relaxes. For a method other than CONNECT, a request target that is
+neither origin form, `*...` nor absolute form with a scheme of letters (`abc`, `host:443`,
+`.`, `1http://x/`, `http://h#f`) is `400` in either mode, and `req.url` is the target byte
+for byte as sent -- an absolute form keeps its spelling, a fragment stays, as in Node
+(`conformance/cases/159-http-server-request-target-forms.mjs`; up to 0.16.2 those targets
+reached the handler with a `req.url` of `""`, and `req.url` was hyper's rewrite of the
+target). The parser underneath is hyper's, so some heads still get a different answer:
 
 - **oam refuses, Node accepts:** `Transfer-Encoding` on an HTTP/1.0 request; request lines
-  with `HTTP/2.0`, no version (HTTP/0.9) or two spaces; an empty `Transfer-Encoding` next to
+  with `HTTP/2.0`, no version (HTTP/0.9) or two spaces; an absolute-form target with an
+  empty authority (`http://`, `http:///p`, `abc://`); an empty `Transfer-Encoding` next to
   `Content-Length`; more than 100 header fields (`431`; Node limits only the byte count
   and keeps the first 1000 fields); a request target over 65534 bytes (`414`; Node answers
   `431` from the byte count). Under `insecureHTTPParser`, obs-fold, control characters in
@@ -1743,7 +1749,10 @@ client does not apply (`rejectUnauthorized: false`, `ca`, `cert` / `key` / `pfx`
 `servername`, `checkServerIdentity`, `minVersion` / `maxVersion` / `secureProtocol`), a
 `socketPath`, a `localAddress` or `localPort` (bound as `net.connect` binds them), a host the URL parser would rewrite (entry 38), a destination oam's client
 would send through the environment proxy where Node would not (entry 38), an
-upgrade, or `'lookup'` / `'connect'` / `'secureConnect'` listeners on `req.socket` when the
+upgrade, a CONNECT, a request target that is not in origin form (a `path` in absolute
+form for a forward proxy, `*`, an authority; also one an agent sets after the constructor,
+as http-proxy-agent does), or `'lookup'` / `'connect'` / `'secureConnect'` listeners on
+`req.socket` when the
 request is dispatched -- at once when nothing listens for `'socket'`, else one turn of the
 loop after it (an immediate, no timer wait), so a listener added after an `await` in an
 async `'socket'` handler counts -- or when the agent's pool already holds a
@@ -1768,7 +1777,18 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
 - **The wire.** Header names go out lowercased (hyper keeps no original case), and
   `rawHeaders` of the response are lowercased too. A request target byte that hyper's URI
   type refuses (`"`, `<`, `>`, `\`, `^`, `` ` ``, and any byte above 0x7F) is
-  percent-encoded where Node writes it raw. A body written in the same tick as `end()` is
+  percent-encoded where Node writes it raw. The target is `path` as written, in whichever
+  form it takes -- origin, absolute (a forward proxy's), authority (a CONNECT's) or `*` --
+  as in Node (`conformance/cases/156-http-request-target-forms.mjs`), except two spellings
+  hyper's URI type cannot hold: an absolute form with no path gains the `/` (`http://h`
+  goes out as `http://h/`), and a target that is neither an authority nor a path
+  (`abc?d=1`) goes out as `/abc?d=1`; Node sends both as written, and its own servers
+  answer the second `400`. A `path` an agent assigns after the constructor checked it
+  (http-proxy-agent rewrites it) is written as it is then, as in Node, but a byte no
+  request target may carry -- a space, a CR or an LF -- is percent-encoded, and fails a
+  CONNECT or an upgrade (whose head is written by hand) with the constructor's
+  `ERR_UNESCAPED_CHARACTERS`; Node writes it raw, so such a path adds header lines to its
+  request. A body written in the same tick as `end()` is
   sent with `content-length`, where Node sends `write()`s before `end()` chunked. No
   `accept`, `user-agent` or `accept-encoding` is added (oam's own client adds all three,
   #148). Redirects are not followed and bodies are not decoded, as in Node.
@@ -1781,9 +1801,16 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   without its `bytesParsed` / `rawPacket` (`conformance/cases/123-http-request-max-header-size.mjs`).
   A `101` head is measured as it arrives, CRLFs included, so it trips a few bytes before
   Node's count would. `insecureHTTPParser` is validated as in Node but relaxes nothing
-  (it does not lift the limit in Node either). An upgrade's head is written
-  by hand, so a header value carrying CR or LF fails that request with Node's
-  `ERR_INVALID_CHAR` (Node throws it earlier, from `setHeader()`).
+  (it does not lift the limit in Node either). An upgrade's and a CONNECT's heads are
+  written by hand, so a header value carrying CR or LF fails that request with Node's
+  `ERR_INVALID_CHAR` (Node throws it earlier, from `setHeader()`). Their answers are read
+  by hand too, the way llhttp reads them: byte by byte as they arrive, a head Node refuses
+  refused with Node's code and reason -- a bad first line before its CRLF arrives
+  (`conformance/cases/158-http-client-hand-read-answer-heads.mjs`). What differs there:
+  an answer to an upgrade request that is not a `101` is read to the end of the
+  connection, its body unframed -- a `Content-Length` does not end it and a chunked body
+  arrives with its chunk framing -- where Node reads it as any response (and fails on
+  bytes after a `Content-Length` body with `HPE_INVALID_CONSTANT`).
 - **Trust.** An https request here verifies with `tls.connect`'s store -- Mozilla's roots
   plus `NODE_EXTRA_CA_CERTS`, and the request's or agent's `ca` -- as Node does, not with
   the operating system's store oam's own client uses (entry 38).
@@ -1801,8 +1828,19 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   from `destroy()` synchronously where Node defers them a tick. After the request ends
   Node clears a closed socket's `localAddress` / `localPort`; oam keeps them on a
   `net.Socket`.
-- **Proxy agents.** `http-proxy-agent` and similar agents that return a plain socket to a
-  proxy work for http, and https-proxy-agent (5 and 7) tunnels to an https target over
+- **Proxy agents.** The agents that send an http request to a forward proxy in absolute
+  form -- http-proxy-agent 7 to 9 (and proxy-agent over it), global-agent, axios's `proxy`
+  option -- reach the proxy with the target as Node sends it, and read back what they
+  need of the request as Node's `ClientRequest` has it: `getHeader('host')` from the
+  constructor on, `_implicitHeader()`, `_header`, `outputData`. The agents built on
+  `http.request({ method: 'CONNECT' })` -- tunnel (under @actions/http-client 2), hpagent
+  -- get their tunnel: the answer to a CONNECT is emitted as `'connect'` whatever its
+  status, with the socket and the bytes behind the head, the request emits no
+  `'response'`, and with no `'connect'` listener the socket is destroyed
+  (`conformance/cases/157-http-client-connect-event.mjs`). The socket a `'connect'` or
+  `'upgrade'` listener receives is unflowing, as Node's, so bytes the peer sends before
+  the new owner reads wait for it (its `readableFlowing` reads `undefined`, not `null`).
+  https-proxy-agent (5, 7 and 9) tunnels to an https target over
   `tls.connect({ socket })` (entry 34), a refusing proxy's answer included, as in Node. Up
   to 0.16.2 they were ignored and the request went direct. agent-base, under all of them,
   decides "is this https?" by looking for Node's own `node:https:` frame on the stack; oam's
@@ -1819,7 +1857,12 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
 
 _(probed)_ Node v22.22.2 vs oam on Windows: the probes behind cases 120-122, and
 request-filtering-agent 3.2.1 / 2.0.1 / 1.1.2 and ssrf-req-filter 1.1.1 against node-hosted
-dual-stack servers, line for line identical except where a pooled socket is reused.
+dual-stack servers, line for line identical except where a pooled socket is reused. The
+proxy agents: tunnel 0.0.6 (http and https targets, through http and https proxies, with
+and without proxy auth), hpagent 1.2.0, http-proxy-agent 7.0.2 and 9.1.0,
+https-proxy-agent 7.0.6 and 9.1.0, proxy-agent 8.0.2, global-agent 4.1.3, axios 1.x's
+`proxy` option and @actions/http-client 2.2.3, against a node-hosted proxy, line for line
+identical.
 
 ### 44. `http2.connect`: what differs
 

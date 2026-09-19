@@ -34,8 +34,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   so a custom or patched agent -- the way request-filtering-agent, ssrf-req-filter and
   similar packages vet a destination -- was never called, and neither were
   `options.createConnection`, a wrapped `net.createConnection` / `tls.connect`, or
-  listeners on `req.socket`. A request that carries such connection policy now goes over
-  the socket the agent returns, as in node. So does `https.request` with
+  listeners on `req.socket`. Proxy agents were skipped the same way -- http-proxy-agent,
+  https-proxy-agent, proxy-agent, global-agent, hpagent and `tunnel` (which
+  @actions/http-client uses) -- so their requests went straight to the destination
+  instead of through the proxy they name. A request that carries such connection policy
+  now goes over the socket the agent returns, as in node, and a proxy agent's requests
+  go through its proxy. So does `https.request` with
   `rejectUnauthorized: false`, which ignored the agent too, and an upgrade request. The
   agent pools these connections as node's does. Their response heads are held to node's
   `maxHeaderSize`, and `http.request` now takes node's per-request `maxHeaderSize` and
@@ -398,6 +402,36 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 - **`net.Socket` had no paused mode.** A `'readable'` listener and `socket.read()` --
   how https-proxy-agent reads a proxy's answer -- threw `socket.read is not a function`;
   `push()` into a socket without a handle was missing too. Both now behave as in node.
+- **A CONNECT request never emitted `'connect'`.** `http.request({ method: 'CONNECT' })`
+  delivered the proxy's answer as an ordinary `'response'`, so an agent that waits for
+  `'connect'` -- `tunnel` (under @actions/http-client), hpagent -- never got its tunnel.
+  As in node, the answer to a CONNECT is now emitted as `'connect'` with the socket and
+  the bytes that came behind the head, whatever its status (a `407` included), and with
+  no `'connect'` listener the socket is destroyed. The socket a `'connect'` or
+  `'upgrade'` listener receives is handed over unflowing, as node's is, so what the peer
+  sends before the new owner reads it waits in the socket instead of being lost. These
+  answers' heads are read as node's parser reads them: a malformed status line, a header
+  line without a colon, obs-fold, control characters, a repeated `Content-Length` or
+  `Content-Length` with `Transfer-Encoding` fail the request with node's `HPE_*` code
+  and reason (they were taken as a head, a garbage status line as status `0`).
+- **`http.request` rewrote a request target that was not a path.** A `path` in absolute
+  form -- how axios's `proxy` option and other forward-proxy clients address the proxy --
+  went out as `GET /http://host/p`, `OPTIONS *` as `OPTIONS /*` and a CONNECT's
+  `host:port` as `/host:port`. node writes `path` as written, and so does oam now; the
+  host dialled is still `host` / `port`, never one named in `path`. The Host header is
+  set in the constructor as node sets it, so `req.getHeader('host')` reads it back and
+  `req.removeHeader('host')` drops it, and `req._implicitHeader()`, `req._header` and
+  `req.outputData` exist: http-proxy-agent (7 to 9, under proxy-agent) builds its
+  absolute-form target from them and failed with `req._implicitHeader is not a
+  function`.
+- **An `http` server rewrote `req.url` and took request targets node refuses.**
+  `req.url` came from hyper's URI type, which lowercases an absolute form's scheme, adds
+  a `/` after a bare authority, drops a fragment (`/p#f` was `/p`) and turned `*x` into
+  `""`; it is now the target byte for byte as sent, as in node, so a forward proxy
+  written on oam reads the absolute-form target a proxy client sends. A target that is
+  neither a path, `*...` nor absolute form with a scheme of letters (`abc`, `host:443`,
+  `1http://x/`) reached the handler with a `req.url` of `""`; it is now answered `400`,
+  as by node, on `http`, `https` and the HTTP/1 side of `http2.createServer`.
 - **A `fetch` could hang forever when the server closed a keep-alive
   connection just as the next request went out on it.** This also affected
   `http.request`, `https.request` and `undici.request`, which ride the same
