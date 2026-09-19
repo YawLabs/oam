@@ -310,19 +310,19 @@ where
             }
         } else if msg.expect_continue && msg.head.version.gt(&Version::HTTP_10) {
             let h1_max_header_size = None; // TODO: remove this when we land h1_max_header_size support
-            self.state.reading = Reading::Continue(Decoder::new(
-                msg.decode,
-                self.state.h1_max_headers,
-                h1_max_header_size,
-            ));
+            self.state.reading = Reading::Continue(
+                Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
+                    // oam patch: a request body's trailers (decode.rs).
+                    .in_request(T::is_server()),
+            );
             wants = wants.add(Wants::EXPECT);
         } else {
             let h1_max_header_size = None; // TODO: remove this when we land h1_max_header_size support
-            self.state.reading = Reading::Body(Decoder::new(
-                msg.decode,
-                self.state.h1_max_headers,
-                h1_max_header_size,
-            ));
+            self.state.reading = Reading::Body(
+                Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
+                    // oam patch: a request body's trailers (decode.rs).
+                    .in_request(T::is_server()),
+            );
         }
 
         self.state.allow_trailer_fields = msg

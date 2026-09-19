@@ -46,6 +46,8 @@ enum Kind {
         trailers_cnt: usize,
         h1_max_headers: Option<usize>,
         h1_max_header_size: Option<usize>,
+        // oam patch: the body is a request's (see `in_request`).
+        request: bool,
     },
     /// A Reader used for responses that don't indicate a length or chunked.
     ///
@@ -112,8 +114,21 @@ impl Decoder {
                 trailers_cnt: 0,
                 h1_max_headers,
                 h1_max_header_size,
+                request: false,
             },
         }
+    }
+
+    // oam patch: whether this body is a request's, for the trailer fields
+    // it may not carry (see `decode_trailers`).
+    pub(super) fn in_request(mut self, is_request: bool) -> Decoder {
+        if let Kind::Chunked {
+            ref mut request, ..
+        } = self.kind
+        {
+            *request = is_request;
+        }
+        self
     }
 
     pub(crate) fn eof() -> Decoder {
@@ -183,6 +198,7 @@ impl Decoder {
                 ref mut trailers_cnt,
                 ref h1_max_headers,
                 ref h1_max_header_size,
+                request,
             } => {
                 let h1_max_headers = h1_max_headers.unwrap_or(DEFAULT_MAX_HEADERS);
                 let h1_max_header_size = h1_max_header_size.unwrap_or(TRAILER_LIMIT);
@@ -218,6 +234,7 @@ impl Decoder {
                             match decode_trailers(
                                 &mut trailers_buf.take().expect("Trailer is None"),
                                 *trailers_cnt,
+                                request,
                             ) {
                                 Ok(headers) => {
                                     return Poll::Ready(Ok(Frame::trailers(headers)));
@@ -697,7 +714,15 @@ impl ChunkedState {
 }
 
 // TODO: disallow Transfer-Encoding, Content-Length, Trailer, etc in trailers ??
-fn decode_trailers(buf: &mut BytesMut, count: usize) -> Result<HeaderMap, io::Error> {
+// oam patch: framing fields are refused in the trailers, as llhttp (node's
+// parser) refuses them -- `Content-Length` in any message's, and
+// `Transfer-Encoding` in a request's -- and a repeated field keeps each of
+// its values (hyper kept only the last).
+fn decode_trailers(
+    buf: &mut BytesMut,
+    count: usize,
+    request: bool,
+) -> Result<HeaderMap, io::Error> {
     let mut trailers = HeaderMap::new();
     let mut headers = vec![httparse::EMPTY_HEADER; count];
     let res = httparse::parse_headers(buf, &mut headers);
@@ -725,7 +750,15 @@ fn decode_trailers(buf: &mut BytesMut, count: usize) -> Result<HeaderMap, io::Er
                     }
                 };
 
-                trailers.insert(name, value);
+                if name == http::header::CONTENT_LENGTH
+                    || (request && name == http::header::TRANSFER_ENCODING)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Invalid trailer: {name}"),
+                    ));
+                }
+                trailers.append(name, value);
             }
 
             Ok(trailers)
@@ -1225,13 +1258,36 @@ mod tests {
         buf.extend_from_slice(
             b"Expires: Wed, 21 Oct 2015 07:28:00 GMT\r\nX-Stream-Error: failed to decode\r\n\r\n",
         );
-        let headers = decode_trailers(&mut buf, 2).expect("decode_trailers");
+        let headers = decode_trailers(&mut buf, 2, false).expect("decode_trailers");
         assert_eq!(headers.len(), 2);
         assert_eq!(
             headers.get("Expires").unwrap(),
             "Wed, 21 Oct 2015 07:28:00 GMT"
         );
         assert_eq!(headers.get("X-Stream-Error").unwrap(), "failed to decode");
+    }
+
+    // oam patch: framing fields in the trailers, and repeated fields.
+    #[test]
+    fn test_decode_trailers_framing_and_repeats() {
+        let decode = |text: &[u8], request: bool| {
+            let mut buf = BytesMut::from(text);
+            decode_trailers(&mut buf, 4, request)
+        };
+        for request in [false, true] {
+            let err = decode(b"X-A: 1\r\ncontent-length: 5\r\n\r\n", request)
+                .expect_err("content-length");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert!(decode(b"Content-Length: 0\r\n\r\n", request).is_err());
+        }
+        let err = decode(b"Transfer-Encoding: chunked\r\n\r\n", true).expect_err("te");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        let headers = decode(b"Transfer-Encoding: chunked\r\n\r\n", false).expect("te, response");
+        assert_eq!(headers.get("transfer-encoding").unwrap(), "chunked");
+        let headers = decode(b"X-T: 1\r\nX-U: 2\r\nx-t: 3\r\nHost: h\r\n\r\n", true).expect("repeats");
+        let values: Vec<_> = headers.get_all("x-t").iter().collect();
+        assert_eq!(values, ["1", "3"]);
+        assert_eq!(headers.get("host").unwrap(), "h");
     }
 
     #[tokio::test]

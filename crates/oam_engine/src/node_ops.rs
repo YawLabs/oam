@@ -2753,7 +2753,7 @@ fn op_http_request_body_read(
                 // next read reports EOF.
                 return match state.take_request_body(id) {
                     Some(bytes) if !bytes.is_empty() => oam_core::OpOutcome::Bytes(bytes),
-                    _ => oam_core::OpOutcome::Done,
+                    _ => body_end(state.finish_request_body(id)),
                 };
             }
         };
@@ -2773,12 +2773,20 @@ fn op_http_request_body_read(
                 state.cancel_body_stream(id);
                 oam_core::OpOutcome::Failed(e)
             }
-            None => {
-                state.cancel_body_stream(id);
-                oam_core::OpOutcome::Done
-            }
+            None => body_end(state.finish_request_body(id)),
         }
     });
+}
+
+/// The end of a request body: done, or `{ trailers: [[name, value], ...] }`
+/// when it had a trailer section (node's `req.trailers`).
+fn body_end(trailers: Option<Vec<(String, String)>>) -> oam_core::OpOutcome {
+    match trailers {
+        Some(trailers) => {
+            oam_core::OpOutcome::Json(serde_json::json!({ "trailers": trailers }).to_string())
+        }
+        None => oam_core::OpOutcome::Done,
+    }
 }
 
 /// Drop a streamed request body (req.destroy() / handler done early). Stops

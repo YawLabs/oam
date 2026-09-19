@@ -113,10 +113,52 @@ diff -ruN a/src/ext/mod.rs b/src/ext/mod.rs
  #[cfg(all(feature = "http1", feature = "client"))]
  mod informational;
  #[cfg(all(feature = "http1", feature = "client"))]
+diff -ruN a/src/proto/h1/conn.rs b/src/proto/h1/conn.rs
+--- a/src/proto/h1/conn.rs
++++ b/src/proto/h1/conn.rs
+@@ -310,19 +310,19 @@
+             }
+         } else if msg.expect_continue && msg.head.version.gt(&Version::HTTP_10) {
+             let h1_max_header_size = None; // TODO: remove this when we land h1_max_header_size support
+-            self.state.reading = Reading::Continue(Decoder::new(
+-                msg.decode,
+-                self.state.h1_max_headers,
+-                h1_max_header_size,
+-            ));
++            self.state.reading = Reading::Continue(
++                Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
++                    // oam patch: a request body's trailers (decode.rs).
++                    .in_request(T::is_server()),
++            );
+             wants = wants.add(Wants::EXPECT);
+         } else {
+             let h1_max_header_size = None; // TODO: remove this when we land h1_max_header_size support
+-            self.state.reading = Reading::Body(Decoder::new(
+-                msg.decode,
+-                self.state.h1_max_headers,
+-                h1_max_header_size,
+-            ));
++            self.state.reading = Reading::Body(
++                Decoder::new(msg.decode, self.state.h1_max_headers, h1_max_header_size)
++                    // oam patch: a request body's trailers (decode.rs).
++                    .in_request(T::is_server()),
++            );
+         }
+ 
+         self.state.allow_trailer_fields = msg
 diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
 --- a/src/proto/h1/decode.rs
 +++ b/src/proto/h1/decode.rs
-@@ -70,8 +70,15 @@
+@@ -46,6 +46,8 @@
+         trailers_cnt: usize,
+         h1_max_headers: Option<usize>,
+         h1_max_header_size: Option<usize>,
++        // oam patch: the body is a request's (see `in_request`).
++        request: bool,
+     },
+     /// A Reader used for responses that don't indicate a length or chunked.
+     ///
+@@ -70,8 +72,15 @@
  enum ChunkedState {
      Start,
      Size,
@@ -133,7 +175,47 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
      SizeLf,
      Body,
      BodyCr,
-@@ -256,6 +263,11 @@
+@@ -105,10 +114,23 @@
+                 trailers_cnt: 0,
+                 h1_max_headers,
+                 h1_max_header_size,
++                request: false,
+             },
+         }
+     }
+ 
++    // oam patch: whether this body is a request's, for the trailer fields
++    // it may not carry (see `decode_trailers`).
++    pub(super) fn in_request(mut self, is_request: bool) -> Decoder {
++        if let Kind::Chunked {
++            ref mut request, ..
++        } = self.kind
++        {
++            *request = is_request;
++        }
++        self
++    }
++
+     pub(crate) fn eof() -> Decoder {
+         Decoder {
+             kind: Kind::Eof(false),
+@@ -176,6 +198,7 @@
+                 ref mut trailers_cnt,
+                 ref h1_max_headers,
+                 ref h1_max_header_size,
++                request,
+             } => {
+                 let h1_max_headers = h1_max_headers.unwrap_or(DEFAULT_MAX_HEADERS);
+                 let h1_max_header_size = h1_max_header_size.unwrap_or(TRAILER_LIMIT);
+@@ -211,6 +234,7 @@
+                             match decode_trailers(
+                                 &mut trailers_buf.take().expect("Trailer is None"),
+                                 *trailers_cnt,
++                                request,
+                             ) {
+                                 Ok(headers) => {
+                                     return Poll::Ready(Ok(Frame::trailers(headers)));
+@@ -256,6 +280,11 @@
      }
  }
  
@@ -145,7 +227,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
  macro_rules! byte (
      ($rdr:ident, $cx:expr) => ({
          let buf = ready!($rdr.read_mem($cx, 1))?;
-@@ -325,8 +337,12 @@
+@@ -325,8 +354,12 @@
          match *self {
              Start => ChunkedState::read_start(cx, body, chunk_size),
              Size => ChunkedState::read_size(cx, body, chunk_size),
@@ -160,7 +242,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
              SizeLf => ChunkedState::read_size_lf(cx, body, *chunk_size),
              Body => ChunkedState::read_body(cx, body, chunk_size, chunk_buf),
              BodyCr => ChunkedState::read_body_cr(cx, body),
-@@ -399,7 +415,9 @@
+@@ -399,7 +432,9 @@
                  *size = or_overflow!(size.checked_mul(radix));
                  *size = or_overflow!(size.checked_add((b + 10 - b'A') as u64));
              }
@@ -171,7 +253,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
              b';' => return Poll::Ready(Ok(ChunkedState::Extension)),
              b'\r' => return Poll::Ready(Ok(ChunkedState::SizeLf)),
              _ => {
-@@ -411,41 +429,61 @@
+@@ -411,41 +446,61 @@
          }
          Poll::Ready(Ok(ChunkedState::Size))
      }
@@ -259,7 +341,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
                  *extensions_cnt += 1;
                  if *extensions_cnt >= CHUNKED_EXTENSIONS_LIMIT {
                      Poll::Ready(Err(io::Error::new(
-@@ -453,9 +491,9 @@
+@@ -453,9 +508,9 @@
                          "chunk extensions over limit",
                      )))
                  } else {
@@ -271,7 +353,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
          }
      }
      fn read_size_lf<R: MemRead>(
-@@ -551,6 +589,15 @@
+@@ -551,6 +606,15 @@
  
          match byte {
              b'\r' => Poll::Ready(Ok(ChunkedState::TrailerLf)),
@@ -287,7 +369,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
              _ => Poll::Ready(Ok(ChunkedState::Trailer)),
          }
      }
-@@ -603,6 +650,13 @@
+@@ -603,6 +667,13 @@
                  }
                  Poll::Ready(Ok(ChunkedState::EndLf))
              }
@@ -301,7 +383,41 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
              byte => {
                  match trailers_buf {
                      None => {
-@@ -829,7 +883,9 @@
+@@ -643,7 +714,15 @@
+ }
+ 
+ // TODO: disallow Transfer-Encoding, Content-Length, Trailer, etc in trailers ??
+-fn decode_trailers(buf: &mut BytesMut, count: usize) -> Result<HeaderMap, io::Error> {
++// oam patch: framing fields are refused in the trailers, as llhttp (node's
++// parser) refuses them -- `Content-Length` in any message's, and
++// `Transfer-Encoding` in a request's -- and a repeated field keeps each of
++// its values (hyper kept only the last).
++fn decode_trailers(
++    buf: &mut BytesMut,
++    count: usize,
++    request: bool,
++) -> Result<HeaderMap, io::Error> {
+     let mut trailers = HeaderMap::new();
+     let mut headers = vec![httparse::EMPTY_HEADER; count];
+     let res = httparse::parse_headers(buf, &mut headers);
+@@ -671,7 +750,15 @@
+                     }
+                 };
+ 
+-                trailers.insert(name, value);
++                if name == http::header::CONTENT_LENGTH
++                    || (request && name == http::header::TRANSFER_ENCODING)
++                {
++                    return Err(io::Error::new(
++                        io::ErrorKind::InvalidInput,
++                        format!("Invalid trailer: {name}"),
++                    ));
++                }
++                trailers.append(name, value);
+             }
+ 
+             Ok(trailers)
+@@ -829,7 +916,9 @@
          assert_eq!(10, read("A\r\n").await);
          assert_eq!(10, read("a\r\n").await);
          assert_eq!(255, read("Ff\r\n").await);
@@ -312,7 +428,7 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
          // Missing LF or CRLF
          read_err("F\rF", InvalidInput).await;
          read_err("F", UnexpectedEof).await;
-@@ -841,19 +897,41 @@
+@@ -841,19 +930,41 @@
          read_err("1X\r\n", InvalidInput).await;
          read_err("-\r\n", InvalidInput).await;
          read_err("-1\r\n", InvalidInput).await;
@@ -362,6 +478,45 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
          read_err("1;reject\nnewlines\r\n", InvalidData).await;
          // Overflow
          read_err("f0000000000000003\r\n", InvalidData).await;
+@@ -1147,7 +1258,7 @@
+         buf.extend_from_slice(
+             b"Expires: Wed, 21 Oct 2015 07:28:00 GMT\r\nX-Stream-Error: failed to decode\r\n\r\n",
+         );
+-        let headers = decode_trailers(&mut buf, 2).expect("decode_trailers");
++        let headers = decode_trailers(&mut buf, 2, false).expect("decode_trailers");
+         assert_eq!(headers.len(), 2);
+         assert_eq!(
+             headers.get("Expires").unwrap(),
+@@ -1156,6 +1267,29 @@
+         assert_eq!(headers.get("X-Stream-Error").unwrap(), "failed to decode");
+     }
+ 
++    // oam patch: framing fields in the trailers, and repeated fields.
++    #[test]
++    fn test_decode_trailers_framing_and_repeats() {
++        let decode = |text: &[u8], request: bool| {
++            let mut buf = BytesMut::from(text);
++            decode_trailers(&mut buf, 4, request)
++        };
++        for request in [false, true] {
++            let err = decode(b"X-A: 1\r\ncontent-length: 5\r\n\r\n", request)
++                .expect_err("content-length");
++            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
++            assert!(decode(b"Content-Length: 0\r\n\r\n", request).is_err());
++        }
++        let err = decode(b"Transfer-Encoding: chunked\r\n\r\n", true).expect_err("te");
++        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
++        let headers = decode(b"Transfer-Encoding: chunked\r\n\r\n", false).expect("te, response");
++        assert_eq!(headers.get("transfer-encoding").unwrap(), "chunked");
++        let headers = decode(b"X-T: 1\r\nX-U: 2\r\nx-t: 3\r\nHost: h\r\n\r\n", true).expect("repeats");
++        let values: Vec<_> = headers.get_all("x-t").iter().collect();
++        assert_eq!(values, ["1", "3"]);
++        assert_eq!(headers.get("host").unwrap(), "h");
++    }
++
+     #[tokio::test]
+     async fn test_trailer_max_headers_enforced() {
+         let h1_max_headers = 10;
 diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
 --- a/src/proto/h1/role.rs
 +++ b/src/proto/h1/role.rs

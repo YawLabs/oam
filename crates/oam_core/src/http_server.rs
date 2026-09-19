@@ -309,6 +309,11 @@ pub struct HttpState {
     pending: Mutex<HashMap<u64, oneshot::Sender<ResponseSpec>>>,
     /// request id -> request body (fetched once by JS).
     bodies: Mutex<HashMap<u64, RequestBody>>,
+    /// request id -> the trailer fields of its chunked body (node's
+    /// `req.trailers`), from when the body's end is read until JS takes them
+    /// at that end. Kept only while the body's entry is: whatever removes the
+    /// body removes these (lock order: `bodies`, then this).
+    trailers: Mutex<HashMap<u64, Vec<(String, String)>>>,
     /// response-stream id -> chunk sender (JS pushes, hyper drains).
     streams: Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>,
     /// response-stream id -> resolves when hyper drops the response body
@@ -484,10 +489,34 @@ impl HttpState {
 
     /// Drop a streamed body outright (JS cancelled / destroyed the request).
     pub fn cancel_body_stream(&self, id: u64) {
-        self.bodies
+        let mut bodies = self.bodies.lock().unwrap_or_else(|e| e.into_inner());
+        bodies.remove(&id);
+        self.trailers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&id);
+    }
+
+    /// The body was read to its end: forget it, and take its trailer fields
+    /// (none when it had no trailer section).
+    pub fn finish_request_body(&self, id: u64) -> Option<Vec<(String, String)>> {
+        let mut bodies = self.bodies.lock().unwrap_or_else(|e| e.into_inner());
+        bodies.remove(&id);
+        self.trailers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&id)
+    }
+
+    /// Keep a body's trailer fields for JS, while the body is still wanted.
+    fn store_trailers(&self, id: u64, trailers: &hyper::HeaderMap) {
+        let bodies = self.bodies.lock().unwrap_or_else(|e| e.into_inner());
+        if bodies.contains_key(&id) {
+            self.trailers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id, header_pairs(trailers));
+        }
     }
 
     pub fn respond_full(
@@ -1173,8 +1202,19 @@ impl Drop for RequestGuard {
             Some(RequestBody::Stream(_) | RequestBody::StreamPending) if self.dispatched => {}
             Some(_) => {
                 bodies.remove(&self.id);
+                self.state
+                    .trailers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&self.id);
             }
-            None => {}
+            None => {
+                self.state
+                    .trailers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&self.id);
+            }
         }
         drop(bodies);
         if self.reserved > 0 {
@@ -1266,8 +1306,16 @@ async fn pump_request_body(
                 return;
             }
         };
-        let Ok(data) = frame.into_data() else {
-            continue;
+        let data = match frame.into_data() {
+            Ok(data) => data,
+            // The trailer section, the body's last frame: kept for JS to
+            // take at the end (node's req.trailers).
+            Err(frame) => {
+                if let Ok(trailers) = frame.into_trailers() {
+                    state.store_trailers(id, &trailers);
+                }
+                continue;
+            }
         };
         total += data.len();
         if total > MAX_REQUEST_BODY {
@@ -1330,11 +1378,14 @@ enum CollectError {
 /// A body that fails part way is never returned as if it were whole: a
 /// malformed one is `Refused` (node's status for it), a truncated one
 /// `Gone`.
-async fn collect_body(mut body: hyper::body::Incoming) -> Result<bytes::Bytes, CollectError> {
+async fn collect_body(
+    mut body: hyper::body::Incoming,
+) -> Result<(bytes::Bytes, Option<hyper::HeaderMap>), CollectError> {
     use bytes::BufMut;
     let mut buf = bytes::BytesMut::new();
     let mut over_cap = false;
     let mut drained: usize = 0;
+    let mut trailers = None;
 
     loop {
         let frame = match body.frame().await {
@@ -1348,9 +1399,14 @@ async fn collect_body(mut body: hyper::body::Incoming) -> Result<bytes::Bytes, C
                 });
             }
         };
-        let Some(chunk) = frame.into_data().ok() else {
-            // Trailers and other frame types: ignore, keep going.
-            continue;
+        let chunk = match frame.into_data() {
+            Ok(chunk) => chunk,
+            // The trailer section (node's req.trailers); other frame types
+            // are ignored.
+            Err(frame) => {
+                trailers = frame.into_trailers().ok();
+                continue;
+            }
         };
         if over_cap {
             // Drain phase: discard bytes up to DRAIN_BUDGET to let the
@@ -1371,8 +1427,21 @@ async fn collect_body(mut body: hyper::body::Incoming) -> Result<bytes::Bytes, C
     if over_cap {
         Err(CollectError::TooLarge)
     } else {
-        Ok(buf.freeze())
+        Ok((buf.freeze(), trailers))
     }
+}
+
+/// A header map's fields as JS reads them: lowercased names, each value on
+/// its own.
+fn header_pairs(map: &hyper::HeaderMap) -> Vec<(String, String)> {
+    map.iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect()
 }
 
 /// Service-level error returned only for ResponseBody::Abort: hyper drops
@@ -1476,11 +1545,11 @@ async fn dispatch_request(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<usize>().ok())
         .is_some_and(|len| len > MAX_REQUEST_BODY);
-    let (collected, body_stream) = if stream_request_body && !declared_oversize {
-        (bytes::Bytes::new(), Some((body, message_done)))
+    let ((collected, trailers), body_stream) = if stream_request_body && !declared_oversize {
+        ((bytes::Bytes::new(), None), Some((body, message_done)))
     } else {
         let collected = match collect_body(body).await {
-            Ok(bytes) => bytes,
+            Ok(collected) => collected,
             Err(CollectError::TooLarge) => return Ok(status_body(413, b"request body too large")),
             Err(CollectError::Refused(status)) => {
                 return Ok(hyper::Response::builder()
@@ -1503,16 +1572,7 @@ async fn dispatch_request(
         state.body_bytes.fetch_sub(body_len, Ordering::AcqRel);
         return Ok(status_body(503, b"server is busy"));
     }
-    let headers: Vec<(String, String)> = parts
-        .headers
-        .iter()
-        .map(|(k, v)| {
-            (
-                k.as_str().to_string(),
-                String::from_utf8_lossy(v.as_bytes()).into_owned(),
-            )
-        })
-        .collect();
+    let headers = header_pairs(&parts.headers);
     let uri = parts
         .uri
         .path_and_query()
@@ -1548,6 +1608,9 @@ async fn dispatch_request(
             .lock()
             .expect("http bodies lock")
             .insert(id, RequestBody::Full(collected.to_vec()));
+        if let Some(trailers) = &trailers {
+            state.store_trailers(id, trailers);
+        }
     }
     // From here on, every exit cleans up — including a cancelled future
     // if the client disconnects while the handler runs — and refunds the

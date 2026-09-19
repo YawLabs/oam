@@ -1468,14 +1468,20 @@ different answer:
   `Content-Length`; more than 100 header fields (`431`; Node limits only the byte count
   and keeps the first 1000 fields); a request target over 65534 bytes (`414`; Node answers
   `431` from the byte count). Under `insecureHTTPParser`, obs-fold, control characters in
-  values, `Transfer-Encoding` codings other than a final `chunked`, and whitespace after
-  a chunk size stay refused.
+  values, `Transfer-Encoding` codings other than a final `chunked`, whitespace after
+  a chunk size, and `Content-Length`, `Transfer-Encoding` or obs-fold in a chunked body's
+  trailers stay refused.
 - **oam accepts, Node refuses:** lowercase or unknown methods (`get`, `FOO`) and an
   HTTP/1.1 request without `Host` (Node's `requireHostHeader`, which oam does not
   implement).
 - A malformed chunked body is answered with Node's status (`400`, or `413` for chunk
   extensions over the limit) when the handler has not responded yet, and the handler's
-  request aborts with `ECONNRESET`, as in Node.
+  request aborts with `ECONNRESET`, as in Node. On `https` servers and the HTTP/1 side of
+  `http2.createServer` the body is read before the handler runs, so a body refused as
+  malformed reaches no handler (Node runs it on the headers, and its request aborts).
+- A chunked body's trailer fields are in `req.trailers` and `req.rawTrailers` once the
+  body has ended, combined as Node combines them, but `rawTrailers` has the names
+  lowercased and a repeated name's values side by side.
 - A refused head is answered with `content-length: 0` and `date` headers next to
   `connection: close` (Node: `Connection: close` alone), except on the upgrade path, which
   writes Node's bytes. There is no `'clientError'` event.
@@ -1489,7 +1495,7 @@ different answer:
   effect there and not here.
 
 _(probed)_ Node v22.22.2 (default and `--insecure-http-parser`) and oam, the same 90 raw
-request heads over TCP, 16 chunked bodies and 40 chunk extensions.
+request heads over TCP, 16 chunked bodies, 40 chunk extensions and 15 trailer sections.
 
 ### 41. The HTTP server's timeouts and connection count: what still differs
 

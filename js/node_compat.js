@@ -17302,6 +17302,30 @@
     const EventEmitter = registry.get("events");
     const { Readable } = registry.get("stream");
 
+    // node's IncomingMessage#_addHeaderLine (lib/_http_incoming.js), for
+    // trailer fields: set-cookie collects an array, cookie joins with '; ',
+    // the fields node keeps one of keep the first, and any other repeated
+    // field joins with ', '.
+    const kSingleValueFields = new Set([
+      "content-type", "content-length", "user-agent", "referer", "host",
+      "authorization", "proxy-authorization", "if-modified-since",
+      "if-unmodified-since", "from", "location", "max-forwards", "retry-after",
+      "etag", "last-modified", "server", "age", "expires",
+    ]);
+    function addHeaderLine(dest, name, value) {
+      const field = name.toLowerCase();
+      if (field === "set-cookie") {
+        if (dest[field] !== undefined) dest[field].push(value);
+        else dest[field] = [value];
+      } else if (kSingleValueFields.has(field)) {
+        if (dest[field] === undefined) dest[field] = value;
+      } else if (typeof dest[field] === "string") {
+        dest[field] += (field === "cookie" ? "; " : ", ") + value;
+      } else {
+        dest[field] = value;
+      }
+    }
+
     class IncomingMessage extends Readable {
       constructor(meta) {
         // The http layer manages this stream's close lifecycle; opt out of
@@ -17339,6 +17363,10 @@
         // node's deprecated alias, the same object.
         this.connection = socket;
         this._requestId = meta.requestId;
+        // node: empty until a chunked body's trailer section is read, at
+        // its end.
+        this.rawTrailers = [];
+        this.trailers = {};
         this._bodyPushed = false;
         this._bodyDone = false;
         this._reading = false;
@@ -17375,6 +17403,16 @@
         natives.httpRequestBodyRead(this._requestId).then(
           (chunk) => {
             this._reading = false;
+            // The end of a chunked body with a trailer section comes with
+            // its fields, which node exposes as req.rawTrailers /
+            // req.trailers once the body has ended.
+            if (chunk && Array.isArray(chunk.trailers)) {
+              for (const [name, value] of chunk.trailers) {
+                this.rawTrailers.push(name, value);
+                addHeaderLine(this.trailers, name, value);
+              }
+              chunk = undefined;
+            }
             if (chunk === undefined || chunk === null || chunk.length === 0) {
               this._bodyDone = true;
               this.complete = true;

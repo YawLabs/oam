@@ -111,6 +111,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   extensions over the limit -- where the connection used to close without one, and the
   handler sees its request abort with `ECONNRESET`. `https` and `http2.createServer`
   servers no longer hand a handler a body that failed part way as if it were complete.
+- **Framing fields in a chunked body's trailers were accepted.** A `Content-Length` or
+  `Transfer-Encoding` field in the trailer section of a chunked request was read as an
+  ordinary field and the connection went on to its next request, where Node refuses the
+  body; a front end that acts on such a field frames the connection differently. Such a
+  request is now answered `400` and the connection is closed, as in Node, and `fetch` and
+  `http.request` fail a response whose trailers carry `Content-Length`, as Node's do.
 - **Response heads had no size limit either.** `fetch`, `http.request`, `https.request`
   and `undici.request` accepted response heads of hundreds of KiB. They now refuse a
   head at Node's limit (16 KiB, or `--max-http-header-size`), counted as Node counts it
@@ -148,6 +154,10 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`req.trailers` and `req.rawTrailers` were `undefined` on server requests.** A chunked
+  request body's trailer fields were dropped. They are now there once the body has
+  ended (empty before, and for a body without trailers), combined as Node combines
+  repeated fields.
 - **A `fetch` could hang forever when the server closed a keep-alive
   connection just as the next request went out on it.** This also affected
   `http.request`, `https.request` and `undici.request`, which ride the same
