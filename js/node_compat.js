@@ -25513,25 +25513,250 @@
       return Object.assign({}, options);
     }
 
+    // ---- tls.Server ----
+    // Node's server lifecycle (lib/internal/tls/wrap.js), measured on
+    // v22.22.2: the secure context is built at createServer() -- a key that
+    // cannot be read, or one that is not its certificate's, throws there --
+    // and every connection is handshaken on its own, bounded by
+    // handshakeTimeout, so a client that never finishes (or never starts)
+    // holds up no one else. requestCert / rejectUnauthorized /
+    // ALPNProtocols are read off the server for each connection, as Node's
+    // tlsConnectionListener reads them. A requested client certificate is
+    // judged after the handshake (onServerSocketSecure): `authorized`, or
+    // `authorizationError` and, under rejectUnauthorized, a socket destroyed
+    // before 'secureConnection' (whose close is the 'tlsClientError'
+    // ECONNRESET Node reports). A failed handshake is 'tlsClientError' with
+    // the connection's socket.
+
+    // Node's convertALPNProtocols (lib/tls.js): an array of names becomes the
+    // wire form -- each name's length byte, then its bytes -- and a name over
+    // 255 bytes throws; a Uint8Array or other ArrayBufferView is taken as the
+    // wire form already (copied); anything else leaves the option unset.
+    function convertALPNProtocols(protocols, out) {
+      var Buf = globalThis.Buffer;
+      if (Array.isArray(protocols)) {
+        var parts = [];
+        for (var i = 0; i < protocols.length; i++) {
+          var bytes = Buf.from(String(protocols[i]), "utf8");
+          if (bytes.length > 255) {
+            var tooLong = new RangeError(
+              "The byte length of the protocol at index " + i +
+                " exceeds the maximum length. It must be <= 255. Received " + bytes.length,
+            );
+            throw applyNodeErrorShape(tooLong, "ERR_OUT_OF_RANGE");
+          }
+          parts.push(Buf.from([bytes.length]), bytes);
+        }
+        out.ALPNProtocols = Buf.concat(parts);
+      } else if (protocols instanceof Uint8Array) {
+        out.ALPNProtocols = Buf.from(protocols);
+      } else if (ArrayBuffer.isView(protocols)) {
+        out.ALPNProtocols = Buf.from(protocols.buffer.slice(
+          protocols.byteOffset, protocols.byteOffset + protocols.byteLength));
+      }
+    }
+
+    // The names in an ALPN wire list, one char per byte, for the native side
+    // (which offers them in this order). A malformed list stops where it
+    // stops making sense, as OpenSSL's parser does.
+    function alpnWireNames(wire) {
+      var names = [];
+      if (!wire) return names;
+      for (var i = 0; i < wire.length;) {
+        var len = wire[i++];
+        if (len === 0 || i + len > wire.length) break;
+        names.push(globalThis.Buffer.from(wire.subarray(i, i + len)).toString("latin1"));
+        i += len;
+      }
+      return names;
+    }
+
+    // PEM text of a `cert` / `key` / `ca` entry: a string as given, bytes as
+    // UTF-8 (PEM is ASCII).
+    function pemText(value) {
+      if (typeof value === "string") return value;
+      if (ArrayBuffer.isView(value)) {
+        return new TextDecoder().decode(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+      }
+      return String(value);
+    }
+    function optionList(value) {
+      if (!value) return [];
+      return Array.isArray(value) ? value : [value];
+    }
+    // Node's validateKeyOrCertOption: a string or a Buffer / TypedArray /
+    // DataView (key and pfx entries may also be objects carrying the value
+    // under `pem` / `buf`).
+    function validateKeyOrCert(name, value) {
+      if (typeof value !== "string" && !ArrayBuffer.isView(value)) {
+        throw codes.ERR_INVALID_ARG_TYPE(
+          "options." + name, ["string", "Buffer", "TypedArray", "DataView"], value);
+      }
+    }
+    // What the native context is built from: Node's createSecureContext
+    // options, normalised.
+    function secureContextSpec(options, versions) {
+      var certs = [];
+      optionList(options.cert).forEach(function(c) {
+        validateKeyOrCert("cert", c);
+        certs.push(pemText(c));
+      });
+      var keys = [];
+      optionList(options.key).forEach(function(k) {
+        if (k !== null && typeof k === "object" && !ArrayBuffer.isView(k)) {
+          validateKeyOrCert("key.pem", k.pem);
+          keys.push({ pem: pemText(k.pem), passphrase: k.passphrase == null ? null : String(k.passphrase) });
+        } else {
+          validateKeyOrCert("key", k);
+          keys.push({ pem: pemText(k), passphrase: null });
+        }
+      });
+      var pfx = [];
+      optionList(options.pfx).forEach(function(p) {
+        var buf = p, passphrase = null;
+        if (p !== null && typeof p === "object" && !ArrayBuffer.isView(p)) {
+          buf = p.buf;
+          passphrase = p.passphrase == null ? null : String(p.passphrase);
+        }
+        validateKeyOrCert("pfx", buf);
+        var bytes = typeof buf === "string" ? globalThis.Buffer.from(buf)
+          : globalThis.Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
+        pfx.push({ buf: bytes.toString("base64"), passphrase: passphrase });
+      });
+      var ca = null;
+      if (options.ca) {
+        ca = optionList(options.ca).map(function(c) {
+          validateKeyOrCert("ca", c);
+          return pemText(c);
+        });
+      }
+      return {
+        certs: certs,
+        keys: keys,
+        pfx: pfx,
+        passphrase: options.passphrase == null ? null : String(options.passphrase),
+        ca: ca,
+        minVersion: versions.min,
+        maxVersion: versions.max,
+      };
+    }
+    // Build a native context, or throw what Node throws: OpenSSL's errors
+    // carry `library`, `reason` and `code`; a PKCS#12 bundle's are plain.
+    function buildServerContext(options, versions) {
+      var built = JSON.parse(natives.tlsServerContext(JSON.stringify(secureContextSpec(options, versions))));
+      if (built.error) {
+        var e = new Error(built.error.message);
+        if (built.error.library !== undefined) e.library = built.error.library;
+        if (built.error.reason !== undefined) e.reason = built.error.reason;
+        if (built.error.code !== undefined) e.code = built.error.code;
+        throw e;
+      }
+      return built.id;
+    }
+    // A context lives as long as the server that built it.
+    var serverContexts = typeof FinalizationRegistry === "function"
+      ? new FinalizationRegistry(function(id) { natives.tlsServerContextFree(id); })
+      : null;
+
+    // Node's ConnResetException('socket hang up').
+    function socketHangUp() {
+      var e = new Error("socket hang up");
+      e.code = "ECONNRESET";
+      return e;
+    }
+
+    // A server-side socket's view of the handshake (the accept record and
+    // what the handshake settled), as Node's TLSSocket reports it.
+    function fillServerSocket(socket, info, accepted) {
+      socket._handle = info.handle;
+      socket.connecting = false;
+      socket._protocol = info.protocol;
+      socket._cipher = info.cipher;
+      socket._cipherStandardName = info.cipherStandardName || null;
+      socket._peerCertificates = info.peerCertificates || null;
+      socket._peerParsed = null;
+      socket.alpnProtocol = info.alpnProtocol == null ? false : info.alpnProtocol;
+      socket.servername = info.servername == null ? false : info.servername;
+      var remote = info.remoteAddr || accepted.remoteAddr;
+      if (remote) {
+        socket.remoteAddress = remote.address;
+        socket.remotePort = remote.port;
+        socket.remoteFamily = remote.family;
+      }
+      if (info.localAddr) {
+        socket.localAddress = info.localAddr.address;
+        socket.localPort = info.localAddr.port;
+        socket.localFamily = info.localAddr.family;
+      }
+    }
+
     class Server extends EventEmitter {
       constructor(options, connectionListener) {
         super();
         if (typeof options === "function") {
           connectionListener = options;
           options = {};
+        } else if (options == null) {
+          options = {};
+        } else if (typeof options !== "object") {
+          throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
         }
-        this._options = options || {};
-        // Node validates the version options when it builds the server's
-        // SecureContext, at createServer() -- so throw here, synchronously.
-        var serverVersions = resolveTlsVersions(this._options);
-        this._tlsMin = serverVersions.min;
-        this._tlsMax = serverVersions.max;
+        this._options = options;
+        this.requestCert = options.requestCert === true;
+        this.rejectUnauthorized = options.rejectUnauthorized !== false;
+        this.ALPNCallback = options.ALPNCallback;
+        if (this.ALPNCallback && options.ALPNProtocols) {
+          throw nodeTypeError(
+            "The ALPNCallback and ALPNProtocols TLS options are mutually exclusive",
+            "ERR_TLS_ALPN_CALLBACK_WITH_PROTOCOLS",
+          );
+        }
+        if (options.ALPNProtocols) convertALPNProtocols(options.ALPNProtocols, this);
+        this._contextId = null;
+        this.setSecureContext(options);
+        this._handshakeTimeout = options.handshakeTimeout || 120 * 1000;
+        if (typeof this._handshakeTimeout !== "number") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.handshakeTimeout", "number", options.handshakeTimeout);
+        }
+        this._SNICallback = options.SNICallback;
+        if (this._SNICallback && typeof this._SNICallback !== "function") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.SNICallback", "Function", this._SNICallback);
+        }
         if (connectionListener) this.on("secureConnection", connectionListener);
         this._serverId = null;
         this._port = null;
         this._host = null;
         this.listening = false;
         this._closed = false;
+      }
+      // Node's Server#setSecureContext: the options are kept on the server
+      // and a new context replaces the old one for connections accepted
+      // from now on (a certificate rotation); a bad one throws and leaves
+      // the old one in place.
+      setSecureContext(options) {
+        if (options === null || typeof options !== "object") {
+          throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+        }
+        // Node validates the version options when it builds the context.
+        var versions = resolveTlsVersions(options);
+        var id = buildServerContext(options, versions);
+        this.pfx = options.pfx || undefined;
+        this.key = options.key || undefined;
+        this.passphrase = options.passphrase || undefined;
+        this.cert = options.cert || undefined;
+        this.ca = options.ca || undefined;
+        this.minVersion = options.minVersion || undefined;
+        this.maxVersion = options.maxVersion || undefined;
+        this.secureProtocol = options.secureProtocol || undefined;
+        this._tlsMin = versions.min;
+        this._tlsMax = versions.max;
+        var old = this._contextId;
+        this._contextId = id;
+        if (serverContexts) {
+          if (old !== null) serverContexts.unregister(this);
+          serverContexts.register(this, id, this);
+        }
+        if (old !== null) natives.tlsServerContextFree(old);
       }
       listen(port, host, callback) {
         if (typeof port === "object" && port !== null) {
@@ -25545,10 +25770,7 @@
         }
         if (typeof callback === "function") this.once("listening", callback);
         var hostname = host || "0.0.0.0";
-        var certPem = this._options.cert instanceof Uint8Array
-          ? new TextDecoder().decode(this._options.cert) : String(this._options.cert || "");
-        var keyPem = this._options.key instanceof Uint8Array
-          ? new TextDecoder().decode(this._options.key) : String(this._options.key || "");
+        this._closed = false;
 
         // Registered synchronously inside listen(), as net.Server is: Node
         // lists a listening tls.Server as a TCPServerWrap.
@@ -25562,7 +25784,7 @@
             // unref() before listen(), applied once bound (as net.Server).
             if (this._handleRefed === false) natives.tcpServerSetRef(bound.serverId, false);
             this.emit("listening");
-            this._acceptLoop(bound.serverId, certPem, keyPem);
+            this._acceptLoop(bound.serverId);
           },
           (err) => {
             registry._activeHandles.delete(this);
@@ -25571,7 +25793,7 @@
         );
         return this;
       }
-      _acceptLoop(serverId, certPem, keyPem) {
+      _acceptLoop(serverId) {
         (async () => {
           while (!this._closed) {
             var accepted;
@@ -25587,45 +25809,58 @@
               continue;
             }
             if (accepted === undefined) break;
-            var tcpHandle = accepted.handle;
-            try {
-              var info = await natives.tlsAcceptWrap(tcpHandle, certPem, keyPem, this._tlsMin, this._tlsMax);
-              var socket = new TLSSocket(null, {});
-              socket._handle = info.handle;
-              socket.connecting = false;
-              // Node: false unless requestCert produced a verified peer
-              // certificate, and this server never requests one. Its
-              // `timeout` is the server's, which is 0.
-              socket.authorized = false;
-              socket.timeout = 0;
-              socket._protocol = info.protocol;
-              socket._cipher = info.cipher;
-              socket._cipherStandardName = info.cipherStandardName || null;
-              socket._peerCertificates = info.peerCertificates || null;
-              socket._peerParsed = null;
-              socket._isServer = true;
-              socket.alpnProtocol = info.alpnProtocol || false;
-              socket.encrypted = true;
-              var remote = info.remoteAddr || accepted.remoteAddr;
-              if (remote) {
-                socket.remoteAddress = remote.address;
-                socket.remotePort = remote.port;
-                socket.remoteFamily = remote.family;
-              }
-              if (info.localAddr) {
-                socket.localAddress = info.localAddr.address;
-                socket.localPort = info.localAddr.port;
-                socket.localFamily = info.localAddr.family;
-              }
-              registry._activeHandles.set(socket, "TCPSocketWrap");
-              this.emit("secureConnection", socket);
-              socket._startReading();
-            } catch (e) {
-              this.emit("tlsClientError", typeof e === "string" ? new Error(e) : e, null);
-            }
+            // Not awaited: each connection handshakes on its own.
+            this._secureConnection(accepted);
           }
           this.emit("close");
         })();
+      }
+      // One accepted connection: its TLSSocket from the start (Node builds it
+      // on 'connection'), the handshake, the verdict, 'secureConnection'.
+      _secureConnection(accepted) {
+        var socket = new TLSSocket(null, {});
+        socket._isServer = true;
+        socket.server = this;
+        socket.authorized = false;
+        socket.timeout = 0;
+        socket.servername = null;
+        if (accepted.remoteAddr) {
+          socket.remoteAddress = accepted.remoteAddr.address;
+          socket.remotePort = accepted.remoteAddr.port;
+          socket.remoteFamily = accepted.remoteAddr.family;
+        }
+        var requestCert = this.requestCert;
+        var rejectUnauthorized = this.rejectUnauthorized;
+        var alpn = this.ALPNProtocols ? JSON.stringify(alpnWireNames(this.ALPNProtocols)) : undefined;
+        natives.tlsAcceptWrap(
+          accepted.handle, this._contextId, this._handshakeTimeout,
+          requestCert, rejectUnauthorized, alpn,
+        ).then(
+          (info) => {
+            fillServerSocket(socket, info, accepted);
+            if (requestCert) {
+              if (info.authorizationError) {
+                socket.authorizationError = info.authorizationError;
+                if (rejectUnauthorized) {
+                  // Destroyed before it is ever handed out; its close is
+                  // the 'socket hang up' Node reports.
+                  socket.destroy();
+                  this.emit("tlsClientError", socketHangUp(), socket);
+                  return;
+                }
+              } else {
+                socket.authorized = true;
+              }
+            }
+            registry._activeHandles.set(socket, "TCPSocketWrap");
+            this.emit("secureConnection", socket);
+            socket._startReading();
+          },
+          (err) => {
+            socket.destroy();
+            this.emit("tlsClientError", typeof err === "string" ? new Error(err) : err, socket);
+          },
+        );
       }
       address() {
         return this.listening

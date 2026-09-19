@@ -408,6 +408,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("tlsShutdown", op_tls_shutdown),
         ("tlsSetRef", op_tls_set_ref),
         ("tlsAcceptWrap", op_tls_accept_wrap),
+        ("tlsServerContext", op_tls_server_context),
+        ("tlsServerContextFree", op_tls_server_context_free),
         // oam:permissions query surface
         ("permissionsQuery", op_permissions_query),
         // worker_threads
@@ -3392,36 +3394,89 @@ fn op_tls_accept_wrap(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let tcp_handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let Some(cert_pem) = arg_string(scope, &args, 1) else {
-        throw_type_error(scope, "tlsAcceptWrap requires cert PEM");
-        return;
+    let context_id = args.get(1).number_value(scope).unwrap_or(0.0) as u64;
+    // Node's handshakeTimeout, in ms (120 s by default, validated in JS).
+    let handshake_ms = args.get(2).number_value(scope).unwrap_or(120_000.0);
+    let handshake_timeout =
+        std::time::Duration::from_millis(if handshake_ms.is_finite() && handshake_ms > 0.0 {
+            handshake_ms as u64
+        } else {
+            120_000
+        });
+    // What Node reads off the server for this connection: requestCert,
+    // rejectUnauthorized, and ALPNProtocols as names (one char per byte).
+    let request_cert = args.get(3).is_true();
+    let reject_unauthorized = args.get(4).is_true();
+    let alpn = match arg_string(scope, &args, 5) {
+        Some(json) => match serde_json::from_str::<Vec<String>>(&json) {
+            Ok(names) => names
+                .iter()
+                .map(|name| name.chars().map(|c| c as u32 as u8).collect())
+                .collect(),
+            Err(e) => {
+                throw_type_error(scope, &format!("tlsAcceptWrap: malformed ALPN list: {e}"));
+                return;
+            }
+        },
+        None => Vec::new(),
     };
-    let Some(key_pem) = arg_string(scope, &args, 2) else {
-        throw_type_error(scope, "tlsAcceptWrap requires key PEM");
-        return;
+    let options = oam_core::tls::server::AcceptOptions {
+        request_cert,
+        reject_unauthorized,
+        alpn,
+        handshake_timeout,
     };
-    // The server's effective minVersion / maxVersion (JS-resolved); empty is
-    // Node's default range.
-    let min_version = arg_string(scope, &args, 3).filter(|s| !s.is_empty());
-    let max_version = arg_string(scope, &args, 4).filter(|s| !s.is_empty());
     let core = core_runtime!(scope);
     let tls = core.tls();
+    let Some(context) = oam_core::tls::server::context(&tls, context_id) else {
+        throw_type_error(scope, "tlsAcceptWrap: the server's secure context is gone");
+        return;
+    };
     let tcp = core.tcp();
     let ids = core.body_ids();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::tls::tls_accept_wrap(
-            tls,
-            tcp,
-            ids,
-            tcp_handle,
-            cert_pem,
-            key_pem,
-            min_version,
-            max_version,
-        ),
+        oam_core::tls::server::tls_accept(tls, tcp, ids, tcp_handle, context, options),
     );
+}
+
+/// tlsServerContext(specJson) -> JSON `{ "id": n }`, or `{ "error": {...} }`
+/// with what Node throws at `tls.createServer()` (JS throws it).
+fn op_tls_server_context(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let spec_json = arg_string(scope, &args, 0).unwrap_or_default();
+    let spec: oam_core::tls::server::ServerContextSpec = match serde_json::from_str(&spec_json) {
+        Ok(spec) => spec,
+        Err(e) => {
+            throw_type_error(scope, &format!("tlsServerContext: malformed options: {e}"));
+            return;
+        }
+    };
+    let core = core_runtime!(scope);
+    let result = match oam_core::tls::server::build_server_context(&spec) {
+        Ok(context) => {
+            let id =
+                oam_core::tls::server::register_context(&core.tls(), &core.body_ids(), context);
+            serde_json::json!({ "id": id })
+        }
+        Err(error) => serde_json::json!({ "error": error.to_json() }),
+    };
+    if let Some(text) = v8::String::new(scope, &result.to_string()) {
+        rv.set(text.into());
+    }
+}
+
+fn op_tls_server_context_free(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    oam_core::tls::server::free_context(&core_runtime!(scope).tls(), id);
 }
 
 /// zlibSync(bytes, format, level, compress) — synchronous transform on the

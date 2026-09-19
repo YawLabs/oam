@@ -34,8 +34,11 @@ use x509_parser::extensions::GeneralName;
 use x509_parser::parse_x509_certificate;
 use x509_parser::time::ASN1Time;
 
+mod keys;
+pub mod server;
+
 type ClientStream = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
-type ServerStream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+type ServerStream = tokio_rustls::server::TlsStream<server::ServerIo>;
 
 enum TlsReader {
     Client(ReadHalf<ClientStream>),
@@ -68,6 +71,8 @@ pub struct TlsState {
     /// drains, and the process hangs at exit. `tls_close` fires the Notify so
     /// the parked read drops its half and the socket closes.
     cancel: HashMap<u64, Arc<tokio::sync::Notify>>,
+    /// Server secure contexts by id (server.rs), one per `tls.createServer`.
+    contexts: HashMap<u64, Arc<server::ServerContext>>,
 }
 
 impl TlsState {
@@ -1473,105 +1478,6 @@ pub fn tls_close(registry: &TlsRegistry, handle: u64) {
     if let Some(notify) = guard.cancel.remove(&handle) {
         notify.notify_one();
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn tls_accept_wrap(
-    tls_registry: TlsRegistry,
-    tcp_registry: crate::tcp::TcpRegistry,
-    ids: Arc<std::sync::atomic::AtomicU64>,
-    tcp_handle: u64,
-    cert_pem: String,
-    key_pem: String,
-    min_version: Option<String>,
-    max_version: Option<String>,
-) -> OpOutcome {
-    let Some((reader, writer)) = tcp_registry
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take_halves(tcp_handle)
-    else {
-        return OpOutcome::Failed(format!("tls accept: tcp handle {tcp_handle} is gone"));
-    };
-
-    let tcp_stream = match reader.reunite(writer) {
-        Ok(s) => s,
-        Err(e) => return OpOutcome::Failed(format!("tls accept: reunite failed: {e}")),
-    };
-
-    // A server range with nothing to offer fails this connection with Node's
-    // per-connection `tlsClientError` code -- the socket is answered with the
-    // alert the client expects (`refuse_no_protocols`), off this op so the
-    // accept loop is not held for it, and the server keeps listening.
-    let versions = match protocol_versions(min_version.as_deref(), max_version.as_deref()) {
-        Ok(v) => v,
-        Err(_) => {
-            tokio::spawn(refuse_no_protocols(tcp_stream));
-            return OpOutcome::node_failed(
-                "ERR_SSL_NO_PROTOCOLS_AVAILABLE",
-                "no protocols available for the requested TLS version range".to_string(),
-            );
-        }
-    };
-
-    let tls_config = match build_server_config(&cert_pem, &key_pem, &versions) {
-        Ok(c) => c,
-        Err(e) => return OpOutcome::Failed(format!("tls accept config: {e}")),
-    };
-
-    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-    let tls_stream = match acceptor.accept(tcp_stream).await {
-        Ok(s) => s,
-        Err(e) => return tls_fail(e, "accept", &tcp_handle.to_string()),
-    };
-
-    let (_, server_conn) = tls_stream.get_ref();
-    let protocol = server_conn
-        .protocol_version()
-        .map(protocol_name)
-        .unwrap_or_default();
-    let (cipher, cipher_standard_name) = server_conn
-        .negotiated_cipher_suite()
-        .map(|c| cipher_names(c.suite()))
-        .unwrap_or_default();
-    // The client's chain, if it sent one (this server requests none, so it
-    // is absent today); no ephemeralKeyInfo -- Node reports null on a
-    // server-side socket.
-    let peer_certificates = peer_certificates_b64(server_conn.peer_certificates());
-    let alpn = server_conn
-        .alpn_protocol()
-        .map(|p| String::from_utf8_lossy(p).into_owned())
-        .unwrap_or_default();
-
-    let (tcp, _) = tls_stream.get_ref();
-    let local_addr = tcp.local_addr().ok();
-    let remote_addr = tcp.peer_addr().ok();
-
-    let handle = ids.fetch_add(1, Ordering::Relaxed);
-    let (reader, writer) = tokio::io::split(tls_stream);
-    {
-        let mut guard = tls_registry.lock().unwrap_or_else(|e| e.into_inner());
-        guard.readers.insert(handle, TlsReader::Server(reader));
-        guard.writers.insert(handle, TlsWriter::Server(writer));
-    }
-
-    let mut payload = serde_json::json!({
-        "handle": handle,
-        "protocol": protocol,
-        "cipher": cipher,
-        "cipherStandardName": cipher_standard_name,
-        "alpnProtocol": alpn,
-    });
-    if let Some(chain) = peer_certificates {
-        payload["peerCertificates"] = serde_json::Value::from(chain);
-    }
-    if let Some(la) = local_addr {
-        payload["localAddr"] = crate::tcp::addr_to_json(la);
-    }
-    if let Some(ra) = remote_addr {
-        payload["remoteAddr"] = crate::tcp::addr_to_json(ra);
-    }
-    OpOutcome::Json(payload.to_string())
 }
 
 /// Build a TLS server config from PEM-encoded cert chain + private key.
