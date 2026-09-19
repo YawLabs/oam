@@ -25491,9 +25491,84 @@
   };
 
   // ------------------------------------------------------------------ http2
+
+  // A socket's bytes to and from a Rust consumer (__oam.node.socketPipe*):
+  // what an http2.connect session runs over, and what a fetch runs over when
+  // an undici dispatcher's `connect` function supplied the socket (the
+  // undici shim takes this as registry._pipeSocket). The socket is paused
+  // while its last chunk is still going into the pipe (read backpressure),
+  // and the next bytes are taken from the pipe only once the socket accepted
+  // the last ones (write backpressure). `outDone` settles when the consumer
+  // is finished writing (or the pump stopped); the owner ends the socket.
+  // `stop()` detaches from the socket and closes the pipe, which the
+  // consumer reads as the peer closing; the socket's 'close' stops it too.
+  function pipeSocket(socket) {
+    var natives = globalThis.__oam.node;
+    var id = natives.socketPipeOpen();
+    var stopped = false;
+    var inTail = Promise.resolve();
+    var resolveOut;
+    var outDone = new Promise(function (resolve) { resolveOut = resolve; });
+    var onData = function (chunk) {
+      var bytes = typeof chunk === "string" ? globalThis.Buffer.from(chunk, "latin1") : chunk;
+      if (typeof socket.pause === "function") socket.pause();
+      inTail = inTail
+        .then(function () { return natives.socketPipeIn(id, bytes); })
+        .then(function () {
+          if (!stopped && !socket.destroyed && typeof socket.resume === "function") socket.resume();
+        }, function () {});
+    };
+    var onEnd = function () {
+      inTail = inTail
+        .then(function () { return natives.socketPipeInEnd(id); })
+        .then(function () {}, function () {});
+    };
+    var stop = function () {
+      if (stopped) return;
+      stopped = true;
+      socket.removeListener("data", onData);
+      socket.removeListener("end", onEnd);
+      socket.removeListener("close", stop);
+      natives.socketPipeClose(id);
+      resolveOut();
+    };
+    socket.on("data", onData);
+    socket.on("end", onEnd);
+    socket.on("close", stop);
+    var pumpOut = function () {
+      natives.socketPipeOut(id).then(function (bytes) {
+        if (bytes === undefined || stopped || socket.destroyed) {
+          resolveOut();
+          return;
+        }
+        socket.write(
+          globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+          function (err) {
+            if (err) resolveOut();
+            else pumpOut();
+          },
+        );
+      }, function () { resolveOut(); });
+    };
+    pumpOut();
+    return { id: id, outDone: outDone, stop: stop };
+  }
+  registry._pipeSocket = pipeSocket;
+
   registry.factories.http2 = (natives) => {
     const EventEmitter = registry.get("events");
     const { Duplex } = registry.get("stream");
+
+    function bodyRead(handle) {
+      return globalThis.__oam.fetchBodyRead(handle);
+    }
+    function bodyCancel(handle) {
+      try {
+        globalThis.__oam.fetchBodyCancel(handle);
+      } catch (_) {
+        /* already drained or gone */
+      }
+    }
 
     class ServerHttp2Stream extends Duplex {
       constructor(requestId, inHeaders) {
@@ -25678,148 +25753,800 @@
       return createServer(options, handler);
     }
 
-    class ClientHttp2Stream extends Duplex {
-      constructor(session, headers) {
-        super({ allowHalfOpen: true, autoDestroy: false });
-        this._session = session;
-        this._reqHeaders = headers;
-        this._bodyChunks = [];
-        this._ended = false;
-        this.sentHeaders = headers;
-        this.id = 1;
-        this._responseEmitted = false;
+    // ---- the client ------------------------------------------------------
+    // node's http2 client (lib/internal/http2/core.js, v22.22.2): a session
+    // is bound to ONE socket and every stream travels over it. connect()
+    // takes that socket from `options.createConnection(authority, options)`
+    // when that is a function, else from net.connect({port, host, ...options})
+    // (http:) or tls.connect(port, host, ...) offering ALPN h2 (https:). So
+    // whatever decides where that socket goes -- the `lookup` option, a
+    // replaced dns.lookup, a 'lookup' or 'connect' listener that destroys it,
+    // the createConnection itself -- decides where every request of the
+    // session goes. The HTTP/2 framing is hyper's client, running over a pipe
+    // the socket is pumped through (natives.http2Session*): it never dials
+    // anything itself. (The client used to be one fetch per stream over the
+    // shared fetch transport, which ignored every connect option and never
+    // opened the session's own connection.)
+    const NGHTTP2_NO_ERROR = 0;
+    const NGHTTP2_INTERNAL_ERROR = 2;
+    const NGHTTP2_CANCEL = 8;
+    const NGHTTP2_SESSION_CLIENT = 1;
+    const NGHTTP2_ERROR_NAMES = [
+      "NGHTTP2_NO_ERROR", "NGHTTP2_PROTOCOL_ERROR", "NGHTTP2_INTERNAL_ERROR",
+      "NGHTTP2_FLOW_CONTROL_ERROR", "NGHTTP2_SETTINGS_TIMEOUT", "NGHTTP2_STREAM_CLOSED",
+      "NGHTTP2_FRAME_SIZE_ERROR", "NGHTTP2_REFUSED_STREAM", "NGHTTP2_CANCEL",
+      "NGHTTP2_COMPRESSION_ERROR", "NGHTTP2_CONNECT_ERROR", "NGHTTP2_ENHANCE_YOUR_CALM",
+      "NGHTTP2_INADEQUATE_SECURITY", "NGHTTP2_HTTP_1_1_REQUIRED",
+    ];
+    const kBoundSession = Symbol("kBoundSession");
+    const kSensitiveHeaders = Symbol.for("nodejs.http2.sensitiveHeaders");
+    const VALID_PSEUDO_HEADERS = new Set([":status", ":method", ":authority", ":scheme", ":path", ":protocol"]);
+    const NO_PAYLOAD_METHODS = new Set(["DELETE", "GET", "HEAD"]);
+
+    function h2Error(code, message, Base) {
+      var err = new (Base || Error)(message);
+      err.code = code;
+      return err;
+    }
+    // node's ERR_HTTP2_STREAM_CANCEL: the error a pending stream is destroyed
+    // with when its session goes down, naming (and carrying) the cause.
+    function streamCancelError(cause) {
+      var err = h2Error(
+        "ERR_HTTP2_STREAM_CANCEL",
+        cause && typeof cause.message === "string"
+          ? "The pending stream has been canceled (caused by: " + cause.message + ")"
+          : "The pending stream has been canceled",
+      );
+      if (cause) err.cause = cause;
+      return err;
+    }
+    function streamCodeError(code) {
+      return h2Error(
+        "ERR_HTTP2_STREAM_ERROR",
+        "Stream closed with error code " + (NGHTTP2_ERROR_NAMES[code] || code),
+      );
+    }
+    function sessionCodeError(code) {
+      return h2Error("ERR_HTTP2_SESSION_ERROR", "Session closed with error code " + code);
+    }
+    // node's NghttpError: the error nghttp2 itself raised; a connection the
+    // h2 layer found malformed is its NGHTTP2_ERR_PROTO.
+    class NghttpError extends Error {
+      constructor(errno, message) {
+        super(message);
+        this.code = "ERR_HTTP2_ERROR";
+        this.errno = errno;
       }
-      _write(chunk, encoding, callback) {
-        if (typeof chunk === "string") {
-          this._bodyChunks.push(globalThis.Buffer.from(chunk, encoding || "utf8"));
-        } else {
-          this._bodyChunks.push(chunk);
-        }
-        callback();
-      }
-      _final(callback) {
-        this._ended = true;
-        this._doFetch(callback);
-      }
-      _read() {}
-      _doFetch(callback) {
-        var self = this;
-        var method = this._reqHeaders[":method"] || "GET";
-        var path = this._reqHeaders[":path"] || "/";
-        var scheme = this._reqHeaders[":scheme"] || "http";
-        var authority = this._reqHeaders[":authority"] || this._session._authority;
-        var url = scheme + "://" + authority + path;
-        var fetchHeaders = {};
-        var keys = Object.keys(this._reqHeaders);
-        for (var i = 0; i < keys.length; i++) {
-          if (keys[i].charAt(0) !== ":") {
-            fetchHeaders[keys[i]] = this._reqHeaders[keys[i]];
-          }
-        }
-        var bodyData = null;
-        if (this._bodyChunks.length > 0) {
-          var totalLen = 0;
-          for (var bi = 0; bi < this._bodyChunks.length; bi++) totalLen += this._bodyChunks[bi].length;
-          var merged = new Uint8Array(totalLen);
-          var boff = 0;
-          for (var bi = 0; bi < this._bodyChunks.length; bi++) {
-            merged.set(this._bodyChunks[bi], boff);
-            boff += this._bodyChunks[bi].length;
-          }
-          bodyData = merged;
-        }
-        // node's http2 client has no Fetch-spec bad-port block.
-        var fetchOpts = { method: method, headers: fetchHeaders, __oamFetchSemantics: false };
-        if (bodyData && method !== "GET" && method !== "HEAD") {
-          fetchOpts.body = bodyData;
-        }
-        globalThis.fetch(url, fetchOpts).then(
-          function(resp) {
-            var respHeaders = { ":status": resp.status };
-            resp.headers.forEach(function(value, name) {
-              respHeaders[name.toLowerCase()] = value;
-            });
-            self.emit("response", respHeaders, 0);
-            resp.arrayBuffer().then(function(ab) {
-              if (ab.byteLength > 0) {
-                self.push(globalThis.Buffer.from(ab));
-              }
-              self.push(null);
-              callback();
-            }, function(err) {
-              self.destroy(err);
-              callback(err);
-            });
-          },
-          function(err) {
-            self.emit("error", typeof err === "string" ? new Error(err) : err);
-            callback(err);
-          },
-        );
-      }
-      close(code, callback) {
-        if (typeof code === "function") { callback = code; code = 0; }
-        this.end();
-        if (callback) this.once("close", callback);
+      toString() {
+        return this.name + " [" + this.code + "]: " + this.message;
       }
     }
+    function emitNT(target, event, a, b) {
+      target.emit(event, a, b);
+    }
+    // node's http2 util assertIsObject.
+    function assertIsObject(value, name, types) {
+      if (value !== undefined && (value === null || typeof value !== "object" || Array.isArray(value))) {
+        var errors = registry.get("internal/errors").codes;
+        throw new errors.ERR_INVALID_ARG_TYPE(name, types || ["Object"], value);
+      }
+    }
+
+    // node's toHeaderObject: `:status` a number, `set-cookie` an array, a
+    // repeated `cookie` joined with '; ', any other repeat with ', '.
+    function toHeaderObject(status, pairs) {
+      var obj = { __proto__: null };
+      obj[":status"] = status;
+      for (var i = 0; i < pairs.length; i++) {
+        var name = pairs[i][0];
+        var value = pairs[i][1];
+        var existing = obj[name];
+        if (existing === undefined) {
+          obj[name] = name === "set-cookie" ? [value] : value;
+        } else if (name === "cookie") {
+          obj[name] = existing + "; " + value;
+        } else if (name === "set-cookie") {
+          existing.push(value);
+        } else {
+          obj[name] = existing + ", " + value;
+        }
+      }
+      obj[kSensitiveHeaders] = [];
+      return obj;
+    }
+
+    // node's prepareRequestHeadersObject + mapToHeaders for the request
+    // headers: the pseudo-headers the session fills in, the header lines
+    // (names lowercased, arrays one line per value, undefined values
+    // skipped), and node's refusals (an unknown pseudo-header, a name with a
+    // space, an HTTP/1 connection-specific header).
+    function prepareRequestHeaders(headersParam, session) {
+      var headers = Object.assign({ __proto__: null }, headersParam);
+      if (headers[":method"] === undefined) headers[":method"] = "GET";
+      if (headers[":authority"] === undefined && headers.host === undefined) {
+        headers[":authority"] = session._authority;
+      }
+      if (headers[":scheme"] === undefined) headers[":scheme"] = session._protocol.slice(0, -1);
+      if (headers[":path"] === undefined) headers[":path"] = "/";
+      var list = [];
+      var keys = Object.keys(headers);
+      for (var i = 0; i < keys.length; i++) {
+        var key = keys[i];
+        var value = headers[key];
+        if (value === undefined || key === "") continue;
+        key = key.toLowerCase();
+        if (key[0] === ":") {
+          if (!VALID_PSEUDO_HEADERS.has(key)) {
+            throw h2Error("ERR_HTTP2_INVALID_PSEUDOHEADER", '"' + key + '" is an invalid pseudoheader or is used incorrectly', TypeError);
+          }
+          continue;
+        }
+        if (key.indexOf(" ") !== -1) {
+          throw h2Error("ERR_INVALID_HTTP_TOKEN", 'Header name must be a valid HTTP token ["' + key + '"]', TypeError);
+        }
+        var values = Array.isArray(value) ? value : [value];
+        for (var j = 0; j < values.length; j++) {
+          var text = String(values[j]);
+          if (key === "connection" || key === "upgrade" || key === "http2-settings" ||
+              key === "keep-alive" || key === "proxy-connection" || key === "transfer-encoding" ||
+              (key === "te" && text !== "trailers")) {
+            throw h2Error("ERR_HTTP2_INVALID_CONNECTION_HEADERS", 'HTTP/1 Connection specific headers are forbidden: "' + key + '"', TypeError);
+          }
+          list.push([key, text]);
+        }
+      }
+      return {
+        headers: headers,
+        list: list,
+        method: String(headers[":method"]),
+        scheme: String(headers[":scheme"]),
+        authority: String(headers[":authority"] !== undefined ? headers[":authority"] : headers.host),
+        path: String(headers[":path"]),
+      };
+    }
+
+    class ClientHttp2Stream extends Duplex {
+      constructor(session, prepared, options) {
+        // autoDestroy: once the response has ended and the request body is
+        // finished the stream is done, and 'close' follows (node's order).
+        super({ allowHalfOpen: true, decodeStrings: false });
+        this._session = session;
+        this.sentHeaders = prepared.headers;
+        this._prepared = prepared;
+        this._id = undefined;
+        this._rstCode = NGHTTP2_NO_ERROR;
+        this._closed = false;
+        this._aborted = false;
+        this._endStream = options.endStream;
+        // The request body streams through an outbound body channel the
+        // session's request takes; a stream that ends with its headers has
+        // none.
+        this._bodyStream = options.endStream ? null : natives.fetchBodyChannelNew();
+        this._channelTail = Promise.resolve();
+        this._bodyHandle = null;
+        this._readWanted = false;
+        this._reading = false;
+        this._readEnded = false;
+      }
+      get id() { return this._id; }
+      get pending() { return this._id === undefined; }
+      get rstCode() { return this._rstCode; }
+      get closed() { return this._closed; }
+      get aborted() { return this._aborted; }
+      get session() { return this._session; }
+      setTimeout() { return this; }
+      priority() {}
+
+      // node's requestOnConnect: the session connected, send the request.
+      _requestOnConnect() {
+        var session = this._session;
+        if (session === undefined || session.destroyed) return;
+        if (session.closed) {
+          this.destroy(h2Error("ERR_HTTP2_GOAWAY_SESSION", "New streams cannot be created after receiving a GOAWAY"));
+          return;
+        }
+        this._id = session._nextStreamId;
+        session._nextStreamId += 2;
+        session._pendingStreams.delete(this);
+        session._streams.set(this._id, this);
+        var self = this;
+        process.nextTick(function () { if (!self.destroyed) self.emit("ready"); });
+        var p = this._prepared;
+        var request = {
+          method: p.method,
+          scheme: p.scheme,
+          authority: p.authority,
+          path: p.path,
+          headers: p.list,
+        };
+        if (this._bodyStream !== null) request.body_stream = this._bodyStream;
+        // A session that fails to open destroys its streams itself.
+        session._opening.then(function (sid) {
+          if (self.destroyed) return;
+          natives.http2SessionRequest(sid, JSON.stringify(request)).then(function (raw) {
+            // Out of the promise job, so a throwing 'response' listener is
+            // an uncaught exception, as it is in node.
+            process.nextTick(function () { self._onResponse(raw); });
+          }, function (err) {
+            if (self.destroyed) return;
+            // The peer reset this stream: closed with its code (node's
+            // onStreamClose), an error unless NO_ERROR or CANCEL.
+            if (err && err.code === "ERR_HTTP2_STREAM_ERROR" && typeof err.errno === "number") {
+              self._closeStream(err.errno);
+              self.destroy();
+              return;
+            }
+            // The connection failed under the stream: the session reports
+            // that once and takes its streams with it.
+            if (err && err.code === "ERR_HTTP2_SESSION_FAILED") return;
+            self.destroy(err);
+          });
+        }, function () {});
+      }
+
+      _onResponse(raw) {
+        if (this.destroyed) {
+          bodyCancel(raw.bodyHandle);
+          return;
+        }
+        var rawHeaders = [":status", String(raw.status)];
+        for (var i = 0; i < raw.headers.length; i++) rawHeaders.push(raw.headers[i][0], raw.headers[i][1]);
+        var headers = toHeaderObject(raw.status, raw.headers);
+        this._bodyHandle = raw.bodyHandle;
+        // nghttp2's flags: END_HEADERS, plus END_STREAM for a response with
+        // no body.
+        this.emit("response", headers, raw.endStream ? 5 : 4, rawHeaders);
+        if (this._readWanted) this._pumpBody();
+      }
+
+      _pumpBody() {
+        if (this._bodyHandle === null || this._reading || this.destroyed) return;
+        this._reading = true;
+        var self = this;
+        var handle = this._bodyHandle;
+        bodyRead(handle).then(function (chunk) {
+          self._reading = false;
+          // Destroyed, or closed (which let go of the body) meanwhile.
+          if (self.destroyed || self._bodyHandle !== handle) return;
+          if (chunk === undefined) {
+            self._bodyHandle = null;
+            self._readEnded = true;
+            self.push(null);
+            return;
+          }
+          self._readWanted = false;
+          self.push(globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+        }, function () {
+          self._reading = false;
+          if (self.destroyed || self._bodyHandle !== handle) return;
+          self._bodyHandle = null;
+          self.destroy(streamCodeError(NGHTTP2_INTERNAL_ERROR));
+        });
+      }
+
+      _read() {
+        this._readWanted = true;
+        this._pumpBody();
+      }
+
+      _write(chunk, encoding, callback) {
+        var bytes = typeof chunk === "string" ? globalThis.Buffer.from(chunk, encoding || "utf8") : chunk;
+        if (this._bodyStream === null) {
+          callback(h2Error("ERR_STREAM_WRITE_AFTER_END", "write after end"));
+          return;
+        }
+        var stream = this._bodyStream;
+        var next = this._channelTail.then(function () {
+          return natives.fetchBodyChannelWrite(stream, bytes);
+        });
+        this._channelTail = next.then(function () {}, function () {});
+        next.then(function () { callback(); }, function (err) { callback(err); });
+      }
+
+      _final(callback) {
+        if (this._bodyStream === null) {
+          callback();
+          return;
+        }
+        var stream = this._bodyStream;
+        this._channelTail = this._channelTail.then(function () {
+          natives.fetchBodyChannelEnd(stream);
+        });
+        this._channelTail.then(function () { callback(); });
+      }
+
+      close(code, callback) {
+        if (code === undefined) code = NGHTTP2_NO_ERROR;
+        if (typeof code !== "number" || !Number.isInteger(code) || code < 0 || code > 2147483647) {
+          var errors = registry.get("internal/errors").codes;
+          if (typeof code !== "number") throw new errors.ERR_INVALID_ARG_TYPE("code", "number", code);
+          throw new errors.ERR_OUT_OF_RANGE("code", ">= 0 && <= 2147483647", code);
+        }
+        if (callback !== undefined && typeof callback !== "function") {
+          var codes = registry.get("internal/errors").codes;
+          throw new codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
+        }
+        if (this._closed) return;
+        if (callback !== undefined) this.once("close", callback);
+        this._closeStream(code);
+        // node's onStreamClose: the readable side ends ('end') before the
+        // stream is destroyed ('close'); an unread response body goes.
+        if (this._bodyHandle !== null) {
+          bodyCancel(this._bodyHandle);
+          this._bodyHandle = null;
+        }
+        var self = this;
+        process.nextTick(function () {
+          if (self.destroyed) return;
+          if (self.readableEnded) {
+            self.destroy();
+            return;
+          }
+          self.once("end", function () { self.destroy(); });
+          self.push(null);
+          self.read(0);
+        });
+      }
+
+      // node's closeStream: record the code and, with the request body still
+      // open, 'aborted' and end it.
+      _closeStream(code) {
+        this._closed = true;
+        this._rstCode = code;
+        if (!this._writableState.ending) {
+          if (!this._aborted) {
+            this._aborted = true;
+            this.emit("aborted");
+          }
+          this.end();
+        }
+      }
+
+      _destroy(err, callback) {
+        var session = this._session;
+        var sessionCode = session ? (session._state.goawayCode || session._state.destroyCode) : 0;
+        // Both halves done: the stream closed cleanly.
+        var done = err == null && this._readEnded && this._writableState.finished;
+        var code = this._closed ? this._rstCode : done ? NGHTTP2_NO_ERROR : sessionCode;
+        if (err != null) {
+          if (sessionCode) code = sessionCode;
+          else if (err.name === "AbortError") code = NGHTTP2_CANCEL;
+          else code = NGHTTP2_INTERNAL_ERROR;
+        }
+        if (!this._closed) this._closeStream(code);
+        // Whatever is still in flight is dropped: an unread response body
+        // (dropping it resets the stream), an unfinished request body.
+        if (this._bodyHandle !== null) {
+          bodyCancel(this._bodyHandle);
+          this._bodyHandle = null;
+        }
+        if (this._bodyStream !== null && !this._writableState.finished) {
+          try { natives.fetchBodyChannelCancel(this._bodyStream); } catch (_) { /* gone */ }
+        }
+        if (session) {
+          if (this._id !== undefined) session._streams.delete(this._id);
+          else session._pendingStreams.delete(this);
+          setImmediate(function () { session._maybeDestroy(); });
+        }
+        // RST code 8 is how a client aborts, and not an error (node).
+        if (err == null && code !== NGHTTP2_NO_ERROR && code !== NGHTTP2_CANCEL) {
+          err = streamCodeError(code);
+        }
+        this._session = undefined;
+        callback(err);
+      }
+    }
+
+    function socketOnError(error) {
+      var session = this[kBoundSession];
+      if (session !== undefined) {
+        // An ECONNRESET after the peer's GOAWAY is the peer's right.
+        if (error && error.code === "ECONNRESET" && session._state.goawayCode !== null) {
+          session.destroy();
+          return;
+        }
+        session.destroy(error);
+      }
+    }
+
+    function socketOnClose() {
+      var session = this[kBoundSession];
+      if (session === undefined) return;
+      // node's nghttp2 has read every byte the socket delivered before the
+      // socket's 'close': a protocol error in them is the session's error.
+      // Here those bytes go through the pipe, so the connection's verdict
+      // is awaited first (closing the pipe ends the connection at once).
+      if (session._pipe !== null && session._ended !== null) {
+        session._pipe.stop();
+        session._ended.then(function (ended) {
+          if (session.destroyed) return;
+          if (ended && ended.error && typeof ended.error.code === "number") {
+            session._onConnectionEnd(ended);
+            return;
+          }
+          closeOnSocketClose(session);
+        });
+        return;
+      }
+      closeOnSocketClose(session);
+    }
+
+    function closeOnSocketClose(session) {
+      var err = session.connecting ? h2Error("ERR_SOCKET_CLOSED", "Socket is closed") : null;
+      session._streams.forEach(function (stream) { stream.close(NGHTTP2_CANCEL); });
+      session._pendingStreams.forEach(function (stream) { stream.close(NGHTTP2_CANCEL); });
+      session.close();
+      session._closeSession(NGHTTP2_NO_ERROR, err);
+    }
+
+    function emitClose(session, error) {
+      if (error) session.emit("error", error);
+      session.emit("close");
+    }
+
+    // node's session.socket: the socket behind a proxy that refuses the
+    // calls that would read or write it under the session.
+    const NO_SOCKET_MANIPULATION = new Set([
+      "destroy", "emit", "end", "pause", "read", "resume", "write",
+      "setEncoding", "setKeepAlive", "setNoDelay",
+    ]);
+    function noSocketManipulation() {
+      return h2Error(
+        "ERR_HTTP2_NO_SOCKET_MANIPULATION",
+        "HTTP/2 sockets should not be directly manipulated (e.g. read and written)",
+      );
+    }
+    function socketUnbound() {
+      return h2Error("ERR_HTTP2_SOCKET_UNBOUND", "The socket has been disconnected from the Http2Session");
+    }
+    const proxySocketHandler = {
+      get(session, prop) {
+        if (prop === "setTimeout" || prop === "ref" || prop === "unref") return session[prop].bind(session);
+        if (NO_SOCKET_MANIPULATION.has(prop)) throw noSocketManipulation();
+        var socket = session._socket;
+        if (socket === undefined) throw socketUnbound();
+        var value = socket[prop];
+        return typeof value === "function" ? value.bind(socket) : value;
+      },
+      getPrototypeOf(session) {
+        var socket = session._socket;
+        if (socket === undefined) throw socketUnbound();
+        return Object.getPrototypeOf(socket);
+      },
+      set(session, prop, value) {
+        if (prop === "setTimeout" || prop === "ref" || prop === "unref") {
+          session[prop] = value;
+          return true;
+        }
+        if (NO_SOCKET_MANIPULATION.has(prop)) throw noSocketManipulation();
+        var socket = session._socket;
+        if (socket === undefined) throw socketUnbound();
+        socket[prop] = value;
+        return true;
+      },
+    };
 
     class ClientHttp2Session extends EventEmitter {
-      constructor(authority) {
+      constructor(options, socket) {
         super();
-        this._authority = authority.replace(/^https?:\/\//, "");
-        this._scheme = authority.startsWith("https") ? "https" : "http";
-        this._closed = false;
-        this._destroyed = false;
-        this.socket = {};
-        this.alpnProtocol = "h2c";
-        var self = this;
-        process.nextTick(function() { self.emit("connect", self); });
-      }
-      request(headers) {
-        if (this._closed || this._destroyed) {
-          throw new Error("Session is closed");
+        if (socket[kBoundSession] !== undefined) {
+          throw h2Error("ERR_HTTP2_SOCKET_BOUND", "The socket is already bound to an Http2Session");
         }
-        var merged = {};
-        merged[":method"] = "GET";
-        merged[":path"] = "/";
-        merged[":scheme"] = this._scheme;
-        merged[":authority"] = this._authority;
-        if (headers) {
-          var keys = Object.keys(headers);
-          for (var i = 0; i < keys.length; i++) {
-            merged[keys[i]] = headers[keys[i]];
+        socket[kBoundSession] = this;
+        socket.on("error", socketOnError);
+        socket.on("close", socketOnClose);
+        this._state = { destroyCode: NGHTTP2_NO_ERROR, goawayCode: null, closed: false, destroyed: false, ready: false };
+        this._streams = new Map();
+        this._pendingStreams = new Set();
+        this._pendingRequestCalls = null;
+        this._socket = socket;
+        this._proxySocket = null;
+        this._encrypted = undefined;
+        this._alpnProtocol = undefined;
+        this._pipe = null;
+        this._sid = null;
+        this._opening = null;
+        this._ended = null;
+        this._nextStreamId = 1;
+        this._authority = undefined;
+        this._protocol = undefined;
+        if (typeof socket.setNoDelay === "function") socket.setNoDelay();
+        var self = this;
+        var setup = function () { self._setup(socket); };
+        if (socket.connecting || socket.secureConnecting) {
+          var event = socket instanceof registry.get("tls").TLSSocket ? "secureConnect" : "connect";
+          socket.once(event, function () {
+            try {
+              setup();
+            } catch (error) {
+              socket.destroy(error);
+            }
+          });
+        } else {
+          setup();
+        }
+      }
+
+      // node's setupHandle: the socket is connected; the session runs over it
+      // from here, and 'connect' follows on the next tick.
+      _setup(socket) {
+        if (this._state.destroyed) {
+          process.nextTick(emitNT, this, "connect", this, socket);
+          return;
+        }
+        this._state.ready = true;
+        if (socket.encrypted) {
+          this._alpnProtocol = socket.alpnProtocol;
+          this._encrypted = true;
+        } else {
+          this._alpnProtocol = "h2c";
+          this._encrypted = false;
+        }
+        var pipe = pipeSocket(socket);
+        this._pipe = pipe;
+        var self = this;
+        this._opening = natives.http2SessionOpen(pipe.id).then(function (opened) {
+          var sid = opened.session;
+          if (self._state.destroyed) {
+            natives.http2SessionDestroy(sid);
+            throw h2Error("ERR_HTTP2_INVALID_SESSION", "The session has been destroyed");
+          }
+          self._sid = sid;
+          self._ended = natives.http2SessionWait(sid);
+          self._ended.then(function (ended) { self._onConnectionEnd(ended); });
+          return sid;
+        });
+        this._opening.then(undefined, function (err) {
+          if (!self._state.destroyed) self.destroy(err);
+        });
+        process.nextTick(emitNT, this, "connect", this, socket);
+      }
+
+      // The h2 connection ended under the session: the peer's GOAWAY, a
+      // protocol error, or the pipe closing with the socket.
+      _onConnectionEnd(ended) {
+        if (this._state.destroyed) return;
+        var e = ended && ended.error;
+        if (!e) {
+          // The h2 layer ended cleanly: the peer's EOF, or its GOAWAY once
+          // no stream was left. Either way the connection is over, as a
+          // socket 'close' would say (h2 reports both the same way).
+          closeOnSocketClose(this);
+          return;
+        }
+        if (typeof e.code === "number") {
+          if (e.goAway && e.remote) {
+            // node's onGoawayData.
+            this._state.goawayCode = e.code;
+            this.emit("goaway", e.code, 0, globalThis.Buffer.alloc(0));
+            if (e.code === NGHTTP2_NO_ERROR) this.destroy();
+            else this.destroy(sessionCodeError(e.code), NGHTTP2_NO_ERROR);
+            return;
+          }
+          if (e.remote) {
+            this.destroy(sessionCodeError(e.code));
+            return;
+          }
+          // Found malformed here: nghttp2's NGHTTP2_ERR_PROTO.
+          this.destroy(new NghttpError(-505, "Protocol error"));
+          return;
+        }
+        // An I/O end: the socket's own 'close' reports it.
+      }
+
+      get connecting() { return !this._state.ready; }
+      get closed() { return this._state.closed; }
+      get destroyed() { return this._state.destroyed; }
+      get encrypted() { return this._encrypted; }
+      get alpnProtocol() { return this._alpnProtocol; }
+      get originSet() {
+        if (!this._encrypted || this._state.destroyed) return undefined;
+        return ["https://" + this._authority];
+      }
+      get type() { return NGHTTP2_SESSION_CLIENT; }
+      get socket() {
+        if (this._proxySocket === null) this._proxySocket = new Proxy(this, proxySocketHandler);
+        return this._proxySocket;
+      }
+
+      request(headersParam, options) {
+        if (this._state.destroyed) throw h2Error("ERR_HTTP2_INVALID_SESSION", "The session has been destroyed");
+        if (this._state.closed) {
+          throw h2Error("ERR_HTTP2_GOAWAY_SESSION", "New streams cannot be created after receiving a GOAWAY");
+        }
+        if (headersParam !== undefined && (headersParam === null || typeof headersParam !== "object")) {
+          var errors = registry.get("internal/errors").codes;
+          throw new errors.ERR_INVALID_ARG_TYPE("headers", ["Object", "Array"], headersParam);
+        }
+        var prepared = prepareRequestHeaders(headersParam || {}, this);
+        assertIsObject(options, "options");
+        options = Object.assign({}, options);
+        if (options.endStream === undefined) {
+          options.endStream = NO_PAYLOAD_METHODS.has(prepared.method);
+        } else if (typeof options.endStream !== "boolean") {
+          var codes = registry.get("internal/errors").codes;
+          throw new codes.ERR_INVALID_ARG_TYPE("options.endStream", "boolean", options.endStream);
+        }
+        var stream = new ClientHttp2Stream(this, prepared, options);
+        if (options.endStream) stream.end();
+        var signal = options.signal;
+        if (signal) {
+          var aborter = function () {
+            var abort = new Error("The operation was aborted", { cause: signal.reason });
+            abort.name = "AbortError";
+            abort.code = "ABORT_ERR";
+            stream.destroy(abort);
+          };
+          if (signal.aborted) aborter();
+          else {
+            signal.addEventListener("abort", aborter, { once: true });
+            stream.once("close", function () { signal.removeEventListener("abort", aborter); });
           }
         }
-        var stream = new ClientHttp2Stream(this, merged);
+        this._pendingStreams.add(stream);
+        if (this.connecting) {
+          if (this._pendingRequestCalls !== null) {
+            this._pendingRequestCalls.push(stream);
+          } else {
+            this._pendingRequestCalls = [stream];
+            var self = this;
+            this.once("connect", function () {
+              var calls = self._pendingRequestCalls;
+              self._pendingRequestCalls = null;
+              for (var i = 0; i < calls.length; i++) calls[i]._requestOnConnect();
+            });
+          }
+        } else {
+          stream._requestOnConnect();
+        }
         return stream;
       }
+
       close(callback) {
-        this._closed = true;
-        if (callback) this.once("close", callback);
-        var self = this;
-        process.nextTick(function() { self.emit("close"); });
+        if (this._state.closed || this._state.destroyed) return;
+        this._state.closed = true;
+        if (typeof callback === "function") this.once("close", callback);
+        this._maybeDestroy();
       }
-      destroy(err) {
-        this._destroyed = true;
-        this._closed = true;
-        if (err) this.emit("error", err);
-        var self = this;
-        process.nextTick(function() { self.emit("close"); });
+
+      // node's kMaybeDestroy: a closed session with nothing open goes.
+      _maybeDestroy(error) {
+        if (error == null) {
+          if (!this._state.closed || this._streams.size > 0 || this._pendingStreams.size > 0) return;
+        }
+        this.destroy(error);
       }
-      ref() { return this; }
-      unref() { return this; }
+
+      destroy(error, code) {
+        if (this._state.destroyed) return;
+        if (error === undefined) error = NGHTTP2_NO_ERROR;
+        if (typeof error === "number") {
+          code = error;
+          error = code !== NGHTTP2_NO_ERROR ? sessionCodeError(code) : undefined;
+        }
+        if (code === undefined && error != null) code = NGHTTP2_INTERNAL_ERROR;
+        this._closeSession(code, error);
+      }
+
+      // node's closeSession: every stream goes (a pending one with
+      // ERR_HTTP2_STREAM_CANCEL naming the cause, an open one with the cause
+      // itself), the session lets go of the socket, and 'close' (after
+      // 'error' for an error) follows once the socket is done.
+      _closeSession(code, error) {
+        var state = this._state;
+        if (state.destroyed) return;
+        state.destroyed = true;
+        state.destroyCode = code;
+        if (this._pendingStreams.size > 0 || this._streams.size > 0) {
+          var cancel = streamCancelError(error);
+          this._pendingStreams.forEach(function (stream) { stream.destroy(cancel); });
+          this._streams.forEach(function (stream) { stream.destroy(error); });
+        }
+        var socket = this._socket;
+        var pipe = this._pipe;
+        var self = this;
+        var finish = function () {
+          if (self._sid !== null) natives.http2SessionDestroy(self._sid);
+          if (pipe !== null) pipe.stop();
+          self._finishSessionClose(socket, error);
+        };
+        // A graceful close lets hyper write its GOAWAY before the socket is
+        // ended; the pipe's out side ends once it has.
+        if (state.closed && error == null && this._sid !== null && pipe !== null && socket && !socket.destroyed) {
+          natives.http2SessionClose(this._sid);
+          pipe.outDone.then(finish);
+          return;
+        }
+        finish();
+      }
+
+      _finishSessionClose(socket, error) {
+        if (socket) {
+          socket[kBoundSession] = undefined;
+        }
+        this._socket = undefined;
+        var self = this;
+        if (socket && !socket.destroyed) {
+          socket.on("close", function () { emitClose(self, error); });
+          if (self._state.closed && typeof socket.resume === "function") socket.resume();
+          socket.end(function () {
+            if (!self._state.closed) {
+              setImmediate(function () { socket.destroy(error); });
+            }
+          });
+        } else {
+          process.nextTick(emitClose, this, error);
+        }
+      }
+
+      ref() {
+        if (this._socket && typeof this._socket.ref === "function") this._socket.ref();
+      }
+      unref() {
+        if (this._socket && typeof this._socket.unref === "function") this._socket.unref();
+      }
+      setTimeout() { return this; }
       ping(payload, callback) {
         if (typeof payload === "function") { callback = payload; payload = undefined; }
-        if (callback) process.nextTick(function() { callback(null, 0, globalThis.Buffer.alloc(8)); });
+        if (callback) process.nextTick(function () { callback(null, 0, payload || globalThis.Buffer.alloc(8)); });
+        return true;
       }
-      get closed() { return this._closed; }
-      get destroyed() { return this._destroyed; }
     }
 
-    function connect(authority, options) {
-      if (typeof options === "function") options = {};
-      return new ClientHttp2Session(authority);
+    // node's initializeTLSOptions for a client: offer h2 by ALPN (and
+    // http/1.1 with allowHTTP1), and name the host in SNI.
+    function initializeTLSOptions(options, servername) {
+      options = Object.assign({}, options);
+      if (!options.ALPNCallback) {
+        options.ALPNProtocols = ["h2"];
+        if (options.allowHTTP1 === true) options.ALPNProtocols.push("http/1.1");
+      }
+      if (servername !== undefined && !options.servername) options.servername = servername;
+      return options;
+    }
+
+    function connect(authority, options, listener) {
+      if (typeof options === "function") {
+        listener = options;
+        options = undefined;
+      }
+      assertIsObject(options, "options");
+      options = Object.assign({}, options);
+      if (typeof authority === "string") authority = new URL(authority);
+      assertIsObject(authority, "authority", ["string", "Object", "URL"]);
+      var protocol = authority.protocol || options.protocol || "https:";
+      var port = "" + (authority.port !== "" && authority.port !== undefined
+        ? authority.port : (authority.protocol === "http:" ? 80 : 443));
+      var host = "localhost";
+      if (authority.hostname) {
+        host = authority.hostname;
+        if (host[0] === "[") host = host.slice(1, -1);
+      } else if (authority.host) {
+        host = authority.host;
+      }
+      var socket;
+      if (typeof options.createConnection === "function") {
+        socket = options.createConnection(authority, options);
+      } else {
+        switch (protocol) {
+          case "http:":
+            socket = registry.get("net").connect(Object.assign({ port: port, host: host }, options));
+            break;
+          case "https:":
+            socket = registry.get("tls").connect(
+              port, host,
+              initializeTLSOptions(options, registry.get("net").isIP(host) ? undefined : host),
+            );
+            break;
+          default:
+            throw h2Error("ERR_HTTP2_UNSUPPORTED_PROTOCOL", 'protocol "' + protocol + '" is unsupported.');
+        }
+      }
+      var session = new ClientHttp2Session(options, socket);
+      session._authority = (options.servername || host) + ":" + port;
+      session._protocol = protocol;
+      if (typeof listener === "function") session.once("connect", listener);
+      return session;
     }
 
     return {
@@ -26303,6 +27030,39 @@
       return [options, typeof last === "function" ? last : undefined];
     }
 
+    // node's convertALPNProtocols for a client: `ALPNProtocols` as an array
+    // of names (strings, Buffers or typed arrays), or one buffer already in
+    // the wire format (each name prefixed with its length). Returns the
+    // names for the native, one byte per code point, as JSON; undefined for
+    // none. A name over 255 bytes throws, as node does at tls.connect().
+    function alpnProtocolNames(protocols) {
+      var names = [];
+      if (Array.isArray(protocols)) {
+        for (var i = 0; i < protocols.length; i++) {
+          var bytes = globalThis.Buffer.from(protocols[i]);
+          if (bytes.length > 255) {
+            var tooLong = new RangeError(
+              "The byte length of the protocol at index " + i +
+              " exceeds the maximum length. It must be <= 255. Received " + bytes.length,
+            );
+            tooLong.code = "ERR_OUT_OF_RANGE";
+            throw tooLong;
+          }
+          if (bytes.length > 0) names.push(bytes.toString("latin1"));
+        }
+      } else if (ArrayBuffer.isView(protocols)) {
+        var wire = globalThis.Buffer.from(protocols.buffer, protocols.byteOffset, protocols.byteLength);
+        for (var at = 0; at < wire.length;) {
+          var len = wire[at];
+          if (len > 0 && at + 1 + len <= wire.length) {
+            names.push(wire.toString("latin1", at + 1, at + 1 + len));
+          }
+          at += 1 + len;
+        }
+      }
+      return names.length > 0 ? JSON.stringify(names) : undefined;
+    }
+
     // The connect flow tls.connect() and TLSSocket.prototype.connect() share.
     // One native op does the TCP connect and the handshake, so 'connect',
     // Node validates and resolves the TLS protocol-version options when it
@@ -26406,6 +27166,7 @@
       // Throws synchronously for an invalid version / method / conflict, as
       // Node does at tls.connect(); the effective range goes to the native.
       var tlsVersions = resolveTlsVersions(options);
+      var alpn = alpnProtocolNames(options.ALPNProtocols);
 
       if (socket._connectPending || socket._handle !== null) {
         // Node: a connect() on a socket that is connecting or connected
@@ -26452,7 +27213,7 @@
           connecting = natives.tlsConnect(
             host, port, serverName, ca, rejectUnauthorized, cert, key,
             tlsVersions.min, tlsVersions.max, attemptTimeout,
-            spec === null ? undefined : JSON.stringify(spec),
+            spec === null ? undefined : JSON.stringify(spec), alpn,
           );
         } catch (err) {
           // A synchronous refusal (ERR_ACCESS_DENIED for an address the net
