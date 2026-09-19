@@ -547,6 +547,62 @@ fn the_response_head_limit_follows_the_flag() {
     );
 }
 
+/// `http.request` holds a response head to the flag's limit on both of its
+/// paths -- oam's own transport and the socket an agent's `createConnection`
+/// returns -- failing with node's own `HPE_HEADER_OVERFLOW` error (measured
+/// on node v22.22.2 with the same flags). A 20 KiB header fails under the
+/// default limit and passes under a 32 KiB one.
+#[test]
+fn the_response_head_limit_follows_the_flag_on_both_http_request_paths() {
+    let mut response = b"HTTP/1.1 200 OK\r\nX-A: ".to_vec();
+    response.extend(std::iter::repeat_n(b'a', 20_000));
+    response.extend_from_slice(b"\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok");
+    let port = raw_responder(response);
+    let script = write_temp(
+        "http_request_limit.mjs",
+        "import http from 'node:http';\n\
+         import net from 'node:net';\n\
+         class OwnSocket extends http.Agent {\n\
+           createConnection(options, cb) { return net.createConnection(options, cb); }\n\
+         }\n\
+         const get = (agent) => new Promise((resolve) => {\n\
+           const req = http.get({ host: '127.0.0.1', port: +process.env.PORT, path: '/', agent }, (res) => {\n\
+             let body = '';\n\
+             res.on('data', (d) => (body += d));\n\
+             res.on('end', () => resolve(`status ${res.statusCode} ${body}`));\n\
+           });\n\
+           req.on('error', (e) => resolve(`error ${e.code} ${e.message}`));\n\
+         });\n\
+         console.log('own transport', await get(false));\n\
+         console.log('agent socket', await get(new OwnSocket()));\n",
+    );
+    let run = |flags: &[&str]| {
+        let bin = std::env::var("OAM_WIRE_TEST_BIN")
+            .unwrap_or_else(|_| env!("CARGO_BIN_EXE_oam").to_string());
+        let out = Command::new(bin)
+            .args(flags)
+            .args(["run", script.to_str().unwrap(), "--no-check"])
+            .env("PORT", port.to_string())
+            .env_remove("NODE_OPTIONS")
+            .output()
+            .expect("oam runs");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .replace("\r\n", "\n")
+    };
+    assert_eq!(
+        run(&[]),
+        "own transport error HPE_HEADER_OVERFLOW Parse Error: Header overflow\n\
+         agent socket error HPE_HEADER_OVERFLOW Parse Error: Header overflow",
+        "the default limit"
+    );
+    assert_eq!(
+        run(&["--max-http-header-size=32768"]),
+        "own transport status 200 ok\nagent socket status 200 ok",
+        "a raised limit"
+    );
+}
+
 /// Reads each request body to the end before answering, and reports how the
 /// body ended. Has no 'upgrade' listener.
 const BODY_SERVER: &str = r#"

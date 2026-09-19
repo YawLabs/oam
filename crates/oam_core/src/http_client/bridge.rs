@@ -52,10 +52,6 @@ const PIPE: usize = 64 * 1024;
 /// The most one [`out`] read returns.
 const OUT_CHUNK: usize = 64 * 1024;
 
-/// node's default `maxHeaderSize` (`--max-http-header-size`), for a request
-/// that names none.
-const DEFAULT_MAX_HEADER_SIZE: u64 = 16 * 1024;
-
 /// Live bridges by id (ids from the runtime's shared handle allocator).
 pub type Bridges = Arc<Mutex<HashMap<u64, Bridge>>>;
 
@@ -267,7 +263,8 @@ pub struct BridgeRequest {
     #[serde(default)]
     pub body_stream: Option<u64>,
     /// node's `maxHeaderSize` for the response head: the request's option,
-    /// else `http.maxHeaderSize`. Absent: 16 KiB.
+    /// else `http.maxHeaderSize`. Absent: the process-wide
+    /// `--max-http-header-size` (16 KiB unless set).
     #[serde(default)]
     pub max_header_size: Option<u64>,
 }
@@ -363,7 +360,9 @@ pub fn start(
                 io: near,
                 parts,
                 body,
-                max_header_size: req.max_header_size.unwrap_or(DEFAULT_MAX_HEADER_SIZE),
+                max_header_size: req
+                    .max_header_size
+                    .unwrap_or_else(crate::http_head::max_http_header_size),
                 sent: sent_tx,
             }),
             out: Some(out),
@@ -389,30 +388,6 @@ fn exchange_error(error: &hyper::Error) -> OpOutcome {
     } else {
         OpOutcome::node_failed("ECONNRESET", "socket hang up")
     }
-}
-
-/// node's parser's response-head limit, counted as `http.request` counts it
-/// (measured on node v22.22.2): the reason phrase, every header name and
-/// every value, refused at a count at or over `limit`. A head too large for
-/// hyper's own read buffer already failed as `HPE_HEADER_OVERFLOW`.
-fn head_overflows(response: &http::Response<hyper::body::Incoming>, limit: u64) -> bool {
-    let reason = response
-        .extensions()
-        .get::<hyper::ext::ReasonPhrase>()
-        .map(|reason| reason.as_bytes().len())
-        .unwrap_or_else(|| {
-            response
-                .status()
-                .canonical_reason()
-                .unwrap_or_default()
-                .len()
-        });
-    let fields: usize = response
-        .headers()
-        .iter()
-        .map(|(name, value)| name.as_str().len() + value.as_bytes().len())
-        .sum();
-    (reason + fields) as u64 >= limit
 }
 
 /// A header value as JS sees it: latin1, one code point per byte.
@@ -491,10 +466,14 @@ pub async fn response(
             return exchange_error(&e);
         }
     };
-    if head_overflows(&response, max_header_size) {
+    // node's parser's response-head limit, counted as `http.request` counts
+    // it: the reason phrase, every header name and every value. A head too
+    // large for hyper's own read buffer already failed as
+    // `HPE_HEADER_OVERFLOW`.
+    if let Some(refusal) = super::send::response_head_overflow(&response, max_header_size, false) {
         drop(response);
         body.request_failed();
-        return OpOutcome::node_failed("HPE_HEADER_OVERFLOW", "Parse Error: Header overflow");
+        return refusal;
     }
     let status = response.status();
     let reason = response

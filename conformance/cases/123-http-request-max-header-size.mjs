@@ -6,11 +6,12 @@
 // `insecureHTTPParser` does not lift the limit. Both options are validated
 // in the constructor with node's errors. Measured on node v22.22.2.
 //
-// The requests here go over an agent's socket (a custom agent), whose parser
-// is oam's own; the transport behind a plain request applies the same limit
-// in the Rust fetch op. A raw server answers `HTTP/1.1 200 OK` with one
-// `X-A` header of the given size plus Content-Length and Connection (counted:
-// 35 + size).
+// Most requests here go over an agent's socket (a custom agent), whose parser
+// is oam's own; the last group sends them with `agent: false`, which oam
+// sends over its own transport, where the Rust fetch op applies the same
+// limit and the request's own `maxHeaderSize`. A raw server answers
+// `HTTP/1.1 200 OK` with one `X-A` header of the given size plus
+// Content-Length and Connection (counted: 35 + size).
 import http from "node:http";
 import net from "node:net";
 
@@ -68,6 +69,18 @@ for (const [size, options] of [
 ]) {
   const server = await rawServer(size);
   console.log(`${JSON.stringify(options)}, size ${size}: ${await get(server.address().port, options)}`);
+  server.close();
+}
+for (const [size, options] of [
+  [16348, {}],
+  [16349, {}],
+  [964, { maxHeaderSize: 1000 }],
+  [965, { maxHeaderSize: 1000 }],
+  [20000, { maxHeaderSize: 40000 }],
+]) {
+  const server = await rawServer(size);
+  const result = await get(server.address().port, { agent: false, ...options });
+  console.log(`agent false ${JSON.stringify(options)}, size ${size}: ${result}`);
   server.close();
 }
 

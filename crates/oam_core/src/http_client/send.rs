@@ -86,10 +86,10 @@ pub struct FetchRequest {
     /// it yet.
     #[serde(default = "yes")]
     pub default_headers: bool,
-    /// node's `maxHeaderSize` for the response heads of this request.
-    /// Absent: the process-wide `--max-http-header-size` (16384 unless set),
-    /// which is what node's fetch and `http.request` use by default. JS does
-    /// not send it yet (`http.request`'s per-request option).
+    /// node's `maxHeaderSize` for the response heads of this request:
+    /// `http.request`'s per-request option, when it sets one. Absent: the
+    /// process-wide `--max-http-header-size` (16384 unless set), which is
+    /// what node's fetch and `http.request` use by default.
     #[serde(default)]
     pub max_header_size: Option<u64>,
 }
@@ -529,8 +529,9 @@ async fn run(
 /// The count comes from the parsed head, so trailing whitespace in a value,
 /// which node counts and the parser trims, is not counted. A head too large
 /// for hyper's read buffer (~400 KiB) already fails the request as a
-/// connection error.
-fn response_head_overflow(
+/// connection error. The agent-socket exchange ([`super::bridge`]) applies
+/// the `http.request` count through this too.
+pub(super) fn response_head_overflow(
     response: &http::Response<Incoming>,
     limit: u64,
     fetch_semantics: bool,
