@@ -24709,7 +24709,6 @@
           "HTTP/2 sockets should not be directly manipulated (e.g. read and written)"),
         headersSent: () => h2Error(Error, "ERR_HTTP2_HEADERS_SENT", "Response has already been initiated."),
         invalidStream: () => h2Error(Error, "ERR_HTTP2_INVALID_STREAM", "The stream has been destroyed"),
-        invalidSession: () => h2Error(Error, "ERR_HTTP2_INVALID_SESSION", "The session has been destroyed"),
         pushDisabled: () => h2Error(Error, "ERR_HTTP2_PUSH_DISABLED", "HTTP/2 client has disabled push streams"),
         statusInvalid: (code) => h2Error(RangeError, "ERR_HTTP2_STATUS_INVALID", "Invalid status code: " + code),
         infoStatusNotAllowed: () => h2Error(RangeError, "ERR_HTTP2_INFO_STATUS_NOT_ALLOWED",
@@ -24726,7 +24725,6 @@
           'Invalid value "' + value + '" for header "' + name + '"'),
         httpToken: (name) => h2Error(TypeError, "ERR_INVALID_HTTP_TOKEN",
           'Header name must be a valid HTTP token ["' + name + '"]'),
-        streamError: (name) => h2Error(Error, "ERR_HTTP2_STREAM_ERROR", "Stream closed with error code " + name),
       };
 
       // node's kSingleValueHeaders (lib/internal/http2/util.js).

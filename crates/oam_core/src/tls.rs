@@ -13,7 +13,10 @@
 //! `ERR_TLS_CERT_ALTNAME_INVALID`, ...) rather than rustls's. Every code,
 //! message and precedence rule here was measured on node v22.22.2.
 //!
-//! Server-side TLS (node:https) is handled in http_server.rs via
+//! Server-side TLS for node:tls servers -- and http2.createSecureServer,
+//! which is one -- is server.rs (the secure context, the per-connection
+//! handshake, Node's client-certificate verdicts) and keys.rs (encrypted
+//! keys, PKCS#12). node:https's server is handled in http_server.rs via
 //! `https_serve` -- it wraps each accepted TCP stream with a TLS
 //! acceptor before handing it to hyper. The request/response lifecycle
 //! is identical to plain HTTP (shared HttpState, same ops).
