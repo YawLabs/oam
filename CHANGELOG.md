@@ -107,8 +107,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   they were not there, and a chunk extension was skipped unread whatever it held, where
   Node, and other parsers, refuse such lines; a proxy in front of the server can frame
   such a body differently. They are now answered `400` and the connection is closed, as
-  in Node (whitespace after the size also under `insecureHTTPParser`, which Node relaxes
-  there). Chunk extensions are read to Node's grammar in responses too, where `fetch`
+  in Node -- whitespace after the size even under `insecureHTTPParser`, where Node
+  accepts it. Chunk extensions are read to Node's grammar in responses too, where `fetch`
   and `http.request` now fail as Node's do. Any other chunked body the
   parser refuses is now answered with Node's status too -- `400`, or `413` for chunk
   extensions over the limit -- where the connection used to close without one, and the
