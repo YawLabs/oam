@@ -103,7 +103,7 @@ async function silent(port, n) {
 
 async function closeAll(sockets) {
   for (const s of sockets) s.destroy();
-  await sleep(300);
+  await sleep(500);
 }
 
 const describeDrop = (server, drop) =>

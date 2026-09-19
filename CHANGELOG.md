@@ -78,7 +78,9 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   front of the server that frames such a request differently disagrees with it about
   where the request ends. These heads are now answered `400` and the connection is
   closed, as in Node, for `http`, `https` and the HTTP/1 side of `http2.createServer`;
-  `insecureHTTPParser` and `--insecure-http-parser` relax the same rules Node's do.
+  `insecureHTTPParser` and `--insecure-http-parser` relax Node's framing rules
+  (`Content-Length` with `Transfer-Encoding`, bare LF, codings after `chunked`) as Node's
+  do, while obs-fold and control characters stay refused.
 - **`maxHeaderSize` was not enforced.** Request heads of hundreds of KiB were accepted,
   and the server's `maxHeaderSize` option, `--max-http-header-size` and
   `http.maxHeaderSize` had no effect. Heads are now counted as Node counts them and
@@ -86,14 +88,15 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   once it outgrows four times the limit (at least 64 KiB) instead of being buffered on.
   `--max-http-header-size` and `--insecure-http-parser` are accepted on the command line
   and in `NODE_OPTIONS`.
-- **The `http` server could treat an ordinary request as an upgrade and leak its
-  socket.** Whether a connection was an upgrade was decided from its first bytes rather
-  than from the request head, so requests that were not upgrades could be handed to the
-  `'upgrade'` event; with no `'upgrade'` listener such a socket was never answered or
-  closed, and it no longer counted against the server's connection limit. A request is
-  now an upgrade only when its head has an `Upgrade` header and `upgrade` in
-  `Connection`, as in Node; anything else is an ordinary request, and an upgrade nobody
-  listens for is closed.
+- **The `http` server routed upgrade and CONNECT requests differently from Node.** An
+  ordinary request could be treated as an upgrade and its connection left open, an
+  upgrade could reach the `'request'` handler, and CONNECT never reached a `'connect'`
+  listener. Requests are now routed as Node routes them, on any request of a keep-alive
+  connection: a request with an `Upgrade` header and `upgrade` in `Connection` goes to
+  `'upgrade'` while the server has an `'upgrade'` listener and is an ordinary request
+  otherwise, and every CONNECT goes to `'connect'` -- with the tunnel's first bytes as
+  `head` -- or, with no listener, has its socket destroyed. `https` servers now close a
+  CONNECT rather than hand it to the `'request'` handler.
 - **A bare LF in a chunked body's trailers was not refused.** hyper's trailer reader and
   its trailer parser disagreed about where the trailers end, so part of what followed
   was read and discarded while the connection stayed open. Such a body is now answered

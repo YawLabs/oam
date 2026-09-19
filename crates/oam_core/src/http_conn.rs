@@ -104,6 +104,10 @@ pub struct ServerTimeouts {
     max_connections: AtomicU64,
     /// Connections being served (node's `server._connections`).
     connections: AtomicUsize,
+    /// The server has an 'upgrade' listener: node hands a request that asks
+    /// for an upgrade to it only then, and serves it as an ordinary request
+    /// otherwise.
+    upgrade_listener: AtomicBool,
     fixed: TimeoutSettings,
 }
 
@@ -128,8 +132,18 @@ impl ServerTimeouts {
             socket: AtomicU64::new(settings.socket_ms),
             max_connections: AtomicU64::new(f64::INFINITY.to_bits()),
             connections: AtomicUsize::new(0),
+            upgrade_listener: AtomicBool::new(false),
             fixed: settings,
         })
+    }
+
+    /// Whether the server has an 'upgrade' listener, as JS last said.
+    pub fn set_upgrade_listener(&self, listening: bool) {
+        self.upgrade_listener.store(listening, Ordering::Relaxed);
+    }
+
+    pub fn upgrade_listener(&self) -> bool {
+        self.upgrade_listener.load(Ordering::Relaxed)
     }
 
     /// `server.maxConnections`, as `Number(value)` (infinity when unset).
@@ -268,6 +282,11 @@ pub struct ConnWatch {
     timer_changed: Notify,
     close: Mutex<Option<CloseReason>>,
     close_notify: Notify,
+    /// hyper holds bytes it has not written out yet: it wrote, or tried to,
+    /// and has not flushed since. A connection handed to JS mid-stream (an
+    /// upgrade) waits for them, or they would be lost with hyper's buffer.
+    unflushed: AtomicBool,
+    flushed: Notify,
 }
 
 impl ConnWatch {
@@ -300,6 +319,8 @@ impl ConnWatch {
             timer_changed: Notify::new(),
             close: Mutex::new(None),
             close_notify: Notify::new(),
+            unflushed: AtomicBool::new(false),
+            flushed: Notify::new(),
         })
     }
 
@@ -341,6 +362,39 @@ impl ConnWatch {
     pub fn note_write(&self, n: usize) {
         if n > 0 {
             self.touch();
+        }
+    }
+
+    /// A write left bytes to flush (it wrote some, or could not write).
+    fn note_unflushed(&self) {
+        self.unflushed.store(true, Ordering::Release);
+    }
+
+    /// Everything written so far is out.
+    fn note_flushed(&self) {
+        if self.unflushed.swap(false, Ordering::AcqRel) {
+            self.flushed.notify_waiters();
+        }
+    }
+
+    /// Whether written bytes still wait for a flush.
+    pub fn unflushed(&self) -> bool {
+        self.unflushed.load(Ordering::Acquire)
+    }
+
+    /// Resolves at the next flush that empties hyper's buffer.
+    pub fn next_flush(&self) -> tokio::sync::futures::Notified<'_> {
+        self.flushed.notified()
+    }
+
+    /// Resolves once nothing waits for a flush.
+    pub async fn flushed(&self) {
+        loop {
+            let flushed = self.flushed.notified();
+            if !self.unflushed() {
+                return;
+            }
+            flushed.await;
         }
     }
 
@@ -568,6 +622,21 @@ impl<S: AsyncRead + Unpin> AsyncRead for WatchedIo<S> {
     }
 }
 
+impl<S> WatchedIo<S> {
+    fn note_write_poll(&self, polled: &Poll<io::Result<usize>>) {
+        match polled {
+            Poll::Ready(Ok(n)) => {
+                self.watch.note_write(*n);
+                if *n > 0 {
+                    self.watch.note_unflushed();
+                }
+            }
+            Poll::Pending => self.watch.note_unflushed(),
+            Poll::Ready(Err(_)) => {}
+        }
+    }
+}
+
 impl<S: AsyncWrite + Unpin> AsyncWrite for WatchedIo<S> {
     fn poll_write(
         mut self: Pin<&mut Self>,
@@ -575,9 +644,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WatchedIo<S> {
         data: &[u8],
     ) -> Poll<io::Result<usize>> {
         let polled = Pin::new(&mut self.inner).poll_write(cx, data);
-        if let Poll::Ready(Ok(n)) = &polled {
-            self.watch.note_write(*n);
-        }
+        self.note_write_poll(&polled);
         polled
     }
 
@@ -587,9 +654,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WatchedIo<S> {
         bufs: &[io::IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
         let polled = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
-        if let Poll::Ready(Ok(n)) = &polled {
-            self.watch.note_write(*n);
-        }
+        self.note_write_poll(&polled);
         polled
     }
 
@@ -598,7 +663,12 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for WatchedIo<S> {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
+        let polled = Pin::new(&mut self.inner).poll_flush(cx);
+        // hyper flushes the stream only once its own buffer is written out.
+        if let Poll::Ready(Ok(())) = &polled {
+            self.watch.note_flushed();
+        }
+        polled
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {

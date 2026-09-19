@@ -2,7 +2,8 @@
 
 This directory is hyper **1.10.1** as published on crates.io, plus a fix
 for a client hang (items 1-3 below), one server extension (item 4), and
-four stricter rules in the chunked-body decoder (items 5 to 8). The root `Cargo.toml` swaps it in with `[patch.crates-io]`.
+four stricter rules in the chunked-body decoder (items 5 to 8), and a
+CONNECT request read without a body (item 9). The root `Cargo.toml` swaps it in with `[patch.crates-io]`.
 
 - **Upstream:** `hyper-1.10.1.crate`, sha256
   `55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498`
@@ -18,7 +19,7 @@ four stricter rules in the chunked-body decoder (items 5 to 8). The root `Cargo.
   directory: it is outside the workspace (no fmt, clippy or tests) and outside
   the unsafe-budget scan. After an edit here, `scripts/check-vendor.sh
   --regen` rewrites the diff; review it and commit it with the edit.
-- **Remove it when** a hyper release ships the fix and items 5 to 8, **and**
+- **Remove it when** a hyper release ships the fix and items 5 to 9, **and**
   oam no longer needs item 4 (see "The request-head extension" below for what
   replacing it takes). To do that:
   1. Delete this directory.
@@ -86,6 +87,9 @@ whole of it.
    (`Decoder::in_request`, set from `T::is_server()` where `conn.rs` builds
    it). New crate test `test_decode_trailers_framing_and_repeats`. See
    "Trailer framing fields" below.
+9. **`src/proto/h1/role.rs`, `Server::parse`.** A CONNECT request's body
+   length is zero, whatever `Content-Length` or `Transfer-Encoding` it
+   carries; `test_decoder_request` gains the cases. See "CONNECT" below.
 
 ## Why
 
@@ -243,6 +247,20 @@ Tested by conformance case 138 (http and https, identical to node; fails on
 stock 1.10.1) and `test_decode_trailers_framing_and_repeats`. hyper 1.11.1
 already keeps repeated trailer fields (`append`), but still accepts the
 framing fields; its `read_extension` (item 7) is unchanged from 1.10.1.
+
+## CONNECT (item 9)
+
+node's parser (llhttp) takes every CONNECT as an upgrade: the bytes after its
+head belong to the tunnel, and the server hands them to its 'connect'
+listener as `head` with the socket. oam's server does the same by taking the
+connection out of hyper once the CONNECT head is parsed (`Connection::
+into_parts`, with hyper's read buffer). hyper read a body for a CONNECT that
+declared one, so those bytes went into a body channel and were lost to the
+tunnel. With the patch the request has no body and the bytes stay in hyper's
+read buffer. hyper 1.11.1's `Server::parse` is unchanged here.
+
+Tested by conformance case 139 (`CONNECT with a length`) and
+`test_decoder_request`.
 
 ## Reproduction
 

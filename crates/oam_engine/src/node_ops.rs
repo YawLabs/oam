@@ -326,6 +326,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpServerTimeouts", op_http_server_timeouts),
         ("httpServerExpire", op_http_server_expire),
         ("httpServerMaxConnections", op_http_server_max_connections),
+        ("httpServerUpgrades", op_http_server_upgrades),
         ("httpConnSetTimeout", op_http_conn_set_timeout),
         ("httpConnDestroy", op_http_conn_destroy),
         // --max-http-header-size / --insecure-http-parser, as the CLI set them
@@ -2542,6 +2543,21 @@ fn op_http_server_max_connections(
     core_runtime!(scope)
         .http()
         .set_max_connections(server_id, limit);
+}
+
+/// `httpServerUpgrades(serverId, listening)`: whether the server has an
+/// 'upgrade' listener, which decides whether an upgrade request takes its
+/// connection or is served as an ordinary request (node's parserOnIncoming).
+fn op_http_server_upgrades(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let listening = args.get(1).is_true();
+    core_runtime!(scope)
+        .http()
+        .set_upgrade_listener(server_id, listening);
 }
 
 /// `httpServerExpire(serverId, headersMs, requestMs)`: node's

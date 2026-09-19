@@ -27,11 +27,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::http_conn::{CloseReason, ConnWatch, Fired, ServerTimeouts, TimeoutSettings, WatchedIo};
-use crate::http_head::{HeadError, HeadPolicy};
+use crate::http_head::{HeadError, HeadPolicy, ParsedHead};
 
 /// Per-request body cap (wave-1 buffered bodies).
 const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
@@ -78,6 +77,11 @@ fn global_body_budget() -> usize {
 /// descriptors, say) before it tries again, instead of spinning on the
 /// error.
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+/// How long a connection being handed to an 'upgrade' / 'connect' listener
+/// may take to write out what hyper still holds for it (a previous response
+/// on the connection, to a client that is not reading) before it is closed
+/// instead.
+const TAKEOVER_FLUSH_BUDGET: Duration = Duration::from_secs(10);
 /// A single streaming-response chunk that cannot be delivered within this
 /// window means the consumer is gone or wedged (a half-open socket the OS
 /// hasn't reset yet): end the stream so the JS pump never parks forever.
@@ -96,6 +100,9 @@ pub struct IncomingRequest {
     /// The connection's id for `httpConnSetTimeout` / `httpConnDestroy`
     /// (an HTTP/1 connection held to node's timeouts).
     pub conn_id: Option<u64>,
+    /// For an upgrade or CONNECT: the bytes that came after the head (node's
+    /// `head` argument), already read off the socket.
+    pub head: Vec<u8>,
 }
 
 /// What a server's accept queue carries to JS.
@@ -408,6 +415,20 @@ impl HttpState {
         }
     }
 
+    /// Whether the server has an 'upgrade' listener (node hands an upgrade
+    /// request to it only then).
+    pub fn set_upgrade_listener(&self, server_id: u64, listening: bool) {
+        if let Some(timeouts) = self
+            .servers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&server_id)
+            .and_then(|entry| entry.timeouts.clone())
+        {
+            timeouts.set_upgrade_listener(listening);
+        }
+    }
+
     /// `socket.setTimeout(ms)` on a server connection.
     pub fn set_conn_timeout(&self, conn_id: u64, ms: u64) {
         if let Some(watch) = self.conn(conn_id) {
@@ -689,19 +710,61 @@ fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
     })
 }
 
-// ---- HTTP upgrade requests (raw-TCP peek, bypasses hyper) ----
-// A connection whose first request is an upgrade (`http_head::
-// upgrade_head_len`) has that head read off the socket here and the socket
-// handed to JS; everything else goes to hyper.
+// ---- Upgrade and CONNECT requests ----
+// Every request head is parsed by hyper. One that node would hand to an
+// 'upgrade' or 'connect' listener takes its connection out of hyper instead
+// of being answered: the connection loop gets the socket and what hyper had
+// read past the head, and both go to JS.
 
-/// Refuse a request head the way node does: its status line and
-/// `Connection: close`, nothing else, then close. For the upgrade path,
-/// which owns the raw socket; hyper's path answers through
-/// [`refused_head_response`].
-async fn refuse_raw(stream: &mut tokio::net::TcpStream, error: HeadError) {
-    use tokio::io::AsyncWriteExt;
-    let _ = stream.write_all(error.node_response()).await;
-    let _ = stream.shutdown().await;
+/// A request that takes its connection out of hyper (node's upgrade and
+/// CONNECT): its id and its head as received.
+pub struct Takeover {
+    id: u64,
+    head: ParsedHead,
+}
+
+/// Where a connection's service hands a [`Takeover`] to its connection loop.
+#[derive(Clone)]
+struct UpgradeRoute {
+    tx: Arc<Mutex<Option<oneshot::Sender<Takeover>>>>,
+    timeouts: Arc<ServerTimeouts>,
+}
+
+impl UpgradeRoute {
+    fn new(timeouts: Arc<ServerTimeouts>) -> (Self, oneshot::Receiver<Takeover>) {
+        let (tx, rx) = oneshot::channel();
+        (
+            UpgradeRoute {
+                tx: Arc::new(Mutex::new(Some(tx))),
+                timeouts,
+            },
+            rx,
+        )
+    }
+
+    /// Hand the connection over; false if it already was, or its loop is
+    /// gone.
+    fn take(&self, takeover: Takeover) -> bool {
+        let tx = self.tx.lock().unwrap_or_else(|e| e.into_inner()).take();
+        tx.is_some_and(|tx| tx.send(takeover).is_ok())
+    }
+}
+
+/// How a server treats a request that asks to leave HTTP: an upgrade (an
+/// `Upgrade` header and `upgrade` in `Connection`), or CONNECT.
+#[derive(Clone)]
+enum Upgrades {
+    /// `oam.serve`: every request goes to the handler.
+    Serve,
+    /// https, and the HTTP/1 side of http2.createServer, whose sockets cannot
+    /// be handed to JS: an upgrade is served as an ordinary request, and a
+    /// CONNECT is closed, as node closes one no 'connect' listener takes.
+    CloseConnect,
+    /// A node:http server: a CONNECT, and an upgrade while the server has an
+    /// 'upgrade' listener, take the connection out of hyper, as node hands
+    /// the socket to 'connect' / 'upgrade' (any request on the connection
+    /// can). An upgrade with no listener is an ordinary request, as in node.
+    Route(UpgradeRoute),
 }
 
 /// hyper's answer to a refused head: the status, `connection: close` (so
@@ -874,6 +937,10 @@ async fn check_connections(
 /// until the connection ends, closing it early when `watch` is closed
 /// (a request timeout answers 408 first), gracefully on server shutdown or
 /// `socket.end()`.
+///
+/// When a request takes the connection (`takeover`), what hyper was writing
+/// is written out first, and the stream comes back with the bytes hyper had
+/// read past that request's head.
 #[allow(clippy::too_many_arguments)]
 async fn serve_http1<S, Svc>(
     stream: S,
@@ -884,7 +951,9 @@ async fn serve_http1<S, Svc>(
     js_driven: bool,
     addrs: ConnAddrs,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-) where
+    takeover: Option<oneshot::Receiver<Takeover>>,
+) -> Option<(S, Bytes, Takeover)>
+where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     Svc: hyper::service::Service<
             hyper::Request<hyper::body::Incoming>,
@@ -897,18 +966,32 @@ async fn serve_http1<S, Svc>(
 {
     let io = hyper_util::rt::TokioIo::new(WatchedIo::new(stream, Arc::clone(&watch)));
     let mut conn = http1_builder(policy).serve_connection(io, service);
+    // A connection no request can take has a receiver that never fires.
+    let (mut taken, mut takeable) = match takeover {
+        Some(rx) => (rx, true),
+        None => (oneshot::channel().1, false),
+    };
+    enum Ended {
+        Done,
+        Closed(CloseReason),
+        Taken(Takeover),
+    }
     // GRACEFUL shutdown on close(): disable keep-alive and let the
     // IN-FLIGHT request finish (Node's server.close() semantics), instead
     // of resetting it. An idle keep-alive connection just closes -- so the
     // queue_tx clone still drops promptly and the accept op isn't pinned.
     let mut shutting_down = false;
-    let closed = loop {
+    let ended = loop {
         // Biased toward hyper: a response JS has already handed over (a
         // `res.end()` just before `socket.destroy()`) is written before a
         // close is acted on, as node writes it before closing.
         tokio::select! {
             biased;
-            _ = &mut conn => break None,
+            _ = &mut conn => break Ended::Done,
+            takeover = &mut taken, if takeable => match takeover {
+                Ok(takeover) => break Ended::Taken(takeover),
+                Err(_) => takeable = false,
+            },
             _ = shutdown.changed(), if !shutting_down => {
                 shutting_down = true;
                 std::pin::Pin::new(&mut conn).graceful_shutdown();
@@ -923,22 +1006,50 @@ async fn serve_http1<S, Svc>(
                     shutting_down = true;
                     std::pin::Pin::new(&mut conn).graceful_shutdown();
                 } else {
-                    break Some(reason);
+                    break Ended::Closed(reason);
                 }
             }
             fired = watch.next_timeout() => {
                 socket_timed_out(&queue, &watch, js_driven, fired, addrs);
             }
+            // hyper does not come back by itself to a request it read while
+            // its write buffer was still draining (it polls that request's
+            // handler only once the buffer is empty, and nothing wakes it
+            // then): a flush that empties the buffer polls it again.
+            _ = watch.next_flush() => {}
         }
     };
-    if let Some(reason) = closed {
-        // hyper's side ends here: an in-flight handler future is dropped
-        // (its RequestGuard tells JS the exchange ended), and the stream
-        // comes back for node's farewell. Read before hyper's side goes:
-        // dropping it ends the response.
-        let may_answer = watch.may_answer();
-        let stream = conn.into_parts().io.into_inner().into_inner();
-        crate::http_conn::finish_close(stream, reason, may_answer).await;
+    match ended {
+        Ended::Done => None,
+        Ended::Closed(reason) => {
+            // hyper's side ends here: an in-flight handler future is dropped
+            // (its RequestGuard tells JS the exchange ended), and the stream
+            // comes back for node's farewell. Read before hyper's side goes:
+            // dropping it ends the response.
+            let may_answer = watch.may_answer();
+            let stream = conn.into_parts().io.into_inner().into_inner();
+            crate::http_conn::finish_close(stream, reason, may_answer).await;
+            None
+        }
+        Ended::Taken(takeover) => {
+            // hyper may still hold part of an earlier response on this
+            // connection, for a client that has not read it yet: its buffer
+            // goes with hyper's side, so it is written out first (node's
+            // socket keeps writing it after the handover).
+            let budget = tokio::time::sleep(TAKEOVER_FLUSH_BUDGET);
+            tokio::pin!(budget);
+            while watch.unflushed() {
+                tokio::select! {
+                    biased;
+                    _ = &mut conn => return None,
+                    _ = watch.flushed() => {}
+                    _ = &mut budget => return None,
+                    _ = shutdown.changed() => return None,
+                }
+            }
+            let parts = conn.into_parts();
+            Some((parts.io.into_inner().into_inner(), parts.read_buf, takeover))
+        }
     }
 }
 
@@ -996,7 +1107,7 @@ pub async fn http_serve(
             tokio::select! {
                 _ = shutdown_rx.changed() => break,
                 accepted = listener.accept() => {
-                    let Ok((mut stream, peer)) = accepted else {
+                    let Ok((stream, peer)) = accepted else {
                         tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                         continue;
                     };
@@ -1009,17 +1120,15 @@ pub async fn http_serve(
                         continue;
                     };
                     // Everything after the accept runs on the connection's
-                    // own task. The upgrade peek below waits for the client's
-                    // first bytes; run inline, it held up this loop, so one
-                    // connection that never sent anything kept every later
-                    // client from being accepted.
+                    // own task: nothing a client sends, or does not send,
+                    // holds up this loop.
                     let conn_state = accept_state.clone();
                     let conn_queue = queue_tx.clone();
                     let conn_tcp = accept_tcp.clone();
                     let conn_tcp_ids = accept_tcp_ids.clone();
                     let conn_stream_bodies = stream_request_body;
                     let conn_timeouts = Arc::clone(&server_timeouts);
-                    let mut conn_shutdown = shutdown_rx.clone();
+                    let conn_shutdown = shutdown_rx.clone();
                     tokio::spawn(async move {
                         let slot = slot;
                         // node's timeouts hold from the accept: a connection
@@ -1029,109 +1138,68 @@ pub async fn http_serve(
                             ConnWatch::new(conn_state.next_id(), server_id, conn_timeouts.clone());
                         let registration = conn_state.register_conn(Arc::clone(&watch));
                         let js_driven = conn_timeouts.js_driven();
-                        // Peek for Connection: Upgrade before hyper takes
-                        // ownership. A server close() while the client has
-                        // sent nothing ends the connection here.
-                        let mut peek_buf = [0u8; 8192];
-                        let peeked = loop {
-                            tokio::select! {
-                                peeked = stream.peek(&mut peek_buf) => break peeked,
-                                _ = conn_shutdown.changed() => return,
-                                // Before a request there is nothing to
-                                // finish: an end closes too.
-                                reason = watch.closed(CloseReason::End) => {
-                                    let may_answer = watch.may_answer();
-                                    crate::http_conn::finish_close(&mut stream, reason, may_answer)
-                                        .await;
-                                    return;
-                                }
-                                fired = watch.next_timeout() => {
-                                    socket_timed_out(
-                                        &conn_queue,
-                                        &watch,
-                                        js_driven,
-                                        fired,
-                                        conn_addrs,
-                                    );
-                                }
-                            }
+                        // A node:http server routes upgrades and CONNECT;
+                        // oam.serve hands every request to its handler.
+                        let (upgrades, taken) = if js_driven {
+                            let (route, taken) = UpgradeRoute::new(Arc::clone(&conn_timeouts));
+                            (Upgrades::Route(route), Some(taken))
+                        } else {
+                            (Upgrades::Serve, None)
                         };
-                        let upgrade_head = match peeked {
-                            Ok(n) if n > 16 => {
-                                crate::http_head::upgrade_head_len(&peek_buf[..n])
-                            }
-                            _ => None,
-                        };
-
-                        if let Some(consume) = upgrade_head {
-                            // The upgraded socket leaves node's http timeouts
-                            // (node drops its 'timeout' handling): it belongs
-                            // to JS.
-                            drop(registration);
-                            let mut head = vec![0u8; consume];
-                            if stream.read_exact(&mut head).await.is_err() {
-                                return;
-                            }
-                            // The same grammar and rules as every other
-                            // request (hyper's parser, then node's): an
-                            // upgrade request is not a way around them.
-                            match crate::http_head::parse_request_head(&head, policy) {
-                                Ok(parsed) => {
-                                let id = conn_state.next_id();
-                                let handle = conn_tcp_ids.fetch_add(1, Ordering::Relaxed);
-                                let (reader, writer) = stream.into_split();
-                                conn_tcp
-                                    .lock()
-                                    .unwrap_or_else(|e| e.into_inner())
-                                    .register_stream(handle, reader, writer);
-                                let _ = conn_queue
-                                    .send(ServerEvent::Request(IncomingRequest {
-                                        id,
-                                        method: parsed.method,
-                                        uri: parsed.target,
-                                        headers: parsed.headers,
-                                        is_upgrade: true,
-                                        socket_handle: Some(handle),
-                                        conn: conn_addrs,
-                                        conn_id: None,
-                                    }))
-                                    .await;
-                                }
-                                Err(error) => refuse_raw(&mut stream, error).await,
-                            }
-                            // The upgraded socket no longer counts toward
-                            // maxConnections (node counts it until it closes).
-                            drop(slot);
-                            return;
-                        }
-
-                        // Normal HTTP: hand to hyper.
-                        let _slot = slot;
-                        let _registration = registration;
+                        let service_state = conn_state.clone();
                         let service_queue = conn_queue.clone();
                         let service_watch = Arc::clone(&watch);
                         let service = hyper::service::service_fn(move |req| {
                             handle_request(
-                                conn_state.clone(),
+                                service_state.clone(),
                                 service_queue.clone(),
                                 req,
                                 conn_stream_bodies, // per-server opt-in
                                 conn_addrs,
                                 policy,
                                 Some(Arc::clone(&service_watch)),
+                                upgrades.clone(),
                             )
                         });
-                        serve_http1(
+                        let taken = serve_http1(
                             stream,
                             watch,
                             policy,
                             service,
-                            conn_queue,
+                            conn_queue.clone(),
                             js_driven,
                             conn_addrs,
                             conn_shutdown,
+                            taken,
                         )
                         .await;
+                        // The socket leaves node's http timeouts (node drops
+                        // its 'timeout' handling for an upgraded socket) and
+                        // maxConnections (node counts it until it closes).
+                        drop(registration);
+                        drop(slot);
+                        let Some((stream, head, takeover)) = taken else {
+                            return;
+                        };
+                        let handle = conn_tcp_ids.fetch_add(1, Ordering::Relaxed);
+                        let (reader, writer) = stream.into_split();
+                        conn_tcp
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .register_stream(handle, reader, writer);
+                        let _ = conn_queue
+                            .send(ServerEvent::Request(IncomingRequest {
+                                id: takeover.id,
+                                method: takeover.head.method,
+                                uri: takeover.head.target,
+                                headers: takeover.head.headers,
+                                is_upgrade: true,
+                                socket_handle: Some(handle),
+                                conn: conn_addrs,
+                                conn_id: None,
+                                head: head.to_vec(),
+                            }))
+                            .await;
                     });
                 }
             }
@@ -1463,6 +1531,7 @@ impl std::error::Error for RequestAborted {}
 /// timeouts (`watch`), its headers are in now, its body is all in when the
 /// body is read to the end (or no longer read), and the response it gets
 /// reports its start and its end.
+#[allow(clippy::too_many_arguments)]
 async fn handle_request(
     state: Arc<HttpState>,
     queue: mpsc::Sender<ServerEvent>,
@@ -1471,6 +1540,7 @@ async fn handle_request(
     conn: ConnAddrs,
     policy: HeadPolicy,
     watch: Option<Arc<ConnWatch>>,
+    upgrades: Upgrades,
 ) -> Result<hyper::Response<BoxedBody>, RequestAborted> {
     let id = state.next_id();
     let message_done = MessageDone(
@@ -1491,6 +1561,7 @@ async fn handle_request(
         message_done,
         conn_id,
         notify_closed,
+        upgrades,
     )
     .await?;
     Ok(watched_response(response, watch.as_ref()))
@@ -1510,15 +1581,52 @@ async fn dispatch_request(
     // Tell JS when the exchange ends without its response (a node:http
     // server keeps the pair until then).
     notify_closed: bool,
+    upgrades: Upgrades,
 ) -> Result<hyper::Response<BoxedBody>, RequestAborted> {
     // node's rules for the head, on the bytes hyper parsed (HTTP/1 only;
     // an HTTP/2 request has no such head). A refused request never reaches
     // JS and its body is never read: the connection closes after the
     // refusal, so nothing after the head is ever parsed as a request.
-    if let Some(raw) = req.extensions().get::<hyper::ext::RawRequestHead>()
-        && let Err(error) = crate::http_head::check_request_head(raw.as_bytes(), policy)
-    {
-        return Ok(refused_head_response(error));
+    if let Some(raw) = req.extensions().get::<hyper::ext::RawRequestHead>() {
+        if let Err(error) = crate::http_head::check_request_head(raw.as_bytes(), policy) {
+            return Ok(refused_head_response(error));
+        }
+        let connect = req.method() == hyper::Method::CONNECT;
+        match &upgrades {
+            Upgrades::Serve => {}
+            Upgrades::CloseConnect => {
+                if connect {
+                    // No 'connect' listener can take it here: closed, as
+                    // node closes a CONNECT nobody tunnels.
+                    return Err(RequestAborted);
+                }
+            }
+            Upgrades::Route(route) => {
+                // node: every CONNECT, and an upgrade while there is an
+                // 'upgrade' listener. An upgrade that declares a body is
+                // left to hyper, which would read that body as the request's
+                // (node hands those bytes to the listener as `head`); hyper
+                // reads none for a CONNECT.
+                let upgrade = !connect
+                    && route.timeouts.upgrade_listener()
+                    && hyper::body::Body::is_end_stream(req.body())
+                    && crate::http_head::is_upgrade(
+                        req.headers()
+                            .iter()
+                            .map(|(name, value)| (name.as_str(), value.as_bytes())),
+                    );
+                if (connect || upgrade)
+                    && let Ok(head) = crate::http_head::parse_request_head(raw.as_bytes(), policy)
+                    && route.take(Takeover { id, head })
+                {
+                    // The connection loop takes the socket; this exchange
+                    // is never answered, and its future is dropped with
+                    // hyper's side of the connection.
+                    drop(message_done);
+                    return std::future::pending().await;
+                }
+            }
+        }
     }
     let (parts, body) = req.into_parts();
     // Collect the body, enforcing MAX_REQUEST_BODY.  When the cap is hit we
@@ -1633,6 +1741,7 @@ async fn dispatch_request(
             socket_handle: None,
             conn,
             conn_id,
+            head: Vec::new(),
         }))
         .await;
     if sent.is_err() {
@@ -1786,6 +1895,7 @@ pub async fn https_serve(
                                 conn_addrs,
                                 policy,
                                 Some(Arc::clone(&service_watch)),
+                                Upgrades::CloseConnect,
                             )
                         });
                         serve_http1(
@@ -1797,6 +1907,7 @@ pub async fn https_serve(
                             js_driven,
                             conn_addrs,
                             conn_shutdown,
+                            None,
                         )
                         .await;
                     });
@@ -1866,6 +1977,9 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
             if request.is_upgrade {
                 meta["isUpgrade"] = serde_json::json!(true);
                 meta["socketHandle"] = serde_json::json!(request.socket_handle);
+                // What came after the head, one char per byte (latin1).
+                let head: String = request.head.iter().map(|&b| char::from(b)).collect();
+                meta["head"] = serde_json::json!(head);
             }
             super::OpOutcome::Json(meta.to_string())
         }
@@ -2024,6 +2138,7 @@ pub async fn http2_serve(
                                     conn_addrs,
                                     policy,
                                     None,
+                                    Upgrades::Serve,
                                 )
                             });
                             let conn = hyper::server::conn::http2::Builder::new(
@@ -2057,6 +2172,7 @@ pub async fn http2_serve(
                                     conn_addrs,
                                     policy,
                                     Some(Arc::clone(&service_watch)),
+                                    Upgrades::CloseConnect,
                                 )
                             });
                             serve_http1(
@@ -2068,6 +2184,7 @@ pub async fn http2_serve(
                                 false,
                                 conn_addrs,
                                 conn_shutdown,
+                                None,
                             )
                             .await;
                         }
@@ -2277,5 +2394,118 @@ mod budget_tests {
         state.body_bytes.fetch_sub(2, Ordering::AcqRel);
         state.body_bytes.fetch_sub(under, Ordering::AcqRel);
         assert_eq!(state.body_bytes.load(Ordering::Acquire), 0);
+    }
+}
+
+#[cfg(test)]
+mod takeover_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// A connection taken by a request (an upgrade) that arrives while hyper
+    /// is still writing an earlier response: the stream comes back once that
+    /// response is out, with the bytes read past the taking request's head.
+    /// hyper reads the next head before its write buffer is empty when the
+    /// previous request's body ends after its response, as here, but polls
+    /// that request's handler only once the buffer has drained -- and nothing
+    /// woke it then, so the handover (like any request pipelined there) hung
+    /// until the client sent something more.
+    #[tokio::test]
+    async fn a_taken_connection_first_writes_out_what_hyper_held() {
+        const BIG: usize = 1024 * 1024;
+        // A small pipe: the response backs up into hyper at once.
+        let (mut client, server) = tokio::io::duplex(16 * 1024);
+        let timeouts = ServerTimeouts::new(TimeoutSettings::default());
+        let watch = ConnWatch::new(1, 1, Arc::clone(&timeouts));
+        let (route, taken) = UpgradeRoute::new(timeouts);
+        let service =
+            hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                let route = route.clone();
+                async move {
+                    if req.uri().path() == "/big" {
+                        // Answered at once; its body is read after, as the
+                        // server's body pump reads it.
+                        tokio::spawn(req.into_body().collect());
+                        return Ok::<_, RequestAborted>(hyper::Response::new(
+                            http_body_util::Full::new(Bytes::from(vec![b'a'; BIG])).boxed(),
+                        ));
+                    }
+                    let head = crate::http_head::parse_request_head(
+                        req.extensions()
+                            .get::<hyper::ext::RawRequestHead>()
+                            .expect("an HTTP/1 head")
+                            .as_bytes(),
+                        HeadPolicy::process_default(),
+                    )
+                    .expect("a good head");
+                    assert!(route.take(Takeover { id: 7, head }));
+                    std::future::pending().await
+                }
+            });
+        let (queue, _events) = mpsc::channel(8);
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        let addrs = ConnAddrs {
+            remote: "127.0.0.1:1".parse().unwrap(),
+            local: None,
+        };
+        let served = tokio::spawn(serve_http1(
+            server,
+            Arc::clone(&watch),
+            HeadPolicy::process_default(),
+            service,
+            queue,
+            false,
+            addrs,
+            shutdown,
+            Some(taken),
+        ));
+        client
+            .write_all(b"POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(watch.unflushed(), "hyper holds most of the response");
+        client
+            .write_all(b"helloGET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: x\r\n\r\nafter")
+            .await
+            .unwrap();
+        // Read the response while the handover waits for it to go out.
+        let mut response = vec![0u8; 0];
+        let reader = async {
+            let mut buf = vec![0u8; 64 * 1024];
+            loop {
+                let n = client.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                response.extend_from_slice(&buf[..n]);
+                if response.len() >= BIG && response.ends_with(b"UPGRADED") {
+                    break;
+                }
+            }
+        };
+        let handover = async {
+            let (mut stream, head, takeover) =
+                served.await.unwrap().expect("the connection is taken");
+            assert_eq!(takeover.id, 7);
+            assert_eq!(takeover.head.target, "/ws");
+            assert_eq!(&head[..], b"after");
+            stream.write_all(b"UPGRADED").await.unwrap();
+            stream.shutdown().await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::join!(reader, handover)
+        })
+        .await
+        .expect("no hang");
+        let head_end = response.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        assert_eq!(response.len(), head_end + BIG + b"UPGRADED".len());
+        assert!(
+            response[head_end..head_end + BIG]
+                .iter()
+                .all(|&b| b == b'a')
+        );
+        assert!(response.ends_with(b"UPGRADED"));
     }
 }

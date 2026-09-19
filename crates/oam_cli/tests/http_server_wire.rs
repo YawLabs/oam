@@ -606,20 +606,88 @@ fn a_bare_lf_in_the_trailers_fails_the_request() {
     assert_eq!(seen["body"], "abc");
 }
 
-/// An upgrade request to a server with no 'upgrade' listener is closed, not
-/// left open: the socket had already been taken from hyper, and nothing
-/// would ever answer or close it (one leaked socket per such request).
+/// An upgrade request to a server with no 'upgrade' listener is an ordinary
+/// request, answered by the 'request' handler on a connection that stays
+/// open, as in node. (It was taken from hyper whatever the listeners, then
+/// closed unanswered -- and before that, left open for good.)
 #[test]
-fn an_upgrade_nobody_listens_for_is_closed() {
+fn an_upgrade_nobody_listens_for_is_an_ordinary_request() {
     let server = Server::start("noupgrade.mjs", BODY_SERVER, &[], &[]);
     let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
     let ex = exchange(
         target,
         None,
         b"GET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
-        Duration::from_secs(5),
+        Duration::from_millis(800),
     );
-    assert!(ex.closed, "the connection must close: {:?}", ex.response);
+    assert_eq!(ex.statuses(), ["HTTP/1.1 200 OK"], "{:?}", ex.response);
+    assert!(!ex.closed, "the connection stays open");
+    let seen = json(&server.next_line(Duration::from_secs(5)).expect("a line"));
+    assert_eq!(seen["kind"], "end", "{seen}");
+    assert_eq!(seen["url"], "/ws", "{seen}");
+}
+
+/// A connection handed to an 'upgrade' listener after a response the client
+/// has not read yet gets all of that response first, then what the listener
+/// writes: the part of it hyper still held is written out before the socket
+/// changes hands, as node's socket goes on writing what it was given. (hyper
+/// reads the next head while its buffer is still being written out when the
+/// previous request's body ends after its response: here the handler answers
+/// at once and the body comes later. Windows' loopback takes the whole
+/// response into the kernel at once, so there the unit test in
+/// http_server.rs, over an in-memory pipe, is the one that gets that far.)
+#[test]
+fn an_upgrade_after_an_unread_response_keeps_the_response() {
+    use std::io::{Read, Write};
+    const BIG: usize = 32 * 1024 * 1024;
+    let script = format!(
+        r#"
+import http from "node:http";
+const big = Buffer.alloc({BIG}, 0x61);
+const server = http.createServer((req, res) => res.end(big));
+server.on("upgrade", (req, socket, head) => {{
+  socket.end("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: x\r\n\r\n");
+}});
+server.listen(0, "127.0.0.1", () => console.log("PORT " + server.address().port));
+"#
+    );
+    let server = Server::start("upgrade_after_big.mjs", &script, &[], &[]);
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    let mut stream = std::net::TcpStream::connect(target).unwrap();
+    stream
+        .write_all(b"POST /big HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\n")
+        .unwrap();
+    // The response fills the socket buffers while this client reads nothing;
+    // then the body ends, and the upgrade request comes.
+    std::thread::sleep(Duration::from_millis(400));
+    stream
+        .write_all(b"helloGET /ws HTTP/1.1\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: x\r\n\r\n")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(400));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(20)))
+        .unwrap();
+    let mut all = Vec::new();
+    let _ = stream.read_to_end(&mut all);
+    let head_end = all
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("a response head")
+        + 4;
+    let head = String::from_utf8_lossy(&all[..head_end]).to_lowercase();
+    assert!(head.starts_with("http/1.1 200 ok"), "{head}");
+    assert!(head.contains(&format!("content-length: {BIG}")), "{head}");
+    let body = &all[head_end..(head_end + BIG).min(all.len())];
+    assert_eq!(body.len(), BIG, "the whole body arrives");
+    assert!(
+        body.iter().all(|&b| b == b'a'),
+        "and nothing else inside it"
+    );
+    let rest = String::from_utf8_lossy(&all[head_end + BIG..]);
+    assert!(
+        rest.starts_with("HTTP/1.1 101 Switching Protocols\r\n"),
+        "then the listener's answer: {rest:?}"
+    );
 }
 
 /// Whitespace after a chunk size -- which parsers disagree about -- is

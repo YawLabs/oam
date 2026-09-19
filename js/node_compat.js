@@ -18010,6 +18010,22 @@
         server[kSyncedMaxConnections] = limit;
         natives.httpServerMaxConnections(server._serverId, limit);
       }
+      syncUpgradeListener(server);
+    }
+
+    // node hands a request that asks for an upgrade to the server's
+    // 'upgrade' listeners, and serves it as an ordinary request when there
+    // are none (parserOnIncoming reads listenerCount('upgrade') for each
+    // request). The native server makes that call as each head is parsed,
+    // so it is told whenever the listeners change.
+    const kSyncedUpgradeListener = Symbol("syncedUpgradeListener");
+    function syncUpgradeListener(server) {
+      if (server._serverId === null || server._serverId === undefined) return;
+      const listening = EventEmitter.prototype.listenerCount.call(server, "upgrade") > 0;
+      if (server[kSyncedUpgradeListener] !== listening) {
+        server[kSyncedUpgradeListener] = listening;
+        natives.httpServerUpgrades(server._serverId, listening);
+      }
     }
 
     const kMaxConnections = Symbol("maxConnections");
@@ -18150,6 +18166,8 @@
         }
         syncServerTimeouts(server);
         if (meta.isUpgrade && meta.socketHandle !== undefined) {
+          // A request that took its connection: an upgrade (the server had
+          // an 'upgrade' listener when its head was parsed) or a CONNECT.
           const NetSocket = registry.get("net").Socket;
           // The accepted connection's real ends (never a stand-in:
           // an upgrade handler's address checks read these).
@@ -18171,18 +18189,26 @@
           });
           socket._readLoop();
           const req = new IncomingMessage(meta);
+          req.upgrade = true;
           // node: the upgrade request's socket IS the socket handed
           // to the 'upgrade' listener.
           req.socket = req.connection = socket;
-          // Nobody to hand the connection to: close it rather than
-          // leave it open forever. (node answers such a request as an
-          // ordinary one; this socket has already left hyper.)
-          if (!server.emit("upgrade", req, socket, globalThis.Buffer.alloc(0))) {
+          // What the client sent after the head, already read off the
+          // socket: node's `head` argument.
+          const head = globalThis.Buffer.from(meta.head || "", "latin1");
+          // node's onParserExecuteCommon: a CONNECT goes to 'connect', and
+          // with no 'connect' listener its socket is destroyed; an upgrade
+          // goes to 'upgrade' (whose listener went away after the head was
+          // parsed, here: nobody is left to take the socket, so it closes).
+          const event = req.method === "CONNECT" ? "connect" : "upgrade";
+          if (!server.emit(event, req, socket, head)) {
             socket.destroy();
           }
           continue;
         }
         const req = new IncomingMessage(meta);
+        // An upgrade request no listener took is an ordinary one (node).
+        req.upgrade = false;
         // The request's socket carries the TCP connection's real
         // addresses (the accept record); a TLS socket is `encrypted`.
         if (encrypted) req.socket.encrypted = true;
@@ -19171,6 +19197,24 @@
     };
     // The https server shares the parser options and their policy.
     defineMaxConnections(Server.prototype);
+    // Every way a listener is added or removed runs through these three
+    // (on / addListener / once / prepend* call _add; off and a once
+    // wrapper call removeListener).
+    Server.prototype._add = function (type, listener, prepend, once) {
+      const result = EventEmitter.prototype._add.call(this, type, listener, prepend, once);
+      if (type === "upgrade") syncUpgradeListener(this);
+      return result;
+    };
+    Server.prototype.removeListener = function (type, listener) {
+      const result = EventEmitter.prototype.removeListener.call(this, type, listener);
+      if (type === "upgrade") syncUpgradeListener(this);
+      return result;
+    };
+    Server.prototype.removeAllListeners = function (type) {
+      const result = EventEmitter.prototype.removeAllListeners.apply(this, arguments);
+      if (type === undefined || type === "upgrade") syncUpgradeListener(this);
+      return result;
+    };
     registry._httpParserOptions = {
       defineMaxConnections,
       store: storeHTTPOptions,

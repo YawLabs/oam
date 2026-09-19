@@ -1483,13 +1483,21 @@ different answer:
   body has ended, combined as Node combines them, but `rawTrailers` has the names
   lowercased and a repeated name's values side by side.
 - A refused head is answered with `content-length: 0` and `date` headers next to
-  `connection: close` (Node: `Connection: close` alone), except on the upgrade path, which
-  writes Node's bytes. There is no `'clientError'` event.
+  `connection: close` (Node: `Connection: close` alone). There is no `'clientError'`
+  event.
 - A head that never ends is refused once it outgrows hyper's read buffer, four times the
   limit (64 KiB for the default), rather than when its count crosses the limit.
-- An upgrade request (an `Upgrade` header and `upgrade` in `Connection`) to a server with
-  no `'upgrade'` listener is closed; Node answers it as an ordinary request. Only the first
-  request on a connection can be an upgrade.
+- Upgrades and CONNECT are routed as Node routes them -- a request with an `Upgrade`
+  header and `upgrade` in `Connection` goes to `'upgrade'` while the server has an
+  `'upgrade'` listener and is an ordinary request otherwise, every CONNECT goes to
+  `'connect'` or has its socket destroyed, on any request of a connection -- with these
+  differences. An upgrade request that declares a body (`Content-Length` above 0, or
+  chunked) is an ordinary request; Node hands those bytes to the listener as `head`. When
+  an upgrade or CONNECT arrives in the same read as an earlier request on the connection,
+  oam answers the earlier one first; Node hands the socket over before that answer is
+  written, and it is lost. `https` servers and the HTTP/1 side of `http2.createServer`
+  serve an upgrade request as an ordinary one whatever the listeners, and close a CONNECT
+  (Node hands either to its listener, when there is one).
 - A server's `maxHeaderSize` and `insecureHTTPParser` are read when it starts listening;
   Node reads them for each new connection, so changing them on a listening server takes
   effect there and not here.

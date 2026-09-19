@@ -334,6 +334,14 @@ impl Http1Transaction for Server {
             return Err(Parse::transfer_encoding_invalid());
         }
 
+        // oam patch: a CONNECT request has no body. What follows its head
+        // is the tunnel's, as node's parser (llhttp) reads it; decoding it as
+        // a body would take those bytes from the connection the server hands
+        // to its 'connect' listener.
+        if subject.0 == Method::CONNECT {
+            decoder = DecodedLength::ZERO;
+        }
+
         let mut extensions = http::Extensions::default();
 
         // oam patch: the head as received (see ext::RawRequestHead).
@@ -2175,6 +2183,17 @@ mod tests {
              ",
             "1.0 chunked",
         );
+
+        // oam patch: a CONNECT request has no body, whatever it declares.
+        for connect in [
+            "CONNECT a:1 HTTP/1.1\r\n\r\n",
+            "CONNECT a:1 HTTP/1.1\r\ncontent-length: 10\r\n\r\n",
+            "CONNECT a:1 HTTP/1.1\r\ntransfer-encoding: chunked\r\n\r\n",
+        ] {
+            let msg = parse(connect);
+            assert_eq!(msg.decode, DecodedLength::ZERO, "{connect:?}");
+            assert!(msg.wants_upgrade, "{connect:?}");
+        }
     }
 
     #[test]
