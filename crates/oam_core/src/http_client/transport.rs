@@ -180,6 +180,20 @@ impl HttpTransport {
         }
         intercept.basic_auth().cloned()
     }
+
+    /// Whether the proxy rules would send a request for `url` on a pooled
+    /// route through a proxy (any scheme, a refused socks one included). A
+    /// URL that is not a URI answers true: the caller asks in order to stay
+    /// off the proxy, so it then keeps off this transport altogether.
+    pub fn env_proxied(&self, url: &str) -> bool {
+        let Ok(uri) = url.parse::<Uri>() else {
+            return true;
+        };
+        self.shared
+            .proxy
+            .as_ref()
+            .is_some_and(|rules| rules.intercept(&uri).is_some())
+    }
 }
 
 /// One client builder for both kinds of client.
@@ -290,6 +304,14 @@ impl SendError {
         if let Some(connect) = self.connect_error() {
             return connect.to_outcome();
         }
+        // A certificate refused in Node's terms (tls_config's
+        // NodeNamedRefusals): its code and message, as tls.connect reports
+        // them.
+        if let Some(refusal) = node_cert_refusal(&self.error)
+            && let Some(code) = refusal.code
+        {
+            return OpOutcome::node_failed(code, refusal.message.clone());
+        }
         if let Some(tls) = find_in_chain::<TlsSetupError>(&self.error) {
             return OpOutcome::Failed(tls.to_string());
         }
@@ -370,6 +392,25 @@ impl std::error::Error for SendError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
     }
+}
+
+/// The Node-named certificate refusal in `error`'s chain, if the handshake
+/// failed with one. tokio-rustls hands the rustls error over as an
+/// `io::Error`'s payload, which `source()` does not reach -- hence the
+/// `get_ref`.
+fn node_cert_refusal<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a crate::tls::VerifyFailure> {
+    let io = find_in_chain::<std::io::Error>(error)?;
+    let rustls::Error::InvalidCertificate(rustls::CertificateError::Other(other)) =
+        io.get_ref()?.downcast_ref::<rustls::Error>()?
+    else {
+        return None;
+    };
+    other
+        .0
+        .downcast_ref::<crate::tls::NodeCertRefusal>()
+        .map(|refusal| &refusal.0)
 }
 
 fn find_in_chain<'a, T: std::error::Error + 'static>(

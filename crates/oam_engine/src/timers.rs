@@ -281,6 +281,39 @@ pub(crate) fn timer_unref(
     }
 }
 
+/// `__oam.node.timerImmediate(callback, ...args)`: node's setImmediate, a
+/// callback due at once -- it runs on the loop's next turn, after the op
+/// completions already waiting, never after a wait on the OS timer. (A
+/// setTimeout clamps to node's 1 ms, and on Windows an idle loop then
+/// sleeps a whole timer tick, about 15 ms, for every setImmediate.) Shares
+/// the timer queue, so clearImmediate / ref / unref work by id.
+pub(crate) fn timer_immediate(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Ok(callback) = v8::Local::<v8::Function>::try_from(args.get(0)) else {
+        throw_type_error(scope, "setImmediate callback must be a function");
+        return;
+    };
+    let callback = v8::Global::new(scope, callback);
+    let mut extra = Vec::new();
+    for i in 1..args.length() {
+        extra.push(v8::Global::new(scope, args.get(i)));
+    }
+    let entry = TimerEntry {
+        callback,
+        args: extra,
+        interval: None,
+        is_ref: true,
+    };
+    let id = scope
+        .get_slot_mut::<TimerQueue>()
+        .expect("timer queue installed")
+        .schedule(entry, Duration::ZERO);
+    rv.set_uint32(id);
+}
+
 fn queue_microtask(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,

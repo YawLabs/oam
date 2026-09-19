@@ -177,9 +177,27 @@ pub async fn tcp_connect(
     port: u16,
     attempt_timeout: std::time::Duration,
 ) -> OpOutcome {
+    tcp_connect_pinned(registry, ids, host, port, attempt_timeout, None, None).await
+}
+
+/// [`tcp_connect`] with the addresses JS resolved for `host` standing in for
+/// getaddrinfo: net.connect's `lookup` option, a replaced `dns.lookup`, or a
+/// redeemed `netResolve` ticket (see `net_connect::ResolvedAnswers`). The
+/// engine has already checked every one of them against the net grant.
+/// `local` is net.connect's `localAddress` / `localPort`.
+pub async fn tcp_connect_pinned(
+    registry: TcpRegistry,
+    ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    host: String,
+    port: u16,
+    attempt_timeout: std::time::Duration,
+    pin: Option<crate::net_connect::Pin>,
+    local: Option<crate::net_connect::LocalBind>,
+) -> OpOutcome {
     let opts = crate::net_connect::ConnectOptions {
         attempt_timeout,
-        pin: None,
+        pin,
+        local,
     };
     let stream = match crate::net_connect::connect(&host, port, &opts).await {
         Ok(connected) => connected.stream,

@@ -21,7 +21,7 @@ use crate::crypto_ops::{
     op_crypto_scrypt_sync, op_crypto_sign, op_crypto_sign_pss, op_crypto_timing_safe_equal,
     op_crypto_verify, op_crypto_verify_pss, op_crypto_x509_parse,
 };
-use crate::timers::{timer_ref, timer_unref};
+use crate::timers::{timer_immediate, timer_ref, timer_unref};
 use crate::vm_context::{
     op_vm_compile, op_vm_create_context, op_vm_is_context, op_vm_run_in_context,
     op_vm_run_in_this_context,
@@ -209,6 +209,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // timer no longer keeps the event loop alive (Node Timeout#ref/#unref).
         ("timerRef", timer_ref),
         ("timerUnref", timer_unref),
+        // setImmediate: due at once, never an OS timer wait.
+        ("timerImmediate", timer_immediate),
         // Inbound OS signals: install/remove native delivery of a Node signal
         // name (SIGTERM/SIGINT/SIGHUP/...). Gated JS-side on process
         // listenerCount so start fires on the FIRST listener and stop on the
@@ -338,6 +340,18 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpsServe", op_https_serve),
         // TCP sockets (node:net)
         ("tcpConnect", op_tcp_connect),
+        ("netResolve", op_net_resolve),
+        // http.request over an agent's socket (oam_core http_client::bridge)
+        ("httpBridgeStart", op_http_bridge_start),
+        ("httpBridgeResponse", op_http_bridge_response),
+        ("httpBridgeOut", op_http_bridge_out),
+        ("httpBridgeRequestSent", op_http_bridge_request_sent),
+        ("httpBridgeIn", op_http_bridge_in),
+        ("httpBridgeInEnd", op_http_bridge_in_end),
+        ("httpBridgeClose", op_http_bridge_close),
+        ("httpEnvProxied", op_http_env_proxied),
+        ("netCheck", op_net_check),
+        ("netResolveDrop", op_net_resolve_drop),
         ("tcpRead", op_tcp_read),
         ("tcpWrite", op_tcp_write),
         ("tcpClose", op_tcp_close),
@@ -402,6 +416,12 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("cryptoCheckPrime", op_crypto_check_prime),
         // TLS sockets (node:tls)
         ("tlsConnect", op_tls_connect),
+        ("tlsConnectOver", op_tls_connect_over),
+        ("tlsPipeOpen", op_tls_pipe_open),
+        ("tlsPipeOut", op_tls_pipe_out),
+        ("tlsPipeIn", op_tls_pipe_in),
+        ("tlsPipeInEnd", op_tls_pipe_in_end),
+        ("tlsPipeClose", op_tls_pipe_close),
         ("tlsRead", op_tls_read),
         ("tlsWrite", op_tls_write),
         ("tlsClose", op_tls_close),
@@ -3006,6 +3026,10 @@ fn op_https_serve(
 
 // ------------------------------------------------------------------- TCP
 
+/// `__oam.node.tcpConnect(host, port, attemptTimeout, spec?, local?)`.
+/// `spec` is the optional address spec [`connect_pin_arg`] reads: without it
+/// the connect resolves `host` itself (getaddrinfo), as it always has.
+/// `local` is net.connect's localAddress / localPort ([`connect_local_arg`]).
 fn op_tcp_connect(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -3019,18 +3043,445 @@ fn op_tcp_connect(
     // net.getDefaultAutoSelectFamilyAttemptTimeout() as JS read it for this
     // connect; JS owns the value, so nothing is cached per runtime.
     let attempt_timeout = attempt_timeout_arg(scope, &args, 2);
+    let Some(pin) = connect_pin_arg(scope, &args, 3, "tcpConnect", &host) else {
+        return;
+    };
+    let Some(local) = connect_local_arg(scope, &args, 4, "tcpConnect") else {
+        return;
+    };
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
     }
+    let pin = match pin {
+        PinArg::Absent => None,
+        PinArg::Ticket(pin) => Some(pin),
+        PinArg::Hook { pin, spelled } => {
+            if !check_hook_answer_perm(scope, &spelled, port) {
+                return;
+            }
+            Some(pin)
+        }
+        PinArg::Refused(message) => {
+            crate::ops::spawn_op(scope, &mut rv, async move {
+                oam_core::OpOutcome::Failed(message)
+            });
+            return;
+        }
+    };
     let core = core_runtime!(scope);
     let tcp = core.tcp();
     let ids = core.body_ids();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::tcp::tcp_connect(tcp, ids, host, port, attempt_timeout),
+        oam_core::tcp::tcp_connect_pinned(tcp, ids, host, port, attempt_timeout, pin, local),
     );
+}
+
+/// `__oam.node.netResolve(host, family, all, port)`: resolve `host` for a net /
+/// tls connect ahead of it (`net_connect::resolve`: getaddrinfo, narrowed to
+/// family 4 or 6), so JS can emit node's `'lookup'` events -- which a
+/// listener may veto -- before anything is dialled. Resolves with `{token,
+/// addresses: [{address, family}]}` (the first address only unless `all`)
+/// and files exactly that list under `token`, for the connect to redeem with
+/// `{"ticket": token}` or JS to drop with `netResolveDrop`. Rejects with the
+/// error a connect to the same name reports. The net grant is asked about
+/// `host:port` first (ERR_ACCESS_DENIED), as the connect will be.
+fn op_net_resolve(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(host) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "netResolve requires a host");
+        return;
+    };
+    let family = match args.get(1).number_value(scope) {
+        Some(4.0) => Some(4),
+        Some(6.0) => Some(6),
+        _ => None,
+    };
+    let all = args.get(2).boolean_value(scope);
+    // The connect's port: the name is resolved only for a connect the net
+    // grant covers (`host:port`, as tcpConnect / tlsConnect ask), so the
+    // resolver is never a way to look up a name the grant refuses.
+    let port = args.get(3).number_value(scope).unwrap_or(0.0) as u16;
+    if !check_net_perm(scope, &format!("{host}:{port}")) {
+        return;
+    }
+    let core = core_runtime!(scope);
+    let answers = core.resolved_answers();
+    let ids = core.body_ids();
+    // What node's GetAddrInfo hands getaddrinfo: the UTS #46 ToASCII form.
+    let name = ada_url::Idna::ascii(&host);
+    crate::ops::spawn_op(scope, &mut rv, async move {
+        let mut addrs = match oam_core::net_connect::resolve_as(&host, &name, family).await {
+            Ok(addrs) => addrs,
+            Err(e) => return e.to_outcome(),
+        };
+        if !all {
+            addrs.truncate(1);
+        }
+        let addresses: Vec<serde_json::Value> = addrs
+            .iter()
+            .map(|ip| {
+                serde_json::json!({
+                    "address": ip.to_string(),
+                    "family": if ip.is_ipv4() { 4 } else { 6 },
+                })
+            })
+            .collect();
+        let token = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        oam_core::net_connect::store_answer(&answers, token, &host, addrs);
+        oam_core::OpOutcome::Json(
+            serde_json::json!({ "token": token, "addresses": addresses }).to_string(),
+        )
+    });
+}
+
+// ------------------------------------------------------- HTTP bridge
+
+/// `__oam.node.httpBridgeStart(requestJson) -> id`: set up an HTTP/1.1
+/// exchange JS will pump over a socket (`oam_core::http_client::bridge`).
+/// Throws a TypeError for a request that cannot be written.
+fn op_http_bridge_start(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(request) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "httpBridgeStart requires a request");
+        return;
+    };
+    let core = core_runtime!(scope);
+    let bridges = core.http_bridges();
+    let ids = core.body_ids();
+    let outbound = core.outbound_bodies();
+    match oam_core::http_client::bridge::start(&bridges, &ids, outbound, &request) {
+        Ok(id) => rv.set_double(id as f64),
+        Err(message) => throw_type_error(scope, &message),
+    }
+}
+
+/// `__oam.node.httpBridgeResponse(id)`: run the exchange; resolves at the
+/// response head with the fetch payload's shape (the body under
+/// `bodyHandle`, read with `__oam.fetchBodyRead`).
+fn op_http_bridge_response(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let core = core_runtime!(scope);
+    let bridges = core.http_bridges();
+    let bodies = core.bodies();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_client::bridge::response(bridges, id, bodies, ids),
+    );
+}
+
+/// `__oam.node.httpBridgeOut(id)`: the next request bytes for the socket,
+/// or undefined at the end. Unref'd: it waits on hyper, which may never
+/// write again (a response whose body nobody reads), and the socket's own
+/// read is what keeps a live connection's process running, as in node.
+fn op_http_bridge_out(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let bridges = core_runtime!(scope).http_bridges();
+    crate::ops::spawn_op_unref(
+        scope,
+        &mut rv,
+        oam_core::http_client::bridge::out(bridges, id),
+    );
+}
+
+/// `__oam.node.httpBridgeRequestSent(id)`: once hyper has written the whole
+/// request, how many of the `httpBridgeOut` bytes it took (node's `'finish'`
+/// follows the socket's write of the last of them); undefined if the
+/// exchange ends first. Unref'd, as httpBridgeOut: it waits on hyper.
+fn op_http_bridge_request_sent(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let bridges = core_runtime!(scope).http_bridges();
+    crate::ops::spawn_op_unref(
+        scope,
+        &mut rv,
+        oam_core::http_client::bridge::request_sent(bridges, id),
+    );
+}
+
+/// `__oam.node.httpBridgeIn(id, bytes)`: response bytes the socket read.
+fn op_http_bridge_in(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let Some(bytes) = arg_bytes(scope, &args, 1) else {
+        throw_type_error(scope, "httpBridgeIn requires bytes");
+        return;
+    };
+    let bridges = core_runtime!(scope).http_bridges();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_client::bridge::input(bridges, id, bytes),
+    );
+}
+
+/// `__oam.node.httpBridgeInEnd(id)`: the socket reached EOF.
+fn op_http_bridge_in_end(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let bridges = core_runtime!(scope).http_bridges();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_client::bridge::input_end(bridges, id),
+    );
+}
+
+/// `__oam.node.httpBridgeClose(id)`: drop the exchange. True if it was
+/// open.
+fn op_http_bridge_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let closed = id >= 0.0
+        && oam_core::http_client::bridge::close(&core_runtime!(scope).http_bridges(), id as u64);
+    rv.set_bool(closed);
+}
+
+/// `__oam.node.httpEnvProxied(url) -> bool`: whether the fetch transport's
+/// environment proxy rules (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY)
+/// would send a request for `url` through a proxy. http.request asks, so a
+/// request node would dial directly (it applies the environment proxy only
+/// under NODE_USE_ENV_PROXY=1) never goes out through one. A URL the
+/// transport cannot read answers true: the caller then dials directly.
+fn op_http_env_proxied(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let url = arg_string(scope, &args, 0).unwrap_or_default();
+    rv.set_bool(core_runtime!(scope).http_client().env_proxied(&url));
+}
+
+/// `__oam.node.netCheck(host, port)`: the net grant's verdict on a connect to
+/// `host:port`, the resource `tcpConnect` / `tlsConnect` ask about, taken
+/// synchronously inside `net.connect()` / `tls.connect()` before the name is
+/// looked up or a literal is dialled on the next tick. A refused host is
+/// never resolved, and the refusal is still thrown from `connect()` itself.
+/// Throws ERR_ACCESS_DENIED; returns undefined when the grant covers it. The
+/// connect op asks again: this is the early answer, not the gate.
+fn op_net_check(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(host) = arg_string(scope, &args, 0) else {
+        throw_type_error(scope, "netCheck requires a host");
+        return;
+    };
+    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let _ = check_net_perm(scope, &format!("{host}:{port}"));
+}
+
+/// `__oam.node.netResolveDrop(token)`: drop a `netResolve` answer no connect
+/// will redeem (the connect was vetoed or destroyed first). True if it was
+/// still there.
+fn op_net_resolve_drop(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let token = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let dropped = token >= 0.0
+        && oam_core::net_connect::drop_answer(
+            &core_runtime!(scope).resolved_answers(),
+            token as u64,
+        );
+    rv.set_bool(dropped);
+}
+
+/// A connect's address spec, as [`connect_pin_arg`] read it.
+enum PinArg {
+    /// No spec: the connect resolves its host itself.
+    Absent,
+    /// A redeemed `netResolve` ticket: oam's own resolver's answer for the
+    /// connect's host.
+    Ticket(oam_core::net_connect::Pin),
+    /// A `lookup` hook's answer, and each address as JS spelled it (what the
+    /// net grant is asked about).
+    Hook {
+        pin: oam_core::net_connect::Pin,
+        spelled: Vec<String>,
+    },
+    /// The spec cannot be honoured (a ticket that is gone or names another
+    /// host, an address that is not one): the connect rejects with this,
+    /// and nothing is dialled.
+    Refused(String),
+}
+
+/// The optional address spec a net / tls connect takes as argument `index`,
+/// a JSON string:
+///
+/// - `{"ticket": N}` redeems the answer `netResolve` filed under `N` -- one
+///   shot, and only for the host it was resolved for
+///   (`net_connect::redeem_answer`). The connect then dials exactly what the
+///   resolver answered, so a hostname grant keeps working.
+/// - `{"ips": ["addr", ...]}` dials the addresses a `lookup` hook (the
+///   `lookup` option, or a replaced `dns.lookup`) answered, in that order.
+///   The caller must check each one against the net grant
+///   ([`check_hook_answer_perm`]) before dialling.
+///
+/// Anything else throws a TypeError. `None` means an exception is pending.
+fn connect_pin_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+    op: &str,
+    host: &str,
+) -> Option<PinArg> {
+    let value = args.get(index);
+    if value.is_null_or_undefined() {
+        return Some(PinArg::Absent);
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Spec {
+        ticket: Option<u64>,
+        ips: Option<Vec<String>>,
+    }
+    let spec = if value.is_string() {
+        let text = value.to_rust_string_lossy(scope);
+        serde_json::from_str::<Spec>(&text).ok()
+    } else {
+        None
+    };
+    match spec {
+        Some(Spec {
+            ticket: Some(ticket),
+            ips: None,
+        }) => {
+            let Some(core) = scope.get_slot::<oam_core::CoreRuntime>() else {
+                throw_type_error(scope, "internal: runtime not initialized");
+                return None;
+            };
+            let answers = core.resolved_answers();
+            Some(
+                match oam_core::net_connect::redeem_answer(&answers, ticket, host) {
+                    Ok(pin) => PinArg::Ticket(pin),
+                    Err(message) => PinArg::Refused(format!("{op}: {message}")),
+                },
+            )
+        }
+        Some(Spec {
+            ticket: None,
+            ips: Some(ips),
+        }) => {
+            let mut addrs = Vec::with_capacity(ips.len());
+            for ip in &ips {
+                match ip.parse::<std::net::IpAddr>() {
+                    Ok(addr) => addrs.push(addr),
+                    Err(_) => {
+                        return Some(PinArg::Refused(format!("{op}: pin ip '{ip}' is not an IP")));
+                    }
+                }
+            }
+            Some(PinArg::Hook {
+                pin: oam_core::net_connect::Pin {
+                    host: host.to_ascii_lowercase(),
+                    addrs,
+                },
+                spelled: ips,
+            })
+        }
+        _ => {
+            throw_type_error(
+                scope,
+                &format!("{op}: the address spec must be {{ticket}} or {{ips}}"),
+            );
+            None
+        }
+    }
+}
+
+/// The optional local end a net / tls connect binds before dialling, as
+/// argument `index`: net.connect's `localAddress` / `localPort`, a JSON
+/// string `{"address"?: string, "port"?: number}` (JS has validated both as
+/// node does). `Some(None)` without one; anything else throws a TypeError,
+/// and `None` means an exception is pending.
+fn connect_local_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+    op: &str,
+) -> Option<Option<oam_core::net_connect::LocalBind>> {
+    let value = args.get(index);
+    if value.is_null_or_undefined() {
+        return Some(None);
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Local {
+        address: Option<String>,
+        port: Option<u16>,
+    }
+    let local = if value.is_string() {
+        let text = value.to_rust_string_lossy(scope);
+        serde_json::from_str::<Local>(&text).ok()
+    } else {
+        None
+    };
+    match local {
+        Some(Local { address, port }) => Some(Some(oam_core::net_connect::LocalBind {
+            address,
+            port: port.unwrap_or(0),
+        })),
+        None => {
+            throw_type_error(
+                scope,
+                &format!("{op}: the local end must be {{address?, port?}}"),
+            );
+            None
+        }
+    }
+}
+
+/// Every address a `lookup` hook answered, checked against the net grant
+/// exactly as a connect to that address named directly is (`addr:port`, the
+/// address spelled as the hook spelled it, which is the resource the op
+/// builds for a literal host), so a grant that admits
+/// `net.connect(port, addr)` admits the answer and nothing else does. The
+/// natives are reachable from user JS, and without this
+/// `--allow-net=example.com` plus a hook answering `169.254.169.254` would
+/// dial the metadata address under the name's grant -- the rule
+/// `fetchContinue` applies to a fetch's hook. Throws ERR_ACCESS_DENIED on the
+/// first refused address and returns false.
+///
+/// A ticket's addresses need no check: they come from oam's own resolver and
+/// are what the granted name resolves to, the same trust a connect without a
+/// spec gives getaddrinfo.
+fn check_hook_answer_perm(scope: &mut v8::PinScope<'_, '_>, spelled: &[String], port: u16) -> bool {
+    spelled
+        .iter()
+        .all(|ip| check_net_perm(scope, &format!("{ip}:{port}")))
 }
 
 /// The optional per-connect attempt timeout (milliseconds) a connect op takes
@@ -3294,17 +3745,40 @@ fn op_tls_connect(
     let min_version = arg_string(scope, &args, 7).filter(|s| !s.is_empty());
     let max_version = arg_string(scope, &args, 8).filter(|s| !s.is_empty());
     let attempt_timeout = attempt_timeout_arg(scope, &args, 9);
+    // The address spec, as tcpConnect takes it (see connect_pin_arg).
+    let Some(pin) = connect_pin_arg(scope, &args, 10, "tlsConnect", &host) else {
+        return;
+    };
+    let Some(local) = connect_local_arg(scope, &args, 11, "tlsConnect") else {
+        return;
+    };
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
     }
+    let pin = match pin {
+        PinArg::Absent => None,
+        PinArg::Ticket(pin) => Some(pin),
+        PinArg::Hook { pin, spelled } => {
+            if !check_hook_answer_perm(scope, &spelled, port) {
+                return;
+            }
+            Some(pin)
+        }
+        PinArg::Refused(message) => {
+            crate::ops::spawn_op(scope, &mut rv, async move {
+                oam_core::OpOutcome::Failed(message)
+            });
+            return;
+        }
+    };
     let core = core_runtime!(scope);
     let tls = core.tls();
     let ids = core.body_ids();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::tls::tls_connect(
+        oam_core::tls::tls_connect_pinned(
             tls,
             ids,
             host,
@@ -3317,6 +3791,122 @@ fn op_tls_connect(
             min_version,
             max_version,
             attempt_timeout,
+            pin,
+            local,
+        ),
+    );
+}
+
+/// `__oam.node.tlsPipeOpen() -> id`: a pipe TLS will run over for
+/// `tls.connect({ socket })`; JS pumps its far end to the socket
+/// (`oam_core::byte_pipe`).
+fn op_tls_pipe_open(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let core = core_runtime!(scope);
+    let pipes = core.tls_pipes();
+    let ids = core.body_ids();
+    rv.set_double(oam_core::byte_pipe::open(&pipes, &ids) as f64);
+}
+
+/// `__oam.node.tlsPipeOut(id)`: the next bytes TLS wrote, for the socket, or
+/// undefined at the end. Unref'd, as httpBridgeOut: an idle connection's TLS
+/// may never write again, and the socket's own read is what keeps a live
+/// connection's process running.
+fn op_tls_pipe_out(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let pipes = core_runtime!(scope).tls_pipes();
+    crate::ops::spawn_op_unref(scope, &mut rv, oam_core::byte_pipe::out(pipes, id));
+}
+
+/// `__oam.node.tlsPipeIn(id, bytes)`: bytes the socket read.
+fn op_tls_pipe_in(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let Some(bytes) = arg_bytes(scope, &args, 1) else {
+        throw_type_error(scope, "tlsPipeIn requires bytes");
+        return;
+    };
+    let pipes = core_runtime!(scope).tls_pipes();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::byte_pipe::input(pipes, id, bytes));
+}
+
+/// `__oam.node.tlsPipeInEnd(id)`: the socket reached EOF.
+fn op_tls_pipe_in_end(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let pipes = core_runtime!(scope).tls_pipes();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::byte_pipe::input_end(pipes, id));
+}
+
+/// `__oam.node.tlsPipeClose(id)`: drop the pipe. True if it was open.
+fn op_tls_pipe_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let closed =
+        id >= 0.0 && oam_core::byte_pipe::close(&core_runtime!(scope).tls_pipes(), id as u64);
+    rv.set_bool(closed);
+}
+
+/// `__oam.node.tlsConnectOver(pipe, serverName, ca, rejectUnauthorized,
+/// cert, key, minVersion, maxVersion)`: the client handshake over a pipe
+/// (`tls.connect({ socket })`); resolves as tlsConnect does, without the
+/// addresses. No net grant is asked: the socket underneath was opened (and
+/// checked) by whoever made it.
+fn op_tls_connect_over(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let pipe = args.get(0).number_value(scope).unwrap_or(-1.0);
+    if pipe < 0.0 {
+        throw_type_error(scope, "tlsConnectOver requires a pipe");
+        return;
+    }
+    let Some(server_name) = arg_string(scope, &args, 1) else {
+        throw_type_error(scope, "tlsConnectOver requires a server name");
+        return;
+    };
+    let ca_pem = arg_string(scope, &args, 2).filter(|s| !s.is_empty());
+    let reject_unauthorized = args.get(3).boolean_value(scope);
+    let client_cert_pem = arg_string(scope, &args, 4).filter(|s| !s.is_empty());
+    let client_key_pem = arg_string(scope, &args, 5).filter(|s| !s.is_empty());
+    let min_version = arg_string(scope, &args, 6).filter(|s| !s.is_empty());
+    let max_version = arg_string(scope, &args, 7).filter(|s| !s.is_empty());
+    let core = core_runtime!(scope);
+    let tls = core.tls();
+    let pipes = core.tls_pipes();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::tls::tls_connect_over(
+            tls,
+            pipes,
+            ids,
+            pipe as u64,
+            server_name,
+            ca_pem,
+            reject_unauthorized,
+            client_cert_pem,
+            client_key_pem,
+            min_version,
+            max_version,
         ),
     );
 }
@@ -6876,11 +7466,13 @@ fn op_dns_lookup(
         0
     };
     let all = args.get(2).is_true();
+    // node's GetAddrInfo hands getaddrinfo the UTS #46 ToASCII form.
+    let name = ada_url::Idna::ascii(&hostname);
 
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::dns::dns_lookup(hostname, family, all),
+        oam_core::dns::dns_lookup(hostname, name, family, all),
     );
 }
 

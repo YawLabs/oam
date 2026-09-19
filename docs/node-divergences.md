@@ -237,23 +237,37 @@ Differences from Node's model:
   list with `=`, not a space; the space form is rejected with a hint rather than being
   read as the script path.
 - **`--allow-net` is checked on every host an HTTP request reaches**, not only the one
-  the script named. `fetch`, `http.request`, a verifying `https.request` and
-  `undici.request` run on oam's HTTP client, which follows redirects itself (entry 38),
-  and each hop's host is checked against the grant before it is dialled, before a
-  `connect.lookup` hook is asked to resolve it, and whether or not the request goes
-  through an environment proxy (the destination is checked, not the proxy). A refused
-  hop is never contacted, and the request fails with the same `ERR_ACCESS_DENIED` error a
-  direct request to that host gets -- not wrapped in `TypeError: fetch failed`, so
-  `err.code` and `err.resource` read the same whichever hop was refused; `http.request`
-  emits it as `'error'`. Up to 0.16.1 only the initial URL was checked, and a granted
-  host's redirect reached any host. What these requests compare is the URL's host as the
+  the script named. `fetch` and `undici.request` run on oam's HTTP client, which follows
+  redirects itself (entry 38), and each hop's host is checked against the grant before it
+  is dialled, before a `connect.lookup` hook is asked to resolve it, and whether or not
+  the request goes through an environment proxy (the destination is checked, not the
+  proxy). A refused hop is never contacted, and the request fails with the same
+  `ERR_ACCESS_DENIED` error a direct request to that host gets -- not wrapped in
+  `TypeError: fetch failed`, so `err.code` and `err.resource` read the same whichever hop
+  was refused. Up to 0.16.1 only the initial URL was checked, and a granted host's
+  redirect reached any host. `http.request` and `https.request`, which followed redirects
+  on the same client up to 0.16.2, follow none now, as in Node; on oam's own client they
+  are checked like `fetch`, and emit a refusal as `'error'`. What these requests compare
+  is the URL's host as the
   URL parser normalises it, without the port: `LOCALHOST`, `%6c%6fcalhost` and `0x7f.1`
   are checked as `localhost`, `localhost` and `127.0.0.1`, and an IPv6 literal as
   `[::1]` (so a grant names it in brackets). A trailing dot is not dropped, so
   `localhost.` is refused under `--allow-net=localhost`. Because the port is not part of
   their resource, a port-scoped entry such as `--allow-net=127.0.0.1:8080` admits
   `net.connect` and `tls.connect` to that port but none of these requests; grant the
-  bare host to allow them.
+  bare host to allow them. An `http.request` / `https.request` that goes over an agent's
+  socket (entry 43) is a `net.connect` / `tls.connect` and is checked as one (`host:port`).
+- **A `lookup` hook's answers are checked too.** A `lookup` option or a replaced
+  `dns.lookup` decides which addresses a granted name is dialled at, so for `net.connect`,
+  `tls.connect` and a request over an agent's socket every address it answers is checked
+  as a connection to that address would be (`addr:port`, the address as the hook spelled
+  it, IPv6 unbracketed as `net.connect(port, '::1')` builds it): `--allow-net=granted.test`
+  plus a hook answering `127.0.0.1` is refused with `ERR_ACCESS_DENIED` before anything is
+  dialled, and `--allow-net=granted.test,127.0.0.1` allows it. oam's own resolver keeps a
+  hostname grant working: its answer is handed to the connection as a one-shot ticket,
+  never as addresses JS could substitute. A fetch's `connect.lookup` answers follow the
+  fetch rule (entry 38: bracketed, no port). The name itself is checked before it is
+  looked up, so a refused name is never resolved.
 - **A denied environment read is silent; every other denial throws.** Filesystem,
   network and child-process denials throw `ERR_ACCESS_DENIED` as described above. A
   variable denied by `--allow-env` is instead simply absent from `process.env` and reads
@@ -789,13 +803,12 @@ byte-inspects the wire, or depends on the poisoned connection 400ing a
 subsequent request, will see the difference; `pipeline(readable, http.get)`
 behaves as on Node.
 
-### 17. `req.end(callback)` fires the callback on `'response'`, not `'finish'`
+### 17. `req.end(callback)` and `'finish'` -- FIXED, no longer a divergence
 
-Node invokes the `end()` callback when the request finishes writing. oam
-invokes it when the response arrives, which is strictly later. `'finish'`
-itself is emitted correctly and in Node's position (`socket -> finish ->
-response -> close`), so `req.on('finish', ...)` and `stream.finished(req)`
-both behave; only the `end(cb)` shorthand differs.
+This entry used to record that oam called the `end()` callback when the response arrived.
+It is now a `'finish'` listener called with no arguments, as in Node, and `'finish'` itself
+follows the request's write to its socket: after `'connect'` / `'secureConnect'` for a
+request sent over an agent's socket (entry 43), at once on oam's own transport (entry 38).
 
 ## Platform constant tables
 
@@ -1025,29 +1038,41 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   a `stream.Duplex` here, so `netSocket instanceof stream.Duplex` is false where Node says
   true.
 - **Node members absent from both classes**, which the mechanical walk cannot see by
-  construction: `destroySoon`, `resetAndDestroy`, and `net.Socket.prototype.read` (a
-  `TLSSocket`, being a Duplex, has `read`). A `tls.connect()` socket also still lacks them.
+  construction: `destroySoon` and `resetAndDestroy`. `net.Socket` has had `read()`,
+  `'readable'` and `push()` since 0.16.3 (below); a `TLSSocket`, being a Duplex, always had
+  `read`.
 - **A bare `connect()` handshakes.** `new tls.TLSSocket(null, opts).connect(port, host)` runs
   the TLS handshake inside oam's native connect and fires `'connect'`, `'ready'` and
   `'secureConnect'`; in Node that `connect()` only opens the transport, and only
   `tls.connect()` starts the handshake. oam is a superset here.
-- **No wrapping of an existing socket.** oam has no native op that starts a client-side TLS
-  session over an already-connected plain socket, so `tls.connect({ socket })` and
-  `new tls.TLSSocket(existingSocket)` are refused: the socket is destroyed on the next tick
-  with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. Node upgrades the given socket in place. This
-  is the STARTTLS shape (`pg` and `mysql2` with `ssl`, `nodemailer`, `ldapjs`); until the op
-  exists, open the TLS connection with `tls.connect({ host, port })` instead.
+- **TLS over an existing socket runs over a pipe.** `tls.connect({ socket })` -- the
+  STARTTLS shape (`pg` and `mysql2` with `ssl`, `nodemailer`, `ldapjs`), a CONNECT tunnel
+  (https-proxy-agent), TLS in TLS (an https proxy) -- works as in Node, over a net.Socket,
+  a TLSSocket or any JS Duplex: no `'connect'` of its own for a connected socket (its
+  `'connect'` is handed on for one still connecting), that socket's addresses, `'secure'`
+  after `'secureConnect'`, the certificate checked against `servername`, else `host`, else
+  the name the socket connected to, and the socket closed with the TLS socket
+  (`conformance/cases/125-tls-connect-over-a-socket.mjs`). Node moves the socket's handle
+  into the TLS layer; oam runs rustls over an in-memory pipe whose other end JS pumps to
+  and from the socket. What that shows: `_handle` is a stand-in with `_parentWrap` (the
+  wrapped socket, or a `JSStreamSocket` over a JS stream, as in Node) and `_parent`, not a
+  TLSWrap; the wrapped socket still emits its own `'data'` / `'end'` (the ciphertext) to
+  anyone else listening, where Node's stops once TLS owns its handle; and when the peer
+  ends the connection first, oam's own close_notify may not reach it before the socket is
+  destroyed. `new tls.TLSSocket(socket)` without `tls.connect()` starts no handshake, as
+  in Node; a server-side wrap (`isServer: true`) is still not supported. Up to 0.16.2 every
+  wrapped socket was refused with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`.
 - **`minVersion` / `maxVersion` / `secureProtocol` are honoured** by `tls.connect`,
-  `tls.createServer`, `https.createServer` and the non-verifying `https.request` (#144), with
-  Node's synchronous `TypeError`s and its asynchronous codes
+  `tls.createServer`, `https.createServer` and `https.request` (#144) -- which sends a
+  request carrying any of them, or `ca`, a client certificate, `servername`,
+  `checkServerIdentity` or `rejectUnauthorized: false`, over `tls.connect` (entry 43) --
+  with Node's synchronous `TypeError`s and its asynchronous codes
   (`ERR_SSL_NO_PROTOCOLS_AVAILABLE`, `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`), pinned by
-  `conformance/cases/109-tls-protocol-version.mjs`. What still differs:
-  - The **verifying `https.request`** (the default, `rejectUnauthorized` not `false`) goes
-    through one shared HTTPS client, which negotiates the default TLS 1.2-1.3 range and takes
-    no per-request `minVersion` / `maxVersion` / `secureProtocol` -- nor `ca`. The options are
-    validated (the same throws as Node), and a pin that would change the negotiated version
-    prints one `Warning` per process rather than being silently dropped. `tls.connect` honours
-    the pin; a per-request client keyed by these options is the fix (#146).
+  `conformance/cases/109-tls-protocol-version.mjs`. `tls.connect` calls a
+  `checkServerIdentity` after the chain check, as Node does, and destroys the socket with
+  its error before `'secureConnect'`. Up to 0.16.2 a verifying `https.request` went through
+  one shared client that applied none of these (a version pin printed a `Warning`), and
+  `tls.connect` never called `checkServerIdentity`. What still differs:
   - **A `TLSv1` / `TLSv1.1` floor is raised to TLS 1.2** -- rustls offers nothing lower --
     which is observationally what Node negotiates too (OpenSSL 3 cannot build a legacy hello
     either: an explicit sub-1.2 range fails with `ERR_SSL_NO_PROTOCOLS_AVAILABLE` on both).
@@ -1127,13 +1152,12 @@ Two things this moved rather than removed:
 
 Node's `server.listen(port)` with no host binds dual-stack `::`, and `net.connect(port)` (default
 host `localhost`) reaches it over `::1`, so `server.address()` reports `{ address: '::', family:
-'IPv6' }` and both ends see `remoteFamily` `IPv6`. oam's `listen(port)` binds `0.0.0.0` and
-`connect(port)` defaults to `127.0.0.1`: same program, same data, `IPv4` in every observable.
-`tls.connect(port)` defaults to `localhost` on both runtimes and, since #137, reaches an
-IPv4-only listener as fast as Node does. `http.request` defaults to `localhost` as well, and
-since #143 its first request to an oam listener tries `::1` first, as Node's does, paying one
-refused attempt (a few milliseconds; entry 35). Switching the connect default alone would
-not close the gap; it needs a dual-stack listen default first.
+'IPv6' }` and both ends see `remoteFamily` `IPv6`. oam's `listen(port)` binds `0.0.0.0`: same
+program, same data, `IPv4` in every observable. `net.connect(port)`, `tls.connect(port)` and
+`http.request` all default to `localhost`, as Node's do, and resolve it like any other name
+(a `lookup` option sees `'localhost'`); against an oam listener the first attempt goes to `::1`
+and is refused, costing a few milliseconds (entry 35), before `127.0.0.1` connects. Closing
+the gap needs a dual-stack listen default.
 
 _(probed)_ Node v22.22.2 and oam on the same `createServer().listen(0)` + `connect(port)`
 program.
@@ -1148,6 +1172,11 @@ address for. On a Linux or macOS host with no routable IPv6 address, Node can re
 plain `Error` in Node and an `AggregateError` over both addresses in oam, and a successful
 one may try `::1` first. On Windows Node's `net` passes no flags, so the two agree there
 (`conformance/cases/110-connect-refused-shapes.mjs` prints the full shape only on Windows).
+
+A `lookup` hook (`net.connect({ lookup })`, `tls.connect`, `http.request`, or a replaced
+`dns.lookup`) is called with Node's arguments, `hints` included: `0` on Windows, the
+platform's `AI_ADDRCONFIG` value elsewhere (`1024` on macOS, `32` on glibc Linux). Only oam's
+own resolver leaves the flag out.
 
 Passing the flag means calling `getaddrinfo` by hand, through new `unsafe` code, which is
 why it is not done yet. `dns.lookup` is the same resolver; with no `hints` Node's passes no
@@ -1187,11 +1216,16 @@ What still differs:
   already delivered stay delivered, and only the chunk boundary at which it stops differs),
   and `text()` / `arrayBuffer()` / `json()` called afterwards reject with undici's own
   `AbortError` `The operation was aborted.` rather than the reason, as Node's do.
-- **TLS verdicts carry no code.** A `fetch` to a server whose certificate does not verify
-  rejects with the uncoded cause `error sending request for url (https://host:port/)`, and the
-  verifying `https.request` emits `ECONNRESET` `socket hang up`. Node reports the verdict:
-  `self-signed certificate`, `code` `DEPTH_ZERO_SELF_SIGNED_CERT`, on both. (`tls.connect`
-  reports Node's verdict codes since #136.)
+- **TLS verdicts carry Node's code** (case 129): a certificate the platform verifier refuses
+  is named as Node names it -- `UNABLE_TO_VERIFY_LEAF_SIGNATURE`,
+  `DEPTH_ZERO_SELF_SIGNED_CERT`, `SELF_SIGNED_CERT_IN_CHAIN`,
+  `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, `CERT_HAS_EXPIRED`, `ERR_TLS_CERT_ALTNAME_INVALID`,
+  ... with Node's message -- as `fetch`'s cause and as the error `https.request` emits, the
+  classification `tls.connect` uses (#136). Up to 0.16.2 `fetch`'s cause was the uncoded
+  `error sending request for url (...)` and `https.request` emitted `ECONNRESET` `socket hang
+  up`. A refusal the platform verifier makes for a reason Node has no name for (an OS
+  policy, say) keeps those old texts. Whether a certificate is accepted is still the
+  platform verifier's call (next item).
 - **The trust store is the operating system's.** `fetch` and the verifying `https.request`
   verify with the platform verifier plus `NODE_EXTRA_CA_CERTS`; Node's `fetch`, and
   `tls.connect` in both runtimes, use Mozilla's bundled roots plus `NODE_EXTRA_CA_CERTS`. A
@@ -1209,10 +1243,26 @@ What still differs:
   the other one. The consequence is a wrong 10-250 ms stagger on one multi-address connect,
   never a wrong address or a wrong error, and a `connect.lookup`-hooked route is unaffected
   (its connector carries its own value). _(source)_
-- **`ClientRequest.socket` does not describe the connection.** Against a dual-stack server
-  reached through `localhost`, Node's `req.socket` reports `remoteAddress` `::1`,
-  `remoteFamily` `IPv6` and the real local port; oam's reports `localhost`, `undefined` and
-  a local port the server never saw.
+- **`req.socket` on this transport is a stand-in.** It is a real `net.Socket` (a
+  `tls.TLSSocket` for https), `null` until `'socket'` as in Node, and by `'response'` it
+  carries the connection the transport used: the dialled peer's address, port and family,
+  the local end the server saw, and for https the verified session (`authorized`,
+  `getPeerCertificate()`, `getProtocol()`, `getCipher()`, `alpnProtocol`), for a pooled or
+  h2 connection too (`conformance/cases/122-http-client-socket-addresses.mjs`). What
+  differs: the fields arrive with the response, where Node's socket has them on
+  `'connect'` (a `'lookup'`, `'connect'` or `'secureConnect'` listener present when the
+  request is dispatched therefore sends it over a real socket instead, entry 43); no bytes
+  pass through it, so it emits no `'data'`, and its idle timer (`setTimeout`, the
+  request's `timeout` option, an agent's `timeout`) is re-armed by what the transport does
+  for the request -- sending it, each upload chunk, the response head, each body chunk --
+  rather than by each read and write on a wire
+  (`conformance/cases/150-http-request-timeouts.mjs`); `'finish'` follows `end()` at once,
+  as Node's does for a socket that is already connected, so it also fires for a request
+  whose connection then fails (Node's never does); it emits `'close'` only when the
+  request is aborted or destroyed; and through an environment proxy its peer is the
+  proxy. At the end of a response whose connection stays open,
+  `res.socket` is null, as node detaches a kept-alive socket. Up to 0.16.2 it was a fixed object naming the host as
+  written, with `localAddress` `127.0.0.1` and `localPort` `0`.
 - **The WebSocket client is not on this connector.** `new WebSocket(url)` dials on its own,
   so on Windows a refused loopback connect takes about 2 s (2035 ms measured; Node 7 ms), and
   the `'error'` event is a plain `Event` where Node's is an `ErrorEvent` with the message
@@ -1273,16 +1323,19 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
 
 **Redirects**
 
-- **`redirect: 'manual'` and `'error'` are not implemented**: every redirect is followed
-  (#149).
+- **`redirect: 'manual'` and `'error'` behave as Node's** (case 126): `'manual'` returns the
+  `3xx` itself (`redirected` false, `url` the request's) and never requests the target;
+  `'error'` rejects with `TypeError: fetch failed`, cause `unexpected redirect`, on a 301,
+  302, 303, 307 or 308 with or without a `Location`; a value outside the enum is refused
+  with Node's `Request constructor: ... is not an accepted type` message. Up to 0.16.2 every
+  redirect was followed whatever the option said. `Response.type` is not implemented.
 - **A `Location` that does not parse** fails the fetch with a plain `Error('Invalid URL')` as
   the `cause` (own keys `stack`, `message`); Node's is a `TypeError` with `code`
   `ERR_INVALID_URL`, `input` and `base`. Case 111 prints only the message.
-- **`http.request` follows redirects** (#148), by the same rules as `fetch`: 20 hops, no
-  `Referer`, credentials dropped for good after a cross-origin hop, and the bad-port block on
-  every hop -- though not on the URL it was given, which Node's `http.request` dials whatever
-  the port. It also decodes the body, as `fetch` does (entry 32). Node's `http.request` does
-  neither.
+- **`http.request` on this transport returns a `3xx` as the response**, as Node's does (it
+  asks the transport for `'manual'`); up to 0.16.2 it followed redirects by `fetch`'s rules.
+  It also decodes the body, as `fetch` does (entry 32). Node's `http.request` does not, and
+  neither does a request sent over an agent's socket (entry 43).
 - **A hop that lands on a pooled connection the server has just closed.** oam's redirect loop
   has no event-loop tick between the 3xx and the hop, so against a server that sends the 3xx
   with keep-alive and then FINs, the hop can be written before the server's FIN arrives.
@@ -1407,10 +1460,20 @@ above.
   applied first, with Node's exact messages, so the normalisation only ever sees a path Node
   would also have sent. This is what keeps the connect target where `hostname` says: without
   it, `{hostname: SAFE, port: GOOD, path: '@other.host:PORT/x'}` reached the OTHER origin.
-- **A `host` the URL parser cannot hold as a bare authority fails the request in oam and the
-  resolver in Node**, with the same class of error but not always the same code: for
-  `{hostname: 'u:p@127.0.0.1:PORT'}` Node reports `getaddrinfo EAI_FAIL` on Windows and oam
-  reports `getaddrinfo ENOTFOUND`; for `{hostname: '127.0.0.1/x'}` both report `ENOTFOUND`.
+- **A `host` the URL parser would rewrite goes to the resolver as written.** oam's client
+  carries a request as a URL, and the URL parser rewrites spellings Node's resolver refuses
+  (percent-escapes, octal and zero-padded IPv4, a trailing dot on an address, a tab, IDNA,
+  fullwidth digits), which would send the request to an address Node never dials. So a
+  name the parser cannot hold, holds only rewritten, or holds bracketed goes over
+  `net.connect` with the string as given, and the platform's `getaddrinfo` answers it as it
+  answers Node (`ENOTFOUND` for all of those on Windows; glibc's resolver takes octal
+  IPv4), with Node's `ERR_INVALID_CHAR` thrown first for a Host header no header may carry
+  (`conformance/cases/121` and `122`). Up to 0.16.2 the parser's rewrite was dialled. The
+  resolver is handed what Node's is: the UTS #46 ToASCII form of the name (Node's
+  GetAddrInfo runs `ada::idna::to_ascii` before getaddrinfo, and so does oam's, for
+  `dns.lookup`, `net.connect` and `tls.connect`), so a soft hyphen vanishes and a fullwidth
+  or superscript digit is a digit, and a name ToASCII refuses is `getaddrinfo EINVAL`; the
+  error names the host as written. Up to 0.16.2 oam's resolver took the name raw.
 - **A port that is a coercible string dials the same place, but the `Host` header differs.**
   Node dials the coercion and writes the caller's raw spelling: `port: '0x50'` sends
   `Host: 127.0.0.1:0xc4df`, and `port: ' 50399'` sends `Host: 127.0.0.1: 50399`. oam dials
@@ -1419,20 +1482,27 @@ above.
 **The environment proxy, an oam extension**
 
 `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` (uppercase first, then lowercase)
-always route `fetch` and `http.request` in oam. Node v22.22.2 ignores them unless
-`NODE_USE_ENV_PROXY=1` is set, which oam does not read; with it set, Node's `http.get` sends
-an http destination to the proxy in absolute form as oam does, but its `fetch` tunnels even
-an http destination through `CONNECT` (and warns that `EnvHttpProxyAgent` is experimental).
+always route `fetch` in oam. Node v22.22.2's `fetch` ignores them unless
+`NODE_USE_ENV_PROXY=1` (or `--use-env-proxy` in `NODE_OPTIONS`) is set, and with it set
+tunnels even an http destination through `CONNECT` (and warns that `EnvHttpProxyAgent` is
+experimental). `http.request` / `https.request` follow Node: without that setting they dial
+the destination themselves, so `res.socket.remoteAddress` is the destination's, never the
+proxy's; with it, a request over Node's own global agent goes through the proxy (an http
+destination in absolute form), and one over any other agent -- `agent: false`, a
+`new http.Agent()`, a replaced `http.globalAgent` -- still dials directly. Up to 0.16.2 oam
+sent every `http.request` through the proxy. Under `NODE_USE_ENV_PROXY=1` oam's rules are
+the transport's, not Node's: Node reads `http_proxy` before `HTTP_PROXY` and never reads
+`ALL_PROXY`. `oam --use-env-proxy` on the command line is not accepted.
 The variables are read from the OS environment once per run, so assigning
-`process.env.HTTP_PROXY` changes nothing, and a set `REQUEST_METHOD` (a CGI environment)
-turns them all off. An http
+`process.env.HTTP_PROXY` (or `NODE_USE_ENV_PROXY`) changes nothing, and a set
+`REQUEST_METHOD` (a CGI environment) turns them all off for `fetch`. An http
 destination goes to the proxy in absolute form, with `proxy-authorization` from the proxy
 URL's credentials; an https destination goes through a `CONNECT` tunnel carrying those
 credentials and oam's `user-agent`, with h2 still negotiated with the origin inside it. The
 handshake with an `https://` proxy itself offers no ALPN. A refused or unresolvable proxy
 fails with Node's connect error naming the proxy. A `socks` proxy URL is not supported and
 fails every request it applies to: `fetch` with `error sending request for url (...)`,
-`http.request` with `ECONNRESET` `socket hang up`.
+`http.request` (under `NODE_USE_ENV_PROXY=1`) with `ECONNRESET` `socket hang up`.
 
 _(probed)_ Node v22.22.2 + undici 6.24.1 vs oam on Windows, the same scripts, unless marked
 _(source)_; the `connect.lookup` behaviour is pinned by e2e tests.
@@ -1544,6 +1614,99 @@ many are open is closed at once and the server emits `'drop'`. What differs:
 
 _(probed)_ Node v22.22.2 and oam, raw TCP and TLS clients against servers with short
 timeouts; conformance case 135.
+
+### 43. `http.request` over an agent's socket: what differs
+
+Node's `ClientRequest` always goes over a socket its agent hands it. oam sends a request that
+way -- over the socket the agent's `createConnection` (or `options.createConnection`)
+returns, the HTTP/1.1 exchange run by hyper over the bytes JS moves between that socket and
+the parser -- whenever the request carries connection-level policy Node applies on a real
+socket: an agent whose `addRequest`, `createSocket` or `createConnection` is not the stock
+one (a subclass that overrides it, or a patched instance or prototype), an
+`options.createConnection`, a `lookup` in the request's or the agent's options, a replaced
+`dns.lookup`, a wrapped `net.createConnection` / `net.Socket.prototype.connect` (http) or
+`tls.connect` / `tls.TLSSocket.prototype.connect` (https), https with a TLS option oam's own
+client does not apply (`rejectUnauthorized: false`, `ca`, `cert` / `key` / `pfx`,
+`servername`, `checkServerIdentity`, `minVersion` / `maxVersion` / `secureProtocol`), a
+`socketPath`, a `localAddress` or `localPort` (bound as `net.connect` binds them), a host the URL parser would rewrite (entry 38), a destination oam's client
+would send through the environment proxy where Node would not (entry 38), an
+upgrade, or `'lookup'` / `'connect'` / `'secureConnect'` listeners on `req.socket` when the
+request is dispatched -- at once when nothing listens for `'socket'`, else one turn of the
+loop after it (an immediate, no timer wait), so a listener added after an `await` in an
+async `'socket'` handler counts -- or when the agent's pool already holds a
+socket for the request (a stock agent's included). Guard packages that vet the destination in any of those places (request-filtering-agent,
+ssrf-req-filter, a `'connect'` listener checking `remoteAddress`) therefore run, and what
+they refuse never reaches the wire, matching Node
+(`conformance/cases/121-http-request-lookup-and-agents.mjs`). Every other request stays on
+oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, `lookup` and
+`createConnection` were ignored. What differs on this path:
+
+- **The pool is Node's.** `http.Agent` is lib/_http_agent.js ported: `keepAlive`,
+  `maxSockets` (requests queue in `agent.requests`), `maxFreeSockets`, `maxTotalSockets`,
+  `scheduling`, the `'free'` event, `freeSockets` keyed by `getName()`, the response's
+  `Keep-Alive: timeout=` hint, `reusedSocket`, `keepSocketAlive` / `reuseSocket` called
+  where Node calls them (agentkeepalive overrides both), and the request's `Connection`
+  header by Node's rules; `conformance/cases/124-http-agent-keepalive-pool.mjs` pins it.
+  What differs: a socket that is not reused because its response said `close` (or was
+  destroyed) leaves `agent.sockets` at once, where Node's leaves it in a later loop
+  phase, when its `'close'` arrives (see Sockets below). Not ported: the `proxyEnv` option
+  (under `NODE_USE_ENV_PROXY=1` the global agents' requests take oam's client and its
+  environment proxy, entry 38) and the `'keylog'` relay.
+- **The wire.** Header names go out lowercased (hyper keeps no original case), and
+  `rawHeaders` of the response are lowercased too. A request target byte that hyper's URI
+  type refuses (`"`, `<`, `>`, `\`, `^`, `` ` ``, and any byte above 0x7F) is
+  percent-encoded where Node writes it raw. A body written in the same tick as `end()` is
+  sent with `content-length`, where Node sends `write()`s before `end()` chunked. No
+  `accept`, `user-agent` or `accept-encoding` is added (oam's own client adds all three,
+  #148). Redirects are not followed and bodies are not decoded, as in Node.
+- **Errors.** A response that cannot be parsed fails with a coded `Parse Error: ...`
+  (`HPE_*`) whose code is the closest llhttp has for what hyper reports; a malformed chunk
+  size is `HPE_INVALID_CHUNK_SIZE`, as in Node. A response head is held to the request's
+  `maxHeaderSize` (or 16 KiB), counted as Node's parser counts it -- reason phrase, header
+  names and values, refused at a count at or over the limit -- and fails with Node's
+  `Parse Error: Header overflow` (`HPE_HEADER_OVERFLOW`, `reason` `Header overflow`), but
+  without its `bytesParsed` / `rawPacket` (`conformance/cases/123-http-request-max-header-size.mjs`).
+  A `101` head is measured as it arrives, CRLFs included, so it trips a few bytes before
+  Node's count would. `insecureHTTPParser` is validated as in Node but relaxes nothing
+  (it does not lift the limit in Node either). An upgrade's head is written
+  by hand, so a header value carrying CR or LF fails that request with Node's
+  `ERR_INVALID_CHAR` (Node throws it earlier, from `setHeader()`).
+- **Trust.** An https request here verifies with `tls.connect`'s store -- Mozilla's roots
+  plus `NODE_EXTRA_CA_CERTS`, and the request's or agent's `ca` -- as Node does, not with
+  the operating system's store oam's own client uses (entry 38).
+- **`'finish'`.** As in Node, it follows the socket's write of the last request byte, so it
+  comes after `'connect'` / `'secureConnect'`, `req.writableFinished` is `false` until
+  then, and a request whose socket refused or that was destroyed before it was written
+  gets none (`conformance/cases/151-http-request-finish-order.mjs`). What differs: a
+  `write()` callback runs once the request has taken the chunk, before the socket has
+  connected, where Node's waits for the socket to write it; and a request destroyed from
+  its socket's own `'connect'` / `'secureConnect'` listener gets no `'finish'`, where
+  Node's still reports one from the write it had queued for the connect.
+- **Sockets.** A `'connect'` listener on a TLS socket runs after the handshake, since oam's
+  native connect does both (entry 34); a listener that destroys the socket there still
+  stops the request before it is written. oam's `net.Socket` emits `'error'` and `'close'`
+  from `destroy()` synchronously where Node defers them a tick. After the request ends
+  Node clears a closed socket's `localAddress` / `localPort`; oam keeps them on a
+  `net.Socket`.
+- **Proxy agents.** `http-proxy-agent` and similar agents that return a plain socket to a
+  proxy work for http, and https-proxy-agent (5 and 7) tunnels to an https target over
+  `tls.connect({ socket })` (entry 34), a refusing proxy's answer included, as in Node. Up
+  to 0.16.2 they were ignored and the request went direct. agent-base, under all of them,
+  decides "is this https?" by looking for Node's own `node:https:` frame on the stack; oam's
+  `https.request` and `https.get` run in frames named `node:https` for it, so a stack
+  trace through them shows that name where it used to show `oam:node_compat.js`.
+- **Pipes.** oam has no client for a Unix domain socket or a Windows named pipe, so
+  `net.connect({ path })`, `net.connect(path)`, `tls.connect({ path })` and an http(s)
+  request's `socketPath` fail with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` where Node connects
+  to the pipe; a non-string `path` throws Node's `ERR_INVALID_ARG_TYPE`. Up to 0.16.2 they
+  connected to `host:port` instead (http.request sent the whole request there).
+- **`--permission`.** The request is a `net.connect` / `tls.connect`, and its grant is
+  checked as theirs is: `host:port`, and each address a `lookup` hook answers as `addr:port`
+  (entry 4).
+
+_(probed)_ Node v22.22.2 vs oam on Windows: the probes behind cases 120-122, and
+request-filtering-agent 3.2.1 / 2.0.1 / 1.1.2 and ssrf-req-filter 1.1.1 against node-hosted
+dual-stack servers, line for line identical except where a pooled socket is reused.
 
 ### `err.syscall` on `fs.realpath` and `fs.opendir`
 
@@ -1761,9 +1924,12 @@ comment, **not** something measured. Do not rely on either the claim or its nega
   runtimes in a single-host probe, which does not distinguish "worked" from "no-op".
 - **`process.setSourceMapsEnabled`** appears to validate and no-op. Not confirmed against
   a real source-mapped stack.
-- **`net.Socket` read-side state.** A source comment says oam's socket is always in
-  flowing mode, so `_readableState.length` stays `0`. That is an internal some libraries
-  (e.g. `ws`) read; not measured here.
+- **`net.Socket` read-side state.** oam's socket reads in flowing mode unless a
+  `'readable'` listener switches it to paused mode (`read()` hands out what is buffered,
+  `'end'` follows the last null), and once the last `'readable'` listener goes, data is
+  held until `resume()` or a `'data'` listener, as Node's `readableFlowing` null does
+  (case 125). A socket nobody reads still emits `'data'` into the void where Node's would
+  buffer, and `_readableState.length` is `0` except in paused mode.
 - **N-API async surfaces.** `napi_create_async_work`, `napi_queue_async_work`, and the
   threadsafe-function family are reported as stubs, with threadsafe finalizers possibly
   dropped. Only reachable with `OAM_ENABLE_NATIVE_ADDONS=1`.

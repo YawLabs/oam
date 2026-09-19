@@ -4806,6 +4806,8 @@ fn oam_run_with_proxy_env(script: &std::path::Path, vars: &[(&str, &str)]) -> Ou
         "no_proxy",
         "REQUEST_METHOD",
         "NODE_EXTRA_CA_CERTS",
+        "NODE_USE_ENV_PROXY",
+        "NODE_OPTIONS",
     ] {
         cmd.env_remove(name);
     }
@@ -5219,13 +5221,19 @@ server.close();
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
-/// HTTP_PROXY is honoured by fetch and http.request alike -- an oam extension
-/// (node v22.22.2 ignores the variable unless NODE_USE_ENV_PROXY=1 is set,
-/// measured) that the reqwest transport had and the owned one keeps:
-/// absolute-form request line, `proxy-authorization` from the proxy URL's
-/// userinfo. Wire and texts measured on the reqwest build first.
+/// HTTP_PROXY is honoured by fetch -- an oam extension the reqwest transport
+/// had and the owned one keeps (node v22.22.2's fetch ignores the variable
+/// unless NODE_USE_ENV_PROXY=1): absolute-form request line,
+/// `proxy-authorization` from the proxy URL's userinfo. http.request follows
+/// node: it dials the target itself unless NODE_USE_ENV_PROXY=1 (or
+/// `--use-env-proxy` in NODE_OPTIONS) puts node's global agent behind the
+/// proxy, so a check of `res.socket.remoteAddress` sees the target, not the
+/// proxy. Measured on node v22.22.2: without the variable (or with `0` /
+/// `true`) the proxy sees nothing from http.get; with `1` it sees the
+/// absolute-form GET. Up to 0.16.2 oam sent http.request through the proxy
+/// regardless.
 #[test]
-fn fetch_and_http_honour_http_proxy_env() {
+fn fetch_honours_http_proxy_env_and_http_request_only_when_node_would() {
     let (proxy, heads) = spawn_recording_proxy(
         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
     );
@@ -5234,36 +5242,77 @@ fn fetch_and_http_honour_http_proxy_env() {
         r#"import http from 'node:http';
 const res = await fetch('http://example.invalid:81/x');
 console.log('fetch', res.status, await res.text());
-const got = await new Promise((resolve) => {
-  http.get('http://example.invalid:81/x', (r) => {
-    let b = '';
-    r.setEncoding('utf8');
-    r.on('data', (c) => (b += c));
-    r.on('end', () => resolve(r.statusCode + ' ' + b));
-  }).on('error', (e) => resolve('error ' + e.code + ' ' + e.message));
-});
-console.log('http.get', got);
+const target = http.createServer((q, r) => r.end('direct'));
+await new Promise((r) => target.listen(0, '127.0.0.1', r));
+const port = target.address().port;
+for (const [label, url] of [['name', 'http://example.invalid:81/x'], ['target', `http://127.0.0.1:${port}/y`]]) {
+  const got = await new Promise((resolve) => {
+    http.get(url, (r) => {
+      const via = r.socket.remotePort === port ? 'target' : 'proxy';
+      let b = '';
+      r.setEncoding('utf8');
+      r.on('data', (c) => (b += c));
+      r.on('end', () => resolve(r.statusCode + ' ' + b + ' ' + via));
+    }).on('error', (e) => resolve('error ' + e.code));
+  });
+  console.log('http.get', label, got);
+}
+target.close();
 "#,
     );
     let proxy_url = format!("http://u:p@127.0.0.1:{proxy}");
-    let out = oam_run_with_proxy_env(&script, &[("HTTP_PROXY", &proxy_url)]);
-    let (stdout, _) = run_script_ok(&script, out);
-    assert_eq!(
-        stdout.trim().replace("\r\n", "\n"),
-        "fetch 200 ok\nhttp.get 200 ok"
-    );
-    let heads = heads.lock().unwrap();
-    assert_eq!(heads.len(), 2, "{heads:?}");
-    for head in heads.iter() {
-        assert!(
-            head.starts_with("GET http://example.invalid:81/x HTTP/1.1\r\n"),
-            "{head}"
+    let run = |extra: &[(&str, &str)]| {
+        heads.lock().unwrap().clear();
+        let mut vars = vec![("HTTP_PROXY", proxy_url.as_str())];
+        vars.extend_from_slice(extra);
+        let out = oam_run_with_proxy_env(&script, &vars);
+        let (stdout, _) = run_script_ok(&script, out);
+        let seen = heads.lock().unwrap().clone();
+        (stdout.trim().replace("\r\n", "\n"), seen)
+    };
+
+    for extra in [
+        &[][..],
+        &[("NODE_USE_ENV_PROXY", "0")][..],
+        &[("NODE_USE_ENV_PROXY", "true")][..],
+    ] {
+        let (stdout, seen) = run(extra);
+        assert_eq!(
+            stdout,
+            "fetch 200 ok\nhttp.get name error ENOTFOUND\nhttp.get target 200 direct target",
+            "{extra:?}"
         );
-        assert!(
-            head.to_ascii_lowercase()
-                .contains("\r\nproxy-authorization: basic dtpw\r\n"),
-            "{head}"
+        assert_eq!(
+            seen.len(),
+            1,
+            "only fetch reaches the proxy ({extra:?}): {seen:?}"
         );
+    }
+
+    for extra in [
+        &[("NODE_USE_ENV_PROXY", "1")][..],
+        &[("NODE_OPTIONS", "--use-env-proxy")][..],
+    ] {
+        let (stdout, seen) = run(extra);
+        assert_eq!(
+            stdout, "fetch 200 ok\nhttp.get name 200 ok proxy\nhttp.get target 200 ok proxy",
+            "{extra:?}"
+        );
+        assert_eq!(seen.len(), 3, "{extra:?}: {seen:?}");
+        for head in &seen[..2] {
+            assert!(
+                head.starts_with("GET http://example.invalid:81/x HTTP/1.1\r\n"),
+                "{head}"
+            );
+        }
+        assert!(seen[2].starts_with("GET http://127.0.0.1:"), "{}", seen[2]);
+        for head in &seen {
+            assert!(
+                head.to_ascii_lowercase()
+                    .contains("\r\nproxy-authorization: basic dtpw\r\n"),
+                "{head}"
+            );
+        }
     }
 }
 
@@ -5271,6 +5320,8 @@ console.log('http.get', got);
 /// proxy credentials, and a refused tunnel keeps the texts the reqwest
 /// transport produced (measured on that build): fetch's cause is `error
 /// sending request for url (...)`, https.get emits ECONNRESET `socket hang up`.
+/// https.get goes through the proxy only where node's would: under
+/// NODE_USE_ENV_PROXY=1 (see fetch_honours_http_proxy_env_and_...).
 #[test]
 fn https_proxy_env_sends_connect_and_keeps_error_texts() {
     let (proxy, heads) =
@@ -5287,7 +5338,10 @@ console.log('https.get', got);
 "#,
     );
     let proxy_url = format!("http://u:p@127.0.0.1:{proxy}");
-    let out = oam_run_with_proxy_env(&script, &[("HTTPS_PROXY", &proxy_url)]);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("HTTPS_PROXY", &proxy_url), ("NODE_USE_ENV_PROXY", "1")],
+    );
     let (stdout, _) = run_script_ok(&script, out);
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
@@ -5323,14 +5377,28 @@ const url = 'http://127.0.0.1:__TARGET__/';
 try { await fetch(url); console.log('fetch resolved?!'); }
 catch (e) { console.log('fetch', e.message, '|', e.cause.message.replace('__TARGET__', 'P')); }
 const got = await new Promise((resolve) => {
-  http.get(url, () => resolve('response?!')).on('error', (e) => resolve(e.code + ' ' + e.message));
+  http.get(url, () => resolve('response?!')).on('error', (e) => resolve(e.code + ' ' + e.message.replace('__TARGET__', 'P')));
 });
 console.log('http.get', got);
 "#
         .replace("__TARGET__", &target.to_string()),
     );
     let socks_url = format!("socks5://127.0.0.1:{socks}");
+    // http.get dials the target itself, as node's does without
+    // NODE_USE_ENV_PROXY=1.
     let out = oam_run_with_proxy_env(&script, &[("ALL_PROXY", &socks_url)]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "fetch fetch failed | error sending request for url (http://127.0.0.1:P/)\n\
+         http.get ECONNREFUSED connect ECONNREFUSED 127.0.0.1:P"
+    );
+    // Under NODE_USE_ENV_PROXY=1 http.get takes the transport's rules, and
+    // the socks failure keeps its texts.
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("ALL_PROXY", &socks_url), ("NODE_USE_ENV_PROXY", "1")],
+    );
     let (stdout, _) = run_script_ok(&script, out);
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
@@ -5518,6 +5586,1042 @@ console.log('continued', tokens.length, 'still parked', tokens.some((t) => inter
         );
     }
     server.join().unwrap();
+}
+
+/// A TCP listener that counts the connections it accepts, for the net / tls
+/// lookup-permission tests: the refused runs must never arrive.
+fn counting_listener() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    (port, hits)
+}
+
+/// net.connect / tls.connect's `lookup` hook -- and so http.get's and
+/// https.get's -- decides where the granted NAME
+/// is dialled, so every address it answers is a `--permission` subject,
+/// checked as a connect naming that address directly is (`addr:port`): under
+/// `--allow-net=granted.invalid` a hook answering 127.0.0.1 is refused with
+/// ERR_ACCESS_DENIED before anything is dialled, and a grant that covers the
+/// address admits it. oam 0.16.2 ignored the option, so there was nothing to
+/// check; the rule is fetch's (`a_connect_lookup_answer_is_checked_against_
+/// the_net_permission`).
+#[test]
+fn a_net_or_tls_lookup_answer_is_checked_against_the_net_permission() {
+    let script = write_temp(
+        "net_lookup_permission/main.mjs",
+        r#"import net from 'node:net';
+import tls from 'node:tls';
+import http from 'node:http';
+import https from 'node:https';
+const port = Number(process.argv[2]);
+const lookup = (h, o, cb) => cb(null, [{ address: '127.0.0.1', family: 4 }]);
+const attempt = (name, start) => new Promise((res) => {
+  let s;
+  try { s = start(); } catch (e) { console.log(name, 'THROW', e.code); res(); return; }
+  s.on('error', (e) => {
+    console.log(name, e.code === 'ERR_ACCESS_DENIED' ? `DENIED ${JSON.stringify(e.resource)}` : 'NOT DENIED');
+    res();
+  });
+  s.on('connect', () => { console.log(name, 'CONNECTED'); s.destroy(); res(); });
+});
+await attempt('net', () => net.connect({ host: 'granted.invalid', port, lookup }));
+await attempt('tls', () => tls.connect({ host: 'granted.invalid', port, lookup, rejectUnauthorized: false }));
+const request = (name, mod) => new Promise((res) => {
+  const req = mod.get({ host: 'granted.invalid', port, lookup, rejectUnauthorized: false }, () => { console.log(name, 'RESPONSE'); res(); });
+  req.on('error', (e) => {
+    console.log(name, e.code === 'ERR_ACCESS_DENIED' ? `DENIED ${JSON.stringify(e.resource)}` : 'NOT DENIED');
+    res();
+  });
+});
+await request('http', http);
+await request('https', https);
+"#,
+    );
+    let path = script.to_str().unwrap().to_string();
+    let (port, hits) = counting_listener();
+    let port_arg = port.to_string();
+    let run = |grant: &str| {
+        let out = oam(&["--permission", grant, "--", &path, &port_arg]);
+        (
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .replace("\r\n", "\n"),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    let (stdout, stderr) = run("--allow-net=granted.invalid");
+    let resource = format!("\"127.0.0.1:{port}\"");
+    assert_eq!(
+        stdout,
+        format!(
+            "net DENIED {resource}\ntls DENIED {resource}\nhttp DENIED {resource}\nhttps DENIED {resource}"
+        ),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a refused answer must never be dialled"
+    );
+
+    // Granted by the address too: each dials it (the listener speaks neither
+    // TLS nor HTTP, so the others fail -- after the connection was made).
+    let (stdout, stderr) = run("--allow-net=granted.invalid,127.0.0.1");
+    assert_eq!(
+        stdout, "net CONNECTED\ntls NOT DENIED\nhttp NOT DENIED\nhttps NOT DENIED",
+        "stderr: {stderr}"
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+}
+
+/// oam's own resolver keeps a hostname grant working: the name's answer
+/// travels as a one-shot ticket the connect redeems, not as addresses JS
+/// hands back, so `--allow-net=localhost` still connects to `localhost`
+/// (resolved by oam) while the same addresses offered by a hook are refused.
+/// A replaced `dns.lookup` is a hook.
+#[test]
+fn the_default_resolver_keeps_a_hostname_grant_and_a_replaced_dns_lookup_does_not() {
+    let script = write_temp(
+        "net_lookup_ticket_grant/main.mjs",
+        r#"import net from 'node:net';
+import dns from 'node:dns';
+const port = Number(process.argv[2]);
+const attempt = (name) => new Promise((res) => {
+  const s = net.connect({ host: 'localhost', port });
+  s.on('error', (e) => { console.log(name, e.code === 'ERR_ACCESS_DENIED' ? 'DENIED' : `ERR ${e.code}`); res(); });
+  s.on('connect', () => { console.log(name, 'CONNECTED'); s.destroy(); res(); });
+});
+await attempt('resolver');
+const original = dns.lookup;
+dns.lookup = (h, o, cb) => cb(null, [{ address: '127.0.0.1', family: 4 }]);
+await attempt('replaced');
+dns.lookup = original;
+await attempt('restored');
+"#,
+    );
+    let path = script.to_str().unwrap().to_string();
+    let (port, hits) = counting_listener();
+    let out = oam(&[
+        "--permission",
+        "--allow-net=localhost",
+        "--",
+        &path,
+        &port.to_string(),
+    ]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .replace("\r\n", "\n"),
+        "resolver CONNECTED\nreplaced DENIED\nrestored CONNECTED",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+/// The connect natives are reachable from user JS (`__oam.node`), so the
+/// address spec they take is attacker input. An explicit address list is
+/// checked against the net grant (never trusted because the host was
+/// granted); a resolver ticket is one-shot, bound to the host it was resolved
+/// for, and gone once dropped; anything else is refused.
+#[test]
+fn the_connect_natives_refuse_a_forged_address_spec() {
+    let script = write_temp(
+        "net_lookup_forgery/main.mjs",
+        r#"const node = globalThis.__oam.node;
+const port = Number(process.argv[2]);
+const show = async (name, run) => {
+  try {
+    const r = await run();
+    console.log(name, 'CONNECTED');
+    node.tcpClose(r.handle);
+  } catch (e) {
+    console.log(name, e.code === 'ERR_ACCESS_DENIED' ? `DENIED ${JSON.stringify(e.resource)}` : `${e.name}: ${e.message}`);
+  }
+};
+await show('ips', () => node.tcpConnect('granted.invalid', port, 250, JSON.stringify({ ips: ['127.0.0.1'] })));
+await show('tls ips', () => node.tlsConnect('granted.invalid', port, 'x', undefined, false, undefined, undefined, '', '', 250, JSON.stringify({ ips: ['127.0.0.1'] })));
+const a = await node.netResolve('localhost', 0, true);
+await show('other host', () => node.tcpConnect('granted.invalid', port, 250, JSON.stringify({ ticket: a.token })));
+await show('reused', () => node.tcpConnect('localhost', port, 250, JSON.stringify({ ticket: a.token })));
+const b = await node.netResolve('localhost', 0, true);
+console.log('dropped', node.netResolveDrop(b.token), node.netResolveDrop(b.token));
+await show('after drop', () => node.tcpConnect('localhost', port, 250, JSON.stringify({ ticket: b.token })));
+await show('malformed', () => node.tcpConnect('localhost', port, 250, JSON.stringify({ ips: ['127.0.0.1'], ticket: 1 })));
+await show('not an ip', () => node.tcpConnect('localhost', port, 250, JSON.stringify({ ips: ['nope'] })));
+const c = await node.netResolve('localhost', 0, true);
+await show('ticket', () => node.tcpConnect('localhost', port, 250, JSON.stringify({ ticket: c.token })));
+// The resolver resolves only a name the grant covers.
+try {
+  await node.netResolve('ungranted.invalid', 0, true, port);
+  console.log('ungranted resolve RESOLVED');
+} catch (e) {
+  console.log('ungranted resolve', e.code === 'ERR_ACCESS_DENIED' ? `DENIED ${JSON.stringify(e.resource)}` : `${e.name}: ${e.message}`);
+}
+"#,
+    );
+    let path = script.to_str().unwrap().to_string();
+    let (port, hits) = counting_listener();
+    let out = oam(&[
+        "--permission",
+        "--allow-net=granted.invalid,localhost",
+        "--",
+        &path,
+        &port.to_string(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .replace("\r\n", "\n");
+    let expected = format!(
+        "ips DENIED \"127.0.0.1:{port}\"\n\
+         tls ips DENIED \"127.0.0.1:{port}\"\n\
+         other host Error: tcpConnect: resolve ticket TOKEN was issued for another host\n\
+         reused Error: tcpConnect: resolve ticket TOKEN is gone\n\
+         dropped true false\n\
+         after drop Error: tcpConnect: resolve ticket TOKEN is gone\n\
+         malformed TypeError: tcpConnect: the address spec must be {{ticket}} or {{ips}}\n\
+         not an ip Error: tcpConnect: pin ip 'nope' is not an IP\n\
+         ticket CONNECTED\n\
+         ungranted resolve DENIED \"ungranted.invalid:{port}\""
+    );
+    let redacted: String = stdout
+        .lines()
+        .map(|line| {
+            let mut words: Vec<String> = line.split(' ').map(str::to_string).collect();
+            for i in 1..words.len() {
+                if words[i - 1] == "ticket" && words[i].chars().all(|c| c.is_ascii_digit()) {
+                    words[i] = "TOKEN".to_string();
+                }
+            }
+            words.join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        redacted,
+        expected,
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Only the last, legitimate, connect arrived.
+    assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A connect vetoed in its 'lookup' listener drops its resolver ticket (none
+/// is left behind however many are vetoed), dials nothing, and holds nothing
+/// open: the run exits on its own. So does one whose hook never answers,
+/// once the socket is destroyed.
+#[test]
+fn a_vetoed_or_abandoned_lookup_leaves_nothing_behind() {
+    let script = write_temp(
+        "net_lookup_leak/main.mjs",
+        r#"import net from 'node:net';
+const node = globalThis.__oam.node;
+const resolve = node.netResolve;
+const tokens = [];
+node.netResolve = (...args) => resolve.apply(node, args).then((a) => { tokens.push(a.token); return a; });
+const port = Number(process.argv[2]);
+let vetoed = 0;
+for (let i = 0; i < 2000; i++) {
+  await new Promise((res) => {
+    const s = net.connect({ host: 'localhost', port });
+    s.once('lookup', () => s.destroy(new Error('veto')));
+    s.on('error', () => { vetoed++; res(); });
+  });
+}
+console.log('vetoed', vetoed, 'tokens', tokens.length, 'left', tokens.filter((t) => node.netResolveDrop(t)).length);
+const hung = net.connect({ host: 'never.invalid', port, lookup: () => {} });
+hung.on('error', () => {});
+setTimeout(() => hung.destroy(), 20);
+"#,
+    );
+    let path = script.to_str().unwrap().to_string();
+    let (port, hits) = counting_listener();
+    let started = std::time::Instant::now();
+    let out = oam(&[&path, &port.to_string()]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "vetoed 2000 tokens 2000 left 0",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success());
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a vetoed connect must dial nothing"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "the run must exit on its own"
+    );
+}
+
+/// http.request over an agent's socket, end to end against raw servers in the
+/// same script: a 10 MiB chunked response read through the bridge with a
+/// pause in the middle (memory stays bounded); a body streamed before the
+/// socket has connected; a server that closes before the head (`socket hang
+/// up`) or inside the body ('aborted'); HEAD, 204 and 304 (no body); a
+/// malformed status line (a coded parse error, no hang); and a request
+/// destroyed mid-response (the run still exits on its own). The agent path is
+/// forced with a `lookup` option (a name, mapped to 127.0.0.1).
+#[test]
+fn http_over_an_agent_socket_end_to_end() {
+    let src = r#"import http from 'node:http';
+import net from 'node:net';
+const map = (h, o, cb) => setTimeout(() => cb(null, [{ address: '127.0.0.1', family: 4 }]), 5);
+function serve(onRequest) {
+  const server = net.createServer((c) => {
+    c.on('error', () => {});
+    let head = '';
+    let handled = false;
+    c.on('data', (d) => {
+      head += d.toString('latin1');
+      if (handled || !head.includes('\r\n\r\n')) return;
+      const [top, rest] = [head.slice(0, head.indexOf('\r\n\r\n')), head.slice(head.indexOf('\r\n\r\n') + 4)];
+      if (/transfer-encoding: chunked/i.test(top) && !rest.endsWith('0\r\n\r\n')) return;
+      handled = true;
+      onRequest(c, top, rest);
+    });
+  });
+  return new Promise((r) => server.listen(0, '127.0.0.1', () => r(server)));
+}
+async function get(server, options = {}, write) {
+  const port = server.address().port;
+  return new Promise((resolve) => {
+    const req = http.request({ host: 'agent.test', port, lookup: map, ...options }, (res) => {
+      let bytes = 0;
+      const events = [`response ${res.statusCode}`];
+      res.on('data', (d) => { bytes += d.length; });
+      res.on('aborted', () => events.push('aborted'));
+      res.on('error', (e) => events.push(`res error ${e.code}`));
+      res.on('end', () => { events.push(`end ${bytes}`); resolve(events.join(' ')); });
+      res.on('close', () => { if (!res.complete) resolve(events.join(' ')); });
+    });
+    req.on('error', (e) => resolve(`error ${e.code} ${e.message.startsWith('Parse Error: ') ? 'Parse Error' : e.message}`));
+    if (write) write(req); else req.end();
+  });
+}
+
+// 10 MiB, chunked, written as the socket drains; the client pauses midway.
+{
+  const big = await serve(async (c) => {
+    c.write('HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n');
+    const chunk = Buffer.alloc(64 * 1024, 120);
+    for (let i = 0; i < 160; i++) {
+      const frame = Buffer.concat([Buffer.from(chunk.length.toString(16) + '\r\n'), chunk, Buffer.from('\r\n')]);
+      if (!c.write(frame)) await new Promise((r) => c.once('drain', r));
+    }
+    c.end('0\r\n\r\n');
+  });
+  const rss0 = process.memoryUsage().rss;
+  let peak = rss0;
+  const port = big.address().port;
+  const result = await new Promise((resolve) => {
+    http.get({ host: 'agent.test', port, lookup: map }, (res) => {
+      let bytes = 0;
+      let paused = false;
+      res.on('data', (d) => {
+        bytes += d.length;
+        peak = Math.max(peak, process.memoryUsage().rss);
+        if (!paused && bytes > 2 * 1024 * 1024) {
+          paused = true;
+          res.pause();
+          setTimeout(() => res.resume(), 200);
+        }
+      });
+      res.on('end', () => resolve(`big ${bytes}`));
+    }).on('error', (e) => resolve(`big error ${e.message}`));
+  });
+  console.log(result, 'bounded', peak - rss0 < 96 * 1024 * 1024);
+  big.close();
+}
+
+// A body streamed before the connection exists (the lookup answers later).
+{
+  const echo = await serve((c, top, rest) => {
+    const chunked = /transfer-encoding: chunked/i.test(top);
+    let body = '';
+    for (let r = rest; r.length > 0;) {
+      const n = parseInt(r, 16);
+      if (!n) break;
+      const start = r.indexOf('\r\n') + 2;
+      body += r.slice(start, start + n);
+      r = r.slice(start + n + 2);
+    }
+    c.end(`HTTP/1.1 200 OK\r\ncontent-length: ${body.length + 8}\r\nconnection: close\r\n\r\n${chunked ? 'chunked:' : 'lengthd:'}${body}`);
+  });
+  const result = await new Promise((resolve) => {
+    const req = http.request({ host: 'agent.test', port: echo.address().port, lookup: map, method: 'POST' }, (res) => {
+      let s = '';
+      res.on('data', (d) => (s += d));
+      res.on('end', () => resolve(`streamed ${s}`));
+    });
+    req.on('error', (e) => resolve(`streamed error ${e.message}`));
+    req.write('ab');
+    setTimeout(() => { req.write('cd'); setTimeout(() => req.end('ef'), 5); }, 1);
+  });
+  console.log(result);
+  echo.close();
+}
+
+const early = await serve((c) => c.destroy());
+console.log('closed before head:', await get(early));
+early.close();
+const mid = await serve((c) => c.end('HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort'));
+console.log('closed inside body:', await get(mid));
+mid.close();
+for (const [label, reply, method] of [
+  ['HEAD', 'HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\n', 'HEAD'],
+  ['204', 'HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n', 'GET'],
+  ['304', 'HTTP/1.1 304 Not Modified\r\ncontent-length: 5\r\nconnection: close\r\n\r\n', 'GET'],
+]) {
+  const s = await serve((c) => c.write(reply));
+  console.log(label + ':', await get(s, { method }));
+  s.close();
+}
+const junk = await serve((c) => c.write('NOT HTTP AT ALL\r\n\r\n'));
+console.log('malformed status line:', await get(junk));
+junk.close();
+
+// Destroyed mid-response, with the server still sending: nothing is left
+// holding the run open.
+const endless = await serve((c) => {
+  c.write('HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n');
+  const t = setInterval(() => c.write('5\r\nhello\r\n'), 5);
+  c.on('close', () => clearInterval(t));
+});
+await new Promise((resolve) => {
+  const req = http.get({ host: 'agent.test', port: endless.address().port, lookup: map }, (res) => {
+    res.once('data', () => { req.destroy(); resolve(); });
+    res.on('error', () => {});
+  });
+  req.on('error', () => {});
+});
+console.log('destroyed mid-response');
+endless.close();
+"#;
+    let started = std::time::Instant::now();
+    let stdout = run_ok("http_agent_path_e2e.mjs", src);
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        "big 10485760 bounded true\n\
+         streamed chunked:abcdef\n\
+         closed before head: error ECONNRESET socket hang up\n\
+         closed inside body: response 200 aborted res error ECONNRESET\n\
+         HEAD: response 200 end 0\n\
+         204: response 204 end 0\n\
+         304: response 304 end 0\n\
+         malformed status line: error HPE_INVALID_CONSTANT Parse Error\n\
+         destroyed mid-response"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "the run must exit on its own"
+    );
+}
+
+/// A keepAlive agent that overrides createConnection (agentkeepalive's and
+/// openai v4's shape) keeps its socket for the next request, as node's does:
+/// five sequential requests go over ONE server-side connection, each says
+/// `Connection: keep-alive`, the second on report `reusedSocket`, and the
+/// socket sits in `agent.freeSockets` between requests -- over http and over
+/// https (one TLS handshake). Up to 0.16.2 every request opened its own
+/// connection and said `Connection: close`.
+#[test]
+fn a_keepalive_agent_reuses_the_socket_its_createconnection_returned() {
+    let src = format!(
+        r#"
+import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
+import tls from 'node:tls';
+const cert = `{leaf}`;
+const key = `{key}`;
+const ca = `{ca}`;
+function serve(secure) {{
+  const stats = {{ connections: 0, headers: [] }};
+  const onConn = (c) => {{
+    stats.connections++;
+    let buf = '';
+    c.on('error', () => {{}});
+    c.on('data', (d) => {{
+      buf += d.toString('latin1');
+      let i;
+      while ((i = buf.indexOf('\r\n\r\n')) !== -1) {{
+        const head = buf.slice(0, i);
+        buf = buf.slice(i + 4);
+        stats.headers.push((/\r\nconnection: *([^\r]*)/i.exec(head) || [])[1]);
+        c.write('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok');
+      }}
+    }});
+  }};
+  const server = secure ? tls.createServer({{ cert, key }}, onConn) : net.createServer(onConn);
+  return new Promise((r) => server.listen(0, '127.0.0.1', () => r({{ server, stats }})));
+}}
+class OwnAgent extends http.Agent {{
+  createConnection(options, cb) {{ return net.createConnection(options, cb); }}
+}}
+class OwnHttpsAgent extends https.Agent {{
+  createConnection(options, cb) {{ return tls.connect(options, cb); }}
+}}
+for (const secure of [false, true]) {{
+  const {{ server, stats }} = await serve(secure);
+  const agent = secure ? new OwnHttpsAgent({{ keepAlive: true, ca }}) : new OwnAgent({{ keepAlive: true }});
+  const reused = [];
+  const pooled = [];
+  for (let i = 0; i < 5; i++) {{
+    const req = await new Promise((resolve, reject) => {{
+      const options = {{ host: '127.0.0.1', port: server.address().port, agent }};
+      if (secure) options.servername = 'localhost';
+      const req = (secure ? https : http).get(options, (res) => {{
+        res.resume();
+        res.on('end', () => resolve(req));
+      }});
+      req.on('error', reject);
+    }});
+    reused.push(req.reusedSocket);
+    pooled.push(Object.values(agent.freeSockets).reduce((n, list) => n + list.length, 0));
+  }}
+  console.log(`${{secure ? 'https' : 'http'}} connections=${{stats.connections}} requests=${{stats.headers.length}} sent=${{[...new Set(stats.headers)]}} reused=${{reused}} pooled=${{pooled}}`);
+  agent.destroy();
+  server.close();
+}}
+"#,
+        leaf = TLS_TEST_LEAF_CERT,
+        key = TLS_TEST_LEAF_KEY,
+        ca = TLS_TEST_CA_CERT,
+    );
+    let out = run_ok("keepalive_agent_pool.mjs", &src);
+    assert_eq!(
+        out,
+        "http connections=1 requests=5 sent=keep-alive reused=false,true,true,true,true pooled=1,1,1,1,1\n\
+         https connections=1 requests=5 sent=keep-alive reused=false,true,true,true,true pooled=1,1,1,1,1"
+    );
+}
+
+/// An http.get on oam's own transport is sent without waiting on a timer,
+/// and setImmediate is due at once. Each used to cost a whole OS timer tick
+/// (about 15 ms on Windows, 1 ms elsewhere): setImmediate was a 1 ms timer,
+/// and every request waited one after 'socket' -- 200 sequential http.get
+/// took about 60 times the same fetch loop. The bound is loose (3x the
+/// fetch loop, best of three) so a loaded machine does not trip it.
+#[test]
+fn sequential_http_requests_do_not_wait_on_a_timer() {
+    let src = r#"
+import http from 'node:http';
+const server = http.createServer((req, res) => res.end('ok'));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const N = 100;
+const get = () => new Promise((resolve, reject) => {
+  http.get({ host: '127.0.0.1', port, path: '/' }, (res) => { res.resume(); res.on('end', resolve); }).on('error', reject);
+});
+async function time(fn) {
+  let best = Infinity;
+  for (let round = 0; round < 3; round++) {
+    const t0 = performance.now();
+    for (let i = 0; i < N; i++) await fn();
+    best = Math.min(best, performance.now() - t0);
+  }
+  return best;
+}
+const viaFetch = await time(async () => { await (await fetch(`http://127.0.0.1:${port}/`)).text(); });
+const viaGet = await time(get);
+let t0 = performance.now();
+for (let i = 0; i < 200; i++) await new Promise((r) => setImmediate(r));
+const immediates = performance.now() - t0;
+console.log(`http.get within 3x of fetch: ${viaGet < 3 * viaFetch + 50} (get ${viaGet.toFixed(0)} ms, fetch ${viaFetch.toFixed(0)} ms)`);
+console.log(`200 immediates under 100 ms: ${immediates < 100} (${immediates.toFixed(0)} ms)`);
+server.close();
+"#;
+    let out = run_ok("sequential_http_latency.mjs", src);
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(
+        lines[0].starts_with("http.get within 3x of fetch: true"),
+        "{out}"
+    );
+    assert!(
+        lines[1].starts_with("200 immediates under 100 ms: true"),
+        "{out}"
+    );
+}
+
+/// Pooled sockets do not keep the process alive, as in node: the agent unrefs
+/// a socket it keeps, and a socket's idle timer (the global agent's 5 s, an
+/// agent's `timeout`) is an unref'd timer. The server is in this test
+/// process, so only the client's handles count.
+#[test]
+fn pooled_sockets_do_not_keep_the_process_alive() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let mut chunk = [0u8; 1024];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                    }
+                    while let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        buf.drain(..end + 4);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nkeep-alive: timeout=30\r\n\r\nok",
+                        );
+                    }
+                }
+            });
+        }
+    });
+    let src = format!(
+        r#"
+import http from 'node:http';
+import net from 'node:net';
+class OwnAgent extends http.Agent {{
+  createConnection(options, cb) {{ return net.createConnection(options, cb); }}
+}}
+const agent = new OwnAgent({{ keepAlive: true, timeout: 20000 }});
+const get = (options) => new Promise((resolve, reject) => {{
+  const req = http.get({{ host: '127.0.0.1', port: {port}, ...options }}, (res) => {{
+    res.resume();
+    res.on('end', resolve);
+  }});
+  // A watched socket sends the request over the global agent's socket.
+  req.on('socket', (s) => s.once('connect', () => {{}}));
+  req.on('error', reject);
+}});
+await get({{ agent }});
+await get({{}});
+const free = (a) => Object.values(a.freeSockets).reduce((n, list) => n + list.length, 0);
+console.log(`pooled ${{free(agent)}} ${{free(http.globalAgent)}}`);
+"#
+    );
+    let started = std::time::Instant::now();
+    let out = run_ok("pooled_sockets_exit.mjs", &src);
+    assert_eq!(out, "pooled 1 1");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(4),
+        "the run waited on its pooled sockets: {:?}",
+        started.elapsed()
+    );
+}
+
+/// Copy a directory tree (the vendored npm fixtures into a project's
+/// node_modules).
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+}
+
+/// The real https-proxy-agent tunnels an https request as it does under node:
+/// a CONNECT to the proxy, then TLS to the target over the proxy's socket
+/// (`tls.connect({ socket })`), checked against the target's own certificate
+/// -- so the proxy relays only ciphertext, never the request -- and a proxy
+/// that refuses the CONNECT has its answer delivered as the response. The
+/// packages are vendored under tests/fixtures/https-proxy-agent as published
+/// (https-proxy-agent 7.0.6, agent-base 7.1.4, debug 4.4.3, ms 2.1.3; MIT,
+/// each with its license; runtime files only). Up to 0.16.2 the TLS step
+/// failed with ERR_FEATURE_UNAVAILABLE_ON_PLATFORM.
+#[test]
+fn https_proxy_agent_tunnels_to_an_https_target() {
+    let src = r#"
+import https from 'node:https';
+import net from 'node:net';
+import { createRequire } from 'node:module';
+const { HttpsProxyAgent } = createRequire(import.meta.url)('https-proxy-agent');
+const cert = `__LEAF__`;
+const key = `__KEY__`;
+const ca = `__CA__`;
+const target = https.createServer({ cert, key }, (req, res) => res.end(`hello ${req.method} ${req.url}`));
+await new Promise((r) => target.listen(0, '127.0.0.1', r));
+const tport = target.address().port;
+function proxy(answer) {
+  const seen = { connects: [], tunnelled: '' };
+  const server = net.createServer((c) => {
+    c.on('error', () => {});
+    let head = '';
+    const onData = (d) => {
+      head += d.toString('latin1');
+      if (!head.includes('\r\n\r\n')) return;
+      c.removeListener('data', onData);
+      seen.connects.push(head.slice(0, head.indexOf('\r\n')).replace(`:${tport} `, ':PORT '));
+      if (answer !== 200) {
+        c.end(`HTTP/1.1 ${answer} Proxy Says No\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope`);
+        return;
+      }
+      const up = net.connect(tport, '127.0.0.1', () => {
+        c.write('HTTP/1.1 200 Connection established\r\n\r\n');
+        c.on('data', (d) => {
+          seen.tunnelled += d.toString('latin1');
+          up.write(d);
+        });
+        c.on('end', () => up.end());
+        up.pipe(c);
+      });
+      up.on('error', () => c.destroy());
+      c.on('close', () => up.destroy());
+    };
+    c.on('data', onData);
+  });
+  return new Promise((r) => server.listen(0, '127.0.0.1', () => r({ server, seen })));
+}
+const get = (url, agent) => new Promise((resolve) => {
+  const req = https.get(url, { agent, ca }, (res) => {
+    let body = '';
+    res.on('data', (d) => (body += d));
+    res.on('end', () => resolve(`${res.statusCode} ${body}`));
+  });
+  req.on('error', (e) => resolve(`error ${e.code} ${e.message}`));
+});
+{
+  const { server, seen } = await proxy(200);
+  const agent = new HttpsProxyAgent(`http://127.0.0.1:${server.address().port}`);
+  console.log(`response: ${await get(`https://localhost:${tport}/secret`, agent)}`);
+  console.log(`proxy saw: ${seen.connects.join(' / ')}`);
+  console.log(`tunnelled: ${seen.tunnelled.length > 0}, request visible to the proxy: ${seen.tunnelled.includes('/secret')}`);
+  server.close();
+}
+{
+  const { server } = await proxy(407);
+  const agent = new HttpsProxyAgent(`http://127.0.0.1:${server.address().port}`);
+  console.log(`refusing proxy: ${await get(`https://localhost:${tport}/`, agent)}`);
+  server.close();
+}
+target.close();
+"#
+    .replace("__LEAF__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY)
+    .replace("__CA__", TLS_TEST_CA_CERT);
+    let main = write_temp("https-proxy-agent-project/main.mjs", &src);
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/https-proxy-agent");
+    copy_tree(&fixture, &main.parent().unwrap().join("node_modules"));
+    let out = oam(&["run", main.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "response: 200 hello GET /secret\n\
+         proxy saw: CONNECT localhost:PORT HTTP/1.1\n\
+         tunnelled: true, request visible to the proxy: false\n\
+         refusing proxy: 407 nope",
+        "stderr: {stderr}"
+    );
+}
+
+/// An upgrade goes over a real socket: the ws library's shape
+/// (`createConnection: net.connect` / `tls.connect`, the upgrade headers) gets
+/// 'upgrade' with that socket and echoes over it, for ws and wss; and a
+/// `lookup` that refuses the host stops the upgrade before any connection.
+/// oam used to dial plain TCP itself for every upgrade, `lookup` ignored and
+/// https included.
+#[test]
+fn an_upgrade_goes_over_the_socket_createconnection_returns() {
+    let src = r#"import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
+import tls from 'node:tls';
+const cert = `__CERT__`;
+const key = `__KEY__`;
+let connections = 0;
+let injected = false;
+const onConn = (c) => {
+  connections++;
+  c.on('error', () => {});
+  let head = '';
+  let upgraded = false;
+  c.on('data', (d) => {
+    if (upgraded) { c.write(d); return; }
+    head += d.toString('latin1');
+    if (/x-injected/i.test(head)) injected = true;
+    if (!head.includes('\r\n\r\n')) return;
+    upgraded = true;
+    c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n');
+  });
+};
+const plain = net.createServer(onConn);
+const secure = tls.createServer({ cert, key }, onConn);
+secure.on('tlsClientError', () => {});
+await new Promise((r) => plain.listen(0, '127.0.0.1', r));
+await new Promise((r) => secure.listen(0, '127.0.0.1', r));
+const headers = { Connection: 'Upgrade', Upgrade: 'echo' };
+function upgrade(label, mod, options, extra = {}) {
+  return new Promise((resolve) => {
+    let req;
+    try { req = mod.request({ ...options, headers: { ...headers, ...extra } }); } catch (e) { resolve(`${label} threw ${e.code}`); return; }
+    req.on('upgrade', (res, socket, rest) => {
+      socket.once('data', (d) => {
+        resolve(`${label} ${res.statusCode} echo=${d.toString()} tls=${socket.encrypted === true} rest=${rest.length}`);
+        socket.destroy();
+      });
+      socket.write('ping');
+    });
+    req.on('error', (e) => resolve(`${label} error ${e.code}`));
+    req.end();
+  });
+}
+const netConnect = (o) => { o.path = o.socketPath; return net.connect(o); };
+const tlsConnect = (o) => { o.path = undefined; return tls.connect(o); };
+console.log(await upgrade('ws', http, { host: '127.0.0.1', port: plain.address().port, createConnection: netConnect }));
+console.log(await upgrade('wss', https, { host: '127.0.0.1', port: secure.address().port, createConnection: tlsConnect, rejectUnauthorized: false }));
+console.log(await upgrade('plain request', http, { host: '127.0.0.1', port: plain.address().port }));
+const before = connections;
+const refuse = (h, o, cb) => cb(Object.assign(new Error('no'), { code: 'EREFUSED_BY_HOOK' }));
+console.log(await upgrade('refused', http, { host: 'ws.test', port: plain.address().port, createConnection: netConnect, lookup: refuse }));
+await new Promise((r) => setTimeout(r, 50));
+console.log('connections after refusal', connections - before);
+// The upgrade head is written by hand: a header value carrying CR / LF is
+// refused, never sent.
+console.log(await upgrade('crlf', http, { host: '127.0.0.1', port: plain.address().port }, { 'X-Bad': 'a\r\nX-Injected: 1' }));
+await new Promise((r) => setTimeout(r, 50));
+console.log('injected header reached the server', injected);
+plain.close();
+secure.close();
+"#
+    .replace("__CERT__", TLS_TEST_CERT)
+    .replace("__KEY__", TLS_TEST_KEY);
+    let stdout = run_ok("http_upgrade_over_socket.mjs", &src);
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        "ws 101 echo=ping tls=false rest=0\n\
+         wss 101 echo=ping tls=true rest=0\n\
+         plain request 101 echo=ping tls=false rest=0\n\
+         refused error EREFUSED_BY_HOOK\n\
+         connections after refusal 0\n\
+         crlf error ERR_INVALID_CHAR\n\
+         injected header reached the server false"
+    );
+}
+
+/// What an upgrade request reads off its socket is bounded, as node's parser
+/// bounds it: a response head that never ends fails with
+/// `HPE_HEADER_OVERFLOW` once it passes 16 KiB, and a non-101 answer whose
+/// body nobody reads stops the socket being read. Both used to grow without
+/// limit.
+#[test]
+fn an_upgrade_response_is_bounded() {
+    let src = r#"import http from 'node:http';
+import net from 'node:net';
+function hostile(kind) {
+  const server = net.createServer((sock) => {
+    sock.on('error', () => {});
+    sock.once('data', () => {
+      sock.write(kind === 'head' ? 'HTTP/1.1 101 Switching Protocols\r\nX-Long: ' : 'HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n');
+      const chunk = Buffer.alloc(64 * 1024, 97);
+      const pump = () => {
+        while (server.sent < 64 * 1024 * 1024) {
+          server.sent += chunk.length;
+          if (!sock.write(chunk)) return sock.once('drain', pump);
+        }
+      };
+      pump();
+    });
+  });
+  server.sent = 0;
+  return new Promise((r) => server.listen(0, '127.0.0.1', () => r(server)));
+}
+const headers = { Connection: 'Upgrade', Upgrade: 'websocket' };
+{
+  const server = await hostile('head');
+  const started = Date.now();
+  const result = await new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port: server.address().port, headers });
+    req.on('upgrade', () => resolve('upgraded?!'));
+    req.on('error', (e) => resolve(`error ${e.code} fast=${Date.now() - started < 5000}`));
+    req.end();
+  });
+  console.log('endless head:', result);
+  server.close();
+}
+{
+  const server = await hostile('body');
+  const result = await new Promise((resolve) => {
+    const req = http.request({ host: '127.0.0.1', port: server.address().port, headers });
+    req.on('response', (res) => {
+      res.pause();
+      setTimeout(() => {
+        resolve(`response ${res.statusCode}, unread body bounded=${server.sent < 32 * 1024 * 1024}`);
+        req.destroy();
+      }, 1500);
+    });
+    req.on('error', (e) => resolve(`error ${e.code}`));
+    req.end();
+  });
+  console.log('unread body:', result);
+  server.close();
+}
+"#;
+    assert_eq!(
+        run_ok("http_upgrade_bounds.mjs", src).replace("\r\n", "\n"),
+        "endless head: error HPE_HEADER_OVERFLOW fast=true\n\
+         unread body: response 200, unread body bounded=true"
+    );
+}
+
+/// fetch resolves a name through a replaced `dns.lookup`, as node's does
+/// (net.connect calls it for every connection undici opens): a refusal fails
+/// the fetch closed -- `TypeError: fetch failed` with the guard's error as the
+/// cause -- and the server never sees the request; with the original put
+/// back, fetch goes out as usual.
+#[test]
+fn fetch_resolves_through_a_replaced_dns_lookup() {
+    let src = r#"import http from 'node:http';
+import dns from 'node:dns';
+let hits = 0;
+const server = http.createServer((req, res) => { hits++; res.end('ok'); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const original = dns.lookup;
+const guard = Object.assign(new Error('guarded'), { code: 'EGUARD' });
+const calls = [];
+dns.lookup = (host, opts, cb) => { calls.push(`${host} ${JSON.stringify(opts)}`); cb(guard); };
+try {
+  await fetch(`http://localhost:${port}/`);
+  console.log('refused: fetched?!');
+} catch (e) {
+  console.log('refused:', e.name, e.message, 'cause is the guard', e.cause === guard);
+}
+console.log('calls', JSON.stringify(calls), 'hits', hits);
+dns.lookup = original;
+const r = await fetch(`http://localhost:${port}/`);
+console.log('restored:', r.status, await r.text(), 'hits', hits);
+server.close();
+"#;
+    let stdout = run_ok("fetch_replaced_dns_lookup.mjs", src);
+    let hints = if cfg!(windows) {
+        0
+    } else if cfg!(any(target_os = "macos", target_os = "freebsd")) {
+        1024
+    } else {
+        32
+    };
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        format!(
+            "refused: TypeError fetch failed cause is the guard true\n\
+             calls [\"localhost {{\\\"hints\\\":{hints},\\\"all\\\":true}}\"] hits 0\n\
+             restored: 200 ok hits 1"
+        )
+    );
+}
+
+/// http.request never goes near globalThis.fetch: replacing it (a test mock,
+/// an instrumentation shim) intercepts fetch() and nothing else, as in node.
+#[test]
+fn replacing_global_fetch_does_not_intercept_http_request() {
+    let src = r#"import http from 'node:http';
+const server = http.createServer((req, res) => res.end('real'));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+globalThis.fetch = () => { throw new Error('intercepted'); };
+const body = await new Promise((resolve, reject) => {
+  http.get(`http://127.0.0.1:${server.address().port}/`, (res) => {
+    let s = '';
+    res.on('data', (d) => (s += d));
+    res.on('end', () => resolve(s));
+  }).on('error', reject);
+});
+console.log('http.get', body);
+server.close();
+"#;
+    assert_eq!(run_ok("global_fetch_replaced.mjs", src), "http.get real");
+}
+
+/// On the fetch transport, an https request's socket is a TLSSocket carrying
+/// the connection the transport used: the dialled peer, the local port the
+/// server saw, the verifier's verdict and the peer certificate (a post-hoc
+/// pinning check reads the real one) -- for a fresh connection and again for
+/// a pooled one. The CA is trusted through NODE_EXTRA_CA_CERTS, which the
+/// transport's platform verifier honours. Not on macOS: Security.framework
+/// caps a server certificate's validity at 825 days, and this 100-year leaf
+/// is refused there for that reason alone.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn an_https_socket_on_the_fetch_transport_reports_its_connection() {
+    let bundle = write_temp("fetch-socket-extra-ca/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import https from 'node:https';
+import tls from 'node:tls';
+const seen = [];
+const conns = new Set();
+const server = tls.createServer({ cert: `__CERT__`, key: `__KEY__` }, (c) => {
+  conns.add(c);
+  c.on('error', () => {});
+  let buf = '';
+  c.on('data', (d) => {
+    buf += d.toString('latin1');
+    while (buf.includes('\r\n\r\n')) {
+      buf = buf.slice(buf.indexOf('\r\n\r\n') + 4);
+      seen.push(c.remotePort);
+      c.write('HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok');
+    }
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+for (const label of ['fresh', 'pooled']) {
+  const line = await new Promise((resolve, reject) => {
+    https.get(`https://localhost:${port}/`, (res) => {
+      const s = res.socket;
+      const facts = [
+        s instanceof tls.TLSSocket,
+        s === res.req.socket,
+        s.remoteAddress,
+        s.remotePort === port,
+        s.remoteFamily,
+        s.localPort === seen[seen.length - 1],
+        s.encrypted,
+        s.authorized,
+        s.getPeerCertificate().subject.CN,
+        /^TLSv1\.[23]$/.test(s.getProtocol()),
+      ];
+      res.resume();
+      res.on('end', () => resolve(`${label} ${facts.join(' ')}`));
+    }).on('error', reject);
+  });
+  console.log(line);
+}
+console.log('one connection', new Set(seen).size === 1);
+// The client pools the connection; close it from the server so the run ends.
+for (const c of conns) c.destroy();
+server.close();
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("fetch_socket_extra_ca/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "fresh true true 127.0.0.1 true IPv4 true true true localhost true\n\
+         pooled true true 127.0.0.1 true IPv4 true true true localhost true\n\
+         one connection true",
+        "stderr: {stderr}"
+    );
 }
 
 /// A thread-per-connection HTTP/1.1 server for the redirect-permission test:
@@ -5793,8 +6897,10 @@ console.log(lines.join('\n'));
             "fetch ip 200 inner /fetch/ip",
             "fetch hex 200 inner /fetch/hex",
             r#"fetch307 localhost DENIED Net "localhost""#,
-            r#"http localhost DENIED Net "localhost""#,
-            "http ip 200 inner /http/ip",
+            // http.request follows no redirect, as in node: the 3xx is the
+            // response, and neither hop is dialled.
+            "http localhost 302 ",
+            "http ip 302 ",
             r#"undici localhost DENIED Net "localhost""#,
             "undici ip 200 inner /undici/ip",
             r#"hook denied DENIED Net "denied.invalid""#,
@@ -5815,7 +6921,6 @@ console.log(lines.join('\n'));
         [
             "GET /fetch/ip",
             "GET /fetch/hex",
-            "GET /http/ip",
             "GET /undici/ip",
             "GET /hook/granted",
         ]
@@ -5824,10 +6929,11 @@ console.log(lines.join('\n'));
         assert!(seen.is_empty(), "a refused IPv6 hop was dialled: {seen:?}");
     }
 
-    // No --permission, and a bare --allow-net: the redirects are followed.
+    // No --permission, and a bare --allow-net: fetch and undici follow the
+    // redirects; http.request still returns the 3xx.
     let followed = [
         "fetch localhost 200 inner /fetch/localhost",
-        "http localhost 200 inner /http/localhost",
+        "http localhost 302 ",
         "undici localhost 200 inner /undici/localhost",
         "hook denied 200 inner /hook/denied",
         r#"hook-calls ["granted.invalid","denied.invalid"]"#,
@@ -5837,7 +6943,7 @@ console.log(lines.join('\n'));
     for flags in [&[][..], &["--permission", "--allow-net"][..]] {
         let (stdout, stderr, inner_seen, _) = run(flags, "off");
         assert_eq!(stdout, followed, "{flags:?} stderr: {stderr}");
-        assert_eq!(inner_seen.len(), 4, "{flags:?}: {inner_seen:?}");
+        assert_eq!(inner_seen.len(), 3, "{flags:?}: {inner_seen:?}");
     }
 }
 
@@ -12114,6 +13220,9 @@ fn http_request_and_get_client() {
              console.log('setHeader:', req2.getHeader('x-test') === 'val');\n\
              req2.removeHeader('x-test');\n\
              console.log('removeHeader:', req2.getHeader('x-test') === undefined);\n\
+             // node: destroyed before its response, the request fails with\n\
+             // 'socket hang up' (unhandled, that 'error' ends the process).\n\
+             req2.on('error', (e) => console.log('destroy_hang_up:', e.code === 'ECONNRESET' && e.message === 'socket hang up'));\n\
              req2.destroy();",
             port = addr.port(),
         ),
@@ -12124,6 +13233,10 @@ fn http_request_and_get_client() {
             "assertion failed: {line}\nfull output: {stdout}"
         );
     }
+    assert!(
+        stdout.contains("destroy_hang_up: true"),
+        "no 'socket hang up' from the destroyed request: {stdout}"
+    );
 }
 
 #[test]
@@ -14961,7 +16074,8 @@ console.log('ear_listeners=' + ear.listenerCount('test'));
         "Agent=function",
         "agent_keepAlive=true",
         "agent_maxSockets=Infinity",
-        "agent_getName=x.com:443",
+        // node's getName: host:port:localAddress, the last field empty.
+        "agent_getName=x.com:443:",
         "maxHeaderSize=16384",
         "validateName=ok",
         "validateValue=ok",
@@ -16766,10 +17880,10 @@ process.exit(0);
 /// its pin to the handshake and, for a range with nothing to offer, binds and
 /// refuses each handshake with the alert (the shape that used to hang the
 /// client -- bounded here by the harness timeout); https.request validates
-/// the options synchronously on both of its paths, carries the pin on the
-/// non-verifying one, and says ONCE, on stderr, that the verifying path's
-/// shared client does not take it. All measured on Node v22.22.2 except the
-/// warning, which is oam's own.
+/// the options synchronously and carries the pin, verifying or not: a request
+/// with a pin goes over tls.connect, which honours it, so the warning the
+/// shared client used to print about dropping it has nothing left to say.
+/// All measured on Node v22.22.2.
 #[test]
 fn https_min_max_version_threads_pins_and_warns_once_on_the_shared_client() {
     let src = format!(
@@ -16833,10 +17947,11 @@ function viaRequest(opts) {{
 console.log('rejectFalseMax1.2=' + await viaRequest({{ rejectUnauthorized: false, maxVersion: 'TLSv1.2' }}));
 console.log('rejectFalseSp1.2=' + await viaRequest({{ rejectUnauthorized: false, secureProtocol: 'TLSv1_2_method' }}));
 console.log('rejectFalseDefault=' + await viaRequest({{ rejectUnauthorized: false }}));
+// A verifying request carries its pin too.
+console.log('verifyingMax1.2=' + await viaRequest({{ ca: cert, servername: 'localhost', maxVersion: 'TLSv1.2' }}));
 await new Promise((r) => echo.close(r));
 
-// The verifying path: a pin that changes nothing stays quiet; one that would
-// change the negotiated version warns, once, however many times it is asked.
+// No pin is dropped any more, so nothing warns about one.
 let warnings = 0;
 process.on('warning', (w) => {{ if (String(w.message).includes('minVersion, maxVersion and secureProtocol are not applied')) warnings++; }});
 function verifying(opts) {{
@@ -16904,14 +18019,18 @@ process.exit(0);
         stdout.contains("rejectFalseDefault=proto=TLSv1.3"),
         "stdout: {stdout}"
     );
+    assert!(
+        stdout.contains("verifyingMax1.2=proto=TLSv1.2"),
+        "stdout: {stdout}"
+    );
     assert!(stdout.contains("quietPins=0"), "stdout: {stdout}");
-    assert!(stdout.contains("loudPins=1"), "stdout: {stdout}");
+    assert!(stdout.contains("loudPins=0"), "stdout: {stdout}");
     assert_eq!(
         stderr
             .matches("minVersion, maxVersion and secureProtocol are not applied")
             .count(),
-        1,
-        "the shared-client warning prints once.\nstderr: {stderr}"
+        0,
+        "no pin is dropped, so nothing warns.\nstderr: {stderr}"
     );
 }
 
@@ -18020,9 +19139,12 @@ server.close();
 
 // Drive an https (rejectUnauthorized:false) client against a raw TLS server
 // that writes a fixed (possibly malformed/truncated) HTTP/1.1 response then
-// closes. `resp_js` is a JS string literal for the bytes to send. Asserts the
-// request surfaces an error whose code contains `expect_code`.
-fn https_client_error_case(name: &str, resp_js: &str, expect_code: &str) {
+// closes. `resp_js` is a JS string literal for the bytes to send. Asserts how
+// the exchange ends, `expect` being node's (v22.22.2, measured): a response
+// the peer cuts short is `aborted` -- 'aborted' on the response, never its
+// 'end', and no error on the request -- while a malformed chunk-size line is
+// also a parse error on the request, which comes first.
+fn https_client_error_case(name: &str, resp_js: &str, expect: &str) {
     let src = r#"
 import tls from 'node:tls';
 import https from 'node:https';
@@ -18039,6 +19161,7 @@ let result = 'none';
 const req = https.get(`https://127.0.0.1:${port}/`, { rejectUnauthorized: false }, (res) => {
   res.on('data', () => {});
   res.on('end', () => { if (result === 'none') result = 'end'; });
+  res.on('aborted', () => { if (result === 'none') result = 'aborted'; });
 });
 req.on('error', (e) => { if (result === 'none') result = 'error:' + (e && e.code); });
 await new Promise((r) => setTimeout(r, 800));
@@ -18058,12 +19181,8 @@ server.close();
         out.status
     );
     assert!(
-        stdout.contains("result=error:"),
-        "expected an error, got: {stdout}"
-    );
-    assert!(
-        stdout.contains(expect_code),
-        "expected code {expect_code}, got: {stdout}"
+        stdout.contains(&format!("result={expect}")),
+        "expected result={expect}, got: {stdout}"
     );
 }
 
@@ -18074,7 +19193,7 @@ fn https_client_content_length_truncation_errors() {
     https_client_error_case(
         "https_len_trunc.mjs",
         r#"'HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort'"#,
-        "result=error:",
+        "aborted",
     );
 }
 
@@ -18085,7 +19204,7 @@ fn https_client_chunked_truncation_errors() {
     https_client_error_case(
         "https_chunk_trunc.mjs",
         r#"'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n'"#,
-        "result=error:",
+        "aborted",
     );
 }
 
@@ -18096,7 +19215,7 @@ fn https_client_malformed_chunk_size_errors() {
     https_client_error_case(
         "https_chunk_bad.mjs",
         r#"'HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nGG\r\nxxxx\r\n'"#,
-        "HPE_INVALID_CHUNK_SIZE",
+        "error:HPE_INVALID_CHUNK_SIZE",
     );
 }
 
@@ -24798,4 +25917,65 @@ show('low', [low.serialNumber, low.toLegacyObject().serialNumber]);
             "missing {expected}\nstdout: {stdout}"
         );
     }
+}
+
+/// node connects a socket given `path` (http.request's `socketPath`) to that
+/// Unix domain socket or named pipe, whatever `host` and `port` say, and
+/// never to host:port. oam has no client for either, so the connect fails
+/// with ERR_FEATURE_UNAVAILABLE_ON_PLATFORM -- and nothing reaches the TCP
+/// listener at host:port. Up to 0.16.2 every one of these connected to it
+/// (http.get sent the whole request there).
+#[test]
+fn a_pipe_path_never_falls_back_to_host_and_port() {
+    let script = write_temp(
+        "pipe_path_refused/main.mjs",
+        r#"import net from 'node:net';
+import tls from 'node:tls';
+import http from 'node:http';
+import https from 'node:https';
+let reached = 0;
+const tcp = net.createServer((c) => { reached++; c.destroy(); });
+await new Promise((r) => tcp.listen(0, '127.0.0.1', r));
+const port = tcp.address().port;
+const pipe = process.platform === 'win32' ? '\\.\pipe\oam-e2e-missing-' + process.pid : '/tmp/oam-e2e-missing-' + process.pid;
+const settle = (s) => new Promise((resolve) => {
+  s.on('connect', () => { resolve('connect'); s.destroy(); });
+  s.on('secureConnect', () => { resolve('secureConnect'); s.destroy(); });
+  s.on('error', (e) => resolve(e.code));
+});
+const request = (mod, o) => new Promise((resolve) => {
+  const q = mod.get(o, (res) => { res.resume(); resolve('response ' + res.statusCode); });
+  q.on('error', (e) => resolve(e.code));
+});
+const out = [];
+out.push('net.connect({path}) ' + await settle(net.connect({ path: pipe, host: '127.0.0.1', port })));
+out.push('net.connect(path) ' + await settle(net.connect(pipe)));
+out.push('net.createConnection(path, cb) ' + await settle(net.createConnection(pipe, () => {})));
+out.push('tls.connect({path}) ' + await settle(tls.connect({ path: pipe, host: '127.0.0.1', port, rejectUnauthorized: false })));
+out.push('http.get({socketPath}) ' + await request(http, { socketPath: pipe, host: '127.0.0.1', port, path: '/x' }));
+out.push('https.get({socketPath}) ' + await request(https, { socketPath: pipe, host: '127.0.0.1', port, path: '/x', rejectUnauthorized: false }));
+out.push('http.get({socketPath}) over a keepAlive agent ' + await request(http, { socketPath: pipe, host: '127.0.0.1', port, agent: new http.Agent({ keepAlive: true }) }));
+let thrown;
+try { net.connect({ path: 7 }); } catch (e) { thrown = e.code; }
+out.push('net.connect({path: 7}) throws ' + thrown);
+await new Promise((r) => setTimeout(r, 200));
+out.push('tcp listener reached ' + reached);
+console.log(out.join('\n'));
+tcp.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "net.connect({path}) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
+         net.connect(path) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
+         net.createConnection(path, cb) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
+         tls.connect({path}) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
+         http.get({socketPath}) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
+         https.get({socketPath}) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
+         http.get({socketPath}) over a keepAlive agent ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
+         net.connect({path: 7}) throws ERR_INVALID_ARG_TYPE\n\
+         tcp listener reached 0"
+    );
 }

@@ -17,7 +17,9 @@
 
 use std::sync::{Arc, OnceLock};
 
-use rustls::ClientConfig;
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, SignatureScheme};
 
 /// The two client configs a transport uses.
 #[derive(Clone)]
@@ -82,7 +84,83 @@ fn build_platform() -> Result<TlsConfigs, String> {
         .with_protocol_versions(rustls::ALL_VERSIONS)
         .map_err(|e| e.to_string())?
         .dangerous()
-        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_custom_certificate_verifier(Arc::new(NodeNamedRefusals {
+            inner: Arc::new(verifier),
+        }))
         .with_no_client_auth();
     Ok(TlsConfigs::from_client_config(config))
+}
+
+/// The platform verifier, its refusals named as Node names them
+/// (`crate::tls::refusal_in_node_terms`): `UNABLE_TO_VERIFY_LEAF_SIGNATURE`,
+/// `DEPTH_ZERO_SELF_SIGNED_CERT`, `CERT_HAS_EXPIRED`,
+/// `ERR_TLS_CERT_ALTNAME_INVALID`, ... A named refusal leaves the handshake
+/// as `CertificateError::Other(NodeCertRefusal)`, which the transport reports
+/// with that code (`SendError::to_outcome`); fetch's cause and http.request's
+/// error then carry it, as tls.connect's do, where they said only that the
+/// request failed (and http.request `socket hang up`). What is accepted is
+/// the platform verifier's call alone.
+#[derive(Debug)]
+struct NodeNamedRefusals {
+    inner: Arc<dyn ServerCertVerifier>,
+}
+
+impl ServerCertVerifier for NodeNamedRefusals {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        self.inner
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+            .map_err(|error| {
+                match crate::tls::refusal_in_node_terms(
+                    end_entity,
+                    intermediates,
+                    server_name,
+                    now,
+                    &error,
+                ) {
+                    Some(failure) if failure.code.is_some() => {
+                        rustls::Error::InvalidCertificate(CertificateError::Other(
+                            rustls::OtherError(Arc::new(crate::tls::NodeCertRefusal(failure))),
+                        ))
+                    }
+                    _ => error,
+                }
+            })
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+
+    fn requires_raw_public_keys(&self) -> bool {
+        self.inner.requires_raw_public_keys()
+    }
+
+    fn root_hint_subjects(&self) -> Option<&[rustls::DistinguishedName]> {
+        self.inner.root_hint_subjects()
+    }
 }

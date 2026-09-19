@@ -36,15 +36,20 @@ use x509_parser::time::ASN1Time;
 
 type ClientStream = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
 type ServerStream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+/// A client over a pipe JS pumps to a socket it already has
+/// (`tls.connect({ socket })`, crate::byte_pipe).
+type WrappedStream = tokio_rustls::client::TlsStream<tokio::io::DuplexStream>;
 
 enum TlsReader {
     Client(ReadHalf<ClientStream>),
     Server(ReadHalf<ServerStream>),
+    Wrapped(ReadHalf<WrappedStream>),
 }
 
 enum TlsWriter {
     Client(WriteHalf<ClientStream>),
     Server(WriteHalf<ServerStream>),
+    Wrapped(WriteHalf<WrappedStream>),
 }
 
 #[derive(Default)]
@@ -420,6 +425,99 @@ impl VerifyFailure {
     }
 }
 
+/// A refusal in Node's terms carried out of a verifier that is not
+/// [`NodeCertVerifier`] -- the fetch transport's platform verifier -- as
+/// `CertificateError::Other`, so the transport can report Node's code
+/// (`http_client::transport`).
+#[derive(Debug)]
+pub struct NodeCertRefusal(pub VerifyFailure);
+
+impl std::fmt::Display for NodeCertRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.message)
+    }
+}
+
+impl std::error::Error for NodeCertRefusal {}
+
+/// Node's name for a certificate another verifier refused with `error`: the
+/// validity period first (OpenSSL's precedence, as in
+/// [`NodeCertVerifier::verdict`]), then the refusal itself -- a name mismatch
+/// by Node's `checkServerIdentity`, an unknown issuer by the chain the peer
+/// presented. None when Node has no name for it (or its own check would
+/// have accepted the name), and the caller keeps the error it had.
+pub(crate) fn refusal_in_node_terms(
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+    server_name: &ServerName<'_>,
+    now: UnixTime,
+    error: &rustls::Error,
+) -> Option<VerifyFailure> {
+    if let Some((failure, _)) = validity_refusal(end_entity, now) {
+        return Some(failure);
+    }
+    let rustls::Error::InvalidCertificate(reason) = error else {
+        return None;
+    };
+    match reason {
+        CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
+            check_server_identity(server_name, end_entity.as_ref()).err()
+        }
+        CertificateError::UnknownIssuer => {
+            Some(classify_unknown_issuer(end_entity, intermediates, &[]))
+        }
+        reason => named_refusal(reason),
+    }
+}
+
+/// A leaf outside its validity period: `CERT_HAS_EXPIRED` /
+/// `CERT_NOT_YET_VALID`, whatever else is wrong with it.
+fn validity_refusal(
+    end_entity: &CertificateDer<'_>,
+    now: UnixTime,
+) -> Option<(VerifyFailure, rustls::Error)> {
+    let (_, leaf) = parse_x509_certificate(end_entity.as_ref()).ok()?;
+    let at = ASN1Time::from_timestamp(now.as_secs() as i64).ok()?;
+    let validity = leaf.validity();
+    if at.timestamp() > validity.not_after.timestamp() {
+        return Some((
+            VerifyFailure::named("CERT_HAS_EXPIRED", "certificate has expired"),
+            CertificateError::Expired.into(),
+        ));
+    }
+    if at.timestamp() < validity.not_before.timestamp() {
+        return Some((
+            VerifyFailure::named("CERT_NOT_YET_VALID", "certificate is not yet valid"),
+            CertificateError::NotValidYet.into(),
+        ));
+    }
+    None
+}
+
+/// The refusals whose Node name follows from rustls's reason alone.
+fn named_refusal(reason: &CertificateError) -> Option<VerifyFailure> {
+    Some(match reason {
+        CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
+            VerifyFailure::named("CERT_HAS_EXPIRED", "certificate has expired")
+        }
+        CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => {
+            VerifyFailure::named("CERT_NOT_YET_VALID", "certificate is not yet valid")
+        }
+        CertificateError::Revoked => VerifyFailure::named("CERT_REVOKED", "certificate revoked"),
+        CertificateError::BadSignature => {
+            VerifyFailure::named("CERT_SIGNATURE_FAILURE", "certificate signature failure")
+        }
+        CertificateError::InvalidPurpose | CertificateError::InvalidPurposeContext { .. } => {
+            VerifyFailure::named("INVALID_PURPOSE", "unsupported certificate purpose")
+        }
+        CertificateError::UnhandledCriticalExtension => VerifyFailure::named(
+            "UNHANDLED_CRITICAL_EXTENSION",
+            "unhandled critical extension",
+        ),
+        _ => return None,
+    })
+}
+
 /// Where the verifier leaves its verdict for `tls_connect` to read after
 /// the handshake: None means the certificate was accepted.
 type VerifySlot = Arc<Mutex<Option<VerifyFailure>>>;
@@ -526,22 +624,8 @@ impl NodeCertVerifier {
         server_name: &ServerName<'_>,
         now: UnixTime,
     ) -> Result<(), (VerifyFailure, rustls::Error)> {
-        if let Ok((_, leaf)) = parse_x509_certificate(end_entity.as_ref())
-            && let Ok(at) = ASN1Time::from_timestamp(now.as_secs() as i64)
-        {
-            let validity = leaf.validity();
-            if at.timestamp() > validity.not_after.timestamp() {
-                return Err((
-                    VerifyFailure::named("CERT_HAS_EXPIRED", "certificate has expired"),
-                    CertificateError::Expired.into(),
-                ));
-            }
-            if at.timestamp() < validity.not_before.timestamp() {
-                return Err((
-                    VerifyFailure::named("CERT_NOT_YET_VALID", "certificate is not yet valid"),
-                    CertificateError::NotValidYet.into(),
-                ));
-            }
+        if let Some(refused) = validity_refusal(end_entity, now) {
+            return Err(refused);
         }
 
         if self
@@ -581,12 +665,6 @@ impl NodeCertVerifier {
                     return check_server_identity(server_name, end_entity.as_ref())
                         .map_err(|failure| (failure, error));
                 }
-                CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
-                    VerifyFailure::named("CERT_HAS_EXPIRED", "certificate has expired")
-                }
-                CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => {
-                    VerifyFailure::named("CERT_NOT_YET_VALID", "certificate is not yet valid")
-                }
                 CertificateError::UnknownIssuer => classify(),
                 // webpki refuses a CA:TRUE leaf before it looks for an
                 // issuer; OpenSSL reads the same chain as "nobody I trust
@@ -599,24 +677,10 @@ impl NodeCertVerifier {
                 {
                     classify()
                 }
-                CertificateError::Revoked => {
-                    VerifyFailure::named("CERT_REVOKED", "certificate revoked")
-                }
-                CertificateError::BadSignature => {
-                    VerifyFailure::named("CERT_SIGNATURE_FAILURE", "certificate signature failure")
-                }
-                CertificateError::InvalidPurpose
-                | CertificateError::InvalidPurposeContext { .. } => {
-                    VerifyFailure::named("INVALID_PURPOSE", "unsupported certificate purpose")
-                }
-                CertificateError::UnhandledCriticalExtension => VerifyFailure::named(
-                    "UNHANDLED_CRITICAL_EXTENSION",
-                    "unhandled critical extension",
-                ),
-                _ => VerifyFailure {
+                reason => named_refusal(reason).unwrap_or_else(|| VerifyFailure {
                     code: None,
                     message: error.to_string(),
-                },
+                }),
             },
             _ => VerifyFailure {
                 code: None,
@@ -1156,7 +1220,7 @@ pub fn ephemeral_key_info(group: rustls::NamedGroup) -> Option<serde_json::Value
 /// The peer's certificate chain as base64 DER, leaf first -- what the JS side
 /// builds `getPeerCertificate()` and `getPeerX509Certificate()` from. None
 /// when the peer sent no certificate (a server whose client sent none).
-fn peer_certificates_b64(
+pub(crate) fn peer_certificates_b64(
     chain: Option<&[rustls::pki_types::CertificateDer<'static>]>,
 ) -> Option<Vec<String>> {
     use base64::Engine;
@@ -1198,6 +1262,45 @@ pub async fn tls_connect(
     max_version: Option<String>,
     attempt_timeout: std::time::Duration,
 ) -> OpOutcome {
+    tls_connect_pinned(
+        registry,
+        ids,
+        host,
+        port,
+        server_name,
+        ca_pem,
+        reject_unauthorized,
+        client_cert_pem,
+        client_key_pem,
+        min_version,
+        max_version,
+        attempt_timeout,
+        None,
+        None,
+    )
+    .await
+}
+
+/// [`tls_connect`] with the addresses JS resolved for `host` standing in for
+/// getaddrinfo, as [`crate::tcp::tcp_connect_pinned`] takes them. The server
+/// name is still `server_name` or `host`, never an address from the pin.
+#[allow(clippy::too_many_arguments)]
+pub async fn tls_connect_pinned(
+    registry: TlsRegistry,
+    ids: Arc<std::sync::atomic::AtomicU64>,
+    host: String,
+    port: u16,
+    server_name: Option<String>,
+    ca_pem: Option<String>,
+    reject_unauthorized: bool,
+    client_cert_pem: Option<String>,
+    client_key_pem: Option<String>,
+    min_version: Option<String>,
+    max_version: Option<String>,
+    attempt_timeout: std::time::Duration,
+    pin: Option<crate::net_connect::Pin>,
+    local: Option<crate::net_connect::LocalBind>,
+) -> OpOutcome {
     let addr = format!("{host}:{port}");
 
     // Node connects the transport first and only sets the SSL handshake up once
@@ -1214,7 +1317,8 @@ pub async fn tls_connect(
     // unchanged.
     let opts = crate::net_connect::ConnectOptions {
         attempt_timeout,
-        pin: None,
+        pin,
+        local,
     };
     let tcp = match crate::net_connect::connect(&host, port, &opts).await {
         Ok(connected) => connected.stream,
@@ -1223,34 +1327,98 @@ pub async fn tls_connect(
 
     let versions = match protocol_versions(min_version.as_deref(), max_version.as_deref()) {
         Ok(v) => v,
-        Err(_) => {
-            return OpOutcome::node_failed(
-                "ERR_SSL_NO_PROTOCOLS_AVAILABLE",
-                "no protocols available for the requested TLS version range".to_string(),
-            );
+        Err(_) => return no_protocols(),
+    };
+    let name = server_name.as_deref().unwrap_or(&host);
+    let (tls_stream, mut payload) = match client_handshake(
+        tcp,
+        name,
+        ca_pem.as_deref(),
+        reject_unauthorized,
+        client_cert_pem.as_deref(),
+        client_key_pem.as_deref(),
+        &versions,
+        &addr,
+    )
+    .await
+    {
+        Ok(done) => done,
+        Err(outcome) => return outcome,
+    };
+
+    let (tcp, _) = tls_stream.get_ref();
+    let local_addr = tcp.local_addr().ok();
+    let remote_addr = tcp.peer_addr().ok();
+
+    let handle = ids.fetch_add(1, Ordering::Relaxed);
+    let (reader, writer) = tokio::io::split(tls_stream);
+    {
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        guard.readers.insert(handle, TlsReader::Client(reader));
+        guard.writers.insert(handle, TlsWriter::Client(writer));
+    }
+    payload["handle"] = serde_json::Value::from(handle);
+    if let Some(la) = local_addr {
+        payload["localAddr"] = crate::tcp::addr_to_json(la);
+    }
+    if let Some(ra) = remote_addr {
+        payload["remoteAddr"] = crate::tcp::addr_to_json(ra);
+    }
+    OpOutcome::Json(payload.to_string())
+}
+
+/// Node's `ERR_SSL_NO_PROTOCOLS_AVAILABLE`, for a version range rustls has
+/// nothing to offer in.
+fn no_protocols() -> OpOutcome {
+    OpOutcome::node_failed(
+        "ERR_SSL_NO_PROTOCOLS_AVAILABLE",
+        "no protocols available for the requested TLS version range".to_string(),
+    )
+}
+
+/// The client handshake over any transport, and what a TLSSocket reports of
+/// it: `protocol`, `cipher`, `cipherStandardName`, `authorized`,
+/// `authorizationError`, `alpnProtocol`, `ephemeralKeyInfo` and the peer
+/// chain as `peerCertificates`. `name` is the SNI and the name verified
+/// (one trailing dot stripped, as node's `unfqdn` does); `target` names the
+/// endpoint in a transport error.
+#[allow(clippy::too_many_arguments)]
+async fn client_handshake<IO>(
+    io: IO,
+    name: &str,
+    ca_pem: Option<&str>,
+    reject_unauthorized: bool,
+    client_cert_pem: Option<&str>,
+    client_key_pem: Option<&str>,
+    versions: &[&'static rustls::SupportedProtocolVersion],
+    target: &str,
+) -> Result<(tokio_rustls::client::TlsStream<IO>, serde_json::Value), OpOutcome>
+where
+    IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let sni = unfqdn(name);
+    let server_name = match ServerName::try_from(sni.to_string()) {
+        Ok(n) => n,
+        Err(e) => {
+            return Err(OpOutcome::Failed(format!(
+                "invalid server name '{sni}': {e}"
+            )));
         }
     };
 
-    // Node strips one trailing dot (`unfqdn`) before it checks the name.
-    let sni = unfqdn(server_name.as_deref().unwrap_or(&host));
-    let server_name = match ServerName::try_from(sni.to_string()) {
-        Ok(n) => n,
-        Err(e) => return OpOutcome::Failed(format!("invalid server name '{sni}': {e}")),
-    };
-
     let (config, verdict) = match build_client_config(
-        ca_pem.as_deref(),
-        client_cert_pem.as_deref(),
-        client_key_pem.as_deref(),
+        ca_pem,
+        client_cert_pem,
+        client_key_pem,
         reject_unauthorized,
-        &versions,
+        versions,
     ) {
         Ok(built) => built,
-        Err(e) => return OpOutcome::Failed(e),
+        Err(e) => return Err(OpOutcome::Failed(e)),
     };
 
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-    let tls_stream = match connector.connect(server_name, tcp).await {
+    let tls_stream = match connector.connect(server_name, io).await {
         Ok(s) => s,
         Err(e) => {
             if reject_unauthorized
@@ -1259,12 +1427,12 @@ pub async fn tls_connect(
                     message,
                 }) = verdict.lock().unwrap_or_else(|e| e.into_inner()).take()
             {
-                return OpOutcome::node_failed(code, message);
+                return Err(OpOutcome::node_failed(code, message));
             }
             if let Some(code) = tls_alert_code(&e) {
-                return OpOutcome::node_failed(code, e.to_string());
+                return Err(OpOutcome::node_failed(code, e.to_string()));
             }
-            return tls_fail(e, "connect", &addr);
+            return Err(tls_fail(e, "connect", target));
         }
     };
     let failure = verdict.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -1287,18 +1455,6 @@ pub async fn tls_connect(
         .map(|p| String::from_utf8_lossy(p).into_owned())
         .unwrap_or_default();
 
-    let (tcp, _) = tls_stream.get_ref();
-    let local_addr = tcp.local_addr().ok();
-    let remote_addr = tcp.peer_addr().ok();
-
-    let handle = ids.fetch_add(1, Ordering::Relaxed);
-    let (reader, writer) = tokio::io::split(tls_stream);
-    {
-        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-        guard.readers.insert(handle, TlsReader::Client(reader));
-        guard.writers.insert(handle, TlsWriter::Client(writer));
-    }
-
     // Node: `authorizationError` is the verify error's code (its message
     // when it has none), null on an accepted certificate.
     let authorization_error = match &failure {
@@ -1312,7 +1468,6 @@ pub async fn tls_connect(
         }) => serde_json::Value::from(message.as_str()),
     };
     let mut payload = serde_json::json!({
-        "handle": handle,
         "protocol": protocol,
         "cipher": cipher,
         "cipherStandardName": cipher_standard_name,
@@ -1326,12 +1481,58 @@ pub async fn tls_connect(
     if let Some(chain) = peer_certificates {
         payload["peerCertificates"] = serde_json::Value::from(chain);
     }
-    if let Some(la) = local_addr {
-        payload["localAddr"] = crate::tcp::addr_to_json(la);
+    Ok((tls_stream, payload))
+}
+
+/// `tls.connect({ socket })`: the client handshake over a pipe JS pumps to
+/// the socket it already has (crate::byte_pipe), registered under a new
+/// handle that tls_read / tls_write / tls_shutdown / tls_close serve as they
+/// serve a connection oam opened. Resolves with tls_connect's payload less
+/// the addresses, which are the socket's own (JS has them).
+#[allow(clippy::too_many_arguments)]
+pub async fn tls_connect_over(
+    registry: TlsRegistry,
+    pipes: crate::byte_pipe::Pipes,
+    ids: Arc<std::sync::atomic::AtomicU64>,
+    pipe: u64,
+    server_name: String,
+    ca_pem: Option<String>,
+    reject_unauthorized: bool,
+    client_cert_pem: Option<String>,
+    client_key_pem: Option<String>,
+    min_version: Option<String>,
+    max_version: Option<String>,
+) -> OpOutcome {
+    let versions = match protocol_versions(min_version.as_deref(), max_version.as_deref()) {
+        Ok(v) => v,
+        Err(_) => return no_protocols(),
+    };
+    let Some(near) = crate::byte_pipe::take_near(&pipes, pipe) else {
+        return OpOutcome::Failed(format!("tls: pipe {pipe} is gone"));
+    };
+    let (tls_stream, mut payload) = match client_handshake(
+        near,
+        &server_name,
+        ca_pem.as_deref(),
+        reject_unauthorized,
+        client_cert_pem.as_deref(),
+        client_key_pem.as_deref(),
+        &versions,
+        &server_name,
+    )
+    .await
+    {
+        Ok(done) => done,
+        Err(outcome) => return outcome,
+    };
+    let handle = ids.fetch_add(1, Ordering::Relaxed);
+    let (reader, writer) = tokio::io::split(tls_stream);
+    {
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        guard.readers.insert(handle, TlsReader::Wrapped(reader));
+        guard.writers.insert(handle, TlsWriter::Wrapped(writer));
     }
-    if let Some(ra) = remote_addr {
-        payload["remoteAddr"] = crate::tcp::addr_to_json(ra);
-    }
+    payload["handle"] = serde_json::Value::from(handle);
     OpOutcome::Json(payload.to_string())
 }
 
@@ -1357,49 +1558,52 @@ pub async fn tls_read(registry: TlsRegistry, handle: u64, len: usize) -> OpOutco
         handle,
     };
 
-    let mut buf = vec![0u8; len.clamp(1, 8 * 1024 * 1024)];
+    let buf = vec![0u8; len.clamp(1, 8 * 1024 * 1024)];
     match reader {
-        TlsReader::Client(mut r) => {
-            tokio::select! {
-                res = r.read(&mut buf) => match res {
-                    Ok(0) => {
-                        reinsert_reader(&registry, handle, TlsReader::Client(r));
-                        OpOutcome::Done
-                    }
-                    Ok(n) => {
-                        reinsert_reader(&registry, handle, TlsReader::Client(r));
-                        buf.truncate(n);
-                        OpOutcome::Bytes(buf)
-                    }
-                    Err(e) => tls_fail(e, "read", &handle.to_string()),
-                },
-                // tls_close fired: drop the read half so the BiLock releases
-                // and the socket closes; do NOT reinsert.
-                _ = notify.notified() => {
-                    drop(r);
-                    OpOutcome::Done
-                }
-            }
+        TlsReader::Client(r) => {
+            read_half(&registry, handle, r, &notify, buf, TlsReader::Client).await
         }
-        TlsReader::Server(mut r) => {
-            tokio::select! {
-                res = r.read(&mut buf) => match res {
-                    Ok(0) => {
-                        reinsert_reader(&registry, handle, TlsReader::Server(r));
-                        OpOutcome::Done
-                    }
-                    Ok(n) => {
-                        reinsert_reader(&registry, handle, TlsReader::Server(r));
-                        buf.truncate(n);
-                        OpOutcome::Bytes(buf)
-                    }
-                    Err(e) => tls_fail(e, "read", &handle.to_string()),
-                },
-                _ = notify.notified() => {
-                    drop(r);
-                    OpOutcome::Done
-                }
+        TlsReader::Server(r) => {
+            read_half(&registry, handle, r, &notify, buf, TlsReader::Server).await
+        }
+        TlsReader::Wrapped(r) => {
+            read_half(&registry, handle, r, &notify, buf, TlsReader::Wrapped).await
+        }
+    }
+}
+
+/// One read on a checked-out half: reinserted (as `back` rebuilds it) after
+/// data or EOF, dropped on an error or when tls_close fires the cancel -- a
+/// parked read drops its half so the BiLock releases and the stream closes.
+async fn read_half<S>(
+    registry: &TlsRegistry,
+    handle: u64,
+    mut r: ReadHalf<S>,
+    notify: &tokio::sync::Notify,
+    mut buf: Vec<u8>,
+    back: fn(ReadHalf<S>) -> TlsReader,
+) -> OpOutcome
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    tokio::select! {
+        res = r.read(&mut buf) => match res {
+            Ok(0) => {
+                reinsert_reader(registry, handle, back(r));
+                OpOutcome::Done
             }
+            Ok(n) => {
+                reinsert_reader(registry, handle, back(r));
+                buf.truncate(n);
+                OpOutcome::Bytes(buf)
+            }
+            Err(e) => tls_fail(e, "read", &handle.to_string()),
+        },
+        // tls_close fired: drop the read half so the BiLock releases and the
+        // socket closes; do NOT reinsert.
+        _ = notify.notified() => {
+            drop(r);
+            OpOutcome::Done
         }
     }
 }
@@ -1418,20 +1622,30 @@ pub async fn tls_write(registry: TlsRegistry, handle: u64, data: Vec<u8>) -> OpO
     };
 
     match writer {
-        TlsWriter::Client(mut w) => match w.write_all(&data).await {
-            Ok(()) => {
-                reinsert_writer(&registry, handle, TlsWriter::Client(w));
-                OpOutcome::Done
-            }
-            Err(e) => tls_fail(e, "write", &handle.to_string()),
-        },
-        TlsWriter::Server(mut w) => match w.write_all(&data).await {
-            Ok(()) => {
-                reinsert_writer(&registry, handle, TlsWriter::Server(w));
-                OpOutcome::Done
-            }
-            Err(e) => tls_fail(e, "write", &handle.to_string()),
-        },
+        TlsWriter::Client(w) => write_half(&registry, handle, w, &data, TlsWriter::Client).await,
+        TlsWriter::Server(w) => write_half(&registry, handle, w, &data, TlsWriter::Server).await,
+        TlsWriter::Wrapped(w) => write_half(&registry, handle, w, &data, TlsWriter::Wrapped).await,
+    }
+}
+
+/// One write on a checked-out half, reinserted (as `back` rebuilds it) once
+/// every byte went.
+async fn write_half<S>(
+    registry: &TlsRegistry,
+    handle: u64,
+    mut w: WriteHalf<S>,
+    data: &[u8],
+    back: fn(WriteHalf<S>) -> TlsWriter,
+) -> OpOutcome
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    match w.write_all(data).await {
+        Ok(()) => {
+            reinsert_writer(registry, handle, back(w));
+            OpOutcome::Done
+        }
+        Err(e) => tls_fail(e, "write", &handle.to_string()),
     }
 }
 
@@ -1452,6 +1666,9 @@ pub async fn tls_shutdown(registry: TlsRegistry, handle: u64) -> OpOutcome {
             let _ = w.shutdown().await;
         }
         TlsWriter::Server(mut w) => {
+            let _ = w.shutdown().await;
+        }
+        TlsWriter::Wrapped(mut w) => {
             let _ = w.shutdown().await;
         }
     }
@@ -2054,6 +2271,181 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
                 let _ = stream.shutdown().await;
             });
         }
+    }
+
+    /// What JS does for `tls.connect({ socket })`: pump a pipe's far end to
+    /// and from a socket -- here a TCP stream to the server.
+    async fn pump_pipe(pipes: crate::byte_pipe::Pipes, id: u64, tcp: tokio::net::TcpStream) {
+        let (mut rd, mut wr) = tcp.into_split();
+        let out_pipes = pipes.clone();
+        let up = tokio::spawn(async move {
+            loop {
+                match crate::byte_pipe::out(out_pipes.clone(), id).await {
+                    OpOutcome::Bytes(bytes) => {
+                        if wr.write_all(&bytes).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ => {
+                        let _ = wr.shutdown().await;
+                        break;
+                    }
+                }
+            }
+        });
+        let mut buf = vec![0u8; 16 * 1024];
+        loop {
+            match rd.read(&mut buf).await {
+                Ok(0) | Err(_) => {
+                    crate::byte_pipe::input_end(pipes.clone(), id).await;
+                    break;
+                }
+                Ok(n) => {
+                    crate::byte_pipe::input(pipes.clone(), id, buf[..n].to_vec()).await;
+                }
+            }
+        }
+        let _ = up.await;
+    }
+
+    fn pipes() -> crate::byte_pipe::Pipes {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    /// `tls.connect({ socket })`: the handshake over a pipe verifies the
+    /// server as a connection oam opened would, and the handle it registers
+    /// is served by tls_read / tls_write / tls_shutdown / tls_close like any
+    /// other, leaving nothing behind.
+    #[tokio::test]
+    async fn a_handshake_over_a_pipe_serves_like_a_connection() {
+        let registry: TlsRegistry = Arc::new(Mutex::new(TlsState::default()));
+        let ids = Arc::new(AtomicU64::new(1));
+        let pipes = pipes();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(echo_server(listener, 1));
+
+        let pipe = crate::byte_pipe::open(&pipes, &ids);
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let pump = tokio::spawn(pump_pipe(pipes.clone(), pipe, tcp));
+
+        let OpOutcome::Json(payload) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tls_connect_over(
+                registry.clone(),
+                pipes.clone(),
+                ids.clone(),
+                pipe,
+                "localhost".into(),
+                Some(CERT.into()),
+                true,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the handshake completes") else {
+            panic!("handshake failed");
+        };
+        let info: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert_eq!(info["authorized"], true, "{payload}");
+        assert!(info["authorizationError"].is_null(), "{payload}");
+        assert!(
+            info.get("remoteAddr").is_none(),
+            "the socket's own: {payload}"
+        );
+        let handle = info["handle"].as_u64().unwrap();
+
+        assert!(matches!(
+            tls_write(registry.clone(), handle, b"ping".to_vec()).await,
+            OpOutcome::Done
+        ));
+        assert!(matches!(
+            tls_read(registry.clone(), handle, 64).await,
+            OpOutcome::Bytes(b) if b == b"ping"
+        ));
+        assert!(matches!(
+            tls_shutdown(registry.clone(), handle).await,
+            OpOutcome::Done
+        ));
+        assert!(matches!(
+            tls_read(registry.clone(), handle, 64).await,
+            OpOutcome::Done
+        ));
+        tls_close(&registry, handle);
+        tokio::time::timeout(std::time::Duration::from_secs(10), pump)
+            .await
+            .expect("the pump ends with the connection")
+            .unwrap();
+        assert!(crate::byte_pipe::close(&pipes, pipe));
+        assert_eq!(crate::byte_pipe::open_count(&pipes), 0);
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+    }
+
+    /// A certificate the wrapped handshake does not trust fails with node's
+    /// code, as a connection oam opened does, and registers nothing; a pipe
+    /// that is gone fails without a handshake.
+    #[tokio::test]
+    async fn a_handshake_over_a_pipe_refuses_an_untrusted_certificate() {
+        let registry: TlsRegistry = Arc::new(Mutex::new(TlsState::default()));
+        let ids = Arc::new(AtomicU64::new(1));
+        let pipes = pipes();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(echo_server(listener, 1));
+        let pipe = crate::byte_pipe::open(&pipes, &ids);
+        let tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tokio::spawn(pump_pipe(pipes.clone(), pipe, tcp));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            tls_connect_over(
+                registry.clone(),
+                pipes.clone(),
+                ids.clone(),
+                pipe,
+                "localhost".into(),
+                None,
+                true,
+                None,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await
+        .expect("the refusal does not hang");
+        match outcome {
+            OpOutcome::NodeFailed { code, .. } => assert!(!code.is_empty()),
+            other => panic!("expected node's refusal, got {other:?}"),
+        }
+        assert_eq!(registry.lock().unwrap().bookkeeping(), (0, 0, 0, 0, 0));
+        crate::byte_pipe::close(&pipes, pipe);
+
+        let gone = tls_connect_over(
+            registry.clone(),
+            pipes.clone(),
+            ids,
+            pipe,
+            "localhost".into(),
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(matches!(gone, OpOutcome::Failed(_)), "{gone:?}");
     }
 
     /// #139: every clean close leaves the registry empty -- no closed

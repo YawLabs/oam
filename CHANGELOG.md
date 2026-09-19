@@ -18,6 +18,92 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Security
 
+- **The `lookup` connect option was ignored.** `net.connect`, `tls.connect`,
+  `http.request` and `https.request` -- the request's own `lookup` and an `http.Agent`'s
+  -- never called it and resolved the host through the system resolver, so a host check
+  an application put in its lookup function never ran; a replaced `dns.lookup` was not
+  consulted either. Both are now honoured as node honours them: the hook is called with
+  node's arguments before anything is dialled, a refusal fails the connection with the
+  hook's own error and never falls back to system DNS, every answered address is emitted
+  as the socket's `'lookup'` event first (a listener that destroys the socket stops the
+  connection), and only the answered addresses are dialled. `fetch` also resolves
+  through a replaced `dns.lookup`. Under `--permission --allow-net`, each address a hook
+  answers is checked against the grant as a connection to that address would be.
+- **An `http.Agent` whose `createConnection` was overridden was not used.**
+  `http.request` and `https.request` sent every request through oam's own HTTP client,
+  so a custom or patched agent -- the way request-filtering-agent, ssrf-req-filter and
+  similar packages vet a destination -- was never called, and neither were
+  `options.createConnection`, a wrapped `net.createConnection` / `tls.connect`, or
+  listeners on `req.socket`. A request that carries such connection policy now goes over
+  the socket the agent returns, as in node. So does `https.request` with
+  `rejectUnauthorized: false`, which ignored the agent too, and an upgrade request. The
+  agent pools these connections as node's does. Their response heads are held to node's
+  `maxHeaderSize`, and `http.request` now takes node's per-request `maxHeaderSize` and
+  `insecureHTTPParser` options, validated as node validates them; an oversized head
+  fails the request with node's own `HPE_HEADER_OVERFLOW` error.
+- **`http.request` followed redirects.** node's `http.request` returns a `3xx` as the
+  response; oam's followed it, so a request whose URL an application had vetted could
+  end at a host it never named. It now returns the `3xx`, as node does.
+- **`fetch` ignored `redirect: 'manual'` and `redirect: 'error'`.** Every redirect was
+  followed, so an application that asks for `'manual'` to vet each hop before following
+  it got the target's response instead. `'manual'` now returns the `3xx` and `'error'`
+  rejects with node's `unexpected redirect` cause, and a value outside the enum is
+  refused, as in node.
+- **`http.request` dialled a rewritten host.** On oam's own transport a request's
+  `host` went through the URL parser, which turns spellings node's resolver refuses --
+  percent-escapes, octal or zero-padded IPv4, a trailing dot, a tab, fullwidth digits --
+  into an address, so a host an application had checked as a string reached an address
+  node never dials. Such a host now goes to the resolver as written, as in node, and a
+  Host header no header may carry throws node's `ERR_INVALID_CHAR`. `net.isIP` also
+  accepts an IPv6 zone id, and `dns.lookup` answers an IP literal as written, as node's do.
+  The resolver behind `dns.lookup`, `net.connect` and `tls.connect` is handed the name's
+  UTS #46 ToASCII form, as node's is (a soft hyphen vanishes, a fullwidth digit is a digit,
+  a name ToASCII refuses is `getaddrinfo EINVAL`).
+- **`http.request` went through the environment proxy.** oam sent every `http.request` /
+  `https.request` through `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`, which node v22 applies
+  only under `NODE_USE_ENV_PROXY=1`; behind a proxy `res.socket.remoteAddress` was the
+  proxy's, so a check of the address a response came from passed for any destination the
+  proxy would fetch. `http.request` now dials the destination itself unless
+  `NODE_USE_ENV_PROXY=1` (or `--use-env-proxy` in `NODE_OPTIONS`) is set, and then only
+  over node's own global agents, as node does. `fetch` still honours the environment
+  proxy.
+- **A `socketPath` or `path` connected to `host:port`.** node connects `http.request`'s
+  `socketPath` and `net.connect` / `tls.connect`'s `path` to that Unix domain socket or
+  named pipe; oam ignored them and connected to `host:port` (by default `localhost:80`),
+  sending the request to whatever listened there. oam has no client for either, so these
+  now fail with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` and nothing is dialled.
+- **The `localAddress` and `localPort` connect options were ignored.** `net.connect`,
+  `tls.connect` and `http.request` validated `localAddress` and then connected from the
+  default address and an ephemeral port, so a connection an application meant to leave
+  from one address or port -- the one a firewall rule or an egress policy is written
+  for -- left from another. The socket is now bound to them before it dials, as in node,
+  and a bind that fails is the connection's error (`bind EADDRNOTAVAIL 192.0.2.1`); a
+  non-number `localPort` throws node's `ERR_INVALID_ARG_TYPE`.
+- **`Object.prototype.toString.call(process)` was `[object Object]`.** node's is
+  `[object process]`, and axios checks exactly that to choose its node http adapter: on
+  oam it chose its fetch adapter instead, which ignores `httpAgent` / `httpsAgent` -- the
+  agents guard packages such as request-filtering-agent hand it. `process` now carries
+  node's `Symbol.toStringTag`.
+- **A refused certificate was reported as `socket hang up`.** On oam's own transport an
+  `https.request` whose server certificate did not verify failed with `ECONNRESET`
+  `socket hang up`, and `fetch`'s cause carried no code, where the same request over
+  `tls.connect` had node's: retry logic that retries `ECONNRESET` retried a refused
+  certificate. Both now report node's code and message (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`,
+  `DEPTH_ZERO_SELF_SIGNED_CERT`, `CERT_HAS_EXPIRED`, ...).
+- **TLS options of `https.request` were not applied.** A verifying `https.request` went
+  through one shared client that ignored the request's `ca`, client certificate,
+  `servername` and `checkServerIdentity`, and `tls.connect` never called a
+  `checkServerIdentity` either, so a certificate pin or a private CA an application set
+  was not enforced. `tls.connect` now calls it after the chain check and fails the
+  connection with its error, and an `https.request` carrying any of these options goes
+  over `tls.connect`.
+- **`req.socket` did not name the connection.** A `ClientRequest`'s socket reported the
+  host as written, `localAddress` `127.0.0.1` and `localPort` `0`, so a check of
+  `req.socket.remoteAddress` / `res.socket.remoteAddress` against a list of internal
+  addresses after connecting saw a host name. It now reports the dialled peer's address,
+  port and family and the local end (by `'response'`, and on `'connect'` for a request
+  sent over an agent's socket); `req.socket` is `null` until `'socket'`, and an https
+  socket carries the verified session (`getPeerCertificate()`, `authorized`).
 - **`--allow-net` could be bypassed through an HTTP redirect.** The grant was checked
   only against the URL a script passed to `fetch`, `http.request`, `https.request` or
   `undici.request`; the redirects those follow were not checked at all. So under
@@ -124,8 +210,9 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   and `undici.request` accepted response heads of hundreds of KiB. They now refuse a
   head at Node's limit (16 KiB, or `--max-http-header-size`), counted as Node counts it
   for each API, on every hop including redirects: `fetch` rejects with `fetch failed`
-  and a cause coded `UND_ERR_HEADERS_OVERFLOW`, the others fail with a cause coded
-  `HPE_HEADER_OVERFLOW`.
+  and a cause coded `UND_ERR_HEADERS_OVERFLOW`, `http.request` and `https.request` fail
+  with Node's own `HPE_HEADER_OVERFLOW` error (`Parse Error: Header overflow`), and
+  `undici.request` fails with a cause coded `HPE_HEADER_OVERFLOW`.
 - **`http` and `https` servers applied none of Node's connection timeouts.**
   `headersTimeout`, `requestTimeout`, `keepAliveTimeout`, `server.timeout` and
   `setTimeout` were stored and ignored, and TLS handshakes had no time limit, so a
@@ -168,6 +255,51 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   request body's trailer fields were dropped. They are now there once the body has
   ended (empty before, and for a body without trailers), combined as Node combines
   repeated fields.
+- **`setImmediate` waited a whole OS timer tick.** It was a 1 ms timer, so an idle loop
+  slept to the next timer tick for it -- about 15 ms on Windows, 1 ms elsewhere; 200
+  awaited immediates took 3 s where node takes 2 ms. An immediate is now due at once.
+  `http.get` / `http.request` on oam's own transport also no longer wait one after
+  `'socket'` unless something listens for `'socket'`: 200 sequential requests to a local
+  server took about 3 s on Windows and now take about 50 ms, as the same `fetch` loop does.
+- **`http.Agent` keeps its sockets alive, as node's does.** A request sent over an
+  agent's socket (a custom agent, such as the agentkeepalive agent openai v4 passes to
+  node-fetch, or a socket got watches) opened a new connection and TLS handshake
+  per request and said `Connection: close`. The agent now pools them with node's rules:
+  `keepAlive`, `maxSockets` (requests queue), `maxFreeSockets`, `maxTotalSockets`,
+  `scheduling`, the `'free'` event, `freeSockets` keyed by `agent.getName()`, the
+  response's `Connection` / `Keep-Alive: timeout=` and framing, `reusedSocket`, and
+  node's `Connection` header on the request. A pooled socket is unref'd, and a socket's
+  idle timeout no longer keeps the process alive. A request destroyed while it waits
+  for a socket hands that socket on and reports `socket hang up`, as in node.
+- **`req.end(callback)` called the callback with the response.** node calls it on
+  `'finish'`, with no arguments; got treated the response as the request's error, so
+  every got request failed once it went over a socket.
+- **A request on oam's own HTTP transport never timed out.** `req.setTimeout()`, the
+  `timeout` option and an agent's `timeout` (the global agents' 5 s included) fired no
+  `'timeout'` unless the request went over an agent's socket, so a client that gives up
+  on a stalled server waited for it forever. They now fire as node's do: on the request,
+  once, after that long without activity -- before the response head, or while its body
+  stalls -- and on the response while it is still being read; nothing fires once the
+  response has ended, and the value is validated as node validates it. `req.destroy()`
+  and `req.abort()` before the response now fail the request with node's `ECONNRESET`
+  `socket hang up` (they were silent), on either path; as in node, that `'error'` ends
+  the process unless something listens for it.
+- **`'finish'` came before the socket connected.** A request sent over an agent's socket
+  emitted `'finish'` on the tick after `end()`, before the socket's `'lookup'`,
+  `'connect'` or `'secureConnect'`, and even when the connection was then refused; got's
+  request timing (`timings.phases.request`) came out `NaN`. It now fires once the socket
+  has written the whole request, as node's does, and `req.writableFinished` stays `false`
+  until then.
+- **`tls.connect({ socket })` works.** TLS over a socket oam did not open -- a CONNECT
+  tunnel, the STARTTLS shape (`pg`, `mysql2`, `nodemailer`, `ldapjs`), TLS in TLS, or
+  any JS Duplex -- failed with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. It now runs as in
+  node, with node's events, the wrapped socket's addresses and the certificate checks of
+  any other `tls.connect`. https-proxy-agent (5 and 7) tunnels to https targets through
+  it, a refusing proxy's answer included, and got 14 loads (http2-wrapper reaches node's
+  `JSStreamSocket` through `new tls.TLSSocket(stream)._handle._parentWrap`).
+- **`net.Socket` had no paused mode.** A `'readable'` listener and `socket.read()` --
+  how https-proxy-agent reads a proxy's answer -- threw `socket.read is not a function`;
+  `push()` into a socket without a handle was missing too. Both now behave as in node.
 - **A `fetch` could hang forever when the server closed a keep-alive
   connection just as the next request went out on it.** This also affected
   `http.request`, `https.request` and `undici.request`, which ride the same

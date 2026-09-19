@@ -647,7 +647,9 @@
         ["string", "number", "bigint", "boolean", "symbol", "object", "function"].includes(low)
       ) {
         types.push(low);
-      } else if (/^[A-Z]/.test(String(value))) {
+      } else if (/^([A-Z][a-z0-9]*)+$/.test(String(value))) {
+        // node's classRegExp: a class name. 'Agent-like Object' is not one
+        // and reads as `one of Agent-like Object, undefined, or false`.
         instances.push(String(value));
       } else {
         other.push(String(value));
@@ -11479,6 +11481,16 @@
     // process.constructor.name === "process" (so a failed `delete process.x`
     // says "#<process>"), and satisfies test-process-prototype's chain checks.
     const process = new (class process extends EventEmitter {})();
+    // node's own `process[Symbol.toStringTag]` (writable, not enumerable,
+    // not configurable): Object.prototype.toString.call(process) is
+    // '[object process]', the check axios and similar packages use to pick
+    // their node (http) adapter over fetch.
+    Object.defineProperty(process, Symbol.toStringTag, {
+      value: "process",
+      writable: true,
+      enumerable: false,
+      configurable: false,
+    });
 
     // NODE_REDIRECT_WARNINGS destination, resolved lazily on the first warning
     // and cached: undefined = not looked up yet, null = unset/empty (write to
@@ -18490,14 +18502,304 @@
       return +port;
     }
 
+    // ---- the http client ----
+    //
+    // A ClientRequest travels one of two ways.
+    //
+    //  - The AGENT path is node's model: the request goes over the socket the
+    //    agent's createConnection (or an `options.createConnection`) returns
+    //    -- a real net.Socket / TLSSocket, connected by net.connect /
+    //    tls.connect with their `lookup` handling, or whatever a custom agent
+    //    hands back -- and the HTTP/1.1 exchange runs over it through the
+    //    bridge (natives.httpBridge*: hyper's client over bytes JS pumps).
+    //    It is taken whenever the request carries connection-level policy that
+    //    node applies on a real socket: an agent whose addRequest /
+    //    createSocket / createConnection is not the stock one (a subclass or
+    //    a patched instance), a createConnection option, a `lookup` in the
+    //    request's or the agent's options, a replaced dns.lookup, https with
+    //    rejectUnauthorized:false, an upgrade, or 'lookup' / 'connect' /
+    //    'secureConnect' listeners on req.socket by the time the request is
+    //    dispatched -- or when the agent's pool already holds a socket for
+    //    the request. A guard in any of those places runs, and every byte
+    //    goes over the socket it vetted. The agent pools sockets as node's
+    //    does (keepAlive, maxSockets, maxFreeSockets, 'free'); each exchange
+    //    on a reused socket starts once the last one finished writing.
+    //  - The FETCH path otherwise: oam's pooled transport (the fetch op),
+    //    through bootstrap's internal entry (never the user-replaceable
+    //    globalThis.fetch). req.socket is still a real net.Socket /
+    //    TLSSocket, emitted at 'socket', that never connects itself: the
+    //    transport's facts about the connection it used (the dialled peer, the
+    //    local end, the TLS session) are filled into it before 'response'.
+    const oamFetchInternal = globalThis.__oamFetchInternal;
+
+    function connResetException(message) {
+      const err = new Error(message);
+      err.code = "ECONNRESET";
+      return err;
+    }
+
+    // node's parser errors (`HPE_*`, `Parse Error: <reason>`) carry the
+    // reason on their own as well.
+    function withParseReason(err) {
+      if (
+        err && typeof err.code === "string" && err.code.indexOf("HPE_") === 0 &&
+        err.reason === undefined && typeof err.message === "string"
+      ) {
+        err.reason = err.message.replace(/^Parse Error: /, "");
+      }
+      return err;
+    }
+
+    function once(fn) {
+      let called = false;
+      return function (...args) {
+        if (called) return undefined;
+        called = true;
+        return fn.apply(this, args);
+      };
+    }
+
+    function isIP(host) {
+      return registry.get("net").isIP(host);
+    }
+
+    function dnsLookupReplaced() {
+      if (!registry.cache.has("dns")) return false;
+      return registry.cache.get("dns").lookup !== registry._dnsLookupOriginal;
+    }
+
+    // A wrapped socket layer -- net.createConnection or
+    // net.Socket.prototype.connect for http, tls.connect or
+    // TLSSocket.prototype.connect for https -- is how instrumentation and
+    // some guards see every connection node's agents open; the agent path
+    // goes through it, oam's own client does not. (A wrapped
+    // net.Socket.prototype.connect is not reached by oam's tls.connect,
+    // whose TLSSocket is not a net.Socket subclass.)
+    function socketLayerPatched(https) {
+      if (https) {
+        var tls = registry.get("tls");
+        var tlsStock = registry._tlsStock;
+        return tls.connect !== tlsStock.connect ||
+          tls.TLSSocket.prototype.connect !== tlsStock.socketConnect;
+      }
+      var net = registry.get("net");
+      var netStock = registry._netStock;
+      return net.createConnection !== netStock.createConnection ||
+        net.Socket.prototype.connect !== netStock.socketConnect;
+    }
+
+    // TLS options node applies per connection and oam's own client cannot
+    // (its shared HTTPS client verifies with one trust store and one range):
+    // a request carrying any of them goes over tls.connect, which honours
+    // them. A `checkServerIdentity` -- a certificate pin -- above all.
+    function carriesTlsPolicy(options) {
+      return options.rejectUnauthorized === false ||
+        options.ca != null || options.cert != null || options.key != null ||
+        options.pfx != null || options.servername != null ||
+        typeof options.checkServerIdentity === "function" ||
+        options.minVersion != null || options.maxVersion != null ||
+        options.secureProtocol != null;
+    }
+
+    // Set on a socket that carried an agent-path exchange and was kept
+    // alive: settles once that exchange has finished writing.
+    const kSocketBridgeTail = Symbol("oamBridgeTail");
+
+    // Whether the agent's pool holds a live socket for the name this request
+    // would be given (node's addRequest takes it before creating one).
+    function agentHasFreeSocket(agent, req, opts, host, port) {
+      var free = agent.freeSockets;
+      if (!free || typeof free !== "object" || Object.keys(free).length === 0) return false;
+      if (typeof agent.getName !== "function") return false;
+      var options = Object.assign({ __proto__: null }, opts, { host: host, port: port }, agent.options);
+      if (options.socketPath) options.path = options.socketPath;
+      var name;
+      try {
+        normalizeServerName(options, req);
+        name = agent.getName(options);
+      } catch (e) {
+        return false;
+      }
+      var list = free[name];
+      if (!Array.isArray(list)) return false;
+      for (var i = 0; i < list.length; i++) {
+        if (list[i] && !list[i].destroyed) return true;
+      }
+      return false;
+    }
+
+    // llhttp's should_keep_alive for a response: HTTP/1.1 unless it says
+    // `Connection: close`, HTTP/1.0 only if it says `keep-alive`, and never
+    // when the body runs to the end of the connection.
+    function responseKeepsAlive(raw, method) {
+      var connection = "";
+      var te = null;
+      var hasLength = false;
+      var headers = raw.headers || [];
+      for (var i = 0; i < headers.length; i++) {
+        var name = String(headers[i][0]).toLowerCase();
+        var value = String(headers[i][1]);
+        if (name === "connection") connection += "," + value.toLowerCase();
+        else if (name === "transfer-encoding") te = te === null ? value : te + "," + value;
+        else if (name === "content-length") hasLength = true;
+      }
+      var tokens = connection.split(",").map(function (t) { return t.trim(); });
+      if (raw.httpVersion === "1.0") {
+        if (tokens.indexOf("keep-alive") === -1) return false;
+      } else if (tokens.indexOf("close") !== -1) {
+        return false;
+      }
+      var status = raw.status;
+      if ((status / 100 | 0) === 1 || status === 204 || status === 304 || method === "HEAD") return true;
+      if (te !== null) return /(?:^|,)\s*chunked\s*$/i.test(te);
+      return hasLength;
+    }
+
+    // A listener for what only a real connection emits: the request goes
+    // over one (a 'lookup' only matters for a name).
+    function fetchSocketWatched(socket, host) {
+      return socket.listenerCount("connect") > 0 ||
+        socket.listenerCount("secureConnect") > 0 ||
+        (isIP(host) === 0 && socket.listenerCount("lookup") > 0);
+    }
+
+    function isSocketLike(socket) {
+      return socket !== null && typeof socket === "object" &&
+        typeof socket.on === "function" && typeof socket.write === "function" &&
+        typeof socket.destroy === "function";
+    }
+
+    function unusableSocketError() {
+      const err = new TypeError(
+        "The socket an agent or createConnection returned is not a stream oam can " +
+          "send a request over (it needs on, write and destroy)",
+      );
+      err.code = "ERR_INVALID_ARG_TYPE";
+      return err;
+    }
+
+    // node's IncomingMessage._addHeaderLine (lib/_http_incoming.js), for a
+    // response read on the agent path: these keep their first value,
+    // set-cookie collects an array, cookie joins with '; ', the rest with
+    // ', '. Names arrive lowercased (hyper keeps no original case).
+    const KEEP_FIRST_HEADERS = new Set([
+      "age", "authorization", "content-length", "content-type", "etag",
+      "expires", "from", "host", "if-modified-since", "if-unmodified-since",
+      "last-modified", "location", "max-forwards", "proxy-authorization",
+      "referer", "retry-after", "server", "user-agent",
+    ]);
+    function agentPathHeaders(pairs) {
+      const headers = {};
+      const raw = [];
+      for (let i = 0; i < pairs.length; i++) {
+        const name = pairs[i][0];
+        const value = pairs[i][1];
+        raw.push(name, value);
+        const key = name.toLowerCase();
+        const existing = headers[key];
+        if (key === "set-cookie") {
+          if (existing === undefined) headers[key] = [value];
+          else existing.push(value);
+        } else if (existing === undefined) {
+          headers[key] = value;
+        } else if (!KEEP_FIRST_HEADERS.has(key)) {
+          headers[key] = existing + (key === "cookie" ? "; " : ", ") + value;
+        }
+      }
+      return { headers, raw };
+    }
+
+    // The fetch path's headers, as they have always been read: through the
+    // fetch Headers class (sorted, repeated names combined).
+    function fetchPathHeaders(pairs) {
+      const combined = new oamFetchInternal.Headers();
+      for (let i = 0; i < pairs.length; i++) combined.append(pairs[i][0], pairs[i][1]);
+      const headers = {};
+      const raw = [];
+      combined.forEach(function (value, name) {
+        const key = name.toLowerCase();
+        headers[key] = key in headers ? headers[key] + ", " + value : value;
+        raw.push(name, value);
+      });
+      return { headers, raw };
+    }
+
+    function bodyRead(handle) {
+      return globalThis.__oam.fetchBodyRead(handle);
+    }
+
+    function bodyCancel(handle) {
+      try {
+        globalThis.__oam.fetchBodyCancel(handle);
+      } catch (_) {
+        /* already drained or gone */
+      }
+    }
+
+    // ---- req.socket on the fetch path ----
+    // Nothing passes through this object: writes go nowhere, and address()
+    // answers from the fields the transport's facts fill in. Its idle timer
+    // is the socket's own (setTimeout, 'timeout'), reset by what the
+    // transport does for the request (ClientRequest#_fetchActivity) as a
+    // real socket's is by its reads and writes.
+    function fetchSocketWrite(data, encoding, cb) {
+      if (typeof encoding === "function") cb = encoding;
+      if (typeof cb === "function") process.nextTick(cb);
+      return true;
+    }
+    function fetchSocketEnd(data, encoding, cb) {
+      if (typeof data === "function") cb = data;
+      else if (typeof encoding === "function") cb = encoding;
+      if (typeof cb === "function") process.nextTick(cb);
+      return this;
+    }
+    function fetchSocketAddress() {
+      if (this.localAddress === undefined) return {};
+      return { address: this.localAddress, family: this.localFamily || "IPv4", port: this.localPort };
+    }
+    const FETCH_SOCKET_OVERRIDES = ["write", "end", "address"];
+    function makeFetchSocket(encrypted) {
+      let socket;
+      if (encrypted) {
+        socket = new (registry.get("tls").TLSSocket)(null, {});
+      } else {
+        socket = new (registry.get("net").Socket)();
+        socket.connecting = true;
+      }
+      socket.write = fetchSocketWrite;
+      socket.end = fetchSocketEnd;
+      socket.address = fetchSocketAddress;
+      return socket;
+    }
+
     class ClientRequest extends EventEmitter {
       constructor(input, options, callback) {
         super();
         var normalized = normalizeClientArgs(input, options, callback);
         var opts = normalized.options || {};
         callback = normalized.callback;
+        // node lib/_http_client.js: the agent comes first. `false` is a fresh
+        // one of the default kind, none is the default (unless a
+        // createConnection option replaces it), and anything without
+        // addRequest is refused.
+        var agent = opts.agent;
+        var defaultAgent = opts._defaultAgent || agentState.globalAgent;
+        if (agent === false) {
+          agent = new defaultAgent.constructor();
+        } else if (agent === null || agent === undefined) {
+          if (typeof opts.createConnection !== "function") agent = defaultAgent;
+        } else if (typeof agent.addRequest !== "function") {
+          throw codes.ERR_INVALID_ARG_TYPE(
+            "options.agent",
+            ["Agent-like Object", "undefined", "false"],
+            agent,
+          );
+        }
+        this.agent = agent;
+        var protocol = opts.protocol || defaultAgent.protocol || "http:";
+        var expectedProtocol = defaultAgent.protocol || "http:";
+        if (this.agent && this.agent.protocol) expectedProtocol = this.agent.protocol;
         this.method = (opts.method || "GET").toUpperCase();
-        var protocol = opts.protocol || "http:";
         // Node's order: the path is validated before the port (measured with
         // both bad -- ERR_UNESCAPED_CHARACTERS wins).
         var reqPath = opts.path || "/";
@@ -18507,32 +18809,35 @@
             throw codes.ERR_UNESCAPED_CHARACTERS("Request path");
           }
         }
+        if (protocol !== expectedProtocol) {
+          throw codes.ERR_INVALID_PROTOCOL(protocol, expectedProtocol);
+        }
         var host =
           validateHost(opts.hostname, "hostname") ||
           validateHost(opts.host, "host") ||
           "localhost";
-        var port = validateClientPort(opts.port || (protocol === "https:" ? 443 : 80));
+        var defaultPort = opts.defaultPort || (this.agent && this.agent.defaultPort);
+        var port = validateClientPort(
+          opts.port || defaultPort || (protocol === "https:" ? 443 : 80),
+        );
         // An IPv6 literal host (`{host: '::1'}`) is bracketed in the URL, or
         // `http://::1:80/` would not parse and the request would fail with
         // "fetch failed" where node connects to ::1. A URL's hostname already
         // carries its brackets (net.isIP('[::1]') is 0).
-        var urlHost = registry.get("net").isIP(host) === 6 ? "[" + host + "]" : host;
+        var urlHost = isIP(host) === 6 ? "[" + host + "]" : host;
         // The connect target must not be movable by the caller's `path` or
         // `host`. Node cannot be: it dials `hostname`:`port` and writes `path`
-        // as an OPAQUE request target. oam carries the request as a URL
-        // string, and plain concatenation let both escape -- measured before
-        // this guard, `{hostname: SAFE, port: GOOD, path: '@127.0.0.1:EVIL/x'}`
-        // and `{hostname: 'u:p@127.0.0.1', ...}` both reached the OTHER origin,
-        // and take_userinfo then sent the intended origin to it as
-        // `Authorization: Basic base64(SAFE:GOOD)`.
+        // as an OPAQUE request target. oam's fetch path carries the request as
+        // a URL string, and plain concatenation let both escape -- measured
+        // before this guard, `{hostname: SAFE, port: GOOD, path:
+        // '@127.0.0.1:EVIL/x'}` and `{hostname: 'u:p@127.0.0.1', ...}` both
+        // reached the OTHER origin, and take_userinfo then sent the intended
+        // origin to it as `Authorization: Basic base64(SAFE:GOOD)`.
         //
         // A path that does not start with "/" is given one, so it can only
         // ever be a path (node would send it verbatim, which its own servers
-        // answer with 400); and a `host` the URL parser cannot hold as a bare
-        // authority fails the request, where node fails it in the resolver
-        // (see docs/node-divergences.md).
+        // answer with 400).
         if (reqPath.charAt(0) !== "/") reqPath = "/" + reqPath;
-        this._urlError = null;
         var authority = null;
         try {
           var probe = new URL(protocol + "//" + urlHost + "/");
@@ -18549,18 +18854,17 @@
         } catch {
           authority = null;
         }
-        if (authority === null) {
-          // node resolves the literal string and fails there. Its own code
-          // varies by spelling on Windows (ENOTFOUND for '127.0.0.1/x',
-          // EAI_FAIL for 'u:p@127.0.0.1'); oam reports the ENOTFOUND shape.
-          this._urlError = globalThis.__oamMakeSysError({
-            message: "getaddrinfo ENOTFOUND " + host,
-            errno: -3008,
-            code: "ENOTFOUND",
-            syscall: "getaddrinfo",
-            hostname: host,
-          });
-        }
+        // node hands `host` to the resolver as written. The URL parser
+        // rewrites spellings the resolver refuses -- percent-escapes, octal or
+        // zero-padded IPv4, a trailing dot on an address, a tab, IDNA,
+        // fullwidth digits -- and a transport dialling its hostname would
+        // reach an address node never dials. So a name the parser cannot
+        // hold, or holds only rewritten (or bracketed, which only some
+        // resolvers accept), goes over net.connect with the string as given:
+        // the platform's resolver answers, as it does node's.
+        this._rawHost = authority === null ||
+          (isIP(host) === 0 &&
+            (authority.hostname !== host.toLowerCase() || host.charAt(0) === "["));
         this._url = protocol + "//" + urlHost + ":" + port + reqPath;
         this._headers = {};
         if (opts.headers) {
@@ -18581,6 +18885,59 @@
         if (opts.auth && this._headers["authorization"] === undefined) {
           this._headers["authorization"] =
             "Basic " + globalThis.Buffer.from(String(opts.auth), "utf8").toString("base64");
+        }
+        // The agent path writes the Host header itself (the fetch path's
+        // transport does): node's, IPv6 bracketed, the port unless it is the
+        // agent's default.
+        this._setHost = opts.setHost !== undefined
+          ? Boolean(opts.setHost)
+          : opts.setDefaultHeaders !== false;
+        var hostHeader = host;
+        var firstColon = hostHeader.indexOf(":");
+        if (
+          firstColon !== -1 &&
+          hostHeader.indexOf(":", firstColon + 1) !== -1 &&
+          hostHeader.charAt(0) !== "["
+        ) {
+          hostHeader = "[" + hostHeader + "]";
+        }
+        if (port && +port !== defaultPort) hostHeader += ":" + port;
+        this._hostHeader = hostHeader;
+        // node: the response head limit for this request (0 or absent: the
+        // process-wide --max-http-header-size, http.maxHeaderSize), and
+        // insecureHTTPParser, which does not lift it. Validated as node's
+        // constructor validates them; an agent's options are not consulted.
+        var maxHeaderSize = opts.maxHeaderSize;
+        if (maxHeaderSize !== undefined) {
+          if (typeof maxHeaderSize !== "number") {
+            throw codes.ERR_INVALID_ARG_TYPE("maxHeaderSize", "number", maxHeaderSize);
+          }
+          if (!Number.isInteger(maxHeaderSize)) {
+            throw codes.ERR_OUT_OF_RANGE("maxHeaderSize", "an integer", maxHeaderSize);
+          }
+          if (maxHeaderSize < 0 || maxHeaderSize > Number.MAX_SAFE_INTEGER) {
+            throw codes.ERR_OUT_OF_RANGE(
+              "maxHeaderSize",
+              ">= 0 && <= " + Number.MAX_SAFE_INTEGER,
+              maxHeaderSize,
+            );
+          }
+        }
+        this.maxHeaderSize = maxHeaderSize;
+        var insecureHTTPParser = opts.insecureHTTPParser;
+        if (insecureHTTPParser !== undefined && typeof insecureHTTPParser !== "boolean") {
+          throw codes.ERR_INVALID_ARG_TYPE(
+            "options.insecureHTTPParser",
+            "boolean",
+            insecureHTTPParser,
+          );
+        }
+        this.insecureHTTPParser = insecureHTTPParser;
+        // node sets the Host header through setHeader(), whose value check
+        // throws for a character no header may carry -- a host spelled with
+        // fullwidth digits, say -- before anything is resolved.
+        if (this._setHost && this._headers.host === undefined && INVALID_HEADER_CHAR.test(this._hostHeader)) {
+          throw invalidHeaderChar("Host");
         }
         this._body = [];
         this._ended = false;
@@ -18615,23 +18972,108 @@
         this._sent = false;
         this._droppedWrites = false;
         this._finished = false;
-        var self = this;
-        this.socket = {
-          remoteAddress: host,
-          remotePort: Number(port),
-          localAddress: "127.0.0.1",
-          localPort: 0,
-          setTimeout: function(ms, cb) { if (cb) self.once("timeout", cb); return this; },
-          setNoDelay: function() { return this; },
-          setKeepAlive: function() { return this; },
-          ref: function() { return this; },
-          unref: function() { return this; },
-          destroy: function() { self.destroy(); },
-        };
+        // node: null until the 'socket' event.
+        this.socket = null;
+        this.path = reqPath;
+        this.host = host;
+        this.protocol = protocol;
+        this.reusedSocket = false;
+        // node: with an agent the socket is kept alive unless the agent could
+        // never reuse it (no keepAlive and no maxSockets cap); without one
+        // (a createConnection option) it is closed.
+        this.shouldKeepAlive = !!this.agent &&
+          !(!this.agent.keepAlive && !Number.isFinite(this.agent.maxSockets));
+        this._removedConnection = false;
+        // node's req._ended: the response has ended (the socket may be freed
+        // once the request has finished too).
+        this._responseEnd = false;
+        // An agent-path request between addRequest and its socket.
+        this._awaitingSocket = false;
+        if (opts.timeout !== undefined) this.timeout = requestTimerDuration(opts.timeout, "timeout");
+        // node's req.timeoutCb: 0 not listening for the socket's 'timeout',
+        // 1 listening (it is re-emitted on the request once), 2 done.
+        this._timeoutListen = 0;
+        this._timeoutAfterResponse = false;
+        // A response teardown held until the socket's 'timeout' listeners
+        // have all run (_onSocketTimeout).
+        this._inSocketTimeout = false;
+        this._resTeardown = null;
+        this._pendingDispatch = null;
+        this._socketEmitted = false;
+        this._responded = false;
+        this._responseDone = false;
+        this._errorEmitted = false;
+        this._bridge = null;
+        this._bridgeIn = null;
+        this._bridgeEnded = false;
+        // Bytes the socket delivered before the exchange started, and those
+        // held back until hyper has written the request (_pumpBridge).
+        this._earlyData = null;
+        this._bridgeGate = null;
+        // The socket closed after delivering a response the exchange still
+        // has to read; the request let go of a kept-alive socket.
+        this._socketGone = false;
+        this._keptAlive = false;
+        // The socket's EOF, held back while the response head is due.
+        this._eofHold = null;
+        // node's 'finish' over a socket: once end() has been called
+        // (_finishOnWrite) and the socket has written the whole request --
+        // `_requestBytes` (the bridge's count, once hyper has written it all)
+        // of the `_requestOut` bytes written so far (_requestFlushed).
+        // `_finishAwaitsPath`: end() came while the way to send was still
+        // being decided (_emitFetchSocket).
+        this._finishOnWrite = false;
+        this._finishAwaitsPath = false;
+        this._requestBytes = null;
+        this._requestOut = 0;
+        this._requestWritten = false;
+        this._exchangeQueued = false;
+        this._waitingConnect = false;
+        this._earlySocketEvents = null;
         if (callback) this.once("response", callback);
-        process.nextTick(function() {
-          self.emit("socket", self.socket);
-        });
+
+        // Which way it goes. The agent's options win over the request's, as
+        // node's createSocket merges them (`{...options, ...agent.options}`).
+        var merged = Object.assign({}, opts, agent ? agent.options : undefined);
+        var literal = isIP(host) !== 0;
+        this._agentPath =
+          (agent && !agentIsStock(agent)) ||
+          (!agent && typeof opts.createConnection === "function") ||
+          (!literal && merged.lookup != null) ||
+          (!literal && dnsLookupReplaced()) ||
+          socketLayerPatched(protocol === "https:") ||
+          (protocol === "https:" && carriesTlsPolicy(merged)) ||
+          // A socket an earlier request over this (stock) agent left in its
+          // pool is reused, as node's addRequest reuses it.
+          (!!agent && agentHasFreeSocket(agent, this, opts, host, port)) ||
+          // node sends it to the Unix socket or named pipe, never host:port;
+          // the agent's socket goes where net.connect({path}) goes.
+          !!merged.socketPath ||
+          // node binds the socket it connects to these; so does net.connect.
+          !!merged.localAddress || !!merged.localPort ||
+          this._rawHost;
+        // node dials the target itself unless its own global agent carries
+        // the environment proxy (NODE_USE_ENV_PROXY=1): a request oam's
+        // transport would send through a proxy that node would not goes
+        // over the agent's socket, which dials directly.
+        if (!this._agentPath && !(ENV_PROXY_AGENTS.has(agent) && useEnvProxy()) &&
+            natives.httpEnvProxied(this._url)) {
+          this._agentPath = true;
+        }
+        this._options = opts;
+        this._port = port;
+        this._fetchSocket = null;
+        if (this._agentPath) {
+          // node starts connecting here, in the constructor: a lookup hook
+          // runs inside http.request(), and what it throws is thrown there.
+          this._connectByAgent();
+        } else {
+          this._fetchSocket = makeFetchSocket(protocol === "https:");
+          var self = this;
+          process.nextTick(function () {
+            self._emitFetchSocket();
+          });
+        }
       }
       // Node OutgoingMessage writable-shape getters. Computed, not stored:
       // end-of-stream reads writableFinished/writableEnded directly.
@@ -18641,12 +19083,29 @@
       get writableHighWaterMark() { return 16384; }
       get writableObjectMode() { return false; }
       get writableCorked() { return 0; }
-      setHeader(name, value) { this._headers[name.toLowerCase()] = value; return this; }
+      // node's deprecated alias for `socket`.
+      get connection() { return this.socket; }
+      set connection(value) { this.socket = value; }
+      setHeader(name, value) {
+        var key = name.toLowerCase();
+        if (key === "connection") this._removedConnection = false;
+        this._headers[key] = value;
+        return this;
+      }
       getHeader(name) { return this._headers[name.toLowerCase()]; }
-      removeHeader(name) { delete this._headers[name.toLowerCase()]; }
+      removeHeader(name) {
+        var key = name.toLowerCase();
+        // node: a removed Connection header is not sent at all.
+        if (key === "connection") this._removedConnection = true;
+        delete this._headers[key];
+      }
       getHeaders() { return Object.assign({}, this._headers); }
       hasHeader(name) { return name.toLowerCase() in this._headers; }
-      flushHeaders() { /* fetch sends headers with the body */ }
+      flushHeaders() {
+        // The fetch path sends headers with the body. The agent path sends
+        // them now, the body following over the channel.
+        if (this._agentPath && !this._sent && !this.finished) this._startBodyStream(true);
+      }
       write(chunk, encoding, callback) {
         if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
         var bytes;
@@ -18686,6 +19145,7 @@
       // queued. Resolves when the transport has accepted it, so write()
       // backpressure still follows the wire.
       _channelWrite(bytes) {
+        this._fetchActivity();
         var stream = this._bodyStream;
         var next = this._channelTail === null
           ? natives.fetchBodyChannelWrite(stream, bytes)
@@ -18711,13 +19171,18 @@
       }
 
       _startBodyStreamIfOpen() {
+        this._startBodyStream(false);
+      }
+
+      // `headersOnly`: flushHeaders() -- nothing was written yet, so a GET or
+      // HEAD goes out now without dropping anything.
+      _startBodyStream(headersOnly) {
         if (this.finished || this._bodyStream !== null || this._aborted) return;
         if (this.method === "GET" || this.method === "HEAD") {
           // Upgrade handshakes (websocket preamble written before end())
-          // must keep waiting for end() -> _doUpgradeRequest; an early
-          // fetch here would consume the exchange and 'upgrade' would
-          // never fire.
-          var conn = (this._headers["connection"] || "").toLowerCase();
+          // must keep waiting for end() -> the upgrade; an early dispatch
+          // here would consume the exchange and 'upgrade' would never fire.
+          var conn = String(this._headers["connection"] || "").toLowerCase();
           if (conn.indexOf("upgrade") !== -1) return;
           // Node never chunk-frames GET/HEAD writes: the request goes out on
           // the first write and the body bytes follow UNFRAMED, so a server
@@ -18730,8 +19195,8 @@
           // pipes a Readable into a GET and waits on exactly that).
           if (this._sent) return;
           this.headersSent = true;
-          this._droppedWrites = true;
-          this._doFetchRequest(null);
+          if (!headersOnly) this._droppedWrites = true;
+          this._dispatch(null);
           return;
         }
         this._bodyStream = natives.fetchBodyChannelNew();
@@ -18739,7 +19204,7 @@
         this._body = [];
         this.headersSent = true;
         // Send now; the body follows over the channel.
-        this._doFetchRequest(null);
+        this._dispatch(null);
         for (const chunk of pending) {
           this._channelWrite(chunk).then(
             () => {},
@@ -18754,12 +19219,16 @@
         // pipeline ends the destination, then the caller ends it too --
         // fires a SECOND request over the wire.
         if (this._ended) {
-          // The response may already have arrived (a GET dispatched on its
-          // first write, or a re-end after completion): once('response')
-          // would never fire again, silently dropping the callback.
-          if (callback) {
-            if (this.res) queueMicrotask(callback);
-            else this.once("response", callback);
+          // node: the callback of a second end() waits for 'finish', or is
+          // told the message already finished.
+          if (typeof callback === "function") {
+            if (!this._finished) {
+              this.once("finish", callback);
+            } else {
+              var already = new Error("Cannot call end after a stream was finished");
+              already.code = "ERR_STREAM_ALREADY_FINISHED";
+              callback(already);
+            }
           }
           return this;
         }
@@ -18780,7 +19249,6 @@
           }
           bodyData = merged;
         }
-        var connHdr = (self._headers["connection"] || "").toLowerCase();
         if (self._bodyStream !== null) {
           // Already in flight: flush the tail and close the channel, which
           // ends the body. Must NOT send a second request.
@@ -18789,100 +19257,203 @@
         } else if (self._sent) {
           // Dispatched bodyless on first write (GET/HEAD): nothing further
           // goes on the wire, and re-sending would fire a second request.
-        } else if (connHdr.indexOf("upgrade") !== -1) {
-          self._doUpgradeRequest(bodyData);
         } else {
-          self._doFetchRequest(bodyData);
+          self._dispatch(bodyData);
         }
-        // Node emits 'finish' once the message has been handed to the
-        // socket -- here, once the body has been handed to the transport.
-        // The tick keeps the ctor's 'socket' first, matching Node's
-        // socket -> finish -> response -> close order.
+        // Node emits 'finish' once the message has been written to the
+        // socket (_finishAfterEnd). The tick keeps the ctor's 'socket'
+        // first, matching Node's socket -> finish -> response -> close
+        // order.
         process.nextTick(function () {
-          if (self._finished) return;
-          self._finished = true;
-          self._bodyLength = 0;
-          self.emit("finish");
+          self._finishAfterEnd();
         });
-        if (callback) {
-          // A GET dispatched on its first write may have its response
-          // before end() is ever called; once('response') would then
-          // never fire.
-          if (self.res) queueMicrotask(callback);
-          else self.once("response", callback);
-        }
+        // node: end()'s callback is a 'finish' listener, called with no
+        // arguments (got treats an argument as the request's failure).
+        if (typeof callback === "function") self.once("finish", callback);
         return this;
       }
+
+      // node's 'finish': the request has been written to its socket. On oam's
+      // own transport that is when the transport has it (now); over a
+      // socket, when the socket has written the last request byte, which is
+      // after it connected (_requestFlushed). A request destroyed first
+      // never finishes, as in node.
+      _finishAfterEnd() {
+        if (this._finished || this._aborted || this._errorEmitted) return;
+        if (this._agentPath) {
+          this._finishOnWrite = true;
+          if (this._requestWritten) this._emitFinish();
+          return;
+        }
+        // A 'socket' listener may still watch the socket, which sends the
+        // request over a real connection: the decision says (decide()).
+        if (!this._socketEmitted) {
+          this._finishAwaitsPath = true;
+          return;
+        }
+        this._emitFinish();
+      }
+
+      _emitFinish() {
+        if (this._finished || this._aborted) return;
+        this._finished = true;
+        this._bodyLength = 0;
+        this.emit("finish");
+      }
+
+      // The socket accepted more request bytes (or the bridge said how many
+      // the request is): once it has written them all, the request is out.
+      _requestFlushed() {
+        if (this._requestWritten || this._requestBytes === null) return;
+        if (this._requestOut < this._requestBytes) return;
+        this._requestWritten = true;
+        if (this._finishOnWrite) this._emitFinish();
+      }
+
+      // The request is ready to go (end(), a streamed body's first write, or
+      // flushHeaders()). Nothing leaves before 'socket' has been emitted and
+      // every 'socket' listener has run: they may watch the socket
+      // ('lookup' / 'connect' / 'secureConnect'), which sends the request
+      // over a real connection, or destroy it, which sends nothing.
+      _dispatch(bodyData) {
+        this._sent = true;
+        this._pendingDispatch = { bodyData: bodyData };
+        if (this._agentPath) {
+          this._maybeStartExchange();
+        } else if (this._socketEmitted) {
+          this._runFetchDispatch();
+        }
+      }
+
+      // ---- the fetch path ----
+
+      _emitFetchSocket() {
+        var socket = this._fetchSocket;
+        if (this._aborted) {
+          if (!socket.destroyed) socket.destroy();
+          return;
+        }
+        this.socket = socket;
+        socket._httpMessage = this;
+        this._attachSocketListeners(socket);
+        var listened = this.listenerCount("socket") > 0;
+        this.emit("socket", socket);
+        var self = this;
+        var decide = function () {
+          self._socketEmitted = true;
+          if (self._pendingDispatch !== null) {
+            if (self._agentPath) self._maybeStartExchange();
+            else self._runFetchDispatch();
+          }
+          if (self._finishAwaitsPath) {
+            self._finishAwaitsPath = false;
+            self._finishAfterEnd();
+          }
+        };
+        // With nothing listening for 'socket', or a socket already watched,
+        // the way to send is known now. Otherwise a 'socket' listener may
+        // still be at work -- an async one that watches the socket after an
+        // await, as it could in node, whose lookup answers a thread-pool
+        // round trip after 'socket' -- and the decision waits one turn of
+        // the loop (an immediate: due at once, no timer wait).
+        if (!listened || fetchSocketWatched(socket, this.host)) {
+          decide();
+          return;
+        }
+        globalThis.setImmediate(decide);
+      }
+
+      _runFetchDispatch() {
+        if (this._aborted || this.destroyed) return;
+        var socket = this._fetchSocket;
+        // Destroyed from a 'socket' listener: the close handler reported it,
+        // and nothing goes out.
+        if (socket.destroyed) return;
+        var conn = String(this._headers["connection"] || "").toLowerCase();
+        if (fetchSocketWatched(socket, this.host) || conn.indexOf("upgrade") !== -1) {
+          this._connectFetchSocket();
+          return;
+        }
+        this._doFetchRequest(this._pendingDispatch.bodyData);
+      }
+
+      // req.socket is watched (or the request is an upgrade): connect it
+      // for real, as the stock agent's createConnection would, so the
+      // listeners already on it fire from the connect itself, and send the
+      // request over it.
+      _connectFetchSocket() {
+        var socket = this._fetchSocket;
+        for (var i = 0; i < FETCH_SOCKET_OVERRIDES.length; i++) {
+          delete socket[FETCH_SOCKET_OVERRIDES[i]];
+        }
+        this._agentPath = true;
+        var options = this._agentConnectOptions();
+        // The socket joins the agent as createSocket's would, so the agent
+        // can keep it alive for the next request.
+        var agent = this.agent;
+        if (agent && agent.sockets && typeof agent.getName === "function") {
+          var name = options._agentKey;
+          agent.sockets[name] ||= [];
+          agent.sockets[name].push(socket);
+          agent.totalSocketCount++;
+          installListeners(agent, socket, options);
+        }
+        try {
+          socket.connect(options);
+        } catch (err) {
+          process.nextTick(function () { socket.destroy(err); });
+        }
+        this._maybeStartExchange();
+      }
+
+      // node's createSocket options: the request's, the agent's over them,
+      // the server name, `encoding: null`, the agent key.
+      _agentConnectOptions() {
+        var agent = this.agent;
+        var options = Object.assign({ __proto__: null }, this._options);
+        delete options.signal;
+        options.host = this.host;
+        options.port = this._port;
+        if (agent && agent.options) Object.assign(options, agent.options);
+        normalizeServerName(options, this);
+        var timeout = this.timeout || (agent && agent.options && agent.options.timeout) || undefined;
+        if (timeout) options.timeout = timeout;
+        if (agent && typeof agent.getName === "function") options._agentKey = agent.getName(options);
+        options.encoding = null;
+        return options;
+      }
+
       _doFetchRequest(bodyData) {
         var self = this;
         self._sent = true;
-        // A `host` the URL parser cannot hold as a bare authority: the request
-        // never goes out, and the failure surfaces as the resolver error node
-        // reports for the same options (see the constructor).
-        if (self._urlError !== null) {
-          var urlError = self._urlError;
-          process.nextTick(function () {
-            if (self._aborted) return;
-            self.errored = urlError;
-            self.destroyed = true;
-            self._emitClose();
-            self.emit("error", urlError);
-          });
-          return;
-        }
+        self._fetchActivity();
         var fetchOpts = {
           method: self.method,
           headers: self._headers,
           // node's http.request has no Fetch-spec bad-port block: port 1
           // or 25 is dialled (and refused), not refused by the client.
           __oamFetchSemantics: false,
+          // node's http client never follows a redirect: a 3xx is the
+          // response. Following it here dialled hosts the caller never
+          // named -- and a `lookup` / 'lookup' guard, which the request's
+          // own (literal) host never needed, never saw them.
+          __oamManualRedirect: true,
         };
+        // The request's own response-head limit; without one the transport
+        // applies the process-wide default.
+        if (self.maxHeaderSize) fetchOpts.__oamMaxHeaderSize = self.maxHeaderSize;
         if (self._bodyStream !== null) {
           fetchOpts.__oamBodyStream = self._bodyStream;
         } else if (bodyData && self.method !== "GET" && self.method !== "HEAD") {
           fetchOpts.body = bodyData;
         }
-        globalThis.fetch(self._url, fetchOpts).then(function (resp) {
-          if (self._aborted) return;
-          // Stream the body through a reader instead of draining
-          // arrayBuffer(): chunks surface as the server flushes them, and
-          // res.destroy() cancels the native body handle so an endless
-          // response cannot pin the event loop (Node socket-destroy
-          // semantics; test-stream-pipeline destroys mid-stream).
-          var reader = resp.body.getReader();
-          var res = new Readable({
-            read: function () {
-              reader.read().then(function (r) {
-                if (r.done) {
-                  res.push(null);
-                  self.destroyed = true;
-                  self._emitClose();
-                } else {
-                  res.push(globalThis.Buffer.from(r.value));
-                }
-              }, function (err) {
-                res.destroy(err);
-              });
-            },
-            destroy: function (err, cb) {
-              reader.cancel().then(function () { cb(err); }, function () { cb(err); });
-            },
-          });
-          res.statusCode = resp.status;
-          res.statusMessage = resp.statusText || "";
-          res.httpVersion = "1.1";
-          res.headers = {};
-          res.rawHeaders = [];
-          resp.headers.forEach(function (value, name) {
-            var key = name.toLowerCase();
-            res.headers[key] = key in res.headers ? res.headers[key] + ", " + value : value;
-            res.rawHeaders.push(name, value);
-          });
-          // Handle for req.destroy(): node destroys the socket, which
-          // surfaces as ECONNRESET on an in-flight response stream.
-          self.res = res;
-          self._res = res;
-          self.emit("response", res);
+        oamFetchInternal.fetch(self._url, fetchOpts).then(function (raw) {
+          if (self._aborted) {
+            bodyCancel(raw.bodyHandle);
+            return;
+          }
+          self._fillFetchSocket(raw);
+          self._emitResponse(raw, false);
           if (self._droppedWrites && !self._ended) {
             // Node's unframed GET/HEAD writes poison the connection, which
             // dies around response time and closes the never-finished
@@ -18918,6 +19489,14 @@
             mapped = cause;
           } else if (cause instanceof AggregateError && cause.code) {
             mapped = cause;
+          } else if (cause && typeof cause.code === "string" && cause.code.indexOf("HPE_") === 0) {
+            // node's parser error (an oversized response head): emitted as
+            // node emits it, with its `reason`.
+            mapped = withParseReason(cause);
+          } else if (cause && typeof cause.code === "string" && TLS_CERT_REFUSALS.has(cause.code)) {
+            // The certificate refused, in node's terms (the code and message
+            // tls.connect reports): the TLS socket's error node emits.
+            mapped = cause;
           } else if (/connection refused|ECONNREFUSED/i.test(detail)) {
             mapped = Object.assign(new Error("connect ECONNREFUSED"), {
               code: "ECONNREFUSED",
@@ -18928,130 +19507,988 @@
           } else {
             mapped = err instanceof Error ? err : new Error(msg);
           }
-          self.errored = mapped;
-          self.destroyed = true;
-          self._emitClose();
-          self.emit("error", mapped);
+          self._failBeforeResponse(mapped);
         });
       }
-      _doUpgradeRequest(bodyData) {
+
+      // The transport's facts about the connection the response came on,
+      // onto req.socket: node's socket has them from 'connect' on.
+      _fillFetchSocket(raw) {
+        var socket = this._fetchSocket;
+        var facts = raw.socket || {};
+        if (facts.remoteAddr) {
+          socket.remoteAddress = facts.remoteAddr.address;
+          socket.remotePort = facts.remoteAddr.port;
+          socket.remoteFamily = facts.remoteAddr.family;
+        }
+        if (facts.localAddr) {
+          socket.localAddress = facts.localAddr.address;
+          socket.localPort = facts.localAddr.port;
+          socket.localFamily = facts.localAddr.family;
+        }
+        socket.connecting = false;
+        if (socket.encrypted && raw.tls) {
+          // Only a verified certificate gets this far on the fetch path.
+          socket.authorized = true;
+          socket.authorizationError = null;
+          socket._protocol = raw.tls.protocol;
+          socket._cipher = raw.tls.cipher;
+          socket._cipherStandardName = raw.tls.cipherStandardName || null;
+          socket._peerCertificates = raw.tls.peerCertificates || null;
+          socket._peerParsed = null;
+          socket.alpnProtocol = raw.tls.alpnProtocol || false;
+        }
+        socket.emit("connect");
+        if (socket.encrypted) socket.emit("secureConnect");
+      }
+
+      // ---- the agent path (node's ClientRequest over a socket) ----
+
+      // node's "initiate connection": the agent's addRequest, or the
+      // createConnection option.
+      _connectByAgent() {
+        var options = Object.assign({ __proto__: null }, this._options);
+        delete options.signal;
+        options.port = this._port;
+        options.host = this.host;
+        this._awaitingSocket = true;
+        if (this.agent) {
+          this.agent.addRequest(this, options);
+          return;
+        }
         var self = this;
-        // Same guard as _doFetchRequest: an unusable `host` never dials.
-        if (self._urlError !== null) {
-          var urlError = self._urlError;
-          process.nextTick(function () {
-            if (self._aborted) return;
-            self.errored = urlError;
-            self.destroyed = true;
-            self._emitClose();
-            self.emit("error", urlError);
+        if (options.path || options.socketPath) {
+          options = Object.assign({ __proto__: null }, options);
+          if (options.socketPath) options.path = options.socketPath;
+          else options.path = undefined;
+        }
+        var oncreate = once(function (err, socket) {
+          if (err) {
+            self._awaitingSocket = false;
+            process.nextTick(function () {
+              if (self._aborted) self._emitClose();
+              else self._failBeforeResponse(err);
+            });
+          } else {
+            self.onSocket(socket);
+          }
+        });
+        try {
+          var socket = options.createConnection(options, oncreate);
+          if (socket) oncreate(null, socket);
+        } catch (err) {
+          oncreate(err);
+        }
+      }
+
+      // node: the agent hands the request its socket (or its failure). The
+      // socket gets a provisional 'error' / 'close' watch until 'socket' is
+      // emitted a tick later: oam's net.Socket reports a failure from
+      // destroy() synchronously, where node's does it on a later tick.
+      onSocket(socket, err) {
+        var self = this;
+        this._awaitingSocket = false;
+        if (!err && isSocketLike(socket)) {
+          var early = [];
+          var onError = function (e) { early.push(["error", e]); };
+          var onClose = function () { early.push(["close"]); };
+          socket.on("error", onError);
+          socket.on("close", onClose);
+          this._earlySocketEvents = { socket: socket, events: early, onError: onError, onClose: onClose };
+        }
+        process.nextTick(function () {
+          self._onSocketNT(socket, err);
+        });
+      }
+
+      _onSocketNT(socket, err) {
+        var early = this._earlySocketEvents;
+        this._earlySocketEvents = null;
+        if (early) {
+          early.socket.removeListener("error", early.onError);
+          early.socket.removeListener("close", early.onClose);
+        }
+        if (!err && !isSocketLike(socket)) err = unusableSocketError();
+        if (this._aborted || err) {
+          // node's onSocketNT: a request destroyed before its socket came
+          // hands a healthy socket back to its agent ('free': the next
+          // queued request, or the pool).
+          if (isSocketLike(socket)) {
+            if (!err && this.agent && !socket.destroyed) socket.emit("free");
+            else if (!socket.destroyed) socket.destroy();
+          }
+          if (!this._aborted) {
+            this._failBeforeResponse(err);
+            return;
+          }
+          // ...and then reports it: a destroy() (not an abort()) as the
+          // hang-up, then 'close'.
+          if (!this._errorEmitted) {
+            var failure = err || (this.aborted ? null : connResetException("socket hang up"));
+            if (failure) {
+              this._errorEmitted = true;
+              this.errored = failure;
+              this.emit("error", failure);
+            }
+          }
+          this._emitClose();
+          return;
+        }
+        this.socket = socket;
+        socket._httpMessage = this;
+        this._attachSocketListeners(socket);
+        this._captureEarlyData(socket);
+        this.emit("socket", socket);
+        this._socketEmitted = true;
+        if (early) {
+          for (var i = 0; i < early.events.length; i++) {
+            if (early.events[i][0] === "error") this._onSocketError(early.events[i][1]);
+            else this._onSocketClose();
+          }
+        }
+        this._maybeStartExchange();
+      }
+
+      // node's tickOnSocket attaches the parser's 'data' listener before
+      // 'socket' is emitted: bytes the socket delivers before the exchange
+      // starts (a proxy agent replaying a response into a fake socket from
+      // its 'socket' listener) are kept for it, as is their end.
+      _captureEarlyData(socket) {
+        var early = { socket: socket, chunks: [], ended: false };
+        early.onData = function (chunk) {
+          early.chunks.push(typeof chunk === "string" ? globalThis.Buffer.from(chunk, "latin1") : chunk);
+        };
+        early.onEnd = function () { early.ended = true; };
+        socket.on("data", early.onData);
+        socket.on("end", early.onEnd);
+        this._earlyData = early;
+      }
+
+      // What arrived before the exchange started, its listeners removed.
+      _takeEarlyData() {
+        var early = this._earlyData;
+        if (!early) return null;
+        this._earlyData = null;
+        early.socket.removeListener("data", early.onData);
+        early.socket.removeListener("end", early.onEnd);
+        return early;
+      }
+
+      _attachSocketListeners(socket) {
+        var self = this;
+        this._socketListeners = {
+          error: function (err) { self._onSocketError(err); },
+          close: function () { self._onSocketClose(); },
+          timeout: function () { self._onSocketTimeout(); },
+        };
+        // node's tickOnSocket: a request with a timeout -- its own, or its
+        // agent's (the global agents' is 5 s) -- hears its socket's.
+        var agent = this.agent;
+        if (this.timeout !== undefined || (agent && agent.options && agent.options.timeout)) {
+          this._listenSocketTimeout();
+        }
+        // The stand-in's idle timeout is the one node's agent gives the
+        // socket it creates: the request's timeout, else the agent's.
+        if (socket === this._fetchSocket && !this._agentPath) {
+          var idle = this.timeout || (agent && agent.options && agent.options.timeout) || 0;
+          if (idle) socket.setTimeout(idle);
+        }
+        socket.on("error", this._socketListeners.error);
+        socket.on("close", this._socketListeners.close);
+        socket.on("timeout", this._socketListeners.timeout);
+      }
+
+      _listenSocketTimeout() {
+        if (this._timeoutListen !== 0) return;
+        this._timeoutListen = 1;
+        // node adds its request listener to the socket's 'timeout' now; one
+        // added after the response came runs after the response's own.
+        this._timeoutAfterResponse = this.res != null;
+      }
+
+      // The socket went idle: node's two socket 'timeout' listeners, in the
+      // order they were added -- emitRequestTimeout (the request, once,
+      // while it listens) and responseOnTimeout (the response, every time)
+      // -- until the response has ended. A request destroyed from its
+      // 'timeout' listener tears its response down after both have run, as
+      // node's does when the destroyed socket closes.
+      _onSocketTimeout() {
+        if (this._responseEnd || this.destroyed) return;
+        var self = this;
+        var toRequest = function () {
+          if (self._timeoutListen !== 1) return;
+          self._timeoutListen = 2;
+          self.emit("timeout");
+        };
+        var toResponse = function () {
+          if (self.res) self.res.emit("timeout");
+        };
+        this._inSocketTimeout = true;
+        try {
+          if (this._timeoutAfterResponse) {
+            toResponse();
+            toRequest();
+          } else {
+            toRequest();
+            toResponse();
+          }
+        } finally {
+          this._inSocketTimeout = false;
+          var teardown = this._resTeardown;
+          this._resTeardown = null;
+          if (teardown !== null) teardown();
+        }
+      }
+
+      // The transport did something for this request (sent it, a body
+      // chunk, the response head, a response chunk): the fetch path's
+      // stand-in socket was active, as a real one is on a read or write.
+      _fetchActivity() {
+        var socket = this._fetchSocket;
+        if (this._agentPath || !socket || socket.destroyed) return;
+        if (socket._timeoutMs > 0) socket._resetTimeout();
+      }
+
+      _detachSocketListeners(socket) {
+        var l = this._socketListeners;
+        if (!l) return;
+        socket.removeListener("error", l.error);
+        socket.removeListener("close", l.close);
+        socket.removeListener("timeout", l.timeout);
+        this._socketListeners = null;
+      }
+
+      // node's socketErrorListener: before the response, the request fails
+      // with the socket's own error object.
+      _onSocketError(err) {
+        if (this._aborted) return;
+        if (!this._responded) {
+          this._failBeforeResponse(err);
+          // The fetch path's stand-in destroyed with an error aborts the
+          // request there and then: a response that lands before its 'close'
+          // (a TLSSocket's comes a tick later) is dropped, not delivered after
+          // the error.
+          if (!this._agentPath) {
+            this._aborted = true;
+            this._cancelBodyStream();
+          }
+        } else if (this.res && !this.res.complete && !this.res.destroyed) {
+          this.res.destroy(err);
+        }
+      }
+
+      // node's socketCloseListener.
+      _onSocketClose() {
+        if (this._aborted || this._responseDone) return;
+        if (this._agentPath) {
+          if (this._bridge !== null) {
+            // What arrived before the close decides: hyper sees the end of
+            // the stream after every byte already read.
+            this._bridgeInEnd();
+          } else if (!this._responded) {
+            var early = this._earlyData;
+            if (early && early.chunks.length > 0 && this._pendingDispatch !== null) {
+              // The socket delivered bytes before it went (node's parser
+              // reads them as they come: a proxy agent's replayed answer):
+              // the exchange still runs over them, then sees the end.
+              early.ended = true;
+              this._socketGone = true;
+              this._maybeStartExchange();
+            } else {
+              this._failBeforeResponse(connResetException("socket hang up"));
+            }
+          }
+          return;
+        }
+        // The fetch path's stand-in was destroyed: the request is aborted.
+        // The transport's result, whenever it comes, is dropped.
+        this._aborted = true;
+        this._cancelBodyStream();
+        if (!this._responded) {
+          if (!this._errorEmitted) {
+            this._errorEmitted = true;
+            var hangUp = connResetException("socket hang up");
+            this.errored = hangUp;
+            this.destroyed = true;
+            this._emitClose();
+            this.emit("error", hangUp);
+            return;
+          }
+        } else if (this.res && !this.res.destroyed) {
+          this.res.destroy(connResetException("aborted"));
+        }
+        this.destroyed = true;
+        this._emitClose();
+      }
+
+      _failBeforeResponse(err) {
+        if (this._errorEmitted || this._aborted) return;
+        this._errorEmitted = true;
+        this.errored = err;
+        this.destroyed = true;
+        // node destroys the socket with the error: its idle timer is done.
+        this._stopFetchSocketTimer();
+        this._closeBridge();
+        this._emitClose();
+        this.emit("error", err);
+      }
+
+      // The exchange starts once 'socket' has been emitted, the socket is
+      // usable (connected, or secureConnect'ed) and the request has been
+      // dispatched -- in the tick after the last of the three, so every
+      // 'connect' / 'secureConnect' listener, a guard's included, has run
+      // first, and a socket one of them destroyed sends nothing.
+      _maybeStartExchange() {
+        if (!this._agentPath || this._exchangeQueued) return;
+        if (this._pendingDispatch === null || !this._socketEmitted) return;
+        var socket = this.socket;
+        if (!socket || (socket.destroyed && !this._socketGone) || this._aborted) return;
+        var self = this;
+        if (socket.connecting && !this._socketGone) {
+          if (!this._waitingConnect) {
+            this._waitingConnect = true;
+            socket.once(socket.encrypted ? "secureConnect" : "connect", function () {
+              self._waitingConnect = false;
+              self._maybeStartExchange();
+            });
+          }
+          return;
+        }
+        this._exchangeQueued = true;
+        process.nextTick(function () {
+          if ((socket.destroyed && !self._socketGone) || self._aborted || self.destroyed) return;
+          self._startExchange();
+        });
+      }
+
+      // The request's header lines, in order: the caller's, then Host (node's
+      // rule), then -- for the bridge -- node's Connection header.
+      _headerList(forBridge) {
+        var list = [];
+        var headers = this._headers;
+        var names = Object.keys(headers);
+        for (var i = 0; i < names.length; i++) {
+          var value = headers[names[i]];
+          if (Array.isArray(value)) {
+            for (var j = 0; j < value.length; j++) list.push([names[i], String(value[j])]);
+          } else {
+            list.push([names[i], String(value)]);
+          }
+        }
+        if (headers.host === undefined && this._setHost) list.push(["host", this._hostHeader]);
+        if (forBridge) {
+          var connection = this._connectionHeader();
+          if (connection !== null) list.push(["connection", connection]);
+        }
+        return list;
+      }
+
+      // node's _storeHeader keep-alive logic: a Connection header the caller
+      // set is sent as set (and one that is not `close` keeps the socket
+      // alive); a removed one is not sent; otherwise `keep-alive` when the
+      // socket is to be kept, else `close`.
+      _connectionHeader() {
+        var set = this._headers.connection;
+        if (set !== undefined) {
+          if (!/(?:^|\W)close(?:$|\W)/i.test(String(set))) this.shouldKeepAlive = true;
+          return null;
+        }
+        if (this._removedConnection) return null;
+        var method = this.method;
+        var chunkedByDefault = method !== "GET" && method !== "HEAD" && method !== "DELETE" &&
+          method !== "OPTIONS" && method !== "TRACE" && method !== "CONNECT";
+        var send = this.shouldKeepAlive &&
+          (this._headers["content-length"] !== undefined || chunkedByDefault || !!this.agent);
+        return send ? "keep-alive" : "close";
+      }
+
+      _startExchange() {
+        var socket = this.socket;
+        // A reused socket carries this exchange only once the last one on it
+        // has finished writing (hyper releases its end of the pipe then).
+        var tail = socket[kSocketBridgeTail];
+        if (tail) {
+          socket[kSocketBridgeTail] = null;
+          var waiting = this;
+          tail.then(function () {
+            if (socket.destroyed || waiting._aborted || waiting.destroyed) return;
+            waiting._startExchange();
           });
           return;
         }
-        var parsed = new URL(self._url);
-        var host = parsed.hostname;
-        var port = Number(parsed.port) || (parsed.protocol === "https:" ? 443 : 80);
-        var reqPath = parsed.pathname + parsed.search;
-        // Node's http hands net the hostname without URL brackets
-        // (urlToHttpOptions); the Host header keeps them.
-        var connectHost = host.charAt(0) === "[" ? host.slice(1, -1) : host;
-        var net = registry.get("net");
-        // A refusal is emitted as the connect op rejected it: node's own
-        // shape (address/port, or the NodeAggregateError of a `localhost`
-        // whose every address refused).
-        natives.tcpConnect(connectHost, port, net.getDefaultAutoSelectFamilyAttemptTimeout()).then(function (result) {
-          var handle = result.handle;
-          if (!self._headers["host"]) {
-            self._headers["host"] = port === 80 ? host : host + ":" + port;
+        var bodyData = this._pendingDispatch.bodyData;
+        var conn = String(this._headers["connection"] || "").toLowerCase();
+        if (conn.indexOf("upgrade") !== -1) {
+          this._upgradeOver(socket, bodyData);
+          return;
+        }
+        var request = {
+          method: this.method,
+          target: this.path,
+          headers: this._headerList(true),
+          max_header_size: this._maxHeaderSizeLimit(),
+        };
+        if (this._bodyStream !== null) {
+          request.body_stream = this._bodyStream;
+        } else if (bodyData && bodyData.length > 0) {
+          request.body_base64 = globalThis.Buffer.from(
+            bodyData.buffer, bodyData.byteOffset, bodyData.byteLength,
+          ).toString("base64");
+        }
+        var id;
+        try {
+          id = natives.httpBridgeStart(JSON.stringify(request));
+        } catch (err) {
+          this._failBeforeResponse(err);
+          socket.destroy();
+          return;
+        }
+        this._bridge = id;
+        this._holdSocketEof(socket);
+        this._pumpBridge(socket, id);
+        var self = this;
+        natives.httpBridgeResponse(id).then(function (raw) {
+          if (self._aborted) {
+            self._releaseSocketEof();
+            bodyCancel(raw.bodyHandle);
+            return;
           }
-          var reqLine = self.method + " " + reqPath + " HTTP/1.1\r\n";
-          var headerStr = "";
-          var hkeys = Object.keys(self._headers);
-          for (var hi = 0; hi < hkeys.length; hi++) {
-            headerStr += hkeys[hi] + ": " + self._headers[hkeys[hi]] + "\r\n";
-          }
-          var reqBytes = globalThis.Buffer.from(reqLine + headerStr + "\r\n");
-          natives.tcpWrite(handle, reqBytes).then(function () {
-            var responseBuf = globalThis.Buffer.alloc(0);
-            function readMore() {
-              natives.tcpRead(handle, 4096).then(function (chunk) {
-                if (chunk === undefined) {
-                  self.emit("error", new Error("connection closed before upgrade response"));
+          self._emitResponse(raw, true);
+          self._releaseSocketEof();
+        }, function (err) {
+          self._releaseSocketEof();
+          if (self._aborted) return;
+          self._failBeforeResponse(withParseReason(err));
+          if (!socket.destroyed) socket.destroy();
+        });
+      }
+
+      // node's parser emits 'response' as it reads the head, before the
+      // socket gets to an EOF that came right behind it. Here the head comes
+      // back from the bridge some ticks after its bytes were read, and by
+      // then a socket that ends itself on EOF (allowHalfOpen false) may have
+      // closed: address() empty, no peer certificate at 'response'. So
+      // while the head is outstanding an EOF only half-closes the socket
+      // (the bridge still sees it), and the end it would have caused
+      // follows once the head has been emitted.
+      _holdSocketEof(socket) {
+        if (socket.allowHalfOpen !== false) return;
+        var hold = { socket: socket, ended: false, onEnd: null };
+        hold.onEnd = function () { hold.ended = true; };
+        socket.allowHalfOpen = true;
+        socket.once("end", hold.onEnd);
+        this._eofHold = hold;
+      }
+      _releaseSocketEof() {
+        var hold = this._eofHold;
+        if (!hold) return;
+        this._eofHold = null;
+        var socket = hold.socket;
+        socket.removeListener("end", hold.onEnd);
+        socket.allowHalfOpen = false;
+        if (!hold.ended || socket.destroyed) return;
+        var ws = socket._writableState;
+        if (ws ? !ws.ended : !socket.writableEnded) socket.end();
+      }
+
+      // node's parser limit for this request's response head: its own
+      // maxHeaderSize, or (0 / absent) the process-wide one.
+      _maxHeaderSizeLimit() {
+        var limit = this.maxHeaderSize || registry.get("http").maxHeaderSize;
+        // (node's http.maxHeaderSize is a read-only getter; a reassigned
+        // one here must not unbound the head or break the request.)
+        return Number.isSafeInteger(limit) && limit > 0 ? limit : 16384;
+      }
+
+      // Bytes between the socket and the bridge. The socket is paused while
+      // its last chunk is still going into the bridge (read backpressure),
+      // and the next request bytes are taken only once the socket accepted
+      // the last ones (write backpressure).
+      _pumpBridge(socket, id) {
+        var self = this;
+        var early = this._takeEarlyData();
+        this._bridgeIn = Promise.resolve();
+        var onData = function (chunk) {
+          var bytes = typeof chunk === "string" ? globalThis.Buffer.from(chunk, "latin1") : chunk;
+          if (typeof socket.pause === "function") socket.pause();
+          self._bridgeIn = self._bridgeIn
+            .then(function () { return natives.httpBridgeIn(id, bytes); })
+            .then(function () {
+              if (!socket.destroyed && typeof socket.resume === "function") socket.resume();
+            }, function () {});
+        };
+        var onEnd = function () { self._bridgeInEnd(); };
+        // Bytes the socket delivered before the exchange (a proxy agent's
+        // replayed answer) reach hyper only once it has written the request:
+        // an idle hyper connection that reads an answer and an EOF first
+        // takes them for the peer closing, where node's parser just reads
+        // them. Until then what the socket delivers queues behind them.
+        var gate = early !== null && (early.chunks.length > 0 || early.ended)
+          ? { chunks: early.chunks.slice(), ended: early.ended }
+          : null;
+        this._bridgeGate = gate;
+        var onSocketData = function (chunk) {
+          if (gate !== null) gate.chunks.push(chunk);
+          else onData(chunk);
+        };
+        var onSocketEnd = function () {
+          if (gate !== null) gate.ended = true;
+          else onEnd();
+        };
+        var openGate = function () {
+          if (gate === null) return;
+          var held = gate;
+          gate = null;
+          self._bridgeGate = null;
+          for (var ei = 0; ei < held.chunks.length; ei++) onData(held.chunks[ei]);
+          if (held.ended) onEnd();
+        };
+        socket.on("data", onSocketData);
+        socket.on("end", onSocketEnd);
+        this._bridgeSocketListeners = { socket: socket, data: onSocketData, end: onSocketEnd };
+        // Settles once every byte hyper wrote for this exchange has been
+        // written to the socket and hyper released the pipe: the point a
+        // reused socket may carry the next exchange.
+        var outDone;
+        this._bridgeOutDone = new Promise(function (resolve) { outDone = resolve; });
+        var pumpOut = function () {
+          natives.httpBridgeOut(id).then(function (bytes) {
+            // hyper has written (or is done): early bytes may follow.
+            openGate();
+            // undefined: hyper is done with the connection.
+            if (bytes === undefined || socket.destroyed) {
+              outDone();
+              return;
+            }
+            socket.write(
+              globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+              function (err) {
+                if (err) {
+                  outDone();
                   return;
                 }
-                responseBuf = globalThis.Buffer.concat([responseBuf, globalThis.Buffer.from(chunk)]);
-                var headerEnd = -1;
-                for (var si = 0; si < responseBuf.length - 3; si++) {
-                  if (responseBuf[si] === 13 && responseBuf[si+1] === 10 && responseBuf[si+2] === 13 && responseBuf[si+3] === 10) {
-                    headerEnd = si;
-                    break;
-                  }
-                }
-                if (headerEnd === -1) { readMore(); return; }
-                var headStr = responseBuf.slice(0, headerEnd).toString();
-                var headBytes = headerEnd + 4;
-                var remaining = responseBuf.slice(headBytes);
-                var lines = headStr.split("\r\n");
-                var statusLine = lines[0] || "";
-                var statusMatch = statusLine.match(/HTTP\/\d\.\d (\d+)/);
-                var statusCode = statusMatch ? Number(statusMatch[1]) : 0;
-                var resHeaders = {};
-                var rawHeaders = [];
-                for (var li = 1; li < lines.length; li++) {
-                  var colonIdx = lines[li].indexOf(":");
-                  if (colonIdx !== -1) {
-                    var hname = lines[li].slice(0, colonIdx);
-                    var hval = lines[li].slice(colonIdx + 1).trim();
-                    var lname = hname.toLowerCase();
-                    resHeaders[lname] = lname in resHeaders ? resHeaders[lname] + ", " + hval : hval;
-                    rawHeaders.push(hname, hval);
-                  }
-                }
-                if (statusCode === 101) {
-                  var NetSocket = registry.get("net").Socket;
-                  var socket = new NetSocket({
-                    _handle: handle,
-                    _remoteAddr: result.remoteAddr,
-                  });
-                  socket._readLoop();
-                  var res = new Readable({ read: function () {} });
-                  res.statusCode = statusCode;
-                  res.statusMessage = statusLine.slice(statusLine.indexOf(" " + statusCode) + String(statusCode).length + 2) || "";
-                  res.httpVersion = "1.1";
-                  res.headers = resHeaders;
-                  res.rawHeaders = rawHeaders;
-                  self.emit("upgrade", res, socket, remaining);
-                } else {
-                  var res = new Readable({ read: function () {} });
-                  res.statusCode = statusCode;
-                  res.statusMessage = "";
-                  res.httpVersion = "1.1";
-                  res.headers = resHeaders;
-                  res.rawHeaders = rawHeaders;
-                  // Handle for req.destroy(): node destroys the socket, which
-                  // surfaces as ECONNRESET on an in-flight response stream.
-                  self.res = res;
-                  self._res = res;
-                  self.emit("response", res);
-                  if (remaining.length > 0) res.push(remaining);
-                  natives.tcpRead(handle, 65536).then(function readRest(chunk) {
-                    if (chunk === undefined) { res.push(null); return; }
-                    res.push(globalThis.Buffer.from(chunk));
-                    natives.tcpRead(handle, 65536).then(readRest);
-                  });
-                }
-              }, function (err) { self.emit("error", err); });
-            }
-            readMore();
-          }, function (err) { self.emit("error", err); });
-        }, function (err) { self.emit("error", err); });
+                self._requestOut += bytes.byteLength;
+                self._requestFlushed();
+                pumpOut();
+              },
+            );
+          }, function () { outDone(); });
+        };
+        pumpOut();
+        // How many of those bytes are the request, once hyper has written it
+        // all: node's 'finish' waits for the socket to have written them.
+        natives.httpBridgeRequestSent(id).then(function (count) {
+          if (count === undefined) return;
+          self._requestBytes = count;
+          self._requestFlushed();
+        }, function () {});
       }
+
+      _bridgeInEnd() {
+        if (this._bridge === null || this._bridgeEnded) return;
+        // Behind bytes still held for hyper: the end follows them.
+        if (this._bridgeGate) {
+          this._bridgeGate.ended = true;
+          return;
+        }
+        this._bridgeEnded = true;
+        var id = this._bridge;
+        this._bridgeIn = this._bridgeIn.then(function () {
+          return natives.httpBridgeInEnd(id);
+        }).then(function () {}, function () {});
+      }
+
+      _closeBridge() {
+        this._takeEarlyData();
+        var listeners = this._bridgeSocketListeners;
+        if (listeners) {
+          listeners.socket.removeListener("data", listeners.data);
+          listeners.socket.removeListener("end", listeners.end);
+          this._bridgeSocketListeners = null;
+        }
+        if (this._bridge !== null) {
+          natives.httpBridgeClose(this._bridge);
+          this._bridge = null;
+        }
+      }
+
+      // The response is done and the socket stays open for another request:
+      // the socket stops feeding this exchange, which is left to finish
+      // writing (its pipe is closed once hyper released it, or when the
+      // socket closes), and the socket reads on -- a peer's FIN on an idle
+      // pooled socket closes it, which takes it out of the pool.
+      _releaseBridge(socket) {
+        this._takeEarlyData();
+        var listeners = this._bridgeSocketListeners;
+        if (listeners) {
+          listeners.socket.removeListener("data", listeners.data);
+          listeners.socket.removeListener("end", listeners.end);
+          this._bridgeSocketListeners = null;
+        }
+        var id = this._bridge;
+        this._bridge = null;
+        if (id === null) return;
+        var closed = false;
+        var closeBridge = function () {
+          if (closed) return;
+          closed = true;
+          socket.removeListener("close", closeBridge);
+          natives.httpBridgeClose(id);
+        };
+        socket.on("close", closeBridge);
+        socket[kSocketBridgeTail] = (this._bridgeOutDone || Promise.resolve()).then(closeBridge);
+        if (!socket.destroyed && typeof socket.resume === "function") socket.resume();
+      }
+
+      // An upgrade over the socket: the request head written straight to it,
+      // the response head read off it, and on a 101 the socket handed to the
+      // 'upgrade' listener with whatever followed the head.
+      _upgradeOver(socket, bodyData) {
+        var self = this;
+        var list = this._headerList(false);
+        // This head is written by hand, so it gets the checks the bridge's
+        // parser applies to every other request (node refuses the same
+        // names and values at setHeader()): a token for the method and each
+        // name, no CR / LF / NUL in a value.
+        var bad = null;
+        if (!HTTP_TOKEN.test(this.method)) {
+          bad = invalidHttpToken("Method", this.method);
+        }
+        for (var i = 0; bad === null && i < list.length; i++) {
+          if (!HTTP_TOKEN.test(list[i][0])) {
+            bad = invalidHttpToken("Header name", list[i][0]);
+          } else if (INVALID_HEADER_CHAR.test(list[i][1])) {
+            bad = invalidHeaderChar(list[i][0]);
+          }
+        }
+        if (bad !== null) {
+          this._failBeforeResponse(bad);
+          socket.destroy();
+          return;
+        }
+        var head = this.method + " " + this.path + " HTTP/1.1\r\n";
+        for (var h = 0; h < list.length; h++) head += list[h][0] + ": " + list[h][1] + "\r\n";
+        // The request is out once the socket has written its last piece.
+        var written = function (err) {
+          if (err) return;
+          self._requestWritten = true;
+          if (self._finishOnWrite) self._emitFinish();
+        };
+        var headBytes = globalThis.Buffer.from(head + "\r\n", "latin1");
+        if (bodyData && bodyData.length > 0) {
+          socket.write(headBytes);
+          socket.write(bodyData, written);
+        } else {
+          socket.write(headBytes, written);
+        }
+        var responseBuf = globalThis.Buffer.alloc(0);
+        // node's parser gives up on a head past maxHeaderSize (16 KiB by
+        // default): a peer that never ends its head cannot grow this buffer
+        // without bound. (The raw head is measured here, CRLFs included --
+        // a bound, not node's exact count.)
+        var maxHeaderSize = this._maxHeaderSizeLimit();
+        var onEnd = function () {
+          socket.removeListener("data", onData);
+          self._failBeforeResponse(connResetException("socket hang up"));
+        };
+        var onData = function (chunk) {
+          var bytes = typeof chunk === "string" ? globalThis.Buffer.from(chunk, "latin1") : chunk;
+          responseBuf = globalThis.Buffer.concat([responseBuf, bytes]);
+          var headerEnd = responseBuf.indexOf("\r\n\r\n");
+          if (headerEnd === -1 || headerEnd > maxHeaderSize) {
+            if (responseBuf.length > maxHeaderSize) {
+              socket.removeListener("data", onData);
+              socket.removeListener("end", onEnd);
+              var overflow = new Error("Parse Error: Header overflow");
+              overflow.code = "HPE_HEADER_OVERFLOW";
+              self._failBeforeResponse(withParseReason(overflow));
+              socket.destroy();
+            }
+            return;
+          }
+          socket.removeListener("data", onData);
+          socket.removeListener("end", onEnd);
+          var headStr = responseBuf.slice(0, headerEnd).toString("latin1");
+          var remaining = responseBuf.slice(headerEnd + 4);
+          var lines = headStr.split("\r\n");
+          var statusLine = lines[0] || "";
+          var statusMatch = statusLine.match(/^HTTP\/(\d)\.(\d) (\d{3})(?: (.*))?$/);
+          var statusCode = statusMatch ? Number(statusMatch[3]) : 0;
+          var pairs = [];
+          for (var li = 1; li < lines.length; li++) {
+            var colonIdx = lines[li].indexOf(":");
+            if (colonIdx !== -1) {
+              pairs.push([lines[li].slice(0, colonIdx), lines[li].slice(colonIdx + 1).trim()]);
+            }
+          }
+          var parsed = agentPathHeaders(pairs);
+          // A non-101 answer is read off the socket as the consumer reads
+          // it: the socket is paused while the response is full.
+          var socketPaused = false;
+          var res = new Readable({
+            read: function () {
+              if (socketPaused) {
+                socketPaused = false;
+                if (typeof socket.resume === "function") socket.resume();
+              }
+            },
+            // node's IncomingMessage._destroy, as for every other response.
+            destroy: function (err, cb) {
+              if (!res.complete) {
+                res.aborted = true;
+                res.emit("aborted");
+              }
+              process.nextTick(function () {
+                cb(res.listenerCount("error") > 0 ? err : undefined);
+              });
+            },
+          });
+          res.aborted = false;
+          res.statusCode = statusCode;
+          res.statusMessage = statusMatch && statusMatch[4] ? statusMatch[4] : "";
+          res.httpVersion = statusMatch ? statusMatch[1] + "." + statusMatch[2] : "1.1";
+          res.headers = parsed.headers;
+          res.rawHeaders = parsed.raw;
+          res.socket = res.connection = socket;
+          res.req = self;
+          self._responded = true;
+          if (statusCode === 101) {
+            // node: the socket leaves the agent and the request; its new
+            // owner starts reading it.
+            self._responseDone = true;
+            self._detachSocketListeners(socket);
+            socket.emit("agentRemove");
+            socket._httpMessage = null;
+            if (self.listenerCount("upgrade") === 0) {
+              socket.destroy();
+            } else {
+              self.emit("upgrade", res, socket, remaining);
+            }
+            self.destroyed = true;
+            self._emitClose();
+            return;
+          }
+          // Not upgraded: an ordinary response, read to the end of the
+          // connection.
+          self.res = res;
+          self._res = res;
+          self.emit("response", res);
+          if (remaining.length > 0) res.push(remaining);
+          socket.on("data", function (more) {
+            if (!res.push(more) && !socketPaused && typeof socket.pause === "function") {
+              socketPaused = true;
+              socket.pause();
+            }
+          });
+          socket.on("end", function () {
+            res.complete = true;
+            res.push(null);
+            self._responseDone = true;
+            self.destroyed = true;
+            self._emitClose();
+          });
+        };
+        var early = this._takeEarlyData();
+        socket.on("data", onData);
+        socket.on("end", onEnd);
+        if (early !== null) {
+          for (var ei = 0; ei < early.chunks.length; ei++) {
+            if (socket.listenerCount("data") === 0 || this._responded) break;
+            onData(early.chunks[ei]);
+          }
+          if (early.ended && !this._responded) onEnd();
+        }
+      }
+
+      // ---- both paths ----
+
+      _emitResponse(raw, agentPath) {
+        var self = this;
+        var handle = raw.bodyHandle;
+        var settled = false;
+        // Stream the body through the handle instead of draining it: chunks
+        // surface as the server flushes them, and res.destroy() cancels the
+        // native body so an endless response cannot pin the event loop
+        // (Node socket-destroy semantics; test-stream-pipeline destroys
+        // mid-stream).
+        var res = new Readable({
+          read: function () {
+            bodyRead(handle).then(function (chunk) {
+              if (chunk === undefined) {
+                settled = true;
+                res.complete = true;
+                res.push(null);
+                self._responseEnded();
+              } else {
+                if (!agentPath) self._fetchActivity();
+                res.push(globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+              }
+            }, function (err) {
+              settled = true;
+              if (agentPath) {
+                // node's parser reports malformed framing on the request
+                // before the response is aborted; a connection that ends
+                // inside a body just aborts it.
+                if (err && typeof err.code === "string" && err.code.indexOf("HPE_") === 0) {
+                  self.errored = withParseReason(err);
+                  self.emit("error", err);
+                }
+                err = connResetException("aborted");
+              }
+              res.destroy(err);
+            });
+          },
+          // node's IncomingMessage._destroy: an unfinished response is
+          // 'aborted', the request closes, and the error is emitted only if
+          // something listens for it.
+          destroy: function (err, cb) {
+            if (!settled) {
+              settled = true;
+              bodyCancel(handle);
+            }
+            if (!res.complete) {
+              res.aborted = true;
+              res.emit("aborted");
+            }
+            self._responseAborted();
+            process.nextTick(function () {
+              cb(res.listenerCount("error") > 0 ? err : undefined);
+            });
+          },
+        });
+        res.aborted = false;
+        var parsed = agentPath ? agentPathHeaders(raw.headers) : fetchPathHeaders(raw.headers);
+        res.statusCode = raw.status;
+        res.statusMessage = raw.statusText || "";
+        res.httpVersion = agentPath && raw.httpVersion ? raw.httpVersion : "1.1";
+        res.headers = parsed.headers;
+        res.rawHeaders = parsed.raw;
+        res.complete = false;
+        res.socket = res.connection = this.socket;
+        res.req = this;
+        this._responded = true;
+        // Handle for req.destroy(): node destroys the socket, which
+        // surfaces as ECONNRESET on an in-flight response stream.
+        this.res = res;
+        this._res = res;
+        if (!agentPath) {
+          this._fetchActivity();
+          // node detaches a kept-alive socket from the response at its end;
+          // the transport's connection stays pooled likewise.
+          if (this.shouldKeepAlive && responseKeepsAlive(raw, this.method)) {
+            res.on("end", function () {
+              res.socket = null;
+              res.connection = null;
+            });
+          }
+          this.emit("response", res);
+          return;
+        }
+        // node's parserOnIncomingClient: the socket is kept only if the
+        // response allows it, and the response's end -- seen first, before
+        // any 'end' listener of the caller's -- decides what becomes of it.
+        if (this.shouldKeepAlive && !responseKeepsAlive(raw, this.method)) {
+          this.shouldKeepAlive = false;
+        }
+        res.on("end", function () {
+          self._agentResponseOnEnd(res);
+        });
+        // A response nobody listens for is read to its end, so the socket
+        // is not left holding it.
+        if (!this.emit("response", res)) res.resume();
+      }
+
+      // node's responseOnEnd.
+      _agentResponseOnEnd(res) {
+        var self = this;
+        this._responseEnd = true;
+        if (!this.shouldKeepAlive) {
+          // The connection is done with once its response is -- closed
+          // after the response's own 'end' has been delivered.
+          var socket = this.socket;
+          globalThis.setImmediate(function () {
+            self._closeBridge();
+            if (socket) {
+              socket._httpMessage = null;
+              if (!socket.destroyed) socket.destroy();
+            }
+          });
+          this.destroyed = true;
+          this._emitClose();
+        } else if (this._finished && !res.aborted) {
+          this._responseKeepAlive();
+        } else {
+          // node's requestOnFinish: the whole response arrived before the
+          // request finished.
+          this.once("finish", function () {
+            if (self.shouldKeepAlive && self._responseEnd) self._responseKeepAlive();
+          });
+        }
+      }
+
+      // node's responseKeepAlive + emitFreeNT: the request lets go of the
+      // socket, closes, and the socket is 'free' for its agent.
+      _responseKeepAlive() {
+        var socket = this.socket;
+        if (!socket || this._keptAlive) return;
+        this._keptAlive = true;
+        this._detachSocketListeners(socket);
+        this._releaseBridge(socket);
+        this.destroyed = true;
+        if (this.res) {
+          // Detach the socket from the response, so destroying the response
+          // does not destroy the freed socket.
+          this.res.socket = null;
+          this.res.connection = null;
+        }
+        var self = this;
+        process.nextTick(function () {
+          if (!self.closed) {
+            self.closed = true;
+            self.emit("close");
+          }
+          if (self.socket) self.socket.emit("free");
+        });
+      }
+
+      // The response stopped before its end (a failed body, a destroy): the
+      // connection is done with, and the request closes.
+      _responseAborted() {
+        if (this._responseDone) return;
+        this._responseDone = true;
+        this._closeBridge();
+        var socket = this.socket;
+        if (socket && isSocketLike(socket) && !socket.destroyed) socket.destroy();
+        this.destroyed = true;
+        this._emitClose();
+      }
+
+      _responseEnded() {
+        this._responseDone = true;
+        // The agent path's socket is settled by the response's 'end'
+        // (_agentResponseOnEnd).
+        if (this._agentPath) return;
+        this._responseEnd = true;
+        this._stopFetchSocketTimer();
+        this.destroyed = true;
+        this._emitClose();
+      }
+
+      // The fetch path's stand-in is done with: its idle timer stops, as a
+      // real socket's does when it is destroyed or handed back.
+      _stopFetchSocketTimer() {
+        var socket = this._fetchSocket;
+        if (this._agentPath || !socket || socket._timeoutId == null) return;
+        globalThis.clearTimeout(socket._timeoutId);
+        socket._timeoutId = null;
+      }
+
       abort() {
         if (this.aborted) return;
         this.aborted = true;
         this._aborted = true;
         this.emit("abort");
-        this._tearDown();
+        this._tearDown(true);
       }
       destroy(err) {
         // Node's ClientRequest.destroy() returns early on an already-
@@ -19059,8 +20496,9 @@
         // (or one after abort()) is silent.
         if (this._aborted) return this;
         this._aborted = true;
-        this._tearDown();
+        this._tearDown(!err);
         if (err) {
+          this._errorEmitted = true;
           this.errored = err;
           this.emit("error", err);
         }
@@ -19077,7 +20515,10 @@
         }
       }
 
-      _tearDown() {
+      // `hangUp`: destroyed without an error of the caller's (destroy(),
+      // abort()) -- which before a response fails the request with node's
+      // 'socket hang up' (its socketCloseListener), ahead of 'close'.
+      _tearDown(hangUp) {
         if (this.destroyed) return;
         this.destroyed = true;
         // Abort an in-flight upload so the transport tears the request down
@@ -19087,7 +20528,28 @@
         if (res && !res.destroyed) {
           const reset = new Error("aborted");
           reset.code = "ECONNRESET";
-          res.destroy(reset);
+          if (this._inSocketTimeout) {
+            // Inside the socket's 'timeout': after its other listener.
+            this._resTeardown = function () {
+              if (!res.destroyed) res.destroy(reset);
+            };
+          } else {
+            res.destroy(reset);
+          }
+        }
+        this._closeBridge();
+        var socket = this.socket || this._fetchSocket;
+        if (socket && isSocketLike(socket) && !socket.destroyed) socket.destroy();
+        // An agent-path request still waiting for its socket (queued behind
+        // maxSockets, or its createConnection pending) closes when the socket
+        // comes, as node's onSocketNT does -- handing that socket back.
+        if (this._agentPath && this._awaitingSocket) return;
+        if (hangUp && !this._responded && !this._errorEmitted) {
+          var self = this;
+          var hungUp = connResetException("socket hang up");
+          this._errorEmitted = true;
+          this.errored = hungUp;
+          process.nextTick(function () { self.emit("error", hungUp); });
         }
         this._emitClose();
       }
@@ -19097,9 +20559,36 @@
         var self = this;
         process.nextTick(function () { self.emit("close"); });
       }
+      // node's: nothing once the response has ended; else the request hears
+      // its socket's 'timeout' (once) and the socket's idle timeout is set
+      // -- the agent path's real socket's (after it connects), or the fetch
+      // path's stand-in's, which the transport's progress resets.
       setTimeout(ms, callback) {
+        if (this._responseEnd) return this;
+        this._listenSocketTimeout();
+        ms = requestTimerDuration(ms, "msecs");
         if (callback) this.once("timeout", callback);
+        var self = this;
+        var apply = function (socket) {
+          if (socket === self._fetchSocket && !self._agentPath) {
+            socket.setTimeout(ms);
+          } else if (socket.connecting) {
+            socket.once(socket.encrypted ? "secureConnect" : "connect", function () {
+              socket.setTimeout(ms);
+            });
+          } else {
+            socket.setTimeout(ms);
+          }
+        };
+        if (this.socket) apply(this.socket);
+        else this.once("socket", apply);
         return this;
+      }
+      setNoDelay(noDelay) {
+        if (this._agentPath && this.socket) this.socket.setNoDelay(noDelay);
+      }
+      setSocketKeepAlive(enable, initialDelay) {
+        if (this._agentPath && this.socket) this.socket.setKeepAlive(enable, initialDelay);
       }
     }
 
@@ -19115,26 +20604,530 @@
       return req;
     }
 
-    class Agent {
-      constructor(options) {
-        this.options = options || {};
-        this.maxSockets = this.options.maxSockets || Infinity;
-        this.maxFreeSockets = this.options.maxFreeSockets || 256;
-        this.keepAlive = this.options.keepAlive || false;
-        this.keepAliveMsecs = this.options.keepAliveMsecs || 1000;
-        this.sockets = {};
-        this.freeSockets = {};
-        this.requests = {};
+    // ---- http.Agent: node lib/_http_agent.js (v22.22.2) ----
+    // node's connection pool, statement for statement: the option merge,
+    // getName, addRequest (a free socket for the name, else a new one under
+    // maxSockets / maxTotalSockets, else the request queues), createSocket's
+    // createConnection call with its three result shapes (a socket, a later
+    // callback, a callback with an error), the 'free' handler that hands a
+    // socket to the next queued request or keeps it in freeSockets
+    // (keepAlive, maxFreeSockets, the response's Keep-Alive hint), and
+    // removeSocket making a socket for a request still queued. An ES5
+    // constructor, so `http.Agent.call(this, options)` subclasses work, and
+    // packages that override keepSocketAlive / reuseSocket (agentkeepalive)
+    // are called where node calls them. Not ported: the keylog relay, and
+    // proxyEnv as an option (the global agents' NODE_USE_ENV_PROXY proxying
+    // is the fetch transport's; see useEnvProxy).
+    const kRequestOptions = Symbol("requestOptions");
+
+    function freeSocketErrorListener(err) {
+      const socket = this;
+      socket.destroy();
+      socket.emit("agentRemove");
+    }
+
+    function Agent(options) {
+      if (!(this instanceof Agent)) return new Agent(options);
+      EventEmitter.call(this);
+      this.options = { __proto__: null, ...options };
+      this.defaultPort = this.options.defaultPort || 80;
+      this.protocol = this.options.protocol || "http:";
+      if (this.options.noDelay === undefined) this.options.noDelay = true;
+      // Don't confuse net and make it think that we're connecting to a pipe.
+      this.options.path = null;
+      this.requests = { __proto__: null };
+      this.sockets = { __proto__: null };
+      this.freeSockets = { __proto__: null };
+      this.keepAliveMsecs = this.options.keepAliveMsecs || 1000;
+      this.keepAlive = this.options.keepAlive || false;
+      this.maxSockets = this.options.maxSockets || Agent.defaultMaxSockets;
+      this.maxFreeSockets = this.options.maxFreeSockets || 256;
+      this.scheduling = this.options.scheduling || "lifo";
+      this.maxTotalSockets = this.options.maxTotalSockets;
+      this.totalSocketCount = 0;
+      this.agentKeepAliveTimeoutBuffer =
+        typeof this.options.agentKeepAliveTimeoutBuffer === "number" &&
+        this.options.agentKeepAliveTimeoutBuffer >= 0 &&
+        Number.isFinite(this.options.agentKeepAliveTimeoutBuffer)
+          ? this.options.agentKeepAliveTimeoutBuffer
+          : 1000;
+      if (this.scheduling !== "fifo" && this.scheduling !== "lifo") {
+        throw codes.ERR_INVALID_ARG_VALUE(
+          "scheduling",
+          this.scheduling,
+          "must be one of: 'fifo', 'lifo'",
+        );
       }
-      destroy() { this.sockets = {}; this.freeSockets = {}; this.requests = {}; }
-      getName(options) {
-        var name = (options.host || "localhost") + ":" + (options.port || 80);
-        if (options.localAddress) name += ":" + options.localAddress;
-        return name;
+      if (this.maxTotalSockets !== undefined) {
+        if (typeof this.maxTotalSockets !== "number") {
+          throw codes.ERR_INVALID_ARG_TYPE("maxTotalSockets", "number", this.maxTotalSockets);
+        }
+        if (this.maxTotalSockets < 1 || Number.isNaN(this.maxTotalSockets)) {
+          throw codes.ERR_OUT_OF_RANGE("maxTotalSockets", ">= 1", this.maxTotalSockets);
+        }
+      } else {
+        this.maxTotalSockets = Infinity;
+      }
+
+      this.on("free", (socket, options) => {
+        const name = this.getName(options);
+        if (!socket.writable) {
+          socket.destroy();
+          return;
+        }
+        const requests = this.requests[name];
+        if (requests && requests.length) {
+          const req = requests.shift();
+          setRequestSocket(this, req, socket);
+          if (requests.length === 0) delete this.requests[name];
+          return;
+        }
+        // If there are no pending requests, then put it in the freeSockets
+        // pool, but only if we're allowed to do so.
+        const req = socket._httpMessage;
+        if (!req || !req.shouldKeepAlive || !this.keepAlive) {
+          socket.destroy();
+          return;
+        }
+        const freeSockets = this.freeSockets[name] || [];
+        const freeLen = freeSockets.length;
+        let count = freeLen;
+        if (this.sockets[name]) count += this.sockets[name].length;
+        if (
+          this.totalSocketCount > this.maxTotalSockets ||
+          count > this.maxSockets ||
+          freeLen >= this.maxFreeSockets ||
+          !this.keepSocketAlive(socket)
+        ) {
+          socket.destroy();
+          return;
+        }
+        this.freeSockets[name] = freeSockets;
+        socket._httpMessage = null;
+        this.removeSocket(socket, options);
+        socket.once("error", freeSocketErrorListener);
+        freeSockets.push(socket);
+      });
+    }
+    Object.setPrototypeOf(Agent.prototype, EventEmitter.prototype);
+    Object.setPrototypeOf(Agent, EventEmitter);
+    Agent.defaultMaxSockets = Infinity;
+
+    Agent.prototype.createConnection = function createConnection(...args) {
+      return registry.get("net").createConnection(...args);
+    };
+
+    // Get the key for a given set of request options.
+    Agent.prototype.getName = function getName(options = {}) {
+      let name = options.host || "localhost";
+      name += ":";
+      if (options.port) name += options.port;
+      name += ":";
+      if (options.localAddress) name += options.localAddress;
+      // Pacify parallel/test-http-agent-getname by only appending the ':'
+      // when options.family is set.
+      if (options.family === 4 || options.family === 6) name += `:${options.family}`;
+      if (options.socketPath) name += `:${options.socketPath}`;
+      return name;
+    };
+
+    Agent.prototype.addRequest = function addRequest(req, options, port, localAddress) {
+      // Legacy API: addRequest(req, host, port, localAddress).
+      if (typeof options === "string") {
+        options = { __proto__: null, host: options, port, localAddress };
+      }
+      // Here the agent options will override per-request options.
+      options = { __proto__: null, ...options, ...this.options };
+      if (options.socketPath) options.path = options.socketPath;
+      normalizeServerName(options, req);
+      const name = this.getName(options);
+      this.sockets[name] ||= [];
+
+      const freeSockets = this.freeSockets[name];
+      let socket;
+      if (freeSockets) {
+        while (freeSockets.length && freeSockets[0].destroyed) freeSockets.shift();
+        socket = this.scheduling === "fifo" ? freeSockets.shift() : freeSockets.pop();
+        if (!freeSockets.length) delete this.freeSockets[name];
+      }
+      const freeLen = freeSockets ? freeSockets.length : 0;
+      const sockLen = freeLen + this.sockets[name].length;
+
+      if (socket) {
+        // Reusing a socket from the pool.
+        this.reuseSocket(socket, req);
+        setRequestSocket(this, req, socket);
+        this.sockets[name].push(socket);
+      } else if (sockLen < this.maxSockets && this.totalSocketCount < this.maxTotalSockets) {
+        // Under maxSockets: a new one.
+        this.createSocket(req, options, (err, socket) => {
+          if (err) {
+            req.onSocket(socket, err);
+            return;
+          }
+          setRequestSocket(this, req, socket);
+        });
+      } else {
+        // Over the limit: the request waits for a socket.
+        this.requests[name] ||= [];
+        // Used to create sockets for pending requests from different origin.
+        req[kRequestOptions] = options;
+        this.requests[name].push(req);
+      }
+    };
+
+    Agent.prototype.createSocket = function createSocket(req, options, cb) {
+      // Here the agent options will override per-request options.
+      options = { __proto__: null, ...options, ...this.options };
+      if (options.socketPath) options.path = options.socketPath;
+      normalizeServerName(options, req);
+      // Make sure per-request timeout is respected.
+      const timeout = req.timeout || this.options.timeout || undefined;
+      if (timeout) options.timeout = timeout;
+      const name = this.getName(options);
+      options._agentKey = name;
+      options.encoding = null;
+      const oncreate = once((err, s) => {
+        if (err) return cb(err);
+        if (!isSocketLike(s)) return cb(unusableSocketError());
+        this.sockets[name] ||= [];
+        this.sockets[name].push(s);
+        this.totalSocketCount++;
+        installListeners(this, s, options);
+        cb(null, s);
+      });
+      // When keepAlive is true, pass the related options to createConnection.
+      if (this.keepAlive) {
+        options.keepAlive = this.keepAlive;
+        options.keepAliveInitialDelay = this.keepAliveMsecs;
+      }
+      const newSocket = this.createConnection(options, oncreate);
+      if (newSocket) oncreate(null, newSocket);
+    };
+
+    function normalizeServerName(options, req) {
+      if (!options.servername && options.servername !== "") {
+        options.servername = calculateServerName(options, req);
       }
     }
 
+    function calculateServerName(options, req) {
+      let servername = options.host;
+      const hostHeader = req.getHeader("host");
+      if (hostHeader) {
+        if (typeof hostHeader !== "string") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.headers.host", "string", hostHeader);
+        }
+        // abc => abc; abc:123 => abc; [::1] => ::1; [::1]:123 => ::1
+        if (hostHeader[0] === "[") {
+          const index = hostHeader.indexOf("]");
+          servername = index === -1 ? hostHeader : hostHeader.substring(1, index);
+        } else {
+          servername = hostHeader.split(":", 1)[0];
+        }
+      }
+      // Don't implicitly set invalid (IP) servernames.
+      if (isIP(servername)) servername = "";
+      return servername;
+    }
+
+    function installListeners(agent, s, options) {
+      function onFree() {
+        agent.emit("free", s, options);
+      }
+      s.on("free", onFree);
+      function onClose() {
+        // This is the only place where sockets get removed from the Agent.
+        // If you want to remove a socket from the pool, just close it.
+        agent.totalSocketCount--;
+        agent.removeSocket(s, options);
+      }
+      s.on("close", onClose);
+      function onTimeout() {
+        // Destroy if in free list.
+        const sockets = agent.freeSockets;
+        if (Object.keys(sockets).some((name) => sockets[name].includes(s))) {
+          return s.destroy();
+        }
+      }
+      s.on("timeout", onTimeout);
+      function onRemove() {
+        // An upgraded socket leaves the pool: it is locked up indefinitely.
+        agent.totalSocketCount--;
+        agent.removeSocket(s, options);
+        s.removeListener("close", onClose);
+        s.removeListener("free", onFree);
+        s.removeListener("timeout", onTimeout);
+        s.removeListener("agentRemove", onRemove);
+      }
+      s.on("agentRemove", onRemove);
+    }
+
+    function setRequestSocket(agent, req, socket) {
+      req.onSocket(socket);
+      const agentTimeout = agent.options.timeout || 0;
+      if (req.timeout === undefined || req.timeout === agentTimeout) return;
+      socket.setTimeout(req.timeout);
+    }
+
+    Agent.prototype.removeSocket = function removeSocket(s, options) {
+      const name = this.getName(options);
+      const sets = [this.sockets];
+      // If the socket was destroyed, remove it from the free buffers too.
+      if (!s.writable) sets.push(this.freeSockets);
+      for (let sk = 0; sk < sets.length; sk++) {
+        const sockets = sets[sk];
+        if (sockets[name]) {
+          const index = sockets[name].indexOf(s);
+          if (index !== -1) {
+            sockets[name].splice(index, 1);
+            // Don't leak
+            if (sockets[name].length === 0) delete sockets[name];
+          }
+        }
+      }
+      let req;
+      if (this.requests[name] && this.requests[name].length) {
+        req = this.requests[name][0];
+      } else {
+        // (node: not FIFO across origins.)
+        const keys = Object.keys(this.requests);
+        for (let i = 0; i < keys.length; i++) {
+          const prop = keys[i];
+          // Check whether this specific origin is already at maxSockets.
+          if (this.sockets[prop] && this.sockets[prop].length) break;
+          req = this.requests[prop][0];
+          options = req[kRequestOptions];
+          break;
+        }
+      }
+      if (req && options) {
+        req[kRequestOptions] = undefined;
+        // If we have pending requests and a socket gets closed make a new one.
+        this.createSocket(req, options, (err, socket) => {
+          if (err) {
+            req.onSocket(null, err);
+            return;
+          }
+          socket.emit("free");
+        });
+      }
+    };
+
+    Agent.prototype.keepSocketAlive = function keepSocketAlive(socket) {
+      socket.setKeepAlive(true, this.keepAliveMsecs);
+      socket.unref();
+      let agentTimeout = this.options.timeout || 0;
+      let canKeepSocketAlive = true;
+      const req = socket._httpMessage;
+      if (req && req.res) {
+        const keepAliveHint = req.res.headers["keep-alive"];
+        if (keepAliveHint) {
+          const match = /^timeout=(\d+)/.exec(keepAliveHint);
+          const hint = match ? match[1] : undefined;
+          if (hint) {
+            // Let the timer expire before the announced timeout to reduce the
+            // likelihood of ECONNRESET errors.
+            let serverHintTimeout = Number.parseInt(hint) * 1000 - this.agentKeepAliveTimeoutBuffer;
+            serverHintTimeout = serverHintTimeout > 0 ? serverHintTimeout : 0;
+            if (serverHintTimeout === 0) {
+              // Cannot safely reuse the socket: the server timeout is too short.
+              canKeepSocketAlive = false;
+            } else if (serverHintTimeout < agentTimeout) {
+              agentTimeout = serverHintTimeout;
+            }
+          }
+        }
+      }
+      if (socket.timeout !== agentTimeout) socket.setTimeout(agentTimeout);
+      return canKeepSocketAlive;
+    };
+
+    Agent.prototype.reuseSocket = function reuseSocket(socket, req) {
+      socket.removeListener("error", freeSocketErrorListener);
+      req.reusedSocket = true;
+      socket.ref();
+    };
+
+    Agent.prototype.destroy = function destroy() {
+      const sets = [this.freeSockets, this.sockets];
+      for (let s = 0; s < sets.length; s++) {
+        const set = sets[s];
+        const keys = Object.keys(set);
+        for (let v = 0; v < keys.length; v++) {
+          const setName = set[keys[v]];
+          for (let n = 0; n < setName.length; n++) setName[n].destroy();
+        }
+      }
+    };
+
+    // https.Agent (node lib/https.js), here beside http.Agent so a request
+    // can tell the stock agents from custom ones. createConnection is
+    // tls.connect with node's argument normalisation (no session cache).
+    function HttpsAgent(options) {
+      if (!(this instanceof HttpsAgent)) return new HttpsAgent(options);
+      Agent.call(this, options);
+      this.defaultPort = 443;
+      this.protocol = "https:";
+      this.maxCachedSessions = this.options.maxCachedSessions;
+      if (this.maxCachedSessions === undefined) this.maxCachedSessions = 100;
+      this._sessionCache = { map: {}, list: [] };
+    }
+    Object.setPrototypeOf(HttpsAgent.prototype, Agent.prototype);
+    Object.setPrototypeOf(HttpsAgent, Agent);
+
+    HttpsAgent.prototype.createConnection = function createConnection(port, host, options) {
+      if (port !== null && typeof port === "object") {
+        options = port;
+      } else if (host !== null && typeof host === "object") {
+        options = { ...host };
+      } else if (options === null || typeof options !== "object") {
+        options = {};
+      } else {
+        options = { ...options };
+      }
+      if (typeof port === "number") options.port = port;
+      if (typeof host === "string") options.host = host;
+      return registry.get("tls").connect(options);
+    };
+
+    HttpsAgent.prototype.getName = function getName(options = {}) {
+      let name = Agent.prototype.getName.call(this, options);
+      name += ":";
+      if (options.ca) name += options.ca;
+      name += ":";
+      if (options.cert) name += options.cert;
+      name += ":";
+      if (options.clientCertEngine) name += options.clientCertEngine;
+      name += ":";
+      if (options.ciphers) name += options.ciphers;
+      name += ":";
+      if (options.key) name += options.key;
+      name += ":";
+      if (options.pfx) name += options.pfx;
+      name += ":";
+      if (options.rejectUnauthorized !== undefined) name += options.rejectUnauthorized;
+      name += ":";
+      if (options.servername && options.servername !== options.host) name += options.servername;
+      name += ":";
+      if (options.minVersion) name += options.minVersion;
+      name += ":";
+      if (options.maxVersion) name += options.maxVersion;
+      name += ":";
+      if (options.secureProtocol) name += options.secureProtocol;
+      name += ":";
+      if (options.crl) name += options.crl;
+      name += ":";
+      if (options.honorCipherOrder !== undefined) name += options.honorCipherOrder;
+      name += ":";
+      if (options.ecdhCurve) name += options.ecdhCurve;
+      name += ":";
+      if (options.dhparam) name += options.dhparam;
+      name += ":";
+      if (options.secureOptions !== undefined) name += options.secureOptions;
+      name += ":";
+      if (options.sessionIdContext) name += options.sessionIdContext;
+      name += ":";
+      if (options.sigalgs) name += JSON.stringify(options.sigalgs);
+      name += ":";
+      if (options.privateKeyIdentifier) name += options.privateKeyIdentifier;
+      name += ":";
+      if (options.privateKeyEngine) name += options.privateKeyEngine;
+      return name;
+    };
+
+    // The stock methods, captured before any caller can patch the
+    // prototypes: an agent whose methods are these is served by the fetch
+    // path; anything else -- a subclass override, a patched instance, a
+    // patched prototype -- is honoured by sending over its socket.
+    const STOCK_AGENT = {
+      addRequest: Agent.prototype.addRequest,
+      createSocket: Agent.prototype.createSocket,
+      createConnection: Agent.prototype.createConnection,
+      httpsCreateConnection: HttpsAgent.prototype.createConnection,
+    };
+    function agentIsStock(agent) {
+      if (agent.addRequest !== STOCK_AGENT.addRequest) return false;
+      if (agent.createSocket !== STOCK_AGENT.createSocket) return false;
+      return agent instanceof HttpsAgent
+        ? agent.createConnection === STOCK_AGENT.httpsCreateConnection
+        : agent.createConnection === STOCK_AGENT.createConnection;
+    }
+
+    // node's global agents, used by reference: patching one is honoured.
+    const agentState = {
+      globalAgent: new Agent({ keepAlive: true, scheduling: "lifo", timeout: 5000 }),
+      httpsGlobalAgent: new HttpsAgent({ keepAlive: true, scheduling: "lifo", timeout: 5000 }),
+    };
+    // The https factory builds its exports from these.
+    registry._httpAgents = { HttpsAgent, state: agentState };
+
+    // node's http.request applies the environment proxy (HTTP_PROXY /
+    // HTTPS_PROXY / NO_PROXY) only under NODE_USE_ENV_PROXY=1 or
+    // --use-env-proxy, read at startup, and only through its own two global
+    // agents (the proxyEnv option they are built with; a `new Agent()`, an
+    // `agent: false` request, or a global agent replaced by assignment dials
+    // directly). oam's transport would proxy every request its rules match,
+    // so a request node dials directly goes over the agent's socket instead
+    // (see the constructor). natives.env() is the OS environment, which a
+    // process.env write never reaches -- as node's startup read.
+    const ENV_PROXY_AGENTS = new WeakSet([agentState.globalAgent, agentState.httpsGlobalAgent]);
+    let envProxyEnabled;
+    function useEnvProxy() {
+      if (envProxyEnabled === undefined) {
+        let env = null;
+        try {
+          env = natives.env();
+        } catch {
+          env = null;
+        }
+        envProxyEnabled = !!env && (env.NODE_USE_ENV_PROXY === "1" ||
+          /(?:^|\s)--use-env-proxy(?:\s|$)/.test(env.NODE_OPTIONS || ""));
+      }
+      return envProxyEnabled;
+    }
+
+    // node's getTimerDuration (lib/internal/timers.js): a request's
+    // `timeout` option and setTimeout(msecs).
+    function requestTimerDuration(msecs, name) {
+      if (typeof msecs !== "number") throw codes.ERR_INVALID_ARG_TYPE(name, "number", msecs);
+      if (msecs < 0 || !Number.isFinite(msecs)) {
+        throw codes.ERR_OUT_OF_RANGE(name, "a non-negative finite number", msecs);
+      }
+      if (msecs > 2147483647) {
+        process.emitWarning(
+          msecs + " does not fit into a 32-bit signed integer." +
+            "\nTimer duration was truncated to 2147483647.",
+          "TimeoutOverflowWarning",
+        );
+        return 2147483647;
+      }
+      return msecs;
+    }
+
     var INVALID_HEADER_CHAR = /[^\t\x20-\x7e\x80-\xff]/;
+    // The certificate refusals oam names as node does (oam_core tls.rs
+    // VerifyFailure): what an https request fails with when the server's
+    // certificate is refused.
+    var TLS_CERT_REFUSALS = new Set([
+      "CERT_HAS_EXPIRED", "CERT_NOT_YET_VALID", "CERT_REVOKED", "CERT_SIGNATURE_FAILURE",
+      "DEPTH_ZERO_SELF_SIGNED_CERT", "ERR_TLS_CERT_ALTNAME_INVALID", "INVALID_PURPOSE",
+      "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_GET_ISSUER_CERT", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNHANDLED_CRITICAL_EXTENSION",
+    ]);
+    // node's checkIsHttpToken (lib/_http_common.js), and the two errors its
+    // header checks throw.
+    var HTTP_TOKEN = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
+    function invalidHttpToken(name, token) {
+      var err = new TypeError(name + " must be a valid HTTP token [\"" + token + "\"]");
+      err.code = "ERR_INVALID_HTTP_TOKEN";
+      return err;
+    }
+    function invalidHeaderChar(name) {
+      var err = new TypeError("Invalid character in header content [\"" + name + "\"]");
+      err.code = "ERR_INVALID_CHAR";
+      return err;
+    }
     function validateHeaderName(name) {
       if (typeof name !== "string" || name.length === 0) throw new TypeError("Header name must be a valid HTTP token [\"" + name + "\"]");
       if (INVALID_HEADER_CHAR.test(name)) throw new TypeError("Header name must be a valid HTTP token [\"" + name + "\"]");
@@ -19224,7 +21217,7 @@
       defineTimeout: defineTimeoutProperty,
       stop: stopConnectionsCheck,
     };
-    return {
+    const httpExports = {
       createServer: (options, handler) => new Server(options, handler),
       Server: callableHttp(Server),
       IncomingMessage: callableHttp(IncomingMessage),
@@ -19233,7 +21226,6 @@
       OutgoingMessage: callableHttp(OutgoingMessage),
       request,
       get,
-      globalAgent: { maxSockets: Infinity, maxFreeSockets: 256, keepAlive: true, keepAliveMsecs: 1000, options: {} },
       Agent,
       // node: a getter for --max-http-header-size (16384 by default).
       get maxHeaderSize() {
@@ -19266,6 +21258,15 @@
         510: "Not Extended", 511: "Network Authentication Required",
       },
     };
+    // node: an accessor over the agent requests default to, so assigning
+    // http.globalAgent changes what later requests use.
+    Object.defineProperty(httpExports, "globalAgent", {
+      configurable: true,
+      enumerable: true,
+      get() { return agentState.globalAgent; },
+      set(value) { agentState.globalAgent = value; },
+    });
+    return httpExports;
   };
 
   // ------------------------------------------------------------- node:net
@@ -19314,8 +21315,14 @@
       return parts.length === 4 && parts.every((p) => V4_SEGMENT.test(p));
     }
     function isIPv6(input) {
-      const text = String(input);
+      let text = String(input);
       if (text.length === 0 || text.includes(" ")) return false;
+      // node's IPv6Reg ends in `(?:%[0-9a-zA-Z-.:]{1,})?`: a zone id.
+      const zone = text.indexOf("%");
+      if (zone !== -1) {
+        if (!/^%[0-9a-zA-Z\-.:]+$/.test(text.slice(zone))) return false;
+        text = text.slice(0, zone);
+      }
       const sections = text.split("::");
       if (sections.length > 2) return false;
       const check = (part) =>
@@ -19408,6 +21415,276 @@
       return e;
     }
 
+    // ---- connect-time name resolution ----
+    // node lib/net.js lookupAndConnect / lookupAndConnectMultiple (v22.22.2),
+    // ported statement for statement wherever the order of calls, events and
+    // errors can be observed. net.connect and tls.connect share it. What a
+    // caller relies on, all measured on node:
+    //  - an IP-literal host is never looked up and fires no 'lookup'; it is
+    //    dialled on the next tick, and only if the socket is still connecting
+    //    (a destroy() right after connect() opens nothing);
+    //  - otherwise the lookup -- the `lookup` option, else the dns module's
+    //    `lookup` as it is NOW (a replaced one is honoured) -- is called
+    //    synchronously inside connect(), with (host, {family, hints[, all]},
+    //    cb); a hook that throws makes connect() throw;
+    //  - its answer is emitted as 'lookup' (err, address, family, host), one
+    //    event per address, before anything is dialled, and a listener that
+    //    destroys the socket stops the connect (no connection is made);
+    //  - an error, an empty or unusable answer, never falls back to system
+    //    DNS: the socket fails with the hook's own error object, or node's
+    //    ERR_INVALID_IP_ADDRESS / ERR_INVALID_ADDRESS_FAMILY.
+    // The connect op dials exactly what was answered: a hook's addresses as
+    // an explicit list (each one checked against --allow-net in Rust), oam's
+    // own resolver's by a one-shot ticket (natives.netResolve), so a hostname
+    // grant keeps working and no address JS hands back is trusted.
+    function socketToDnsFamily(family) {
+      switch (family) {
+        case "IPv4":
+          return 4;
+        case "IPv6":
+          return 6;
+      }
+      return family;
+    }
+
+    // node's `dns.ADDRCONFIG`, the hints net passes a lookup off Windows when
+    // the caller gave none: the platform's AI_ADDRCONFIG. The table
+    // bootstrap.js lookupHints() uses for a fetch's connect.lookup (measured:
+    // 1024 on macOS 26, 0x20 on glibc).
+    function addrconfigHints() {
+      const platform = globalThis.process.platform;
+      if (platform === "darwin" || platform === "freebsd") return 1024;
+      return 0x20;
+    }
+
+    // The dns module's `lookup` as a connect reads it: at call time. null is
+    // oam's own resolver: the dns module was never loaded (so nothing can
+    // have replaced its lookup), or its lookup is still the original.
+    function connectDnsLookup() {
+      if (!registry.cache.has("dns")) return null;
+      const lookup = registry.cache.get("dns").lookup;
+      return lookup === registry._dnsLookupOriginal ? null : lookup;
+    }
+
+    function connectErrorNT(self, err) {
+      self.destroy(err);
+    }
+
+    // node's emitLookup for the `all` form (lookupAndConnectMultiple's
+    // callback). `dialList(ips)` gets the addresses to attempt, interleaved
+    // by family exactly as node attempts them.
+    function onLookupMultiple(self, options, host, err, addresses, dialList) {
+      // It's possible we were destroyed while looking this up.
+      if (!self.connecting) {
+        return;
+      } else if (err) {
+        self.emit("lookup", err, undefined, undefined, host);
+        process.nextTick(connectErrorNT, self, err);
+        return;
+      }
+      // Keep the addresses net can dial; the first valid one picks which
+      // family is attempted first.
+      const validAddresses = [[], []];
+      const validIps = [[], []];
+      let destinations;
+      for (let i = 0, l = addresses.length; i < l; i++) {
+        const address = addresses[i];
+        const { address: ip, family: addressType } = address;
+        self.emit("lookup", err, ip, addressType, host);
+        // A 'lookup' listener may have destroyed the socket.
+        if (!self.connecting) {
+          return;
+        }
+        if (isIP(ip) && (addressType === 4 || addressType === 6)) {
+          destinations ||= addressType === 6 ? { 6: 0, 4: 1 } : { 4: 0, 6: 1 };
+          const destination = destinations[addressType];
+          // Only try an address once.
+          if (!validIps[destination].includes(ip)) {
+            validAddresses[destination].push(address);
+            validIps[destination].push(ip);
+          }
+        }
+      }
+      // Nothing usable: fail on the first entry. node's destructure, so an
+      // empty answer throws its TypeError into the hook and the socket stays
+      // connecting, as in node.
+      if (!validAddresses[0].length && !validAddresses[1].length) {
+        const { address: firstIp, family: firstAddressType } = addresses[0];
+        if (!isIP(firstIp)) {
+          err = codes.ERR_INVALID_IP_ADDRESS(firstIp);
+          process.nextTick(connectErrorNT, self, err);
+        } else if (firstAddressType !== 4 && firstAddressType !== 6) {
+          err = codes.ERR_INVALID_ADDRESS_FAMILY(firstAddressType, options.host, options.port);
+          process.nextTick(connectErrorNT, self, err);
+        }
+        return;
+      }
+      const toAttempt = [];
+      for (let i = 0, l = Math.max(validAddresses[0].length, validAddresses[1].length); i < l; i++) {
+        if (i in validAddresses[0]) toAttempt.push(validAddresses[0][i].address);
+        if (i in validAddresses[1]) toAttempt.push(validAddresses[1][i].address);
+      }
+      dialList(toAttempt);
+    }
+
+    // node's emitLookup for the single form (family 4 / 6, a localAddress,
+    // or autoSelectFamily false): the event comes BEFORE the connecting
+    // check.
+    function onLookupSingle(self, options, host, err, ip, addressType, dialOne) {
+      self.emit("lookup", err, ip, addressType, host);
+      if (!self.connecting) return;
+      if (err) {
+        process.nextTick(connectErrorNT, self, err);
+      } else if (typeof ip !== "string" || !isIP(ip)) {
+        process.nextTick(connectErrorNT, self, codes.ERR_INVALID_IP_ADDRESS(ip));
+      } else if (addressType !== 4 && addressType !== 6) {
+        process.nextTick(
+          connectErrorNT,
+          self,
+          codes.ERR_INVALID_ADDRESS_FAMILY(addressType, options.host, options.port),
+        );
+      } else {
+        dialOne(ip);
+      }
+    }
+
+    // node connects a socket given `path` to that Unix domain socket or
+    // Windows named pipe (lib/net.js: `const pipe = !!path`), whatever host
+    // and port also say -- http.request's `socketPath` arrives this way. oam
+    // has no client for either, so the connect fails, on the next tick as a
+    // refused one does, rather than going to host:port, where something else
+    // may be listening. True when it refused.
+    function refusePipeConnect(self, options) {
+      const path = options.path;
+      if (!path) return false;
+      if (typeof path !== "string") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.path", "string", path);
+      }
+      const err = new Error(
+        "The feature connecting to a Unix domain socket or named pipe (the `path` option) " +
+        "is unavailable on the current platform, which is being used to run oam",
+      );
+      err.code = "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM";
+      process.nextTick(() => self.destroy(err));
+      return true;
+    }
+    registry._netRefusePipeConnect = refusePipeConnect;
+
+    // `host` is the caller's (net: options.host || 'localhost').
+    // `dial(spec, local)` starts the native connect: spec null for an IP
+    // literal, `{ ips }` for a hook's answer, `{ ticket }` for oam's
+    // resolver's; `local` the localAddress / localPort the socket is bound
+    // to first (node's internalConnect binds when either is set), as the
+    // natives take it, or undefined. Throws synchronously
+    // what node's connect() throws: a bad host / localAddress /
+    // autoSelectFamily / lookup option, a hook's own synchronous throw, and
+    // (oam) a --allow-net refusal of the host, which is asked before the name
+    // is looked up.
+    function lookupAndConnect(self, options, host, port, dial) {
+      const localAddress = options.localAddress;
+      if (typeof host !== "string") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.host", "string", host);
+      }
+      if (localAddress && !isIP(localAddress)) {
+        throw codes.ERR_INVALID_IP_ADDRESS(localAddress);
+      }
+      const localPort = options.localPort;
+      if (localPort && typeof localPort !== "number") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.localPort", "number", localPort);
+      }
+      const local = localAddress || localPort
+        ? JSON.stringify({ address: localAddress || undefined, port: localPort || undefined })
+        : undefined;
+      const dialFrom = dial;
+      dial = (spec) => dialFrom(spec, local);
+      let autoSelectFamily = options.autoSelectFamily;
+      if (autoSelectFamily != null) {
+        if (typeof autoSelectFamily !== "boolean") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.autoSelectFamily", "boolean", autoSelectFamily);
+        }
+      } else {
+        autoSelectFamily = true;
+      }
+      natives.netCheck(host, port);
+      // node keeps the name it connected to; tls.connect({ socket }) checks
+      // the certificate against it when given neither servername nor host.
+      self._host = host;
+
+      // If host is an IP, skip performing a lookup.
+      if (isIP(host)) {
+        process.nextTick(() => {
+          if (self.connecting) dial(null);
+        });
+        return;
+      }
+
+      if (options.lookup != null && typeof options.lookup !== "function") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.lookup", "Function", options.lookup);
+      }
+      const dnsopts = {
+        family: socketToDnsFamily(options.family),
+        hints: options.hints || 0,
+      };
+      if (
+        globalThis.process.platform !== "win32" &&
+        dnsopts.family !== 4 &&
+        dnsopts.family !== 6 &&
+        dnsopts.hints === 0
+      ) {
+        dnsopts.hints = addrconfigHints();
+      }
+      self._host = host;
+      let lookup = options.lookup || connectDnsLookup();
+      // `lookup: dns.lookup` passed explicitly is oam's own resolver too.
+      if (lookup === registry._dnsLookupOriginal) lookup = null;
+      const multiple =
+        dnsopts.family !== 4 && dnsopts.family !== 6 && !localAddress && autoSelectFamily;
+      if (multiple) dnsopts.all = true;
+
+      if (lookup !== null) {
+        if (multiple) {
+          lookup(host, dnsopts, function emitLookup(err, addresses) {
+            onLookupMultiple(self, options, host, err, addresses, (ips) => dial({ ips }));
+          });
+        } else {
+          lookup(host, dnsopts, function emitLookup(err, ip, addressType) {
+            onLookupSingle(self, options, host, err, ip, addressType, (one) => dial({ ips: [one] }));
+          });
+        }
+        return;
+      }
+
+      // oam's resolver: the addresses come back with a ticket the connect
+      // redeems, and every path that does not dial drops it.
+      const family = dnsopts.family === 4 || dnsopts.family === 6 ? dnsopts.family : 0;
+      natives.netResolve(host, family, multiple, port).then(
+        (answer) => {
+          const token = answer.token;
+          let redeemed = false;
+          const dialTicket = () => {
+            redeemed = true;
+            dial({ ticket: token });
+          };
+          try {
+            if (multiple) {
+              onLookupMultiple(self, options, host, null, answer.addresses, dialTicket);
+            } else {
+              const first = answer.addresses[0];
+              onLookupSingle(self, options, host, null, first.address, first.family, dialTicket);
+            }
+          } finally {
+            if (!redeemed) natives.netResolveDrop(token);
+          }
+        },
+        (err) => {
+          if (multiple) onLookupMultiple(self, options, host, err);
+          else onLookupSingle(self, options, host, err);
+        },
+      );
+    }
+    // tls.connect runs the same flow (see _connectTls).
+    registry._netLookupAndConnect = lookupAndConnect;
+
     // In Node, tls.TLSSocket EXTENDS net.Socket, so `x instanceof net.Socket`
     // is how library code decides it holds a socket. Here the two classes
     // cannot share a base -- this Socket is a hand-rolled EventEmitter over
@@ -19470,12 +21747,28 @@
         };
         this._paused = false;
         this._readLoopActive = false;
+        // Paused-mode reading (node's readableFlowing false / null): a
+        // 'readable' listener buffers what arrives here for read(), and once
+        // the last one goes the data is held until resume() or a 'data'
+        // listener. _readFull stops the read loop while the buffer is full.
+        this._readBuf = [];
+        this._readBufBytes = 0;
+        this._readableMode = false;
+        this._holdData = false;
+        this._eofPending = false;
+        this._readFull = false;
+        this._releaseScheduled = false;
+        // node's Duplex options: a side can be closed from the start.
+        if (options && options.readable === false) this.readable = false;
+        if (options && options.writable === false) this.writable = false;
         this._pipeHandler = null;
         this._timeoutMs = 0;
         this._timeoutId = null;
         // Distinguishes ERR_SOCKET_CLOSED vs ERR_SOCKET_CLOSED_BEFORE_
         // CONNECTION for callbacks queued on a dead socket (Node parity).
         this._everConnected = false;
+        // Opens the write chain once a connect settles (see connect()).
+        this._connectGate = null;
         if (options && options._handle !== undefined) {
           this._handle = options._handle;
           this.connecting = false;
@@ -19498,18 +21791,23 @@
       }
 
       connect(...args) {
-        let port, host, cb;
+        let options, cb;
         if (typeof args[0] === "object" && args[0] !== null) {
-          const opts = args[0];
-          port = opts.port;
-          host = opts.host || "127.0.0.1";
+          options = args[0];
           cb = args[1];
+        } else if (typeof args[0] === "string" && !(Number(args[0]) >= 0)) {
+          // node's normalizeArgs: a string that is not a port names a pipe.
+          options = { path: args[0] };
+          cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : undefined;
         } else {
-          port = args[0];
-          host = typeof args[1] === "string" ? args[1] : "127.0.0.1";
+          options = { port: args[0], host: typeof args[1] === "string" ? args[1] : undefined };
           cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : undefined;
         }
-        if (cb) this.once("connect", cb);
+        const port = options.port;
+        // node: `options.host || 'localhost'`, and the name is looked up like
+        // any other (a `lookup` option sees 'localhost').
+        const host = options.host || "localhost";
+        if (typeof cb === "function") this.once("connect", cb);
         this.connecting = true;
         // Node registers the TCPSocketWrap synchronously inside connect(), well
         // before the connection is established (probe: _getActiveHandles()
@@ -19519,7 +21817,46 @@
         // _doClose() both early-return and the entry would be pinned in this
         // strong Map for the process lifetime (one per socket).
         if (!this.destroyed) registry._activeHandles.set(this, "TCPSocketWrap");
-        const pending = natives.tcpConnect(host, port, autoSelectFamilyAttemptTimeoutDefault).then(
+        // Node queues writes (and the end() FIN) issued before the
+        // connection exists; the write chain waits on this gate, which opens
+        // once the connect settles -- or once the socket is destroyed while
+        // its name is still being looked up (destroy() opens it).
+        let openGate;
+        const gate = new Promise((resolve) => {
+          openGate = resolve;
+        });
+        this._connectGate = openGate;
+        this._chain = this._chain.then(() => gate);
+        const dial = (spec, local) => {
+          let connecting;
+          try {
+            connecting = natives.tcpConnect(
+              host,
+              port,
+              autoSelectFamilyAttemptTimeoutDefault,
+              spec === null ? undefined : JSON.stringify(spec),
+              local,
+            );
+          } catch (err) {
+            // A refusal the op raises synchronously (ERR_ACCESS_DENIED for an
+            // address the net grant does not cover) is this socket's connect
+            // failure -- never an exception into the lookup hook that
+            // answered.
+            process.nextTick(connectErrorNT, this, err);
+            return;
+          }
+          this._startConnect(connecting, host, port).then(openGate);
+        };
+        if (refusePipeConnect(this, options)) return this;
+        lookupAndConnect(this, options, host, port, dial);
+        return this;
+      }
+
+      // The native connect in flight: its success handler and failure
+      // handler, as net.connect has always run them. Resolves once either
+      // has run.
+      _startConnect(connecting, host, port) {
+        return connecting.then(
           (result) => {
             if (this.destroyed) {
               // destroy() raced the connect: close the just-established
@@ -19555,12 +21892,6 @@
             this.destroy(_shapeConnectError(err, host, port));
           },
         );
-        // Node queues writes (and the end() FIN) issued before the
-        // connection exists; gate the write chain on the pending connect so
-        // an immediate end() shuts the socket down instead of silently
-        // skipping tcpShutdown on a null handle.
-        this._chain = this._chain.then(() => pending);
-        return this;
       }
 
       write(data, encoding, cb) {
@@ -19694,6 +22025,14 @@
         this.writable = false;
         this.connecting = false;
         registry._activeHandles.delete(this);
+        // Destroyed while its name was still being looked up: nothing will
+        // settle the connect, so release the writes queued behind it (they
+        // fail with ERR_SOCKET_CLOSED_BEFORE_CONNECTION).
+        if (this._connectGate) {
+          const openGate = this._connectGate;
+          this._connectGate = null;
+          openGate();
+        }
         const rs = this._readableState;
         const ws = this._writableState;
         rs.destroyed = ws.destroyed = true;
@@ -19740,7 +22079,7 @@
 
       async _readLoopBody() {
         while (!this.destroyed) {
-          if (this._paused) return;
+          if (this._paused || this._readFull) return;
           let chunk;
           try {
             chunk = await natives.tcpRead(this._handle, 65536);
@@ -19749,36 +22088,198 @@
             return;
           }
           if (chunk === undefined) {
-            this.readable = false;
-            // state.readable stays untouched (side-existence marker; see destroy).
-            this._readableState.ended = true;
-            this._readableState.endEmitted = true;
-            this.emit("end");
-            if (!this.allowHalfOpen) {
-              if (this._writableState.ended) {
-                // end() already ran (the common write->end->echo->EOF shape);
-                // the reentry guard means calling it again would no-op, so
-                // route the close through the write chain -- it sequences
-                // AFTER the in-flight shutdown + 'finish'. Before the guard,
-                // this path re-ran end() and closed via its duplicate chain
-                // (which also double-emitted 'finish').
-                this._chain = this._chain.then(() => this._doClose());
-              } else {
-                this.end();
-              }
-            } else if (!this.writable) {
-              this._doClose();
+            if (this._readableMode || this._holdData) {
+              // Buffered or held: 'end' follows once what is left is read
+              // (read() returns null), as node's does.
+              this._eofPending = true;
+              if (this._readableMode) this.emit("readable");
+            } else {
+              this._onReadEof();
             }
             break;
           }
           this.bytesRead += chunk.length;
           if (this._timeoutMs > 0) this._resetTimeout();
-          if (this._encoding) {
+          const buf = globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+          if (this._readableMode || this._holdData) {
+            this._readBuf.push(buf);
+            this._readBufBytes += buf.length;
+            this._readableState.length = this._readBufBytes;
+            if (this._readBufBytes >= 65536) this._readFull = true;
+            if (this._readableMode) this.emit("readable");
+          } else if (this._encoding) {
             this.emit("data", new TextDecoder(this._encoding).decode(chunk));
           } else {
-            this.emit("data", globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+            this.emit("data", buf);
           }
         }
+      }
+
+      _onReadEof() {
+        this.readable = false;
+        // state.readable stays untouched (side-existence marker; see destroy).
+        this._readableState.ended = true;
+        this._readableState.endEmitted = true;
+        this.emit("end");
+        if (!this.allowHalfOpen) {
+          if (this._writableState.ended) {
+            // end() already ran (the common write->end->echo->EOF shape);
+            // the reentry guard means calling it again would no-op, so
+            // route the close through the write chain -- it sequences
+            // AFTER the in-flight shutdown + 'finish'. Before the guard,
+            // this path re-ran end() and closed via its duplicate chain
+            // (which also double-emitted 'finish').
+            this._chain = this._chain.then(() => this._doClose());
+          } else {
+            this.end();
+          }
+        } else if (!this.writable) {
+          this._doClose();
+        }
+      }
+
+      // node's paused-mode read(): what is buffered (all of it, or `n` bytes
+      // of it), emitted as 'data' too; null when nothing is -- and at the
+      // end of the stream that null is followed by 'end'. A socket nobody
+      // switched to paused mode has nothing buffered.
+      read(n) {
+        if (n === 0 || this._readBufBytes === 0) {
+          if (this._readBufBytes === 0 && this._eofPending) {
+            this._eofPending = false;
+            process.nextTick(() => this._onReadEof());
+          }
+          return null;
+        }
+        const all = this._readBuf.length === 1
+          ? this._readBuf[0]
+          : globalThis.Buffer.concat(this._readBuf, this._readBufBytes);
+        let out = all;
+        if (typeof n === "number" && n > 0 && n < all.length) {
+          out = all.subarray(0, n);
+          this._readBuf = [all.subarray(n)];
+          this._readBufBytes = all.length - n;
+        } else {
+          this._readBuf = [];
+          this._readBufBytes = 0;
+        }
+        this._readableState.length = this._readBufBytes;
+        this._resumeReading();
+        const value = this._encoding ? new TextDecoder(this._encoding).decode(out) : out;
+        this.emit("data", value);
+        return value;
+      }
+
+      // node's Readable.push, for a socket fed by hand rather than by its
+      // handle (https-proxy-agent replays a refused CONNECT's answer into a
+      // fake socket this way): 'data' at once, or buffered in paused mode;
+      // null ends the stream, 'end' a tick later.
+      push(chunk, encoding) {
+        if (chunk === null) {
+          if (this._readableMode || this._holdData) {
+            this._eofPending = true;
+            if (this._readableMode) this.emit("readable");
+          } else {
+            process.nextTick(() => {
+              if (!this._readableState.endEmitted) this._onReadEof();
+            });
+          }
+          return false;
+        }
+        const buf = typeof chunk === "string"
+          ? globalThis.Buffer.from(chunk, encoding)
+          : globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+        // Buffered, as node's stream buffers a push before its first read:
+        // 'data' comes on the next tick (paused mode: 'readable').
+        this._readBuf.push(buf);
+        this._readBufBytes += buf.length;
+        this._readableState.length = this._readBufBytes;
+        if (this._readableMode) {
+          this.emit("readable");
+        } else {
+          this._holdData = true;
+          if (this.listenerCount("data") > 0) this._scheduleRelease();
+        }
+        return true;
+      }
+
+      // The buffer drained below the limit: the read loop goes on.
+      _resumeReading() {
+        if (this._readFull && this._readBufBytes < 65536) {
+          this._readFull = false;
+          if (this._handle !== null && !this.destroyed) this._readLoop();
+        }
+      }
+
+      // Held data flows again (resume(), a 'data' listener): what was held
+      // is emitted, and a deferred end follows it.
+      _releaseHeld() {
+        this._holdData = false;
+        if (this._readBufBytes > 0) {
+          const all = this._readBuf.length === 1
+            ? this._readBuf[0]
+            : globalThis.Buffer.concat(this._readBuf, this._readBufBytes);
+          this._readBuf = [];
+          this._readBufBytes = 0;
+          this._readableState.length = 0;
+          this.emit("data", this._encoding ? new TextDecoder(this._encoding).decode(all) : all);
+        }
+        if (this._eofPending) {
+          this._eofPending = false;
+          this._onReadEof();
+          return;
+        }
+        this._resumeReading();
+      }
+
+      // node's Readable.on: a 'readable' listener switches the socket to
+      // paused mode (and is told at once of anything already buffered); a
+      // 'data' listener on a socket whose 'readable' listeners are gone
+      // resumes it.
+      _add(type, listener, prepend, once) {
+        const result = super._add(type, listener, prepend, once);
+        if (type === "readable") {
+          if (!this._readableMode) {
+            this._readableMode = true;
+            this._holdData = false;
+            if (this._readBufBytes > 0 || this._eofPending) {
+              process.nextTick(() => {
+                if (this._readableMode) this.emit("readable");
+              });
+            }
+          }
+        } else if (type === "data" && this._holdData) {
+          this._scheduleRelease();
+        }
+        return result;
+      }
+
+      // node's resume(): the held data flows on the next tick, so a listener
+      // added right after ('end' after 'data') still sees it.
+      _scheduleRelease() {
+        if (this._releaseScheduled) return;
+        this._releaseScheduled = true;
+        process.nextTick(() => {
+          this._releaseScheduled = false;
+          if (this._holdData && !this._readableMode) this._releaseHeld();
+        });
+      }
+      removeListener(type, listener) {
+        const result = super.removeListener(type, listener);
+        if (type === "readable") this._readableListenersChanged();
+        return result;
+      }
+      removeAllListeners(type) {
+        const result = super.removeAllListeners(type);
+        if (type === undefined || type === "readable") this._readableListenersChanged();
+        return result;
+      }
+      // The last 'readable' listener went: node's flowing is null -- data is
+      // held until resume() or a 'data' listener.
+      _readableListenersChanged() {
+        if (!this._readableMode || this.listenerCount("readable") > 0) return;
+        this._readableMode = false;
+        this._holdData = true;
+        if (this.listenerCount("data") > 0) this._scheduleRelease();
       }
 
       _doClose() {
@@ -19807,6 +22308,9 @@
             this._timeoutId = null;
             this.emit("timeout");
           }, this._timeoutMs);
+          // node's socket timeouts are unref'd timers: an idle timeout never
+          // keeps the process alive (a pooled, unref'd socket's included).
+          if (typeof this._timeoutId.unref === "function") this._timeoutId.unref();
         }
       }
       setNoDelay() { return this; }
@@ -19869,6 +22373,9 @@
       }
       pause() { this._paused = true; return this; }
       resume() {
+        // node: resume() does not leave paused mode while a 'readable'
+        // listener is attached; otherwise held data flows again.
+        if (this._holdData && !this._readableMode) this._scheduleRelease();
         if (this._paused) {
           this._paused = false;
           this._readLoop();
@@ -20053,6 +22560,11 @@
       }
       get rules() { return this._rules.slice(); }
     }
+
+    // What http's agent path needs to tell a patched socket layer (an
+    // instrumentation or guard wrapping connect) from the stock one, captured
+    // before any caller can patch it.
+    registry._netStock = { createConnection, socketConnect: Socket.prototype.connect };
 
     return {
       isIPv4, isIPv6, isIP,
@@ -21554,6 +24066,7 @@
   // supports HTTPS natively via reqwest+rustls).
   registry.factories.https = (natives) => {
     const http = registry.get("http");
+    const agents = registry._httpAgents;
     const EventEmitter = registry.get("events");
     // tls's minVersion / maxVersion / secureProtocol resolver (#144): the same
     // validation Node runs when it builds a SecureContext for a server or a
@@ -21562,7 +24075,6 @@
       registry.get("tls");
       return registry._resolveTlsVersions(options);
     }
-    let httpsVersionPinWarned = false;
 
     class Server extends EventEmitter {
       constructor(options, handler) {
@@ -21703,308 +24215,17 @@
       // Node validates the version options when it builds the request's
       // SecureContext, so an invalid name or method, or a secureProtocol +
       // min/max conflict, throws here at https.request() on either path.
-      var tlsVersions = resolveTlsVersions(options);
-      if (options.rejectUnauthorized === false) {
-        return new TlsClientRequest(options, callback);
-      }
-      // The verifying path goes through the shared HTTPS client, which
-      // negotiates the default TLS 1.2-1.3 range and takes no per-request pin
-      // (docs/node-divergences.md). A pin that would change what is negotiated
-      // is said so once, rather than silently connecting with a version the
-      // caller ruled out; the default-range spellings (minVersion TLSv1.2,
-      // maxVersion TLSv1.3, TLS_method) change nothing and stay quiet.
-      if (
-        !httpsVersionPinWarned &&
-        (tlsVersions.min === "TLSv1.3" || (tlsVersions.max !== "" && tlsVersions.max !== "TLSv1.3"))
-      ) {
-        httpsVersionPinWarned = true;
-        process.emitWarning(
-          "https.request: minVersion, maxVersion and secureProtocol are not applied to a " +
-            "verifying request in oam; the shared HTTPS client negotiates TLS 1.2-1.3 " +
-            "(YawLabs/oam#146). tls.connect honours them. See docs/node-divergences.md.",
-        );
-      }
+      resolveTlsVersions(options);
+      // node: an https request's default agent is https.globalAgent (as it
+      // is now, assignments included). A request with rejectUnauthorized
+      // false -- like any other that carries connection policy -- goes over
+      // a socket that agent's tls.connect opened, which honours every TLS
+      // option; only the fetch path's shared client cannot.
+      // A version pin (like `ca`, a client certificate or a
+      // checkServerIdentity) sends the request over tls.connect, which
+      // honours it (http's carriesTlsPolicy), so no pin is dropped.
+      options._defaultAgent = agents.state.httpsGlobalAgent;
       return http.request(options, callback);
-    }
-
-    class TlsClientRequest extends EventEmitter {
-      constructor(options, callback) {
-        super();
-        this.method = (options.method || "GET").toUpperCase();
-        this._options = options;
-        this._headers = {};
-        if (options.headers) {
-          var keys = Object.keys(options.headers);
-          for (var i = 0; i < keys.length; i++) this._headers[keys[i].toLowerCase()] = options.headers[keys[i]];
-        }
-        // node's `auth` option (or a URL's userinfo) as Basic credentials, the
-        // same rule http.ClientRequest applies.
-        if (options.auth && this._headers["authorization"] === undefined) {
-          this._headers["authorization"] =
-            "Basic " + globalThis.Buffer.from(String(options.auth), "utf8").toString("base64");
-        }
-        this._body = [];
-        this._ended = false;
-        this._aborted = false;
-        this.headersSent = false;
-        var self = this;
-        this.socket = {
-          remoteAddress: options.hostname || "localhost",
-          remotePort: Number(options.port || 443),
-          localAddress: "127.0.0.1", localPort: 0,
-          setTimeout: function() { return this; },
-          setNoDelay: function() { return this; },
-          setKeepAlive: function() { return this; },
-          ref: function() { return this; },
-          unref: function() { return this; },
-          destroy: function() { self.destroy(); },
-        };
-        if (callback) this.once("response", callback);
-      }
-      setHeader(name, value) { this._headers[name.toLowerCase()] = value; return this; }
-      getHeader(name) { return this._headers[name.toLowerCase()]; }
-      removeHeader(name) { delete this._headers[name.toLowerCase()]; }
-      write(chunk, encoding, cb) {
-        if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
-        if (typeof chunk === "string") chunk = globalThis.Buffer.from(chunk, encoding || "utf8");
-        else if (!(chunk instanceof Uint8Array)) chunk = globalThis.Buffer.from(chunk);
-        this._body.push(chunk);
-        if (cb) queueMicrotask(cb);
-        return true;
-      }
-      end(data, encoding, cb) {
-        if (typeof data === "function") { cb = data; data = undefined; }
-        if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
-        if (data != null) this.write(data, encoding);
-        this._ended = true;
-        this.headersSent = true;
-        this._send();
-        if (cb) this.once("response", cb);
-        return this;
-      }
-      destroy() { this._aborted = true; }
-      on(ev, fn) { return super.on(ev, fn); }
-      _send() {
-        var self = this;
-        var tls = registry.get("tls");
-        var { Readable } = registry.get("stream");
-        var host = self._options.hostname || "localhost";
-        var port = Number(self._options.port || 443);
-        var path = self._options.path || "/";
-        // The version pin travels with the request (#144); the other TLS
-        // options (ca, servername) do not on this path, which does not verify.
-        var o = self._options;
-        var sock = tls.connect({
-          host: host, port: port, rejectUnauthorized: false,
-          minVersion: o.minVersion, maxVersion: o.maxVersion, secureProtocol: o.secureProtocol,
-        });
-        sock.on("error", function(err) { self.emit("error", err); });
-        sock.on("secureConnect", function() {
-          var lc = self._headers; // header names already lowercased
-          var bodyBuf = null;
-          if (self._body.length > 0) {
-            var total = 0;
-            for (var i = 0; i < self._body.length; i++) total += self._body[i].length;
-            bodyBuf = globalThis.Buffer.alloc(total);
-            var off = 0;
-            for (var i = 0; i < self._body.length; i++) { bodyBuf.set(self._body[i], off); off += self._body[i].length; }
-          }
-          var needsBody = bodyBuf && self.method !== "GET" && self.method !== "HEAD";
-
-          // Request line + headers. Dedupe Host / Content-Length / Connection:
-          // a caller-supplied value wins and is emitted once (two Host or two
-          // Content-Length fields are an RFC 7230 / request-smuggling hazard).
-          // We force a single Connection: close (no keep-alive reuse here).
-          var reqStr = self.method + " " + path + " HTTP/1.1\r\n";
-          // node's ClientRequest Host header: an IPv6 literal bracketed (two
-          // or more colons, not already bracketed), then `:port` unless it is
-          // https' default 443. Measured on node v22.22.2: `https.get` to
-          // `https://[::1]:PORT/` and to `{ hostname: '::1', port: PORT }`
-          // both send `Host: [::1]:PORT`; oam sent a bare `::1`.
-          var hostHeader = String(host);
-          var firstColon = hostHeader.indexOf(":");
-          if (
-            firstColon !== -1 &&
-            hostHeader.indexOf(":", firstColon + 1) !== -1 &&
-            hostHeader.charAt(0) !== "["
-          ) {
-            hostHeader = "[" + hostHeader + "]";
-          }
-          if (port && port !== 443) hostHeader += ":" + port;
-          reqStr += "Host: " + (lc["host"] != null ? lc["host"] : hostHeader) + "\r\n";
-          var hkeys = Object.keys(lc);
-          for (var i = 0; i < hkeys.length; i++) {
-            var hk = hkeys[i];
-            if (hk === "host" || hk === "connection" || hk === "content-length") continue;
-            reqStr += hk + ": " + lc[hk] + "\r\n";
-          }
-          if (needsBody) {
-            reqStr += "Content-Length: " + (lc["content-length"] != null ? lc["content-length"] : bodyBuf.length) + "\r\n";
-          } else if (lc["content-length"] != null) {
-            reqStr += "Content-Length: " + lc["content-length"] + "\r\n";
-          }
-          reqStr += "Connection: close\r\n\r\n";
-          sock.write(reqStr);
-          if (needsBody) sock.write(bodyBuf);
-
-          // Response parser. Honors Transfer-Encoding: chunked and
-          // Content-Length, falling back to read-to-EOF only when neither is
-          // present. The header buffer is released once headers are parsed, so
-          // body bytes are never retained (no 2x memory / O(n^2) concat).
-          var headerBuf = globalThis.Buffer.alloc(0);
-          var headersDone = false;
-          var res = null;
-          var bodyMode = "eof";          // "eof" | "length" | "chunked"
-          var remaining = 0;             // bytes left in "length" mode
-          var chunkBuf = globalThis.Buffer.alloc(0);
-          var chunkState = "size";       // "size" | "data" | "crlf" | "done"
-          var chunkRemaining = 0;
-
-          function finishRes() { if (res) { res.push(null); res = null; } }
-
-          function feedBody(buf) {
-            if (!res) return;
-            if (bodyMode === "eof") {
-              if (buf.length > 0) res.push(buf);
-              return;
-            }
-            if (bodyMode === "length") {
-              if (remaining <= 0) { finishRes(); return; }
-              var take = buf.length <= remaining ? buf : buf.slice(0, remaining);
-              if (take.length > 0) res.push(take);
-              remaining -= take.length;
-              if (remaining <= 0) finishRes();
-              return;
-            }
-            // chunked
-            chunkBuf = globalThis.Buffer.concat([chunkBuf, buf]);
-            for (;;) {
-              if (chunkState === "size") {
-                var nl = chunkBuf.indexOf("\r\n");
-                if (nl === -1) return;
-                var sizeLine = chunkBuf.slice(0, nl).toString().trim();
-                var semi = sizeLine.indexOf(";");
-                if (semi !== -1) sizeLine = sizeLine.slice(0, semi);
-                var size = parseInt(sizeLine, 16);
-                chunkBuf = chunkBuf.slice(nl + 2);
-                if (isNaN(size)) {
-                  // Malformed chunk-size line -- surface a parse error rather
-                  // than silently treating it as the 0-terminator.
-                  chunkState = "done";
-                  var perr = new Error("Parse Error: invalid chunk size");
-                  perr.code = "HPE_INVALID_CHUNK_SIZE";
-                  self.emit("error", perr);
-                  finishRes();
-                  return;
-                }
-                if (size === 0) { chunkState = "done"; finishRes(); return; }
-                chunkRemaining = size;
-                chunkState = "data";
-              } else if (chunkState === "data") {
-                if (chunkBuf.length < chunkRemaining) {
-                  if (chunkBuf.length > 0 && res) {
-                    res.push(chunkBuf);
-                    chunkRemaining -= chunkBuf.length;
-                    chunkBuf = globalThis.Buffer.alloc(0);
-                  }
-                  return;
-                }
-                if (chunkRemaining > 0 && res) res.push(chunkBuf.slice(0, chunkRemaining));
-                chunkBuf = chunkBuf.slice(chunkRemaining);
-                chunkRemaining = 0;
-                chunkState = "crlf";
-              } else if (chunkState === "crlf") {
-                if (chunkBuf.length < 2) return;
-                chunkBuf = chunkBuf.slice(2);
-                chunkState = "size";
-              } else {
-                return;
-              }
-            }
-          }
-
-          sock.on("data", function(chunk) {
-            if (self._aborted) return;
-            var b = typeof chunk === "string" ? globalThis.Buffer.from(chunk) : chunk;
-            if (!headersDone) {
-              headerBuf = globalThis.Buffer.concat([headerBuf, b]);
-              var idx = headerBuf.indexOf("\r\n\r\n");
-              if (idx === -1) return;
-              headersDone = true;
-              var headerStr = headerBuf.slice(0, idx).toString();
-              var bodyStart = headerBuf.slice(idx + 4);
-              headerBuf = null;
-              var lines = headerStr.split("\r\n");
-              var statusParts = lines[0].split(" ");
-              var statusCode = parseInt(statusParts[1]) || 200;
-              var statusMessage = statusParts.slice(2).join(" ") || "";
-              var resHeaders = {};
-              var rawHeaders = [];
-              for (var i = 1; i < lines.length; i++) {
-                var colon = lines[i].indexOf(":");
-                if (colon === -1) continue;
-                var k = lines[i].slice(0, colon).trim();
-                var v = lines[i].slice(colon + 1).trim();
-                var lk = k.toLowerCase();
-                rawHeaders.push(k, v);
-                if (lk === "set-cookie") {
-                  if (Array.isArray(resHeaders[lk])) resHeaders[lk].push(v);
-                  else resHeaders[lk] = [v];
-                } else if (resHeaders[lk] !== undefined) {
-                  resHeaders[lk] = resHeaders[lk] + ", " + v;
-                } else {
-                  resHeaders[lk] = v;
-                }
-              }
-              res = new Readable({ read: function() {} });
-              res.statusCode = statusCode;
-              res.statusMessage = statusMessage;
-              res.httpVersion = "1.1";
-              res.headers = resHeaders;
-              res.rawHeaders = rawHeaders;
-              var te = resHeaders["transfer-encoding"];
-              var cl = resHeaders["content-length"];
-              if (te && String(te).toLowerCase().indexOf("chunked") !== -1) {
-                bodyMode = "chunked";
-              } else if (cl !== undefined) {
-                bodyMode = "length";
-                remaining = parseInt(cl, 10) || 0;
-              } else {
-                bodyMode = "eof";
-              }
-              // Handle for req.destroy(): node destroys the socket, which
-              // surfaces as ECONNRESET on an in-flight response stream.
-              self._res = res;
-              self.emit("response", res);
-              if (bodyStart.length > 0) feedBody(bodyStart);
-              else if (bodyMode === "length" && remaining <= 0) finishRes();
-            } else {
-              feedBody(b);
-            }
-          });
-          sock.on("end", function() {
-            if (!headersDone) {
-              // Peer closed before a full header block: surface an error rather
-              // than leaving the caller's callback/promise pending forever.
-              var err = new Error("socket hang up");
-              err.code = "ECONNRESET";
-              self.emit("error", err);
-              return;
-            }
-            // Peer closed mid-body before the declared length / chunk terminator
-            // arrived: surface a truncation error instead of ending cleanly
-            // (a short body must not look complete).
-            if ((bodyMode === "length" && remaining > 0) ||
-                (bodyMode === "chunked" && chunkState !== "done")) {
-              var terr = new Error("aborted");
-              terr.code = "ECONNRESET";
-              self.emit("error", terr);
-            }
-            // Flush end-of-stream (covers eof mode and ends the body stream).
-            finishRes();
-          });
-        });
-      }
     }
 
     function get(url, options, callback) {
@@ -22013,13 +24234,37 @@
       return req;
     }
 
+    // agent-base -- under https-proxy-agent, http-proxy-agent,
+    // socks-proxy-agent and pac-proxy-agent -- tells an https request from
+    // an http one (its `protocol`, and whether to put TLS over the tunnel) by
+    // looking for node's own `node:https:` frame on the stack. oam's
+    // https.request and https.get run in frames named that too, as node's
+    // do; everything else about them is the functions above.
+    var httpsFrames = new Function(
+      "requestImpl",
+      "getImpl",
+      "return [\n" +
+        "  function request(url, options, callback) { return requestImpl(url, options, callback); },\n" +
+        "  function get(url, options, callback) { return getImpl(url, options, callback); },\n" +
+        "];\n//# sourceURL=node:https",
+    )(request, get);
+
     var merged = {};
     var httpKeys = Object.keys(http);
     for (var i = 0; i < httpKeys.length; i++) merged[httpKeys[i]] = http[httpKeys[i]];
     merged.createServer = createServer;
     merged.Server = Server;
-    merged.request = request;
-    merged.get = get;
+    merged.request = httpsFrames[0];
+    merged.get = httpsFrames[1];
+    // node's https.Agent and https.globalAgent, not http's: an https.Agent
+    // connects with tls.connect, and the global one is its own instance.
+    merged.Agent = agents.HttpsAgent;
+    Object.defineProperty(merged, "globalAgent", {
+      configurable: true,
+      enumerable: true,
+      get() { return agents.state.httpsGlobalAgent; },
+      set(value) { agents.state.httpsGlobalAgent = value; },
+    });
     return merged;
   };
 
@@ -24052,6 +26297,9 @@
       if (lookupPath) {
         const errno = _dnsLookupErrno(code);
         if (errno !== undefined) e.errno = errno;
+        // A name ToASCII refused is libuv's EINVAL, whose number the native
+        // side already took for this platform.
+        else if (code === "EINVAL" && typeof err.errno === "number") e.errno = err.errno;
       }
       return e;
     }
@@ -24062,6 +26310,13 @@
     // returned the native promise straight to the caller.
     function _dnsLookup(hostname, family, all) {
       const host = String(hostname);
+      // node answers an IP literal itself, as written (no resolver, no
+      // family filter): '0:0:0:0:0:0:0:1' stays that, '::1%1' keeps its zone.
+      const literal = registry.get("net").isIP(host);
+      if (literal !== 0) {
+        const answer = { address: host, family: literal };
+        return Promise.resolve(all ? [answer] : answer);
+      }
       return natives.dnsLookup(host, family, all).then(undefined, (err) => {
         throw _shapeDnsError(err, "getaddrinfo", host, true);
       });
@@ -24281,6 +26536,11 @@
     const ADDRCONFIG = 0;
     const V4MAPPED = 0;
     const ALL = 0;
+
+    // net.connect / tls.connect / http read `dns.lookup` at call time, as
+    // node does; while it is still this function they use oam's own resolver
+    // directly (lookupAndConnect), and a replaced one is called instead.
+    registry._dnsLookupOriginal = lookup;
 
     return {
       lookup,
@@ -24978,7 +27238,32 @@
         // The TLS options (ca, cert, key, servername, rejectUnauthorized) a
         // later connect() reuses.
         this._tlsOptions = options || {};
-        this._wrappedSocket = socket || (options && options.socket) || null;
+        // TLS over a socket this one did not open (tls.connect({ socket })):
+        // the wrapped socket, the pipe TLS runs over, and the pump's
+        // listeners on the wrapped socket (_wrapOver, _connectTlsOver).
+        this._wrappedSocket = null;
+        this._tlsPipe = null;
+        this._wrapListeners = null;
+        var over = socket || (options && options.socket) || null;
+        if (over) this._wrapOver(over);
+      }
+      // node's TLSSocket over a socket it did not open: a net.Socket (a
+      // CONNECT tunnel, the STARTTLS shape, a TLSSocket for TLS in TLS) is
+      // wrapped as it is, any other stream through a JSStreamSocket -- node's
+      // internal net.Socket over a JS stream. `_handle` is node's TLSWrap
+      // stand-in from here on: its `_parentWrap` is that socket (http2-wrapper
+      // reaches the JSStreamSocket class through it), and the native TLS id
+      // joins it at the handshake. A connected socket makes this one
+      // connected, with its addresses; one still connecting hands on its
+      // 'connect'.
+      _wrapOver(over) {
+        var net = registry.get("net");
+        var wrap = over instanceof net.Socket ? over : new JSStreamSocket(over);
+        this._wrappedSocket = wrap;
+        this._handle = new TLSWrapHandle(wrap);
+        this.allowHalfOpen = !!over.allowHalfOpen;
+        this.connecting = !!wrap.connecting;
+        copyWrapAddresses(this, wrap);
       }
       // Readable EOF. `read(0)` after the null push is what Node's
       // onStreamRead does: with nothing buffered it emits 'end' whether or
@@ -24997,12 +27282,13 @@
       // left the Readable believing a read is in flight (its _read no-op'd
       // on the null handle), and read(0) defers to that belief.
       _startReading() {
-        if (this._handle !== null && !this._reading) this._read(65536);
+        if (tlsIdOf(this) !== null && !this._reading) this._read(65536);
       }
       _read(size) {
-        if (this._handle === null || this._reading) return;
+        var id = tlsIdOf(this);
+        if (id === null || this._reading) return;
         this._reading = true;
-        natives.tlsRead(this._handle, size || 65536).then(
+        natives.tlsRead(id, size || 65536).then(
           (data) => {
             this._reading = false;
             if (data === undefined) {
@@ -25046,8 +27332,10 @@
       // it ever connected -- the `const s = tls.connect(o); s.write(req)`
       // shape every hand-rolled client and ioredis's connector use.
       _writeData(data, callback) {
-        if (this._handle === null) {
-          if (this.connecting && !this.destroyed) {
+        var id = tlsIdOf(this);
+        if (id === null) {
+          // Connecting, or a wrapped socket's handshake in flight: queued.
+          if ((this.connecting || this._connectPending) && !this.destroyed) {
             this._afterConnect(() => this._writeData(data, callback), callback);
             return;
           }
@@ -25055,27 +27343,29 @@
           return;
         }
         if (this._timeoutMs > 0) this._resetTimeout();
-        natives.tlsWrite(this._handle, data).then(
+        natives.tlsWrite(id, data).then(
           () => callback(),
           (err) => callback(typeof err === "string" ? new Error(err) : err),
         );
       }
-      // Run `fn` once the socket connects, or `onClose(err)` if it closes
-      // first -- whichever comes first, exactly once.
+      // Run `fn` once the socket's TLS handle exists (a connect's, or a
+      // wrapped socket's handshake), or `onClose(err)` if it closes first --
+      // whichever comes first, exactly once.
       _afterConnect(fn, onClose) {
         var connected, closed;
         connected = () => { this.removeListener("close", closed); fn(); };
-        closed = () => { this.removeListener("connect", connected); onClose(socketClosedBeforeConnectionError()); };
-        this.once("connect", connected);
+        closed = () => { this.removeListener(kTlsReady, connected); onClose(socketClosedBeforeConnectionError()); };
+        this.once(kTlsReady, connected);
         this.once("close", closed);
       }
       _final(callback) {
-        if (this._handle === null && this.connecting && !this.destroyed) {
+        var id = tlsIdOf(this);
+        if (id === null && (this.connecting || this._connectPending) && !this.destroyed) {
           this._afterConnect(() => this._final(callback), () => callback());
           return;
         }
-        if (this._handle !== null) {
-          natives.tlsShutdown(this._handle).then(() => callback(), () => callback());
+        if (id !== null) {
+          natives.tlsShutdown(id).then(() => callback(), () => callback());
         } else {
           callback();
         }
@@ -25092,10 +27382,18 @@
         // `{}` again. The remote fields stay, as they do in Node once read.
         this.localAddress = this.localPort = this.localFamily = undefined;
         if (this._handle !== null) {
-          natives.tlsClose(this._handle);
+          var id = tlsIdOf(this);
+          if (id !== null) natives.tlsClose(id);
           this._handle = null;
         }
+        var wrapped = this._releaseWrap();
         callback(err);
+        // node: the transport goes with the TLS socket, after its 'error'.
+        if (wrapped !== null) {
+          process.nextTick(() => {
+            if (!wrapped.destroyed && typeof wrapped.destroy === "function") wrapped.destroy();
+          });
+        }
         // Node emits 'close' from the handle-close callback: a loop turn
         // after 'end' / 'error', with `hadError`, so a listener attached
         // after awaiting 'end' still sees it.
@@ -25207,6 +27505,9 @@
             this._timeoutId = null;
             this.emit("timeout");
           }, this._timeoutMs);
+          // node's socket timeouts are unref'd timers: an idle timeout never
+          // keeps the process alive (a pooled, unref'd socket's included).
+          if (typeof this._timeoutId.unref === "function") this._timeoutId.unref();
         }
       }
       // Chainable no-ops, as on net.Socket: ioredis calls both on every
@@ -25222,13 +27523,37 @@
       // is applied when the connect lands (node's deferral to 'connect').
       ref() {
         this._handleRefed = true;
-        if (this._handle !== null) natives.tlsSetRef(this._handle, true);
+        var id = tlsIdOf(this);
+        if (id !== null) natives.tlsSetRef(id, true);
+        // A wrapped socket's transport is this socket's handle in node.
+        if (this._wrappedSocket !== null && typeof this._wrappedSocket.ref === "function") this._wrappedSocket.ref();
         return this;
       }
       unref() {
         this._handleRefed = false;
-        if (this._handle !== null) natives.tlsSetRef(this._handle, false);
+        var id = tlsIdOf(this);
+        if (id !== null) natives.tlsSetRef(id, false);
+        if (this._wrappedSocket !== null && typeof this._wrappedSocket.unref === "function") this._wrappedSocket.unref();
         return this;
+      }
+      // The pump between a wrapped socket and its pipe stops, and the pipe
+      // closes; the wrapped socket is returned for the caller to destroy.
+      _releaseWrap() {
+        var wrapped = this._wrappedSocket;
+        if (wrapped === null) return null;
+        var l = this._wrapListeners;
+        if (l !== null) {
+          this._wrapListeners = null;
+          wrapped.removeListener("data", l.data);
+          wrapped.removeListener("end", l.end);
+          wrapped.removeListener("error", l.error);
+          wrapped.removeListener("close", l.close);
+        }
+        if (this._tlsPipe !== null) {
+          natives.tlsPipeClose(this._tlsPipe);
+          this._tlsPipe = null;
+        }
+        return wrapped;
       }
       // `{}` until connected, then Node's key order (probed on v22.22.2).
       address() {
@@ -25379,6 +27704,198 @@
     // https.request(); shared through the registry rather than as an export.
     registry._resolveTlsVersions = resolveTlsVersions;
 
+    // Emitted once a TLS socket's native handle exists, before 'connect':
+    // writes queued while it was connecting go then.
+    const kTlsReady = Symbol("tlsReady");
+
+    // A TLS socket's native id: its `_handle` for a connection oam opened,
+    // the id the wrap stand-in carries for one over a socket it did not.
+    function tlsIdOf(socket) {
+      var h = socket._handle;
+      if (h === null || h === undefined) return null;
+      if (typeof h === "number") return h;
+      return typeof h._tlsId === "number" ? h._tlsId : null;
+    }
+
+    // node's TLSWrap as JS code sees it on a TLS socket over another socket:
+    // `_parentWrap` is that socket (a net.Socket, or a JSStreamSocket over a
+    // JS stream), `_parent` its handle.
+    class TLSWrapHandle {
+      constructor(wrap) {
+        this._parentWrap = wrap;
+        this._parent = wrap._handle === undefined ? null : wrap._handle;
+        this._tlsId = null;
+      }
+    }
+
+    // node's internal/js_stream_socket: a net.Socket over any JS stream, so
+    // TLS can run over it. Writes, ends, pauses and destroys go to the
+    // stream; its data, end, errors and close come back as this socket's.
+    class JSStreamSocket extends registry.get("net").Socket {
+      constructor(stream) {
+        super();
+        this.stream = stream;
+        this.connecting = false;
+        this.readable = stream.readable !== false;
+        this.writable = stream.writable !== false;
+        // node pauses the stream until the TLS layer starts reading.
+        if (typeof stream.pause === "function") stream.pause();
+        stream.on("data", (chunk) => this.emit("data", chunk));
+        stream.once("end", () => this.emit("end"));
+        stream.on("error", (err) => this.emit("error", err));
+        stream.once("close", () => {
+          if (!this.destroyed) this.destroy();
+        });
+      }
+      write(chunk, encoding, callback) {
+        if (typeof encoding === "function") {
+          callback = encoding;
+          encoding = undefined;
+        }
+        return this.stream.write(chunk, encoding, callback);
+      }
+      end(chunk, encoding, callback) {
+        if (typeof chunk === "function") {
+          callback = chunk;
+          chunk = undefined;
+        }
+        this.stream.end(chunk, encoding, callback);
+        return this;
+      }
+      pause() {
+        if (typeof this.stream.pause === "function") this.stream.pause();
+        return this;
+      }
+      resume() {
+        if (typeof this.stream.resume === "function") this.stream.resume();
+        return this;
+      }
+      destroy(err) {
+        if (this.destroyed) return this;
+        this.destroyed = true;
+        this.readable = this.writable = false;
+        if (typeof this.stream.destroy === "function") this.stream.destroy();
+        if (err) this.emit("error", err);
+        this.emit("close", !!err);
+        return this;
+      }
+      ref() { return this; }
+      unref() { return this; }
+      address() { return {}; }
+    }
+
+    function copyWrapAddresses(socket, wrap) {
+      if (wrap.remoteAddress === undefined) return;
+      socket.remoteAddress = wrap.remoteAddress;
+      socket.remotePort = wrap.remotePort;
+      socket.remoteFamily = wrap.remoteFamily;
+      socket.localAddress = wrap.localAddress;
+      socket.localPort = wrap.localPort;
+      socket.localFamily = wrap.localFamily;
+    }
+
+    // tls.connect({ socket }): the handshake over the socket the TLS socket
+    // wraps, through a pipe (natives.tlsPipe*) whose far end is pumped to and
+    // from that socket. node checks the certificate against `servername`,
+    // else `host`, else the name the socket connected to, else 'localhost'.
+    function _connectTlsOver(socket, options, callback, event) {
+      if (socket._connectPending || tlsIdOf(socket) !== null) {
+        var h = options.host || "localhost";
+        var p = options.port || 443;
+        process.nextTick(() => socket.destroy(connectSyscallError("EISCONN", h, p, socket)));
+        return;
+      }
+      var wrap = socket._wrappedSocket;
+      var ca = options.ca == null ? undefined
+        : Array.isArray(options.ca) ? options.ca.map(String).join("\n") : String(options.ca);
+      var cert = options.cert != null ? String(options.cert) : undefined;
+      var key = options.key != null ? String(options.key) : undefined;
+      var rejectUnauthorized = options.rejectUnauthorized !== false;
+      var tlsVersions = resolveTlsVersions(options);
+      var name = options.servername || options.host || wrap._host || "localhost";
+      if (callback) socket.once(event, callback);
+      socket._connectPending = true;
+      var pipe = natives.tlsPipeOpen();
+      socket._tlsPipe = pipe;
+      pumpTlsPipe(socket, wrap, pipe);
+      var start = function () {
+        if (socket.destroyed) return;
+        var connecting;
+        try {
+          connecting = natives.tlsConnectOver(
+            pipe, name, ca, rejectUnauthorized, cert, key, tlsVersions.min, tlsVersions.max,
+          );
+        } catch (err) {
+          process.nextTick(() => socket.destroy(err));
+          return;
+        }
+        _settleTlsConnect(socket, connecting, name, options, rejectUnauthorized);
+      };
+      if (wrap.connecting) {
+        wrap.once("connect", () => {
+          if (socket.destroyed) return;
+          socket.connecting = false;
+          copyWrapAddresses(socket, wrap);
+          socket.emit("connect");
+          start();
+        });
+      } else {
+        start();
+      }
+    }
+
+    // Bytes between a wrapped socket and the pipe TLS runs over. The socket
+    // is paused while its last chunk is still going into the pipe (read
+    // backpressure), and the next TLS bytes are taken only once the socket
+    // accepted the last ones. When TLS has shut its side (close_notify
+    // sent), the socket's write side is ended. The TLS layer owns the
+    // socket's end now: a FIN from the peer no longer ends its write side
+    // (allowHalfOpen), TLS decides.
+    function pumpTlsPipe(socket, wrap, pipe) {
+      var inChain = Promise.resolve();
+      var ended = false;
+      var onData = function (chunk) {
+        var bytes = typeof chunk === "string" ? globalThis.Buffer.from(chunk, "latin1") : chunk;
+        if (typeof wrap.pause === "function") wrap.pause();
+        inChain = inChain
+          .then(function () { return natives.tlsPipeIn(pipe, bytes); })
+          .then(function () {
+            if (!wrap.destroyed && typeof wrap.resume === "function") wrap.resume();
+          }, function () {});
+      };
+      var onEnd = function () {
+        if (ended) return;
+        ended = true;
+        inChain = inChain
+          .then(function () { return natives.tlsPipeInEnd(pipe); })
+          .then(function () {}, function () {});
+      };
+      var onError = function (err) {
+        if (!socket.destroyed) socket.destroy(err);
+      };
+      wrap.on("data", onData);
+      wrap.on("end", onEnd);
+      wrap.on("error", onError);
+      wrap.on("close", onEnd);
+      socket._wrapListeners = { data: onData, end: onEnd, error: onError, close: onEnd };
+      if ("allowHalfOpen" in wrap) wrap.allowHalfOpen = true;
+      if (typeof wrap.resume === "function") wrap.resume();
+      var pumpOut = function () {
+        natives.tlsPipeOut(pipe).then(function (bytes) {
+          if (wrap.destroyed) return;
+          if (bytes === undefined) {
+            if (typeof wrap.end === "function") wrap.end();
+            return;
+          }
+          wrap.write(
+            globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
+            function (err) { if (!err) pumpOut(); },
+          );
+        }, function () {});
+      };
+      pumpOut();
+    }
+
     // 'ready' and 'secureConnect' fire back to back -- Node's order, probed
     // -- and the transport's addresses land as they would on a net.Socket:
     // remoteAddress is the resolved IP, never the host name.
@@ -25396,22 +27913,16 @@
       // Node does at tls.connect(); the effective range goes to the native.
       var tlsVersions = resolveTlsVersions(options);
 
-      if (socket._connectPending || socket._handle !== null) {
+      if (socket._connectPending || tlsIdOf(socket) !== null) {
         // Node: a connect() on a socket that is connecting or connected
         // fails with EISCONN and destroys the socket, and the callback
         // never runs. Ignoring the call would drop the callback silently.
         process.nextTick(() => socket.destroy(connectSyscallError("EISCONN", host, port, socket)));
         return;
       }
-      if (socket._wrappedSocket) {
-        // Not openable here (class comment): fail on the next tick, the way
-        // a refused connect would, rather than connect somewhere else.
-        var unsupported = new Error(
-          "The feature tls over an existing socket (the `socket` option) is " +
-          "unavailable on the current platform, which is being used to run oam",
-        );
-        unsupported.code = "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM";
-        process.nextTick(() => socket.destroy(unsupported));
+      if (socket._wrappedSocket !== null) {
+        // Over the socket it wraps, not a connection of its own.
+        _connectTlsOver(socket, options, callback, event);
         return;
       }
       if (socket.destroyed) {
@@ -25422,6 +27933,9 @@
       }
       if (callback) socket.once(event, callback);
       socket.connecting = true;
+      // A `path` names a pipe in node, never host:port (see net's
+      // refusePipeConnect).
+      if (registry.get("net") && registry._netRefusePipeConnect(socket, options)) return;
       socket._connectPending = true;
       // Node registers the handle synchronously inside connect(), before the
       // connection exists, and a TLS socket reports as a TCPSocketWrap
@@ -25429,8 +27943,43 @@
       // handle).
       registry._activeHandles.set(socket, "TCPSocketWrap");
 
-      var attemptTimeout = registry.get("net").getDefaultAutoSelectFamilyAttemptTimeout();
-      natives.tlsConnect(host, port, serverName, ca, rejectUnauthorized, cert, key, tlsVersions.min, tlsVersions.max, attemptTimeout).then(
+      var net = registry.get("net");
+      var attemptTimeout = net.getDefaultAutoSelectFamilyAttemptTimeout();
+      // The name is looked up as net.connect looks it up (the `lookup`
+      // option, a replaced dns.lookup, 'lookup' events a listener can veto);
+      // `dial` starts the native connect with what that answered. The TLS
+      // server name stays `servername` or the host, never an address.
+      var dial = function (spec, local) {
+        var connecting;
+        try {
+          connecting = natives.tlsConnect(
+            host, port, serverName, ca, rejectUnauthorized, cert, key,
+            tlsVersions.min, tlsVersions.max, attemptTimeout,
+            spec === null ? undefined : JSON.stringify(spec),
+            local,
+          );
+        } catch (err) {
+          // A synchronous refusal (ERR_ACCESS_DENIED for an address the net
+          // grant does not cover) fails this socket, never the lookup hook.
+          process.nextTick(() => socket.destroy(err));
+          return;
+        }
+        _settleTlsConnect(socket, connecting, serverName, options, rejectUnauthorized);
+      };
+      registry._netLookupAndConnect(socket, options, host, port, dial);
+    }
+
+    // tls.checkServerIdentity: rustls has already matched the name against
+    // the certificate by the time a caller could ask, so this answers
+    // "matches"; a caller's own checkServerIdentity that calls it and then
+    // adds a pin works as in node.
+    function stubCheckServerIdentity() {
+      return undefined;
+    }
+
+    // The native tls connect in flight, settled onto `socket`.
+    function _settleTlsConnect(socket, connecting, serverName, options, rejectUnauthorized) {
+      connecting.then(
         (info) => {
           socket._connectPending = false;
           if (socket.destroyed) {
@@ -25439,7 +27988,12 @@
             try { natives.tlsClose(info.handle); } catch (_) { /* noop */ }
             return;
           }
-          socket._handle = info.handle;
+          var wrapped = socket._wrappedSocket;
+          if (wrapped !== null) {
+            socket._handle._tlsId = info.handle;
+          } else {
+            socket._handle = info.handle;
+          }
           socket.connecting = false;
           // Node: `authorized` is the verifier's verdict even with
           // rejectUnauthorized:false, and `authorizationError` its code
@@ -25453,23 +28007,58 @@
           socket._peerParsed = null;
           socket._ephemeralKeyInfo = info.ephemeralKeyInfo || null;
           socket.alpnProtocol = info.alpnProtocol || false;
-          if (info.remoteAddr) {
-            socket.remoteAddress = info.remoteAddr.address;
-            socket.remotePort = info.remoteAddr.port;
-            socket.remoteFamily = info.remoteAddr.family;
-          }
-          if (info.localAddr) {
-            socket.localAddress = info.localAddr.address;
-            socket.localPort = info.localAddr.port;
-            socket.localFamily = info.localAddr.family;
+          if (wrapped !== null) {
+            // The transport's addresses: a TLS socket over a net.Socket
+            // reports that socket's (a JS stream has none).
+            copyWrapAddresses(socket, wrapped);
+          } else {
+            if (info.remoteAddr) {
+              socket.remoteAddress = info.remoteAddr.address;
+              socket.remotePort = info.remoteAddr.port;
+              socket.remoteFamily = info.remoteAddr.family;
+            }
+            if (info.localAddr) {
+              socket.localAddress = info.localAddr.address;
+              socket.localPort = info.localAddr.port;
+              socket.localFamily = info.localAddr.family;
+            }
           }
           if (socket._timeoutMs > 0) socket._resetTimeout();
           // unref() before the handle existed is applied now, before
           // 'connect' and before the first read parks (see TLSSocket.unref).
           if (socket._handleRefed === false) natives.tlsSetRef(info.handle, false);
-          socket.emit("connect");
-          socket.emit("ready");
+          // Writes queued while connecting go now.
+          socket.emit(kTlsReady);
+          // A wrapped socket was connected already: node emits no 'connect'
+          // (nor 'ready') for it.
+          if (wrapped === null) socket.emit("connect");
+          // A 'connect' listener that destroyed the socket (a guard vetting
+          // the peer) ends it there: no 'secureConnect', nothing read.
+          if (socket.destroyed) return;
+          // node's onConnectSecure: a certificate the chain check accepted
+          // is handed to `checkServerIdentity(hostname, cert)` -- the
+          // caller's own identity or pinning check -- and an Error it returns
+          // makes the socket unauthorized; with rejectUnauthorized the socket
+          // is destroyed with it before 'secureConnect'. The host name check
+          // node's default does is rustls's, already applied.
+          var identityCheck = options && options.checkServerIdentity;
+          if (socket.authorized && typeof identityCheck === "function" && identityCheck !== stubCheckServerIdentity) {
+            var hostname = options.servername || options.host || "localhost";
+            var identityError = identityCheck(hostname, socket.getPeerCertificate(true));
+            if (identityError) {
+              socket.authorized = false;
+              socket.authorizationError = identityError.code || identityError.message;
+              if (rejectUnauthorized) {
+                socket.destroy(identityError);
+                return;
+              }
+            }
+          }
+          if (wrapped === null) socket.emit("ready");
           socket.emit("secureConnect");
+          // node's internal 'secure', whose first listener emits
+          // 'secureConnect': anyone else listening sees it after that.
+          socket.emit("secure");
           socket._startReading();
         },
         (err) => {
@@ -25501,13 +28090,30 @@
     function connect(...args) {
       var parsed = normalizeConnectArgs(args);
       var options = parsed[0];
+      if (options.socket) {
+        // node's tls.connect over a socket it did not open: the handshake
+        // starts over that socket at once (node's _start()), with no connect
+        // of the TLS socket's own.
+        var over = new TLSSocket(options.socket, options);
+        _connectTlsOver(over, options, parsed[1], "secureConnect");
+        return over;
+      }
       var socket = new TLSSocket(null, options);
       // Node arms the idle timer from the option when it opens the transport
       // itself (never for a wrapped socket, which is refused here anyway).
       if (options.timeout && !options.socket) socket.setTimeout(options.timeout);
+      // node's tls.connect calls the socket's own connect(): a caller that
+      // wraps TLSSocket.prototype.connect sees every tls connection.
+      if (socket.connect !== stockTlsSocketConnect) {
+        socket.connect(options);
+        if (parsed[1]) socket.once("secureConnect", parsed[1]);
+        return socket;
+      }
       _connectTls(socket, options, parsed[1], "secureConnect");
       return socket;
     }
+    var stockTlsSocketConnect = TLSSocket.prototype.connect;
+    registry._tlsStock = { connect, socketConnect: stockTlsSocketConnect };
 
     function createSecureContext(options) {
       return Object.assign({}, options);
@@ -25674,7 +28280,7 @@
       DEFAULT_MIN_VERSION: "TLSv1.2",
       rootCertificates: [],
       getCiphers: () => ["TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256"],
-      checkServerIdentity: () => undefined,
+      checkServerIdentity: stubCheckServerIdentity,
     };
   };
 
@@ -26527,6 +29133,8 @@
       const nativeTimerRef = typeof natives.timerRef === "function" ? natives.timerRef : null;
       const nativeTimerUnref =
         typeof natives.timerUnref === "function" ? natives.timerUnref : null;
+      const nativeImmediate =
+        typeof natives.timerImmediate === "function" ? natives.timerImmediate : null;
       const applyNativeRef = (id, isRef) => {
         if (!id) return;
         if (isRef) {
@@ -26656,8 +29264,15 @@
             }
           }
         };
-        const native = this._repeat ? nativeSetInterval : nativeSetTimeout;
-        this._id = native(wrapped, this._delay, ...this._args);
+        // An Immediate is due at once (node's check phase): the native
+        // immediate, not a 1 ms timer the idle loop would sleep a whole OS
+        // timer tick for.
+        if (this._kind === "Immediate" && nativeImmediate !== null) {
+          this._id = nativeImmediate(wrapped, ...this._args);
+        } else {
+          const native = this._repeat ? nativeSetInterval : nativeSetTimeout;
+          this._id = native(wrapped, this._delay, ...this._args);
+        }
         this._destroyed = false;
         // A fresh native timer is ref'd by default; re-apply an unref'd state so
         // refresh()/re-schedule preserves the handle's ref flag (Node parity).

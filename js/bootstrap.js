@@ -1111,6 +1111,13 @@
   // cause, unchanged, as in node) and never falls back to system DNS; an
   // abort while parked drops the parked fetch.
   async function settleFetch(pending, lookup, signal) {
+    return makeResponse(await settleRaw(pending, lookup, signal), signal);
+  }
+
+  // settleFetch's loop, ending at the op's raw payload (the response head
+  // with its `bodyHandle`, and the `socket` / `tls` facts of the connection
+  // it arrived on) instead of a Response.
+  async function settleRaw(pending, lookup, signal) {
     const internal = globalThis.__oam;
     const aborted = () =>
       signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
@@ -1156,7 +1163,21 @@
         throw fetchFailed(e);
       }
     }
-    return makeResponse(raw, signal);
+    return raw;
+  }
+
+  // A replaced `require('dns').lookup`: node's fetch dials through
+  // net.connect / tls.connect, which call dns.lookup as it is at call time,
+  // so a guard that replaces it vets every new connection a fetch opens
+  // (measured on node v22.22.2, redirect hops included). undefined while
+  // the dns module is not loaded (nothing can have replaced it) or its
+  // lookup is still oam's own.
+  function replacedDnsLookup() {
+    const reg = globalThis.__oamNode;
+    const dns = reg?.cache?.get?.("dns");
+    if (!dns) return undefined;
+    const lookup = dns.lookup;
+    return lookup !== reg._dnsLookupOriginal ? lookup : undefined;
   }
 
   // The methods the Fetch Standard byte-uppercases. Anything else keeps the
@@ -1204,6 +1225,26 @@
   }
 
   globalThis.fetch = async function fetch(input, init) {
+    return oamFetch(input, init, false);
+  };
+
+  // http.ClientRequest's own entry (node_compat.js): the same transport,
+  // resolving to the raw payload -- the response head, its body handle and
+  // the connection's facts -- and out of the user's reach: replacing
+  // globalThis.fetch must not intercept http.request, which in node never
+  // goes near fetch. `Headers` is the class the fetch path builds headers
+  // with.
+  Object.defineProperty(globalThis, "__oamFetchInternal", {
+    value: Object.freeze({
+      fetch: (input, init) => oamFetch(input, init, true),
+      Headers,
+    }),
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+
+  async function oamFetch(input, init, rawPayload) {
     init = init || {};
     const signal = init.signal;
     // Already-aborted: reject before touching the network (spec).
@@ -1224,6 +1265,18 @@
     // `http.request` and the http2 client set these headers legitimately in
     // node and are not subject to either set.
     const dispatchSemantics = fetchSemantics || init.__oamDispatchSemantics === true;
+    // fetch's `redirect` (RequestInit's RequestRedirect enum): the Request
+    // constructor converts init first, so a value outside the enum is
+    // refused before the URL is even parsed, with webidl's message.
+    let redirectMode;
+    if (fetchSemantics && init.redirect !== undefined) {
+      redirectMode = String(init.redirect);
+      if (redirectMode !== "follow" && redirectMode !== "manual" && redirectMode !== "error") {
+        throw new TypeError(
+          `Request constructor: ${redirectMode} is not an accepted type. Expected one of follow, manual, error.`,
+        );
+      }
+    }
     const rawUrl = wellFormed(input);
     if (fetchSemantics) {
       // node parses the URL in the Request constructor, so a bad URL is a URL
@@ -1307,6 +1360,22 @@
       // undici's Fetch-spec bad-port block on the initial URL.
       fetch_semantics: fetchSemantics,
     };
+    // http.request (through the internal entry only) gets a 3xx as the
+    // response, as node's does: node's http client never follows a
+    // redirect, and an application that vets a URL before requesting it
+    // relies on that.
+    if (rawPayload && init.__oamManualRedirect === true) request.redirect = "manual";
+    // fetch's own `redirect: "manual"` returns the 3xx (its status, headers
+    // and body; `redirected` false, `url` the request's) and `"error"` fails
+    // on a redirect status with cause `unexpected redirect`, as node's do:
+    // an application asking for either vets each hop itself, and the
+    // target must not be requested behind its back.
+    if (redirectMode === "manual" || redirectMode === "error") request.redirect = redirectMode;
+    // http.request's own maxHeaderSize for the response heads (without it
+    // the transport applies the process-wide limit).
+    if (rawPayload && typeof init.__oamMaxHeaderSize === "number") {
+      request.max_header_size = init.__oamMaxHeaderSize;
+    }
     // An undici-style dispatcher may carry a connect.lookup hook -- the
     // DNS-rebind / SSRF pin. The oam:undici shim exposes it as
     // `_oamConnectLookup`. node honours that hook however the dispatcher was
@@ -1315,8 +1384,12 @@
     // `init.dispatcher` overrides it, as in node. No dispatcher / no hook =
     // the plain path, no cost -- the holder does not exist until a run imports
     // undici.
+    //
+    // A replaced dns.lookup is the same kind of hook (node's net.connect
+    // calls it for every connection undici opens): the dispatcher's own hook
+    // wins, as undici's connector calls that one instead.
     const dispatcher = init.dispatcher ?? globalThis.__oamUndiciDispatcher?.current;
-    const lookup = dispatcher && dispatcher._oamConnectLookup;
+    const lookup = (dispatcher && dispatcher._oamConnectLookup) || replacedDnsLookup();
     if (typeof lookup === "function") request.lookup_hook = true;
     // Internal escape hatch: a request whose body is produced over time
     // rides an outbound body channel instead of a materialized body
@@ -1371,7 +1444,9 @@
     }
     // Started synchronously: a malformed request or a --permission refusal
     // throws from here, as it always has.
-    const op = settleFetch(globalThis.__oam.fetch(JSON.stringify(request)), lookup, signal);
+    const pending = globalThis.__oam.fetch(JSON.stringify(request));
+    if (rawPayload) return settleRaw(pending, lookup, signal);
+    const op = settleFetch(pending, lookup, signal);
     if (!signal) return op;
     // Race the abort. Wave-1 divergence (documented): the underlying op
     // is not cancelled at the socket — the abort rejects the fetch
@@ -1391,7 +1466,7 @@
         );
       }),
     ]);
-  };
+  }
 
   // ---------------------------------------------------------- oam.serve
   // The web-standard server: oam.serve({ port, hostname, fetch(request) })

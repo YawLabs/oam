@@ -26,7 +26,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::mem::MaybeUninit;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin as StdPin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -144,6 +144,73 @@ impl Clone for ConnStats {
     }
 }
 
+/// Where one connection goes and what it negotiated: the local and peer
+/// address of the TCP stream the connector dialled and, for an https origin,
+/// the TLS session. `http.request` reports them on `req.socket` /
+/// `res.socket` as node reports the socket it dialled (the peer's IP, never
+/// the host as written). hyper-util copies this extra into the extensions of
+/// every response the connection carries -- pooled and h2 ones included --
+/// and `send::respond` serialises it into the payload. Through an
+/// environment proxy the peer is the proxy.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ConnInfo {
+    pub(crate) local: Option<SocketAddr>,
+    pub(crate) peer: Option<SocketAddr>,
+    pub(crate) tls: Option<TlsInfo>,
+}
+
+impl ConnInfo {
+    fn of(tcp: &EagerTcp) -> ConnInfo {
+        ConnInfo {
+            local: tcp.0.local_addr().ok(),
+            peer: tcp.0.peer_addr().ok(),
+            tls: None,
+        }
+    }
+
+    /// The same endpoints, with the origin's TLS session.
+    fn with_tls(&self, conn: &rustls::ClientConnection) -> ConnInfo {
+        ConnInfo {
+            tls: Some(TlsInfo::of(conn)),
+            ..self.clone()
+        }
+    }
+}
+
+/// An origin TLS session's facts, in the spelling `tls.connect` reports them
+/// (`crate::tls`): what `res.socket.getProtocol()`, `getCipher()`,
+/// `alpnProtocol` and `getPeerCertificate()` answer.
+#[derive(Debug, Clone)]
+pub(crate) struct TlsInfo {
+    pub(crate) protocol: String,
+    pub(crate) cipher: String,
+    pub(crate) cipher_standard_name: String,
+    pub(crate) alpn: Option<String>,
+    /// The peer's chain as base64 DER, leaf first.
+    pub(crate) peer_certificates: Option<Vec<String>>,
+}
+
+impl TlsInfo {
+    fn of(conn: &rustls::ClientConnection) -> TlsInfo {
+        let (cipher, cipher_standard_name) = conn
+            .negotiated_cipher_suite()
+            .map(|c| crate::tls::cipher_names(c.suite()))
+            .unwrap_or_default();
+        TlsInfo {
+            protocol: conn
+                .protocol_version()
+                .map(crate::tls::protocol_name)
+                .unwrap_or_default(),
+            cipher,
+            cipher_standard_name,
+            alpn: conn
+                .alpn_protocol()
+                .map(|p| String::from_utf8_lossy(p).into_owned()),
+            peer_certificates: crate::tls::peer_certificates_b64(conn.peer_certificates()),
+        }
+    }
+}
+
 /// A connection handed to hyper-util. `Connected` is not publicly `Clone`, so
 /// the facts it carries are kept here and a fresh one is built on every
 /// call.
@@ -155,10 +222,12 @@ pub(crate) struct OamConn {
     proxied: bool,
     /// The requests and response bytes this connection has carried.
     stats: ConnStats,
+    /// Where it goes and what it negotiated.
+    info: ConnInfo,
 }
 
 impl OamConn {
-    fn new(io: Box<dyn AsyncIo>, h2: bool, proxied: bool) -> OamConn {
+    fn new(io: Box<dyn AsyncIo>, h2: bool, proxied: bool, info: ConnInfo) -> OamConn {
         let stats = ConnStats::new();
         OamConn {
             io: TokioIo::new(Counted {
@@ -168,6 +237,7 @@ impl OamConn {
             h2,
             proxied,
             stats,
+            info,
         }
     }
 }
@@ -231,7 +301,8 @@ impl Connection for OamConn {
     fn connected(&self) -> Connected {
         let connected = Connected::new()
             .proxy(self.proxied)
-            .extra(self.stats.clone_for_pool());
+            .extra(self.stats.clone_for_pool())
+            .extra(self.info.clone());
         if self.h2 {
             connected.negotiated_h2()
         } else {
@@ -445,6 +516,7 @@ impl OamConnector {
                 ConnectOptions {
                     attempt_timeout: self.shared.attempt_timeout(),
                     pin: None,
+                    local: None,
                 }
             }
             Via::Hooked {
@@ -475,6 +547,7 @@ impl OamConnector {
                 ConnectOptions {
                     attempt_timeout: *attempt_timeout,
                     pin,
+                    local: None,
                 }
             }
         };
@@ -484,12 +557,14 @@ impl OamConnector {
             None
         };
         let tcp = dial(&host, port, &opts).await?;
+        let info = ConnInfo::of(&tcp);
         let Some(name) = name else {
-            return Ok(OamConn::new(Box::new(tcp), false, false));
+            return Ok(OamConn::new(Box::new(tcp), false, false, info));
         };
         let config = self.shared.tls(false).await?;
         let (tls, h2) = tls_handshake(config, name, tcp).await?;
-        Ok(OamConn::new(Box::new(tls), h2, false))
+        let info = info.with_tls(tls.get_ref().1);
+        Ok(OamConn::new(Box::new(tls), h2, false, info))
     }
 
     async fn through_proxy(
@@ -523,9 +598,12 @@ impl OamConnector {
         headers.insert(USER_AGENT, self.shared.user_agent.clone());
         tunnel = tunnel.with_headers(headers);
         let tunneled = tunnel.call(dst).await?;
+        // The TCP endpoints are the proxy's; the TLS session is the origin's.
+        let endpoints = tunneled.info.clone();
         let config = self.shared.tls(false).await?;
         let (tls, h2) = tls_handshake(config, name, TokioIo::new(tunneled)).await?;
-        Ok(OamConn::new(Box::new(tls), h2, false))
+        let info = endpoints.with_tls(tls.get_ref().1);
+        Ok(OamConn::new(Box::new(tls), h2, false, info))
     }
 }
 
@@ -562,17 +640,21 @@ impl Service<Uri> for ProxyTransport {
             let opts = ConnectOptions {
                 attempt_timeout: this.attempt_timeout,
                 pin: None,
+                local: None,
             };
             let tcp = dial(&host, port, &opts).await?;
+            // The proxy's endpoints. Its own TLS session is not an origin's
+            // and is not reported.
+            let info = ConnInfo::of(&tcp);
             let Some(name) = name else {
-                return Ok(OamConn::new(Box::new(tcp), false, false));
+                return Ok(OamConn::new(Box::new(tcp), false, false, info));
             };
             // No ALPN towards the proxy: what goes through it is an
             // http/1.1 CONNECT or an absolute-form request, which h2 cannot
             // carry. (reqwest offered h2 here for an http destination.)
             let config = this.shared.tls(true).await?;
             let (tls, _) = tls_handshake(config, name, tcp).await?;
-            Ok(OamConn::new(Box::new(tls), false, false))
+            Ok(OamConn::new(Box::new(tls), false, false, info))
         })
     }
 }

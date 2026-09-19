@@ -38,12 +38,37 @@ pub struct FetchBody {
     decoder: Option<Decoder>,
     /// Compressed input the decoder has not consumed yet.
     pending: Bytes,
+    /// A malformed body (a bad chunk-size line) fails the read with node's
+    /// coded parse error instead of [`BODY_READ_FAILED`]: http.request over
+    /// an agent's socket reads its body here and reports what node's parser
+    /// reports. fetch keeps the one text it has always had.
+    coded: bool,
 }
 
 /// The body could not be read (a wire failure or a corrupt encoding). The op
-/// reports [`BODY_READ_FAILED`].
+/// reports [`BODY_READ_FAILED`], or for a coded body whose framing was
+/// malformed (`parse`), node's parse error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BodyReadError;
+pub struct BodyReadError {
+    pub parse: bool,
+}
+
+/// hyper reports malformed chunked framing as a body error whose source is an
+/// `io::Error` of kind InvalidInput / InvalidData ("Invalid chunk size
+/// line"); a connection that ends early is a different kind.
+fn is_framing_error(error: &hyper::Error) -> bool {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(error);
+    while let Some(e) = current {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            return matches!(
+                io.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData
+            );
+        }
+        current = e.source();
+    }
+    false
+}
 
 impl FetchBody {
     /// `codings`: the plan's codings for a decoded body, `None` for identity.
@@ -52,6 +77,16 @@ impl FetchBody {
             incoming: Some(incoming),
             decoder: codings.map(Decoder::new),
             pending: Bytes::new(),
+            coded: false,
+        }
+    }
+
+    /// An undecoded body whose malformed framing reads as node's coded parse
+    /// error (http.request over an agent's socket).
+    pub fn coded(incoming: Incoming) -> FetchBody {
+        FetchBody {
+            coded: true,
+            ..FetchBody::new(incoming, None)
         }
     }
 
@@ -66,10 +101,10 @@ impl FetchBody {
             if let Some(decoder) = &mut self.decoder {
                 if self.incoming.is_none() {
                     // The wire is over: drain what is still decodable.
-                    return decoder.finish().map_err(|_| BodyReadError);
+                    return decoder.finish().map_err(|_| BodyReadError { parse: false });
                 }
                 match decoder.push(&mut self.pending) {
-                    Err(_) => return Err(self.fail()),
+                    Err(_) => return Err(self.fail(false)),
                     Ok(Some(chunk)) => return Ok(Some(chunk)),
                     Ok(None) if decoder.is_done() => {
                         // node ends the body where the compressed stream
@@ -93,7 +128,7 @@ impl FetchBody {
                         return Ok(None);
                     }
                 }
-                Some(Err(_)) => return Err(self.fail()),
+                Some(Err(e)) => return Err(self.fail(is_framing_error(&e))),
                 Some(Ok(frame)) => {
                     // Trailers carry no body bytes; an empty data frame is
                     // not a chunk.
@@ -112,10 +147,10 @@ impl FetchBody {
         }
     }
 
-    fn fail(&mut self) -> BodyReadError {
+    fn fail(&mut self, parse: bool) -> BodyReadError {
         self.incoming = None;
         self.pending = Bytes::new();
-        BodyReadError
+        BodyReadError { parse }
     }
 }
 
@@ -187,7 +222,13 @@ pub async fn read(
             OpOutcome::Bytes(chunk.to_vec())
         }
         Ok(None) => OpOutcome::Done,
-        Err(BodyReadError) => OpOutcome::Failed(BODY_READ_FAILED.to_string()),
+        // llhttp's code and text for a bad chunk-size line, the one framing
+        // error hyper leaves in the body.
+        Err(BodyReadError { parse: true }) if body.coded => OpOutcome::node_failed(
+            "HPE_INVALID_CHUNK_SIZE",
+            "Parse Error: Invalid character in chunk size",
+        ),
+        Err(_) => OpOutcome::Failed(BODY_READ_FAILED.to_string()),
     }
 }
 

@@ -512,3 +512,22 @@ async fn request_body_shapes_match_today() {
     })
     .await;
 }
+
+/// `env_proxied` answers what the pooled route's rules would do with a URI:
+/// http.request asks it to keep a request node would dial directly off the
+/// proxy.
+#[test]
+fn env_proxied_reports_what_the_rules_intercept() {
+    let rules = Matcher::builder()
+        .http("http://127.0.0.1:9".to_string())
+        .no("skip.test".to_string())
+        .build();
+    let t = transport(ProxySource::Fixed(Box::new(rules)));
+    assert!(t.env_proxied("http://a.test/x"));
+    assert!(!t.env_proxied("http://skip.test/x"));
+    assert!(!t.env_proxied("https://a.test/x"), "no https rule");
+    let none = transport(ProxySource::None);
+    assert!(!none.env_proxied("http://a.test/x"));
+    // Not a URI: the caller is told to keep off the proxy's transport.
+    assert!(none.env_proxied("http://a b/"));
+}
