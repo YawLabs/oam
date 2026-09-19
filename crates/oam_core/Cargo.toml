@@ -45,6 +45,25 @@ brotli = { workspace = true }
 hickory-resolver = { workspace = true }
 # Base64 decoding for binary fetch request bodies.
 base64 = { workspace = true }
+# TLS server keys (tls/keys.rs): encrypted PEM keys and PKCS#12 bundles, as
+# Node's createSecureContext opens them -- PBES2 (PBKDF2 or scrypt, AES-CBC),
+# OpenSSL's legacy EVP_BytesToKey (MD5), PKCS#12's KDF and MAC (SHA-1/2).
+#
+# NOT new supply chain: all seven already compile in the graph as oam_engine's
+# node:crypto backends, on the same versions and features. New dependency
+# EDGES onto crates already being built.
+aes = { workspace = true }
+cbc = { workspace = true }
+pbkdf2 = { workspace = true }
+scrypt = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+md-5 = { workspace = true }
+# Triple-DES for the same keys and bundles (Node reads DES-EDE3-CBC legacy
+# PEM keys, PBES2 des-ede3-cbc and PKCS#12's 3DES PBEs). A NEW crate in the
+# graph (RustCrypto `des`, MIT OR Apache-2.0), whose only dependency is
+# `cipher` 0.4, already built for aes and cbc.
+des = { workspace = true }
 # TLS client/server for node:tls and node:https.
 tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }

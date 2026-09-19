@@ -68,8 +68,6 @@ pub struct TimeoutSettings {
     pub socket_ms: u64,
     /// `connectionsCheckingInterval`, for a check that runs here.
     pub check_interval_ms: u64,
-    /// The TLS `handshakeTimeout` (https).
-    pub handshake_ms: u64,
     /// JS runs the headers / request check and handles socket timeouts
     /// (a node:http server); otherwise both happen here.
     pub js_driven: bool,
@@ -84,7 +82,6 @@ impl Default for TimeoutSettings {
             keep_alive_ms: 5_000 + 1_000,
             socket_ms: 0,
             check_interval_ms: 30_000,
-            handshake_ms: 120_000,
             js_driven: false,
         }
     }
@@ -194,11 +191,6 @@ impl ServerTimeouts {
     /// How often a check run here looks (node's interval is at least 1 ms).
     pub fn check_interval(&self) -> Duration {
         Duration::from_millis(self.fixed.check_interval_ms.max(1))
-    }
-
-    /// The TLS handshake's time limit (node: `handshakeTimeout`).
-    pub fn handshake(&self) -> Duration {
-        Duration::from_millis(self.fixed.handshake_ms.max(1))
     }
 
     pub fn js_driven(&self) -> bool {

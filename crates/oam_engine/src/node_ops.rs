@@ -336,8 +336,11 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpInsecureParser", op_http_insecure_parser),
         // HTTP/2 cleartext server (h2c — same accept/respond ops)
         ("http2Serve", op_http2_serve),
+        // http2.createSecureServer: a node:tls connection served as h2 / h1
+        ("http2ServeTls", op_http2_serve_tls),
         // HTTPS server (TLS-wrapped HTTP, same accept/respond ops)
         ("httpsServe", op_https_serve),
+        ("httpsServerTls", op_https_server_tls),
         // TCP sockets (node:net)
         ("tcpConnect", op_tcp_connect),
         ("netResolve", op_net_resolve),
@@ -434,6 +437,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("tlsShutdown", op_tls_shutdown),
         ("tlsSetRef", op_tls_set_ref),
         ("tlsAcceptWrap", op_tls_accept_wrap),
+        ("tlsServerContext", op_tls_server_context),
+        ("tlsServerContextFree", op_tls_server_context_free),
         // oam:permissions query surface
         ("permissionsQuery", op_permissions_query),
         // worker_threads
@@ -2511,7 +2516,7 @@ fn ms_arg(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -> 
 /// headersTimeout, requestTimeout, keepAliveTimeout + keepAliveTimeoutBuffer,
 /// server.timeout, connectionsCheckingInterval, then whether JS runs the
 /// headers / request check and handles socket timeouts (a node:http
-/// server), then the TLS handshakeTimeout. Missing or invalid values are
+/// server). Missing or invalid values are
 /// node's defaults; a caller that passes nothing (oam.serve) gets them all
 /// and the check runs natively.
 fn timeout_args(
@@ -2533,9 +2538,6 @@ fn timeout_args(
         }
     }
     settings.js_driven = args.get(first + 5).is_true();
-    if let Some(ms) = ms_arg(scope, args.get(first + 6)) {
-        settings.handshake_ms = ms;
-    }
     settings
 }
 
@@ -2982,8 +2984,54 @@ fn op_http2_serve(
     );
 }
 
+/// http2ServeTls(tlsHandle, http1, maxHeaderSize, insecureHTTPParser,
+/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs) -> JSON
+/// `{ sessionId, connId }`: an accepted node:tls connection (at rest: JS has
+/// not read it) served natively from now on, as an HTTP/2 session or, with
+/// `http1`, as HTTP/1.1 (node's allowHTTP1). Its requests arrive on the
+/// session's own accept queue (`httpAccept(sessionId)`); `httpConnDestroy
+/// (connId, graceful)` closes or destroys it.
+fn op_http2_serve_tls(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let http1 = args.get(1).is_true();
+    let policy = head_policy_args(scope, &args, 2);
+    let timeouts = timeout_args(scope, &args, 4);
+    let core = core_runtime!(scope);
+    let Some(stream) = oam_core::tls::server::take_server_stream(&core.tls(), handle) else {
+        throw_type_error(scope, "http2ServeTls: the TLS connection is gone or in use");
+        return;
+    };
+    let served = {
+        let _runtime = core.enter();
+        oam_core::http_server::http2_serve_tls(core.http(), stream, http1, policy, timeouts)
+    };
+    match served {
+        Ok(session) => {
+            let json = serde_json::json!({
+                "sessionId": session.session_id,
+                "connId": session.conn_id,
+            })
+            .to_string();
+            if let Some(text) = v8::String::new(scope, &json) {
+                rv.set(text.into());
+            }
+        }
+        Err(e) => throw_type_error(scope, &format!("http2ServeTls: {e}")),
+    }
+}
+
 // ----------------------------------------------------------------- HTTPS
 
+/// httpsServe(host, port, contextId, handshakeMs, requestCert,
+/// rejectUnauthorized, alpnJson, maxHeaderSize, insecureHTTPParser,
+/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs, jsDriven)
+/// -> Promise<{ serverId, port }>: an https server whose connections are
+/// accepted with the secure context `contextId` (`tlsServerContext`, built
+/// at `https.createServer()`) and those options.
 fn op_https_serve(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -2991,43 +3039,53 @@ fn op_https_serve(
 ) {
     let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
     let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
-    let Some(cert_pem) = arg_string(scope, &args, 2) else {
-        throw_type_error(scope, "httpsServe requires cert PEM");
+    let context_id = args.get(2).number_value(scope).unwrap_or(0.0) as u64;
+    // args 3..=6: handshakeTimeout, requestCert, rejectUnauthorized, ALPN.
+    let Some(options) = accept_option_args(scope, &args, 3, "httpsServe") else {
         return;
     };
-    let Some(key_pem) = arg_string(scope, &args, 3) else {
-        throw_type_error(scope, "httpsServe requires key PEM");
-        return;
-    };
-    // Effective minVersion / maxVersion, validated by the JS https layer (#144);
-    // empty means Node's default range.
-    let min_version = arg_string(scope, &args, 4).filter(|s| !s.is_empty());
-    let max_version = arg_string(scope, &args, 5).filter(|s| !s.is_empty());
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
     }
-    let state = core_runtime!(scope).http();
-    // args 6, 7: maxHeaderSize, insecureHTTPParser.
-    let policy = head_policy_args(scope, &args, 6);
-    // args 8..=14: node's server timeouts (8..=13) and the TLS
-    // handshakeTimeout (14).
-    let timeouts = timeout_args(scope, &args, 8);
+    let core = core_runtime!(scope);
+    let Some(context) = oam_core::tls::server::context(&core.tls(), context_id) else {
+        throw_type_error(scope, "httpsServe: the server's secure context is gone");
+        return;
+    };
+    let state = core.http();
+    // args 7, 8: maxHeaderSize, insecureHTTPParser.
+    let policy = head_policy_args(scope, &args, 7);
+    // args 9..=14: node's server timeouts.
+    let timeouts = timeout_args(scope, &args, 9);
+    let tls = std::sync::Arc::new(oam_core::http_server::HttpsTls::new(context, options));
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::http_server::https_serve(
-            state,
-            host,
-            port,
-            cert_pem,
-            key_pem,
-            min_version,
-            max_version,
-            policy,
-            timeouts,
-        ),
+        oam_core::http_server::https_serve(state, host, port, tls, policy, timeouts),
     );
+}
+
+/// httpsServerTls(serverId, contextId, handshakeMs, requestCert,
+/// rejectUnauthorized, alpnJson): what an https server accepts its next
+/// connections with (`server.setSecureContext()`, a changed `requestCert`,
+/// `rejectUnauthorized` or `ALPNProtocols`).
+fn op_https_server_tls(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let context_id = args.get(1).number_value(scope).unwrap_or(0.0) as u64;
+    let Some(options) = accept_option_args(scope, &args, 2, "httpsServerTls") else {
+        return;
+    };
+    let core = core_runtime!(scope);
+    let Some(context) = oam_core::tls::server::context(&core.tls(), context_id) else {
+        throw_type_error(scope, "httpsServerTls: the server's secure context is gone");
+        return;
+    };
+    core.http().set_https_tls(server_id, context, options);
 }
 
 // ------------------------------------------------------------------- TCP
@@ -4101,42 +4159,109 @@ fn op_tls_shutdown(
     crate::ops::spawn_op(scope, &mut rv, oam_core::tls::tls_shutdown(tls, handle));
 }
 
+/// What a TLS server reads off itself for each connection it accepts
+/// (Node's tlsConnectionListener), from four arguments starting at `first`:
+/// handshakeTimeout in ms (120 s by default, validated in JS), requestCert,
+/// rejectUnauthorized, and ALPNProtocols as a JSON list of names (one char
+/// per byte). None, with a TypeError thrown, for a malformed ALPN list.
+fn accept_option_args(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    first: i32,
+    op: &str,
+) -> Option<oam_core::tls::server::AcceptOptions> {
+    let handshake_ms = args.get(first).number_value(scope).unwrap_or(120_000.0);
+    let handshake_timeout =
+        std::time::Duration::from_millis(if handshake_ms.is_finite() && handshake_ms > 0.0 {
+            handshake_ms as u64
+        } else {
+            120_000
+        });
+    let request_cert = args.get(first + 1).is_true();
+    let reject_unauthorized = args.get(first + 2).is_true();
+    let alpn = match arg_string(scope, args, first + 3) {
+        Some(json) => match serde_json::from_str::<Vec<String>>(&json) {
+            Ok(names) => names
+                .iter()
+                .map(|name| name.chars().map(|c| c as u32 as u8).collect())
+                .collect(),
+            Err(e) => {
+                throw_type_error(scope, &format!("{op}: malformed ALPN list: {e}"));
+                return None;
+            }
+        },
+        None => Vec::new(),
+    };
+    Some(oam_core::tls::server::AcceptOptions {
+        request_cert,
+        reject_unauthorized,
+        alpn,
+        handshake_timeout,
+    })
+}
+
 fn op_tls_accept_wrap(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let tcp_handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let Some(cert_pem) = arg_string(scope, &args, 1) else {
-        throw_type_error(scope, "tlsAcceptWrap requires cert PEM");
+    let context_id = args.get(1).number_value(scope).unwrap_or(0.0) as u64;
+    // args 2..=5: handshakeTimeout, requestCert, rejectUnauthorized, ALPN.
+    let Some(options) = accept_option_args(scope, &args, 2, "tlsAcceptWrap") else {
         return;
     };
-    let Some(key_pem) = arg_string(scope, &args, 2) else {
-        throw_type_error(scope, "tlsAcceptWrap requires key PEM");
-        return;
-    };
-    // The server's effective minVersion / maxVersion (JS-resolved); empty is
-    // Node's default range.
-    let min_version = arg_string(scope, &args, 3).filter(|s| !s.is_empty());
-    let max_version = arg_string(scope, &args, 4).filter(|s| !s.is_empty());
     let core = core_runtime!(scope);
     let tls = core.tls();
+    let Some(context) = oam_core::tls::server::context(&tls, context_id) else {
+        throw_type_error(scope, "tlsAcceptWrap: the server's secure context is gone");
+        return;
+    };
     let tcp = core.tcp();
     let ids = core.body_ids();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::tls::tls_accept_wrap(
-            tls,
-            tcp,
-            ids,
-            tcp_handle,
-            cert_pem,
-            key_pem,
-            min_version,
-            max_version,
-        ),
+        oam_core::tls::server::tls_accept(tls, tcp, ids, tcp_handle, context, options),
     );
+}
+
+/// tlsServerContext(specJson) -> JSON `{ "id": n }`, or `{ "error": {...} }`
+/// with what Node throws at `tls.createServer()` (JS throws it).
+fn op_tls_server_context(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let spec_json = arg_string(scope, &args, 0).unwrap_or_default();
+    let spec: oam_core::tls::server::ServerContextSpec = match serde_json::from_str(&spec_json) {
+        Ok(spec) => spec,
+        Err(e) => {
+            throw_type_error(scope, &format!("tlsServerContext: malformed options: {e}"));
+            return;
+        }
+    };
+    let core = core_runtime!(scope);
+    let result = match oam_core::tls::server::build_server_context(&spec) {
+        Ok(context) => {
+            let id =
+                oam_core::tls::server::register_context(&core.tls(), &core.body_ids(), context);
+            serde_json::json!({ "id": id })
+        }
+        Err(error) => serde_json::json!({ "error": error.to_json() }),
+    };
+    if let Some(text) = v8::String::new(scope, &result.to_string()) {
+        rv.set(text.into());
+    }
+}
+
+fn op_tls_server_context_free(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    oam_core::tls::server::free_context(&core_runtime!(scope).tls(), id);
 }
 
 /// zlibSync(bytes, format, level, compress) — synchronous transform on the

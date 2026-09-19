@@ -1557,7 +1557,12 @@ What still differs: each request gets its own socket object, so two keep-alive r
 one connection see two objects where Node shows one, and the server emits no
 `'connection'` event (Node: one per connection). That socket is an `EventEmitter` that
 never emits. An `'upgrade'` listener gets a real `net.Socket` for the connection, and the
-request's `req.socket` is that socket, as in Node.
+request's `req.socket` is that socket, as in Node. On an `https` server the object also
+reports the connection's TLS handshake (`encrypted`, `authorized`, `authorizationError`,
+`alpnProtocol`, `servername`, `getPeerCertificate()`, `getPeerX509Certificate()`,
+`getProtocol()`, `getCipher()`), but it is not a `tls.TLSSocket` (`instanceof` is false, and
+it has none of the stream methods), and the server emits no `'secureConnection'` (entry 42).
+`req.client` is `req.socket`, as in Node.
 
 _(probed)_ Node v22.22.2 and oam, http and https servers on `0.0.0.0`, `::`, `127.0.0.1` and
 `::1`, clients from four local IPv4 and three IPv6 addresses.
@@ -1592,7 +1597,7 @@ different answer:
   lowercased and a repeated name's values side by side.
 - A refused head is answered with `content-length: 0` and `date` headers next to
   `connection: close` (Node: `Connection: close` alone). There is no `'clientError'`
-  event.
+  event for it (an `https` server emits one only for a failed TLS handshake, entry 42).
 - A head that never ends is refused once it outgrows hyper's read buffer, four times the
   limit (64 KiB for the default), rather than when its count crosses the limit.
 - Upgrades and CONNECT are routed as Node routes them -- a request with an `Upgrade`
@@ -1626,9 +1631,10 @@ https's `handshakeTimeout`. Like Node's, a server takes connections for as long 
 gives them, unless `server.maxConnections` is set: then a connection that arrives while that
 many are open is closed at once and the server emits `'drop'`. What differs:
 
-- There is no `'clientError'` event, so a request timeout is always answered with the
-  `408`; Node hands it to a `'clientError'` listener when there is one. A TLS handshake
-  that times out raises no `'tlsClientError'`.
+- There is no `'clientError'` event for a request timeout, so it is always answered with
+  the `408`; Node hands it to a `'clientError'` listener when there is one. (A TLS
+  handshake that times out on an `https` server is `'tlsClientError'` and `'clientError'`
+  `ERR_TLS_HANDSHAKE_TIMEOUT`, as in Node.)
 - The socket a `'timeout'` event carries is oam's per-request socket object (entry 39),
   not a `net.Socket`: it has the addresses, `setTimeout`, `destroy` and `end` (which
   closes the connection once what is being written is out; there is no half-close).
@@ -1652,6 +1658,70 @@ many are open is closed at once and the server emits `'drop'`. What differs:
 
 _(probed)_ Node v22.22.2 and oam, raw TCP and TLS clients against servers with short
 timeouts; conformance case 135.
+
+### 42. TLS servers, `https` servers and `http2.createSecureServer`: what still differs
+
+`tls.createServer` builds its secure context at `createServer()` (Node's errors for a key
+it cannot read or that is not its certificate's), handshakes each connection on its own
+within `handshakeTimeout`, negotiates `ALPNProtocols` in the server's order, and honours
+`requestCert` / `rejectUnauthorized` / `ca` with Node's verdicts (`authorized`,
+`authorizationError`, a refused client dropped before `'secureConnection'`). `key` may be
+encrypted (PKCS#8 under PBES2 or PKCS#12's triple-DES PBEs, AES or triple-DES legacy PEM) and
+`pfx` a PKCS#12 bundle (PBES2 or triple-DES bags). `http2.createSecureServer`
+is a `tls.Server` offering `h2`: HTTP/2 sessions with `'session'`, `'stream'` and the
+compatibility API, `allowHTTP1`, `'unknownProtocol'` and Node's `403`. `https.createServer`
+is a `tls.Server` too (`ALPNProtocols` `['http/1.1']` by default), and each of its
+connections runs the same handshake with its options before it is served as HTTP/1.1:
+`req.socket` reports the handshake, and a failed one is `'tlsClientError'` and
+`'clientError'`. What differs:
+
+- **Camellia- and ARIA-protected keys are refused.** A legacy PEM key with `DEK-Info:
+  CAMELLIA-128-CBC` (`openssl rsa -camellia128`) or a PKCS#8 key under PBES2 with Camellia or
+  ARIA throws `ERR_OSSL_UNSUPPORTED` at `createServer()`; Node opens them (OpenSSL 3's
+  default provider has both ciphers). AES and triple DES are read as Node reads them, and the
+  ciphers Node 22 itself refuses (single DES, RC2, RC4, Blowfish, CAST5, IDEA, SEED) are
+  refused with Node's errors.
+- **`SNICallback` and `ALPNCallback` are validated but not called.** The server's own key
+  and certificate serve every name, and with `ALPNCallback` no protocol is negotiated.
+- **`createServer()`'s errors carry no `opensslErrorStack`**, and a `pfx` that cannot be
+  parsed is `not enough data` whatever is wrong with it (OpenSSL names the fault).
+- **A handshake that times out closes the connection.** Node emits `'tlsClientError'`
+  `ERR_TLS_HANDSHAKE_TIMEOUT` and leaves the socket open when a `'tlsClientError'` listener
+  exists; oam emits the same event and closes it.
+- **No `'connection'` event** on a `tls.Server`: the plain socket is not exposed before
+  its handshake. `'tlsClientError'` messages are rustls's; the codes are Node's.
+- **An `https` server's connections are served natively**, so it emits no
+  `'secureConnection'`, and the socket its requests, its `'tlsClientError'` and its
+  `'clientError'` carry is oam's per-request socket object with the handshake's fields
+  (entry 39), not a `tls.TLSSocket`. It has no `ref()` / `unref()` (nor does an `http`
+  server here). `requestCert`, `rejectUnauthorized` and `ALPNProtocols` are read for each
+  new connection as in Node, through accessor properties on the server (Node: data
+  properties).
+- **HTTP/2 sessions have no push, 1xx, trailers or settings.** `stream.pushAllowed` is
+  `false` and `pushStream()` throws `ERR_HTTP2_PUSH_DISABLED`; `additionalHeaders()` sends
+  nothing and `writeContinue()` / `writeEarlyHints()` return `false`; response trailers
+  (`waitForTrailers`, `addTrailers`) are not sent; `respondWithFD()` / `respondWithFile()`,
+  `session.ping()`, `settings()`, `goaway()`, `altsvc()` and `origin()` are absent, and
+  `localSettings` / `remoteSettings` are `undefined`. `server.updateSettings()` is stored
+  and not applied (the session runs hyper's defaults). `session.ref()` / `unref()` do
+  nothing. `'sessionError'`, `'frameError'` and `'goaway'` are not emitted on the server.
+- **Wire details.** Stream ids are numbered in arrival order (1, 3, 5, ...); a stream's
+  `rawHeaders` lists the pseudo-headers as `:method`, `:authority`, `:scheme`, `:path`,
+  not in the order the client sent them; `stream.close(code)` after `respond()` ends the
+  stream instead of resetting it with `code`; a graceful `session.close()` may send two
+  GOAWAY frames (RFC 9113 6.8's two-step shutdown) where Node sends one; a `te` response
+  header is not sent.
+- **`allowHTTP1` serves `http.IncomingMessage` / `http.ServerResponse`** whatever
+  `Http1IncomingMessage` / `Http1ServerResponse` name, with the TLS socket as
+  `req.socket`, and the HTTP/1 connection is held to the server's `headersTimeout` /
+  `requestTimeout` as they are when it connects. `server.close()` stops the listener and
+  leaves open HTTP/1 connections alone (Node also closes the idle ones), and there is no
+  `closeIdleConnections()`.
+- **Keys rustls cannot sign with** -- DSA among them -- are refused at `createServer()`
+  with `ERR_OSSL_UNSUPPORTED`.
+
+_(probed)_ Node v22.22.2 and oam as servers for the same real Node clients (tls, https,
+http2, raw TCP): conformance cases 141-144, 154 and 155.
 
 ### 43. `http.request` over an agent's socket: what differs
 

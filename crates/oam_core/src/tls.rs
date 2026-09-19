@@ -13,10 +13,12 @@
 //! `ERR_TLS_CERT_ALTNAME_INVALID`, ...) rather than rustls's. Every code,
 //! message and precedence rule here was measured on node v22.22.2.
 //!
-//! Server-side TLS (node:https) is handled in http_server.rs via
-//! `https_serve` -- it wraps each accepted TCP stream with a TLS
-//! acceptor before handing it to hyper. The request/response lifecycle
-//! is identical to plain HTTP (shared HttpState, same ops).
+//! Server-side TLS for node:tls servers -- and http2.createSecureServer,
+//! which is one -- is server.rs (the secure context, the per-connection
+//! handshake, Node's client-certificate verdicts) and keys.rs (encrypted
+//! keys, PKCS#12). node:https's server (`https_serve` in http_server.rs)
+//! runs the same per-connection handshake, then serves the connection with
+//! hyper exactly as a plain HTTP one (shared HttpState, same ops).
 
 use crate::{OpOutcome, node_errno, node_error_code, node_error_message};
 use rustls::CertificateError;
@@ -34,8 +36,11 @@ use x509_parser::extensions::GeneralName;
 use x509_parser::parse_x509_certificate;
 use x509_parser::time::ASN1Time;
 
+mod keys;
+pub mod server;
+
 type ClientStream = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
-type ServerStream = tokio_rustls::server::TlsStream<tokio::net::TcpStream>;
+type ServerStream = tokio_rustls::server::TlsStream<server::ServerIo>;
 /// A client over a pipe JS pumps to a socket it already has
 /// (`tls.connect({ socket })`, crate::byte_pipe).
 type WrappedStream = tokio_rustls::client::TlsStream<tokio::io::DuplexStream>;
@@ -73,6 +78,8 @@ pub struct TlsState {
     /// drains, and the process hangs at exit. `tls_close` fires the Notify so
     /// the parked read drops its half and the socket closes.
     cancel: HashMap<u64, Arc<tokio::sync::Notify>>,
+    /// Server secure contexts by id (server.rs), one per `tls.createServer`.
+    contexts: HashMap<u64, Arc<server::ServerContext>>,
 }
 
 impl TlsState {
@@ -1724,130 +1731,6 @@ pub fn tls_close(registry: &TlsRegistry, handle: u64) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn tls_accept_wrap(
-    tls_registry: TlsRegistry,
-    tcp_registry: crate::tcp::TcpRegistry,
-    ids: Arc<std::sync::atomic::AtomicU64>,
-    tcp_handle: u64,
-    cert_pem: String,
-    key_pem: String,
-    min_version: Option<String>,
-    max_version: Option<String>,
-) -> OpOutcome {
-    let Some((reader, writer)) = tcp_registry
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take_halves(tcp_handle)
-    else {
-        return OpOutcome::Failed(format!("tls accept: tcp handle {tcp_handle} is gone"));
-    };
-
-    let tcp_stream = match reader.reunite(writer) {
-        Ok(s) => s,
-        Err(e) => return OpOutcome::Failed(format!("tls accept: reunite failed: {e}")),
-    };
-
-    // A server range with nothing to offer fails this connection with Node's
-    // per-connection `tlsClientError` code -- the socket is answered with the
-    // alert the client expects (`refuse_no_protocols`), off this op so the
-    // accept loop is not held for it, and the server keeps listening.
-    let versions = match protocol_versions(min_version.as_deref(), max_version.as_deref()) {
-        Ok(v) => v,
-        Err(_) => {
-            tokio::spawn(refuse_no_protocols(tcp_stream));
-            return OpOutcome::node_failed(
-                "ERR_SSL_NO_PROTOCOLS_AVAILABLE",
-                "no protocols available for the requested TLS version range".to_string(),
-            );
-        }
-    };
-
-    let tls_config = match build_server_config(&cert_pem, &key_pem, &versions) {
-        Ok(c) => c,
-        Err(e) => return OpOutcome::Failed(format!("tls accept config: {e}")),
-    };
-
-    let acceptor = tokio_rustls::TlsAcceptor::from(tls_config);
-    let tls_stream = match acceptor.accept(tcp_stream).await {
-        Ok(s) => s,
-        Err(e) => return tls_fail(e, "accept", &tcp_handle.to_string()),
-    };
-
-    let (_, server_conn) = tls_stream.get_ref();
-    let protocol = server_conn
-        .protocol_version()
-        .map(protocol_name)
-        .unwrap_or_default();
-    let (cipher, cipher_standard_name) = server_conn
-        .negotiated_cipher_suite()
-        .map(|c| cipher_names(c.suite()))
-        .unwrap_or_default();
-    // The client's chain, if it sent one (this server requests none, so it
-    // is absent today); no ephemeralKeyInfo -- Node reports null on a
-    // server-side socket.
-    let peer_certificates = peer_certificates_b64(server_conn.peer_certificates());
-    let alpn = server_conn
-        .alpn_protocol()
-        .map(|p| String::from_utf8_lossy(p).into_owned())
-        .unwrap_or_default();
-
-    let (tcp, _) = tls_stream.get_ref();
-    let local_addr = tcp.local_addr().ok();
-    let remote_addr = tcp.peer_addr().ok();
-
-    let handle = ids.fetch_add(1, Ordering::Relaxed);
-    let (reader, writer) = tokio::io::split(tls_stream);
-    {
-        let mut guard = tls_registry.lock().unwrap_or_else(|e| e.into_inner());
-        guard.readers.insert(handle, TlsReader::Server(reader));
-        guard.writers.insert(handle, TlsWriter::Server(writer));
-    }
-
-    let mut payload = serde_json::json!({
-        "handle": handle,
-        "protocol": protocol,
-        "cipher": cipher,
-        "cipherStandardName": cipher_standard_name,
-        "alpnProtocol": alpn,
-    });
-    if let Some(chain) = peer_certificates {
-        payload["peerCertificates"] = serde_json::Value::from(chain);
-    }
-    if let Some(la) = local_addr {
-        payload["localAddr"] = crate::tcp::addr_to_json(la);
-    }
-    if let Some(ra) = remote_addr {
-        payload["remoteAddr"] = crate::tcp::addr_to_json(ra);
-    }
-    OpOutcome::Json(payload.to_string())
-}
-
-/// Build a TLS server config from PEM-encoded cert chain + private key.
-pub fn build_server_config(
-    cert_pem: &str,
-    key_pem: &str,
-    versions: &[&'static rustls::SupportedProtocolVersion],
-) -> Result<Arc<rustls::ServerConfig>, String> {
-    let certs = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| format!("server cert parse: {e}"))?;
-    let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))
-        .map_err(|e| format!("server key parse: {e}"))?
-        .ok_or("no private key found in server key PEM")?;
-    let config = rustls::ServerConfig::builder_with_protocol_versions(versions)
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| format!("server tls config: {e}"))?;
-    Ok(Arc::new(config))
-}
-
-/// The full TLS 1.2 + 1.3 set -- Node's default range, for callers that do
-/// not (yet) thread `minVersion` / `maxVersion` (the https server).
-pub fn default_protocol_versions() -> Vec<&'static rustls::SupportedProtocolVersion> {
-    vec![&rustls::version::TLS13, &rustls::version::TLS12]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2282,12 +2165,26 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         }
     }
 
+    /// A plain rustls server config for the test certificate (TLS 1.2 and
+    /// 1.3, no client authentication).
+    fn test_server_config() -> Arc<rustls::ServerConfig> {
+        let certs = rustls_pemfile::certs(&mut BufReader::new(CERT.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut BufReader::new(KEY.as_bytes()))
+            .unwrap()
+            .unwrap();
+        let config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap();
+        Arc::new(config)
+    }
+
     /// Accepts N connections; each echoes its first read, waits for the
     /// client to finish (so a second client read can park), then closes.
     async fn echo_server(listener: tokio::net::TcpListener, connections: usize) {
-        let acceptor = tokio_rustls::TlsAcceptor::from(
-            build_server_config(CERT, KEY, &default_protocol_versions()).unwrap(),
-        );
+        let acceptor = tokio_rustls::TlsAcceptor::from(test_server_config());
         for _ in 0..connections {
             let (tcp, _) = listener.accept().await.unwrap();
             let acceptor = acceptor.clone();

@@ -263,6 +263,41 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   low-severity denial of service against a stream that is not being read). oam's
   HTTP/2 server (`http2.createServer`) and the `fetch` transport's HTTP/2 connections
   both use it.
+- **`http2.createSecureServer` served cleartext.** It ignored `key`, `cert` and every
+  other TLS option and returned an `http2.createServer`, so its port spoke HTTP/2 without
+  TLS (h2c) and plain HTTP/1.1: a server meant to be reached only over TLS answered
+  cleartext clients, and TLS clients could not connect to it. Present since 0.6.0. It is
+  now Node's `Http2SecureServer`, a `tls.Server` that offers `h2` by ALPN: a client that
+  does not complete a TLS handshake gets no response, only a `'tlsClientError'` on the
+  server. A connection that negotiates `h2` is served as an HTTP/2 session (`'session'`,
+  `'stream'`, and the `(req, res)` compatibility API for the `'request'` handler); one
+  that negotiates `http/1.1` or nothing is served as HTTP/1.1 under `allowHTTP1`, handed
+  to an `'unknownProtocol'` listener, or answered with Node's `403` and closed. The TLS
+  options below apply to it.
+- **`tls.createServer` never asked for a client certificate.** It ignored
+  `requestCert`, `rejectUnauthorized` and `ca`, so a server configured to admit only
+  clients with a certificate its CA signed admitted every client, with or without one.
+  Present since 0.6.0. `requestCert` now asks for a certificate, and it is judged as
+  Node judges it: `socket.authorized`, or `socket.authorizationError` with Node's code
+  (`UNABLE_TO_GET_ISSUER_CERT` when there is none, `DEPTH_ZERO_SELF_SIGNED_CERT`,
+  `UNABLE_TO_VERIFY_LEAF_SIGNATURE`, ...), against `ca`, or the default store without it.
+  Under `rejectUnauthorized` (the default) a client with no certificate fails the
+  handshake, and one whose certificate does not verify is dropped before
+  `'secureConnection'` and never reaches the application.
+- **One client could stall a TLS server's handshakes.** `tls.createServer` completed each
+  handshake before accepting the next connection, with no time limit, so a client that
+  connected and sent nothing held up every client after it. Each connection is now
+  handshaken on its own, bounded by `handshakeTimeout` (120 s by default; the connection
+  is closed with `'tlsClientError'` `ERR_TLS_HANDSHAKE_TIMEOUT`).
+- **`https.createServer` never asked for a client certificate either.** It ignored
+  `requestCert`, `rejectUnauthorized` and `ca`, so an https server configured to admit
+  only clients with a certificate its CA signed served every client, with or without
+  one, and `req.socket` had no `authorized` or `getPeerCertificate()` to check. Present
+  since 0.4.0. Each connection now runs the `tls.createServer` handshake above with the
+  server's options: under `rejectUnauthorized` a client with no certificate, or one that
+  does not verify against `ca`, never reaches the `'request'` handler, and without it
+  `req.socket.authorized` / `authorizationError` carry Node's verdict. A failed handshake
+  is `'tlsClientError'`, passed on as `'clientError'` as in Node.
 
 ### Fixed
 
@@ -273,6 +308,47 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `gc()`, and a server's heap grew with every request (about 650 bytes a request on
   0.16.2) where Node's stays flat. Each turn now releases what it touched, and the heap
   stays flat.
+- **`https.createServer` takes node:tls's server options.** An https server is now a
+  `tls.Server`, as in Node: its secure context is built at `createServer()` (a key it
+  cannot read, one that is not its certificate's, or a wrong `passphrase` throws there
+  instead of failing at `listen()`), `passphrase` and `pfx` are read,
+  `server.setSecureContext()` and a changed `requestCert` / `rejectUnauthorized` /
+  `ALPNProtocols` apply to the connections accepted after them, and `ALPNProtocols`
+  defaults to `['http/1.1']` unless `ALPNProtocols` or `ALPNCallback` is given (a client
+  offering only `h2` gets `no_application_protocol`, as from Node). `req.socket` reports
+  the handshake as Node's `TLSSocket` does (`authorized`, `authorizationError`,
+  `alpnProtocol`, `servername`, `getPeerCertificate([detailed])`,
+  `getPeerX509Certificate()`, `getProtocol()`, `getCipher()`), and `req.client` is
+  `req.socket`, as in Node, on every server. A client that does not speak TLS gets no
+  answer and a `'clientError'` (`ERR_SSL_HTTP_REQUEST`, ...), and a TLS 1.3 client whose
+  certificate a server refuses after it has sent its request now sees the connection end
+  rather than reset, as with Node.
+- **TLS servers now negotiate ALPN and report the handshake as Node does.**
+  `tls.createServer` honours `ALPNProtocols` (the server's order among what the client
+  offers; a client offering only protocols the server lacks gets
+  `no_application_protocol`), validates it and `ALPNCallback` / `handshakeTimeout` /
+  `SNICallback` as Node does, and reports `socket.servername`. Its secure context is built
+  at `createServer()`, which throws Node's errors for a key it cannot read or one that is
+  not its certificate's (`ERR_OSSL_UNSUPPORTED`, `ERR_OSSL_X509_KEY_VALUES_MISMATCH`,
+  `ERR_OSSL_PEM_NO_START_LINE`); `server.setSecureContext()` replaces it. A failed
+  handshake is `'tlsClientError'` with the connection's socket and Node's code, and a
+  client that does not speak TLS is refused on OpenSSL's rules for its first bytes
+  (`ERR_SSL_HTTP_REQUEST`, `ERR_SSL_WRONG_VERSION_NUMBER`, ...) without an answer it
+  could read.
+- **TLS servers read encrypted keys and PKCS#12 bundles.** `key` may be an encrypted
+  PKCS#8 key (PBES2 with PBKDF2 or scrypt and AES-CBC or triple-DES, or PKCS#12's
+  triple-DES PBEs, as `openssl pkcs8 -topk8 -v1 PBE-SHA1-3DES` writes them) or a legacy
+  encrypted PEM key (AES-CBC, or `DES-EDE3-CBC` as `openssl rsa -des3` writes it), opened
+  with `passphrase` or a `{ pem, passphrase }` entry's own; `pfx` is opened as Node opens
+  it, its MAC checked (`mac verify failure`), its bags read whether PBES2-protected,
+  protected with PKCS#12's triple-DES PBEs (OpenSSL 1.x's default) or not at all, and its
+  other certificates served as the chain and trusted as CAs. The errors are Node's
+  (`ERR_OSSL_BAD_DECRYPT`, `bad decrypt` for a bundle without a MAC). What Node 22 no
+  longer reads -- single DES, RC2, RC4, Blowfish -- is refused as Node refuses it:
+  `ERR_OSSL_EVP_UNSUPPORTED` for a key, `Unsupported PKCS12 PFX data` for a bundle.
+  Triple DES comes from the RustCrypto `des` crate, new in the dependency graph.
+- **`http2.Http2ServerRequest` and `http2.Http2ServerResponse` are exported**, and an
+  HTTP/2 request's headers include `:authority` and `:scheme` on every oam HTTP/2 server.
 - **`req.trailers` and `req.rawTrailers` were `undefined` on server requests.** A chunked
   request body's trailer fields were dropped. They are now there once the body has
   ended (empty before, and for a body without trailers), combined as Node combines

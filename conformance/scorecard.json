@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "1901c4b",
+  "commit": "dfd1343+wip",
   "oamVersion": "oam 0.16.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 140,
-      "total": 140,
+      "pass": 146,
+      "total": 146,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -223,6 +223,22 @@
           "status": "pass"
         },
         {
+          "case": "141-tls-server-alpn-and-client-certificates.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "142-http2-secure-server.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "143-http2-secure-server-http1-and-client-certificates.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "144-tls-server-key-passphrase-and-pfx.mjs",
+          "status": "pass"
+        },
+        {
           "case": "149-tls-connect-local-end-and-alpn.mjs",
           "status": "pass"
         },
@@ -236,6 +252,14 @@
         },
         {
           "case": "151-http-request-finish-order.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "154-https-server-tls-options-and-client-certificates.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "155-tls-server-triple-des-keys.mjs",
           "status": "pass"
         },
         {
@@ -678,7 +702,7 @@
         "platform": "win32",
         "noBaseline": false,
         "nodeTotal": 1874,
-        "knownMissing": 349,
+        "knownMissing": 347,
         "newMissing": [],
         "staleRatchet": [],
         "absentModules": [],

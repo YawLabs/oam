@@ -317,8 +317,6 @@
           "setMaxIdleHTTPParsers"
         ],
         "http2": [
-          "Http2ServerRequest",
-          "Http2ServerResponse",
           "getDefaultSettings",
           "getPackedSettings",
           "getUnpackedSettings",
@@ -816,8 +814,6 @@
           "setMaxIdleHTTPParsers"
         ],
         "http2": [
-          "Http2ServerRequest",
-          "Http2ServerResponse",
           "getDefaultSettings",
           "getPackedSettings",
           "getUnpackedSettings",
@@ -1300,8 +1296,6 @@
           "setMaxIdleHTTPParsers"
         ],
         "http2": [
-          "Http2ServerRequest",
-          "Http2ServerResponse",
           "getDefaultSettings",
           "getPackedSettings",
           "getUnpackedSettings",

@@ -17374,6 +17374,9 @@
         this.socket = socket;
         // node's deprecated alias, the same object.
         this.connection = socket;
+        // and its other name for it (node sets both in the constructor;
+        // mutual-TLS code reads req.client.authorized).
+        this.client = socket;
         this._requestId = meta.requestId;
         // node: empty until a chunked body's trailer section is read, at
         // its end.
@@ -18120,6 +18123,26 @@
         });
         return;
       }
+      if (meta.event === "tlsClientError") {
+        // An https connection whose TLS handshake failed: node's
+        // 'tlsClientError' with its socket (the connection is already
+        // closed; the https server passes the error on as 'clientError').
+        const err = new Error(meta.message);
+        if (meta.code) err.code = meta.code;
+        const socket = registry._tlsServer.serverSocketView(serverSocket(meta), null);
+        // As node's socket is by then: destroyed, unless the handshake ran
+        // out of time (the server destroys that one on the error); and a
+        // connection that closed under its handshake ('socket hang up',
+        // raised from the close) has no addresses left to report.
+        socket.destroyed = meta.code !== "ERR_TLS_HANDSHAKE_TIMEOUT";
+        if (meta.code === "ECONNRESET") {
+          for (const key of ["remoteAddress", "remotePort", "remoteFamily", "localAddress", "localPort", "localFamily"]) {
+            socket[key] = undefined;
+          }
+        }
+        server.emit("tlsClientError", err, socket);
+        return;
+      }
       if (meta.event === "closed") {
         // The exchange ended without its response (the connection was
         // closed under it): node's abortIncoming -- the request is
@@ -18204,7 +18227,7 @@
           req.upgrade = true;
           // node: the upgrade request's socket IS the socket handed
           // to the 'upgrade' listener.
-          req.socket = req.connection = socket;
+          req.socket = req.connection = req.client = socket;
           // What the client sent after the head, already read off the
           // socket: node's `head` argument.
           const head = globalThis.Buffer.from(meta.head || "", "latin1");
@@ -18222,8 +18245,10 @@
         // An upgrade request no listener took is an ordinary one (node).
         req.upgrade = false;
         // The request's socket carries the TCP connection's real
-        // addresses (the accept record); a TLS socket is `encrypted`.
-        if (encrypted) req.socket.encrypted = true;
+        // addresses (the accept record); an https connection's also reports
+        // what its TLS handshake settled, as node's TLSSocket does.
+        if (meta.tls) registry._tlsServer.serverSocketView(req.socket, meta.tls);
+        else if (encrypted) req.socket.encrypted = true;
         // Node's server keeps a request-stream error from becoming
         // an unhandled 'error' that kills the process: a client that
         // hangs up mid-upload, or a body the server sheds under
@@ -24076,43 +24101,105 @@
       return registry._resolveTlsVersions(options);
     }
 
-    class Server extends EventEmitter {
+    // Node's https.Server (lib/https.js): a tls.Server whose connections are
+    // served as HTTP/1.1. Its TLS options are node:tls's -- read and
+    // validated by tls.Server, the secure context built at createServer()
+    // (so a bad key throws there), ALPNProtocols defaulting to
+    // ['http/1.1'] -- and each connection is accepted natively with them
+    // (httpsServe runs node:tls's server handshake), so requestCert /
+    // rejectUnauthorized / ca, ALPN and handshakeTimeout hold as they do for
+    // tls.createServer: a client the server refuses never reaches a request
+    // handler. req.socket reports the handshake (authorized,
+    // authorizationError, getPeerCertificate(), ...), and a failed handshake
+    // is 'tlsClientError', which the server passes on as 'clientError'.
+    const tls = registry.get("tls");
+    const kTlsSynced = Symbol("httpsTlsSynced");
+
+    // What the native server accepts connections with: the secure context
+    // and the options Node's tlsConnectionListener reads off the server.
+    function tlsAcceptArgs(server) {
+      var alpn = server.ALPNProtocols;
+      var names = null;
+      if (Array.isArray(alpn)) names = alpn.map(String);
+      else if (ArrayBuffer.isView(alpn)) {
+        names = registry._tlsServer.alpnWireNames(
+          new Uint8Array(alpn.buffer, alpn.byteOffset, alpn.byteLength));
+      }
+      return [
+        server._contextId,
+        Math.min(Math.floor(server._handshakeTimeout), 2147483647),
+        !!server.requestCert,
+        !!server.rejectUnauthorized,
+        names && names.length ? JSON.stringify(names) : undefined,
+      ];
+    }
+
+    // Tell a listening server what its next connections are accepted with,
+    // when that changed.
+    function syncTls(server) {
+      if (server._serverId === null || server._serverId === undefined) return;
+      var args = tlsAcceptArgs(server);
+      var key = JSON.stringify(args);
+      if (server[kTlsSynced] === key) return;
+      server[kTlsSynced] = key;
+      natives.httpsServerTls(server._serverId, ...args);
+    }
+
+    // node's addTlsClientErrorHandler.
+    function onTlsClientError(err, conn) {
+      if (!this.emit("clientError", err, conn)) conn.destroy(err);
+    }
+
+    class Server extends tls.Server {
       constructor(options, handler) {
-        super();
+        // node: ['http/1.1'] unless the caller set ALPNProtocols or an
+        // ALPNCallback (only one of the two may be set).
+        let ALPNProtocols = ["http/1.1"];
         if (typeof options === "function") {
           handler = options;
           options = {};
+        } else if (options === undefined || options === null) {
+          options = {};
+        } else {
+          if (typeof options !== "object" || Array.isArray(options)) {
+            throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+          }
+          if (options.ALPNProtocols || options.ALPNCallback) ALPNProtocols = undefined;
         }
-        this._options = options || {};
+        // node runs storeHTTPOptions first, so its errors win; the values
+        // are stored on the server once it exists.
+        registry._httpParserOptions.store({}, options);
+        super(Object.assign({ noDelay: true, ALPNProtocols }, options));
+        this.httpAllowHalfOpen = false;
         // maxHeaderSize / insecureHTTPParser and the timeouts, validated and
-        // stored as the http server does (node's https.Server runs
-        // storeHTTPOptions too).
-        registry._httpParserOptions.store(this, this._options);
-        var serverVersions = resolveTlsVersions(this._options);
-        this._tlsMin = serverVersions.min;
-        this._tlsMax = serverVersions.max;
-        // tls.Server's handshakeTimeout: a number (node validates the type
-        // only); a falsy one is the 120 s default.
-        var handshakeTimeout = this._options.handshakeTimeout;
-        if (handshakeTimeout !== undefined && typeof handshakeTimeout !== "number") {
-          throw codes.ERR_INVALID_ARG_TYPE(
-            "options.handshakeTimeout",
-            "number",
-            handshakeTimeout,
-          );
-        }
-        // Not enumerable: node keeps it internal.
-        Object.defineProperty(this, "_handshakeTimeoutMs", {
-          value: handshakeTimeout > 0 ? handshakeTimeout : 120000,
-          writable: true,
-          configurable: true,
-        });
+        // stored as the http server does.
+        registry._httpParserOptions.store(this, options);
         registry._httpParserOptions.defineTimeout(this, "timeout", 0);
+        // Read for each connection, as node reads them: a new value reaches
+        // the native server at once, for the connections after it.
+        for (const name of ["requestCert", "rejectUnauthorized", "ALPNProtocols"]) {
+          let current = this[name];
+          Object.defineProperty(this, name, {
+            get() {
+              return current;
+            },
+            set(next) {
+              current = next;
+              syncTls(this);
+            },
+            enumerable: true,
+            configurable: true,
+          });
+        }
         if (handler) this.on("request", handler);
-        this._serverId = null;
-        this._port = null;
-        this._host = null;
-        this.listening = false;
+        this.on("tlsClientError", onTlsClientError);
+        this.maxHeadersCount = null;
+      }
+      // A new context (a certificate rotation) for the connections accepted
+      // from now on.
+      setSecureContext(options) {
+        super.setSecureContext(options);
+        syncTls(this);
       }
       listen(port, host, callback) {
         if (typeof port === "object" && port !== null) {
@@ -24126,24 +24213,22 @@
         }
         if (typeof callback === "function") this.once("listening", callback);
         var hostname = host || "127.0.0.1";
-        var certPem = typeof this._options.cert === "object" && this._options.cert instanceof Uint8Array
-          ? new TextDecoder().decode(this._options.cert) : String(this._options.cert || "");
-        var keyPem = typeof this._options.key === "object" && this._options.key instanceof Uint8Array
-          ? new TextDecoder().decode(this._options.key) : String(this._options.key || "");
         var policy = registry._httpParserOptions.policy(this);
+        var accept = tlsAcceptArgs(this);
         natives.httpsServe(
           hostname,
           port || 0,
-          certPem,
-          keyPem,
-          this._tlsMin,
-          this._tlsMax,
+          ...accept,
           policy.maxHeaderSize,
           policy.insecure,
           ...registry._httpParserOptions.timeoutArgs(this),
-          Math.min(Math.floor(this._handshakeTimeoutMs), 2147483647),
         ).then(
-          (bound) => registry._httpParserOptions.bound(this, bound, hostname, true),
+          (bound) => {
+            this[kTlsSynced] = JSON.stringify(accept);
+            registry._httpParserOptions.bound(this, bound, hostname, true);
+            // Anything changed while the server was binding.
+            syncTls(this);
+          },
           (err) => this.emit("error", typeof err === "string" ? new Error(err) : err),
         );
         return this;
@@ -24168,6 +24253,12 @@
         if (callback) this.once("close", callback);
         return this;
       }
+    }
+    // The native http server has no ref / unref of its own yet: an https
+    // server keeps not offering them rather than inheriting tls.Server's,
+    // which act on a node:net listener this server does not have.
+    for (const name of ["ref", "unref"]) {
+      Object.defineProperty(Server.prototype, name, { value: undefined, writable: true, configurable: true });
     }
 
     registry._httpParserOptions.defineMaxConnections(Server.prototype);
@@ -26810,7 +26901,10 @@
 
   registry.factories.http2 = (natives) => {
     const EventEmitter = registry.get("events");
-    const { Duplex } = registry.get("stream");
+    const { Duplex, Readable } = registry.get("stream");
+    // The legacy Stream class (the module itself), which node's
+    // Http2ServerResponse extends.
+    const StreamBase = registry.get("stream").Stream || registry.get("stream");
 
     function bodyRead(handle) {
       return globalThis.__oam.fetchBodyRead(handle);
@@ -27002,9 +27096,1250 @@
       return new Http2Server(options, handler);
     }
 
-    function createSecureServer(options, handler) {
-      return createServer(options, handler);
-    }
+    // --------------------------------------------- http2.createSecureServer
+    // (Its own scope: the h2c server above has classes of the same names.)
+    const secureServer = (() => {
+      // Node's Http2SecureServer (lib/internal/http2/core.js), measured on
+      // v22.22.2: a tls.Server that offers `h2` by ALPN (and `http/1.1` too
+      // under allowHTTP1). Each TLS connection is judged by what it
+      // negotiated, in the server's first 'secureConnection' listener
+      // (connectionListener): `h2` becomes an Http2Session -- 'session', then a
+      // 'stream' per request and, with a 'request' listener, the compatibility
+      // API's (req, res) -- served natively over the TLS connection; `http/1.1`
+      // or nothing is served as HTTP/1.1 under allowHTTP1, handed to an
+      // 'unknownProtocol' listener, or answered with node's 403 and closed. A
+      // client that does not speak TLS never gets past the handshake.
+      const kSocket = Symbol("kSocket");
+      const kServer = Symbol("kServer");
+      const kOptions = Symbol("kOptions");
+      const kSession = Symbol("kSession");
+      const kProxySocket = Symbol("kProxySocket");
+      const kRequest = Symbol("kRequest");
+      const kResponse = Symbol("kResponse");
+      const kState = Symbol("kState");
+      const kHeaders = Symbol("kHeaders");
+      const kTrailers = Symbol("kTrailers");
+      const kStream = Symbol("kStream");
+      const kAborted = Symbol("kAborted");
+      const kSensitiveHeaders = Symbol.for("nodejs.http2.sensitiveHeaders");
+      const NGHTTP2_NO_ERROR = 0;
+      const NGHTTP2_INTERNAL_ERROR = 2;
+      const NGHTTP2_CANCEL = 8;
+      const STREAM_FLAGS_END_STREAM = 0x1;
+      const STREAM_FLAGS_END_HEADERS = 0x4;
+
+      function h2Error(Base, code, message) {
+        return applyNodeErrorShape(new Base(message), code);
+      }
+      const h2Errors = {
+        noSocketManipulation: () => h2Error(Error, "ERR_HTTP2_NO_SOCKET_MANIPULATION",
+          "HTTP/2 sockets should not be directly manipulated (e.g. read and written)"),
+        headersSent: () => h2Error(Error, "ERR_HTTP2_HEADERS_SENT", "Response has already been initiated."),
+        invalidStream: () => h2Error(Error, "ERR_HTTP2_INVALID_STREAM", "The stream has been destroyed"),
+        pushDisabled: () => h2Error(Error, "ERR_HTTP2_PUSH_DISABLED", "HTTP/2 client has disabled push streams"),
+        statusInvalid: (code) => h2Error(RangeError, "ERR_HTTP2_STATUS_INVALID", "Invalid status code: " + code),
+        infoStatusNotAllowed: () => h2Error(RangeError, "ERR_HTTP2_INFO_STATUS_NOT_ALLOWED",
+          "Informational status codes cannot be used"),
+        connectionHeaders: (name) => h2Error(TypeError, "ERR_HTTP2_INVALID_CONNECTION_HEADERS",
+          'HTTP/1 Connection specific headers are forbidden: "' + name + '"'),
+        pseudoHeader: (name) => h2Error(TypeError, "ERR_HTTP2_INVALID_PSEUDOHEADER",
+          '"' + name + '" is an invalid pseudoheader or is used incorrectly'),
+        singleValue: (name) => h2Error(TypeError, "ERR_HTTP2_HEADER_SINGLE_VALUE",
+          'Header field "' + name + '" must only have a single value'),
+        pseudoNotAllowed: () => h2Error(TypeError, "ERR_HTTP2_PSEUDOHEADER_NOT_ALLOWED",
+          "Cannot set HTTP/2 pseudo-headers"),
+        headerValue: (value, name) => h2Error(TypeError, "ERR_HTTP2_INVALID_HEADER_VALUE",
+          'Invalid value "' + value + '" for header "' + name + '"'),
+        httpToken: (name) => h2Error(TypeError, "ERR_INVALID_HTTP_TOKEN",
+          'Header name must be a valid HTTP token ["' + name + '"]'),
+      };
+
+      // node's kSingleValueHeaders (lib/internal/http2/util.js).
+      const kSingleValueHeaders = new Set([
+        ":status", ":method", ":authority", ":scheme", ":path", ":protocol",
+        "access-control-allow-credentials", "access-control-max-age",
+        "access-control-request-method", "age", "authorization",
+        "content-encoding", "content-language", "content-length",
+        "content-location", "content-md5", "content-range", "content-type",
+        "date", "dnt", "etag", "expires", "from", "host", "if-match",
+        "if-modified-since", "if-none-match", "if-range", "if-unmodified-since",
+        "last-modified", "location", "max-forwards", "proxy-authorization",
+        "range", "referer", "retry-after", "tk", "upgrade-insecure-requests",
+        "user-agent", "x-content-type-options",
+      ]);
+      const kHttpToken = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
+      // node's isIllegalConnectionSpecificHeader.
+      function illegalConnectionHeader(name, value) {
+        switch (name) {
+          case "connection": case "upgrade": case "http2-settings":
+          case "keep-alive": case "proxy-connection": case "transfer-encoding":
+            return true;
+          case "te":
+            return value !== "trailers";
+          default:
+            return false;
+        }
+      }
+      function utcDate() {
+        return new Date().toUTCString();
+      }
+      // node's prepareResponseHeaders + buildNgHeaderString for a response:
+      // the pairs to send (lower-cased names, arrays expanded), the status,
+      // and the object node keeps as `stream.sentHeaders`.
+      function prepareResponseHeaders(headersParam, options) {
+        var list = [];
+        var sent;
+        if (Array.isArray(headersParam)) {
+          for (var i = 0; i + 1 < headersParam.length; i += 2) list.push([headersParam[i], headersParam[i + 1]]);
+          sent = headersParam;
+        } else {
+          if (headersParam !== undefined && headersParam !== null && typeof headersParam !== "object") {
+            throw codes.ERR_INVALID_ARG_TYPE("headers", ["Object", "Array"], headersParam);
+          }
+          sent = { __proto__: null };
+          if (headersParam) {
+            for (var key in headersParam) {
+              if (Object.prototype.hasOwnProperty.call(headersParam, key)) sent[key] = headersParam[key];
+            }
+          }
+          sent[":status"] = (sent[":status"] | 0) || 200;
+          if ((options.sendDate == null || options.sendDate) && sent.date === undefined) sent.date = utcDate();
+          list = Object.keys(sent).map(function(k) { return [k, sent[k]]; });
+        }
+        var status = 200;
+        var hasStatus = false, hasDate = false;
+        for (var j = 0; j < list.length; j++) {
+          var n = String(list[j][0]).toLowerCase();
+          if (n === ":status") { status = list[j][1] | 0; hasStatus = true; }
+          if (n === "date") hasDate = true;
+        }
+        if (!hasStatus) list.unshift([":status", 200]);
+        if (!hasDate && Array.isArray(headersParam) && (options.sendDate == null || options.sendDate)) {
+          list.push(["date", utcDate()]);
+        }
+        if (status < 200 || status > 599) throw h2Errors.statusInvalid(status);
+        var pairs = [];
+        var singles = new Set();
+        for (var m = 0; m < list.length; m++) {
+          var name = String(list[m][0]).toLowerCase();
+          var value = list[m][1];
+          if (value === undefined || name === "") continue;
+          var isArray = Array.isArray(value);
+          if (isArray) {
+            if (value.length === 0) continue;
+            if (value.length === 1) { value = String(value[0]); isArray = false; }
+            else if (kSingleValueHeaders.has(name)) throw h2Errors.singleValue(name);
+          } else {
+            value = String(value);
+          }
+          if (kSingleValueHeaders.has(name)) {
+            if (singles.has(name)) throw h2Errors.singleValue(name);
+            singles.add(name);
+          }
+          if (name.charAt(0) === ":") {
+            if (name !== ":status") throw h2Errors.pseudoHeader(name);
+            continue;
+          }
+          if (!kHttpToken.test(name)) throw h2Errors.httpToken(name);
+          if (illegalConnectionHeader(name, value)) throw h2Errors.connectionHeaders(name);
+          if (isArray) {
+            for (var v = 0; v < value.length; v++) pairs.push([name, String(value[v])]);
+          } else {
+            pairs.push([name, value]);
+          }
+        }
+        return { pairs: pairs, status: status, sent: sent };
+      }
+
+      // node's toHeaderObject over a native request: the pseudo-headers, then
+      // the fields -- set-cookie as an array, cookie joined with '; ', a
+      // repeated single-value field keeping the first, any other joined with
+      // ', ' -- on a null-prototype object; and the flat rawHeaders.
+      function requestHeaders(meta) {
+        var raw = [":method", meta.method];
+        var fields = [];
+        var authority, scheme;
+        for (var i = 0; i < meta.headers.length; i++) {
+          var name = meta.headers[i][0];
+          var value = meta.headers[i][1];
+          if (name === ":authority") authority = value;
+          else if (name === ":scheme") scheme = value;
+          else fields.push([name.toLowerCase(), value]);
+        }
+        if (authority !== undefined) raw.push(":authority", authority);
+        if (scheme !== undefined) raw.push(":scheme", scheme);
+        raw.push(":path", meta.uri);
+        for (var f = 0; f < fields.length; f++) raw.push(fields[f][0], fields[f][1]);
+        var obj = { __proto__: null };
+        for (var n = 0; n < raw.length; n += 2) {
+          var key = raw[n], val = raw[n + 1];
+          var existing = obj[key];
+          if (existing === undefined) {
+            obj[key] = key === "set-cookie" ? [val] : val;
+          } else if (!kSingleValueHeaders.has(key)) {
+            if (key === "cookie") obj[key] = existing + "; " + val;
+            else if (key === "set-cookie") existing.push(val);
+            else obj[key] = existing + ", " + val;
+          }
+        }
+        obj[kSensitiveHeaders] = [];
+        return { headers: obj, rawHeaders: raw };
+      }
+
+      // node's proxySocketHandler: session.socket, the TLS socket behind a
+      // Proxy that forbids reading and writing it directly.
+      const sessionSocketHandler = {
+        get(session, prop) {
+          switch (prop) {
+            case "setTimeout": case "ref": case "unref":
+              return session[prop].bind(session);
+            case "destroy": case "emit": case "end": case "pause": case "read":
+            case "resume": case "write": case "setEncoding": case "setKeepAlive":
+            case "setNoDelay":
+              throw h2Errors.noSocketManipulation();
+            default: {
+              var socket = session[kSocket];
+              var value = socket[prop];
+              return typeof value === "function" ? value.bind(socket) : value;
+            }
+          }
+        },
+        getPrototypeOf(session) {
+          return Reflect.getPrototypeOf(session[kSocket]);
+        },
+        set(session, prop, value) {
+          switch (prop) {
+            case "setTimeout": case "ref": case "unref":
+              session[prop] = value;
+              return true;
+            case "destroy": case "emit": case "end": case "pause": case "read":
+            case "resume": case "write": case "setEncoding": case "setKeepAlive":
+            case "setNoDelay":
+              throw h2Errors.noSocketManipulation();
+            default:
+              session[kSocket][prop] = value;
+              return true;
+          }
+        },
+      };
+      // The compatibility API's req.socket / res.socket: the stream behind a
+      // Proxy that reads through to the session's socket (lib/internal/http2/
+      // compat.js).
+      const streamSocketHandler = {
+        has(stream, prop) {
+          var ref = stream.session !== undefined ? stream.session[kSocket] : stream;
+          return (prop in stream) || (prop in ref);
+        },
+        get(stream, prop) {
+          switch (prop) {
+            case "on": case "once": case "end": case "emit": case "destroy":
+              return stream[prop].bind(stream);
+            case "writable": case "destroyed":
+              return stream[prop];
+            case "readable": {
+              if (stream.destroyed) return false;
+              var request = stream[kRequest];
+              return request ? request.readable : stream.readable;
+            }
+            case "setTimeout": {
+              var session = stream.session;
+              if (session !== undefined) return session.setTimeout.bind(session);
+              return stream.setTimeout.bind(stream);
+            }
+            case "write": case "read": case "pause": case "resume":
+              throw h2Errors.noSocketManipulation();
+            default: {
+              var ref = stream.session !== undefined ? stream.session[kSocket] : stream;
+              var value = ref[prop];
+              return typeof value === "function" ? value.bind(ref) : value;
+            }
+          }
+        },
+        getPrototypeOf(stream) {
+          if (stream.session !== undefined) return Reflect.getPrototypeOf(stream.session[kSocket]);
+          return Reflect.getPrototypeOf(stream);
+        },
+        set(stream, prop, value) {
+          switch (prop) {
+            case "writable": case "readable": case "destroyed": case "on":
+            case "once": case "end": case "emit": case "destroy":
+              stream[prop] = value;
+              return true;
+            case "setTimeout": {
+              var session = stream.session;
+              if (session !== undefined) session.setTimeout = value;
+              else stream.setTimeout = value;
+              return true;
+            }
+            case "write": case "read": case "pause": case "resume":
+              throw h2Errors.noSocketManipulation();
+            default: {
+              var ref = stream.session !== undefined ? stream.session[kSocket] : stream;
+              ref[prop] = value;
+              return true;
+            }
+          }
+        },
+      };
+
+      // An idle timer (session / stream setTimeout): 'timeout' after `msecs`
+      // without activity.
+      function armIdleTimer(owner, msecs, callback) {
+        if (owner._idleTimer) {
+          globalThis.clearTimeout(owner._idleTimer);
+          owner._idleTimer = null;
+        }
+        if (callback !== undefined) {
+          if (typeof callback !== "function") throw codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
+          owner.on("timeout", callback);
+        }
+        owner._idleMs = msecs;
+        touchIdleTimer(owner);
+      }
+      function touchIdleTimer(owner) {
+        if (owner._idleTimer) globalThis.clearTimeout(owner._idleTimer);
+        owner._idleTimer = null;
+        if (owner._idleMs > 0 && !owner.destroyed) {
+          owner._idleTimer = globalThis.setTimeout(function() {
+            owner._idleTimer = null;
+            owner.emit("timeout");
+          }, owner._idleMs);
+          if (owner._idleTimer && typeof owner._idleTimer.unref === "function") owner._idleTimer.unref();
+        }
+      }
+      function clearIdleTimer(owner) {
+        if (owner._idleTimer) globalThis.clearTimeout(owner._idleTimer);
+        owner._idleTimer = null;
+        owner._idleMs = 0;
+      }
+
+      // One request stream of a server session. The request body is read from
+      // the native side as it arrives; the response goes out through the
+      // exchange's native responder.
+      class ServerHttp2Stream extends Duplex {
+        constructor(session, meta, id, headers) {
+          super({ allowHalfOpen: true, autoDestroy: false, emitClose: false });
+          this[kSession] = session;
+          this._requestId = meta.requestId;
+          this._id = id;
+          this._responded = false;
+          this._responseEnded = false;
+          this._responseStream = null;
+          this._chain = Promise.resolve();
+          this._bodyDone = false;
+          this._reading = false;
+          this._closed = false;
+          this._sentHeaders = undefined;
+          this._idleTimer = null;
+          this._idleMs = 0;
+          this.rstCode = undefined;
+          this.aborted = false;
+          this.endAfterHeaders = meta.endStream === true;
+          this.headRequest = meta.method === "HEAD";
+          this._authority = headers[":authority"] !== undefined ? headers[":authority"] : headers.host;
+          this._protocol = headers[":scheme"];
+        }
+        get id() { return this._id; }
+        get session() { return this[kSession]; }
+        get headersSent() { return this._responded; }
+        get sentHeaders() { return this._sentHeaders; }
+        get sentInfoHeaders() { return undefined; }
+        get sentTrailers() { return undefined; }
+        get closed() { return this._closed; }
+        get pending() { return false; }
+        get bufferSize() { return this.writableLength; }
+        // Server push is not offered: hyper's server has no PUSH_PROMISE.
+        get pushAllowed() { return false; }
+        pushStream() {
+          throw h2Errors.pushDisabled();
+        }
+        priority() {}
+        // 1xx informational headers are not sent (hyper gives no way to).
+        additionalHeaders(headers) {
+          if (this.destroyed || this._closed) throw h2Errors.invalidStream();
+          if (this._responded) {
+            throw h2Error(Error, "ERR_HTTP2_HEADERS_AFTER_RESPOND",
+              "Cannot specify additional headers after response initiated");
+          }
+        }
+        respond(headersParam, options) {
+          if (this.destroyed || this._closed) throw h2Errors.invalidStream();
+          if (this._responded) throw h2Errors.headersSent();
+          if (options !== undefined && (options === null || typeof options !== "object")) {
+            throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+          }
+          options = Object.assign({}, options);
+          var prepared = prepareResponseHeaders(headersParam, options);
+          this._responded = true;
+          this._sentHeaders = prepared.sent;
+          touchIdleTimer(this);
+          var status = prepared.status;
+          var endStream = !!options.endStream || status === 204 || status === 205 ||
+            status === 304 || this.headRequest === true;
+          var pairs = JSON.stringify(prepared.pairs);
+          if (endStream) {
+            this._responseEnded = true;
+            natives.httpRespond(this._requestId, status, pairs, new Uint8Array(0));
+            this.end();
+            return;
+          }
+          var responseStream = natives.httpRespondStream(this._requestId, status, pairs);
+          if (responseStream === undefined) {
+            // The exchange is gone: the client reset the stream.
+            this._onAborted();
+            return;
+          }
+          this._responseStream = responseStream;
+          natives.httpStreamClosed(responseStream).then(() => {
+            // hyper let go of the response body: it was finished, or the
+            // client went away mid-response.
+            if (!this._responseEnded) this._onAborted();
+          });
+        }
+        _write(chunk, encoding, callback) {
+          if (!this._responded) {
+            // node's kProceed: writing before respond() responds 200.
+            try {
+              this.respond();
+            } catch (err) {
+              callback(err);
+              return;
+            }
+          }
+          if (this._responseEnded || this._responseStream === null) {
+            callback();
+            return;
+          }
+          touchIdleTimer(this);
+          var bytes = typeof chunk === "string" ? globalThis.Buffer.from(chunk, encoding || "utf8") : chunk;
+          var responseStream = this._responseStream;
+          this._chain = this._chain
+            .then(function() { return natives.httpBodyPush(responseStream, bytes); })
+            .then(function() { callback(); }, (err) => {
+              this._onAborted();
+              callback();
+            });
+        }
+        _final(callback) {
+          if (!this._responded && !this._closed) {
+            try {
+              this.respond();
+            } catch (err) {
+              callback(err);
+              return;
+            }
+          }
+          if (this._responseEnded || this._responseStream === null) {
+            callback();
+            this._maybeClose();
+            return;
+          }
+          var responseStream = this._responseStream;
+          this._chain = this._chain.then(() => {
+            this._responseEnded = true;
+            natives.httpBodyEnd(responseStream);
+            callback();
+            this._maybeClose();
+          });
+        }
+        _read() {
+          if (this._bodyDone || this._reading) return;
+          this._reading = true;
+          natives.httpRequestBodyRead(this._requestId).then(
+            (chunk) => {
+              this._reading = false;
+              if (chunk && Array.isArray(chunk.trailers)) chunk = undefined;
+              if (chunk === undefined || chunk === null || chunk.length === 0) {
+                this._bodyDone = true;
+                this.push(null);
+                return;
+              }
+              touchIdleTimer(this);
+              this.push(globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.length));
+            },
+            () => {
+              this._reading = false;
+              this._bodyDone = true;
+              this._onAborted();
+            },
+          );
+        }
+        // The response is done: the stream closes once what was handed over
+        // is on its way (node: nghttp2 closes it after the last frame; a
+        // request body still coming is cut off with it).
+        _maybeClose() {
+          if (this._closed || this._closeScheduled) return;
+          this._closeScheduled = true;
+          globalThis.setImmediate(() => this._close(NGHTTP2_NO_ERROR));
+        }
+        _close(code) {
+          if (this._closed) return;
+          this._closed = true;
+          if (this.rstCode === undefined) this.rstCode = code;
+          clearIdleTimer(this);
+          if (!this._bodyDone) {
+            this._bodyDone = true;
+            natives.httpRequestBodyCancel(this._requestId);
+          }
+          if (!this._responded) natives.httpAbort(this._requestId);
+          else if (!this._responseEnded && this._responseStream !== null) {
+            this._responseEnded = true;
+            natives.httpBodyEnd(this._responseStream);
+          }
+          // The readable side ends with the stream (what was not read is
+          // gone).
+          if (!this.readableEnded) this.push(null);
+          process.nextTick(() => this.emit("close"));
+        }
+        // The client reset the stream (or the session went away) before the
+        // response was done: node's 'aborted', then 'close' with
+        // NGHTTP2_CANCEL.
+        _onAborted() {
+          if (this._closed) return;
+          // A stream whose response was all handed over just closes.
+          var finished = this._responseEnded;
+          if (!finished) {
+            this.aborted = true;
+            this._responseEnded = true;
+            this.emit("aborted");
+          }
+          this._close(finished ? NGHTTP2_NO_ERROR : NGHTTP2_CANCEL);
+        }
+        close(code, callback) {
+          if (typeof code === "function") {
+            callback = code;
+            code = NGHTTP2_NO_ERROR;
+          }
+          if (code === undefined) code = NGHTTP2_NO_ERROR;
+          if (typeof code !== "number" || !Number.isInteger(code) || code < 0 || code > 0xffffffff) {
+            throw codes.ERR_OUT_OF_RANGE("code", ">= 0 && <= 4294967295", code);
+          }
+          if (callback !== undefined) {
+            if (typeof callback !== "function") throw codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
+            this.once("close", callback);
+          }
+          if (this._closed) return;
+          this.rstCode = code;
+          this._close(code);
+        }
+        _destroy(err, callback) {
+          if (!this._closed) this._close(err ? NGHTTP2_INTERNAL_ERROR : NGHTTP2_NO_ERROR);
+          callback(err);
+        }
+        setTimeout(msecs, callback) {
+          if (this.destroyed) return this;
+          armIdleTimer(this, msecs, callback);
+          return this;
+        }
+        sendTrailers() {
+          throw h2Error(Error, "ERR_HTTP2_TRAILERS_NOT_READY",
+            "Trailing headers cannot be sent until after the wantTrailers event is emitted");
+        }
+      }
+
+      // ---- the compatibility API (lib/internal/http2/compat.js)
+      function onStreamCloseRequest() {
+        var req = this[kRequest];
+        if (req === undefined) return;
+        req[kState].closed = true;
+        req.push(null);
+        if (!req[kState].didRead && !req._readableState.resumeScheduled) req.resume();
+        this[kProxySocket] = null;
+        this[kRequest] = undefined;
+        req.emit("close");
+      }
+      function onStreamAbortedRequest() {
+        var request = this[kRequest];
+        if (request !== undefined && request[kState].closed === false) {
+          request[kAborted] = true;
+          request.emit("aborted");
+        }
+      }
+      function onStreamCloseResponse() {
+        var res = this[kResponse];
+        if (res === undefined) return;
+        res[kState].closed = true;
+        this[kProxySocket] = null;
+        this[kResponse] = undefined;
+        res.emit("finish");
+        res.emit("close");
+      }
+
+      class Http2ServerRequest extends Readable {
+        constructor(stream, headers, options, rawHeaders) {
+          super(Object.assign({ autoDestroy: false }, options));
+          this[kState] = { closed: false, didRead: false };
+          this[kHeaders] = headers;
+          this._rawHeaders = rawHeaders;
+          this[kTrailers] = {};
+          this._rawTrailers = [];
+          this[kStream] = stream;
+          this[kAborted] = false;
+          stream[kProxySocket] = null;
+          stream[kRequest] = this;
+          stream.on("end", function() {
+            var request = this[kRequest];
+            if (request !== undefined) request.push(null);
+          });
+          stream.on("error", function() {});
+          stream.on("aborted", onStreamAbortedRequest);
+          stream.on("close", onStreamCloseRequest);
+          stream.on("timeout", function() {
+            var request = this[kRequest];
+            if (request !== undefined) request.emit("timeout");
+          });
+          this.on("pause", function() { this[kStream].pause(); });
+          this.on("resume", function() { this[kStream].resume(); });
+        }
+        get aborted() { return this[kAborted]; }
+        get complete() {
+          return this[kAborted] || this.readableEnded || this[kState].closed || this[kStream].destroyed;
+        }
+        get stream() { return this[kStream]; }
+        get headers() { return this[kHeaders]; }
+        get rawHeaders() { return this._rawHeaders; }
+        get trailers() { return this[kTrailers]; }
+        get rawTrailers() { return this._rawTrailers; }
+        get httpVersionMajor() { return 2; }
+        get httpVersionMinor() { return 0; }
+        get httpVersion() { return "2.0"; }
+        get socket() {
+          var stream = this[kStream];
+          var proxy = stream[kProxySocket];
+          if (proxy === null || proxy === undefined) {
+            return (stream[kProxySocket] = new Proxy(stream, streamSocketHandler));
+          }
+          return proxy;
+        }
+        get connection() { return this.socket; }
+        _read() {
+          var state = this[kState];
+          if (state.closed) return;
+          if (!state.didRead) {
+            state.didRead = true;
+            var request = this;
+            this[kStream].on("data", function(chunk) {
+              if (!request.push(chunk)) this.pause();
+            });
+          } else {
+            var stream = this[kStream];
+            process.nextTick(function() { stream.resume(); });
+          }
+        }
+        get method() { return this[kHeaders][":method"]; }
+        set method(method) {
+          if (typeof method !== "string") throw codes.ERR_INVALID_ARG_TYPE("method", "string", method);
+          if (method.trim() === "") throw codes.ERR_INVALID_ARG_VALUE("method", method);
+          this[kHeaders][":method"] = method;
+        }
+        get authority() {
+          var headers = this[kHeaders];
+          return headers[":authority"] !== undefined ? headers[":authority"] : headers.host;
+        }
+        get scheme() { return this[kHeaders][":scheme"]; }
+        get url() { return this[kHeaders][":path"]; }
+        set url(url) { this[kHeaders][":path"] = url; }
+        setTimeout(msecs, callback) {
+          if (!this[kState].closed) this[kStream].setTimeout(msecs, callback);
+          return this;
+        }
+      }
+
+      let statusMessageWarned = false;
+      let connectionHeaderWarned = false;
+      function statusMessageWarn() {
+        if (!statusMessageWarned) {
+          process.emitWarning("Status message is not supported by HTTP/2 (RFC7540 8.1.2.4)", "UnsupportedWarning");
+          statusMessageWarned = true;
+        }
+      }
+      function isPseudoHeader(name) {
+        return name === ":status" || name === ":method" || name === ":path" ||
+          name === ":authority" || name === ":scheme";
+      }
+      function assertValidHeader(name, value) {
+        if (name === "" || typeof name !== "string" || name.includes(" ")) throw h2Errors.httpToken(name);
+        if (isPseudoHeader(name)) throw h2Errors.pseudoNotAllowed();
+        if (value === undefined || value === null) throw h2Errors.headerValue(value, name);
+        if (name === "connection" && value !== "trailers" && !connectionHeaderWarned) {
+          process.emitWarning(
+            "The provided connection header is not valid, the value will be dropped from the header and will never be in use.",
+            "UnsupportedWarning",
+          );
+          connectionHeaderWarned = true;
+        }
+      }
+
+      class Http2ServerResponse extends StreamBase {
+        constructor(stream, options) {
+          super(options);
+          this[kState] = {
+            closed: false,
+            ending: false,
+            destroyed: false,
+            headRequest: false,
+            sendDate: true,
+            statusCode: 200,
+          };
+          this[kHeaders] = { __proto__: null };
+          this[kTrailers] = { __proto__: null };
+          this[kStream] = stream;
+          stream[kProxySocket] = null;
+          stream[kResponse] = this;
+          this.writable = true;
+          this.req = stream[kRequest];
+          stream.on("drain", function() {
+            var response = this[kResponse];
+            if (response !== undefined) response.emit("drain");
+          });
+          stream.on("close", onStreamCloseResponse);
+          stream.on("timeout", function() {
+            var response = this[kResponse];
+            if (response !== undefined) response.emit("timeout");
+          });
+        }
+        get _header() { return this.headersSent; }
+        get writableEnded() { return this[kState].ending; }
+        get finished() { return this[kState].ending; }
+        get socket() {
+          if (this[kState].closed) return undefined;
+          var stream = this[kStream];
+          var proxy = stream[kProxySocket];
+          if (proxy === null || proxy === undefined) {
+            return (stream[kProxySocket] = new Proxy(stream, streamSocketHandler));
+          }
+          return proxy;
+        }
+        get connection() { return this.socket; }
+        get stream() { return this[kStream]; }
+        get headersSent() { return this[kStream].headersSent; }
+        get sendDate() { return this[kState].sendDate; }
+        set sendDate(bool) { this[kState].sendDate = Boolean(bool); }
+        get statusCode() { return this[kState].statusCode; }
+        set statusCode(code) {
+          code |= 0;
+          if (code >= 100 && code < 200) throw h2Errors.infoStatusNotAllowed();
+          if (code < 100 || code > 599) throw h2Errors.statusInvalid(code);
+          this[kState].statusCode = code;
+        }
+        get writableCorked() { return this[kStream].writableCorked; }
+        get writableHighWaterMark() { return this[kStream].writableHighWaterMark; }
+        get writableFinished() { return this[kStream].writableFinished; }
+        get writableLength() { return this[kStream].writableLength; }
+        setTrailer(name, value) {
+          if (typeof name !== "string") throw codes.ERR_INVALID_ARG_TYPE("name", "string", name);
+          name = name.trim().toLowerCase();
+          assertValidHeader(name, value);
+          this[kTrailers][name] = value;
+        }
+        addTrailers(headers) {
+          var keys = Object.keys(headers);
+          for (var i = 0; i < keys.length; i++) this.setTrailer(keys[i], headers[keys[i]]);
+        }
+        getHeader(name) {
+          if (typeof name !== "string") throw codes.ERR_INVALID_ARG_TYPE("name", "string", name);
+          return this[kHeaders][name.trim().toLowerCase()];
+        }
+        getHeaderNames() { return Object.keys(this[kHeaders]); }
+        getHeaders() { return Object.assign({ __proto__: null }, this[kHeaders]); }
+        hasHeader(name) {
+          if (typeof name !== "string") throw codes.ERR_INVALID_ARG_TYPE("name", "string", name);
+          return Object.prototype.hasOwnProperty.call(this[kHeaders], name.trim().toLowerCase());
+        }
+        removeHeader(name) {
+          if (typeof name !== "string") throw codes.ERR_INVALID_ARG_TYPE("name", "string", name);
+          if (this[kStream].headersSent) throw h2Errors.headersSent();
+          name = name.trim().toLowerCase();
+          if (name === "date") {
+            this[kState].sendDate = false;
+            return;
+          }
+          delete this[kHeaders][name];
+        }
+        setHeader(name, value) {
+          if (typeof name !== "string") throw codes.ERR_INVALID_ARG_TYPE("name", "string", name);
+          if (this[kStream].headersSent) throw h2Errors.headersSent();
+          this._setHeader(name, value);
+        }
+        _setHeader(name, value) {
+          name = name.trim().toLowerCase();
+          assertValidHeader(name, value);
+          if (name === "connection" && value !== "trailers") return;
+          if (name.charAt(0) === ":") {
+            if (!isPseudoHeader(name) && name !== ":protocol") throw h2Errors.pseudoHeader(name);
+          } else if (!kHttpToken.test(name)) {
+            this.destroy(h2Errors.httpToken(name));
+          }
+          this[kHeaders][name] = value;
+        }
+        appendHeader(name, value) {
+          if (typeof name !== "string") throw codes.ERR_INVALID_ARG_TYPE("name", "string", name);
+          if (this[kStream].headersSent) throw h2Errors.headersSent();
+          this._appendHeader(name, value);
+        }
+        _appendHeader(name, value) {
+          name = name.trim().toLowerCase();
+          assertValidHeader(name, value);
+          if (name === "connection" && value !== "trailers") return;
+          var headers = this[kHeaders];
+          if (!headers[name]) {
+            this.setHeader(name, value);
+            return;
+          }
+          if (!Array.isArray(headers[name])) headers[name] = [headers[name]];
+          if (Array.isArray(value)) for (var i = 0; i < value.length; i++) headers[name].push(value[i]);
+          else headers[name].push(value);
+        }
+        get statusMessage() {
+          statusMessageWarn();
+          return "";
+        }
+        set statusMessage(msg) {
+          statusMessageWarn();
+        }
+        flushHeaders() {
+          var state = this[kState];
+          if (!state.closed && !this[kStream].headersSent) this.writeHead(state.statusCode);
+        }
+        writeHead(statusCode, statusMessage, headers) {
+          var state = this[kState];
+          if (state.closed || this.stream.destroyed || this.stream.closed) return this;
+          if (this[kStream].headersSent) throw h2Errors.headersSent();
+          if (typeof statusMessage === "string") statusMessageWarn();
+          if (headers === undefined && typeof statusMessage === "object") headers = statusMessage;
+          if (Array.isArray(headers)) {
+            var tuples = headers.length && Array.isArray(headers[0]);
+            if (!tuples && headers.length % 2 !== 0) throw codes.ERR_INVALID_ARG_VALUE("headers", headers);
+            if (tuples) {
+              for (var t = 0; t < headers.length; t++) this.removeHeader(headers[t][0]);
+              for (var u = 0; u < headers.length; u++) this._appendHeader(headers[u][0], headers[u][1]);
+            } else {
+              for (var r = 0; r < headers.length; r += 2) this.removeHeader(headers[r]);
+              for (var a = 0; a < headers.length; a += 2) this._appendHeader(headers[a], headers[a + 1]);
+            }
+          } else if (headers !== null && typeof headers === "object") {
+            var keys = Object.keys(headers);
+            for (var k = 0; k < keys.length; k++) this._setHeader(keys[k], headers[keys[k]]);
+          }
+          state.statusCode = statusCode;
+          this._beginSend();
+          return this;
+        }
+        cork() { this[kStream].cork(); }
+        uncork() { this[kStream].uncork(); }
+        write(chunk, encoding, cb) {
+          var state = this[kState];
+          if (typeof encoding === "function") {
+            cb = encoding;
+            encoding = "utf8";
+          }
+          var err;
+          if (state.ending) err = codes.ERR_STREAM_WRITE_AFTER_END();
+          else if (state.closed) err = h2Errors.invalidStream();
+          else if (state.destroyed) return false;
+          if (err) {
+            if (typeof cb === "function") process.nextTick(cb, err);
+            this.destroy(err);
+            return false;
+          }
+          var stream = this[kStream];
+          if (!stream.headersSent) this.writeHead(state.statusCode);
+          return stream.write(chunk, encoding, cb);
+        }
+        end(chunk, encoding, cb) {
+          var stream = this[kStream];
+          var state = this[kState];
+          if (typeof chunk === "function") {
+            cb = chunk;
+            chunk = null;
+          } else if (typeof encoding === "function") {
+            cb = encoding;
+            encoding = "utf8";
+          }
+          if ((state.closed || state.ending) && state.headRequest === stream.headRequest) {
+            if (typeof cb === "function") process.nextTick(cb);
+            return this;
+          }
+          if (chunk !== null && chunk !== undefined) this.write(chunk, encoding);
+          state.headRequest = stream.headRequest;
+          state.ending = true;
+          if (typeof cb === "function") {
+            if (stream.writableEnded) this.once("finish", cb);
+            else stream.once("finish", cb);
+          }
+          if (!stream.headersSent) this.writeHead(this[kState].statusCode);
+          if (this[kState].closed || stream.destroyed) onStreamCloseResponse.call(stream);
+          else stream.end();
+          return this;
+        }
+        destroy(err) {
+          if (this[kState].destroyed) return;
+          this[kState].destroyed = true;
+          this[kStream].destroy(err);
+        }
+        setTimeout(msecs, callback) {
+          if (this[kState].closed) return;
+          this[kStream].setTimeout(msecs, callback);
+        }
+        createPushResponse(headers, callback) {
+          if (typeof callback !== "function") throw codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
+          if (this[kState].closed) {
+            process.nextTick(callback, h2Errors.invalidStream());
+            return;
+          }
+          this[kStream].pushStream(headers, {}, callback);
+        }
+        _beginSend() {
+          var state = this[kState];
+          var headers = this[kHeaders];
+          headers[":status"] = state.statusCode;
+          this[kStream].respond(headers, { endStream: state.ending, sendDate: state.sendDate });
+        }
+        writeContinue() {
+          return false;
+        }
+        writeEarlyHints() {
+          return false;
+        }
+      }
+
+      // node's onServerStream: the compatibility API's (req, res) for a
+      // stream, with CONNECT and Expect handled as node handles them.
+      function onServerStream(stream, headers, flags, rawHeaders) {
+        var server = this;
+        var options = server[kOptions] || {};
+        var ServerRequest = options.Http2ServerRequest || Http2ServerRequest;
+        var ServerResponse = options.Http2ServerResponse || Http2ServerResponse;
+        var request = new ServerRequest(stream, headers, undefined, rawHeaders);
+        var response = new ServerResponse(stream);
+        if (headers[":method"] === "CONNECT") {
+          if (!server.emit("connect", request, response)) {
+            response.statusCode = 405;
+            response.end();
+          }
+          return;
+        }
+        if (headers.expect !== undefined) {
+          if (headers.expect === "100-continue") {
+            if (server.listenerCount("checkContinue")) {
+              server.emit("checkContinue", request, response);
+            } else {
+              response.writeContinue();
+              server.emit("request", request, response);
+            }
+          } else if (server.listenerCount("checkExpectation")) {
+            server.emit("checkExpectation", request, response);
+          } else {
+            response.statusCode = 417;
+            response.end();
+          }
+          return;
+        }
+        server.emit("request", request, response);
+      }
+      function setupCompat(ev) {
+        if (ev === "request") {
+          this.removeListener("newListener", setupCompat);
+          this.on("stream", onServerStream);
+        }
+      }
+
+      // A TLS connection handed to the native server from here on: its socket
+      // object stays (it is session.socket, req.socket), with no I/O of its
+      // own; destroying it (or ending it) closes the connection.
+      function takeOver(socket, connId) {
+        socket._handle = null;
+        socket._takenOverConn = connId;
+        socket._destroy = function(err, callback) {
+          natives.httpConnDestroy(connId, false);
+          TLSSocketBase.prototype._destroy.call(this, err, callback);
+        };
+        socket._final = function(callback) {
+          natives.httpConnDestroy(connId, true);
+          callback();
+        };
+      }
+
+      // node's server-side Http2Session.
+      class ServerHttp2Session extends EventEmitter {
+        constructor(options, socket, server) {
+          super();
+          this[kSocket] = socket;
+          this[kServer] = server;
+          this[kOptions] = options;
+          this[kProxySocket] = null;
+          this.type = 0;
+          this.alpnProtocol = socket.alpnProtocol;
+          this.encrypted = true;
+          this._closed = false;
+          this._destroyed = false;
+          this._streams = new Map();
+          this._nextStreamId = 1;
+          this._idleTimer = null;
+          this._idleMs = 0;
+          var policy = serverHeadPolicy(server);
+          var served = JSON.parse(natives.http2ServeTls(socket._handle, false, policy.maxHeaderSize, policy.insecure));
+          this._sessionId = served.sessionId;
+          this._connId = served.connId;
+          takeOver(socket, served.connId);
+          this._serve();
+        }
+        get socket() {
+          if (this[kProxySocket] === null) this[kProxySocket] = new Proxy(this, sessionSocketHandler);
+          return this[kProxySocket];
+        }
+        get closed() { return this._closed; }
+        get destroyed() { return this._destroyed; }
+        get connecting() { return false; }
+        get pendingSettingsAck() { return false; }
+        // node's initOriginSet, as it reads for a server session.
+        get originSet() {
+          if (this._destroyed) return undefined;
+          var socket = this[kSocket];
+          if (socket.servername == null || socket.servername === false) return [];
+          var origin = "https://" + socket.servername;
+          if (socket.remotePort != null) origin += ":" + socket.remotePort;
+          return [origin];
+        }
+        async _serve() {
+          for (;;) {
+            var meta = await natives.httpAccept(this._sessionId);
+            if (meta === undefined) break;
+            if (meta.event === "closed") {
+              var aborted = this._streams.get(meta.requestId);
+              if (aborted) aborted._onAborted();
+              continue;
+            }
+            if (meta.event !== undefined) continue;
+            this._onStream(meta);
+          }
+          natives.httpClose(this._sessionId);
+          this._onConnectionEnd();
+        }
+        _onStream(meta) {
+          var id = this._nextStreamId;
+          this._nextStreamId += 2;
+          var parsed = requestHeaders(meta);
+          var stream = new ServerHttp2Stream(this, meta, id, parsed.headers);
+          this._streams.set(meta.requestId, stream);
+          stream.once("close", () => this._streams.delete(meta.requestId));
+          touchIdleTimer(this);
+          var flags = STREAM_FLAGS_END_HEADERS | (stream.endAfterHeaders ? STREAM_FLAGS_END_STREAM : 0);
+          if (stream.endAfterHeaders) {
+            // No body: the readable side is over before it starts.
+            stream._bodyDone = true;
+            natives.httpRequestBodyCancel(meta.requestId);
+            stream.push(null);
+          }
+          this.emit("stream", stream, parsed.headers, flags, parsed.rawHeaders);
+        }
+        _onConnectionEnd() {
+          this._closed = true;
+          var wasDestroyed = this._destroyed;
+          this._destroyed = true;
+          clearIdleTimer(this);
+          for (var stream of this._streams.values()) stream._onAborted();
+          this._streams.clear();
+          var socket = this[kSocket];
+          if (!socket.destroyed) TLSSocketBase.prototype.destroy.call(socket);
+          if (!wasDestroyed || this._emitClosePending) {
+            this._emitClosePending = false;
+            process.nextTick(() => this.emit("close"));
+          }
+        }
+        close(callback) {
+          if (this._closed || this._destroyed) return;
+          this._closed = true;
+          if (callback !== undefined) {
+            if (typeof callback !== "function") throw codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
+            this.once("close", callback);
+          }
+          natives.httpConnDestroy(this._connId, true);
+        }
+        destroy(error, code) {
+          if (this._destroyed) return;
+          if (typeof error === "number") {
+            code = error;
+            error = code !== NGHTTP2_NO_ERROR ? h2Error(Error, "ERR_HTTP2_SESSION_ERROR",
+              "Session closed with error code " + code) : undefined;
+          }
+          this._destroyed = true;
+          this._closed = true;
+          this._emitClosePending = true;
+          for (var stream of this._streams.values()) stream._onAborted();
+          natives.httpConnDestroy(this._connId, false);
+          if (error) process.nextTick(() => this.emit("error", error));
+        }
+        setTimeout(msecs, callback) {
+          if (this._destroyed) return this;
+          armIdleTimer(this, msecs, callback);
+          return this;
+        }
+        ref() {}
+        unref() {}
+      }
+
+      // allowHTTP1: the connection is served as HTTP/1.1, and its requests
+      // reach the same 'request' listeners as http.IncomingMessage /
+      // http.ServerResponse, with the TLS socket as req.socket.
+      function serveHttp1(server, socket) {
+        var http = registry.get("http");
+        var policy = serverHeadPolicy(server);
+        var ms = function(v, dflt) { return Number.isFinite(v) && v >= 0 ? v : dflt; };
+        var served = JSON.parse(natives.http2ServeTls(
+          socket._handle, true, policy.maxHeaderSize, policy.insecure,
+          ms(server.headersTimeout, 60000), ms(server.requestTimeout, 300000),
+          0, ms(server.timeout, 0), ms(server.connectionsCheckingInterval, 30000),
+        ));
+        takeOver(socket, served.connId);
+        (async () => {
+          for (;;) {
+            var meta = await natives.httpAccept(served.sessionId);
+            if (meta === undefined) break;
+            if (meta.event !== undefined) continue;
+            var req = new http.IncomingMessage(meta);
+            req.upgrade = false;
+            req.socket = req.connection = req.client = socket;
+            req.on("error", function() {});
+            var res = new http.ServerResponse(meta.requestId);
+            req.res = res;
+            res.req = req;
+            server.emit("request", req, res);
+          }
+          natives.httpClose(served.sessionId);
+          if (!socket.destroyed) TLSSocketBase.prototype.destroy.call(socket);
+        })();
+      }
+
+      // What the native server enforces for a request head: the server's
+      // maxHeaderSize / insecureHTTPParser or the process's.
+      function serverHeadPolicy(server) {
+        var options = server[kOptions] || {};
+        var maxHeaderSize = options.maxHeaderSize || natives.httpMaxHeaderSize();
+        var insecure = options.insecureHTTPParser;
+        if (insecure === undefined) insecure = natives.httpInsecureParser();
+        return { maxHeaderSize: maxHeaderSize, insecure: insecure };
+      }
+
+      // node's connectionListener: the server's first 'secureConnection'
+      // listener.
+      function connectionListener(socket) {
+        var options = this[kOptions] || {};
+        if (socket.alpnProtocol === false || socket.alpnProtocol === "http/1.1") {
+          if (options.allowHTTP1 === true) {
+            serveHttp1(this, socket);
+            return;
+          }
+          if (!this.emit("unknownProtocol", socket)) {
+            var timer = globalThis.setTimeout(function() {
+              if (!socket.destroyed) socket.destroy();
+            }, options.unknownProtocolTimeout);
+            if (timer && typeof timer.unref === "function") timer.unref();
+            socket.once("close", function() { globalThis.clearTimeout(timer); });
+            socket.end("HTTP/1.0 403 Forbidden\r\n" +
+                       "Content-Type: text/plain\r\n\r\n" +
+                       "Missing ALPN Protocol, expected `h2` to be available.\n" +
+                       "If this is a HTTP request: The server was not " +
+                       "configured with the `allowHTTP1` option or a " +
+                       "listener for the `unknownProtocol` event.\n");
+          }
+          return;
+        }
+        var session;
+        try {
+          session = new ServerHttp2Session(options, socket, this);
+        } catch (err) {
+          // The connection went before it could be served.
+          socket.destroy();
+          return;
+        }
+        var server = this;
+        session.on("stream", function(stream, headers, flags, rawHeaders) {
+          server.emit("stream", stream, headers, flags, rawHeaders);
+        });
+        session.on("error", function(error) {
+          server.emit("sessionError", error, session);
+        });
+        if (this.timeout) {
+          session.setTimeout(this.timeout, function() {
+            if (session.destroyed || session.closed) return;
+            if (!server.emit("timeout", session)) session.destroy();
+          });
+        }
+        this.emit("session", session);
+      }
+
+      // node's initializeOptions / initializeTLSOptions.
+      function initializeSecureOptions(options) {
+        if (options === undefined || options === null) options = {};
+        else if (typeof options !== "object") throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+        options = Object.assign({}, options);
+        if (options.settings !== undefined && (options.settings === null || typeof options.settings !== "object")) {
+          throw codes.ERR_INVALID_ARG_TYPE("options.settings", "Object", options.settings);
+        }
+        options.settings = Object.assign({}, options.settings);
+        if (options.unknownProtocolTimeout !== undefined) {
+          var t = options.unknownProtocolTimeout;
+          if (typeof t !== "number") throw codes.ERR_INVALID_ARG_TYPE("unknownProtocolTimeout", "number", t);
+          if (!Number.isInteger(t) || t < 0 || t > 4294967295) {
+            throw codes.ERR_OUT_OF_RANGE("unknownProtocolTimeout", ">= 0 && <= 4294967295", t);
+          }
+        } else {
+          options.unknownProtocolTimeout = 10000;
+        }
+        options.Http2ServerRequest = options.Http2ServerRequest || Http2ServerRequest;
+        options.Http2ServerResponse = options.Http2ServerResponse || Http2ServerResponse;
+        if (!options.ALPNCallback) {
+          options.ALPNProtocols = ["h2"];
+          if (options.allowHTTP1 === true) options.ALPNProtocols.push("http/1.1");
+        }
+        return options;
+      }
+
+      function onErrorSecureServerSession(err, socket) {
+        if (!this.emit("clientError", err, socket) && socket) socket.destroy(err);
+      }
+
+      const TLSServerBase = registry.get("tls").Server;
+      const TLSSocketBase = registry.get("tls").TLSSocket;
+      class Http2SecureServer extends TLSServerBase {
+        constructor(options, requestListener) {
+          options = initializeSecureOptions(options);
+          super(options, connectionListener);
+          this[kOptions] = options;
+          this.timeout = 0;
+          this.on("newListener", setupCompat);
+          if (options.allowHTTP1 === true) {
+            this.headersTimeout = 60000;
+            this.requestTimeout = 300000;
+            this.connectionsCheckingInterval = 30000;
+          }
+          if (typeof requestListener === "function") this.on("request", requestListener);
+          this.on("tlsClientError", onErrorSecureServerSession);
+        }
+        setTimeout(msecs, callback) {
+          this.timeout = msecs;
+          if (callback !== undefined) {
+            if (typeof callback !== "function") throw codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
+            this.on("timeout", callback);
+          }
+          return this;
+        }
+        updateSettings(settings) {
+          if (settings === null || typeof settings !== "object") {
+            throw codes.ERR_INVALID_ARG_TYPE("settings", "Object", settings);
+          }
+          this[kOptions].settings = Object.assign({}, this[kOptions].settings, settings);
+        }
+      }
+
+      function createSecureServer(options, handler) {
+        return new Http2SecureServer(options, handler);
+      }
+
+      return { createSecureServer, Http2ServerRequest, Http2ServerResponse };
+    })();
+    const { createSecureServer, Http2ServerRequest, Http2ServerResponse } = secureServer;
 
     // ---- the client ------------------------------------------------------
     // node's http2 client (lib/internal/http2/core.js, v22.22.2): a session
@@ -27806,6 +29141,8 @@
       createServer,
       createSecureServer,
       connect,
+      Http2ServerRequest,
+      Http2ServerResponse,
       constants: {
         NGHTTP2_SESSION_SERVER: 0,
         NGHTTP2_SESSION_CLIENT: 1,
@@ -28883,25 +30220,292 @@
       return Object.assign({}, options);
     }
 
+    // ---- tls.Server ----
+    // Node's server lifecycle (lib/internal/tls/wrap.js), measured on
+    // v22.22.2: the secure context is built at createServer() -- a key that
+    // cannot be read, or one that is not its certificate's, throws there --
+    // and every connection is handshaken on its own, bounded by
+    // handshakeTimeout, so a client that never finishes (or never starts)
+    // holds up no one else. requestCert / rejectUnauthorized /
+    // ALPNProtocols are read off the server for each connection, as Node's
+    // tlsConnectionListener reads them. A requested client certificate is
+    // judged after the handshake (onServerSocketSecure): `authorized`, or
+    // `authorizationError` and, under rejectUnauthorized, a socket destroyed
+    // before 'secureConnection' (whose close is the 'tlsClientError'
+    // ECONNRESET Node reports). A failed handshake is 'tlsClientError' with
+    // the connection's socket.
+
+    // Node's convertALPNProtocols (lib/tls.js): an array of names becomes the
+    // wire form -- each name's length byte, then its bytes -- and a name over
+    // 255 bytes throws; a Uint8Array or other ArrayBufferView is taken as the
+    // wire form already (copied); anything else leaves the option unset.
+    function convertALPNProtocols(protocols, out) {
+      var Buf = globalThis.Buffer;
+      if (Array.isArray(protocols)) {
+        var parts = [];
+        for (var i = 0; i < protocols.length; i++) {
+          var bytes = Buf.from(String(protocols[i]), "utf8");
+          if (bytes.length > 255) {
+            var tooLong = new RangeError(
+              "The byte length of the protocol at index " + i +
+                " exceeds the maximum length. It must be <= 255. Received " + bytes.length,
+            );
+            throw applyNodeErrorShape(tooLong, "ERR_OUT_OF_RANGE");
+          }
+          parts.push(Buf.from([bytes.length]), bytes);
+        }
+        out.ALPNProtocols = Buf.concat(parts);
+      } else if (protocols instanceof Uint8Array) {
+        out.ALPNProtocols = Buf.from(protocols);
+      } else if (ArrayBuffer.isView(protocols)) {
+        out.ALPNProtocols = Buf.from(protocols.buffer.slice(
+          protocols.byteOffset, protocols.byteOffset + protocols.byteLength));
+      }
+    }
+
+    // The names in an ALPN wire list, one char per byte, for the native side
+    // (which offers them in this order). A malformed list stops where it
+    // stops making sense, as OpenSSL's parser does.
+    function alpnWireNames(wire) {
+      var names = [];
+      if (!wire) return names;
+      for (var i = 0; i < wire.length;) {
+        var len = wire[i++];
+        if (len === 0 || i + len > wire.length) break;
+        names.push(globalThis.Buffer.from(wire.subarray(i, i + len)).toString("latin1"));
+        i += len;
+      }
+      return names;
+    }
+
+    // PEM text of a `cert` / `key` / `ca` entry: a string as given, bytes as
+    // UTF-8 (PEM is ASCII).
+    function pemText(value) {
+      if (typeof value === "string") return value;
+      if (ArrayBuffer.isView(value)) {
+        return new TextDecoder().decode(new Uint8Array(value.buffer, value.byteOffset, value.byteLength));
+      }
+      return String(value);
+    }
+    function optionList(value) {
+      if (!value) return [];
+      return Array.isArray(value) ? value : [value];
+    }
+    // Node's validateKeyOrCertOption: a string or a Buffer / TypedArray /
+    // DataView (key and pfx entries may also be objects carrying the value
+    // under `pem` / `buf`).
+    function validateKeyOrCert(name, value) {
+      if (typeof value !== "string" && !ArrayBuffer.isView(value)) {
+        throw codes.ERR_INVALID_ARG_TYPE(
+          "options." + name, ["string", "Buffer", "TypedArray", "DataView"], value);
+      }
+    }
+    // What the native context is built from: Node's createSecureContext
+    // options, normalised.
+    // Node's createSecureContext reading of the key options
+    // (lib/internal/tls/secure-context.js): `key` is one PEM or an array of
+    // them, an array entry may be `{ pem, passphrase }`; `pfx` is one bundle
+    // or an array of them, an array entry may be `{ buf, passphrase }`; an
+    // entry's own passphrase wins over `passphrase`. What the native context
+    // is built from.
+    function secureContextSpec(options, versions) {
+      var isBytes = function(v) { return ArrayBuffer.isView(v); };
+      var passphraseText = function(v) {
+        if (v === undefined || v === null) return null;
+        if (typeof v === "string") return v;
+        return new TextDecoder().decode(new Uint8Array(v.buffer, v.byteOffset, v.byteLength));
+      };
+      var ca = null;
+      if (options.ca) {
+        ca = optionList(options.ca).map(function(c) {
+          validateKeyOrCert("ca", c);
+          return pemText(c);
+        });
+      }
+      var certs = [];
+      optionList(options.cert).forEach(function(c) {
+        validateKeyOrCert("cert", c);
+        certs.push(pemText(c));
+      });
+      var keys = [];
+      var setKey = function(pem, passphrase) {
+        validateKeyOrCert("key", pem);
+        if (passphrase !== undefined && passphrase !== null && typeof passphrase !== "string") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.passphrase", "string", passphrase);
+        }
+        keys.push({ pem: pemText(pem), passphrase: passphrase == null ? null : passphrase });
+      };
+      if (options.key) {
+        if (Array.isArray(options.key)) {
+          options.key.forEach(function(val) {
+            var pem = val != null && val.pem !== undefined ? val.pem : val;
+            var pass = val != null && val.passphrase !== undefined ? val.passphrase : options.passphrase;
+            setKey(pem, pass);
+          });
+        } else {
+          setKey(options.key, options.passphrase);
+        }
+      }
+      var pfx = [];
+      var loadPfx = function(raw, passphrase) {
+        if (typeof raw === "string") raw = globalThis.Buffer.from(raw);
+        if (!isBytes(raw)) {
+          var unable = new Error("Unable to load PFX certificate");
+          unable.code = "ERR_CRYPTO_OPERATION_FAILED";
+          throw unable;
+        }
+        if (passphrase !== undefined && passphrase !== null && typeof passphrase !== "string" && !isBytes(passphrase)) {
+          throw nodeTypeError("Pass phrase must be a buffer", "ERR_INVALID_ARG_TYPE");
+        }
+        pfx.push({
+          buf: globalThis.Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength).toString("base64"),
+          passphrase: passphraseText(passphrase),
+        });
+      };
+      if (options.pfx !== undefined && options.pfx !== null) {
+        if (Array.isArray(options.pfx)) {
+          options.pfx.forEach(function(val) {
+            var raw = val != null && val.buf ? val.buf : val;
+            var pass = (val != null && val.passphrase) || options.passphrase;
+            loadPfx(raw, pass);
+          });
+        } else {
+          loadPfx(options.pfx, options.passphrase || undefined);
+        }
+      }
+      return {
+        certs: certs,
+        keys: keys,
+        pfx: pfx,
+        passphrase: typeof options.passphrase === "string" ? options.passphrase : null,
+        ca: ca,
+        minVersion: versions.min,
+        maxVersion: versions.max,
+      };
+    }
+    // Build a native context, or throw what Node throws: OpenSSL's errors
+    // carry `library`, `reason` and `code`; a PKCS#12 bundle's are plain.
+    function buildServerContext(options, versions) {
+      var built = JSON.parse(natives.tlsServerContext(JSON.stringify(secureContextSpec(options, versions))));
+      if (built.error) {
+        var failure = built.error;
+        var e = new Error(failure.message);
+        if (failure.library !== undefined) e.library = failure.library;
+        if (failure.reason !== undefined) e.reason = failure.reason;
+        if (failure.code !== undefined) e.code = failure.code;
+        throw e;
+      }
+      return built.id;
+    }
+    // A context lives as long as the server that built it.
+    var serverContexts = typeof FinalizationRegistry === "function"
+      ? new FinalizationRegistry(function(id) { natives.tlsServerContextFree(id); })
+      : null;
+
+    // Node's ConnResetException('socket hang up').
+    function socketHangUp() {
+      var e = new Error("socket hang up");
+      e.code = "ECONNRESET";
+      return e;
+    }
+
+    // A server-side socket's view of the handshake (the accept record and
+    // what the handshake settled), as Node's TLSSocket reports it.
+    function fillServerSocket(socket, info, accepted) {
+      socket._handle = info.handle;
+      socket.connecting = false;
+      socket._protocol = info.protocol;
+      socket._cipher = info.cipher;
+      socket._cipherStandardName = info.cipherStandardName || null;
+      socket._peerCertificates = info.peerCertificates || null;
+      socket._peerParsed = null;
+      socket.alpnProtocol = info.alpnProtocol == null ? false : info.alpnProtocol;
+      socket.servername = info.servername == null ? false : info.servername;
+      var remote = info.remoteAddr || accepted.remoteAddr;
+      if (remote) {
+        socket.remoteAddress = remote.address;
+        socket.remotePort = remote.port;
+        socket.remoteFamily = remote.family;
+      }
+      if (info.localAddr) {
+        socket.localAddress = info.localAddr.address;
+        socket.localPort = info.localAddr.port;
+        socket.localFamily = info.localAddr.family;
+      }
+    }
+
     class Server extends EventEmitter {
       constructor(options, connectionListener) {
         super();
         if (typeof options === "function") {
           connectionListener = options;
           options = {};
+        } else if (options == null) {
+          options = {};
+        } else if (typeof options !== "object") {
+          throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
         }
-        this._options = options || {};
-        // Node validates the version options when it builds the server's
-        // SecureContext, at createServer() -- so throw here, synchronously.
-        var serverVersions = resolveTlsVersions(this._options);
-        this._tlsMin = serverVersions.min;
-        this._tlsMax = serverVersions.max;
+        this._options = options;
+        this.requestCert = options.requestCert === true;
+        this.rejectUnauthorized = options.rejectUnauthorized !== false;
+        this.ALPNCallback = options.ALPNCallback;
+        if (this.ALPNCallback && options.ALPNProtocols) {
+          throw nodeTypeError(
+            "The ALPNCallback and ALPNProtocols TLS options are mutually exclusive",
+            "ERR_TLS_ALPN_CALLBACK_WITH_PROTOCOLS",
+          );
+        }
+        if (options.ALPNProtocols) convertALPNProtocols(options.ALPNProtocols, this);
+        this._contextId = null;
+        this.setSecureContext(options);
+        // Not enumerable: Node keeps it internal (kHandshakeTimeout).
+        Object.defineProperty(this, "_handshakeTimeout", {
+          value: options.handshakeTimeout || 120 * 1000,
+          writable: true,
+          configurable: true,
+        });
+        if (typeof this._handshakeTimeout !== "number") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.handshakeTimeout", "number", options.handshakeTimeout);
+        }
+        this._SNICallback = options.SNICallback;
+        if (this._SNICallback && typeof this._SNICallback !== "function") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.SNICallback", "Function", this._SNICallback);
+        }
         if (connectionListener) this.on("secureConnection", connectionListener);
         this._serverId = null;
         this._port = null;
         this._host = null;
         this.listening = false;
         this._closed = false;
+      }
+      // Node's Server#setSecureContext: the options are kept on the server
+      // and a new context replaces the old one for connections accepted
+      // from now on (a certificate rotation); a bad one throws and leaves
+      // the old one in place.
+      setSecureContext(options) {
+        if (options === null || typeof options !== "object") {
+          throw codes.ERR_INVALID_ARG_TYPE("options", "Object", options);
+        }
+        // Node validates the version options when it builds the context.
+        var versions = resolveTlsVersions(options);
+        var id = buildServerContext(options, versions);
+        this.pfx = options.pfx || undefined;
+        this.key = options.key || undefined;
+        this.passphrase = options.passphrase || undefined;
+        this.cert = options.cert || undefined;
+        this.ca = options.ca || undefined;
+        this.minVersion = options.minVersion || undefined;
+        this.maxVersion = options.maxVersion || undefined;
+        this.secureProtocol = options.secureProtocol || undefined;
+        this._tlsMin = versions.min;
+        this._tlsMax = versions.max;
+        var old = this._contextId;
+        this._contextId = id;
+        if (serverContexts) {
+          if (old !== null) serverContexts.unregister(this);
+          serverContexts.register(this, id, this);
+        }
+        if (old !== null) natives.tlsServerContextFree(old);
       }
       listen(port, host, callback) {
         if (typeof port === "object" && port !== null) {
@@ -28915,10 +30519,7 @@
         }
         if (typeof callback === "function") this.once("listening", callback);
         var hostname = host || "0.0.0.0";
-        var certPem = this._options.cert instanceof Uint8Array
-          ? new TextDecoder().decode(this._options.cert) : String(this._options.cert || "");
-        var keyPem = this._options.key instanceof Uint8Array
-          ? new TextDecoder().decode(this._options.key) : String(this._options.key || "");
+        this._closed = false;
 
         // Registered synchronously inside listen(), as net.Server is: Node
         // lists a listening tls.Server as a TCPServerWrap.
@@ -28932,7 +30533,7 @@
             // unref() before listen(), applied once bound (as net.Server).
             if (this._handleRefed === false) natives.tcpServerSetRef(bound.serverId, false);
             this.emit("listening");
-            this._acceptLoop(bound.serverId, certPem, keyPem);
+            this._acceptLoop(bound.serverId);
           },
           (err) => {
             registry._activeHandles.delete(this);
@@ -28941,7 +30542,7 @@
         );
         return this;
       }
-      _acceptLoop(serverId, certPem, keyPem) {
+      _acceptLoop(serverId) {
         (async () => {
           while (!this._closed) {
             var accepted;
@@ -28957,45 +30558,64 @@
               continue;
             }
             if (accepted === undefined) break;
-            var tcpHandle = accepted.handle;
-            try {
-              var info = await natives.tlsAcceptWrap(tcpHandle, certPem, keyPem, this._tlsMin, this._tlsMax);
-              var socket = new TLSSocket(null, {});
-              socket._handle = info.handle;
-              socket.connecting = false;
-              // Node: false unless requestCert produced a verified peer
-              // certificate, and this server never requests one. Its
-              // `timeout` is the server's, which is 0.
-              socket.authorized = false;
-              socket.timeout = 0;
-              socket._protocol = info.protocol;
-              socket._cipher = info.cipher;
-              socket._cipherStandardName = info.cipherStandardName || null;
-              socket._peerCertificates = info.peerCertificates || null;
-              socket._peerParsed = null;
-              socket._isServer = true;
-              socket.alpnProtocol = info.alpnProtocol || false;
-              socket.encrypted = true;
-              var remote = info.remoteAddr || accepted.remoteAddr;
-              if (remote) {
-                socket.remoteAddress = remote.address;
-                socket.remotePort = remote.port;
-                socket.remoteFamily = remote.family;
-              }
-              if (info.localAddr) {
-                socket.localAddress = info.localAddr.address;
-                socket.localPort = info.localAddr.port;
-                socket.localFamily = info.localAddr.family;
-              }
-              registry._activeHandles.set(socket, "TCPSocketWrap");
-              this.emit("secureConnection", socket);
-              socket._startReading();
-            } catch (e) {
-              this.emit("tlsClientError", typeof e === "string" ? new Error(e) : e, null);
-            }
+            // Not awaited: each connection handshakes on its own.
+            this._secureConnection(accepted);
           }
           this.emit("close");
         })();
+      }
+      // One accepted connection: its TLSSocket from the start (Node builds it
+      // on 'connection'), the handshake, the verdict, 'secureConnection'.
+      _secureConnection(accepted) {
+        var socket = new TLSSocket(null, {});
+        socket._isServer = true;
+        socket.server = this;
+        socket.authorized = false;
+        socket.timeout = 0;
+        socket.servername = null;
+        if (accepted.remoteAddr) {
+          socket.remoteAddress = accepted.remoteAddr.address;
+          socket.remotePort = accepted.remoteAddr.port;
+          socket.remoteFamily = accepted.remoteAddr.family;
+        }
+        var requestCert = this.requestCert;
+        var rejectUnauthorized = this.rejectUnauthorized;
+        var alpn = this.ALPNProtocols ? JSON.stringify(alpnWireNames(this.ALPNProtocols)) : undefined;
+        var handshake;
+        try {
+          handshake = natives.tlsAcceptWrap(
+            accepted.handle, this._contextId, this._handshakeTimeout,
+            requestCert, rejectUnauthorized, alpn,
+          );
+        } catch (e) {
+          handshake = Promise.reject(e);
+        }
+        handshake.then(
+          (info) => {
+            fillServerSocket(socket, info, accepted);
+            if (requestCert) {
+              if (info.authorizationError) {
+                socket.authorizationError = info.authorizationError;
+                if (rejectUnauthorized) {
+                  // Destroyed before it is ever handed out; its close is
+                  // the 'socket hang up' Node reports.
+                  socket.destroy();
+                  this.emit("tlsClientError", socketHangUp(), socket);
+                  return;
+                }
+              } else {
+                socket.authorized = true;
+              }
+            }
+            registry._activeHandles.set(socket, "TCPSocketWrap");
+            this.emit("secureConnection", socket);
+            socket._startReading();
+          },
+          (err) => {
+            socket.destroy();
+            this.emit("tlsClientError", typeof err === "string" ? new Error(err) : err, socket);
+          },
+        );
       }
       address() {
         return this.listening
@@ -29032,6 +30652,48 @@
     function createServer(options, connectionListener) {
       return new Server(options, connectionListener);
     }
+
+    // The TLS side of a socket the https server hands out (req.socket, and
+    // the socket of its 'tlsClientError' / 'clientError'): that server
+    // serves its connections natively, so the object is the http server's
+    // stand-in over the connection, and here it gets what Node's
+    // server-side TLSSocket reports from the handshake -- `encrypted`,
+    // `authorized` / `authorizationError`, `alpnProtocol`, `servername`,
+    // getPeerCertificate() / getPeerX509Certificate(), getProtocol(),
+    // getCipher() -- read the same way TLSSocket reads them. `info` is the
+    // native handshake record, or null for a connection whose handshake
+    // failed.
+    function serverSocketView(socket, info) {
+      info = info || {};
+      socket.encrypted = true;
+      socket.authorized = info.authorized === true;
+      socket.authorizationError = info.authorizationError == null ? null : info.authorizationError;
+      socket.alpnProtocol = info.alpnProtocol == null ? false : info.alpnProtocol;
+      socket.servername = info.servername == null ? false : info.servername;
+      socket._isServer = true;
+      socket._protocol = info.protocol || null;
+      socket._cipher = info.cipher || null;
+      socket._cipherStandardName = info.cipherStandardName || null;
+      socket._peerCertificates = info.peerCertificates || null;
+      socket._peerParsed = null;
+      socket._ephemeralKeyInfo = null;
+      var proto = TLSSocket.prototype;
+      socket.getProtocol = proto.getProtocol;
+      socket.getCipher = proto.getCipher;
+      socket.getEphemeralKeyInfo = proto.getEphemeralKeyInfo;
+      socket.getPeerCertificate = proto.getPeerCertificate;
+      socket.getPeerX509Certificate = proto.getPeerX509Certificate;
+      socket._parsedPeerCert = proto._parsedPeerCert;
+      return socket;
+    }
+
+    // What the https server builds on: its options are node:tls's, read and
+    // validated by tls.Server, and its connections are accepted natively
+    // with the context tls.Server built.
+    registry._tlsServer = {
+      alpnWireNames: alpnWireNames,
+      serverSocketView: serverSocketView,
+    };
 
     return {
       connect,
