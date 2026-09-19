@@ -1545,6 +1545,54 @@ many are open is closed at once and the server emits `'drop'`. What differs:
 _(probed)_ Node v22.22.2 and oam, raw TCP and TLS clients against servers with short
 timeouts; conformance case 135.
 
+### 42. TLS servers and `http2.createSecureServer`: what still differs
+
+`tls.createServer` builds its secure context at `createServer()` (Node's errors for a key
+it cannot read or that is not its certificate's), handshakes each connection on its own
+within `handshakeTimeout`, negotiates `ALPNProtocols` in the server's order, and honours
+`requestCert` / `rejectUnauthorized` / `ca` with Node's verdicts (`authorized`,
+`authorizationError`, a refused client dropped before `'secureConnection'`). `key` may be
+encrypted (PBES2 PKCS#8, AES legacy PEM) and `pfx` a PKCS#12 bundle. `http2.createSecureServer`
+is a `tls.Server` offering `h2`: HTTP/2 sessions with `'session'`, `'stream'` and the
+compatibility API, `allowHTTP1`, `'unknownProtocol'` and Node's `403`. What differs:
+
+- **Triple-DES key protection is refused.** A legacy PEM key with `DEK-Info: DES-EDE3-CBC`
+  (what `openssl rsa -des3` writes), a PKCS#8 key under PBES1 3DES, and a PKCS#12 bundle
+  whose bags use `pbeWithSHAAnd3-KeyTripleDES-CBC` throw `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`
+  at `createServer()`; Node opens them. oam has no DES implementation. Re-encrypt the key
+  with AES (`openssl pkcs8 -topk8 -v2 aes-256-cbc`, `openssl pkcs12 -export` from OpenSSL
+  3) or pass it unencrypted.
+- **`SNICallback` and `ALPNCallback` are validated but not called.** The server's own key
+  and certificate serve every name, and with `ALPNCallback` no protocol is negotiated.
+- **`createServer()`'s errors carry no `opensslErrorStack`**, and a `pfx` that cannot be
+  parsed is `not enough data` whatever is wrong with it (OpenSSL names the fault).
+- **A handshake that times out closes the connection.** Node emits `'tlsClientError'`
+  `ERR_TLS_HANDSHAKE_TIMEOUT` and leaves the socket open when a `'tlsClientError'` listener
+  exists; oam emits the same event and closes it.
+- **No `'connection'` event** on a `tls.Server`: the plain socket is not exposed before
+  its handshake. `'tlsClientError'` messages are rustls's; the codes are Node's.
+- **HTTP/2 sessions have no push, 1xx, trailers or settings.** `stream.pushAllowed` is
+  `false` and `pushStream()` throws `ERR_HTTP2_PUSH_DISABLED`; `additionalHeaders()` sends
+  nothing and `writeContinue()` / `writeEarlyHints()` return `false`; response trailers
+  (`waitForTrailers`, `addTrailers`) are not sent; `respondWithFD()` / `respondWithFile()`,
+  `session.ping()`, `settings()`, `goaway()`, `altsvc()` and `origin()` are absent, and
+  `localSettings` / `remoteSettings` are `undefined`. `server.updateSettings()` is stored
+  and not applied (the session runs hyper's defaults). `session.ref()` / `unref()` do
+  nothing. `'sessionError'`, `'frameError'` and `'goaway'` are not emitted on the server.
+- **Wire details.** Stream ids are numbered in arrival order (1, 3, 5, ...); a stream's
+  `rawHeaders` lists the pseudo-headers as `:method`, `:authority`, `:scheme`, `:path`,
+  not in the order the client sent them; `stream.close(code)` after `respond()` ends the
+  stream instead of resetting it with `code`; a graceful `session.close()` may send two
+  GOAWAY frames (RFC 9113 6.8's two-step shutdown) where Node sends one; a `te` response
+  header is not sent.
+- **`allowHTTP1` serves `http.IncomingMessage` / `http.ServerResponse`** whatever
+  `Http1IncomingMessage` / `Http1ServerResponse` name, with the TLS socket as
+  `req.socket`, and the HTTP/1 connection is held to the server's `headersTimeout` /
+  `requestTimeout` as they are when it connects.
+
+_(probed)_ Node v22.22.2 and oam as servers for the same real Node clients (tls, https,
+http2, raw TCP): conformance cases 150-153.
+
 ### `err.syscall` on `fs.realpath` and `fs.opendir`
 
 Node's own sync and async forms disagree on these two, and oam is

@@ -154,8 +154,57 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   low-severity denial of service against a stream that is not being read). oam's
   HTTP/2 server (`http2.createServer`) and the `fetch` transport's HTTP/2 connections
   both use it.
+- **`http2.createSecureServer` served cleartext.** It ignored `key`, `cert` and every
+  other TLS option and returned an `http2.createServer`, so its port spoke HTTP/2 without
+  TLS (h2c) and plain HTTP/1.1: a server meant to be reached only over TLS answered
+  cleartext clients, and TLS clients could not connect to it. Present since 0.6.0. It is
+  now Node's `Http2SecureServer`, a `tls.Server` that offers `h2` by ALPN: a client that
+  does not complete a TLS handshake gets no response, only a `'tlsClientError'` on the
+  server. A connection that negotiates `h2` is served as an HTTP/2 session (`'session'`,
+  `'stream'`, and the `(req, res)` compatibility API for the `'request'` handler); one
+  that negotiates `http/1.1` or nothing is served as HTTP/1.1 under `allowHTTP1`, handed
+  to an `'unknownProtocol'` listener, or answered with Node's `403` and closed. The TLS
+  options below apply to it.
+- **`tls.createServer` never asked for a client certificate.** It ignored
+  `requestCert`, `rejectUnauthorized` and `ca`, so a server configured to admit only
+  clients with a certificate its CA signed admitted every client, with or without one.
+  Present since 0.6.0. `requestCert` now asks for a certificate, and it is judged as
+  Node judges it: `socket.authorized`, or `socket.authorizationError` with Node's code
+  (`UNABLE_TO_GET_ISSUER_CERT` when there is none, `DEPTH_ZERO_SELF_SIGNED_CERT`,
+  `UNABLE_TO_VERIFY_LEAF_SIGNATURE`, ...), against `ca`, or the default store without it.
+  Under `rejectUnauthorized` (the default) a client with no certificate fails the
+  handshake, and one whose certificate does not verify is dropped before
+  `'secureConnection'` and never reaches the application.
+- **One client could stall a TLS server's handshakes.** `tls.createServer` completed each
+  handshake before accepting the next connection, with no time limit, so a client that
+  connected and sent nothing held up every client after it. Each connection is now
+  handshaken on its own, bounded by `handshakeTimeout` (120 s by default; the connection
+  is closed with `'tlsClientError'` `ERR_TLS_HANDSHAKE_TIMEOUT`).
 
 ### Fixed
+
+- **TLS servers now negotiate ALPN and report the handshake as Node does.**
+  `tls.createServer` honours `ALPNProtocols` (the server's order among what the client
+  offers; a client offering only protocols the server lacks gets
+  `no_application_protocol`), validates it and `ALPNCallback` / `handshakeTimeout` /
+  `SNICallback` as Node does, and reports `socket.servername`. Its secure context is built
+  at `createServer()`, which throws Node's errors for a key it cannot read or one that is
+  not its certificate's (`ERR_OSSL_UNSUPPORTED`, `ERR_OSSL_X509_KEY_VALUES_MISMATCH`,
+  `ERR_OSSL_PEM_NO_START_LINE`); `server.setSecureContext()` replaces it. A failed
+  handshake is `'tlsClientError'` with the connection's socket and Node's code, and a
+  client that does not speak TLS is refused on OpenSSL's rules for its first bytes
+  (`ERR_SSL_HTTP_REQUEST`, `ERR_SSL_WRONG_VERSION_NUMBER`, ...) without an answer it
+  could read.
+- **TLS servers read encrypted keys and PKCS#12 bundles.** `key` may be an encrypted
+  PKCS#8 key (PBES2 with PBKDF2 or scrypt, AES-CBC) or a legacy encrypted PEM key
+  (AES-CBC), opened with `passphrase` or a `{ pem, passphrase }` entry's own; `pfx` is
+  opened as Node opens it, its MAC checked (`mac verify failure`), its PBES2-protected or
+  unprotected bags read, and its other certificates served as the chain and trusted as
+  CAs. The errors are Node's (`ERR_OSSL_BAD_DECRYPT`, `Unsupported PKCS12 PFX data` for an
+  RC2 bundle). Triple-DES-protected keys and bundles, which Node reads, are refused with
+  `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` (divergence 42).
+- **`http2.Http2ServerRequest` and `http2.Http2ServerResponse` are exported**, and an
+  HTTP/2 request's headers include `:authority` and `:scheme` on every oam HTTP/2 server.
 
 - **`req.trailers` and `req.rawTrailers` were `undefined` on server requests.** A chunked
   request body's trailer fields were dropped. They are now there once the body has
