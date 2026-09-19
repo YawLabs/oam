@@ -54,6 +54,14 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   The resolver behind `dns.lookup`, `net.connect` and `tls.connect` is handed the name's
   UTS #46 ToASCII form, as node's is (a soft hyphen vanishes, a fullwidth digit is a digit,
   a name ToASCII refuses is `getaddrinfo EINVAL`).
+- **`http.request` went through the environment proxy.** oam sent every `http.request` /
+  `https.request` through `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`, which node v22 applies
+  only under `NODE_USE_ENV_PROXY=1`; behind a proxy `res.socket.remoteAddress` was the
+  proxy's, so a check of the address a response came from passed for any destination the
+  proxy would fetch. `http.request` now dials the destination itself unless
+  `NODE_USE_ENV_PROXY=1` (or `--use-env-proxy` in `NODE_OPTIONS`) is set, and then only
+  over node's own global agents, as node does. `fetch` still honours the environment
+  proxy.
 - **TLS options of `https.request` were not applied.** A verifying `https.request` went
   through one shared client that ignored the request's `ca`, client certificate,
   `servername` and `checkServerIdentity`, and `tls.connect` never called a

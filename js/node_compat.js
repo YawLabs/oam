@@ -18469,6 +18469,14 @@
           // pool is reused, as node's addRequest reuses it.
           (!!agent && agentHasFreeSocket(agent, this, opts, host, port)) ||
           this._rawHost;
+        // node dials the target itself unless its own global agent carries
+        // the environment proxy (NODE_USE_ENV_PROXY=1): a request oam's
+        // transport would send through a proxy that node would not goes
+        // over the agent's socket, which dials directly.
+        if (!this._agentPath && !(ENV_PROXY_AGENTS.has(agent) && useEnvProxy()) &&
+            natives.httpEnvProxied(this._url)) {
+          this._agentPath = true;
+        }
         this._options = opts;
         this._port = port;
         this._fetchSocket = null;
@@ -19824,8 +19832,9 @@
     // removeSocket making a socket for a request still queued. An ES5
     // constructor, so `http.Agent.call(this, options)` subclasses work, and
     // packages that override keepSocketAlive / reuseSocket (agentkeepalive)
-    // are called where node calls them. Not ported: proxyEnv (--use-env-proxy)
-    // and the keylog relay.
+    // are called where node calls them. Not ported: the keylog relay, and
+    // proxyEnv as an option (the global agents' NODE_USE_ENV_PROXY proxying
+    // is the fetch transport's; see useEnvProxy).
     const kRequestOptions = Symbol("requestOptions");
 
     function freeSocketErrorListener(err) {
@@ -20269,6 +20278,31 @@
     };
     // The https factory builds its exports from these.
     registry._httpAgents = { HttpsAgent, state: agentState };
+
+    // node's http.request applies the environment proxy (HTTP_PROXY /
+    // HTTPS_PROXY / NO_PROXY) only under NODE_USE_ENV_PROXY=1 or
+    // --use-env-proxy, read at startup, and only through its own two global
+    // agents (the proxyEnv option they are built with; a `new Agent()`, an
+    // `agent: false` request, or a global agent replaced by assignment dials
+    // directly). oam's transport would proxy every request its rules match,
+    // so a request node dials directly goes over the agent's socket instead
+    // (see the constructor). natives.env() is the OS environment, which a
+    // process.env write never reaches -- as node's startup read.
+    const ENV_PROXY_AGENTS = new WeakSet([agentState.globalAgent, agentState.httpsGlobalAgent]);
+    let envProxyEnabled;
+    function useEnvProxy() {
+      if (envProxyEnabled === undefined) {
+        let env = null;
+        try {
+          env = natives.env();
+        } catch {
+          env = null;
+        }
+        envProxyEnabled = !!env && (env.NODE_USE_ENV_PROXY === "1" ||
+          /(?:^|\s)--use-env-proxy(?:\s|$)/.test(env.NODE_OPTIONS || ""));
+      }
+      return envProxyEnabled;
+    }
 
     var INVALID_HEADER_CHAR = /[^\t\x20-\x7e\x80-\xff]/;
     // node's checkIsHttpToken (lib/_http_common.js), and the two errors its

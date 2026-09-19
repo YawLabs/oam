@@ -180,6 +180,20 @@ impl HttpTransport {
         }
         intercept.basic_auth().cloned()
     }
+
+    /// Whether the proxy rules would send a request for `url` on a pooled
+    /// route through a proxy (any scheme, a refused socks one included). A
+    /// URL that is not a URI answers true: the caller asks in order to stay
+    /// off the proxy, so it then keeps off this transport altogether.
+    pub fn env_proxied(&self, url: &str) -> bool {
+        let Ok(uri) = url.parse::<Uri>() else {
+            return true;
+        };
+        self.shared
+            .proxy
+            .as_ref()
+            .is_some_and(|rules| rules.intercept(&uri).is_some())
+    }
 }
 
 /// One client builder for both kinds of client.

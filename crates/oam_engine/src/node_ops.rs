@@ -338,6 +338,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpBridgeIn", op_http_bridge_in),
         ("httpBridgeInEnd", op_http_bridge_in_end),
         ("httpBridgeClose", op_http_bridge_close),
+        ("httpEnvProxied", op_http_env_proxied),
         ("netCheck", op_net_check),
         ("netResolveDrop", op_net_resolve_drop),
         ("tcpRead", op_tcp_read),
@@ -3032,6 +3033,21 @@ fn op_http_bridge_close(
     let closed = id >= 0.0
         && oam_core::http_client::bridge::close(&core_runtime!(scope).http_bridges(), id as u64);
     rv.set_bool(closed);
+}
+
+/// `__oam.node.httpEnvProxied(url) -> bool`: whether the fetch transport's
+/// environment proxy rules (HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY)
+/// would send a request for `url` through a proxy. http.request asks, so a
+/// request node would dial directly (it applies the environment proxy only
+/// under NODE_USE_ENV_PROXY=1) never goes out through one. A URL the
+/// transport cannot read answers true: the caller then dials directly.
+fn op_http_env_proxied(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let url = arg_string(scope, &args, 0).unwrap_or_default();
+    rv.set_bool(core_runtime!(scope).http_client().env_proxied(&url));
 }
 
 /// `__oam.node.netCheck(host, port)`: the net grant's verdict on a connect to

@@ -4806,6 +4806,8 @@ fn oam_run_with_proxy_env(script: &std::path::Path, vars: &[(&str, &str)]) -> Ou
         "no_proxy",
         "REQUEST_METHOD",
         "NODE_EXTRA_CA_CERTS",
+        "NODE_USE_ENV_PROXY",
+        "NODE_OPTIONS",
     ] {
         cmd.env_remove(name);
     }
@@ -5219,13 +5221,19 @@ server.close();
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
-/// HTTP_PROXY is honoured by fetch and http.request alike -- an oam extension
-/// (node v22.22.2 ignores the variable unless NODE_USE_ENV_PROXY=1 is set,
-/// measured) that the reqwest transport had and the owned one keeps:
-/// absolute-form request line, `proxy-authorization` from the proxy URL's
-/// userinfo. Wire and texts measured on the reqwest build first.
+/// HTTP_PROXY is honoured by fetch -- an oam extension the reqwest transport
+/// had and the owned one keeps (node v22.22.2's fetch ignores the variable
+/// unless NODE_USE_ENV_PROXY=1): absolute-form request line,
+/// `proxy-authorization` from the proxy URL's userinfo. http.request follows
+/// node: it dials the target itself unless NODE_USE_ENV_PROXY=1 (or
+/// `--use-env-proxy` in NODE_OPTIONS) puts node's global agent behind the
+/// proxy, so a check of `res.socket.remoteAddress` sees the target, not the
+/// proxy. Measured on node v22.22.2: without the variable (or with `0` /
+/// `true`) the proxy sees nothing from http.get; with `1` it sees the
+/// absolute-form GET. Up to 0.16.2 oam sent http.request through the proxy
+/// regardless.
 #[test]
-fn fetch_and_http_honour_http_proxy_env() {
+fn fetch_honours_http_proxy_env_and_http_request_only_when_node_would() {
     let (proxy, heads) = spawn_recording_proxy(
         "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
     );
@@ -5234,36 +5242,77 @@ fn fetch_and_http_honour_http_proxy_env() {
         r#"import http from 'node:http';
 const res = await fetch('http://example.invalid:81/x');
 console.log('fetch', res.status, await res.text());
-const got = await new Promise((resolve) => {
-  http.get('http://example.invalid:81/x', (r) => {
-    let b = '';
-    r.setEncoding('utf8');
-    r.on('data', (c) => (b += c));
-    r.on('end', () => resolve(r.statusCode + ' ' + b));
-  }).on('error', (e) => resolve('error ' + e.code + ' ' + e.message));
-});
-console.log('http.get', got);
+const target = http.createServer((q, r) => r.end('direct'));
+await new Promise((r) => target.listen(0, '127.0.0.1', r));
+const port = target.address().port;
+for (const [label, url] of [['name', 'http://example.invalid:81/x'], ['target', `http://127.0.0.1:${port}/y`]]) {
+  const got = await new Promise((resolve) => {
+    http.get(url, (r) => {
+      const via = r.socket.remotePort === port ? 'target' : 'proxy';
+      let b = '';
+      r.setEncoding('utf8');
+      r.on('data', (c) => (b += c));
+      r.on('end', () => resolve(r.statusCode + ' ' + b + ' ' + via));
+    }).on('error', (e) => resolve('error ' + e.code));
+  });
+  console.log('http.get', label, got);
+}
+target.close();
 "#,
     );
     let proxy_url = format!("http://u:p@127.0.0.1:{proxy}");
-    let out = oam_run_with_proxy_env(&script, &[("HTTP_PROXY", &proxy_url)]);
-    let (stdout, _) = run_script_ok(&script, out);
-    assert_eq!(
-        stdout.trim().replace("\r\n", "\n"),
-        "fetch 200 ok\nhttp.get 200 ok"
-    );
-    let heads = heads.lock().unwrap();
-    assert_eq!(heads.len(), 2, "{heads:?}");
-    for head in heads.iter() {
-        assert!(
-            head.starts_with("GET http://example.invalid:81/x HTTP/1.1\r\n"),
-            "{head}"
+    let run = |extra: &[(&str, &str)]| {
+        heads.lock().unwrap().clear();
+        let mut vars = vec![("HTTP_PROXY", proxy_url.as_str())];
+        vars.extend_from_slice(extra);
+        let out = oam_run_with_proxy_env(&script, &vars);
+        let (stdout, _) = run_script_ok(&script, out);
+        let seen = heads.lock().unwrap().clone();
+        (stdout.trim().replace("\r\n", "\n"), seen)
+    };
+
+    for extra in [
+        &[][..],
+        &[("NODE_USE_ENV_PROXY", "0")][..],
+        &[("NODE_USE_ENV_PROXY", "true")][..],
+    ] {
+        let (stdout, seen) = run(extra);
+        assert_eq!(
+            stdout,
+            "fetch 200 ok\nhttp.get name error ENOTFOUND\nhttp.get target 200 direct target",
+            "{extra:?}"
         );
-        assert!(
-            head.to_ascii_lowercase()
-                .contains("\r\nproxy-authorization: basic dtpw\r\n"),
-            "{head}"
+        assert_eq!(
+            seen.len(),
+            1,
+            "only fetch reaches the proxy ({extra:?}): {seen:?}"
         );
+    }
+
+    for extra in [
+        &[("NODE_USE_ENV_PROXY", "1")][..],
+        &[("NODE_OPTIONS", "--use-env-proxy")][..],
+    ] {
+        let (stdout, seen) = run(extra);
+        assert_eq!(
+            stdout, "fetch 200 ok\nhttp.get name 200 ok proxy\nhttp.get target 200 ok proxy",
+            "{extra:?}"
+        );
+        assert_eq!(seen.len(), 3, "{extra:?}: {seen:?}");
+        for head in &seen[..2] {
+            assert!(
+                head.starts_with("GET http://example.invalid:81/x HTTP/1.1\r\n"),
+                "{head}"
+            );
+        }
+        assert!(seen[2].starts_with("GET http://127.0.0.1:"), "{}", seen[2]);
+        for head in &seen {
+            assert!(
+                head.to_ascii_lowercase()
+                    .contains("\r\nproxy-authorization: basic dtpw\r\n"),
+                "{head}"
+            );
+        }
     }
 }
 
@@ -5271,6 +5320,8 @@ console.log('http.get', got);
 /// proxy credentials, and a refused tunnel keeps the texts the reqwest
 /// transport produced (measured on that build): fetch's cause is `error
 /// sending request for url (...)`, https.get emits ECONNRESET `socket hang up`.
+/// https.get goes through the proxy only where node's would: under
+/// NODE_USE_ENV_PROXY=1 (see fetch_honours_http_proxy_env_and_...).
 #[test]
 fn https_proxy_env_sends_connect_and_keeps_error_texts() {
     let (proxy, heads) =
@@ -5287,7 +5338,10 @@ console.log('https.get', got);
 "#,
     );
     let proxy_url = format!("http://u:p@127.0.0.1:{proxy}");
-    let out = oam_run_with_proxy_env(&script, &[("HTTPS_PROXY", &proxy_url)]);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("HTTPS_PROXY", &proxy_url), ("NODE_USE_ENV_PROXY", "1")],
+    );
     let (stdout, _) = run_script_ok(&script, out);
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
@@ -5323,14 +5377,28 @@ const url = 'http://127.0.0.1:__TARGET__/';
 try { await fetch(url); console.log('fetch resolved?!'); }
 catch (e) { console.log('fetch', e.message, '|', e.cause.message.replace('__TARGET__', 'P')); }
 const got = await new Promise((resolve) => {
-  http.get(url, () => resolve('response?!')).on('error', (e) => resolve(e.code + ' ' + e.message));
+  http.get(url, () => resolve('response?!')).on('error', (e) => resolve(e.code + ' ' + e.message.replace('__TARGET__', 'P')));
 });
 console.log('http.get', got);
 "#
         .replace("__TARGET__", &target.to_string()),
     );
     let socks_url = format!("socks5://127.0.0.1:{socks}");
+    // http.get dials the target itself, as node's does without
+    // NODE_USE_ENV_PROXY=1.
     let out = oam_run_with_proxy_env(&script, &[("ALL_PROXY", &socks_url)]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "fetch fetch failed | error sending request for url (http://127.0.0.1:P/)\n\
+         http.get ECONNREFUSED connect ECONNREFUSED 127.0.0.1:P"
+    );
+    // Under NODE_USE_ENV_PROXY=1 http.get takes the transport's rules, and
+    // the socks failure keeps its texts.
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("ALL_PROXY", &socks_url), ("NODE_USE_ENV_PROXY", "1")],
+    );
     let (stdout, _) = run_script_ok(&script, out);
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),

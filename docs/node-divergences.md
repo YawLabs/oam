@@ -1469,20 +1469,27 @@ above.
 **The environment proxy, an oam extension**
 
 `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY` (uppercase first, then lowercase)
-always route `fetch` and `http.request` in oam. Node v22.22.2 ignores them unless
-`NODE_USE_ENV_PROXY=1` is set, which oam does not read; with it set, Node's `http.get` sends
-an http destination to the proxy in absolute form as oam does, but its `fetch` tunnels even
-an http destination through `CONNECT` (and warns that `EnvHttpProxyAgent` is experimental).
+always route `fetch` in oam. Node v22.22.2's `fetch` ignores them unless
+`NODE_USE_ENV_PROXY=1` (or `--use-env-proxy` in `NODE_OPTIONS`) is set, and with it set
+tunnels even an http destination through `CONNECT` (and warns that `EnvHttpProxyAgent` is
+experimental). `http.request` / `https.request` follow Node: without that setting they dial
+the destination themselves, so `res.socket.remoteAddress` is the destination's, never the
+proxy's; with it, a request over Node's own global agent goes through the proxy (an http
+destination in absolute form), and one over any other agent -- `agent: false`, a
+`new http.Agent()`, a replaced `http.globalAgent` -- still dials directly. Up to 0.16.2 oam
+sent every `http.request` through the proxy. Under `NODE_USE_ENV_PROXY=1` oam's rules are
+the transport's, not Node's: Node reads `http_proxy` before `HTTP_PROXY` and never reads
+`ALL_PROXY`. `oam --use-env-proxy` on the command line is not accepted.
 The variables are read from the OS environment once per run, so assigning
-`process.env.HTTP_PROXY` changes nothing, and a set `REQUEST_METHOD` (a CGI environment)
-turns them all off. An http
+`process.env.HTTP_PROXY` (or `NODE_USE_ENV_PROXY`) changes nothing, and a set
+`REQUEST_METHOD` (a CGI environment) turns them all off for `fetch`. An http
 destination goes to the proxy in absolute form, with `proxy-authorization` from the proxy
 URL's credentials; an https destination goes through a `CONNECT` tunnel carrying those
 credentials and oam's `user-agent`, with h2 still negotiated with the origin inside it. The
 handshake with an `https://` proxy itself offers no ALPN. A refused or unresolvable proxy
 fails with Node's connect error naming the proxy. A `socks` proxy URL is not supported and
 fails every request it applies to: `fetch` with `error sending request for url (...)`,
-`http.request` with `ECONNRESET` `socket hang up`.
+`http.request` (under `NODE_USE_ENV_PROXY=1`) with `ECONNRESET` `socket hang up`.
 
 _(probed)_ Node v22.22.2 + undici 6.24.1 vs oam on Windows, the same scripts, unless marked
 _(source)_; the `connect.lookup` behaviour is pinned by e2e tests.
