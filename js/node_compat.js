@@ -11481,6 +11481,16 @@
     // process.constructor.name === "process" (so a failed `delete process.x`
     // says "#<process>"), and satisfies test-process-prototype's chain checks.
     const process = new (class process extends EventEmitter {})();
+    // node's own `process[Symbol.toStringTag]` (writable, not enumerable,
+    // not configurable): Object.prototype.toString.call(process) is
+    // '[object process]', the check axios and similar packages use to pick
+    // their node (http) adapter over fetch.
+    Object.defineProperty(process, Symbol.toStringTag, {
+      value: "process",
+      writable: true,
+      enumerable: false,
+      configurable: false,
+    });
 
     // NODE_REDIRECT_WARNINGS destination, resolved lazily on the first warning
     // and cached: undefined = not looked up yet, null = unset/empty (write to

@@ -79,6 +79,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   for -- left from another. The socket is now bound to them before it dials, as in node,
   and a bind that fails is the connection's error (`bind EADDRNOTAVAIL 192.0.2.1`); a
   non-number `localPort` throws node's `ERR_INVALID_ARG_TYPE`.
+- **`Object.prototype.toString.call(process)` was `[object Object]`.** node's is
+  `[object process]`, and axios checks exactly that to choose its node http adapter: on
+  oam it chose its fetch adapter instead, which ignores `httpAgent` / `httpsAgent` -- the
+  agents guard packages such as request-filtering-agent hand it. `process` now carries
+  node's `Symbol.toStringTag`.
 - **TLS options of `https.request` were not applied.** A verifying `https.request` went
   through one shared client that ignored the request's `ca`, client certificate,
   `servername` and `checkServerIdentity`, and `tls.connect` never called a
