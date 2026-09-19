@@ -18473,6 +18473,8 @@
           // node sends it to the Unix socket or named pipe, never host:port;
           // the agent's socket goes where net.connect({path}) goes.
           !!merged.socketPath ||
+          // node binds the socket it connects to these; so does net.connect.
+          !!merged.localAddress || !!merged.localPort ||
           this._rawHost;
         // node dials the target itself unless its own global agent carries
         // the environment proxy (NODE_USE_ENV_PROXY=1): a request oam's
@@ -20766,9 +20768,12 @@
     }
     registry._netRefusePipeConnect = refusePipeConnect;
 
-    // `host` is the caller's (net: options.host || 'localhost'). `dial(spec)`
-    // starts the native connect: spec null for an IP literal, `{ ips }` for a
-    // hook's answer, `{ ticket }` for oam's resolver's. Throws synchronously
+    // `host` is the caller's (net: options.host || 'localhost').
+    // `dial(spec, local)` starts the native connect: spec null for an IP
+    // literal, `{ ips }` for a hook's answer, `{ ticket }` for oam's
+    // resolver's; `local` the localAddress / localPort the socket is bound
+    // to first (node's internalConnect binds when either is set), as the
+    // natives take it, or undefined. Throws synchronously
     // what node's connect() throws: a bad host / localAddress /
     // autoSelectFamily / lookup option, a hook's own synchronous throw, and
     // (oam) a --allow-net refusal of the host, which is asked before the name
@@ -20781,6 +20786,15 @@
       if (localAddress && !isIP(localAddress)) {
         throw codes.ERR_INVALID_IP_ADDRESS(localAddress);
       }
+      const localPort = options.localPort;
+      if (localPort && typeof localPort !== "number") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.localPort", "number", localPort);
+      }
+      const local = localAddress || localPort
+        ? JSON.stringify({ address: localAddress || undefined, port: localPort || undefined })
+        : undefined;
+      const dialFrom = dial;
+      dial = (spec) => dialFrom(spec, local);
       let autoSelectFamily = options.autoSelectFamily;
       if (autoSelectFamily != null) {
         if (typeof autoSelectFamily !== "boolean") {
@@ -21011,7 +21025,7 @@
         });
         this._connectGate = openGate;
         this._chain = this._chain.then(() => gate);
-        const dial = (spec) => {
+        const dial = (spec, local) => {
           let connecting;
           try {
             connecting = natives.tcpConnect(
@@ -21019,6 +21033,7 @@
               port,
               autoSelectFamilyAttemptTimeoutDefault,
               spec === null ? undefined : JSON.stringify(spec),
+              local,
             );
           } catch (err) {
             // A refusal the op raises synchronously (ERR_ACCESS_DENIED for an
@@ -27107,13 +27122,14 @@
       // option, a replaced dns.lookup, 'lookup' events a listener can veto);
       // `dial` starts the native connect with what that answered. The TLS
       // server name stays `servername` or the host, never an address.
-      var dial = function (spec) {
+      var dial = function (spec, local) {
         var connecting;
         try {
           connecting = natives.tlsConnect(
             host, port, serverName, ca, rejectUnauthorized, cert, key,
             tlsVersions.min, tlsVersions.max, attemptTimeout,
             spec === null ? undefined : JSON.stringify(spec),
+            local,
           );
         } catch (err) {
           // A synchronous refusal (ERR_ACCESS_DENIED for an address the net

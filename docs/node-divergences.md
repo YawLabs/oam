@@ -1510,7 +1510,7 @@ one (a subclass that overrides it, or a patched instance or prototype), an
 `tls.connect` / `tls.TLSSocket.prototype.connect` (https), https with a TLS option oam's own
 client does not apply (`rejectUnauthorized: false`, `ca`, `cert` / `key` / `pfx`,
 `servername`, `checkServerIdentity`, `minVersion` / `maxVersion` / `secureProtocol`), a
-`socketPath`, a host the URL parser would rewrite (entry 38), a destination oam's client
+`socketPath`, a `localAddress` or `localPort` (bound as `net.connect` binds them), a host the URL parser would rewrite (entry 38), a destination oam's client
 would send through the environment proxy where Node would not (entry 38), an
 upgrade, or `'lookup'` / `'connect'` / `'secureConnect'` listeners on `req.socket` when the
 request is dispatched -- at once when nothing listens for `'socket'`, else one turn of the

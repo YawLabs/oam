@@ -72,6 +72,13 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   named pipe; oam ignored them and connected to `host:port` (by default `localhost:80`),
   sending the request to whatever listened there. oam has no client for either, so these
   now fail with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` and nothing is dialled.
+- **The `localAddress` and `localPort` connect options were ignored.** `net.connect`,
+  `tls.connect` and `http.request` validated `localAddress` and then connected from the
+  default address and an ephemeral port, so a connection an application meant to leave
+  from one address or port -- the one a firewall rule or an egress policy is written
+  for -- left from another. The socket is now bound to them before it dials, as in node,
+  and a bind that fails is the connection's error (`bind EADDRNOTAVAIL 192.0.2.1`); a
+  non-number `localPort` throws node's `ERR_INVALID_ARG_TYPE`.
 - **TLS options of `https.request` were not applied.** A verifying `https.request` went
   through one shared client that ignored the request's `ca`, client certificate,
   `servername` and `checkServerIdentity`, and `tls.connect` never called a

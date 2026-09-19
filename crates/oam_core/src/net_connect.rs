@@ -75,6 +75,9 @@ pub struct ConnectOptions {
     /// `dns.lookup` or a redeemed [`resolve`] ticket. Applies only when the
     /// connect's host is `pin.host`.
     pub pin: Option<Pin>,
+    /// Where each attempt's socket is bound before it dials: node's
+    /// `localAddress` / `localPort`.
+    pub local: Option<LocalBind>,
 }
 
 impl Default for ConnectOptions {
@@ -82,8 +85,23 @@ impl Default for ConnectOptions {
         ConnectOptions {
             attempt_timeout: DEFAULT_ATTEMPT_TIMEOUT,
             pin: None,
+            local: None,
         }
     }
+}
+
+/// node's `localAddress` / `localPort` connect options (lib/net.js
+/// `internalConnect`, `internalConnectMultiple`): with either set, the socket
+/// is bound before it dials -- to `address`, or the unspecified address of
+/// the target's family (`0.0.0.0` / `::`), and `port` (0: any).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBind {
+    /// As the caller spelled it; node's bind error names it that way. An
+    /// address of the other family than the target's -- or one that is not
+    /// an address at all -- fails that attempt with `bind EINVAL`, as
+    /// libuv's `uv_ip4_addr` / `uv_ip6_addr` refuse it.
+    pub address: Option<String>,
+    pub port: u16,
 }
 
 /// Addresses a caller resolved itself for one host.
@@ -325,6 +343,10 @@ pub(crate) struct DialFailure {
     /// (`undefined:undefined` when getsockname fails). `None` for a failure
     /// that arrived through the event loop, which node reports bare.
     pub(crate) local: Option<String>,
+    /// The attempt failed binding its socket to this local address and port
+    /// (node's `ExceptionWithHostPort(err, 'bind', address, port)`), before
+    /// anything was dialled.
+    pub(crate) bind: Option<(String, u16)>,
 }
 
 /// The two effects the algorithm has, separated so the algorithm can be
@@ -333,8 +355,13 @@ pub(crate) trait Dialer {
     type Stream;
     /// getaddrinfo, in the resolver's order.
     async fn lookup(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>>;
-    /// One connect attempt to one address.
-    async fn dial(&self, target: SocketAddr) -> Result<Self::Stream, DialFailure>;
+    /// One connect attempt to one address, its socket bound to `local`
+    /// first when that is set.
+    async fn dial(
+        &self,
+        target: SocketAddr,
+        local: Option<&LocalBind>,
+    ) -> Result<Self::Stream, DialFailure>;
 }
 
 /// The real network.
@@ -347,8 +374,12 @@ impl Dialer for SystemDialer {
         Ok(tokio::net::lookup_host((host, port)).await?.collect())
     }
 
-    async fn dial(&self, target: SocketAddr) -> Result<Self::Stream, DialFailure> {
-        dial(target).await
+    async fn dial(
+        &self,
+        target: SocketAddr,
+        local: Option<&LocalBind>,
+    ) -> Result<Self::Stream, DialFailure> {
+        dial(target, local).await
     }
 }
 
@@ -363,7 +394,7 @@ pub(crate) async fn connect_with<D: Dialer>(
     // 1. An IP literal: no DNS, one attempt, the address as written.
     if let Ok(ip) = host.parse::<IpAddr>() {
         let target = SocketAddr::new(ip, port);
-        return match dialer.dial(target).await {
+        return match dialer.dial(target, opts.local.as_ref()).await {
             Ok(stream) => Ok((stream, vec![target])),
             Err(failure) => Err(ConnectError::Single(Box::new(attempt_error(
                 host, port, &failure,
@@ -410,7 +441,7 @@ pub(crate) async fn connect_with<D: Dialer>(
     let order = interleave(&resolved);
     if let [target] = order[..] {
         let address = target.ip().to_string();
-        return match dialer.dial(target).await {
+        return match dialer.dial(target, opts.local.as_ref()).await {
             Ok(stream) => Ok((stream, vec![target])),
             Err(failure) => Err(ConnectError::Single(Box::new(attempt_error(
                 &address, port, &failure,
@@ -427,7 +458,9 @@ pub(crate) async fn connect_with<D: Dialer>(
         attempted.push(target);
         let address = target.ip().to_string();
         let outcome = if i < last {
-            match tokio::time::timeout(attempt_timeout, dialer.dial(target)).await {
+            match tokio::time::timeout(attempt_timeout, dialer.dial(target, opts.local.as_ref()))
+                .await
+            {
                 Ok(outcome) => outcome,
                 Err(_elapsed) => {
                     // Dropping the dial future closed its socket.
@@ -442,7 +475,7 @@ pub(crate) async fn connect_with<D: Dialer>(
                 }
             }
         } else {
-            dialer.dial(target).await
+            dialer.dial(target, opts.local.as_ref()).await
         };
         match outcome {
             Ok(stream) => return Ok((stream, attempted)),
@@ -526,7 +559,28 @@ fn fallback_errno(code: &str) -> Option<i32> {
 fn attempt_error(address: &str, port: u16, failure: &DialFailure) -> NodeSysError {
     let code = node_error_code(&failure.error);
     let errno = node_errno(code, &failure.error).or_else(|| fallback_errno(code));
+    if let Some((local_address, local_port)) = &failure.bind {
+        return bind_error(code, errno, local_address, *local_port);
+    }
     connect_error(code, errno, address, port, failure.local.as_deref())
+}
+
+/// `ExceptionWithHostPort(err, 'bind', localAddress, localPort)`: `bind CODE
+/// address`, then `:port` (and a `port` key) only for a non-zero port.
+fn bind_error(code: &str, errno: Option<i32>, address: &str, port: u16) -> NodeSysError {
+    let mut message = format!("bind {code} {address}");
+    if port > 0 {
+        message.push_str(&format!(":{port}"));
+    }
+    NodeSysError {
+        code: code.to_string(),
+        message,
+        errno,
+        syscall: Some("bind".to_string()),
+        hostname: None,
+        address: Some(address.to_string()),
+        port: (port > 0).then_some(port),
+    }
 }
 
 /// lib/internal/errors.js `ExceptionWithHostPort`: `connect CODE address`, then
@@ -635,7 +689,10 @@ fn classify_resolve(error: &std::io::Error) -> (&'static str, i32) {
 
 /// One real connect attempt, libuv's way (src/win/tcp.c `uv__tcp_try_connect`,
 /// src/unix/tcp.c `uv__tcp_connect`).
-async fn dial(target: SocketAddr) -> Result<tokio::net::TcpStream, DialFailure> {
+async fn dial(
+    target: SocketAddr,
+    local: Option<&LocalBind>,
+) -> Result<tokio::net::TcpStream, DialFailure> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
     let dialled = dialled_address(target);
@@ -651,15 +708,23 @@ async fn dial(target: SocketAddr) -> Result<tokio::net::TcpStream, DialFailure> 
             return Err(DialFailure {
                 error,
                 local: Some("undefined:undefined".to_string()),
+                bind: None,
             });
         }
     };
     let sync_failure = |socket: &Socket, error: std::io::Error| DialFailure {
         error,
         local: Some(local_details(socket)),
+        bind: None,
     };
     if let Err(error) = socket.set_nonblocking(true) {
         return Err(sync_failure(&socket, error));
+    }
+
+    // node's localAddress / localPort: bound before the connect, and a bind
+    // that fails is the attempt's error, named for the bind.
+    if let Some(bind) = local {
+        bind_local(&socket, dialled, bind)?;
     }
 
     #[cfg(windows)]
@@ -668,15 +733,17 @@ async fn dial(target: SocketAddr) -> Result<tokio::net::TcpStream, DialFailure> 
         // unspecified address (which is also what makes getsockname answer
         // for a synchronous failure), and an IPv6 one dual-stack (IPV6_V6ONLY
         // off, failure ignored as libuv ignores it) so `::ffff:127.0.0.1`
-        // connects.
-        let unspecified = if dialled.is_ipv4() {
-            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
-        } else {
-            let _ = socket.set_only_v6(false);
-            SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
-        };
-        if let Err(error) = socket.bind(&SockAddr::from(unspecified)) {
-            return Err(sync_failure(&socket, error));
+        // connects -- unless the caller's localAddress / localPort bound it.
+        if local.is_none() {
+            let unspecified = if dialled.is_ipv4() {
+                SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+            } else {
+                let _ = socket.set_only_v6(false);
+                SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
+            };
+            if let Err(error) = socket.bind(&SockAddr::from(unspecified)) {
+                return Err(sync_failure(&socket, error));
+            }
         }
         if is_loopback(dialled.ip()) {
             fail_fast_on_loopback(&socket);
@@ -691,12 +758,20 @@ async fn dial(target: SocketAddr) -> Result<tokio::net::TcpStream, DialFailure> 
         // like any refusal, with no local detail.
         #[cfg(unix)]
         Err(error) if error.raw_os_error() == Some(libc::ECONNREFUSED) => {
-            return Err(DialFailure { error, local: None });
+            return Err(DialFailure {
+                error,
+                local: None,
+                bind: None,
+            });
         }
         Err(error) => return Err(sync_failure(&socket, error)),
     }
 
-    let async_failure = |error| DialFailure { error, local: None };
+    let async_failure = |error| DialFailure {
+        error,
+        local: None,
+        bind: None,
+    };
     let stream = tokio::net::TcpStream::from_std(std::net::TcpStream::from(socket))
         .map_err(async_failure)?;
     // mio's documented protocol for a connecting socket: wait for writable,
@@ -725,6 +800,61 @@ async fn dial(target: SocketAddr) -> Result<tokio::net::TcpStream, DialFailure> 
         let _ = stream.try_io(tokio::io::Interest::WRITABLE, || {
             Err::<(), _>(std::io::ErrorKind::WouldBlock.into())
         });
+    }
+}
+
+/// Bind `socket` (about to dial `dialled`) where `bind` says, libuv's way:
+/// the address must be of the target's family (`uv_ip4_addr` /
+/// `uv_ip6_addr` refuse the other: EINVAL); none means the family's
+/// unspecified address; on unix SO_REUSEADDR first (`uv__tcp_bind`); an
+/// IPv6 socket stays dual-stack, as libuv leaves it (IPV6_V6ONLY off). The
+/// failure names the address as the caller spelled it (or node's `0.0.0.0` /
+/// `::`) and the port.
+fn bind_local(
+    socket: &socket2::Socket,
+    dialled: SocketAddr,
+    bind: &LocalBind,
+) -> Result<(), DialFailure> {
+    let named = bind.address.clone().unwrap_or_else(|| {
+        if dialled.is_ipv4() {
+            "0.0.0.0".to_string()
+        } else {
+            "::".to_string()
+        }
+    });
+    let failure = |error: std::io::Error| DialFailure {
+        error,
+        local: None,
+        bind: Some((named.clone(), bind.port)),
+    };
+    let ip = match &bind.address {
+        None if dialled.is_ipv4() => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        None => IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+        Some(text) => match text.parse::<IpAddr>() {
+            Ok(ip) if ip.is_ipv4() == dialled.is_ipv4() => ip,
+            _ => return Err(failure(einval())),
+        },
+    };
+    if ip.is_ipv6() {
+        let _ = socket.set_only_v6(false);
+    }
+    #[cfg(unix)]
+    socket.set_reuse_address(true).map_err(failure)?;
+    socket
+        .bind(&socket2::SockAddr::from(SocketAddr::new(ip, bind.port)))
+        .map_err(failure)
+}
+
+/// The OS's EINVAL, so the error classifies as node's `EINVAL` everywhere.
+fn einval() -> std::io::Error {
+    #[cfg(windows)]
+    {
+        // WSAEINVAL.
+        std::io::Error::from_raw_os_error(10022)
+    }
+    #[cfg(unix)]
+    {
+        std::io::Error::from_raw_os_error(libc::EINVAL)
     }
 }
 
@@ -917,7 +1047,11 @@ mod tests {
             }
         }
 
-        async fn dial(&self, target: SocketAddr) -> Result<SocketAddr, DialFailure> {
+        async fn dial(
+            &self,
+            target: SocketAddr,
+            _local: Option<&LocalBind>,
+        ) -> Result<SocketAddr, DialFailure> {
             self.dialled.lock().unwrap().push(target);
             let dial = self
                 .dials
@@ -931,10 +1065,12 @@ mod tests {
                 Outcome::Refuse => Err(DialFailure {
                     error: io::ErrorKind::ConnectionRefused.into(),
                     local: None,
+                    bind: None,
                 }),
                 Outcome::SyncFail(kind, local) => Err(DialFailure {
                     error: kind.into(),
                     local: Some(local.to_string()),
+                    bind: None,
                 }),
                 Outcome::Hang => std::future::pending().await,
             }
@@ -945,6 +1081,7 @@ mod tests {
         ConnectOptions {
             attempt_timeout: Duration::from_millis(attempt_ms),
             pin: None,
+            local: None,
         }
     }
 
@@ -1144,6 +1281,7 @@ mod tests {
         let pinned = ConnectOptions {
             attempt_timeout: Duration::from_millis(250),
             pin: Some(pin.clone()),
+            local: None,
         };
         let script = Script::new(&["::1"], &[("127.0.0.1", now(Outcome::Connect))]);
         let (answered, attempted) = connect_with("Pinned.Example", 443, &pinned, &script)
@@ -1496,6 +1634,7 @@ mod tests {
                 host: "blackhole.example".to_string(),
                 addrs: vec!["192.0.2.1".parse().unwrap(), "127.0.0.1".parse().unwrap()],
             }),
+            local: None,
         };
         let Err(ConnectError::Multi(errors)) = connect("blackhole.example", port, &pinned).await
         else {
@@ -1528,6 +1667,58 @@ mod tests {
             .unwrap();
         assert_eq!(v6.len(), 2);
         assert!(script.dialled().is_empty(), "resolving never dials");
+    }
+
+    /// localAddress / localPort: the socket is bound before it dials, so the
+    /// peer sees the connection come from there; a bind that fails is the
+    /// attempt's error in node's `bind CODE address[:port]` shape.
+    #[tokio::test]
+    async fn a_local_bind_is_where_the_connection_comes_from() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let free = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let local_port = free.local_addr().unwrap().port();
+        drop(free);
+        let bound = |address: Option<&str>, port: u16| ConnectOptions {
+            local: Some(LocalBind {
+                address: address.map(str::to_string),
+                port,
+            }),
+            ..ConnectOptions::default()
+        };
+
+        let connected = connect("127.0.0.1", port, &bound(Some("127.0.0.1"), local_port))
+            .await
+            .unwrap();
+        let (_accepted, peer) = listener.accept().await.unwrap();
+        assert_eq!(peer.port(), local_port);
+        assert_eq!(connected.stream.local_addr().unwrap().port(), local_port);
+
+        // Not an address of this host.
+        let Err(ConnectError::Single(error)) =
+            connect("127.0.0.1", port, &bound(Some("192.0.2.1"), 0)).await
+        else {
+            panic!("expected the bind to fail");
+        };
+        assert_eq!(error.code, "EADDRNOTAVAIL");
+        assert_eq!(error.syscall.as_deref(), Some("bind"));
+        assert_eq!(error.message, "bind EADDRNOTAVAIL 192.0.2.1");
+        assert_eq!(error.address.as_deref(), Some("192.0.2.1"));
+        assert_eq!(error.port, None);
+
+        // The other family than the target's: libuv's EINVAL, with the port.
+        let Err(ConnectError::Single(error)) =
+            connect("127.0.0.1", port, &bound(Some("::1"), 40123)).await
+        else {
+            panic!("expected EINVAL");
+        };
+        assert_eq!(error.code, "EINVAL");
+        assert_eq!(error.message, "bind EINVAL ::1:40123");
+        assert_eq!(error.port, Some(40123));
+        #[cfg(windows)]
+        assert_eq!(error.errno, Some(-4071));
+        #[cfg(unix)]
+        assert_eq!(error.errno, Some(-libc::EINVAL));
     }
 
     #[tokio::test]
@@ -1668,6 +1859,7 @@ mod tests {
         let pinned = ConnectOptions {
             attempt_timeout: Duration::from_millis(250),
             pin: Some(pin),
+            local: None,
         };
         let script = Script::new(&["10.9.9.9"], &[]);
         let _ = connect_with("ticket.example", 80, &pinned, &script).await;
@@ -1684,6 +1876,7 @@ mod tests {
         let pinned = ConnectOptions {
             attempt_timeout: Duration::from_millis(250),
             pin: Some(redeem_answer(&answers, 6, "one.example").unwrap()),
+            local: None,
         };
         let script = Script::new(&[], &[]);
         let Err(ConnectError::Single(error)) =

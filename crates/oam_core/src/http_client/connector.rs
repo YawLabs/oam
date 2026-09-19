@@ -516,6 +516,7 @@ impl OamConnector {
                 ConnectOptions {
                     attempt_timeout: self.shared.attempt_timeout(),
                     pin: None,
+                    local: None,
                 }
             }
             Via::Hooked {
@@ -546,6 +547,7 @@ impl OamConnector {
                 ConnectOptions {
                     attempt_timeout: *attempt_timeout,
                     pin,
+                    local: None,
                 }
             }
         };
@@ -638,6 +640,7 @@ impl Service<Uri> for ProxyTransport {
             let opts = ConnectOptions {
                 attempt_timeout: this.attempt_timeout,
                 pin: None,
+                local: None,
             };
             let tcp = dial(&host, port, &opts).await?;
             // The proxy's endpoints. Its own TLS session is not an origin's

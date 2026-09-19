@@ -2816,9 +2816,10 @@ fn op_https_serve(
 
 // ------------------------------------------------------------------- TCP
 
-/// `__oam.node.tcpConnect(host, port, attemptTimeout, spec?)`. `spec` is
-/// the optional address spec [`connect_pin_arg`] reads: without it the
-/// connect resolves `host` itself (getaddrinfo), as it always has.
+/// `__oam.node.tcpConnect(host, port, attemptTimeout, spec?, local?)`.
+/// `spec` is the optional address spec [`connect_pin_arg`] reads: without it
+/// the connect resolves `host` itself (getaddrinfo), as it always has.
+/// `local` is net.connect's localAddress / localPort ([`connect_local_arg`]).
 fn op_tcp_connect(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -2833,6 +2834,9 @@ fn op_tcp_connect(
     // connect; JS owns the value, so nothing is cached per runtime.
     let attempt_timeout = attempt_timeout_arg(scope, &args, 2);
     let Some(pin) = connect_pin_arg(scope, &args, 3, "tcpConnect", &host) else {
+        return;
+    };
+    let Some(local) = connect_local_arg(scope, &args, 4, "tcpConnect") else {
         return;
     };
     let net_resource = format!("{host}:{port}");
@@ -2861,7 +2865,7 @@ fn op_tcp_connect(
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::tcp::tcp_connect_pinned(tcp, ids, host, port, attempt_timeout, pin),
+        oam_core::tcp::tcp_connect_pinned(tcp, ids, host, port, attempt_timeout, pin, local),
     );
 }
 
@@ -3190,6 +3194,48 @@ fn connect_pin_arg(
     }
 }
 
+/// The optional local end a net / tls connect binds before dialling, as
+/// argument `index`: net.connect's `localAddress` / `localPort`, a JSON
+/// string `{"address"?: string, "port"?: number}` (JS has validated both as
+/// node does). `Some(None)` without one; anything else throws a TypeError,
+/// and `None` means an exception is pending.
+fn connect_local_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+    op: &str,
+) -> Option<Option<oam_core::net_connect::LocalBind>> {
+    let value = args.get(index);
+    if value.is_null_or_undefined() {
+        return Some(None);
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Local {
+        address: Option<String>,
+        port: Option<u16>,
+    }
+    let local = if value.is_string() {
+        let text = value.to_rust_string_lossy(scope);
+        serde_json::from_str::<Local>(&text).ok()
+    } else {
+        None
+    };
+    match local {
+        Some(Local { address, port }) => Some(Some(oam_core::net_connect::LocalBind {
+            address,
+            port: port.unwrap_or(0),
+        })),
+        None => {
+            throw_type_error(
+                scope,
+                &format!("{op}: the local end must be {{address?, port?}}"),
+            );
+            None
+        }
+    }
+}
+
 /// Every address a `lookup` hook answered, checked against the net grant
 /// exactly as a connect to that address named directly is (`addr:port`, the
 /// address spelled as the hook spelled it, which is the resource the op
@@ -3475,6 +3521,9 @@ fn op_tls_connect(
     let Some(pin) = connect_pin_arg(scope, &args, 10, "tlsConnect", &host) else {
         return;
     };
+    let Some(local) = connect_local_arg(scope, &args, 11, "tlsConnect") else {
+        return;
+    };
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
@@ -3515,6 +3564,7 @@ fn op_tls_connect(
             max_version,
             attempt_timeout,
             pin,
+            local,
         ),
     );
 }

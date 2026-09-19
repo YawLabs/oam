@@ -1217,6 +1217,7 @@ pub async fn tls_connect(
         max_version,
         attempt_timeout,
         None,
+        None,
     )
     .await
 }
@@ -1239,6 +1240,7 @@ pub async fn tls_connect_pinned(
     max_version: Option<String>,
     attempt_timeout: std::time::Duration,
     pin: Option<crate::net_connect::Pin>,
+    local: Option<crate::net_connect::LocalBind>,
 ) -> OpOutcome {
     let addr = format!("{host}:{port}");
 
@@ -1257,6 +1259,7 @@ pub async fn tls_connect_pinned(
     let opts = crate::net_connect::ConnectOptions {
         attempt_timeout,
         pin,
+        local,
     };
     let tcp = match crate::net_connect::connect(&host, port, &opts).await {
         Ok(connected) => connected.stream,
