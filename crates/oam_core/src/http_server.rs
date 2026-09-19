@@ -1789,11 +1789,22 @@ async fn dispatch_request(
         }
         headers.splice(0..0, pseudo);
     }
-    let uri = parts
-        .uri
-        .path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| parts.uri.path().to_string());
+    // node's req.url is the request target as the client wrote it. Over
+    // http/1.x that includes the ABSOLUTE form a client of a forward proxy
+    // sends (`GET http://host/p HTTP/1.1`), which a proxy written on this
+    // server reads to know where to send the request. Over h2 the URI is
+    // assembled from the pseudo-headers and node's compat req.url is
+    // `:path` alone.
+    let absolute_form = parts.version != hyper::Version::HTTP_2 && parts.uri.scheme().is_some();
+    let uri = if absolute_form {
+        parts.uri.to_string()
+    } else {
+        parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str().to_string())
+            .unwrap_or_else(|| parts.uri.path().to_string())
+    };
 
     let (tx, rx) = oneshot::channel::<ResponseSpec>();
     state

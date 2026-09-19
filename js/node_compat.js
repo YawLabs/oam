@@ -873,6 +873,11 @@
   codes.ERR_STREAM_DESTROYED = E("ERR_STREAM_DESTROYED", Error, function(name) {
     return 'Cannot call ' + (name || 'write') + ' after a stream was destroyed';
   });
+  // node's OutgoingMessage guard: `%s` is the operation ('render', 'set',
+  // 'remove', 'append').
+  codes.ERR_HTTP_HEADERS_SENT = E("ERR_HTTP_HEADERS_SENT", Error, function(what) {
+    return 'Cannot ' + what + ' headers after they are sent to the client';
+  });
   codes.ERR_STREAM_PREMATURE_CLOSE = E("ERR_STREAM_PREMATURE_CLOSE", Error, function() {
     return 'Premature close';
   });
@@ -18859,10 +18864,17 @@
         // reached the OTHER origin, and take_userinfo then sent the intended
         // origin to it as `Authorization: Basic base64(SAFE:GOOD)`.
         //
-        // A path that does not start with "/" is given one, so it can only
-        // ever be a path (node would send it verbatim, which its own servers
-        // answer with 400).
-        if (reqPath.charAt(0) !== "/") reqPath = "/" + reqPath;
+        // node writes `path` verbatim as the request target, in whichever
+        // form the caller chose: origin form (`/p?q`), absolute form for a
+        // forward proxy (`http://host/p` -- axios's `proxy` option,
+        // http-proxy-agent), authority form for CONNECT (`host:port` --
+        // tunnel, hpagent) or `*` for OPTIONS. So `this.path` stays as
+        // written and only the URL the fetch path DIALS is built from a copy
+        // forced into origin form. A target that is not origin form is sent
+        // over a socket this request dialled itself (`_agentPath` below),
+        // where the target is just bytes on a connection that already went
+        // to `hostname`:`port` and cannot move it.
+        var urlPath = reqPath.charAt(0) === "/" ? reqPath : "/" + reqPath;
         var authority = null;
         try {
           var probe = new URL(protocol + "//" + urlHost + "/");
@@ -18890,7 +18902,7 @@
         this._rawHost = authority === null ||
           (isIP(host) === 0 &&
             (authority.hostname !== host.toLowerCase() || host.charAt(0) === "["));
-        this._url = protocol + "//" + urlHost + ":" + port + reqPath;
+        this._url = protocol + "//" + urlHost + ":" + port + urlPath;
         this._headers = {};
         if (opts.headers) {
           var keys = Object.keys(opts.headers);
@@ -18898,22 +18910,13 @@
             this._headers[keys[i].toLowerCase()] = opts.headers[keys[i]];
           }
         }
-        // node lib/_http_client.js: `if (options.auth && !this.getHeader(
-        // 'Authorization')) this.setHeader('Authorization', 'Basic ' +
-        // Buffer.from(options.auth).toString('base64'))`. The bytes are the
-        // string's UTF-8 (measured: `auth: 'café:p'` sends
-        // `Basic Y2Fmw6k6cA==`), no colon is required, an empty `auth` sends
-        // nothing, and an explicit authorization header wins in either case.
-        // oam dropped the documented option entirely, so every caller using it
-        // -- and every `http.request('http://u:p@host/')`, whose userinfo IS
-        // this option -- talked to the server unauthenticated and got a 401.
-        if (opts.auth && this._headers["authorization"] === undefined) {
-          this._headers["authorization"] =
-            "Basic " + globalThis.Buffer.from(String(opts.auth), "utf8").toString("base64");
-        }
-        // The agent path writes the Host header itself (the fetch path's
-        // transport does): node's, IPv6 bracketed, the port unless it is the
-        // agent's default.
+        // node sets the Host header with setHeader() here, before the auth
+        // one and after the caller's (measured order: the caller's, Host,
+        // Authorization, Connection). It is an ORDINARY header from then on:
+        // getHeader('host') reads it back -- http-proxy-agent builds the
+        // absolute-form target it rewrites `path` to out of it, and without
+        // it aims every request at `localhost` -- and removeHeader('host')
+        // really drops it.
         this._setHost = opts.setHost !== undefined
           ? Boolean(opts.setHost)
           : opts.setDefaultHeaders !== false;
@@ -18928,6 +18931,26 @@
         }
         if (port && +port !== defaultPort) hostHeader += ":" + port;
         this._hostHeader = hostHeader;
+        if (this._setHost && this._headers.host === undefined) {
+          // node's setHeader() value check throws for a character no header
+          // may carry -- a host spelled with fullwidth digits, say -- before
+          // anything is resolved.
+          if (INVALID_HEADER_CHAR.test(hostHeader)) throw invalidHeaderChar("Host");
+          this._headers.host = hostHeader;
+        }
+        // node lib/_http_client.js: `if (options.auth && !this.getHeader(
+        // 'Authorization')) this.setHeader('Authorization', 'Basic ' +
+        // Buffer.from(options.auth).toString('base64'))`. The bytes are the
+        // string's UTF-8 (measured: `auth: 'café:p'` sends
+        // `Basic Y2Fmw6k6cA==`), no colon is required, an empty `auth` sends
+        // nothing, and an explicit authorization header wins in either case.
+        // oam dropped the documented option entirely, so every caller using it
+        // -- and every `http.request('http://u:p@host/')`, whose userinfo IS
+        // this option -- talked to the server unauthenticated and got a 401.
+        if (opts.auth && this._headers["authorization"] === undefined) {
+          this._headers["authorization"] =
+            "Basic " + globalThis.Buffer.from(String(opts.auth), "utf8").toString("base64");
+        }
         // node: the response head limit for this request (0 or absent: the
         // process-wide --max-http-header-size, http.maxHeaderSize), and
         // insecureHTTPParser, which does not lift it. Validated as node's
@@ -18958,16 +18981,21 @@
           );
         }
         this.insecureHTTPParser = insecureHTTPParser;
-        // node sets the Host header through setHeader(), whose value check
-        // throws for a character no header may carry -- a host spelled with
-        // fullwidth digits, say -- before anything is resolved.
-        if (this._setHost && this._headers.host === undefined && INVALID_HEADER_CHAR.test(this._hostHeader)) {
-          throw invalidHeaderChar("Host");
-        }
         this._body = [];
         this._ended = false;
         this._aborted = false;
         this.headersSent = false;
+        // node's OutgoingMessage internals a proxy agent reaches for. node
+        // renders the request head into `_header` when the message is sent
+        // and queues what follows in `outputData`; http-proxy-agent (v7-v9,
+        // under proxy-agent) nulls `_header`, rewrites `path` to absolute
+        // form, calls `_implicitHeader()` to re-render, and -- only if there
+        // is one -- patches the head at the front of `outputData`. oam
+        // renders the head when it actually sends, from the live `path` and
+        // headers, so nothing is ever queued ahead of it and `outputData`
+        // stays empty.
+        this._header = null;
+        this.outputData = [];
         // Node's ClientRequest is an OutgoingMessage: a LEGACY writable
         // stream -- no _writableState, lifecycle duck-read off plain
         // properties. The vendored end-of-stream keys on exactly these, so
@@ -19076,6 +19104,12 @@
           !!merged.socketPath ||
           // node binds the socket it connects to these; so does net.connect.
           !!merged.localAddress || !!merged.localPort ||
+          // A request target that is not origin form is written verbatim
+          // onto a socket of this request's own (see `urlPath` above), and
+          // CONNECT hands that socket to the caller -- neither is something
+          // oam's own transport, which carries a request as a URL, can do.
+          urlPath !== reqPath ||
+          this.method === "CONNECT" ||
           this._rawHost;
         // node dials the target itself unless its own global agent carries
         // the environment proxy (NODE_USE_ENV_PROXY=1): a request oam's
@@ -19126,6 +19160,27 @@
       }
       getHeaders() { return Object.assign({}, this._headers); }
       hasHeader(name) { return name.toLowerCase() in this._headers; }
+      // The request head as it goes on the wire: the request line, every
+      // header line, and the blank line that ends it -- node's `_header`.
+      _renderHead() {
+        var list = this._headerList(true);
+        var head = this.method + " " + this.path + " HTTP/1.1\r\n";
+        for (var i = 0; i < list.length; i++) head += list[i][0] + ": " + list[i][1] + "\r\n";
+        return head + "\r\n";
+      }
+      // node's ClientRequest.prototype._implicitHeader: render the head now,
+      // refusing a second render (a caller that means to re-render nulls
+      // `_header` first, as http-proxy-agent does).
+      _implicitHeader() {
+        if (this._header) throw codes.ERR_HTTP_HEADERS_SENT("render");
+        this._header = this._renderHead();
+      }
+      // node's headersSent is `!!this._header`: the head exists from the
+      // moment the message is sent.
+      _markHeadersSent() {
+        this.headersSent = true;
+        if (this._header === null) this._header = this._renderHead();
+      }
       flushHeaders() {
         // The fetch path sends headers with the body. The agent path sends
         // them now, the body following over the channel.
@@ -19219,7 +19274,7 @@
           // close Node's dead connection produces (test-stream-pipeline
           // pipes a Readable into a GET and waits on exactly that).
           if (this._sent) return;
-          this.headersSent = true;
+          this._markHeadersSent();
           if (!headersOnly) this._droppedWrites = true;
           this._dispatch(null);
           return;
@@ -19227,7 +19282,7 @@
         this._bodyStream = natives.fetchBodyChannelNew();
         const pending = this._body;
         this._body = [];
-        this.headersSent = true;
+        this._markHeadersSent();
         // Send now; the body follows over the channel.
         this._dispatch(null);
         for (const chunk of pending) {
@@ -19260,7 +19315,7 @@
         if (data != null) this.write(data, encoding);
         this._ended = true;
         this.finished = true;
-        this.headersSent = true;
+        this._markHeadersSent();
         var self = this;
         var bodyData = null;
         if (self._body.length > 0) {
@@ -19395,7 +19450,14 @@
         // and nothing goes out.
         if (socket.destroyed) return;
         var conn = String(this._headers["connection"] || "").toLowerCase();
-        if (fetchSocketWatched(socket, this.host) || conn.indexOf("upgrade") !== -1) {
+        // A CONNECT hands its socket to the caller, and a request target
+        // that is not origin form is written verbatim -- neither is
+        // something oam's own transport can do. The constructor already
+        // sends both over a socket; this catches a `path` an agent rewrote
+        // after it (http-proxy-agent's addRequest) on a request that was
+        // otherwise going over the transport.
+        if (fetchSocketWatched(socket, this.host) || conn.indexOf("upgrade") !== -1 ||
+            this.method === "CONNECT" || String(this.path).charAt(0) !== "/") {
           this._connectFetchSocket();
           return;
         }
@@ -19886,8 +19948,10 @@
         });
       }
 
-      // The request's header lines, in order: the caller's, then Host (node's
-      // rule), then -- for the bridge -- node's Connection header.
+      // The request's header lines in the order they were set -- the
+      // caller's, then Host, then Authorization (the constructor sets both
+      // as node does) -- and then, for a head this writes itself, node's
+      // Connection header.
       _headerList(forBridge) {
         var list = [];
         var headers = this._headers;
@@ -19900,7 +19964,6 @@
             list.push([names[i], String(value)]);
           }
         }
-        if (headers.host === undefined && this._setHost) list.push(["host", this._hostHeader]);
         if (forBridge) {
           var connection = this._connectionHeader();
           if (connection !== null) list.push(["connection", connection]);
@@ -19943,7 +20006,10 @@
         }
         var bodyData = this._pendingDispatch.bodyData;
         var conn = String(this._headers["connection"] || "").toLowerCase();
-        if (conn.indexOf("upgrade") !== -1) {
+        // node's parser treats a CONNECT exchange as an upgrade whatever the
+        // status: the socket carries the tunnel afterwards, so the head goes
+        // on it by hand and the answer is read off it, as for a 101.
+        if (this.method === "CONNECT" || conn.indexOf("upgrade") !== -1) {
           this._upgradeOver(socket, bodyData);
           return;
         }
@@ -20165,12 +20231,16 @@
         if (!socket.destroyed && typeof socket.resume === "function") socket.resume();
       }
 
-      // An upgrade over the socket: the request head written straight to it,
-      // the response head read off it, and on a 101 the socket handed to the
-      // 'upgrade' listener with whatever followed the head.
+      // An upgrade or a CONNECT over the socket: the request head written
+      // straight to it, the response head read off it, and -- on a 101, or on
+      // any answer to a CONNECT -- the socket handed to the 'upgrade' /
+      // 'connect' listener with whatever followed the head.
       _upgradeOver(socket, bodyData) {
         var self = this;
-        var list = this._headerList(false);
+        // node's _storeHeader adds its Connection header here too: an upgrade
+        // sets its own (so `_connectionHeader` adds none), and a CONNECT that
+        // sets none gets node's `keep-alive` / `close`.
+        var list = this._headerList(true);
         // This head is written by hand, so it gets the checks the bridge's
         // parser applies to every other request (node refuses the same
         // names and values at setHeader()): a token for the method and each
@@ -20193,6 +20263,9 @@
         }
         var head = this.method + " " + this.path + " HTTP/1.1\r\n";
         for (var h = 0; h < list.length; h++) head += list[h][0] + ": " + list[h][1] + "\r\n";
+        // What actually went out is what `_header` holds (an agent may have
+        // rewritten `path` since it was first rendered).
+        this._header = head + "\r\n";
         // The request is out once the socket has written its last piece.
         var written = function (err) {
           if (err) return;
@@ -20277,17 +20350,28 @@
           res.socket = res.connection = socket;
           res.req = self;
           self._responded = true;
-          if (statusCode === 101) {
+          // node's parserOnIncomingClient: a 101 is an upgrade, and the
+          // answer to a CONNECT is one too WHATEVER its status -- a 407 or a
+          // 502 with a body included, whose body bytes are simply the first
+          // bytes after the head. The event is 'connect' for a CONNECT and
+          // 'upgrade' otherwise (socketOnData), and with nothing listening
+          // for it the socket is destroyed.
+          var isConnect = self.method === "CONNECT";
+          if (isConnect || statusCode === 101) {
             // node: the socket leaves the agent and the request; its new
             // owner starts reading it.
+            res.upgrade = true;
+            res.complete = true;
+            self.res = res;
             self._responseDone = true;
             self._detachSocketListeners(socket);
             socket.emit("agentRemove");
             socket._httpMessage = null;
-            if (self.listenerCount("upgrade") === 0) {
+            var event = isConnect ? "connect" : "upgrade";
+            if (self.listenerCount(event) === 0) {
               socket.destroy();
             } else {
-              self.emit("upgrade", res, socket, remaining);
+              self.emit(event, res, socket, remaining);
             }
             self.destroyed = true;
             self._emitClose();

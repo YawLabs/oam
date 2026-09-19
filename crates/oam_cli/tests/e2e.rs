@@ -26483,3 +26483,200 @@ tcp.close();
          tcp listener reached 0"
     );
 }
+
+/// The proxy agents built on `http.request({ method: 'CONNECT' })` --
+/// `tunnel` (behind @actions/http-client, global-tunnel-ng, tunnel-agent) and
+/// `hpagent` -- get their tunnel: node emits 'connect' on the ClientRequest
+/// with the proxy's answer and the socket, whatever the status, and the
+/// agent's own request then runs over that socket. Up to 0.16.2 the agent's
+/// createConnection was ignored, so these requests quietly went DIRECT;
+/// honouring it turned them into a request that never settled, because a 2xx
+/// answer to a CONNECT was delivered as an ordinary 'response'. The packages
+/// are vendored under tests/fixtures/proxy-agents as published (tunnel 0.0.6,
+/// hpagent 1.2.0; MIT, each with its license).
+#[test]
+fn connect_tunnelling_proxy_agents_reach_their_target() {
+    let src = r#"
+import http from 'node:http';
+import net from 'node:net';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const tunnel = require('tunnel');
+const { HttpProxyAgent } = require('hpagent');
+
+const origin = http.createServer((req, res) => res.end(`origin ${req.method} ${req.url}`));
+await new Promise((r) => origin.listen(0, '127.0.0.1', r));
+const oport = origin.address().port;
+
+const seen = [];
+const proxy = http.createServer((req, res) => { res.writeHead(405); res.end('not a proxy request'); });
+proxy.on('connect', (req, client, head) => {
+  seen.push(`CONNECT ${req.url.replace(`:${oport}`, ':PORT')}`);
+  const up = net.connect(oport, '127.0.0.1', () => {
+    client.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    if (head && head.length) up.write(head);
+    up.pipe(client);
+    client.pipe(up);
+  });
+  up.on('error', () => client.destroy());
+  client.on('error', () => up.destroy());
+});
+await new Promise((r) => proxy.listen(0, '127.0.0.1', r));
+const pport = proxy.address().port;
+
+const get = (agent) => new Promise((resolve) => {
+  const req = http.get({ host: '127.0.0.1', port: oport, path: '/t', agent }, (res) => {
+    let body = '';
+    res.on('data', (d) => (body += d));
+    res.on('end', () => resolve(`${res.statusCode} ${body}`));
+  });
+  req.on('error', (e) => resolve(`error ${e.code} ${e.message}`));
+  const t = setTimeout(() => resolve('NEVER SETTLED'), 8000);
+  if (t.unref) t.unref();
+});
+
+console.log(`tunnel: ${await get(tunnel.httpOverHttp({ proxy: { host: '127.0.0.1', port: pport } }))}`);
+const hp = new HttpProxyAgent({ proxy: `http://127.0.0.1:${pport}` });
+console.log(`hpagent: ${await get(hp)}`);
+
+// The answer to a CONNECT reaches 'connect' whatever its status, with the
+// bytes behind the head as the tunnel's first bytes, and with no listener
+// the socket is destroyed (node's socketOnData).
+const refusing = net.createServer((c) => {
+  c.on('error', () => {});
+  c.once('data', () => c.write('HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 4\r\n\r\nnope'));
+});
+await new Promise((r) => refusing.listen(0, '127.0.0.1', r));
+const rport = refusing.address().port;
+const refused = await new Promise((resolve) => {
+  const req = http.request({ host: '127.0.0.1', port: rport, method: 'CONNECT', path: 'target.test:443', agent: false });
+  req.on('connect', (res, socket, head) => {
+    socket.destroy();
+    resolve(`connect ${res.statusCode} head ${JSON.stringify(head.toString())} upgrade ${res.upgrade}`);
+  });
+  req.on('response', (res) => { res.resume(); resolve(`response ${res.statusCode}`); });
+  req.on('error', (e) => resolve(`error ${e.code}`));
+  req.end();
+});
+console.log(`refusing proxy: ${refused}`);
+const unhandled = await new Promise((resolve) => {
+  const req = http.request({ host: '127.0.0.1', port: rport, method: 'CONNECT', path: 'target.test:443', agent: false });
+  req.on('response', (res) => { res.resume(); resolve('response'); });
+  req.on('error', (e) => resolve(`error ${e.code}`));
+  req.on('close', () => resolve(`close, destroyed ${req.destroyed}`));
+  req.end();
+});
+console.log(`no connect listener: ${unhandled}`);
+console.log(`proxy saw: ${seen.join(' / ')}`);
+origin.close(); proxy.close(); refusing.close(); hp.destroy?.();
+"#;
+    let main = write_temp("connect-proxy-agents-project/main.mjs", src);
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/proxy-agents");
+    copy_tree(&fixture, &main.parent().unwrap().join("node_modules"));
+    let out = oam(&["run", main.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "tunnel: 200 origin GET /t\n\
+         hpagent: 200 origin GET /t\n\
+         refusing proxy: connect 407 head \"nope\" upgrade true\n\
+         no connect listener: close, destroyed true\n\
+         proxy saw: CONNECT 127.0.0.1:PORT / CONNECT 127.0.0.1:PORT",
+        "stderr: {stderr}"
+    );
+}
+
+/// http-proxy-agent (TooTallNate; v7 to v9, and so proxy-agent) sends an
+/// http:// request through a forward proxy by rewriting `req.path` to the
+/// absolute form of the target URL -- which it builds from
+/// `req.getHeader('host')` -- and re-rendering the head with
+/// `req._implicitHeader()`. So the request target goes on the wire as
+/// written, an unsent Host header is readable, and `_implicitHeader` exists.
+/// Up to 0.16.2 the agent was ignored and the request went direct; honouring
+/// it then failed with `req._implicitHeader is not a function`. The packages
+/// are vendored under tests/fixtures/proxy-agents as published
+/// (http-proxy-agent 7.0.2, agent-base 7.1.4, debug 4.4.3, ms 2.1.3; MIT).
+#[test]
+fn http_proxy_agent_sends_an_absolute_form_request_to_the_proxy() {
+    let src = r#"
+import http from 'node:http';
+import { createRequire } from 'node:module';
+const { HttpProxyAgent } = createRequire(import.meta.url)('http-proxy-agent');
+
+const origin = http.createServer((req, res) => res.end(`origin ${req.url}`));
+await new Promise((r) => origin.listen(0, '127.0.0.1', r));
+const oport = origin.address().port;
+
+const seen = [];
+const proxy = http.createServer((req, res) => {
+  seen.push(`${req.method} ${req.url.replace(`:${oport}`, ':PORT')}`);
+  let target;
+  try {
+    target = new URL(req.url);
+  } catch {
+    res.writeHead(400);
+    res.end(`the proxy cannot read the target ${req.url}`);
+    return;
+  }
+  const up = http.request(
+    { host: target.hostname, port: target.port, path: target.pathname + target.search, method: req.method },
+    (r2) => { res.writeHead(r2.statusCode, r2.headers); r2.pipe(res); },
+  );
+  up.on('error', (e) => { res.writeHead(502); res.end(`upstream ${e.code}`); });
+  req.pipe(up);
+});
+await new Promise((r) => proxy.listen(0, '127.0.0.1', r));
+const pport = proxy.address().port;
+
+const agent = new HttpProxyAgent(`http://127.0.0.1:${pport}`);
+const answer = await new Promise((resolve) => {
+  const req = http.get({ host: '127.0.0.1', port: oport, path: '/a?b=1', agent }, (res) => {
+    let body = '';
+    res.on('data', (d) => (body += d));
+    res.on('end', () => resolve(`${res.statusCode} ${body}`));
+  });
+  req.on('error', (e) => resolve(`error ${e.code} ${e.message.split('\n')[0]}`));
+  const t = setTimeout(() => resolve('NEVER SETTLED'), 8000);
+  if (t.unref) t.unref();
+});
+console.log(`through the proxy: ${answer}`);
+console.log(`proxy saw: ${seen.join(' / ')}`);
+
+// What the agent reaches for, on a plain request.
+const probe = http.request({ host: '127.0.0.1', port: oport, path: '/p' });
+probe.on('error', () => {});
+console.log(`host header readable: ${probe.getHeader('host') === `127.0.0.1:${oport}`}`);
+console.log(`_implicitHeader: ${typeof probe._implicitHeader}, outputData: ${Array.isArray(probe.outputData)}, _header before: ${probe._header}`);
+probe._implicitHeader();
+console.log(`_header request line: ${probe._header.split('\r\n')[0]}`);
+try {
+  probe._implicitHeader();
+  console.log('second render: no error');
+} catch (e) {
+  console.log(`second render: ${e.code}`);
+}
+probe.destroy();
+origin.close(); proxy.close(); agent.destroy?.();
+"#;
+    let main = write_temp("http-proxy-agent-project/main.mjs", src);
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/proxy-agents");
+    copy_tree(&fixture, &main.parent().unwrap().join("node_modules"));
+    let out = oam(&["run", main.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "through the proxy: 200 origin /a?b=1\n\
+         proxy saw: GET http://127.0.0.1:PORT/a?b=1\n\
+         host header readable: true\n\
+         _implicitHeader: function, outputData: true, _header before: null\n\
+         _header request line: GET /p HTTP/1.1\n\
+         second render: ERR_HTTP_HEADERS_SENT",
+        "stderr: {stderr}"
+    );
+}

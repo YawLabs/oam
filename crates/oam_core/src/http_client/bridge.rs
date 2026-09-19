@@ -21,8 +21,9 @@
 //! the whole request, once hyper has written all of them: node emits
 //! `'finish'` when the socket has written the last of those.
 //!
-//! Upgrades (`Connection: upgrade`) do not come here: JS writes and parses
-//! those itself so the socket can be handed over after the 101.
+//! Upgrades (`Connection: upgrade`) and CONNECT requests do not come here:
+//! JS writes and parses those itself so the socket can be handed over after
+//! the 101, or to the 'connect' listener that tunnels through it.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -281,13 +282,42 @@ fn latin1_bytes(text: &str, what: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-/// The request target as a `Uri`. node writes its path verbatim, one byte
-/// per code point (any byte 0x21-0xFF); `http::Uri` refuses a few of those,
-/// so a target it will not hold is percent-encoded byte by byte where it has
-/// to be.
+/// True for a target in absolute form (`http://host/p`), which a request to
+/// a forward proxy carries: a scheme, then `://`.
+fn is_absolute_form(target: &[u8]) -> bool {
+    let Some(end) = target.iter().position(|&b| b == b':') else {
+        return false;
+    };
+    if end == 0 || !target[end..].starts_with(b"://") {
+        return false;
+    }
+    target[0].is_ascii_alphabetic()
+        && target[1..end]
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.'))
+}
+
+/// The request target as a `Uri`, spelled so that hyper writes it back
+/// byte for byte (it writes `Display`).
+///
+/// node writes `path` verbatim, one byte per code point (any byte
+/// 0x21-0xFF), in whichever form the caller chose. Only absolute form is
+/// parsed as a whole URI; origin form (`/p?q`), `*` and `?q` become the
+/// URI's path-and-query; an authority-form target (`host:port`) is held as
+/// the authority. `http::Uri` refuses a few bytes node allows, so a target
+/// it will not hold is percent-encoded byte by byte where it has to be.
+///
+/// An opaque target `http::Uri` cannot spell at all -- `abc?d=1`, which is
+/// neither an authority (no query allowed) nor a path (no leading `/`) --
+/// is sent in origin form, `/abc?d=1`, rather than failing the request:
+/// node sends it as written and every server answers 400. (Recorded in
+/// docs/node-divergences.md.)
+///
+/// This only ever names the target on a connection that is already open to
+/// the host the request dialled, so it cannot move where the request goes.
 fn target_uri(target: &str) -> Result<http::Uri, String> {
     let bytes = latin1_bytes(target, "the request target")?;
-    if let Ok(uri) = http::Uri::from_maybe_shared(Bytes::from(bytes.clone())) {
+    if let Ok(uri) = hold_target(Bytes::from(bytes.clone())) {
         return Ok(uri);
     }
     let mut encoded = String::with_capacity(target.len() * 3);
@@ -303,9 +333,49 @@ fn target_uri(target: &str) -> Result<http::Uri, String> {
             let _ = write!(encoded, "%{byte:02X}");
         }
     }
-    encoded
-        .parse::<http::Uri>()
+    if let Ok(uri) = hold_target(Bytes::from(encoded.clone())) {
+        return Ok(uri);
+    }
+    hold_target(Bytes::from(format!("/{encoded}")))
         .map_err(|e| format!("invalid request target: {e}"))
+}
+
+/// One attempt at [`target_uri`]'s spelling, for the bytes as given.
+fn hold_target(bytes: Bytes) -> Result<http::Uri, String> {
+    let held = |e: http::Error| e.to_string();
+    // Absolute form: a whole URI, which is how hyper writes it back.
+    if is_absolute_form(&bytes) {
+        return http::Uri::from_maybe_shared(bytes).map_err(|e| held(e.into()));
+    }
+    // Origin form, `*` and a bare query: the URI's path-and-query, written
+    // back as it is.
+    if bytes
+        .first()
+        .is_some_and(|&b| b == b'/' || b == b'*' || b == b'?')
+    {
+        let path = http::uri::PathAndQuery::from_maybe_shared(bytes).map_err(|e| held(e.into()))?;
+        let mut parts = http::uri::Parts::default();
+        parts.path_and_query = Some(path);
+        return http::Uri::from_parts(parts).map_err(|e| held(e.into()));
+    }
+    // Anything else -- authority form, or an opaque target -- is held only
+    // if `Display` gives it back unchanged.
+    let target = std::str::from_utf8(&bytes)
+        .map_err(|e| e.to_string())?
+        .to_owned();
+    let uri = http::Uri::from_maybe_shared(bytes).map_err(|e| held(e.into()))?;
+    if uri.to_string() != target {
+        return Err(format!("{target:?} cannot be written back as itself"));
+    }
+    Ok(uri)
+}
+
+/// True when `target_uri` gives hyper the target back byte for byte (see
+/// its doc comment): everything but an absolute form with no path, which
+/// gains the `/` every proxy expects.
+#[cfg(test)]
+fn target_round_trips(target: &str) -> bool {
+    target_uri(target).is_ok_and(|uri| *uri.to_string() == *target)
 }
 
 fn build_parts(req: &BridgeRequest) -> Result<http::request::Parts, String> {
@@ -587,4 +657,69 @@ pub fn close(bridges: &Bridges, id: u64) -> bool {
 /// How many bridges are open.
 pub fn open(bridges: &Bridges) -> usize {
     lock(bridges).len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// hyper writes the request target as the URI's `Display`, so every form
+    /// node can put in `path` has to come back byte for byte -- origin form,
+    /// absolute form for a forward proxy, authority form for CONNECT, `*`,
+    /// and the opaque targets in between.
+    #[test]
+    fn target_uri_round_trips_every_request_target_form() {
+        for target in [
+            "/",
+            "/p?q=1",
+            "/p?q=1&r=%20",
+            "/a:b/c",
+            "/p?q=a:b//c",
+            "*",
+            "http://abs.test:81/p?q=1",
+            "https://abs.test/p",
+            "http://user@abs.test/p",
+            "opaque",
+            "example.test:443",
+            "[::1]:8443",
+        ] {
+            assert!(target_round_trips(target), "target {target:?}");
+        }
+    }
+
+    /// A byte `http::Uri` will not hold is percent-encoded rather than
+    /// refused, and the target still reaches hyper.
+    #[test]
+    fn target_uri_encodes_what_the_uri_type_refuses() {
+        assert_eq!(target_uri("/a b").unwrap().to_string(), "/a%20b");
+        assert_eq!(target_uri("/caf\u{00e9}").unwrap().to_string(), "/caf%E9");
+    }
+
+    /// The two spellings `http::Uri` cannot hold as written, both recorded
+    /// in docs/node-divergences.md: an absolute form with no path gains the
+    /// `/`, and an opaque target that is neither an authority (a query is
+    /// not allowed in one) nor a path (no leading `/`) is sent in origin
+    /// form rather than failing the request.
+    #[test]
+    fn target_uri_falls_back_where_the_uri_type_cannot_spell_it() {
+        assert_eq!(target_uri("http://h").unwrap().to_string(), "http://h/");
+        assert_eq!(target_uri("abc?d=1").unwrap().to_string(), "/abc?d=1");
+    }
+
+    /// Past U+00FF there is no byte to send (node writes latin1).
+    #[test]
+    fn target_uri_refuses_a_character_that_is_not_a_byte() {
+        assert!(target_uri("/\u{1f600}").is_err());
+    }
+
+    #[test]
+    fn absolute_form_is_a_scheme_then_slash_slash() {
+        assert!(is_absolute_form(b"http://h/p"));
+        assert!(is_absolute_form(b"a+b-c.d://h"));
+        assert!(!is_absolute_form(b"/p://q"));
+        assert!(!is_absolute_form(b"://h"));
+        assert!(!is_absolute_form(b"1http://h"));
+        assert!(!is_absolute_form(b"host:443"));
+        assert!(!is_absolute_form(b"*"));
+    }
 }
