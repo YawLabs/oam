@@ -1217,11 +1217,16 @@ What still differs:
   already delivered stay delivered, and only the chunk boundary at which it stops differs),
   and `text()` / `arrayBuffer()` / `json()` called afterwards reject with undici's own
   `AbortError` `The operation was aborted.` rather than the reason, as Node's do.
-- **TLS verdicts carry no code.** A `fetch` to a server whose certificate does not verify
-  rejects with the uncoded cause `error sending request for url (https://host:port/)`, and the
-  verifying `https.request` emits `ECONNRESET` `socket hang up`. Node reports the verdict:
-  `self-signed certificate`, `code` `DEPTH_ZERO_SELF_SIGNED_CERT`, on both. (`tls.connect`
-  reports Node's verdict codes since #136.)
+- **TLS verdicts carry Node's code** (case 129): a certificate the platform verifier refuses
+  is named as Node names it -- `UNABLE_TO_VERIFY_LEAF_SIGNATURE`,
+  `DEPTH_ZERO_SELF_SIGNED_CERT`, `SELF_SIGNED_CERT_IN_CHAIN`,
+  `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`, `CERT_HAS_EXPIRED`, `ERR_TLS_CERT_ALTNAME_INVALID`,
+  ... with Node's message -- as `fetch`'s cause and as the error `https.request` emits, the
+  classification `tls.connect` uses (#136). Up to 0.16.2 `fetch`'s cause was the uncoded
+  `error sending request for url (...)` and `https.request` emitted `ECONNRESET` `socket hang
+  up`. A refusal the platform verifier makes for a reason Node has no name for (an OS
+  policy, say) keeps those old texts. Whether a certificate is accepted is still the
+  platform verifier's call (next item).
 - **The trust store is the operating system's.** `fetch` and the verifying `https.request`
   verify with the platform verifier plus `NODE_EXTRA_CA_CERTS`; Node's `fetch`, and
   `tls.connect` in both runtimes, use Mozilla's bundled roots plus `NODE_EXTRA_CA_CERTS`. A

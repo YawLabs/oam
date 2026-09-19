@@ -425,6 +425,99 @@ impl VerifyFailure {
     }
 }
 
+/// A refusal in Node's terms carried out of a verifier that is not
+/// [`NodeCertVerifier`] -- the fetch transport's platform verifier -- as
+/// `CertificateError::Other`, so the transport can report Node's code
+/// (`http_client::transport`).
+#[derive(Debug)]
+pub struct NodeCertRefusal(pub VerifyFailure);
+
+impl std::fmt::Display for NodeCertRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0.message)
+    }
+}
+
+impl std::error::Error for NodeCertRefusal {}
+
+/// Node's name for a certificate another verifier refused with `error`: the
+/// validity period first (OpenSSL's precedence, as in
+/// [`NodeCertVerifier::verdict`]), then the refusal itself -- a name mismatch
+/// by Node's `checkServerIdentity`, an unknown issuer by the chain the peer
+/// presented. None when Node has no name for it (or its own check would
+/// have accepted the name), and the caller keeps the error it had.
+pub(crate) fn refusal_in_node_terms(
+    end_entity: &CertificateDer<'_>,
+    intermediates: &[CertificateDer<'_>],
+    server_name: &ServerName<'_>,
+    now: UnixTime,
+    error: &rustls::Error,
+) -> Option<VerifyFailure> {
+    if let Some((failure, _)) = validity_refusal(end_entity, now) {
+        return Some(failure);
+    }
+    let rustls::Error::InvalidCertificate(reason) = error else {
+        return None;
+    };
+    match reason {
+        CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
+            check_server_identity(server_name, end_entity.as_ref()).err()
+        }
+        CertificateError::UnknownIssuer => {
+            Some(classify_unknown_issuer(end_entity, intermediates, &[]))
+        }
+        reason => named_refusal(reason),
+    }
+}
+
+/// A leaf outside its validity period: `CERT_HAS_EXPIRED` /
+/// `CERT_NOT_YET_VALID`, whatever else is wrong with it.
+fn validity_refusal(
+    end_entity: &CertificateDer<'_>,
+    now: UnixTime,
+) -> Option<(VerifyFailure, rustls::Error)> {
+    let (_, leaf) = parse_x509_certificate(end_entity.as_ref()).ok()?;
+    let at = ASN1Time::from_timestamp(now.as_secs() as i64).ok()?;
+    let validity = leaf.validity();
+    if at.timestamp() > validity.not_after.timestamp() {
+        return Some((
+            VerifyFailure::named("CERT_HAS_EXPIRED", "certificate has expired"),
+            CertificateError::Expired.into(),
+        ));
+    }
+    if at.timestamp() < validity.not_before.timestamp() {
+        return Some((
+            VerifyFailure::named("CERT_NOT_YET_VALID", "certificate is not yet valid"),
+            CertificateError::NotValidYet.into(),
+        ));
+    }
+    None
+}
+
+/// The refusals whose Node name follows from rustls's reason alone.
+fn named_refusal(reason: &CertificateError) -> Option<VerifyFailure> {
+    Some(match reason {
+        CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
+            VerifyFailure::named("CERT_HAS_EXPIRED", "certificate has expired")
+        }
+        CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => {
+            VerifyFailure::named("CERT_NOT_YET_VALID", "certificate is not yet valid")
+        }
+        CertificateError::Revoked => VerifyFailure::named("CERT_REVOKED", "certificate revoked"),
+        CertificateError::BadSignature => {
+            VerifyFailure::named("CERT_SIGNATURE_FAILURE", "certificate signature failure")
+        }
+        CertificateError::InvalidPurpose | CertificateError::InvalidPurposeContext { .. } => {
+            VerifyFailure::named("INVALID_PURPOSE", "unsupported certificate purpose")
+        }
+        CertificateError::UnhandledCriticalExtension => VerifyFailure::named(
+            "UNHANDLED_CRITICAL_EXTENSION",
+            "unhandled critical extension",
+        ),
+        _ => return None,
+    })
+}
+
 /// Where the verifier leaves its verdict for `tls_connect` to read after
 /// the handshake: None means the certificate was accepted.
 type VerifySlot = Arc<Mutex<Option<VerifyFailure>>>;
@@ -531,22 +624,8 @@ impl NodeCertVerifier {
         server_name: &ServerName<'_>,
         now: UnixTime,
     ) -> Result<(), (VerifyFailure, rustls::Error)> {
-        if let Ok((_, leaf)) = parse_x509_certificate(end_entity.as_ref())
-            && let Ok(at) = ASN1Time::from_timestamp(now.as_secs() as i64)
-        {
-            let validity = leaf.validity();
-            if at.timestamp() > validity.not_after.timestamp() {
-                return Err((
-                    VerifyFailure::named("CERT_HAS_EXPIRED", "certificate has expired"),
-                    CertificateError::Expired.into(),
-                ));
-            }
-            if at.timestamp() < validity.not_before.timestamp() {
-                return Err((
-                    VerifyFailure::named("CERT_NOT_YET_VALID", "certificate is not yet valid"),
-                    CertificateError::NotValidYet.into(),
-                ));
-            }
+        if let Some(refused) = validity_refusal(end_entity, now) {
+            return Err(refused);
         }
 
         if self
@@ -586,12 +665,6 @@ impl NodeCertVerifier {
                     return check_server_identity(server_name, end_entity.as_ref())
                         .map_err(|failure| (failure, error));
                 }
-                CertificateError::Expired | CertificateError::ExpiredContext { .. } => {
-                    VerifyFailure::named("CERT_HAS_EXPIRED", "certificate has expired")
-                }
-                CertificateError::NotValidYet | CertificateError::NotValidYetContext { .. } => {
-                    VerifyFailure::named("CERT_NOT_YET_VALID", "certificate is not yet valid")
-                }
                 CertificateError::UnknownIssuer => classify(),
                 // webpki refuses a CA:TRUE leaf before it looks for an
                 // issuer; OpenSSL reads the same chain as "nobody I trust
@@ -604,24 +677,10 @@ impl NodeCertVerifier {
                 {
                     classify()
                 }
-                CertificateError::Revoked => {
-                    VerifyFailure::named("CERT_REVOKED", "certificate revoked")
-                }
-                CertificateError::BadSignature => {
-                    VerifyFailure::named("CERT_SIGNATURE_FAILURE", "certificate signature failure")
-                }
-                CertificateError::InvalidPurpose
-                | CertificateError::InvalidPurposeContext { .. } => {
-                    VerifyFailure::named("INVALID_PURPOSE", "unsupported certificate purpose")
-                }
-                CertificateError::UnhandledCriticalExtension => VerifyFailure::named(
-                    "UNHANDLED_CRITICAL_EXTENSION",
-                    "unhandled critical extension",
-                ),
-                _ => VerifyFailure {
+                reason => named_refusal(reason).unwrap_or_else(|| VerifyFailure {
                     code: None,
                     message: error.to_string(),
-                },
+                }),
             },
             _ => VerifyFailure {
                 code: None,

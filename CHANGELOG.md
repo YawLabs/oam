@@ -84,6 +84,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   oam it chose its fetch adapter instead, which ignores `httpAgent` / `httpsAgent` -- the
   agents guard packages such as request-filtering-agent hand it. `process` now carries
   node's `Symbol.toStringTag`.
+- **A refused certificate was reported as `socket hang up`.** On oam's own transport an
+  `https.request` whose server certificate did not verify failed with `ECONNRESET`
+  `socket hang up`, and `fetch`'s cause carried no code, where the same request over
+  `tls.connect` had node's: retry logic that retries `ECONNRESET` retried a refused
+  certificate. Both now report node's code and message (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`,
+  `DEPTH_ZERO_SELF_SIGNED_CERT`, `CERT_HAS_EXPIRED`, ...).
 - **TLS options of `https.request` were not applied.** A verifying `https.request` went
   through one shared client that ignored the request's `ca`, client certificate,
   `servername` and `checkServerIdentity`, and `tls.connect` never called a

@@ -304,6 +304,14 @@ impl SendError {
         if let Some(connect) = self.connect_error() {
             return connect.to_outcome();
         }
+        // A certificate refused in Node's terms (tls_config's
+        // NodeNamedRefusals): its code and message, as tls.connect reports
+        // them.
+        if let Some(refusal) = node_cert_refusal(&self.error)
+            && let Some(code) = refusal.code
+        {
+            return OpOutcome::node_failed(code, refusal.message.clone());
+        }
         if let Some(tls) = find_in_chain::<TlsSetupError>(&self.error) {
             return OpOutcome::Failed(tls.to_string());
         }
@@ -384,6 +392,25 @@ impl std::error::Error for SendError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(&self.error)
     }
+}
+
+/// The Node-named certificate refusal in `error`'s chain, if the handshake
+/// failed with one. tokio-rustls hands the rustls error over as an
+/// `io::Error`'s payload, which `source()` does not reach -- hence the
+/// `get_ref`.
+fn node_cert_refusal<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a crate::tls::VerifyFailure> {
+    let io = find_in_chain::<std::io::Error>(error)?;
+    let rustls::Error::InvalidCertificate(rustls::CertificateError::Other(other)) =
+        io.get_ref()?.downcast_ref::<rustls::Error>()?
+    else {
+        return None;
+    };
+    other
+        .0
+        .downcast_ref::<crate::tls::NodeCertRefusal>()
+        .map(|refusal| &refusal.0)
 }
 
 fn find_in_chain<'a, T: std::error::Error + 'static>(

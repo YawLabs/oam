@@ -18887,6 +18887,10 @@
             // node's parser error (an oversized response head): emitted as
             // node emits it, with its `reason`.
             mapped = withParseReason(cause);
+          } else if (cause && typeof cause.code === "string" && TLS_CERT_REFUSALS.has(cause.code)) {
+            // The certificate refused, in node's terms (the code and message
+            // tls.connect reports): the TLS socket's error node emits.
+            mapped = cause;
           } else if (/connection refused|ECONNREFUSED/i.test(detail)) {
             mapped = Object.assign(new Error("connect ECONNREFUSED"), {
               code: "ECONNREFUSED",
@@ -20354,6 +20358,15 @@
     }
 
     var INVALID_HEADER_CHAR = /[^\t\x20-\x7e\x80-\xff]/;
+    // The certificate refusals oam names as node does (oam_core tls.rs
+    // VerifyFailure): what an https request fails with when the server's
+    // certificate is refused.
+    var TLS_CERT_REFUSALS = new Set([
+      "CERT_HAS_EXPIRED", "CERT_NOT_YET_VALID", "CERT_REVOKED", "CERT_SIGNATURE_FAILURE",
+      "DEPTH_ZERO_SELF_SIGNED_CERT", "ERR_TLS_CERT_ALTNAME_INVALID", "INVALID_PURPOSE",
+      "SELF_SIGNED_CERT_IN_CHAIN", "UNABLE_TO_GET_ISSUER_CERT", "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+      "UNABLE_TO_VERIFY_LEAF_SIGNATURE", "UNHANDLED_CRITICAL_EXTENSION",
+    ]);
     // node's checkIsHttpToken (lib/_http_common.js), and the two errors its
     // header checks throw.
     var HTTP_TOKEN = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
