@@ -101,6 +101,8 @@ pub enum RedirectMode {
     Follow,
     /// Return it as the response.
     Manual,
+    /// Fail the fetch on a redirect status (undici's "error").
+    Error,
 }
 
 /// Parked hook-mode fetches by continuation token (ids from the runtime's
@@ -441,8 +443,16 @@ async fn run(
             }
         };
 
-        if state.redirect == RedirectMode::Manual {
-            break response;
+        match state.redirect {
+            RedirectMode::Manual => break response,
+            // undici checks the status alone: a 3xx without a Location fails
+            // too, and nothing is requested from where it points.
+            RedirectMode::Error if redirect::is_redirect_status(response.status().as_u16()) => {
+                drop(response);
+                state.source.request_failed();
+                return OpOutcome::Failed(redirect::UNEXPECTED_REDIRECT.to_string());
+            }
+            RedirectMode::Error | RedirectMode::Follow => {}
         }
         let location = redirect::location(response.headers());
         match redirect::next(

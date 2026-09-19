@@ -44,6 +44,11 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 - **`http.request` followed redirects.** node's `http.request` returns a `3xx` as the
   response; oam's followed it, so a request whose URL an application had vetted could
   end at a host it never named. It now returns the `3xx`, as node does.
+- **`fetch` ignored `redirect: 'manual'` and `redirect: 'error'`.** Every redirect was
+  followed, so an application that asks for `'manual'` to vet each hop before following
+  it got the target's response instead. `'manual'` now returns the `3xx` and `'error'`
+  rejects with node's `unexpected redirect` cause, and a value outside the enum is
+  refused, as in node.
 - **`http.request` dialled a rewritten host.** On oam's own transport a request's
   `host` went through the URL parser, which turns spellings node's resolver refuses --
   percent-escapes, octal or zero-padded IPv4, a trailing dot, a tab, fullwidth digits --

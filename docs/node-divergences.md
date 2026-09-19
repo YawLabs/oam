@@ -1313,16 +1313,19 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
 
 **Redirects**
 
-- **`redirect: 'manual'` and `'error'` are not implemented**: every redirect is followed
-  (#149).
+- **`redirect: 'manual'` and `'error'` behave as Node's** (case 126): `'manual'` returns the
+  `3xx` itself (`redirected` false, `url` the request's) and never requests the target;
+  `'error'` rejects with `TypeError: fetch failed`, cause `unexpected redirect`, on a 301,
+  302, 303, 307 or 308 with or without a `Location`; a value outside the enum is refused
+  with Node's `Request constructor: ... is not an accepted type` message. Up to 0.16.2 every
+  redirect was followed whatever the option said. `Response.type` is not implemented.
 - **A `Location` that does not parse** fails the fetch with a plain `Error('Invalid URL')` as
   the `cause` (own keys `stack`, `message`); Node's is a `TypeError` with `code`
   `ERR_INVALID_URL`, `input` and `base`. Case 111 prints only the message.
-- **`http.request` on this transport follows redirects** (#148), by the same rules as `fetch`: 20 hops, no
-  `Referer`, credentials dropped for good after a cross-origin hop, and the bad-port block on
-  every hop -- though not on the URL it was given, which Node's `http.request` dials whatever
-  the port. It also decodes the body, as `fetch` does (entry 32). Node's `http.request` does
-  neither, and neither does a request sent over an agent's socket (entry 39).
+- **`http.request` on this transport returns a `3xx` as the response**, as Node's does (it
+  asks the transport for `'manual'`); up to 0.16.2 it followed redirects by `fetch`'s rules.
+  It also decodes the body, as `fetch` does (entry 32). Node's `http.request` does not, and
+  neither does a request sent over an agent's socket (entry 39).
 - **A hop that lands on a pooled connection the server has just closed.** oam's redirect loop
   has no event-loop tick between the 3xx and the hop, so against a server that sends the 3xx
   with keep-alive and then FINs, the hop can be written before the server's FIN arrives.

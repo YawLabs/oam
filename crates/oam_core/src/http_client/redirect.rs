@@ -44,6 +44,9 @@ pub const CREDENTIALS: &str = "cross origin not allowed for request mode \"cors\
 /// fetch/index.js:541-543, run by `mainFetch` for the hop the redirect starts
 /// (fetch/index.js:1351). See [`super::prepare::is_bad_port`].
 pub const BAD_PORT: &str = "bad port";
+/// fetch/index.js `httpFetch`: a redirect status under `redirect: "error"`
+/// is `makeNetworkError('unexpected redirect')`, Location or not.
+pub const UNEXPECTED_REDIRECT: &str = "unexpected redirect";
 
 /// What to do with a response.
 #[derive(Debug, Clone, PartialEq, Eq)]

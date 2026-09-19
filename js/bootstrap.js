@@ -1265,6 +1265,18 @@
     // `http.request` and the http2 client set these headers legitimately in
     // node and are not subject to either set.
     const dispatchSemantics = fetchSemantics || init.__oamDispatchSemantics === true;
+    // fetch's `redirect` (RequestInit's RequestRedirect enum): the Request
+    // constructor converts init first, so a value outside the enum is
+    // refused before the URL is even parsed, with webidl's message.
+    let redirectMode;
+    if (fetchSemantics && init.redirect !== undefined) {
+      redirectMode = String(init.redirect);
+      if (redirectMode !== "follow" && redirectMode !== "manual" && redirectMode !== "error") {
+        throw new TypeError(
+          `Request constructor: ${redirectMode} is not an accepted type. Expected one of follow, manual, error.`,
+        );
+      }
+    }
     const rawUrl = wellFormed(input);
     if (fetchSemantics) {
       // node parses the URL in the Request constructor, so a bad URL is a URL
@@ -1353,6 +1365,12 @@
     // redirect, and an application that vets a URL before requesting it
     // relies on that.
     if (rawPayload && init.__oamManualRedirect === true) request.redirect = "manual";
+    // fetch's own `redirect: "manual"` returns the 3xx (its status, headers
+    // and body; `redirected` false, `url` the request's) and `"error"` fails
+    // on a redirect status with cause `unexpected redirect`, as node's do:
+    // an application asking for either vets each hop itself, and the
+    // target must not be requested behind its back.
+    if (redirectMode === "manual" || redirectMode === "error") request.redirect = redirectMode;
     // http.request's own maxHeaderSize for the response heads (without it
     // the transport applies the process-wide limit).
     if (rawPayload && typeof init.__oamMaxHeaderSize === "number") {
