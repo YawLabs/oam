@@ -21525,6 +21525,126 @@ console.log(typeof http2.sensitiveHeaders);"#,
     );
 }
 
+/// http2.createSecureServer is a TLS server: a client that does not speak
+/// TLS -- a cleartext HTTP/1.1 request, the HTTP/2 connection preface --
+/// gets not one byte back, and the server reports it as 'tlsClientError'
+/// with node's codes. A TLS client that negotiates no ALPN gets node's 403
+/// without allowHTTP1, and is served over HTTP/1.1 through the same (req,
+/// res) handler with it. oam's createSecureServer used to ignore its key and
+/// cert and serve both cleartext clients, handing the handler (stream,
+/// headers).
+#[test]
+fn http2_secure_server_answers_no_cleartext_client() {
+    let src = r#"import http2 from 'node:http2';
+import https from 'node:https';
+import net from 'node:net';
+const cert = `__CERT__`;
+const key = `__KEY__`;
+const raw = (port, bytes) => new Promise((resolve) => {
+  const chunks = [];
+  const s = net.connect(port, '127.0.0.1', () => s.write(bytes));
+  s.on('data', (d) => chunks.push(d));
+  s.on('error', () => {});
+  s.on('close', () => resolve(Buffer.concat(chunks).length));
+  setTimeout(() => s.destroy(), 3000).unref();
+});
+const get = (port, path) => new Promise((resolve) => {
+  https.get({ host: '127.0.0.1', port, path, rejectUnauthorized: false }, (res) => {
+    let body = '';
+    res.on('data', (d) => (body += d));
+    res.on('end', () => resolve(res.statusCode + ' ' + body.split('\n')[0]));
+  }).on('error', (e) => resolve('error ' + e.code));
+});
+for (const allowHTTP1 of [false, true]) {
+  const seen = [];
+  const server = http2.createSecureServer({ cert, key, allowHTTP1 }, (req, res) => {
+    seen.push(req.httpVersion + ' ' + req.url + ' encrypted=' + req.socket.encrypted + ' alpn=' + req.socket.alpnProtocol);
+    res.end('served over ' + req.httpVersion);
+  });
+  server.on('tlsClientError', (e) => seen.push('tlsClientError ' + e.code));
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+  console.log('allowHTTP1=' + allowHTTP1);
+  console.log('cleartext GET bytes back: ' + await raw(port, 'GET /leak HTTP/1.1\r\nHost: x\r\n\r\n'));
+  console.log('cleartext h2 preface bytes back: ' + await raw(port, 'PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n'));
+  console.log('https.get: ' + await get(port, '/tls'));
+  await new Promise((r) => setTimeout(r, 100));
+  server.close();
+  for (const line of seen) console.log('  ' + line);
+}
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let stdout = run_ok("h2_secure_cleartext.mjs", &src);
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        "allowHTTP1=false\n\
+         cleartext GET bytes back: 0\n\
+         cleartext h2 preface bytes back: 0\n\
+         https.get: 403 Missing ALPN Protocol, expected `h2` to be available.\n  \
+         tlsClientError ERR_SSL_HTTP_REQUEST\n  \
+         tlsClientError ERR_SSL_WRONG_VERSION_NUMBER\n\
+         allowHTTP1=true\n\
+         cleartext GET bytes back: 0\n\
+         cleartext h2 preface bytes back: 0\n\
+         https.get: 200 served over 1.1\n  \
+         tlsClientError ERR_SSL_HTTP_REQUEST\n  \
+         tlsClientError ERR_SSL_WRONG_VERSION_NUMBER\n  \
+         1.1 /tls encrypted=true alpn=false"
+    );
+}
+
+/// oam's own fetch negotiates h2 by ALPN with http2.createSecureServer and
+/// is served over HTTP/2 through the compatibility API (the server trusts
+/// nothing but its own key; the client trusts the test CA through
+/// NODE_EXTRA_CA_CERTS). Not on macOS: Security.framework refuses the
+/// 100-year test leaf on its validity alone (see
+/// fetch_https_trusts_node_extra_ca_certs).
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn http2_secure_server_serves_fetch_over_h2() {
+    let bundle = write_temp("h2-secure-extra-ca/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import http2 from 'node:http2';
+const seen = [];
+const server = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__` }, (req, res) => {
+  seen.push(req.httpVersion + ' ' + req.method + ' ' + req.url + ' alpn=' + req.socket.alpnProtocol);
+  let body = '';
+  req.on('data', (d) => (body += d));
+  req.on('end', () => {
+    res.setHeader('content-type', 'text/plain');
+    res.end('h2 says ' + (body || 'hi'));
+  });
+});
+server.on('session', (session) => seen.push('session alpn=' + session.alpnProtocol + ' encrypted=' + session.encrypted));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const a = await fetch(`https://localhost:${port}/one`);
+console.log(a.status, a.headers.get('content-type'), await a.text());
+const b = await fetch(`https://localhost:${port}/two`, { method: 'POST', body: 'posted' });
+console.log(b.status, await b.text());
+server.close();
+for (const line of seen) console.log(line);
+process.exit(0);
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("h2_secure_fetch/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "200 text/plain h2 says hi\n\
+         200 h2 says posted\n\
+         session alpn=h2 encrypted=true\n\
+         2.0 GET /one alpn=h2\n\
+         2.0 POST /two alpn=h2",
+        "stderr: {stderr}"
+    );
+}
+
 #[test]
 fn oam_mcp_module_batch_array() {
     use std::io::{BufRead, BufReader, Write};

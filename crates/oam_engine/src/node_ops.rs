@@ -334,6 +334,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpInsecureParser", op_http_insecure_parser),
         // HTTP/2 cleartext server (h2c — same accept/respond ops)
         ("http2Serve", op_http2_serve),
+        // http2.createSecureServer: a node:tls connection served as h2 / h1
+        ("http2ServeTls", op_http2_serve_tls),
         // HTTPS server (TLS-wrapped HTTP, same accept/respond ops)
         ("httpsServe", op_https_serve),
         // TCP sockets (node:net)
@@ -2956,6 +2958,46 @@ fn op_http2_serve(
         &mut rv,
         oam_core::http_server::http2_serve(state, host, port, policy),
     );
+}
+
+/// http2ServeTls(tlsHandle, http1, maxHeaderSize, insecureHTTPParser,
+/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs) -> JSON
+/// `{ sessionId, connId }`: an accepted node:tls connection (at rest: JS has
+/// not read it) served natively from now on, as an HTTP/2 session or, with
+/// `http1`, as HTTP/1.1 (node's allowHTTP1). Its requests arrive on the
+/// session's own accept queue (`httpAccept(sessionId)`); `httpConnDestroy
+/// (connId, graceful)` closes or destroys it.
+fn op_http2_serve_tls(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let http1 = args.get(1).is_true();
+    let policy = head_policy_args(scope, &args, 2);
+    let timeouts = timeout_args(scope, &args, 4);
+    let core = core_runtime!(scope);
+    let Some(stream) = oam_core::tls::server::take_server_stream(&core.tls(), handle) else {
+        throw_type_error(scope, "http2ServeTls: the TLS connection is gone or in use");
+        return;
+    };
+    let served = {
+        let _runtime = core.enter();
+        oam_core::http_server::http2_serve_tls(core.http(), stream, http1, policy, timeouts)
+    };
+    match served {
+        Ok(session) => {
+            let json = serde_json::json!({
+                "sessionId": session.session_id,
+                "connId": session.conn_id,
+            })
+            .to_string();
+            if let Some(text) = v8::String::new(scope, &json) {
+                rv.set(text.into());
+            }
+        }
+        Err(e) => throw_type_error(scope, &format!("http2ServeTls: {e}")),
+    }
 }
 
 // ----------------------------------------------------------------- HTTPS

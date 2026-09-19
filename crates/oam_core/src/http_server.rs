@@ -32,6 +32,10 @@ use tokio::sync::{mpsc, oneshot};
 use crate::http_conn::{CloseReason, ConnWatch, Fired, ServerTimeouts, TimeoutSettings, WatchedIo};
 use crate::http_head::{HeadError, HeadPolicy, ParsedHead};
 
+// http2.createSecureServer's connections, served over node:tls.
+mod secure;
+pub use secure::{SecureSession, http2_serve_tls};
+
 /// Per-request body cap (wave-1 buffered bodies).
 const MAX_REQUEST_BODY: usize = 100 * 1024 * 1024;
 /// After the per-request cap is hit we drain (discard) up to this many
@@ -103,6 +107,9 @@ pub struct IncomingRequest {
     /// For an upgrade or CONNECT: the bytes that came after the head (node's
     /// `head` argument), already read off the socket.
     pub head: Vec<u8>,
+    /// The request has no body: an HTTP/2 request whose HEADERS frame ended
+    /// the stream (node's `endAfterHeaders`, END_STREAM in 'stream' flags).
+    pub end_stream: bool,
 }
 
 /// What a server's accept queue carries to JS.
@@ -1198,6 +1205,7 @@ pub async fn http_serve(
                                 conn: conn_addrs,
                                 conn_id: None,
                                 head: head.to_vec(),
+                                end_stream: false,
                             }))
                             .await;
                     });
@@ -1629,6 +1637,8 @@ async fn dispatch_request(
         }
     }
     let (parts, body) = req.into_parts();
+    let end_stream =
+        parts.version == hyper::Version::HTTP_2 && hyper::body::Body::is_end_stream(&body);
     // Collect the body, enforcing MAX_REQUEST_BODY.  When the cap is hit we
     // drain up to DRAIN_BUDGET additional bytes before returning 413.
     //
@@ -1680,7 +1690,20 @@ async fn dispatch_request(
         state.body_bytes.fetch_sub(body_len, Ordering::AcqRel);
         return Ok(status_body(503, b"server is busy"));
     }
-    let headers = header_pairs(&parts.headers);
+    let mut headers = header_pairs(&parts.headers);
+    // An HTTP/2 request's :authority and :scheme are pseudo-headers hyper
+    // folds into the URI; node's server hands them to the handler with the
+    // rest of its headers.
+    if parts.version == hyper::Version::HTTP_2 {
+        let mut pseudo = Vec::new();
+        if let Some(authority) = parts.uri.authority() {
+            pseudo.push((":authority".to_string(), authority.as_str().to_string()));
+        }
+        if let Some(scheme) = parts.uri.scheme_str() {
+            pseudo.push((":scheme".to_string(), scheme.to_string()));
+        }
+        headers.splice(0..0, pseudo);
+    }
     let uri = parts
         .uri
         .path_and_query()
@@ -1742,6 +1765,7 @@ async fn dispatch_request(
             conn,
             conn_id,
             head: Vec::new(),
+            end_stream,
         }))
         .await;
     if sent.is_err() {
@@ -1971,6 +1995,9 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
                 "headers": request.headers,
             });
             request.conn.write_meta(&mut meta);
+            if request.end_stream {
+                meta["endStream"] = serde_json::json!(true);
+            }
             if let Some(conn_id) = request.conn_id {
                 meta["connectionId"] = serde_json::json!(conn_id);
             }

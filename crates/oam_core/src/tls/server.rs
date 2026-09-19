@@ -932,7 +932,10 @@ impl tokio::io::AsyncWrite for ServerIo {
     ) -> std::task::Poll<std::io::Result<usize>> {
         match self.gate() {
             Gate::Open => std::pin::Pin::new(&mut self.tcp).poll_write(cx, buf),
-            Gate::Silent => std::task::Poll::Ready(Err(gate_closed())),
+            // Swallowed: the handshake completes on rustls's side without
+            // its last flight reaching the client, and the connection is
+            // then dropped (`close_refused_connection`).
+            Gate::Silent => std::task::Poll::Ready(Ok(buf.len())),
             Gate::NoCertificate => {
                 while self.alert_written < HANDSHAKE_FAILURE_ALERT.len() {
                     let from = self.alert_written;
@@ -963,6 +966,25 @@ impl tokio::io::AsyncWrite for ServerIo {
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.tcp).poll_shutdown(cx)
     }
+}
+
+/// Drop a connection whose client certificate was refused, as Node's
+/// server drops it (`socket.destroy()` straight from the handshake): a
+/// client that has already sent something past its handshake -- an HTTP/2
+/// client's preface -- is reset, having data unread on a closed socket; one
+/// that sent nothing sees the connection end.
+fn close_refused_connection(mut stream: tokio_rustls::server::TlsStream<ServerIo>) {
+    let (io, conn) = stream.get_mut();
+    let buffered = conn
+        .process_new_packets()
+        .map(|state| state.plaintext_bytes_to_read() > 0)
+        .unwrap_or(true);
+    let mut probe = [0u8; 1];
+    let pending = matches!(io.tcp.try_read(&mut probe), Ok(n) if n > 0);
+    if buffered || pending {
+        let _ = socket2::SockRef::from(&io.tcp).set_linger(Some(std::time::Duration::ZERO));
+    }
+    drop(stream);
 }
 
 /// What a server reads off itself for each connection it accepts (Node's
@@ -1104,6 +1126,7 @@ pub async fn tls_accept(
     // A refusal whose queued flight was already out (nothing left to write
     // after the verdict): the connection still never reaches JS.
     if verdict.gate() != Gate::Open {
+        close_refused_connection(tls_stream);
         return socket_hang_up();
     }
 
@@ -1166,6 +1189,37 @@ pub async fn tls_accept(
         payload["remoteAddr"] = crate::tcp::addr_to_json(ra);
     }
     OpOutcome::Json(payload.to_string())
+}
+
+/// Take an accepted server connection out of the registry whole, for a
+/// protocol served natively on it (the http2 secure server). Only a
+/// connection at rest can be taken -- both halves in the registry, which is
+/// the case until JS first reads or writes it; None otherwise, and the
+/// registry is left as it was.
+pub fn take_server_stream(
+    registry: &TlsRegistry,
+    handle: u64,
+) -> Option<tokio_rustls::server::TlsStream<ServerIo>> {
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+    if !guard.readers.contains_key(&handle) || !guard.writers.contains_key(&handle) {
+        return None;
+    }
+    let reader = guard.readers.remove(&handle)?;
+    let Some(writer) = guard.writers.remove(&handle) else {
+        guard.readers.insert(handle, reader);
+        return None;
+    };
+    match (reader, writer) {
+        (TlsReader::Server(reader), TlsWriter::Server(writer)) => {
+            guard.cancel.remove(&handle);
+            Some(reader.unsplit(writer))
+        }
+        (reader, writer) => {
+            guard.readers.insert(handle, reader);
+            guard.writers.insert(handle, writer);
+            None
+        }
+    }
 }
 
 /// Register a context; its id is what `tls_accept` is called with.
