@@ -27122,10 +27122,16 @@
         var requestCert = this.requestCert;
         var rejectUnauthorized = this.rejectUnauthorized;
         var alpn = this.ALPNProtocols ? JSON.stringify(alpnWireNames(this.ALPNProtocols)) : undefined;
-        natives.tlsAcceptWrap(
-          accepted.handle, this._contextId, this._handshakeTimeout,
-          requestCert, rejectUnauthorized, alpn,
-        ).then(
+        var handshake;
+        try {
+          handshake = natives.tlsAcceptWrap(
+            accepted.handle, this._contextId, this._handshakeTimeout,
+            requestCert, rejectUnauthorized, alpn,
+          );
+        } catch (e) {
+          handshake = Promise.reject(e);
+        }
+        handshake.then(
           (info) => {
             fillServerSocket(socket, info, accepted);
             if (requestCert) {

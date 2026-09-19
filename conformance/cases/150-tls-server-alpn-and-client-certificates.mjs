@@ -315,3 +315,44 @@ await scenario("cleartext", [
   silent.destroy();
   server.close();
 }
+
+// ---- 6. a resumed session keeps its client certificate's verdict.
+{
+  const events = [];
+  const server = tls.createServer({ key: KEY, cert: CERT, requestCert: true, ca: [CA] }, (socket) => {
+    const peer = socket.getPeerCertificate();
+    events.push("secureConnection authorized=" + socket.authorized + " peer=" + (peer.subject ? peer.subject.CN : "none"));
+    socket.end("hello");
+  });
+  server.on("tlsClientError", (e) => events.push("tlsClientError " + e.code));
+  const port = await listen(server);
+  const RESUMING = `
+import tls from "node:tls";
+const [port, ca, cert, key, maxVersion] = JSON.parse(process.argv[1]);
+let session;
+for (let i = 0; i < 2; i++) {
+  const out = await new Promise((resolve) => {
+    const s = tls.connect({ host: "127.0.0.1", port, servername: "localhost", ca, cert, key, session, maxVersion }, () => s.resume());
+    s.on("session", (sess) => { session = sess; });
+    s.on("end", () => resolve("reused=" + s.isSessionReused()));
+    s.on("error", (e) => resolve("error " + e.code));
+  });
+  console.log(out);
+}
+`;
+  for (const maxVersion of ["TLSv1.3", "TLSv1.2"]) {
+    const out = await new Promise((resolve) => {
+      const child = spawn("node", ["--input-type=module", "-e", RESUMING, JSON.stringify([port, CA, CLIENT_CERT, CLIENT_KEY, maxVersion])], {
+        stdio: ["ignore", "pipe", "inherit"],
+      });
+      let text = "";
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (d) => { text += d; });
+      child.on("close", () => resolve(text.trim().split("\n").join(", ")));
+    });
+    console.log("resumption " + maxVersion + ": " + out);
+  }
+  await new Promise((r) => setTimeout(r, 100));
+  server.close();
+  for (const e of events) console.log("  server " + e);
+}

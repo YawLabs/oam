@@ -1183,12 +1183,14 @@ pub async fn tls_accept(
         .alpn_protocol()
         .map(|p| p.iter().map(|&b| char::from(b)).collect::<String>());
     let servername = server_conn.server_name().map(str::to_string);
-    // The verdict: the verifier's on the chain the client sent, or -- when
-    // it sent none -- Node's for no certificate.
+    // The verdict: the verifier's on the chain the client sent in this
+    // handshake; else (a resumed session, whose chain comes from the session
+    // it resumes, or no certificate at all) Node's on the chain the
+    // connection has.
     let (authorized, authorization_error) = if options.request_cert {
         let judged = verdict
             .get()
-            .unwrap_or_else(|| context.judge.verdict(None, UnixTime::now()));
+            .unwrap_or_else(|| context.judge.verdict(peer_chain, UnixTime::now()));
         match judged {
             None => (true, None),
             Some(failure) => (false, failure.code),
