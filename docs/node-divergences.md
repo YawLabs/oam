@@ -1109,8 +1109,9 @@ error named the URL's host as written: reqwest did not say which resolved addres
 refused, so `fetch('http://localhost:8080/')` failed with one `Error` carrying
 `address: 'localhost'` where Node names each address it tried.
 
-`fetch`, `http.request`, `https.request` and the `http2` compat client now dial through
-the connector `net.connect` and `tls.connect` use: Node's connect algorithm
+`fetch`, `http.request` and `https.request` now dial through the connector `net.connect`
+and `tls.connect` use (an `http2.connect` session dials with `net.connect` / `tls.connect`
+themselves, entry 44): Node's connect algorithm
 (`lookupAndConnect`: an IP literal as written, a name's addresses interleaved by family, and
 every attempt but the last bounded by the 250 ms attempt timeout from
 `net.getDefaultAutoSelectFamilyAttemptTimeout()`) on a libuv-style socket per attempt. A
@@ -1188,8 +1189,8 @@ Windows.)_
 
 ### 38. `fetch` and `http.request` on oam's own client: what still differs (#143)
 
-Since #143 `fetch`, `http.request`, `https.request` and the `http2` compat client run on
-oam's own transport: hyper's pooled client over the connector `net` and `tls` share
+Since #143 `fetch`, `http.request` and `https.request` run on oam's own transport (an
+`http2.connect` session runs over its own socket instead, entry 44): hyper's pooled client over the connector `net` and `tls` share
 (entry 35), rustls, and the redirect and decoding rules of undici 6.24.1, the `fetch` Node
 v22.22.2 bundles. Redirect handling and decoding are pinned byte-identical with Node by
 `conformance/cases/111-fetch-redirect-and-bad-port.mjs` and `112-fetch-content-decoding.mjs`.
@@ -1321,6 +1322,42 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
   hop's lookup, so the hook is only ever asked about names the grant covers. Node has no
   `--permission` net grant to compare against.
 
+**A `connect` function, `buildConnector`, and dispatchers oam refuses**
+
+`import 'undici'` is oam's shim, also when the package is installed (the real one does not
+run on oam). A dispatcher's `connect` FUNCTION -- `new Agent|Pool|Client({ connect(opts,
+cb) })`, a custom connector -- is called before every connection a request makes, redirect
+hops included, IP literals too, with undici's parameters (`host`, `hostname`, `protocol`,
+`port`, `servername`, `localAddress`), on all five entry points above plus `Pool` and
+`Client`. The request goes over the socket it hands back and nowhere else: oam's transport
+speaks HTTP over that socket (h2 when it negotiated `h2`), never dials, resolves or proxies
+for it, and fails closed on a hop it was handed no socket for. A connector that refuses or
+throws fails the request with its error; a socket that fails to connect fails it with the
+socket's error. `undici.buildConnector` is undici's own connector over `net.connect` /
+`tls.connect`, and a `connect` OBJECT carrying anything besides `lookup` and the connect
+tuning keys (`timeout`, `keepAlive`, `keepAliveInitialDelay`, `maxCachedSessions`,
+`allowH2`) -- `ca`, `checkServerIdentity`, `servername`, `rejectUnauthorized`, `family`,
+`localAddress`, `socketPath` -- becomes a connect function through it, as in undici, so
+those options apply. An `Agent`'s `factory` is honored the same way: the dispatcher it makes
+for each origin decides that origin's connections. Pinned against Node + undici 6.24.1 by
+`undici_connect_function_decides_every_connection` (e2e). Up to 0.16.2 the function, the
+TLS options and the factory were ignored and oam connected by itself. What differs:
+
+- **Nothing is pooled.** Each connection the function supplies carries one request and is
+  destroyed after it; undici keeps it for the next request to that origin. So the function
+  is called once per request (and per redirect hop), where undici skips it for a pooled
+  connection. TLS sessions are not cached.
+- **Errors on `undici.request` / `agent.request` are wrapped**, as for the lookup hook:
+  `TypeError: fetch failed` with the connector's error as `cause`.
+- **Refused, where undici would run them:** a dispatcher whose `dispatch()` is overridden
+  (a subclass or a patched instance), one built with `interceptors`, and an object that is
+  not one of the shim's dispatchers (a real undici's, a hand-rolled `{ dispatch }`) fail the
+  request with `NotSupportedError` (`UND_ERR_NOT_SUPPORTED`) and nothing is sent. oam sends
+  requests itself rather than through `dispatch()`, so whatever that `dispatch()` does -- a
+  destination check, for one -- could not run; up to 0.16.2 the request was sent without it.
+  The same policy written as a `connect` function works. `http.request` is not affected: it
+  never goes through an undici dispatcher, in Node or here. `compose()` is not provided.
+
 **Redirects**
 
 - **`redirect: 'manual'` and `'error'` behave as Node's** (case 126): `'manual'` returns the
@@ -1441,8 +1478,9 @@ Request as `fetch`, so it gets them too (measured: `undici.request` with
 `transfer-encoding: chunked` throws `invalid transfer-encoding header` and nothing reaches
 the wire). Everything else in that list is Fetch-level and `fetch` only: `undici.request`
 SENDS a caller `host` header and leaves the method as written, both measured. `http.request`,
-`https.request` and the `http2` compat client share the op but get neither set, because Node
-applies neither to them -- they set these headers legitimately.
+`https.request` share the op but get neither set, because Node applies neither to them --
+they set these headers legitimately. (`http2.connect` refuses node's HTTP/1
+connection-specific headers itself, as node's does.)
 
 The one thing `undici.request` does not reproduce is the error's SHAPE: it runs on `fetch` in
 oam, so a refusal arrives as `TypeError: fetch failed` carrying the undici-named error as
@@ -1707,6 +1745,38 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
 _(probed)_ Node v22.22.2 vs oam on Windows: the probes behind cases 120-122, and
 request-filtering-agent 3.2.1 / 2.0.1 / 1.1.2 and ssrf-req-filter 1.1.1 against node-hosted
 dual-stack servers, line for line identical except where a pooled socket is reused.
+
+### 44. `http2.connect`: what differs
+
+As in Node, an `http2.connect` session runs over one socket: the one
+`options.createConnection(authority, options)` returns, else `net.connect({ port, host,
+...options })` for `http:` and `tls.connect(port, host, options)` offering `h2` by ALPN (and
+`http/1.1` with `allowHTTP1`) for `https:`. Every stream of the session travels over it:
+hyper's HTTP/2 client runs over the bytes JS moves between that socket and a pipe
+(`crates/oam_core/src/http_client/h2_session.rs`). So `lookup`, a replaced `dns.lookup`,
+`family`, `ca`, `servername`, `checkServerIdentity`, `rejectUnauthorized`, the socket's
+`'lookup'` / `'connect'` listeners and `--permission`'s net grant apply exactly as they do
+to that socket; a refusal fails the session with its own error and cancels the pending
+streams with `ERR_HTTP2_STREAM_CANCEL` naming it; `session.socket` is Node's proxy of the
+real socket (its addresses; the calls that would read or write it throw
+`ERR_HTTP2_NO_SOCKET_MANIPULATION`). `conformance/cases/140-http2-connect-lookup-and-create-connection.mjs`
+pins this against Node. Up to 0.16.2 the options were ignored and every stream went out on
+oam's shared client. What differs:
+
+- **The session API is partial.** `request()`, `close()`, `destroy()`, `ref()` / `unref()`,
+  `socket`, `alpnProtocol`, `encrypted`, `originSet`, `connecting`, `closed`, `destroyed`
+  and `type` behave as Node's; `ping()` answers at once without sending a PING frame and
+  `setTimeout()` does nothing. `settings()`, `goaway()`, `setLocalWindowSize()`, `state`,
+  `localSettings`, `remoteSettings` and `pendingSettingsAck` are absent, and so are a
+  stream's `sendTrailers()`, `sentTrailers`, `sentInfoHeaders`, `state`, `bufferSize` and
+  `endAfterHeaders`. hyper chooses the SETTINGS and window sizes.
+- **A plain `Duplex` from `createConnection` is used as it is.** Node wraps a stream that is
+  not a socket in its `JSStreamSocket` and hands that wrapper to `'connect'`; oam runs the
+  session over the stream itself and hands it on.
+
+_(probed)_ Node v22.22.2 vs oam on Windows: lookup and createConnection guards over h2c, and
+a node-hosted `createSecureServer` for `ca`, `servername`, a refusing lookup, an untrusted
+certificate and `rejectUnauthorized: false`, line for line identical.
 
 ### `err.syscall` on `fs.realpath` and `fs.opendir`
 

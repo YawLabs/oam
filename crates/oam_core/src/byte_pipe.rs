@@ -2,16 +2,22 @@
 //!
 //! `tls.connect({ socket })` runs TLS over a stream oam did not open itself
 //! -- a net.Socket to a CONNECT proxy, a TLSSocket (TLS in TLS), or any JS
-//! Duplex. rustls runs over the pipe's near end ([`take_near`]); JS owns the
-//! far end: it takes what rustls wrote with [`out`] and writes it to the
-//! socket, and feeds what the socket read back with [`input`], ending it with
-//! [`input_end`] at the socket's EOF. Both directions are bounded by the pipe,
-//! so a peer nobody reads stops the socket being read, and a slow socket
-//! stops rustls writing.
+//! Duplex. An `http2.connect` session runs over one the same way (hyper's h2
+//! client over the socket `net.connect`, `tls.connect` or `createConnection`
+//! returned; `http_client::h2_session`), and so does a fetch whose undici
+//! dispatcher has a `connect` function (over the socket that function handed
+//! back; `http_client::send::fetch_supply`).
+//!
+//! rustls (or that consumer) runs over the pipe's near end ([`take_near`]);
+//! JS owns the far end: it takes what the near end wrote with [`out`] and
+//! writes it to the socket, and feeds what the socket read back with
+//! [`input`], ending it with [`input_end`] at the socket's EOF. Both
+//! directions are bounded by the pipe, so a peer nobody reads stops the
+//! socket being read, and a slow socket stops the near end writing.
 //!
 //! A pipe lives until [`close`]. Closing drops JS's end, which the near end
-//! reads as EOF; a parked [`out`] read returns `Done` once rustls lets go of
-//! the near end.
+//! reads as EOF; a parked [`out`] read returns `Done` once the near end is
+//! let go of.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -185,5 +191,34 @@ mod tests {
             input(pipes.clone(), id, b"x".to_vec()).await,
             OpOutcome::Done
         ));
+    }
+
+    #[tokio::test]
+    async fn closing_the_pipe_reads_as_the_peer_closing() {
+        let (pipes, ids) = pipes();
+        let id = open(&pipes, &ids);
+        let mut near = take_near(&pipes, id).unwrap();
+        assert!(close(&pipes, id));
+        let mut rest = Vec::new();
+        near.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty());
+        // Nothing to pump any more.
+        assert!(matches!(out(pipes.clone(), id).await, OpOutcome::Done));
+    }
+
+    #[tokio::test]
+    async fn a_full_pipe_holds_the_socket_back() {
+        let (pipes, ids) = pipes();
+        let id = open(&pipes, &ids);
+        let mut near = take_near(&pipes, id).unwrap();
+        // More than the pipe holds: the write parks until the near end reads.
+        let big = vec![7u8; PIPE + 1024];
+        let parked = tokio::spawn(input(pipes.clone(), id, big));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(!parked.is_finished(), "input waits for the near end");
+        let mut got = vec![0u8; PIPE + 1024];
+        near.read_exact(&mut got).await.unwrap();
+        assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
+        assert!(got.iter().all(|&b| b == 7));
     }
 }

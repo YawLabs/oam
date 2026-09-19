@@ -1,8 +1,10 @@
 //! `http_client::send` and `http_client::body` over real loopback sockets:
 //! the payload, undici's redirect rules on the wire, the per-hop proxy
 //! credential, content decoding and its streaming bounds, cancellation, the
-//! h2 retry, the outbound body channel lifecycle, and the `connect.lookup`
-//! continuation (#143 slice C, design-143-C-pinhook).
+//! h2 retry, the outbound body channel lifecycle, the `connect.lookup`
+//! continuation (#143 slice C, design-143-C-pinhook), and connector mode (a
+//! connection supplied for every hop, as an undici `connect` function
+//! supplies one).
 
 mod common;
 
@@ -140,6 +142,55 @@ impl Reg {
 
     fn parked(&self) -> usize {
         self.continuations.lock().unwrap().len()
+    }
+
+    /// Resume a connector-mode fetch with a connection to `port`: a TCP
+    /// stream pumped to and from a byte pipe, as JS pumps the socket an
+    /// undici `connect` function returned.
+    async fn supply(&self, pipes: &oam_core::byte_pipe::Pipes, token: u64, port: u16) -> OpOutcome {
+        let id = oam_core::byte_pipe::open(pipes, &self.ids);
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let (mut rd, mut wr) = stream.into_split();
+        let out_pipes = pipes.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt as _;
+            while let OpOutcome::Bytes(bytes) =
+                oam_core::byte_pipe::out(out_pipes.clone(), id).await
+            {
+                if wr.write_all(&bytes).await.is_err() {
+                    return;
+                }
+            }
+            let _ = wr.shutdown().await;
+        });
+        let in_pipes = pipes.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt as _;
+            let mut buf = vec![0u8; 16 * 1024];
+            loop {
+                match rd.read(&mut buf).await {
+                    Ok(0) | Err(_) => {
+                        oam_core::byte_pipe::input_end(in_pipes.clone(), id).await;
+                        return;
+                    }
+                    Ok(n) => {
+                        oam_core::byte_pipe::input(in_pipes.clone(), id, buf[..n].to_vec()).await;
+                    }
+                }
+            }
+        });
+        let io = oam_core::byte_pipe::take_near(pipes, id).unwrap();
+        send::fetch_supply(
+            token,
+            io,
+            false,
+            self.bodies.clone(),
+            self.ids.clone(),
+            self.continuations.clone(),
+        )
+        .await
     }
 }
 
@@ -1725,6 +1776,111 @@ async fn early_failure_texts() {
             ),
             "fetch: unknown body stream 424242"
         );
+    })
+    .await;
+}
+
+// ---------------------------------------------------------------- connector mode
+
+/// A connect request: (token, the undici connector parameters).
+fn connect_of(outcome: OpOutcome) -> (u64, Value) {
+    let value = payload(outcome);
+    let connect = value["connect"].clone();
+    assert!(
+        connect.is_object(),
+        "expected a connect request, got {value}"
+    );
+    (connect["token"].as_u64().unwrap(), connect)
+}
+
+/// A fetch in connector mode parks before EVERY hop with undici's connector
+/// parameters -- the first host and a cross-host redirect target -- and each
+/// hop goes over the connection supplied for it and nowhere else: the URL
+/// names hosts that do not resolve and an environment proxy that is not
+/// there, and the requests still arrive, with the URL's host in `Host`. A
+/// parked fetch takes only a connection: addresses leave it parked.
+#[tokio::test(flavor = "multi_thread")]
+async fn connector_mode_parks_every_hop_and_sends_it_over_the_supplied_connection() {
+    within(async {
+        let b = serve_replies(|_| response("200 OK", &[], b"done")).await;
+        let b_port = b.port;
+        let a = serve_replies(move |_| {
+            let next = format!("http://b.test:{b_port}/next");
+            response("302 Found", &[("location", &next)], b"")
+        })
+        .await;
+        let dead_proxy = closed_port().await;
+        let rules = Matcher::builder()
+            .all(format!("http://127.0.0.1:{dead_proxy}"))
+            .build();
+        let t = transport(ProxySource::Fixed(Box::new(rules)));
+        let reg = Reg::new();
+        let pipes: oam_core::byte_pipe::Pipes = Arc::new(Mutex::new(HashMap::new()));
+
+        let first = reg
+            .fetch(
+                &t,
+                json!({
+                    "url": format!("http://A.test:{}/start", a.port),
+                    "connect_hook": true,
+                    "lookup_hook": true,
+                }),
+            )
+            .await;
+        let (token, params) = connect_of(first);
+        assert_eq!(params["host"], format!("a.test:{}", a.port).as_str());
+        assert_eq!(params["hostname"], "a.test");
+        assert_eq!(params["protocol"], "http:");
+        assert_eq!(params["port"], a.port.to_string().as_str());
+        assert_eq!(reg.parked(), 1);
+        assert_eq!(a.accepts(), 0);
+
+        // Addresses are not a connection: refused, and the fetch stays parked.
+        let text = failed(reg.resume(token, &["127.0.0.1"]).await);
+        assert!(text.contains("is gone"), "{text}");
+        assert_eq!(reg.parked(), 1);
+
+        let (token, params) = connect_of(reg.supply(&pipes, token, a.port).await);
+        assert_eq!(params["host"], format!("b.test:{b_port}").as_str());
+        assert_eq!(params["hostname"], "b.test");
+        assert_eq!(
+            a.seen()[0].head.get("host"),
+            Some(format!("a.test:{}", a.port).as_str())
+        );
+        assert_eq!(b.accepts(), 0);
+
+        let p = payload(reg.supply(&pipes, token, b_port).await);
+        assert_eq!(p["status"], 200);
+        assert_eq!(p["redirected"], true);
+        assert_eq!(reg.text(handle_of(&p)).await, "done");
+        assert_eq!(
+            b.seen()[0].head.get("host"),
+            Some(format!("b.test:{b_port}").as_str())
+        );
+        assert_eq!(reg.parked(), 0);
+
+        // An https URL and an IPv6 literal park too, with undici's spelling
+        // of the parameters (no port for the scheme default; the hostname
+        // unbracketed).
+        let (_, params) = connect_of(
+            reg.fetch(
+                &t,
+                json!({ "url": "https://secure.test/x", "connect_hook": true }),
+            )
+            .await,
+        );
+        assert_eq!(params["host"], "secure.test");
+        assert_eq!(params["protocol"], "https:");
+        assert_eq!(params["port"], "");
+        let (_, params) = connect_of(
+            reg.fetch(
+                &t,
+                json!({ "url": "http://[::1]:9/x", "connect_hook": true }),
+            )
+            .await,
+        );
+        assert_eq!(params["host"], "[::1]:9");
+        assert_eq!(params["hostname"], "::1");
     })
     .await;
 }

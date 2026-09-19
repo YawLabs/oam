@@ -1277,13 +1277,39 @@ pub async fn tls_connect(
         attempt_timeout,
         None,
         None,
+        Vec::new(),
     )
     .await
+}
+
+/// `tls.connect`'s `ALPNProtocols` as the connect op carries it: a JSON array
+/// of protocol names, each one byte per code point (a Buffer entry arrives
+/// latin1-decoded). Each name is 1-255 bytes, the limits TLS puts on one.
+pub fn parse_alpn_protocols(json: &str) -> Result<Vec<Vec<u8>>, String> {
+    let names: Vec<String> = serde_json::from_str(json)
+        .map_err(|e| format!("tlsConnect: malformed ALPNProtocols: {e}"))?;
+    names
+        .iter()
+        .map(|name| {
+            let bytes = name
+                .chars()
+                .map(|c| u8::try_from(u32::from(c)))
+                .collect::<Result<Vec<u8>, _>>()
+                .map_err(|_| "tlsConnect: an ALPN protocol name must be bytes".to_string())?;
+            if bytes.is_empty() || bytes.len() > 255 {
+                return Err("tlsConnect: an ALPN protocol name must be 1-255 bytes".to_string());
+            }
+            Ok(bytes)
+        })
+        .collect()
 }
 
 /// [`tls_connect`] with the addresses JS resolved for `host` standing in for
 /// getaddrinfo, as [`crate::tcp::tcp_connect_pinned`] takes them. The server
 /// name is still `server_name` or `host`, never an address from the pin.
+/// `local` is the `localAddress` / `localPort` bind made before dialling.
+/// `alpn` is `ALPNProtocols` in preference order (empty: none offered); the
+/// protocol the server selected is the result's `alpnProtocol`.
 #[allow(clippy::too_many_arguments)]
 pub async fn tls_connect_pinned(
     registry: TlsRegistry,
@@ -1300,6 +1326,7 @@ pub async fn tls_connect_pinned(
     attempt_timeout: std::time::Duration,
     pin: Option<crate::net_connect::Pin>,
     local: Option<crate::net_connect::LocalBind>,
+    alpn: Vec<Vec<u8>>,
 ) -> OpOutcome {
     let addr = format!("{host}:{port}");
 
@@ -1339,6 +1366,7 @@ pub async fn tls_connect_pinned(
         client_key_pem.as_deref(),
         &versions,
         &addr,
+        alpn,
     )
     .await
     {
@@ -1392,6 +1420,7 @@ async fn client_handshake<IO>(
     client_key_pem: Option<&str>,
     versions: &[&'static rustls::SupportedProtocolVersion],
     target: &str,
+    alpn: Vec<Vec<u8>>,
 ) -> Result<(tokio_rustls::client::TlsStream<IO>, serde_json::Value), OpOutcome>
 where
     IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -1406,7 +1435,7 @@ where
         }
     };
 
-    let (config, verdict) = match build_client_config(
+    let (mut config, verdict) = match build_client_config(
         ca_pem,
         client_cert_pem,
         client_key_pem,
@@ -1416,6 +1445,7 @@ where
         Ok(built) => built,
         Err(e) => return Err(OpOutcome::Failed(e)),
     };
+    config.alpn_protocols = alpn;
 
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
     let tls_stream = match connector.connect(server_name, io).await {
@@ -1502,6 +1532,7 @@ pub async fn tls_connect_over(
     client_key_pem: Option<String>,
     min_version: Option<String>,
     max_version: Option<String>,
+    alpn: Vec<Vec<u8>>,
 ) -> OpOutcome {
     let versions = match protocol_versions(min_version.as_deref(), max_version.as_deref()) {
         Ok(v) => v,
@@ -1519,6 +1550,7 @@ pub async fn tls_connect_over(
         client_key_pem.as_deref(),
         &versions,
         &server_name,
+        alpn,
     )
     .await
     {
@@ -2345,6 +2377,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
                 None,
                 None,
                 None,
+                Vec::new(),
             ),
         )
         .await
@@ -2420,6 +2453,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
                 None,
                 None,
                 None,
+                Vec::new(),
             ),
         )
         .await
@@ -2443,6 +2477,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
             None,
             None,
             None,
+            Vec::new(),
         )
         .await;
         assert!(matches!(gone, OpOutcome::Failed(_)), "{gone:?}");

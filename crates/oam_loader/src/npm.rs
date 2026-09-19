@@ -325,8 +325,11 @@ fn resolve_subpath_import(
 /// npm packages oam provides NATIVELY, shadowing any installed copy. They
 /// resolve to the matching `oam:` virtual builtin before the node_modules
 /// walk (the Bun/Deno approach). `undici` is shadowed because the real
-/// package cannot load on oam (it pulls node:sqlite + a WASM HTTP stack) and
-/// adds nothing over oam's web-standard fetch.
+/// package does not run on oam (it pulls node:sqlite + a WASM HTTP stack).
+/// The shim carries a dispatcher's connection policy onto oam's fetch -- its
+/// `connect` function, `connect` options and `connect.lookup` -- and refuses
+/// a dispatcher it cannot run as undici would (an overridden `dispatch()`,
+/// `interceptors`) rather than send the request without it (js/undici.js).
 fn shadowed_builtin(specifier: &str) -> Option<&'static str> {
     match specifier {
         "undici" => Some("oam:undici"),

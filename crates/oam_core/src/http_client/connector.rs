@@ -448,6 +448,21 @@ pub(crate) fn authority_key(uri: &Uri) -> Option<String> {
     Some(format!("{}:{port}", host.to_ascii_lowercase()))
 }
 
+/// A connection JS supplied for one fetch whose undici dispatcher carries a
+/// `connect` FUNCTION: the near end of a [`crate::byte_pipe`] JS pumps to and
+/// from the socket that function handed back. That socket is already the
+/// whole transport -- connected, and for an https origin already TLS -- so
+/// the connector adds nothing to it.
+pub(crate) struct SuppliedConn {
+    pub(crate) io: tokio::io::DuplexStream,
+    /// The socket negotiated h2 by ALPN (undici then speaks h2 over it).
+    pub(crate) h2: bool,
+}
+
+/// One connector-hooked fetch's supplied connections: [`authority_key`] ->
+/// the connections JS supplied for it, oldest first. Each is used once.
+pub(crate) type SuppliedConns = Arc<Mutex<HashMap<String, Vec<SuppliedConn>>>>;
+
 /// Which client a connector serves.
 #[derive(Clone)]
 pub(crate) enum Via {
@@ -464,6 +479,12 @@ pub(crate) enum Via {
         addrs: HostAddrs,
         attempt_timeout: Duration,
     },
+    /// One connector-hooked fetch's own client: every connection is one JS
+    /// supplied for the authority, from the socket the dispatcher's
+    /// `connect` function returned. Nothing is dialled here -- no DNS, no
+    /// environment proxy, no TLS (undici hands the request to whatever
+    /// socket its connector returns, and so does this).
+    Supplied { conns: SuppliedConns },
 }
 
 #[derive(Clone)]
@@ -502,12 +523,32 @@ impl std::fmt::Display for UnresolvedHost {
 
 impl std::error::Error for UnresolvedHost {}
 
+/// A connector-hooked fetch reached the connector for an authority JS
+/// supplied no connection for. The fetch loop parks for one before every
+/// send, so this is a backstop: it fails the request rather than dial the
+/// origin itself, which would skip the dispatcher's `connect` function.
+#[derive(Debug)]
+struct UnsuppliedConnection(String);
+
+impl std::fmt::Display for UnsuppliedConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no connection from the dispatcher's connect for {}",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for UnsuppliedConnection {}
+
 impl OamConnector {
     async fn connect(self, dst: Uri) -> Result<OamConn, BoxError> {
         let https = dst.scheme_str() == Some("https");
         let host = host_for_connect(&dst).ok_or("request url has no host")?;
         let port = dst.port_u16().unwrap_or(if https { 443 } else { 80 });
         let opts = match &self.via {
+            Via::Supplied { conns } => return supplied(conns, &dst),
             Via::Pooled => {
                 if let Some(intercept) = self.shared.proxy.as_ref().and_then(|m| m.intercept(&dst))
                 {
@@ -605,6 +646,25 @@ impl OamConnector {
         let info = endpoints.with_tls(tls.get_ref().1);
         Ok(OamConn::new(Box::new(tls), h2, false, info))
     }
+}
+
+/// The next connection JS supplied for `dst`'s authority, used as it is.
+fn supplied(conns: &SuppliedConns, dst: &Uri) -> Result<OamConn, BoxError> {
+    let key = authority_key(dst).ok_or("request url has no host")?;
+    let conn = conns
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_mut(&key)
+        .and_then(|queue| (!queue.is_empty()).then(|| queue.remove(0)));
+    let Some(conn) = conn else {
+        return Err(Box::new(UnsuppliedConnection(key)));
+    };
+    Ok(OamConn::new(
+        Box::new(conn.io),
+        conn.h2,
+        false,
+        ConnInfo::default(),
+    ))
 }
 
 /// Dials a proxy: the CONNECT tunnel's inner connector and the connection an

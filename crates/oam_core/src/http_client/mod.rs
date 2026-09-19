@@ -33,6 +33,10 @@
 //!   channel lifecycle.
 //! - [`bridge`]: an HTTP/1.1 exchange over a byte stream JS pumps to and from
 //!   a socket object (`http.request` over an agent's socket).
+//! - [`h2_session`]: an HTTP/2 client session over a [`crate::byte_pipe`]
+//!   (`http2.connect` over the socket it connected or `createConnection`
+//!   returned). A fetch over an undici `connect` function's socket runs over
+//!   the same kind of pipe (`send::fetch_supply`).
 //!
 //! The modules are `pub` so the URL-heavy tests live in
 //! `crates/oam_core/tests/http_client_*.rs`, outside the published-URLs gate's
@@ -42,6 +46,7 @@ pub mod body;
 pub mod bridge;
 mod connector;
 pub mod decode;
+pub mod h2_session;
 pub mod prepare;
 pub mod redirect;
 pub mod send;

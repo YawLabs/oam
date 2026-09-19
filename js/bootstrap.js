@@ -1085,6 +1085,77 @@
     });
   }
 
+  // One call of an undici dispatcher's `connect` function, as undici's
+  // Client makes it: the connector parameters and a callback taking
+  // `(err, socket)`. The first callback wins; an error, or a synchronous
+  // throw, rejects with that value unchanged. A socket handed back after
+  // that is destroyed, as nothing will use it.
+  function runConnector(connector, params) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      try {
+        connector.fn.call(connector.self, params, (err, socket) => {
+          if (settled) {
+            if (!err && socket && typeof socket.destroy === "function") socket.destroy();
+            return;
+          }
+          settled = true;
+          if (err) {
+            reject(err);
+          } else if (socket == null || typeof socket.write !== "function" || typeof socket.on !== "function") {
+            reject(new TypeError("the dispatcher's connect function returned no socket"));
+          } else {
+            resolve(socket);
+          }
+        });
+      } catch (e) {
+        if (!settled) {
+          settled = true;
+          reject(e);
+        }
+      }
+    });
+  }
+
+  // The socket a connector handed back, as the connection of one request:
+  // its bytes pumped through a pipe the parked fetch resumes on. It is the
+  // request's alone -- nothing pools it -- so once the transport lets go of
+  // the connection (or the socket closes) the socket is destroyed. An error
+  // the socket reports is the fetch's cause when the exchange fails (a
+  // connector that hands back a socket still connecting to a refused port
+  // fails with that ECONNREFUSED, as in node).
+  function supplySocket(socket) {
+    let socketError = null;
+    socket.on("error", (e) => {
+      if (socketError === null) socketError = e;
+    });
+    const pipe = globalThis.__oamNode._pipeSocket(socket);
+    const close = () => {
+      pipe.stop();
+      if (!socket.destroyed) socket.destroy();
+    };
+    pipe.outDone.then(close);
+    return { id: pipe.id, close, error: () => socketError };
+  }
+
+  // The connection policy of the undici dispatcher a fetch rides (the
+  // `dispatcher` option, else the global one): `{ connector }` for one whose
+  // `connect` is a function (a connect object carrying socket or TLS options,
+  // or an Agent `factory`, is turned into one), `{ refuse }` for one oam
+  // cannot run faithfully -- a dispatch() override, interceptors, or an
+  // object that is not one of the oam:undici shim's dispatchers -- since oam
+  // would otherwise send the request without it.
+  function dispatcherPolicy(dispatcher, holder) {
+    if (holder && typeof holder.policy === "function") return holder.policy(dispatcher);
+    const refuse = new Error(
+      "a fetch dispatcher that is not one of oam's undici dispatchers is not supported: " +
+        "oam cannot run its dispatch(); pass the connection policy as a `connect` function",
+    );
+    refuse.name = "NotSupportedError";
+    refuse.code = "UND_ERR_NOT_SUPPORTED";
+    return { refuse };
+  }
+
   // WHATWG: fetch() rejects with a TypeError on a network failure, and node's
   // message is the bare "fetch failed" with the transport error underneath as
   // `cause` -- that is where `code` (ECONNREFUSED, ENOTFOUND, ...) lives and
@@ -1110,14 +1181,14 @@
   // name up here. A hook that fails fails the fetch CLOSED (its error is the
   // cause, unchanged, as in node) and never falls back to system DNS; an
   // abort while parked drops the parked fetch.
-  async function settleFetch(pending, lookup, signal) {
-    return makeResponse(await settleRaw(pending, lookup, signal), signal);
+  async function settleFetch(pending, lookup, signal, connector) {
+    return makeResponse(await settleRaw(pending, lookup, signal, connector), signal);
   }
 
   // settleFetch's loop, ending at the op's raw payload (the response head
   // with its `bodyHandle`, and the `socket` / `tls` facts of the connection
   // it arrived on) instead of a Response.
-  async function settleRaw(pending, lookup, signal) {
+  async function settleRaw(pending, lookup, signal, connector) {
     const internal = globalThis.__oam;
     const aborted = () =>
       signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
@@ -1128,7 +1199,51 @@
       throw fetchFailed(e);
     }
     let resumed = false;
-    while (raw && raw.lookup) {
+    while (raw && (raw.lookup || raw.connect)) {
+      if (raw.connect) {
+        // Connector mode: the dispatcher's `connect` function is asked for
+        // this hop's connection, with the parameters undici's Client calls
+        // its connector with, and the request goes over the socket it hands
+        // back and nowhere else. A connector that fails (or throws) fails
+        // the fetch with its error as the cause, as in node.
+        const { token, host, hostname, protocol, port } = raw.connect;
+        const abandon = () => internal.fetchAbandon(token);
+        if (resumed && signal?.aborted) {
+          abandon();
+          throw aborted();
+        }
+        signal?.addEventListener("abort", abandon, { once: true });
+        let socket;
+        try {
+          socket = await runConnector(connector, {
+            host,
+            hostname,
+            protocol,
+            port,
+            servername: null,
+            localAddress: null,
+          });
+        } catch (err) {
+          abandon();
+          throw new TypeError("fetch failed", { cause: err });
+        } finally {
+          signal?.removeEventListener("abort", abandon);
+        }
+        if (signal?.aborted) {
+          abandon();
+          socket.destroy();
+          throw aborted();
+        }
+        resumed = true;
+        const supplied = supplySocket(socket);
+        try {
+          raw = await internal.fetchSupply(token, supplied.id, socket.alpnProtocol === "h2");
+        } catch (e) {
+          supplied.close();
+          throw fetchFailed(supplied.error() ?? e);
+        }
+        continue;
+      }
       const { token, host, port } = raw.lookup;
       const abandon = () => internal.fetchAbandon(token);
       // Aborted while the previous hop was on the wire: node ends the fetch
@@ -1388,9 +1503,24 @@
     // A replaced dns.lookup is the same kind of hook (node's net.connect
     // calls it for every connection undici opens): the dispatcher's own hook
     // wins, as undici's connector calls that one instead.
-    const dispatcher = init.dispatcher ?? globalThis.__oamUndiciDispatcher?.current;
+    const holder = globalThis.__oamUndiciDispatcher;
+    const dispatcher = init.dispatcher ?? holder?.current;
     const lookup = (dispatcher && dispatcher._oamConnectLookup) || replacedDnsLookup();
     if (typeof lookup === "function") request.lookup_hook = true;
+    // A `connect` FUNCTION is asked for every connection the fetch makes
+    // (connector mode, which wins over the lookup hook), and a dispatcher oam
+    // cannot run faithfully fails the fetch rather than being ignored. Not for
+    // http.request's internal entry: node's http.request never goes through
+    // an undici dispatcher.
+    let connector = null;
+    if (!rawPayload && dispatcher != null) {
+      const policy = dispatcherPolicy(dispatcher, holder);
+      if (policy.refuse) throw new TypeError("fetch failed", { cause: policy.refuse });
+      if (policy.connector) {
+        connector = policy.connector;
+        request.connect_hook = true;
+      }
+    }
     // Internal escape hatch: a request whose body is produced over time
     // rides an outbound body channel instead of a materialized body
     // (docs/design/streaming-bodies.md). Not part of the WHATWG surface --
@@ -1445,8 +1575,8 @@
     // Started synchronously: a malformed request or a --permission refusal
     // throws from here, as it always has.
     const pending = globalThis.__oam.fetch(JSON.stringify(request));
-    if (rawPayload) return settleRaw(pending, lookup, signal);
-    const op = settleFetch(pending, lookup, signal);
+    if (rawPayload) return settleRaw(pending, lookup, signal, connector);
+    const op = settleFetch(pending, lookup, signal, connector);
     if (!signal) return op;
     // Race the abort. Wave-1 divergence (documented): the underlying op
     // is not cancelled at the socket — the abort rejects the fetch

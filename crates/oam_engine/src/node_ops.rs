@@ -350,6 +350,12 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpBridgeInEnd", op_http_bridge_in_end),
         ("httpBridgeClose", op_http_bridge_close),
         ("httpEnvProxied", op_http_env_proxied),
+        // http2.connect sessions over a pipe (tlsPipe*; http_client::h2_session)
+        ("http2SessionOpen", op_http2_session_open),
+        ("http2SessionRequest", op_http2_session_request),
+        ("http2SessionWait", op_http2_session_wait),
+        ("http2SessionClose", op_http2_session_close),
+        ("http2SessionDestroy", op_http2_session_destroy),
         ("netCheck", op_net_check),
         ("netResolveDrop", op_net_resolve_drop),
         ("tcpRead", op_tcp_read),
@@ -3282,6 +3288,99 @@ fn op_http_env_proxied(
     rv.set_bool(core_runtime!(scope).http_client().env_proxied(&url));
 }
 
+// ------------------------------------------------------- http2 sessions
+
+/// `__oam.node.http2SessionOpen(pipeId)`: an HTTP/2 client session over the
+/// near end of pipe `pipeId` (a `tlsPipeOpen` pipe JS pumps to and from the
+/// session's socket); resolves with `{session}`.
+fn op_http2_session_open(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let pipe_id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let core = core_runtime!(scope);
+    let sessions = core.h2_sessions();
+    let pipes = core.tls_pipes();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_client::h2_session::open(sessions, pipes, pipe_id, ids),
+    );
+}
+
+/// `__oam.node.http2SessionRequest(session, requestJson)`: open one stream;
+/// resolves at its response head with the body under `bodyHandle` (read with
+/// `__oam.fetchBodyRead`).
+fn op_http2_session_request(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let Some(request) = arg_string(scope, &args, 1) else {
+        throw_type_error(scope, "http2SessionRequest requires a request");
+        return;
+    };
+    let core = core_runtime!(scope);
+    let sessions = core.h2_sessions();
+    let bodies = core.bodies();
+    let ids = core.body_ids();
+    let outbound = core.outbound_bodies();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_client::h2_session::request(sessions, id, request, bodies, ids, outbound),
+    );
+}
+
+/// `__oam.node.http2SessionWait(session)`: resolves when the session's
+/// connection ends, with how it ended. Unref'd: the socket keeps a live
+/// session's process running, as in node.
+fn op_http2_session_wait(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let sessions = core_runtime!(scope).h2_sessions();
+    crate::ops::spawn_op_unref(
+        scope,
+        &mut rv,
+        oam_core::http_client::h2_session::wait(sessions, id),
+    );
+}
+
+/// `__oam.node.http2SessionClose(session)`: open no more streams; the
+/// connection ends with a GOAWAY once the open ones are done.
+fn op_http2_session_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let closed = id >= 0.0
+        && oam_core::http_client::h2_session::close(&core_runtime!(scope).h2_sessions(), id as u64);
+    rv.set_bool(closed);
+}
+
+/// `__oam.node.http2SessionDestroy(session)`: drop the session and abort its
+/// connection.
+fn op_http2_session_destroy(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let destroyed = id >= 0.0
+        && oam_core::http_client::h2_session::destroy(
+            &core_runtime!(scope).h2_sessions(),
+            id as u64,
+        );
+    rv.set_bool(destroyed);
+}
+
 /// `__oam.node.netCheck(host, port)`: the net grant's verdict on a connect to
 /// `host:port`, the resource `tcpConnect` / `tlsConnect` ask about, taken
 /// synchronously inside `net.connect()` / `tls.connect()` before the name is
@@ -3752,6 +3851,19 @@ fn op_tls_connect(
     let Some(local) = connect_local_arg(scope, &args, 11, "tlsConnect") else {
         return;
     };
+    // ALPNProtocols: a JSON array of protocol names, one byte per code
+    // point, in preference order (tls.connect has already refused an empty
+    // or over-long one); absent or empty offers none.
+    let alpn = match arg_string(scope, &args, 12).filter(|s| !s.is_empty()) {
+        None => Vec::new(),
+        Some(json) => match oam_core::tls::parse_alpn_protocols(&json) {
+            Ok(alpn) => alpn,
+            Err(message) => {
+                throw_type_error(scope, &message);
+                return;
+            }
+        },
+    };
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
@@ -3793,6 +3905,7 @@ fn op_tls_connect(
             attempt_timeout,
             pin,
             local,
+            alpn,
         ),
     );
 }
@@ -3864,7 +3977,7 @@ fn op_tls_pipe_close(
 }
 
 /// `__oam.node.tlsConnectOver(pipe, serverName, ca, rejectUnauthorized,
-/// cert, key, minVersion, maxVersion)`: the client handshake over a pipe
+/// cert, key, minVersion, maxVersion, alpn)`: the client handshake over a pipe
 /// (`tls.connect({ socket })`); resolves as tlsConnect does, without the
 /// addresses. No net grant is asked: the socket underneath was opened (and
 /// checked) by whoever made it.
@@ -3888,6 +4001,17 @@ fn op_tls_connect_over(
     let client_key_pem = arg_string(scope, &args, 5).filter(|s| !s.is_empty());
     let min_version = arg_string(scope, &args, 6).filter(|s| !s.is_empty());
     let max_version = arg_string(scope, &args, 7).filter(|s| !s.is_empty());
+    // ALPNProtocols, as tlsConnect takes them (argument 12 there).
+    let alpn = match arg_string(scope, &args, 8).filter(|s| !s.is_empty()) {
+        None => Vec::new(),
+        Some(json) => match oam_core::tls::parse_alpn_protocols(&json) {
+            Ok(alpn) => alpn,
+            Err(message) => {
+                throw_type_error(scope, &message);
+                return;
+            }
+        },
+    };
     let core = core_runtime!(scope);
     let tls = core.tls();
     let pipes = core.tls_pipes();
@@ -3907,6 +4031,7 @@ fn op_tls_connect_over(
             client_key_pem,
             min_version,
             max_version,
+            alpn,
         ),
     );
 }

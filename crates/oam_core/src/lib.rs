@@ -694,9 +694,14 @@ pub struct CoreRuntime {
     /// http.request exchanges over a JS socket (`http_client::bridge`);
     /// dropped with the run.
     http_bridges: http_client::bridge::Bridges,
-    /// Pipes TLS runs over for `tls.connect({ socket })` (`byte_pipe`);
-    /// dropped with the run.
+    /// Pipes TLS runs over for `tls.connect({ socket })` (`byte_pipe`) --
+    /// and, the same kind of pipe, what an http2.connect session and a fetch
+    /// over an undici connect function's socket run over; dropped with the
+    /// run.
     tls_pipes: byte_pipe::Pipes,
+    /// http2.connect sessions over a pipe (`http_client::h2_session`);
+    /// dropped with the run.
+    h2_sessions: http_client::h2_session::H2Sessions,
     tx: mpsc::Sender<OpCompletion>,
     rx: mpsc::Receiver<OpCompletion>,
     next_id: OpId,
@@ -781,6 +786,7 @@ impl CoreRuntime {
             resolved_answers: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             http_bridges: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             tls_pipes: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            h2_sessions: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             tx,
             rx,
             next_id: 1,
@@ -859,9 +865,15 @@ impl CoreRuntime {
         self.http_bridges.clone()
     }
 
-    /// The pipes TLS runs over for `tls.connect({ socket })` (Arc clone).
+    /// The pipes TLS runs over for `tls.connect({ socket })` (Arc clone);
+    /// http2.connect sessions and supplied fetch connections use them too.
     pub fn tls_pipes(&self) -> byte_pipe::Pipes {
         self.tls_pipes.clone()
+    }
+
+    /// http2.connect sessions (Arc clone).
+    pub fn h2_sessions(&self) -> http_client::h2_session::H2Sessions {
+        self.h2_sessions.clone()
     }
 
     /// The streaming-body registry (Arc clone). Dies with the CoreRuntime,
@@ -3774,6 +3786,7 @@ pub mod ops {
     /// body reader is [`fetch_body_read`].
     pub use crate::http_client::send::{
         FetchContinuations, FetchRequest, RedirectMode, fetch, fetch_abandon, fetch_continue,
+        fetch_supply,
     };
 
     /// zlibStreamCreate: allocate an incremental compressor or decompressor.

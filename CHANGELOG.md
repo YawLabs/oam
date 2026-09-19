@@ -104,6 +104,28 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   port and family and the local end (by `'response'`, and on `'connect'` for a request
   sent over an agent's socket); `req.socket` is `null` until `'socket'`, and an https
   socket carries the verified session (`getPeerCertificate()`, `authorized`).
+- **`http2.connect` ignored its options.** Every stream went out on oam's shared HTTP
+  client, so the session's `lookup`, `createConnection`, `ca`, `servername`,
+  `checkServerIdentity` and `rejectUnauthorized` were never applied and
+  `session.socket` reported no addresses. A session now runs over one socket, as in
+  node: the one `createConnection` returns, else `net.connect` (http:) or `tls.connect`
+  offering h2 by ALPN (https:), so those options, a replaced `dns.lookup` and the
+  socket's `'lookup'` / `'connect'` listeners apply as they do to that socket, a refusal
+  fails the session with its own error, and `session.socket` is node's proxy of the
+  real socket. `tls.connect({ socket })` also passes `ALPNProtocols` on.
+- **An undici dispatcher's connection policy was ignored.** `import 'undici'` is oam's
+  shim even when the package is installed, and the shim honoured only `connect.lookup`: a
+  `connect` function (`new Agent|Pool|Client({ connect(opts, cb) })`), the TLS options of
+  a `connect` object (`ca`, `checkServerIdentity`, `rejectUnauthorized`, ...), an Agent's
+  `factory`, a dispatcher that overrides `dispatch()`, `interceptors`, and a dispatcher
+  that is not one of the shim's were all skipped, and oam connected by itself. Now the
+  `connect` function is called before every connection -- redirect hops included, on
+  `fetch`, the global dispatcher, `undici.fetch`, `undici.request` and `agent.request` --
+  and the request goes over the socket it returns and nowhere else; a `connect` object's
+  socket and TLS options apply through undici's `buildConnector`, which the shim now
+  exports; a factory's dispatchers decide their origins' connections. A dispatcher oam
+  cannot run as undici would (an overridden `dispatch()`, `interceptors`, a foreign
+  object) fails the request with `NotSupportedError` instead of being skipped.
 - **`--allow-net` could be bypassed through an HTTP redirect.** The grant was checked
   only against the URL a script passed to `fetch`, `http.request`, `https.request` or
   `undici.request`; the redirects those follow were not checked at all. So under
