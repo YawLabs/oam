@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "8d3e4a4",
+  "commit": "ea53133",
   "oamVersion": "oam 0.16.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 147,
-      "total": 147,
+      "pass": 151,
+      "total": 151,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -264,6 +264,22 @@
         },
         {
           "case": "155-tls-server-triple-des-keys.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "156-http-request-target-forms.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "157-http-client-connect-event.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "158-http-client-hand-read-answer-heads.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "159-http-server-request-target-forms.mjs",
           "status": "pass"
         },
         {
