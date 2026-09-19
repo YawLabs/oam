@@ -22568,6 +22568,37 @@
         return true;
       }
 
+      // node's Readable.unshift: the chunk goes back in front of whatever is
+      // buffered and is read first. ws hands the bytes that came behind a
+      // 101 back to the socket this way (`socket.unshift(head)`) before it
+      // listens for 'data', and a consumer returns what it read too far.
+      unshift(chunk, encoding) {
+        if (chunk === null || chunk === undefined) return false;
+        if (this._readableState.endEmitted) {
+          this.emit("error", codes.ERR_STREAM_UNSHIFT_AFTER_END_EVENT());
+          return false;
+        }
+        const buf = typeof chunk === "string"
+          ? globalThis.Buffer.from(chunk, encoding)
+          : globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+        if (buf.length === 0) return this._readBufBytes < 65536;
+        this._readBuf.unshift(buf);
+        this._readBufBytes += buf.length;
+        this._readableState.length = this._readBufBytes;
+        if (this._readableMode) {
+          process.nextTick(() => {
+            if (this._readableMode) this.emit("readable");
+          });
+        } else {
+          // What the read loop takes from here on queues behind it, so the
+          // order holds; it all flows again on the next tick for a 'data'
+          // listener (or when one is added, or on resume()).
+          this._holdData = true;
+          if (this.listenerCount("data") > 0 && !this._paused) this._scheduleRelease();
+        }
+        return this._readBufBytes < 65536;
+      }
+
       // The buffer drained below the limit: the read loop goes on.
       _resumeReading() {
         if (this._readFull && this._readBufBytes < 65536) {

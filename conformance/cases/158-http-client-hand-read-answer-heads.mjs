@@ -188,4 +188,29 @@ for (const kind of ["connect", "upgrade"]) {
   });
   console.log(`${kind}, read 200 ms later: ${got}`);
 }
+
+// The owner puts the head back (`socket.unshift(head)`, as ws does with the
+// bytes behind a 101) and reads the socket from the start.
+for (const kind of ["connect", "upgrade"]) {
+  script = (s) => {
+    s.write(
+      kind === "connect"
+        ? "HTTP/1.1 200 OK\r\n\r\nHEAD"
+        : "HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\nUpgrade: x\r\n\r\nHEAD",
+    );
+    setTimeout(() => s.end("TAIL"), 30);
+  };
+  const got = await new Promise((resolve) => {
+    const req = request(kind);
+    req.on(kind, (res, socket, head) => {
+      const more = socket.unshift(head);
+      let data = "";
+      socket.on("data", (d) => (data += d));
+      socket.on("end", () => resolve(`${JSON.stringify(head.toString())} unshift ${more}, read ${data}`));
+    });
+    req.on("error", (e) => resolve(`error ${e.code}`));
+    req.end();
+  });
+  console.log(`${kind}, head put back: ${got}`);
+}
 server.close();

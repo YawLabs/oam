@@ -409,7 +409,10 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   the bytes that came behind the head, whatever its status (a `407` included), and with
   no `'connect'` listener the socket is destroyed. The socket a `'connect'` or
   `'upgrade'` listener receives is handed over unflowing, as node's is, so what the peer
-  sends before the new owner reads it waits in the socket instead of being lost. These
+  sends before the new owner reads it waits in the socket instead of being lost, and
+  `net.Socket` has node's `unshift()`: the ws client puts back a server's first frame
+  that arrived with the `101` that way, and failed with `socket.unshift is not a
+  function`. These
   answers' heads are read as node's parser reads them: a malformed status line, a header
   line without a colon, obs-fold, control characters, a repeated `Content-Length` or
   `Content-Length` with `Transfer-Encoding` fail the request with node's `HPE_*` code
