@@ -1588,7 +1588,11 @@ compatibility API, `allowHTTP1`, `'unknownProtocol'` and Node's `403`. What diff
 - **`allowHTTP1` serves `http.IncomingMessage` / `http.ServerResponse`** whatever
   `Http1IncomingMessage` / `Http1ServerResponse` name, with the TLS socket as
   `req.socket`, and the HTTP/1 connection is held to the server's `headersTimeout` /
-  `requestTimeout` as they are when it connects.
+  `requestTimeout` as they are when it connects. `server.close()` stops the listener and
+  leaves open HTTP/1 connections alone (Node also closes the idle ones), and there is no
+  `closeIdleConnections()`.
+- **Keys rustls cannot sign with** -- DSA among them -- are refused at `createServer()`
+  with `ERR_OSSL_UNSUPPORTED`.
 
 _(probed)_ Node v22.22.2 and oam as servers for the same real Node clients (tls, https,
 http2, raw TCP): conformance cases 150-153.
