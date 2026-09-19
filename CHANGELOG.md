@@ -180,6 +180,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   and `req.abort()` before the response now fail the request with node's `ECONNRESET`
   `socket hang up` (they were silent), on either path; as in node, that `'error'` ends
   the process unless something listens for it.
+- **`'finish'` came before the socket connected.** A request sent over an agent's socket
+  emitted `'finish'` on the tick after `end()`, before the socket's `'lookup'`,
+  `'connect'` or `'secureConnect'`, and even when the connection was then refused; got's
+  request timing (`timings.phases.request`) came out `NaN`. It now fires once the socket
+  has written the whole request, as node's does, and `req.writableFinished` stays `false`
+  until then.
 - **`tls.connect({ socket })` works.** TLS over a socket oam did not open -- a CONNECT
   tunnel, the STARTTLS shape (`pg`, `mysql2`, `nodemailer`, `ldapjs`), TLS in TLS, or
   any JS Duplex -- failed with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. It now runs as in

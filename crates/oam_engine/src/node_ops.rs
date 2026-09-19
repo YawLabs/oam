@@ -335,6 +335,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpBridgeStart", op_http_bridge_start),
         ("httpBridgeResponse", op_http_bridge_response),
         ("httpBridgeOut", op_http_bridge_out),
+        ("httpBridgeRequestSent", op_http_bridge_request_sent),
         ("httpBridgeIn", op_http_bridge_in),
         ("httpBridgeInEnd", op_http_bridge_in_end),
         ("httpBridgeClose", op_http_bridge_close),
@@ -2989,6 +2990,24 @@ fn op_http_bridge_out(
         scope,
         &mut rv,
         oam_core::http_client::bridge::out(bridges, id),
+    );
+}
+
+/// `__oam.node.httpBridgeRequestSent(id)`: once hyper has written the whole
+/// request, how many of the `httpBridgeOut` bytes it took (node's `'finish'`
+/// follows the socket's write of the last of them); undefined if the
+/// exchange ends first. Unref'd, as httpBridgeOut: it waits on hyper.
+fn op_http_bridge_request_sent(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let bridges = core_runtime!(scope).http_bridges();
+    crate::ops::spawn_op_unref(
+        scope,
+        &mut rv,
+        oam_core::http_client::bridge::request_sent(bridges, id),
     );
 }
 

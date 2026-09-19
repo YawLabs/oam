@@ -803,13 +803,12 @@ byte-inspects the wire, or depends on the poisoned connection 400ing a
 subsequent request, will see the difference; `pipeline(readable, http.get)`
 behaves as on Node.
 
-### 17. `req.end(callback)` fires the callback on `'response'`, not `'finish'`
+### 17. `req.end(callback)` and `'finish'` -- FIXED, no longer a divergence
 
-Node invokes the `end()` callback when the request finishes writing. oam
-invokes it when the response arrives, which is strictly later. `'finish'`
-itself is emitted correctly and in Node's position (`socket -> finish ->
-response -> close`), so `req.on('finish', ...)` and `stream.finished(req)`
-both behave; only the `end(cb)` shorthand differs.
+This entry used to record that oam called the `end()` callback when the response arrived.
+It is now a `'finish'` listener called with no arguments, as in Node, and `'finish'` itself
+follows the request's write to its socket: after `'connect'` / `'secureConnect'` for a
+request sent over an agent's socket (entry 39), at once on oam's own transport (entry 38).
 
 ## Platform constant tables
 
@@ -1257,7 +1256,9 @@ What still differs:
   request's `timeout` option, an agent's `timeout`) is re-armed by what the transport does
   for the request -- sending it, each upload chunk, the response head, each body chunk --
   rather than by each read and write on a wire
-  (`conformance/cases/150-http-request-timeouts.mjs`); it emits `'close'` only when the
+  (`conformance/cases/150-http-request-timeouts.mjs`); `'finish'` follows `end()` at once,
+  as Node's does for a socket that is already connected, so it also fires for a request
+  whose connection then fails (Node's never does); it emits `'close'` only when the
   request is aborted or destroyed; and through an environment proxy its peer is the
   proxy. At the end of a response whose connection stays open,
   `res.socket` is null, as node detaches a kept-alive socket. Up to 0.16.2 it was a fixed object naming the host as
@@ -1565,6 +1566,14 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
 - **Trust.** An https request here verifies with `tls.connect`'s store -- Mozilla's roots
   plus `NODE_EXTRA_CA_CERTS`, and the request's or agent's `ca` -- as Node does, not with
   the operating system's store oam's own client uses (entry 38).
+- **`'finish'`.** As in Node, it follows the socket's write of the last request byte, so it
+  comes after `'connect'` / `'secureConnect'`, `req.writableFinished` is `false` until
+  then, and a request whose socket refused or that was destroyed before it was written
+  gets none (`conformance/cases/151-http-request-finish-order.mjs`). What differs: a
+  `write()` callback runs once the request has taken the chunk, before the socket has
+  connected, where Node's waits for the socket to write it; and a request destroyed from
+  its socket's own `'connect'` / `'secureConnect'` listener gets no `'finish'`, where
+  Node's still reports one from the write it had queued for the connect.
 - **Sockets.** A `'connect'` listener on a TLS socket runs after the handshake, since oam's
   native connect does both (entry 34); a listener that destroys the socket there still
   stops the request before it is written. oam's `net.Socket` emits `'error'` and `'close'`

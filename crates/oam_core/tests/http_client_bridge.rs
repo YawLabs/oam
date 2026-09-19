@@ -380,6 +380,120 @@ async fn an_unread_response_body_pushes_back_on_the_socket() {
     .await;
 }
 
+/// `request_sent` resolves once hyper has written the whole request -- with
+/// exactly the number of bytes `out` hands over for it, framing included --
+/// and not before; a bridge closed first answers `Done`. JS emits node's
+/// `'finish'` when the socket has written that many.
+#[tokio::test(flavor = "multi_thread")]
+async fn request_sent_counts_the_whole_request_once_it_is_written() {
+    async fn sent(reg: &Reg, id: u64) -> u64 {
+        match bridge::request_sent(reg.bridges.clone(), id).await {
+            OpOutcome::Json(n) => n.parse().unwrap(),
+            other => panic!("request_sent: {other:?}"),
+        }
+    }
+    /// Every byte `out` gives until `total` have come.
+    async fn read_exactly(reg: &Reg, id: u64, total: usize) -> Vec<u8> {
+        let mut wire = Vec::new();
+        while wire.len() < total {
+            match bridge::out(reg.bridges.clone(), id).await {
+                OpOutcome::Bytes(bytes) => wire.extend_from_slice(&bytes),
+                other => panic!("out ended early: {other:?} after {} bytes", wire.len()),
+            }
+        }
+        wire
+    }
+    within(async {
+        let reg = Reg::new();
+
+        // No body: the head is the request.
+        let id = reg.start(json!({ "method": "GET", "target": "/", "headers": [["host", "h"]] }));
+        let _head = reg.response(id);
+        let wire = reg.written_until(id, "\r\n\r\n").await;
+        assert_eq!(sent(&reg, id).await, wire.len() as u64);
+        bridge::close(&reg.bridges, id);
+
+        // A buffered body larger than the pipe: every byte of it counts.
+        let body = vec![b'a'; 300_000];
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &body);
+        let id = reg.start(json!({
+            "method": "POST",
+            "target": "/big",
+            "headers": [["host", "h"]],
+            "body_base64": encoded,
+        }));
+        let _head = reg.response(id);
+        let counted = tokio::spawn(bridge::request_sent(reg.bridges.clone(), id));
+        let head_len = "POST /big HTTP/1.1\r\nhost: h\r\ncontent-length: 300000\r\n\r\n".len();
+        let wire = read_exactly(&reg, id, head_len + body.len()).await;
+        assert_eq!(wire.len(), head_len + body.len());
+        match counted.await.unwrap() {
+            OpOutcome::Json(n) => assert_eq!(n, wire.len().to_string()),
+            other => panic!("request_sent: {other:?}"),
+        }
+        bridge::close(&reg.bridges, id);
+
+        // A streamed body: not written until its end is, then the whole of
+        // it, the last chunk's framing included.
+        let handle = 9100;
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        reg.outbound
+            .lock()
+            .unwrap()
+            .insert(handle, (Some(tx.clone()), Some(rx)));
+        let id = reg.start(json!({
+            "method": "PUT",
+            "target": "/s",
+            "headers": [["host", "h"]],
+            "body_stream": handle,
+        }));
+        let _head = reg.response(id);
+        let counted = tokio::spawn(bridge::request_sent(reg.bridges.clone(), id));
+        tx.send(Ok(b"ab".to_vec())).await.unwrap();
+        let first = reg.written_until(id, "ab\r\n").await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!counted.is_finished(), "counted before the body ended");
+        drop(tx);
+        body::end_outbound(&reg.outbound, handle);
+        let rest = reg.written_until(id, "0\r\n\r\n").await;
+        let total = first.len() + rest.len();
+        assert_eq!(
+            format!("{first}{rest}"),
+            "PUT /s HTTP/1.1\r\nhost: h\r\ntransfer-encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n"
+        );
+        match counted.await.unwrap() {
+            OpOutcome::Json(n) => assert_eq!(n, total.to_string()),
+            other => panic!("request_sent: {other:?}"),
+        }
+        bridge::close(&reg.bridges, id);
+
+        // Closed before the request was all written: never sent.
+        let handle = 9101;
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(8);
+        reg.outbound
+            .lock()
+            .unwrap()
+            .insert(handle, (Some(tx.clone()), Some(rx)));
+        let id = reg.start(json!({
+            "method": "PUT",
+            "target": "/s",
+            "headers": [["host", "h"]],
+            "body_stream": handle,
+        }));
+        let _head = reg.response(id);
+        let counted = tokio::spawn(bridge::request_sent(reg.bridges.clone(), id));
+        reg.written_until(id, "\r\n\r\n").await;
+        assert!(bridge::close(&reg.bridges, id));
+        assert!(matches!(counted.await.unwrap(), OpOutcome::Done));
+        drop(tx);
+        assert!(matches!(
+            bridge::request_sent(reg.bridges.clone(), id).await,
+            OpOutcome::Done
+        ));
+    })
+    .await;
+}
+
 /// Closing a bridge ends a parked `out` read (EOF) and fails the exchange;
 /// later calls on the id are inert.
 #[tokio::test(flavor = "multi_thread")]

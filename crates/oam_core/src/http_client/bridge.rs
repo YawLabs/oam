@@ -17,22 +17,33 @@
 //! ends, fails, or the request is destroyed. Closing aborts the connection
 //! task, which ends a parked [`out`] read with EOF.
 //!
+//! [`request_sent`] tells JS how many of the bytes [`out`] hands it make up
+//! the whole request, once hyper has written all of them: node emits
+//! `'finish'` when the socket has written the last of those.
+//!
 //! Upgrades (`Connection: upgrade`) do not come here: JS writes and parses
 //! those itself so the socket can be handed over after the 101.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Poll};
 
 use base64::Engine as _;
 use bytes::Bytes;
 use http::header::{HeaderName, HeaderValue};
+use hyper::body::{Frame, SizeHint};
 use hyper_util::rt::TokioIo;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
+use tokio::io::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf, ReadHalf, WriteHalf,
+};
+use tokio::sync::watch;
 
 use super::body::{FetchBodies, FetchBody, StreamSlot};
 use super::transport::{channel_body, empty_body, full_body};
+use super::{BoxError, ReqBody};
 use crate::{OpOutcome, OutboundBodies};
 
 /// Each direction of the in-memory pipe buffers at most this much.
@@ -61,6 +72,9 @@ pub struct Bridge {
     input: Option<WriteHalf<DuplexStream>>,
     /// The connection task, once started.
     task: Option<tokio::task::AbortHandle>,
+    /// Set once hyper has written the whole request into the pipe: how many
+    /// bytes it wrote (see [`RequestEnd`]).
+    sent: watch::Receiver<Option<u64>>,
 }
 
 impl Drop for Bridge {
@@ -76,6 +90,137 @@ struct Pending {
     parts: http::request::Parts,
     body: Body,
     max_header_size: u64,
+    sent: watch::Sender<Option<u64>>,
+}
+
+/// How [`request_sent`] learns that the request is all written.
+///
+/// hyper has no such signal, so two wrappers make one. The request body
+/// ([`EndWatch`]) records that hyper has seen its end -- hyper asks
+/// `is_end_stream` before it encodes the last bytes, or polls the end of a
+/// streamed body -- and the pipe end hyper writes to ([`Counted`]) counts
+/// the bytes and, at the first completed flush after that, publishes the
+/// count. hyper flushes the pipe only once its own write buffer is empty,
+/// so at that flush every request byte, the body's framing end included,
+/// is in the pipe. Each bridge carries one request, so no later request's
+/// bytes are in the count.
+struct RequestEnd {
+    body_ended: Arc<AtomicBool>,
+    sent: watch::Sender<Option<u64>>,
+}
+
+/// hyper's end of the pipe, counting what hyper writes (see [`RequestEnd`]).
+struct Counted {
+    io: DuplexStream,
+    written: u64,
+    end: RequestEnd,
+}
+
+impl Counted {
+    fn flushed(&mut self) {
+        if self.written == 0 || !self.end.body_ended.load(Ordering::Acquire) {
+            return;
+        }
+        let written = self.written;
+        self.end.sent.send_if_modified(|sent| {
+            if sent.is_some() {
+                return false;
+            }
+            *sent = Some(written);
+            true
+        });
+    }
+}
+
+impl AsyncRead for Counted {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Counted {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.io).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = &polled {
+            this.written += *n as u64;
+        }
+        polled
+    }
+
+    fn poll_write_vectored(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.io).poll_write_vectored(cx, bufs);
+        if let Poll::Ready(Ok(n)) = &polled {
+            this.written += *n as u64;
+        }
+        polled
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.io.is_write_vectored()
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.io).poll_flush(cx);
+        if let Poll::Ready(Ok(())) = &polled {
+            this.flushed();
+        }
+        polled
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+    }
+}
+
+/// The request body, recording when hyper has reached its end (see
+/// [`RequestEnd`]).
+struct EndWatch {
+    body: ReqBody,
+    ended: Arc<AtomicBool>,
+}
+
+impl hyper::body::Body for EndWatch {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        let polled = Pin::new(&mut this.body).poll_frame(cx);
+        if let Poll::Ready(None) = &polled {
+            this.ended.store(true, Ordering::Release);
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        let end = self.body.is_end_stream();
+        if end {
+            self.ended.store(true, Ordering::Release);
+        }
+        end
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.body.size_hint()
+    }
 }
 
 enum Body {
@@ -209,6 +354,7 @@ pub fn start(
     };
     let (near, far) = tokio::io::duplex(PIPE);
     let (out, input) = tokio::io::split(far);
+    let (sent_tx, sent_rx) = watch::channel(None);
     let id = ids.fetch_add(1, Ordering::Relaxed);
     lock(bridges).insert(
         id,
@@ -218,10 +364,12 @@ pub fn start(
                 parts,
                 body,
                 max_header_size: req.max_header_size.unwrap_or(DEFAULT_MAX_HEADER_SIZE),
+                sent: sent_tx,
             }),
             out: Some(out),
             input: Some(input),
             task: None,
+            sent: sent_rx,
         },
     );
     Ok(id)
@@ -289,6 +437,7 @@ pub async fn response(
         parts,
         mut body,
         max_header_size,
+        sent,
     }) = pending
     else {
         return OpOutcome::Failed(format!("httpBridgeResponse: bridge {id} is gone"));
@@ -297,7 +446,19 @@ pub async fn response(
         Ok(request_body) => request_body,
         Err(text) => return OpOutcome::Failed(text),
     };
-    let request = http::Request::from_parts(parts, request_body);
+    let body_ended = Arc::new(AtomicBool::new(false));
+    let request = http::Request::from_parts(
+        parts,
+        EndWatch {
+            body: request_body,
+            ended: body_ended.clone(),
+        },
+    );
+    let io = Counted {
+        io,
+        written: 0,
+        end: RequestEnd { body_ended, sent },
+    };
     let (mut sender, connection) = match hyper::client::conn::http1::Builder::new()
         .handshake(TokioIo::new(io))
         .await
@@ -384,6 +545,25 @@ pub async fn out(bridges: Bridges, id: u64) -> OpOutcome {
             buf.truncate(n);
             OpOutcome::Bytes(buf)
         }
+    }
+}
+
+/// `httpBridgeRequestSent`: once hyper has written the whole request, how
+/// many bytes that was -- the count of [`out`] bytes the socket has to have
+/// written for node's `'finish'`. `Done` if the exchange ends first (a
+/// failed or destroyed request is never finished).
+pub async fn request_sent(bridges: Bridges, id: u64) -> OpOutcome {
+    let sent = lock(&bridges).get(&id).map(|bridge| bridge.sent.clone());
+    let Some(mut sent) = sent else {
+        return OpOutcome::Done;
+    };
+    let count = match sent.wait_for(Option::is_some).await {
+        Ok(count) => *count,
+        Err(_) => None,
+    };
+    match count {
+        Some(count) => OpOutcome::Json(count.to_string()),
+        None => OpOutcome::Done,
     }
 }
 

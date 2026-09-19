@@ -18467,6 +18467,17 @@
         this._keptAlive = false;
         // The socket's EOF, held back while the response head is due.
         this._eofHold = null;
+        // node's 'finish' over a socket: once end() has been called
+        // (_finishOnWrite) and the socket has written the whole request --
+        // `_requestBytes` (the bridge's count, once hyper has written it all)
+        // of the `_requestOut` bytes written so far (_requestFlushed).
+        // `_finishAwaitsPath`: end() came while the way to send was still
+        // being decided (_emitFetchSocket).
+        this._finishOnWrite = false;
+        this._finishAwaitsPath = false;
+        this._requestBytes = null;
+        this._requestOut = 0;
+        this._requestWritten = false;
         this._exchangeQueued = false;
         this._waitingConnect = false;
         this._earlySocketEvents = null;
@@ -18700,20 +18711,54 @@
         } else {
           self._dispatch(bodyData);
         }
-        // Node emits 'finish' once the message has been handed to the
-        // socket -- here, once the body has been handed to the transport.
-        // The tick keeps the ctor's 'socket' first, matching Node's
-        // socket -> finish -> response -> close order.
+        // Node emits 'finish' once the message has been written to the
+        // socket (_finishAfterEnd). The tick keeps the ctor's 'socket'
+        // first, matching Node's socket -> finish -> response -> close
+        // order.
         process.nextTick(function () {
-          if (self._finished) return;
-          self._finished = true;
-          self._bodyLength = 0;
-          self.emit("finish");
+          self._finishAfterEnd();
         });
         // node: end()'s callback is a 'finish' listener, called with no
         // arguments (got treats an argument as the request's failure).
         if (typeof callback === "function") self.once("finish", callback);
         return this;
+      }
+
+      // node's 'finish': the request has been written to its socket. On oam's
+      // own transport that is when the transport has it (now); over a
+      // socket, when the socket has written the last request byte, which is
+      // after it connected (_requestFlushed). A request destroyed first
+      // never finishes, as in node.
+      _finishAfterEnd() {
+        if (this._finished || this._aborted || this._errorEmitted) return;
+        if (this._agentPath) {
+          this._finishOnWrite = true;
+          if (this._requestWritten) this._emitFinish();
+          return;
+        }
+        // A 'socket' listener may still watch the socket, which sends the
+        // request over a real connection: the decision says (decide()).
+        if (!this._socketEmitted) {
+          this._finishAwaitsPath = true;
+          return;
+        }
+        this._emitFinish();
+      }
+
+      _emitFinish() {
+        if (this._finished || this._aborted) return;
+        this._finished = true;
+        this._bodyLength = 0;
+        this.emit("finish");
+      }
+
+      // The socket accepted more request bytes (or the bridge said how many
+      // the request is): once it has written them all, the request is out.
+      _requestFlushed() {
+        if (this._requestWritten || this._requestBytes === null) return;
+        if (this._requestOut < this._requestBytes) return;
+        this._requestWritten = true;
+        if (this._finishOnWrite) this._emitFinish();
       }
 
       // The request is ready to go (end(), a streamed body's first write, or
@@ -18750,6 +18795,10 @@
           if (self._pendingDispatch !== null) {
             if (self._agentPath) self._maybeStartExchange();
             else self._runFetchDispatch();
+          }
+          if (self._finishAwaitsPath) {
+            self._finishAwaitsPath = false;
+            self._finishAfterEnd();
           }
         };
         // With nothing listening for 'socket', or a socket already watched,
@@ -19463,13 +19512,25 @@
             socket.write(
               globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
               function (err) {
-                if (err) outDone();
-                else pumpOut();
+                if (err) {
+                  outDone();
+                  return;
+                }
+                self._requestOut += bytes.byteLength;
+                self._requestFlushed();
+                pumpOut();
               },
             );
           }, function () { outDone(); });
         };
         pumpOut();
+        // How many of those bytes are the request, once hyper has written it
+        // all: node's 'finish' waits for the socket to have written them.
+        natives.httpBridgeRequestSent(id).then(function (count) {
+          if (count === undefined) return;
+          self._requestBytes = count;
+          self._requestFlushed();
+        }, function () {});
       }
 
       _bridgeInEnd() {
@@ -19556,8 +19617,19 @@
         }
         var head = this.method + " " + this.path + " HTTP/1.1\r\n";
         for (var h = 0; h < list.length; h++) head += list[h][0] + ": " + list[h][1] + "\r\n";
-        socket.write(globalThis.Buffer.from(head + "\r\n", "latin1"));
-        if (bodyData && bodyData.length > 0) socket.write(bodyData);
+        // The request is out once the socket has written its last piece.
+        var written = function (err) {
+          if (err) return;
+          self._requestWritten = true;
+          if (self._finishOnWrite) self._emitFinish();
+        };
+        var headBytes = globalThis.Buffer.from(head + "\r\n", "latin1");
+        if (bodyData && bodyData.length > 0) {
+          socket.write(headBytes);
+          socket.write(bodyData, written);
+        } else {
+          socket.write(headBytes, written);
+        }
         var responseBuf = globalThis.Buffer.alloc(0);
         // node's parser gives up on a head past maxHeaderSize (16 KiB by
         // default): a peer that never ends its head cannot grow this buffer
