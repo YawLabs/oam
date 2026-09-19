@@ -58,6 +58,15 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   port and family and the local end (by `'response'`, and on `'connect'` for a request
   sent over an agent's socket); `req.socket` is `null` until `'socket'`, and an https
   socket carries the verified session (`getPeerCertificate()`, `authorized`).
+- **`http2.connect` ignored its options.** Every stream went out on oam's shared HTTP
+  client, so the session's `lookup`, `createConnection`, `ca`, `servername`,
+  `checkServerIdentity` and `rejectUnauthorized` were never applied and
+  `session.socket` reported no addresses. A session now runs over one socket, as in
+  node: the one `createConnection` returns, else `net.connect` (http:) or `tls.connect`
+  offering h2 by ALPN (https:), so those options, a replaced `dns.lookup` and the
+  socket's `'lookup'` / `'connect'` listeners apply as they do to that socket, a refusal
+  fails the session with its own error, and `session.socket` is node's proxy of the
+  real socket. `tls.connect({ socket })` also passes `ALPNProtocols` on.
 
 - **`--allow-net` could be bypassed through an HTTP redirect.** The grant was checked
   only against the URL a script passed to `fetch`, `http.request`, `https.request` or
