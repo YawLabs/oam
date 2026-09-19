@@ -15,7 +15,9 @@
 //! memory, the streaming push has a STALL TIMEOUT so a half-open client
 //! can't wedge the pump, and close() does a GRACEFUL shutdown (in-flight
 //! requests finish, keep-alive is disabled) instead of resetting live
-//! connections.
+//! connections. Every HTTP/1 connection is held to node's server timeouts
+//! (`http_conn`): headersTimeout / requestTimeout, keepAliveTimeout and the
+//! socket timeout.
 
 use bytes::Bytes;
 use http_body_util::BodyExt;
@@ -27,6 +29,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
+use crate::http_conn::{CloseReason, ConnWatch, ServerTimeouts, TimeoutSettings, WatchedIo};
 use crate::http_head::{HeadError, HeadPolicy};
 
 /// Per-request body cap (wave-1 buffered bodies).
@@ -89,6 +92,28 @@ pub struct IncomingRequest {
     pub socket_handle: Option<u64>,
     /// Both ends of the connection the request arrived on.
     pub conn: ConnAddrs,
+    /// The connection's id for `httpConnSetTimeout` / `httpConnDestroy`
+    /// (an HTTP/1 connection held to node's timeouts).
+    pub conn_id: Option<u64>,
+}
+
+/// What a server's accept queue carries to JS.
+pub enum ServerEvent {
+    Request(IncomingRequest),
+    /// A connection's socket timeout expired (node's socket 'timeout'): JS
+    /// emits 'timeout' and destroys the connection when nobody listens.
+    Timeout {
+        conn_id: u64,
+        /// The request whose response was in flight, if any.
+        request_id: Option<u64>,
+        conn: ConnAddrs,
+    },
+    /// A connection was closed (a request timeout, a destroyed socket) while
+    /// `request_id` had no response yet: JS closes the response (node's
+    /// 'close' without 'finish').
+    Closed {
+        request_id: u64,
+    },
 }
 
 /// Both ends of an accepted connection, as the OS reports them.
@@ -258,18 +283,23 @@ pub struct ResponseSpec {
 struct ServerEntry {
     /// Taken out for the duration of each accept await (remove-await-
     /// reinsert; the JS accept loop is the single consumer).
-    queue: Option<mpsc::Receiver<IncomingRequest>>,
+    queue: Option<mpsc::Receiver<ServerEvent>>,
     /// watch (not oneshot): every CONNECTION task selects on it too.
     /// Keep-alive sockets (a client pool can idle one for 90s) would
     /// otherwise hold queue_tx clones long after close, leaving the
     /// pending accept op pinning the event loop open.
     shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    /// node's timeout settings for the server's connections (none for the
+    /// http2 server).
+    timeouts: Option<Arc<ServerTimeouts>>,
 }
 
 #[derive(Default)]
 pub struct HttpState {
     next: AtomicU64,
     servers: Mutex<HashMap<u64, ServerEntry>>,
+    /// connection id -> the timeouts of an HTTP/1 connection being served.
+    conns: Mutex<HashMap<u64, Arc<ConnWatch>>>,
     /// request id -> the hyper-side responder waiting for JS.
     pending: Mutex<HashMap<u64, oneshot::Sender<ResponseSpec>>>,
     /// request id -> request body (fetched once by JS).
@@ -288,6 +318,85 @@ pub struct HttpState {
 impl HttpState {
     fn next_id(&self) -> u64 {
         self.next.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Start tracking a connection's timeouts; it is forgotten when the
+    /// returned guard drops (the connection task ends, or the socket went to
+    /// JS as an upgrade).
+    fn register_conn(self: &Arc<Self>, watch: Arc<ConnWatch>) -> ConnRegistration {
+        let id = watch.id;
+        self.conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, watch);
+        ConnRegistration {
+            state: Arc::clone(self),
+            id,
+        }
+    }
+
+    fn conn(&self, conn_id: u64) -> Option<Arc<ConnWatch>> {
+        self.conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&conn_id)
+            .cloned()
+    }
+
+    /// node's checkConnections for `server_id`: every connection whose
+    /// request did not arrive within `headers_ms` / `requestTimeout` is
+    /// answered 408 and closed. Returns how many.
+    pub fn expire_connections(&self, server_id: u64, headers_ms: u64, request_ms: u64) -> usize {
+        if headers_ms == 0 && request_ms == 0 {
+            return 0;
+        }
+        let now = tokio::time::Instant::now();
+        let due: Vec<Arc<ConnWatch>> = self
+            .conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .filter(|w| w.server_id == server_id && w.expire(headers_ms, request_ms, now))
+            .cloned()
+            .collect();
+        for watch in &due {
+            watch.close(CloseReason::RequestTimeout);
+        }
+        due.len()
+    }
+
+    /// The server's timeout properties, as JS read them.
+    pub fn update_timeouts(
+        &self,
+        server_id: u64,
+        headers_ms: u64,
+        request_ms: u64,
+        keep_alive_ms: u64,
+        socket_ms: u64,
+    ) {
+        if let Some(timeouts) = self
+            .servers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&server_id)
+            .and_then(|entry| entry.timeouts.clone())
+        {
+            timeouts.update(headers_ms, request_ms, keep_alive_ms, socket_ms);
+        }
+    }
+
+    /// `socket.setTimeout(ms)` on a server connection.
+    pub fn set_conn_timeout(&self, conn_id: u64, ms: u64) {
+        if let Some(watch) = self.conn(conn_id) {
+            watch.set_socket_timeout(ms);
+        }
+    }
+
+    /// `socket.destroy()` on a server connection.
+    pub fn destroy_conn(&self, conn_id: u64) {
+        if let Some(watch) = self.conn(conn_id) {
+            watch.close(CloseReason::Destroy);
+        }
     }
 
     /// Sync (isolate-thread) helpers consumed by the engine natives.
@@ -561,7 +670,198 @@ fn http1_builder(policy: HeadPolicy) -> hyper::server::conn::http1::Builder {
     builder
 }
 
+/// Removes a connection from `HttpState::conns` when dropped.
+struct ConnRegistration {
+    state: Arc<HttpState>,
+    id: u64,
+}
+
+impl Drop for ConnRegistration {
+    fn drop(&mut self) {
+        self.state
+            .conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+/// Marks the request being received as all in when dropped: its body was
+/// read to the end, failed, or will not be read (node's message complete,
+/// after which headersTimeout / requestTimeout no longer apply to it).
+struct MessageDone(Option<Arc<ConnWatch>>);
+
+impl Drop for MessageDone {
+    fn drop(&mut self) {
+        if let Some(watch) = &self.0 {
+            watch.message_complete();
+        }
+    }
+}
+
+/// A response body that tells the connection's watch when the response is
+/// done (written to the end, or dropped with the connection): the moment
+/// node starts an idle keep-alive connection's timeout.
+struct ResponseDone {
+    inner: BoxedBody,
+    watch: Arc<ConnWatch>,
+}
+
+impl hyper::body::Body for ResponseDone {
+    type Data = Bytes;
+    type Error = <BoxedBody as hyper::body::Body>::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+impl Drop for ResponseDone {
+    fn drop(&mut self) {
+        self.watch.response_finished();
+    }
+}
+
+/// The response for a request on a watched connection: its head is about
+/// to go out, and its body reports when it is done.
+fn watched_response(
+    response: hyper::Response<BoxedBody>,
+    watch: Option<&Arc<ConnWatch>>,
+) -> hyper::Response<BoxedBody> {
+    let Some(watch) = watch else {
+        return response;
+    };
+    watch.response_started();
+    let (parts, body) = response.into_parts();
+    hyper::Response::from_parts(
+        parts,
+        ResponseDone {
+            inner: body,
+            watch: Arc::clone(watch),
+        }
+        .boxed(),
+    )
+}
+
+/// A connection's socket timeout expired: node emits 'timeout' on the
+/// request, the response and the server and destroys the socket when none
+/// of them listens. A node:http server decides in JS; for any other server,
+/// or when JS cannot be told (its queue is full or gone), the connection is
+/// closed here.
+fn socket_timed_out(
+    queue: &mpsc::Sender<ServerEvent>,
+    watch: &ConnWatch,
+    js_driven: bool,
+    request_id: Option<u64>,
+    conn: ConnAddrs,
+) {
+    let told = js_driven
+        && queue
+            .try_send(ServerEvent::Timeout {
+                conn_id: watch.id,
+                request_id,
+                conn,
+            })
+            .is_ok();
+    if !told {
+        watch.close(CloseReason::Destroy);
+    }
+}
+
+/// node's checkConnections for a server whose connections JS does not
+/// check (`oam.serve`): every `connectionsCheckingInterval`, with the
+/// server's headers / request timeouts.
+async fn check_connections(
+    state: Arc<HttpState>,
+    server_id: u64,
+    timeouts: Arc<ServerTimeouts>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let interval = timeouts.check_interval();
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let (headers_ms, request_ms) = timeouts.headers_and_request_ms();
+                state.expire_connections(server_id, headers_ms, request_ms);
+            }
+            _ = shutdown.changed() => break,
+        }
+    }
+}
+
+/// Serve one HTTP/1 connection with hyper, held to node's timeouts: runs
+/// until the connection ends, closing it early when `watch` is closed
+/// (a request timeout answers 408 first), gracefully on server shutdown.
+#[allow(clippy::too_many_arguments)]
+async fn serve_http1<S, Svc>(
+    stream: S,
+    watch: Arc<ConnWatch>,
+    policy: HeadPolicy,
+    service: Svc,
+    queue: mpsc::Sender<ServerEvent>,
+    js_driven: bool,
+    addrs: ConnAddrs,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    Svc: hyper::service::Service<
+            hyper::Request<hyper::body::Incoming>,
+            Response = hyper::Response<BoxedBody>,
+            Error = RequestAborted,
+        > + Unpin
+        + Send
+        + 'static,
+    Svc::Future: Send + 'static,
+{
+    let io = hyper_util::rt::TokioIo::new(WatchedIo::new(stream, Arc::clone(&watch)));
+    let mut conn = http1_builder(policy).serve_connection(io, service);
+    // GRACEFUL shutdown on close(): disable keep-alive and let the
+    // IN-FLIGHT request finish (Node's server.close() semantics), instead
+    // of resetting it. An idle keep-alive connection just closes -- so the
+    // queue_tx clone still drops promptly and the accept op isn't pinned.
+    let mut shutting_down = false;
+    let closed = loop {
+        tokio::select! {
+            _ = &mut conn => break None,
+            _ = shutdown.changed(), if !shutting_down => {
+                shutting_down = true;
+                std::pin::Pin::new(&mut conn).graceful_shutdown();
+            }
+            reason = watch.closed() => break Some(reason),
+            request_id = watch.next_timeout() => {
+                socket_timed_out(&queue, &watch, js_driven, request_id, addrs);
+            }
+        }
+    };
+    if let Some(reason) = closed {
+        // hyper's side ends here (an in-flight handler future is dropped);
+        // the stream comes back for node's farewell.
+        // Read before hyper's side goes: dropping it ends the response.
+        let unanswered = watch.current_request();
+        let may_answer = watch.may_answer();
+        let stream = conn.into_parts().io.into_inner().into_inner();
+        crate::http_conn::finish_close(stream, reason, may_answer).await;
+        if js_driven && let Some(request_id) = unanswered {
+            let _ = queue.try_send(ServerEvent::Closed { request_id });
+        }
+    }
+}
+
 /// Bind + spawn the accept loop. Resolves Json {serverId, port}.
+#[allow(clippy::too_many_arguments)]
 pub async fn http_serve(
     state: Arc<HttpState>,
     tcp: super::tcp::TcpRegistry,
@@ -573,6 +873,8 @@ pub async fn http_serve(
     stream_request_body: bool,
     // maxHeaderSize / insecureHTTPParser for this server.
     policy: HeadPolicy,
+    // node's server timeouts (headersTimeout, keepAliveTimeout, ...).
+    timeouts: TimeoutSettings,
 ) -> super::OpOutcome {
     let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
         Ok(listener) => listener,
@@ -580,8 +882,9 @@ pub async fn http_serve(
     };
     let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     let server_id = state.next_id();
-    let (queue_tx, queue_rx) = mpsc::channel::<IncomingRequest>(64);
+    let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let server_timeouts = ServerTimeouts::new(timeouts);
     state
         .servers
         .lock()
@@ -591,8 +894,17 @@ pub async fn http_serve(
             ServerEntry {
                 queue: Some(queue_rx),
                 shutdown: Some(shutdown_tx),
+                timeouts: Some(Arc::clone(&server_timeouts)),
             },
         );
+    if !server_timeouts.js_driven() {
+        tokio::spawn(check_connections(
+            state.clone(),
+            server_id,
+            Arc::clone(&server_timeouts),
+            shutdown_rx.clone(),
+        ));
+    }
 
     let accept_state = state.clone();
     let accept_tcp = tcp;
@@ -622,16 +934,41 @@ pub async fn http_serve(
                     let conn_tcp = accept_tcp.clone();
                     let conn_tcp_ids = accept_tcp_ids.clone();
                     let conn_stream_bodies = stream_request_body;
+                    let conn_timeouts = Arc::clone(&server_timeouts);
                     let mut conn_shutdown = shutdown_rx.clone();
                     tokio::spawn(async move {
                         let permit = permit;
+                        // node's timeouts hold from the accept: a connection
+                        // that never sends a byte is answered 408 once
+                        // headersTimeout passes, like any other.
+                        let watch =
+                            ConnWatch::new(conn_state.next_id(), server_id, conn_timeouts.clone());
+                        let registration = conn_state.register_conn(Arc::clone(&watch));
+                        let js_driven = conn_timeouts.js_driven();
                         // Peek for Connection: Upgrade before hyper takes
                         // ownership. A server close() while the client has
                         // sent nothing ends the connection here.
                         let mut peek_buf = [0u8; 8192];
-                        let peeked = tokio::select! {
-                            peeked = stream.peek(&mut peek_buf) => peeked,
-                            _ = conn_shutdown.changed() => return,
+                        let peeked = loop {
+                            tokio::select! {
+                                peeked = stream.peek(&mut peek_buf) => break peeked,
+                                _ = conn_shutdown.changed() => return,
+                                reason = watch.closed() => {
+                                    let may_answer = watch.may_answer();
+                                    crate::http_conn::finish_close(&mut stream, reason, may_answer)
+                                        .await;
+                                    return;
+                                }
+                                request_id = watch.next_timeout() => {
+                                    socket_timed_out(
+                                        &conn_queue,
+                                        &watch,
+                                        js_driven,
+                                        request_id,
+                                        conn_addrs,
+                                    );
+                                }
+                            }
                         };
                         let upgrade_head = match peeked {
                             Ok(n) if n > 16 => {
@@ -641,6 +978,10 @@ pub async fn http_serve(
                         };
 
                         if let Some(consume) = upgrade_head {
+                            // The upgraded socket leaves node's http timeouts
+                            // (node drops its 'timeout' handling) and, below,
+                            // the connection cap: it belongs to JS.
+                            drop(registration);
                             let mut head = vec![0u8; consume];
                             if stream.read_exact(&mut head).await.is_err() {
                                 return;
@@ -658,7 +999,7 @@ pub async fn http_serve(
                                     .unwrap_or_else(|e| e.into_inner())
                                     .register_stream(handle, reader, writer);
                                 let _ = conn_queue
-                                    .send(IncomingRequest {
+                                    .send(ServerEvent::Request(IncomingRequest {
                                         id,
                                         method: parsed.method,
                                         uri: parsed.target,
@@ -666,51 +1007,43 @@ pub async fn http_serve(
                                         is_upgrade: true,
                                         socket_handle: Some(handle),
                                         conn: conn_addrs,
-                                    })
+                                        conn_id: None,
+                                    }))
                                     .await;
                                 }
                                 Err(error) => refuse_raw(&mut stream, error).await,
                             }
-                            // The upgraded socket belongs to JS now; it no
-                            // longer counts against the connection cap.
                             drop(permit);
                             return;
                         }
 
                         // Normal HTTP: hand to hyper.
                         let _permit = permit;
-                        let io = hyper_util::rt::TokioIo::new(stream);
+                        let _registration = registration;
+                        let service_queue = conn_queue.clone();
+                        let service_watch = Arc::clone(&watch);
                         let service = hyper::service::service_fn(move |req| {
                             handle_request(
                                 conn_state.clone(),
-                                conn_queue.clone(),
+                                service_queue.clone(),
                                 req,
                                 conn_stream_bodies, // per-server opt-in
                                 conn_addrs,
                                 policy,
+                                Some(Arc::clone(&service_watch)),
                             )
                         });
-                        let conn = http1_builder(policy).serve_connection(io, service);
-                        // GRACEFUL shutdown on close(): disable keep-alive and
-                        // let the IN-FLIGHT request finish (Node's
-                        // server.close() semantics), instead of resetting it.
-                        // An idle keep-alive connection just closes — so the
-                        // queue_tx clone still drops promptly and the accept
-                        // op isn't pinned.
-                        let mut conn = std::pin::pin!(conn);
-                        let mut shutting_down = false;
-                        loop {
-                            tokio::select! {
-                                result = conn.as_mut() => {
-                                    let _ = result;
-                                    break;
-                                }
-                                _ = conn_shutdown.changed(), if !shutting_down => {
-                                    shutting_down = true;
-                                    conn.as_mut().graceful_shutdown();
-                                }
-                            }
-                        }
+                        serve_http1(
+                            stream,
+                            watch,
+                            policy,
+                            service,
+                            conn_queue,
+                            js_driven,
+                            conn_addrs,
+                            conn_shutdown,
+                        )
+                        .await;
                     });
                 }
             }
@@ -839,6 +1172,9 @@ async fn pump_request_body(
     chunk_tx: mpsc::Sender<Result<BudgetedChunk, String>>,
     state: std::sync::Arc<HttpState>,
     id: u64,
+    // Dropped when the pump ends: the request is all in, as far as node's
+    // headers / request timeouts go.
+    _message_done: MessageDone,
 ) {
     use http_body_util::BodyExt;
     let mut total: usize = 0;
@@ -977,13 +1313,51 @@ impl std::fmt::Display for RequestAborted {
 
 impl std::error::Error for RequestAborted {}
 
+/// One request, from hyper to JS and back. On a connection held to node's
+/// timeouts (`watch`), its headers are in now, its body is all in when the
+/// body is read to the end (or no longer read), and the response it gets
+/// reports its start and its end.
 async fn handle_request(
     state: Arc<HttpState>,
-    queue: mpsc::Sender<IncomingRequest>,
+    queue: mpsc::Sender<ServerEvent>,
     req: hyper::Request<hyper::body::Incoming>,
     stream_request_body: bool,
     conn: ConnAddrs,
     policy: HeadPolicy,
+    watch: Option<Arc<ConnWatch>>,
+) -> Result<hyper::Response<BoxedBody>, RequestAborted> {
+    let id = state.next_id();
+    if let Some(watch) = &watch {
+        watch.headers_complete(id);
+    }
+    let message_done = MessageDone(watch.clone());
+    let conn_id = watch.as_ref().map(|w| w.id);
+    let response = dispatch_request(
+        state,
+        queue,
+        req,
+        stream_request_body,
+        conn,
+        policy,
+        id,
+        message_done,
+        conn_id,
+    )
+    .await?;
+    Ok(watched_response(response, watch.as_ref()))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_request(
+    state: Arc<HttpState>,
+    queue: mpsc::Sender<ServerEvent>,
+    req: hyper::Request<hyper::body::Incoming>,
+    stream_request_body: bool,
+    conn: ConnAddrs,
+    policy: HeadPolicy,
+    id: u64,
+    message_done: MessageDone,
+    conn_id: Option<u64>,
 ) -> Result<hyper::Response<BoxedBody>, RequestAborted> {
     // node's rules for the head, on the bytes hyper parsed (HTTP/1 only;
     // an HTTP/2 request has no such head). A refused request never reaches
@@ -1020,7 +1394,7 @@ async fn handle_request(
         .and_then(|v| v.parse::<usize>().ok())
         .is_some_and(|len| len > MAX_REQUEST_BODY);
     let (collected, body_stream) = if stream_request_body && !declared_oversize {
-        (bytes::Bytes::new(), Some(body))
+        (bytes::Bytes::new(), Some((body, message_done)))
     } else {
         let collected = match collect_body(body).await {
             Ok(bytes) => bytes,
@@ -1034,6 +1408,7 @@ async fn handle_request(
             }
             Err(CollectError::Gone) => return Err(RequestAborted),
         };
+        drop(message_done);
         (collected, None)
     };
     // Reserve the retained bytes; refund (RequestGuard) on completion. A
@@ -1045,7 +1420,6 @@ async fn handle_request(
         state.body_bytes.fetch_sub(body_len, Ordering::AcqRel);
         return Ok(status_body(503, b"server is busy"));
     }
-    let id = state.next_id();
     let headers: Vec<(String, String)> = parts
         .headers
         .iter()
@@ -1068,7 +1442,7 @@ async fn handle_request(
         .lock()
         .expect("http pending lock")
         .insert(id, tx);
-    if let Some(body) = body_stream {
+    if let Some((body, message_done)) = body_stream {
         // Bounded: an unconsumed body applies backpressure to hyper rather
         // than growing without limit. This is the memory ceiling that
         // replaces the buffered path's byte reservation.
@@ -1083,6 +1457,7 @@ async fn handle_request(
             chunk_tx,
             std::sync::Arc::clone(&state),
             id,
+            message_done,
         ));
     } else {
         state
@@ -1102,7 +1477,7 @@ async fn handle_request(
     };
 
     let sent = queue
-        .send(IncomingRequest {
+        .send(ServerEvent::Request(IncomingRequest {
             id,
             method: parts.method.as_str().to_string(),
             uri,
@@ -1110,7 +1485,8 @@ async fn handle_request(
             is_upgrade: false,
             socket_handle: None,
             conn,
-        })
+            conn_id,
+        }))
         .await;
     if sent.is_err() {
         return Ok(hyper::Response::builder()
@@ -1150,6 +1526,8 @@ pub async fn https_serve(
     max_version: Option<String>,
     // maxHeaderSize / insecureHTTPParser for this server.
     policy: HeadPolicy,
+    // node's server timeouts, and the TLS handshakeTimeout.
+    timeouts: TimeoutSettings,
 ) -> super::OpOutcome {
     // The server's minVersion / maxVersion (#144), already validated by the JS
     // https layer; empty means Node's default range. A range with nothing to
@@ -1173,8 +1551,9 @@ pub async fn https_serve(
     };
     let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     let server_id = state.next_id();
-    let (queue_tx, queue_rx) = mpsc::channel::<IncomingRequest>(64);
+    let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let server_timeouts = ServerTimeouts::new(timeouts);
     state
         .servers
         .lock()
@@ -1184,8 +1563,17 @@ pub async fn https_serve(
             ServerEntry {
                 queue: Some(queue_rx),
                 shutdown: Some(shutdown_tx),
+                timeouts: Some(Arc::clone(&server_timeouts)),
             },
         );
+    if !server_timeouts.js_driven() {
+        tokio::spawn(check_connections(
+            state.clone(),
+            server_id,
+            Arc::clone(&server_timeouts),
+            shutdown_rx.clone(),
+        ));
+    }
 
     let accept_state = state.clone();
     let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -1214,39 +1602,54 @@ pub async fn https_serve(
                     };
                     let conn_state = accept_state.clone();
                     let conn_queue = queue_tx.clone();
+                    let conn_timeouts = Arc::clone(&server_timeouts);
                     let mut conn_shutdown = shutdown_rx.clone();
                     tokio::spawn(async move {
                         let _permit = permit;
-                        let tls_stream = match conn_acceptor.accept(stream).await {
-                            Ok(s) => s,
-                            Err(_) => return, // handshake failed, drop connection
+                        // node's handshakeTimeout (120 s by default): a client
+                        // that never completes the handshake is dropped (node
+                        // also emits 'tlsClientError', which oam does not).
+                        let tls_stream = tokio::select! {
+                            accepted = tokio::time::timeout(
+                                conn_timeouts.handshake(),
+                                conn_acceptor.accept(stream),
+                            ) => match accepted {
+                                Ok(Ok(s)) => s,
+                                // Handshake failed or timed out: drop it.
+                                _ => return,
+                            },
+                            _ = conn_shutdown.changed() => return,
                         };
-                        let io = hyper_util::rt::TokioIo::new(tls_stream);
+                        // node's http timeouts start once the TLS connection
+                        // is up (its http side sees 'secureConnection').
+                        let watch =
+                            ConnWatch::new(conn_state.next_id(), server_id, conn_timeouts.clone());
+                        let _registration = conn_state.register_conn(Arc::clone(&watch));
+                        let js_driven = conn_timeouts.js_driven();
+                        let service_queue = conn_queue.clone();
+                        let service_watch = Arc::clone(&watch);
                         let service = hyper::service::service_fn(move |req| {
                             handle_request(
                                 conn_state.clone(),
-                                conn_queue.clone(),
+                                service_queue.clone(),
                                 req,
                                 false, // TLS: buffered until a later slice
                                 conn_addrs,
                                 policy,
+                                Some(Arc::clone(&service_watch)),
                             )
                         });
-                        let conn = http1_builder(policy).serve_connection(io, service);
-                        let mut conn = std::pin::pin!(conn);
-                        let mut shutting_down = false;
-                        loop {
-                            tokio::select! {
-                                result = conn.as_mut() => {
-                                    let _ = result;
-                                    break;
-                                }
-                                _ = conn_shutdown.changed(), if !shutting_down => {
-                                    shutting_down = true;
-                                    conn.as_mut().graceful_shutdown();
-                                }
-                            }
-                        }
+                        serve_http1(
+                            tls_stream,
+                            watch,
+                            policy,
+                            service,
+                            conn_queue,
+                            js_driven,
+                            conn_addrs,
+                            conn_shutdown,
+                        )
+                        .await;
                     });
                 }
             }
@@ -1300,7 +1703,7 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
         entry.queue = Some(queue);
     }
     match next {
-        Some(request) => {
+        Some(ServerEvent::Request(request)) => {
             let mut meta = serde_json::json!({
                 "requestId": request.id,
                 "method": request.method,
@@ -1308,12 +1711,33 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
                 "headers": request.headers,
             });
             request.conn.write_meta(&mut meta);
+            if let Some(conn_id) = request.conn_id {
+                meta["connectionId"] = serde_json::json!(conn_id);
+            }
             if request.is_upgrade {
                 meta["isUpgrade"] = serde_json::json!(true);
                 meta["socketHandle"] = serde_json::json!(request.socket_handle);
             }
             super::OpOutcome::Json(meta.to_string())
         }
+        Some(ServerEvent::Timeout {
+            conn_id,
+            request_id,
+            conn,
+        }) => {
+            let mut meta = serde_json::json!({
+                "event": "timeout",
+                "connectionId": conn_id,
+            });
+            if let Some(request_id) = request_id {
+                meta["requestId"] = serde_json::json!(request_id);
+            }
+            conn.write_meta(&mut meta);
+            super::OpOutcome::Json(meta.to_string())
+        }
+        Some(ServerEvent::Closed { request_id }) => super::OpOutcome::Json(
+            serde_json::json!({ "event": "closed", "requestId": request_id }).to_string(),
+        ),
         None => super::OpOutcome::Done,
     }
 }
@@ -1344,7 +1768,7 @@ pub async fn http2_serve(
     };
     let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     let server_id = state.next_id();
-    let (queue_tx, queue_rx) = mpsc::channel::<IncomingRequest>(64);
+    let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     state
         .servers
@@ -1355,6 +1779,8 @@ pub async fn http2_serve(
             ServerEntry {
                 queue: Some(queue_rx),
                 shutdown: Some(shutdown_tx),
+                // node's Http2Server has no headersTimeout / keepAliveTimeout.
+                timeouts: None,
             },
         );
 
@@ -1414,6 +1840,7 @@ pub async fn http2_serve(
                                 false, // http2: buffered until a later slice
                                 conn_addrs,
                                 policy,
+                                None,
                             )
                         });
 

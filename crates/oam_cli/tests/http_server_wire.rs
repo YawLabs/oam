@@ -660,3 +660,109 @@ fn a_malformed_chunk_size_line_is_answered_like_node() {
     let seen = json(&server.next_line(Duration::from_secs(5)).expect("a line"));
     assert_eq!(seen["body"], "abc");
 }
+
+/// A server with short node timeouts: headersTimeout 400 ms, requestTimeout
+/// 800 ms, keepAliveTimeout 300 ms with no buffer, checked every 50 ms.
+const TIMEOUT_SERVER: &str = r#"
+import http from "node:http";
+const server = http.createServer(
+  { headersTimeout: 400, requestTimeout: 800, keepAliveTimeout: 300, keepAliveTimeoutBuffer: 0, connectionsCheckingInterval: 50 },
+  (req, res) => res.end("ok"),
+);
+server.listen(0, "127.0.0.1", () => console.log("PORT " + server.address().port));
+"#;
+
+/// More connections than the server serves at once.
+const FLOOD: usize = 300;
+
+/// Keep trying a request until one is answered 200 or `deadline` passes.
+fn served_within(target: SocketAddr, deadline: Duration) -> Option<Duration> {
+    let started = std::time::Instant::now();
+    while started.elapsed() < deadline {
+        let ex = exchange(
+            target,
+            None,
+            b"GET /real HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n",
+            Duration::from_millis(500),
+        );
+        if ex
+            .statuses()
+            .first()
+            .is_some_and(|s| s == "HTTP/1.1 200 OK")
+        {
+            return Some(started.elapsed());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
+/// Connections that never send a request are answered 408 and closed once
+/// headersTimeout passes, so a flood of them locks a server out only until
+/// then. (They were held for good: past the server's connection limit every
+/// new client was dropped for as long as they stayed open.)
+#[test]
+fn silent_connections_do_not_lock_the_server_out() {
+    use std::io::Read;
+    let server = Server::start("silent_flood.mjs", TIMEOUT_SERVER, &[], &[]);
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    let silent: Vec<std::net::TcpStream> = (0..FLOOD)
+        .map(|_| std::net::TcpStream::connect(target).expect("connect"))
+        .collect();
+    let waited = served_within(target, Duration::from_secs(8));
+    assert!(
+        waited.is_some(),
+        "a real client must be served once headersTimeout closed the silent connections"
+    );
+    // The silent connections were answered as node answers them.
+    let mut first = &silent[0];
+    first
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut answer = Vec::new();
+    let _ = first.read_to_end(&mut answer);
+    assert_eq!(
+        String::from_utf8_lossy(&answer),
+        "HTTP/1.1 408 Request Timeout\r\nConnection: close\r\n\r\n"
+    );
+}
+
+/// Idle keep-alive connections are closed once keepAliveTimeout (plus its
+/// buffer) passes, so a client pool that keeps its connections open does
+/// not lock others out. (They were held for good.)
+#[test]
+fn idle_keep_alive_connections_do_not_lock_the_server_out() {
+    use std::io::{Read, Write};
+    let server = Server::start("idle_flood.mjs", TIMEOUT_SERVER, &[], &[]);
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    let mut idle = Vec::new();
+    for _ in 0..FLOOD {
+        let Ok(mut stream) = std::net::TcpStream::connect(target) else {
+            break;
+        };
+        // One request each, answered, then nothing more: an idle pool.
+        if stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+            .is_err()
+        {
+            break;
+        }
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut buf = [0u8; 256];
+        let _ = stream.read(&mut buf);
+        idle.push(stream);
+    }
+    assert!(!idle.is_empty());
+    let waited = served_within(target, Duration::from_secs(8));
+    assert!(
+        waited.is_some(),
+        "a real client must be served once keepAliveTimeout closed the idle connections"
+    );
+    // The idle connections were closed without another byte.
+    let mut first = &idle[0];
+    let mut rest = Vec::new();
+    let _ = first.read_to_end(&mut rest);
+    assert!(rest.is_empty(), "{:?}", String::from_utf8_lossy(&rest));
+}

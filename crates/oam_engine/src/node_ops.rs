@@ -322,6 +322,11 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpRequestBodyCancel", op_http_request_body_cancel),
         ("httpAbort", op_http_abort),
         ("httpClose", op_http_close),
+        // node's server timeouts (headersTimeout, keepAliveTimeout, ...)
+        ("httpServerTimeouts", op_http_server_timeouts),
+        ("httpServerExpire", op_http_server_expire),
+        ("httpConnSetTimeout", op_http_conn_set_timeout),
+        ("httpConnDestroy", op_http_conn_destroy),
         // --max-http-header-size / --insecure-http-parser, as the CLI set them
         ("httpMaxHeaderSize", op_http_max_header_size),
         ("httpInsecureParser", op_http_insecure_parser),
@@ -2463,6 +2468,105 @@ fn head_policy_args(
     policy
 }
 
+/// A millisecond count JS passed: a finite number >= 0, truncated;
+/// anything else is `None`.
+fn ms_arg(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -> Option<u64> {
+    if !value.is_number() {
+        return None;
+    }
+    let n = value.number_value(scope)?;
+    // `as` saturates (NaN casts to 0); the value is kept only when finite and >= 0.
+    (n.is_finite() && n >= 0.0).then_some(n as u64)
+}
+
+/// node's server timeouts from JS, starting at argument `first`:
+/// headersTimeout, requestTimeout, keepAliveTimeout + keepAliveTimeoutBuffer,
+/// server.timeout, connectionsCheckingInterval, then whether JS runs the
+/// headers / request check and handles socket timeouts (a node:http
+/// server), then the TLS handshakeTimeout. Missing or invalid values are
+/// node's defaults; a caller that passes nothing (oam.serve) gets them all
+/// and the check runs natively.
+fn timeout_args(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    first: i32,
+) -> oam_core::http_conn::TimeoutSettings {
+    let mut settings = oam_core::http_conn::TimeoutSettings::default();
+    let fields: [&mut u64; 5] = [
+        &mut settings.headers_ms,
+        &mut settings.request_ms,
+        &mut settings.keep_alive_ms,
+        &mut settings.socket_ms,
+        &mut settings.check_interval_ms,
+    ];
+    for (offset, field) in (0..).zip(fields) {
+        if let Some(ms) = ms_arg(scope, args.get(first + offset)) {
+            *field = ms;
+        }
+    }
+    settings.js_driven = args.get(first + 5).is_true();
+    if let Some(ms) = ms_arg(scope, args.get(first + 6)) {
+        settings.handshake_ms = ms;
+    }
+    settings
+}
+
+/// `httpServerTimeouts(serverId, headersMs, requestMs, keepAliveMs,
+/// socketMs)`: the server's timeout properties as JS reads them now.
+fn op_http_server_timeouts(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let mut ms = [0u64; 4];
+    for (offset, slot) in (1..).zip(ms.iter_mut()) {
+        *slot = ms_arg(scope, args.get(offset)).unwrap_or(0);
+    }
+    core_runtime!(scope)
+        .http()
+        .update_timeouts(server_id, ms[0], ms[1], ms[2], ms[3]);
+}
+
+/// `httpServerExpire(serverId, headersMs, requestMs)`: node's
+/// checkConnections. Returns how many connections were answered 408.
+fn op_http_server_expire(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let server_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let headers_ms = ms_arg(scope, args.get(1)).unwrap_or(0);
+    let request_ms = ms_arg(scope, args.get(2)).unwrap_or(0);
+    let expired = core_runtime!(scope)
+        .http()
+        .expire_connections(server_id, headers_ms, request_ms);
+    rv.set_double(expired as f64);
+}
+
+/// `httpConnSetTimeout(connectionId, ms)`: `socket.setTimeout(ms)` on a
+/// server connection (0 turns it off).
+fn op_http_conn_set_timeout(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let conn_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let ms = ms_arg(scope, args.get(1)).unwrap_or(0);
+    core_runtime!(scope).http().set_conn_timeout(conn_id, ms);
+}
+
+/// `httpConnDestroy(connectionId)`: `socket.destroy()` on a server
+/// connection.
+fn op_http_conn_destroy(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let conn_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    core_runtime!(scope).http().destroy_conn(conn_id);
+}
+
 fn op_http_max_header_size(
     scope: &mut v8::PinScope<'_, '_>,
     _args: v8::FunctionCallbackArguments<'_>,
@@ -2499,6 +2603,8 @@ fn op_http_serve(
     let tcp_ids = rt.body_ids();
     // args 3, 4: maxHeaderSize, insecureHTTPParser.
     let policy = head_policy_args(scope, &args, 3);
+    // args 5..=10: node's server timeouts.
+    let timeouts = timeout_args(scope, &args, 5);
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -2511,6 +2617,7 @@ fn op_http_serve(
             // arg 2: opt into dispatch-on-headers + streamed request bodies.
             args.get(2).is_true(),
             policy,
+            timeouts,
         ),
     );
 }
@@ -2835,6 +2942,8 @@ fn op_https_serve(
     let state = core_runtime!(scope).http();
     // args 6, 7: maxHeaderSize, insecureHTTPParser.
     let policy = head_policy_args(scope, &args, 6);
+    // args 8..=14: node's server timeouts and the TLS handshakeTimeout.
+    let timeouts = timeout_args(scope, &args, 8);
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -2847,6 +2956,7 @@ fn op_https_serve(
             min_version,
             max_version,
             policy,
+            timeouts,
         ),
     );
 }

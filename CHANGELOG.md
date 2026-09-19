@@ -114,6 +114,18 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   for each API, on every hop including redirects: `fetch` rejects with `fetch failed`
   and a cause coded `UND_ERR_HEADERS_OVERFLOW`, the others fail with a cause coded
   `HPE_HEADER_OVERFLOW`.
+- **`http` and `https` servers applied none of Node's connection timeouts.**
+  `headersTimeout`, `requestTimeout`, `keepAliveTimeout`, `server.timeout` and
+  `setTimeout` were stored and ignored, and TLS handshakes had no time limit, so a
+  connection that sent nothing, stopped part way through a request, or sat idle between
+  requests stayed open for good; enough of them used up the server's connection limit
+  and kept every other client out. They are now enforced as Node enforces them, with
+  Node's defaults (60 s for the headers, 300 s for a request, 5 s plus a 1 s buffer
+  between requests, 120 s for a TLS handshake): a late request is answered `408` and
+  closed, an idle connection is closed, and the socket timeout emits `'timeout'` on the
+  request, response and server, destroying the connection when nobody listens.
+  `connectionsCheckingInterval`, `keepAliveTimeoutBuffer`, `handshakeTimeout`,
+  `req.setTimeout` and `res.setTimeout` are supported too.
 - **One idle connection stopped an `http` server from accepting.** The server waited
   for a new connection's first bytes before accepting the next one, so a connection
   that sent nothing, such as a browser preconnect, kept every later client waiting. Each

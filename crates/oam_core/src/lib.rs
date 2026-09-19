@@ -26,6 +26,7 @@ pub mod dns;
 pub mod http_client;
 /// node's acceptance rules for inbound HTTP/1 request heads, and its
 /// `maxHeaderSize` count.
+pub mod http_conn;
 pub mod http_head;
 pub mod http_server;
 pub mod inspector;

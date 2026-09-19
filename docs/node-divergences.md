@@ -1492,6 +1492,39 @@ different answer:
 _(probed)_ Node v22.22.2 (default and `--insecure-http-parser`) and oam, the same 90 raw
 request heads over TCP, and 16 chunked bodies.
 
+### 41. The HTTP server's timeouts: what still differs
+
+`http` and `https` servers hold every connection to Node's timeouts, with Node's options,
+defaults and validation: `headersTimeout` and `requestTimeout` (checked every
+`connectionsCheckingInterval`; a request that is not in is answered
+`408 Request Timeout` and its connection closed), `keepAliveTimeout` plus
+`keepAliveTimeoutBuffer`, `server.timeout` / `server.setTimeout`, `req.setTimeout`,
+`res.setTimeout` and `req.socket.setTimeout` (a `'timeout'` event on the request, the
+response and the server, and the connection destroyed when none of them listens), and
+https's `handshakeTimeout`. What differs:
+
+- There is no `'clientError'` event, so a request timeout is always answered with the
+  `408`; Node hands it to a `'clientError'` listener when there is one. A TLS handshake
+  that times out raises no `'tlsClientError'`.
+- The socket a `'timeout'` event carries is oam's per-request socket object (entry 39),
+  not a `net.Socket`: it has the addresses, `setTimeout`, `destroy` and `end` (which
+  closes at once).
+- Responses carry no `Connection: keep-alive` / `Keep-Alive: timeout=N` headers, so a
+  client cannot learn the keep-alive timeout from them.
+- When a request timeout closes a connection while the handler is reading the body, the
+  request's `'error'` can come before the response's `'close'` (Node emits `'aborted'`,
+  then the response's `'close'`, then `'error'`).
+- The server properties the timeouts read (`timeout`, `keepAliveTimeout`,
+  `keepAliveTimeoutBuffer`, `headersTimeout`, `requestTimeout`) are accessor properties,
+  so an assignment reaches the native server at once; in Node they are data properties.
+- `http2.createServer` applies none of these, to its HTTP/2 or HTTP/1 connections (Node's
+  `Http2Server` has none of them either).
+- `oam.serve` uses Node's defaults (60 s, 300 s, 5 s + 1 s, checked every 30 s), with no
+  way to change them.
+
+_(probed)_ Node v22.22.2 and oam, raw TCP and TLS clients against servers with short
+timeouts; conformance case 135.
+
 ### `err.syscall` on `fs.realpath` and `fs.opendir`
 
 Node's own sync and async forms disagree on these two, and oam is

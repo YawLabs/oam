@@ -17334,19 +17334,7 @@
         // req.socket.remoteAddress), per-IP limits -- so an absent record
         // leaves them undefined, as on an unconnected node socket; nothing
         // is ever filled in.
-        const socket = Object.assign(new EventEmitter(), {
-          remoteAddress: meta.remoteAddress,
-          remotePort: meta.remotePort,
-          remoteFamily: meta.remoteFamily,
-          localAddress: meta.localAddress,
-          localPort: meta.localPort,
-          localFamily: meta.localFamily,
-        });
-        // net.Socket#address(): the LOCAL end, {address, family, port}.
-        socket.address = function address() {
-          if (this.localAddress === undefined) return {};
-          return { address: this.localAddress, family: this.localFamily, port: this.localPort };
-        };
+        const socket = serverSocket(meta);
         this.socket = socket;
         // node's deprecated alias, the same object.
         this.connection = socket;
@@ -17362,6 +17350,15 @@
         // paired response answerable (test-stream-destroy).
         this._consuming = false;
         this._dumped = false;
+      }
+      // node: `if (callback) this.on('timeout', callback);
+      // this.socket.setTimeout(msecs); return this;` -- the connection's
+      // inactivity timeout. 'timeout' reaches the request only while it is
+      // incomplete, as in node.
+      setTimeout(msecs, callback) {
+        if (callback) this.on("timeout", callback);
+        this.socket.setTimeout(msecs);
+        return this;
       }
       _read() {
         // Pull one chunk per _read. The op serves a streamed body chunk by
@@ -17686,6 +17683,23 @@
         }
         return this;
       }
+      // node's OutgoingMessage#setTimeout: the connection's inactivity
+      // timeout; 'timeout' is emitted on the response too.
+      setTimeout(msecs, callback) {
+        if (callback) this.on("timeout", callback);
+        const socket = this.socket || (this.req && this.req.socket);
+        if (socket && typeof socket.setTimeout === "function") socket.setTimeout(msecs);
+        return this;
+      }
+      // The connection was closed under an unfinished response (a request
+      // timeout, or a destroyed socket): node's 'close' without 'finish'.
+      _connectionLost() {
+        if (this._finished || this.closed) return;
+        this.closed = true;
+        if (this._streamId !== null) natives.httpBodyEnd(this._streamId);
+        this._dumpReq();
+        this.emit("close");
+      }
       // Node's resOnFinish dumps an unconsumed request when the response
       // finishes, so a later req.destroy() reads as routine teardown, not a
       // client abort (aborted stays false, no 'aborted' event). A CONSUMED
@@ -17731,6 +17745,378 @@
         for (const [key, value] of this._headers) out[key] = value;
         return out;
       }
+    }
+
+    // The socket object a server hands out for one of its connections
+    // (req.socket, and the argument of a 'timeout' event): node's net.Socket
+    // address fields, from the native accept record, plus setTimeout and
+    // destroy on the native connection when it has one (HTTP/1).
+    //
+    // An EventEmitter, not a bare object: handlers register error/close
+    // listeners on req.socket (test-stream-pipeline does), and Node's
+    // socket is an emitter even when oam never surfaces events on it.
+    //
+    // The addresses are the accepted connection's own, spelled as node
+    // spells them (an IPv4 client of a dual-stack `::` server is
+    // `::ffff:a.b.c.d` / 'IPv6'). Applications gate on these --
+    // loopback-only routes, `trust proxy` (proxy-addr reads
+    // req.socket.remoteAddress), per-IP limits -- so an absent record
+    // leaves them undefined, as on an unconnected node socket; nothing is
+    // ever filled in.
+    function serverSocket(meta) {
+      const socket = Object.assign(new EventEmitter(), {
+        remoteAddress: meta.remoteAddress,
+        remotePort: meta.remotePort,
+        remoteFamily: meta.remoteFamily,
+        localAddress: meta.localAddress,
+        localPort: meta.localPort,
+        localFamily: meta.localFamily,
+        destroyed: false,
+      });
+      const connectionId = meta.connectionId;
+      // net.Socket#address(): the LOCAL end, {address, family, port}.
+      socket.address = function address() {
+        if (this.localAddress === undefined) return {};
+        return { address: this.localAddress, family: this.localFamily, port: this.localPort };
+      };
+      // net.Socket#setTimeout: node's validation, then the connection's
+      // inactivity timeout (0 turns it off).
+      socket.setTimeout = function setTimeout(msecs, callback) {
+        if (typeof msecs !== "number") {
+          throw codes.ERR_INVALID_ARG_TYPE("msecs", "number", msecs);
+        }
+        if (!(msecs >= 0) || !Number.isFinite(msecs)) {
+          throw codes.ERR_OUT_OF_RANGE("msecs", "a non-negative finite number", msecs);
+        }
+        if (callback !== undefined && typeof callback !== "function") {
+          throw codes.ERR_INVALID_ARG_TYPE("callback", "function", callback);
+        }
+        this.timeout = msecs;
+        if (typeof connectionId === "number" && !this.destroyed) {
+          natives.httpConnSetTimeout(connectionId, timerMs(msecs));
+        }
+        if (msecs === 0) {
+          if (callback !== undefined) this.removeListener("timeout", callback);
+        } else if (callback !== undefined) {
+          this.once("timeout", callback);
+        }
+        return this;
+      };
+      // Closes the connection. The server's own error handler is always
+      // listening in node, so an error here reaches only the caller's
+      // listeners.
+      socket.destroy = function destroy(err) {
+        if (this.destroyed) return this;
+        this.destroyed = true;
+        if (typeof connectionId === "number") natives.httpConnDestroy(connectionId);
+        process.nextTick(() => {
+          if (err && this.listenerCount("error") > 0) this.emit("error", err);
+          this.emit("close", Boolean(err));
+        });
+        return this;
+      };
+      // No half-close here: the connection is closed.
+      socket.end = function end() {
+        return this.destroy();
+      };
+      return socket;
+    }
+
+    // A duration handed to the native server: node's timer range (a finite
+    // number >= 0, capped at 2**31 - 1 like its timers); anything else is 0,
+    // which is off.
+    function timerMs(value) {
+      if (typeof value !== "number" || !(value > 0) || !Number.isFinite(value)) return 0;
+      return Math.min(Math.floor(value), 2147483647);
+    }
+
+    // node's validateInteger(value, name, 0), as storeHTTPOptions uses it.
+    function validateOptionInteger(value, name) {
+      if (typeof value !== "number") {
+        throw codes.ERR_INVALID_ARG_TYPE(name, "number", value);
+      }
+      if (!Number.isInteger(value)) {
+        throw codes.ERR_OUT_OF_RANGE(name, "an integer", value);
+      }
+      if (value < 0 || value > Number.MAX_SAFE_INTEGER) {
+        throw codes.ERR_OUT_OF_RANGE(name, ">= 0 && <= " + Number.MAX_SAFE_INTEGER, value);
+      }
+    }
+
+    // A timeout property of a server: a plain enumerable own property as in
+    // node, whose new value reaches the native server at once. node reads
+    // these where it uses them -- `timeout` for each new connection -- so a
+    // value assigned after listen() (the usual place for
+    // `server.keepAliveTimeout = ...`) holds from the next connection on.
+    function defineTimeoutProperty(server, name, value) {
+      let current = value;
+      Object.defineProperty(server, name, {
+        get() {
+          return current;
+        },
+        set(next) {
+          current = next;
+          syncServerTimeouts(server);
+        },
+        enumerable: true,
+        configurable: true,
+      });
+    }
+
+    // node's storeHTTPOptions, the timeout half, in node's order:
+    // requestTimeout (300 s), headersTimeout (min(60 s, requestTimeout),
+    // and no more than requestTimeout when both are on), keepAliveTimeout
+    // (5 s), keepAliveTimeoutBuffer (1 s), connectionsCheckingInterval
+    // (30 s).
+    function storeHTTPTimeoutOptions(server, options) {
+      const requestTimeout = options.requestTimeout;
+      if (requestTimeout !== undefined) validateOptionInteger(requestTimeout, "requestTimeout");
+      defineTimeoutProperty(
+        server,
+        "requestTimeout",
+        requestTimeout !== undefined ? requestTimeout : 300000,
+      );
+      const headersTimeout = options.headersTimeout;
+      if (headersTimeout !== undefined) validateOptionInteger(headersTimeout, "headersTimeout");
+      defineTimeoutProperty(
+        server,
+        "headersTimeout",
+        headersTimeout !== undefined ? headersTimeout : Math.min(60000, server.requestTimeout),
+      );
+      if (
+        server.requestTimeout > 0 &&
+        server.headersTimeout > 0 &&
+        server.headersTimeout > server.requestTimeout
+      ) {
+        throw codes.ERR_OUT_OF_RANGE("headersTimeout", "<= requestTimeout", headersTimeout);
+      }
+      const keepAliveTimeout = options.keepAliveTimeout;
+      if (keepAliveTimeout !== undefined) validateOptionInteger(keepAliveTimeout, "keepAliveTimeout");
+      defineTimeoutProperty(
+        server,
+        "keepAliveTimeout",
+        keepAliveTimeout !== undefined ? keepAliveTimeout : 5000,
+      );
+      const keepAliveTimeoutBuffer = options.keepAliveTimeoutBuffer;
+      if (keepAliveTimeoutBuffer !== undefined) {
+        validateOptionInteger(keepAliveTimeoutBuffer, "keepAliveTimeoutBuffer");
+      }
+      defineTimeoutProperty(
+        server,
+        "keepAliveTimeoutBuffer",
+        keepAliveTimeoutBuffer !== undefined ? keepAliveTimeoutBuffer : 1000,
+      );
+      const interval = options.connectionsCheckingInterval;
+      if (interval !== undefined) validateOptionInteger(interval, "connectionsCheckingInterval");
+      server.connectionsCheckingInterval = interval !== undefined ? interval : 30000;
+    }
+
+    // node's storeHTTPOptions: the parser options, then the timeouts.
+    function storeHTTPOptions(server, options) {
+      storeHTTPParserOptions(server, options);
+      storeHTTPTimeoutOptions(server, options);
+    }
+
+    // The four timeouts the native server enforces, read off the server as
+    // node reads them: headersTimeout / requestTimeout at each check,
+    // keepAliveTimeout + keepAliveTimeoutBuffer when a response finishes
+    // (resOnFinish; a keepAliveTimeout of 0 leaves the socket timeout
+    // alone), `timeout` for a new connection and after a keep-alive wait.
+    function serverTimeoutValues(server) {
+      const keepAlive = Number.isFinite(server.keepAliveTimeout) && server.keepAliveTimeout >= 0
+        ? server.keepAliveTimeout : 0;
+      const buffer = Number.isFinite(server.keepAliveTimeoutBuffer) &&
+          server.keepAliveTimeoutBuffer >= 0
+        ? server.keepAliveTimeoutBuffer : 1000;
+      return [
+        timerMs(server.headersTimeout),
+        timerMs(server.requestTimeout),
+        keepAlive ? timerMs(keepAlive + buffer) : 0,
+        timerMs(server.timeout),
+      ];
+    }
+
+    // The arguments httpServe / httpsServe take after the parser policy:
+    // the four values above, connectionsCheckingInterval, and that JS runs
+    // the checks and takes the socket timeouts.
+    function serverTimeoutArgs(server) {
+      return [...serverTimeoutValues(server), timerMs(server.connectionsCheckingInterval), true];
+    }
+
+    // Tell the native server the current values when they changed. node
+    // reads the properties when it uses them; this runs before each
+    // request is handed out and at every connections check, so a change
+    // takes effect from the next of those.
+    function syncServerTimeouts(server) {
+      if (server._serverId === null || server._serverId === undefined) return;
+      const values = serverTimeoutValues(server);
+      const key = values.join(",");
+      if (server._syncedTimeouts === key) return;
+      server._syncedTimeouts = key;
+      natives.httpServerTimeouts(server._serverId, ...values);
+    }
+
+    // node's checkConnections: requests not in within headersTimeout /
+    // requestTimeout are answered 408 and their connections closed.
+    function checkConnections(server) {
+      if (server._serverId === null || server._serverId === undefined) return;
+      syncServerTimeouts(server);
+      if (server.headersTimeout === 0 && server.requestTimeout === 0) return;
+      natives.httpServerExpire(
+        server._serverId,
+        timerMs(server.headersTimeout),
+        timerMs(server.requestTimeout),
+      );
+    }
+
+    // node's setupConnectionsTracking, run on 'listening': the check every
+    // connectionsCheckingInterval, unref'd.
+    function startConnectionsCheck(server) {
+      stopConnectionsCheck(server);
+      const timer = globalThis.setInterval(
+        () => checkConnections(server),
+        server.connectionsCheckingInterval,
+      );
+      if (timer && typeof timer.unref === "function") timer.unref();
+      server._connectionsCheck = timer;
+    }
+
+    function stopConnectionsCheck(server) {
+      if (server._connectionsCheck) {
+        globalThis.clearInterval(server._connectionsCheck);
+        server._connectionsCheck = null;
+      }
+    }
+
+    // The requests whose responses are not done, by request id, for the
+    // 'timeout' events a connection raises while one is in flight.
+    function trackExchange(server, requestId, req, res) {
+      if (!server._exchanges) server._exchanges = new Map();
+      const exchanges = server._exchanges;
+      exchanges.set(requestId, { req, res });
+      const forget = () => exchanges.delete(requestId);
+      res.once("finish", forget);
+      res.once("close", forget);
+    }
+
+    // A connection event from the native server.
+    function onConnectionEvent(server, meta) {
+      const exchange =
+        meta.requestId === undefined || !server._exchanges
+          ? undefined
+          : server._exchanges.get(meta.requestId);
+      if (meta.event === "closed") {
+        // The connection was closed under an unanswered request: node's
+        // abortIncoming -- an unfinished request is destroyed with
+        // ECONNRESET "aborted" ('aborted' now, 'error' and 'close' on the
+        // next tick) -- and the response closes without 'finish'.
+        if (exchange) {
+          server._exchanges.delete(meta.requestId);
+          const req = exchange.req;
+          if (!req.complete && !req.destroyed) {
+            const reset = new Error("aborted");
+            reset.code = "ECONNRESET";
+            req.destroy(reset);
+          }
+          exchange.res._connectionLost();
+        }
+        return;
+      }
+      // node's socketOnTimeout: 'timeout' on the request (while it is
+      // incomplete), the response and the server; the socket is destroyed
+      // when none of them listens. Then the socket's own listeners
+      // (socket.setTimeout(ms, cb)), which node registers after it.
+      const req = exchange && exchange.req;
+      const res = exchange && exchange.res;
+      const socket = req ? req.socket : serverSocket(meta);
+      const reqTimeout = req && !req.complete && req.emit("timeout", socket);
+      const resTimeout = res && res.emit("timeout", socket);
+      const serverTimeout = server.emit("timeout", socket);
+      if (!reqTimeout && !resTimeout && !serverTimeout) socket.destroy();
+      socket.emit("timeout");
+    }
+
+    // A server's native side is bound: record it, push the timeouts as they
+    // are now (values set right after listen() returned are in), start the
+    // connections check (node does it on 'listening', ahead of the caller's
+    // listeners), emit 'listening' and serve.
+    function serverBound(server, bound, hostname, encrypted) {
+      server._serverId = bound.serverId;
+      server._port = bound.port;
+      server._host = hostname;
+      server.listening = true;
+      syncServerTimeouts(server);
+      startConnectionsCheck(server);
+      server.emit("listening");
+      serveRequests(server, bound.serverId, encrypted);
+    }
+
+    async function serveRequests(server, serverId, encrypted) {
+      for (;;) {
+        const meta = await natives.httpAccept(serverId);
+        if (meta === undefined) break;
+        if (meta.event !== undefined) {
+          onConnectionEvent(server, meta);
+          continue;
+        }
+        syncServerTimeouts(server);
+        if (meta.isUpgrade && meta.socketHandle !== undefined) {
+          const NetSocket = registry.get("net").Socket;
+          // The accepted connection's real ends (never a stand-in:
+          // an upgrade handler's address checks read these).
+          const socket = new NetSocket({
+            _handle: meta.socketHandle,
+            _remoteAddr: {
+              address: meta.remoteAddress,
+              port: meta.remotePort,
+              family: meta.remoteFamily,
+            },
+            _localAddr:
+              meta.localAddress === undefined
+                ? undefined
+                : {
+                    address: meta.localAddress,
+                    port: meta.localPort,
+                    family: meta.localFamily,
+                  },
+          });
+          socket._readLoop();
+          const req = new IncomingMessage(meta);
+          // node: the upgrade request's socket IS the socket handed
+          // to the 'upgrade' listener.
+          req.socket = req.connection = socket;
+          // Nobody to hand the connection to: close it rather than
+          // leave it open forever. (node answers such a request as an
+          // ordinary one; this socket has already left hyper.)
+          if (!server.emit("upgrade", req, socket, globalThis.Buffer.alloc(0))) {
+            socket.destroy();
+          }
+          continue;
+        }
+        const req = new IncomingMessage(meta);
+        // The request's socket carries the TCP connection's real
+        // addresses (the accept record); a TLS socket is `encrypted`.
+        if (encrypted) req.socket.encrypted = true;
+        // Node's server keeps a request-stream error from becoming
+        // an unhandled 'error' that kills the process: a client that
+        // hangs up mid-upload, or a body the server sheds under
+        // load, destroys the request stream, and with no listener
+        // that would be fatal. Node delivers such an error to a
+        // user listener and to an in-flight `for await`, but a
+        // server with neither stays up (verified against Node
+        // v22: process exits 0 on a mid-upload RST). This default
+        // listener is additive -- req.on('error') still fires.
+        req.on("error", () => {});
+        const res = new ServerResponse(meta.requestId);
+        // Node exposes the pair on each other; res end() uses
+        // req via _dumpReq() (resOnFinish parity).
+        req.res = res;
+        res.req = req;
+        trackExchange(server, meta.requestId, req, res);
+        server.emit("request", req, res);
+      }
+      stopConnectionsCheck(server);
+      server.emit("close");
     }
 
     // node's storeHTTPOptions (lib/_http_server.js), the parser half:
@@ -17797,21 +18183,16 @@
         } else if (typeof options !== "object") {
           throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
         }
-        storeHTTPParserOptions(this, options);
+        storeHTTPOptions(this, options);
+        // node's Server: `timeout` (the socket timeout of a new
+        // connection, off), then maxRequestsPerSocket.
+        defineTimeoutProperty(this, "timeout", 0);
+        this.maxRequestsPerSocket = 0;
         if (handler) this.on("request", handler);
         this._serverId = null;
         this._port = null;
         this._host = null;
         this.listening = false;
-        // Node http.Server timeout knobs. The native hyper substrate owns the
-        // real per-connection lifecycle, so these are plain properties that
-        // libraries (e.g. fastify) read/write at boot; oam stores them but does
-        // not arm real per-socket timers off them (see setTimeout below).
-        this.timeout = 0;
-        this.keepAliveTimeout = 5000;
-        this.requestTimeout = 300000;
-        this.headersTimeout = 60000;
-        this.maxRequestsPerSocket = 0;
       }
       listen(port, host, callback) {
         if (typeof port === "function") {
@@ -17835,71 +18216,15 @@
         // req delivers chunks as they arrive, instead of waiting for the
         // last byte (docs/design/streaming-bodies.md).
         const policy = serverHeadPolicy(this);
-        natives.httpServe(hostname, port ?? 0, true, policy.maxHeaderSize, policy.insecure).then(
-          (bound) => {
-            this._serverId = bound.serverId;
-            this._port = bound.port;
-            this._host = hostname;
-            this.listening = true;
-            this.emit("listening");
-            (async () => {
-              for (;;) {
-                const meta = await natives.httpAccept(bound.serverId);
-                if (meta === undefined) break;
-                if (meta.isUpgrade && meta.socketHandle !== undefined) {
-                  const NetSocket = registry.get("net").Socket;
-                  // The accepted connection's real ends (never a stand-in:
-                  // an upgrade handler's address checks read these).
-                  const socket = new NetSocket({
-                    _handle: meta.socketHandle,
-                    _remoteAddr: {
-                      address: meta.remoteAddress,
-                      port: meta.remotePort,
-                      family: meta.remoteFamily,
-                    },
-                    _localAddr:
-                      meta.localAddress === undefined
-                        ? undefined
-                        : {
-                            address: meta.localAddress,
-                            port: meta.localPort,
-                            family: meta.localFamily,
-                          },
-                  });
-                  socket._readLoop();
-                  const req = new IncomingMessage(meta);
-                  // node: the upgrade request's socket IS the socket handed
-                  // to the 'upgrade' listener.
-                  req.socket = req.connection = socket;
-                  // Nobody to hand the connection to: close it rather than
-                  // leave it open forever. (node answers such a request as an
-                  // ordinary one; this socket has already left hyper.)
-                  if (!this.emit("upgrade", req, socket, globalThis.Buffer.alloc(0))) {
-                    socket.destroy();
-                  }
-                } else {
-                  const req = new IncomingMessage(meta);
-                  // Node's server keeps a request-stream error from becoming
-                  // an unhandled 'error' that kills the process: a client that
-                  // hangs up mid-upload, or a body the server sheds under
-                  // load, destroys the request stream, and with no listener
-                  // that would be fatal. Node delivers such an error to a
-                  // user listener and to an in-flight `for await`, but a
-                  // server with neither stays up (verified against Node
-                  // v22: process exits 0 on a mid-upload RST). This default
-                  // listener is additive -- req.on('error') still fires.
-                  req.on("error", () => {});
-                  const res = new ServerResponse(meta.requestId);
-                  // Node exposes the pair on each other; res end() uses
-                  // req via _dumpReq() (resOnFinish parity).
-                  req.res = res;
-                  res.req = req;
-                  this.emit("request", req, res);
-                }
-              }
-              this.emit("close");
-            })();
-          },
+        natives.httpServe(
+          hostname,
+          port ?? 0,
+          true,
+          policy.maxHeaderSize,
+          policy.insecure,
+          ...serverTimeoutArgs(this),
+        ).then(
+          (bound) => serverBound(this, bound, hostname, false),
           (err) => this.emit("error", err),
         );
         return this;
@@ -17911,6 +18236,7 @@
       }
       close(callback) {
         if (this._serverId !== null) {
+          stopConnectionsCheck(this);
           natives.httpClose(this._serverId);
           this.listening = false;
           if (callback) this.once("close", callback);
@@ -17927,13 +18253,9 @@
         }
         return this;
       }
-      // Node http.Server.setTimeout(msecs[, callback]): store the socket
-      // inactivity timeout and, if given, register callback as a "timeout"
-      // listener; return the server. Divergence: the native hyper layer owns
-      // connection sockets and never surfaces idle sockets to JS, so oam stores
-      // the value and wires the listener but never arms a real per-socket timer
-      // nor emits "timeout". Sufficient for fastify boot, which unconditionally
-      // calls server.setTimeout(connectionTimeout).
+      // Node http.Server.setTimeout(msecs[, callback]): the socket timeout
+      // of new connections (and of each connection after a keep-alive
+      // wait), and callback as a 'timeout' listener; returns the server.
       setTimeout(msecs, callback) {
         this.timeout = msecs;
         if (callback) this.on("timeout", callback);
@@ -18759,7 +19081,14 @@
       return proxy;
     };
     // The https server shares the parser options and their policy.
-    registry._httpParserOptions = { store: storeHTTPParserOptions, policy: serverHeadPolicy };
+    registry._httpParserOptions = {
+      store: storeHTTPOptions,
+      policy: serverHeadPolicy,
+      timeoutArgs: serverTimeoutArgs,
+      bound: serverBound,
+      defineTimeout: defineTimeoutProperty,
+      stop: stopConnectionsCheck,
+    };
     return {
       createServer: (options, handler) => new Server(options, handler),
       Server: callableHttp(Server),
@@ -21108,12 +21437,30 @@
           options = {};
         }
         this._options = options || {};
-        // maxHeaderSize / insecureHTTPParser, validated and stored as the
-        // http server does (node's https.Server runs storeHTTPOptions too).
+        // maxHeaderSize / insecureHTTPParser and the timeouts, validated and
+        // stored as the http server does (node's https.Server runs
+        // storeHTTPOptions too).
         registry._httpParserOptions.store(this, this._options);
         var serverVersions = resolveTlsVersions(this._options);
         this._tlsMin = serverVersions.min;
         this._tlsMax = serverVersions.max;
+        // tls.Server's handshakeTimeout: a number (node validates the type
+        // only); a falsy one is the 120 s default.
+        var handshakeTimeout = this._options.handshakeTimeout;
+        if (handshakeTimeout !== undefined && typeof handshakeTimeout !== "number") {
+          throw codes.ERR_INVALID_ARG_TYPE(
+            "options.handshakeTimeout",
+            "number",
+            handshakeTimeout,
+          );
+        }
+        // Not enumerable: node keeps it internal.
+        Object.defineProperty(this, "_handshakeTimeoutMs", {
+          value: handshakeTimeout > 0 ? handshakeTimeout : 120000,
+          writable: true,
+          configurable: true,
+        });
+        registry._httpParserOptions.defineTimeout(this, "timeout", 0);
         if (handler) this.on("request", handler);
         this._serverId = null;
         this._port = null;
@@ -21146,29 +21493,18 @@
           this._tlsMax,
           policy.maxHeaderSize,
           policy.insecure,
+          ...registry._httpParserOptions.timeoutArgs(this),
+          Math.min(Math.floor(this._handshakeTimeoutMs), 2147483647),
         ).then(
-          (bound) => {
-            this._serverId = bound.serverId;
-            this._port = bound.port;
-            this._host = hostname;
-            this.listening = true;
-            this.emit("listening");
-            (async () => {
-              for (;;) {
-                const meta = await natives.httpAccept(bound.serverId);
-                if (meta === undefined) break;
-                const req = new http.IncomingMessage(meta);
-                // The request's socket carries the TCP connection's real
-                // addresses (the accept record); a TLS socket is `encrypted`.
-                req.socket.encrypted = true;
-                const res = new http.ServerResponse(meta.requestId);
-                this.emit("request", req, res);
-              }
-              this.emit("close");
-            })();
-          },
+          (bound) => registry._httpParserOptions.bound(this, bound, hostname, true),
           (err) => this.emit("error", typeof err === "string" ? new Error(err) : err),
         );
+        return this;
+      }
+      // node's Server#setTimeout (the http one).
+      setTimeout(msecs, callback) {
+        this.timeout = msecs;
+        if (callback) this.on("timeout", callback);
         return this;
       }
       address() {
@@ -21178,6 +21514,7 @@
       }
       close(callback) {
         if (this._serverId !== null) {
+          registry._httpParserOptions.stop(this);
           natives.httpClose(this._serverId);
           this.listening = false;
         }
