@@ -640,16 +640,16 @@ mod tests {
             "*",
             "*x",
             "**",
-            "http://h",
-            "http://h/p?q",
+            "http://example.com",
+            "http://example.com/p?q",
             "HTTP://H/P",
-            "http://h?q",
-            "http://[::1]:8/p",
-            "http://u@h/p",
-            "http://h:x/",
+            "http://example.com?q",
+            "http://127.0.0.1:8/p",
+            "http://u@example.com/p",
+            "http://example.com:x/",
             "ws://h",
             "abc://h",
-            "http://h/p?q#f",
+            "http://example.com/p?q#f",
         ] {
             for policy in [STRICT, LENIENT] {
                 assert_eq!(check(&head("GET", target), policy), Ok(()), "GET {target}");
@@ -666,7 +666,7 @@ mod tests {
             ".",
             "h-t.t+p://x/",
             "1http://x/",
-            "http://h#f",
+            "http://example.com#f",
         ] {
             for policy in [STRICT, LENIENT] {
                 assert_eq!(
@@ -678,7 +678,7 @@ mod tests {
             assert!(bad(&head("OPTIONS", target), STRICT), "OPTIONS {target}");
         }
         // CONNECT takes any of them (node: 'connect' with req.url as sent).
-        for target in ["h.test:443", "/p", "http://h.test/", "abc"] {
+        for target in ["example.com:443", "/p", "http://example.com/", "abc"] {
             assert_eq!(
                 check(&head("CONNECT", target), STRICT),
                 Ok(()),
@@ -701,8 +701,8 @@ mod tests {
             Some("HTTP://H/P")
         );
         assert_eq!(
-            target(b"GET http://h HTTP/1.1\r\n\r\n").as_deref(),
-            Some("http://h")
+            target(b"GET http://example.com HTTP/1.1\r\n\r\n").as_deref(),
+            Some("http://example.com")
         );
         assert_eq!(
             target(b"GET /p#f HTTP/1.1\r\n\r\n").as_deref(),

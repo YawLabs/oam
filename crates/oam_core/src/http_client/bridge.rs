@@ -676,9 +676,9 @@ mod tests {
             "/a:b/c",
             "/p?q=a:b//c",
             "*",
-            "http://abs.test:81/p?q=1",
-            "https://abs.test/p",
-            "http://user@abs.test/p",
+            "http://example.com:81/p?q=1",
+            "https://example.com/p",
+            "http://user@example.com/p",
             "opaque",
             "example.test:443",
             "[::1]:8443",
@@ -702,7 +702,10 @@ mod tests {
     /// form rather than failing the request.
     #[test]
     fn target_uri_falls_back_where_the_uri_type_cannot_spell_it() {
-        assert_eq!(target_uri("http://h").unwrap().to_string(), "http://h/");
+        assert_eq!(
+            target_uri("http://example.com").unwrap().to_string(),
+            "http://example.com/"
+        );
         assert_eq!(target_uri("abc?d=1").unwrap().to_string(), "/abc?d=1");
     }
 
@@ -714,11 +717,11 @@ mod tests {
 
     #[test]
     fn absolute_form_is_a_scheme_then_slash_slash() {
-        assert!(is_absolute_form(b"http://h/p"));
+        assert!(is_absolute_form(b"http://example.com/p"));
         assert!(is_absolute_form(b"a+b-c.d://h"));
         assert!(!is_absolute_form(b"/p://q"));
         assert!(!is_absolute_form(b"://h"));
-        assert!(!is_absolute_form(b"1http://h"));
+        assert!(!is_absolute_form(b"1http://example.com"));
         assert!(!is_absolute_form(b"host:443"));
         assert!(!is_absolute_form(b"*"));
     }
