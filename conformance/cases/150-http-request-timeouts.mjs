@@ -3,15 +3,17 @@
 // fire 'timeout' on the request once its socket has been idle that long --
 // before the response head, or while its body stalls -- and a response still
 // being read hears it too; activity (the head, each body chunk, each upload
-// chunk) re-arms it, and nothing fires once the response has ended. oam used
-// to fire none of them for a request on its own transport (only one sent
-// over an agent's socket timed out). Destroying the request before its
+// chunk) re-arms it, and nothing fires once the response has ended or the
+// request has failed. oam used to fire none of them for a request on its own
+// transport (only one sent over an agent's socket timed out), and for a while
+// fired one after a failed request's error. Destroying the request before its
 // response -- the usual reply to 'timeout' -- fails it with node's
 // ECONNRESET 'socket hang up'; abort() too; destroy(err) with that error.
 //
 // Only the order of events is printed (and whether the response closed):
 // every server delay is several times the timeout it is measured against.
 import http from "node:http";
+import net from "node:net";
 
 setTimeout(() => {
   console.log("WATCHDOG");
@@ -133,6 +135,31 @@ for (const [kind, agent] of [["transport", () => new http.Agent()], ["agent sock
     }, 60);
   }, a({ method: "POST", timeout: 300, noEnd: true }));
 }
+
+// A request that fails hears no timeout after its error: node's socket is
+// destroyed with it.
+const rude = net.createServer((c) => c.destroy());
+await new Promise((r) => rude.listen(0, "127.0.0.1", r));
+const gone = net.createServer();
+await new Promise((r) => gone.listen(0, "127.0.0.1", r));
+const gonePort = gone.address().port;
+await new Promise((r) => gone.close(r));
+for (const [kind, agent] of [["transport", () => new http.Agent()], ["agent socket", () => new WrappingAgent()]]) {
+  for (const [what, to] of [["hung up", rude.address().port], ["refused", gonePort]]) {
+    const events = [];
+    await new Promise((resolve) => {
+      const req = http.get({ host: "127.0.0.1", port: to, agent: agent(), timeout: 100 });
+      req.on("timeout", () => events.push("timeout"));
+      req.on("error", (e) => events.push(`error ${e.code}`));
+      req.on("close", () => {
+        events.push("close");
+        setTimeout(resolve, 400);
+      });
+    });
+    console.log(`${kind}: ${what}, timeout option: ${JSON.stringify(events)}`);
+  }
+}
+rude.close();
 
 await run("destroy() at once", "/?head=300", (r) => r.destroy());
 await run("destroy() from 'socket'", "/?head=300", (r) => r.on("socket", () => r.destroy()));

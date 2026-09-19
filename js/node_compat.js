@@ -19164,7 +19164,7 @@
       // 'timeout' listener tears its response down after both have run, as
       // node's does when the destroyed socket closes.
       _onSocketTimeout() {
-        if (this._responseEnd) return;
+        if (this._responseEnd || this.destroyed) return;
         var self = this;
         var toRequest = function () {
           if (self._timeoutListen !== 1) return;
@@ -19277,6 +19277,8 @@
         this._errorEmitted = true;
         this.errored = err;
         this.destroyed = true;
+        // node destroys the socket with the error: its idle timer is done.
+        this._stopFetchSocketTimer();
         this._closeBridge();
         this._emitClose();
         this.emit("error", err);
@@ -19918,13 +19920,18 @@
         // (_agentResponseOnEnd).
         if (this._agentPath) return;
         this._responseEnd = true;
-        var socket = this._fetchSocket;
-        if (socket && socket._timeoutId !== null) {
-          globalThis.clearTimeout(socket._timeoutId);
-          socket._timeoutId = null;
-        }
+        this._stopFetchSocketTimer();
         this.destroyed = true;
         this._emitClose();
+      }
+
+      // The fetch path's stand-in is done with: its idle timer stops, as a
+      // real socket's does when it is destroyed or handed back.
+      _stopFetchSocketTimer() {
+        var socket = this._fetchSocket;
+        if (this._agentPath || !socket || socket._timeoutId == null) return;
+        globalThis.clearTimeout(socket._timeoutId);
+        socket._timeoutId = null;
       }
 
       abort() {
