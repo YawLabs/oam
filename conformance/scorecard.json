@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "dfd1343+wip",
+  "commit": "8d3e4a4",
   "oamVersion": "oam 0.16.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 146,
-      "total": 146,
+      "pass": 147,
+      "total": 147,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -236,6 +236,10 @@
         },
         {
           "case": "144-tls-server-key-passphrase-and-pfx.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "145-tls-clients-against-tls-servers.mjs",
           "status": "pass"
         },
         {
