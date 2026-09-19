@@ -6042,6 +6042,53 @@ for (const secure of [false, true]) {{
     );
 }
 
+/// An http.get on oam's own transport is sent without waiting on a timer,
+/// and setImmediate is due at once. Each used to cost a whole OS timer tick
+/// (about 15 ms on Windows, 1 ms elsewhere): setImmediate was a 1 ms timer,
+/// and every request waited one after 'socket' -- 200 sequential http.get
+/// took about 60 times the same fetch loop. The bound is loose (3x the
+/// fetch loop, best of three) so a loaded machine does not trip it.
+#[test]
+fn sequential_http_requests_do_not_wait_on_a_timer() {
+    let src = r#"
+import http from 'node:http';
+const server = http.createServer((req, res) => res.end('ok'));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const N = 100;
+const get = () => new Promise((resolve, reject) => {
+  http.get({ host: '127.0.0.1', port, path: '/' }, (res) => { res.resume(); res.on('end', resolve); }).on('error', reject);
+});
+async function time(fn) {
+  let best = Infinity;
+  for (let round = 0; round < 3; round++) {
+    const t0 = performance.now();
+    for (let i = 0; i < N; i++) await fn();
+    best = Math.min(best, performance.now() - t0);
+  }
+  return best;
+}
+const viaFetch = await time(async () => { await (await fetch(`http://127.0.0.1:${port}/`)).text(); });
+const viaGet = await time(get);
+let t0 = performance.now();
+for (let i = 0; i < 200; i++) await new Promise((r) => setImmediate(r));
+const immediates = performance.now() - t0;
+console.log(`http.get within 3x of fetch: ${viaGet < 3 * viaFetch + 50} (get ${viaGet.toFixed(0)} ms, fetch ${viaFetch.toFixed(0)} ms)`);
+console.log(`200 immediates under 100 ms: ${immediates < 100} (${immediates.toFixed(0)} ms)`);
+server.close();
+"#;
+    let out = run_ok("sequential_http_latency.mjs", src);
+    let lines: Vec<&str> = out.lines().collect();
+    assert!(
+        lines[0].starts_with("http.get within 3x of fetch: true"),
+        "{out}"
+    );
+    assert!(
+        lines[1].starts_with("200 immediates under 100 ms: true"),
+        "{out}"
+    );
+}
+
 /// Pooled sockets do not keep the process alive, as in node: the agent unrefs
 /// a socket it keeps, and a socket's idle timer (the global agent's 5 s, an
 /// agent's `timeout`) is an unref'd timer. The server is in this test

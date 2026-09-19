@@ -1491,8 +1491,9 @@ one (a subclass that overrides it, or a patched instance or prototype), an
 client does not apply (`rejectUnauthorized: false`, `ca`, `cert` / `key` / `pfx`,
 `servername`, `checkServerIdentity`, `minVersion` / `maxVersion` / `secureProtocol`), an
 upgrade, or `'lookup'` / `'connect'` / `'secureConnect'` listeners on `req.socket` when the
-request is dispatched -- one macrotask after `'socket'`, so a listener added after an
-`await` in an async `'socket'` handler counts -- or when the agent's pool already holds a
+request is dispatched -- at once when nothing listens for `'socket'`, else one turn of the
+loop after it (an immediate, no timer wait), so a listener added after an `await` in an
+async `'socket'` handler counts -- or when the agent's pool already holds a
 socket for the request (a stock agent's included). Guard packages that vet the destination in any of those places (request-filtering-agent,
 ssrf-req-filter, a `'connect'` listener checking `remoteAddress`) therefore run, and what
 they refuse never reaches the wire, matching Node

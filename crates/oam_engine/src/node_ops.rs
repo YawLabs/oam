@@ -21,7 +21,7 @@ use crate::crypto_ops::{
     op_crypto_scrypt_sync, op_crypto_sign, op_crypto_sign_pss, op_crypto_timing_safe_equal,
     op_crypto_verify, op_crypto_verify_pss, op_crypto_x509_parse,
 };
-use crate::timers::{timer_ref, timer_unref};
+use crate::timers::{timer_immediate, timer_ref, timer_unref};
 use crate::vm_context::{
     op_vm_compile, op_vm_create_context, op_vm_is_context, op_vm_run_in_context,
     op_vm_run_in_this_context,
@@ -209,6 +209,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         // timer no longer keeps the event loop alive (Node Timeout#ref/#unref).
         ("timerRef", timer_ref),
         ("timerUnref", timer_unref),
+        // setImmediate: due at once, never an OS timer wait.
+        ("timerImmediate", timer_immediate),
         // Inbound OS signals: install/remove native delivery of a Node signal
         // name (SIGTERM/SIGINT/SIGHUP/...). Gated JS-side on process
         // listenerCount so start fires on the FIRST listener and stop on the

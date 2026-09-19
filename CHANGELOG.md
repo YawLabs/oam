@@ -105,9 +105,15 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`setImmediate` waited a whole OS timer tick.** It was a 1 ms timer, so an idle loop
+  slept to the next timer tick for it -- about 15 ms on Windows, 1 ms elsewhere; 200
+  awaited immediates took 3 s where node takes 2 ms. An immediate is now due at once.
+  `http.get` / `http.request` on oam's own transport also no longer wait one after
+  `'socket'` unless something listens for `'socket'`: 200 sequential requests to a local
+  server took about 3 s on Windows and now take about 50 ms, as the same `fetch` loop does.
 - **`http.Agent` keeps its sockets alive, as node's does.** A request sent over an
-  agent's socket (a custom agent such as agentkeepalive's, which openai v4 and
-  node-fetch use, or a socket got watches) opened a new connection and TLS handshake
+  agent's socket (a custom agent, such as the agentkeepalive agent openai v4 passes to
+  node-fetch, or a socket got watches) opened a new connection and TLS handshake
   per request and said `Connection: close`. The agent now pools them with node's rules:
   `keepAlive`, `maxSockets` (requests queue), `maxFreeSockets`, `maxTotalSockets`,
   `scheduling`, the `'free'` event, `freeSockets` keyed by `agent.getName()`, the

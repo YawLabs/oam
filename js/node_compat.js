@@ -18096,6 +18096,14 @@
       return hasLength;
     }
 
+    // A listener for what only a real connection emits: the request goes
+    // over one (a 'lookup' only matters for a name).
+    function fetchSocketWatched(socket, host) {
+      return socket.listenerCount("connect") > 0 ||
+        socket.listenerCount("secureConnect") > 0 ||
+        (isIP(host) === 0 && socket.listenerCount("lookup") > 0);
+    }
+
     function isSocketLike(socket) {
       return socket !== null && typeof socket === "object" &&
         typeof socket.on === "function" && typeof socket.write === "function" &&
@@ -18699,19 +18707,27 @@
         this.socket = socket;
         socket._httpMessage = this;
         this._attachSocketListeners(socket);
+        var listened = this.listenerCount("socket") > 0;
         this.emit("socket", socket);
-        // node's name lookup answers a thread-pool round trip after
-        // 'socket', so a listener attached a little later -- after an await
-        // in an async 'socket' handler -- still sees 'lookup' and 'connect'.
-        // The decision on how to send waits a macrotask for the same reason.
         var self = this;
-        globalThis.setImmediate(function () {
+        var decide = function () {
           self._socketEmitted = true;
           if (self._pendingDispatch !== null) {
             if (self._agentPath) self._maybeStartExchange();
             else self._runFetchDispatch();
           }
-        });
+        };
+        // With nothing listening for 'socket', or a socket already watched,
+        // the way to send is known now. Otherwise a 'socket' listener may
+        // still be at work -- an async one that watches the socket after an
+        // await, as it could in node, whose lookup answers a thread-pool
+        // round trip after 'socket' -- and the decision waits one turn of
+        // the loop (an immediate: due at once, no timer wait).
+        if (!listened || fetchSocketWatched(socket, this.host)) {
+          decide();
+          return;
+        }
+        globalThis.setImmediate(decide);
       }
 
       _runFetchDispatch() {
@@ -18721,11 +18737,7 @@
         // and nothing goes out.
         if (socket.destroyed) return;
         var conn = String(this._headers["connection"] || "").toLowerCase();
-        var watched =
-          socket.listenerCount("connect") > 0 ||
-          socket.listenerCount("secureConnect") > 0 ||
-          (isIP(this.host) === 0 && socket.listenerCount("lookup") > 0);
-        if (watched || conn.indexOf("upgrade") !== -1) {
+        if (fetchSocketWatched(socket, this.host) || conn.indexOf("upgrade") !== -1) {
           this._connectFetchSocket();
           return;
         }
@@ -28169,6 +28181,8 @@
       const nativeTimerRef = typeof natives.timerRef === "function" ? natives.timerRef : null;
       const nativeTimerUnref =
         typeof natives.timerUnref === "function" ? natives.timerUnref : null;
+      const nativeImmediate =
+        typeof natives.timerImmediate === "function" ? natives.timerImmediate : null;
       const applyNativeRef = (id, isRef) => {
         if (!id) return;
         if (isRef) {
@@ -28298,8 +28312,15 @@
             }
           }
         };
-        const native = this._repeat ? nativeSetInterval : nativeSetTimeout;
-        this._id = native(wrapped, this._delay, ...this._args);
+        // An Immediate is due at once (node's check phase): the native
+        // immediate, not a 1 ms timer the idle loop would sleep a whole OS
+        // timer tick for.
+        if (this._kind === "Immediate" && nativeImmediate !== null) {
+          this._id = nativeImmediate(wrapped, ...this._args);
+        } else {
+          const native = this._repeat ? nativeSetInterval : nativeSetTimeout;
+          this._id = native(wrapped, this._delay, ...this._args);
+        }
         this._destroyed = false;
         // A fresh native timer is ref'd by default; re-apply an unref'd state so
         // refresh()/re-schedule preserves the handle's ref flag (Node parity).
