@@ -528,6 +528,34 @@ await run("https servername the certificate does not name", () =>
   console.log("tls.connect checkServerIdentity refuses", outcome, j(events));
 }
 
+// A host node's resolver refuses is refused on oam too: the URL parser
+// would rewrite these spellings to an address (percent-escapes, octal and
+// zero-padded IPv4, a trailing dot, a tab, a space, a port, fullwidth digits
+// -- which node refuses at the Host header), and a request must not reach an
+// address node never dials. What each resolves to is the platform's
+// getaddrinfo's answer on both runtimes; the server is not reached unless it
+// resolves.
+for (const host of [
+  "%31%32%37.0.0.1", "127.0.0.1.", "0177.0.0.1", "127.000.000.001", "127.0.0.1	", " 127.0.0.1",
+  "127.0.0.1:80", "%6c%6f%63%61%6c%68%6f%73%74", "１２７.0.0.1", "[::1]", "LocalHost",
+]) {
+  const before = hits;
+  const outcome = await new Promise((resolve) => {
+    let req;
+    try {
+      req = http.get({ host, port: P4, path: "/spelling" }, (res) => {
+        res.resume();
+        res.on("end", () => resolve(`RESPONSE ${res.statusCode}`));
+      });
+    } catch (e) {
+      resolve(`THROW ${e.code} ${e.message}`);
+      return;
+    }
+    req.on("error", (e) => resolve(`ERROR ${e.code}`));
+  });
+  console.log(`host ${j(host)}: ${outcome} | reached=${hits > before}`);
+}
+
 srv4.close();
 srv6.close();
 tsrv4.close();

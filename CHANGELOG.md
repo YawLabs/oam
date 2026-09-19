@@ -44,6 +44,13 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 - **`http.request` followed redirects.** node's `http.request` returns a `3xx` as the
   response; oam's followed it, so a request whose URL an application had vetted could
   end at a host it never named. It now returns the `3xx`, as node does.
+- **`http.request` dialled a rewritten host.** On oam's own transport a request's
+  `host` went through the URL parser, which turns spellings node's resolver refuses --
+  percent-escapes, octal or zero-padded IPv4, a trailing dot, a tab, fullwidth digits --
+  into an address, so a host an application had checked as a string reached an address
+  node never dials. Such a host now goes to the resolver as written, as in node, and a
+  Host header no header may carry throws node's `ERR_INVALID_CHAR`. `net.isIP` also
+  accepts an IPv6 zone id, and `dns.lookup` answers an IP literal as written, as node's do.
 - **TLS options of `https.request` were not applied.** A verifying `https.request` went
   through one shared client that ignored the request's `ca`, client certificate,
   `servername` and `checkServerIdentity`, and `tls.connect` never called a

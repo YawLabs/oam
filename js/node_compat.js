@@ -18279,11 +18279,8 @@
         //
         // A path that does not start with "/" is given one, so it can only
         // ever be a path (node would send it verbatim, which its own servers
-        // answer with 400); and a `host` the URL parser cannot hold as a bare
-        // authority fails the request, where node fails it in the resolver
-        // (see docs/node-divergences.md).
+        // answer with 400).
         if (reqPath.charAt(0) !== "/") reqPath = "/" + reqPath;
-        this._urlError = null;
         var authority = null;
         try {
           var probe = new URL(protocol + "//" + urlHost + "/");
@@ -18300,18 +18297,17 @@
         } catch {
           authority = null;
         }
-        if (authority === null) {
-          // node resolves the literal string and fails there. Its own code
-          // varies by spelling on Windows (ENOTFOUND for '127.0.0.1/x',
-          // EAI_FAIL for 'u:p@127.0.0.1'); oam reports the ENOTFOUND shape.
-          this._urlError = globalThis.__oamMakeSysError({
-            message: "getaddrinfo ENOTFOUND " + host,
-            errno: -3008,
-            code: "ENOTFOUND",
-            syscall: "getaddrinfo",
-            hostname: host,
-          });
-        }
+        // node hands `host` to the resolver as written. The URL parser
+        // rewrites spellings the resolver refuses -- percent-escapes, octal or
+        // zero-padded IPv4, a trailing dot on an address, a tab, IDNA,
+        // fullwidth digits -- and a transport dialling its hostname would
+        // reach an address node never dials. So a name the parser cannot
+        // hold, or holds only rewritten (or bracketed, which only some
+        // resolvers accept), goes over net.connect with the string as given:
+        // the platform's resolver answers, as it does node's.
+        this._rawHost = authority === null ||
+          (isIP(host) === 0 &&
+            (authority.hostname !== host.toLowerCase() || host.charAt(0) === "["));
         this._url = protocol + "//" + urlHost + ":" + port + reqPath;
         this._headers = {};
         if (opts.headers) {
@@ -18380,6 +18376,12 @@
           );
         }
         this.insecureHTTPParser = insecureHTTPParser;
+        // node sets the Host header through setHeader(), whose value check
+        // throws for a character no header may carry -- a host spelled with
+        // fullwidth digits, say -- before anything is resolved.
+        if (this._setHost && this._headers.host === undefined && INVALID_HEADER_CHAR.test(this._hostHeader)) {
+          throw invalidHeaderChar("Host");
+        }
         this._body = [];
         this._ended = false;
         this._aborted = false;
@@ -18465,7 +18467,8 @@
           (protocol === "https:" && carriesTlsPolicy(merged)) ||
           // A socket an earlier request over this (stock) agent left in its
           // pool is reused, as node's addRequest reuses it.
-          (!!agent && agentHasFreeSocket(agent, this, opts, host, port));
+          (!!agent && agentHasFreeSocket(agent, this, opts, host, port)) ||
+          this._rawHost;
         this._options = opts;
         this._port = port;
         this._fetchSocket = null;
@@ -18793,17 +18796,6 @@
       _doFetchRequest(bodyData) {
         var self = this;
         self._sent = true;
-        // A `host` the URL parser cannot hold as a bare authority: the request
-        // never goes out, and the failure surfaces as the resolver error node
-        // reports for the same options (see the constructor).
-        if (self._urlError !== null) {
-          var urlError = self._urlError;
-          process.nextTick(function () {
-            if (self._aborted) return;
-            self._failBeforeResponse(urlError);
-          });
-          return;
-        }
         var fetchOpts = {
           method: self.method,
           headers: self._headers,
@@ -20448,8 +20440,14 @@
       return parts.length === 4 && parts.every((p) => V4_SEGMENT.test(p));
     }
     function isIPv6(input) {
-      const text = String(input);
+      let text = String(input);
       if (text.length === 0 || text.includes(" ")) return false;
+      // node's IPv6Reg ends in `(?:%[0-9a-zA-Z-.:]{1,})?`: a zone id.
+      const zone = text.indexOf("%");
+      if (zone !== -1) {
+        if (!/^%[0-9a-zA-Z\-.:]+$/.test(text.slice(zone))) return false;
+        text = text.slice(0, zone);
+      }
       const sections = text.split("::");
       if (sections.length > 2) return false;
       const check = (part) =>
@@ -25369,6 +25367,13 @@
     // returned the native promise straight to the caller.
     function _dnsLookup(hostname, family, all) {
       const host = String(hostname);
+      // node answers an IP literal itself, as written (no resolver, no
+      // family filter): '0:0:0:0:0:0:0:1' stays that, '::1%1' keeps its zone.
+      const literal = registry.get("net").isIP(host);
+      if (literal !== 0) {
+        const answer = { address: host, family: literal };
+        return Promise.resolve(all ? [answer] : answer);
+      }
       return natives.dnsLookup(host, family, all).then(undefined, (err) => {
         throw _shapeDnsError(err, "getaddrinfo", host, true);
       });

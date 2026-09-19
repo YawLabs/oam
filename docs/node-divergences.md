@@ -1447,10 +1447,17 @@ above.
   applied first, with Node's exact messages, so the normalisation only ever sees a path Node
   would also have sent. This is what keeps the connect target where `hostname` says: without
   it, `{hostname: SAFE, port: GOOD, path: '@other.host:PORT/x'}` reached the OTHER origin.
-- **A `host` the URL parser cannot hold as a bare authority fails the request in oam and the
-  resolver in Node**, with the same class of error but not always the same code: for
-  `{hostname: 'u:p@127.0.0.1:PORT'}` Node reports `getaddrinfo EAI_FAIL` on Windows and oam
-  reports `getaddrinfo ENOTFOUND`; for `{hostname: '127.0.0.1/x'}` both report `ENOTFOUND`.
+- **A `host` the URL parser would rewrite goes to the resolver as written.** oam's client
+  carries a request as a URL, and the URL parser rewrites spellings Node's resolver refuses
+  (percent-escapes, octal and zero-padded IPv4, a trailing dot on an address, a tab, IDNA,
+  fullwidth digits), which would send the request to an address Node never dials. So a
+  name the parser cannot hold, holds only rewritten, or holds bracketed goes over
+  `net.connect` with the string as given, and the platform's `getaddrinfo` answers it as it
+  answers Node (`ENOTFOUND` for all of those on Windows; glibc's resolver takes octal
+  IPv4), with Node's `ERR_INVALID_CHAR` thrown first for a Host header no header may carry
+  (`conformance/cases/121` and `122`). Up to 0.16.2 the parser's rewrite was dialled. One
+  resolver difference remains: on Windows Node's `dns.lookup` maps a fullwidth-digit name to
+  its ASCII address and oam's refuses it (fail-closed; `http.request` throws on it in both).
 - **A port that is a coercible string dials the same place, but the `Host` header differs.**
   Node dials the coercion and writes the caller's raw spelling: `port: '0x50'` sends
   `Host: 127.0.0.1:0xc4df`, and `port: ' 50399'` sends `Host: 127.0.0.1: 50399`. oam dials
