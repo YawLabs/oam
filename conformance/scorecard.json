@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "3a3318b",
+  "commit": "4d471bb",
   "oamVersion": "oam 0.16.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 120,
-      "total": 120,
+      "pass": 126,
+      "total": 126,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -148,6 +148,30 @@
         },
         {
           "case": "133-http-client-response-header-limit.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "134-http-server-chunked-body.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "135-http-server-timeouts.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "136-http-server-max-connections.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "137-http-chunk-extensions.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "138-http-server-request-trailers.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "139-http-server-upgrade-and-connect.mjs",
           "status": "pass"
         },
         {
