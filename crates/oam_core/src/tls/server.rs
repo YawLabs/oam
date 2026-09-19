@@ -266,6 +266,14 @@ pub fn build_server_context(spec: &ServerContextSpec) -> Result<ServerContext, C
             passphrase,
         )?);
     }
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+
+    // A pfx carries its own key, its certificate and any CA certificates:
+    // its chain is the certificate that is the key's, then the others, and
+    // (Node's LoadPKCS12) those others are trusted CAs of the server too.
+    let mut pfx_cas: Vec<CertificateDer<'static>> = Vec::new();
     for pfx in &spec.pfx {
         let passphrase = pfx.passphrase.as_deref().or(spec.passphrase.as_deref());
         let der = {
@@ -275,17 +283,32 @@ pub fn build_server_context(spec: &ServerContextSpec) -> Result<ServerContext, C
                 .map_err(|_| ContextError::plain("not enough data", None))?
         };
         let bundle = super::keys::load_pkcs12(&der, passphrase.unwrap_or(""))?;
-        if let Some(key) = bundle.key {
-            keys.push(key);
+        let Some(key) = bundle.key else {
+            pfx_cas.extend(bundle.certs);
+            continue;
+        };
+        let signing_key = provider
+            .key_provider
+            .load_private_key(key.clone_key())
+            .map_err(|_| ContextError::unsupported_key())?;
+        let leaf = bundle.certs.iter().position(|cert| {
+            CertifiedKey::new(vec![cert.clone()], Arc::clone(&signing_key))
+                .keys_match()
+                .is_ok()
+        });
+        match leaf {
+            Some(index) => {
+                let mut certs = bundle.certs;
+                let leaf = certs.remove(index);
+                pfx_cas.extend(certs.iter().cloned());
+                let mut chain = vec![leaf];
+                chain.extend(certs);
+                chains.push(chain);
+            }
+            None => pfx_cas.extend(bundle.certs),
         }
-        if !bundle.chain.is_empty() {
-            chains.push(bundle.chain);
-        }
+        keys.push(key);
     }
-
-    let provider = rustls::crypto::CryptoProvider::get_default()
-        .cloned()
-        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
 
     // Each key serves the chain whose leaf it matches; a key that matches no
     // certificate is Node's mismatch error.
@@ -310,7 +333,7 @@ pub fn build_server_context(spec: &ServerContextSpec) -> Result<ServerContext, C
         }
     }
     let has_identity = !identities.is_empty();
-    let judge = Arc::new(ClientCertJudge::new(spec.ca.as_deref()));
+    let judge = Arc::new(ClientCertJudge::new(spec.ca.as_deref(), &pfx_cas));
     let resolver: Arc<dyn rustls::server::ResolvesServerCert> = Arc::new(Identities(identities));
 
     let versions = protocol_versions(
@@ -506,10 +529,12 @@ struct ClientCertJudge {
 }
 
 impl ClientCertJudge {
-    fn new(ca: Option<&[String]>) -> Self {
+    /// `ca` (None: the default store), plus any CA certificates a pfx
+    /// brought.
+    fn new(ca: Option<&[String]>, pfx_cas: &[CertificateDer<'static>]) -> Self {
         let mut root_store = rustls::RootCertStore::empty();
         let mut hints = Vec::new();
-        let trusted_leaves: Vec<CertificateDer<'static>> = match ca {
+        let mut trusted_leaves: Vec<CertificateDer<'static>> = match ca {
             Some(ca) => {
                 // Node reads what it can of `ca` and ignores the rest (a
                 // `ca` of garbage does not throw; measured).
@@ -542,6 +567,17 @@ impl ClientCertJudge {
                 extras.certs.clone()
             }
         };
+        for cert in pfx_cas {
+            if let Ok((_, parsed)) = parse_x509_certificate(cert.as_ref()) {
+                hints.push(rustls::DistinguishedName::from(
+                    parsed.subject().as_raw().to_vec(),
+                ));
+            }
+            if is_self_signed(cert.as_ref()) {
+                let _ = root_store.add(cert.clone());
+            }
+            trusted_leaves.push(cert.clone());
+        }
         let trusted_non_anchors = trusted_leaves
             .iter()
             .filter(|c| !is_self_signed(c.as_ref()))
@@ -1382,7 +1418,7 @@ asDZ6pyGf669FP4nlBCxQetAmb5ZvRlSGk6/Cus=\n\
     #[test]
     fn client_certificate_verdicts_are_nodes() {
         let now = UnixTime::now();
-        let with_ca = ClientCertJudge::new(Some(&[CA.to_string()]));
+        let with_ca = ClientCertJudge::new(Some(&[CA.to_string()]), &[]);
         assert_eq!(
             code(with_ca.verdict(None, now)),
             Some("UNABLE_TO_GET_ISSUER_CERT")
@@ -1398,13 +1434,13 @@ asDZ6pyGf669FP4nlBCxQetAmb5ZvRlSGk6/Cus=\n\
             Some("INVALID_PURPOSE")
         );
         // Trusted by name: a self-signed certificate that is itself in `ca`.
-        let rogue_trusted = ClientCertJudge::new(Some(&[ROGUE_CERT.to_string()]));
+        let rogue_trusted = ClientCertJudge::new(Some(&[ROGUE_CERT.to_string()]), &[]);
         assert_eq!(
             code(rogue_trusted.verdict(Some(&der(ROGUE_CERT)), now)),
             None
         );
         // Without `ca`, the bundled roots: nobody signed the test CA.
-        let default_store = ClientCertJudge::new(None);
+        let default_store = ClientCertJudge::new(None, &[]);
         assert_eq!(
             code(default_store.verdict(Some(&der(CLIENT_CERT)), now)),
             Some("UNABLE_TO_VERIFY_LEAF_SIGNATURE")

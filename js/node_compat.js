@@ -26843,34 +26843,19 @@
     }
     // What the native context is built from: Node's createSecureContext
     // options, normalised.
+    // Node's createSecureContext reading of the key options
+    // (lib/internal/tls/secure-context.js): `key` is one PEM or an array of
+    // them, an array entry may be `{ pem, passphrase }`; `pfx` is one bundle
+    // or an array of them, an array entry may be `{ buf, passphrase }`; an
+    // entry's own passphrase wins over `passphrase`. What the native context
+    // is built from.
     function secureContextSpec(options, versions) {
-      var certs = [];
-      optionList(options.cert).forEach(function(c) {
-        validateKeyOrCert("cert", c);
-        certs.push(pemText(c));
-      });
-      var keys = [];
-      optionList(options.key).forEach(function(k) {
-        if (k !== null && typeof k === "object" && !ArrayBuffer.isView(k)) {
-          validateKeyOrCert("key.pem", k.pem);
-          keys.push({ pem: pemText(k.pem), passphrase: k.passphrase == null ? null : String(k.passphrase) });
-        } else {
-          validateKeyOrCert("key", k);
-          keys.push({ pem: pemText(k), passphrase: null });
-        }
-      });
-      var pfx = [];
-      optionList(options.pfx).forEach(function(p) {
-        var buf = p, passphrase = null;
-        if (p !== null && typeof p === "object" && !ArrayBuffer.isView(p)) {
-          buf = p.buf;
-          passphrase = p.passphrase == null ? null : String(p.passphrase);
-        }
-        validateKeyOrCert("pfx", buf);
-        var bytes = typeof buf === "string" ? globalThis.Buffer.from(buf)
-          : globalThis.Buffer.from(buf.buffer, buf.byteOffset, buf.byteLength);
-        pfx.push({ buf: bytes.toString("base64"), passphrase: passphrase });
-      });
+      var isBytes = function(v) { return ArrayBuffer.isView(v); };
+      var passphraseText = function(v) {
+        if (v === undefined || v === null) return null;
+        if (typeof v === "string") return v;
+        return new TextDecoder().decode(new Uint8Array(v.buffer, v.byteOffset, v.byteLength));
+      };
       var ca = null;
       if (options.ca) {
         ca = optionList(options.ca).map(function(c) {
@@ -26878,25 +26863,82 @@
           return pemText(c);
         });
       }
+      var certs = [];
+      optionList(options.cert).forEach(function(c) {
+        validateKeyOrCert("cert", c);
+        certs.push(pemText(c));
+      });
+      var keys = [];
+      var setKey = function(pem, passphrase) {
+        validateKeyOrCert("key", pem);
+        if (passphrase !== undefined && passphrase !== null && typeof passphrase !== "string") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.passphrase", "string", passphrase);
+        }
+        keys.push({ pem: pemText(pem), passphrase: passphrase == null ? null : passphrase });
+      };
+      if (options.key) {
+        if (Array.isArray(options.key)) {
+          options.key.forEach(function(val) {
+            var pem = val != null && val.pem !== undefined ? val.pem : val;
+            var pass = val != null && val.passphrase !== undefined ? val.passphrase : options.passphrase;
+            setKey(pem, pass);
+          });
+        } else {
+          setKey(options.key, options.passphrase);
+        }
+      }
+      var pfx = [];
+      var loadPfx = function(raw, passphrase) {
+        if (typeof raw === "string") raw = globalThis.Buffer.from(raw);
+        if (!isBytes(raw)) {
+          var unable = new Error("Unable to load PFX certificate");
+          unable.code = "ERR_CRYPTO_OPERATION_FAILED";
+          throw unable;
+        }
+        if (passphrase !== undefined && passphrase !== null && typeof passphrase !== "string" && !isBytes(passphrase)) {
+          throw nodeTypeError("Pass phrase must be a buffer", "ERR_INVALID_ARG_TYPE");
+        }
+        pfx.push({
+          buf: globalThis.Buffer.from(raw.buffer, raw.byteOffset, raw.byteLength).toString("base64"),
+          passphrase: passphraseText(passphrase),
+        });
+      };
+      if (options.pfx !== undefined && options.pfx !== null) {
+        if (Array.isArray(options.pfx)) {
+          options.pfx.forEach(function(val) {
+            var raw = val != null && val.buf ? val.buf : val;
+            var pass = (val != null && val.passphrase) || options.passphrase;
+            loadPfx(raw, pass);
+          });
+        } else {
+          loadPfx(options.pfx, options.passphrase || undefined);
+        }
+      }
       return {
         certs: certs,
         keys: keys,
         pfx: pfx,
-        passphrase: options.passphrase == null ? null : String(options.passphrase),
+        passphrase: typeof options.passphrase === "string" ? options.passphrase : null,
         ca: ca,
         minVersion: versions.min,
         maxVersion: versions.max,
       };
     }
     // Build a native context, or throw what Node throws: OpenSSL's errors
-    // carry `library`, `reason` and `code`; a PKCS#12 bundle's are plain.
+    // carry `library`, `reason` and `code`; a PKCS#12 bundle's are plain; a
+    // key protection oam cannot open is ERR_FEATURE_UNAVAILABLE_ON_PLATFORM
+    // (a TypeError, as Node's is).
     function buildServerContext(options, versions) {
       var built = JSON.parse(natives.tlsServerContext(JSON.stringify(secureContextSpec(options, versions))));
       if (built.error) {
-        var e = new Error(built.error.message);
-        if (built.error.library !== undefined) e.library = built.error.library;
-        if (built.error.reason !== undefined) e.reason = built.error.reason;
-        if (built.error.code !== undefined) e.code = built.error.code;
+        var failure = built.error;
+        if (failure.code === "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM") {
+          throw nodeTypeError(failure.message, failure.code);
+        }
+        var e = new Error(failure.message);
+        if (failure.library !== undefined) e.library = failure.library;
+        if (failure.reason !== undefined) e.reason = failure.reason;
+        if (failure.code !== undefined) e.code = failure.code;
         throw e;
       }
       return built.id;
