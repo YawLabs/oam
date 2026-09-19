@@ -402,6 +402,12 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("cryptoCheckPrime", op_crypto_check_prime),
         // TLS sockets (node:tls)
         ("tlsConnect", op_tls_connect),
+        ("tlsConnectOver", op_tls_connect_over),
+        ("tlsPipeOpen", op_tls_pipe_open),
+        ("tlsPipeOut", op_tls_pipe_out),
+        ("tlsPipeIn", op_tls_pipe_in),
+        ("tlsPipeInEnd", op_tls_pipe_in_end),
+        ("tlsPipeClose", op_tls_pipe_close),
         ("tlsRead", op_tls_read),
         ("tlsWrite", op_tls_write),
         ("tlsClose", op_tls_close),
@@ -3489,6 +3495,120 @@ fn op_tls_connect(
             max_version,
             attempt_timeout,
             pin,
+        ),
+    );
+}
+
+/// `__oam.node.tlsPipeOpen() -> id`: a pipe TLS will run over for
+/// `tls.connect({ socket })`; JS pumps its far end to the socket
+/// (`oam_core::byte_pipe`).
+fn op_tls_pipe_open(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let core = core_runtime!(scope);
+    let pipes = core.tls_pipes();
+    let ids = core.body_ids();
+    rv.set_double(oam_core::byte_pipe::open(&pipes, &ids) as f64);
+}
+
+/// `__oam.node.tlsPipeOut(id)`: the next bytes TLS wrote, for the socket, or
+/// undefined at the end. Unref'd, as httpBridgeOut: an idle connection's TLS
+/// may never write again, and the socket's own read is what keeps a live
+/// connection's process running.
+fn op_tls_pipe_out(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let pipes = core_runtime!(scope).tls_pipes();
+    crate::ops::spawn_op_unref(scope, &mut rv, oam_core::byte_pipe::out(pipes, id));
+}
+
+/// `__oam.node.tlsPipeIn(id, bytes)`: bytes the socket read.
+fn op_tls_pipe_in(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let Some(bytes) = arg_bytes(scope, &args, 1) else {
+        throw_type_error(scope, "tlsPipeIn requires bytes");
+        return;
+    };
+    let pipes = core_runtime!(scope).tls_pipes();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::byte_pipe::input(pipes, id, bytes));
+}
+
+/// `__oam.node.tlsPipeInEnd(id)`: the socket reached EOF.
+fn op_tls_pipe_in_end(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let pipes = core_runtime!(scope).tls_pipes();
+    crate::ops::spawn_op(scope, &mut rv, oam_core::byte_pipe::input_end(pipes, id));
+}
+
+/// `__oam.node.tlsPipeClose(id)`: drop the pipe. True if it was open.
+fn op_tls_pipe_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let closed =
+        id >= 0.0 && oam_core::byte_pipe::close(&core_runtime!(scope).tls_pipes(), id as u64);
+    rv.set_bool(closed);
+}
+
+/// `__oam.node.tlsConnectOver(pipe, serverName, ca, rejectUnauthorized,
+/// cert, key, minVersion, maxVersion)`: the client handshake over a pipe
+/// (`tls.connect({ socket })`); resolves as tlsConnect does, without the
+/// addresses. No net grant is asked: the socket underneath was opened (and
+/// checked) by whoever made it.
+fn op_tls_connect_over(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let pipe = args.get(0).number_value(scope).unwrap_or(-1.0);
+    if pipe < 0.0 {
+        throw_type_error(scope, "tlsConnectOver requires a pipe");
+        return;
+    }
+    let Some(server_name) = arg_string(scope, &args, 1) else {
+        throw_type_error(scope, "tlsConnectOver requires a server name");
+        return;
+    };
+    let ca_pem = arg_string(scope, &args, 2).filter(|s| !s.is_empty());
+    let reject_unauthorized = args.get(3).boolean_value(scope);
+    let client_cert_pem = arg_string(scope, &args, 4).filter(|s| !s.is_empty());
+    let client_key_pem = arg_string(scope, &args, 5).filter(|s| !s.is_empty());
+    let min_version = arg_string(scope, &args, 6).filter(|s| !s.is_empty());
+    let max_version = arg_string(scope, &args, 7).filter(|s| !s.is_empty());
+    let core = core_runtime!(scope);
+    let tls = core.tls();
+    let pipes = core.tls_pipes();
+    let ids = core.body_ids();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::tls::tls_connect_over(
+            tls,
+            pipes,
+            ids,
+            pipe as u64,
+            server_name,
+            ca_pem,
+            reject_unauthorized,
+            client_cert_pem,
+            client_key_pem,
+            min_version,
+            max_version,
         ),
     );
 }

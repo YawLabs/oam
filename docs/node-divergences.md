@@ -1039,18 +1039,30 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   a `stream.Duplex` here, so `netSocket instanceof stream.Duplex` is false where Node says
   true.
 - **Node members absent from both classes**, which the mechanical walk cannot see by
-  construction: `destroySoon`, `resetAndDestroy`, and `net.Socket.prototype.read` (a
-  `TLSSocket`, being a Duplex, has `read`). A `tls.connect()` socket also still lacks them.
+  construction: `destroySoon` and `resetAndDestroy`. `net.Socket` has had `read()`,
+  `'readable'` and `push()` since 0.16.3 (below); a `TLSSocket`, being a Duplex, always had
+  `read`.
 - **A bare `connect()` handshakes.** `new tls.TLSSocket(null, opts).connect(port, host)` runs
   the TLS handshake inside oam's native connect and fires `'connect'`, `'ready'` and
   `'secureConnect'`; in Node that `connect()` only opens the transport, and only
   `tls.connect()` starts the handshake. oam is a superset here.
-- **No wrapping of an existing socket.** oam has no native op that starts a client-side TLS
-  session over an already-connected plain socket, so `tls.connect({ socket })` and
-  `new tls.TLSSocket(existingSocket)` are refused: the socket is destroyed on the next tick
-  with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. Node upgrades the given socket in place. This
-  is the STARTTLS shape (`pg` and `mysql2` with `ssl`, `nodemailer`, `ldapjs`); until the op
-  exists, open the TLS connection with `tls.connect({ host, port })` instead.
+- **TLS over an existing socket runs over a pipe.** `tls.connect({ socket })` -- the
+  STARTTLS shape (`pg` and `mysql2` with `ssl`, `nodemailer`, `ldapjs`), a CONNECT tunnel
+  (https-proxy-agent), TLS in TLS (an https proxy) -- works as in Node, over a net.Socket,
+  a TLSSocket or any JS Duplex: no `'connect'` of its own for a connected socket (its
+  `'connect'` is handed on for one still connecting), that socket's addresses, `'secure'`
+  after `'secureConnect'`, the certificate checked against `servername`, else `host`, else
+  the name the socket connected to, and the socket closed with the TLS socket
+  (`conformance/cases/125-tls-connect-over-a-socket.mjs`). Node moves the socket's handle
+  into the TLS layer; oam runs rustls over an in-memory pipe whose other end JS pumps to
+  and from the socket. What that shows: `_handle` is a stand-in with `_parentWrap` (the
+  wrapped socket, or a `JSStreamSocket` over a JS stream, as in Node) and `_parent`, not a
+  TLSWrap; the wrapped socket still emits its own `'data'` / `'end'` (the ciphertext) to
+  anyone else listening, where Node's stops once TLS owns its handle; and when the peer
+  ends the connection first, oam's own close_notify may not reach it before the socket is
+  destroyed. `new tls.TLSSocket(socket)` without `tls.connect()` starts no handshake, as
+  in Node; a server-side wrap (`isServer: true`) is still not supported. Up to 0.16.2 every
+  wrapped socket was refused with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`.
 - **`minVersion` / `maxVersion` / `secureProtocol` are honoured** by `tls.connect`,
   `tls.createServer`, `https.createServer` and `https.request` (#144) -- which sends a
   request carrying any of them, or `ca`, a client certificate, `servername`,
@@ -1238,7 +1250,8 @@ What still differs:
   request is dispatched therefore sends it over a real socket instead, entry 39); no bytes
   pass through it, so it emits no `'data'` and its `setTimeout` does nothing; it emits
   `'close'` only when the request is aborted or destroyed; and through an environment
-  proxy its peer is the proxy. Up to 0.16.2 it was a fixed object naming the host as
+  proxy its peer is the proxy. At the end of a response whose connection stays open,
+  `res.socket` is null, as node detaches a kept-alive socket. Up to 0.16.2 it was a fixed object naming the host as
   written, with `localAddress` `127.0.0.1` and `localPort` `0`.
 - **The WebSocket client is not on this connector.** `new WebSocket(url)` dials on its own,
   so on Windows a refused loopback connect takes about 2 s (2035 ms measured; Node 7 ms), and
@@ -1528,9 +1541,12 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   Node clears a closed socket's `localAddress` / `localPort`; oam keeps them on a
   `net.Socket`.
 - **Proxy agents.** `http-proxy-agent` and similar agents that return a plain socket to a
-  proxy work for http. For an https target, agents that ask `tls.connect` to run TLS over
-  an existing socket fail with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` (entry 34), where they
-  used to be ignored and the request went direct.
+  proxy work for http, and https-proxy-agent (5 and 7) tunnels to an https target over
+  `tls.connect({ socket })` (entry 34), a refusing proxy's answer included, as in Node. Up
+  to 0.16.2 they were ignored and the request went direct. agent-base, under all of them,
+  decides "is this https?" by looking for Node's own `node:https:` frame on the stack; oam's
+  `https.request` and `https.get` run in frames named `node:https` for it, so a stack
+  trace through them shows that name where it used to show `oam:node_compat.js`.
 - **`--permission`.** The request is a `net.connect` / `tls.connect`, and its grant is
   checked as theirs is: `host:port`, and each address a `lookup` hook answers as `addr:port`
   (entry 4).
@@ -1755,9 +1771,12 @@ comment, **not** something measured. Do not rely on either the claim or its nega
   runtimes in a single-host probe, which does not distinguish "worked" from "no-op".
 - **`process.setSourceMapsEnabled`** appears to validate and no-op. Not confirmed against
   a real source-mapped stack.
-- **`net.Socket` read-side state.** A source comment says oam's socket is always in
-  flowing mode, so `_readableState.length` stays `0`. That is an internal some libraries
-  (e.g. `ws`) read; not measured here.
+- **`net.Socket` read-side state.** oam's socket reads in flowing mode unless a
+  `'readable'` listener switches it to paused mode (`read()` hands out what is buffered,
+  `'end'` follows the last null), and once the last `'readable'` listener goes, data is
+  held until `resume()` or a `'data'` listener, as Node's `readableFlowing` null does
+  (case 125). A socket nobody reads still emits `'data'` into the void where Node's would
+  buffer, and `_readableState.length` is `0` except in paused mode.
 - **`req.socket` on an HTTP server** may be a synthetic `EventEmitter` with a fixed
   `remoteAddress` of `127.0.0.1` rather than the real peer. Measured so far only from a
   `127.0.0.1` client, where `remoteAddress` is right but `localAddress`, `localPort` and
