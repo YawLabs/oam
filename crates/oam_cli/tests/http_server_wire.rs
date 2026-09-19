@@ -766,3 +766,45 @@ fn idle_keep_alive_connections_do_not_lock_the_server_out() {
     let _ = first.read_to_end(&mut rest);
     assert!(rest.is_empty(), "{:?}", String::from_utf8_lossy(&rest));
 }
+
+/// A request pipelined behind one whose body the handler never read is held
+/// to its own timeouts: the end of the first body, read after the second
+/// head was parsed, used to count as the second request's end, so a second
+/// request whose body never came was never answered 408 and its connection
+/// stayed open for good.
+#[test]
+fn a_pipelined_request_after_an_unread_body_keeps_its_timeouts() {
+    use std::io::{Read, Write};
+    // Answers /a without reading its body; /x waits for its body.
+    let script = TIMEOUT_SERVER.replace(
+        r#"(req, res) => res.end("ok")"#,
+        r#"(req, res) => { if (req.url === "/a") res.end("ok"); else req.on("end", () => res.end("late")).resume(); }"#,
+    );
+    assert_ne!(script, TIMEOUT_SERVER);
+    let server = Server::start("pipelined.mjs", &script, &[], &[]);
+    let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
+    let mut stream = std::net::TcpStream::connect(target).unwrap();
+    stream
+        .write_all(b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nab")
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    stream
+        .write_all(b"cdePOST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n")
+        .unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(6)))
+        .unwrap();
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let text = String::from_utf8_lossy(&response);
+    // Status lines wherever they start (the first body runs into the next).
+    let statuses: Vec<&str> = text
+        .match_indices("HTTP/1.1 ")
+        .map(|(at, _)| text[at..].split("\r\n").next().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        statuses,
+        ["HTTP/1.1 200 OK", "HTTP/1.1 408 Request Timeout"],
+        "{text:?}"
+    );
+}

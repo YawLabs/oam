@@ -17435,6 +17435,11 @@
         // unanswered exchange surface a connection error client-side.
         if (this.socket && this.aborted && typeof this._requestId === "number") {
           natives.httpAbort(this._requestId);
+          // The connection goes with it: an unfinished response closes
+          // (node's 'close' without 'finish').
+          if (this.res && typeof this.res._connectionLost === "function") {
+            this.res._connectionLost();
+          }
         }
         callback(err);
       }
@@ -17815,19 +17820,23 @@
         });
         return this;
       };
-      // No half-close here: the connection is closed.
+      // Closes the connection once what is being written is out (no
+      // half-close: the connection ends).
       socket.end = function end() {
-        return this.destroy();
+        if (typeof connectionId === "number" && !this.destroyed) {
+          natives.httpConnDestroy(connectionId, true);
+        }
+        return this;
       };
       return socket;
     }
 
     // A duration handed to the native server: node's timer range (a finite
-    // number >= 0, capped at 2**31 - 1 like its timers); anything else is 0,
-    // which is off.
+    // number > 0, at least 1 ms and capped at 2**31 - 1 like its timers);
+    // anything else is 0, which is off.
     function timerMs(value) {
       if (typeof value !== "number" || !(value > 0) || !Number.isFinite(value)) return 0;
-      return Math.min(Math.floor(value), 2147483647);
+      return Math.min(Math.max(Math.floor(value), 1), 2147483647);
     }
 
     // node's validateInteger(value, name, 0), as storeHTTPOptions uses it.
@@ -18006,14 +18015,15 @@
           ? undefined
           : server._exchanges.get(meta.requestId);
       if (meta.event === "closed") {
-        // The connection was closed under an unanswered request: node's
-        // abortIncoming -- an unfinished request is destroyed with
-        // ECONNRESET "aborted" ('aborted' now, 'error' and 'close' on the
-        // next tick) -- and the response closes without 'finish'.
+        // The exchange ended without its response (the connection was
+        // closed under it): node's abortIncoming -- the request is
+        // destroyed with ECONNRESET "aborted" ('aborted' now when it was
+        // not read to the end, 'error' and 'close' on the next tick) --
+        // and the response closes without 'finish'.
         if (exchange) {
           server._exchanges.delete(meta.requestId);
           const req = exchange.req;
-          if (!req.complete && !req.destroyed) {
+          if (!req.destroyed) {
             const reset = new Error("aborted");
             reset.code = "ECONNRESET";
             req.destroy(reset);
@@ -18022,14 +18032,15 @@
         }
         return;
       }
-      // node's socketOnTimeout: 'timeout' on the request (while it is
-      // incomplete), the response and the server; the socket is destroyed
+      // node's socketOnTimeout: 'timeout' on the request (while the parser
+      // has not seen all of it -- node's req.complete, which the native
+      // side reports), the response and the server; the socket is destroyed
       // when none of them listens. Then the socket's own listeners
       // (socket.setTimeout(ms, cb)), which node registers after it.
       const req = exchange && exchange.req;
       const res = exchange && exchange.res;
       const socket = req ? req.socket : serverSocket(meta);
-      const reqTimeout = req && !req.complete && req.emit("timeout", socket);
+      const reqTimeout = req && !meta.requestComplete && req.emit("timeout", socket);
       const resTimeout = res && res.emit("timeout", socket);
       const serverTimeout = server.emit("timeout", socket);
       if (!reqTimeout && !resTimeout && !serverTimeout) socket.destroy();

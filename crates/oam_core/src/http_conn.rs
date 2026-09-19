@@ -148,14 +148,28 @@ impl ServerTimeouts {
     }
 }
 
-/// Why a connection is being closed from outside hyper.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Why a connection is being closed from outside hyper, weakest first: a
+/// stronger reason given later takes over.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CloseReason {
+    /// `socket.end()`: finish what is being written, then close (hyper's
+    /// graceful shutdown).
+    End,
     /// `socket.destroy()`, or a socket timeout nobody handled: close it.
     Destroy,
     /// headersTimeout / requestTimeout: answer 408 when no response head went
     /// out, then close.
     RequestTimeout,
+}
+
+/// A socket timeout that fired (node's socket 'timeout').
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fired {
+    /// The request whose response was in flight, if any.
+    pub request_id: Option<u64>,
+    /// That request was all in -- node's `req.complete`, which decides
+    /// whether 'timeout' reaches the request.
+    pub request_complete: bool,
 }
 
 /// Where a connection is in node's terms.
@@ -173,10 +187,18 @@ struct Phase {
     message_start: Instant,
     /// Its headers are in.
     headers_complete: bool,
+    /// Counts the requests received on the connection: the one being
+    /// received is this one. A request's end is only taken for it when it
+    /// carries the same number, so the end of a body read late cannot mark
+    /// the request after it as all in.
+    generation: u64,
     /// Requests dispatched whose response is not done.
     in_flight: u32,
     /// The latest of them (node's `parser.incoming` / `socket._httpMessage`).
     current_request: Option<u64>,
+    /// Its generation, and whether it is all in.
+    current_generation: u64,
+    current_complete: bool,
     /// A response head went out for it (node: `_headerSent`), so a timeout
     /// closes the connection without a 408.
     response_started: bool,
@@ -220,8 +242,11 @@ impl ConnWatch {
                 begun: false,
                 message_start: now,
                 headers_complete: false,
+                generation: 0,
                 in_flight: 0,
                 current_request: None,
+                current_generation: 0,
+                current_complete: false,
                 response_started: false,
                 keep_alive_set: false,
             }),
@@ -262,6 +287,7 @@ impl ConnWatch {
         if !phase.begun {
             phase.begun = true;
             phase.active = true;
+            phase.generation += 1;
             phase.message_start = Instant::now();
             phase.headers_complete = false;
         }
@@ -275,32 +301,47 @@ impl ConnWatch {
     }
 
     /// A request's headers are in and it is being dispatched as
-    /// `request_id`.
-    pub fn headers_complete(&self, request_id: u64) {
+    /// `request_id`. Returns its generation, for [`ConnWatch::message_complete`].
+    ///
+    /// A head whose first byte was not seen as the start of a request -- it
+    /// came in the same read as the previous body's end, or was read while
+    /// that body was still being taken -- starts its request now.
+    pub fn headers_complete(&self, request_id: u64) -> u64 {
         let mut phase = self.phase();
-        if !phase.begun {
+        if !phase.begun || phase.headers_complete {
             phase.begun = true;
             phase.active = true;
+            phase.generation += 1;
             phase.message_start = Instant::now();
         }
         phase.headers_complete = true;
         phase.in_flight += 1;
         phase.current_request = Some(request_id);
+        phase.current_generation = phase.generation;
+        phase.current_complete = false;
         phase.response_started = false;
+        let generation = phase.generation;
         // node's resetSocketTimeout: `socket.setTimeout(server.timeout || 0)`.
         if phase.keep_alive_set {
             phase.keep_alive_set = false;
             drop(phase);
             self.set_socket_timeout(self.timeouts.socket_ms());
         }
+        generation
     }
 
-    /// The request being received is all in (or its body is no longer
-    /// read): the headers / request check is done with it.
-    pub fn message_complete(&self) {
+    /// Request `generation` is all in (or its body is no longer read): the
+    /// headers / request check is done with it, unless a later request is
+    /// already being received.
+    pub fn message_complete(&self, generation: u64) {
         let mut phase = self.phase();
-        phase.active = false;
-        phase.begun = false;
+        if phase.current_generation == generation {
+            phase.current_complete = true;
+        }
+        if phase.generation == generation {
+            phase.active = false;
+            phase.begun = false;
+        }
     }
 
     /// The response head for the current request went out.
@@ -340,27 +381,36 @@ impl ConnWatch {
         self.phase().current_request
     }
 
+    /// JS handles this connection's timeouts and closed exchanges.
+    pub fn js_driven(&self) -> bool {
+        self.timeouts.js_driven()
+    }
+
     /// Whether a 408 may still be written: no response head went out.
     pub fn may_answer(&self) -> bool {
         !self.phase().response_started
     }
 
-    /// Close the connection (the first reason given wins).
+    /// Close the connection. A stronger reason than one already given
+    /// takes over (a destroy after an end, a request timeout after either).
     pub fn close(&self, reason: CloseReason) {
         {
             let mut close = self.close.lock().unwrap_or_else(|e| e.into_inner());
-            if close.is_none() {
+            if close.is_none_or(|current| reason > current) {
                 *close = Some(reason);
             }
         }
         self.close_notify.notify_one();
     }
 
-    /// Resolves once [`ConnWatch::close`] was called.
-    pub async fn closed(&self) -> CloseReason {
+    /// Resolves once [`ConnWatch::close`] was called with `at_least` or a
+    /// stronger reason, with the reason.
+    pub async fn closed(&self, at_least: CloseReason) -> CloseReason {
         loop {
             let notified = self.close_notify.notified();
-            if let Some(reason) = *self.close.lock().unwrap_or_else(|e| e.into_inner()) {
+            if let Some(reason) = *self.close.lock().unwrap_or_else(|e| e.into_inner())
+                && reason >= at_least
+            {
                 return reason;
             }
             notified.await;
@@ -368,8 +418,15 @@ impl ConnWatch {
     }
 
     /// node's headers / request check for this connection at `now`: true when
-    /// it is due, and then it is not checked again for this request.
+    /// it is due, and then it is not checked again for this request. Like
+    /// node's `ConnectionsList::Expired`, a headers timeout longer than the
+    /// request timeout swaps with it.
     pub fn expire(&self, headers_ms: u64, request_ms: u64, now: Instant) -> bool {
+        let (headers_ms, request_ms) = if request_ms > 0 && headers_ms > request_ms {
+            (request_ms, headers_ms)
+        } else {
+            (headers_ms, request_ms)
+        };
         let mut phase = self.phase();
         if !phase.active {
             return false;
@@ -390,7 +447,7 @@ impl ConnWatch {
     /// Resolves when the socket timeout expires, with the request in flight
     /// then (if any). It does not fire again until there is activity or a
     /// new timeout is set. Cancel-safe: nothing changes until it resolves.
-    pub async fn next_timeout(&self) -> Option<u64> {
+    pub async fn next_timeout(&self) -> Fired {
         loop {
             let changed = self.timer_changed.notified();
             let timeout = self.socket_timeout_ms.load(Ordering::Relaxed);
@@ -405,7 +462,11 @@ impl ConnWatch {
             let now = self.now_ms();
             if now >= deadline {
                 self.fired.store(true, Ordering::Release);
-                return self.current_request();
+                let phase = self.phase();
+                return Fired {
+                    request_id: phase.current_request,
+                    request_complete: phase.current_complete,
+                };
             }
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(deadline - now)) => {}
@@ -534,15 +595,15 @@ mod tests {
         let w = watch(TimeoutSettings::default());
         w.note_read(10);
         let start = w.phase().message_start;
-        w.headers_complete(7);
+        let _ = w.headers_complete(7);
         assert_eq!(w.phase().message_start, start, "the headers keep the clock");
         assert!(!w.expire(1000, 2000, start + Duration::from_millis(1500)));
         assert!(w.expire(1000, 2000, start + Duration::from_millis(2000)));
 
         let w = watch(TimeoutSettings::default());
         let start = w.phase().message_start;
-        w.headers_complete(7);
-        w.message_complete();
+        let generation = w.headers_complete(7);
+        w.message_complete(generation);
         assert!(!w.expire(1000, 2000, start + Duration::from_secs(60)));
         // The next request's first byte starts a new clock.
         w.note_read(1);
@@ -554,6 +615,35 @@ mod tests {
         let w = watch(TimeoutSettings::default());
         let start = w.phase().message_start;
         assert!(!w.expire(0, 0, start + Duration::from_secs(3600)));
+        // A headers timeout over the request timeout swaps with it.
+        let w = watch(TimeoutSettings::default());
+        let start = w.phase().message_start;
+        assert!(w.expire(2000, 1000, start + Duration::from_millis(1000)));
+    }
+
+    /// The end of a body read late belongs to its own request: a request
+    /// whose head came before it stays under the check.
+    #[test]
+    fn a_late_body_end_does_not_complete_the_next_request() {
+        let w = watch(TimeoutSettings::default());
+        w.note_read(100);
+        let first = w.headers_complete(1);
+        // The next head was parsed before the first body's pump finished.
+        let second = w.headers_complete(2);
+        assert_ne!(first, second);
+        let second_start = w.phase().message_start;
+        w.message_complete(first);
+        assert!(
+            w.phase().active,
+            "the second request is still being received"
+        );
+        assert!(w.expire(0, 1000, second_start + Duration::from_millis(1000)));
+        // Its own end completes it.
+        let w = watch(TimeoutSettings::default());
+        let first = w.headers_complete(1);
+        w.message_complete(first);
+        assert!(!w.phase().active);
+        assert!(w.phase().current_complete);
     }
 
     /// The socket timeout becomes keepAliveTimeout + buffer once no response
@@ -567,8 +657,8 @@ mod tests {
         });
         let w = ConnWatch::new(1, 1, timeouts.clone());
         assert_eq!(w.socket_timeout_ms.load(Ordering::Relaxed), 700);
-        w.headers_complete(1);
-        w.headers_complete(2);
+        let _ = w.headers_complete(1);
+        let _ = w.headers_complete(2);
         assert_eq!(w.current_request(), Some(2));
         w.response_finished();
         assert_eq!(
@@ -580,7 +670,7 @@ mod tests {
         assert_eq!(w.current_request(), None);
         assert_eq!(w.socket_timeout_ms.load(Ordering::Relaxed), 1500);
         timeouts.update(60_000, 300_000, 1500, 900);
-        w.headers_complete(3);
+        let _ = w.headers_complete(3);
         assert_eq!(w.socket_timeout_ms.load(Ordering::Relaxed), 900);
         // keepAliveTimeout 0 leaves the socket timeout alone.
         timeouts.update(60_000, 300_000, 0, 900);
@@ -595,7 +685,7 @@ mod tests {
     fn a_408_is_owed_until_a_response_starts() {
         let w = watch(TimeoutSettings::default());
         assert!(w.may_answer());
-        w.headers_complete(1);
+        let _ = w.headers_complete(1);
         w.response_started();
         assert!(!w.may_answer());
         w.response_finished();
@@ -609,16 +699,18 @@ mod tests {
             ..TimeoutSettings::default()
         });
         let started = Instant::now();
-        assert_eq!(w.next_timeout().await, None);
+        assert_eq!(w.next_timeout().await.request_id, None);
         assert!(started.elapsed() >= Duration::from_millis(150));
         // Fired: no second event without activity.
         let again = tokio::time::timeout(Duration::from_millis(400), w.next_timeout()).await;
         assert!(again.is_err());
         // Activity re-arms it.
         w.note_write(10);
-        w.headers_complete(4);
+        let _ = w.headers_complete(4);
         let rearmed = Instant::now();
-        assert_eq!(w.next_timeout().await, Some(4));
+        let fired = w.next_timeout().await;
+        assert_eq!(fired.request_id, Some(4));
+        assert!(!fired.request_complete);
         assert!(rearmed.elapsed() >= Duration::from_millis(100));
         // 0 turns it off.
         w.set_socket_timeout(0);
@@ -627,10 +719,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_resolves_with_the_first_reason() {
+    async fn close_resolves_with_the_strongest_reason() {
         let w = watch(TimeoutSettings::default());
+        w.close(CloseReason::End);
+        assert_eq!(w.closed(CloseReason::End).await, CloseReason::End);
+        let later =
+            tokio::time::timeout(Duration::from_millis(100), w.closed(CloseReason::Destroy)).await;
+        assert!(later.is_err(), "an end is not a destroy");
         w.close(CloseReason::RequestTimeout);
         w.close(CloseReason::Destroy);
-        assert_eq!(w.closed().await, CloseReason::RequestTimeout);
+        assert_eq!(
+            w.closed(CloseReason::Destroy).await,
+            CloseReason::RequestTimeout
+        );
     }
 }

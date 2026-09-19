@@ -29,7 +29,7 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::{Semaphore, mpsc, oneshot};
 
-use crate::http_conn::{CloseReason, ConnWatch, ServerTimeouts, TimeoutSettings, WatchedIo};
+use crate::http_conn::{CloseReason, ConnWatch, Fired, ServerTimeouts, TimeoutSettings, WatchedIo};
 use crate::http_head::{HeadError, HeadPolicy};
 
 /// Per-request body cap (wave-1 buffered bodies).
@@ -104,12 +104,12 @@ pub enum ServerEvent {
     /// emits 'timeout' and destroys the connection when nobody listens.
     Timeout {
         conn_id: u64,
-        /// The request whose response was in flight, if any.
-        request_id: Option<u64>,
+        fired: Fired,
         conn: ConnAddrs,
     },
-    /// A connection was closed (a request timeout, a destroyed socket) while
-    /// `request_id` had no response yet: JS closes the response (node's
+    /// An exchange ended without its response (the connection was closed
+    /// under it: a request timeout, a destroyed socket, a lost client): JS
+    /// aborts the request and closes the response (node's abortIncoming;
     /// 'close' without 'finish').
     Closed {
         request_id: u64,
@@ -392,10 +392,15 @@ impl HttpState {
         }
     }
 
-    /// `socket.destroy()` on a server connection.
-    pub fn destroy_conn(&self, conn_id: u64) {
+    /// `socket.destroy()` on a server connection, or `socket.end()`
+    /// (`graceful`: what is being written is finished first).
+    pub fn destroy_conn(&self, conn_id: u64, graceful: bool) {
         if let Some(watch) = self.conn(conn_id) {
-            watch.close(CloseReason::Destroy);
+            watch.close(if graceful {
+                CloseReason::End
+            } else {
+                CloseReason::Destroy
+            });
         }
     }
 
@@ -686,15 +691,17 @@ impl Drop for ConnRegistration {
     }
 }
 
-/// Marks the request being received as all in when dropped: its body was
-/// read to the end, failed, or will not be read (node's message complete,
-/// after which headersTimeout / requestTimeout no longer apply to it).
-struct MessageDone(Option<Arc<ConnWatch>>);
+/// Marks a request as all in when dropped: its body was read to the end,
+/// failed, or will not be read (node's message complete, after which
+/// headersTimeout / requestTimeout no longer apply to it). It carries the
+/// request's generation, so a body finished late cannot complete the
+/// request after it.
+struct MessageDone(Option<(Arc<ConnWatch>, u64)>);
 
 impl Drop for MessageDone {
     fn drop(&mut self) {
-        if let Some(watch) = &self.0 {
-            watch.message_complete();
+        if let Some((watch, generation)) = &self.0 {
+            watch.message_complete(*generation);
         }
     }
 }
@@ -763,14 +770,14 @@ fn socket_timed_out(
     queue: &mpsc::Sender<ServerEvent>,
     watch: &ConnWatch,
     js_driven: bool,
-    request_id: Option<u64>,
+    fired: Fired,
     conn: ConnAddrs,
 ) {
     let told = js_driven
         && queue
             .try_send(ServerEvent::Timeout {
                 conn_id: watch.id,
-                request_id,
+                fired,
                 conn,
             })
             .is_ok();
@@ -804,7 +811,8 @@ async fn check_connections(
 
 /// Serve one HTTP/1 connection with hyper, held to node's timeouts: runs
 /// until the connection ends, closing it early when `watch` is closed
-/// (a request timeout answers 408 first), gracefully on server shutdown.
+/// (a request timeout answers 408 first), gracefully on server shutdown or
+/// `socket.end()`.
 #[allow(clippy::too_many_arguments)]
 async fn serve_http1<S, Svc>(
     stream: S,
@@ -834,29 +842,42 @@ async fn serve_http1<S, Svc>(
     // queue_tx clone still drops promptly and the accept op isn't pinned.
     let mut shutting_down = false;
     let closed = loop {
+        // Biased toward hyper: a response JS has already handed over (a
+        // `res.end()` just before `socket.destroy()`) is written before a
+        // close is acted on, as node writes it before closing.
         tokio::select! {
+            biased;
             _ = &mut conn => break None,
             _ = shutdown.changed(), if !shutting_down => {
                 shutting_down = true;
                 std::pin::Pin::new(&mut conn).graceful_shutdown();
             }
-            reason = watch.closed() => break Some(reason),
-            request_id = watch.next_timeout() => {
-                socket_timed_out(&queue, &watch, js_driven, request_id, addrs);
+            reason = watch.closed(if shutting_down {
+                CloseReason::Destroy
+            } else {
+                CloseReason::End
+            }) => {
+                if reason == CloseReason::End {
+                    // socket.end(): finish what is being written, then close.
+                    shutting_down = true;
+                    std::pin::Pin::new(&mut conn).graceful_shutdown();
+                } else {
+                    break Some(reason);
+                }
+            }
+            fired = watch.next_timeout() => {
+                socket_timed_out(&queue, &watch, js_driven, fired, addrs);
             }
         }
     };
     if let Some(reason) = closed {
-        // hyper's side ends here (an in-flight handler future is dropped);
-        // the stream comes back for node's farewell.
-        // Read before hyper's side goes: dropping it ends the response.
-        let unanswered = watch.current_request();
+        // hyper's side ends here: an in-flight handler future is dropped
+        // (its RequestGuard tells JS the exchange ended), and the stream
+        // comes back for node's farewell. Read before hyper's side goes:
+        // dropping it ends the response.
         let may_answer = watch.may_answer();
         let stream = conn.into_parts().io.into_inner().into_inner();
         crate::http_conn::finish_close(stream, reason, may_answer).await;
-        if js_driven && let Some(request_id) = unanswered {
-            let _ = queue.try_send(ServerEvent::Closed { request_id });
-        }
     }
 }
 
@@ -953,18 +974,20 @@ pub async fn http_serve(
                             tokio::select! {
                                 peeked = stream.peek(&mut peek_buf) => break peeked,
                                 _ = conn_shutdown.changed() => return,
-                                reason = watch.closed() => {
+                                // Before a request there is nothing to
+                                // finish: an end closes too.
+                                reason = watch.closed(CloseReason::End) => {
                                     let may_answer = watch.may_answer();
                                     crate::http_conn::finish_close(&mut stream, reason, may_answer)
                                         .await;
                                     return;
                                 }
-                                request_id = watch.next_timeout() => {
+                                fired = watch.next_timeout() => {
                                     socket_timed_out(
                                         &conn_queue,
                                         &watch,
                                         js_driven,
-                                        request_id,
+                                        fired,
                                         conn_addrs,
                                     );
                                 }
@@ -1073,15 +1096,33 @@ struct RequestGuard {
     /// then no JS reap path can exist, so Drop must remove the body entry
     /// itself (queue send failed, or the future was cancelled mid-send).
     dispatched: bool,
+    /// Where to report an exchange that ends before JS answered it (the
+    /// connection was closed under it), for a server whose JS keeps the
+    /// request / response pair.
+    closed_to: Option<mpsc::Sender<ServerEvent>>,
 }
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
-        self.state
+        let unanswered = self
+            .state
             .pending
             .lock()
             .expect("http pending lock")
-            .remove(&self.id);
+            .remove(&self.id)
+            .is_some();
+        // After the request event in the queue; a send that waits for room
+        // rather than one that can be dropped.
+        if unanswered
+            && self.dispatched
+            && let Some(queue) = self.closed_to.take()
+            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        {
+            let request_id = self.id;
+            runtime.spawn(async move {
+                let _ = queue.send(ServerEvent::Closed { request_id }).await;
+            });
+        }
         let mut bodies = self.state.bodies.lock().expect("http bodies lock");
         match bodies.get(&self.id) {
             // Streamed bodies on a DISPATCHED request outlive this guard:
@@ -1327,11 +1368,13 @@ async fn handle_request(
     watch: Option<Arc<ConnWatch>>,
 ) -> Result<hyper::Response<BoxedBody>, RequestAborted> {
     let id = state.next_id();
-    if let Some(watch) = &watch {
-        watch.headers_complete(id);
-    }
-    let message_done = MessageDone(watch.clone());
+    let message_done = MessageDone(
+        watch
+            .as_ref()
+            .map(|w| (Arc::clone(w), w.headers_complete(id))),
+    );
     let conn_id = watch.as_ref().map(|w| w.id);
+    let notify_closed = watch.as_ref().is_some_and(|w| w.js_driven());
     let response = dispatch_request(
         state,
         queue,
@@ -1342,6 +1385,7 @@ async fn handle_request(
         id,
         message_done,
         conn_id,
+        notify_closed,
     )
     .await?;
     Ok(watched_response(response, watch.as_ref()))
@@ -1358,6 +1402,9 @@ async fn dispatch_request(
     id: u64,
     message_done: MessageDone,
     conn_id: Option<u64>,
+    // Tell JS when the exchange ends without its response (a node:http
+    // server keeps the pair until then).
+    notify_closed: bool,
 ) -> Result<hyper::Response<BoxedBody>, RequestAborted> {
     // node's rules for the head, on the bytes hyper parsed (HTTP/1 only;
     // an HTTP/2 request has no such head). A refused request never reaches
@@ -1474,6 +1521,7 @@ async fn dispatch_request(
         id,
         reserved: body_len,
         dispatched: false,
+        closed_to: notify_closed.then(|| queue.clone()),
     };
 
     let sent = queue
@@ -1722,15 +1770,16 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
         }
         Some(ServerEvent::Timeout {
             conn_id,
-            request_id,
+            fired,
             conn,
         }) => {
             let mut meta = serde_json::json!({
                 "event": "timeout",
                 "connectionId": conn_id,
             });
-            if let Some(request_id) = request_id {
+            if let Some(request_id) = fired.request_id {
                 meta["requestId"] = serde_json::json!(request_id);
+                meta["requestComplete"] = serde_json::json!(fired.request_complete);
             }
             conn.write_meta(&mut meta);
             super::OpOutcome::Json(meta.to_string())

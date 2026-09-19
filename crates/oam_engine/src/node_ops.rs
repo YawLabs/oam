@@ -2556,15 +2556,17 @@ fn op_http_conn_set_timeout(
     core_runtime!(scope).http().set_conn_timeout(conn_id, ms);
 }
 
-/// `httpConnDestroy(connectionId)`: `socket.destroy()` on a server
-/// connection.
+/// `httpConnDestroy(connectionId, graceful)`: `socket.destroy()` on a
+/// server connection, or `socket.end()` when `graceful` (what is being
+/// written is finished first).
 fn op_http_conn_destroy(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let conn_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    core_runtime!(scope).http().destroy_conn(conn_id);
+    let graceful = args.get(1).is_true();
+    core_runtime!(scope).http().destroy_conn(conn_id, graceful);
 }
 
 fn op_http_max_header_size(
@@ -2603,7 +2605,7 @@ fn op_http_serve(
     let tcp_ids = rt.body_ids();
     // args 3, 4: maxHeaderSize, insecureHTTPParser.
     let policy = head_policy_args(scope, &args, 3);
-    // args 5..=10: node's server timeouts.
+    // args 5..=11: node's server timeouts.
     let timeouts = timeout_args(scope, &args, 5);
     crate::ops::spawn_op(
         scope,
@@ -2942,7 +2944,8 @@ fn op_https_serve(
     let state = core_runtime!(scope).http();
     // args 6, 7: maxHeaderSize, insecureHTTPParser.
     let policy = head_policy_args(scope, &args, 6);
-    // args 8..=14: node's server timeouts and the TLS handshakeTimeout.
+    // args 8..=14: node's server timeouts (8..=13) and the TLS
+    // handshakeTimeout (14).
     let timeouts = timeout_args(scope, &args, 8);
     crate::ops::spawn_op(
         scope,

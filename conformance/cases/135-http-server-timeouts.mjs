@@ -324,3 +324,56 @@ const FAST = { headersTimeout: 500, requestTimeout: 1000, connectionsCheckingInt
   log("https, silent after the handshake", idle.statuses, `closed ${idle.closed}`, within(idle.elapsed, 500, 2500));
   server.close();
 }
+{
+  // A request pipelined behind one whose body the handler never read is
+  // held to its own timeouts: its body never comes, so it is answered 408.
+  const server = await serve(FAST, (req, res) => {
+    if (req.url === "/a") res.end("nope");
+  });
+  const r = await connect(server.address().port, {
+    writes: [
+      [0, "POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nab"],
+      [200, "cdePOST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 10\r\n\r\n"],
+    ],
+  });
+  log("pipelined request after an unread body", r.statuses, `closed ${r.closed}`, within(r.elapsed, 1000, 3500));
+  server.close();
+}
+{
+  // Uploads the client abandons mid-body: each response closes.
+  let closes = 0;
+  const server = await serve({}, (req, res) => {
+    res.on("close", () => closes++);
+    req.resume();
+    req.on("end", () => res.end("ok"));
+  });
+  for (let i = 0; i < 3; i++) {
+    await new Promise((resolve) => {
+      const socket = net.connect(server.address().port, "127.0.0.1", () => {
+        socket.write("POST /u HTTP/1.1\r\nHost: x\r\nContent-Length: 100000\r\n\r\n" + "x".repeat(1000));
+        setTimeout(() => {
+          socket.destroy();
+          resolve();
+        }, 100);
+      });
+      socket.on("error", () => {});
+    });
+  }
+  await sleep(300);
+  log("uploads abandoned mid-body", `response closes ${closes}`);
+  server.close();
+}
+for (const how of ["end", "destroy"]) {
+  // The response handed over before the socket goes is still delivered.
+  const server = await serve({}, (req, res) => {
+    res.end(`body-${how}`);
+    req.socket[how]();
+  });
+  let delivered = 0;
+  for (let i = 0; i < 10; i++) {
+    const r = await connect(server.address().port, { writes: [[0, GET]], hold: 2000 });
+    if (r.raw.includes(`body-${how}`) && r.closed) delivered++;
+  }
+  log(`res.end() then socket.${how}()`, `delivered and closed ${delivered}/10`);
+  server.close();
+}

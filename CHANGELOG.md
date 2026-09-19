@@ -125,7 +125,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   closed, an idle connection is closed, and the socket timeout emits `'timeout'` on the
   request, response and server, destroying the connection when nobody listens.
   `connectionsCheckingInterval`, `keepAliveTimeoutBuffer`, `handshakeTimeout`,
-  `req.setTimeout` and `res.setTimeout` are supported too.
+  `req.setTimeout` and `res.setTimeout` are supported too, and a response whose
+  connection is lost before it is sent now emits `'close'`, as in Node.
 - **One idle connection stopped an `http` server from accepting.** The server waited
   for a new connection's first bytes before accepting the next one, so a connection
   that sent nothing, such as a browser preconnect, kept every later client waiting. Each

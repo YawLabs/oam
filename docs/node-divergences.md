@@ -1508,7 +1508,7 @@ https's `handshakeTimeout`. What differs:
   that times out raises no `'tlsClientError'`.
 - The socket a `'timeout'` event carries is oam's per-request socket object (entry 39),
   not a `net.Socket`: it has the addresses, `setTimeout`, `destroy` and `end` (which
-  closes at once).
+  closes the connection once what is being written is out; there is no half-close).
 - Responses carry no `Connection: keep-alive` / `Keep-Alive: timeout=N` headers, so a
   client cannot learn the keep-alive timeout from them.
 - When a request timeout closes a connection while the handler is reading the body, the
