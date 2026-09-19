@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "3a3318b",
+  "commit": "1b84b0a",
   "oamVersion": "oam 0.16.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 120,
-      "total": 120,
+      "pass": 130,
+      "total": 130,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -151,11 +151,51 @@
           "status": "pass"
         },
         {
+          "case": "134-http-server-chunked-body.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "135-http-server-timeouts.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "136-http-server-max-connections.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "137-http-chunk-extensions.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "138-http-server-request-trailers.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "139-http-server-upgrade-and-connect.mjs",
+          "status": "pass"
+        },
+        {
           "case": "14-querystring.mjs",
           "status": "pass"
         },
         {
           "case": "15-timers-promises-console.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "150-tls-server-alpn-and-client-certificates.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "151-http2-secure-server.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "152-http2-secure-server-http1-and-client-certificates.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "153-tls-server-key-passphrase-and-pfx.mjs",
           "status": "pass"
         },
         {
@@ -598,7 +638,7 @@
         "platform": "win32",
         "noBaseline": false,
         "nodeTotal": 1874,
-        "knownMissing": 349,
+        "knownMissing": 347,
         "newMissing": [],
         "staleRatchet": [],
         "absentModules": [],
