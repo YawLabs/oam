@@ -1472,8 +1472,7 @@ different answer:
   a chunk size stay refused.
 - **oam accepts, Node refuses:** lowercase or unknown methods (`get`, `FOO`) and an
   HTTP/1.1 request without `Host` (Node's `requireHostHeader`, which oam does not
-  implement); whitespace or other bytes inside a chunk extension (`3;e =1`), which hyper
-  skips unread.
+  implement).
 - A malformed chunked body is answered with Node's status (`400`, or `413` for chunk
   extensions over the limit) when the handler has not responded yet, and the handler's
   request aborts with `ECONNRESET`, as in Node.
@@ -1490,7 +1489,7 @@ different answer:
   effect there and not here.
 
 _(probed)_ Node v22.22.2 (default and `--insecure-http-parser`) and oam, the same 90 raw
-request heads over TCP, and 16 chunked bodies.
+request heads over TCP, 16 chunked bodies and 40 chunk extensions.
 
 ### 41. The HTTP server's timeouts and connection count: what still differs
 

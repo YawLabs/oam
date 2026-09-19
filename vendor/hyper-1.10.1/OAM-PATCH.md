@@ -1,9 +1,8 @@
 # hyper 1.10.1, patched for oam
 
-This directory is hyper **1.10.1** as published on crates.io, plus four
-changes: a fix for a client hang (items 1-3 below), one server extension
-(item 4), and two stricter rules in the chunked-body decoder (items 5 and
-6). The root `Cargo.toml` swaps it in with `[patch.crates-io]`.
+This directory is hyper **1.10.1** as published on crates.io, plus a fix
+for a client hang (items 1-3 below), one server extension (item 4), and
+three stricter rules in the chunked-body decoder (items 5, 6 and 7). The root `Cargo.toml` swaps it in with `[patch.crates-io]`.
 
 - **Upstream:** `hyper-1.10.1.crate`, sha256
   `55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498`
@@ -19,7 +18,7 @@ changes: a fix for a client hang (items 1-3 below), one server extension
   directory: it is outside the workspace (no fmt, clippy or tests) and outside
   the unsafe-budget scan. After an edit here, `scripts/check-vendor.sh
   --regen` rewrites the diff; review it and commit it with the edit.
-- **Remove it when** a hyper release ships the fix and items 5 and 6, **and**
+- **Remove it when** a hyper release ships the fix and items 5 to 7, **and**
   oam no longer needs item 4 (see "The request-head extension" below for what
   replacing it takes). To do that:
   1. Delete this directory.
@@ -73,6 +72,12 @@ whole of it.
    white space; the `SizeLws` state and `read_size_lws` are gone, and the
    crate's own `test_read_chunk_size` cases for it now expect the error. See
    "Chunk size whitespace" below.
+7. **`src/proto/h1/decode.rs`, `read_extension`.** A chunk extension is read
+   to llhttp's grammar ("Invalid chunk extension" otherwise) instead of
+   skipped up to the CR: five `ChunkedState` variants after `Extension`, one
+   `read_extension` for all six, and an `is_token` helper. The crate's
+   `test_read_chunk_size` extension cases that break the grammar now expect
+   the error, and gain cases for it. See "Chunk extensions" below.
 
 ## Why
 
@@ -181,6 +186,33 @@ modes (hyper has no per-connection switch for it).
 Tested by `crates/oam_cli/tests/http_server_wire.rs`
 `a_malformed_chunk_size_line_is_answered_like_node` and conformance case 134
 (both fail on stock 1.10.1). hyper 1.11.1's `read_size` is unchanged here.
+
+## Chunk extensions (item 7)
+
+hyper read nothing of a chunk extension: every byte between the `;` and the
+CR was skipped (counted against its 16 KiB extension limit, a plain LF
+refused). llhttp, node's parser for requests and responses alike, reads the
+extension to a grammar and refuses a body whose extension breaks it:
+
+- after each `;`, a name of token characters (it may be empty, but may not
+  start with SP or CR), then `;`, `=` or the CR;
+- after `=`, a value of token characters and quoted strings, which may be
+  empty; after a closing quote only `;` or the CR;
+- in a quoted string, HTAB, SP and 0x21-0xFF except `"` and `\`, and quoted
+  pairs of `\` and HTAB, SP, VCHAR or obs-text.
+
+Whitespace anywhere else, separators such as `,` `/` `=` `@` in a name or
+value, control characters and DEL are errors; `insecureHTTPParser` does not
+relax any of it. Two parsers that disagree about a chunk line can disagree
+about where the body ends, which is the request-smuggling pattern items 5
+and 6 close. With the patch, oam's server answers such a body 400 and closes
+the connection, as node does, and `fetch` / `http.request` fail a response
+with one, as node's do. The extension limit is unchanged and still counts
+every extension byte.
+
+Tested by conformance case 137 (35 request lines and 6 response lines,
+identical to node; fails on stock 1.10.1) and the crate's
+`test_read_chunk_size`. hyper 1.11.1's `read_extension` is unchanged here.
 
 ## Reproduction
 

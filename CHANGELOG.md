@@ -99,11 +99,14 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   was read and discarded while the connection stayed open. Such a body is now answered
   `400` and the connection is closed, as in Node. The same applies to chunked responses
   read by `fetch` and `http.request`, which now fail.
-- **Whitespace after a chunk size was accepted.** A chunked request body whose size line
-  had spaces or tabs after the size was read as if they were not there, where Node, and
-  other parsers, refuse the line; a proxy in front of the server can frame such a body
-  differently. It is now answered `400` and the connection is closed, as in Node (also
-  under `insecureHTTPParser`, which Node relaxes here). Any other chunked body the
+- **Whitespace after a chunk size, and malformed chunk extensions, were accepted.** A
+  chunked request body whose size line had spaces or tabs after the size was read as if
+  they were not there, and a chunk extension was skipped unread whatever it held, where
+  Node, and other parsers, refuse such lines; a proxy in front of the server can frame
+  such a body differently. They are now answered `400` and the connection is closed, as
+  in Node (whitespace after the size also under `insecureHTTPParser`, which Node relaxes
+  there). Chunk extensions are read to Node's grammar in responses too, where `fetch`
+  and `http.request` now fail as Node's do. Any other chunked body the
   parser refuses is now answered with Node's status too -- `400`, or `413` for chunk
   extensions over the limit -- where the connection used to close without one, and the
   handler sees its request abort with `ECONNRESET`. `https` and `http2.createServer`

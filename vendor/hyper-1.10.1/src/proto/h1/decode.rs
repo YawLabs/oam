@@ -70,7 +70,15 @@ enum Kind {
 enum ChunkedState {
     Start,
     Size,
+    // oam patch: a chunk extension is read to its grammar (llhttp's, as
+    // node applies it) instead of skipped to the CR. `Extension` is just
+    // after a `;`.
     Extension,
+    ExtensionName,
+    ExtensionValue,
+    ExtensionQuoted,
+    ExtensionQuotedPair,
+    ExtensionQuotedEnd,
     SizeLf,
     Body,
     BodyCr,
@@ -255,6 +263,11 @@ impl fmt::Debug for Decoder {
     }
 }
 
+// oam patch: an RFC 9110 token byte (tchar), for chunk extensions.
+fn is_token(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
 macro_rules! byte (
     ($rdr:ident, $cx:expr) => ({
         let buf = ready!($rdr.read_mem($cx, 1))?;
@@ -324,7 +337,12 @@ impl ChunkedState {
         match *self {
             Start => ChunkedState::read_start(cx, body, chunk_size),
             Size => ChunkedState::read_size(cx, body, chunk_size),
-            Extension => ChunkedState::read_extension(cx, body, extensions_cnt),
+            Extension
+            | ExtensionName
+            | ExtensionValue
+            | ExtensionQuoted
+            | ExtensionQuotedPair
+            | ExtensionQuotedEnd => ChunkedState::read_extension(*self, cx, body, extensions_cnt),
             SizeLf => ChunkedState::read_size_lf(cx, body, *chunk_size),
             Body => ChunkedState::read_body(cx, body, chunk_size, chunk_buf),
             BodyCr => ChunkedState::read_body_cr(cx, body),
@@ -411,25 +429,61 @@ impl ChunkedState {
         }
         Poll::Ready(Ok(ChunkedState::Size))
     }
+    // oam patch: the extension's own grammar. hyper skipped every byte up to
+    // the CR, so an extension node refuses -- whitespace in it, a byte that
+    // is neither a token nor quoted -- was read past; a front end that
+    // refuses or reads it differently disagrees with this parser about the
+    // body. llhttp's grammar, which node applies to requests and responses
+    // alike:
+    //
+    //   `;` name [ `=` value ] ( `;` ... )* CR
+    //   name:  token bytes, possibly none; not starting with SP or CR
+    //   value: token bytes and quoted strings, possibly none; nothing may
+    //          follow a quoted string but `;` or CR
+    //   quoted string: HTAB, SP, 0x21-0xFF except `"` and `\`, and quoted
+    //          pairs `\` + (HTAB, SP, VCHAR or obs-text)
     fn read_extension<R: MemRead>(
+        state: ChunkedState,
         cx: &mut Context<'_>,
         rdr: &mut R,
         extensions_cnt: &mut u64,
     ) -> Poll<Result<ChunkedState, io::Error>> {
+        use self::ChunkedState::*;
         trace!("read_extension");
-        // We don't care about extensions really at all. Just ignore them.
-        // They "end" at the next CRLF.
-        //
-        // However, some implementations may not check for the CR, so to save
-        // them from themselves, we reject extensions containing plain LF as
-        // well.
-        match byte!(rdr, cx) {
-            b'\r' => Poll::Ready(Ok(ChunkedState::SizeLf)),
-            b'\n' => Poll::Ready(Err(io::Error::new(
+        let b = byte!(rdr, cx);
+        if b == b'\n' {
+            // Some implementations do not check for the CR: reject a plain
+            // LF anywhere in an extension.
+            return Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid chunk extension contains newline",
+            )));
+        }
+        let next = match (state, b) {
+            (Extension, b' ' | b'\r') => None,
+            (Extension | ExtensionName, b'=') => Some(ExtensionValue),
+            (Extension | ExtensionName, b';') => Some(Extension),
+            (ExtensionName, b'\r') => Some(SizeLf),
+            (Extension | ExtensionName, b) if is_token(b) => Some(ExtensionName),
+            (ExtensionValue, b'"') => Some(ExtensionQuoted),
+            (ExtensionValue, b) if is_token(b) => Some(ExtensionValue),
+            (ExtensionValue | ExtensionQuotedEnd, b';') => Some(Extension),
+            (ExtensionValue | ExtensionQuotedEnd, b'\r') => Some(SizeLf),
+            (ExtensionQuoted, b'"') => Some(ExtensionQuotedEnd),
+            (ExtensionQuoted, b'\\') => Some(ExtensionQuotedPair),
+            (ExtensionQuoted, b'\t' | b' ' | 0x21..=0xff) => Some(ExtensionQuoted),
+            (ExtensionQuotedPair, b'\t' | b' ' | 0x21..=0x7e | 0x80..=0xff) => {
+                Some(ExtensionQuoted)
+            }
+            _ => None,
+        };
+        match next {
+            None => Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid chunk extension",
             ))),
-            _ => {
+            Some(SizeLf) => Poll::Ready(Ok(SizeLf)),
+            Some(next) => {
                 *extensions_cnt += 1;
                 if *extensions_cnt >= CHUNKED_EXTENSIONS_LIMIT {
                     Poll::Ready(Err(io::Error::new(
@@ -437,9 +491,9 @@ impl ChunkedState {
                         "chunk extensions over limit",
                     )))
                 } else {
-                    Poll::Ready(Ok(ChunkedState::Extension))
+                    Poll::Ready(Ok(next))
                 }
-            } // no supported extensions
+            }
         }
     }
     fn read_size_lf<R: MemRead>(
@@ -843,19 +897,41 @@ mod tests {
         read_err("1X\r\n", InvalidInput).await;
         read_err("-\r\n", InvalidInput).await;
         read_err("-1\r\n", InvalidInput).await;
-        // Acceptable (if not fully valid) extensions do not influence the size
+        // Extensions do not influence the size
         assert_eq!(1, read("1;extension\r\n").await);
-        assert_eq!(10, read("a;ext name=value\r\n").await);
         assert_eq!(1, read("1;extension;extension2\r\n").await);
-        assert_eq!(1, read("1;;;  ;\r\n").await);
-        assert_eq!(2, read("2; extension...\r\n").await);
+        // oam patch: extensions are read to llhttp's grammar.
+        assert_eq!(10, read("a;name=value\r\n").await);
+        assert_eq!(10, read("a;n=v;m;o=\"q \\\" \\\\\";p=\r\n").await);
+        assert_eq!(1, read("1;=v\r\n").await);
+        assert_eq!(1, read("1;e=a\"b\"\r\n").await);
+        assert_eq!(1, read("1;e=\"\t\x7f\"\r\n").await);
+        read_err("a;ext name=value\r\n", InvalidInput).await;
+        read_err("1;;;  ;\r\n", InvalidInput).await;
+        read_err("2; extension...\r\n", InvalidInput).await;
+        read_err("3;   \r\n", InvalidInput).await;
+        read_err("3;\r\n", InvalidInput).await;
+        read_err("3;e =1\r\n", InvalidInput).await;
+        read_err("3;e= 1\r\n", InvalidInput).await;
+        read_err("3;e=1 \r\n", InvalidInput).await;
+        read_err("3;e=1;\r\n", InvalidInput).await;
+        read_err("3;e=a,b\r\n", InvalidInput).await;
+        read_err("3;e==1\r\n", InvalidInput).await;
+        read_err("3;\"e\"\r\n", InvalidInput).await;
+        read_err("3;e=\"q\"x\r\n", InvalidInput).await;
+        read_err("3;e=\"q\r\n", InvalidInput).await;
+        read_err("3;e=\"\x01\"\r\n", InvalidInput).await;
+        read_err("3;e=\"\\\x7f\"\r\n", InvalidInput).await;
+        read_err("3;e=\x7f\r\n", InvalidInput).await;
+        read_err("3;e\t=1\r\n", InvalidInput).await;
         read_err("3   ; extension=123\r\n", InvalidInput).await;
         read_err("3   ;\r\n", InvalidInput).await;
-        assert_eq!(3, read("3;   \r\n").await);
         // Invalid extensions cause an error
         read_err("1 invalid extension\r\n", InvalidInput).await;
         read_err("1 A\r\n", InvalidInput).await;
-        read_err("1;no CRLF", UnexpectedEof).await;
+        // oam patch: EOF inside an extension (a space in one is refused).
+        read_err("1;noCRLF", UnexpectedEof).await;
+        read_err("1;no CRLF", InvalidInput).await;
         read_err("1;reject\nnewlines\r\n", InvalidData).await;
         // Overflow
         read_err("f0000000000000003\r\n", InvalidData).await;
