@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "296d2ff+wip",
+  "commit": "532ca0e",
   "oamVersion": "oam 0.16.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 122,
-      "total": 122,
+      "pass": 128,
+      "total": 128,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -155,6 +155,22 @@
           "status": "pass"
         },
         {
+          "case": "126-fetch-redirect-modes.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "127-net-connect-local-address.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "128-process-to-string-tag.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "129-https-request-certificate-refusals.mjs",
+          "status": "pass"
+        },
+        {
           "case": "13-zlib.mjs",
           "status": "pass"
         },
@@ -164,6 +180,14 @@
         },
         {
           "case": "15-timers-promises-console.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "150-http-request-timeouts.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "151-http-request-finish-order.mjs",
           "status": "pass"
         },
         {
