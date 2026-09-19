@@ -1255,6 +1255,15 @@ pub(crate) fn pump_event_loop(
     // handler that schedules nothing exits after a single emission.
     let mut before_exit_emitted = false;
     loop {
+        // One HandleScope per turn. Every Local a turn creates -- the
+        // resolver a completion settles and the value it settles with, a
+        // timer's callback and arguments, the hooks looked up by name --
+        // must die with the turn. Created in the caller's scope instead,
+        // they lived as long as the loop, so every settled op and every
+        // timer stayed reachable for the life of the process: the JS heap
+        // grew by about half a KiB per callback, on every server request.
+        v8::scope!(let turn, &mut **tc);
+        v8::tc_scope!(let tc, turn);
         if entry_promise.is_some_and(|promise| promise.state() == v8::PromiseState::Rejected) {
             break;
         }

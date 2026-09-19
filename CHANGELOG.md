@@ -157,6 +157,13 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **The JS heap grew with every callback the event loop ran.** Whatever a loop turn
+  touched -- the promise an async op settled and its result, a timer's or immediate's
+  callback and arguments -- stayed reachable for the life of the process, so every
+  `fs` callback, socket read, timer and immediate kept about half a KiB, even after
+  `gc()`, and a server's heap grew with every request (about 650 bytes a request on
+  0.16.2) where Node's stays flat. Each turn now releases what it touched, and the heap
+  stays flat.
 - **`req.trailers` and `req.rawTrailers` were `undefined` on server requests.** A chunked
   request body's trailer fields were dropped. They are now there once the body has
   ended (empty before, and for a body without trailers), combined as Node combines
