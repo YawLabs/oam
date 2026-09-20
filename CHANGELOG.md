@@ -456,6 +456,10 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   node's `Connection` header on the request. A pooled socket is unref'd, and a socket's
   idle timeout no longer keeps the process alive. A request destroyed while it waits
   for a socket hands that socket on and reports `socket hang up`, as in node.
+  `agent.destroy()` destroys every socket the agent is holding, and a socket goes back
+  into the pool on its response's end whenever the peer has read the whole request --
+  node's `req.writableFinished` rule -- so the next request reuses the connection even
+  when the write oam sent it has yet to be acknowledged.
 - **`req.end(callback)` called the callback with the response.** node calls it on
   `'finish'`, with no arguments; got treated the response as the request's error, so
   every got request failed once it went over a socket.
