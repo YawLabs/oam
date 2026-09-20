@@ -5248,6 +5248,72 @@ server.close();
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// undici's MockAgent / MockPool / MockClient INTERCEPT: a request that
+/// matches an interceptor is answered from memory and never dialled, and
+/// disableNetConnect() turns an unmatched one into an error instead of a real
+/// connection. oam's fetch owns its transport and cannot be intercepted from
+/// JS. Up to 0.16.2 the three were constructible stubs that intercepted
+/// nothing, so a suite that installed a MockAgent, called disableNetConnect()
+/// and expected canned answers made REAL requests to whatever host it named
+/// and read the real answers as its mocks. They now refuse at construction,
+/// the way a dispatcher oam cannot run does, and stay exported so the import
+/// resolves and the failure names itself.
+#[test]
+fn undici_mock_dispatchers_refuse_instead_of_reaching_the_network() {
+    let script = write_temp(
+        "undici_mock_refused/main.mjs",
+        r##"import http from 'node:http';
+import * as undici from 'undici';
+
+const hits = [];
+const server = http.createServer((req, res) => { hits.push(req.url); res.end('direct ' + req.url); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+
+function attempt(name, run) {
+  try {
+    run();
+    console.log(name, 'NO THROW');
+  } catch (e) {
+    console.log(name, e.name, e.code);
+  }
+}
+attempt('MockAgent', () => new undici.MockAgent());
+attempt('MockPool', () => new undici.MockPool(base, {}));
+attempt('MockClient', () => new undici.MockClient(base, {}));
+// The test-double shape a suite writes, in one go.
+attempt('mock-suite', () => {
+  const agent = new undici.MockAgent();
+  agent.disableNetConnect();
+  undici.setGlobalDispatcher(agent);
+  agent.get(base).intercept({ path: '/m' }).reply(200, 'mocked');
+});
+console.log('exported', typeof undici.MockAgent, typeof undici.MockPool, typeof undici.MockClient);
+try {
+  new undici.MockAgent();
+} catch (e) {
+  console.log('names itself', e.message.startsWith("undici's MockAgent is not supported on oam"));
+}
+// Nothing was sent while all that was refused, and the global dispatcher is
+// untouched, so an honest request still works.
+const res = await fetch(base + '/live');
+await res.text();
+console.log('still serves', res.status, JSON.stringify(hits));
+server.close();
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "MockAgent NotSupportedError UND_ERR_NOT_SUPPORTED\n\
+         MockPool NotSupportedError UND_ERR_NOT_SUPPORTED\n\
+         MockClient NotSupportedError UND_ERR_NOT_SUPPORTED\n\
+         mock-suite NotSupportedError UND_ERR_NOT_SUPPORTED\n\
+         exported function function function\n\
+         names itself true\n\
+         still serves 200 [\"/live\"]";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 /// An abort ends a hooked fetch where node ends it. Aborted in the same tick
 /// as fetch(), the first host is still passed to the hook (undici has begun
 /// connecting); aborted while a request is on the wire, the redirect it

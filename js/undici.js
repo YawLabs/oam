@@ -42,18 +42,18 @@
 //    undici.request(url, { dispatcher }).
 //
 // Refused, never ignored: a dispatcher whose dispatch() is overridden (a
-// subclass or a patched instance), one built with `interceptors`, and an
-// object that is not one of this shim's dispatchers fail the request with
-// NotSupportedError. oam runs a request itself rather than through
-// dispatch(), so honouring anything that lives there is impossible, and
-// dropping it could skip a policy the application put there.
+// subclass or a patched instance), one built with `interceptors`, an object
+// that is not one of this shim's dispatchers, and MockAgent / MockPool /
+// MockClient fail with NotSupportedError. oam runs a request itself rather
+// than through dispatch(), so honouring anything that lives there is
+// impossible, and dropping it could skip a policy the application put there
+// -- or, for the Mock* classes, send a request the test meant to stay in
+// memory (they refuse at construction; see below).
 //
 // Documented divergences (a shim over fetch cannot honor everything):
 //  - Other connection-level dispatcher options (connection pooling,
 //    keep-alive tuning) are accepted but NOT applied -- oam's fetch owns the
 //    transport beyond the connect hooks.
-//  - Mock* (MockAgent/MockPool/...) are minimal stubs: constructible, but
-//    they do not intercept requests.
 
 (function oamUndiciModule(registry) {
   // The global dispatcher lives on a locked global, not in this closure:
@@ -574,27 +574,42 @@
       responseError: passThrough,
     };
 
-    // ---- minimal Mock* stubs (constructible, non-intercepting) -----------
-    class MockAgent extends Dispatcher {
-      get() { return new MockPool(); }
-      enableNetConnect() {}
-      disableNetConnect() {}
-      assertNoPendingInterceptors() {}
-      deactivate() {}
-      activate() {}
+    // ---- Mock*: refused, never a silent no-op ----------------------------
+    // undici's MockAgent / MockPool / MockClient INTERCEPT: a request that
+    // matches an interceptor is answered from memory and never dialled, and
+    // disableNetConnect() turns an unmatched one into a MockNotMatchedError
+    // instead of a real connection. oam's fetch owns its transport and
+    // cannot be intercepted from JS, so these were constructible stubs that
+    // intercepted nothing: a suite that installed a MockAgent, called
+    // disableNetConnect() and expected canned answers made REAL requests to
+    // whatever host it named, and read the real answers as its mocks. A test
+    // double that fails open is worse than one that is missing, so -- as
+    // with a dispatcher whose dispatch() oam cannot run (policyOf) -- they
+    // refuse instead. The classes stay exported so the import still
+    // resolves and the failure names itself.
+    function mockNotSupported(what) {
+      return new errors.NotSupportedError(
+        what + " is not supported on oam: oam sends the request itself, so the interceptors " +
+          "would not run and disableNetConnect() would not hold -- every request meant for the " +
+          "mock would go to the real host and its answer would be read as the mock's. Point the " +
+          "code under test at a local server instead",
+      );
     }
-    class MockPool extends Dispatcher {
-      intercept() {
-        return {
-          reply() { return this; },
-          replyWithError() { return this; },
-          persist() { return this; },
-          times() { return this; },
-          delay() { return this; },
-        };
+    class MockAgent extends Dispatcher {
+      constructor() {
+        throw mockNotSupported("undici's MockAgent");
       }
     }
-    class MockClient extends MockPool {}
+    class MockPool extends Dispatcher {
+      constructor() {
+        throw mockNotSupported("undici's MockPool");
+      }
+    }
+    class MockClient extends Dispatcher {
+      constructor() {
+        throw mockNotSupported("undici's MockClient");
+      }
+    }
 
     // ---- web globals undici re-exports -----------------------------------
     const mod = {
