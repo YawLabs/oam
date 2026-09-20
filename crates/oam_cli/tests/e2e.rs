@@ -23572,6 +23572,115 @@ for (const line of seen) console.log('server ' + line);
     );
 }
 
+/// The same decision one step earlier: an application that filters clients
+/// in a server's 'connection' listener -- an allow list that destroys the
+/// sockets it refuses -- on an http and on an https server.
+///
+/// oam's servers used to go straight from the accept to serving, emitting
+/// no 'connection' at all, so this listener never ran and a client the
+/// application would have refused was served instead. What it refuses must
+/// reach no handler and be answered nothing; on an https server the
+/// refusal lands before the handshake, so the client never completes one.
+///
+/// The last connection's listener throws: node raises 'uncaughtException'
+/// and keeps serving, and a server that stopped taking connections because
+/// one listener threw would be a denial of service of its own -- so the
+/// connection after it is served as usual.
+#[test]
+fn a_connection_listener_decides_which_clients_are_served() {
+    let src = r#"import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
+import tls from 'node:tls';
+
+const thrown = [];
+process.on('uncaughtException', (e) => thrown.push(e.message));
+
+const ask = (port, secure) => new Promise((resolve) => {
+  let data = '';
+  const opts = { host: '127.0.0.1', port, servername: 'localhost', rejectUnauthorized: false };
+  const s = secure
+    ? tls.connect(opts, () => send())
+    : net.connect(port, '127.0.0.1', () => send());
+  function send() {
+    setTimeout(() => {
+      if (!s.destroyed) s.write('GET /private HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n');
+    }, 120);
+  }
+  s.setEncoding('utf8');
+  s.on('data', (d) => (data += d));
+  s.on('error', () => {});
+  s.on('close', () => resolve(data ? data.split('\r\n')[0] + ' ' + data.split('\r\n\r\n')[1] : 'nothing'));
+  setTimeout(() => s.destroy(), 5000).unref();
+});
+
+// The application's own rule: refuse everything but the third connection,
+// and throw on the fourth.
+async function check(label, server, secure) {
+  const seen = [];
+  let n = 0;
+  server.on('connection', (socket) => {
+    n += 1;
+    seen.push('connection ' + n + ' isNetSocket=' + (socket instanceof net.Socket) +
+      ' remote=' + socket.remoteAddress);
+    if (n === 4) throw new Error('boom from the ' + label + ' listener');
+    if (n !== 3) {
+      seen.push('refused ' + n);
+      socket.destroy();
+    }
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const port = server.address().port;
+  for (const i of [1, 2, 3, 4, 5]) console.log(label + ' ' + i + ': ' + await ask(port, secure));
+  await new Promise((r) => setTimeout(r, 200));
+  server.close();
+  for (const line of seen) console.log(label + ' server ' + line);
+}
+
+const handler = (req, res) => res.end('secret');
+await check('http', http.createServer(handler), false);
+await check('https', https.createServer({ key: `__KEY__`, cert: `__CERT__` }, handler), true);
+await new Promise((r) => setTimeout(r, 100));
+for (const message of thrown) console.log('uncaught ' + message);
+"#
+    .replace("__KEY__", MTLS_SERVER_KEY)
+    .replace("__CERT__", MTLS_SERVER_CERT);
+    let stdout = run_ok("connection_listener_verdict.mjs", &src);
+    assert_eq!(
+        stdout.replace("\r\n", "\n").trim_end(),
+        // Only the connections the listener let through were served, and
+        // the one whose listener threw did not stop the ones after it.
+        "http 1: nothing\n\
+         http 2: nothing\n\
+         http 3: HTTP/1.1 200 OK secret\n\
+         http 4: HTTP/1.1 200 OK secret\n\
+         http 5: nothing\n\
+         http server connection 1 isNetSocket=true remote=127.0.0.1\n\
+         http server refused 1\n\
+         http server connection 2 isNetSocket=true remote=127.0.0.1\n\
+         http server refused 2\n\
+         http server connection 3 isNetSocket=true remote=127.0.0.1\n\
+         http server connection 4 isNetSocket=true remote=127.0.0.1\n\
+         http server connection 5 isNetSocket=true remote=127.0.0.1\n\
+         http server refused 5\n\
+         https 1: nothing\n\
+         https 2: nothing\n\
+         https 3: HTTP/1.1 200 OK secret\n\
+         https 4: HTTP/1.1 200 OK secret\n\
+         https 5: nothing\n\
+         https server connection 1 isNetSocket=true remote=127.0.0.1\n\
+         https server refused 1\n\
+         https server connection 2 isNetSocket=true remote=127.0.0.1\n\
+         https server refused 2\n\
+         https server connection 3 isNetSocket=true remote=127.0.0.1\n\
+         https server connection 4 isNetSocket=true remote=127.0.0.1\n\
+         https server connection 5 isNetSocket=true remote=127.0.0.1\n\
+         https server refused 5\n\
+         uncaught boom from the http listener\n\
+         uncaught boom from the https listener"
+    );
+}
+
 #[test]
 fn oam_mcp_module_batch_array() {
     use std::io::{BufRead, BufReader, Write};

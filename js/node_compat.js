@@ -18254,6 +18254,13 @@
         // sees a destroy instead of serving it.
         const socket = serverSocket(meta);
         socket._isConnectionSocket = true;
+        // A net.Socket by brand, as oam's own TLSSocket is (#132,
+        // divergence 34). Node hands this listener a net.Socket, and a
+        // check that filters clients here is often written behind
+        // `socket instanceof net.Socket` -- a check that silently skipped
+        // itself would be the weakness this event exists to close. The
+        // object still has none of the stream API (divergence 39).
+        socket[Symbol.for("oam.netSocketLike")] = true;
         connectionRecord(server, meta.connectionId).conn = socket;
         try {
           server.emit("connection", socket);

@@ -218,17 +218,19 @@ async function scenario(label, options, op, verdict) {
       s.destroy();
     }
   });
-  server.on("connection", () => events.push("connection"));
+  server.on("connection", (s) => events.push(
+    "connection encrypted=" + s.encrypted +
+    " remote=" + s.remoteAddress + " localPort=" + (typeof s.localPort)));
   server.on("tlsClientError", (err) => events.push("tlsClientError " + err.code));
   server.on("clientError", (err) => events.push("clientError " + err.code));
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   const client = await runClient({ ...op, port: server.address().port, ca: CA });
   await new Promise((r) => setTimeout(r, 250));
   console.log("== " + label);
-  // 'connection' carries the plain socket before the handshake; oam's https
-  // server has no such moment to offer (divergence 39), so it is left out
-  // of the comparison here.
-  for (const e of events) if (e !== "connection") console.log("   " + e);
+  // 'connection' carries the plain socket, before the handshake: it is the
+  // first thing the server hears about a connection, and it is where an
+  // application filtering clients by address decides.
+  for (const e of events) console.log("   " + e);
   console.log("   client " + client);
   console.log("   socket closed after the connection ended: " + closed);
   server.close();
