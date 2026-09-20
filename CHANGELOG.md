@@ -18,24 +18,30 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Security
 
-- **An `https` server emitted no `'secureConnection'`, so an application's own client check
-  never ran.** Node documents a mutual-TLS pattern where the server is created with
-  `requestCert: true` and `rejectUnauthorized: false` -- admitting every handshake -- and the
-  application decides for itself in a `'secureConnection'` listener, reading
-  `socket.authorized`, `socket.authorizationError` and `socket.getPeerCertificate()` and
-  destroying the clients it refuses. oam's https server terminates TLS natively and went
-  straight from the handshake to serving HTTP: the event was never emitted, so that listener
-  never ran and a client the application would have refused was served instead. A connection
-  past its handshake now announces itself and nothing on it is parsed as HTTP until the
-  listeners have run; one that destroys the socket stops the request reaching the handler,
-  and the client is answered nothing. `requestCert` with `rejectUnauthorized: true` -- the
-  server refusing on its own -- was already enforced in 0.16.3 and is unchanged. The socket
-  is the connection's, as node's `TLSSocket` is: `req.socket`, `res.socket`, `req.client`
-  and every later request on a keep-alive connection are that one object, it answers
-  `instanceof tls.TLSSocket` (by brand, as oam's own `TLSSocket` answers `instanceof
-  net.Socket`), and it emits `'close'` when the connection ends. `tls.createServer` and
-  `http2.createSecureServer` already emitted `'secureConnection'` with a real `TLSSocket`
-  and are unaffected. Conformance case 168 holds the whole shape to node v22.22.2.
+- **A server emitted no `'connection'` or `'secureConnection'`, so an application's own
+  client check never ran.** An application decides for itself which clients it will serve in
+  those listeners: an allow list that destroys the sockets it refuses, or the mutual-TLS
+  pattern node documents, where the server is created with `requestCert: true` and
+  `rejectUnauthorized: false` -- admitting every handshake -- and a `'secureConnection'`
+  listener reads `socket.authorized`, `socket.authorizationError` and
+  `socket.getPeerCertificate()`. oam's servers went straight from the accept to serving, and
+  its https server terminated TLS natively and went straight from the handshake to serving
+  HTTP: neither event was emitted, so those listeners never ran and a client the application
+  would have refused was served instead. `'connection'` was missing on `http.createServer`,
+  `https.createServer`, `tls.createServer` and `http2.createSecureServer`;
+  `'secureConnection'` on `https.createServer` (the other two already emitted it with a real
+  `TLSSocket`). A connection now announces itself before a byte is read off it -- and an
+  https connection again once its handshake is done, before anything on it is parsed as
+  HTTP -- and nothing happens on it until the listeners have run; one that destroys the
+  socket stops the client being served, with no answer on the wire. `requestCert` with
+  `rejectUnauthorized: true` -- the server refusing on its own -- was already enforced in
+  0.16.3 and is unchanged. Conformance cases 168 and 169 hold the whole shape to node
+  v22.22.2.
+- **A listener that threw took the server down.** A `'connection'` or `'secureConnection'`
+  listener that threw -- a mutual-TLS check reading a field off an empty certificate, say --
+  ended the server's accept loop, after which every connection was accepted and then never
+  dispatched. As in node, the exception is now raised as `'uncaughtException'` and the server
+  keeps serving. The same shape still applies to a `'request'` handler that throws.
 - **`tls.checkServerIdentity` accepted every certificate.** It answered `undefined`
   whatever the host name and the certificate, so code that checks the name itself -- after
   `rejectUnauthorized: false`, or around a certificate pin -- accepted a certificate issued
@@ -356,6 +362,24 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   intercepted from JS, so the three now refuse at construction with `NotSupportedError`
   (`UND_ERR_NOT_SUPPORTED`), as a dispatcher oam cannot run does. They stay exported, so the
   import resolves and the failure names itself.
+
+### Changed
+
+- **An http or https server's `req.socket` is the connection's socket**, as node's is: the
+  object `'connection'` -- and on an https server `'secureConnection'` -- handed out. Up to
+  0.16.3 an http server made a new one per request, so two keep-alive requests saw two
+  objects where node shows one; they now see one, it emits `'close'` when the connection
+  ends, and `res.socket` / `res.connection` / `req.client` are that same object. It also
+  answers `instanceof net.Socket`, and on an https server `instanceof tls.TLSSocket`, where
+  both were `false` before -- by brand, as oam's own `TLSSocket` answers `instanceof
+  net.Socket` (0.16.0). The object is still not a stream: it has the addresses,
+  `address()`, `setTimeout`, `destroy` and `end`, and none of `write`, `pause`, `resume`,
+  `setNoDelay`, `setKeepAlive`, `ref` or `unref`, so code that reads an `instanceof` test as
+  a promise of the stream API will now reach a missing method where it used to take its
+  non-socket path. It is branded because a check that filters clients in a `'connection'` or
+  `'secureConnection'` listener is commonly written behind exactly that test, and a check
+  that silently skipped itself would be the weakness the Security entry above is about.
+  Divergence 39 lists what the object has.
 
 ### Fixed
 

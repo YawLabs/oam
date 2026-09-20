@@ -1575,7 +1575,7 @@ fails every request it applies to: `fetch` with `error sending request for url (
 _(probed)_ Node v22.22.2 + undici 6.24.1 vs oam on Windows, the same scripts, unless marked
 _(source)_; the `connect.lookup` behaviour is pinned by e2e tests.
 
-### 39. An HTTP server's `req.socket`: one object per request, no `'connection'` event
+### 39. An HTTP server's `req.socket` and the socket its `'connection'` hands out
 
 `req.socket` on an `http` or `https` server carries the connection's own addresses, spelled as
 Node spells them: `remoteAddress` / `remotePort` / `remoteFamily`, `localAddress` /
@@ -1588,24 +1588,32 @@ runtime as the client; libuv clears the option, so Node's `::` listener takes IP
 everywhere. Entry 36 is the same gap on the `listen(port)` default. A link-local peer carries
 its scope: the interface index on Windows (as Node), the interface name on Linux (as Node),
 and the index elsewhere, where Node writes the name. `req.connection` is the same object.
-What still differs: on an `http` server each request gets its own socket object, so two
-keep-alive requests on one connection see two objects where Node shows one, and the server
-emits no `'connection'` event (Node: one per connection); that socket is an `EventEmitter`
-that never emits. An `'upgrade'` listener gets a real `net.Socket` for the connection, and
-the request's `req.socket` is that socket, as in Node.
 
-On an `https` server the socket is the CONNECTION's, as Node's `TLSSocket` is: the object
-`'secureConnection'` hands out (entry 42) is `req.socket`, `res.socket` and `req.client`
-for every request on that connection, so a keep-alive client's second request sees the
-handshake it was admitted on, and it emits `'close'` when the connection ends. It reports
-the handshake (`encrypted`, `authorized`, `authorizationError`, `alpnProtocol`,
-`servername`, `getPeerCertificate()`, `getPeerX509Certificate()`, `getProtocol()`,
-`getCipher()`) and answers `instanceof tls.TLSSocket` and `instanceof net.Socket` -- by
-brand, as oam's own `TLSSocket` does (entry 34): it is not built from the `TLSSocket`
-class and has none of the stream methods, since the connection is read and written
-natively. The `'connection'` event (Node: the plain socket, before the handshake) is still
-not emitted: there is no moment at which that socket belongs to JS. `req.client` is
-`req.socket`, as in Node.
+The socket is the CONNECTION's, as Node's is. A server emits `'connection'` once per
+connection, before a byte is read off it (and, on an `https` server, before its handshake:
+entry 42), with the plain socket; on an `https` server the socket `'secureConnection'` hands
+out supersedes it. That object is `req.socket`, `res.socket` and `req.client` for every
+request on the connection, so two keep-alive requests see one object as they do in Node, and
+it emits `'close'` when the connection ends. A listener that destroys it stops the client
+being served: nothing on the connection is read or parsed until the listeners have run.
+An `https` connection's socket also reports the handshake (`encrypted`, `authorized`,
+`authorizationError`, `alpnProtocol`, `servername`, `getPeerCertificate()`,
+`getPeerX509Certificate()`, `getProtocol()`, `getCipher()`).
+
+What still differs: the socket is an `EventEmitter` with the addresses, `address()`,
+`setTimeout`, `destroy` and `end`, not a stream -- the connection is read and written
+natively -- so it has none of `write`, `pause`, `resume`, `setNoDelay`, `setKeepAlive`,
+`ref`, `unref`, `cork`, `pipe` or `read`, and `constructor.name` is `EventEmitter`. It
+answers `instanceof net.Socket` (and an `https` connection's also `instanceof
+tls.TLSSocket`) by brand, as oam's own `TLSSocket` does (entry 34), because a check that
+filters clients in a `'connection'` or `'secureConnection'` listener is often written
+behind exactly that test; code that reads the test as a promise of the stream API will find
+the method it reaches for missing. An `'upgrade'` listener gets a real `net.Socket` for the
+connection, and the request's `req.socket` is that socket, as in Node; the socket
+`'connection'` handed out for the same connection closes at the handover rather than with
+the upgraded socket. On an exchange the connection was closed under after its response had
+started, the socket's `'close'` comes after the response's, where Node emits it first (they
+are in Node's order when the response had not started).
 
 `req.socket.readable` and `req.socket.writable` are Node's: both true while the connection
 is up -- after the request body has ended, and after the response has been sent, for the
@@ -1618,7 +1626,8 @@ request looked already finished and `express.json()` / `express.urlencoded()` le
 
 _(probed)_ Node v22.22.2 and oam, http and https servers on `0.0.0.0`, `::`, `127.0.0.1` and
 `::1`, clients from four local IPv4 and three IPv6 addresses. The https socket's identity
-and lifetime: case 168.
+and lifetime: case 168. The `'connection'` event and what a listener that refuses a client
+there decides, on `http`, `https` and `tls` servers alike: case 169.
 
 ### 40. The HTTP server's request parser: what still differs
 
@@ -1703,9 +1712,12 @@ many are open is closed at once and the server emits `'drop'`. What differs:
   the `408`; Node hands it to a `'clientError'` listener when there is one. (A TLS
   handshake that times out on an `https` server is `'tlsClientError'` and `'clientError'`
   `ERR_TLS_HANDSHAKE_TIMEOUT`, as in Node.)
-- The socket a `'timeout'` event carries is oam's per-request socket object (entry 39),
-  not a `net.Socket`: it has the addresses, `setTimeout`, `destroy` and `end` (which
-  closes the connection once what is being written is out; there is no half-close).
+- The socket a `'timeout'` event carries is the connection's, the same object
+  `'connection'` (and on an `https` server `'secureConnection'`) handed out, as Node's is.
+  It is not a real `net.Socket` (entry 39): it has the addresses, `setTimeout`, `destroy`
+  and `end` (which closes the connection once what is being written is out; there is no
+  half-close), and answers `instanceof net.Socket` -- and on an `https` server `instanceof
+  tls.TLSSocket` -- by brand.
 - Responses carry no `Connection: keep-alive` / `Keep-Alive: timeout=N` headers, so a
   client cannot learn the keep-alive timeout from them.
 - When a request timeout closes a connection while the handler is reading the body, the
@@ -1762,22 +1774,44 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
 - **A handshake that times out closes the connection.** Node emits `'tlsClientError'`
   `ERR_TLS_HANDSHAKE_TIMEOUT` and leaves the socket open when a `'tlsClientError'` listener
   exists; oam emits the same event and closes it.
-- **No `'connection'` event** on a `tls.Server`: the plain socket is not exposed before
-  its handshake. `'tlsClientError'` messages are rustls's; the codes are Node's.
+- **A `tls.Server`'s `'connection'` runs before its handshake**, with the plain socket, as
+  in Node: a listener that destroys it refuses the client before any TLS work is done for
+  it. What differs is the socket afterwards -- the connection becomes the `TLSSocket`'s,
+  and the plain object is a handle on it: `destroy()` and `end()` reach the connection and
+  its `'close'` is the `TLSSocket`'s, but it is not read from or written to, so bytes
+  written on it go nowhere. `http2.createSecureServer` is a `tls.Server` and behaves the
+  same. `'tlsClientError'` messages are rustls's; the codes are Node's.
 - **An `https` server's connections are served natively**, so the socket it hands to
-  `'secureConnection'`, to its requests and to its `'tlsClientError'` / `'clientError'` is
-  not built from the `TLSSocket` class and has none of the stream methods; it carries the
-  handshake and answers `instanceof tls.TLSSocket` by brand (entries 34 and 39). The event
-  itself is Node's: it fires once per connection before anything on it is parsed as HTTP,
-  with `authorized`, `authorizationError`, `getPeerCertificate()`, `getProtocol()`,
-  `getCipher()`, `alpnProtocol`, `servername` and the connection's addresses already
-  filled in, and a listener that destroys the socket stops the request reaching the
-  handler -- so the mutual-TLS pattern Node documents (`requestCert: true` with
-  `rejectUnauthorized: false`, the application deciding in the listener) holds here.
-  `'connection'` is not emitted here either, for the reason in the bullet above. The
-  server has no `ref()` / `unref()` (nor does an `http` server here). `requestCert`, `rejectUnauthorized`
-  and `ALPNProtocols` are read for each new connection as in Node, through accessor
-  properties on the server (Node: data properties).
+  `'connection'`, to `'secureConnection'`, to its requests and to its `'tlsClientError'` /
+  `'clientError'` is not built from the `net.Socket` / `TLSSocket` classes and has none of
+  the stream methods; it carries the handshake and answers `instanceof tls.TLSSocket` by
+  brand (entries 34 and 39). The events themselves are Node's: `'connection'` fires once
+  per connection before the handshake, `'secureConnection'` once it is done and before
+  anything on the connection is parsed as HTTP, with `authorized`, `authorizationError`,
+  `getPeerCertificate()`, `getProtocol()`, `getCipher()`, `alpnProtocol`, `servername` and
+  the connection's addresses already filled in, and a listener on either that destroys the
+  socket stops the request reaching the handler -- so the mutual-TLS pattern Node documents
+  (`requestCert: true` with `rejectUnauthorized: false`, the application deciding in the
+  listener) holds here. The server has no `ref()` / `unref()` (nor does an `http` server
+  here). `requestCert`, `rejectUnauthorized` and `ALPNProtocols` are read for each new
+  connection as in Node, through accessor properties on the server (Node: data
+  properties).
+- **An `https` server emits no `'upgrade'` and no `'connect'`.** An upgrade request is
+  served as an ordinary request (Node: `'upgrade'`, with the connection handed over) and a
+  CONNECT is closed, so `wss://` servers -- `ws`, `socket.io` -- do not work on an oam
+  `https` server. An `http` server routes both as Node does (entry 39).
+- **An `https` server emits no HTTP-level `'clientError'`.** A request head it refuses is
+  answered `400` natively, where Node hands the error to a `'clientError'` listener with
+  the connection's socket; the only `'clientError'` an `https` server raises is the one it
+  passes on from `'tlsClientError'` when a handshake fails, and that one carries a fresh
+  socket object rather than the connection's.
+- **`server.close()` does not wait for the connections already accepted.** The server
+  stops listening and its accept loop ends at once, so `'close'` (and the `close(cb)`
+  callback) fires immediately where Node waits for the last connection to go, and a
+  request that had not yet reached the handler is dropped rather than served -- including
+  the connection whose own `'connection'` / `'secureConnection'` listener called
+  `close()`. A response already in flight is finished. This is the same on an `http`
+  server.
 - **HTTP/2 sessions have no push, 1xx, trailers or settings.** `stream.pushAllowed` is
   `false` and `pushStream()` throws `ERR_HTTP2_PUSH_DISABLED`; `additionalHeaders()` sends
   nothing and `writeContinue()` / `writeEarlyHints()` return `false`; response trailers
