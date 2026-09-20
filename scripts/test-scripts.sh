@@ -583,8 +583,15 @@ if [ -s "$SRC_LIST" ]; then pass; else fail "git ls-files produced nothing -- ev
 # repo, each carrying its own target/; eight of them is what the anchored
 # `--exclude=./target` missed.
 it "ships no .claude/ agent worktree, and no build output of any kind"
+# The two exemptions are TRACKED fixtures whose path happens to spell a build
+# directory: the node-suite's vendored node_modules, and the vendored MIT
+# proxy-agent packages the http client's tests run against, which are shipped
+# as their published form (a `dist/`). Both are asserted below, so exempting
+# them here cannot quietly hide their loss. Everything else named here is
+# output or scratch, and neither belongs in a source tarball.
 OFFENDERS="$(grep -nE '(^|/)(target|node_modules|dist)/|^\.claude/|^\.git/' "$SRC_LIST" \
-  | grep -v 'conformance/vendor/node/test/fixtures/.*/node_modules/' | head -5)"
+  | grep -v 'conformance/vendor/node/test/fixtures/.*/node_modules/' \
+  | grep -v 'crates/oam_cli/tests/fixtures/.*/dist/' | head -5)"
 if [ -z "$OFFENDERS" ]; then pass; else fail "build output or agent scratch in the sync list: $OFFENDERS"; fi
 
 # The other half of that guard, and the reason the naive fix (dropping the `./`
@@ -593,6 +600,12 @@ if [ -z "$OFFENDERS" ]; then pass; else fail "build output or agent scratch in t
 # asserts on. Verified on GNU tar 1.35, 2026-08-31.
 it "still ships the tracked vendored node_modules conformance fixtures"
 eq "$(grep -c 'conformance/vendor/node/test/fixtures/warning_node_modules/node_modules/' "$SRC_LIST")" "4"
+
+# The same for the proxy-agent fixtures: the remote legs run the http client's
+# proxy tests, and a tarball without these leaves them with nothing to require.
+it "still ships the tracked vendored proxy-agent test fixtures"
+PROXY_FIXTURES="$(grep -c 'crates/oam_cli/tests/fixtures/.*/dist/' "$SRC_LIST")"
+if [ "$PROXY_FIXTURES" -gt 0 ]; then pass; else fail "the vendored proxy-agent fixtures are not in the sync list"; fi
 
 # A tree missing any of these does not build on the far side at all.
 it "ships the inputs a remote build cannot start without"

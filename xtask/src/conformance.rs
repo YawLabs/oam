@@ -26,6 +26,24 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// How long ONE side of a differential pair may run before the harness kills
+/// it.
+///
+/// It must stay above the longest watchdog a case arms for itself, or the
+/// harness races the case: on a host where a case really reaches its own
+/// watchdog, this ceiling fires first and the case is recorded `TIMEOUT`
+/// instead of being read. That is what happened to
+/// `121-http-request-lookup-and-agents` and `122-http-client-socket-addresses`
+/// on macOS, whose 60 s watchdog equalled a 60 s ceiling: resolving the host
+/// spellings Node's resolver refuses takes long enough there to reach it --
+/// under Node too, so both sides were killed and the case was scored on the
+/// harness's clock rather than on what the two runtimes printed.
+/// `a_case_watchdog_fires_before_the_harness_gives_up` keeps the margin.
+///
+/// A case that really hangs still ends here; its own watchdog just gets to
+/// speak first.
+const CASE_CEILING: Duration = Duration::from_secs(90);
+
 pub fn run(release: bool) -> Result<()> {
     let release = release
         || std::env::var("CONFORMANCE_RELEASE")
@@ -234,7 +252,7 @@ pub fn run(release: bool) -> Result<()> {
                 .env_remove("CLICOLOR_FORCE")
                 .env("NO_COLOR", "1")
                 .current_dir(&repo),
-            Duration::from_secs(60),
+            CASE_CEILING,
         )?;
         let node_out = run_with_timeout(
             Command::new(node)
@@ -244,7 +262,7 @@ pub fn run(release: bool) -> Result<()> {
                 .env_remove("CLICOLOR_FORCE")
                 .env("NO_COLOR", "1")
                 .current_dir(&repo),
-            Duration::from_secs(60),
+            CASE_CEILING,
         )?;
         if oam_out.timed_out || node_out.timed_out {
             println!("  TIMEOUT {name}");
@@ -1575,6 +1593,53 @@ mod receipt_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every case that arms its own watchdog must be able to fire it before
+    /// `CASE_CEILING` kills it, or the harness records `TIMEOUT` and the case
+    /// is scored on the clock instead of on what the two runtimes printed.
+    /// Cases 121 and 122 reached exactly that on macOS with a 60 s watchdog
+    /// under a 60 s ceiling.
+    #[test]
+    fn a_case_watchdog_fires_before_the_harness_gives_up() {
+        let dir = repo_root()
+            .expect("repo root")
+            .join("conformance")
+            .join("cases");
+        let mut seen = 0usize;
+        let mut worst: Option<(String, u64)> = None;
+        for entry in std::fs::read_dir(&dir).expect("read cases").flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("mjs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("read case");
+            // The shape every case uses: `setTimeout(() => { ...  }, N)`
+            // around a WATCHDOG line.
+            let Some(watchdog) = src.split("WATCHDOG").nth(1) else {
+                continue;
+            };
+            let Some(ms) = watchdog
+                .split_once("}, ")
+                .and_then(|(_, rest)| rest.split(')').next())
+                .and_then(|n| n.trim().parse::<u64>().ok())
+            else {
+                continue;
+            };
+            seen += 1;
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            if worst.as_ref().is_none_or(|(_, w)| ms > *w) {
+                worst = Some((name, ms));
+            }
+        }
+        assert!(seen > 0, "no case watchdogs found in {}", dir.display());
+        let (name, ms) = worst.expect("a watchdog");
+        assert!(
+            Duration::from_millis(ms) < CASE_CEILING,
+            "{name} arms a {ms} ms watchdog, but the harness gives up at \
+             {} ms -- the case can never print its own verdict",
+            CASE_CEILING.as_millis()
+        );
+    }
 
     /// A surface-runner document with one module's export names.
     fn surface(entries: &[(&str, Option<&[&str]>)]) -> Value {
