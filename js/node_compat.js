@@ -17529,6 +17529,19 @@
       get writableEnded() {
         return this._ended;
       }
+      // node's deprecated OutgoingMessage#finished: true from the moment
+      // end() hands the message off, exactly when writableEnded turns true,
+      // and a truthy one makes a later end() a no-op (node reads it at the
+      // top of end()). on-finished branches on `typeof msg.finished ===
+      // "boolean"` to tell a response from a request, so without it
+      // isFinished(res) answered undefined for every middleware that asks
+      // (morgan, compression, express-session).
+      get finished() {
+        return this._ended;
+      }
+      set finished(value) {
+        this._ended = Boolean(value);
+      }
       get writableFinished() {
         // Node's computed getter is already true in the synchronous window
         // after end() returns (bytes handed off), BEFORE 'finish' emits --
@@ -17835,6 +17848,20 @@
         localAddress: meta.localAddress,
         localPort: meta.localPort,
         localFamily: meta.localFamily,
+        // node's net.Socket lifecycle flags. An open connection can still be
+        // read from and written to, and node keeps both `true` for as long as
+        // the connection lives -- after the request body has ended and after
+        // the response has been sent, for the next keep-alive exchange. They
+        // go false together when the connection closes or is destroyed.
+        //
+        // These are not decoration: on-finished reads `socket.readable` to
+        // decide whether a request body is still coming
+        // (`!socket.readable` means "already finished"), and body-parser 2 /
+        // raw-body ask it before reading. With the flags absent, every
+        // express.json() and express.urlencoded() request looked finished,
+        // so the body was never parsed and req.body stayed undefined.
+        readable: true,
+        writable: true,
         destroyed: false,
       });
       const connectionId = meta.connectionId;
@@ -17872,6 +17899,8 @@
       socket.destroy = function destroy(err) {
         if (this.destroyed) return this;
         this.destroyed = true;
+        this.readable = false;
+        this.writable = false;
         if (typeof connectionId === "number") natives.httpConnDestroy(connectionId);
         process.nextTick(() => {
           if (err && this.listenerCount("error") > 0) this.emit("error", err);
@@ -17880,12 +17909,25 @@
         return this;
       };
       // Closes the connection once what is being written is out (no
-      // half-close: the connection ends).
+      // half-close: the connection ends). node's end() stops the writable
+      // side at once, before the FIN is out.
       socket.end = function end() {
+        this.writable = false;
         if (typeof connectionId === "number" && !this.destroyed) {
           natives.httpConnDestroy(connectionId, true);
         }
         return this;
+      };
+      // The connection went away under the exchange (the native side's
+      // 'closed'): node's socket is neither readable nor writable then, and
+      // on-finished reads exactly that to tell an aborted request from one
+      // still arriving. Not destroy(): the connection is already gone, and
+      // node emits the socket's 'close' from the teardown that reported it,
+      // which oam does not surface on this object (divergence 39).
+      socket._markClosed = function markClosed() {
+        this.readable = false;
+        this.writable = false;
+        this.destroyed = true;
       };
       return socket;
     }
@@ -18158,6 +18200,8 @@
         if (exchange) {
           server._exchanges.delete(meta.requestId);
           const req = exchange.req;
+          const socket = req.socket;
+          if (socket && typeof socket._markClosed === "function") socket._markClosed();
           if (!req.destroyed) {
             const reset = new Error("aborted");
             reset.code = "ECONNRESET";
@@ -18270,6 +18314,12 @@
         // req via _dumpReq() (resOnFinish parity).
         req.res = res;
         res.req = req;
+        // node's response carries the connection as well, the SAME object
+        // req.socket is: middleware reads res.socket for the peer address or
+        // to check the connection is still up, and on-finished reads
+        // `!res.socket.writable` as "already finished".
+        res.socket = req.socket;
+        res.connection = req.socket;
         trackExchange(server, meta.requestId, req, res);
         server.emit("request", req, res);
       }
