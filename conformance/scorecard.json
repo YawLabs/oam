@@ -1,7 +1,7 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "845d460",
-  "oamVersion": "oam 0.16.2",
+  "commit": "63540f3+wip",
+  "oamVersion": "oam 0.16.3",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
   "suites": {
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 159,
-      "total": 159,
+      "pass": 160,
+      "total": 160,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -316,6 +316,10 @@
         },
         {
           "case": "167-web-class-to-string-tags.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "168-https-server-secure-connection.mjs",
           "status": "pass"
         },
         {
