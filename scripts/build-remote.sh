@@ -206,6 +206,14 @@ run_gate() {
 
 run_test() {
   cargo build --workspace
+  # The http_server_wire flood tests dial ~300 sockets at once and the server
+  # answers every one, to prove a server no longer stops at 256 connections.
+  # A stock POSIX soft limit sits below that (macOS ships 256), so without
+  # this the HARNESS runs out of descriptors first and those tests skip
+  # themselves. The spawned servers inherit it. Best effort: fall back to the
+  # hard limit, and if neither takes, the tests report why they skipped.
+  ulimit -n 4096 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
+  note "descriptor limit for tests: $(ulimit -n)"
   # ci.yml bounded a hung test at 15 min (deadlocked/lingering test class).
   command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1 \
     || warn "no timeout/gtimeout on this host -- a deadlocked test hangs instead of dying at 15 min (mac: brew install coreutils)"

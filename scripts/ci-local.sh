@@ -379,6 +379,10 @@ if [ "$SKIP_TESTS" -eq 0 ]; then
   # surface the gap -- the oam-check differential tests self-skip without it.
   command -v tsgo >/dev/null 2>&1 \
     || warn "tsgo not on PATH -- oam-check tests will self-skip (npm install -g @typescript/native-preview)"
+  # The http_server_wire flood tests dial ~300 sockets at once, above a stock
+  # POSIX soft limit (macOS ships 256), and skip themselves when the harness
+  # would be the one to run out. A no-op on Windows, which has no such limit.
+  ulimit -n 4096 2>/dev/null || ulimit -n "$(ulimit -Hn)" 2>/dev/null || true
   # The harnesses cargo is about to relink are exactly the images a previous
   # run's orphans are still executing.
   clear_debug_holders

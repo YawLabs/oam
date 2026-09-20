@@ -799,6 +799,71 @@ server.listen(0, "127.0.0.1", () => console.log("PORT " + server.address().port)
 /// More connections than oam's servers used to take at once (256).
 const FLOOD: usize = 300;
 
+/// Descriptors a flood test needs beyond its `FLOOD` sockets: the server's
+/// pipes, the `served_within` probe, and the rest of the binary's slack.
+const FLOOD_SLACK: usize = 64;
+
+/// The flood tests hold `FLOOD` sockets each for the length of the test, and
+/// `cargo test` runs them on threads of ONE process, so unserialised they ask
+/// for five times the descriptors at once. Take this first and they queue
+/// instead, which is also what makes the budget check below a fixed number.
+static FLOOD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// How many descriptors this process may open at once -- the soft
+/// `RLIMIT_NOFILE`, as a shell's `ulimit -n` reports it -- or `None` where
+/// there is no such limit (Windows) or it cannot be read. It is read through
+/// a shell because std exposes no rlimit call and this crate cannot make one
+/// without `unsafe`: `conformance/unsafe-budget.json` is a ratchet that only
+/// goes down, and a test convenience is no reason to spend from it.
+#[cfg(unix)]
+fn fd_budget() -> Option<usize> {
+    let out = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("ulimit -n")
+        .output()
+        .ok()?;
+    let reported = String::from_utf8_lossy(&out.stdout);
+    let reported = reported.trim();
+    if reported == "unlimited" {
+        return Some(usize::MAX);
+    }
+    reported.parse().ok()
+}
+
+#[cfg(not(unix))]
+fn fd_budget() -> Option<usize> {
+    None
+}
+
+/// Serialise a flood test, or tell the caller to skip it.
+///
+/// A flood test dials `FLOOD` sockets from THIS process and the server
+/// answers every one, so the harness needs the descriptors for them: a stock
+/// macOS login shell allows 256, no more than the 256 connections the server
+/// used to stop at, so the harness -- not the server -- is what runs out
+/// first, and `> 256` could never hold however well the server behaved. That
+/// arrives as an `EMFILE` inside a connect, or as `113 connections`, both of
+/// which read like the server failing. Say so and skip instead, the way the
+/// dual-stack test skips a host whose `::` listener is IPv6-only.
+/// `scripts/ci-local.sh` and `scripts/build-remote.sh` raise the limit before
+/// `cargo test`, so the gates that must run these tests do run them.
+#[must_use]
+fn flood_guard() -> Option<std::sync::MutexGuard<'static, ()>> {
+    let needed = FLOOD + FLOOD_SLACK;
+    if let Some(budget) = fd_budget()
+        && budget < needed
+    {
+        eprintln!(
+            "skipped: this process may open {budget} descriptors and this test needs {needed} \
+             -- raise `ulimit -n` (the release legs do)"
+        );
+        return None;
+    }
+    // A flood test that panicked poisoned the lock; the next one still wants
+    // to run, and its own assertions are what judge it.
+    Some(FLOOD_LOCK.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
 /// Keep trying a request until one is answered 200 or `deadline` passes.
 fn served_within(target: SocketAddr, deadline: Duration) -> Option<Duration> {
     let started = std::time::Instant::now();
@@ -828,6 +893,7 @@ fn served_within(target: SocketAddr, deadline: Duration) -> Option<Duration> {
 #[test]
 fn silent_connections_do_not_lock_the_server_out() {
     use std::io::Read;
+    let Some(_flood) = flood_guard() else { return };
     let server = Server::start("silent_flood.mjs", TIMEOUT_SERVER, &[], &[]);
     let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
     let silent: Vec<std::net::TcpStream> = (0..FLOOD)
@@ -857,6 +923,7 @@ fn silent_connections_do_not_lock_the_server_out() {
 #[test]
 fn idle_keep_alive_connections_do_not_lock_the_server_out() {
     use std::io::{Read, Write};
+    let Some(_flood) = flood_guard() else { return };
     let server = Server::start("idle_flood.mjs", TIMEOUT_SERVER, &[], &[]);
     let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
     let mut idle = Vec::new();
@@ -971,6 +1038,7 @@ fn keep_alive_request(stream: &mut std::net::TcpStream) -> bool {
 fn busy_keep_alive_clients_do_not_lock_the_server_out() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    let Some(_flood) = flood_guard() else { return };
     let server = Server::start("busy_flood.mjs", DEFAULT_SERVER, &[], &[]);
     let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
     let mut busy = Vec::new();
@@ -1020,6 +1088,7 @@ fn busy_keep_alive_clients_do_not_lock_the_server_out() {
 /// headersTimeout, 60 s) do not keep the next client out either.
 #[test]
 fn silent_connections_do_not_keep_the_next_client_waiting() {
+    let Some(_flood) = flood_guard() else { return };
     let server = Server::start("silent_default.mjs", DEFAULT_SERVER, &[], &[]);
     let target: SocketAddr = format!("127.0.0.1:{}", server.port).parse().unwrap();
     let silent: Vec<std::net::TcpStream> = (0..FLOOD)
@@ -1040,6 +1109,7 @@ fn silent_connections_do_not_keep_the_next_client_waiting() {
 #[test]
 fn silent_connections_do_not_lock_an_http2_server() {
     use std::io::{Read, Write};
+    let Some(_flood) = flood_guard() else { return };
     let script = r#"
 import http2 from "node:http2";
 const server = http2.createServer((req, res) => res.end("ok"));
