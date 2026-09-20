@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "69556c1",
+  "commit": "845d460",
   "oamVersion": "oam 0.16.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 156,
-      "total": 156,
+      "pass": 159,
+      "total": 159,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -304,6 +304,18 @@
         },
         {
           "case": "164-tls-ca-certificate-lists.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "165-http-server-request-socket-flags.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "166-string-decoder-es5-inheritance.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "167-web-class-to-string-tags.mjs",
           "status": "pass"
         },
         {
