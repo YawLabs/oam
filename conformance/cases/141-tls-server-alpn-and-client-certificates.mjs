@@ -356,3 +356,61 @@ for (let i = 0; i < 2; i++) {
   server.close();
   for (const e of events) console.log("  server " + e);
 }
+
+// ---- 7. a session made while the server let any client certificate in,
+// resumed after it turned rejectUnauthorized on: the certificate the
+// session carries is judged again and refused (node's onServerSocketSecure
+// reads the verdict of a resumed session too), as a new handshake with it
+// is. Over TLS 1.3 (a ticket) and TLS 1.2.
+{
+  const RESUME = `
+import tls from "node:tls";
+const [port, ca, cert, key, maxVersion, session64] = JSON.parse(process.argv[1]);
+const out = { secure: false, data: "" };
+let session = null;
+const s = tls.connect({
+  host: "127.0.0.1", port, servername: "localhost", ca, cert, key, maxVersion,
+  session: session64 ? Buffer.from(session64, "base64") : undefined,
+}, () => {
+  out.secure = true;
+  out.reused = s.isSessionReused();
+});
+s.setEncoding("utf8");
+s.on("session", (next) => { session = next; });
+s.on("data", (d) => { out.data += d; });
+s.on("error", (e) => { if (e.code !== "ECONNRESET") out.error = e.code; });
+s.on("close", () => setTimeout(() => {
+  process.stdout.write(JSON.stringify({ out, session: session && session.toString("base64") }));
+}, 20));
+setTimeout(() => { out.timeout = true; s.destroy(); }, 4000).unref();
+`;
+  const client = (port, maxVersion, session) => new Promise((resolve) => {
+    const child = spawn("node", ["--input-type=module", "-e", RESUME,
+      JSON.stringify([port, CA, ROGUE_CERT, ROGUE_KEY, maxVersion, session])], { stdio: ["ignore", "pipe", "inherit"] });
+    let text = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (d) => { text += d; });
+    child.on("close", () => resolve(JSON.parse(text)));
+  });
+  for (const maxVersion of ["TLSv1.3", "TLSv1.2"]) {
+    const events = [];
+    const server = tls.createServer({ key: KEY, cert: CERT, requestCert: true, rejectUnauthorized: false, ca: [CA] }, (socket) => {
+      const peer = socket.getPeerCertificate();
+      events.push("secureConnection authorized=" + socket.authorized + " authorizationError=" +
+        socket.authorizationError + " peer=" + (peer.subject ? peer.subject.CN : "none"));
+      socket.end("hello");
+    });
+    server.on("tlsClientError", (e) => events.push("tlsClientError " + e.code));
+    const port = await listen(server);
+    const first = await client(port, maxVersion);
+    console.log("stricter server " + maxVersion + " | first: " + JSON.stringify(first.out) + " session=" + !!first.session);
+    server.rejectUnauthorized = true;
+    const resumed = await client(port, maxVersion, first.session);
+    console.log("stricter server " + maxVersion + " | resumed: " + JSON.stringify(resumed.out));
+    const fresh = await client(port, maxVersion);
+    console.log("stricter server " + maxVersion + " | new handshake: " + JSON.stringify(fresh.out));
+    await new Promise((r) => setTimeout(r, 100));
+    server.close();
+    for (const e of events) console.log("  server " + e);
+  }
+}
