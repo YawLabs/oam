@@ -68,6 +68,18 @@ des = { workspace = true }
 tokio-rustls = { workspace = true }
 webpki-roots = { workspace = true }
 rustls-pemfile = { workspace = true }
+# node:tls's CA certificate lists (tls/roots.rs) and the chain a lone leaf is
+# served with (tls/chain.rs). webpki-root-certs is webpki-roots' Mozilla
+# store as whole certificates: already in the lock file (rustls-platform-
+# verifier builds it for wasm), now compiled on the shipped targets too --
+# 1.0.7, CDLA-Permissive-2.0 like webpki-roots, and its only dependency,
+# rustls-pki-types, is already built. rustls-native-certs 0.8.4 already
+# compiles on Linux (via rustls-platform-verifier); on macOS it adds nothing
+# new (security-framework is in the graph) and on Windows it compiles
+# schannel 0.1.29 (MIT, already attributed), whose one dependency,
+# windows-sys 0.61, is already built. No package is new to the lock file.
+webpki-root-certs = { workspace = true }
+rustls-native-certs = { workspace = true }
 # Node's certificate verdicts (tls.rs): x509-parser reads validity,
 # issuer/subject and subjectAltName off the peer chain to name a refusal the
 # way OpenSSL does and to run Node's own hostname check; rustls-webpki is

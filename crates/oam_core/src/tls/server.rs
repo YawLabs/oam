@@ -177,6 +177,17 @@ impl ContextError {
         )
     }
 
+    /// `ERR_OSSL_WRONG_FINAL_BLOCK_LENGTH`: an encrypted legacy PEM key whose
+    /// ciphertext is not a whole number of cipher blocks (a truncated one).
+    pub(crate) fn wrong_final_block_length() -> Self {
+        Self::openssl(
+            "1C80006B",
+            "Provider routines",
+            "wrong final block length",
+            "ERR_OSSL_WRONG_FINAL_BLOCK_LENGTH",
+        )
+    }
+
     /// `ERR_OSSL_PEM_NO_START_LINE`: a `cert` with no certificate in it.
     fn no_start_line() -> Self {
         Self::openssl(
@@ -216,6 +227,21 @@ pub struct ServerContext {
     /// No certificate / key pair to serve: Node creates the server and fails
     /// each handshake.
     has_identity: bool,
+    /// The context's certificate store: the `ca` option's certificates and a
+    /// pfx's, or None for Node's default store. What
+    /// `getPeerCertificate(true)` looks a client chain's last issuer up in.
+    store: Option<Vec<CertificateDer<'static>>>,
+}
+
+impl ServerContext {
+    /// The certificates of this context's store, as `chain::store_issuers`
+    /// takes them.
+    fn store(&self) -> Vec<&CertificateDer<'static>> {
+        match &self.store {
+            Some(store) => store.iter().collect(),
+            None => super::chain::default_store().iter().collect(),
+        }
+    }
 }
 
 impl ServerContext {
@@ -263,8 +289,34 @@ impl ServerContext {
     }
 }
 
-/// Build a server's context, or the error Node throws at `createServer()`.
-pub fn build_server_context(spec: &ServerContextSpec) -> Result<ServerContext, ContextError> {
+/// What a secure context serves as its own identity: each key with the chain
+/// it goes out with, and the CA certificates any pfx brought.
+pub(crate) struct Identities {
+    pub(crate) certified: Vec<Arc<CertifiedKey>>,
+    pub(crate) pfx_cas: Vec<CertificateDer<'static>>,
+}
+
+/// The `ca` option's certificates as Node's context reads them: what parses,
+/// the rest ignored (a `ca` of garbage does not throw; measured).
+pub(crate) fn ca_certificates(ca: &[String]) -> Vec<CertificateDer<'static>> {
+    ca.iter()
+        .flat_map(|pem| {
+            rustls_pemfile::certs(&mut BufReader::new(pem.as_bytes()))
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Read a context's `cert`, `key` and `pfx` options as Node's
+/// createSecureContext does -- the errors it throws there, a key that is not
+/// its certificate's included -- and give each key the chain it is sent
+/// with: its `cert` entry's certificates, or, for a certificate given alone,
+/// the chain OpenSSL builds from the context's store (`chain.rs`).
+pub(crate) fn load_identities(
+    spec: &ServerContextSpec,
+    provider: &Arc<rustls::crypto::CryptoProvider>,
+) -> Result<Identities, ContextError> {
     let mut chains = spec
         .certs
         .iter()
@@ -278,13 +330,10 @@ pub fn build_server_context(spec: &ServerContextSpec) -> Result<ServerContext, C
             passphrase,
         )?);
     }
-    let provider = rustls::crypto::CryptoProvider::get_default()
-        .cloned()
-        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
 
     // A pfx carries its own key, its certificate and any CA certificates:
     // its chain is the certificate that is the key's, then the others, and
-    // (Node's LoadPKCS12) those others are trusted CAs of the server too.
+    // (Node's LoadPKCS12) those others are trusted CAs of the context too.
     let mut pfx_cas: Vec<CertificateDer<'static>> = Vec::new();
     for pfx in &spec.pfx {
         let passphrase = pfx.passphrase.as_deref().or(spec.passphrase.as_deref());
@@ -322,9 +371,25 @@ pub fn build_server_context(spec: &ServerContextSpec) -> Result<ServerContext, C
         keys.push(key);
     }
 
+    // A certificate given without its chain goes out with the chain OpenSSL
+    // builds for it from the context's store: the `ca` certificates (or the
+    // bundled roots and NODE_EXTRA_CA_CERTS without one), and a pfx's CAs.
+    if chains.iter().any(|chain| chain.len() == 1) {
+        let ca = spec.ca.as_deref().map(ca_certificates);
+        let mut store: Vec<&CertificateDer<'static>> = match &ca {
+            Some(ca) => ca.iter().collect(),
+            None => super::chain::default_store().iter().collect(),
+        };
+        store.extend(pfx_cas.iter());
+        let now = super::chain::unix_now();
+        for chain in chains.iter_mut().filter(|chain| chain.len() == 1) {
+            *chain = super::chain::complete_chain(&chain[0], &store, now);
+        }
+    }
+
     // Each key serves the chain whose leaf it matches; a key that matches no
     // certificate is Node's mismatch error.
-    let mut identities: Vec<Arc<CertifiedKey>> = Vec::new();
+    let mut certified: Vec<Arc<CertifiedKey>> = Vec::new();
     for key in keys {
         let signing_key = provider
             .key_provider
@@ -340,13 +405,36 @@ pub fn build_server_context(spec: &ServerContextSpec) -> Result<ServerContext, C
             candidate.keys_match().is_ok().then_some(candidate)
         });
         match matched {
-            Some(identity) => identities.push(Arc::new(identity)),
+            Some(identity) => certified.push(Arc::new(identity)),
             None => return Err(ContextError::key_mismatch()),
         }
     }
+    Ok(Identities { certified, pfx_cas })
+}
+
+/// The crypto provider every context is built with.
+pub(crate) fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+    rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()))
+}
+
+/// Build a server's context, or the error Node throws at `createServer()`.
+pub fn build_server_context(spec: &ServerContextSpec) -> Result<ServerContext, ContextError> {
+    let provider = provider();
+    let Identities {
+        certified: identities,
+        pfx_cas,
+    } = load_identities(spec, &provider)?;
     let has_identity = !identities.is_empty();
+    let store = spec.ca.as_deref().map(|ca| {
+        let mut store = ca_certificates(ca);
+        store.extend(pfx_cas.iter().cloned());
+        store
+    });
     let judge = Arc::new(ClientCertJudge::new(spec.ca.as_deref(), &pfx_cas));
-    let resolver: Arc<dyn rustls::server::ResolvesServerCert> = Arc::new(Identities(identities));
+    let resolver: Arc<dyn rustls::server::ResolvesServerCert> =
+        Arc::new(ServedIdentities(identities));
 
     let versions = protocol_versions(
         Some(spec.min_version.as_str()).filter(|v| !v.is_empty()),
@@ -370,6 +458,7 @@ pub fn build_server_context(spec: &ServerContextSpec) -> Result<ServerContext, C
         resolver,
         judge,
         has_identity,
+        store,
     })
 }
 
@@ -388,9 +477,9 @@ fn parse_cert_chain(pem: &str) -> Result<Vec<CertificateDer<'static>>, ContextEr
 /// The server's certificates: the first whose key can sign with a scheme the
 /// client offers (OpenSSL picks among a context's certificates the same way).
 #[derive(Debug)]
-struct Identities(Vec<Arc<CertifiedKey>>);
+struct ServedIdentities(Vec<Arc<CertifiedKey>>);
 
-impl rustls::server::ResolvesServerCert for Identities {
+impl rustls::server::ResolvesServerCert for ServedIdentities {
     fn resolve(&self, hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         let schemes = hello.signature_schemes();
         self.0
@@ -548,16 +637,7 @@ impl ClientCertJudge {
         let mut hints = Vec::new();
         let mut trusted_leaves: Vec<CertificateDer<'static>> = match ca {
             Some(ca) => {
-                // Node reads what it can of `ca` and ignores the rest (a
-                // `ca` of garbage does not throw; measured).
-                let certs: Vec<CertificateDer<'static>> = ca
-                    .iter()
-                    .flat_map(|pem| {
-                        rustls_pemfile::certs(&mut BufReader::new(pem.as_bytes()))
-                            .filter_map(Result::ok)
-                            .collect::<Vec<_>>()
-                    })
-                    .collect();
+                let certs = ca_certificates(ca);
                 for cert in &certs {
                     if let Ok((_, parsed)) = parse_x509_certificate(cert.as_ref()) {
                         hints.push(rustls::DistinguishedName::from(
@@ -1070,6 +1150,10 @@ pub struct HandshakeInfo {
     /// The client's chain, leaf first, base64 DER (what
     /// `getPeerCertificate()` is built from).
     pub peer_certificates: Option<Vec<String>>,
+    /// The issuers of that chain's last certificate that the server's store
+    /// holds, base64 DER -- where Node's `getPeerCertificate(true)` goes on
+    /// (`GetLastIssuedCert`).
+    pub store_issuers: Option<Vec<String>>,
 }
 
 impl HandshakeInfo {
@@ -1086,6 +1170,9 @@ impl HandshakeInfo {
         });
         if let Some(chain) = &self.peer_certificates {
             info["peerCertificates"] = serde_json::Value::from(chain.clone());
+        }
+        if let Some(issuers) = &self.store_issuers {
+            info["storeIssuers"] = serde_json::Value::from(issuers.clone());
         }
         info
     }
@@ -1220,6 +1307,11 @@ pub async fn accept_stream(
         .unwrap_or_default();
     let peer_chain = server_conn.peer_certificates();
     let peer_certificates = peer_certificates_b64(peer_chain);
+    let store_issuers = peer_chain.and_then(|chain| {
+        let issuers =
+            super::chain::store_issuers(chain, &context.store(), super::chain::unix_now());
+        peer_certificates_b64(Some(&issuers))
+    });
     let alpn = server_conn
         .alpn_protocol()
         .map(|p| p.iter().map(|&b| char::from(b)).collect::<String>());
@@ -1250,6 +1342,7 @@ pub async fn accept_stream(
             authorized,
             authorization_error,
             peer_certificates,
+            store_issuers,
         },
     ))
 }

@@ -14895,16 +14895,17 @@
     }
     return out;
   }
+  // Node's translatePeerCertificate reading of the infoAccess text: each
+  // "KEY:VALUE" line, a value printed as a JSON string literal (a name with
+  // a comma, a quote or a control character in it) parsed back.
   function x509InfoAccessObject(text) {
     var out = Object.create(null);
-    var lines = text.split("\n");
-    for (var i = 0; i < lines.length; i++) {
-      var colon = lines[i].indexOf(":");
-      if (colon < 0) continue;
-      var key = lines[i].slice(0, colon), value = lines[i].slice(colon + 1);
+    text.replace(/([^\n:]*):([^\n]*)(?:\n|$)/g, function(all, key, value) {
+      if (value.charCodeAt(0) === 0x22) value = JSON.parse(value);
       if (key in out) out[key].push(value);
       else out[key] = [value];
-    }
+      return all;
+    });
     return out;
   }
   function x509LegacyObject(parsed) {
@@ -18626,6 +18627,7 @@
       return options.rejectUnauthorized === false ||
         options.ca != null || options.cert != null || options.key != null ||
         options.pfx != null || options.servername != null ||
+        options.secureContext != null ||
         typeof options.checkServerIdentity === "function" ||
         options.minVersion != null || options.maxVersion != null ||
         options.secureProtocol != null;
@@ -29648,6 +29650,9 @@
         // key-exchange group behind getEphemeralKeyInfo(). _isServer marks
         // the accept loop's sockets, where Node reports no key info.
         this._peerCertificates = null;
+        // The issuers of the chain's last certificate from the connection's
+        // store (base64 DER), which getPeerCertificate(true) goes on to.
+        this._storeIssuers = null;
         // Parsed form of _peerCertificates, filled lazily and per index by
         // _parsedPeerCert so getPeerCertificate does not re-decode the same
         // DER on every call; dropped whenever the chain is (re)set.
@@ -29881,10 +29886,9 @@
       // Node's legacy object for the peer's leaf, a fresh one per call; {}
       // when the peer sent no certificate (before the handshake; a server
       // whose client sent none). `detailed` links each certificate to the
-      // next in the chain through issuerCertificate, and the last one to
-      // itself when it is self-issued. Node would otherwise look the last
-      // issuer up in the trust store; oam has no store to consult, so a
-      // chain ending in a certificate the peer did not send stops there.
+      // next in the chain through issuerCertificate: the peer's own, then
+      // the issuers the connection's store holds for the last of them, and
+      // the last one to itself when it is self-issued.
       getPeerCertificate(detailed) {
         if (this.destroyed) return null;
         var chain = this._peerCertificates;
@@ -29898,8 +29902,7 @@
         if (detailed) {
           // Node's AddIssuerChainToObject: from the leaf, find its issuer
           // among the remaining certificates (X509_check_issued), link, and
-          // go on from that one; the last links to itself when it issued
-          // itself.
+          // go on from that one.
           var rest = [];
           for (var j = 1; j < parsed.length; j++) rest.push(j);
           var current = 0;
@@ -29913,7 +29916,18 @@
             current = rest[found];
             rest.splice(found, 1);
           }
-          if (x509IssuedBy(parsed[current], parsed[current])) objects[current].issuerCertificate = objects[current];
+          // GetLastIssuedCert: then the store's issuers, each the last one's.
+          var lastParsed = parsed[current];
+          var lastObject = objects[current];
+          var store = this._storeIssuers || [];
+          for (var k = 0; k < store.length; k++) {
+            var issuerParsed = natives.cryptoX509Parse(new Uint8Array(globalThis.Buffer.from(store[k], "base64")));
+            var issuerObject = x509LegacyObject(issuerParsed);
+            lastObject.issuerCertificate = issuerObject;
+            lastParsed = issuerParsed;
+            lastObject = issuerObject;
+          }
+          if (x509IssuedBy(lastParsed, lastParsed)) lastObject.issuerCertificate = lastObject;
         }
         return objects[0];
       }
@@ -30276,15 +30290,17 @@
         return;
       }
       var wrap = socket._wrappedSocket;
-      var ca = options.ca == null ? undefined
-        : Array.isArray(options.ca) ? options.ca.map(String).join("\n") : String(options.ca);
-      var cert = options.cert != null ? String(options.cert) : undefined;
-      var key = options.key != null ? String(options.key) : undefined;
       var rejectUnauthorized = options.rejectUnauthorized !== false;
-      var tlsVersions = resolveTlsVersions(options);
+      // As _connectTls: the identity check, then the secure context.
+      var identityCheck = identityCheckOf(options);
+      var context = secureContextOf(options);
+      var secure = context.context[kContextState];
+      var ca = secure.ca;
+      var tlsVersions = secure.versions;
       var alpn = alpnProtocolNames(options.ALPNProtocols);
       var name = options.servername || options.host || wrap._host || "localhost";
       if (callback) socket.once(event, callback);
+      socket._secureContext = context;
       socket._connectPending = true;
       var pipe = natives.tlsPipeOpen();
       socket._tlsPipe = pipe;
@@ -30294,14 +30310,15 @@
         var connecting;
         try {
           connecting = natives.tlsConnectOver(
-            pipe, name, ca, rejectUnauthorized, cert, key, tlsVersions.min, tlsVersions.max,
-            alpn,
+            pipe, name, ca, rejectUnauthorized,
+            secure.id === null ? undefined : secure.id, identityCheck === null,
+            tlsVersions.min, tlsVersions.max, alpn,
           );
         } catch (err) {
           process.nextTick(() => socket.destroy(err));
           return;
         }
-        _settleTlsConnect(socket, connecting, name, options, rejectUnauthorized);
+        _settleTlsConnect(socket, connecting, name, options, rejectUnauthorized, identityCheck, name);
       };
       if (wrap.connecting) {
         wrap.once("connect", () => {
@@ -30375,15 +30392,18 @@
       var host = options.host || options.hostname || "localhost";
       var port = options.port || 443;
       var serverName = options.servername || host;
-      // Node takes `ca` as one PEM (string or Buffer) or an array of them.
-      var ca = options.ca == null ? undefined
-        : Array.isArray(options.ca) ? options.ca.map(String).join("\n") : String(options.ca);
-      var cert = options.cert != null ? String(options.cert) : undefined;
-      var key = options.key != null ? String(options.key) : undefined;
       var rejectUnauthorized = options.rejectUnauthorized !== false;
-      // Throws synchronously for an invalid version / method / conflict, as
-      // Node does at tls.connect(); the effective range goes to the native.
-      var tlsVersions = resolveTlsVersions(options);
+      // node's tls.connect, in its order, synchronously: the identity check
+      // must be a function; then the secure context is `secureContext` or
+      // one built from the options -- which throws for a version, key,
+      // certificate or pfx it cannot use, as createSecureContext does -- and
+      // the connection is made with that context's trust (`ca`), version
+      // range and certificate, whatever else the options say.
+      var identityCheck = identityCheckOf(options);
+      var context = secureContextOf(options);
+      var secure = context.context[kContextState];
+      var ca = secure.ca;
+      var tlsVersions = secure.versions;
       var alpn = alpnProtocolNames(options.ALPNProtocols);
 
       if (socket._connectPending || tlsIdOf(socket) !== null) {
@@ -30405,6 +30425,7 @@
         socket._reading = false;
       }
       if (callback) socket.once(event, callback);
+      socket._secureContext = context;
       socket.connecting = true;
       // A `path` names a pipe in node, never host:port (see net's
       // refusePipeConnect).
@@ -30426,7 +30447,8 @@
         var connecting;
         try {
           connecting = natives.tlsConnect(
-            host, port, serverName, ca, rejectUnauthorized, cert, key,
+            host, port, serverName, ca, rejectUnauthorized,
+            secure.id === null ? undefined : secure.id, identityCheck === null,
             tlsVersions.min, tlsVersions.max, attemptTimeout,
             spec === null ? undefined : JSON.stringify(spec),
             local, alpn,
@@ -30437,21 +30459,169 @@
           process.nextTick(() => socket.destroy(err));
           return;
         }
-        _settleTlsConnect(socket, connecting, serverName, options, rejectUnauthorized);
+        _settleTlsConnect(socket, connecting, serverName, options, rejectUnauthorized,
+          identityCheck, options.servername || options.host || "localhost");
       };
       registry._netLookupAndConnect(socket, options, host, port, dial);
     }
 
-    // tls.checkServerIdentity: rustls has already matched the name against
-    // the certificate by the time a caller could ask, so this answers
-    // "matches"; a caller's own checkServerIdentity that calls it and then
-    // adds a pin works as in node.
-    function stubCheckServerIdentity() {
-      return undefined;
+    // ---- tls.checkServerIdentity: node's lib/tls.js (v22.22.2), line for
+    // line. It reads the certificate object's `subjectaltname` -- which oam
+    // prints as node does, a name that could be taken for more than one
+    // (a comma, a quote, a control character) as a JSON string literal, so
+    // a DNS name can never be read out of a URI or a directory name -- and
+    // `subject.CN`, and answers undefined for a match or node's
+    // ERR_TLS_CERT_ALTNAME_INVALID (reason, host, cert) for a mismatch.
+    function unfqdn(host) {
+      return host.replace(/[.]$/, "");
+    }
+    // String#toLowerCase() is locale-sensitive: node lowercases A-Z only.
+    function lowerAZ(c) {
+      return String.fromCharCode(32 + c.charCodeAt(0));
+    }
+    function splitHost(host) {
+      return unfqdn(host).replace(/[A-Z]/g, lowerAZ).split(".");
+    }
+    function checkHostPattern(hostParts, pattern, wildcards) {
+      // Empty strings, null, undefined, etc. never match.
+      if (!pattern) return false;
+      var patternParts = splitHost(pattern);
+      if (hostParts.length !== patternParts.length) return false;
+      // Pattern has empty components, e.g. "bad..example.com".
+      if (patternParts.includes("")) return false;
+      // RFC 6125 allows IDNA U-labels (Unicode) in names but node has no
+      // good way to detect their encoding or normalize them, so it rejects
+      // them; control characters and blanks too.
+      var isBad = function(part) { return /[^\u0021-\u007F]/u.test(part); };
+      if (patternParts.some(isBad)) return false;
+      // Check host parts from right to left first.
+      for (var i = hostParts.length - 1; i > 0; i -= 1) {
+        if (hostParts[i] !== patternParts[i]) return false;
+      }
+      var hostSubdomain = hostParts[0];
+      var patternSubdomain = patternParts[0];
+      var patternSubdomainParts = patternSubdomain.split("*", 3);
+      // Short-circuit when the subdomain does not contain a wildcard. RFC
+      // 6125 does not allow wildcard substitution for components containing
+      // IDNA A-labels (Punycode), so those match verbatim.
+      if (patternSubdomainParts.length === 1 || patternSubdomain.includes("xn--")) {
+        return hostSubdomain === patternSubdomain;
+      }
+      if (!wildcards) return false;
+      // More than one wildcard is always wrong.
+      if (patternSubdomainParts.length > 2) return false;
+      // *.tld wildcards are not allowed.
+      if (patternParts.length <= 2) return false;
+      var prefix = patternSubdomainParts[0];
+      var suffix = patternSubdomainParts[1];
+      if (prefix.length + suffix.length > hostSubdomain.length) return false;
+      if (!hostSubdomain.startsWith(prefix)) return false;
+      if (!hostSubdomain.endsWith(suffix)) return false;
+      return true;
+    }
+    // Any valid JSON string literal (ECMA-404 / RFC 8259), and only those.
+    // eslint-disable-next-line no-control-regex
+    var jsonStringPattern = /^"(?:[^"\\\u0000-\u001f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"/;
+    function splitEscapedAltNames(altNames) {
+      var result = [];
+      var currentToken = "";
+      var offset = 0;
+      while (offset !== altNames.length) {
+        var nextSep = altNames.indexOf(",", offset);
+        var nextQuote = altNames.indexOf('"', offset);
+        if (nextQuote !== -1 && (nextSep === -1 || nextQuote < nextSep)) {
+          // A quote, and no separator before it.
+          currentToken += altNames.substring(offset, nextQuote);
+          var match = jsonStringPattern.exec(altNames.substring(nextQuote));
+          if (!match) {
+            var format = new SyntaxError("Invalid subject alternative name string");
+            throw applyNodeErrorShape(format, "ERR_TLS_CERT_ALTNAME_FORMAT");
+          }
+          currentToken += JSON.parse(match[0]);
+          offset = nextQuote + match[0].length;
+        } else if (nextSep !== -1) {
+          // A separator, and no quote before it.
+          currentToken += altNames.substring(offset, nextSep);
+          result.push(currentToken);
+          currentToken = "";
+          offset = nextSep + 2;
+        } else {
+          currentToken += altNames.substring(offset);
+          offset = altNames.length;
+        }
+      }
+      result.push(currentToken);
+      return result;
+    }
+    function checkServerIdentity(hostname, cert) {
+      var subject = cert.subject;
+      var altNames = cert.subjectaltname;
+      var dnsNames = [];
+      var ips = [];
+      hostname = "" + hostname;
+      if (altNames) {
+        var splitAltNames = altNames.includes('"') ? splitEscapedAltNames(altNames) : altNames.split(", ");
+        splitAltNames.forEach(function(name) {
+          if (name.startsWith("DNS:")) {
+            dnsNames.push(name.slice(4));
+          } else if (name.startsWith("IP Address:")) {
+            ips.push(natives.tlsCanonicalizeIp(name.slice(11)));
+          }
+        });
+      }
+      var valid = false;
+      var reason = "Unknown reason";
+      hostname = unfqdn(hostname); // Remove trailing dot for error messages.
+      if (registry.get("net").isIP(hostname)) {
+        valid = ips.includes(natives.tlsCanonicalizeIp(hostname));
+        if (!valid) reason = "IP: " + hostname + " is not in the cert's list: " + ips.join(", ");
+      } else if (dnsNames.length > 0 || (subject != null && subject.CN)) {
+        var hostParts = splitHost(hostname);
+        var wildcard = function(pattern) { return checkHostPattern(hostParts, pattern, true); };
+        if (dnsNames.length > 0) {
+          valid = dnsNames.some(wildcard);
+          if (!valid) reason = "Host: " + hostname + ". is not in the cert's altnames: " + altNames;
+        } else {
+          // Match against Common Name only if no supported identifiers exist.
+          var cn = subject.CN;
+          if (Array.isArray(cn)) valid = cn.some(wildcard);
+          else if (cn) valid = wildcard(cn);
+          if (!valid) reason = "Host: " + hostname + ". is not cert's CN: " + cn;
+        }
+      } else {
+        reason = "Cert does not contain a DNS name";
+      }
+      if (!valid) {
+        var mismatch = new Error("Hostname/IP does not match certificate's altnames: " + reason);
+        applyNodeErrorShape(mismatch, "ERR_TLS_CERT_ALTNAME_INVALID");
+        mismatch.reason = reason;
+        mismatch.host = hostname;
+        mismatch.cert = cert;
+        return mismatch;
+      }
+    }
+
+    // The identity check a client connection runs -- node's tls.connect
+    // defaults `checkServerIdentity` to tls.checkServerIdentity (as the
+    // module has it when the connection is made; an own property of the
+    // options wins, undefined included) and refuses one that is not a
+    // function. null means tls.checkServerIdentity itself: the native
+    // verifier runs that same algorithm on the certificate's DER. Any other
+    // function is called with the peer's certificate once the chain is
+    // trusted, and the native side leaves the name to it.
+    function identityCheckOf(options) {
+      var check = Object.prototype.propertyIsEnumerable.call(options, "checkServerIdentity")
+        ? options.checkServerIdentity
+        : tlsExports.checkServerIdentity;
+      if (typeof check !== "function") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.checkServerIdentity", "Function", check);
+      }
+      return check === checkServerIdentity ? null : check;
     }
 
     // The native tls connect in flight, settled onto `socket`.
-    function _settleTlsConnect(socket, connecting, serverName, options, rejectUnauthorized) {
+    function _settleTlsConnect(socket, connecting, serverName, options, rejectUnauthorized,
+      identityCheck, hostname) {
       connecting.then(
         (info) => {
           socket._connectPending = false;
@@ -30462,12 +30632,6 @@
             return;
           }
           var wrapped = socket._wrappedSocket;
-          if (wrapped !== null) {
-            socket._handle._tlsId = info.handle;
-          } else {
-            socket._handle = info.handle;
-          }
-          socket.connecting = false;
           // Node: `authorized` is the verifier's verdict even with
           // rejectUnauthorized:false, and `authorizationError` its code
           // (null on an accepted certificate).
@@ -30478,8 +30642,37 @@
           socket._cipherStandardName = info.cipherStandardName || null;
           socket._peerCertificates = info.peerCertificates || null;
           socket._peerParsed = null;
+          socket._storeIssuers = info.storeIssuers || null;
           socket._ephemeralKeyInfo = info.ephemeralKeyInfo || null;
           socket.alpnProtocol = info.alpnProtocol || false;
+          // node's onConnectSecure: a certificate the chain check accepted
+          // is handed to `checkServerIdentity(hostname, cert)` -- the
+          // caller's own name or pinning check -- and an Error it returns
+          // makes the socket unauthorized; with rejectUnauthorized the
+          // connection fails with it. It runs before the connection is the
+          // socket's, so nothing written while connecting reaches a peer it
+          // refuses (node sends none either). node's own
+          // tls.checkServerIdentity (identityCheck null) ran natively, in the
+          // verifier.
+          if (socket.authorized && identityCheck !== null) {
+            var identityError = identityCheck(hostname, socket.getPeerCertificate(true));
+            if (identityError) {
+              socket.authorized = false;
+              socket.authorizationError = identityError.code || identityError.message;
+              if (rejectUnauthorized) {
+                try { natives.tlsClose(info.handle); } catch (_) { /* noop */ }
+                socket.connecting = false;
+                socket.destroy(identityError);
+                return;
+              }
+            }
+          }
+          if (wrapped !== null) {
+            socket._handle._tlsId = info.handle;
+          } else {
+            socket._handle = info.handle;
+          }
+          socket.connecting = false;
           if (wrapped !== null) {
             // The transport's addresses: a TLS socket over a net.Socket
             // reports that socket's (a JS stream has none).
@@ -30508,25 +30701,6 @@
           // A 'connect' listener that destroyed the socket (a guard vetting
           // the peer) ends it there: no 'secureConnect', nothing read.
           if (socket.destroyed) return;
-          // node's onConnectSecure: a certificate the chain check accepted
-          // is handed to `checkServerIdentity(hostname, cert)` -- the
-          // caller's own identity or pinning check -- and an Error it returns
-          // makes the socket unauthorized; with rejectUnauthorized the socket
-          // is destroyed with it before 'secureConnect'. The host name check
-          // node's default does is rustls's, already applied.
-          var identityCheck = options && options.checkServerIdentity;
-          if (socket.authorized && typeof identityCheck === "function" && identityCheck !== stubCheckServerIdentity) {
-            var hostname = options.servername || options.host || "localhost";
-            var identityError = identityCheck(hostname, socket.getPeerCertificate(true));
-            if (identityError) {
-              socket.authorized = false;
-              socket.authorizationError = identityError.code || identityError.message;
-              if (rejectUnauthorized) {
-                socket.destroy(identityError);
-                return;
-              }
-            }
-          }
           if (wrapped === null) socket.emit("ready");
           socket.emit("secureConnect");
           // node's internal 'secure', whose first listener emits
@@ -30588,8 +30762,97 @@
     var stockTlsSocketConnect = TLSSocket.prototype.connect;
     registry._tlsStock = { connect, socketConnect: stockTlsSocketConnect };
 
+    // ---- tls.SecureContext / tls.createSecureContext (node's
+    // lib/_tls_common.js). A context is what a client connection is secured
+    // with: its trust (`ca`, else the default store), its version range, and
+    // its certificate -- the key, cert and pfx options read when the context
+    // is built, as node reads them: a key that cannot be decrypted or read,
+    // a certificate that is not one and a key that is not the certificate's
+    // throw here, with node's codes, not at the handshake. The native half
+    // (`.context`, a SecureContext object as in node) holds the loaded
+    // certificate, freed with it.
+    var kContextState = Symbol("oamSecureContextState");
+    var clientContexts = typeof FinalizationRegistry === "function"
+      ? new FinalizationRegistry(function(id) { natives.tlsClientContextFree(id); })
+      : null;
+    var NativeSecureContext = function SecureContext() {};
+    function SecureContext(secureProtocol, secureOptions, minVersion, maxVersion) {
+      if (!(this instanceof SecureContext)) {
+        return new SecureContext(secureProtocol, secureOptions, minVersion, maxVersion);
+      }
+      var versions = resolveTlsVersions({
+        secureProtocol: secureProtocol, minVersion: minVersion, maxVersion: maxVersion,
+      });
+      this.context = new NativeSecureContext();
+      Object.defineProperty(this.context, kContextState, {
+        value: { ca: undefined, versions: versions, id: null },
+      });
+    }
+    function secureContextError(failure) {
+      var e = new Error(failure.message);
+      if (failure.library !== undefined) e.library = failure.library;
+      if (failure.reason !== undefined) e.reason = failure.reason;
+      if (failure.code !== undefined) e.code = failure.code;
+      return e;
+    }
     function createSecureContext(options) {
-      return Object.assign({}, options);
+      if (!options) options = {};
+      var context = new SecureContext(options.secureProtocol, undefined, options.minVersion, options.maxVersion);
+      if (typeof options !== "object" || Array.isArray(options)) {
+        throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+      }
+      var state = context.context[kContextState];
+      var spec = secureContextSpec(options, state.versions);
+      state.ca = spec.ca === null ? undefined : spec.ca.join("\n");
+      if (spec.certs.length > 0 || spec.keys.length > 0 || spec.pfx.length > 0) {
+        var built = JSON.parse(natives.tlsClientContext(JSON.stringify(spec)));
+        if (built.error) throw secureContextError(built.error);
+        state.id = built.id;
+        if (clientContexts) clientContexts.register(context.context, built.id);
+      }
+      return context;
+    }
+    // A connection's context: `secureContext` as given (it must be one), or
+    // one built from the connect options.
+    function secureContextOf(options) {
+      var context = options.secureContext;
+      if (!context) return createSecureContext(options);
+      if (context === null || typeof context !== "object" ||
+          !(context.context instanceof NativeSecureContext)) {
+        throw nodeTypeError("context must be a SecureContext", "ERR_TLS_INVALID_CONTEXT");
+      }
+      return context;
+    }
+
+    // ---- tls.rootCertificates / tls.getCACertificates (node's lib/tls.js):
+    // frozen arrays of PEM strings, each built once. `bundled` is the root
+    // store oam's client trusts by default (tls/roots.rs); `default` is it
+    // plus NODE_EXTRA_CA_CERTS, as node composes it.
+    var caCertificateCache = { __proto__: null };
+    function caCertificatesOf(kind) {
+      if (caCertificateCache[kind] === undefined) {
+        caCertificateCache[kind] = Object.freeze(natives.tlsCaCertificates(kind));
+      }
+      return caCertificateCache[kind];
+    }
+    var defaultCaCertificates;
+    function getCACertificates(type = "default") {
+      if (typeof type !== "string") throw codes.ERR_INVALID_ARG_TYPE("type", "string", type);
+      switch (type) {
+        case "default":
+          if (defaultCaCertificates === undefined) {
+            var list = caCertificatesOf("bundled").slice();
+            if (process.env.NODE_EXTRA_CA_CERTS) list.push.apply(list, caCertificatesOf("extra"));
+            defaultCaCertificates = Object.freeze(list);
+          }
+          return defaultCaCertificates;
+        case "bundled":
+        case "system":
+        case "extra":
+          return caCertificatesOf(type);
+        default:
+          throw codes.ERR_INVALID_ARG_VALUE("type", type);
+      }
     }
 
     // ---- tls.Server ----
@@ -30759,14 +31022,7 @@
     // carry `library`, `reason` and `code`; a PKCS#12 bundle's are plain.
     function buildServerContext(options, versions) {
       var built = JSON.parse(natives.tlsServerContext(JSON.stringify(secureContextSpec(options, versions))));
-      if (built.error) {
-        var failure = built.error;
-        var e = new Error(failure.message);
-        if (failure.library !== undefined) e.library = failure.library;
-        if (failure.reason !== undefined) e.reason = failure.reason;
-        if (failure.code !== undefined) e.code = failure.code;
-        throw e;
-      }
+      if (built.error) throw secureContextError(built.error);
       return built.id;
     }
     // A context lives as long as the server that built it.
@@ -30791,6 +31047,7 @@
       socket._cipherStandardName = info.cipherStandardName || null;
       socket._peerCertificates = info.peerCertificates || null;
       socket._peerParsed = null;
+      socket._storeIssuers = info.storeIssuers || null;
       socket.alpnProtocol = info.alpnProtocol == null ? false : info.alpnProtocol;
       socket.servername = info.servername == null ? false : info.servername;
       var remote = info.remoteAddr || accepted.remoteAddr;
@@ -31048,6 +31305,7 @@
       socket._cipherStandardName = info.cipherStandardName || null;
       socket._peerCertificates = info.peerCertificates || null;
       socket._peerParsed = null;
+      socket._storeIssuers = info.storeIssuers || null;
       socket._ephemeralKeyInfo = null;
       var proto = TLSSocket.prototype;
       socket.getProtocol = proto.getProtocol;
@@ -31067,19 +31325,28 @@
       serverSocketView: serverSocketView,
     };
 
-    return {
+    var tlsExports = {
       connect,
       createServer,
       createSecureContext,
+      SecureContext,
       Server,
       TLSSocket,
       DEFAULT_ECDH_CURVE: "auto",
       DEFAULT_MAX_VERSION: "TLSv1.3",
       DEFAULT_MIN_VERSION: "TLSv1.2",
-      rootCertificates: [],
       getCiphers: () => ["TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256"],
-      checkServerIdentity: stubCheckServerIdentity,
+      getCACertificates,
+      checkServerIdentity,
     };
+    // node: a getter (enumerable, not configurable) that builds the frozen
+    // list on first use.
+    Object.defineProperty(tlsExports, "rootCertificates", {
+      configurable: false,
+      enumerable: true,
+      get: function() { return caCertificatesOf("bundled"); },
+    });
+    return tlsExports;
   };
 
   // --------------------------------------------------------- worker_threads

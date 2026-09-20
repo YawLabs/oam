@@ -2513,33 +2513,6 @@ fn asn1_time_openssl(secs: i64) -> String {
     )
 }
 
-/// Node's spelling of a GeneralName in subjectAltName and infoAccess
-/// (probed): "DNS:", "IP Address:" -- a dotted quad, or IPv6 as uppercase
-/// hex groups with no zero compression ("0:0:0:0:0:0:0:1") -- "email:",
-/// "URI:". "Registered ID:" and "othername:<unsupported>" follow Node's
-/// printer unprobed; the rest keep the parser's Debug form.
-fn general_name_string(gn: &x509_parser::extensions::GeneralName<'_>) -> String {
-    use x509_parser::extensions::GeneralName;
-    match gn {
-        GeneralName::DNSName(s) => format!("DNS:{s}"),
-        GeneralName::IPAddress(b) if b.len() == 4 => {
-            format!("IP Address:{}.{}.{}.{}", b[0], b[1], b[2], b[3])
-        }
-        GeneralName::IPAddress(b) if b.len() == 16 => {
-            let groups: Vec<String> = b
-                .chunks(2)
-                .map(|pair| format!("{:X}", u16::from_be_bytes([pair[0], pair[1]])))
-                .collect();
-            format!("IP Address:{}", groups.join(":"))
-        }
-        GeneralName::RFC822Name(s) => format!("email:{s}"),
-        GeneralName::URI(s) => format!("URI:{s}"),
-        GeneralName::RegisteredID(oid) => format!("Registered ID:{}", oid.to_id_string()),
-        GeneralName::OtherName(..) => "othername:<unsupported>".to_string(),
-        other => format!("{other:?}"),
-    }
-}
-
 /// The extended-key-usage OIDs in certificate order -- Node's `keyUsage` and
 /// the legacy `ext_key_usage`. x509-parser's parsed form keeps flags, not
 /// order, so the SEQUENCE OF OBJECT IDENTIFIER is read by hand.
@@ -2758,7 +2731,6 @@ pub(crate) fn op_crypto_x509_parse(
     }
 
     let mut basic_constraints: Option<bool> = None;
-    let mut san_formatted: Option<String> = None;
     let mut ku_list: Vec<&str> = Vec::new();
     // The pieces of OpenSSL's X509_check_issued that decide whether one
     // certificate issued another (the legacy object's issuerCertificate
@@ -2766,20 +2738,31 @@ pub(crate) fn op_crypto_x509_parse(
     // KeyUsage extension is present at all.
     let mut key_cert_sign: Option<bool> = None;
     let mut ext_key_usage: Option<Vec<String>> = None;
-    let mut info_access: Option<String> = None;
     let mut subject_key_id: Option<String> = None;
     let mut authority_key_id: Option<String> = None;
+
+    // subjectAltName and infoAccess are printed off the extension's DER as
+    // Node prints them (oam_core::tls::names): each name that could be read
+    // as more than one -- a comma, a quote, a control character -- is a JSON
+    // string literal, so a list split on ", " (tls.checkServerIdentity's)
+    // can never find a `DNS:` entry inside a URI or a directory name. The
+    // first extension of each kind is the one Node prints; one that does not
+    // decode is absent, as in Node.
+    let first_extension = |oid: &str| {
+        cert.extensions()
+            .iter()
+            .find(|ext| ext.oid.to_id_string() == oid)
+            .map(|ext| ext.value)
+    };
+    let san_formatted = first_extension("2.5.29.17").and_then(oam_core::tls::names::alt_names_text);
+    let info_access =
+        first_extension("1.3.6.1.5.5.7.1.1").and_then(oam_core::tls::names::info_access_text);
 
     for ext in cert.extensions() {
         use x509_parser::extensions::ParsedExtension;
         match ext.parsed_extension() {
             ParsedExtension::BasicConstraints(bc) => {
                 basic_constraints = Some(bc.ca);
-            }
-            ParsedExtension::SubjectAlternativeName(san) => {
-                let names: Vec<String> =
-                    san.general_names.iter().map(general_name_string).collect();
-                san_formatted = Some(names.join(", "));
             }
             ParsedExtension::KeyUsage(ku) => {
                 if ku.digital_signature() {
@@ -2807,23 +2790,6 @@ pub(crate) fn op_crypto_x509_parse(
             }
             ParsedExtension::ExtendedKeyUsage(_) => {
                 ext_key_usage = Some(ext_key_usage_oids(ext.value));
-            }
-            ParsedExtension::AuthorityInfoAccess(aia) => {
-                // Node's X509Certificate#infoAccess: "METHOD - LOCATION" per
-                // line, OpenSSL's long names for the two well-known methods.
-                let lines: Vec<String> = aia
-                    .accessdescs
-                    .iter()
-                    .map(|ad| {
-                        let method = match ad.access_method.to_id_string().as_str() {
-                            "1.3.6.1.5.5.7.48.1" => "OCSP".to_string(),
-                            "1.3.6.1.5.5.7.48.2" => "CA Issuers".to_string(),
-                            other => other.to_string(),
-                        };
-                        format!("{method} - {}", general_name_string(&ad.access_location))
-                    })
-                    .collect();
-                info_access = Some(lines.join("\n"));
             }
             ParsedExtension::SubjectKeyIdentifier(id) => {
                 subject_key_id = Some(hex_lower(id.0));
@@ -3028,25 +2994,5 @@ mod x509_legacy_fields {
         );
         assert!(ext_key_usage_oids(&[0x04, 0x00]).is_empty());
         assert!(ext_key_usage_oids(&[0x30, 0x05, 0x06]).is_empty());
-    }
-
-    // Node's subjectAltName spellings (probed): IPv6 as uppercase groups with
-    // no zero compression.
-    #[test]
-    fn general_names_print_like_node() {
-        use x509_parser::extensions::GeneralName;
-        let v6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
-        assert_eq!(
-            general_name_string(&GeneralName::IPAddress(&v6)),
-            "IP Address:2001:DB8:0:0:0:0:0:1"
-        );
-        assert_eq!(
-            general_name_string(&GeneralName::IPAddress(&[127, 0, 0, 1])),
-            "IP Address:127.0.0.1"
-        );
-        assert_eq!(
-            general_name_string(&GeneralName::DNSName("localhost")),
-            "DNS:localhost"
-        );
     }
 }

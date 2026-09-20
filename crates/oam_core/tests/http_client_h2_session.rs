@@ -501,7 +501,7 @@ async fn tls_alpn(port: u16, alpn: Vec<Vec<u8>>) -> Value {
             Some(TLS_TEST_CA_CERT.to_string()),
             true,
             None,
-            None,
+            true,
             None,
             None,
             std::time::Duration::from_millis(250),

@@ -32,11 +32,13 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use x509_parser::certificate::X509Certificate;
-use x509_parser::extensions::GeneralName;
 use x509_parser::parse_x509_certificate;
 use x509_parser::time::ASN1Time;
 
+mod chain;
 mod keys;
+pub mod names;
+pub mod roots;
 pub mod server;
 
 type ClientStream = tokio_rustls::client::TlsStream<tokio::net::TcpStream>;
@@ -80,6 +82,9 @@ pub struct TlsState {
     cancel: HashMap<u64, Arc<tokio::sync::Notify>>,
     /// Server secure contexts by id (server.rs), one per `tls.createServer`.
     contexts: HashMap<u64, Arc<server::ServerContext>>,
+    /// Client secure contexts by id (`ClientContext`), one per
+    /// `tls.createSecureContext` that carries a key, a certificate or a pfx.
+    client_contexts: HashMap<u64, Arc<ClientContext>>,
 }
 
 impl TlsState {
@@ -567,6 +572,12 @@ struct NodeCertVerifier {
     /// rejectUnauthorized:false -- verify and record, never fail the
     /// handshake. What fills `socket.authorized` / `authorizationError`.
     advisory: bool,
+    /// Whether the host name is checked here. Node checks it with
+    /// `options.checkServerIdentity` once the chain is trusted; when that is
+    /// tls.checkServerIdentity itself the check runs here (the same
+    /// algorithm, on the DER), and when it is the caller's own function the
+    /// JS layer calls it and the chain is all that is judged here.
+    check_name: bool,
     outcome: VerifySlot,
 }
 
@@ -640,6 +651,9 @@ impl NodeCertVerifier {
             .iter()
             .any(|trusted| trusted.as_ref() == end_entity.as_ref())
         {
+            if !self.check_name {
+                return Ok(());
+            }
             return check_server_identity(server_name, end_entity.as_ref())
                 .map_err(|failure| (failure, CertificateError::NotValidForName.into()));
         }
@@ -665,10 +679,15 @@ impl NodeCertVerifier {
         };
         let failure = match &error {
             rustls::Error::InvalidCertificate(reason) => match reason {
-                // webpki insists on a subjectAltName; Node falls back to the
-                // subject CN when there is none, so its check decides.
+                // webpki names the host only once the chain is trusted, and
+                // insists on a subjectAltName where Node falls back to the
+                // subject CN, so Node's check decides -- or, when the caller
+                // brought its own checkServerIdentity, that function does.
                 CertificateError::NotValidForName
                 | CertificateError::NotValidForNameContext { .. } => {
+                    if !self.check_name {
+                        return Ok(());
+                    }
                     return check_server_identity(server_name, end_entity.as_ref())
                         .map_err(|failure| (failure, error));
                 }
@@ -774,34 +793,27 @@ fn classify_unknown_issuer(
 
 // --------------------------------------------- tls.checkServerIdentity port
 
-/// The identity fields Node's `checkServerIdentity` reads off a peer
-/// certificate object: `subjectaltname` in OpenSSL's rendering, split the
-/// way Node splits it, and the subject CN(s).
-#[derive(Debug, Default, PartialEq, Eq)]
-struct CertIdentity {
-    /// `cert.subjectaltname`, absent when the certificate has no SAN.
-    alt_names: Option<String>,
-    dns_names: Vec<String>,
-    /// Canonical text of every IP Address entry (Node's `canonicalizeIP`).
-    ips: Vec<String>,
-    /// `cert.subject.CN`: one entry per CN attribute, empty ones dropped
-    /// (Node reads an empty CN as no CN).
-    cn: Vec<String>,
-}
+/// What Node's `checkServerIdentity` reads off a peer certificate (see
+/// `names::HostIdentity`): the DNS names and addresses of its
+/// subjectAltName, read entry by entry off the DER, and its subject CN.
+type CertIdentity = names::HostIdentity;
 
-impl CertIdentity {
-    /// From the two fields as Node sees them -- the SAN string is parsed
-    /// exactly as `checkServerIdentity` parses it (`', '`-separated,
-    /// `DNS:` and `IP Address:` entries, everything else ignored).
+#[cfg(test)]
+impl names::HostIdentity {
+    /// From the two fields as Node's `checkServerIdentity` sees them on a
+    /// certificate object: the `subjectaltname` text split as it splits it
+    /// (`', '`-separated, JSON-quoted entries unquoted; `DNS:` and
+    /// `IP Address:` entries kept, everything else ignored), and the CN
+    /// values.
     fn from_node_shape(alt_names: Option<&str>, cn: Vec<String>) -> Self {
         let mut dns_names = Vec::new();
         let mut ips = Vec::new();
         if let Some(alt) = alt_names.filter(|a| !a.is_empty()) {
-            for name in alt.split(", ") {
+            for name in split_escaped_alt_names(alt) {
                 if let Some(dns) = name.strip_prefix("DNS:") {
                     dns_names.push(dns.to_string());
                 } else if let Some(ip) = name.strip_prefix("IP Address:") {
-                    ips.push(canonicalize_ip(ip));
+                    ips.push(names::canonicalize_ip(ip).unwrap_or_default());
                 }
             }
         }
@@ -809,74 +821,52 @@ impl CertIdentity {
             alt_names: alt_names.filter(|a| !a.is_empty()).map(str::to_string),
             dns_names,
             ips,
-            cn,
+            cn: (!cn.is_empty()).then_some(cn),
         }
     }
-
-    fn from_der(der: &[u8]) -> Self {
-        let Ok((_, cert)) = parse_x509_certificate(der) else {
-            return Self::default();
-        };
-        let alt_names = match cert.subject_alternative_name() {
-            Ok(Some(ext)) => {
-                let entries: Vec<String> = ext
-                    .value
-                    .general_names
-                    .iter()
-                    .map(render_general_name)
-                    .collect();
-                Some(entries.join(", "))
-            }
-            _ => None,
-        };
-        let cn: Vec<String> = cert
-            .subject()
-            .iter_common_name()
-            .filter_map(|attr| attr.as_str().ok())
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect();
-        Self::from_node_shape(alt_names.as_deref(), cn)
-    }
 }
 
-/// One SAN entry as OpenSSL prints it (`X509V3_EXT_print`), which is what
-/// Node's `cert.subjectaltname` is made of and what its mismatch message
-/// echoes back verbatim.
-fn render_general_name(name: &GeneralName<'_>) -> String {
-    match name {
-        GeneralName::DNSName(dns) => format!("DNS:{dns}"),
-        GeneralName::IPAddress(bytes) => match bytes.len() {
-            4 => format!(
-                "IP Address:{}",
-                std::net::Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3])
-            ),
-            // OpenSSL writes an IPv6 SAN as eight uncompressed uppercase
-            // hex groups: `IP Address:0:0:0:0:0:0:0:1`.
-            16 => {
-                let groups: Vec<String> = bytes
-                    .chunks(2)
-                    .map(|pair| format!("{:X}", u16::from_be_bytes([pair[0], pair[1]])))
-                    .collect();
-                format!("IP Address:{}", groups.join(":"))
-            }
-            _ => "IP Address:<invalid>".to_string(),
-        },
-        GeneralName::RFC822Name(mail) => format!("email:{mail}"),
-        GeneralName::URI(uri) => format!("URI:{uri}"),
-        GeneralName::DirectoryName(dir) => format!("DirName:{dir}"),
-        GeneralName::RegisteredID(oid) => format!("Registered ID:{oid}"),
-        GeneralName::OtherName(..) => "othername:<unsupported>".to_string(),
-        GeneralName::X400Address(_) => "X400Name:<unsupported>".to_string(),
-        GeneralName::EDIPartyName(_) => "EdiPartyName:<unsupported>".to_string(),
+/// Node's `splitEscapedAltNames` (and its plain `split(', ')` when there
+/// is no quote), for the node-shape test constructor.
+#[cfg(test)]
+fn split_escaped_alt_names(alt: &str) -> Vec<String> {
+    if !alt.contains('"') {
+        return alt.split(", ").map(str::to_string).collect();
     }
-}
-
-/// Node's `canonicalizeIP`: the address re-rendered, `""` if it is not one.
-fn canonicalize_ip(text: &str) -> String {
-    text.parse::<std::net::IpAddr>()
-        .map(|ip| ip.to_string())
-        .unwrap_or_default()
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut rest = alt;
+    while !rest.is_empty() {
+        let sep = rest.find(',');
+        let quote = rest.find('"');
+        match (quote, sep) {
+            (Some(q), s) if s.is_none_or(|s| q < s) => {
+                current.push_str(&rest[..q]);
+                let literal: String = {
+                    let mut end = q + 1;
+                    let bytes = rest.as_bytes();
+                    while end < bytes.len() && bytes[end] != b'"' {
+                        end += if bytes[end] == b'\\' { 2 } else { 1 };
+                    }
+                    rest[q..=end.min(bytes.len() - 1)].to_string()
+                };
+                let text: String = serde_json::from_str(&literal).unwrap_or_default();
+                current.push_str(&text);
+                rest = &rest[q + literal.len()..];
+            }
+            (_, Some(s)) => {
+                current.push_str(&rest[..s]);
+                out.push(std::mem::take(&mut current));
+                rest = rest.get(s + 2..).unwrap_or("");
+            }
+            _ => {
+                current.push_str(rest);
+                rest = "";
+            }
+        }
+    }
+    out.push(current);
+    out
 }
 
 /// Node's `unfqdn`: one trailing dot removed.
@@ -884,10 +874,11 @@ fn unfqdn(host: &str) -> &str {
     host.strip_suffix('.').unwrap_or(host)
 }
 
-/// Node's `splitHost`: labels of the un-dotted, lower-cased name.
+/// Node's `splitHost`: labels of the un-dotted name, A-Z lower-cased (Node
+/// lower-cases nothing else: `toLowerCase()` is locale-sensitive).
 fn split_host(host: &str) -> Vec<String> {
     unfqdn(host)
-        .to_lowercase()
+        .to_ascii_lowercase()
         .split('.')
         .map(str::to_string)
         .collect()
@@ -949,8 +940,11 @@ fn host_matches(host_parts: &[String], pattern: &str, wildcards: bool) -> bool {
 /// matches, else the `reason` its `ERR_TLS_CERT_ALTNAME_INVALID` carries.
 fn check_identity(hostname: &str, identity: &CertIdentity) -> Option<String> {
     let hostname = unfqdn(hostname);
-    let (valid, reason) = if let Ok(ip) = hostname.parse::<std::net::IpAddr>() {
-        let wanted = ip.to_string();
+    // `subject.CN` as Node tests it: one value is there when it is not
+    // empty; several (an array) always are.
+    let cn: &[String] = identity.cn.as_deref().unwrap_or(&[]);
+    let has_cn = cn.len() > 1 || cn.first().is_some_and(|c| !c.is_empty());
+    let (valid, reason) = if let Some(wanted) = names::canonicalize_ip(hostname) {
         (
             identity.ips.contains(&wanted),
             format!(
@@ -958,7 +952,7 @@ fn check_identity(hostname: &str, identity: &CertIdentity) -> Option<String> {
                 identity.ips.join(", ")
             ),
         )
-    } else if !identity.dns_names.is_empty() || !identity.cn.is_empty() {
+    } else if !identity.dns_names.is_empty() || has_cn {
         let host_parts = split_host(hostname);
         if !identity.dns_names.is_empty() {
             (
@@ -974,14 +968,9 @@ fn check_identity(hostname: &str, identity: &CertIdentity) -> Option<String> {
         } else {
             // Match against Common Name only if no supported identifiers exist.
             (
-                identity
-                    .cn
-                    .iter()
+                cn.iter()
                     .any(|pattern| host_matches(&host_parts, pattern, true)),
-                format!(
-                    "Host: {hostname}. is not cert's CN: {}",
-                    identity.cn.join(",")
-                ),
+                format!("Host: {hostname}. is not cert's CN: {}", cn.join(",")),
             )
         }
     } else {
@@ -995,7 +984,10 @@ fn check_identity(hostname: &str, identity: &CertIdentity) -> Option<String> {
 fn check_server_identity(server_name: &ServerName<'_>, der: &[u8]) -> Result<(), VerifyFailure> {
     let hostname = match server_name {
         ServerName::DnsName(dns) => dns.as_ref().to_string(),
-        ServerName::IpAddress(ip) => std::net::IpAddr::from(*ip).to_string(),
+        ServerName::IpAddress(ip) => match std::net::IpAddr::from(*ip) {
+            std::net::IpAddr::V4(v4) => names::ip_text(&v4.octets()).unwrap_or_default(),
+            std::net::IpAddr::V6(v6) => names::ip_text(&v6.octets()).unwrap_or_default(),
+        },
         _ => String::new(),
     };
     match check_identity(&hostname, &CertIdentity::from_der(der)) {
@@ -1065,12 +1057,11 @@ pub(crate) fn protocol_versions(
     Ok(versions)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn build_client_config(
     ca_pem: Option<&str>,
-    client_cert_pem: Option<&str>,
-    client_key_pem: Option<&str>,
+    identity: Option<&ClientContext>,
     reject_unauthorized: bool,
+    check_name: bool,
     versions: &[&'static rustls::SupportedProtocolVersion],
 ) -> Result<(rustls::ClientConfig, VerifySlot), String> {
     let mut root_store = rustls::RootCertStore::empty();
@@ -1078,7 +1069,7 @@ fn build_client_config(
 
     // The user's certificates: only a self-signed one anchors a chain (see
     // `trusted_non_anchors`); every one is trusted by name as a leaf.
-    let (trusted_leaves, untrusted_known) = if let Some(ca) = ca_pem {
+    let (mut trusted_leaves, untrusted_known) = if let Some(ca) = ca_pem {
         let certs = rustls_pemfile::certs(&mut BufReader::new(ca.as_bytes()))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("ca cert parse: {e}"))?;
@@ -1097,6 +1088,14 @@ fn build_client_config(
         }
         (extras.certs.clone(), Vec::new())
     };
+    // A pfx's CA certificates join the store, as the `ca` option's do (Node's
+    // LoadPKCS12 adds them to the context's certificate store).
+    for cert in identity.map(|c| c.pfx_cas.as_slice()).unwrap_or_default() {
+        if is_self_signed(cert.as_ref()) {
+            let _ = root_store.add(cert.clone());
+        }
+        trusted_leaves.push(cert.clone());
+    }
     let trusted_non_anchors: Vec<CertificateDer<'static>> = trusted_leaves
         .iter()
         .filter(|c| !is_self_signed(c.as_ref()))
@@ -1120,26 +1119,98 @@ fn build_client_config(
         trusted_non_anchors,
         untrusted_known,
         advisory: !reject_unauthorized,
+        check_name,
         outcome: outcome.clone(),
     });
     let builder = rustls::ClientConfig::builder_with_protocol_versions(versions)
         .dangerous()
         .with_custom_certificate_verifier(verifier);
 
-    let config = if let (Some(cert_pem), Some(key_pem)) = (client_cert_pem, client_key_pem) {
-        let certs = rustls_pemfile::certs(&mut BufReader::new(cert_pem.as_bytes()))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("client cert parse: {e}"))?;
-        let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem.as_bytes()))
-            .map_err(|e| format!("client key parse: {e}"))?
-            .ok_or("no private key found in client key PEM")?;
-        builder
-            .with_client_auth_cert(certs, key)
-            .map_err(|e| format!("client auth: {e}"))?
-    } else {
-        builder.with_no_client_auth()
+    let config = match identity.filter(|c| !c.identities.is_empty()) {
+        Some(context) => builder
+            .with_client_cert_resolver(Arc::new(ClientIdentities(context.identities.clone()))),
+        None => builder.with_no_client_auth(),
     };
     Ok((config, outcome))
+}
+
+// ------------------------------------------------------------ client context
+
+/// A client's secure context: the key, certificate and pfx options of
+/// `tls.createSecureContext()` (which `tls.connect()` builds when it is not
+/// given one), read the way Node reads them -- a passphrase-protected key or
+/// a PKCS#12 bundle decrypted, a key that is not its certificate's refused --
+/// once, when the context is built, with each key's chain completed from
+/// the context's store as OpenSSL completes it (`chain.rs`).
+#[derive(Debug)]
+pub struct ClientContext {
+    identities: Vec<Arc<rustls::sign::CertifiedKey>>,
+    /// CA certificates a pfx brought, trusted as the `ca` option is.
+    pfx_cas: Vec<CertificateDer<'static>>,
+}
+
+/// Build a client context, or the error Node's createSecureContext throws.
+pub fn build_client_context(
+    spec: &server::ServerContextSpec,
+) -> Result<ClientContext, server::ContextError> {
+    let loaded = server::load_identities(spec, &server::provider())?;
+    Ok(ClientContext {
+        identities: loaded.certified,
+        pfx_cas: loaded.pfx_cas,
+    })
+}
+
+pub fn register_client_context(
+    registry: &TlsRegistry,
+    ids: &std::sync::atomic::AtomicU64,
+    context: ClientContext,
+) -> u64 {
+    let id = ids.fetch_add(1, Ordering::Relaxed);
+    registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .client_contexts
+        .insert(id, Arc::new(context));
+    id
+}
+
+pub fn client_context(registry: &TlsRegistry, id: u64) -> Option<Arc<ClientContext>> {
+    registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .client_contexts
+        .get(&id)
+        .cloned()
+}
+
+pub fn free_client_context(registry: &TlsRegistry, id: u64) {
+    registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .client_contexts
+        .remove(&id);
+}
+
+/// The client's certificates: the first whose key can sign with a scheme the
+/// server accepts, as OpenSSL picks among a context's certificates.
+#[derive(Debug)]
+struct ClientIdentities(Vec<Arc<rustls::sign::CertifiedKey>>);
+
+impl rustls::client::ResolvesClientCert for ClientIdentities {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        sigschemes: &[rustls::SignatureScheme],
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        self.0
+            .iter()
+            .find(|identity| identity.key.choose_scheme(sigschemes).is_some())
+            .cloned()
+    }
+
+    fn has_certs(&self) -> bool {
+        !self.0.is_empty()
+    }
 }
 
 // ------------------------------------------------------------ Node's names
@@ -1263,8 +1334,8 @@ pub async fn tls_connect(
     server_name: Option<String>,
     ca_pem: Option<String>,
     reject_unauthorized: bool,
-    client_cert_pem: Option<String>,
-    client_key_pem: Option<String>,
+    identity: Option<Arc<ClientContext>>,
+    check_name: bool,
     min_version: Option<String>,
     max_version: Option<String>,
     attempt_timeout: std::time::Duration,
@@ -1277,8 +1348,8 @@ pub async fn tls_connect(
         server_name,
         ca_pem,
         reject_unauthorized,
-        client_cert_pem,
-        client_key_pem,
+        identity,
+        check_name,
         min_version,
         max_version,
         attempt_timeout,
@@ -1326,8 +1397,8 @@ pub async fn tls_connect_pinned(
     server_name: Option<String>,
     ca_pem: Option<String>,
     reject_unauthorized: bool,
-    client_cert_pem: Option<String>,
-    client_key_pem: Option<String>,
+    identity: Option<Arc<ClientContext>>,
+    check_name: bool,
     min_version: Option<String>,
     max_version: Option<String>,
     attempt_timeout: std::time::Duration,
@@ -1369,8 +1440,8 @@ pub async fn tls_connect_pinned(
         name,
         ca_pem.as_deref(),
         reject_unauthorized,
-        client_cert_pem.as_deref(),
-        client_key_pem.as_deref(),
+        identity.as_deref(),
+        check_name,
         &versions,
         &addr,
         alpn,
@@ -1423,8 +1494,8 @@ async fn client_handshake<IO>(
     name: &str,
     ca_pem: Option<&str>,
     reject_unauthorized: bool,
-    client_cert_pem: Option<&str>,
-    client_key_pem: Option<&str>,
+    identity: Option<&ClientContext>,
+    check_name: bool,
     versions: &[&'static rustls::SupportedProtocolVersion],
     target: &str,
     alpn: Vec<Vec<u8>>,
@@ -1442,16 +1513,11 @@ where
         }
     };
 
-    let (mut config, verdict) = match build_client_config(
-        ca_pem,
-        client_cert_pem,
-        client_key_pem,
-        reject_unauthorized,
-        versions,
-    ) {
-        Ok(built) => built,
-        Err(e) => return Err(OpOutcome::Failed(e)),
-    };
+    let (mut config, verdict) =
+        match build_client_config(ca_pem, identity, reject_unauthorized, check_name, versions) {
+            Ok(built) => built,
+            Err(e) => return Err(OpOutcome::Failed(e)),
+        };
     config.alpn_protocols = alpn;
 
     let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
@@ -1518,6 +1584,24 @@ where
     if let Some(chain) = peer_certificates {
         payload["peerCertificates"] = serde_json::Value::from(chain);
     }
+    // Node's getPeerCertificate(true) goes on from the last certificate the
+    // peer's chain reaches to the issuers the context's store holds
+    // (GetLastIssuedCert): the `ca` certificates, or the default store, and
+    // a pfx's CAs.
+    if let Some(chain) = client_conn.peer_certificates() {
+        let ca = ca_pem.map(|pem| server::ca_certificates(&[pem.to_string()]));
+        let mut store: Vec<&CertificateDer<'static>> = match &ca {
+            Some(ca) => ca.iter().collect(),
+            None => chain::default_store().iter().collect(),
+        };
+        if let Some(identity) = identity {
+            store.extend(identity.pfx_cas.iter());
+        }
+        let issuers = chain::store_issuers(chain, &store, chain::unix_now());
+        if let Some(issuers) = peer_certificates_b64(Some(&issuers)) {
+            payload["storeIssuers"] = serde_json::Value::from(issuers);
+        }
+    }
     Ok((tls_stream, payload))
 }
 
@@ -1535,8 +1619,8 @@ pub async fn tls_connect_over(
     server_name: String,
     ca_pem: Option<String>,
     reject_unauthorized: bool,
-    client_cert_pem: Option<String>,
-    client_key_pem: Option<String>,
+    identity: Option<Arc<ClientContext>>,
+    check_name: bool,
     min_version: Option<String>,
     max_version: Option<String>,
     alpn: Vec<Vec<u8>>,
@@ -1553,8 +1637,8 @@ pub async fn tls_connect_over(
         &server_name,
         ca_pem.as_deref(),
         reject_unauthorized,
-        client_cert_pem.as_deref(),
-        client_key_pem.as_deref(),
+        identity.as_deref(),
+        check_name,
         &versions,
         &server_name,
         alpn,
@@ -1941,7 +2025,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         assert_eq!(identity.alt_names, None);
         assert!(identity.dns_names.is_empty());
         assert!(identity.ips.is_empty());
-        assert_eq!(identity.cn, ["localhost"]);
+        assert_eq!(identity.cn, Some(vec!["localhost".to_string()]));
         assert_eq!(check_identity("localhost", &identity), None);
         assert_eq!(
             check_identity("example.com", &identity).as_deref(),
@@ -2149,7 +2233,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
                 Some(CERT.into()),
                 true,
                 None,
-                None,
+                true,
                 None,
                 None,
                 crate::net_connect::DEFAULT_ATTEMPT_TIMEOUT,
@@ -2271,7 +2355,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
                 Some(CERT.into()),
                 true,
                 None,
-                None,
+                true,
                 None,
                 None,
                 Vec::new(),
@@ -2347,7 +2431,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
                 None,
                 true,
                 None,
-                None,
+                true,
                 None,
                 None,
                 Vec::new(),
@@ -2371,7 +2455,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
             None,
             true,
             None,
-            None,
+            true,
             None,
             None,
             Vec::new(),
@@ -2404,7 +2488,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
                 Some(CERT.into()),
                 true,
                 None,
-                None,
+                true,
                 None,
                 None,
                 crate::net_connect::DEFAULT_ATTEMPT_TIMEOUT,
@@ -2495,7 +2579,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
             Some(CERT.into()),
             true,
             None,
-            None,
+            true,
             None,
             None,
             crate::net_connect::DEFAULT_ATTEMPT_TIMEOUT,
@@ -2577,7 +2661,7 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
                 ca.map(String::from),
                 reject,
                 None,
-                None,
+                true,
                 None,
                 None,
                 crate::net_connect::DEFAULT_ATTEMPT_TIMEOUT,

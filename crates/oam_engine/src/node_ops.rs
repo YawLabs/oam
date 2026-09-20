@@ -439,6 +439,10 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("tlsAcceptWrap", op_tls_accept_wrap),
         ("tlsServerContext", op_tls_server_context),
         ("tlsServerContextFree", op_tls_server_context_free),
+        ("tlsClientContext", op_tls_client_context),
+        ("tlsClientContextFree", op_tls_client_context_free),
+        ("tlsCaCertificates", op_tls_ca_certificates),
+        ("tlsCanonicalizeIp", op_tls_canonicalize_ip),
         // oam:permissions query surface
         ("permissionsQuery", op_permissions_query),
         // worker_threads
@@ -3891,11 +3895,14 @@ fn op_tls_connect(
     let server_name = arg_string(scope, &args, 2).filter(|s| !s.is_empty());
     let ca_pem = arg_string(scope, &args, 3).filter(|s| !s.is_empty());
     let reject_unauthorized = args.get(4).boolean_value(scope);
-    // Empty PEM strings mean "not provided" -- only the (Some, Some) cert+key
-    // pair should build a client-auth config (build_client_config:103);
-    // otherwise a server-auth-only connection wrongly enters that branch.
-    let client_cert_pem = arg_string(scope, &args, 5).filter(|s| !s.is_empty());
-    let client_key_pem = arg_string(scope, &args, 6).filter(|s| !s.is_empty());
+    // The client secure context (`tlsClientContext`) carrying the key and
+    // certificate, if the connection has one; and whether the host name is
+    // checked natively (false: the caller's own checkServerIdentity decides,
+    // in JS).
+    let Some(identity) = client_context_arg(scope, &args, 5, "tlsConnect") else {
+        return;
+    };
+    let check_name = args.get(6).boolean_value(scope);
     // Effective minVersion / maxVersion, already resolved and validated by the
     // JS tls layer (secureProtocol folded in, invalid names thrown); empty
     // means "Node's default range" (min TLSv1.2, max TLSv1.3).
@@ -3956,8 +3963,8 @@ fn op_tls_connect(
             server_name,
             ca_pem,
             reject_unauthorized,
-            client_cert_pem,
-            client_key_pem,
+            identity,
+            check_name,
             min_version,
             max_version,
             attempt_timeout,
@@ -4035,7 +4042,8 @@ fn op_tls_pipe_close(
 }
 
 /// `__oam.node.tlsConnectOver(pipe, serverName, ca, rejectUnauthorized,
-/// cert, key, minVersion, maxVersion, alpn)`: the client handshake over a pipe
+/// contextId, checkName, minVersion, maxVersion, alpn)`: the client handshake
+/// over a pipe
 /// (`tls.connect({ socket })`); resolves as tlsConnect does, without the
 /// addresses. No net grant is asked: the socket underneath was opened (and
 /// checked) by whoever made it.
@@ -4055,8 +4063,10 @@ fn op_tls_connect_over(
     };
     let ca_pem = arg_string(scope, &args, 2).filter(|s| !s.is_empty());
     let reject_unauthorized = args.get(3).boolean_value(scope);
-    let client_cert_pem = arg_string(scope, &args, 4).filter(|s| !s.is_empty());
-    let client_key_pem = arg_string(scope, &args, 5).filter(|s| !s.is_empty());
+    let Some(identity) = client_context_arg(scope, &args, 4, "tlsConnectOver") else {
+        return;
+    };
+    let check_name = args.get(5).boolean_value(scope);
     let min_version = arg_string(scope, &args, 6).filter(|s| !s.is_empty());
     let max_version = arg_string(scope, &args, 7).filter(|s| !s.is_empty());
     // ALPNProtocols, as tlsConnect takes them (argument 12 there).
@@ -4085,13 +4095,41 @@ fn op_tls_connect_over(
             server_name,
             ca_pem,
             reject_unauthorized,
-            client_cert_pem,
-            client_key_pem,
+            identity,
+            check_name,
             min_version,
             max_version,
             alpn,
         ),
     );
+}
+
+/// A connect op's client-context argument: undefined for none, else the id
+/// `tlsClientContext` returned. Outer None: an id that names no context (a
+/// TypeError has been thrown).
+#[allow(clippy::option_option)]
+fn client_context_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+    op: &str,
+) -> Option<Option<std::sync::Arc<oam_core::tls::ClientContext>>> {
+    let value = args.get(index);
+    if value.is_null_or_undefined() {
+        return Some(None);
+    }
+    let id = value.number_value(scope).unwrap_or(-1.0);
+    let found = match scope.get_slot::<oam_core::CoreRuntime>() {
+        Some(rt) if id >= 0.0 => oam_core::tls::client_context(&rt.tls(), id as u64),
+        _ => None,
+    };
+    match found {
+        Some(context) => Some(Some(context)),
+        None => {
+            throw_type_error(scope, &format!("{op}: no such secure context"));
+            None
+        }
+    }
 }
 
 fn op_tls_read(
@@ -4262,6 +4300,78 @@ fn op_tls_server_context_free(
 ) {
     let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     oam_core::tls::server::free_context(&core_runtime!(scope).tls(), id);
+}
+
+/// tlsClientContext(specJson) -> JSON `{ "id": n }`, or `{ "error": {...} }`
+/// with what Node's createSecureContext throws for the key, certificate and
+/// pfx options (JS throws it). The spec is tlsServerContext's.
+fn op_tls_client_context(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let spec_json = arg_string(scope, &args, 0).unwrap_or_default();
+    let spec: oam_core::tls::server::ServerContextSpec = match serde_json::from_str(&spec_json) {
+        Ok(spec) => spec,
+        Err(e) => {
+            throw_type_error(scope, &format!("tlsClientContext: malformed options: {e}"));
+            return;
+        }
+    };
+    let core = core_runtime!(scope);
+    let result = match oam_core::tls::build_client_context(&spec) {
+        Ok(context) => {
+            let id = oam_core::tls::register_client_context(&core.tls(), &core.body_ids(), context);
+            serde_json::json!({ "id": id })
+        }
+        Err(error) => serde_json::json!({ "error": error.to_json() }),
+    };
+    if let Some(text) = v8::String::new(scope, &result.to_string()) {
+        rv.set(text.into());
+    }
+}
+
+fn op_tls_client_context_free(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    oam_core::tls::free_client_context(&core_runtime!(scope).tls(), id);
+}
+
+/// tlsCaCertificates(kind) -> the PEM strings of `tls.getCACertificates`'s
+/// `bundled`, `extra` or `system` list; undefined for any other kind.
+fn op_tls_ca_certificates(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let kind = arg_string(scope, &args, 0).unwrap_or_default();
+    let Some(pems) = oam_core::tls::roots::ca_certificates(&kind) else {
+        return;
+    };
+    let items: Vec<v8::Local<'_, v8::Value>> = pems
+        .iter()
+        .filter_map(|pem| v8::String::new(scope, pem).map(Into::into))
+        .collect();
+    let array = v8::Array::new_with_elements(scope, &items);
+    rv.set(array.into());
+}
+
+/// tlsCanonicalizeIp(text) -> Node's `canonicalizeIP`: the address as libuv
+/// prints it back, or undefined when libuv does not read one.
+fn op_tls_canonicalize_ip(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let text = arg_string(scope, &args, 0).unwrap_or_default();
+    if let Some(ip) = oam_core::tls::names::canonicalize_ip(&text)
+        && let Some(out) = v8::String::new(scope, &ip)
+    {
+        rv.set(out.into());
+    }
 }
 
 /// zlibSync(bytes, format, level, compress) — synchronous transform on the

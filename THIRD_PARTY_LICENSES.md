@@ -50,7 +50,7 @@ DEALINGS IN THE SOFTWARE.
 - Unicode License v3 -- 27 crate(s)
 - BSD 3-Clause "New" or "Revised" License -- 4 crate(s)
 - ISC License -- 4 crate(s)
-- Community Data License Agreement Permissive 2.0 -- 2 crate(s)
+- Community Data License Agreement Permissive 2.0 -- 3 crate(s)
 - Boost Software License 1.0 -- 1 crate(s)
 
 ---
@@ -9144,6 +9144,7 @@ DEALINGS IN THE SOFTWARE.
 
 Used by:
 
+- webpki-root-certs 1.0.7
 - webpki-roots 0.26.11
 - webpki-roots 1.0.7
 

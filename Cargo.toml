@@ -161,6 +161,13 @@ rustls-platform-verifier = "0.7"
 tokio-rustls = { version = "0.26", default-features = false }
 webpki-roots = "0.26"
 rustls-pemfile = "2"
+# node:tls's CA certificate lists (oam_core tls/roots.rs): webpki-root-certs
+# is the Mozilla store webpki-roots carries as trust anchors, as whole
+# certificates from the same CCADB release (tls.rootCertificates, and the
+# issuers a lone leaf is served with); rustls-native-certs reads the OS
+# store for tls.getCACertificates('system').
+webpki-root-certs = "1"
+rustls-native-certs = "0.8"
 # DNS record-type resolution (MX, TXT, CNAME, NS, SRV, SOA, PTR, etc.)
 # and reverse lookups. tokio-runtime for async; system-config reads
 # the OS resolver settings.

@@ -781,6 +781,12 @@ pub fn load_private_key(
                 if iv.len() != cipher.iv_len() {
                     return Err(ContextError::unsupported_key());
                 }
+                // OpenSSL's EVP_DecryptFinal refuses a ciphertext that is not
+                // whole blocks before it looks at the padding (measured: a
+                // truncated key is this, not a bad decrypt).
+                if block.der.len() % cipher.iv_len() != 0 {
+                    return Err(ContextError::wrong_final_block_length());
+                }
                 let key = evp_bytes_to_key(&password.bytes, &iv[..8], cipher.key_len());
                 cbc_decrypt(cipher, &key, &iv, &block.der)
                     .filter(|plain| is_versioned_sequence(plain))
@@ -1671,6 +1677,44 @@ sHru29UzKFvQ6BoECGJ2YEXz/KNcAgIIAA==";
             code(load_private_key(b"not a key", None)),
             Some("ERR_OSSL_UNSUPPORTED")
         );
+    }
+
+    /// A legacy key cut short of a whole cipher block is OpenSSL's "wrong
+    /// final block length"; cut at a block boundary, its padding fails:
+    /// "bad decrypt" (both measured on v22.22.2).
+    #[test]
+    fn truncated_legacy_keys_fail_as_openssl_fails_them() {
+        use base64::Engine;
+        let engine = base64::engine::general_purpose::STANDARD;
+        for pem in [ENC_TRAD_DES3, ENC_TRAD_AES256] {
+            let (head, rest) = pem
+                .split_once(
+                    "
+
+",
+                )
+                .unwrap();
+            let body: String = rest.lines().filter(|l| !l.starts_with("-----")).collect();
+            let der = engine.decode(body).unwrap();
+            let footer = rest.lines().last().unwrap();
+            let cut = |len: usize| {
+                let pem = format!(
+                    "{head}
+
+{}
+{footer}
+",
+                    engine.encode(&der[..len])
+                );
+                code(load_private_key(pem.as_bytes(), Some("hunter2")))
+            };
+            assert_eq!(
+                cut(der.len() - 1),
+                Some("ERR_OSSL_WRONG_FINAL_BLOCK_LENGTH")
+            );
+            assert_eq!(cut(1), Some("ERR_OSSL_WRONG_FINAL_BLOCK_LENGTH"));
+            assert_eq!(cut(der.len() - 16), Some("ERR_OSSL_BAD_DECRYPT"));
+        }
     }
 
     // `openssl enc -des-ede3-cbc` / `-des-ede-cbc` (OpenSSL 3.5) of "oam
