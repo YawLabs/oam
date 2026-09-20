@@ -21,6 +21,109 @@ fn write_temp(name: &str, content: &str) -> PathBuf {
     path
 }
 
+/// How long any single `oam` the suite launches may take before the test that
+/// launched it fails.
+///
+/// `Command::output()` waits forever, so a runtime that finished its work and
+/// then failed to exit used to burn the WHOLE `cargo test`'s ceiling
+/// (`bounded_cargo_test`, scripts/ci-local.sh: 900s, status 124) and report
+/// nothing about which test was stuck. Bounded here, the same defect costs one
+/// named test and a few seconds, and the panic carries the output the run had
+/// already produced -- which is where the diagnosis starts.
+///
+/// The ceiling is deliberately far above any honest invocation (the slowest
+/// legitimately waits on a cold tsgo, `OAM_CHECK_WAIT_MS` = 60s) and far below
+/// the gate's, so it always attributes before the gate gives up.
+const OAM_DEADLINE: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Read a child pipe into a buffer the caller can look at at any time --
+/// including while the child is still running, so a killed child's partial
+/// output is still reportable.
+fn drain_pipe(mut pipe: impl std::io::Read + Send + 'static) -> PipeSink {
+    let sink = PipeSink {
+        bytes: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        eof: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let (bytes, eof) = (
+        std::sync::Arc::clone(&sink.bytes),
+        std::sync::Arc::clone(&sink.eof),
+    );
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => bytes
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .extend_from_slice(&chunk[..n]),
+            }
+        }
+        eof.store(true, std::sync::atomic::Ordering::Release);
+    });
+    sink
+}
+
+struct PipeSink {
+    bytes: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    eof: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PipeSink {
+    fn taken(&self) -> Vec<u8> {
+        self.bytes.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+    fn at_eof(&self) -> bool {
+        self.eof.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// `Command::output()` with [`OAM_DEADLINE`]: the same `Output` on a normal
+/// run, a panic naming the command and its partial output on one that hangs.
+fn bounded_output(cmd: &mut std::process::Command) -> Output {
+    let described = format!("{cmd:?}");
+    let mut child = cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("oam binary runs");
+    let stdout = drain_pipe(child.stdout.take().expect("piped stdout"));
+    let stderr = drain_pipe(child.stderr.take().expect("piped stderr"));
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait().expect("child status readable") {
+            Some(status) => break Some(status),
+            None if started.elapsed() >= OAM_DEADLINE => break None,
+            None => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    };
+    let Some(status) = status else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "`oam` did not exit within {}s and was killed -- {described}\nstdout so far: {}\nstderr so far: {}",
+            OAM_DEADLINE.as_secs(),
+            String::from_utf8_lossy(&stdout.taken()),
+            String::from_utf8_lossy(&stderr.taken()),
+        );
+    };
+    // The child is gone; its pipes are about to reach EOF. Wait for the
+    // readers so a test still asserts on the WHOLE of stdout -- bounded too,
+    // in case something the child spawned inherited the pipe and holds it.
+    let drained = std::time::Instant::now();
+    while (!stdout.at_eof() || !stderr.at_eof())
+        && drained.elapsed() < std::time::Duration::from_secs(30)
+    {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    Output {
+        status,
+        stdout: stdout.taken(),
+        stderr: stderr.taken(),
+    }
+}
+
 fn oam(args: &[&str]) -> Output {
     // Isolated cache world: any daemon/build-info these invocations create
     // lives under the run dir and self-reaps quickly.
@@ -28,8 +131,8 @@ fn oam(args: &[&str]) -> Output {
         .parent()
         .unwrap()
         .to_path_buf();
-    std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
-        .args(args)
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_oam"));
+    cmd.args(args)
         // The e2e suite exercises oam's N-API alpha (napi_* tests load real
         // .node addons), which is OFF by default in production -- opt in here.
         .env("OAM_ENABLE_NATIVE_ADDONS", "1")
@@ -48,9 +151,8 @@ fn oam(args: &[&str]) -> Output {
         // A test that wants one sets it in its own script or Command.
         .env_remove("FORCE_COLOR")
         .env_remove("NO_COLOR")
-        .env_remove("NODE_DISABLE_COLORS")
-        .output()
-        .expect("oam binary runs")
+        .env_remove("NODE_DISABLE_COLORS");
+    bounded_output(&mut cmd)
 }
 
 // bug: `oam -e` writes its source to a REAL file in the CWD (node's eval
@@ -4814,7 +4916,7 @@ fn oam_run_with_proxy_env(script: &std::path::Path, vars: &[(&str, &str)]) -> Ou
     for (k, v) in vars {
         cmd.env(k, v);
     }
-    cmd.output().expect("oam binary runs")
+    bounded_output(&mut cmd)
 }
 
 /// undici calls a dispatcher's `connect.lookup` before it connects to a host
@@ -7007,7 +7109,7 @@ fn oam_without_proxy_env(args: &[&str]) -> Output {
     ] {
         cmd.env_remove(name);
     }
-    cmd.output().expect("oam binary runs")
+    bounded_output(&mut cmd)
 }
 
 /// `--allow-net` is enforced on every redirect hop, not only on the URL the
@@ -24638,7 +24740,7 @@ fn oam_with_env(args: &[&str], vars: &[(&str, &str)]) -> Output {
     for (k, v) in vars {
         cmd.env(k, v);
     }
-    cmd.output().expect("oam binary runs")
+    bounded_output(&mut cmd)
 }
 
 /// `process.env` must respect the `env` permission.
