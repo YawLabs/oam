@@ -18,6 +18,35 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Security
 
+- **`tls.checkServerIdentity` accepted every certificate.** It answered `undefined`
+  whatever the host name and the certificate, so code that checks the name itself -- after
+  `rejectUnauthorized: false`, or around a certificate pin -- accepted a certificate issued
+  for another host. It is now node's own check (`lib/tls.js`): the subjectAltName's DNS
+  names and IP addresses, the subject CN when it has neither, node's wildcard rules, and its
+  `ERR_TLS_CERT_ALTNAME_INVALID` carrying `reason`, `host` and `cert`. A connection's own
+  `checkServerIdentity` now decides the name, as in node -- oam checked the name itself and
+  never called the function on a mismatch, so a function written to accept a known mismatch
+  (an address, a pinned certificate) could not -- and a function that refuses a peer does so
+  before anything written while connecting is sent to it. A certificate's names are also
+  printed as node prints them: a name holding a comma, a quote, a backslash or a control
+  character is a JSON string literal in `subjectaltname` / `subjectAltName` / `infoAccess`,
+  so no DNS name can be read out of a URI, an e-mail address, a directory name or an
+  otherName in that list (the shape of CVE-2021-44532).
+- **`tls.createSecureContext` checked nothing, and `secureContext` was ignored.**
+  `createSecureContext(options)` copied the options and read no key: a wrong or missing
+  passphrase, a key that is not a key or not its certificate's, and a PKCS#12 bundle that
+  does not open were all reported as a context. And `tls.connect`, `https.request` and
+  `http2.connect` ignored a `secureContext` they were given, so a context built to trust one
+  private CA was replaced by the default trust store -- a certificate any public CA issued
+  for the name then passed -- and a client certificate it carried was never sent. Both now
+  follow node: a context reads its `key`, `cert` and `pfx` when it is built and throws
+  node's errors there (`ERR_OSSL_BAD_DECRYPT`, `ERR_OSSL_UNSUPPORTED`,
+  `ERR_OSSL_X509_KEY_VALUES_MISMATCH`, `mac verify failure`), at `createSecureContext()` and
+  synchronously at `tls.connect()`; and a connection given a context is made with that
+  context's trust, certificate and version range, whatever the connect options say about
+  them. A client certificate may now come as a passphrase-protected key
+  (`key: [{ pem, passphrase }]` included) or a `pfx`, which `tls.connect` ignored.
+
 - **The `lookup` connect option was ignored.** `net.connect`, `tls.connect`,
   `http.request` and `https.request` -- the request's own `lookup` and an `http.Agent`'s
   -- never called it and resolved the host through the system resolver, so a host check
@@ -304,6 +333,30 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   is `'tlsClientError'`, passed on as `'clientError'` as in Node.
 
 ### Fixed
+
+- **`tls.rootCertificates` was an empty array and `tls.getCACertificates` was missing.**
+  `ca: [...tls.rootCertificates, privateCA]` -- node's usual way to add a private CA to the
+  public roots, which `https.request` has honoured since #144 -- therefore trusted the
+  private CA alone and every public host failed with `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`.
+  `tls.rootCertificates` is now the Mozilla root store oam's TLS client trusts, as PEM
+  strings behind node's getter, and `tls.getCACertificates([type])` answers `'default'`
+  (the bundled roots plus `NODE_EXTRA_CA_CERTS`), `'bundled'`, `'extra'` and `'system'`
+  (the operating system's store), with node's caching, freezing and argument errors.
+  `tls.SecureContext` is exported too.
+- **A TLS endpoint sent only the certificates in `cert`.** node's OpenSSL completes a
+  certificate given on its own from the context's store, so `{ cert: leaf, ca: intermediate }`
+  -- a common server configuration -- serves the intermediate, and a client with
+  `{ cert, key, ca: [intermediate, root] }` is authorized by a server that trusts the root.
+  oam sent the leaf alone, so such a server was `UNABLE_TO_VERIFY_LEAF_SIGNATURE` for every
+  client that did not already hold the intermediate, and such a client was refused. It now
+  builds the same chain as OpenSSL does, on `tls.createServer`, `https.createServer`,
+  `http2.createSecureServer` and the client side alike.
+- **`getPeerCertificate(true)` stopped at the certificates the peer sent.** node goes on
+  from the last of them through the issuers the connection's store holds, so a server that
+  asks for a client certificate reports the CA that signed it, and a client reports the root
+  behind a chain the server did not send. oam now does the same on both sides.
+- **A truncated encrypted PEM key was `ERR_OSSL_BAD_DECRYPT`** where node reports
+  `ERR_OSSL_WRONG_FINAL_BLOCK_LENGTH` (its ciphertext is not whole cipher blocks).
 
 - **The JS heap grew with every callback the event loop ran.** Whatever a loop turn
   touched -- the promise an async op settled and its result, a timer's or immediate's
