@@ -6592,6 +6592,83 @@ watch.unref();
     );
 }
 
+/// A socket that TAKES the request but reports the write a turn late still
+/// goes back into the pool on the response's end.
+///
+/// node gates responseOnEnd's hand-back on `req.writableFinished` --
+/// `finished && outputSize === 0 && socket.writableLength === 0` -- and not
+/// on the request's 'finish' event, so a late acknowledgement costs it
+/// nothing. oam waited for its write op to come back instead. On a quiet box
+/// that op wins the race with the response's read op; under load it does not,
+/// and then the socket was handed back only after the caller had already
+/// dispatched the next request, so the agent opened a second connection --
+/// `connections=2` where the test above asserts 1, and a second pooled socket
+/// for `agent.destroy()` to skip. This makes that interleaving deterministic:
+/// the socket's write lands normally, only its acknowledgement is deferred.
+/// node v22.22.2 answers exactly the line asserted here.
+#[test]
+fn a_late_write_acknowledgement_still_pools_the_socket() {
+    let src = r#"
+import http from 'node:http';
+import net from 'node:net';
+const server = net.createServer((c) => {
+  let buf = '';
+  c.on('error', () => {});
+  c.on('data', (d) => {
+    buf += d.toString('latin1');
+    let i;
+    while ((i = buf.indexOf('\r\n\r\n')) !== -1) {
+      buf = buf.slice(i + 4);
+      c.write('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok');
+    }
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+let connections = 0;
+server.on('connection', () => { connections++; });
+class LateAck extends net.Socket {
+  write(chunk, encoding, cb) {
+    if (typeof encoding === 'function') { cb = encoding; encoding = undefined; }
+    return super.write(chunk, encoding, (err) => {
+      if (cb) setTimeout(() => cb(err), 20);
+    });
+  }
+}
+class OwnAgent extends http.Agent {
+  createConnection(options, cb) {
+    const s = new LateAck();
+    s.connect(options, cb);
+    return s;
+  }
+}
+const agent = new OwnAgent({ keepAlive: true });
+const reused = [];
+const pooled = [];
+for (let i = 0; i < 3; i++) {
+  await new Promise((resolve, reject) => {
+    const req = http.get({ host: '127.0.0.1', port, agent }, (res) => {
+      res.resume();
+      res.on('end', resolve);
+    });
+    req.on('response', () => reused.push(req.reusedSocket));
+    req.on('error', reject);
+  });
+  pooled.push(Object.values(agent.freeSockets).reduce((n, l) => n + l.length, 0));
+}
+console.log(`connections=${connections} reused=${reused} pooled=${pooled}`);
+agent.destroy();
+server.close();
+const watch = setTimeout(() => {
+  console.log('the run did not end on its own');
+  process.exit(3);
+}, 10000);
+watch.unref();
+"#;
+    let out = run_ok("late_write_ack_pool.mjs", src);
+    assert_eq!(out, "connections=1 reused=false,true,true pooled=1,1,1");
+}
+
 /// An http.get on oam's own transport is sent without waiting on a timer,
 /// and setImmediate is due at once. Each used to cost a whole OS timer tick
 /// (about 15 ms on Windows, 1 ms elsewhere): setImmediate was a 1 ms timer,

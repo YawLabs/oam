@@ -19421,10 +19421,14 @@
         // of the `_requestOut` bytes written so far (_requestFlushed).
         // `_finishAwaitsPath`: end() came while the way to send was still
         // being decided (_emitFetchSocket).
+        // `_requestAccepted`: of those, the bytes the socket has TAKEN --
+        // ahead of `_requestOut`, which waits for the write to come back
+        // (_requestWritableFinished).
         this._finishOnWrite = false;
         this._finishAwaitsPath = false;
         this._requestBytes = null;
         this._requestOut = 0;
+        this._requestAccepted = 0;
         this._requestWritten = false;
         this._exchangeQueued = false;
         this._waitingConnect = false;
@@ -19734,6 +19738,28 @@
         if (this._requestOut < this._requestBytes) return;
         this._requestWritten = true;
         if (this._finishOnWrite) this._emitFinish();
+      }
+
+      // node's `req.writableFinished`, which is what responseOnEnd gates the
+      // socket's hand-back on -- NOT the request's 'finish' event:
+      //
+      //   finished && outputSize === 0 && socket.writableLength === 0
+      //
+      // i.e. end() has been called, the request holds nothing back, and the
+      // socket holds nothing of it either. In node the last of those goes
+      // true the moment a write the kernel can take is taken, so the gate is
+      // open before the answer to the request can be read. oam's socket has
+      // to hear back from its write op for that, and the write and the read
+      // are independent tasks racing through one completion channel, so
+      // under load the ANSWER can arrive first -- and a request whose whole
+      // response has arrived has demonstrably been read in full by the peer,
+      // whatever its own write has yet to report. So once the socket has
+      // TAKEN every request byte, the request is writable-finished; 'finish'
+      // still waits for the write, as node's does.
+      _requestWritableFinished() {
+        if (!this._finishOnWrite) return false;
+        if (this._requestWritten) return true;
+        return this._requestBytes !== null && this._requestAccepted >= this._requestBytes;
       }
 
       // The request is ready to go (end(), a streamed body's first write, or
@@ -20497,6 +20523,8 @@
               outDone();
               return;
             }
+            // Taken by the socket now; written when it says so, below.
+            self._requestAccepted += bytes.byteLength;
             socket.write(
               globalThis.Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength),
               function (err) {
@@ -20877,11 +20905,12 @@
           });
           this.destroyed = true;
           this._emitClose();
-        } else if (this._finished && !res.aborted) {
+        } else if (this._requestWritableFinished() && !res.aborted) {
           this._responseKeepAlive();
         } else {
           // node's requestOnFinish: the whole response arrived before the
-          // request finished.
+          // request finished -- a server that answers an upload it has not
+          // read to the end.
           this.once("finish", function () {
             if (self.shouldKeepAlive && self._responseEnd) self._responseKeepAlive();
           });
