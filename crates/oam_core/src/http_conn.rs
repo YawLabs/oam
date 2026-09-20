@@ -509,19 +509,35 @@ impl ConnWatch {
         *self.close.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// JS is done with the connection's `'secureConnection'` listeners.
-    /// Idempotent: a second call is a no-op, and a call that arrives before
-    /// anyone waits still releases the next [`ConnWatch::resume_wait`].
+    /// JS is done with the listeners for whatever the connection was
+    /// announced as: `'connection'`, and then an https connection's
+    /// `'secureConnection'`. An answer that arrives before anyone waits
+    /// still releases the next [`ConnWatch::resume_wait`].
     pub fn resume(&self) {
         self.resumed.store(true, Ordering::Release);
-        self.resume_notify.notify_waiters();
+        // `notify_one`, not `notify_waiters`: only `notify_one` stores a
+        // permit for a waiter that has not registered yet. `resume_wait`
+        // reads `resumed` before its `Notified` registers, and `resume`
+        // runs on the V8 thread while the connection waits on an io
+        // worker, so with `notify_waiters` an answer landing in that gap
+        // would be lost and the connection would wait for ever: never
+        // served, never closed, holding its maxConnections slot and its
+        // socket, with no timeout running over it. `close`/`closed` two
+        // functions above are the same shape for the same reason.
+        self.resume_notify.notify_one();
     }
 
-    /// Resolves once [`ConnWatch::resume`] has been called.
+    /// Resolves once [`ConnWatch::resume`] has been called, taking that
+    /// answer with it: a connection announced twice waits twice, and the
+    /// second wait does not return on the first answer.
     pub async fn resume_wait(&self) {
         loop {
             let notified = self.resume_notify.notified();
-            if self.resumed.load(Ordering::Acquire) {
+            if self
+                .resumed
+                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
                 return;
             }
             notified.await;
@@ -887,6 +903,49 @@ mod tests {
         assert!(timeouts.admit().is_none());
         timeouts.set_max_connections(f64::INFINITY);
         assert!(timeouts.admit().is_some());
+    }
+
+    /// A connection is announced twice -- `'connection'`, then an https
+    /// connection's `'secureConnection'` -- and each announcement is
+    /// answered by exactly one `resume`. The second wait must not return
+    /// on the first answer, or the handshake's listeners would be skipped.
+    #[tokio::test]
+    async fn each_announcement_waits_for_its_own_resume() {
+        let w = watch(TimeoutSettings::default());
+        // An answer that lands before anyone waits is kept.
+        w.resume();
+        tokio::time::timeout(Duration::from_millis(500), w.resume_wait())
+            .await
+            .expect("the first answer releases the first wait");
+        let unanswered = tokio::time::timeout(Duration::from_millis(150), w.resume_wait()).await;
+        assert!(
+            unanswered.is_err(),
+            "the second announcement waits for its own answer"
+        );
+        let waiter = Arc::clone(&w);
+        let joined = tokio::spawn(async move { waiter.resume_wait().await });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        w.resume();
+        tokio::time::timeout(Duration::from_millis(500), joined)
+            .await
+            .expect("the second answer releases the second wait")
+            .expect("the waiter did not panic");
+    }
+
+    /// `resume` and `resume_wait` run on different threads (JS on V8, the
+    /// connection on an io worker), so an answer that lands between the
+    /// wait's check and its registration must not be lost.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_resume_that_races_the_wait_is_not_lost() {
+        for _ in 0..2000 {
+            let w = watch(TimeoutSettings::default());
+            let answering = Arc::clone(&w);
+            let answer = tokio::spawn(async move { answering.resume() });
+            tokio::time::timeout(Duration::from_secs(5), w.resume_wait())
+                .await
+                .expect("the connection is not left waiting for ever");
+            answer.await.expect("the answer did not panic");
+        }
     }
 
     #[tokio::test]
