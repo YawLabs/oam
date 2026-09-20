@@ -6570,9 +6570,14 @@ const get = () => new Promise((resolve, reject) => {
 // Concurrent, so more than one socket ends up pooled under the one name --
 // with a single socket the skipping loop has nothing to skip.
 await Promise.all([get(), get(), get()]);
-// The hand-backs run on nextTick; a macrotask turn is after all of them.
-await new Promise((r) => setImmediate(r));
-console.log('pooled', Object.values(agent.freeSockets).reduce((n, l) => n + l.length, 0));
+// WAIT for the pool to fill rather than assume a tick is enough: a request
+// whose write has not been acknowledged by the time its response ends is
+// handed back on its 'finish' instead, which is a moment later. Bounded, so
+// a pool that never fills says so instead of hanging.
+const inPool = () => Object.values(agent.freeSockets).reduce((n, l) => n + l.length, 0);
+const full = Date.now() + 10000;
+while (inPool() < 3 && Date.now() < full) await new Promise((r) => setTimeout(r, 5));
+console.log('pooled', inPool());
 agent.destroy();
 console.log('destroyed', sockets.length, sockets.map((s) => s.destroyed).join(','));
 server.close();
