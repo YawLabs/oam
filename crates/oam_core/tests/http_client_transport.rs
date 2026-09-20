@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use common::*;
-use http::header::PROXY_AUTHORIZATION;
+use http::header::{HOST, HeaderValue, PROXY_AUTHORIZATION};
 use http_body_util::BodyExt;
 use hyper_util::client::proxy::matcher::Matcher;
 use oam_core::OpOutcome;
@@ -308,6 +308,121 @@ async fn https_through_connect_tunnel_negotiates_h2() {
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].head.method, "CONNECT");
         assert_eq!(seen[0].head.target, format!("localhost:{}", origin.port));
+    })
+    .await;
+}
+
+/// A request sent over h2 carries its authority in `:authority` and NO `host`
+/// field beside it (RFC 9113 8.3.1). `ClientRequest` sets a `host` header in
+/// its constructor, as node does, so every `http.request` / `https.request`
+/// reaches the transport carrying one; over h2 that would be a second copy of
+/// `:authority`, which Google's frontends answer by resetting the connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_h2_request_sends_the_authority_without_a_host_field() {
+    within(async {
+        let origin = serve_h2_tls("h2 ok").await;
+        let transport = transport(ProxySource::None);
+        let route = transport.route(false, ATTEMPT);
+        let target = format!("https://localhost:{}/x", origin.port);
+        let mut request = get(&target);
+        // What ClientRequest writes: the host, and the port unless it is the
+        // scheme's default (which is also how hyper-util spells the header it
+        // adds for HTTP/1.1, so a request that names its own origin carries
+        // the authority the URI does).
+        request.headers_mut().insert(
+            HOST,
+            HeaderValue::from_str(&format!("localhost:{}", origin.port)).unwrap(),
+        );
+        let response = send(&transport, &route, request).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.version(), http::Version::HTTP_2);
+        let seen = origin.seen();
+        assert_eq!(seen.len(), 1);
+        assert!(!seen[0].head.has("host"), "{:?}", seen[0].head);
+        assert_eq!(
+            seen[0].head.target,
+            format!("https://localhost:{}/x", origin.port)
+        );
+    })
+    .await;
+}
+
+/// A `host` header naming a DIFFERENT authority is the caller's HTTP/1.1
+/// routing override; `:authority` is what carries it on h2, so it becomes
+/// that -- one field, not two -- and the request still goes to the server the
+/// URL dialled.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_h2_host_header_that_overrides_the_authority_becomes_it() {
+    within(async {
+        let origin = serve_h2_tls("h2 ok").await;
+        let transport = transport(ProxySource::None);
+        let route = transport.route(false, ATTEMPT);
+        let target = format!("https://localhost:{}/x", origin.port);
+        let mut request = get(&target);
+        request
+            .headers_mut()
+            .insert(HOST, HeaderValue::from_static("vhost.example"));
+        let response = send(&transport, &route, request).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.version(), http::Version::HTTP_2);
+        let seen = origin.seen();
+        assert_eq!(seen.len(), 1);
+        assert!(!seen[0].head.has("host"), "{:?}", seen[0].head);
+        assert_eq!(seen[0].head.target, "https://vhost.example/x");
+    })
+    .await;
+}
+
+/// A request the caller wrote as an HTTP/2 one -- what `http2.connect` sends,
+/// where the pseudo-headers are the caller's to write -- keeps the
+/// `:authority` it authored; only the `host` field goes, so the pair the RFC
+/// calls malformed still never reaches the wire.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_authored_h2_request_keeps_the_authority_it_wrote() {
+    within(async {
+        let origin = serve_h2_tls("h2 ok").await;
+        let transport = transport(ProxySource::None);
+        let route = transport.route(false, ATTEMPT);
+        let target = format!("https://localhost:{}/x", origin.port);
+        let mut request = request("GET", &target, empty_body());
+        *request.version_mut() = http::Version::HTTP_2;
+        request
+            .headers_mut()
+            .insert(HOST, HeaderValue::from_static("vhost.example"));
+        let response = send(&transport, &route, request).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let seen = origin.seen();
+        assert_eq!(seen.len(), 1);
+        assert!(!seen[0].head.has("host"), "{:?}", seen[0].head);
+        assert_eq!(
+            seen[0].head.target,
+            format!("https://localhost:{}/x", origin.port)
+        );
+    })
+    .await;
+}
+
+/// The same request over HTTP/1.1 keeps its `Host` header: there is no
+/// `:authority` there, and an override is how a caller reaches a named
+/// virtual host on an address it chose.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_h1_request_keeps_the_host_header_it_was_given() {
+    within(async {
+        let server = serve_replies(ok_reply).await;
+        let transport = transport(ProxySource::None);
+        let route = transport.route(false, ATTEMPT);
+        let target = format!("http://127.0.0.1:{}/x", server.port);
+        let mut request = get(&target);
+        request
+            .headers_mut()
+            .insert(HOST, HeaderValue::from_static("vhost.example"));
+        let response = send(&transport, &route, request).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.version(), http::Version::HTTP_11);
+        let seen = server.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].head.all("host"), vec!["vhost.example"]);
+        assert_eq!(seen[0].head.target, "/x");
     })
     .await;
 }

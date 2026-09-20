@@ -487,9 +487,14 @@ pub async fn proxy(connect_reply: Option<&'static [u8]>, reply: &'static [u8]) -
 /// A TLS origin on 127.0.0.1 negotiating h2 (ALPN `h2` only) and answering
 /// every request `200` with `body` and an `x-version` header naming the
 /// protocol the server saw.
+///
+/// Each request is recorded in `seen`: `head.target` is the URI the request's
+/// pseudo-headers built, so it carries `:authority`, and `head.headers` are
+/// the ordinary fields, so a test can see whether a `host` field rode along
+/// beside it.
 pub async fn serve_h2_tls(body: &'static str) -> Server {
     let acceptor = tls_acceptor(&[b"h2"]);
-    serve(move |conn, _, _| {
+    serve(move |conn, _, seen| {
         let acceptor = acceptor.clone();
         async move {
             let Ok(tls) = acceptor.accept(conn.io).await else {
@@ -497,6 +502,23 @@ pub async fn serve_h2_tls(body: &'static str) -> Server {
             };
             let service = hyper::service::service_fn(move |request: http::Request<_>| {
                 let version = format!("{:?}", request.version());
+                seen.lock().unwrap().push(Received {
+                    head: Head {
+                        method: request.method().to_string(),
+                        target: request.uri().to_string(),
+                        headers: request
+                            .headers()
+                            .iter()
+                            .map(|(name, value)| {
+                                (
+                                    name.as_str().to_string(),
+                                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                                )
+                            })
+                            .collect(),
+                    },
+                    body: Vec::new(),
+                });
                 async move {
                     let _: &hyper::body::Incoming = request.body();
                     Ok::<_, std::convert::Infallible>(

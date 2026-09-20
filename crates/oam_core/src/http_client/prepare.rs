@@ -20,7 +20,18 @@
 //!   `accept-encoding: gzip,deflate` (no space: compression_utils.rs
 //!   `to_header_value`; `br` is not advertised).
 //!
-//! `host` is left to hyper-util's `set_host`, which adds it only if absent.
+//! `host` is left to the transport. Over HTTP/1.1 hyper-util's `set_host`
+//! adds one only if absent, so a `host` the caller supplied -- `ClientRequest`
+//! sets one in its constructor, as node does -- is the one that goes out.
+//! Over h2 no `host` field goes out at all: the authority belongs in
+//! `:authority` (RFC 9113 8.3.1), and a request carrying both is what
+//! Google's frontends answer by resetting the connection. hyper's h2 client
+//! takes the field out of the header list and, for a request written as an
+//! HTTP/1.1 one (which is every request from here), lets it name the
+//! authority `:authority` carries, so an override still reaches the server
+//! (`vendor/hyper-1.10.1`, OAM-PATCH item 10). The URI it compares against is
+//! `to_uri`'s, whose authority `url::Url` has already spelled without a
+//! default port -- the same spelling node's Host header uses.
 
 use base64::Engine as _;
 use http::header::{ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};

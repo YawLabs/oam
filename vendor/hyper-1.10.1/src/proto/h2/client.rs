@@ -147,6 +147,56 @@ fn new_ping_config(config: &Config) -> ping::Config {
     }
 }
 
+/// oam: take the `host` field out of a request about to go out over HTTP/2,
+/// and, for a request that was written as an HTTP/1.1 one, let it name the
+/// authority the pseudo-header carries.
+///
+/// RFC 9113 8.3.1: a client that generates HTTP/2 requests directly carries
+/// the authority in `:authority`, which `Pseudo::request` fills in from the
+/// request URI. A `host` field would ride along beside it as a second copy --
+/// Google's frontends answer a request carrying both by resetting the
+/// connection, and an origin that routes on one of the two can be made to
+/// disagree with a front end that routes on the other, which is why the RFC
+/// calls a pair that differs malformed.
+///
+/// Which of the two survives is decided by how the request was written:
+///
+/// - an HTTP/1.1 request being converted here (`Version::HTTP_11`, what
+///   hyper-util's pooled client sends and what it upgrades on ALPN) wrote its
+///   authority in the `host` field, so that is what `:authority` becomes --
+///   the same rule curl applies converting `Host:`, and Go's http2 transport
+///   (`:authority` from `Request.Host`, the field skipped as "Host is
+///   :authority, already sent"). Where the field agrees with the URI, which
+///   is the ordinary case, this changes nothing but the field's removal.
+/// - a request the caller already wrote as an HTTP/2 one (`Version::HTTP_2`)
+///   authored its own pseudo-headers, so its `:authority` stands and only the
+///   field goes.
+///
+/// A CONNECT's `:authority` is the destination of its tunnel, not a routing
+/// hint, so nothing moves it either. The connection is already open when this
+/// runs, so this only ever moves a name inside the header block, never where
+/// the request goes.
+fn authority_from_host(req: &mut ::http::Request<()>) {
+    let Some(host) = req.headers_mut().remove(::http::header::HOST) else {
+        return;
+    };
+    if req.version() == ::http::Version::HTTP_2 || req.method() == Method::CONNECT {
+        return;
+    }
+    let Ok(authority) = host
+        .to_str()
+        .map_err(drop)
+        .and_then(|host| host.parse::<::http::uri::Authority>().map_err(drop))
+    else {
+        return;
+    };
+    let mut parts = ::http::uri::Parts::from(req.uri().clone());
+    parts.authority = Some(authority);
+    if let Ok(uri) = ::http::Uri::from_parts(parts) {
+        *req.uri_mut() = uri;
+    }
+}
+
 pub(crate) async fn handshake<T, B, E>(
     io: T,
     req_rx: ClientRx<B>,
@@ -707,6 +757,7 @@ where
                     let (head, body) = req.into_parts();
                     let mut req = ::http::Request::from_parts(head, ());
                     super::strip_connection_headers(req.headers_mut(), true);
+                    authority_from_host(&mut req);
                     if let Some(len) = body.size_hint().exact() {
                         if len != 0 || headers::method_has_defined_payload_semantics(req.method()) {
                             headers::set_content_length_if_missing(req.headers_mut(), len);

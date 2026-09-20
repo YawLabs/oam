@@ -2,8 +2,9 @@
 
 This directory is hyper **1.10.1** as published on crates.io, plus a fix
 for a client hang (items 1-3 below), one server extension (item 4), and
-four stricter rules in the chunked-body decoder (items 5 to 8), and a
-CONNECT request read without a body (item 9). The root `Cargo.toml` swaps it in with `[patch.crates-io]`.
+four stricter rules in the chunked-body decoder (items 5 to 8), a
+CONNECT request read without a body (item 9), and the `host` field kept out
+of an HTTP/2 request (item 10). The root `Cargo.toml` swaps it in with `[patch.crates-io]`.
 
 - **Upstream:** `hyper-1.10.1.crate`, sha256
   `55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498`
@@ -19,7 +20,7 @@ CONNECT request read without a body (item 9). The root `Cargo.toml` swaps it in 
   directory: it is outside the workspace (no fmt, clippy or tests) and outside
   the unsafe-budget scan. After an edit here, `scripts/check-vendor.sh
   --regen` rewrites the diff; review it and commit it with the edit.
-- **Remove it when** a hyper release ships the fix and items 5 to 9, **and**
+- **Remove it when** a hyper release ships the fix and items 5 to 10, **and**
   oam no longer needs item 4 (see "The request-head extension" below for what
   replacing it takes). To do that:
   1. Delete this directory.
@@ -90,6 +91,12 @@ whole of it.
 9. **`src/proto/h1/role.rs`, `Server::parse`.** A CONNECT request's body
    length is zero, whatever `Content-Length` or `Transfer-Encoding` it
    carries; `test_decoder_request` gains the cases. See "CONNECT" below.
+10. **`src/proto/h2/client.rs`, `ClientTask::poll`.** A request going out
+    over HTTP/2 loses its `host` field, and in an HTTP/1.1 request being
+    converted here that field names the authority `:authority` carries. One
+    new private function, `authority_from_host`, and one line after the
+    existing `strip_connection_headers` call. See "The host field on h2"
+    below.
 
 ## Why
 
@@ -261,6 +268,70 @@ read buffer. hyper 1.11.1's `Server::parse` is unchanged here.
 
 Tested by conformance case 139 (`CONNECT with a length`) and
 `test_decoder_request`.
+
+## The host field on h2 (item 10)
+
+RFC 9113 8.3.1: a client that generates HTTP/2 requests directly carries the
+authority in `:authority`, and a request carrying a `Host` field that
+disagrees with it is malformed. hyper fills `:authority` in from the request
+URI (`h2::frame::Pseudo::request`) and forwards the header map as it stands,
+so a `host` field in that map goes out beside the pseudo-header as a second
+copy of it -- hyper-util adds no `host` of its own on h2, but every caller
+that builds an HTTP/1.1-shaped request does. In oam that is every
+`http.request` / `https.request`: node's `ClientRequest` sets a Host header in
+its constructor (`getHeader('host')` reads it back and `removeHeader('host')`
+drops it, which the proxy agents depend on), and oam's transport forwards the
+header list verbatim.
+
+Google's frontends answer a request carrying both with a connection reset:
+before this hunk, every `https.request` to `www.google.com`,
+`generativelanguage.googleapis.com`, `storage.googleapis.com`,
+`oauth2.googleapis.com` (and so every axios / got / node-fetch request to
+them) failed `ECONNRESET`, while `fetch` and `undici.request` -- which build
+their own header lists and never carry a `host` -- were fine. The general
+hazard is the one the RFC names: an origin that routes on `:authority` and a
+front end that routes on `Host` can be made to disagree about where a request
+is going.
+
+With the patch the field is removed, and which of the two survives follows
+how the request was written:
+
+- An **HTTP/1.1 request being converted here** (`Version::HTTP_11`: what
+  hyper-util's pooled client sends and what it upgrades when ALPN picks h2,
+  and how oam's fetch path builds every request -- `http::Request::new` in
+  `http_client::send`) wrote its authority in the `host` field, so
+  `:authority` becomes that. curl applies the same rule converting `Host:`,
+  and Go's http2 transport sends `:authority` from `Request.Host` and skips
+  the field ("Host is :authority, already sent"). In the ordinary case the
+  field already agrees with the URI -- node's Host header is the host, plus
+  the port unless it is the scheme's default, which is exactly how `url::Url`
+  spells the authority `prepare::to_uri` hands hyper -- so nothing changes
+  but the field's removal. Where they disagree, the caller's HTTP/1.1 routing
+  override reaches the server instead of being dropped in silence.
+- A request **the caller already wrote as an HTTP/2 one**
+  (`Version::HTTP_2`, which is how `h2_session::build_request` builds what
+  `http2.connect` sends) authored its own pseudo-headers, so its
+  `:authority` stands and only the field goes.
+
+A CONNECT's `:authority` is the destination of its tunnel, not a routing
+hint, so nothing moves that either. The connection is already open when this
+runs, so nothing here can move where a request goes.
+
+One divergence follows, on the `http2.connect` API alone: node sends a
+request carrying BOTH a `:authority` and a disagreeing `host` as written
+(`prepareRequestHeaders` fills `:authority` in only when neither was given),
+where oam sends the authored `:authority` and drops the field. That pair is
+the one the RFC calls malformed, and oam did not match node there before this
+hunk either: it sent both fields where node, given only a `host`, sends only
+that.
+
+Tested by `crates/oam_core/tests/http_client_transport.rs`
+`an_h2_request_sends_the_authority_without_a_host_field`,
+`an_h2_host_header_that_overrides_the_authority_becomes_it` and
+`an_authored_h2_request_keeps_the_authority_it_wrote` (all three fail on
+stock 1.10.1), with `an_h1_request_keeps_the_host_header_it_was_given` next to
+them for the other direction. hyper 1.11.1's `ClientTask::poll` is unchanged
+here, and hyperium/hyper has no issue open for it.
 
 ## Reproduction
 
