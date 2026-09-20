@@ -1588,16 +1588,24 @@ runtime as the client; libuv clears the option, so Node's `::` listener takes IP
 everywhere. Entry 36 is the same gap on the `listen(port)` default. A link-local peer carries
 its scope: the interface index on Windows (as Node), the interface name on Linux (as Node),
 and the index elsewhere, where Node writes the name. `req.connection` is the same object.
-What still differs: each request gets its own socket object, so two keep-alive requests on
-one connection see two objects where Node shows one, and the server emits no
-`'connection'` event (Node: one per connection). That socket is an `EventEmitter` that
-never emits. An `'upgrade'` listener gets a real `net.Socket` for the connection, and the
-request's `req.socket` is that socket, as in Node. On an `https` server the object also
-reports the connection's TLS handshake (`encrypted`, `authorized`, `authorizationError`,
-`alpnProtocol`, `servername`, `getPeerCertificate()`, `getPeerX509Certificate()`,
-`getProtocol()`, `getCipher()`), but it is not a `tls.TLSSocket` (`instanceof` is false, and
-it has none of the stream methods), and the server emits no `'secureConnection'` (entry 42).
-`req.client` is `req.socket`, as in Node.
+What still differs: on an `http` server each request gets its own socket object, so two
+keep-alive requests on one connection see two objects where Node shows one, and the server
+emits no `'connection'` event (Node: one per connection); that socket is an `EventEmitter`
+that never emits. An `'upgrade'` listener gets a real `net.Socket` for the connection, and
+the request's `req.socket` is that socket, as in Node.
+
+On an `https` server the socket is the CONNECTION's, as Node's `TLSSocket` is: the object
+`'secureConnection'` hands out (entry 42) is `req.socket`, `res.socket` and `req.client`
+for every request on that connection, so a keep-alive client's second request sees the
+handshake it was admitted on, and it emits `'close'` when the connection ends. It reports
+the handshake (`encrypted`, `authorized`, `authorizationError`, `alpnProtocol`,
+`servername`, `getPeerCertificate()`, `getPeerX509Certificate()`, `getProtocol()`,
+`getCipher()`) and answers `instanceof tls.TLSSocket` and `instanceof net.Socket` -- by
+brand, as oam's own `TLSSocket` does (entry 34): it is not built from the `TLSSocket`
+class and has none of the stream methods, since the connection is read and written
+natively. The `'connection'` event (Node: the plain socket, before the handshake) is still
+not emitted: there is no moment at which that socket belongs to JS. `req.client` is
+`req.socket`, as in Node.
 
 `req.socket.readable` and `req.socket.writable` are Node's: both true while the connection
 is up -- after the request body has ended, and after the response has been sent, for the
@@ -1609,7 +1617,8 @@ request looked already finished and `express.json()` / `express.urlencoded()` le
 `req.body` undefined. Case 165 holds them to Node's.
 
 _(probed)_ Node v22.22.2 and oam, http and https servers on `0.0.0.0`, `::`, `127.0.0.1` and
-`::1`, clients from four local IPv4 and three IPv6 addresses.
+`::1`, clients from four local IPv4 and three IPv6 addresses. The https socket's identity
+and lifetime: case 168.
 
 ### 40. The HTTP server's request parser: what still differs
 
@@ -1731,8 +1740,9 @@ is a `tls.Server` offering `h2`: HTTP/2 sessions with `'session'`, `'stream'` an
 compatibility API, `allowHTTP1`, `'unknownProtocol'` and Node's `403`. `https.createServer`
 is a `tls.Server` too (`ALPNProtocols` `['http/1.1']` by default), and each of its
 connections runs the same handshake with its options before it is served as HTTP/1.1:
-`req.socket` reports the handshake, and a failed one is `'tlsClientError'` and
-`'clientError'`. What differs:
+the connection reaches `'secureConnection'` before anything on it is parsed as HTTP,
+`req.socket` is that same socket and reports the handshake, and a failed handshake is
+`'tlsClientError'` and `'clientError'`. What differs:
 
 - **Camellia- and ARIA-protected keys are refused.** A legacy PEM key with `DEK-Info:
   CAMELLIA-128-CBC` (`openssl rsa -camellia128`) or a PKCS#8 key under PBES2 with Camellia or
@@ -1754,13 +1764,20 @@ connections runs the same handshake with its options before it is served as HTTP
   exists; oam emits the same event and closes it.
 - **No `'connection'` event** on a `tls.Server`: the plain socket is not exposed before
   its handshake. `'tlsClientError'` messages are rustls's; the codes are Node's.
-- **An `https` server's connections are served natively**, so it emits no
-  `'secureConnection'`, and the socket its requests, its `'tlsClientError'` and its
-  `'clientError'` carry is oam's per-request socket object with the handshake's fields
-  (entry 39), not a `tls.TLSSocket`. It has no `ref()` / `unref()` (nor does an `http`
-  server here). `requestCert`, `rejectUnauthorized` and `ALPNProtocols` are read for each
-  new connection as in Node, through accessor properties on the server (Node: data
-  properties).
+- **An `https` server's connections are served natively**, so the socket it hands to
+  `'secureConnection'`, to its requests and to its `'tlsClientError'` / `'clientError'` is
+  not built from the `TLSSocket` class and has none of the stream methods; it carries the
+  handshake and answers `instanceof tls.TLSSocket` by brand (entries 34 and 39). The event
+  itself is Node's: it fires once per connection before anything on it is parsed as HTTP,
+  with `authorized`, `authorizationError`, `getPeerCertificate()`, `getProtocol()`,
+  `getCipher()`, `alpnProtocol`, `servername` and the connection's addresses already
+  filled in, and a listener that destroys the socket stops the request reaching the
+  handler -- so the mutual-TLS pattern Node documents (`requestCert: true` with
+  `rejectUnauthorized: false`, the application deciding in the listener) holds here.
+  `'connection'` is not emitted here either, for the reason in the bullet above. The
+  server has no `ref()` / `unref()` (nor does an `http` server here). `requestCert`, `rejectUnauthorized`
+  and `ALPNProtocols` are read for each new connection as in Node, through accessor
+  properties on the server (Node: data properties).
 - **HTTP/2 sessions have no push, 1xx, trailers or settings.** `stream.pushAllowed` is
   `false` and `pushStream()` throws `ERR_HTTP2_PUSH_DISABLED`; `additionalHeaders()` sends
   nothing and `writeContinue()` / `writeEarlyHints()` return `false`; response trailers
@@ -1785,7 +1802,7 @@ connections runs the same handshake with its options before it is served as HTTP
   with `ERR_OSSL_UNSUPPORTED`.
 
 _(probed)_ Node v22.22.2 and oam as servers for the same real Node clients (tls, https,
-http2, raw TCP): conformance cases 141-144, 154 and 155.
+http2, raw TCP): conformance cases 141-144, 154, 155 and 168.
 
 ### 43. `http.request` over an agent's socket: what differs
 

@@ -18,6 +18,24 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Security
 
+- **An `https` server emitted no `'secureConnection'`, so an application's own client check
+  never ran.** Node documents a mutual-TLS pattern where the server is created with
+  `requestCert: true` and `rejectUnauthorized: false` -- admitting every handshake -- and the
+  application decides for itself in a `'secureConnection'` listener, reading
+  `socket.authorized`, `socket.authorizationError` and `socket.getPeerCertificate()` and
+  destroying the clients it refuses. oam's https server terminates TLS natively and went
+  straight from the handshake to serving HTTP: the event was never emitted, so that listener
+  never ran and a client the application would have refused was served instead. A connection
+  past its handshake now announces itself and nothing on it is parsed as HTTP until the
+  listeners have run; one that destroys the socket stops the request reaching the handler,
+  and the client is answered nothing. `requestCert` with `rejectUnauthorized: true` -- the
+  server refusing on its own -- was already enforced in 0.16.3 and is unchanged. The socket
+  is the connection's, as node's `TLSSocket` is: `req.socket`, `res.socket`, `req.client`
+  and every later request on a keep-alive connection are that one object, it answers
+  `instanceof tls.TLSSocket` (by brand, as oam's own `TLSSocket` answers `instanceof
+  net.Socket`), and it emits `'close'` when the connection ends. `tls.createServer` and
+  `http2.createSecureServer` already emitted `'secureConnection'` with a real `TLSSocket`
+  and are unaffected. Conformance case 168 holds the whole shape to node v22.22.2.
 - **`tls.checkServerIdentity` accepted every certificate.** It answered `undefined`
   whatever the host name and the certificate, so code that checks the name itself -- after
   `rejectUnauthorized: false`, or around a certificate pin -- accepted a certificate issued
