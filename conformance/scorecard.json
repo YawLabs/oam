@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "ea53133",
+  "commit": "69556c1",
   "oamVersion": "oam 0.16.2",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 151,
-      "total": 151,
+      "pass": 156,
+      "total": 156,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -284,6 +284,26 @@
         },
         {
           "case": "16-diagnostics-channel.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "160-x509-certificate-name-printing.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "161-tls-check-server-identity.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "162-tls-secure-contexts-and-client-identities.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "163-tls-served-certificate-chains.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "164-tls-ca-certificate-lists.mjs",
           "status": "pass"
         },
         {
@@ -722,7 +742,7 @@
         "platform": "win32",
         "noBaseline": false,
         "nodeTotal": 1874,
-        "knownMissing": 347,
+        "knownMissing": 345,
         "newMissing": [],
         "staleRatchet": [],
         "absentModules": [],
