@@ -18,6 +18,23 @@
 "use strict";
 (() => {
 
+  // Every web class node ships carries a Symbol.toStringTag, so
+  // `Object.prototype.toString.call(new Headers())` is '[object Headers]'
+  // and not '[object Object]'. Libraries brand-check on exactly that
+  // string: @sindresorhus/is (got 14's type guard) refuses a URL whose tag
+  // reads 'Object', which failed every redirect got followed. node's
+  // descriptor is Web IDL's -- a data property, not writable, not
+  // enumerable, configurable -- and sits on the PROTOTYPE, so subclasses
+  // inherit it.
+  function brand(ctor, name) {
+    Object.defineProperty(ctor.prototype, Symbol.toStringTag, {
+      value: name,
+      writable: false,
+      enumerable: false,
+      configurable: true,
+    });
+  }
+
   // Minimal DOMException (AbortError/TimeoutError carriers) — defined
   // first so the abort primitives below can throw it.
   if (typeof globalThis.DOMException !== "function") {
@@ -43,6 +60,7 @@
         return LEGACY_CODES[this.name] || 0;
       }
     }
+    brand(DOMException, "DOMException");
     globalThis.DOMException = DOMException;
   }
 
@@ -168,6 +186,7 @@
     }
   };
   defineEventPhases(Event);
+  brand(Event, "Event");
   globalThis.Event = Event;
 
   // CustomEvent: the standard way to carry a payload on an event, and a
@@ -295,6 +314,7 @@
   function listenerOf(entry) {
     return entry.ref ? entry.ref.deref() : entry.fn;
   }
+  brand(EventTarget, "EventTarget");
   globalThis.EventTarget = EventTarget;
 
   // ------------------------------------------- AbortController / Signal
@@ -343,6 +363,7 @@
       this.dispatchEvent(event);
     }
   }
+  brand(AbortSignal, "AbortSignal");
   globalThis.AbortSignal = AbortSignal;
 
   class AbortController {
@@ -353,6 +374,7 @@
       this.signal._fire(reason);
     }
   }
+  brand(AbortController, "AbortController");
   globalThis.AbortController = AbortController;
 
   // Headers (Fetch-standard subset): case-insensitive, repeated values
@@ -439,6 +461,7 @@
       return this.entries();
     }
   }
+  brand(Headers, "Headers");
   globalThis.Headers = Headers;
 
   // Response constructor (the SERVING side; fetch's inbound responses come
@@ -475,6 +498,7 @@
       return JSON.parse(await this.text());
     }
   }
+  brand(Response, "Response");
   globalThis.Response = Response;
 
   // ------------------------------------------------------------ structuredClone
@@ -664,8 +688,8 @@
         });
       }
       toString() { return "[object Blob]"; }
-      get [Symbol.toStringTag]() { return "Blob"; }
     }
+    brand(Blob, "Blob");
     globalThis.Blob = Blob;
   }
 
@@ -681,8 +705,8 @@
       get name() { return this._name; }
       get lastModified() { return this._lastModified; }
       toString() { return "[object File]"; }
-      get [Symbol.toStringTag]() { return "File"; }
     }
+    brand(File, "File");
     globalThis.File = File;
   }
 
@@ -736,8 +760,8 @@
         if (typeof value === "string") return value;
         return String(value);
       }
-      get [Symbol.toStringTag]() { return "FormData"; }
     }
+    brand(FormData, "FormData");
     globalThis.FormData = FormData;
   }
 
@@ -799,8 +823,8 @@
         if (this.bodyUsed) throw new TypeError("Cannot clone a Request whose body has already been consumed");
         return new Request(this);
       }
-      get [Symbol.toStringTag]() { return "Request"; }
     }
+    brand(Request, "Request");
     globalThis.Request = Request;
   }
 
@@ -844,7 +868,6 @@
           if (peers.size === 0) _bcChannels.delete(this.name);
         }
       }
-      get [Symbol.toStringTag]() { return "BroadcastChannel"; }
     }
     // MessageEvent: minimal shape for BroadcastChannel messages.
     class MessageEvent extends Event {
@@ -857,7 +880,11 @@
         this.ports = [];
       }
     }
+    // No brand() here: node gives BroadcastChannel no tag of its own, so
+    // Object.prototype.toString.call(new BroadcastChannel(n)) reads
+    // "[object EventTarget]", inherited from its base.
     globalThis.BroadcastChannel = BroadcastChannel;
+    brand(MessageEvent, "MessageEvent");
     globalThis.MessageEvent = globalThis.MessageEvent || MessageEvent;
   }
 
@@ -1872,6 +1899,7 @@
       this.dispatchEvent(ev);
     }
   }
+  brand(WebSocket, "WebSocket");
   globalThis.WebSocket = WebSocket;
 })();
 

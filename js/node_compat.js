@@ -272,6 +272,19 @@
     }
   }
 
+  // node brands each of these with Symbol.toStringTag, so
+  // Object.prototype.toString.call(x) names the class and a brand
+  // check (@sindresorhus/is, is-stream, type-detect) recognises it.
+  // Web IDL's descriptor: a data property, not writable, not
+  // enumerable, configurable.
+  Object.defineProperty(TextEncoder.prototype, Symbol.toStringTag, {
+    value: "TextEncoder",
+    configurable: true,
+  });
+  Object.defineProperty(TextDecoder.prototype, Symbol.toStringTag, {
+    value: "TextDecoder",
+    configurable: true,
+  });
   globalThis.TextEncoder = TextEncoder;
   globalThis.TextDecoder = TextDecoder;
   const utf8Encoder = new TextEncoder();
@@ -13916,6 +13929,19 @@
       }
     };
 
+    // node brands each of these with Symbol.toStringTag, so
+    // Object.prototype.toString.call(x) names the class and a brand
+    // check (@sindresorhus/is, is-stream, type-detect) recognises it.
+    // Web IDL's descriptor: a data property, not writable, not
+    // enumerable, configurable.
+    Object.defineProperty(URL.prototype, Symbol.toStringTag, {
+      value: "URL",
+      configurable: true,
+    });
+    Object.defineProperty(URLSearchParams.prototype, Symbol.toStringTag, {
+      value: "URLSearchParams",
+      configurable: true,
+    });
     globalThis.URL = URL;
     globalThis.URLSearchParams = URLSearchParams;
   }

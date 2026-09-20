@@ -526,6 +526,32 @@
     }
   }
 
+  // node brands each of these with Symbol.toStringTag, so
+  // Object.prototype.toString.call(x) names the class and a brand
+  // check (@sindresorhus/is, is-stream, type-detect) recognises it.
+  // Web IDL's descriptor: a data property, not writable, not
+  // enumerable, configurable.
+  Object.defineProperty(ReadableStream.prototype, Symbol.toStringTag, {
+    value: "ReadableStream",
+    configurable: true,
+  });
+  Object.defineProperty(WritableStream.prototype, Symbol.toStringTag, {
+    value: "WritableStream",
+    configurable: true,
+  });
+  Object.defineProperty(TransformStream.prototype, Symbol.toStringTag, {
+    value: "TransformStream",
+    configurable: true,
+  });
+  Object.defineProperty(CountQueuingStrategy.prototype, Symbol.toStringTag, {
+    value: "CountQueuingStrategy",
+    configurable: true,
+  });
+  Object.defineProperty(ByteLengthQueuingStrategy.prototype, Symbol.toStringTag, {
+    value: "ByteLengthQueuingStrategy",
+    configurable: true,
+  });
+  // node's TextEncoderStream / TextDecoderStream carry no tag.
   globalThis.ReadableStream = ReadableStream;
   globalThis.WritableStream = WritableStream;
   globalThis.TransformStream = TransformStream;
