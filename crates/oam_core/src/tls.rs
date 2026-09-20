@@ -455,9 +455,11 @@ impl std::error::Error for NodeCertRefusal {}
 /// Node's name for a certificate another verifier refused with `error`: the
 /// validity period first (OpenSSL's precedence, as in
 /// [`NodeCertVerifier::verdict`]), then the refusal itself -- a name mismatch
-/// by Node's `checkServerIdentity`, an unknown issuer by the chain the peer
-/// presented. None when Node has no name for it (or its own check would
-/// have accepted the name), and the caller keeps the error it had.
+/// by Node's `checkServerIdentity`, anything else by the chain the peer
+/// presented, which is what OpenSSL reports and the one reading that every
+/// platform's verifier agrees on. None when the refusal is not about the
+/// certificate at all, or when Node's own name check would have accepted the
+/// name; the caller then keeps the error it had.
 pub(crate) fn refusal_in_node_terms(
     end_entity: &CertificateDer<'_>,
     intermediates: &[CertificateDer<'_>],
@@ -475,10 +477,20 @@ pub(crate) fn refusal_in_node_terms(
         CertificateError::NotValidForName | CertificateError::NotValidForNameContext { .. } => {
             check_server_identity(server_name, end_entity.as_ref()).err()
         }
-        CertificateError::UnknownIssuer => {
-            Some(classify_unknown_issuer(end_entity, intermediates, &[]))
-        }
-        reason => named_refusal(reason),
+        // Everything else is the platform saying it could not build a chain
+        // it trusts, and each platform says it differently: webpki answers
+        // `UnknownIssuer`, while Apple's Security framework names only
+        // `errSecCreateChainFailed` that way and returns every other verdict
+        // as an opaque `Other(<OSStatus>)` (rustls-platform-verifier's
+        // `apple.rs`). Reading the reason is therefore not portable --
+        // matching on `UnknownIssuer` alone left a refused certificate
+        // unnamed on macOS, so the transport reported it as `ECONNRESET`
+        // `socket hang up`, which is the very thing having a name is for.
+        // node does not read a reason either: OpenSSL's verdict comes off
+        // the chain that was presented, so take it off the chain here too,
+        // for any refusal the arms above have not already named.
+        reason => named_refusal(reason)
+            .or_else(|| Some(classify_unknown_issuer(end_entity, intermediates, &[]))),
     }
 }
 
@@ -2053,6 +2065,34 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         assert_eq!(
             classify_unknown_issuer(&cert, &[], &[]).message,
             "self-signed certificate"
+        );
+    }
+
+    /// A platform verifier that refuses a chain in its own words still gets
+    /// Node's name. Apple's Security framework maps only
+    /// `errSecCreateChainFailed` to `UnknownIssuer` and returns every other
+    /// refusal as an opaque `Other(<OSStatus>)`; matching on `UnknownIssuer`
+    /// alone left those unnamed, and the transport reported a refused
+    /// certificate as `ECONNRESET` `socket hang up` on macOS.
+    #[test]
+    fn an_opaque_platform_refusal_is_still_named_from_the_chain() {
+        let cert = CertificateDer::from_pem_slice(CERT.as_bytes()).unwrap();
+        let name = ServerName::try_from("localhost").unwrap();
+        let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_789_000_000));
+        let opaque = rustls::Error::InvalidCertificate(CertificateError::Other(
+            rustls::OtherError(Arc::from(Box::<dyn std::error::Error + Send + Sync>::from(
+                "Certificate 0 \"localhost\" has errors: not trusted: -67843",
+            ))),
+        ));
+        let named = refusal_in_node_terms(&cert, &[], &name, now, &opaque)
+            .expect("an opaque certificate refusal is still read off the chain");
+        assert_eq!(named.code, Some("DEPTH_ZERO_SELF_SIGNED_CERT"));
+        assert_eq!(named.message, "self-signed certificate");
+
+        // A refusal that is not about the certificate keeps its own error.
+        assert!(
+            refusal_in_node_terms(&cert, &[], &name, now, &rustls::Error::DecryptError,).is_none(),
+            "only a certificate refusal is renamed"
         );
     }
 
