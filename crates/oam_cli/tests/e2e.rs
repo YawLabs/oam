@@ -23476,6 +23476,102 @@ for (const rejectUnauthorized of [true, false]) {
     );
 }
 
+/// The mutual-TLS pattern node documents for an application that decides for
+/// itself which clients to serve: `requestCert: true` with
+/// `rejectUnauthorized: false`, so the server admits every handshake, and a
+/// 'secureConnection' listener reads `authorized` / `authorizationError` /
+/// `getPeerCertificate()` and destroys the clients it refuses.
+///
+/// oam's https server terminates TLS natively and used to go straight from
+/// the handshake to serving HTTP: it emitted no 'secureConnection' at all,
+/// so this listener never ran and a client the application would have
+/// refused was served instead. What the listener refuses must not reach the
+/// handler and must be answered nothing; what it accepts must be served.
+/// The socket it decides on is the connection's, so the request that
+/// follows carries that same object.
+///
+/// The clients here are oam's own tls.connect, so the test needs no node.
+/// Each sends its request from a timer rather than inline in its own
+/// 'secureConnect' callback: a request pipelined into the handshake flight
+/// can already be buffered when the listener destroys the socket (node
+/// parses what it has buffered, and still answers nothing), so off that
+/// flight is where the refusal is deterministic.
+#[test]
+fn https_secure_connection_listener_decides_which_clients_are_served() {
+    let src = r#"import https from 'node:https';
+import tls from 'node:tls';
+const CA = `__CA__`;
+const connect = (port, opts) => new Promise((resolve) => {
+  let data = '';
+  const s = tls.connect({ host: '127.0.0.1', port, servername: 'localhost', rejectUnauthorized: false, ...opts }, () => {
+    setTimeout(() => {
+      if (!s.destroyed) s.write('GET /private HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n');
+    }, 120);
+  });
+  s.setEncoding('utf8');
+  s.on('data', (d) => (data += d));
+  s.on('error', () => {});
+  s.on('close', () => resolve(data ? data.split('\r\n')[0] + ' ' + data.split('\r\n\r\n')[1] : 'nothing'));
+  setTimeout(() => s.destroy(), 5000).unref();
+});
+
+const seen = [];
+let admitted = null;
+// The server admits every handshake and leaves the verdict to the listener.
+const server = https.createServer(
+  { key: `__KEY__`, cert: `__CERT__`, ca: [CA], requestCert: true, rejectUnauthorized: false },
+  (req, res) => {
+    seen.push('handler reached, peer=' + (req.socket.getPeerCertificate().subject || {}).CN +
+      ' sameSocket=' + (req.socket === admitted));
+    res.end('secret');
+  },
+);
+server.on('secureConnection', (socket) => {
+  const peer = socket.getPeerCertificate();
+  seen.push('secureConnection authorized=' + socket.authorized +
+    ' error=' + socket.authorizationError +
+    ' peer=' + (peer.subject ? peer.subject.CN : 'none') +
+    ' isTLSSocket=' + (socket instanceof tls.TLSSocket));
+  if (!socket.authorized) {
+    seen.push('refused');
+    socket.destroy();
+    return;
+  }
+  admitted = socket;
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+console.log('no certificate: ' + await connect(port, {}));
+console.log('a certificate the CA signed: ' + await connect(port, { cert: `__CLIENT_CERT__`, key: `__CLIENT_KEY__` }));
+console.log('a certificate from an unknown CA: ' + await connect(port, { cert: `__ROGUE_CERT__`, key: `__ROGUE_KEY__` }));
+await new Promise((r) => setTimeout(r, 200));
+server.close();
+for (const line of seen) console.log('server ' + line);
+"#
+    .replace("__CA__", MTLS_CA_CERT)
+    .replace("__KEY__", MTLS_SERVER_KEY)
+    .replace("__CERT__", MTLS_SERVER_CERT)
+    .replace("__CLIENT_CERT__", MTLS_CLIENT_CERT)
+    .replace("__CLIENT_KEY__", MTLS_CLIENT_KEY)
+    .replace("__ROGUE_CERT__", MTLS_ROGUE_CERT)
+    .replace("__ROGUE_KEY__", MTLS_ROGUE_KEY);
+    let stdout = run_ok("https_secure_connection_verdict.mjs", &src);
+    assert_eq!(
+        stdout.replace("\r\n", "\n").trim_end(),
+        // The two clients the listener refused were answered nothing, and
+        // only the one it admitted reached the handler.
+        "no certificate: nothing\n\
+         a certificate the CA signed: HTTP/1.1 200 OK secret\n\
+         a certificate from an unknown CA: nothing\n\
+         server secureConnection authorized=false error=UNABLE_TO_GET_ISSUER_CERT peer=none isTLSSocket=true\n\
+         server refused\n\
+         server secureConnection authorized=true error=null peer=oam client isTLSSocket=true\n\
+         server handler reached, peer=oam client sameSocket=true\n\
+         server secureConnection authorized=false error=DEPTH_ZERO_SELF_SIGNED_CERT peer=rogue client isTLSSocket=true\n\
+         server refused"
+    );
+}
+
 #[test]
 fn oam_mcp_module_batch_array() {
     use std::io::{BufRead, BufReader, Write};
