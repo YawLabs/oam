@@ -136,6 +136,23 @@ pub enum ServerEvent {
         fired: Fired,
         conn: ConnAddrs,
     },
+    /// An https connection past its handshake, before anything on it is
+    /// parsed as HTTP (node's 'secureConnection'). The connection waits for
+    /// `httpConnResume` before it is served, so the listeners run where node
+    /// runs them -- one that destroys the socket stops the request reaching
+    /// the handler.
+    SecureConnection {
+        conn_id: u64,
+        conn: ConnAddrs,
+        /// What the handshake settled (`HandshakeInfo::to_json`): the same
+        /// record the connection's requests carry.
+        tls: Arc<serde_json::Value>,
+    },
+    /// An https connection is over: JS lets go of the socket it handed to
+    /// 'secureConnection' and closes it (node's socket 'close').
+    ConnectionClosed {
+        conn_id: u64,
+    },
     /// A connection refused under `server.maxConnections` (node's 'drop').
     Drop {
         conn: ConnAddrs,
@@ -518,6 +535,15 @@ impl HttpState {
     pub fn set_conn_timeout(&self, conn_id: u64, ms: u64) {
         if let Some(watch) = self.conn(conn_id) {
             watch.set_socket_timeout(ms);
+        }
+    }
+
+    /// JS has run the connection's `'secureConnection'` listeners: it may be
+    /// served now (unless one of them destroyed it, which `close_reason`
+    /// reports to the waiting connection task).
+    pub fn resume_conn(&self, conn_id: u64) {
+        if let Some(watch) = self.conn(conn_id) {
+            watch.resume();
         }
     }
 
@@ -2057,11 +2083,44 @@ async fn serve_https_connection(
     server_id: u64,
     conn_addrs: ConnAddrs,
     policy: HeadPolicy,
-    shutdown: tokio::sync::watch::Receiver<bool>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let tls_meta = Some(Arc::new(info.to_json()));
     let watch = ConnWatch::new(state.next_id(), server_id, Arc::clone(&timeouts));
     let _registration = state.register_conn(Arc::clone(&watch));
+    // node's tlsConnectionListener: the server's 'secureConnection'
+    // listeners see the connection before its HTTP parser does, and the
+    // application decides there whether to serve it at all -- the documented
+    // mutual-TLS pattern reads `authorized` / `authorizationError` /
+    // `getPeerCertificate()` and destroys the clients it refuses. Nothing on
+    // this connection is parsed as HTTP until JS has run them and answered.
+    let announced = queue
+        .send(ServerEvent::SecureConnection {
+            conn_id: watch.id,
+            conn: conn_addrs,
+            tls: Arc::clone(tls_meta.as_ref().expect("https connection has a handshake")),
+        })
+        .await
+        .is_ok();
+    if announced {
+        tokio::select! {
+            _ = watch.resume_wait() => {}
+            // The server closed under the handshake: nobody is left to run
+            // the listeners, so the connection is not served.
+            _ = shutdown.changed() => return,
+        }
+    }
+    let done = queue.clone();
+    let conn_id = watch.id;
+    // A listener refused this client: the connection closes without a
+    // request ever reaching the handler, and without an answer on the wire.
+    if watch.close_reason().is_some() {
+        drop(tls_stream);
+        if announced {
+            let _ = done.send(ServerEvent::ConnectionClosed { conn_id }).await;
+        }
+        return;
+    }
     let js_driven = timeouts.js_driven();
     let service_queue = queue.clone();
     let service_watch = Arc::clone(&watch);
@@ -2082,6 +2141,9 @@ async fn serve_https_connection(
         tls_stream, watch, policy, service, queue, js_driven, conn_addrs, shutdown, None,
     )
     .await;
+    if announced {
+        let _ = done.send(ServerEvent::ConnectionClosed { conn_id }).await;
+    }
 }
 
 /// A failed handshake's error as 'tlsClientError' carries it: node's code,
@@ -2178,6 +2240,18 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
             conn.write_meta(&mut meta);
             super::OpOutcome::Json(meta.to_string())
         }
+        Some(ServerEvent::SecureConnection { conn_id, conn, tls }) => {
+            let mut meta = serde_json::json!({
+                "event": "secureConnection",
+                "connectionId": conn_id,
+                "tls": serde_json::Value::clone(&tls),
+            });
+            conn.write_meta(&mut meta);
+            super::OpOutcome::Json(meta.to_string())
+        }
+        Some(ServerEvent::ConnectionClosed { conn_id }) => super::OpOutcome::Json(
+            serde_json::json!({ "event": "connectionClosed", "connectionId": conn_id }).to_string(),
+        ),
         Some(ServerEvent::Drop { conn }) => {
             let mut meta = serde_json::json!({ "event": "drop" });
             conn.write_meta(&mut meta);

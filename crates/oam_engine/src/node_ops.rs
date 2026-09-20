@@ -331,6 +331,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpServerUpgrades", op_http_server_upgrades),
         ("httpConnSetTimeout", op_http_conn_set_timeout),
         ("httpConnDestroy", op_http_conn_destroy),
+        ("httpConnResume", op_http_conn_resume),
         // --max-http-header-size / --insecure-http-parser, as the CLI set them
         ("httpMaxHeaderSize", op_http_max_header_size),
         ("httpInsecureParser", op_http_insecure_parser),
@@ -2631,6 +2632,19 @@ fn op_http_conn_destroy(
     let conn_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let graceful = args.get(1).is_true();
     core_runtime!(scope).http().destroy_conn(conn_id, graceful);
+}
+
+/// `httpConnResume(connectionId)`: the server's `'secureConnection'`
+/// listeners have run for this connection, so it may be served. A listener
+/// that destroyed the socket has already said so through `httpConnDestroy`,
+/// and the connection sees that instead of being served.
+fn op_http_conn_resume(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let conn_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    core_runtime!(scope).http().resume_conn(conn_id);
 }
 
 fn op_http_max_header_size(

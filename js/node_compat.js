@@ -17420,7 +17420,10 @@
         // req.socket.remoteAddress), per-IP limits -- so an absent record
         // leaves them undefined, as on an unconnected node socket; nothing
         // is ever filled in.
-        const socket = serverSocket(meta);
+        // On a connection the server already handed out a socket for (an
+        // https 'secureConnection'), that object -- node's req.socket is the
+        // connection's socket, not a fresh one per request.
+        const socket = meta.connSocket || serverSocket(meta);
         this.socket = socket;
         // node's deprecated alias, the same object.
         this.connection = socket;
@@ -18195,6 +18198,15 @@
       res.once("close", forget);
     }
 
+    // The socket objects a server's live connections are served through, by
+    // connection id. An https server has one per connection, as node does:
+    // the object 'secureConnection' hands out is req.socket / res.socket for
+    // every request on that connection and the socket of its 'clientError'.
+    function connectionSockets(server) {
+      if (!server._connSockets) server._connSockets = new Map();
+      return server._connSockets;
+    }
+
     // A connection event from the native server.
     function onConnectionEvent(server, meta) {
       const exchange =
@@ -18213,6 +18225,42 @@
           remotePort: meta.remotePort,
           remoteFamily: meta.remoteFamily,
         });
+        return;
+      }
+      if (meta.event === "secureConnection") {
+        // node's tlsConnectionListener: an https connection reaches the
+        // server's 'secureConnection' listeners before anything on it is
+        // parsed as HTTP, with the handshake's verdict on it -- `authorized`,
+        // `authorizationError`, `getPeerCertificate()` -- and the
+        // application decides there whether to serve the client at all
+        // (node documents `requestCert: true` with
+        // `rejectUnauthorized: false` for exactly this). A listener that
+        // destroys the socket stops the request reaching the handler: the
+        // native side holds the connection until httpConnResume, and sees
+        // the destroy instead.
+        //
+        // The socket is the connection's, not the request's: every request
+        // on it, and its 'clientError', carry this same object, as node's
+        // TLSSocket is the same object throughout.
+        const socket = registry._tlsServer.serverSocketView(serverSocket(meta), meta.tls);
+        connectionSockets(server).set(meta.connectionId, socket);
+        try {
+          server.emit("secureConnection", socket);
+        } finally {
+          natives.httpConnResume(meta.connectionId);
+        }
+        return;
+      }
+      if (meta.event === "connectionClosed") {
+        // The connection is over: node's socket is neither readable nor
+        // writable, 'close' has fired, and nothing holds it any more.
+        const sockets = server._connSockets;
+        const socket = sockets && sockets.get(meta.connectionId);
+        if (sockets) sockets.delete(meta.connectionId);
+        if (socket && !socket.destroyed) {
+          socket._markClosed();
+          socket.emit("close", false);
+        }
         return;
       }
       if (meta.event === "tlsClientError") {
@@ -18262,7 +18310,10 @@
       // (socket.setTimeout(ms, cb)), which node registers after it.
       const req = exchange && exchange.req;
       const res = exchange && exchange.res;
-      const socket = req ? req.socket : serverSocket(meta);
+      const socket =
+        (req && req.socket) ||
+        (server._connSockets && server._connSockets.get(meta.connectionId)) ||
+        serverSocket(meta);
       const reqTimeout = req && !meta.requestComplete && req.emit("timeout", socket);
       const resTimeout = res && res.emit("timeout", socket);
       const serverTimeout = server.emit("timeout", socket);
@@ -18335,14 +18386,25 @@
           }
           continue;
         }
+        // A connection that announced itself ('secureConnection') is served
+        // through the socket object that event handed out -- node's
+        // req.socket IS that TLSSocket, the same object for every request on
+        // the connection, so a keep-alive client's second request sees the
+        // handshake it was admitted on.
+        const connSocket =
+          meta.connectionId === undefined || !server._connSockets
+            ? undefined
+            : server._connSockets.get(meta.connectionId);
+        if (connSocket) meta.connSocket = connSocket;
         const req = new IncomingMessage(meta);
         // An upgrade request no listener took is an ordinary one (node).
         req.upgrade = false;
         // The request's socket carries the TCP connection's real
         // addresses (the accept record); an https connection's also reports
-        // what its TLS handshake settled, as node's TLSSocket does.
-        if (meta.tls) registry._tlsServer.serverSocketView(req.socket, meta.tls);
-        else if (encrypted) req.socket.encrypted = true;
+        // what its TLS handshake settled, as node's TLSSocket does. A
+        // connection socket already carries it, from 'secureConnection'.
+        if (meta.tls && !connSocket) registry._tlsServer.serverSocketView(req.socket, meta.tls);
+        else if (encrypted && !connSocket) req.socket.encrypted = true;
         // Node's server keeps a request-stream error from becoming
         // an unhandled 'error' that kills the process: a client that
         // hangs up mid-upload, or a body the server sheds under
@@ -29703,6 +29765,14 @@
     // `tlsSocket instanceof net.Socket` true here, as it is in Node.
     const kNetSocketLike = Symbol.for("oam.netSocketLike");
 
+    // tls.TLSSocket's own brand (see its Symbol.hasInstance). An https
+    // server terminates TLS natively, so the socket it hands to
+    // 'secureConnection', to its requests and to 'clientError' is not built
+    // from the TLSSocket class -- it reports the same handshake the same
+    // way, and Node's is a TLSSocket, so `instanceof` answers as Node's
+    // does. Same shape as net.Socket's brand above.
+    const kTlsSocketLike = Symbol.for("oam.tlsSocketLike");
+
     function socketClosedBeforeConnectionError() {
       var e = new Error("Socket closed before the connection was established");
       e.code = "ERR_SOCKET_CLOSED_BEFORE_CONNECTION";
@@ -29748,6 +29818,11 @@
     // oam's connect() runs the handshake too: 'secureConnect' fires from
     // both paths.
     class TLSSocket extends Duplex {
+      static [Symbol.hasInstance](instance) {
+        if (Function.prototype[Symbol.hasInstance].call(this, instance)) return true;
+        return this === TLSSocket && instance !== null && typeof instance === "object" &&
+          instance[kTlsSocketLike] === true;
+      }
       constructor(socket, options) {
         // autoDestroy ON: once both 'end' and 'finish' have fired, the Duplex
         // destroys itself, which is what net.Socket does with its handle and
@@ -29765,6 +29840,7 @@
         // released, the way Node's handle-close callback does.
         super({ autoDestroy: true, emitClose: false });
         this[kNetSocketLike] = true;
+        this[kTlsSocketLike] = true;
         this.encrypted = true;
         this.authorized = false;
         this.authorizationError = null;
@@ -31453,6 +31529,12 @@
     // failed.
     function serverSocketView(socket, info) {
       info = info || {};
+      // A TLSSocket by brand, as oam's own TLSSocket is a net.Socket by
+      // brand (#132, divergence 34): mutual-TLS code gates on
+      // `socket instanceof tls.TLSSocket` before reading the handshake off
+      // it, and Node hands it a TLSSocket.
+      socket[kNetSocketLike] = true;
+      socket[kTlsSocketLike] = true;
       socket.encrypted = true;
       socket.authorized = info.authorized === true;
       socket.authorizationError = info.authorizationError == null ? null : info.authorizationError;

@@ -274,6 +274,13 @@ pub struct ConnWatch {
     timer_changed: Notify,
     close: Mutex<Option<CloseReason>>,
     close_notify: Notify,
+    /// JS has run the connection's `'secureConnection'` listeners and the
+    /// connection may be served. Node attaches its HTTP parser to a TLS
+    /// connection only once those listeners have returned, so a listener
+    /// that destroys the socket stops the request reaching the handler;
+    /// this is where that verdict is handed back.
+    resumed: AtomicBool,
+    resume_notify: Notify,
     /// hyper holds bytes it has not written out yet: it wrote, or tried to,
     /// and has not flushed since. A connection handed to JS mid-stream (an
     /// upgrade) waits for them, or they would be lost with hyper's buffer.
@@ -311,6 +318,8 @@ impl ConnWatch {
             timer_changed: Notify::new(),
             close: Mutex::new(None),
             close_notify: Notify::new(),
+            resumed: AtomicBool::new(false),
+            resume_notify: Notify::new(),
             unflushed: AtomicBool::new(false),
             flushed: Notify::new(),
         })
@@ -491,6 +500,32 @@ impl ConnWatch {
             }
         }
         self.close_notify.notify_one();
+    }
+
+    /// Why the connection is closing, if it is: what [`ConnWatch::close`]
+    /// was last called with. Read without waiting, for a caller that has
+    /// just given JS its turn and needs the verdict now.
+    pub fn close_reason(&self) -> Option<CloseReason> {
+        *self.close.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// JS is done with the connection's `'secureConnection'` listeners.
+    /// Idempotent: a second call is a no-op, and a call that arrives before
+    /// anyone waits still releases the next [`ConnWatch::resume_wait`].
+    pub fn resume(&self) {
+        self.resumed.store(true, Ordering::Release);
+        self.resume_notify.notify_waiters();
+    }
+
+    /// Resolves once [`ConnWatch::resume`] has been called.
+    pub async fn resume_wait(&self) {
+        loop {
+            let notified = self.resume_notify.notified();
+            if self.resumed.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Resolves once [`ConnWatch::close`] was called with `at_least` or a
