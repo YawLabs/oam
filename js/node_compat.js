@@ -18199,12 +18199,29 @@
     }
 
     // The socket objects a server's live connections are served through, by
-    // connection id. An https server has one per connection, as node does:
-    // the object 'secureConnection' hands out is req.socket / res.socket for
-    // every request on that connection and the socket of its 'clientError'.
-    function connectionSockets(server) {
+    // connection id. One per connection, as node has: the object
+    // 'connection' hands out -- superseded on an https server by the one
+    // 'secureConnection' hands out -- is req.socket / res.socket for every
+    // request on that connection, and the socket its 'timeout' carries.
+    // Both are kept so both close when the connection does, as node's plain
+    // socket and the TLSSocket over it both do.
+    function connectionRecord(server, connectionId) {
       if (!server._connSockets) server._connSockets = new Map();
-      return server._connSockets;
+      let record = server._connSockets.get(connectionId);
+      if (record === undefined) {
+        record = { conn: null, secure: null };
+        server._connSockets.set(connectionId, record);
+      }
+      return record;
+    }
+
+    // The socket a connection's requests are served through, if the server
+    // was told about that connection at all.
+    function connectionSocket(server, connectionId) {
+      if (connectionId === undefined || !server._connSockets) return undefined;
+      const record = server._connSockets.get(connectionId);
+      if (record === undefined) return undefined;
+      return record.secure || record.conn || undefined;
     }
 
     // A connection event from the native server.
@@ -18227,6 +18244,24 @@
         });
         return;
       }
+      if (meta.event === "connection") {
+        // net.Server's 'connection': a connection the server has just
+        // accepted, before a byte is read off it and, on an https server,
+        // before its handshake. An application that decides which clients
+        // it will serve here -- an allow list that destroys the sockets it
+        // refuses -- decides before anything else happens on the
+        // connection: the native side holds it until httpConnResume, and
+        // sees a destroy instead of serving it.
+        const socket = serverSocket(meta);
+        socket._isConnectionSocket = true;
+        connectionRecord(server, meta.connectionId).conn = socket;
+        try {
+          server.emit("connection", socket);
+        } finally {
+          natives.httpConnResume(meta.connectionId);
+        }
+        return;
+      }
       if (meta.event === "secureConnection") {
         // node's tlsConnectionListener: an https connection reaches the
         // server's 'secureConnection' listeners before anything on it is
@@ -18240,10 +18275,12 @@
         // the destroy instead.
         //
         // The socket is the connection's, not the request's: every request
-        // on it, and its 'clientError', carry this same object, as node's
-        // TLSSocket is the same object throughout.
+        // on it carries this same object, as node's TLSSocket is the same
+        // object throughout. It supersedes the plain socket 'connection'
+        // handed out, which node's TLSSocket wraps.
         const socket = registry._tlsServer.serverSocketView(serverSocket(meta), meta.tls);
-        connectionSockets(server).set(meta.connectionId, socket);
+        socket._isConnectionSocket = true;
+        connectionRecord(server, meta.connectionId).secure = socket;
         try {
           server.emit("secureConnection", socket);
         } finally {
@@ -18253,13 +18290,19 @@
       }
       if (meta.event === "connectionClosed") {
         // The connection is over: node's socket is neither readable nor
-        // writable, 'close' has fired, and nothing holds it any more.
+        // writable, 'close' has fired, and nothing holds it any more. Both
+        // of an https connection's sockets close, the TLS one first, as
+        // node's TLSSocket closes before the socket under it.
         const sockets = server._connSockets;
-        const socket = sockets && sockets.get(meta.connectionId);
+        const record = sockets && sockets.get(meta.connectionId);
         if (sockets) sockets.delete(meta.connectionId);
-        if (socket && !socket.destroyed) {
-          socket._markClosed();
-          socket.emit("close", false);
+        if (record) {
+          for (const socket of [record.secure, record.conn]) {
+            if (socket && !socket.destroyed) {
+              socket._markClosed();
+              socket.emit("close", false);
+            }
+          }
         }
         return;
       }
@@ -18293,7 +18336,14 @@
           server._exchanges.delete(meta.requestId);
           const req = exchange.req;
           const socket = req.socket;
-          if (socket && typeof socket._markClosed === "function") socket._markClosed();
+          if (socket && typeof socket._markClosed === "function") {
+            socket._markClosed();
+            // node closes the connection's socket before the response it
+            // was carrying: the exchange ended because the connection went,
+            // and this IS that connection's socket. The `connectionClosed`
+            // that follows finds it already closed and leaves it alone.
+            if (socket._isConnectionSocket) socket.emit("close", false);
+          }
           if (!req.destroyed) {
             const reset = new Error("aborted");
             reset.code = "ECONNRESET";
@@ -18311,9 +18361,7 @@
       const req = exchange && exchange.req;
       const res = exchange && exchange.res;
       const socket =
-        (req && req.socket) ||
-        (server._connSockets && server._connSockets.get(meta.connectionId)) ||
-        serverSocket(meta);
+        (req && req.socket) || connectionSocket(server, meta.connectionId) || serverSocket(meta);
       const reqTimeout = req && !meta.requestComplete && req.emit("timeout", socket);
       const resTimeout = res && res.emit("timeout", socket);
       const serverTimeout = server.emit("timeout", socket);
@@ -18341,7 +18389,22 @@
         const meta = await natives.httpAccept(serverId);
         if (meta === undefined) break;
         if (meta.event !== undefined) {
-          onConnectionEvent(server, meta);
+          try {
+            onConnectionEvent(server, meta);
+          } catch (e) {
+            // node: a listener that throws raises 'uncaughtException' and
+            // the server keeps serving. Letting it out of this loop would
+            // end the loop with it, and every later connection would be
+            // accepted and then never dispatched -- so a check installed
+            // on 'connection' / 'secureConnection' that throws (an mTLS
+            // listener reading a field off an empty certificate) would
+            // take the server down rather than refuse one client. The tick
+            // queue runs the same uncaught ladder node's does, including a
+            // process.on('uncaughtException') that means to keep serving.
+            process.nextTick(() => {
+              throw e;
+            });
+          }
           continue;
         }
         syncServerTimeouts(server);
@@ -18386,15 +18449,13 @@
           }
           continue;
         }
-        // A connection that announced itself ('secureConnection') is served
-        // through the socket object that event handed out -- node's
-        // req.socket IS that TLSSocket, the same object for every request on
-        // the connection, so a keep-alive client's second request sees the
-        // handshake it was admitted on.
-        const connSocket =
-          meta.connectionId === undefined || !server._connSockets
-            ? undefined
-            : server._connSockets.get(meta.connectionId);
+        // A connection the server was told about ('connection', and on an
+        // https server 'secureConnection') is served through the socket
+        // object that event handed out -- node's req.socket IS that socket,
+        // the same object for every request on the connection, so a
+        // keep-alive client's second request sees the handshake it was
+        // admitted on.
+        const connSocket = connectionSocket(server, meta.connectionId);
         if (connSocket) meta.connSocket = connSocket;
         const req = new IncomingMessage(meta);
         // An upgrade request no listener took is an ordinary one (node).
@@ -18430,6 +18491,22 @@
         server.emit("request", req, res);
       }
       stopConnectionsCheck(server);
+      // The server is done. Nothing will serve the connections it was
+      // still holding sockets for, so they close with it -- node's sockets
+      // close before the server's own 'close' -- rather than being kept
+      // for ever in a table nobody reads again.
+      const held = server._connSockets;
+      if (held !== undefined) {
+        server._connSockets = undefined;
+        for (const record of held.values()) {
+          for (const socket of [record.secure, record.conn]) {
+            if (socket && !socket.destroyed) {
+              socket._markClosed();
+              socket.emit("close", false);
+            }
+          }
+        }
+      }
       server.emit("close");
     }
 
@@ -31422,16 +31499,68 @@
               continue;
             }
             if (accepted === undefined) break;
-            // Not awaited: each connection handshakes on its own.
-            this._secureConnection(accepted);
+            // Not awaited: each connection handshakes on its own. A
+            // listener that throws raises 'uncaughtException' as in Node;
+            // letting it out would end this loop and the server would stop
+            // taking connections.
+            try {
+              this._secureConnection(accepted);
+            } catch (e) {
+              process.nextTick(() => {
+                throw e;
+              });
+            }
           }
           this.emit("close");
         })();
       }
-      // One accepted connection: its TLSSocket from the start (Node builds it
-      // on 'connection'), the handshake, the verdict, 'secureConnection'.
+      // One accepted connection: Node's net.Server side hands the plain
+      // socket to the server's 'connection' listeners before any TLS work
+      // is done for this client -- an application that filters clients
+      // there, destroying the sockets it refuses, has decided before the
+      // handshake starts -- and then it is the TLSSocket's (Node builds it
+      // on 'connection' too), the handshake, the verdict,
+      // 'secureConnection'.
       _secureConnection(accepted) {
+        var plain = null;
+        if (this.listenerCount("connection") > 0) {
+          plain = new (registry.get("net").Socket)({
+            _handle: accepted.handle,
+            _remoteAddr: accepted.remoteAddr,
+            _localAddr: accepted.localAddr,
+          });
+          // Never read from: every byte on this connection belongs to the
+          // handshake, and then to the TLSSocket over it.
+          this.emit("connection", plain);
+          // A listener refused this client: the handle closed with the
+          // socket it destroyed, and no handshake is run for it.
+          if (plain.destroyed) return;
+          // The connection is the TLS side's from here: the plain wrapper
+          // lets go of the handle so it cannot close it under the
+          // handshake, and what it can still be asked to do is forwarded
+          // to the socket that now holds the connection.
+          plain._handle = null;
+          registry._activeHandles.delete(plain);
+        }
         var socket = new TLSSocket(null, {});
+        if (plain !== null) {
+          plain.destroy = function destroy(err) {
+            socket.destroy(err);
+            return this;
+          };
+          plain.end = function end() {
+            socket.end();
+            return this;
+          };
+          // Node's plain socket closes with the TLSSocket over it.
+          socket.once("close", function () {
+            if (plain.destroyed) return;
+            plain.destroyed = true;
+            plain.readable = false;
+            plain.writable = false;
+            plain.emit("close", false);
+          });
+        }
         socket._isServer = true;
         socket.server = this;
         socket.authorized = false;

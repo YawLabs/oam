@@ -136,6 +136,16 @@ pub enum ServerEvent {
         fired: Fired,
         conn: ConnAddrs,
     },
+    /// A connection the server has just accepted, before anything is read
+    /// off it and, on an https server, before its handshake (node's
+    /// 'connection'). Like `SecureConnection` below, the connection waits
+    /// for `httpConnResume` before it goes any further, so the listeners
+    /// run where node runs them -- one that destroys the socket stops the
+    /// client being served.
+    Connection {
+        conn_id: u64,
+        conn: ConnAddrs,
+    },
     /// An https connection past its handshake, before anything on it is
     /// parsed as HTTP (node's 'secureConnection'). The connection waits for
     /// `httpConnResume` before it is served, so the listeners run where node
@@ -148,8 +158,9 @@ pub enum ServerEvent {
         /// record the connection's requests carry.
         tls: Arc<serde_json::Value>,
     },
-    /// An https connection is over: JS lets go of the socket it handed to
-    /// 'secureConnection' and closes it (node's socket 'close').
+    /// A connection is over: JS lets go of the socket(s) it was handed for
+    /// it ('connection', and an https connection's 'secureConnection') and
+    /// closes them (node's socket 'close').
     ConnectionClosed {
         conn_id: u64,
     },
@@ -1052,6 +1063,58 @@ async fn check_connections(
 /// When a request takes the connection (`takeover`), what hyper was writing
 /// is written out first, and the stream comes back with the bytes hyper had
 /// read past that request's head.
+/// What JS said about a connection it was told about.
+#[derive(Clone, Copy)]
+struct Announcement {
+    /// JS holds a socket for this connection and must be told when it
+    /// closes, or it keeps it for ever.
+    announced: bool,
+    /// The connection may go on: no listener refused it and the server is
+    /// still there to serve it.
+    serve: bool,
+}
+
+/// Tell JS about a connection and wait for its answer. This is node's
+/// position for `'connection'` and `'secureConnection'`: the server's
+/// listeners see the connection before anything on it is read or parsed,
+/// and the application decides there whether to serve the client at all --
+/// an allow list that destroys the sockets it refuses, or the documented
+/// mutual-TLS pattern that reads `authorized` / `authorizationError` /
+/// `getPeerCertificate()`. Nothing happens on the connection until JS has
+/// run them and answered.
+async fn announce_connection(
+    queue: &mpsc::Sender<ServerEvent>,
+    watch: &ConnWatch,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+    event: ServerEvent,
+) -> Announcement {
+    if queue.send(event).await.is_err() {
+        // The server's queue is gone: there is no JS side left to ask.
+        return Announcement {
+            announced: false,
+            serve: watch.close_reason().is_none(),
+        };
+    }
+    let mut abandoned = false;
+    tokio::select! {
+        // Biased toward JS's answer: a listener that answered and then
+        // closed the server (`server.close()` from inside it) leaves both
+        // ready at once, and its answer is what it said about THIS
+        // connection. Picking between them at random dropped the
+        // connection half the time.
+        biased;
+        _ = watch.resume_wait() => {}
+        // The server closed while JS still held the connection: its accept
+        // loop goes with the server's queue, so no answer is coming and
+        // nothing would dispatch a request read off this connection.
+        _ = shutdown.changed() => abandoned = true,
+    }
+    Announcement {
+        announced: true,
+        serve: !abandoned && watch.close_reason().is_none(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn serve_http1<S, Svc>(
     stream: S,
@@ -1240,7 +1303,7 @@ pub async fn http_serve(
                     let conn_tcp_ids = accept_tcp_ids.clone();
                     let conn_stream_bodies = stream_request_body;
                     let conn_timeouts = Arc::clone(&server_timeouts);
-                    let conn_shutdown = shutdown_rx.clone();
+                    let mut conn_shutdown = shutdown_rx.clone();
                     tokio::spawn(async move {
                         let slot = slot;
                         // node's timeouts hold from the accept: a connection
@@ -1249,7 +1312,47 @@ pub async fn http_serve(
                         let watch =
                             ConnWatch::new(conn_state.next_id(), server_id, conn_timeouts.clone());
                         let registration = conn_state.register_conn(Arc::clone(&watch));
+                        let conn_id = watch.id;
                         let js_driven = conn_timeouts.js_driven();
+                        // node's 'connection': the server's listeners see a
+                        // new connection before a byte is read off it, and an
+                        // application that filters clients there -- an allow
+                        // list that destroys the sockets it refuses -- has
+                        // decided before the request head is parsed. A server
+                        // oam drives itself (oam.serve) has no JS server
+                        // object and nothing to ask.
+                        let announcement = if js_driven {
+                            announce_connection(
+                                &conn_queue,
+                                &watch,
+                                &mut conn_shutdown,
+                                ServerEvent::Connection {
+                                    conn_id,
+                                    conn: conn_addrs,
+                                },
+                            )
+                            .await
+                        } else {
+                            Announcement {
+                                announced: false,
+                                serve: true,
+                            }
+                        };
+                        if !announcement.serve {
+                            // A listener refused this client, or the server
+                            // went away under it: the connection closes
+                            // without a request ever reaching the handler,
+                            // and without an answer on the wire.
+                            drop(stream);
+                            if announcement.announced {
+                                let _ = conn_queue
+                                    .send(ServerEvent::ConnectionClosed { conn_id })
+                                    .await;
+                            }
+                            drop(registration);
+                            drop(slot);
+                            return;
+                        }
                         // A node:http server routes upgrades and CONNECT;
                         // oam.serve hands every request to its handler.
                         let (upgrades, taken) = if js_driven {
@@ -1291,6 +1394,15 @@ pub async fn http_serve(
                         // maxConnections (node counts it until it closes).
                         drop(registration);
                         drop(slot);
+                        // JS lets go of the socket it was handed for this
+                        // connection. An upgraded connection is handed on as
+                        // a socket of its own below, so this one is done
+                        // either way.
+                        if announcement.announced {
+                            let _ = conn_queue
+                                .send(ServerEvent::ConnectionClosed { conn_id })
+                                .await;
+                        }
                         let Some((stream, head, takeover)) = taken else {
                             return;
                         };
@@ -2005,50 +2117,87 @@ pub async fn https_serve(
                     // holds up no one else.
                     tokio::spawn(async move {
                         let slot = slot;
-                        let handshake = tokio::select! {
-                            accepted = crate::tls::server::accept_stream(
-                                stream, &context, &options,
-                            ) => accepted,
-                            _ = conn_shutdown.changed() => return,
-                        };
-                        let refusal = match handshake {
-                            Ok((tls_stream, info)) => {
-                                // node's onServerSocketSecure: a certificate
-                                // that did not verify, under
-                                // rejectUnauthorized, and the socket is
-                                // destroyed before 'secureConnection' (a
-                                // resumed session's; a chain sent in the
-                                // handshake was refused there).
-                                if options.request_cert
-                                    && options.reject_unauthorized
-                                    && !info.authorized
-                                {
-                                    drop(tls_stream);
-                                    Some((
-                                        Some("ECONNRESET".to_string()),
-                                        "socket hang up".to_string(),
-                                    ))
-                                } else {
-                                    serve_https_connection(
-                                        tls_stream,
-                                        info,
-                                        conn_state,
-                                        conn_queue.clone(),
-                                        conn_timeouts,
-                                        server_id,
-                                        conn_addrs,
-                                        policy,
-                                        conn_shutdown,
-                                    )
-                                    .await;
-                                    None
+                        // The connection belongs to JS from the accept, as
+                        // node's does: 'connection' carries the plain socket,
+                        // before any TLS work is done for this client, and an
+                        // application that filters clients there has decided
+                        // before the handshake starts.
+                        let watch = ConnWatch::new(
+                            conn_state.next_id(),
+                            server_id,
+                            Arc::clone(&conn_timeouts),
+                        );
+                        let registration = conn_state.register_conn(Arc::clone(&watch));
+                        let conn_id = watch.id;
+                        let announcement = announce_connection(
+                            &conn_queue,
+                            &watch,
+                            &mut conn_shutdown,
+                            ServerEvent::Connection {
+                                conn_id,
+                                conn: conn_addrs,
+                            },
+                        )
+                        .await;
+                        let mut announced = announcement.announced;
+                        let refusal = if !announcement.serve {
+                            // A listener refused this client, or the server
+                            // went away under it: no handshake is run and no
+                            // 'tlsClientError' is raised -- node's client
+                            // sees the connection close mid-handshake.
+                            drop(stream);
+                            None
+                        } else {
+                            let handshake = tokio::select! {
+                                accepted = crate::tls::server::accept_stream(
+                                    stream, &context, &options,
+                                ) => Some(accepted),
+                                _ = conn_shutdown.changed() => None,
+                            };
+                            match handshake {
+                                None => None,
+                                Some(Ok((tls_stream, info))) => {
+                                    // node's onServerSocketSecure: a
+                                    // certificate that did not verify, under
+                                    // rejectUnauthorized, and the socket is
+                                    // destroyed before 'secureConnection' (a
+                                    // resumed session's; a chain sent in the
+                                    // handshake was refused there).
+                                    if options.request_cert
+                                        && options.reject_unauthorized
+                                        && !info.authorized
+                                    {
+                                        drop(tls_stream);
+                                        Some((
+                                            Some("ECONNRESET".to_string()),
+                                            "socket hang up".to_string(),
+                                        ))
+                                    } else {
+                                        if serve_https_connection(
+                                            tls_stream,
+                                            info,
+                                            conn_state,
+                                            conn_queue.clone(),
+                                            conn_timeouts,
+                                            Arc::clone(&watch),
+                                            conn_addrs,
+                                            policy,
+                                            conn_shutdown,
+                                        )
+                                        .await
+                                        {
+                                            announced = true;
+                                        }
+                                        None
+                                    }
                                 }
+                                Some(Err(failed)) => Some(failure_parts(failed)),
                             }
-                            Err(failed) => Some(failure_parts(failed)),
                         };
                         // The connection is gone: it no longer counts
                         // against maxConnections, and JS hears why (node's
                         // 'tlsClientError').
+                        drop(registration);
                         drop(slot);
                         if let Some((code, message)) = refusal {
                             let _ = conn_queue
@@ -2057,6 +2206,13 @@ pub async fn https_serve(
                                     code,
                                     message,
                                 })
+                                .await;
+                        }
+                        // JS lets go of every socket it was handed for this
+                        // connection, however it ended.
+                        if announced {
+                            let _ = conn_queue
+                                .send(ServerEvent::ConnectionClosed { conn_id })
                                 .await;
                         }
                     });
@@ -2072,7 +2228,9 @@ pub async fn https_serve(
 
 /// One https connection past its handshake, served as HTTP/1.1 until it
 /// ends. node's http timeouts start here (its http side sees
-/// 'secureConnection').
+/// 'secureConnection'). Returns whether JS was handed a socket for it,
+/// which its caller answers with a `ConnectionClosed` when the connection
+/// is finally over.
 #[allow(clippy::too_many_arguments)]
 async fn serve_https_connection(
     tls_stream: tokio_rustls::server::TlsStream<crate::tls::server::ServerIo>,
@@ -2080,46 +2238,35 @@ async fn serve_https_connection(
     state: Arc<HttpState>,
     queue: mpsc::Sender<ServerEvent>,
     timeouts: Arc<ServerTimeouts>,
-    server_id: u64,
+    watch: Arc<ConnWatch>,
     conn_addrs: ConnAddrs,
     policy: HeadPolicy,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
+) -> bool {
     let tls_meta = Some(Arc::new(info.to_json()));
-    let watch = ConnWatch::new(state.next_id(), server_id, Arc::clone(&timeouts));
-    let _registration = state.register_conn(Arc::clone(&watch));
     // node's tlsConnectionListener: the server's 'secureConnection'
     // listeners see the connection before its HTTP parser does, and the
     // application decides there whether to serve it at all -- the documented
     // mutual-TLS pattern reads `authorized` / `authorizationError` /
     // `getPeerCertificate()` and destroys the clients it refuses. Nothing on
     // this connection is parsed as HTTP until JS has run them and answered.
-    let announced = queue
-        .send(ServerEvent::SecureConnection {
+    let announcement = announce_connection(
+        &queue,
+        &watch,
+        &mut shutdown,
+        ServerEvent::SecureConnection {
             conn_id: watch.id,
             conn: conn_addrs,
             tls: Arc::clone(tls_meta.as_ref().expect("https connection has a handshake")),
-        })
-        .await
-        .is_ok();
-    if announced {
-        tokio::select! {
-            _ = watch.resume_wait() => {}
-            // The server closed under the handshake: nobody is left to run
-            // the listeners, so the connection is not served.
-            _ = shutdown.changed() => return,
-        }
-    }
-    let done = queue.clone();
-    let conn_id = watch.id;
-    // A listener refused this client: the connection closes without a
-    // request ever reaching the handler, and without an answer on the wire.
-    if watch.close_reason().is_some() {
+        },
+    )
+    .await;
+    // A listener refused this client, or the server went away under it:
+    // the connection closes without a request ever reaching the handler,
+    // and without an answer on the wire.
+    if !announcement.serve {
         drop(tls_stream);
-        if announced {
-            let _ = done.send(ServerEvent::ConnectionClosed { conn_id }).await;
-        }
-        return;
+        return announcement.announced;
     }
     let js_driven = timeouts.js_driven();
     let service_queue = queue.clone();
@@ -2141,9 +2288,7 @@ async fn serve_https_connection(
         tls_stream, watch, policy, service, queue, js_driven, conn_addrs, shutdown, None,
     )
     .await;
-    if announced {
-        let _ = done.send(ServerEvent::ConnectionClosed { conn_id }).await;
-    }
+    announcement.announced
 }
 
 /// A failed handshake's error as 'tlsClientError' carries it: node's code,
@@ -2237,6 +2382,14 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
                 meta["requestId"] = serde_json::json!(request_id);
                 meta["requestComplete"] = serde_json::json!(fired.request_complete);
             }
+            conn.write_meta(&mut meta);
+            super::OpOutcome::Json(meta.to_string())
+        }
+        Some(ServerEvent::Connection { conn_id, conn }) => {
+            let mut meta = serde_json::json!({
+                "event": "connection",
+                "connectionId": conn_id,
+            });
             conn.write_meta(&mut meta);
             super::OpOutcome::Json(meta.to_string())
         }
