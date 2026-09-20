@@ -6519,6 +6519,79 @@ for (const secure of [false, true]) {{
     );
 }
 
+/// `agent.destroy()` destroys EVERY socket the agent is holding, and the run
+/// ends on its own once it has.
+///
+/// node's `Agent.prototype.destroy` indexes the live `freeSockets[name]`
+/// array, which is safe there only because node's `socket.destroy()` leaves
+/// 'close' for a later tick. oam emits 'close' from inside `destroy()`, so
+/// the agent's own onClose listener spliced that array mid-loop and `n + 1`
+/// landed past the socket that had shifted down -- every second socket under
+/// a name survived. Each survivor stayed open and pooled, and (unref'd, as
+/// every pooled socket is) contributed nothing the event loop would count,
+/// while its in-process PEER -- the socket this server accepted -- sat ref'd
+/// in a read that nothing would ever wake: no FIN was coming, because the
+/// client socket was never destroyed. The script finished its work and the
+/// process never exited, which is how one test consumed the 0.16.3 gate's
+/// whole 15-minute ceiling. node v22.22.2 answers `destroyed 3 true,true,true`
+/// and exits 0.
+#[test]
+fn an_agent_destroy_destroys_every_socket_it_pooled() {
+    let src = r#"
+import http from 'node:http';
+import net from 'node:net';
+const server = net.createServer((c) => {
+  let buf = '';
+  c.on('error', () => {});
+  c.on('data', (d) => {
+    buf += d.toString('latin1');
+    let i;
+    while ((i = buf.indexOf('\r\n\r\n')) !== -1) {
+      buf = buf.slice(i + 4);
+      c.write('HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok');
+    }
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+class OwnAgent extends http.Agent {
+  createConnection(options, cb) { return net.createConnection(options, cb); }
+}
+const agent = new OwnAgent({ keepAlive: true });
+const sockets = [];
+const get = () => new Promise((resolve, reject) => {
+  const req = http.get({ host: '127.0.0.1', port, agent }, (res) => {
+    res.resume();
+    res.on('end', resolve);
+  });
+  req.on('socket', (s) => { if (!sockets.includes(s)) sockets.push(s); });
+  req.on('error', reject);
+});
+// Concurrent, so more than one socket ends up pooled under the one name --
+// with a single socket the skipping loop has nothing to skip.
+await Promise.all([get(), get(), get()]);
+// The hand-backs run on nextTick; a macrotask turn is after all of them.
+await new Promise((r) => setImmediate(r));
+console.log('pooled', Object.values(agent.freeSockets).reduce((n, l) => n + l.length, 0));
+agent.destroy();
+console.log('destroyed', sockets.length, sockets.map((s) => s.destroyed).join(','));
+server.close();
+// Unref'd: it can only fire if something ELSE is still holding the loop open,
+// which is the whole failure being guarded against. Without it the harness
+// would have to wait out its own deadline to say so.
+const watch = setTimeout(() => {
+  console.log('the run did not end on its own');
+  process.exit(3);
+}, 10000);
+watch.unref();
+"#;
+    let out = run_ok("agent_destroy_pool.mjs", src);
+    assert_eq!(
+        out.replace("\r\n", "\n"),
+        "pooled 3\ndestroyed 3 true,true,true"
+    );
+}
+
 /// An http.get on oam's own transport is sent without waiting on a timer,
 /// and setImmediate is due at once. Each used to cost a whole OS timer tick
 /// (about 15 ms on Windows, 1 ms elsewhere): setImmediate was a 1 ms timer,

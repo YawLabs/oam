@@ -21417,8 +21417,19 @@
         const set = sets[s];
         const keys = Object.keys(set);
         for (let v = 0; v < keys.length; v++) {
+          // node indexes the live array here, which is safe only because its
+          // socket.destroy() leaves 'close' for a later tick. oam emits
+          // 'close' from inside destroy(), so the agent's own onClose
+          // listener splices the socket out of the very array being indexed
+          // and `n + 1` lands past whatever shifted down -- every second
+          // socket under a name survived agent.destroy(), still open, still
+          // pooled, and (having been unref'd by keepSocketAlive) invisible
+          // in anything that counts handles. A snapshot destroys each socket
+          // exactly once, which is what node's loop amounts to.
           const setName = set[keys[v]];
-          for (let n = 0; n < setName.length; n++) setName[n].destroy();
+          if (setName === undefined) continue;
+          const sockets = setName.slice();
+          for (let n = 0; n < sockets.length; n++) sockets[n].destroy();
         }
       }
     };
