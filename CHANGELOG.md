@@ -330,8 +330,38 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   does not verify against `ca`, never reaches the `'request'` handler, and without it
   `req.socket.authorized` / `authorizationError` carry Node's verdict. A failed handshake
   is `'tlsClientError'`, passed on as `'clientError'` as in Node.
+- **undici's `MockAgent`, `MockPool` and `MockClient` intercepted nothing.** They were
+  constructible stubs, and `disableNetConnect()` did nothing, so a test suite that installed
+  a `MockAgent` and expected canned answers sent real requests to the hosts its tests name
+  and read the real answers as its mocks -- with no sign that the mock had not been used.
+  Present since the undici shim landed. oam's `fetch` owns its transport and cannot be
+  intercepted from JS, so the three now refuse at construction with `NotSupportedError`
+  (`UND_ERR_NOT_SUPPORTED`), as a dispatcher oam cannot run does. They stay exported, so the
+  import resolves and the failure names itself.
 
 ### Fixed
+
+- **An http or https server's `req.socket` had no `readable` or `writable`.** on-finished
+  reads `!req.socket.readable` as "this request has already finished", so body-parser 2
+  skipped the body: every express 5 `express.json()` and `express.urlencoded()` POST left
+  `req.body` undefined, and clients of such an app read back `{}`. Both flags are now
+  Node's -- true while the connection is up, false with `destroyed` once it is gone -- and
+  the response carries the same socket object (`res.socket`, `res.connection`) plus Node's
+  deprecated `res.finished`, which on-finished needs to tell a response from a request.
+- **`string_decoder.StringDecoder` could not be inherited the ES5 way.** It was a class, so
+  `StringDecoder.call(this, encoding)` threw "Class constructor StringDecoder cannot be
+  invoked without 'new'". That is iconv-lite 0.4's utf8 decoder, under raw-body 2 ->
+  body-parser 1 -> express 4, so every express 4 `express.json()` /
+  `express.urlencoded()` request answered a 500. It is a function constructor now, as
+  node's is, with its three methods on the prototype.
+- **The web classes carried no `Symbol.toStringTag`.** `Object.prototype.toString.call(new
+  URL(...))` read `[object Object]`, and so did `URLSearchParams`, `Headers`, `Response`,
+  `AbortSignal`, `AbortController`, `Event`, `EventTarget`, `MessageEvent`, `DOMException`,
+  `TextEncoder`, `TextDecoder` and the stream classes. Libraries brand-check on that
+  string: @sindresorhus/is refused the URL got 14 follows a redirect to, so no got 14
+  redirect completed. Each class now carries node's descriptor (a data property on the
+  prototype, not writable, not enumerable, configurable), including the four that had a
+  getter instead; `BroadcastChannel` reads as the `EventTarget` it extends, as node's does.
 
 - **`tls.rootCertificates` was an empty array and `tls.getCACertificates` was missing.**
   `ca: [...tls.rootCertificates, privateCA]` -- node's usual way to add a private CA to the
@@ -410,10 +440,12 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   repeated fields.
 - **`setImmediate` waited a whole OS timer tick.** It was a 1 ms timer, so an idle loop
   slept to the next timer tick for it -- about 15 ms on Windows, 1 ms elsewhere; 200
-  awaited immediates took 3 s where node takes 2 ms. An immediate is now due at once.
-  `http.get` / `http.request` on oam's own transport also no longer wait one after
-  `'socket'` unless something listens for `'socket'`: 200 sequential requests to a local
-  server took about 3 s on Windows and now take about 50 ms, as the same `fetch` loop does.
+  awaited immediates took about 1.8 s on 0.16.2 where node takes 1 ms. An immediate is now
+  due at once, and the same 200 take under a millisecond. `http.get` / `http.request` on
+  oam's own transport also no longer wait an immediate after `'socket'` unless something
+  listens for `'socket'`; 200 sequential
+  requests to a local server were never slowed by it (about 75 ms on 0.16.2, about 48 ms
+  now, Node about 42 ms).
 - **`http.Agent` keeps its sockets alive, as node's does.** A request sent over an
   agent's socket (a custom agent, such as the agentkeepalive agent openai v4 passes to
   node-fetch, or a socket got watches) opened a new connection and TLS handshake

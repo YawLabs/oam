@@ -1375,6 +1375,18 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   destination check, for one -- could not run; up to 0.16.2 the request was sent without it.
   The same policy written as a `connect` function works. `http.request` is not affected: it
   never goes through an undici dispatcher, in Node or here. `compose()` is not provided.
+- **`MockAgent`, `MockPool` and `MockClient` refuse at construction**, with the same
+  `NotSupportedError`, and so does everything they carry (`disableNetConnect()`,
+  `get(origin).intercept(...).reply(...)`, `assertNoPendingInterceptors()`). undici's mocks
+  INTERCEPT: a request that matches an interceptor is answered from memory and never
+  dialled, and `disableNetConnect()` turns an unmatched one into an error instead of a real
+  connection. oam's `fetch` owns its transport and cannot be intercepted from JS, so up to
+  0.16.2 the three were constructible stubs that intercepted nothing: a suite that installed
+  a `MockAgent`, called `disableNetConnect()` and expected canned answers sent REAL requests
+  to whatever host it named, and read the real answers as its mocks. The classes stay
+  exported, so `import { MockAgent } from 'undici'` still resolves and the failure names
+  itself; point the code under test at a local server instead. Pinned by
+  `undici_mock_dispatchers_refuse_instead_of_reaching_the_network` (e2e).
 
 **Redirects**
 
@@ -1568,7 +1580,12 @@ _(source)_; the `connect.lookup` behaviour is pinned by e2e tests.
 `req.socket` on an `http` or `https` server carries the connection's own addresses, spelled as
 Node spells them: `remoteAddress` / `remotePort` / `remoteFamily`, `localAddress` /
 `localPort` / `localFamily`, and `address()` for the local end. An IPv4 client of a
-dual-stack `::` listener is `::ffff:a.b.c.d` with family `IPv6`. A link-local peer carries
+dual-stack `::` listener is `::ffff:a.b.c.d` with family `IPv6` -- where such a client is
+accepted at all: oam does not clear `IPV6_V6ONLY` on a listening socket (its client sockets
+do clear it), so an oam `::` listener is dual-stack only where the OS makes it so. On
+Windows it is IPv6-only and an IPv4 client of it is refused with `ECONNREFUSED`, on either
+runtime as the client; libuv clears the option, so Node's `::` listener takes IPv4 clients
+everywhere. Entry 36 is the same gap on the `listen(port)` default. A link-local peer carries
 its scope: the interface index on Windows (as Node), the interface name on Linux (as Node),
 and the index elsewhere, where Node writes the name. `req.connection` is the same object.
 What still differs: each request gets its own socket object, so two keep-alive requests on
@@ -1581,6 +1598,15 @@ reports the connection's TLS handshake (`encrypted`, `authorized`, `authorizatio
 `getProtocol()`, `getCipher()`), but it is not a `tls.TLSSocket` (`instanceof` is false, and
 it has none of the stream methods), and the server emits no `'secureConnection'` (entry 42).
 `req.client` is `req.socket`, as in Node.
+
+`req.socket.readable` and `req.socket.writable` are Node's: both true while the connection
+is up -- after the request body has ended, and after the response has been sent, for the
+next keep-alive exchange -- and both false with `destroyed` once it is destroyed or the
+connection closes under the exchange. `res.socket` and `res.connection` are the same object,
+and `res.finished` is Node's deprecated flag. on-finished reads exactly these (express,
+body-parser, morgan, serve-static), and up to 0.16.2 none of them was there, so every
+request looked already finished and `express.json()` / `express.urlencoded()` left
+`req.body` undefined. Case 165 holds them to Node's.
 
 _(probed)_ Node v22.22.2 and oam, http and https servers on `0.0.0.0`, `::`, `127.0.0.1` and
 `::1`, clients from four local IPv4 and three IPv6 addresses.
@@ -1616,6 +1642,15 @@ target). The parser underneath is hyper's, so some heads still get a different a
   request aborts with `ECONNRESET`, as in Node. On `https` servers and the HTTP/1 side of
   `http2.createServer` the body is read before the handler runs, so a body refused as
   malformed reaches no handler (Node runs it on the headers, and its request aborts).
+- **An `https` handler cannot cut an upload short**, for the same reason: it runs once the
+  body has arrived, so a 413-and-destroy answer takes effect only after the whole body has
+  been read, up to the 100 MB per-request cap, and that much is held for the connection.
+  Measured on Windows against a client streaming a chunked body at an https handler that
+  answers `413` and destroys at once: Node cuts the client off after 2 MB (server peak RSS
+  49 MB), oam after 118 MB (peak 132 MB). The cap and the global body budget still hold, and
+  a body that DECLARES itself over the cap is refused before the handler. An `http` server
+  streams the body to the handler and matches Node (413 after 4 MB, peak 32 MB); `https`
+  joins it with slice 3 of `docs/design/streaming-bodies.md`.
 - A chunked body's trailer fields are in `req.trailers` and `req.rawTrailers` once the
   body has ended, combined as Node combines them, but `rawTrailers` has the names
   lowercased and a repeated name's values side by side.
