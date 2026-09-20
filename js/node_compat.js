@@ -30301,6 +30301,7 @@
       var name = options.servername || options.host || wrap._host || "localhost";
       if (callback) socket.once(event, callback);
       socket._secureContext = context;
+      var releaseContext = releaseSecureContext(socket, context, options);
       socket._connectPending = true;
       var pipe = natives.tlsPipeOpen();
       socket._tlsPipe = pipe;
@@ -30315,9 +30316,11 @@
             tlsVersions.min, tlsVersions.max, alpn,
           );
         } catch (err) {
+          releaseContext();
           process.nextTick(() => socket.destroy(err));
           return;
         }
+        releaseContext();
         _settleTlsConnect(socket, connecting, name, options, rejectUnauthorized, identityCheck, name);
       };
       if (wrap.connecting) {
@@ -30400,11 +30403,6 @@
       // the connection is made with that context's trust (`ca`), version
       // range and certificate, whatever else the options say.
       var identityCheck = identityCheckOf(options);
-      var context = secureContextOf(options);
-      var secure = context.context[kContextState];
-      var ca = secure.ca;
-      var tlsVersions = secure.versions;
-      var alpn = alpnProtocolNames(options.ALPNProtocols);
 
       if (socket._connectPending || tlsIdOf(socket) !== null) {
         // Node: a connect() on a socket that is connecting or connected
@@ -30414,10 +30412,16 @@
         return;
       }
       if (socket._wrappedSocket !== null) {
-        // Over the socket it wraps, not a connection of its own.
+        // Over the socket it wraps, not a connection of its own (it builds
+        // the context there).
         _connectTlsOver(socket, options, callback, event);
         return;
       }
+      var context = secureContextOf(options);
+      var secure = context.context[kContextState];
+      var ca = secure.ca;
+      var tlsVersions = secure.versions;
+      var alpn = alpnProtocolNames(options.ALPNProtocols);
       if (socket.destroyed) {
         // Node reconnects a destroyed socket (its documented reconnect
         // shape): reset the stream state and go again.
@@ -30426,6 +30430,7 @@
       }
       if (callback) socket.once(event, callback);
       socket._secureContext = context;
+      var releaseContext = releaseSecureContext(socket, context, options);
       socket.connecting = true;
       // A `path` names a pipe in node, never host:port (see net's
       // refusePipeConnect).
@@ -30456,9 +30461,11 @@
         } catch (err) {
           // A synchronous refusal (ERR_ACCESS_DENIED for an address the net
           // grant does not cover) fails this socket, never the lookup hook.
+          releaseContext();
           process.nextTick(() => socket.destroy(err));
           return;
         }
+        releaseContext();
         _settleTlsConnect(socket, connecting, serverName, options, rejectUnauthorized,
           identityCheck, options.servername || options.host || "localhost");
       };
@@ -30812,6 +30819,24 @@
       }
       return context;
     }
+    // A context oam built for one connection is released as soon as the
+    // handshake has taken it (the native side holds what it needs from the
+    // moment it starts), or when the socket dies before that; one the caller
+    // built is the caller's, and lives with its SecureContext.
+    function releaseSecureContext(socket, context, options) {
+      var state = context.context[kContextState];
+      if (options.secureContext || state.id === null) return function() {};
+      var released = false;
+      var release = function() {
+        if (released) return;
+        released = true;
+        if (clientContexts) clientContexts.unregister(context.context);
+        natives.tlsClientContextFree(state.id);
+      };
+      socket.once("close", release);
+      return release;
+    }
+
     // A connection's context: `secureContext` as given (it must be one), or
     // one built from the connect options.
     function secureContextOf(options) {

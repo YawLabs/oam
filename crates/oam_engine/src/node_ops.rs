@@ -4043,9 +4043,8 @@ fn op_tls_pipe_close(
 
 /// `__oam.node.tlsConnectOver(pipe, serverName, ca, rejectUnauthorized,
 /// contextId, checkName, minVersion, maxVersion, alpn)`: the client handshake
-/// over a pipe
-/// (`tls.connect({ socket })`); resolves as tlsConnect does, without the
-/// addresses. No net grant is asked: the socket underneath was opened (and
+/// over a pipe (`tls.connect({ socket })`); resolves as tlsConnect does,
+/// without the addresses. No net grant is asked: the socket underneath was opened (and
 /// checked) by whoever made it.
 fn op_tls_connect_over(
     scope: &mut v8::PinScope<'_, '_>,

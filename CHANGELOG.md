@@ -46,7 +46,6 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   context's trust, certificate and version range, whatever the connect options say about
   them. A client certificate may now come as a passphrase-protected key
   (`key: [{ pem, passphrase }]` included) or a `pfx`, which `tls.connect` ignored.
-
 - **The `lookup` connect option was ignored.** `net.connect`, `tls.connect`,
   `http.request` and `https.request` -- the request's own `lookup` and an `http.Agent`'s
   -- never called it and resolved the host through the system resolver, so a host check
@@ -357,7 +356,6 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   behind a chain the server did not send. oam now does the same on both sides.
 - **A truncated encrypted PEM key was `ERR_OSSL_BAD_DECRYPT`** where node reports
   `ERR_OSSL_WRONG_FINAL_BLOCK_LENGTH` (its ciphertext is not whole cipher blocks).
-
 - **The JS heap grew with every callback the event loop ran.** Whatever a loop turn
   touched -- the promise an async op settled and its result, a timer's or immediate's
   callback and arguments -- stayed reachable for the life of the process, so every
