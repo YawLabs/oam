@@ -20,7 +20,7 @@ members = [
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.16.2"
+version = "0.16.3"
 # Internal crates: oam ships BINARIES, nothing here goes to crates.io.
 # Also lets `cargo about` filter them out of THIRD_PARTY_LICENSES.md.
 publish = false
