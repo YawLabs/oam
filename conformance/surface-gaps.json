@@ -436,10 +436,8 @@
           "CLIENT_RENEG_LIMIT",
           "CLIENT_RENEG_WINDOW",
           "DEFAULT_CIPHERS",
-          "SecureContext",
           "convertALPNProtocols",
           "createSecurePair",
-          "getCACertificates",
           "setDefaultCACertificates"
         ],
         "url": [
@@ -933,10 +931,8 @@
           "CLIENT_RENEG_LIMIT",
           "CLIENT_RENEG_WINDOW",
           "DEFAULT_CIPHERS",
-          "SecureContext",
           "convertALPNProtocols",
           "createSecurePair",
-          "getCACertificates",
           "setDefaultCACertificates"
         ],
         "url": [
@@ -1415,10 +1411,8 @@
           "CLIENT_RENEG_LIMIT",
           "CLIENT_RENEG_WINDOW",
           "DEFAULT_CIPHERS",
-          "SecureContext",
           "convertALPNProtocols",
           "createSecurePair",
-          "getCACertificates",
           "setDefaultCACertificates"
         ],
         "url": [
