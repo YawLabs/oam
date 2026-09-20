@@ -1094,6 +1094,16 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   with `EIO` and rustls's message instead. The connection is refused either way; only the
   code differs. (`conformance/cases/145-tls-clients-against-tls-servers.mjs` leaves the
   client's code out for this reason.)
+- **`tls.setDefaultCACertificates()` is absent.** Node 22.15 and later replace the
+  default trust store with it; oam has `NODE_EXTRA_CA_CERTS` and the `ca` option (and
+  `tls.getCACertificates()` to read the default store out) only.
+- **`tls.getCACertificates('bundled')` is the Mozilla store oam's client trusts**, which is
+  webpki-roots' release of it, not Node's own copy: the two lists hold different numbers of
+  certificates. `'system'` is the operating system's store as rustls-native-certs reads it
+  (the current user's Root store on Windows, the keychains' trust settings on macOS, the
+  OpenSSL-layout bundle elsewhere); Node reads a different set of Windows stores, and lists
+  the duplicates among them. Neither list is used to verify anything unless it is passed as
+  `ca`: oam has no `--use-system-ca`.
 - **A refused name carries no certificate.** `tls.connect`'s
   `ERR_TLS_CERT_ALTNAME_INVALID` has Node's message, `reason` and `host`, but its `cert` is
   `{}`: oam's verifier refuses the name inside the handshake, so the peer's chain never
@@ -1695,16 +1705,6 @@ connections runs the same handshake with its options before it is served as HTTP
   default provider has both ciphers). AES and triple DES are read as Node reads them, and the
   ciphers Node 22 itself refuses (single DES, RC2, RC4, Blowfish, CAST5, IDEA, SEED) are
   refused with Node's errors.
-- **`tls.setDefaultCACertificates()` is absent.** Node 22.15 and later replace the
-  default trust store with it; oam has `NODE_EXTRA_CA_CERTS` and the `ca` option (and
-  `tls.getCACertificates()` to read the default store out) only.
-- **`tls.getCACertificates('bundled')` is the Mozilla store oam's client trusts**, which is
-  webpki-roots' release of it, not Node's own copy: the two lists hold different numbers of
-  certificates. `'system'` is the operating system's store as rustls-native-certs reads it
-  (the current user's Root store on Windows, the keychains' trust settings on macOS, the
-  OpenSSL-layout bundle elsewhere); Node reads a different set of Windows stores, and lists
-  the duplicates among them. Neither list is used to verify anything unless it is passed as
-  `ca`: oam has no `--use-system-ca`.
 - **`SNICallback` and `ALPNCallback` are validated but not called.** The server's own key
   and certificate serve every name, and with `ALPNCallback` no protocol is negotiated.
 - **A context's `ciphers`, `ecdhCurve`, `sigalgs`, `dhparam`, `crl`, `sessionIdContext`,
