@@ -13338,38 +13338,47 @@
       return byte >> 6 === 0x02 ? -1 : -2;
     }
 
-    class StringDecoder {
-      constructor(encoding) {
-        this.encoding = normalizeEncoding(encoding);
-        let nb;
-        switch (this.encoding) {
-          case "utf16le":
-            this.text = utf16Text;
-            this.end = utf16End;
-            this.fillLast = simpleFillLast;
-            nb = 4;
-            break;
-          case "utf8":
-            this.fillLast = utf8FillLast;
-            nb = 4;
-            break;
-          case "base64":
-          case "base64url":
-            this.text = base64Text;
-            this.end = base64End;
-            this.fillLast = simpleFillLast;
-            nb = 3;
-            break;
-          default:
-            this.write = simpleWrite;
-            this.end = simpleEnd;
-            return;
-        }
-        this.lastNeed = 0;
-        this.lastTotal = 0;
-        this.lastChar = Buffer.allocUnsafe(nb);
+    // node's StringDecoder is a FUNCTION constructor (lib/string_decoder.js),
+    // not a class, and packages inherit from it the ES5 way:
+    //   function InternalDecoder(options, codec) { StringDecoder.call(this, codec.enc); }
+    //   InternalDecoder.prototype = StringDecoder.prototype;
+    // is iconv-lite 0.4's utf8 decoder, which raw-body 2 -> body-parser 1 ->
+    // express 4 runs for every parsed body. A class throws there ("Class
+    // constructor StringDecoder cannot be invoked without 'new'"), so keep
+    // this callable: the methods below are prototype assignments, enumerable
+    // as node's own are.
+    function StringDecoder(encoding) {
+      this.encoding = normalizeEncoding(encoding);
+      let nb;
+      switch (this.encoding) {
+        case "utf16le":
+          this.text = utf16Text;
+          this.end = utf16End;
+          this.fillLast = simpleFillLast;
+          nb = 4;
+          break;
+        case "utf8":
+          this.fillLast = utf8FillLast;
+          nb = 4;
+          break;
+        case "base64":
+        case "base64url":
+          this.text = base64Text;
+          this.end = base64End;
+          this.fillLast = simpleFillLast;
+          nb = 3;
+          break;
+        default:
+          this.write = simpleWrite;
+          this.end = simpleEnd;
+          return;
       }
+      this.lastNeed = 0;
+      this.lastTotal = 0;
+      this.lastChar = Buffer.allocUnsafe(nb);
+    }
 
+    Object.assign(StringDecoder.prototype, {
       write(buf) {
         if (buf.length === 0) return "";
         let r;
@@ -13386,7 +13395,7 @@
           return r ? r + this.text(buf, i) : this.text(buf, i);
         }
         return r || "";
-      }
+      },
 
       end(buf) {
         const r = buf && buf.length ? this.write(buf) : "";
@@ -13398,7 +13407,7 @@
           return r + "�";
         }
         return r;
-      }
+      },
 
       // utf8 text + utf8 end (overridable below for other encodings).
       text(buf, i) {
@@ -13408,12 +13417,21 @@
         const end = buf.length - (total - this.lastNeed);
         buf.copy(this.lastChar, 0, end);
         return buf.toString("utf8", i, end);
-      }
-
-      fillLast(buf) {
+      },
+    });
+    // oam's own hook, not one of node's three prototype methods: the
+    // constructor gives each encoding its own, and this is the utf8
+    // fallback for an instance built without it. Hidden from
+    // Object.keys(StringDecoder.prototype), which node answers with its
+    // own members only.
+    Object.defineProperty(StringDecoder.prototype, "fillLast", {
+      value: function fillLast(buf) {
         return utf8FillLast.call(this, buf);
-      }
-    }
+      },
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
 
     // ---- simple fillLast (utf16le / base64): accumulate raw bytes ----
     function simpleFillLast(buf) {
