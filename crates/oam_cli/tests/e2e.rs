@@ -6610,7 +6610,9 @@ watch.unref();
 /// `connections=2` where the test above asserts 1, and a second pooled socket
 /// for `agent.destroy()` to skip. This makes that interleaving deterministic:
 /// the socket's write lands normally, only its acknowledgement is deferred.
-/// node v22.22.2 answers exactly the line asserted here.
+/// node v22.22.2 answers exactly the line asserted here; oam answered
+/// `connections=3 reused=false,false,false`, and then hung, because the three
+/// sockets it stranded gave `agent.destroy()` something to skip.
 #[test]
 fn a_late_write_acknowledgement_still_pools_the_socket() {
     let src = r#"
@@ -6649,7 +6651,11 @@ class OwnAgent extends http.Agent {
 }
 const agent = new OwnAgent({ keepAlive: true });
 const reused = [];
-const pooled = [];
+// `reusedSocket` is decided when the request is DISPATCHED, which is the
+// moment this is about: the socket has to be back in the pool by the time
+// the caller asks for the next request, not merely at some point after.
+// (A pool count read here would say the same thing one turn later, where
+// whether the count has caught up is exactly what is not being asserted.)
 for (let i = 0; i < 3; i++) {
   await new Promise((resolve, reject) => {
     const req = http.get({ host: '127.0.0.1', port, agent }, (res) => {
@@ -6659,9 +6665,8 @@ for (let i = 0; i < 3; i++) {
     req.on('response', () => reused.push(req.reusedSocket));
     req.on('error', reject);
   });
-  pooled.push(Object.values(agent.freeSockets).reduce((n, l) => n + l.length, 0));
 }
-console.log(`connections=${connections} reused=${reused} pooled=${pooled}`);
+console.log(`connections=${connections} reused=${reused}`);
 agent.destroy();
 server.close();
 const watch = setTimeout(() => {
@@ -6671,7 +6676,7 @@ const watch = setTimeout(() => {
 watch.unref();
 "#;
     let out = run_ok("late_write_ack_pool.mjs", src);
-    assert_eq!(out, "connections=1 reused=false,true,true pooled=1,1,1");
+    assert_eq!(out, "connections=1 reused=false,true,true");
 }
 
 /// An http.get on oam's own transport is sent without waiting on a timer,
