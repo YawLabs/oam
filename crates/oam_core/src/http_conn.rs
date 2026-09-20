@@ -341,6 +341,21 @@ impl ConnWatch {
         }
     }
 
+    /// node's http side has taken the connection over, and its timeouts
+    /// start here. On an https connection that is the end of the handshake
+    /// (where node attaches its parser, after `'secureConnection'`), not
+    /// the accept: the connection exists for JS from the accept, so that a
+    /// `'connection'` listener can refuse the client before any TLS work is
+    /// done for it, but the handshake's time is the handshake timeout's to
+    /// spend, not headersTimeout's.
+    pub fn served_from_now(&self) {
+        self.touch();
+        let mut phase = self.phase();
+        phase.message_start = Instant::now();
+        phase.begun = false;
+        phase.headers_complete = false;
+    }
+
     /// Bytes arrived. The first byte of a request starts its clock again
     /// (node's `on_message_begin` resets the start the accept set), and the
     /// first byte after a request was all in begins the next one.

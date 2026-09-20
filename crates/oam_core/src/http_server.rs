@@ -2268,6 +2268,11 @@ async fn serve_https_connection(
         drop(tls_stream);
         return announcement.announced;
     }
+    // node's http timeouts start where its http side takes the connection:
+    // here, once the handshake is done and the listeners have run, not at
+    // the accept this connection's clock was set by. What the handshake
+    // spent is the handshake timeout's to spend, not headersTimeout's.
+    watch.served_from_now();
     let js_driven = timeouts.js_driven();
     let service_queue = queue.clone();
     let service_watch = Arc::clone(&watch);
