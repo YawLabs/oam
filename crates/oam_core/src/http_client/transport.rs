@@ -170,8 +170,35 @@ impl HttpTransport {
                 &self.client
             }
         };
+        // A request that told the server the connection closes after it --
+        // node's `Connection: close`, which http.request sends for a socket it
+        // does not keep -- must be the last one on that connection (RFC 9112
+        // s9.6), whether or not the response says `close` back. hyper drops a
+        // connection from the pool only when the RESPONSE says so, so it went
+        // back and the next request could go out on a connection the server
+        // was already closing: a POST failed with ECONNRESET, a GET was sent
+        // twice. It is poisoned instead, as node destroys the socket. HTTP/1
+        // only: an h2 connection carries every stream on it, and no
+        // Connection header at all.
+        let close_requested = request
+            .headers()
+            .get_all(http::header::CONNECTION)
+            .iter()
+            .any(|value| {
+                value.to_str().is_ok_and(|value| {
+                    value
+                        .split(',')
+                        .any(|token| token.trim().eq_ignore_ascii_case("close"))
+                })
+            });
         let capture = capture_connection(&mut request);
         let result = client.request(request).await;
+        if close_requested
+            && let Some(connected) = capture.connection_metadata().as_ref()
+            && !connected.is_negotiated_h2()
+        {
+            connected.poison();
+        }
         // Count this request in on the connection it went out on, whatever
         // the outcome, and learn whether an earlier request had used it and
         // whether any of a response arrived. No connection at all (a connect
