@@ -337,7 +337,19 @@ restore_gate_artifacts "preflight"
 # repo uses. Beyond that it stays shallow: a gate that judged prose would be
 # gameable with a placeholder or wrong about legitimate text, and the policy's
 # own words are "human annotation".
-if [ -f CHANGELOG.md ]; then
+# Non-empty was not enough. Nothing ever MOVED those entries under a version
+# heading, so every release from 0.15.1 on left its notes in [Unreleased] and
+# passed this check on the next release's notes. By 0.16.4 six shipped versions
+# had no heading at all and a single 1100-line block held all of them -- the
+# second time it needed a hand-written backfill (d2632ae did 0.12.0-0.15.0).
+# So the three states are separated here:
+#
+#   1. a `## [x.y.z]` heading for THIS tag exists -- promoted already, or this
+#      is a re-run after a failed attempt. Nothing to check.
+#   2. [Unreleased] is empty -- the log was never written. Fails as before.
+#   3. entries sit under [Unreleased] with no heading for this tag -- the state
+#      that used to pass silently. scripts/changelog-release.sh promotes them.
+if [ -f CHANGELOG.md ] && ! grep -q "^##[[:space:]]*\[${TAG#v}\]" CHANGELOG.md; then
   unreleased_body="$(awk '
     /^#+[[:space:]]*\[?[Uu]nreleased\]?/ { inside = 1; next }
     inside && /^#+[[:space:]]/ && !/^###[[:space:]]/ { exit }
@@ -345,6 +357,7 @@ if [ -f CHANGELOG.md ]; then
     inside { print }
   ' CHANGELOG.md | tr -d '[:space:]')"
   [ -n "$unreleased_body" ] || fail "CHANGELOG.md's Unreleased section has no entries -- RELIABILITY.md requires a public behavior-change log for every release. Add them, or say plainly that this release changes nothing observable. (Bare '### Added'-style subheadings with nothing under them do not count.)"
+  fail "CHANGELOG.md has entries under [Unreleased] but no '## [${TAG#v}]' heading -- they would ship unattributed, which is how 0.15.1 through 0.16.3 ended up with none. Promote and commit them, then re-run: scripts/changelog-release.sh ${TAG#v}"
 fi
 
 # origin/main is load-bearing for BOTH the auto-bump (which pushes a commit

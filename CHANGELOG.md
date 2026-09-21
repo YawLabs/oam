@@ -16,6 +16,15 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+## [0.16.4] - 2026-09-20
+
+The events a server announces a connection with. `'connection'` and
+`'secureConnection'` now reach an application before anything on the connection is
+served, so a listener that filters clients -- an allow list, or the mutual-TLS pattern
+node documents -- runs and is obeyed. The socket an `http` or `https` request carries
+is the connection's own, as node's is, and a listener that throws no longer takes the
+server down.
+
 ### Security
 
 - **A server emitted no `'connection'` or `'secureConnection'`, so an application's own
@@ -37,11 +46,47 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `rejectUnauthorized: true` -- the server refusing on its own -- was already enforced in
   0.16.3 and is unchanged. Conformance cases 168 and 169 hold the whole shape to node
   v22.22.2.
+
 - **A listener that threw took the server down.** A `'connection'` or `'secureConnection'`
   listener that threw -- a mutual-TLS check reading a field off an empty certificate, say --
   ended the server's accept loop, after which every connection was accepted and then never
   dispatched. As in node, the exception is now raised as `'uncaughtException'` and the server
   keeps serving. The same shape still applies to a `'request'` handler that throws.
+
+### Changed
+
+- **An http or https server's `req.socket` is the connection's socket**, as node's is: the
+  object `'connection'` -- and on an https server `'secureConnection'` -- handed out. Up to
+  0.16.3 an http server made a new one per request, so two keep-alive requests saw two
+  objects where node shows one; they now see one, it emits `'close'` when the connection
+  ends, and `res.socket` / `res.connection` / `req.client` are that same object. It also
+  answers `instanceof net.Socket`, and on an https server `instanceof tls.TLSSocket`, where
+  both were `false` before -- by brand, as oam's own `TLSSocket` answers `instanceof
+  net.Socket` (0.16.0). The object is still not a stream: it has the addresses,
+  `address()`, `setTimeout`, `destroy` and `end`, and none of `write`, `pause`, `resume`,
+  `setNoDelay`, `setKeepAlive`, `ref` or `unref`, so code that reads an `instanceof` test as
+  a promise of the stream API will now reach a missing method where it used to take its
+  non-socket path. It is branded because a check that filters clients in a `'connection'` or
+  `'secureConnection'` listener is commonly written behind exactly that test, and a check
+  that silently skipped itself would be the weakness the Security entry above is about.
+  Divergence 39 lists what the object has.
+
+## [0.16.3] - 2026-09-20
+
+A security release over both ends of the HTTP stack, and the one that made
+oam's own transport carry real traffic. On the client, checks an application installs
+were not being called: `tls.checkServerIdentity`, a `secureContext`, a `lookup`
+function, an `http.Agent`'s own `createConnection`, an undici dispatcher's `connect`.
+Requests could also leave by a route the caller had not asked for -- a followed
+redirect, an environment proxy, a rewritten host. On the server, every client was
+reported as `127.0.0.1`, request heads Node refuses were accepted, neither a head's
+size nor a connection's life was bounded, and a TLS server neither asked for a client
+certificate nor, over HTTP/2, encrypted at all. Alongside those, the correctness fixes
+that came out of running real clients over the new transport: keep-alive pooling,
+`setImmediate`, and a heap that grew with every callback the loop ran.
+
+### Security
+
 - **`tls.checkServerIdentity` accepted every certificate.** It answered `undefined`
   whatever the host name and the certificate, so code that checks the name itself -- after
   `rejectUnauthorized: false`, or around a certificate pin -- accepted a certificate issued
@@ -56,6 +101,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   character is a JSON string literal in `subjectaltname` / `subjectAltName` / `infoAccess`,
   so no DNS name can be read out of a URI, an e-mail address, a directory name or an
   otherName in that list (the shape of CVE-2021-44532).
+
 - **`tls.createSecureContext` checked nothing, and `secureContext` was ignored.**
   `createSecureContext(options)` copied the options and read no key: a wrong or missing
   passphrase, a key that is not a key or not its certificate's, and a PKCS#12 bundle that
@@ -70,6 +116,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   context's trust, certificate and version range, whatever the connect options say about
   them. A client certificate may now come as a passphrase-protected key
   (`key: [{ pem, passphrase }]` included) or a `pfx`, which `tls.connect` ignored.
+
 - **The `lookup` connect option was ignored.** `net.connect`, `tls.connect`,
   `http.request` and `https.request` -- the request's own `lookup` and an `http.Agent`'s
   -- never called it and resolved the host through the system resolver, so a host check
@@ -81,6 +128,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   connection), and only the answered addresses are dialled. `fetch` also resolves
   through a replaced `dns.lookup`. Under `--permission --allow-net`, each address a hook
   answers is checked against the grant as a connection to that address would be.
+
 - **An `http.Agent` whose `createConnection` was overridden was not used.**
   `http.request` and `https.request` sent every request through oam's own HTTP client,
   so a custom or patched agent -- the way request-filtering-agent, ssrf-req-filter and
@@ -97,14 +145,17 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `maxHeaderSize`, and `http.request` now takes node's per-request `maxHeaderSize` and
   `insecureHTTPParser` options, validated as node validates them; an oversized head
   fails the request with node's own `HPE_HEADER_OVERFLOW` error.
+
 - **`http.request` followed redirects.** node's `http.request` returns a `3xx` as the
   response; oam's followed it, so a request whose URL an application had vetted could
   end at a host it never named. It now returns the `3xx`, as node does.
+
 - **`fetch` ignored `redirect: 'manual'` and `redirect: 'error'`.** Every redirect was
   followed, so an application that asks for `'manual'` to vet each hop before following
   it got the target's response instead. `'manual'` now returns the `3xx` and `'error'`
   rejects with node's `unexpected redirect` cause, and a value outside the enum is
   refused, as in node.
+
 - **`http.request` dialled a rewritten host.** On oam's own transport a request's
   `host` went through the URL parser, which turns spellings node's resolver refuses --
   percent-escapes, octal or zero-padded IPv4, a trailing dot, a tab, fullwidth digits --
@@ -115,6 +166,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   The resolver behind `dns.lookup`, `net.connect` and `tls.connect` is handed the name's
   UTS #46 ToASCII form, as node's is (a soft hyphen vanishes, a fullwidth digit is a digit,
   a name ToASCII refuses is `getaddrinfo EINVAL`).
+
 - **`http.request` went through the environment proxy.** oam sent every `http.request` /
   `https.request` through `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`, which node v22 applies
   only under `NODE_USE_ENV_PROXY=1`; behind a proxy `res.socket.remoteAddress` was the
@@ -123,11 +175,13 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `NODE_USE_ENV_PROXY=1` (or `--use-env-proxy` in `NODE_OPTIONS`) is set, and then only
   over node's own global agents, as node does. `fetch` still honours the environment
   proxy.
+
 - **A `socketPath` or `path` connected to `host:port`.** node connects `http.request`'s
   `socketPath` and `net.connect` / `tls.connect`'s `path` to that Unix domain socket or
   named pipe; oam ignored them and connected to `host:port` (by default `localhost:80`),
   sending the request to whatever listened there. oam has no client for either, so these
   now fail with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` and nothing is dialled.
+
 - **The `localAddress` and `localPort` connect options were ignored.** `net.connect`,
   `tls.connect` and `http.request` validated `localAddress` and then connected from the
   default address and an ephemeral port, so a connection an application meant to leave
@@ -135,17 +189,20 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   for -- left from another. The socket is now bound to them before it dials, as in node,
   and a bind that fails is the connection's error (`bind EADDRNOTAVAIL 192.0.2.1`); a
   non-number `localPort` throws node's `ERR_INVALID_ARG_TYPE`.
+
 - **`Object.prototype.toString.call(process)` was `[object Object]`.** node's is
   `[object process]`, and axios checks exactly that to choose its node http adapter: on
   oam it chose its fetch adapter instead, which ignores `httpAgent` / `httpsAgent` -- the
   agents guard packages such as request-filtering-agent hand it. `process` now carries
   node's `Symbol.toStringTag`.
+
 - **A refused certificate was reported as `socket hang up`.** On oam's own transport an
   `https.request` whose server certificate did not verify failed with `ECONNRESET`
   `socket hang up`, and `fetch`'s cause carried no code, where the same request over
   `tls.connect` had node's: retry logic that retries `ECONNRESET` retried a refused
   certificate. Both now report node's code and message (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`,
   `DEPTH_ZERO_SELF_SIGNED_CERT`, `CERT_HAS_EXPIRED`, ...).
+
 - **TLS options of `https.request` were not applied.** A verifying `https.request` went
   through one shared client that ignored the request's `ca`, client certificate,
   `servername` and `checkServerIdentity`, and `tls.connect` never called a
@@ -153,6 +210,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   was not enforced. `tls.connect` now calls it after the chain check and fails the
   connection with its error, and an `https.request` carrying any of these options goes
   over `tls.connect`.
+
 - **`req.socket` did not name the connection.** A `ClientRequest`'s socket reported the
   host as written, `localAddress` `127.0.0.1` and `localPort` `0`, so a check of
   `req.socket.remoteAddress` / `res.socket.remoteAddress` against a list of internal
@@ -160,6 +218,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   port and family and the local end (by `'response'`, and on `'connect'` for a request
   sent over an agent's socket); `req.socket` is `null` until `'socket'`, and an https
   socket carries the verified session (`getPeerCertificate()`, `authorized`).
+
 - **`http2.connect` ignored its options.** Every stream went out on oam's shared HTTP
   client, so the session's `lookup`, `createConnection`, `ca`, `servername`,
   `checkServerIdentity` and `rejectUnauthorized` were never applied and
@@ -169,6 +228,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   socket's `'lookup'` / `'connect'` listeners apply as they do to that socket, a refusal
   fails the session with its own error, and `session.socket` is node's proxy of the
   real socket. `tls.connect({ socket })` also passes `ALPNProtocols` on.
+
 - **An undici dispatcher's connection policy was ignored.** `import 'undici'` is oam's
   shim even when the package is installed, and the shim honoured only `connect.lookup`: a
   `connect` function (`new Agent|Pool|Client({ connect(opts, cb) })`), the TLS options of
@@ -182,6 +242,375 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   exports; a factory's dispatchers decide their origins' connections. A dispatcher oam
   cannot run as undici would (an overridden `dispatch()`, `interceptors`, a foreign
   object) fails the request with `NotSupportedError` instead of being skipped.
+
+- **`http` and `https` servers reported every client as `127.0.0.1`.** `req.socket`
+  carried a fixed `remoteAddress` of `127.0.0.1` and no port or family, whatever address
+  the client connected from, so anything that decides on the peer address (a
+  loopback-only route, a loopback `trust proxy` setting, per-IP allow lists and rate
+  limits) treated every client as local. `req.socket` now carries the connection's own
+  `remoteAddress`, `remotePort`, `remoteFamily`, `localAddress`, `localPort` and
+  `localFamily`, spelled as Node spells them, `address()` returns the local end, and
+  `req.connection` is the same object. The socket an `'upgrade'` listener receives now
+  reports the client's real family (it said `IPv4` for every client) and its local end.
+
+- **The `http` server accepted request heads that Node refuses.** A request carrying both
+  `Content-Length` and `Transfer-Encoding` (in either order) reached the handler with
+  both headers, and so did a repeated `Content-Length`, a `Transfer-Encoding` with a
+  coding after `chunked`, and header lines ending in a bare LF; an upgrade request was
+  not checked at all (obs-fold and control characters got through too). A proxy in
+  front of the server that frames such a request differently disagrees with it about
+  where the request ends. These heads are now answered `400` and the connection is
+  closed, as in Node, for `http`, `https` and the HTTP/1 side of `http2.createServer`;
+  `insecureHTTPParser` and `--insecure-http-parser` relax Node's framing rules
+  (`Content-Length` with `Transfer-Encoding`, bare LF, codings after `chunked`) as Node's
+  do, while obs-fold and control characters stay refused.
+
+- **`maxHeaderSize` was not enforced.** Request heads of hundreds of KiB were accepted,
+  and the server's `maxHeaderSize` option, `--max-http-header-size` and
+  `http.maxHeaderSize` had no effect. Heads are now counted as Node counts them and
+  answered `431` at the limit (16 KiB by default), and a head that never ends is refused
+  once it outgrows four times the limit (at least 64 KiB) instead of being buffered on.
+  `--max-http-header-size` and `--insecure-http-parser` are accepted on the command line
+  and in `NODE_OPTIONS`.
+
+- **The `http` server routed upgrade and CONNECT requests differently from Node.** An
+  ordinary request could be treated as an upgrade and its connection left open, an
+  upgrade could reach the `'request'` handler, and CONNECT never reached a `'connect'`
+  listener. Requests are now routed as Node routes them, on any request of a keep-alive
+  connection: a request with an `Upgrade` header and `upgrade` in `Connection` goes to
+  `'upgrade'` while the server has an `'upgrade'` listener and is an ordinary request
+  otherwise, and every CONNECT goes to `'connect'` -- with the tunnel's first bytes as
+  `head` -- or, with no listener, has its socket destroyed. `https` servers now close a
+  CONNECT rather than hand it to the `'request'` handler.
+
+- **A bare LF in a chunked body's trailers was not refused.** hyper's trailer reader and
+  its trailer parser disagreed about where the trailers end, so part of what followed
+  was read and discarded while the connection stayed open. Such a body is now answered
+  `400` and the connection is closed, as in Node. The same applies to chunked responses
+  read by `fetch` and `http.request`, which now fail.
+
+- **Whitespace after a chunk size, and malformed chunk extensions, were accepted.** A
+  chunked request body whose size line had spaces or tabs after the size was read as if
+  they were not there, and a chunk extension was skipped unread whatever it held, where
+  Node, and other parsers, refuse such lines; a proxy in front of the server can frame
+  such a body differently. They are now answered `400` and the connection is closed, as
+  in Node -- whitespace after the size even under `insecureHTTPParser`, where Node
+  accepts it. Chunk extensions are read to Node's grammar in responses too, where `fetch`
+  and `http.request` now fail as Node's do. Any other chunked body the
+  parser refuses is now answered with Node's status too -- `400`, or `413` for chunk
+  extensions over the limit -- where the connection used to close without one, and the
+  handler sees its request abort with `ECONNRESET`. `https` and `http2.createServer`
+  servers no longer hand a handler a body that failed part way as if it were complete.
+
+- **Framing fields in a chunked body's trailers were accepted.** A `Content-Length` or
+  `Transfer-Encoding` field in the trailer section of a chunked request was read as an
+  ordinary field and the connection went on to its next request, where Node refuses the
+  body; a front end that acts on such a field frames the connection differently. Such a
+  request is now answered `400` and the connection is closed, as in Node, and `fetch` and
+  `http.request` fail a response whose trailers carry `Content-Length`, as Node's do.
+
+- **Response heads had no size limit either.** `fetch`, `http.request`, `https.request`
+  and `undici.request` accepted response heads of hundreds of KiB. They now refuse a
+  head at Node's limit (16 KiB, or `--max-http-header-size`), counted as Node counts it
+  for each API, on every hop including redirects: `fetch` rejects with `fetch failed`
+  and a cause coded `UND_ERR_HEADERS_OVERFLOW`, `http.request` and `https.request` fail
+  with Node's own `HPE_HEADER_OVERFLOW` error (`Parse Error: Header overflow`), and
+  `undici.request` fails with a cause coded `HPE_HEADER_OVERFLOW`.
+
+- **`http` and `https` servers applied none of Node's connection timeouts.**
+  `headersTimeout`, `requestTimeout`, `keepAliveTimeout`, `server.timeout` and
+  `setTimeout` were stored and ignored, and TLS handshakes had no time limit, so a
+  connection that sent nothing, stopped part way through a request, or sat idle between
+  requests stayed open for good. They are now enforced as Node enforces them, with
+  Node's defaults (60 s for the headers, 300 s for a request, 5 s plus a 1 s buffer
+  between requests, 120 s for a TLS handshake): a late request is answered `408` and
+  closed, an idle connection is closed, and the socket timeout emits `'timeout'` on the
+  request, response and server, destroying the connection when nobody listens.
+  `connectionsCheckingInterval`, `keepAliveTimeoutBuffer`, `handshakeTimeout`,
+  `req.setTimeout` and `res.setTimeout` are supported too, and a response whose
+  connection is lost before it is sent now emits `'close'`, as in Node.
+
+- **`http`, `https` and `http2` servers stopped taking connections at 256.** Each server
+  dropped every new connection once 256 were open, so clients holding that many open,
+  idle or busy, kept everyone else out -- for good on `http2.createServer`, whose
+  connections had no timeouts. That limit is gone: as in Node, a server takes
+  connections for as long as the OS gives them. `server.maxConnections` is supported on
+  `http` and `https` servers, with Node's `'drop'` event, and the HTTP/1 connections of
+  `http2.createServer` are held to the `http` server's default timeouts.
+
+- **One idle connection stopped an `http` server from accepting.** The server waited
+  for a new connection's first bytes before accepting the next one, so a connection
+  that sent nothing, such as a browser preconnect, kept every later client waiting. Each
+  connection is now read on its own task.
+
+- **The `h2` crate is updated from 0.4.14 to 0.4.19**, which bounds the number of empty
+  HTTP/2 DATA frames a peer can have queued (RUSTSEC-2026-0258, GHSA-q83h-524g-xf6h: a
+  low-severity denial of service against a stream that is not being read). oam's
+  HTTP/2 server (`http2.createServer`) and the `fetch` transport's HTTP/2 connections
+  both use it.
+
+- **`http2.createSecureServer` served cleartext.** It ignored `key`, `cert` and every
+  other TLS option and returned an `http2.createServer`, so its port spoke HTTP/2 without
+  TLS (h2c) and plain HTTP/1.1: a server meant to be reached only over TLS answered
+  cleartext clients, and TLS clients could not connect to it. Present since 0.6.0. It is
+  now Node's `Http2SecureServer`, a `tls.Server` that offers `h2` by ALPN: a client that
+  does not complete a TLS handshake gets no response, only a `'tlsClientError'` on the
+  server. A connection that negotiates `h2` is served as an HTTP/2 session (`'session'`,
+  `'stream'`, and the `(req, res)` compatibility API for the `'request'` handler); one
+  that negotiates `http/1.1` or nothing is served as HTTP/1.1 under `allowHTTP1`, handed
+  to an `'unknownProtocol'` listener, or answered with Node's `403` and closed. The TLS
+  options below apply to it.
+
+- **`tls.createServer` never asked for a client certificate.** It ignored
+  `requestCert`, `rejectUnauthorized` and `ca`, so a server configured to admit only
+  clients with a certificate its CA signed admitted every client, with or without one.
+  Present since 0.6.0. `requestCert` now asks for a certificate, and it is judged as
+  Node judges it: `socket.authorized`, or `socket.authorizationError` with Node's code
+  (`UNABLE_TO_GET_ISSUER_CERT` when there is none, `DEPTH_ZERO_SELF_SIGNED_CERT`,
+  `UNABLE_TO_VERIFY_LEAF_SIGNATURE`, ...), against `ca`, or the default store without it.
+  Under `rejectUnauthorized` (the default) a client with no certificate fails the
+  handshake, and one whose certificate does not verify is dropped before
+  `'secureConnection'` and never reaches the application.
+
+- **One client could stall a TLS server's handshakes.** `tls.createServer` completed each
+  handshake before accepting the next connection, with no time limit, so a client that
+  connected and sent nothing held up every client after it. Each connection is now
+  handshaken on its own, bounded by `handshakeTimeout` (120 s by default; the connection
+  is closed with `'tlsClientError'` `ERR_TLS_HANDSHAKE_TIMEOUT`).
+
+- **`https.createServer` never asked for a client certificate either.** It ignored
+  `requestCert`, `rejectUnauthorized` and `ca`, so an https server configured to admit
+  only clients with a certificate its CA signed served every client, with or without
+  one, and `req.socket` had no `authorized` or `getPeerCertificate()` to check. Present
+  since 0.4.0. Each connection now runs the `tls.createServer` handshake above with the
+  server's options: under `rejectUnauthorized` a client with no certificate, or one that
+  does not verify against `ca`, never reaches the `'request'` handler, and without it
+  `req.socket.authorized` / `authorizationError` carry Node's verdict. A failed handshake
+  is `'tlsClientError'`, passed on as `'clientError'` as in Node.
+
+- **undici's `MockAgent`, `MockPool` and `MockClient` intercepted nothing.** They were
+  constructible stubs, and `disableNetConnect()` did nothing, so a test suite that installed
+  a `MockAgent` and expected canned answers sent real requests to the hosts its tests name
+  and read the real answers as its mocks -- with no sign that the mock had not been used.
+  Present since the undici shim landed. oam's `fetch` owns its transport and cannot be
+  intercepted from JS, so the three now refuse at construction with `NotSupportedError`
+  (`UND_ERR_NOT_SUPPORTED`), as a dispatcher oam cannot run does. They stay exported, so the
+  import resolves and the failure names itself.
+
+### Fixed
+
+- **An http or https server's `req.socket` had no `readable` or `writable`.** on-finished
+  reads `!req.socket.readable` as "this request has already finished", so body-parser 2
+  skipped the body: every express 5 `express.json()` and `express.urlencoded()` POST left
+  `req.body` undefined, and clients of such an app read back `{}`. Both flags are now
+  Node's -- true while the connection is up, false with `destroyed` once it is gone -- and
+  the response carries the same socket object (`res.socket`, `res.connection`) plus Node's
+  deprecated `res.finished`, which on-finished needs to tell a response from a request.
+
+- **`string_decoder.StringDecoder` could not be inherited the ES5 way.** It was a class, so
+  `StringDecoder.call(this, encoding)` threw "Class constructor StringDecoder cannot be
+  invoked without 'new'". That is iconv-lite 0.4's utf8 decoder, under raw-body 2 ->
+  body-parser 1 -> express 4, so every express 4 `express.json()` /
+  `express.urlencoded()` request answered a 500. It is a function constructor now, as
+  node's is, with its three methods on the prototype.
+
+- **The web classes carried no `Symbol.toStringTag`.** `Object.prototype.toString.call(new
+  URL(...))` read `[object Object]`, and so did `URLSearchParams`, `Headers`, `Response`,
+  `AbortSignal`, `AbortController`, `Event`, `EventTarget`, `MessageEvent`, `DOMException`,
+  `TextEncoder`, `TextDecoder` and the stream classes. Libraries brand-check on that
+  string: @sindresorhus/is refused the URL got 14 follows a redirect to, so no got 14
+  redirect completed. Each class now carries node's descriptor (a data property on the
+  prototype, not writable, not enumerable, configurable), including the four that had a
+  getter instead; `BroadcastChannel` reads as the `EventTarget` it extends, as node's does.
+
+- **`tls.rootCertificates` was an empty array and `tls.getCACertificates` was missing.**
+  `ca: [...tls.rootCertificates, privateCA]` -- node's usual way to add a private CA to the
+  public roots, which `https.request` has honoured since #144 -- therefore trusted the
+  private CA alone and every public host failed with `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`.
+  `tls.rootCertificates` is now the Mozilla root store oam's TLS client trusts, as PEM
+  strings behind node's getter, and `tls.getCACertificates([type])` answers `'default'`
+  (the bundled roots plus `NODE_EXTRA_CA_CERTS`), `'bundled'`, `'extra'` and `'system'`
+  (the operating system's store), with node's caching, freezing and argument errors.
+  `tls.SecureContext` is exported too.
+
+- **A TLS endpoint sent only the certificates in `cert`.** node's OpenSSL completes a
+  certificate given on its own from the context's store, so `{ cert: leaf, ca: intermediate }`
+  -- a common server configuration -- serves the intermediate, and a client with
+  `{ cert, key, ca: [intermediate, root] }` is authorized by a server that trusts the root.
+  oam sent the leaf alone, so such a server was `UNABLE_TO_VERIFY_LEAF_SIGNATURE` for every
+  client that did not already hold the intermediate, and such a client was refused. It now
+  builds the same chain as OpenSSL does, on `tls.createServer`, `https.createServer`,
+  `http2.createSecureServer` and the client side alike.
+
+- **`getPeerCertificate(true)` stopped at the certificates the peer sent.** node goes on
+  from the last of them through the issuers the connection's store holds, so a server that
+  asks for a client certificate reports the CA that signed it, and a client reports the root
+  behind a chain the server did not send. oam now does the same on both sides.
+
+- **A truncated encrypted PEM key was `ERR_OSSL_BAD_DECRYPT`** where node reports
+  `ERR_OSSL_WRONG_FINAL_BLOCK_LENGTH` (its ciphertext is not whole cipher blocks).
+
+- **The JS heap grew with every callback the event loop ran.** Whatever a loop turn
+  touched -- the promise an async op settled and its result, a timer's or immediate's
+  callback and arguments -- stayed reachable for the life of the process, so every
+  `fs` callback, socket read, timer and immediate kept about half a KiB, even after
+  `gc()`, and a server's heap grew with every request (about 650 bytes a request on
+  0.16.2) where Node's stays flat. Each turn now releases what it touched, and the heap
+  stays flat.
+
+- **`https.createServer` takes node:tls's server options.** An https server is now a
+  `tls.Server`, as in Node: its secure context is built at `createServer()` (a key it
+  cannot read, one that is not its certificate's, or a wrong `passphrase` throws there
+  instead of failing at `listen()`), `passphrase` and `pfx` are read,
+  `server.setSecureContext()` and a changed `requestCert` / `rejectUnauthorized` /
+  `ALPNProtocols` apply to the connections accepted after them, and `ALPNProtocols`
+  defaults to `['http/1.1']` unless `ALPNProtocols` or `ALPNCallback` is given (a client
+  offering only `h2` gets `no_application_protocol`, as from Node). `req.socket` reports
+  the handshake as Node's `TLSSocket` does (`authorized`, `authorizationError`,
+  `alpnProtocol`, `servername`, `getPeerCertificate([detailed])`,
+  `getPeerX509Certificate()`, `getProtocol()`, `getCipher()`), and `req.client` is
+  `req.socket`, as in Node, on every server. A client that does not speak TLS gets no
+  answer and a `'clientError'` (`ERR_SSL_HTTP_REQUEST`, ...), and a TLS 1.3 client whose
+  certificate a server refuses after it has sent its request now sees the connection end
+  rather than reset, as with Node.
+
+- **TLS servers now negotiate ALPN and report the handshake as Node does.**
+  `tls.createServer` honours `ALPNProtocols` (the server's order among what the client
+  offers; a client offering only protocols the server lacks gets
+  `no_application_protocol`), validates it and `ALPNCallback` / `handshakeTimeout` /
+  `SNICallback` as Node does, and reports `socket.servername`. Its secure context is built
+  at `createServer()`, which throws Node's errors for a key it cannot read or one that is
+  not its certificate's (`ERR_OSSL_UNSUPPORTED`, `ERR_OSSL_X509_KEY_VALUES_MISMATCH`,
+  `ERR_OSSL_PEM_NO_START_LINE`); `server.setSecureContext()` replaces it. A failed
+  handshake is `'tlsClientError'` with the connection's socket and Node's code, and a
+  client that does not speak TLS is refused on OpenSSL's rules for its first bytes
+  (`ERR_SSL_HTTP_REQUEST`, `ERR_SSL_WRONG_VERSION_NUMBER`, ...) without an answer it
+  could read.
+
+- **TLS servers read encrypted keys and PKCS#12 bundles.** `key` may be an encrypted
+  PKCS#8 key (PBES2 with PBKDF2 or scrypt and AES-CBC or triple-DES, or PKCS#12's
+  triple-DES PBEs, as `openssl pkcs8 -topk8 -v1 PBE-SHA1-3DES` writes them) or a legacy
+  encrypted PEM key (AES-CBC, or `DES-EDE3-CBC` as `openssl rsa -des3` writes it), opened
+  with `passphrase` or a `{ pem, passphrase }` entry's own; `pfx` is opened as Node opens
+  it, its MAC checked (`mac verify failure`), its bags read whether PBES2-protected,
+  protected with PKCS#12's triple-DES PBEs (OpenSSL 1.x's default) or not at all, and its
+  other certificates served as the chain and trusted as CAs. The errors are Node's
+  (`ERR_OSSL_BAD_DECRYPT`, `bad decrypt` for a bundle without a MAC). What Node 22 no
+  longer reads -- single DES, RC2, RC4, Blowfish -- is refused as Node refuses it:
+  `ERR_OSSL_EVP_UNSUPPORTED` for a key, `Unsupported PKCS12 PFX data` for a bundle.
+  Triple DES comes from the RustCrypto `des` crate, new in the dependency graph.
+
+- **`http2.Http2ServerRequest` and `http2.Http2ServerResponse` are exported**, and an
+  HTTP/2 request's headers include `:authority` and `:scheme` on every oam HTTP/2 server.
+
+- **`req.trailers` and `req.rawTrailers` were `undefined` on server requests.** A chunked
+  request body's trailer fields were dropped. They are now there once the body has
+  ended (empty before, and for a body without trailers), combined as Node combines
+  repeated fields.
+
+- **`setImmediate` waited a whole OS timer tick.** It was a 1 ms timer, so an idle loop
+  slept to the next timer tick for it -- about 15 ms on Windows, 1 ms elsewhere; 200
+  awaited immediates took about 1.8 s on 0.16.2 where node takes 1 ms. An immediate is now
+  due at once, and the same 200 take under a millisecond. `http.get` / `http.request` on
+  oam's own transport also no longer wait an immediate after `'socket'` unless something
+  listens for `'socket'`; 200 sequential
+  requests to a local server were never slowed by it (about 75 ms on 0.16.2, about 48 ms
+  now, Node about 42 ms).
+
+- **`http.Agent` keeps its sockets alive, as node's does.** A request sent over an
+  agent's socket (a custom agent, such as the agentkeepalive agent openai v4 passes to
+  node-fetch, or a socket got watches) opened a new connection and TLS handshake
+  per request and said `Connection: close`. The agent now pools them with node's rules:
+  `keepAlive`, `maxSockets` (requests queue), `maxFreeSockets`, `maxTotalSockets`,
+  `scheduling`, the `'free'` event, `freeSockets` keyed by `agent.getName()`, the
+  response's `Connection` / `Keep-Alive: timeout=` and framing, `reusedSocket`, and
+  node's `Connection` header on the request. A pooled socket is unref'd, and a socket's
+  idle timeout no longer keeps the process alive. A request destroyed while it waits
+  for a socket hands that socket on and reports `socket hang up`, as in node.
+  `agent.destroy()` destroys every socket the agent is holding, and a socket goes back
+  into the pool on its response's end whenever the peer has read the whole request --
+  node's `req.writableFinished` rule -- so the next request reuses the connection even
+  when the write oam sent it has yet to be acknowledged.
+
+- **`req.end(callback)` called the callback with the response.** node calls it on
+  `'finish'`, with no arguments; got treated the response as the request's error, so
+  every got request failed once it went over a socket.
+
+- **A request on oam's own HTTP transport never timed out.** `req.setTimeout()`, the
+  `timeout` option and an agent's `timeout` (the global agents' 5 s included) fired no
+  `'timeout'` unless the request went over an agent's socket, so a client that gives up
+  on a stalled server waited for it forever. They now fire as node's do: on the request,
+  once, after that long without activity -- before the response head, or while its body
+  stalls -- and on the response while it is still being read; nothing fires once the
+  response has ended, and the value is validated as node validates it. `req.destroy()`
+  and `req.abort()` before the response now fail the request with node's `ECONNRESET`
+  `socket hang up` (they were silent), on either path; as in node, that `'error'` ends
+  the process unless something listens for it.
+
+- **`'finish'` came before the socket connected.** A request sent over an agent's socket
+  emitted `'finish'` on the tick after `end()`, before the socket's `'lookup'`,
+  `'connect'` or `'secureConnect'`, and even when the connection was then refused; got's
+  request timing (`timings.phases.request`) came out `NaN`. It now fires once the socket
+  has written the whole request, as node's does, and `req.writableFinished` stays `false`
+  until then.
+
+- **`tls.connect({ socket })` works.** TLS over a socket oam did not open -- a CONNECT
+  tunnel, the STARTTLS shape (`pg`, `mysql2`, `nodemailer`, `ldapjs`), TLS in TLS, or
+  any JS Duplex -- failed with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. It now runs as in
+  node, with node's events, the wrapped socket's addresses and the certificate checks of
+  any other `tls.connect`. https-proxy-agent (5 and 7) tunnels to https targets through
+  it, a refusing proxy's answer included, and got 14 loads (http2-wrapper reaches node's
+  `JSStreamSocket` through `new tls.TLSSocket(stream)._handle._parentWrap`).
+
+- **`net.Socket` had no paused mode.** A `'readable'` listener and `socket.read()` --
+  how https-proxy-agent reads a proxy's answer -- threw `socket.read is not a function`;
+  `push()` into a socket without a handle was missing too. Both now behave as in node.
+
+- **A CONNECT request never emitted `'connect'`.** `http.request({ method: 'CONNECT' })`
+  delivered the proxy's answer as an ordinary `'response'`, so an agent that waits for
+  `'connect'` -- `tunnel` (under @actions/http-client), hpagent -- never got its tunnel.
+  As in node, the answer to a CONNECT is now emitted as `'connect'` with the socket and
+  the bytes that came behind the head, whatever its status (a `407` included), and with
+  no `'connect'` listener the socket is destroyed. The socket a `'connect'` or
+  `'upgrade'` listener receives is handed over unflowing, as node's is, so what the peer
+  sends before the new owner reads it waits in the socket instead of being lost, and
+  `net.Socket` has node's `unshift()`: the ws client puts back a server's first frame
+  that arrived with the `101` that way, and failed with `socket.unshift is not a
+  function`. These
+  answers' heads are read as node's parser reads them: a malformed status line, a header
+  line without a colon, obs-fold, control characters, a repeated `Content-Length` or
+  `Content-Length` with `Transfer-Encoding` fail the request with node's `HPE_*` code
+  and reason (they were taken as a head, a garbage status line as status `0`).
+
+- **`http.request` rewrote a request target that was not a path.** A `path` in absolute
+  form -- how axios's `proxy` option and other forward-proxy clients address the proxy --
+  went out as `GET /http://host/p`, `OPTIONS *` as `OPTIONS /*` and a CONNECT's
+  `host:port` as `/host:port`. node writes `path` as written, and so does oam now; the
+  host dialled is still `host` / `port`, never one named in `path`. The Host header is
+  set in the constructor as node sets it, so `req.getHeader('host')` reads it back and
+  `req.removeHeader('host')` drops it, and `req._implicitHeader()`, `req._header` and
+  `req.outputData` exist: http-proxy-agent (7 to 9, under proxy-agent) builds its
+  absolute-form target from them and failed with `req._implicitHeader is not a
+  function`.
+
+- **An `http` server rewrote `req.url` and took request targets node refuses.**
+  `req.url` came from hyper's URI type, which lowercases an absolute form's scheme, adds
+  a `/` after a bare authority, drops a fragment (`/p#f` was `/p`) and turned `*x` into
+  `""`; it is now the target byte for byte as sent, as in node, so a forward proxy
+  written on oam reads the absolute-form target a proxy client sends. A target that is
+  neither a path, `*...` nor absolute form with a scheme of letters (`abc`, `host:443`,
+  `1http://x/`) reached the handler with a `req.url` of `""`; it is now answered `400`,
+  as by node, on `http`, `https` and the HTTP/1 side of `http2.createServer`.
+
+## [0.16.2] - 2026-09-18
+
+Three ways `--allow-net` could be got round -- a grant that was not
+re-checked when a redirect moved the request, a bracketed IPv6 grant that matched host
+names by prefix, and a UDP datagram whose destination was never checked at all -- plus
+the stale-connection bug that could leave a `fetch` waiting forever.
+
+### Security
+
 - **`--allow-net` could be bypassed through an HTTP redirect.** The grant was checked
   only against the URL a script passed to `fetch`, `http.request`, `https.request` or
   `undici.request`; the redirects those follow were not checked at all. So under
@@ -205,6 +634,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `docs/node-divergences.md` entry 4: on the host alone, so a port-scoped entry
   (`--allow-net=127.0.0.1:8080`) admits `net.connect` to that port but no HTTP request.
   (#143, #151)
+
 - **A bracketed IPv6 grant admitted any host name that began with it.** Under
   `--allow-net=[::1]`, the grant matcher read a target such as
   `[::1].127.0.0.1.nip.io:443` as `[::1]` (it stopped at the first `]`), while
@@ -216,6 +646,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   Present since 0.15.0, when net grants became exact matches; before that the raw prefix
   match admitted the same names. A bracketed entry now matches only the literal itself,
   alone or followed by `:<port>`. (#151)
+
 - **A UDP datagram's destination was never checked against `--allow-net`.** Only
   `dgram`'s `bind` was, and it names the local address, so a script granted any address
   to bind could `send()` to any host and port: with a loopback grant to every other
@@ -225,345 +656,38 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   affected. The destination is now checked by the same rule as `net.connect`
   (`host:port`), and a refused send fails with `ERR_ACCESS_DENIED` through the send
   callback, or `'error'` without one, and is never sent. (#151)
-- **`http` and `https` servers reported every client as `127.0.0.1`.** `req.socket`
-  carried a fixed `remoteAddress` of `127.0.0.1` and no port or family, whatever address
-  the client connected from, so anything that decides on the peer address (a
-  loopback-only route, a loopback `trust proxy` setting, per-IP allow lists and rate
-  limits) treated every client as local. `req.socket` now carries the connection's own
-  `remoteAddress`, `remotePort`, `remoteFamily`, `localAddress`, `localPort` and
-  `localFamily`, spelled as Node spells them, `address()` returns the local end, and
-  `req.connection` is the same object. The socket an `'upgrade'` listener receives now
-  reports the client's real family (it said `IPv4` for every client) and its local end.
-- **The `http` server accepted request heads that Node refuses.** A request carrying both
-  `Content-Length` and `Transfer-Encoding` (in either order) reached the handler with
-  both headers, and so did a repeated `Content-Length`, a `Transfer-Encoding` with a
-  coding after `chunked`, and header lines ending in a bare LF; an upgrade request was
-  not checked at all (obs-fold and control characters got through too). A proxy in
-  front of the server that frames such a request differently disagrees with it about
-  where the request ends. These heads are now answered `400` and the connection is
-  closed, as in Node, for `http`, `https` and the HTTP/1 side of `http2.createServer`;
-  `insecureHTTPParser` and `--insecure-http-parser` relax Node's framing rules
-  (`Content-Length` with `Transfer-Encoding`, bare LF, codings after `chunked`) as Node's
-  do, while obs-fold and control characters stay refused.
-- **`maxHeaderSize` was not enforced.** Request heads of hundreds of KiB were accepted,
-  and the server's `maxHeaderSize` option, `--max-http-header-size` and
-  `http.maxHeaderSize` had no effect. Heads are now counted as Node counts them and
-  answered `431` at the limit (16 KiB by default), and a head that never ends is refused
-  once it outgrows four times the limit (at least 64 KiB) instead of being buffered on.
-  `--max-http-header-size` and `--insecure-http-parser` are accepted on the command line
-  and in `NODE_OPTIONS`.
-- **The `http` server routed upgrade and CONNECT requests differently from Node.** An
-  ordinary request could be treated as an upgrade and its connection left open, an
-  upgrade could reach the `'request'` handler, and CONNECT never reached a `'connect'`
-  listener. Requests are now routed as Node routes them, on any request of a keep-alive
-  connection: a request with an `Upgrade` header and `upgrade` in `Connection` goes to
-  `'upgrade'` while the server has an `'upgrade'` listener and is an ordinary request
-  otherwise, and every CONNECT goes to `'connect'` -- with the tunnel's first bytes as
-  `head` -- or, with no listener, has its socket destroyed. `https` servers now close a
-  CONNECT rather than hand it to the `'request'` handler.
-- **A bare LF in a chunked body's trailers was not refused.** hyper's trailer reader and
-  its trailer parser disagreed about where the trailers end, so part of what followed
-  was read and discarded while the connection stayed open. Such a body is now answered
-  `400` and the connection is closed, as in Node. The same applies to chunked responses
-  read by `fetch` and `http.request`, which now fail.
-- **Whitespace after a chunk size, and malformed chunk extensions, were accepted.** A
-  chunked request body whose size line had spaces or tabs after the size was read as if
-  they were not there, and a chunk extension was skipped unread whatever it held, where
-  Node, and other parsers, refuse such lines; a proxy in front of the server can frame
-  such a body differently. They are now answered `400` and the connection is closed, as
-  in Node -- whitespace after the size even under `insecureHTTPParser`, where Node
-  accepts it. Chunk extensions are read to Node's grammar in responses too, where `fetch`
-  and `http.request` now fail as Node's do. Any other chunked body the
-  parser refuses is now answered with Node's status too -- `400`, or `413` for chunk
-  extensions over the limit -- where the connection used to close without one, and the
-  handler sees its request abort with `ECONNRESET`. `https` and `http2.createServer`
-  servers no longer hand a handler a body that failed part way as if it were complete.
-- **Framing fields in a chunked body's trailers were accepted.** A `Content-Length` or
-  `Transfer-Encoding` field in the trailer section of a chunked request was read as an
-  ordinary field and the connection went on to its next request, where Node refuses the
-  body; a front end that acts on such a field frames the connection differently. Such a
-  request is now answered `400` and the connection is closed, as in Node, and `fetch` and
-  `http.request` fail a response whose trailers carry `Content-Length`, as Node's do.
-- **Response heads had no size limit either.** `fetch`, `http.request`, `https.request`
-  and `undici.request` accepted response heads of hundreds of KiB. They now refuse a
-  head at Node's limit (16 KiB, or `--max-http-header-size`), counted as Node counts it
-  for each API, on every hop including redirects: `fetch` rejects with `fetch failed`
-  and a cause coded `UND_ERR_HEADERS_OVERFLOW`, `http.request` and `https.request` fail
-  with Node's own `HPE_HEADER_OVERFLOW` error (`Parse Error: Header overflow`), and
-  `undici.request` fails with a cause coded `HPE_HEADER_OVERFLOW`.
-- **`http` and `https` servers applied none of Node's connection timeouts.**
-  `headersTimeout`, `requestTimeout`, `keepAliveTimeout`, `server.timeout` and
-  `setTimeout` were stored and ignored, and TLS handshakes had no time limit, so a
-  connection that sent nothing, stopped part way through a request, or sat idle between
-  requests stayed open for good. They are now enforced as Node enforces them, with
-  Node's defaults (60 s for the headers, 300 s for a request, 5 s plus a 1 s buffer
-  between requests, 120 s for a TLS handshake): a late request is answered `408` and
-  closed, an idle connection is closed, and the socket timeout emits `'timeout'` on the
-  request, response and server, destroying the connection when nobody listens.
-  `connectionsCheckingInterval`, `keepAliveTimeoutBuffer`, `handshakeTimeout`,
-  `req.setTimeout` and `res.setTimeout` are supported too, and a response whose
-  connection is lost before it is sent now emits `'close'`, as in Node.
-- **`http`, `https` and `http2` servers stopped taking connections at 256.** Each server
-  dropped every new connection once 256 were open, so clients holding that many open,
-  idle or busy, kept everyone else out -- for good on `http2.createServer`, whose
-  connections had no timeouts. That limit is gone: as in Node, a server takes
-  connections for as long as the OS gives them. `server.maxConnections` is supported on
-  `http` and `https` servers, with Node's `'drop'` event, and the HTTP/1 connections of
-  `http2.createServer` are held to the `http` server's default timeouts.
-- **One idle connection stopped an `http` server from accepting.** The server waited
-  for a new connection's first bytes before accepting the next one, so a connection
-  that sent nothing, such as a browser preconnect, kept every later client waiting. Each
-  connection is now read on its own task.
-- **The `h2` crate is updated from 0.4.14 to 0.4.19**, which bounds the number of empty
-  HTTP/2 DATA frames a peer can have queued (RUSTSEC-2026-0258, GHSA-q83h-524g-xf6h: a
-  low-severity denial of service against a stream that is not being read). oam's
-  HTTP/2 server (`http2.createServer`) and the `fetch` transport's HTTP/2 connections
-  both use it.
-- **`http2.createSecureServer` served cleartext.** It ignored `key`, `cert` and every
-  other TLS option and returned an `http2.createServer`, so its port spoke HTTP/2 without
-  TLS (h2c) and plain HTTP/1.1: a server meant to be reached only over TLS answered
-  cleartext clients, and TLS clients could not connect to it. Present since 0.6.0. It is
-  now Node's `Http2SecureServer`, a `tls.Server` that offers `h2` by ALPN: a client that
-  does not complete a TLS handshake gets no response, only a `'tlsClientError'` on the
-  server. A connection that negotiates `h2` is served as an HTTP/2 session (`'session'`,
-  `'stream'`, and the `(req, res)` compatibility API for the `'request'` handler); one
-  that negotiates `http/1.1` or nothing is served as HTTP/1.1 under `allowHTTP1`, handed
-  to an `'unknownProtocol'` listener, or answered with Node's `403` and closed. The TLS
-  options below apply to it.
-- **`tls.createServer` never asked for a client certificate.** It ignored
-  `requestCert`, `rejectUnauthorized` and `ca`, so a server configured to admit only
-  clients with a certificate its CA signed admitted every client, with or without one.
-  Present since 0.6.0. `requestCert` now asks for a certificate, and it is judged as
-  Node judges it: `socket.authorized`, or `socket.authorizationError` with Node's code
-  (`UNABLE_TO_GET_ISSUER_CERT` when there is none, `DEPTH_ZERO_SELF_SIGNED_CERT`,
-  `UNABLE_TO_VERIFY_LEAF_SIGNATURE`, ...), against `ca`, or the default store without it.
-  Under `rejectUnauthorized` (the default) a client with no certificate fails the
-  handshake, and one whose certificate does not verify is dropped before
-  `'secureConnection'` and never reaches the application.
-- **One client could stall a TLS server's handshakes.** `tls.createServer` completed each
-  handshake before accepting the next connection, with no time limit, so a client that
-  connected and sent nothing held up every client after it. Each connection is now
-  handshaken on its own, bounded by `handshakeTimeout` (120 s by default; the connection
-  is closed with `'tlsClientError'` `ERR_TLS_HANDSHAKE_TIMEOUT`).
-- **`https.createServer` never asked for a client certificate either.** It ignored
-  `requestCert`, `rejectUnauthorized` and `ca`, so an https server configured to admit
-  only clients with a certificate its CA signed served every client, with or without
-  one, and `req.socket` had no `authorized` or `getPeerCertificate()` to check. Present
-  since 0.4.0. Each connection now runs the `tls.createServer` handshake above with the
-  server's options: under `rejectUnauthorized` a client with no certificate, or one that
-  does not verify against `ca`, never reaches the `'request'` handler, and without it
-  `req.socket.authorized` / `authorizationError` carry Node's verdict. A failed handshake
-  is `'tlsClientError'`, passed on as `'clientError'` as in Node.
-- **undici's `MockAgent`, `MockPool` and `MockClient` intercepted nothing.** They were
-  constructible stubs, and `disableNetConnect()` did nothing, so a test suite that installed
-  a `MockAgent` and expected canned answers sent real requests to the hosts its tests name
-  and read the real answers as its mocks -- with no sign that the mock had not been used.
-  Present since the undici shim landed. oam's `fetch` owns its transport and cannot be
-  intercepted from JS, so the three now refuse at construction with `NotSupportedError`
-  (`UND_ERR_NOT_SUPPORTED`), as a dispatcher oam cannot run does. They stay exported, so the
-  import resolves and the failure names itself.
 
 ### Changed
 
-- **An http or https server's `req.socket` is the connection's socket**, as node's is: the
-  object `'connection'` -- and on an https server `'secureConnection'` -- handed out. Up to
-  0.16.3 an http server made a new one per request, so two keep-alive requests saw two
-  objects where node shows one; they now see one, it emits `'close'` when the connection
-  ends, and `res.socket` / `res.connection` / `req.client` are that same object. It also
-  answers `instanceof net.Socket`, and on an https server `instanceof tls.TLSSocket`, where
-  both were `false` before -- by brand, as oam's own `TLSSocket` answers `instanceof
-  net.Socket` (0.16.0). The object is still not a stream: it has the addresses,
-  `address()`, `setTimeout`, `destroy` and `end`, and none of `write`, `pause`, `resume`,
-  `setNoDelay`, `setKeepAlive`, `ref` or `unref`, so code that reads an `instanceof` test as
-  a promise of the stream API will now reach a missing method where it used to take its
-  non-socket path. It is branded because a check that filters clients in a `'connection'` or
-  `'secureConnection'` listener is commonly written behind exactly that test, and a check
-  that silently skipped itself would be the weakness the Security entry above is about.
-  Divergence 39 lists what the object has.
+- **The conformance oracle is now one pinned Node on every build leg.** oam claims
+  parity with Node v22.22.2 -- the vendored node-suite corpus is a snapshot of that
+  tag, and the 111 node-differential cases and the builtin export-parity ratchet were
+  measured against it -- but each leg compared against whatever `node` its PATH found,
+  and nothing checked which. The Windows dev box happened to carry v22.22.2; the
+  tailnet Mac ran a hand-copied `/usr/local/bin/node` v22.23.1 and the GCP Linux
+  builder its image's v22.23.1, so two of the three legs had never once run the
+  differential against the version their receipts claimed, and
+  `conformance/surface-gaps.json` recorded both their sections as
+  `generatedAgainst: v22.23.1`. `.node-version` at the repo root is now the single
+  source of truth: the remote legs provision exactly that Node from nodejs.org (the
+  official tarball, sha256-verified against the release's `SHASUMS256.txt`, cached per
+  version under `~/.cache/oam-node`) and put it first on PATH for the conformance,
+  surface-gaps and bench dispatches; `xtask conformance` and the `ci-local.sh`
+  preflight refuse any other version before doing any work; `xtask node-suite` refuses
+  a vendored corpus whose manifest names a different Node and stamps its receipts from
+  the pin rather than a hard-coded string; and `gen-surface-gaps.mjs` refuses to record
+  a ratchet section against another node. `OAM_ALLOW_NODE_MISMATCH=1` downgrades each
+  refusal to a warning for an ad-hoc local run, and a conformance receipt produced that
+  way says on its own line that it is not a parity receipt. Measured after the change:
+  linux-x64 and macos-arm64 are each 111/111 on the differential and 0 new / 0 stale on
+  the export ratchet against v22.22.2, so the swap changed no result on either -- only
+  the honesty of the receipt. The linux and darwin ratchet sections are re-recorded
+  against the pin (their name lists are unchanged -- pinning exposed no export
+  difference the newer Node had hidden; their stored counts had drifted from the list
+  they summarize).
 
 ### Fixed
 
-- **An http or https server's `req.socket` had no `readable` or `writable`.** on-finished
-  reads `!req.socket.readable` as "this request has already finished", so body-parser 2
-  skipped the body: every express 5 `express.json()` and `express.urlencoded()` POST left
-  `req.body` undefined, and clients of such an app read back `{}`. Both flags are now
-  Node's -- true while the connection is up, false with `destroyed` once it is gone -- and
-  the response carries the same socket object (`res.socket`, `res.connection`) plus Node's
-  deprecated `res.finished`, which on-finished needs to tell a response from a request.
-- **`string_decoder.StringDecoder` could not be inherited the ES5 way.** It was a class, so
-  `StringDecoder.call(this, encoding)` threw "Class constructor StringDecoder cannot be
-  invoked without 'new'". That is iconv-lite 0.4's utf8 decoder, under raw-body 2 ->
-  body-parser 1 -> express 4, so every express 4 `express.json()` /
-  `express.urlencoded()` request answered a 500. It is a function constructor now, as
-  node's is, with its three methods on the prototype.
-- **The web classes carried no `Symbol.toStringTag`.** `Object.prototype.toString.call(new
-  URL(...))` read `[object Object]`, and so did `URLSearchParams`, `Headers`, `Response`,
-  `AbortSignal`, `AbortController`, `Event`, `EventTarget`, `MessageEvent`, `DOMException`,
-  `TextEncoder`, `TextDecoder` and the stream classes. Libraries brand-check on that
-  string: @sindresorhus/is refused the URL got 14 follows a redirect to, so no got 14
-  redirect completed. Each class now carries node's descriptor (a data property on the
-  prototype, not writable, not enumerable, configurable), including the four that had a
-  getter instead; `BroadcastChannel` reads as the `EventTarget` it extends, as node's does.
-
-- **`tls.rootCertificates` was an empty array and `tls.getCACertificates` was missing.**
-  `ca: [...tls.rootCertificates, privateCA]` -- node's usual way to add a private CA to the
-  public roots, which `https.request` has honoured since #144 -- therefore trusted the
-  private CA alone and every public host failed with `UNABLE_TO_GET_ISSUER_CERT_LOCALLY`.
-  `tls.rootCertificates` is now the Mozilla root store oam's TLS client trusts, as PEM
-  strings behind node's getter, and `tls.getCACertificates([type])` answers `'default'`
-  (the bundled roots plus `NODE_EXTRA_CA_CERTS`), `'bundled'`, `'extra'` and `'system'`
-  (the operating system's store), with node's caching, freezing and argument errors.
-  `tls.SecureContext` is exported too.
-- **A TLS endpoint sent only the certificates in `cert`.** node's OpenSSL completes a
-  certificate given on its own from the context's store, so `{ cert: leaf, ca: intermediate }`
-  -- a common server configuration -- serves the intermediate, and a client with
-  `{ cert, key, ca: [intermediate, root] }` is authorized by a server that trusts the root.
-  oam sent the leaf alone, so such a server was `UNABLE_TO_VERIFY_LEAF_SIGNATURE` for every
-  client that did not already hold the intermediate, and such a client was refused. It now
-  builds the same chain as OpenSSL does, on `tls.createServer`, `https.createServer`,
-  `http2.createSecureServer` and the client side alike.
-- **`getPeerCertificate(true)` stopped at the certificates the peer sent.** node goes on
-  from the last of them through the issuers the connection's store holds, so a server that
-  asks for a client certificate reports the CA that signed it, and a client reports the root
-  behind a chain the server did not send. oam now does the same on both sides.
-- **A truncated encrypted PEM key was `ERR_OSSL_BAD_DECRYPT`** where node reports
-  `ERR_OSSL_WRONG_FINAL_BLOCK_LENGTH` (its ciphertext is not whole cipher blocks).
-- **The JS heap grew with every callback the event loop ran.** Whatever a loop turn
-  touched -- the promise an async op settled and its result, a timer's or immediate's
-  callback and arguments -- stayed reachable for the life of the process, so every
-  `fs` callback, socket read, timer and immediate kept about half a KiB, even after
-  `gc()`, and a server's heap grew with every request (about 650 bytes a request on
-  0.16.2) where Node's stays flat. Each turn now releases what it touched, and the heap
-  stays flat.
-- **`https.createServer` takes node:tls's server options.** An https server is now a
-  `tls.Server`, as in Node: its secure context is built at `createServer()` (a key it
-  cannot read, one that is not its certificate's, or a wrong `passphrase` throws there
-  instead of failing at `listen()`), `passphrase` and `pfx` are read,
-  `server.setSecureContext()` and a changed `requestCert` / `rejectUnauthorized` /
-  `ALPNProtocols` apply to the connections accepted after them, and `ALPNProtocols`
-  defaults to `['http/1.1']` unless `ALPNProtocols` or `ALPNCallback` is given (a client
-  offering only `h2` gets `no_application_protocol`, as from Node). `req.socket` reports
-  the handshake as Node's `TLSSocket` does (`authorized`, `authorizationError`,
-  `alpnProtocol`, `servername`, `getPeerCertificate([detailed])`,
-  `getPeerX509Certificate()`, `getProtocol()`, `getCipher()`), and `req.client` is
-  `req.socket`, as in Node, on every server. A client that does not speak TLS gets no
-  answer and a `'clientError'` (`ERR_SSL_HTTP_REQUEST`, ...), and a TLS 1.3 client whose
-  certificate a server refuses after it has sent its request now sees the connection end
-  rather than reset, as with Node.
-- **TLS servers now negotiate ALPN and report the handshake as Node does.**
-  `tls.createServer` honours `ALPNProtocols` (the server's order among what the client
-  offers; a client offering only protocols the server lacks gets
-  `no_application_protocol`), validates it and `ALPNCallback` / `handshakeTimeout` /
-  `SNICallback` as Node does, and reports `socket.servername`. Its secure context is built
-  at `createServer()`, which throws Node's errors for a key it cannot read or one that is
-  not its certificate's (`ERR_OSSL_UNSUPPORTED`, `ERR_OSSL_X509_KEY_VALUES_MISMATCH`,
-  `ERR_OSSL_PEM_NO_START_LINE`); `server.setSecureContext()` replaces it. A failed
-  handshake is `'tlsClientError'` with the connection's socket and Node's code, and a
-  client that does not speak TLS is refused on OpenSSL's rules for its first bytes
-  (`ERR_SSL_HTTP_REQUEST`, `ERR_SSL_WRONG_VERSION_NUMBER`, ...) without an answer it
-  could read.
-- **TLS servers read encrypted keys and PKCS#12 bundles.** `key` may be an encrypted
-  PKCS#8 key (PBES2 with PBKDF2 or scrypt and AES-CBC or triple-DES, or PKCS#12's
-  triple-DES PBEs, as `openssl pkcs8 -topk8 -v1 PBE-SHA1-3DES` writes them) or a legacy
-  encrypted PEM key (AES-CBC, or `DES-EDE3-CBC` as `openssl rsa -des3` writes it), opened
-  with `passphrase` or a `{ pem, passphrase }` entry's own; `pfx` is opened as Node opens
-  it, its MAC checked (`mac verify failure`), its bags read whether PBES2-protected,
-  protected with PKCS#12's triple-DES PBEs (OpenSSL 1.x's default) or not at all, and its
-  other certificates served as the chain and trusted as CAs. The errors are Node's
-  (`ERR_OSSL_BAD_DECRYPT`, `bad decrypt` for a bundle without a MAC). What Node 22 no
-  longer reads -- single DES, RC2, RC4, Blowfish -- is refused as Node refuses it:
-  `ERR_OSSL_EVP_UNSUPPORTED` for a key, `Unsupported PKCS12 PFX data` for a bundle.
-  Triple DES comes from the RustCrypto `des` crate, new in the dependency graph.
-- **`http2.Http2ServerRequest` and `http2.Http2ServerResponse` are exported**, and an
-  HTTP/2 request's headers include `:authority` and `:scheme` on every oam HTTP/2 server.
-- **`req.trailers` and `req.rawTrailers` were `undefined` on server requests.** A chunked
-  request body's trailer fields were dropped. They are now there once the body has
-  ended (empty before, and for a body without trailers), combined as Node combines
-  repeated fields.
-- **`setImmediate` waited a whole OS timer tick.** It was a 1 ms timer, so an idle loop
-  slept to the next timer tick for it -- about 15 ms on Windows, 1 ms elsewhere; 200
-  awaited immediates took about 1.8 s on 0.16.2 where node takes 1 ms. An immediate is now
-  due at once, and the same 200 take under a millisecond. `http.get` / `http.request` on
-  oam's own transport also no longer wait an immediate after `'socket'` unless something
-  listens for `'socket'`; 200 sequential
-  requests to a local server were never slowed by it (about 75 ms on 0.16.2, about 48 ms
-  now, Node about 42 ms).
-- **`http.Agent` keeps its sockets alive, as node's does.** A request sent over an
-  agent's socket (a custom agent, such as the agentkeepalive agent openai v4 passes to
-  node-fetch, or a socket got watches) opened a new connection and TLS handshake
-  per request and said `Connection: close`. The agent now pools them with node's rules:
-  `keepAlive`, `maxSockets` (requests queue), `maxFreeSockets`, `maxTotalSockets`,
-  `scheduling`, the `'free'` event, `freeSockets` keyed by `agent.getName()`, the
-  response's `Connection` / `Keep-Alive: timeout=` and framing, `reusedSocket`, and
-  node's `Connection` header on the request. A pooled socket is unref'd, and a socket's
-  idle timeout no longer keeps the process alive. A request destroyed while it waits
-  for a socket hands that socket on and reports `socket hang up`, as in node.
-  `agent.destroy()` destroys every socket the agent is holding, and a socket goes back
-  into the pool on its response's end whenever the peer has read the whole request --
-  node's `req.writableFinished` rule -- so the next request reuses the connection even
-  when the write oam sent it has yet to be acknowledged.
-- **`req.end(callback)` called the callback with the response.** node calls it on
-  `'finish'`, with no arguments; got treated the response as the request's error, so
-  every got request failed once it went over a socket.
-- **A request on oam's own HTTP transport never timed out.** `req.setTimeout()`, the
-  `timeout` option and an agent's `timeout` (the global agents' 5 s included) fired no
-  `'timeout'` unless the request went over an agent's socket, so a client that gives up
-  on a stalled server waited for it forever. They now fire as node's do: on the request,
-  once, after that long without activity -- before the response head, or while its body
-  stalls -- and on the response while it is still being read; nothing fires once the
-  response has ended, and the value is validated as node validates it. `req.destroy()`
-  and `req.abort()` before the response now fail the request with node's `ECONNRESET`
-  `socket hang up` (they were silent), on either path; as in node, that `'error'` ends
-  the process unless something listens for it.
-- **`'finish'` came before the socket connected.** A request sent over an agent's socket
-  emitted `'finish'` on the tick after `end()`, before the socket's `'lookup'`,
-  `'connect'` or `'secureConnect'`, and even when the connection was then refused; got's
-  request timing (`timings.phases.request`) came out `NaN`. It now fires once the socket
-  has written the whole request, as node's does, and `req.writableFinished` stays `false`
-  until then.
-- **`tls.connect({ socket })` works.** TLS over a socket oam did not open -- a CONNECT
-  tunnel, the STARTTLS shape (`pg`, `mysql2`, `nodemailer`, `ldapjs`), TLS in TLS, or
-  any JS Duplex -- failed with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. It now runs as in
-  node, with node's events, the wrapped socket's addresses and the certificate checks of
-  any other `tls.connect`. https-proxy-agent (5 and 7) tunnels to https targets through
-  it, a refusing proxy's answer included, and got 14 loads (http2-wrapper reaches node's
-  `JSStreamSocket` through `new tls.TLSSocket(stream)._handle._parentWrap`).
-- **`net.Socket` had no paused mode.** A `'readable'` listener and `socket.read()` --
-  how https-proxy-agent reads a proxy's answer -- threw `socket.read is not a function`;
-  `push()` into a socket without a handle was missing too. Both now behave as in node.
-- **A CONNECT request never emitted `'connect'`.** `http.request({ method: 'CONNECT' })`
-  delivered the proxy's answer as an ordinary `'response'`, so an agent that waits for
-  `'connect'` -- `tunnel` (under @actions/http-client), hpagent -- never got its tunnel.
-  As in node, the answer to a CONNECT is now emitted as `'connect'` with the socket and
-  the bytes that came behind the head, whatever its status (a `407` included), and with
-  no `'connect'` listener the socket is destroyed. The socket a `'connect'` or
-  `'upgrade'` listener receives is handed over unflowing, as node's is, so what the peer
-  sends before the new owner reads it waits in the socket instead of being lost, and
-  `net.Socket` has node's `unshift()`: the ws client puts back a server's first frame
-  that arrived with the `101` that way, and failed with `socket.unshift is not a
-  function`. These
-  answers' heads are read as node's parser reads them: a malformed status line, a header
-  line without a colon, obs-fold, control characters, a repeated `Content-Length` or
-  `Content-Length` with `Transfer-Encoding` fail the request with node's `HPE_*` code
-  and reason (they were taken as a head, a garbage status line as status `0`).
-- **`http.request` rewrote a request target that was not a path.** A `path` in absolute
-  form -- how axios's `proxy` option and other forward-proxy clients address the proxy --
-  went out as `GET /http://host/p`, `OPTIONS *` as `OPTIONS /*` and a CONNECT's
-  `host:port` as `/host:port`. node writes `path` as written, and so does oam now; the
-  host dialled is still `host` / `port`, never one named in `path`. The Host header is
-  set in the constructor as node sets it, so `req.getHeader('host')` reads it back and
-  `req.removeHeader('host')` drops it, and `req._implicitHeader()`, `req._header` and
-  `req.outputData` exist: http-proxy-agent (7 to 9, under proxy-agent) builds its
-  absolute-form target from them and failed with `req._implicitHeader is not a
-  function`.
-- **An `http` server rewrote `req.url` and took request targets node refuses.**
-  `req.url` came from hyper's URI type, which lowercases an absolute form's scheme, adds
-  a `/` after a bare authority, drops a fragment (`/p#f` was `/p`) and turned `*x` into
-  `""`; it is now the target byte for byte as sent, as in node, so a forward proxy
-  written on oam reads the absolute-form target a proxy client sends. A target that is
-  neither a path, `*...` nor absolute form with a scheme of letters (`abc`, `host:443`,
-  `1http://x/`) reached the handler with a `req.url` of `""`; it is now answered `400`,
-  as by node, on `http`, `https` and the HTTP/1 side of `http2.createServer`.
 - **A `fetch` could hang forever when the server closed a keep-alive
   connection just as the next request went out on it.** This also affected
   `http.request`, `https.request` and `undici.request`, which ride the same
@@ -607,6 +731,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `crates/oam_core/tests/http_client_stale_pool.rs`. On stock hyper its
   in-memory race test failed 10 of 10 runs, 5 on Windows and 5 on macOS.
   (#151 follow-up)
+
 - **Requests were written onto keep-alive connections the server had already
   closed, so a `POST` failed where node's succeeded and a `GET` reached the
   server twice.** A pooled connection answered reads from tokio's readiness
@@ -644,6 +769,30 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   can be sent again, a connection an earlier request had used.
   (#151 follow-up)
 
+## [0.16.1] - 2026-09-14
+
+TLS protocol-version pinning.
+
+### Fixed
+
+- **`minVersion` / `maxVersion` / `secureProtocol` were ignored, so a TLS handshake could
+  not be pinned to a protocol version** (#144). They are now honoured by `tls.connect`,
+  `tls.createServer`, `https.createServer` and `https.request`, with Node's synchronous
+  `TypeError`s and its asynchronous codes (`ERR_SSL_NO_PROTOCOLS_AVAILABLE`,
+  `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`), pinned by
+  `conformance/cases/109-tls-protocol-version.mjs`. Per-request TLS options on
+  `https.request`'s verifying path remain unapplied (#146).
+
+## [0.15.3] - 2026-09-14
+
+What a socket reports, and what `oam check` can read. A TLS socket gained
+the `net.Socket` API that ioredis and its neighbours reach for, sockets and servers
+learned to release the event loop on `unref()`, a refused connection stopped taking
+two seconds on Windows and started carrying Node's code, and `oam check` stopped
+losing oam's declarations on the two tsconfig shapes most projects use.
+
+### Fixed
+
 - **`socket.unref()` and `server.unref()` did not release the event loop**
   (#140). They removed the handle from `process.getActiveResourcesInfo()` as
   Node's do, but a connected, reading, unref'd `net.Socket` or `tls.TLSSocket`,
@@ -659,6 +808,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `'connect'`. Pinned by three conformance cases (a net and a tls client with
   every socket unref'd, and an `unref()` then `ref()` kept alive by an
   unref'd timer) and wall-clock e2e tests.
+
 - **`net.Socket` state before connect and after close.** `socket.address()`
   is `{}` before connect and after close (it always returned an endpoint
   object); `socket.pending` is `!handle || connecting`, true on a fresh socket
@@ -728,6 +878,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   tokio's, byte for byte. `http` and `fetch` go through reqwest's own
   connector, which cannot be told this, and keep the 2 s on Windows
   (`docs/node-divergences.md` #35).
+
 - **`fetch` and `http.request` reported a refused connection as
   `ECONNRESET`, or with no code at all.** reqwest's error text stops at
   "error sending request" and the refusal sits deeper in its source chain,
@@ -823,6 +974,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `net.Socket` (prototype and instance fields) against a `tls.connect()`
   socket, byte-identical with Node, so the next missing member fails the gate
   instead of a library.
+
 - **`oam check` failed every project with `"types": ["node"]` in its
   tsconfig** (#130), reporting an internal `OAM-TS0004` carrying
   `TS2688: Cannot find type definition file for 'node'` where `tsc` and `tsgo`
@@ -878,6 +1030,26 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
     stamps whether a `node_modules` exists at each level above the project:
     a verdict cached while it was missing (a TS2688 for the missing types) is
     no longer served after a reinstall that leaves the lockfile alone.
+
+## [0.15.2] - 2026-09-13
+
+Windows behaviour and the honesty of the sidecar release gate. OS errors
+carried Node's codes, a child no longer outlived the process that spawned it, and
+`process.stdin` emitted `'close'`. The gate itself had been comparing oam against oam
+while reporting "verified against node"; it now runs a real tool call per sidecar,
+fails one that leaves a process behind, and records what it actually tested.
+
+### Changed
+
+- **The sidecar release gate reports what it tested.** Each row carries the resolved
+  sidecar version, the summary states how many of the advertised tools were actually
+  called, `--json=<path>` writes a machine-readable report (release-local.sh keeps it
+  beside the conformance stamps, outside the published assets), and progress text is
+  only rewritten in place on a terminal, so a captured log no longer runs lines
+  together.
+
+### Fixed
+
 - **On Windows, OS errors carried a different code than node reports.** oam
   named an OS error by std's `io::ErrorKind` instead of the raw Win32 code, and
   the kind is a lossy view of the number. A write to a read-only file, an
@@ -922,6 +1094,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   as a character device; and for a BARE program name, spawn's PATH search still
   differs from libuv's. **This is a behaviour change** for any code that compared
   a Windows error code against `EACCES` or `EIO`. (#134)
+
 - **On Windows, a raw-mode switch on a cold start could echo a stray newline or
   put the cursor back after the next write.** `setRawMode` cancels the stdin read
   in flight and must not flip the console mode until that read has settled.
@@ -935,65 +1108,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   can never settle rather than a latency guess. The console e2e now also runs
   against both Windows release assets, win-x64 under emulation included, before
   a release publishes. (#109)
-- **On Windows, going raw right after a prompt could overwrite the answer line.**
-  `setRawMode` flipped the console mode first and cancelled the stdin read in
-  flight afterwards, so the synthetic Enter that cancels the read was handled
-  under the NEW mode -- and a raw read returns that Enter as one silent byte, a
-  bare carriage return with nothing echoed, so no newline scrolled the buffer the
-  way libuv's last-row cursor adjustment assumes. With the prompt on the screen
-  buffer's last row the cursor came back one row too high and the next output
-  landed on top of the answer (reproduced in a real conhost: "name? bob" became
-  "MARK? bob"). The switch now runs in libuv's order -- hold the reader, cancel
-  while the read's own mode is still in force, flip, release -- and what the Enter
-  writes to the screen is derived from that pre-flip mode: a line read writes it
-  whether or not it echoes, CRLF with `ENABLE_PROCESSED_INPUT` and a bare CR
-  without, while a raw read writes nothing (`readDataCooked.cpp`, measured on
-  conhost 10.0.26100.1), so the cursor steps up a row only when a newline actually
-  scrolled it. The switch is also serialised process-wide now, so a second
-  `setRawMode` -- a Worker's, or the exit hook's -- cannot read the console mode
-  or the saved slot mid-switch and save a raw mode as the "original". A
-  `setRawMode(false)` whose `SetConsoleMode` fails also keeps the saved original
-  mode now, where it used to be taken out of the slot and lost with the error,
-  leaving the exit hook nothing to put back. (#125)
-- **A raw program killed by SIGINT or SIGTERM left the terminal raw.** oam
-  installed a native handler for a signal only when a JS listener asked for one,
-  so a program that had called `setRawMode(true)` and was then killed without one
-  died at `SIG_DFL` with the exit hook never running -- and a shell left raw does
-  not recover by itself. `setRawMode(true)` now arms a process-wide default action
-  for SIGINT and SIGTERM (`signal::serve_default_action`), which restores the
-  terminal, then restores `SIG_DFL` and re-raises, so the process still dies by
-  that signal and the parent sees it; Node does the same from a handler it
-  installs at startup whether or not JS listens (`SignalExit` -> `ResetStdio` in
-  `src/node.cc` -- read from Node's source). The restore follows
-  `uv_tty_reset_mode` rather than the ordinary switch -- `TCSANOW` where the
-  switch drains with `TCSADRAIN`, SIGTTOU blocked, retried on `EINTR`, and giving
-  up rather than waiting behind a switch on another thread -- so a stalled
-  terminal cannot hold a dying process. A stop is not a death: a SIGTSTP with no
-  listener leaves raw mode intact, as Node does. **This is a behaviour change** on
-  Unix; Windows is untouched. (#125)
-- **A signal could be swallowed, or kill the process under another isolate's
-  listener.** Each signal handle reproduced the OS default as soon as its own
-  listeners were gone, which a second isolate made wrong in both directions: a
-  dormant handle in one isolate killed the process while another isolate was
-  still listening, and a handle that died with its run -- `oam test` builds a
-  runtime per file, and a Worker or `oam.fork` isolate has its own -- left
-  tokio's process-global handler installed with nobody receiving, so every later
-  delivery was caught and discarded (a SIGINT during the second file of
-  `oam test` hung the runner). Whether anyone is listening is now decided for the
-  whole process, from a count of watched handles across every isolate, and one
-  never-dropped task per signal serves the default. (#125)
-- **`scripts/bump-taps.sh` crashed inside its own EXIT trap on an early abort.**
-  `cleanup()` guarded the two tap directories but dereferenced `$BREW_FILE` and
-  `$SCOOP_FILE` bare, and both are assigned long after the trap is armed -- so
-  under `set -u` every failure in that window (no published `SHA256SUMS`, the
-  downgrade guard, a missing asset hash) died with `BREW_FILE: unbound variable`
-  inside the trap, appending a bash error about the script's own bookkeeping to
-  the diagnosis the operator actually needs -- and aborting the rest of `cleanup`
-  behind it. Both filenames now carry the same `${:-}` guard the directories had,
-  and a test case asserts the crash is absent on that early-abort path: the
-  pre-existing downgrade case could not catch it, because `fail` prints its
-  message BEFORE the trap runs, so grepping for that message passed either way.
-  (#127)
+
 - **The sidecar release gate's "verified against node" rows were oam against oam.**
   Every @yawlabs sidecar's `bin` is a runtime launcher that prefers oam, so the
   control arm's `node <bin>` re-spawned oam -- measured with a process-tree walk --
@@ -1001,6 +1116,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   arm now sets the launcher's own `*_RUNTIME` switch to `node`, read from its source
   rather than listed, and a launcher that names no switch is refused instead of
   trusted.
+
 - **Every sidecar in the release gate now answers a real tool call; six were
   boot-only.** None needs a credential or the internet: tailscale's network-free
   `tailscale_tool_groups`, Lemon Squeezy's webhook sink pointed at the loopback
@@ -1012,17 +1128,20 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   that failed quietly turned fetch into "boot only" and exited 0. Inherited
   credentials and configuration are scrubbed from each sidecar's environment, so
   "needs no credential" holds on a box that has one.
+
 - **The release gate now fails a sidecar that leaves a process behind.** Each probe
   shuts the sidecar down the way a host does (stdin closed, then killed) and checks
   its direct children against the node control. On Windows, node's libuv places
   children in a kill-on-close job object and oam does not, so on oam 0.15.1 both
   browser sidecars leave their browser running where node leaves none -- and the gate
   now says so rather than passing them.
+
 - **puppeteer no longer SKIPs the gate on an interrupted browser download.** Its
   postinstall fetches a Chrome the gate never used, and a half-extracted copy in the
   user cache failed the whole batch install. `PUPPETEER_SKIP_DOWNLOAD=1` is set for
   the install, and a failed install now reports its error or its timeout rather than
   the first deprecation warning npm printed.
+
 - **On Windows, a child outlived the oam process that spawned it when that process
   was killed.** node's libuv puts every non-detached child in a process-global job
   object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, and the kernel closes the job's
@@ -1047,6 +1166,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   child there outlives its parent under node as well. A new e2e test kills a real
   `oam run` with `TerminateProcess` and checks a child from each of those seven paths
   is gone and a `detached` one is not; it fails on 0.15.1, where all eight survive.
+
 - **`process.stdin` emitted 'end' but never 'close' when a parent closed the pipe.**
   node builds stdin's class from what fd 0 is: a pipe or socket is a `net.Socket`
   and a terminal a `tty.ReadStream`, both of which destroy themselves after 'end',
@@ -1062,40 +1182,14 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   `read()`, a handler that shuts down on 'close', `destroy()` before and after EOF,
   and `for await ... break` -- against node, and differs from node on 0.15.1.
 
+## [0.15.1] - 2026-09-12
+
+Raw mode and signals at the terminal. Going raw right after a prompt could
+overwrite the answer line, a program killed by SIGINT or SIGTERM left the terminal raw,
+and a signal could be swallowed or land under another isolate's handler.
+
 ### Changed
 
-- **The conformance oracle is now one pinned Node on every build leg.** oam claims
-  parity with Node v22.22.2 -- the vendored node-suite corpus is a snapshot of that
-  tag, and the 111 node-differential cases and the builtin export-parity ratchet were
-  measured against it -- but each leg compared against whatever `node` its PATH found,
-  and nothing checked which. The Windows dev box happened to carry v22.22.2; the
-  tailnet Mac ran a hand-copied `/usr/local/bin/node` v22.23.1 and the GCP Linux
-  builder its image's v22.23.1, so two of the three legs had never once run the
-  differential against the version their receipts claimed, and
-  `conformance/surface-gaps.json` recorded both their sections as
-  `generatedAgainst: v22.23.1`. `.node-version` at the repo root is now the single
-  source of truth: the remote legs provision exactly that Node from nodejs.org (the
-  official tarball, sha256-verified against the release's `SHASUMS256.txt`, cached per
-  version under `~/.cache/oam-node`) and put it first on PATH for the conformance,
-  surface-gaps and bench dispatches; `xtask conformance` and the `ci-local.sh`
-  preflight refuse any other version before doing any work; `xtask node-suite` refuses
-  a vendored corpus whose manifest names a different Node and stamps its receipts from
-  the pin rather than a hard-coded string; and `gen-surface-gaps.mjs` refuses to record
-  a ratchet section against another node. `OAM_ALLOW_NODE_MISMATCH=1` downgrades each
-  refusal to a warning for an ad-hoc local run, and a conformance receipt produced that
-  way says on its own line that it is not a parity receipt. Measured after the change:
-  linux-x64 and macos-arm64 are each 111/111 on the differential and 0 new / 0 stale on
-  the export ratchet against v22.22.2, so the swap changed no result on either -- only
-  the honesty of the receipt. The linux and darwin ratchet sections are re-recorded
-  against the pin (their name lists are unchanged -- pinning exposed no export
-  difference the newer Node had hidden; their stored counts had drifted from the list
-  they summarize).
-- **The sidecar release gate reports what it tested.** Each row carries the resolved
-  sidecar version, the summary states how many of the advertised tools were actually
-  called, `--json=<path>` writes a machine-readable report (release-local.sh keeps it
-  beside the conformance stamps, outside the published assets), and progress text is
-  only rewritten in place on a terminal, so a captured log no longer runs lines
-  together.
 - **A failed `setRawMode` emits Node's error shape.** oam built an error with
   `code` `'ERR_SYSTEM_ERROR'` and `syscall` `'uv_tty_set_mode'`; Node v22.22.2's
   `lib/tty.js` emits `new ErrnoException(err, 'setRawMode')`, whose `code` is
@@ -1105,6 +1199,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   never matched before. Checked against Node's source only -- no test reaches this
   branch: it needs a console that refuses `SetConsoleMode`, and the one harness
   that has such a console (#109) is `#[ignore]`d. (#125)
+
 - **The Windows console mode oam leaves behind is documented** as divergence 33 in
   `docs/node-divergences.md`. libuv's `uv_tty_set_mode` writes a fixed input mode
   in each direction and only restores the startup mode at a normal exit, while oam
@@ -1116,6 +1211,71 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   -- the program itself, or a child that inherits the console without setting its
   own mode. No behaviour changed here; it is written down. Read out of both
   implementations, not measured side by side. (#125)
+
+### Fixed
+
+- **On Windows, going raw right after a prompt could overwrite the answer line.**
+  `setRawMode` flipped the console mode first and cancelled the stdin read in
+  flight afterwards, so the synthetic Enter that cancels the read was handled
+  under the NEW mode -- and a raw read returns that Enter as one silent byte, a
+  bare carriage return with nothing echoed, so no newline scrolled the buffer the
+  way libuv's last-row cursor adjustment assumes. With the prompt on the screen
+  buffer's last row the cursor came back one row too high and the next output
+  landed on top of the answer (reproduced in a real conhost: "name? bob" became
+  "MARK? bob"). The switch now runs in libuv's order -- hold the reader, cancel
+  while the read's own mode is still in force, flip, release -- and what the Enter
+  writes to the screen is derived from that pre-flip mode: a line read writes it
+  whether or not it echoes, CRLF with `ENABLE_PROCESSED_INPUT` and a bare CR
+  without, while a raw read writes nothing (`readDataCooked.cpp`, measured on
+  conhost 10.0.26100.1), so the cursor steps up a row only when a newline actually
+  scrolled it. The switch is also serialised process-wide now, so a second
+  `setRawMode` -- a Worker's, or the exit hook's -- cannot read the console mode
+  or the saved slot mid-switch and save a raw mode as the "original". A
+  `setRawMode(false)` whose `SetConsoleMode` fails also keeps the saved original
+  mode now, where it used to be taken out of the slot and lost with the error,
+  leaving the exit hook nothing to put back. (#125)
+
+- **A raw program killed by SIGINT or SIGTERM left the terminal raw.** oam
+  installed a native handler for a signal only when a JS listener asked for one,
+  so a program that had called `setRawMode(true)` and was then killed without one
+  died at `SIG_DFL` with the exit hook never running -- and a shell left raw does
+  not recover by itself. `setRawMode(true)` now arms a process-wide default action
+  for SIGINT and SIGTERM (`signal::serve_default_action`), which restores the
+  terminal, then restores `SIG_DFL` and re-raises, so the process still dies by
+  that signal and the parent sees it; Node does the same from a handler it
+  installs at startup whether or not JS listens (`SignalExit` -> `ResetStdio` in
+  `src/node.cc` -- read from Node's source). The restore follows
+  `uv_tty_reset_mode` rather than the ordinary switch -- `TCSANOW` where the
+  switch drains with `TCSADRAIN`, SIGTTOU blocked, retried on `EINTR`, and giving
+  up rather than waiting behind a switch on another thread -- so a stalled
+  terminal cannot hold a dying process. A stop is not a death: a SIGTSTP with no
+  listener leaves raw mode intact, as Node does. **This is a behaviour change** on
+  Unix; Windows is untouched. (#125)
+
+- **A signal could be swallowed, or kill the process under another isolate's
+  listener.** Each signal handle reproduced the OS default as soon as its own
+  listeners were gone, which a second isolate made wrong in both directions: a
+  dormant handle in one isolate killed the process while another isolate was
+  still listening, and a handle that died with its run -- `oam test` builds a
+  runtime per file, and a Worker or `oam.fork` isolate has its own -- left
+  tokio's process-global handler installed with nobody receiving, so every later
+  delivery was caught and discarded (a SIGINT during the second file of
+  `oam test` hung the runner). Whether anyone is listening is now decided for the
+  whole process, from a count of watched handles across every isolate, and one
+  never-dropped task per signal serves the default. (#125)
+
+- **`scripts/bump-taps.sh` crashed inside its own EXIT trap on an early abort.**
+  `cleanup()` guarded the two tap directories but dereferenced `$BREW_FILE` and
+  `$SCOOP_FILE` bare, and both are assigned long after the trap is armed -- so
+  under `set -u` every failure in that window (no published `SHA256SUMS`, the
+  downgrade guard, a missing asset hash) died with `BREW_FILE: unbound variable`
+  inside the trap, appending a bash error about the script's own bookkeeping to
+  the diagnosis the operator actually needs -- and aborting the rest of `cleanup`
+  behind it. Both filenames now carry the same `${:-}` guard the directories had,
+  and a test case asserts the crash is absent on that early-abort path: the
+  pre-existing downgrade case could not catch it, because `fail` prints its
+  message BEFORE the trap runs, so grepping for that message passed either way.
+  (#127)
 
 ## [0.15.0] - 2026-09-10
 
@@ -2824,6 +2984,13 @@ releases.
 - `io_uring` read chunks grow from 64 KiB to 4 MiB, fixing large-file reads.
 
 [Unreleased]: https://github.com/YawLabs/oam/compare/v0.15.0...HEAD
+[0.16.4]: https://github.com/YawLabs/oam/compare/v0.16.3...v0.16.4
+[0.16.3]: https://github.com/YawLabs/oam/compare/v0.16.2...v0.16.3
+[0.16.2]: https://github.com/YawLabs/oam/compare/v0.16.1...v0.16.2
+[0.16.1]: https://github.com/YawLabs/oam/compare/v0.15.3...v0.16.1
+[0.15.3]: https://github.com/YawLabs/oam/compare/v0.15.2...v0.15.3
+[0.15.2]: https://github.com/YawLabs/oam/compare/v0.15.1...v0.15.2
+[0.15.1]: https://github.com/YawLabs/oam/compare/v0.15.0...v0.15.1
 [0.15.0]: https://github.com/YawLabs/oam/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/YawLabs/oam/compare/v0.13.2...v0.14.0
 [0.13.2]: https://github.com/YawLabs/oam/compare/v0.13.1...v0.13.2
