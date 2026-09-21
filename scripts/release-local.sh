@@ -349,15 +349,23 @@ restore_gate_artifacts "preflight"
 #   2. [Unreleased] is empty -- the log was never written. Fails as before.
 #   3. entries sit under [Unreleased] with no heading for this tag -- the state
 #      that used to pass silently. scripts/changelog-release.sh promotes them.
-if [ -f CHANGELOG.md ] && ! grep -q "^##[[:space:]]*\[${TAG#v}\]" CHANGELOG.md; then
+if [ -f CHANGELOG.md ]; then
   unreleased_body="$(awk '
     /^#+[[:space:]]*\[?[Uu]nreleased\]?/ { inside = 1; next }
     inside && /^#+[[:space:]]/ && !/^###[[:space:]]/ { exit }
     inside && /^###[[:space:]]/ { next }
     inside { print }
   ' CHANGELOG.md | tr -d '[:space:]')"
-  [ -n "$unreleased_body" ] || fail "CHANGELOG.md's Unreleased section has no entries -- RELIABILITY.md requires a public behavior-change log for every release. Add them, or say plainly that this release changes nothing observable. (Bare '### Added'-style subheadings with nothing under them do not count.)"
-  fail "CHANGELOG.md has entries under [Unreleased] but no '## [${TAG#v}]' heading -- they would ship unattributed, which is how 0.15.1 through 0.16.3 ended up with none. Promote and commit them, then re-run: scripts/changelog-release.sh ${TAG#v}"
+  if grep -q "^##[[:space:]]*\[${TAG#v}\]" CHANGELOG.md; then
+    # Promoted. Anything written under [Unreleased] SINCE then still ships in
+    # THIS release -- the tag is cut from this tree -- and would land with no
+    # heading of its own: the same drift again, one release later.
+    [ -z "$unreleased_body" ] \
+      || fail "CHANGELOG.md has a '## [${TAG#v}]' heading AND entries under [Unreleased] -- the latter ship in this release with no heading. Move them into the [${TAG#v}] section and commit, then re-run."
+  else
+    [ -n "$unreleased_body" ] || fail "CHANGELOG.md's Unreleased section has no entries -- RELIABILITY.md requires a public behavior-change log for every release. Add them, or say plainly that this release changes nothing observable. (Bare '### Added'-style subheadings with nothing under them do not count.)"
+    fail "CHANGELOG.md has entries under [Unreleased] but no '## [${TAG#v}]' heading -- they would ship unattributed, which is how 0.15.1 through 0.16.3 ended up with none. Promote and commit them, then re-run: scripts/changelog-release.sh ${TAG#v}"
+  fi
 fi
 
 # origin/main is load-bearing for BOTH the auto-bump (which pushes a commit
