@@ -81,6 +81,9 @@ pub fn http2_serve_tls(
             ServerEntry {
                 queue: Some(queue_rx),
                 shutdown: Some(shutdown_tx),
+                // A session serves one connection JavaScript already accepted:
+                // there is no listening socket for close() to wait on.
+                listener_gone: None,
                 timeouts: Some(Arc::clone(&timeouts)),
                 tls: None,
             },

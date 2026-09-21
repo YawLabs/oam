@@ -18218,10 +18218,12 @@
 
     // The requests whose responses are not done, by request id, for the
     // 'timeout' events a connection raises while one is in flight.
-    function trackExchange(server, requestId, req, res) {
+    function trackExchange(server, requestId, req, res, connectionId) {
       if (!server._exchanges) server._exchanges = new Map();
       const exchanges = server._exchanges;
-      exchanges.set(requestId, { req, res });
+      // The connection it is on, for closeIdleConnections(): a connection
+      // with an exchange still open is not idle.
+      exchanges.set(requestId, { req, res, connectionId });
       const forget = () => exchanges.delete(requestId);
       res.once("finish", forget);
       res.once("close", forget);
@@ -18416,6 +18418,9 @@
     // connections check (node does it on 'listening', ahead of the caller's
     // listeners), emit 'listening' and serve.
     function serverBound(server, bound, hostname, encrypted) {
+      // A server listening again after a close() is running again.
+      server[Symbol.for("oam.serverClosing")] = false;
+      server[Symbol.for("oam.serverClosed")] = false;
       server._serverId = bound.serverId;
       server._port = bound.port;
       server._host = hostname;
@@ -18564,7 +18569,7 @@
         // `!res.socket.writable` as "already finished".
         res.socket = req.socket;
         res.connection = req.socket;
-        trackExchange(server, meta.requestId, req, res);
+        trackExchange(server, meta.requestId, req, res, meta.connectionId);
         try {
           server.emit("request", req, res);
         } catch (e) {
@@ -18572,10 +18577,12 @@
         }
       }
       stopConnectionsCheck(server);
-      // The server is done. Nothing will serve the connections it was
-      // still holding sockets for, so they close with it -- node's sockets
-      // close before the server's own 'close' -- rather than being kept
-      // for ever in a table nobody reads again.
+      // The queue has ended, which the native side lets happen only once
+      // server.close() has run AND the last connection it was serving has
+      // closed -- each one's close has already come through as its own
+      // event. Any record still here is one the native side never reported
+      // closed (a safety net): its sockets close now, before the server's
+      // own 'close', as node's do.
       const held = server._connSockets;
       if (held !== undefined) {
         server._connSockets = undefined;
@@ -18583,12 +18590,96 @@
           for (const socket of [record.secure, record.conn]) {
             if (socket && !socket.destroyed) {
               socket._markClosed();
-              socket.emit("close", false);
+              try {
+                socket.emit("close", false);
+              } catch (e) {
+                raiseFromListener(e);
+              }
             }
           }
         }
       }
-      server.emit("close");
+      finishClose(server);
+    }
+
+    const kServerClosing = Symbol.for("oam.serverClosing");
+    const kServerClosed = Symbol.for("oam.serverClosed");
+    const kOnDrained = Symbol.for("oam.onDrained");
+
+    // node's _emitCloseIfDrained: 'close' comes once the server has stopped
+    // AND the last connection it held has gone. The native side answers for
+    // the connections it serves (the queue ends after the last); a socket an
+    // upgrade or CONNECT took over is JavaScript's alone, so the server waits
+    // for the set that counts those to empty too -- a websocket open when
+    // close() ran holds 'close' back until it closes, as in node.
+    function finishClose(server) {
+      const done = () => {
+        server[kServerClosed] = true;
+        try {
+          server.emit("close");
+        } catch (e) {
+          raiseFromListener(e);
+        }
+      };
+      const handedOver = server[Symbol.for("oam.serverConnections")];
+      if (handedOver && handedOver.size > 0) handedOver[kOnDrained] = done;
+      else done();
+    }
+
+    function serverNotRunning() {
+      return Object.assign(new Error("Server is not running."), { code: "ERR_SERVER_NOT_RUNNING" });
+    }
+
+    // node's net.Server#close(cb): the first close() stops the server and its
+    // callback runs at 'close'. One made while the server is draining, or
+    // after it has closed, or on a server that never listened, gets
+    // ERR_SERVER_NOT_RUNNING -- at 'close', which a server with nothing left
+    // to drain emits (again) on a later tick. `stop` is the server kind's own
+    // shutdown call, run once.
+    function closeServer(server, callback, stop) {
+      const running = server._serverId !== null && server._serverId !== undefined &&
+        !server[kServerClosing];
+      if (typeof callback === "function") {
+        if (running) server.once("close", callback);
+        else server.once("close", () => callback(serverNotRunning()));
+      }
+      if (running) {
+        server[kServerClosing] = true;
+        server.listening = false;
+        stop();
+      } else if (!server[kServerClosing] || server[kServerClosed]) {
+        process.nextTick(() => {
+          try {
+            server.emit("close");
+          } catch (e) {
+            raiseFromListener(e);
+          }
+        });
+      }
+      return server;
+    }
+
+    // node's closeAllConnections() / closeIdleConnections(): destroy every
+    // connection the server is serving, or only those with no request open.
+    // Once close() waits for its connections, these are how an application
+    // (fastify's forceCloseConnections) cuts a drain short. A socket an
+    // upgrade or CONNECT took over is not the server's any more, and is left
+    // alone, as node leaves it.
+    function closeServerConnections(server, idleOnly) {
+      const held = server._connSockets;
+      if (!held) return;
+      let busy;
+      if (idleOnly) {
+        busy = new Set();
+        if (server._exchanges) {
+          for (const exchange of server._exchanges.values()) busy.add(exchange.connectionId);
+        }
+      }
+      for (const [connectionId, record] of [...held]) {
+        if (idleOnly && busy.has(connectionId)) continue;
+        const socket = record.secure || record.conn;
+        if (socket && !socket.destroyed) socket.destroy();
+      }
     }
 
     // node's storeHTTPOptions (lib/_http_server.js), the parser half:
@@ -18710,23 +18801,13 @@
           : null;
       }
       close(callback) {
-        if (this._serverId !== null) {
+        // A never-listening server's callback gets ERR_SERVER_NOT_RUNNING
+        // (a fastify onClose hook calls server.close() on one, and must not
+        // hang), and a listening one drains: see closeServer.
+        return closeServer(this, callback, () => {
           stopConnectionsCheck(this);
           natives.httpClose(this._serverId);
-          this.listening = false;
-          if (callback) this.once("close", callback);
-        } else if (callback) {
-          // Node fires close()'s callback with ERR_SERVER_NOT_RUNNING when the
-          // server was never listening. Without this, a fastify onClose hook
-          // (which always calls server.close) on a non-listening instance hangs
-          // because the "close" event is never emitted.
-          process.nextTick(() => {
-            callback(Object.assign(new Error("Server is not running."), {
-              code: "ERR_SERVER_NOT_RUNNING",
-            }));
-          });
-        }
-        return this;
+        });
       }
       // Node http.Server.setTimeout(msecs[, callback]): the socket timeout
       // of new connections (and of each connection after a keep-alive
@@ -18736,14 +18817,12 @@
         if (callback) this.on("timeout", callback);
         return this;
       }
-      // Node closeIdleConnections()/closeAllConnections() destroy idle / all
-      // open connections. oam's graceful server.close() already drains idle
-      // keep-alive connections in the native substrate (http_server.rs) and
-      // per-connection sockets are not reachable from JS, so these are no-ops
-      // that satisfy fastify's shutdown path (it feature-detects and calls them
-      // before server.close()).
-      closeIdleConnections() {}
-      closeAllConnections() {}
+      closeIdleConnections() {
+        closeServerConnections(this, true);
+      }
+      closeAllConnections() {
+        closeServerConnections(this, false);
+      }
       // net.Server#getConnections. The live connections are the records the
       // native server's announcements keep, one per connection (see
       // connectionRecord), plus the sockets an upgrade or CONNECT took over,
@@ -21977,6 +22056,8 @@
       bound: serverBound,
       defineTimeout: defineTimeoutProperty,
       stop: stopConnectionsCheck,
+      close: closeServer,
+      closeConnections: closeServerConnections,
     };
     const httpExports = {
       createServer: (options, handler) => new Server(options, handler),
@@ -22786,11 +22867,7 @@
         this.writable = false;
         this.connecting = false;
         registry._activeHandles.delete(this);
-        const counted = this[kCountedIn];
-        if (counted) {
-          counted.delete(this);
-          this[kCountedIn] = undefined;
-        }
+        leaveCount(this);
         // Destroyed while its name was still being looked up: nothing will
         // settle the connect, so release the writes queued behind it (they
         // fail with ERR_SOCKET_CLOSED_BEFORE_CONNECTION).
@@ -23081,11 +23158,7 @@
 
       _doClose() {
         registry._activeHandles.delete(this);
-        const counted = this[kCountedIn];
-        if (counted) {
-          counted.delete(this);
-          this[kCountedIn] = undefined;
-        }
+        leaveCount(this);
         if (this._handle !== null) {
           try { natives.tcpClose(this._handle); } catch (_) { /* noop */ }
           this._handle = null;
@@ -23191,11 +23264,10 @@
     // net.Socket's brand (above), for servers. node's http, https and tls
     // servers ARE net.Servers -- `http.Server extends net.Server`,
     // `tls.Server extends net.Server`, `https.Server extends tls.Server` --
-    // and library code tests for one: a graceful-shutdown wrapper deciding
-    // what it was handed, middleware picking a transport. oam builds each of
-    // them on its own native server, so the prototype chain cannot carry the
-    // relationship and the brand does (#213). Consulted only for `net.Server`
-    // itself; a user subclass gets the ordinary prototype walk.
+    // and code written for node may test any of them for one. oam builds
+    // each of them on its own native server, so the prototype chain cannot
+    // carry the relationship and the brand does (#213). Consulted only for
+    // `net.Server` itself; a user subclass gets the ordinary prototype walk.
     const kNetServerLike = Symbol.for("oam.netServerLike");
     // The live connections a server has accepted, which getConnections()
     // reports. An http or https server keeps its own in `_connSockets`, one
@@ -23210,6 +23282,30 @@
     // listener throws at the 'error' emit before 'close' is ever reached --
     // either way the count stayed high for good, and the set kept the socket.
     const kCountedIn = Symbol.for("oam.countedIn");
+
+    // A counted socket leaving its server's count, in its own teardown. The
+    // last one out wakes a server that is waiting for its connections before
+    // it emits 'close' -- on a later tick, so the socket's own 'close' comes
+    // first, as node's server closes after its last socket.
+    function leaveCount(socket) {
+      const counted = socket[kCountedIn];
+      if (!counted) return;
+      counted.delete(socket);
+      socket[kCountedIn] = undefined;
+      const drained = counted.size === 0 && counted[Symbol.for("oam.onDrained")];
+      if (drained) {
+        counted[Symbol.for("oam.onDrained")] = undefined;
+        process.nextTick(drained);
+      }
+    }
+
+    // node raises a listener's throw as 'uncaughtException' and the server
+    // goes on; letting it out of an accept loop ends the loop with it.
+    function raiseFromListener(e) {
+      process.nextTick(() => {
+        throw e;
+      });
+    }
 
     class Server extends EventEmitter {
       static [Symbol.hasInstance](instance) {
@@ -23308,11 +23404,26 @@
             value: live, writable: true, configurable: true,
           });
           socket._readLoop();
-          this.emit("connection", socket);
+          try {
+            this.emit("connection", socket);
+          } catch (e) {
+            raiseFromListener(e);
+          }
         }
         if (generation !== this._listenGeneration) return; // superseded
         registry._activeHandles.delete(this);
-        this.emit("close");
+        // node's _emitCloseIfDrained: 'close' once the last socket accepted
+        // has gone too, not when the listener stops.
+        const emitClose = () => {
+          try {
+            this.emit("close");
+          } catch (e) {
+            raiseFromListener(e);
+          }
+        };
+        const live = this[kServerConns];
+        if (live.size > 0) live[Symbol.for("oam.onDrained")] = emitClose;
+        else emitClose();
       }
 
       address() {
@@ -25069,13 +25180,21 @@
           : null;
       }
       close(callback) {
-        if (this._serverId !== null) {
-          registry._httpParserOptions.stop(this);
+        // As the http server's: it drains, and a close() on a server that
+        // is not running -- never listening included, which used to hang
+        // waiting for a 'close' nothing would emit -- gets
+        // ERR_SERVER_NOT_RUNNING.
+        const options = registry._httpParserOptions;
+        return options.close(this, callback, () => {
+          options.stop(this);
           natives.httpClose(this._serverId);
-          this.listening = false;
-        }
-        if (callback) this.once("close", callback);
-        return this;
+        });
+      }
+      closeIdleConnections() {
+        registry._httpParserOptions.closeConnections(this, true);
+      }
+      closeAllConnections() {
+        registry._httpParserOptions.closeConnections(this, false);
       }
     }
     // The native http server has no ref / unref of its own yet: an https
@@ -27882,6 +28001,11 @@
               for (;;) {
                 var meta = await natives.httpAccept(bound.serverId);
                 if (meta === undefined) break;
+                // Requests only: the native side reports no connection events
+                // for this server, and one that ever arrived -- the queue now
+                // runs until the server's last connection has closed -- is
+                // not a stream to serve.
+                if (meta.event !== undefined) continue;
                 var hdrs = {};
                 for (var i = 0; i < meta.headers.length; i++) {
                   var key = meta.headers[i][0].toLowerCase();
@@ -30284,6 +30408,12 @@
         if (counted) {
           counted.delete(this);
           this[Symbol.for("oam.countedIn")] = undefined;
+          // The last one out wakes a server waiting to emit 'close'.
+          var drained = counted.size === 0 && counted[Symbol.for("oam.onDrained")];
+          if (drained) {
+            counted[Symbol.for("oam.onDrained")] = undefined;
+            process.nextTick(drained);
+          }
         }
         if (this._timeoutId !== null) {
           globalThis.clearTimeout(this._timeoutId);
@@ -31699,7 +31829,20 @@
               });
             }
           }
-          this.emit("close");
+          // node's _emitCloseIfDrained: 'close' once the last connection
+          // accepted has gone too, not when the listener stops.
+          var emitClose = () => {
+            try {
+              this.emit("close");
+            } catch (e) {
+              process.nextTick(() => {
+                throw e;
+              });
+            }
+          };
+          var live = this[Symbol.for("oam.serverConnections")];
+          if (live && live.size > 0) live[Symbol.for("oam.onDrained")] = emitClose;
+          else emitClose();
         })();
       }
       // One accepted connection: Node's net.Server side hands the plain
@@ -31718,8 +31861,16 @@
             _localAddr: accepted.localAddr,
           });
           // Never read from: every byte on this connection belongs to the
-          // handshake, and then to the TLSSocket over it.
-          this.emit("connection", plain);
+          // handshake, and then to the TLSSocket over it. A listener that
+          // throws raises 'uncaughtException', and -- as in node -- this
+          // connection is still served unless the listener destroyed it.
+          try {
+            this.emit("connection", plain);
+          } catch (e) {
+            process.nextTick(() => {
+              throw e;
+            });
+          }
           // A listener refused this client: the handle closed with the
           // socket it destroyed, and no handshake is run for it.
           if (plain.destroyed) return;
@@ -31802,7 +31953,17 @@
               }
             }
             registry._activeHandles.set(socket, "TCPSocketWrap");
-            this.emit("secureConnection", socket);
+            // Inside the handshake's continuation, where a throw would become
+            // an unhandled rejection that ends the process: raised as
+            // 'uncaughtException' instead, as node raises it, and the
+            // connection goes on unless the listener destroyed it.
+            try {
+              this.emit("secureConnection", socket);
+            } catch (e) {
+              process.nextTick(() => {
+                throw e;
+              });
+            }
             socket._startReading();
           },
           (err) => {

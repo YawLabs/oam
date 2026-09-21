@@ -281,6 +281,9 @@ pub struct ConnWatch {
     /// this is where that verdict is handed back.
     resumed: AtomicBool,
     resume_notify: Notify,
+    /// Woken when a request is dispatched or the one being received is all
+    /// in: what [`ConnWatch::dispatched`] waits on.
+    dispatch_notify: Notify,
     /// hyper holds bytes it has not written out yet: it wrote, or tried to,
     /// and has not flushed since. A connection handed to JS mid-stream (an
     /// upgrade) waits for them, or they would be lost with hyper's buffer.
@@ -320,6 +323,7 @@ impl ConnWatch {
             close_notify: Notify::new(),
             resumed: AtomicBool::new(false),
             resume_notify: Notify::new(),
+            dispatch_notify: Notify::new(),
             unflushed: AtomicBool::new(false),
             flushed: Notify::new(),
         })
@@ -440,7 +444,10 @@ impl ConnWatch {
             phase.keep_alive_set = false;
             drop(phase);
             self.set_socket_timeout(self.timeouts.socket_ms());
+        } else {
+            drop(phase);
         }
+        self.dispatch_notify.notify_waiters();
         generation
     }
 
@@ -455,6 +462,34 @@ impl ConnWatch {
         if phase.generation == generation {
             phase.active = false;
             phase.begun = false;
+        }
+        drop(phase);
+        self.dispatch_notify.notify_waiters();
+    }
+
+    /// A request is being received -- or the connection is fresh from the
+    /// accept -- and none has been dispatched: node's "active" connection
+    /// with no response pending. node's server.close() leaves such a
+    /// connection alone (its closeIdleConnections takes only the idle ones),
+    /// so the request is read and served.
+    pub fn awaiting_dispatch(&self) -> bool {
+        let phase = self.phase();
+        phase.active && phase.in_flight == 0
+    }
+
+    /// Resolves once the connection is no longer
+    /// [`ConnWatch::awaiting_dispatch`]: its request was dispatched, or it
+    /// went idle.
+    pub async fn dispatched(&self) {
+        loop {
+            // Made before the check: `notify_waiters` wakes a `Notified`
+            // from the moment it exists, so a dispatch landing between the
+            // check and the await is not missed.
+            let notified = self.dispatch_notify.notified();
+            if !self.awaiting_dispatch() {
+                return;
+            }
+            notified.await;
         }
     }
 

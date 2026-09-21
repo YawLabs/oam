@@ -351,11 +351,17 @@ struct ServerEntry {
     /// Taken out for the duration of each accept await (remove-await-
     /// reinsert; the JS accept loop is the single consumer).
     queue: Option<mpsc::Receiver<ServerEvent>>,
-    /// watch (not oneshot): every CONNECTION task selects on it too.
-    /// Keep-alive sockets (a client pool can idle one for 90s) would
-    /// otherwise hold queue_tx clones long after close, leaving the
-    /// pending accept op pinning the event loop open.
+    /// watch (not oneshot): the accept loop and every CONNECTION task select
+    /// on it. On close() an idle keep-alive connection closes at once (hyper's
+    /// graceful_shutdown -- a client pool can otherwise idle one for 90 s),
+    /// and a busy one finishes its exchange and then closes; so the queue
+    /// senders the connection tasks hold all drop, and `queue` ends on its
+    /// own once the last connection has.
     shutdown: Option<tokio::sync::watch::Sender<bool>>,
+    /// Answered by the accept loop once it has dropped the listening socket.
+    /// close() waits for it, briefly, so a connect made after close() returns
+    /// is refused, as node's close() closes its handle before returning.
+    listener_gone: Option<std::sync::mpsc::Receiver<()>>,
     /// node's timeout settings for the server's connections (none for the
     /// http2 server).
     timeouts: Option<Arc<ServerTimeouts>>,
@@ -773,15 +779,32 @@ impl HttpState {
             .remove(&stream_id);
     }
 
+    /// node's server.close(): stop taking connections, and let the ones
+    /// already taken finish. The listener goes and every connection hears the
+    /// shutdown, but the entry -- and its event queue -- stays: a connection
+    /// with a request in flight goes on reporting to JS (its request, its
+    /// close, a client that hangs up) until it ends, as node keeps counting it
+    /// and holds 'close' back until the last one has. http_accept removes the
+    /// entry when the queue ends.
     pub fn close_server(&self, server_id: u64) {
-        if let Some(mut entry) = self
-            .servers
-            .lock()
-            .expect("http servers lock")
-            .remove(&server_id)
-            && let Some(shutdown) = entry.shutdown.take()
-        {
+        let listener_gone = {
+            let mut servers = self.servers.lock().expect("http servers lock");
+            let Some(entry) = servers.get_mut(&server_id) else {
+                return;
+            };
+            let Some(shutdown) = entry.shutdown.take() else {
+                return;
+            };
             let _ = shutdown.send(true);
+            entry.listener_gone.take()
+        };
+        // node's close() closes the listening handle before it returns, so a
+        // connect made after it is refused. The accept loop drops the socket
+        // the moment it sees the shutdown -- microseconds, on a runtime whose
+        // workers are not this thread -- and answers; the bound only keeps a
+        // starved runtime from holding close() up.
+        if let Some(gone) = listener_gone {
+            let _ = gone.recv_timeout(LISTENER_CLOSE_BUDGET);
         }
     }
 }
@@ -1091,7 +1114,6 @@ struct Announcement {
 async fn announce_connection(
     queue: &mpsc::Sender<ServerEvent>,
     watch: &ConnWatch,
-    shutdown: &mut tokio::sync::watch::Receiver<bool>,
     event: ServerEvent,
 ) -> Announcement {
     if queue.send(event).await.is_err() {
@@ -1101,23 +1123,15 @@ async fn announce_connection(
             serve: watch.close_reason().is_none(),
         };
     }
-    let mut abandoned = false;
-    tokio::select! {
-        // Biased toward JS's answer: a listener that answered and then
-        // closed the server (`server.close()` from inside it) leaves both
-        // ready at once, and its answer is what it said about THIS
-        // connection. Picking between them at random dropped the
-        // connection half the time.
-        biased;
-        _ = watch.resume_wait() => {}
-        // The server closed while JS still held the connection: its accept
-        // loop goes with the server's queue, so no answer is coming and
-        // nothing would dispatch a request read off this connection.
-        _ = shutdown.changed() => abandoned = true,
-    }
+    // JS always answers: it resumes the connection once the listeners have
+    // run, whatever they did. A server.close() made meanwhile -- from one of
+    // those listeners, even -- does not change that: the server's queue
+    // outlives the accept loop until its last connection is over, and node
+    // serves a connection it had accepted before close().
+    watch.resume_wait().await;
     Announcement {
         announced: true,
-        serve: !abandoned && watch.close_reason().is_none(),
+        serve: watch.close_reason().is_none(),
     }
 }
 
@@ -1161,6 +1175,13 @@ where
     // of resetting it. An idle keep-alive connection just closes -- so the
     // queue_tx clone still drops promptly and the accept op isn't pinned.
     let mut shutting_down = false;
+    // close() came while a request was being received and none had been
+    // dispatched -- a fresh connection, or a keep-alive one partway into
+    // its next request. hyper's graceful shutdown would close it before
+    // that request is read (it sees no exchange yet); node's close() leaves
+    // an active connection alone and serves it. So the shutdown waits for
+    // the dispatch, and then ends the connection after that exchange.
+    let mut shutdown_waiting = false;
     let ended = loop {
         // Biased toward hyper: a response JS has already handed over (a
         // `res.end()` just before `socket.destroy()`) is written before a
@@ -1172,7 +1193,15 @@ where
                 Ok(takeover) => break Ended::Taken(takeover),
                 Err(_) => takeable = false,
             },
-            _ = shutdown.changed(), if !shutting_down => {
+            _ = shutdown.changed(), if !shutting_down && !shutdown_waiting => {
+                if watch.awaiting_dispatch() {
+                    shutdown_waiting = true;
+                } else {
+                    shutting_down = true;
+                    std::pin::Pin::new(&mut conn).graceful_shutdown();
+                }
+            }
+            _ = watch.dispatched(), if shutdown_waiting && !shutting_down => {
                 shutting_down = true;
                 std::pin::Pin::new(&mut conn).graceful_shutdown();
             }
@@ -1218,13 +1247,15 @@ where
             // socket keeps writing it after the handover).
             let budget = tokio::time::sleep(TAKEOVER_FLUSH_BUDGET);
             tokio::pin!(budget);
+            // Not cut short by server.close(): the connection is being handed
+            // to an 'upgrade' / 'connect' listener, and a close() only stops
+            // new connections -- the budget already bounds the wait.
             while watch.unflushed() {
                 tokio::select! {
                     biased;
                     _ = &mut conn => return None,
                     _ = watch.flushed() => {}
                     _ = &mut budget => return None,
-                    _ = shutdown.changed() => return None,
                 }
             }
             let parts = conn.into_parts();
@@ -1232,6 +1263,9 @@ where
         }
     }
 }
+
+/// How long close() waits for an accept loop to drop its listening socket.
+const LISTENER_CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Bind + spawn the accept loop. Resolves Json {serverId, port}.
 #[allow(clippy::too_many_arguments)]
@@ -1258,6 +1292,7 @@ pub async fn http_serve(
     let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let server_timeouts = ServerTimeouts::new(timeouts);
+    let (listener_gone_tx, listener_gone_rx) = std::sync::mpsc::sync_channel::<()>(1);
     state
         .servers
         .lock()
@@ -1267,6 +1302,7 @@ pub async fn http_serve(
             ServerEntry {
                 queue: Some(queue_rx),
                 shutdown: Some(shutdown_tx),
+                listener_gone: Some(listener_gone_rx),
                 timeouts: Some(Arc::clone(&server_timeouts)),
                 tls: None,
             },
@@ -1286,6 +1322,7 @@ pub async fn http_serve(
     tokio::spawn(async move {
         loop {
             tokio::select! {
+                biased;
                 _ = shutdown_rx.changed() => break,
                 accepted = listener.accept() => {
                     let Ok((stream, peer)) = accepted else {
@@ -1309,7 +1346,7 @@ pub async fn http_serve(
                     let conn_tcp_ids = accept_tcp_ids.clone();
                     let conn_stream_bodies = stream_request_body;
                     let conn_timeouts = Arc::clone(&server_timeouts);
-                    let mut conn_shutdown = shutdown_rx.clone();
+                    let conn_shutdown = shutdown_rx.clone();
                     tokio::spawn(async move {
                         let slot = slot;
                         // node's timeouts hold from the accept: a connection
@@ -1331,7 +1368,6 @@ pub async fn http_serve(
                             announce_connection(
                                 &conn_queue,
                                 &watch,
-                                &mut conn_shutdown,
                                 ServerEvent::Connection {
                                     conn_id,
                                     conn: conn_addrs,
@@ -1445,6 +1481,10 @@ pub async fn http_serve(
                 }
             }
         }
+        // The listening socket closes here, before close() is answered:
+        // from then on a connect is refused rather than left in the backlog.
+        drop(listener);
+        let _ = listener_gone_tx.send(());
         // Last queue_tx drops with the loop + finished connections: the
         // pending accept op resolves Done and the JS loop exits.
     });
@@ -2078,6 +2118,7 @@ pub async fn https_serve(
     let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
     let server_timeouts = ServerTimeouts::new(timeouts);
+    let (listener_gone_tx, listener_gone_rx) = std::sync::mpsc::sync_channel::<()>(1);
     state
         .servers
         .lock()
@@ -2087,6 +2128,7 @@ pub async fn https_serve(
             ServerEntry {
                 queue: Some(queue_rx),
                 shutdown: Some(shutdown_tx),
+                listener_gone: Some(listener_gone_rx),
                 timeouts: Some(Arc::clone(&server_timeouts)),
                 tls: Some(Arc::clone(&tls)),
             },
@@ -2104,6 +2146,7 @@ pub async fn https_serve(
     tokio::spawn(async move {
         loop {
             tokio::select! {
+                biased;
                 _ = shutdown_rx.changed() => break,
                 accepted = listener.accept() => {
                     let Ok((stream, peer)) = accepted else {
@@ -2126,7 +2169,7 @@ pub async fn https_serve(
                     let conn_state = accept_state.clone();
                     let conn_queue = queue_tx.clone();
                     let conn_timeouts = Arc::clone(&server_timeouts);
-                    let mut conn_shutdown = shutdown_rx.clone();
+                    let conn_shutdown = shutdown_rx.clone();
                     // Everything after the accept runs on the connection's
                     // own task: a client that never finishes its handshake
                     // holds up no one else.
@@ -2147,7 +2190,6 @@ pub async fn https_serve(
                         let announcement = announce_connection(
                             &conn_queue,
                             &watch,
-                            &mut conn_shutdown,
                             ServerEvent::Connection {
                                 conn_id,
                                 conn: conn_addrs,
@@ -2156,22 +2198,21 @@ pub async fn https_serve(
                         .await;
                         let mut announced = announcement.announced;
                         let refusal = if !announcement.serve {
-                            // A listener refused this client, or the server
-                            // went away under it: no handshake is run and no
+                            // A listener refused this client: no handshake is
+                            // run and no
                             // 'tlsClientError' is raised -- node's client
                             // sees the connection close mid-handshake.
                             drop(stream);
                             None
                         } else {
-                            let handshake = tokio::select! {
-                                accepted = crate::tls::server::accept_stream(
-                                    stream, &context, &options,
-                                ) => Some(accepted),
-                                _ = conn_shutdown.changed() => None,
-                            };
+                            // A handshake under way when close() is called
+                            // runs to its end, as node's does: the server
+                            // had accepted the connection. handshakeTimeout
+                            // bounds it.
+                            let handshake =
+                                crate::tls::server::accept_stream(stream, &context, &options).await;
                             match handshake {
-                                None => None,
-                                Some(Ok((tls_stream, info))) => {
+                                Ok((tls_stream, info)) => {
                                     // node's onServerSocketSecure: a
                                     // certificate that did not verify, under
                                     // rejectUnauthorized, and the socket is
@@ -2206,7 +2247,7 @@ pub async fn https_serve(
                                         None
                                     }
                                 }
-                                Some(Err(failed)) => Some(failure_parts(failed)),
+                                Err(failed) => Some(failure_parts(failed)),
                             }
                         };
                         // The connection is gone: it no longer counts
@@ -2234,6 +2275,10 @@ pub async fn https_serve(
                 }
             }
         }
+        // The listening socket closes here, before close() is answered:
+        // from then on a connect is refused rather than left in the backlog.
+        drop(listener);
+        let _ = listener_gone_tx.send(());
     });
 
     super::OpOutcome::Json(
@@ -2256,7 +2301,7 @@ async fn serve_https_connection(
     watch: Arc<ConnWatch>,
     conn_addrs: ConnAddrs,
     policy: HeadPolicy,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> bool {
     let tls_meta = Some(Arc::new(info.to_json()));
     // node's tlsConnectionListener: the server's 'secureConnection'
@@ -2268,7 +2313,6 @@ async fn serve_https_connection(
     let announcement = announce_connection(
         &queue,
         &watch,
-        &mut shutdown,
         ServerEvent::SecureConnection {
             conn_id: watch.id,
             conn: conn_addrs,
@@ -2276,8 +2320,8 @@ async fn serve_https_connection(
         },
     )
     .await;
-    // A listener refused this client, or the server went away under it:
-    // the connection closes without a request ever reaching the handler,
+    // A listener refused this client: the connection closes without a
+    // request ever reaching the handler,
     // and without an answer on the wire.
     if !announcement.serve {
         drop(tls_stream);
@@ -2324,43 +2368,34 @@ fn failure_parts(failed: super::OpOutcome) -> (Option<String>, String) {
 /// Long-poll the next request. Json metadata, or Done when the server
 /// closed (queue drained + senders dropped).
 pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutcome {
-    let (queue, mut shutdown_rx) = {
-        let mut guard = state.servers.lock().expect("http servers lock");
-        match guard.get_mut(&server_id) {
-            Some(entry) => (
-                entry.queue.take(),
-                entry.shutdown.as_ref().map(|tx| tx.subscribe()),
-            ),
-            None => (None, None),
-        }
-    };
-    let Some(mut queue) = queue else {
-        // Server was already closed (close_server removed the entry) or
-        // another accept is in flight.  Either way, signal Done so the JS
-        // accept loop exits cleanly instead of surfacing an unhandled
-        // rejection.
-        return super::OpOutcome::Done;
-    };
-    // Wait for the next request OR a server.close() shutdown. Idle keep-alive
-    // connection tasks hold queue_tx clones that can outlive graceful_shutdown,
-    // so queue.recv() alone may park forever after close(); the shutdown watch
-    // lets accept return Done promptly, matching Node's closeIdleConnections.
-    let next = match shutdown_rx {
-        Some(ref mut sd) => {
-            tokio::select! {
-                n = queue.recv() => n,
-                _ = sd.changed() => None,
-            }
-        }
-        None => queue.recv().await,
-    };
-    if let Some(entry) = state
+    let queue = state
         .servers
         .lock()
         .expect("http servers lock")
         .get_mut(&server_id)
+        .and_then(|entry| entry.queue.take());
+    let Some(mut queue) = queue else {
+        // The server is done (its queue ended and the entry went), or another
+        // accept is in flight. Either way, signal Done so the JS accept loop
+        // exits cleanly instead of surfacing an unhandled rejection.
+        return super::OpOutcome::Done;
+    };
+    // The next event. Before close() that is all there is to it. After it,
+    // the listener is gone and every connection has heard the shutdown (an
+    // idle keep-alive one closes at once, a busy one when its exchange is
+    // over), so the queue ends -- recv() yields None -- once the last
+    // connection task has, and not before: a request in flight, its body, a
+    // client hanging up on it and the connection's close all still reach JS,
+    // which is what lets 'close' and close(cb) wait for them as node's do.
+    let next = queue.recv().await;
     {
-        entry.queue = Some(queue);
+        let mut servers = state.servers.lock().expect("http servers lock");
+        if next.is_none() {
+            // Every sender has gone: nothing can reach this server again.
+            servers.remove(&server_id);
+        } else if let Some(entry) = servers.get_mut(&server_id) {
+            entry.queue = Some(queue);
+        }
     }
     match next {
         Some(ServerEvent::Request(request)) => {
@@ -2487,6 +2522,7 @@ pub async fn http2_serve(
     // good when it is HTTP/1, it is held to the http server's defaults,
     // checked here.
     let server_timeouts = ServerTimeouts::new(TimeoutSettings::default());
+    let (listener_gone_tx, listener_gone_rx) = std::sync::mpsc::sync_channel::<()>(1);
     state
         .servers
         .lock()
@@ -2496,6 +2532,7 @@ pub async fn http2_serve(
             ServerEntry {
                 queue: Some(queue_rx),
                 shutdown: Some(shutdown_tx),
+                listener_gone: Some(listener_gone_rx),
                 timeouts: Some(Arc::clone(&server_timeouts)),
                 tls: None,
             },
@@ -2511,6 +2548,7 @@ pub async fn http2_serve(
     tokio::spawn(async move {
         loop {
             tokio::select! {
+                biased;
                 _ = shutdown_rx.changed() => break,
                 accepted = listener.accept() => {
                     let Ok((stream, peer)) = accepted else {
@@ -2637,6 +2675,10 @@ pub async fn http2_serve(
                 }
             }
         }
+        // The listening socket closes here, before close() is answered:
+        // from then on a connect is refused rather than left in the backlog.
+        drop(listener);
+        let _ = listener_gone_tx.send(());
     });
 
     super::OpOutcome::Json(
