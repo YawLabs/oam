@@ -5,11 +5,13 @@
 // `instanceof net.Server`, all four carry getConnections(), and the count
 // reaches its callback on a later tick rather than synchronously.
 //
-// It is what library code relies on. A graceful-shutdown wrapper (stoppable,
-// http-terminator, server-destroy) polls getConnections() until it reads 0,
-// so the count has to go UP with every connection -- a websocket an upgrade
-// took over included -- and come back DOWN when each one ends, however it
-// ends.
+// It is what code written for node can rely on. A caller that waits for a
+// server to drain by reading getConnections() until it is 0 needs the count
+// to go UP with every connection -- a websocket an upgrade took over
+// included -- and come back DOWN when each one ends, however it ends. (The
+// graceful-shutdown wrappers stoppable, http-terminator and server-destroy
+// do not call it: they record sockets from 'connection' /
+// 'secureConnection', which cases 168 and 169 hold.)
 //
 // Regression guard: oam builds each server on its own native server, so none
 // of them was `instanceof net.Server`, only net.Server had getConnections()
@@ -23,7 +25,8 @@
 // What is deliberately NOT asserted: the http count after a KEEP-ALIVE agent
 // is destroyed. Over oam's own HTTP transport the pooled connection outlives
 // the JS agent until the server's keep-alive timeout, a client-side gap
-// rather than a server one. Every other way a connection ends is held to 0.
+// rather than a server one. Every other ending this case exercises is held
+// to 0.
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";

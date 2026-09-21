@@ -90,7 +90,27 @@ corruption and mirror tampering, not against someone who has compromised the
 release channel itself. Code signing is a planned addition; until it lands,
 treat the checksums as integrity, not authenticity.
 
+## How fixes are disclosed
+
+oam is in beta (pre-1.0), and it is used outside Yaw Labs. A security fix is
+disclosed in three places, once a release carrying it is out:
+
+- **The CHANGELOG**, under that release's **Security** heading, states what
+  was wrong and what changed.
+- **The GitHub Release notes** summarise the release's security fixes first.
+- **A GitHub Security Advisory** is published for each vulnerability, naming
+  the affected versions and the release that fixes it. Where one of oam's
+  security boundaries failed — the permission model, TLS certificate
+  verification, TLS client authentication, or the client address a server
+  reports — the advisory also carries a **CVE ID**, so scanners and
+  vulnerability trackers see it.
+
+Advisories describe the weakness and its impact, not how to exploit it. A
+reporter is told before a fix goes public (see above), and credited in the
+advisory and the release notes if they ask to be.
+
 ## Supported versions
 
 Fixes land on the latest release. There is no long-term-support branch —
-upgrade to pick up security fixes.
+upgrade to pick up security fixes. An advisory names the first release that
+carries its fix; the release to run is the latest.

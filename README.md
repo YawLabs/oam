@@ -21,7 +21,8 @@ oam is a JavaScript/TypeScript runtime built in Rust on V8, designed around thre
 ## Status
 
 Beta. Breaking changes before 1.0 are still possible and are called out in
-[CHANGELOG.md](CHANGELOG.md); there is no LTS yet. npm resolution against existing
+[CHANGELOG.md](CHANGELOG.md); there is no LTS yet, so security fixes land on the latest
+release only — [SECURITY.md](SECURITY.md) says how they are disclosed. npm resolution against existing
 node_modules, CommonJS interop, the `node:` builtins (fs, path, process, Buffer, events,
 util, assert, os, tty, module, stream, http, async_hooks — AsyncLocalStorage rides V8's
 continuation-preserved embedder data), TypeScript and JSX/TSX without a build step,

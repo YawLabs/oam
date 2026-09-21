@@ -16,14 +16,16 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
-## [0.16.4] - 2026-09-20
+## [0.16.4] - 2026-09-21
 
 The events a server announces a connection with. `'connection'` and
 `'secureConnection'` now reach an application before anything on the connection is
 served, so a listener that filters clients -- an allow list, or the mutual-TLS pattern
-node documents -- runs and is obeyed. The socket an `http` or `https` request carries
-is the connection's own, as node's is, and a listener that throws no longer takes the
-server down.
+node documents -- runs and is obeyed; they are also where graceful-shutdown wrappers
+(`stoppable`, `http-terminator`, `server-destroy`) learn which sockets a server holds.
+The socket an `http` or `https` request carries is the connection's own, as node's is,
+a listener that throws no longer takes a server down, and `server.close()` lets the
+connections a server had accepted finish before it reports itself closed.
 
 ### Security
 
@@ -44,14 +46,26 @@ server down.
   HTTP -- and nothing happens on it until the listeners have run; one that destroys the
   socket stops the client being served, with no answer on the wire. `requestCert` with
   `rejectUnauthorized: true` -- the server refusing on its own -- was already enforced in
-  0.16.3 and is unchanged. Conformance cases 168 and 169 hold the whole shape to node
-  v22.22.2.
+  0.16.3 and is unchanged. Conformance cases 168 and 169 hold it to node v22.22.2 on the
+  `http`, `https` and `tls` servers, and case 174 on `http2.createSecureServer`.
 
-- **A listener that threw took the server down.** A `'connection'` or `'secureConnection'`
-  listener that threw -- a mutual-TLS check reading a field off an empty certificate, say --
-  ended the server's accept loop, after which every connection was accepted and then never
-  dispatched. As in node, the exception is now raised as `'uncaughtException'` and the server
-  keeps serving. The same shape still applies to a `'request'` handler that throws.
+- **A listener that threw took a server down.** In 0.16.3 a `'request'`
+  handler, an `'upgrade'` listener or a `'connect'` listener that threw ended the process with
+  an unhandled promise rejection (`OAM-RT0004`), even when the application had installed
+  `process.on('uncaughtException')` to log the error and go on serving: one request that
+  reached a bug in a handler stopped the server for every client. In node the throw is raised
+  as `'uncaughtException'`, so with such a handler the server keeps serving (without one, the
+  process exits on both runtimes). oam now does the same for every listener an `http` or
+  `https` server calls while it serves or closes: those three, the `'connection'` and
+  `'secureConnection'` listeners this release adds -- a mutual-TLS check reading a field off
+  an empty certificate, say -- and a `'close'` listener on the socket `'connection'` handed
+  out. The other servers had the same fault: in 0.16.3 a `'connection'` listener on
+  `net.createServer`, or a `'secureConnection'` listener on `tls.createServer` or
+  `http2.createSecureServer`, that threw ended the process despite the handler. Those are
+  raised as node raises them too, and the connection whose listener threw is still served.
+  Case 173 holds the `http` server's `'request'`, `'upgrade'`, `'connect'` and `'close'`
+  listeners to node v22.22.2, and case 176 the `net`, `tls` and `http2` servers' listeners
+  and a socket `'close'` listener that throws when `server.close()` ends its connection.
 
 ### Changed
 
@@ -84,22 +98,60 @@ server down.
   pipe or file receives is byte-for-byte what node writes, binary data and a UTF-8
   character cut across two writes included.
 
+- **A write to stdout or stderr that failed was dropped without a word.** node reports it: a
+  stdout that is a read-only file, say, or a full disk (`ENOSPC`), gives the write's
+  callback the error and emits `'error'` on `process.stdout` -- which ends the program when
+  nothing listens for it -- and `fs.writeSync(1, ...)` throws. oam discarded the error and
+  ran on as though the output had been written. It now reports it as node does, with
+  node's `code`, `errno` and message (`EBADF: bad file descriptor, write`). A reader that
+  goes away still ends the program quietly, as before, and that now includes a Windows pipe
+  server that disconnects, which oam used to go on writing into. `process.stdout.destroy()`
+  and `end()` leave the stream writable, as node's do, where oam's refused every later
+  write; `fs.write` on a descriptor that fails calls back `(err, 0, data)`, as node's does;
+  and on Linux and macOS a stdout pipe in non-blocking mode no longer loses the tail of a
+  large write -- it waits for the reader and delivers all of it. What still differs is in
+  the divergences table (`process.stdout` / `process.stderr` rows).
+
 - **A server was not `instanceof net.Server`, and had no `getConnections()`.** In node every
   server in this family is one -- `http.Server extends net.Server`, `tls.Server extends
-  net.Server`, `https.Server extends tls.Server` -- and library code tests for it: a
-  graceful-shutdown wrapper (`stoppable`, `http-terminator`, `server-destroy`) polls
-  `server.getConnections()` to decide when a drain has finished, and middleware checks the
-  instance to decide what it was handed. oam's `http`, `https` and `tls` servers answered
-  `false` and carried no such method, and `net.Server`'s own was a stub that answered 0
-  whatever was connected -- the worse half of the two, because a drain loop written against
-  it finished at once rather than failing in a way its caller would notice. All four now
-  answer the check, through the same brand `net.Socket` uses, and report the connections the
-  server is holding, on a later tick as node's do. `http2.createSecureServer` is a
-  `tls.Server` and gets both; `http2.createServer`'s h2c server is not covered. A connection an
-  upgrade or CONNECT takes over is counted until its socket closes, as node counts a
-  websocket, and a socket leaves the count in its own teardown rather than through a
-  `'close'` listener user code could remove. Case 170 holds the shape to node v22.22.2,
-  net and tls connections included, down to zero after they close.
+  net.Server`, `https.Server extends tls.Server` -- so code written for node can test any of
+  them with `instanceof net.Server` and ask any of them `getConnections()`. oam's `http`,
+  `https` and `tls` servers answered `false` and carried no such method, and `net.Server`'s
+  own was a stub that answered 0 whatever was connected -- the worse half of the two, because
+  a drain loop written against it finished at once rather than failing in a way its caller
+  would notice. All four now answer the check, through the same brand `net.Socket` uses, and
+  report the connections the server is holding, on a later tick as node's do.
+  `http2.createSecureServer` is a `tls.Server` and gets both; `http2.createServer`'s h2c
+  server is not covered. A connection an upgrade or CONNECT takes over is counted until its
+  socket closes, as node counts a websocket, and a socket leaves the count in its own
+  teardown rather than through a `'close'` listener user code could remove. Case 170 holds
+  the shape to node v22.22.2, net and tls connections included, down to zero after they
+  close -- all but one ending, which it leaves out: on an `http` server, the count after a
+  client's keep-alive `Agent` is destroyed. oam's client keeps that pooled connection open
+  until the server's keep-alive timeout closes it, where node's closes it at once -- a gap
+  in the client, not in the count (divergence 38).
+
+- **`server.close()` did not wait for the connections a server had accepted.** node's
+  `http` and `https` servers stop listening at `close()`, close the idle keep-alive
+  connections, and let every other connection finish: a request in flight is answered, its
+  connection keeps counting in `getConnections()` until it ends, and `'close'` -- with the
+  `close(cb)` callback -- comes after the last one has gone. oam let go of every connection
+  at `close()`. The count read 0 at once with a request still in flight, so a drain loop
+  polling it finished early; `'close'` and the callback fired about a millisecond after
+  `close()`, so the common `server.close(() => process.exit(0))` cut off the request it was
+  meant to let finish; a request already on its way to the handler was dropped, its client
+  left waiting; and a connection whose own `'connection'` listener called `close()` was
+  reset. Each now behaves as node's does. An upgraded socket -- a websocket -- holds
+  `'close'` back until it ends; a second `close(cb)` made during the drain is answered
+  `ERR_SERVER_NOT_RUNNING` when the drain ends; the listening socket is closed before
+  `close()` returns, so a connection made after it is refused; and a connection accepted
+  before it is served, its TLS handshake included. `closeIdleConnections()` and
+  `closeAllConnections()`, empty until now, close what node's close. A `net` or `tls` server
+  likewise emits `'close'` only once its last connection has ended, where 0.16.3 emitted it
+  at `close()`. Case 175 holds it to node v22.22.2. Two differences remain (divergence 42):
+  a connection with a request in flight at `close()` is answered with `Connection: close`
+  and ends after that response, where node keeps it open until its keep-alive timeout; and
+  requests pipelined behind that one are not read.
 
 - **`http.request` sent no `Connection` header, so a server kept the connection open.** node's
   client puts one on every request -- `close` when the socket is not to be kept alive,
@@ -116,7 +168,8 @@ server down.
   'connection')` and `getHeaders()` still report only what the caller set. A connection a request asked
   to close is never given another request, whether or not the response said `close` back
   (RFC 9112 s9.6), as node destroys the socket. Case 171 holds the table -- eight request
-  shapes, and pooling -- to node v22.22.2.
+  shapes, and pooling -- to node v22.22.2, and case 172 holds that rule against a server
+  that never closes a connection and never says `close`.
 
 ## [0.16.3] - 2026-09-20
 
