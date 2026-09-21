@@ -27350,3 +27350,55 @@ process.exit(0);
          live=1"
     );
 }
+
+/// node's client puts a Connection header on every request, and the peer's
+/// handling of the connection follows from it. The server here is given a
+/// 30 s keep-alive timeout, so the connection can only be gone in time if the
+/// request was framed `close` -- if the header is dropped again, the count
+/// stays at 1 and this fails rather than waiting the timeout out.
+#[test]
+fn an_agentless_request_frames_itself_close_so_the_server_lets_go() {
+    let src = r#"import http from 'node:http';
+
+const seen = [];
+const server = http.createServer((req, res) => {
+  seen.push(req.headers.connection);
+  res.end('ok');
+});
+server.keepAliveTimeout = 30000;
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const count = () => new Promise((r) => server.getConnections((_e, n) => r(n)));
+const ask = (opts) => new Promise((resolve, reject) => {
+  const req = http.request({ host: '127.0.0.1', port, path: '/', ...opts }, (res) => {
+    res.resume();
+    res.on('end', resolve);
+  });
+  req.on('error', reject);
+  req.end();
+});
+
+await ask({ agent: false });
+let left = -1;
+for (let i = 0; i < 40; i++) {
+  left = await count();
+  if (left === 0) break;
+  await new Promise((r) => setTimeout(r, 50));
+}
+console.log('agent-false header=' + seen[0] + ' connections-left=' + left);
+
+// The other half: a keep-alive agent still says so, and the server holds it.
+const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+await ask({ agent });
+console.log('keep-alive header=' + seen[1] + ' held=' + ((await count()) === 1));
+agent.destroy();
+server.close();
+process.exit(0);
+"#;
+    let stdout = run_ok("client_connection_header.mjs", src);
+    assert_eq!(
+        stdout.replace("\r\n", "\n").trim_end(),
+        "agent-false header=close connections-left=0\n\
+         keep-alive header=keep-alive held=true"
+    );
+}

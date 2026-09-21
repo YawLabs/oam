@@ -20043,9 +20043,30 @@
         var self = this;
         self._sent = true;
         self._fetchActivity();
+        // node's _storeHeader puts a Connection header on every request it
+        // sends -- `close` when the socket is not to be kept alive,
+        // `keep-alive` when it is -- and what the peer does with the
+        // connection follows from it. Without it the request goes out as an
+        // ordinary HTTP/1.1 keep-alive one, so a server holds the connection
+        // (and its socket, its getConnections() count and its maxConnections
+        // slot) until its own keep-alive timeout, where node's client had it
+        // closed as soon as the response was read. The raw-socket path
+        // already writes it, from _headerList(true).
+        //
+        // On a COPY: mutating this._headers would make getHeader('connection')
+        // and getHeaders() report a header node does not report there, and
+        // would send _connectionHeader()'s "the caller set one" branch down
+        // the wrong path on a later hop. Called once -- it sets
+        // shouldKeepAlive as a side effect.
+        var headers = self._headers;
+        var connection = self._connectionHeader();
+        if (connection !== null) {
+          headers = Object.assign({ __proto__: null }, headers);
+          headers.connection = connection;
+        }
         var fetchOpts = {
           method: self.method,
-          headers: self._headers,
+          headers: headers,
           // node's http.request has no Fetch-spec bad-port block: port 1
           // or 25 is dialled (and refused), not refused by the client.
           __oamFetchSemantics: false,

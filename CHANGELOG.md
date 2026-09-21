@@ -87,6 +87,21 @@ server down.
   `tls.Server` and gets both; `http2.createServer`'s h2c server is not covered. Case 170
   holds the shape to node v22.22.2.
 
+- **`http.request` sent no `Connection` header, so a server kept the connection open.** node's
+  client puts one on every request -- `close` when the socket is not to be kept alive,
+  `keep-alive` when it is, nothing when the caller removed it -- and what the peer does with
+  the connection follows from it. oam computed the value and then wrote it only on its
+  raw-socket path; over its own transport, which is where `http.request` goes, it was dropped
+  and every request went out as an ordinary HTTP/1.1 keep-alive one. So a request node has the
+  server let go of as soon as the response is read (`agent: false`) instead left the
+  connection held until the server's keep-alive timeout expired -- 2007 ms against node's own
+  server, where node's client measured 7 ms -- and the connection's socket, its `'close'`, the
+  `getConnections()` count and a `maxConnections` slot went with it. The server was never the
+  problem: handed the same request, node's server holds it exactly as long. What the caller
+  sees of its own headers is unchanged, since the value goes on a copy: `getHeader(
+  'connection')` and `getHeaders()` still report only what the caller set. Case 171 holds the
+  table -- eight request shapes, and pooling -- to node v22.22.2.
+
 ## [0.16.3] - 2026-09-20
 
 A security release over both ends of the HTTP stack, and the one that made

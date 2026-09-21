@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "acaa008+wip",
+  "commit": "38947c8+wip",
   "oamVersion": "oam 0.16.4",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 162,
-      "total": 162,
+      "pass": 163,
+      "total": 163,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -332,6 +332,10 @@
         },
         {
           "case": "170-server-get-connections.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "171-client-connection-header.mjs",
           "status": "pass"
         },
         {
