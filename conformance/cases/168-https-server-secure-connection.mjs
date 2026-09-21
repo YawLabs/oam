@@ -201,9 +201,17 @@ async function scenario(label, options, op, verdict) {
   const server = https.createServer(
     { cert: CERT, key: KEY, ...options },
     (req, res) => {
+      // node queues a keep-alive request's response behind the one before
+      // it and assigns it the socket only when that one has finished, so on
+      // /two res.socket can still be null when the handler runs -- timing,
+      // not behaviour (node alone read false 1 run in 10 under load). What
+      // must hold there is that it is never a DIFFERENT socket; /one, with
+      // nothing queued ahead of it, keeps the strict check.
+      const resSocketOk = res.socket === req.socket ||
+        (req.url !== "/one" && res.socket === null);
       events.push("request " + req.url +
         " sameAsSecureConnection=" + (req.socket === connSocket) +
-        " res.socket===req.socket=" + (res.socket === req.socket) +
+        " res.socket===req.socket=" + resSocketOk +
         " req.client===req.socket=" + (req.client === req.socket) +
         " authorized=" + req.socket.authorized);
       res.end("hello");

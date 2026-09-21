@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "38947c8+wip",
+  "commit": "da5fb7f+wip",
   "oamVersion": "oam 0.16.4",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
