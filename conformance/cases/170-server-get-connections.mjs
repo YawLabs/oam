@@ -216,6 +216,37 @@ await web("https");
   server.close();
 }
 
+// ---- a client that never finishes the handshake still counts, then leaves --
+// Port scanners and TCP health checks connect to a TLS port and never speak
+// TLS. The connection counts from the accept; it must leave the count when
+// the client hangs up, or when what it sent is refused as not TLS.
+async function halfHandshake(kind) {
+  const server = kind === "https"
+    ? https.createServer({ cert: CERT, key: KEY }, (_q, s) => s.end("ok"))
+    : tls.createServer({ cert: CERT, key: KEY });
+  server.on("tlsClientError", () => {});
+  server.on("clientError", () => {});
+  await listen(server);
+  const port = server.address().port;
+  // Connects and says nothing.
+  const silent = net.connect(port, "127.0.0.1");
+  silent.on("error", () => {});
+  await new Promise((r) => silent.on("connect", r));
+  let n = 0;
+  for (let i = 0; i < 40 && n < 1; i++) { n = await count(server); if (n < 1) await tick(25); }
+  line(kind + ".connections with a client that never handshakes", n);
+  silent.destroy();
+  line(kind + ".connections after that client hangs up", await drained(server));
+  // Connects and sends bytes that are not TLS.
+  const junk = net.connect(port, "127.0.0.1", () => junk.write("GET / HTTP/1.1\r\nHost: x\r\n\r\n"));
+  junk.on("error", () => {});
+  await new Promise((r) => junk.on("close", r));
+  line(kind + ".connections after a non-TLS client is refused", await drained(server));
+  server.close();
+}
+await halfHandshake("tls");
+await halfHandshake("https");
+
 // ---- an upgrade or CONNECT keeps its connection counted until it closes ---
 {
   const held = [];

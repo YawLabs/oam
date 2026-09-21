@@ -18397,6 +18397,22 @@
       serveRequests(server, bound.serverId, encrypted);
     }
 
+    // node: a listener that throws raises 'uncaughtException' and the server
+    // keeps serving. Letting the throw out of serveRequests' loop would end
+    // the loop with it, and every later connection would be accepted and
+    // then never dispatched -- so a check installed on 'connection' /
+    // 'secureConnection' that throws (an mTLS listener reading a field off
+    // an empty certificate), a 'request' handler that throws, or an
+    // 'upgrade' listener that throws would take the server down rather than
+    // fail one client. The tick queue runs the same uncaught ladder node's
+    // does, including a process.on('uncaughtException') that means to keep
+    // serving. Every listener the loop calls goes through here.
+    function raiseFromListener(e) {
+      process.nextTick(() => {
+        throw e;
+      });
+    }
+
     async function serveRequests(server, serverId, encrypted) {
       for (;;) {
         const meta = await natives.httpAccept(serverId);
@@ -18405,18 +18421,7 @@
           try {
             onConnectionEvent(server, meta);
           } catch (e) {
-            // node: a listener that throws raises 'uncaughtException' and
-            // the server keeps serving. Letting it out of this loop would
-            // end the loop with it, and every later connection would be
-            // accepted and then never dispatched -- so a check installed
-            // on 'connection' / 'secureConnection' that throws (an mTLS
-            // listener reading a field off an empty certificate) would
-            // take the server down rather than refuse one client. The tick
-            // queue runs the same uncaught ladder node's does, including a
-            // process.on('uncaughtException') that means to keep serving.
-            process.nextTick(() => {
-              throw e;
-            });
+            raiseFromListener(e);
           }
           continue;
         }
@@ -18452,7 +18457,12 @@
           // own teardown (kCountedIn). The record's stand-in socket closes
           // first, before 'upgrade' / 'connect' runs, as it always has.
           if (meta.replacesConnection !== undefined) {
-            releaseConnection(server, meta.replacesConnection);
+            // The stand-in's 'close' listeners run here.
+            try {
+              releaseConnection(server, meta.replacesConnection);
+            } catch (e) {
+              raiseFromListener(e);
+            }
           }
           const handedOver =
             server[Symbol.for("oam.serverConnections")] ||
@@ -18477,8 +18487,13 @@
           // goes to 'upgrade' (whose listener went away after the head was
           // parsed, here: nobody is left to take the socket, so it closes).
           const event = req.method === "CONNECT" ? "connect" : "upgrade";
-          if (!server.emit(event, req, socket, head)) {
-            socket.destroy();
+          try {
+            if (!server.emit(event, req, socket, head)) {
+              socket.destroy();
+            }
+          } catch (e) {
+            // The listener that threw was handed the socket; it is its.
+            raiseFromListener(e);
           }
           continue;
         }
@@ -18521,7 +18536,11 @@
         res.socket = req.socket;
         res.connection = req.socket;
         trackExchange(server, meta.requestId, req, res);
-        server.emit("request", req, res);
+        try {
+          server.emit("request", req, res);
+        } catch (e) {
+          raiseFromListener(e);
+        }
       }
       stopConnectionsCheck(server);
       // The server is done. Nothing will serve the connections it was

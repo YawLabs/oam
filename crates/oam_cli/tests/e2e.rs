@@ -27402,3 +27402,61 @@ process.exit(0);
          keep-alive header=keep-alive held=true"
     );
 }
+
+/// A server keeps the connections it counts in a set, and each counted socket
+/// knows the set it is in. That membership must stay out of what inspecting
+/// the socket prints: as an enumerable property whose value is the server's
+/// whole set, `console.log(socket)` in an error handler printed every other
+/// client's socket -- output linear in the connection count, and other
+/// clients' addresses in the log.
+#[test]
+fn inspecting_a_counted_socket_does_not_print_the_servers_other_connections() {
+    let src = r#"import net from 'node:net';
+import http from 'node:http';
+import util from 'node:util';
+
+const membership = Symbol.for('oam.countedIn');
+const report = (label, socket) => {
+  const desc = Object.getOwnPropertyDescriptor(socket, membership);
+  const text = util.inspect(socket, { depth: 4 });
+  console.log(label + ' member=' + (desc !== undefined) + ' enumerable=' + (desc ? desc.enumerable : 'n/a') +
+    ' printsSet=' + text.includes('Set(') + ' printsPeerPort=' + text.includes(String(PEER_PORT)) +
+    ' chars=' + (text.length < 4000 ? 'bounded' : text.length));
+};
+let PEER_PORT = -1;
+
+// net: two clients, inspect the first accepted socket; the second's port must
+// not appear in it.
+const accepted = [];
+const server = net.createServer((s) => { s.on('error', () => {}); accepted.push(s); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const a = net.connect(port, '127.0.0.1'); a.on('error', () => {});
+const b = net.connect(port, '127.0.0.1'); b.on('error', () => {});
+await new Promise((r) => b.on('connect', r));
+while (accepted.length < 2) await new Promise((r) => setTimeout(r, 10));
+PEER_PORT = accepted[1].remotePort;
+report('net', accepted[0]);
+a.destroy(); b.destroy(); server.close();
+
+// http upgrade: the handed-over socket is counted too.
+const held = [];
+const web = http.createServer((_q, s) => s.end('ok'));
+web.on('upgrade', (_req, socket) => { socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: p\r\nConnection: Upgrade\r\n\r\n'); held.push(socket); });
+await new Promise((r) => web.listen(0, '127.0.0.1', r));
+const wport = web.address().port;
+const up = (n) => new Promise((r) => { const c = net.connect(wport, '127.0.0.1', () => c.write('GET /' + n + ' HTTP/1.1\r\nHost: x\r\nUpgrade: p\r\nConnection: Upgrade\r\n\r\n')); c.on('error', () => {}); c.once('data', () => r(c)); });
+const u1 = await up(1); const u2 = await up(2);
+while (held.length < 2) await new Promise((r) => setTimeout(r, 10));
+PEER_PORT = held[1].remotePort;
+report('upgrade', held[0]);
+u1.destroy(); u2.destroy(); held.forEach((s) => s.destroy()); web.close();
+process.exit(0);
+"#;
+    let stdout = run_ok("inspect_counted_socket.mjs", src);
+    assert_eq!(
+        stdout.replace("\r\n", "\n").trim_end(),
+        "net member=true enumerable=false printsSet=false printsPeerPort=false chars=bounded\n\
+         upgrade member=true enumerable=false printsSet=false printsPeerPort=false chars=bounded"
+    );
+}
