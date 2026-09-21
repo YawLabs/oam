@@ -18572,6 +18572,9 @@
     class Server extends EventEmitter {
       constructor(options, handler) {
         super();
+        // node's http.Server extends net.Server; oam's is built on its own
+        // native server, so it carries net.Server's brand instead (#213).
+        this[Symbol.for("oam.netServerLike")] = true;
         // node: Server([options][, requestListener]).
         if (typeof options === "function") {
           handler = options;
@@ -18667,6 +18670,14 @@
       // before server.close()).
       closeIdleConnections() {}
       closeAllConnections() {}
+      // net.Server#getConnections. The live connections are the records the
+      // native server's announcements keep, one per connection (see
+      // connectionRecord), so the count is already here; node answers on a
+      // later tick rather than synchronously.
+      getConnections(cb) {
+        process.nextTick(cb, null, this._connSockets ? this._connSockets.size : 0);
+        return this;
+      }
     }
 
     // Node's urlToHttpOptions (lib/internal/url.js): the options a URL or a
@@ -23065,11 +23076,33 @@
       uncork() { return this; }
     }
 
+    // net.Socket's brand (above), for servers. node's http, https and tls
+    // servers ARE net.Servers -- `http.Server extends net.Server`,
+    // `tls.Server extends net.Server`, `https.Server extends tls.Server` --
+    // and library code tests for one: a graceful-shutdown wrapper deciding
+    // what it was handed, middleware picking a transport. oam builds each of
+    // them on its own native server, so the prototype chain cannot carry the
+    // relationship and the brand does (#213). Consulted only for `net.Server`
+    // itself; a user subclass gets the ordinary prototype walk.
+    const kNetServerLike = Symbol.for("oam.netServerLike");
+    // The live connections a server has accepted, which getConnections()
+    // reports. An http or https server keeps its own in `_connSockets`, one
+    // record per connection, made when the native server announces it; a net
+    // or tls server accepts in JS and keeps them here.
+    const kServerConns = Symbol.for("oam.serverConnections");
+
     class Server extends EventEmitter {
+      static [Symbol.hasInstance](instance) {
+        if (Function.prototype[Symbol.hasInstance].call(this, instance)) return true;
+        return this === Server && instance !== null && typeof instance === "object" &&
+          instance[kNetServerLike] === true;
+      }
       constructor(options, connectionListener) {
         super();
         if (typeof options === "function") { connectionListener = options; options = {}; }
         if (connectionListener) this.on("connection", connectionListener);
+        this[kNetServerLike] = true;
+        this[kServerConns] = new Set();
         this._serverId = null;
         this._port = null;
         this._host = null;
@@ -23144,6 +23177,11 @@
             _remoteAddr: accepted.remoteAddr,
             _localAddr: accepted.localAddr,
           });
+          // node's `this._connections`, the number getConnections() answers
+          // with: a connection counts from the accept until its socket closes.
+          const live = this[kServerConns];
+          live.add(socket);
+          socket.once("close", () => live.delete(socket));
           socket._readLoop();
           this.emit("connection", socket);
         }
@@ -23168,7 +23206,14 @@
         return this;
       }
 
-      getConnections(cb) { if (cb) cb(null, 0); return this; }
+      // node answers on a later tick -- its getConnections() hands the count
+      // to process.nextTick -- never synchronously, so a caller that starts a
+      // drain loop from the callback sees the same ordering here.
+      getConnections(cb) {
+        const live = this[kServerConns];
+        process.nextTick(cb, null, live ? live.size : 0);
+        return this;
+      }
       // Same unref semantics as Socket (see the note there): the flag feeds
       // the active-handle views, the native releases the loop -- node exits
       // with an unref'd server still listening (probed). Only while bound:
@@ -31385,6 +31430,10 @@
     class Server extends EventEmitter {
       constructor(options, connectionListener) {
         super();
+        // node's tls.Server extends net.Server, and https.Server extends this
+        // one, so both answer `instanceof net.Server` through the brand (#213).
+        this[Symbol.for("oam.netServerLike")] = true;
+        this[Symbol.for("oam.serverConnections")] = new Set();
         if (typeof options === "function") {
           connectionListener = options;
           options = {};
@@ -31550,6 +31599,14 @@
           registry._activeHandles.delete(plain);
         }
         var socket = new TLSSocket(null, {});
+        // The connection counts from here -- the accept -- until its socket
+        // closes, which covers a handshake that never finishes, as node's
+        // net.Server does. A client refused in 'connection' returned above.
+        var live = this[Symbol.for("oam.serverConnections")];
+        if (live) {
+          live.add(socket);
+          socket.once("close", function () { live.delete(socket); });
+        }
         if (plain !== null) {
           plain.destroy = function destroy(err) {
             socket.destroy(err);
@@ -31643,6 +31700,15 @@
       unref() {
         this._handleRefed = false;
         if (this.listening) natives.tcpServerSetRef(this._serverId, false);
+        return this;
+      }
+      // net.Server#getConnections. A tls server accepts in JS and holds its
+      // live sockets itself; an https server is this class but is served
+      // natively, so its connections are the native announcements' records.
+      getConnections(cb) {
+        const live = this[Symbol.for("oam.serverConnections")];
+        const count = this._connSockets ? this._connSockets.size : live ? live.size : 0;
+        process.nextTick(cb, null, count);
         return this;
       }
       getTicketKeys() { return Buffer.alloc(48); }

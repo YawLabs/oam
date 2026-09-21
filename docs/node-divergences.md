@@ -1796,6 +1796,15 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
   here). `requestCert`, `rejectUnauthorized` and `ALPNProtocols` are read for each new
   connection as in Node, through accessor properties on the server (Node: data
   properties).
+- **A server answers `instanceof net.Server` by brand.** Node's `http.Server` and
+  `tls.Server` extend `net.Server` (and `https.Server` extends `tls.Server`); oam builds
+  each on its own native server, so the answer comes from the same brand `net.Socket` uses
+  (entry 34) rather than from the prototype chain -- `Object.getPrototypeOf` does not walk
+  through `net.Server`, and none of `net.Server`'s own methods arrives that way.
+  `getConnections()` is implemented on each of them, reporting the connections the server
+  is holding and answering on a later tick as Node's does; what it counts is released when
+  the connection's record is (see the connection lifetime above). `http2.createSecureServer`
+  is a `tls.Server` and has both; `http2.createServer`'s h2c server has neither.
 - **An `https` server emits no `'upgrade'` and no `'connect'`.** An upgrade request is
   served as an ordinary request (Node: `'upgrade'`, with the connection handed over) and a
   CONNECT is closed, so `wss://` servers -- `ws`, `socket.io` -- do not work on an oam

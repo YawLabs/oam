@@ -27281,3 +27281,72 @@ srv.close();
         "stderr: {stderr}"
     );
 }
+
+/// An http, https or tls server is a `net.Server`, and reports the connections
+/// it is holding. node's servers all inherit from one -- `http.Server extends
+/// net.Server`, `tls.Server extends net.Server` -- and library code tests for
+/// that: a graceful-shutdown wrapper polls `getConnections()` to decide when a
+/// drain has finished. oam builds each server on its own native server, so the
+/// relationship is carried by the same brand `net.Socket` uses, and the count
+/// comes from the per-connection records the server already keeps.
+#[test]
+fn a_server_is_a_net_server_and_counts_the_connections_it_holds() {
+    let src = r#"import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
+import tls from 'node:tls';
+
+const count = (s) =>
+  new Promise((res, rej) => s.getConnections((e, n) => (e ? rej(e) : res(n))));
+
+const plain = http.createServer((_q, r) => r.end('ok'));
+const secure = https.createServer({ key: `__KEY__`, cert: `__CERT__` }, (_q, r) => r.end('ok'));
+const tlsServer = tls.createServer({ key: `__KEY__`, cert: `__CERT__` });
+const bare = net.createServer();
+for (const [name, s] of [['http', plain], ['https', secure], ['tls', tlsServer], ['net', bare]]) {
+  console.log(name + ' isNetServer=' + (s instanceof net.Server) +
+    ' getConnections=' + typeof s.getConnections);
+}
+// A subclass is still one; something else is not.
+class Mine extends http.Server {}
+console.log('subclass=' + (new Mine(() => {}) instanceof net.Server) +
+  ' socket=' + (new net.Socket() instanceof net.Server));
+
+// node hands the count to process.nextTick, never synchronously.
+let sync = true;
+plain.getConnections(() => console.log('synchronous=' + sync));
+sync = false;
+await new Promise((r) => setTimeout(r, 20));
+console.log('idle=' + (await count(plain)));
+
+await new Promise((r) => plain.listen(0, '127.0.0.1', r));
+const port = plain.address().port;
+const agent = new http.Agent({ keepAlive: true, maxSockets: 1 });
+await new Promise((resolve, reject) => {
+  const req = http.request({ host: '127.0.0.1', port, path: '/', agent }, (res) => {
+    res.resume();
+    res.on('end', resolve);
+  });
+  req.on('error', reject);
+  req.end();
+});
+console.log('live=' + (await count(plain)));
+agent.destroy();
+plain.close();
+process.exit(0);
+"#
+    .replace("__KEY__", MTLS_SERVER_KEY)
+    .replace("__CERT__", MTLS_SERVER_CERT);
+    let stdout = run_ok("server_get_connections.mjs", &src);
+    assert_eq!(
+        stdout.replace("\r\n", "\n").trim_end(),
+        "http isNetServer=true getConnections=function\n\
+         https isNetServer=true getConnections=function\n\
+         tls isNetServer=true getConnections=function\n\
+         net isNetServer=true getConnections=function\n\
+         subclass=true socket=false\n\
+         synchronous=false\n\
+         idle=0\n\
+         live=1"
+    );
+}

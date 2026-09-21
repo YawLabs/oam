@@ -1,7 +1,7 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "f1854b0",
-  "oamVersion": "oam 0.16.3",
+  "commit": "acaa008+wip",
+  "oamVersion": "oam 0.16.4",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
   "suites": {
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 161,
-      "total": 161,
+      "pass": 162,
+      "total": 162,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -328,6 +328,10 @@
         },
         {
           "case": "17-class-extends-emitter.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "170-server-get-connections.mjs",
           "status": "pass"
         },
         {

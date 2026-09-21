@@ -71,6 +71,22 @@ server down.
   that silently skipped itself would be the weakness the Security entry above is about.
   Divergence 39 lists what the object has.
 
+### Fixed
+
+- **A server was not `instanceof net.Server`, and had no `getConnections()`.** In node every
+  server in this family is one -- `http.Server extends net.Server`, `tls.Server extends
+  net.Server`, `https.Server extends tls.Server` -- and library code tests for it: a
+  graceful-shutdown wrapper (`stoppable`, `http-terminator`, `server-destroy`) polls
+  `server.getConnections()` to decide when a drain has finished, and middleware checks the
+  instance to decide what it was handed. oam's `http`, `https` and `tls` servers answered
+  `false` and carried no such method, and `net.Server`'s own was a stub that answered 0
+  whatever was connected -- the worse half of the two, because a drain loop written against
+  it finished at once rather than failing in a way its caller would notice. All four now
+  answer the check, through the same brand `net.Socket` uses, and report the connections the
+  server is holding, on a later tick as node's do. `http2.createSecureServer` is a
+  `tls.Server` and gets both; `http2.createServer`'s h2c server is not covered. Case 170
+  holds the shape to node v22.22.2.
+
 ## [0.16.3] - 2026-09-20
 
 A security release over both ends of the HTTP stack, and the one that made
