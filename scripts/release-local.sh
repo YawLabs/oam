@@ -345,10 +345,14 @@ restore_gate_artifacts "preflight"
 # So the three states are separated here:
 #
 #   1. a `## [x.y.z]` heading for THIS tag exists -- promoted already, or this
-#      is a re-run after a failed attempt. Nothing to check.
+#      is a re-run after a failed attempt. Its own section must hold entries,
+#      and [Unreleased] must hold none (see below).
 #   2. [Unreleased] is empty -- the log was never written. Fails as before.
 #   3. entries sit under [Unreleased] with no heading for this tag -- the state
 #      that used to pass silently. scripts/changelog-release.sh promotes them.
+#
+# The tag's heading is matched LITERALLY: spliced into a regex, every dot in
+# the version would match any character.
 if [ -f CHANGELOG.md ]; then
   unreleased_body="$(awk '
     /^#+[[:space:]]*\[?[Uu]nreleased\]?/ { inside = 1; next }
@@ -356,12 +360,25 @@ if [ -f CHANGELOG.md ]; then
     inside && /^###[[:space:]]/ { next }
     inside { print }
   ' CHANGELOG.md | tr -d '[:space:]')"
-  if grep -q "^##[[:space:]]*\[${TAG#v}\]" CHANGELOG.md; then
+  version_head="## [${TAG#v}]"
+  if awk -v head="$version_head" 'index($0, head) == 1 { found = 1; exit } END { exit !found }' CHANGELOG.md; then
     # Promoted. Anything written under [Unreleased] SINCE then still ships in
     # THIS release -- the tag is cut from this tree -- and would land with no
     # heading of its own: the same drift again, one release later.
     [ -z "$unreleased_body" ] \
       || fail "CHANGELOG.md has a '## [${TAG#v}]' heading AND entries under [Unreleased] -- the latter ship in this release with no heading. Move them into the [${TAG#v}] section and commit, then re-run."
+    # And the heading has to carry the log: one written by hand, or emptied
+    # later, would otherwise stand in for it -- the empty-[Unreleased] check
+    # above is the only other place the policy is enforced, and it no longer
+    # applies once a version is promoted.
+    version_body="$(awk -v head="$version_head" '
+      !inside && index($0, head) == 1 { inside = 1; next }
+      inside && /^#+[[:space:]]/ && !/^###[[:space:]]/ { exit }
+      inside && /^###[[:space:]]/ { next }
+      inside { print }
+    ' CHANGELOG.md | tr -d '[:space:]')"
+    [ -n "$version_body" ] \
+      || fail "CHANGELOG.md's '## [${TAG#v}]' section has no entries -- RELIABILITY.md requires a public behavior-change log for every release. Add them, or say plainly that this release changes nothing observable. (Bare '### Added'-style subheadings with nothing under them do not count.)"
   else
     [ -n "$unreleased_body" ] || fail "CHANGELOG.md's Unreleased section has no entries -- RELIABILITY.md requires a public behavior-change log for every release. Add them, or say plainly that this release changes nothing observable. (Bare '### Added'-style subheadings with nothing under them do not count.)"
     fail "CHANGELOG.md has entries under [Unreleased] but no '## [${TAG#v}]' heading -- they would ship unattributed, which is how 0.15.1 through 0.16.3 ended up with none. Promote and commit them, then re-run: scripts/changelog-release.sh ${TAG#v}"

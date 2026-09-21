@@ -62,7 +62,7 @@ server down.
   ends, and `res.socket` / `res.connection` / `req.client` are that same object. It also
   answers `instanceof net.Socket`, and on an https server `instanceof tls.TLSSocket`, where
   both were `false` before -- by brand, as oam's own `TLSSocket` answers `instanceof
-  net.Socket` (0.16.0). The object is still not a stream: it has the addresses,
+  net.Socket` (0.15.3). The object is still not a stream: it has the addresses,
   `address()`, `setTimeout`, `destroy` and `end`, and none of `write`, `pause`, `resume`,
   `setNoDelay`, `setKeepAlive`, `ref` or `unref`, so code that reads an `instanceof` test as
   a promise of the stream API will now reach a missing method where it used to take its
@@ -72,6 +72,17 @@ server down.
   Divergence 39 lists what the object has.
 
 ### Fixed
+
+- **One `process.stdout.write()` reached the terminal as two writes.** It went through Rust's
+  line-buffered stdout, which sends a payload through its last newline at once and holds the
+  rest until the flush. So a TUI frame -- hide the cursor, rewrite the rows, restore the
+  cursor -- arrived in two pieces a few milliseconds apart, and the terminal drew the
+  half-frame in between: flicker on every keystroke. Measured through a real ConPTY at
+  100x30, node delivered 12 frames of 12 whole and oam none. Each write now goes out whole,
+  as node's does: a console gets it as UTF-16 through `WriteConsoleW`, in chunks of at most
+  8192 units as libuv hands them, and a pipe or a file gets the bytes in one write. What a
+  pipe or file receives is byte-for-byte what node writes, binary data and a UTF-8
+  character cut across two writes included.
 
 - **A server was not `instanceof net.Server`, and had no `getConnections()`.** In node every
   server in this family is one -- `http.Server extends net.Server`, `tls.Server extends
@@ -84,8 +95,11 @@ server down.
   it finished at once rather than failing in a way its caller would notice. All four now
   answer the check, through the same brand `net.Socket` uses, and report the connections the
   server is holding, on a later tick as node's do. `http2.createSecureServer` is a
-  `tls.Server` and gets both; `http2.createServer`'s h2c server is not covered. Case 170
-  holds the shape to node v22.22.2.
+  `tls.Server` and gets both; `http2.createServer`'s h2c server is not covered. A connection an
+  upgrade or CONNECT takes over is counted until its socket closes, as node counts a
+  websocket, and a socket leaves the count in its own teardown rather than through a
+  `'close'` listener user code could remove. Case 170 holds the shape to node v22.22.2,
+  net and tls connections included, down to zero after they close.
 
 - **`http.request` sent no `Connection` header, so a server kept the connection open.** node's
   client puts one on every request -- `close` when the socket is not to be kept alive,
@@ -99,13 +113,14 @@ server down.
   `getConnections()` count and a `maxConnections` slot went with it. The server was never the
   problem: handed the same request, node's server holds it exactly as long. What the caller
   sees of its own headers is unchanged, since the value goes on a copy: `getHeader(
-  'connection')` and `getHeaders()` still report only what the caller set. Case 171 holds the
-  table -- eight request shapes, and pooling -- to node v22.22.2.
+  'connection')` and `getHeaders()` still report only what the caller set. A connection a request asked
+  to close is never given another request, whether or not the response said `close` back
+  (RFC 9112 s9.6), as node destroys the socket. Case 171 holds the table -- eight request
+  shapes, and pooling -- to node v22.22.2.
 
 ## [0.16.3] - 2026-09-20
 
-A security release over both ends of the HTTP stack, and the one that made
-oam's own transport carry real traffic. On the client, checks an application installs
+A security release over both ends of the HTTP stack. On the client, checks an application installs
 were not being called: `tls.checkServerIdentity`, a `secureContext`, a `lookup`
 function, an `http.Agent`'s own `createConnection`, an undici dispatcher's `connect`.
 Requests could also leave by a route the caller had not asked for -- a followed
@@ -635,8 +650,10 @@ that came out of running real clients over the new transport: keep-alive pooling
 
 ## [0.16.2] - 2026-09-18
 
-Three ways `--allow-net` could be got round -- a grant that was not
-re-checked when a redirect moved the request, a bracketed IPv6 grant that matched host
+The release that moved `fetch`, `http.request` and `https.request` off reqwest and onto
+oam's own HTTP transport, with node's connect algorithm. Alongside it, three ways
+`--allow-net` could be got round -- a grant that was not re-checked when a redirect moved
+the request, a bracketed IPv6 grant that matched host
 names by prefix, and a UDP datagram whose destination was never checked at all -- plus
 the stale-connection bug that could leave a `fetch` waiting forever.
 
@@ -689,6 +706,15 @@ the stale-connection bug that could leave a `fetch` waiting forever.
   callback, or `'error'` without one, and is never sent. (#151)
 
 ### Changed
+
+- **`fetch`, `http.request` and `https.request` run on oam's own HTTP transport** (#143).
+  They went through reqwest, which offers no say in how a connection is made, so node's
+  connect behaviour could not be matched. Every outbound connection now follows node
+  v22.22.2's `lookupAndConnect` / `lookupAndConnectMultiple`: an IP literal skips DNS, the
+  addresses a name resolves to are grouped by family and interleaved, each attempt but the
+  last races the attempt timeout, and a failure carries node's system-error shape --
+  `hostname`, `address` and `port`, and an `AggregateError` with one error per attempt when
+  several addresses were tried.
 
 - **The conformance oracle is now one pinned Node on every build leg.** oam claims
   parity with Node v22.22.2 -- the vendored node-suite corpus is a snapshot of that
@@ -3014,7 +3040,7 @@ releases.
 - The `fork` prewarm pool warms lazily, on first `fork()`.
 - `io_uring` read chunks grow from 64 KiB to 4 MiB, fixing large-file reads.
 
-[Unreleased]: https://github.com/YawLabs/oam/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/YawLabs/oam/compare/v0.16.4...HEAD
 [0.16.4]: https://github.com/YawLabs/oam/compare/v0.16.3...v0.16.4
 [0.16.3]: https://github.com/YawLabs/oam/compare/v0.16.2...v0.16.3
 [0.16.2]: https://github.com/YawLabs/oam/compare/v0.16.1...v0.16.2

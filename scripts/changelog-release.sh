@@ -32,7 +32,13 @@ case "$date" in
   *) echo "'$date' is not a YYYY-MM-DD date" >&2; exit 1 ;;
 esac
 
-if grep -q "^##[[:space:]]*\[${version}\]" "$file"; then
+# Headings are matched LITERALLY: a version spliced into a regex would let each
+# of its dots match any character.
+has_heading() {
+  awk -v head="## [$1]" 'index($0, head) == 1 { found = 1; exit } END { exit !found }' "$2"
+}
+
+if has_heading "$version" "$file"; then
   echo "CHANGELOG.md already has a [${version}] heading -- nothing to do"
   exit 0
 fi
@@ -45,27 +51,45 @@ body="$(awk '
 ' "$file" | tr -d '[:space:]')"
 [ -n "$body" ] || { echo "[Unreleased] has no entries -- write them before releasing $version" >&2; exit 1; }
 
-# The version this one follows, for the compare link: the first version heading
-# below [Unreleased], read before we insert ours.
-prev="$(awk '/^##[[:space:]]*\[[0-9]/ { gsub(/[^0-9.]/, "", $2); print $2; exit }' "$file")"
+# The version this one follows, for the compare link: whatever sits between the
+# brackets of the first version heading below [Unreleased], read before ours is
+# inserted. Taken whole, so a pre-release such as 0.17.0-rc.1 survives intact.
+prev="$(awk '/^##[[:space:]]*\[[0-9]/ {
+  s = $0; sub(/^##[[:space:]]*\[/, "", s); sub(/\].*$/, "", s); print s; exit
+}' "$file")"
 
 tmp="$(mktemp)"
-trap 'rm -f "$tmp"' EXIT
+trap 'rm -f "$tmp" "$tmp.2"' EXIT
 
 # Insert the version heading directly under [Unreleased], which keeps every
-# entry where it is and leaves [Unreleased] empty for the next cycle.
+# entry where it is and leaves [Unreleased] empty for the next cycle. The
+# heading is found at any depth, as the release gate and the body scan above
+# find it.
 awk -v v="$version" -v d="$date" '
   { print }
-  !done && /^##[[:space:]]*\[?[Uu]nreleased\]?/ { print ""; print "## [" v "] - " d; done = 1 }
+  !done && /^#+[[:space:]]*\[?[Uu]nreleased\]?/ { print ""; print "## [" v "] - " d; done = 1 }
 ' "$file" > "$tmp"
+has_heading "$version" "$tmp" \
+  || { echo "found no [Unreleased] heading to put [${version}] under -- CHANGELOG.md is unchanged" >&2; exit 1; }
 
-# Link reference, above the newest existing one.
-if [ -n "$prev" ] && grep -q "^\[${prev}\]:" "$tmp"; then
+# Link references, matched literally as the headings are: the new version's
+# above the newest existing one, and [Unreleased] moved on to compare from it.
+if [ -n "$prev" ]; then
   awk -v v="$version" -v p="$prev" '
-    !done && $0 ~ "^\\[" p "\\]:" { print "[" v "]: https://github.com/YawLabs/oam/compare/v" p "...v" v; done = 1 }
+    !done && index($0, "[" p "]:") == 1 {
+      print "[" v "]: https://github.com/YawLabs/oam/compare/v" p "...v" v
+      done = 1
+    }
     { print }
-  ' "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp"
+  ' "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp" || { echo "could not rewrite the link references -- CHANGELOG.md is unchanged" >&2; exit 1; }
 fi
+awk -v v="$version" '
+  index(tolower($0), "[unreleased]:") == 1 {
+    print "[Unreleased]: https://github.com/YawLabs/oam/compare/v" v "...HEAD"
+    next
+  }
+  { print }
+' "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp" || { echo "could not rewrite the link references -- CHANGELOG.md is unchanged" >&2; exit 1; }
 
 cp "$tmp" "$file"
 echo "CHANGELOG.md: [Unreleased] -> ## [${version}] - ${date}${prev:+ (compare link from v$prev)}"
