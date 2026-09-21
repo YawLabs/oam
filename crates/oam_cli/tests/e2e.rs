@@ -9488,10 +9488,21 @@ fn check_rejects_an_impostor_tsgo_and_daemon_status_reports_why() {
 
     // The daemon's failure is observable: status carries the recorded
     // reason and the spawn-failure timestamp instead of a bare
-    // {"running":false}.
-    let status = run(&["daemon", "status", proj.to_str().unwrap()]);
-    let parsed: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim()).unwrap();
+    // {"running":false}. The daemon records its reason from its own
+    // process, when its tsgo probe fails; the client stops waiting for it
+    // after SPAWN_WAIT (5 s), marks the spawn failed and falls back. On a
+    // loaded machine the client can get there first, with the daemon still
+    // probing, so status is read until the reason is in (bounded).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let parsed: serde_json::Value = loop {
+        let status = run(&["daemon", "status", proj.to_str().unwrap()]);
+        let parsed: serde_json::Value =
+            serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim()).unwrap();
+        if parsed["last_error"].is_string() || std::time::Instant::now() >= deadline {
+            break parsed;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
     assert_eq!(parsed["running"], false);
     assert!(
         parsed["last_error"]
