@@ -1142,3 +1142,58 @@ setTimeout(() => {
     assert_eq!(pty.wait_exit(), 0);
     pty.assert_written_right_after("[raw]", "[off]");
 }
+
+/// Text to a REAL console goes through WriteConsoleW as UTF-16, the way
+/// node (libuv) and std write it: WriteFile would hand the console UTF-8
+/// bytes to read in its code page, and "h\u{e9}llo \u{2014}" comes out as
+/// mojibake (`\u{393}\u{c7}\u{f6}` for the dash) on the CP437 a fresh console
+/// has. What `op_stdout_write` -> `win_console_write` has to get right on
+/// the way:
+///
+/// - a character cut between two writes (`Buffer` halves of "\u{20ac}") is
+///   carried and completed by the next write, never replaced;
+/// - an invalid byte is one U+FFFD, and decoding goes on past it;
+/// - a payload over libuv's 8192-unit WriteConsoleW chunk is chunked, and
+///   an astral character (a surrogate pair) on the boundary moves whole to
+///   the next chunk rather than leaving a lone high surrogate on this one.
+///
+/// The decoder and the chunking are unit-tested in node_ops.rs; this is the
+/// same text through the real console, read back off the pseudoconsole.
+#[test]
+fn console_text_is_utf16_with_cut_characters_carried_and_bad_bytes_replaced() {
+    let script = write_temp(
+        "conpty_text.mjs",
+        r"
+// U+20AC is e2 82 ac: the first two bytes in one write, the last in the next.
+process.stdout.write(Buffer.from([0xe2, 0x82]));
+process.stdout.write(Buffer.from([0xac, 0x21]));
+process.stdout.write('h\u{e9}llo \u{2014} \u{2713} \u{4e2d}\u{6587}\n');
+// '[' ff ']': a byte no UTF-8 sequence starts with.
+process.stdout.write(Buffer.from([0x5b, 0xff, 0x5d]));
+// 8191 units, then U+1F600 (two units, straddling the 8192 boundary), then
+// more: over one WriteConsoleW chunk.
+process.stdout.write('a'.repeat(8191) + '\u{1F600}' + 'b'.repeat(100) + '[END]');
+console.log('[done]');
+",
+    );
+    let pty = ConPty::spawn(&script);
+    let text = pty.wait_for("[done]");
+    assert_eq!(pty.wait_exit(), 0);
+    for expected in [
+        "\u{20ac}!",
+        "h\u{e9}llo \u{2014} \u{2713}",
+        "\u{4e2d}\u{6587}",
+        "[\u{fffd}]",
+        "\u{1f600}",
+        "[END]",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the console shows {expected:?}: {text:?}"
+        );
+    }
+    assert!(
+        !text.contains("\u{393}\u{c7}"),
+        "no mojibake (UTF-8 read as CP437): {text:?}"
+    );
+}

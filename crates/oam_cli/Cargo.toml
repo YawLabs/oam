@@ -52,10 +52,16 @@ libc = "0.2"
 # Runs by default. CreatePseudoConsole does not need the host to have a console
 # of its own, but it does need Windows 10 1809 or later: windows-sys imports it
 # statically, which is why that test is a target of its own.
+#
+# The stdout e2e (tests/e2e.rs, `named_pipe`) puts `oam run` on a named pipe
+# of its own making: message mode to see every WriteFile as a record, and one
+# named like an msys pty. CreateNamedPipeW lives in Win32_System_Pipes but is
+# gated on Win32_Storage_FileSystem too (its open-mode type is declared there).
 [target.'cfg(windows)'.dev-dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_Pipes",
     "Win32_System_Threading",

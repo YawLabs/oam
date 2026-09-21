@@ -125,6 +125,13 @@ fn bounded_output(cmd: &mut std::process::Command) -> Output {
 }
 
 fn oam(args: &[&str]) -> Output {
+    bounded_output(&mut oam_command(args))
+}
+
+/// The `oam` invocation [`oam`] runs, before its stdio is chosen -- for a
+/// test that needs stdout to be something other than a pipe this process
+/// reads to the end (a record-preserving pipe, a file, a reader it drops).
+fn oam_command(args: &[&str]) -> std::process::Command {
     // Isolated cache world: any daemon/build-info these invocations create
     // lives under the run dir and self-reaps quickly.
     let cache = write_temp("oam-cache/.keep", "")
@@ -152,7 +159,7 @@ fn oam(args: &[&str]) -> Output {
         .env_remove("FORCE_COLOR")
         .env_remove("NO_COLOR")
         .env_remove("NODE_DISABLE_COLORS");
-    bounded_output(&mut cmd)
+    cmd
 }
 
 // bug: `oam -e` writes its source to a REAL file in the CWD (node's eval
@@ -27459,4 +27466,476 @@ process.exit(0);
         "net member=true enumerable=false printsSet=false printsPeerPort=false chars=bounded\n\
          upgrade member=true enumerable=false printsSet=false printsPeerPort=false chars=bounded"
     );
+}
+
+// ================================================================== stdout
+//
+// The stdout path in oam_engine/src/node_ops.rs -- op_stdout_write ->
+// stdout_write_whole -> win_console_write | raw_stdout / write_whole --
+// against the binary. The unit tests there pin the mechanism (std's stdout is
+// a LineWriter, which splits a frame at its last newline; write_whole does
+// not); these pin what the process on the other end of oam's stdout sees. The
+// console half -- a real pseudoconsole -- is in tests/conpty.rs.
+
+/// A TUI frame: hide the cursor, home, rewrite two rows, restore the cursor.
+/// Newlines INSIDE one write and a tail after the last one -- the shape a
+/// LineWriter hands the OS as two writes (everything through the last
+/// newline at once, the tail on flush), which a terminal renders in between
+/// as the half-frame with the cursor hidden: flicker on every keystroke.
+fn tui_frames() -> Vec<Vec<u8>> {
+    (1..=8)
+        .map(|i| {
+            format!("\x1b[?25l\x1b[H[F{i:02}] row one\r\n row two\r\n tail[T{i:02}]\x1b[?25h")
+                .into_bytes()
+        })
+        .collect()
+}
+
+/// [`tui_frames`], one `process.stdout.write` each.
+const TUI_FRAMES_MJS: &str = r"
+for (let i = 1; i <= 8; i++) {
+  const n = String(i).padStart(2, '0');
+  process.stdout.write('\x1b[?25l\x1b[H[F' + n + '] row one\r\n row two\r\n tail[T' + n + ']\x1b[?25h');
+}
+";
+
+/// What a record-preserving reader delivered: one entry per OS read that
+/// returned bytes. Off a message-mode pipe or a datagram socket that is one
+/// entry per OS WRITE on the other end -- the boundary a byte stream loses,
+/// and the whole question for a TUI frame.
+struct RecordSink {
+    records: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    done: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RecordSink {
+    fn records(&self) -> Vec<Vec<u8>> {
+        self.records
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Wait for the reader to reach the end, `bound` at most: EOF, or -- for
+    /// a reader whose reads time out rather than end, a datagram socket -- an
+    /// idle read once the writer is known to be gone. False past the bound.
+    fn wait_finished(&self, bound: std::time::Duration) -> bool {
+        use std::sync::atomic::Ordering;
+        self.stop.store(true, Ordering::Release);
+        let started = std::time::Instant::now();
+        while !self.done.load(Ordering::Acquire) {
+            if started.elapsed() >= bound {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        true
+    }
+}
+
+/// Read records off `read` on a thread until it reports EOF (`Ok(0)`), fails,
+/// or -- once [`RecordSink::wait_finished`] has asked it to stop -- times out.
+fn drain_records(
+    mut read: impl FnMut(&mut [u8]) -> std::io::Result<usize> + Send + 'static,
+) -> RecordSink {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let sink = RecordSink {
+        records: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        done: std::sync::Arc::new(AtomicBool::new(false)),
+        stop: std::sync::Arc::new(AtomicBool::new(false)),
+    };
+    let (records, done, stop) = (
+        std::sync::Arc::clone(&sink.records),
+        std::sync::Arc::clone(&sink.done),
+        std::sync::Arc::clone(&sink.stop),
+    );
+    std::thread::spawn(move || {
+        // One read takes one whole record, so the buffer is far larger than
+        // any record these tests write: a message-mode pipe cuts a record
+        // that does not fit (ERROR_MORE_DATA) and a datagram socket drops
+        // the rest of it, and either would count as a split that oam never
+        // made.
+        let mut buf = vec![0u8; 65536];
+        loop {
+            match read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => records
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(buf[..n].to_vec()),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        done.store(true, Ordering::Release);
+    });
+    sink
+}
+
+/// A name no other run's pipe has: `oam-e2e-<tag>-<pid>-<nanos>`.
+#[cfg(windows)]
+fn unique_name(tag: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("oam-e2e-{tag}-{}-{nanos}", std::process::id())
+}
+
+/// A named pipe with its server end for this process to read and its client
+/// end for a child to write. `message` makes it PIPE_TYPE_MESSAGE +
+/// PIPE_READMODE_MESSAGE, where every ReadFile returns exactly one WriteFile's
+/// payload and never two; otherwise a plain byte pipe. `name` is the part
+/// after `\\.\pipe\`.
+#[cfg(windows)]
+fn named_pipe(name: &str, message: bool) -> (std::fs::File, std::fs::File) {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_INBOUND;
+    use windows_sys::Win32::System::Pipes::{
+        CreateNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_TYPE_BYTE, PIPE_TYPE_MESSAGE,
+    };
+    let path = format!(r"\\.\pipe\{name}");
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    // Blocking (PIPE_WAIT) either way; that flag, like PIPE_READMODE_BYTE, is
+    // the zero default.
+    let mode = if message {
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE
+    } else {
+        PIPE_TYPE_BYTE
+    };
+    // SAFETY: `wide` is a live NUL-terminated UTF-16 name that outlives the
+    // call, and the null security attributes are the documented default. The
+    // handle is checked against INVALID_HANDLE_VALUE before it is wrapped,
+    // and it is wrapped exactly once.
+    let server = unsafe {
+        let handle = CreateNamedPipeW(
+            wide.as_ptr(),
+            PIPE_ACCESS_INBOUND,
+            mode,
+            1,
+            65536,
+            65536,
+            0,
+            std::ptr::null(),
+        );
+        assert!(
+            handle != INVALID_HANDLE_VALUE,
+            "CreateNamedPipeW {path}: {}",
+            std::io::Error::last_os_error()
+        );
+        std::fs::File::from_raw_handle(handle)
+    };
+    // Opening the client end IS the connection. ConnectNamedPipe is for a
+    // server that wants to wait for one; called after this it reports
+    // ERROR_PIPE_CONNECTED, which the docs call a good connection.
+    let client = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("open {path}: {e}"));
+    (server, client)
+}
+
+/// A stdout for the child that keeps write boundaries, and the reader of it:
+/// a message-mode named pipe on Windows, a datagram socketpair elsewhere.
+///
+/// `UnixDatagram::pair()` rather than a SOCK_SEQPACKET socketpair because
+/// macOS has no SOCK_SEQPACKET for AF_UNIX (socketpair fails EPROTOTYPE), and
+/// a datagram pair keeps the boundaries just the same: one write(2), one
+/// datagram, one recv. What it lacks is EOF -- a datagram socket never learns
+/// its peer closed -- which is what the reader's timeout and the sink's stop
+/// flag are for.
+fn record_stdout(tag: &str) -> (RecordSink, std::process::Stdio) {
+    #[cfg(windows)]
+    {
+        use std::io::Read;
+        let (mut server, client) = named_pipe(&unique_name(tag), true);
+        (
+            drain_records(move |buf| server.read(buf)),
+            std::process::Stdio::from(client),
+        )
+    }
+    #[cfg(unix)]
+    {
+        let _ = tag;
+        let (server, client) = std::os::unix::net::UnixDatagram::pair().expect("socketpair");
+        server
+            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
+            .expect("read timeout");
+        (
+            drain_records(move |buf| server.recv(buf)),
+            std::process::Stdio::from(std::os::fd::OwnedFd::from(client)),
+        )
+    }
+}
+
+/// `oam run <script> --no-check` with `stdout` as its stdout, stderr drained,
+/// stdin closed. The Command -- and with it this process's copy of `stdout`
+/// -- is dropped as soon as the child holds its own, so a pipe reaches EOF
+/// when the child is gone, not when the test is.
+fn spawn_oam_with_stdout(
+    script: &std::path::Path,
+    stdout: std::process::Stdio,
+) -> (std::process::Child, PipeSink) {
+    let mut cmd = oam_command(&["run", script.to_str().unwrap(), "--no-check"]);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(stdout)
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().expect("oam binary runs");
+    drop(cmd);
+    let stderr = drain_pipe(child.stderr.take().expect("piped stderr"));
+    (child, stderr)
+}
+
+/// The child's exit status within `bound`; past it the child is killed and
+/// the test fails, with `context` in the message.
+fn wait_within(
+    child: &mut std::process::Child,
+    bound: std::time::Duration,
+    context: impl FnOnce() -> String,
+) -> std::process::ExitStatus {
+    let started = std::time::Instant::now();
+    loop {
+        match child.try_wait().expect("child status readable") {
+            Some(status) => return status,
+            None if started.elapsed() >= bound => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "`oam` did not exit within {}s and was killed -- {}",
+                    bound.as_secs(),
+                    context()
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(10)),
+        }
+    }
+}
+
+/// The stderr a finished child left, once its pipe has drained (bounded).
+fn stderr_text(stderr: &PipeSink) -> String {
+    let started = std::time::Instant::now();
+    while !stderr.at_eof() && started.elapsed() < std::time::Duration::from_secs(30) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    String::from_utf8_lossy(&stderr.taken()).into_owned()
+}
+
+/// THE flicker regression guard: eight TUI frames, eight `process.stdout.write`
+/// calls, eight OS writes -- read off a pipe that keeps the boundaries, so a
+/// frame split in two shows up as two records. Through std's stdout (a
+/// LineWriter, as op_stdout_write once wrote) each frame arrives as two
+/// records, "...\r\n row two\r\n" and " tail[Tnn]\x1b[?25h", sixteen in all;
+/// through node, and through oam, as eight.
+#[test]
+fn one_js_stdout_write_is_one_os_write() {
+    let script = write_temp("stdout_frames.mjs", TUI_FRAMES_MJS);
+    let (sink, stdout) = record_stdout("frames");
+    let (mut child, stderr) = spawn_oam_with_stdout(&script, stdout);
+    let status = wait_within(&mut child, OAM_DEADLINE, || {
+        format!("records so far: {:?}", sink.records())
+    });
+    assert!(
+        sink.wait_finished(std::time::Duration::from_secs(30)),
+        "the reader reached the end of stdout; records so far: {:?}",
+        sink.records()
+    );
+    assert!(status.success(), "stderr: {}", stderr_text(&stderr));
+    let (records, frames) = (sink.records(), tui_frames());
+    let listed = || {
+        records
+            .iter()
+            .map(|r| format!("  {:?}", String::from_utf8_lossy(r)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert_eq!(
+        records.len(),
+        frames.len(),
+        "one OS write per JS write -- got these records:\n{}",
+        listed()
+    );
+    assert!(
+        records == frames,
+        "every record is its frame, byte for byte -- got these records:\n{}",
+        listed()
+    );
+}
+
+/// The reader goes away mid-stream -- `oam run x | head`, a closed terminal
+/// -- and the program is over: exit 0, nothing on stderr. Not an exception in
+/// the script (LOOP_FINISHED would never print anyway), and not an EPIPE
+/// stack trace. On Windows the closed read end fails the write with
+/// ERROR_NO_DATA, which std reads as BrokenPipe, same as EPIPE on unix.
+#[test]
+fn a_reader_that_goes_away_ends_the_program_quietly() {
+    use std::io::Read;
+    let script = write_temp(
+        "stdout_broken_pipe.mjs",
+        r"
+import fs from 'node:fs';
+process.stdout.write('ready\n');
+const chunk = Buffer.alloc(65536, 0x61);
+for (let i = 0; i < 4000; i++) fs.writeSync(1, chunk);
+process.stderr.write('LOOP_FINISHED');
+",
+    );
+    let (mut child, stderr) = spawn_oam_with_stdout(&script, std::process::Stdio::piped());
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 8192];
+    while !seen.windows(6).any(|w| w == b"ready\n") {
+        let n = stdout.read(&mut buf).expect("stdout readable");
+        assert!(n > 0, "stdout ended before ready: {seen:?}");
+        seen.extend_from_slice(&buf[..n]);
+    }
+    // The read end closes with the writer mid-loop, blocked on a full pipe
+    // or about to write the next chunk.
+    drop(stdout);
+    let status = wait_within(&mut child, std::time::Duration::from_secs(20), || {
+        format!(
+            "stderr so far: {:?}",
+            String::from_utf8_lossy(&stderr.taken())
+        )
+    });
+    let stderr = stderr_text(&stderr);
+    assert!(status.success(), "exit {status}; stderr: {stderr:?}");
+    assert_eq!(stderr, "", "nothing on stderr: no LOOP_FINISHED, no error");
+}
+
+/// The bytes a script writes to a pipe or a file, exactly: nothing decoded,
+/// nothing replaced. All 256 byte values, a character cut between two
+/// writes, and a payload with newlines inside it.
+const BINARY_MJS: &str = r"
+process.stdout.write(Buffer.from(Array.from({ length: 256 }, (_, i) => i)));
+process.stdout.write(Buffer.from([0xe2, 0x82]));
+process.stdout.write(Buffer.from([0xac]));
+process.stdout.write(Buffer.from('line one\nline two\r\nno newline at the end'));
+";
+
+fn binary_expected() -> Vec<u8> {
+    let mut bytes: Vec<u8> = (0..=255).collect();
+    bytes.extend_from_slice(&[0xe2, 0x82, 0xac]);
+    bytes.extend_from_slice(b"line one\nline two\r\nno newline at the end");
+    bytes
+}
+
+/// A hex dump of the first difference, for a byte-exact assertion's message.
+fn first_difference(actual: &[u8], expected: &[u8]) -> String {
+    let at = actual
+        .iter()
+        .zip(expected)
+        .position(|(a, e)| a != e)
+        .unwrap_or(actual.len().min(expected.len()));
+    let window = |bytes: &[u8]| {
+        bytes[at.saturating_sub(4)..(at + 8).min(bytes.len())]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    format!(
+        "differ at byte {at} (actual {} bytes, expected {}): actual [{}] expected [{}]",
+        actual.len(),
+        expected.len(),
+        window(actual),
+        window(expected)
+    )
+}
+
+#[test]
+fn stdout_to_a_pipe_and_to_a_file_is_byte_exact() {
+    let script = write_temp("stdout_binary.mjs", BINARY_MJS);
+    let expected = binary_expected();
+
+    // (a) A pipe.
+    let out = oam(&["run", script.to_str().unwrap(), "--no-check"]);
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout == expected,
+        "pipe: {}",
+        first_difference(&out.stdout, &expected)
+    );
+
+    // (b) A file, as `oam run x.mjs > file` hands one over.
+    let path = write_temp("stdout_binary.out", "");
+    let file = std::fs::File::create(&path).expect("stdout file");
+    let (mut child, stderr) = spawn_oam_with_stdout(&script, std::process::Stdio::from(file));
+    let status = wait_within(&mut child, OAM_DEADLINE, || {
+        format!(
+            "stderr so far: {:?}",
+            String::from_utf8_lossy(&stderr.taken())
+        )
+    });
+    assert!(status.success(), "stderr: {}", stderr_text(&stderr));
+    let written = std::fs::read(&path).expect("stdout file readable");
+    assert!(
+        written == expected,
+        "file: {}",
+        first_difference(&written, &expected)
+    );
+}
+
+/// Git Bash under mintty: stdout is a pipe named `msys-<hex>-pty<n>-...`,
+/// which std's `is_terminal` answers true for (its msys hack). WriteConsoleW
+/// refuses it, so oam's first real console write is where the "terminal"
+/// shows itself as a pipe, and from then on the bytes go out as they are --
+/// with the partial character the first write was carrying (a cut UTF-8
+/// sequence, held back for the console) put back in front of them, and
+/// nothing decoded, replaced or dropped after that.
+#[cfg(windows)]
+#[test]
+fn an_msys_pty_pipe_gets_the_bytes_as_they_are() {
+    use std::io::{IsTerminal, Read};
+    let script = write_temp(
+        "stdout_msys_pty.mjs",
+        r"
+process.stdout.write(Buffer.from([0xe2, 0x82]));
+process.stdout.write(Buffer.from([0xac, 0x0a]));
+process.stdout.write(Buffer.from([0xff, 0x00, 0x41]));
+",
+    );
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let hex = (u64::from(std::process::id()) << 32) | ((nanos as u64) & 0xffff_ffff);
+    let name = format!("msys-{hex:016x}-pty0-to-master");
+    let (mut server, client) = named_pipe(&name, false);
+    // The premise, checked on the handle the child is about to get: were
+    // std to drop its msys hack, this would pass through the plain pipe path
+    // and test nothing of the carry.
+    assert!(
+        client.is_terminal(),
+        "std takes a pipe named {name} for a terminal"
+    );
+    let sink = drain_records(move |buf| server.read(buf));
+    let (mut child, stderr) = spawn_oam_with_stdout(&script, std::process::Stdio::from(client));
+    let status = wait_within(&mut child, OAM_DEADLINE, || {
+        format!("records so far: {:?}", sink.records())
+    });
+    assert!(
+        sink.wait_finished(std::time::Duration::from_secs(30)),
+        "the reader reached the end of stdout; records so far: {:?}",
+        sink.records()
+    );
+    assert!(status.success(), "stderr: {}", stderr_text(&stderr));
+    // A byte pipe may merge writes, so only the bytes are asserted on.
+    let bytes = sink.records().concat();
+    let expected = [0xe2, 0x82, 0xac, 0x0a, 0xff, 0x00, 0x41];
+    assert!(bytes == expected, "{}", first_difference(&bytes, &expected));
 }
