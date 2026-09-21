@@ -104,6 +104,12 @@ pub struct IncomingRequest {
     /// The connection's id for `httpConnSetTimeout` / `httpConnDestroy`
     /// (an HTTP/1 connection held to node's timeouts).
     pub conn_id: Option<u64>,
+    /// For an upgrade or CONNECT: the announced connection this request takes
+    /// over. JS lets go of that connection's record in the same step as it
+    /// counts the socket that carries it on, so the server's count never
+    /// reads the connection twice or not at all -- as it did when the release
+    /// came as an event of its own, a turn apart from the takeover.
+    pub replaces_conn: Option<u64>,
     /// For an upgrade or CONNECT: the bytes that came after the head (node's
     /// `head` argument), already read off the socket.
     pub head: Vec<u8>,
@@ -1397,13 +1403,20 @@ pub async fn http_serve(
                         // JS lets go of the socket it was handed for this
                         // connection. An upgraded connection is handed on as
                         // a socket of its own below, so this one is done
-                        // either way.
-                        if announcement.announced {
-                            let _ = conn_queue
-                                .send(ServerEvent::ConnectionClosed { conn_id })
-                                .await;
-                        }
+                        // either way -- but for a taken connection the release
+                        // rides ON the takeover (replaces_conn) rather than as
+                        // an event of its own. Sent apart, one of them arrives
+                        // a turn before the other, and in that turn the
+                        // server's getConnections() counted the connection
+                        // twice or not at all -- node does neither, and a
+                        // drain loop that reads the short count finishes with
+                        // the websocket still open.
                         let Some((stream, head, takeover)) = taken else {
+                            if announcement.announced {
+                                let _ = conn_queue
+                                    .send(ServerEvent::ConnectionClosed { conn_id })
+                                    .await;
+                            }
                             return;
                         };
                         let handle = conn_tcp_ids.fetch_add(1, Ordering::Relaxed);
@@ -1422,6 +1435,7 @@ pub async fn http_serve(
                                 socket_handle: Some(handle),
                                 conn: conn_addrs,
                                 conn_id: None,
+                                replaces_conn: announcement.announced.then_some(conn_id),
                                 head: head.to_vec(),
                                 end_stream: false,
                                 tls: None,
@@ -2004,6 +2018,7 @@ async fn dispatch_request(
             socket_handle: None,
             conn,
             conn_id,
+            replaces_conn: None,
             head: Vec::new(),
             end_stream,
             tls,
@@ -2364,6 +2379,9 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
             }
             if let Some(conn_id) = request.conn_id {
                 meta["connectionId"] = serde_json::json!(conn_id);
+            }
+            if let Some(replaced) = request.replaces_conn {
+                meta["replacesConnection"] = serde_json::json!(replaced);
             }
             if request.is_upgrade {
                 meta["isUpgrade"] = serde_json::json!(true);

@@ -18224,6 +18224,26 @@
       return record.secure || record.conn || undefined;
     }
 
+    // A connection is over for the server: node's socket is neither readable
+    // nor writable, 'close' has fired, and nothing holds it any more. Both of
+    // an https connection's sockets close, the TLS one first, as node's
+    // TLSSocket closes before the socket under it. Also what an upgrade or
+    // CONNECT does to the connection it takes over, in the same step as it
+    // counts the socket that carries the connection on.
+    function releaseConnection(server, connectionId) {
+      const sockets = server._connSockets;
+      const record = sockets && sockets.get(connectionId);
+      if (sockets) sockets.delete(connectionId);
+      if (record) {
+        for (const socket of [record.secure, record.conn]) {
+          if (socket && !socket.destroyed) {
+            socket._markClosed();
+            socket.emit("close", false);
+          }
+        }
+      }
+    }
+
     // A connection event from the native server.
     function onConnectionEvent(server, meta) {
       const exchange =
@@ -18296,21 +18316,7 @@
         return;
       }
       if (meta.event === "connectionClosed") {
-        // The connection is over: node's socket is neither readable nor
-        // writable, 'close' has fired, and nothing holds it any more. Both
-        // of an https connection's sockets close, the TLS one first, as
-        // node's TLSSocket closes before the socket under it.
-        const sockets = server._connSockets;
-        const record = sockets && sockets.get(meta.connectionId);
-        if (sockets) sockets.delete(meta.connectionId);
-        if (record) {
-          for (const socket of [record.secure, record.conn]) {
-            if (socket && !socket.destroyed) {
-              socket._markClosed();
-              socket.emit("close", false);
-            }
-          }
-        }
+        releaseConnection(server, meta.connectionId);
         return;
       }
       if (meta.event === "tlsClientError") {
@@ -18436,6 +18442,26 @@
                     port: meta.localPort,
                     family: meta.localFamily,
                   },
+          });
+          // node counts a connection an upgrade or CONNECT took until that
+          // socket closes -- a drain loop on a ws / socket.io server waits for
+          // its websockets. The record the connection was announced with is
+          // let go here and the socket that carries it on counted in its
+          // place, in one synchronous step, so no turn sees the connection
+          // counted twice or not at all; the socket takes itself out in its
+          // own teardown (kCountedIn). The record's stand-in socket closes
+          // first, before 'upgrade' / 'connect' runs, as it always has.
+          if (meta.replacesConnection !== undefined) {
+            releaseConnection(server, meta.replacesConnection);
+          }
+          const handedOver =
+            server[Symbol.for("oam.serverConnections")] ||
+            (server[Symbol.for("oam.serverConnections")] = new Set());
+          handedOver.add(socket);
+          // Not enumerable: inspecting one socket must not print every
+          // other connection on the server (the set is all of them).
+          Object.defineProperty(socket, Symbol.for("oam.countedIn"), {
+            value: handedOver, writable: true, configurable: true,
           });
           socket._readLoop();
           const req = new IncomingMessage(meta);
@@ -18672,10 +18698,14 @@
       closeAllConnections() {}
       // net.Server#getConnections. The live connections are the records the
       // native server's announcements keep, one per connection (see
-      // connectionRecord), so the count is already here; node answers on a
-      // later tick rather than synchronously.
+      // connectionRecord), plus the sockets an upgrade or CONNECT took over,
+      // which outlive their record; node answers on a later tick rather than
+      // synchronously.
       getConnections(cb) {
-        process.nextTick(cb, null, this._connSockets ? this._connSockets.size : 0);
+        const handedOver = this[Symbol.for("oam.serverConnections")];
+        const count =
+          (this._connSockets ? this._connSockets.size : 0) + (handedOver ? handedOver.size : 0);
+        process.nextTick(cb, null, count);
         return this;
       }
     }
@@ -20056,8 +20086,11 @@
         // On a COPY: mutating this._headers would make getHeader('connection')
         // and getHeaders() report a header node does not report there, and
         // would send _connectionHeader()'s "the caller set one" branch down
-        // the wrong path on a later hop. Called once -- it sets
-        // shouldKeepAlive as a side effect.
+        // the wrong path on a later hop. _renderHead already asked the same
+        // question when it built req._header, from the same live headers, so
+        // the value sent here is the one _header shows; the one side effect,
+        // setting shouldKeepAlive for a caller-set non-close header, is the
+        // same both times.
         var headers = self._headers;
         var connection = self._connectionHeader();
         if (connection !== null) {
@@ -22705,6 +22738,11 @@
         this.writable = false;
         this.connecting = false;
         registry._activeHandles.delete(this);
+        const counted = this[kCountedIn];
+        if (counted) {
+          counted.delete(this);
+          this[kCountedIn] = undefined;
+        }
         // Destroyed while its name was still being looked up: nothing will
         // settle the connect, so release the writes queued behind it (they
         // fail with ERR_SOCKET_CLOSED_BEFORE_CONNECTION).
@@ -22995,6 +23033,11 @@
 
       _doClose() {
         registry._activeHandles.delete(this);
+        const counted = this[kCountedIn];
+        if (counted) {
+          counted.delete(this);
+          this[kCountedIn] = undefined;
+        }
         if (this._handle !== null) {
           try { natives.tcpClose(this._handle); } catch (_) { /* noop */ }
           this._handle = null;
@@ -23111,6 +23154,14 @@
     // record per connection, made when the native server announces it; a net
     // or tls server accepts in JS and keeps them here.
     const kServerConns = Symbol.for("oam.serverConnections");
+    // On a counted socket: the live set it is counted in. The socket takes
+    // itself out in its own teardown -- destroy(), _doClose(), a TLSSocket's
+    // _destroy() -- before it emits anything, as node's Socket._destroy
+    // decrements `_server._connections`. A 'close' listener would not do: user
+    // code can remove it (removeAllListeners), and destroy(err) with no 'error'
+    // listener throws at the 'error' emit before 'close' is ever reached --
+    // either way the count stayed high for good, and the set kept the socket.
+    const kCountedIn = Symbol.for("oam.countedIn");
 
     class Server extends EventEmitter {
       static [Symbol.hasInstance](instance) {
@@ -23199,10 +23250,15 @@
             _localAddr: accepted.localAddr,
           });
           // node's `this._connections`, the number getConnections() answers
-          // with: a connection counts from the accept until its socket closes.
+          // with: a connection counts from the accept until its socket's own
+          // teardown (see kCountedIn).
           const live = this[kServerConns];
           live.add(socket);
-          socket.once("close", () => live.delete(socket));
+          // Not enumerable: inspecting one socket must not print every
+          // other connection on the server (the set is all of them).
+          Object.defineProperty(socket, kCountedIn, {
+            value: live, writable: true, configurable: true,
+          });
           socket._readLoop();
           this.emit("connection", socket);
         }
@@ -30174,6 +30230,13 @@
       }
       _destroy(err, callback) {
         registry._activeHandles.delete(this);
+        // Out of its server's connection count before anything is emitted,
+        // as node's Socket._destroy does (see kCountedIn in node:net).
+        var counted = this[Symbol.for("oam.countedIn")];
+        if (counted) {
+          counted.delete(this);
+          this[Symbol.for("oam.countedIn")] = undefined;
+        }
         if (this._timeoutId !== null) {
           globalThis.clearTimeout(this._timeoutId);
           this._timeoutId = null;
@@ -31626,7 +31689,12 @@
         var live = this[Symbol.for("oam.serverConnections")];
         if (live) {
           live.add(socket);
-          socket.once("close", function () { live.delete(socket); });
+          // Taken out in the TLSSocket's own _destroy, not by a 'close'
+          // listener user code could remove (see kCountedIn in node:net).
+          // Not enumerable: inspecting one socket must not print the set.
+          Object.defineProperty(socket, Symbol.for("oam.countedIn"), {
+            value: live, writable: true, configurable: true,
+          });
         }
         if (plain !== null) {
           plain.destroy = function destroy(err) {
@@ -31728,7 +31796,7 @@
       // natively, so its connections are the native announcements' records.
       getConnections(cb) {
         const live = this[Symbol.for("oam.serverConnections")];
-        const count = this._connSockets ? this._connSockets.size : live ? live.size : 0;
+        const count = (this._connSockets ? this._connSockets.size : 0) + (live ? live.size : 0);
         process.nextTick(cb, null, count);
         return this;
       }
