@@ -48,6 +48,11 @@
 #                                            logic, tunnel-log parsing, sshd
 #                                            detection, disk thresholds, and
 #                                            THIS script's miri-gate verdicts)
+#      + scripts/test-changelog-tools.sh  (GATING; release-local.sh's changelog
+#                                            gate block, sliced verbatim and run
+#                                            on fixtures, its position above the
+#                                            bump and the tag, and
+#                                            scripts/changelog-release.sh)
 #  14. miri aliasing models               (GATING when nightly+miri present,
 #                                            SKIPPED with a notice otherwise --
 #                                            machine-checks the raw-pointer
@@ -603,7 +608,7 @@ else
   ok "npm launcher tests passed"
 fi
 
-say "13/14 Scripts (release-orchestration shell tests)"
+say "13/14 Scripts (release-orchestration shell tests + changelog tooling)"
 # GATING, and compiles nothing -- but NOT the ~2s this comment used to claim.
 # Measured on win-arm64: ~7m30s for 59 assertions (2026-08-30), then ~4m20s for
 # 107 (2026-09-09, after a batch of pure-function cases). The two are not
@@ -625,6 +630,25 @@ if bash scripts/test-scripts.sh; then
   ok "script tests passed"
 else
   ko "script tests failed (see above) -- './scripts/test-scripts.sh -v' for per-case detail"
+fi
+
+# Still step 13: the changelog tooling. release-local.sh's changelog gate had
+# no test of its own and passed six releases (0.15.1 through 0.16.4) whose
+# notes never left [Unreleased]; the helper that now promotes them shipped
+# claiming a strictness its code did not have. The suite slices the gate block VERBATIM out of
+# release-local.sh (so it tests what the release runs, not a copy), runs it and
+# scripts/changelog-release.sh on fixtures, checks the two agree on one file,
+# and asserts the gate still sits above the auto-bump and the tag -- the order
+# whose violation once left a half-released state. Its own script rather than
+# a group in test-scripts.sh: it belongs beside the two scripts it covers, and
+# the release runs it on all three legs, so it is kept to bash + POSIX awk.
+# Compiles nothing. Spawn-bound like the suite above: ~280 process spawns,
+# seconds on the Linux and Mac legs; measured 2m13s on win-arm64 on a day the
+# box spawned a bare awk in 0.8s (2026-09-21).
+if bash scripts/test-changelog-tools.sh; then
+  ok "changelog tooling tests passed"
+else
+  ko "changelog tooling tests failed (see above) -- './scripts/test-changelog-tools.sh -v' for per-case detail"
 fi
 
 say "14/14 Miri aliasing models (Stacked Borrows check on napi.rs's pointer disciplines)"

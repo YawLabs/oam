@@ -74,22 +74,46 @@ has_heading "$version" "$tmp" \
 
 # Link references, matched literally as the headings are: the new version's
 # above the newest existing one, and [Unreleased] moved on to compare from it.
+#
+# Each rewrite is judged by its EFFECT: the line it must have produced is
+# looked for in its output, exactly once. awk exits 0 whether or not any line
+# matched, so `&& mv` after it only ever caught a failed process -- a file
+# missing either link line used to get its heading, no link, and a clean exit,
+# while the commit that shipped this claimed the opposite.
+link_landed() { # link_landed <line> <file> <what is missing>
+  case "$(grep -cFx -- "$1" "$2" || true)" in
+    1) return 0 ;;
+    0) echo "$3 -- CHANGELOG.md is unchanged" >&2; return 1 ;;
+    *) echo "rewriting the link references would leave more than one '$1' line -- CHANGELOG.md is unchanged" >&2; return 1 ;;
+  esac
+}
+
 if [ -n "$prev" ]; then
+  version_link="[${version}]: https://github.com/YawLabs/oam/compare/v${prev}...v${version}"
   awk -v v="$version" -v p="$prev" '
     !done && index($0, "[" p "]:") == 1 {
       print "[" v "]: https://github.com/YawLabs/oam/compare/v" p "...v" v
       done = 1
     }
     { print }
-  ' "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp" || { echo "could not rewrite the link references -- CHANGELOG.md is unchanged" >&2; exit 1; }
+  ' "$tmp" > "$tmp.2" || { echo "could not rewrite the link references -- CHANGELOG.md is unchanged" >&2; exit 1; }
+  link_landed "$version_link" "$tmp.2" \
+    "CHANGELOG.md has no '[${prev}]:' link reference to put [${version}]'s above (the compare links at the foot of the file) -- add it, then re-run" \
+    || exit 1
+  mv "$tmp.2" "$tmp"
 fi
+unreleased_link="[Unreleased]: https://github.com/YawLabs/oam/compare/v${version}...HEAD"
 awk -v v="$version" '
   index(tolower($0), "[unreleased]:") == 1 {
     print "[Unreleased]: https://github.com/YawLabs/oam/compare/v" v "...HEAD"
     next
   }
   { print }
-' "$tmp" > "$tmp.2" && mv "$tmp.2" "$tmp" || { echo "could not rewrite the link references -- CHANGELOG.md is unchanged" >&2; exit 1; }
+' "$tmp" > "$tmp.2" || { echo "could not rewrite the link references -- CHANGELOG.md is unchanged" >&2; exit 1; }
+link_landed "$unreleased_link" "$tmp.2" \
+  "CHANGELOG.md has no '[Unreleased]:' link reference to move on to v${version} (the compare links at the foot of the file) -- add it, then re-run" \
+  || exit 1
+mv "$tmp.2" "$tmp"
 
 cp "$tmp" "$file"
 echo "CHANGELOG.md: [Unreleased] -> ## [${version}] - ${date}${prev:+ (compare link from v$prev)}"
