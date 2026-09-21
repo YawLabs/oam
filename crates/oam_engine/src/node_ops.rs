@@ -877,14 +877,306 @@ fn op_stdout_write(
                 .send(oam_core::worker::WorkerEvent::Stdout(bytes));
             return;
         }
-        use std::io::Write;
-        let stdout = std::io::stdout();
-        let mut lock = stdout.lock();
-        if let Err(e) = lock.write_all(&bytes).and_then(|_| lock.flush())
+        if let Err(e) = stdout_write_whole(&bytes)
             && e.kind() == std::io::ErrorKind::BrokenPipe
         {
             oam_core::exit_process(0);
         }
+    }
+}
+
+/// One JS write, one OS write, as node's is.
+///
+/// `std::io::stdout()` is a `LineWriter`. Handed "rows\n...restore", it writes
+/// everything through the LAST newline at once and buffers the tail until the
+/// flush, so a single `process.stdout.write()` reached the OS as two writes a
+/// few milliseconds apart. A terminal renders what it has in between, and for
+/// a TUI frame -- hide the cursor, move, rewrite the rows, restore the cursor
+/// -- that is the half-frame with the cursor hidden: flicker on every
+/// keystroke. node writes each JS write whole: libuv hands a console the whole
+/// payload through WriteConsoleW (in chunks of at most 8192 UTF-16 units) and
+/// anything else through one WriteFile / write(2).
+///
+/// std's lock is held throughout, so a write from another thread -- a worker
+/// that shares the process's stdout -- cannot land inside this one, and std's
+/// own buffer is flushed first so anything written through it keeps its place.
+fn stdout_write_whole(bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    lock.flush()?;
+    #[cfg(windows)]
+    if let Some(done) = win_console_write(bytes) {
+        return done;
+    }
+    match raw_stdout() {
+        Some(file) => write_whole(file, bytes),
+        // No handle of our own to write through (a detached process with no
+        // stdout): std's path, as before.
+        None => lock.write_all(bytes).and_then(|()| lock.flush()),
+    }
+}
+
+/// The payload in a single `write_all` to a sink with no line buffering in
+/// front of it -- one OS write for any payload the OS takes whole.
+fn write_whole(mut sink: impl std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
+    sink.write_all(bytes)
+}
+
+/// The process's stdout as a plain `File`: a duplicate of the descriptor /
+/// handle, so the writes skip std's `LineWriter` and still reach the same pipe,
+/// file or terminal. Made once; `None` when there is no stdout to duplicate.
+fn raw_stdout() -> Option<&'static std::fs::File> {
+    static RAW: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
+    RAW.get_or_init(|| {
+        #[cfg(unix)]
+        let owned = {
+            use std::os::fd::AsFd;
+            std::io::stdout().as_fd().try_clone_to_owned()
+        };
+        #[cfg(windows)]
+        let owned = {
+            use std::os::windows::io::AsHandle;
+            std::io::stdout().as_handle().try_clone_to_owned()
+        };
+        owned.ok().map(std::fs::File::from)
+    })
+    .as_ref()
+}
+
+/// A Windows console gets UTF-16 through WriteConsoleW, as std and libuv give
+/// it: WriteFile would hand it bytes to read in the console's code page, which
+/// is not UTF-8 unless someone set it so. `None` when stdout is not a console
+/// -- a pipe, a file, or the pipe an msys/mintty "pty" is made of -- and the
+/// caller writes the bytes as they are.
+#[cfg(windows)]
+fn win_console_write(bytes: &[u8]) -> Option<std::io::Result<()>> {
+    use std::io::IsTerminal;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // What stdout turned out to be; it does not change during a run.
+    const UNKNOWN: u8 = 0;
+    const CONSOLE: u8 = 1;
+    const NOT_CONSOLE: u8 = 2;
+    static KIND: AtomicU8 = AtomicU8::new(UNKNOWN);
+    // An incomplete UTF-8 sequence a write ended on, completed by the next
+    // write (a Buffer can be cut mid-character). std and libuv keep the same.
+    static CARRY: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+    let kind = KIND.load(Ordering::Relaxed);
+    if kind == NOT_CONSOLE {
+        return None;
+    }
+    let h = win_std_handle(1);
+    if kind == UNKNOWN && (h == 0 || h == -1 || !std::io::stdout().is_terminal()) {
+        KIND.store(NOT_CONSOLE, Ordering::Relaxed);
+        return None;
+    }
+    let mut carry = CARRY.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pending = carry.clone();
+    pending.extend_from_slice(bytes);
+    let (wide, rest) = console_utf16(&pending);
+    if wide.is_empty() {
+        // Nothing to hand the console yet -- the whole write is the start of
+        // one character. It is carried, and stdout's kind stays as it was:
+        // only a WriteConsoleW that took units can vouch for a console, and
+        // an msys/mintty "pty" (is_terminal says yes, WriteConsoleW refuses
+        // the pipe) must not be taken for one on a write that never asked.
+        *carry = rest;
+        return Some(Ok(()));
+    }
+    match win_write_console(h, &wide) {
+        Ok(()) => {
+            KIND.store(CONSOLE, Ordering::Relaxed);
+            *carry = rest;
+            Some(Ok(()))
+        }
+        // The first write is where a "terminal" that is really a pipe (msys,
+        // mintty) shows itself: WriteConsoleW refuses it before writing
+        // anything, and the bytes go out as they are from then on -- with
+        // whatever earlier partial character was being carried put back in
+        // front of them.
+        Err(_) if kind == UNKNOWN => {
+            KIND.store(NOT_CONSOLE, Ordering::Relaxed);
+            *carry = Vec::new();
+            Some(match raw_stdout() {
+                Some(file) => write_whole(file, &pending),
+                // std's stdout lock is reentrant, so taking it again under
+                // the caller's is fine.
+                None => {
+                    use std::io::Write;
+                    let stdout = std::io::stdout();
+                    let mut lock = stdout.lock();
+                    lock.write_all(&pending).and_then(|()| lock.flush())
+                }
+            })
+        }
+        Err(e) => Some(Err(e)),
+    }
+}
+
+/// Decode for the console: valid UTF-8 as itself, an invalid sequence as
+/// U+FFFD (as libuv's decoder writes it), and an incomplete sequence at the
+/// very end returned apart, to be completed by the next write.
+#[cfg(any(windows, test))]
+fn console_utf16(mut input: &[u8]) -> (Vec<u16>, Vec<u8>) {
+    let mut out = Vec::with_capacity(input.len());
+    loop {
+        match std::str::from_utf8(input) {
+            Ok(s) => {
+                out.extend(s.encode_utf16());
+                return (out, Vec::new());
+            }
+            Err(e) => {
+                let (valid, after) = input.split_at(e.valid_up_to());
+                if let Ok(s) = std::str::from_utf8(valid) {
+                    out.extend(s.encode_utf16());
+                }
+                match e.error_len() {
+                    None => return (out, after.to_vec()),
+                    Some(bad) => {
+                        out.push(0xFFFD);
+                        input = &after[bad..];
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// How much of `rest` one WriteConsoleW call takes: libuv's MAX_CONSOLE_CHAR,
+/// 8192 UTF-16 units, backed off by one rather than splitting a surrogate pair.
+#[cfg(any(windows, test))]
+fn console_chunk_len(rest: &[u16]) -> usize {
+    const MAX_CONSOLE_CHAR: usize = 8192;
+    let n = rest.len().min(MAX_CONSOLE_CHAR);
+    if n < rest.len() && (0xD800..0xDC00).contains(&rest[n - 1]) {
+        n - 1
+    } else {
+        n
+    }
+}
+
+#[cfg(windows)]
+fn win_write_console(h: isize, wide: &[u16]) -> std::io::Result<()> {
+    // ABI: the declared signature matches the Win32 WriteConsoleW ABI
+    // (kernel32: HANDLE, const WCHAR* buffer, DWORD count, DWORD* out count,
+    // LPVOID reserved that must be NULL). The declaration dereferences nothing.
+    unsafe extern "system" {
+        fn WriteConsoleW(
+            h: isize,
+            buf: *const u16,
+            n: u32,
+            written: *mut u32,
+            reserved: *const core::ffi::c_void,
+        ) -> i32;
+    }
+    let mut rest = wide;
+    while !rest.is_empty() {
+        let n = console_chunk_len(rest);
+        let mut written: u32 = 0;
+        // SAFETY: `rest` is a live slice and `n <= rest.len()` (at most 8192,
+        // so it fits the DWORD), so WriteConsoleW reads only initialised u16s
+        // inside it. `written` is a live stack u32 passed by `&mut` for the
+        // out-write, read only after the return is checked. The reserved
+        // argument is NULL, as the API requires. `h` is the process's stdout
+        // handle, already checked to be neither NULL nor INVALID_HANDLE_VALUE.
+        let ok =
+            unsafe { WriteConsoleW(h, rest.as_ptr(), n as u32, &mut written, std::ptr::null()) };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if written == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        rest = &rest[(written as usize).min(rest.len())..];
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod stdout_write_tests {
+    use super::{console_chunk_len, console_utf16, write_whole};
+    use std::io::Write;
+
+    /// A sink that keeps every write it is handed, as its own entry.
+    struct Calls(Vec<Vec<u8>>);
+    impl Write for Calls {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // The mechanism behind the flicker, pinned: std's stdout is a LineWriter,
+    // which sends a payload through its LAST newline straight away and the
+    // tail on flush -- two writes for one JS write. write_whole is one.
+    #[test]
+    fn a_line_writer_splits_a_frame_at_its_last_newline_and_write_whole_does_not() {
+        let frame: &[u8] = b"\x1b[?25l\x1b[Hrow one\r\nrow two\r\nthe tail\x1b[?25h";
+
+        let mut split = Calls(Vec::new());
+        {
+            let mut line_writer = std::io::LineWriter::new(&mut split);
+            line_writer
+                .write_all(frame)
+                .expect("line writer takes the frame");
+            line_writer.flush().expect("line writer flushes");
+        }
+        assert_eq!(split.0.len(), 2, "std's stdout path: two OS writes");
+        assert_eq!(split.0[0], b"\x1b[?25l\x1b[Hrow one\r\nrow two\r\n");
+        assert_eq!(split.0[1], b"the tail\x1b[?25h");
+
+        let mut whole = Calls(Vec::new());
+        write_whole(&mut whole, frame).expect("write_whole takes the frame");
+        assert_eq!(whole.0, vec![frame.to_vec()], "op_stdout_write's path: one");
+    }
+
+    #[test]
+    fn console_text_is_utf16_with_bad_bytes_replaced_and_a_cut_character_carried() {
+        let text = "h\u{e9}llo \u{2014} \u{2713} \u{4e2d}\u{6587} \u{1f600}";
+        let (wide, rest) = console_utf16(text.as_bytes());
+        assert_eq!(String::from_utf16(&wide).expect("valid utf-16"), text);
+        assert!(rest.is_empty());
+
+        // A byte that can start no character: U+FFFD, and decoding goes on.
+        let (wide, rest) = console_utf16(b"a\xffb");
+        assert_eq!(
+            String::from_utf16(&wide).expect("valid utf-16"),
+            "a\u{fffd}b"
+        );
+        assert!(rest.is_empty());
+
+        // A character cut at the end is held back and completes next write.
+        let euro = "\u{20ac}".as_bytes();
+        let (wide, rest) = console_utf16(&[b'x', euro[0], euro[1]]);
+        assert_eq!(String::from_utf16(&wide).expect("valid utf-16"), "x");
+        assert_eq!(rest, &euro[..2]);
+        let mut next = rest;
+        next.extend_from_slice(&[euro[2], b'!']);
+        let (wide, rest) = console_utf16(&next);
+        assert_eq!(
+            String::from_utf16(&wide).expect("valid utf-16"),
+            "\u{20ac}!"
+        );
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn a_console_write_is_chunked_as_libuv_chunks_it_without_splitting_a_pair() {
+        assert_eq!(console_chunk_len(&[u16::from(b'a'); 100]), 100);
+        assert_eq!(console_chunk_len(&vec![u16::from(b'a'); 20_000]), 8192);
+        // An astral character straddling the 8192 boundary moves whole to the
+        // next call rather than leaving a lone high surrogate on this one.
+        let mut edge = vec![u16::from(b'a'); 8191];
+        edge.extend("\u{1f600}".encode_utf16());
+        edge.push(u16::from(b'z'));
+        assert_eq!(console_chunk_len(&edge), 8191);
     }
 }
 
