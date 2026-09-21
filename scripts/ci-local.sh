@@ -633,18 +633,20 @@ else
 fi
 
 # Still step 13: the changelog tooling. release-local.sh's changelog gate had
-# no test of its own and passed six releases (0.15.1 through 0.16.4) whose
+# no test of its own and passed six releases (0.15.1 through 0.16.3) whose
 # notes never left [Unreleased]; the helper that now promotes them shipped
 # claiming a strictness its code did not have. The suite slices the gate block VERBATIM out of
 # release-local.sh (so it tests what the release runs, not a copy), runs it and
 # scripts/changelog-release.sh on fixtures, checks the two agree on one file,
 # and asserts the gate still sits above the auto-bump and the tag -- the order
 # whose violation once left a half-released state. Its own script rather than
-# a group in test-scripts.sh: it belongs beside the two scripts it covers, and
-# the release runs it on all three legs, so it is kept to bash + POSIX awk.
-# Compiles nothing. Spawn-bound like the suite above: ~280 process spawns,
-# seconds on the Linux and Mac legs; measured 2m13s on win-arm64 on a day the
-# box spawned a bare awk in 0.8s (2026-09-21).
+# a group in test-scripts.sh: it belongs beside the two scripts it covers. A
+# release runs it only here, on the Windows box -- the Linux and Mac legs run
+# scripts/build-remote.sh, which calls neither this suite nor this script --
+# but it is kept to bash + POSIX awk so any checkout can run it.
+# Compiles nothing. Spawn-bound like the suite above: ~280 process spawns;
+# measured 2m13s on win-arm64 on a day the box spawned a bare awk in 0.8s
+# (2026-09-21), and 4m18s for 35 assertions on the same box later that day.
 if bash scripts/test-changelog-tools.sh; then
   ok "changelog tooling tests passed"
 else

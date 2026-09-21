@@ -43,6 +43,12 @@ if has_heading "$version" "$file"; then
   exit 0
 fi
 
+# The heading first: the body scan below cannot tell a missing heading from an
+# empty section -- both read as no entries -- and "write them" sends the author
+# to fill in a section the file does not have.
+awk '/^#+[[:space:]]*\[?[Uu]nreleased\]?/ { found = 1; exit } END { exit !found }' "$file" \
+  || { echo "found no [Unreleased] heading to put [${version}] under -- CHANGELOG.md is unchanged" >&2; exit 1; }
+
 body="$(awk '
   /^#+[[:space:]]*\[?[Uu]nreleased\]?/ { inside = 1; next }
   inside && /^#+[[:space:]]/ && !/^###[[:space:]]/ { exit }
@@ -63,14 +69,15 @@ trap 'rm -f "$tmp" "$tmp.2"' EXIT
 
 # Insert the version heading directly under [Unreleased], which keeps every
 # entry where it is and leaves [Unreleased] empty for the next cycle. The
-# heading is found at any depth, as the release gate and the body scan above
-# find it.
+# heading is found at any depth, as the release gate and the checks above
+# find it. Judged by its effect, like the link rewrites below: with the heading
+# checked above, a miss here would mean this regex and that one had drifted.
 awk -v v="$version" -v d="$date" '
   { print }
   !done && /^#+[[:space:]]*\[?[Uu]nreleased\]?/ { print ""; print "## [" v "] - " d; done = 1 }
 ' "$file" > "$tmp"
 has_heading "$version" "$tmp" \
-  || { echo "found no [Unreleased] heading to put [${version}] under -- CHANGELOG.md is unchanged" >&2; exit 1; }
+  || { echo "inserting the [${version}] heading under [Unreleased] did not take effect -- CHANGELOG.md is unchanged" >&2; exit 1; }
 
 # Link references, matched literally as the headings are: the new version's
 # above the newest existing one, and [Unreleased] moved on to compare from it.

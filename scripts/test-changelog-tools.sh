@@ -6,7 +6,7 @@
 # Two pieces of shell decide whether a release ships with a changelog and where
 # its entries land, and neither had a test: the gate in release-local.sh
 # checked only that [Unreleased] was non-empty, so every release from 0.15.1 to
-# 0.16.4 shipped with its notes still under [Unreleased] and no heading of its
+# 0.16.3 shipped with its notes still under [Unreleased] and no heading of its
 # own -- the second time that needed a hand-written backfill (d2632ae did
 # 0.12.0 through 0.15.0). The helper that now promotes them shipped with a
 # claim ("fails rather than continues if a link rewrite does not happen") its
@@ -24,10 +24,11 @@
 #
 # Separate from test-scripts.sh, which is spawn-bound and minutes long: this
 # suite is fixture-driven, needs no build, and belongs next to the two scripts
-# it covers. Portable on purpose -- the release runs from Git Bash on Windows,
-# bash on the GCP Linux VM and bash on the Mac -- so: bash, POSIX awk, grep,
-# cmp and mktemp only. No `sed -i` (BSD sed wants `-i ''`), no md5sum (absent
-# on stock macOS), no bats.
+# it covers. It runs wherever ci-local.sh step 13 does, and in a release that
+# is only the Windows box: the Linux and Mac legs run scripts/build-remote.sh,
+# which never calls it. Portable anyway, so a Linux or Mac checkout can run it
+# too: bash, POSIX awk, grep, cmp and mktemp only. No `sed -i` (BSD sed wants
+# `-i ''`), no md5sum (absent on stock macOS), no bats.
 #
 # Usage:
 #   ./scripts/test-changelog-tools.sh      # run all, non-zero exit on any failure
@@ -123,6 +124,13 @@ gate_says "$FX" v0.16.5 "no '## [0.16.5]' heading" "scripts/changelog-release.sh
 it "nothing written at all: refused as an empty Unreleased section"
 mk "# Changelog" "" "## [Unreleased]" "" "## [0.16.4] - 2026-09-20" "" "- old"
 gate_says "$FX" v0.16.5 "Unreleased section has no entries"
+
+# The same wrong-place trap the block's own comment names: with no [Unreleased]
+# heading the body reads empty, and "the section has no entries" would send the
+# author to fill in a section the file does not have.
+it "no [Unreleased] heading and none for the tag: refused as missing headings, naming the helper"
+mk "# Changelog" "" "- stray" "" "## [0.16.4] - 2026-09-20" "" "- old"
+gate_says "$FX" v0.16.5 "neither a '## [0.16.5]' heading nor an [Unreleased] heading" "scripts/changelog-release.sh 0.16.5"
 
 # The dot trap: a version spliced into a regex reads 0.16.5 as 0?16?5, and
 # this heading would then count as the tag's.
@@ -236,8 +244,17 @@ ck grep -qxF "[0.17.0]: https://github.com/YawLabs/oam/compare/v0.17.0-rc.1...v0
 printf '%s\n' "# Changelog" "" "- stray" "" "## [0.16.4] - 2026-09-20" "" "$(unreleased_link 0.16.4)" "$(version_link 0.16.4)" > "$C"
 snapshot
 HELPER_OUT="$(helper 0.16.5)"; HELPER_RC=$?
-it "no [Unreleased] heading: fails"
-ck [ "$HELPER_RC" -ne 0 ]
+# The message is the point: this used to report "[Unreleased] has no entries --
+# write them", sending the author to a section the file does not have, while
+# the accurate refusal sat below it, unreachable.
+it "no [Unreleased] heading: fails, saying the heading is missing (not that it is empty)"
+if [ "$HELPER_RC" -ne 0 ]; then
+  case "$HELPER_OUT" in
+    *"has no entries"*) fail "reported as an empty section -- output: $HELPER_OUT" ;;
+    *"no [Unreleased] heading"*) pass ;;
+    *) fail "output: $HELPER_OUT" ;;
+  esac
+else fail "rc=0 output: $HELPER_OUT"; fi
 it "no [Unreleased] heading: the file is untouched"
 ck untouched
 

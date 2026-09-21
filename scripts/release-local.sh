@@ -201,12 +201,14 @@ smoke() {
   ok "smoke ok ($bin)"
 }
 
-# The gate's conformance + node-suite steps REGENERATE these committed
-# artifacts with fresh commit/version stamps -- a prior (or this) run's gate
-# self-dirties the tree with them. When they are the ONLY dirty paths,
-# restore them to HEAD instead of failing: the content is machine-
-# regenerated, reproducible by re-running xtask at this commit, and
-# restoring keeps the tree the remote legs tar byte-identical to the tag.
+# The gate's conformance + node-suite steps rewrite these committed artifacts
+# when their RESULTS differ from the committed copy (xtask's write_receipts
+# ignores the commit/version stamp when comparing, and writes nothing when only
+# the stamp would change) -- so a prior (or this) run's gate can leave them
+# dirty. When they are the ONLY dirty paths, restore them to HEAD instead of
+# failing: the content is machine-regenerated, reproducible by re-running xtask
+# at this commit, and restoring keeps the tree the remote legs tar
+# byte-identical to the tag.
 CONFORMANCE_ARTIFACTS=(CONFORMANCE.md CONFORMANCE-NODE.md conformance/scorecard.json conformance/node-suite-scorecard.json)
 # only_stamps_dirty -- 0 when every dirty path (if any) is one of the four
 # gate-regenerated conformance artifacts. Here-string, not a pipe, so the
@@ -234,6 +236,19 @@ restore_gate_artifacts() {  # restore_gate_artifacts <context>
     git checkout HEAD -- "${CONFORMANCE_ARTIFACTS[@]}"
   fi
   return 0
+}
+
+# assert_tree_clean <context> -- fail, naming every dirty path, unless the
+# working tree is clean. Every leg builds the WORKING TREE, not the tag: cargo
+# here, and the remote legs tar it (lib/src-sync.sh packs tracked + untracked,
+# non-ignored files). A path dirty at that point ships in the assets without
+# being in the tag, and the legs themselves only warn about tracked changes.
+assert_tree_clean() {
+  local dirty
+  dirty="$(git status --porcelain)" || fail "$1: could not read the working tree status"
+  [ -n "$dirty" ] || return 0
+  printf '%s\n' "$dirty" | sed 's/^/        /' >&2
+  fail "$1: the working tree is dirty (paths above) -- the builds would ship them without their being in $TAG. Nothing has been built and no release exists yet; clean the tree and re-run (the tag has no release, so the re-run reconciles it)"
 }
 
 # A build output cannot be replaced while something is mid-launch from it, and
@@ -380,6 +395,10 @@ if [ -f CHANGELOG.md ]; then
     [ -n "$version_body" ] \
       || fail "CHANGELOG.md's '## [${TAG#v}]' section has no entries -- RELIABILITY.md requires a public behavior-change log for every release. Add them, or say plainly that this release changes nothing observable. (Bare '### Added'-style subheadings with nothing under them do not count.)"
   else
+    # No heading at all reads as an empty body above; say which it is, or the
+    # author is sent to fill in a section the file does not have.
+    awk '/^#+[[:space:]]*\[?[Uu]nreleased\]?/ { found = 1; exit } END { exit !found }' CHANGELOG.md \
+      || fail "CHANGELOG.md has neither a '## [${TAG#v}]' heading nor an [Unreleased] heading -- write this release's entries under '## [Unreleased]' (above the newest version heading), then promote them: scripts/changelog-release.sh ${TAG#v}"
     [ -n "$unreleased_body" ] || fail "CHANGELOG.md's Unreleased section has no entries -- RELIABILITY.md requires a public behavior-change log for every release. Add them, or say plainly that this release changes nothing observable. (Bare '### Added'-style subheadings with nothing under them do not count.)"
     fail "CHANGELOG.md has entries under [Unreleased] but no '## [${TAG#v}]' heading -- they would ship unattributed, which is how 0.15.1 through 0.16.3 ended up with none. Promote and commit them, then re-run: scripts/changelog-release.sh ${TAG#v}"
   fi
@@ -392,8 +411,28 @@ git fetch -q origin main 2>/dev/null || true
 # A PUBLISHED tag is immutable: whatever the release assets were built from must
 # keep pointing there forever. So check for the release FIRST -- before the
 # auto-bump commits anything or the tag reconciliation moves anything.
-gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 \
-  && fail "release $TAG already exists on $REPO (possibly a draft left by an interrupted run) -- inspect/delete it: gh release view $TAG --repo $REPO"
+#
+# Fails CLOSED. gh exits 1 both for "no such release" and for every other
+# failure, so the exit code alone cannot tell them apart -- and reading an
+# outage as "absent" would let the re-point below move a PUBLISHED tag. What
+# separates them is stderr: measured with gh 2.87.3 against this repo, a tag
+# with no release prints exactly `release not found`, while an unreachable proxy
+# (HTTPS_PROXY=http://127.0.0.1:9) printed `Get "https://api.github.com/..."` or
+# `Post "https://api.github.com/graphql"` then `: proxyconnect tcp: ...` -- for
+# a release that EXISTS as well as for one that does not -- and a bad token
+# `HTTP 401: Bad credentials (...)`, all with exit 1. So only exit 1 with that
+# exact line reads as absent; anything else stops the run here, and a gh that
+# ever rewords it fails closed too.
+release_view_rc=0
+release_view_err="$(gh release view "$TAG" --repo "$REPO" 2>&1 >/dev/null)" || release_view_rc=$?
+if [ "$release_view_rc" -eq 0 ]; then
+  fail "release $TAG already exists on $REPO (possibly a draft left by an interrupted run) -- inspect/delete it: gh release view $TAG --repo $REPO"
+elif [ "$release_view_rc" -ne 1 ] \
+     || ! printf '%s\n' "$release_view_err" | grep -qxF 'release not found'; then
+  printf '%s\n' "${release_view_err:-<no output>}" | sed 's/^/        gh: /' >&2
+  fail "could not tell whether release $TAG exists on $REPO (gh exited $release_view_rc, output above) -- moving the tag is safe only while it is unpublished, so this stops rather than guess. Check the network and 'gh auth status', then re-run"
+fi
+ok "no release $TAG on $REPO yet"
 
 # The binaries report the workspace version -- a v0.7.0 tag over a 0.6.1
 # Cargo.toml would ship assets that self-identify wrong. The tag IS the
@@ -691,17 +730,26 @@ if [ "$SKIP_LOCAL_GATE" = "1" ]; then
 else
   step "Local CI gate (scripts/ci-local.sh)"
   bash "$SCRIPT_DIR/ci-local.sh" || fail "local CI gate failed -- fix before releasing"
-  # The gate just refreshed the conformance stamps AT THIS VERSION AND COMMIT.
-  # They still cannot ship in the build -- the remote legs tar the working tree
-  # and it must stay byte-identical to the tag -- so stash them, restore the
-  # tree, and commit them after the release publishes. Without that last step
-  # the committed scorecards keep reporting the PREVIOUS release's version
-  # forever, which is exactly what they did up to v0.8.1.
+  # If the gate's conformance or node-suite results differ from the committed
+  # receipts, xtask has just rewritten those files, stamped with the commit and
+  # version the gate measured. If the results are unchanged it wrote nothing:
+  # write_receipts ignores the stamp when comparing, so the committed files keep
+  # whatever commit and version they were last written at. Rewritten files still
+  # cannot ship in the build -- the remote legs tar the working tree and it must
+  # stay byte-identical to the tag -- so stash them, restore the tree, and
+  # commit them after the release publishes (an unchanged file stashes as a
+  # copy of HEAD and lands nothing).
   for f in "${CONFORMANCE_ARTIFACTS[@]}"; do
     if [ -f "$f" ]; then cp "$f" "$STAMP_STASH/${f//\//_}"; fi
   done
   restore_gate_artifacts "post-gate"
 fi
+
+# The preflight proved the tree clean, but the gate has run since, and
+# restore_gate_artifacts puts back only the four receipts, and only when they
+# are the sole dirty paths -- any other dirt it leaves in place and returns 0.
+# So check again before the first build starts.
+assert_tree_clean "after the local gate"
 
 # --- local Windows legs ---------------------------------------------------------
 step "Build oam-aarch64-pc-windows-msvc.exe (local, native)"
@@ -888,43 +936,64 @@ SITE_DIR="${OAM_SITE_DIR:-$REPO_DIR/../oamjs.org}"
 if [ ! -d "$SITE_DIR/public" ]; then
   warn "no site checkout at $SITE_DIR -- site NOT republished (clone YawLabs/oamjs.org, or set OAM_SITE_DIR)"
 else
-  cp "$REPO_DIR/install/install.sh" "$SITE_DIR/public/install.sh"
-  cp "$REPO_DIR/install/install.ps1" "$SITE_DIR/public/install.ps1"
+  # Every command in this step is guarded, down to these copies: the release is
+  # already live, so a failure here must warn and fall through to the taps, the
+  # stamps and the verification below. Under set -e an unguarded one ends the
+  # whole run: a rejected site push would leave the taps unbumped, the stamps
+  # unlanded and the live site unverified.
+  { cp "$REPO_DIR/install/install.sh" "$SITE_DIR/public/install.sh" \
+      && cp "$REPO_DIR/install/install.ps1" "$SITE_DIR/public/install.ps1"; } \
+    || warn "could not copy install/ into $SITE_DIR/public -- the site keeps its previous installers"
   # Reads the PUBLISHED release for its sizes and hashes, so this must run after
   # the "Cut GitHub Release" step above. Non-fatal for the same reason as the
   # rest of this step: the release is already out, and the verification below
   # says loudly if the live page is stale.
   if [ -x "$SITE_DIR/scripts/refresh-downloads.sh" ]; then
     "$SITE_DIR/scripts/refresh-downloads.sh" "$TAG" >/dev/null 2>&1 \
-      && ok "downloads page regenerated for $TAG" \
-      || warn "refresh-downloads.sh failed -- downloads page still advertises the previous release"
+      && ok "release pages regenerated for $TAG (downloads page + checksums post)" \
+      || warn "refresh-downloads.sh failed -- the downloads page and checksums post still advertise the previous release"
   else
     warn "no scripts/refresh-downloads.sh in $SITE_DIR -- downloads page NOT regenerated"
   fi
-  # Every version-specific file the site serves for a release. The downloads page
-  # inlines the tag, asset sizes and per-asset hashes, so it rots on EVERY
-  # release -- and unlike the installers it cannot be right by accident, because
-  # none of those values survive a version bump.
+  # What gets committed is DERIVED from what gets deployed, not listed.
+  # `netlify deploy --dir public` below publishes the WORKING TREE of public/,
+  # so every path there that differs from the site's HEAD goes live whether or
+  # not it is committed. The hand-kept list this replaced had drifted from
+  # refresh-downloads.sh, which rewrites the downloads page AND the
+  # unsigned-checksummed-binaries post (its header names both): only the first
+  # was staged, so the v0.16.3 run deployed the post's retag with no commit
+  # behind it, and a deploy from a clean clone would have reverted it. Staging
+  # all of public/ keeps the committed site and the deployed site the same
+  # files, whatever refresh-downloads.sh comes to write. Anything else dirty
+  # under public/ is swept in too -- it was going live regardless -- and every
+  # path is printed before it is committed.
   #
-  # Built by existence rather than hardcoded: `git add` on a path that is not
-  # there is FATAL, and under `set -e` that would abort the run after the
-  # release is already published. An older site checkout without a downloads
-  # page must degrade to installer-only, not blow up the release.
-  SITE_PATHS=()
-  for p in public/install.sh public/install.ps1 public/downloads/index.html; do
-    if [ -f "$SITE_DIR/$p" ]; then SITE_PATHS+=("$p"); fi
-  done
-  # Gate on ALL of them. Checking only the installers is what let a
-  # two-releases-stale downloads page ship: installers are byte-identical across
-  # most releases, so the "already match" branch short-circuited the commit AND
-  # the deploy, and the page never went out.
-  if git -C "$SITE_DIR" diff --quiet -- "${SITE_PATHS[@]}"; then
-    ok "oamjs.org already matches this release"
+  # Gated on ALL of public/, never the installers alone: they are byte-identical
+  # across most releases, and checking only them is what once let a
+  # two-releases-stale downloads page skip both the commit and the deploy.
+  if ! site_dirty="$(git -C "$SITE_DIR" status --porcelain --untracked-files=all -- public)"; then
+    warn "could not read git status in $SITE_DIR -- site NOT committed or deployed"
+  elif [ -z "$site_dirty" ]; then
+    ok "nothing under $SITE_DIR/public differs from the site's HEAD -- nothing to commit, so no deploy (the verification below checks the live site)"
   else
-    git -C "$SITE_DIR" add "${SITE_PATHS[@]}"
-    git -C "$SITE_DIR" commit -q -m "Sync installers + downloads page from oam $TAG"
-    git -C "$SITE_DIR" push -q
-    ( cd "$SITE_DIR" && netlify deploy --prod --dir public >/dev/null 2>&1 )       && ok "oamjs.org republished"       || warn "netlify deploy failed -- run 'netlify deploy --prod --dir public' in $SITE_DIR"
+    printf '%s\n' "$site_dirty" | sed 's/^/        /' >&2
+    site_paths="$(printf '%s\n' "$site_dirty" | cut -c4-)"
+    # A commit that fails means NO deploy: publishing uncommitted files is the
+    # drift this step exists to stop. A push that fails still deploys, since
+    # the content is committed -- the commit is merely local until pushed.
+    if ! git -C "$SITE_DIR" add -A -- public; then
+      warn "could not stage the site changes above -- NOT deployed. Finish by hand in $SITE_DIR: git add -A -- public, commit, push, then 'netlify deploy --prod --dir public'"
+    elif ! git -C "$SITE_DIR" commit -q -m "Sync installers + release pages from oam $TAG" \
+             -m "Written by oam's scripts/release-local.sh; everything under public/ that the deploy publishes:" \
+             -m "$site_paths"; then
+      warn "could not commit the staged site changes -- NOT deployed. Finish by hand in $SITE_DIR: commit, push, then 'netlify deploy --prod --dir public'"
+    else
+      git -C "$SITE_DIR" push -q \
+        || warn "site push failed -- the sync commit is local-only in $SITE_DIR; bring it level with its upstream and push it by hand (deploying anyway: the content is committed)"
+      ( cd "$SITE_DIR" && netlify deploy --prod --dir public >/dev/null 2>&1 ) \
+        && ok "oamjs.org republished" \
+        || warn "netlify deploy failed -- run 'netlify deploy --prod --dir public' in $SITE_DIR"
+    fi
   fi
 fi
 
@@ -963,26 +1032,39 @@ else
   esac
 fi
 
-# The gate regenerated these at this version and commit; restore_gate_artifacts
-# then threw them away so the remote legs would build a tree byte-identical to
-# the tag. Land them NOW, after the release is published, so the committed
-# scorecards describe the release that exists instead of the one before it.
-# Deliberately last-ish and non-fatal in spirit: the release is already out, and
-# a stamp commit that cannot land is a documentation gap, not a bad release.
-step "Land the conformance stamps the gate regenerated"
+# What the gate did to these depends on its results. Where a result differs
+# from the committed receipt, xtask rewrote that receipt together with its twin
+# (each markdown file and its JSON are written as a pair), stamped with the
+# commit and version the gate measured; restore_gate_artifacts put the
+# committed copy back so the remote legs would build a tree byte-identical to
+# the tag, and the rewrite waited in the stash for this step, which lands it now
+# that the release is published. Where nothing changed, xtask wrote nothing --
+# its write_receipts ignores the stamp when comparing -- so there is nothing to
+# land, and the committed receipts keep the commit and version stamp of the run
+# that last changed a result, which can be several releases back. Neither case
+# restamps an unchanged receipt with this release.
+#
+# Runs after the site and the taps so a failure here cannot cost them. It is not
+# guarded, though: a receipt commit that cannot be staged, made or landed stops
+# the run here, with only the site verification below left undone.
+step "Land the conformance receipts the gate rewrote"
 for f in "${CONFORMANCE_ARTIFACTS[@]}"; do
   stash="$STAMP_STASH/${f//\//_}"
   if [ -f "$stash" ]; then cp "$stash" "$f"; fi
 done
 if git diff --quiet -- "${CONFORMANCE_ARTIFACTS[@]}"; then
-  ok "conformance stamps already describe $TAG"
+  if [ "$SKIP_LOCAL_GATE" = "1" ]; then
+    ok "local gate skipped -- no conformance receipts to land"
+  else
+    ok "the gate rewrote no conformance receipts (results match the committed ones) -- nothing to land"
+  fi
 elif ! only_stamps_dirty; then
-  warn "tree carries non-stamp changes -- leaving the refreshed stamps uncommitted for you to review"
+  warn "tree carries non-receipt changes -- leaving the rewritten conformance receipts uncommitted for you to review"
 else
-  git add "${CONFORMANCE_ARTIFACTS[@]}" || fail "could not stage the conformance stamps"
-  git commit -q -m "chore(release): refresh conformance stamps for $TAG" \
-    || fail "could not commit the conformance stamps"
-  land_on_main "chore(release): refresh conformance stamps for $TAG" "$tag_version"
+  git add "${CONFORMANCE_ARTIFACTS[@]}" || fail "could not stage the rewritten conformance receipts"
+  git commit -q -m "chore(release): land the conformance receipts the $TAG gate rewrote" \
+    || fail "could not commit the rewritten conformance receipts"
+  land_on_main "chore(release): land the conformance receipts the $TAG gate rewrote" "$tag_version"
 fi
 
 # Verify what the SITE actually serves, not what we just uploaded: a stale CDN
