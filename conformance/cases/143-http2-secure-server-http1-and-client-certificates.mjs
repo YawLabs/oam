@@ -132,11 +132,19 @@ function h2Op(op) {
     // and the stream with it: whichever ends first reports. A connection
     // dropped after its handshake reads as a reset or as a plain close
     // depending on timing (in Node too), so those two are one outcome.
+    // So is a refusal of the client's certificate: the server sends that
+    // alert after reading the flight that carried it (under TLS 1.3, once
+    // this side's handshake is already done) and closes right behind it
+    // with this client's preface unread -- a reset, which can pre-empt the
+    // alert in the client's read. Node's own client against Node's own
+    // server prints either under load. The server's 'tlsClientError' lines
+    // hold why it refused.
     const done = () => {
       session.destroy();
       if (out.status === undefined) {
         const code = out.streamError || out.sessionError;
-        resolve({ refused: code && code !== "ECONNRESET" ? code : "connection closed" });
+        const closed = !code || code === "ECONNRESET" || /ALERT_(HANDSHAKE_FAILURE|CERTIFICATE_REQUIRED|UNKNOWN_CA|BAD_CERTIFICATE|CERTIFICATE_UNKNOWN|DECRYPT_ERROR)/.test(code);
+        resolve({ refused: closed ? "connection closed" : code });
       } else {
         resolve(out);
       }

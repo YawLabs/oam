@@ -30,15 +30,12 @@
 // on 'connect' as they always do; they carry no request.)
 //
 // What this case leaves out, because oam 0.16.4 differs there (verified by
-// probe against node v22.22.2, reported rather than bent to fit):
+// probe against node v22.22.2, reported rather than bent to fit; divergence
+// 42):
 //   - a socket destroyed in 'connection' closes before its handshake, and
 //     node reports that as 'tlsClientError' ECONNRESET "socket hang up"
 //     (and, on this server, 'clientError'); oam raises neither. No listener
 //     for them is added here.
-//   - a prepended 'secureConnection' listener that destroys the socket:
-//     node's connectionListener still runs after it and emits 'session'
-//     (then 'session close') for the dead socket; oam emits neither. The
-//     client is refused on both.
 //
 // Fixtures: the case 141 throwaway P-256 CA (valid 2025-2125) and the
 // localhost leaf it signed.
@@ -235,6 +232,11 @@ await scenario("a 'secureConnection' listener that refuses the client",
 // the session exists.
 await scenario("a 'secureConnection' listener prepended in front of the server's own, admitting the client",
   { onSecure: admit, prependSecure: true });
+// Prepended and refusing: the server's own listener still runs on the dead
+// socket and builds its session, so 'session' and the session's 'close' are
+// emitted for a connection that was never served.
+await scenario("a 'secureConnection' listener prepended in front of the server's own, refusing the client",
+  { onSecure: refuse, prependSecure: true });
 
 // ---- a net.Server and a tls.Server, counting its connections --------------
 {

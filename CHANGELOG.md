@@ -48,6 +48,11 @@ connections a server had accepted finish before it reports itself closed.
   `rejectUnauthorized: true` -- the server refusing on its own -- was already enforced in
   0.16.3 and is unchanged. Conformance cases 168 and 169 hold it to node v22.22.2 on the
   `http`, `https` and `tls` servers, and case 174 on `http2.createSecureServer`.
+  A connection that goes before `http2.createSecureServer` can serve it -- a client that
+  leaves right after its handshake, or a `'secureConnection'` listener put in front of the
+  server's own that destroys the socket -- still gets its `'session'` and the session's
+  `'close'`, as node builds the session over the dead socket; oam dropped it without a
+  word, so a server counting sessions missed one under load.
 
 - **A listener that threw took a server down.** In 0.16.3 a `'request'`
   handler, an `'upgrade'` listener or a `'connect'` listener that threw ended the process with

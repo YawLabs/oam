@@ -29026,7 +29026,27 @@
           this._idleTimer = null;
           this._idleMs = 0;
           var policy = serverHeadPolicy(server);
-          var served = JSON.parse(natives.http2ServeTls(socket._handle, false, policy.maxHeaderSize, policy.insecure));
+          var served = null;
+          try {
+            served = JSON.parse(natives.http2ServeTls(socket._handle, false, policy.maxHeaderSize, policy.insecure));
+          } catch (err) {
+            // The connection went before it could be served: a client that
+            // left straight after its handshake, or a 'secureConnection'
+            // listener ahead of the server's own that destroyed the socket.
+            // node builds the session over it all the same -- 'session' is
+            // emitted -- and the session closes once the socket's end
+            // reaches it, so this one closes on the next tick.
+          }
+          if (served === null) {
+            // node wraps a socket with no handle in a JSStreamSocket, which
+            // has no `encrypted`: the session over it reads as plain h2c.
+            this.alpnProtocol = "h2c";
+            this.encrypted = false;
+            this._sessionId = null;
+            this._connId = null;
+            process.nextTick(() => this._onConnectionEnd());
+            return;
+          }
           this._sessionId = served.sessionId;
           this._connId = served.connId;
           takeOver(socket, served.connId);
@@ -29102,7 +29122,7 @@
             if (typeof callback !== "function") throw codes.ERR_INVALID_ARG_TYPE("callback", "Function", callback);
             this.once("close", callback);
           }
-          natives.httpConnDestroy(this._connId, true);
+          if (this._connId !== null) natives.httpConnDestroy(this._connId, true);
         }
         destroy(error, code) {
           if (this._destroyed) return;
@@ -29115,7 +29135,7 @@
           this._closed = true;
           this._emitClosePending = true;
           for (var stream of this._streams.values()) stream._onAborted();
-          natives.httpConnDestroy(this._connId, false);
+          if (this._connId !== null) natives.httpConnDestroy(this._connId, false);
           if (error) process.nextTick(() => this.emit("error", error));
         }
         setTimeout(msecs, callback) {
@@ -29193,14 +29213,9 @@
           }
           return;
         }
-        var session;
-        try {
-          session = new ServerHttp2Session(options, socket, this);
-        } catch (err) {
-          // The connection went before it could be served.
-          socket.destroy();
-          return;
-        }
+        // A connection that has already gone still gets its session (see the
+        // constructor): node emits 'session' for it, then its 'close'.
+        var session = new ServerHttp2Session(options, socket, this);
         var server = this;
         session.on("stream", function(stream, headers, flags, rawHeaders) {
           server.emit("stream", stream, headers, flags, rawHeaders);

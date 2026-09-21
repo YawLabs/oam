@@ -1832,10 +1832,7 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
 - **A connection a `'connection'` listener destroys raises no `'tlsClientError'`.** On a
   `tls`, `https` or `http2` secure server Node reports it as a `'tlsClientError'`
   (`ECONNRESET`, `socket hang up`) and, on `https` and `http2`, a `'clientError'`; oam emits
-  neither. The client is refused the same way on both. And when a `'secureConnection'`
-  listener added ahead of the server's own (`prependListener`) destroys the socket, Node's
-  `http2` secure server still emits `'session'` and the session's `'close'` for it; oam's
-  emits neither.
+  neither. The client is refused the same way on both.
 - **`server.close()` ends a busy connection after its response.** The server stops
   listening before `close()` returns, closes the idle keep-alive connections and lets the
   rest finish, as Node's does: `'close'` and the `close(cb)` callback come after the last

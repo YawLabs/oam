@@ -141,7 +141,20 @@ function tlsOp(op) {
         s.write("GET /two HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n");
       }
     });
-    s.on("error", (e) => { error = e.code; });
+    // A refusal of the client's certificate is an alert the server sends
+    // after reading the flight that carried it (under TLS 1.3, once this
+    // side's handshake is already done), and it closes right behind the
+    // alert with the rest of that flight, or the request, unread: a reset,
+    // which can pre-empt the alert in this client's read. Which of the
+    // alert, the reset and a plain end comes first is timing -- Node's own
+    // client against Node's own server prints any of them under load -- so
+    // the line records that the client was refused, and the server's lines
+    // say why. An alert answering the ClientHello alone (ALPN) is read
+    // before a clean close, and stays.
+    s.on("error", (e) => {
+      if (/ALERT_(HANDSHAKE_FAILURE|CERTIFICATE_REQUIRED|UNKNOWN_CA|BAD_CERTIFICATE|CERTIFICATE_UNKNOWN|DECRYPT_ERROR)/.test(e.code)) return;
+      error = e.code;
+    });
     s.on("close", () => {
       out.answers = data ? data.split("HTTP/1.1").length - 1 : 0;
       if (data) out.status = data.split("\\r\\n")[0];
