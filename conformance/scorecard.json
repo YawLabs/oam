@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "da5fb7f+wip",
+  "commit": "fd8bb64+wip",
   "oamVersion": "oam 0.16.4",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 163,
-      "total": 163,
+      "pass": 165,
+      "total": 165,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -336,6 +336,14 @@
         },
         {
           "case": "171-client-connection-header.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "172-client-close-not-reused.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "173-http-server-throwing-listener.mjs",
           "status": "pass"
         },
         {
