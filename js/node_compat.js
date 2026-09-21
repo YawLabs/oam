@@ -10752,8 +10752,13 @@
         // fd 1/2 (stdout/stderr) have no native fd-table entry -- route them to
         // the process stdout/stderr sinks so fs.writeSync(1|2, ...) matches Node
         // instead of throwing EBADF (pino/sonic-boom sync mode writes here).
-        if (fd === 1) { natives.stdoutWrite(buf); return buf.length; }
-        if (fd === 2) { natives.stderrWrite(buf); return buf.length; }
+        // The sink hands back the error a failed write got, and it throws
+        // here as node's writeSync throws it, in writeSync's key order.
+        if (fd === 1 || fd === 2) {
+          const failed = fd === 1 ? natives.stdoutWrite(buf) : natives.stderrWrite(buf);
+          if (failed) throw ctxOrderError(failed);
+          return buf.length;
+        }
         // ctxOrderError only here: fs.write and fs.writevSync route through the
         // same native but keep node's common errno/code/syscall order.
         try {
@@ -10879,13 +10884,19 @@
           queueMicrotask(function () { cb(e); });
           return;
         }
-        var n;
+        var n, failed;
         try {
-          if (fd === 1) { natives.stdoutWrite(buf); n = buf.length; }
-          else if (fd === 2) { natives.stderrWrite(buf); n = buf.length; }
+          if (fd === 1 || fd === 2) {
+            failed = fd === 1 ? natives.stdoutWrite(buf) : natives.stderrWrite(buf);
+            if (failed) throw failed;
+            n = buf.length;
+          }
           else { n = natives.fsWriteSync(fd, buf, typeof pos === "number" ? pos : null); }
         } catch (e) {
-          queueMicrotask(function () { cb(e); });
+          // node's callback for a failed write is (err, 0, data), not (err):
+          // its wrapper passes `written || 0` and the buffer or string
+          // either way (measured on v22.22.2, fd 1 and a read-only fd).
+          queueMicrotask(function () { cb(e, 0, data); });
           return;
         }
         queueMicrotask(function () { cb(null, n, data); });
@@ -12806,17 +12817,35 @@
           },
         });
       };
+      // A failed write reaches the stream as node's does: the native hands
+      // back the error (undefined when the write went out), the write's
+      // callback gets it and the stream emits 'error' -- with no listener,
+      // the program dies of it. The error has fs.writeSync's key order,
+      // which is what node's stdout on a file (and on Windows a pipe) writes
+      // through. And, as node's stdio does, the stream
+      // outlives the error: destroy() here is node's dummyDestroy
+      // (lib/internal/bootstrap/switches/is_main_thread.js), which lets the
+      // 'error' and 'close' out and puts the stream back, so the next write
+      // is tried again rather than refused with ERR_STREAM_DESTROYED. The
+      // same holds for destroy() and end() called by the program. (node's
+      // version also emits 'close' itself when emitClose is off; it is on.)
+      function stdioDestroy(err, cb) {
+        cb(err);
+        this._undestroy();
+      }
       lazyStdio("stdout", () => {
         const { Writable } = registry.get("stream");
         return decorateTtyWriteStream(new Writable({
-          write(chunk, _enc, cb) { natives.stdoutWrite(chunk); cb(); },
+          write(chunk, _enc, cb) { cb(ctxOrderError(natives.stdoutWrite(chunk))); },
+          destroy: stdioDestroy,
           decodeStrings: false,
         }), 1, stdoutIsTTY);
       });
       lazyStdio("stderr", () => {
         const { Writable } = registry.get("stream");
         return decorateTtyWriteStream(new Writable({
-          write(chunk, _enc, cb) { natives.stderrWrite(chunk); cb(); },
+          write(chunk, _enc, cb) { cb(ctxOrderError(natives.stderrWrite(chunk))); },
+          destroy: stdioDestroy,
           decodeStrings: false,
         }), 2, stderrIsTTY);
       });

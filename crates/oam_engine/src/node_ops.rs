@@ -617,6 +617,20 @@ fn throw_system_error(
     path: Option<&str>,
     error: &std::io::Error,
 ) {
+    let exception = system_error(scope, code, message, syscall, path, error);
+    scope.throw_exception(exception);
+}
+
+/// node's system-error object, built and handed back rather than thrown: for
+/// an op that returns a failure to its JS caller (see `stdio_write_failed`).
+fn system_error<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    code: &str,
+    message: &str,
+    syscall: &str,
+    path: Option<&str>,
+    error: &std::io::Error,
+) -> v8::Local<'s, v8::Value> {
     let message_v8 =
         v8::String::new(scope, message).unwrap_or_else(|| v8::String::new(scope, code).unwrap());
     let exception = v8::Exception::error(scope, message_v8);
@@ -649,7 +663,7 @@ fn throw_system_error(
             }
         }
     }
-    scope.throw_exception(exception);
+    exception
 }
 
 /// An optional non-negative POSITION argument: a number seeks (pread/pwrite),
@@ -859,10 +873,12 @@ fn op_exit(
     oam_core::exit_process(code);
 }
 
+/// `__oam.node.stdoutWrite(chunk)`: `undefined`, or the error the write
+/// failed with (see [`stdio_write_failed`]).
 fn op_stdout_write(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     // arg_bytes: views pass through VERBATIM (binary pipes stay binary),
     // strings encode as UTF-8.
@@ -877,12 +893,53 @@ fn op_stdout_write(
                 .send(oam_core::worker::WorkerEvent::Stdout(bytes));
             return;
         }
-        if let Err(e) = stdout_write_whole(&bytes)
-            && e.kind() == std::io::ErrorKind::BrokenPipe
-        {
-            oam_core::exit_process(0);
+        if let Err(e) = stdout_write_whole(&bytes) {
+            stdio_write_failed(scope, &mut rv, &e);
         }
     }
+}
+
+/// What a failed stdout or stderr write does.
+///
+/// A reader that went away ends the program, quietly, with exit 0 -- `oam
+/// run x | head`. node emits EPIPE there instead; this is oam's divergence,
+/// and it is kept for everything node would call EPIPE. std's BrokenPipe is
+/// EPIPE, ERROR_BROKEN_PIPE and ERROR_NO_DATA; libuv also names
+/// ERROR_PIPE_NOT_CONNECTED EPIPE, and that is what a pipe server's
+/// DisconnectNamedPipe leaves the writer with (node reported
+/// `EPIPE: broken pipe, write`, errno -4047, for it on v22.22.2).
+///
+/// Any other failure goes back to JS as the op's result, node's error for a
+/// write to that descriptor -- `EBADF: bad file descriptor, write` with
+/// errno, code and syscall, the shape node's fs.writeSync throws -- and the
+/// caller delivers it the way node does: process.stdout's write callback and
+/// 'error' event, fs.writeSync's throw. console.log ignores it. (node's
+/// console swallows the first failed write too, but on a stdout that fails
+/// synchronously a second failing console.log dies of an unhandled 'error';
+/// oam's console.log does not write through process.stdout, so it stays
+/// quiet.) The error used to be dropped here: a write that failed reported
+/// success and its bytes were gone without a sign. Measured on node v22.22.2
+/// (Windows) and v22.23.2 (Linux): a stdout opened read-only fails EBADF, a
+/// pipe's read end on Windows EBADF, /dev/full ENOSPC, each with that shape.
+///
+/// Not raised at all, as in node: a stdout that was never there. A NULL or
+/// invalid handle cannot be duplicated, so the write goes through std's
+/// stdout, which reports a write to it as done (`handle_ebadf`) -- node and
+/// oam both run silently to exit 0 with a NULL, invalid or detached stdout
+/// (measured) -- and a closed fd 1 or 2 on unix is /dev/null by the time
+/// main runs (std reopens it, as node does).
+fn stdio_write_failed(
+    scope: &mut v8::PinScope<'_, '_>,
+    rv: &mut v8::ReturnValue<'_, v8::Value>,
+    error: &std::io::Error,
+) {
+    let code = oam_core::fd_error_code(error);
+    if error.kind() == std::io::ErrorKind::BrokenPipe || code == "EPIPE" {
+        oam_core::exit_process(0);
+    }
+    let message = oam_core::node_error_message_fd(code, "write", error);
+    let failure = system_error(scope, code, &message, "write", None, error);
+    rv.set(failure);
 }
 
 /// One JS write, one OS write, as node's is.
@@ -916,14 +973,44 @@ fn stdout_write_whole(bytes: &[u8]) -> std::io::Result<()> {
         Some(file) => write_whole(file, bytes),
         // No handle of our own to write through (a detached process with no
         // stdout): std's path, as before.
-        None => lock.write_all(bytes).and_then(|()| lock.flush()),
+        None => write_whole(&mut lock, bytes).and_then(|()| lock.flush()),
     }
 }
 
-/// The payload in a single `write_all` to a sink with no line buffering in
-/// front of it -- one OS write for any payload the OS takes whole.
-fn write_whole(mut sink: impl std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
-    sink.write_all(bytes)
+/// The payload to a sink with no line buffering in front of it, in one OS
+/// write for any payload the OS takes whole.
+///
+/// A sink that is not ready -- a pipe someone else put in non-blocking mode,
+/// full because its reader is slow -- is waited out and written again, the
+/// rest of the payload after what it took. That is what node's
+/// process.stdout amounts to (libuv queues the write and finishes it as the
+/// pipe drains): on Linux, a 1 MiB write to an O_NONBLOCK stdout pipe behind
+/// a reader that sleeps 2s arrives whole, with no error, measured on node
+/// v22.23.2. `write_all` gave up at the first EAGAIN, part-way through, and
+/// the tail was lost -- and reported now, it would crash a program node runs.
+/// The wait is a sleep that backs off to 50ms, not a poll(2): the same
+/// outcome with no FFI.
+fn write_whole(mut sink: impl std::io::Write, mut bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::ErrorKind;
+    const FIRST_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
+    const LONGEST_PAUSE: std::time::Duration = std::time::Duration::from_millis(50);
+    let mut pause = FIRST_PAUSE;
+    while !bytes.is_empty() {
+        match sink.write(bytes) {
+            Ok(0) => return Err(ErrorKind::WriteZero.into()),
+            Ok(n) => {
+                bytes = &bytes[n.min(bytes.len())..];
+                pause = FIRST_PAUSE;
+            }
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(LONGEST_PAUSE);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
 }
 
 /// The process's stdout as a plain `File`: a duplicate of the descriptor /
@@ -1009,7 +1096,7 @@ fn win_console_write(bytes: &[u8]) -> Option<std::io::Result<()>> {
                     use std::io::Write;
                     let stdout = std::io::stdout();
                     let mut lock = stdout.lock();
-                    lock.write_all(&pending).and_then(|()| lock.flush())
+                    write_whole(&mut lock, &pending).and_then(|()| lock.flush())
                 }
             })
         }
@@ -1137,6 +1224,98 @@ mod stdout_write_tests {
         assert_eq!(whole.0, vec![frame.to_vec()], "op_stdout_write's path: one");
     }
 
+    /// What a scripted sink does on each write call, in order.
+    enum Step {
+        /// EAGAIN: a non-blocking pipe that is full.
+        NotReady,
+        /// EINTR: a signal landed mid-write.
+        Interrupted,
+        /// Takes at most this many bytes of what it is handed.
+        Takes(usize),
+        /// Fails for good.
+        Fails(std::io::ErrorKind),
+    }
+
+    /// A sink that answers each write with the next [`Step`], and keeps
+    /// what it took. Past the script it takes everything.
+    struct Scripted {
+        steps: std::collections::VecDeque<Step>,
+        taken: Vec<u8>,
+        calls: usize,
+    }
+    impl Scripted {
+        fn new(steps: Vec<Step>) -> Self {
+            Self {
+                steps: steps.into(),
+                taken: Vec::new(),
+                calls: 0,
+            }
+        }
+    }
+    impl Write for Scripted {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            let n = match self.steps.pop_front() {
+                Some(Step::NotReady) => return Err(std::io::ErrorKind::WouldBlock.into()),
+                Some(Step::Interrupted) => return Err(std::io::ErrorKind::Interrupted.into()),
+                Some(Step::Fails(kind)) => return Err(kind.into()),
+                Some(Step::Takes(n)) => n.min(buf.len()),
+                None => buf.len(),
+            };
+            self.taken.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    // A full non-blocking pipe (EAGAIN) is waited out and the rest of the
+    // payload written after what it took; write_all stopped at the first
+    // EAGAIN with only the head of the payload out.
+    #[test]
+    fn a_sink_that_is_not_ready_is_waited_out_and_gets_the_whole_payload() {
+        let payload: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+        let script = || {
+            vec![
+                Step::NotReady,
+                Step::Takes(4096),
+                Step::NotReady,
+                Step::NotReady,
+                Step::Interrupted,
+                Step::Takes(1000),
+            ]
+        };
+
+        let mut old = Scripted::new(script());
+        let lost = old.write_all(&payload);
+        assert_eq!(
+            lost.map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::WouldBlock),
+            "write_all gives up at the first EAGAIN"
+        );
+        assert!(old.taken.is_empty());
+
+        let mut sink = Scripted::new(script());
+        write_whole(&mut sink, &payload).expect("waited out");
+        assert!(sink.taken == payload, "every byte, in order, once");
+        assert_eq!(sink.calls, 7, "six scripted answers, then the rest in one");
+
+        // A sink that is ready takes the payload in ONE write -- the property
+        // the flicker guard is about -- and a real failure is returned, not
+        // retried.
+        let mut ready = Scripted::new(Vec::new());
+        write_whole(&mut ready, &payload).expect("ready sink");
+        assert_eq!(ready.calls, 1);
+        let mut broken = Scripted::new(vec![
+            Step::Takes(10),
+            Step::Fails(std::io::ErrorKind::PermissionDenied),
+        ]);
+        let failed = write_whole(&mut broken, &payload).map_err(|e| e.kind());
+        assert_eq!(failed, Err(std::io::ErrorKind::PermissionDenied));
+        assert_eq!(broken.calls, 2);
+    }
+
     #[test]
     fn console_text_is_utf16_with_bad_bytes_replaced_and_a_cut_character_carried() {
         let text = "h\u{e9}llo \u{2014} \u{2713} \u{4e2d}\u{6587} \u{1f600}";
@@ -1180,19 +1359,23 @@ mod stdout_write_tests {
     }
 }
 
+/// `__oam.node.stderrWrite(chunk)`: `undefined`, or the error the write
+/// failed with (see [`stdio_write_failed`]). std's stderr is unbuffered, so
+/// nothing is held back between calls. One failure this path cannot see: on
+/// unix std's stderr reports a write to an fd not open for writing (EBADF)
+/// as done (`handle_ebadf`), where node v22.23.2 on Linux raises EBADF for a
+/// stderr opened read-only.
 fn op_stderr_write(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     if let Some(bytes) = arg_bytes(scope, &args, 0) {
         use std::io::Write;
         let stderr = std::io::stderr();
         let mut lock = stderr.lock();
-        if let Err(e) = lock.write_all(&bytes).and_then(|_| lock.flush())
-            && e.kind() == std::io::ErrorKind::BrokenPipe
-        {
-            oam_core::exit_process(0);
+        if let Err(e) = write_whole(&mut lock, &bytes).and_then(|()| lock.flush()) {
+            stdio_write_failed(scope, &mut rv, &e);
         }
     }
 }

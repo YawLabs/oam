@@ -27939,3 +27939,238 @@ process.stdout.write(Buffer.from([0xff, 0x00, 0x41]));
     let expected = [0xe2, 0x82, 0xac, 0x0a, 0xff, 0x00, 0x41];
     assert!(bytes == expected, "{}", first_difference(&bytes, &expected));
 }
+
+/// A stdout that takes no writes: a file opened read-only, as `oam run x.mjs
+/// 1<file` hands one over. Every write to it fails EBADF -- on unix write(2)
+/// says so, on Windows WriteFile says ERROR_ACCESS_DENIED and node, like
+/// libuv's fs write, calls that EBADF -- and the failure reaches the program
+/// the way node delivers it (node v22.22.2 on Windows, v22.23.2 on Linux):
+/// process.stdout's write callback gets the error and the stream emits
+/// 'error'; the stream is still there afterwards and the next write fails
+/// the same way; fs.writeSync(1) throws it and fs.write(1) hands it to its
+/// callback; console.log swallows it. The error is node's fs shape: errno,
+/// code, syscall, "EBADF: bad file descriptor, write". oam used to report
+/// every one of these writes as a success.
+const REFUSING_STDOUT_MJS: &str = r"
+import fs from 'node:fs';
+const say = (s) => fs.writeSync(2, s + '\n');
+const shape = (e) => e ? [e.code, e.errno, e.syscall, e.message, Object.keys(e).join(',')].join(' | ') : 'none';
+process.stdout.on('error', (e) => say('error event: ' + shape(e)));
+say('write returned ' + process.stdout.write('one\n', (e) => say('write cb: ' + shape(e))));
+try { fs.writeSync(1, 'two\n'); say('writeSync returned'); } catch (e) { say('writeSync threw: ' + shape(e)); }
+fs.write(1, 'three\n', (e, n, data) => say('fs.write cb: ' + shape(e) + ' | ' + n + ' | ' + JSON.stringify(data)));
+console.log('four');
+say('console.log returned');
+setTimeout(() => {
+  say('destroyed ' + process.stdout.destroyed);
+  process.stdout.write('five\n', (e) => say('second write cb: ' + shape(e)));
+  setTimeout(() => say('END'), 20);
+}, 20);
+";
+
+/// node's EBADF for a failed write on this platform, as the scripts here
+/// print an error: code | errno | syscall | message | its own keys. The keys
+/// come in fs.writeSync's order -- errno, syscall, code -- from writeSync and
+/// from process.stdout / process.stderr, which node writes through
+/// writeSync; fs.write's callback gets the common errno, code, syscall.
+fn ebadf_write_shape(keys: &str) -> String {
+    let errno = if cfg!(windows) { -4083 } else { -9 };
+    format!("EBADF | {errno} | write | EBADF: bad file descriptor, write | {keys}")
+}
+
+const WRITE_SYNC_KEYS: &str = "errno,syscall,code";
+const COMMON_KEYS: &str = "errno,code,syscall";
+
+#[test]
+fn a_stdout_that_refuses_writes_says_so_as_node_does() {
+    let script = write_temp("stdout_refused.mjs", REFUSING_STDOUT_MJS);
+    let target = write_temp("stdout_refused.txt", "untouched\n");
+    let read_only = std::fs::File::open(&target).expect("open read-only");
+    let (mut child, stderr) = spawn_oam_with_stdout(&script, std::process::Stdio::from(read_only));
+    let status = wait_within(&mut child, OAM_DEADLINE, || {
+        format!(
+            "stderr so far: {:?}",
+            String::from_utf8_lossy(&stderr.taken())
+        )
+    });
+    let stderr = stderr_text(&stderr);
+    assert!(status.success(), "exit {status}; stderr:\n{stderr}");
+    let shape = ebadf_write_shape(WRITE_SYNC_KEYS);
+    let lines: Vec<&str> = stderr.lines().collect();
+    for want in [
+        "write returned false".to_string(),
+        format!("write cb: {shape}"),
+        format!("writeSync threw: {shape}"),
+        // (err, 0, data): what node's fs.write hands a failed write's callback.
+        format!(
+            "fs.write cb: {} | 0 | \"three\\n\"",
+            ebadf_write_shape(COMMON_KEYS)
+        ),
+        "console.log returned".to_string(),
+        "destroyed false".to_string(),
+        format!("second write cb: {shape}"),
+        "END".to_string(),
+    ] {
+        assert!(
+            lines.contains(&want.as_str()),
+            "missing {want:?}; stderr:\n{stderr}"
+        );
+    }
+    let error_event = format!("error event: {shape}");
+    let errors = lines.iter().filter(|l| **l == error_event).count();
+    assert_eq!(
+        errors, 2,
+        "one 'error' per failed stream write; stderr:\n{stderr}"
+    );
+    // The write's callback first, then the 'error', as node's Writable
+    // orders them.
+    let at = |line: &str| lines.iter().position(|l| *l == line);
+    assert!(
+        at(&format!("write cb: {shape}")) < at(&error_event),
+        "stderr:\n{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("target readable"),
+        "untouched\n"
+    );
+}
+
+/// The same refusal with nobody listening for 'error': node's program dies of
+/// the unhandled 'error' event -- exit 1, the EBADF on stderr -- and so does
+/// oam's, rather than carrying on as if the write had worked.
+#[test]
+fn an_unheard_stdout_error_ends_the_program_as_node_does() {
+    let script = write_temp(
+        "stdout_refused_unheard.mjs",
+        r"
+import fs from 'node:fs';
+process.stdout.write('one\n');
+setTimeout(() => fs.writeSync(2, 'STILL_RUNNING\n'), 200);
+",
+    );
+    let target = write_temp("stdout_refused_unheard.txt", "");
+    let read_only = std::fs::File::open(&target).expect("open read-only");
+    let (mut child, stderr) = spawn_oam_with_stdout(&script, std::process::Stdio::from(read_only));
+    let status = wait_within(&mut child, OAM_DEADLINE, || {
+        format!(
+            "stderr so far: {:?}",
+            String::from_utf8_lossy(&stderr.taken())
+        )
+    });
+    let stderr = stderr_text(&stderr);
+    assert_eq!(status.code(), Some(1), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("EBADF: bad file descriptor, write"),
+        "stderr:\n{stderr}"
+    );
+    assert!(!stderr.contains("STILL_RUNNING"), "stderr:\n{stderr}");
+}
+
+/// stderr refusing writes, on Windows: std's stderr reports the failure, and
+/// process.stderr and fs.writeSync(2) deliver it as node does (node v22.22.2,
+/// same script, same lines). On unix std's stderr reports a write to an fd
+/// not open for writing (EBADF) as done, so there is nothing to deliver.
+#[cfg(windows)]
+#[test]
+fn a_stderr_that_refuses_writes_says_so_as_node_does() {
+    let script = write_temp(
+        "stderr_refused.mjs",
+        r"
+import fs from 'node:fs';
+const say = (s) => fs.writeSync(1, s + '\n');
+const shape = (e) => e ? [e.code, e.errno, e.syscall, e.message, Object.keys(e).join(',')].join(' | ') : 'none';
+process.stderr.on('error', (e) => say('error event: ' + shape(e)));
+process.stderr.write('one\n', (e) => say('write cb: ' + shape(e)));
+try { fs.writeSync(2, 'two\n'); say('writeSync returned'); } catch (e) { say('writeSync threw: ' + shape(e)); }
+setTimeout(() => say('END'), 20);
+",
+    );
+    let target = write_temp("stderr_refused.txt", "");
+    let read_only = std::fs::File::open(&target).expect("open read-only");
+    let mut cmd = oam_command(&["run", script.to_str().unwrap(), "--no-check"]);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::from(read_only));
+    let mut child = cmd.spawn().expect("oam binary runs");
+    drop(cmd);
+    let stdout = drain_pipe(child.stdout.take().expect("piped stdout"));
+    let status = wait_within(&mut child, OAM_DEADLINE, || {
+        format!(
+            "stdout so far: {:?}",
+            String::from_utf8_lossy(&stdout.taken())
+        )
+    });
+    let stdout = stderr_text(&stdout);
+    assert!(status.success(), "exit {status}; stdout:\n{stdout}");
+    let shape = ebadf_write_shape(WRITE_SYNC_KEYS);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines,
+        [
+            format!("writeSync threw: {shape}"),
+            format!("write cb: {shape}"),
+            format!("error event: {shape}"),
+            "END".to_string(),
+        ],
+        "stdout:\n{stdout}"
+    );
+}
+
+/// The reader goes away another way: the pipe's server end disconnects
+/// (DisconnectNamedPipe). The writer's next WriteFile fails
+/// ERROR_PIPE_NOT_CONNECTED, which std does not call BrokenPipe but libuv
+/// does call EPIPE -- node v22.22.2 emits `EPIPE: broken pipe, write`, errno
+/// -4047, for exactly this. So it ends the program as every other EPIPE does
+/// in oam: exit 0, nothing on stderr. Before, the failure was dropped and the
+/// program ran on, writing into nothing.
+#[cfg(windows)]
+#[test]
+fn a_pipe_server_that_disconnects_ends_the_program_quietly() {
+    use std::io::Read;
+    use std::os::windows::io::AsRawHandle;
+    let script = write_temp(
+        "stdout_disconnected.mjs",
+        r"
+import fs from 'node:fs';
+process.stdout.write('ready\n');
+let i = 0;
+const tick = setInterval(() => {
+  process.stdout.write('tick ' + i + '\n');
+  if (++i === 500) {
+    clearInterval(tick);
+    fs.writeSync(2, 'LOOP_FINISHED');
+  }
+}, 10);
+",
+    );
+    let (mut server, client) = named_pipe(&unique_name("disconnect"), false);
+    let (mut child, stderr) = spawn_oam_with_stdout(&script, std::process::Stdio::from(client));
+    let mut seen = Vec::new();
+    let mut buf = [0u8; 8192];
+    while !seen.windows(6).any(|w| w == b"ready\n") {
+        let n = server.read(&mut buf).expect("stdout readable");
+        assert!(n > 0, "stdout ended before ready: {seen:?}");
+        seen.extend_from_slice(&buf[..n]);
+    }
+    // SAFETY: `server` is a live named-pipe server handle this test created
+    // and owns until the drop below; DisconnectNamedPipe takes the handle by
+    // value and reads or writes no memory of ours.
+    let disconnected =
+        unsafe { windows_sys::Win32::System::Pipes::DisconnectNamedPipe(server.as_raw_handle()) };
+    assert_ne!(
+        disconnected,
+        0,
+        "DisconnectNamedPipe: {}",
+        std::io::Error::last_os_error()
+    );
+    let status = wait_within(&mut child, std::time::Duration::from_secs(20), || {
+        format!(
+            "stderr so far: {:?}",
+            String::from_utf8_lossy(&stderr.taken())
+        )
+    });
+    drop(server);
+    let stderr = stderr_text(&stderr);
+    assert!(status.success(), "exit {status}; stderr: {stderr:?}");
+    assert_eq!(stderr, "", "nothing on stderr: no LOOP_FINISHED, no error");
+}
