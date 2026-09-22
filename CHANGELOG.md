@@ -195,6 +195,27 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   read into flags of its own and merged under argv's -- an explicit flag still wins, lists
   apply the environment's entries first -- and `execArgv` reflects argv alone. Found by
   case 178, which spawns children under `NODE_OPTIONS`.
+### Security
+
+- **zlib's one-shot functions ignored `maxOutputLength`.** `gunzipSync`, `inflateSync`,
+  `inflateRawSync`, `unzipSync`, the encoders and all their callback forms read `level`
+  and dropped every other option, so `gunzipSync(buf, { maxOutputLength: 1000 })`
+  returned the whole inflated output where node throws `RangeError
+  [ERR_BUFFER_TOO_LARGE]: Cannot create a Buffer larger than 1000 bytes` -- and node
+  stops inflating at the cap, where oam had already inflated everything. The option is
+  the one defence a program has against a decompression bomb it did not write the
+  decoder for: a 200 KB gzip of 200 MiB of spaces, handed to `@yawlabs/fetch-mcp`'s
+  sitemap tool with a 1 MiB cap, inflated all 200 MiB under oam and ended the server at
+  the 4 GB heap cap (found 2026-09-21; that server now counts the bytes itself). The cap
+  is now enforced while inflating -- measured on that bomb, oam grows by 0.5 MiB and
+  fails in 9 ms, node by 1 MiB in 2 ms -- and on the finished buffer for the encoders,
+  as node's is. The option is validated as node validates it: `undefined` and `NaN` mean
+  no cap, a non-number is `ERR_INVALID_ARG_TYPE`, `Infinity` is "a finite number",
+  outside 1..`kMaxLength` is `ERR_OUT_OF_RANGE`, and a fraction is compared as written.
+  Case 177 holds all of it to node v22.22.2, the 64 MiB bomb under a 64 KiB cap included.
+  The other one-shot options (`chunkSize`, `windowBits`, `finishFlush`, `info`,
+  `dictionary`, `params`) are still not read; `brotliCompressSync` /
+  `brotliDecompressSync` remain unsupported (divergences table).
 
 ## [0.16.4] - 2026-09-21
 

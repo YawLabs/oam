@@ -4941,8 +4941,48 @@ fn op_tls_canonicalize_ip(
     }
 }
 
-/// zlibSync(bytes, format, level, compress) — synchronous transform on the
-/// isolate thread (the *Sync API contract). "unzip" auto-detects on decode.
+/// The optional `maxOutputLength` argument of the one-shot zlib ops: a
+/// positive finite number, already validated by the shim; anything else
+/// (undefined, null) means no cap. Fractions round down: node measures the
+/// finished buffer against the raw value, and a buffer of 2 bytes exceeds
+/// `1.5` exactly when it exceeds `1`.
+fn arg_max_output(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+) -> Option<usize> {
+    let value = args.get(index);
+    if value.is_null_or_undefined() {
+        return None;
+    }
+    let n = value.number_value(scope)?;
+    if !n.is_finite() || n < 1.0 {
+        return None;
+    }
+    Some(n.min(usize::MAX as f64) as usize)
+}
+
+/// Throw the error for a one-shot zlib result. An output past
+/// `maxOutputLength` is a plain error carrying that sentinel message alone
+/// (see `oam_core::zlib::OUTPUT_TOO_LARGE`); the shim turns it into node's
+/// `RangeError [ERR_BUFFER_TOO_LARGE]` with the caller's number in it.
+fn throw_zlib_error(scope: &mut v8::PinScope<'_, '_>, e: &std::io::Error) {
+    let text = e.to_string();
+    let message = if text == oam_core::zlib::OUTPUT_TOO_LARGE {
+        text
+    } else {
+        format!("zlib: {text}")
+    };
+    let message = v8::String::new(scope, &message).unwrap();
+    let exception = v8::Exception::error(scope, message);
+    scope.throw_exception(exception);
+}
+
+/// zlibSync(bytes, format, level, compress, maxOutputLength?) — synchronous
+/// transform on the isolate thread (the *Sync API contract). "unzip"
+/// auto-detects on decode. `maxOutputLength` (node's option of that name)
+/// bounds the output: while it is produced for a decode, on the finished
+/// buffer for an encode.
 fn op_zlib_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -4955,15 +4995,16 @@ fn op_zlib_sync(
     let format = arg_string(scope, &args, 1).unwrap_or_default();
     let level = args.get(2).int32_value(scope).unwrap_or(-1);
     let compress = args.get(3).is_true();
+    let max_output = arg_max_output(scope, &args, 4);
     let result = if !compress && format == "unzip" {
-        oam_core::zlib::unzip(&bytes)
+        oam_core::zlib::unzip_capped(&bytes, max_output)
     } else {
         match oam_core::zlib::Format::parse(&format) {
             Some(parsed) => {
                 if compress {
-                    oam_core::zlib::compress(&bytes, parsed, level)
+                    oam_core::zlib::compress_capped(&bytes, parsed, level, max_output)
                 } else {
-                    oam_core::zlib::decompress(&bytes, parsed)
+                    oam_core::zlib::decompress_capped(&bytes, parsed, max_output)
                 }
             }
             None => {
@@ -4978,15 +5019,11 @@ fn op_zlib_sync(
                 rv.set(value);
             }
         }
-        Err(e) => {
-            let message = v8::String::new(scope, &format!("zlib: {e}")).unwrap();
-            let exception = v8::Exception::error(scope, message);
-            scope.throw_exception(exception);
-        }
+        Err(e) => throw_zlib_error(scope, &e),
     }
 }
 
-/// zlibAsync(bytes, format, level, compress) -> Promise<Uint8Array>.
+/// zlibAsync(bytes, format, level, compress, maxOutputLength?) -> Promise<Uint8Array>.
 fn op_zlib_async(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -4999,10 +5036,11 @@ fn op_zlib_async(
     let format = arg_string(scope, &args, 1).unwrap_or_default();
     let level = args.get(2).int32_value(scope).unwrap_or(-1);
     let compress = args.get(3).is_true();
+    let max_output = arg_max_output(scope, &args, 4);
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::zlib_transform(bytes, format, level, compress),
+        oam_core::ops::zlib_transform(bytes, format, level, compress, max_output),
     );
 }
 
