@@ -1450,6 +1450,14 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   3000 ms and 5000 ms after `agent.destroy()`; with Node's client, within 500 ms. A pooled
   request's socket also emits no `'close'` when the server ends the connection (a server
   that answered `Connection: close` and closed it: no `'close'` 1.5 s later).
+- **The pool opens a connection it may never use.** A request made while no pooled
+  connection is idle starts a new one AND waits for a pooled one to come free; when a pooled
+  one wins (a response finishing on the loopback does), the new connection is finished and
+  parked idle, having carried no request. undici opens a connection only to send on it. A
+  server sees one more connection than requests explain, and Node's `http` server -- oam's
+  too -- keeps such a connection across `server.close()` until the client goes (entry 41 has
+  what `oam.serve` does with it). Measured: six sequential-then-concurrent fetches to one
+  origin arrived on one connection, with a second open that never received a byte.
 - **`statusText` is the canonical reason phrase**, not the server's: `200 Custom Reason` reads
   `OK` in oam, and `299 Whatever` reads `''`. Node reports the reason on the wire.
 - **The request header count is capped.** More than 24,576 distinct header names (fewer if
@@ -1746,7 +1754,13 @@ many are open is closed at once and the server emits `'drop'`. What differs:
   `Http2Server`. The HTTP/1 connections it also takes are held to the `http` server's
   default timeouts, which cannot be changed there, and it has no `maxConnections`.
 - `oam.serve` uses Node's defaults (60 s, 300 s, 5 s + 1 s, checked every 30 s), with no
-  way to change them.
+  way to change them. Its `close()` finishes the requests in flight and closes every
+  other connection, one that connected and never sent a request included: a client pool
+  opens such a connection (`fetch`'s spare, raced against a pooled connection that won),
+  and since `close()` stops the check that would have timed it out, as Node's does, and
+  `oam.serve` has no `closeAllConnections()`, it would hold `close()` -- and the process --
+  for ever. Node's `http` server keeps such a connection until the client goes, and so
+  does oam's.
 
 _(probed)_ Node v22.22.2 and oam, raw TCP and TLS clients against servers with short
 timeouts; conformance case 135.
