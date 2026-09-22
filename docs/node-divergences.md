@@ -1752,7 +1752,8 @@ many are open is closed at once and the server emits `'drop'`. What differs:
   Node counts it until it closes.
 - `http2.createServer` applies none of these to its HTTP/2 connections, as Node's
   `Http2Server`. The HTTP/1 connections it also takes are held to the `http` server's
-  default timeouts, which cannot be changed there, and it has no `maxConnections`.
+  default timeouts, which cannot be changed there, and it has no `maxConnections`. Its
+  `close()` treats them as `oam.serve`'s does (next bullet).
 - `oam.serve` uses Node's defaults (60 s, 300 s, 5 s + 1 s, checked every 30 s), with no
   way to change them. Its `close()` finishes the requests in flight and closes every
   other connection, one that connected and never sent a request included: a client pool

@@ -161,7 +161,8 @@ connections a server had accepted finish before it reports itself closed.
   request included: a client pool opens such a connection (`fetch`'s spare, raced against a
   pooled connection that won), and since `close()` stops the check that would have timed it
   out, as node's does, the drain would have held `close()` -- and the process -- for ever
-  (it never shipped: the drain and this are both new in this release). A `node:http` server
+  (it never shipped: the drain and this are both new in this release). The HTTP/1
+  connections `http2.createServer` also takes are served the same way. A `node:http` server
   keeps such a connection until the client goes, as node's does.
 
 - **`http.request` sent no `Connection` header, so a server kept the connection open.** node's

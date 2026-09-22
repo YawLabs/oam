@@ -1186,8 +1186,9 @@ where
     // that would have timed the connection out, and a client that connected
     // and never sends holds close() until it goes (probed on v22.22.2;
     // closeAllConnections() is the application's way out). Only there.
-    // oam.serve stops its check at close() the same way but has no
-    // closeAllConnections() to call, and a client pool does open a
+    // oam.serve -- and the HTTP/1 connections http2.createServer() also
+    // takes, served the same way -- stops its check at close() the same way
+    // but has no closeAllConnections() to call, and a client pool does open a
     // connection it then never uses (a spare, raced against a pooled one
     // that won), so such a connection would hold close() -- and the process
     // -- for ever. It gets hyper's graceful shutdown instead, which
