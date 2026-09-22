@@ -1179,8 +1179,20 @@ where
     // dispatched -- a fresh connection, or a keep-alive one partway into
     // its next request. hyper's graceful shutdown would close it before
     // that request is read (it sees no exchange yet); node's close() leaves
-    // an active connection alone and serves it. So the shutdown waits for
-    // the dispatch, and then ends the connection after that exchange.
+    // an active connection alone and serves it. So on a node server the
+    // shutdown waits for the dispatch, and then ends the connection after
+    // that exchange -- for as long as the client takes: node counts a
+    // connection as active from its accept, its close() stops the check
+    // that would have timed the connection out, and a client that connected
+    // and never sends holds close() until it goes (probed on v22.22.2;
+    // closeAllConnections() is the application's way out). Only there.
+    // oam.serve -- and the HTTP/1 connections http2.createServer() also
+    // takes, served the same way -- stops its check at close() the same way
+    // but has no closeAllConnections() to call, and a client pool does open a
+    // connection it then never uses (a spare, raced against a pooled one
+    // that won), so such a connection would hold close() -- and the process
+    // -- for ever. It gets hyper's graceful shutdown instead, which
+    // finishes an exchange in flight and closes everything else.
     let mut shutdown_waiting = false;
     let ended = loop {
         // Biased toward hyper: a response JS has already handed over (a
@@ -1194,7 +1206,7 @@ where
                 Err(_) => takeable = false,
             },
             _ = shutdown.changed(), if !shutting_down && !shutdown_waiting => {
-                if watch.awaiting_dispatch() {
+                if js_driven && watch.awaiting_dispatch() {
                     shutdown_waiting = true;
                 } else {
                     shutting_down = true;

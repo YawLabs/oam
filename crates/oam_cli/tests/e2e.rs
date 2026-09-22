@@ -3181,6 +3181,73 @@ fn oam_serve_handles_get_post_and_errors() {
     assert_eq!(lines[5], "closed");
 }
 
+/// `oam.serve`'s `close()` finishes the requests in flight and closes every
+/// other connection -- one that connected and never sent a request
+/// included. A client pool opens such a connection (fetch's spare, raced
+/// against a pooled connection that won), and with the check that would
+/// time it out stopped at close(), as node stops its own, it held close()
+/// and the process for ever: oam_serve_handles_get_post_and_errors never
+/// exited under the e2e harness. A node:http server keeps such a connection, as node does (the
+/// test after this one).
+#[test]
+fn oam_serve_close_ends_a_connection_that_sent_nothing() {
+    let stdout = run_ok(
+        "serve_close_silent.mjs",
+        "import net from 'node:net';\n\
+         let arrived, release;\n\
+         const reached = new Promise((r) => (arrived = r));\n\
+         const held = new Promise((r) => (release = r));\n\
+         const server = await oam.serve({\n\
+           async fetch(req) {\n\
+             if (new URL(req.url).pathname === '/held') { arrived(); await held; }\n\
+             return new Response('served');\n\
+           },\n\
+         });\n\
+         const port = server.port;\n\
+         const silent = net.connect(port, '127.0.0.1');\n\
+         silent.on('error', () => {});\n\
+         await new Promise((r) => silent.once('connect', r));\n\
+         const silentClosed = new Promise((r) => silent.once('close', () => r('silent closed')));\n\
+         const inFlight = fetch(`http://127.0.0.1:${port}/held`).then((r) => r.text());\n\
+         await reached;\n\
+         server.close();\n\
+         release();\n\
+         console.log(await inFlight);\n\
+         console.log(await silentClosed);",
+    );
+    assert_eq!(stdout, "served\nsilent closed");
+}
+
+/// node's `server.close()` keeps a connection that connected and never sent
+/// a request: node counts it as active from the accept, and close() stops
+/// the check that would have timed it out, so 'close' and close(cb) wait
+/// until the client goes (probed on v22.22.2). `closeAllConnections()` is
+/// the application's way out.
+#[test]
+fn http_server_close_keeps_a_connection_that_sent_nothing() {
+    let stdout = run_ok(
+        "server_close_silent.mjs",
+        "import http from 'node:http';\n\
+         import net from 'node:net';\n\
+         const server = http.createServer((q, s) => s.end('ok'));\n\
+         await new Promise((r) => server.listen(0, '127.0.0.1', r));\n\
+         const silent = net.connect(server.address().port, '127.0.0.1');\n\
+         silent.on('error', () => {});\n\
+         await new Promise((r) => silent.once('connect', r));\n\
+         let called = false;\n\
+         server.close(() => { called = true; });\n\
+         await new Promise((r) => setTimeout(r, 300));\n\
+         console.log(`close(cb) within 300 ms: ${called}`);\n\
+         silent.destroy();\n\
+         await new Promise((r) => server.once('close', r));\n\
+         console.log(`close(cb) once the client left: ${called}`);",
+    );
+    assert_eq!(
+        stdout,
+        "close(cb) within 300 ms: false\nclose(cb) once the client left: true"
+    );
+}
+
 #[test]
 fn oam_serve_streams_sse_incrementally() {
     let stdout = run_ok(
@@ -6736,7 +6803,12 @@ server.close();
 /// Pooled sockets do not keep the process alive, as in node: the agent unrefs
 /// a socket it keeps, and a socket's idle timer (the global agent's 5 s, an
 /// agent's `timeout`) is an unref'd timer. The server is in this test
-/// process, so only the client's handles count.
+/// process, so only the client's handles count. What is measured is the
+/// time from the last line of the script to its 'exit', inside the
+/// process: a pooled socket that held the loop would put the global agent's
+/// 5 s idle timer in between. The wall clock of the whole run is not it --
+/// on a loaded box the process's start and teardown alone take seconds
+/// (measured at 2-9 s per run at 96% CPU), which failed the release gate.
 #[test]
 fn pooled_sockets_do_not_keep_the_process_alive() {
     use std::io::{Read, Write};
@@ -6784,15 +6856,21 @@ await get({{ agent }});
 await get({{}});
 const free = (a) => Object.values(a.freeSockets).reduce((n, list) => n + list.length, 0);
 console.log(`pooled ${{free(agent)}} ${{free(http.globalAgent)}}`);
+const printed = performance.now();
+process.on('exit', () => console.log(`exit ${{(performance.now() - printed).toFixed(0)}}`));
 "#
     );
-    let started = std::time::Instant::now();
     let out = run_ok("pooled_sockets_exit.mjs", &src);
-    assert_eq!(out, "pooled 1 1");
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines[0], "pooled 1 1", "{out}");
+    let lag_ms: u64 = lines
+        .get(1)
+        .and_then(|line| line.strip_prefix("exit "))
+        .and_then(|ms| ms.parse().ok())
+        .unwrap_or_else(|| panic!("no exit line: {out}"));
     assert!(
-        started.elapsed() < std::time::Duration::from_secs(4),
-        "the run waited on its pooled sockets: {:?}",
-        started.elapsed()
+        lag_ms < 2_000,
+        "the run waited on its pooled sockets: {lag_ms} ms from the last line to 'exit'"
     );
 }
 
