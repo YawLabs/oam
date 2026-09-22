@@ -1450,7 +1450,7 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   3000 ms and 5000 ms after `agent.destroy()`; with Node's client, within 500 ms. A pooled
   request's socket also emits no `'close'` when the server ends the connection (a server
   that answered `Connection: close` and closed it: no `'close'` 1.5 s later).
-- **The pool opens a connection it may never use.** A request made while no pooled
+- **The pool opens a connection it may never use (#216).** A request made while no pooled
   connection is idle starts a new one AND waits for a pooled one to come free; when a pooled
   one wins (a response finishing on the loopback does), the new connection is finished and
   parked idle, having carried no request. undici opens a connection only to send on it. A
