@@ -49,6 +49,18 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   had to leave out. `tls.getCiphers()` now lists the nine suites oam offers, in node's
   lowercase spelling, where it listed three TLS 1.3 names. The `ciphers` option is still
   ignored (docs/node-divergences.md, entry 42).
+- **A handshake the server refuses with the `protocol_version` alert failed an `https`
+  request with the alert's own code, `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`, where node's
+  fails with `write EPROTO`** (#146). Node's rule, measured: a socket with nothing queued
+  gets the alert's code; one with a write queued behind the handshake -- `tls.connect(o);
+  s.write(x)`, an https request's head once `end()`, `write()` or `flushHeaders()` ran, any
+  request on the shared transport -- gets that write's `write EPROTO` (errno, code, syscall)
+  on the socket's error and every queued write's callback; `end()` with no data queues no
+  write. oam now follows it. The rest of #146 -- a verifying `https.request`'s `ca`,
+  `minVersion` / `maxVersion` / `secureProtocol`, `cert` / `key`, `servername`,
+  `checkServerIdentity` and `secureContext`, in its own options or its agent's -- has held
+  since 0.16.3, when such a request began to go over `tls.connect` (entry 43); conformance
+  case 179 now pins it, the negotiated protocol read from the server.
 - **`process.execArgv` listed the flags `NODE_OPTIONS` carried** (`NODE_OPTIONS=--no-warnings`
   made it `['--no-warnings']`), where node lists what the command line gave and nothing
   else: a child re-spawned from it got every environment flag twice. `NODE_OPTIONS` is now
