@@ -169,22 +169,96 @@ fn reinsert_writer(registry: &TlsRegistry, handle: u64, writer: TlsWriter) -> bo
     }
 }
 
-/// Node's error `code` for a rustls handshake failure that maps to a specific
-/// OpenSSL code rather than a transport errno. Today the one mapping is a
-/// received `protocol_version` fatal alert -- the peer's highest offered
-/// version is below our `minVersion` -- which Node reports as
-/// `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION` (measured on v22). tokio-rustls wraps
-/// the `rustls::Error` as the source of an `InvalidData` io error, so it can be
-/// recovered by downcast. The accompanying message stays rustls's own: Node's
-/// is an OpenSSL diagnostic blob carrying its build path, which no runtime can
-/// reproduce (see docs/node-divergences.md), so only the code is matched.
-fn tls_alert_code(error: &std::io::Error) -> Option<&'static str> {
+/// Node's error `code` for a fatal alert the peer sent: `ERR_SSL_` and
+/// OpenSSL's reason string for the alert, uppercased with underscores --
+/// the SSL3-era alerts spelled `SSL/TLS` (OpenSSL 3's spelling; 1.1 said
+/// `SSLV3`), the rest `TLSV1` or `TLSV13`, and five of them without the
+/// word `ALERT`. Measured on Node v22.22.2 (OpenSSL 3.5.5) for every
+/// description a raw server can send, on both sides of a connection: a
+/// client names the alert its server sent, a server (`tlsClientError`) the
+/// one its client sent. `None` for a description OpenSSL has no name for,
+/// and for `close_notify` sent as fatal (rustls reports it as the alert it
+/// is when it arrives mid-handshake): a bare `tls.connect` socket reports
+/// the transport closing (`disconnected_before_secure`), one with a write
+/// queued behind the handshake that write's `EPROTO` (`alert_outcome`), as
+/// Node does for both.
+pub(crate) fn alert_code(alert: rustls::AlertDescription) -> Option<&'static str> {
+    use rustls::AlertDescription as A;
+    Some(match alert {
+        A::UnexpectedMessage => "ERR_SSL_SSL/TLS_ALERT_UNEXPECTED_MESSAGE",
+        A::BadRecordMac => "ERR_SSL_SSL/TLS_ALERT_BAD_RECORD_MAC",
+        A::DecryptionFailed => "ERR_SSL_TLSV1_ALERT_DECRYPTION_FAILED",
+        A::RecordOverflow => "ERR_SSL_TLSV1_ALERT_RECORD_OVERFLOW",
+        A::DecompressionFailure => "ERR_SSL_SSL/TLS_ALERT_DECOMPRESSION_FAILURE",
+        A::HandshakeFailure => "ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE",
+        A::NoCertificate => "ERR_SSL_SSL/TLS_ALERT_NO_CERTIFICATE",
+        A::BadCertificate => "ERR_SSL_SSL/TLS_ALERT_BAD_CERTIFICATE",
+        A::UnsupportedCertificate => "ERR_SSL_SSL/TLS_ALERT_UNSUPPORTED_CERTIFICATE",
+        A::CertificateRevoked => "ERR_SSL_SSL/TLS_ALERT_CERTIFICATE_REVOKED",
+        A::CertificateExpired => "ERR_SSL_SSL/TLS_ALERT_CERTIFICATE_EXPIRED",
+        A::CertificateUnknown => "ERR_SSL_SSL/TLS_ALERT_CERTIFICATE_UNKNOWN",
+        A::IllegalParameter => "ERR_SSL_SSL/TLS_ALERT_ILLEGAL_PARAMETER",
+        A::UnknownCA => "ERR_SSL_TLSV1_ALERT_UNKNOWN_CA",
+        A::AccessDenied => "ERR_SSL_TLSV1_ALERT_ACCESS_DENIED",
+        A::DecodeError => "ERR_SSL_TLSV1_ALERT_DECODE_ERROR",
+        A::DecryptError => "ERR_SSL_TLSV1_ALERT_DECRYPT_ERROR",
+        A::ExportRestriction => "ERR_SSL_TLSV1_ALERT_EXPORT_RESTRICTION",
+        A::ProtocolVersion => "ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION",
+        A::InsufficientSecurity => "ERR_SSL_TLSV1_ALERT_INSUFFICIENT_SECURITY",
+        A::InternalError => "ERR_SSL_TLSV1_ALERT_INTERNAL_ERROR",
+        A::InappropriateFallback => "ERR_SSL_TLSV1_ALERT_INAPPROPRIATE_FALLBACK",
+        A::UserCanceled => "ERR_SSL_TLSV1_ALERT_USER_CANCELLED",
+        A::NoRenegotiation => "ERR_SSL_TLSV1_ALERT_NO_RENEGOTIATION",
+        A::MissingExtension => "ERR_SSL_TLSV13_ALERT_MISSING_EXTENSION",
+        A::UnsupportedExtension => "ERR_SSL_TLSV1_UNSUPPORTED_EXTENSION",
+        A::CertificateUnobtainable => "ERR_SSL_TLSV1_CERTIFICATE_UNOBTAINABLE",
+        A::UnrecognisedName => "ERR_SSL_TLSV1_UNRECOGNIZED_NAME",
+        A::BadCertificateStatusResponse => "ERR_SSL_TLSV1_BAD_CERTIFICATE_STATUS_RESPONSE",
+        A::BadCertificateHashValue => "ERR_SSL_TLSV1_BAD_CERTIFICATE_HASH_VALUE",
+        A::UnknownPSKIdentity => "ERR_SSL_TLSV1_ALERT_UNKNOWN_PSK_IDENTITY",
+        A::CertificateRequired => "ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED",
+        A::NoApplicationProtocol => "ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL",
+        _ => return None,
+    })
+}
+
+/// The fatal alert an io error from rustls carries, if it carries one.
+/// tokio-rustls wraps the `rustls::Error` as the inner error of an
+/// `InvalidData` io error (not its `source()`), so it is opened here.
+pub(crate) fn received_alert(error: &std::io::Error) -> Option<rustls::AlertDescription> {
     match error.get_ref()?.downcast_ref::<rustls::Error>()? {
-        rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion) => {
-            Some("ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION")
-        }
+        rustls::Error::AlertReceived(alert) => Some(*alert),
         _ => None,
     }
+}
+
+/// Node's error for a fatal alert the server sent: its code, with rustls's
+/// text for the message (Node's is an OpenSSL diagnostic carrying its build
+/// path; docs/node-divergences.md entry 34). An alert Node has no name for
+/// is `EPROTO` with no syscall -- the protocol failed, in no named way --
+/// which the JS side shapes as Node does (measured on v22.22.2 with a raw
+/// server sending description 255): the disconnect below on a bare socket,
+/// the failed write's `write EPROTO` once a write was queued behind the
+/// handshake, as for every named alert.
+fn alert_outcome(alert: rustls::AlertDescription) -> OpOutcome {
+    let message = format!("received fatal alert: {alert:?}");
+    match alert_code(alert) {
+        Some(code) => OpOutcome::node_failed(code, message),
+        None => OpOutcome::node_failed("EPROTO", message),
+    }
+}
+
+/// Node's error when the transport closes before the handshake is done --
+/// the server went away, or sent an alert OpenSSL could not name to a
+/// socket with nothing queued -- an `ECONNRESET` with Node's own message
+/// and no syscall (`path`, `host`, `port` and `localAddress` are added by
+/// the JS side, which has the options).
+pub(crate) fn disconnected_before_secure() -> OpOutcome {
+    OpOutcome::node_failed(
+        "ECONNRESET",
+        "Client network socket disconnected before secure TLS connection was established"
+            .to_string(),
+    )
 }
 
 /// The TLS `protocol_version` fatal alert as one record on the wire: content
@@ -219,6 +293,12 @@ pub(crate) async fn refuse_no_protocols(mut stream: tokio::net::TcpStream) {
 }
 
 fn tls_fail(error: std::io::Error, syscall: &str, target: &str) -> OpOutcome {
+    // A fatal alert the server sent after the handshake -- a TLS 1.3 server
+    // requiring a client certificate sends `certificate_required` then --
+    // arrives on a read or a write, and is named as Node names it (#196).
+    if let Some(alert) = received_alert(&error) {
+        return alert_outcome(alert);
+    }
     let code = node_error_code(&error);
     // syscall + errno, but no `path`: a host:port is not a filesystem path,
     // and node does not put one on a net error.
@@ -1603,8 +1683,26 @@ where
             {
                 return Err(OpOutcome::node_failed(code, message));
             }
-            if let Some(code) = tls_alert_code(&e) {
-                return Err(OpOutcome::node_failed(code, e.to_string()));
+            // A fatal alert answering the handshake: Node's code for it
+            // (#196). The transport going away instead: Node's disconnect
+            // (an EOF), or `read ECONNRESET` (a reset), measured on
+            // v22.22.2 against a raw server that closes or resets after
+            // the ClientHello.
+            if let Some(alert) = received_alert(&e) {
+                return Err(alert_outcome(alert));
+            }
+            match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => return Err(disconnected_before_secure()),
+                std::io::ErrorKind::ConnectionReset => {
+                    return Err(OpOutcome::node_failed_at(
+                        "ECONNRESET",
+                        "read ECONNRESET".to_string(),
+                        "read",
+                        None,
+                        node_errno("ECONNRESET", &e),
+                    ));
+                }
+                _ => {}
             }
             return Err(tls_fail(e, "connect", target));
         }
@@ -2334,27 +2432,67 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         assert!(selected(None, Some("bogus")).is_err());
     }
 
-    /// A received `protocol_version` fatal alert keys to Node's code; any other
-    /// io error (or a rustls error that is not that alert) does not.
+    /// Every fatal alert a rustls io error carries keys to Node's code for it
+    /// -- OpenSSL 3's spellings, measured for each description (case 180) --
+    /// and an io error that carries no alert keys to nothing.
     #[test]
-    fn tls_alert_code_maps_only_the_protocol_version_alert() {
-        let alert = std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion),
-        );
+    fn received_alerts_map_to_nodes_codes() {
+        use rustls::AlertDescription as A;
+        let wrapped = |alert: A| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                rustls::Error::AlertReceived(alert),
+            )
+        };
         assert_eq!(
-            tls_alert_code(&alert),
-            Some("ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION")
+            received_alert(&wrapped(A::ProtocolVersion)),
+            Some(A::ProtocolVersion)
         );
-
-        let other_alert = std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure),
-        );
-        assert_eq!(tls_alert_code(&other_alert), None);
-
+        for (alert, code) in [
+            (A::ProtocolVersion, "ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION"),
+            (
+                A::HandshakeFailure,
+                "ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE",
+            ),
+            (A::BadCertificate, "ERR_SSL_SSL/TLS_ALERT_BAD_CERTIFICATE"),
+            (A::UnknownCA, "ERR_SSL_TLSV1_ALERT_UNKNOWN_CA"),
+            (A::UnrecognisedName, "ERR_SSL_TLSV1_UNRECOGNIZED_NAME"),
+            (
+                A::MissingExtension,
+                "ERR_SSL_TLSV13_ALERT_MISSING_EXTENSION",
+            ),
+            (
+                A::CertificateRequired,
+                "ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED",
+            ),
+            (
+                A::NoApplicationProtocol,
+                "ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL",
+            ),
+        ] {
+            assert_eq!(alert_code(alert), Some(code), "{alert:?}");
+            let outcome = alert_outcome(alert);
+            assert!(
+                matches!(&outcome, OpOutcome::NodeFailed { code: c, .. } if c == code),
+                "{alert:?}: {outcome:?}"
+            );
+        }
+        // A description OpenSSL cannot name, and close_notify sent as
+        // fatal: EPROTO with no syscall, for the JS side to shape as Node's
+        // disconnect or as the failed write's.
+        assert_eq!(alert_code(A::CloseNotify), None);
+        assert_eq!(alert_code(A::Unknown(200)), None);
+        assert!(matches!(
+            alert_outcome(A::Unknown(200)),
+            OpOutcome::NodeFailed { code, syscall: None, .. } if code == "EPROTO"
+        ));
+        assert!(matches!(
+            disconnected_before_secure(),
+            OpOutcome::NodeFailed { code, syscall: None, .. } if code == "ECONNRESET"
+        ));
+        // No alert in an errno.
         let refused = std::io::Error::from_raw_os_error(10061);
-        assert_eq!(tls_alert_code(&refused), None);
+        assert_eq!(received_alert(&refused), None);
     }
 
     /// A server with no version to offer answers the ClientHello with a

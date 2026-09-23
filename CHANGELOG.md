@@ -49,6 +49,32 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   had to leave out. `tls.getCiphers()` now lists the nine suites oam offers, in node's
   lowercase spelling, where it listed three TLS 1.3 names. The `ciphers` option is still
   ignored (docs/node-divergences.md, entry 42).
+- **A fatal alert from the server failed the `tls.connect`-based clients with `EIO`** --
+  `tls.connect`, `https.request` and an `http2.connect` session -- **where node names the
+  alert**, and left an option-less `https.get` or `fetch` with a bare `socket hang up`
+  (only `protocol_version` was named, #146) (#196). Every alert a server can send is now node's code:
+  `ERR_SSL_` and OpenSSL 3's reason for it, uppercased
+  (`ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE`, `ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL`,
+  `ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED` from a TLS 1.3 server requiring a client
+  certificate, which arrives after `'secureConnect'`), with `library` and `reason` ahead of
+  `code`; the `write EPROTO` rule of #146 holds for every alert answering the handshake on
+  `tls.connect` and `https.request` (an option-less `https.get` reports it the same way,
+  where `fetch` keeps the alert's code as its `cause`); a description node cannot name is node's
+  disconnect (`ECONNRESET`, "Client network socket disconnected before secure TLS
+  connection was established", carrying `path`, `host`, `port` and `localAddress`) on a
+  socket with nothing queued and that EPROTO on one with a write queued, and the transport
+  closing during the handshake -- or after a warning-level alert -- is that disconnect on
+  every client. A write queued behind a handshake that ends otherwise gets node's error
+  on its callback: `write ECANCELED Canceled because of SSL destruction` when the transport
+  closes, `write EBADF` when the verifier refuses the certificate, a detail-less `write
+  EPROTO` when the version range offers nothing -- where every one got
+  `ERR_SOCKET_CLOSED_BEFORE_CONNECTION` -- and `authorizationError` stays null after an
+  alert, as in node. Measured for every alert description on node v22.22.2 (OpenSSL 3.5.5);
+  conformance case 180 pins the table on five clients and case 145 now compares the
+  refused client's code, which it had to leave out. The same table names the alert a
+  client sends on a server's `tlsClientError`, in OpenSSL 3's spelling
+  (`ERR_SSL_SSL/TLS_ALERT_*` where 0.16.4 said `ERR_SSL_SSLV3_ALERT_*`). The messages stay
+  rustls's (docs/node-divergences.md, entry 34).
 - **A handshake the server refuses with the `protocol_version` alert failed an `https`
   request with the alert's own code, `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`, where node's
   fails with `write EPROTO`** (#146). Node's rule, measured: a socket with nothing queued

@@ -867,46 +867,10 @@ fn socket_hang_up() -> OpOutcome {
     OpOutcome::node_failed("ECONNRESET", "socket hang up")
 }
 
-/// OpenSSL's reason code for a fatal alert the peer sent, as Node names it
-/// (`ERR_SSL_<reason>`): SSLv3-era alerts keep their `SSLV3_ALERT_` names,
-/// TLS 1.0-era ones `TLSV1_ALERT_`, TLS 1.3 additions `TLSV13_ALERT_`.
-pub(crate) fn alert_code(alert: rustls::AlertDescription) -> Option<&'static str> {
-    use rustls::AlertDescription as A;
-    Some(match alert {
-        A::UnexpectedMessage => "ERR_SSL_SSLV3_ALERT_UNEXPECTED_MESSAGE",
-        A::BadRecordMac => "ERR_SSL_SSLV3_ALERT_BAD_RECORD_MAC",
-        A::DecompressionFailure => "ERR_SSL_SSLV3_ALERT_DECOMPRESSION_FAILURE",
-        A::HandshakeFailure => "ERR_SSL_SSLV3_ALERT_HANDSHAKE_FAILURE",
-        A::NoCertificate => "ERR_SSL_SSLV3_ALERT_NO_CERTIFICATE",
-        A::BadCertificate => "ERR_SSL_SSLV3_ALERT_BAD_CERTIFICATE",
-        A::UnsupportedCertificate => "ERR_SSL_SSLV3_ALERT_UNSUPPORTED_CERTIFICATE",
-        A::CertificateRevoked => "ERR_SSL_SSLV3_ALERT_CERTIFICATE_REVOKED",
-        A::CertificateExpired => "ERR_SSL_SSLV3_ALERT_CERTIFICATE_EXPIRED",
-        A::CertificateUnknown => "ERR_SSL_SSLV3_ALERT_CERTIFICATE_UNKNOWN",
-        A::IllegalParameter => "ERR_SSL_SSLV3_ALERT_ILLEGAL_PARAMETER",
-        A::DecryptionFailed => "ERR_SSL_TLSV1_ALERT_DECRYPTION_FAILED",
-        A::RecordOverflow => "ERR_SSL_TLSV1_ALERT_RECORD_OVERFLOW",
-        A::UnknownCA => "ERR_SSL_TLSV1_ALERT_UNKNOWN_CA",
-        A::AccessDenied => "ERR_SSL_TLSV1_ALERT_ACCESS_DENIED",
-        A::DecodeError => "ERR_SSL_TLSV1_ALERT_DECODE_ERROR",
-        A::DecryptError => "ERR_SSL_TLSV1_ALERT_DECRYPT_ERROR",
-        A::ExportRestriction => "ERR_SSL_TLSV1_ALERT_EXPORT_RESTRICTION",
-        A::ProtocolVersion => "ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION",
-        A::InsufficientSecurity => "ERR_SSL_TLSV1_ALERT_INSUFFICIENT_SECURITY",
-        A::InternalError => "ERR_SSL_TLSV1_ALERT_INTERNAL_ERROR",
-        A::InappropriateFallback => "ERR_SSL_TLSV1_ALERT_INAPPROPRIATE_FALLBACK",
-        A::UserCanceled => "ERR_SSL_TLSV1_ALERT_USER_CANCELLED",
-        A::NoRenegotiation => "ERR_SSL_TLSV1_ALERT_NO_RENEGOTIATION",
-        A::MissingExtension => "ERR_SSL_TLSV13_ALERT_MISSING_EXTENSION",
-        A::UnsupportedExtension => "ERR_SSL_TLSV1_ALERT_UNSUPPORTED_EXTENSION",
-        A::UnrecognisedName => "ERR_SSL_TLSV1_UNRECOGNIZED_NAME",
-        A::BadCertificateStatusResponse => "ERR_SSL_TLSV1_BAD_CERTIFICATE_STATUS_RESPONSE",
-        A::UnknownPSKIdentity => "ERR_SSL_TLSV1_ALERT_UNKNOWN_PSK_IDENTITY",
-        A::CertificateRequired => "ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED",
-        A::NoApplicationProtocol => "ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL",
-        _ => return None,
-    })
-}
+/// Node's name for a fatal alert the client sent: the one table both sides
+/// share (`super::alert_code`), OpenSSL's reason strings being the same
+/// whichever side received the alert.
+pub(crate) use super::alert_code;
 
 /// The largest record OpenSSL's server reads (its default read buffer less
 /// the header); a first record declaring more is refused before anything
@@ -1748,9 +1712,10 @@ SM
             alert_code(A::CertificateRequired),
             Some("ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED")
         );
+        // OpenSSL 3 spells the SSL3-era alerts `SSL/TLS` (1.1 said `SSLV3`).
         assert_eq!(
             alert_code(A::BadCertificate),
-            Some("ERR_SSL_SSLV3_ALERT_BAD_CERTIFICATE")
+            Some("ERR_SSL_SSL/TLS_ALERT_BAD_CERTIFICATE")
         );
         assert_eq!(
             alert_code(A::UnknownCA),

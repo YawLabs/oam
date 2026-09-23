@@ -34,8 +34,8 @@ use super::{BoxError, ReqBody};
 use crate::OpOutcome;
 use crate::net_connect::{ConnectError, DEFAULT_ATTEMPT_TIMEOUT};
 
-use super::connector::NoProtocolsAvailable;
 pub use super::connector::TlsSource;
+use super::connector::{HandshakeFailed, NoProtocolsAvailable};
 use super::tls_config::TlsRange;
 use std::sync::atomic::AtomicU8;
 
@@ -426,15 +426,42 @@ impl SendError {
         if let Some(none) = find_in_chain::<NoProtocolsAvailable>(&self.error) {
             return OpOutcome::node_failed("ERR_SSL_NO_PROTOCOLS_AVAILABLE", none.to_string());
         }
-        // The peer's highest version is below this request's floor: the
-        // `protocol_version` alert, the one alert node names on a fetch
-        // (`ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION` as the cause; measured),
-        // as tls.connect names it.
-        if protocol_version_alert(&self.error) {
-            return OpOutcome::node_failed(
-                "ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION",
-                "received fatal alert: ProtocolVersion".to_string(),
-            );
+        // A fatal alert the server sent (#196). The two callers of this
+        // transport shape it differently, as node's two do, so the outcome
+        // carries the alert and the JS side -- which knows whether it is a
+        // `fetch` or an option-less `https.get` -- finishes it:
+        // - `fetch` reports the alert as the request's `cause`, code and
+        //   all, whether it answered the handshake or came after it;
+        // - `https.get` fails a handshake-time alert with `write EPROTO`
+        //   (its request head was a write queued behind the handshake, which
+        //   OpenSSL then refused; measured for every alert, #146) and keeps
+        //   a post-handshake alert's own code.
+        // The `handshake failed:` message prefix marks a handshake-time
+        // alert for the JS; a description node cannot name is `ECONNRESET`
+        // (its disconnect, which `fetch` keeps) with the same prefix and the
+        // `received fatal alert` text a transport EOF lacks, so `https.get`
+        // can still tell it from a close and make it `write EPROTO`.
+        if let Some(alert) = received_alert(&self.error) {
+            let handshake = find_in_chain::<HandshakeFailed>(&self.error).is_some();
+            let detail = format!("received fatal alert: {alert:?}");
+            let message = if handshake {
+                format!("handshake failed: {detail}")
+            } else {
+                detail
+            };
+            return match crate::tls::alert_code(alert) {
+                Some(code) => OpOutcome::node_failed(code, message),
+                None if handshake => OpOutcome::node_failed("ECONNRESET", message),
+                None => OpOutcome::node_failed("EPROTO", message),
+            };
+        }
+        // The transport closed before the handshake was done: node's
+        // disconnect, with its own message (the JS side adds the options
+        // the request dialled with).
+        if let Some(handshake) = find_in_chain::<HandshakeFailed>(&self.error)
+            && handshake.0.kind() == std::io::ErrorKind::UnexpectedEof
+        {
+            return crate::tls::disconnected_before_secure();
         }
         if let Some(tls) = find_in_chain::<TlsSetupError>(&self.error) {
             return OpOutcome::Failed(tls.to_string());
@@ -537,35 +564,25 @@ fn node_cert_refusal<'a>(
         .map(|refusal| &refusal.0)
 }
 
-/// Whether a handshake in this error's chain was refused with the
-/// `protocol_version` alert. tokio-rustls wraps the `rustls::Error` in an
-/// `io::Error` whose `source()` is the rustls error's own (none), not the
-/// rustls error, so the chain walk cannot see it: each io error on the way
-/// is opened with `get_ref` instead, as `tls::tls_alert_code` opens
-/// tls.connect's.
-fn protocol_version_alert(error: &(dyn std::error::Error + 'static)) -> bool {
-    fn is_alert(e: &(dyn std::error::Error + 'static)) -> bool {
-        matches!(
-            e.downcast_ref::<rustls::Error>(),
-            Some(rustls::Error::AlertReceived(
-                rustls::AlertDescription::ProtocolVersion
-            ))
-        )
-    }
+/// The fatal alert a handshake or a read in this error's chain received, if
+/// one did. tokio-rustls wraps the `rustls::Error` in an `io::Error` whose
+/// `source()` is the rustls error's own (none), not the rustls error, so
+/// the chain walk cannot see it: each io error on the way is opened with
+/// `get_ref` instead (`tls::received_alert`), as tls.connect's is.
+fn received_alert(error: &(dyn std::error::Error + 'static)) -> Option<rustls::AlertDescription> {
     let mut current = Some(error);
     while let Some(e) = current {
-        if is_alert(e) {
-            return true;
+        if let Some(rustls::Error::AlertReceived(alert)) = e.downcast_ref::<rustls::Error>() {
+            return Some(*alert);
         }
         if let Some(io) = e.downcast_ref::<std::io::Error>()
-            && let Some(inner) = io.get_ref()
-            && is_alert(inner)
+            && let Some(alert) = crate::tls::received_alert(io)
         {
-            return true;
+            return Some(alert);
         }
         current = e.source();
     }
-    false
+    None
 }
 
 fn find_in_chain<'a, T: std::error::Error + 'static>(

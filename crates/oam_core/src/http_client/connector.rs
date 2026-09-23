@@ -386,6 +386,27 @@ impl std::fmt::Display for NoProtocolsAvailable {
 
 impl std::error::Error for NoProtocolsAvailable {}
 
+/// The TLS handshake with the server failed: rustls's error, marked as the
+/// handshake's. The request's outcome tells a fatal alert answering the
+/// handshake -- node: `write EPROTO`, the request head being a write queued
+/// behind it -- from one sent after it (node: the alert's own code), and
+/// the transport closing before the handshake was done from a reset after
+/// it (#196).
+#[derive(Debug)]
+pub(crate) struct HandshakeFailed(pub(crate) std::io::Error);
+
+impl std::fmt::Display for HandshakeFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "handshake failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for HandshakeFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 /// Where a transport's TLS configs come from.
 #[derive(Clone)]
 pub enum TlsSource {
@@ -949,7 +970,8 @@ where
 {
     let tls = tokio_rustls::TlsConnector::from(config)
         .connect(name, io)
-        .await?;
+        .await
+        .map_err(|e| Box::new(HandshakeFailed(e)) as BoxError)?;
     let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
     Ok((tls, h2))
 }

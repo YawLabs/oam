@@ -19293,6 +19293,133 @@ process.exit(0);
     assert!(stdout.contains("untrusted=200 "), "stdout: {stdout}");
 }
 
+/// Issue #196: a fatal alert the server sends is named with node's code on
+/// every client, answering the handshake (a raw server sending
+/// `handshake_failure` after the ClientHello: the alert's own code on a
+/// tls.connect socket with nothing queued, `write EPROTO` once a write was
+/// queued behind the handshake -- an https request's head included, on the
+/// agent path and the shared transport alike -- and a description node cannot
+/// name as node's disconnect or that same EPROTO) and after it (a TLS 1.3
+/// server requiring a client certificate, whose `certificate_required`
+/// arrives after 'secureConnect': the alert's own code on tls.connect,
+/// https.request and an http2 stream). The shared transport's post-handshake
+/// alert is not covered: hyper collapses a post-handshake read failure to a
+/// connection-closed, so oam cannot recover the alert there (entry 34).
+/// Every line measured on node v22.22.2; conformance cases 145 and 180 hold
+/// the handshake-time table.
+#[test]
+fn tls_alerts_from_the_server_carry_nodes_codes_on_every_client() {
+    let src = format!(
+        r#"
+import net from 'node:net';
+import tls from 'node:tls';
+import https from 'node:https';
+import http2 from 'node:http2';
+const root = `{root}`;
+const cert = `{cert}`;
+const key = `{key}`;
+setTimeout(() => {{ console.log('TIMEOUT'); process.exit(3); }}, 30000).unref();
+const shape = (e) => e.code + ':' + e.syscall + ':' + (typeof e.errno === 'number' && e.errno < 0 ? 'errno' : 'noerrno') + ':' + Object.keys(e).join(',') + ':' + e.library + ':' + e.reason;
+function rawServer(answer) {{
+  const server = net.createServer((c) => {{ c.on('error', () => {{}}); c.once('data', () => answer(c)); }});
+  return new Promise((r) => server.listen(0, '127.0.0.1', () => r(server)));
+}}
+function tlsClient(label, port, opts, write) {{
+  return new Promise((resolve) => {{
+    const events = [];
+    const s = tls.connect({{ host: '127.0.0.1', port, ...opts }}, () => events.push('secureConnect'));
+    if (write) s.write('x', (e) => events.push('cb=' + (e ? e.code : 'ok')));
+    s.on('error', (e) => events.push(shape(e)));
+    s.on('close', () => {{ console.log(label + '=' + events.join(' ')); resolve(); }});
+  }});
+}}
+function request(label, port, opts) {{
+  return new Promise((resolve) => {{
+    const r = https.request({{ host: '127.0.0.1', port, path: '/', ...opts }}, (res) => {{ res.resume(); res.on('end', () => {{ console.log(label + '=response'); resolve(); }}); }});
+    r.on('error', (e) => {{ console.log(label + '=' + shape(e)); resolve(); }});
+    r.end();
+  }});
+}}
+function shared(label, port) {{
+  return new Promise((resolve) => {{
+    const r = https.get('https://localhost:' + port + '/', (res) => {{ res.resume(); res.on('end', () => {{ console.log(label + '=response'); resolve(); }}); }});
+    r.on('error', (e) => {{ console.log(label + '=' + shape(e)); resolve(); }});
+  }});
+}}
+const alert = (d) => Buffer.from([0x15, 0x03, 0x03, 0x00, 0x02, 0x02, d]);
+let server = await rawServer((c) => c.end(alert(40)));
+let port = server.address().port;
+await tlsClient('noWrite', port, {{ rejectUnauthorized: false }}, false);
+await tlsClient('write', port, {{ rejectUnauthorized: false }}, true);
+await request('request', port, {{ rejectUnauthorized: false }});
+await shared('shared', port);
+await new Promise((r) => server.close(r));
+server = await rawServer((c) => c.end(alert(255)));
+port = server.address().port;
+await tlsClient('unnamedNoWrite', port, {{ rejectUnauthorized: false }}, false);
+await tlsClient('unnamedWrite', port, {{ rejectUnauthorized: false }}, true);
+await new Promise((r) => server.close(r));
+server = await rawServer((c) => c.end());
+port = server.address().port;
+await tlsClient('eof', port, {{ rejectUnauthorized: false }}, false);
+await shared('eofShared', port);
+await new Promise((r) => server.close(r));
+const conns = new Set();
+const strict = tls.createServer({{ cert, key, ca: [root], requestCert: true, rejectUnauthorized: true, minVersion: 'TLSv1.3', ALPNProtocols: ['h2', 'http/1.1'] }}, (c) => {{ conns.add(c); c.on('error', () => {{}}); }});
+strict.on('tlsClientError', () => {{}});
+await new Promise((r) => strict.listen(0, '127.0.0.1', r));
+port = strict.address().port;
+await tlsClient('after', port, {{ ca: root, servername: 'localhost' }}, false);
+await request('afterRequest', port, {{ ca: root, servername: 'localhost' }});
+await new Promise((resolve) => {{
+  const session = http2.connect('https://localhost:' + port, {{ ca: root }});
+  session.on('error', () => {{}});
+  const stream = session.request({{ ':path': '/' }});
+  stream.on('error', (e) => console.log('afterH2=' + shape(e)));
+  stream.on('close', () => {{ session.destroy(); resolve(); }});
+}});
+for (const c of conns) c.destroy();
+await new Promise((r) => strict.close(r));
+process.exit(0);
+"#,
+        root = FETCH_TEST_CA,
+        cert = FETCH_TEST_LEAF,
+        key = FETCH_TEST_LEAF_KEY,
+    );
+    let file = write_temp("tls_alert_codes.mjs", &src);
+    let ca = write_temp("tls_alert_codes_ca.pem", FETCH_TEST_CA);
+    let mut cmd = oam_command(&["run", file.to_str().unwrap(), "--no-check"]);
+    // The shared-transport requests trust the root the same way a fetch can.
+    cmd.env("NODE_EXTRA_CA_CERTS", &ca);
+    let output = bounded_output(&mut cmd);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let alert = "ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE:undefined:noerrno:library,reason,code:SSL routines:ssl/tls alert handshake failure";
+    let eproto = "EPROTO:write:errno:errno,code,syscall:undefined:undefined";
+    let disconnect =
+        "ECONNRESET:undefined:noerrno:code,path,host,port,localAddress:undefined:undefined";
+    let required = "ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED:undefined:noerrno:library,reason,code:SSL routines:tlsv13 alert certificate required";
+    for line in [
+        format!("noWrite={alert}"),
+        format!("write=cb=EPROTO {eproto}"),
+        format!("request={eproto}"),
+        format!("shared={eproto}"),
+        format!("unnamedNoWrite={disconnect}"),
+        format!("unnamedWrite=cb=EPROTO {eproto}"),
+        format!("eof={disconnect}"),
+        format!("eofShared={disconnect}"),
+        format!("after=secureConnect {required}"),
+        format!("afterRequest={required}"),
+        format!("afterH2={required}"),
+    ] {
+        assert!(stdout.contains(&line), "missing {line:?}\nstdout: {stdout}");
+    }
+}
+
 /// `https.get('https://[::1]:PORT/', { rejectUnauthorized: false })` takes the
 /// URL's hostname WITHOUT its brackets, as node's urlToHttpOptions does. oam
 /// kept them: the connect then failed everywhere with `invalid server name
