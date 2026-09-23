@@ -189,8 +189,9 @@ const clientCert = { cert: CLIENT_CERT, key: CLIENT_KEY };
       const session = http2.connect(`https://127.0.0.1:${port}`, { servername: "localhost", ca: [CA], ...extra });
       session.on("connect", () => out.push("connect alpn=" + session.alpnProtocol + " encrypted=" + session.encrypted +
         " server=" + cn(session.socket.getPeerCertificate())));
-      // Not recorded: after the server's alert oam's session emits 'error'
-      // and 'close', node's neither (docs/node-divergences.md entry 44).
+      // After the server's alert the session stays silent on both runtimes
+      // (#197); this listener would only fire on the older oam. The pending
+      // stream carries the alert (docs/node-divergences.md entry 44).
       session.on("error", () => {});
       const stream = session.request({ ":path": "/over-h2" });
       stream.setEncoding("utf8");

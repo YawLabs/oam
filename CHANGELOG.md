@@ -18,6 +18,17 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **An `http2.connect` session ended by a server's fatal TLS alert emitted `'error'` and
+  `'close'`, crashing a program that had no session `'error'` listener** (#197). A TLS 1.3
+  server that requires a client certificate answers a client that sent none with a fatal
+  `certificate_required` alert after the handshake; Node carries it on the pending stream
+  (`ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED`, #196) and destroys the session silently, so
+  a program written for Node -- handling the request's error, with no reason to listen on
+  the session -- survives. oam re-surfaced the alert on the session as an unhandled
+  `'error'`, taking the process down. It now leaves the session silent, as Node does, while
+  a connection-level failure -- a refused connection, a reset or EOF during the handshake --
+  still reaches the session. Conformance case 181 and an e2e test pin it; measured on node
+  v22.22.2.
 - **A pinned TLS 1.2 handshake between two oam peers negotiated
   `ECDHE-RSA-AES256-GCM-SHA384`, where two node peers negotiate
   `ECDHE-RSA-AES128-GCM-SHA256`; a server's `honorCipherOrder` was ignored;
