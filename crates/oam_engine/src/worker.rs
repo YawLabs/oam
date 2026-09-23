@@ -21,8 +21,10 @@ impl super::JsRuntime {
         // An ESM entry has to go through the module graph. load_cjs compiles
         // it as a classic script, so `new Worker('x.mjs')` threw on its first
         // import statement -- the ESM guard lives in the require() callback,
-        // which an entry never passes through.
-        if oam_loader::module_kind(entry) == oam_loader::ModuleKind::Esm {
+        // which an entry never passes through. Asked of the file's real path,
+        // as the CLI routes a program's entry (entry_module_kind in oam_cli).
+        let real = crate::modules::module_key(entry).unwrap_or_else(|_| entry.to_path_buf());
+        if oam_loader::module_kind(&real) == oam_loader::ModuleKind::Esm {
             let host = crate::worker_host().ok_or_else(|| {
                 vec![Diagnostic::new(
                     "OAM-MOD0003",
@@ -40,6 +42,12 @@ impl super::JsRuntime {
         }
         self.reset_run_slots()?;
         self.isolate.set_slot(ctx);
+        // A worker's CommonJS entry is the main module of its thread, as in
+        // node, which runs the `require.main === module` guard there. The
+        // same path runs the scripts of oam.fork()'s in-process pool.
+        // (child_process.fork() is not this path: it starts a separate
+        // `oam run` process, whose entry execute_cjs names.)
+        crate::cjs::name_main_entry(&mut self.isolate, entry);
 
         v8::scope_with_context!(let scope, &mut self.isolate, &self.context);
         v8::tc_scope!(let tc, scope);

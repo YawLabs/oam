@@ -781,6 +781,26 @@ every other compilerOption the loader reads. A dependency's own `tsconfig.json` 
 `node_modules` is never consulted -- neither for JSX settings nor for `paths` -- because
 neither Node nor tsc applies it to the package's published files.
 
+### 45. A CommonJS `module` has no `children` or `parent`, and the main module's `id` is its filename
+
+A CommonJS module object in oam carries `exports`, `filename`, `id`, `loaded`, `path`,
+`paths` and a non-enumerable `require`. `require.main` and `process.mainModule` are the
+entry's module object, as in Node, so `if (require.main === module)` and
+`require.main.require(...)` behave the same in both runtimes. Three members Node sets are
+missing or different:
+
+```js
+// entry.cjs
+module.id === '.'          // Node: true.   oam: false -- id is the filename.
+module.parent              // Node: null here, the requiring module elsewhere.  oam: undefined.
+module.children            // Node: the modules this one required.               oam: undefined.
+```
+
+So the older main-module idioms `if (module.id === '.')` and `if (!module.parent)` do not
+work in oam: the first never runs, and the second runs in every module. Use
+`require.main === module`, which Node's documentation recommends. `module.parent` is
+deprecated in Node (DEP0144).
+
 ---
 
 ### 16. GET/HEAD body writes are dropped, not sent unframed

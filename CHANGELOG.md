@@ -16,6 +16,30 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`require.main` was never set, so `if (require.main === module)` never ran.** A CommonJS
+  script uses that guard to tell being run from being required, and in oam it was always
+  false: the script loaded, did nothing and exited 0. A hook script whose job is to refuse a
+  command answered with silence, which the harness running it reads as consent.
+  `require.main` is now the entry's `module` in the entry and in everything it requires, and
+  `process.mainModule` is the same object -- for a program's CommonJS entry, a worker's, a
+  `child_process.fork()` script, each file `oam test` runs and a compiled executable's
+  embedded script. Like node, each new `require` takes `require.main` from
+  `process.mainModule`, and the main module stays set when the entry throws. `-e` and `-p`
+  source and an ES module entry have no main module, as in node, and `require.main` is
+  `undefined` there.
+- **A CommonJS entry named by a relative path could run as an ES module entry.** The
+  package.json `"type"` lookup started from the path as typed, so `oam gate.js` run from a
+  subdirectory of a `"type": "commonjs"` package never found that package.json. The file still
+  ran as CommonJS, but without a main module, so the guard above stayed false. An entry's kind
+  is now decided on its real path, as node resolves its main entry -- for `oam <file>`,
+  `oam run`, `oam test` and a worker's entry.
+- **A CommonJS `module` now has node's `require`, `path` and `paths`.** Code that loads
+  relative to the application's entry with `require.main.require(...)`, or reads
+  `require.main.paths`, threw a TypeError once `require.main` was set. `children`, `parent`
+  and the main module's `id` of `'.'` still differ; see docs/node-divergences.md, entry 45.
+
 ## [0.16.4] - 2026-09-21
 
 The events a server announces a connection with. `'connection'` and
