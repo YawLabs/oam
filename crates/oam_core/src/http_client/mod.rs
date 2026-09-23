@@ -53,6 +53,7 @@ pub mod send;
 pub mod tls_config;
 pub mod transport;
 
+pub use tls_config::TlsRange;
 pub use transport::{HttpTransport, ProxySource, Route, SendError, TlsSource, TransportOptions};
 
 /// A host a fetch is about to connect to, as [`NetCheck`] sees it.

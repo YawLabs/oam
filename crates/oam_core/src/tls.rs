@@ -1011,13 +1011,55 @@ fn check_server_identity(server_name: &ServerName<'_>, der: &[u8]) -> Result<(),
     }
 }
 
+// ----------------------------------------------------------- crypto provider
+
+/// The cipher suites oam offers and accepts, in Node's order of preference.
+///
+/// rustls's ring provider lists its suites AES-256 first under both protocol
+/// versions. Node's OpenSSL runs on `tls.DEFAULT_CIPHERS`, which
+/// `openssl ciphers -v` expands to TLS 1.3's `TLS_AES_256_GCM_SHA384`,
+/// `TLS_CHACHA20_POLY1305_SHA256`, `TLS_AES_128_GCM_SHA256` and, for TLS 1.2,
+/// the ECDHE AES-128-GCM suites before the AES-256-GCM ones, with CHACHA20
+/// last (from the list's `HIGH` tail). The order is what a client offers
+/// and -- under `honorCipherOrder`, a server's default -- what a server
+/// picks by, so it decides what `getCipher()` reports on a pinned TLS 1.2
+/// handshake between two oam peers: `ECDHE-RSA-AES128-GCM-SHA256`, as
+/// between two Node peers (measured on v22.22.2; rustls's own order gave
+/// `ECDHE-RSA-AES256-GCM-SHA384`, #144). The set is ring's whole set,
+/// nothing dropped or added. Every client and server config in this crate
+/// is built on this provider by name, so the process-wide default --
+/// installed by `CoreRuntime::new`, or by `oam install`'s own client,
+/// whichever runs first -- never decides an order.
+pub fn node_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    static PROVIDER: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
+    Arc::clone(PROVIDER.get_or_init(|| Arc::new(node_crypto_provider_value())))
+}
+
+/// `node_crypto_provider` by value, as `CryptoProvider::install_default`
+/// takes it.
+pub fn node_crypto_provider_value() -> rustls::crypto::CryptoProvider {
+    use rustls::crypto::ring::cipher_suite as ring;
+    rustls::crypto::CryptoProvider {
+        cipher_suites: vec![
+            // TLS 1.3: tls.DEFAULT_CIPHERS' first three entries.
+            ring::TLS13_AES_256_GCM_SHA384,
+            ring::TLS13_CHACHA20_POLY1305_SHA256,
+            ring::TLS13_AES_128_GCM_SHA256,
+            // TLS 1.2: the list's ECDHE AES-GCM entries in its order, then
+            // the CHACHA20 pair as `HIGH` orders it.
+            ring::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            ring::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            ring::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            ring::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            ring::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            ring::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        ],
+        ..rustls::crypto::ring::default_provider()
+    }
+}
+
 // ------------------------------------------------------------- client config
 
-/// Build a rustls ClientConfig from optional PEM-encoded CA certs. Trust is
-/// the `ca` option alone when given, else the Mozilla root store plus the
-/// NODE_EXTRA_CA_CERTS bundle -- `ca` replaces the extras rather than
-/// adding to them, as in Node (measured). The returned slot is where the
-/// verifier leaves its verdict.
 /// A rank for the four TLS version names Node accepts, low to high. The JS
 /// layer validates the strings (an unknown one throws
 /// `ERR_TLS_INVALID_PROTOCOL_VERSION` before the op is spawned) and resolves
@@ -1069,6 +1111,11 @@ pub(crate) fn protocol_versions(
     Ok(versions)
 }
 
+/// Build a rustls ClientConfig from optional PEM-encoded CA certs. Trust is
+/// the `ca` option alone when given, else the Mozilla root store plus the
+/// NODE_EXTRA_CA_CERTS bundle -- `ca` replaces the extras rather than
+/// adding to them, as in Node (measured). The returned slot is where the
+/// verifier leaves its verdict.
 fn build_client_config(
     ca_pem: Option<&str>,
     identity: Option<&ClientContext>,
@@ -1114,19 +1161,26 @@ fn build_client_config(
         .cloned()
         .collect();
 
+    // Every piece of this config -- the chain verifier included -- is built
+    // on the one provider, never on the process-wide default (which `oam
+    // install`'s own client may have installed first).
+    let provider = node_crypto_provider();
     let inner = if root_store.is_empty() {
         None
     } else {
         Some(
-            rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
-                .build()
-                .map_err(|e| format!("tls verifier: {e}"))?,
+            rustls::client::WebPkiServerVerifier::builder_with_provider(
+                Arc::new(root_store),
+                Arc::clone(&provider),
+            )
+            .build()
+            .map_err(|e| format!("tls verifier: {e}"))?,
         )
     };
     let outcome: VerifySlot = Arc::new(Mutex::new(None));
     let verifier = Arc::new(NodeCertVerifier {
         inner,
-        supported: rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        supported: provider.signature_verification_algorithms,
         trusted_leaves,
         trusted_non_anchors,
         untrusted_known,
@@ -1134,7 +1188,12 @@ fn build_client_config(
         check_name,
         outcome: outcome.clone(),
     });
-    let builder = rustls::ClientConfig::builder_with_protocol_versions(versions)
+    // The suites go out in Node's order (`node_crypto_provider`); the
+    // versions were narrowed by `protocol_versions`, which never leaves a
+    // set no suite serves, so the builder's refusal cannot happen here.
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(versions)
+        .map_err(|e| format!("tls client config: {e}"))?
         .dangerous()
         .with_custom_certificate_verifier(verifier);
 
@@ -2166,6 +2225,58 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         protocol_versions(min, max).map(|v| v.iter().map(|p| p.version).collect())
     }
 
+    /// The provider is ring's whole suite set in Node's preference order:
+    /// `tls.DEFAULT_CIPHERS` as `openssl ciphers -v` expands it, narrowed to
+    /// what rustls implements (v22.22.2 / OpenSSL 3.5). The order decides
+    /// what `getCipher()` reports on a pinned 1.2 handshake between two oam
+    /// peers: rustls's own order put AES-256 first, Node's puts AES-128
+    /// first, and a client offering rustls's order against a server picking
+    /// by Node's (conformance case 178) would show the difference.
+    #[test]
+    fn node_crypto_provider_orders_ring_suites_as_node_does() {
+        use rustls::CipherSuite as C;
+        let provider = node_crypto_provider();
+        let ids: Vec<C> = provider.cipher_suites.iter().map(|s| s.suite()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                C::TLS13_AES_256_GCM_SHA384,
+                C::TLS13_CHACHA20_POLY1305_SHA256,
+                C::TLS13_AES_128_GCM_SHA256,
+                C::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                C::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                C::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                C::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                C::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                C::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            ]
+        );
+        // Nothing ring offers is dropped, and nothing is listed twice: the
+        // same set, only reordered.
+        let mut ring: Vec<u16> = rustls::crypto::ring::ALL_CIPHER_SUITES
+            .iter()
+            .map(|s| u16::from(s.suite()))
+            .collect();
+        let mut ours: Vec<u16> = ids.iter().map(|c| u16::from(*c)).collect();
+        ring.sort_unstable();
+        ours.sort_unstable();
+        assert_eq!(ours, ring);
+        // Everything else -- key exchange groups, signature algorithms -- is
+        // ring's own, in ring's order.
+        let ring_default = rustls::crypto::ring::default_provider();
+        let groups = |p: &rustls::crypto::CryptoProvider| {
+            p.kx_groups.iter().map(|g| g.name()).collect::<Vec<_>>()
+        };
+        assert_eq!(groups(&provider), groups(&ring_default));
+        // The one handed out by reference and the one built by value agree.
+        let by_value: Vec<C> = node_crypto_provider_value()
+            .cipher_suites
+            .iter()
+            .map(|s| s.suite())
+            .collect();
+        assert_eq!(by_value, ids);
+    }
+
     #[test]
     fn tls_version_rank_maps_only_nodes_four_names() {
         assert_eq!(tls_version_rank("TLSv1"), Some(1));
@@ -2791,8 +2902,9 @@ mod node_names {
     // A TLS 1.2 handshake (a Node server pinned with maxVersion) reports
     // OpenSSL's name next to the IANA standardName -- probed:
     // ECDHE-RSA-AES128-GCM-SHA256 / TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256.
-    // oam's tls has no minVersion/maxVersion to pin 1.2 from JS, so the six
-    // 1.2 suites are covered here rather than end to end.
+    // A pinned 1.2 handshake reaches one of them end to end (conformance
+    // case 178 holds the negotiated name to Node's); the other five are
+    // covered here.
     #[test]
     fn tls12_suites_carry_openssl_and_iana_names() {
         for (suite, name, standard) in [

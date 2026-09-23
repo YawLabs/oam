@@ -279,18 +279,22 @@ fn main() -> ExitCode {
         let argv: Vec<String> = std::env::args().collect();
         let raw: Vec<String> = argv.clone();
         let mut i = 1;
-        let mut flags = NodeFlags::default();
-        // NODE_OPTIONS, folded in BEFORE argv so an explicit command-line
-        // flag still wins. Node gates it behind an allowlist and so does
-        // this: it is a strict allowlist of process-level toggles, it never
-        // touches `raw`/`i` (so no environment token can reach clap and
+        // NODE_OPTIONS, read into flags of its own and merged UNDER argv's
+        // once argv is parsed (`NodeFlags::merged`): an explicit
+        // command-line flag wins, and process.execArgv reflects argv alone,
+        // as node's does. Node gates the variable behind an allowlist and so
+        // does this: it is a strict allowlist of process-level toggles, it
+        // never touches `raw`/`i` (so no environment token can reach clap and
         // brick a subcommand), and it deliberately excludes everything that
         // executes code or names a file -- `-e`/`--eval`/`-p`/`--input-type`/
         // `--env-file`/`--permission`. An unrecognized token is ignored
         // rather than fatal, because NODE_OPTIONS is usually set globally in
         // a shell profile and may legitimately carry flags oam has no
         // opinion on.
-        let from_env = apply_node_options_env(&mut flags);
+        let mut env_flags = NodeFlags::default();
+        let from_env = apply_node_options_env(&mut env_flags);
+        // What argv gives, alone, until the merge below.
+        let mut flags = NodeFlags::default();
         // Node accepts eval flags in any order and in several spellings:
         // `-e code`, `--eval code`, `--eval=code`, `-p code`, `-pe code`
         // (bundled: print + eval), and `-p -e code`. print and eval compose;
@@ -417,6 +421,24 @@ fn main() -> ExitCode {
                 i += 1;
             } else if arg == "--zero-fill-buffers" {
                 flags.zero_fill_buffers = true;
+                i += 1;
+            } else if arg == "--tls-min-v1.0" {
+                flags.tls_min_v1_0 = true;
+                i += 1;
+            } else if arg == "--tls-min-v1.1" {
+                flags.tls_min_v1_1 = true;
+                i += 1;
+            } else if arg == "--tls-min-v1.2" {
+                flags.tls_min_v1_2 = true;
+                i += 1;
+            } else if arg == "--tls-min-v1.3" {
+                flags.tls_min_v1_3 = true;
+                i += 1;
+            } else if arg == "--tls-max-v1.2" {
+                flags.tls_max_v1_2 = true;
+                i += 1;
+            } else if arg == "--tls-max-v1.3" {
+                flags.tls_max_v1_3 = true;
                 i += 1;
             } else if let Some(v) = arg.strip_prefix("--max-http-header-size=") {
                 if v.is_empty() {
@@ -553,6 +575,9 @@ fn main() -> ExitCode {
                 break;
             }
         }
+        // Everything from here on runs with both sources: NODE_OPTIONS under
+        // argv, argv kept aside for execArgv.
+        let flags = env_flags.merged(flags);
         // V8 flags must be set before V8::initialize, i.e. before any
         // JsRuntime is constructed.
         // The loader decides whether `internal/...` resolves, and it reads
@@ -590,6 +615,17 @@ fn main() -> ExitCode {
             if !v8_flags.is_empty() {
                 oam_engine::init_platform_with_flags(&v8_flags);
             }
+        }
+        // node (src/node_options.cc, EnvironmentOptions::CheckOptions): the
+        // one pair of --tls-* flags it refuses, a floor of 1.3 over a ceiling
+        // of 1.2 -- from argv or NODE_OPTIONS alike, whatever else was given
+        // -- exit 9 before anything runs, node's line after argv[0] as it was
+        // given (`node: ...` from a shell, the path when spawned by one;
+        // src/node.cc prints args.at(0); measured on v22.22.2).
+        if flags.tls_min_v1_3 && flags.tls_max_v1_2 {
+            let exe = argv.first().map(String::as_str).unwrap_or("oam");
+            eprintln!("{exe}: either --tls-min-v1.3 or --tls-max-v1.2 can be used, not both");
+            return ExitCode::from(9);
         }
         if let Some(source) = eval_source {
             return run_eval(&source, print, &raw[i..], &flags);
@@ -1788,6 +1824,18 @@ fn apply_node_options_env(flags: &mut NodeFlags) -> bool {
             flags.no_deprecation = true;
         } else if tok == "--expose-gc" {
             flags.expose_gc = true;
+        } else if tok == "--tls-min-v1.0" {
+            flags.tls_min_v1_0 = true;
+        } else if tok == "--tls-min-v1.1" {
+            flags.tls_min_v1_1 = true;
+        } else if tok == "--tls-min-v1.2" {
+            flags.tls_min_v1_2 = true;
+        } else if tok == "--tls-min-v1.3" {
+            flags.tls_min_v1_3 = true;
+        } else if tok == "--tls-max-v1.2" {
+            flags.tls_max_v1_2 = true;
+        } else if tok == "--tls-max-v1.3" {
+            flags.tls_max_v1_3 = true;
         } else if let Some(v) = tok.strip_prefix("--disable-warning=") {
             flags.disabled_warnings.push(v.to_string());
         } else if tok == "--disable-warning"
@@ -2525,9 +2573,103 @@ struct NodeFlags {
     max_http_header_size_spaced: bool,
     /// `--insecure-http-parser`.
     insecure_http_parser: bool,
+    /// `--tls-min-v1.0` / `--tls-min-v1.1` / `--tls-min-v1.2` /
+    /// `--tls-min-v1.3` and `--tls-max-v1.2` / `--tls-max-v1.3`: the initial
+    /// `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION`, so the default
+    /// version range of every TLS connection and server. Each is kept as
+    /// given -- execArgv hands every one back -- and node's precedence when
+    /// several are set is applied by `tls_default_versions`.
+    tls_min_v1_0: bool,
+    tls_min_v1_1: bool,
+    tls_min_v1_2: bool,
+    tls_min_v1_3: bool,
+    tls_max_v1_2: bool,
+    tls_max_v1_3: bool,
+    /// The flags argv gave, kept apart from NODE_OPTIONS's once the two are
+    /// merged (`merged`): what `process.execArgv` reflects, node listing
+    /// only argv there. None on a set that was never merged.
+    argv: Option<Box<NodeFlags>>,
 }
 
 impl NodeFlags {
+    /// NODE_OPTIONS's flags (`self`) under argv's: a value argv gave wins,
+    /// a toggle either gave is on, a list holds the environment's entries
+    /// then argv's (node applies NODE_OPTIONS first, so a later `--env-file`
+    /// on the command line still wins), and `argv` is kept for execArgv.
+    fn merged(self, argv: NodeFlags) -> NodeFlags {
+        let env = self;
+        let (max_http_header_size, max_http_header_size_spaced) =
+            if argv.max_http_header_size.is_some() {
+                (
+                    argv.max_http_header_size.clone(),
+                    argv.max_http_header_size_spaced,
+                )
+            } else {
+                (env.max_http_header_size, env.max_http_header_size_spaced)
+            };
+        NodeFlags {
+            pending_deprecation: env.pending_deprecation || argv.pending_deprecation,
+            expose_gc: env.expose_gc || argv.expose_gc,
+            permission: env.permission || argv.permission,
+            allow_fs_read: argv.allow_fs_read.clone().or(env.allow_fs_read),
+            allow_fs_write: argv.allow_fs_write.clone().or(env.allow_fs_write),
+            allow_net: argv.allow_net.clone().or(env.allow_net),
+            allow_env: argv.allow_env.clone().or(env.allow_env),
+            allow_child_process: env.allow_child_process || argv.allow_child_process,
+            allow_worker: env.allow_worker || argv.allow_worker,
+            allow_addons: env.allow_addons || argv.allow_addons,
+            env_files: [env.env_files, argv.env_files.clone()].concat(),
+            input_type: argv.input_type.clone().or(env.input_type),
+            no_warnings: env.no_warnings || argv.no_warnings,
+            no_deprecation: env.no_deprecation || argv.no_deprecation,
+            disabled_warnings: [env.disabled_warnings, argv.disabled_warnings.clone()].concat(),
+            redirect_warnings: argv.redirect_warnings.clone().or(env.redirect_warnings),
+            allow_natives_syntax: env.allow_natives_syntax || argv.allow_natives_syntax,
+            js_float16array: env.js_float16array || argv.js_float16array,
+            zero_fill_buffers: env.zero_fill_buffers || argv.zero_fill_buffers,
+            title: argv.title.clone().or(env.title),
+            expose_internals: env.expose_internals || argv.expose_internals,
+            experimental_vm_modules: env.experimental_vm_modules || argv.experimental_vm_modules,
+            max_http_header_size,
+            max_http_header_size_spaced,
+            insecure_http_parser: env.insecure_http_parser || argv.insecure_http_parser,
+            tls_min_v1_0: env.tls_min_v1_0 || argv.tls_min_v1_0,
+            tls_min_v1_1: env.tls_min_v1_1 || argv.tls_min_v1_1,
+            tls_min_v1_2: env.tls_min_v1_2 || argv.tls_min_v1_2,
+            tls_min_v1_3: env.tls_min_v1_3 || argv.tls_min_v1_3,
+            tls_max_v1_2: env.tls_max_v1_2 || argv.tls_max_v1_2,
+            tls_max_v1_3: env.tls_max_v1_3 || argv.tls_max_v1_3,
+            argv: Some(Box::new(argv)),
+        }
+    }
+
+    /// The initial `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION` the
+    /// flags ask for, in node's precedence (lib/tls.js: the first of
+    /// --tls-min-v1.0, v1.1, v1.2, v1.3 that is set names the minimum, and
+    /// --tls-max-v1.3 beats --tls-max-v1.2, from argv and NODE_OPTIONS
+    /// together), or None for node's own default.
+    fn tls_default_versions(&self) -> (Option<&'static str>, Option<&'static str>) {
+        let min = if self.tls_min_v1_0 {
+            Some("TLSv1")
+        } else if self.tls_min_v1_1 {
+            Some("TLSv1.1")
+        } else if self.tls_min_v1_2 {
+            Some("TLSv1.2")
+        } else if self.tls_min_v1_3 {
+            Some("TLSv1.3")
+        } else {
+            None
+        };
+        let max = if self.tls_max_v1_3 {
+            Some("TLSv1.3")
+        } else if self.tls_max_v1_2 {
+            Some("TLSv1.2")
+        } else {
+            None
+        };
+        (min, max)
+    }
+
     /// Publish `--max-http-header-size` / `--insecure-http-parser` to the
     /// process-wide state oam_core reads (they are not per-runtime: workers
     /// share them, as in node).
@@ -2572,6 +2714,16 @@ impl NodeFlags {
         }
         if self.zero_fill_buffers {
             js.push_str(&def("__oamZeroFillBuffers", "true".into()));
+        }
+        // node:tls reads these as the initial DEFAULT_MIN_VERSION /
+        // DEFAULT_MAX_VERSION (the names are node's own four, so quoting
+        // them is all the escaping they need).
+        let (tls_min, tls_max) = self.tls_default_versions();
+        if let Some(v) = tls_min {
+            js.push_str(&def("__oamTlsMinVersion", format!("\"{v}\"")));
+        }
+        if let Some(v) = tls_max {
+            js.push_str(&def("__oamTlsMaxVersion", format!("\"{v}\"")));
         }
         if let Some(title) = &self.title {
             let t = serde_json::to_string(title).unwrap_or_else(|_| "\"\"".into());
@@ -2648,9 +2800,13 @@ impl NodeFlags {
         })
     }
 
-    /// The subset node reflects in process.execArgv (NODE_OPTIONS tokens are
-    /// excluded there, so callers pass only argv-sourced flags).
+    /// The subset node reflects in process.execArgv: the flags argv gave,
+    /// never NODE_OPTIONS's (a merged set answers for its `argv` half; one
+    /// never merged answers for itself).
     fn exec_argv(&self) -> Vec<String> {
+        if let Some(argv) = &self.argv {
+            return argv.exec_argv();
+        }
         let mut out = Vec::new();
         if self.pending_deprecation {
             out.push("--pending-deprecation".into());
@@ -2718,6 +2874,18 @@ impl NodeFlags {
         }
         if self.insecure_http_parser {
             out.push("--insecure-http-parser".into());
+        }
+        for (set, flag) in [
+            (self.tls_min_v1_0, "--tls-min-v1.0"),
+            (self.tls_min_v1_1, "--tls-min-v1.1"),
+            (self.tls_min_v1_2, "--tls-min-v1.2"),
+            (self.tls_min_v1_3, "--tls-min-v1.3"),
+            (self.tls_max_v1_2, "--tls-max-v1.2"),
+            (self.tls_max_v1_3, "--tls-max-v1.3"),
+        ] {
+            if set {
+                out.push(flag.into());
+            }
         }
         out
     }
@@ -3558,6 +3726,125 @@ mod tests {
             ..Default::default()
         };
         assert!(listed.exec_argv().contains(&"--allow-net=a,b".to_string()));
+    }
+
+    #[test]
+    fn tls_default_versions_follow_nodes_precedence() {
+        let none = super::NodeFlags::default();
+        assert_eq!(none.tls_default_versions(), (None, None));
+        // lib/tls.js checks v1.0, v1.1, v1.2, v1.3 in that order for the
+        // minimum, and v1.3 before v1.2 for the maximum (measured on
+        // v22.22.2: `--tls-min-v1.3 --tls-min-v1.0` is TLSv1 and
+        // `--tls-max-v1.2 --tls-max-v1.3` is TLSv1.3, from argv and
+        // NODE_OPTIONS alike, whichever came first).
+        let several = super::NodeFlags {
+            tls_min_v1_0: true,
+            tls_min_v1_3: true,
+            tls_max_v1_2: true,
+            tls_max_v1_3: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            several.tls_default_versions(),
+            (Some("TLSv1"), Some("TLSv1.3"))
+        );
+        let one_each = super::NodeFlags {
+            tls_min_v1_3: true,
+            tls_max_v1_2: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            one_each.tls_default_versions(),
+            (Some("TLSv1.3"), Some("TLSv1.2"))
+        );
+        let middle = super::NodeFlags {
+            tls_min_v1_1: true,
+            tls_min_v1_2: true,
+            ..Default::default()
+        };
+        assert_eq!(middle.tls_default_versions(), (Some("TLSv1.1"), None));
+        // Every flag given comes back through execArgv, as node hands them
+        // back, and none that was not.
+        let argv = several.exec_argv();
+        for flag in [
+            "--tls-min-v1.0",
+            "--tls-min-v1.3",
+            "--tls-max-v1.2",
+            "--tls-max-v1.3",
+        ] {
+            assert!(argv.contains(&flag.to_string()), "{argv:?}");
+        }
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a == "--tls-min-v1.1" || a == "--tls-min-v1.2"),
+            "{argv:?}"
+        );
+        assert!(none.exec_argv().iter().all(|a| !a.starts_with("--tls-")));
+    }
+
+    #[test]
+    fn merged_folds_node_options_under_argv_and_reflects_argv_alone() {
+        let env = super::NodeFlags {
+            no_warnings: true,
+            tls_max_v1_2: true,
+            max_http_header_size: Some("1000".into()),
+            max_http_header_size_spaced: true,
+            title: Some("from-env".into()),
+            disabled_warnings: vec!["EnvWarning".into()],
+            env_files: vec![("env.env".into(), true)],
+            ..Default::default()
+        };
+        let argv = super::NodeFlags {
+            expose_gc: true,
+            tls_max_v1_3: true,
+            max_http_header_size: Some("2000".into()),
+            max_http_header_size_spaced: false,
+            disabled_warnings: vec!["ArgvWarning".into()],
+            env_files: vec![("argv.env".into(), false)],
+            ..Default::default()
+        };
+        let merged = env.merged(argv);
+        // Toggles from either source are on; a value argv gave wins as a
+        // pair; a value only the environment gave stands; lists apply the
+        // environment's entries first.
+        assert!(merged.no_warnings && merged.expose_gc);
+        assert!(merged.tls_max_v1_2 && merged.tls_max_v1_3);
+        assert_eq!(merged.max_http_header_size.as_deref(), Some("2000"));
+        assert!(!merged.max_http_header_size_spaced);
+        assert_eq!(merged.title.as_deref(), Some("from-env"));
+        assert_eq!(merged.disabled_warnings, vec!["EnvWarning", "ArgvWarning"]);
+        assert_eq!(
+            merged.env_files,
+            vec![
+                ("env.env".to_string(), true),
+                ("argv.env".to_string(), false)
+            ]
+        );
+        // execArgv is argv's alone: node never lists NODE_OPTIONS there.
+        let reflected = merged.exec_argv();
+        assert_eq!(
+            reflected,
+            vec![
+                "--expose-gc",
+                "--disable-warning=ArgvWarning",
+                "--max-http-header-size=2000",
+                "--tls-max-v1.3",
+            ]
+        );
+        // An environment-only set reflects nothing; argv-only, everything.
+        let env_only = super::NodeFlags {
+            no_warnings: true,
+            ..Default::default()
+        }
+        .merged(super::NodeFlags::default());
+        assert!(env_only.no_warnings);
+        assert!(env_only.exec_argv().is_empty());
+        let argv_only = super::NodeFlags::default().merged(super::NodeFlags {
+            no_warnings: true,
+            ..Default::default()
+        });
+        assert_eq!(argv_only.exec_argv(), vec!["--no-warnings"]);
     }
 }
 

@@ -1052,6 +1052,24 @@
     return 250;
   }
 
+  // node's undici (and its https.Agent) connect with tls.connect, whose
+  // SecureContext reads the LIVE tls.DEFAULT_MIN_VERSION / DEFAULT_MAX_VERSION
+  // for every connection: `tls.DEFAULT_MAX_VERSION = 'TLSv1.2'` or
+  // `--tls-max-v1.2` caps fetch and an option-less https.get too (measured on
+  // v22.22.2). The loaded module's resolver gives the effective names,
+  // validated exactly as tls.connect validates them (a default that is not a
+  // version throws ERR_TLS_INVALID_PROTOCOL_VERSION); with node:tls never
+  // loaded nobody could have reassigned them, so the initial values -- what
+  // the --tls-* flags set -- stand. "" is a side with no bound of its own.
+  function tlsDefaultVersions() {
+    const resolve = globalThis.__oamNode?._resolveTlsVersions;
+    if (typeof resolve === "function") return resolve({});
+    return {
+      min: globalThis.__oamTlsMinVersion || "",
+      max: globalThis.__oamTlsMaxVersion || "",
+    };
+  }
+
   // The `hints` node's net.connect hands a connect.lookup hook
   // (lib/net.js lookupAndConnect): 0 on Windows, dns.ADDRCONFIG -- the
   // platform's AI_ADDRCONFIG -- elsewhere. Measured: node v22.22.2 passes
@@ -1502,6 +1520,22 @@
       // undici's Fetch-spec bad-port block on the initial URL.
       fetch_semantics: fetchSemantics,
     };
+    // An https URL handshakes under node's live TLS defaults
+    // (tlsDefaultVersions). A default that is not a version fails a fetch as
+    // undici's tls.connect fails it -- `fetch failed` with that error as the
+    // cause; http.request's entry has already thrown it synchronously, and
+    // undici.request rejects with it as given.
+    if (/^https:/i.test(rawUrl)) {
+      let versions;
+      try {
+        versions = tlsDefaultVersions();
+      } catch (e) {
+        if (fetchSemantics) throw new TypeError("fetch failed", { cause: e });
+        throw e;
+      }
+      request.tls_min_version = versions.min;
+      request.tls_max_version = versions.max;
+    }
     // http.request (through the internal entry only) gets a 3xx as the
     // response, as node's does: node's http client never follows a
     // redirect, and an application that vets a URL before requesting it

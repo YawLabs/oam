@@ -300,7 +300,11 @@ async fn chain_hung(transport: HttpTransport, route: Arc<Route>, uri: String) ->
 async fn a_request_racing_a_closing_pooled_connection_settles() {
     let port = answer_then_fin();
     let transport = transport(ProxySource::None);
-    let route = Arc::new(transport.route(false, Duration::from_millis(250)));
+    let route = Arc::new(transport.route(
+        false,
+        Duration::from_millis(250),
+        oam_core::http_client::TlsRange::Both,
+    ));
     let uri = format!("http://127.0.0.1:{port}/");
     let started = Instant::now();
 
