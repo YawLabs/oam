@@ -1072,7 +1072,9 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
 - **`minVersion` / `maxVersion` / `secureProtocol` are honoured** by `tls.connect`,
   `tls.createServer`, `https.createServer` and `https.request` (#144) -- which sends a
   request carrying any of them, or `ca`, a client certificate, `servername`,
-  `checkServerIdentity` or `rejectUnauthorized: false`, over `tls.connect` (entry 43) --
+  `checkServerIdentity`, a `secureContext` or `rejectUnauthorized: false`, in its own
+  options or its agent's (`https.globalAgent.options` included), over `tls.connect` (entry
+  43; #146, `conformance/cases/179-https-request-tls-options.mjs`) --
   with Node's synchronous `TypeError`s and its asynchronous codes
   (`ERR_SSL_NO_PROTOCOLS_AVAILABLE`, `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`), pinned by
   `conformance/cases/109-tls-protocol-version.mjs`. `tls.connect` calls a
@@ -1096,11 +1098,16 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   AES-256 first (`ECDHE-RSA-AES256-GCM-SHA384`), `honorCipherOrder` was ignored, the
   defaults were inert constants, the flags were rejected as unknown arguments, and the
   shared transport was built once with every version. What still differs:
-  - An **`https` request whose handshake the server refuses with the `protocol_version`
-    alert fails with `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`**, the code `tls.connect`
-    reports; Node's fails with `write EPROTO`, its request head having been queued on the
-    socket before the alert came (a `fetch`'s cause names the alert on both). An empty
-    range fails with `ERR_SSL_NO_PROTOCOLS_AVAILABLE` on both.
+  - The **`write EPROTO` a refused handshake turns into** carries rustls's text (`write
+    EPROTO received fatal alert: ProtocolVersion`) where Node's carries OpenSSL's. The shape
+    is Node's: a server answering the ClientHello with the `protocol_version` alert fails a
+    socket that had nothing queued with `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`, and one
+    with a write queued behind the handshake -- `tls.connect(o); s.write(x)`, an `https`
+    request whose head was written by `end()`, `write()` or `flushHeaders()`, any request
+    on the shared transport -- with that write's `write EPROTO` (errno, code, syscall) on
+    the socket's error and every queued write's callback (#146,
+    `conformance/cases/179-https-request-tls-options.mjs`). `end()` with no data queues no
+    write. An empty range fails with `ERR_SSL_NO_PROTOCOLS_AVAILABLE` on both.
   - **A `TLSv1` / `TLSv1.1` floor is raised to TLS 1.2** -- rustls offers nothing lower --
     which is observationally what Node negotiates too (OpenSSL 3 cannot build a legacy hello
     either: an explicit sub-1.2 range fails with `ERR_SSL_NO_PROTOCOLS_AVAILABLE` on both).

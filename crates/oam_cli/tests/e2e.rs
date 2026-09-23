@@ -19169,6 +19169,130 @@ process.exit(0);
     }
 }
 
+/// Issue #146: a verifying https request's per-request TLS options reach the
+/// handshake (they route the request over tls.connect), and a handshake the
+/// server refuses with the protocol_version alert takes node's shape: the
+/// alert's own code on a socket that had nothing queued, and `write EPROTO`
+/// (errno, code, syscall) on the socket's error and every queued write's
+/// callback once a write was queued behind the handshake -- a request head
+/// included, on the tls.connect path and on the shared transport alike.
+/// Measured on node v22.22.2; conformance case 179 holds the same byte for
+/// byte.
+#[test]
+fn https_request_tls_options_and_the_handshake_alerts_write_eproto() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+import https from 'node:https';
+const root = `{root}`;
+const cert = `{cert}`;
+const key = `{key}`;
+let seen = 'none';
+const conns = new Set();
+function serve(opts) {{
+  const server = tls.createServer({{ cert, key, ...opts }}, (c) => {{
+    conns.add(c);
+    c.on('error', () => {{}});
+    let buf = '';
+    c.on('data', (d) => {{
+      buf += d.toString('latin1');
+      if (buf.includes('\r\n\r\n')) {{
+        seen = c.getProtocol() + '/' + c.getCipher().name;
+        c.end('HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\nok');
+      }}
+    }});
+  }});
+  server.on('tlsClientError', () => {{}});
+  return new Promise((r) => server.listen(0, '127.0.0.1', () => r(server)));
+}}
+async function closeAll(server) {{ for (const c of conns) c.destroy(); conns.clear(); await new Promise((r) => server.close(r)); }}
+const shape = (e) => e.code + ':' + e.syscall + ':' + (typeof e.errno === 'number' && e.errno < 0 ? 'errno' : 'noerrno') + ':' + Object.keys(e).join(',');
+function request(label, port, opts) {{
+  seen = 'none';
+  return new Promise((resolve) => {{
+    const r = https.request({{ host: 'localhost', port, path: '/', ...opts }}, (res) => {{
+      res.resume();
+      res.on('end', () => {{ console.log(label + '=' + res.statusCode + ' ' + seen); resolve(); }});
+    }});
+    r.on('error', (e) => {{ console.log(label + '=ERROR ' + shape(e)); resolve(); }});
+    r.end();
+  }});
+}}
+let server = await serve({{ minVersion: 'TLSv1.2', maxVersion: 'TLSv1.3' }});
+let port = server.address().port;
+await request('untrusted', port, {{}});
+await request('ca', port, {{ ca: root }});
+await request('caMax12', port, {{ ca: root, maxVersion: 'TLSv1.2' }});
+await request('caSp12', port, {{ ca: root, secureProtocol: 'TLSv1_2_method' }});
+await request('agentCaMax12', port, {{ agent: new https.Agent({{ ca: root, maxVersion: 'TLSv1.2' }}) }});
+await closeAll(server);
+server = await serve({{ minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2' }});
+port = server.address().port;
+const base = {{ host: 'localhost', port, ca: root, minVersion: 'TLSv1.3' }};
+await new Promise((resolve) => {{
+  const s = tls.connect(base, () => {{ console.log('noWrite=secureConnect'); s.destroy(); }});
+  s.on('error', (e) => console.log('noWrite=' + shape(e)));
+  s.on('close', resolve);
+}});
+await new Promise((resolve) => {{
+  const s = tls.connect(base, () => {{ s.destroy(); }});
+  s.write('x', (e) => console.log('writeCb=' + (e ? e.code : 'ok')));
+  s.on('error', (e) => console.log('write=' + shape(e)));
+  s.on('close', resolve);
+}});
+await new Promise((resolve) => {{
+  const s = tls.connect(base, () => {{ s.destroy(); }});
+  s.end();
+  s.on('error', (e) => console.log('endNoData=' + shape(e)));
+  s.on('close', resolve);
+}});
+await request('requestMin13', port, {{ ca: root, minVersion: 'TLSv1.3' }});
+tls.DEFAULT_MIN_VERSION = 'TLSv1.3';
+await new Promise((resolve) => {{
+  // No option of its own: the shared transport, under the live default.
+  const r = https.get('https://localhost:' + port + '/', (res) => {{ res.resume(); res.on('end', () => {{ console.log('sharedMin13=response'); resolve(); }}); }});
+  r.on('error', (e) => {{ console.log('sharedMin13=ERROR ' + shape(e)); resolve(); }});
+}});
+tls.DEFAULT_MIN_VERSION = 'TLSv1.2';
+await closeAll(server);
+process.exit(0);
+"#,
+        root = FETCH_TEST_CA,
+        cert = FETCH_TEST_LEAF,
+        key = FETCH_TEST_LEAF_KEY,
+    );
+    let file = write_temp("https_request_tls_options.mjs", &src);
+    let ca = write_temp("https_request_tls_options_ca.pem", FETCH_TEST_CA);
+    let mut cmd = oam_command(&["run", file.to_str().unwrap(), "--no-check"]);
+    // The shared-transport request trusts the root the same way a fetch can.
+    cmd.env("NODE_EXTRA_CA_CERTS", &ca);
+    let output = bounded_output(&mut cmd);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for line in [
+        "ca=200 TLSv1.3/TLS_AES_256_GCM_SHA384",
+        "caMax12=200 TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+        "caSp12=200 TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+        "agentCaMax12=200 TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+        "noWrite=ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION:undefined:noerrno:library,reason,code",
+        "writeCb=EPROTO",
+        "write=EPROTO:write:errno:errno,code,syscall",
+        "endNoData=ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION:undefined:noerrno:library,reason,code",
+        "requestMin13=ERROR EPROTO:write:errno:errno,code,syscall",
+        "sharedMin13=ERROR EPROTO:write:errno:errno,code,syscall",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?}\nstdout: {stdout}");
+    }
+    // The untrusted root is refused on the verifying path, as before: the
+    // root is trusted for this run through NODE_EXTRA_CA_CERTS, so the line
+    // reads 200 here; case 179 pins the refusal without it.
+    assert!(stdout.contains("untrusted=200 "), "stdout: {stdout}");
+}
+
 /// `https.get('https://[::1]:PORT/', { rejectUnauthorized: false })` takes the
 /// URL's hostname WITHOUT its brackets, as node's urlToHttpOptions does. oam
 /// kept them: the connect then failed everywhere with `invalid server name

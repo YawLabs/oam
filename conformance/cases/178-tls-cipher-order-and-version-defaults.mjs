@@ -159,8 +159,9 @@ const here = fileURLToPath(import.meta.url);
 // option-less https.get() under the live defaults. Node's undici and its
 // https.Agent connect through tls.connect and read the defaults for every
 // connection; oam's shared transport used to be built once with every
-// version. An https.get whose floor is above the server's ceiling is left
-// out: node reports EPROTO on that path where oam names the alert.
+// version. An https.get whose floor is above the server's ceiling fails
+// with the failed write's `write EPROTO`, its head having been queued
+// behind the handshake the alert refused (case 179).
 if (process.env.OAM_CASE_178 === "fetch") {
   let seen = "none";
   const conns = new Set();
@@ -200,7 +201,7 @@ if (process.env.OAM_CASE_178 === "fetch") {
         res.on("end", () => { console.log(label + " https.get -> " + seen); resolve(); });
       });
     } catch (e) { console.log(label + " https.get -> THROW " + e.code); resolve(); return; }
-    req.on("error", (e) => { console.log(label + " https.get -> ERROR " + e.code); resolve(); });
+    req.on("error", (e) => { console.log(label + " https.get -> ERROR " + e.code + " syscall=" + e.syscall); resolve(); });
   });
   const closeAll = async (server) => {
     for (const c of conns) c.destroy();
@@ -233,6 +234,7 @@ if (process.env.OAM_CASE_178 === "fetch") {
     port = server.address().port;
     tls.DEFAULT_MIN_VERSION = "TLSv1.3";
     await viaFetch("DEFAULT_MIN=1.3 vsServer1.2", port);
+    await viaGet("DEFAULT_MIN=1.3 vsServer1.2", port, {});
     tls.DEFAULT_MIN_VERSION = "TLSv1.2";
     await viaFetch("restored vsServer1.2", port);
   }
