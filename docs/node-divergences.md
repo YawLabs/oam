@@ -2106,17 +2106,23 @@ oam's shared client. What differs:
 - **A plain `Duplex` from `createConnection` is used as it is.** Node wraps a stream that is
   not a socket in its `JSStreamSocket` and hands that wrapper to `'connect'`; oam runs the
   session over the stream itself and hands it on.
-- **A fatal alert after the handshake also ends the session with events.** When a TLS 1.3
-  server refuses a session that sent no client certificate, the pending stream fails and
-  closes as in Node (with `ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED`, as in Node; entry
-  34), and oam's session then emits `'error'`
-  and `'close'`; Node's session is destroyed and emits neither (measured for 3 s).
-- **A session the server refuses AFTER securing it reports it differently.** Against an
-  `http2` secure server that destroys the connection in `'secureConnection'`, Node's
-  session connects and then closes cleanly, where oam's connects and emits `'error'`
-  `ERR_STREAM_WRITE_AFTER_END` first. A server that destroys it earlier, in `'connection'`
-  (before the TLS handshake), fails both sessions alike with `'error'` `ECONNRESET` -- oam
-  reported that case as `EIO` until #196 named the alert path.
+- **A fatal alert after the handshake leaves the session silent, as in Node** (#197). When
+  a TLS 1.3 server refuses a session that sent no client certificate, the pending stream
+  carries the alert (`ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED`, #196) and the session is
+  destroyed without `'error'` or `'close'` -- so a program that handles the request's
+  error, as it would on Node with no reason to listen on the session, is not taken down by
+  the session's. oam re-surfaced it on the session, `'error'` then `'close'`, until #197.
+  A connection-level failure before `'connect'` -- a refused connection, or a reset or EOF
+  during the handshake -- still reaches the session as `'error'` then `'close'` on both, an
+  unhandled one ending the process on both: the code is the socket's own, `ECONNREFUSED`
+  for a refusal and `ECONNRESET` for a reset or EOF.
+- **A reset the instant the handshake finishes gives the session's `'error'` a different
+  code.** When a server accepts the TLS connection and then resets it before the HTTP/2
+  preface is exchanged, both runtimes cancel the pending stream (`ERR_HTTP2_STREAM_CANCEL`)
+  and emit `'error'` on the session (an unhandled one ends the process on both), but oam's
+  session-error code is `ERR_STREAM_WRITE_AFTER_END` where Node's is `ECONNRESET`. A
+  graceful close after the session is up ends both cleanly with the stream's `'close'` and
+  the session's.
 
 _(probed)_ Node v22.22.2 vs oam on Windows: lookup and createConnection guards over h2c, and
 a node-hosted `createSecureServer` for `ca`, `servername`, a refusing lookup, an untrusted

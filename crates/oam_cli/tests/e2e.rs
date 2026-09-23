@@ -19420,6 +19420,69 @@ process.exit(0);
     }
 }
 
+/// Issue #197: an http2 session that a fatal TLS alert ends AFTER it has
+/// connected is destroyed silently -- the failure is carried by its streams,
+/// not re-surfaced on the session. A program written for node handles the
+/// request's error and never installs a session `'error'` listener; up to
+/// 0.16.4 oam's session emitted `'error'` there, an unhandled event that
+/// crashed the whole process. This drives a TLS 1.3 server that requires a
+/// client certificate against a client that sends none (the server answers
+/// with `certificate_required` after the handshake) and asserts the process
+/// survives, the stream carrying the alert's code (#196). Measured on node
+/// v22.22.2.
+#[test]
+fn http2_session_ended_by_a_server_alert_does_not_crash_the_process() {
+    let src = format!(
+        r#"
+import http2 from 'node:http2';
+const root = `{root}`;
+const cert = `{cert}`;
+const key = `{key}`;
+setTimeout(() => {{ console.log('TIMEOUT'); process.exit(3); }}, 20000).unref();
+const server = http2.createSecureServer(
+  {{ cert, key, ca: [root], requestCert: true, rejectUnauthorized: true }},
+  () => {{}},
+);
+server.on('error', () => {{}});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+// No session 'error' listener -- as a node program has none, the session
+// staying silent. An unhandled session 'error' would crash before 'survived'.
+const session = http2.connect('https://localhost:' + port, {{ ca: root }});
+session.on('connect', () => console.log('connect'));
+const stream = session.request({{ ':path': '/' }});
+stream.on('error', (e) => console.log('stream error ' + e.code));
+stream.on('close', () => console.log('stream close'));
+setTimeout(() => {{
+  console.log('survived destroyed=' + session.destroyed);
+  try {{ session.destroy(); }} catch {{}}
+  server.close();
+  process.exit(0);
+}}, 900);
+"#,
+        root = FETCH_TEST_CA,
+        cert = FETCH_TEST_LEAF,
+        key = FETCH_TEST_LEAF_KEY,
+    );
+    let file = write_temp("http2_session_alert.mjs", &src);
+    let mut cmd = oam_command(&["run", file.to_str().unwrap(), "--no-check"]);
+    let output = bounded_output(&mut cmd);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the session's alert must not crash the process.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for line in [
+        "connect",
+        "stream error ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED",
+        "stream close",
+        "survived destroyed=true",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?}\nstdout: {stdout}");
+    }
+}
+
 /// `https.get('https://[::1]:PORT/', { rejectUnauthorized: false })` takes the
 /// URL's hostname WITHOUT its brackets, as node's urlToHttpOptions does. oam
 /// kept them: the connect then failed everywhere with `invalid server name

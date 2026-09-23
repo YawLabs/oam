@@ -29739,6 +29739,23 @@
           session.destroy();
           return;
         }
+        // A fatal TLS alert the server sends once the session has connected
+        // is read, in Node, through the h2 layer and delivered to the active
+        // request as its own error; the session is destroyed silently -- no
+        // 'error' (which, unhandled, would crash the process -- #197) and no
+        // 'close'. oam surfaces that alert as a socket 'error' instead, so it
+        // reaches here; the stream still carries it (`session.destroy(error)`
+        // below names the streams with it), and the flag keeps it off the
+        // session, as Node has it. A transport error -- a reset, an EOF, a
+        // refused connection, an abrupt reset the instant the handshake
+        // finished (ECONNRESET, not an alert) -- Node DOES surface on the
+        // session, before 'connect' and after; a session-level error the h2
+        // layer raises (a GOAWAY, a protocol error) comes through
+        // `_onConnectionEnd`, not here. Measured on node v22.22.2.
+        if (session._state.ready && registry._isTlsAlertCode &&
+            registry._isTlsAlertCode(error && error.code)) {
+          session._state.streamsCarryError = true;
+        }
         session.destroy(error);
       }
     }
@@ -29774,6 +29791,9 @@
     }
 
     function emitClose(session, error) {
+      // A transport failure the streams already carried, after the session
+      // connected: Node leaves the session destroyed and silent (#197).
+      if (error && session._state.streamsCarryError) return;
       if (error) session.emit("error", error);
       session.emit("close");
     }
@@ -29829,7 +29849,7 @@
         socket[kBoundSession] = this;
         socket.on("error", socketOnError);
         socket.on("close", socketOnClose);
-        this._state = { destroyCode: NGHTTP2_NO_ERROR, goawayCode: null, closed: false, destroyed: false, ready: false };
+        this._state = { destroyCode: NGHTTP2_NO_ERROR, goawayCode: null, closed: false, destroyed: false, ready: false, streamsCarryError: false };
         this._streams = new Map();
         this._pendingStreams = new Set();
         this._pendingRequestCalls = null;
