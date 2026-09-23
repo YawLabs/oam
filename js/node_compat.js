@@ -20294,6 +20294,15 @@
             // The certificate refused, in node's terms (the code and message
             // tls.connect reports): the TLS socket's error node emits.
             mapped = cause;
+          } else if (cause && (cause.code === "ERR_SSL_NO_PROTOCOLS_AVAILABLE" ||
+              cause.code === "ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION")) {
+            // The version range node's live defaults name has nothing to
+            // offer, or the peer's highest version is below its floor: the
+            // codes tls.connect reports. (node's own agent path reports the
+            // alert as `write EPROTO`, its request head having been queued
+            // on the socket before the alert came -- docs/node-divergences.md,
+            // entry 34.)
+            mapped = cause;
           } else if (/connection refused|ECONNREFUSED/i.test(detail)) {
             mapped = Object.assign(new Error("connect ECONNREFUSED"), {
               code: "ECONNREFUSED",
@@ -30210,6 +30219,10 @@
     // opens the transport and only tls.connect() starts the handshake,
     // oam's connect() runs the handshake too: 'secureConnect' fires from
     // both paths.
+    // The option a server's accept loop builds its sockets with: born with
+    // the server's context, so no context of their own is built (or
+    // validated) at construction.
+    var kServerBorn = Symbol("oamServerBorn");
     class TLSSocket extends Duplex {
       static [Symbol.hasInstance](instance) {
         if (Function.prototype[Symbol.hasInstance].call(this, instance)) return true;
@@ -30283,6 +30296,18 @@
         // The TLS options (ca, cert, key, servername, rejectUnauthorized) a
         // later connect() reuses.
         this._tlsOptions = options || {};
+        // node (_wrapHandle): a socket built without a `secureContext` or
+        // `credentials` builds one from its options HERE, so minVersion /
+        // maxVersion / secureProtocol -- and the live defaults they fall
+        // back to -- are validated at construction, whether or not connect()
+        // ever runs (measured: `new TLSSocket(null, { minVersion: 'bad' })`
+        // throws ERR_TLS_INVALID_PROTOCOL_VERSION). A server's accepted
+        // sockets are born with the server's context, as node's are, and
+        // skip it (kServerBorn).
+        if (!this._tlsOptions.secureContext && !this._tlsOptions.credentials &&
+            !this._tlsOptions[kServerBorn]) {
+          resolveTlsVersions(this._tlsOptions);
+        }
         // TLS over a socket this one did not open (tls.connect({ socket })):
         // the wrapped socket, the pipe TLS runs over, and the pump's
         // listeners on the wrapped socket (_wrapOver, _connectTlsOver).
@@ -30737,28 +30762,62 @@
       "TLSv1_2_method": "TLSv1.2",
     };
     // util.format's %j, which Node renders the offending value with in these
-    // messages: a string comes out quoted, a number, boolean or object does not.
+    // messages (lib/internal/util/inspect.js tryStringify): JSON.stringify's
+    // text -- a string quoted, a number, boolean or object bare -- or
+    // "undefined" for a value it has no text for (a function, a symbol), or
+    // "[Circular]" for a circular object; any other refusal (a BigInt) is
+    // thrown as it is, a plain TypeError with no code.
+    var circularJsonMessage = null;
     function formatJ(value) {
       try {
         var s = JSON.stringify(value);
-        return s === undefined ? String(value) : s;
+        return s === undefined ? "undefined" : s;
       } catch (e) {
-        return String(value);
+        if (circularJsonMessage === null) {
+          try {
+            var loop = {};
+            loop.self = loop;
+            JSON.stringify(loop);
+          } catch (circular) {
+            circularJsonMessage = String(circular.message).split("\n")[0];
+          }
+        }
+        if (e instanceof TypeError && String(e.message).split("\n")[0] === circularJsonMessage) {
+          return "[Circular]";
+        }
+        throw e;
       }
     }
-    // Node's minVersion / maxVersion / secureProtocol semantics, measured on
-    // v22.22.2 (all three errors are TypeErrors there):
+    // Node's minVersion / maxVersion / secureProtocol semantics
+    // (lib/internal/tls/common.js SecureContext + toV, measured on v22.22.2;
+    // all three errors are TypeErrors there):
     //  - a truthy secureProtocol conflicts with a minVersion or maxVersion that
     //    is not null/undefined ('' counts, null does not);
+    //  - a null / undefined version is the module's LIVE default,
+    //    tls.DEFAULT_MIN_VERSION / DEFAULT_MAX_VERSION -- assignable, and set
+    //    at startup by --tls-min-v1.x / --tls-max-v1.x -- read at the call.
+    //    Whatever its source, a version that is not one of the four names is
+    //    invalid ('' and 771 included, a default of null too): the minimum is
+    //    checked first, and both before the method name;
     //  - only a string names a method (Node's C++ checks IsString): '' is looked
-    //    up and unknown, a non-string is ignored and the default range applies;
-    //    TLS_method and its _client/_server forms are the default range, the
-    //    SSLv23_* forms cap it at TLS 1.2 (the name predates 1.3, and Node keeps
-    //    that meaning); the SSLv2 / SSLv3 families are refused with their own
-    //    message; there is no TLSv1_3_method;
-    //  - a version that is not one of the four names is invalid whatever its
-    //    type ('' and 771 included); null / undefined means Node's default.
-    // Returns the effective {min, max} as names, '' for Node's default.
+    //    up and unknown, a non-string is ignored and the defaults apply;
+    //    TLS_method and its _client/_server forms are OpenSSL's whole range
+    //    whatever the defaults say, the SSLv23_* forms keep the default floor
+    //    and cap at TLS 1.2 (the name predates 1.3, and Node keeps that
+    //    meaning), a TLSv1_x_method pins x; the SSLv2 / SSLv3 families are
+    //    refused with their own message; there is no TLSv1_3_method.
+    // Returns the effective {min, max} as names, '' for no bound of its own
+    // (rustls's TLS 1.2 floor and 1.3 ceiling apply natively).
+    function toTlsVersion(which, value, fallback) {
+      if (value == null) value = fallback;
+      if (TLS_VERSION_NAMES.indexOf(value) < 0) {
+        throw nodeTypeError(
+          formatJ(value) + " is not a valid " + which + " TLS protocol version",
+          "ERR_TLS_INVALID_PROTOCOL_VERSION",
+        );
+      }
+      return value;
+    }
     function resolveTlsVersions(options) {
       var min = options.minVersion, max = options.maxVersion, sp = options.secureProtocol;
       if (sp && (min != null || max != null)) {
@@ -30768,10 +30827,14 @@
           "ERR_TLS_PROTOCOL_VERSION_CONFLICT",
         );
       }
+      // Node's toV, evaluated for both bounds before the method name is
+      // looked up (they are the init() call's arguments).
+      var floor = toTlsVersion("minimum", min, tlsExports.DEFAULT_MIN_VERSION);
+      var ceiling = toTlsVersion("maximum", max, tlsExports.DEFAULT_MAX_VERSION);
       if (typeof sp === "string") {
         var base = sp.replace(/_(client|server)_method$/, "_method");
         if (base === "TLS_method") return { min: "", max: "" };
-        if (base === "SSLv23_method") return { min: "", max: "TLSv1.2" };
+        if (base === "SSLv23_method") return { min: floor, max: "TLSv1.2" };
         var v = SECURE_PROTOCOL_TO_VERSION[base];
         if (v === undefined) {
           // Thrown from C++ in Node: a plain TypeError carrying the code, with
@@ -30786,19 +30849,7 @@
         }
         return { min: v, max: v };
       }
-      if (min != null && TLS_VERSION_NAMES.indexOf(min) < 0) {
-        throw nodeTypeError(
-          formatJ(min) + " is not a valid minimum TLS protocol version",
-          "ERR_TLS_INVALID_PROTOCOL_VERSION",
-        );
-      }
-      if (max != null && TLS_VERSION_NAMES.indexOf(max) < 0) {
-        throw nodeTypeError(
-          formatJ(max) + " is not a valid maximum TLS protocol version",
-          "ERR_TLS_INVALID_PROTOCOL_VERSION",
-        );
-      }
-      return { min: min != null ? min : "", max: max != null ? max : "" };
+      return { min: floor, max: ceiling };
     }
     // The https factory validates the same options at https.createServer() and
     // https.request(); shared through the registry rather than as an export.
@@ -31657,6 +31708,10 @@
         ca: ca,
         minVersion: versions.min,
         maxVersion: versions.max,
+        // node (lib/internal/tls/wrap.js): a server picks a cipher suite by
+        // its own list unless the option is given and falsy. Read by the
+        // server context alone.
+        honorCipherOrder: options.honorCipherOrder !== undefined ? !!options.honorCipherOrder : true,
       };
     }
     // Build a native context, or throw what Node throws: OpenSSL's errors
@@ -31771,6 +31826,9 @@
         this.minVersion = options.minVersion || undefined;
         this.maxVersion = options.maxVersion || undefined;
         this.secureProtocol = options.secureProtocol || undefined;
+        // node: `!!options.honorCipherOrder` when given, else true (measured:
+        // 0, '' and null pick by the client's order, 'no' by the server's).
+        this.honorCipherOrder = options.honorCipherOrder !== undefined ? !!options.honorCipherOrder : true;
         this._tlsMin = versions.min;
         this._tlsMax = versions.max;
         var old = this._contextId;
@@ -31896,7 +31954,9 @@
           plain._handle = null;
           registry._activeHandles.delete(plain);
         }
-        var socket = new TLSSocket(null, {});
+        var options = {};
+        options[kServerBorn] = true;
+        var socket = new TLSSocket(null, options);
         // The connection counts from here -- the accept -- until its socket
         // closes, which covers a handshake that never finishes, as node's
         // net.Server does. A client refused in 'connection' returned above.
@@ -32089,9 +32149,21 @@
       Server,
       TLSSocket,
       DEFAULT_ECDH_CURVE: "auto",
-      DEFAULT_MAX_VERSION: "TLSv1.3",
-      DEFAULT_MIN_VERSION: "TLSv1.2",
-      getCiphers: () => ["TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256"],
+      // node (lib/tls.js): the defaults of the maxVersion / minVersion
+      // options, read live by every context build (resolveTlsVersions), so
+      // assigning them changes every connection and server made after;
+      // --tls-max-v1.x / --tls-min-v1.x (argv or NODE_OPTIONS) set the
+      // initial values, in node's precedence (the CLI resolves several).
+      DEFAULT_MAX_VERSION: globalThis.__oamTlsMaxVersion || "TLSv1.3",
+      DEFAULT_MIN_VERSION: globalThis.__oamTlsMinVersion || "TLSv1.2",
+      // node: every suite OpenSSL supports (62), lowercase, sorted. oam: the
+      // nine rustls offers (node_crypto_provider), in the same spelling and
+      // order node lists them in (docs/node-divergences.md, entry 34).
+      getCiphers: () => [
+        "ecdhe-ecdsa-aes128-gcm-sha256", "ecdhe-ecdsa-aes256-gcm-sha384", "ecdhe-ecdsa-chacha20-poly1305",
+        "ecdhe-rsa-aes128-gcm-sha256", "ecdhe-rsa-aes256-gcm-sha384", "ecdhe-rsa-chacha20-poly1305",
+        "tls_aes_128_gcm_sha256", "tls_aes_256_gcm_sha384", "tls_chacha20_poly1305_sha256",
+      ],
       getCACertificates,
       checkServerIdentity,
     };

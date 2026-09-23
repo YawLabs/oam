@@ -285,12 +285,14 @@ statement, including what is and is not in scope for a vulnerability report.
 
 ### 5. `NODE_OPTIONS` is honored for a strict allowlist only
 
-oam reads `NODE_OPTIONS` and folds it in before argv, so an explicit command-line flag
+oam reads `NODE_OPTIONS` and folds it in under argv, so an explicit command-line flag
 still wins. Only these tokens are accepted:
 
 ```
 --pending-deprecation   --no-warnings   --no-deprecation   --expose-gc
 --disable-warning[=]    --redirect-warnings[=]
+--max-http-header-size[=]   --insecure-http-parser
+--tls-min-v1.0  --tls-min-v1.1  --tls-min-v1.2  --tls-min-v1.3  --tls-max-v1.2  --tls-max-v1.3
 ```
 
 Everything else in the variable is **ignored, not rejected** — `NODE_OPTIONS` is usually
@@ -1077,16 +1079,41 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   `checkServerIdentity` after the chain check, as Node does, and destroys the socket with
   its error before `'secureConnect'`. Up to 0.16.2 a verifying `https.request` went through
   one shared client that applied none of these (a version pin printed a `Warning`), and
-  `tls.connect` never called `checkServerIdentity`. What still differs:
+  `tls.connect` never called `checkServerIdentity`. A pinned TLS 1.2 handshake negotiates
+  `ECDHE-RSA-AES128-GCM-SHA256`, as between two Node peers: oam offers its suites in
+  `tls.DEFAULT_CIPHERS`' order (under TLS 1.2 the ECDHE AES-128-GCM suites before AES-256-GCM,
+  CHACHA20 last; under TLS 1.3 AES-256, CHACHA20, AES-128) on every client and server, and a
+  server picks by its own list unless `honorCipherOrder` is given falsy. `tls.DEFAULT_MIN_VERSION`
+  / `DEFAULT_MAX_VERSION` are the live defaults of the two options -- assignable, set at
+  startup by `--tls-min-v1.x` / `--tls-max-v1.x` (argv or `NODE_OPTIONS`, Node's precedence
+  when several are given) -- and are validated as Node validates them; `TLS_method` ignores
+  them and `SSLv23_method` keeps the default floor (`conformance/cases/178-tls-cipher-order-and-version-defaults.mjs`).
+  They reach `fetch()` and an option-less `https.get()` -- the requests oam sends over its
+  shared transport -- as they reach Node's, whose undici and https agent connect through
+  `tls.connect`: the handshake runs in the range the defaults name, an empty range fails
+  with `ERR_SSL_NO_PROTOCOLS_AVAILABLE` (a fetch's cause) and a floor above the server's
+  ceiling with `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`. Up to 0.16.4 rustls's own order put
+  AES-256 first (`ECDHE-RSA-AES256-GCM-SHA384`), `honorCipherOrder` was ignored, the
+  defaults were inert constants, the flags were rejected as unknown arguments, and the
+  shared transport was built once with every version. What still differs:
+  - An **`https` request whose handshake the server refuses with the `protocol_version`
+    alert fails with `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`**, the code `tls.connect`
+    reports; Node's fails with `write EPROTO`, its request head having been queued on the
+    socket before the alert came (a `fetch`'s cause names the alert on both). An empty
+    range fails with `ERR_SSL_NO_PROTOCOLS_AVAILABLE` on both.
   - **A `TLSv1` / `TLSv1.1` floor is raised to TLS 1.2** -- rustls offers nothing lower --
     which is observationally what Node negotiates too (OpenSSL 3 cannot build a legacy hello
     either: an explicit sub-1.2 range fails with `ERR_SSL_NO_PROTOCOLS_AVAILABLE` on both).
   - The **asynchronous error messages** are rustls's (`no protocols available for the
     requested TLS version range`, `received fatal alert: ProtocolVersion`); Node's are OpenSSL
     diagnostics carrying its build path. Only the `code` is matched.
-  - A **TLS 1.2 handshake negotiates `ECDHE-RSA-AES256-GCM-SHA384`** where Node's OpenSSL
-    prefers `ECDHE-RSA-AES128-GCM-SHA256`: rustls orders AES-256 first. `getCipher()` reports
-    it in OpenSSL's spelling either way.
+  - The **`ciphers` option is still ignored** (entry 42), so a list that reorders or narrows
+    the suites changes nothing, and `tls.DEFAULT_CIPHERS` is absent; only the nine suites
+    rustls implements are ever offered, in the order above, and `tls.getCiphers()` lists
+    those nine (in Node's lowercase spelling) where Node lists OpenSSL's 62.
+  - **`process.execArgv` lists the Node flags oam takes in a fixed order** (the `--tls-*`
+    flags last, minimums by version then maximums); Node keeps the order they were given
+    in. A single flag reads the same; two or more may come back reordered.
   - A **`_server_method` name on a client** (or `_client_method` on a server) is taken as its
     base method here; Node's OpenSSL accepts the name and then fails the handshake with
     `ERR_SSL_CALLED_A_FUNCTION_YOU_SHOULD_NOT_CALL`, a misuse it does not check up front.
@@ -1794,7 +1821,8 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
 - **A context's `ciphers`, `ecdhCurve`, `sigalgs`, `dhparam`, `crl`, `sessionIdContext`,
   `ticketKeys`, `sessionTimeout`, `privateKeyIdentifier` / `privateKeyEngine` and
   `clientCertEngine` are ignored** (and not validated): rustls has no knobs for them. `key`,
-  `cert`, `ca`, `pfx`, `passphrase` and the version range are read as Node reads them, at
+  `cert`, `ca`, `pfx`, `passphrase`, `honorCipherOrder` and the version range are read as
+  Node reads them, at
   `createSecureContext()` / `createServer()` / `connect()`.
 - **`createServer()`'s errors carry no `opensslErrorStack`**, and a `pfx` that cannot be
   parsed is `not enough data` whatever is wrong with it (OpenSSL names the fault).

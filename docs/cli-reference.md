@@ -66,6 +66,7 @@ Notable ones:
 | `--experimental-vm-modules` | Enables `vm.SourceTextModule`. |
 | `--expose-internals` | Resolves `internal/*` from the builtin registry. |
 | `--expose-gc`, `--no-warnings`, `--no-deprecation`, `--pending-deprecation` | As in Node. |
+| `--tls-min-v1.0`, `--tls-min-v1.1`, `--tls-min-v1.2`, `--tls-min-v1.3`, `--tls-max-v1.2`, `--tls-max-v1.3` | As in Node: the initial `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION`, so the default version range of every TLS connection and server (`NODE_OPTIONS` takes them too, several resolve in Node's precedence, and `--tls-min-v1.3` with `--tls-max-v1.2` is refused at startup with exit 9, as Node refuses it). A floor below TLS 1.2 is accepted and raised to 1.2, which is what Node negotiates too -- see `docs/node-divergences.md`, entry 34. |
 | `--env-file=<path>`, `--env-file-if-exists=<path>` | As in Node. |
 | `-e` / `--eval`, `-p` / `--print`, `-pe` | As in Node, including the bundled form. |
 

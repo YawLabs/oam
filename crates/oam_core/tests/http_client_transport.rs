@@ -58,7 +58,7 @@ fn ok_reply(_: &Received) -> Vec<u8> {
 async fn refused_ip_literal_is_node_s_connect_error() {
     within(async {
         let transport = transport(ProxySource::None);
-        let route = transport.route(false, ATTEMPT);
+        let route = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
         let port = closed_port().await;
         let target = format!("http://127.0.0.1:{port}/");
         let err = send(&transport, &route, get(&target)).await.unwrap_err();
@@ -94,7 +94,7 @@ async fn refused_ip_literal_is_node_s_connect_error() {
 async fn hooked_route_two_refused_addresses_is_an_aggregate() {
     within(async {
         let transport = transport(ProxySource::None);
-        let route = transport.route(true, ATTEMPT);
+        let route = transport.route(true, ATTEMPT, oam_core::http_client::TlsRange::Both);
         let port = closed_port().await;
         let target = format!("http://pinned.test:{port}/");
         let uri: http::Uri = target.parse().unwrap();
@@ -134,7 +134,7 @@ async fn hooked_route_dials_only_hosts_the_hook_resolved() {
     within(async {
         let server = serve_replies(ok_reply).await;
         let transport = transport(ProxySource::None);
-        let route = transport.route(true, ATTEMPT);
+        let route = transport.route(true, ATTEMPT, oam_core::http_client::TlsRange::Both);
         route.set_addrs("a.test:80", vec!["127.0.0.1".parse().unwrap()]);
         let local = format!("http://localhost:{}/", server.port);
         let literal = format!("http://127.0.0.1:{}/", server.port);
@@ -157,7 +157,7 @@ async fn hooked_route_dials_only_hosts_the_hook_resolved() {
         let response = send(&transport, &route, get(&literal)).await.unwrap();
         assert_eq!(response.status(), 200);
         // A pooled route never needs a lookup.
-        let pooled = transport.route(false, ATTEMPT);
+        let pooled = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
         assert!(!pooled.is_hooked());
         assert_eq!(pooled.lookup_needed(&local.parse().unwrap()), None);
     })
@@ -173,7 +173,7 @@ async fn hooked_route_dials_only_hosts_the_hook_resolved() {
 async fn a_hooked_route_asks_the_hook_again_for_the_same_host_on_another_port() {
     within(async {
         let transport = transport(ProxySource::None);
-        let route = transport.route(true, ATTEMPT);
+        let route = transport.route(true, ATTEMPT, oam_core::http_client::TlsRange::Both);
         let first: http::Uri = "http://guarded.test:8443/a".parse().unwrap();
         let second: http::Uri = "http://guarded.test:6379/b".parse().unwrap();
         let default_port: http::Uri = "http://guarded.test/c".parse().unwrap();
@@ -218,7 +218,7 @@ async fn http_proxy_gets_absolute_form_and_caller_adds_proxy_authorization() {
             .http(format!("http://u:p@127.0.0.1:{}", proxy.port))
             .build();
         let transport = transport(ProxySource::Fixed(Box::new(rules)));
-        let route = transport.route(false, ATTEMPT);
+        let route = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
         let target = "http://origin.test:81/p?q=1";
         let uri: http::Uri = target.parse().unwrap();
         let auth = transport.proxy_authorization(&route, &uri).unwrap();
@@ -228,7 +228,10 @@ async fn http_proxy_gets_absolute_form_and_caller_adds_proxy_authorization() {
             None
         );
         assert_eq!(
-            transport.proxy_authorization(&transport.route(true, ATTEMPT), &uri),
+            transport.proxy_authorization(
+                &transport.route(true, ATTEMPT, oam_core::http_client::TlsRange::Both),
+                &uri
+            ),
             None
         );
 
@@ -266,7 +269,7 @@ async fn https_via_proxy_sends_connect_with_user_agent_and_auth() {
             .all(format!("http://u:p@127.0.0.1:{}", proxy.port))
             .build();
         let transport = transport(ProxySource::Fixed(Box::new(rules)));
-        let route = transport.route(false, ATTEMPT);
+        let route = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
         let target = "https://example.test:8443/";
         let err = send(&transport, &route, get(target)).await.unwrap_err();
         match err.to_outcome(&url(target)) {
@@ -297,7 +300,7 @@ async fn https_through_connect_tunnel_negotiates_h2() {
             .https(format!("http://127.0.0.1:{}", proxy.port))
             .build();
         let transport = transport(ProxySource::Fixed(Box::new(rules)));
-        let route = transport.route(false, ATTEMPT);
+        let route = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
         let target = format!("https://localhost:{}/x", origin.port);
         let response = send(&transport, &route, get(&target)).await.unwrap();
         assert_eq!(response.status(), 200);
@@ -322,7 +325,7 @@ async fn an_h2_request_sends_the_authority_without_a_host_field() {
     within(async {
         let origin = serve_h2_tls("h2 ok").await;
         let transport = transport(ProxySource::None);
-        let route = transport.route(false, ATTEMPT);
+        let route = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
         let target = format!("https://localhost:{}/x", origin.port);
         let mut request = get(&target);
         // What ClientRequest writes: the host, and the port unless it is the
@@ -356,7 +359,7 @@ async fn an_h2_host_header_that_overrides_the_authority_becomes_it() {
     within(async {
         let origin = serve_h2_tls("h2 ok").await;
         let transport = transport(ProxySource::None);
-        let route = transport.route(false, ATTEMPT);
+        let route = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
         let target = format!("https://localhost:{}/x", origin.port);
         let mut request = get(&target);
         request
@@ -382,7 +385,7 @@ async fn an_authored_h2_request_keeps_the_authority_it_wrote() {
     within(async {
         let origin = serve_h2_tls("h2 ok").await;
         let transport = transport(ProxySource::None);
-        let route = transport.route(false, ATTEMPT);
+        let route = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
         let target = format!("https://localhost:{}/x", origin.port);
         let mut request = request("GET", &target, empty_body());
         *request.version_mut() = http::Version::HTTP_2;
@@ -410,7 +413,7 @@ async fn an_h1_request_keeps_the_host_header_it_was_given() {
     within(async {
         let server = serve_replies(ok_reply).await;
         let transport = transport(ProxySource::None);
-        let route = transport.route(false, ATTEMPT);
+        let route = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
         let target = format!("http://127.0.0.1:{}/x", server.port);
         let mut request = get(&target);
         request
@@ -437,7 +440,7 @@ async fn refused_proxy_names_the_proxy() {
             .all(format!("http://127.0.0.1:{port}"))
             .build();
         let transport = transport(ProxySource::Fixed(Box::new(rules)));
-        let route = transport.route(false, ATTEMPT);
+        let route = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
         for target in ["http://origin.test/", "https://origin.test/"] {
             let err = send(&transport, &route, get(target)).await.unwrap_err();
             match err.to_outcome(&url(target)) {
@@ -466,7 +469,7 @@ async fn socks_proxy_keeps_the_uncoded_text() {
         let server = serve_replies(ok_reply).await;
         let rules = Matcher::builder().all("socks5://127.0.0.1:1").build();
         let transport = transport(ProxySource::Fixed(Box::new(rules)));
-        let route = transport.route(false, ATTEMPT);
+        let route = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
         let target = format!("http://127.0.0.1:{}/", server.port);
         let err = send(&transport, &route, get(&target)).await.unwrap_err();
         match err.to_outcome(&url(&target)) {
@@ -490,7 +493,7 @@ async fn hooked_route_bypasses_the_proxy() {
             .all(format!("http://u:p@127.0.0.1:{dead_proxy}"))
             .build();
         let transport = transport(ProxySource::Fixed(Box::new(rules)));
-        let route = transport.route(true, ATTEMPT);
+        let route = transport.route(true, ATTEMPT, oam_core::http_client::TlsRange::Both);
         let target = format!("http://origin.test:{}/h", server.port);
         let uri: http::Uri = target.parse().unwrap();
         let (key, _) = route.lookup_needed(&uri).unwrap();
@@ -516,7 +519,7 @@ async fn tls_unavailable_fails_https_only() {
         let server = serve_replies(ok_reply).await;
         let transport =
             transport_with_tls(TlsSource::Unavailable("x".to_string()), ProxySource::None);
-        let route = transport.route(false, ATTEMPT);
+        let route = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
         let https = format!("https://127.0.0.1:{}/", server.port);
         let err = send(&transport, &route, get(&https)).await.unwrap_err();
         match err.to_outcome(&url(&https)) {
@@ -563,7 +566,7 @@ partial",
         })
         .await;
         let transport = transport(ProxySource::None);
-        let route = transport.route(false, ATTEMPT);
+        let route = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
         let kept = format!("http://127.0.0.1:{}/kept", server.port);
         for _ in 0..2 {
             let response = send(&transport, &route, get(&kept)).await.unwrap();
@@ -593,7 +596,7 @@ async fn request_body_shapes_match_today() {
     within(async {
         let server = serve_replies(ok_reply).await;
         let transport = transport(ProxySource::None);
-        let route = transport.route(false, ATTEMPT);
+        let route = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
         let target = format!("http://127.0.0.1:{}/", server.port);
 
         let full = request("POST", &target, full_body(Bytes::from_static(b"xyz")));

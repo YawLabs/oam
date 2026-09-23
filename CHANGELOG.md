@@ -16,6 +16,46 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A pinned TLS 1.2 handshake between two oam peers negotiated
+  `ECDHE-RSA-AES256-GCM-SHA384`, where two node peers negotiate
+  `ECDHE-RSA-AES128-GCM-SHA256`; a server's `honorCipherOrder` was ignored;
+  `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION` were inert constants; and
+  `--tls-min-v1.x` / `--tls-max-v1.x` were rejected as unknown arguments** (#144, the
+  residue of 0.16.1's fix). oam's rustls now offers its cipher suites in
+  `tls.DEFAULT_CIPHERS`' order -- under TLS 1.2 the ECDHE AES-128-GCM suites before the
+  AES-256-GCM ones and CHACHA20 last, under TLS 1.3 AES-256, CHACHA20, AES-128 -- on every
+  client (`tls.connect`, `https.request`, `fetch`) and every server, and a server picks a
+  suite by its own list unless `honorCipherOrder` is given falsy, as node's does. A
+  `minVersion` / `maxVersion` left null is the module's live `DEFAULT_MIN_VERSION` /
+  `DEFAULT_MAX_VERSION`, read when the connection or server is made and validated like an
+  explicit value (`ERR_TLS_INVALID_PROTOCOL_VERSION`, the minimum checked first and both
+  before a method name); `TLS_method` ignores the defaults and `SSLv23_method` keeps the
+  default floor, as in node. They reach `fetch()` and an option-less `https.get()` too --
+  node's undici and https agent connect through `tls.connect`, which reads them for every
+  connection -- where oam's shared transport was built once with every version: a request
+  now handshakes in the range the defaults name, an empty one fails with
+  `ERR_SSL_NO_PROTOCOLS_AVAILABLE` (a fetch's cause) and a default that is not a version
+  fails a fetch with `ERR_TLS_INVALID_PROTOCOL_VERSION` as its cause, as in node.
+  `new tls.TLSSocket(socket, options)` validates the version options (and the defaults they
+  fall back to) at construction, as node's constructor does, unless given a `secureContext`;
+  the value in these messages is rendered as node's `%j` renders it (a function or symbol
+  `undefined`, a circular object `[Circular]`, a BigInt JSON's own refusal). The six flags
+  set the initial defaults, from argv or `NODE_OPTIONS`, with node's precedence when
+  several are given (and node's refusal of `--tls-min-v1.3` with `--tls-max-v1.2`: exit 9
+  before anything runs), and come back through `process.execArgv`. Conformance case 178
+  holds all of it to node v22.22.2, the negotiated cipher names included, which case 109
+  had to leave out. `tls.getCiphers()` now lists the nine suites oam offers, in node's
+  lowercase spelling, where it listed three TLS 1.3 names. The `ciphers` option is still
+  ignored (docs/node-divergences.md, entry 42).
+- **`process.execArgv` listed the flags `NODE_OPTIONS` carried** (`NODE_OPTIONS=--no-warnings`
+  made it `['--no-warnings']`), where node lists what the command line gave and nothing
+  else: a child re-spawned from it got every environment flag twice. `NODE_OPTIONS` is now
+  read into flags of its own and merged under argv's -- an explicit flag still wins, lists
+  apply the environment's entries first -- and `execArgv` reflects argv alone. Found by
+  case 178, which spawns children under `NODE_OPTIONS`.
+
 ## [0.16.4] - 2026-09-21
 
 The events a server announces a connection with. `'connection'` and

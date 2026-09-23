@@ -756,10 +756,14 @@ pub struct CoreRuntime {
 impl CoreRuntime {
     pub fn new() -> Result<Self, String> {
         // Process-wide TLS provider: ring (see workspace Cargo.toml for why
-        // not aws-lc-rs). Err means a provider is already installed: fine.
+        // not aws-lc-rs), with its suites in Node's order of preference
+        // (`tls::node_crypto_provider`). Err means a provider is already
+        // installed: fine -- every config this crate builds names the
+        // provider itself, so the default only serves code that asks for
+        // one by default.
         static TLS_PROVIDER: std::sync::Once = std::sync::Once::new();
         TLS_PROVIDER.call_once(|| {
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            let _ = tls::node_crypto_provider_value().install_default();
         });
         // NODE_EXTRA_CA_CERTS: read once, here at boot, with Node's warning
         // on stderr if the file will not load -- before any script runs and

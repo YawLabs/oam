@@ -46,6 +46,7 @@ use super::connector::{ConnInfo, SuppliedConn};
 use super::decode::{self, MAX_CODINGS, Plan};
 use super::prepare::{self, PrepareError};
 use super::redirect::{self, Next};
+use super::tls_config::TlsRange;
 use super::transport::{channel_body, empty_body, full_body};
 use super::{HttpTransport, NetCheck, NetTarget, ReqBody, Route};
 use crate::OpOutcome;
@@ -104,6 +105,15 @@ pub struct FetchRequest {
     /// what node's fetch and `http.request` use by default.
     #[serde(default)]
     pub max_header_size: Option<u64>,
+    /// For an https URL, the TLS version range: node's live
+    /// `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION` as `node:tls`
+    /// resolves them (bootstrap.js tlsDefaultVersions), "" or absent for a
+    /// side with no bound of its own. Node's undici connects through
+    /// tls.connect, which reads them for every connection.
+    #[serde(default)]
+    pub tls_min_version: Option<String>,
+    #[serde(default)]
+    pub tls_max_version: Option<String>,
 }
 
 fn yes() -> bool {
@@ -286,10 +296,14 @@ pub async fn fetch(
         BodySource::Empty
     };
     let attempt_timeout = attempt_timeout_from_ms(req.attempt_timeout_ms);
+    let tls_range = TlsRange::from_versions(
+        req.tls_min_version.as_deref().filter(|v| !v.is_empty()),
+        req.tls_max_version.as_deref().filter(|v| !v.is_empty()),
+    );
     let route = if req.connect_hook {
-        transport.supplied_route(attempt_timeout)
+        transport.supplied_route(attempt_timeout, tls_range)
     } else {
-        transport.route(req.lookup_hook, attempt_timeout)
+        transport.route(req.lookup_hook, attempt_timeout, tls_range)
     };
     let state = LoopState {
         transport,
