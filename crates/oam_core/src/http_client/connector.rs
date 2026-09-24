@@ -46,8 +46,9 @@ use tower_service::Service;
 
 use super::BoxError;
 use super::prepare::host_for_connect;
-use super::tls_config::{self, TlsConfigs};
+use super::tls_config::{self, TlsConfigs, TlsRange};
 use crate::net_connect::{self, ConnectOptions, Pin};
+use std::sync::atomic::AtomicU8;
 
 /// The byte stream under a connection: TCP, TLS over TCP, or TLS over a
 /// tunnel.
@@ -370,6 +371,42 @@ impl std::fmt::Display for TlsSetupError {
 
 impl std::error::Error for TlsSetupError {}
 
+/// The request's TLS version range -- node's live defaults, resolved by JS
+/// -- has nothing rustls can offer: node's `ERR_SSL_NO_PROTOCOLS_AVAILABLE`,
+/// with the message tls.connect reports, which the send path maps
+/// (`SendError::to_outcome`).
+#[derive(Debug)]
+pub(crate) struct NoProtocolsAvailable;
+
+impl std::fmt::Display for NoProtocolsAvailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no protocols available for the requested TLS version range")
+    }
+}
+
+impl std::error::Error for NoProtocolsAvailable {}
+
+/// The TLS handshake with the server failed: rustls's error, marked as the
+/// handshake's. The request's outcome tells a fatal alert answering the
+/// handshake -- node: `write EPROTO`, the request head being a write queued
+/// behind it -- from one sent after it (node: the alert's own code), and
+/// the transport closing before the handshake was done from a reset after
+/// it (#196).
+#[derive(Debug)]
+pub(crate) struct HandshakeFailed(pub(crate) std::io::Error);
+
+impl std::fmt::Display for HandshakeFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "handshake failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for HandshakeFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
 /// Where a transport's TLS configs come from.
 #[derive(Clone)]
 pub enum TlsSource {
@@ -396,6 +433,14 @@ pub(crate) struct Shared {
     /// `net.setDefaultAutoSelectFamilyAttemptTimeout()` is changing a value
     /// that is process-wide in node too.
     pub(crate) attempt_timeout_ms: AtomicU64,
+    /// The TLS version range of the request being sent (`TlsRange::code`):
+    /// node's live `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION`, which
+    /// every send stores before its request goes out and the connector reads
+    /// at the handshake, like `attempt_timeout_ms`. Two concurrent requests
+    /// can only disagree while a default is being reassigned, a value that is
+    /// process-wide in node too; a pooled connection made under an earlier
+    /// value is reused, as node's undici reuses its own.
+    pub(crate) tls_range: AtomicU8,
 }
 
 impl Shared {
@@ -408,13 +453,30 @@ impl Shared {
         self.attempt_timeout_ms.store(ms, Ordering::Relaxed);
     }
 
+    pub(crate) fn tls_range(&self) -> TlsRange {
+        TlsRange::from_code(self.tls_range.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn set_tls_range(&self, range: TlsRange) {
+        self.tls_range.store(range.code(), Ordering::Relaxed);
+    }
+
     /// The config for an origin handshake, or with `for_proxy` for the
-    /// handshake with an https proxy.
+    /// handshake with an https proxy, in the range the request being sent
+    /// asked for (`set_tls_range`).
     async fn tls(&self, for_proxy: bool) -> Result<Arc<ClientConfig>, BoxError> {
         let configs = match &self.tls {
-            TlsSource::Platform => tls_config::platform()
-                .await
-                .map_err(|e| Box::new(TlsSetupError(e)) as BoxError)?,
+            TlsSource::Platform => {
+                let range = self.tls_range();
+                if range == TlsRange::None {
+                    return Err(Box::new(NoProtocolsAvailable));
+                }
+                tls_config::platform(range)
+                    .await
+                    .map_err(|e| Box::new(TlsSetupError(e)) as BoxError)?
+            }
+            // Tests' prebuilt configs: their versions are their own, the
+            // request's range is not applied.
             TlsSource::Fixed(configs) => configs.clone(),
             TlsSource::Unavailable(message) => {
                 return Err(Box::new(TlsSetupError(message.clone())));
@@ -908,7 +970,8 @@ where
 {
     let tls = tokio_rustls::TlsConnector::from(config)
         .connect(name, io)
-        .await?;
+        .await
+        .map_err(|e| Box::new(HandshakeFailed(e)) as BoxError)?;
     let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2".as_slice());
     Ok((tls, h2))
 }
@@ -923,6 +986,7 @@ mod tests {
             proxy,
             user_agent: HeaderValue::from_static("oam/test"),
             attempt_timeout_ms: AtomicU64::new(250),
+            tls_range: AtomicU8::new(TlsRange::Both.code()),
         })
     }
 

@@ -35,6 +35,9 @@ use crate::OpOutcome;
 use crate::net_connect::{ConnectError, DEFAULT_ATTEMPT_TIMEOUT};
 
 pub use super::connector::TlsSource;
+use super::connector::{HandshakeFailed, NoProtocolsAvailable};
+use super::tls_config::TlsRange;
+use std::sync::atomic::AtomicU8;
 
 /// The proxy rules a transport applies to its pooled requests.
 pub enum ProxySource {
@@ -95,6 +98,7 @@ impl HttpTransport {
             attempt_timeout_ms: AtomicU64::new(
                 u64::try_from(DEFAULT_ATTEMPT_TIMEOUT.as_millis()).unwrap_or(250),
             ),
+            tls_range: AtomicU8::new(TlsRange::Both.code()),
         });
         let client = build_client(OamConnector {
             shared: shared.clone(),
@@ -112,7 +116,12 @@ impl HttpTransport {
     /// recorded with [`Route::set_addrs`] and never through the environment
     /// proxy; its pool is its own and dies with the route. Otherwise the
     /// fetch shares the process pool.
-    pub fn route(&self, lookup_hook: bool, attempt_timeout: Duration) -> Route {
+    pub fn route(
+        &self,
+        lookup_hook: bool,
+        attempt_timeout: Duration,
+        tls_range: TlsRange,
+    ) -> Route {
         let hooked = lookup_hook.then(|| {
             let addrs: HostAddrs = Arc::new(Mutex::new(HashMap::new()));
             let client = build_client(OamConnector {
@@ -126,6 +135,7 @@ impl HttpTransport {
         });
         Route {
             attempt_timeout,
+            tls_range,
             hooked,
             supplied: None,
         }
@@ -137,7 +147,7 @@ impl HttpTransport {
     /// returned. Nothing on it is pooled -- each hop parks for a connection
     /// of its own and uses it once -- so a supplied connection can never be
     /// reused for a request the dispatcher's function was not asked about.
-    pub fn supplied_route(&self, attempt_timeout: Duration) -> Route {
+    pub fn supplied_route(&self, attempt_timeout: Duration, tls_range: TlsRange) -> Route {
         let conns: SuppliedConns = Arc::new(Mutex::new(HashMap::new()));
         let client = Client::builder(TokioExecutor::new())
             .timer(TokioTimer::new())
@@ -151,6 +161,7 @@ impl HttpTransport {
             });
         Route {
             attempt_timeout,
+            tls_range,
             hooked: None,
             supplied: Some(Supplied { conns, client }),
         }
@@ -162,6 +173,9 @@ impl HttpTransport {
         route: &Route,
         mut request: http::Request<ReqBody>,
     ) -> Result<http::Response<Incoming>, SendError> {
+        // Every route's connector handshakes through the shared state, so
+        // the request's version range goes there whichever client sends it.
+        self.shared.set_tls_range(route.tls_range);
         let client = match (&route.hooked, &route.supplied) {
             (Some(hooked), _) => &hooked.client,
             (None, Some(supplied)) => &supplied.client,
@@ -273,6 +287,9 @@ fn build_client(connector: OamConnector) -> Client<OamConnector, ReqBody> {
 /// How one fetch reaches the network.
 pub struct Route {
     attempt_timeout: Duration,
+    /// The TLS version range its https handshakes run in: node's live
+    /// defaults as JS resolved them for this request.
+    tls_range: TlsRange,
     hooked: Option<Hooked>,
     supplied: Option<Supplied>,
 }
@@ -404,6 +421,48 @@ impl SendError {
         {
             return OpOutcome::node_failed(code, refusal.message.clone());
         }
+        // A version range with nothing to offer (node's live defaults leave
+        // none): the code tls.connect reports for the same range.
+        if let Some(none) = find_in_chain::<NoProtocolsAvailable>(&self.error) {
+            return OpOutcome::node_failed("ERR_SSL_NO_PROTOCOLS_AVAILABLE", none.to_string());
+        }
+        // A fatal alert the server sent (#196). The two callers of this
+        // transport shape it differently, as node's two do, so the outcome
+        // carries the alert and the JS side -- which knows whether it is a
+        // `fetch` or an option-less `https.get` -- finishes it:
+        // - `fetch` reports the alert as the request's `cause`, code and
+        //   all, whether it answered the handshake or came after it;
+        // - `https.get` fails a handshake-time alert with `write EPROTO`
+        //   (its request head was a write queued behind the handshake, which
+        //   OpenSSL then refused; measured for every alert, #146) and keeps
+        //   a post-handshake alert's own code.
+        // The `handshake failed:` message prefix marks a handshake-time
+        // alert for the JS; a description node cannot name is `ECONNRESET`
+        // (its disconnect, which `fetch` keeps) with the same prefix and the
+        // `received fatal alert` text a transport EOF lacks, so `https.get`
+        // can still tell it from a close and make it `write EPROTO`.
+        if let Some(alert) = received_alert(&self.error) {
+            let handshake = find_in_chain::<HandshakeFailed>(&self.error).is_some();
+            let detail = format!("received fatal alert: {alert:?}");
+            let message = if handshake {
+                format!("handshake failed: {detail}")
+            } else {
+                detail
+            };
+            return match crate::tls::alert_code(alert) {
+                Some(code) => OpOutcome::node_failed(code, message),
+                None if handshake => OpOutcome::node_failed("ECONNRESET", message),
+                None => OpOutcome::node_failed("EPROTO", message),
+            };
+        }
+        // The transport closed before the handshake was done: node's
+        // disconnect, with its own message (the JS side adds the options
+        // the request dialled with).
+        if let Some(handshake) = find_in_chain::<HandshakeFailed>(&self.error)
+            && handshake.0.kind() == std::io::ErrorKind::UnexpectedEof
+        {
+            return crate::tls::disconnected_before_secure();
+        }
         if let Some(tls) = find_in_chain::<TlsSetupError>(&self.error) {
             return OpOutcome::Failed(tls.to_string());
         }
@@ -503,6 +562,27 @@ fn node_cert_refusal<'a>(
         .0
         .downcast_ref::<crate::tls::NodeCertRefusal>()
         .map(|refusal| &refusal.0)
+}
+
+/// The fatal alert a handshake or a read in this error's chain received, if
+/// one did. tokio-rustls wraps the `rustls::Error` in an `io::Error` whose
+/// `source()` is the rustls error's own (none), not the rustls error, so
+/// the chain walk cannot see it: each io error on the way is opened with
+/// `get_ref` instead (`tls::received_alert`), as tls.connect's is.
+fn received_alert(error: &(dyn std::error::Error + 'static)) -> Option<rustls::AlertDescription> {
+    let mut current = Some(error);
+    while let Some(e) = current {
+        if let Some(rustls::Error::AlertReceived(alert)) = e.downcast_ref::<rustls::Error>() {
+            return Some(*alert);
+        }
+        if let Some(io) = e.downcast_ref::<std::io::Error>()
+            && let Some(alert) = crate::tls::received_alert(io)
+        {
+            return Some(alert);
+        }
+        current = e.source();
+    }
+    None
 }
 
 fn find_in_chain<'a, T: std::error::Error + 'static>(

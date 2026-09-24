@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "7357685",
+  "commit": "588665c+wip",
   "oamVersion": "oam 0.16.4",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 170,
-      "total": 170,
+      "pass": 175,
+      "total": 175,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -363,11 +363,31 @@
           "status": "pass"
         },
         {
-          "case": "178-cjs-module-object.mjs",
+          "case": "178-tls-cipher-order-and-version-defaults.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "179-https-request-tls-options.mjs",
           "status": "pass"
         },
         {
           "case": "18-zlib-classes.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "180-tls-alert-codes.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "181-http2-session-silent-on-post-connect-failure.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "182-tls-altname-error-carries-cert.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "183-cjs-module-object.mjs",
           "status": "pass"
         },
         {

@@ -285,12 +285,14 @@ statement, including what is and is not in scope for a vulnerability report.
 
 ### 5. `NODE_OPTIONS` is honored for a strict allowlist only
 
-oam reads `NODE_OPTIONS` and folds it in before argv, so an explicit command-line flag
+oam reads `NODE_OPTIONS` and folds it in under argv, so an explicit command-line flag
 still wins. Only these tokens are accepted:
 
 ```
 --pending-deprecation   --no-warnings   --no-deprecation   --expose-gc
 --disable-warning[=]    --redirect-warnings[=]
+--max-http-header-size[=]   --insecure-http-parser
+--tls-min-v1.0  --tls-min-v1.1  --tls-min-v1.2  --tls-min-v1.3  --tls-max-v1.2  --tls-max-v1.3
 ```
 
 Everything else in the variable is **ignored, not rejected** — `NODE_OPTIONS` is usually
@@ -1090,35 +1092,97 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
 - **`minVersion` / `maxVersion` / `secureProtocol` are honoured** by `tls.connect`,
   `tls.createServer`, `https.createServer` and `https.request` (#144) -- which sends a
   request carrying any of them, or `ca`, a client certificate, `servername`,
-  `checkServerIdentity` or `rejectUnauthorized: false`, over `tls.connect` (entry 43) --
+  `checkServerIdentity`, a `secureContext` or `rejectUnauthorized: false`, in its own
+  options or its agent's (`https.globalAgent.options` included), over `tls.connect` (entry
+  43; #146, `conformance/cases/179-https-request-tls-options.mjs`) --
   with Node's synchronous `TypeError`s and its asynchronous codes
   (`ERR_SSL_NO_PROTOCOLS_AVAILABLE`, `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`), pinned by
   `conformance/cases/109-tls-protocol-version.mjs`. `tls.connect` calls a
   `checkServerIdentity` after the chain check, as Node does, and destroys the socket with
   its error before `'secureConnect'`. Up to 0.16.2 a verifying `https.request` went through
   one shared client that applied none of these (a version pin printed a `Warning`), and
-  `tls.connect` never called `checkServerIdentity`. What still differs:
+  `tls.connect` never called `checkServerIdentity`. A pinned TLS 1.2 handshake negotiates
+  `ECDHE-RSA-AES128-GCM-SHA256`, as between two Node peers: oam offers its suites in
+  `tls.DEFAULT_CIPHERS`' order (under TLS 1.2 the ECDHE AES-128-GCM suites before AES-256-GCM,
+  CHACHA20 last; under TLS 1.3 AES-256, CHACHA20, AES-128) on every client and server, and a
+  server picks by its own list unless `honorCipherOrder` is given falsy. `tls.DEFAULT_MIN_VERSION`
+  / `DEFAULT_MAX_VERSION` are the live defaults of the two options -- assignable, set at
+  startup by `--tls-min-v1.x` / `--tls-max-v1.x` (argv or `NODE_OPTIONS`, Node's precedence
+  when several are given) -- and are validated as Node validates them; `TLS_method` ignores
+  them and `SSLv23_method` keeps the default floor (`conformance/cases/178-tls-cipher-order-and-version-defaults.mjs`).
+  They reach `fetch()` and an option-less `https.get()` -- the requests oam sends over its
+  shared transport -- as they reach Node's, whose undici and https agent connect through
+  `tls.connect`: the handshake runs in the range the defaults name, an empty range fails
+  with `ERR_SSL_NO_PROTOCOLS_AVAILABLE` (a fetch's cause) and a floor above the server's
+  ceiling with `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`. Up to 0.16.4 rustls's own order put
+  AES-256 first (`ECDHE-RSA-AES256-GCM-SHA384`), `honorCipherOrder` was ignored, the
+  defaults were inert constants, the flags were rejected as unknown arguments, and the
+  shared transport was built once with every version. What still differs:
+  - The **`write EPROTO` a refused handshake turns into** carries rustls's text (`write
+    EPROTO received fatal alert: ProtocolVersion`) where Node's carries OpenSSL's. The shape
+    is Node's: a server answering the ClientHello with the `protocol_version` alert fails a
+    socket that had nothing queued with `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`, and one
+    with a write queued behind the handshake -- `tls.connect(o); s.write(x)`, an `https`
+    request whose head was written by `end()`, `write()` or `flushHeaders()`, any request
+    on the shared transport -- with that write's `write EPROTO` (errno, code, syscall) on
+    the socket's error and every queued write's callback (#146,
+    `conformance/cases/179-https-request-tls-options.mjs`). `end()` with no data queues no
+    write. An empty range fails with `ERR_SSL_NO_PROTOCOLS_AVAILABLE` on both.
   - **A `TLSv1` / `TLSv1.1` floor is raised to TLS 1.2** -- rustls offers nothing lower --
     which is observationally what Node negotiates too (OpenSSL 3 cannot build a legacy hello
     either: an explicit sub-1.2 range fails with `ERR_SSL_NO_PROTOCOLS_AVAILABLE` on both).
   - The **asynchronous error messages** are rustls's (`no protocols available for the
     requested TLS version range`, `received fatal alert: ProtocolVersion`); Node's are OpenSSL
     diagnostics carrying its build path. Only the `code` is matched.
-  - A **TLS 1.2 handshake negotiates `ECDHE-RSA-AES256-GCM-SHA384`** where Node's OpenSSL
-    prefers `ECDHE-RSA-AES128-GCM-SHA256`: rustls orders AES-256 first. `getCipher()` reports
-    it in OpenSSL's spelling either way.
+  - The **`ciphers` option is still ignored** (entry 42), so a list that reorders or narrows
+    the suites changes nothing, and `tls.DEFAULT_CIPHERS` is absent; only the nine suites
+    rustls implements are ever offered, in the order above, and `tls.getCiphers()` lists
+    those nine (in Node's lowercase spelling) where Node lists OpenSSL's 62.
+  - **`process.execArgv` lists the Node flags oam takes in a fixed order** (the `--tls-*`
+    flags last, minimums by version then maximums); Node keeps the order they were given
+    in. A single flag reads the same; two or more may come back reordered.
   - A **`_server_method` name on a client** (or `_client_method` on a server) is taken as its
     base method here; Node's OpenSSL accepts the name and then fails the handshake with
     `ERR_SSL_CALLED_A_FUNCTION_YOU_SHOULD_NOT_CALL`, a misuse it does not check up front.
-- **A fatal alert from the server fails a client with `EIO`**, except `protocol_version`
-  (`ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`, as in Node). Node names every alert a client
-  receives: `ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL` when the server has none of the
-  offered ALPN protocols, `ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED` when a TLS 1.3 server
-  that requires a client certificate gets none (that alert arrives after `'secureConnect'`).
-  oam's `tls.connect` -- and `https.request` and an `http2.connect` stream over it -- fails
-  with `EIO` and rustls's message instead. The connection is refused either way; only the
-  code differs. (`conformance/cases/145-tls-clients-against-tls-servers.mjs` leaves the
-  client's code out for this reason.)
+- **A fatal alert from the server is named with Node's code** on every client (#196):
+  `tls.connect`, `https.request`, an option-less `https.get`, `fetch` and an
+  `http2.connect` session and its streams -- `ERR_SSL_` and OpenSSL 3's reason for the
+  alert, uppercased (`ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE`,
+  `ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL` when the server has none of the offered
+  ALPN protocols, `ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED` when a TLS 1.3 server that
+  requires a client certificate gets none, which arrives after `'secureConnect'`), with
+  `library` and `reason` ahead of `code`, answering the handshake or after it. The `write
+  EPROTO` rule above holds for every alert answering the handshake on `tls.connect` and
+  `https.request` (an `https.get` with no TLS option of its own reports it the same way);
+  `fetch` keeps the alert's code as its `cause` instead, as Node's does; a description Node
+  cannot name (255) is its disconnect (`ECONNRESET`, "Client network socket disconnected
+  before secure TLS connection was established", with `path`, `host`, `port` and
+  `localAddress`) on a socket with nothing queued, as the transport closing during the
+  handshake is on any; a warning-level alert is ignored. A write queued behind a handshake
+  that ends otherwise gets Node's error on its callback too: `write ECANCELED Canceled
+  because of SSL destruction` when the transport closes, `write EBADF` when the verifier
+  refuses the certificate, a detail-less `write EPROTO` when the version range offers
+  nothing (a second queued write gets the socket's error, as a buffered write does on
+  `destroy()`). Measured for every description on Node v22.22.2 (OpenSSL 3.5.5) and pinned
+  by `conformance/cases/180-tls-alert-codes.mjs` and 145. Up to 0.16.4 every alert but
+  `protocol_version` failed a `tls.connect`-based client (`tls.connect`, `https.request`,
+  `http2`) with `EIO` and left an option-less `https.get` / `fetch` with a bare `socket
+  hang up`, and a queued write got `ERR_SOCKET_CLOSED_BEFORE_CONNECTION` whatever ended the
+  handshake. What still differs:
+  - The **message is rustls's** (`received fatal alert: HandshakeFailure`) where Node's is
+    OpenSSL's diagnostic (`...:error:0A000410:SSL routines:ssl3_read_bytes:ssl/tls alert
+    handshake failure:...`), which carries its build path.
+  - **A fatal alert the server sends AFTER the handshake over the shared transport** -- an
+    option-less `https.get` or a `fetch` to a TLS 1.3 server that requires a client
+    certificate -- is `ECONNRESET` `socket hang up`, not the alert's code: hyper collapses
+    a post-handshake read failure to a connection-closed, so oam cannot recover the alert
+    there. `tls.connect`, `https.request` and an `http2` stream (which read the alert
+    themselves) do report it.
+  - **A server that answers the ClientHello with something that is not TLS** fails oam's
+    client with `EIO` and rustls's message; Node reports `ERR_SSL_PACKET_LENGTH_TOO_LONG`
+    (or `write EPROTO`, with a write queued).
+  - **An alert Node cannot name, sent after the handshake**, is `EPROTO` with no syscall
+    and rustls's message on oam; Node's shape for it was not measured.
 - **`tls.setDefaultCACertificates()` is absent.** Node 22.15 and later replace the
   default trust store with it; oam has `NODE_EXTRA_CA_CERTS` and the `ca` option (and
   `tls.getCACertificates()` to read the default store out) only.
@@ -1129,18 +1193,13 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   OpenSSL-layout bundle elsewhere); Node reads a different set of Windows stores, and lists
   the duplicates among them. Neither list is used to verify anything unless it is passed as
   `ca`: oam has no `--use-system-ca`.
-- **A refused name carries no certificate.** `tls.connect`'s
-  `ERR_TLS_CERT_ALTNAME_INVALID` has Node's message, `reason` and `host`, but its `cert` is
-  `{}`: oam's verifier refuses the name inside the handshake, so the peer's chain never
-  reaches JS. A `checkServerIdentity` of the caller's own is handed the certificate as in
-  Node (it is called after the handshake).
-
-The complete fix for the chain is making `net.Socket` a real `Duplex` and re-parenting
-`TLSSocket` under it; that is a rewrite of the class every socket-heavy module leans on, and
-it waits for the `net` tranche of the vendored Node suite to gate it.
-
 _(probed)_ Node v22.22.2 and oam on the same fixtures: `instanceof` both true; chains as
-described; the bare-`connect()` and `socket`-option shapes as described.
+described; the bare-`connect()` and `socket`-option shapes as described. A refused name's
+`ERR_TLS_CERT_ALTNAME_INVALID` now carries the peer certificate as Node's `err.cert` (#198):
+the verifier hands the chain it refused out of the handshake, and `tls.connect`'s error path
+builds the certificate from it exactly as `getPeerCertificate(true)` does, `issuerCertificate`
+linked. A chain-build failure (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) still leaves `err.cert` `{}`,
+as Node does.
 
 ### 35. `http` and `fetch` to a refused port — FIXED, no longer a divergence (#143)
 
@@ -1814,7 +1873,8 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
 - **A context's `ciphers`, `ecdhCurve`, `sigalgs`, `dhparam`, `crl`, `sessionIdContext`,
   `ticketKeys`, `sessionTimeout`, `privateKeyIdentifier` / `privateKeyEngine` and
   `clientCertEngine` are ignored** (and not validated): rustls has no knobs for them. `key`,
-  `cert`, `ca`, `pfx`, `passphrase` and the version range are read as Node reads them, at
+  `cert`, `ca`, `pfx`, `passphrase`, `honorCipherOrder` and the version range are read as
+  Node reads them, at
   `createSecureContext()` / `createServer()` / `connect()`.
 - **`createServer()`'s errors carry no `opensslErrorStack`**, and a `pfx` that cannot be
   parsed is `not enough data` whatever is wrong with it (OpenSSL names the fault).
@@ -2061,15 +2121,23 @@ oam's shared client. What differs:
 - **A plain `Duplex` from `createConnection` is used as it is.** Node wraps a stream that is
   not a socket in its `JSStreamSocket` and hands that wrapper to `'connect'`; oam runs the
   session over the stream itself and hands it on.
-- **A fatal alert after the handshake also ends the session with events.** When a TLS 1.3
-  server refuses a session that sent no client certificate, the pending stream fails and
-  closes as in Node (its code is `EIO`, entry 34), and oam's session then emits `'error'`
-  and `'close'`; Node's session is destroyed and emits neither (measured for 3 s).
-- **A session the server refuses reports it differently.** Against an `http2` secure
-  server that destroys the connection in `'connection'`, Node's session emits `'error'`
-  `ECONNRESET` and oam's `EIO`. Destroyed in `'secureConnection'`, Node's session closes
-  cleanly where oam's emits `'error'` `ECONNABORTED` first -- or
-  `ERR_STREAM_WRITE_AFTER_END` when that listener runs ahead of the server's own.
+- **A fatal alert after the handshake leaves the session silent, as in Node** (#197). When
+  a TLS 1.3 server refuses a session that sent no client certificate, the pending stream
+  carries the alert (`ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED`, #196) and the session is
+  destroyed without `'error'` or `'close'` -- so a program that handles the request's
+  error, as it would on Node with no reason to listen on the session, is not taken down by
+  the session's. oam re-surfaced it on the session, `'error'` then `'close'`, until #197.
+  A connection-level failure before `'connect'` -- a refused connection, or a reset or EOF
+  during the handshake -- still reaches the session as `'error'` then `'close'` on both, an
+  unhandled one ending the process on both: the code is the socket's own, `ECONNREFUSED`
+  for a refusal and `ECONNRESET` for a reset or EOF.
+- **A reset the instant the handshake finishes gives the session's `'error'` a different
+  code.** When a server accepts the TLS connection and then resets it before the HTTP/2
+  preface is exchanged, both runtimes cancel the pending stream (`ERR_HTTP2_STREAM_CANCEL`)
+  and emit `'error'` on the session (an unhandled one ends the process on both), but oam's
+  session-error code is `ERR_STREAM_WRITE_AFTER_END` where Node's is `ECONNRESET`. A
+  graceful close after the session is up ends both cleanly with the stream's `'close'` and
+  the session's.
 
 _(probed)_ Node v22.22.2 vs oam on Windows: lookup and createConnection guards over h2c, and
 a node-hosted `createSecureServer` for `ca`, `servername`, a refusing lookup, an untrusted

@@ -18,6 +18,104 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **A refused server name failed `tls.connect` with `ERR_TLS_CERT_ALTNAME_INVALID` whose
+  `cert` was `{}`, where Node hands over the peer certificate** (#198). Node reports the
+  certificate the name check refused as `err.cert` -- the same object
+  `getPeerCertificate(true)` returns, its subject, issuer, altnames, fingerprints, validity
+  and linked `issuerCertificate` -- which is what diagnostics print. oam's verifier refused
+  the name inside the handshake, so the chain never reached JS and `err.cert` was empty. The
+  verifier now carries the chain it refused out through the verdict, and `tls.connect`'s
+  error path builds `err.cert` from it with the routine `getPeerCertificate()` uses, so a
+  caught `ERR_TLS_CERT_ALTNAME_INVALID` reports the same certificate on both runtimes. A
+  chain-build failure (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) still leaves `err.cert` `{}`, as
+  Node does. Measured on node v22.22.2.
+- **An `http2.connect` session ended by a server's fatal TLS alert emitted `'error'` and
+  `'close'`, crashing a program that had no session `'error'` listener** (#197). A TLS 1.3
+  server that requires a client certificate answers a client that sent none with a fatal
+  `certificate_required` alert after the handshake; Node carries it on the pending stream
+  (`ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED`, #196) and destroys the session silently, so
+  a program written for Node -- handling the request's error, with no reason to listen on
+  the session -- survives. oam re-surfaced the alert on the session as an unhandled
+  `'error'`, taking the process down. It now leaves the session silent, as Node does, while
+  a connection-level failure -- a refused connection, a reset or EOF during the handshake --
+  still reaches the session. Conformance case 181 and an e2e test pin it; measured on node
+  v22.22.2.
+- **A pinned TLS 1.2 handshake between two oam peers negotiated
+  `ECDHE-RSA-AES256-GCM-SHA384`, where two node peers negotiate
+  `ECDHE-RSA-AES128-GCM-SHA256`; a server's `honorCipherOrder` was ignored;
+  `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION` were inert constants; and
+  `--tls-min-v1.x` / `--tls-max-v1.x` were rejected as unknown arguments** (#144, the
+  residue of 0.16.1's fix). oam's rustls now offers its cipher suites in
+  `tls.DEFAULT_CIPHERS`' order -- under TLS 1.2 the ECDHE AES-128-GCM suites before the
+  AES-256-GCM ones and CHACHA20 last, under TLS 1.3 AES-256, CHACHA20, AES-128 -- on every
+  client (`tls.connect`, `https.request`, `fetch`) and every server, and a server picks a
+  suite by its own list unless `honorCipherOrder` is given falsy, as node's does. A
+  `minVersion` / `maxVersion` left null is the module's live `DEFAULT_MIN_VERSION` /
+  `DEFAULT_MAX_VERSION`, read when the connection or server is made and validated like an
+  explicit value (`ERR_TLS_INVALID_PROTOCOL_VERSION`, the minimum checked first and both
+  before a method name); `TLS_method` ignores the defaults and `SSLv23_method` keeps the
+  default floor, as in node. They reach `fetch()` and an option-less `https.get()` too --
+  node's undici and https agent connect through `tls.connect`, which reads them for every
+  connection -- where oam's shared transport was built once with every version: a request
+  now handshakes in the range the defaults name, an empty one fails with
+  `ERR_SSL_NO_PROTOCOLS_AVAILABLE` (a fetch's cause) and a default that is not a version
+  fails a fetch with `ERR_TLS_INVALID_PROTOCOL_VERSION` as its cause, as in node.
+  `new tls.TLSSocket(socket, options)` validates the version options (and the defaults they
+  fall back to) at construction, as node's constructor does, unless given a `secureContext`;
+  the value in these messages is rendered as node's `%j` renders it (a function or symbol
+  `undefined`, a circular object `[Circular]`, a BigInt JSON's own refusal). The six flags
+  set the initial defaults, from argv or `NODE_OPTIONS`, with node's precedence when
+  several are given (and node's refusal of `--tls-min-v1.3` with `--tls-max-v1.2`: exit 9
+  before anything runs), and come back through `process.execArgv`. Conformance case 178
+  holds all of it to node v22.22.2, the negotiated cipher names included, which case 109
+  had to leave out. `tls.getCiphers()` now lists the nine suites oam offers, in node's
+  lowercase spelling, where it listed three TLS 1.3 names. The `ciphers` option is still
+  ignored (docs/node-divergences.md, entry 42).
+- **A fatal alert from the server failed the `tls.connect`-based clients with `EIO`** --
+  `tls.connect`, `https.request` and an `http2.connect` session -- **where node names the
+  alert**, and left an option-less `https.get` or `fetch` with a bare `socket hang up`
+  (only `protocol_version` was named, #146) (#196). Every alert a server can send is now node's code:
+  `ERR_SSL_` and OpenSSL 3's reason for it, uppercased
+  (`ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE`, `ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL`,
+  `ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED` from a TLS 1.3 server requiring a client
+  certificate, which arrives after `'secureConnect'`), with `library` and `reason` ahead of
+  `code`; the `write EPROTO` rule of #146 holds for every alert answering the handshake on
+  `tls.connect` and `https.request` (an option-less `https.get` reports it the same way,
+  where `fetch` keeps the alert's code as its `cause`); a description node cannot name is node's
+  disconnect (`ECONNRESET`, "Client network socket disconnected before secure TLS
+  connection was established", carrying `path`, `host`, `port` and `localAddress`) on a
+  socket with nothing queued and that EPROTO on one with a write queued, and the transport
+  closing during the handshake -- or after a warning-level alert -- is that disconnect on
+  every client. A write queued behind a handshake that ends otherwise gets node's error
+  on its callback: `write ECANCELED Canceled because of SSL destruction` when the transport
+  closes, `write EBADF` when the verifier refuses the certificate, a detail-less `write
+  EPROTO` when the version range offers nothing -- where every one got
+  `ERR_SOCKET_CLOSED_BEFORE_CONNECTION` -- and `authorizationError` stays null after an
+  alert, as in node. Measured for every alert description on node v22.22.2 (OpenSSL 3.5.5);
+  conformance case 180 pins the table on five clients and case 145 now compares the
+  refused client's code, which it had to leave out. The same table names the alert a
+  client sends on a server's `tlsClientError`, in OpenSSL 3's spelling
+  (`ERR_SSL_SSL/TLS_ALERT_*` where 0.16.4 said `ERR_SSL_SSLV3_ALERT_*`). The messages stay
+  rustls's (docs/node-divergences.md, entry 34).
+- **A handshake the server refuses with the `protocol_version` alert failed an `https`
+  request with the alert's own code, `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`, where node's
+  fails with `write EPROTO`** (#146). Node's rule, measured: a socket with nothing queued
+  gets the alert's code; one with a write queued behind the handshake -- `tls.connect(o);
+  s.write(x)`, an https request's head once `end()`, `write()` or `flushHeaders()` ran, any
+  request on the shared transport -- gets that write's `write EPROTO` (errno, code, syscall)
+  on the socket's error and every queued write's callback; `end()` with no data queues no
+  write. oam now follows it. The rest of #146 -- a verifying `https.request`'s `ca`,
+  `minVersion` / `maxVersion` / `secureProtocol`, `cert` / `key`, `servername`,
+  `checkServerIdentity` and `secureContext`, in its own options or its agent's -- has held
+  since 0.16.3, when such a request began to go over `tls.connect` (entry 43); conformance
+  case 179 now pins it, the negotiated protocol read from the server.
+- **`process.execArgv` listed the flags `NODE_OPTIONS` carried** (`NODE_OPTIONS=--no-warnings`
+  made it `['--no-warnings']`), where node lists what the command line gave and nothing
+  else: a child re-spawned from it got every environment flag twice. `NODE_OPTIONS` is now
+  read into flags of its own and merged under argv's -- an explicit flag still wins, lists
+  apply the environment's entries first -- and `execArgv` reflects argv alone. Found by
+  case 178, which spawns children under `NODE_OPTIONS`.
+
 - **`require.main` was never set, so `if (require.main === module)` never ran.** A CommonJS
   script uses that guard to tell being run from being required, and in oam it was always
   false: the script loaded, did nothing and exited 0. A hook script whose job is to refuse a

@@ -53,7 +53,7 @@ use x509_parser::time::ASN1Time;
 
 /// What `tls.createServer()` hands the native side, already validated and
 /// normalised by the JS layer (Node's option checks throw there).
-#[derive(Debug, Default, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ServerContextSpec {
     /// The `cert` option: one entry per chain (a string may hold a whole
@@ -74,6 +74,25 @@ pub struct ServerContextSpec {
     /// The effective `minVersion` / `maxVersion` ("" = Node's default).
     pub min_version: String,
     pub max_version: String,
+    /// The server's `honorCipherOrder`: a suite is chosen by the server's
+    /// order of preference (Node's default, `SSL_OP_CIPHER_SERVER_PREFERENCE`
+    /// there) rather than the client's.
+    pub honor_cipher_order: bool,
+}
+
+impl Default for ServerContextSpec {
+    fn default() -> Self {
+        Self {
+            certs: Vec::new(),
+            keys: Vec::new(),
+            pfx: Vec::new(),
+            passphrase: None,
+            ca: None,
+            min_version: String::new(),
+            max_version: String::new(),
+            honor_cipher_order: true,
+        }
+    }
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -221,6 +240,9 @@ pub struct ServerContext {
     plain: Option<Arc<rustls::ServerConfig>>,
     versions: Vec<&'static rustls::SupportedProtocolVersion>,
     provider: Arc<rustls::crypto::CryptoProvider>,
+    /// `honorCipherOrder`: carried so a per-connection config built from
+    /// scratch (`config_for`) picks suites the way `plain` does.
+    honor_cipher_order: bool,
     resolver: Arc<dyn rustls::server::ResolvesServerCert>,
     /// Node's verdict on a requested client certificate.
     judge: Arc<ClientCertJudge>,
@@ -278,6 +300,7 @@ impl ServerContext {
                 .with_cert_resolver(Arc::clone(&self.resolver));
             config.session_storage = Arc::clone(&plain.session_storage);
             config.ticketer = Arc::clone(&plain.ticketer);
+            config.ignore_client_order = self.honor_cipher_order;
             config
         } else if options.alpn.is_empty() {
             return Arc::clone(plain);
@@ -412,11 +435,11 @@ pub(crate) fn load_identities(
     Ok(Identities { certified, pfx_cas })
 }
 
-/// The crypto provider every context is built with.
+/// The crypto provider every context is built with: ring, its suites in
+/// Node's order (`super::node_crypto_provider`), which is what a server
+/// honouring its own order picks by.
 pub(crate) fn provider() -> Arc<rustls::crypto::CryptoProvider> {
-    rustls::crypto::CryptoProvider::get_default()
-        .cloned()
-        .unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()))
+    super::node_crypto_provider()
 }
 
 /// Build a server's context, or the error Node throws at `createServer()`.
@@ -444,17 +467,24 @@ pub fn build_server_context(spec: &ServerContextSpec) -> Result<ServerContext, C
     let plain = if versions.is_empty() {
         None
     } else {
-        let config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
             .with_protocol_versions(&versions)
             .map_err(|e| ContextError::plain(&format!("tls server config: {e}"), None))?
             .with_no_client_auth()
             .with_cert_resolver(Arc::clone(&resolver));
+        // Node's server picks by its own list unless honorCipherOrder is
+        // false (measured: a client offering AES-256 before AES-128 under
+        // TLS 1.2 gets AES-128 from a default server, AES-256 from one
+        // created with `honorCipherOrder: false`); rustls's default is the
+        // client's order.
+        config.ignore_client_order = spec.honor_cipher_order;
         Some(Arc::new(config))
     };
     Ok(ServerContext {
         plain,
         versions,
         provider,
+        honor_cipher_order: spec.honor_cipher_order,
         resolver,
         judge,
         has_identity,
@@ -678,9 +708,15 @@ impl ClientCertJudge {
         let inner = if root_store.is_empty() {
             None
         } else {
-            rustls::server::WebPkiClientVerifier::builder(Arc::new(root_store))
-                .build()
-                .ok()
+            // Built on the same provider as every config here, not the
+            // process-wide default (which `oam install`'s own client may
+            // have installed first).
+            rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(root_store),
+                provider(),
+            )
+            .build()
+            .ok()
         };
         ClientCertJudge {
             inner,
@@ -831,46 +867,10 @@ fn socket_hang_up() -> OpOutcome {
     OpOutcome::node_failed("ECONNRESET", "socket hang up")
 }
 
-/// OpenSSL's reason code for a fatal alert the peer sent, as Node names it
-/// (`ERR_SSL_<reason>`): SSLv3-era alerts keep their `SSLV3_ALERT_` names,
-/// TLS 1.0-era ones `TLSV1_ALERT_`, TLS 1.3 additions `TLSV13_ALERT_`.
-pub(crate) fn alert_code(alert: rustls::AlertDescription) -> Option<&'static str> {
-    use rustls::AlertDescription as A;
-    Some(match alert {
-        A::UnexpectedMessage => "ERR_SSL_SSLV3_ALERT_UNEXPECTED_MESSAGE",
-        A::BadRecordMac => "ERR_SSL_SSLV3_ALERT_BAD_RECORD_MAC",
-        A::DecompressionFailure => "ERR_SSL_SSLV3_ALERT_DECOMPRESSION_FAILURE",
-        A::HandshakeFailure => "ERR_SSL_SSLV3_ALERT_HANDSHAKE_FAILURE",
-        A::NoCertificate => "ERR_SSL_SSLV3_ALERT_NO_CERTIFICATE",
-        A::BadCertificate => "ERR_SSL_SSLV3_ALERT_BAD_CERTIFICATE",
-        A::UnsupportedCertificate => "ERR_SSL_SSLV3_ALERT_UNSUPPORTED_CERTIFICATE",
-        A::CertificateRevoked => "ERR_SSL_SSLV3_ALERT_CERTIFICATE_REVOKED",
-        A::CertificateExpired => "ERR_SSL_SSLV3_ALERT_CERTIFICATE_EXPIRED",
-        A::CertificateUnknown => "ERR_SSL_SSLV3_ALERT_CERTIFICATE_UNKNOWN",
-        A::IllegalParameter => "ERR_SSL_SSLV3_ALERT_ILLEGAL_PARAMETER",
-        A::DecryptionFailed => "ERR_SSL_TLSV1_ALERT_DECRYPTION_FAILED",
-        A::RecordOverflow => "ERR_SSL_TLSV1_ALERT_RECORD_OVERFLOW",
-        A::UnknownCA => "ERR_SSL_TLSV1_ALERT_UNKNOWN_CA",
-        A::AccessDenied => "ERR_SSL_TLSV1_ALERT_ACCESS_DENIED",
-        A::DecodeError => "ERR_SSL_TLSV1_ALERT_DECODE_ERROR",
-        A::DecryptError => "ERR_SSL_TLSV1_ALERT_DECRYPT_ERROR",
-        A::ExportRestriction => "ERR_SSL_TLSV1_ALERT_EXPORT_RESTRICTION",
-        A::ProtocolVersion => "ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION",
-        A::InsufficientSecurity => "ERR_SSL_TLSV1_ALERT_INSUFFICIENT_SECURITY",
-        A::InternalError => "ERR_SSL_TLSV1_ALERT_INTERNAL_ERROR",
-        A::InappropriateFallback => "ERR_SSL_TLSV1_ALERT_INAPPROPRIATE_FALLBACK",
-        A::UserCanceled => "ERR_SSL_TLSV1_ALERT_USER_CANCELLED",
-        A::NoRenegotiation => "ERR_SSL_TLSV1_ALERT_NO_RENEGOTIATION",
-        A::MissingExtension => "ERR_SSL_TLSV13_ALERT_MISSING_EXTENSION",
-        A::UnsupportedExtension => "ERR_SSL_TLSV1_ALERT_UNSUPPORTED_EXTENSION",
-        A::UnrecognisedName => "ERR_SSL_TLSV1_UNRECOGNIZED_NAME",
-        A::BadCertificateStatusResponse => "ERR_SSL_TLSV1_BAD_CERTIFICATE_STATUS_RESPONSE",
-        A::UnknownPSKIdentity => "ERR_SSL_TLSV1_ALERT_UNKNOWN_PSK_IDENTITY",
-        A::CertificateRequired => "ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED",
-        A::NoApplicationProtocol => "ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL",
-        _ => return None,
-    })
-}
+/// Node's name for a fatal alert the client sent: the one table both sides
+/// share (`super::alert_code`), OpenSSL's reason strings being the same
+/// whichever side received the alert.
+pub(crate) use super::alert_code;
 
 /// The largest record OpenSSL's server reads (its default read buffer less
 /// the header); a first record declaring more is refused before anything
@@ -1712,13 +1712,149 @@ SM
             alert_code(A::CertificateRequired),
             Some("ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED")
         );
+        // OpenSSL 3 spells the SSL3-era alerts `SSL/TLS` (1.1 said `SSLV3`).
         assert_eq!(
             alert_code(A::BadCertificate),
-            Some("ERR_SSL_SSLV3_ALERT_BAD_CERTIFICATE")
+            Some("ERR_SSL_SSL/TLS_ALERT_BAD_CERTIFICATE")
         );
         assert_eq!(
             alert_code(A::UnknownCA),
             Some("ERR_SSL_TLSV1_ALERT_UNKNOWN_CA")
         );
+    }
+
+    /// `honorCipherOrder` (Node's default) makes a server pick by its own
+    /// list -- Node's, AES-128 before AES-256 under TLS 1.2 -- and turning it
+    /// off makes it pick by the client's. Measured against Node's server with
+    /// a client whose `ciphers` puts AES-256 first: AES-128 from a default
+    /// server, AES-256 from one created with `honorCipherOrder: false`. The
+    /// client here offers rustls's own order for the same effect, and the
+    /// per-connection config a certificate request builds from scratch
+    /// carries the same choice as the shared one.
+    #[tokio::test]
+    async fn honor_cipher_order_picks_by_the_servers_list_unless_turned_off() {
+        use rustls::CipherSuite as C;
+        use rustls::crypto::ring::cipher_suite as ring;
+
+        #[derive(Debug)]
+        struct Trusting;
+        impl rustls::client::danger::ServerCertVerifier for Trusting {
+            fn verify_server_cert(
+                &self,
+                _: &CertificateDer<'_>,
+                _: &[CertificateDer<'_>],
+                _: &rustls::pki_types::ServerName<'_>,
+                _: &[u8],
+                _: UnixTime,
+            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _: &[u8],
+                _: &CertificateDer<'_>,
+                _: &rustls::DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _: &[u8],
+                _: &CertificateDer<'_>,
+                _: &rustls::DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+
+        for (honor, expect_aes128) in [(true, true), (false, false)] {
+            let context = build_server_context(&ServerContextSpec {
+                honor_cipher_order: honor,
+                max_version: "TLSv1.2".into(),
+                ..spec(&[CERT], &[KEY])
+            })
+            .unwrap();
+            let plain = Arc::clone(context.plain.as_ref().unwrap());
+            assert_eq!(plain.ignore_client_order, honor);
+            let per_connection = context.config_for(
+                &plain,
+                &AcceptOptions {
+                    request_cert: true,
+                    reject_unauthorized: false,
+                    alpn: Vec::new(),
+                    handshake_timeout: Duration::from_secs(5),
+                },
+                &Arc::new(VerdictSlot::default()),
+                true,
+            );
+            assert_eq!(per_connection.ignore_client_order, honor);
+
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let acceptor = tokio_rustls::TlsAcceptor::from(plain);
+            let served = tokio::spawn(async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let stream = acceptor.accept(tcp).await.unwrap();
+                stream
+                    .get_ref()
+                    .1
+                    .negotiated_cipher_suite()
+                    .unwrap()
+                    .suite()
+            });
+            // AES-256 before AES-128 for either key type: rustls's own order,
+            // the one a client's `ciphers` list reverses in the measurement.
+            let reversed = rustls::crypto::CryptoProvider {
+                cipher_suites: vec![
+                    ring::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                    ring::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                    ring::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                    ring::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                ],
+                ..rustls::crypto::ring::default_provider()
+            };
+            let client = rustls::ClientConfig::builder_with_provider(Arc::new(reversed))
+                .with_protocol_versions(&[&rustls::version::TLS12])
+                .unwrap()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(Trusting))
+                .with_no_client_auth();
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let stream = tokio_rustls::TlsConnector::from(Arc::new(client))
+                .connect(
+                    rustls::pki_types::ServerName::try_from("localhost").unwrap(),
+                    tcp,
+                )
+                .await
+                .unwrap();
+            let negotiated = stream
+                .get_ref()
+                .1
+                .negotiated_cipher_suite()
+                .unwrap()
+                .suite();
+            let aes128 = matches!(
+                negotiated,
+                C::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+                    | C::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+            );
+            let aes256 = matches!(
+                negotiated,
+                C::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+                    | C::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+            );
+            assert!(aes128 || aes256, "negotiated {negotiated:?}");
+            assert_eq!(
+                aes128, expect_aes128,
+                "honorCipherOrder {honor}: negotiated {negotiated:?}"
+            );
+            assert_eq!(served.await.unwrap(), negotiated);
+            drop(stream);
+        }
     }
 }

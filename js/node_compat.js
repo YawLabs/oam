@@ -20294,6 +20294,39 @@
             // The certificate refused, in node's terms (the code and message
             // tls.connect reports): the TLS socket's error node emits.
             mapped = cause;
+          } else if (cause && cause.code === "ERR_SSL_NO_PROTOCOLS_AVAILABLE") {
+            // The version range node's live defaults name has nothing to
+            // offer: the code tls.connect reports, with no syscall (node's
+            // context setup fails before a write).
+            mapped = cause;
+          } else if (cause && registry._isTlsAlertCode && registry._isTlsAlertCode(cause.code)) {
+            // A fatal alert the server named. Answering the handshake (the
+            // native side marks it `handshake failed:`) the request head was
+            // a write queued behind the handshake, and the alert fails that
+            // write: `write EPROTO` (errno, code, syscall), as node's
+            // https.get reports it -- the tls factory builds the same for a
+            // socket of its own. After the handshake (a TLS 1.3 server
+            // wanting a client certificate) it is the alert's own error,
+            // library and reason included (#146 / #196).
+            mapped = /^handshake failed: /.test(cause.message)
+              ? registry._writeEprotoError(cause.message.slice("handshake failed: ".length))
+              : registry._opensslError(cause.message, cause.code);
+          } else if (cause && cause.code === "EPROTO" && cause.syscall === undefined) {
+            // A post-handshake alert node has no name for: the protocol
+            // error as the native side reports it.
+            mapped = cause;
+          } else if (cause && cause.code === "ECONNRESET" && cause.syscall === undefined &&
+              !(cause instanceof AggregateError)) {
+            // A description node cannot name, answering the handshake (its
+            // message keeps `received fatal alert`): the failed request-head
+            // write, `write EPROTO`, as node's https.get reports it. A plain
+            // transport close during the handshake: node's disconnect, with
+            // the options its agent dialled with (#196).
+            mapped = /received fatal alert/.test(cause.message)
+              ? registry._writeEprotoError(cause.message.replace(/^handshake failed: /, ""))
+              : registry._disconnectedBeforeSecure({
+                  path: null, host: self.host, port: self._port, localAddress: self._options.localAddress,
+                });
           } else if (/connection refused|ECONNREFUSED/i.test(detail)) {
             mapped = Object.assign(new Error("connect ECONNREFUSED"), {
               code: "ECONNREFUSED",
@@ -20642,6 +20675,12 @@
         if (!socket || (socket.destroyed && !this._socketGone) || this._aborted) return;
         var self = this;
         if (socket.connecting && !this._socketGone) {
+          // A dispatched request's head is a write queued behind the
+          // socket's handshake, in node's terms (its ClientRequest writes it
+          // into the socket's queue): a handshake the server refuses with an
+          // alert then fails as that write's `write EPROTO`, not with the
+          // alert's code (the TLS socket's _settleTlsConnect).
+          if (socket.encrypted) socket._writeQueuedBeforeConnect = true;
           if (!this._waitingConnect) {
             this._waitingConnect = true;
             socket.once(socket.encrypted ? "secureConnect" : "connect", function () {
@@ -22222,12 +22261,16 @@
       const plat = globalThis.process.platform;
       const table =
         plat === "win32"
-          ? { ECONNREFUSED: -4078, ECONNRESET: -4077, ECONNABORTED: -4079, ETIMEDOUT: -4039, EHOSTUNREACH: -4073, ENETUNREACH: -4062, EADDRINUSE: -4091, EADDRNOTAVAIL: -4090, ENOTCONN: -4053, EPIPE: -4047, EACCES: -4092, ENOTFOUND: -3008, EAI_AGAIN: -3001 }
+          ? { ECONNREFUSED: -4078, ECONNRESET: -4077, ECONNABORTED: -4079, ETIMEDOUT: -4039, EHOSTUNREACH: -4073, ENETUNREACH: -4062, EADDRINUSE: -4091, EADDRNOTAVAIL: -4090, ENOTCONN: -4053, EPIPE: -4047, EACCES: -4092, EPROTO: -4046, ECANCELED: -4081, EBADF: -4083, ENOTFOUND: -3008, EAI_AGAIN: -3001 }
           : plat === "darwin"
-            ? { ECONNREFUSED: -61, ECONNRESET: -54, ECONNABORTED: -53, ETIMEDOUT: -60, EHOSTUNREACH: -65, ENETUNREACH: -51, EADDRINUSE: -48, EADDRNOTAVAIL: -49, ENOTCONN: -57, EPIPE: -32, EACCES: -13, ENOTFOUND: -3008, EAI_AGAIN: -3001 }
-            : { ECONNREFUSED: -111, ECONNRESET: -104, ECONNABORTED: -103, ETIMEDOUT: -110, EHOSTUNREACH: -113, ENETUNREACH: -101, EADDRINUSE: -98, EADDRNOTAVAIL: -99, ENOTCONN: -107, EPIPE: -32, EACCES: -13, ENOTFOUND: -3008, EAI_AGAIN: -3001 };
+            ? { ECONNREFUSED: -61, ECONNRESET: -54, ECONNABORTED: -53, ETIMEDOUT: -60, EHOSTUNREACH: -65, ENETUNREACH: -51, EADDRINUSE: -48, EADDRNOTAVAIL: -49, ENOTCONN: -57, EPIPE: -32, EACCES: -13, EPROTO: -100, ECANCELED: -89, EBADF: -9, ENOTFOUND: -3008, EAI_AGAIN: -3001 }
+            : { ECONNREFUSED: -111, ECONNRESET: -104, ECONNABORTED: -103, ETIMEDOUT: -110, EHOSTUNREACH: -113, ENETUNREACH: -101, EADDRINUSE: -98, EADDRNOTAVAIL: -99, ENOTCONN: -107, EPIPE: -32, EACCES: -13, EPROTO: -71, ECANCELED: -125, EBADF: -9, ENOTFOUND: -3008, EAI_AGAIN: -3001 };
       return table[code];
     }
+    // The tls and http factories build node's `write EPROTO` (a handshake
+    // alert failing a queued write), `write ECANCELED` and `write EBADF`
+    // (the other ends a queued write can meet) with the same table.
+    registry._netErrno = _netErrno;
     function _shapeConnectError(err, host, port) {
       const code = err && err.code;
       if (!code) return err;
@@ -29696,6 +29739,23 @@
           session.destroy();
           return;
         }
+        // A fatal TLS alert the server sends once the session has connected
+        // is read, in Node, through the h2 layer and delivered to the active
+        // request as its own error; the session is destroyed silently -- no
+        // 'error' (which, unhandled, would crash the process -- #197) and no
+        // 'close'. oam surfaces that alert as a socket 'error' instead, so it
+        // reaches here; the stream still carries it (`session.destroy(error)`
+        // below names the streams with it), and the flag keeps it off the
+        // session, as Node has it. A transport error -- a reset, an EOF, a
+        // refused connection, an abrupt reset the instant the handshake
+        // finished (ECONNRESET, not an alert) -- Node DOES surface on the
+        // session, before 'connect' and after; a session-level error the h2
+        // layer raises (a GOAWAY, a protocol error) comes through
+        // `_onConnectionEnd`, not here. Measured on node v22.22.2.
+        if (session._state.ready && registry._isTlsAlertCode &&
+            registry._isTlsAlertCode(error && error.code)) {
+          session._state.streamsCarryError = true;
+        }
         session.destroy(error);
       }
     }
@@ -29731,6 +29791,9 @@
     }
 
     function emitClose(session, error) {
+      // A transport failure the streams already carried, after the session
+      // connected: Node leaves the session destroyed and silent (#197).
+      if (error && session._state.streamsCarryError) return;
       if (error) session.emit("error", error);
       session.emit("close");
     }
@@ -29786,7 +29849,7 @@
         socket[kBoundSession] = this;
         socket.on("error", socketOnError);
         socket.on("close", socketOnClose);
-        this._state = { destroyCode: NGHTTP2_NO_ERROR, goawayCode: null, closed: false, destroyed: false, ready: false };
+        this._state = { destroyCode: NGHTTP2_NO_ERROR, goawayCode: null, closed: false, destroyed: false, ready: false, streamsCarryError: false };
         this._streams = new Map();
         this._pendingStreams = new Set();
         this._pendingRequestCalls = null;
@@ -30210,6 +30273,10 @@
     // opens the transport and only tls.connect() starts the handshake,
     // oam's connect() runs the handshake too: 'secureConnect' fires from
     // both paths.
+    // The option a server's accept loop builds its sockets with: born with
+    // the server's context, so no context of their own is built (or
+    // validated) at construction.
+    var kServerBorn = Symbol("oamServerBorn");
     class TLSSocket extends Duplex {
       static [Symbol.hasInstance](instance) {
         if (Function.prototype[Symbol.hasInstance].call(this, instance)) return true;
@@ -30269,6 +30336,11 @@
         // second connect() is judged by.
         this.connecting = true;
         this._connectPending = false;
+        // A write queued behind the handshake (_writeData, or a request
+        // head waiting on it): a refused handshake then fails it, and the
+        // socket, with node's `write EPROTO` (_settleTlsConnect).
+        this._writeQueuedBeforeConnect = false;
+        this._queuedWriteError = null;
         this.remoteAddress = undefined;
         this.remotePort = undefined;
         this.remoteFamily = undefined;
@@ -30283,6 +30355,18 @@
         // The TLS options (ca, cert, key, servername, rejectUnauthorized) a
         // later connect() reuses.
         this._tlsOptions = options || {};
+        // node (_wrapHandle): a socket built without a `secureContext` or
+        // `credentials` builds one from its options HERE, so minVersion /
+        // maxVersion / secureProtocol -- and the live defaults they fall
+        // back to -- are validated at construction, whether or not connect()
+        // ever runs (measured: `new TLSSocket(null, { minVersion: 'bad' })`
+        // throws ERR_TLS_INVALID_PROTOCOL_VERSION). A server's accepted
+        // sockets are born with the server's context, as node's are, and
+        // skip it (kServerBorn).
+        if (!this._tlsOptions.secureContext && !this._tlsOptions.credentials &&
+            !this._tlsOptions[kServerBorn]) {
+          resolveTlsVersions(this._tlsOptions);
+        }
         // TLS over a socket this one did not open (tls.connect({ socket })):
         // the wrapped socket, the pipe TLS runs over, and the pump's
         // listeners on the wrapped socket (_wrapOver, _connectTlsOver).
@@ -30358,6 +30442,10 @@
               this._onReadEof();
               return;
             }
+            // A fatal alert the server sent after the handshake (a TLS 1.3
+            // server requiring a client certificate): node's error for it,
+            // library and reason included (#196).
+            if (err && isAlertCode(err.code)) err = opensslError(err.message, opensslReason(err.code), err.code);
             this.destroy(typeof err === "string" ? new Error(err) : err);
           },
         );
@@ -30380,7 +30468,12 @@
         var id = tlsIdOf(this);
         if (id === null) {
           // Connecting, or a wrapped socket's handshake in flight: queued.
+          // A handshake the server then refuses with an alert fails this
+          // write -- and the socket -- with node's `write EPROTO`
+          // (_settleTlsConnect); a FIN alone (end() with no data) is not a
+          // write and leaves the alert's own code.
           if ((this.connecting || this._connectPending) && !this.destroyed) {
+            this._writeQueuedBeforeConnect = true;
             this._afterConnect(() => this._writeData(data, callback), callback);
             return;
           }
@@ -30397,10 +30490,23 @@
       // wrapped socket's handshake), or `onClose(err)` if it closes first --
       // whichever comes first, exactly once.
       _afterConnect(fn, onClose) {
-        var connected, closed;
-        connected = () => { this.removeListener("close", closed); fn(); };
-        closed = () => { this.removeListener(kTlsReady, connected); onClose(socketClosedBeforeConnectionError()); };
+        var connected, closed, failed;
+        var settle = () => {
+          this.removeListener(kTlsReady, connected);
+          this.removeListener(kTlsFailed, failed);
+          this.removeListener("close", closed);
+        };
+        connected = () => { settle(); fn(); };
+        // A write the handshake's refusal failed (the transport had
+        // connected; OpenSSL refused the write): its callback runs with
+        // that failure BEFORE the socket's 'error', as node's does. One the
+        // handshake never carried fails on 'close', with what ended the
+        // handshake (_settleTlsConnect: ECANCELED, EBADF) or, for a
+        // transport never reached, node's ERR_SOCKET_CLOSED_BEFORE_CONNECTION.
+        failed = (err) => { settle(); onClose(err); };
+        closed = () => { settle(); onClose(this._queuedWriteError || socketClosedBeforeConnectionError()); };
         this.once(kTlsReady, connected);
+        this.once(kTlsFailed, failed);
         this.once("close", closed);
       }
       _final(callback) {
@@ -30737,28 +30843,62 @@
       "TLSv1_2_method": "TLSv1.2",
     };
     // util.format's %j, which Node renders the offending value with in these
-    // messages: a string comes out quoted, a number, boolean or object does not.
+    // messages (lib/internal/util/inspect.js tryStringify): JSON.stringify's
+    // text -- a string quoted, a number, boolean or object bare -- or
+    // "undefined" for a value it has no text for (a function, a symbol), or
+    // "[Circular]" for a circular object; any other refusal (a BigInt) is
+    // thrown as it is, a plain TypeError with no code.
+    var circularJsonMessage = null;
     function formatJ(value) {
       try {
         var s = JSON.stringify(value);
-        return s === undefined ? String(value) : s;
+        return s === undefined ? "undefined" : s;
       } catch (e) {
-        return String(value);
+        if (circularJsonMessage === null) {
+          try {
+            var loop = {};
+            loop.self = loop;
+            JSON.stringify(loop);
+          } catch (circular) {
+            circularJsonMessage = String(circular.message).split("\n")[0];
+          }
+        }
+        if (e instanceof TypeError && String(e.message).split("\n")[0] === circularJsonMessage) {
+          return "[Circular]";
+        }
+        throw e;
       }
     }
-    // Node's minVersion / maxVersion / secureProtocol semantics, measured on
-    // v22.22.2 (all three errors are TypeErrors there):
+    // Node's minVersion / maxVersion / secureProtocol semantics
+    // (lib/internal/tls/common.js SecureContext + toV, measured on v22.22.2;
+    // all three errors are TypeErrors there):
     //  - a truthy secureProtocol conflicts with a minVersion or maxVersion that
     //    is not null/undefined ('' counts, null does not);
+    //  - a null / undefined version is the module's LIVE default,
+    //    tls.DEFAULT_MIN_VERSION / DEFAULT_MAX_VERSION -- assignable, and set
+    //    at startup by --tls-min-v1.x / --tls-max-v1.x -- read at the call.
+    //    Whatever its source, a version that is not one of the four names is
+    //    invalid ('' and 771 included, a default of null too): the minimum is
+    //    checked first, and both before the method name;
     //  - only a string names a method (Node's C++ checks IsString): '' is looked
-    //    up and unknown, a non-string is ignored and the default range applies;
-    //    TLS_method and its _client/_server forms are the default range, the
-    //    SSLv23_* forms cap it at TLS 1.2 (the name predates 1.3, and Node keeps
-    //    that meaning); the SSLv2 / SSLv3 families are refused with their own
-    //    message; there is no TLSv1_3_method;
-    //  - a version that is not one of the four names is invalid whatever its
-    //    type ('' and 771 included); null / undefined means Node's default.
-    // Returns the effective {min, max} as names, '' for Node's default.
+    //    up and unknown, a non-string is ignored and the defaults apply;
+    //    TLS_method and its _client/_server forms are OpenSSL's whole range
+    //    whatever the defaults say, the SSLv23_* forms keep the default floor
+    //    and cap at TLS 1.2 (the name predates 1.3, and Node keeps that
+    //    meaning), a TLSv1_x_method pins x; the SSLv2 / SSLv3 families are
+    //    refused with their own message; there is no TLSv1_3_method.
+    // Returns the effective {min, max} as names, '' for no bound of its own
+    // (rustls's TLS 1.2 floor and 1.3 ceiling apply natively).
+    function toTlsVersion(which, value, fallback) {
+      if (value == null) value = fallback;
+      if (TLS_VERSION_NAMES.indexOf(value) < 0) {
+        throw nodeTypeError(
+          formatJ(value) + " is not a valid " + which + " TLS protocol version",
+          "ERR_TLS_INVALID_PROTOCOL_VERSION",
+        );
+      }
+      return value;
+    }
     function resolveTlsVersions(options) {
       var min = options.minVersion, max = options.maxVersion, sp = options.secureProtocol;
       if (sp && (min != null || max != null)) {
@@ -30768,10 +30908,14 @@
           "ERR_TLS_PROTOCOL_VERSION_CONFLICT",
         );
       }
+      // Node's toV, evaluated for both bounds before the method name is
+      // looked up (they are the init() call's arguments).
+      var floor = toTlsVersion("minimum", min, tlsExports.DEFAULT_MIN_VERSION);
+      var ceiling = toTlsVersion("maximum", max, tlsExports.DEFAULT_MAX_VERSION);
       if (typeof sp === "string") {
         var base = sp.replace(/_(client|server)_method$/, "_method");
         if (base === "TLS_method") return { min: "", max: "" };
-        if (base === "SSLv23_method") return { min: "", max: "TLSv1.2" };
+        if (base === "SSLv23_method") return { min: floor, max: "TLSv1.2" };
         var v = SECURE_PROTOCOL_TO_VERSION[base];
         if (v === undefined) {
           // Thrown from C++ in Node: a plain TypeError carrying the code, with
@@ -30786,19 +30930,7 @@
         }
         return { min: v, max: v };
       }
-      if (min != null && TLS_VERSION_NAMES.indexOf(min) < 0) {
-        throw nodeTypeError(
-          formatJ(min) + " is not a valid minimum TLS protocol version",
-          "ERR_TLS_INVALID_PROTOCOL_VERSION",
-        );
-      }
-      if (max != null && TLS_VERSION_NAMES.indexOf(max) < 0) {
-        throw nodeTypeError(
-          formatJ(max) + " is not a valid maximum TLS protocol version",
-          "ERR_TLS_INVALID_PROTOCOL_VERSION",
-        );
-      }
-      return { min: min != null ? min : "", max: max != null ? max : "" };
+      return { min: floor, max: ceiling };
     }
     // The https factory validates the same options at https.createServer() and
     // https.request(); shared through the registry rather than as an export.
@@ -30807,6 +30939,9 @@
     // Emitted once a TLS socket's native handle exists, before 'connect':
     // writes queued while it was connecting go then.
     const kTlsReady = Symbol("tlsReady");
+    // Emitted with the `write EPROTO` a refused handshake hands the writes
+    // queued behind it, before the socket is destroyed with it.
+    const kTlsFailed = Symbol("tlsFailed");
 
     // A TLS socket's native id: its `_handle` for a connection oam opened,
     // the id the wrap stand-in carries for one over a socket it did not.
@@ -31335,27 +31470,156 @@
           socket._connectPending = false;
           socket.connecting = false;
           if (typeof err === "string") err = new Error(err);
-          if (err && typeof err.code === "string" && err.syscall === undefined && !(err instanceof AggregateError)) {
+          // A fatal alert the server sent answering the handshake (#196):
+          // one node names, or one it cannot (the native side's EPROTO with
+          // no syscall). Its rustls text, kept for the failed write below.
+          var alert = err && (isAlertCode(err.code) || (err.code === "EPROTO" && err.syscall === undefined));
+          var detail = err && err.message;
+          // node's OpenSSL errors carry `library` and `reason` ahead of
+          // `code` (keys in that order): a named alert, or a version range
+          // with nothing to offer -- the message staying rustls's (entry
+          // 34). The transport closing before the handshake was done (an
+          // EOF), and an alert node cannot name, are node's disconnect,
+          // carrying the options dialled with instead.
+          if (err && (isAlertCode(err.code) || err.code === "ERR_SSL_NO_PROTOCOLS_AVAILABLE")) {
+            err = opensslError(err.message, opensslReason(err.code), err.code);
+          } else if (err && (err.code === "ECONNRESET" || err.code === "EPROTO") &&
+              err.syscall === undefined && !(err instanceof AggregateError)) {
+            err = disconnectedBeforeSecure(options);
+          }
+          // A write queued behind the handshake (a request head, a
+          // `write()` on the line after `tls.connect()`; `end()` with no
+          // data queues none) gets, on its callback -- measured on v22.22.2
+          // with two writes queued, the first in node's TLS handle and the
+          // second still in the stream's buffer, where destroy() fails it
+          // with the socket's error, as oam's stream does:
+          // - a fatal alert answering the handshake, named or not: that
+          //   write's `write EPROTO` (errno, code, syscall), which OpenSSL
+          //   refused, and which is then the socket's error too, the
+          //   callbacks running before it (#146 / #196);
+          // - a version range with nothing to offer: `write EPROTO` with no
+          //   detail, before the socket's own ERR_SSL_NO_PROTOCOLS_AVAILABLE;
+          // - the transport closing during the handshake (an EOF, a reset):
+          //   `write ECANCELED Canceled because of SSL destruction`, after
+          //   the socket's error (TLSWrap::DestroySSL cancels what it holds);
+          // - a certificate the verifier refused: `write EBADF`, after the
+          //   socket's error (the handshake done, the write met a closed
+          //   handle);
+          // - a connect or a lookup that failed: net's
+          //   ERR_SOCKET_CLOSED_BEFORE_CONNECTION, after the socket's error
+          //   (_afterConnect's default).
+          var queued = socket._writeQueuedBeforeConnect;
+          var verdict = err && typeof err.code === "string" && err.syscall === undefined &&
+            err.code !== "ECONNRESET" && !alert && err.code !== "ERR_SSL_NO_PROTOCOLS_AVAILABLE" &&
+            !(err instanceof AggregateError);
+          var noProtocolsQueued = false;
+          if (alert && queued) {
+            err = writeEprotoError(detail);
+            socket.emit(kTlsFailed, err);
+          } else if (queued && err && err.code === "ERR_SSL_NO_PROTOCOLS_AVAILABLE") {
+            // Its callback runs after destroy() below has taken the socket's
+            // own error, and before that error is emitted: the first error
+            // stands, as node's does (the write's would otherwise destroy
+            // the socket first, through the stream's write path).
+            noProtocolsQueued = true;
+          } else if (queued && err && ((err.code === "ECONNRESET" && err.syscall === undefined) || err.syscall === "read")) {
+            socket._queuedWriteError = writeSyscallError("ECANCELED", "Canceled because of SSL destruction");
+          } else if (queued && verdict) {
+            socket._queuedWriteError = writeSyscallError("EBADF", "");
+          }
+          if (verdict) {
             // The verifier refused the certificate (a connect-syscall error
-            // carries `syscall`, and a NodeAggregateError of refused addresses
-            // carries neither but is no verdict; this one carries only Node's
-            // code): Node
-            // records the verdict on the socket before destroying it, and
-            // its ERR_TLS_CERT_ALTNAME_INVALID carries the reason, the name
-            // it checked and the peer certificate.
+            // carries `syscall`; a NodeAggregateError of refused addresses,
+            // a handshake alert and an empty version range carry only a
+            // code but are no verdict -- node leaves authorizationError null
+            // for them; this one is): Node records the verdict on the socket
+            // before destroying it, and its ERR_TLS_CERT_ALTNAME_INVALID
+            // carries the reason, the name it checked and the peer
+            // certificate.
             socket.authorized = false;
             socket.authorizationError = err.code;
             if (err.code === "ERR_TLS_CERT_ALTNAME_INVALID") {
               err.reason = err.message.slice(ALTNAME_MISMATCH_PREFIX.length);
               err.host = serverName.replace(/[.]$/, "");
-              err.cert = socket.getPeerCertificate();
+              // The native side carried the peer's chain out of the refused
+              // handshake (#198): put it on the socket so getPeerCertificate
+              // builds the certificate node reports as `err.cert` -- detailed,
+              // its issuers linked -- then drop the raw chains so the error's
+              // own keys stay node's.
+              if (err.peerCertificates) {
+                socket._peerCertificates = err.peerCertificates;
+                socket._storeIssuers = err.storeIssuers || null;
+                socket._peerParsed = null;
+              }
+              delete err.peerCertificates;
+              delete err.storeIssuers;
+              err.cert = socket.getPeerCertificate(true);
             }
           }
           socket.destroy(err);
+          if (noProtocolsQueued) socket.emit(kTlsFailed, writeEprotoError(""));
         },
       );
     }
     var ALTNAME_MISMATCH_PREFIX = "Hostname/IP does not match certificate's altnames: ";
+    // node's `write EPROTO <detail>`: libuv's exception shape, keys in its
+    // order (errno, code, syscall). The detail is OpenSSL's diagnostic in
+    // node and rustls's text here (docs/node-divergences.md, entry 34).
+    function writeSyscallError(code, detail) {
+      var e = new Error("write " + code + (detail ? " " + detail : ""));
+      e.errno = registry._netErrno ? registry._netErrno(code) : undefined;
+      e.code = code;
+      e.syscall = "write";
+      return e;
+    }
+    function writeEprotoError(detail) {
+      return writeSyscallError("EPROTO", detail);
+    }
+    registry._writeEprotoError = writeEprotoError;
+    // node's shape for an OpenSSL error on a socket: `library`, `reason`,
+    // then `code`.
+    function opensslError(message, reason, code) {
+      var e = new Error(message);
+      e.library = "SSL routines";
+      e.reason = reason;
+      e.code = code;
+      return e;
+    }
+    // The codes node gives a fatal alert the server sent, as the native side
+    // names them (OpenSSL 3's spellings, measured for every description on
+    // v22.22.2: `SSL/TLS` for the SSL3-era alerts, `TLSV1` / `TLSV13` for
+    // the rest, five of them without the word ALERT).
+    var SSL_ALERT_CODE = /^ERR_SSL_(SSL\/TLS|TLSV1|TLSV13)_(ALERT_|UNSUPPORTED_EXTENSION$|CERTIFICATE_UNOBTAINABLE$|UNRECOGNIZED_NAME$|BAD_CERTIFICATE_STATUS_RESPONSE$|BAD_CERTIFICATE_HASH_VALUE$)/;
+    function isAlertCode(code) {
+      return typeof code === "string" && SSL_ALERT_CODE.test(code);
+    }
+    // node's `reason` is OpenSSL's reason string, which the code spells
+    // uppercased with underscores: back to it ("tlsv13 alert certificate
+    // required", "ssl/tls alert handshake failure", "no protocols available").
+    function opensslReason(code) {
+      return code.slice("ERR_SSL_".length).toLowerCase().replace(/_/g, " ");
+    }
+    // node (lib/_tls_wrap.js onSocketClose): the transport closed before
+    // the handshake was done -- the server went away, or sent an alert
+    // OpenSSL cannot name to a socket with nothing queued -- an ECONNRESET
+    // carrying node's own message and the options it dialled with, keys in
+    // this order (an agent dials with `path: null`).
+    function disconnectedBeforeSecure(options) {
+      var e = new Error("Client network socket disconnected before secure TLS connection was established");
+      e.code = "ECONNRESET";
+      e.path = options.path;
+      e.host = options.host;
+      e.port = options.port;
+      e.localAddress = options.localAddress;
+      return e;
+    }
+    // For the http client's shared-transport requests, which get the same
+    // errors by code.
+    registry._isTlsAlertCode = isAlertCode;
+    registry._opensslError = function (message, code) {
+      return opensslError(message, opensslReason(code), code);
+    };
+    registry._disconnectedBeforeSecure = disconnectedBeforeSecure;
 
     function connect(...args) {
       var parsed = normalizeConnectArgs(args);
@@ -31657,6 +31921,10 @@
         ca: ca,
         minVersion: versions.min,
         maxVersion: versions.max,
+        // node (lib/internal/tls/wrap.js): a server picks a cipher suite by
+        // its own list unless the option is given and falsy. Read by the
+        // server context alone.
+        honorCipherOrder: options.honorCipherOrder !== undefined ? !!options.honorCipherOrder : true,
       };
     }
     // Build a native context, or throw what Node throws: OpenSSL's errors
@@ -31771,6 +32039,9 @@
         this.minVersion = options.minVersion || undefined;
         this.maxVersion = options.maxVersion || undefined;
         this.secureProtocol = options.secureProtocol || undefined;
+        // node: `!!options.honorCipherOrder` when given, else true (measured:
+        // 0, '' and null pick by the client's order, 'no' by the server's).
+        this.honorCipherOrder = options.honorCipherOrder !== undefined ? !!options.honorCipherOrder : true;
         this._tlsMin = versions.min;
         this._tlsMax = versions.max;
         var old = this._contextId;
@@ -31896,7 +32167,9 @@
           plain._handle = null;
           registry._activeHandles.delete(plain);
         }
-        var socket = new TLSSocket(null, {});
+        var options = {};
+        options[kServerBorn] = true;
+        var socket = new TLSSocket(null, options);
         // The connection counts from here -- the accept -- until its socket
         // closes, which covers a handshake that never finishes, as node's
         // net.Server does. A client refused in 'connection' returned above.
@@ -32089,9 +32362,21 @@
       Server,
       TLSSocket,
       DEFAULT_ECDH_CURVE: "auto",
-      DEFAULT_MAX_VERSION: "TLSv1.3",
-      DEFAULT_MIN_VERSION: "TLSv1.2",
-      getCiphers: () => ["TLS_AES_128_GCM_SHA256", "TLS_AES_256_GCM_SHA384", "TLS_CHACHA20_POLY1305_SHA256"],
+      // node (lib/tls.js): the defaults of the maxVersion / minVersion
+      // options, read live by every context build (resolveTlsVersions), so
+      // assigning them changes every connection and server made after;
+      // --tls-max-v1.x / --tls-min-v1.x (argv or NODE_OPTIONS) set the
+      // initial values, in node's precedence (the CLI resolves several).
+      DEFAULT_MAX_VERSION: globalThis.__oamTlsMaxVersion || "TLSv1.3",
+      DEFAULT_MIN_VERSION: globalThis.__oamTlsMinVersion || "TLSv1.2",
+      // node: every suite OpenSSL supports (62), lowercase, sorted. oam: the
+      // nine rustls offers (node_crypto_provider), in the same spelling and
+      // order node lists them in (docs/node-divergences.md, entry 34).
+      getCiphers: () => [
+        "ecdhe-ecdsa-aes128-gcm-sha256", "ecdhe-ecdsa-aes256-gcm-sha384", "ecdhe-ecdsa-chacha20-poly1305",
+        "ecdhe-rsa-aes128-gcm-sha256", "ecdhe-rsa-aes256-gcm-sha384", "ecdhe-rsa-chacha20-poly1305",
+        "tls_aes_128_gcm_sha256", "tls_aes_256_gcm_sha384", "tls_chacha20_poly1305_sha256",
+      ],
       getCACertificates,
       checkServerIdentity,
     };

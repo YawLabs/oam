@@ -94,10 +94,11 @@ async function freePort() {
 }
 const listen = (server) => new Promise((r) => server.listen(0, "127.0.0.1", () => r(server.address().port)));
 const clientCert = { cert: CLIENT_CERT, key: CLIENT_KEY };
-// A client the server refuses records that it failed, not its code: node
-// names the alert the server sent (ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED)
-// where oam's TLS client reports EIO (docs/node-divergences.md entry 34).
-// The server's code, which names why, is printed in full.
+// A client the server refuses records its code, node's name for the alert
+// the server sent (ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED after the
+// handshake, on every client; #196), and the server's code, which names
+// why. Never printed: the messages, OpenSSL's diagnostics under node
+// (docs/node-divergences.md entry 34).
 
 // ---- tls.connect against tls.createServer
 {
@@ -128,7 +129,7 @@ const clientCert = { cert: CLIENT_CERT, key: CLIENT_KEY };
       s.on("secureConnect", () => out.push("secureConnect alpn=" + s.alpnProtocol + " authorized=" + s.authorized +
         " server=" + cn(s.getPeerCertificate()) + " localPort=" + (s.localPort === localPort ? "as asked" : s.localPort)));
       s.on("data", (d) => out.push("data " + JSON.stringify(d)));
-      s.on("error", () => out.push("error"));
+      s.on("error", (e) => out.push("error " + e.code + " " + Object.keys(e).join(",")));
       s.on("close", resolve);
     });
     await settle(50);
@@ -158,7 +159,7 @@ const clientCert = { cert: CLIENT_CERT, key: CLIENT_KEY };
         res.on("data", (d) => (body += d));
         res.on("end", () => resolve(res.statusCode + " " + body + " server=" + server + " authorized=" + authorized));
       });
-      req.on("error", () => resolve("error"));
+      req.on("error", (e) => resolve("error " + e.code + " " + Object.keys(e).join(",")));
       req.end();
     });
     await settle(50);
@@ -188,8 +189,9 @@ const clientCert = { cert: CLIENT_CERT, key: CLIENT_KEY };
       const session = http2.connect(`https://127.0.0.1:${port}`, { servername: "localhost", ca: [CA], ...extra });
       session.on("connect", () => out.push("connect alpn=" + session.alpnProtocol + " encrypted=" + session.encrypted +
         " server=" + cn(session.socket.getPeerCertificate())));
-      // Not recorded: after the server's alert oam's session emits 'error'
-      // and 'close', node's neither (docs/node-divergences.md entry 44).
+      // After the server's alert the session stays silent on both runtimes
+      // (#197); this listener would only fire on the older oam. The pending
+      // stream carries the alert (docs/node-divergences.md entry 44).
       session.on("error", () => {});
       const stream = session.request({ ":path": "/over-h2" });
       stream.setEncoding("utf8");
@@ -197,7 +199,7 @@ const clientCert = { cert: CLIENT_CERT, key: CLIENT_KEY };
       stream.on("response", (h) => out.push("response " + h[":status"]));
       stream.on("data", (d) => (body += d));
       stream.on("end", () => out.push("body " + JSON.stringify(body)));
-      stream.on("error", () => out.push("stream error"));
+      stream.on("error", (e) => out.push("stream error " + e.code + " " + Object.keys(e).join(",")));
       // The stream's end, not the session's: node emits no session 'close'
       // after a peer's fatal alert.
       stream.on("close", () => {

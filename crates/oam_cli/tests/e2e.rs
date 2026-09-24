@@ -18266,6 +18266,14 @@ const verdict = (port, opts) => within(8000, 'verdict', new Promise((resolve) =>
     const out = { ok: false, code: e.code, message: e.message, keys: Object.keys(e), hasSyscall: 'syscall' in e, hasErrno: 'errno' in e };
     if ('reason' in e) out.reason = e.reason;
     if ('host' in e) out.host = e.host;
+    // A refused name carries the peer certificate (#198): pin the leaf it
+    // reports, its altnames and its linked issuer, so err.cert is the real
+    // certificate and not an empty object.
+    if (e.cert && Object.keys(e.cert).length) {
+      out.certCN = (e.cert.subject || {}).CN;
+      out.certAltName = e.cert.subjectaltname;
+      out.certIssuerCN = ((e.cert.issuerCertificate || {}).subject || {}).CN;
+    }
     out.authorized = s.authorized;
     out.authorizationError = s.authorizationError;
     resolve(out);
@@ -18697,6 +18705,790 @@ process.exit(0);
         0,
         "no pin is dropped, so nothing warns.\nstderr: {stderr}"
     );
+}
+
+/// Issue #144, the residue: the suite a pinned TLS 1.2 handshake negotiates,
+/// the server's `honorCipherOrder`, the live `tls.DEFAULT_MIN_VERSION` /
+/// `DEFAULT_MAX_VERSION` defaults, and the `--tls-min-v1.x` / `--tls-max-v1.x`
+/// flags that set them. Two oam peers used to negotiate
+/// `ECDHE-RSA-AES256-GCM-SHA384` (rustls's suite order) where two Node peers
+/// negotiate `ECDHE-RSA-AES128-GCM-SHA256`; the defaults were inert
+/// constants; the flags were rejected as unknown arguments. Every value is
+/// Node v22.22.2's (conformance case 178 holds the same byte for byte); this
+/// test keeps it without a Node on the machine, and covers the flag
+/// plumbing -- argv, NODE_OPTIONS, both at once, execArgv -- through real
+/// child processes.
+#[test]
+fn tls_cipher_order_default_versions_and_tls_flags_match_node() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+const cert = `{cert}`;
+const key = `{key}`;
+
+function listen(opts) {{
+  return new Promise((resolve) => {{
+    const server = tls.createServer({{ cert, key, ...opts }}, (s) => {{ s.resume(); s.on('error', () => {{}}); }});
+    server.on('tlsClientError', () => {{}});
+    server.on('error', () => {{}});
+    server.listen(0, '127.0.0.1', () => resolve(server));
+  }});
+}}
+function clientResult(server, clientOpts) {{
+  const port = server.address().port;
+  return new Promise((resolve) => {{
+    const c = tls.connect(
+      {{ host: '127.0.0.1', port, rejectUnauthorized: false, servername: 'localhost', ...clientOpts }},
+      () => {{ const r = c.getProtocol() + '/' + c.getCipher().name; c.destroy(); resolve(r); }},
+    );
+    c.on('error', (e) => resolve('code:' + e.code));
+  }});
+}}
+const close = (server) => new Promise((r) => server.close(r));
+
+if (process.env.OAM_E2E_TLS_MODE === 'child') {{
+  // Spawned with flags: the defaults they set, execArgv, a default handshake.
+  const server = await listen({{}});
+  console.log('child=' + tls.DEFAULT_MIN_VERSION + '/' + tls.DEFAULT_MAX_VERSION +
+    ' execArgv=' + JSON.stringify(process.execArgv) + ' negotiated=' + await clientResult(server, {{}}));
+  await close(server);
+  process.exit(0);
+}}
+
+// The suite of a pinned 1.2 handshake, and of the default one.
+let server = await listen({{}});
+console.log('pin12=' + await clientResult(server, {{ maxVersion: 'TLSv1.2' }}));
+console.log('sp12=' + await clientResult(server, {{ secureProtocol: 'TLSv1_2_method' }}));
+console.log('default=' + await clientResult(server, {{}}));
+await close(server);
+// honorCipherOrder off: both peers offer the same list, so the same suite.
+server = await listen({{ maxVersion: 'TLSv1.2', honorCipherOrder: false }});
+console.log('serverPin12HonorFalse=' + server.honorCipherOrder + ':' + await clientResult(server, {{}}));
+await close(server);
+console.log('honorReflected=' + [{{}}, {{ honorCipherOrder: 0 }}, {{ honorCipherOrder: 'no' }}, {{ honorCipherOrder: null }}]
+  .map((o) => tls.createServer({{ cert, key, ...o }}).honorCipherOrder).join(','));
+
+// The live defaults.
+tls.DEFAULT_MAX_VERSION = 'TLSv1.2';
+server = await listen({{}});
+console.log('defaultMax12=' + await clientResult(server, {{}}));
+await close(server);
+tls.DEFAULT_MAX_VERSION = 'TLSv1.3';
+tls.DEFAULT_MIN_VERSION = 'TLSv1.3';
+server = await listen({{ minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2' }});
+console.log('defaultMin13vsServer12=' + await clientResult(server, {{}}));
+console.log('defaultMin13TLS_method=' + await clientResult(server, {{ secureProtocol: 'TLS_method' }}));
+console.log('defaultMin13SSLv23=' + await clientResult(server, {{ secureProtocol: 'SSLv23_method' }}));
+await close(server);
+tls.DEFAULT_MIN_VERSION = 'TLSv1.2';
+tls.DEFAULT_MAX_VERSION = 'bogus';
+function syncThrow(fn) {{
+  try {{ const r = fn(); if (r && r.close) r.close(); if (r && r.destroy) r.destroy(); return 'NOTHROW'; }}
+  catch (e) {{ return e.code + ':' + e.message; }}
+}}
+const conn = (opts) => tls.connect({{ host: '127.0.0.1', port: 1, ...opts }}, () => {{}}).on('error', () => {{}});
+console.log('bogusDefaultConnect=' + syncThrow(() => conn({{}})));
+console.log('bogusDefaultServer=' + syncThrow(() => tls.createServer({{ cert, key }})));
+console.log('bogusDefaultExplicit=' + syncThrow(() => conn({{ maxVersion: 'TLSv1.3' }})));
+console.log('bogusDefaultMethodFirst=' + syncThrow(() => conn({{ secureProtocol: 'no_such_method' }})));
+console.log('bogusDefaultConflictFirst=' + syncThrow(() => conn({{ secureProtocol: 'TLSv1_2_method', minVersion: 'TLSv1.2' }})));
+tls.DEFAULT_MAX_VERSION = 'TLSv1.3';
+process.exit(0);
+"#,
+        cert = TLS_TEST_CERT,
+        key = TLS_TEST_KEY,
+    );
+
+    let file = write_temp("tls_cipher_order_defaults.mjs", &src);
+    let path = file.to_str().unwrap();
+    let output = oam(&["run", path, "--no-check"]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for line in [
+        "pin12=TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+        "sp12=TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+        "default=TLSv1.3/TLS_AES_256_GCM_SHA384",
+        "serverPin12HonorFalse=false:TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+        "honorReflected=true,false,true,false",
+        "defaultMax12=TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+        "defaultMin13vsServer12=code:ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION",
+        "defaultMin13TLS_method=TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+        "defaultMin13SSLv23=code:ERR_SSL_NO_PROTOCOLS_AVAILABLE",
+        "bogusDefaultConnect=ERR_TLS_INVALID_PROTOCOL_VERSION:\"bogus\" is not a valid maximum TLS protocol version",
+        "bogusDefaultServer=ERR_TLS_INVALID_PROTOCOL_VERSION:\"bogus\" is not a valid maximum TLS protocol version",
+        "bogusDefaultExplicit=NOTHROW",
+        "bogusDefaultMethodFirst=ERR_TLS_INVALID_PROTOCOL_VERSION:\"bogus\" is not a valid maximum TLS protocol version",
+        "bogusDefaultConflictFirst=ERR_TLS_PROTOCOL_VERSION_CONFLICT:TLS protocol version \"TLSv1.2\" conflicts with secureProtocol \"TLSv1_2_method\"",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?}\nstdout: {stdout}");
+    }
+
+    // The flags, through real processes: argv, NODE_OPTIONS, both at once.
+    let child = |flags: &[&str], node_options: Option<&str>| -> String {
+        let mut args: Vec<&str> = flags.to_vec();
+        args.extend(["run", path, "--no-check"]);
+        let mut cmd = oam_command(&args);
+        cmd.env("OAM_E2E_TLS_MODE", "child");
+        match node_options {
+            Some(v) => {
+                cmd.env("NODE_OPTIONS", v);
+            }
+            None => {
+                cmd.env_remove("NODE_OPTIONS");
+            }
+        }
+        let out = bounded_output(&mut cmd);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "child {flags:?} NODE_OPTIONS={node_options:?} failed.\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        stdout
+    };
+    let expect = |got: String, want: &str| {
+        assert!(got.contains(want), "want {want:?}\ngot: {got}");
+    };
+    expect(
+        child(&["--tls-max-v1.2"], None),
+        "child=TLSv1.2/TLSv1.2 execArgv=[\"--tls-max-v1.2\"] negotiated=TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+    );
+    expect(
+        child(&["--tls-min-v1.3"], None),
+        "child=TLSv1.3/TLSv1.3 execArgv=[\"--tls-min-v1.3\"] negotiated=TLSv1.3/TLS_AES_256_GCM_SHA384",
+    );
+    // A floor below 1.2 is node's name for it, and negotiates as node does.
+    expect(
+        child(&["--tls-min-v1.0"], None),
+        "child=TLSv1/TLSv1.3 execArgv=[\"--tls-min-v1.0\"] negotiated=TLSv1.3/TLS_AES_256_GCM_SHA384",
+    );
+    // node's precedence: the lowest minimum and the highest maximum given win,
+    // and every flag given comes back through execArgv.
+    let both = child(&["--tls-min-v1.3", "--tls-min-v1.0"], None);
+    expect(both.clone(), "child=TLSv1/TLSv1.3 execArgv=[");
+    expect(both.clone(), "\"--tls-min-v1.0\"");
+    expect(both, "\"--tls-min-v1.3\"");
+    // NODE_OPTIONS sets the defaults but stays out of execArgv, as in node.
+    expect(
+        child(&[], Some("--tls-max-v1.2")),
+        "child=TLSv1.2/TLSv1.2 execArgv=[] negotiated=TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+    );
+    expect(
+        child(&["--tls-max-v1.3"], Some("--tls-max-v1.2")),
+        "child=TLSv1.2/TLSv1.3 execArgv=[\"--tls-max-v1.3\"] negotiated=TLSv1.3/",
+    );
+    expect(
+        child(&["--tls-max-v1.2"], Some("--tls-max-v1.3")),
+        "child=TLSv1.2/TLSv1.3 execArgv=[\"--tls-max-v1.2\"] negotiated=TLSv1.3/",
+    );
+    // The one pair node refuses at startup, from argv or NODE_OPTIONS alike:
+    // exit 9, node's message after the executable's path, nothing run.
+    for (flags, node_options) in [
+        (vec!["--tls-min-v1.3", "--tls-max-v1.2"], None),
+        (
+            vec!["--tls-max-v1.2", "--tls-min-v1.3", "--tls-max-v1.3"],
+            None,
+        ),
+        (vec!["--tls-max-v1.2"], Some("--tls-min-v1.3")),
+        (vec![], Some("--tls-min-v1.3 --tls-max-v1.2")),
+    ] {
+        let mut args: Vec<&str> = flags.clone();
+        args.extend(["run", path, "--no-check"]);
+        let mut cmd = oam_command(&args);
+        cmd.env("OAM_E2E_TLS_MODE", "child");
+        match node_options {
+            Some(v) => {
+                cmd.env("NODE_OPTIONS", v);
+            }
+            None => {
+                cmd.env_remove("NODE_OPTIONS");
+            }
+        }
+        let out = bounded_output(&mut cmd);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(9),
+            "{flags:?} NODE_OPTIONS={node_options:?}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        assert!(
+            stderr.contains(": either --tls-min-v1.3 or --tls-max-v1.2 can be used, not both"),
+            "{flags:?} NODE_OPTIONS={node_options:?}\nstderr: {stderr}"
+        );
+        assert!(
+            !stdout.contains("child="),
+            "{flags:?}: ran anyway.\nstdout: {stdout}"
+        );
+    }
+}
+
+/// A private CA (100 years) and the `localhost` leaf it signed (SAN
+/// `DNS:localhost, IP:127.0.0.1`), for the requests that can trust a root
+/// only through NODE_EXTRA_CA_CERTS: fetch and an option-less https.get.
+const FETCH_TEST_CA: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDMTCCAhmgAwIBAgIUDvtPdO4ljOTrt9v6/+Ds4F6Q6HgwDQYJKoZIhvcNAQEL\n\
+BQAwHzEdMBsGA1UEAwwUb2FtIGNhc2UgMTc4IHRlc3QgQ0EwIBcNMjYwOTIzMTgy\n\
+MjE0WhgPMjEyNjA4MzAxODIyMTRaMB8xHTAbBgNVBAMMFG9hbSBjYXNlIDE3OCB0\n\
+ZXN0IENBMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAz9cdoNsHNOsj\n\
+GTcYfimeOeV9zQaJgGgongxaEDtri3QGl0uNjPUhgRtvIkVagRLH3Huohw/yv6p8\n\
+WhsTOdrJ8/OQ+kBTP/KNIkjjsVkXoPZDCt/FDa74EoNJZLJxAlF90nVFBiZzvB2B\n\
+nKHVZJjyhyETcAEbSynrHbK+SpMlrFxcNLAatbPPI08KnBRCK7Lj6rA+yt98o3kb\n\
+ZMbZ95i/OeBh/9gWCY/0GTTtIlLuG/Fgih7xYmyBXfITklrt3dzDL8Q9usb7IV6M\n\
+cqwgdb78c90nw20dMRZ+EG5NAV4tkCYrhli7vOuep4JBI49ZpKpPNHkFn2+rawY5\n\
+W+0PvYd5IQIDAQABo2MwYTAdBgNVHQ4EFgQU1XqMZ0VpqntEb9tcwFu+AzFxG2Uw\n\
+HwYDVR0jBBgwFoAU1XqMZ0VpqntEb9tcwFu+AzFxG2UwDwYDVR0TAQH/BAUwAwEB\n\
+/zAOBgNVHQ8BAf8EBAMCAQYwDQYJKoZIhvcNAQELBQADggEBAF+iugXNCBQDJpTg\n\
+Urq26/DoFTPtrK6u4DHcPx9XpNavTh+uLr3xDxfjmH9ozOTjPkfJURHhDkSmBath\n\
+fnr6RD9YjiZcrKAVA+V77dGo23MfeVa/xJnYHpXy2iuc4zm09s1KxYTOenw3+MKz\n\
+qvGMiAZqXsd4KWxCeplPEA+E/T1Ytm4mY+cLFrohxPwFJakXemL60HcB0zALKAsk\n\
+9U3s++koVXZ+olzVBNc6cDGNyEruzfKFzbSU7pXxqxGN0X3zwHlYoNB6SqpZuiUZ\n\
+78SnbUSI6SHu6okYRpS7Ezfk7MDWoGaXL1bET7WGX+Tc6CLLCYLIOvFiQ+7pkwgi\n\
+lWA6cC8=\n\
+-----END CERTIFICATE-----\n";
+
+const FETCH_TEST_LEAF: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIDUDCCAjigAwIBAgIUEns5QKWKdI8bDzl7kmMBUZycEV8wDQYJKoZIhvcNAQEL\n\
+BQAwHzEdMBsGA1UEAwwUb2FtIGNhc2UgMTc4IHRlc3QgQ0EwIBcNMjYwOTIzMTgy\n\
+MjE0WhgPMjEyNjA4MzAxODIyMTRaMBQxEjAQBgNVBAMMCWxvY2FsaG9zdDCCASIw\n\
+DQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAJhs8ruXknapFBnTKlK5vROHOizd\n\
+5cBQuFGljwnX/aFc8TLLX6OcHydZnzY0tg7GMxx7i6t0Becop0t+ZMCuxljUB4y7\n\
+RHUEm8G0dWJ1KdJZRIvHYnhGB6MdBKYapEzTloqGWuQBj42QZiyjzeJuczzueE2B\n\
+sxHrK+s83MzGOj9znftD6WkXBnWcMzsyovbsZjKru30OE+uuIgmrhtDYmLhpX9GS\n\
+WVo1szau8JSWBrnsH2jFrvu77YCJWOOFYPijJ5oyjYAD1AfpS/hTxgfZA9BZUxIo\n\
+NaEUisY7maKoORrd2kMOvv506onz7ig7adfsCpWHcoAbtFScWc9fyy81N0MCAwEA\n\
+AaOBjDCBiTAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCQYDVR0TBAIwADAL\n\
+BgNVHQ8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwHQYDVR0OBBYEFEuYio5R\n\
+kZRiCdH97/NbiO7pC0EUMB8GA1UdIwQYMBaAFNV6jGdFaap7RG/bXMBbvgMxcRtl\n\
+MA0GCSqGSIb3DQEBCwUAA4IBAQB4rZ898wcpW70moYgPGUp/RZN9ZjUt4PbgGGyU\n\
+p+4cfkDkMglb4b/NfXd6bGHFA0buxH7U+9lOU4pCGy23JkWgs8IMruB9fenbNAKv\n\
+eWCrljFLb217AmE7JnAr5cXl8Kwh/7Bga/JP5oKmS1UGiR5dl3yMk0iKJ3yd9ubr\n\
+cSMBxg2WAOFF+My6rYNR1f0Dp9/8lscZ/AErXybmlP1SXI8JDLJBLMDN/wLL4V1A\n\
+UDYCSZljuL4gmS3b0GF2Tdl5Z+EwGFIwZ6Y4DBHDeOlQ6AjTXTVOhyI3BTHS2hGo\n\
+QniMX7unLF0cGCBWEtOd0tDNbRkHDVcnhebY0dJjPY7+Y6+P\n\
+-----END CERTIFICATE-----\n";
+
+const FETCH_TEST_LEAF_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQCYbPK7l5J2qRQZ\n\
+0ypSub0Thzos3eXAULhRpY8J1/2hXPEyy1+jnB8nWZ82NLYOxjMce4urdAXnKKdL\n\
+fmTArsZY1AeMu0R1BJvBtHVidSnSWUSLx2J4RgejHQSmGqRM05aKhlrkAY+NkGYs\n\
+o83ibnM87nhNgbMR6yvrPNzMxjo/c537Q+lpFwZ1nDM7MqL27GYyq7t9DhPrriIJ\n\
+q4bQ2Ji4aV/RkllaNbM2rvCUlga57B9oxa77u+2AiVjjhWD4oyeaMo2AA9QH6Uv4\n\
+U8YH2QPQWVMSKDWhFIrGO5miqDka3dpDDr7+dOqJ8+4oO2nX7AqVh3KAG7RUnFnP\n\
+X8svNTdDAgMBAAECggEAFXGeZI3aaR84WLnAhori8tBfeths7jVs+O+VxAjDAeSV\n\
+elPqTJY2O877+yBHTKTNpAAtkh1shyzM/G33trPf67dIqJ/f7aaMUyAUM5nQHGu6\n\
+nP+b9tfDU0tN0CCHZNePokVsnA8sJvpdpYIWAPkQ9U2HV0Ab9TVkpF+XoKdyomJm\n\
+DjZuGXU2Lkm9gskdtrtxP9dEAYnKgQeDfgmn/i9bawn1xMH/p9fwKhVbaxmDSJFv\n\
+XGDugVZV/LjHK2H9xyFC9n92O+0tz32C7WVzD5C3t7YwLmFCEBZAOjzLFqQvsJ6U\n\
+zvmaHAajPXMw8C8+tEj4iyFgutLr6dVR5lb7xyA4AQKBgQDG6AasgC6MQv7fONv6\n\
+V9ld4PiuBAVj+cmbnUnIv2Wp04dTntEb5lXuQgmeiQrcnGrF50KUcaYXe4nYxwhE\n\
+ZDzqHRzo+U8PrxjFIQQGnARi9eMwDI96B31SN0l9wziOIQehMB0TQlWWheBHgzFu\n\
+HGxz/8bx3O1oqwClbWpDN+VHAQKBgQDELW/DTIz4tlZdUuWxnyc/F9JD+3ui30oF\n\
+qIvHZt/XZK2agWTTANL/NSGO5RcJoIogJaesoptaNeZnOo32An1IfZKRcLth7Taj\n\
+MUMS6Y9YUT7xBxyNXEZ4LxHydkee2QKbxAW+PLZk5SI+tQbniDJD84v5PwMEHffI\n\
+fpa8VEWiQwKBgQC6/m8nxOn92w4ZdS75T5V+eH3Rut4Ge1JaBajUHXvKCJ70sh4M\n\
+iKLIdzTr4hJgDH0kyKEDRUTMVsvlDFhtU38g6XXAYIE/UXGMAdnzDMHi9x86kNRh\n\
++KCMpoVkwh9tHwg5NS5gaMBl3j5XfLL/vaEH/LJftz9KY1kcLJz1zJq0AQKBgDU8\n\
+w1yzlHoWOV/AFFdcgnELzOLoB0hO4i6g67XkRBCW4MnSHYNpcNkTGRVHNDZHm9RX\n\
+g6ZExnX3tJwE9utxB4C5myHe/ur3TeGBh9tFCMKF4dfU/zmZdgI9e9hZotwHtj6B\n\
+NrHGlhTRXba4t7PzcPihyjWMlQvz+f8t40gecnszAoGBALsQh4kp0BP6Hearxi02\n\
+gZg0AOeY2tRXnK+6GLyO4PUmrRtoOWrmXeoJyao15cL4tINE+IBaL5g3P5mo9XWB\n\
+erw2Wan8x7OmClXxc4mm3w2xWWoZEj3vJyhEauNfbJgt/yrGm1G1FK12hsWK1R1K\n\
+oMWl7y+w2KJlXjTSc0SiM5Qr\n\
+-----END PRIVATE KEY-----\n";
+
+/// The live `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION` and the
+/// `--tls-*` flags reach `fetch()` and an option-less `https.get()` -- the
+/// requests oam sends over its shared transport -- as they reach node's,
+/// whose undici and https.Agent connect through tls.connect. The server pins
+/// its own range (1.2 to 1.3) so the client alone decides what is
+/// negotiated; the CA is trusted through NODE_EXTRA_CA_CERTS, the one way a
+/// fetch can trust a private root. Measured on node v22.22.2: a default
+/// ceiling of 1.2 caps both at TLSv1.2 (`ECDHE-RSA-AES128-GCM-SHA256`), an
+/// empty range fails fetch with cause `ERR_SSL_NO_PROTOCOLS_AVAILABLE` and
+/// https.get with that code, a default that is not a version fails fetch
+/// with cause `ERR_TLS_INVALID_PROTOCOL_VERSION`, and a floor above the
+/// server's ceiling fails fetch with cause
+/// `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION`. Before this, oam's shared
+/// transport was built once with every version and ignored all of it.
+#[test]
+fn fetch_and_https_get_follow_the_live_tls_defaults() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+import https from 'node:https';
+const cert = `{cert}`;
+const key = `{key}`;
+let seen = 'none';
+const conns = new Set();
+function serve(range) {{
+  const server = tls.createServer({{ cert, key, ...range }}, (c) => {{
+    conns.add(c);
+    c.on('error', () => {{}});
+    let buf = '';
+    c.on('data', (d) => {{
+      buf += d.toString('latin1');
+      if (buf.includes('\r\n\r\n')) {{
+        seen = c.getProtocol() + '/' + c.getCipher().name;
+        c.end('HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\nok');
+      }}
+    }});
+  }});
+  server.on('tlsClientError', () => {{}});
+  return new Promise((r) => server.listen(0, '127.0.0.1', () => r(server)));
+}}
+async function viaFetch(label, port) {{
+  seen = 'none';
+  try {{
+    const res = await fetch('https://localhost:' + port + '/');
+    await res.text();
+    console.log(label + ' fetch=' + seen);
+  }} catch (e) {{
+    console.log(label + ' fetch=' + e.constructor.name + ':' + e.message + ':cause=' +
+      (e.cause && e.cause.code) + ':' + (e.cause && e.cause.constructor.name));
+  }}
+}}
+function viaGet(label, port, opts) {{
+  seen = 'none';
+  return new Promise((resolve) => {{
+    let req;
+    try {{
+      req = https.get('https://localhost:' + port + '/', {{ agent: false, ...opts }}, (res) => {{
+        res.resume();
+        res.on('end', () => {{ console.log(label + ' get=' + seen); resolve(); }});
+      }});
+    }} catch (e) {{ console.log(label + ' get=THROW:' + e.code); resolve(); return; }}
+    req.on('error', (e) => {{ console.log(label + ' get=ERROR:' + e.code); resolve(); }});
+  }});
+}}
+async function closeAll(server) {{
+  for (const c of conns) c.destroy();
+  conns.clear();
+  await new Promise((r) => server.close(r));
+}}
+
+let server = await serve({{ minVersion: 'TLSv1.2', maxVersion: 'TLSv1.3' }});
+let port = server.address().port;
+if (process.env.OAM_E2E_FETCH_MODE === 'child') {{
+  console.log('child defaults=' + tls.DEFAULT_MIN_VERSION + '/' + tls.DEFAULT_MAX_VERSION);
+  await viaFetch('child', port);
+  await viaGet('child', port, {{}});
+  await closeAll(server);
+  process.exit(0);
+}}
+await viaFetch('default', port);
+await viaGet('default', port, {{}});
+tls.DEFAULT_MAX_VERSION = 'TLSv1.2';
+await viaFetch('max12', port);
+await viaGet('max12', port, {{}});
+await viaGet('max12null', port, {{ maxVersion: null }});
+tls.DEFAULT_MAX_VERSION = 'TLSv1.3';
+tls.DEFAULT_MIN_VERSION = 'TLSv1.3';
+await viaFetch('min13', port);
+tls.DEFAULT_MIN_VERSION = 'TLSv1.2';
+tls.DEFAULT_MAX_VERSION = 'TLSv1.1';
+await viaFetch('max11', port);
+await viaGet('max11', port, {{}});
+tls.DEFAULT_MAX_VERSION = 'bogus';
+await viaFetch('bogus', port);
+await viaGet('bogus', port, {{}});
+tls.DEFAULT_MAX_VERSION = 'TLSv1.3';
+await closeAll(server);
+server = await serve({{ minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2' }});
+port = server.address().port;
+tls.DEFAULT_MIN_VERSION = 'TLSv1.3';
+await viaFetch('min13vs12', port);
+tls.DEFAULT_MIN_VERSION = 'TLSv1.2';
+await viaFetch('restored', port);
+await closeAll(server);
+process.exit(0);
+"#,
+        cert = FETCH_TEST_LEAF,
+        key = FETCH_TEST_LEAF_KEY,
+    );
+
+    let file = write_temp("fetch_tls_defaults.mjs", &src);
+    let ca = write_temp("fetch_tls_defaults_ca.pem", FETCH_TEST_CA);
+    let path = file.to_str().unwrap();
+    let run = |flags: &[&str], node_options: Option<&str>, child: bool| -> String {
+        let mut args: Vec<&str> = flags.to_vec();
+        args.extend(["run", path, "--no-check"]);
+        let mut cmd = oam_command(&args);
+        cmd.env("NODE_EXTRA_CA_CERTS", &ca);
+        if child {
+            cmd.env("OAM_E2E_FETCH_MODE", "child");
+        } else {
+            cmd.env_remove("OAM_E2E_FETCH_MODE");
+        }
+        match node_options {
+            Some(v) => {
+                cmd.env("NODE_OPTIONS", v);
+            }
+            None => {
+                cmd.env_remove("NODE_OPTIONS");
+            }
+        }
+        let out = bounded_output(&mut cmd);
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{flags:?} NODE_OPTIONS={node_options:?} child={child}\nstdout: {stdout}\nstderr: {stderr}"
+        );
+        stdout
+    };
+    let main = run(&[], None, false);
+    for line in [
+        "default fetch=TLSv1.3/TLS_AES_256_GCM_SHA384",
+        "default get=TLSv1.3/TLS_AES_256_GCM_SHA384",
+        "max12 fetch=TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+        "max12 get=TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+        "max12null get=TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+        "min13 fetch=TLSv1.3/TLS_AES_256_GCM_SHA384",
+        "max11 fetch=TypeError:fetch failed:cause=ERR_SSL_NO_PROTOCOLS_AVAILABLE:Error",
+        "max11 get=ERROR:ERR_SSL_NO_PROTOCOLS_AVAILABLE",
+        "bogus fetch=TypeError:fetch failed:cause=ERR_TLS_INVALID_PROTOCOL_VERSION:TypeError",
+        "bogus get=THROW:ERR_TLS_INVALID_PROTOCOL_VERSION",
+        "min13vs12 fetch=TypeError:fetch failed:cause=ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION:Error",
+        "restored fetch=TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+    ] {
+        assert!(main.contains(line), "missing {line:?}\nstdout: {main}");
+    }
+    // The flags reach the shared transport too, from argv and NODE_OPTIONS.
+    for (flags, node_options) in [
+        (vec!["--tls-max-v1.2"], None),
+        (vec![], Some("--tls-max-v1.2")),
+    ] {
+        let child = run(&flags, node_options, true);
+        for line in [
+            "child defaults=TLSv1.2/TLSv1.2",
+            "child fetch=TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+            "child get=TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+        ] {
+            assert!(
+                child.contains(line),
+                "{flags:?} NODE_OPTIONS={node_options:?}: missing {line:?}\nstdout: {child}"
+            );
+        }
+    }
+}
+
+/// Issue #146: a verifying https request's per-request TLS options reach the
+/// handshake (they route the request over tls.connect), and a handshake the
+/// server refuses with the protocol_version alert takes node's shape: the
+/// alert's own code on a socket that had nothing queued, and `write EPROTO`
+/// (errno, code, syscall) on the socket's error and every queued write's
+/// callback once a write was queued behind the handshake -- a request head
+/// included, on the tls.connect path and on the shared transport alike.
+/// Measured on node v22.22.2; conformance case 179 holds the same byte for
+/// byte.
+#[test]
+fn https_request_tls_options_and_the_handshake_alerts_write_eproto() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+import https from 'node:https';
+const root = `{root}`;
+const cert = `{cert}`;
+const key = `{key}`;
+let seen = 'none';
+const conns = new Set();
+function serve(opts) {{
+  const server = tls.createServer({{ cert, key, ...opts }}, (c) => {{
+    conns.add(c);
+    c.on('error', () => {{}});
+    let buf = '';
+    c.on('data', (d) => {{
+      buf += d.toString('latin1');
+      if (buf.includes('\r\n\r\n')) {{
+        seen = c.getProtocol() + '/' + c.getCipher().name;
+        c.end('HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 2\r\n\r\nok');
+      }}
+    }});
+  }});
+  server.on('tlsClientError', () => {{}});
+  return new Promise((r) => server.listen(0, '127.0.0.1', () => r(server)));
+}}
+async function closeAll(server) {{ for (const c of conns) c.destroy(); conns.clear(); await new Promise((r) => server.close(r)); }}
+const shape = (e) => e.code + ':' + e.syscall + ':' + (typeof e.errno === 'number' && e.errno < 0 ? 'errno' : 'noerrno') + ':' + Object.keys(e).join(',');
+function request(label, port, opts) {{
+  seen = 'none';
+  return new Promise((resolve) => {{
+    const r = https.request({{ host: 'localhost', port, path: '/', ...opts }}, (res) => {{
+      res.resume();
+      res.on('end', () => {{ console.log(label + '=' + res.statusCode + ' ' + seen); resolve(); }});
+    }});
+    r.on('error', (e) => {{ console.log(label + '=ERROR ' + shape(e)); resolve(); }});
+    r.end();
+  }});
+}}
+let server = await serve({{ minVersion: 'TLSv1.2', maxVersion: 'TLSv1.3' }});
+let port = server.address().port;
+await request('untrusted', port, {{}});
+await request('ca', port, {{ ca: root }});
+await request('caMax12', port, {{ ca: root, maxVersion: 'TLSv1.2' }});
+await request('caSp12', port, {{ ca: root, secureProtocol: 'TLSv1_2_method' }});
+await request('agentCaMax12', port, {{ agent: new https.Agent({{ ca: root, maxVersion: 'TLSv1.2' }}) }});
+await closeAll(server);
+server = await serve({{ minVersion: 'TLSv1.2', maxVersion: 'TLSv1.2' }});
+port = server.address().port;
+const base = {{ host: 'localhost', port, ca: root, minVersion: 'TLSv1.3' }};
+await new Promise((resolve) => {{
+  const s = tls.connect(base, () => {{ console.log('noWrite=secureConnect'); s.destroy(); }});
+  s.on('error', (e) => console.log('noWrite=' + shape(e)));
+  s.on('close', resolve);
+}});
+await new Promise((resolve) => {{
+  const s = tls.connect(base, () => {{ s.destroy(); }});
+  s.write('x', (e) => console.log('writeCb=' + (e ? e.code : 'ok')));
+  s.on('error', (e) => console.log('write=' + shape(e)));
+  s.on('close', resolve);
+}});
+await new Promise((resolve) => {{
+  const s = tls.connect(base, () => {{ s.destroy(); }});
+  s.end();
+  s.on('error', (e) => console.log('endNoData=' + shape(e)));
+  s.on('close', resolve);
+}});
+await request('requestMin13', port, {{ ca: root, minVersion: 'TLSv1.3' }});
+tls.DEFAULT_MIN_VERSION = 'TLSv1.3';
+await new Promise((resolve) => {{
+  // No option of its own: the shared transport, under the live default.
+  const r = https.get('https://localhost:' + port + '/', (res) => {{ res.resume(); res.on('end', () => {{ console.log('sharedMin13=response'); resolve(); }}); }});
+  r.on('error', (e) => {{ console.log('sharedMin13=ERROR ' + shape(e)); resolve(); }});
+}});
+tls.DEFAULT_MIN_VERSION = 'TLSv1.2';
+await closeAll(server);
+process.exit(0);
+"#,
+        root = FETCH_TEST_CA,
+        cert = FETCH_TEST_LEAF,
+        key = FETCH_TEST_LEAF_KEY,
+    );
+    let file = write_temp("https_request_tls_options.mjs", &src);
+    let ca = write_temp("https_request_tls_options_ca.pem", FETCH_TEST_CA);
+    let mut cmd = oam_command(&["run", file.to_str().unwrap(), "--no-check"]);
+    // The shared-transport request trusts the root the same way a fetch can.
+    cmd.env("NODE_EXTRA_CA_CERTS", &ca);
+    let output = bounded_output(&mut cmd);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for line in [
+        "ca=200 TLSv1.3/TLS_AES_256_GCM_SHA384",
+        "caMax12=200 TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+        "caSp12=200 TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+        "agentCaMax12=200 TLSv1.2/ECDHE-RSA-AES128-GCM-SHA256",
+        "noWrite=ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION:undefined:noerrno:library,reason,code",
+        "writeCb=EPROTO",
+        "write=EPROTO:write:errno:errno,code,syscall",
+        "endNoData=ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION:undefined:noerrno:library,reason,code",
+        "requestMin13=ERROR EPROTO:write:errno:errno,code,syscall",
+        "sharedMin13=ERROR EPROTO:write:errno:errno,code,syscall",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?}\nstdout: {stdout}");
+    }
+    // The untrusted root is refused on the verifying path, as before: the
+    // root is trusted for this run through NODE_EXTRA_CA_CERTS, so the line
+    // reads 200 here; case 179 pins the refusal without it.
+    assert!(stdout.contains("untrusted=200 "), "stdout: {stdout}");
+}
+
+/// Issue #196: a fatal alert the server sends is named with node's code on
+/// every client, answering the handshake (a raw server sending
+/// `handshake_failure` after the ClientHello: the alert's own code on a
+/// tls.connect socket with nothing queued, `write EPROTO` once a write was
+/// queued behind the handshake -- an https request's head included, on the
+/// agent path and the shared transport alike -- and a description node cannot
+/// name as node's disconnect or that same EPROTO) and after it (a TLS 1.3
+/// server requiring a client certificate, whose `certificate_required`
+/// arrives after 'secureConnect': the alert's own code on tls.connect,
+/// https.request and an http2 stream). The shared transport's post-handshake
+/// alert is not covered: hyper collapses a post-handshake read failure to a
+/// connection-closed, so oam cannot recover the alert there (entry 34).
+/// Every line measured on node v22.22.2; conformance cases 145 and 180 hold
+/// the handshake-time table.
+#[test]
+fn tls_alerts_from_the_server_carry_nodes_codes_on_every_client() {
+    let src = format!(
+        r#"
+import net from 'node:net';
+import tls from 'node:tls';
+import https from 'node:https';
+import http2 from 'node:http2';
+const root = `{root}`;
+const cert = `{cert}`;
+const key = `{key}`;
+setTimeout(() => {{ console.log('TIMEOUT'); process.exit(3); }}, 30000).unref();
+const shape = (e) => e.code + ':' + e.syscall + ':' + (typeof e.errno === 'number' && e.errno < 0 ? 'errno' : 'noerrno') + ':' + Object.keys(e).join(',') + ':' + e.library + ':' + e.reason;
+function rawServer(answer) {{
+  const server = net.createServer((c) => {{ c.on('error', () => {{}}); c.once('data', () => answer(c)); }});
+  return new Promise((r) => server.listen(0, '127.0.0.1', () => r(server)));
+}}
+function tlsClient(label, port, opts, write) {{
+  return new Promise((resolve) => {{
+    const events = [];
+    const s = tls.connect({{ host: '127.0.0.1', port, ...opts }}, () => events.push('secureConnect'));
+    if (write) s.write('x', (e) => events.push('cb=' + (e ? e.code : 'ok')));
+    s.on('error', (e) => events.push(shape(e)));
+    s.on('close', () => {{ console.log(label + '=' + events.join(' ')); resolve(); }});
+  }});
+}}
+function request(label, port, opts) {{
+  return new Promise((resolve) => {{
+    const r = https.request({{ host: '127.0.0.1', port, path: '/', ...opts }}, (res) => {{ res.resume(); res.on('end', () => {{ console.log(label + '=response'); resolve(); }}); }});
+    r.on('error', (e) => {{ console.log(label + '=' + shape(e)); resolve(); }});
+    r.end();
+  }});
+}}
+function shared(label, port) {{
+  return new Promise((resolve) => {{
+    const r = https.get('https://localhost:' + port + '/', (res) => {{ res.resume(); res.on('end', () => {{ console.log(label + '=response'); resolve(); }}); }});
+    r.on('error', (e) => {{ console.log(label + '=' + shape(e)); resolve(); }});
+  }});
+}}
+const alert = (d) => Buffer.from([0x15, 0x03, 0x03, 0x00, 0x02, 0x02, d]);
+let server = await rawServer((c) => c.end(alert(40)));
+let port = server.address().port;
+await tlsClient('noWrite', port, {{ rejectUnauthorized: false }}, false);
+await tlsClient('write', port, {{ rejectUnauthorized: false }}, true);
+await request('request', port, {{ rejectUnauthorized: false }});
+await shared('shared', port);
+await new Promise((r) => server.close(r));
+server = await rawServer((c) => c.end(alert(255)));
+port = server.address().port;
+await tlsClient('unnamedNoWrite', port, {{ rejectUnauthorized: false }}, false);
+await tlsClient('unnamedWrite', port, {{ rejectUnauthorized: false }}, true);
+await new Promise((r) => server.close(r));
+server = await rawServer((c) => c.end());
+port = server.address().port;
+await tlsClient('eof', port, {{ rejectUnauthorized: false }}, false);
+await shared('eofShared', port);
+await new Promise((r) => server.close(r));
+const conns = new Set();
+const strict = tls.createServer({{ cert, key, ca: [root], requestCert: true, rejectUnauthorized: true, minVersion: 'TLSv1.3', ALPNProtocols: ['h2', 'http/1.1'] }}, (c) => {{ conns.add(c); c.on('error', () => {{}}); }});
+strict.on('tlsClientError', () => {{}});
+await new Promise((r) => strict.listen(0, '127.0.0.1', r));
+port = strict.address().port;
+await tlsClient('after', port, {{ ca: root, servername: 'localhost' }}, false);
+await request('afterRequest', port, {{ ca: root, servername: 'localhost' }});
+await new Promise((resolve) => {{
+  const session = http2.connect('https://localhost:' + port, {{ ca: root }});
+  session.on('error', () => {{}});
+  const stream = session.request({{ ':path': '/' }});
+  stream.on('error', (e) => console.log('afterH2=' + shape(e)));
+  stream.on('close', () => {{ session.destroy(); resolve(); }});
+}});
+for (const c of conns) c.destroy();
+await new Promise((r) => strict.close(r));
+process.exit(0);
+"#,
+        root = FETCH_TEST_CA,
+        cert = FETCH_TEST_LEAF,
+        key = FETCH_TEST_LEAF_KEY,
+    );
+    let file = write_temp("tls_alert_codes.mjs", &src);
+    let ca = write_temp("tls_alert_codes_ca.pem", FETCH_TEST_CA);
+    let mut cmd = oam_command(&["run", file.to_str().unwrap(), "--no-check"]);
+    // The shared-transport requests trust the root the same way a fetch can.
+    cmd.env("NODE_EXTRA_CA_CERTS", &ca);
+    let output = bounded_output(&mut cmd);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "test failed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    let alert = "ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE:undefined:noerrno:library,reason,code:SSL routines:ssl/tls alert handshake failure";
+    let eproto = "EPROTO:write:errno:errno,code,syscall:undefined:undefined";
+    let disconnect =
+        "ECONNRESET:undefined:noerrno:code,path,host,port,localAddress:undefined:undefined";
+    let required = "ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED:undefined:noerrno:library,reason,code:SSL routines:tlsv13 alert certificate required";
+    for line in [
+        format!("noWrite={alert}"),
+        format!("write=cb=EPROTO {eproto}"),
+        format!("request={eproto}"),
+        format!("shared={eproto}"),
+        format!("unnamedNoWrite={disconnect}"),
+        format!("unnamedWrite=cb=EPROTO {eproto}"),
+        format!("eof={disconnect}"),
+        format!("eofShared={disconnect}"),
+        format!("after=secureConnect {required}"),
+        format!("afterRequest={required}"),
+        format!("afterH2={required}"),
+    ] {
+        assert!(stdout.contains(&line), "missing {line:?}\nstdout: {stdout}");
+    }
+}
+
+/// Issue #197: an http2 session that a fatal TLS alert ends AFTER it has
+/// connected is destroyed silently -- the failure is carried by its streams,
+/// not re-surfaced on the session. A program written for node handles the
+/// request's error and never installs a session `'error'` listener; up to
+/// 0.16.4 oam's session emitted `'error'` there, an unhandled event that
+/// crashed the whole process. This drives a TLS 1.3 server that requires a
+/// client certificate against a client that sends none (the server answers
+/// with `certificate_required` after the handshake) and asserts the process
+/// survives, the stream carrying the alert's code (#196). Measured on node
+/// v22.22.2.
+#[test]
+fn http2_session_ended_by_a_server_alert_does_not_crash_the_process() {
+    let src = format!(
+        r#"
+import http2 from 'node:http2';
+const root = `{root}`;
+const cert = `{cert}`;
+const key = `{key}`;
+setTimeout(() => {{ console.log('TIMEOUT'); process.exit(3); }}, 20000).unref();
+const server = http2.createSecureServer(
+  {{ cert, key, ca: [root], requestCert: true, rejectUnauthorized: true }},
+  () => {{}},
+);
+server.on('error', () => {{}});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+// No session 'error' listener -- as a node program has none, the session
+// staying silent. An unhandled session 'error' would crash before 'survived'.
+const session = http2.connect('https://localhost:' + port, {{ ca: root }});
+session.on('connect', () => console.log('connect'));
+const stream = session.request({{ ':path': '/' }});
+stream.on('error', (e) => console.log('stream error ' + e.code));
+stream.on('close', () => console.log('stream close'));
+setTimeout(() => {{
+  console.log('survived destroyed=' + session.destroyed);
+  try {{ session.destroy(); }} catch {{}}
+  server.close();
+  process.exit(0);
+}}, 900);
+"#,
+        root = FETCH_TEST_CA,
+        cert = FETCH_TEST_LEAF,
+        key = FETCH_TEST_LEAF_KEY,
+    );
+    let file = write_temp("http2_session_alert.mjs", &src);
+    let mut cmd = oam_command(&["run", file.to_str().unwrap(), "--no-check"]);
+    let output = bounded_output(&mut cmd);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "the session's alert must not crash the process.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    for line in [
+        "connect",
+        "stream error ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED",
+        "stream close",
+        "survived destroyed=true",
+    ] {
+        assert!(stdout.contains(line), "missing {line:?}\nstdout: {stdout}");
+    }
 }
 
 /// `https.get('https://[::1]:PORT/', { rejectUnauthorized: false })` takes the
@@ -19287,8 +20079,8 @@ expiredServer.close();
         // The e2e cert has no subjectAltName at all (CN=localhost only), so
         // the IP the host resolved to is checked against an empty list --
         // Node's exact wording.
-        r#"selfsigned-ip={"ok":false,"code":"ERR_TLS_CERT_ALTNAME_INVALID","message":"Hostname/IP does not match certificate's altnames: IP: 127.0.0.1 is not in the cert's list: ","keys":["code","reason","host","cert"],"hasSyscall":false,"hasErrno":false,"reason":"IP: 127.0.0.1 is not in the cert's list: ","host":"127.0.0.1","authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
-        r#"hostname={"ok":false,"code":"ERR_TLS_CERT_ALTNAME_INVALID","message":"Hostname/IP does not match certificate's altnames: Host: example.com. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1","keys":["code","reason","host","cert"],"hasSyscall":false,"hasErrno":false,"reason":"Host: example.com. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1","host":"example.com","authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
+        r#"selfsigned-ip={"ok":false,"code":"ERR_TLS_CERT_ALTNAME_INVALID","message":"Hostname/IP does not match certificate's altnames: IP: 127.0.0.1 is not in the cert's list: ","keys":["code","reason","host","cert"],"hasSyscall":false,"hasErrno":false,"reason":"IP: 127.0.0.1 is not in the cert's list: ","host":"127.0.0.1","certCN":"localhost","certIssuerCN":"localhost","authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
+        r#"hostname={"ok":false,"code":"ERR_TLS_CERT_ALTNAME_INVALID","message":"Hostname/IP does not match certificate's altnames: Host: example.com. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1","keys":["code","reason","host","cert"],"hasSyscall":false,"hasErrno":false,"reason":"Host: example.com. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1","host":"example.com","certCN":"localhost","certAltName":"DNS:localhost, IP Address:127.0.0.1","certIssuerCN":"oam test CA","authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
         r#"hostname-advisory={"ok":true,"authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
         // An untrusted chain is refused before the name is looked at.
         r#"untrusted-wrong-host={"ok":false,"code":"UNABLE_TO_VERIFY_LEAF_SIGNATURE","message":"unable to verify the first certificate""#,

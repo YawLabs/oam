@@ -185,6 +185,19 @@ pub enum OpOutcome {
     NodeAggregateFailed {
         errors: Vec<NodeSysError>,
     },
+    /// A TLS certificate refusal that also carries the peer's chain, so the
+    /// error the engine rejects with reports `err.cert` the way node does for
+    /// a caught `ERR_TLS_CERT_ALTNAME_INVALID` (#198). The engine builds the
+    /// same coded error as `NodeFailed` and hangs the two base64 chains on it
+    /// (`peerCertificates` leaf-first, `storeIssuers` from the store), which
+    /// tls.connect's JS reads into the socket before `getPeerCertificate()`.
+    /// A new variant, so a replay file recorded before it existed still loads.
+    NodeCertRefused {
+        code: String,
+        message: String,
+        peer_certificates: Vec<String>,
+        store_issuers: Vec<String>,
+    },
     /// A `--permission` refusal raised mid-op (see [`AccessDenial`]): the
     /// engine rejects with the `ERR_ACCESS_DENIED` error its synchronous gates
     /// throw. A new variant, so a replay file recorded before it existed still
@@ -756,10 +769,14 @@ pub struct CoreRuntime {
 impl CoreRuntime {
     pub fn new() -> Result<Self, String> {
         // Process-wide TLS provider: ring (see workspace Cargo.toml for why
-        // not aws-lc-rs). Err means a provider is already installed: fine.
+        // not aws-lc-rs), with its suites in Node's order of preference
+        // (`tls::node_crypto_provider`). Err means a provider is already
+        // installed: fine -- every config this crate builds names the
+        // provider itself, so the default only serves code that asks for
+        // one by default.
         static TLS_PROVIDER: std::sync::Once = std::sync::Once::new();
         TLS_PROVIDER.call_once(|| {
-            let _ = rustls::crypto::ring::default_provider().install_default();
+            let _ = tls::node_crypto_provider_value().install_default();
         });
         // NODE_EXTRA_CA_CERTS: read once, here at boot, with Node's warning
         // on stderr if the file will not load -- before any script runs and

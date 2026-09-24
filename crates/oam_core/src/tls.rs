@@ -169,22 +169,96 @@ fn reinsert_writer(registry: &TlsRegistry, handle: u64, writer: TlsWriter) -> bo
     }
 }
 
-/// Node's error `code` for a rustls handshake failure that maps to a specific
-/// OpenSSL code rather than a transport errno. Today the one mapping is a
-/// received `protocol_version` fatal alert -- the peer's highest offered
-/// version is below our `minVersion` -- which Node reports as
-/// `ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION` (measured on v22). tokio-rustls wraps
-/// the `rustls::Error` as the source of an `InvalidData` io error, so it can be
-/// recovered by downcast. The accompanying message stays rustls's own: Node's
-/// is an OpenSSL diagnostic blob carrying its build path, which no runtime can
-/// reproduce (see docs/node-divergences.md), so only the code is matched.
-fn tls_alert_code(error: &std::io::Error) -> Option<&'static str> {
+/// Node's error `code` for a fatal alert the peer sent: `ERR_SSL_` and
+/// OpenSSL's reason string for the alert, uppercased with underscores --
+/// the SSL3-era alerts spelled `SSL/TLS` (OpenSSL 3's spelling; 1.1 said
+/// `SSLV3`), the rest `TLSV1` or `TLSV13`, and five of them without the
+/// word `ALERT`. Measured on Node v22.22.2 (OpenSSL 3.5.5) for every
+/// description a raw server can send, on both sides of a connection: a
+/// client names the alert its server sent, a server (`tlsClientError`) the
+/// one its client sent. `None` for a description OpenSSL has no name for,
+/// and for `close_notify` sent as fatal (rustls reports it as the alert it
+/// is when it arrives mid-handshake): a bare `tls.connect` socket reports
+/// the transport closing (`disconnected_before_secure`), one with a write
+/// queued behind the handshake that write's `EPROTO` (`alert_outcome`), as
+/// Node does for both.
+pub(crate) fn alert_code(alert: rustls::AlertDescription) -> Option<&'static str> {
+    use rustls::AlertDescription as A;
+    Some(match alert {
+        A::UnexpectedMessage => "ERR_SSL_SSL/TLS_ALERT_UNEXPECTED_MESSAGE",
+        A::BadRecordMac => "ERR_SSL_SSL/TLS_ALERT_BAD_RECORD_MAC",
+        A::DecryptionFailed => "ERR_SSL_TLSV1_ALERT_DECRYPTION_FAILED",
+        A::RecordOverflow => "ERR_SSL_TLSV1_ALERT_RECORD_OVERFLOW",
+        A::DecompressionFailure => "ERR_SSL_SSL/TLS_ALERT_DECOMPRESSION_FAILURE",
+        A::HandshakeFailure => "ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE",
+        A::NoCertificate => "ERR_SSL_SSL/TLS_ALERT_NO_CERTIFICATE",
+        A::BadCertificate => "ERR_SSL_SSL/TLS_ALERT_BAD_CERTIFICATE",
+        A::UnsupportedCertificate => "ERR_SSL_SSL/TLS_ALERT_UNSUPPORTED_CERTIFICATE",
+        A::CertificateRevoked => "ERR_SSL_SSL/TLS_ALERT_CERTIFICATE_REVOKED",
+        A::CertificateExpired => "ERR_SSL_SSL/TLS_ALERT_CERTIFICATE_EXPIRED",
+        A::CertificateUnknown => "ERR_SSL_SSL/TLS_ALERT_CERTIFICATE_UNKNOWN",
+        A::IllegalParameter => "ERR_SSL_SSL/TLS_ALERT_ILLEGAL_PARAMETER",
+        A::UnknownCA => "ERR_SSL_TLSV1_ALERT_UNKNOWN_CA",
+        A::AccessDenied => "ERR_SSL_TLSV1_ALERT_ACCESS_DENIED",
+        A::DecodeError => "ERR_SSL_TLSV1_ALERT_DECODE_ERROR",
+        A::DecryptError => "ERR_SSL_TLSV1_ALERT_DECRYPT_ERROR",
+        A::ExportRestriction => "ERR_SSL_TLSV1_ALERT_EXPORT_RESTRICTION",
+        A::ProtocolVersion => "ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION",
+        A::InsufficientSecurity => "ERR_SSL_TLSV1_ALERT_INSUFFICIENT_SECURITY",
+        A::InternalError => "ERR_SSL_TLSV1_ALERT_INTERNAL_ERROR",
+        A::InappropriateFallback => "ERR_SSL_TLSV1_ALERT_INAPPROPRIATE_FALLBACK",
+        A::UserCanceled => "ERR_SSL_TLSV1_ALERT_USER_CANCELLED",
+        A::NoRenegotiation => "ERR_SSL_TLSV1_ALERT_NO_RENEGOTIATION",
+        A::MissingExtension => "ERR_SSL_TLSV13_ALERT_MISSING_EXTENSION",
+        A::UnsupportedExtension => "ERR_SSL_TLSV1_UNSUPPORTED_EXTENSION",
+        A::CertificateUnobtainable => "ERR_SSL_TLSV1_CERTIFICATE_UNOBTAINABLE",
+        A::UnrecognisedName => "ERR_SSL_TLSV1_UNRECOGNIZED_NAME",
+        A::BadCertificateStatusResponse => "ERR_SSL_TLSV1_BAD_CERTIFICATE_STATUS_RESPONSE",
+        A::BadCertificateHashValue => "ERR_SSL_TLSV1_BAD_CERTIFICATE_HASH_VALUE",
+        A::UnknownPSKIdentity => "ERR_SSL_TLSV1_ALERT_UNKNOWN_PSK_IDENTITY",
+        A::CertificateRequired => "ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED",
+        A::NoApplicationProtocol => "ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL",
+        _ => return None,
+    })
+}
+
+/// The fatal alert an io error from rustls carries, if it carries one.
+/// tokio-rustls wraps the `rustls::Error` as the inner error of an
+/// `InvalidData` io error (not its `source()`), so it is opened here.
+pub(crate) fn received_alert(error: &std::io::Error) -> Option<rustls::AlertDescription> {
     match error.get_ref()?.downcast_ref::<rustls::Error>()? {
-        rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion) => {
-            Some("ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION")
-        }
+        rustls::Error::AlertReceived(alert) => Some(*alert),
         _ => None,
     }
+}
+
+/// Node's error for a fatal alert the server sent: its code, with rustls's
+/// text for the message (Node's is an OpenSSL diagnostic carrying its build
+/// path; docs/node-divergences.md entry 34). An alert Node has no name for
+/// is `EPROTO` with no syscall -- the protocol failed, in no named way --
+/// which the JS side shapes as Node does (measured on v22.22.2 with a raw
+/// server sending description 255): the disconnect below on a bare socket,
+/// the failed write's `write EPROTO` once a write was queued behind the
+/// handshake, as for every named alert.
+fn alert_outcome(alert: rustls::AlertDescription) -> OpOutcome {
+    let message = format!("received fatal alert: {alert:?}");
+    match alert_code(alert) {
+        Some(code) => OpOutcome::node_failed(code, message),
+        None => OpOutcome::node_failed("EPROTO", message),
+    }
+}
+
+/// Node's error when the transport closes before the handshake is done --
+/// the server went away, or sent an alert OpenSSL could not name to a
+/// socket with nothing queued -- an `ECONNRESET` with Node's own message
+/// and no syscall (`path`, `host`, `port` and `localAddress` are added by
+/// the JS side, which has the options).
+pub(crate) fn disconnected_before_secure() -> OpOutcome {
+    OpOutcome::node_failed(
+        "ECONNRESET",
+        "Client network socket disconnected before secure TLS connection was established"
+            .to_string(),
+    )
 }
 
 /// The TLS `protocol_version` fatal alert as one record on the wire: content
@@ -219,6 +293,12 @@ pub(crate) async fn refuse_no_protocols(mut stream: tokio::net::TcpStream) {
 }
 
 fn tls_fail(error: std::io::Error, syscall: &str, target: &str) -> OpOutcome {
+    // A fatal alert the server sent after the handshake -- a TLS 1.3 server
+    // requiring a client certificate sends `certificate_required` then --
+    // arrives on a read or a write, and is named as Node names it (#196).
+    if let Some(alert) = received_alert(&error) {
+        return alert_outcome(alert);
+    }
     let code = node_error_code(&error);
     // syscall + errno, but no `path`: a host:port is not a filesystem path,
     // and node does not put one on a net error.
@@ -544,7 +624,7 @@ fn named_refusal(reason: &CertificateError) -> Option<VerifyFailure> {
 
 /// Where the verifier leaves its verdict for `tls_connect` to read after
 /// the handshake: None means the certificate was accepted.
-type VerifySlot = Arc<Mutex<Option<VerifyFailure>>>;
+type VerifySlot = Arc<Mutex<Option<(VerifyFailure, Vec<Vec<u8>>)>>>;
 
 /// rustls's webpki verification plus Node's departures from it.
 #[derive(Debug)]
@@ -605,7 +685,21 @@ impl ServerCertVerifier for NodeCertVerifier {
         let verdict = self.verdict(end_entity, intermediates, server_name, now);
         *self.outcome.lock().unwrap_or_else(|e| e.into_inner()) = match &verdict {
             Ok(()) => None,
-            Err((failure, _)) => Some(failure.clone()),
+            Err((failure, _)) => {
+                // Only a name refusal carries the peer certificate to Node's
+                // `err.cert`; a chain-build failure leaves it `{}` (measured
+                // on v22.22.2). Carry the chain the connect path builds it
+                // from, alongside the failure so `VerifyFailure` -- returned
+                // by value from `verdict` -- stays small (#198).
+                let chain = if failure.code == Some("ERR_TLS_CERT_ALTNAME_INVALID") {
+                    std::iter::once(end_entity.as_ref().to_vec())
+                        .chain(intermediates.iter().map(|c| c.as_ref().to_vec()))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                Some((failure.clone(), chain))
+            }
         };
         match verdict {
             Ok(()) => Ok(ServerCertVerified::assertion()),
@@ -1011,13 +1105,55 @@ fn check_server_identity(server_name: &ServerName<'_>, der: &[u8]) -> Result<(),
     }
 }
 
+// ----------------------------------------------------------- crypto provider
+
+/// The cipher suites oam offers and accepts, in Node's order of preference.
+///
+/// rustls's ring provider lists its suites AES-256 first under both protocol
+/// versions. Node's OpenSSL runs on `tls.DEFAULT_CIPHERS`, which
+/// `openssl ciphers -v` expands to TLS 1.3's `TLS_AES_256_GCM_SHA384`,
+/// `TLS_CHACHA20_POLY1305_SHA256`, `TLS_AES_128_GCM_SHA256` and, for TLS 1.2,
+/// the ECDHE AES-128-GCM suites before the AES-256-GCM ones, with CHACHA20
+/// last (from the list's `HIGH` tail). The order is what a client offers
+/// and -- under `honorCipherOrder`, a server's default -- what a server
+/// picks by, so it decides what `getCipher()` reports on a pinned TLS 1.2
+/// handshake between two oam peers: `ECDHE-RSA-AES128-GCM-SHA256`, as
+/// between two Node peers (measured on v22.22.2; rustls's own order gave
+/// `ECDHE-RSA-AES256-GCM-SHA384`, #144). The set is ring's whole set,
+/// nothing dropped or added. Every client and server config in this crate
+/// is built on this provider by name, so the process-wide default --
+/// installed by `CoreRuntime::new`, or by `oam install`'s own client,
+/// whichever runs first -- never decides an order.
+pub fn node_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    static PROVIDER: OnceLock<Arc<rustls::crypto::CryptoProvider>> = OnceLock::new();
+    Arc::clone(PROVIDER.get_or_init(|| Arc::new(node_crypto_provider_value())))
+}
+
+/// `node_crypto_provider` by value, as `CryptoProvider::install_default`
+/// takes it.
+pub fn node_crypto_provider_value() -> rustls::crypto::CryptoProvider {
+    use rustls::crypto::ring::cipher_suite as ring;
+    rustls::crypto::CryptoProvider {
+        cipher_suites: vec![
+            // TLS 1.3: tls.DEFAULT_CIPHERS' first three entries.
+            ring::TLS13_AES_256_GCM_SHA384,
+            ring::TLS13_CHACHA20_POLY1305_SHA256,
+            ring::TLS13_AES_128_GCM_SHA256,
+            // TLS 1.2: the list's ECDHE AES-GCM entries in its order, then
+            // the CHACHA20 pair as `HIGH` orders it.
+            ring::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+            ring::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            ring::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+            ring::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            ring::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            ring::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        ],
+        ..rustls::crypto::ring::default_provider()
+    }
+}
+
 // ------------------------------------------------------------- client config
 
-/// Build a rustls ClientConfig from optional PEM-encoded CA certs. Trust is
-/// the `ca` option alone when given, else the Mozilla root store plus the
-/// NODE_EXTRA_CA_CERTS bundle -- `ca` replaces the extras rather than
-/// adding to them, as in Node (measured). The returned slot is where the
-/// verifier leaves its verdict.
 /// A rank for the four TLS version names Node accepts, low to high. The JS
 /// layer validates the strings (an unknown one throws
 /// `ERR_TLS_INVALID_PROTOCOL_VERSION` before the op is spawned) and resolves
@@ -1069,6 +1205,11 @@ pub(crate) fn protocol_versions(
     Ok(versions)
 }
 
+/// Build a rustls ClientConfig from optional PEM-encoded CA certs. Trust is
+/// the `ca` option alone when given, else the Mozilla root store plus the
+/// NODE_EXTRA_CA_CERTS bundle -- `ca` replaces the extras rather than
+/// adding to them, as in Node (measured). The returned slot is where the
+/// verifier leaves its verdict.
 fn build_client_config(
     ca_pem: Option<&str>,
     identity: Option<&ClientContext>,
@@ -1114,19 +1255,26 @@ fn build_client_config(
         .cloned()
         .collect();
 
+    // Every piece of this config -- the chain verifier included -- is built
+    // on the one provider, never on the process-wide default (which `oam
+    // install`'s own client may have installed first).
+    let provider = node_crypto_provider();
     let inner = if root_store.is_empty() {
         None
     } else {
         Some(
-            rustls::client::WebPkiServerVerifier::builder(Arc::new(root_store))
-                .build()
-                .map_err(|e| format!("tls verifier: {e}"))?,
+            rustls::client::WebPkiServerVerifier::builder_with_provider(
+                Arc::new(root_store),
+                Arc::clone(&provider),
+            )
+            .build()
+            .map_err(|e| format!("tls verifier: {e}"))?,
         )
     };
     let outcome: VerifySlot = Arc::new(Mutex::new(None));
     let verifier = Arc::new(NodeCertVerifier {
         inner,
-        supported: rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        supported: provider.signature_verification_algorithms,
         trusted_leaves,
         trusted_non_anchors,
         untrusted_known,
@@ -1134,7 +1282,12 @@ fn build_client_config(
         check_name,
         outcome: outcome.clone(),
     });
-    let builder = rustls::ClientConfig::builder_with_protocol_versions(versions)
+    // The suites go out in Node's order (`node_crypto_provider`); the
+    // versions were narrowed by `protocol_versions`, which never leaves a
+    // set no suite serves, so the builder's refusal cannot happen here.
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(versions)
+        .map_err(|e| format!("tls client config: {e}"))?
         .dangerous()
         .with_custom_certificate_verifier(verifier);
 
@@ -1323,6 +1476,32 @@ pub(crate) fn peer_certificates_b64(
             .iter()
             .map(|c| base64::engine::general_purpose::STANDARD.encode(c.as_ref()))
             .collect(),
+    )
+}
+
+/// The base64 chains Node's `getPeerCertificate(true)` is built from for a
+/// peer that presented `chain`: its own certificates (`peerCertificates`,
+/// leaf first) and, from the last one, the issuers the context's store holds
+/// (`storeIssuers` -- the `ca` option, or the default store, plus a pfx's
+/// CAs). Shared by the accepted path and the name-refusal path (#198).
+pub(crate) fn peer_cert_payload(
+    chain: &[CertificateDer<'static>],
+    ca_pem: Option<&str>,
+    identity: Option<&ClientContext>,
+) -> (Vec<String>, Vec<String>) {
+    let peer = peer_certificates_b64(Some(chain)).unwrap_or_default();
+    let ca = ca_pem.map(|pem| server::ca_certificates(&[pem.to_string()]));
+    let mut store: Vec<&CertificateDer<'static>> = match &ca {
+        Some(ca) => ca.iter().collect(),
+        None => chain::default_store().iter().collect(),
+    };
+    if let Some(identity) = identity {
+        store.extend(identity.pfx_cas.iter());
+    }
+    let issuers = chain::store_issuers(chain, &store, chain::unix_now());
+    (
+        peer,
+        peer_certificates_b64(Some(&issuers)).unwrap_or_default(),
     )
 }
 
@@ -1537,15 +1716,48 @@ where
         Ok(s) => s,
         Err(e) => {
             if reject_unauthorized
-                && let Some(VerifyFailure {
-                    code: Some(code),
-                    message,
-                }) = verdict.lock().unwrap_or_else(|e| e.into_inner()).take()
+                && let Some((failure, peer_chain)) =
+                    verdict.lock().unwrap_or_else(|e| e.into_inner()).take()
+                && let Some(code) = failure.code
             {
-                return Err(OpOutcome::node_failed(code, message));
+                // A refused name reports the peer certificate as Node's
+                // `err.cert` (#198): the chain the verifier held and the
+                // store's issuers of it, the same base64 the accepted path
+                // sends, for the JS side's `getPeerCertificate(true)`.
+                if !peer_chain.is_empty() {
+                    let chain: Vec<CertificateDer<'static>> =
+                        peer_chain.into_iter().map(CertificateDer::from).collect();
+                    let (peer_certificates, store_issuers) =
+                        peer_cert_payload(&chain, ca_pem, identity);
+                    return Err(OpOutcome::NodeCertRefused {
+                        code: code.to_string(),
+                        message: failure.message,
+                        peer_certificates,
+                        store_issuers,
+                    });
+                }
+                return Err(OpOutcome::node_failed(code, failure.message));
             }
-            if let Some(code) = tls_alert_code(&e) {
-                return Err(OpOutcome::node_failed(code, e.to_string()));
+            // A fatal alert answering the handshake: Node's code for it
+            // (#196). The transport going away instead: Node's disconnect
+            // (an EOF), or `read ECONNRESET` (a reset), measured on
+            // v22.22.2 against a raw server that closes or resets after
+            // the ClientHello.
+            if let Some(alert) = received_alert(&e) {
+                return Err(alert_outcome(alert));
+            }
+            match e.kind() {
+                std::io::ErrorKind::UnexpectedEof => return Err(disconnected_before_secure()),
+                std::io::ErrorKind::ConnectionReset => {
+                    return Err(OpOutcome::node_failed_at(
+                        "ECONNRESET",
+                        "read ECONNRESET".to_string(),
+                        "read",
+                        None,
+                        node_errno("ECONNRESET", &e),
+                    ));
+                }
+                _ => {}
             }
             return Err(tls_fail(e, "connect", target));
         }
@@ -1574,13 +1786,20 @@ where
     // when it has none), null on an accepted certificate.
     let authorization_error = match &failure {
         None => serde_json::Value::Null,
-        Some(VerifyFailure {
-            code: Some(code), ..
-        }) => serde_json::Value::from(*code),
-        Some(VerifyFailure {
-            code: None,
-            message,
-        }) => serde_json::Value::from(message.as_str()),
+        Some((
+            VerifyFailure {
+                code: Some(code), ..
+            },
+            _,
+        )) => serde_json::Value::from(*code),
+        Some((
+            VerifyFailure {
+                code: None,
+                message,
+                ..
+            },
+            _,
+        )) => serde_json::Value::from(message.as_str()),
     };
     let mut payload = serde_json::json!({
         "protocol": protocol,
@@ -1601,16 +1820,8 @@ where
     // (GetLastIssuedCert): the `ca` certificates, or the default store, and
     // a pfx's CAs.
     if let Some(chain) = client_conn.peer_certificates() {
-        let ca = ca_pem.map(|pem| server::ca_certificates(&[pem.to_string()]));
-        let mut store: Vec<&CertificateDer<'static>> = match &ca {
-            Some(ca) => ca.iter().collect(),
-            None => chain::default_store().iter().collect(),
-        };
-        if let Some(identity) = identity {
-            store.extend(identity.pfx_cas.iter());
-        }
-        let issuers = chain::store_issuers(chain, &store, chain::unix_now());
-        if let Some(issuers) = peer_certificates_b64(Some(&issuers)) {
+        let (_, issuers) = peer_cert_payload(chain, ca_pem, identity);
+        if !issuers.is_empty() {
             payload["storeIssuers"] = serde_json::Value::from(issuers);
         }
     }
@@ -2166,6 +2377,58 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         protocol_versions(min, max).map(|v| v.iter().map(|p| p.version).collect())
     }
 
+    /// The provider is ring's whole suite set in Node's preference order:
+    /// `tls.DEFAULT_CIPHERS` as `openssl ciphers -v` expands it, narrowed to
+    /// what rustls implements (v22.22.2 / OpenSSL 3.5). The order decides
+    /// what `getCipher()` reports on a pinned 1.2 handshake between two oam
+    /// peers: rustls's own order put AES-256 first, Node's puts AES-128
+    /// first, and a client offering rustls's order against a server picking
+    /// by Node's (conformance case 178) would show the difference.
+    #[test]
+    fn node_crypto_provider_orders_ring_suites_as_node_does() {
+        use rustls::CipherSuite as C;
+        let provider = node_crypto_provider();
+        let ids: Vec<C> = provider.cipher_suites.iter().map(|s| s.suite()).collect();
+        assert_eq!(
+            ids,
+            vec![
+                C::TLS13_AES_256_GCM_SHA384,
+                C::TLS13_CHACHA20_POLY1305_SHA256,
+                C::TLS13_AES_128_GCM_SHA256,
+                C::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                C::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                C::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                C::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                C::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                C::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+            ]
+        );
+        // Nothing ring offers is dropped, and nothing is listed twice: the
+        // same set, only reordered.
+        let mut ring: Vec<u16> = rustls::crypto::ring::ALL_CIPHER_SUITES
+            .iter()
+            .map(|s| u16::from(s.suite()))
+            .collect();
+        let mut ours: Vec<u16> = ids.iter().map(|c| u16::from(*c)).collect();
+        ring.sort_unstable();
+        ours.sort_unstable();
+        assert_eq!(ours, ring);
+        // Everything else -- key exchange groups, signature algorithms -- is
+        // ring's own, in ring's order.
+        let ring_default = rustls::crypto::ring::default_provider();
+        let groups = |p: &rustls::crypto::CryptoProvider| {
+            p.kx_groups.iter().map(|g| g.name()).collect::<Vec<_>>()
+        };
+        assert_eq!(groups(&provider), groups(&ring_default));
+        // The one handed out by reference and the one built by value agree.
+        let by_value: Vec<C> = node_crypto_provider_value()
+            .cipher_suites
+            .iter()
+            .map(|s| s.suite())
+            .collect();
+        assert_eq!(by_value, ids);
+    }
+
     #[test]
     fn tls_version_rank_maps_only_nodes_four_names() {
         assert_eq!(tls_version_rank("TLSv1"), Some(1));
@@ -2223,27 +2486,67 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         assert!(selected(None, Some("bogus")).is_err());
     }
 
-    /// A received `protocol_version` fatal alert keys to Node's code; any other
-    /// io error (or a rustls error that is not that alert) does not.
+    /// Every fatal alert a rustls io error carries keys to Node's code for it
+    /// -- OpenSSL 3's spellings, measured for each description (case 180) --
+    /// and an io error that carries no alert keys to nothing.
     #[test]
-    fn tls_alert_code_maps_only_the_protocol_version_alert() {
-        let alert = std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            rustls::Error::AlertReceived(rustls::AlertDescription::ProtocolVersion),
-        );
+    fn received_alerts_map_to_nodes_codes() {
+        use rustls::AlertDescription as A;
+        let wrapped = |alert: A| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                rustls::Error::AlertReceived(alert),
+            )
+        };
         assert_eq!(
-            tls_alert_code(&alert),
-            Some("ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION")
+            received_alert(&wrapped(A::ProtocolVersion)),
+            Some(A::ProtocolVersion)
         );
-
-        let other_alert = std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            rustls::Error::AlertReceived(rustls::AlertDescription::HandshakeFailure),
-        );
-        assert_eq!(tls_alert_code(&other_alert), None);
-
+        for (alert, code) in [
+            (A::ProtocolVersion, "ERR_SSL_TLSV1_ALERT_PROTOCOL_VERSION"),
+            (
+                A::HandshakeFailure,
+                "ERR_SSL_SSL/TLS_ALERT_HANDSHAKE_FAILURE",
+            ),
+            (A::BadCertificate, "ERR_SSL_SSL/TLS_ALERT_BAD_CERTIFICATE"),
+            (A::UnknownCA, "ERR_SSL_TLSV1_ALERT_UNKNOWN_CA"),
+            (A::UnrecognisedName, "ERR_SSL_TLSV1_UNRECOGNIZED_NAME"),
+            (
+                A::MissingExtension,
+                "ERR_SSL_TLSV13_ALERT_MISSING_EXTENSION",
+            ),
+            (
+                A::CertificateRequired,
+                "ERR_SSL_TLSV13_ALERT_CERTIFICATE_REQUIRED",
+            ),
+            (
+                A::NoApplicationProtocol,
+                "ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL",
+            ),
+        ] {
+            assert_eq!(alert_code(alert), Some(code), "{alert:?}");
+            let outcome = alert_outcome(alert);
+            assert!(
+                matches!(&outcome, OpOutcome::NodeFailed { code: c, .. } if c == code),
+                "{alert:?}: {outcome:?}"
+            );
+        }
+        // A description OpenSSL cannot name, and close_notify sent as
+        // fatal: EPROTO with no syscall, for the JS side to shape as Node's
+        // disconnect or as the failed write's.
+        assert_eq!(alert_code(A::CloseNotify), None);
+        assert_eq!(alert_code(A::Unknown(200)), None);
+        assert!(matches!(
+            alert_outcome(A::Unknown(200)),
+            OpOutcome::NodeFailed { code, syscall: None, .. } if code == "EPROTO"
+        ));
+        assert!(matches!(
+            disconnected_before_secure(),
+            OpOutcome::NodeFailed { code, syscall: None, .. } if code == "ECONNRESET"
+        ));
+        // No alert in an errno.
         let refused = std::io::Error::from_raw_os_error(10061);
-        assert_eq!(tls_alert_code(&refused), None);
+        assert_eq!(received_alert(&refused), None);
     }
 
     /// A server with no version to offer answers the ClientHello with a
@@ -2740,13 +3043,21 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         // Trusted by name but presented for the wrong host: Node's
         // checkServerIdentity error, with its exact message (this
         // certificate has no SAN, so the CN is what it is matched against).
+        // The refusal carries the peer certificate out, for Node's err.cert
+        // (#198): a `NodeCertRefused` whose `peer_certificates` is the leaf.
         match connect(Some(CERT), true, "example.com").await {
-            OpOutcome::NodeFailed { code, message, .. } => {
+            OpOutcome::NodeCertRefused {
+                code,
+                message,
+                peer_certificates,
+                ..
+            } => {
                 assert_eq!(code, "ERR_TLS_CERT_ALTNAME_INVALID");
                 assert_eq!(
                     message,
                     "Hostname/IP does not match certificate's altnames: Host: example.com. is not cert's CN: localhost"
                 );
+                assert_eq!(peer_certificates.len(), 1, "the leaf it refused");
             }
             other => panic!("expected a hostname rejection, got {other:?}"),
         }
@@ -2791,8 +3102,9 @@ mod node_names {
     // A TLS 1.2 handshake (a Node server pinned with maxVersion) reports
     // OpenSSL's name next to the IANA standardName -- probed:
     // ECDHE-RSA-AES128-GCM-SHA256 / TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256.
-    // oam's tls has no minVersion/maxVersion to pin 1.2 from JS, so the six
-    // 1.2 suites are covered here rather than end to end.
+    // A pinned 1.2 handshake reaches one of them end to end (conformance
+    // case 178 holds the negotiated name to Node's); the other five are
+    // covered here.
     #[test]
     fn tls12_suites_carry_openssl_and_iana_names() {
         for (suite, name, standard) in [
