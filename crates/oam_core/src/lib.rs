@@ -2230,28 +2230,152 @@ pub mod zlib {
         }
     }
 
+    /// The message of the `io::Error` `decompress_capped` returns when the
+    /// output would exceed `max_output`. The op layer matches on it to raise
+    /// node's `RangeError [ERR_BUFFER_TOO_LARGE]`; nothing else produces it.
+    pub const OUTPUT_TOO_LARGE: &str = "zlib output exceeds maxOutputLength";
+
     pub fn decompress(bytes: &[u8], format: Format) -> std::io::Result<Vec<u8>> {
+        decompress_capped(bytes, format, None)
+    }
+
+    /// Decompress, giving up as soon as the output passes `max_output` bytes.
+    ///
+    /// node's `maxOutputLength` (the one-shot zlib APIs). The cap is enforced
+    /// while inflating, not on the finished buffer: a 200 KB gzip of 200 MiB
+    /// of spaces must fail after ~`max_output` bytes of work, not after the
+    /// whole 200 MiB has been allocated -- that allocation is the OOM the
+    /// option exists to prevent. Reads are bounded by what the cap still
+    /// allows, plus one byte so overflow is seen without a second pass.
+    pub fn decompress_capped(
+        bytes: &[u8],
+        format: Format,
+        max_output: Option<usize>,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut reader: Box<dyn Read + '_> = match format {
+            Format::Gzip => Box::new(flate2::read::GzDecoder::new(bytes)),
+            Format::Deflate => Box::new(flate2::read::ZlibDecoder::new(bytes)),
+            Format::DeflateRaw => Box::new(flate2::read::DeflateDecoder::new(bytes)),
+        };
+        match max_output {
+            None => {
+                let mut out = Vec::new();
+                reader.read_to_end(&mut out)?;
+                Ok(out)
+            }
+            Some(cap) => read_capped(&mut reader, cap),
+        }
+    }
+
+    /// Read `reader` to its end, giving up with [`OUTPUT_TOO_LARGE`] the moment
+    /// the output would pass `cap`. It never buffers more than `cap` (plus one
+    /// byte, and a read buffer capped at 64 KiB), so a reader that inflates
+    /// without bound -- a decompression bomb -- is stopped at the cap, not run
+    /// to exhaustion. Split out from `decompress_capped` so the bound can be
+    /// tested against an endless reader, which a `read_to_end` regression would
+    /// run forever.
+    fn read_capped(reader: &mut dyn Read, cap: usize) -> std::io::Result<Vec<u8>> {
         let mut out = Vec::new();
-        match format {
-            Format::Gzip => {
-                flate2::read::GzDecoder::new(bytes).read_to_end(&mut out)?;
+        // Never hand the decoder more room than the cap plus one byte, so
+        // memory stays bounded by `cap` whatever the input inflates to.
+        let mut buf = vec![0u8; (cap + 1).min(64 * 1024)];
+        loop {
+            let want = (cap + 1 - out.len()).min(buf.len());
+            let n = reader.read(&mut buf[..want])?;
+            if n == 0 {
+                return Ok(out);
             }
-            Format::Deflate => {
-                flate2::read::ZlibDecoder::new(bytes).read_to_end(&mut out)?;
-            }
-            Format::DeflateRaw => {
-                flate2::read::DeflateDecoder::new(bytes).read_to_end(&mut out)?;
+            out.extend_from_slice(&buf[..n]);
+            if out.len() > cap {
+                return Err(std::io::Error::other(OUTPUT_TOO_LARGE));
             }
         }
-        Ok(out)
+    }
+
+    // Kept next to `read_capped` (the code it guards) rather than at the module
+    // end past the streaming and brotli code.
+    #[cfg(test)]
+    #[allow(clippy::items_after_test_module)]
+    mod capped_tests {
+        use super::{Format, OUTPUT_TOO_LARGE, compress, decompress_capped, read_capped};
+        use std::io::Read;
+
+        /// A reader that never returns 0: `read_to_end` would allocate without
+        /// bound and never return. It counts the bytes it was asked for.
+        struct Endless {
+            byte: u8,
+            pulled: usize,
+        }
+        impl Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf.fill(self.byte);
+                self.pulled += buf.len();
+                Ok(buf.len())
+            }
+        }
+
+        #[test]
+        fn read_capped_bounds_an_endless_stream() {
+            let cap = 4096;
+            let mut src = Endless {
+                byte: b' ',
+                pulled: 0,
+            };
+            // The whole point of the fix: an endless (bomb) stream is stopped
+            // at the cap, not inflated to exhaustion. A `read_to_end` regression
+            // would never return here.
+            let err = read_capped(&mut src, cap).unwrap_err();
+            assert_eq!(err.to_string(), OUTPUT_TOO_LARGE);
+            // Memory (and reads) bounded by the cap plus one buffer, not the
+            // unbounded stream.
+            assert!(
+                src.pulled <= cap + 1 + 64 * 1024,
+                "pulled {} bytes past the {cap}-byte cap",
+                src.pulled
+            );
+        }
+
+        #[test]
+        fn decompress_capped_stops_a_gzip_bomb_at_the_cap() {
+            // 16 MiB of spaces gzips to a few KB. Under a 1 KiB cap the real
+            // decoder path returns the cap error having buffered ~1 KiB, not
+            // 16 MiB; and the cap boundary is exact.
+            let size = 16 * 1024 * 1024;
+            let bomb = compress(&vec![b' '; size], Format::Gzip, 6).unwrap();
+            let err = decompress_capped(&bomb, Format::Gzip, Some(1024)).unwrap_err();
+            assert_eq!(err.to_string(), OUTPUT_TOO_LARGE);
+            assert!(decompress_capped(&bomb, Format::Gzip, Some(size)).is_ok());
+            assert!(decompress_capped(&bomb, Format::Gzip, Some(size - 1)).is_err());
+        }
+    }
+
+    /// `compress` with node's `maxOutputLength`, which node applies to the
+    /// encoders as well. Checked on the finished buffer: compressed output is
+    /// bounded by the input, so there is no bomb to stop early.
+    pub fn compress_capped(
+        bytes: &[u8],
+        format: Format,
+        level: i32,
+        max_output: Option<usize>,
+    ) -> std::io::Result<Vec<u8>> {
+        let out = compress(bytes, format, level)?;
+        match max_output {
+            Some(cap) if out.len() > cap => Err(std::io::Error::other(OUTPUT_TOO_LARGE)),
+            _ => Ok(out),
+        }
     }
 
     /// Node's unzip*: auto-detect gzip (1f 8b magic) vs zlib-wrapped.
     pub fn unzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
+        unzip_capped(bytes, None)
+    }
+
+    /// `unzip` with node's `maxOutputLength`; see `decompress_capped`.
+    pub fn unzip_capped(bytes: &[u8], max_output: Option<usize>) -> std::io::Result<Vec<u8>> {
         if bytes.starts_with(&[0x1f, 0x8b]) {
-            decompress(bytes, Format::Gzip)
+            decompress_capped(bytes, Format::Gzip, max_output)
         } else {
-            decompress(bytes, Format::Deflate)
+            decompress_capped(bytes, Format::Deflate, max_output)
         }
     }
 
@@ -4020,15 +4144,17 @@ pub mod ops {
     /// Async zlib: CPU-bound, so spawn_blocking off the op channel
     /// (Node's threadpool model). compress=true encodes, false decodes;
     /// format "unzip" auto-detects on the decode side.
+    /// `max_output` is node's `maxOutputLength` for a decode; `None` is no cap.
     pub async fn zlib_transform(
         bytes: Vec<u8>,
         format: String,
         level: i32,
         compress: bool,
+        max_output: Option<usize>,
     ) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || {
             if !compress && format == "unzip" {
-                return super::zlib::unzip(&bytes);
+                return super::zlib::unzip_capped(&bytes, max_output);
             }
             let Some(parsed) = super::zlib::Format::parse(&format) else {
                 return Err(std::io::Error::new(
@@ -4037,14 +4163,19 @@ pub mod ops {
                 ));
             };
             if compress {
-                super::zlib::compress(&bytes, parsed, level)
+                super::zlib::compress_capped(&bytes, parsed, level, max_output)
             } else {
-                super::zlib::decompress(&bytes, parsed)
+                super::zlib::decompress_capped(&bytes, parsed, max_output)
             }
         })
         .await;
         match result {
             Ok(Ok(out)) => OpOutcome::Bytes(out),
+            // The over-cap sentinel travels unprefixed: the shim matches on it
+            // to raise node's ERR_BUFFER_TOO_LARGE.
+            Ok(Err(e)) if e.to_string() == super::zlib::OUTPUT_TOO_LARGE => {
+                OpOutcome::Failed(super::zlib::OUTPUT_TOO_LARGE.to_string())
+            }
             Ok(Err(e)) => OpOutcome::Failed(format!("zlib: {e}")),
             Err(e) => OpOutcome::Failed(format!("zlib task: {e}")),
         }
