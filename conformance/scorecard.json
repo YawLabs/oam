@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "6c3c966+wip",
+  "commit": "1cfc7bb+wip",
   "oamVersion": "oam 0.16.4",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 181,
-      "total": 181,
+      "pass": 183,
+      "total": 183,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -416,6 +416,14 @@
         },
         {
           "case": "19-fs-fd-callbacks.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "190-cjs-module-object.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "191-require-main.mjs",
           "status": "pass"
         },
         {

@@ -1420,7 +1420,7 @@ fn test_command(paths: &[PathBuf], filter: Option<&str>, json: bool) -> ExitCode
             return ExitCode::from(9);
         }
 
-        let evaluated = if oam_loader::module_kind(file) == oam_loader::ModuleKind::Cjs {
+        let evaluated = if entry_module_kind(file) == oam_loader::ModuleKind::Cjs {
             rt.execute_cjs(file, &CliHost)
         } else {
             rt.execute_module(file, &CliHost)
@@ -2221,6 +2221,18 @@ fn run_file(
     run_file_with_flags(file, script_args, inspect, replay_mode, &flags)
 }
 
+/// Which loader an entry file goes to, decided on the file's real location
+/// (module_key: absolute, links resolved), as node resolves its main entry.
+/// module_kind's package.json "type" walk starts from the path it is handed,
+/// so a relative `gate.js` only ever looked for ./package.json: a CommonJS
+/// script named from a subdirectory of its package routed as an ES module,
+/// and that path names no main module -- its `require.main === module`
+/// guard never ran, and it exited 0.
+fn entry_module_kind(file: &Path) -> oam_loader::ModuleKind {
+    let real = oam_engine::module_key(file).unwrap_or_else(|_| file.to_path_buf());
+    oam_loader::module_kind(&real)
+}
+
 fn run_file_with_flags(
     file: &Path,
     script_args: &[String],
@@ -2291,7 +2303,7 @@ fn run_file_with_flags(
     // project .js) runs as a CJS program through interop; everything else
     // is the ESM graph. See oam_loader::module_kind for the typeless
     // default divergence.
-    let result = if oam_loader::module_kind(file) == oam_loader::ModuleKind::Cjs {
+    let result = if entry_module_kind(file) == oam_loader::ModuleKind::Cjs {
         rt.execute_cjs(file, &CliHost)
     } else {
         rt.execute_module(file, &CliHost)
@@ -2994,7 +3006,9 @@ fn run_eval(source: &str, print: bool, extra_args: &[String], flags: &NodeFlags)
     let result = if ext == "mjs" {
         rt.execute_module(&tmp_file, &CliHost)
     } else {
-        rt.execute_cjs(&tmp_file, &CliHost)
+        // No main module for eval source, as in node: require.main stays
+        // undefined, so the temp file never reads as the program's entry.
+        rt.execute_cjs_eval(&tmp_file, &CliHost)
     };
     cleanup_eval_artifacts(tmp_dir.as_deref(), &tmp_file);
     report_loader_warnings(false);

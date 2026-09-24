@@ -37,6 +37,25 @@ pub(crate) struct CjsCache {
     /// loaded}). The exports property is re-read on every hit so
     /// `module.exports =` reassignment and mid-cycle partials both behave.
     modules: HashMap<PathBuf, v8::Global<v8::Object>>,
+    /// The key of the CommonJS file this run started from, named by
+    /// `name_main_entry` before the entry loads. Unset when there is no main
+    /// module in node's sense: an ES module entry, or `-e` source.
+    main_key: Option<PathBuf>,
+    /// That entry's `module` object once load_cjs has created it: node's
+    /// `process.mainModule`, handed to every `require` built afterwards as
+    /// `require.main`. None leaves `require.main` undefined, as node does.
+    main: Option<v8::Global<v8::Object>>,
+}
+
+/// Name `entry` as this run's main module. Call after reset_run_slots
+/// (which installs a fresh cache) and before the entry loads: load_cjs
+/// records the module object it creates for this key, so the entry's own
+/// `require.main` is itself, as node sets `process.mainModule` before the
+/// body runs. An unreadable path names nothing; load_cjs reports the error.
+pub(crate) fn name_main_entry(isolate: &mut v8::Isolate, entry: &Path) {
+    if let (Ok(key), Some(cache)) = (module_key(entry), isolate.get_slot_mut::<CjsCache>()) {
+        cache.main_key = Some(key);
+    }
 }
 
 /// Add the internal facade hook to the existing `__oam` object (created by
@@ -502,6 +521,7 @@ pub(crate) fn load_cjs<'s>(
             .modules
             .insert(key.clone(), global);
     }
+    record_main(scope, &key, module);
 
     // Shebang: byte-for-byte replacement keeps every offset intact. Shared
     // with produce_cjs_code_cache so the cache key matches at compile time.
@@ -590,6 +610,28 @@ pub(crate) fn load_cjs<'s>(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     let dirname_v8 = v8::String::new(scope, &dirname)?;
+    // node's own module members, which require.main hands to every module:
+    // `require` (so `require.main.require(x)` resolves from the entry's
+    // directory), `path`, and `paths` -- the node_modules directories a bare
+    // require searches from here. `require` is not enumerable, as it lives on
+    // Module.prototype in node rather than on each module.
+    let require_key = v8::String::new(scope, "require")?;
+    module.define_own_property(
+        scope,
+        require_key.into(),
+        require.into(),
+        v8::PropertyAttribute::DONT_ENUM,
+    );
+    let path_key = v8::String::new(scope, "path")?;
+    module.set(scope, path_key.into(), dirname_v8.into());
+    let lookup = node_modules_lookup(&key);
+    let lookup: Vec<v8::Local<v8::Value>> = lookup
+        .iter()
+        .filter_map(|p| v8::String::new(scope, p).map(v8::Local::<v8::Value>::from))
+        .collect();
+    let paths = v8::Array::new_with_elements(scope, &lookup);
+    let paths_key = v8::String::new(scope, "paths")?;
+    module.set(scope, paths_key.into(), paths.into());
     let context = scope.get_current_context();
     let global_obj = context.global(scope);
 
@@ -634,6 +676,32 @@ fn evict(scope: &mut v8::PinScope<'_, '_>, key: &Path) {
     }
 }
 
+/// If `key` is the entry name_main_entry named and no main module exists
+/// yet, make `module` the main module: `process.mainModule`, and the
+/// `require.main` of every require built from here on -- the entry's own
+/// included, since load_cjs builds it next. It stays set if the entry body
+/// throws, as node's does, so an 'uncaughtException' listener still sees it.
+fn record_main(scope: &mut v8::PinScope<'_, '_>, key: &Path, module: v8::Local<v8::Object>) {
+    let is_main = scope
+        .get_slot::<CjsCache>()
+        .is_some_and(|cache| cache.main.is_none() && cache.main_key.as_deref() == Some(key));
+    if !is_main {
+        return;
+    }
+    let global = v8::Global::new(scope, module);
+    if let Some(cache) = scope.get_slot_mut::<CjsCache>() {
+        cache.main = Some(global);
+    }
+    let context = scope.get_current_context();
+    let global_obj = context.global(scope);
+    let process = v8::String::new(scope, "process")
+        .and_then(|k| global_obj.get(scope, k.into()))
+        .and_then(|p| v8::Local::<v8::Object>::try_from(p).ok());
+    if let (Some(process), Some(field)) = (process, v8::String::new(scope, "mainModule")) {
+        process.set(scope, field.into(), module.into());
+    }
+}
+
 /// Build a `require` function bound to `filename` (each CJS module gets
 /// one; node:module's createRequire hands them to ESM callers too).
 /// Carries the Node require surface: `resolve` (with `resolve.paths`),
@@ -668,7 +736,39 @@ pub(crate) fn make_require<'s>(
     let extensions_key = v8::String::new(scope, "extensions")?;
     require.set(scope, extensions_key.into(), extensions.into());
 
+    let main = main_module(scope);
+    let main_key = v8::String::new(scope, "main")?;
+    require.set(scope, main_key.into(), main);
+
     Some(require)
+}
+
+/// What node gives a new require as `require.main`: `process.mainModule`,
+/// read when the require is built. That is the entry's module object when
+/// the program started from a CommonJS file (record_main put it there),
+/// undefined otherwise -- an ES module entry's createRequire and everything
+/// it loads -- and whatever the program assigned, if it reassigned
+/// process.mainModule. The cache's copy stands in only when there is no
+/// process object to read.
+fn main_module<'s>(scope: &mut v8::PinScope<'s, '_>) -> v8::Local<'s, v8::Value> {
+    let context = scope.get_current_context();
+    let global_obj = context.global(scope);
+    let process = v8::String::new(scope, "process")
+        .and_then(|k| global_obj.get(scope, k.into()))
+        .and_then(|p| v8::Local::<v8::Object>::try_from(p).ok());
+    if let Some(process) = process
+        && let Some(field) = v8::String::new(scope, "mainModule")
+        && let Some(value) = process.get(scope, field.into())
+    {
+        return value;
+    }
+    let main = scope
+        .get_slot::<CjsCache>()
+        .and_then(|cache| cache.main.clone());
+    match main {
+        Some(main) => v8::Local::new(scope, &main).into(),
+        None => v8::undefined(scope).into(),
+    }
 }
 
 /// `require.resolve(specifier)`: full require resolution without loading.
@@ -710,6 +810,22 @@ fn require_resolve_callback(
     }
 }
 
+/// The `node_modules` directories a bare require from `file` searches, nearest
+/// first: one under each ancestor of its directory, skipping an ancestor that
+/// is itself a `node_modules` directory -- node's `Module._nodeModulePaths`,
+/// which is also a module's `module.paths`.
+fn node_modules_lookup(file: &Path) -> Vec<String> {
+    let mut lookup = Vec::new();
+    let mut dir = file.parent();
+    while let Some(d) = dir {
+        if d.file_name().is_none_or(|n| n != "node_modules") {
+            lookup.push(d.join("node_modules").to_string_lossy().into_owned());
+        }
+        dir = d.parent();
+    }
+    lookup
+}
+
 /// `require.resolve.paths(request)`: null for builtins, else the ancestor
 /// `node_modules` chain from the requiring file's directory (Node's lookup
 /// paths minus the legacy `$HOME/.node_modules` entries).
@@ -735,22 +851,20 @@ fn require_resolve_paths_callback(
             .map(|s| s.to_rust_string_lossy(scope))
             .unwrap_or_default(),
     );
-    let mut lookup: Vec<String> = Vec::new();
-    if request.starts_with("./") || request.starts_with("../") || request == "." || request == ".."
+    let lookup: Vec<String> = if request.starts_with("./")
+        || request.starts_with("../")
+        || request == "."
+        || request == ".."
     {
         // Relative requests search only the requiring directory.
-        if let Some(parent) = referrer.parent() {
-            lookup.push(parent.to_string_lossy().into_owned());
-        }
+        referrer
+            .parent()
+            .map(|parent| parent.to_string_lossy().into_owned())
+            .into_iter()
+            .collect()
     } else {
-        let mut dir = referrer.parent();
-        while let Some(d) = dir {
-            if d.file_name().is_none_or(|n| n != "node_modules") {
-                lookup.push(d.join("node_modules").to_string_lossy().into_owned());
-            }
-            dir = d.parent();
-        }
-    }
+        node_modules_lookup(&referrer)
+    };
     let elements: Vec<v8::Local<v8::Value>> = lookup
         .iter()
         .filter_map(|p| v8::String::new(scope, p).map(v8::Local::<v8::Value>::from))
@@ -855,16 +969,42 @@ fn facade_with_prelude(
     out
 }
 
-/// Run a CJS entry file as the program: execute it, then pump the event
-/// loop (timers/ops keep the process alive, Node semantics) and fail on
-/// unhandled rejections, exactly like the ESM path.
 impl crate::JsRuntime {
+    /// Run a CJS entry file as the program: execute it, then pump the event
+    /// loop (timers/ops keep the process alive, Node semantics) and fail on
+    /// unhandled rejections, exactly like the ESM path. The entry is the main
+    /// module -- `require.main` and `process.mainModule` -- so the
+    /// `if (require.main === module)` guard runs.
     pub fn execute_cjs(
         &mut self,
         entry: &Path,
         host: &dyn crate::ModuleHost,
     ) -> Result<(), Vec<oam_diagnostics::Diagnostic>> {
+        self.run_cjs_entry(entry, host, true)
+    }
+
+    /// `-e` / `-p` source the CLI staged in a temp file: run exactly as
+    /// execute_cjs does, but with no main module. node leaves `require.main`
+    /// and `process.mainModule` undefined for eval, and the temp file is an
+    /// implementation detail that must not show through as a main module.
+    pub fn execute_cjs_eval(
+        &mut self,
+        entry: &Path,
+        host: &dyn crate::ModuleHost,
+    ) -> Result<(), Vec<oam_diagnostics::Diagnostic>> {
+        self.run_cjs_entry(entry, host, false)
+    }
+
+    fn run_cjs_entry(
+        &mut self,
+        entry: &Path,
+        host: &dyn crate::ModuleHost,
+        as_main: bool,
+    ) -> Result<(), Vec<oam_diagnostics::Diagnostic>> {
         self.reset_run_slots()?;
+        if as_main {
+            name_main_entry(&mut self.isolate, entry);
+        }
         // A CJS entry may still `import()`; park the host so
         // dynamic_import_callback can resolve it (the ESM path does the
         // same in execute_module). Without this, import() from a CJS entry

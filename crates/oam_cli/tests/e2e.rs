@@ -22799,6 +22799,132 @@ fn compile_produces_standalone_binary_that_runs() {
     );
 }
 
+// bug: oam never set require.main, so `if (require.main === module) main()`
+// was false everywhere and a script built on it ran nothing and exited 0.
+// Conformance case 191 holds the node-comparable entry paths to node; these
+// two are oam's own -- a compiled executable's embedded script, and each file
+// `oam test` runs -- so node has nothing to compare them against.
+#[test]
+fn compiled_binary_runs_its_embedded_script_as_the_main_module() {
+    let entry = write_temp(
+        "compile_require_main/app.cjs",
+        "if (require.main === module && process.mainModule === module) {\n\
+           console.log('ran as the main module');\n\
+         }\n",
+    );
+    let ext = if cfg!(windows) { ".exe" } else { "" };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let output = std::env::temp_dir().join(format!(
+        "oam-compile-main-{}-{nanos}{ext}",
+        std::process::id()
+    ));
+    let compile_out = oam(&[
+        "compile",
+        entry.to_str().unwrap(),
+        "--output",
+        output.to_str().unwrap(),
+    ]);
+    assert!(
+        compile_out.status.success(),
+        "oam compile failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&compile_out.stdout),
+        String::from_utf8_lossy(&compile_out.stderr)
+    );
+    let run_out = std::process::Command::new(&output)
+        .output()
+        .expect("compiled binary runs");
+    let _ = std::fs::remove_file(&output);
+    let stdout = String::from_utf8_lossy(&run_out.stdout);
+    assert!(
+        run_out.status.success(),
+        "compiled binary failed: stdout={stdout} stderr={}",
+        String::from_utf8_lossy(&run_out.stderr)
+    );
+    // The guard printing is the whole point: exit 0 with nothing on stdout is
+    // exactly how the bug looked.
+    assert!(
+        stdout.contains("ran as the main module"),
+        "the embedded script's main guard did not run: stdout=<<{stdout}>>"
+    );
+}
+
+// A plain `.js` test file, named relative to a working directory BELOW the
+// package.json that makes it CommonJS: `oam test` has to decide the file's
+// kind from where it really is (the "type" lookup used to stop at the
+// working directory and route it as an ES module), and then run it as the
+// main module.
+#[test]
+fn oam_test_runs_each_commonjs_file_as_the_main_module() {
+    write_temp(
+        "test_runner_require_main/package.json",
+        "{ \"type\": \"commonjs\" }\n",
+    );
+    let file = write_temp(
+        "test_runner_require_main/sub/main.test.js",
+        "const { test } = require('oam:test');\n\
+         test('the test file is the main module', () => {\n\
+           if (require.main !== module) {\n\
+             throw new Error('require.main is ' + typeof require.main + ', not this file');\n\
+           }\n\
+           if (process.mainModule !== module) {\n\
+             throw new Error('process.mainModule is not this file');\n\
+           }\n\
+         });\n",
+    );
+    let out =
+        bounded_output(oam_command(&["test", "main.test.js"]).current_dir(file.parent().unwrap()));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // oam test writes its runner output to stderr; the body throws on a
+    // regression, so a failing exit status is the signal.
+    assert!(
+        out.status.success(),
+        "exit {}: stdout=<<{}>> stderr=<<{stderr}>>",
+        out.status,
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        stderr.contains("1 passed"),
+        "expected the one test to run and pass: stderr=<<{stderr}>>"
+    );
+}
+
+// A worker's entry is routed on the file's real path too. Windows file names
+// are case-insensitive, so `W.CJS` names an on-disk `w.cjs` -- CommonJS to
+// node, which runs it as the worker's main module. Judged by the extension as
+// typed, the same entry falls to the typeless default and runs without a main
+// module. Windows only: elsewhere `W.CJS` does not name the file at all.
+#[cfg(windows)]
+#[test]
+fn worker_entry_is_routed_on_its_real_path() {
+    write_temp(
+        "worker_real_path/w.cjs",
+        "require('worker_threads').parentPort.postMessage(\n\
+           JSON.stringify({ isMain: require.main === module }));\n",
+    );
+    let launcher = write_temp(
+        "worker_real_path/launch.cjs",
+        "const { Worker } = require('worker_threads');\n\
+         new Worker(require('path').join(__dirname, 'W.CJS'))\n\
+           .on('message', (m) => console.log(m))\n\
+           .on('error', (e) => console.log('worker error: ' + e.message));\n",
+    );
+    let out = oam(&[launcher.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "exit {}: stdout=<<{stdout}>> stderr=<<{}>>",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("{\"isMain\":true}"),
+        "the worker's entry did not run as its main module: stdout=<<{stdout}>>"
+    );
+}
+
 #[test]
 fn compile_binary_passes_script_args() {
     let entry = write_temp(
