@@ -45,6 +45,13 @@ fn pem(der: &[u8], trailing_newline: bool) -> String {
     out
 }
 
+/// One certificate as PEM, with a trailing newline -- how Node re-emits a
+/// certificate from `tls.getCACertificates` and the replaced default store
+/// (#199).
+pub(crate) fn pem_string(der: &[u8]) -> String {
+    pem(der, true)
+}
+
 /// `tls.getCACertificates(kind)`'s list for one of Node's kinds -- `bundled`,
 /// `extra` or `system` -- or None for any other (the JS layer composes
 /// `default` and refuses the rest).

@@ -1163,9 +1163,17 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
     (or `write EPROTO`, with a write queued).
   - **An alert Node cannot name, sent after the handshake**, is `EPROTO` with no syscall
     and rustls's message on oam; Node's shape for it was not measured.
-- **`tls.setDefaultCACertificates()` is absent.** Node 22.15 and later replace the
-  default trust store with it; oam has `NODE_EXTRA_CA_CERTS` and the `ca` option (and
-  `tls.getCACertificates()` to read the default store out) only.
+- **`tls.setDefaultCACertificates()` replaces the default trust store** (Node 22.15+,
+  #199): a connection made after it with no `ca` of its own verifies against the given
+  certificates -- an empty array trusting nothing -- and `tls.getCACertificates('default')`
+  reads them back. The argument is validated as Node validates it (`ERR_INVALID_ARG_TYPE`
+  for a non-array or a non-string, non-`ArrayBufferView` element; `ERR_CRYPTO_OPERATION_FAILED`
+  when nothing in a non-empty array parses, the store left as it was), duplicates are
+  dropped, and `'bundled'` / `'system'` / `'extra'` stay what they are. The one difference:
+  a connection refused by an EMPTY override reports `UNABLE_TO_VERIFY_LEAF_SIGNATURE` (the
+  code an empty `ca: []` gives on both runtimes) where Node reports
+  `SELF_SIGNED_CERT_IN_CHAIN` -- Node classifies an empty default store differently from an
+  empty `ca` option, a distinction oam does not draw.
 - **`tls.getCACertificates('bundled')` is the Mozilla store oam's client trusts**, which is
   webpki-roots' release of it, not Node's own copy: the two lists hold different numbers of
   certificates. `'system'` is the operating system's store as rustls-native-certs reads it

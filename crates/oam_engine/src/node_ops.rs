@@ -443,6 +443,10 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("tlsClientContext", op_tls_client_context),
         ("tlsClientContextFree", op_tls_client_context_free),
         ("tlsCaCertificates", op_tls_ca_certificates),
+        (
+            "tlsSetDefaultCaCertificates",
+            op_tls_set_default_ca_certificates
+        ),
         ("tlsCanonicalizeIp", op_tls_canonicalize_ip),
         // oam:permissions query surface
         ("permissionsQuery", op_permissions_query),
@@ -4836,7 +4840,16 @@ fn op_tls_ca_certificates(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let kind = arg_string(scope, &args, 0).unwrap_or_default();
-    let Some(pems) = oam_core::tls::roots::ca_certificates(&kind) else {
+    // `default` is served here only once `tls.setDefaultCACertificates` has
+    // replaced the store (#199); until then it returns undefined and the JS
+    // composes bundled + NODE_EXTRA_CA_CERTS. `bundled` / `extra` / `system`
+    // are the fixed lists.
+    let pems = if kind == "default" {
+        oam_core::tls::default_ca_override_pems()
+    } else {
+        oam_core::tls::roots::ca_certificates(&kind)
+    };
+    let Some(pems) = pems else {
         return;
     };
     let items: Vec<v8::Local<'_, v8::Value>> = pems
@@ -4845,6 +4858,32 @@ fn op_tls_ca_certificates(
         .collect();
     let array = v8::Array::new_with_elements(scope, &items);
     rv.set(array.into());
+}
+
+/// tlsSetDefaultCaCertificates(pems: string[]) -> the count of certificates
+/// kept, or -1 when the array has entries but none parse (the JS then throws
+/// `ERR_CRYPTO_OPERATION_FAILED`; a failed set leaves the store as it was).
+/// Replaces the process default trust store, `tls.setDefaultCACertificates`
+/// (Node 22.15+, #199). Argument-type validation is the JS layer's; each
+/// element reaches here as its PEM text.
+fn op_tls_set_default_ca_certificates(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let mut pems: Vec<String> = Vec::new();
+    if let Ok(arr) = v8::Local::<v8::Array>::try_from(args.get(0)) {
+        for i in 0..arr.length() {
+            if let Some(value) = arr.get_index(scope, i) {
+                pems.push(value.to_rust_string_lossy(scope));
+            }
+        }
+    }
+    let result = match oam_core::tls::set_default_ca_certificates(&pems) {
+        Some(count) => count as i32,
+        None => -1,
+    };
+    rv.set(v8::Integer::new(scope, result).into());
 }
 
 /// tlsCanonicalizeIp(text) -> Node's `canonicalizeIP`: the address as libuv

@@ -16,6 +16,19 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Added
+
+- **`tls.setDefaultCACertificates(certs)` (Node 22.15+) replaces the process default trust
+  store** (#199). oam had the reading half (`tls.getCACertificates`) but not the writing
+  half, so a program that pins the process to its own roots threw `TypeError:
+  tls.setDefaultCACertificates is not a function`. It now takes an array of PEM strings or
+  `ArrayBufferView`s, validated as Node validates it (`ERR_INVALID_ARG_TYPE` for a non-array
+  or a bad element, `ERR_CRYPTO_OPERATION_FAILED` when a non-empty array has nothing
+  parseable, an empty array accepted and trusting nothing, duplicates dropped); a connection
+  made after it with no `ca` of its own verifies against the override, and
+  `tls.getCACertificates('default')` reads it back while `'bundled'` / `'system'` / `'extra'`
+  stay put. Conformance case 183 holds it to node v22.22.2.
+
 ### Fixed
 
 - **A refused server name failed `tls.connect` with `ERR_TLS_CERT_ALTNAME_INVALID` whose

@@ -31745,6 +31745,11 @@
       if (typeof type !== "string") throw codes.ERR_INVALID_ARG_TYPE("type", "string", type);
       switch (type) {
         case "default":
+          // Once setDefaultCACertificates has replaced the store, that list
+          // is the default (#199); until then it is bundled +
+          // NODE_EXTRA_CA_CERTS, built once.
+          var override = natives.tlsCaCertificates("default");
+          if (override !== undefined) return Object.freeze(override);
           if (defaultCaCertificates === undefined) {
             var list = caCertificatesOf("bundled").slice();
             if (process.env.NODE_EXTRA_CA_CERTS) list.push.apply(list, caCertificatesOf("extra"));
@@ -31758,6 +31763,35 @@
         default:
           throw codes.ERR_INVALID_ARG_VALUE("type", type);
       }
+    }
+    // tls.setDefaultCACertificates (node 22.15+): replace the process default
+    // trust store. Each element is a PEM string or an ArrayBufferView holding
+    // PEM; the array is validated as node does (a non-array or a non-string,
+    // non-view element is ERR_INVALID_ARG_TYPE), an empty array is accepted
+    // and trusts nothing, and a non-empty array with nothing parseable is
+    // ERR_CRYPTO_OPERATION_FAILED with the store left as it was. A connection
+    // made after it with no `ca` of its own verifies against this list, and
+    // getCACertificates('default') reads it back.
+    function setDefaultCACertificates(certs) {
+      if (!Array.isArray(certs)) throw codes.ERR_INVALID_ARG_TYPE("certs", "Array", certs);
+      var pems = [];
+      for (var i = 0; i < certs.length; i++) {
+        var cert = certs[i];
+        if (typeof cert === "string") {
+          pems.push(cert);
+        } else if (ArrayBuffer.isView(cert)) {
+          pems.push(globalThis.Buffer.from(cert.buffer, cert.byteOffset, cert.byteLength).toString("latin1"));
+        } else {
+          throw codes.ERR_INVALID_ARG_TYPE("certs[" + i + "]", ["string", "ArrayBufferView"], cert);
+        }
+      }
+      if (natives.tlsSetDefaultCaCertificates(pems) < 0) {
+        var unable = new Error("No valid certificates found in the provided array");
+        unable.code = "ERR_CRYPTO_OPERATION_FAILED";
+        throw unable;
+      }
+      // Drop the composed-default cache; the override answers now.
+      defaultCaCertificates = undefined;
     }
 
     // ---- tls.Server ----
@@ -32378,6 +32412,7 @@
         "tls_aes_128_gcm_sha256", "tls_aes_256_gcm_sha384", "tls_chacha20_poly1305_sha256",
       ],
       getCACertificates,
+      setDefaultCACertificates,
       checkServerIdentity,
     };
     // node: a getter (enumerable, not configurable) that builds the frozen
