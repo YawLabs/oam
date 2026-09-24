@@ -1746,18 +1746,11 @@ target). The parser underneath is hyper's, so some heads still get a different a
   `conformance/cases/185-http-server-max-headers-count.mjs` holds the rest to node v22.22.2.
 - A malformed chunked body is answered with Node's status (`400`, or `413` for chunk
   extensions over the limit) when the handler has not responded yet, and the handler's
-  request aborts with `ECONNRESET`, as in Node. On `https` servers and the HTTP/1 side of
-  `http2.createServer` the body is read before the handler runs, so a body refused as
-  malformed reaches no handler (Node runs it on the headers, and its request aborts).
-- **An `https` handler cannot cut an upload short**, for the same reason: it runs once the
-  body has arrived, so a 413-and-destroy answer takes effect only after the whole body has
-  been read, up to the 100 MB per-request cap, and that much is held for the connection.
-  Measured on Windows against a client streaming a chunked body at an https handler that
-  answers `413` and destroys at once: Node cuts the client off after 2 MB (server peak RSS
-  49 MB), oam after 118 MB (peak 132 MB). The cap and the global body budget still hold, and
-  a body that DECLARES itself over the cap is refused before the handler. An `http` server
-  streams the body to the handler and matches Node (413 after 4 MB, peak 32 MB); `https`
-  joins it with slice 3 of `docs/design/streaming-bodies.md`.
+  request aborts with `ECONNRESET`, as in Node. On the HTTP/1 side of `http2.createServer`
+  the body is read before the handler runs, so a body refused as malformed reaches no
+  handler (Node runs it on the headers, and its request aborts); an `https` server now
+  streams the body and dispatches the handler on the head, as node and oam's `http` server
+  do, so an https handler answers (and cuts) an upload before it finishes (#203).
 - A chunked body's trailer fields are in `req.trailers` and `req.rawTrailers` once the
   body has ended, combined as Node combines them, but `rawTrailers` has the names
   lowercased and a repeated name's values side by side.
