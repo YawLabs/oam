@@ -31,6 +31,16 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **The cleartext `http2.createServer` had no compatibility API, so a `'request'` listener
+  never fired and a `(req, res)` server never answered** (#200). `createServer(handler)` put
+  the handler on `'stream'` and lacked the `Http2ServerRequest` / `Http2ServerResponse`
+  machinery the secure server got in 0.16.3, so the way most HTTP/2 code is written --
+  `http2.createServer()` plus `server.on('request', (req, res) => res.end(...))` -- hung with
+  no response. The cleartext server now shares the secure server's wiring: `createServer`
+  registers the handler on `'request'`, and a `'request'` listener installs the `'stream'`
+  bridge that builds the request and response objects (`req.url`, `req.method`,
+  `res.writeHead`, `res.end`); the raw `'stream'` API keeps working alongside it, as on Node.
+  Conformance case 184 holds it to node v22.22.2.
 - **A refused server name failed `tls.connect` with `ERR_TLS_CERT_ALTNAME_INVALID` whose
   `cert` was `{}`, where Node hands over the peer certificate** (#198). Node reports the
   certificate the name check refused as `err.cert` -- the same object

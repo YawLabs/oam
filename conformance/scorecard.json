@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "bf8dd15+wip",
+  "commit": "0d4a9eb+wip",
   "oamVersion": "oam 0.16.4",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 174,
-      "total": 174,
+      "pass": 175,
+      "total": 175,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -384,6 +384,10 @@
         },
         {
           "case": "183-tls-set-default-ca-certificates.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "184-http2-cleartext-server-compat.mjs",
           "status": "pass"
         },
         {

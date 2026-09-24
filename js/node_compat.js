@@ -27954,6 +27954,14 @@
         }
       }
       additionalHeaders() {}
+      // The compatibility Http2ServerResponse reads `headersSent` and both
+      // req and res call `setTimeout` (#200); the h2c stream has no timeout of
+      // its own.
+      get headersSent() { return this._responded; }
+      setTimeout(msecs, callback) {
+        if (typeof callback === "function") this.once("timeout", callback);
+        return this;
+      }
       _write(chunk, encoding, callback) {
         if (this._ended) { callback(); return; }
         if (!this._responded) {
@@ -28014,7 +28022,13 @@
           options = {};
         }
         this._options = options || {};
-        if (handler) this.on("stream", handler);
+        // The compatibility API (req, res): a 'request' listener -- the
+        // handler, or one added later -- installs the 'stream' bridge that
+        // builds Node's Http2ServerRequest / Http2ServerResponse, the same
+        // wiring the secure server has (#200). The raw 'stream' API keeps
+        // working alongside it, as on Node.
+        secureServer.installCompat(this, this._options);
+        if (handler) this.on("request", handler);
         this._serverId = null;
         this._port = null;
         this._host = null;
@@ -28057,8 +28071,12 @@
                 hdrs[":method"] = meta.method;
                 hdrs[":path"] = meta.uri;
                 hdrs[":scheme"] = "http";
+                var rawHeaders = [];
+                for (var r = 0; r < meta.headers.length; r++) {
+                  rawHeaders.push(meta.headers[r][0], meta.headers[r][1]);
+                }
                 var stream = new ServerHttp2Stream(meta.requestId, hdrs);
-                self.emit("stream", stream, hdrs);
+                self.emit("stream", stream, hdrs, 0, rawHeaders);
               }
               self.emit("close");
             })();
@@ -29034,6 +29052,18 @@
           this.on("stream", onServerStream);
         }
       }
+      // Give a server (the cleartext h2c one, which lives outside this
+      // scope) the same compatibility wiring the secure server has (#200):
+      // the request/response classes on its options, and the newListener hook
+      // that installs the 'stream' bridge as soon as a 'request' listener is
+      // added.
+      function installCompat(server, options) {
+        var opts = options || {};
+        opts.Http2ServerRequest = opts.Http2ServerRequest || Http2ServerRequest;
+        opts.Http2ServerResponse = opts.Http2ServerResponse || Http2ServerResponse;
+        server[kOptions] = opts;
+        server.on("newListener", setupCompat);
+      }
 
       // A TLS connection handed to the native server from here on: its socket
       // object stays (it is session.socket, req.socket), with no I/O of its
@@ -29343,7 +29373,7 @@
         return new Http2SecureServer(options, handler);
       }
 
-      return { createSecureServer, Http2ServerRequest, Http2ServerResponse };
+      return { createSecureServer, Http2ServerRequest, Http2ServerResponse, installCompat };
     })();
     const { createSecureServer, Http2ServerRequest, Http2ServerResponse } = secureServer;
 
