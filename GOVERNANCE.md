@@ -37,4 +37,5 @@ instructions; the Covenant binds successors. This file is the authoritative stat
 ## Releases
 
 Release cadence, semver policy, and the behavior-change log are specified in RELIABILITY.md.
-Every release is signed; provenance (SLSA) attaches from the first public binary.
+Release binaries are currently unsigned and ship with a `SHA256SUMS` checksum file. Code
+signing and SLSA provenance are planned, not yet shipped; see SECURITY.md, "Release integrity".
