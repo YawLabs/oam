@@ -50,8 +50,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   verifier now carries the chain it refused out through the verdict, and `tls.connect`'s
   error path builds `err.cert` from it with the routine `getPeerCertificate()` uses, so a
   caught `ERR_TLS_CERT_ALTNAME_INVALID` reports the same certificate on both runtimes. A
-  chain-build failure (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) still leaves `err.cert` `{}`, as
-  Node does. Measured on node v22.22.2.
+  chain-build failure (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) leaves `err.cert` undefined (no
+  `cert` key), as Node does. Measured on node v22.22.2.
 - **An `http2.connect` session ended by a server's fatal TLS alert emitted `'error'` and
   `'close'`, crashing a program that had no session `'error'` listener** (#197). A TLS 1.3
   server that requires a client certificate answers a client that sent none with a fatal

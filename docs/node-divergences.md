@@ -1186,8 +1186,8 @@ described; the bare-`connect()` and `socket`-option shapes as described. A refus
 `ERR_TLS_CERT_ALTNAME_INVALID` now carries the peer certificate as Node's `err.cert` (#198):
 the verifier hands the chain it refused out of the handshake, and `tls.connect`'s error path
 builds the certificate from it exactly as `getPeerCertificate(true)` does, `issuerCertificate`
-linked. A chain-build failure (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) still leaves `err.cert` `{}`,
-as Node does.
+linked. A chain-build failure (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) leaves `err.cert` undefined
+(no `cert` key, the error's own keys being `[code]`), as Node does.
 
 ### 35. `http` and `fetch` to a refused port — FIXED, no longer a divergence (#143)
 

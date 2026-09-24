@@ -190,7 +190,7 @@ pub enum OpOutcome {
     /// a caught `ERR_TLS_CERT_ALTNAME_INVALID` (#198). The engine builds the
     /// same coded error as `NodeFailed` and hangs the two base64 chains on it
     /// (`peerCertificates` leaf-first, `storeIssuers` from the store), which
-    /// tls.connect's JS reads into the socket before `getPeerCertificate()`.
+    /// tls.connect's JS reads into the socket before `getPeerCertificate(true)`.
     /// A new variant, so a replay file recorded before it existed still loads.
     NodeCertRefused {
         code: String,
