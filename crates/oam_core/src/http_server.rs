@@ -2366,7 +2366,11 @@ async fn serve_https_connection(
             Arc::clone(&state),
             service_queue.clone(),
             req,
-            false, // TLS: buffered until a later slice
+            // Stream the body: dispatch the handler on the head and deliver the
+            // body as it arrives, so an https handler can answer (and cut) an
+            // upload before it finishes, as node's does and oam's http path
+            // already does. Same caps and drain accounting (#203).
+            true,
             conn_addrs,
             tls_meta.clone(),
             policy,

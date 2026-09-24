@@ -31,6 +31,16 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **An `https` server ran the request handler only after the whole request body had arrived,
+  so it could not answer or cut an upload early** (#203). The https connection was built with
+  the buffered-body path, where the `http` server already streams: the handler was dispatched
+  only once the body ended, so a `res.writeHead(413); req.destroy()` took effect only after
+  the client had finished sending (up to the 100 MB per-request cap), and a body the parser
+  refused as malformed reached no handler. The https connection now uses the same streaming
+  path as `http` -- the handler is dispatched on the head and the body is delivered as it
+  arrives, with the same caps and drain accounting -- so an https handler answers (and cuts)
+  an upload before it finishes, as node's does. Conformance case 187 holds both halves
+  (dispatch-on-head and early-cut) byte-identical to node v22.22.2 for `http` and `https`.
 - **`fetch`'s connection pool opened a spare connection that carried no request and held a
   `node:http` server's `close()` open for 90 seconds** (#216). hyper-util's legacy client
   raced a fresh connect against a pooled checkout on a cache-miss; when the pooled connection
