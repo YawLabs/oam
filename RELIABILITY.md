@@ -49,5 +49,6 @@ parsing, and the TS stripper. OSS-Fuzz application at public launch. Trophies pu
 
 Release binaries are currently unsigned and ship with a `SHA256SUMS` checksum file; see
 SECURITY.md, "Release integrity". Code signing (Windows Authenticode, macOS notarization),
-SLSA provenance and reproducible builds are planned, not yet in place. The installer and
-update channel serve exclusively from oamjs.org, with checksums pinned in-repo.
+SLSA provenance and reproducible builds are planned, not yet in place. The installer scripts
+are served from oamjs.org, and `oam self-update` re-runs them. They download the binary and
+`SHA256SUMS` from the GitHub release and refuse to install on a checksum mismatch.
