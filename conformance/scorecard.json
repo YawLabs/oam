@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "7d2acb8+wip",
+  "commit": "bf8dd15+wip",
   "oamVersion": "oam 0.16.4",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 173,
-      "total": 173,
+      "pass": 174,
+      "total": 174,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -380,6 +380,10 @@
         },
         {
           "case": "182-tls-altname-error-carries-cert.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "183-tls-set-default-ca-certificates.mjs",
           "status": "pass"
         },
         {
@@ -810,9 +814,16 @@
         "platform": "win32",
         "noBaseline": false,
         "nodeTotal": 1874,
-        "knownMissing": 345,
+        "knownMissing": 344,
         "newMissing": [],
-        "staleRatchet": [],
+        "staleRatchet": [
+          {
+            "module": "tls",
+            "names": [
+              "setDefaultCACertificates"
+            ]
+          }
+        ],
         "absentModules": [],
         "staleAbsentModules": [],
         "extra": [
