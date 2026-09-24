@@ -4,7 +4,8 @@
 // getPeerCertificate(true) returns: the leaf's subject, issuer, altnames,
 // key, validity, fingerprints, and its `issuerCertificate` linked from the
 // store (#198). A chain-build failure (no `ca`) refuses with
-// UNABLE_TO_VERIFY_LEAF_SIGNATURE and leaves `err.cert` `{}`, as Node does.
+// UNABLE_TO_VERIFY_LEAF_SIGNATURE and leaves `err.cert` absent (the property is
+// never set; `err.cert === undefined`, own-keys `[code]`), as Node does.
 //
 // Printed: the error's own keys (order matters), and every stable field of
 // err.cert -- never the fingerprints' or raw bytes' values (they are the

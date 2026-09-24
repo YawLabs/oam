@@ -933,6 +933,12 @@ fn refused_head_response(error: HeadError) -> hyper::Response<BoxedBody> {
 fn http1_builder(policy: HeadPolicy) -> hyper::server::conn::http1::Builder {
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder.max_buf_size(policy.read_buffer_limit());
+    // hyper refuses a head of more than 100 fields by default; node refuses one
+    // only on its byte size. Lift the field ceiling to the byte budget so the
+    // parser stops at the same point node does -- the excess beyond
+    // maxHeadersCount is dropped when the handler is given its headers, not
+    // refused. (The vendored parser only grows to this when a head needs it.)
+    builder.max_headers(policy.max_parsed_headers());
     builder
 }
 
@@ -1990,6 +1996,14 @@ async fn dispatch_request(
         return Ok(status_body(503, b"server is busy"));
     }
     let mut headers = header_pairs(&parts.headers);
+    // node's `server.maxHeadersCount`: the handler is given only the first so
+    // many header fields, the rest dropped (the request is still served). It
+    // is an HTTP/1 parser limit; an h2 request's headers are not counted by it.
+    if parts.version != hyper::Version::HTTP_2
+        && let Some(limit) = policy.header_field_limit(headers.len())
+    {
+        headers.truncate(limit);
+    }
     // An HTTP/2 request's :authority and :scheme are pseudo-headers hyper
     // folds into the URI; node's server hands them to the handler with the
     // rest of its headers.
@@ -2120,6 +2134,11 @@ pub async fn https_serve(
     policy: HeadPolicy,
     // node's server timeouts.
     timeouts: TimeoutSettings,
+    // For handing an upgrade / CONNECT connection to JS as a tls.TLSSocket: the
+    // TLS handle store and the shared handle-id counter (the same one net and
+    // tls handles draw from, so ids stay globally unique).
+    tls_registry: crate::tls::TlsRegistry,
+    body_ids: Arc<std::sync::atomic::AtomicU64>,
 ) -> super::OpOutcome {
     let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
         Ok(listener) => listener,
@@ -2182,6 +2201,8 @@ pub async fn https_serve(
                     let conn_queue = queue_tx.clone();
                     let conn_timeouts = Arc::clone(&server_timeouts);
                     let conn_shutdown = shutdown_rx.clone();
+                    let conn_tls_registry = tls_registry.clone();
+                    let conn_body_ids = Arc::clone(&body_ids);
                     // Everything after the accept runs on the connection's
                     // own task: a client that never finishes its handshake
                     // holds up no one else.
@@ -2251,6 +2272,8 @@ pub async fn https_serve(
                                             conn_addrs,
                                             policy,
                                             conn_shutdown,
+                                            conn_tls_registry,
+                                            conn_body_ids,
                                         )
                                         .await
                                         {
@@ -2314,6 +2337,8 @@ async fn serve_https_connection(
     conn_addrs: ConnAddrs,
     policy: HeadPolicy,
     shutdown: tokio::sync::watch::Receiver<bool>,
+    tls_registry: crate::tls::TlsRegistry,
+    body_ids: Arc<std::sync::atomic::AtomicU64>,
 ) -> bool {
     let tls_meta = Some(Arc::new(info.to_json()));
     // node's tlsConnectionListener: the server's 'secureConnection'
@@ -2345,6 +2370,21 @@ async fn serve_https_connection(
     // spent is the handshake timeout's to spend, not headersTimeout's.
     watch.served_from_now();
     let js_driven = timeouts.js_driven();
+    // A node:https server routes an upgrade / CONNECT out of hyper and hands JS
+    // a tls.TLSSocket, the way node:http hands over a net.Socket. Every rule
+    // rides along from `Upgrades::Route`: an upgrade needs an 'upgrade'
+    // listener, an upgrade that declares a body stays an ordinary request, and
+    // a CONNECT always takes the connection (JS destroys it if nothing
+    // listens). A non-js-driven server closes them, as before.
+    let (upgrades, takeover_rx) = if js_driven {
+        let (route, rx) = UpgradeRoute::new(Arc::clone(&timeouts));
+        (Upgrades::Route(route), Some(rx))
+    } else {
+        (Upgrades::CloseConnect, None)
+    };
+    let conn_id = watch.id;
+    // Kept for the taken request's `tls` field; the service moves its own copy.
+    let event_tls = tls_meta.clone();
     let service_queue = queue.clone();
     let service_watch = Arc::clone(&watch);
     let service = hyper::service::service_fn(move |req| {
@@ -2352,18 +2392,56 @@ async fn serve_https_connection(
             Arc::clone(&state),
             service_queue.clone(),
             req,
-            false, // TLS: buffered until a later slice
+            // Stream the body: dispatch the handler on the head and deliver the
+            // body as it arrives, so an https handler can answer (and cut) an
+            // upload before it finishes, as node's does and oam's http path
+            // already does. Same caps and drain accounting (#203).
+            true,
             conn_addrs,
             tls_meta.clone(),
             policy,
             Some(Arc::clone(&service_watch)),
-            Upgrades::CloseConnect,
+            upgrades.clone(),
         )
     });
-    serve_http1(
-        tls_stream, watch, policy, service, queue, js_driven, conn_addrs, shutdown, None,
+    let taken = serve_http1(
+        tls_stream,
+        watch,
+        policy,
+        service,
+        queue.clone(),
+        js_driven,
+        conn_addrs,
+        shutdown,
+        takeover_rx,
     )
     .await;
+    // An upgrade or CONNECT took the connection out of hyper. Register the whole
+    // TLS stream (its rustls state and any buffered ciphertext travel with it)
+    // as a handle and hand JS the request with its `tls` facts, so JS builds a
+    // tls.TLSSocket over it -- the encrypted mirror of the http net.Socket
+    // handover. The plaintext hyper read past the head is `head`, as on http.
+    let Some((tls_stream, head, takeover)) = taken else {
+        return announcement.announced;
+    };
+    let handle =
+        crate::tls::server::register_taken_server_stream(&tls_registry, &body_ids, tls_stream);
+    let _ = queue
+        .send(ServerEvent::Request(IncomingRequest {
+            id: takeover.id,
+            method: takeover.head.method,
+            uri: takeover.head.target,
+            headers: takeover.head.headers,
+            is_upgrade: true,
+            socket_handle: Some(handle),
+            conn: conn_addrs,
+            conn_id: None,
+            replaces_conn: announcement.announced.then_some(conn_id),
+            head: head.to_vec(),
+            end_stream: false,
+            tls: event_tls,
+        }))
+        .await;
     announcement.announced
 }
 

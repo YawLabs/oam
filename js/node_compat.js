@@ -18462,26 +18462,34 @@
         syncServerTimeouts(server);
         if (meta.isUpgrade && meta.socketHandle !== undefined) {
           // A request that took its connection: an upgrade (the server had
-          // an 'upgrade' listener when its head was parsed) or a CONNECT.
-          const NetSocket = registry.get("net").Socket;
-          // The accepted connection's real ends (never a stand-in:
-          // an upgrade handler's address checks read these).
-          const socket = new NetSocket({
-            _handle: meta.socketHandle,
-            _remoteAddr: {
-              address: meta.remoteAddress,
-              port: meta.remotePort,
-              family: meta.remoteFamily,
-            },
-            _localAddr:
-              meta.localAddress === undefined
-                ? undefined
-                : {
-                    address: meta.localAddress,
-                    port: meta.localPort,
-                    family: meta.localFamily,
-                  },
-          });
+          // an 'upgrade' listener when its head was parsed) or a CONNECT. An
+          // https connection (meta.tls) is handed over as a server-born
+          // tls.TLSSocket reading/writing the decrypted stream through its TLS
+          // handle; an http one as a net.Socket over the raw TCP handle. Either
+          // way its ends are the accepted connection's real ones (never a
+          // stand-in: an upgrade handler's address checks read these).
+          let socket;
+          if (meta.tls) {
+            socket = registry._tlsServer.takenServerSocket(meta);
+          } else {
+            const NetSocket = registry.get("net").Socket;
+            socket = new NetSocket({
+              _handle: meta.socketHandle,
+              _remoteAddr: {
+                address: meta.remoteAddress,
+                port: meta.remotePort,
+                family: meta.remoteFamily,
+              },
+              _localAddr:
+                meta.localAddress === undefined
+                  ? undefined
+                  : {
+                      address: meta.localAddress,
+                      port: meta.localPort,
+                      family: meta.localFamily,
+                    },
+            });
+          }
           // node counts a connection an upgrade or CONNECT took until that
           // socket closes -- a drain loop on a ws / socket.io server waits for
           // its websockets. The record the connection was announced with is
@@ -18507,7 +18515,8 @@
           Object.defineProperty(socket, Symbol.for("oam.countedIn"), {
             value: handedOver, writable: true, configurable: true,
           });
-          socket._readLoop();
+          if (meta.tls) socket._startReading();
+          else socket._readLoop();
           const req = new IncomingMessage(meta);
           req.upgrade = true;
           // node: the upgrade request's socket IS the socket handed
@@ -18754,6 +18763,10 @@
         // connection, off), then maxRequestsPerSocket.
         defineTimeoutProperty(this, "timeout", 0);
         this.maxRequestsPerSocket = 0;
+        // node's http.Server: the most header fields a request may carry to
+        // the handler, the rest dropped. null (the default) is node's 1000;
+        // 0 is no limit. Read when a server starts (like maxHeaderSize).
+        this.maxHeadersCount = null;
         if (handler) this.on("request", handler);
         this._serverId = null;
         this._port = null;
@@ -18789,6 +18802,9 @@
           policy.maxHeaderSize,
           policy.insecure,
           ...serverTimeoutArgs(this),
+          // maxHeadersCount: null (the default) leaves the native 1000-field
+          // cap; 0 is no limit; a number is that cap.
+          this.maxHeadersCount,
         ).then(
           (bound) => serverBound(this, bound, hostname, false),
           (err) => this.emit("error", err),
@@ -25200,6 +25216,9 @@
           policy.maxHeaderSize,
           policy.insecure,
           ...registry._httpParserOptions.timeoutArgs(this),
+          // maxHeadersCount: null (the default) leaves the native 1000-field
+          // cap; 0 is no limit; a number is that cap.
+          this.maxHeadersCount,
         ).then(
           (bound) => {
             this[kTlsSynced] = JSON.stringify(accept);
@@ -25326,15 +25345,17 @@
         "];\n//# sourceURL=node:https",
     )(request, get);
 
+    // node's https exports exactly six names. Copying every export of http --
+    // as this did -- adds nine that node's https does not have (STATUS_CODES,
+    // METHODS, ClientRequest, IncomingMessage, OutgoingMessage, ServerResponse,
+    // maxHeaderSize, validateHeaderName, validateHeaderValue), which link on oam
+    // and fail to link on node, before a line of the program runs (#204). Only
+    // the six node exports are built here, in node's key order (Agent,
+    // globalAgent, Server, createServer, get, request); a program that wants the
+    // rest imports them from `http`, where node keeps them.
     var merged = {};
-    var httpKeys = Object.keys(http);
-    for (var i = 0; i < httpKeys.length; i++) merged[httpKeys[i]] = http[httpKeys[i]];
-    merged.createServer = createServer;
-    merged.Server = Server;
-    merged.request = httpsFrames[0];
-    merged.get = httpsFrames[1];
-    // node's https.Agent and https.globalAgent, not http's: an https.Agent
-    // connects with tls.connect, and the global one is its own instance.
+    // node's https.Agent / globalAgent, not http's: an https.Agent connects
+    // with tls.connect, and the global one is its own instance.
     merged.Agent = agents.HttpsAgent;
     Object.defineProperty(merged, "globalAgent", {
       configurable: true,
@@ -25342,6 +25363,10 @@
       get() { return agents.state.httpsGlobalAgent; },
       set(value) { agents.state.httpsGlobalAgent = value; },
     });
+    merged.Server = Server;
+    merged.createServer = createServer;
+    merged.get = httpsFrames[1];
+    merged.request = httpsFrames[0];
     return merged;
   };
 
@@ -27903,6 +27928,32 @@
       }
     }
 
+    // Helpers the cleartext server, the secure server and the client share
+    // -- one copy at the factory's top (#201). The nghttp2 error codes, the
+    // sensitive-headers symbol, the coded-error builder (`code`, `message`,
+    // then the error class -- the client's argument order, the whole
+    // factory's now, and node's coded shape for the message and stack), and
+    // the HTTP/1 connection-header rule the request and response validation
+    // both apply.
+    const NGHTTP2_NO_ERROR = 0;
+    const NGHTTP2_INTERNAL_ERROR = 2;
+    const NGHTTP2_CANCEL = 8;
+    const kSensitiveHeaders = Symbol.for("nodejs.http2.sensitiveHeaders");
+    function h2Error(code, message, Base) {
+      return applyNodeErrorShape(new (Base || Error)(message), code);
+    }
+    function illegalConnectionHeader(name, value) {
+      switch (name) {
+        case "connection": case "upgrade": case "http2-settings":
+        case "keep-alive": case "proxy-connection": case "transfer-encoding":
+          return true;
+        case "te":
+          return value !== "trailers";
+        default:
+          return false;
+      }
+    }
+
     class ServerHttp2Stream extends Duplex {
       constructor(requestId, inHeaders) {
         // The http2 layer manages this stream's close lifecycle; opt out of
@@ -27954,6 +28005,14 @@
         }
       }
       additionalHeaders() {}
+      // The compatibility Http2ServerResponse reads `headersSent` and both
+      // req and res call `setTimeout` (#200); the h2c stream has no timeout of
+      // its own.
+      get headersSent() { return this._responded; }
+      setTimeout(msecs, callback) {
+        if (typeof callback === "function") this.once("timeout", callback);
+        return this;
+      }
       _write(chunk, encoding, callback) {
         if (this._ended) { callback(); return; }
         if (!this._responded) {
@@ -28014,7 +28073,13 @@
           options = {};
         }
         this._options = options || {};
-        if (handler) this.on("stream", handler);
+        // The compatibility API (req, res): a 'request' listener -- the
+        // handler, or one added later -- installs the 'stream' bridge that
+        // builds Node's Http2ServerRequest / Http2ServerResponse, the same
+        // wiring the secure server has (#200). The raw 'stream' API keeps
+        // working alongside it, as on Node.
+        secureServer.installCompat(this, this._options);
+        if (handler) this.on("request", handler);
         this._serverId = null;
         this._port = null;
         this._host = null;
@@ -28057,8 +28122,12 @@
                 hdrs[":method"] = meta.method;
                 hdrs[":path"] = meta.uri;
                 hdrs[":scheme"] = "http";
+                var rawHeaders = [];
+                for (var r = 0; r < meta.headers.length; r++) {
+                  rawHeaders.push(meta.headers[r][0], meta.headers[r][1]);
+                }
                 var stream = new ServerHttp2Stream(meta.requestId, hdrs);
-                self.emit("stream", stream, hdrs);
+                self.emit("stream", stream, hdrs, 0, rawHeaders);
               }
               self.emit("close");
             })();
@@ -28112,37 +28181,30 @@
       const kTrailers = Symbol("kTrailers");
       const kStream = Symbol("kStream");
       const kAborted = Symbol("kAborted");
-      const kSensitiveHeaders = Symbol.for("nodejs.http2.sensitiveHeaders");
-      const NGHTTP2_NO_ERROR = 0;
-      const NGHTTP2_INTERNAL_ERROR = 2;
-      const NGHTTP2_CANCEL = 8;
       const STREAM_FLAGS_END_STREAM = 0x1;
       const STREAM_FLAGS_END_HEADERS = 0x4;
 
-      function h2Error(Base, code, message) {
-        return applyNodeErrorShape(new Base(message), code);
-      }
       const h2Errors = {
-        noSocketManipulation: () => h2Error(Error, "ERR_HTTP2_NO_SOCKET_MANIPULATION",
-          "HTTP/2 sockets should not be directly manipulated (e.g. read and written)"),
-        headersSent: () => h2Error(Error, "ERR_HTTP2_HEADERS_SENT", "Response has already been initiated."),
-        invalidStream: () => h2Error(Error, "ERR_HTTP2_INVALID_STREAM", "The stream has been destroyed"),
-        pushDisabled: () => h2Error(Error, "ERR_HTTP2_PUSH_DISABLED", "HTTP/2 client has disabled push streams"),
-        statusInvalid: (code) => h2Error(RangeError, "ERR_HTTP2_STATUS_INVALID", "Invalid status code: " + code),
-        infoStatusNotAllowed: () => h2Error(RangeError, "ERR_HTTP2_INFO_STATUS_NOT_ALLOWED",
-          "Informational status codes cannot be used"),
-        connectionHeaders: (name) => h2Error(TypeError, "ERR_HTTP2_INVALID_CONNECTION_HEADERS",
-          'HTTP/1 Connection specific headers are forbidden: "' + name + '"'),
-        pseudoHeader: (name) => h2Error(TypeError, "ERR_HTTP2_INVALID_PSEUDOHEADER",
-          '"' + name + '" is an invalid pseudoheader or is used incorrectly'),
-        singleValue: (name) => h2Error(TypeError, "ERR_HTTP2_HEADER_SINGLE_VALUE",
-          'Header field "' + name + '" must only have a single value'),
-        pseudoNotAllowed: () => h2Error(TypeError, "ERR_HTTP2_PSEUDOHEADER_NOT_ALLOWED",
-          "Cannot set HTTP/2 pseudo-headers"),
-        headerValue: (value, name) => h2Error(TypeError, "ERR_HTTP2_INVALID_HEADER_VALUE",
-          'Invalid value "' + value + '" for header "' + name + '"'),
-        httpToken: (name) => h2Error(TypeError, "ERR_INVALID_HTTP_TOKEN",
-          'Header name must be a valid HTTP token ["' + name + '"]'),
+        noSocketManipulation: () => h2Error("ERR_HTTP2_NO_SOCKET_MANIPULATION",
+          "HTTP/2 sockets should not be directly manipulated (e.g. read and written)", Error),
+        headersSent: () => h2Error("ERR_HTTP2_HEADERS_SENT", "Response has already been initiated.", Error),
+        invalidStream: () => h2Error("ERR_HTTP2_INVALID_STREAM", "The stream has been destroyed", Error),
+        pushDisabled: () => h2Error("ERR_HTTP2_PUSH_DISABLED", "HTTP/2 client has disabled push streams", Error),
+        statusInvalid: (code) => h2Error("ERR_HTTP2_STATUS_INVALID", "Invalid status code: " + code, RangeError),
+        infoStatusNotAllowed: () => h2Error("ERR_HTTP2_INFO_STATUS_NOT_ALLOWED",
+          "Informational status codes cannot be used", RangeError),
+        connectionHeaders: (name) => h2Error("ERR_HTTP2_INVALID_CONNECTION_HEADERS",
+          'HTTP/1 Connection specific headers are forbidden: "' + name + '"', TypeError),
+        pseudoHeader: (name) => h2Error("ERR_HTTP2_INVALID_PSEUDOHEADER",
+          '"' + name + '" is an invalid pseudoheader or is used incorrectly', TypeError),
+        singleValue: (name) => h2Error("ERR_HTTP2_HEADER_SINGLE_VALUE",
+          'Header field "' + name + '" must only have a single value', TypeError),
+        pseudoNotAllowed: () => h2Error("ERR_HTTP2_PSEUDOHEADER_NOT_ALLOWED",
+          "Cannot set HTTP/2 pseudo-headers", TypeError),
+        headerValue: (value, name) => h2Error("ERR_HTTP2_INVALID_HEADER_VALUE",
+          'Invalid value "' + value + '" for header "' + name + '"', TypeError),
+        httpToken: (name) => h2Error("ERR_INVALID_HTTP_TOKEN",
+          'Header name must be a valid HTTP token ["' + name + '"]', TypeError),
       };
 
       // node's kSingleValueHeaders (lib/internal/http2/util.js).
@@ -28160,17 +28222,6 @@
       ]);
       const kHttpToken = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
       // node's isIllegalConnectionSpecificHeader.
-      function illegalConnectionHeader(name, value) {
-        switch (name) {
-          case "connection": case "upgrade": case "http2-settings":
-          case "keep-alive": case "proxy-connection": case "transfer-encoding":
-            return true;
-          case "te":
-            return value !== "trailers";
-          default:
-            return false;
-        }
-      }
       function utcDate() {
         return new Date().toUTCString();
       }
@@ -28449,8 +28500,8 @@
         additionalHeaders(headers) {
           if (this.destroyed || this._closed) throw h2Errors.invalidStream();
           if (this._responded) {
-            throw h2Error(Error, "ERR_HTTP2_HEADERS_AFTER_RESPOND",
-              "Cannot specify additional headers after response initiated");
+            throw h2Error("ERR_HTTP2_HEADERS_AFTER_RESPOND",
+              "Cannot specify additional headers after response initiated", Error);
           }
         }
         respond(headersParam, options) {
@@ -28623,8 +28674,8 @@
           return this;
         }
         sendTrailers() {
-          throw h2Error(Error, "ERR_HTTP2_TRAILERS_NOT_READY",
-            "Trailing headers cannot be sent until after the wantTrailers event is emitted");
+          throw h2Error("ERR_HTTP2_TRAILERS_NOT_READY",
+            "Trailing headers cannot be sent until after the wantTrailers event is emitted", Error);
         }
       }
 
@@ -29034,6 +29085,18 @@
           this.on("stream", onServerStream);
         }
       }
+      // Give a server (the cleartext h2c one, which lives outside this
+      // scope) the same compatibility wiring the secure server has (#200):
+      // the request/response classes on its options, and the newListener hook
+      // that installs the 'stream' bridge as soon as a 'request' listener is
+      // added.
+      function installCompat(server, options) {
+        var opts = options || {};
+        opts.Http2ServerRequest = opts.Http2ServerRequest || Http2ServerRequest;
+        opts.Http2ServerResponse = opts.Http2ServerResponse || Http2ServerResponse;
+        server[kOptions] = opts;
+        server.on("newListener", setupCompat);
+      }
 
       // A TLS connection handed to the native server from here on: its socket
       // object stays (it is session.socket, req.socket), with no I/O of its
@@ -29171,8 +29234,8 @@
           if (this._destroyed) return;
           if (typeof error === "number") {
             code = error;
-            error = code !== NGHTTP2_NO_ERROR ? h2Error(Error, "ERR_HTTP2_SESSION_ERROR",
-              "Session closed with error code " + code) : undefined;
+            error = code !== NGHTTP2_NO_ERROR ? h2Error("ERR_HTTP2_SESSION_ERROR",
+              "Session closed with error code " + code, Error) : undefined;
           }
           this._destroyed = true;
           this._closed = true;
@@ -29343,7 +29406,7 @@
         return new Http2SecureServer(options, handler);
       }
 
-      return { createSecureServer, Http2ServerRequest, Http2ServerResponse };
+      return { createSecureServer, Http2ServerRequest, Http2ServerResponse, installCompat };
     })();
     const { createSecureServer, Http2ServerRequest, Http2ServerResponse } = secureServer;
 
@@ -29361,9 +29424,6 @@
     // anything itself. (The client used to be one fetch per stream over the
     // shared fetch transport, which ignored every connect option and never
     // opened the session's own connection.)
-    const NGHTTP2_NO_ERROR = 0;
-    const NGHTTP2_INTERNAL_ERROR = 2;
-    const NGHTTP2_CANCEL = 8;
     const NGHTTP2_SESSION_CLIENT = 1;
     const NGHTTP2_ERROR_NAMES = [
       "NGHTTP2_NO_ERROR", "NGHTTP2_PROTOCOL_ERROR", "NGHTTP2_INTERNAL_ERROR",
@@ -29373,15 +29433,9 @@
       "NGHTTP2_INADEQUATE_SECURITY", "NGHTTP2_HTTP_1_1_REQUIRED",
     ];
     const kBoundSession = Symbol("kBoundSession");
-    const kSensitiveHeaders = Symbol.for("nodejs.http2.sensitiveHeaders");
     const VALID_PSEUDO_HEADERS = new Set([":status", ":method", ":authority", ":scheme", ":path", ":protocol"]);
     const NO_PAYLOAD_METHODS = new Set(["DELETE", "GET", "HEAD"]);
 
-    function h2Error(code, message, Base) {
-      var err = new (Base || Error)(message);
-      err.code = code;
-      return err;
-    }
     // node's ERR_HTTP2_STREAM_CANCEL: the error a pending stream is destroyed
     // with when its session goes down, naming (and carrying) the cause.
     function streamCancelError(cause) {
@@ -29481,9 +29535,7 @@
         var values = Array.isArray(value) ? value : [value];
         for (var j = 0; j < values.length; j++) {
           var text = String(values[j]);
-          if (key === "connection" || key === "upgrade" || key === "http2-settings" ||
-              key === "keep-alive" || key === "proxy-connection" || key === "transfer-encoding" ||
-              (key === "te" && text !== "trailers")) {
+          if (illegalConnectionHeader(key, text)) {
             throw h2Error("ERR_HTTP2_INVALID_CONNECTION_HEADERS", 'HTTP/1 Connection specific headers are forbidden: "' + key + '"', TypeError);
           }
           list.push([key, text]);
@@ -31745,6 +31797,11 @@
       if (typeof type !== "string") throw codes.ERR_INVALID_ARG_TYPE("type", "string", type);
       switch (type) {
         case "default":
+          // Once setDefaultCACertificates has replaced the store, that list
+          // is the default (#199); until then it is bundled +
+          // NODE_EXTRA_CA_CERTS, built once.
+          var override = natives.tlsCaCertificates("default");
+          if (override !== undefined) return Object.freeze(override);
           if (defaultCaCertificates === undefined) {
             var list = caCertificatesOf("bundled").slice();
             if (process.env.NODE_EXTRA_CA_CERTS) list.push.apply(list, caCertificatesOf("extra"));
@@ -31758,6 +31815,35 @@
         default:
           throw codes.ERR_INVALID_ARG_VALUE("type", type);
       }
+    }
+    // tls.setDefaultCACertificates (node 22.15+): replace the process default
+    // trust store. Each element is a PEM string or an ArrayBufferView holding
+    // PEM; the array is validated as node does (a non-array or a non-string,
+    // non-view element is ERR_INVALID_ARG_TYPE), an empty array is accepted
+    // and trusts nothing, and a non-empty array with nothing parseable is
+    // ERR_CRYPTO_OPERATION_FAILED with the store left as it was. A connection
+    // made after it with no `ca` of its own verifies against this list, and
+    // getCACertificates('default') reads it back.
+    function setDefaultCACertificates(certs) {
+      if (!Array.isArray(certs)) throw codes.ERR_INVALID_ARG_TYPE("certs", "Array", certs);
+      var pems = [];
+      for (var i = 0; i < certs.length; i++) {
+        var cert = certs[i];
+        if (typeof cert === "string") {
+          pems.push(cert);
+        } else if (ArrayBuffer.isView(cert)) {
+          pems.push(globalThis.Buffer.from(cert.buffer, cert.byteOffset, cert.byteLength).toString("latin1"));
+        } else {
+          throw codes.ERR_INVALID_ARG_TYPE("certs[" + i + "]", ["string", "ArrayBufferView"], cert);
+        }
+      }
+      if (natives.tlsSetDefaultCaCertificates(pems) < 0) {
+        var unable = new Error("No valid certificates found in the provided array");
+        unable.code = "ERR_CRYPTO_OPERATION_FAILED";
+        throw unable;
+      }
+      // Drop the composed-default cache; the override answers now.
+      defaultCaCertificates = undefined;
     }
 
     // ---- tls.Server ----
@@ -32346,12 +32432,40 @@
       return socket;
     }
 
+    // An upgrade / CONNECT connection an https server handed to JS: a
+    // server-born tls.TLSSocket over the TLS handle the connection was taken
+    // out of hyper as, its view the handshake it was admitted on. The
+    // encrypted mirror of the net.Socket the http server hands an 'upgrade' /
+    // 'connect' listener; it reads and writes the decrypted stream through the
+    // TLS handle (_startReading / _write over natives.tls*), not the raw TCP.
+    // #205.
+    function takenServerSocket(meta) {
+      var socket = new TLSSocket(null, { [kServerBorn]: true });
+      var info = Object.assign({ handle: meta.socketHandle }, meta.tls || {});
+      info.remoteAddr = {
+        address: meta.remoteAddress,
+        port: meta.remotePort,
+        family: meta.remoteFamily,
+      };
+      if (meta.localAddress !== undefined) {
+        info.localAddr = {
+          address: meta.localAddress,
+          port: meta.localPort,
+          family: meta.localFamily,
+        };
+      }
+      fillServerSocket(socket, info, {});
+      registry._activeHandles.set(socket, "TCPSocketWrap");
+      return socket;
+    }
+
     // What the https server builds on: its options are node:tls's, read and
     // validated by tls.Server, and its connections are accepted natively
     // with the context tls.Server built.
     registry._tlsServer = {
       alpnWireNames: alpnWireNames,
       serverSocketView: serverSocketView,
+      takenServerSocket: takenServerSocket,
     };
 
     var tlsExports = {
@@ -32378,6 +32492,7 @@
         "tls_aes_128_gcm_sha256", "tls_aes_256_gcm_sha384", "tls_chacha20_poly1305_sha256",
       ],
       getCACertificates,
+      setDefaultCACertificates,
       checkServerIdentity,
     };
     // node: a getter (enumerable, not configurable) that builds the frozen

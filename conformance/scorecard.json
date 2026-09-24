@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "588665c+wip",
+  "commit": "a649ea6+wip",
   "oamVersion": "oam 0.16.4",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 175,
-      "total": 175,
+      "pass": 182,
+      "total": 182,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -387,11 +387,39 @@
           "status": "pass"
         },
         {
-          "case": "183-cjs-module-object.mjs",
+          "case": "183-tls-set-default-ca-certificates.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "184-http2-cleartext-server-compat.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "185-http-server-max-headers-count.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "186-fetch-pool-no-spare-connection.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "187-https-server-streams-request-body.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "188-https-module-exports.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "189-https-server-upgrade-connect.mjs",
           "status": "pass"
         },
         {
           "case": "19-fs-fd-callbacks.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "190-cjs-module-object.mjs",
           "status": "pass"
         },
         {
@@ -818,7 +846,7 @@
         "platform": "win32",
         "noBaseline": false,
         "nodeTotal": 1874,
-        "knownMissing": 345,
+        "knownMissing": 344,
         "newMissing": [],
         "staleRatchet": [],
         "absentModules": [],
@@ -875,20 +903,6 @@
             "names": [
               "Dirent",
               "_globAsPromise"
-            ]
-          },
-          {
-            "module": "https",
-            "names": [
-              "ClientRequest",
-              "IncomingMessage",
-              "METHODS",
-              "OutgoingMessage",
-              "STATUS_CODES",
-              "ServerResponse",
-              "maxHeaderSize",
-              "validateHeaderName",
-              "validateHeaderValue"
             ]
           },
           {

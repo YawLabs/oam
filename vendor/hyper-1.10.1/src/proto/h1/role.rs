@@ -150,61 +150,77 @@ impl Http1Transaction for Server {
         // but we *never* read any of it until after httparse has assigned
         // values into it. By not zeroing out the stack memory, this saves
         // a good ~5% on pipeline benchmarks.
+        // oam patch (item 11): grow the header buffers on demand rather than
+        // allocating `h1_max_headers` slots on every parse. oam raises
+        // max_headers to a large byte-derived cap so a head is refused only on
+        // its size, as node does; allocating that upfront would burden the
+        // common few-header request. Start with the inline capacity and grow
+        // -- re-parsing the buffered head -- only when a head carries more
+        // fields, up to the cap. The cap still bounds it: a head past it is
+        // refused exactly as before. Both buffers use uninitialized memory,
+        // but we *never* read any of it until httparse has assigned into it.
+        let hard_cap = ctx.h1_max_headers.unwrap_or(DEFAULT_MAX_HEADERS);
         let mut headers_indices: SmallVec<[MaybeUninit<HeaderIndices>; DEFAULT_MAX_HEADERS]> =
-            match ctx.h1_max_headers {
-                Some(cap) => smallvec![MaybeUninit::uninit(); cap],
-                None => smallvec_inline![MaybeUninit::uninit(); DEFAULT_MAX_HEADERS],
-            };
+            smallvec![MaybeUninit::uninit(); DEFAULT_MAX_HEADERS.min(hard_cap)];
         {
-            let mut headers: SmallVec<[MaybeUninit<httparse::Header<'_>>; DEFAULT_MAX_HEADERS]> =
-                match ctx.h1_max_headers {
-                    Some(cap) => smallvec![MaybeUninit::uninit(); cap],
-                    None => smallvec_inline![MaybeUninit::uninit(); DEFAULT_MAX_HEADERS],
-                };
-            trace!(bytes = buf.len(), "Request.parse");
-            let mut req = httparse::Request::new(&mut []);
-            let bytes = buf.as_ref();
-            match ctx.h1_parser_config.parse_request_with_uninit_headers(
-                &mut req,
-                bytes,
-                &mut headers,
-            ) {
-                Ok(httparse::Status::Complete(parsed_len)) => {
-                    trace!("Request.parse Complete({})", parsed_len);
-                    len = parsed_len;
-                    let uri = req.path.expect("httparse completed");
-                    if uri.len() > MAX_URI_LEN {
-                        return Err(Parse::UriTooLong);
-                    }
-                    method =
-                        Method::from_bytes(req.method.expect("httparse completed").as_bytes())?;
-                    path_range = Server::record_path_range(bytes, uri);
-                    version = if req.version.expect("httparse completed") == 1 {
-                        keep_alive = true;
-                        is_http_11 = true;
-                        Version::HTTP_11
-                    } else {
-                        keep_alive = false;
-                        is_http_11 = false;
-                        Version::HTTP_10
-                    };
-
-                    record_header_indices(bytes, req.headers, &mut headers_indices)?;
-                    headers_len = req.headers.len();
-                }
-                Ok(httparse::Status::Partial) => return Ok(None),
-                // if invalid Token, try to determine if for method or path
-                Err(httparse::Error::Token) => {
-                    return Err({
-                        if req.method.is_none() {
-                            Parse::Method
-                        } else {
-                            debug_assert!(req.path.is_none());
-                            Parse::Uri
+            loop {
+                let cap = headers_indices.len();
+                let mut headers: SmallVec<[MaybeUninit<httparse::Header<'_>>; DEFAULT_MAX_HEADERS]> =
+                    smallvec![MaybeUninit::uninit(); cap];
+                trace!(bytes = buf.len(), "Request.parse");
+                let mut req = httparse::Request::new(&mut []);
+                let bytes = buf.as_ref();
+                match ctx.h1_parser_config.parse_request_with_uninit_headers(
+                    &mut req,
+                    bytes,
+                    &mut headers,
+                ) {
+                    Ok(httparse::Status::Complete(parsed_len)) => {
+                        trace!("Request.parse Complete({})", parsed_len);
+                        len = parsed_len;
+                        let uri = req.path.expect("httparse completed");
+                        if uri.len() > MAX_URI_LEN {
+                            return Err(Parse::UriTooLong);
                         }
-                    })
+                        method = Method::from_bytes(
+                            req.method.expect("httparse completed").as_bytes(),
+                        )?;
+                        path_range = Server::record_path_range(bytes, uri);
+                        version = if req.version.expect("httparse completed") == 1 {
+                            keep_alive = true;
+                            is_http_11 = true;
+                            Version::HTTP_11
+                        } else {
+                            keep_alive = false;
+                            is_http_11 = false;
+                            Version::HTTP_10
+                        };
+
+                        record_header_indices(bytes, req.headers, &mut headers_indices)?;
+                        headers_len = req.headers.len();
+                        break;
+                    }
+                    Ok(httparse::Status::Partial) => return Ok(None),
+                    // if invalid Token, try to determine if for method or path
+                    Err(httparse::Error::Token) => {
+                        return Err({
+                            if req.method.is_none() {
+                                Parse::Method
+                            } else {
+                                debug_assert!(req.path.is_none());
+                                Parse::Uri
+                            }
+                        })
+                    }
+                    // oam patch (item 11): the head overflowed the current
+                    // buffer but is still within the cap -- grow and re-parse.
+                    Err(httparse::Error::TooManyHeaders) if cap < hard_cap => {
+                        headers_indices =
+                            smallvec![MaybeUninit::uninit(); (cap * 2).min(hard_cap)];
+                        continue;
+                    }
+                    Err(err) => return Err(err.into()),
                 }
-                Err(err) => return Err(err.into()),
             }
         };
 

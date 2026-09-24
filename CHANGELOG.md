@@ -16,8 +16,88 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+### Added
+
+- **`tls.setDefaultCACertificates(certs)` (Node 22.15+) replaces the process default trust
+  store** (#199). oam had the reading half (`tls.getCACertificates`) but not the writing
+  half, so a program that pins the process to its own roots threw `TypeError:
+  tls.setDefaultCACertificates is not a function`. It now takes an array of PEM strings or
+  `ArrayBufferView`s, validated as Node validates it (`ERR_INVALID_ARG_TYPE` for a non-array
+  or a bad element, `ERR_CRYPTO_OPERATION_FAILED` when a non-empty array has nothing
+  parseable, an empty array accepted and trusting nothing, duplicates dropped); a connection
+  made after it with no `ca` of its own verifies against the override, and
+  `tls.getCACertificates('default')` reads it back while `'bundled'` / `'system'` / `'extra'`
+  stay put. Conformance case 183 holds it to node v22.22.2.
+
 ### Fixed
 
+- **An `https` server never fired `'upgrade'` or `'connect'`, so a WebSocket handshake reached
+  the ordinary `'request'` handler and a CONNECT was closed** (#205). The https connection was
+  built with `Upgrades::CloseConnect` -- an upgrade served as an ordinary request, a CONNECT
+  closed -- where the `http` path hands the connection to JS. So `ws`, `socket.io`, and
+  anything on `server.on('upgrade')` could not serve over TLS, and an https server could not
+  act as a CONNECT proxy. The https connection now routes like http when the server is
+  JS-driven: on an upgrade with a listener, or a CONNECT, it takes the TLS connection out of
+  hyper, registers it as a TLS handle, and hands the listener a `tls.TLSSocket` with the bytes
+  behind the head -- the encrypted mirror of the http `net.Socket` handover, sharing its rules
+  (an upgrade needs a listener; a CONNECT with no listener is destroyed). Conformance case 189
+  holds the four cases byte-identical to node v22.22.2. (The HTTP/1 side of
+  `http2.createServer` is unchanged -- a separate concern.)
+- **`node:https` exported nine names node's `https` does not have** (#204). The module was
+  built by copying every export of `node:http` and overriding six, so it carried
+  `STATUS_CODES`, `METHODS`, `ClientRequest`, `IncomingMessage`, `OutgoingMessage`,
+  `ServerResponse`, `maxHeaderSize`, `validateHeaderName` and `validateHeaderValue` -- names
+  node keeps on `http` alone. A builtin's ESM named exports are its module object's own keys,
+  so `import { STATUS_CODES } from "node:https"` linked on oam and threw a `SyntaxError` at
+  link time on node, and `if (https.maxHeaderSize)` read the opposite way on each. `https`
+  now exports exactly node's six names -- `Agent`, `globalAgent`, `Server`, `createServer`,
+  `get`, `request` -- in node's order; a program that wants the rest imports them from `http`.
+  Conformance case 188 holds the export set to node v22.22.2.
+- **An `https` server ran the request handler only after the whole request body had arrived,
+  so it could not answer or cut an upload early** (#203). The https connection was built with
+  the buffered-body path, where the `http` server already streams: the handler was dispatched
+  only once the body ended, so a `res.writeHead(413); req.destroy()` took effect only after
+  the client had finished sending (up to the 100 MB per-request cap), and a body the parser
+  refused as malformed reached no handler. The https connection now uses the same streaming
+  path as `http` -- the handler is dispatched on the head and the body is delivered as it
+  arrives, with the same caps and drain accounting -- so an https handler answers (and cuts)
+  an upload before it finishes, as node's does. Conformance case 187 holds both halves
+  (dispatch-on-head and early-cut) byte-identical to node v22.22.2 for `http` and `https`.
+- **`fetch`'s connection pool opened a spare connection that carried no request and held a
+  `node:http` server's `close()` open for 90 seconds** (#216). hyper-util's legacy client
+  raced a fresh connect against a pooled checkout on a cache-miss; when the pooled connection
+  won, the freshly opened one was parked idle having sent nothing, so a server saw one more
+  connection than its requests explained and a `fetch`-then-`server.close()` in the same
+  process hung until the spare's 90 s idle timeout. oam now owns its connection pool: a
+  request either reuses an idle connection or opens exactly one it will send on, never both,
+  the way undici does, so no spare is ever created and `close()` fires at once. The pool is
+  built on hyper's low-level `client::conn` dispatchers over oam's existing connector, keeps
+  the same origin-keyed reuse, keep-alive, HTTP/2 multiplexing, `Connection: close` handling
+  and stale-connection resend, and adds real idle eviction. Conformance case 186 holds the
+  no-spare property and the prompt `close()` to node v22.22.2. (The owned pool also makes
+  `agent.destroy()` promptly close its sockets fixable -- divergence entry 38 -- but that
+  wiring, which needs a per-agent pool, is a follow-up.)
+- **An http/https server refused a request with more than 100 header fields (`431`), and
+  `server.maxHeadersCount` was ignored** (#202). The vendored parser's default cap refused
+  any head past 100 fields, so a request a proxy chain had piled `x-forwarded-*` / tracing
+  headers onto -- one Node serves with a `200` -- got a `431`; and `maxHeadersCount`, Node's
+  knob for limiting header count, was stored and never read. A head is now refused only on
+  its byte size (`maxHeaderSize` -> `431`), never its field count, and the handler is given
+  the first `maxHeadersCount` header fields with the rest dropped (`null`, the default,
+  keeps Node's 1000; `0` is no limit) -- on `http` and `https`, and with `maxHeaderSize`
+  raised. The vendored parser grows its header buffer only when a head needs it, so the
+  common few-header request keeps its allocation-free fast path. Conformance case 185 holds
+  it to node v22.22.2.
+- **The cleartext `http2.createServer` had no compatibility API, so a `'request'` listener
+  never fired and a `(req, res)` server never answered** (#200). `createServer(handler)` put
+  the handler on `'stream'` and lacked the `Http2ServerRequest` / `Http2ServerResponse`
+  machinery the secure server got in 0.16.3, so the way most HTTP/2 code is written --
+  `http2.createServer()` plus `server.on('request', (req, res) => res.end(...))` -- hung with
+  no response. The cleartext server now shares the secure server's wiring: `createServer`
+  registers the handler on `'request'`, and a `'request'` listener installs the `'stream'`
+  bridge that builds the request and response objects (`req.url`, `req.method`,
+  `res.writeHead`, `res.end`); the raw `'stream'` API keeps working alongside it, as on Node.
+  Conformance case 184 holds it to node v22.22.2.
 - **A refused server name failed `tls.connect` with `ERR_TLS_CERT_ALTNAME_INVALID` whose
   `cert` was `{}`, where Node hands over the peer certificate** (#198). Node reports the
   certificate the name check refused as `err.cert` -- the same object
@@ -27,8 +107,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
   verifier now carries the chain it refused out through the verdict, and `tls.connect`'s
   error path builds `err.cert` from it with the routine `getPeerCertificate()` uses, so a
   caught `ERR_TLS_CERT_ALTNAME_INVALID` reports the same certificate on both runtimes. A
-  chain-build failure (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) still leaves `err.cert` `{}`, as
-  Node does. Measured on node v22.22.2.
+  chain-build failure (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) leaves `err.cert` undefined (no
+  `cert` key), as Node does. Measured on node v22.22.2.
 - **An `http2.connect` session ended by a server's fatal TLS alert emitted `'error'` and
   `'close'`, crashing a program that had no session `'error'` listener** (#197). A TLS 1.3
   server that requires a client certificate answers a client that sent none with a fatal

@@ -1183,9 +1183,17 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
     (or `write EPROTO`, with a write queued).
   - **An alert Node cannot name, sent after the handshake**, is `EPROTO` with no syscall
     and rustls's message on oam; Node's shape for it was not measured.
-- **`tls.setDefaultCACertificates()` is absent.** Node 22.15 and later replace the
-  default trust store with it; oam has `NODE_EXTRA_CA_CERTS` and the `ca` option (and
-  `tls.getCACertificates()` to read the default store out) only.
+- **`tls.setDefaultCACertificates()` replaces the default trust store** (Node 22.15+,
+  #199): a connection made after it with no `ca` of its own verifies against the given
+  certificates -- an empty array trusting nothing -- and `tls.getCACertificates('default')`
+  reads them back. The argument is validated as Node validates it (`ERR_INVALID_ARG_TYPE`
+  for a non-array or a non-string, non-`ArrayBufferView` element; `ERR_CRYPTO_OPERATION_FAILED`
+  when nothing in a non-empty array parses, the store left as it was), duplicates are
+  dropped, and `'bundled'` / `'system'` / `'extra'` stay what they are. The one difference:
+  a connection refused by an EMPTY override reports `UNABLE_TO_VERIFY_LEAF_SIGNATURE` (the
+  code an empty `ca: []` gives on both runtimes) where Node reports
+  `SELF_SIGNED_CERT_IN_CHAIN` -- Node classifies an empty default store differently from an
+  empty `ca` option, a distinction oam does not draw.
 - **`tls.getCACertificates('bundled')` is the Mozilla store oam's client trusts**, which is
   webpki-roots' release of it, not Node's own copy: the two lists hold different numbers of
   certificates. `'system'` is the operating system's store as rustls-native-certs reads it
@@ -1198,8 +1206,8 @@ described; the bare-`connect()` and `socket`-option shapes as described. A refus
 `ERR_TLS_CERT_ALTNAME_INVALID` now carries the peer certificate as Node's `err.cert` (#198):
 the verifier hands the chain it refused out of the handshake, and `tls.connect`'s error path
 builds the certificate from it exactly as `getPeerCertificate(true)` does, `issuerCertificate`
-linked. A chain-build failure (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) still leaves `err.cert` `{}`,
-as Node does.
+linked. A chain-build failure (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) leaves `err.cert` undefined
+(no `cert` key, the error's own keys being `[code]`), as Node does.
 
 ### 35. `http` and `fetch` to a refused port — FIXED, no longer a divergence (#143)
 
@@ -1522,21 +1530,16 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
 
 **Responses and requests**
 
-- **A keep-alive `Agent`'s pooled connection outlives `agent.destroy()`.** The pool on this
-  transport is hyper's, and `agent.destroy()` does not close the connections it holds: one
-  stays open until the server's keep-alive timeout closes it. Measured against an oam
-  server with `keepAliveTimeout` 2000 ms and 4000 ms, its `getConnections()` read 0 about
-  3000 ms and 5000 ms after `agent.destroy()`; with Node's client, within 500 ms. A pooled
-  request's socket also emits no `'close'` when the server ends the connection (a server
-  that answered `Connection: close` and closed it: no `'close'` 1.5 s later).
-- **The pool opens a connection it may never use (#216).** A request made while no pooled
-  connection is idle starts a new one AND waits for a pooled one to come free; when a pooled
-  one wins (a response finishing on the loopback does), the new connection is finished and
-  parked idle, having carried no request. undici opens a connection only to send on it. A
-  server sees one more connection than requests explain, and Node's `http` server -- oam's
-  too -- keeps such a connection across `server.close()` until the client goes (entry 41 has
-  what `oam.serve` does with it). Measured: six sequential-then-concurrent fetches to one
-  origin arrived on one connection, with a second open that never received a byte.
+- **A keep-alive `Agent`'s pooled connection outlives `agent.destroy()`.** oam's client now
+  owns its connection pool (#216), so `agent.destroy()` is fixable -- but it is not wired yet:
+  every hookless agent shares the one process pool, so destroying one agent must not evict the
+  connections another agent is using, which needs a per-agent pool. Until then
+  `agent.destroy()` does not close the connections the shared pool holds: one stays open until
+  the server's keep-alive timeout closes it. Measured against an oam server with
+  `keepAliveTimeout` 2000 ms and 4000 ms, its `getConnections()` read 0 about 3000 ms and
+  5000 ms after `agent.destroy()`; with Node's client, within 500 ms. A pooled request's
+  socket also emits no `'close'` when the server ends the connection (a server that answered
+  `Connection: close` and closed it: no `'close'` 1.5 s later).
 - **`statusText` is the canonical reason phrase**, not the server's: `200 Custom Reason` reads
   `OK` in oam, and `299 Whatever` reads `''`. Node reports the reason on the wire.
 - **The request header count is capped.** More than 24,576 distinct header names (fewer if
@@ -1745,8 +1748,7 @@ target). The parser underneath is hyper's, so some heads still get a different a
 - **oam refuses, Node accepts:** `Transfer-Encoding` on an HTTP/1.0 request; request lines
   with `HTTP/2.0`, no version (HTTP/0.9) or two spaces; an absolute-form target with an
   empty authority (`http://`, `http:///p`, `abc://`); an empty `Transfer-Encoding` next to
-  `Content-Length`; more than 100 header fields (`431`; Node limits only the byte count
-  and keeps the first 1000 fields); a request target over 65534 bytes (`414`; Node answers
+  `Content-Length`; a request target over 65534 bytes (`414`; Node answers
   `431` from the byte count). Under `insecureHTTPParser`, obs-fold, control characters in
   values, `Transfer-Encoding` codings other than a final `chunked`, whitespace after
   a chunk size, and `Content-Length`, `Transfer-Encoding` or obs-fold in a chunked body's
@@ -1754,20 +1756,21 @@ target). The parser underneath is hyper's, so some heads still get a different a
 - **oam accepts, Node refuses:** lowercase or unknown methods (`get`, `FOO`) and an
   HTTP/1.1 request without `Host` (Node's `requireHostHeader`, which oam does not
   implement).
+- **`server.maxHeadersCount`** now works as Node's (#202): a head is refused only on its
+  byte size, never its field count, and the handler is given the first `maxHeadersCount`
+  header fields (`req.headers`), the rest dropped -- `null` (the default) keeps Node's
+  1000, `0` is no limit. One nuance is left: Node's `req.rawHeaders` keeps whole 32-field
+  parser batches, so with a limit below 32 and a head of fewer than 32 fields its
+  `rawHeaders` holds every field while `req.headers` is capped; oam caps `rawHeaders` to
+  the same count, so `rawHeaders` can be shorter than Node's in that narrow case.
+  `conformance/cases/185-http-server-max-headers-count.mjs` holds the rest to node v22.22.2.
 - A malformed chunked body is answered with Node's status (`400`, or `413` for chunk
   extensions over the limit) when the handler has not responded yet, and the handler's
-  request aborts with `ECONNRESET`, as in Node. On `https` servers and the HTTP/1 side of
-  `http2.createServer` the body is read before the handler runs, so a body refused as
-  malformed reaches no handler (Node runs it on the headers, and its request aborts).
-- **An `https` handler cannot cut an upload short**, for the same reason: it runs once the
-  body has arrived, so a 413-and-destroy answer takes effect only after the whole body has
-  been read, up to the 100 MB per-request cap, and that much is held for the connection.
-  Measured on Windows against a client streaming a chunked body at an https handler that
-  answers `413` and destroys at once: Node cuts the client off after 2 MB (server peak RSS
-  49 MB), oam after 118 MB (peak 132 MB). The cap and the global body budget still hold, and
-  a body that DECLARES itself over the cap is refused before the handler. An `http` server
-  streams the body to the handler and matches Node (413 after 4 MB, peak 32 MB); `https`
-  joins it with slice 3 of `docs/design/streaming-bodies.md`.
+  request aborts with `ECONNRESET`, as in Node. On the HTTP/1 side of `http2.createServer`
+  the body is read before the handler runs, so a body refused as malformed reaches no
+  handler (Node runs it on the headers, and its request aborts); an `https` server now
+  streams the body and dispatches the handler on the head, as node and oam's `http` server
+  do, so an https handler answers (and cuts) an upload before it finishes (#203).
 - A chunked body's trailer fields are in `req.trailers` and `req.rawTrailers` once the
   body has ended, combined as Node combines them, but `rawTrailers` has the names
   lowercased and a repeated name's values side by side.
@@ -1784,9 +1787,10 @@ target). The parser underneath is hyper's, so some heads still get a different a
   chunked) is an ordinary request; Node hands those bytes to the listener as `head`. When
   an upgrade or CONNECT arrives in the same read as an earlier request on the connection,
   oam answers the earlier one first; Node hands the socket over before that answer is
-  written, and it is lost. `https` servers and the HTTP/1 side of `http2.createServer`
-  serve an upgrade request as an ordinary one whatever the listeners, and close a CONNECT
-  (Node hands either to its listener, when there is one).
+  written, and it is lost. The HTTP/1 side of `http2.createServer` serves an upgrade request
+  as an ordinary one whatever the listeners, and closes a CONNECT (Node hands either to its
+  listener, when there is one); an `https` server hands an upgrade or CONNECT to its
+  `'upgrade'` / `'connect'` listener with a `tls.TLSSocket`, as node does (#205).
 - A server's `maxHeaderSize` and `insecureHTTPParser` are read when it starts listening;
   Node reads them for each new connection, so changing them on a listening server takes
   effect there and not here.

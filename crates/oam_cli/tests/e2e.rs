@@ -23889,6 +23889,161 @@ fn http_upgrade_event_fires_with_socket() {
     assert!(stdout.contains("got_body: true"), "stdout: {stdout}");
 }
 
+#[test]
+fn https_upgrade_hands_a_tls_socket() {
+    // #205: an https server fires 'upgrade' and hands the connection to the
+    // listener as a tls.TLSSocket (encrypted), writable both ways over the
+    // decrypted stream -- the client's post-upgrade bytes reach the listener
+    // and its reply reaches the client.
+    let src = format!(
+        r#"import https from 'node:https';
+import tls from 'node:tls';
+const cert = `{cert}`;
+const key = `{key}`;
+const server = https.createServer({{ cert, key }}, (req, res) => res.end('normal'));
+server.on('upgrade', (req, socket) => {{
+  console.log('upgrade_url:', req.url);
+  console.log('upgrade_hdr:', req.headers['upgrade']);
+  console.log('is_tls:', socket instanceof tls.TLSSocket);
+  console.log('encrypted:', socket.encrypted === true);
+  socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
+  socket.on('data', (d) => socket.write('echo:' + d.toString()));
+}});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const client = tls.connect({{ port, host: '127.0.0.1', rejectUnauthorized: false }}, () => {{
+  client.write('GET /wss-test HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
+}});
+let data = '';
+let sent = false;
+await new Promise((resolve) => {{
+  const done = setTimeout(resolve, 5000);
+  client.on('data', (chunk) => {{
+    data += chunk.toString();
+    if (!sent && data.includes('101')) {{ sent = true; client.write('CLIENTPING'); }}
+    if (data.includes('echo:CLIENTPING')) {{ clearTimeout(done); resolve(); }}
+  }});
+  client.on('error', () => {{ clearTimeout(done); resolve(); }});
+}});
+console.log('got_101:', data.includes('101'));
+console.log('got_echo:', data.includes('echo:CLIENTPING'));
+client.destroy();
+server.close();
+"#,
+        cert = TLS_TEST_CERT,
+        key = TLS_TEST_KEY,
+    );
+    let stdout = run_ok("https_upgrade.mjs", &src);
+    assert!(
+        stdout.contains("upgrade_url: /wss-test"),
+        "stdout: {stdout}"
+    );
+    assert!(
+        stdout.contains("upgrade_hdr: websocket"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("is_tls: true"), "stdout: {stdout}");
+    assert!(stdout.contains("encrypted: true"), "stdout: {stdout}");
+    assert!(stdout.contains("got_101: true"), "stdout: {stdout}");
+    assert!(stdout.contains("got_echo: true"), "stdout: {stdout}");
+}
+
+#[test]
+fn https_connect_hands_a_tls_socket() {
+    // #205: an https server fires 'connect' for a CONNECT and hands the tunnel
+    // over as a tls.TLSSocket.
+    let src = format!(
+        r#"import https from 'node:https';
+import tls from 'node:tls';
+const cert = `{cert}`;
+const key = `{key}`;
+const server = https.createServer({{ cert, key }}, (req, res) => res.end('normal'));
+server.on('connect', (req, socket) => {{
+  console.log('connect_url:', req.url);
+  console.log('is_tls:', socket instanceof tls.TLSSocket);
+  socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+  socket.on('data', (d) => socket.write('tun:' + d.toString()));
+}});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const client = tls.connect({{ port, host: '127.0.0.1', rejectUnauthorized: false }}, () => {{
+  client.write('CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n');
+}});
+let data = '';
+let sent = false;
+await new Promise((resolve) => {{
+  const done = setTimeout(resolve, 5000);
+  client.on('data', (chunk) => {{
+    data += chunk.toString();
+    if (!sent && data.includes('200')) {{ sent = true; client.write('HELLO'); }}
+    if (data.includes('tun:HELLO')) {{ clearTimeout(done); resolve(); }}
+  }});
+  client.on('error', () => {{ clearTimeout(done); resolve(); }});
+}});
+console.log('got_200:', data.includes('200 Connection Established'));
+console.log('got_tunnel:', data.includes('tun:HELLO'));
+client.destroy();
+server.close();
+"#,
+        cert = TLS_TEST_CERT,
+        key = TLS_TEST_KEY,
+    );
+    let stdout = run_ok("https_connect.mjs", &src);
+    assert!(
+        stdout.contains("connect_url: example.com:443"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("is_tls: true"), "stdout: {stdout}");
+    assert!(stdout.contains("got_200: true"), "stdout: {stdout}");
+    assert!(stdout.contains("got_tunnel: true"), "stdout: {stdout}");
+}
+
+#[test]
+fn https_flushes_a_keep_alive_response_before_an_upgrade() {
+    // #205 risk: a response written before an upgrade takeover on the same
+    // keep-alive connection must be encrypted and flushed at the socket level
+    // (through rustls), not lost when hyper's stream is taken out.
+    let src = format!(
+        r#"import https from 'node:https';
+import tls from 'node:tls';
+const cert = `{cert}`;
+const key = `{key}`;
+const server = https.createServer({{ cert, key }}, (req, res) => res.end('first-response'));
+server.on('upgrade', (req, socket) => {{
+  socket.write('HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n');
+}});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const client = tls.connect({{ port, host: '127.0.0.1', rejectUnauthorized: false }}, () => {{
+  client.write('GET /first HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n');
+}});
+let data = '';
+let upgraded = false;
+await new Promise((resolve) => {{
+  const done = setTimeout(resolve, 5000);
+  client.on('data', (chunk) => {{
+    data += chunk.toString();
+    if (!upgraded && data.includes('first-response')) {{
+      upgraded = true;
+      client.write('GET /up HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n');
+    }}
+    if (data.includes('101')) {{ clearTimeout(done); resolve(); }}
+  }});
+  client.on('error', () => {{ clearTimeout(done); resolve(); }});
+}});
+console.log('got_first:', data.includes('first-response'));
+console.log('got_101:', data.includes('101'));
+client.destroy();
+server.close();
+"#,
+        cert = TLS_TEST_CERT,
+        key = TLS_TEST_KEY,
+    );
+    let stdout = run_ok("https_flush_upgrade.mjs", &src);
+    assert!(stdout.contains("got_first: true"), "stdout: {stdout}");
+    assert!(stdout.contains("got_101: true"), "stdout: {stdout}");
+}
+
 // ------------------------------------------------- fs stream e2e tests
 
 #[test]

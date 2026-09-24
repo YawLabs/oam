@@ -443,6 +443,10 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("tlsClientContext", op_tls_client_context),
         ("tlsClientContextFree", op_tls_client_context_free),
         ("tlsCaCertificates", op_tls_ca_certificates),
+        (
+            "tlsSetDefaultCaCertificates",
+            op_tls_set_default_ca_certificates
+        ),
         ("tlsCanonicalizeIp", op_tls_canonicalize_ip),
         // oam:permissions query surface
         ("permissionsQuery", op_permissions_query),
@@ -2981,6 +2985,27 @@ fn head_policy_args(
     policy
 }
 
+/// Reads node's `server.maxHeadersCount` (already resolved by JS: `1000` for
+/// the `null` default, `0` for no limit, else the value) from arg `at` and
+/// applies it to `policy`. Anything but a number `>= 0` leaves the process
+/// default -- so a caller that passes nothing keeps node's 1000-field cap.
+fn apply_max_headers_count(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    at: i32,
+    policy: &mut oam_core::http_head::HeadPolicy,
+) {
+    let value = args.get(at);
+    if value.is_number()
+        && let Some(n) = value.number_value(scope)
+        && n >= 0.0
+    {
+        // `as` saturates at u64::MAX, which header_field_limit treats as a cap
+        // no head reaches -- the same as node's very large counts.
+        policy.max_headers_count = n as u64;
+    }
+}
+
 /// A millisecond count JS passed: a finite number >= 0, truncated;
 /// anything else is `None`.
 fn ms_arg(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -> Option<u64> {
@@ -3157,9 +3182,11 @@ fn op_http_serve(
     let tcp = rt.tcp();
     let tcp_ids = rt.body_ids();
     // args 3, 4: maxHeaderSize, insecureHTTPParser.
-    let policy = head_policy_args(scope, &args, 3);
-    // args 5..=11: node's server timeouts.
+    let mut policy = head_policy_args(scope, &args, 3);
+    // args 5..=10: node's server timeouts.
     let timeouts = timeout_args(scope, &args, 5);
+    // arg 11: maxHeadersCount.
+    apply_max_headers_count(scope, &args, 11, &mut policy);
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -3547,15 +3574,32 @@ fn op_https_serve(
         return;
     };
     let state = core.http();
+    // The TLS handle store and the shared handle-id counter, for handing an
+    // upgrade / CONNECT connection to JS as a tls.TLSSocket (#205). Taken now,
+    // as the last use of `core`, so its borrow ends before the scope-mutating
+    // arg reads below.
+    let tls_registry = core.tls();
+    let body_ids = core.body_ids();
     // args 7, 8: maxHeaderSize, insecureHTTPParser.
-    let policy = head_policy_args(scope, &args, 7);
+    let mut policy = head_policy_args(scope, &args, 7);
     // args 9..=14: node's server timeouts.
     let timeouts = timeout_args(scope, &args, 9);
+    // arg 15: maxHeadersCount.
+    apply_max_headers_count(scope, &args, 15, &mut policy);
     let tls = std::sync::Arc::new(oam_core::http_server::HttpsTls::new(context, options));
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::http_server::https_serve(state, host, port, tls, policy, timeouts),
+        oam_core::http_server::https_serve(
+            state,
+            host,
+            port,
+            tls,
+            policy,
+            timeouts,
+            tls_registry,
+            body_ids,
+        ),
     );
 }
 
@@ -4836,7 +4880,16 @@ fn op_tls_ca_certificates(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let kind = arg_string(scope, &args, 0).unwrap_or_default();
-    let Some(pems) = oam_core::tls::roots::ca_certificates(&kind) else {
+    // `default` is served here only once `tls.setDefaultCACertificates` has
+    // replaced the store (#199); until then it returns undefined and the JS
+    // composes bundled + NODE_EXTRA_CA_CERTS. `bundled` / `extra` / `system`
+    // are the fixed lists.
+    let pems = if kind == "default" {
+        oam_core::tls::default_ca_override_pems()
+    } else {
+        oam_core::tls::roots::ca_certificates(&kind)
+    };
+    let Some(pems) = pems else {
         return;
     };
     let items: Vec<v8::Local<'_, v8::Value>> = pems
@@ -4845,6 +4898,32 @@ fn op_tls_ca_certificates(
         .collect();
     let array = v8::Array::new_with_elements(scope, &items);
     rv.set(array.into());
+}
+
+/// tlsSetDefaultCaCertificates(pems: string[]) -> the count of certificates
+/// kept, or -1 when the array has entries but none parse (the JS then throws
+/// `ERR_CRYPTO_OPERATION_FAILED`; a failed set leaves the store as it was).
+/// Replaces the process default trust store, `tls.setDefaultCACertificates`
+/// (Node 22.15+, #199). Argument-type validation is the JS layer's; each
+/// element reaches here as its PEM text.
+fn op_tls_set_default_ca_certificates(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let mut pems: Vec<String> = Vec::new();
+    if let Ok(arr) = v8::Local::<v8::Array>::try_from(args.get(0)) {
+        for i in 0..arr.length() {
+            if let Some(value) = arr.get_index(scope, i) {
+                pems.push(value.to_rust_string_lossy(scope));
+            }
+        }
+    }
+    let result = match oam_core::tls::set_default_ca_certificates(&pems) {
+        Some(count) => count as i32,
+        None => -1,
+    };
+    rv.set(v8::Integer::new(scope, result).into());
 }
 
 /// tlsCanonicalizeIp(text) -> Node's `canonicalizeIP`: the address as libuv

@@ -31,10 +31,12 @@ Trademark and governance transfer to a neutral foundation (OpenJS or independent
 ## Succession (bus-factor plan)
 
 If the founder is unable to continue: maintainers (or, before any exist, the most recent
-release's co-signers) gain admin on the GitHub org; DNS and signing keys are escrowed with
-instructions; the Covenant binds successors. This file is the authoritative statement.
+release's co-signers) gain admin on the GitHub org; DNS is escrowed with instructions, and
+release signing keys will be once code signing lands (see Releases); the Covenant binds
+successors. This file is the authoritative statement.
 
 ## Releases
 
 Release cadence, semver policy, and the behavior-change log are specified in RELIABILITY.md.
-Every release is signed; provenance (SLSA) attaches from the first public binary.
+Release binaries are currently unsigned and ship with a `SHA256SUMS` checksum file. Code
+signing and SLSA provenance are planned, not yet shipped; see SECURITY.md, "Release integrity".

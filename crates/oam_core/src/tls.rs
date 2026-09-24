@@ -344,6 +344,60 @@ pub fn extra_ca_certs() -> &'static ExtraCaCerts {
     })
 }
 
+/// The process default trust store once `tls.setDefaultCACertificates`
+/// replaces it (Node 22.15+). `None` until then: the bundled roots plus
+/// `NODE_EXTRA_CA_CERTS`, as `build_client_config` composes them. `Some` --
+/// even `Some(empty)`, which trusts nothing -- once set, and used for a
+/// connection with no `ca` of its own and read back by
+/// `tls.getCACertificates('default')`. Process-global runtime state, so a
+/// fresh `None` at every start. #199.
+static DEFAULT_CA_OVERRIDE: Mutex<Option<Vec<CertificateDer<'static>>>> = Mutex::new(None);
+
+/// Replace the process default trust store with `pems` (each parsed as PEM,
+/// duplicates dropped). `Err` -- the store left as it was -- when the array
+/// has entries but none parse (Node's `ERR_CRYPTO_OPERATION_FAILED`); an
+/// empty array is accepted and trusts nothing. `Some` is the count kept;
+/// `None` is Node's `ERR_CRYPTO_OPERATION_FAILED`. #199.
+pub fn set_default_ca_certificates(pems: &[String]) -> Option<usize> {
+    let mut certs: Vec<CertificateDer<'static>> = Vec::new();
+    for pem in pems {
+        for der in rustls_pemfile::certs(&mut BufReader::new(pem.as_bytes())).flatten() {
+            if !certs.iter().any(|kept| kept.as_ref() == der.as_ref()) {
+                certs.push(der);
+            }
+        }
+    }
+    if !pems.is_empty() && certs.is_empty() {
+        return None;
+    }
+    let count = certs.len();
+    *DEFAULT_CA_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(certs);
+    Some(count)
+}
+
+/// The process default trust store override, if one is set. #199.
+fn default_ca_override() -> Option<Vec<CertificateDer<'static>>> {
+    DEFAULT_CA_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// `tls.getCACertificates('default')`'s list once the store is replaced: the
+/// override's certificates as PEM (each with a trailing newline, as Node
+/// re-emits them), or `None` when no override is set (the JS layer then
+/// composes bundled + extra). #199.
+pub fn default_ca_override_pems() -> Option<Vec<String>> {
+    default_ca_override().map(|certs| {
+        certs
+            .iter()
+            .map(|cert| roots::pem_string(cert.as_ref()))
+            .collect()
+    })
+}
+
 /// Read one extra-CA bundle the way Node's `AddCertsFromFile` does: every
 /// certificate up to the first section that will not decode is kept, and
 /// that section (or a file that could not be opened) becomes the warning.
@@ -1232,6 +1286,16 @@ fn build_client_config(
                 .map_err(|e| format!("ca cert add: {e}"))?;
         }
         (certs, extras.certs.clone())
+    } else if let Some(override_certs) = default_ca_override() {
+        // `tls.setDefaultCACertificates` replaced the process store (#199): a
+        // connection with no `ca` of its own trusts exactly these -- an empty
+        // override trusting nothing -- in place of the bundled roots and
+        // NODE_EXTRA_CA_CERTS. A self-signed one anchors a chain; every one
+        // is trusted by name as a leaf, as the `ca` option's are.
+        for cert in override_certs.iter().filter(|c| is_self_signed(c.as_ref())) {
+            let _ = root_store.add(cert.clone());
+        }
+        (override_certs, Vec::new())
     } else {
         root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         for cert in extras.certs.iter().filter(|c| is_self_signed(c.as_ref())) {

@@ -97,6 +97,15 @@ whole of it.
     new private function, `authority_from_host`, and one line after the
     existing `strip_connection_headers` call. See "The host field on h2"
     below.
+11. **`src/proto/h1/role.rs`, `Server::parse`.** The request-head parser
+    allocates its header buffer on demand instead of the full `max_headers`
+    upfront. oam raises a server's `max_headers` to a large byte-derived cap
+    (so a head is refused on its size, like node, not on a field count), and
+    the stock code heap-allocated that whole cap on every parse. It now starts
+    with the inline capacity and grows -- re-parsing the buffered head -- only
+    when a head carries more fields, up to the cap; the cap still bounds it, so
+    the accept/reject boundary is unchanged and hyper's own `max_headers` tests
+    still hold. See "On-demand header buffer" below.
 
 ## Why
 
@@ -357,6 +366,29 @@ All counts below are from 2026-09-18.
   - patched: 0 hung.
 - A single process sending 20,000 such fetches, 6 runs: before the patch 3
   and 6 of 6 hung (two passes); patched: 0.
+
+## On-demand header buffer (item 11)
+
+`Server::parse` sizes two `SmallVec`s to hold the head's parsed headers -- one
+of `httparse::Header`, one of `HeaderIndices`. Stock 1.10.1 sizes them to
+`h1_max_headers` when it is set (`Some(cap) => smallvec![uninit; cap]`) and to
+the inline `DEFAULT_MAX_HEADERS` (100) otherwise. oam sets `max_headers` from
+the server's `maxHeaderSize` byte budget -- thousands of fields -- so a head is
+refused on its size the way node's is, not at a 100-field wall. With the stock
+allocation that would heap-allocate thousands of slots on *every* request head,
+including the overwhelming majority that carry a handful of fields.
+
+The patch starts each parse with `DEFAULT_MAX_HEADERS.min(hard_cap)` slots (the
+inline 100, so no heap for the common head) and, on `httparse::Error::
+TooManyHeaders` while the buffer is still under the cap, doubles it -- up to the
+cap -- and re-parses the buffered head. `hard_cap` is `h1_max_headers.unwrap_or
+(DEFAULT_MAX_HEADERS)`, so the accept/reject boundary is exactly what it was:
+`None` still rejects past 100, `Some(0)` rejects any header, `Some(n)` accepts
+up to `n`. The re-parse reads the same buffered bytes (nothing is consumed until
+after the loop), and only a head that overflows 100 fields pays for the growth.
+No new `unsafe`: the uninitialized slots are still read only up to the count
+httparse reported. hyper's own `Server::parse` header tests (default 100, a
+limit of 0, a limit of 200) exercise the boundary and still pass.
 
 ## Upstream status (checked 2026-09-18)
 
