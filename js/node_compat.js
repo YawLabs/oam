@@ -16678,16 +16678,56 @@
     }
 
 
-    const sync = (format, compress) => (data, options) =>
-      asBuffer(natives.zlibSync(toBytes(data), format, levelOf(options), compress));
+    // node's checkRangesOrGetDefault for options.maxOutputLength: undefined and
+    // NaN mean "no cap" (kMaxLength), a non-number is ERR_INVALID_ARG_TYPE,
+    // Infinity is "a finite number", anything outside 1..kMaxLength is
+    // ERR_OUT_OF_RANGE. Fractions pass (node compares the finished buffer to
+    // the raw value). Returned as undefined when there is no cap, so the
+    // native op reads "no argument".
+    const K_MAX_LENGTH = 9007199254740991;
+    const maxOutputLengthOf = (options) => {
+      const value = options?.maxOutputLength;
+      if (value === undefined || Number.isNaN(value)) return undefined;
+      const name = "options.maxOutputLength";
+      if (!Number.isFinite(value)) {
+        if (typeof value !== "number") throw codes.ERR_INVALID_ARG_TYPE(name, "number", value);
+        throw codes.ERR_OUT_OF_RANGE(name, "a finite number", value);
+      }
+      if (value < 1 || value > K_MAX_LENGTH) {
+        throw codes.ERR_OUT_OF_RANGE(name, ">= 1 and <= " + K_MAX_LENGTH, value);
+      }
+      return value;
+    };
+    // The native op reports an output past the cap with exactly this message
+    // (oam_core::zlib::OUTPUT_TOO_LARGE); node raises ERR_BUFFER_TOO_LARGE
+    // naming the caller's value.
+    const OUTPUT_TOO_LARGE = "zlib output exceeds maxOutputLength";
+    const bufferTooLarge = (max) => {
+      const err = new RangeError("Cannot create a Buffer larger than " + max + " bytes");
+      applyNodeErrorShape(err, "ERR_BUFFER_TOO_LARGE");
+      return err;
+    };
+    const translate = (err, max) =>
+      err instanceof Error && err.message === OUTPUT_TOO_LARGE ? bufferTooLarge(max) : err;
+
+    const sync = (format, compress) => (data, options) => {
+      const max = maxOutputLengthOf(options);
+      try {
+        return asBuffer(natives.zlibSync(toBytes(data), format, levelOf(options), compress, max));
+      } catch (err) {
+        throw translate(err, max);
+      }
+    };
     const callbackForm = (format, compress) => (data, options, callback) => {
       if (typeof options === "function") {
         callback = options;
         options = undefined;
       }
-      natives.zlibAsync(toBytes(data), format, levelOf(options), compress).then(
+      // Validation throws synchronously, as node's does.
+      const max = maxOutputLengthOf(options);
+      natives.zlibAsync(toBytes(data), format, levelOf(options), compress, max).then(
         (bytes) => callback(null, asBuffer(bytes)),
-        (err) => callback(err),
+        (err) => callback(translate(err, max)),
       );
     };
 

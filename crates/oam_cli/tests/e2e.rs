@@ -22801,7 +22801,7 @@ fn compile_produces_standalone_binary_that_runs() {
 
 // bug: oam never set require.main, so `if (require.main === module) main()`
 // was false everywhere and a script built on it ran nothing and exited 0.
-// Conformance case 177 holds the node-comparable entry paths to node; these
+// Conformance case 191 holds the node-comparable entry paths to node; these
 // two are oam's own -- a compiled executable's embedded script, and each file
 // `oam test` runs -- so node has nothing to compare them against.
 #[test]
