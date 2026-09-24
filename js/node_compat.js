@@ -27903,6 +27903,32 @@
       }
     }
 
+    // Helpers the cleartext server, the secure server and the client share
+    // -- one copy at the factory's top (#201). The nghttp2 error codes, the
+    // sensitive-headers symbol, the coded-error builder (`code`, `message`,
+    // then the error class -- the client's argument order, the whole
+    // factory's now, and node's coded shape for the message and stack), and
+    // the HTTP/1 connection-header rule the request and response validation
+    // both apply.
+    const NGHTTP2_NO_ERROR = 0;
+    const NGHTTP2_INTERNAL_ERROR = 2;
+    const NGHTTP2_CANCEL = 8;
+    const kSensitiveHeaders = Symbol.for("nodejs.http2.sensitiveHeaders");
+    function h2Error(code, message, Base) {
+      return applyNodeErrorShape(new (Base || Error)(message), code);
+    }
+    function illegalConnectionHeader(name, value) {
+      switch (name) {
+        case "connection": case "upgrade": case "http2-settings":
+        case "keep-alive": case "proxy-connection": case "transfer-encoding":
+          return true;
+        case "te":
+          return value !== "trailers";
+        default:
+          return false;
+      }
+    }
+
     class ServerHttp2Stream extends Duplex {
       constructor(requestId, inHeaders) {
         // The http2 layer manages this stream's close lifecycle; opt out of
@@ -28130,37 +28156,30 @@
       const kTrailers = Symbol("kTrailers");
       const kStream = Symbol("kStream");
       const kAborted = Symbol("kAborted");
-      const kSensitiveHeaders = Symbol.for("nodejs.http2.sensitiveHeaders");
-      const NGHTTP2_NO_ERROR = 0;
-      const NGHTTP2_INTERNAL_ERROR = 2;
-      const NGHTTP2_CANCEL = 8;
       const STREAM_FLAGS_END_STREAM = 0x1;
       const STREAM_FLAGS_END_HEADERS = 0x4;
 
-      function h2Error(Base, code, message) {
-        return applyNodeErrorShape(new Base(message), code);
-      }
       const h2Errors = {
-        noSocketManipulation: () => h2Error(Error, "ERR_HTTP2_NO_SOCKET_MANIPULATION",
-          "HTTP/2 sockets should not be directly manipulated (e.g. read and written)"),
-        headersSent: () => h2Error(Error, "ERR_HTTP2_HEADERS_SENT", "Response has already been initiated."),
-        invalidStream: () => h2Error(Error, "ERR_HTTP2_INVALID_STREAM", "The stream has been destroyed"),
-        pushDisabled: () => h2Error(Error, "ERR_HTTP2_PUSH_DISABLED", "HTTP/2 client has disabled push streams"),
-        statusInvalid: (code) => h2Error(RangeError, "ERR_HTTP2_STATUS_INVALID", "Invalid status code: " + code),
-        infoStatusNotAllowed: () => h2Error(RangeError, "ERR_HTTP2_INFO_STATUS_NOT_ALLOWED",
-          "Informational status codes cannot be used"),
-        connectionHeaders: (name) => h2Error(TypeError, "ERR_HTTP2_INVALID_CONNECTION_HEADERS",
-          'HTTP/1 Connection specific headers are forbidden: "' + name + '"'),
-        pseudoHeader: (name) => h2Error(TypeError, "ERR_HTTP2_INVALID_PSEUDOHEADER",
-          '"' + name + '" is an invalid pseudoheader or is used incorrectly'),
-        singleValue: (name) => h2Error(TypeError, "ERR_HTTP2_HEADER_SINGLE_VALUE",
-          'Header field "' + name + '" must only have a single value'),
-        pseudoNotAllowed: () => h2Error(TypeError, "ERR_HTTP2_PSEUDOHEADER_NOT_ALLOWED",
-          "Cannot set HTTP/2 pseudo-headers"),
-        headerValue: (value, name) => h2Error(TypeError, "ERR_HTTP2_INVALID_HEADER_VALUE",
-          'Invalid value "' + value + '" for header "' + name + '"'),
-        httpToken: (name) => h2Error(TypeError, "ERR_INVALID_HTTP_TOKEN",
-          'Header name must be a valid HTTP token ["' + name + '"]'),
+        noSocketManipulation: () => h2Error("ERR_HTTP2_NO_SOCKET_MANIPULATION",
+          "HTTP/2 sockets should not be directly manipulated (e.g. read and written)", Error),
+        headersSent: () => h2Error("ERR_HTTP2_HEADERS_SENT", "Response has already been initiated.", Error),
+        invalidStream: () => h2Error("ERR_HTTP2_INVALID_STREAM", "The stream has been destroyed", Error),
+        pushDisabled: () => h2Error("ERR_HTTP2_PUSH_DISABLED", "HTTP/2 client has disabled push streams", Error),
+        statusInvalid: (code) => h2Error("ERR_HTTP2_STATUS_INVALID", "Invalid status code: " + code, RangeError),
+        infoStatusNotAllowed: () => h2Error("ERR_HTTP2_INFO_STATUS_NOT_ALLOWED",
+          "Informational status codes cannot be used", RangeError),
+        connectionHeaders: (name) => h2Error("ERR_HTTP2_INVALID_CONNECTION_HEADERS",
+          'HTTP/1 Connection specific headers are forbidden: "' + name + '"', TypeError),
+        pseudoHeader: (name) => h2Error("ERR_HTTP2_INVALID_PSEUDOHEADER",
+          '"' + name + '" is an invalid pseudoheader or is used incorrectly', TypeError),
+        singleValue: (name) => h2Error("ERR_HTTP2_HEADER_SINGLE_VALUE",
+          'Header field "' + name + '" must only have a single value', TypeError),
+        pseudoNotAllowed: () => h2Error("ERR_HTTP2_PSEUDOHEADER_NOT_ALLOWED",
+          "Cannot set HTTP/2 pseudo-headers", TypeError),
+        headerValue: (value, name) => h2Error("ERR_HTTP2_INVALID_HEADER_VALUE",
+          'Invalid value "' + value + '" for header "' + name + '"', TypeError),
+        httpToken: (name) => h2Error("ERR_INVALID_HTTP_TOKEN",
+          'Header name must be a valid HTTP token ["' + name + '"]', TypeError),
       };
 
       // node's kSingleValueHeaders (lib/internal/http2/util.js).
@@ -28178,17 +28197,6 @@
       ]);
       const kHttpToken = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
       // node's isIllegalConnectionSpecificHeader.
-      function illegalConnectionHeader(name, value) {
-        switch (name) {
-          case "connection": case "upgrade": case "http2-settings":
-          case "keep-alive": case "proxy-connection": case "transfer-encoding":
-            return true;
-          case "te":
-            return value !== "trailers";
-          default:
-            return false;
-        }
-      }
       function utcDate() {
         return new Date().toUTCString();
       }
@@ -28467,8 +28475,8 @@
         additionalHeaders(headers) {
           if (this.destroyed || this._closed) throw h2Errors.invalidStream();
           if (this._responded) {
-            throw h2Error(Error, "ERR_HTTP2_HEADERS_AFTER_RESPOND",
-              "Cannot specify additional headers after response initiated");
+            throw h2Error("ERR_HTTP2_HEADERS_AFTER_RESPOND",
+              "Cannot specify additional headers after response initiated", Error);
           }
         }
         respond(headersParam, options) {
@@ -28641,8 +28649,8 @@
           return this;
         }
         sendTrailers() {
-          throw h2Error(Error, "ERR_HTTP2_TRAILERS_NOT_READY",
-            "Trailing headers cannot be sent until after the wantTrailers event is emitted");
+          throw h2Error("ERR_HTTP2_TRAILERS_NOT_READY",
+            "Trailing headers cannot be sent until after the wantTrailers event is emitted", Error);
         }
       }
 
@@ -29201,8 +29209,8 @@
           if (this._destroyed) return;
           if (typeof error === "number") {
             code = error;
-            error = code !== NGHTTP2_NO_ERROR ? h2Error(Error, "ERR_HTTP2_SESSION_ERROR",
-              "Session closed with error code " + code) : undefined;
+            error = code !== NGHTTP2_NO_ERROR ? h2Error("ERR_HTTP2_SESSION_ERROR",
+              "Session closed with error code " + code, Error) : undefined;
           }
           this._destroyed = true;
           this._closed = true;
@@ -29391,9 +29399,6 @@
     // anything itself. (The client used to be one fetch per stream over the
     // shared fetch transport, which ignored every connect option and never
     // opened the session's own connection.)
-    const NGHTTP2_NO_ERROR = 0;
-    const NGHTTP2_INTERNAL_ERROR = 2;
-    const NGHTTP2_CANCEL = 8;
     const NGHTTP2_SESSION_CLIENT = 1;
     const NGHTTP2_ERROR_NAMES = [
       "NGHTTP2_NO_ERROR", "NGHTTP2_PROTOCOL_ERROR", "NGHTTP2_INTERNAL_ERROR",
@@ -29403,15 +29408,9 @@
       "NGHTTP2_INADEQUATE_SECURITY", "NGHTTP2_HTTP_1_1_REQUIRED",
     ];
     const kBoundSession = Symbol("kBoundSession");
-    const kSensitiveHeaders = Symbol.for("nodejs.http2.sensitiveHeaders");
     const VALID_PSEUDO_HEADERS = new Set([":status", ":method", ":authority", ":scheme", ":path", ":protocol"]);
     const NO_PAYLOAD_METHODS = new Set(["DELETE", "GET", "HEAD"]);
 
-    function h2Error(code, message, Base) {
-      var err = new (Base || Error)(message);
-      err.code = code;
-      return err;
-    }
     // node's ERR_HTTP2_STREAM_CANCEL: the error a pending stream is destroyed
     // with when its session goes down, naming (and carrying) the cause.
     function streamCancelError(cause) {
@@ -29511,9 +29510,7 @@
         var values = Array.isArray(value) ? value : [value];
         for (var j = 0; j < values.length; j++) {
           var text = String(values[j]);
-          if (key === "connection" || key === "upgrade" || key === "http2-settings" ||
-              key === "keep-alive" || key === "proxy-connection" || key === "transfer-encoding" ||
-              (key === "te" && text !== "trailers")) {
+          if (illegalConnectionHeader(key, text)) {
             throw h2Error("ERR_HTTP2_INVALID_CONNECTION_HEADERS", 'HTTP/1 Connection specific headers are forbidden: "' + key + '"', TypeError);
           }
           list.push([key, text]);
