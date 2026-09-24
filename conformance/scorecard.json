@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "5f2fc90+wip",
+  "commit": "0f615bf+wip",
   "oamVersion": "oam 0.16.4",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 179,
-      "total": 179,
+      "pass": 180,
+      "total": 180,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -404,6 +404,10 @@
         },
         {
           "case": "188-https-module-exports.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "189-https-server-upgrade-connect.mjs",
           "status": "pass"
         },
         {

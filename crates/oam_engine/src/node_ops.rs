@@ -3574,6 +3574,12 @@ fn op_https_serve(
         return;
     };
     let state = core.http();
+    // The TLS handle store and the shared handle-id counter, for handing an
+    // upgrade / CONNECT connection to JS as a tls.TLSSocket (#205). Taken now,
+    // as the last use of `core`, so its borrow ends before the scope-mutating
+    // arg reads below.
+    let tls_registry = core.tls();
+    let body_ids = core.body_ids();
     // args 7, 8: maxHeaderSize, insecureHTTPParser.
     let mut policy = head_policy_args(scope, &args, 7);
     // args 9..=14: node's server timeouts.
@@ -3584,7 +3590,16 @@ fn op_https_serve(
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::http_server::https_serve(state, host, port, tls, policy, timeouts),
+        oam_core::http_server::https_serve(
+            state,
+            host,
+            port,
+            tls,
+            policy,
+            timeouts,
+            tls_registry,
+            body_ids,
+        ),
     );
 }
 

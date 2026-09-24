@@ -1767,9 +1767,10 @@ target). The parser underneath is hyper's, so some heads still get a different a
   chunked) is an ordinary request; Node hands those bytes to the listener as `head`. When
   an upgrade or CONNECT arrives in the same read as an earlier request on the connection,
   oam answers the earlier one first; Node hands the socket over before that answer is
-  written, and it is lost. `https` servers and the HTTP/1 side of `http2.createServer`
-  serve an upgrade request as an ordinary one whatever the listeners, and close a CONNECT
-  (Node hands either to its listener, when there is one).
+  written, and it is lost. The HTTP/1 side of `http2.createServer` serves an upgrade request
+  as an ordinary one whatever the listeners, and closes a CONNECT (Node hands either to its
+  listener, when there is one); an `https` server hands an upgrade or CONNECT to its
+  `'upgrade'` / `'connect'` listener with a `tls.TLSSocket`, as node does (#205).
 - A server's `maxHeaderSize` and `insecureHTTPParser` are read when it starts listening;
   Node reads them for each new connection, so changing them on a listening server takes
   effect there and not here.
