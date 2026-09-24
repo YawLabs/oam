@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "67c8d7b+wip",
+  "commit": "5f2fc90+wip",
   "oamVersion": "oam 0.16.4",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 178,
-      "total": 178,
+      "pass": 179,
+      "total": 179,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -400,6 +400,10 @@
         },
         {
           "case": "187-https-server-streams-request-body.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "188-https-module-exports.mjs",
           "status": "pass"
         },
         {
@@ -887,20 +891,6 @@
             "names": [
               "Dirent",
               "_globAsPromise"
-            ]
-          },
-          {
-            "module": "https",
-            "names": [
-              "ClientRequest",
-              "IncomingMessage",
-              "METHODS",
-              "OutgoingMessage",
-              "STATUS_CODES",
-              "ServerResponse",
-              "maxHeaderSize",
-              "validateHeaderName",
-              "validateHeaderValue"
             ]
           },
           {
