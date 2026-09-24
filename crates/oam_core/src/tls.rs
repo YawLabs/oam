@@ -624,7 +624,7 @@ fn named_refusal(reason: &CertificateError) -> Option<VerifyFailure> {
 
 /// Where the verifier leaves its verdict for `tls_connect` to read after
 /// the handshake: None means the certificate was accepted.
-type VerifySlot = Arc<Mutex<Option<VerifyFailure>>>;
+type VerifySlot = Arc<Mutex<Option<(VerifyFailure, Vec<Vec<u8>>)>>>;
 
 /// rustls's webpki verification plus Node's departures from it.
 #[derive(Debug)]
@@ -685,7 +685,21 @@ impl ServerCertVerifier for NodeCertVerifier {
         let verdict = self.verdict(end_entity, intermediates, server_name, now);
         *self.outcome.lock().unwrap_or_else(|e| e.into_inner()) = match &verdict {
             Ok(()) => None,
-            Err((failure, _)) => Some(failure.clone()),
+            Err((failure, _)) => {
+                // Only a name refusal carries the peer certificate to Node's
+                // `err.cert`; a chain-build failure leaves it `{}` (measured
+                // on v22.22.2). Carry the chain the connect path builds it
+                // from, alongside the failure so `VerifyFailure` -- returned
+                // by value from `verdict` -- stays small (#198).
+                let chain = if failure.code == Some("ERR_TLS_CERT_ALTNAME_INVALID") {
+                    std::iter::once(end_entity.as_ref().to_vec())
+                        .chain(intermediates.iter().map(|c| c.as_ref().to_vec()))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                Some((failure.clone(), chain))
+            }
         };
         match verdict {
             Ok(()) => Ok(ServerCertVerified::assertion()),
@@ -1465,6 +1479,32 @@ pub(crate) fn peer_certificates_b64(
     )
 }
 
+/// The base64 chains Node's `getPeerCertificate(true)` is built from for a
+/// peer that presented `chain`: its own certificates (`peerCertificates`,
+/// leaf first) and, from the last one, the issuers the context's store holds
+/// (`storeIssuers` -- the `ca` option, or the default store, plus a pfx's
+/// CAs). Shared by the accepted path and the name-refusal path (#198).
+pub(crate) fn peer_cert_payload(
+    chain: &[CertificateDer<'static>],
+    ca_pem: Option<&str>,
+    identity: Option<&ClientContext>,
+) -> (Vec<String>, Vec<String>) {
+    let peer = peer_certificates_b64(Some(chain)).unwrap_or_default();
+    let ca = ca_pem.map(|pem| server::ca_certificates(&[pem.to_string()]));
+    let mut store: Vec<&CertificateDer<'static>> = match &ca {
+        Some(ca) => ca.iter().collect(),
+        None => chain::default_store().iter().collect(),
+    };
+    if let Some(identity) = identity {
+        store.extend(identity.pfx_cas.iter());
+    }
+    let issuers = chain::store_issuers(chain, &store, chain::unix_now());
+    (
+        peer,
+        peer_certificates_b64(Some(&issuers)).unwrap_or_default(),
+    )
+}
+
 /// tls.connect: TCP connect + TLS handshake.
 /// Returns Json {handle, protocol, cipher, cipherStandardName, authorized,
 /// authorizationError, alpnProtocol, ephemeralKeyInfo?, peerCertificates?,
@@ -1676,12 +1716,27 @@ where
         Ok(s) => s,
         Err(e) => {
             if reject_unauthorized
-                && let Some(VerifyFailure {
-                    code: Some(code),
-                    message,
-                }) = verdict.lock().unwrap_or_else(|e| e.into_inner()).take()
+                && let Some((failure, peer_chain)) =
+                    verdict.lock().unwrap_or_else(|e| e.into_inner()).take()
+                && let Some(code) = failure.code
             {
-                return Err(OpOutcome::node_failed(code, message));
+                // A refused name reports the peer certificate as Node's
+                // `err.cert` (#198): the chain the verifier held and the
+                // store's issuers of it, the same base64 the accepted path
+                // sends, for the JS side's `getPeerCertificate(true)`.
+                if !peer_chain.is_empty() {
+                    let chain: Vec<CertificateDer<'static>> =
+                        peer_chain.into_iter().map(CertificateDer::from).collect();
+                    let (peer_certificates, store_issuers) =
+                        peer_cert_payload(&chain, ca_pem, identity);
+                    return Err(OpOutcome::NodeCertRefused {
+                        code: code.to_string(),
+                        message: failure.message,
+                        peer_certificates,
+                        store_issuers,
+                    });
+                }
+                return Err(OpOutcome::node_failed(code, failure.message));
             }
             // A fatal alert answering the handshake: Node's code for it
             // (#196). The transport going away instead: Node's disconnect
@@ -1731,13 +1786,20 @@ where
     // when it has none), null on an accepted certificate.
     let authorization_error = match &failure {
         None => serde_json::Value::Null,
-        Some(VerifyFailure {
-            code: Some(code), ..
-        }) => serde_json::Value::from(*code),
-        Some(VerifyFailure {
-            code: None,
-            message,
-        }) => serde_json::Value::from(message.as_str()),
+        Some((
+            VerifyFailure {
+                code: Some(code), ..
+            },
+            _,
+        )) => serde_json::Value::from(*code),
+        Some((
+            VerifyFailure {
+                code: None,
+                message,
+                ..
+            },
+            _,
+        )) => serde_json::Value::from(message.as_str()),
     };
     let mut payload = serde_json::json!({
         "protocol": protocol,
@@ -1758,16 +1820,8 @@ where
     // (GetLastIssuedCert): the `ca` certificates, or the default store, and
     // a pfx's CAs.
     if let Some(chain) = client_conn.peer_certificates() {
-        let ca = ca_pem.map(|pem| server::ca_certificates(&[pem.to_string()]));
-        let mut store: Vec<&CertificateDer<'static>> = match &ca {
-            Some(ca) => ca.iter().collect(),
-            None => chain::default_store().iter().collect(),
-        };
-        if let Some(identity) = identity {
-            store.extend(identity.pfx_cas.iter());
-        }
-        let issuers = chain::store_issuers(chain, &store, chain::unix_now());
-        if let Some(issuers) = peer_certificates_b64(Some(&issuers)) {
+        let (_, issuers) = peer_cert_payload(chain, ca_pem, identity);
+        if !issuers.is_empty() {
             payload["storeIssuers"] = serde_json::Value::from(issuers);
         }
     }
@@ -2989,13 +3043,21 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         // Trusted by name but presented for the wrong host: Node's
         // checkServerIdentity error, with its exact message (this
         // certificate has no SAN, so the CN is what it is matched against).
+        // The refusal carries the peer certificate out, for Node's err.cert
+        // (#198): a `NodeCertRefused` whose `peer_certificates` is the leaf.
         match connect(Some(CERT), true, "example.com").await {
-            OpOutcome::NodeFailed { code, message, .. } => {
+            OpOutcome::NodeCertRefused {
+                code,
+                message,
+                peer_certificates,
+                ..
+            } => {
                 assert_eq!(code, "ERR_TLS_CERT_ALTNAME_INVALID");
                 assert_eq!(
                     message,
                     "Hostname/IP does not match certificate's altnames: Host: example.com. is not cert's CN: localhost"
                 );
+                assert_eq!(peer_certificates.len(), 1, "the leaf it refused");
             }
             other => panic!("expected a hostname rejection, got {other:?}"),
         }

@@ -787,6 +787,34 @@ pub(crate) fn settle_completion(
             let error = v8::Local::new(tc, &error);
             resolver.reject(tc, error);
         }
+        // A TLS certificate refusal carrying the peer's chain (#198): the same
+        // coded error a `NodeFailed` builds, with the two base64 chains hung
+        // on it for tls.connect's JS to read into the socket before it builds
+        // `err.cert`. The JS deletes them, so the error's own keys stay node's.
+        OpOutcome::NodeCertRefused {
+            code,
+            message,
+            peer_certificates,
+            store_issuers,
+        } => {
+            let fields = SysFields {
+                code: &code,
+                message: &message,
+                errno: None,
+                syscall: None,
+                path: None,
+                hostname: None,
+                address: None,
+                port: None,
+            };
+            let error = sys_error(tc, &fields);
+            let error = v8::Local::new(tc, &error);
+            if let Ok(obj) = v8::Local::<v8::Object>::try_from(error) {
+                set_string_array(tc, obj, "peerCertificates", &peer_certificates);
+                set_string_array(tc, obj, "storeIssuers", &store_issuers);
+            }
+            resolver.reject(tc, error);
+        }
         // The error a synchronous gate throws, rejected instead: a refusal
         // the op raised mid-flight must read exactly like one raised at entry.
         OpOutcome::AccessDenied(denial) => {
@@ -849,6 +877,26 @@ fn locked_factory<'s>(
 fn clear_factory_throw(tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>) {
     if tc.has_caught() && !tc.has_terminated() {
         tc.reset();
+    }
+}
+
+/// Set a string array as an own data property on an error object -- the
+/// base64 certificate chains a `NodeCertRefused` carries (#198).
+fn set_string_array(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+    obj: v8::Local<v8::Object>,
+    name: &str,
+    items: &[String],
+) {
+    let mut elems: Vec<v8::Local<v8::Value>> = Vec::with_capacity(items.len());
+    for item in items {
+        if let Some(value) = v8::String::new(tc, item) {
+            elems.push(value.into());
+        }
+    }
+    let array = v8::Array::new_with_elements(tc, &elems);
+    if let Some(key) = v8::String::new(tc, name) {
+        obj.create_data_property(tc, key.into(), array.into());
     }
 }
 
