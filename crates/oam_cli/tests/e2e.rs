@@ -18266,6 +18266,14 @@ const verdict = (port, opts) => within(8000, 'verdict', new Promise((resolve) =>
     const out = { ok: false, code: e.code, message: e.message, keys: Object.keys(e), hasSyscall: 'syscall' in e, hasErrno: 'errno' in e };
     if ('reason' in e) out.reason = e.reason;
     if ('host' in e) out.host = e.host;
+    // A refused name carries the peer certificate (#198): pin the leaf it
+    // reports, its altnames and its linked issuer, so err.cert is the real
+    // certificate and not an empty object.
+    if (e.cert && Object.keys(e.cert).length) {
+      out.certCN = (e.cert.subject || {}).CN;
+      out.certAltName = e.cert.subjectaltname;
+      out.certIssuerCN = ((e.cert.issuerCertificate || {}).subject || {}).CN;
+    }
     out.authorized = s.authorized;
     out.authorizationError = s.authorizationError;
     resolve(out);
@@ -20071,8 +20079,8 @@ expiredServer.close();
         // The e2e cert has no subjectAltName at all (CN=localhost only), so
         // the IP the host resolved to is checked against an empty list --
         // Node's exact wording.
-        r#"selfsigned-ip={"ok":false,"code":"ERR_TLS_CERT_ALTNAME_INVALID","message":"Hostname/IP does not match certificate's altnames: IP: 127.0.0.1 is not in the cert's list: ","keys":["code","reason","host","cert"],"hasSyscall":false,"hasErrno":false,"reason":"IP: 127.0.0.1 is not in the cert's list: ","host":"127.0.0.1","authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
-        r#"hostname={"ok":false,"code":"ERR_TLS_CERT_ALTNAME_INVALID","message":"Hostname/IP does not match certificate's altnames: Host: example.com. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1","keys":["code","reason","host","cert"],"hasSyscall":false,"hasErrno":false,"reason":"Host: example.com. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1","host":"example.com","authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
+        r#"selfsigned-ip={"ok":false,"code":"ERR_TLS_CERT_ALTNAME_INVALID","message":"Hostname/IP does not match certificate's altnames: IP: 127.0.0.1 is not in the cert's list: ","keys":["code","reason","host","cert"],"hasSyscall":false,"hasErrno":false,"reason":"IP: 127.0.0.1 is not in the cert's list: ","host":"127.0.0.1","certCN":"localhost","certIssuerCN":"localhost","authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
+        r#"hostname={"ok":false,"code":"ERR_TLS_CERT_ALTNAME_INVALID","message":"Hostname/IP does not match certificate's altnames: Host: example.com. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1","keys":["code","reason","host","cert"],"hasSyscall":false,"hasErrno":false,"reason":"Host: example.com. is not in the cert's altnames: DNS:localhost, IP Address:127.0.0.1","host":"example.com","certCN":"localhost","certAltName":"DNS:localhost, IP Address:127.0.0.1","certIssuerCN":"oam test CA","authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
         r#"hostname-advisory={"ok":true,"authorized":false,"authorizationError":"ERR_TLS_CERT_ALTNAME_INVALID"}"#,
         // An untrusted chain is refused before the name is looked at.
         r#"untrusted-wrong-host={"ok":false,"code":"UNABLE_TO_VERIFY_LEAF_SIGNATURE","message":"unable to verify the first certificate""#,

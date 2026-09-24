@@ -1173,18 +1173,13 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   OpenSSL-layout bundle elsewhere); Node reads a different set of Windows stores, and lists
   the duplicates among them. Neither list is used to verify anything unless it is passed as
   `ca`: oam has no `--use-system-ca`.
-- **A refused name carries no certificate.** `tls.connect`'s
-  `ERR_TLS_CERT_ALTNAME_INVALID` has Node's message, `reason` and `host`, but its `cert` is
-  `{}`: oam's verifier refuses the name inside the handshake, so the peer's chain never
-  reaches JS. A `checkServerIdentity` of the caller's own is handed the certificate as in
-  Node (it is called after the handshake).
-
-The complete fix for the chain is making `net.Socket` a real `Duplex` and re-parenting
-`TLSSocket` under it; that is a rewrite of the class every socket-heavy module leans on, and
-it waits for the `net` tranche of the vendored Node suite to gate it.
-
 _(probed)_ Node v22.22.2 and oam on the same fixtures: `instanceof` both true; chains as
-described; the bare-`connect()` and `socket`-option shapes as described.
+described; the bare-`connect()` and `socket`-option shapes as described. A refused name's
+`ERR_TLS_CERT_ALTNAME_INVALID` now carries the peer certificate as Node's `err.cert` (#198):
+the verifier hands the chain it refused out of the handshake, and `tls.connect`'s error path
+builds the certificate from it exactly as `getPeerCertificate(true)` does, `issuerCertificate`
+linked. A chain-build failure (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) still leaves `err.cert` `{}`,
+as Node does.
 
 ### 35. `http` and `fetch` to a refused port — FIXED, no longer a divergence (#143)
 

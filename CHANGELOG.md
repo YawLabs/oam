@@ -18,6 +18,17 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **A refused server name failed `tls.connect` with `ERR_TLS_CERT_ALTNAME_INVALID` whose
+  `cert` was `{}`, where Node hands over the peer certificate** (#198). Node reports the
+  certificate the name check refused as `err.cert` -- the same object
+  `getPeerCertificate(true)` returns, its subject, issuer, altnames, fingerprints, validity
+  and linked `issuerCertificate` -- which is what diagnostics print. oam's verifier refused
+  the name inside the handshake, so the chain never reached JS and `err.cert` was empty. The
+  verifier now carries the chain it refused out through the verdict, and `tls.connect`'s
+  error path builds `err.cert` from it with the routine `getPeerCertificate()` uses, so a
+  caught `ERR_TLS_CERT_ALTNAME_INVALID` reports the same certificate on both runtimes. A
+  chain-build failure (`UNABLE_TO_VERIFY_LEAF_SIGNATURE`) still leaves `err.cert` `{}`, as
+  Node does. Measured on node v22.22.2.
 - **An `http2.connect` session ended by a server's fatal TLS alert emitted `'error'` and
   `'close'`, crashing a program that had no session `'error'` listener** (#197). A TLS 1.3
   server that requires a client certificate answers a client that sent none with a fatal

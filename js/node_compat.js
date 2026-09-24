@@ -31541,7 +31541,19 @@
             if (err.code === "ERR_TLS_CERT_ALTNAME_INVALID") {
               err.reason = err.message.slice(ALTNAME_MISMATCH_PREFIX.length);
               err.host = serverName.replace(/[.]$/, "");
-              err.cert = socket.getPeerCertificate();
+              // The native side carried the peer's chain out of the refused
+              // handshake (#198): put it on the socket so getPeerCertificate
+              // builds the certificate node reports as `err.cert` -- detailed,
+              // its issuers linked -- then drop the raw chains so the error's
+              // own keys stay node's.
+              if (err.peerCertificates) {
+                socket._peerCertificates = err.peerCertificates;
+                socket._storeIssuers = err.storeIssuers || null;
+                socket._peerParsed = null;
+              }
+              delete err.peerCertificates;
+              delete err.storeIssuers;
+              err.cert = socket.getPeerCertificate(true);
             }
           }
           socket.destroy(err);
