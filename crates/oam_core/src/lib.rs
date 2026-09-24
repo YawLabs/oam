@@ -2257,11 +2257,24 @@ pub mod zlib {
             Format::Deflate => Box::new(flate2::read::ZlibDecoder::new(bytes)),
             Format::DeflateRaw => Box::new(flate2::read::DeflateDecoder::new(bytes)),
         };
-        let Some(cap) = max_output else {
-            let mut out = Vec::new();
-            reader.read_to_end(&mut out)?;
-            return Ok(out);
-        };
+        match max_output {
+            None => {
+                let mut out = Vec::new();
+                reader.read_to_end(&mut out)?;
+                Ok(out)
+            }
+            Some(cap) => read_capped(&mut reader, cap),
+        }
+    }
+
+    /// Read `reader` to its end, giving up with [`OUTPUT_TOO_LARGE`] the moment
+    /// the output would pass `cap`. It never buffers more than `cap` (plus one
+    /// byte, and a read buffer capped at 64 KiB), so a reader that inflates
+    /// without bound -- a decompression bomb -- is stopped at the cap, not run
+    /// to exhaustion. Split out from `decompress_capped` so the bound can be
+    /// tested against an endless reader, which a `read_to_end` regression would
+    /// run forever.
+    fn read_capped(reader: &mut dyn Read, cap: usize) -> std::io::Result<Vec<u8>> {
         let mut out = Vec::new();
         // Never hand the decoder more room than the cap plus one byte, so
         // memory stays bounded by `cap` whatever the input inflates to.
@@ -2276,6 +2289,63 @@ pub mod zlib {
             if out.len() > cap {
                 return Err(std::io::Error::other(OUTPUT_TOO_LARGE));
             }
+        }
+    }
+
+    // Kept next to `read_capped` (the code it guards) rather than at the module
+    // end past the streaming and brotli code.
+    #[cfg(test)]
+    #[allow(clippy::items_after_test_module)]
+    mod capped_tests {
+        use super::{Format, OUTPUT_TOO_LARGE, compress, decompress_capped, read_capped};
+        use std::io::Read;
+
+        /// A reader that never returns 0: `read_to_end` would allocate without
+        /// bound and never return. It counts the bytes it was asked for.
+        struct Endless {
+            byte: u8,
+            pulled: usize,
+        }
+        impl Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf.fill(self.byte);
+                self.pulled += buf.len();
+                Ok(buf.len())
+            }
+        }
+
+        #[test]
+        fn read_capped_bounds_an_endless_stream() {
+            let cap = 4096;
+            let mut src = Endless {
+                byte: b' ',
+                pulled: 0,
+            };
+            // The whole point of the fix: an endless (bomb) stream is stopped
+            // at the cap, not inflated to exhaustion. A `read_to_end` regression
+            // would never return here.
+            let err = read_capped(&mut src, cap).unwrap_err();
+            assert_eq!(err.to_string(), OUTPUT_TOO_LARGE);
+            // Memory (and reads) bounded by the cap plus one buffer, not the
+            // unbounded stream.
+            assert!(
+                src.pulled <= cap + 1 + 64 * 1024,
+                "pulled {} bytes past the {cap}-byte cap",
+                src.pulled
+            );
+        }
+
+        #[test]
+        fn decompress_capped_stops_a_gzip_bomb_at_the_cap() {
+            // 16 MiB of spaces gzips to a few KB. Under a 1 KiB cap the real
+            // decoder path returns the cap error having buffered ~1 KiB, not
+            // 16 MiB; and the cap boundary is exact.
+            let size = 16 * 1024 * 1024;
+            let bomb = compress(&vec![b' '; size], Format::Gzip, 6).unwrap();
+            let err = decompress_capped(&bomb, Format::Gzip, Some(1024)).unwrap_err();
+            assert_eq!(err.to_string(), OUTPUT_TOO_LARGE);
+            assert!(decompress_capped(&bomb, Format::Gzip, Some(size)).is_ok());
+            assert!(decompress_capped(&bomb, Format::Gzip, Some(size - 1)).is_err());
         }
     }
 
