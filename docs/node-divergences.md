@@ -1733,8 +1733,7 @@ target). The parser underneath is hyper's, so some heads still get a different a
 - **oam refuses, Node accepts:** `Transfer-Encoding` on an HTTP/1.0 request; request lines
   with `HTTP/2.0`, no version (HTTP/0.9) or two spaces; an absolute-form target with an
   empty authority (`http://`, `http:///p`, `abc://`); an empty `Transfer-Encoding` next to
-  `Content-Length`; more than 100 header fields (`431`; Node limits only the byte count
-  and keeps the first 1000 fields); a request target over 65534 bytes (`414`; Node answers
+  `Content-Length`; a request target over 65534 bytes (`414`; Node answers
   `431` from the byte count). Under `insecureHTTPParser`, obs-fold, control characters in
   values, `Transfer-Encoding` codings other than a final `chunked`, whitespace after
   a chunk size, and `Content-Length`, `Transfer-Encoding` or obs-fold in a chunked body's
@@ -1742,6 +1741,14 @@ target). The parser underneath is hyper's, so some heads still get a different a
 - **oam accepts, Node refuses:** lowercase or unknown methods (`get`, `FOO`) and an
   HTTP/1.1 request without `Host` (Node's `requireHostHeader`, which oam does not
   implement).
+- **`server.maxHeadersCount`** now works as Node's (#202): a head is refused only on its
+  byte size, never its field count, and the handler is given the first `maxHeadersCount`
+  header fields (`req.headers`), the rest dropped -- `null` (the default) keeps Node's
+  1000, `0` is no limit. One nuance is left: Node's `req.rawHeaders` keeps whole 32-field
+  parser batches, so with a limit below 32 and a head of fewer than 32 fields its
+  `rawHeaders` holds every field while `req.headers` is capped; oam caps `rawHeaders` to
+  the same count, so `rawHeaders` can be shorter than Node's in that narrow case.
+  `conformance/cases/185-http-server-max-headers-count.mjs` holds the rest to node v22.22.2.
 - A malformed chunked body is answered with Node's status (`400`, or `413` for chunk
   extensions over the limit) when the handler has not responded yet, and the handler's
   request aborts with `ECONNRESET`, as in Node. On `https` servers and the HTTP/1 side of

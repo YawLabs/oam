@@ -933,6 +933,12 @@ fn refused_head_response(error: HeadError) -> hyper::Response<BoxedBody> {
 fn http1_builder(policy: HeadPolicy) -> hyper::server::conn::http1::Builder {
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder.max_buf_size(policy.read_buffer_limit());
+    // hyper refuses a head of more than 100 fields by default; node refuses one
+    // only on its byte size. Lift the field ceiling to the byte budget so the
+    // parser stops at the same point node does -- the excess beyond
+    // maxHeadersCount is dropped when the handler is given its headers, not
+    // refused. (The vendored parser only grows to this when a head needs it.)
+    builder.max_headers(policy.max_parsed_headers());
     builder
 }
 
@@ -1990,6 +1996,14 @@ async fn dispatch_request(
         return Ok(status_body(503, b"server is busy"));
     }
     let mut headers = header_pairs(&parts.headers);
+    // node's `server.maxHeadersCount`: the handler is given only the first so
+    // many header fields, the rest dropped (the request is still served). It
+    // is an HTTP/1 parser limit; an h2 request's headers are not counted by it.
+    if parts.version != hyper::Version::HTTP_2
+        && let Some(limit) = policy.header_field_limit(headers.len())
+    {
+        headers.truncate(limit);
+    }
     // An HTTP/2 request's :authority and :scheme are pseudo-headers hyper
     // folds into the URI; node's server hands them to the handler with the
     // rest of its headers.
