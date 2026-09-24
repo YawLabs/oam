@@ -18462,26 +18462,34 @@
         syncServerTimeouts(server);
         if (meta.isUpgrade && meta.socketHandle !== undefined) {
           // A request that took its connection: an upgrade (the server had
-          // an 'upgrade' listener when its head was parsed) or a CONNECT.
-          const NetSocket = registry.get("net").Socket;
-          // The accepted connection's real ends (never a stand-in:
-          // an upgrade handler's address checks read these).
-          const socket = new NetSocket({
-            _handle: meta.socketHandle,
-            _remoteAddr: {
-              address: meta.remoteAddress,
-              port: meta.remotePort,
-              family: meta.remoteFamily,
-            },
-            _localAddr:
-              meta.localAddress === undefined
-                ? undefined
-                : {
-                    address: meta.localAddress,
-                    port: meta.localPort,
-                    family: meta.localFamily,
-                  },
-          });
+          // an 'upgrade' listener when its head was parsed) or a CONNECT. An
+          // https connection (meta.tls) is handed over as a server-born
+          // tls.TLSSocket reading/writing the decrypted stream through its TLS
+          // handle; an http one as a net.Socket over the raw TCP handle. Either
+          // way its ends are the accepted connection's real ones (never a
+          // stand-in: an upgrade handler's address checks read these).
+          let socket;
+          if (meta.tls) {
+            socket = registry._tlsServer.takenServerSocket(meta);
+          } else {
+            const NetSocket = registry.get("net").Socket;
+            socket = new NetSocket({
+              _handle: meta.socketHandle,
+              _remoteAddr: {
+                address: meta.remoteAddress,
+                port: meta.remotePort,
+                family: meta.remoteFamily,
+              },
+              _localAddr:
+                meta.localAddress === undefined
+                  ? undefined
+                  : {
+                      address: meta.localAddress,
+                      port: meta.localPort,
+                      family: meta.localFamily,
+                    },
+            });
+          }
           // node counts a connection an upgrade or CONNECT took until that
           // socket closes -- a drain loop on a ws / socket.io server waits for
           // its websockets. The record the connection was announced with is
@@ -18507,7 +18515,8 @@
           Object.defineProperty(socket, Symbol.for("oam.countedIn"), {
             value: handedOver, writable: true, configurable: true,
           });
-          socket._readLoop();
+          if (meta.tls) socket._startReading();
+          else socket._readLoop();
           const req = new IncomingMessage(meta);
           req.upgrade = true;
           // node: the upgrade request's socket IS the socket handed
@@ -32423,12 +32432,40 @@
       return socket;
     }
 
+    // An upgrade / CONNECT connection an https server handed to JS: a
+    // server-born tls.TLSSocket over the TLS handle the connection was taken
+    // out of hyper as, its view the handshake it was admitted on. The
+    // encrypted mirror of the net.Socket the http server hands an 'upgrade' /
+    // 'connect' listener; it reads and writes the decrypted stream through the
+    // TLS handle (_startReading / _write over natives.tls*), not the raw TCP.
+    // #205.
+    function takenServerSocket(meta) {
+      var socket = new TLSSocket(null, { [kServerBorn]: true });
+      var info = Object.assign({ handle: meta.socketHandle }, meta.tls || {});
+      info.remoteAddr = {
+        address: meta.remoteAddress,
+        port: meta.remotePort,
+        family: meta.remoteFamily,
+      };
+      if (meta.localAddress !== undefined) {
+        info.localAddr = {
+          address: meta.localAddress,
+          port: meta.localPort,
+          family: meta.localFamily,
+        };
+      }
+      fillServerSocket(socket, info, {});
+      registry._activeHandles.set(socket, "TCPSocketWrap");
+      return socket;
+    }
+
     // What the https server builds on: its options are node:tls's, read and
     // validated by tls.Server, and its connections are accepted natively
     // with the context tls.Server built.
     registry._tlsServer = {
       alpnWireNames: alpnWireNames,
       serverSocketView: serverSocketView,
+      takenServerSocket: takenServerSocket,
     };
 
     var tlsExports = {

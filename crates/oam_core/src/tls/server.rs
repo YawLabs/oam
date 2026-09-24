@@ -1429,6 +1429,25 @@ pub fn take_server_stream(
     }
 }
 
+/// Register a `TlsStream<ServerIo>` that hyper drove and then released (via
+/// `Connection::into_parts` on an https upgrade or CONNECT) as a TLS handle for
+/// JS, the way `tls_accept` registers a fresh accept. There is no "at rest"
+/// guard as in [`take_server_stream`]: hyper owned the whole stream un-split and
+/// is done with it, so the entire stream -- rustls state and any buffered
+/// ciphertext with it -- is moved into the registry and split here.
+pub fn register_taken_server_stream(
+    registry: &TlsRegistry,
+    ids: &std::sync::atomic::AtomicU64,
+    tls_stream: tokio_rustls::server::TlsStream<ServerIo>,
+) -> u64 {
+    let handle = ids.fetch_add(1, Ordering::Relaxed);
+    let (reader, writer) = tokio::io::split(tls_stream);
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+    guard.readers.insert(handle, TlsReader::Server(reader));
+    guard.writers.insert(handle, TlsWriter::Server(writer));
+    handle
+}
+
 /// Register a context; its id is what `tls_accept` is called with.
 pub fn register_context(
     registry: &TlsRegistry,

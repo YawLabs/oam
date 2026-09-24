@@ -31,6 +31,18 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **An `https` server never fired `'upgrade'` or `'connect'`, so a WebSocket handshake reached
+  the ordinary `'request'` handler and a CONNECT was closed** (#205). The https connection was
+  built with `Upgrades::CloseConnect` -- an upgrade served as an ordinary request, a CONNECT
+  closed -- where the `http` path hands the connection to JS. So `ws`, `socket.io`, and
+  anything on `server.on('upgrade')` could not serve over TLS, and an https server could not
+  act as a CONNECT proxy. The https connection now routes like http when the server is
+  JS-driven: on an upgrade with a listener, or a CONNECT, it takes the TLS connection out of
+  hyper, registers it as a TLS handle, and hands the listener a `tls.TLSSocket` with the bytes
+  behind the head -- the encrypted mirror of the http `net.Socket` handover, sharing its rules
+  (an upgrade needs a listener; a CONNECT with no listener is destroyed). Conformance case 189
+  holds the four cases byte-identical to node v22.22.2. (The HTTP/1 side of
+  `http2.createServer` is unchanged -- a separate concern.)
 - **`node:https` exported nine names node's `https` does not have** (#204). The module was
   built by copying every export of `node:http` and overriding six, so it carried
   `STATUS_CODES`, `METHODS`, `ClientRequest`, `IncomingMessage`, `OutgoingMessage`,
