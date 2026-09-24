@@ -47,7 +47,7 @@ parsing, and the TS stripper. OSS-Fuzz application at public launch. Trophies pu
 
 ## oam's own supply chain
 
-SLSA provenance + reproducible builds for all release artifacts from the first public release.
-Binaries are code-signed (Windows Authenticode) and notarized (macOS) before any public
-distribution. The installer and update channel serve exclusively from oamjs.org, with
-checksums pinned in-repo.
+Release binaries are currently unsigned and ship with a `SHA256SUMS` checksum file; see
+SECURITY.md, "Release integrity". Code signing (Windows Authenticode, macOS notarization),
+SLSA provenance and reproducible builds are planned, not yet in place. The installer and
+update channel serve exclusively from oamjs.org, with checksums pinned in-repo.
