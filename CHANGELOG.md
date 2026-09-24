@@ -31,6 +31,17 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **An http/https server refused a request with more than 100 header fields (`431`), and
+  `server.maxHeadersCount` was ignored** (#202). The vendored parser's default cap refused
+  any head past 100 fields, so a request a proxy chain had piled `x-forwarded-*` / tracing
+  headers onto -- one Node serves with a `200` -- got a `431`; and `maxHeadersCount`, Node's
+  knob for limiting header count, was stored and never read. A head is now refused only on
+  its byte size (`maxHeaderSize` -> `431`), never its field count, and the handler is given
+  the first `maxHeadersCount` header fields with the rest dropped (`null`, the default,
+  keeps Node's 1000; `0` is no limit) -- on `http` and `https`, and with `maxHeaderSize`
+  raised. The vendored parser grows its header buffer only when a head needs it, so the
+  common few-header request keeps its allocation-free fast path. Conformance case 185 holds
+  it to node v22.22.2.
 - **The cleartext `http2.createServer` had no compatibility API, so a `'request'` listener
   never fired and a `(req, res)` server never answered** (#200). `createServer(handler)` put
   the handler on `'stream'` and lacked the `Http2ServerRequest` / `Http2ServerResponse`

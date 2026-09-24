@@ -2985,6 +2985,27 @@ fn head_policy_args(
     policy
 }
 
+/// Reads node's `server.maxHeadersCount` (already resolved by JS: `1000` for
+/// the `null` default, `0` for no limit, else the value) from arg `at` and
+/// applies it to `policy`. Anything but a number `>= 0` leaves the process
+/// default -- so a caller that passes nothing keeps node's 1000-field cap.
+fn apply_max_headers_count(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    at: i32,
+    policy: &mut oam_core::http_head::HeadPolicy,
+) {
+    let value = args.get(at);
+    if value.is_number()
+        && let Some(n) = value.number_value(scope)
+        && n >= 0.0
+    {
+        // `as` saturates at u64::MAX, which header_field_limit treats as a cap
+        // no head reaches -- the same as node's very large counts.
+        policy.max_headers_count = n as u64;
+    }
+}
+
 /// A millisecond count JS passed: a finite number >= 0, truncated;
 /// anything else is `None`.
 fn ms_arg(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -> Option<u64> {
@@ -3161,9 +3182,11 @@ fn op_http_serve(
     let tcp = rt.tcp();
     let tcp_ids = rt.body_ids();
     // args 3, 4: maxHeaderSize, insecureHTTPParser.
-    let policy = head_policy_args(scope, &args, 3);
-    // args 5..=11: node's server timeouts.
+    let mut policy = head_policy_args(scope, &args, 3);
+    // args 5..=10: node's server timeouts.
     let timeouts = timeout_args(scope, &args, 5);
+    // arg 11: maxHeadersCount.
+    apply_max_headers_count(scope, &args, 11, &mut policy);
     crate::ops::spawn_op(
         scope,
         &mut rv,
@@ -3552,9 +3575,11 @@ fn op_https_serve(
     };
     let state = core.http();
     // args 7, 8: maxHeaderSize, insecureHTTPParser.
-    let policy = head_policy_args(scope, &args, 7);
+    let mut policy = head_policy_args(scope, &args, 7);
     // args 9..=14: node's server timeouts.
     let timeouts = timeout_args(scope, &args, 9);
+    // arg 15: maxHeadersCount.
+    apply_max_headers_count(scope, &args, 15, &mut policy);
     let tls = std::sync::Arc::new(oam_core::http_server::HttpsTls::new(context, options));
     crate::ops::spawn_op(
         scope,

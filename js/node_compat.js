@@ -18754,6 +18754,10 @@
         // connection, off), then maxRequestsPerSocket.
         defineTimeoutProperty(this, "timeout", 0);
         this.maxRequestsPerSocket = 0;
+        // node's http.Server: the most header fields a request may carry to
+        // the handler, the rest dropped. null (the default) is node's 1000;
+        // 0 is no limit. Read when a server starts (like maxHeaderSize).
+        this.maxHeadersCount = null;
         if (handler) this.on("request", handler);
         this._serverId = null;
         this._port = null;
@@ -18789,6 +18793,9 @@
           policy.maxHeaderSize,
           policy.insecure,
           ...serverTimeoutArgs(this),
+          // maxHeadersCount: null (the default) leaves the native 1000-field
+          // cap; 0 is no limit; a number is that cap.
+          this.maxHeadersCount,
         ).then(
           (bound) => serverBound(this, bound, hostname, false),
           (err) => this.emit("error", err),
@@ -25200,6 +25207,9 @@
           policy.maxHeaderSize,
           policy.insecure,
           ...registry._httpParserOptions.timeoutArgs(this),
+          // maxHeadersCount: null (the default) leaves the native 1000-field
+          // cap; 0 is no limit; a number is that cap.
+          this.maxHeadersCount,
         ).then(
           (bound) => {
             this[kTlsSynced] = JSON.stringify(accept);

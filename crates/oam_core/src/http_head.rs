@@ -34,6 +34,20 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// node's default `maxHeaderSize` (`--max-http-header-size`), 16 KiB.
 pub const DEFAULT_MAX_HEADER_SIZE: u64 = 16 * 1024;
 
+/// node's effective default header-field cap for a server that leaves
+/// `maxHeadersCount` at `null`: its parser keeps 2000 header pairs, i.e. the
+/// first 1000 fields, dropping the rest (measured on node v22.22.2).
+pub const DEFAULT_MAX_HEADERS_COUNT: u64 = 1000;
+
+/// node's parser header batch (`kMaxHeaderFieldsCount`). `maxHeadersCount`
+/// caps `req.headers` exactly, but node's `req.rawHeaders` keeps whole batches
+/// this size: with a limit below 32, a head of fewer than 32 fields still
+/// reaches `rawHeaders` in full while `req.headers` is capped (measured on
+/// node v22.22.2). oam caps both alike, so its `rawHeaders` can be shorter in
+/// that narrow case -- a documented divergence (docs/node-divergences.md).
+/// Used here as headroom over the byte-derived parse ceiling.
+pub const HEADER_BATCH: usize = 32;
+
 static MAX_HEADER_SIZE: AtomicU64 = AtomicU64::new(DEFAULT_MAX_HEADER_SIZE);
 static INSECURE_PARSER: AtomicBool = AtomicBool::new(false);
 
@@ -98,6 +112,13 @@ pub struct HeadPolicy {
     pub max_header_size: u64,
     /// `insecureHTTPParser`: the framing rules node relaxes are relaxed.
     pub lenient: bool,
+    /// node's `server.maxHeadersCount`, resolved: the most header fields the
+    /// handler is given, past which the extra fields are dropped -- the
+    /// request is still served (node never answers `431` on a field count,
+    /// only on `maxHeaderSize` bytes). `0` is no limit (`maxHeadersCount ===
+    /// 0`); the default is `1000` (node's `null` default, whose parser keeps
+    /// 2000 header pairs).
+    pub max_headers_count: u64,
 }
 
 impl HeadPolicy {
@@ -106,6 +127,7 @@ impl HeadPolicy {
         HeadPolicy {
             max_header_size: max_http_header_size(),
             lenient: insecure_http_parser(),
+            max_headers_count: DEFAULT_MAX_HEADERS_COUNT,
         }
     }
 
@@ -120,6 +142,29 @@ impl HeadPolicy {
         const FLOOR: u64 = 64 * 1024;
         let wanted = self.max_header_size.saturating_mul(4).max(FLOOR);
         usize::try_from(wanted).unwrap_or(usize::MAX)
+    }
+
+    /// The most header fields hyper is allowed to parse from one head before
+    /// it refuses it. node refuses a head only on its byte size, never on a
+    /// field count, so this is set from the byte budget: at four wire bytes
+    /// per field (`a:\r\n`) no head that fits [`read_buffer_limit`] can carry
+    /// more, and a slack of one batch covers the request line and rounding.
+    /// The parser starts with an inline buffer and only grows to this when a
+    /// head actually needs it (see `vendor/hyper-1.10.1` `Server::parse`).
+    pub fn max_parsed_headers(&self) -> usize {
+        self.read_buffer_limit() / 4 + HEADER_BATCH
+    }
+
+    /// node's `maxHeadersCount` rule for a request whose head carried `sent`
+    /// header fields: the number the handler is given, or `None` to keep them
+    /// all. node caps `req.headers` at the limit exactly (`0` is no limit);
+    /// oam applies the same cap to `rawHeaders` too (see [`HEADER_BATCH`]).
+    pub fn header_field_limit(&self, sent: usize) -> Option<usize> {
+        if self.max_headers_count == 0 {
+            return None;
+        }
+        let cap = usize::try_from(self.max_headers_count).unwrap_or(usize::MAX);
+        (sent > cap).then_some(cap)
     }
 }
 
@@ -415,10 +460,12 @@ mod tests {
     const STRICT: HeadPolicy = HeadPolicy {
         max_header_size: DEFAULT_MAX_HEADER_SIZE,
         lenient: false,
+        max_headers_count: DEFAULT_MAX_HEADERS_COUNT,
     };
     const LENIENT: HeadPolicy = HeadPolicy {
         max_header_size: DEFAULT_MAX_HEADER_SIZE,
         lenient: true,
+        max_headers_count: DEFAULT_MAX_HEADERS_COUNT,
     };
 
     fn check(head: &str, policy: HeadPolicy) -> Result<(), HeadError> {
@@ -612,6 +659,7 @@ mod tests {
         let small = HeadPolicy {
             max_header_size: 1000,
             lenient: false,
+            max_headers_count: DEFAULT_MAX_HEADERS_COUNT,
         };
         assert_eq!(check(&one(975), small), Ok(()));
         assert_eq!(check(&one(976), small), Err(HeadError::HeaderOverflow));
@@ -619,6 +667,7 @@ mod tests {
         let zero = HeadPolicy {
             max_header_size: 0,
             lenient: false,
+            max_headers_count: DEFAULT_MAX_HEADERS_COUNT,
         };
         assert_eq!(check(&one(0), zero), Err(HeadError::HeaderOverflow));
     }
@@ -775,6 +824,7 @@ mod tests {
         let small = HeadPolicy {
             max_header_size: 1000,
             lenient: false,
+            max_headers_count: DEFAULT_MAX_HEADERS_COUNT,
         };
         assert_eq!(
             parse_request_head(big.as_bytes(), small),
@@ -837,12 +887,36 @@ mod tests {
         let big = HeadPolicy {
             max_header_size: 1 << 20,
             lenient: false,
+            max_headers_count: DEFAULT_MAX_HEADERS_COUNT,
         };
         assert_eq!(big.read_buffer_limit(), 4 << 20);
         let zero = HeadPolicy {
             max_header_size: 0,
             lenient: false,
+            max_headers_count: DEFAULT_MAX_HEADERS_COUNT,
         };
         assert!(zero.read_buffer_limit() >= 8192, "hyper's floor");
+    }
+
+    #[test]
+    fn the_header_field_limit_matches_node() {
+        let with = |count: u64| HeadPolicy {
+            max_header_size: DEFAULT_MAX_HEADER_SIZE,
+            lenient: false,
+            max_headers_count: count,
+        };
+        // The handler is given the first `max_headers_count` fields; a head at
+        // or under the limit is kept whole.
+        assert_eq!(with(5).header_field_limit(5), None);
+        assert_eq!(with(5).header_field_limit(6), Some(5));
+        assert_eq!(with(5).header_field_limit(20), Some(5));
+        assert_eq!(with(50).header_field_limit(20), None);
+        assert_eq!(with(50).header_field_limit(50), None);
+        assert_eq!(with(50).header_field_limit(100), Some(50));
+        // The default keeps 1000; a head under it is untouched.
+        assert_eq!(with(1000).header_field_limit(999), None);
+        assert_eq!(with(1000).header_field_limit(1500), Some(1000));
+        // `maxHeadersCount === 0` is no limit.
+        assert_eq!(with(0).header_field_limit(5000), None);
     }
 }

@@ -437,8 +437,7 @@
           "CLIENT_RENEG_WINDOW",
           "DEFAULT_CIPHERS",
           "convertALPNProtocols",
-          "createSecurePair",
-          "setDefaultCACertificates"
+          "createSecurePair"
         ],
         "url": [
           "fileURLToPathBuffer"
@@ -932,8 +931,7 @@
           "CLIENT_RENEG_WINDOW",
           "DEFAULT_CIPHERS",
           "convertALPNProtocols",
-          "createSecurePair",
-          "setDefaultCACertificates"
+          "createSecurePair"
         ],
         "url": [
           "fileURLToPathBuffer"
@@ -1412,8 +1410,7 @@
           "CLIENT_RENEG_WINDOW",
           "DEFAULT_CIPHERS",
           "convertALPNProtocols",
-          "createSecurePair",
-          "setDefaultCACertificates"
+          "createSecurePair"
         ],
         "url": [
           "fileURLToPathBuffer"
