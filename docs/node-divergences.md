@@ -1510,21 +1510,16 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
 
 **Responses and requests**
 
-- **A keep-alive `Agent`'s pooled connection outlives `agent.destroy()`.** The pool on this
-  transport is hyper's, and `agent.destroy()` does not close the connections it holds: one
-  stays open until the server's keep-alive timeout closes it. Measured against an oam
-  server with `keepAliveTimeout` 2000 ms and 4000 ms, its `getConnections()` read 0 about
-  3000 ms and 5000 ms after `agent.destroy()`; with Node's client, within 500 ms. A pooled
-  request's socket also emits no `'close'` when the server ends the connection (a server
-  that answered `Connection: close` and closed it: no `'close'` 1.5 s later).
-- **The pool opens a connection it may never use (#216).** A request made while no pooled
-  connection is idle starts a new one AND waits for a pooled one to come free; when a pooled
-  one wins (a response finishing on the loopback does), the new connection is finished and
-  parked idle, having carried no request. undici opens a connection only to send on it. A
-  server sees one more connection than requests explain, and Node's `http` server -- oam's
-  too -- keeps such a connection across `server.close()` until the client goes (entry 41 has
-  what `oam.serve` does with it). Measured: six sequential-then-concurrent fetches to one
-  origin arrived on one connection, with a second open that never received a byte.
+- **A keep-alive `Agent`'s pooled connection outlives `agent.destroy()`.** oam's client now
+  owns its connection pool (#216), so `agent.destroy()` is fixable -- but it is not wired yet:
+  every hookless agent shares the one process pool, so destroying one agent must not evict the
+  connections another agent is using, which needs a per-agent pool. Until then
+  `agent.destroy()` does not close the connections the shared pool holds: one stays open until
+  the server's keep-alive timeout closes it. Measured against an oam server with
+  `keepAliveTimeout` 2000 ms and 4000 ms, its `getConnections()` read 0 about 3000 ms and
+  5000 ms after `agent.destroy()`; with Node's client, within 500 ms. A pooled request's
+  socket also emits no `'close'` when the server ends the connection (a server that answered
+  `Connection: close` and closed it: no `'close'` 1.5 s later).
 - **`statusText` is the canonical reason phrase**, not the server's: `200 Custom Reason` reads
   `OK` in oam, and `299 Whatever` reads `''`. Node reports the reason on the wire.
 - **The request header count is capped.** More than 24,576 distinct header names (fewer if

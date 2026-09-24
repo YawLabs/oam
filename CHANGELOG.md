@@ -31,6 +31,20 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`fetch`'s connection pool opened a spare connection that carried no request and held a
+  `node:http` server's `close()` open for 90 seconds** (#216). hyper-util's legacy client
+  raced a fresh connect against a pooled checkout on a cache-miss; when the pooled connection
+  won, the freshly opened one was parked idle having sent nothing, so a server saw one more
+  connection than its requests explained and a `fetch`-then-`server.close()` in the same
+  process hung until the spare's 90 s idle timeout. oam now owns its connection pool: a
+  request either reuses an idle connection or opens exactly one it will send on, never both,
+  the way undici does, so no spare is ever created and `close()` fires at once. The pool is
+  built on hyper's low-level `client::conn` dispatchers over oam's existing connector, keeps
+  the same origin-keyed reuse, keep-alive, HTTP/2 multiplexing, `Connection: close` handling
+  and stale-connection resend, and adds real idle eviction. Conformance case 186 holds the
+  no-spare property and the prompt `close()` to node v22.22.2. (The owned pool also makes
+  `agent.destroy()` promptly close its sockets fixable -- divergence entry 38 -- but that
+  wiring, which needs a per-agent pool, is a follow-up.)
 - **An http/https server refused a request with more than 100 header fields (`431`), and
   `server.maxHeadersCount` was ignored** (#202). The vendored parser's default cap refused
   any head past 100 fields, so a request a proxy chain had piled `x-forwarded-*` / tracing

@@ -20,15 +20,12 @@ use http::Uri;
 use http::header::HeaderValue;
 use http_body_util::{BodyExt, Empty, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::capture_connection;
 use hyper_util::client::proxy::matcher::Matcher;
-use hyper_util::rt::{TokioExecutor, TokioTimer};
 
 use super::connector::{
-    ConnStats, HostAddrs, OamConnector, Shared, SuppliedConn, SuppliedConns, TlsSetupError, Via,
-    authority_key,
+    HostAddrs, OamConnector, Shared, SuppliedConn, SuppliedConns, TlsSetupError, Via, authority_key,
 };
+use super::pool::{Pool, PoolError, PoolFail};
 use super::prepare::host_for_connect;
 use super::{BoxError, ReqBody};
 use crate::OpOutcome;
@@ -63,7 +60,7 @@ pub struct TransportOptions {
 /// A runtime's fetch transport. Cloning shares the pool.
 #[derive(Clone)]
 pub struct HttpTransport {
-    client: Client<OamConnector, ReqBody>,
+    pool: Pool,
     shared: Arc<Shared>,
 }
 
@@ -100,15 +97,22 @@ impl HttpTransport {
             ),
             tls_range: AtomicU8::new(TlsRange::Both.code()),
         });
-        let client = build_client(OamConnector {
+        let pool = Pool::pooled(OamConnector {
             shared: shared.clone(),
             via: Via::Pooled,
         });
-        HttpTransport { client, shared }
+        HttpTransport { pool, shared }
     }
 
     pub fn user_agent(&self) -> &HeaderValue {
         &self.shared.user_agent
+    }
+
+    /// Drop every connection this transport has pooled: `agent.destroy()` for
+    /// an agent that runs on the shared transport (divergence entry 38). An
+    /// owned pool can evict promptly where hyper-util's could not.
+    pub fn destroy_pool(&self) {
+        self.pool.destroy();
     }
 
     /// The route one fetch takes. With `lookup_hook`, the fetch gets its own
@@ -124,14 +128,14 @@ impl HttpTransport {
     ) -> Route {
         let hooked = lookup_hook.then(|| {
             let addrs: HostAddrs = Arc::new(Mutex::new(HashMap::new()));
-            let client = build_client(OamConnector {
+            let pool = Pool::pooled(OamConnector {
                 shared: self.shared.clone(),
                 via: Via::Hooked {
                     addrs: addrs.clone(),
                     attempt_timeout,
                 },
             });
-            Hooked { addrs, client }
+            Hooked { addrs, pool }
         });
         Route {
             attempt_timeout,
@@ -149,21 +153,22 @@ impl HttpTransport {
     /// reused for a request the dispatcher's function was not asked about.
     pub fn supplied_route(&self, attempt_timeout: Duration, tls_range: TlsRange) -> Route {
         let conns: SuppliedConns = Arc::new(Mutex::new(HashMap::new()));
-        let client = Client::builder(TokioExecutor::new())
-            .timer(TokioTimer::new())
-            .pool_timer(TokioTimer::new())
-            .pool_max_idle_per_host(0)
-            .build(OamConnector {
+        // No idle timeout: nothing is parked or reused, so each supplied
+        // connection is used once (hyper-util's `pool_max_idle_per_host(0)`).
+        let pool = Pool::new(
+            OamConnector {
                 shared: self.shared.clone(),
                 via: Via::Supplied {
                     conns: conns.clone(),
                 },
-            });
+            },
+            None,
+        );
         Route {
             attempt_timeout,
             tls_range,
             hooked: None,
-            supplied: Some(Supplied { conns, client }),
+            supplied: Some(Supplied { conns, pool }),
         }
     }
 
@@ -171,29 +176,27 @@ impl HttpTransport {
     pub async fn send(
         &self,
         route: &Route,
-        mut request: http::Request<ReqBody>,
+        request: http::Request<ReqBody>,
     ) -> Result<http::Response<Incoming>, SendError> {
         // Every route's connector handshakes through the shared state, so
-        // the request's version range goes there whichever client sends it.
+        // the request's version range goes there whichever pool sends it.
         self.shared.set_tls_range(route.tls_range);
-        let client = match (&route.hooked, &route.supplied) {
-            (Some(hooked), _) => &hooked.client,
-            (None, Some(supplied)) => &supplied.client,
+        let pool = match (&route.hooked, &route.supplied) {
+            (Some(hooked), _) => &hooked.pool,
+            (None, Some(supplied)) => &supplied.pool,
             (None, None) => {
                 self.shared.set_attempt_timeout(route.attempt_timeout);
-                &self.client
+                &self.pool
             }
         };
         // A request that told the server the connection closes after it --
         // node's `Connection: close`, which http.request sends for a socket it
         // does not keep -- must be the last one on that connection (RFC 9112
-        // s9.6), whether or not the response says `close` back. hyper drops a
-        // connection from the pool only when the RESPONSE says so, so it went
-        // back and the next request could go out on a connection the server
-        // was already closing: a POST failed with ECONNRESET, a GET was sent
-        // twice. It is poisoned instead, as node destroys the socket. HTTP/1
-        // only: an h2 connection carries every stream on it, and no
-        // Connection header at all.
+        // s9.6), whether or not the response says `close` back. The pool
+        // therefore does not re-park such a connection (h1 only; an h2
+        // connection carries every stream and no Connection header). A
+        // response that itself says `close` is not re-parked either, inside
+        // the pool.
         let close_requested = request
             .headers()
             .get_all(http::header::CONNECTION)
@@ -205,34 +208,18 @@ impl HttpTransport {
                         .any(|token| token.trim().eq_ignore_ascii_case("close"))
                 })
             });
-        let capture = capture_connection(&mut request);
-        let result = client.request(request).await;
-        if close_requested
-            && let Some(connected) = capture.connection_metadata().as_ref()
-            && !connected.is_negotiated_h2()
-        {
-            connected.poison();
+        match pool.request(request, close_requested).await {
+            Ok(response) => Ok(response),
+            Err(PoolFail {
+                error,
+                reused,
+                response_started,
+            }) => Err(SendError {
+                error,
+                reused,
+                response_started,
+            }),
         }
-        // Count this request in on the connection it went out on, whatever
-        // the outcome, and learn whether an earlier request had used it and
-        // whether any of a response arrived. No connection at all (a connect
-        // that failed) is not a reused one, and no response started on it.
-        let (reused, response_started) = match capture.connection_metadata().as_ref() {
-            Some(connected) => {
-                let mut extras = http::Extensions::new();
-                connected.get_extras(&mut extras);
-                match extras.get::<ConnStats>() {
-                    Some(stats) => (stats.count_one(), stats.response_started()),
-                    None => (false, true),
-                }
-            }
-            None => (false, false),
-        };
-        result.map_err(|error| SendError {
-            error,
-            reused,
-            response_started,
-        })
     }
 
     /// The `proxy-authorization` value this hop needs: only an http request
@@ -265,25 +252,6 @@ impl HttpTransport {
     }
 }
 
-/// One client builder for both kinds of client.
-///
-/// Both pool. A hooked client's pool is scoped to its own fetch -- the
-/// [`Route`] that owns it is dropped in `send::respond`, and its idle
-/// connections die with it -- and hyper-util keys the pool on the request's
-/// scheme and authority, so a pooled connection can only ever be reused for
-/// the origin it was opened to. Without it a single hooked fetch through four
-/// same-host redirects opened FIVE connections where node opens two
-/// (measured), paying a TCP -- and over https a full TLS -- handshake per hop
-/// for an authority whose hook-approved address set had not changed.
-fn build_client(connector: OamConnector) -> Client<OamConnector, ReqBody> {
-    Client::builder(TokioExecutor::new())
-        .timer(TokioTimer::new())
-        .pool_timer(TokioTimer::new())
-        .pool_idle_timeout(Duration::from_secs(90))
-        .pool_max_idle_per_host(usize::MAX)
-        .build(connector)
-}
-
 /// How one fetch reaches the network.
 pub struct Route {
     attempt_timeout: Duration,
@@ -296,12 +264,12 @@ pub struct Route {
 
 struct Hooked {
     addrs: HostAddrs,
-    client: Client<OamConnector, ReqBody>,
+    pool: Pool,
 }
 
 struct Supplied {
     conns: SuppliedConns,
-    client: Client<OamConnector, ReqBody>,
+    pool: Pool,
 }
 
 impl Route {
@@ -383,7 +351,7 @@ impl Route {
 /// A request that produced no response.
 #[derive(Debug)]
 pub struct SendError {
-    error: hyper_util::client::legacy::Error,
+    error: PoolError,
     /// It went out on a connection an earlier request had already used.
     reused: bool,
     /// Some part of a response arrived on that connection after this request
