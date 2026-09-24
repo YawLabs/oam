@@ -25336,15 +25336,17 @@
         "];\n//# sourceURL=node:https",
     )(request, get);
 
+    // node's https exports exactly six names. Copying every export of http --
+    // as this did -- adds nine that node's https does not have (STATUS_CODES,
+    // METHODS, ClientRequest, IncomingMessage, OutgoingMessage, ServerResponse,
+    // maxHeaderSize, validateHeaderName, validateHeaderValue), which link on oam
+    // and fail to link on node, before a line of the program runs (#204). Only
+    // the six node exports are built here, in node's key order (Agent,
+    // globalAgent, Server, createServer, get, request); a program that wants the
+    // rest imports them from `http`, where node keeps them.
     var merged = {};
-    var httpKeys = Object.keys(http);
-    for (var i = 0; i < httpKeys.length; i++) merged[httpKeys[i]] = http[httpKeys[i]];
-    merged.createServer = createServer;
-    merged.Server = Server;
-    merged.request = httpsFrames[0];
-    merged.get = httpsFrames[1];
-    // node's https.Agent and https.globalAgent, not http's: an https.Agent
-    // connects with tls.connect, and the global one is its own instance.
+    // node's https.Agent / globalAgent, not http's: an https.Agent connects
+    // with tls.connect, and the global one is its own instance.
     merged.Agent = agents.HttpsAgent;
     Object.defineProperty(merged, "globalAgent", {
       configurable: true,
@@ -25352,6 +25354,10 @@
       get() { return agents.state.httpsGlobalAgent; },
       set(value) { agents.state.httpsGlobalAgent = value; },
     });
+    merged.Server = Server;
+    merged.createServer = createServer;
+    merged.get = httpsFrames[1];
+    merged.request = httpsFrames[0];
     return merged;
   };
 

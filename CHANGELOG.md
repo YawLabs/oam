@@ -31,6 +31,16 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`node:https` exported nine names node's `https` does not have** (#204). The module was
+  built by copying every export of `node:http` and overriding six, so it carried
+  `STATUS_CODES`, `METHODS`, `ClientRequest`, `IncomingMessage`, `OutgoingMessage`,
+  `ServerResponse`, `maxHeaderSize`, `validateHeaderName` and `validateHeaderValue` -- names
+  node keeps on `http` alone. A builtin's ESM named exports are its module object's own keys,
+  so `import { STATUS_CODES } from "node:https"` linked on oam and threw a `SyntaxError` at
+  link time on node, and `if (https.maxHeaderSize)` read the opposite way on each. `https`
+  now exports exactly node's six names -- `Agent`, `globalAgent`, `Server`, `createServer`,
+  `get`, `request` -- in node's order; a program that wants the rest imports them from `http`.
+  Conformance case 188 holds the export set to node v22.22.2.
 - **An `https` server ran the request handler only after the whole request body had arrived,
   so it could not answer or cut an upload early** (#203). The https connection was built with
   the buffered-body path, where the `http` server already streams: the handler was dispatched
