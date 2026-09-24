@@ -90,7 +90,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     // __oam: the internal op table consumed by js/bootstrap.js. Not public
     // API; the bootstrap wraps these in web-shaped surfaces (fetch, ...).
     let internal = v8::Object::new(scope);
-    let internal_bindings: [(&str, v8::Local<v8::Function>); 20] = [
+    let internal_bindings: [(&str, v8::Local<v8::Function>); 21] = [
         ("fetch", v8::Function::new(scope, op_fetch).unwrap()),
         // A fetch whose dispatcher has a `connect.lookup` hook parks before
         // dialling a host name; JS runs the hook and resumes or drops it.
@@ -115,6 +115,12 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         (
             "fetchBodyCancel",
             v8::Function::new(scope, op_fetch_body_cancel).unwrap(),
+        ),
+        // `agent.destroy()` for an agent that runs on the shared fetch
+        // transport: drop every connection it has pooled (divergence 38).
+        (
+            "httpTransportDestroy",
+            v8::Function::new(scope, op_http_transport_destroy).unwrap(),
         ),
         (
             "wsConnect",
@@ -498,6 +504,17 @@ fn op_fetch_abandon(
     let continuations = core_runtime!(scope).fetch_continuations();
     let dropped = oam_core::ops::fetch_abandon(token, &continuations);
     rv.set(v8::Boolean::new(scope, dropped).into());
+}
+
+/// `httpTransportDestroy()`: drop every connection the shared fetch transport
+/// has pooled -- `agent.destroy()` for an agent that runs on it (divergence
+/// 38). The owned pool (#216) evicts promptly where hyper-util's could not.
+fn op_http_transport_destroy(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    core_runtime!(scope).http_client().destroy_pool();
 }
 
 fn op_fetch_body_read(

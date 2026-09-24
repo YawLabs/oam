@@ -47,6 +47,7 @@ pub mod bridge;
 mod connector;
 pub mod decode;
 pub mod h2_session;
+mod pool;
 pub mod prepare;
 pub mod redirect;
 pub mod send;

@@ -241,6 +241,31 @@ impl OamConn {
             info,
         }
     }
+
+    /// ALPN negotiated HTTP/2 (the owned pool picks the h1 or h2 dispatcher
+    /// from this, where hyper-util read the `negotiated_h2()` marker).
+    pub(crate) fn negotiated_h2(&self) -> bool {
+        self.h2
+    }
+
+    /// The connection reaches its origin through an http proxy, so an http
+    /// request on it is written in absolute form (`absolute_form`).
+    pub(crate) fn is_proxied(&self) -> bool {
+        self.proxied
+    }
+
+    /// The pool's own [`ConnStats`] copy (shared counters, no checkout
+    /// baseline): the pool clones THIS at each checkout to snapshot the
+    /// response-byte count, exactly as hyper-util's captured copy did.
+    pub(crate) fn pool_stats(&self) -> ConnStats {
+        self.stats.clone_for_pool()
+    }
+
+    /// The connection's socket/TLS facts, re-attached to every response the
+    /// pool returns (`response.extensions_mut().insert(..)`).
+    pub(crate) fn conn_info(&self) -> ConnInfo {
+        self.info.clone()
+    }
 }
 
 /// The byte stream under a connection, counting what is read from it into
@@ -605,7 +630,11 @@ impl std::fmt::Display for UnsuppliedConnection {
 impl std::error::Error for UnsuppliedConnection {}
 
 impl OamConnector {
-    async fn connect(self, dst: Uri) -> Result<OamConn, BoxError> {
+    /// Dial one connection for `dst`: node's connect algorithm, TLS, the
+    /// environment proxy / CONNECT tunnel, or a hooked / supplied connection.
+    /// The owned pool calls this directly (`self.clone().connect(uri)`) instead
+    /// of through the `Service` impl hyper-util used.
+    pub(crate) async fn connect(self, dst: Uri) -> Result<OamConn, BoxError> {
         let https = dst.scheme_str() == Some("https");
         let host = host_for_connect(&dst).ok_or("request url has no host")?;
         let port = dst.port_u16().unwrap_or(if https { 443 } else { 80 });

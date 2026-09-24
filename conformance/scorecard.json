@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "227331c+wip",
+  "commit": "10c49e0+wip",
   "oamVersion": "oam 0.16.4",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 176,
-      "total": 176,
+      "pass": 177,
+      "total": 177,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -392,6 +392,10 @@
         },
         {
           "case": "185-http-server-max-headers-count.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "186-fetch-pool-no-spare-connection.mjs",
           "status": "pass"
         },
         {
