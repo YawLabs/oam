@@ -9,8 +9,9 @@
 # What it runs, per platform (a failed leg warns and the sweep continues):
 #   local (this box)      cargo run -p xtask -- bench --release --compare
 #   mac-arm64 (tailnet)   scripts/build-platforms-tailnet.sh --mode=bench
-#   linux-x64 (GCP IAP)   scripts/build-platforms-gcp-iap.sh --mode=bench
-#                         (includes the Linux-only io_uring same-binary A/B --
+#   linux-x64 (GCP)       scripts/build-platforms-gcp-iap.sh --mode=bench
+#                         (direct ssh to the VM, IAP tunnel fallback;
+#                         includes the Linux-only io_uring same-binary A/B --
 #                         bench.yml's io-uring-ab job)
 #
 # Runtime discovery is PATH-based: a missing bun just drops that column
@@ -27,7 +28,7 @@
 #   OAM_SKIP_LINUX=1 ...                         # drop the linux leg
 #   OAM_SKIP_LOCAL=1 ...                         # drop the local leg
 # Remote host config: same env as the two platform scripts (OAM_MAC_HOST,
-# OAM_MAC_USER, OAM_GCP_*, OAM_KEEP_VM).
+# OAM_MAC_USER, OAM_GCP_*, OAM_KEEP_VM, OAM_IAP_SSH_MODE).
 #
 # NOTE: the local leg overwrites the committed BENCHMARKS.md +
 # bench/results.json in the working tree (that is how the dev-host reference
@@ -85,7 +86,7 @@ fi
 if [ "${OAM_SKIP_LINUX:-0}" = "1" ]; then
   warn "OAM_SKIP_LINUX=1 -- linux leg skipped"
 else
-  step "Linux leg (GCP IAP, --mode=bench, incl. io_uring A/B)"
+  step "Linux leg (GCP, --mode=bench, incl. io_uring A/B)"
   if LINUX_ART=$(bash "$SCRIPT_DIR/build-platforms-gcp-iap.sh" --mode=bench); then
     LINUX_ART="${LINUX_ART##*$'\n'}"   # contract: artifact dir = LAST stdout line
     cp -r "$LINUX_ART/linux-x64" "$STAGE_DIR/"

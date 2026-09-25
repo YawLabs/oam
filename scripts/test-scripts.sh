@@ -590,6 +590,161 @@ it "empty text is not a transport drop"
 ssh_transport_dropped "" && fail "matched nothing" || pass
 
 # =============================================================================
+group "iap-helpers.sh -- ssh transport: direct first, IAP tunnel fallback"
+# =============================================================================
+# On 2026-09-25 the builder answered plain OpenSSH on its external IP in ~1s
+# while every IAP probe took 11-57s, and a release died after 1269s of them
+# reporting only "(empty stderr)". The orchestrator now goes direct and keeps
+# the tunnel as the fallback; these are the decisions that choose between them
+# and what the operator is told when the direct path does not answer.
+
+it "the three documented OAM_IAP_SSH_MODE values are accepted"
+if ssh_mode_valid auto && ssh_mode_valid direct && ssh_mode_valid tunnel; then pass
+else fail "a documented mode was rejected"; fi
+
+it "a typo, a wrong case, padding, an empty value and 'iap' are rejected"
+SSH_MODE_BAD=""
+for m in "" DIRECT Auto "auto " iap dirct; do
+  ssh_mode_valid "$m" && SSH_MODE_BAD="$SSH_MODE_BAD '$m'"
+done
+if [ -z "$SSH_MODE_BAD" ]; then pass; else fail "accepted:$SSH_MODE_BAD"; fi
+
+it "auto goes direct when the direct probe answered"
+eq "$(ssh_transport_pick auto 1)" "direct"
+
+it "auto falls back to the tunnel when it did not"
+eq "$(ssh_transport_pick auto 0)" "tunnel"
+
+it "forced direct uses direct when it answered"
+eq "$(ssh_transport_pick direct 1)" "direct"
+
+# The one outcome that must NOT degrade into a tunnel: an operator who forced
+# direct asked for the run to stop rather than crawl through the relay.
+it "forced direct picks nothing when direct did not answer"
+SSH_PICK_OUT="$(ssh_transport_pick direct 0)"; SSH_PICK_RC=$?
+if [ "$SSH_PICK_RC" != "0" ] && [ -z "$SSH_PICK_OUT" ]; then pass
+else fail "rc=$SSH_PICK_RC out='$SSH_PICK_OUT' -- forced direct fell back"; fi
+
+it "forced tunnel stays on the tunnel even when direct would answer"
+eq "$(ssh_transport_pick tunnel 1)" "tunnel"
+
+it "an invalid mode picks no transport"
+ssh_transport_pick bogus 1 >/dev/null 2>&1 && fail "picked a transport for an invalid mode" || pass
+
+# Captured 2026-09-25 from this orchestrator's own ssh (OpenSSH_10.2p1, Git
+# Bash) against yaw-linux-builder, with the CRLF endings Windows tools write.
+it "a refused key reads back as ssh's own line, CR stripped"
+eq "$(last_nonblank_line $'nosuchuser@34.83.189.193: Permission denied (publickey).\r\n')" \
+   "nosuchuser@34.83.189.193: Permission denied (publickey)."
+
+it "trailing blank and whitespace-only lines are skipped"
+eq "$(last_nonblank_line $'Warning: Permanently added \'34.83.189.193\' (ED25519) to the list of known hosts.\r\nssh: connect to host 34.83.189.193 port 22: Connection timed out\r\n\r\n \t \r\n')" \
+   "ssh: connect to host 34.83.189.193 port 22: Connection timed out"
+
+it "a last line with no newline after it still counts"
+eq "$(last_nonblank_line $'first\nsecond')" "second"
+
+# The 2026-09-25 failure mode: the caller must be told there is NOTHING, so it
+# says what that means (killed by the timeout, or the exit code) instead of
+# printing "(empty stderr)".
+it "empty or whitespace-only stderr is a miss, not a blank line"
+if ! last_nonblank_line "" >/dev/null && ! last_nonblank_line $' \r\n\t\n' >/dev/null \
+   && [ -z "$(last_nonblank_line $'\r\n' || true)" ]; then pass
+else fail "reported a line for text that has none"; fi
+
+it "a changed host key is permanent -- polling cannot fix it"
+if ssh_error_is_permanent $'@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\nHost key verification failed.' \
+   && ssh_error_is_permanent 'Host key verification failed.'; then pass
+else fail "a changed host key would be retried for the whole boot budget"; fi
+
+it "the failures a booting guest gives are retried"
+SSH_PERM_BAD=""
+for e in "jeff@34.83.189.193: Permission denied (publickey)." \
+         "ssh: connect to host 34.83.189.193 port 22: Connection refused" \
+         "ssh: connect to host 34.83.189.193 port 22: Connection timed out" \
+         "kex_exchange_identification: read: Connection reset by peer" ""; do
+  ssh_error_is_permanent "$e" && SSH_PERM_BAD="$SSH_PERM_BAD [$e]"
+done
+if [ -z "$SSH_PERM_BAD" ]; then pass; else fail "treated as permanent:$SSH_PERM_BAD"; fi
+
+it "a firewall-shaped failure names tcp:22 and the address"
+SSH_HINT="$(direct_ssh_hint 'ssh: connect to host 34.83.189.193 port 22: Connection timed out' 34.83.189.193)"
+grep -qF 'tcp:22 on 34.83.189.193' <<<"$SSH_HINT" && pass || fail "hint: '$SSH_HINT'"
+
+it "a changed host key gets the exact command that clears it"
+SSH_HINT="$(direct_ssh_hint 'Host key verification failed.' 34.83.189.193)"
+grep -qF 'ssh-keygen -R 34.83.189.193 -f ~/.ssh/google_compute_known_hosts' <<<"$SSH_HINT" && pass || fail "hint: '$SSH_HINT'"
+
+it "a refused key points at the key, not the firewall"
+SSH_HINT="$(direct_ssh_hint 'jeff@34.83.189.193: Permission denied (publickey).' 34.83.189.193)"
+if grep -qF 'google_compute_engine' <<<"$SSH_HINT" && ! grep -qF 'tcp:22' <<<"$SSH_HINT"; then pass
+else fail "hint: '$SSH_HINT'"; fi
+
+it "an unrecognised failure gets no hint rather than a wrong one"
+eq "$(direct_ssh_hint 'kex_exchange_identification: read: Connection reset by peer' 34.83.189.193)" ""
+
+# Nothing executes the orchestrator (it runs against live GCP), so a syntax
+# error in it would first show up as a dead release leg.
+it "the linux-leg orchestrator parses"
+bash -n scripts/build-platforms-gcp-iap.sh 2>/dev/null && pass || fail "bash -n rejects scripts/build-platforms-gcp-iap.sh"
+
+# =============================================================================
+group "iap-helpers.sh -- background process-tree reaping"
+# =============================================================================
+
+it "an empty pid is a no-op that succeeds"
+kill_proc_tree "" && pass || fail "rc=$? for an empty pid"
+
+it "a plain background job is killed and reaped"
+sleep 60 & KPT_PID=$!
+kill_proc_tree "$KPT_PID"; KPT_RC=$?
+if [ "$KPT_RC" = "0" ] && ! kill -0 "$KPT_PID" 2>/dev/null; then pass
+else fail "rc=$KPT_RC, pid $KPT_PID still alive"; kill "$KPT_PID" 2>/dev/null; fi
+
+# The tunnel retry path reaps a gcloud that has usually exited already (a 4003
+# from a still-booting guest), so a dead pid must be a quiet success.
+it "a job that has already exited is not an error"
+true & KPT_PID=$!
+sleep 1
+kill_proc_tree "$KPT_PID" && pass || fail "rc=$? for an exited job"
+
+# The real shape of the leak: the scoop gcloud shim is a /bin/sh script
+# running `cmd.exe /C gcloud.cmd`, and $! is that sh. This shim is built the
+# same way, and its cmd.exe leaf appends to a file about once a second -- so
+# the leaf is alive exactly as long as the file keeps growing. A plain `kill`
+# of the sh leaves it growing (the python.exe tunnels of the 2026-09-25 03:52
+# and 03:56 runs were still alive ten hours later). The loop is bounded, so a
+# regression leaks a process for a minute, not forever.
+it "a scoop-shaped shim tree (sh -> cmd.exe -> native leaf) is reaped whole"
+if [ -r "/proc/$$/winpid" ] && command -v cmd.exe >/dev/null 2>&1 \
+   && command -v taskkill >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then
+  KPT_DIR="$SUITE_TMP/kpt"
+  mkdir -p "$KPT_DIR"
+  printf '@for /L %%%%i in (1,1,60) do @(echo x>>"%%~dp0beat.txt" & ping -n 2 127.0.0.1 >nul)\r\n' \
+    > "$KPT_DIR/leaf.cmd"
+  printf '#!/bin/sh\nMSYS2_ARG_CONV_EXCL=/C cmd.exe /C "%s" "$@"\n' "$(cygpath -w "$KPT_DIR/leaf.cmd")" \
+    > "$KPT_DIR/shim"
+  chmod +x "$KPT_DIR/shim"
+  "$KPT_DIR/shim" >/dev/null 2>&1 &
+  KPT_PID=$!
+  for _ in $(seq 1 120); do [ -s "$KPT_DIR/beat.txt" ] && break; sleep 0.25; done
+  if [ ! -s "$KPT_DIR/beat.txt" ]; then
+    kill_proc_tree "$KPT_PID"
+    fail "the cmd.exe leaf never wrote its first beat within 30s -- the fixture did not start"
+  else
+    kill_proc_tree "$KPT_PID"
+    sleep 0.5
+    KPT_B1="$(wc -c <"$KPT_DIR/beat.txt" | tr -d ' ')"
+    sleep 3
+    KPT_B2="$(wc -c <"$KPT_DIR/beat.txt" | tr -d ' ')"
+    if [ "$KPT_B1" = "$KPT_B2" ]; then pass
+    else fail "the cmd.exe under the shim kept running after kill_proc_tree ($KPT_B1 -> $KPT_B2 bytes)"; fi
+  fi
+else
+  skip "no MSYS/Cygwin process tree here (on Linux/macOS gcloud execs python, so the plain kill is the whole job)"
+fi
+
+# =============================================================================
 group "src-sync.sh -- source tarball ceiling"
 # =============================================================================
 # shellcheck source=lib/src-sync.sh

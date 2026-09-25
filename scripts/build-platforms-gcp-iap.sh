@@ -1,12 +1,17 @@
 #!/bin/bash
 # =============================================================================
-# oam GCP-IAP platform-build orchestrator  (linux-x64 leg)
+# oam GCP platform-build orchestrator  (linux-x64 leg)
 # =============================================================================
 # Runs the Linux leg of the deleted GitHub workflows on the shared GCP Linux
-# VM (the same yaw-linux-builder that builds yaw/vew), reached via gcloud IAP
-# TCP forwarding. Mirrors yaw's scripts/build-platforms-gcp-iap.sh tunnel
-# machinery; adapted for a Rust workspace and given VM lifecycle management
-# (yaw's release.sh owns the VM start/stop there; oam is self-contained here).
+# VM (the same yaw-linux-builder that builds yaw/vew). The VM is reached over
+# plain OpenSSH to its EXTERNAL IP first; only when that does not answer does
+# the run fall back, loudly, to a gcloud IAP TCP-forwarding tunnel (the only
+# transport before 2026-09-25 -- see "ssh transport" below for why it is no
+# longer the default). Mirrors yaw's scripts/build-platforms-gcp-iap.sh
+# transport machinery; adapted for a Rust workspace and given VM lifecycle
+# management (yaw's release.sh owns the VM start/stop there; oam is
+# self-contained here). The file name predates direct ssh and is kept because
+# release-local.sh, node-compat-measure.sh and bench-platforms.sh call it.
 #
 # Modes (per-mode remote steps; each is a short ssh sub-step -- see the
 # tunnel rationale below):
@@ -48,13 +53,29 @@
 #                             while the run is going and re-attach on exit --
 #                             yaw-linux-builder-autostop stops the VM at 03:00
 #                             America/Los_Angeles every day, mid-run or not)
+#   OAM_IAP_SSH_MODE          auto               (default -- direct ssh to the
+#                                                VM's external IP, falling back
+#                                                to the IAP tunnel, with a
+#                                                warning naming the direct-ssh
+#                                                error, when that does not
+#                                                answer)
+#                             direct             (direct only: a direct path
+#                                                that does not answer fails the
+#                                                run instead of falling back)
+#                             tunnel             (IAP tunnel only: the direct
+#                                                path is never probed -- the
+#                                                pre-2026-09-25 behaviour)
 #
-# Prereqs (same as yaw's IAP path):
-#   - gcloud CLI authenticated; identity has roles/iap.tunnelResourceAccessor
-#     + compute.instances.get/use (and start/stop for the lifecycle step,
-#     compute.resourcePolicies.get + instances.{add,remove}ResourcePolicies
-#     for the instance-schedule step).
-#   - Firewall allows TCP:22 from 35.235.240.0/20 (IAP range).
+# Prereqs:
+#   - gcloud CLI authenticated; identity has compute.instances.get (and
+#     start/stop for the lifecycle step, compute.resourcePolicies.get +
+#     instances.{add,remove}ResourcePolicies for the instance-schedule step).
+#   - Direct path: the VM has an external IP, and TCP:22 on it is reachable
+#     from this host (the default network's default-allow-ssh rule opens it
+#     to 0.0.0.0/0); ~/.ssh/google_compute_engine is a key the VM accepts for
+#     OAM_LINUX_USER (any earlier `gcloud compute ssh` published it).
+#   - IAP fallback: roles/iap.tunnelResourceAccessor + compute.instances.use,
+#     and a firewall rule allowing TCP:22 from 35.235.240.0/20 (IAP range).
 #   - VM image: build-essential, curl, outbound HTTPS to nodejs.org.
 #     rustup is auto-installed by scripts/build-remote.sh prep on first run,
 #     and so is the conformance oracle: exactly the Node in .node-version,
@@ -82,6 +103,7 @@ ZONE="${OAM_GCP_BUILDER_ZONE:-us-west1-b}"
 LINUX_USER="${OAM_LINUX_USER:-jeff}"
 REMOTE_DIR="${OAM_REMOTE_DIR:-oam-build}"
 LINUX_FAST="${OAM_LINUX_FAST:-0}"
+SSH_MODE="${OAM_IAP_SSH_MODE:-auto}"
 
 RED='\033[0;31m'; GRN='\033[0;32m'; YEL='\033[1;33m'; CYA='\033[1;36m'; NC='\033[0m'
 ok()  { echo -e "${GRN}  [ok]${NC} $*" >&2; }
@@ -97,6 +119,10 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 . "$SCRIPT_DIR/lib/iap-helpers.sh"
 # shellcheck source=lib/src-sync.sh
 . "$SCRIPT_DIR/lib/src-sync.sh"
+
+# Before anything touches the VM: a typo here must not cost a VM start.
+ssh_mode_valid "$SSH_MODE" \
+  || fail "invalid OAM_IAP_SSH_MODE='$SSH_MODE' (want auto|direct|tunnel)"
 
 RUNID="$(date +%Y%m%d-%H%M%S)"
 STAGE_DIR="$(mktemp -d -t oam-iap-build-$RUNID-XXXXXX)"
@@ -138,7 +164,8 @@ if [ "$VM_STATUS" != "RUNNING" ]; then
   WE_STARTED_VM=1
   ok "VM started"
   # `instances start` returning RUNNING means the API finished, NOT the guest:
-  # sshd comes up ~15-60s later. gcloud`s start-iap-tunnel does a real backend
+  # sshd comes up ~15-60s later -- whichever transport the run then uses. On
+  # the IAP fallback it is worse: gcloud`s start-iap-tunnel does a real backend
   # round-trip BEFORE it binds anything, and against a still-booting guest that
   # round-trip EXITS with a 4003 instead of retrying -- so the first tunnel
   # attempt was near-guaranteed to fail on a cold VM, burning ~30s and printing
@@ -171,8 +198,9 @@ if [ "$VM_STATUS" != "RUNNING" ]; then
       sleep 10
       waited=$((waited + 10))
     done
-    # Never fatal: the tunnel retry loop is still the real backstop.
-    warn "no sshd banner on the serial console after ${max}s -- proceeding (the tunnel loop still retries)"
+    # Never fatal: the connect step's own retries (the direct probe's boot
+    # budget, then the tunnel loop) are still the real backstop.
+    warn "no sshd banner on the serial console after ${max}s -- proceeding (the connect step still retries)"
     return 0
   }
   step "Wait for guest sshd on $INSTANCE"
@@ -248,14 +276,19 @@ reattach_stop_schedules() {
   DETACHED_POLICIES=""
 }
 
-# --- IAP tunnel machinery (mirrors yaw's, see that script for the full
-# rationale) -------------------------------------------------------------------
+# --- IAP tunnel machinery: the FALLBACK transport (mirrors yaw's, see that
+# script for the full rationale) ----------------------------------------------
+# Used only when direct ssh to the external IP does not answer, or when
+# OAM_IAP_SSH_MODE=tunnel -- see "ssh transport" below. None of it runs on the
+# direct path: no tunnel is started, so there is nothing to stop.
+#
 # Short version: gcloud's own ssh wrapper uses plink on Windows, which has no
 # keepalive, and the IAP tunnel drops idle connections after ~5 min. So: run
 # one long-lived `gcloud compute start-iap-tunnel` in the background for the
 # whole build, parse the local port it picked, and drive plain OpenSSH
 # (which has ServerAliveInterval) over localhost. Remote work is split into
-# short per-step ssh invocations. The trap kills the tunnel on any exit.
+# short per-step ssh invocations. The trap kills the tunnel -- the whole
+# process tree, see kill_proc_tree in lib/iap-helpers.sh -- on any exit.
 IAP_TUNNEL_LOG="$(mktemp -t oam-iap-tunnel-XXXXXX.log)"
 IAP_TUNNEL_PID=""
 IAP_TUNNEL_PORT=""
@@ -327,16 +360,15 @@ start_iap_tunnel() {
     if iap_tunnel_serving; then
       return 0
     fi
-    # Never leave a half-open tunnel behind for the next attempt to trip on.
-    if kill -0 "$IAP_TUNNEL_PID" 2>/dev/null; then
-      kill "$IAP_TUNNEL_PID" 2>/dev/null || true
-      wait "$IAP_TUNNEL_PID" 2>/dev/null || true
-    fi
+    # Never leave a half-open tunnel behind for the next attempt to trip on --
+    # and reap the whole tree: on Windows $! is the scoop shim's sh, and a
+    # plain kill leaves gcloud's python running under it (lib/iap-helpers.sh).
+    kill_proc_tree "$IAP_TUNNEL_PID"
     if [ "$attempt" -ge "$max_attempts" ]; then
       # Inline the log tail: cleanup rm's the file, so a path alone destroys
       # the evidence the operator needs.
       fail "IAP tunnel never served on any of $max_attempts attempts. Last output: $(tail -3 "$IAP_TUNNEL_LOG" 2>/dev/null | tr '
-' ' ')"
+' ' ')${DIRECT_SSH_ERR:+ (direct ssh was tried first and failed: $DIRECT_SSH_ERR)}"
     fi
     warn "tunnel attempt $attempt did not serve (sshd likely still booting) -- retrying in 15s"
     attempt=$((attempt + 1))
@@ -345,14 +377,15 @@ start_iap_tunnel() {
 }
 stop_iap_tunnel() {
   if [ -n "$IAP_TUNNEL_PID" ] && kill -0 "$IAP_TUNNEL_PID" 2>/dev/null; then
-    kill "$IAP_TUNNEL_PID" 2>/dev/null || true
-    wait "$IAP_TUNNEL_PID" 2>/dev/null || true
+    kill_proc_tree "$IAP_TUNNEL_PID"
     ok "IAP tunnel stopped (pid $IAP_TUNNEL_PID, port $IAP_TUNNEL_PORT)"
   fi
   # Keep gcloud's own tunnel output next to the step logs. It is the only
   # record of a tunnel-side reset, and it used to be deleted here before
-  # anyone could read it.
-  if [ -f "$IAP_TUNNEL_LOG" ]; then
+  # anyone could read it. -s, not -f: on the direct path no tunnel ran, and an
+  # empty iap-tunnel.log among the logs would read as a tunnel that said
+  # nothing.
+  if [ -s "$IAP_TUNNEL_LOG" ]; then
     cp "$IAP_TUNNEL_LOG" "$STAGE_DIR/logs/iap-tunnel.log" 2>/dev/null || true
   fi
   rm -f "$IAP_TUNNEL_LOG"
@@ -363,33 +396,189 @@ trap cleanup EXIT
 # arming the trap would leave the VM with no scheduled stop at all.
 detach_stop_schedules
 
-# Built INSIDE the helpers, not at script scope: $IAP_TUNNEL_PORT is set by
-# start_iap_tunnel() and bash captures values at expansion time. Port flag is
-# -o Port= (NOT -p/-P) -- the only spelling portable across ssh and scp
-# including OpenSSH 10.2 on Windows.
-_ssh_opts() {
-  echo \
-    -o "StrictHostKeyChecking=accept-new" \
-    -o "ServerAliveInterval=30" \
-    -o "ServerAliveCountMax=10" \
-    -o "ConnectTimeout=10" \
-    -o "IdentitiesOnly=yes" \
-    -o "UserKnownHostsFile=${HOME}/.ssh/google_compute_known_hosts" \
-    -i "$IAP_SSH_KEY" \
-    -o "Port=$IAP_TUNNEL_PORT"
+# --- ssh transport: direct first, the IAP tunnel as the fallback --------------
+# Every remote command and file transfer goes through gcp_ssh / gcp_scp_to /
+# gcp_scp_from, which dispatch on REMOTE_TRANSPORT, set once by
+# connect_builder below:
+#   direct  plain OpenSSH to the VM's external IP. ~1s per call from the
+#           Windows orchestrator, no relay, no idle drop.
+#   tunnel  plain OpenSSH to localhost:$IAP_TUNNEL_PORT, forwarded by the
+#           long-lived `gcloud compute start-iap-tunnel` above.
+# Why direct is the default: on 2026-09-25 the sibling yaw release died with
+# "not reachable over IAP within 1269s. Last error: (empty stderr)" against a
+# VM that was RUNNING and healthy the whole time. Each `gcloud compute ssh
+# --tunnel-through-iap` probe cost 11-57s (gcloud's Python startup, then the
+# websocket relay), only 4 of 20 reached sshd at all, and those 4
+# authenticated fine and were killed by the client-side timeout. Plain
+# OpenSSH to the external IP answered in ~1s, and default-allow-ssh
+# already opens tcp:22 to 0.0.0.0/0 on the default network, so IAP bought no
+# security here. The tunnel stays as the fallback for a host that cannot
+# reach tcp:22 (no external IP, egress or firewall blocking it).
+# OAM_IAP_SSH_MODE=direct|tunnel forces one; the pure selection logic lives
+# in lib/iap-helpers.sh, where it is tested.
+REMOTE_TRANSPORT=""   # direct | tunnel, set by connect_builder
+DIRECT_IP=""          # re-read after the VM is RUNNING, never cached earlier
+DIRECT_SSH_ERR=""     # last non-blank stderr line of the last direct probe
+DIRECT_SSH_HINT=""
+
+# _ssh_target [direct|tunnel]: fills the array SSH_OPTS and SSH_HOST for the
+# transport (default: the one in use). Built at CALL time, not at script
+# scope: DIRECT_IP and IAP_TUNNEL_PORT are only set once the connect step has
+# run, and bash captures values at expansion time. An array rather than an
+# unquoted $(echo ...), so a $HOME with a space in it cannot split an option.
+# The Port flag is -o Port= (NOT -p/-P) -- the only spelling portable across
+# ssh and scp including OpenSSH 10.2 on Windows.
+_ssh_target() {
+  SSH_OPTS=(
+    -o "StrictHostKeyChecking=accept-new"
+    -o "ServerAliveInterval=30"
+    -o "ServerAliveCountMax=10"
+    -o "IdentitiesOnly=yes"
+    -o "UserKnownHostsFile=${HOME}/.ssh/google_compute_known_hosts"
+    -i "$IAP_SSH_KEY"
+  )
+  if [ "${1:-$REMOTE_TRANSPORT}" = "direct" ]; then
+    # BatchMode: a passphrase or password prompt has nobody to answer it and
+    # would hang the run; fail instead, with the reason on stderr.
+    SSH_OPTS+=(-o "BatchMode=yes" -o "ConnectTimeout=8")
+    SSH_HOST="$DIRECT_IP"
+  else
+    SSH_OPTS+=(-o "ConnectTimeout=10" -o "Port=$IAP_TUNNEL_PORT")
+    SSH_HOST="localhost"
+  fi
 }
-gcp_ssh(){  ssh $(_ssh_opts) "${LINUX_USER}@localhost" "$@"; }
-gcp_scp_to(){ scp $(_ssh_opts) "$1" "${LINUX_USER}@localhost:$2"; }
+gcp_ssh(){ _ssh_target; ssh "${SSH_OPTS[@]}" "${LINUX_USER}@${SSH_HOST}" "$@"; }
+gcp_scp_to(){ _ssh_target; scp "${SSH_OPTS[@]}" "$1" "${LINUX_USER}@${SSH_HOST}:$2"; }
 gcp_scp_from(){  # gcp_scp_from <remote-glob-under-REMOTE_DIR> <local-dir>
   # scp can't expand server-side globs; tar on the remote side can (the whole
-  # command is one remote-shell invocation), piped back over the tunnel.
+  # command is one remote-shell invocation), piped back over the connection.
   local pattern="$1" local_dir="$2" parent_dir glob
   case "$pattern" in
     */*) parent_dir="${pattern%/*}"; glob="${pattern##*/}" ;;
     *)   parent_dir=".";             glob="$pattern" ;;
   esac
-  ssh $(_ssh_opts) "${LINUX_USER}@localhost" "cd $REMOTE_DIR/$parent_dir && tar czf - $glob" \
+  _ssh_target
+  # shellcheck disable=SC2029  # $REMOTE_DIR, $parent_dir and $glob are meant to expand here
+  ssh "${SSH_OPTS[@]}" "${LINUX_USER}@${SSH_HOST}" "cd $REMOTE_DIR/$parent_dir && tar czf - $glob" \
     | tar xzf - -C "$local_dir"
+}
+# For messages: which path a failure travelled.
+transport_desc(){
+  if [ "$REMOTE_TRANSPORT" = "direct" ]; then printf 'direct ssh %s@%s' "$LINUX_USER" "$DIRECT_IP"
+  else printf 'IAP tunnel localhost:%s' "$IAP_TUNNEL_PORT"; fi
+}
+
+# The external IP, read NOW -- an ephemeral one changes across stop/start, so
+# a value read before this run started the VM would point at nobody. One
+# repeat: an empty answer is indistinguishable from "this VM has no external
+# IP", and a single blinked describe must not demote the run to the tunnel.
+vm_external_ip(){
+  local ip attempt
+  for attempt in 1 2; do
+    ip="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
+      --format='value(networkInterfaces[0].accessConfigs[0].natIP)' 2>/dev/null | tr -d '[:space:]' || true)"
+    if [ -n "$ip" ]; then printf '%s' "$ip"; return 0; fi
+    if [ "$attempt" -lt 2 ]; then sleep 3; fi
+  done
+  return 1
+}
+
+# Outer bound on one probe. ConnectTimeout covers the TCP connect and the key
+# exchange but not authentication, and on a booting guest the OS Login /
+# metadata key lookup behind auth can stall. GNU timeout only: Windows'
+# own timeout.exe (if PATH puts it first) and a stock macOS have none, and
+# then ConnectTimeout alone has to do.
+_with_timeout(){
+  local secs="$1"; shift
+  if timeout --version >/dev/null 2>&1; then timeout "$secs" "$@"; else "$@"; fi
+}
+
+# direct_ssh_probe <budget-seconds>
+# 0 once `ssh true` answers on the external IP, with exactly the options the
+# run then uses. Non-zero when it has not within the budget -- or at once for
+# a failure retrying cannot fix -- with DIRECT_SSH_ERR saying why: the LAST
+# NON-BLANK line ssh wrote to stderr, never a placeholder.
+direct_ssh_probe(){
+  local budget="$1" started="$SECONDS" attempt=0 err rc line elapsed
+  DIRECT_SSH_ERR=""; DIRECT_SSH_HINT=""
+  if ! DIRECT_IP="$(vm_external_ip)"; then
+    DIRECT_IP=""
+    DIRECT_SSH_ERR="$INSTANCE has no external IP (networkInterfaces[0].accessConfigs[0].natIP is empty)"
+    DIRECT_SSH_HINT="give it one with: gcloud compute instances add-access-config $INSTANCE --zone=$ZONE --project=$PROJECT"
+    return 1
+  fi
+  _ssh_target direct
+  while :; do
+    attempt=$((attempt + 1))
+    rc=0
+    err="$(_with_timeout 30 ssh "${SSH_OPTS[@]}" "${LINUX_USER}@${DIRECT_IP}" true 2>&1 >/dev/null)" || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    if line="$(last_nonblank_line "$err")"; then
+      DIRECT_SSH_ERR="$line"
+    elif [ "$rc" -eq 124 ]; then
+      DIRECT_SSH_ERR="ssh ${LINUX_USER}@${DIRECT_IP} gave no answer within 30s and was killed (nothing on stderr)"
+    else
+      DIRECT_SSH_ERR="ssh ${LINUX_USER}@${DIRECT_IP} exited $rc without writing anything to stderr"
+    fi
+    elapsed=$((SECONDS - started))
+    if ssh_error_is_permanent "$err" || [ "$elapsed" -ge "$budget" ]; then
+      DIRECT_SSH_HINT="$(direct_ssh_hint "$err" "$DIRECT_IP")"
+      return 1
+    fi
+    warn "direct ssh to ${LINUX_USER}@${DIRECT_IP} not answering yet (attempt $attempt, ${elapsed}s of ${budget}s): $DIRECT_SSH_ERR -- retrying in 5s"
+    sleep 5
+  done
+}
+
+# connect_builder: pick the transport, prove it, and set REMOTE_TRANSPORT.
+# Direct first (unless OAM_IAP_SSH_MODE=tunnel); the IAP tunnel only when that
+# does not answer, and then loudly. The tunnel is not started at all on the
+# direct path.
+connect_builder(){
+  # A VM this run just started gets a real boot budget: sshd comes up ~15-60s
+  # after RUNNING, and the guest agent writes the ssh keys after that. One
+  # that was already RUNNING should answer at once, so a failure there is a
+  # firewall or a key, and is not worth more than a few attempts.
+  local budget=30 direct_ok=0
+  [ "$WE_STARTED_VM" = "1" ] && budget=120
+  if [ "$SSH_MODE" = "tunnel" ]; then
+    ok "OAM_IAP_SSH_MODE=tunnel -- not probing direct ssh; going through the IAP tunnel"
+  elif direct_ssh_probe "$budget"; then
+    direct_ok=1
+  fi
+  REMOTE_TRANSPORT="$(ssh_transport_pick "$SSH_MODE" "$direct_ok")" \
+    || fail "OAM_IAP_SSH_MODE=direct, but direct ssh to $INSTANCE did not answer: $DIRECT_SSH_ERR${DIRECT_SSH_HINT:+ -- $DIRECT_SSH_HINT}. Unset OAM_IAP_SSH_MODE (auto) to fall back to the IAP tunnel."
+  if [ "$REMOTE_TRANSPORT" = "direct" ]; then
+    ok "direct ssh roundtrip ok: ${LINUX_USER}@${DIRECT_IP} (external IP; no IAP tunnel started)"
+    return 0
+  fi
+  if [ "$SSH_MODE" = "auto" ]; then
+    warn "FALLING BACK TO THE IAP TUNNEL: direct ssh to ${LINUX_USER}@${DIRECT_IP:-$INSTANCE} failed -- $DIRECT_SSH_ERR"
+    if [ -n "$DIRECT_SSH_HINT" ]; then warn "  hint: $DIRECT_SSH_HINT"; fi
+    warn "  every remote call now goes through gcloud's IAP relay, which is slower per call and drops idle connections; OAM_IAP_SSH_MODE=tunnel skips this probe next time"
+  fi
+
+  step "Start IAP tunnel + verify SSH on $INSTANCE"
+  start_iap_tunnel
+  # Retry the roundtrip probe: after a cold VM start, OS Login / metadata key
+  # propagation can lag the tunnel by a few seconds. 10 x 6s covers a cold
+  # boot; a real auth problem fails all ten.
+  local probe_ok=0 probe_attempt probe_err="" probe_rc
+  for probe_attempt in 1 2 3 4 5 6 7 8 9 10; do
+    probe_rc=0
+    probe_err="$(gcp_ssh "true" 2>&1 >/dev/null)" || probe_rc=$?
+    if [ "$probe_rc" -eq 0 ]; then
+      probe_ok=1
+      break
+    fi
+    [ "$probe_attempt" -lt 10 ] && { warn "IAP SSH probe failed (attempt $probe_attempt/10) -- retrying in 6s..."; sleep 6; }
+  done
+  if [ "$probe_ok" -eq 1 ]; then
+    ok "IAP SSH roundtrip ok (tunnel localhost:$IAP_TUNNEL_PORT)"
+  else
+    probe_err="$(last_nonblank_line "$probe_err" || echo "ssh exited $probe_rc without writing anything to stderr")"
+    fail "IAP tunnel is up (port $IAP_TUNNEL_PORT) but ssh 'true' failed after 10 attempts: $probe_err. Check (1) $IAP_SSH_KEY exists, (2) OS Login accepted the key for $LINUX_USER, (3) google_compute_known_hosts is not stale."
+  fi
 }
 
 # Ship the WORKING TREE (uncommitted release fixes should build), asking git
@@ -405,7 +594,7 @@ gcp_scp_from(){  # gcp_scp_from <remote-glob-under-REMOTE_DIR> <local-dir>
 # 2026-08-31 operator saw only the EXIT trap's "stopping VM" line and had no
 # indication of which step had failed, or that a step had failed at all.
 sync_src(){
-  ok "sync source -> $INSTANCE:$REMOTE_DIR (via IAP; remote target/ preserved)"
+  ok "sync source -> $INSTANCE:$REMOTE_DIR (via $(transport_desc); remote target/ preserved)"
   local t; t="$(mktemp "$STAGE_DIR/src-XXXXXX.tar.gz")" \
     || fail "could not create a staging tarball under $STAGE_DIR"
   write_src_tarball "$REPO_DIR" "$t" \
@@ -424,18 +613,19 @@ sync_src(){
   ok "source tarball: $((bytes / 1024))KB (ceiling ${OAM_SRC_TARBALL_MAX_MB}MB)"
 
   gcp_scp_to "$t" "oam-src.tar.gz" \
-    || fail "scp of the source tarball to $INSTANCE failed (tunnel localhost:$IAP_TUNNEL_PORT)"
+    || fail "scp of the source tarball to $INSTANCE failed ($(transport_desc))"
   gcp_ssh "mkdir -p $REMOTE_DIR && cd $REMOTE_DIR && find . -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} + && tar xzf ~/oam-src.tar.gz && rm -f ~/oam-src.tar.gz" \
     || fail "remote extract of the source tarball into $REMOTE_DIR failed"
   rm -f "$t"
 }
 
 # remote_step_postmortem <log>: a remote step whose ssh transport dropped ends
-# with `Connection to localhost closed by remote host.` and no remote exit
-# code -- which is what a scheduled VM stop, a host error and an IAP tunnel
-# reset all look like from here. The run's cleanup is about to stop the VM and
-# delete the tunnel log, so ask the compute API NOW and put the answer next to
-# the failure. Best effort: a postmortem must never mask the failure itself.
+# with `Connection to <host> closed by remote host.` and no remote exit code
+# -- which is what a scheduled VM stop, a host error, a network blip and an
+# IAP tunnel reset all look like from here. The run's cleanup is about to stop
+# the VM and delete the tunnel log, so ask the compute API NOW and put the
+# answer next to the failure. Best effort: a postmortem must never mask the
+# failure itself.
 remote_step_postmortem() {
   local log="$1" status last_stop
   ssh_transport_dropped "$(tail -5 "$log" 2>/dev/null || true)" || return 0
@@ -444,7 +634,11 @@ remote_step_postmortem() {
   status="${status//$'\r'/}"
   case "$status" in
     RUNNING)
-      warn "ssh transport dropped but $INSTANCE is still RUNNING -- the IAP tunnel reset under the step (transient; re-run). Tunnel log tail: $(tail -3 "$IAP_TUNNEL_LOG" 2>/dev/null | tr -d '\r' | tr '\n' ' ')"
+      if [ "$REMOTE_TRANSPORT" = "direct" ]; then
+        warn "ssh transport dropped but $INSTANCE is still RUNNING -- the direct connection to ${DIRECT_IP} was cut under the step (a network blip or an sshd restart on the guest; transient -- re-run)"
+      else
+        warn "ssh transport dropped but $INSTANCE is still RUNNING -- the IAP tunnel reset under the step (transient; re-run). Tunnel log tail: $(tail -3 "$IAP_TUNNEL_LOG" 2>/dev/null | tr -d '\r' | tr '\n' ' ')"
+      fi
       ;;
     *)
       last_stop="$(gcloud compute operations list --project="$PROJECT" \
@@ -482,27 +676,11 @@ remote_step_advisory(){
 }
 
 # --- preflight ----------------------------------------------------------------
-step "Run $RUNID -- oam linux-x64 --mode=$MODE on $INSTANCE via IAP"
+step "Run $RUNID -- oam linux-x64 --mode=$MODE on $INSTANCE"
 ( cd "$REPO_DIR" && git diff --quiet HEAD ) || warn "working tree dirty -- uncommitted changes WILL ship"
 
-step "Start IAP tunnel + verify SSH on $INSTANCE"
-start_iap_tunnel
-# Retry the roundtrip probe: after a cold VM start, OS Login / metadata key
-# propagation can lag the tunnel by a few seconds. 10 x 6s covers a cold
-# boot; a real auth problem fails all ten.
-IAP_PROBE_OK=0
-for IAP_PROBE_ATTEMPT in 1 2 3 4 5 6 7 8 9 10; do
-  if gcp_ssh "true" >/dev/null 2>&1; then
-    IAP_PROBE_OK=1
-    break
-  fi
-  [ "$IAP_PROBE_ATTEMPT" -lt 10 ] && { warn "IAP SSH probe failed (attempt $IAP_PROBE_ATTEMPT/10) -- retrying in 6s..."; sleep 6; }
-done
-if [ "$IAP_PROBE_OK" -eq 1 ]; then
-  ok "IAP SSH roundtrip ok (tunnel localhost:$IAP_TUNNEL_PORT)"
-else
-  fail "IAP tunnel is up (port $IAP_TUNNEL_PORT) but ssh 'true' failed after 10 attempts. Check (1) $IAP_SSH_KEY exists, (2) OS Login accepted the key for $LINUX_USER, (3) google_compute_known_hosts is not stale."
-fi
+step "Connect to $INSTANCE (OAM_IAP_SSH_MODE=$SSH_MODE)"
+connect_builder
 
 # --- build --------------------------------------------------------------------
 sync_src

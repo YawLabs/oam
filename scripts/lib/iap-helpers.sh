@@ -14,9 +14,14 @@
 #                       into a silent 180s stall on every cold VM start.
 #   disk_needs_reclaim  decides whether a release reclaims, proceeds, or aborts
 #   disk_below_floor    -- i.e. whether a release runs at all.
+#   ssh_transport_pick  direct ssh or the IAP tunnel -- the choice that decides
+#   last_nonblank_line  whether a run reaches the builder at all, and what it
+#                       says when it cannot.
 #
 # Same convention as lib/build-locks.sh: sourced, never executed. All functions
-# RETURN status rather than exiting; the caller owns fail()/warn().
+# RETURN status rather than exiting; the caller owns fail()/warn(). The one
+# helper that is not pure, kill_proc_tree, is here so the suite can run it
+# against a real process tree.
 # =============================================================================
 
 # --- gcloud tunnel log parsing -----------------------------------------------
@@ -149,4 +154,114 @@ iap_policy_region() {
 # ssh_transport_dropped <log-tail-text>   -- 0 when the text carries one.
 ssh_transport_dropped() {
   grep -qE 'closed by remote host|Connection reset by peer|Broken pipe|Connection closed by|client_loop: send disconnect|Connection timed out' <<<"$1"
+}
+
+# --- ssh transport: direct first, the IAP tunnel as the fallback --------------
+#
+# The builder has an external IP, and the default network's default-allow-ssh
+# rule opens tcp:22 on it to 0.0.0.0/0 -- so plain OpenSSH straight at that IP
+# works, and while that rule stands IAP adds no security. Measured
+# from the Windows orchestrator on 2026-09-25: ~1s per direct `ssh true`,
+# against 11-57s per `gcloud compute ssh --tunnel-through-iap` call (gcloud's
+# Python startup, then the IAP websocket relay). That day the sibling yaw
+# release died with "not reachable over IAP within 1269s" against a VM that
+# was up and healthy throughout: only 4 of 20 IAP probes even reached sshd, and
+# those 4 authenticated fine. So the orchestrator goes direct and keeps the
+# tunnel for a host that cannot reach tcp:22. OAM_IAP_SSH_MODE forces either.
+
+# ssh_mode_valid <mode>   -- 0 for a value OAM_IAP_SSH_MODE accepts.
+ssh_mode_valid() {
+  case "$1" in auto | direct | tunnel) return 0 ;; *) return 1 ;; esac
+}
+
+# ssh_transport_pick <mode> <direct-answered: 1 or anything else>
+# Echoes the transport the run uses: `direct` or `tunnel`. Non-zero, echoing
+# nothing, when there is none: OAM_IAP_SSH_MODE=direct forbids the fallback,
+# so a direct path that did not answer ends the run. `tunnel` never probes the
+# direct path, so its second argument is ignored.
+ssh_transport_pick() {
+  case "$1" in
+    tunnel) printf 'tunnel' ;;
+    direct) [ "$2" = "1" ] || return 1; printf 'direct' ;;
+    auto) if [ "$2" = "1" ]; then printf 'direct'; else printf 'tunnel'; fi ;;
+    *) return 1 ;;
+  esac
+}
+
+# last_nonblank_line <text>
+# Echoes the last line of <text> with anything but whitespace on it, CRs
+# stripped (ssh and gcloud on Windows end lines in \r\n). Non-zero when there
+# is no such line, so the caller has to say what that MEANS instead of printing
+# a placeholder: "Last error: (empty stderr)" is all 1269s of failed probes
+# left the operator on 2026-09-25.
+last_nonblank_line() {
+  local text="${1//$'\r'/}" line last=""
+  while IFS= read -r line; do
+    [[ "$line" =~ [^[:space:]] ]] && last="$line"
+  done <<<"$text"
+  [ -n "$last" ] || return 1
+  printf '%s' "$last"
+}
+
+# ssh_error_is_permanent <ssh-stderr>   -- 0 when retrying cannot help.
+# A changed host key is the one direct-ssh failure no amount of polling fixes:
+# ephemeral external IPs are recycled across stop/start, so an address this box
+# once recorded for another host can come back on this one, and OpenSSH refuses
+# it until the stale entry goes. Everything else a probe sees on a booting VM --
+# refused, timed out, publickey denied while the guest agent is still writing
+# keys -- is expected for the first minute.
+ssh_error_is_permanent() {
+  grep -qE 'Host key verification failed|REMOTE HOST IDENTIFICATION HAS CHANGED' <<<"$1"
+}
+
+# direct_ssh_hint <ssh-stderr> <ip>
+# One actionable sentence for the failure the text shows; nothing for a shape
+# it does not recognise (the stderr line itself then has to carry it).
+direct_ssh_hint() {
+  local t="$1" ip="$2"
+  case "$t" in
+    *'Host key verification failed'* | *'REMOTE HOST IDENTIFICATION HAS CHANGED'*)
+      printf 'the known_hosts entry for %s is for another host (ephemeral IPs are recycled); remove it with: ssh-keygen -R %s -f ~/.ssh/google_compute_known_hosts' "$ip" "$ip" ;;
+    *'Permission denied'*)
+      printf 'sshd refused ~/.ssh/google_compute_engine; running gcloud compute ssh against the VM once publishes that key for this user' ;;
+    *'timed out'* | *'No route to host'* | *'Network is unreachable'*)
+      printf 'tcp:22 on %s did not answer from this host; a firewall rule must allow it (default-allow-ssh does, unless it was removed) and this network must allow outbound ssh' "$ip" ;;
+    *'Connection refused'*)
+      printf 'nothing is listening on %s:22 -- sshd is down or still starting' "$ip" ;;
+  esac
+  return 0
+}
+
+# --- background process reaping -----------------------------------------------
+#
+# On Windows the scoop gcloud shim is a /bin/sh script that runs
+# `cmd.exe /C gcloud.cmd`, which runs python.exe -- so the pid `$!` names is
+# the sh, and `kill` stops ONLY the sh. The python under it lives on: two
+# `gcloud compute start-iap-tunnel` processes from the 2026-09-25 03:52 and
+# 03:56 runs were still alive ten hours later. `taskkill /T` walks the Windows
+# process tree down from the sh's Windows pid (/proc/<pid>/winpid, which only
+# MSYS/Cygwin have) and takes the whole chain. On Linux and macOS gcloud's
+# launcher execs python, so the plain kill is the whole job and the taskkill
+# branch never runs.
+#
+# Path conversion is switched off for the one call rather than spelling the
+# flags //F: under an exported MSYS_NO_PATHCONV=1, //F reaches taskkill
+# literally and it rejects it.
+
+# kill_proc_tree <pid>
+# Kills a background job and everything under it, then reaps it. Always
+# returns 0: a process that has already gone is the goal, not an error.
+kill_proc_tree() {
+  local pid="${1:-}" winpid=""
+  [ -n "$pid" ] || return 0
+  if [ -r "/proc/$pid/winpid" ] && command -v taskkill >/dev/null 2>&1; then
+    winpid="$(cat "/proc/$pid/winpid" 2>/dev/null || true)"
+    winpid="${winpid//[!0-9]/}"
+    if [ -n "$winpid" ]; then
+      MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' taskkill /F /T /PID "$winpid" >/dev/null 2>&1 || true
+    fi
+  fi
+  kill "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  return 0
 }

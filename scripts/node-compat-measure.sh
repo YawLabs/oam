@@ -8,7 +8,8 @@
 # continues, matching the old workflow's continue-on-error):
 #   local (this box)      cargo run -p xtask -- conformance + node-suite
 #   mac-arm64 (tailnet)   scripts/build-platforms-tailnet.sh --mode=measure
-#   linux-x64 (GCP IAP)   scripts/build-platforms-gcp-iap.sh --mode=measure
+#   linux-x64 (GCP)       scripts/build-platforms-gcp-iap.sh --mode=measure
+#                         (direct ssh to the VM, IAP tunnel fallback)
 #
 # The per-PR RATCHET gate (the only gating part of node-compat.yml) lives in
 # scripts/ci-local.sh step 7 -- this script is purely measurement.
@@ -22,7 +23,7 @@
 #   OAM_SKIP_LINUX=1 ...                             # drop the linux leg
 #   OAM_SKIP_LOCAL=1 ...                             # drop the local leg
 # Remote host config: same env as the two platform scripts (OAM_MAC_HOST,
-# OAM_MAC_USER, OAM_GCP_*, OAM_KEEP_VM).
+# OAM_MAC_USER, OAM_GCP_*, OAM_KEEP_VM, OAM_IAP_SSH_MODE).
 # =============================================================================
 
 set -euo pipefail
@@ -79,7 +80,7 @@ fi
 if [ "${OAM_SKIP_LINUX:-0}" = "1" ]; then
   warn "OAM_SKIP_LINUX=1 -- linux leg skipped"
 else
-  step "Linux leg (GCP IAP, --mode=measure)"
+  step "Linux leg (GCP, --mode=measure)"
   if LINUX_ART=$(bash "$SCRIPT_DIR/build-platforms-gcp-iap.sh" --mode=measure); then
     LINUX_ART="${LINUX_ART##*$'\n'}"   # contract: artifact dir = LAST stdout line
     cp -r "$LINUX_ART/linux-x64" "$STAGE_DIR/"
