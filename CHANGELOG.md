@@ -16,6 +16,8 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-09-24
+
 ### Added
 
 - **`tls.setDefaultCACertificates(certs)` (Node 22.15+) replaces the process default trust
@@ -3328,7 +3330,8 @@ releases.
 - The `fork` prewarm pool warms lazily, on first `fork()`.
 - `io_uring` read chunks grow from 64 KiB to 4 MiB, fixing large-file reads.
 
-[Unreleased]: https://github.com/YawLabs/oam/compare/v0.16.4...HEAD
+[Unreleased]: https://github.com/YawLabs/oam/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/YawLabs/oam/compare/v0.16.4...v0.17.0
 [0.16.4]: https://github.com/YawLabs/oam/compare/v0.16.3...v0.16.4
 [0.16.3]: https://github.com/YawLabs/oam/compare/v0.16.2...v0.16.3
 [0.16.2]: https://github.com/YawLabs/oam/compare/v0.16.1...v0.16.2
