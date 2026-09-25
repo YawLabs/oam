@@ -877,6 +877,120 @@ impl NodeCertVerifier {
     }
 }
 
+/// Node's rules for the chains the NODE_EXTRA_CA_CERTS bundle anchors, for a
+/// client whose other chains another verifier judges: the fetch transport,
+/// whose public chains are the platform verifier's call
+/// (`http_client::tls_config`). Node's undici and https share OpenSSL's one
+/// store with tls.connect, so a certificate under an extra root is accepted
+/// or refused there exactly as `tls.connect` accepts or refuses it, with no
+/// operating-system policy on top. Apple's Security framework -- the
+/// platform verifier on macOS -- refuses any server certificate valid for
+/// more than 825 days whatever anchors it (measured on macOS 27: 826 days
+/// refused, 825 accepted), so a private CA's long-lived certificate that node
+/// trusts through NODE_EXTRA_CA_CERTS was refused by oam's fetch on macOS
+/// alone, and named `SELF_SIGNED_CERT_IN_CHAIN` off the chain because the
+/// refusal itself is opaque. Judging those chains here, with the verifier
+/// tls.connect uses, gives them node's verdict on every platform.
+#[derive(Debug)]
+pub(crate) struct ExtraCaVerifier {
+    inner: NodeCertVerifier,
+}
+
+/// What [`ExtraCaVerifier::judge`] says about a chain.
+#[derive(Debug)]
+pub(crate) enum ExtraCaVerdict {
+    /// The chain ends at an extra root, or the leaf is one of the extra
+    /// certificates itself, and it passed the validity and host-name checks.
+    Accepted,
+    /// The chain is refused: node's failure (with node's code, when node has
+    /// a name for it) and the rustls error that aborts the handshake.
+    Refused(VerifyFailure, rustls::Error),
+    /// Nothing in the bundle anchors the chain: not this verifier's to judge.
+    NotAnchored,
+}
+
+impl ExtraCaVerifier {
+    /// The verifier for `certs`, the NODE_EXTRA_CA_CERTS bundle as
+    /// `extra_ca_certs` loaded it; `None` for an empty bundle. The store is
+    /// composed as `build_client_config` composes it for a connection with no
+    /// `ca`: a self-signed certificate anchors, a non-self-signed one is an
+    /// intermediate, and every one is trusted by name as a leaf.
+    pub(crate) fn new(certs: &[CertificateDer<'static>]) -> Result<Option<Self>, String> {
+        if certs.is_empty() {
+            return Ok(None);
+        }
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in certs.iter().filter(|c| is_self_signed(c.as_ref())) {
+            let _ = root_store.add(cert.clone());
+        }
+        let trusted_non_anchors: Vec<CertificateDer<'static>> = certs
+            .iter()
+            .filter(|c| !is_self_signed(c.as_ref()))
+            .cloned()
+            .collect();
+        let provider = node_crypto_provider();
+        let inner = if root_store.is_empty() {
+            None
+        } else {
+            Some(
+                rustls::client::WebPkiServerVerifier::builder_with_provider(
+                    Arc::new(root_store),
+                    Arc::clone(&provider),
+                )
+                .build()
+                .map_err(|e| format!("tls verifier: {e}"))?,
+            )
+        };
+        Ok(Some(Self {
+            inner: NodeCertVerifier {
+                inner,
+                supported: provider.signature_verification_algorithms,
+                trusted_leaves: certs.to_vec(),
+                trusted_non_anchors,
+                untrusted_known: Vec::new(),
+                advisory: false,
+                check_name: true,
+                outcome: Arc::new(Mutex::new(None)),
+            },
+        }))
+    }
+
+    /// Node's verdict on the chain, or `NotAnchored` when the bundle does not
+    /// anchor it -- the one refusal that is another verifier's to make. A
+    /// leaf outside its validity period is refused here whatever anchors it,
+    /// as OpenSSL refuses it first (and as every platform verifier would).
+    pub(crate) fn judge(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        now: UnixTime,
+    ) -> ExtraCaVerdict {
+        match self
+            .inner
+            .verdict(end_entity, intermediates, server_name, now)
+        {
+            Ok(()) => ExtraCaVerdict::Accepted,
+            Err((_, error)) if is_unknown_issuer(&error) => ExtraCaVerdict::NotAnchored,
+            Err((failure, error)) => ExtraCaVerdict::Refused(failure, error),
+        }
+    }
+}
+
+/// Whether `error` is webpki failing to reach a trust anchor: `UnknownIssuer`,
+/// or the `CaUsedAsEndEntity` a CA:TRUE leaf draws before any issuer is
+/// looked for, which [`NodeCertVerifier::verdict`] reads the same way.
+fn is_unknown_issuer(error: &rustls::Error) -> bool {
+    match error {
+        rustls::Error::InvalidCertificate(CertificateError::UnknownIssuer) => true,
+        rustls::Error::InvalidCertificate(CertificateError::Other(other)) => other
+            .0
+            .downcast_ref::<webpki::Error>()
+            .is_some_and(|e| matches!(e, webpki::Error::CaUsedAsEndEntity)),
+        _ => false,
+    }
+}
+
 /// Whether a certificate is its own issuer (subject == issuer, byte for
 /// byte) -- the shape OpenSSL will accept as a trust anchor.
 fn is_self_signed(der: &[u8]) -> bool {
@@ -2369,6 +2483,61 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
             refusal_in_node_terms(&cert, &[], &name, now, &rustls::Error::DecryptError,).is_none(),
             "only a certificate refusal is renamed"
         );
+    }
+
+    /// The fetch transport judges a chain the NODE_EXTRA_CA_CERTS bundle
+    /// anchors by node's rules, not the platform's: the bundle's own
+    /// certificate served as the leaf is trusted by name, refused on the host
+    /// name, and refused on its validity, while a chain the bundle does not
+    /// anchor is left to the platform verifier.
+    #[test]
+    fn the_extra_ca_verifier_judges_only_what_the_bundle_anchors() {
+        let cert = CertificateDer::from_pem_slice(CERT.as_bytes()).unwrap();
+        let verifier = ExtraCaVerifier::new(std::slice::from_ref(&cert))
+            .unwrap()
+            .expect("a non-empty bundle has a verifier");
+        let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_789_000_000));
+        let localhost = ServerName::try_from("localhost").unwrap();
+        assert!(matches!(
+            verifier.judge(&cert, &[], &localhost, now),
+            ExtraCaVerdict::Accepted
+        ));
+        // The bundle's certificate under another name: trusted, then refused
+        // on the name, as node's checkServerIdentity refuses it.
+        let elsewhere = ServerName::try_from("example.com").unwrap();
+        match verifier.judge(&cert, &[], &elsewhere, now) {
+            ExtraCaVerdict::Refused(failure, _) => {
+                assert_eq!(failure.code, Some("ERR_TLS_CERT_ALTNAME_INVALID"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // Outside its validity period: refused on that first, whatever
+        // anchors it.
+        let later = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_900_000_000));
+        match verifier.judge(&cert, &[], &localhost, later) {
+            ExtraCaVerdict::Refused(failure, _) => {
+                assert_eq!(failure.code, Some("CERT_HAS_EXPIRED"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // A chain the bundle does not anchor -- a Mozilla root, valid at the
+        // test time so that its validity is not what decides -- is not this
+        // verifier's to judge.
+        let at = ASN1Time::from_timestamp(1_789_000_000).unwrap();
+        let stranger = webpki_root_certs::TLS_SERVER_ROOT_CERTS
+            .iter()
+            .find(|der| {
+                parse_x509_certificate(der.as_ref())
+                    .is_ok_and(|(_, root)| root.validity().is_valid_at(at))
+            })
+            .expect("a Mozilla root valid at the test time")
+            .clone();
+        assert!(matches!(
+            verifier.judge(&stranger, &[], &localhost, now),
+            ExtraCaVerdict::NotAnchored
+        ));
+        // An empty bundle has no verifier at all.
+        assert!(ExtraCaVerifier::new(&[]).unwrap().is_none());
     }
 
     #[test]

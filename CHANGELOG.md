@@ -33,6 +33,18 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
+- **`fetch` and an option-less `https.request` refused a private CA's long-lived certificate
+  on macOS, though `NODE_EXTRA_CA_CERTS` trusted its root.** The shared transport handed the
+  bundle to the platform verifier as extra anchors, and Apple's Security framework applies its
+  own policy to every chain it evaluates: a server certificate valid for more than 825 days is
+  refused whatever anchors it (measured on macOS 27: 826 days refused, 825 accepted). Node's
+  OpenSSL has no such cap, so a certificate node accepted -- a ten-year internal certificate,
+  or the 100-year test leaves -- failed oam's `fetch` on macOS alone, with the cause
+  `SELF_SIGNED_CERT_IN_CHAIN` (the refusal is opaque, so it was named off the chain). A chain
+  the `NODE_EXTRA_CA_CERTS` bundle anchors is now judged by node's rules -- the verifier
+  `tls.connect` uses -- on every platform, before the platform verifier, which keeps every
+  other chain. Windows and Linux never showed it: their verifiers apply no validity cap. Three
+  e2e tests that had skipped macOS for this run there again.
 - **An `https` server never fired `'upgrade'` or `'connect'`, so a WebSocket handshake reached
   the ordinary `'request'` handler and a CONNECT was closed** (#205). The https connection was
   built with `Upgrades::CloseConnect` -- an upgrade served as an ordinary request, a CONNECT

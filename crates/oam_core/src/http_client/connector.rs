@@ -435,8 +435,9 @@ impl std::error::Error for HandshakeFailed {
 /// Where a transport's TLS configs come from.
 #[derive(Clone)]
 pub enum TlsSource {
-    /// The platform verifier plus NODE_EXTRA_CA_CERTS, built on first use
-    /// (see [`tls_config::platform`]).
+    /// Node's rules for a chain NODE_EXTRA_CA_CERTS anchors, the platform
+    /// verifier for every other; built on first use (see
+    /// [`tls_config::platform`]).
     Platform,
     /// Fixed configs (tests: a private root instead of the system store).
     Fixed(TlsConfigs),

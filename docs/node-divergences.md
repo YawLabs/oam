@@ -1337,13 +1337,22 @@ What still differs:
   up`. A refusal the platform verifier makes for a reason Node has no name for (an OS
   policy, say) keeps those old texts. Whether a certificate is accepted is still the
   platform verifier's call (next item).
-- **The trust store is the operating system's.** `fetch` and the verifying `https.request`
-  verify with the platform verifier plus `NODE_EXTRA_CA_CERTS`; Node's `fetch`, and
-  `tls.connect` in both runtimes, use Mozilla's bundled roots plus `NODE_EXTRA_CA_CERTS`. A
-  root the OS trusts and Mozilla does not (a corporate inspection proxy's, say) is trusted by
-  oam's `fetch` and not by Node's. The verifier is built on the first https request, so a
-  machine without a usable certificate store still runs; its https requests then fail with
-  `tls configuration error: ...`. _(source)_
+- **The trust store is the operating system's, except for what `NODE_EXTRA_CA_CERTS`
+  anchors.** `fetch` and an option-less `https.request` judge a chain the `NODE_EXTRA_CA_CERTS`
+  bundle anchors by node's rules -- the verifier `tls.connect` uses, so the certificate is
+  accepted or refused exactly as `tls.connect` accepts or refuses it -- and every other chain
+  with the platform verifier; Node's `fetch`, and `tls.connect` in both runtimes, use
+  Mozilla's bundled roots plus `NODE_EXTRA_CA_CERTS`. A root the OS trusts and Mozilla does
+  not (a corporate inspection proxy's, say) is trusted by oam's `fetch` and not by Node's.
+  The split keeps an operating-system policy off a private CA's certificates: Apple's
+  Security framework refuses any server certificate valid for more than 825 days whatever
+  anchors it (measured on macOS 27: 826 days refused, 825 accepted), so up to 0.16.4, when
+  the bundle was handed to the platform verifier as extra anchors, a long-lived certificate
+  node trusts through `NODE_EXTRA_CA_CERTS` failed oam's `fetch` on macOS alone, with the
+  cause `SELF_SIGNED_CERT_IN_CHAIN` (the refusal is opaque, so it was named off the chain).
+  The verifier is built on the first https request, so a machine without a usable certificate
+  store still runs; its https requests then fail with `tls configuration error: ...`.
+  _(source)_
 - **The happy-eyeballs attempt timeout is latched at the dial, not at the request.** Both
   runtimes take it from one process-wide value
   (`net.setDefaultAutoSelectFamilyAttemptTimeout`), and for the usual case -- every caller

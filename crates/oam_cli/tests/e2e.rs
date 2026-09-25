@@ -7208,10 +7208,10 @@ server.close();
 /// server saw, the verifier's verdict and the peer certificate (a post-hoc
 /// pinning check reads the real one) -- for a fresh connection and again for
 /// a pooled one. The CA is trusted through NODE_EXTRA_CA_CERTS, which the
-/// transport's platform verifier honours. Not on macOS: Security.framework
-/// caps a server certificate's validity at 825 days, and this 100-year leaf
-/// is refused there for that reason alone.
-#[cfg(not(target_os = "macos"))]
+/// transport honours on every platform: a chain the bundle anchors is judged
+/// by node's rules, so Security.framework's 825-day cap on a server
+/// certificate's validity does not reach this 100-year leaf on macOS (it
+/// did, while the platform verifier held the bundle).
 #[test]
 fn an_https_socket_on_the_fetch_transport_reports_its_connection() {
     let bundle = write_temp("fetch-socket-extra-ca/ca.pem", TLS_TEST_CA_CERT);
@@ -8017,13 +8017,12 @@ server.close();
     );
 }
 
-/// fetch trusts NODE_EXTRA_CA_CERTS through the platform verifier, for a
-/// plain fetch, a hooked one (whose connection is pinned but whose
-/// certificate is still checked against the host name) and https.get; without
-/// the variable the private CA is refused. Not on macOS: Security.framework
-/// caps a server certificate's validity at 825 days, and this 100-year leaf
-/// would be refused there for that reason alone.
-#[cfg(not(target_os = "macos"))]
+/// fetch trusts NODE_EXTRA_CA_CERTS, for a plain fetch, a hooked one (whose
+/// connection is pinned but whose certificate is still checked against the
+/// host name) and https.get; without the variable the private CA is refused.
+/// On macOS too: a chain the bundle anchors is judged by node's rules, not
+/// Security.framework's, whose 825-day cap on a server certificate's validity
+/// refused this 100-year leaf while the platform verifier held the bundle.
 #[test]
 fn fetch_https_trusts_node_extra_ca_certs() {
     let bundle = write_temp("fetch-extra-ca/ca.pem", TLS_TEST_CA_CERT);
@@ -24454,10 +24453,8 @@ for (const allowHTTP1 of [false, true]) {
 /// oam's own fetch negotiates h2 by ALPN with http2.createSecureServer and
 /// is served over HTTP/2 through the compatibility API (the server trusts
 /// nothing but its own key; the client trusts the test CA through
-/// NODE_EXTRA_CA_CERTS). Not on macOS: Security.framework refuses the
-/// 100-year test leaf on its validity alone (see
+/// NODE_EXTRA_CA_CERTS -- on macOS too, see
 /// fetch_https_trusts_node_extra_ca_certs).
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn http2_secure_server_serves_fetch_over_h2() {
     let bundle = write_temp("h2-secure-extra-ca/ca.pem", TLS_TEST_CA_CERT);
