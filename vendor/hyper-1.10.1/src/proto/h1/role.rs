@@ -11,7 +11,9 @@ use http::header::Entry;
 use http::header::ValueIter;
 use http::header::{self, HeaderMap, HeaderName, HeaderValue};
 use http::{Method, StatusCode, Version};
-use smallvec::{smallvec, smallvec_inline, SmallVec};
+#[cfg(feature = "client")]
+use smallvec::smallvec_inline;
+use smallvec::{smallvec, SmallVec};
 
 use crate::body::DecodedLength;
 #[cfg(feature = "server")]
@@ -165,8 +167,9 @@ impl Http1Transaction for Server {
         {
             loop {
                 let cap = headers_indices.len();
-                let mut headers: SmallVec<[MaybeUninit<httparse::Header<'_>>; DEFAULT_MAX_HEADERS]> =
-                    smallvec![MaybeUninit::uninit(); cap];
+                let mut headers: SmallVec<
+                    [MaybeUninit<httparse::Header<'_>>; DEFAULT_MAX_HEADERS],
+                > = smallvec![MaybeUninit::uninit(); cap];
                 trace!(bytes = buf.len(), "Request.parse");
                 let mut req = httparse::Request::new(&mut []);
                 let bytes = buf.as_ref();
@@ -182,9 +185,8 @@ impl Http1Transaction for Server {
                         if uri.len() > MAX_URI_LEN {
                             return Err(Parse::UriTooLong);
                         }
-                        method = Method::from_bytes(
-                            req.method.expect("httparse completed").as_bytes(),
-                        )?;
+                        method =
+                            Method::from_bytes(req.method.expect("httparse completed").as_bytes())?;
                         path_range = Server::record_path_range(bytes, uri);
                         version = if req.version.expect("httparse completed") == 1 {
                             keep_alive = true;
@@ -215,8 +217,7 @@ impl Http1Transaction for Server {
                     // oam patch (item 11): the head overflowed the current
                     // buffer but is still within the cap -- grow and re-parse.
                     Err(httparse::Error::TooManyHeaders) if cap < hard_cap => {
-                        headers_indices =
-                            smallvec![MaybeUninit::uninit(); (cap * 2).min(hard_cap)];
+                        headers_indices = smallvec![MaybeUninit::uninit(); (cap * 2).min(hard_cap)];
                         continue;
                     }
                     Err(err) => return Err(err.into()),
