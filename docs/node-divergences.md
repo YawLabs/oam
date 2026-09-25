@@ -1335,24 +1335,32 @@ What still differs:
   classification `tls.connect` uses (#136). Up to 0.16.2 `fetch`'s cause was the uncoded
   `error sending request for url (...)` and `https.request` emitted `ECONNRESET` `socket hang
   up`. A refusal the platform verifier makes for a reason Node has no name for (an OS
-  policy, say) keeps those old texts. Whether a certificate is accepted is still the
-  platform verifier's call (next item).
-- **The trust store is the operating system's, except for what `NODE_EXTRA_CA_CERTS`
-  anchors.** `fetch` and an option-less `https.request` judge a chain the `NODE_EXTRA_CA_CERTS`
-  bundle anchors by node's rules -- the verifier `tls.connect` uses, so the certificate is
-  accepted or refused exactly as `tls.connect` accepts or refuses it -- and every other chain
-  with the platform verifier; Node's `fetch`, and `tls.connect` in both runtimes, use
-  Mozilla's bundled roots plus `NODE_EXTRA_CA_CERTS`. A root the OS trusts and Mozilla does
-  not (a corporate inspection proxy's, say) is trusted by oam's `fetch` and not by Node's.
-  The split keeps an operating-system policy off a private CA's certificates: Apple's
-  Security framework refuses any server certificate valid for more than 825 days whatever
-  anchors it (measured on macOS 27: 826 days refused, 825 accepted), so up to 0.16.4, when
-  the bundle was handed to the platform verifier as extra anchors, a long-lived certificate
-  node trusts through `NODE_EXTRA_CA_CERTS` failed oam's `fetch` on macOS alone, with the
-  cause `SELF_SIGNED_CERT_IN_CHAIN` (the refusal is opaque, so it was named off the chain).
-  The verifier is built on the first https request, so a machine without a usable certificate
-  store still runs; its https requests then fail with `tls configuration error: ...`.
-  _(source)_
+  policy, say) is named off the chain the server sent, as OpenSSL's would be. Whether a
+  certificate is accepted is the platform verifier's call, with a second verdict on macOS for
+  a chain `NODE_EXTRA_CA_CERTS` anchors (next item).
+- **The trust store is the operating system's.** `fetch`, and an `https.request` / `https.get`
+  that runs on the shared transport (no TLS option of its own, among the other conditions
+  entry 43 lists), verify with the platform verifier plus
+  `NODE_EXTRA_CA_CERTS`; Node's `fetch`, and `tls.connect` in both runtimes, use Mozilla's
+  bundled roots plus `NODE_EXTRA_CA_CERTS`. A root the OS trusts and Mozilla does not (a
+  corporate inspection proxy's, say) is trusted by oam's `fetch` and not by Node's. A
+  platform verifier also applies its operating system's TLS policy to the bundle's chains,
+  and Apple's holds a rule node's does not: a server certificate valid for more than 825 days
+  is refused even under a root the user added (measured on macOS 27 with `security
+  verify-cert -p ssl`: 826 days refused, 825 accepted). So on macOS a chain Apple's TLS policy
+  refuses gets a second verdict: it is accepted when Apple's basic X.509 evaluation trusts it
+  against the `NODE_EXTRA_CA_CERTS` bundle alone (signatures, validity periods and CA
+  constraints, the root's included, but no TLS rule) and node's TLS rules accept it (the
+  extended key usage of every certificate in the path, the leaf's validity period and
+  purpose, the host name); refused with node's code when that evaluation trusts it and node's
+  rules do not; and otherwise the platform's refusal stands, as does any revocation it
+  found. Up to 0.16.4,
+  without it, a long-lived certificate node trusts through `NODE_EXTRA_CA_CERTS` failed oam's
+  `fetch` on macOS alone; the refusal is opaque, so it was named off the chain the server sent
+  (`SELF_SIGNED_CERT_IN_CHAIN` when the server sent its root, `UNABLE_TO_VERIFY_LEAF_SIGNATURE`
+  for a leaf sent alone). The verifier is built on the first https request, so a machine
+  without a usable certificate store still runs; its https requests then fail with `tls
+  configuration error: ...`. _(source)_
 - **The happy-eyeballs attempt timeout is latched at the dial, not at the request.** Both
   runtimes take it from one process-wide value
   (`net.setDefaultAutoSelectFamilyAttemptTimeout`), and for the usual case -- every caller

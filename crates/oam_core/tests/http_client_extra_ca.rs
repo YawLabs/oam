@@ -1,12 +1,15 @@
 //! The fetch transport's trust for the NODE_EXTRA_CA_CERTS bundle
-//! (`http_client::tls_config`), over real loopback TLS: a chain the bundle
-//! anchors is judged by node's rules on every platform -- the 100-year test
-//! leaf included, which Apple's Security framework refuses on its validity
-//! alone when it is the one asked -- and a chain the bundle does not anchor is
-//! the platform verifier's, refused with node's code for a lone leaf nobody
-//! trusts. The bundle is passed in directly (`platform_with_extra_roots`):
-//! the environment variable is read once per process, which no test in a
-//! shared binary can own.
+//! (`http_client::tls_config`), over real loopback TLS with this host's own
+//! platform verifier: a chain the bundle anchors is accepted on every
+//! platform -- the 100-year test leaf included, which Apple's TLS policy
+//! refuses on its validity period alone, where the macOS second verdict
+//! (Apple's X.509 rules and node's TLS rules) accepts it -- and refused with
+//! node's code when node refuses it; a chain the bundle does not anchor is
+//! refused with node's code for a lone leaf nobody trusts. The bundle is
+//! passed in directly (`platform_with_extra_roots`): the environment
+//! variable is read once per process, which no test in a shared binary can
+//! own. How the two verdicts combine is pinned host-independently by
+//! tls_config's unit tests.
 
 mod common;
 
@@ -75,11 +78,11 @@ async fn body_text(response: http::Response<hyper::body::Incoming>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// The bundle's root anchors the served leaf: accepted by node's rules, on
-/// macOS too, where the platform verifier alone refuses this 100-year leaf
-/// (Security.framework caps a server certificate's validity at 825 days).
+/// The bundle's root anchors the served leaf: accepted, on macOS too, where
+/// Apple's TLS policy refuses this 100-year leaf on its validity period
+/// alone (the 825-day rule) and the second verdict accepts it.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_chain_the_extra_ca_bundle_anchors_is_judged_by_node_s_rules() {
+async fn a_chain_the_extra_ca_bundle_anchors_is_accepted() {
     within(async {
         let origin = serve_h2_tls("extra ok").await;
         let transport = transport_trusting(&bundle(TLS_TEST_CA_CERT));
@@ -91,14 +94,42 @@ async fn a_chain_the_extra_ca_bundle_anchors_is_judged_by_node_s_rules() {
     .await;
 }
 
-/// The bundle holds the server's own certificate: trusted by name after the
-/// validity and host-name checks, as OpenSSL trusts a leaf that is itself in
-/// the store (how node reaches a self-signed development certificate).
+/// A self-signed development certificate (P-256, CA:FALSE, key usage
+/// digitalSignature, extended key usage serverAuth, SAN DNS:localhost and
+/// IP:127.0.0.1, valid 2025-2125) and its key: what a developer points
+/// NODE_EXTRA_CA_CERTS at for a local https server.
+const DEV_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBrDCCAVKgAwIBAgIUOhmQZYt9Bjx2GmWM6t1lMYG6XnAwCgYIKoZIzj0EAwIw\n\
+HDEaMBgGA1UEAwwRb2FtIGRldiBsb2NhbGhvc3QwIBcNMjUwMTAxMDAwMDAwWhgP\n\
+MjEyNTAxMDEwMDAwMDBaMBwxGjAYBgNVBAMMEW9hbSBkZXYgbG9jYWxob3N0MFkw\n\
+EwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE5yzAM4KyR4WAoPnqlA5I4956IqSIK5C0\n\
+qhDvJoTws1BXnIFCGySUiKt+ym7O0AjL2X6K4479ohfwYX0GsA0N0KNwMG4wGgYD\n\
+VR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/\n\
+BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMB0GA1UdDgQWBBRZIWZkadOURbzJ\n\
+hPc9wc1ty+lu1jAKBggqhkjOPQQDAgNIADBFAiB0kOXBGX8XphkW2VSsP9xRR5eF\n\
+Io8nesrXS7xDFFyo+wIhAJQ+G5IO6arB0XGOI1gRmTKcVtl9bwv8lpza3cr/lKR1\n\
+-----END CERTIFICATE-----\n";
+
+const DEV_KEY: &str = "-----BEGIN PRIVATE KEY-----\n\
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQguoknnn0/o/pphUNn\n\
+QCsCIr74b28GTTgv5VYN61AuKi6hRANCAATnLMAzgrJHhYCg+eqUDkjj3noipIgr\n\
+kLSqEO8mhPCzUFecgUIbJJSIq37Kbs7QCMvZforjjv2iF/BhfQawDQ3Q\n\
+-----END PRIVATE KEY-----\n";
+
+/// The bundle holds the server's own self-signed certificate: trusted by
+/// name after the validity and host-name checks, as OpenSSL trusts a
+/// self-signed leaf that is itself in the store (node v22.22.2 accepts this
+/// one through NODE_EXTRA_CA_CERTS, measured). On macOS that is the second
+/// verdict's call: Apple's TLS policy refuses this 100-year certificate.
 #[tokio::test(flavor = "multi_thread")]
-async fn the_server_s_own_certificate_in_the_bundle_is_trusted_by_name() {
+async fn the_server_s_own_self_signed_certificate_in_the_bundle_is_trusted_by_name() {
     within(async {
-        let origin = serve_h2_tls("own leaf ok").await;
-        let transport = transport_trusting(&bundle(TLS_TEST_LEAF_CERT));
+        let origin = serve_h2_tls_with(
+            tls_acceptor_with(DEV_CERT, DEV_KEY, &[b"h2"]),
+            "own leaf ok",
+        )
+        .await;
+        let transport = transport_trusting(&bundle(DEV_CERT));
         let target = format!("https://localhost:{}/", origin.port);
         let response = get(&transport, &target).await.unwrap();
         assert_eq!(response.status(), 200);
@@ -108,7 +139,8 @@ async fn the_server_s_own_certificate_in_the_bundle_is_trusted_by_name() {
 }
 
 /// The bundle anchors the leaf but the host name is another's: refused on
-/// the name, with node's code, before the platform verifier is asked.
+/// the name, with node's code -- by the platform's name check, or on macOS,
+/// where Apple may report the validity period instead, by node's TLS rules.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_anchored_chain_under_the_wrong_name_is_refused_in_node_s_terms() {
     within(async {
@@ -142,8 +174,8 @@ async fn an_anchored_chain_under_the_wrong_name_is_refused_in_node_s_terms() {
     .await;
 }
 
-/// A bundle that anchors nothing of the chain leaves it to the platform
-/// verifier, whose refusal carries node's name for a lone leaf nobody trusts.
+/// A bundle that anchors nothing of the chain leaves the platform's refusal
+/// standing, named as node names a lone leaf nobody trusts.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_chain_the_bundle_does_not_anchor_is_the_platform_s_refused_in_node_s_terms() {
     within(async {

@@ -285,7 +285,41 @@ pub fn spawn_extra(
                         1 => GetStdHandle(STD_OUTPUT_HANDLE),
                         _ => GetStdHandle(STD_ERROR_HANDLE),
                     };
-                    child_handles.push(h);
+                    if h.is_null() || h == INVALID_HANDLE_VALUE {
+                        // No std handle to pass (a parent with none): the
+                        // sentinel stays, and is left out of the inherit list.
+                        child_handles.push(h);
+                        continue;
+                    }
+                    // Duplicated as INHERITABLE, as libuv duplicates an
+                    // inherited fd for its child: this process's own std
+                    // handle need not be -- oam clears the flag on its std
+                    // handles before it starts a type-checker
+                    // (oam_ts::daemon::unshare_std_handles) -- and a handle in
+                    // PROC_THREAD_ATTRIBUTE_HANDLE_LIST that is not
+                    // inheritable fails CreateProcessW with
+                    // ERROR_INVALID_PARAMETER, which surfaced as `spawn
+                    // EINVAL` from a script whose type-check had started. The
+                    // dup is ours, so it lands in child_close.
+                    let mut dup: HANDLE = std::ptr::null_mut();
+                    if DuplicateHandle(
+                        GetCurrentProcess(),
+                        h,
+                        GetCurrentProcess(),
+                        &mut dup,
+                        0,
+                        1, // inheritable
+                        DUPLICATE_SAME_ACCESS,
+                    ) == 0
+                    {
+                        cleanup_fail(&child_close, &nul_handles, &parent_fds);
+                        return Err(format!(
+                            "DuplicateHandle(fd{fd}) failed: {}",
+                            GetLastError()
+                        ));
+                    }
+                    child_close.push(dup);
+                    child_handles.push(dup);
                 }
                 StdioFd::Descriptor(raw) => {
                     // Re-duplicated as INHERITABLE: the caller's handle is not,
@@ -374,11 +408,13 @@ pub fn spawn_extra(
         // handles limits the child to them and makes concurrent spawn_extra
         // calls race-free: each child sees only its own list. (A residual
         // window remains against a concurrent NON-list spawner like tokio/std,
-        // inherent to the Win32 API -- std has the same limitation.)
+        // inherent to the Win32 API -- std has the same limitation -- and it
+        // covers the inheritable duplicates of this process's std handles an
+        // `inherit` fd is given, for as long as this spawn holds them.)
         //
-        // Handles in the list must be unique and valid; child_handles can
-        // repeat (two `inherit` fds share one std handle) and can hold INVALID
-        // sentinels, so dedup/filter first.
+        // Handles in the list must be unique and valid; child_handles can hold
+        // INVALID sentinels (a std handle this process does not have), so
+        // filter and dedup first.
         let mut inherit_list: Vec<HANDLE> = Vec::with_capacity(child_handles.len());
         for h in &child_handles {
             if !h.is_null() && *h != INVALID_HANDLE_VALUE && !inherit_list.contains(h) {

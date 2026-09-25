@@ -33,18 +33,53 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ### Fixed
 
-- **`fetch` and an option-less `https.request` refused a private CA's long-lived certificate
-  on macOS, though `NODE_EXTRA_CA_CERTS` trusted its root.** The shared transport handed the
-  bundle to the platform verifier as extra anchors, and Apple's Security framework applies its
-  own policy to every chain it evaluates: a server certificate valid for more than 825 days is
-  refused whatever anchors it (measured on macOS 27: 826 days refused, 825 accepted). Node's
-  OpenSSL has no such cap, so a certificate node accepted -- a ten-year internal certificate,
-  or the 100-year test leaves -- failed oam's `fetch` on macOS alone, with the cause
-  `SELF_SIGNED_CERT_IN_CHAIN` (the refusal is opaque, so it was named off the chain). A chain
-  the `NODE_EXTRA_CA_CERTS` bundle anchors is now judged by node's rules -- the verifier
-  `tls.connect` uses -- on every platform, before the platform verifier, which keeps every
-  other chain. Windows and Linux never showed it: their verifiers apply no validity cap. Three
-  e2e tests that had skipped macOS for this run there again.
+- **`fetch`, and an `https.request` / `https.get` with no TLS options of its own, refused a
+  private CA's long-lived certificate on macOS, though `NODE_EXTRA_CA_CERTS` trusted its
+  root.** Those requests run on the shared transport, whose platform verifier -- given the
+  bundle as extra roots -- applies the operating system's TLS policy to the bundle's chains
+  too, and Apple's holds a rule node's OpenSSL does not: a server certificate valid for more
+  than 825 days is refused even under a root the user added (measured on macOS 27 with
+  `security verify-cert -p ssl`: 826 days refused, 825 accepted). So a certificate node
+  accepted -- a ten-year internal certificate, or the 100-year test leaves -- failed oam's
+  `fetch` on macOS alone. The refusal is opaque, so it was named off the chain the server
+  sent: `SELF_SIGNED_CERT_IN_CHAIN` when the server sent its root (as oam's own servers do
+  with `NODE_EXTRA_CA_CERTS` set), `UNABLE_TO_VERIFY_LEAF_SIGNATURE` for a leaf sent alone. On
+  macOS a chain Apple's TLS policy refuses now gets a second verdict: it is accepted when
+  Apple's basic X.509 evaluation trusts it against the `NODE_EXTRA_CA_CERTS` bundle alone
+  (signatures, validity periods and CA constraints, the root's included) and node's TLS rules
+  accept it too (the extended key usage of every certificate in the path, the leaf's validity
+  period and purpose, the host name), and refused with node's code when that evaluation
+  trusts it and node's rules do not (`ERR_TLS_CERT_ALTNAME_INVALID`, `INVALID_PURPOSE`).
+  Anything else keeps the platform's refusal, and a revocation the platform found is final. Windows and Linux
+  are unchanged: their platform verifiers accepted the 100-year test leaves in every release
+  since the transport shipped. Three e2e tests that had skipped macOS for this run there
+  again.
+- **`oam mcp`'s `oam_run` answered long after its deadline when the script's output was still
+  held open.** On Windows, `oam run` type-checks a TypeScript file that has no tsconfig by
+  spawning tsgo directly, and tsgo inherited `oam run`'s own stdout and stderr as extra
+  handles; when the deadline killed the script, tsgo kept the pipes `oam mcp` reads open and
+  the tool answered only when tsgo exited (a 25-second tsgo held a 1.5-second deadline to 26
+  seconds, and the e2e deadline test failed on a loaded machine). tsgo no longer inherits
+  them. Separately, a process the script started that kept its stdio and outlived it -- on
+  Windows, a detached one -- held the answer until that process exited; the tool now
+  answers by the deadline plus half a second with the output that arrived, and drops what
+  such a process writes afterwards.
+- **On Windows, a `child_process` spawn with more than three stdio entries, `'inherit'` among
+  them, threw `spawn EINVAL` once the script's type-check had started.** oam clears the
+  inherit flag on its own std handles before it starts a type-checker (so the checker cannot
+  hold them open), and the spawn path for extra stdio entries passed the std handle itself in
+  the child's explicit inherit list, which Windows refuses for a handle that is not
+  inheritable. It now passes an inheritable duplicate, as libuv does. Every `.ts` run whose
+  type-check starts a checker process was exposed -- through the type-check daemon for a
+  project with a tsconfig since the daemon shipped, and with this release's tsgo fix above,
+  for a file without one too.
+- **A `fetch` aborted before it reached its dispatcher's `connect.lookup` hook (or its
+  `connect` function) stayed parked until the hook answered, forever if it never did.** Such a
+  fetch parks before dialling, and an abort drops the parked fetch, releasing a streamed
+  request body and every write blocked on it. The abort listener was attached only once the
+  fetch had parked, so an abort that landed first -- in the same tick as the call, or before a
+  busy machine got the fetch that far -- never fired it. The fetch now drops itself when it
+  parks already aborted; the hook is still asked, as node asks it.
 - **An `https` server never fired `'upgrade'` or `'connect'`, so a WebSocket handshake reached
   the ordinary `'request'` handler and a CONNECT was closed** (#205). The https connection was
   built with `Upgrades::CloseConnect` -- an upgrade served as an ordinary request, a CONNECT

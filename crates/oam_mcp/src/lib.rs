@@ -221,19 +221,60 @@ fn call_tool(name: &str, arguments: &Value) -> Result<Value, String> {
     }
 }
 
+/// How long, past the budget (or past a kill at the budget), the tool waits
+/// for the output pipes to close before it answers with what arrived.
+const PIPE_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Drain `pipe` on a thread into a buffer the caller can take at any time,
+/// sending on `closed` at end of file. The caller never has to wait for the
+/// end of file: a process the script started can hold the pipe open long
+/// after the script is gone. Once taken, the buffer is `None` and whatever
+/// such a process writes later is read and dropped -- read, so its writes do
+/// not block or fail on a full or closed pipe; dropped, so a long-lived
+/// server holds nothing for an answer already sent.
+fn drain_pipe<R: std::io::Read + Send + 'static>(
+    mut pipe: R,
+    closed: std::sync::mpsc::Sender<()>,
+) -> std::sync::Arc<std::sync::Mutex<Option<Vec<u8>>>> {
+    let buffer = std::sync::Arc::new(std::sync::Mutex::new(Some(Vec::new())));
+    let sink = std::sync::Arc::clone(&buffer);
+    std::thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Some(kept) = sink.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                        kept.extend_from_slice(&chunk[..n]);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        let _ = closed.send(());
+    });
+    buffer
+}
+
 /// Run `oam run <file> --json` with a kill-on-deadline budget. The `--`
 /// terminator keeps '-'-prefixed file strings out of clap's flag parsing
 /// (file '--help' used to return a success-shaped payload). Pipes are
 /// drained on threads so a chatty child can't deadlock the wait loop.
+///
+/// The budget bounds the whole call, not just the script: the answer comes
+/// by the deadline plus [`PIPE_GRACE`] even when something other than the
+/// script still holds its stdout or stderr -- a child the script started
+/// with inherited stdio, say, which outlives a kill of the script. Waiting
+/// for those pipes to close held the answer until that process exited.
 fn run_subprocess(file: &str, timeout_ms: u64) -> Result<Value, String> {
-    use std::io::Read;
     use std::time::{Duration, Instant};
 
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     // Windows: clear inherit on OUR std handles (the agent's pipes) so they
     // can't leak through the run child into its detached type-check daemon
     // and hold the agent's pipe chain open (see oam_ts::daemon docs). stdin
-    // is explicitly null because inherit would no longer work after this.
+    // is null: the agent's JSON-RPC stream is not the script's to read.
     oam_ts::daemon::unshare_std_handles();
     // Absolutize so a dash-prefixed filename ('--help') can never read as a
     // flag — `--` is taken by script-args forwarding since the argv work.
@@ -248,18 +289,12 @@ fn run_subprocess(file: &str, timeout_ms: u64) -> Result<Value, String> {
         .spawn()
         .map_err(|e| format!("spawn oam run: {e}"))?;
 
-    let mut stdout_pipe = child.stdout.take().expect("piped stdout");
-    let mut stderr_pipe = child.stderr.take().expect("piped stderr");
-    let stdout_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
-    });
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+    let stdout_buf = drain_pipe(
+        child.stdout.take().expect("piped stdout"),
+        closed_tx.clone(),
+    );
+    let stderr_buf = drain_pipe(child.stderr.take().expect("piped stderr"), closed_tx);
 
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut timed_out = false;
@@ -276,8 +311,26 @@ fn run_subprocess(file: &str, timeout_ms: u64) -> Result<Value, String> {
         }
     };
 
-    let stdout = String::from_utf8_lossy(&stdout_reader.join().unwrap_or_default()).into_owned();
-    let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).into_owned();
+    // Both pipes normally close with the script. When they do not, wait
+    // until the budget plus PIPE_GRACE (the script finished early) or
+    // PIPE_GRACE past the kill (the budget ran out), then answer with what
+    // arrived; the drainer threads end whenever the pipe's last holder exits.
+    let wait_until = deadline.max(Instant::now()) + PIPE_GRACE;
+    for _ in 0..2 {
+        let left = wait_until.saturating_duration_since(Instant::now());
+        if closed_rx.recv_timeout(left).is_err() {
+            break;
+        }
+    }
+    let take = |buffer: &std::sync::Mutex<Option<Vec<u8>>>| {
+        buffer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_default()
+    };
+    let stdout = String::from_utf8_lossy(&take(&stdout_buf)).into_owned();
+    let stderr = String::from_utf8_lossy(&take(&stderr_buf)).into_owned();
     let mut diagnostics: Vec<Value> = Vec::new();
     let mut stderr_raw: Vec<&str> = Vec::new();
     for line in stderr.lines() {

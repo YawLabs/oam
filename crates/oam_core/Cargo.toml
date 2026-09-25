@@ -157,6 +157,11 @@ tokio-uring = "0.5"
 # panic tokio_uring::start would raise on an unsupported kernel / seccomp.
 io-uring = "0.6"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# The fetch transport's second verdict on a NODE_EXTRA_CA_CERTS chain Apple's
+# TLS policy refused (http_client/tls_config.rs): Apple's basic X.509 policy.
+security-framework = { workspace = true }
+
 [lints.clippy]
 undocumented_unsafe_blocks = "deny"
 unnecessary_safety_comment = "deny"

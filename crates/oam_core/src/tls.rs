@@ -877,20 +877,17 @@ impl NodeCertVerifier {
     }
 }
 
-/// Node's rules for the chains the NODE_EXTRA_CA_CERTS bundle anchors, for a
-/// client whose other chains another verifier judges: the fetch transport,
-/// whose public chains are the platform verifier's call
-/// (`http_client::tls_config`). Node's undici and https share OpenSSL's one
-/// store with tls.connect, so a certificate under an extra root is accepted
-/// or refused there exactly as `tls.connect` accepts or refuses it, with no
-/// operating-system policy on top. Apple's Security framework -- the
-/// platform verifier on macOS -- refuses any server certificate valid for
-/// more than 825 days whatever anchors it (measured on macOS 27: 826 days
-/// refused, 825 accepted), so a private CA's long-lived certificate that node
-/// trusts through NODE_EXTRA_CA_CERTS was refused by oam's fetch on macOS
-/// alone, and named `SELF_SIGNED_CERT_IN_CHAIN` off the chain because the
-/// refusal itself is opaque. Judging those chains here, with the verifier
-/// tls.connect uses, gives them node's verdict on every platform.
+/// Node's TLS rules for a chain the NODE_EXTRA_CA_CERTS bundle anchors: the
+/// second verdict the fetch transport takes on macOS when Apple's TLS policy
+/// refused a chain its X.509 rules accept (`http_client::tls_config`). This
+/// judges what that X.509 verdict does not -- the leaf's validity period,
+/// its purpose, the host name -- over the bundle alone, and names a refusal
+/// with node's code.
+///
+/// The bundle's self-signed certificates that can anchor a TLS server chain
+/// (`can_anchor`) are its anchors, its self-signed certificates are trusted
+/// by name when the server presents one, and the rest only complete a
+/// chain.
 #[derive(Debug)]
 pub(crate) struct ExtraCaVerifier {
     inner: NodeCertVerifier,
@@ -899,35 +896,32 @@ pub(crate) struct ExtraCaVerifier {
 /// What [`ExtraCaVerifier::judge`] says about a chain.
 #[derive(Debug)]
 pub(crate) enum ExtraCaVerdict {
-    /// The chain ends at an extra root, or the leaf is one of the extra
-    /// certificates itself, and it passed the validity and host-name checks.
+    /// Node's rules accept the chain through the bundle.
     Accepted,
-    /// The chain is refused: node's failure (with node's code, when node has
-    /// a name for it) and the rustls error that aborts the handshake.
-    Refused(VerifyFailure, rustls::Error),
+    /// Node's rules refuse it: node's failure.
+    Refused(VerifyFailure),
     /// Nothing in the bundle anchors the chain: not this verifier's to judge.
     NotAnchored,
 }
 
 impl ExtraCaVerifier {
     /// The verifier for `certs`, the NODE_EXTRA_CA_CERTS bundle as
-    /// `extra_ca_certs` loaded it; `None` for an empty bundle. The store is
-    /// composed as `build_client_config` composes it for a connection with no
-    /// `ca`: a self-signed certificate anchors, a non-self-signed one is an
-    /// intermediate, and every one is trusted by name as a leaf.
-    pub(crate) fn new(certs: &[CertificateDer<'static>]) -> Result<Option<Self>, String> {
-        if certs.is_empty() {
-            return Ok(None);
+    /// `extra_ca_certs` loaded it; `None` when the bundle holds no
+    /// self-signed certificate (nothing in it can anchor a chain or be
+    /// trusted by name), or, never in practice, when webpki will not build
+    /// over it.
+    pub(crate) fn new(certs: &[CertificateDer<'static>]) -> Option<Self> {
+        let (self_signed, non_anchors): (Vec<_>, Vec<_>) = certs
+            .iter()
+            .cloned()
+            .partition(|c| is_self_signed(c.as_ref()));
+        if self_signed.is_empty() {
+            return None;
         }
         let mut root_store = rustls::RootCertStore::empty();
-        for cert in certs.iter().filter(|c| is_self_signed(c.as_ref())) {
+        for cert in self_signed.iter().filter(|c| can_anchor(c.as_ref())) {
             let _ = root_store.add(cert.clone());
         }
-        let trusted_non_anchors: Vec<CertificateDer<'static>> = certs
-            .iter()
-            .filter(|c| !is_self_signed(c.as_ref()))
-            .cloned()
-            .collect();
         let provider = node_crypto_provider();
         let inner = if root_store.is_empty() {
             None
@@ -938,27 +932,27 @@ impl ExtraCaVerifier {
                     Arc::clone(&provider),
                 )
                 .build()
-                .map_err(|e| format!("tls verifier: {e}"))?,
+                .ok()?,
             )
         };
-        Ok(Some(Self {
+        Some(Self {
             inner: NodeCertVerifier {
                 inner,
                 supported: provider.signature_verification_algorithms,
-                trusted_leaves: certs.to_vec(),
-                trusted_non_anchors,
+                trusted_leaves: self_signed,
+                trusted_non_anchors: non_anchors,
                 untrusted_known: Vec::new(),
                 advisory: false,
                 check_name: true,
                 outcome: Arc::new(Mutex::new(None)),
             },
-        }))
+        })
     }
 
-    /// Node's verdict on the chain, or `NotAnchored` when the bundle does not
-    /// anchor it -- the one refusal that is another verifier's to make. A
-    /// leaf outside its validity period is refused here whatever anchors it,
-    /// as OpenSSL refuses it first (and as every platform verifier would).
+    /// Node's verdict on a chain, in the order node surfaces OpenSSL's: the
+    /// leaf's validity period (checked last by OpenSSL, so it wins), then its
+    /// purpose, then the chain, and the host name only once the chain is
+    /// trusted. `NotAnchored` when webpki finds no anchor in the bundle.
     pub(crate) fn judge(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -966,13 +960,22 @@ impl ExtraCaVerifier {
         server_name: &ServerName<'_>,
         now: UnixTime,
     ) -> ExtraCaVerdict {
+        if let Some((failure, _)) = validity_refusal(end_entity, now) {
+            return ExtraCaVerdict::Refused(failure);
+        }
+        if !serves_tls(end_entity.as_ref()) {
+            return ExtraCaVerdict::Refused(VerifyFailure::named(
+                "INVALID_PURPOSE",
+                "unsupported certificate purpose",
+            ));
+        }
         match self
             .inner
             .verdict(end_entity, intermediates, server_name, now)
         {
             Ok(()) => ExtraCaVerdict::Accepted,
             Err((_, error)) if is_unknown_issuer(&error) => ExtraCaVerdict::NotAnchored,
-            Err((failure, error)) => ExtraCaVerdict::Refused(failure, error),
+            Err((failure, _)) => ExtraCaVerdict::Refused(failure),
         }
     }
 }
@@ -991,9 +994,100 @@ fn is_unknown_issuer(error: &rustls::Error) -> bool {
     }
 }
 
+/// Whether OpenSSL's SSL-server purpose check passes a leaf
+/// (check_purpose_ssl_server in crypto/x509/v3_purp.c): an extended key
+/// usage, if present, allows a TLS server ([`eku_allows_tls_server`]); a key
+/// usage, if present, allows digitalSignature, keyEncipherment or
+/// keyAgreement; a Netscape certificate type, if present, includes an SSL
+/// server. Node refuses a leaf that fails it with `INVALID_PURPOSE` -- a
+/// clientAuth-only extended key usage, a nonRepudiation-only key usage, and a
+/// self-signed clientAuth certificate served as itself, measured on
+/// v22.22.2.
+fn serves_tls(der: &[u8]) -> bool {
+    let Ok((_, cert)) = parse_x509_certificate(der) else {
+        return false;
+    };
+    let eku = match cert.extended_key_usage() {
+        Ok(eku) => eku.is_none_or(|eku| eku_allows_tls_server(eku.value)),
+        Err(_) => false,
+    };
+    let ku = match cert.key_usage() {
+        Ok(ku) => ku.is_none_or(|ku| {
+            ku.value.digital_signature() || ku.value.key_encipherment() || ku.value.key_agreement()
+        }),
+        Err(_) => false,
+    };
+    let ns = cert
+        .extensions()
+        .iter()
+        .all(|ext| match ext.parsed_extension() {
+            x509_parser::extensions::ParsedExtension::NSCertType(kind) => kind.ssl_server(),
+            _ => true,
+        });
+    eku && ku && ns
+}
+
+/// OpenSSL's extended-key-usage rule for every certificate in a TLS server
+/// chain, the trust anchor included (xku_reject with XKU_SSL_SERVER |
+/// XKU_SGC): serverAuth, or one of the two Server Gated Crypto purposes.
+/// anyExtendedKeyUsage alone does not pass. Node refuses a chain under a
+/// root whose extended key usage is clientAuth only with `INVALID_PURPOSE`
+/// (measured on v22.22.2).
+fn eku_allows_tls_server(eku: &x509_parser::extensions::ExtendedKeyUsage<'_>) -> bool {
+    // msSGC (Microsoft) and nsSGC (Netscape).
+    const SGC: [&[u64]; 2] = [
+        &[1, 3, 6, 1, 4, 1, 311, 10, 3, 3],
+        &[2, 16, 840, 1, 113730, 4, 1],
+    ];
+    eku.server_auth
+        || eku.other.iter().any(|oid| {
+            oid.iter().is_some_and(|arcs| {
+                let arcs: Vec<u64> = arcs.collect();
+                SGC.contains(&arcs.as_slice())
+            })
+        })
+}
+
+/// Whether OpenSSL takes `der` as the trust anchor of a TLS server chain, as
+/// far as the extensions a modern certificate carries decide it: its
+/// `X509_check_ca` is non-zero (check_ca in crypto/x509/v3_purp.c) -- a key
+/// usage without keyCertSign never is; a basicConstraints extension decides
+/// by its CA flag; without one, a v1 certificate, or one with a key usage (so
+/// allowing keyCertSign), is -- and its extended key usage, if present,
+/// allows a TLS server ([`eku_allows_tls_server`]). The Netscape
+/// certificate-type branch of check_ca is not followed: such a certificate
+/// anchors nothing here, which errs toward refusing. A leaf signed with the
+/// key of a CA:FALSE, digitalSignature-only self-signed certificate is
+/// refused (measured on v22.22.2: OpenSSL's "key usage does not include
+/// certificate signing").
+fn can_anchor(der: &[u8]) -> bool {
+    let Ok((_, cert)) = parse_x509_certificate(der) else {
+        return false;
+    };
+    let Ok(key_usage) = cert.key_usage() else {
+        return false;
+    };
+    if key_usage
+        .as_ref()
+        .is_some_and(|ku| !ku.value.key_cert_sign())
+    {
+        return false;
+    }
+    match cert.extended_key_usage() {
+        Ok(Some(eku)) if !eku_allows_tls_server(eku.value) => return false,
+        Ok(_) => {}
+        Err(_) => return false,
+    }
+    match cert.basic_constraints() {
+        Ok(Some(constraints)) => constraints.value.ca,
+        Ok(None) => cert.version().0 == 0 || key_usage.is_some(),
+        Err(_) => false,
+    }
+}
+
 /// Whether a certificate is its own issuer (subject == issuer, byte for
 /// byte) -- the shape OpenSSL will accept as a trust anchor.
-fn is_self_signed(der: &[u8]) -> bool {
+pub(crate) fn is_self_signed(der: &[u8]) -> bool {
     parse_x509_certificate(der)
         .ok()
         .is_some_and(|(_, cert)| cert.subject().as_raw() == cert.issuer().as_raw())
@@ -2485,59 +2579,194 @@ I5PYIZ3kyY8EsQqX4JpTtbY=\n\
         );
     }
 
-    /// The fetch transport judges a chain the NODE_EXTRA_CA_CERTS bundle
-    /// anchors by node's rules, not the platform's: the bundle's own
-    /// certificate served as the leaf is trusted by name, refused on the host
-    /// name, and refused on its validity, while a chain the bundle does not
-    /// anchor is left to the platform verifier.
+    /// A self-signed development certificate (P-256, CA:FALSE, key usage
+    /// digitalSignature only, extended key usage serverAuth, SAN
+    /// DNS:localhost and IP:127.0.0.1, valid 2025-2125), a leaf for
+    /// api.example.com signed with its key, and a self-signed certificate
+    /// whose extended key usage is clientAuth only. node v22.22.2, with the
+    /// first in NODE_EXTRA_CA_CERTS, accepts it served as its own
+    /// certificate and refuses the second; with the third, refuses it served
+    /// as itself with `INVALID_PURPOSE`; with the second alone, refuses it
+    /// with `UNABLE_TO_VERIFY_LEAF_SIGNATURE` (all measured).
+    const DEV_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBrDCCAVKgAwIBAgIUOhmQZYt9Bjx2GmWM6t1lMYG6XnAwCgYIKoZIzj0EAwIw\n\
+HDEaMBgGA1UEAwwRb2FtIGRldiBsb2NhbGhvc3QwIBcNMjUwMTAxMDAwMDAwWhgP\n\
+MjEyNTAxMDEwMDAwMDBaMBwxGjAYBgNVBAMMEW9hbSBkZXYgbG9jYWxob3N0MFkw\n\
+EwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE5yzAM4KyR4WAoPnqlA5I4956IqSIK5C0\n\
+qhDvJoTws1BXnIFCGySUiKt+ym7O0AjL2X6K4479ohfwYX0GsA0N0KNwMG4wGgYD\n\
+VR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAwGA1UdEwEB/wQCMAAwDgYDVR0PAQH/\n\
+BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMB0GA1UdDgQWBBRZIWZkadOURbzJ\n\
+hPc9wc1ty+lu1jAKBggqhkjOPQQDAgNIADBFAiB0kOXBGX8XphkW2VSsP9xRR5eF\n\
+Io8nesrXS7xDFFyo+wIhAJQ+G5IO6arB0XGOI1gRmTKcVtl9bwv8lpza3cr/lKR1\n\
+-----END CERTIFICATE-----\n";
+
+    const MINTED_BY_DEV_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBpjCCAUugAwIBAgIBAjAKBggqhkjOPQQDAjAcMRowGAYDVQQDDBFvYW0gZGV2\n\
+IGxvY2FsaG9zdDAgFw0yNTAxMDEwMDAwMDBaGA8yMTI1MDEwMTAwMDAwMFowGjEY\n\
+MBYGA1UEAwwPYXBpLmV4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcD\n\
+QgAEN6fQkfE1EZKW+OcZIEFixB2kF/tvaaJdQ1bgEoLRj+4GHAWfqoCuTHIpxqS8\n\
+2HKoRgnO5iP6ysRmpGposTw9m6N+MHwwGgYDVR0RBBMwEYIPYXBpLmV4YW1wbGUu\n\
+Y29tMAkGA1UdEwQCMAAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwHQYDVR0OBBYEFBsK\n\
+Y54HVtaPXg7CRiDV3gV8/nHuMB8GA1UdIwQYMBaAFFkhZmRp05RFvMmE9z3BzW3L\n\
+6W7WMAoGCCqGSM49BAMCA0kAMEYCIQDiF33CY6Hy4OF+1HzWd7NkQPUoO1ItP3EO\n\
+dXwNhtk1PgIhANPMCIJpgEhY29bZrgejraEMOHIbetKCQzq/eknK2H++\n\
+-----END CERTIFICATE-----\n";
+
+    const CLIENT_ONLY_CERT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBjTCCATKgAwIBAgIUKGSj6ZQ9JVKut7sib9f+UEE4IggwCgYIKoZIzj0EAwIw\n\
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI1MDEwMTAwMDAwMFoYDzIxMjUwMTAx\n\
+MDAwMDAwWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO\n\
+PQMBBwNCAAQHbBVWlR6yKfddR38qJxLUolWId+i7vFSYemj8yQJpBExtHtWErwCd\n\
+wKqOiOiKegpftLhoa1U+WbZ6WvgfJ+Lao2AwXjAaBgNVHREEEzARgglsb2NhbGhv\n\
+c3SHBH8AAAEwDAYDVR0TAQH/BAIwADATBgNVHSUEDDAKBggrBgEFBQcDAjAdBgNV\n\
+HQ4EFgQUHxxo6zKn2lMRIoV38oL4T+oFeYMwCgYIKoZIzj0EAwIDSQAwRgIhANMg\n\
+gPgvbHGQaCm12cfNKnd/xmUTkF82n0T9GLV5yq7VAiEAwtlptz96LHw0VD7qdIV1\n\
+v9rosiSQqKE13Nl/HtOJB/w=\n\
+-----END CERTIFICATE-----\n";
+
+    fn pem_der(pem: &str) -> CertificateDer<'static> {
+        CertificateDer::from_pem_slice(pem.as_bytes()).unwrap()
+    }
+
+    /// Node's verdict on a chain through the bundle: its self-signed
+    /// certificate served as the leaf is trusted by name, then refused on the
+    /// host name or on its validity period; a chain nothing in the bundle
+    /// anchors is not this verifier's to judge.
     #[test]
-    fn the_extra_ca_verifier_judges_only_what_the_bundle_anchors() {
-        let cert = CertificateDer::from_pem_slice(CERT.as_bytes()).unwrap();
+    fn the_extra_ca_verifier_judges_what_the_bundle_anchors() {
+        let cert = pem_der(CERT);
         let verifier = ExtraCaVerifier::new(std::slice::from_ref(&cert))
-            .unwrap()
-            .expect("a non-empty bundle has a verifier");
+            .expect("a bundle with a self-signed certificate has a verifier");
         let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_789_000_000));
         let localhost = ServerName::try_from("localhost").unwrap();
         assert!(matches!(
             verifier.judge(&cert, &[], &localhost, now),
             ExtraCaVerdict::Accepted
         ));
-        // The bundle's certificate under another name: trusted, then refused
-        // on the name, as node's checkServerIdentity refuses it.
         let elsewhere = ServerName::try_from("example.com").unwrap();
         match verifier.judge(&cert, &[], &elsewhere, now) {
-            ExtraCaVerdict::Refused(failure, _) => {
+            ExtraCaVerdict::Refused(failure) => {
                 assert_eq!(failure.code, Some("ERR_TLS_CERT_ALTNAME_INVALID"));
             }
             other => panic!("{other:?}"),
         }
-        // Outside its validity period: refused on that first, whatever
-        // anchors it.
         let later = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_900_000_000));
         match verifier.judge(&cert, &[], &localhost, later) {
-            ExtraCaVerdict::Refused(failure, _) => {
+            ExtraCaVerdict::Refused(failure) => {
                 assert_eq!(failure.code, Some("CERT_HAS_EXPIRED"));
             }
             other => panic!("{other:?}"),
         }
-        // A chain the bundle does not anchor -- a Mozilla root, valid at the
-        // test time so that its validity is not what decides -- is not this
-        // verifier's to judge.
-        let at = ASN1Time::from_timestamp(1_789_000_000).unwrap();
-        let stranger = webpki_root_certs::TLS_SERVER_ROOT_CERTS
-            .iter()
-            .find(|der| {
-                parse_x509_certificate(der.as_ref())
-                    .is_ok_and(|(_, root)| root.validity().is_valid_at(at))
-            })
-            .expect("a Mozilla root valid at the test time")
-            .clone();
+        // A server leaf from an issuer the bundle does not hold.
         assert!(matches!(
-            verifier.judge(&stranger, &[], &localhost, now),
+            verifier.judge(
+                &pem_der(MINTED_BY_DEV_CERT),
+                &[],
+                &ServerName::try_from("api.example.com").unwrap(),
+                now
+            ),
             ExtraCaVerdict::NotAnchored
         ));
-        // An empty bundle has no verifier at all.
-        assert!(ExtraCaVerifier::new(&[]).unwrap().is_none());
+        // A bundle with nothing self-signed has no verifier at all.
+        assert!(ExtraCaVerifier::new(&[pem_der(MINTED_BY_DEV_CERT)]).is_none());
+        assert!(ExtraCaVerifier::new(&[]).is_none());
+    }
+
+    /// A self-signed server certificate in the bundle is trusted as itself
+    /// but cannot issue: node refuses a leaf signed with its key, so the
+    /// verifier does not anchor one.
+    #[test]
+    fn a_self_signed_server_certificate_in_the_bundle_cannot_issue() {
+        let dev = pem_der(DEV_CERT);
+        assert!(!can_anchor(dev.as_ref()), "CA:FALSE, no keyCertSign");
+        assert!(can_anchor(pem_der(CERT).as_ref()), "CA:TRUE, no key usage");
+        let verifier = ExtraCaVerifier::new(std::slice::from_ref(&dev)).unwrap();
+        let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_800_000_000));
+        assert!(matches!(
+            verifier.judge(&dev, &[], &ServerName::try_from("localhost").unwrap(), now),
+            ExtraCaVerdict::Accepted
+        ));
+        assert!(matches!(
+            verifier.judge(
+                &pem_der(MINTED_BY_DEV_CERT),
+                &[],
+                &ServerName::try_from("api.example.com").unwrap(),
+                now
+            ),
+            ExtraCaVerdict::NotAnchored
+        ));
+    }
+
+    /// OpenSSL's SSL-server purpose check on the leaf: node refuses a
+    /// clientAuth-only certificate even when the bundle trusts it by name.
+    #[test]
+    fn a_leaf_that_is_not_for_a_server_is_refused_as_node_refuses_it() {
+        assert!(
+            serves_tls(pem_der(DEV_CERT).as_ref()),
+            "serverAuth, digitalSignature"
+        );
+        assert!(
+            serves_tls(pem_der(CERT).as_ref()),
+            "no key usage of either kind"
+        );
+        assert!(
+            !serves_tls(pem_der(CLIENT_ONLY_CERT).as_ref()),
+            "clientAuth only"
+        );
+        let client_only = pem_der(CLIENT_ONLY_CERT);
+        let verifier = ExtraCaVerifier::new(std::slice::from_ref(&client_only)).unwrap();
+        let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_800_000_000));
+        match verifier.judge(
+            &client_only,
+            &[],
+            &ServerName::try_from("localhost").unwrap(),
+            now,
+        ) {
+            ExtraCaVerdict::Refused(failure) => {
+                assert_eq!(failure.code, Some("INVALID_PURPOSE"));
+                assert_eq!(failure.message, "unsupported certificate purpose");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A private root whose extended key usage is clientAuth only (CA:TRUE,
+    /// keyCertSign, valid 2025-2125), and a plain one: node refuses a server
+    /// chain under the first with `INVALID_PURPOSE` and accepts one under the
+    /// second (measured on v22.22.2).
+    const CLIENT_AUTH_ROOT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBfTCCASOgAwIBAgIUI1098FdYdTj8X8B+xuEboLHgK9owCgYIKoZIzj0EAwIw\n\
+ETEPMA0GA1UEAwwGb2FtIHIxMCAXDTI1MDEwMTAwMDAwMFoYDzIxMjUwMTAxMDAw\n\
+MDAwWjARMQ8wDQYDVQQDDAZvYW0gcjEwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC\n\
+AATXzpcevkp9Ow2xyEk43xmfEmim6ZQwplcqdbxCrmjF0ysNMNPOjqyEmrnhbO2v\n\
+LZJJ49Pj6YJYaLxRJBrX7WgIo1cwVTAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB\n\
+/wQEAwIBBjATBgNVHSUEDDAKBggrBgEFBQcDAjAdBgNVHQ4EFgQU1524FNJeMtZS\n\
+km45UYo35cF2UTMwCgYIKoZIzj0EAwIDSAAwRQIhAI9rPQeY7hNMnEXgoxupyjxz\n\
+a7PkPJrihqFWD0EwOZLLAiAtU7dwEVX+FsEgS3OiyRVE1+spv6uMTEFSdHlngxMb\n\
+sg==\n\
+-----END CERTIFICATE-----\n";
+
+    const PLAIN_ROOT: &str = "-----BEGIN CERTIFICATE-----\n\
+MIIBaDCCAQ6gAwIBAgIUVXdVR3izTncWb8neZh9ZBDniTukwCgYIKoZIzj0EAwIw\n\
+ETEPMA0GA1UEAwwGb2FtIHI1MCAXDTI1MDEwMTAwMDAwMFoYDzIxMjUwMTAxMDAw\n\
+MDAwWjARMQ8wDQYDVQQDDAZvYW0gcjUwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNC\n\
+AASr8X8TMwnXsBC5T5AKMhYME1INjigI1zSA8/XxThE7yggZqrFeiU+tr1eguqNS\n\
+aKm0rPPl7cN0oLd1tXQpzK4vo0IwQDAPBgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB\n\
+/wQEAwIBBjAdBgNVHQ4EFgQUdALZg6FgwMjhj1v1A1xQSO+D0e8wCgYIKoZIzj0E\n\
+AwIDSAAwRQIhAP16CfYP6llNefP53Ez0EP5VPEfQIfhl+qveYhaFPbnQAiATrEZp\n\
+RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
+-----END CERTIFICATE-----\n";
+
+    /// A root anchors a TLS server chain only if its extended key usage
+    /// allows a server: OpenSSL checks the trust anchor's as it checks every
+    /// certificate's in the chain.
+    #[test]
+    fn a_root_whose_extended_key_usage_excludes_servers_anchors_nothing() {
+        assert!(can_anchor(pem_der(PLAIN_ROOT).as_ref()));
+        assert!(!can_anchor(pem_der(CLIENT_AUTH_ROOT).as_ref()));
+        // Trusted by name all the same, as any self-signed bundle
+        // certificate is: the verifier exists, and anchors nothing.
+        assert!(ExtraCaVerifier::new(&[pem_der(CLIENT_AUTH_ROOT)]).is_some());
     }
 
     #[test]

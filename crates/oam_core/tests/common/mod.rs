@@ -160,10 +160,19 @@ pub fn test_tls() -> TlsConfigs {
 
 /// A TLS acceptor presenting the test leaf, offering `alpn`.
 pub fn tls_acceptor(alpn: &[&[u8]]) -> tokio_rustls::TlsAcceptor {
-    let certs = rustls_pemfile::certs(&mut TLS_TEST_LEAF_CERT.as_bytes())
+    tls_acceptor_with(TLS_TEST_LEAF_CERT, TLS_TEST_LEAF_KEY, alpn)
+}
+
+/// A TLS acceptor presenting `cert_pem` (its key `key_pem`), offering `alpn`.
+pub fn tls_acceptor_with(
+    cert_pem: &str,
+    key_pem: &str,
+    alpn: &[&[u8]],
+) -> tokio_rustls::TlsAcceptor {
+    let certs = rustls_pemfile::certs(&mut cert_pem.as_bytes())
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    let key = rustls_pemfile::private_key(&mut TLS_TEST_LEAF_KEY.as_bytes())
+    let key = rustls_pemfile::private_key(&mut key_pem.as_bytes())
         .unwrap()
         .unwrap();
     let mut config = rustls::ServerConfig::builder_with_provider(ring())
@@ -493,7 +502,12 @@ pub async fn proxy(connect_reply: Option<&'static [u8]>, reply: &'static [u8]) -
 /// the ordinary fields, so a test can see whether a `host` field rode along
 /// beside it.
 pub async fn serve_h2_tls(body: &'static str) -> Server {
-    let acceptor = tls_acceptor(&[b"h2"]);
+    serve_h2_tls_with(tls_acceptor(&[b"h2"]), body).await
+}
+
+/// [`serve_h2_tls`] behind `acceptor`: an h2 server presenting another
+/// certificate.
+pub async fn serve_h2_tls_with(acceptor: tokio_rustls::TlsAcceptor, body: &'static str) -> Server {
     serve(move |conn, _, seen| {
         let acceptor = acceptor.clone();
         async move {

@@ -5619,10 +5619,16 @@ server.close();
 /// A streamed request body and a lookup hook: the fetch parks BEFORE it takes
 /// the body channel's receiver, so a write can block on the full channel
 /// while the hook runs. Abandoning the parked fetch -- the hook refused, or
-/// the signal aborted while the hook never answered -- drops the receiver, so
-/// every blocked write settles instead of hanging; an answer resumes the fetch,
-/// which takes the receiver and streams the whole body. oam-only (the channel
-/// is internal: http.ClientRequest's), so there is no node output to match.
+/// the signal aborted while the hook never answered, or aborted before the
+/// fetch even parked -- drops the receiver, so every blocked write settles
+/// instead of hanging; an answer resumes the fetch, which takes the receiver
+/// and streams the whole body. oam-only (the channel is internal:
+/// http.ClientRequest's), so there is no node output to match. The aborts
+/// and answers wait on events, not timers: an abort on a 50 ms timer used to
+/// land before a loaded machine had parked the fetch, which is the case the
+/// fourth block pins (it hung: the abort listener was attached too late).
+/// The refusal keeps one 50 ms beat after the channel fills, to see the
+/// blocked writes stay blocked.
 #[test]
 fn fetch_connect_lookup_parks_a_streamed_body_until_answered() {
     let script = write_temp(
@@ -5650,7 +5656,14 @@ const watchdog = setTimeout(() => { console.log('HANG'); process.exit(1); }, 200
     const pending = [];
     for (let i = 0; i < 12; i++) pending.push(natives.fetchBodyChannelWrite(handle, encode('chunk' + i + ';')).then(() => settled++));
     writes = Promise.all(pending);
-    setTimeout(() => { atAnswer = settled; cb(new Error('refused by hook')); }, 50);
+    // Answer once the channel's 8 slots have settled, then a beat more: the
+    // other 4 writes must still be blocked on the parked fetch.
+    const began = Date.now();
+    const answer = () => {
+      if (settled < 8 && Date.now() - began < 15000) return setTimeout(answer, 5);
+      setTimeout(() => { atAnswer = settled; cb(new Error('refused by hook')); }, 50);
+    };
+    answer();
   } } });
   try {
     await fetch(`http://stream.test:${port}/`, { method: 'POST', dispatcher: agent, __oamBodyStream: handle });
@@ -5663,17 +5676,37 @@ const watchdog = setTimeout(() => { console.log('HANG'); process.exit(1); }, 200
   natives.fetchBodyChannelEnd(handle);
 }
 {
+  // Aborted while parked: the hook is running and never answers.
   const handle = natives.fetchBodyChannelNew();
   const writes = [];
   let calls = 0;
-  const agent = new Agent({ connect: { lookup: () => { calls++; } } });
   const controller = new AbortController();
+  const agent = new Agent({ connect: { lookup: () => { calls++; setTimeout(() => controller.abort(), 0); } } });
   const p = fetch(`http://stream.test:${port}/`, { method: 'POST', dispatcher: agent, __oamBodyStream: handle, signal: controller.signal });
   for (let i = 0; i < 10; i++) writes.push(natives.fetchBodyChannelWrite(handle, encode('x')));
-  setTimeout(() => controller.abort(), 50);
   try { await p; console.log('aborted: resolved?!'); } catch (e) { console.log('aborted', e.name, 'calls', calls); }
   await Promise.all(writes);
   console.log('aborted: writes settled, server saw', received);
+  natives.fetchBodyChannelEnd(handle);
+}
+{
+  // Aborted before the fetch parked (the same tick as fetch()): the hook is
+  // still asked once, as node asks it, and never answers.
+  const handle = natives.fetchBodyChannelNew();
+  const writes = [];
+  let calls = 0;
+  let hooked;
+  const asked = new Promise((r) => (hooked = r));
+  const agent = new Agent({ connect: { lookup: () => { calls++; hooked(); } } });
+  const controller = new AbortController();
+  const p = fetch(`http://stream.test:${port}/`, { method: 'POST', dispatcher: agent, __oamBodyStream: handle, signal: controller.signal });
+  for (let i = 0; i < 10; i++) writes.push(natives.fetchBodyChannelWrite(handle, encode('x')));
+  controller.abort();
+  let outcome = 'resolved?!';
+  try { await p; } catch (e) { outcome = e.name; }
+  await asked;
+  await Promise.all(writes);
+  console.log('aborted before parking', outcome, 'calls', calls, 'writes settled, server saw', received);
   natives.fetchBodyChannelEnd(handle);
 }
 {
@@ -5700,6 +5733,7 @@ server.close();
          refused: writes settled 12 server saw null\n\
          aborted AbortError calls 1\n\
          aborted: writes settled, server saw null\n\
+         aborted before parking AbortError calls 1 writes settled, server saw null\n\
          answered 200 got 86 true";
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
@@ -7208,10 +7242,10 @@ server.close();
 /// server saw, the verifier's verdict and the peer certificate (a post-hoc
 /// pinning check reads the real one) -- for a fresh connection and again for
 /// a pooled one. The CA is trusted through NODE_EXTRA_CA_CERTS, which the
-/// transport honours on every platform: a chain the bundle anchors is judged
-/// by node's rules, so Security.framework's 825-day cap on a server
-/// certificate's validity does not reach this 100-year leaf on macOS (it
-/// did, while the platform verifier held the bundle).
+/// transport honours on every platform: on macOS, where Apple's TLS policy
+/// refuses this 100-year leaf on its validity period alone (the 825-day
+/// rule), the transport's second verdict on a chain the bundle anchors
+/// accepts it.
 #[test]
 fn an_https_socket_on_the_fetch_transport_reports_its_connection() {
     let bundle = write_temp("fetch-socket-extra-ca/ca.pem", TLS_TEST_CA_CERT);
@@ -8020,9 +8054,9 @@ server.close();
 /// fetch trusts NODE_EXTRA_CA_CERTS, for a plain fetch, a hooked one (whose
 /// connection is pinned but whose certificate is still checked against the
 /// host name) and https.get; without the variable the private CA is refused.
-/// On macOS too: a chain the bundle anchors is judged by node's rules, not
-/// Security.framework's, whose 825-day cap on a server certificate's validity
-/// refused this 100-year leaf while the platform verifier held the bundle.
+/// On macOS too: Apple's TLS policy refuses this 100-year leaf on its validity
+/// period alone (the 825-day rule), and the transport's second verdict on a
+/// chain the bundle anchors accepts it.
 #[test]
 fn fetch_https_trusts_node_extra_ca_certs() {
     let bundle = write_temp("fetch-extra-ca/ca.pem", TLS_TEST_CA_CERT);
@@ -10899,6 +10933,265 @@ fn mcp_run_kills_hung_scripts_at_deadline() {
     .unwrap();
     assert_eq!(payload["timedOut"], true);
     assert_eq!(responses[0]["result"]["isError"], true);
+}
+
+/// Writes its path when dropped: releases a helper process a test started,
+/// whatever the test's assertions did first.
+struct ReleaseOnDrop(std::path::PathBuf);
+
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, "");
+    }
+}
+
+/// The oam_run budget bounds the whole call, not just the script: a child
+/// the script started with inherited stdio keeps the script's stdout open
+/// after the deadline kills the script, and the tool answered only when that
+/// child exited. It now answers at the deadline plus a short grace, with the
+/// output that arrived before it. The child is detached so that it outlives
+/// the script on Windows too, where a non-detached child dies with its oam
+/// parent (the kill-on-close job, as libuv's); it marks itself started and
+/// runs until released, so the test proves something held the pipe.
+#[test]
+fn mcp_run_answers_at_the_deadline_while_a_grandchild_holds_stdout() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let stop = write_temp("mcp_grandchild/stop.flag", "");
+    std::fs::remove_file(&stop).unwrap();
+    let _release = ReleaseOnDrop(stop.clone());
+    let alive = stop.with_file_name("alive.flag");
+    let json_path = |p: &std::path::Path| serde_json::to_string(p.to_str().unwrap()).unwrap();
+    // Outlives the kill by far more than the bound below, unless released.
+    let sleeper = write_temp(
+        "mcp_grandchild/sleeper.mjs",
+        &format!(
+            "import fs from 'node:fs';\n\
+             fs.writeFileSync({alive}, '');\n\
+             const end = Date.now() + 90000;\n\
+             const t = setInterval(() => {{ if (Date.now() > end || fs.existsSync({stop})) {{ clearInterval(t); fs.rmSync({alive}, {{ force: true }}); }} }}, 200);\n",
+            alive = json_path(&alive),
+            stop = json_path(&stop)
+        ),
+    );
+    let parent = write_temp(
+        "mcp_grandchild/parent.mjs",
+        &format!(
+            "import {{ spawn }} from 'node:child_process';\n\
+             import fs from 'node:fs';\n\
+             spawn(process.execPath, ['run', '--no-check', {sleeper}], {{ stdio: 'inherit', detached: true }});\n\
+             while (!fs.existsSync({alive})) await new Promise((r) => setTimeout(r, 20));\n\
+             console.log('spawned');\n\
+             setInterval(() => {{}}, 1000);\n",
+            sleeper = json_path(&sleeper),
+            alive = json_path(&alive)
+        ),
+    );
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_oam"))
+        .arg("mcp")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("oam mcp spawns");
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        // Long enough for a loaded box to start the script and its child.
+        let call = serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "oam_run", "arguments": {"file": parent.to_str().unwrap(), "timeoutMs": 8000}}});
+        writeln!(stdin, "{call}").unwrap();
+    }
+    drop(child.stdin.take());
+
+    let started = std::time::Instant::now();
+    let stdout = BufReader::new(child.stdout.take().unwrap());
+    let responses: Vec<serde_json::Value> = stdout
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+        .collect();
+    let elapsed = started.elapsed();
+    // Still holding the pipe when the answer came: the case under test.
+    let held = alive.exists();
+    assert!(child.wait().unwrap().success());
+    assert!(
+        elapsed < std::time::Duration::from_secs(45),
+        "the answer waited for the grandchild holding stdout ({elapsed:?})"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_secs(8),
+        "answered before the budget ran out ({elapsed:?})"
+    );
+    assert!(held, "the grandchild was not running when oam_run answered");
+
+    let payload: serde_json::Value = serde_json::from_str(
+        responses[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(payload["timedOut"], true);
+    assert_eq!(payload["stdout"], "spawned\n", "{payload}");
+}
+
+/// A stand-in tsgo under `dir`: answers `--version` as tsgo 7 does, and for
+/// a check writes the file OAM_FAKE_TSGO_MARK names, then runs until the
+/// file OAM_FAKE_TSGO_STOP names exists (two minutes at most).
+fn stand_in_tsgo(dir: &str) -> PathBuf {
+    if cfg!(windows) {
+        write_temp(
+            &format!("{dir}/tsgo.cmd"),
+            "@echo off\r\n\
+             if \"%~1\"==\"--version\" (echo Version 7.0.0-dev& exit /b 0)\r\n\
+             type nul > \"%OAM_FAKE_TSGO_MARK%\"\r\n\
+             for /l %%i in (1,1,120) do (\r\n\
+             \x20 if exist \"%OAM_FAKE_TSGO_STOP%\" exit /b 0\r\n\
+             \x20 ping -n 2 127.0.0.1 >nul\r\n\
+             )\r\n\
+             exit /b 0\r\n",
+        )
+    } else {
+        let path = write_temp(
+            &format!("{dir}/tsgo"),
+            "#!/bin/sh\n\
+             if [ \"$1\" = \"--version\" ]; then echo 'Version 7.0.0-dev'; exit 0; fi\n\
+             : > \"$OAM_FAKE_TSGO_MARK\"\n\
+             i=0\n\
+             while [ $i -lt 120 ] && [ ! -e \"$OAM_FAKE_TSGO_STOP\" ]; do sleep 1; i=$((i+1)); done\n\
+             exit 0\n",
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+}
+
+/// No tsconfig.json at or above `dir`: a check of a file there is one-shot,
+/// the path these tests are about (with one, the type-check daemon takes it).
+fn assert_no_tsconfig_above(dir: &std::path::Path) {
+    let found = dir
+        .ancestors()
+        .map(|d| d.join("tsconfig.json"))
+        .find(|p| p.is_file());
+    assert!(
+        found.is_none(),
+        "a stray {} would send the check to the daemon",
+        found.unwrap().display()
+    );
+}
+
+/// Windows hands a spawned process every inheritable handle its parent
+/// holds, and `oam run` held its own stdout and stderr inheritable when it
+/// type-checked a file with no tsconfig one-shot: tsgo got the pipes as
+/// extra handles and kept them open after `oam run` was killed, so whatever
+/// read the run's output waited for the checker -- under `oam mcp`, past
+/// the tool's deadline (mcp_run_kills_hung_scripts_at_deadline failed on a
+/// loaded box that way). A stand-in tsgo that stays alive shows it: killing
+/// `oam run` must close its output at once, not when the checker exits.
+/// The leak is Windows-only (on POSIX a child gets only the descriptors it
+/// is given), so only the Windows leg proves the fix; the others check the
+/// behaviour.
+#[test]
+fn a_killed_oam_run_does_not_leave_its_type_check_holding_stdout() {
+    use std::io::Read;
+
+    let script = write_temp("killed_run_check/hang.ts", "setInterval(() => {}, 1000);\n");
+    let dir = script.parent().unwrap().to_path_buf();
+    assert_no_tsconfig_above(&dir);
+    let mark = dir.join("tsgo-started");
+    let stop = dir.join("tsgo-stop");
+    let _release = ReleaseOnDrop(stop.clone());
+    let tsgo = stand_in_tsgo("killed_run_check");
+
+    let mut child = oam_command(&["run", script.to_str().unwrap()])
+        .env("OAM_TSGO", &tsgo)
+        .env("OAM_FAKE_TSGO_MARK", &mark)
+        .env("OAM_FAKE_TSGO_STOP", &stop)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("oam run spawns");
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+    let pipes: [Box<dyn Read + Send>; 2] = [
+        Box::new(child.stdout.take().unwrap()),
+        Box::new(child.stderr.take().unwrap()),
+    ];
+    for mut pipe in pipes {
+        let closed = closed_tx.clone();
+        std::thread::spawn(move || {
+            let mut sink = Vec::new();
+            let _ = pipe.read_to_end(&mut sink);
+            let _ = closed.send(());
+        });
+    }
+
+    let waiting = std::time::Instant::now();
+    while !mark.exists() && waiting.elapsed() < std::time::Duration::from_secs(90) {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let started = mark.exists();
+    let _ = child.kill();
+    let _ = child.wait();
+    let bound = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let closed = (0..2).all(|_| {
+        closed_rx
+            .recv_timeout(bound.saturating_duration_since(std::time::Instant::now()))
+            .is_ok()
+    });
+    assert!(started, "the stand-in tsgo never started");
+    assert!(
+        closed,
+        "oam run's output stayed open after it was killed: its type-check inherited the pipes"
+    );
+}
+
+/// A child spawned with more than three stdio entries, 'inherit' among them,
+/// after the script's type-check started. oam clears the inherit flag on its
+/// own std handles before it starts a checker, and the Windows spawn path
+/// for extra stdio entries passed the std handle itself in the child's
+/// explicit inherit list, which Windows refuses for a handle that is not
+/// inheritable: the spawn threw `spawn EINVAL`. It now passes an inheritable
+/// duplicate, as libuv does. Windows-only in effect, like the leak above.
+#[test]
+fn a_spawn_with_extra_stdio_works_once_the_type_check_has_started() {
+    let script = write_temp(
+        "spawn_after_check/main.ts",
+        "import { spawn } from 'node:child_process';\n\
+         import fs from 'node:fs';\n\
+         const mark = process.env.OAM_FAKE_TSGO_MARK as string;\n\
+         await new Promise<void>((r) => { const t = setInterval(() => { if (fs.existsSync(mark)) { clearInterval(t); r(); } }, 20); });\n\
+         const child = spawn(process.execPath, ['run', '--no-check', process.env.OAM_E2E_CHILD as string], { stdio: ['inherit', 'inherit', 'inherit', 'pipe'] });\n\
+         child.on('error', (e: NodeJS.ErrnoException) => { console.log('spawn error', e.code); process.exit(0); });\n\
+         child.on('exit', (code) => { console.log('child exit', code); process.exit(0); });\n",
+    );
+    let dir = script.parent().unwrap().to_path_buf();
+    assert_no_tsconfig_above(&dir);
+    let child_script = write_temp("spawn_after_check/child.mjs", "console.log('child ok');\n");
+    let mark = dir.join("tsgo-started");
+    let stop = dir.join("tsgo-stop");
+    let _release = ReleaseOnDrop(stop.clone());
+    let tsgo = stand_in_tsgo("spawn_after_check");
+
+    let out = bounded_output(
+        oam_command(&["run", script.to_str().unwrap()])
+            .env("OAM_TSGO", &tsgo)
+            .env("OAM_FAKE_TSGO_MARK", &mark)
+            .env("OAM_FAKE_TSGO_STOP", &stop)
+            .env("OAM_E2E_CHILD", &child_script)
+            // The run waits this long for the stand-in checker after the
+            // program exits; it never answers.
+            .env("OAM_CHECK_WAIT_MS", "0")
+            .stdin(std::process::Stdio::null()),
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("child ok") && stdout.contains("child exit 0"),
+        "stdout: {stdout}\nstderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

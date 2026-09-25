@@ -1258,6 +1258,9 @@
           throw aborted();
         }
         signal?.addEventListener("abort", abandon, { once: true });
+        // Aborted before the fetch parked: the listener will never fire (see
+        // the lookup branch below), so drop the parked fetch now.
+        if (signal?.aborted) abandon();
         let socket;
         try {
           socket = await runConnector(connector, {
@@ -1302,6 +1305,12 @@
         throw aborted();
       }
       signal?.addEventListener("abort", abandon, { once: true });
+      // An abort that landed before the fetch parked has already fired, so
+      // the listener above never will: drop the parked fetch now, or it
+      // keeps its streamed body's receiver -- and every write blocked on it
+      // -- for as long as the hook takes to answer, forever if it never
+      // does. The hook is still asked, as node asks it.
+      if (signal?.aborted) abandon();
       let ips;
       try {
         ips = await runConnectLookup(lookup, host, port);

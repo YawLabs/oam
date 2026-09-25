@@ -976,8 +976,12 @@ fn image_is_oam(name: &str) -> bool {
 /// `oam run` leaked ITS std handles (the agent's pipes) into the run child
 /// as non-stdio extras, which the daemon then inherited transitively. Any
 /// oam code spawning children with piped/null stdio should call this first
-/// (and must NOT rely on Stdio::inherit afterwards — inherit requires the
-/// handle to stay inheritable). The durable fix is an explicit
+/// (the one-shot tsgo spawn in `run_with_timeout` does). A later
+/// Stdio::inherit is unaffected: std duplicates the std handle it passes as
+/// a fresh inheritable handle (library/std/src/sys/process/windows.rs), and
+/// so does oam_core's child_win for an inherited fd, as libuv does -- it
+/// used to pass the handle itself, and a spawn with extra stdio entries
+/// then failed with EINVAL once this had run. The durable fix is an explicit
 /// PROC_THREAD_ATTRIBUTE_HANDLE_LIST; tracked for the perf/correctness pass.
 #[cfg(windows)]
 pub fn unshare_std_handles() {

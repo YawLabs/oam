@@ -243,6 +243,17 @@ fn run_with_timeout(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Windows: tsgo (and the cmd -> node -> tsgo shim chain) would inherit
+    // every inheritable handle this process holds -- our own stdout and
+    // stderr included, when we run with piped stdio -- as extras beside the
+    // pipes set above. `oam run` checks a tsconfig-less file one-shot, never
+    // reaching spawn_daemon's own unshare, so under `oam mcp` the script's
+    // tsgo kept the pipes `oam mcp` reads open after the deadline killed the
+    // script, and the tool answered only when tsgo exited (a 25 s tsgo held a
+    // 1.5 s deadline to 26 s; the e2e deadline test failed on a loaded box).
+    // Stdio::inherit duplicates the handle it passes, so a later spawn that
+    // inherits our stdio is unaffected.
+    daemon::unshare_std_handles();
     let deadline = Instant::now() + timeout;
     let mut child = command.spawn().map_err(RunFailure::Spawn)?;
     let out_pipe = drain(child.stdout.take());

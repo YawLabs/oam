@@ -154,6 +154,11 @@ miniz_oxide = { version = "0.8", default-features = false }
 h2 = "0.4"
 tower-service = "0.3"
 rustls-platform-verifier = "0.7"
+# macOS only: Apple's basic X.509 trust evaluation for the fetch transport's
+# NODE_EXTRA_CA_CERTS chains (http_client/tls_config.rs). Already compiled on
+# macOS as rustls-platform-verifier's own dependency, at this version: a new
+# dependency EDGE, no new package.
+security-framework = "3"
 # TLS client/server: tokio-rustls wraps rustls for async IO; webpki-roots
 # bundles Mozilla's CA store for public HTTPS; rustls-pemfile parses PEM.
 # All three are already compiled transitively via tokio-tungstenite --

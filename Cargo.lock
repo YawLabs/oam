@@ -1952,6 +1952,7 @@ dependencies = [
  "rustls-platform-verifier",
  "rustls-webpki",
  "scrypt",
+ "security-framework",
  "serde",
  "serde_json",
  "sha1 0.10.6",
