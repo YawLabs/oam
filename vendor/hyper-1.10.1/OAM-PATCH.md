@@ -390,6 +390,12 @@ No new `unsafe`: the uninitialized slots are still read only up to the count
 httparse reported. hyper's own `Server::parse` header tests (default 100, a
 limit of 0, a limit of 200) exercise the boundary and still pass.
 
+With the server path no longer using `smallvec_inline!`, that import is gated
+on `client` -- its one remaining user, `Client::parse` -- so a server-only
+build stays warning-free. `scripts/check-vendor.sh --build` compiles every
+feature set in OAM-PATCH.features and is where an unused import in one of
+them shows up.
+
 ## Upstream status (checked 2026-09-18)
 
 - The newest hyper is **1.11.1**. Its `Receiver::drop` is unchanged, and so is
