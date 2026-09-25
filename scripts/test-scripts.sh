@@ -542,6 +542,54 @@ eq "$(OAM_DISK_MIN_GB=50 bash -c '. scripts/lib/iap-helpers.sh; disk_below_floor
    "abort"
 
 # =============================================================================
+group "iap-helpers.sh -- instance schedules + ssh transport drops"
+# =============================================================================
+# The reading gcloud gave for yaw-linux-builder on 2026-09-25. gcloud on
+# Windows terminates value() output with \r\n, so every parser here is fed the
+# \r too: a policy name carrying one would make `resource-policies describe`
+# look up a policy that does not exist, and the detach would silently skip.
+POLICY_URL='https://www.googleapis.com/compute/v1/projects/yaw-labs-prod/regions/us-west1/resourcePolicies/yaw-linux-builder-autostop'
+
+it "policy name comes off the selfLink"
+eq "$(iap_policy_name "$POLICY_URL")" "yaw-linux-builder-autostop"
+
+it "policy name survives a CRLF-terminated reading"
+eq "$(iap_policy_name "$POLICY_URL"$'\r')" "yaw-linux-builder-autostop"
+
+it "a bare policy name passes through as itself"
+eq "$(iap_policy_name "yaw-linux-builder-autostop")" "yaw-linux-builder-autostop"
+
+it "an empty reading is a clean miss, not an empty name"
+iap_policy_name "" >/dev/null 2>&1 && fail "named an empty policy" || pass
+
+it "policy region comes off the selfLink"
+eq "$(iap_policy_region "$POLICY_URL"$'\r')" "us-west1"
+
+it "a bare policy name has no region to read"
+iap_policy_region "yaw-linux-builder-autostop" >/dev/null 2>&1 && fail "invented a region" || pass
+
+it "two attached policies split into two URLs"
+eq "$(iap_policy_urls "$POLICY_URL;${POLICY_URL%autostop}snap"$'\r' | wc -l | tr -d ' ')" "2"
+
+it "the split URLs carry no CR"
+eq "$(iap_policy_urls "$POLICY_URL"$'\r' | tr -d '\n')" "$POLICY_URL"
+
+it "no attached policies yields no output at all"
+eq "$(iap_policy_urls "" | wc -c | tr -d ' ')" "0"
+
+# The last two lines of the 2026-09-25 node-suite log, verbatim.
+it "the scheduled-stop signature reads as a transport drop"
+if ssh_transport_dropped $'  PASS   test-stream-pipeline-with-empty-string.js\nConnection to localhost closed by remote host.'; then pass
+else fail "missed OpenSSH's closed-by-remote-host line"; fi
+
+it "a remote command that merely failed is not a transport drop"
+if ssh_transport_dropped $'error: test failed, to rerun pass ...\n[remote] node-suite FAILED'; then fail "a remote exit code is not a transport drop"
+else pass; fi
+
+it "empty text is not a transport drop"
+ssh_transport_dropped "" && fail "matched nothing" || pass
+
+# =============================================================================
 group "src-sync.sh -- source tarball ceiling"
 # =============================================================================
 # shellcheck source=lib/src-sync.sh

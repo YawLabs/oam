@@ -43,10 +43,17 @@
 #   OAM_KEEP_VM=1             leave the VM running on exit even if this
 #                             script started it (default: stop what we start;
 #                             a VM found already RUNNING is always left alone)
+#   OAM_KEEP_VM_SCHEDULE=1    leave the VM's instance schedule(s) attached for
+#                             the run (default: detach every stop schedule
+#                             while the run is going and re-attach on exit --
+#                             yaw-linux-builder-autostop stops the VM at 03:00
+#                             America/Los_Angeles every day, mid-run or not)
 #
 # Prereqs (same as yaw's IAP path):
 #   - gcloud CLI authenticated; identity has roles/iap.tunnelResourceAccessor
-#     + compute.instances.get/use (and start/stop for the lifecycle step).
+#     + compute.instances.get/use (and start/stop for the lifecycle step,
+#     compute.resourcePolicies.get + instances.{add,remove}ResourcePolicies
+#     for the instance-schedule step).
 #   - Firewall allows TCP:22 from 35.235.240.0/20 (IAP range).
 #   - VM image: build-essential, curl, outbound HTTPS to nodejs.org.
 #     rustup is auto-installed by scripts/build-remote.sh prep on first run,
@@ -180,6 +187,67 @@ stop_vm() {
   fi
 }
 
+# --- instance schedules ------------------------------------------------------
+# yaw-linux-builder carries an instance schedule (`yaw-linux-builder-autostop`:
+# stop at 03:00 America/Los_Angeles, every day) as the cost backstop for a VM
+# left running. It fires whatever the VM is doing. The 2026-09-25 v0.17.0
+# release leg started at 02:39, was 86s into node-suite at 03:00, and died
+# with nothing but `Connection to localhost closed by remote host.` -- the
+# guest journal (sshd SIGTERM, systemd shutdown.target one second after the
+# session closed) and a `stop` by the Compute Engine system service account
+# in the operations log were the only evidence, and this script's own cleanup
+# had stopped the VM and deleted the tunnel log before anyone looked.
+#
+# So: detach every stop schedule for the run and re-attach on exit. The EXIT
+# trap runs on failure too, so the backstop is back before this script is
+# gone; if the re-attach itself fails, the warning carries the exact command.
+# A VM found already RUNNING gets the same treatment -- the schedule does not
+# care who started it. OAM_KEEP_VM_SCHEDULE=1 leaves the schedules alone, and
+# the run then has to fit before the next stop. The parsing lives in
+# lib/iap-helpers.sh (iap_policy_*), where it is tested.
+DETACHED_POLICIES=""
+detach_stop_schedules() {
+  if [ "${OAM_KEEP_VM_SCHEDULE:-0}" = "1" ]; then
+    warn "OAM_KEEP_VM_SCHEDULE=1 -- leaving the VM's instance schedules attached; a scheduled stop will kill this run"
+    return 0
+  fi
+  local reading url name region fields stop tz
+  reading="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
+    --format='value(resourcePolicies)' 2>/dev/null || true)"
+  while IFS= read -r url; do
+    [ -n "$url" ] || continue
+    name="$(iap_policy_name "$url")" || continue
+    region="$(iap_policy_region "$url" || true)"
+    [ -n "$region" ] || region="${ZONE%-*}"
+    # Only a policy with a vmStopSchedule can kill the run; snapshot and
+    # placement policies attach the same way and are left alone.
+    fields="$(gcloud compute resource-policies describe "$name" --region="$region" --project="$PROJECT" \
+      --format='value(instanceSchedulePolicy.vmStopSchedule.schedule,instanceSchedulePolicy.timeZone)' \
+      2>/dev/null || true)"
+    IFS=$'\t' read -r stop tz <<<"${fields//$'\r'/}"
+    [ -n "$stop" ] || continue
+    if gcloud compute instances remove-resource-policies "$INSTANCE" --resource-policies="$name" \
+         --zone="$ZONE" --project="$PROJECT" >/dev/null 2>&1; then
+      DETACHED_POLICIES="$DETACHED_POLICIES $name"
+      ok "detached instance schedule $name (stops $INSTANCE at '$stop' $tz) for this run -- re-attached on exit"
+    else
+      warn "could not detach instance schedule $name (stops $INSTANCE at '$stop' $tz) -- a run still going then will be killed"
+    fi
+  done <<<"$(iap_policy_urls "$reading")"
+}
+reattach_stop_schedules() {
+  local name
+  for name in $DETACHED_POLICIES; do
+    if gcloud compute instances add-resource-policies "$INSTANCE" --resource-policies="$name" \
+         --zone="$ZONE" --project="$PROJECT" >/dev/null 2>&1; then
+      ok "re-attached instance schedule $name"
+    else
+      warn "could not re-attach instance schedule $name -- $INSTANCE has NO scheduled stop until you run: gcloud compute instances add-resource-policies $INSTANCE --resource-policies=$name --zone=$ZONE --project=$PROJECT"
+    fi
+  done
+  DETACHED_POLICIES=""
+}
+
 # --- IAP tunnel machinery (mirrors yaw's, see that script for the full
 # rationale) -------------------------------------------------------------------
 # Short version: gcloud's own ssh wrapper uses plink on Windows, which has no
@@ -281,10 +349,19 @@ stop_iap_tunnel() {
     wait "$IAP_TUNNEL_PID" 2>/dev/null || true
     ok "IAP tunnel stopped (pid $IAP_TUNNEL_PID, port $IAP_TUNNEL_PORT)"
   fi
+  # Keep gcloud's own tunnel output next to the step logs. It is the only
+  # record of a tunnel-side reset, and it used to be deleted here before
+  # anyone could read it.
+  if [ -f "$IAP_TUNNEL_LOG" ]; then
+    cp "$IAP_TUNNEL_LOG" "$STAGE_DIR/logs/iap-tunnel.log" 2>/dev/null || true
+  fi
   rm -f "$IAP_TUNNEL_LOG"
 }
-cleanup() { stop_iap_tunnel; stop_vm; }
+cleanup() { stop_iap_tunnel; reattach_stop_schedules; stop_vm; }
 trap cleanup EXIT
+# Only now that the trap is armed: a failure between detaching a schedule and
+# arming the trap would leave the VM with no scheduled stop at all.
+detach_stop_schedules
 
 # Built INSIDE the helpers, not at script scope: $IAP_TUNNEL_PORT is set by
 # start_iap_tunnel() and bash captures values at expansion time. Port flag is
@@ -353,13 +430,38 @@ sync_src(){
   rm -f "$t"
 }
 
+# remote_step_postmortem <log>: a remote step whose ssh transport dropped ends
+# with `Connection to localhost closed by remote host.` and no remote exit
+# code -- which is what a scheduled VM stop, a host error and an IAP tunnel
+# reset all look like from here. The run's cleanup is about to stop the VM and
+# delete the tunnel log, so ask the compute API NOW and put the answer next to
+# the failure. Best effort: a postmortem must never mask the failure itself.
+remote_step_postmortem() {
+  local log="$1" status last_stop
+  ssh_transport_dropped "$(tail -5 "$log" 2>/dev/null || true)" || return 0
+  status="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
+    --format='value(status)' 2>/dev/null || echo UNKNOWN)"
+  status="${status//$'\r'/}"
+  case "$status" in
+    RUNNING)
+      warn "ssh transport dropped but $INSTANCE is still RUNNING -- the IAP tunnel reset under the step (transient; re-run). Tunnel log tail: $(tail -3 "$IAP_TUNNEL_LOG" 2>/dev/null | tr -d '\r' | tr '\n' ' ')"
+      ;;
+    *)
+      last_stop="$(gcloud compute operations list --project="$PROJECT" \
+        --filter="targetLink~$INSTANCE AND operationType=stop" --sort-by=~insertTime --limit=1 \
+        --format='value(insertTime,user)' 2>/dev/null | tr -d '\r' | tr '\t' ' ' || true)"
+      warn "ssh transport dropped because $INSTANCE is $status -- last stop operation: ${last_stop:-none found}. A stop by service-<project-number>@compute-system.iam.gserviceaccount.com is an instance schedule firing (this script detaches those for the run unless OAM_KEEP_VM_SCHEDULE=1)"
+      ;;
+  esac
+}
+
 # remote_step <dispatch>: one short ssh invocation per build-remote.sh
 # dispatch, log captured per step, tail surfaced on failure.
 remote_step(){
   local dispatch="$1"
   gcp_ssh "cd $REMOTE_DIR && bash scripts/build-remote.sh $dispatch" \
     > "$STAGE_DIR/logs/$dispatch.log" 2>&1 \
-    || { tail -30 "$STAGE_DIR/logs/$dispatch.log" >&2; fail "remote '$dispatch' failed -- see $STAGE_DIR/logs/$dispatch.log"; }
+    || { tail -30 "$STAGE_DIR/logs/$dispatch.log" >&2; remote_step_postmortem "$STAGE_DIR/logs/$dispatch.log"; fail "remote '$dispatch' failed -- see $STAGE_DIR/logs/$dispatch.log"; }
   ok "remote $dispatch ok"
 }
 
@@ -374,6 +476,7 @@ remote_step_advisory(){
     ok "remote $dispatch ok"
   else
     tail -30 "$STAGE_DIR/logs/$dispatch.log" >&2
+    remote_step_postmortem "$STAGE_DIR/logs/$dispatch.log"
     warn "remote '$dispatch' failed (advisory -- continuing; see $STAGE_DIR/logs/$dispatch.log)"
   fi
 }
