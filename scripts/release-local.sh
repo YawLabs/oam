@@ -16,7 +16,8 @@
 #   oam-aarch64-apple-darwin          MacBook Air (tailnet), native
 #   oam-x86_64-apple-darwin           MacBook Air, x64 HOST toolchain under
 #                                     Rosetta 2
-#   oam-x86_64-unknown-linux-gnu      GCP Linux VM (IAP), native
+#   oam-x86_64-unknown-linux-gnu      GCP Linux VM (direct ssh, IAP
+#                                     tunnel fallback), native
 #   SHA256SUMS
 #   LICENSE, NOTICE, THIRD_PARTY_LICENSES.md   (attribution travels with the
 #                                               binaries -- see the staging step)
@@ -92,6 +93,10 @@
 #   OAM_SKIP_MAC_X64=1      drop only the mac-x64 asset
 #   OAM_SKIP_LINUX=1        drop the linux asset
 #   OAM_KEEP_VM=1           leave the GCP VM running after the linux leg
+#   OAM_IAP_SSH_MODE=direct|tunnel
+#                           force the linux leg's ssh transport (default auto:
+#                           direct ssh to the VM's external IP, falling back to
+#                           the IAP tunnel when that does not answer)
 #   OAM_DRY_RUN=1           build + checksum everything, publish nothing
 #                           (release.yml's workflow_dispatch dry-run). Preflight
 #                           still runs in full -- it bumps, commits and tags, so
@@ -842,7 +847,7 @@ fi
 if [ "$SKIP_LINUX" = "1" ]; then
   warn "OAM_SKIP_LINUX=1 -- linux asset dropped this release"
 else
-  step "Linux leg (GCP IAP)"
+  step "Linux leg (GCP: direct ssh, IAP fallback)"
   LINUX_ART=$(bash "$SCRIPT_DIR/build-platforms-gcp-iap.sh" --mode=release) \
     || fail "linux leg failed -- see its log output above"
   LINUX_ART="${LINUX_ART##*$'\n'}"   # contract: artifact dir = LAST stdout line

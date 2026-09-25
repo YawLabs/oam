@@ -45,8 +45,11 @@
 #                                            gate before this step existed)
 #  13. scripts/test-scripts.sh             (GATING; the shell scripts under
 #                                            scripts/ -- gc-target.sh selection
-#                                            logic, tunnel-log parsing, sshd
-#                                            detection, disk thresholds, and
+#                                            logic, the linux leg's ssh
+#                                            transport choice and process-
+#                                            tree reaping, tunnel-log
+#                                            parsing, sshd detection, disk
+#                                            thresholds, and
 #                                            THIS script's miri-gate verdicts)
 #      + scripts/test-changelog-tools.sh  (GATING; release-local.sh's changelog
 #                                            gate block, sliced verbatim and run
