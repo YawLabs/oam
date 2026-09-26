@@ -347,9 +347,13 @@ run_io_uring_ab() {
 # Measured on the Linux builder 2026-08-22: 39GB -> 9GB, / from 10GB free to
 # 40GB, build cache intact.
 #
-# --keep 2, not the default 1: cargo emits a bin and its test harness under the
-# same family name (both `oam-<hash>`), so keeping a single copy can evict the
-# current one of the pair and force a needless rebuild.
+# --keep 3, not the default 1: a family can hold several LIVE artifacts, and
+# evicting one forces a rebuild of it and everything that depends on it on the
+# very next run. Measured from the debug maps of the Air's binaries (2026-09-25):
+# up to 3 live rlibs per family -- getrandom 0.2/0.3/0.4, three serde_json and
+# sha1 builds -- and a bin beside its test harnesses. --keep 2 evicted one of
+# those on every run, so each run rebuilt it and the prune never converged.
+# .rmeta families hold more live members still; gc-target.sh gives them 4x.
 run_gc() {
   if [ ! -f scripts/gc-target.sh ]; then
     warn "scripts/gc-target.sh missing -- skipping target/ reclaim"
@@ -357,7 +361,7 @@ run_gc() {
   fi
   # Advisory by construction: a host that cannot prune must never fail a run
   # whose artifacts are already built.
-  bash scripts/gc-target.sh --keep 2 || warn "target/ reclaim failed (non-blocking)"
+  bash scripts/gc-target.sh --keep 3 || warn "target/ reclaim failed (non-blocking)"
 }
 
 # --- dispatch ----------------------------------------------------------------

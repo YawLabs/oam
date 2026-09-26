@@ -21,8 +21,12 @@
 #   deps/         per-FAMILY prune. Files are grouped by name-with-the-hash-
 #                 stripped plus extension, sorted newest-first, and only copies
 #                 beyond --keep are removed. A crate with exactly one artifact
-#                 keeps it no matter how old it is, so nothing that is still
-#                 linked can be collected.
+#                 keeps it no matter how old it is. A family can hold more
+#                 than one LIVE artifact, though -- see --keep below.
+#                 Hashed codegen-unit objects (<name>-<hash>.*.rcgu.o) follow
+#                 their unit instead. An unhashed cdylib`s (a path crate such
+#                 as oam_napi_test_addon: <name>.*.rcgu.o) match no rule and
+#                 are left, a few KB per build.
 #   *.inuse-*     parked copies from scripts/lib/build-locks.sh whose holder
 #                 has since exited.
 #
@@ -34,11 +38,13 @@
 #   ./scripts/gc-target.sh --dry-run       # report only, delete nothing
 #   ./scripts/gc-target.sh --keep 2        # keep the 2 newest per family
 #
-# On --keep: cargo emits a bin and that bin`s test harness under the SAME family
-# name (both `oam-<hash>`, or `oam-<hash>.exe` on Windows), so the default keep=1
-# can evict the current half of the pair and force a rebuild of it. That is a
-# time cost, never a correctness one -- everything under deps/ is regenerable --
-# but it is why the remote `gc` dispatch in build-remote.sh passes --keep 2.
+# On --keep: a family is crate name + extension, and several artifacts in it
+# can be live at once -- a bin and its test harness (both `oam-<hash>`, or
+# `oam-<hash>.exe` on Windows), or one crate built at several versions or
+# feature sets (getrandom 0.2, 0.3 and 0.4 all link into oam). Evicting a live
+# one forces a rebuild of it and everything above it. That is a time cost,
+# never a correctness one -- everything under deps/ is regenerable -- but it is
+# why the remote `gc` dispatch in build-remote.sh passes --keep 3.
 #   ./scripts/gc-target.sh --keep-incremental   # leave incremental/ alone
 # =============================================================================
 
@@ -90,10 +96,34 @@ TREES=(
   target/x64-host/x86_64-apple-darwin/release
 )
 
-# deps/ pruning needs GNU find (-printf). macOS BSD find yields nothing and the
-# prune silently reports zero candidates -- degrade LOUDLY instead.
-GNU_FIND=1
-find . -maxdepth 0 -printf '' >/dev/null 2>&1 || GNU_FIND=0
+# deps/ pruning needs each file's mtime and size. GNU find prints both with
+# -printf; macOS has BSD find, which has no -printf, so there BSD stat -f prints
+# them instead. That fallback is not optional: the Mac build leg skipped this
+# prune for its whole life, and ~/oam-build/target on the Air reached 93GB
+# (2026-09-25). A host with neither still degrades LOUDLY below rather than
+# reporting a clean prune that collected nothing.
+LISTER=none
+if find . -maxdepth 0 -printf '' >/dev/null 2>&1; then
+  LISTER=gnu
+elif stat -f '%m' . >/dev/null 2>&1; then
+  # GNU stat reads -f as --file-system and '%m' as a file operand, so this
+  # probe only succeeds on BSD stat.
+  LISTER=bsd
+fi
+
+# list_files <dir>  -- one "<mtime>\t<KB>\t<path>" line per regular file.
+# BSD stat's %m is whole seconds and %b is 512-byte blocks, halved up to KB to
+# match GNU find's %k. Whole seconds cannot misorder two generations of one
+# family: those come from separate builds, minutes apart.
+list_files() {
+  case "$LISTER" in
+    gnu) find "$1" -maxdepth 1 -type f -printf '%T@\t%k\t%p\n' 2>/dev/null ;;
+    bsd)
+      find "$1" -maxdepth 1 -type f -exec stat -f '%m%t%b%t%N' {} + 2>/dev/null |
+        awk -F'\t' -v OFS='\t' '{ $2 = int(($2 + 1) / 2); print }'
+      ;;
+  esac
+}
 
 before_gb="$(oam_dir_gb target)"
 say "target/ is ${before_gb}GB before pruning (keep=$KEEP, dry-run=$DRY_RUN)"
@@ -119,26 +149,28 @@ for tree in "${TREES[@]}"; do
   fi
 
   [ -d "$tree/deps" ] || continue
-  if [ "$GNU_FIND" = "0" ]; then
-    warn "$tree/deps: per-family prune skipped -- needs GNU find -printf (BSD find here); incremental/ was still reclaimed"
+  if [ "$LISTER" = "none" ]; then
+    warn "$tree/deps: per-family prune skipped -- needs GNU find -printf or BSD stat -f, and this host has neither; incremental/ was still reclaimed"
     oam_reap_parked "$tree"; oam_reap_parked "$tree/deps"
     continue
   fi
   # Newest-first globally, so the FIRST time awk sees a family it is that
   # family's current artifact. Anything past --keep in the same family is a
-  # superseded copy. NUL-delimited: nothing here has spaces today, but a path
-  # that grows one should not silently delete the wrong file.
+  # superseded copy. Newline-delimited, not NUL: a space in a path is still
+  # safe (only the tab and the newline separate, and cargo names outputs
+  # <crate>-<hash>[.ext], which carry neither), while macOS's BSD awk takes
+  # RS='\0' as an empty string and loses every record after the first.
   stale_count=0
   stale_kb=0
-  while IFS= read -r -d '' line; do
+  while IFS= read -r line; do
     kb="${line%% *}"; path="${line#* }"
     stale_count=$((stale_count + 1))
     stale_kb=$((stale_kb + kb))
     gc_rm "$path"
   done < <(
-    find "$tree/deps" -maxdepth 1 -type f -printf '%T@\t%k\t%p\0' 2>/dev/null |
-      sort -zrn |
-      awk -v keep="$KEEP" -v RS='\0' -v ORS='\0' -F'\t' '
+    list_files "$tree/deps" |
+      sort -rn |
+      awk -v keep="$KEEP" -v now="$(date +%s)" -F'\t' '
         BEGIN {
           # Interval expressions ({16}) are NOT portable. mawk is Ubuntu`s
           # default awk -- and so the GCP builder`s -- and mawk 1.3.4 matches
@@ -163,12 +195,53 @@ for tree in "${TREES[@]}"; do
           # 107 extensionless binaries held 16GB of a 21GB deps/.
           if (match(base, bare)) {
             family = substr(base, 1, RSTART - 1)
+            stem = base
           } else if (match(base, dotted)) {
+            stem = substr(base, 1, RSTART + 16)
+            # A codegen-unit object, <name>-<hash>.<cgu>.rcgu.o, is not a family
+            # of its own: every build names its units afresh, so each object
+            # was a family of one and none was ever collected. macOS leaves
+            # them all in deps/ (an executable`s debug info lives in its own
+            # unit`s objects), and on the Air 2026-09-25 they held most of a
+            # 49GB deps/, 57 generations of oam_engine alone. So an object
+            # stays while its unit survives in this tree -- as an executable
+            # (whose debug info it is) or as a <name>-<hash>.d -- and goes once
+            # neither does (decided in END, once every file is seen). Never on
+            # the .d alone: clippy and cargo check write .d files into the same
+            # family, so a test harness loses its .d generations before the
+            # harness itself goes. Deciding that from what THIS run pruned
+            # took a live xtask binary`s debug info in one version, and
+            # orphaned every harness`s objects for good in the next. An object
+            # younger than an hour whose unit is not here yet is left alone:
+            # that is a build still writing it.
+            if (base ~ /\.rcgu\.o$/) {
+              obj[++nobj] = $2 " " path; objstem[nobj] = stem; objmt[nobj] = $1 + 0
+              next
+            }
             family = substr(base, 1, RSTART - 1) substr(base, RSTART + RLENGTH)
           } else {
             next
           }
-          if (++seen[family] > keep) print $2 " " path
+          # A crate version has several LIVE .rmeta files at once: one per
+          # target cargo check ran (lib, lib test, bin, bin test) beside the
+          # build`s own, and oam links getrandom at three versions. Evicting
+          # any of them re-checks or rebuilds that crate and everything above
+          # it on the next run, every run. They are metadata only (0.44GB for
+          # the Air`s whole tree), so they get four times the keep.
+          k = keep
+          if (base ~ /\.rmeta$/) k = keep * 4
+          if (++seen[family] > k) {
+            print $2 " " path
+          } else {
+            if (stem == base || base ~ /\.exe$/) exe[stem] = 1
+            if (base ~ /\.d$/) keptd[stem] = 1
+          }
+        }
+        END {
+          for (i = 1; i <= nobj; i++) {
+            s = objstem[i]
+            if (!(s in exe) && !(s in keptd) && objmt[i] < now - 3600) print obj[i]
+          }
         }
       '
   )

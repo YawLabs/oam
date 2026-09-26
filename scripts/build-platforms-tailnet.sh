@@ -76,6 +76,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=lib/src-sync.sh
 . "$SCRIPT_DIR/lib/src-sync.sh"
+# disk_needs_reclaim / disk_below_floor -- the same thresholds as the linux leg.
+# shellcheck source=lib/iap-helpers.sh
+. "$SCRIPT_DIR/lib/iap-helpers.sh"
 
 RUNID="$(date +%Y%m%d-%H%M%S)"
 STAGE_DIR="$(mktemp -d -t oam-tailnet-build-$RUNID-XXXXXX)"
@@ -130,6 +133,20 @@ pull(){  # pull <user@host> <remote-glob-under-REMOTE_DIR> <local-dir>
   scp "${SSH_OPTS[@]}" -q "$1:$REMOTE_DIR/$2" "$3"
 }
 
+# mac_free_gb <user@host>  -- whole GB free on the volume holding $REMOTE_DIR.
+# POSIX `df -Pk` has the same columns on macOS and Linux. An ssh or df failure,
+# or a line whose Available column is not a number, prints nothing, which
+# disk_needs_reclaim / disk_below_floor read as "not low" -- never as 0GB free.
+mac_free_gb(){
+  ssh "${SSH_OPTS[@]}" "$1" "df -Pk $REMOTE_DIR | tail -1" 2>/dev/null | awk '$4 ~ /^[0-9]+$/ { print int($4 / 1048576) }'
+}
+
+# mac_reclaim <user@host>  -- scripts/gc-target.sh on the Air, via the same
+# `build-remote.sh gc` dispatch the linux leg uses.
+mac_reclaim(){
+  ssh "${SSH_OPTS[@]}" "$1" "cd $REMOTE_DIR && bash scripts/build-remote.sh gc"
+}
+
 # --- preflight ----------------------------------------------------------------
 step "Run $RUNID -- oam mac --mode=$MODE on $MAC_USER@$MAC_HOST"
 [ -f "$MAC_KEY" ] || fail "Mac SSH key not found: $MAC_KEY\n  One-time setup:\n    ssh-keygen -t ed25519 -N '' -C oam-mac-air -f \"$MAC_KEY\"\n    ssh-copy-id -i \"$MAC_KEY.pub\" $MAC_USER@$MAC_HOST\n  Already have a key on the Air? point at it with OAM_MAC_KEY=/path/to/key"
@@ -171,8 +188,24 @@ ok "key auth OK on $MAC_USER@$MAC_HOST"
 # Called as `build_mac || handler` -- every step fails the function EXPLICITLY
 # (bash suppresses set -e inside the || call tree).
 build_mac(){
-  local hp="$MAC_USER@$MAC_HOST"
+  local hp="$MAC_USER@$MAC_HOST" free
   sync_src "$hp" || return 1
+  # Disk headroom, reclaimed the way the linux leg does it -- after the sync, so
+  # the gc dispatch is this run's (see the ordering comment there). This leg
+  # used to never prune: target/ on the Air reached 93GB and the disk 91% full
+  # (2026-09-25), with superseded cargo output from every release since August.
+  free="$(mac_free_gb "$hp")"
+  if disk_needs_reclaim "$free"; then
+    warn "mac has ${free}GB free -- reclaiming accreted cargo output before building"
+    mac_reclaim "$hp" || warn "pre-build reclaim failed -- continuing to the threshold check"
+    free="$(mac_free_gb "$hp")"
+  fi
+  if disk_below_floor "$free"; then
+    warn "mac still has only ${free}GB free after reclaiming prunable cargo output -- a build needs ~7GB. Free space on the Air outside ~/${REMOTE_DIR}/target."
+    return 1
+  fi
+  if [ -n "$free" ]; then ok "mac disk headroom: ${free}GB free"
+  else warn "could not read free disk on the Air -- headroom check skipped"; fi
   case "$MODE" in
     release)
       ssh "${SSH_OPTS[@]}" "$hp" "cd $REMOTE_DIR && OAM_SKIP_MAC_X64=$SKIP_MAC_X64 bash scripts/build-remote.sh mac-release" || return 1
@@ -206,6 +239,10 @@ build_mac(){
       pull "$hp" "conformance/surface-gaps.json" "$REPO_DIR/conformance/" || return 1
       ;;
   esac
+  # Reclaim AFTER this mode's outputs are pulled, every run, so target/ never
+  # accretes until the check above has to act. Advisory: the leg has already
+  # succeeded, and a failed cleanup must not retract that.
+  mac_reclaim "$hp" || warn "post-build reclaim failed (non-blocking -- outputs are already pulled)"
 }
 
 step "Run mac --mode=$MODE on $MAC_USER@$MAC_HOST"

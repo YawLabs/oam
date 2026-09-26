@@ -240,9 +240,21 @@ direct_ssh_hint() {
 # `gcloud compute start-iap-tunnel` processes from the 2026-09-25 03:52 and
 # 03:56 runs were still alive ten hours later. `taskkill /T` walks the Windows
 # process tree down from the sh's Windows pid (/proc/<pid>/winpid, which only
-# MSYS/Cygwin have) and takes the whole chain. On Linux and macOS gcloud's
-# launcher execs python, so the plain kill is the whole job and the taskkill
-# branch never runs.
+# MSYS/Cygwin have) and takes the whole chain.
+#
+# Linux and macOS have no winpid. gcloud's launcher execs python there, so the
+# tunnel is one process today -- but a plain kill of any job with children
+# orphans them exactly as on Windows, which made "everything under it" true only
+# by the luck of the job's shape. So the tree comes from ONE `ps -A -o pid= -o
+# ppid=` snapshot (procps and BSD ps agree on it), taken before anything is
+# signalled: a child whose parent dies first is reparented and can no longer be
+# found by walking. Then every process is SIGKILLed, parents first, so a shell
+# cannot start its next command as its child dies; KILL rather than TERM because
+# taskkill /F forces too, and a hung process that ignores TERM would otherwise
+# survive, with the `wait` below blocking on it if it is the job itself. Never
+# `kill -- -<pgid>`: with no job control the job shares the caller's process
+# group, so that would kill the caller too. MSYS ps rejects -A, so a Windows job
+# whose winpid is already gone just has the job itself killed.
 #
 # Path conversion is switched off for the one call rather than spelling the
 # flags //F: under an exported MSYS_NO_PATHCONV=1, //F reaches taskkill
@@ -252,16 +264,24 @@ direct_ssh_hint() {
 # Kills a background job and everything under it, then reaps it. Always
 # returns 0: a process that has already gone is the goal, not an error.
 kill_proc_tree() {
-  local pid="${1:-}" winpid=""
-  [ -n "$pid" ] || return 0
+  local pid="${1:-}" winpid="" desc="" p
+  # Only a real job pid. 0 or 1 would make the walk below return nearly every
+  # process on the host, and -1 makes `kill -KILL -1` signal all of them.
+  case "$pid" in '' | *[!0-9]* | 0 | 1) return 0 ;; esac
   if [ -r "/proc/$pid/winpid" ] && command -v taskkill >/dev/null 2>&1; then
     winpid="$(cat "/proc/$pid/winpid" 2>/dev/null || true)"
     winpid="${winpid//[!0-9]/}"
     if [ -n "$winpid" ]; then
       MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL='*' taskkill /F /T /PID "$winpid" >/dev/null 2>&1 || true
     fi
+    kill "$pid" 2>/dev/null || true
+  else
+    desc="$(ps -A -o pid= -o ppid= 2>/dev/null | awk -v root="$pid" '
+      { parent[$1] = $2 }
+      END { n = 1; q[1] = root
+            for (i = 1; i <= n; i++) for (c in parent) if (parent[c] == q[i]) { q[++n] = c; print c } }' || true)"
+    for p in "$pid" $desc; do kill -KILL "$p" 2>/dev/null || true; done
   fi
-  kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
   return 0
 }

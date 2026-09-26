@@ -213,9 +213,112 @@ it "prunes every configured tree in one run, not just target/debug"
 eq "debug=$(count_in target/debug/deps) release=$(count_in target/release/deps) win-x64=$(count_in target/x64-host/release/deps) msvc=$(count_in target/x64-host/x86_64-pc-windows-msvc/release/deps) mac-x64=$(count_in target/x64-host/x86_64-apple-darwin/release/deps)" \
    "debug=1 release=1 win-x64=1 msvc=1 mac-x64=1"
 
+# --- codegen-unit objects follow their unit's dep-info ------------------------
+# macOS leaves each unit's <name>-<hash>.<cgu>.rcgu.o in deps/ (its debug info
+# lives there), and every build names its codegen units afresh -- so keyed like
+# any other dotted file, each object was a family of one and never collected:
+# 57 generations of oam_engine on the Air, most of a 49GB deps/ (2026-09-25).
+reset_tree
+plant target/debug/deps 0 eng-0000000000000001.d eng-0000000000000001.a1.rcgu.o eng-0000000000000001.b1.rcgu.o
+plant target/debug/deps 1 eng-0000000000000002.d eng-0000000000000002.a2.rcgu.o
+plant target/debug/deps 2 eng-0000000000000003.d eng-0000000000000003.a3.rcgu.o eng-0000000000000003.b3.rcgu.o
+gc --keep 2
+
+it "a codegen-unit object goes once neither its unit's .d nor its executable survives"
+survivors eng-0000000000000002.d eng-0000000000000002.a2.rcgu.o \
+          eng-0000000000000003.d eng-0000000000000003.a3.rcgu.o eng-0000000000000003.b3.rcgu.o \
+          '!eng-0000000000000001.d' '!eng-0000000000000001.a1.rcgu.o' '!eng-0000000000000001.b1.rcgu.o'
+
+# Neither an executable nor a .d names this unit. An hour-old one is a build
+# that died, and goes; a fresh one may be a build still writing it -- deleting
+# its objects would break its link -- so it stays.
+it "an unclaimed object goes once it is an hour old, and stays while fresh"
+reset_tree
+plant target/debug/deps 0 dead-00000000000000fe.x.rcgu.o
+echo artifact > "$ROOT/target/debug/deps/wip-00000000000000ff.x.rcgu.o"
+gc --keep 2
+survivors wip-00000000000000ff.x.rcgu.o '!dead-00000000000000fe.x.rcgu.o'
+
+# The leak the first version had: a harness loses its .d (check .d files outrank
+# it) while the harness itself survives, then a later run evicts the harness.
+# The objects must go in THAT run, not be orphaned because this run did not
+# prune the .d itself.
+it "an executable's objects go in the run that evicts it, after its .d went earlier"
+reset_tree
+plant target/debug/deps 0 hx-b000000000000001 hx-b000000000000001.d hx-b000000000000001.x.rcgu.o
+plant target/debug/deps 1 hx-b000000000000002.d
+plant target/debug/deps 2 hx-b000000000000003.d
+gc --keep 2
+HX_RUN1="$([ -e "$ROOT/target/debug/deps/hx-b000000000000001.x.rcgu.o" ] && echo kept || echo gone)"
+plant target/debug/deps 3 hx-b000000000000004
+plant target/debug/deps 4 hx-b000000000000005
+gc --keep 2
+if [ "$HX_RUN1" = "kept" ]; then
+  survivors '!hx-b000000000000001' '!hx-b000000000000001.x.rcgu.o'
+else fail "run 1 already took the objects of the executable it kept"; fi
+
+# One crate version has several live .rmeta files (a check-mode one per target
+# beside the build's), and three versions of one crate can be live at once;
+# evicting any forces a re-check or rebuild on every run. .rmeta is metadata
+# only, so it gets four times the keep.
+it ".rmeta keeps four times --keep per family"
+reset_tree
+for g in 1 2 3 4 5 6 7 8 9; do plant target/debug/deps "$g" "librm-c00000000000000$g.rmeta"; done
+gc --keep 2
+survivors librm-c000000000000009.rmeta librm-c000000000000002.rmeta '!librm-c000000000000001.rmeta'
+
+# The real tree's shape: clippy and cargo check write .d files (with no
+# executable) into the same family, so they outrank a real build's .d. On the
+# Air that pruned the .d of the xtask binary still in use, and its 236 debug
+# objects went with it. An executable that survives keeps its own objects.
+reset_tree
+plant target/debug/deps 0 app-a000000000000001 app-a000000000000001.d app-a000000000000001.x.rcgu.o
+plant target/debug/deps 1 app-a000000000000002.d
+plant target/debug/deps 2 app-a000000000000003.d
+gc --keep 2
+
+it "a surviving executable keeps its objects when check-only .d files outrank its .d"
+survivors app-a000000000000001 app-a000000000000001.x.rcgu.o '!app-a000000000000001.d'
+
 # =============================================================================
 group "gc-target.sh -- portability and safety"
 # =============================================================================
+
+# macOS has BSD find (no -printf), so there the listing comes from BSD stat -f.
+# That path is what the Air runs, and nothing else here reaches it: on a host
+# with real BSD stat it runs as-is; elsewhere a shim hides find -printf and
+# answers `stat -f` the BSD way through GNU stat, so the dev box proves it too.
+it "without find -printf, BSD stat -f still drives the per-family prune"
+BSDLIST="$SUITE_TMP/shim-bsdlist"
+mkdir -p "$BSDLIST"
+REAL_FIND="$(command -v find)"
+REAL_STAT="$(command -v stat)"
+{
+  echo '#!/bin/sh'
+  echo 'for a in "$@"; do [ "$a" = "-printf" ] && exit 1; done'
+  printf 'exec "%s" "$@"\n' "$REAL_FIND"
+} > "$BSDLIST/find"
+if ! stat -f '%m' . >/dev/null 2>&1; then
+  # GNU stat: map the three BSD conversions gc-target.sh uses (%m mtime, %b
+  # 512-byte blocks, %N name) and its %t tab onto --printf.
+  {
+    echo '#!/bin/sh'
+    printf '[ "$1" = "-f" ] || exec "%s" "$@"\n' "$REAL_STAT"
+    echo "fmt=\$(printf '%s' \"\$2\" | sed 's/%m/%Y/g; s/%N/%n/g; s/%t/\\\\t/g'); shift 2"
+    printf 'exec "%s" --printf="$fmt\\n" "$@"\n' "$REAL_STAT"
+  } > "$BSDLIST/stat"
+fi
+chmod +x "$BSDLIST"/*
+reset_tree
+plant target/debug/deps 0 oam-bbbd000000000001 lib-bbbd000000000001.d lib-bbbd000000000001.q.rcgu.o
+plant target/debug/deps 1 oam-bbbd000000000002 lib-bbbd000000000002.d
+BSD_OUT="$( cd "$ROOT" && PATH="$BSDLIST:$PATH" bash scripts/gc-target.sh --keep 1 2>&1 )"
+if grep -q 'prune skipped' <<<"$BSD_OUT"; then
+  fail "the BSD path degraded instead of pruning: $BSD_OUT"
+else
+  survivors oam-bbbd000000000002 lib-bbbd000000000002.d \
+            '!oam-bbbd000000000001' '!lib-bbbd000000000001.d' '!lib-bbbd000000000001.q.rcgu.o'
+fi
 
 # THE regression guard. mawk -- Ubuntu`s default awk, and the GCP builder`s --
 # matches NOTHING for /-[0-9a-f]{16}/ rather than erroring, so reintroducing an
@@ -234,7 +337,11 @@ else pass; fi
 it "selection is identical under every awk installed here"
 AWK_TESTED=""
 AWK_BAD=0
-for AWKBIN in mawk gawk original-awk busybox; do
+# Plain `awk` only when no named one exists: macOS ships its BSD awk (the one
+# true awk) under that name alone, so without it this case found nothing to run
+# there -- on exactly the host whose awk differs most.
+for AWKBIN in mawk gawk original-awk busybox awk; do
+  [ "$AWKBIN" = "awk" ] && [ -n "$AWK_TESTED" ] && continue
   AWKPATH="$(command -v "$AWKBIN" 2>/dev/null)" || continue
   [ -n "$AWKPATH" ] || continue
   SHIM="$SUITE_TMP/shim-$AWKBIN"
@@ -390,21 +497,28 @@ HELP_OUT="$(gc_out -h)"
 if [ -n "$HELP_OUT" ] && [ "$(count_in target/debug/deps)" = "2" ]; then pass
 else fail "help printed ${#HELP_OUT} chars and left $(count_in target/debug/deps) of 2 files"; fi
 
-# --- the BSD/macOS leg --------------------------------------------------------
-# `find -printf` is GNU-only. BSD find yields nothing for it, so without the
-# probe the per-family prune would collect zero while reporting a clean run --
-# the precise shape of the mawk bug this suite exists for. The contract is to
-# degrade LOUDLY: skip the deps prune, say why, and still reclaim incremental/.
-it "a find without -printf skips the deps prune loudly, reclaiming the rest"
+# --- a host with neither lister -----------------------------------------------
+# `find -printf` is GNU-only and `stat -f` is BSD-only. With neither, the
+# per-family prune would collect zero while reporting a clean run -- the precise
+# shape of the mawk bug this suite exists for. The contract is to degrade
+# LOUDLY: skip the deps prune, say why, and still reclaim incremental/. Both
+# are shimmed away, so this holds on macOS too, where real stat -f exists.
+it "with neither find -printf nor BSD stat, the deps prune is skipped loudly, reclaiming the rest"
 NOPRINTF="$SUITE_TMP/shim-noprintf"
 mkdir -p "$NOPRINTF"
 REAL_FIND="$(command -v find)"
+REAL_STAT="$(command -v stat)"
 {
   echo '#!/bin/sh'
   echo 'for a in "$@"; do [ "$a" = "-printf" ] && exit 1; done'
   printf 'exec %s "$@"\n' "$REAL_FIND"
 } > "$NOPRINTF/find"
-chmod +x "$NOPRINTF/find"
+{
+  echo '#!/bin/sh'
+  echo '[ "$1" = "-f" ] && exit 1'
+  printf 'exec "%s" "$@"\n' "$REAL_STAT"
+} > "$NOPRINTF/stat"
+chmod +x "$NOPRINTF/find" "$NOPRINTF/stat"
 reset_tree
 plant target/debug/deps 0 oam-9999000000000001
 plant target/debug/deps 1 oam-9999000000000002
@@ -688,12 +802,45 @@ eq "$(direct_ssh_hint 'kex_exchange_identification: read: Connection reset by pe
 it "the linux-leg orchestrator parses"
 bash -n scripts/build-platforms-gcp-iap.sh 2>/dev/null && pass || fail "bash -n rejects scripts/build-platforms-gcp-iap.sh"
 
+it "the mac-leg orchestrator parses"
+bash -n scripts/build-platforms-tailnet.sh 2>/dev/null && pass || fail "bash -n rejects scripts/build-platforms-tailnet.sh"
+
+# The mac leg never reclaimed at all, so target/ on the Air grew to 93GB with
+# nothing to catch it (2026-09-25). Like the linux leg it must prune BEFORE
+# building when short (after the sync, so the gc dispatch is this run's) and
+# AFTER every build. Asserted on the source: the leg only runs against the Air.
+it "the mac leg reclaims before building when short, and after every build"
+MAC_BUILD="$(sed -n '/^build_mac(){/,/^}/p' scripts/build-platforms-tailnet.sh | sed 's/#.*//')"
+MAC_SYNC="$(grep -n 'sync_src "\$hp"' <<<"$MAC_BUILD" | head -1 | cut -d: -f1)"
+MAC_PRE="$(grep -n 'disk_needs_reclaim' <<<"$MAC_BUILD" | head -1 | cut -d: -f1)"
+MAC_ESAC="$(grep -n '^  esac' <<<"$MAC_BUILD" | tail -1 | cut -d: -f1)"
+MAC_POST="$(grep -n 'mac_reclaim "\$hp"' <<<"$MAC_BUILD" | tail -1 | cut -d: -f1)"
+# The reclaim's own body, comments stripped: the comment above it names the
+# dispatch too, so a file-wide grep passed with the ssh line gone.
+MAC_RECLAIM="$(sed -n '/^mac_reclaim(){/,/^}/p' scripts/build-platforms-tailnet.sh | sed 's/#.*//')"
+if [ -n "$MAC_SYNC" ] && [ -n "$MAC_PRE" ] && [ -n "$MAC_ESAC" ] && [ -n "$MAC_POST" ] \
+   && [ "$MAC_SYNC" -lt "$MAC_PRE" ] && [ "$MAC_POST" -gt "$MAC_ESAC" ] \
+   && grep -q 'ssh .*build-remote.sh gc' <<<"$MAC_RECLAIM"; then pass
+else fail "sync@${MAC_SYNC:-none} pre-check@${MAC_PRE:-none} esac@${MAC_ESAC:-none} post-reclaim@${MAC_POST:-none}"; fi
+
 # =============================================================================
 group "iap-helpers.sh -- background process-tree reaping"
 # =============================================================================
 
 it "an empty pid is a no-op that succeeds"
 kill_proc_tree "" && pass || fail "rc=$? for an empty pid"
+
+# 0 or 1 would have the tree walk return nearly every process on the host, and
+# -1 is `kill -KILL -1`. Run against stubs, never the real kill: a regression
+# here must not take the suite's own host down with it.
+it "a pid that names no job (0, 1, -1, garbage) signals nothing"
+KPT_SIGNALLED="$(
+  kill(){ echo "kill $*"; }
+  taskkill(){ echo "taskkill $*"; }
+  ps(){ printf '%s\n' '    5     1' '    6     5'; }
+  for p in 0 1 -1 abc '5;6'; do kill_proc_tree "$p"; done
+)"
+eq "$KPT_SIGNALLED" ""
 
 it "a plain background job is killed and reaped"
 sleep 60 & KPT_PID=$!
@@ -741,7 +888,42 @@ if [ -r "/proc/$$/winpid" ] && command -v cmd.exe >/dev/null 2>&1 \
     else fail "the cmd.exe under the shim kept running after kill_proc_tree ($KPT_B1 -> $KPT_B2 bytes)"; fi
   fi
 else
-  skip "no MSYS/Cygwin process tree here (on Linux/macOS gcloud execs python, so the plain kill is the whole job)"
+  skip "no MSYS/Cygwin process tree here (the POSIX tree case below covers Linux/macOS)"
+fi
+
+# The same guarantee off Windows, where there is no winpid and the tree comes
+# from a ps snapshot. A real tree, not `exec sleep`: exec leaves ONE process,
+# which even a plain kill of the job reaches -- the shape under which the old
+# kill passed while orphaning everything below the job. Each level records its
+# own pid (the leaf's exec keeps the one it wrote) and the trailing `:` keeps
+# each sh alive as its child's parent. Survivors are counted by pid rather than
+# by name: a multicall sleep (uutils, busybox) picks its utility from argv[0],
+# and pgrep is not on every host.
+it "a sh -> sh -> sleep tree is reaped whole off Windows"
+if [ ! -r "/proc/$$/winpid" ]; then
+  KPT_DIR="$SUITE_TMP/kpt-posix"
+  mkdir -p "$KPT_DIR"
+  printf '#!/bin/sh\necho $$ >>"$(dirname "$0")/pids"\n"$(dirname "$0")/mid"\n:\n' > "$KPT_DIR/shim"
+  printf '#!/bin/sh\necho $$ >>"$(dirname "$0")/pids"\nsh -c '"'"'echo $$ >>"$1"; exec sleep 60'"'"' sh "$(dirname "$0")/pids"\n:\n' > "$KPT_DIR/mid"
+  chmod +x "$KPT_DIR/shim" "$KPT_DIR/mid"
+  : >"$KPT_DIR/pids"
+  "$KPT_DIR/shim" >/dev/null 2>&1 &
+  KPT_PID=$!
+  for _ in $(seq 1 40); do [ "$(wc -l <"$KPT_DIR/pids" 2>/dev/null | tr -d ' ')" = "3" ] && break; sleep 0.25; done
+  KPT_TREE="$(wc -l <"$KPT_DIR/pids" 2>/dev/null | tr -d ' ')"
+  kill_proc_tree "$KPT_PID"
+  # Signals land asynchronously; a real survivor (a 60s sleep) is still there.
+  KPT_LEFT=""
+  for _ in 1 2 3 4 5; do
+    KPT_LEFT=""
+    for p in $(cat "$KPT_DIR/pids"); do kill -0 "$p" 2>/dev/null && KPT_LEFT="$KPT_LEFT $p"; done
+    [ -z "$KPT_LEFT" ] && break
+    sleep 1
+  done
+  if [ "$KPT_TREE" = "3" ] && [ -z "$KPT_LEFT" ]; then pass
+  else fail "tree of ${KPT_TREE:-0}/3 started; still alive:${KPT_LEFT:- none}"; for p in $KPT_LEFT; do kill -KILL "$p" 2>/dev/null; done; fi
+else
+  skip "MSYS/Cygwin: the scoop-shaped case above covers this host"
 fi
 
 # =============================================================================
