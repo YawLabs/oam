@@ -428,6 +428,13 @@ const EXIT_GRACE_MS = 5_000;
 // be exiting before it counts as left behind. Polled, so a clean teardown
 // costs nothing and only a real leak waits the full window.
 const LEAK_SETTLE_MS = 10_000;
+// How long a finished probe waits for the sidecar's stderr pipe to close, so
+// the last thing it -- or a process it handed off to -- printed is read.
+// Normally the pipe is closed by the end of teardown, which kills whatever
+// the sidecar left running; this only runs out when something outside that
+// tree holds it open. Long enough for a handed-off node to start and print on
+// a loaded box.
+const STDERR_DRAIN_MS = 3_000;
 // A process-table read, which on a loaded Windows box is mostly PowerShell
 // starting up -- measured at 11-17s, so a 30s budget failed under load.
 const PROCESS_TABLE_TIMEOUT_MS = 60_000;
@@ -606,13 +613,26 @@ function armEnv(host, s, call, ctx, nodePin, inherited) {
  * mid-call was excused whenever the control could not boot (an engines bump
  * past the release box's node, say), and the release went out on a warn.
  *
+ * Depth alone does not close that at the SAME point. An oam boot failure met
+ * by a node control that refused this box's node (the sidecar's engines or
+ * its launcher's floor, past the node the release box runs) is two arms
+ * failing at depth 0, and read as "node fails identically". `refused` is
+ * nodeHostRefusal's answer for the control: when it names a reason, the
+ * control ran nothing this sidecar supports, at any depth, and is no evidence.
+ *
  * Split out of the run loop so it is testable without spawning a sidecar --
  * the same reason classifyCall below is a pure function. It decides whether a
  * release goes red, and it was the one verdict nothing could exercise.
  */
-function classifyBoot(oam, node) {
+function classifyBoot(oam, node, refused = null) {
   const oamAt = oam.depth ?? 0;
   const nodeAt = node.depth ?? 0;
+  if (!node.ok && refused) {
+    return {
+      state: "fail",
+      why: `${oam.why}; the node control cannot run this sidecar on this box (${refused}), so nothing exonerates oam`,
+    };
+  }
   if (!node.ok && nodeAt < oamAt) {
     return {
       state: "fail",
@@ -725,10 +745,103 @@ function uncalledVerdict(s, unmet) {
  *  control whose probe failed -- it could not boot, or died or hung before the
  *  call's reply -- produced no call verdict, so it is marked probeFailed, and
  *  classifyCall will not let it exonerate oam. A control that answered is its
- *  answer, a failed call included. */
-function controlVerdict(control) {
-  if (!control.ok) return { ok: false, probeFailed: true, why: `node control could not probe: ${control.why}` };
-  return control.call ?? { ok: false, why: "node control returned no verdict" };
+ *  answer, a failed call included -- unless `refused` says this box's node is
+ *  one the sidecar does not support. Then a failed call on node is the
+ *  unsupported configuration talking, and it is marked probeFailed too. A
+ *  PASS on an unsupported node is still a pass: it can only ever convict oam. */
+function controlVerdict(control, refused = null) {
+  const because = refused ? ` (${refused})` : "";
+  if (!control.ok) return { ok: false, probeFailed: true, why: `node control could not probe: ${control.why}${because}` };
+  const call = control.call ?? { ok: false, why: "node control returned no verdict" };
+  if (!call.ok && refused) {
+    return { ok: false, probeFailed: true, why: `node control ran outside the sidecar's supported node${because}, and its call failed: ${call.why}` };
+  }
+  return call;
+}
+
+/** Whether node `version` satisfies an npm `engines.node` range: true, false,
+ *  or null when the range uses syntax this does not read (a hyphen range, a
+ *  prerelease tag, a 0.x caret), which then decides nothing. Reads what
+ *  packages declare: comparators (>= > <= < =), full and partial versions
+ *  with x or * wildcards, ^ and ~, space-joined AND sets, and ||. Hand-rolled
+ *  because the harness takes no dependencies; the self-test holds it to
+ *  node-semver's own answers. */
+function satisfiesNodeRange(range, version) {
+  const have = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(String(version).trim());
+  if (!have) return null;
+  const v = have.slice(1, 4).map(Number);
+  const cmp = (a, b) => a[0] - b[0] || a[1] - b[1] || a[2] - b[2];
+  const test = (comparator) => {
+    const m = /^(>=|<=|>|<|=|\^|~)?v?(\d+|[xX*])(?:\.(\d+|[xX*]))?(?:\.(\d+|[xX*]))?$/.exec(comparator);
+    if (!m) return null;
+    const op = m[1] ?? "=";
+    const parts = [m[2], m[3], m[4]].map((p) => (p === undefined || /^[xX*]$/.test(p) ? null : Number(p)));
+    // A wildcard or a missing part ends the version: 20.x.5 means 20.x.
+    const given = parts.findIndex((p) => p === null);
+    const n = given === -1 ? 3 : given;
+    const lo = [0, 1, 2].map((i) => (i < n ? parts[i] : 0));
+    // The first version past the range a partial version names: 20 -> 21.0.0, 20.1 -> 20.2.0.
+    const next = (k) => [0, 1, 2].map((i) => (i < k - 1 ? lo[i] : i === k - 1 ? lo[i] + 1 : 0));
+    if (n === 0) return op === "<" || op === ">" ? false : true; // * or x: any version
+    switch (op) {
+      case "=":
+        return n === 3 ? cmp(v, lo) === 0 : cmp(v, lo) >= 0 && cmp(v, next(n)) < 0;
+      case ">=":
+        return cmp(v, lo) >= 0;
+      case ">":
+        return n === 3 ? cmp(v, lo) > 0 : cmp(v, next(n)) >= 0;
+      case "<":
+        return cmp(v, lo) < 0;
+      case "<=":
+        return n === 3 ? cmp(v, lo) <= 0 : cmp(v, next(n)) < 0;
+      case "~":
+        return cmp(v, lo) >= 0 && cmp(v, next(n === 1 ? 1 : 2)) < 0;
+      case "^":
+        if (lo[0] === 0) return null; // 0.x carets have their own rules; no node release is 0.x
+        return cmp(v, lo) >= 0 && cmp(v, next(1)) < 0;
+    }
+    return null;
+  };
+  let unread = false;
+  for (const set of String(range).split("||")) {
+    const comparators = set.trim().replace(/(>=|<=|>|<|=|\^|~)\s+/g, "$1").split(/\s+/).filter(Boolean);
+    const results = comparators.length === 0 ? [true] : comparators.map(test);
+    // One comparator this cannot read leaves the whole set unread, even beside
+    // a false one: node-semver rejects ">=22 garbage" outright, and a floor
+    // this harness invented from half a range would convict oam on a guess.
+    // A hyphen range lands here too -- its "-" is no comparator -- which keeps
+    // "20 - 24" from being read as the AND set "=20 =24", false for 22.
+    if (results.includes(null)) unread = true;
+    else if (results.every((r) => r === true)) return true;
+  }
+  return unread ? null : false;
+}
+
+// The node-floor refusal the launchers print when the node hosting them is
+// too old. fetch-mcp: "is Node 22.22.2, older than 24.0.0; ... needs Node
+// 24.0.0 or newer"; tailscale-mcp: "needs Node 24.0.0 or newer, found ...".
+// Both say "Node", which their OAM-floor refusals ("is oam 0.15.0, older
+// than 0.15.2", "to get oam 0.15.2 or newer") never do.
+const NODE_FLOOR_REFUSAL =
+  /\b(?:needs|requires) node(?:\.js)? v?\d+(?:\.\d+){0,2} or (?:newer|later)\b|\bis node(?:\.js)? v?\d+(?:\.\d+){0,2}, older than\b/i;
+
+/** Why the node control cannot speak for this sidecar on this box, or null.
+ *  Two sources, because neither covers every sidecar. The package's own
+ *  `engines.node` (`engines`) when this box's node (`nodeVersion`) falls
+ *  outside it: the declared floor, and the only one a sidecar with no
+ *  launcher has (puppeteer, playwright). And the refusal a launcher prints
+ *  (`stderr`) when it enforces a floor of its own: fetch-mcp and tailscale-mcp
+ *  check NODE_MIN only when node hosts them, and that floor can be stricter
+ *  than engines. An engines range this cannot read decides nothing. */
+function nodeHostRefusal(engines, nodeVersion, stderr) {
+  if (engines && satisfiesNodeRange(engines, nodeVersion) === false) {
+    return `this box's node ${nodeVersion} is outside the sidecar's engines "${engines}"`;
+  }
+  const said = String(stderr ?? "")
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => NODE_FLOOR_REFUSAL.test(l));
+  return said ? `it refused this box's node: ${said.length > 200 ? `${said.slice(0, 200)}...` : said}` : null;
 }
 
 /** `msedge.exe x8, oam.exe` -- counts collapse, order follows first sighting. */
@@ -915,6 +1028,20 @@ async function selfTest() {
     'const oam = findOam();',
     'child = spawn(oam, ["run", SERVER_ENTRY]);',
   ].join("\n");
+  // The stderr each launcher that enforces a node floor prints when node is
+  // below it, captured verbatim on node 22.22.2 (2026-09-29) by raising only
+  // NODE_MIN, to 99.0.0, in a copy of @yawlabs/fetch-mcp 0.8.1's and
+  // @yawlabs/tailscale-mcp 0.21.0's launcher, run the way the control arm runs
+  // them (the runtime switch pinned to node). Both exit 1 before serving.
+  const FLOOR_REFUSALS = {
+    "fetch-mcp":
+      "fetch-mcp: this process is Node 22.22.2, older than 99.0.0; @yawlabs/fetch-mcp needs Node 99.0.0 or newer "
+      + "(the floor of its HTTP client, undici 8 -- an older Node crashes at import or on the first zstd-encoded response).\n"
+      + "Install a newer Node, or install oam from https://oamjs.org and this launcher will use it.\n",
+    "tailscale-mcp":
+      "tailscale-mcp: needs Node 99.0.0 or newer, found 22.22.2.\n"
+      + 'Install a newer Node (https://nodejs.org/en/download), or point your MCP client\'s "command" at one.\n',
+  };
   // The shape of the http_get reply @yawlabs/fetch-mcp 0.8.1 returns, captured
   // on node v22.22.2 (2026-09-29) against the fixture and against bodies the
   // call must not accept. Each came back as a 200 with isError false, so each
@@ -1533,8 +1660,11 @@ async function selfTest() {
           ['env: envFor("node", call)', 2],
           ['const unmet = s.call?.requires ? await s.call.requires(ctxFor("oam")) : null;', 1],
           ["uncalledVerdict(s, unmet)", 1],
-          ["classifyBoot(oam, control)", 1],
-          ["const nodeVerdict = controlVerdict(control);", 1],
+          // Both control sites ask whether this box's node is one the sidecar
+          // runs on, and hand the answer to the verdict.
+          ["const refused = nodeHostRefusal(bin.engines, process.versions.node, control.stderr);", 2],
+          ["classifyBoot(oam, control, refused)", 1],
+          ["const nodeVerdict = controlVerdict(control, refused);", 1],
           ["classifyCall(oam.call, nodeVerdict,", 1],
         ];
         assertDeep(
@@ -1543,9 +1673,151 @@ async function selfTest() {
           "every arm's env, the uncalled-row verdict and the control's evidence go through the tested functions",
         );
         assertDeep(
-          ["sidecarEnv(", "probeFailed: true", '? "boot"'].filter((inline) => loop.includes(inline)),
+          ["sidecarEnv(", "probeFailed: true", '? "boot"', "satisfiesNodeRange(", "NODE_FLOOR_REFUSAL"].filter((inline) =>
+            loop.includes(inline),
+          ),
           [],
           "and none of them is re-implemented inline beside the call",
+        );
+        // bin.engines comes from resolveBin, outside the loop. Dropped there,
+        // the declared floor would read as "none" for every sidecar, and the
+        // only floor a launcher-less sidecar has would go unchecked. Its body
+        // is found by its column-0 declaration, like the loop, so the quotes
+        // of it in this case do not answer for it.
+        const at = source.search(/^function resolveBin\(/m);
+        const resolveBinBody = source.slice(at, source.indexOf("\n}\n", at)).replace(/\s+/g, " ");
+        assertDeep(
+          [
+            'const engines = typeof manifest.engines?.node === "string" ? manifest.engines.node : null;',
+            "return { entry, version: manifest.version, engines };",
+          ].filter((needle) => at < 0 || !resolveBinBody.includes(needle)),
+          [],
+          "resolveBin hands each sidecar's declared engines.node to the loop",
+        );
+      },
+    },
+    {
+      name: "a node control that cannot run the sidecar on this box's node exonerates nothing",
+      async run() {
+        // The gap depth could not close: the sidecar's floor moves past the
+        // release box's node, the control refuses at boot, and an oam boot
+        // failure beside it -- also depth 0 -- read as "node fails identically".
+        const oamBoot = { ok: false, why: "exited early (code 1) awaiting tools/list", depth: 0 };
+        const nodeBoot = { ok: false, why: "exited early (code 1) awaiting tools/list", depth: 0 };
+        const refused = 'this box\'s node 22.22.2 is outside the sidecar\'s engines ">=24"';
+        assertDeep(classifyBoot(oamBoot, nodeBoot).state, "upstream", "with nothing refused, failing alike at boot is still the sidecar's");
+        const v = classifyBoot(oamBoot, nodeBoot, refused);
+        assertDeep(v.state, "fail", "a control this box's node cannot run is no evidence, so oam's boot failure is oam's");
+        assertDeep(v.why.includes(refused), true, "and the row says why the control does not count");
+        // The call path. A failed call on an unsupported node is the
+        // unsupported node talking; a pass there can still convict oam.
+        const oamCall = { ok: false, why: "tool reported an error: fetch failed" };
+        const failedThere = controlVerdict({ ok: true, tools: ["http_get"], call: oamCall }, refused);
+        assertDeep(failedThere.probeFailed, true, "a control's failed call on an unsupported node is marked, not read as the sidecar's bug");
+        assertDeep(classifyCall(oamCall, failedThere, false).state, "fail", "so oam's failed call stands against it");
+        const passedThere = controlVerdict({ ok: true, tools: ["http_get"], call: { ok: true, text: "t" } }, refused);
+        assertDeep(passedThere, { ok: true, text: "t" }, "a pass on an unsupported node is still a pass");
+        assertDeep(classifyCall(oamCall, passedThere, false).state, "fail", "and it still convicts an oam that failed");
+        // End to end through probe: a control that prints a launcher's real
+        // refusal and exits, the way tailscale-mcp does, has that refusal read
+        // off its stderr -- including when it exits the moment it has printed.
+        const env = { ...process.env, NO_COLOR: "1" };
+        const say = FLOOR_REFUSALS["tailscale-mcp"];
+        const refusing = await probe("node", "-e", {
+          env,
+          scriptArgs: [`process.stderr.write(${JSON.stringify(say)}); process.exit(1);`],
+          call: null,
+          ctx: {},
+        });
+        const found = nodeHostRefusal(null, "22.22.2", refusing.stderr);
+        assertDeep([refusing.ok, refusing.depth, refusing.stderr === say], [false, 0, true], "probe keeps all of the control's stderr");
+        assertDeep(classifyBoot(oamBoot, refusing, found).state, "fail", "and the refusal in it keeps oam's boot failure oam's");
+        // A launcher that hands off exits first, and the refusal comes from the
+        // process it started, after 'exit' has already fired. Detached, so it
+        // outlives its parent's job object on Windows, and it prints the
+        // moment it starts -- which is after its parent is gone.
+        const late = `process.stderr.write(${JSON.stringify(say)});`;
+        const handOff =
+          'require("node:child_process").spawn(process.execPath, ["-e", '
+          + `${JSON.stringify(late)}], { detached: true, stdio: ["ignore", "ignore", "inherit"] }); process.exit(1);`;
+        const handedOff = await probe("node", "-e", { env, scriptArgs: [handOff], call: null, ctx: {} });
+        assertDeep(
+          [handedOff.ok, typeof nodeHostRefusal(null, "22.22.2", handedOff.stderr)],
+          [false, "string"],
+          "a refusal printed after the launcher exited is still read -- probe waits for stderr to close",
+        );
+      },
+    },
+    {
+      name: "a node-floor refusal is read from engines and from the launchers' own words",
+      run() {
+        // Every floor the staged sidecars declare (fetch, tailscale, postgres,
+        // redis, playwright, lemonsqueezy, ctxlint; memory and puppeteer
+        // declare none) admits node 22.22.2, the release box's node.
+        const declared = [">=22.19.0", ">=20.11.0", ">=22", ">=20", ">=18", null];
+        assertDeep(declared.map((e) => nodeHostRefusal(e, "22.22.2", "")), declared.map(() => null), "today's floors refuse nothing");
+        assertDeep(typeof nodeHostRefusal(">=24", "22.22.2", ""), "string", "a declared floor past this box's node is a refusal");
+        assertDeep(nodeHostRefusal("20 - 24", "22.22.2", ""), null, "a range this cannot read decides nothing");
+        for (const [who, said] of Object.entries(FLOOR_REFUSALS)) {
+          const r = nodeHostRefusal(null, "22.22.2", `some earlier log line\n${said}`);
+          assertDeep(typeof r === "string" && r.includes(`${who}:`), true, `${who}'s own refusal is found, and quoted`);
+        }
+        // The OAM-floor refusals the same launchers print must never read as
+        // node's (rendered from their templates at 0.15.0 against 0.15.2).
+        for (const said of [
+          "fetch-mcp: this process is oam 0.15.0, older than 0.15.2, and no newer oam was found",
+          "Run `oam self-update` to get oam 0.15.2 or newer, or launch this command with node.",
+          "redis-mcp: REDIS_MCP_RUNTIME=oam but no usable oam (0.15.2 or newer) was found.",
+        ]) {
+          assertDeep(nodeHostRefusal(null, "22.22.2", said), null, `not a node refusal: ${said}`);
+        }
+      },
+    },
+    {
+      name: "the engines check gives node-semver's answers, or none",
+      run() {
+        // Expected values are node-semver 7.7.4's satisfies(), except the null
+        // rows: syntax this does not read, where deciding nothing is the point
+        // (node-semver itself rejects the last two outright).
+        const table = [
+          [">=22.19.0", "22.22.2", true],
+          [">=22.19.0", "22.18.9", false],
+          [">=22", "21.9.9", false],
+          [">=18", "18.0.0", true],
+          [">22", "22.22.2", false],
+          [">22", "23.0.0", true],
+          [">22.1", "22.22.2", true],
+          ["<22", "21.9.9", true],
+          ["<22", "22.0.0", false],
+          ["<=22", "22.22.2", true],
+          ["<=22.22.1", "22.22.2", false],
+          ["22", "22.22.2", true],
+          ["22.x", "23.0.0", false],
+          ["22.22", "22.22.2", true],
+          ["=22.22.2", "22.22.2", true],
+          ["v22.22.2", "22.22.1", false],
+          ["~22.21", "22.22.2", false],
+          ["~22", "22.22.2", true],
+          ["^22.23", "22.22.2", false],
+          ["^22.19.0", "23.0.0", false],
+          ["^20.19.0 || >=22.12.0", "22.22.2", true],
+          ["^20.19.0 || >=22.12.0", "21.9.9", false],
+          [">= 18", "20.11.0", true],
+          [">=18 <22", "22.22.2", false],
+          ["20 || 22", "22.22.2", true],
+          ["*", "22.22.2", true],
+          ["", "22.22.2", true],
+          [">*", "22.22.2", false],
+          ["20 - 24", "22.22.2", null],
+          [">=22.0.0-rc.1", "22.22.2", null],
+          ["^0.1.0", "22.22.2", null],
+          [">=22 garbage", "21.9.9", null],
+          ["lts/*", "22.22.2", null],
+        ];
+        assertDeep(
+          table.filter(([range, v, want]) => satisfiesNodeRange(range, v) !== want).map(([range, v, want]) => `${range} @ ${v}: want ${want}, got ${satisfiesNodeRange(range, v)}`),
+          [],
+          "every row agrees",
         );
       },
     },
@@ -1568,7 +1840,9 @@ async function selfTest() {
   return failures === 0 ? 0 : 1;
 }
 
-/** Resolve an installed package's bin entry point and version.
+/** Resolve an installed package's bin entry point, version, and declared
+ *  `engines.node` (null when it declares none) -- the floor nodeHostRefusal
+ *  holds the node control to.
  *  Mirrors oam-spawn.ts: the BIN from package.json, not require.resolve --
  *  a package's library export is often ESM-gated and is not what npx runs. */
 function resolveBin(pkg) {
@@ -1581,7 +1855,8 @@ function resolveBin(pkg) {
   if (!rel) return { error: "package.json declares no bin", version: manifest.version };
   const entry = resolve(dir, rel);
   if (!existsSync(entry)) return { error: `bin missing on disk: ${entry}`, version: manifest.version };
-  return { entry, version: manifest.version };
+  const engines = typeof manifest.engines?.node === "string" ? manifest.engines.node : null;
+  return { entry, version: manifest.version, engines };
 }
 
 /** Turn a tools/call reply into a verdict the adjudicator can judge.
@@ -1778,6 +2053,12 @@ function probe(host, entry, { env, scriptArgs = [], call = null, ctx }) {
   const argv = host === "oam" ? oamArgv : [entry, ...scriptArgs];
   return new Promise((resolveP) => {
     const child = spawn(cmd, argv, { stdio: ["pipe", "pipe", "pipe"], env, windowsHide: true });
+    // 'exit' can fire before the pipe's last stderr chunk is read, and a
+    // sidecar that refuses to start prints why and exits at once -- the
+    // refusal nodeHostRefusal reads. Resolving waits for stderr to close,
+    // capped, because a grandchild that inherited the pipe (a browser) can
+    // hold it open long after the sidecar is gone.
+    const stderrClosed = new Promise((r) => child.stderr.once("close", r));
 
     let out = "";
     let stderr = "";
@@ -1798,7 +2079,9 @@ function probe(host, entry, { env, scriptArgs = [], call = null, ctx }) {
       // Taken now: a reply that lands during teardown can still advance the
       // exchange, and the verdict must describe where it stood when it failed.
       const reached = depth;
-      teardown(child).then((left) => resolveP({ ...result, depth: reached, left, stderr }));
+      teardown(child)
+        .then((left) => Promise.race([stderrClosed, sleep(STDERR_DRAIN_MS)]).then(() => left))
+        .then((left) => resolveP({ ...result, depth: reached, left, stderr }));
     };
     const wait = (what, ms) => {
       awaiting = what;
@@ -2189,7 +2472,11 @@ for (const s of selected) {
     // most likely to be upstream was the one never checked.
     progress(`  ${s.name.padEnd(12)} node control (boot)...`);
     const control = await probe("node", bin.entry, { env: envFor("node", call), scriptArgs, call, ctx: ctxFor("node") });
-    const v = classifyLeaks(classifyBoot(oam, control), oam.left, control.left);
+    // A control that cannot run this sidecar on this box's node is no evidence
+    // at any depth -- the one shape depth comparison cannot see, since a node
+    // refused at boot and an oam that fails at boot both stop at depth 0.
+    const refused = nodeHostRefusal(bin.engines, process.versions.node, control.stderr);
+    const v = classifyLeaks(classifyBoot(oam, control, refused), oam.left, control.left);
     record(v.state, v.why, { note: v.note, extra: [diagnosis(oam.stderr)] });
     continue;
   }
@@ -2221,8 +2508,10 @@ for (const s of selected) {
   // enough to invoke anything" is no evidence at all, and folding them together
   // let a REAL oam regression be excused as upstream whenever the control host
   // could not boot the sidecar (an engines bump past the release box's node,
-  // say). A missing control must never exonerate oam.
-  const nodeVerdict = controlVerdict(control);
+  // say). A missing control must never exonerate oam -- and neither must one
+  // that ran on a node the sidecar does not support, and failed there.
+  const refused = nodeHostRefusal(bin.engines, process.versions.node, control.stderr);
+  const nodeVerdict = controlVerdict(control, refused);
 
   const v = classifyLeaks(
     classifyCall(oam.call, nodeVerdict, call.deterministic === true, call.unavailable),
