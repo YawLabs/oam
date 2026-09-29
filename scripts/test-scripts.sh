@@ -1214,6 +1214,14 @@ for vdir in vendor/*/; do
 done
 if [ -z "$VENDOR_BAD" ]; then pass; else fail "vendored-crate gate out of sync:$VENDOR_BAD"; fi
 
+# The sidecar matrix's self-test holds the release gate's own verdicts, and it
+# ran in no gate at all until ci-local.sh step 13 called it -- so a matrix edit
+# that turned an oam regression into a warn passed every release. A ci-local.sh
+# that stopped calling it would put it back there with every step green.
+it "ci-local.sh runs the sidecar matrix self-test"
+if grep -qE 'node scripts/mcp-sidecar-matrix\.mjs --self-test' scripts/ci-local.sh; then pass
+else fail "ci-local.sh no longer runs 'node scripts/mcp-sidecar-matrix.mjs --self-test'"; fi
+
 # #90 shipped a whole second build configuration -- oam_engine without `napi`,
 # oam_cli without its passthrough -- that was verified by hand once and then had
 # no coverage anywhere: `no-default-features` appeared in no script, no test and
