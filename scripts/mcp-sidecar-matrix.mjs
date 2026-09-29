@@ -441,14 +441,15 @@ const STDERR_DRAIN_MS = 3_000;
 // starting up -- measured at 11-17s, so a 30s budget failed under load.
 const PROCESS_TABLE_TIMEOUT_MS = 60_000;
 
-/** `npm install --no-save <specs...>` into the shared stage. */
-function npmInstall(specs) {
-  const r = spawnSync(
+/** `npm install --no-save <specs...>` into the shared stage, bounded by
+ *  INSTALL_TIMEOUT_MS -- and a timeout ends npm, not just its shell
+ *  (runBounded). */
+async function npmInstall(specs) {
+  const r = await runBounded(
     process.platform === "win32" ? "npm.cmd" : "npm",
     ["install", "--no-save", "--no-audit", "--no-fund", "--prefix", stage, ...specs],
     {
-      encoding: "utf8",
-      timeout: INSTALL_TIMEOUT_MS,
+      timeoutMs: INSTALL_TIMEOUT_MS,
       shell: process.platform === "win32",
       // puppeteer's postinstall downloads its own Chrome, and a half-extracted
       // copy left in the user cache by an interrupted download fails that
@@ -459,7 +460,91 @@ function npmInstall(specs) {
     },
   );
   if (r.status === 0) return null;
+  if (r.error?.code === "ETIMEDOUT") {
+    // npm was killed mid-install, so what it left can hold a package whose
+    // manifest landed and whose code did not. The next install trusts that
+    // manifest and installProblems cannot see the gap; both runtimes would
+    // then fail to boot the sidecar, and the row read as a broken sidecar.
+    // The half-written tree is moved aside, so whatever installs next starts
+    // clean. (spawnSync's timeout never got here: it left npm running, which
+    // finished the job while the next install and the probes used the stage.)
+    const stuck = await wipeStageModules();
+    const aftermath = stuck ? `; its half-written node_modules could not be moved aside (${stuck})` : "";
+    return `npm install failed: ${npmFailureReason(r)}${aftermath}`;
+  }
   return `npm install failed: ${npmFailureReason(r)}`;
+}
+
+/** Run a command to completion, or -- once `timeoutMs` passes -- kill it and
+ *  EVERYTHING it started. Resolves to spawnSync's result shape (`status`,
+ *  `signal`, `stdout`, `stderr`, `error`; a timeout's error has code
+ *  ETIMEDOUT), so npmFailureReason reads it unchanged.
+ *
+ *  spawnSync's own timeout killed only the process it spawned. For npm on
+ *  Windows that is the cmd.exe running npm.cmd: npm's node ran on under no one,
+ *  still writing into the stage that the next install and the probes use --
+ *  the kind of concurrent write that leaves hollow folders. Elsewhere it is npm
+ *  itself, and the lifecycle scripts npm started ran on. So the whole tree goes
+ *  (killTree). npm is not detached into a group of its own to make that easy:
+ *  a Ctrl-C of the matrix would then no longer reach it. */
+function runBounded(cmd, args, { timeoutMs, shell = false, env = process.env }) {
+  return new Promise((resolveP) => {
+    const child = spawn(cmd, args, { shell, env, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let spawnError = null;
+    let settled = false;
+    let guard = null;
+    const settle = (status, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(guard);
+      const error = timedOut ? Object.assign(new Error(`timed out after ${timeoutMs / 1000}s`), { code: "ETIMEDOUT" }) : spawnError;
+      resolveP({ status: timedOut ? null : status, signal, stdout, stderr, error });
+    };
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (d) => {
+      stdout += d;
+    });
+    child.stderr.on("data", (d) => {
+      stderr += d;
+    });
+    child.on("error", (e) => {
+      spawnError = e;
+    });
+    // 'close', not 'exit': the output is complete only once the pipes close.
+    child.on("close", (status, signal) => settle(status, signal));
+    const timer = setTimeout(async () => {
+      timedOut = true;
+      await killTree(child.pid);
+      // Everything holding the pipes is dead, so 'close' follows at once. If
+      // something outside the tree still holds them, stop waiting anyway.
+      guard = setTimeout(() => settle(null, "SIGKILL"), 10_000);
+    }, timeoutMs);
+  });
+}
+
+/** Kill `pid` and every process under it, parents first so none of them can
+ *  start another. Windows walks the tree itself (taskkill /T), from the
+ *  parent-pid chain; elsewhere a snapshot of the tree (descendants) is killed
+ *  in walk order, the root first. */
+async function killTree(pid) {
+  if (!pid) return;
+  if (process.platform === "win32") {
+    spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true, stdio: "ignore" });
+    return;
+  }
+  const tree = (await descendants(pid)) ?? [];
+  for (const p of [pid, ...tree.map((t) => t.pid)]) {
+    try {
+      process.kill(p, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  }
 }
 
 /** Why an npm run failed, from its spawnSync result.
@@ -499,15 +584,15 @@ function npmFailureReason(r) {
  *  `install` is a seam, not configuration: production always passes nothing and
  *  gets npm. `--self-test` substitutes a recorder so the call SEQUENCE below --
  *  the part that has already been wrong once -- can be asserted offline. */
-function installAll(pkgs, install = npmInstall, note = (line) => process.stderr.write(line)) {
-  const batch = install(pkgs.map((p) => `${p}@latest`));
+async function installAll(pkgs, install = npmInstall, note = (line) => process.stderr.write(line)) {
+  const batch = await install(pkgs.map((p) => `${p}@latest`));
   if (!batch) return new Map();
   // One bad package must not take the other six down with it. Install each on
   // its own to find out WHICH one npm rejected.
   note(`  batch install failed (${batch}); retrying one by one\n`);
   const failed = new Map();
   for (const pkg of pkgs) {
-    const err = install([`${pkg}@latest`]);
+    const err = await install([`${pkg}@latest`]);
     if (err) failed.set(pkg, err);
   }
   // Those solo installs pruned each other, so only the last one is still on
@@ -516,7 +601,7 @@ function installAll(pkgs, install = npmInstall, note = (line) => process.stderr.
   // would report every survivor as "not on disk after install".
   const survivors = pkgs.filter((p) => !failed.has(p));
   if (survivors.length > 0) {
-    const err = install(survivors.map((p) => `${p}@latest`));
+    const err = await install(survivors.map((p) => `${p}@latest`));
     if (err) for (const p of survivors) failed.set(p, err);
   }
   return failed;
@@ -543,13 +628,13 @@ function installAll(pkgs, install = npmInstall, note = (line) => process.stderr.
  *  was rebuilt. `install`, `check` (package -> problems), `wipe` (null, or why
  *  it failed) and `note` are seams like installAll's, so the self-test can
  *  assert the sequence without npm or a disk. */
-function settleInstall(pkgs, { install = npmInstall, check = stageProblems, wipe = wipeStageModules, note = (line) => process.stderr.write(line) } = {}) {
+async function settleInstall(pkgs, { install = npmInstall, check = stageProblems, wipe = wipeStageModules, note = (line) => process.stderr.write(line) } = {}) {
   const damageOf = (errors) => new Map(pkgs.filter((p) => !errors.has(p)).map((p) => [p, check(p)]).filter(([, found]) => found.length > 0));
-  let installErrors = installAll(pkgs, install, note);
+  let installErrors = await installAll(pkgs, install, note);
   let damaged = damageOf(installErrors);
   if (damaged.size === 0) return { installErrors, damaged, rebuilt: false };
   note(`  the stage's install is damaged -- ${describeDamage(damaged)}; rebuilding it from scratch\n`);
-  const wipeFailed = wipe();
+  const wipeFailed = await wipe();
   if (wipeFailed) {
     // The wipe moves node_modules aside whole or not at all, so a failure
     // should have left the tree as it was -- checked again, not assumed.
@@ -557,7 +642,7 @@ function settleInstall(pkgs, { install = npmInstall, check = stageProblems, wipe
     note(`  could not move the stage's node_modules aside (${wipeFailed}); nothing was reinstalled\n`);
     return { installErrors, damaged, rebuilt: false };
   }
-  installErrors = installAll(pkgs, install, note);
+  installErrors = await installAll(pkgs, install, note);
   damaged = damageOf(installErrors);
   const whole = pkgs.length - damaged.size - installErrors.size;
   note(
@@ -582,18 +667,31 @@ function stageProblems(pkg) {
  *  next install trusts and the damage check passes. What was moved aside is
  *  then deleted best effort (sweepStageTrash); a copy that will not go costs
  *  disk, not correctness. npm puts no links in the stage, and a link would be
- *  moved or removed, never followed. */
-function wipeStageModules() {
+ *  moved or removed, never followed.
+ *
+ *  A refusal is retried for a few seconds before it is believed. Right after
+ *  an npm that ran out of time is killed, Windows has not yet let go of that
+ *  process's open handles and cwd inside the tree: measured, the first rename
+ *  failed with EPERM, and the same rename on the next timeout went through. */
+async function wipeStageModules() {
   const nm = join(stage, "node_modules");
-  try {
-    renameSync(nm, `${nm}.trash-${process.pid}-${Date.now()}`);
-  } catch (e) {
-    if (e.code === "ENOENT") return null;
-    return e.code ?? e.message;
+  for (let attempt = 1; ; attempt++) {
+    try {
+      renameSync(nm, `${nm}.trash-${process.pid}-${Date.now()}`);
+      break;
+    } catch (e) {
+      if (e.code === "ENOENT") return null;
+      if (!["EPERM", "EBUSY", "EACCES"].includes(e.code) || attempt >= WIPE_ATTEMPTS) return e.code ?? e.message;
+      await sleep(WIPE_RETRY_MS);
+    }
   }
   sweepStageTrash();
   return null;
 }
+// About 3s in all: long enough for a killed process tree's handles to close,
+// short enough that a directory something really holds open is reported.
+const WIPE_ATTEMPTS = 15;
+const WIPE_RETRY_MS = 200;
 
 /** Delete, best effort, every node_modules this or an earlier run moved aside. */
 function sweepStageTrash() {
@@ -1356,12 +1454,15 @@ function respReply(argv) {
 // uncalledVerdict, controlVerdict, binFor) so they can be held, and one case
 // pins the loop's calls to them at the source. So is the install the loop
 // runs over: settleInstall checks it whole, and rebuilds it once, before
-// anything is probed. Two cases spawn, both stand-in sidecars
-// on node's own `-e`, because what they hold is probe's to report: the depth
+// anything is probed. Three cases spawn, all on node's own `-e`. Two run
+// stand-in sidecars, because what they hold is probe's to report: the depth
 // classifyBoot compares, and a control's stderr, including a refusal printed
 // by a detached child after its parent exited (that child exits by itself).
-// No network, npm or oam, and no disk beyond reading this file.
-// scripts/ci-local.sh runs all of it (step 13).
+// The third runs a stand-in install under a shell and lets it time out,
+// because the timeout must end the node under the shell -- it waits out that
+// 5s bound, which is most of the self-test's run time. No network, npm or
+// oam, and no disk beyond reading this file. scripts/ci-local.sh runs all of
+// it (step 13).
 
 /** Compares by JSON shape -- the assertions here are all arrays of specs, and a
  *  printed expected-vs-actual is what makes a regression diagnosable. */
@@ -1372,13 +1473,15 @@ function assertDeep(actual, expected, what) {
 }
 
 /** Stands in for npmInstall: records every spec list it is handed, and returns
- *  npmInstall's own contract (an error string, or null on success).
+ *  npmInstall's own contract (a promise of an error string, or of null on
+ *  success) -- a promise, as npmInstall's is, so a caller that forgets to
+ *  await it reads every install as failed here too, not only in production.
  *  `rejects` names packages npm refuses; `rejectCall` fails the Nth call
  *  regardless, for conflicts that only exist when packages are installed
  *  together. */
 function recordingInstaller({ rejects = [], rejectCall = null } = {}) {
   const calls = [];
-  const install = (specs) => {
+  const install = async (specs) => {
     calls.push([...specs]);
     if (rejectCall === calls.length) {
       return "npm install failed: npm error ERESOLVE could not resolve";
@@ -1475,11 +1578,11 @@ async function selfTest() {
   const cases = [
     {
       name: "one bad package: batch, then attribution, then a SURVIVOR RE-BATCH",
-      run() {
+      async run() {
         const pkgs = ["@scope/alpha", "bravo", "@scope/charlie"];
         const npm = recordingInstaller({ rejects: ["bravo"] });
 
-        const failed = installAll(pkgs, npm.install, quiet);
+        const failed = await installAll(pkgs, npm.install, quiet);
 
         assertDeep(
           [...failed.keys()],
@@ -1514,11 +1617,11 @@ async function selfTest() {
     },
     {
       name: "all packages install: exactly ONE npm call, no failures",
-      run() {
+      async run() {
         const pkgs = ["@scope/alpha", "bravo"];
         const npm = recordingInstaller();
 
-        const failed = installAll(pkgs, npm.install, quiet);
+        const failed = await installAll(pkgs, npm.install, quiet);
 
         assertDeep([...failed.keys()], [], "a clean batch reports no failures");
         // The fallback is expensive (a full re-download per package). A green
@@ -1532,11 +1635,11 @@ async function selfTest() {
     },
     {
       name: "every package fails: no trailing empty install",
-      run() {
+      async run() {
         const pkgs = ["alpha", "bravo"];
         const npm = recordingInstaller({ rejects: pkgs });
 
-        const failed = installAll(pkgs, npm.install, quiet);
+        const failed = await installAll(pkgs, npm.install, quiet);
 
         assertDeep([...failed.keys()], pkgs, "every package is reported failed");
         // With no survivors there is nothing to re-batch, and a spec-less
@@ -1547,14 +1650,14 @@ async function selfTest() {
     },
     {
       name: "survivor re-batch fails: survivors are attributed, not silently dropped",
-      run() {
+      async run() {
         const pkgs = ["alpha", "bravo", "charlie"];
         // bravo is rejected on its own; the 5th call -- the survivor re-batch --
         // is rejected too, the shape of a conflict only visible when the
         // survivors coexist.
         const npm = recordingInstaller({ rejects: ["bravo"], rejectCall: 5 });
 
-        const failed = installAll(pkgs, npm.install, quiet);
+        const failed = await installAll(pkgs, npm.install, quiet);
 
         // Survivors that are NOT on disk must be reported, not left to fail
         // later as an undiagnosable SKIP.
@@ -1887,7 +1990,7 @@ async function selfTest() {
     {
       name: "a failure mid-call is not excused by a control that never booted",
       async run() {
-        // One of the two cases that spawn: the depth classifyBoot compares is probe's
+        // One of the three cases that spawn: the depth classifyBoot compares is probe's
         // to report, so probe itself is run, against the stand-in above. The
         // call has a setup step, like puppeteer's navigate before evaluate:
         // depth has to count steps, or oam dying on the setup and node dying on
@@ -2069,7 +2172,7 @@ async function selfTest() {
         // damage and rebuilt once -- not a bare installAll. The call sits above
         // the loop, at column 0, which this case's quote of it does not.
         assertDeep(
-          source.search(/^const \{ installErrors, damaged, rebuilt \} = settleInstall\(/m) > 0,
+          source.search(/^const \{ installErrors, damaged, rebuilt \} = await settleInstall\(/m) > 0,
           true,
           "the run installs through settleInstall, so a damaged stage is found and rebuilt before anything is probed",
         );
@@ -2078,7 +2181,7 @@ async function selfTest() {
         const lockAt = source.search(/^const lockProblem = await lockStage\(join\(stage, "\.matrix\.lock"\)\);/m);
         const sweepAt = source.search(/^sweepStageTrash\(\);/m);
         const fixtureAt = source.search(/^prepareFixture\(\);/m);
-        const installAt = source.search(/^const \{ installErrors, damaged, rebuilt \} = settleInstall\(/m);
+        const installAt = source.search(/^const \{ installErrors, damaged, rebuilt \} = await settleInstall\(/m);
         assertDeep(
           [lockAt > 0, lockAt < sweepAt, sweepAt < fixtureAt, fixtureAt < installAt],
           [true, true, true, true],
@@ -2097,6 +2200,23 @@ async function selfTest() {
           ),
           [],
           "resolveBin hands the loop the engines ranges of each sidecar and its whole installed tree",
+        );
+        // npm runs through runBounded, whose timeout ends npm and everything it
+        // started. A spawnSync back in its place would bring back the orphan:
+        // its timeout kills the shell and leaves npm writing into the stage.
+        const npmAt = source.search(/^async function npmInstall\(/m);
+        const npmBody = source.slice(npmAt, source.indexOf("\n}\n", npmAt));
+        assertDeep(
+          [npmAt > 0, npmBody.includes("await runBounded("), npmBody.includes("spawnSync(")],
+          [true, true, false],
+          "npm installs are bounded by runBounded, never by spawnSync's own timeout",
+        );
+        // And a killed install's half-written tree does not survive it.
+        const timeoutBranch = npmBody.slice(npmBody.indexOf('if (r.error?.code === "ETIMEDOUT") {'));
+        assertDeep(
+          npmBody.includes('if (r.error?.code === "ETIMEDOUT") {') && /^\s*const stuck = await wipeStageModules\(\);/m.test(timeoutBranch),
+          true,
+          "an install killed by its timeout moves its half-written node_modules aside",
         );
       },
     },
@@ -2312,18 +2432,20 @@ async function selfTest() {
     },
     {
       name: "a damaged install gets one rebuild, and what stays damaged is a SKIP that names it",
-      run() {
+      async run() {
         const damage = [{ from: "sdk@1.30.0", name: "express", hollow: join("/", "stage", "node_modules", "express") }];
         // install, check and wipe recorded in one sequence; `healed` is when
         // check stops finding damage (after the wipe, never, or at once).
         // `reject` is refused on every install; `rejectAfterWipe` only by the
         // rebuild's -- so what the rebuild returns has to be the rebuild's own.
-        const run = ({ healed, wipeFails = null, reject = [], rejectAfterWipe = [] }) => {
+        const run = async ({ healed, wipeFails = null, reject = [], rejectAfterWipe = [] }) => {
           const events = [];
           const notes = [];
           let wiped = false;
-          const result = settleInstall(["good", ...reject, ...rejectAfterWipe], {
-            install: (specs) => {
+          // install and wipe return promises, as npmInstall and
+          // wipeStageModules do, so a missing await fails here as it would there.
+          const result = await settleInstall(["good", ...reject, ...rejectAfterWipe], {
+            install: async (specs) => {
               events.push(`install ${specs.join(" ")}`);
               const refusing = wiped ? [...reject, ...rejectAfterWipe] : reject;
               const bad = specs.find((s) => refusing.includes(s.replace(/@latest$/, "")));
@@ -2333,7 +2455,7 @@ async function selfTest() {
               events.push(`check ${pkg}`);
               return healed === "now" || (healed === "after-wipe" && wiped) ? [] : damage;
             },
-            wipe: () => {
+            wipe: async () => {
               events.push("wipe");
               wiped = wipeFails === null;
               return wipeFails;
@@ -2351,11 +2473,11 @@ async function selfTest() {
         };
         const refused = "npm install failed: npm error E404 bad@latest";
         assertDeep(
-          run({ healed: "now" }),
+          await run({ healed: "now" }),
           { events: ["install good@latest", "check good"], notes: [], installErrors: {}, damaged: {}, rebuilt: false },
           "a whole install is checked once and left alone",
         );
-        const healedRun = run({ healed: "after-wipe" });
+        const healedRun = await run({ healed: "after-wipe" });
         assertDeep(
           [healedRun.events, healedRun.installErrors, healedRun.damaged, healedRun.rebuilt, healedRun.notes.at(-1)],
           [
@@ -2367,31 +2489,31 @@ async function selfTest() {
           ],
           "a damaged one is moved aside, reinstalled and checked again -- once -- and what the rebuild healed is not skipped",
         );
-        const stuck = run({ healed: "never" });
+        const stuck = await run({ healed: "never" });
         assertDeep(
           [stuck.rebuilt, stuck.damaged, stuck.notes.at(-1)],
           [true, { good: damage }, "  rebuilt: 0 of 1 sidecars reinstalled whole; the rest are SKIPs below\n"],
           "damage that survives the rebuild is returned, and said, not hidden",
         );
-        const locked = run({ healed: "never", wipeFails: "EBUSY" });
+        const locked = await run({ healed: "never", wipeFails: "EBUSY" });
         assertDeep(
           [locked.events, locked.rebuilt, Object.keys(locked.damaged), /aside \(EBUSY\); nothing was reinstalled/.test(locked.notes.at(-1))],
           [["install good@latest", "check good", "wipe", "check good"], false, ["good"], true],
           "a stage that cannot be moved aside is not reinstalled over, and is checked again rather than assumed unchanged",
         );
-        const refusedOnly = run({ healed: "now", reject: ["bad"] });
+        const refusedOnly = await run({ healed: "now", reject: ["bad"] });
         assertDeep(
           [refusedOnly.installErrors, refusedOnly.damaged, refusedOnly.events.filter((e) => e.startsWith("check"))],
           [{ bad: refused }, {}, ["check good"]],
           "a package npm refused keeps npm's reason, and is not checked for damage",
         );
-        const both = run({ healed: "after-wipe", reject: ["bad"] });
+        const both = await run({ healed: "after-wipe", reject: ["bad"] });
         assertDeep(
           [both.installErrors, both.damaged, both.rebuilt, both.notes.at(-1), both.notes.some((n) => /now whole/.test(n))],
           [{ bad: refused }, {}, true, "  rebuilt: 1 of 2 sidecars reinstalled whole; the rest are SKIPs below\n", false],
           "a rebuild that npm refuses part of says so, and keeps the refusal -- never 'every sidecar's install is now whole'",
         );
-        const lateRefusal = run({ healed: "after-wipe", rejectAfterWipe: ["bad"] });
+        const lateRefusal = await run({ healed: "after-wipe", rejectAfterWipe: ["bad"] });
         assertDeep(
           [lateRefusal.installErrors, lateRefusal.damaged, lateRefusal.notes.at(-1)],
           [{ bad: refused }, {}, "  rebuilt: 1 of 2 sidecars reinstalled whole; the rest are SKIPs below\n"],
@@ -2422,6 +2544,39 @@ async function selfTest() {
           "a damaged install is a SKIP that names the missing package, where it was, and who needed it",
         );
         assertDeep(exitCodeFor([{ state: "verified" }, { state: "skip" }]), 3, "which leaves the run incomplete, never clean");
+      },
+    },
+    {
+      name: "an install that runs out of time is ended with everything it started",
+      async run() {
+        // npm's shape on Windows: a shell, and a node process under it that
+        // outlives the shell when only the shell is killed -- what spawnSync's
+        // timeout did. The stand-in prints its own pid and never exits; the
+        // bound must end IT. Quoted by hand: a shell command line is one string.
+        const standIn = "process.stdout.write(String(process.pid)); setInterval(function () {}, 1000)";
+        const r = await runBounded(`"${process.execPath}"`, ["-e", `"${standIn}"`], { timeoutMs: 5_000, shell: true });
+        const pid = Number.parseInt(r.stdout, 10);
+        let alive = Number.isInteger(pid) && isAlive(pid);
+        for (let waited = 0; alive && waited < 3_000; waited += 100) {
+          await sleep(100);
+          alive = isAlive(pid);
+        }
+        if (alive) {
+          try {
+            process.kill(pid); // leave nothing behind, even when the case fails
+          } catch {
+            // Already gone.
+          }
+        }
+        assertDeep(
+          [r.error?.code, r.status, Number.isInteger(pid), alive],
+          ["ETIMEDOUT", null, true, false],
+          "the timeout ends the node under the shell, not just the shell -- nothing is left writing into the stage -- and reports no exit status npmInstall could read as success",
+        );
+        assertDeep(npmFailureReason(r), `timed out after ${INSTALL_TIMEOUT_MS / 1000}s`, "and the install is reported as timed out");
+        // A run that ends on its own reads as it always did.
+        const done = await runBounded(process.execPath, ["-e", "process.stdout.write('done'); process.exitCode = 3"], { timeoutMs: 30_000 });
+        assertDeep([done.status, done.stdout, done.error], [3, "done", null], "a finished run keeps its status and output, and no timeout");
       },
     },
     {
@@ -3057,7 +3212,7 @@ const clearProgress = () => {
 };
 
 progress(`  installing ${selected.length} package(s)...`);
-const { installErrors, damaged, rebuilt } = settleInstall(
+const { installErrors, damaged, rebuilt } = await settleInstall(
   selected.map((s) => s.pkg),
   {
     note: (line) => {
