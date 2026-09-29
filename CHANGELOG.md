@@ -54,6 +54,11 @@ Release tooling only; no runtime behavior change.
   it left out, rebuilds the stage from scratch once when it finds one, and reports what is
   still missing as a SKIP that names it. Runs also take a lock on the shared stage, so two at
   once -- one way the damage happens -- now wait for each other.
+- **An npm install that ran out of time kept running** (#257). The gate's install timeout
+  killed only the process it spawned: on Windows the shell around npm, so npm itself ran on,
+  installing into the stage while the gate retried the install and probed the sidecars. A
+  timeout now kills npm and everything it started, and moves the half-written `node_modules`
+  aside, so the next install starts clean.
 
 ## [0.17.0] - 2026-09-24
 
