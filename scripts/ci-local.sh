@@ -667,9 +667,11 @@ fi
 # sidecar is, which arm is pinned to node, what an uncalled row counts as. It
 # ran in no gate until this block, so it guarded only when someone ran it by
 # hand, and a verdict mutation that turned an oam regression into a warn passed
-# every release. Offline by construction: no disk, network, npm or oam; one case
-# spawns a stand-in sidecar on node's own -e. Seconds. Skips without node, like
-# step 12 -- a full run cannot get this far without one anyway.
+# every release. Offline by construction: no network, npm or oam, and no disk
+# beyond reading its own source; two cases spawn stand-in sidecars on node's own
+# -e, one of them through a detached child that exits by itself. Seconds. Skips
+# without node, like step 12 -- a full run cannot get this far without one
+# anyway.
 if ! command -v node >/dev/null 2>&1; then
   warn "sidecar matrix self-test SKIPPED -- no node on PATH"
 elif node scripts/mcp-sidecar-matrix.mjs --self-test; then

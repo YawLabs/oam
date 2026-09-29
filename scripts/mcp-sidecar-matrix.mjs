@@ -817,22 +817,29 @@ function satisfiesNodeRange(range, version) {
   return unread ? null : false;
 }
 
-// The node-floor refusal the launchers print when the node hosting them is
-// too old. fetch-mcp: "is Node 22.22.2, older than 24.0.0; ... needs Node
-// 24.0.0 or newer"; tailscale-mcp: "needs Node 24.0.0 or newer, found ...".
-// Both say "Node", which their OAM-floor refusals ("is oam 0.15.0, older
-// than 0.15.2", "to get oam 0.15.2 or newer") never do.
+// The node-floor refusal a sidecar prints when the node hosting it is too old,
+// in the staged sidecars' own words. fetch-mcp: "is Node 22.22.2, older than
+// 24.0.0; ... needs Node 24.0.0 or newer". tailscale-mcp: "needs Node 24.0.0
+// or newer, found ...". @playwright/mcp, through playwright-core's bootstrap:
+// "Playwright requires Node.js 20 or higher." The launchers' OAM-floor lines
+// do mention node ("to get oam 0.15.2 or newer, or launch this command with
+// node", "no Node was found on PATH") but never match: the pattern needs a
+// node VERSION, after "needs"/"requires" and before "or newer" and its
+// synonyms, or after "is" and before ", older than".
 const NODE_FLOOR_REFUSAL =
-  /\b(?:needs|requires) node(?:\.js)? v?\d+(?:\.\d+){0,2} or (?:newer|later)\b|\bis node(?:\.js)? v?\d+(?:\.\d+){0,2}, older than\b/i;
+  /\b(?:needs|requires) node(?:\.js)? v?\d+(?:\.\d+){0,2} or (?:newer|later|higher|above)\b|\bis node(?:\.js)? v?\d+(?:\.\d+){0,2}, older than\b/i;
 
 /** Why the node control cannot speak for this sidecar on this box, or null.
- *  Two sources, because neither covers every sidecar. The package's own
- *  `engines.node` (`engines`) when this box's node (`nodeVersion`) falls
- *  outside it: the declared floor, and the only one a sidecar with no
- *  launcher has (puppeteer, playwright). And the refusal a launcher prints
- *  (`stderr`) when it enforces a floor of its own: fetch-mcp and tailscale-mcp
- *  check NODE_MIN only when node hosts them, and that floor can be stricter
- *  than engines. An engines range this cannot read decides nothing. */
+ *  Two sources, because neither covers every sidecar. First, the package's
+ *  own `engines.node` (`engines`), when this box's node (`nodeVersion`) falls
+ *  outside it -- the top-level package's only; a dependency's engines is not
+ *  read. Second, a refusal on the control's `stderr`, for a floor enforced at
+ *  run time and possibly stricter than engines: fetch-mcp's and
+ *  tailscale-mcp's launchers check NODE_MIN, and @playwright/mcp inherits
+ *  playwright-core's floor (20, where its own engines says ">=18"). memory and
+ *  puppeteer declare no floor and print no refusal, so an old node that
+ *  crashes them in its own words (a SyntaxError, a missing API) still reads as
+ *  the sidecar's. An engines range this cannot read decides nothing. */
 function nodeHostRefusal(engines, nodeVersion, stderr) {
   if (engines && satisfiesNodeRange(engines, nodeVersion) === false) {
     return `this box's node ${nodeVersion} is outside the sidecar's engines "${engines}"`;
@@ -988,10 +995,12 @@ function respReply(argv) {
 // worth. Each once lived inline in the loop, where a mutation that flipped the
 // verdict still passed every case here; they are pure functions now (armEnv,
 // uncalledVerdict, controlVerdict) so they can be held, and one case pins the
-// loop's calls to them at the source. One case does spawn: probe itself,
-// against a stand-in sidecar on node's own `-e`, because the depth
-// classifyBoot compares is probe's to report. No network, npm or oam, and no
-// disk beyond reading this file. scripts/ci-local.sh runs all of it (step 13).
+// loop's calls to them at the source. Two cases spawn, both stand-in sidecars
+// on node's own `-e`, because what they hold is probe's to report: the depth
+// classifyBoot compares, and a control's stderr, including a refusal printed
+// by a detached child after its parent exited (that child exits by itself).
+// No network, npm or oam, and no disk beyond reading this file.
+// scripts/ci-local.sh runs all of it (step 13).
 
 /** Compares by JSON shape -- the assertions here are all arrays of specs, and a
  *  printed expected-vs-actual is what makes a regression diagnosable. */
@@ -1028,19 +1037,33 @@ async function selfTest() {
     'const oam = findOam();',
     'child = spawn(oam, ["run", SERVER_ENTRY]);',
   ].join("\n");
-  // The stderr each launcher that enforces a node floor prints when node is
-  // below it, captured verbatim on node 22.22.2 (2026-09-29) by raising only
-  // NODE_MIN, to 99.0.0, in a copy of @yawlabs/fetch-mcp 0.8.1's and
-  // @yawlabs/tailscale-mcp 0.21.0's launcher, run the way the control arm runs
-  // them (the runtime switch pinned to node). Both exit 1 before serving.
+  // The stderr each staged sidecar that enforces a node floor at run time
+  // prints when node is below it, captured verbatim (2026-09-29), with the
+  // line nodeHostRefusal must quote. All three exit 1 before serving.
+  //   fetch-mcp 0.8.1, tailscale-mcp 0.21.0: on node 22.22.2, NODE_MIN raised
+  //     to 99.0.0 in a copy of each launcher, run the way the control arm runs
+  //     them (the runtime switch pinned to node).
+  //   @playwright/mcp 0.0.83: the staged package untouched, on a node made to
+  //     report 18.20.0 by a preload -- its floor lives in playwright-core's
+  //     bootstrap, a dependency, and is 20.
   const FLOOR_REFUSALS = {
-    "fetch-mcp":
-      "fetch-mcp: this process is Node 22.22.2, older than 99.0.0; @yawlabs/fetch-mcp needs Node 99.0.0 or newer "
-      + "(the floor of its HTTP client, undici 8 -- an older Node crashes at import or on the first zstd-encoded response).\n"
-      + "Install a newer Node, or install oam from https://oamjs.org and this launcher will use it.\n",
-    "tailscale-mcp":
-      "tailscale-mcp: needs Node 99.0.0 or newer, found 22.22.2.\n"
-      + 'Install a newer Node (https://nodejs.org/en/download), or point your MCP client\'s "command" at one.\n',
+    "fetch-mcp": {
+      stderr:
+        "fetch-mcp: this process is Node 22.22.2, older than 99.0.0; @yawlabs/fetch-mcp needs Node 99.0.0 or newer "
+        + "(the floor of its HTTP client, undici 8 -- an older Node crashes at import or on the first zstd-encoded response).\n"
+        + "Install a newer Node, or install oam from https://oamjs.org and this launcher will use it.\n",
+      quote: "fetch-mcp: this process is Node 22.22.2, older than 99.0.0",
+    },
+    "tailscale-mcp": {
+      stderr:
+        "tailscale-mcp: needs Node 99.0.0 or newer, found 22.22.2.\n"
+        + 'Install a newer Node (https://nodejs.org/en/download), or point your MCP client\'s "command" at one.\n',
+      quote: "tailscale-mcp: needs Node 99.0.0 or newer, found 22.22.2.",
+    },
+    "@playwright/mcp": {
+      stderr: "You are running Node.js 18.20.0.\nPlaywright requires Node.js 20 or higher. \nPlease update your version of Node.js.\n",
+      quote: "Playwright requires Node.js 20 or higher.",
+    },
   };
   // The shape of the http_get reply @yawlabs/fetch-mcp 0.8.1 returns, captured
   // on node v22.22.2 (2026-09-29) against the fixture and against bodies the
@@ -1503,7 +1526,7 @@ async function selfTest() {
     {
       name: "a failure mid-call is not excused by a control that never booted",
       async run() {
-        // The one case that spawns: the depth classifyBoot compares is probe's
+        // One of the two cases that spawn: the depth classifyBoot compares is probe's
         // to report, so probe itself is run, against the stand-in above. The
         // call has a setup step, like puppeteer's navigate before evaluate:
         // depth has to count steps, or oam dying on the setup and node dying on
@@ -1722,7 +1745,7 @@ async function selfTest() {
         // refusal and exits, the way tailscale-mcp does, has that refusal read
         // off its stderr -- including when it exits the moment it has printed.
         const env = { ...process.env, NO_COLOR: "1" };
-        const say = FLOOR_REFUSALS["tailscale-mcp"];
+        const say = FLOOR_REFUSALS["tailscale-mcp"].stderr;
         const refusing = await probe("node", "-e", {
           env,
           scriptArgs: [`process.stderr.write(${JSON.stringify(say)}); process.exit(1);`],
@@ -1758,15 +1781,18 @@ async function selfTest() {
         assertDeep(declared.map((e) => nodeHostRefusal(e, "22.22.2", "")), declared.map(() => null), "today's floors refuse nothing");
         assertDeep(typeof nodeHostRefusal(">=24", "22.22.2", ""), "string", "a declared floor past this box's node is a refusal");
         assertDeep(nodeHostRefusal("20 - 24", "22.22.2", ""), null, "a range this cannot read decides nothing");
-        for (const [who, said] of Object.entries(FLOOR_REFUSALS)) {
-          const r = nodeHostRefusal(null, "22.22.2", `some earlier log line\n${said}`);
-          assertDeep(typeof r === "string" && r.includes(`${who}:`), true, `${who}'s own refusal is found, and quoted`);
+        for (const [who, { stderr, quote }] of Object.entries(FLOOR_REFUSALS)) {
+          const r = nodeHostRefusal(null, "22.22.2", `some earlier log line\n${stderr}`);
+          assertDeep(typeof r === "string" && r.includes(quote), true, `${who}'s own refusal is found, and quoted`);
         }
         // The OAM-floor refusals the same launchers print must never read as
-        // node's (rendered from their templates at 0.15.0 against 0.15.2).
+        // node's (rendered from their templates at 0.15.0 against 0.15.2),
+        // including the ones that mention node by name.
         for (const said of [
           "fetch-mcp: this process is oam 0.15.0, older than 0.15.2, and no newer oam was found",
+          "fetch-mcp: this process is oam 0.15.0, older than 0.15.2, and no Node was found on PATH to run the server.",
           "Run `oam self-update` to get oam 0.15.2 or newer, or launch this command with node.",
+          "Put Node on PATH, or launch this command with node.",
           "redis-mcp: REDIS_MCP_RUNTIME=oam but no usable oam (0.15.2 or newer) was found.",
         ]) {
           assertDeep(nodeHostRefusal(null, "22.22.2", said), null, `not a node refusal: ${said}`);
