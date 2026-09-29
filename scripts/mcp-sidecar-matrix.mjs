@@ -70,11 +70,13 @@
 //
 // Exit code is the gate: 0 when every selected sidecar answered its tool call
 // on oam; 1 when oam failed one; 3 when the matrix could not answer for one
-// (install failure, broken upstream, demoted fixture); 2 for bad usage.
+// (install failure, an install still damaged after a rebuild, broken
+// upstream, demoted fixture); 2 for bad usage, or when another run has held
+// the shared stage for longer than this one will wait.
 // =============================================================================
 
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { connect, createServer as createTcpServer } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
@@ -520,6 +522,206 @@ function installAll(pkgs, install = npmInstall, note = (line) => process.stderr.
   return failed;
 }
 
+/** Install the selected sidecars, then make sure what npm left is WHOLE.
+ *
+ *  npm exiting 0 does not mean every required package is on disk. On
+ *  2026-09-29 the shared stage held 15 hollow folders where required packages
+ *  belonged, every install since had passed over them, and the matrix ran on
+ *  that tree green -- only because no stdio sidecar happened to load what was
+ *  missing. One that did would have failed on BOTH runtimes, and the gate
+ *  would have filed an oam regression beside it as a broken sidecar. So each
+ *  installed sidecar's tree is checked (installProblems). Damage gets ONE
+ *  rebuild: the stage's node_modules, npm's hidden lockfile with it, is moved
+ *  aside and everything reinstalled, since reinstalling over the damage is
+ *  what had already failed to repair it. What is still damaged after that is
+ *  returned, and its row is a SKIP that names what is missing: the matrix
+ *  cannot vouch for a sidecar it could not install whole. Two runs never do
+ *  this to each other's stage: the run holds the stage lock (lockStage).
+ *
+ *  Returns `{ installErrors, damaged, rebuilt }`: installAll's map, a map of
+ *  package -> installProblems for what is still damaged, and whether the stage
+ *  was rebuilt. `install`, `check` (package -> problems), `wipe` (null, or why
+ *  it failed) and `note` are seams like installAll's, so the self-test can
+ *  assert the sequence without npm or a disk. */
+function settleInstall(pkgs, { install = npmInstall, check = stageProblems, wipe = wipeStageModules, note = (line) => process.stderr.write(line) } = {}) {
+  const damageOf = (errors) => new Map(pkgs.filter((p) => !errors.has(p)).map((p) => [p, check(p)]).filter(([, found]) => found.length > 0));
+  let installErrors = installAll(pkgs, install, note);
+  let damaged = damageOf(installErrors);
+  if (damaged.size === 0) return { installErrors, damaged, rebuilt: false };
+  note(`  the stage's install is damaged -- ${describeDamage(damaged)}; rebuilding it from scratch\n`);
+  const wipeFailed = wipe();
+  if (wipeFailed) {
+    // The wipe moves node_modules aside whole or not at all, so a failure
+    // should have left the tree as it was -- checked again, not assumed.
+    damaged = damageOf(installErrors);
+    note(`  could not move the stage's node_modules aside (${wipeFailed}); nothing was reinstalled\n`);
+    return { installErrors, damaged, rebuilt: false };
+  }
+  installErrors = installAll(pkgs, install, note);
+  damaged = damageOf(installErrors);
+  const whole = pkgs.length - damaged.size - installErrors.size;
+  note(
+    whole === pkgs.length
+      ? "  rebuilt: every sidecar's install is now whole\n"
+      : `  rebuilt: ${whole} of ${pkgs.length} sidecars reinstalled whole; the rest are SKIPs below\n`,
+  );
+  return { installErrors, damaged, rebuilt: true };
+}
+
+/** installProblems for an installed sidecar in the shared stage. */
+function stageProblems(pkg) {
+  return installProblems(join(stage, "node_modules", ...pkg.split("/")));
+}
+
+/** Move the shared stage's node_modules aside for a clean reinstall, whole or
+ *  not at all: null, or why it could not be moved. A rename either happens or
+ *  leaves every file where it was. A recursive delete that meets a file it
+ *  cannot remove (a handle opened without delete sharing, a process whose cwd
+ *  is inside) stops halfway instead -- hidden lockfile gone, packages gone, a
+ *  package cut mid-delete keeping its manifest but not its code, which the
+ *  next install trusts and the damage check passes. What was moved aside is
+ *  then deleted best effort (sweepStageTrash); a copy that will not go costs
+ *  disk, not correctness. npm puts no links in the stage, and a link would be
+ *  moved or removed, never followed. */
+function wipeStageModules() {
+  const nm = join(stage, "node_modules");
+  try {
+    renameSync(nm, `${nm}.trash-${process.pid}-${Date.now()}`);
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    return e.code ?? e.message;
+  }
+  sweepStageTrash();
+  return null;
+}
+
+/** Delete, best effort, every node_modules this or an earlier run moved aside. */
+function sweepStageTrash() {
+  let names = [];
+  try {
+    names = readdirSync(stage).filter((name) => name.startsWith("node_modules.trash-"));
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    try {
+      rmSync(join(stage, name), { recursive: true, force: true, maxRetries: 3 });
+    } catch {
+      // Held open; the next run tries again.
+    }
+  }
+}
+
+// How long a run waits for another run to finish with the shared stage, and
+// how old a lock must be before it is taken over whatever its pid says -- a
+// pid can be reused by an unrelated process after a crash. A whole run is
+// bounded well inside the stale age: install (300s, at most twice) plus two
+// probes per sidecar (90s boot, 60s per call).
+const LOCK_WAIT_MS = 15 * 60_000;
+const LOCK_STALE_MS = 3 * 60 * 60_000;
+
+/** What to do about a stage lock another run holds: "stale" when its holder is
+ *  gone or it is older than any run can last (take it over), else "wait". */
+function lockVerdict({ holderAlive, ageMs }) {
+  return !holderAlive || ageMs > LOCK_STALE_MS ? "stale" : "wait";
+}
+
+/** Whether a lock holder's pid is a live process. EPERM means it exists. */
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+
+/** Hold the shared stage for the whole run: null once held, or why it could
+ *  not be. Every run on the box shares one stage, and two at once had npm
+ *  installing into one prefix concurrently -- a demonstrated way to leave the
+ *  hollow folders and empty lockfile entries the 2026-09-29 stage had -- and
+ *  would now also have one run's rebuild moving node_modules out from under
+ *  the other's probes. The lock is an exclusively created file holding the
+ *  pid, released at exit when it is still ours. A Ctrl-C runs no exit
+ *  handler, so a lock whose holder is gone, or that is older than any run,
+ *  is taken over (lockVerdict); a live one is waited for, up to LOCK_WAIT_MS. */
+async function lockStage(lock) {
+  const mine = `${process.pid}\n`;
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let waiting = false;
+  for (;;) {
+    try {
+      writeFileSync(lock, mine, { flag: "wx" });
+      process.on("exit", () => {
+        try {
+          if (readFileSync(lock, "utf8") === mine) rmSync(lock, { force: true });
+        } catch {
+          // Already gone.
+        }
+      });
+      return null;
+    } catch (e) {
+      if (e.code !== "EEXIST") return `cannot create the stage lock ${lock}: ${e.code ?? e.message}`;
+    }
+    let held;
+    let ageMs;
+    try {
+      held = readFileSync(lock, "utf8");
+      ageMs = Date.now() - statSync(lock).mtimeMs;
+    } catch {
+      continue; // released between the create and the read
+    }
+    const holder = Number.parseInt(held, 10);
+    if (lockVerdict({ holderAlive: pidAlive(holder), ageMs }) === "stale") {
+      // Only the lock just judged: another run may have taken it over since.
+      try {
+        if (readFileSync(lock, "utf8") === held) rmSync(lock, { force: true });
+      } catch {
+        // Gone already.
+      }
+      continue;
+    }
+    if (Date.now() > deadline) {
+      return `another matrix run (pid ${holder}) has held the stage for over ${LOCK_WAIT_MS / 60_000} minutes (${lock})`;
+    }
+    if (!waiting) {
+      process.stderr.write(`  waiting for another matrix run (pid ${holder}) to finish with the stage...\n`);
+      waiting = true;
+    }
+    await sleep(2_000);
+  }
+}
+
+/** `15 required packages missing (express, a hollow folder, required by
+ *  @modelcontextprotocol/sdk@1.30.0; hono, ...; 12 more)` -- short enough for
+ *  one row, each missing package named once however many trees lack it. */
+function describeProblems(problems) {
+  const distinct = [...new Map(problems.map((p) => [p.name, p])).values()];
+  const shown = distinct
+    .slice(0, 3)
+    .map((p) => `${p.name}, ${p.hollow ? "a hollow folder" : "absent"}, required by ${p.from}`)
+    .join("; ");
+  const more = distinct.length > 3 ? `; ${distinct.length - 3} more` : "";
+  return `${distinct.length} required ${distinct.length === 1 ? "package" : "packages"} missing (${shown}${more})`;
+}
+
+/** describeProblems over every damaged sidecar, led by their names. */
+function describeDamage(damaged) {
+  return `${[...damaged.keys()].join(", ")}: ${describeProblems([...damaged.values()].flat())}`;
+}
+
+/** What the run loop probes for `pkg`: its install error if npm failed it;
+ *  a SKIP-shaped error naming what is missing if settleInstall left its tree
+ *  damaged (with the version still reported); otherwise `resolve(pkg)`. */
+function binFor(pkg, installErrors, damaged, rebuilt, resolve) {
+  if (installErrors.has(pkg)) return { error: installErrors.get(pkg) };
+  const bin = resolve(pkg);
+  if (bin.error || !damaged.has(pkg)) return bin;
+  const after = rebuilt ? " even after the stage was rebuilt" : "";
+  return { error: `its install is not whole${after}: ${describeProblems(damaged.get(pkg))}`, version: bin.version };
+}
+
 // =============================================================================
 // The control arm -- making `node <bin>` actually run on node
 // =============================================================================
@@ -833,7 +1035,19 @@ const NODE_FLOOR_REFUSAL =
 /** A package.json as an object, or null when `dir` holds none that parses. */
 function readManifestAt(dir) {
   try {
-    return JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+    return parseManifest(readFileSync(join(dir, "package.json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/** A package.json's text as an object, or null when it does not parse. A
+ *  leading byte-order mark is dropped first, as node's and npm's own readers
+ *  drop it: JSON.parse throws on one, a Windows editor can write one, and a
+ *  package npm installs and node loads must not read here as a hollow folder. */
+function parseManifest(text) {
+  try {
+    return JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text);
   } catch {
     return null;
   }
@@ -860,17 +1074,6 @@ function readManifestAt(dir) {
  *  each walked in well under a second. `readManifest` is readManifestAt,
  *  injectable so the self-test walks a tree not on disk. */
 function engineRanges(root, readManifest = readManifestAt) {
-  const names = (field) => (field && typeof field === "object" ? Object.keys(field) : []);
-  const find = (from, name) => {
-    for (let d = from; ; d = dirname(d)) {
-      if (basename(d) !== "node_modules") {
-        const at = join(d, "node_modules", ...name.split("/"));
-        const manifest = readManifest(at);
-        if (manifest) return { at, manifest };
-      }
-      if (dirname(d) === d) return null;
-    }
-  };
   const top = readManifest(root);
   if (!top) return [];
   const ranges = [];
@@ -884,16 +1087,98 @@ function engineRanges(root, readManifest = readManifestAt) {
       ranges.push({ pkg: `${manifest.name}@${manifest.version}`, range: manifest.engines.node, dependency: at !== root });
     }
     const deps = new Set([
-      ...names(manifest.dependencies),
-      ...names(manifest.optionalDependencies),
-      ...names(manifest.peerDependencies),
+      ...fieldNames(manifest.dependencies),
+      ...fieldNames(manifest.optionalDependencies),
+      ...fieldNames(manifest.peerDependencies),
     ]);
     for (const name of deps) {
-      const found = find(at, name);
+      const found = resolveInstalled(at, name, readManifest);
       if (found && !seen.has(found.at)) queue.push(found);
     }
   }
   return ranges;
+}
+
+/** The keys of a package.json dependency field, or none when the field is
+ *  absent or not an object (a malformed manifest's string must not be read as
+ *  a list of one-character names). */
+function fieldNames(field) {
+  return field && typeof field === "object" ? Object.keys(field) : [];
+}
+
+/** The directories node searches for package `name` required from the
+ *  package at `from`, nearest first: `<from or an ancestor>/node_modules/<name>`,
+ *  never inside a node_modules dir itself. */
+function lookupDirs(from, name) {
+  const dirs = [];
+  for (let d = from; ; d = dirname(d)) {
+    if (basename(d) !== "node_modules") dirs.push(join(d, "node_modules", ...name.split("/")));
+    if (dirname(d) === d) return dirs;
+  }
+}
+
+/** The installed package require() would load for `name` from `from` -- the
+ *  first of lookupDirs holding a readable manifest -- as `{ at, manifest }`, or
+ *  null. require() looks past a folder with no manifest; import does not (it
+ *  stops at the first folder that exists), which installProblems reports. */
+function resolveInstalled(from, name, readManifest = readManifestAt) {
+  for (const at of lookupDirs(from, name)) {
+    const manifest = readManifest(at);
+    if (manifest) return { at, manifest };
+  }
+  return null;
+}
+
+/** What is damaged or missing in the install of the package at `root`, as
+ *  `{ from: "name@version", name, hollow }`, found two ways -- `npm ls`'s view
+ *  of the same tree, which marks both "invalid" or "missing":
+ *
+ *    - hollow: a folder standing FIRST in node's lookup order for a dependency
+ *      that holds no readable package.json. That is damage whatever the
+ *      dependency's kind, and whether or not a copy further up resolves:
+ *      import stops at the first folder that exists, so a hollow nested folder
+ *      shadows a whole hoisted copy, and npm never leaves one behind -- not
+ *      even for an optional package it skipped. `hollow` names the folder. On
+ *      2026-09-29 the shared stage had 15, mostly the SDK's HTTP stack; every
+ *      reinstall since had kept them, and npm's hidden lockfile listed each
+ *      as an empty entry.
+ *    - absent: a REQUIRED dependency that resolves to nothing (`hollow` null).
+ *      Required follows npm's own precedence (arborist loads peer, then prod,
+ *      then optional edges; the last wins): a name in optionalDependencies is
+ *      optional whatever else lists it, and a peer whose peerDependenciesMeta
+ *      says optional -- any truthy value -- is optional too. `npm ls` calls an
+ *      absent optional one UNMET OPTIONAL, which is no damage.
+ *
+ *  Every installed package is walked, optional ones included, since one that
+ *  is there must be whole. A missing root is not this function's to report:
+ *  resolveBin already says the package is not on disk. `readManifest` and
+ *  `exists` are injectable for the self-test. */
+function installProblems(root, readManifest = readManifestAt, exists = existsSync) {
+  const top = readManifest(root);
+  if (!top) return [];
+  const problems = [];
+  const seen = new Set();
+  const queue = [{ at: root, manifest: top }];
+  while (queue.length > 0) {
+    const { at, manifest } = queue.shift();
+    if (seen.has(at)) continue;
+    seen.add(at);
+    const from = `${manifest.name}@${manifest.version}`;
+    const optional = new Set(fieldNames(manifest.optionalDependencies));
+    const peers = fieldNames(manifest.peerDependencies);
+    const peerMeta = manifest.peerDependenciesMeta && typeof manifest.peerDependenciesMeta === "object" ? manifest.peerDependenciesMeta : {};
+    const required = new Set(
+      [...fieldNames(manifest.dependencies), ...peers.filter((name) => !peerMeta[name]?.optional)].filter((name) => !optional.has(name)),
+    );
+    for (const name of new Set([...fieldNames(manifest.dependencies), ...optional, ...peers])) {
+      const found = resolveInstalled(at, name, readManifest);
+      if (found && !seen.has(found.at)) queue.push(found);
+      const first = lookupDirs(at, name).find((dir) => exists(dir)) ?? null;
+      if (first && first !== found?.at) problems.push({ from, name, hollow: first });
+      else if (!found && required.has(name)) problems.push({ from, name, hollow: null });
+    }
+  }
+  return problems;
 }
 
 /** Why the node control cannot speak for this sidecar on this box, or null.
@@ -1068,8 +1353,10 @@ function respReply(argv) {
 // row whose call was never made counts as, what a control that never ran is
 // worth. Each once lived inline in the loop, where a mutation that flipped the
 // verdict still passed every case here; they are pure functions now (armEnv,
-// uncalledVerdict, controlVerdict) so they can be held, and one case pins the
-// loop's calls to them at the source. Two cases spawn, both stand-in sidecars
+// uncalledVerdict, controlVerdict, binFor) so they can be held, and one case
+// pins the loop's calls to them at the source. So is the install the loop
+// runs over: settleInstall checks it whole, and rebuilds it once, before
+// anything is probed. Two cases spawn, both stand-in sidecars
 // on node's own `-e`, because what they hold is probe's to report: the depth
 // classifyBoot compares, and a control's stderr, including a refusal printed
 // by a detached child after its parent exited (that child exits by itself).
@@ -1763,6 +2050,8 @@ async function selfTest() {
           ["classifyBoot(oam, control, refused)", 1],
           ["const nodeVerdict = controlVerdict(control, refused);", 1],
           ["classifyCall(oam.call, nodeVerdict,", 1],
+          // Every row's bin, a damaged install's SKIP included, comes from binFor.
+          ["const bin = binFor(s.pkg, installErrors, damaged, rebuilt, resolveBin);", 1],
         ];
         assertDeep(
           calls.filter(([needle, n]) => count(needle) !== n).map(([needle, n]) => `${needle} (want ${n}, found ${count(needle)})`),
@@ -1770,11 +2059,30 @@ async function selfTest() {
           "every arm's env, the uncalled-row verdict and the control's evidence go through the tested functions",
         );
         assertDeep(
-          ["sidecarEnv(", "probeFailed: true", '? "boot"', "satisfiesNodeRange(", "NODE_FLOOR_REFUSAL"].filter((inline) =>
-            loop.includes(inline),
+          ["sidecarEnv(", "probeFailed: true", '? "boot"', "satisfiesNodeRange(", "NODE_FLOOR_REFUSAL", "installErrors.has("].filter(
+            (inline) => loop.includes(inline),
           ),
           [],
           "and none of them is re-implemented inline beside the call",
+        );
+        // The install the loop runs over is settleInstall's -- checked for
+        // damage and rebuilt once -- not a bare installAll. The call sits above
+        // the loop, at column 0, which this case's quote of it does not.
+        assertDeep(
+          source.search(/^const \{ installErrors, damaged, rebuilt \} = settleInstall\(/m) > 0,
+          true,
+          "the run installs through settleInstall, so a damaged stage is found and rebuilt before anything is probed",
+        );
+        // And the run owns the stage before touching it: the lock comes before
+        // the trash sweep, the fixture wipe and the install, all at column 0.
+        const lockAt = source.search(/^const lockProblem = await lockStage\(join\(stage, "\.matrix\.lock"\)\);/m);
+        const sweepAt = source.search(/^sweepStageTrash\(\);/m);
+        const fixtureAt = source.search(/^prepareFixture\(\);/m);
+        const installAt = source.search(/^const \{ installErrors, damaged, rebuilt \} = settleInstall\(/m);
+        assertDeep(
+          [lockAt > 0, lockAt < sweepAt, sweepAt < fixtureAt, fixtureAt < installAt],
+          [true, true, true, true],
+          "the stage lock is taken before anything under the stage is swept, wiped or installed",
         );
         // bin.engines comes from resolveBin, outside the loop. Dropped there,
         // or cut back to the sidecar's own range, the floors of every sidecar
@@ -1946,6 +2254,174 @@ async function selfTest() {
           "a dependency's floor above this node refuses the control, and names the dependency",
         );
         assertDeep(engineRanges(join(nm, "absent"), read), [], "a package not on disk has no ranges");
+      },
+    },
+    {
+      name: "a required package missing from a sidecar's install is found, hollow or absent",
+      run() {
+        // An npm-shaped tree with the damage the shared stage had on
+        // 2026-09-29 -- a hollow folder where a required package belongs --
+        // beside the absences npm is allowed, and ones it is not.
+        const tree = new Map();
+        const nm = join("/", "stage", "node_modules");
+        const put = (parts, manifest) => tree.set(join(nm, ...parts), manifest);
+        // Folders with no package.json: where a required package belongs, where
+        // an optional one does, and a nested one shadowing a whole hoisted copy.
+        const hollow = new Set([join(nm, "express"), join(nm, "hollowopt"), join(nm, "sidecar", "node_modules", "shadowed")]);
+        put(["sidecar"], {
+          name: "sidecar",
+          version: "1.0.0",
+          dependencies: { sdk: "^1", express: "^5", gone: "^1", maybe: "^1", shadowed: "^1" },
+          // "maybe" is in dependencies too, and "fsev" is a peer too: npm treats
+          // both as optional, since the optional edge loads last and wins.
+          optionalDependencies: { maybe: "^1", native: "^1", hollowopt: "^1", fsev: "^2" },
+          // zod installed; react a required peer npm did not install; ts
+          // optional; "weird" optional by a truthy meta value that is not true.
+          peerDependencies: { zod: "*", react: "*", ts: "*", fsev: "*", weird: "*" },
+          peerDependenciesMeta: { ts: { optional: true }, weird: { optional: "true" } },
+        });
+        put(["sdk"], { name: "sdk", version: "1.30.0", dependencies: { cors: "^2" } });
+        // An optional package that IS installed must be whole too.
+        put(["native"], { name: "native", version: "1.0.0", dependencies: { "node-gyp-build": "^4" } });
+        put(["zod"], { name: "zod", version: "3.0.0" });
+        put(["shadowed"], { name: "shadowed", version: "2.0.0" });
+        const read = (dir) => tree.get(dir) ?? null;
+        const exists = (dir) => tree.has(dir) || hollow.has(dir);
+        assertDeep(
+          installProblems(join(nm, "sidecar"), read, exists),
+          [
+            { from: "sidecar@1.0.0", name: "express", hollow: join(nm, "express") },
+            { from: "sidecar@1.0.0", name: "gone", hollow: null },
+            // require() would look past it to the hoisted copy; import stops here.
+            { from: "sidecar@1.0.0", name: "shadowed", hollow: join(nm, "sidecar", "node_modules", "shadowed") },
+            // npm never leaves a folder for an optional package it skipped.
+            { from: "sidecar@1.0.0", name: "hollowopt", hollow: join(nm, "hollowopt") },
+            { from: "sidecar@1.0.0", name: "react", hollow: null },
+            { from: "sdk@1.30.0", name: "cors", hollow: null },
+            { from: "native@1.0.0", name: "node-gyp-build", hollow: null },
+          ],
+          "every hollow folder first in the lookup order, and every absent required package, anywhere in the tree; absent optional ones and optional peers excused as npm excuses them",
+        );
+        assertDeep(installProblems(join(nm, "zod"), read, exists), [], "a whole tree has no problems");
+        assertDeep(installProblems(join(nm, "absent"), read, exists), [], "a package not on disk is resolveBin's to report");
+        // A manifest with a byte-order mark is a manifest: node and npm drop
+        // the mark, and so must the reader, or a working package reads as hollow.
+        assertDeep(parseManifest('﻿{"name":"bom","version":"1.0.0"}'), { name: "bom", version: "1.0.0" }, "a leading BOM is dropped");
+        assertDeep(parseManifest('{"name": '), null, "and one that does not parse is null");
+      },
+    },
+    {
+      name: "a damaged install gets one rebuild, and what stays damaged is a SKIP that names it",
+      run() {
+        const damage = [{ from: "sdk@1.30.0", name: "express", hollow: join("/", "stage", "node_modules", "express") }];
+        // install, check and wipe recorded in one sequence; `healed` is when
+        // check stops finding damage (after the wipe, never, or at once).
+        // `reject` is refused on every install; `rejectAfterWipe` only by the
+        // rebuild's -- so what the rebuild returns has to be the rebuild's own.
+        const run = ({ healed, wipeFails = null, reject = [], rejectAfterWipe = [] }) => {
+          const events = [];
+          const notes = [];
+          let wiped = false;
+          const result = settleInstall(["good", ...reject, ...rejectAfterWipe], {
+            install: (specs) => {
+              events.push(`install ${specs.join(" ")}`);
+              const refusing = wiped ? [...reject, ...rejectAfterWipe] : reject;
+              const bad = specs.find((s) => refusing.includes(s.replace(/@latest$/, "")));
+              return bad ? `npm install failed: npm error E404 ${bad}` : null;
+            },
+            check: (pkg) => {
+              events.push(`check ${pkg}`);
+              return healed === "now" || (healed === "after-wipe" && wiped) ? [] : damage;
+            },
+            wipe: () => {
+              events.push("wipe");
+              wiped = wipeFails === null;
+              return wipeFails;
+            },
+            note: (line) => notes.push(line),
+          });
+          // Maps print as {} through assertDeep's JSON, so both become objects.
+          return {
+            events,
+            notes,
+            installErrors: Object.fromEntries(result.installErrors),
+            damaged: Object.fromEntries(result.damaged),
+            rebuilt: result.rebuilt,
+          };
+        };
+        const refused = "npm install failed: npm error E404 bad@latest";
+        assertDeep(
+          run({ healed: "now" }),
+          { events: ["install good@latest", "check good"], notes: [], installErrors: {}, damaged: {}, rebuilt: false },
+          "a whole install is checked once and left alone",
+        );
+        const healedRun = run({ healed: "after-wipe" });
+        assertDeep(
+          [healedRun.events, healedRun.installErrors, healedRun.damaged, healedRun.rebuilt, healedRun.notes.at(-1)],
+          [
+            ["install good@latest", "check good", "wipe", "install good@latest", "check good"],
+            {},
+            {},
+            true,
+            "  rebuilt: every sidecar's install is now whole\n",
+          ],
+          "a damaged one is moved aside, reinstalled and checked again -- once -- and what the rebuild healed is not skipped",
+        );
+        const stuck = run({ healed: "never" });
+        assertDeep(
+          [stuck.rebuilt, stuck.damaged, stuck.notes.at(-1)],
+          [true, { good: damage }, "  rebuilt: 0 of 1 sidecars reinstalled whole; the rest are SKIPs below\n"],
+          "damage that survives the rebuild is returned, and said, not hidden",
+        );
+        const locked = run({ healed: "never", wipeFails: "EBUSY" });
+        assertDeep(
+          [locked.events, locked.rebuilt, Object.keys(locked.damaged), /aside \(EBUSY\); nothing was reinstalled/.test(locked.notes.at(-1))],
+          [["install good@latest", "check good", "wipe", "check good"], false, ["good"], true],
+          "a stage that cannot be moved aside is not reinstalled over, and is checked again rather than assumed unchanged",
+        );
+        const refusedOnly = run({ healed: "now", reject: ["bad"] });
+        assertDeep(
+          [refusedOnly.installErrors, refusedOnly.damaged, refusedOnly.events.filter((e) => e.startsWith("check"))],
+          [{ bad: refused }, {}, ["check good"]],
+          "a package npm refused keeps npm's reason, and is not checked for damage",
+        );
+        const both = run({ healed: "after-wipe", reject: ["bad"] });
+        assertDeep(
+          [both.installErrors, both.damaged, both.rebuilt, both.notes.at(-1), both.notes.some((n) => /now whole/.test(n))],
+          [{ bad: refused }, {}, true, "  rebuilt: 1 of 2 sidecars reinstalled whole; the rest are SKIPs below\n", false],
+          "a rebuild that npm refuses part of says so, and keeps the refusal -- never 'every sidecar's install is now whole'",
+        );
+        const lateRefusal = run({ healed: "after-wipe", rejectAfterWipe: ["bad"] });
+        assertDeep(
+          [lateRefusal.installErrors, lateRefusal.damaged, lateRefusal.notes.at(-1)],
+          [{ bad: refused }, {}, "  rebuilt: 1 of 2 sidecars reinstalled whole; the rest are SKIPs below\n"],
+          "what the rebuild's own install refused is reported, not the first install's clean slate",
+        );
+        // The stage lock: a holder that is gone, or a lock older than any run
+        // can last, is taken over; a live, recent one is waited for.
+        assertDeep(
+          [
+            lockVerdict({ holderAlive: false, ageMs: 1_000 }),
+            lockVerdict({ holderAlive: true, ageMs: 60_000 }),
+            lockVerdict({ holderAlive: true, ageMs: LOCK_STALE_MS + 1 }),
+          ],
+          ["stale", "wait", "stale"],
+          "a dead or ancient lock is taken over; a live one is waited for",
+        );
+        assertDeep([pidAlive(process.pid), pidAlive(0), pidAlive(Number.NaN)], [true, false, false], "this process is alive; no pid is not");
+        // The row. An install error wins; damage is a SKIP naming what is
+        // missing, with the version still shown; otherwise the bin as resolved.
+        const resolve = (pkg) => ({ entry: `/bin/${pkg}`, version: "1.0.0" });
+        const none = new Map();
+        assertDeep(binFor("a", new Map([["a", "npm install failed: E404"]]), none, false, resolve), { error: "npm install failed: E404" }, "an install error wins");
+        assertDeep(binFor("a", none, none, false, resolve), { entry: "/bin/a", version: "1.0.0" }, "a whole install resolves as before");
+        const skipped = binFor("a", none, new Map([["a", damage]]), true, resolve);
+        assertDeep(
+          [skipped.version, /even after the stage was rebuilt: 1 required package missing \(express, a hollow folder, required by sdk@1\.30\.0\)/.test(skipped.error)],
+          ["1.0.0", true],
+          "a damaged install is a SKIP that names the missing package, where it was, and who needed it",
+        );
+        assertDeep(exitCodeFor([{ state: "verified" }, { state: "skip" }]), 3, "which leaves the run incomplete, never clean");
       },
     },
     {
@@ -2558,6 +3034,15 @@ console.error(`oam sidecar matrix -- ${oamVersion} against node ${process.versio
 console.error(`stage: ${stage}\n`);
 
 mkdirSync(stage, { recursive: true });
+// Before anything under the stage is touched -- the fixture wipe below
+// included -- the run owns it (lockStage), and only then are earlier runs'
+// moved-aside node_modules swept away.
+const lockProblem = await lockStage(join(stage, ".matrix.lock"));
+if (lockProblem) {
+  console.error(lockProblem);
+  process.exit(2);
+}
+sweepStageTrash();
 prepareFixture();
 
 // In-place progress only on a terminal. Captured by release-local.sh, a `\r`
@@ -2572,12 +3057,13 @@ const clearProgress = () => {
 };
 
 progress(`  installing ${selected.length} package(s)...`);
-const installErrors = installAll(
+const { installErrors, damaged, rebuilt } = settleInstall(
   selected.map((s) => s.pkg),
-  npmInstall,
-  (line) => {
-    clearProgress();
-    process.stderr.write(line);
+  {
+    note: (line) => {
+      clearProgress();
+      process.stderr.write(line);
+    },
   },
 );
 clearProgress();
@@ -2598,7 +3084,7 @@ const under = (detail) => row("", "", "", detail);
 const results = [];
 
 for (const s of selected) {
-  const bin = installErrors.has(s.pkg) ? { error: installErrors.get(s.pkg) } : resolveBin(s.pkg);
+  const bin = binFor(s.pkg, installErrors, damaged, rebuilt, resolveBin);
   const ver = bin.version ?? "?";
   const record = (state, detail, { why = detail, note = null, tools = null, tool = null, extra = [] } = {}) => {
     clearProgress();
@@ -2741,7 +3227,7 @@ const code = exitCodeFor(results);
 if (jsonPath) {
   writeFileSync(
     jsonPath,
-    `${JSON.stringify({ schema: "oam-mcp-sidecar-matrix/1", oam: oamVersion, node: process.version, platform: `${process.platform}-${process.arch}`, exitCode: code, sidecars: results }, null, 2)}\n`,
+    `${JSON.stringify({ schema: "oam-mcp-sidecar-matrix/1", oam: oamVersion, node: process.version, platform: `${process.platform}-${process.arch}`, exitCode: code, stage: { rebuilt, damaged: Object.fromEntries(damaged), installErrors: Object.fromEntries(installErrors) }, sidecars: results }, null, 2)}\n`,
   );
   console.error(`report: ${jsonPath}`);
 }
