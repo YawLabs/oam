@@ -50,9 +50,10 @@ Release tooling only; no runtime behavior change.
   required package as an empty folder that later installs keep: the gate's shared stage held
   15, and every sidecar still passed only because none of them loaded one. A sidecar that did
   would have failed on both runtimes and been filed as broken upstream. After installing, the
-  gate now checks each sidecar's installed tree for a required package that does not resolve,
-  rebuilds the stage from scratch once when it finds one, and reports what is still missing as
-  a SKIP that names it.
+  gate now checks each sidecar's installed tree for a package npm left hollow or a required one
+  it left out, rebuilds the stage from scratch once when it finds one, and reports what is
+  still missing as a SKIP that names it. Runs also take a lock on the shared stage, so two at
+  once -- one way the damage happens -- now wait for each other.
 
 ## [0.17.0] - 2026-09-24
 
