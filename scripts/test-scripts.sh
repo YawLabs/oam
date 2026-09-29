@@ -1218,9 +1218,12 @@ if [ -z "$VENDOR_BAD" ]; then pass; else fail "vendored-crate gate out of sync:$
 # ran in no gate at all until ci-local.sh step 13 called it -- so a matrix edit
 # that turned an oam regression into a warn passed every release. A ci-local.sh
 # that stopped calling it would put it back there with every step green.
+# Anchored to the `if`/`elif` that RUNS it: the step's failure message quotes
+# the same command as a reproduce hint, and an unanchored match on that hint
+# stayed green with the call itself changed or gone.
 it "ci-local.sh runs the sidecar matrix self-test"
-if grep -qE 'node scripts/mcp-sidecar-matrix\.mjs --self-test' scripts/ci-local.sh; then pass
-else fail "ci-local.sh no longer runs 'node scripts/mcp-sidecar-matrix.mjs --self-test'"; fi
+if grep -qE '^[[:space:]]*(if|elif)[[:space:]]+node scripts/mcp-sidecar-matrix\.mjs --self-test;' scripts/ci-local.sh; then pass
+else fail "ci-local.sh no longer runs 'node scripts/mcp-sidecar-matrix.mjs --self-test' as a step's condition"; fi
 
 # #90 shipped a whole second build configuration -- oam_engine without `napi`,
 # oam_cli without its passthrough -- that was verified by hand once and then had
