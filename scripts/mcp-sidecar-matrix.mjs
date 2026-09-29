@@ -77,7 +77,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { connect, createServer as createTcpServer } from "node:net";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 
 // Paths only -- nothing here touches the disk. `--list` and `--self-test` run
@@ -829,20 +829,84 @@ function satisfiesNodeRange(range, version) {
 const NODE_FLOOR_REFUSAL =
   /\b(?:needs|requires) node(?:\.js)? v?\d+(?:\.\d+){0,2} or (?:newer|later|higher|above)\b|\bis node(?:\.js)? v?\d+(?:\.\d+){0,2}, older than\b/i;
 
+/** A package.json as an object, or null when `dir` holds none that parses. */
+function readManifestAt(dir) {
+  try {
+    return JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+/** Every engines.node range the package installed at `root` runs under -- its
+ *  own first, then each package of its installed dependency closure -- as
+ *  `{ pkg: "name@version", range, dependency }`. Dependencies are found the
+ *  way node's resolver finds them: `<dir or an ancestor>/node_modules/<name>`,
+ *  nearest first, never inside a node_modules dir itself, starting from each
+ *  package's own directory -- so a nested copy wins over a hoisted one, as it
+ *  does at run time. dependencies, optionalDependencies and peerDependencies
+ *  are followed (npm installs non-optional peers). One not on disk is skipped:
+ *  npm leaves out an optional one it could not build, and one pruned from the
+ *  stage that is only required lazily (the SDK's HTTP transports, on a stdio
+ *  sidecar) never loads -- so what is read is what could run. Measured on the
+ *  staged sidecars: 1 to 104 packages, under half a second each. `readManifest`
+ *  is readManifestAt, injectable so the self-test walks a tree not on disk. */
+function engineRanges(root, readManifest = readManifestAt) {
+  const names = (field) => (field && typeof field === "object" ? Object.keys(field) : []);
+  const find = (from, name) => {
+    for (let d = from; ; d = dirname(d)) {
+      if (basename(d) !== "node_modules") {
+        const at = join(d, "node_modules", ...name.split("/"));
+        const manifest = readManifest(at);
+        if (manifest) return { at, manifest };
+      }
+      if (dirname(d) === d) return null;
+    }
+  };
+  const top = readManifest(root);
+  if (!top) return [];
+  const ranges = [];
+  const seen = new Set();
+  const queue = [{ at: root, manifest: top }];
+  while (queue.length > 0) {
+    const { at, manifest } = queue.shift();
+    if (seen.has(at)) continue;
+    seen.add(at);
+    if (typeof manifest.engines?.node === "string") {
+      ranges.push({ pkg: `${manifest.name}@${manifest.version}`, range: manifest.engines.node, dependency: at !== root });
+    }
+    const deps = new Set([
+      ...names(manifest.dependencies),
+      ...names(manifest.optionalDependencies),
+      ...names(manifest.peerDependencies),
+    ]);
+    for (const name of deps) {
+      const found = find(at, name);
+      if (found && !seen.has(found.at)) queue.push(found);
+    }
+  }
+  return ranges;
+}
+
 /** Why the node control cannot speak for this sidecar on this box, or null.
- *  Two sources, because neither covers every sidecar. First, the package's
- *  own `engines.node` (`engines`), when this box's node (`nodeVersion`) falls
- *  outside it -- the top-level package's only; a dependency's engines is not
- *  read. Second, a refusal on the control's `stderr`, for a floor enforced at
- *  run time and possibly stricter than engines: fetch-mcp's and
- *  tailscale-mcp's launchers check NODE_MIN, and @playwright/mcp inherits
- *  playwright-core's floor (20, where its own engines says ">=18"). memory and
- *  puppeteer declare no floor and print no refusal, so an old node that
- *  crashes them in its own words (a SyntaxError, a missing API) still reads as
- *  the sidecar's. An engines range this cannot read decides nothing. */
+ *  Two sources, because neither covers every sidecar. First, `engines` --
+ *  engineRanges' list for the sidecar, its own range and every installed
+ *  dependency's -- when this box's node (`nodeVersion`) falls outside any of
+ *  them: a dependency's floor binds the control as surely as the sidecar's,
+ *  and it is the only floor a launcher-less sidecar may have (memory's SDK,
+ *  puppeteer's 54 declared ranges). Second, a refusal on the control's
+ *  `stderr`, for a floor enforced at run time and stricter than any declared
+ *  one: fetch-mcp's and tailscale-mcp's launchers check NODE_MIN, and
+ *  playwright-core refuses below 20 in words as well as in its engines. A
+ *  floor no installed package declares and none prints -- an old node that
+ *  crashes a sidecar in its own words -- still reads as the sidecar's; nothing
+ *  on disk says otherwise. A range this cannot read decides nothing. */
 function nodeHostRefusal(engines, nodeVersion, stderr) {
-  if (engines && satisfiesNodeRange(engines, nodeVersion) === false) {
-    return `this box's node ${nodeVersion} is outside the sidecar's engines "${engines}"`;
+  const outside = (engines ?? []).find(({ range }) => satisfiesNodeRange(range, nodeVersion) === false);
+  if (outside) {
+    return outside.dependency
+      ? `this box's node ${nodeVersion} is outside the engines "${outside.range}" of ${outside.pkg}, which the sidecar depends on`
+      : `this box's node ${nodeVersion} is outside the sidecar's engines "${outside.range}"`;
   }
   const said = String(stderr ?? "")
     .split("\n")
@@ -1703,19 +1767,18 @@ async function selfTest() {
           "and none of them is re-implemented inline beside the call",
         );
         // bin.engines comes from resolveBin, outside the loop. Dropped there,
-        // the declared floor would read as "none" for every sidecar, and the
-        // only floor a launcher-less sidecar has would go unchecked. Its body
-        // is found by its column-0 declaration, like the loop, so the quotes
-        // of it in this case do not answer for it.
+        // or cut back to the sidecar's own range, the floors of every sidecar
+        // -- or of every dependency -- would go unchecked. Its body is found by
+        // its column-0 declaration, like the loop, so the quotes of it in this
+        // case do not answer for it.
         const at = source.search(/^function resolveBin\(/m);
         const resolveBinBody = source.slice(at, source.indexOf("\n}\n", at)).replace(/\s+/g, " ");
         assertDeep(
-          [
-            'const engines = typeof manifest.engines?.node === "string" ? manifest.engines.node : null;',
-            "return { entry, version: manifest.version, engines };",
-          ].filter((needle) => at < 0 || !resolveBinBody.includes(needle)),
+          ["return { entry, version: manifest.version, engines: engineRanges(dir) };"].filter(
+            (needle) => at < 0 || !resolveBinBody.includes(needle),
+          ),
           [],
-          "resolveBin hands each sidecar's declared engines.node to the loop",
+          "resolveBin hands the loop the engines ranges of each sidecar and its whole installed tree",
         );
       },
     },
@@ -1774,13 +1837,32 @@ async function selfTest() {
     {
       name: "a node-floor refusal is read from engines and from the launchers' own words",
       run() {
-        // Every floor the staged sidecars declare (fetch, tailscale, postgres,
-        // redis, playwright, lemonsqueezy, ctxlint; memory and puppeteer
-        // declare none) admits node 22.22.2, the release box's node.
-        const declared = [">=22.19.0", ">=20.11.0", ">=22", ">=20", ">=18", null];
-        assertDeep(declared.map((e) => nodeHostRefusal(e, "22.22.2", "")), declared.map(() => null), "today's floors refuse nothing");
-        assertDeep(typeof nodeHostRefusal(">=24", "22.22.2", ""), "string", "a declared floor past this box's node is a refusal");
-        assertDeep(nodeHostRefusal("20 - 24", "22.22.2", ""), null, "a range this cannot read decides nothing");
+        // Every distinct engines.node range declared anywhere in the nine
+        // staged sidecars' installed trees admits node 22.22.2, the release
+        // box's node -- so nothing is refused today, and no passing row can
+        // change. (2026-09-29, by engineRanges over the real stage: 27 distinct
+        // ranges from 71 declarations, in trees of 147 packages all told.)
+        const today = [
+          ">=18", ">=22.19.0", ">=14.0.0", ">=16.0.0", ">=20.11.0", ">=22", ">=20", ">=14", ">=6.0", ">= 10.17.0",
+          ">=0.4.0", ">= 14", ">=12", ">=10", ">=6", ">=8", ">=10.0.0", "6.* || 8.* || >= 10.*", ">=0.10.0", ">=4",
+          ">=6.9.0", "*", ">= 10.0.0", ">= 0.4.0", ">= 6.0.0", ">=7.0.0", ">=4.0",
+        ];
+        const dep = (range) => ({ pkg: "some-dep@1.0.0", range, dependency: true });
+        assertDeep(today.filter((range) => nodeHostRefusal([dep(range)], "22.22.2", "")), [], "today's floors refuse nothing");
+        assertDeep(nodeHostRefusal(null, "22.22.2", ""), null, "a sidecar with no ranges and no refusal is not refused");
+        const own = nodeHostRefusal([{ pkg: "s@1.0.0", range: ">=24", dependency: false }], "22.22.2", "");
+        assertDeep(typeof own === "string" && own.includes("the sidecar's engines"), true, "a sidecar's own floor past this box's node is a refusal");
+        const theirs = nodeHostRefusal(
+          [{ pkg: "s@1.0.0", range: ">=18", dependency: false }, { pkg: "playwright-core@1.64.0", range: ">=24", dependency: true }],
+          "22.22.2",
+          "",
+        );
+        assertDeep(
+          typeof theirs === "string" && theirs.includes("playwright-core@1.64.0"),
+          true,
+          "so is a dependency's, and the row names the dependency",
+        );
+        assertDeep(nodeHostRefusal([dep("20 - 24")], "22.22.2", ""), null, "a range this cannot read decides nothing");
         for (const [who, { stderr, quote }] of Object.entries(FLOOR_REFUSALS)) {
           const r = nodeHostRefusal(null, "22.22.2", `some earlier log line\n${stderr}`);
           assertDeep(typeof r === "string" && r.includes(quote), true, `${who}'s own refusal is found, and quoted`);
@@ -1797,6 +1879,54 @@ async function selfTest() {
         ]) {
           assertDeep(nodeHostRefusal(null, "22.22.2", said), null, `not a node refusal: ${said}`);
         }
+      },
+    },
+    {
+      name: "a sidecar's installed dependencies are walked the way node resolves them",
+      run() {
+        // A tree that is not on disk, shaped like npm's: a nested copy under
+        // the package that needs it, the rest hoisted, one dependency never
+        // installed, an optional one installed and one npm left out, a peer,
+        // and a cycle.
+        const tree = new Map();
+        const nm = join("/", "stage", "node_modules");
+        const put = (parts, manifest) => tree.set(join(nm, ...parts), manifest);
+        put(["app"], {
+          name: "app",
+          version: "1.0.0",
+          engines: { node: ">=18" },
+          dependencies: { lib: "^1", "@s/core": "^2", gone: "^1" },
+          optionalDependencies: { native: "^1", unbuilt: "^1" },
+          peerDependencies: { peer: "*" },
+        });
+        put(["native"], { name: "native", version: "1.2.0", engines: { node: ">=12" } });
+        put(["app", "node_modules", "lib"], { name: "lib", version: "1.0.0", engines: { node: ">=20" }, dependencies: { app: "^1" } });
+        // A hoisted lib nobody here resolves to: node finds app's nested copy first.
+        put(["lib"], { name: "lib", version: "2.0.0", engines: { node: ">=99" } });
+        put(["@s", "core"], { name: "@s/core", version: "2.0.0", dependencies: { deep: "^1" } });
+        put(["deep"], { name: "deep", version: "1.0.0", engines: { node: ">=16" }, dependencies: "not-an-object" });
+        put(["peer"], { name: "peer", version: "3.0.0", engines: { node: ">=14" } });
+        const read = (dir) => tree.get(dir) ?? null;
+        const ranges = engineRanges(join(nm, "app"), read);
+        assertDeep(
+          ranges,
+          [
+            { pkg: "app@1.0.0", range: ">=18", dependency: false },
+            { pkg: "lib@1.0.0", range: ">=20", dependency: true },
+            { pkg: "native@1.2.0", range: ">=12", dependency: true },
+            { pkg: "peer@3.0.0", range: ">=14", dependency: true },
+            { pkg: "deep@1.0.0", range: ">=16", dependency: true },
+          ],
+          "own range first, then every installed dependency, optional and peer included -- the nested copy, not the hoisted one; missing ones skipped; the cycle walked once",
+        );
+        assertDeep(nodeHostRefusal(ranges, "22.22.2", ""), null, "a tree whose floors all admit this node refuses nothing");
+        const refused = nodeHostRefusal(ranges, "19.0.0", "");
+        assertDeep(
+          typeof refused === "string" && refused.includes("lib@1.0.0") && refused.includes(">=20"),
+          true,
+          "a dependency's floor above this node refuses the control, and names the dependency",
+        );
+        assertDeep(engineRanges(join(nm, "absent"), read), [], "a package not on disk has no ranges");
       },
     },
     {
@@ -1866,9 +1996,9 @@ async function selfTest() {
   return failures === 0 ? 0 : 1;
 }
 
-/** Resolve an installed package's bin entry point, version, and declared
- *  `engines.node` (null when it declares none) -- the floor nodeHostRefusal
- *  holds the node control to.
+/** Resolve an installed package's bin entry point, version, and the
+ *  engines.node ranges of it and its installed dependencies (engineRanges) --
+ *  the floors nodeHostRefusal holds the node control to.
  *  Mirrors oam-spawn.ts: the BIN from package.json, not require.resolve --
  *  a package's library export is often ESM-gated and is not what npx runs. */
 function resolveBin(pkg) {
@@ -1881,8 +2011,7 @@ function resolveBin(pkg) {
   if (!rel) return { error: "package.json declares no bin", version: manifest.version };
   const entry = resolve(dir, rel);
   if (!existsSync(entry)) return { error: `bin missing on disk: ${entry}`, version: manifest.version };
-  const engines = typeof manifest.engines?.node === "string" ? manifest.engines.node : null;
-  return { entry, version: manifest.version, engines };
+  return { entry, version: manifest.version, engines: engineRanges(dir) };
 }
 
 /** Turn a tools/call reply into a verdict the adjudicator can judge.
