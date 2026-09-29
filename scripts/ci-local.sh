@@ -61,7 +61,7 @@
 #                                            whose fault a failed sidecar is,
 #                                            which arm gets the node pin, what
 #                                            an uncalled row counts as)
-#  14. miri aliasing models              (GATING when nightly+miri present,
+#  14. miri aliasing models               (GATING when nightly+miri present,
 #                                            SKIPPED with a notice otherwise --
 #                                            machine-checks the raw-pointer
 #                                            disciplines napi.rs relies on)
