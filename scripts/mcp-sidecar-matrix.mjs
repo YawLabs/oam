@@ -170,10 +170,20 @@ const SIDECARS = [
       // against a server the harness itself starts on loopback: nothing
       // external, no name resolution, no credential.
       //
-      // `allow_private_hosts` is not a test-only escape hatch; it is the
-      // sidecar's own documented switch for exactly this, and it defaults off
-      // so a loopback URL is refused without it.
+      // Reaching loopback takes two switches, and the sidecar refuses the call
+      // before any dial unless BOTH are set: the per-call `allow_private_hosts`
+      // argument, and FETCH_MCP_ALLOW_PRIVATE_HOSTS=1 in the server's
+      // environment. fetch-mcp 0.7.1 (2026-09-21) added the second one because
+      // the model picks tool arguments, so the per-call flag alone let a
+      // prompt-injected call widen the SSRF guard. The prefix scrub above
+      // strips every FETCH_MCP_* the box carries, so the harness sets the
+      // variable itself: it starts the process AND owns the URL, which is
+      // exactly the operator that switch exists for. Without this layer the
+      // row read UPSTREAM from 0.7.1 on -- node refused identically, so the
+      // adjudicator filed a stale harness as a broken sidecar and the call
+      // never reached oam's HTTP stack.
       requires: (ctx) => ctx.loopback.error ?? null,
+      env: () => ({ FETCH_MCP_ALLOW_PRIVATE_HOSTS: "1" }),
       args: (ctx) => ({
         url: ctx.loopback.url,
         allow_private_hosts: true,
