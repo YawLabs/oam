@@ -62,7 +62,8 @@
 //   node scripts/mcp-sidecar-matrix.mjs --json=report.json
 //   node scripts/mcp-sidecar-matrix.mjs --list
 //   node scripts/mcp-sidecar-matrix.mjs --self-test     # checks THIS harness;
-//                                                       # no network, no npm, no oam
+//                                                       # no network, no npm, no oam;
+//                                                       # ci-local.sh step 13 runs it
 //   OAM_BIN=/path/to/oam node scripts/mcp-sidecar-matrix.mjs
 //   OAM_MATRIX_BROWSER=/path/to/chrome     # browser for puppeteer + playwright
 //   OAM_MATRIX_DATABASE_URL=postgresql://  # default postgres@127.0.0.1:5432
@@ -546,6 +547,29 @@ function sidecarEnv(inherited, prefixes, ...layers) {
   return Object.assign(env, { NO_COLOR: "1" }, ...layers);
 }
 
+/** The `*_RUNTIME=node` layer that pins a launcher's control arm to node. */
+function nodePinFor(pin) {
+  return Object.fromEntries(pin.vars.map((v) => [v, "node"]));
+}
+
+/** The environment ONE arm of a row spawns with: the scrubbed inheritance, the
+ *  entry's env, the call's env (evaluated with that arm's own ctx), and on the
+ *  node arm only, the launcher pin. The split is the control's whole meaning.
+ *  The pin on the oam arm hands every launcher off to node, and the row
+ *  compares node with node and passes whatever oam does. No pin on the node
+ *  arm, and the launcher goes looking for oam and hands the control to it, so
+ *  a real oam regression reads as upstream. Pure, and out of the run loop, so
+ *  the self-test can hold that split. */
+function armEnv(host, s, call, ctx, nodePin, inherited) {
+  return sidecarEnv(
+    inherited,
+    s.envPrefixes ?? [],
+    s.env ?? {},
+    call?.env ? call.env(ctx) : {},
+    host === "node" ? nodePin : {},
+  );
+}
+
 // =============================================================================
 // Adjudication -- whose fault is a failed tool call?
 // =============================================================================
@@ -565,13 +589,42 @@ function sidecarEnv(inherited, prefixes, ...layers) {
 //   upstream -- the sidecar is broken on node too, so oam is not the suspect
 //   demoted  -- the environment could not support the call on either runtime
 
-/** Adjudicate a BOOT failure against the node control.
+/** Adjudicate a failed oam PROBE against the node control.
+ *
+ * "Boot" undersells it: this is every oam probe that came back without a call
+ * verdict, and a sidecar that boots and then hangs or dies while a tool call is
+ * in flight lands here too -- the likeliest shape of an oam HTTP regression.
+ * So the control only speaks to oam's failure when it failed at the SAME
+ * point. `depth` is how far each exchange got (probe: 0 while booting, 1 + i
+ * while awaiting the i-th tools/call); a hand-built verdict without one is a
+ * boot failure.
+ *   - node stopped EARLIER than oam: it never reached the point oam failed at,
+ *     which is no evidence at all -- the rule classifyCall applies to
+ *     probeFailed. oam's failure stands.
+ *   - node got FURTHER than oam: node went past that point, so it is oam's.
+ * Before depth was compared, any node failure read as upstream, so an oam hang
+ * mid-call was excused whenever the control could not boot (an engines bump
+ * past the release box's node, say), and the release went out on a warn.
  *
  * Split out of the run loop so it is testable without spawning a sidecar --
  * the same reason classifyCall below is a pure function. It decides whether a
  * release goes red, and it was the one verdict nothing could exercise.
  */
 function classifyBoot(oam, node) {
+  const oamAt = oam.depth ?? 0;
+  const nodeAt = node.depth ?? 0;
+  if (!node.ok && nodeAt < oamAt) {
+    return {
+      state: "fail",
+      why: `${oam.why}; the node control never got that far (${node.why}), so nothing exonerates oam`,
+    };
+  }
+  if (!node.ok && nodeAt > oamAt) {
+    return {
+      state: "fail",
+      why: `${oam.why}; the node control got past that point before failing (${node.why}), so this is oam`,
+    };
+  }
   if (!node.ok) {
     const same = node.why === oam.why;
     return {
@@ -581,7 +634,12 @@ function classifyBoot(oam, node) {
         : `${oam.why}; node also fails, differently (${node.why}) -- broken sidecar, not oam`,
     };
   }
-  return { state: "fail", why: `${oam.why}; the node control booted fine, so this is oam` };
+  return {
+    state: "fail",
+    why: oamAt === 0
+      ? `${oam.why}; the node control booted fine, so this is oam`
+      : `${oam.why}; the node control answered the call, so this is oam`,
+  };
 }
 
 /** Adjudicate an oam tool-call verdict against the node control's.
@@ -650,6 +708,27 @@ function classifyLeaks(verdict, oamLeft, nodeLeft) {
   const why = `left ${left} running after the sidecar exited; the node control left none`;
   if (verdict.state === "fail") return { ...verdict, why: `${verdict.why}; also ${why}` };
   return { ...verdict, state: "fail", why };
+}
+
+/** The verdict on a row whose tool call was never made, before leaks.
+ *  A declared `bootOnly` is coverage decided in review and does not hold the
+ *  gate. An unmet `requires` is a call that SHOULD have run and could not (a
+ *  loopback fixture that failed to listen, no browser on the box), so it is
+ *  demoted and the run exits 3. The first version of this recorded an unmet
+ *  requires as "boot" too: the run exited 0 with the gate green and the fetch
+ *  assertion never run (fixed in 94d3792). */
+function uncalledVerdict(s, unmet) {
+  return s.bootOnly ? { state: "boot", why: s.bootOnly } : { state: "demoted", why: unmet };
+}
+
+/** The node control's evidence about the call, as classifyCall reads it. A
+ *  control whose probe failed -- it could not boot, or died or hung before the
+ *  call's reply -- produced no call verdict, so it is marked probeFailed, and
+ *  classifyCall will not let it exonerate oam. A control that answered is its
+ *  answer, a failed call included. */
+function controlVerdict(control) {
+  if (!control.ok) return { ok: false, probeFailed: true, why: `node control could not probe: ${control.why}` };
+  return control.call ?? { ok: false, why: "node control returned no verdict" };
 }
 
 /** `msedge.exe x8, oam.exe` -- counts collapse, order follows first sighting. */
@@ -790,6 +869,15 @@ function respReply(argv) {
 // gets held. The sidecar table is asserted too, so a sidecar added without a
 // tool call and without a stated reason fails offline instead of silently
 // widening the boot-only column.
+//
+// So are the run loop's own decisions -- which arm gets the node pin, what a
+// row whose call was never made counts as, what a control that never ran is
+// worth. Each once lived inline in the loop, where a mutation that flipped the
+// verdict still passed every case here; they are pure functions now (armEnv,
+// uncalledVerdict, controlVerdict) so they can be held. One case does spawn:
+// probe itself, against a stand-in sidecar on node's own `-e`, because the
+// depth classifyBoot compares is probe's to report. Still no disk, network,
+// npm or oam. scripts/ci-local.sh runs all of it (step 13).
 
 /** Compares by JSON shape -- the assertions here are all arrays of specs, and a
  *  printed expected-vs-actual is what makes a regression diagnosable. */
@@ -817,9 +905,49 @@ function recordingInstaller({ rejects = [], rejectCall = null } = {}) {
   return { calls, install };
 }
 
-/** Runs the self-test cases. Returns the process exit code. */
-function selfTest() {
+/** Runs the self-test cases. Resolves to the process exit code. */
+async function selfTest() {
   const quiet = () => {};
+  // The shape of a real @yawlabs launcher's runtime switch (fetch-mcp's).
+  const FETCH_LAUNCHER = [
+    'const mode = (process.env.FETCH_MCP_RUNTIME ?? "auto").toLowerCase();',
+    'const oam = findOam();',
+    'child = spawn(oam, ["run", SERVER_ENTRY]);',
+  ].join("\n");
+  // http_get replies captured verbatim from @yawlabs/fetch-mcp 0.8.1 on node
+  // v22.22.2 (2026-09-29): one against the fixture, three against bodies the
+  // call must not accept. All four came back as a 200 with isError false, so
+  // every one of them reaches the call's expect() -- that check is the only
+  // thing between a lost or mangled body and a PASS.
+  const FETCH_REPLY_HEAD =
+    "HTTP/1.1 200 OK\nURL: http://127.0.0.1:59791/\nDuration: 35ms\n\n--- Headers ---\n"
+    + "connection: keep-alive\ncontent-type: application/json\ndate: Tue, 29 Sep 2026 10:41:58 GMT\n"
+    + "keep-alive: timeout=5\ntransfer-encoding: chunked\n\n";
+  const FETCH_REPLY_BODIES = {
+    fixture: `--- Body (parsed JSON) ---\n{\n  "fixture": "${LOOPBACK_MARKER}"\n}`,
+    empty: "--- Body ---\n",
+    foreign: '--- Body (parsed JSON) ---\n{\n  "fixture": "somebody-else"\n}',
+    truncated: `--- Body ---\n{"fixture":"${LOOPBACK_MARKER.slice(0, 14)}`,
+  };
+  // A stand-in sidecar on node's own `-e`: no file, no network, no oam. It
+  // answers initialize and tools/list like any MCP server, then dies the moment
+  // a tool is called -- what an oam crash mid-call leaves behind.
+  const DIES_ON_CALL = [
+    'let buf = "";',
+    'process.stdin.on("data", (d) => {',
+    "  buf += d;",
+    '  const lines = buf.split("\\n");',
+    "  buf = lines.pop();",
+    "  for (const line of lines) {",
+    "    if (!line.trim()) continue;",
+    "    const m = JSON.parse(line);",
+    '    const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result }) + "\\n");',
+    '    if (m.method === "initialize") reply({ protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "stand-in", version: "0" } });',
+    '    else if (m.method === "tools/list") reply({ tools: [{ name: "http_get", inputSchema: { type: "object" } }] });',
+    '    else if (m.method === "tools/call") process.exit(7);',
+    "  }",
+    "});",
+  ].join("\n");
   // Scoped and unscoped names both appear on purpose: the specs are built by
   // string concatenation, and `@scope/pkg@latest` is where that goes wrong.
   const cases = [
@@ -1122,13 +1250,8 @@ function selfTest() {
     {
       name: "the control arm is pinned to node through the launcher's own switch",
       run() {
-        const launcher = [
-          'const mode = (process.env.FETCH_MCP_RUNTIME ?? "auto").toLowerCase();',
-          'const oam = findOam();',
-          'child = spawn(oam, ["run", SERVER_ENTRY]);',
-        ].join("\n");
         assertDeep(
-          launcherRuntimeVars(launcher),
+          launcherRuntimeVars(FETCH_LAUNCHER),
           { launcher: true, vars: ["FETCH_MCP_RUNTIME"] },
           "a launcher's switch is found, so `node <bin>` stops re-spawning oam",
         );
@@ -1239,13 +1362,126 @@ function selfTest() {
         );
       },
     },
+    {
+      name: "a failure mid-call is not excused by a control that never booted",
+      async run() {
+        // The one case that spawns: the depth classifyBoot compares is probe's
+        // to report, so probe itself is run, against the stand-in above.
+        const call = { tool: "http_get", args: () => ({}), expect: () => null };
+        const env = { ...process.env, NO_COLOR: "1" };
+        const midCall = await probe("node", "-e", { env, scriptArgs: [DIES_ON_CALL], call, ctx: {} });
+        const noBoot = await probe("node", "-e", { env, scriptArgs: ["process.exit(9)"], call, ctx: {} });
+        assertDeep(
+          [midCall.ok, midCall.depth, noBoot.ok, noBoot.depth],
+          [false, 1, false, 0],
+          "probe reports how far each exchange got -- the fact the verdicts below turn on",
+        );
+        const v = classifyBoot(midCall, noBoot);
+        assertDeep(v.state, "fail", "an oam crash or hang mid-call stands when the control never reached the call");
+        assertDeep(/never got that far/.test(v.why), true, "and the reason says why the control is no evidence");
+        assertDeep(
+          classifyBoot(noBoot, midCall).state,
+          "fail",
+          "a control that booted where oam could not puts the boot failure on oam",
+        );
+        assertDeep(
+          classifyBoot(midCall, midCall).state,
+          "upstream",
+          "failing at the same point on both runtimes is still the sidecar's",
+        );
+      },
+    },
+    {
+      name: "the node pin reaches the node arm and only the node arm",
+      run() {
+        const fetch = SIDECARS.find((s) => s.name === "fetch");
+        const nodePin = nodePinFor(launcherRuntimeVars(FETCH_LAUNCHER));
+        // The box's own copies of the switches, which must decide nothing.
+        const inherited = { PATH: "/bin", FETCH_MCP_RUNTIME: "oam", FETCH_MCP_ALLOW_PRIVATE_HOSTS: "0" };
+        const ctx = (host) => ({ host, loopback: { url: "http://127.0.0.1:1/" } });
+        const oamEnv = armEnv("oam", fetch, fetch.call, ctx("oam"), nodePin, inherited);
+        const nodeEnv = armEnv("node", fetch, fetch.call, ctx("node"), nodePin, inherited);
+        assertDeep(
+          nodeEnv.FETCH_MCP_RUNTIME,
+          "node",
+          "the control runs on node, not on whatever oam its launcher would find",
+        );
+        assertDeep(
+          "FETCH_MCP_RUNTIME" in oamEnv,
+          false,
+          "the oam arm is never handed off to node, and the box's own setting is scrubbed",
+        );
+        for (const [k, v] of Object.entries(fetch.call.env(ctx("oam")))) {
+          assertDeep([oamEnv[k], nodeEnv[k]], [v, v], `the call's ${k} reaches both arms, over the box's own value`);
+        }
+      },
+    },
+    {
+      name: "a call the environment cannot support is demoted, never recorded as boot",
+      run() {
+        const fetch = SIDECARS.find((s) => s.name === "fetch");
+        const refused = "loopback fixture server: listen EACCES: permission denied 127.0.0.1";
+        assertDeep(
+          fetch.call.requires({ loopback: { error: refused } }),
+          refused,
+          "a fixture that could not listen is an unmet requirement, with its reason",
+        );
+        assertDeep(fetch.call.requires({ loopback: { url: "http://127.0.0.1:1/" } }), null, "a listening one meets it");
+        const v = uncalledVerdict(fetch, refused);
+        assertDeep(
+          v,
+          { state: "demoted", why: refused },
+          "recorded as boot, this exited 0 with the fetch assertion never run (fixed in 94d3792)",
+        );
+        assertDeep(exitCodeFor([{ state: "verified" }, v]), 3, "so the run is incomplete, not clean");
+        assertDeep(
+          uncalledVerdict({ bootOnly: "needs a tailnet" }, null),
+          { state: "boot", why: "needs a tailnet" },
+          "only a reviewed boot-only declaration skips the call without holding the gate",
+        );
+      },
+    },
+    {
+      name: "a node control whose probe failed is marked unable to probe, and exonerates nothing",
+      run() {
+        const oamCall = { ok: false, why: "tool reported an error: fetch failed" };
+        const dead = controlVerdict({ ok: false, why: "exited early (code 1) awaiting tools/list", depth: 0 });
+        assertDeep(
+          dead,
+          { ok: false, probeFailed: true, why: "node control could not probe: exited early (code 1) awaiting tools/list" },
+          "a control that never produced a call verdict is marked, not read as a failed call",
+        );
+        assertDeep(classifyCall(oamCall, dead, false).state, "fail", "so oam's failed call stands against it");
+        const answered = controlVerdict({ ok: true, tools: ["http_get"], call: oamCall });
+        assertDeep(answered, oamCall, "a control that answered is its answer, a failure included");
+        assertDeep(classifyCall(oamCall, answered, false).state, "upstream", "and that answer is evidence against the sidecar");
+      },
+    },
+    {
+      name: "the fetch call holds a 200 to the fixture's own body",
+      run() {
+        const { expect } = SIDECARS.find((s) => s.name === "fetch").call;
+        assertDeep(
+          expect(FETCH_REPLY_HEAD + FETCH_REPLY_BODIES.fixture),
+          null,
+          "the reply fetch-mcp actually returns for the fixture passes",
+        );
+        for (const what of ["empty", "foreign", "truncated"]) {
+          assertDeep(
+            typeof expect(FETCH_REPLY_HEAD + FETCH_REPLY_BODIES[what]),
+            "string",
+            `a 200 with a ${what} body fails: a lost or mangled body is oam's HTTP stack failing`,
+          );
+        }
+      },
+    },
   ];
 
   console.error("mcp-sidecar-matrix --self-test (offline)\n");
   let failures = 0;
   for (const c of cases) {
     try {
-      c.run();
+      await c.run();
       console.error(`  PASS  ${c.name}`);
     } catch (e) {
       failures += 1;
@@ -1476,13 +1712,19 @@ function probe(host, entry, { env, scriptArgs = [], call = null, ctx }) {
     // in: "boots but never answers a tool call" and "never boots" are different
     // bugs and used to print the same line.
     let awaiting = "tools/list";
+    // The same fact as a number, for classifyBoot to compare across arms: 0
+    // while booting, 1 + i while awaiting the i-th tools/call.
+    let depth = 0;
     let tools = [];
     let timer = null;
     const done = (result) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      teardown(child).then((left) => resolveP({ ...result, left, stderr }));
+      // Taken now: a reply that lands during teardown can still advance the
+      // exchange, and the verdict must describe where it stood when it failed.
+      const reached = depth;
+      teardown(child).then((left) => resolveP({ ...result, depth: reached, left, stderr }));
     };
     const wait = (what, ms) => {
       awaiting = what;
@@ -1507,6 +1749,7 @@ function probe(host, entry, { env, scriptArgs = [], call = null, ctx }) {
     let step = 0;
     const nextStep = () => {
       const s = steps[step];
+      depth = 1 + step;
       wait(`tools/call ${s.tool}`, CALL_TIMEOUT_MS);
       send({ jsonrpc: "2.0", id: 3 + step, method: "tools/call", params: { name: s.tool, arguments: s.args(ctx) } });
     };
@@ -1767,7 +2010,7 @@ if (argv.includes("--list")) {
 }
 // Before anything that touches the disk, the network, or oam -- the self-test
 // exists precisely so it can run where none of those are available.
-if (argv.includes("--self-test")) process.exit(selfTest());
+if (argv.includes("--self-test")) process.exit(await selfTest());
 if (selected.length === 0) {
   console.error(`no sidecar matches --only=${only}; try --list`);
   process.exit(2);
@@ -1843,7 +2086,7 @@ for (const s of selected) {
     record("skip", "its bin re-spawns oam and names no *_RUNTIME switch, so the node control arm cannot be pinned to node");
     continue;
   }
-  const nodePin = Object.fromEntries(pin.vars.map((v) => [v, "node"]));
+  const nodePin = nodePinFor(pin);
   const ctxFor = (host) => ({
     host,
     loopback: fixtures.loopback,
@@ -1851,8 +2094,7 @@ for (const s of selected) {
     browser: fixtures.browser,
     profileDir: join(profiles, `${s.name}-${host}`),
   });
-  const envFor = (host, call) =>
-    sidecarEnv(process.env, s.envPrefixes ?? [], s.env ?? {}, call?.env ? call.env(ctxFor(host)) : {}, host === "node" ? nodePin : {});
+  const envFor = (host, call) => armEnv(host, s, call, ctxFor(host), nodePin, process.env);
 
   // A call the environment cannot support is not attempted: the sidecar still
   // has to boot and serve tools on oam, and the row says exactly what was
@@ -1878,8 +2120,7 @@ for (const s of selected) {
     continue;
   }
   if (!call) {
-    const state = s.bootOnly ? "boot" : "demoted";
-    const reason = s.bootOnly ?? unmet;
+    const { state, why: reason } = uncalledVerdict(s, unmet);
     const v = classifyLeaks({ state }, oam.left, null);
     record(v.state, `${oam.tools.length} tools served, ${s.call?.tool ?? "no tool"} not called: ${v.why ?? reason}`, {
       why: v.why ?? reason,
@@ -1907,9 +2148,7 @@ for (const s of selected) {
   // let a REAL oam regression be excused as upstream whenever the control host
   // could not boot the sidecar (an engines bump past the release box's node,
   // say). A missing control must never exonerate oam.
-  const nodeVerdict = control.ok
-    ? (control.call ?? { ok: false, why: "node control returned no verdict" })
-    : { ok: false, probeFailed: true, why: `node control could not probe: ${control.why}` };
+  const nodeVerdict = controlVerdict(control);
 
   const v = classifyLeaks(
     classifyCall(oam.call, nodeVerdict, call.deterministic === true, call.unavailable),

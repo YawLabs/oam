@@ -56,7 +56,12 @@
 #                                            on fixtures, its position above the
 #                                            bump and the tag, and
 #                                            scripts/changelog-release.sh)
-#  14. miri aliasing models               (GATING when nightly+miri present,
+#      + mcp-sidecar-matrix.mjs --self-test (GATING when node is present --
+#                                            the release gate's own verdicts:
+#                                            whose fault a failed sidecar is,
+#                                            which arm gets the node pin, what
+#                                            an uncalled row counts as)
+#  14. miri aliasing models              (GATING when nightly+miri present,
 #                                            SKIPPED with a notice otherwise --
 #                                            machine-checks the raw-pointer
 #                                            disciplines napi.rs relies on)
@@ -611,7 +616,7 @@ else
   ok "npm launcher tests passed"
 fi
 
-say "13/14 Scripts (release-orchestration shell tests + changelog tooling)"
+say "13/14 Scripts (release-orchestration shell tests + changelog tooling + sidecar matrix self-test)"
 # GATING, and compiles nothing -- but NOT the ~2s this comment used to claim.
 # Measured on win-arm64: ~7m30s for 59 assertions (2026-08-30), then ~4m20s for
 # 107 (2026-09-09, after a batch of pure-function cases). The two are not
@@ -654,6 +659,23 @@ if bash scripts/test-changelog-tools.sh; then
   ok "changelog tooling tests passed"
 else
   ko "changelog tooling tests failed (see above) -- './scripts/test-changelog-tools.sh -v' for per-case detail"
+fi
+
+# Still step 13: the MCP sidecar matrix's offline self-test. The matrix gates
+# every release (release-local.sh runs it live against the staged binary), and
+# its self-test is what holds the matrix's own verdicts -- whose fault a failed
+# sidecar is, which arm is pinned to node, what an uncalled row counts as. It
+# ran in no gate until this block, so it guarded only when someone ran it by
+# hand, and a verdict mutation that turned an oam regression into a warn passed
+# every release. Offline by construction: no disk, network, npm or oam; one case
+# spawns a stand-in sidecar on node's own -e. Seconds. Skips without node, like
+# step 12 -- a full run cannot get this far without one anyway.
+if ! command -v node >/dev/null 2>&1; then
+  warn "sidecar matrix self-test SKIPPED -- no node on PATH"
+elif node scripts/mcp-sidecar-matrix.mjs --self-test; then
+  ok "sidecar matrix self-test passed"
+else
+  ko "sidecar matrix self-test failed (see above) -- reproduce with: node scripts/mcp-sidecar-matrix.mjs --self-test"
 fi
 
 say "14/14 Miri aliasing models (Stacked Borrows check on napi.rs's pointer disciplines)"
