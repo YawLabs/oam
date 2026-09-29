@@ -874,10 +874,11 @@ function respReply(argv) {
 // row whose call was never made counts as, what a control that never ran is
 // worth. Each once lived inline in the loop, where a mutation that flipped the
 // verdict still passed every case here; they are pure functions now (armEnv,
-// uncalledVerdict, controlVerdict) so they can be held. One case does spawn:
-// probe itself, against a stand-in sidecar on node's own `-e`, because the
-// depth classifyBoot compares is probe's to report. Still no disk, network,
-// npm or oam. scripts/ci-local.sh runs all of it (step 13).
+// uncalledVerdict, controlVerdict) so they can be held, and one case pins the
+// loop's calls to them at the source. One case does spawn: probe itself,
+// against a stand-in sidecar on node's own `-e`, because the depth
+// classifyBoot compares is probe's to report. No network, npm or oam, and no
+// disk beyond reading this file. scripts/ci-local.sh runs all of it (step 13).
 
 /** Compares by JSON shape -- the assertions here are all arrays of specs, and a
  *  printed expected-vs-actual is what makes a regression diagnosable. */
@@ -914,11 +915,13 @@ async function selfTest() {
     'const oam = findOam();',
     'child = spawn(oam, ["run", SERVER_ENTRY]);',
   ].join("\n");
-  // http_get replies captured verbatim from @yawlabs/fetch-mcp 0.8.1 on node
-  // v22.22.2 (2026-09-29): one against the fixture, three against bodies the
-  // call must not accept. All four came back as a 200 with isError false, so
-  // every one of them reaches the call's expect() -- that check is the only
-  // thing between a lost or mangled body and a PASS.
+  // The shape of the http_get reply @yawlabs/fetch-mcp 0.8.1 returns, captured
+  // on node v22.22.2 (2026-09-29) against the fixture and against bodies the
+  // call must not accept. Each came back as a 200 with isError false, so each
+  // reaches the call's expect(), and that check is all that stands between the
+  // reply and a PASS. What it holds is narrow: a 200 status line with its
+  // reason phrase, and the marker somewhere in the reply. A body that lost or
+  // mangled the marker fails; one damaged only AFTER the marker does not.
   const FETCH_REPLY_HEAD =
     "HTTP/1.1 200 OK\nURL: http://127.0.0.1:59791/\nDuration: 35ms\n\n--- Headers ---\n"
     + "connection: keep-alive\ncontent-type: application/json\ndate: Tue, 29 Sep 2026 10:41:58 GMT\n"
@@ -927,12 +930,19 @@ async function selfTest() {
     fixture: `--- Body (parsed JSON) ---\n{\n  "fixture": "${LOOPBACK_MARKER}"\n}`,
     empty: "--- Body ---\n",
     foreign: '--- Body (parsed JSON) ---\n{\n  "fixture": "somebody-else"\n}',
-    truncated: `--- Body ---\n{"fixture":"${LOOPBACK_MARKER.slice(0, 14)}`,
+    // Cut halfway through the marker, whatever its length -- a fixed cut would
+    // hold the whole marker once the marker got short enough, and pass. A body
+    // that does not parse is rendered raw under a plain "--- Body ---".
+    truncated: `--- Body ---\n{"fixture":"${LOOPBACK_MARKER.slice(0, Math.floor(LOOPBACK_MARKER.length / 2))}`,
   };
   // A stand-in sidecar on node's own `-e`: no file, no network, no oam. It
-  // answers initialize and tools/list like any MCP server, then dies the moment
-  // a tool is called -- what an oam crash mid-call leaves behind.
-  const DIES_ON_CALL = [
+  // answers initialize and tools/list like any MCP server and serves two tools,
+  // shaped like puppeteer's navigate-then-evaluate. It answers tools/calls until
+  // the Nth (argv[1], default 1), and dies on that one -- what an oam crash
+  // mid-call leaves behind, at whichever step it happens.
+  const STAND_IN = [
+    'const dieOn = Number(process.argv[1] ?? "1");',
+    "let calls = 0;",
     'let buf = "";',
     'process.stdin.on("data", (d) => {',
     "  buf += d;",
@@ -943,8 +953,9 @@ async function selfTest() {
     "    const m = JSON.parse(line);",
     '    const reply = (result) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result }) + "\\n");',
     '    if (m.method === "initialize") reply({ protocolVersion: "2024-11-05", capabilities: { tools: {} }, serverInfo: { name: "stand-in", version: "0" } });',
-    '    else if (m.method === "tools/list") reply({ tools: [{ name: "http_get", inputSchema: { type: "object" } }] });',
-    '    else if (m.method === "tools/call") process.exit(7);',
+    '    else if (m.method === "tools/list") reply({ tools: ["navigate", "evaluate"].map((name) => ({ name, inputSchema: { type: "object" } })) });',
+    '    else if (m.method === "tools/call" && ++calls >= dieOn) process.exit(7);',
+    '    else if (m.method === "tools/call") reply({ content: [{ type: "text", text: "ok" }] });',
     "  }",
     "});",
   ].join("\n");
@@ -1366,26 +1377,40 @@ async function selfTest() {
       name: "a failure mid-call is not excused by a control that never booted",
       async run() {
         // The one case that spawns: the depth classifyBoot compares is probe's
-        // to report, so probe itself is run, against the stand-in above.
-        const call = { tool: "http_get", args: () => ({}), expect: () => null };
+        // to report, so probe itself is run, against the stand-in above. The
+        // call has a setup step, like puppeteer's navigate before evaluate:
+        // depth has to count steps, or oam dying on the setup and node dying on
+        // the asserted call would read as one point, and as upstream.
+        const call = {
+          tool: "evaluate",
+          before: [{ tool: "navigate", args: () => ({}) }],
+          args: () => ({}),
+          expect: () => null,
+        };
         const env = { ...process.env, NO_COLOR: "1" };
-        const midCall = await probe("node", "-e", { env, scriptArgs: [DIES_ON_CALL], call, ctx: {} });
+        const at = (dieOn) => probe("node", "-e", { env, scriptArgs: [STAND_IN, String(dieOn)], call, ctx: {} });
         const noBoot = await probe("node", "-e", { env, scriptArgs: ["process.exit(9)"], call, ctx: {} });
+        const onSetup = await at(1);
+        const onCall = await at(2);
         assertDeep(
-          [midCall.ok, midCall.depth, noBoot.ok, noBoot.depth],
-          [false, 1, false, 0],
-          "probe reports how far each exchange got -- the fact the verdicts below turn on",
+          [noBoot.ok, noBoot.depth, onSetup.ok, onSetup.depth, onCall.ok, onCall.depth],
+          [false, 0, false, 1, false, 2],
+          "probe reports how far each exchange got, step by step -- the fact the verdicts below turn on",
         );
-        const v = classifyBoot(midCall, noBoot);
-        assertDeep(v.state, "fail", "an oam crash or hang mid-call stands when the control never reached the call");
-        assertDeep(/never got that far/.test(v.why), true, "and the reason says why the control is no evidence");
+        const shallower = classifyBoot(onCall, noBoot);
+        assertDeep(shallower.state, "fail", "an oam crash or hang mid-call stands when the control never reached the call");
+        assertDeep(/never got that far/.test(shallower.why), true, "and the reason says why the control is no evidence");
+        assertDeep(classifyBoot(onCall, onSetup).state, "fail", "a control that died on the setup step never reached the call either");
+        const deeper = classifyBoot(onSetup, onCall);
+        assertDeep(deeper.state, "fail", "a control that got past the step oam died on puts the failure on oam");
+        assertDeep(/got past that point/.test(deeper.why), true, "and the reason says the control went further");
         assertDeep(
-          classifyBoot(noBoot, midCall).state,
+          classifyBoot(noBoot, onSetup).state,
           "fail",
           "a control that booted where oam could not puts the boot failure on oam",
         );
         assertDeep(
-          classifyBoot(midCall, midCall).state,
+          classifyBoot(onCall, onCall).state,
           "upstream",
           "failing at the same point on both runtimes is still the sidecar's",
         );
@@ -1470,9 +1495,58 @@ async function selfTest() {
           assertDeep(
             typeof expect(FETCH_REPLY_HEAD + FETCH_REPLY_BODIES[what]),
             "string",
-            `a 200 with a ${what} body fails: a lost or mangled body is oam's HTTP stack failing`,
+            `a 200 with a ${what} body fails: the marker is missing, so the fixture's body did not arrive`,
           );
         }
+        // fetch-mcp prints `HTTP/1.1 ${status} ${statusText}` and trims the end,
+        // so a response whose reason phrase was lost reads "HTTP/1.1 200". The
+        // fixture sends "OK" and node reports it; oam dropping it is a real
+        // divergence, and the status check is the only thing that sees it.
+        assertDeep(
+          typeof expect(FETCH_REPLY_HEAD.replace("HTTP/1.1 200 OK", "HTTP/1.1 200") + FETCH_REPLY_BODIES.fixture),
+          "string",
+          "a 200 that lost its reason phrase fails, marker and all",
+        );
+      },
+    },
+    {
+      name: "the run loop decides through the extracted functions, not inline",
+      run() {
+        // The cases above hold armEnv, uncalledVerdict and controlVerdict, but
+        // the loop that calls them never runs offline. Handing every arm "oam",
+        // skipping armEnv, or inlining a verdict again would leave every case
+        // green while the release path changed -- mutation-tested, all three
+        // survived. So the loop's calls are pinned at the source, the way
+        // scripts/test-scripts.sh pins ci-local.sh's miri verdict functions.
+        // Reads this file and nothing else. The loop is found by its opening
+        // line at column 0, so this case's own copy of it, inside a string
+        // above, is not mistaken for it.
+        const source = readFileSync(new URL(import.meta.url), "utf8");
+        const start = source.search(/^for \(const s of selected\) \{/m);
+        assertDeep(start > 0, true, "the per-sidecar run loop is still where this case looks for it");
+        const loop = source.slice(start).replace(/\s+/g, " ");
+        const count = (needle) => loop.split(needle).length - 1;
+        const calls = [
+          ["const nodePin = nodePinFor(pin);", 1],
+          ["const envFor = (host, call) => armEnv(host, s, call, ctxFor(host), nodePin, process.env);", 1],
+          ['env: envFor("oam", call)', 1],
+          ['env: envFor("node", call)', 2],
+          ['const unmet = s.call?.requires ? await s.call.requires(ctxFor("oam")) : null;', 1],
+          ["uncalledVerdict(s, unmet)", 1],
+          ["classifyBoot(oam, control)", 1],
+          ["const nodeVerdict = controlVerdict(control);", 1],
+          ["classifyCall(oam.call, nodeVerdict,", 1],
+        ];
+        assertDeep(
+          calls.filter(([needle, n]) => count(needle) !== n).map(([needle, n]) => `${needle} (want ${n}, found ${count(needle)})`),
+          [],
+          "every arm's env, the uncalled-row verdict and the control's evidence go through the tested functions",
+        );
+        assertDeep(
+          ["sidecarEnv(", "probeFailed: true", '? "boot"'].filter((inline) => loop.includes(inline)),
+          [],
+          "and none of them is re-implemented inline beside the call",
+        );
       },
     },
   ];
