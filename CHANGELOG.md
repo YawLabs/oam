@@ -16,6 +16,37 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-09-29
+
+Release tooling only; no runtime behavior change.
+
+### Fixed
+
+- **The linux release leg died at 03:00, when its builder VM's cost-backstop stop schedule
+  fired mid-build** (#244). The run now detaches the VM's stop schedules for its duration and
+  re-attaches them on exit, a failed run included; `OAM_KEEP_VM_SCHEDULE=1` leaves them alone.
+- **The linux release leg reached its builder only through an IAP tunnel that took 11-57 s a
+  call and lost most of its probes** (#245). It now connects over direct ssh first, and falls
+  back to the tunnel, with a warning, when that fails.
+- **The mac build host's `target/` grew without bound, to 93 GB** (#246). The mac release leg
+  now reclaims space the way the linux leg does, and `gc-target.sh` prunes `deps/` on macOS
+  too, where BSD `find` and `awk` had silently disabled it. Off Windows, killing a release job
+  now kills its descendants too, instead of orphaning them.
+- **The MCP sidecar gate's fetch row had not exercised oam's HTTP stack since
+  `@yawlabs/fetch-mcp` 0.7.1** (#247). That release put private-host fetches behind an
+  operator opt-in that the gate scrubbed from the sidecar's environment, so the call was
+  refused on both runtimes and filed as a broken sidecar. The gate now sets
+  `FETCH_MCP_ALLOW_PRIVATE_HOSTS=1` for its own loopback fixture.
+- **The sidecar gate's own verdicts were checked by nothing that ran** (#248, #249, #250). Its
+  offline self-test now runs in `scripts/ci-local.sh` step 13 and holds each verdict, the run
+  loop's decisions included. An oam hang or crash mid-call is no longer excused as upstream by
+  a node control that never booted: the verdict compares how far each runtime got.
+- **A node control that cannot run a sidecar on the release box's node no longer exonerates
+  oam** (#251, #252, #253). An oam failure beside such a control was filed as upstream and
+  shipped on a warning. The gate now recognizes the refusal from the declared `engines.node` of
+  the sidecar and of every package in its installed dependency tree, and from the refusal text
+  fetch-mcp, tailscale-mcp and playwright print, and holds the failure against oam.
+
 ## [0.17.0] - 2026-09-24
 
 ### Added
@@ -3377,7 +3408,8 @@ releases.
 - The `fork` prewarm pool warms lazily, on first `fork()`.
 - `io_uring` read chunks grow from 64 KiB to 4 MiB, fixing large-file reads.
 
-[Unreleased]: https://github.com/YawLabs/oam/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/YawLabs/oam/compare/v0.17.1...HEAD
+[0.17.1]: https://github.com/YawLabs/oam/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/YawLabs/oam/compare/v0.16.4...v0.17.0
 [0.16.4]: https://github.com/YawLabs/oam/compare/v0.16.3...v0.16.4
 [0.16.3]: https://github.com/YawLabs/oam/compare/v0.16.2...v0.16.3
