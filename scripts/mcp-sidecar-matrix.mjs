@@ -614,8 +614,9 @@ function armEnv(host, s, call, ctx, nodePin, inherited) {
  * past the release box's node, say), and the release went out on a warn.
  *
  * Depth alone does not close that at the SAME point. An oam boot failure met
- * by a node control that refused this box's node (the sidecar's engines or
- * its launcher's floor, past the node the release box runs) is two arms
+ * by a node control that refused this box's node (an engines range anywhere
+ * in the sidecar's installed tree, or a floor its launcher or a dependency
+ * enforces at run time, past the node the release box runs) is two arms
  * failing at depth 0, and read as "node fails identically". `refused` is
  * nodeHostRefusal's answer for the control: when it names a reason, the
  * control ran nothing this sidecar supports, at any depth, and is no evidence.
@@ -845,12 +846,19 @@ function readManifestAt(dir) {
  *  nearest first, never inside a node_modules dir itself, starting from each
  *  package's own directory -- so a nested copy wins over a hoisted one, as it
  *  does at run time. dependencies, optionalDependencies and peerDependencies
- *  are followed (npm installs non-optional peers). One not on disk is skipped:
- *  npm leaves out an optional one it could not build, and one pruned from the
- *  stage that is only required lazily (the SDK's HTTP transports, on a stdio
- *  sidecar) never loads -- so what is read is what could run. Measured on the
- *  staged sidecars: 1 to 104 packages, under half a second each. `readManifest`
- *  is readManifestAt, injectable so the self-test walks a tree not on disk. */
+ *  are followed (npm installs non-optional peers). A package with no readable
+ *  manifest is skipped: an optional one npm left out, or the hollow folder a
+ *  damaged install leaves behind.
+ *
+ *  It reads what is INSTALLED, not what loads, on purpose. A stdio sidecar
+ *  never loads its SDK's HTTP-transport stack (express, hono, cors and their
+ *  dependencies -- most of memory's 73 ranges and fetch's 78), but that
+ *  stack is in its tree, and a floor raised there refuses the control too.
+ *  That errs the way this gate errs, toward holding a release: the row names
+ *  the package, and whether it loads on the failing path is the first thing to
+ *  check. Measured on a fresh stage (2026-09-29): trees of 1 to 117 packages,
+ *  each walked in well under a second. `readManifest` is readManifestAt,
+ *  injectable so the self-test walks a tree not on disk. */
 function engineRanges(root, readManifest = readManifestAt) {
   const names = (field) => (field && typeof field === "object" ? Object.keys(field) : []);
   const find = (from, name) => {
@@ -893,19 +901,21 @@ function engineRanges(root, readManifest = readManifestAt) {
  *  engineRanges' list for the sidecar, its own range and every installed
  *  dependency's -- when this box's node (`nodeVersion`) falls outside any of
  *  them: a dependency's floor binds the control as surely as the sidecar's,
- *  and it is the only floor a launcher-less sidecar may have (memory's SDK,
- *  puppeteer's 54 declared ranges). Second, a refusal on the control's
- *  `stderr`, for a floor enforced at run time and stricter than any declared
- *  one: fetch-mcp's and tailscale-mcp's launchers check NODE_MIN, and
- *  playwright-core refuses below 20 in words as well as in its engines. A
- *  floor no installed package declares and none prints -- an old node that
- *  crashes a sidecar in its own words -- still reads as the sidecar's; nothing
- *  on disk says otherwise. A range this cannot read decides nothing. */
+ *  and for a launcher-less sidecar (memory, puppeteer) it is the only floor
+ *  there is. Second, a refusal on the control's `stderr`, for a floor
+ *  enforced at run time that may be stricter than the declared ones, or
+ *  declared nowhere. Today each such check equals a declared range --
+ *  fetch-mcp's and tailscale-mcp's NODE_MIN and playwright-core's bootstrap
+ *  check (22.19.0, 20.11.0, 20) -- so this is the backstop for a launcher whose
+ *  floor moves ahead of its engines. A floor no installed package declares and
+ *  none prints -- an old node that crashes a sidecar in its own words -- still
+ *  reads as the sidecar's; nothing on disk says otherwise. A range this cannot
+ *  read decides nothing. */
 function nodeHostRefusal(engines, nodeVersion, stderr) {
   const outside = (engines ?? []).find(({ range }) => satisfiesNodeRange(range, nodeVersion) === false);
   if (outside) {
     return outside.dependency
-      ? `this box's node ${nodeVersion} is outside the engines "${outside.range}" of ${outside.pkg}, which the sidecar depends on`
+      ? `this box's node ${nodeVersion} is outside the engines "${outside.range}" of ${outside.pkg}, installed in the sidecar's dependency tree`
       : `this box's node ${nodeVersion} is outside the sidecar's engines "${outside.range}"`;
   }
   const said = String(stderr ?? "")
@@ -1840,12 +1850,17 @@ async function selfTest() {
         // Every distinct engines.node range declared anywhere in the nine
         // staged sidecars' installed trees admits node 22.22.2, the release
         // box's node -- so nothing is refused today, and no passing row can
-        // change. (2026-09-29, by engineRanges over the real stage: 27 distinct
-        // ranges from 71 declarations, in trees of 147 packages all told.)
+        // change. (2026-09-29, by engineRanges over a FRESH stage -- 221
+        // packages, none hollow: 41 distinct ranges from 225 declarations, in
+        // trees of 332 packages all told. A damaged stage, missing the SDK's
+        // HTTP stack, had shown 27.)
         const today = [
-          ">=18", ">=22.19.0", ">=14.0.0", ">=16.0.0", ">=20.11.0", ">=22", ">=20", ">=14", ">=6.0", ">= 10.17.0",
-          ">=0.4.0", ">= 14", ">=12", ">=10", ">=6", ">=8", ">=10.0.0", "6.* || 8.* || >= 10.*", ">=0.10.0", ">=4",
-          ">=6.9.0", "*", ">= 10.0.0", ">= 0.4.0", ">= 6.0.0", ">=7.0.0", ">=4.0",
+          ">=18", ">=20", ">= 0.6", ">= 0.10", ">= 8", ">=18.0.0", ">= 18", ">= 16",
+          ">=16.9.0", ">=16.20.0", ">=0.10.0", ">= 0.8", ">=8", ">=6.6.0", ">=6.0", ">= 18.0.0",
+          ">=0.6", ">= 12", ">= 0.4", ">=22.19.0", ">=14.0.0", ">=16.0.0", ">=20.11.0", ">=22",
+          ">=14", ">= 10.17.0", ">=0.4.0", ">= 14", ">=12", ">=10", ">=6", ">=10.0.0",
+          "6.* || 8.* || >= 10.*", ">=4", ">=6.9.0", "*", ">= 10.0.0", ">= 0.4.0", ">= 6.0.0", ">=7.0.0",
+          ">=4.0",
         ];
         const dep = (range) => ({ pkg: "some-dep@1.0.0", range, dependency: true });
         assertDeep(today.filter((range) => nodeHostRefusal([dep(range)], "22.22.2", "")), [], "today's floors refuse nothing");
@@ -1905,6 +1920,10 @@ async function selfTest() {
         put(["lib"], { name: "lib", version: "2.0.0", engines: { node: ">=99" } });
         put(["@s", "core"], { name: "@s/core", version: "2.0.0", dependencies: { deep: "^1" } });
         put(["deep"], { name: "deep", version: "1.0.0", engines: { node: ">=16" }, dependencies: "not-an-object" });
+        // What a malformed string field would reach if it were read as names:
+        // Object.keys("not-an-object") is "0".."12", and "0" is installed here,
+        // declaring a floor past every node. The walk must not follow it.
+        put(["0"], { name: "zero", version: "1.0.0", engines: { node: ">=99" } });
         put(["peer"], { name: "peer", version: "3.0.0", engines: { node: ">=14" } });
         const read = (dir) => tree.get(dir) ?? null;
         const ranges = engineRanges(join(nm, "app"), read);
