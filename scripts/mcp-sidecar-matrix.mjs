@@ -72,7 +72,10 @@
 // on oam; 1 when oam failed one; 3 when the matrix could not answer for one
 // (install failure, an install still damaged after a rebuild, broken
 // upstream, demoted fixture); 2 for bad usage, or when another run has held
-// the shared stage for longer than this one will wait.
+// the shared stage for longer than this one will wait. An interrupt (Ctrl-C,
+// SIGTERM, SIGHUP) ends npm first; then the matrix dies of the signal (on
+// Windows, exits STATUS_CONTROL_C_EXIT), so a calling script sees an
+// interrupt -- which release-local.sh treats as fatal.
 // =============================================================================
 
 import { spawn, spawnSync } from "node:child_process";
@@ -488,7 +491,8 @@ let ending = false;
 /** Run a command to completion, or -- once `timeoutMs` passes -- kill it and
  *  every process still under it (killTree). Resolves to spawnSync's result
  *  shape (`status`, `signal`, `stdout`, `stderr`, `error`; a timeout's error
- *  has code ETIMEDOUT), so npmFailureReason reads it unchanged.
+ *  has code ETIMEDOUT), so npmFailureReason reads it unchanged. `spawnFn` is a
+ *  seam for the self-test, to count what starts.
  *
  *  spawnSync's own timeout killed only the process it spawned. For npm on
  *  Windows that is the cmd.exe running npm.cmd: npm's node ran on under no one,
@@ -509,11 +513,17 @@ let ending = false;
  *
  *  Once the matrix is being ended, nothing here starts and nothing settles, so
  *  the run stops where it stands -- no retry of an install endRun just killed,
- *  no probe of a stage it is moving aside. */
-function runBounded(cmd, args, { timeoutMs, shell = false, env = process.env }) {
+ *  no probe of a stage it is moving aside. And nothing starts before one turn
+ *  of the event loop, which is where an interrupt is handled: one that arrived
+ *  during the synchronous work before this call (the startup sweep, the
+ *  fixture) then finds nothing in flight and ends the run at once, instead of
+ *  killing an npm started after the Ctrl-C and moving a whole, untouched
+ *  install aside as half-written. */
+async function runBounded(cmd, args, { timeoutMs, shell = false, env = process.env, spawnFn = spawn }) {
+  await new Promise((resolveTurn) => setImmediate(resolveTurn));
   return new Promise((resolveP) => {
     if (ending) return;
-    const child = spawn(cmd, args, { shell, env, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawnFn(cmd, args, { shell, env, stdio: ["ignore", "pipe", "pipe"] });
     inFlight.add(child);
     let stdout = "";
     let stderr = "";
@@ -565,29 +575,57 @@ function runBounded(cmd, args, { timeoutMs, shell = false, env = process.env }) 
  *  running 40s after the next -- an install still under way in the stage,
  *  which the matrix, gone at once, had left to the next run. So whatever
  *  runBounded has in flight is killed first, tree and all, and the
- *  half-written node_modules it leaves is moved aside, as after a timeout
- *  (npmInstall). Only then does the matrix exit, releasing the stage lock on
- *  the way. With nothing in flight, or on a second interrupt, it exits at once.
+ *  half-written node_modules it leaves is renamed aside, as after a timeout
+ *  (npmInstall) -- renamed only: deleting it is the next run's startup sweep,
+ *  so the exit does not wait on a delete, which blocks the event loop and with
+ *  it a second Ctrl-C. Then the stage lock is released and the matrix dies of
+ *  the interrupt (dieOf). With nothing in flight, or on a second interrupt, it
+ *  does that at once; a second interrupt during the rename's retries leaves
+ *  what is there to the next run's damage check.
  *
- *  Exits with 128 + the signal's number. `kill`, `wipe`, `exit` and `note`
- *  are seams for the self-test; production passes only the signal. */
+ *  The note is written after the kill: when the terminal has gone away
+ *  (SIGHUP), writing to it fails, and npm is dead by then.
+ *
+ *  `kill`, `wipe`, `release`, `die` and `note` are seams for the self-test;
+ *  production passes only the signal. */
 async function endRun(
   signal,
-  { kill = killTree, wipe = wipeStageModules, exit = (code) => process.exit(code), note = (line) => process.stderr.write(line) } = {},
+  {
+    kill = killTree,
+    wipe = () => wipeStageModules({ sweep: false }),
+    release = () => releaseLock(),
+    die = dieOf,
+    note = (line) => process.stderr.write(line),
+  } = {},
 ) {
-  const code = 128 + osConstants.signals[signal];
   const running = [...inFlight];
   const again = ending;
   ending = true;
-  if (again || running.length === 0) {
-    exit(code);
-    return;
+  if (!again && running.length > 0) {
+    for (const child of running) await kill(child.pid);
+    note(`\n  ${signal}: ended the npm install in flight; moving what it half-wrote aside\n`);
+    const stuck = await wipe();
+    if (stuck) note(`  could not move the stage's node_modules aside (${stuck}); the next run's damage check judges what is there\n`);
   }
-  note(`\n  ${signal}: ending the npm install in flight, and moving what it half-wrote aside\n`);
-  for (const child of running) await kill(child.pid);
-  const stuck = await wipe();
-  if (stuck) note(`  could not move the stage's node_modules aside (${stuck}); the next run's damage check judges what is there\n`);
-  exit(code);
+  release();
+  die(signal);
+}
+
+/** Die of `signal`, the way an interrupted process does, so whatever ran the
+ *  matrix sees an interrupt and not an exit it could take as handled. A shell
+ *  that sees its child exit normally after a Ctrl-C concludes the child dealt
+ *  with it and carries on: release-local.sh went on to cut the release when
+ *  endRun exited 130. On Windows that death is STATUS_CONTROL_C_EXIT, the
+ *  code node's own Ctrl-C handling ends a process with, and which Git Bash
+ *  reports as a death by SIGINT. Elsewhere it is the signal itself, raised again with no
+ *  listener left; that runs no 'exit' handler, so endRun releases the lock
+ *  first. Should the process outlive that, it exits 128 + the signal's number.
+ *  Self-contained, so the self-test can run it in a child of its own. */
+function dieOf(signal) {
+  if (process.platform === "win32") process.exit(0xc000013a);
+  process.removeAllListeners(signal);
+  process.kill(process.pid, signal);
+  setTimeout(() => process.exit(128 + osConstants.signals[signal]), 2_000);
 }
 
 /** Kill `pid` and every process under it. Windows walks the tree itself
@@ -729,7 +767,8 @@ function stageProblems(pkg) {
  *  is inside) stops halfway instead -- hidden lockfile gone, packages gone, a
  *  package cut mid-delete keeping its manifest but not its code, which the
  *  next install trusts and the damage check passes. What was moved aside is
- *  then deleted best effort (sweepStageTrash); a copy that will not go costs
+ *  then deleted best effort (sweepStageTrash) -- unless `sweep` is false, when
+ *  the next run's startup sweep deletes it; a copy that will not go costs
  *  disk, not correctness. npm puts no links in the stage, and a link would be
  *  moved or removed, never followed.
  *
@@ -737,7 +776,7 @@ function stageProblems(pkg) {
  *  an npm that ran out of time is killed, Windows has not yet let go of that
  *  process's open handles and cwd inside the tree: measured, the first rename
  *  failed with EPERM, and the same rename on the next timeout went through. */
-async function wipeStageModules() {
+async function wipeStageModules({ sweep = true } = {}) {
   const nm = join(stage, "node_modules");
   for (let attempt = 1; ; attempt++) {
     try {
@@ -749,7 +788,7 @@ async function wipeStageModules() {
       await sleep(WIPE_RETRY_MS);
     }
   }
-  sweepStageTrash();
+  if (sweep) sweepStageTrash();
   return null;
 }
 // About 3s in all: long enough for a killed process tree's handles to close,
@@ -785,6 +824,9 @@ function sweepStageTrash() {
 // self-test works it out from the constants and holds the stale age above it.
 const LOCK_WAIT_MS = 15 * 60_000;
 const LOCK_STALE_MS = 6 * 60 * 60_000;
+// Release the stage lock this run holds, if it still holds it; set by
+// lockStage once the lock is taken.
+let releaseLock = () => {};
 
 /** What to do about a stage lock another run holds: "stale" when its holder is
  *  gone or it is older than any run can last (take it over), else "wait". */
@@ -809,11 +851,11 @@ function pidAlive(pid) {
  *  hollow folders and empty lockfile entries the 2026-09-29 stage had -- and
  *  would now also have one run's rebuild moving node_modules out from under
  *  the other's probes. The lock is an exclusively created file holding the
- *  pid, released at exit when it is still ours -- an interrupt's exit
- *  included (endRun). A kill that runs no exit handler (taskkill, SIGKILL, a
- *  crash) leaves it behind, so a lock whose holder is gone, or that is older
- *  than any run, is taken over (lockVerdict); a live one is waited for, up to
- *  LOCK_WAIT_MS. */
+ *  pid, released at exit when it is still ours (releaseLock) -- and by endRun
+ *  before an interrupt's death, which runs no exit handler on POSIX. A kill
+ *  that runs no exit handler (taskkill, SIGKILL, a crash) leaves it behind, so
+ *  a lock whose holder is gone, or that is older than any run, is taken over
+ *  (lockVerdict); a live one is waited for, up to LOCK_WAIT_MS. */
 async function lockStage(lock) {
   const mine = `${process.pid}\n`;
   const deadline = Date.now() + LOCK_WAIT_MS;
@@ -821,13 +863,14 @@ async function lockStage(lock) {
   for (;;) {
     try {
       writeFileSync(lock, mine, { flag: "wx" });
-      process.on("exit", () => {
+      releaseLock = () => {
         try {
           if (readFileSync(lock, "utf8") === mine) rmSync(lock, { force: true });
         } catch {
           // Already gone.
         }
-      });
+      };
+      process.on("exit", () => releaseLock());
       return null;
     } catch (e) {
       if (e.code !== "EEXIST") return `cannot create the stage lock ${lock}: ${e.code ?? e.message}`;
@@ -1524,14 +1567,16 @@ function respReply(argv) {
 // uncalledVerdict, controlVerdict, binFor) so they can be held, and one case
 // pins the loop's calls to them at the source. So is the install the loop
 // runs over: settleInstall checks it whole, and rebuilds it once, before
-// anything is probed. Three cases spawn, all on node's own `-e`. Two run
+// anything is probed. Four cases spawn, all on node's own `-e`. Two run
 // stand-in sidecars, because what they hold is probe's to report: the depth
 // classifyBoot compares, and a control's stderr, including a refusal printed
 // by a detached child after its parent exited (that child exits by itself).
-// The third runs a stand-in install under a shell and lets it time out,
-// because the timeout must end the node under the shell -- it waits out that
-// 5s bound, which is most of the self-test's run time. No network, npm or
-// oam, and no disk beyond reading this file. scripts/ci-local.sh runs all of
+// The third runs a stand-in install -- a node, and a child of its, under a
+// shell -- and lets it time out, because the timeout must end both, not just
+// the shell; it waits out that 5s bound, which is most of the self-test's run
+// time. The fourth interrupts a stand-in install, which must die before the
+// matrix does, and has a node die of the interrupt the way the matrix does.
+// No network, npm or oam, and no disk beyond reading this file. scripts/ci-local.sh runs all of
 // it (step 13).
 
 /** Compares by JSON shape -- the assertions here are all arrays of specs, and a
@@ -2060,7 +2105,7 @@ async function selfTest() {
     {
       name: "a failure mid-call is not excused by a control that never booted",
       async run() {
-        // One of the three cases that spawn: the depth classifyBoot compares is probe's
+        // One of the four cases that spawn: the depth classifyBoot compares is probe's
         // to report, so probe itself is run, against the stand-in above. The
         // call has a setup step, like puppeteer's navigate before evaluate:
         // depth has to count steps, or oam dying on the setup and node dying on
@@ -2286,21 +2331,33 @@ async function selfTest() {
         );
         // And a Ctrl-C of the matrix reaches npm: no console of its own, no
         // process group of its own.
-        const boundedAt = source.search(/^function runBounded\(/m);
+        const boundedAt = source.search(/^async function runBounded\(cmd, args, \{ timeoutMs, shell = false, env = process\.env, spawnFn = spawn \}\) \{$/m);
         const boundedBody = boundedAt < 0 ? "" : source.slice(boundedAt, source.indexOf("\n}\n", boundedAt));
         assertDeep(
-          [boundedAt > 0, boundedBody.includes("spawn(cmd, args, {"), /windowsHide|detached/.test(boundedBody)],
+          [boundedAt > 0, boundedBody.includes("spawnFn(cmd, args, {"), /windowsHide|detached/.test(boundedBody)],
           [true, true, false],
           "runBounded's child shares the matrix's console and process group",
         );
         // And an interrupt, from the moment the stage is held until the run
-        // is done with it, ends npm first and releases the lock (endRun).
-        // (lockAt and installAt as found above.)
+        // is done with it, ends npm first and releases the lock (endRun) --
+        // with production's own kill, rename, release and death, which the
+        // interrupt case replaces and only the source shows. (lockAt and
+        // installAt as found above.)
         const signalsAt = source.search(/^for \(const signal of \["SIGINT", "SIGTERM", "SIGHUP"\]\) process\.on\(signal, \(\) => endRun\(signal\)\);$/m);
+        const guardAt = source.search(/^process\.stderr\.on\("error", \(\) => \{\}\);$/m);
+        const endAt = source.search(/^async function endRun\(/m);
+        const endHead = endAt < 0 ? "" : source.slice(endAt, source.indexOf("\n) {\n", endAt)).replace(/\s+/g, " ");
         assertDeep(
-          [lockAt > 0, signalsAt > lockAt, installAt > signalsAt],
-          [true, true, true],
-          "an interrupt once the stage is held goes through endRun, installs included",
+          [lockAt > 0, guardAt > lockAt, signalsAt > guardAt, installAt > signalsAt],
+          [true, true, true, true],
+          "an interrupt once the stage is held goes through endRun, installs included, and a terminal gone away cannot end the run first",
+        );
+        assertDeep(
+          endHead.includes(
+            "kill = killTree, wipe = () => wipeStageModules({ sweep: false }), release = () => releaseLock(), die = dieOf, note = (line) => process.stderr.write(line),",
+          ),
+          true,
+          "an interrupt kills npm's whole tree, renames what it half-wrote aside, releases the lock and dies of the signal",
         );
       },
     },
@@ -2344,11 +2401,13 @@ async function selfTest() {
         // process it started, after 'exit' has already fired. Detached, so it
         // outlives its parent's job object on Windows, and it prints the
         // moment it starts -- which is after its parent is gone. What this
-        // holds is that probe waits for the pipe to close, not that
-        // STDERR_DRAIN_MS is long enough: on a loaded box, where a fresh node
-        // can take seconds to start, this case missed the refusal once in ten
-        // runs under that cap. The pipe closes the moment the child exits, so
-        // the longer cap costs nothing when it passes.
+        // holds is that probe waits for the pipe to close, not how long:
+        // under STDERR_DRAIN_MS the case once missed the refusal on a loaded
+        // box (one run in ten), cause not established -- the hand-off itself
+        // measured under 1s to print even beside 24 CPU burners. The cap is
+        // the only timing in the case, so a long one takes timing out of it,
+        // and it costs nothing when the case passes: the pipe closes the
+        // moment the child exits.
         const late = `process.stderr.write(${JSON.stringify(say)});`;
         const handOff =
           'require("node:child_process").spawn(process.execPath, ["-e", '
@@ -2766,20 +2825,33 @@ async function selfTest() {
           [`npm install failed: ${npmFailureReason(rejected)}`, true, 0],
           "an install npm refused is reported by its reason, and the stage is left as it is",
         );
-        // A spawn that fails closes with the negated errno as its status.
+        // A spawn that fails closes with a negative libuv error code as its
+        // status (-2 for ENOENT on POSIX, -4058 on Windows); npmFailureReason
+        // reads only the error.
         const unspawned = await install(ran(-2, "", Object.assign(new Error("spawn npm ENOENT"), { code: "ENOENT" })));
         assertDeep([unspawned.said, unspawned.wipes], ["npm install failed: spawn npm ENOENT", 0], "as is one whose npm never started");
       },
     },
     {
-      name: "an interrupted run ends its npm before it exits",
+      name: "an interrupted run ends its npm, then dies of the interrupt",
       async run() {
         // A stand-in npm that never exits, in flight under runBounded, and an
-        // interrupt with the real tree kill and a recorded wipe and exit.
+        // interrupt with the real tree kill and a recorded rename, lock
+        // release and death. Every process runBounded starts here is counted
+        // and kept, so one started when none may be is seen -- and still
+        // cleaned up.
+        const children = [];
+        const spawnFn = (...spawnArgs) => {
+          const child = spawn(...spawnArgs);
+          children.push(child);
+          return child;
+        };
+        const standIn = ["-e", "setInterval(function () {}, 1000)"];
         let result = "pending";
-        runBounded(process.execPath, ["-e", "setInterval(function () {}, 1000)"], { timeoutMs: 60_000 }).then((r) => {
+        runBounded(process.execPath, standIn, { timeoutMs: 60_000, spawnFn }).then((r) => {
           result = r;
         });
+        for (let waited = 0; inFlight.size === 0 && waited < 3_000; waited += 20) await sleep(20);
         const pid = [...inFlight][0]?.pid;
         const steps = [];
         const seams = {
@@ -2791,18 +2863,21 @@ async function selfTest() {
             steps.push("wipe");
             return null;
           },
-          exit: (code) => steps.push(`exit ${code}`),
-          note: () => {},
+          release: () => steps.push("release"),
+          die: (signal) => steps.push(`die ${signal}`),
+          note: () => steps.push("note"),
         };
         let alive = true;
-        let started = "not started";
+        let started = 0;
         let steps1 = [];
         let idle = [];
         // `ending` is the whole module's: every later case needs runBounded
         // back, so it is reset however this one ends.
         try {
           // A second interrupt lands while the first is still killing, and
-          // does not wait for it: its exit comes before the first's wipe.
+          // does not wait for it: it releases the lock and dies before the
+          // first's rename. The first says what it did only once npm is dead
+          // -- a terminal gone away can fail that write.
           const firstEnding = endRun("SIGINT", seams);
           await endRun("SIGTERM", seams);
           await firstEnding;
@@ -2813,31 +2888,54 @@ async function selfTest() {
             alive = isAlive(pid);
           }
           await sleep(200); // room for a settle that must not happen
-          // Ending, nothing new starts: no retry of the install just killed.
-          const before = inFlight.size;
-          runBounded(process.execPath, ["-e", "setInterval(function () {}, 1000)"], { timeoutMs: 60_000 });
-          started = inFlight.size === before ? "not started" : "started";
-          // With no install in flight, an interrupt exits at once and moves
-          // nothing: the stage is whole, or the damage check's to judge.
+          // Nothing starts once the run is being ended -- not even an install
+          // called just before the interrupt was handled. That is the
+          // interrupt which arrived during synchronous work, and runBounded's
+          // turn before spawning is where it gets handled: endRun sets
+          // `ending` then, as here.
+          ending = false;
+          const before = children.length;
+          runBounded(process.execPath, standIn, { timeoutMs: 60_000, spawnFn });
+          ending = true;
+          await sleep(200);
+          started = children.length - before;
+          // With no install in flight, an interrupt releases the lock and dies
+          // at once, moving nothing: the stage is whole, or the damage check's
+          // to judge.
           ending = false;
           await endRun("SIGINT", seams);
           idle = steps.splice(0);
         } finally {
           ending = false;
-          for (const child of [...inFlight]) await killTree(child.pid);
-          if (Number.isInteger(pid) && isAlive(pid)) process.kill(pid); // leave nothing behind, even when the case fails
+          for (const child of children) if (child.exitCode === null && child.signalCode === null) await killTree(child.pid);
         }
         assertDeep(
           [Number.isInteger(pid), alive, result, started],
-          [true, false, "pending", "not started"],
-          "npm is killed before the matrix exits, and the run goes no further -- no result, nothing new started",
+          [true, false, "pending", 0],
+          "npm is killed before the matrix dies, and the run goes no further -- no result, nothing new started",
         );
         assertDeep(
           steps1,
-          ["kill", `exit ${128 + osConstants.signals.SIGTERM}`, "wipe", "exit 130"],
-          "its half-written tree is moved aside only once it is dead, then the matrix exits -- and a second interrupt exits at once",
+          ["kill", "release", "die SIGTERM", "note", "wipe", "release", "die SIGINT"],
+          "its half-written tree is moved aside only once it is dead, then the lock is released and the matrix dies -- and a second interrupt does that at once",
         );
-        assertDeep(idle, ["exit 130"], "an interrupt between installs exits at once, and moves nothing");
+        assertDeep(idle, ["release", "die SIGINT"], "an interrupt between installs releases the lock and dies at once, and moves nothing");
+        // And the death is an interrupt's, in a process of its own: dieOf must
+        // end it the way a Ctrl-C does -- STATUS_CONTROL_C_EXIT on Windows,
+        // the signal elsewhere -- never with an exit a calling shell could
+        // take as handled. The child holds a SIGINT listener, as the matrix
+        // does, which a re-raised signal must not land in; it would otherwise
+        // live 10s and exit 0.
+        const died = spawnSync(
+          process.execPath,
+          ["--input-type=module", "-e", `import { constants as osConstants } from "node:os";\n${dieOf}\nprocess.on("SIGINT", () => {});\ndieOf("SIGINT");\nsetTimeout(() => {}, 10_000);`],
+          { encoding: "utf8", timeout: 30_000 },
+        );
+        assertDeep(
+          [died.status, died.signal],
+          process.platform === "win32" ? [0xc000013a, null] : [null, "SIGINT"],
+          "the matrix dies of the interrupt, so a calling script stops too",
+        );
       },
     },
     {
@@ -3461,6 +3559,9 @@ if (lockProblem) {
   process.exit(2);
 }
 // From here on an interrupt ends npm before the matrix, and releases the lock.
+// A terminal that has gone away (SIGHUP) fails every write to it (EIO), which
+// with no listener would end the run -- before endRun has ended npm.
+process.stderr.on("error", () => {});
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, () => endRun(signal));
 sweepStageTrash();
 prepareFixture();

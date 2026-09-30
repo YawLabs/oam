@@ -59,6 +59,12 @@ Release tooling only; no runtime behavior change.
   installing into the stage while the gate retried the install and probed the sidecars. A
   timeout now kills npm and every process still under it, and moves the half-written
   `node_modules` aside, so the next install starts clean.
+- **A Ctrl-C of the sidecar gate left npm installing, and could let the release carry on**
+  (#258). npm takes an interrupt mid-install as the cue to finish its current step and roll
+  back, which ran on for over 40 seconds after the gate itself was gone. The gate now ends npm
+  first, moves what it half-wrote aside, releases its stage lock and dies of the interrupt. And
+  `release-local.sh` stops on a gate that was interrupted or killed, where it used to warn and
+  go on to publish.
 
 ## [0.17.0] - 2026-09-24
 

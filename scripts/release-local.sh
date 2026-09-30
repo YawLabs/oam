@@ -905,6 +905,14 @@ else
   OAM_BIN="$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe" node "$REPO_DIR/scripts/mcp-sidecar-matrix.mjs" --json="$matrix_report"
   matrix_status=$?
   set -e
+  # Above 128 is a gate killed by a signal -- Git Bash reports Windows'
+  # STATUS_CONTROL_C_EXIT as SIGINT, 130 -- or one that exited as if it had
+  # been. That is the operator stopping the release, or the gate dying
+  # mid-verdict, never "could not complete" -- and such a status used to fall
+  # into the warn below, which carries on to publish.
+  if [ "$matrix_status" -gt 128 ]; then
+    fail "sidecar matrix was interrupted or killed (status $matrix_status) -- stopping; nothing has been published"
+  fi
   case "$matrix_status" in
     0) ok "every oam-hosted sidecar answered a tool call on this build (report: $matrix_report)" ;;
     1) fail "a sidecar failed on this build -- see above; nothing has been published (report: $matrix_report)" ;;
