@@ -1225,6 +1225,19 @@ it "ci-local.sh runs the sidecar matrix self-test"
 if grep -qE '^[[:space:]]*(if|elif)[[:space:]]+node scripts/mcp-sidecar-matrix\.mjs --self-test;' scripts/ci-local.sh; then pass
 else fail "ci-local.sh no longer runs 'node scripts/mcp-sidecar-matrix.mjs --self-test' as a step's condition"; fi
 
+# The sidecar gate installs with no lifecycle script and no git: a script can
+# start a daemon that outlives npm, which no kill of npm's tree reaches, and
+# which ran on writing into the gate's stage. The self-test holds the arguments
+# too; this is the belt, should that pin be edited along with them.
+it "the sidecar matrix never runs install scripts or git"
+MX_ARGS_FN="$(awk '/^function npmInstallArgs\(/ { f = 1 } f { print } f && /^}$/ { exit }' scripts/mcp-sidecar-matrix.mjs)"
+MX_SEAL_MISSING=""
+for want in '"--ignore-scripts"' '`--script-shell=${join(dir, basename(NO_SCRIPT_SHELL))}`' '`--git=${join(dir, basename(NO_GIT))}`'; do
+  case "$MX_ARGS_FN" in *"$want"*) ;; *) MX_SEAL_MISSING="$MX_SEAL_MISSING $want" ;; esac
+done
+if [ -z "$MX_SEAL_MISSING" ] && grep -q 'npmInstallArgs(specs)' scripts/mcp-sidecar-matrix.mjs; then pass
+else fail "the matrix's npm install is no longer sealed (missing:${MX_SEAL_MISSING:- npmInstallArgs(specs) in npmInstall})"; fi
+
 # The release's own reading of the matrix's status, run as written: the lines
 # from `matrix_status=$?` to the `esac`, after a command that exits with each
 # status, with ok/warn/fail stubbed to say which fired. A gate killed by a

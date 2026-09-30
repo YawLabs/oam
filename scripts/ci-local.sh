@@ -668,11 +668,12 @@ fi
 # ran in no gate until this block, so it guarded only when someone ran it by
 # hand, and a verdict mutation that turned an oam regression into a warn passed
 # every release. Offline by construction: no network, npm or oam, and no disk
-# beyond reading its own source; four cases spawn on node's own -e: two
+# beyond reading its own source; five cases spawn on node's own -e: two
 # stand-in sidecars (one through a detached child that exits by itself), a
 # stand-in install -- a node, and a child of its, under a shell -- that is left
-# to time out and is killed with everything under it, and one more that an
-# interrupt of the run kills. About ten seconds on an idle box.
+# to time out and is killed with everything under it, one more that an
+# interrupt of the run kills, and a node handed npm's arguments the way npm is.
+# About ten seconds on an idle box.
 # Skips without node, like step 12 -- a full run cannot get this far without
 # one anyway.
 if ! command -v node >/dev/null 2>&1; then

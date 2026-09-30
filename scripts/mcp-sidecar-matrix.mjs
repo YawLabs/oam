@@ -100,6 +100,13 @@ const fixture = join(stage, "fixture");
 // one leak made the NEXT run die clearing it.
 const profilesRoot = join(stage, "profiles");
 const profiles = join(profilesRoot, `run-${process.pid}`);
+// What npm is handed as its script shell and as its git: two paths that are
+// never created. The install runs with --ignore-scripts, and anything that
+// would still run package code -- a git dependency's prepare, which npm 10
+// runs even then (measured) -- fails at spawn with ENOENT instead, and npm's
+// `syscall spawn <path>` line names which of the two it was (refusedReason).
+const NO_SCRIPT_SHELL = join(stage, "lifecycle-scripts-are-not-run-by-the-matrix");
+const NO_GIT = join(stage, "git-is-not-run-by-the-matrix");
 const FIXTURE_CONTEXT_FILE = "CLAUDE.md";
 const FIXTURE_CONTEXT_BODY =
   "# oam sidecar matrix fixture\n\nFixed input so a token count is deterministic.\n";
@@ -425,6 +432,26 @@ const SIDECARS = [
   },
 ];
 
+// The install scripts the matrix does not run and has READ, with why skipping
+// each keeps the test faithful. The gate installs with --ignore-scripts (see
+// npmInstall), so it installs each sidecar a little differently from npx, which
+// runs them; this table is where that difference is decided, one script at a
+// time. A sidecar whose installed tree holds a script missing from it is a
+// SKIP naming the script (binFor): a PASS on a tree whose install differs from
+// what users get could hide an untested native path. Matched exactly on name,
+// event and script text -- not on version -- so a changed script needs a fresh
+// look. On 2026-09-30 this one script was the only one in the nine sidecars'
+// 221 installed packages, and it did nothing under PUPPETEER_SKIP_DOWNLOAD=1;
+// the trees installed with and without scripts were byte-identical.
+const REVIEWED_INSTALL_SCRIPTS = [
+  {
+    name: "puppeteer",
+    event: "postinstall",
+    script: "node install.mjs",
+    why: "downloads Chrome for Testing into the user cache; the matrix drives the browser already on the box, and PUPPETEER_SKIP_DOWNLOAD=1 made it a no-op before scripts were turned off",
+  },
+];
+
 const BOOT_TIMEOUT_MS = 90_000;
 const CALL_TIMEOUT_MS = 60_000;
 const INSTALL_TIMEOUT_MS = 300_000;
@@ -449,26 +476,73 @@ const PROCESS_TABLE_TIMEOUT_MS = 60_000;
 // Only something outside the killed tree holding them makes it run out.
 const CLOSE_AFTER_KILL_MS = 10_000;
 
-/** `npm install --no-save <specs...>` into the shared stage, bounded by
- *  INSTALL_TIMEOUT_MS -- and a timeout ends npm, not just its shell
- *  (runBounded). `run` and `wipe` are seams like installAll's: production
- *  passes nothing, and the self-test hands in a timed-out or failed run to
- *  hold what each one leaves behind. */
-async function npmInstall(specs, { run = runBounded, wipe = wipeStageModules } = {}) {
-  const r = await run(
-    process.platform === "win32" ? "npm.cmd" : "npm",
-    ["install", "--no-save", "--no-audit", "--no-fund", "--prefix", stage, ...specs],
-    {
-      timeoutMs: INSTALL_TIMEOUT_MS,
-      shell: process.platform === "win32",
-      // puppeteer's postinstall downloads its own Chrome, and a half-extracted
-      // copy left in the user cache by an interrupted download fails that
-      // postinstall -- which failed the whole batch and SKIPPED puppeteer on
-      // 2026-09-12. The matrix drives the browser already on the box, so the
-      // download buys nothing and can only break the install.
-      env: { ...process.env, PUPPETEER_SKIP_DOWNLOAD: "1" },
-    },
-  );
+/** The arguments of the matrix's `npm install` of `specs` into `dir` (the
+ *  stage), for `platform`.
+ *
+ *  Sealed: --ignore-scripts, and a script shell and a git that do not exist
+ *  (NO_SCRIPT_SHELL, NO_GIT). An install then starts no process but npm (and,
+ *  on Windows, the cmd.exe around npm.cmd), so the tree kill on a timeout or
+ *  an interrupt reaches everything an install started. A lifecycle script can
+ *  start a process that outlives its parent -- a daemon -- which is no longer
+ *  under npm, so no tree kill finds it: measured, a preinstall's detached
+ *  child survived the timeout's kill, went on running in the stage, and made
+ *  the next rename of node_modules fail with EPERM. Which scripts that skips,
+ *  and why skipping them keeps the test faithful, is REVIEWED_INSTALL_SCRIPTS.
+ *
+ *  On Windows npm runs through cmd.exe (shell: true), which splits its command
+ *  line on spaces, so every path is quoted: unquoted, a stage under a user
+ *  name with a space became two arguments. A `%` cannot be quoted past cmd.exe
+ *  at all; stagePathProblem refuses such a stage before npm runs. */
+function npmInstallArgs(specs, { dir = stage, platform = process.platform } = {}) {
+  const quoted = (arg) => (platform === "win32" ? `"${arg}"` : arg);
+  return [
+    "install",
+    "--no-save",
+    "--no-audit",
+    "--no-fund",
+    "--ignore-scripts",
+    quoted(`--script-shell=${join(dir, basename(NO_SCRIPT_SHELL))}`),
+    quoted(`--git=${join(dir, basename(NO_GIT))}`),
+    "--prefix",
+    quoted(dir),
+    ...specs,
+  ];
+}
+
+/** Why `dir` cannot be handed to npm on `platform`, or null. cmd.exe expands
+ *  %NAME% even inside quotes, and a quote in a path cannot get past it. */
+function stagePathProblem(dir, platform = process.platform) {
+  if (platform === "win32" && /[%"]/.test(dir)) {
+    return `the stage path ${dir} holds a % or ", which cmd.exe (npm.cmd's shell) would rewrite -- point TEMP at a path without one`;
+  }
+  return null;
+}
+
+/** `npm install --no-save <specs...>` into the shared stage, sealed
+ *  (npmInstallArgs) and bounded by INSTALL_TIMEOUT_MS -- and a timeout ends
+ *  npm, not just its shell (runBounded). `run`, `wipe` and `exists` are seams
+ *  like installAll's: production passes nothing, and the self-test hands in a
+ *  timed-out or failed run, or a planted refuser, to hold what each one
+ *  leaves behind. */
+async function npmInstall(specs, { run = runBounded, wipe = wipeStageModules, exists = existsSync } = {}) {
+  const badStage = stagePathProblem(stage);
+  if (badStage) return `npm install refused: ${badStage}`;
+  // Something at a refuser's path would be run by npm as its script shell or
+  // its git. Nothing the matrix does creates either, so one there was put
+  // there.
+  const planted = [NO_SCRIPT_SHELL, NO_GIT].find((path) => exists(path));
+  if (planted) return `npm install refused: ${planted} exists, and the matrix will not hand it to npm as its script shell or its git -- remove it`;
+  const r = await run(process.platform === "win32" ? "npm.cmd" : "npm", npmInstallArgs(specs), {
+    timeoutMs: INSTALL_TIMEOUT_MS,
+    shell: process.platform === "win32",
+    // A belt: scripts are off, so puppeteer's postinstall, which downloads its
+    // own Chrome, does not run. Should puppeteer ever get a reviewed path to
+    // run it, the download stays off: the matrix drives the browser already
+    // on the box, and a half-extracted copy an interrupted download left in
+    // the user cache failed that postinstall and SKIPPED puppeteer on
+    // 2026-09-12.
+    env: { ...process.env, PUPPETEER_SKIP_DOWNLOAD: "1" },
+  });
   if (r.status === 0) return null;
   if (r.error?.code === "ETIMEDOUT") {
     // npm was killed mid-install, so what it left can hold a package whose
@@ -501,9 +575,10 @@ let ending = false;
  *  still writing into the stage that the next install and the probes use --
  *  the kind of concurrent write that leaves hollow folders. Elsewhere it is npm
  *  itself, and the lifecycle scripts npm started ran on. So the whole tree goes.
- *  What the tree kill cannot find is a process whose parent exited before the
- *  timeout -- a daemon a lifecycle script left behind is no longer under npm.
- *  No sidecar the matrix installs starts one.
+ *  What a tree kill cannot find is a process whose parent exited before it --
+ *  a daemon a lifecycle script left behind is no longer under npm. The matrix's
+ *  installs run no lifecycle script (npmInstallArgs), so everything an install
+ *  starts is npm, under the kill.
  *
  *  An interrupt of the matrix ends npm too: endRun kills what is in flight
  *  here before the matrix exits. npm also stays where a Ctrl-C at the terminal,
@@ -666,10 +741,14 @@ async function killTree(pid) {
  *  made every SKIP undiagnosable. The first `npm error` line carries the code
  *  (E404, EACCES). Warnings are never the reason: with no error line, the
  *  first line used to be a deprecation notice, printed as the cause of an
- *  install that had actually been killed by the timeout. */
+ *  install that had actually been killed by the timeout. An install refused
+ *  for wanting a script or git the matrix does not run is said in those words
+ *  (refusedReason): npm's own lines are a bare ENOENT. */
 function npmFailureReason(r) {
   if (r.error?.code === "ETIMEDOUT") return `timed out after ${INSTALL_TIMEOUT_MS / 1000}s`;
   if (r.error) return r.error.message;
+  const refused = refusedReason(r.stderr);
+  if (refused) return refused;
   const lines = (r.stderr || "")
     .split("\n")
     .map((l) => l.trim())
@@ -679,6 +758,29 @@ function npmFailureReason(r) {
     ?? lines[0]
     ?? (r.signal ? `killed by ${r.signal}` : `exited ${r.status} with no error output`)
   );
+}
+
+/** The reason an install was refused for wanting what the matrix does not run
+ *  -- git, or a lifecycle script -- or null when that is not why it failed.
+ *  npm reports either as a spawn of the refuser that failed, `npm error syscall
+ *  spawn <path>`, and the two refusers' names differ, so the line says which.
+ *  For a script, the `npm error path` line names the package: the last
+ *  node_modules segment in it, scope included. A path in npm's cache is a git
+ *  dependency's clone, whose prepare npm 10 runs even with --ignore-scripts. */
+function refusedReason(stderr) {
+  const lines = (stderr || "").split("\n").map((l) => l.trim());
+  const spawned = lines.find((l) => /^npm (error|ERR!) syscall spawn /.test(l)) ?? "";
+  if (spawned.includes(basename(NO_GIT))) {
+    return "its dependency tree has a git dependency, and the matrix runs no git: it installs only what the registry serves";
+  }
+  if (!spawned.includes(basename(NO_SCRIPT_SHELL))) return null;
+  const at = lines.find((l) => /^npm (error|ERR!) path /.test(l)) ?? "";
+  if (/[\\/]_cacache[\\/]tmp[\\/]git-clone/.test(at)) {
+    return "a git dependency in its tree runs a prepare script to build, and the matrix runs no lifecycle script";
+  }
+  const named = [...at.matchAll(/node_modules[\\/]((?:@[^\\/\s]+[\\/])?[^\\/\s]+)/g)].pop();
+  const pkg = named ? named[1].replace(/\\/g, "/") : "a package";
+  return `${pkg} cannot install without running a lifecycle script, and the matrix runs none`;
 }
 
 /** Install every selected package in ONE npm call.
@@ -951,13 +1053,25 @@ function describeDamage(damaged) {
 
 /** What the run loop probes for `pkg`: its install error if npm failed it;
  *  a SKIP-shaped error naming what is missing if settleInstall left its tree
- *  damaged (with the version still reported); otherwise `resolve(pkg)`. */
+ *  damaged, or naming the install scripts in its tree that nobody reviewed
+ *  (REVIEWED_INSTALL_SCRIPTS) -- the version still reported either way;
+ *  otherwise `resolve(pkg)`. */
 function binFor(pkg, installErrors, damaged, rebuilt, resolve) {
   if (installErrors.has(pkg)) return { error: installErrors.get(pkg) };
   const bin = resolve(pkg);
-  if (bin.error || !damaged.has(pkg)) return bin;
-  const after = rebuilt ? " even after the stage was rebuilt" : "";
-  return { error: `its install is not whole${after}: ${describeProblems(damaged.get(pkg))}`, version: bin.version };
+  if (bin.error) return bin;
+  if (damaged.has(pkg)) {
+    const after = rebuilt ? " even after the stage was rebuilt" : "";
+    return { error: `its install is not whole${after}: ${describeProblems(damaged.get(pkg))}`, version: bin.version };
+  }
+  const unreviewed = unreviewedScripts(bin.scripts ?? []);
+  if (unreviewed.length > 0) {
+    return {
+      error: `its install tree has ${unreviewed.length === 1 ? "an install script" : "install scripts"} the matrix does not run and nobody has reviewed: ${describeScripts(unreviewed)} -- read it, then list it in REVIEWED_INSTALL_SCRIPTS with why skipping it keeps the test faithful`,
+      version: bin.version,
+    };
+  }
+  return bin;
 }
 
 // =============================================================================
@@ -1312,18 +1426,22 @@ function parseManifest(text) {
  *  each walked in well under a second. `readManifest` is readManifestAt,
  *  injectable so the self-test walks a tree not on disk. */
 function engineRanges(root, readManifest = readManifestAt) {
+  return closureFacts(root, readManifest, () => false).engines;
+}
+
+/** Every package installed for the one at `root`, itself included, handed to
+ *  `visit({ at, manifest })` once each -- engineRanges' walk, which says how
+ *  dependencies are found and which are followed. */
+function walkClosure(root, readManifest, visit) {
   const top = readManifest(root);
-  if (!top) return [];
-  const ranges = [];
+  if (!top) return;
   const seen = new Set();
   const queue = [{ at: root, manifest: top }];
   while (queue.length > 0) {
     const { at, manifest } = queue.shift();
     if (seen.has(at)) continue;
     seen.add(at);
-    if (typeof manifest.engines?.node === "string") {
-      ranges.push({ pkg: `${manifest.name}@${manifest.version}`, range: manifest.engines.node, dependency: at !== root });
-    }
+    visit({ at, manifest });
     const deps = new Set([
       ...fieldNames(manifest.dependencies),
       ...fieldNames(manifest.optionalDependencies),
@@ -1334,7 +1452,52 @@ function engineRanges(root, readManifest = readManifestAt) {
       if (found && !seen.has(found.at)) queue.push(found);
     }
   }
-  return ranges;
+}
+
+/** The install scripts of the package at `at`, as `{ pkg: "name@version",
+ *  name, event, script }`: the ones npm runs on install -- preinstall,
+ *  install, postinstall -- plus the one npm makes up, `install: node-gyp
+ *  rebuild` for a package with a binding.gyp, no install or preinstall script
+ *  of its own and `gypfile` not false. prepare is not an install script of an
+ *  installed package. `exists` is injectable for the self-test. */
+function installScriptsOf(at, manifest, exists = existsSync) {
+  const pkg = `${manifest.name}@${manifest.version}`;
+  const scripts = manifest.scripts && typeof manifest.scripts === "object" ? manifest.scripts : {};
+  const found = ["preinstall", "install", "postinstall"]
+    .filter((event) => typeof scripts[event] === "string" && scripts[event].trim() !== "")
+    .map((event) => ({ pkg, name: manifest.name, event, script: scripts[event] }));
+  const own = (event) => found.some((s) => s.event === event);
+  if (!own("install") && !own("preinstall") && manifest.gypfile !== false && exists(join(at, "binding.gyp"))) {
+    found.push({ pkg, name: manifest.name, event: "install", script: "node-gyp rebuild" });
+  }
+  return found;
+}
+
+/** What the run loop needs from the tree installed for the package at `root`,
+ *  from ONE walk: its engines floors (engineRanges' entries) and its install
+ *  scripts (installScriptsOf). */
+function closureFacts(root, readManifest = readManifestAt, exists = existsSync) {
+  const engines = [];
+  const scripts = [];
+  walkClosure(root, readManifest, ({ at, manifest }) => {
+    if (typeof manifest.engines?.node === "string") {
+      engines.push({ pkg: `${manifest.name}@${manifest.version}`, range: manifest.engines.node, dependency: at !== root });
+    }
+    scripts.push(...installScriptsOf(at, manifest, exists));
+  });
+  return { engines, scripts };
+}
+
+/** The scripts in `scripts` with no exact match -- name, event and script
+ *  text -- in `reviewed`. */
+function unreviewedScripts(scripts, reviewed = REVIEWED_INSTALL_SCRIPTS) {
+  return scripts.filter((s) => !reviewed.some((r) => r.name === s.name && r.event === s.event && r.script === s.script));
+}
+
+/** Install scripts for one row: `pkg event \`script\``, two at most. */
+function describeScripts(scripts) {
+  const shown = scripts.slice(0, 2).map((s) => `${s.pkg} ${s.event} \`${s.script}\``).join("; ");
+  return scripts.length > 2 ? `${shown}; ${scripts.length - 2} more` : shown;
 }
 
 /** The keys of a package.json dependency field, or none when the field is
@@ -1594,7 +1757,7 @@ function respReply(argv) {
 // uncalledVerdict, controlVerdict, binFor) so they can be held, and one case
 // pins the loop's calls to them at the source. So is the install the loop
 // runs over: settleInstall checks it whole, and rebuilds it once, before
-// anything is probed. Four cases spawn, all on node's own `-e`. Two run
+// anything is probed. Five cases spawn, all on node's own `-e`. Two run
 // stand-in sidecars, because what they hold is probe's to report: the depth
 // classifyBoot compares, and a control's stderr, including a refusal printed
 // by a detached child after its parent exited (that child exits by itself).
@@ -1603,8 +1766,9 @@ function respReply(argv) {
 // the shell; it waits out that 5s bound, which is most of the self-test's run
 // time. The fourth interrupts a stand-in install, which must die before the
 // matrix does, and has a node die of the interrupt the way the matrix does.
-// No network, npm or oam, and no disk beyond reading this file. scripts/ci-local.sh runs all of
-// it (step 13).
+// The fifth hands npm's arguments to a node spawned the way npm is, which must
+// get each quoted path whole. No network, npm or oam, and no disk beyond
+// reading this file. scripts/ci-local.sh runs all of it (step 13).
 
 /** Compares by JSON shape -- the assertions here are all arrays of specs, and a
  *  printed expected-vs-actual is what makes a regression diagnosable. */
@@ -2132,7 +2296,7 @@ async function selfTest() {
     {
       name: "a failure mid-call is not excused by a control that never booted",
       async run() {
-        // One of the four cases that spawn: the depth classifyBoot compares is probe's
+        // One of the five cases that spawn: the depth classifyBoot compares is probe's
         // to report, so probe itself is run, against the stand-in above. The
         // call has a setup step, like puppeteer's navigate before evaluate:
         // depth has to count steps, or oam dying on the setup and node dying on
@@ -2329,32 +2493,36 @@ async function selfTest() {
           [true, true, true, true],
           "the stage lock is taken before anything under the stage is swept, wiped or installed",
         );
-        // bin.engines comes from resolveBin, outside the loop. Dropped there,
-        // or cut back to the sidecar's own range, the floors of every sidecar
-        // -- or of every dependency -- would go unchecked. Its body is found by
-        // its column-0 declaration, like the loop, so the quotes of it in this
-        // case do not answer for it.
+        // bin.engines and bin.scripts come from resolveBin, outside the loop.
+        // Dropped there, or cut back to the sidecar's own manifest, the floors
+        // of every sidecar -- or of every dependency -- would go unchecked, and
+        // so would the install scripts binFor holds against the review. Its
+        // body is found by its column-0 declaration, like the loop, so the
+        // quotes of it in this case do not answer for it.
         const at = source.search(/^function resolveBin\(/m);
         const resolveBinBody = source.slice(at, source.indexOf("\n}\n", at)).replace(/\s+/g, " ");
         assertDeep(
-          ["return { entry, version: manifest.version, engines: engineRanges(dir) };"].filter(
-            (needle) => at < 0 || !resolveBinBody.includes(needle),
-          ),
+          [
+            "const { engines, scripts } = closureFacts(dir);",
+            "return { entry, version: manifest.version, engines, scripts };",
+          ].filter((needle) => at < 0 || !resolveBinBody.includes(needle)),
           [],
-          "resolveBin hands the loop the engines ranges of each sidecar and its whole installed tree",
+          "resolveBin hands the loop the engines ranges and the install scripts of each sidecar's whole installed tree",
         );
         // npm runs through runBounded, whose timeout ends npm and every process
         // under it. A spawnSync back in its place would bring back the orphan:
         // its timeout kills the shell and leaves npm writing into the stage.
         // What npmInstall does with each result is held by running it (see
         // "what a failed install leaves behind"); these are the defaults
-        // production gets, which only the source shows.
-        const npmAt = source.search(/^async function npmInstall\(specs, \{ run = runBounded, wipe = wipeStageModules \} = \{\}\) \{$/m);
+        // production gets, which only the source shows -- and it installs with
+        // npmInstallArgs, sealed, which the case "an install runs no lifecycle
+        // script" holds.
+        const npmAt = source.search(/^async function npmInstall\(specs, \{ run = runBounded, wipe = wipeStageModules, exists = existsSync \} = \{\}\) \{$/m);
         const npmBody = npmAt < 0 ? "" : source.slice(npmAt, source.indexOf("\n}\n", npmAt));
         assertDeep(
-          [npmAt > 0, npmBody.includes("await run("), npmBody.includes("spawnSync(")],
-          [true, true, false],
-          "npm installs are bounded by runBounded and cleaned up by wipeStageModules, never by spawnSync's own timeout",
+          [npmAt > 0, npmBody.includes("await run("), npmBody.includes("npmInstallArgs(specs)"), npmBody.includes("spawnSync(")],
+          [true, true, true, false],
+          "npm installs are sealed, bounded by runBounded and cleaned up by wipeStageModules, never by spawnSync's own timeout",
         );
         // And a Ctrl-C of the matrix reaches npm: no console of its own, no
         // process group of its own.
@@ -2815,7 +2983,7 @@ async function selfTest() {
         // replaced: which result moves the stage's node_modules aside is the
         // decision, and a source check could not tell a wipe inside the
         // timeout's branch from one after it, or after its return.
-        const install = async (result, wipeSays = null) => {
+        const install = async (result, wipeSays = null, exists = () => false) => {
           const calls = [];
           let wipes = 0;
           const said = await npmInstall(["a@latest", "b@latest"], {
@@ -2827,6 +2995,7 @@ async function selfTest() {
               wipes++;
               return wipeSays;
             },
+            exists,
           });
           return { said, calls, wipes };
         };
@@ -2841,13 +3010,23 @@ async function selfTest() {
           [
             1,
             process.platform === "win32" ? "npm.cmd" : "npm",
-            ["install", "--no-save", "--no-audit", "--no-fund", "--prefix", stage, "a@latest", "b@latest"],
+            npmInstallArgs(["a@latest", "b@latest"]),
             INSTALL_TIMEOUT_MS,
             process.platform === "win32",
             "1",
           ],
-          "npm installs the specs into the stage, once, bounded by INSTALL_TIMEOUT_MS, without puppeteer's Chrome download",
+          "npm installs the specs into the stage, once, sealed, bounded by INSTALL_TIMEOUT_MS, without puppeteer's Chrome download",
         );
+        // A refuser that exists would be run by npm as its script shell or
+        // git: the install is refused, and npm never starts.
+        for (const planted of [NO_SCRIPT_SHELL, NO_GIT]) {
+          const refused = await install(ran(0), null, (path) => path === planted);
+          assertDeep(
+            [refused.calls.length, refused.said?.startsWith(`npm install refused: ${planted} exists`)],
+            [0, true],
+            `an install whose ${basename(planted)} exists is refused before npm runs`,
+          );
+        }
 
         const killed = await install(timedOut);
         assertDeep(
@@ -2881,6 +3060,173 @@ async function selfTest() {
         // reads only the error.
         const unspawned = await install(ran(-2, "", Object.assign(new Error("spawn npm ENOENT"), { code: "ENOENT" })));
         assertDeep([unspawned.said, unspawned.wipes], ["npm install failed: spawn npm ENOENT", 0], "as is one whose npm never started");
+      },
+    },
+    {
+      name: "an install runs no lifecycle script, and a script it would need is named",
+      run() {
+        // The arguments. Sealed everywhere; on Windows every path is quoted,
+        // since cmd.exe splits the command line on spaces and a user name
+        // with one split the stage in two.
+        const spaced = join("/", "Users", "A B", "Temp", "oam-mcp-matrix");
+        const shellAt = join(spaced, basename(NO_SCRIPT_SHELL));
+        const gitAt = join(spaced, basename(NO_GIT));
+        const sealed = (q) => [
+          "install", "--no-save", "--no-audit", "--no-fund", "--ignore-scripts",
+          q(`--script-shell=${shellAt}`), q(`--git=${gitAt}`), "--prefix", q(spaced), "x@latest",
+        ];
+        assertDeep(npmInstallArgs(["x@latest"], { dir: spaced, platform: "win32" }), sealed((a) => `"${a}"`), "on Windows the install is sealed and every path quoted");
+        assertDeep(npmInstallArgs(["x@latest"], { dir: spaced, platform: "linux" }), sealed((a) => a), "elsewhere it is sealed and nothing is quoted");
+        assertDeep(
+          [dirname(NO_SCRIPT_SHELL) === stage, dirname(NO_GIT) === stage, basename(NO_SCRIPT_SHELL) !== basename(NO_GIT)],
+          [true, true, true],
+          "the two refusers live in the stage the run holds, under names that tell them apart",
+        );
+        // And they arrive whole: spawned the way npmInstall spawns (through
+        // cmd.exe on Windows), a node that prints its argv gets each path as
+        // one argument, space and all.
+        const printArgv = "process.stdout.write(JSON.stringify(process.argv.slice(1)))";
+        const viaShell = process.platform === "win32";
+        const echoed = spawnSync(
+          viaShell ? `"${process.execPath}"` : process.execPath,
+          ["-e", viaShell ? `"${printArgv}"` : printArgv, ...npmInstallArgs(["x@latest"], { dir: spaced })],
+          { shell: viaShell, encoding: "utf8", timeout: 30_000 },
+        );
+        assertDeep(JSON.parse(echoed.stdout || "null"), sealed((a) => a), "the quoted paths reach the program as single arguments");
+        assertDeep(
+          [
+            stagePathProblem(join("/", "Users", "%USERNAME%", "Temp"), "win32") !== null,
+            stagePathProblem('C:\\a"b', "win32") !== null,
+            stagePathProblem(spaced, "win32"),
+            stagePathProblem(join("/", "home", "100%"), "linux"),
+          ],
+          [true, true, null, null],
+          "a stage cmd.exe would rewrite is refused on Windows, and only there",
+        );
+
+        // Why an install was refused, from npm's own lines (shapes captured
+        // from npm 11.13.0 on Windows and 10.9.8 on Linux).
+        const npmSaid = (...lines) =>
+          `${lines.map((l) => `npm error ${l}`).join("\n")}\nnpm error A complete log of this run can be found in: C:\\npm\\x.log\n`;
+        const reason = (stderr) => npmFailureReason({ status: -4058, signal: null, stdout: "", stderr, error: null });
+        assertDeep(
+          [
+            reason(npmSaid("code ENOENT", `syscall spawn ${NO_GIT}`, `path ${NO_GIT}`, "errno -4058")),
+            reason(npmSaid("code ENOENT", `syscall spawn ${NO_SCRIPT_SHELL}`, "path C:\\stage\\node_modules\\esc-detached", "errno -4058")),
+            reason(npmSaid("code ENOENT", `syscall spawn ${NO_SCRIPT_SHELL}`, "path /stage/node_modules/@scope/x", "errno -2")),
+            reason(npmSaid("code ENOENT", `syscall spawn ${NO_SCRIPT_SHELL}`, "path /stage/node_modules/a/node_modules/b", "errno -2")),
+            reason(npmSaid("code ENOENT", `syscall spawn ${NO_SCRIPT_SHELL}`, "path /home/u/.npm/_cacache/tmp/git-cloneFCcNIK", "errno -2")),
+            reason(npmSaid("code ENOENT", `syscall spawn ${NO_SCRIPT_SHELL}`, "errno -2")),
+          ],
+          [
+            "its dependency tree has a git dependency, and the matrix runs no git: it installs only what the registry serves",
+            "esc-detached cannot install without running a lifecycle script, and the matrix runs none",
+            "@scope/x cannot install without running a lifecycle script, and the matrix runs none",
+            "b cannot install without running a lifecycle script, and the matrix runs none",
+            "a git dependency in its tree runs a prepare script to build, and the matrix runs no lifecycle script",
+            "a package cannot install without running a lifecycle script, and the matrix runs none",
+          ],
+          "a refused install says what it wanted -- git, or a script, and whose",
+        );
+        assertDeep(
+          [
+            reason(npmSaid("code E404", "404 Not Found - GET https://registry.npmjs.org/nope")),
+            reason(npmSaid("code ENOENT", "syscall spawn C:\\Windows\\system32\\cmd.exe", "errno -4058")),
+            npmFailureReason({ status: null, signal: null, stdout: "", stderr: "", error: Object.assign(new Error("t"), { code: "ETIMEDOUT" }) }),
+          ],
+          ["npm error code E404", "npm error code ENOENT", `timed out after ${INSTALL_TIMEOUT_MS / 1000}s`],
+          "every other failure reads as it did",
+        );
+
+        // Which install scripts a package has: what npm runs on install, and
+        // the node-gyp build npm makes up for a binding.gyp.
+        const at = join("/", "nm", "p");
+        const withGyp = (path) => path === join(at, "binding.gyp");
+        const none = () => false;
+        const p = (extra) => ({ name: "p", version: "1.0.0", ...extra });
+        const found = (manifest, exists) => installScriptsOf(at, manifest, exists).map((s) => `${s.pkg} ${s.event}: ${s.script}`);
+        assertDeep(
+          [
+            found(p({ scripts: { preinstall: "a", install: "b", postinstall: "c", prepare: "d", test: "e" } }), none),
+            found(p({}), withGyp),
+            found(p({ gypfile: false }), withGyp),
+            found(p({ scripts: { install: "make" } }), withGyp),
+            found(p({ scripts: { preinstall: "setup" } }), withGyp),
+            found(p({ scripts: { prepare: "tsc" } }), none),
+            found(p({ scripts: { postinstall: 42, install: "  " } }), none),
+            found(p({ scripts: "not-an-object" }), none),
+          ],
+          [
+            ["p@1.0.0 preinstall: a", "p@1.0.0 install: b", "p@1.0.0 postinstall: c"],
+            ["p@1.0.0 install: node-gyp rebuild"],
+            [],
+            ["p@1.0.0 install: make"],
+            ["p@1.0.0 preinstall: setup"],
+            [],
+            [],
+            [],
+          ],
+          "install scripts are the three install events plus npm's implicit node-gyp build -- not prepare, not a blank or non-string one",
+        );
+
+        // One walk gives both facts, the nested copy's script, not the
+        // hoisted one's, and the same engines engineRanges gives.
+        const tree = new Map();
+        const nm = join("/", "stage", "node_modules");
+        const put = (parts, manifest) => tree.set(join(nm, ...parts), manifest);
+        put(["app"], { name: "app", version: "1.0.0", engines: { node: ">=18" }, dependencies: { lib: "^1", tool: "^1" } });
+        put(["app", "node_modules", "lib"], { name: "lib", version: "1.0.0", scripts: { postinstall: "node nested.js" } });
+        put(["lib"], { name: "lib", version: "2.0.0", scripts: { postinstall: "node hoisted.js" } });
+        put(["tool"], { name: "tool", version: "3.0.0", engines: { node: ">=20" }, scripts: { install: "node build.js" } });
+        const read = (dir) => tree.get(dir) ?? null;
+        const facts = closureFacts(join(nm, "app"), read, none);
+        assertDeep(
+          [facts.scripts.map((s) => `${s.pkg} ${s.event}: ${s.script}`), facts.engines],
+          [["lib@1.0.0 postinstall: node nested.js", "tool@3.0.0 install: node build.js"], engineRanges(join(nm, "app"), read)],
+          "the tree's scripts are the ones node would load, and its engines are engineRanges'",
+        );
+        assertDeep(closureFacts(join(nm, "absent"), read, none), { engines: [], scripts: [] }, "a package not on disk has neither");
+
+        // The review: exact on name, event and text.
+        const puppeteer = { pkg: "puppeteer@23.11.1", name: "puppeteer", event: "postinstall", script: "node install.mjs" };
+        const others = [
+          { ...puppeteer, script: "node install.mjs --force" },
+          { ...puppeteer, event: "install" },
+          { ...puppeteer, pkg: "puppeteerx@1.0.0", name: "puppeteerx" },
+        ];
+        assertDeep(
+          [unreviewedScripts([puppeteer]), unreviewedScripts(others).length],
+          [[], 3],
+          "puppeteer's reviewed postinstall passes; changed text, another event or another package does not",
+        );
+        assertDeep(
+          describeScripts(others),
+          "puppeteer@23.11.1 postinstall `node install.mjs --force`; puppeteer@23.11.1 install `node install.mjs`; 1 more",
+          "a row names two scripts and counts the rest",
+        );
+        for (const r of REVIEWED_INSTALL_SCRIPTS) {
+          assertDeep(
+            [["preinstall", "install", "postinstall"].includes(r.event), [r.name, r.script, r.why].every((v) => typeof v === "string" && v.trim() !== "")],
+            [true, true],
+            `the review of ${r.name} names an install event, the script, and why skipping it is faithful`,
+          );
+        }
+
+        // The row: an install error first, then damage, then an unreviewed
+        // script, each a SKIP keeping the version; a reviewed one passes.
+        const resolved = (scripts) => () => ({ entry: "/bin/x", version: "1.0.0", engines: [], scripts });
+        const unreviewedTool = [{ pkg: "tool@3.0.0", name: "tool", event: "install", script: "node build.js" }];
+        const noErrors = new Map();
+        const brokenTree = new Map([["x", [{ from: "x@1.0.0", name: "gone", hollow: null }]]]);
+        const skipped = binFor("x", noErrors, noErrors, false, resolved(unreviewedTool));
+        assertDeep(
+          [skipped.version, skipped.error?.includes("tool@3.0.0 install `node build.js`"), skipped.error?.includes("REVIEWED_INSTALL_SCRIPTS")],
+          ["1.0.0", true, true],
+          "an unreviewed install script makes the row a SKIP that names it, version kept",
+        );
+        assertDeep(binFor("x", noErrors, noErrors, false, resolved([puppeteer])).entry, "/bin/x", "a reviewed one leaves the row to run");
+        assertDeep(binFor("x", noErrors, brokenTree, false, resolved(unreviewedTool)).error?.startsWith("its install is not whole"), true, "damage is reported first");
+        assertDeep(binFor("x", new Map([["x", "npm install failed: E404"]]), brokenTree, false, resolved(unreviewedTool)), { error: "npm install failed: E404" }, "and an install error before anything");
       },
     },
     {
@@ -3060,9 +3406,10 @@ async function selfTest() {
   return failures === 0 ? 0 : 1;
 }
 
-/** Resolve an installed package's bin entry point, version, and the
- *  engines.node ranges of it and its installed dependencies (engineRanges) --
- *  the floors nodeHostRefusal holds the node control to.
+/** Resolve an installed package's bin entry point, version, and -- from one
+ *  walk of its installed tree (closureFacts) -- the engines.node ranges of it
+ *  and its dependencies, the floors nodeHostRefusal holds the node control to,
+ *  and the install scripts in it, which binFor holds against the review.
  *  Mirrors oam-spawn.ts: the BIN from package.json, not require.resolve --
  *  a package's library export is often ESM-gated and is not what npx runs. */
 function resolveBin(pkg) {
@@ -3075,7 +3422,8 @@ function resolveBin(pkg) {
   if (!rel) return { error: "package.json declares no bin", version: manifest.version };
   const entry = resolve(dir, rel);
   if (!existsSync(entry)) return { error: `bin missing on disk: ${entry}`, version: manifest.version };
-  return { entry, version: manifest.version, engines: engineRanges(dir) };
+  const { engines, scripts } = closureFacts(dir);
+  return { entry, version: manifest.version, engines, scripts };
 }
 
 /** Turn a tools/call reply into a verdict the adjudicator can judge.
@@ -3668,7 +4016,10 @@ for (const s of selected) {
     clearProgress();
     process.stderr.write(row(s.name, BANNER[state], ver, detail));
     for (const line of [note ? `note: ${note}` : "", ...extra]) if (line) process.stderr.write(under(line.slice(0, 160)));
-    results.push({ name: s.name, pkg: s.pkg, version: bin.version ?? null, state, tool, tools, why, note });
+    // The reviewed install scripts its tree holds and this install skipped, so
+    // the record shows where the install differed from npx's.
+    const installScriptsSkipped = (bin.scripts ?? []).map((sc) => `${sc.pkg} ${sc.event}: ${sc.script}`);
+    results.push({ name: s.name, pkg: s.pkg, version: bin.version ?? null, state, tool, tools, why, note, installScriptsSkipped });
   };
   if (bin.error) {
     record("skip", bin.error);
