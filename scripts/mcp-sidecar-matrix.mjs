@@ -2345,12 +2345,17 @@ async function selfTest() {
         // installAt as found above.)
         const signalsAt = source.search(/^for \(const signal of \["SIGINT", "SIGTERM", "SIGHUP"\]\) process\.on\(signal, \(\) => endRun\(signal\)\);$/m);
         const guardAt = source.search(/^process\.stderr\.on\("error", \(\) => \{\}\);$/m);
+        // endRun's head is its signature up to the `) {` that opens its body,
+        // inside endRun: a close not found there is no match, not a slice that
+        // runs on into this case's own quote of the defaults.
         const endAt = source.search(/^async function endRun\(/m);
-        const endHead = endAt < 0 ? "" : source.slice(endAt, source.indexOf("\n) {\n", endAt)).replace(/\s+/g, " ");
+        const endBodyEnd = endAt < 0 ? -1 : source.indexOf("\n}\n", endAt);
+        const endClose = endAt < 0 ? -1 : source.indexOf("\n) {\n", endAt);
+        const endHead = endClose < 0 || endClose > endBodyEnd ? "" : source.slice(endAt, endClose).replace(/\s+/g, " ");
         assertDeep(
           [lockAt > 0, guardAt > lockAt, signalsAt > guardAt, installAt > signalsAt],
           [true, true, true, true],
-          "an interrupt once the stage is held goes through endRun, installs included, and a terminal gone away cannot end the run first",
+          "an interrupt once the stage is held goes through endRun, installs included, and a failed write to a terminal gone away cannot cut it short",
         );
         assertDeep(
           endHead.includes(
@@ -2890,13 +2895,16 @@ async function selfTest() {
           await sleep(200); // room for a settle that must not happen
           // Nothing starts once the run is being ended -- not even an install
           // called just before the interrupt was handled. That is the
-          // interrupt which arrived during synchronous work, and runBounded's
-          // turn before spawning is where it gets handled: endRun sets
-          // `ending` then, as here.
+          // interrupt which arrived during synchronous work: it is handled on
+          // the event loop's next turn, which no microtask reaches, so
+          // runBounded must not spawn before that turn. The callback here
+          // sets `ending` on it, ahead of runBounded's own, as endRun would.
           ending = false;
           const before = children.length;
+          setImmediate(() => {
+            ending = true;
+          });
           runBounded(process.execPath, standIn, { timeoutMs: 60_000, spawnFn });
-          ending = true;
           await sleep(200);
           started = children.length - before;
           // With no install in flight, an interrupt releases the lock and dies
@@ -2925,7 +2933,8 @@ async function selfTest() {
         // the signal elsewhere -- never with an exit a calling shell could
         // take as handled. The child holds a SIGINT listener, as the matrix
         // does, which a re-raised signal must not land in; it would otherwise
-        // live 10s and exit 0.
+        // live until dieOf's 2s fallback and exit 130 -- an exit a calling
+        // shell could take as handled.
         const died = spawnSync(
           process.execPath,
           ["--input-type=module", "-e", `import { constants as osConstants } from "node:os";\n${dieOf}\nprocess.on("SIGINT", () => {});\ndieOf("SIGINT");\nsetTimeout(() => {}, 10_000);`],
@@ -3559,8 +3568,10 @@ if (lockProblem) {
   process.exit(2);
 }
 // From here on an interrupt ends npm before the matrix, and releases the lock.
-// A terminal that has gone away (SIGHUP) fails every write to it (EIO), which
-// with no listener would end the run -- before endRun has ended npm.
+// A terminal that has gone away (SIGHUP) fails every write to it (EIO). With
+// no listener, endRun's note would then end the run with exit 1 -- after npm
+// is dead, but possibly before the half-written tree is renamed aside, and not
+// as the death by the signal a calling script has to see.
 process.stderr.on("error", () => {});
 for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, () => endRun(signal));
 sweepStageTrash();

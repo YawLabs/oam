@@ -1229,15 +1229,16 @@ else fail "ci-local.sh no longer runs 'node scripts/mcp-sidecar-matrix.mjs --sel
 # from `matrix_status=$?` to the `esac`, after a command that exits with each
 # status, with ok/warn/fail stubbed to say which fired. A gate killed by a
 # signal -- a Ctrl-C (130; Git Bash reports Windows' STATUS_CONTROL_C_EXIT the
-# same way), SIGHUP, SIGKILL, SIGTERM -- must stop the release. Every status
-# above 1 used to be a warn, and a warn carries on to publish.
-it "release-local.sh stops the release when the sidecar matrix is interrupted or killed"
+# same way), SIGHUP, SIGKILL, SIGTERM -- or ended by Stop-Process or a native
+# crash (127 under Git Bash) must stop the release. Every status above 1 used
+# to be a warn, and a warn carries on to publish.
+it "release-local.sh stops the release when the sidecar matrix is interrupted, killed or crashed"
 MX_BLOCK="$(awk '/^  matrix_status=\$\?$/ { f = 1 } f { print } f && /^  esac$/ { exit }' scripts/release-local.sh)"
 MX_GOT=""
-for st in 0 1 2 3 129 130 137 143; do
+for st in 0 1 2 3 127 129 130 137 143; do
   MX_GOT="$MX_GOT $st:$(bash -c "ok(){ echo ok; }; warn(){ echo warn; }; fail(){ echo fail; exit 1; }; (exit $st); $MX_BLOCK" 2>/dev/null | head -1)"
 done
-if [ "$MX_GOT" = " 0:ok 1:fail 2:warn 3:warn 129:fail 130:fail 137:fail 143:fail" ]; then pass
+if [ "$MX_GOT" = " 0:ok 1:fail 2:warn 3:warn 127:fail 129:fail 130:fail 137:fail 143:fail" ]; then pass
 else fail "release-local.sh's matrix step read the statuses as:$MX_GOT"; fi
 
 # #90 shipped a whole second build configuration -- oam_engine without `napi`,
