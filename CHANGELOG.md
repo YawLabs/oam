@@ -90,9 +90,9 @@ Release tooling only; no runtime behavior change.
   IP". The leg now asks ssh alone and says what failed -- the name does not resolve, nothing
   answers, nothing listens on port 22, the host key changed, or key authentication was
   refused -- and when nothing answers it prints what `tailscale status` lists, since a device
-  that joins a tailnet again gets a new address. `release-local.sh` runs that check at the start of
-  its preflight, before it bumps or tags; it used to reach the Air only after the local gate
-  and both Windows builds.
+  that joins a tailnet again gets a new address. `release-local.sh` runs that check at the
+  start of its preflight, before it bumps or tags; it used to reach the Air only after the
+  local gate and both Windows builds.
 
 ## [0.17.0] - 2026-09-24
 
