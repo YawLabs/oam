@@ -900,8 +900,10 @@ else
   # `gh release create "$RELEASE_DIR"/*` would publish it as a release asset.
   matrix_report="$STAMP_STASH/mcp-sidecar-matrix.json"
   # The matrix writes its report last, only once it has a verdict, so the
-  # report is how a verdict is told from a gate that died first (below). One
-  # left by an earlier run would stand in for a verdict this run never reached.
+  # report is how a verdict is told from a gate that died first (below). That
+  # holds only for a report this run wrote. STAMP_STASH is a fresh mktemp dir
+  # per run, so none is there today; the rm keeps it so should the stash ever
+  # be reused.
   rm -f "$matrix_report"
   set +e
   # The freshly built NATIVE asset -- the matrix must exercise the binary this

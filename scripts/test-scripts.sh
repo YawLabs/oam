@@ -1237,7 +1237,7 @@ else fail "ci-local.sh no longer runs 'node scripts/mcp-sidecar-matrix.mjs --sel
 it "release-local.sh stops the release when the sidecar matrix is interrupted, killed or crashed"
 MX_BLOCK="$(awk '/^  matrix_status=\$\?$/ { f = 1 } f { print } f && /^  esac$/ { exit }' scripts/release-local.sh)"
 MX_STUBS='ok(){ echo ok; }; warn(){ echo warn; }; fail(){ case "$1" in *"a sidecar failed"*) echo fail-verdict ;; *) echo fail ;; esac; exit 1; }'
-MX_REPORT="$(mktemp)"
+MX_REPORT="$SUITE_TMP/mcp-sidecar-matrix.json"
 MX_GOT=""
 for st in 0 1 1-noreport 2 3 127 129 130 137 143; do
   MX_CODE="${st%-noreport}"
@@ -1245,12 +1245,12 @@ for st in 0 1 1-noreport 2 3 127 129 130 137 143; do
   [ "$st" = "$MX_CODE" ] && printf '{\n  "exitCode": %s,\n  "sidecars": []\n}\n' "$MX_CODE" > "$MX_REPORT"
   MX_GOT="$MX_GOT $st:$(bash -c "$MX_STUBS; matrix_report='$MX_REPORT'; (exit $MX_CODE); $MX_BLOCK" 2>/dev/null | head -1)"
 done
-rm -f "$MX_REPORT"
 if [ "$MX_GOT" = " 0:ok 1:fail-verdict 1-noreport:fail 2:warn 3:warn 127:fail 129:fail 130:fail 137:fail 143:fail" ]; then pass
 else fail "release-local.sh's matrix step read the statuses as:$MX_GOT"; fi
 
-# And the report it reads is this run's: one an earlier release left would
-# make a gate killed before its verdict read as a sidecar failing.
+# And the report it reads is this run's. The stash is a fresh mktemp dir per
+# run, so no earlier report is there today; the rm keeps it so if the stash is
+# ever reused, and this keeps the rm.
 it "release-local.sh removes the previous sidecar matrix report before running the gate"
 MX_RM="$(grep -n '^  rm -f "\$matrix_report"$' scripts/release-local.sh | head -1 | cut -d: -f1)"
 MX_RUN="$(grep -n 'node "\$REPO_DIR/scripts/mcp-sidecar-matrix\.mjs" --json="\$matrix_report"$' scripts/release-local.sh | head -1 | cut -d: -f1)"

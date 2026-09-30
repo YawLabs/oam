@@ -517,10 +517,10 @@ let ending = false;
  *  the run stops where it stands -- no retry of an install endRun just killed,
  *  no probe of a stage it is moving aside. And nothing starts before one turn
  *  of the event loop, which is where an interrupt is handled: one that arrived
- *  during the synchronous work before this call (the startup sweep, the
- *  fixture) then finds nothing in flight and ends the run at once, instead of
- *  killing an npm started after the Ctrl-C and moving a whole, untouched
- *  install aside as half-written. */
+ *  during the synchronous work before this call (the fixture setup) then finds
+ *  nothing in flight and ends the run at once, instead of killing an npm
+ *  started after the Ctrl-C and moving a whole, untouched install aside as
+ *  half-written. */
 async function runBounded(cmd, args, { timeoutMs, shell = false, env = process.env, spawnFn = spawn }) {
   await new Promise((resolveTurn) => setImmediate(resolveTurn));
   return new Promise((resolveP) => {
@@ -586,8 +586,8 @@ const INTERRUPTS = ["SIGINT", "SIGTERM", "SIGHUP", ...(process.platform === "win
  *  runBounded has in flight is killed first, tree and all, and the
  *  half-written node_modules it leaves is renamed aside, as after a timeout
  *  (npmInstall) -- renamed only: deleting it is the next run's startup sweep,
- *  so the exit does not wait on a delete, which blocks the event loop and with
- *  it a second Ctrl-C. Then the stage lock is released and the matrix dies of
+ *  so the exit does not wait on a delete of a whole tree, which takes
+ *  seconds. Then the stage lock is released and the matrix dies of
  *  the interrupt (dieOf). With nothing in flight, or on a second interrupt, it
  *  does that at once; a second interrupt during the rename's retries leaves
  *  what is there to the next run's damage check.
@@ -812,7 +812,12 @@ const WIPE_RETRY_MS = 200;
  *  startup is handled at once (endRun, with nothing in flight) instead of
  *  after the whole delete, and what is left is the next run's to sweep. On a
  *  copy of the real stage (123 MB) the synchronous delete took 2.3-2.6s
- *  with the loop stalled; this one took 1.0s with the loop running. */
+ *  with the loop stalled; this one took 1.0s with the loop running.
+ *
+ *  Retried here, a few times and briefly, never through rm's own maxRetries:
+ *  the promise rm retries at every directory level of the tree, so one file
+ *  held open (a handle without delete sharing) cost 4x per level of depth --
+ *  measured 13s at 3 levels and 53s at 4, where rmSync gave up in 0.6s. */
 async function sweepStageTrash() {
   let names = [];
   try {
@@ -821,13 +826,19 @@ async function sweepStageTrash() {
     return;
   }
   for (const name of names) {
-    try {
-      await rm(join(stage, name), { recursive: true, force: true, maxRetries: 3 });
-    } catch {
-      // Held open; the next run tries again.
+    for (let attempt = 1; attempt <= SWEEP_ATTEMPTS; attempt++) {
+      try {
+        await rm(join(stage, name), { recursive: true, force: true });
+        break;
+      } catch {
+        // Held open: a little later, then the next run tries again.
+        if (attempt < SWEEP_ATTEMPTS) await sleep(100 * attempt);
+      }
     }
   }
 }
+// At most 0.3s of waiting per moved-aside tree, whatever its depth.
+const SWEEP_ATTEMPTS = 3;
 
 // How long a run waits for another run to finish with the shared stage, and
 // how old a lock must be before it is taken over whatever its pid says -- a
@@ -2370,12 +2381,14 @@ async function selfTest() {
         // The startup sweep runs once an interrupt is handled, and deletes
         // asynchronously, so a Ctrl-C during it is handled at once; a
         // synchronous delete held the event loop, and the Ctrl-C, for seconds.
+        // And never with rm's own maxRetries, which retries at every level of
+        // the tree: one held-open file cost 4x per level of depth.
         const sweepFnAt = source.search(/^async function sweepStageTrash\(\) \{$/m);
         const sweepBody = sweepFnAt < 0 ? "" : source.slice(sweepFnAt, source.indexOf("\n}\n", sweepFnAt));
         assertDeep(
-          [sweepFnAt > 0, sweepBody.includes("await rm("), sweepBody.includes("rmSync("), sweepAt > signalsAt],
-          [true, true, false, true],
-          "the startup sweep deletes without blocking the event loop, after the interrupt handlers are in place",
+          [sweepFnAt > 0, sweepBody.includes("await rm("), sweepBody.includes("rmSync("), sweepBody.includes("maxRetries"), sweepAt > signalsAt],
+          [true, true, false, false, true],
+          "the startup sweep deletes without blocking the event loop or retrying per directory, after the interrupt handlers are in place",
         );
         const guardAt = source.search(/^process\.stderr\.on\("error", \(\) => \{\}\);$/m);
         // endRun's head is its signature up to the `) {` that opens its body,
