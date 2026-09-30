@@ -23,6 +23,12 @@
 #   --mode=bench               mac-bench: prep + bench
 #       pulls:  $ART/mac-arm64/{BENCHMARKS.md,results.json}
 #
+#   --preflight-only           with any mode: check the key file, then that the
+#                              Air resolves, answers and accepts the key -- and
+#                              stop there. Syncs nothing, builds nothing, prints
+#                              nothing on stdout; exit 0 means a build could
+#                              start. release-local.sh runs it before it tags.
+#
 # Usage (FAIL-CLOSED -- capture first, check the exit, THEN consume):
 #   ART=$(./scripts/build-platforms-tailnet.sh) || { echo "mac leg failed"; exit 1; }
 #   # Artifact dir = LAST stdout line; all progress goes to stderr.
@@ -49,14 +55,16 @@
 set -euo pipefail
 
 MODE="release"
+PREFLIGHT_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     --mode=release|--mode=measure|--mode=bench|--mode=surface-gaps) MODE="${arg#--mode=}" ;;
+    --preflight-only) PREFLIGHT_ONLY=1 ;;
     -h|--help)
       awk 'NR==1{next} !/^#/{exit} {sub(/^# ?/, ""); print}' "$0"
       exit 0
       ;;
-    *) echo "unknown arg: $arg (want --mode=release|measure|bench|surface-gaps)" >&2; exit 1 ;;
+    *) echo "unknown arg: $arg (want --mode=release|measure|bench|surface-gaps, --preflight-only)" >&2; exit 1 ;;
   esac
 done
 
@@ -79,11 +87,15 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # disk_needs_reclaim / disk_below_floor -- the same thresholds as the linux leg.
 # shellcheck source=lib/iap-helpers.sh
 . "$SCRIPT_DIR/lib/iap-helpers.sh"
+# tailnet_ssh_failure / tailnet_peer_state -- what the host preflight tells the
+# operator when the Air cannot be used.
+# shellcheck source=lib/tailnet-helpers.sh
+. "$SCRIPT_DIR/lib/tailnet-helpers.sh"
 
 RUNID="$(date +%Y%m%d-%H%M%S)"
-STAGE_DIR="$(mktemp -d -t oam-tailnet-build-$RUNID-XXXXXX)"
-ARTIFACTS_DIR="$STAGE_DIR/artifacts"
-mkdir -p "$STAGE_DIR/logs" "$ARTIFACTS_DIR"
+# $STAGE_DIR and $ARTIFACTS_DIR are created after the preflight, which needs
+# neither: a preflight that fails, or is all that was asked for, leaves no
+# directory behind.
 
 # Key-based NON-INTERACTIVE auth. BatchMode=yes makes a missing/rejected key
 # fail fast (exit 255) instead of dropping to an interactive Password: prompt
@@ -148,41 +160,93 @@ mac_reclaim(){
 }
 
 # --- preflight ----------------------------------------------------------------
-step "Run $RUNID -- oam mac --mode=$MODE on $MAC_USER@$MAC_HOST"
+if [ "$PREFLIGHT_ONLY" = "1" ]; then
+  step "Mac build host preflight -- $MAC_USER@$MAC_HOST"
+else
+  step "Run $RUNID -- oam mac --mode=$MODE on $MAC_USER@$MAC_HOST"
+fi
 [ -f "$MAC_KEY" ] || fail "Mac SSH key not found: $MAC_KEY\n  One-time setup:\n    ssh-keygen -t ed25519 -N '' -C oam-mac-air -f \"$MAC_KEY\"\n    ssh-copy-id -i \"$MAC_KEY.pub\" $MAC_USER@$MAC_HOST\n  Already have a key on the Air? point at it with OAM_MAC_KEY=/path/to/key"
-( cd "$REPO_DIR" && git diff --quiet HEAD ) || warn "working tree dirty -- uncommitted changes WILL ship"
+# Nothing ships on a preflight-only call, and its caller has its own tree check.
+if [ "$PREFLIGHT_ONLY" != "1" ]; then
+  ( cd "$REPO_DIR" && git diff --quiet HEAD ) || warn "working tree dirty -- uncommitted changes WILL ship"
+fi
 ok "target: mac=$MAC_USER@$MAC_HOST (key: $MAC_KEY)"
 
-# Resolve-time guard: catch a non-resolving OAM_MAC_HOST before scp hangs.
-# getent on Linux/mac (NSS -> MagicDNS works); nslookup on Windows, grepped
-# for a positive answer because it exits 0 even on NXDOMAIN.
-resolve_check() {
-  local host="$1"
-  local err_msg="mac host '$host' does not resolve via DNS. Use the Tailscale MagicDNS name (run 'tailscale status') or the tailnet IP."
-  if command -v getent >/dev/null 2>&1; then
-    getent hosts "$host" >/dev/null 2>&1 || fail "$err_msg"
-  elif command -v nslookup >/dev/null 2>&1; then
-    local out
-    out=$(nslookup -timeout=2 "$host" 2>&1) || true
-    grep -qE "^Name:[[:space:]]+" <<<"$out" || fail "$err_msg"
-  else
-    warn "no resolver tool found (getent/nslookup) -- skipping resolve check for '$host'"
-  fi
+# mac_tailnet_note  -- what this box's tailnet says about $MAC_HOST, as a
+# "\n  ..." continuation for a failure message. Prints nothing when that adds
+# nothing: no tailscale CLI here, or the Air is listed and not marked offline.
+#
+# Everything it prints reaches the operator through fail(), which is `echo -e`:
+# text captured from a tool has its backslashes doubled first, so a Windows
+# path in it is not read as an escape (`\t`) or a cut-off (`\c`).
+mac_tailnet_note(){
+  command -v tailscale >/dev/null 2>&1 || return 0
+  local st line rows
+  # stderr too: that is where a CLI that cannot reach its daemon says so. The
+  # helpers take only address-led lines as rows, so a warning is not a device.
+  st="$(tailscale status 2>&1)" || {
+    line="$(last_nonblank_line "$st")" || line="it printed nothing"
+    printf '\n  tailscale status fails on this box (%s) -- is Tailscale running and signed in here?' "${line//\\/\\\\}"
+    return 0
+  }
+  case "$(tailnet_peer_state "$MAC_HOST" "$st")" in
+    absent)
+      rows="$(tailnet_peer_rows "$st")"
+      rows="${rows//\\/\\\\}"
+      if [ -z "$rows" ]; then
+        printf "\n  'tailscale status' on this box lists no device at '%s', and no other device at all: this box is alone on its tailnet." "$MAC_HOST"
+        printf "\n  A 100.x address or MagicDNS name is valid on ONE tailnet, so this box and the Air are on different ones (or the Air is not signed in to Tailscale). Put them on the same one -- 'tailscale switch --list' or 'tailscale login' here, or sign the Air in to this one -- then set OAM_MAC_HOST to what 'tailscale status' shows for the Air."
+      else
+        printf "\n  'tailscale status' on this box lists no device at '%s'. It lists:\n      %s" "$MAC_HOST" "${rows//$'\n'/$'\n      '}"
+        printf "\n  If one of these is the Air, set OAM_MAC_HOST to its address or name: a device that joins a tailnet again gets a new address. If none is, this box and the Air are on different tailnets -- put them on the same one ('tailscale switch --list' or 'tailscale login' here, or sign the Air in to this one)."
+      fi ;;
+    offline)
+      printf "\n  'tailscale status' lists '%s' as offline -- wake the Air, and check Tailscale is connected on it." "$MAC_HOST" ;;
+  esac
+  return 0
 }
-resolve_check "$MAC_HOST"
 
-# Auth preflight: the key file existing proves nothing -- it must be enrolled
-# in the Air's authorized_keys. One BatchMode probe surfaces cause + fix
-# before any work.
+# Host preflight: ONE BatchMode ssh, which answers everything a build needs of
+# the Air through the resolver and the route every later scp uses -- the name
+# resolves, the host answers, the key is enrolled (the key FILE existing proves
+# nothing). A separate DNS lookup used to run first and got both halves wrong:
+# see lib/tailnet-helpers.sh. ConnectTimeout bounds a dead address at 15s.
 probe_out=$(ssh "${SSH_OPTS[@]}" "$MAC_USER@$MAC_HOST" true 2>&1) || {
-  case "$probe_out" in
-    *"Permission denied"*)
-      fail "Mac SSH key not enrolled on $MAC_HOST (key exists at $MAC_KEY, Air rejects it).\n  Enroll:  ssh-copy-id -i \"$MAC_KEY.pub\" $MAC_USER@$MAC_HOST" ;;
+  probe_rc=$?
+  # Backslashes doubled for fail()'s `echo -e` -- see mac_tailnet_note.
+  probe_out="${probe_out//\\/\\\\}"
+  # An ssh that fails and says nothing (LogLevel QUIET, a killed ssh) must not
+  # leave a blank where the cause belongs -- see last_nonblank_line.
+  probe_line="$(last_nonblank_line "$probe_out")" \
+    || { probe_line="ssh exited $probe_rc and printed nothing"; probe_out="$probe_line"; }
+  # ssh's whole output, every line indented to sit under the headline.
+  probe_all="${probe_out//$'\r'/}"
+  probe_all="${probe_all//$'\n'/$'\n    '}"
+  case "$(tailnet_ssh_failure "$probe_out")" in
+    auth)
+      fail "$MAC_USER@$MAC_HOST answered and refused key authentication with $MAC_KEY:\n    $probe_all\n  Key not enrolled for that account?  ssh-copy-id -i \"$MAC_KEY.pub\" $MAC_USER@$MAC_HOST\n  Otherwise: check OAM_MAC_USER is the account on the Air and is allowed under Remote Login, and that $MAC_KEY is a private key with no passphrase (BatchMode cannot prompt)." ;;
+    hostkey)
+      probe_offending="$(grep -m1 'Offending' <<<"${probe_out//$'\r'/}" || true)"
+      fail "$MAC_HOST answered with a different SSH host key than the one this box recorded for it -- another machine holds that address now, or the Air's host keys were regenerated.${probe_offending:+\n    $probe_offending}\n  If that is expected, drop the stale entry:  ssh-keygen -R $MAC_HOST" ;;
+    resolve)
+      fail "OAM_MAC_HOST '$MAC_HOST' does not resolve on this box:\n    $probe_line$(mac_tailnet_note)\n  OAM_MAC_HOST has to be the address (first column) or the name (second column) that 'tailscale status' on this box shows for the Air; the address needs no DNS." ;;
+    unreachable)
+      fail "nothing answered at $MAC_HOST on tcp:22:\n    $probe_line$(mac_tailnet_note)\n  The Air has to be awake and on this box's tailnet, the tailnet's ACLs have to let this box reach its tcp:22 (a denied connection is dropped silently, so it times out), and Remote Login has to be on." ;;
+    refused)
+      fail "$MAC_HOST is up but nothing is listening on tcp:22:\n    $probe_line\n  Turn on Remote Login on the Air (System Settings > General > Sharing)." ;;
     *)
-      fail "cannot reach $MAC_USER@$MAC_HOST over SSH:\n    $probe_out\n  Is the Air awake and on the tailnet? Check 'tailscale status'." ;;
+      fail "ssh to $MAC_USER@$MAC_HOST failed (exit $probe_rc):\n    $probe_all\n  For the detail, run it by hand:  ssh -v -i \"$MAC_KEY\" -o BatchMode=yes $MAC_USER@$MAC_HOST true" ;;
   esac
 }
 ok "key auth OK on $MAC_USER@$MAC_HOST"
+
+if [ "$PREFLIGHT_ONLY" = "1" ]; then
+  exit 0
+fi
+
+STAGE_DIR="$(mktemp -d -t oam-tailnet-build-$RUNID-XXXXXX)"
+ARTIFACTS_DIR="$STAGE_DIR/artifacts"
+mkdir -p "$STAGE_DIR/logs" "$ARTIFACTS_DIR"
 
 # --- build --------------------------------------------------------------------
 # Called as `build_mac || handler` -- every step fails the function EXPLICITLY

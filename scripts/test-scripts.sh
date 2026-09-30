@@ -927,6 +927,327 @@ else
 fi
 
 # =============================================================================
+group "tailnet-helpers.sh -- the mac build host preflight"
+# =============================================================================
+# On 2026-09-30 the release box and the Air were not on the same tailnet, and
+# the mac leg said "mac host '<the Air's tailnet IP>' does not resolve via DNS.
+# Use the Tailscale MagicDNS name ... or the tailnet IP" -- of a tailnet IP --
+# after the release had already tagged, run the whole local gate and built both
+# Windows assets. The leg now asks ssh alone and classifies its answer, and
+# release-local.sh runs that preflight before it bumps or tags.
+#
+# The fixtures below are real output with the addresses, device names, tailnet
+# name and accounts replaced by placeholders: this box is release-box at
+# 100.80.0.1, the Air was at 100.90.0.5 and came back at 100.90.0.6.
+# shellcheck source=lib/tailnet-helpers.sh
+. scripts/lib/tailnet-helpers.sh
+
+# The first three lines are this orchestrator's own ssh (OpenSSH_10.2p1, Git
+# Bash), captured 2026-09-30: the dead tailnet address, a name that does not
+# resolve, and a host with no sshd. The two banner lines are what ssh prints
+# when something ACCEPTED the connection and then sent nothing: a timeout, but
+# not an address nothing answers at.
+it "ssh's own line is classed by what actually failed"
+TSF_BAD=""
+while IFS='|' read -r TSF_WANT TSF_TEXT; do
+  TSF_GOT="$(tailnet_ssh_failure "$TSF_TEXT")"
+  [ "$TSF_GOT" = "$TSF_WANT" ] || TSF_BAD="$TSF_BAD [$TSF_TEXT -> ${TSF_GOT:-nothing}, want $TSF_WANT]"
+done <<'EOF'
+unreachable|ssh: connect to host 100.90.0.5 port 22: Connection timed out
+resolve|ssh: Could not resolve hostname oam-no-such-host.invalid: Name or service not known
+refused|ssh: connect to host release-box.tail1234.ts.net port 22: Connection refused
+unreachable|ssh: connect to host 100.90.0.5 port 22: Operation timed out
+unreachable|ssh: connect to host 100.90.0.5 port 22: No route to host
+unreachable|ssh: connect to host 100.90.0.5 port 22: Network is unreachable
+unreachable|ssh: connect to host 100.90.0.5 port 22: Host is down
+resolve|ssh: Could not resolve hostname air: nodename nor servname provided, or not known
+auth|builder@100.90.0.5: Permission denied (publickey,password,keyboard-interactive).
+unknown|Connection timed out during banner exchange
+unknown|Connection to 100.90.0.5 port 22 timed out
+unknown|kex_exchange_identification: read: Connection reset by peer
+unknown|
+EOF
+if [ -z "$TSF_BAD" ]; then pass; else fail "misclassified:$TSF_BAD"; fi
+
+it "a refused key is found under the known_hosts line ssh prints first"
+eq "$(tailnet_ssh_failure $'Warning: Permanently added \'100.90.0.5\' (ED25519) to the list of known hosts.\r\nbuilder@100.90.0.5: Permission denied (publickey).\r\n')" "auth"
+
+# sshd's refusal reads the same when ssh never offered the key because it could
+# not load it; the line that says so comes first, which is why the orchestrator
+# prints all of ssh's output for this class.
+it "a key ssh could not load is an authentication refusal too"
+eq "$(tailnet_ssh_failure $'Load key "/c/Users/me/.ssh/yaw_mac_air": error in libcrypto\r\nbuilder@100.90.0.6: Permission denied (publickey,password,keyboard-interactive).')" "auth"
+
+# connect() itself can fail with EACCES, which ssh prints with the same two
+# words. "Enroll the key" is the wrong instruction for a blocked connection.
+it "a connect() that was denied is not an authentication refusal"
+eq "$(tailnet_ssh_failure 'ssh: connect to host 100.90.0.5 port 22: Permission denied')" "unknown"
+
+it "a changed host key is named as that"
+eq "$(tailnet_ssh_failure $'@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @\nHost key verification failed.')" "hostkey"
+
+# `tailscale status` on the release box, captured 2026-09-30, twice: when the
+# release failed (this machine and nothing else -- the address the release was
+# given is simply not in it), and after the Air was signed in to this tailnet,
+# where it came back under a NEW address.
+TS_ALONE='100.80.0.1  release-box  owner@  windows  -  '
+TS_NOW='100.80.0.1  release-box  owner@  windows  -
+100.90.0.6  macbook-air  owner@  macOS    -  '
+
+it "an address with no row is absent, and a table holding this box alone lists no peer"
+eq "$(tailnet_peer_state 100.90.0.5 "$TS_ALONE")|$(tailnet_peer_rows "$TS_ALONE")" "absent|"
+
+it "the old address is absent from the table the Air came back in, which lists the new one"
+eq "$(tailnet_peer_state 100.90.0.5 "$TS_NOW")|$(tailnet_peer_rows "$TS_NOW")" \
+   "absent|100.90.0.6  macbook-air  macOS"
+
+# The states tailscale 1.102 prints for a peer: no traffic ("-"), idle, offline,
+# idle and offline, and active -- that last one on a device shared in from
+# another tailnet, which is listed by its full DNS name. Then the health
+# warnings it appends as `#` lines.
+TS_TABLE='100.80.0.1      release-box           owner@  windows  -
+100.64.0.7      air                   owner@  macOS    -
+100.64.0.8      studio                owner@  macOS    idle, tx 17420 rx 20844
+100.64.0.9      old-mini              owner@  macOS    offline, last seen 3d ago
+100.64.0.10     old-book              owner@  macOS    idle; offline, last seen 3d ago, tx 1 rx 2
+100.70.1.2      build.tail0abc.ts.net other@    linux    active; direct 203.0.113.5:41641, tx 1204 rx 3388
+
+# Health check:
+#     - Some peers are advertising routes but --accept-routes is false'
+
+it "a peer is found by address, by MagicDNS name and by bare label, in any case"
+TSP_BAD=""
+for h in 100.64.0.7 air air.tail1234.ts.net Air.Tail1234.ts.net. AIR studio \
+         100.70.1.2 build.tail0abc.ts.net build; do
+  TSP_GOT="$(tailnet_peer_state "$h" "$TS_TABLE")"
+  [ "$TSP_GOT" = "listed" ] || TSP_BAD="$TSP_BAD [$h -> ${TSP_GOT:-nothing}]"
+done
+if [ -z "$TSP_BAD" ]; then pass; else fail "not found:$TSP_BAD"; fi
+
+it "a peer marked offline is reported offline, idle or not, by address or by name"
+eq "$(tailnet_peer_state 100.64.0.9 "$TS_TABLE") $(tailnet_peer_state old-mini "$TS_TABLE") $(tailnet_peer_state old-book "$TS_TABLE")" \
+   "offline offline offline"
+
+# 100.64.0.70 and 100.64.0 must not match the row for 100.64.0.7, nor 100.64.0.1
+# the row for 100.64.0.10, and the word after `#` on a health line is not a
+# device name.
+it "a longer address, a shorter one and a health-warning word match no row"
+TSP_BAD=""
+for h in 100.64.0.70 100.64.0 100.64.0.77 100.64.0.1 Health ai mini; do
+  TSP_GOT="$(tailnet_peer_state "$h" "$TS_TABLE")"
+  [ "$TSP_GOT" = "absent" ] || TSP_BAD="$TSP_BAD [$h -> ${TSP_GOT:-nothing}]"
+done
+if [ -z "$TSP_BAD" ]; then pass; else fail "matched a row:$TSP_BAD"; fi
+
+it "the peer rows leave out this box, the state detail, blank lines and health warnings"
+eq "$(tailnet_peer_rows "$TS_TABLE")" \
+   '100.64.0.7  air  macOS
+100.64.0.8  studio  macOS
+100.64.0.9  old-mini  macOS  offline
+100.64.0.10  old-book  macOS  offline
+100.70.1.2  build.tail0abc.ts.net  linux'
+
+# The orchestrator captures the CLI's stderr with its stdout, and the CLI warns
+# there when it and its daemon are different versions. That line is not a row:
+# counted as one, a box alone on its tailnet would be told it has a peer.
+it "a warning the CLI wrote to stderr is neither a device nor a match"
+TS_WARN='Warning: client version "1.102.4-t3caf7d9e7" != tailscaled server version "1.100.1-t0abc"
+'"$TS_ALONE"
+eq "$(tailnet_peer_rows "$TS_WARN")|$(tailnet_peer_state client "$TS_WARN")" "|absent"
+
+# A peer that reported no OS has an empty OS cell, so its state sits one field
+# to the left of where the other rows have it.
+it "a peer with no OS in its row still reads as offline"
+eq "$(tailnet_peer_state bare "$TS_ALONE"$'\n''100.64.0.11  bare  owner@  offline, last seen 1h ago')" "offline"
+
+# tailscale writes LF; a capture that has been through a CRLF translation must
+# read the same -- a blank "\r" line is not a row, and "offline,\r" is offline.
+it "a CRLF table reads the same as an LF one"
+TS_CRLF="${TS_TABLE//$'\n'/$'\r\n'}"
+eq "$(tailnet_peer_state old-mini "$TS_CRLF") $(tailnet_peer_state 100.64.0.7 "$TS_CRLF") $(tailnet_peer_rows "$TS_CRLF" | wc -l | tr -d ' ')" \
+   "offline listed 5"
+
+# The table shows IPv4 only, so it cannot say an IPv6 tailnet address is absent.
+it "an IPv6 address gets no verdict rather than a wrong one"
+eq "$(tailnet_peer_state fd7a:115c:a1e0::4a34:d531 "$TS_TABLE")" ""
+
+it "an empty table lists nothing and has no peers"
+eq "$(tailnet_peer_state 100.64.0.7 "")|$(tailnet_peer_rows "")" "absent|"
+
+# The rows go into a failure message: eight are enough to spot the Air in.
+it "a large tailnet is cut to eight rows and a count of the rest"
+TS_BIG="$TS_ALONE"
+for i in 1 2 3 4 5 6 7 8 9 10 11; do TS_BIG="$TS_BIG"$'\n'"100.64.1.$i  peer$i  owner@  linux  -"; done
+TS_BIG_ROWS="$(tailnet_peer_rows "$TS_BIG")"
+eq "$(wc -l <<<"$TS_BIG_ROWS" | tr -d ' ')|$(tail -1 <<<"$TS_BIG_ROWS")" "9|... and 3 more"
+
+# The preflight itself, run for real with every tool that would leave this box
+# replaced: ssh and tailscale by what they printed on 2026-09-30, scp and
+# mktemp by stubs that record the call and fail -- so a preflight that went on
+# to stage or sync is caught offline, not by a real scp to the Air. TMPDIR is an
+# empty directory of the run's own, so "staged nothing" is checked, not assumed.
+MACPF_BIN="$SUITE_TMP/macpf-bin"; MACPF_TMP="$SUITE_TMP/macpf-tmp"
+mkdir -p "$MACPF_BIN" "$MACPF_TMP"
+: > "$SUITE_TMP/macpf-key"
+# The table comes from a file each test writes. The stub also prints the
+# version warning on stderr, which the orchestrator captures with the table.
+cat > "$MACPF_BIN/tailscale" <<EOF
+#!/bin/bash
+[ "\$1" = "status" ] || exit 1
+echo 'Warning: client version "1.102.4-t3caf7d9e7" != tailscaled server version "1.100.1-t0abc"' >&2
+cat "$SUITE_TMP/macpf-table"
+EOF
+for t in scp mktemp; do
+  cat > "$MACPF_BIN/$t" <<EOF
+#!/bin/bash
+: > "$SUITE_TMP/macpf-went-on"
+exit 98
+EOF
+done
+# macpf_ssh  -- installs the ssh stub whose body is on stdin.
+macpf_ssh(){ { echo '#!/bin/bash'; cat; } > "$MACPF_BIN/ssh"; chmod +x "$MACPF_BIN/ssh"; }
+chmod +x "$MACPF_BIN/tailscale" "$MACPF_BIN/scp" "$MACPF_BIN/mktemp"
+# macpf [args...]  -- the preflight against the stubs; stdout to MACPF_OUT,
+# stderr to MACPF_ERR, status to MACPF_RC.
+macpf(){
+  MACPF_OUT="$(PATH="$MACPF_BIN:$PATH" TMPDIR="$MACPF_TMP" OAM_MAC_KEY="$SUITE_TMP/macpf-key" \
+    OAM_MAC_HOST=100.90.0.5 OAM_MAC_USER=builder \
+    bash scripts/build-platforms-tailnet.sh "$@" 2>"$SUITE_TMP/macpf-err")"
+  MACPF_RC=$?
+  MACPF_ERR="$(cat "$SUITE_TMP/macpf-err")"
+}
+# What the runs so far left behind: entries in the private TMPDIR (dotfiles
+# included), and whether any of them got as far as mktemp or scp.
+macpf_left(){
+  local n; n="$(ls -A "$MACPF_TMP" 2>/dev/null | wc -l | tr -d ' ')"
+  if [ -e "$SUITE_TMP/macpf-went-on" ]; then echo "tmp=$n went-on"; else echo "tmp=$n"; fi
+}
+
+macpf_ssh <<'EOF'
+echo 'ssh: connect to host 100.90.0.5 port 22: Connection timed out' >&2
+exit 255
+EOF
+printf '%s\n' "$TS_ALONE" > "$SUITE_TMP/macpf-table"
+macpf --preflight-only
+
+it "the 2026-09-30 failure is reported as a box that is alone on its tailnet"
+if [ "$MACPF_RC" != "0" ] \
+   && grep -qF 'nothing answered at 100.90.0.5 on tcp:22' <<<"$MACPF_ERR" \
+   && grep -qF "lists no device at '100.90.0.5', and no other device at all" <<<"$MACPF_ERR"; then pass
+else fail "rc=$MACPF_RC stderr: $MACPF_ERR"; fi
+
+it "an address that was given as an IP is never told it does not resolve"
+if grep -qiF 'does not resolve' <<<"$MACPF_ERR"; then fail "stderr: $MACPF_ERR"; else pass; fi
+
+it "a failed preflight prints nothing on stdout and stages nothing"
+eq "out='$MACPF_OUT' $(macpf_left)" "out='' tmp=0"
+
+# The same failure on a full run must stop there too, before any sync.
+macpf --mode=release
+it "a full run stops at the same preflight failure, with nothing staged or synced"
+if [ "$MACPF_RC" != "0" ] && [ -z "$MACPF_OUT" ] && [ "$(macpf_left)" = "tmp=0" ] \
+   && grep -qF 'nothing answered at 100.90.0.5 on tcp:22' <<<"$MACPF_ERR"; then pass
+else fail "rc=$MACPF_RC out='$MACPF_OUT' $(macpf_left) stderr: $MACPF_ERR"; fi
+
+# Later the same day: the Air is on the tailnet again, under a new address, and
+# the release is still being given the old one. The failure has to show the row
+# that answers it rather than tell the operator to sign in a device that is
+# already there.
+printf '%s\n' "$TS_NOW" > "$SUITE_TMP/macpf-table"
+macpf --preflight-only
+it "a stale address is answered with the devices the tailnet does list"
+if [ "$MACPF_RC" != "0" ] \
+   && grep -qF "lists no device at '100.90.0.5'. It lists:" <<<"$MACPF_ERR" \
+   && grep -qF '      100.90.0.6  macbook-air  macOS' <<<"$MACPF_ERR" \
+   && grep -qF 'If one of these is the Air, set OAM_MAC_HOST to its address or name' <<<"$MACPF_ERR"; then pass
+else fail "rc=$MACPF_RC stderr: $MACPF_ERR"; fi
+
+# "Last error: (empty stderr)" is all a 2026-09-25 linux-leg failure left the
+# operator (see last_nonblank_line). An ssh that fails silently gets a sentence.
+macpf_ssh <<'EOF'
+exit 255
+EOF
+macpf --preflight-only
+it "an ssh that fails and prints nothing is reported as that, with its exit code"
+if [ "$MACPF_RC" != "0" ] && grep -qF 'ssh exited 255 and printed nothing' <<<"$MACPF_ERR"; then pass
+else fail "rc=$MACPF_RC stderr: $MACPF_ERR"; fi
+
+# The messages go through `echo -e`. A Windows path in ssh's own text used to
+# be read as escapes: \U and \j pass, but \c cuts the message off where it
+# stands, taking the advice line with it.
+macpf_ssh <<'EOF'
+echo 'C:\Users\me\.ssh\config: line 3: Bad configuration option: \checkhostip' >&2
+exit 255
+EOF
+macpf --preflight-only
+it "a backslash in ssh's text is printed as it came, and the advice after it survives"
+if grep -qF 'C:\Users\me\.ssh\config: line 3: Bad configuration option: \checkhostip' <<<"$MACPF_ERR" \
+   && grep -qF 'run it by hand' <<<"$MACPF_ERR"; then pass
+else fail "stderr: $MACPF_ERR"; fi
+
+# A host that answers: --preflight-only must succeed WITHOUT going on to stage
+# and sync, which is what release-local.sh relies on when it calls this before
+# tagging. The mktemp and scp stubs record and fail a run that kept going, and
+# the ssh stub fails any call after the first.
+macpf_ssh <<EOF
+[ -e "$SUITE_TMP/macpf-ssh-called" ] && exit 97
+: > "$SUITE_TMP/macpf-ssh-called"
+exit 0
+EOF
+macpf --preflight-only
+it "a usable host passes --preflight-only, which then stages, syncs and builds nothing"
+if [ "$MACPF_RC" = "0" ] && [ -z "$MACPF_OUT" ] && [ "$(macpf_left)" = "tmp=0" ] \
+   && grep -qF 'key auth OK on builder@100.90.0.5' <<<"$MACPF_ERR"; then pass
+else fail "rc=$MACPF_RC out='$MACPF_OUT' $(macpf_left) stderr: $MACPF_ERR"; fi
+
+# The real ssh, not a stub: what THIS host's OpenSSH prints for a name that
+# cannot resolve has to be a shape the classifier knows. An empty label under
+# the reserved .invalid TLD can never be a DNS name, so no resolver answers it.
+it "a name this host's own ssh cannot resolve is reported as exactly that"
+if command -v ssh >/dev/null 2>&1; then
+  MACPF_REAL="$(TMPDIR="$MACPF_TMP" OAM_MAC_KEY="$SUITE_TMP/macpf-key" OAM_MAC_HOST=oam-no-such-host..invalid \
+    OAM_MAC_USER=nobody bash scripts/build-platforms-tailnet.sh --preflight-only 2>&1)"; MACPF_RC=$?
+  if [ "$MACPF_RC" != "0" ] \
+     && grep -qF "OAM_MAC_HOST 'oam-no-such-host..invalid' does not resolve on this box" <<<"$MACPF_REAL"; then pass
+  else fail "rc=$MACPF_RC output: $MACPF_REAL"; fi
+else
+  skip "no ssh on this host"
+fi
+
+# Asserted on the source, comments stripped: a second resolver is how the leg
+# came to disagree with ssh about a host ssh could reach. Captured, then
+# matched: `sed | grep -q` under pipefail reads a HIT as a miss once the body
+# is big enough for grep to exit before sed has finished writing.
+it "the mac leg consults no resolver but ssh's own"
+MACLEG_CODE="$(sed 's/#.*//' scripts/build-platforms-tailnet.sh)"
+if grep -qE 'nslookup|getent|Resolve-DnsName|dscacheutil' <<<"$MACLEG_CODE"; then
+  fail "scripts/build-platforms-tailnet.sh runs a DNS tool again"
+else pass; fi
+
+# The old check sat at the end of release-local.sh's preflight and only asked
+# whether OAM_MAC_HOST was set, so an unusable Air surfaced after the bump, the
+# tag and the local gate. The bump's first write is the Cargo.toml rewrite its
+# warning announces.
+it "release-local.sh proves the mac host usable before it bumps or tags"
+REL_MACPF="$(grep -n 'build-platforms-tailnet\.sh" --preflight-only' scripts/release-local.sh | head -1 | cut -d: -f1)"
+REL_BUMP="$(grep -n 'bumping Cargo\.toml to' scripts/release-local.sh | head -1 | cut -d: -f1)"
+REL_TAG="$(grep -n 'git tag -a "$TAG" -m "$TAG"' scripts/release-local.sh | head -1 | cut -d: -f1)"
+if [ -n "$REL_MACPF" ] && [ -n "$REL_BUMP" ] && [ -n "$REL_TAG" ] \
+   && [ "$REL_MACPF" -lt "$REL_BUMP" ] && [ "$REL_MACPF" -lt "$REL_TAG" ]; then pass
+else fail "host preflight@${REL_MACPF:-none} bump@${REL_BUMP:-none} tag@${REL_TAG:-none}"; fi
+
+REL_MACPF_BLOCK="$(awk '/^if \[ "\$SKIP_MAC" != "1" \]; then$/ { f = 1 } f { print } f && /^fi$/ { exit }' scripts/release-local.sh)"
+it "OAM_SKIP_MAC=1 skips the mac host preflight along with the mac leg"
+grep -qF -- '--preflight-only' <<<"$REL_MACPF_BLOCK" && pass || fail "the --preflight-only call is not inside the SKIP_MAC guard: '$REL_MACPF_BLOCK'"
+
+it "a mac host preflight that fails stops the release"
+REL_MACPF_CALL="$(grep -A1 -- '--preflight-only' <<<"$REL_MACPF_BLOCK")"
+case "$REL_MACPF_CALL" in
+  *'|| fail "'*) pass ;;
+  *) fail "the --preflight-only call has no '|| fail' after it: '$REL_MACPF_CALL'" ;;
+esac
+
+# =============================================================================
 group "src-sync.sh -- source tarball ceiling"
 # =============================================================================
 # shellcheck source=lib/src-sync.sh

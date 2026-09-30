@@ -325,6 +325,23 @@ step "Preflight $TAG"
 command -v gh >/dev/null 2>&1 || fail "gh CLI not found"
 gh auth status >/dev/null 2>&1 || fail "gh not authenticated -- run 'gh auth status' to inspect"
 
+# The remote legs' prerequisites, checked HERE for the reason the dirty-tree
+# guard below gives: never tag a tree we would refuse to build. They used to
+# sit at the END of the preflight, after the bump was on main and the tag on
+# origin, and the mac one asked only whether OAM_MAC_HOST was SET. The first
+# thing to actually reach the Air was the mac leg itself -- after the local
+# gate, both Windows builds and the console e2e. On 2026-09-30 that is where a
+# release found out this box and the Air were not on the same tailnet, with
+# v0.17.1 already tagged. --preflight-only is the mac leg's own host preflight (key
+# file, name resolves, host answers, key enrolled) and nothing else; the leg
+# still runs it again when it starts, since the Air can drop off in between.
+if [ "$SKIP_MAC" != "1" ]; then
+  [ -n "${OAM_MAC_HOST:-}" ] || fail "OAM_MAC_HOST not set (or set OAM_SKIP_MAC=1 to drop the mac assets)"
+  bash "$SCRIPT_DIR/build-platforms-tailnet.sh" --preflight-only \
+    || fail "the mac build host cannot be used -- see above. Fix that, or set OAM_SKIP_MAC=1 to drop the mac assets"
+fi
+[ "$SKIP_LINUX" = "1" ] || command -v gcloud >/dev/null 2>&1 || fail "gcloud CLI not found (or set OAM_SKIP_LINUX=1 to drop the linux asset)"
+
 # --porcelain, not `git diff --quiet`: untracked files count too -- the
 # remote legs tar the WORKING TREE, so an untracked file ships into builds.
 # Leftover gate-regenerated conformance stamps (e.g. from a failed prior
@@ -724,9 +741,6 @@ if [ -n "$free_gb" ] && [ "$free_gb" -lt 60 ]; then
   warn "only ${free_gb}GB free on this volume -- a release needs room for three target trees; prune with scripts/gc-target.sh"
 fi
 
-
-[ "$SKIP_MAC" = "1" ]   || [ -n "${OAM_MAC_HOST:-}" ] || fail "OAM_MAC_HOST not set (or set OAM_SKIP_MAC=1 to drop the mac assets)"
-[ "$SKIP_LINUX" = "1" ] || command -v gcloud >/dev/null 2>&1 || fail "gcloud CLI not found (or set OAM_SKIP_LINUX=1 to drop the linux asset)"
 ok "preflight ok (tag on remote, HEAD == $TAG, tree clean)"
 
 # --- local gate ----------------------------------------------------------------

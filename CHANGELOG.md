@@ -81,6 +81,18 @@ Release tooling only; no runtime behavior change.
   puppeteer's browser download, was already skipped. A sidecar whose tree gains an install
   script nobody has reviewed is reported as not answered, naming the script. The install also
   no longer fails when the Windows user folder's name has a space.
+- **The mac release leg reported a build host that was not on the release box's tailnet as a
+  DNS failure, after the release had already been tagged**. Its host check ran `nslookup`,
+  which reverse-resolves an IP address and, on Windows, skips the name-resolution policy rules
+  Tailscale can install MagicDNS as. It had passed for the build host's address on earlier
+  releases; on the tailnet the release box is on now it failed every tailnet address and name,
+  the box's own included, and a run given a tailnet IP was told to use "the tailnet IP". The
+  leg now asks ssh alone and says what failed -- the name does not resolve, nothing answers,
+  nothing listens on port 22, the host key changed, or key authentication was refused -- and
+  when nothing answers it prints what `tailscale status` lists, since a device that joins a
+  tailnet again gets a new address. `release-local.sh` runs that check at the start of its
+  preflight, before it bumps or tags; it used to reach the Air only after the local gate and
+  both Windows builds.
 
 ## [0.17.0] - 2026-09-24
 
