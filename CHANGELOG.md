@@ -72,6 +72,15 @@ Release tooling only; no runtime behavior change.
   `release-local.sh` read a gate ended by `taskkill /F`, or by an uncaught error, as "a sidecar
   failed", which sends the operator looking for an oam regression; it now says so only for a
   gate that wrote its verdict, and still stops the release either way.
+- **A process a sidecar's install script started could outlive the sidecar gate's install**
+  (#260). A lifecycle script can start a daemon whose parent then exits; no kill of npm's tree
+  reaches it, and it went on running in the gate's stage. The gate now installs with
+  `--ignore-scripts`, `--allow-git=none`, and a script shell and git that do not exist, so an
+  install starts nothing but npm, and a git dependency is refused with its reason.
+  The sidecars' installed trees are byte-identical either way: their one install script,
+  puppeteer's browser download, was already skipped. A sidecar whose tree gains an install
+  script nobody has reviewed is reported as not answered, naming the script. The install also
+  no longer fails when the Windows user folder's name has a space.
 
 ## [0.17.0] - 2026-09-24
 
