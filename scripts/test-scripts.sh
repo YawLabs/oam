@@ -996,11 +996,14 @@ EOF
 )"
 VMS_DETAILS_CR="$(sed 's/$/\r/' <<<"$VMS_DETAILS")"
 # The HTTP-error shape gcloud prints for a synchronous refusal, with the
-# trailing blank line it ends on. The not-found text is verbatim off a describe
-# on this box (2026-09-30); the permission one is that text with start's verb
-# (the wrapper is the same); the quota one is constructed from the documented
-# shape -- none has ever been logged here, and us-west1's CPU quotas leave no
-# way to provoke one.
+# trailing blank line it ends on. Provenance, since the group's premise is
+# gcloud's own words: NOTFOUND is verbatim off a describe on this box
+# (2026-09-30); PERM is that text with start's verb (the wrapper is the same);
+# HTTP_CAPACITY is today's operation message in that wrapper; QUOTA, BADTYPE
+# and BACKEND are constructed from the documented API messages (none has ever
+# been logged here, and us-west1's CPU quotas leave no way to provoke one);
+# AUTH is the SDK's own text (core/credentials/store.py, exceptions.py:126);
+# INTERRUPTED is core/util/keyboard_interrupt.py:36.
 VMS_HTTP_CAPACITY=$'ERROR: (gcloud.compute.instances.start) Could not fetch resource:\r\n - The zone \'projects/yaw-labs-prod/zones/us-central1-a\' does not have enough resources available to fulfill the request.  Try a different zone, or try again later.\r\n\r\n'
 VMS_QUOTA=$'ERROR: (gcloud.compute.instances.start) Could not fetch resource:\r\n - Quota \'N2_CPUS\' exceeded.  Limit: 100.0 in region us-west1.\r\n\r\n'
 VMS_PERM=$'ERROR: (gcloud.compute.instances.start) Could not fetch resource:\r\n - Required \'compute.instances.start\' permission for \'projects/yaw-labs-prod/zones/us-west1-b/instances/yaw-linux-builder\'\r\n\r\n'
@@ -1125,7 +1128,10 @@ group "build-platforms-gcp-iap.sh -- the start loop against a stubbed gcloud"
 # records the type. Nothing here reaches GCP. TMPDIR is private to the run.
 VMS_BIN="$SUITE_TMP/vms-bin"; VMS_TMP="$SUITE_TMP/vms-tmp"; VMS_STATE="$SUITE_TMP/vms-state"
 mkdir -p "$VMS_BIN" "$VMS_TMP" "$VMS_STATE"
-printf '%s\r\n' "$VMS_EXHAUSTED" > "$VMS_STATE/exhausted.txt"
+# CR on every line, as gcloud prints it: sed into the file, since printf '%s\r\n'
+# would put one CR after the last line only, and $(...) drops a trailing CRLF.
+sed 's/$/\r/' <<<"$VMS_EXHAUSTED" > "$VMS_STATE/exhausted.txt"
+printf '%s' "$VMS_QUOTA" > "$VMS_STATE/quota.txt"
 cat > "$VMS_BIN/gcloud" <<EOF
 #!/bin/bash
 S="$VMS_STATE"
@@ -1145,11 +1151,20 @@ case "\$a" in
   *"instances describe"*"machineType.basename()"*)      cat "\$S/type" ;;
   *"instances describe"*"resourcePolicies"*)            echo ;;
   *"instances describe"*"natIP"*)                       echo 203.0.113.9 ;;
-  *"instances set-machine-type"*)  t="\${a##*--machine-type=}"; echo "\${t%% *}" > "\$S/type" ;;
+  *"instances set-machine-type"*)
+    t="\${a##*--machine-type=}"; t="\${t%% *}"
+    # reject-set-<type>: the API refuses the type. interrupt-set-<type>: the
+    # change is applied, then gcloud reports a Ctrl-C the way Windows sees it.
+    if [ -e "\$S/reject-set-\$t" ]; then
+      printf "ERROR: (gcloud.compute.instances.set-machine-type) Could not fetch resource:\r\n - Invalid value for field 'resource.machineType': 'zones/us-west1-b/machineTypes/\$t'.\r\n\r\n" >&2; exit 1
+    fi
+    echo "\$t" > "\$S/type"
+    if [ -e "\$S/interrupt-set-\$t" ]; then printf '\n\nCommand killed by keyboard interrupt\n' >&2; exit 2; fi ;;
   *"instances start"*)
     if [ "\$(cat "\$S/type")" = "\$(cat "\$S/good-type")" ]; then echo RUNNING > "\$S/status"
+    elif [ -e "\$S/start-quota" ]; then cat "\$S/quota.txt" >&2; exit 1
     else cat "\$S/exhausted.txt" >&2; exit 1; fi ;;
-  *"instances stop"*)              echo TERMINATED > "\$S/status" ;;
+  *"instances stop"*)              echo 'Stopping instance(s) yaw-linux-builder...' >&2; echo TERMINATED > "\$S/status" ;;
   *"get-serial-port-output"*)      echo 'Started ssh.service - OpenBSD Secure Shell server.' ;;
   *) echo "stub gcloud: unexpected call: \$a" >&2; exit 97 ;;
 esac
@@ -1160,17 +1175,22 @@ echo 'Host key verification failed.' >&2
 exit 255
 EOF
 chmod +x "$VMS_BIN/gcloud" "$VMS_BIN/ssh"
-# vms_run <good-type|none> [moved]  -- the orchestrator against the stubs, from
-# a TERMINATED e2-highmem-4, with n2-highmem-4 the one fallback and no budget
-# for a second pass. Stdout to VMS_OUT, stderr to VMS_ERR, status to VMS_RC,
-# the stub's call log to VMS_LOG.
+# vms_run <good-type|none> [flag...]  -- the orchestrator against the stubs,
+# from a TERMINATED e2-highmem-4, with n2-highmem-4 the one fallback and no
+# budget for a second pass. Flags are state files the stub reads: moved,
+# start-quota, reject-set-<type>, interrupt-set-<type>. Every OAM_* knob the
+# orchestrator reads is pinned, so a shell that exports OAM_KEEP_VM=1 or
+# another project cannot turn a run red. Stdout to VMS_OUT, stderr to VMS_ERR,
+# status to VMS_RC, the stub's call log to VMS_LOG.
 vms_run(){
-  rm -f "$VMS_STATE/log" "$VMS_STATE/moved"
+  rm -f "$VMS_STATE/log" "$VMS_STATE/moved" "$VMS_STATE/start-quota" "$VMS_STATE"/reject-set-* "$VMS_STATE"/interrupt-set-*
   echo TERMINATED > "$VMS_STATE/status"; echo e2-highmem-4 > "$VMS_STATE/type"
-  echo "$1" > "$VMS_STATE/good-type"
-  [ "${2:-}" = "moved" ] && : > "$VMS_STATE/moved"
+  echo "$1" > "$VMS_STATE/good-type"; shift
+  local flag; for flag in "$@"; do : > "$VMS_STATE/$flag"; done
   VMS_OUT="$(PATH="$VMS_BIN:$PATH" TMPDIR="$VMS_TMP" OAM_GCP_FALLBACK_MACHINE_TYPES=n2-highmem-4 \
     OAM_VM_START_BUDGET_S=0 OAM_IAP_SSH_MODE=direct OAM_GCP_BUILDER_ZONE=us-west1-b \
+    OAM_GCP_PROJECT=yaw-labs-prod OAM_GCP_BUILDER_INSTANCE=yaw-linux-builder OAM_LINUX_USER=jeff \
+    OAM_KEEP_VM=0 OAM_KEEP_VM_SCHEDULE=0 OAM_LINUX_FAST=0 \
     bash scripts/build-platforms-gcp-iap.sh --mode=release 2>"$SUITE_TMP/vms-err")"
   VMS_RC=$?
   VMS_ERR="$(sed 's/\x1b\[[0-9;]*m//g' "$SUITE_TMP/vms-err")"
@@ -1202,6 +1222,30 @@ if [ "$VMS_RC" != "0" ] && [ -z "$VMS_OUT" ] \
    && ! grep -E 'instances stop.*--async' <<<"$VMS_LOG" >/dev/null \
    && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ] && [ "$(cat "$VMS_STATE/status")" = "TERMINATED" ]; then pass
 else fail "rc=$VMS_RC stop@${VMS_STOP_LINE:-?} restore@${VMS_BACK_LINE:-?} type=$(cat "$VMS_STATE/type") log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+it "and the way back is printed before the stop begins"
+VMS_HINT_LINE="$(grep -n -- '-- if this is interrupted, run:' <<<"$VMS_ERR" | head -1 | cut -d: -f1)"
+VMS_STOPPING_LINE="$(grep -n 'Stopping instance(s) yaw-linux-builder' <<<"$VMS_ERR" | head -1 | cut -d: -f1)"
+if [ -n "$VMS_HINT_LINE" ] && [ -n "$VMS_STOPPING_LINE" ] && [ "$VMS_HINT_LINE" -lt "$VMS_STOPPING_LINE" ]; then pass
+else fail "hint@${VMS_HINT_LINE:-?} stop@${VMS_STOPPING_LINE:-?} in stderr"; fi
+
+vms_run n2-highmem-4 interrupt-set-n2-highmem-4
+it "a Ctrl-C that lands after set-machine-type was applied ends the run, and the VM's real type is what gets put back"
+if [ "$VMS_RC" != "0" ] \
+   && grep -qF "interrupted while setting yaw-linux-builder to n2-highmem-4" <<<"$VMS_ERR" \
+   && grep -qF "set yaw-linux-builder back to e2-highmem-4" <<<"$VMS_ERR" \
+   && [[ "$(tail -1 <<<"$VMS_LOG")" == *"instances set-machine-type yaw-linux-builder"*"--machine-type=e2-highmem-4" ]] \
+   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ]; then pass
+else fail "rc=$VMS_RC type=$(cat "$VMS_STATE/type") log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+vms_run none start-quota reject-set-n2-highmem-4
+it "a quota on the VM's type and a fallback the API rejects drop both, and the run ends with nothing left to try"
+if [ "$VMS_RC" != "0" ] \
+   && grep -qF "e2-highmem-4 is not usable here -- not trying it again this run: Quota 'N2_CPUS' exceeded." <<<"$VMS_ERR" \
+   && grep -qF "yaw-linux-builder cannot be set to n2-highmem-4 -- not trying it again this run: Invalid value for field" <<<"$VMS_ERR" \
+   && grep -qF "no machine type left to try for yaw-linux-builder in us-west1-b (tried: e2-highmem-4; last: Invalid value" <<<"$VMS_ERR" \
+   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ] && ! grep -q 'instances stop' <<<"$VMS_LOG"; then pass
+else fail "rc=$VMS_RC log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
 
 vms_run none moved
 it "an instance that moved zones is found by name, and every later call goes to the zone it is in"
