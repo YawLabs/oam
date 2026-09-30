@@ -93,6 +93,20 @@ Release tooling only; no runtime behavior change.
   that joins a tailnet again gets a new address. `release-local.sh` runs that check at the
   start of its preflight, before it bumps or tags; it used to reach the Air only after the
   local gate and both Windows builds.
+- **The linux release leg gave up after five minutes when its builder VM's zone had no
+  capacity for the VM's machine type, and could only guess why** (#262). Six starts of the
+  VM a minute apart were each refused for want of e2-highmem-4 in us-west1-b, with gcloud's
+  reason sent to `/dev/null`, and the zone was still out twenty minutes later. The leg now
+  walks a list of same-zone fallback machine types (`OAM_GCP_FALLBACK_MACHINE_TYPES`;
+  types on separate hardware pools that boot the VM's disk and NIC as they are), setting the
+  stopped VM to each before starting it, a minute between passes, for
+  `OAM_VM_START_BUDGET_S` seconds; the VM's own type is put back when the run stops it, a
+  failed run included. Every refusal is classified from gcloud's own text: no capacity
+  moves to the next type, a quota or a type the API rejects drops that type for the run, a
+  missing permission or an expired credential ends the run at once, and a Ctrl-C, which
+  gcloud on Windows turns into an ordinary exit, ends it too. A builder moved to another
+  zone is found by name. The final message names every type tried, gcloud's last words,
+  and the zone move.
 
 ## [0.17.0] - 2026-09-24
 
