@@ -46,7 +46,7 @@ Release tooling only; no runtime behavior change.
   shipped on a warning. The gate now recognizes the refusal from the declared `engines.node` of
   the sidecar and of every package in its installed dependency tree, and from the refusal text
   fetch-mcp, tailscale-mcp and playwright print, and holds the failure against oam.
-- **The sidecar gate probed a damaged install without noticing** (#256). npm can leave a
+- **The sidecar gate probed a damaged install without noticing** (#256, #258). npm can leave a
   required package as an empty folder that later installs keep: the gate's shared stage held
   15, and every sidecar still passed only because none of them loaded one. A sidecar that did
   would have failed on both runtimes and been filed as broken upstream. After installing, the
@@ -54,11 +54,18 @@ Release tooling only; no runtime behavior change.
   it left out, rebuilds the stage from scratch once when it finds one, and reports what is
   still missing as a SKIP that names it. Runs also take a lock on the shared stage, so two at
   once -- one way the damage happens -- now wait for each other.
-- **An npm install that ran out of time kept running** (#257). The gate's install timeout
+- **An npm install that ran out of time kept running** (#257, #258). The gate's install timeout
   killed only the process it spawned: on Windows the shell around npm, so npm itself ran on,
   installing into the stage while the gate retried the install and probed the sidecars. A
-  timeout now kills npm and everything it started, and moves the half-written `node_modules`
-  aside, so the next install starts clean.
+  timeout now kills npm and every process still under it, and moves the half-written
+  `node_modules` aside, so the next install starts clean.
+- **A Ctrl-C of the sidecar gate left npm installing into its stage** (#258). The gate died at
+  once, and npm took the interrupt as the cue to finish its current step and roll back: in one
+  measured run it was still going 40 seconds later. The gate now kills npm's process tree
+  first, moves what it half-wrote aside, releases its stage lock, and then dies of the
+  interrupt. `release-local.sh` also now stops on a gate that was killed by a signal, ended by
+  `Stop-Process`, or crashed (a status above 128, or 127), where it used to warn and go on to
+  publish.
 
 ## [0.17.0] - 2026-09-24
 
