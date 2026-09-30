@@ -1231,15 +1231,31 @@ else fail "ci-local.sh no longer runs 'node scripts/mcp-sidecar-matrix.mjs --sel
 # signal -- a Ctrl-C (130; Git Bash reports Windows' STATUS_CONTROL_C_EXIT the
 # same way), SIGHUP, SIGKILL, SIGTERM -- or ended by Stop-Process or a native
 # crash (127 under Git Bash) must stop the release. Every status above 1 used
-# to be a warn, and a warn carries on to publish.
+# to be a warn, and a warn carries on to publish. And 1 is "a sidecar failed"
+# only with the report the gate writes once it has a verdict: taskkill /F and
+# an uncaught error end it with 1 and no report (1-noreport).
 it "release-local.sh stops the release when the sidecar matrix is interrupted, killed or crashed"
 MX_BLOCK="$(awk '/^  matrix_status=\$\?$/ { f = 1 } f { print } f && /^  esac$/ { exit }' scripts/release-local.sh)"
+MX_STUBS='ok(){ echo ok; }; warn(){ echo warn; }; fail(){ case "$1" in *"a sidecar failed"*) echo fail-verdict ;; *) echo fail ;; esac; exit 1; }'
+MX_REPORT="$(mktemp)"
 MX_GOT=""
-for st in 0 1 2 3 127 129 130 137 143; do
-  MX_GOT="$MX_GOT $st:$(bash -c "ok(){ echo ok; }; warn(){ echo warn; }; fail(){ echo fail; exit 1; }; (exit $st); $MX_BLOCK" 2>/dev/null | head -1)"
+for st in 0 1 1-noreport 2 3 127 129 130 137 143; do
+  MX_CODE="${st%-noreport}"
+  rm -f "$MX_REPORT"
+  [ "$st" = "$MX_CODE" ] && printf '{\n  "exitCode": %s,\n  "sidecars": []\n}\n' "$MX_CODE" > "$MX_REPORT"
+  MX_GOT="$MX_GOT $st:$(bash -c "$MX_STUBS; matrix_report='$MX_REPORT'; (exit $MX_CODE); $MX_BLOCK" 2>/dev/null | head -1)"
 done
-if [ "$MX_GOT" = " 0:ok 1:fail 2:warn 3:warn 127:fail 129:fail 130:fail 137:fail 143:fail" ]; then pass
+rm -f "$MX_REPORT"
+if [ "$MX_GOT" = " 0:ok 1:fail-verdict 1-noreport:fail 2:warn 3:warn 127:fail 129:fail 130:fail 137:fail 143:fail" ]; then pass
 else fail "release-local.sh's matrix step read the statuses as:$MX_GOT"; fi
+
+# And the report it reads is this run's: one an earlier release left would
+# make a gate killed before its verdict read as a sidecar failing.
+it "release-local.sh removes the previous sidecar matrix report before running the gate"
+MX_RM="$(grep -n '^  rm -f "\$matrix_report"$' scripts/release-local.sh | head -1 | cut -d: -f1)"
+MX_RUN="$(grep -n 'node "\$REPO_DIR/scripts/mcp-sidecar-matrix\.mjs" --json="\$matrix_report"$' scripts/release-local.sh | head -1 | cut -d: -f1)"
+if [ -n "$MX_RM" ] && [ -n "$MX_RUN" ] && [ "$MX_RM" -lt "$MX_RUN" ]; then pass
+else fail "release-local.sh no longer removes \$matrix_report before the gate runs (rm at '${MX_RM}', gate at '${MX_RUN}')"; fi
 
 # #90 shipped a whole second build configuration -- oam_engine without `napi`,
 # oam_cli without its passthrough -- that was verified by hand once and then had
