@@ -66,6 +66,12 @@ Release tooling only; no runtime behavior change.
   interrupt. `release-local.sh` also now stops on a gate that was killed by a signal, ended by
   `Stop-Process`, or crashed (a status above 128, or 127), where it used to warn and go on to
   publish.
+- **A Ctrl-Break of the sidecar gate left a half-written install, and a killed gate was
+  reported as a failing sidecar** (#259). npm has no Ctrl-Break handler, so Ctrl-Break ended npm
+  and the gate on the spot, mid-install; it now gets the same cleanup as Ctrl-C.
+  `release-local.sh` read a gate ended by `taskkill /F`, or by an uncaught error, as "a sidecar
+  failed", which sends the operator looking for an oam regression; it now says so only for a
+  gate that wrote its verdict, and still stops the release either way.
 
 ## [0.17.0] - 2026-09-24
 

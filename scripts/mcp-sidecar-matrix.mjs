@@ -73,13 +73,15 @@
 // (install failure, an install still damaged after a rebuild, broken
 // upstream, demoted fixture); 2 for bad usage, or when another run has held
 // the shared stage for longer than this one will wait. An interrupt (Ctrl-C,
-// SIGTERM, SIGHUP) ends npm first; then the matrix dies of the signal (on
-// Windows, exits STATUS_CONTROL_C_EXIT), so a calling script sees an
-// interrupt -- which release-local.sh treats as fatal.
+// Ctrl-Break, SIGTERM, SIGHUP) ends npm first; then the matrix dies of the
+// signal (on Windows, exits STATUS_CONTROL_C_EXIT), so a calling script sees
+// an interrupt -- which release-local.sh treats as fatal. The --json report is
+// written last, only once there is a verdict.
 // =============================================================================
 
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { connect, createServer as createTcpServer } from "node:net";
 import { basename, dirname, join, resolve } from "node:path";
@@ -515,10 +517,10 @@ let ending = false;
  *  the run stops where it stands -- no retry of an install endRun just killed,
  *  no probe of a stage it is moving aside. And nothing starts before one turn
  *  of the event loop, which is where an interrupt is handled: one that arrived
- *  during the synchronous work before this call (the startup sweep, the
- *  fixture) then finds nothing in flight and ends the run at once, instead of
- *  killing an npm started after the Ctrl-C and moving a whole, untouched
- *  install aside as half-written. */
+ *  during the synchronous work before this call (the fixture setup) then finds
+ *  nothing in flight and ends the run at once, instead of killing an npm
+ *  started after the Ctrl-C and moving a whole, untouched install aside as
+ *  half-written. */
 async function runBounded(cmd, args, { timeoutMs, shell = false, env = process.env, spawnFn = spawn }) {
   await new Promise((resolveTurn) => setImmediate(resolveTurn));
   return new Promise((resolveP) => {
@@ -564,8 +566,15 @@ async function runBounded(cmd, args, { timeoutMs, shell = false, env = process.e
   });
 }
 
-/** End the run on an interrupt -- Ctrl-C (SIGINT), SIGTERM, or the terminal
- *  going away (SIGHUP) -- without leaving npm writing into the stage.
+// The interrupts endRun handles. Ctrl-Break (SIGBREAK) exists only on Windows,
+// and unhandled it is the worst of them: npm registers no handler for it, so
+// it dies mid-install with no rollback, and the matrix dies with it, running no
+// exit handler -- the half-written tree and the lock both left behind.
+const INTERRUPTS = ["SIGINT", "SIGTERM", "SIGHUP", ...(process.platform === "win32" ? ["SIGBREAK"] : [])];
+
+/** End the run on an interrupt -- Ctrl-C (SIGINT), Ctrl-Break (SIGBREAK),
+ *  SIGTERM, or the terminal going away (SIGHUP) -- without leaving npm writing
+ *  into the stage.
  *
  *  A Ctrl-C at the terminal reaches npm directly as well (runBounded), but npm
  *  takes an interrupt mid-install as the cue to finish the step it is on --
@@ -577,8 +586,8 @@ async function runBounded(cmd, args, { timeoutMs, shell = false, env = process.e
  *  runBounded has in flight is killed first, tree and all, and the
  *  half-written node_modules it leaves is renamed aside, as after a timeout
  *  (npmInstall) -- renamed only: deleting it is the next run's startup sweep,
- *  so the exit does not wait on a delete, which blocks the event loop and with
- *  it a second Ctrl-C. Then the stage lock is released and the matrix dies of
+ *  so the exit does not wait on a delete of a whole tree, which takes
+ *  seconds. Then the stage lock is released and the matrix dies of
  *  the interrupt (dieOf). With nothing in flight, or on a second interrupt, it
  *  does that at once; a second interrupt during the rename's retries leaves
  *  what is there to the next run's damage check.
@@ -616,10 +625,11 @@ async function endRun(
  *  that sees its child exit normally after a Ctrl-C concludes the child dealt
  *  with it and carries on: release-local.sh went on to cut the release when
  *  endRun exited 130. On Windows that death is STATUS_CONTROL_C_EXIT, the
- *  code node's own Ctrl-C handling ends a process with, and which Git Bash
- *  reports as a death by SIGINT. Elsewhere it is the signal itself, raised again with no
- *  listener left; that runs no 'exit' handler, so endRun releases the lock
- *  first. Should the process outlive that, it exits 128 + the signal's number.
+ *  code node's own Ctrl-C and Ctrl-Break handling ends a process with, and
+ *  which Git Bash reports as a death by SIGINT. Elsewhere it is the signal
+ *  itself, raised again with no listener left; that runs no 'exit' handler,
+ *  so endRun releases the lock first. Should the process outlive that, it
+ *  exits 128 + the signal's number.
  *  Self-contained, so the self-test can run it in a child of its own. */
 function dieOf(signal) {
   if (process.platform === "win32") process.exit(0xc000013a);
@@ -788,7 +798,7 @@ async function wipeStageModules({ sweep = true } = {}) {
       await sleep(WIPE_RETRY_MS);
     }
   }
-  if (sweep) sweepStageTrash();
+  if (sweep) await sweepStageTrash();
   return null;
 }
 // About 3s in all: long enough for a killed process tree's handles to close,
@@ -796,8 +806,19 @@ async function wipeStageModules({ sweep = true } = {}) {
 const WIPE_ATTEMPTS = 15;
 const WIPE_RETRY_MS = 200;
 
-/** Delete, best effort, every node_modules this or an earlier run moved aside. */
-function sweepStageTrash() {
+/** Delete, best effort, every node_modules this or an earlier run moved aside.
+ *
+ *  Asynchronously, so the event loop keeps turning while it runs: a Ctrl-C at
+ *  startup is handled at once (endRun, with nothing in flight) instead of
+ *  after the whole delete, and what is left is the next run's to sweep. On a
+ *  copy of the real stage (123 MB) the synchronous delete took 2.3-2.6s
+ *  with the loop stalled; this one took 1.0s with the loop running.
+ *
+ *  Retried here, a few times and briefly, never through rm's own maxRetries:
+ *  the promise rm retries at every directory level of the tree, so one file
+ *  held open (a handle without delete sharing) cost 4x per level of depth --
+ *  measured 13s at 3 levels and 53s at 4, where rmSync gave up in 0.6s. */
+async function sweepStageTrash() {
   let names = [];
   try {
     names = readdirSync(stage).filter((name) => name.startsWith("node_modules.trash-"));
@@ -805,13 +826,19 @@ function sweepStageTrash() {
     return;
   }
   for (const name of names) {
-    try {
-      rmSync(join(stage, name), { recursive: true, force: true, maxRetries: 3 });
-    } catch {
-      // Held open; the next run tries again.
+    for (let attempt = 1; attempt <= SWEEP_ATTEMPTS; attempt++) {
+      try {
+        await rm(join(stage, name), { recursive: true, force: true });
+        break;
+      } catch {
+        // Held open: a little later, then the next run tries again.
+        if (attempt < SWEEP_ATTEMPTS) await sleep(100 * attempt);
+      }
     }
   }
 }
+// At most 0.3s of waiting per moved-aside tree, whatever its depth.
+const SWEEP_ATTEMPTS = 3;
 
 // How long a run waits for another run to finish with the shared stage, and
 // how old a lock must be before it is taken over whatever its pid says -- a
@@ -2294,7 +2321,7 @@ async function selfTest() {
         // And the run owns the stage before touching it: the lock comes before
         // the trash sweep, the fixture wipe and the install, all at column 0.
         const lockAt = source.search(/^const lockProblem = await lockStage\(join\(stage, "\.matrix\.lock"\)\);/m);
-        const sweepAt = source.search(/^sweepStageTrash\(\);/m);
+        const sweepAt = source.search(/^await sweepStageTrash\(\);$/m);
         const fixtureAt = source.search(/^prepareFixture\(\);/m);
         const installAt = source.search(/^const \{ installErrors, damaged, rebuilt \} = await settleInstall\(/m);
         assertDeep(
@@ -2343,7 +2370,26 @@ async function selfTest() {
         // with production's own kill, rename, release and death, which the
         // interrupt case replaces and only the source shows. (lockAt and
         // installAt as found above.)
-        const signalsAt = source.search(/^for \(const signal of \["SIGINT", "SIGTERM", "SIGHUP"\]\) process\.on\(signal, \(\) => endRun\(signal\)\);$/m);
+        const signalsAt = source.search(/^for \(const signal of INTERRUPTS\) process\.on\(signal, \(\) => endRun\(signal\)\);$/m);
+        // Every interrupt this platform has -- Ctrl-Break only on Windows,
+        // where unhandled it kills npm and the matrix with no cleanup at all.
+        assertDeep(
+          INTERRUPTS,
+          process.platform === "win32" ? ["SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"] : ["SIGINT", "SIGTERM", "SIGHUP"],
+          "endRun handles Ctrl-C, SIGTERM, a terminal gone away and, on Windows, Ctrl-Break",
+        );
+        // The startup sweep runs once an interrupt is handled, and deletes
+        // asynchronously, so a Ctrl-C during it is handled at once; a
+        // synchronous delete held the event loop, and the Ctrl-C, for seconds.
+        // And never with rm's own maxRetries, which retries at every level of
+        // the tree: one held-open file cost 4x per level of depth.
+        const sweepFnAt = source.search(/^async function sweepStageTrash\(\) \{$/m);
+        const sweepBody = sweepFnAt < 0 ? "" : source.slice(sweepFnAt, source.indexOf("\n}\n", sweepFnAt));
+        assertDeep(
+          [sweepFnAt > 0, sweepBody.includes("await rm("), sweepBody.includes("rmSync("), sweepBody.includes("maxRetries"), sweepAt > signalsAt],
+          [true, true, false, false, true],
+          "the startup sweep deletes without blocking the event loop or retrying per directory, after the interrupt handlers are in place",
+        );
         const guardAt = source.search(/^process\.stderr\.on\("error", \(\) => \{\}\);$/m);
         // endRun's head is its signature up to the `) {` that opens its body,
         // inside endRun: a close not found there is no match, not a slice that
@@ -3573,8 +3619,8 @@ if (lockProblem) {
 // is dead, but possibly before the half-written tree is renamed aside, and not
 // as the death by the signal a calling script has to see.
 process.stderr.on("error", () => {});
-for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, () => endRun(signal));
-sweepStageTrash();
+for (const signal of INTERRUPTS) process.on(signal, () => endRun(signal));
+await sweepStageTrash();
 prepareFixture();
 
 // In-place progress only on a terminal. Captured by release-local.sh, a `\r`

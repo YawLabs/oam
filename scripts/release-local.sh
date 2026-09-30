@@ -899,6 +899,12 @@ else
   # The machine-readable report goes beside the stamps, never into RELEASE_DIR:
   # `gh release create "$RELEASE_DIR"/*` would publish it as a release asset.
   matrix_report="$STAMP_STASH/mcp-sidecar-matrix.json"
+  # The matrix writes its report last, only once it has a verdict, so the
+  # report is how a verdict is told from a gate that died first (below). That
+  # holds only for a report this run wrote. STAMP_STASH is a fresh mktemp dir
+  # per run, so none is there today; the rm keeps it so should the stash ever
+  # be reused.
+  rm -f "$matrix_report"
   set +e
   # The freshly built NATIVE asset -- the matrix must exercise the binary this
   # release actually ships, not whatever oam happens to be on PATH.
@@ -912,14 +918,24 @@ else
   # (TerminateProcess with -1) and for a native crash code it maps to no
   # signal. That is the operator stopping the release, or the gate dying
   # mid-verdict, never "could not complete" -- and such a status used to fall
-  # into the warn below, which carries on to publish. (taskkill /F ends it
-  # with 1, read below as a failed sidecar: wrongly named, but fatal.)
+  # into the warn below, which carries on to publish.
   if [ "$matrix_status" -gt 128 ] || [ "$matrix_status" -eq 127 ]; then
     fail "sidecar matrix was interrupted, killed or crashed (status $matrix_status) -- stopping; nothing has been published"
   fi
   case "$matrix_status" in
     0) ok "every oam-hosted sidecar answered a tool call on this build (report: $matrix_report)" ;;
-    1) fail "a sidecar failed on this build -- see above; nothing has been published (report: $matrix_report)" ;;
+    1)
+      # 1 is also what taskkill /F and an uncaught JS error end the gate with,
+      # before it has any verdict -- and read as "a sidecar failed", that sends
+      # the operator looking for an oam regression that is not there. Only a
+      # report this run wrote, recording 1, is a sidecar failing. Fatal either
+      # way.
+      if grep -q '"exitCode": 1,' "$matrix_report" 2>/dev/null; then
+        fail "a sidecar failed on this build -- see above; nothing has been published (report: $matrix_report)"
+      else
+        fail "sidecar matrix ended before its verdict (status 1 and no report: killed by taskkill /F, or crashed -- see above) -- stopping; nothing has been published"
+      fi
+      ;;
     *) warn "sidecar matrix could not complete (status $matrix_status) -- result is INCOMPLETE, not clean; the unanswered sidecars are named above" ;;
   esac
 fi
