@@ -17,6 +17,11 @@
 #   ssh_transport_pick  direct ssh or the IAP tunnel -- the choice that decides
 #   last_nonblank_line  whether a run reaches the builder at all, and what it
 #                       says when it cannot.
+#   vm_start_verdict    what a failed `instances start` means -- wait, switch
+#   vm_start_types      machine type, or stop -- and which types to walk. The
+#   gcloud_error_message  2026-09-30 release died on a zone with no
+#   vm_start_zones_available  e2-highmem-4 for its whole retry window, with
+#                       gcloud's stderr thrown away and the log guessing.
 #
 # Same convention as lib/build-locks.sh: sourced, never executed. All functions
 # RETURN status rather than exiting; the caller owns fail()/warn(). The one
@@ -230,6 +235,116 @@ direct_ssh_hint() {
       printf 'nothing is listening on %s:22 -- sshd is down or still starting' "$ip" ;;
   esac
   return 0
+}
+
+# --- VM start: zone capacity, quotas, fallback machine types ------------------
+#
+# `gcloud compute instances start` fails for reasons that want different
+# answers, and until 2026-09-30 the orchestrator threw its stderr away and
+# retried whatever it was six times, a minute apart. That day us-west1-b had
+# no e2-highmem-4 for the whole window (ZONE_RESOURCE_POOL_EXHAUSTED on all
+# six starts in the operations log, and still twenty minutes later), the log
+# could only say "usually zone capacity", and the v0.17.1 release stopped
+# there. A zone short of one machine type usually has another that boots the
+# same disk, so the orchestrator now walks a list of fallback types and keeps
+# walking it for a budget; these are the pure parts of that.
+#
+# gcloud prints two shapes, CRLF-terminated on Windows. A failed OPERATION --
+# the start was accepted and then failed on the zone -- is a YAML block after
+# "ERROR: (gcloud.compute.instances.start) ---" (captured 2026-09-30):
+#   code: ZONE_RESOURCE_POOL_EXHAUSTED
+#   errorDetails:
+#   - errorInfo: ... reason: resource_availability ... zonesAvailable: ''
+#   message: The zone 'projects/P/zones/Z' does not have enough resources
+#     available to fulfill the request.  Try a different zone, or try again later.
+# A synchronous HTTP error -- 403 permission, 404 not found, 400 invalid
+# value, quota -- is "Could not fetch resource:" with the message as a " - "
+# bullet (captured the same day, off a describe; start differs in the verb):
+#   ERROR: (gcloud.compute.instances.describe) Could not fetch resource:
+#    - Required 'compute.instances.get' permission for 'projects/P/zones/Z/instances/I'
+# Both are matched by substring, never by position. A Ctrl-C lands on gcloud
+# too, and on Windows gcloud then EXITS (code 2) with a line of its own rather
+# than dying of the signal -- so without the first verdict below, bash would
+# carry on to the next type.
+
+# vm_start_verdict <gcloud-stderr>
+# Echoes what the failure means for the start loop:
+#   interrupted  the operator hit Ctrl-C: stop now, whatever else the text says
+#   capacity     the zone has none of this machine type right now: try the
+#                next type now, and this one again on the next pass
+#   quota        the project's quota for this type's CPU family is used up:
+#                waiting does not clear it, so the type is out for the run
+#   unsupported  the API rejects this type here (not offered in the zone, or
+#                the disk or NIC cannot go with it): out for the run, too
+#   permanent    retrying cannot help and no other type would (permission,
+#                credentials, a missing instance): the run fails, with the text
+#   unknown      anything else (a backend error, a timeout, empty text):
+#                retried within the budget, printed verbatim
+vm_start_verdict() {
+  local t="${1//$'\r'/}"
+  if grep -qF 'Command killed by keyboard interrupt' <<<"$t"; then
+    printf 'interrupted'
+  elif grep -qE 'ZONE_RESOURCE_POOL_EXHAUSTED|does not have enough resources available|reason: resource_availability|currently unavailable in the' <<<"$t"; then
+    printf 'capacity'
+  elif grep -qE 'QUOTA_EXCEEDED|[Qq]uota .* exceeded' <<<"$t"; then
+    printf 'quota'
+  elif grep -qE 'INVALID_ARGUMENT|Invalid value|UNSUPPORTED_OPERATION|[Nn]ot supported|Unsupported|does not exist in zone|machineTypes/[^ ]* was not found' <<<"$t"; then
+    printf 'unsupported'
+  elif grep -qE 'PERMISSION_DENIED|[Pp]ermission .*denied|does not have permission|Required .* permission|[Ff]orbidden|NOT_FOUND|was not found|problem refreshing your current auth tokens|Reauthentication required|do not currently have an active account|invalid_grant' <<<"$t"; then
+    printf 'permanent'
+  else
+    printf 'unknown'
+  fi
+}
+
+# vm_start_types <current-type> <fallback-list>
+# One machine type per line: the VM's own type first, then each fallback that
+# is not it and not already listed, so a list that repeats the VM's type does
+# not try it twice a pass. CRs are stripped (gcloud on Windows). Non-zero,
+# echoing nothing, for a blank current type: the caller then has nothing to
+# restore to, and must not change the type at all.
+vm_start_types() {
+  local cur="${1//$'\r'/}" list="${2//$'\r'/}" t seen
+  cur="${cur//[[:space:]]/}"
+  [ -n "$cur" ] || return 1
+  printf '%s\n' "$cur"
+  seen=" $cur "
+  for t in $list; do
+    case "$seen" in *" $t "*) continue ;; esac
+    printf '%s\n' "$t"
+    seen="$seen$t "
+  done
+}
+
+# gcloud_error_message <gcloud-stderr>
+# The one line worth showing an operator: the top-level `message:` of the
+# operation-error shape with its YAML continuation lines joined, else the
+# " - " bullet of the HTTP-error shape, else the last non-blank line. CRs
+# stripped first. Non-zero, echoing nothing, when there is no text at all.
+gcloud_error_message() {
+  local t="${1//$'\r'/}" msg
+  msg="$(awk '
+    /^message: / { sub(/^message: /, ""); m = $0; inmsg = 1; next }
+    inmsg && /^[ \t]+[^ \t]/ { sub(/^[ \t]+/, ""); m = m " " $0; next }
+    { inmsg = 0 }
+    END { if (m != "") print m }' <<<"$t")"
+  [ -n "$msg" ] || msg="$(awk '/^ +- / { sub(/^ +- /, ""); print; exit }' <<<"$t")"
+  [ -n "$msg" ] || msg="$(last_nonblank_line "$t" || true)"
+  [ -n "$msg" ] || return 1
+  printf '%s' "$msg"
+}
+
+# vm_start_zones_available <gcloud-stderr>
+# The zones gcloud says DO have the type (`zonesAvailable:` in the error's
+# metadata), comma-separated as given, quotes and blanks stripped. Non-zero,
+# echoing nothing, when the field is absent or empty -- the 2026-09-30
+# reading was `zonesAvailable: ''`.
+vm_start_zones_available() {
+  local t="${1//$'\r'/}" z
+  z="$(awk '/^[ \t]*zonesAvailable:/ { sub(/^[ \t]*zonesAvailable:[ \t]*/, ""); print; exit }' <<<"$t")"
+  z="${z//\'/}"; z="${z//\"/}"; z="${z//[[:space:]]/}"
+  [ -n "$z" ] || return 1
+  printf '%s' "$z"
 }
 
 # --- background process reaping -----------------------------------------------

@@ -927,6 +927,337 @@ else
 fi
 
 # =============================================================================
+group "iap-helpers.sh -- VM start: zone capacity, quota, fallback machine types"
+# =============================================================================
+# gcloud's stderr for the start that failed six times on 2026-09-30, verbatim,
+# and fed CRLF-terminated as gcloud on Windows prints it. The v0.17.1 release
+# stopped on this with the text thrown away and the log guessing.
+VMS_EXHAUSTED="$(cat <<'EOF'
+Starting instance(s) yaw-linux-builder...
+................................failed.
+ERROR: (gcloud.compute.instances.start) ---
+code: ZONE_RESOURCE_POOL_EXHAUSTED
+errorDetails:
+- help:
+    links:
+    - description: Troubleshooting documentation
+      url: https://cloud.google.com/compute/docs/resource-error
+- localizedMessage:
+    locale: en-US
+    message: A e2-highmem-4 VM instance is currently unavailable in the us-west1-b
+      zone. Alternatively, you can try your request again with a different VM hardware
+      configuration or at a later time. For more information, see the troubleshooting
+      documentation.
+- errorInfo:
+    domain: compute.googleapis.com
+    metadatas:
+      attachment: ''
+      vmType: e2-highmem-4
+      zone: us-west1-b
+      zonesAvailable: ''
+    reason: resource_availability
+message: The zone 'projects/yaw-labs-prod/zones/us-west1-b' does not have enough resources
+  available to fulfill the request.  Try a different zone, or try again later.
+EOF
+)"
+VMS_EXHAUSTED_CR="$(sed 's/$/\r/' <<<"$VMS_EXHAUSTED")"
+# The other capacity code, with a bare (unquoted) zonesAvailable: the body of
+# the 2026-09-28 13:48 operation in this project's operations log, laid out as
+# gcloud printed today's.
+VMS_DETAILS="$(cat <<'EOF'
+Starting instance(s) typed-arm-probe...
+................................failed.
+ERROR: (gcloud.compute.instances.start) ---
+code: ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS
+errorDetails:
+- help:
+    links:
+    - description: Troubleshooting documentation
+      url: https://cloud.google.com/compute/docs/resource-error
+- localizedMessage:
+    locale: en-US
+    message: A t2a-standard-2 VM instance is currently unavailable in the us-central1-f
+      zone. Consider trying your request in the us-central1-b, us-central1-a zone(s),
+      which currently has capacity to accommodate your request. Alternatively,
+      you can try your request again with a different VM hardware configuration
+      or at a later time. For more information, see the troubleshooting documentation.
+- errorInfo:
+    domain: compute.googleapis.com
+    metadatas:
+      attachment: ''
+      vmType: t2a-standard-2
+      zone: us-central1-f
+      zonesAvailable: us-central1-b,us-central1-a
+    reason: resource_availability
+message: The zone 'projects/yaw-labs-prod/zones/us-central1-f' does not have enough
+  resources available to fulfill the request.  'NULL:0/NULL:0/NULL:0 (state:STOCKOUT,
+  sub-state:STOCKOUT, resource type:compute)'.
+EOF
+)"
+VMS_DETAILS_CR="$(sed 's/$/\r/' <<<"$VMS_DETAILS")"
+# The HTTP-error shape gcloud prints for a synchronous refusal, with the
+# trailing blank line it ends on. Provenance, since the group's premise is
+# gcloud's own words: NOTFOUND is verbatim off a describe on this box
+# (2026-09-30); PERM is that text with start's verb (the wrapper is the same);
+# HTTP_CAPACITY is today's operation message in that wrapper; QUOTA, BADTYPE
+# and BACKEND are constructed from the documented API messages (none has ever
+# been logged here, and us-west1's CPU quotas leave no way to provoke one);
+# AUTH is the SDK's own text (core/credentials/store.py, exceptions.py:126);
+# INTERRUPTED is core/util/keyboard_interrupt.py:36.
+VMS_HTTP_CAPACITY=$'ERROR: (gcloud.compute.instances.start) Could not fetch resource:\r\n - The zone \'projects/yaw-labs-prod/zones/us-central1-a\' does not have enough resources available to fulfill the request.  Try a different zone, or try again later.\r\n\r\n'
+VMS_QUOTA=$'ERROR: (gcloud.compute.instances.start) Could not fetch resource:\r\n - Quota \'N2_CPUS\' exceeded.  Limit: 100.0 in region us-west1.\r\n\r\n'
+VMS_PERM=$'ERROR: (gcloud.compute.instances.start) Could not fetch resource:\r\n - Required \'compute.instances.start\' permission for \'projects/yaw-labs-prod/zones/us-west1-b/instances/yaw-linux-builder\'\r\n\r\n'
+VMS_NOTFOUND=$'ERROR: (gcloud.compute.instances.describe) Could not fetch resource:\r\n - The resource \'projects/yaw-labs-prod/zones/us-west1-b/instances/no-such-vm\' was not found\r\n\r\n'
+VMS_AUTH=$'ERROR: (gcloud.compute.instances.start) There was a problem refreshing your current auth tokens: (\'invalid_grant: Token has been expired or revoked.\', {\'error\': \'invalid_grant\'})\r\nPlease run:\r\n\r\n  $ gcloud auth login\r\n\r\nto obtain new access credentials.\r\n'
+VMS_BADTYPE=$'ERROR: (gcloud.compute.instances.set-machine-type) Could not fetch resource:\r\n - Invalid value for field \'resource.machineType\': \'zones/us-west1-b/machineTypes/c3-highmem-4\'. Machine type with name \'c3-highmem-4\' does not exist in zone \'us-west1-b\'.\r\n\r\n'
+# What gcloud prints on Windows for a Ctrl-C (core/util/keyboard_interrupt.py),
+# where it then exits 2 instead of dying of the signal.
+VMS_INTERRUPTED=$'Starting instance(s) yaw-linux-builder...\r\n\r\n\r\nCommand killed by keyboard interrupt\r\n'
+VMS_BACKEND=$'ERROR: (gcloud.compute.instances.start) Could not fetch resource:\r\n - Internal error. Please try again or contact support.\r\n\r\n'
+
+it "today's exhausted-zone stderr, CRs and all, reads as capacity"
+eq "$(vm_start_verdict "$VMS_EXHAUSTED_CR")" "capacity"
+
+it "the _WITH_DETAILS exhaustion of 2026-09-28 reads as capacity too"
+eq "$(vm_start_verdict "$VMS_DETAILS_CR")" "capacity"
+
+it "the HTTP-error shape of the capacity message reads as capacity"
+eq "$(vm_start_verdict "$VMS_HTTP_CAPACITY")" "capacity"
+
+it "a CPU-family quota reads as quota, not capacity"
+eq "$(vm_start_verdict "$VMS_QUOTA")" "quota"
+
+it "a missing permission and a missing instance are permanent, in the shape gcloud prints them"
+eq "$(vm_start_verdict "$VMS_PERM")-$(vm_start_verdict "$VMS_NOTFOUND")" "permanent-permanent"
+
+it "expired credentials are permanent -- no retry refreshes them"
+eq "$(vm_start_verdict "$VMS_AUTH")" "permanent"
+
+it "a machine type the API rejects is unsupported: out for the run, not the end of it"
+eq "$(vm_start_verdict "$VMS_BADTYPE")" "unsupported"
+
+it "a Ctrl-C that gcloud turned into an exit reads as interrupted, above every other verdict"
+eq "$(vm_start_verdict "$VMS_INTERRUPTED")-$(vm_start_verdict "$VMS_INTERRUPTED$VMS_EXHAUSTED_CR")" "interrupted-interrupted"
+
+it "a backend error, a bare failed line and empty text are unknown -- retried, never fatal"
+# A variable, not an inline $'...': beside the '' below, inside one "$(...)",
+# bash mis-nests the quotes and skips the whole line with a parse error.
+VMS_FAILED_LINE=$'................failed.\r\n'
+eq "$(vm_start_verdict "$VMS_BACKEND")-$(vm_start_verdict "$VMS_FAILED_LINE")-$(vm_start_verdict "")" "unknown-unknown-unknown"
+
+it "the operation error's folded message comes back as one CR-free line, not the localized one"
+eq "$(gcloud_error_message "$VMS_EXHAUSTED_CR")" \
+   "The zone 'projects/yaw-labs-prod/zones/us-west1-b' does not have enough resources available to fulfill the request.  Try a different zone, or try again later."
+
+it "a message folded over three lines joins the same way"
+eq "$(gcloud_error_message "$VMS_DETAILS_CR")" \
+   "The zone 'projects/yaw-labs-prod/zones/us-central1-f' does not have enough resources available to fulfill the request.  'NULL:0/NULL:0/NULL:0 (state:STOCKOUT, sub-state:STOCKOUT, resource type:compute)'."
+
+it "the HTTP-error shape yields its bullet, trailing blank line and all"
+eq "$(gcloud_error_message "$VMS_NOTFOUND")" \
+   "The resource 'projects/yaw-labs-prod/zones/us-west1-b/instances/no-such-vm' was not found"
+
+it "text with neither shape yields its last non-blank line, CR stripped"
+eq "$(gcloud_error_message $'ERROR: something else\r\n\r\n')" "ERROR: something else"
+
+it "empty text yields no message, non-zero"
+gcloud_error_message "" >/dev/null 2>&1 && fail "invented a message" || pass
+
+it "a quoted, empty zonesAvailable is a clean miss"
+vm_start_zones_available "$VMS_EXHAUSTED_CR" >/dev/null 2>&1 && fail "read zones off an empty field" || pass
+
+it "a bare zonesAvailable list comes back as it is, CR-free"
+eq "$(vm_start_zones_available "$VMS_DETAILS_CR")" "us-central1-b,us-central1-a"
+
+it "a quoted zonesAvailable list loses its quotes"
+eq "$(vm_start_zones_available $'    metadatas:\r\n      zonesAvailable: \'us-west1-a,us-west1-c\'\r\n    reason: resource_availability\r')" "us-west1-a,us-west1-c"
+
+it "the VM's own type is walked first, then the fallbacks in order"
+eq "$(vm_start_types $'e2-highmem-4\r' "n2-highmem-4 n2d-highmem-4" | tr '\n' ' ')" "e2-highmem-4 n2-highmem-4 n2d-highmem-4 "
+
+it "a fallback that repeats the VM's type, or another fallback, is walked once"
+eq "$(vm_start_types e2-highmem-4 "n2-highmem-4 e2-highmem-4 n2-highmem-4 n1-highmem-4" | tr '\n' ' ')" "e2-highmem-4 n2-highmem-4 n1-highmem-4 "
+
+it "an empty fallback list walks the VM's own type alone"
+eq "$(vm_start_types e2-highmem-4 "" | tr '\n' ' ')" "e2-highmem-4 "
+
+it "a blank current type is refused -- there would be nothing to restore to"
+vm_start_types "" "n2-highmem-4" >/dev/null 2>&1 && fail "walked types with no original" || pass
+
+# --- wiring: the orchestrator must decide through the lib ----------------------
+# Comment-stripped: the block above the loop describes the old loop, and a
+# negative grep must not match a description.
+VMS_SRC="$(sed 's/#.*//' scripts/build-platforms-gcp-iap.sh)"
+
+it "build-platforms-gcp-iap.sh starts the VM through the lib's verdicts and type walk"
+VMS_WIRE=""
+for want in 'vm_start_types "$ORIGINAL_MACHINE_TYPE"' 'vm_start_verdict "$start_err"' \
+            'vm_start_verdict "$set_err"' 'gcloud_error_message "$start_err"' \
+            'vm_start_zones_available "$start_err"' \
+            '${OAM_GCP_FALLBACK_MACHINE_TYPES-' 'OAM_VM_START_BUDGET_S:-900' \
+            '--filter="name~^${INSTANCE}\$"' 'trap restore_machine_type EXIT' \
+            'cleanup() { stop_iap_tunnel; reattach_stop_schedules; stop_vm; restore_machine_type; }'; do
+  grep -qF -- "$want" <<<"$VMS_SRC" || VMS_WIRE="$VMS_WIRE [$want]"
+done
+if [ -z "$VMS_WIRE" ]; then pass; else fail "build-platforms-gcp-iap.sh no longer carries:$VMS_WIRE"; fi
+
+it "the VM start neither discards gcloud's stderr nor retries a fixed six times"
+if grep -E 'instances start ' <<<"$VMS_SRC" | grep -q '2>/dev/null' \
+   || ! grep -E 'instances start ' <<<"$VMS_SRC" | grep -q '2>&1' \
+   || grep -q 'for VM_ATTEMPT in 1 2 3 4 5 6' <<<"$VMS_SRC"; then
+  fail "the blind six-attempt start loop is back"
+else pass; fi
+
+# The restore needs the VM TERMINATED, so the type change has to be undone by an
+# EXIT trap armed BEFORE the first set-machine-type runs, and in cleanup() only
+# after the stop. Asserted by line order, since that is the property.
+it "the restore trap is armed before the first set-machine-type, and cleanup stops before it restores"
+VMS_TRAP_LINE="$(grep -n 'trap restore_machine_type EXIT' scripts/build-platforms-gcp-iap.sh | head -1 | cut -d: -f1)"
+VMS_SET_LINE="$(grep -n -- '--machine-type="$vm_type"' scripts/build-platforms-gcp-iap.sh | head -1 | cut -d: -f1)"
+if [ -n "$VMS_TRAP_LINE" ] && [ -n "$VMS_SET_LINE" ] && [ "$VMS_TRAP_LINE" -lt "$VMS_SET_LINE" ] \
+   && grep -q 'stop_vm; restore_machine_type; }' scripts/build-platforms-gcp-iap.sh; then pass
+else fail "order is trap@${VMS_TRAP_LINE:-?} set-machine-type@${VMS_SET_LINE:-?}; cleanup must run stop_vm, then restore_machine_type"; fi
+
+# =============================================================================
+group "build-platforms-gcp-iap.sh -- the start loop against a stubbed gcloud"
+# =============================================================================
+# The loop itself, run for real under the script's `set -euo pipefail`, with
+# gcloud and ssh replaced by stubs that log every call and answer from a state
+# directory: a start on the "good" type turns the VM RUNNING, any other start
+# prints today's stderr and fails, a stop turns it TERMINATED, set-machine-type
+# records the type. Nothing here reaches GCP. TMPDIR is private to the run.
+VMS_BIN="$SUITE_TMP/vms-bin"; VMS_TMP="$SUITE_TMP/vms-tmp"; VMS_STATE="$SUITE_TMP/vms-state"
+mkdir -p "$VMS_BIN" "$VMS_TMP" "$VMS_STATE"
+# CR on every line, as gcloud prints it: sed into the file, since printf '%s\r\n'
+# would put one CR after the last line only, and $(...) drops a trailing CRLF.
+sed 's/$/\r/' <<<"$VMS_EXHAUSTED" > "$VMS_STATE/exhausted.txt"
+printf '%s' "$VMS_QUOTA" > "$VMS_STATE/quota.txt"
+cat > "$VMS_BIN/gcloud" <<EOF
+#!/bin/bash
+S="$VMS_STATE"
+printf '%s\n' "\$*" >> "\$S/log"
+a="\$*"
+# An instance that moved zones: nothing answers in the old zone but the list.
+if [ -e "\$S/moved" ]; then
+  case "\$a" in
+    *"instances list"*) printf 'us-west1-c\r\n'; exit 0 ;;
+    *"--zone=us-west1-b"*)
+      printf 'ERROR: (gcloud.compute.instances.describe) Could not fetch resource:\r\n - The resource '"'"'projects/yaw-labs-prod/zones/us-west1-b/instances/yaw-linux-builder'"'"' was not found\r\n\r\n' >&2; exit 1 ;;
+  esac
+fi
+case "\$a" in
+  *"instances describe"*"value(name)"*)                 echo yaw-linux-builder ;;
+  *"instances describe"*"value(status)"*)               cat "\$S/status" ;;
+  *"instances describe"*"machineType.basename()"*)      cat "\$S/type" ;;
+  *"instances describe"*"resourcePolicies"*)            echo ;;
+  *"instances describe"*"natIP"*)                       echo 203.0.113.9 ;;
+  *"instances set-machine-type"*)
+    t="\${a##*--machine-type=}"; t="\${t%% *}"
+    # reject-set-<type>: the API refuses the type. interrupt-set-<type>: the
+    # change is applied, then gcloud reports a Ctrl-C the way Windows sees it.
+    if [ -e "\$S/reject-set-\$t" ]; then
+      printf "ERROR: (gcloud.compute.instances.set-machine-type) Could not fetch resource:\r\n - Invalid value for field 'resource.machineType': 'zones/us-west1-b/machineTypes/\$t'.\r\n\r\n" >&2; exit 1
+    fi
+    echo "\$t" > "\$S/type"
+    if [ -e "\$S/interrupt-set-\$t" ]; then printf '\n\nCommand killed by keyboard interrupt\n' >&2; exit 2; fi ;;
+  *"instances start"*)
+    if [ "\$(cat "\$S/type")" = "\$(cat "\$S/good-type")" ]; then echo RUNNING > "\$S/status"
+    elif [ -e "\$S/start-quota" ]; then cat "\$S/quota.txt" >&2; exit 1
+    else cat "\$S/exhausted.txt" >&2; exit 1; fi ;;
+  *"instances stop"*)              echo 'Stopping instance(s) yaw-linux-builder...' >&2; echo TERMINATED > "\$S/status" ;;
+  *"get-serial-port-output"*)      echo 'Started ssh.service - OpenBSD Secure Shell server.' ;;
+  *) echo "stub gcloud: unexpected call: \$a" >&2; exit 97 ;;
+esac
+EOF
+cat > "$VMS_BIN/ssh" <<'EOF'
+#!/bin/bash
+echo 'Host key verification failed.' >&2
+exit 255
+EOF
+chmod +x "$VMS_BIN/gcloud" "$VMS_BIN/ssh"
+# vms_run <good-type|none> [flag...]  -- the orchestrator against the stubs,
+# from a TERMINATED e2-highmem-4, with n2-highmem-4 the one fallback and no
+# budget for a second pass. Flags are state files the stub reads: moved,
+# start-quota, reject-set-<type>, interrupt-set-<type>. Every OAM_* knob the
+# orchestrator reads is pinned, so a shell that exports OAM_KEEP_VM=1 or
+# another project cannot turn a run red. Stdout to VMS_OUT, stderr to VMS_ERR,
+# status to VMS_RC, the stub's call log to VMS_LOG.
+vms_run(){
+  rm -f "$VMS_STATE/log" "$VMS_STATE/moved" "$VMS_STATE/start-quota" "$VMS_STATE"/reject-set-* "$VMS_STATE"/interrupt-set-*
+  echo TERMINATED > "$VMS_STATE/status"; echo e2-highmem-4 > "$VMS_STATE/type"
+  echo "$1" > "$VMS_STATE/good-type"; shift
+  local flag; for flag in "$@"; do : > "$VMS_STATE/$flag"; done
+  VMS_OUT="$(PATH="$VMS_BIN:$PATH" TMPDIR="$VMS_TMP" OAM_GCP_FALLBACK_MACHINE_TYPES=n2-highmem-4 \
+    OAM_VM_START_BUDGET_S=0 OAM_IAP_SSH_MODE=direct OAM_GCP_BUILDER_ZONE=us-west1-b \
+    OAM_GCP_PROJECT=yaw-labs-prod OAM_GCP_BUILDER_INSTANCE=yaw-linux-builder OAM_LINUX_USER=jeff \
+    OAM_KEEP_VM=0 OAM_KEEP_VM_SCHEDULE=0 OAM_LINUX_FAST=0 \
+    bash scripts/build-platforms-gcp-iap.sh --mode=release 2>"$SUITE_TMP/vms-err")"
+  VMS_RC=$?
+  VMS_ERR="$(sed 's/\x1b\[[0-9;]*m//g' "$SUITE_TMP/vms-err")"
+  VMS_LOG="$(cat "$VMS_STATE/log" 2>/dev/null)"
+}
+
+vms_run none
+it "a zone that stays exhausted ends the run with gcloud's own words, every type tried, and the VM's own type put back"
+if [ "$VMS_RC" != "0" ] && [ -z "$VMS_OUT" ] \
+   && grep -qF "no e2-highmem-4 capacity in us-west1-b (pass 1): The zone 'projects/yaw-labs-prod/zones/us-west1-b' does not have enough resources available to fulfill the request.  Try a different zone, or try again later." <<<"$VMS_ERR" \
+   && grep -qF "no n2-highmem-4 capacity in us-west1-b (pass 1)" <<<"$VMS_ERR" \
+   && grep -qF "could not start yaw-linux-builder in us-west1-b within 0s (tried: e2-highmem-4 n2-highmem-4; last: The zone" <<<"$VMS_ERR" \
+   && grep -qF "OAM_VM_START_BUDGET_S" <<<"$VMS_ERR" \
+   && grep -qF "set yaw-linux-builder back to e2-highmem-4" <<<"$VMS_ERR" \
+   && [[ "$(tail -1 <<<"$VMS_LOG")" == *"instances set-machine-type yaw-linux-builder"*"--machine-type=e2-highmem-4" ]] \
+   && ! grep -q 'instances stop' <<<"$VMS_LOG"; then pass
+else fail "rc=$VMS_RC stdout=[$VMS_OUT] log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+vms_run n2-highmem-4
+it "a start that succeeds on a fallback says so, and the exit stops the VM before putting its type back"
+VMS_STOP_LINE="$(grep -n 'instances stop' <<<"$VMS_LOG" | head -1 | cut -d: -f1)"
+VMS_BACK_LINE="$(grep -n -- 'set-machine-type yaw-linux-builder .*--machine-type=e2-highmem-4' <<<"$VMS_LOG" | tail -1 | cut -d: -f1)"
+if [ "$VMS_RC" != "0" ] && [ -z "$VMS_OUT" ] \
+   && grep -qF "VM started as n2-highmem-4 (its own type is e2-highmem-4; set back when this run stops it)" <<<"$VMS_ERR" \
+   && grep -qF "OAM_IAP_SSH_MODE=direct, but direct ssh to yaw-linux-builder did not answer: Host key verification failed." <<<"$VMS_ERR" \
+   && grep -qF -- "-- if this is interrupted, run: gcloud compute instances stop yaw-linux-builder --zone=us-west1-b --project=yaw-labs-prod && gcloud compute instances set-machine-type yaw-linux-builder --zone=us-west1-b --project=yaw-labs-prod --machine-type=e2-highmem-4" <<<"$VMS_ERR" \
+   && grep -qF "set yaw-linux-builder back to e2-highmem-4" <<<"$VMS_ERR" \
+   && [ -n "$VMS_STOP_LINE" ] && [ -n "$VMS_BACK_LINE" ] && [ "$VMS_STOP_LINE" -lt "$VMS_BACK_LINE" ] \
+   && ! grep -E 'instances stop.*--async' <<<"$VMS_LOG" >/dev/null \
+   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ] && [ "$(cat "$VMS_STATE/status")" = "TERMINATED" ]; then pass
+else fail "rc=$VMS_RC stop@${VMS_STOP_LINE:-?} restore@${VMS_BACK_LINE:-?} type=$(cat "$VMS_STATE/type") log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+it "and the way back is printed before the stop begins"
+VMS_HINT_LINE="$(grep -n -- '-- if this is interrupted, run:' <<<"$VMS_ERR" | head -1 | cut -d: -f1)"
+VMS_STOPPING_LINE="$(grep -n 'Stopping instance(s) yaw-linux-builder' <<<"$VMS_ERR" | head -1 | cut -d: -f1)"
+if [ -n "$VMS_HINT_LINE" ] && [ -n "$VMS_STOPPING_LINE" ] && [ "$VMS_HINT_LINE" -lt "$VMS_STOPPING_LINE" ]; then pass
+else fail "hint@${VMS_HINT_LINE:-?} stop@${VMS_STOPPING_LINE:-?} in stderr"; fi
+
+vms_run n2-highmem-4 interrupt-set-n2-highmem-4
+it "a Ctrl-C that lands after set-machine-type was applied ends the run, and the VM's real type is what gets put back"
+if [ "$VMS_RC" != "0" ] \
+   && grep -qF "interrupted while setting yaw-linux-builder to n2-highmem-4" <<<"$VMS_ERR" \
+   && grep -qF "set yaw-linux-builder back to e2-highmem-4" <<<"$VMS_ERR" \
+   && [[ "$(tail -1 <<<"$VMS_LOG")" == *"instances set-machine-type yaw-linux-builder"*"--machine-type=e2-highmem-4" ]] \
+   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ]; then pass
+else fail "rc=$VMS_RC type=$(cat "$VMS_STATE/type") log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+vms_run none start-quota reject-set-n2-highmem-4
+it "a quota on the VM's type and a fallback the API rejects drop both, and the run ends with nothing left to try"
+if [ "$VMS_RC" != "0" ] \
+   && grep -qF "e2-highmem-4 is not usable here -- not trying it again this run: Quota 'N2_CPUS' exceeded." <<<"$VMS_ERR" \
+   && grep -qF "yaw-linux-builder cannot be set to n2-highmem-4 -- not trying it again this run: Invalid value for field" <<<"$VMS_ERR" \
+   && grep -qF "no machine type left to try for yaw-linux-builder in us-west1-b (tried: e2-highmem-4; last: Invalid value" <<<"$VMS_ERR" \
+   && [ "$(cat "$VMS_STATE/type")" = "e2-highmem-4" ] && ! grep -q 'instances stop' <<<"$VMS_LOG"; then pass
+else fail "rc=$VMS_RC log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+vms_run none moved
+it "an instance that moved zones is found by name, and every later call goes to the zone it is in"
+if [ "$VMS_RC" != "0" ] \
+   && grep -qF "instance yaw-linux-builder is not in us-west1-b but in us-west1-c -- using that (OAM_GCP_BUILDER_ZONE=us-west1-c silences this)" <<<"$VMS_ERR" \
+   && grep -qF -- "--filter=name~^yaw-linux-builder$" <<<"$VMS_LOG" \
+   && [ "$(grep -c -- '--zone=us-west1-b' <<<"$VMS_LOG")" = "1" ] \
+   && grep -qF -- "instances start yaw-linux-builder --zone=us-west1-c" <<<"$VMS_LOG" \
+   && grep -qF "no e2-highmem-4 capacity in us-west1-c (pass 1)" <<<"$VMS_ERR"; then pass
+else fail "rc=$VMS_RC log:$(printf '\n  %s' "$VMS_LOG") stderr:$(printf '\n  %s' "$VMS_ERR")"; fi
+
+# =============================================================================
 group "tailnet-helpers.sh -- the mac build host preflight"
 # =============================================================================
 # On 2026-09-30 the release box and the Air were not on the same tailnet, and
