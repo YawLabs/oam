@@ -53,6 +53,34 @@
 #                             while the run is going and re-attach on exit --
 #                             yaw-linux-builder-autostop stops the VM at 03:00
 #                             America/Los_Angeles every day, mid-run or not)
+#   OAM_GCP_FALLBACK_MACHINE_TYPES
+#                             n2-highmem-4 n2d-highmem-4 c2d-highmem-4
+#                             n1-highmem-4 e2-standard-8 t2d-standard-8
+#                             (default -- same-zone machine types tried, in
+#                             this order, when the zone has no capacity for
+#                             the VM's own type: ZONE_RESOURCE_POOL_EXHAUSTED
+#                             held us-west1-b's e2-highmem-4 for the whole
+#                             2026-09-30 retry window. The VM is set to the
+#                             fallback for the run and set back to its own
+#                             type when this script stops it; a second Ctrl-C
+#                             during that stop leaves it on the fallback, with
+#                             the command to set it back printed first. Each
+#                             must boot the VM's disk and NIC as they are --
+#                             x86_64, pd-balanced, virtio -- so no ARM
+#                             (t2a/c4a) and no c3/c3d/c4/c4d/n4, which need
+#                             gVNIC or Hyperdisk; the separate hardware pools
+#                             are the point, e2-standard-8 shares the E2 pool
+#                             that ran out and sits late for it. Each family
+#                             draws on its own regional CPU quota (E2_CPUS,
+#                             N2_CPUS, N2D_CPUS, C2D_CPUS, T2D_CPUS; n1 on
+#                             CPUS), all ample for one VM here. Empty
+#                             disables the fallback.)
+#   OAM_VM_START_BUDGET_S     900                (default -- seconds the start
+#                                                step may spend walking those
+#                                                types, a minute between
+#                                                passes, before the run fails
+#                                                and names the zone move;
+#                                                whole seconds only)
 #   OAM_IAP_SSH_MODE          auto               (default -- direct ssh to the
 #                                                VM's external IP, falling back
 #                                                to the IAP tunnel, with a
@@ -68,7 +96,8 @@
 #
 # Prereqs:
 #   - gcloud CLI authenticated; identity has compute.instances.get (and
-#     start/stop for the lifecycle step, compute.resourcePolicies.get +
+#     start/stop for the lifecycle step, instances.setMachineType for the
+#     capacity fallback, compute.resourcePolicies.get +
 #     instances.{add,remove}ResourcePolicies for the instance-schedule step).
 #   - Direct path: the VM has an external IP, and TCP:22 on it is reachable
 #     from this host (the default network's default-allow-ssh rule opens it
@@ -123,6 +152,9 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Before anything touches the VM: a typo here must not cost a VM start.
 ssh_mode_valid "$SSH_MODE" \
   || fail "invalid OAM_IAP_SSH_MODE='$SSH_MODE' (want auto|direct|tunnel)"
+case "${OAM_VM_START_BUDGET_S:-900}" in
+  '' | *[!0-9]*) fail "invalid OAM_VM_START_BUDGET_S='${OAM_VM_START_BUDGET_S:-}' (want whole seconds, e.g. 900)" ;;
+esac
 
 RUNID="$(date +%Y%m%d-%H%M%S)"
 STAGE_DIR="$(mktemp -d -t oam-iap-build-$RUNID-XXXXXX)"
@@ -135,34 +167,154 @@ mkdir -p "$STAGE_DIR/logs" "$ARTIFACTS_DIR"
 # keeps it running either way (useful when iterating: the next run skips the
 # ~30s boot).
 WE_STARTED_VM=0
+# The builder has moved zones once (us-central1-a -> us-west1-b, 2026-08-06,
+# for capacity), and the way out of a zone with none is to move it again --
+# so a stale zone default finds the instance wherever it is, as yaw's sibling
+# script does, instead of failing the release on a name that exists.
+if ! gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
+       --format='value(name)' >/dev/null 2>&1; then
+  # Anchored: gcloud's `name=` is turning into a contains-match (it warns so
+  # today), and a builder whose name is a prefix of another's must not find it.
+  FOUND_ZONE="$(gcloud compute instances list --project="$PROJECT" --filter="name~^${INSTANCE}\$" \
+    --format='value(zone.basename())' 2>/dev/null | head -1 | tr -d '\r' || true)"
+  case "$FOUND_ZONE" in
+    '' | */* | *[[:space:]]*)
+      fail "instance $INSTANCE not found in $ZONE, or in any zone of $PROJECT${FOUND_ZONE:+ (zone reading: '$FOUND_ZONE')}" ;;
+  esac
+  warn "instance $INSTANCE is not in $ZONE but in $FOUND_ZONE -- using that (OAM_GCP_BUILDER_ZONE=$FOUND_ZONE silences this)"
+  ZONE="$FOUND_ZONE"
+fi
 VM_STATUS="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
-  --format='value(status)' 2>/dev/null)" \
-  || fail "instance $INSTANCE not found in $ZONE ($PROJECT)"
+  --format='value(status)' 2>/dev/null | tr -d '\r' || true)"
+[ -n "$VM_STATUS" ] || fail "could not read the status of $INSTANCE in $ZONE ($PROJECT)"
+# The machine type this run found the VM with, and the one it is set to now.
+# They differ only while a capacity fallback is in effect; restore_machine_type
+# (on EXIT, from before the first change) puts the VM back.
+ORIGINAL_MACHINE_TYPE=""
+CURRENT_MACHINE_TYPE=""
+restore_machine_type() {
+  [ "$CURRENT_MACHINE_TYPE" != "$ORIGINAL_MACHINE_TYPE" ] || return 0
+  local status
+  status="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
+    --format='value(status)' 2>/dev/null | tr -d '\r' || true)"
+  if [ "$status" = "TERMINATED" ] \
+     && gcloud compute instances set-machine-type "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
+          --machine-type="$ORIGINAL_MACHINE_TYPE" >/dev/null 2>&1; then
+    ok "set $INSTANCE back to $ORIGINAL_MACHINE_TYPE"
+    CURRENT_MACHINE_TYPE="$ORIGINAL_MACHINE_TYPE"
+  else
+    warn "$INSTANCE is still $CURRENT_MACHINE_TYPE (status ${status:-unknown}) -- set it back with: gcloud compute instances stop $INSTANCE --zone=$ZONE --project=$PROJECT && gcloud compute instances set-machine-type $INSTANCE --zone=$ZONE --project=$PROJECT --machine-type=$ORIGINAL_MACHINE_TYPE"
+  fi
+}
 if [ "$VM_STATUS" != "RUNNING" ]; then
   step "Start VM $INSTANCE (status: $VM_STATUS)"
-  # `instances start` can fail with a zone-level `resource_availability` error
-  # ("does not have enough resources available"), which is TRANSIENT -- the
-  # same start succeeds minutes later. The old code neither retried nor
-  # checked: it printed "VM started" unconditionally and the run then died in
-  # the tunnel step with a misleading connection error. Retry with backoff,
-  # and confirm RUNNING before believing it.
-  VM_START_OK=0
-  for VM_ATTEMPT in 1 2 3 4 5 6; do
-    if gcloud compute instances start "$INSTANCE" --zone="$ZONE" --project="$PROJECT" >&2 2>/dev/null; then
-      if [ "$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
-              --format='value(status)' 2>/dev/null)" = "RUNNING" ]; then
-        VM_START_OK=1
-        break
+  # `instances start` fails with ZONE_RESOURCE_POOL_EXHAUSTED when the zone
+  # has no capacity for the VM's machine type. The 06be680 loop retried that
+  # six times a minute apart, which covered the shortages of its week (the
+  # same start succeeded minutes later) and not the 2026-09-30 one, which
+  # outlasted the window and took the v0.17.1 release with it. It also threw
+  # gcloud's stderr away and retried every error alike, so the log guessed
+  # "usually zone capacity" whatever had happened.
+  #
+  # Now: the VM's own type first, then each OAM_GCP_FALLBACK_MACHINE_TYPES
+  # entry, set with `set-machine-type` (TERMINATED VMs only; this branch is
+  # one) -- a zone short of e2-highmem-4 usually has n2/n2d/n1 to spare, and
+  # nothing on the leg reads the vCPU count. Every failure is classified by
+  # lib/iap-helpers.sh (tested): capacity moves on to the next type, quota
+  # drops the type for the run, anything permanent fails now with gcloud's
+  # own text, and the walk repeats a minute apart until OAM_VM_START_BUDGET_S
+  # is spent. gcloud's progress ("Starting instance(s)...", the dots) is
+  # stderr too, so it is captured with the error and the operator sees one
+  # verdict line per attempt instead.
+  VM_START_BUDGET="${OAM_VM_START_BUDGET_S:-900}"
+  ORIGINAL_MACHINE_TYPE="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
+    --format='value(machineType.basename())' 2>/dev/null | tr -d '\r' || true)"
+  VM_TYPES="$(vm_start_types "$ORIGINAL_MACHINE_TYPE" \
+    "${OAM_GCP_FALLBACK_MACHINE_TYPES-n2-highmem-4 n2d-highmem-4 c2d-highmem-4 n1-highmem-4 e2-standard-8 t2d-standard-8}")" \
+    || fail "could not read the machine type of $INSTANCE -- not starting it"
+  CURRENT_MACHINE_TYPE="$ORIGINAL_MACHINE_TYPE"
+  # Armed before the first set-machine-type: a fail below must not leave the
+  # VM stopped on a fallback type. cleanup() takes this over further down.
+  trap restore_machine_type EXIT
+  VM_START_OK=0; VM_START_PASS=0; VM_UNUSABLE_TYPES=" "; VM_TRIED=""; VM_LAST_MSG=""
+  VM_START_DEADLINE=$((SECONDS + VM_START_BUDGET))
+  while :; do
+    VM_START_PASS=$((VM_START_PASS + 1))
+    while IFS= read -r vm_type; do
+      [ -n "$vm_type" ] || continue
+      case "$VM_UNUSABLE_TYPES" in *" $vm_type "*) continue ;; esac
+      # A start whose gcloud side failed can still have been accepted, and the
+      # 03:00 schedule or an operator can be stopping or starting the VM under
+      # this loop: only a TERMINATED VM takes a set-machine-type, and one that
+      # is RUNNING is what the loop is after.
+      vm_now="$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
+        --format='value(status)' 2>/dev/null | tr -d '\r' || true)"
+      case "$vm_now" in
+        RUNNING) ok "$INSTANCE is RUNNING (as $CURRENT_MACHINE_TYPE)"; VM_START_OK=1; break ;;
+        TERMINATED) ;;
+        *) warn "$INSTANCE is ${vm_now:-unreadable}, not TERMINATED -- leaving it alone this pass"; continue ;;
+      esac
+      if [ "$vm_type" != "$CURRENT_MACHINE_TYPE" ]; then
+        if ! set_err="$(gcloud compute instances set-machine-type "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
+               --machine-type="$vm_type" 2>&1 >/dev/null)"; then
+          VM_LAST_MSG="$(gcloud_error_message "$set_err" || echo '(gcloud printed nothing)')"
+          case "$(vm_start_verdict "$set_err")" in
+            interrupted) fail "interrupted while setting $INSTANCE to $vm_type" ;;
+            permanent)   fail "setting $INSTANCE to $vm_type failed, and retrying cannot help: $VM_LAST_MSG" ;;
+            quota | unsupported)
+              warn "$INSTANCE cannot be set to $vm_type -- not trying it again this run: $VM_LAST_MSG"
+              VM_UNUSABLE_TYPES="$VM_UNUSABLE_TYPES$vm_type " ;;
+            *) warn "setting $INSTANCE to $vm_type failed (pass $VM_START_PASS): $VM_LAST_MSG -- again next pass" ;;
+          esac
+          continue
+        fi
+        CURRENT_MACHINE_TYPE="$vm_type"
+        ok "set $INSTANCE to $vm_type for this run (its own type is $ORIGINAL_MACHINE_TYPE)"
       fi
-    fi
-    [ "$VM_ATTEMPT" -lt 6 ] && {
-      warn "VM start failed (attempt $VM_ATTEMPT/6) -- usually zone capacity for $(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" --format='value(machineType.basename())' 2>/dev/null). Retrying in 60s..."
-      sleep 60
-    }
+      case " $VM_TRIED " in *" $vm_type "*) ;; *) VM_TRIED="${VM_TRIED:+$VM_TRIED }$vm_type" ;; esac
+      ok "starting $INSTANCE as $vm_type (pass $VM_START_PASS; gcloud's progress is captured, so this can be silent for a minute)..."
+      start_err="$(gcloud compute instances start "$INSTANCE" --zone="$ZONE" --project="$PROJECT" 2>&1 >/dev/null)" \
+        && [ "$(gcloud compute instances describe "$INSTANCE" --zone="$ZONE" --project="$PROJECT" \
+                --format='value(status)' 2>/dev/null | tr -d '\r')" = "RUNNING" ] \
+        && { VM_START_OK=1; break; }
+      VM_LAST_MSG="$(gcloud_error_message "$start_err" || echo '(gcloud printed nothing)')"
+      case "$(vm_start_verdict "$start_err")" in
+        interrupted)
+          fail "interrupted while starting $INSTANCE ($vm_type)" ;;
+        capacity)
+          zones_with_it="$(vm_start_zones_available "$start_err" || true)"
+          warn "no $vm_type capacity in $ZONE (pass $VM_START_PASS): $VM_LAST_MSG${zones_with_it:+ -- zones with capacity for it: $zones_with_it}" ;;
+        quota | unsupported)
+          warn "$vm_type is not usable here -- not trying it again this run: $VM_LAST_MSG"
+          VM_UNUSABLE_TYPES="$VM_UNUSABLE_TYPES$vm_type " ;;
+        permanent)
+          fail "starting $INSTANCE ($vm_type) in $ZONE failed, and retrying cannot help: $VM_LAST_MSG" ;;
+        *)
+          warn "start of $INSTANCE ($vm_type) failed (pass $VM_START_PASS): $VM_LAST_MSG -- retrying" ;;
+      esac
+    done <<<"$VM_TYPES"
+    [ "$VM_START_OK" = "1" ] && break
+    VM_USABLE_LEFT=0
+    while IFS= read -r vm_type; do
+      [ -n "$vm_type" ] || continue
+      case "$VM_UNUSABLE_TYPES" in *" $vm_type "*) ;; *) VM_USABLE_LEFT=1 ;; esac
+    done <<<"$VM_TYPES"
+    [ "$VM_USABLE_LEFT" = "1" ] \
+      || fail "no machine type left to try for $INSTANCE in $ZONE (tried: $VM_TRIED; last: $VM_LAST_MSG)"
+    VM_START_REMAINING=$((VM_START_DEADLINE - SECONDS))
+    [ "$VM_START_REMAINING" -gt 0 ] \
+      || fail "could not start $INSTANCE in $ZONE within ${VM_START_BUDGET}s (tried: $VM_TRIED; last: $VM_LAST_MSG). Wait and re-run (OAM_VM_START_BUDGET_S=<seconds> waits longer), or move the builder to a zone that has capacity: snapshot its boot disk, create a disk from the snapshot there, create the instance from that disk under the same name, and run again -- this script finds the moved instance by itself (OAM_GCP_BUILDER_ZONE pins it)."
+    VM_START_PAUSE=60
+    [ "$VM_START_PAUSE" -le "$VM_START_REMAINING" ] || VM_START_PAUSE="$VM_START_REMAINING"
+    warn "nothing started on pass $VM_START_PASS -- pass $((VM_START_PASS + 1)) in ${VM_START_PAUSE}s (${VM_START_REMAINING}s of the ${VM_START_BUDGET}s budget left)"
+    sleep "$VM_START_PAUSE"
   done
-  [ "$VM_START_OK" = "1" ] || fail "could not start $INSTANCE in $ZONE after 6 attempts -- the zone is out of capacity for this machine type. Wait and re-run, or move the builder to another zone."
   WE_STARTED_VM=1
-  ok "VM started"
+  if [ "$CURRENT_MACHINE_TYPE" = "$ORIGINAL_MACHINE_TYPE" ]; then
+    ok "VM started"
+  else
+    ok "VM started as $CURRENT_MACHINE_TYPE (its own type is $ORIGINAL_MACHINE_TYPE; set back when this run stops it)"
+  fi
   # `instances start` returning RUNNING means the API finished, NOT the guest:
   # sshd comes up ~15-60s later -- whichever transport the run then uses. On
   # the IAP fallback it is worse: gcloud`s start-iap-tunnel does a real backend
@@ -210,8 +362,16 @@ else
 fi
 stop_vm() {
   if [ "$WE_STARTED_VM" = "1" ] && [ "${OAM_KEEP_VM:-0}" != "1" ]; then
-    warn "stopping VM $INSTANCE (started by this run; OAM_KEEP_VM=1 to keep)"
-    gcloud compute instances stop "$INSTANCE" --zone="$ZONE" --project="$PROJECT" --async >&2 || true
+    if [ "$CURRENT_MACHINE_TYPE" != "$ORIGINAL_MACHINE_TYPE" ]; then
+      # set-machine-type wants TERMINATED, so this stop is not --async and
+      # restore_machine_type runs right after it. A second Ctrl-C during the
+      # stop ends the trap here, so the way back is printed before it.
+      warn "stopping VM $INSTANCE (started by this run; OAM_KEEP_VM=1 to keep) and waiting, to set it back to $ORIGINAL_MACHINE_TYPE -- if this is interrupted, run: gcloud compute instances stop $INSTANCE --zone=$ZONE --project=$PROJECT && gcloud compute instances set-machine-type $INSTANCE --zone=$ZONE --project=$PROJECT --machine-type=$ORIGINAL_MACHINE_TYPE"
+      gcloud compute instances stop "$INSTANCE" --zone="$ZONE" --project="$PROJECT" >&2 || true
+    else
+      warn "stopping VM $INSTANCE (started by this run; OAM_KEEP_VM=1 to keep)"
+      gcloud compute instances stop "$INSTANCE" --zone="$ZONE" --project="$PROJECT" --async >&2 || true
+    fi
   fi
 }
 
@@ -390,7 +550,8 @@ stop_iap_tunnel() {
   fi
   rm -f "$IAP_TUNNEL_LOG"
 }
-cleanup() { stop_iap_tunnel; reattach_stop_schedules; stop_vm; }
+# restore_machine_type last: it needs the stop before it to have finished.
+cleanup() { stop_iap_tunnel; reattach_stop_schedules; stop_vm; restore_machine_type; }
 trap cleanup EXIT
 # Only now that the trap is armed: a failure between detaching a schedule and
 # arming the trap would leave the VM with no scheduled stop at all.
