@@ -1231,12 +1231,16 @@ else fail "ci-local.sh no longer runs 'node scripts/mcp-sidecar-matrix.mjs --sel
 # too; this is the belt, should that pin be edited along with them.
 it "the sidecar matrix never runs install scripts or git"
 MX_ARGS_FN="$(awk '/^function npmInstallArgs\(/ { f = 1 } f { print } f && /^}$/ { exit }' scripts/mcp-sidecar-matrix.mjs)"
+MX_INSTALL_FN="$(awk '/^async function npmInstall\(/ { f = 1 } f { print } f && /^}$/ { exit }' scripts/mcp-sidecar-matrix.mjs)"
 MX_SEAL_MISSING=""
-for want in '"--ignore-scripts"' '`--script-shell=${join(dir, basename(NO_SCRIPT_SHELL))}`' '`--git=${join(dir, basename(NO_GIT))}`'; do
+for want in '"--ignore-scripts"' '`--script-shell=${join(dir, basename(NO_SCRIPT_SHELL))}`' '`--git=${join(dir, basename(NO_GIT))}`' '"--allow-git=none"'; do
   case "$MX_ARGS_FN" in *"$want"*) ;; *) MX_SEAL_MISSING="$MX_SEAL_MISSING $want" ;; esac
 done
-if [ -z "$MX_SEAL_MISSING" ] && grep -q 'npmInstallArgs(specs)' scripts/mcp-sidecar-matrix.mjs; then pass
-else fail "the matrix's npm install is no longer sealed (missing:${MX_SEAL_MISSING:- npmInstallArgs(specs) in npmInstall})"; fi
+# Inside npmInstall itself: the self-test's own quote of the call is elsewhere
+# in the file, and must not stand in for it.
+case "$MX_INSTALL_FN" in *'npmInstallArgs(specs)'*) ;; *) MX_SEAL_MISSING="$MX_SEAL_MISSING npmInstallArgs(specs)-in-npmInstall" ;; esac
+if [ -z "$MX_SEAL_MISSING" ]; then pass
+else fail "the matrix's npm install is no longer sealed (missing:$MX_SEAL_MISSING)"; fi
 
 # The release's own reading of the matrix's status, run as written: the lines
 # from `matrix_status=$?` to the `esac`, after a command that exits with each

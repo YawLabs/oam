@@ -503,6 +503,12 @@ function npmInstallArgs(specs, { dir = stage, platform = process.platform } = {}
     "--ignore-scripts",
     quoted(`--script-shell=${join(dir, basename(NO_SCRIPT_SHELL))}`),
     quoted(`--git=${join(dir, basename(NO_GIT))}`),
+    // npm 11 fetches a git dependency pinned to a full sha on GitHub as a
+    // tarball, with no git at all, and under --ignore-scripts skips its
+    // prepare: measured, it installed exit 0 with the dependency unbuilt,
+    // where npx builds it. This refuses every git dependency (EALLOWGIT);
+    // npm 10 does not know the setting, and fails closed on the refusers.
+    "--allow-git=none",
     "--prefix",
     quoted(dir),
     ...specs,
@@ -518,6 +524,20 @@ function stagePathProblem(dir, platform = process.platform) {
   return null;
 }
 
+/** A file at a path npm would run as its script shell or its git, or null.
+ *  Nothing the matrix does creates one, so one there was put there. On
+ *  Windows those are `<refuser>.com` and `<refuser>.exe`: libuv tries a name
+ *  with no extension only with those two added, never bare (measured: a
+ *  planted `.exe` ran as npm's git). The bare path is checked everywhere --
+ *  it is what runs elsewhere. */
+function plantedRefuser(exists, platform = process.platform) {
+  const suffixes = platform === "win32" ? ["", ".com", ".exe"] : [""];
+  for (const refuser of [NO_SCRIPT_SHELL, NO_GIT]) {
+    for (const suffix of suffixes) if (exists(`${refuser}${suffix}`)) return `${refuser}${suffix}`;
+  }
+  return null;
+}
+
 /** `npm install --no-save <specs...>` into the shared stage, sealed
  *  (npmInstallArgs) and bounded by INSTALL_TIMEOUT_MS -- and a timeout ends
  *  npm, not just its shell (runBounded). `run`, `wipe` and `exists` are seams
@@ -527,10 +547,7 @@ function stagePathProblem(dir, platform = process.platform) {
 async function npmInstall(specs, { run = runBounded, wipe = wipeStageModules, exists = existsSync } = {}) {
   const badStage = stagePathProblem(stage);
   if (badStage) return `npm install refused: ${badStage}`;
-  // Something at a refuser's path would be run by npm as its script shell or
-  // its git. Nothing the matrix does creates either, so one there was put
-  // there.
-  const planted = [NO_SCRIPT_SHELL, NO_GIT].find((path) => exists(path));
+  const planted = plantedRefuser(exists);
   if (planted) return `npm install refused: ${planted} exists, and the matrix will not hand it to npm as its script shell or its git -- remove it`;
   const r = await run(process.platform === "win32" ? "npm.cmd" : "npm", npmInstallArgs(specs), {
     timeoutMs: INSTALL_TIMEOUT_MS,
@@ -762,15 +779,19 @@ function npmFailureReason(r) {
 
 /** The reason an install was refused for wanting what the matrix does not run
  *  -- git, or a lifecycle script -- or null when that is not why it failed.
- *  npm reports either as a spawn of the refuser that failed, `npm error syscall
- *  spawn <path>`, and the two refusers' names differ, so the line says which.
- *  For a script, the `npm error path` line names the package: the last
- *  node_modules segment in it, scope included. A path in npm's cache is a git
- *  dependency's clone, whose prepare npm 10 runs even with --ignore-scripts. */
+ *  npm 11 refuses a git dependency outright (EALLOWGIT, from --allow-git);
+ *  otherwise either shows as a spawn of a refuser that failed, `npm error
+ *  syscall spawn <path>`, and the two refusers' names differ, so the line says
+ *  which. Under --ignore-scripts the script refuser is reached by a git
+ *  dependency's prepare, which npm 10 runs even then, from a clone in npm's
+ *  cache. A package's own install scripts never run, so they never get here:
+ *  binFor reports them. Reading a package name off the `npm error path` line
+ *  -- its last node_modules segment -- is a backstop, should an npm ever run
+ *  one anyway. */
 function refusedReason(stderr) {
   const lines = (stderr || "").split("\n").map((l) => l.trim());
   const spawned = lines.find((l) => /^npm (error|ERR!) syscall spawn /.test(l)) ?? "";
-  if (spawned.includes(basename(NO_GIT))) {
+  if (spawned.includes(basename(NO_GIT)) || lines.some((l) => /^npm (error|ERR!) code EALLOWGIT$/.test(l))) {
     return "its dependency tree has a git dependency, and the matrix runs no git: it installs only what the registry serves";
   }
   if (!spawned.includes(basename(NO_SCRIPT_SHELL))) return null;
@@ -1498,6 +1519,12 @@ function unreviewedScripts(scripts, reviewed = REVIEWED_INSTALL_SCRIPTS) {
 function describeScripts(scripts) {
   const shown = scripts.slice(0, 2).map((s) => `${s.pkg} ${s.event} \`${s.script}\``).join("; ");
   return scripts.length > 2 ? `${shown}; ${scripts.length - 2} more` : shown;
+}
+
+/** The --json report's record of the install scripts a row's tree holds, all
+ *  of them skipped by the sealed install: `pkg event: script`, every one. */
+function skippedScriptsOf(bin) {
+  return (bin.scripts ?? []).map((s) => `${s.pkg} ${s.event}: ${s.script}`);
 }
 
 /** The keys of a package.json dependency field, or none when the field is
@@ -2461,6 +2488,8 @@ async function selfTest() {
           ["classifyCall(oam.call, nodeVerdict,", 1],
           // Every row's bin, a damaged install's SKIP included, comes from binFor.
           ["const bin = binFor(s.pkg, installErrors, damaged, rebuilt, resolveBin);", 1],
+          // And every row's record of the install scripts it skipped.
+          ["installScriptsSkipped: skippedScriptsOf(bin)", 1],
         ];
         assertDeep(
           calls.filter(([needle, n]) => count(needle) !== n).map(([needle, n]) => `${needle} (want ${n}, found ${count(needle)})`),
@@ -2520,9 +2549,16 @@ async function selfTest() {
         const npmAt = source.search(/^async function npmInstall\(specs, \{ run = runBounded, wipe = wipeStageModules, exists = existsSync \} = \{\}\) \{$/m);
         const npmBody = npmAt < 0 ? "" : source.slice(npmAt, source.indexOf("\n}\n", npmAt));
         assertDeep(
-          [npmAt > 0, npmBody.includes("await run("), npmBody.includes("npmInstallArgs(specs)"), npmBody.includes("spawnSync(")],
-          [true, true, true, false],
-          "npm installs are sealed, bounded by runBounded and cleaned up by wipeStageModules, never by spawnSync's own timeout",
+          [
+            npmAt > 0,
+            npmBody.includes("await run("),
+            npmBody.includes("npmInstallArgs(specs)"),
+            npmBody.includes("stagePathProblem(stage)"),
+            npmBody.includes("plantedRefuser(exists)"),
+            npmBody.includes("spawnSync("),
+          ],
+          [true, true, true, true, true, false],
+          "npm installs are sealed behind the stage and refuser checks, bounded by runBounded and cleaned up by wipeStageModules, never by spawnSync's own timeout",
         );
         // And a Ctrl-C of the matrix reaches npm: no console of its own, no
         // process group of its own.
@@ -3073,7 +3109,7 @@ async function selfTest() {
         const gitAt = join(spaced, basename(NO_GIT));
         const sealed = (q) => [
           "install", "--no-save", "--no-audit", "--no-fund", "--ignore-scripts",
-          q(`--script-shell=${shellAt}`), q(`--git=${gitAt}`), "--prefix", q(spaced), "x@latest",
+          q(`--script-shell=${shellAt}`), q(`--git=${gitAt}`), "--allow-git=none", "--prefix", q(spaced), "x@latest",
         ];
         assertDeep(npmInstallArgs(["x@latest"], { dir: spaced, platform: "win32" }), sealed((a) => `"${a}"`), "on Windows the install is sealed and every path quoted");
         assertDeep(npmInstallArgs(["x@latest"], { dir: spaced, platform: "linux" }), sealed((a) => a), "elsewhere it is sealed and nothing is quoted");
@@ -3104,11 +3140,38 @@ async function selfTest() {
           "a stage cmd.exe would rewrite is refused on Windows, and only there",
         );
 
+        // A file npm would run as a refuser: on Windows the .com and .exe
+        // libuv tries, never the bare name; elsewhere the bare name.
+        const plantedAt = (platform, path) => plantedRefuser((p) => p === path, platform);
+        assertDeep(
+          [
+            plantedAt("win32", `${NO_GIT}.exe`),
+            plantedAt("win32", `${NO_SCRIPT_SHELL}.com`),
+            plantedAt("win32", NO_GIT),
+            plantedAt("linux", NO_SCRIPT_SHELL),
+            plantedAt("linux", `${NO_GIT}.exe`),
+            plantedAt("win32", `${NO_GIT}.bat`),
+          ],
+          [`${NO_GIT}.exe`, `${NO_SCRIPT_SHELL}.com`, NO_GIT, NO_SCRIPT_SHELL, null, null],
+          "a planted refuser is found where npm would run it -- on Windows as .com or .exe",
+        );
+
         // Why an install was refused, from npm's own lines (shapes captured
         // from npm 11.13.0 on Windows and 10.9.8 on Linux).
         const npmSaid = (...lines) =>
           `${lines.map((l) => `npm error ${l}`).join("\n")}\nnpm error A complete log of this run can be found in: C:\\npm\\x.log\n`;
         const reason = (stderr) => npmFailureReason({ status: -4058, signal: null, stdout: "", stderr, error: null });
+        assertDeep(
+          reason(
+            npmSaid(
+              "code EALLOWGIT",
+              'Fetching packages of type "git" have been disabled',
+              'Refusing to fetch "npm-life-cycle-scripts-sample@github:kimulaco/npm-life-cycle-scripts-sample#8d0807cac0e1a88100a50ee0ebe2aebdbb5d64ba"',
+            ),
+          ),
+          "its dependency tree has a git dependency, and the matrix runs no git: it installs only what the registry serves",
+          "npm 11's refusal of a git dependency reads as the git refusal",
+        );
         assertDeep(
           [
             reason(npmSaid("code ENOENT", `syscall spawn ${NO_GIT}`, `path ${NO_GIT}`, "errno -4058")),
@@ -3182,9 +3245,21 @@ async function selfTest() {
         const facts = closureFacts(join(nm, "app"), read, none);
         assertDeep(
           [facts.scripts.map((s) => `${s.pkg} ${s.event}: ${s.script}`), facts.engines],
-          [["lib@1.0.0 postinstall: node nested.js", "tool@3.0.0 install: node build.js"], engineRanges(join(nm, "app"), read)],
-          "the tree's scripts are the ones node would load, and its engines are engineRanges'",
+          [
+            ["lib@1.0.0 postinstall: node nested.js", "tool@3.0.0 install: node build.js"],
+            [
+              { pkg: "app@1.0.0", range: ">=18", dependency: false },
+              { pkg: "tool@3.0.0", range: ">=20", dependency: true },
+            ],
+          ],
+          "the tree's scripts are the ones node would load, beside its engines floors",
         );
+        assertDeep(
+          skippedScriptsOf({ scripts: facts.scripts }),
+          ["lib@1.0.0 postinstall: node nested.js", "tool@3.0.0 install: node build.js"],
+          "the report records every script the row's install skipped",
+        );
+        assertDeep(skippedScriptsOf({ error: "x" }), [], "and none for a row that never resolved");
         assertDeep(closureFacts(join(nm, "absent"), read, none), { engines: [], scripts: [] }, "a package not on disk has neither");
 
         // The review: exact on name, event and text.
@@ -4016,10 +4091,9 @@ for (const s of selected) {
     clearProgress();
     process.stderr.write(row(s.name, BANNER[state], ver, detail));
     for (const line of [note ? `note: ${note}` : "", ...extra]) if (line) process.stderr.write(under(line.slice(0, 160)));
-    // The reviewed install scripts its tree holds and this install skipped, so
-    // the record shows where the install differed from npx's.
-    const installScriptsSkipped = (bin.scripts ?? []).map((sc) => `${sc.pkg} ${sc.event}: ${sc.script}`);
-    results.push({ name: s.name, pkg: s.pkg, version: bin.version ?? null, state, tool, tools, why, note, installScriptsSkipped });
+    // The install scripts its tree holds and this install skipped, so the
+    // record shows where the install differed from npx's.
+    results.push({ name: s.name, pkg: s.pkg, version: bin.version ?? null, state, tool, tools, why, note, installScriptsSkipped: skippedScriptsOf(bin) });
   };
   if (bin.error) {
     record("skip", bin.error);

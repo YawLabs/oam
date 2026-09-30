@@ -75,8 +75,8 @@ Release tooling only; no runtime behavior change.
 - **A process a sidecar's install script started could outlive the sidecar gate's install**
   (#260). A lifecycle script can start a daemon whose parent then exits; no kill of npm's tree
   reaches it, and it went on running in the gate's stage. The gate now installs with
-  `--ignore-scripts`, and with a script shell and git that do not exist, so an install starts
-  nothing but npm, and a script or git dependency it would need fails closed with its reason.
+  `--ignore-scripts`, `--allow-git=none`, and a script shell and git that do not exist, so an
+  install starts nothing but npm, and a git dependency is refused with its reason.
   The sidecars' installed trees are byte-identical either way: their one install script,
   puppeteer's browser download, was already skipped. A sidecar whose tree gains an install
   script nobody has reviewed is reported as not answered, naming the script. The install also
