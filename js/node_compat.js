@@ -20464,7 +20464,10 @@
           var cause = err && err.cause;
           var detail = cause && cause.message ? cause.message : msg;
           var mapped;
-          if (cause && cause.code && (cause.syscall === "connect" || cause.syscall === "getaddrinfo")) {
+          if (cause && cause.code &&
+              (cause.syscall === "connect" || cause.syscall === "getaddrinfo" || cause.syscall === "read")) {
+            // A read failure is the server's reset before the response
+            // head: node's socket error, `read ECONNRESET`.
             mapped = cause;
           } else if (cause instanceof AggregateError && cause.code) {
             mapped = cause;
@@ -20539,6 +20542,13 @@
           socket.localFamily = facts.localAddr.family;
         }
         socket.connecting = false;
+        // The connection the response came on, which destroy() and
+        // resetAndDestroy() close as node's close the socket's handle. A
+        // TLSSocket's (no reset there: ERR_INVALID_HANDLE_TYPE) is not
+        // tracked, nor is an h2 one, which the transport does not name.
+        if (facts.connection !== undefined && !socket.encrypted) {
+          socket[registry._netNativeConnection] = facts.connection;
+        }
         if (socket.encrypted && raw.tls) {
           // Only a verified certificate gets this far on the fetch path.
           socket.authorized = true;
@@ -23264,7 +23274,9 @@
       destroy(err) {
         if (this.destroyed) return this;
         // node creates the handle in connect(): a connecting socket has one.
-        const hadHandle = this._handle !== null || this.connecting;
+        // So does the fetch path's stand-in while its connection is open.
+        const connection = this[kNativeConnection];
+        const hadHandle = this._handle !== null || this.connecting || connection !== undefined;
         this.destroyed = true;
         this.readable = false;
         this.writable = false;
@@ -23315,6 +23327,14 @@
             try { natives.tcpClose(this._handle); } catch (_) { /* noop */ }
           }
           this._handle = null;
+        } else if (connection !== undefined) {
+          // The fetch path's stand-in: its connection is the transport's,
+          // closed there -- with a reset for resetAndDestroy(), mid-response
+          // or idle in the pool alike.
+          this[kNativeConnection] = undefined;
+          const reset = this.resetAndClosing === true;
+          if (reset) this.resetAndClosing = false;
+          globalThis.__oam.fetchConnClose(connection, reset);
         }
         rs.closed = ws.closed = true;
         if (resetRefused !== undefined) {
@@ -23712,9 +23732,11 @@
     const kNotTcpHandle = Symbol("oam.notTcpHandle");
     registry._netNotTcpHandle = kNotTcpHandle;
     // On a socket that stands in for a connection oam holds natively -- the
-    // socket an http server hands out -- that connection's id. node's socket
-    // has its TCP handle until it is destroyed; this one has the connection,
-    // and its destroy() / _reset() close it.
+    // req.socket of an http.request on the fetch path, the socket an http
+    // server hands out -- that connection's id. node's socket has its TCP
+    // handle until it is destroyed; this one has the connection, and its
+    // destroy() / _reset() close it (the fetch path's through Socket#destroy
+    // and `__oam.fetchConnClose`; the server's through its own destroy()).
     const kNativeConnection = Symbol("oam.nativeConnection");
     registry._netNativeConnection = kNativeConnection;
 
@@ -23726,9 +23748,10 @@
     // destroyed with ERR_SOCKET_CLOSED (a no-op once destroyed); any other
     // handle is ERR_INVALID_HANDLE_TYPE, thrown. Returns the socket.
     //
-    // Also the very function on the socket stand-in oam's http server hands
-    // out (req.socket, the 'connection' socket): it holds a native
-    // connection (kNativeConnection) in place of a handle, and resets that.
+    // Also the very function on the socket stand-ins oam's http server
+    // (req.socket, the 'connection' socket) and http client (the fetch
+    // path's req.socket) hand out: each holds a native connection
+    // (kNativeConnection) in place of a handle, and resets that.
     Socket.prototype.resetAndDestroy = function() {
       // node's handle exists from connect() until the socket is destroyed.
       // oam's TCP handle appears only once connected; its TLS sockets', and

@@ -258,8 +258,8 @@ fn set_linger_zero(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
 }
 
 /// Arm a stream that is about to be dropped so that its close is a reset:
-/// node's resetAndDestroy() on a socket oam's http server holds rather than
-/// this registry. Best-effort, as a failed close is: the
+/// node's resetAndDestroy() on a socket oam's http server or http client
+/// holds rather than this registry. Best-effort, as a failed close is: the
 /// stream closes either way.
 pub(crate) fn arm_reset(stream: &tokio::net::TcpStream) {
     let _ = set_linger_zero(stream);
@@ -437,7 +437,14 @@ fn listen_error(error: &std::io::Error, address: &str, port: u16) -> NodeSysErro
 /// v22.22.2). It used to be the fs shape, `ECONNRESET: connection reset by
 /// peer, read '66'`, the handle's internal id standing in for a path.
 fn tcp_fail(error: std::io::Error, syscall: &str) -> OpOutcome {
-    let code = node_error_code(&error);
+    errno_failure(&error, syscall)
+}
+
+/// [`tcp_fail`]'s shape for an error read off some other socket: the HTTP
+/// client's connection, whose reset node reports as the same `read
+/// ECONNRESET`.
+pub(crate) fn errno_failure(error: &std::io::Error, syscall: &str) -> OpOutcome {
+    let code = node_error_code(error);
     // syscall + errno, but no `path`: a host:port is not a filesystem path,
     // and node does not put one on a net error.
     OpOutcome::node_failed_at(
@@ -445,7 +452,7 @@ fn tcp_fail(error: std::io::Error, syscall: &str) -> OpOutcome {
         format!("{syscall} {code}"),
         syscall,
         None,
-        node_errno(code, &error),
+        node_errno(code, error),
     )
 }
 

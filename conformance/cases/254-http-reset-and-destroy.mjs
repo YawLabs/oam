@@ -1,8 +1,13 @@
-// socket.resetAndDestroy() on the sockets node's http and https servers
-// hand out. A server's req.socket and its 'connection' socket reset the
+// socket.resetAndDestroy() on the sockets node's http and https modules hand
+// out. A server's req.socket and its 'connection' socket reset the
 // connection: the client's read fails with `read ECONNRESET`, the request is
 // aborted, and the socket closes saying no error. An https connection's
-// socket is a TLSSocket and refuses with ERR_INVALID_HANDLE_TYPE.
+// socket is a TLSSocket and refuses with ERR_INVALID_HANDLE_TYPE. An
+// http.request's req.socket resets its connection too -- mid-response, the
+// response fails with ECONNRESET 'aborted'; after the response, the pooled
+// connection -- and a client whose server reset before answering fails with
+// node's `read ECONNRESET` (http.request and fetch alike). destroy() on that
+// socket after the response closes the pooled connection with a FIN.
 //
 // Each object's events are kept apart and printed once everything has
 // closed: the order across objects is the scheduler's.
@@ -160,6 +165,81 @@ function rawClient(port, request) {
     }).on("error", reject);
   });
   log(`  client got ${body}`);
+  server.close();
+}
+
+// A raw server that answers each request with the head of a 100-byte body
+// and one byte of it, and records each connection.
+async function rawServer(length) {
+  const peers = [];
+  const server = net.createServer((conn) => {
+    peers.push(record(conn, ["end", "error"]));
+    conn.on("data", () => conn.write(`HTTP/1.1 200 OK\r\nContent-Length: ${length}\r\n\r\nx`));
+  });
+  return { server, peers, port: await listen(server) };
+}
+
+// 4. An http.request's req.socket, mid-response: the default agent and a
+// fresh one (agent: false).
+for (const [label, agent] of [["default agent", undefined], ["agent: false", false]]) {
+  log(`--- http client, mid-response, ${label}`);
+  const { server, peers, port } = await rawServer(100);
+  const recs = await new Promise((resolve) => {
+    const req = http.get({ host: "127.0.0.1", port, agent }, (res) => {
+      const socket = req.socket;
+      log(`  instanceof net.Socket ${socket instanceof net.Socket}, ` +
+        `node's function ${socket.resetAndDestroy === resetFn}`);
+      const got = {
+        socket: record(socket, ["error"]),
+        req: record(req, ["error"]),
+        res: record(res, ["aborted", "error"]),
+      };
+      reset(socket);
+      resolve(got);
+    });
+  });
+  await Promise.all([recs.socket.closed, recs.req.closed, recs.res.closed, peers[0].closed]);
+  for (const [name, rec] of Object.entries(recs)) log(`  ${name}: ${rec.events.join(", ")}`);
+  log(`  server: ${peers[0].events.join(", ")}`);
+  server.close();
+}
+
+// 5. After the response, on the default agent: the connection is the pool's
+// now, and the reset (or the destroy) reaches it there.
+for (const how of ["resetAndDestroy", "destroy"]) {
+  log(`--- http client, after the response, ${how}()`);
+  const { server, peers, port } = await rawServer(1);
+  const socket = await new Promise((resolve) => {
+    const req = http.get({ host: "127.0.0.1", port }, (res) => {
+      res.resume();
+      res.on("end", () => setImmediate(() => resolve(req.socket)));
+    });
+  });
+  const rec = record(socket, ["error"]);
+  if (how === "destroy") socket.destroy();
+  else reset(socket);
+  await Promise.all([rec.closed, peers[0].closed]);
+  log(`  socket: ${rec.events.join(", ")}`);
+  log(`  server: ${peers[0].events.join(", ")}`);
+  server.close();
+}
+
+// 6. A server that resets the connection before answering: node's clients
+// report the socket's read error.
+{
+  log("--- a server that resets before the response");
+  const server = net.createServer((conn) => conn.once("data", () => conn.resetAndDestroy()));
+  const port = await listen(server);
+  const err = await new Promise((resolve) => {
+    http.get({ host: "127.0.0.1", port, agent: false }).on("error", resolve);
+  });
+  log(`  http.get: error ${describe(err)}`);
+  try {
+    await fetch(`http://127.0.0.1:${port}/`);
+    log("  fetch: resolved");
+  } catch (e) {
+    log(`  fetch: ${e.name} ${e.message}, cause ${describe(e.cause)}`);
+  }
   server.close();
 }
 
