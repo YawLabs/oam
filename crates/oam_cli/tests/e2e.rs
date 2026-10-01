@@ -3816,7 +3816,10 @@ fn small_builtins_wave_smoke() {
 /// docs/node-divergences.md, the zlib `dictionary` row, says what still
 /// differs: the deflated bytes are miniz's). Node's own bytes are
 /// `78bb622008b3cb401205b3013b200691` (FDICT set) and raw `cb401205b301`
-/// for the deflates below.
+/// for the deflates below. The last line pins the `strategy` / `windowBits`
+/// / `memLevel` row: oam ignores both, so its header stays `78bb` where
+/// node writes `783f` and `18b4`. If either is ever honoured, update that
+/// row and the dictionary row with it.
 #[test]
 fn zlib_dictionary_option_is_used_as_documented() {
     let stdout = run_ok(
@@ -3835,7 +3838,9 @@ fn zlib_dictionary_option_is_used_as_documented() {
          console.log('node bytes', tryIt(() => z.inflateSync(nodeBytes, { dictionary })));\n\
          const nodeRaw = Buffer.from('cb401205b301', 'hex');\n\
          console.log('node raw', tryIt(() => z.inflateRawSync(nodeRaw, { dictionary })));\n\
-         console.log('wrong', tryIt(() => z.inflateSync(nodeBytes, { dictionary: Buffer.from('nope') })));",
+         console.log('wrong', tryIt(() => z.inflateSync(nodeBytes, { dictionary: Buffer.from('nope') })));\n\
+         const hdr = (o) => z.deflateSync('hello world hello', { dictionary, ...o }).subarray(0, 2).toString('hex');\n\
+         console.log('ignored', hdr({ strategy: 2 }), hdr({ windowBits: 9 }));",
     );
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
@@ -3846,7 +3851,8 @@ fn zlib_dictionary_option_is_used_as_documented() {
          raw without Z_DATA_ERROR -3 invalid distance too far back\n\
          node bytes hello world hello\n\
          node raw hello world hello\n\
-         wrong Z_NEED_DICT 2 Bad dictionary"
+         wrong Z_NEED_DICT 2 Bad dictionary\n\
+         ignored 78bb 78bb"
     );
 }
 
