@@ -880,6 +880,66 @@ fn the_headers_timeout_stops_while_an_unsent_request_is_re_dialled() {
     );
 }
 
+/// undici's `bodyTimeout` on a response body: a read that waits longer than
+/// the limit for bytes fails with `UND_ERR_BODY_TIMEOUT` and closes the
+/// connection, as undici destroys the socket; the bytes that came in time
+/// were delivered, and a body read with no limit is left alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_body_read_fails_after_the_body_timeout() {
+    within(async {
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let closed_tx = Arc::new(Mutex::new(Some(closed_tx)));
+        let server = serve(move |mut conn, _, _| {
+            let closed_tx = closed_tx.clone();
+            async move {
+                conn.request().await;
+                conn.send(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n")
+                    .await;
+                // Then nothing: the client has to give up on its own.
+                let closed = conn.closed_within(Duration::from_secs(5)).await;
+                if let Some(tx) = closed_tx.lock().unwrap().take() {
+                    let _ = tx.send(closed);
+                }
+            }
+        })
+        .await;
+        let transport = transport(ProxySource::None);
+        let reg = Reg::new();
+        const LIMIT_MS: u64 = 200;
+        let p = payload(
+            reg.fetch(
+                &transport,
+                json!({
+                    "url": format!("http://127.0.0.1:{}/", server.port),
+                    "body_timeout_ms": LIMIT_MS,
+                }),
+            )
+            .await,
+        );
+        let handle = handle_of(&p);
+        assert!(matches!(reg.read(handle).await, OpOutcome::Bytes(ref b) if b == b"hello"));
+        let start = std::time::Instant::now();
+        match reg.read(handle).await {
+            OpOutcome::NodeFailed { code, message, .. } => {
+                assert_eq!(code, "UND_ERR_BODY_TIMEOUT");
+                assert_eq!(message, "Body Timeout Error");
+            }
+            other => panic!("expected a body timeout, got {other:?}"),
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(LIMIT_MS) && elapsed < Duration::from_secs(3),
+            "{elapsed:?}"
+        );
+        assert!(closed_rx.await.unwrap(), "the connection was not closed");
+        assert!(
+            matches!(reg.read(handle).await, OpOutcome::Failed(ref t) if t.contains("is gone")),
+            "the timed-out body is gone"
+        );
+    })
+    .await;
+}
+
 // ---------------------------------------------------------------- redirects
 
 #[tokio::test(flavor = "multi_thread")]

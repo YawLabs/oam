@@ -178,50 +178,29 @@
     // request().body is a Readable streaming the response bytes, plus the
     // undici body-mixin helpers, all consuming the same stream.
     //
-    // `bodyTimeout` (ms, 0 = none) is undici's: the longest the body may go
-    // without a byte while something is reading it. The timer runs for as
-    // long as a read is outstanding and is cleared by the chunk that answers
-    // it, so a slow consumer never trips it -- undici does not count the time
-    // its parser is paused by backpressure either. When it lapses the body is
-    // destroyed with BodyTimeoutError and `abort` lets go of the connection.
-    function makeBodyReadable(webStream, bodyTimeout, abort) {
+    // undici's `bodyTimeout` runs in the transport, as for fetch: each read
+    // of the body waits at most that long for bytes, and one that lapses
+    // closes the connection and fails the read -- which fetch's body reports
+    // as `TypeError: terminated` with a BodyTimeoutError cause, and this
+    // body as the BodyTimeoutError itself, as undici's request() does.
+    function makeBodyReadable(webStream) {
       const reader = webStream && typeof webStream.getReader === "function" ? webStream.getReader() : null;
-      let timer = null;
-      const disarm = () => {
-        if (timer !== null) {
-          clearTimeout(timer);
-          timer = null;
-        }
-      };
       const r = new Readable({
         read() {
           if (!reader) {
             this.push(null);
             return;
           }
-          if (bodyTimeout && timer === null) {
-            timer = undiciTimer(() => {
-              timer = null;
-              const err = new errors.BodyTimeoutError("Body Timeout Error");
-              abort(err);
-              r.destroy(err);
-            }, bodyTimeout);
-          }
           reader.read().then(
             ({ done, value }) => {
-              disarm();
               if (done) this.push(null);
               else this.push(G.Buffer.from(value));
             },
             (err) => {
-              disarm();
+              if (err instanceof TypeError && err.cause instanceof errors.BodyTimeoutError) err = err.cause;
               this.destroy(err instanceof Error ? err : new Error(String(err)));
             },
           );
-        },
-        destroy(err, cb) {
-          disarm();
-          cb(err);
         },
       });
       const collect = async () => {
@@ -345,8 +324,11 @@
       // has a connection for the request -- the pool's, or the socket a
       // connect function handed back -- so it costs no op of its own, and
       // a late head fails the fetch with UND_ERR_HEADERS_TIMEOUT and closes
-      // that connection, as undici destroys the socket.
-      if (headersTimeout) init.__oamHeadersTimeout = headersTimeout;
+      // that connection, as undici destroys the socket. bodyTimeout runs
+      // there too, on each read of the body. Both are given whatever they
+      // are (0: no limit), so fetch does not apply its dispatcher's.
+      init.__oamHeadersTimeout = headersTimeout;
+      init.__oamBodyTimeout = bodyTimeout;
       let res;
       try {
         // The body, by undici's rules: checked before anything is sent,
@@ -357,7 +339,7 @@
         unlink();
         throw requestError(err);
       }
-      const body = makeBodyReadable(res.body, bodyTimeout, (err) => controller.abort(err));
+      const body = makeBodyReadable(res.body);
       // A signal shared by many requests must not keep one listener per
       // finished body.
       body.once("close", unlink);
@@ -385,7 +367,8 @@
     function requestError(err) {
       if (!(err instanceof TypeError) || err.message !== "fetch failed" || !err.cause) return err;
       const cause = err.cause;
-      if (cause.code === "UND_ERR_HEADERS_TIMEOUT") return new errors.HeadersTimeoutError("Headers Timeout Error");
+      // fetch's cause is already undici's class (holder.undiciError).
+      if (cause instanceof errors.HeadersTimeoutError) return cause;
       if (cause instanceof errors.UndiciError) return err;
       const Class = UNWRAPPED[cause.name];
       return Class ? new Class(cause.message) : err;
@@ -1335,10 +1318,22 @@
         const refusal = dispatcher._oamVet(request);
         if (refusal) return { refuse: refusal };
       }
-      if (typeof dispatcher._oamConnect === "function") {
-        return { connector: { fn: dispatcher._oamConnect, self: dispatcher } };
+      const policy = {};
+      if (request) {
+        // A fetch rides the dispatcher's own headersTimeout / bodyTimeout
+        // (null: undici's 300 s), checked as its Client checks them -- a bad
+        // one fails the fetch with that InvalidArgumentError as the cause.
+        try {
+          policy.headersTimeout = dispatcherTimeout("headersTimeout", dispatcher);
+          policy.bodyTimeout = dispatcherTimeout("bodyTimeout", dispatcher);
+        } catch (err) {
+          return { refuse: err };
+        }
       }
-      return {};
+      if (typeof dispatcher._oamConnect === "function") {
+        policy.connector = { fn: dispatcher._oamConnect, self: dispatcher };
+      }
+      return policy;
     }
 
     // ---- global dispatcher ------------------------------------------------
@@ -1354,6 +1349,22 @@
     if (holder.policy === undefined) {
       Object.defineProperty(holder, "policy", {
         value: policyOf,
+        writable: false,
+        enumerable: false,
+        configurable: false,
+      });
+    }
+    // The undici class of a failure oam's transport raises with undici's
+    // code (a headers or body timeout, an oversized response head), so the
+    // `cause` of a fetch failure is an instance of `errors.*` as in node.
+    if (holder.undiciError === undefined) {
+      const byCode = {
+        UND_ERR_HEADERS_TIMEOUT: errors.HeadersTimeoutError,
+        UND_ERR_BODY_TIMEOUT: errors.BodyTimeoutError,
+        UND_ERR_HEADERS_OVERFLOW: errors.HeadersOverflowError,
+      };
+      Object.defineProperty(holder, "undiciError", {
+        value: (code, message) => (byCode[code] ? new byCode[code](message) : null),
         writable: false,
         enumerable: false,
         configurable: false,

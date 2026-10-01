@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::BodyExt as _;
@@ -43,6 +44,9 @@ pub struct FetchBody {
     /// an agent's socket reads its body here and reports what node's parser
     /// reports. fetch keeps the one text it has always had.
     coded: bool,
+    /// undici's `bodyTimeout`: the longest one read may wait for bytes
+    /// (`fetch`'s and `undici.request`'s; `None` for none).
+    timeout: Option<Duration>,
 }
 
 /// The body could not be read (a wire failure or a corrupt encoding). The op
@@ -78,7 +82,13 @@ impl FetchBody {
             decoder: codings.map(Decoder::new),
             pending: Bytes::new(),
             coded: false,
+            timeout: None,
         }
+    }
+
+    /// The body with undici's `bodyTimeout` (`None`: no limit).
+    pub fn timed(self, timeout: Option<Duration>) -> FetchBody {
+        FetchBody { timeout, ..self }
     }
 
     /// An undecoded body whose malformed framing reads as node's coded parse
@@ -159,7 +169,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// `fetchBodyRead`: one chunk of the body under `handle` (`Bytes`), `Done`
-/// at the end, [`BODY_READ_FAILED`] on a failure.
+/// at the end, [`BODY_READ_FAILED`] on a failure, and undici's
+/// `UND_ERR_BODY_TIMEOUT` when the body has a `bodyTimeout` and no bytes
+/// came within it.
 ///
 /// A cancel (`fetchBodyCancel`) that lands while the read is in flight --
 /// the body is out of the registry then -- leaves a tombstone in `cancelled`
@@ -193,9 +205,25 @@ pub async fn read(
     if lock(&cancelled).remove(&handle) {
         return OpOutcome::Done;
     }
+    // undici's bodyTimeout, for this read: it runs while the body is being
+    // read and is cleared by the bytes that answer it. One that lapses fails
+    // the read and drops the body, which closes its connection, as undici
+    // destroys the socket.
+    let timeout = body.timeout;
+    let lapsed = async move {
+        match timeout {
+            Some(limit) => tokio::time::sleep(limit).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(lapsed);
     let result = loop {
         tokio::select! {
             result = body.next_chunk() => break result,
+            () = &mut lapsed => {
+                drop(body);
+                return OpOutcome::node_failed("UND_ERR_BODY_TIMEOUT", "Body Timeout Error");
+            }
             () = cancelled_wake.as_mut() => {
                 cancelled_wake.set(cancel_signal.notified());
                 cancelled_wake.as_mut().enable();

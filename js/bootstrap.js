@@ -966,6 +966,9 @@
           } catch (e) {
             if (bodyAborted) return;
             bodyOver();
+            // undici's bodyTimeout lapsed: node's body errors with
+            // `TypeError: terminated`, the BodyTimeoutError as its cause.
+            if (e?.code === "UND_ERR_BODY_TIMEOUT") throw new TypeError("terminated", { cause: undiciCause(e) });
             throw e;
           }
           // The read that was in flight when the abort landed returns here
@@ -1216,7 +1219,26 @@
     // checked when the fetch resumes) has to look the same or a policy
     // failure reads as an unreachable host.
     if (e instanceof Error && e.code === "ERR_ACCESS_DENIED") return e;
-    return new TypeError("fetch failed", { cause: e instanceof Error ? e : new Error(String(e)) });
+    return new TypeError("fetch failed", { cause: e instanceof Error ? undiciCause(e) : new Error(String(e)) });
+  }
+
+  // The transport's own failures that carry undici's code -- a late
+  // response head, a stalled body, an oversized head -- as node reports them:
+  // an instance of undici's error class (`errors.HeadersTimeoutError`, ...),
+  // from the oam:undici shim once it is loaded, else an error with that
+  // class's name.
+  const UNDICI_CLASS_NAMES = {
+    UND_ERR_HEADERS_TIMEOUT: "HeadersTimeoutError",
+    UND_ERR_BODY_TIMEOUT: "BodyTimeoutError",
+    UND_ERR_HEADERS_OVERFLOW: "HeadersOverflowError",
+  };
+  function undiciCause(e) {
+    const name = UNDICI_CLASS_NAMES[e.code];
+    if (name === undefined) return e;
+    const made = globalThis.__oamUndiciDispatcher?.undiciError?.(e.code, e.message);
+    if (made) return made;
+    e.name = name;
+    return e;
   }
 
   // The op, settled: a response, or -- for a fetch whose dispatcher carries a
@@ -1577,13 +1599,6 @@
     if (rawPayload && typeof init.__oamSentSignal === "number") {
       request.sent_signal = init.__oamSentSignal;
     }
-    // undici.request's headersTimeout (internal; > 0 only). The transport
-    // runs it from the moment a connection has the request -- undici's
-    // start, after DNS, the connect and any TLS handshake or tunnel -- and
-    // fails the fetch with UND_ERR_HEADERS_TIMEOUT when the head is late.
-    if (!rawPayload && typeof init.__oamHeadersTimeout === "number" && init.__oamHeadersTimeout > 0) {
-      request.headers_timeout_ms = init.__oamHeadersTimeout;
-    }
     // An undici-style dispatcher may carry a connect.lookup hook -- the
     // DNS-rebind / SSRF pin. The oam:undici shim exposes it as
     // `_oamConnectLookup`. node honours that hook however the dispatcher was
@@ -1606,8 +1621,9 @@
     // http.request's internal entry: node's http.request never goes through
     // an undici dispatcher.
     let connector = null;
+    let policy = null;
     if (!rawPayload && dispatcher != null) {
-      const policy = dispatcherPolicy(dispatcher, holder, {
+      policy = dispatcherPolicy(dispatcher, holder, {
         url: rawUrl,
         headerNames: headers.map((h) => h[0]),
       });
@@ -1616,6 +1632,26 @@
         connector = policy.connector;
         request.connect_hook = true;
       }
+    }
+    // undici's two per-phase limits, which every node fetch runs under: the
+    // dispatcher's `headersTimeout` / `bodyTimeout` (the global one's when
+    // none is passed), else undici's 300 s; 0 for none. `undici.request`
+    // passes its own, already resolved. The transport runs both:
+    // headersTimeout from the moment a connection has the request -- after
+    // DNS, the connect and any TLS handshake or tunnel, and after a streamed
+    // body has gone -- failing the fetch with UND_ERR_HEADERS_TIMEOUT and
+    // closing that connection when the head is late; bodyTimeout on each read
+    // of the body, failing it with UND_ERR_BODY_TIMEOUT. http.request (the
+    // raw entry) has node's own timeouts instead.
+    if (!rawPayload) {
+      let headersTimeout = init.__oamHeadersTimeout;
+      let bodyTimeout = init.__oamBodyTimeout;
+      if (headersTimeout === undefined) {
+        headersTimeout = policy?.headersTimeout ?? 300e3;
+        bodyTimeout = policy?.bodyTimeout ?? 300e3;
+      }
+      if (headersTimeout > 0) request.headers_timeout_ms = headersTimeout;
+      if (bodyTimeout > 0) request.body_timeout_ms = bodyTimeout;
     }
     // Internal escape hatch: a request whose body is produced over time
     // rides an outbound body channel instead of a materialized body

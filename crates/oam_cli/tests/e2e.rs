@@ -5647,6 +5647,125 @@ error-mid-body finalized=false"##;
     );
 }
 
+/// `fetch()` runs under its dispatcher's `headersTimeout` / `bodyTimeout`, as
+/// node's does: the `dispatcher` option's (global `fetch` and `undici.fetch`),
+/// the global one's after `setGlobalDispatcher`, a ProxyAgent's for the
+/// origin's answer, else undici's 300 s. A late head fails the fetch with
+/// `TypeError: fetch failed`, cause HeadersTimeoutError; a stalled body
+/// errors its reader, `text()` and `for await` with `TypeError: terminated`,
+/// cause BodyTimeoutError -- instances of the shim's `errors.*`. The limit
+/// starts once connected (a slow connect function counts for nothing), each
+/// redirect hop gets its own, 0 disables, a `headersTimeout` in the fetch
+/// init is not an option, and a bad dispatcher value is undici's
+/// InvalidArgumentError as the cause. Up to this fix a fetch got no limit at
+/// all and only its own signal ended it. The expected output is node
+/// v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn fetch_rides_its_dispatchers_headers_and_body_timeouts() {
+    let script = write_temp(
+        "fetch_dispatcher_timeouts/main.mjs",
+        r##"import net from 'node:net';
+import * as undici from 'undici';
+const { Agent, ProxyAgent, errors, setGlobalDispatcher, getGlobalDispatcher, buildConnector } = undici;
+
+const never = net.createServer((s) => { s.on('data', () => {}); s.on('error', () => {}); });
+const stall = net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => s.write('HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n'));
+});
+const slow = net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => setTimeout(() => s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok'), 300));
+});
+const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${srv.address().port}`)));
+const [nu, su, lu] = await Promise.all([listen(never), listen(stall), listen(slow)]);
+
+const describe = (e) => {
+  const c = e?.cause;
+  return [e?.name, JSON.stringify(e?.message), e instanceof TypeError,
+    c ? `cause=${c.name}/${c.code}/${JSON.stringify(c.message)}/undici=${c instanceof errors.UndiciError}/cls=${c instanceof (errors[c.name] ?? Object)}` : 'nocause'].join(' ');
+};
+async function attempt(label, fn) {
+  const t0 = Date.now();
+  try {
+    console.log(label, 'ok', await fn());
+  } catch (e) {
+    console.log(label, 'failed', describe(e), 'early=' + (Date.now() - t0 < 4000));
+  }
+}
+// A budget that ends a probe the phase timeout did not end, with its own reason.
+const budget = (ms) => { const ac = new AbortController(); setTimeout(() => ac.abort(new Error('budget')), ms).unref(); return ac.signal; };
+const total = () => budget(6000);
+
+await attempt('headers-dispatcher', () => fetch(nu, { dispatcher: new Agent({ headersTimeout: 400 }), signal: total() }).then((r) => r.status));
+await attempt('headers-undici-fetch', () => undici.fetch(nu, { dispatcher: new Agent({ headersTimeout: 400 }), signal: total() }).then((r) => r.status));
+await attempt('headers-zero', () => fetch(nu, { dispatcher: new Agent({ headersTimeout: 0 }), signal: budget(900) }).then((r) => r.status));
+await attempt('headers-in-time', () => fetch(lu, { dispatcher: new Agent({ headersTimeout: 600 }) }).then((r) => r.text()));
+await attempt('headers-slow-connect', () => fetch(lu, { dispatcher: new Agent({ headersTimeout: 600, connect: (o, cb) => setTimeout(() => buildConnector({})(o, cb), 800) }) }).then((r) => r.text()));
+await attempt('headers-init-option-ignored', () => fetch(nu, { headersTimeout: 400, signal: budget(900) }).then((r) => r.status));
+await attempt('body-text', async () => (await fetch(su, { dispatcher: new Agent({ bodyTimeout: 400 }), signal: total() })).text());
+await attempt('body-reader', async () => {
+  const r = await fetch(su, { dispatcher: new Agent({ bodyTimeout: 400 }), signal: total() });
+  const reader = r.body.getReader();
+  const got = [];
+  for (;;) { const { done, value } = await reader.read(); if (done) break; got.push(new TextDecoder().decode(value)); }
+  return got.join('');
+});
+await attempt('body-for-await', async () => {
+  const r = await fetch(su, { dispatcher: new Agent({ bodyTimeout: 400 }), signal: total() });
+  let s = ''; for await (const c of r.body) s += new TextDecoder().decode(c); return s;
+});
+const previous = getGlobalDispatcher();
+setGlobalDispatcher(new Agent({ headersTimeout: 400, bodyTimeout: 400 }));
+await attempt('global-headers', () => fetch(nu, { signal: total() }).then((r) => r.status));
+await attempt('global-body', async () => (await fetch(su, { signal: total() })).arrayBuffer().then((b) => b.byteLength));
+setGlobalDispatcher(previous);
+await attempt('dispatcher-bad', () => fetch(nu, { dispatcher: new Agent({ headersTimeout: -1 }), signal: total() }).then((r) => r.status));
+// Redirect hops each get their own limit.
+const target = lu;
+const redirector = await listen(net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => setTimeout(() => s.end(`HTTP/1.1 302 Found\r\nlocation: ${target}/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n`), 300));
+}));
+await attempt('redirect-hops', () => fetch(redirector, { dispatcher: new Agent({ headersTimeout: 500 }) }).then((r) => r.text()));
+// A ProxyAgent's headersTimeout bounds the origin's answer.
+const proxy = net.createServer((c) => {
+  c.on('error', () => {});
+  c.once('data', (d) => {
+    const port = Number(d.toString('latin1').split(' ')[1].split(':').pop());
+    const up = net.connect(port, '127.0.0.1', () => { c.write('HTTP/1.1 200 Connection Established\r\n\r\n'); up.pipe(c); c.pipe(up); });
+    up.on('error', () => c.destroy());
+    c.on('close', () => up.destroy());
+  });
+});
+const pu = await listen(proxy);
+await attempt('proxy-silent-origin', () => fetch(nu, { dispatcher: new ProxyAgent({ uri: pu, headersTimeout: 400 }), signal: total() }).then((r) => r.status));
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"headers-dispatcher failed TypeError "fetch failed" true cause=HeadersTimeoutError/UND_ERR_HEADERS_TIMEOUT/"Headers Timeout Error"/undici=true/cls=true early=true
+headers-undici-fetch failed TypeError "fetch failed" true cause=HeadersTimeoutError/UND_ERR_HEADERS_TIMEOUT/"Headers Timeout Error"/undici=true/cls=true early=true
+headers-zero failed Error "budget" false nocause early=true
+headers-in-time ok ok
+headers-slow-connect ok ok
+headers-init-option-ignored failed Error "budget" false nocause early=true
+body-text failed TypeError "terminated" true cause=BodyTimeoutError/UND_ERR_BODY_TIMEOUT/"Body Timeout Error"/undici=true/cls=true early=true
+body-reader failed TypeError "terminated" true cause=BodyTimeoutError/UND_ERR_BODY_TIMEOUT/"Body Timeout Error"/undici=true/cls=true early=true
+body-for-await failed TypeError "terminated" true cause=BodyTimeoutError/UND_ERR_BODY_TIMEOUT/"Body Timeout Error"/undici=true/cls=true early=true
+global-headers failed TypeError "fetch failed" true cause=HeadersTimeoutError/UND_ERR_HEADERS_TIMEOUT/"Headers Timeout Error"/undici=true/cls=true early=true
+global-body failed TypeError "terminated" true cause=BodyTimeoutError/UND_ERR_BODY_TIMEOUT/"Body Timeout Error"/undici=true/cls=true early=true
+dispatcher-bad failed TypeError "fetch failed" true cause=InvalidArgumentError/UND_ERR_INVALID_ARG/"headersTimeout must be a positive integer or zero"/undici=true/cls=true early=true
+redirect-hops ok ok
+proxy-silent-origin failed TypeError "fetch failed" true cause=HeadersTimeoutError/UND_ERR_HEADERS_TIMEOUT/"Headers Timeout Error"/undici=true/cls=true early=true"##;
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
 // An undici Agent's connect.lookup hook is honored as a REAL DNS/connect pin
 // (the DNS-rebind / SSRF control @yawlabs/fetch-mcp relies on). Proof: pin a
 // NON-resolvable host to the server's real IP -- the request must connect

@@ -1579,7 +1579,7 @@ generator as `[object AsyncGenerator]`. What differs:
 - **`strictContentLength: false`** on a dispatcher is not applied: a mismatch is refused as
   under undici's default, where undici would warn and send.
 
-**`headersTimeout` and `bodyTimeout` on `undici.request`**
+**`headersTimeout` and `bodyTimeout` on `undici.request` and `fetch`**
 
 `undici.request()`, `undici.stream()` and a dispatcher's `request()` honour undici's two
 per-phase stall limits (#218): a response head that does not arrive within `headersTimeout`
@@ -1596,6 +1596,23 @@ Infinity, which undici's `Agent` and `Pool` lose in a JSON copy of their options
 default).
 Pinned against Node + undici 6.29.0 by `undici_request_honours_headers_and_body_timeouts`
 (e2e). Up to 0.17.1 both options were accepted and ignored.
+
+`fetch()` -- global `fetch` and `undici.fetch` -- runs under the same two limits, as Node's
+does: its dispatcher's (the `dispatcher` option's, else the global one's, a ProxyAgent's
+for the origin's answer), else undici's 300 s, with or without `undici` imported (measured:
+a plain `fetch` to a silent server fails at 300 s in oam and 321 s in Node, whose timers are
+coarse). A `headersTimeout` in the fetch init is not an option, in either runtime. A late
+head rejects with `TypeError: fetch failed`, cause `HeadersTimeoutError`; a stalled body
+errors its reader, `text()` / `json()` / `arrayBuffer()` and `for await` with `TypeError:
+terminated`, cause `BodyTimeoutError`; a bad dispatcher value is the dispatcher's
+`InvalidArgumentError` as the cause. Each cause is an instance of the shim's `errors.*`
+once `undici` is imported, as an oversized response head's `HeadersOverflowError` is (case
+277), and carries that class's name either way. Both limits run in the transport, one
+implementation for `fetch` and `undici.request`. Pinned against Node + undici 6.29.0 by
+`fetch_rides_its_dispatchers_headers_and_body_timeouts` (e2e) and
+`a_stalled_body_read_fails_after_the_body_timeout` (`http_client_fetch.rs`). Up to 0.17.1 a
+`fetch` had no limit at all: a server that never answered held it until its `signal` ended
+it, and a cause from oam's transport was a plain `Error`.
 
 As in Node, `headersTimeout` starts once the request is on a connected socket -- DNS (a
 replaced `dns.lookup` or a `connect.lookup` hook), the TCP connect, the TLS handshake, a
@@ -1618,21 +1635,20 @@ taken (pinned by `undici_headers_timeout_starts_when_a_streamed_body_ends`). Wha
   `HeadersTimeoutError` after `headersTimeout` (measured: 64 MiB to a server that never reads,
   limit 500 ms, under 4 s in Node). oam's timer waits for the body's end, which never comes:
   the request stays open until the caller's signal ends it.
-
 - **The timers are exact.** undici's are coarse (a 500 ms `headersTimeout` fires after about
   1019 ms in Node); oam's fire at the configured delay. A delay above 2^31-1 ms
   (`headersTimeout: 2 ** 31` and the like, a common way to say "no limit") is held to that
   ceiling, about 24.8 days, where undici's timestamp-based timers never come due; a plain
   `setTimeout` would have fired it after 1 ms.
-- **`bodyTimeout` runs only while the body is being read.** oam reads a `request()` body
-  from the transport when something consumes it; undici reads ahead into the stream's
-  buffer. So a stalled body nobody reads is left alone in oam, where Node destroys it with
-  `BodyTimeoutError` (an uncaught `'error'` if nothing listens). A body that is read --
-  `text()`, `json()`, a `'data'` listener, `pipe()`, `stream()` -- times out in both.
-- **`fetch` through a dispatcher does not get them.** Node applies an `Agent`'s
-  `headersTimeout` / `bodyTimeout` to a `fetch` that rides it (and the 300 s defaults to
-  every `fetch`); oam applies them to `undici.request` / `stream` / `dispatcher.request`
-  only, and a `fetch` is bounded by its `signal`.
+- **`bodyTimeout` runs only while the body is being read.** oam reads a `request()` or
+  `fetch` body from the transport when something consumes it; undici reads ahead into the
+  stream's buffer. So a stalled body nobody reads is left alone in oam, where Node destroys
+  it with `BodyTimeoutError` (an uncaught `'error'` on a `request()` body if nothing listens)
+  and closes its connection. A body that is read -- `text()`, `json()`, a `'data'` listener,
+  `pipe()`, `stream()`, a `fetch` body's reader -- times out in both.
+- **A cause's class with `undici` not imported.** Node's built-in `fetch` raises its
+  bundled undici's classes, which are not the npm package's; oam has one undici, so with
+  the shim loaded a cause is an instance of `errors.*` whichever `fetch` raised it.
 
 **Redirects**
 

@@ -126,22 +126,28 @@ pub struct FetchRequest {
     /// takes it from the runtime's registry and puts it here.
     #[serde(skip)]
     pub dispatched: Option<Dispatched>,
-    /// undici's `headersTimeout` in ms (`undici.request`'s; fractional
-    /// allowed, absent or 0 for no limit): the longest a hop's response head
-    /// may take once a connection has the request ([`super::sent`]).
+    /// undici's `headersTimeout` in ms (`fetch`'s and `undici.request`'s;
+    /// fractional allowed, absent or 0 for no limit): the longest a hop's
+    /// response head may take once a connection has the request
+    /// ([`super::sent`]).
     #[serde(default)]
     pub headers_timeout_ms: Option<f64>,
+    /// undici's `bodyTimeout` in ms (absent or 0 for no limit): the longest
+    /// one read of the response body may wait for bytes
+    /// ([`super::body::read`]).
+    #[serde(default)]
+    pub body_timeout_ms: Option<f64>,
 }
 
 /// The longest timer JS can set (2^31-1 ms, about 24.8 days). A
-/// `headersTimeout` above it is held to it, as `undici.request`'s timer
-/// always was in oam (docs/node-divergences.md).
+/// `headersTimeout` or `bodyTimeout` above it is held to it, as
+/// `undici.request`'s timers always were in oam (docs/node-divergences.md).
 const MAX_TIMER_MS: f64 = 2_147_483_647.0;
 
-/// A `headers_timeout_ms` as a limit: `None` for none (absent, 0, or not a
-/// number), else at least 1 ms -- `setTimeout`'s floor -- and at most
-/// [`MAX_TIMER_MS`].
-fn headers_limit(ms: Option<f64>) -> Option<Duration> {
+/// A `headers_timeout_ms` / `body_timeout_ms` as a limit: `None` for none
+/// (absent, 0, or not a number), else at least 1 ms -- `setTimeout`'s floor
+/// -- and at most [`MAX_TIMER_MS`].
+fn timeout_limit(ms: Option<f64>) -> Option<Duration> {
     let ms = ms.filter(|ms| *ms > 0.0)?;
     Some(Duration::from_secs_f64(
         ms.clamp(1.0, MAX_TIMER_MS) / 1000.0,
@@ -149,7 +155,7 @@ fn headers_limit(ms: Option<f64>) -> Option<Duration> {
 }
 
 /// undici's `HeadersTimeoutError`, raised when a hop's head is late. JS
-/// turns it into that class (js/undici.js).
+/// gives it that class (bootstrap.js `undiciCause`).
 fn headers_timed_out() -> OpOutcome {
     OpOutcome::node_failed("UND_ERR_HEADERS_TIMEOUT", "Headers Timeout Error")
 }
@@ -243,6 +249,8 @@ struct LoopState {
     /// undici's `headersTimeout`, run from each checkout
     /// ([`super::sent::headers_deadline`]). `None`: no limit, and no timer.
     headers_timeout: Option<Duration>,
+    /// undici's `bodyTimeout`, handed to the response body. `None`: no limit.
+    body_timeout: Option<Duration>,
 }
 
 enum BodySource {
@@ -364,7 +372,7 @@ pub async fn fetch(
     } else {
         transport.route(req.lookup_hook, attempt_timeout, tls_range)
     };
-    let headers_timeout = headers_limit(req.headers_timeout_ms);
+    let headers_timeout = timeout_limit(req.headers_timeout_ms);
     let dispatched = match req.dispatched {
         Some(dispatched) => Some(dispatched),
         None => headers_timeout.map(|_| Dispatched::new()),
@@ -386,6 +394,7 @@ pub async fn fetch(
         fetch_semantics: req.fetch_semantics,
         dispatched,
         headers_timeout,
+        body_timeout: timeout_limit(req.body_timeout_ms),
     };
     run(state, &bodies, &ids, &continuations).await
 }
@@ -870,7 +879,7 @@ fn respond(
     let mut url = state.current;
     url.set_fragment(None);
     let handle = ids.fetch_add(1, Ordering::Relaxed);
-    let body = FetchBody::new(response.into_body(), codings.as_deref());
+    let body = FetchBody::new(response.into_body(), codings.as_deref()).timed(state.body_timeout);
     lock(bodies).insert(handle, body);
     let mut payload = serde_json::json!({
         "status": status.as_u16(),
