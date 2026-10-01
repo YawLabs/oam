@@ -1798,11 +1798,34 @@ behind exactly that test; code that reads the test as a promise of the stream AP
 the method it reaches for missing. An `'upgrade'` listener gets a real `net.Socket` for the
 connection, and the request's `req.socket` is that socket, as in Node; the socket
 `'connection'` handed out for the same connection closes at the handover rather than with
-the upgraded socket. On an exchange the connection was closed under after its response had
-started, the socket's `'close'` comes after the response's, where Node emits it first (they
-are in Node's order when the response had not started). A socket JS destroys mid-exchange
-(`destroy()`, `resetAndDestroy()`) emits its `'close'` on the next tick, before the request's
-`'aborted'` and the response's `'close'`, where Node emits it after them.
+the upgraded socket.
+
+When the connection closes under an exchange, the socket's `'close'` drives the rest, as in
+Node: it comes once the connection has closed (the native side reports it), and its listeners
+run in the order they were added -- the server's own first (the request's `'aborted'`), then
+a `'connection'` listener's, then the response's (its `'close'` without `'finish'`), then the
+handler's; the request's `'error'` and `'close'` follow on the next tick. A `destroy(err)`
+emits `'error'` on the next tick and `'close'` with `true`. An `https` connection's plain
+socket closes before its TLS socket, as Node's does. That holds whoever closed it --
+`destroy()`, `destroy(err)` or `resetAndDestroy()` on the socket, `req.destroy()` (which
+closes the connection even once the response is under way, as Node's does), or the client
+going away after the response started
+(`conformance/cases/272-http-server-connection-close-order.mjs`). Up to 0.17.1 a socket JS
+destroyed emitted `'close'` on the next tick, before `'aborted'` and the response's
+`'close'`; a client that went away after the response started closed the response before the
+socket; and a `req.destroy()` once the response was under way left the connection open and
+the response never closed.
+
+What still differs around a close: the socket never emits `'end'`, and a client that goes
+away closes it with `false` -- Node's says `true` when its read failed (`ECONNRESET`) or the
+request was cut short (`HPE_INVALID_EOF_STATE`, which Node also emits as the socket's
+`'error'`). A server request emits `'close'` only when it is destroyed or aborted -- Node's
+destroys itself once read to the end, so its `'close'` follows `'end'` on every exchange; a
+request read to the end whose connection then closes gets its `'close'` there, without an
+error, where Node's came earlier. A client that half-closes or goes away while the handler
+has not read the request body is not noticed until the server's timeouts end the connection;
+Node notices at once (`'aborted'`, the socket's `'close'`). Of two pipelined requests Node
+dispatches both before a `destroy()` in the first one's handler takes effect; oam the first.
 
 `resetAndDestroy()` is `net.Socket`'s own function (the same object) and does what Node's
 does: the connection closes with a reset -- the client's read fails with `read ECONNRESET`,
