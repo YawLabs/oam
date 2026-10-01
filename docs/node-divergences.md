@@ -1559,6 +1559,17 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   `Connection: close` and closed it: no `'close'` 1.5 s later).
 - **`statusText` is the canonical reason phrase**, not the server's: `200 Custom Reason` reads
   `OK` in oam, and `299 Whatever` reads `''`. Node reports the reason on the wire.
+- **Bodies are extracted as the Fetch Standard says, with three gaps.** `fetch`, `Request`
+  and `Response` take a `Blob`/`File`, `URLSearchParams`, `FormData`, `ReadableStream` (or
+  any async iterable; `duplex: 'half'` required), buffers and strings, with Node's
+  content-type for each, and a streamed upload's chunks, a failing source and a redirect of
+  a streamed body (every redirect but a 303 fails the fetch) behave as in Node (#154). What
+  differs: a `FormData` body's boundary reads `----formdata-oam-0<11 digits>` where undici's
+  reads `----formdata-undici-0<11 digits>` (same shape, three bytes shorter per occurrence);
+  nothing has `formData()`, neither a constructed `Request` / `Response` nor a fetched
+  response; and when a fetch with a streamed body is aborted or its connection drops, oam
+  cancels the source stream (with the abort reason or the failure), as the Fetch Standard
+  says, where Node neither cancels it nor stops pulling it.
 - **The request header count is capped.** More than 24,576 distinct header names (fewer if
   the header table's hash-flooding defence rebuilds it) fails with
   `fetch: too many request headers`; Node has no cap (25,000 distinct names get a 200).

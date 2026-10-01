@@ -3181,6 +3181,54 @@ fn oam_serve_handles_get_post_and_errors() {
     assert_eq!(lines[5], "closed");
 }
 
+/// What `oam.serve` writes for each kind of `Response` body (#154): the
+/// content-type the body implies, and a body whose bytes are known goes out
+/// whole under a content-length -- only a stream is chunked. A Blob used to
+/// crash the handler's answer (`_body is not async iterable`) and a
+/// URLSearchParams went out as two NUL-ish bytes with no type.
+#[test]
+fn oam_serve_writes_each_response_body_kind() {
+    let stdout = run_ok(
+        "serve_body_kinds.mjs",
+        "const form = new FormData();\n\
+         form.append('k', 'v');\n\
+         const bodies = {\n\
+           '/string': () => new Response('text'),\n\
+           '/blob': () => new Response(new Blob(['blobdata'], { type: 'application/x-test' })),\n\
+           '/params': () => new Response(new URLSearchParams({ a: '1', b: 'x y' })),\n\
+           '/form': () => new Response(form),\n\
+           '/bytes': () => new Response(new Uint8Array([104, 105])),\n\
+           '/typed': () => new Response('{}', { headers: { 'content-type': 'application/json' } }),\n\
+           '/empty': () => new Response(null, { status: 204 }),\n\
+           '/stream': () => new Response(new ReadableStream({\n\
+             start(c) { c.enqueue(new TextEncoder().encode('streamed')); c.close(); },\n\
+           })),\n\
+         };\n\
+         const server = await oam.serve({ fetch: (req) => bodies[new URL(req.url).pathname]() });\n\
+         for (const path of Object.keys(bodies)) {\n\
+           const res = await fetch(`http://127.0.0.1:${server.port}${path}`);\n\
+           const text = (await res.text()).replace(/----formdata-oam-\\d+/g, '----B');\n\
+           const type = String(res.headers.get('content-type')).replace(/----formdata-oam-\\d+/, '----B');\n\
+           const framing = res.headers.get('transfer-encoding') ?? `cl ${res.headers.get('content-length')}`;\n\
+           console.log(path, res.status, type, framing, JSON.stringify(text));\n\
+         }\n\
+         server.close();",
+    );
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            r#"/string 200 text/plain;charset=UTF-8 cl 4 "text""#,
+            r#"/blob 200 application/x-test cl 8 "blobdata""#,
+            r#"/params 200 application/x-www-form-urlencoded;charset=UTF-8 cl 9 "a=1&b=x+y""#,
+            r#"/form 200 multipart/form-data; boundary=----B cl 115 "------B\r\nContent-Disposition: form-data; name=\"k\"\r\n\r\nv\r\n------B--\r\n""#,
+            r#"/bytes 200 null cl 2 "hi""#,
+            r#"/typed 200 application/json cl 2 "{}""#,
+            r#"/empty 204 null cl null """#,
+            r#"/stream 200 null chunked "streamed""#,
+        ]
+    );
+}
+
 /// `oam.serve`'s `close()` finishes the requests in flight and closes every
 /// other connection -- one that connected and never sent a request
 /// included. A client pool opens such a connection (fetch's spare, raced
@@ -9682,7 +9730,7 @@ fn fetch_body_cannot_be_consumed_twice() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "double: Body already consumed\nused: true"
+        "double: Body is unusable: Body has already been read\nused: true"
     );
 }
 

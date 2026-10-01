@@ -33,8 +33,10 @@ const ALL_METHODS: &[&str] = &[
     "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "QUERY",
 ];
 
-/// Every redirect status x method x replayability: the rewrite happens only
-/// for (301|302 && POST) || (303 && method not GET/HEAD) (fetch/index.js:
+/// Every redirect status x method x replayability: a body that cannot be
+/// replayed stops every redirect but a 303 (fetch/index.js:1273-1279, which
+/// runs before the rewrite); the rewrite happens only for
+/// (301|302 && POST) || (303 && method not GET/HEAD) (fetch/index.js:
 /// 1297-1305); otherwise method and body are kept, and a kept body that
 /// cannot be replayed returns the 3xx.
 #[test]
@@ -46,7 +48,9 @@ fn status_method_body_matrix() {
                 let got = follow(status, &method, "http://a.test/x", "/y", replayable);
                 let rewrite = (matches!(status, 301 | 302) && method == Method::POST)
                     || (status == 303 && method != Method::GET && method != Method::HEAD);
-                let want = if rewrite {
+                let want = if status != 303 && !replayable {
+                    Next::ReturnResponse
+                } else if rewrite {
                     Next::Follow {
                         url: url("http://a.test/y"),
                         method: Method::GET,
@@ -98,14 +102,31 @@ fn spot_checks_of_the_matrix() {
             drop_body: false
         }
     );
-    // A streamed POST on 301 is dropped by the rewrite, so it follows.
-    assert!(matches!(
+    // A streamed POST on 301 stops there, although the rewrite would drop
+    // its body (measured on node v22.22.2: fetch fails, the GET is never
+    // sent); on 303 it is dropped and the GET follows.
+    assert_eq!(
         follow(301, &Method::POST, "http://a.test/", "/b", false),
+        Next::ReturnResponse
+    );
+    assert!(matches!(
+        follow(303, &Method::POST, "http://a.test/", "/b", false),
         Next::Follow {
             drop_body: true,
             ..
         }
     ));
+    // ... and before the next hop's bad-port check.
+    assert_eq!(
+        follow(
+            307,
+            &Method::POST,
+            "http://a.test/",
+            "http://a.test:25/",
+            false
+        ),
+        Next::ReturnResponse
+    );
     // A streamed PUT on 308 would have to be replayed: the 3xx comes back.
     assert_eq!(
         follow(308, &Method::PUT, "http://a.test/", "/b", false),
@@ -253,7 +274,7 @@ fn a_hop_to_a_bad_port_fails_after_every_other_check() {
     );
     // The body rewrite does not skip it.
     assert_eq!(
-        follow(302, &Method::POST, cur.as_str(), "http://a.test:25/", false),
+        follow(302, &Method::POST, cur.as_str(), "http://a.test:25/", true),
         Next::Fail(BAD_PORT)
     );
     // Allowed ports still follow.
@@ -271,8 +292,8 @@ fn a_hop_to_a_bad_port_fails_after_every_other_check() {
         );
     }
     // Every httpRedirectFetch check comes first: the count, the credentials,
-    // and the unreplayable body (undici fails there with a network error of
-    // its own; oam returns the 3xx, design-143 section 0).
+    // and the unreplayable body (a network error of its own: fetch fails
+    // with UNREPLAYABLE_BODY, the callers that are not fetch get the 3xx).
     let bad = hv("http://a.test:25/");
     assert_eq!(
         redirect::next(302, &get, &cur, Some(&bad), MAX_REDIRECTS, true),
@@ -284,6 +305,10 @@ fn a_hop_to_a_bad_port_fails_after_every_other_check() {
     );
     assert_eq!(
         redirect::next(307, &Method::PUT, &cur, Some(&bad), 0, false),
+        Next::ReturnResponse
+    );
+    assert_eq!(
+        redirect::next(302, &Method::POST, &cur, Some(&bad), 0, false),
         Next::ReturnResponse
     );
 }
@@ -569,7 +594,7 @@ fn post_302_cross_origin_end_to_end() {
         &from,
         Some(&hv("http://b.test/done")),
         0,
-        false,
+        true,
     )
     else {
         panic!("must follow");
