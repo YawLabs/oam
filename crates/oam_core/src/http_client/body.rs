@@ -27,6 +27,17 @@ pub const SOCKET_CODE: &str = "UND_ERR_SOCKET";
 pub const BAD_CHUNK_SIZE_CODE: &str = "HPE_INVALID_CHUNK_SIZE";
 pub const BAD_CHUNK_SIZE: &str =
     "Response does not match the HTTP/1.1 protocol (Invalid character in chunk size)";
+/// undici's `ResponseContentLengthMismatchError`: a response the server
+/// does not keep alive ended short of its content-length.
+pub const LENGTH_MISMATCH_CODE: &str = "UND_ERR_RES_CONTENT_LENGTH_MISMATCH";
+pub const LENGTH_MISMATCH: &str = "Response body length does not match content-length header";
+/// A response the server does not keep alive, with no content-length, ended
+/// at the connection's close inside a chunked body. undici takes what has
+/// arrived as the whole response (its socket 'end' handler completes the
+/// message), so fetch() ends the body there; node's http client aborts the
+/// response. Not an undici code: JS ends or aborts on it (bootstrap.js,
+/// node_compat.js) and it never reaches a caller.
+pub const ENDED_AT_CLOSE_CODE: &str = "OAM_BODY_ENDED_AT_CLOSE";
 
 /// Live response bodies by handle. A std Mutex on purpose: a reader REMOVES
 /// its body under a short lock, awaits the chunk with no lock held, then
@@ -48,6 +59,50 @@ pub struct FetchBody {
     /// over an agent's socket reads its body here and reports what node's
     /// http client reports.
     coded: bool,
+    /// What a connection ending inside the body means
+    /// ([`FetchBody::with_framing`]); `None` reads it as a keep-alive one.
+    framing: Option<Framing>,
+    /// Body bytes off the wire so far, before any decoding: what undici
+    /// compares with the content-length.
+    wire_read: u64,
+}
+
+/// The response facts undici's parser weighs when the connection ends inside
+/// a body: whether the response let the connection be kept alive (llhttp's
+/// `should_keep_alive`), and its content-length.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Framing {
+    pub keep_alive: bool,
+    pub content_length: Option<u64>,
+}
+
+impl Framing {
+    /// llhttp's `should_keep_alive` for a response: HTTP/1.1 unless a
+    /// `Connection` header says `close`, HTTP/1.0 only if one says
+    /// `keep-alive`.
+    pub fn of(version: http::Version, headers: &http::HeaderMap) -> Framing {
+        let mut close = false;
+        let mut keep_alive = false;
+        for value in headers.get_all(http::header::CONNECTION) {
+            for token in value.as_bytes().split(|b| *b == b',') {
+                let token = token.trim_ascii();
+                close |= token.eq_ignore_ascii_case(b"close");
+                keep_alive |= token.eq_ignore_ascii_case(b"keep-alive");
+            }
+        }
+        let keep_alive = match version {
+            http::Version::HTTP_10 | http::Version::HTTP_09 => keep_alive && !close,
+            _ => !close,
+        };
+        let content_length = headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok());
+        Framing {
+            keep_alive,
+            content_length,
+        }
+    }
 }
 
 /// Why a body could not be read. Node's fetch rejects the read with
@@ -63,7 +118,9 @@ pub enum BodyReadError {
     /// Malformed chunked framing (a bad chunk-size line).
     Framing,
     /// The connection ended before the body did -- inside a `content-length`
-    /// body or between chunks: undici's `SocketError: other side closed`.
+    /// body or between chunks, or with a TLS failure: undici's
+    /// `SocketError: other side closed` on a kept-alive response
+    /// ([`FetchBody::closed`] for the others).
     Closed,
     /// The connection failed with an OS error (a reset): node's `read
     /// ECONNRESET`, with this code and its errno.
@@ -71,8 +128,14 @@ pub enum BodyReadError {
         code: &'static str,
         errno: Option<i32>,
     },
-    /// Anything else (an h2 stream error, a TLS failure mid-body), in
-    /// hyper's words. Node's cause for these is not mirrored.
+    /// A response the server does not keep alive ended short of its
+    /// content-length: undici's `ResponseContentLengthMismatchError`.
+    LengthMismatch,
+    /// A response the server does not keep alive ended inside its chunked
+    /// body ([`ENDED_AT_CLOSE_CODE`]).
+    EndedAtClose,
+    /// Anything else (an h2 stream error), in hyper's words. Node's cause
+    /// for these is not mirrored.
     Other(String),
 }
 
@@ -82,12 +145,29 @@ impl BodyReadError {
     /// chunked framing ("Invalid chunk size line"), UnexpectedEof for a
     /// connection that ended early (h1 decode.rs, both framings), and the
     /// OS error itself for a reset.
+    ///
+    /// The transport's errors pass through hyper's decoder unchanged, and
+    /// tokio-rustls reports every TLS failure in a read -- a fatal alert, a
+    /// record that does not decrypt -- as InvalidData with the
+    /// `rustls::Error` as its payload: that is not framing, and is told
+    /// apart by the payload (`get_ref`, which `source()` does not reach).
+    /// node's fetch reports such a failure as the connection ending there
+    /// (measured on v22.22.2 with a record that fails to decrypt: `other
+    /// side closed` on a kept-alive response; the content-length mismatch,
+    /// or the end of the body, on one that is not kept), so it is
+    /// [`BodyReadError::Closed`].
     fn from_hyper(error: &hyper::Error) -> BodyReadError {
         use std::io::ErrorKind;
         let mut current: Option<&(dyn std::error::Error + 'static)> =
             std::error::Error::source(error);
         while let Some(e) = current {
             if let Some(io) = e.downcast_ref::<std::io::Error>() {
+                let tls = io
+                    .get_ref()
+                    .is_some_and(|inner| inner.downcast_ref::<rustls::Error>().is_some());
+                if tls {
+                    return BodyReadError::Closed;
+                }
                 return match io.kind() {
                     ErrorKind::InvalidInput | ErrorKind::InvalidData => BodyReadError::Framing,
                     ErrorKind::UnexpectedEof => BodyReadError::Closed,
@@ -141,6 +221,12 @@ impl BodyReadError {
             ),
             BodyReadError::Framing => OpOutcome::node_failed(BAD_CHUNK_SIZE_CODE, BAD_CHUNK_SIZE),
             BodyReadError::Closed => OpOutcome::node_failed(SOCKET_CODE, OTHER_SIDE_CLOSED),
+            BodyReadError::LengthMismatch => {
+                OpOutcome::node_failed(LENGTH_MISMATCH_CODE, LENGTH_MISMATCH)
+            }
+            BodyReadError::EndedAtClose => {
+                OpOutcome::node_failed(ENDED_AT_CLOSE_CODE, OTHER_SIDE_CLOSED)
+            }
             BodyReadError::Io { code, errno } => OpOutcome::NodeFailed {
                 code: code.to_string(),
                 message: format!("read {code}"),
@@ -164,6 +250,31 @@ impl FetchBody {
             decoder: codings.map(Decoder::new),
             pending: Bytes::new(),
             coded: false,
+            framing: None,
+            wire_read: 0,
+        }
+    }
+
+    /// The response's [`Framing`], for a connection that ends inside the
+    /// body. undici's socket 'end' handler fails a kept-alive response with
+    /// `SocketError: other side closed`; any other it completes with what
+    /// has arrived (its parser's onMessageComplete), which fails a
+    /// content-length body that came up short with
+    /// `ResponseContentLengthMismatchError` and ends a chunked one there
+    /// (measured on node v22.22.2).
+    pub fn with_framing(mut self, framing: Framing) -> FetchBody {
+        self.framing = Some(framing);
+        self
+    }
+
+    /// What a connection that ended inside the body is, per [`Framing`].
+    fn closed(&self) -> BodyReadError {
+        match self.framing {
+            Some(framing) if !framing.keep_alive => match framing.content_length {
+                Some(length) if length != self.wire_read => BodyReadError::LengthMismatch,
+                _ => BodyReadError::EndedAtClose,
+            },
+            _ => BodyReadError::Closed,
         }
     }
 
@@ -214,7 +325,19 @@ impl FetchBody {
                         return Ok(None);
                     }
                 }
-                Some(Err(e)) => return Err(self.fail(BodyReadError::from_hyper(&e))),
+                Some(Err(e)) => {
+                    let mut error = BodyReadError::from_hyper(&e);
+                    if error == BodyReadError::Closed {
+                        error = self.closed();
+                        if error == BodyReadError::EndedAtClose && self.decoder.is_some() {
+                            // What has arrived is the whole response: a
+                            // decoded body ends as the decoder does on it.
+                            self.incoming = None;
+                            continue;
+                        }
+                    }
+                    return Err(self.fail(error));
+                }
                 Some(Ok(frame)) => {
                     // Trailers carry no body bytes; an empty data frame is
                     // not a chunk.
@@ -224,6 +347,7 @@ impl FetchBody {
                     if data.is_empty() {
                         continue;
                     }
+                    self.wire_read += data.len() as u64;
                     if self.decoder.is_none() {
                         return Ok(Some(data));
                     }

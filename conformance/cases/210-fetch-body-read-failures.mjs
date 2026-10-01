@@ -6,8 +6,13 @@
 //     `errno` and `code` (zlib: -3, Z_DATA_ERROR, and zlib's message; brotli:
 //     `Decompression failed` with an `ERR__ERROR_FORMAT_*` code);
 //   - a connection that ends inside the body (short of its content-length,
-//     or between chunks): undici's `SocketError: other side closed`, code
-//     UND_ERR_SOCKET, with the connection's addresses on `socket`;
+//     or between chunks) of a kept-alive response: undici's `SocketError:
+//     other side closed`, code UND_ERR_SOCKET, with the connection's
+//     addresses on `socket`. A response the server does not keep alive
+//     (`connection: close`, HTTP/1.0) is completed with what arrived
+//     instead: short of its content-length, undici's
+//     ResponseContentLengthMismatchError; between chunks, the body just
+//     ends there. oam reported `other side closed` for every one;
 //   - a bad chunk-size line: undici's HTTPParserError, HPE_INVALID_CHUNK_SIZE.
 //
 // The same error rejects text(), arrayBuffer(), bytes(), json() and a
@@ -30,6 +35,7 @@
 // test is the fetch client. A decode failure is sent without a
 // content-length and the close held for 250 ms, as in case 112: with an
 // immediate close node's own fetch sometimes never settles on macOS.
+import http from "node:http";
 import net from "node:net";
 
 setTimeout(() => {
@@ -71,6 +77,10 @@ const WIRE = {
   "/short": "HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n0123456789",
   "/chunked-short": "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n",
   "/chunked-bad": "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\nZZ\r\n",
+  "/short-close": "HTTP/1.1 200 OK\r\ncontent-length: 100\r\nconnection: close\r\n\r\n0123456789",
+  "/short-http10": "HTTP/1.0 200 OK\r\ncontent-length: 100\r\n\r\n0123456789",
+  "/chunked-short-close":
+    "HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n5\r\nhello\r\n",
 };
 
 const server = net.createServer((socket) => {
@@ -164,6 +174,37 @@ for (const path of Object.keys(WIRE)) {
       again = e2;
     }
     console.log(`${path} reader: ${JSON.stringify(got.join(""))} then ${describe(e)} | again same=${again === e}`);
+  }
+}
+
+// http.request does not speak undici: node's request hears its parser's
+// error for a bad chunk-size line before the response is aborted, and a
+// connection that ends inside a body only aborts the response, whatever the
+// response said about keeping it. oam's shared transport aborted the
+// response without the request's 'error'.
+for (const agent of [undefined, false]) {
+  for (const path of Object.keys(WIRE)) {
+    const events = [];
+    // What arrived, printed last: when a chunk is delivered against the
+    // parser's error is not compared.
+    let got = "";
+    await new Promise((resolve) => {
+      const req = http.get(base + path, { agent }, (res) => {
+        res.on("data", (d) => (got += d.toString("latin1")));
+        res.on("end", () => events.push("res end"));
+        res.on("aborted", () => events.push("res aborted"));
+        res.on("error", (e) => events.push(`res error ${e.code} ${e.message}`));
+        res.on("close", () => {
+          events.push("res close");
+          setTimeout(resolve, 50);
+        });
+      });
+      req.on("error", (e) => {
+        const own = Reflect.ownKeys(e).map(String).filter((k) => k !== "bytesParsed" && k !== "rawPacket");
+        events.push(`req error ${e.code} ${JSON.stringify(e.message)} reason=${e.reason} own=${JSON.stringify(own)}`);
+      });
+    });
+    console.log(`http.get ${agent === false ? "agent: false" : "default agent"} ${path}: ${events.join(", ")} | got ${JSON.stringify(got)}`);
   }
 }
 server.close();

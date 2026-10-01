@@ -956,9 +956,13 @@ What else still differs:
 - **The details of a failed body read.** A body that cannot be read to its end rejects the
   read as Node's does (case 210): `TypeError: terminated`, with what failed as the `cause`
   -- the decoder's error for a corrupt encoding (`code` `Z_DATA_ERROR`, `errno` `-3`), undici's
-  `SocketError: other side closed` (`UND_ERR_SOCKET`) for a connection that ends inside the
-  body, its `HTTPParserError` (`HPE_INVALID_CHUNK_SIZE`) for a bad chunk-size line, and
-  `read ECONNRESET` for a reset. Up to 0.17.1 all of these were one plain `Error`,
+  `SocketError: other side closed` (`UND_ERR_SOCKET`) for a connection that ends (or fails
+  in TLS) inside the body of a kept-alive response, its `ResponseContentLengthMismatchError`
+  (`UND_ERR_RES_CONTENT_LENGTH_MISMATCH`) when the response was not kept alive
+  (`Connection: close`, HTTP/1.0) and had a content-length -- one with a chunked body
+  instead just ends there, with what arrived --, its `HTTPParserError`
+  (`HPE_INVALID_CHUNK_SIZE`) for a bad chunk-size line, and `read ECONNRESET` for a reset.
+  Up to 0.17.1 all of these were one plain `Error`,
   `fetch: body read failed: error decoding response body`, with no `cause`. What still
   differs is detail inside the cause:
   - zlib's message for a corrupt deflate stream. oam's inflater (miniz) reports one failure
@@ -974,7 +978,10 @@ What else still differs:
   - `cause.socket` of the `SocketError` carries the connection's addresses but not undici's
     `bytesWritten` / `bytesRead`, which oam does not count; `HTTPParserError`'s `data` (the
     bytes that did not parse) is `undefined`.
-  - an HTTP/2 stream error or a TLS failure inside a body has hyper's text as the cause.
+  - an HTTP/2 stream error inside a body has hyper's text as the cause.
+  - `http.request` hears a TLS failure inside a response body only as the response's
+    `aborted`; Node's request also emits OpenSSL's error (`ERR_SSL_*`), which rustls has no
+    counterpart for.
 
 _(probed)_ Node v22.22.2 vs oam on Windows, the same raw-socket server: the request
 headers over http and https, and a `deflate` body holding a copy from before the start of

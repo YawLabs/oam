@@ -1598,6 +1598,156 @@ async fn a_failed_body_read_says_what_failed() {
     .await;
 }
 
+/// A connection that ends inside the body of a response the server did not
+/// keep alive is what undici's socket 'end' handler makes of it (measured on
+/// node v22.22.2): the content-length mismatch for a content-length body,
+/// the end of the body for a chunked one -- not `other side closed`, which
+/// is the kept-alive response's. `Connection: close` and HTTP/1.0 both say
+/// so; HTTP/1.0 with `keep-alive` does not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_cut_short_on_a_closing_connection_is_undicis_verdict() {
+    within(async {
+        let server = serve(|mut conn, _, _| async move {
+            let Some(request) = conn.request().await else {
+                return;
+            };
+            let reply: &[u8] = match request.head.target.as_str() {
+                "/cl-close" => {
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\nconnection: close\r\n\r\n0123456789"
+                }
+                "/cl-http10" => b"HTTP/1.0 200 OK\r\ncontent-length: 100\r\n\r\n0123456789",
+                "/cl-http10-keep-alive" => {
+                    b"HTTP/1.0 200 OK\r\ncontent-length: 100\r\nconnection: keep-alive\r\n\r\n0123456789"
+                }
+                "/chunked-close" => {
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: Keep-Alive, Close\r\n\r\n5\r\nhello\r\n"
+                }
+                _ => b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\nconnection: close\r\n\r\n0123456789",
+            };
+            conn.send(reply).await;
+        })
+        .await;
+        let reg = Reg::new();
+        let t = plain();
+        let read_all = |path: &'static str| {
+            let reg = &reg;
+            let t = &t;
+            let url = format!("http://127.0.0.1:{}/{path}", server.port);
+            async move {
+                let p = payload(reg.fetch(t, json!({ "url": url })).await);
+                let handle = handle_of(&p);
+                let mut got = Vec::new();
+                loop {
+                    match reg.read(handle).await {
+                        OpOutcome::Bytes(bytes) => got.extend(bytes),
+                        other => return (String::from_utf8(got).unwrap(), other),
+                    }
+                }
+            }
+        };
+        let code_of = |outcome: &OpOutcome| match outcome {
+            OpOutcome::NodeFailed { code, message, .. } => (code.clone(), message.clone()),
+            OpOutcome::Done => ("done".to_string(), String::new()),
+            other => panic!("{other:?}"),
+        };
+        for path in ["cl-close", "cl-http10"] {
+            let (got, outcome) = read_all(path).await;
+            assert_eq!(got, "0123456789", "{path}");
+            assert_eq!(
+                code_of(&outcome),
+                (body::LENGTH_MISMATCH_CODE.to_string(), body::LENGTH_MISMATCH.to_string()),
+                "{path}"
+            );
+        }
+        let (_, outcome) = read_all("cl-http10-keep-alive").await;
+        assert_eq!(
+            code_of(&outcome),
+            (body::SOCKET_CODE.to_string(), body::OTHER_SIDE_CLOSED.to_string())
+        );
+        let (got, outcome) = read_all("chunked-close").await;
+        assert_eq!(got, "hello");
+        assert_eq!(
+            code_of(&outcome),
+            (body::ENDED_AT_CLOSE_CODE.to_string(), body::OTHER_SIDE_CLOSED.to_string())
+        );
+        // A body that arrived whole is not cut short.
+        let (got, outcome) = read_all("whole").await;
+        assert_eq!((got.as_str(), code_of(&outcome).0.as_str()), ("0123456789", "done"));
+    })
+    .await;
+}
+
+/// A TLS failure inside a response body -- here a record that does not
+/// decrypt -- is the connection ending there, as node's fetch reports it
+/// (measured on v22.22.2): `other side closed` on a kept-alive response, the
+/// content-length mismatch on one that is not kept. tokio-rustls reports
+/// it as an io error of kind InvalidData, which the body read used to take
+/// for a bad chunk-size line.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tls_failure_inside_a_body_is_the_connection_ending() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    within(async {
+        let acceptor = tls_acceptor(&[b"http/1.1"]);
+        let server = serve(move |conn, _, _| {
+            let acceptor = acceptor.clone();
+            async move {
+                let Ok(mut tls) = acceptor.accept(conn.io).await else {
+                    return;
+                };
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tls.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let close = String::from_utf8_lossy(&head).starts_with("GET /close ");
+                let reply: &[u8] = if close {
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\nconnection: close\r\n\r\n0123456789"
+                } else {
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n0123456789"
+                };
+                if tls.write_all(reply).await.is_err() || tls.flush().await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                // An application-data record that is not one: the client's
+                // decryption fails on it.
+                let (tcp, _) = tls.get_mut();
+                let mut record = vec![0x17, 0x03, 0x03, 0x00, 0x20];
+                record.extend_from_slice(&[0xa5; 0x20]);
+                let _ = tcp.write_all(&record).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await;
+        let reg = Reg::new();
+        let t = plain();
+        for (path, want) in [
+            ("keep", (body::SOCKET_CODE, body::OTHER_SIDE_CLOSED)),
+            ("close", (body::LENGTH_MISMATCH_CODE, body::LENGTH_MISMATCH)),
+        ] {
+            let url = format!("https://127.0.0.1:{}/{path}", server.port);
+            let p = payload(reg.fetch(&t, json!({ "url": url })).await);
+            let handle = handle_of(&p);
+            let outcome = loop {
+                match reg.read(handle).await {
+                    OpOutcome::Bytes(_) => {}
+                    other => break other,
+                }
+            };
+            match outcome {
+                OpOutcome::NodeFailed { code, message, .. } => {
+                    assert_eq!((code.as_str(), message.as_str()), want, "{path}");
+                }
+                other => panic!("{path}: {other:?}"),
+            }
+        }
+    })
+    .await;
+}
+
 /// gzip followed by a zero byte ends the body there (node), even though the
 /// server promised more and holds the connection open.
 #[tokio::test(flavor = "multi_thread")]

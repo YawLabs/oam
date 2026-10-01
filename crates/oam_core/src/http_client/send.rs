@@ -887,7 +887,8 @@ fn respond(
     let mut url = state.current;
     url.set_fragment(None);
     let handle = ids.fetch_add(1, Ordering::Relaxed);
-    let body = FetchBody::new(response.into_body(), codings.as_deref());
+    let framing = super::body::Framing::of(response.version(), response.headers());
+    let body = FetchBody::new(response.into_body(), codings.as_deref()).with_framing(framing);
     lock(bodies).insert(handle, body);
     let mut payload = serde_json::json!({
         "status": status.as_u16(),

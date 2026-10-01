@@ -21266,11 +21266,32 @@
                 }
                 err = connResetException("aborted");
               } else if (err && (err.code === "UND_ERR_SOCKET" || err.syscall === "read" ||
+                  err.code === "UND_ERR_RES_CONTENT_LENGTH_MISMATCH" ||
+                  err.code === "OAM_BODY_ENDED_AT_CLOSE" ||
                   (typeof err.code === "string" && err.code.indexOf("HPE_") === 0))) {
                 // The shared transport reports a body's wire failure in the
-                // words of undici, which http.request is not: a connection
-                // that ends or fails inside a body aborts the response, as
-                // on the agent path and in node.
+                // words of undici, which http.request is not. node's request
+                // hears what its socket heard first -- its parser's error
+                // for malformed framing (in node's own words, as on the
+                // agent path), the socket's `read ECONNRESET` for a reset --
+                // and the response is then aborted. A connection that just
+                // ends inside a body only aborts it, whatever undici would
+                // make of it.
+                var heard = null;
+                if (typeof err.code === "string" && err.code.indexOf("HPE_") === 0) {
+                  // undici's sentence carries llhttp's reason in brackets.
+                  var why = /\(([^()]*)\)$/.exec(err.message || "");
+                  heard = new Error("Parse Error: " + (why ? why[1] : err.message));
+                  heard.code = err.code;
+                  heard = withParseReason(heard);
+                } else if (err.syscall === "read") {
+                  heard = err;
+                }
+                if (heard !== null && !self._errorEmitted && !self._aborted) {
+                  self._errorEmitted = true;
+                  self.errored = heard;
+                  self.emit("error", heard);
+                }
                 err = connResetException("aborted");
               }
               res.destroy(err);

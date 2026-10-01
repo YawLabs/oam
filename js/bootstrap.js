@@ -908,17 +908,27 @@
   // a caller can tell a truncated download from a corrupt payload:
   // - a corrupt encoding: the decoder's error, an Error with zlib's `errno`
   //   and `code` (-3, Z_DATA_ERROR) or brotli's. The op builds it whole;
-  // - the connection ending inside the body: undici's `SocketError: other
-  //   side closed`, whose `socket` describes the connection. oam fills in the
-  //   addresses; undici's `bytesWritten` / `bytesRead` are not counted here,
-  //   so they are left out rather than made up;
+  // - the connection ending inside the body of a kept-alive response:
+  //   undici's `SocketError: other side closed`, whose `socket` describes the
+  //   connection. oam fills in the addresses; undici's `bytesWritten` /
+  //   `bytesRead` are not counted here, so they are left out rather than
+  //   made up;
+  // - the same inside a content-length body the server did not keep alive
+  //   (`Connection: close`, HTTP/1.0): undici's
+  //   ResponseContentLengthMismatchError. (Inside such a chunked body the
+  //   body just ends: BODY_ENDED_AT_CLOSE, never an error.)
   // - a bad chunk-size line: undici's HTTPParserError (its `data`, the bytes
   //   that did not parse, is not available: undefined);
   // - a reset: node's `read ECONNRESET`, built whole by the op too.
   // `raw` is the response payload, for the connection's facts.
+  // http_client/body.rs ENDED_AT_CLOSE_CODE.
+  const BODY_ENDED_AT_CLOSE = "OAM_BODY_ENDED_AT_CLOSE";
+
   function bodyTerminated(e, raw) {
     let cause = e;
-    if (e instanceof Error && e.code === "UND_ERR_SOCKET") {
+    if (e instanceof Error && e.code === "UND_ERR_RES_CONTENT_LENGTH_MISMATCH") {
+      cause = new undiciErrors.ResponseContentLengthMismatchError();
+    } else if (e instanceof Error && e.code === "UND_ERR_SOCKET") {
       const { localAddr, remoteAddr } = raw.socket ?? {};
       cause = new undiciErrors.SocketError(e.message, {
         localAddress: localAddr?.address,
@@ -1005,8 +1015,13 @@
             chunk = await globalThis.__oam.fetchBodyRead(handle);
           } catch (e) {
             if (bodyAborted) return;
-            bodyOver();
-            throw bodyTerminated(e, raw);
+            // A response the server did not keep alive, cut off inside its
+            // chunked body: undici takes what arrived as the whole response.
+            if (e instanceof Error && e.code === BODY_ENDED_AT_CLOSE) chunk = undefined;
+            else {
+              bodyOver();
+              throw bodyTerminated(e, raw);
+            }
           }
           // The read that was in flight when the abort landed returns here
           // against a stream that is already errored; closing or enqueuing
