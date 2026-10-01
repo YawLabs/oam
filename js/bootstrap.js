@@ -2287,19 +2287,14 @@
   // cause, unchanged, as in node) and never falls back to system DNS; an
   // abort while parked drops the parked fetch.
   // `fetchSemantics` false is undici.request's entry (see makeResponse).
-  async function settleFetch(pending, lookup, signal, connector, phase, fetchSemantics) {
-    return makeResponse(await settleRaw(pending, lookup, signal, connector, phase), signal, fetchSemantics);
+  async function settleFetch(pending, lookup, signal, connector, fetchSemantics) {
+    return makeResponse(await settleRaw(pending, lookup, signal, connector), signal, fetchSemantics);
   }
 
   // settleFetch's loop, ending at the op's raw payload (the response head
   // with its `bodyHandle`, and the `socket` / `tls` facts of the connection
   // it arrived on) instead of a Response.
-  //
-  // `phase` (undici.request's, else null) hears when a connector is asked
-  // for a connection (`connecting()`) and when the socket it handed back
-  // carries the request (`connected()`): undici's headersTimeout runs only
-  // while a request is on a connected socket, never across the connect.
-  async function settleRaw(pending, lookup, signal, connector, phase) {
+  async function settleRaw(pending, lookup, signal, connector) {
     const internal = globalThis.__oam;
     const aborted = () =>
       signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
@@ -2327,7 +2322,6 @@
         // Aborted before the fetch parked: the listener will never fire (see
         // the lookup branch below), so drop the parked fetch now.
         if (signal?.aborted) abandon();
-        phase?.connecting();
         let socket;
         try {
           socket = await runConnector(connector, {
@@ -2350,7 +2344,6 @@
           throw aborted();
         }
         resumed = true;
-        phase?.connected();
         const supplied = supplySocket(socket);
         try {
           raw = await internal.fetchSupply(token, supplied.id, socket.alpnProtocol === "h2");
@@ -2892,6 +2885,13 @@
     if (rawPayload && typeof init.__oamSentSignal === "number") {
       request.sent_signal = init.__oamSentSignal;
     }
+    // undici.request's headersTimeout (internal; > 0 only). The transport
+    // runs it from the moment a connection has the request -- undici's
+    // start, after DNS, the connect and any TLS handshake or tunnel -- and
+    // fails the fetch with UND_ERR_HEADERS_TIMEOUT when the head is late.
+    if (!rawPayload && typeof init.__oamHeadersTimeout === "number" && init.__oamHeadersTimeout > 0) {
+      request.headers_timeout_ms = init.__oamHeadersTimeout;
+    }
     // An undici-style dispatcher may carry a connect.lookup hook -- the
     // DNS-rebind / SSRF pin. The oam:undici shim exposes it as
     // `_oamConnectLookup`. node honours that hook however the dispatcher was
@@ -3040,11 +3040,9 @@
     if (rawPayload) {
       // http.ClientRequest cancels on abort() / destroy().
       if (typeof init.__oamCanceller === "function") init.__oamCanceller(cancel);
-      return settleRaw(pending, lookup, signal, connector, null);
+      return settleRaw(pending, lookup, signal, connector);
     }
-    // undici.request's connect-phase listener (see settleRaw).
-    const phase = init.__oamConnectPhase && typeof init.__oamConnectPhase === "object" ? init.__oamConnectPhase : null;
-    let op = settleFetch(pending, lookup, signal, connector, phase, fetchSemantics);
+    let op = settleFetch(pending, lookup, signal, connector, fetchSemantics);
     if (pump !== null) {
       // A request that failed, or was aborted, stops reading its body. One
       // that failed because its body did fails with that error as the cause,

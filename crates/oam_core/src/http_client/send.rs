@@ -141,6 +141,32 @@ pub struct FetchRequest {
     /// takes it from the runtime's registry and puts it here.
     #[serde(skip)]
     pub dispatched: Option<Dispatched>,
+    /// undici's `headersTimeout` in ms (`undici.request`'s; fractional
+    /// allowed, absent or 0 for no limit): the longest a hop's response head
+    /// may take once a connection has the request ([`super::sent`]).
+    #[serde(default)]
+    pub headers_timeout_ms: Option<f64>,
+}
+
+/// The longest timer JS can set (2^31-1 ms, about 24.8 days). A
+/// `headersTimeout` above it is held to it, as `undici.request`'s timer
+/// always was in oam (docs/node-divergences.md).
+const MAX_TIMER_MS: f64 = 2_147_483_647.0;
+
+/// A `headers_timeout_ms` as a limit: `None` for none (absent, 0, or not a
+/// number), else at least 1 ms -- `setTimeout`'s floor -- and at most
+/// [`MAX_TIMER_MS`].
+fn headers_limit(ms: Option<f64>) -> Option<Duration> {
+    let ms = ms.filter(|ms| *ms > 0.0)?;
+    Some(Duration::from_secs_f64(
+        ms.clamp(1.0, MAX_TIMER_MS) / 1000.0,
+    ))
+}
+
+/// undici's `HeadersTimeoutError`, raised when a hop's head is late. JS
+/// turns it into that class (js/undici.js).
+fn headers_timed_out() -> OpOutcome {
+    OpOutcome::node_failed("UND_ERR_HEADERS_TIMEOUT", "Headers Timeout Error")
 }
 
 fn yes() -> bool {
@@ -298,9 +324,14 @@ struct LoopState {
     fetch_semantics: bool,
     /// Fired by the pool when a connection has a hop's request (see
     /// [`super::sent`]); carried across a park, dropped with the fetch.
+    /// `http.request`'s, or the loop's own when only `headers_timeout` needs
+    /// it.
     dispatched: Option<Dispatched>,
     /// The fetch's cancel registration, if JS can cancel it.
     cancel: Option<FetchCancel>,
+    /// undici's `headersTimeout`, run from each checkout
+    /// ([`super::sent::headers_deadline`]). `None`: no limit, and no timer.
+    headers_timeout: Option<Duration>,
 }
 
 enum BodySource {
@@ -416,6 +447,11 @@ pub async fn fetch(
             .route(req.lookup_hook, attempt_timeout, tls_range)
             .with_connect_timeout(connect_timeout_from_ms(req.connect_timeout_ms))
     };
+    let headers_timeout = headers_limit(req.headers_timeout_ms);
+    let dispatched = match req.dispatched {
+        Some(dispatched) => Some(dispatched),
+        None => headers_timeout.map(|_| Dispatched::new()),
+    };
     let state = LoopState {
         transport,
         route,
@@ -431,8 +467,9 @@ pub async fn fetch(
             .max_header_size
             .unwrap_or_else(crate::http_head::max_http_header_size),
         fetch_semantics: req.fetch_semantics,
-        dispatched: req.dispatched,
+        dispatched,
         cancel,
+        headers_timeout,
     };
     run(state, &bodies, &ids, &continuations).await
 }
@@ -639,22 +676,46 @@ async fn run(
             if let Some(dispatched) = &state.dispatched {
                 request.extensions_mut().insert(dispatched.clone());
             }
-            // The one place the loop waits. A cancel drops the send: a
-            // connect in progress is abandoned, an h1 connection the request
-            // went out on is closed (hyper shuts a connection whose response
-            // nobody waits for), an h2 stream is reset -- which is how the
-            // server learns the client left.
+            // The one place the loop waits. Each send (a hop, a resend) gets
+            // its own headersTimeout, started by its own checkout: a head that
+            // is late fails the hop, and dropping the send drops the request
+            // (hyper closes its connection, as undici destroys the socket). A
+            // cancel drops the send too: a connect in progress is abandoned,
+            // an h1 connection the request went out on is closed (hyper shuts
+            // a connection whose response nobody waits for), an h2 stream is
+            // reset -- which is how the server learns the client left.
+            let send = state.transport.send(&state.route, request);
+            let headers_timeout = state.headers_timeout;
+            let dispatched = state.dispatched.as_ref();
+            let timed = async move {
+                match (headers_timeout, dispatched) {
+                    (Some(limit), Some(dispatched)) => {
+                        let deadline = super::sent::headers_deadline(dispatched.subscribe(), limit);
+                        tokio::select! {
+                            biased;
+                            sent = send => Some(sent),
+                            () = deadline => None,
+                        }
+                    }
+                    _ => Some(send.await),
+                }
+            };
+            // Outer None: cancelled. Inner None: the head was late.
             let sent = match &state.cancel {
                 Some(cancel) => tokio::select! {
                     biased;
                     () = cancel.cancelled() => None,
-                    sent = state.transport.send(&state.route, request) => Some(sent),
+                    sent = timed => Some(sent),
                 },
-                None => Some(state.transport.send(&state.route, request).await),
+                None => Some(timed.await),
             };
             let Some(sent) = sent else {
                 state.source.request_failed();
                 return OpOutcome::Failed(ABORTED.to_string());
+            };
+            let Some(sent) = sent else {
+                state.source.request_failed();
+                return headers_timed_out();
             };
             match sent {
                 Ok(response) => break response,

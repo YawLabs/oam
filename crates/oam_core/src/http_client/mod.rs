@@ -32,7 +32,8 @@
 //! - [`body`]: the response body reader and the outbound request-body
 //!   channel lifecycle.
 //! - [`sent`]: the signal that a request has a connection, which is when
-//!   `http.request` on this transport emits node's `'finish'`.
+//!   `http.request` on this transport emits node's `'finish'` and when
+//!   undici's `headersTimeout` starts.
 //! - [`bridge`]: an HTTP/1.1 exchange over a byte stream JS pumps to and from
 //!   a socket object (`http.request` over an agent's socket).
 //! - [`h2_session`]: an HTTP/2 client session over a [`crate::byte_pipe`]

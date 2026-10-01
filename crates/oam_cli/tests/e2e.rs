@@ -5364,6 +5364,115 @@ warnings []";
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// The same rule on oam's own connection pool, with no connect function:
+/// `headersTimeout` starts once the pool has a connection for the request,
+/// so a slow DNS answer (a replaced `dns.lookup`, 800 ms) or a slow TLS
+/// handshake (a relay that holds the ClientHello for 800 ms) does not use up
+/// a 600 ms limit on an origin that answers 300 ms after the request. A
+/// silent origin still times out after the connect, and the timeout closes
+/// that connection, as undici destroys the socket. Each redirect hop gets its
+/// own limit. Up to this fix the timer started when the request was
+/// dispatched there: every `ok` line below failed with HeadersTimeoutError,
+/// the silent ones came early and left the connection open. The expected
+/// output is node v22.22.2 + undici 6.29.0's, line for line (the CA trusted
+/// through NODE_EXTRA_CA_CERTS in both).
+#[test]
+fn undici_headers_timeout_on_the_pool_starts_once_connected() {
+    let bundle = write_temp("undici-headers-timeout-pool/ca.pem", TLS_TEST_CA_CERT);
+    let src = r##"import net from 'node:net';
+import tls from 'node:tls';
+import dns from 'node:dns';
+import { request, Agent } from 'undici';
+
+const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(srv.address().port)));
+// An origin that answers `delay` ms after the request head; never for null.
+let closed = 0;
+function answering(delay) {
+  return (s) => {
+    s.on('error', () => {});
+    s.on('close', () => { closed++; });
+    s.once('data', () => {
+      if (delay !== null) setTimeout(() => s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok'), delay);
+    });
+  };
+}
+// A TCP relay that holds the client's first bytes (its ClientHello) for
+// `hold` ms: a slow TLS handshake.
+function relay(target, hold) {
+  return net.createServer((c) => {
+    c.on('error', () => {});
+    const up = net.connect(target, '127.0.0.1');
+    up.on('error', () => {});
+    c.pause();
+    c.once('readable', () => setTimeout(() => { c.pipe(up); up.pipe(c); c.resume(); }, hold));
+  });
+}
+const cert = `__CERT__`;
+const key = `__KEY__`;
+const plain = await listen(net.createServer(answering(300)));
+const silent = await listen(net.createServer(answering(null)));
+const slowTls = await listen(relay(await listen(tls.createServer({ cert, key }, answering(300))), 800));
+const slowTlsSilent = await listen(relay(await listen(tls.createServer({ cert, key }, answering(null))), 800));
+
+async function attempt(label, fn) {
+  const t0 = Date.now();
+  closed = 0;
+  try {
+    const r = await fn();
+    console.log(label, 'ok', r.statusCode, await r.body.text());
+  } catch (e) {
+    // `late`: the limit ran after the 800 ms connect, not across it.
+    const late = Date.now() - t0 >= 1150;
+    await new Promise((r) => setTimeout(r, 500));
+    console.log(label, 'failed', e.name, e.code, 'late=' + late, 'closed=' + (closed > 0));
+  }
+}
+
+const realLookup = dns.lookup;
+dns.lookup = function (host, opts, cb) {
+  if (typeof opts === 'function') { cb = opts; opts = {}; }
+  setTimeout(() => realLookup.call(dns, host, opts, cb), 800);
+};
+await attempt('slow-dns', () => request(`http://localhost:${plain}/`, { headersTimeout: 600, dispatcher: new Agent() }));
+await attempt('slow-dns-agent-option', () => request(`http://localhost:${plain}/`, { dispatcher: new Agent({ headersTimeout: 600 }) }));
+await attempt('slow-dns-silent', () => request(`http://localhost:${silent}/`, { headersTimeout: 400, dispatcher: new Agent() }));
+dns.lookup = realLookup;
+await attempt('slow-tls', () => request(`https://localhost:${slowTls}/`, { headersTimeout: 600, dispatcher: new Agent() }));
+await attempt('slow-tls-global', () => request(`https://localhost:${slowTls}/`, { headersTimeout: 600 }));
+await attempt('slow-tls-silent', () => request(`https://localhost:${slowTlsSilent}/`, { headersTimeout: 400, dispatcher: new Agent() }));
+
+// Two hops of 300 ms each under a 500 ms limit: each hop has its own.
+const target = await listen(net.createServer(answering(300)));
+const redirector = await listen(net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => setTimeout(() => s.end(`HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:${target}/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n`), 300));
+}));
+await attempt('redirect-hops', () => request(`http://127.0.0.1:${redirector}/`, { headersTimeout: 500, maxRedirections: 1, dispatcher: new Agent() }));
+process.exit(0);
+"##
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("undici_headers_timeout_pool/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = "\
+slow-dns ok 200 ok
+slow-dns-agent-option ok 200 ok
+slow-dns-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT late=true closed=true
+slow-tls ok 200 ok
+slow-tls-global ok 200 ok
+slow-tls-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT late=true closed=true
+redirect-hops ok 200 ok";
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
 // An undici Agent's connect.lookup hook is honored as a REAL DNS/connect pin
 // (the DNS-rebind / SSRF control @yawlabs/fetch-mcp relies on). Proof: pin a
 // NON-resolvable host to the server's real IP -- the request must connect

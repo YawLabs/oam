@@ -1646,23 +1646,26 @@ by a `Client` when it is built and by the others on the request (where NaN or an
 Infinity, which undici's `Agent` and `Pool` lose in a JSON copy of their options, is the
 default).
 Pinned against Node + undici 6.29.0 by `undici_request_honours_headers_and_body_timeouts`
-(e2e). Up to 0.17.1 both options were accepted and ignored. What differs:
+(e2e). Up to 0.17.1 both options were accepted and ignored.
+
+As in Node, `headersTimeout` starts once the request is on a connected socket -- DNS (a
+replaced `dns.lookup` or a `connect.lookup` hook), the TCP connect, the TLS handshake, a
+connect function and a proxy tunnel count for nothing -- each redirect hop gets its own, and
+a late head closes that connection. The transport runs it from the moment it has a
+connection for the request, oam's own pool's or the socket a connect function handed back,
+and only while one has it: a pooled connection that hands the request back unsent stops the
+limit, and the fresh connection the pool dials in its place starts it again once connected,
+as undici arms a new timer on the socket that next carries a request it re-queued (pinned by
+`undici_phase_timeouts_measure_what_undici_measures` and
+`undici_headers_timeout_on_the_pool_starts_once_connected`, e2e, and
+`the_headers_timeout_stops_while_an_unsent_request_is_re_dialled` in
+`crates/oam_core/tests/http_client_fetch.rs`). What differs:
 
 - **The timers are exact.** undici's are coarse (a 500 ms `headersTimeout` fires after about
   1019 ms in Node); oam's fire at the configured delay. A delay above 2^31-1 ms
   (`headersTimeout: 2 ** 31` and the like, a common way to say "no limit") is held to that
   ceiling, about 24.8 days, where undici's timestamp-based timers never come due; a plain
   `setTimeout` would have fired it after 1 ms.
-- **Without a connect function, `headersTimeout` also covers the connect.** undici starts it
-  once the request is on a connected socket, so DNS, the TCP connect and the TLS handshake do
-  not count. Through a dispatcher with a connect function (a `connect` function or socket /
-  TLS options, an `Agent` `factory`, `ProxyAgent` with its tunnel, `EnvHttpProxyAgent`) oam
-  does the same: the timer stops while the connect function is asked and starts afresh once
-  the socket it hands back carries the request (pinned by
-  `undici_phase_timeouts_measure_what_undici_measures`, e2e). Otherwise oam's own pool dials,
-  and the transport does not tell JS when it has a connection for the request, so the timer
-  starts when the request is dispatched: a slow DNS answer or TLS handshake uses up part of
-  `headersTimeout` in oam and none of it in Node.
 - **`bodyTimeout` runs only while the body is being read.** oam reads a `request()` body
   from the transport when something consumes it; undici reads ahead into the stream's
   buffer. So a stalled body nobody reads is left alone in oam, where Node destroys it with

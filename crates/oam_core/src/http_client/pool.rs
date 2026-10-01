@@ -195,7 +195,8 @@ impl Pool {
                 key: conn_key,
             } = conn;
             // The request has a connection, and hyper writes it as soon as
-            // it is handed over: node's 'finish' for http.request (`sent`).
+            // it is handed over: node's 'finish' for http.request, and where
+            // undici's headersTimeout starts (`sent`).
             if let Some(dispatched) = req.extensions().get::<Dispatched>() {
                 dispatched.fire();
             }
@@ -219,6 +220,11 @@ impl Pool {
                     if reused && allow_reuse {
                         // A pooled connection handed the request back unsent:
                         // re-dial and send it on a fresh one (retry_canceled).
+                        // No connection has it while that one dials, so a
+                        // headers timeout stops until its checkout (`sent`).
+                        if let Some(dispatched) = returned.extensions().get::<Dispatched>() {
+                            dispatched.unsent();
+                        }
                         req = returned;
                         allow_reuse = false;
                         continue;
