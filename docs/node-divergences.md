@@ -2187,13 +2187,14 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   connection is `connecting` until that socket connects, as Node's
   (`conformance/cases/261-net-end-then-destroy-before-connect.mjs`; up to 0.17.1 all of
   these ran before `'error'` and `'close'`, `end()`'s first, with
-  `ERR_SOCKET_CLOSED_BEFORE_CONNECTION`). What is left there: a write the
-  socket could not take at once is still queued natively when `destroy()` closes the
-  handle, and its callback gets `ERR_SOCKET_CLOSED` after `'close'` (Node's gets `null`,
-  before it); oam settles a write's accounting with its callback, after `write()` has
-  returned, so `write()` returns `false` and `writableLength` counts the bytes until that
-  callback even when the socket took them all at once (Node reports `true` and `0` for
-  those); and the callback of a write made before the connect runs after the `'connect'`
+  `ERR_SOCKET_CLOSED_BEFORE_CONNECTION`). A write the socket takes whole inside the call is
+  no longer counted when `write()` returns, as Node's: `writableLength` and `bufferSize` read
+  `0` and `write()` returns `true` (case 225; up to 0.17.1 oam counted the bytes until the
+  callback, so `write()` could return `false` for a write already on the wire). What is
+  left there: a write the socket could not take at once, still queued when `destroy()`
+  closes the handle, calls back with `ERR_SOCKET_CLOSED` after `'close'`, where Node's is
+  cancelled -- `write ECANCELED` (`errno`, `code`, `syscall`) before `'close'` (measured on
+  Windows); and the callback of a write made before the connect runs after the `'connect'`
   listeners rather than among them. After
   the request ends
   Node clears a closed socket's `localAddress` / `localPort`; oam keeps them on a

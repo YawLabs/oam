@@ -23162,8 +23162,18 @@
           return op;
         });
         inCall = false;
+        // Taken whole: as node's, whose onwrite has run by the time write()
+        // returns (libuv's try-write took it all), the bytes are no longer
+        // counted -- writableLength / bufferSize read 0 and write() returns
+        // true below -- though the callback still waits for its turn. No
+        // 'drain' from here: a write before this one still counted settles
+        // after it returns, and emits it.
+        if (tookWhole) {
+          this._writableState.length -= bytes.length;
+          this.bufferSize = this._writableState.length;
+        }
         this._chain = this._chain.then(() => written).then((failure) => {
-          settle();
+          if (!tookWhole) settle();
           if (failure === undefined) {
             if (cb) cb(null);
           } else if (failure === kSocketClosed) {
@@ -23194,10 +23204,11 @@
             this._failEndCallbacks(failure === kSocketClosed);
           }
         });
-        // Node: false once the queue is at or past the high-water mark. The
-        // write is still accepted -- false is advisory, asking the producer to
-        // wait for 'drain'.
-        if (this._writableState.length >= this.writableHighWaterMark) {
+        // Node: false once the queue is at or past the high-water mark (and
+        // not empty). The write is still accepted -- false is advisory,
+        // asking the producer to wait for 'drain'.
+        const queued = this._writableState.length;
+        if (queued >= this.writableHighWaterMark && queued !== 0) {
           this._writableState.needDrain = true;
           return false;
         }

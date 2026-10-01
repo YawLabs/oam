@@ -173,6 +173,27 @@ const quietPort = quiet.address().port;
   flush("end() after the stream finished");
 }
 
+{
+  // A small write the socket takes whole in the call is no longer counted
+  // when write() returns -- writableLength and bufferSize read 0, write()
+  // returns true -- though its callback still comes later (oam counted it
+  // until the callback; node's onwrite has already run).
+  const socket = net.connect(quietPort, "127.0.0.1");
+  await new Promise((resolve) => socket.once("connect", resolve));
+  const state = () => `writableLength ${socket.writableLength} bufferSize ${socket.bufferSize}`;
+  socket.on("drain", () => log.push(`drain ${state()}`));
+  const one = socket.write("hello", () => log.push(`callback ${state()}`));
+  log.push(`write() returned ${one}, ${state()}`);
+  queueMicrotask(() => log.push(`microtask ${state()}`));
+  await settle();
+  const two = socket.write("a");
+  const three = socket.write("b", () => log.push(`second callback ${state()}`));
+  log.push(`two writes returned ${two} ${three}, ${state()}`);
+  await settle();
+  socket.destroy();
+  flush("a write taken whole");
+}
+
 quiet.close();
 answering.close();
 collecting.close();
