@@ -2206,11 +2206,15 @@ What still differs:
 
 - **Arguments node validates before the descriptor, which oam does not check there.**
   `fchmod`'s mode (`ERR_INVALID_ARG_VALUE` for `'zz'`), `ftruncate`'s `len`,
-  `fchown`'s `uid` / `gid`, `readSync` / `writeSync`'s `buffer`, `offset`, `position`
-  and `options`, and the callback `writeFile` / `appendFile`'s `data` (oam reports a bad
-  one through the callback). node refuses these first, so `fs.fchmodSync(-1, 'zz')` is
-  the mode error there; oam reports the descriptor. With a valid descriptor oam passes such a
-  value to the OS as before. (`futimes`' times are validated, in node's order.)
+  `fchown`'s `uid` / `gid`, `writeSync`'s `buffer`, `offset`, `position` and `options`,
+  the `position` of `read` / `readSync` / `FileHandle.read` (node's `validatePosition`:
+  `'zz'`, `-2` and `1.5` are refused), and the callback `writeFile` / `appendFile`'s
+  `data` (oam reports a bad one through the callback). node refuses these first, so
+  `fs.fchmodSync(-1, 'zz')` is the mode error there; oam reports the descriptor. With a
+  valid descriptor oam passes such a value to the OS as before. (`futimes`' times are
+  validated, in node's order; so are the `buffer`, options object, `offset` and `length`
+  of `read`, `readSync` and `FileHandle.read`, with node's overloads -- a bad offset is
+  refused even by a read of length 0.)
 - **`fs.writeSync(fd, string, position, 'bogus')`**: node's binding ignores an encoding
   it does not know and writes UTF-8 (so with `-1` it is the descriptor error); oam
   throws `ERR_UNKNOWN_ENCODING`.

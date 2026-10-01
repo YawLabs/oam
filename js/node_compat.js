@@ -1610,16 +1610,19 @@
     }
   }
 
-  // Node's validateInteger: number-typed integer >= min (copyBytesFrom offsets).
-  function validateInteger(value, name, min) {
+  // Node's validateInteger: a number-typed integer in [min, max], both
+  // defaulting to the safe-integer bounds, and a range failure names both
+  // ("It must be >= 0 && <= 9007199254740991", as copyBytesFrom and
+  // fs.read's offset report it on v22.22.2).
+  function validateInteger(value, name, min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER) {
     if (typeof value !== "number") {
       throw argTypeOfError(name, "number", value);
     }
     if (!Number.isInteger(value)) {
       throw codes.ERR_OUT_OF_RANGE(name, "an integer", fmtRange(value));
     }
-    if (min !== undefined && value < min) {
-      throw codes.ERR_OUT_OF_RANGE(name, ">= " + min, fmtRange(value));
+    if (value < min || value > max) {
+      throw codes.ERR_OUT_OF_RANGE(name, ">= " + min + " && <= " + max, fmtRange(value));
     }
   }
 
@@ -10035,15 +10038,48 @@
     return out;
   }
 
-  // node's ERR_OUT_OF_RANGE guard on a read into a caller-supplied buffer.
-  // Without it an over-long `length` reaches the native, which then allocates
-  // it -- `fs.read(fd, Buffer.alloc(4), 0, 1e9)` is a gigabyte on our side and
-  // a synchronous throw on node's.
-  function validateReadLength(buffer, offset, length) {
-    if (!buffer || typeof length !== "number") return;
-    const room = buffer.byteLength - (offset || 0);
-    if (length > room) {
-      throw codes.ERR_OUT_OF_RANGE("length", "<= " + room, length);
+  // The checks fs.read and fs.readSync share once their overloads are
+  // resolved (lib/fs.js, v22.22.2): the offset first -- an integer in [0,
+  // 2**53-1], so a bad one is refused even by a zero-length read -- then
+  // `length |= 0` and, for a read that is not empty, validateReadRange. All
+  // before the descriptor is used. Returns the int32 length; 0 means
+  // "return 0".
+  function validateReadSpan(buffer, offset, length) {
+    validateInteger(offset, "offset", 0);
+    length |= 0;
+    if (length === 0) return 0;
+    validateReadRange(buffer, offset, length);
+    return length;
+  }
+
+  // What every read into a caller's buffer (fs.read, fs.readSync,
+  // FileHandle.read) checks once the offset is valid and the read is not
+  // empty: an empty buffer, then node's validateOffsetLengthRead. Without it
+  // an over-long length reaches the native, which allocates it --
+  // `fs.read(fd, Buffer.alloc(4), 0, 1e9)` would be a gigabyte on our side
+  // and is a synchronous throw on node's.
+  function validateReadRange(buffer, offset, length) {
+    const size = buffer.byteLength;
+    if (size === 0) {
+      throw codes.ERR_INVALID_ARG_VALUE("buffer", buffer, "is empty and cannot be written");
+    }
+    if (length < 0) throw codes.ERR_OUT_OF_RANGE("length", ">= 0", length);
+    if (offset + length > size) throw codes.ERR_OUT_OF_RANGE("length", "<= " + (size - offset), length);
+  }
+
+  // node's validateObject(options, "options", kValidateObjectAllowNullable),
+  // for the options forms of fs.read and fs.readSync: null passes, an array
+  // does not.
+  function validateReadOptions(options) {
+    if (options !== null && (typeof options !== "object" || Array.isArray(options))) {
+      throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+    }
+  }
+
+  // node's validateBuffer, the first check of fs.read and fs.readSync.
+  function validateReadBuffer(buffer) {
+    if (!ArrayBuffer.isView(buffer)) {
+      throw codes.ERR_INVALID_ARG_TYPE("buffer", ["Buffer", "TypedArray", "DataView"], buffer);
     }
   }
 
@@ -10667,17 +10703,35 @@
             await natives.fsWriteChunk(h, slice, fsPositionArg(position));
             return { bytesWritten: slice.length, buffer: buffer };
           },
+          // node's overloads and checks (lib/internal/fs/promises.js,
+          // v22.22.2): read(options), read(buffer, options) and the
+          // positional form; then the offset, which an empty read checks
+          // too, and the range. Unlike fs.read the length is not `| 0`'d:
+          // a missing one is the rest of the buffer.
           read: async function (buffer, offset, length, position) {
             guard("read");
-            validateReadLength(buffer, offset, length);
-            var want = length != null ? length : (buffer ? buffer.byteLength - (offset || 0) : 65536);
-            var chunk = await natives.fsReadChunk(h, want, fsPositionArg(position));
-            if (chunk === undefined) return { bytesRead: 0, buffer: buffer };
-            if (buffer) {
-              var dest = new Uint8Array(buffer.buffer || buffer, (buffer.byteOffset || 0) + (offset || 0));
-              dest.set(chunk);
+            if (!ArrayBuffer.isView(buffer)) {
+              if (buffer !== undefined) validateReadOptions(buffer);
+              ({
+                buffer = globalThis.Buffer.alloc(16384),
+                offset = 0,
+                length = buffer.byteLength - offset,
+                position = null,
+              } = buffer ?? {});
+              validateReadBuffer(buffer);
             }
-            return { bytesRead: chunk.length, buffer: buffer || globalThis.Buffer.from(chunk) };
+            if (offset !== null && typeof offset === "object") {
+              ({ offset = 0, length = buffer.byteLength - offset, position = null } = offset);
+            }
+            if (offset == null) offset = 0;
+            else validateInteger(offset, "offset", 0);
+            length ??= buffer.byteLength - offset;
+            if (length === 0) return { bytesRead: 0, buffer: buffer };
+            validateReadRange(buffer, offset, length);
+            var chunk = await natives.fsReadChunk(h, length, fsPositionArg(position));
+            if (chunk === undefined) return { bytesRead: 0, buffer: buffer };
+            new Uint8Array(buffer.buffer, buffer.byteOffset + offset, length).set(chunk);
+            return { bytesRead: chunk.length, buffer: buffer };
           },
           // FSTAT, not stat. This used to re-stat the PATH the handle was
           // opened from, which is a different object the moment anything moves
@@ -11420,19 +11474,25 @@
       // after every other argument, right before the call (see validateFd).
       closeSync: (fd) => { validateFd(fd, true); natives.fsCloseSync(fd); },
       fstatSync: (fd) => { validateFd(fd, true); return wrapStat(natives.fsFstatSync(fd)); },
-      readSync: (fd, buffer, offset, length, position) => {
-        // (fd, buffer, {offset,length,position}) object form.
-        if (offset !== null && typeof offset === "object") {
-          const o = offset;
-          offset = o.offset ?? 0; length = o.length ?? (buffer ? buffer.length - offset : 0); position = o.position ?? null;
+      // node's argument order (lib/fs.js, v22.22.2): the buffer, the options
+      // object, the offset, the length, and only then the descriptor -- so a
+      // bad offset is refused even by a read of length 0, which returns 0
+      // without looking at the descriptor.
+      readSync: function readSync(fd, buffer, offsetOrOptions, length, position) {
+        validateReadBuffer(buffer);
+        let offset = offsetOrOptions;
+        // The (fd, buffer[, options]) form: node takes it for three arguments
+        // or fewer, and whenever the third is an object (null included, which
+        // reads as no options at all).
+        if (arguments.length <= 3 || typeof offsetOrOptions === "object") {
+          if (offsetOrOptions !== undefined) validateReadOptions(offsetOrOptions);
+          ({ offset = 0, length = buffer.byteLength - offset, position = null } = offsetOrOptions ?? {});
         }
-        const len = length ?? (buffer ? buffer.length - (offset ?? 0) : 0);
-        // node's `length |= 0; if (length === 0) return 0;`: an empty read
-        // into a real buffer returns before the descriptor is looked at.
-        if ((len | 0) === 0 && ArrayBuffer.isView(buffer)) return 0;
-        validateReadLength(buffer, offset ?? 0, len);
+        if (offset === undefined) offset = 0;
+        const len = validateReadSpan(buffer, offset, length);
+        if (len === 0) return 0;
         validateFd(fd, true);
-        return natives.fsReadSync(fd, buffer, offset ?? 0, len, position ?? null);
+        return natives.fsReadSync(fd, buffer, offset, len, position ?? null);
       },
       writeSync: (fd, data, offsetOrPosition, length, position) => {
         // Buffer form: (fd, buffer, offset, length, position).
@@ -11622,31 +11682,46 @@
         }
         queueMicrotask(function () { cb(null, n, data); });
       },
-      read: function (fd, buffer, offset, length, position, cb) {
+      read: function read(fd, buffer, offsetOrOptions, length, position, cb) {
         // node's JS getValidatedFd, before any other argument (validateFd).
         validateFd(fd, false);
-        // Variants: (fd, buffer, offset, length, position, cb),
-        // (fd, options, cb), and trailing-callback short forms.
-        if (typeof buffer === "function") {
-          cb = buffer; buffer = globalThis.Buffer.alloc(16384); offset = 0; length = buffer.length;
-        } else if (buffer && typeof buffer === "object" && !ArrayBuffer.isView(buffer)) {
-          var o = buffer; cb = offset;
-          buffer = o.buffer || globalThis.Buffer.alloc(o.length || 16384);
-          offset = o.offset || 0;
-          length = o.length != null ? o.length : buffer.length - offset;
-          // o.position was the one field this form never read, so the options
-          // overload kept reading from the cursor after the positional overload
-          // below was fixed. readSync's object form has always honoured it.
-          position = o.position ?? null;
+        // node's overloads (lib/fs.js, v22.22.2) go by argument count:
+        //   (fd, buffer, offset, length, position, cb) for five or more;
+        //   (fd, buffer, options, cb) for four -- options an object or null;
+        //   (fd, buffer, cb) or (fd, { buffer, ... }, cb) for three;
+        //   (fd, cb) for two, into a new 16 KiB buffer.
+        // The short forms take offset / length / position from the options,
+        // defaulting to the whole buffer and the cursor.
+        let offset = offsetOrOptions;
+        if (arguments.length <= 4) {
+          let params = null;
+          if (arguments.length === 4) {
+            validateReadOptions(offsetOrOptions);
+            cb = length;
+            params = offsetOrOptions;
+          } else if (arguments.length === 3) {
+            if (!ArrayBuffer.isView(buffer)) {
+              params = buffer;
+              ({ buffer = globalThis.Buffer.alloc(16384) } = params ?? {});
+            }
+            cb = offsetOrOptions;
+          } else {
+            cb = buffer;
+            buffer = globalThis.Buffer.alloc(16384);
+          }
+          ({ offset = 0, length = buffer?.byteLength - offset, position = null } = params ?? {});
         }
-        if (typeof offset === "function") { cb = offset; offset = 0; length = buffer ? buffer.length : 16384; }
-        if (typeof length === "function") { cb = length; length = buffer ? buffer.length - (offset || 0) : 16384; }
-        if (typeof position === "function") { cb = position; }
+        validateReadBuffer(buffer);
         validateCb(cb);
-        var want = length != null ? length : (buffer ? buffer.length - (offset || 0) : 16384);
-        // Bounded by the destination, exactly as node bounds it -- and thrown
-        // SYNCHRONOUSLY even from this callback form, which is what node does.
-        validateReadLength(buffer, offset, want);
+        // The offset (null is 0 here, unlike readSync) and the length, bounded
+        // by the destination -- thrown SYNCHRONOUSLY even from this callback
+        // form, as node does. An empty read calls back 0 without the fd.
+        if (offset == null) offset = 0;
+        var want = validateReadSpan(buffer, offset, length);
+        if (want === 0) {
+          process.nextTick(cb, null, 0, buffer);
+          return;
+        }
         // The position was parsed above and then DROPPED -- fsReadChunk had no
         // position parameter, so `fs.read(fd, buf, 0, 3, 10, cb)` read from the
         // cursor and handed back the wrong bytes with no error. The native now

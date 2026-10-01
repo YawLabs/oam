@@ -23,7 +23,12 @@
 // popping the last argument: a missing one is "Received undefined", not the
 // path or uid before it, and an argument after it is ignored (oam threw on
 // it). opendir calls it "callback"; symlink alone takes its last argument.
+// fs.read takes node's overloads by argument count and checks its buffer,
+// offset and length at the call, the offset even for a read of length 0;
+// FileHandle.read shares those checks with its own overloads.
 import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 const B = Buffer.alloc(4);
 function shape(err) {
@@ -196,10 +201,95 @@ async function extraArguments() {
   }
 }
 
+// fs.read's overloads go by argument count, and its offset and length are
+// checked at the call -- the offset even for a read of length 0, which calls
+// back 0 without reading. Each on a fresh descriptor, one at a time.
+const readForms = {
+  "(fd, B, cb)": (fd, b, cb) => fs.read(fd, b, cb),
+  "(fd, cb)": (fd, b, cb) => fs.read(fd, (err, n, buf) => { buf.copy(b, 0, 0, 4); cb(err, n); }),
+  "(fd, { buffer, position: 2 }, cb)": (fd, b, cb) => fs.read(fd, { buffer: b, position: 2 }, cb),
+  "(fd, { buffer, offset: 1 }, cb)": (fd, b, cb) => fs.read(fd, { buffer: b, offset: 1 }, cb),
+  "(fd, { length: 3 }, cb)": (fd, b, cb) => fs.read(fd, { length: 3 }, (err, n, buf) => { cb(err, n + "/" + buf.length); }),
+  "(fd, null, cb)": (fd, b, cb) => fs.read(fd, null, (err, n, buf) => { cb(err, n + "/" + buf.length); }),
+  "(fd, B, { position: 3 }, cb)": (fd, b, cb) => fs.read(fd, b, { position: 3 }, cb),
+  "(fd, B, { offset: 1, length: 2 }, cb)": (fd, b, cb) => fs.read(fd, b, { offset: 1, length: 2 }, cb),
+  "(fd, B, null, cb)": (fd, b, cb) => fs.read(fd, b, null, cb),
+  "(fd, B, 0, cb)": (fd, b, cb) => fs.read(fd, b, 0, cb),
+  "(fd, B, 0, 2, cb)": (fd, b, cb) => fs.read(fd, b, 0, 2, cb),
+  "(fd, B, null, 2, 0, cb)": (fd, b, cb) => fs.read(fd, b, null, 2, 0, cb),
+  "(fd, B, undefined, undefined, 0, cb)": (fd, b, cb) => fs.read(fd, b, undefined, undefined, 0, cb),
+  "(fd, B, -5, 0, 0, cb)": (fd, b, cb) => fs.read(fd, b, -5, 0, 0, cb),
+  "(fd, B, 'x', 1, 0, cb)": (fd, b, cb) => fs.read(fd, b, "x", 1, 0, cb),
+  "(fd, B, 1.5, 1, 0, cb)": (fd, b, cb) => fs.read(fd, b, 1.5, 1, 0, cb),
+  "(fd, B, 2**53, 0, 0, cb)": (fd, b, cb) => fs.read(fd, b, 2 ** 53, 0, 0, cb),
+  "(fd, B, 5, 0, 0, cb)": (fd, b, cb) => fs.read(fd, b, 5, 0, 0, cb),
+  "(fd, B, 5, 1, 0, cb)": (fd, b, cb) => fs.read(fd, b, 5, 1, 0, cb),
+  "(fd, B, 0, -1, 0, cb)": (fd, b, cb) => fs.read(fd, b, 0, -1, 0, cb),
+  "(fd, B, { offset: -1 }, cb)": (fd, b, cb) => fs.read(fd, b, { offset: -1 }, cb),
+  "(fd, { buffer, offset: 'x' }, cb)": (fd, b, cb) => fs.read(fd, { buffer: b, offset: "x" }, cb),
+  "(fd, { buffer: 'x' }, cb)": (fd, b, cb) => fs.read(fd, { buffer: "x" }, cb),
+  "(fd, empty Buffer, 0, 1, 0, cb)": (fd, b, cb) => fs.read(fd, Buffer.alloc(0), 0, 1, 0, cb),
+  "(fd, B, 0, 1, 0) no callback": (fd, b) => fs.read(fd, b, 0, 1, 0),
+};
+async function readOverloads() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oam-read-"));
+  const file = path.join(dir, "f.txt");
+  fs.writeFileSync(file, "abcdefgh");
+  for (const [label, fn] of Object.entries(readForms)) {
+    const fd = fs.openSync(file, "r");
+    const b = Buffer.alloc(4);
+    await new Promise((resolve) => {
+      let returned = false;
+      try {
+        fn(fd, b, (err, n) => {
+          const how = returned ? "" : "(synchronous!) ";
+          console.log(`read${label} -> callback ${how}${err ? shape(err) : `null ${n} ${JSON.stringify(b.toString())}`}`);
+          resolve();
+        });
+        returned = true;
+      } catch (err) {
+        console.log(`read${label} threw`, shape(err));
+        resolve();
+      }
+    });
+    fs.closeSync(fd);
+  }
+  // FileHandle.read shares the offset and range checks, with its own
+  // overloads and no `| 0` on the length.
+  const fhForms = {
+    "()": () => [],
+    "(B, 1)": (b) => [b, 1],
+    "(B, undefined, undefined, 2)": (b) => [b, undefined, undefined, 2],
+    "(B, { offset: 1, length: 2, position: 4 })": (b) => [b, { offset: 1, length: 2, position: 4 }],
+    "({ buffer: B, position: 2 })": (b) => [{ buffer: b, position: 2 }],
+    "({ length: 3 })": () => [{ length: 3 }],
+    "(5)": () => [5],
+    "({ buffer: 'x' })": () => [{ buffer: "x" }],
+    "(B, -5, 0)": (b) => [b, -5, 0],
+    "(B, 'x', 1)": (b) => [b, "x", 1],
+    "(B, 0, -1)": (b) => [b, 0, -1],
+    "(B, 5)": (b) => [b, 5],
+    "(empty Buffer, 0, 1)": () => [Buffer.alloc(0), 0, 1],
+  };
+  for (const [label, args] of Object.entries(fhForms)) {
+    const fh = await fs.promises.open(file, "r");
+    const b = Buffer.alloc(4);
+    try {
+      const { bytesRead, buffer } = await fh.read(...args(b));
+      const head = Buffer.from(buffer.buffer, buffer.byteOffset, Math.min(buffer.byteLength, 8));
+      console.log(`fh.read${label} ->`, bytesRead, JSON.stringify(head.toString()), buffer.byteLength, buffer === b);
+    } catch (err) {
+      console.log(`fh.read${label} rejected`, shape(err));
+    }
+    await fh.close();
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 // readFile(-1, cb): thrown a tick later, as an uncaught exception.
 process.on("uncaughtException", (err) => events.push(`uncaughtException ${shape(err)}`));
 call("readFile(-1)", (cb) => fs.readFile(-1, cb));
 setTimeout(() => {
   for (const line of events) console.log(line);
-  extraArguments();
+  extraArguments().then(readOverloads);
 }, 50);
