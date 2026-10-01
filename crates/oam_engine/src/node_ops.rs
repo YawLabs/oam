@@ -5977,29 +5977,10 @@ fn op_fs_fstat(
 ) {
     let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let files = core_runtime!(scope).sync_files();
-    // Same adoption rule as the sync twin: a low fd we never allocated is the
-    // parent's, passed in at spawn.
-    oam_core::adopt_inherited_fd(&files, fd);
-    // Clone the handle under the lock and drop the lock immediately -- the
-    // metadata read then happens on a blocking thread with nothing held, so a
-    // slow device cannot stall every other fd op.
-    let cloned = {
-        let guard = files.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.files.get(&fd) {
-            None => {
-                throw_ebadf(scope, "fstat");
-                return;
-            }
-            Some(file) => match file.try_clone() {
-                Ok(cloned) => cloned,
-                Err(e) => {
-                    throw_fd_error(scope, "fstat", &e);
-                    return;
-                }
-            },
-        }
+    let Some(file) = registered_fd(scope, &files, fd, "fstat") else {
+        return;
     };
-    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fstat(cloned));
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fstat(file));
 }
 
 // --------------------------------------------------------- fd-based fs ops
@@ -6008,53 +5989,39 @@ fn op_fs_fstat(
 // All exempt-by-capability in `permission_audit`: the fd can only have come
 // from an `open` that was checked, and there is no path here to re-check.
 
-/// Resolve an fd to an owned `File` for an op that will hand it to a blocking
-/// thread. Throws EBADF and returns None when the fd is not open.
+/// Resolve an fd to its shared handle (see `oam_core::OpenFile`), adopting a
+/// descriptor the parent passed in. Throws EBADF and returns None when the fd
+/// is not open. The registry lock is held only for the lookup, never for the
+/// op's IO, so a slow descriptor stalls nothing else -- and nothing is taken
+/// out of the table, so concurrent ops on one descriptor all find it.
 ///
 /// The registry comes in as a parameter rather than from `core_runtime!`: that
 /// macro expands to a bare `return;`, which only compiles inside a function
 /// returning `()`. The op callbacks do; this does not.
-fn clone_registered_fd(
+fn registered_fd(
     scope: &mut v8::PinScope<'_, '_>,
     files: &oam_core::SyncFileRegistry,
     fd: u64,
     syscall: &str,
-) -> Option<std::fs::File> {
-    // Same adoption rule as fstat: a low fd we never allocated came from the
-    // parent at spawn.
-    oam_core::adopt_inherited_fd(files, fd);
-    let cloned = {
-        let guard = files.lock().unwrap_or_else(|e| e.into_inner());
-        guard.files.get(&fd).map(|file| file.try_clone())
-    };
-    match cloned {
-        None => {
-            throw_ebadf(scope, syscall);
-            None
-        }
-        Some(Err(e)) => {
-            throw_node_error(scope, syscall, "", &e);
-            None
-        }
-        Some(Ok(file)) => Some(file),
+) -> Option<oam_core::OpenFile> {
+    let file = oam_core::registered_file(files, fd);
+    if file.is_none() {
+        throw_ebadf(scope, syscall);
     }
+    file
 }
 
-/// Run a synchronous fd operation against the registry, throwing on failure.
+/// Run a synchronous fd operation, throwing on failure.
 fn with_registered_fd<F>(scope: &mut v8::PinScope<'_, '_>, fd: u64, syscall: &str, action: F)
 where
     F: FnOnce(&std::fs::File) -> std::io::Result<()>,
 {
     let files = core_runtime!(scope).sync_files();
-    oam_core::adopt_inherited_fd(&files, fd);
-    let outcome = {
-        let guard = files.lock().unwrap_or_else(|e| e.into_inner());
-        guard.files.get(&fd).map(action)
+    let Some(file) = registered_fd(scope, &files, fd, syscall) else {
+        return;
     };
-    match outcome {
-        None => throw_ebadf(scope, syscall),
-        Some(Err(e)) => throw_node_error(scope, syscall, "", &e),
-        Some(Ok(())) => {}
+    if let Err(e) = action(&file) {
+        throw_node_error(scope, syscall, "", &e);
     }
 }
 
@@ -6077,7 +6044,7 @@ fn op_fs_fsync(
 ) {
     let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let files = core_runtime!(scope).sync_files();
-    let Some(file) = clone_registered_fd(scope, &files, fd, "fsync") else {
+    let Some(file) = registered_fd(scope, &files, fd, "fsync") else {
         return;
     };
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fsync(file, false));
@@ -6090,7 +6057,7 @@ fn op_fs_fdatasync(
 ) {
     let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let files = core_runtime!(scope).sync_files();
-    let Some(file) = clone_registered_fd(scope, &files, fd, "fdatasync") else {
+    let Some(file) = registered_fd(scope, &files, fd, "fdatasync") else {
         return;
     };
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fsync(file, true));
@@ -6104,7 +6071,7 @@ fn op_fs_ftruncate(
     let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let len = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u64;
     let files = core_runtime!(scope).sync_files();
-    let Some(file) = clone_registered_fd(scope, &files, fd, "ftruncate") else {
+    let Some(file) = registered_fd(scope, &files, fd, "ftruncate") else {
         return;
     };
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_ftruncate(file, len));
@@ -6118,7 +6085,7 @@ fn op_fs_fchmod(
     let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
     let files = core_runtime!(scope).sync_files();
-    let Some(file) = clone_registered_fd(scope, &files, fd, "fchmod") else {
+    let Some(file) = registered_fd(scope, &files, fd, "fchmod") else {
         return;
     };
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fchmod(file, mode));
@@ -6133,7 +6100,7 @@ fn op_fs_fchown(
     let uid = args.get(1).uint32_value(scope).unwrap_or(0);
     let gid = args.get(2).uint32_value(scope).unwrap_or(0);
     let files = core_runtime!(scope).sync_files();
-    let Some(file) = clone_registered_fd(scope, &files, fd, "fchown") else {
+    let Some(file) = registered_fd(scope, &files, fd, "fchown") else {
         return;
     };
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fchown(file, uid, gid));
@@ -6147,7 +6114,7 @@ fn op_fs_futimes(
     let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let (atime, mtime) = utime_args(scope, &args, 1);
     let files = core_runtime!(scope).sync_files();
-    let Some(file) = clone_registered_fd(scope, &files, fd, "futime") else {
+    let Some(file) = registered_fd(scope, &files, fd, "futime") else {
         return;
     };
     crate::ops::spawn_op(
@@ -6927,7 +6894,8 @@ fn op_fs_write_chunk(
     );
 }
 
-/// Synchronous: dropping the File closes it (flush happens in write ops).
+/// Synchronous: dropping the registry's reference closes the file once no op
+/// in flight on it still holds one (see `oam_core::OpenFile`).
 fn op_fs_close(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -6935,13 +6903,12 @@ fn op_fs_close(
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let files = core_runtime!(scope).files();
-    let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
-    // If the File is in flight (removed by a chunk op for its IO await),
-    // it is absent here -- record the close so the op's reinsert drops it
-    // instead of resurrecting a leaked fd (destroy()-during-read race).
-    if guard.files.remove(&handle).is_none() {
-        guard.closed.insert(handle);
-    }
+    let removed = files
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .files
+        .remove(&handle);
+    drop(removed);
 }
 
 /// Throw an `Error` carrying `.code`/`.syscall` for a bad/missing fd. Node
@@ -7009,7 +6976,7 @@ fn op_fs_open_sync(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .files
-                .insert(id, file);
+                .insert(id, std::sync::Arc::new(file));
             let val = v8::Number::new(scope, id as f64);
             rv.set(val.into());
         }
@@ -7018,60 +6985,10 @@ fn op_fs_open_sync(
 }
 
 /// fsReadSync(fd, buffer, offset, length, position) -> bytesRead. Reads into
-/// buffer's backing store at `offset`; `position` (a number) seeks first,
-/// null reads from the current position.
-/// Read at an explicit position WITHOUT moving the descriptor's cursor, which
-/// is what `pread(2)` does and what node's positional `fs.read` family means.
-///
-/// This used to seek and leave the cursor there. The bug is silent and nasty:
-/// node gives `readSync(fd, b, 0, 3, 10)` then `readSync(fd, b, 0, 3, null)`
-/// -> "KLM" then "ABC" (the sequential read still starts at 0), while oam gave
-/// "KLM" then "NOP". A program that positionally probes a file and then reads
-/// sequentially got the wrong bytes with no error anywhere.
-///
-/// Save/seek/act/restore rather than a real pread: std has no positional read
-/// on the stable cross-platform surface (`FileExt` is per-OS and differs in
-/// name between unix `read_at` and windows `seek_read`), and the registry is
-/// already serialised behind its mutex here, so nothing else can observe the
-/// cursor mid-operation.
-fn read_at(
-    file: &mut std::fs::File,
-    buf: &mut [u8],
-    position: Option<u64>,
-) -> std::io::Result<usize> {
-    use std::io::{Read, Seek, SeekFrom};
-    let Some(p) = position else {
-        return file.read(buf);
-    };
-    let saved = file.stream_position();
-    file.seek(SeekFrom::Start(p))?;
-    let result = file.read(buf);
-    if let Ok(prev) = saved {
-        let _ = file.seek(SeekFrom::Start(prev));
-    }
-    result
-}
-
-/// Write at an explicit position without moving the cursor -- `pwrite(2)`.
-/// Same bug and same reasoning as `read_at`.
-///
-/// A descriptor opened in APPEND mode ignores the position entirely and always
-/// writes at the end; that is the OS's behaviour, node's too, and restoring the
-/// cursor afterwards does not change it.
-fn write_at(file: &mut std::fs::File, bytes: &[u8], position: Option<u64>) -> std::io::Result<()> {
-    use std::io::{Seek, SeekFrom};
-    let Some(p) = position else {
-        return oam_core::write_all_checked(file, bytes);
-    };
-    let saved = file.stream_position();
-    file.seek(SeekFrom::Start(p))?;
-    let result = oam_core::write_all_checked(file, bytes);
-    if let Ok(prev) = saved {
-        let _ = file.seek(SeekFrom::Start(prev));
-    }
-    result
-}
-
+/// buffer's backing store at `offset`; a numeric `position` is a `pread`
+/// (`oam_core::read_at`: the cursor does not move -- node gives
+/// `readSync(fd, b, 0, 3, 10)` then `readSync(fd, b, 0, 3, null)` -> "KLM" then
+/// "ABC"), null reads from the cursor.
 fn op_fs_read_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -7091,8 +7008,11 @@ fn op_fs_read_sync(
     let files = core_runtime!(scope).sync_files();
     // A low fd missing from the registry cannot be one oam allocated -- the
     // counter starts above the inheritable window -- so it is the parent's to
-    // adopt. This is what lets oam BE the child of an extra-fd spawn.
-    oam_core::adopt_inherited_fd(&files, fd);
+    // adopt (`registered_file` does). This is what lets oam BE the child of an
+    // extra-fd spawn.
+    let Some(file) = registered_fd(scope, &files, fd, "read") else {
+        return;
+    };
     // `length` is an unvalidated JS number; its saturating f64->usize cast can
     // reach usize::MAX, and `vec![0u8; length]` would abort this non-unwindable
     // callback (capacity-overflow panic). A read can never usefully exceed the
@@ -7103,17 +7023,9 @@ fn op_fs_read_sync(
             .unwrap_or(0),
     );
     let mut tmp = vec![0u8; length];
-    let read_result = {
-        let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .files
-            .get_mut(&fd)
-            .map(|file| read_at(file, &mut tmp, pos_seek))
-    };
-    match read_result {
-        None => throw_ebadf(scope, "read"),
-        Some(Err(e)) => throw_fd_error(scope, "read", &e),
-        Some(Ok(n)) => {
+    match oam_core::read_at(&file, &mut tmp, pos_seek) {
+        Err(e) => throw_fd_error(scope, "read", &e),
+        Ok(n) => {
             if n > 0 {
                 let buf_value = args.get(1);
                 if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(buf_value)
@@ -7154,8 +7066,8 @@ fn op_fs_read_sync(
 }
 
 /// fsWriteSync(fd, data, position?) -> bytesWritten. `data` is bytes (Buffer)
-/// or a string (UTF-8). `position` (a number) seeks first; null appends at the
-/// current position.
+/// or a string (UTF-8). A numeric `position` is a `pwrite`
+/// (`oam_core::write_all_at`); null writes at the cursor.
 fn op_fs_write_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -7174,21 +7086,13 @@ fn op_fs_write_sync(
         None
     };
     let files = core_runtime!(scope).sync_files();
-    // A low fd missing from the registry cannot be one oam allocated -- the
-    // counter starts above the inheritable window -- so it is the parent's to
-    // adopt. This is what lets oam BE the child of an extra-fd spawn.
-    oam_core::adopt_inherited_fd(&files, fd);
-    let write_result = {
-        let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .files
-            .get_mut(&fd)
-            .map(|file| write_at(file, &bytes, pos_seek))
+    // Adopts an inherited fd, as in op_fs_read_sync.
+    let Some(file) = registered_fd(scope, &files, fd, "write") else {
+        return;
     };
-    match write_result {
-        None => throw_ebadf(scope, "write"),
-        Some(Err(e)) => throw_fd_error(scope, "write", &e),
-        Some(Ok(())) => {
+    match oam_core::write_all_at(&file, &bytes, pos_seek) {
+        Err(e) => throw_fd_error(scope, "write", &e),
+        Ok(()) => {
             let val = v8::Number::new(scope, bytes.len() as f64);
             rv.set(val.into());
         }
@@ -7236,21 +7140,17 @@ fn op_fs_fstat_sync(
 ) {
     let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let files = core_runtime!(scope).sync_files();
-    // A low fd missing from the registry cannot be one oam allocated -- the
-    // counter starts above the inheritable window -- so it is the parent's to
-    // adopt. This is what lets oam BE the child of an extra-fd spawn.
-    oam_core::adopt_inherited_fd(&files, fd);
-    // Held across the whole read: fstat has no path to reopen from, so the
-    // extra fields have to come off the descriptor the caller already owns.
-    let guard = files.lock().unwrap_or_else(|e| e.into_inner());
-    let payload = guard.files.get(&fd).map(|file| {
-        file.metadata()
-            .map(|meta| oam_core::ops::stat_to_json(&meta, oam_core::ops::StatSource::File(file)))
-    });
+    // Adopts an inherited fd, as in op_fs_read_sync. fstat has no path to
+    // reopen from, so the extra fields come off the descriptor itself.
+    let Some(file) = registered_fd(scope, &files, fd, "fstat") else {
+        return;
+    };
+    let payload = file
+        .metadata()
+        .map(|meta| oam_core::ops::stat_to_json(&meta, oam_core::ops::StatSource::File(&file)));
     match payload {
-        None => throw_ebadf(scope, "fstat"),
-        Some(Err(e)) => throw_fd_error(scope, "fstat", &e),
-        Some(Ok(json)) => return_json(scope, &mut rv, &json),
+        Err(e) => throw_fd_error(scope, "fstat", &e),
+        Ok(json) => return_json(scope, &mut rv, &json),
     }
 }
 
