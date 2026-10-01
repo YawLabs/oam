@@ -11459,6 +11459,11 @@
     const realpathByPath = callbackify1((p) => realpathWalking(realpathArg(p)), 1);
     const truncateByPath = callbackify1(promises.truncate, 2);
 
+    // node's callback for fs.close(fd) without one: a failure is thrown.
+    function defaultCloseCallback(err) {
+      if (err != null) throw err;
+    }
+
     // The read behind fs.read and fs.readv, arguments already checked: `want`
     // bytes at `position` (the native's: null for the cursor, else a
     // non-negative number) into buffer[offset..], then cb(err, bytesRead,
@@ -11771,13 +11776,18 @@
         );
       },
       // The callback is optional, but one that is passed must be a function,
-      // and node checks it before the descriptor.
-      close: function (fd, cb) {
-        if (cb !== undefined) validateCb(cb);
+      // and node checks it before the descriptor. A descriptor that is not
+      // open is EBADF through the callback, as closeSync throws it -- the
+      // same native, so the two cannot disagree (fs.close used to call back
+      // null for one, through the streams' close, which forgives a double
+      // close). With no callback node's default one throws the error, which
+      // makes it an uncaught exception.
+      close: function close(fd, cb = defaultCloseCallback) {
+        if (cb !== defaultCloseCallback) validateCb(cb);
         validateFd(fd, true);
         var err = null;
-        try { natives.fsClose(fd); } catch (e) { err = e; }
-        if (typeof cb === "function") queueMicrotask(function () { cb(err); });
+        try { natives.fsCloseSync(fd); } catch (e) { err = e; }
+        queueMicrotask(function () { cb(err); });
       },
       // Async fd-based write. Node overloads:
       //   fs.write(fd, buffer[, offset[, length[, position]]], cb)

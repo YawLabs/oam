@@ -2242,9 +2242,11 @@ What still differs:
   the rm's completion later dies with an uncaught `TypeError: callback is not a
   function`. Reproducing that would turn a clear error at the call site into a
   crash with no user frame, so oam keeps the check.
-- **A closed descriptor in range** behaves as before: `fs.close(fd, cb)` on one oam
-  never opened calls back `null` where node reports `EBADF`, and on Windows node's
-  `fchown` on any descriptor is a no-op success where oam reports `EBADF`.
+- **`fchown` of a closed descriptor on Windows.** node's (libuv's) Windows `fchown`
+  is a no-op success for any descriptor, open or not; oam reports `EBADF` for one
+  that is not open. (`fs.close` of a descriptor that is not open is `EBADF` through
+  the callback, as node's is, and an uncaught exception without one --
+  `conformance/cases/259-*`.)
 
 ### `fs.realpath` under `--permission` — oam is stricter
 
