@@ -463,6 +463,18 @@ impl SendError {
         if let Some(tls) = find_in_chain::<TlsSetupError>(&self.error) {
             return OpOutcome::Failed(tls.to_string());
         }
+        // The server reset the connection (resetAndDestroy(), SO_LINGER 0)
+        // before the response head was in: node's socket read fails, and
+        // both of its clients report that error -- `read ECONNRESET`, with
+        // errno, code and syscall -- http.request as the request's 'error',
+        // fetch as the cause of its `fetch failed` (measured on v22.22.2). A
+        // close without a reset stays the transport's failure (node's 'socket
+        // hang up' / undici's `other side closed`).
+        if let Some(io) = find_in_chain::<std::io::Error>(&self.error)
+            && io.kind() == std::io::ErrorKind::ConnectionReset
+        {
+            return crate::tcp::errno_failure(io, "read");
+        }
         OpOutcome::Failed(format!("error sending request for url ({url})"))
     }
 

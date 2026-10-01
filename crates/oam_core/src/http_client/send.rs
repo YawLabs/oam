@@ -959,6 +959,11 @@ fn conn_payload(payload: &mut serde_json::Value, conn: &ConnInfo) {
     if let Some(local) = conn.local {
         socket.insert("localAddr".to_string(), crate::tcp::addr_to_json(local));
     }
+    // What `req.socket.destroy()` / `resetAndDestroy()` close it by
+    // (`__oam.fetchConnClose`).
+    if let Some(connection) = conn.connection {
+        socket.insert("connection".to_string(), connection.into());
+    }
     payload["socket"] = serde_json::Value::Object(socket);
     if let Some(tls) = &conn.tls {
         payload["tls"] = serde_json::json!({

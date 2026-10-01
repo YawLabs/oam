@@ -51,7 +51,7 @@ use hyper::body::Incoming;
 use hyper::client::conn::{http1, http2};
 use hyper_util::rt::TokioExecutor;
 
-use super::connector::{ConnInfo, ConnStats, OamConnector};
+use super::connector::{ConnCloser, ConnInfo, ConnStats, OamConnector};
 use super::sent::Dispatched;
 use super::{BoxError, ReqBody};
 
@@ -368,8 +368,27 @@ impl Pool {
             let (sender, connection) = http1::handshake(conn)
                 .await
                 .map_err(|e| Box::new(e) as BoxError)?;
+            // JS may close the connection through a response it carried
+            // (`req.socket.destroy()` / `resetAndDestroy()`): the task then
+            // drops it, mid-response or idle in the pool alike.
+            let closer = info.connection.and_then(ConnCloser::find);
             tokio::spawn(async move {
-                let _ = connection.with_upgrades().await;
+                match closer {
+                    Some(closer) => {
+                        // The close first: a body JS drops right after asking
+                        // (the destroyed socket's response) must not get
+                        // hyper to shut the connection down with a FIN ahead
+                        // of the reset.
+                        tokio::select! {
+                            biased;
+                            () = closer.requested() => {}
+                            _ = connection.with_upgrades() => {}
+                        }
+                    }
+                    None => {
+                        let _ = connection.with_upgrades().await;
+                    }
+                }
             });
             Ok(Conn {
                 proto: Proto::H1(sender, pool_stats),

@@ -57,6 +57,7 @@ pub mod sent;
 pub mod tls_config;
 pub mod transport;
 
+pub use connector::close_connection;
 pub use tls_config::TlsRange;
 pub use transport::{HttpTransport, ProxySource, Route, SendError, TlsSource, TransportOptions};
 

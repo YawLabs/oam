@@ -1092,7 +1092,8 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   a `stream.Duplex` here, so `netSocket instanceof stream.Duplex` is false where Node says
   true.
 - **Node members absent from both classes**, which the mechanical walk cannot see by
-  construction: `destroySoon` and `resetAndDestroy`. `net.Socket` has had `read()`,
+  construction: `destroySoon`. (`resetAndDestroy` is on both now, the same function as in
+  Node -- entry 46.) `net.Socket` has had `read()`,
   `'readable'` and `push()` since 0.16.3 (below); a `TLSSocket`, being a Duplex, always had
   `read`.
 - **A bare `connect()` handshakes.** `new tls.TLSSocket(null, opts).connect(port, host)` runs
@@ -1444,6 +1445,26 @@ What still differs:
   proxy. At the end of a response whose connection stays open,
   `res.socket` is null, as node detaches a kept-alive socket. Up to 0.16.2 it was a fixed object naming the host as
   written, with `localAddress` `127.0.0.1` and `localPort` `0`.
+  `destroy()` and `resetAndDestroy()` on the http stand-in close the HTTP/1 connection the
+  response came on, as Node's close the socket's handle, whether the response is still
+  arriving or the connection is back in the pool: `resetAndDestroy()` with a reset (the
+  server's read fails with `read ECONNRESET`; a response still arriving fails with
+  ECONNRESET `aborted`), `destroy()` with a FIN; the socket's `'close'` says `false`
+  (`conformance/cases/254-http-reset-and-destroy.mjs`). Up to 0.17.1 neither reached the
+  connection: `resetAndDestroy()` failed the socket and the response with
+  `ERR_SOCKET_CLOSED`, sent a FIN and left an idle pooled connection open, as `destroy()` did.
+  What differs: the https stand-in is a `tls.TLSSocket`, whose `resetAndDestroy()` throws
+  `ERR_INVALID_HANDLE_TYPE` as Node's does, but whose `destroy()` after the response leaves
+  the kept-alive TLS connection in the pool, where Node closes it; an h2 connection, which
+  carries other requests at once, is never closed through one request's socket. _(source)_
+- **A server's reset before the response head is Node's socket error** (case 254): the
+  request's `'error'` and `fetch`'s cause are `read ECONNRESET` with `errno`, `code` and
+  `syscall: 'read'`, as Node's socket reports it. Up to 0.17.1 it was `ECONNRESET` `socket
+  hang up` with no `errno` / `syscall`, and `fetch`'s cause the uncoded `error sending
+  request for url (...)`. A close without a reset is still that uncoded cause where undici
+  says `UND_ERR_SOCKET` `other side closed`, and a reset in the middle of a `fetch` body
+  rejects with oam's own `fetch: body read failed` where undici's `terminated` carries the
+  same `read ECONNRESET` cause.
 - **The WebSocket client dials on this connector too** (since 0.17.2; up to 0.17.1 it dialled
   on its own, so on Windows a refused loopback connect took about 2 s per resolved address,
   and the `'error'` event was a plain `Event`). A connect that fails dispatches Node's
@@ -1930,8 +1951,8 @@ An `https` connection's socket also reports the handshake (`encrypted`, `authori
 `getPeerX509Certificate()`, `getProtocol()`, `getCipher()`).
 
 What still differs: the socket is an `EventEmitter` with the addresses, `address()`,
-`setTimeout`, `destroy` and `end`, not a stream -- the connection is read and written
-natively -- so it has none of `write`, `pause`, `resume`, `setNoDelay`, `setKeepAlive`,
+`setTimeout`, `destroy`, `end` and `resetAndDestroy`, not a stream -- the connection is read
+and written natively -- so it has none of `write`, `pause`, `resume`, `setNoDelay`, `setKeepAlive`,
 `ref`, `unref`, `cork`, `pipe` or `read`, and `constructor.name` is `EventEmitter`. It
 answers `instanceof net.Socket` (and an `https` connection's also `instanceof
 tls.TLSSocket`) by brand, as oam's own `TLSSocket` does (entry 34), because a check that
@@ -1942,7 +1963,18 @@ connection, and the request's `req.socket` is that socket, as in Node; the socke
 `'connection'` handed out for the same connection closes at the handover rather than with
 the upgraded socket. On an exchange the connection was closed under after its response had
 started, the socket's `'close'` comes after the response's, where Node emits it first (they
-are in Node's order when the response had not started).
+are in Node's order when the response had not started). A socket JS destroys mid-exchange
+(`destroy()`, `resetAndDestroy()`) emits its `'close'` on the next tick, before the request's
+`'aborted'` and the response's `'close'`, where Node emits it after them.
+
+`resetAndDestroy()` is `net.Socket`'s own function (the same object) and does what Node's
+does: the connection closes with a reset -- the client's read fails with `read ECONNRESET`,
+nothing unsent reaches it, a response being written included -- the socket is returned,
+destroyed at once, and its `'close'` says `false`; the request it was carrying is aborted
+(`'aborted'`, then ECONNRESET `aborted`). From a `'connection'` listener it refuses the client
+before a byte is read. An `https` connection's socket throws `ERR_INVALID_HANDLE_TYPE`, as
+Node's server-side `TLSSocket` does (`conformance/cases/254-http-reset-and-destroy.mjs`). Up
+to 0.17.1 the socket had no `resetAndDestroy` and the call threw a `TypeError`.
 
 `req.socket.readable` and `req.socket.writable` are Node's: both true while the connection
 is up -- after the request body has ended, and after the response has been sent, for the
@@ -2429,6 +2461,36 @@ oam's shared client. What differs:
 _(probed)_ Node v22.22.2 vs oam on Windows: lookup and createConnection guards over h2c, and
 a node-hosted `createSecureServer` for `ca`, `servername`, a refusing lookup, an untrusted
 certificate and `rejectUnauthorized: false`, line for line identical.
+
+### 46. `socket.resetAndDestroy()` while `end()` is shutting the socket down
+
+`resetAndDestroy()` is Node's otherwise: SO_LINGER 0 and a close, so the peer's read fails
+with `read ECONNRESET` and nothing unsent is delivered; the socket returned, destroyed at
+once, its own `'close'` with `false`; reset once it connects when still connecting;
+`ERR_SOCKET_CLOSED` without a handle; `ERR_INVALID_HANDLE_TYPE` thrown on a `TLSSocket` or a
+pipe (`conformance/cases/252-net-reset-and-destroy.mjs`, `253-net-reset-and-destroy-edges.mjs`).
+The sockets oam's http server and http client hand out are stand-ins over a native
+connection, and their `resetAndDestroy()` resets that connection the same way (entries 38 and
+39, case 254).
+What differs is the window where libuv refuses the reset: after `end()` has handed its FIN to
+the socket and before its shutdown callback (`'finish'`) has run.
+
+- **After the refusal oam closes the socket; Node leaves it open.** Both emit `'error'`
+  (`reset EINVAL`, `syscall: 'reset'`) inside the call. Node then never emits `'close'`:
+  libuv returns before closing the handle, `_destroy` drops its reference anyway, and the
+  open TCP handle keeps the process alive for good (measured on v22.22.2, Windows: the
+  process does not exit). oam closes the connection the orderly way -- its FIN is already out
+  -- and emits `'close'` with `true`.
+- **The window opens and closes at different moments.** oam's end() hands the FIN to the
+  socket in the same turn when no write is still queued (#156), and emits `'finish'` a few
+  microtasks later; Node's `'finish'` waits for the next loop turn. So
+  `socket.end(); process.nextTick(() => socket.resetAndDestroy())` is refused with EINVAL on
+  Node and resets (RST after the FIN) on oam. Measured on Windows, where Node's writes complete
+  in the call and every `end()` on a connected socket opens the window at once, as oam's does
+  (`write(); end(); resetAndDestroy()` is EINVAL on both). On Linux and macOS Node defers the
+  shutdown behind a write that has not called back yet, where oam has sent the FIN once the
+  write was taken whole -- not measured there. An `end()` whose FIN is still queued behind a
+  write the peer is not draining is reset on both, the FIN never sent.
 
 ### `err.syscall` on `fs.opendir`
 

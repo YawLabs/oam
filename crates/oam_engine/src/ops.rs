@@ -122,6 +122,12 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
             "fetchBodyCancel",
             v8::Function::new(scope, op_fetch_body_cancel).unwrap(),
         ),
+        // `destroy()` / `resetAndDestroy()` on the req.socket of an
+        // http.request the transport carries: close its connection.
+        (
+            "fetchConnClose",
+            v8::Function::new(scope, op_fetch_conn_close).unwrap(),
+        ),
         // `agent.destroy()` for an agent that runs on the shared fetch
         // transport: drop every connection it has pooled (divergence 38).
         (
@@ -551,6 +557,20 @@ fn op_http_transport_destroy(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     core_runtime!(scope).http_client().destroy_pool();
+}
+
+/// `__oam.fetchConnClose(connection, reset)`, synchronous: close the
+/// transport connection a response named as `socket.connection` -- with a
+/// reset (SO_LINGER 0) when `reset` -- whether it is carrying a response or
+/// idle in the pool. One already gone is left alone.
+fn op_fetch_conn_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let connection = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let reset = args.get(1).is_true();
+    oam_core::http_client::close_connection(connection, reset);
 }
 
 fn op_fetch_body_read(

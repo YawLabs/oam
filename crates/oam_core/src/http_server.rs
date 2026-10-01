@@ -582,6 +582,14 @@ impl HttpState {
         }
     }
 
+    /// `socket.resetAndDestroy()` on a server connection: closed with a
+    /// reset, whatever it was doing ([`CloseReason::Reset`]).
+    pub fn reset_conn(&self, conn_id: u64) {
+        if let Some(watch) = self.conn(conn_id) {
+            watch.close(CloseReason::Reset);
+        }
+    }
+
     /// Sync (isolate-thread) helpers consumed by the engine natives.
     /// Take the fully-collected body. Returns None for a request whose body
     /// is being streamed (no such request yet -- see slice 2), so callers
@@ -1154,7 +1162,12 @@ async fn serve_http1<S, Svc>(
     takeover: Option<oneshot::Receiver<Takeover>>,
 ) -> Option<(S, Bytes, Takeover)>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead
+        + tokio::io::AsyncWrite
+        + crate::http_conn::AbortiveClose
+        + Unpin
+        + Send
+        + 'static,
     Svc: hyper::service::Service<
             hyper::Request<hyper::body::Incoming>,
             Response = hyper::Response<BoxedBody>,
@@ -1402,7 +1415,7 @@ pub async fn http_serve(
                             // went away under it: the connection closes
                             // without a request ever reaching the handler,
                             // and without an answer on the wire.
-                            drop(stream);
+                            crate::http_conn::close_unserved(stream, &watch);
                             if announcement.announced {
                                 let _ = conn_queue
                                     .send(ServerEvent::ConnectionClosed { conn_id })
@@ -2242,7 +2255,7 @@ pub async fn https_serve(
                             // run and no
                             // 'tlsClientError' is raised -- node's client
                             // sees the connection close mid-handshake.
-                            drop(stream);
+                            crate::http_conn::close_unserved(stream, &watch);
                             None
                         } else {
                             // A handshake under way when close() is called
@@ -2374,7 +2387,8 @@ async fn serve_https_connection(
     // request ever reaching the handler,
     // and without an answer on the wire.
     if !announcement.serve {
-        drop(tls_stream);
+        // The plain socket 'connection' handed out may have been reset.
+        crate::http_conn::close_unserved(tls_stream, &watch);
         return announcement.announced;
     }
     // node's http timeouts start where its http side takes the connection:
