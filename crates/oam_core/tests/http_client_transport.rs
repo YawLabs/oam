@@ -72,7 +72,9 @@ async fn refused_ip_literal_is_node_s_connect_error() {
                 port: got_port,
                 hostname,
                 path,
+                dest,
             } => {
+                assert_eq!(dest, None);
                 assert_eq!(code, "ECONNREFUSED");
                 assert_eq!(message, format!("connect ECONNREFUSED 127.0.0.1:{port}"));
                 assert_eq!(syscall.as_deref(), Some("connect"));

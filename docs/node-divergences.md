@@ -2167,22 +2167,24 @@ _(probed)_ Node v22.22.2 vs oam on Windows: lookup and createConnection guards o
 a node-hosted `createSecureServer` for `ca`, `servername`, a refusing lookup, an untrusted
 certificate and `rejectUnauthorized: false`, line for line identical.
 
-### `err.syscall` on `fs.realpath` and `fs.opendir`
+### `err.syscall` on `fs.opendir`
 
-Node's own sync and async forms disagree on these two, and oam is
-self-consistent where node is not:
+Node's own sync and async forms disagree here, and oam is self-consistent where
+node is not:
 
 | call | node | oam |
 |---|---|---|
-| `realpathSync(missing)` | `syscall: "lstat"` (its path-walk uses lstat) | `syscall: "realpath"` |
-| `realpath(missing)` | `syscall: "realpath"` | `syscall: "realpath"` |
 | `opendirSync(missing)` | `syscall: "opendir"`, no `path` | `syscall: "scandir"`, `path` set |
 | `opendir(missing)` | `syscall: "opendir"`, `path` set | `syscall: "scandir"`, `path` set |
 
-Everything else — `code`, `errno`, the message — matches. These are the only
-two fs calls excluded from the async/sync error-parity case
-(`conformance/cases/72-*`), because asserting node's behaviour there would mean
-encoding its inconsistency into a case whose purpose is the rule.
+Everything else — `code`, `errno`, the message — matches. `fs.realpath` used to
+be listed here too; since #167 oam reports what node does for every form:
+`realpathSync` and callback `realpath` fail with the `lstat` of the first
+missing component (node's JS path walk), and `realpathSync.native`,
+`realpath.native` and `fs/promises.realpath` with `realpath` and the whole path
+(`conformance/cases/240-*`). Both are excluded from the async/sync error-parity
+case (`conformance/cases/72-*`), because asserting node's behaviour there would
+mean encoding its inconsistency into a case whose purpose is the rule.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 

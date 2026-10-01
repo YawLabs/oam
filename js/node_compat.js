@@ -383,10 +383,11 @@
       EPERM: "operation not permitted",
     };
     const err = new Error(`${code}: ${TEXT[code] ?? code}, ${syscall} '${path}'`);
+    // errno first: node's own order is errno, code, syscall, path.
+    if (ERRNO[code] !== undefined) err.errno = ERRNO[code];
     err.code = code;
     err.syscall = syscall;
     err.path = String(path);
-    if (ERRNO[code] !== undefined) err.errno = ERRNO[code];
     return err;
   }
 
@@ -408,21 +409,63 @@
   /// Buffer stays explicit even though `String(buf)` happened to produce the
   /// same bytes -- that worked only because Buffer's toString defaults to utf8,
   /// which is a coincidence of the class, not a decision this code made.
-  function toPath(path) {
-    if (typeof path === "string") return path;
+  ///
+  /// Anything else is node's `getValidatedPath` refusal (#167): a TypeError
+  /// ERR_INVALID_ARG_TYPE naming the argument (`name`, node's name for it --
+  /// "path", "oldPath", "src", ...), and ERR_INVALID_ARG_VALUE for a path
+  /// holding a NUL byte. `String(path)` used to be the fallback, so
+  /// `fs.statSync(42n)` stat'ed a file named `42`, `fsp.readFile({})` one named
+  /// `[object Object]`, and `fs.writeFileSync(fd, data)` CREATED a file named
+  /// after the descriptor -- a real file a typo could clobber.
+  function toPath(path, name = "path") {
+    if (typeof path === "string") {
+      if (path.includes("\u0000")) throw nulInPath(name, path);
+      return path;
+    }
     // Duck-typed, not `instanceof URL`: a URL minted in another realm (a vm
     // context, a worker message) fails the instanceof and would fall through
-    // to String(). Node checks the protocol the same way.
-    if (path && typeof path === "object" && typeof path.protocol === "string" && typeof path.href === "string") {
+    // to String(). Node checks the protocol the same way, and tells a WHATWG
+    // URL from a legacy url.parse() result by the latter's `auth` / `path`
+    // (lib/internal/url.js isURL).
+    if (
+      path && typeof path === "object" && typeof path.protocol === "string" &&
+      typeof path.href === "string" && path.auth === undefined && path.path === undefined
+    ) {
       if (path.protocol !== "file:") {
         const err = new TypeError("The URL must be of scheme file");
         err.code = "ERR_INVALID_URL_SCHEME";
         throw err;
       }
-      return registry.get("url").fileURLToPath(path);
+      const fromUrl = registry.get("url").fileURLToPath(path);
+      if (fromUrl.includes("\u0000")) throw nulInPath(name, fromUrl);
+      return fromUrl;
     }
-    if (path instanceof Uint8Array) return bufferToUtf8Path(path);
-    return String(path);
+    if (path instanceof Uint8Array) {
+      if (path.includes(0)) throw nulInPath(name, path);
+      return bufferToUtf8Path(path);
+    }
+    throw codes.ERR_INVALID_ARG_TYPE(name, ["string", "Buffer", "URL"], path);
+  }
+
+  function nulInPath(name, path) {
+    return codes.ERR_INVALID_ARG_VALUE(
+      name, path, "must be a string, Uint8Array, or URL without null bytes",
+    );
+  }
+
+  /// The path node names in an error oam builds itself, for a path as the
+  /// caller passed it: on Windows node's binding reports the RESOLVED path
+  /// (`ToNamespacedPath`), so `rmdirSync("file.txt")` fails `rmdir
+  /// 'C:\cwd\file.txt'`. The native ops do the same (oam_core::fs_error_path);
+  /// this is its twin for the errors made in JS. An empty path, and one that
+  /// resolves to two characters or fewer, stay as passed.
+  function fsErrorPath(path) {
+    if (globalThis.__oam.node.platform !== "win32" || path === "") return path;
+    const resolved = registry.get("path").win32.resolve(path);
+    if (resolved.length <= 2) return path;
+    if (resolved.startsWith("\\\\?\\UNC\\")) return "\\\\" + resolved.slice(8);
+    if (resolved.startsWith("\\\\?\\")) return resolved.slice(4);
+    return resolved;
   }
 
   /// Buffer/Uint8Array path -> string. Split out so `toPath` reads as a
@@ -462,6 +505,64 @@
   /// callback layer builds on these so a bad path still throws synchronously,
   /// as node does; only the exported module object is wrapped.
   let rawFsPromises = null;
+
+  /// Every FileHandle `fs/promises.open` hands out, so `readFile` /
+  /// `writeFile` / `appendFile` can tell one from a path (node checks
+  /// `instanceof FileHandle`; oam's handles are plain objects).
+  const fileHandles = new WeakSet();
+
+  /// The error of a native that probed with lstat on rmdir's behalf, as node
+  /// reports it: rmdir is the syscall, in `syscall` AND in the message
+  /// ("ENOENT: no such file or directory, rmdir 'p'"). Relabelling `syscall`
+  /// alone left the message saying lstat.
+  function asRmdirError(e) {
+    if (e && e.syscall === "lstat") {
+      e.syscall = "rmdir";
+      const marker = ", lstat '";
+      const at = typeof e.message === "string" ? e.message.indexOf(marker) : -1;
+      if (at !== -1) e.message = e.message.slice(0, at) + ", rmdir '" + e.message.slice(at + marker.length);
+    }
+    return e;
+  }
+
+  /// node's `fs.realpathSync` / `fs.realpath` (lib/fs.js) are JS: they resolve
+  /// the path and lstat it one component at a time from the root, following
+  /// each symlink they meet, so a failure names `lstat` and the component that
+  /// failed -- `realpathSync("a/missing/x")` fails `lstat '<cwd>/a/missing'`.
+  /// oam asks the OS for the whole path at once (`realpath`, which is what
+  /// node's `.native` forms and `fs/promises.realpath` report). When that
+  /// fails, this walk finds the error node's would have: the first component
+  /// whose lstat fails. If every component stats, the native error stands.
+  /// The walk yields `[op, path]` for the caller to run -- "lstat", "stat" or
+  /// "readlink", sync or async -- so one walk serves both forms.
+  function* realpathWalk(path) {
+    const pathMod = registry.get("path");
+    let full = pathMod.resolve(path);
+    let hops = 0;
+    for (;;) {
+      const root = pathMod.parse(full).root;
+      const parts = full.slice(root.length).split(pathMod.sep).filter(Boolean);
+      // On Windows node checks the root exists first.
+      if (globalThis.__oam.node.platform === "win32") yield ["lstat", root];
+      let current = root;
+      let relinked = false;
+      for (let i = 0; i < parts.length; i++) {
+        current = current === root ? root + parts[i] : current + pathMod.sep + parts[i];
+        const stat = yield ["lstat", current];
+        if (stat.kind === "symlink") {
+          // node stats the link (so a dangling one fails `stat`), reads it,
+          // and starts over from the resolved path.
+          if (++hops > 40) return;
+          yield ["stat", current];
+          const target = yield ["readlink", current];
+          full = pathMod.resolve(pathMod.dirname(current), target, ...parts.slice(i + 1));
+          relinked = true;
+          break;
+        }
+      }
+      if (!relinked) return;
+    }
+  }
 
   /// Captured when node_compat.js is evaluated, so a script that replaces
   /// Promise.prototype.then or Error.captureStackTrace cannot redirect how
@@ -10196,50 +10297,79 @@
     // node, and the opposite of what this branch's own e2e docstring claims.
     // So the raw object is stashed for `registry.factories.fs` and only the
     // exported copy is wrapped.
+    // The async methods take their path through `withPath`, which validates
+    // it BEFORE the first await: the callback forms built on these must throw
+    // a bad path synchronously, as node's do, and an async function turned
+    // that throw into a callback error. (The exported module's wrapper turns
+    // it back into a rejection.)
+    const withPath = (fn) => (path, ...rest) => fn(toPath(path), ...rest);
+    // fs/promises.cp over two validated paths.
+    async function cpRecursive(srcStr, destStr, options) {
+      var opts = options || {};
+      var raw;
+      try { raw = await natives.fsStat(srcStr, false); } catch (e) { throw e; }
+      if (raw.kind === "dir") {
+        if (!opts.recursive) throw makeNodeError("ERR_FS_CP_DIR_TO_NON_DIR", "cp: -r not specified; omitting directory '" + srcStr + "'");
+        try { await natives.fsMkdir(destStr, true); } catch (e) {}
+        var entries = await natives.fsReaddir(srcStr);
+        for (var i = 0; i < entries.length; i++) {
+          var sep = srcStr.endsWith("/") || srcStr.endsWith("\\") ? "" : "/";
+          await cpRecursive(srcStr + sep + entries[i].name, destStr + sep + entries[i].name, opts);
+        }
+      } else {
+        await natives.fsCopyFile(srcStr, destStr);
+      }
+    }
+    const readFileAt = async (file, options) => {
+      const bytes = await natives.fsReadFile(file);
+      return decodeRead(bytes, readOptions(options).encoding ?? null);
+    };
     rawFsPromises = {
-      readFile: async (path, options) => {
-        const bytes = await natives.fsReadFile(toPath(path));
-        return decodeRead(bytes, readOptions(options).encoding ?? null);
-      },
+      // A FileHandle reads / writes through itself, as node's do.
+      readFile: (path, options) =>
+        fileHandles.has(path) ? path.readFile(options) : readFileAt(toPath(path), options),
       writeFile: (path, data, options) =>
-        natives.fsWriteFile(toPath(path), encodeWrite(data, options), false),
+        fileHandles.has(path)
+          ? path.writeFile(data, options)
+          : natives.fsWriteFile(toPath(path), encodeWrite(data, options), false),
       appendFile: (path, data, options) =>
-        natives.fsWriteFile(toPath(path), encodeWrite(data, options), true),
-      stat: async (path) => wrapStat(await natives.fsStat(toPath(path), false)),
-      lstat: async (path) => wrapStat(await natives.fsStat(toPath(path), true)),
-      statfs: async (path, options) => wrapStatFs(await natives.fsStatfs(toPath(path)), options),
-      readdir: async (path, options) => {
+        fileHandles.has(path)
+          ? path.appendFile(data, options)
+          : natives.fsWriteFile(toPath(path), encodeWrite(data, options), true),
+      stat: withPath(async (file) => wrapStat(await natives.fsStat(file, false))),
+      lstat: withPath(async (file) => wrapStat(await natives.fsStat(file, true))),
+      statfs: withPath(async (file, options) => wrapStatFs(await natives.fsStatfs(file), options)),
+      readdir: withPath(async (file, options) => {
         const { withFileTypes } = readOptions(options);
-        const entries = await natives.fsReaddir(toPath(path));
-        return wrapDirents(toPath(path), entries, withFileTypes === true);
-      },
-      mkdir: async (path, options) => {
-        await natives.fsMkdir(toPath(path), readOptions(options).recursive === true);
-      },
-      rm: async (path, options = {}) => {
-        await natives.fsRm(toPath(path), options.recursive === true, options.force === true);
-      },
-      rmdir: async (path) => {
+        const entries = await natives.fsReaddir(file);
+        return wrapDirents(file, entries, withFileTypes === true);
+      }),
+      mkdir: withPath(async (file, options) => {
+        await natives.fsMkdir(file, readOptions(options).recursive === true);
+      }),
+      rm: withPath(async (file, options = {}) => {
+        await natives.fsRm(file, options.recursive === true, options.force === true);
+      }),
+      rmdir: withPath(async (dir) => {
         // Node never deletes a FILE through rmdir (code-probing callers
         // depend on the throw); kind-check first. The probe is an internal
         // detail -- node reports `rmdir` as the failing syscall, so relabel
         // rather than leaking `lstat` (same as the sync twin).
         let raw;
         try {
-          raw = await natives.fsStat(toPath(path), true);
+          raw = await natives.fsStat(dir, true);
         } catch (e) {
-          if (e && e.syscall === "lstat") e.syscall = "rmdir";
-          throw e;
+          throw asRmdirError(e);
         }
         if (raw.kind !== "dir") {
           // As in the sync twin: node's full system-error shape.
-          throw makeSystemError(isWin ? "ENOENT" : "ENOTDIR", "rmdir", path);
+          throw makeSystemError(isWin ? "ENOENT" : "ENOTDIR", "rmdir", fsErrorPath(dir));
         }
-        await natives.fsRm(toPath(path), false, false);
-      },
+        await natives.fsRm(dir, false, false);
+      }),
       unlink: (path) => natives.fsUnlink(toPath(path)),
-      rename: (from, to) => natives.fsRename(toPath(from), toPath(to)),
-      copyFile: (from, to) => natives.fsCopyFile(toPath(from), toPath(to)),
+      rename: (from, to) => natives.fsRename(toPath(from, "oldPath"), toPath(to, "newPath")),
+      copyFile: (from, to) => natives.fsCopyFile(toPath(from, "src"), toPath(to, "dest")),
       // node v22's fs.promises.glob returns an AsyncIterable, not a Promise.
       // Wrap the materialized array so Array.fromAsync() works on both sides.
       glob: (pattern, options) => globAsyncIterable(globSyncRaw(pattern, options, natives)),
@@ -10249,10 +10379,11 @@
       _globAsPromise: (pattern, options) => Promise.resolve().then(() => globSyncRaw(pattern, options, natives)),
       access: (path, mode) => natives.fsAccess(toPath(path), mode ?? 0),
       realpath: (path) => natives.fsRealpath(toPath(path)),
-      mkdtemp: (prefix) => natives.fsMkdtemp(toPath(prefix)),
-      symlink: (target, path) => natives.fsSymlink(toPath(target), toPath(path)),
+      mkdtemp: (prefix) => natives.fsMkdtemp(toPath(prefix, "prefix")),
+      symlink: (target, path) => natives.fsSymlink(toPath(target, "target"), toPath(path)),
       readlink: (path) => natives.fsReadlink(toPath(path)),
-      link: (existing, newPath) => natives.fsLink(toPath(existing), toPath(newPath)),
+      link: (existing, newPath) =>
+        natives.fsLink(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
       chmod: (path, mode) => natives.fsChmod(toPath(path), mode),
       truncate: (path, len) => natives.fsTruncate(toPath(path), len ?? 0),
       chown: (path, uid, gid) => natives.fsChown(toPath(path), uid, gid),
@@ -10273,31 +10404,14 @@
         err.code = "ERR_METHOD_NOT_IMPLEMENTED";
         return Promise.reject(err);
       },
-      opendir: async function (path) {
-        var dirPath = toPath(path);
+      opendir: withPath(async function (dirPath) {
         return new Dir(dirPath, await natives.fsReaddir(dirPath));
-      },
-      cp: async function cpRecursive(src, dest, options) {
-        var srcStr = toPath(src);
-        var destStr = toPath(dest);
-        var opts = options || {};
-        var raw;
-        try { raw = await natives.fsStat(srcStr, false); } catch (e) { throw e; }
-        if (raw.kind === "dir") {
-          if (!opts.recursive) throw makeNodeError("ERR_FS_CP_DIR_TO_NON_DIR", "cp: -r not specified; omitting directory '" + srcStr + "'");
-          try { await natives.fsMkdir(destStr, true); } catch (e) {}
-          var entries = await natives.fsReaddir(srcStr);
-          for (var i = 0; i < entries.length; i++) {
-            var sep = srcStr.endsWith("/") || srcStr.endsWith("\\") ? "" : "/";
-            await cpRecursive(srcStr + sep + entries[i].name, destStr + sep + entries[i].name, opts);
-          }
-        } else {
-          await natives.fsCopyFile(srcStr, destStr);
-        }
-      },
-      open: async function (path, flags, mode) {
+      }),
+      cp: (src, dest, options) => cpRecursive(toPath(src, "src"), toPath(dest, "dest"), options),
+      open: withPath(async function (file, flags, mode) {
         flags = flags || "r";
-        var info = await natives.fsOpen(toPath(path), String(flags));
+        var info = await natives.fsOpen(file, String(flags));
+
         var h = info.handle;
         var closed = false;
         // readableWebStream() locks the handle to its stream FOR LIFE -- see
@@ -10606,8 +10720,9 @@
             await fh.close();
           },
         };
+        fileHandles.add(fh);
         return fh;
-      },
+      }),
       constants: {
         F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
         O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,
@@ -10672,6 +10787,142 @@
           (value) => { fsReqEnd(token); queueMicrotask(() => cb(null, value)); },
           (err) => { fsReqEnd(token); queueMicrotask(() => cb(err)); },
         );
+      };
+    }
+
+    // node's isInt32: what readFile / writeFile / appendFile take as a file
+    // descriptor rather than a path.
+    function isInt32(value) {
+      return value === (value | 0);
+    }
+
+    // node's realpath / realpathSync argument: a file: URL becomes its path,
+    // anything else is stringified (`p += ''`), and a NUL byte is refused.
+    function realpathArg(path) {
+      const isUrl = path && typeof path === "object" && typeof path.href === "string" &&
+        path.auth === undefined && path.path === undefined;
+      return toPath(typeof path === "string" || isUrl ? path : path + "");
+    }
+
+    function realpathWalkErrorSync(path, original) {
+      const walk = realpathWalk(path);
+      let step = walk.next();
+      try {
+        while (!step.done) {
+          const [op, at] = step.value;
+          step = walk.next(op === "readlink" ? natives.fsReadlinkSync(at) : natives.fsStatSync(at, op === "lstat"));
+        }
+      } catch (e) {
+        return e;
+      }
+      return original;
+    }
+
+    async function realpathWalking(path) {
+      try {
+        return await natives.fsRealpath(path);
+      } catch (original) {
+        // A failing lstat / readlink rejects with its own error.
+        const walk = realpathWalk(path);
+        let step = walk.next();
+        while (!step.done) {
+          const [op, at] = step.value;
+          step = walk.next(op === "readlink" ? await natives.fsReadlink(at) : await natives.fsStat(at, op === "lstat"));
+        }
+        throw original;
+      }
+    }
+
+    // DEP0081, once per process as node warns it.
+    let truncateFdWarned = false;
+    function warnTruncateFd() {
+      if (truncateFdWarned) return;
+      truncateFdWarned = true;
+      process.emitWarning(
+        "Using fs.truncate with a file descriptor is deprecated. Please use fs.ftruncate with a file descriptor instead.",
+        "DeprecationWarning",
+        "DEP0081",
+      );
+    }
+
+    // node's getValidatedFd for the int32 a readFile-family call took as a
+    // descriptor: a negative one is out of range.
+    function checkFd(fd) {
+      if (fd < 0) throw codes.ERR_OUT_OF_RANGE("fd", ">= 0 && <= 2147483647", fd);
+    }
+
+    // readFileSync(fd): everything from the descriptor's current position.
+    // fstat first, as node's does, so a bad descriptor fails `fstat`.
+    function readFdSync(fd) {
+      checkFd(fd);
+      fs.fstatSync(fd);
+      const chunks = [];
+      let total = 0;
+      for (;;) {
+        const chunk = globalThis.Buffer.allocUnsafe(65536);
+        const n = fs.readSync(fd, chunk, 0, chunk.length, null);
+        if (n === 0) break;
+        chunks.push(n === chunk.length ? chunk : chunk.subarray(0, n));
+        total += n;
+      }
+      return globalThis.Buffer.concat(chunks, total);
+    }
+
+    // writeFileSync(fd) / appendFileSync(fd): all of `bytes` at the current
+    // position (node does not seek a descriptor it was handed).
+    function writeFdSync(fd, bytes) {
+      checkFd(fd);
+      let off = 0;
+      while (off < bytes.length) {
+        off += fs.writeSync(fd, bytes, off, bytes.length - off, null);
+      }
+    }
+
+    function readFdAsync(fd, cb) {
+      checkFd(fd);
+      fs.fstat(fd, (statErr) => {
+        if (statErr) return cb(statErr);
+        const chunks = [];
+        let total = 0;
+        const next = () => {
+          const chunk = globalThis.Buffer.allocUnsafe(65536);
+          fs.read(fd, chunk, 0, chunk.length, null, (err, n) => {
+            if (err) return cb(err);
+            if (n === 0) return cb(null, globalThis.Buffer.concat(chunks, total));
+            chunks.push(n === chunk.length ? chunk : chunk.subarray(0, n));
+            total += n;
+            next();
+          });
+        };
+        next();
+      });
+    }
+
+    // writeFile / appendFile, callback form: a descriptor is written in place
+    // from its current position, a path goes through fs/promises.
+    function fdOrPathWrite(promiseFn) {
+      return function (path, data, options, cb) {
+        if (typeof options === "function") { cb = options; options = undefined; }
+        if (!isInt32(path)) return callbackify1(promiseFn)(path, data, options, cb);
+        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+        checkFd(path);
+        let bytes;
+        try {
+          bytes = encodeWrite(data, options);
+        } catch (e) {
+          queueMicrotask(() => cb(e));
+          return;
+        }
+        let off = 0;
+        const next = () => {
+          if (off >= bytes.length) return cb(null);
+          fs.write(path, bytes, off, bytes.length - off, null, (err, n) => {
+            if (err) return cb(err);
+            off += n;
+            next();
+          });
+        };
+        next();
       };
     }
 
@@ -10823,8 +11074,11 @@
       F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
       Dir,
 
+      // An int32 `path` is a file descriptor (node's isInt32 test), read or
+      // written from its current position; anything else must be a path.
       readFileSync: (path, options) => {
         const enc = readOptions(options).encoding;
+        if (isInt32(path)) return decodeRead(readFdSync(path), enc ?? null);
         if (enc === "utf8" || enc === "utf-8") {
           return natives.fsReadFileUtf8Sync(toPath(path));
         }
@@ -10832,12 +11086,23 @@
         return decodeRead(bytes, enc ?? null);
       },
       writeFileSync: (path, data, options) => {
+        if (isInt32(path)) return void writeFdSync(path, encodeWrite(data, options));
         natives.fsWriteFileSync(toPath(path), encodeWrite(data, options), false);
       },
       appendFileSync: (path, data, options) => {
+        if (isInt32(path)) return void writeFdSync(path, encodeWrite(data, options));
         natives.fsWriteFileSync(toPath(path), encodeWrite(data, options), true);
       },
-      existsSync: (path) => natives.fsExistsSync(toPath(path)),
+      // node answers false for a path it cannot even validate.
+      existsSync: (path) => {
+        let file;
+        try {
+          file = toPath(path);
+        } catch {
+          return false;
+        }
+        return natives.fsExistsSync(file);
+      },
       statSync: (path) => wrapStat(natives.fsStatSync(toPath(path), false)),
       lstatSync: (path) => wrapStat(natives.fsStatSync(toPath(path), true)),
       statfsSync: (path, options) => wrapStatFs(natives.fsStatfsSync(toPath(path)), options),
@@ -10860,12 +11125,12 @@
         // The kind probe is an implementation detail: node reports `rmdir` as
         // the failing syscall, so an ENOENT from this internal lstat must not
         // surface as `syscall: "lstat"`.
+        const dir = toPath(path);
         let raw;
         try {
-          raw = natives.fsStatSync(toPath(path), true);
+          raw = natives.fsStatSync(dir, true);
         } catch (e) {
-          if (e && e.syscall === "lstat") e.syscall = "rmdir";
-          throw e;
+          throw asRmdirError(e);
         }
         if (raw.kind !== "dir") {
           // Full system-error shape, not just a code: node sets syscall/path/
@@ -10873,22 +11138,40 @@
           throw makeSystemError(
             natives.platform === "win32" ? "ENOENT" : "ENOTDIR",
             "rmdir",
-            path,
+            fsErrorPath(dir),
           );
         }
-        natives.fsRmSync(toPath(path), false, false);
+        natives.fsRmSync(dir, false, false);
       },
       unlinkSync: (path) => natives.fsUnlinkSync(toPath(path)),
-      renameSync: (from, to) => natives.fsRenameSync(toPath(from), toPath(to)),
-      copyFileSync: (from, to) => natives.fsCopyFileSync(toPath(from), toPath(to)),
+      renameSync: (from, to) =>
+        natives.fsRenameSync(toPath(from, "oldPath"), toPath(to, "newPath")),
+      copyFileSync: (from, to) => natives.fsCopyFileSync(toPath(from, "src"), toPath(to, "dest")),
       accessSync: (path, mode) => natives.fsAccessSync(toPath(path), mode ?? 0),
-      realpathSync: (path) => natives.fsRealpathSync(toPath(path)),
-      mkdtempSync: (prefix) => natives.fsMkdtempSync(toPath(prefix)),
-      symlinkSync: (target, path) => natives.fsSymlinkSync(toPath(target), toPath(path)),
+      // node's realpathSync stringifies rather than type-checks (`p += ''`),
+      // and on failure reports what its component walk hit (realpathWalk).
+      realpathSync: (path) => {
+        const file = realpathArg(path);
+        try {
+          return natives.fsRealpathSync(file);
+        } catch (e) {
+          throw realpathWalkErrorSync(file, e);
+        }
+      },
+      mkdtempSync: (prefix) => natives.fsMkdtempSync(toPath(prefix, "prefix")),
+      symlinkSync: (target, path) => natives.fsSymlinkSync(toPath(target, "target"), toPath(path)),
       readlinkSync: (path) => natives.fsReadlinkSync(toPath(path)),
-      linkSync: (existing, newPath) => natives.fsLinkSync(toPath(existing), toPath(newPath)),
+      linkSync: (existing, newPath) =>
+        natives.fsLinkSync(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
       chmodSync: (path, mode) => natives.fsChmodSync(toPath(path), mode),
-      truncateSync: (path, len) => natives.fsTruncateSync(toPath(path), len ?? 0),
+      // A descriptor is truncated through ftruncate, with node's DEP0081.
+      truncateSync: (path, len) => {
+        if (typeof path === "number") {
+          warnTruncateFd();
+          return void natives.fsFtruncateSync(path, len ?? 0);
+        }
+        natives.fsTruncateSync(toPath(path), len ?? 0);
+      },
       // Classic synchronous fd ops. The native handle (a number) IS the fd.
       // graceful-fs / playwright probe locks via openSync(path,"r+") and rely
       // on err.code === "ENOENT" to tell missing from locked.
@@ -10943,8 +11226,8 @@
         return new Dir(dirPath, natives.fsReaddirSync(dirPath));
       },
       cpSync: function cpSyncRecursive(src, dest, options) {
-        var srcStr = toPath(src);
-        var destStr = toPath(dest);
+        var srcStr = toPath(src, "src");
+        var destStr = toPath(dest, "dest");
         var opts = options || {};
         var raw;
         try { raw = natives.fsStatSync(srcStr, false); } catch (e) { throw e; }
@@ -10961,9 +11244,23 @@
         }
       },
 
-      readFile: callbackify1(promises.readFile),
-      writeFile: callbackify1(promises.writeFile),
-      appendFile: callbackify1(promises.appendFile),
+      readFile: function (path, options, cb) {
+        if (typeof options === "function") { cb = options; options = undefined; }
+        if (!isInt32(path)) return callbackify1(promises.readFile)(path, options, cb);
+        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+        readFdAsync(path, (err, bytes) => {
+          if (err) return cb(err);
+          let out;
+          try {
+            out = decodeRead(bytes, readOptions(options).encoding ?? null);
+          } catch (e) {
+            return cb(e);
+          }
+          cb(null, out);
+        });
+      },
+      writeFile: fdOrPathWrite(promises.writeFile),
+      appendFile: fdOrPathWrite(promises.appendFile),
       stat: callbackify1(promises.stat),
       lstat: callbackify1(promises.lstat),
       statfs: callbackify1(promises.statfs),
@@ -10976,18 +11273,32 @@
       rename: callbackify1(promises.rename),
       copyFile: callbackify1(promises.copyFile),
       access: callbackify1(promises.access),
-      realpath: callbackify1(promises.realpath),
+      // As realpathSync: stringified, and on failure the component walk's
+      // error. fs.realpath.native (below) is the plain native.
+      realpath: function (path, options, cb) {
+        if (typeof options === "function") { cb = options; options = undefined; }
+        const file = realpathArg(path);
+        callbackify1((p) => realpathWalking(p))(file, cb);
+      },
       mkdtemp: callbackify1(promises.mkdtemp),
       symlink: callbackify1(promises.symlink),
       readlink: callbackify1(promises.readlink),
       link: callbackify1(promises.link),
       chmod: callbackify1(promises.chmod),
-      truncate: callbackify1(promises.truncate),
+      truncate: function (path, len, cb) {
+        if (typeof len === "function") { cb = len; len = 0; }
+        if (typeof path === "number") {
+          warnTruncateFd();
+          return fs.ftruncate(path, len, cb);
+        }
+        return callbackify1(promises.truncate)(path, len, cb);
+      },
       opendir: callbackify1(promises.opendir),
       cp: callbackify1(promises.cp),
       exists: (path, cb) => {
-        // Deprecated single-arg callback shape, still in the wild.
-        cb(natives.fsExistsSync(toPath(path)));
+        // Deprecated single-arg callback shape, still in the wild. A path
+        // node cannot validate is simply false, as in existsSync.
+        cb(fs.existsSync(path));
       },
 
       // fd-based callback ops (chokidar etc. do promisify(fs.open)). The
@@ -11340,16 +11651,22 @@
     //     TypeError with code ERR_INVALID_ARG_VALUE, message "Unable to open
     //     file as blob", and `code` as its ONLY own property -- no errno, no
     //     syscall, no path.
-    fs.openAsBlob = async (p, options) => {
+    //   - the arguments are checked SYNCHRONOUSLY -- node's openAsBlob is a
+    //     plain function returning a promise, so a bad type or path throws
+    //     at the call.
+    fs.openAsBlob = (p, options) => {
       const type = (options && options.type) || "";
       if (typeof type !== "string") {
         throw nodeTypeError(
           `The "options.type" argument must be of type string. Received ${describeArg(type)}`,
         );
       }
+      return openAsBlobPath(toPath(p), type);
+    };
+    const openAsBlobPath = async (file, type) => {
       let bytes;
       try {
-        bytes = await natives.fsReadFile(toPath(p));
+        bytes = await natives.fsReadFile(file);
       } catch {
         // Deliberately swallowing the underlying error: node reports none of
         // it, and leaking ENOENT here would be a divergence, not a courtesy.
@@ -11373,7 +11690,10 @@
       return blob;
     };
 
-    fs.realpathSync.native = fs.realpathSync;
+    // The `.native` forms are the OS realpath: node type-checks their path
+    // (getValidatedPath) and reports `realpath` with the whole path.
+    fs.realpathSync.native = (path) => natives.fsRealpathSync(toPath(path));
+    fs.realpath.native = callbackify1(promises.realpath);
     fs.Dirent = Dirent;
     // The real class, so `stat instanceof fs.Stats` holds -- it was a bare
     // placeholder no stat object was ever an instance of.

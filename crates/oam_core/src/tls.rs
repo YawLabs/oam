@@ -3482,10 +3482,11 @@ RPKrIMIQSTEunGHpHfEW3H/9HD37A0UYrchbGA==\n\
                 hostname,
                 address,
                 port,
+                dest,
             } => {
                 assert_eq!(code, "DEPTH_ZERO_SELF_SIGNED_CERT");
                 assert_eq!(message, "self-signed certificate");
-                assert_eq!((syscall, path, errno), (None, None, None));
+                assert_eq!((syscall, path, errno, dest), (None, None, None, None));
                 assert_eq!((hostname, address, port), (None, None, None));
             }
             other => panic!("expected a node-coded rejection, got {other:?}"),

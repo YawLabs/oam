@@ -570,7 +570,21 @@ fn node_errno(code: &str, error: &std::io::Error) -> Option<i32> {
 /// with `path: ''` present. For an operation on a descriptor, which has no
 /// path at all, use `throw_fd_error` -- inferring "no path" from `path == ""`
 /// conflated the two and stripped the quotes off every empty-path error.
+///
+/// On Windows the path is the resolved one node reports (see
+/// `oam_core::fs_error_path`).
 fn throw_node_error(
+    scope: &mut v8::PinScope<'_, '_>,
+    syscall: &str,
+    path: &str,
+    error: &std::io::Error,
+) {
+    throw_node_error_as_passed(scope, syscall, &oam_core::fs_error_path(path), error);
+}
+
+/// `throw_node_error` naming `path` exactly as given: for mkdtemp, whose
+/// template node does not resolve.
+fn throw_node_error_as_passed(
     scope: &mut v8::PinScope<'_, '_>,
     syscall: &str,
     path: &str,
@@ -579,6 +593,28 @@ fn throw_node_error(
     let code = node_error_code(error);
     let message = node_error_message(code, syscall, path, error);
     throw_system_error(scope, code, &message, syscall, Some(path), error);
+}
+
+/// node's system error for a TWO-path operation (rename, copyfile, link,
+/// symlink): `'path' -> 'dest'` in the message, and a `dest` property after
+/// `path`. The caller passes both as they are to be shown.
+fn throw_node_error_dest(
+    scope: &mut v8::PinScope<'_, '_>,
+    syscall: &str,
+    path: &str,
+    dest: &str,
+    error: &std::io::Error,
+) {
+    let code = node_error_code(error);
+    let message = oam_core::node_error_message_dest(code, syscall, path, dest, error);
+    let exception = system_error(scope, code, &message, syscall, Some(path), error);
+    if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception)
+        && let (Some(key), Some(value)) =
+            (v8::String::new(scope, "dest"), v8::String::new(scope, dest))
+    {
+        obj.set(scope, key.into(), value.into());
+    }
+    scope.throw_exception(exception);
 }
 
 /// `throw_node_error` for an operation with call-site error rules: the
@@ -592,13 +628,14 @@ fn throw_fs_error(
     error: &std::io::Error,
 ) {
     let failure = oam_core::fs_error_at(site, syscall, path, error);
-    let message = oam_core::fs_error_message(failure, path, error);
+    let shown = oam_core::fs_error_path(path);
+    let message = oam_core::fs_error_message(failure, &shown, error);
     throw_system_error(
         scope,
         failure.code,
         &message,
         failure.syscall,
-        failure.has_path.then_some(path),
+        failure.has_path.then_some(&*shown),
         error,
     );
 }
@@ -5744,7 +5781,8 @@ fn op_fs_rename_sync(
         return;
     }
     if let Err(e) = std::fs::rename(&from, &to) {
-        throw_node_error(scope, "rename", &from, &e);
+        let (path, dest) = (oam_core::fs_error_path(&from), oam_core::fs_error_path(&to));
+        throw_node_error_dest(scope, "rename", &path, &dest, &e);
     }
 }
 
@@ -5764,7 +5802,8 @@ fn op_fs_copy_file_sync(
         return;
     }
     if let Err(e) = std::fs::copy(&from, &to) {
-        throw_node_error(scope, "copyfile", &from, &e);
+        let (path, dest) = (oam_core::fs_error_path(&from), oam_core::fs_error_path(&to));
+        throw_node_error_dest(scope, "copyfile", &path, &dest, &e);
     }
 }
 
@@ -5802,26 +5841,27 @@ fn op_fs_access_sync(
         Ok(()) => {}
         Err((code, message, errno)) => {
             // EPERM/EACCES with the path attached, same shape as
-            // throw_node_error but with the access-specific code.
+            // throw_node_error but with the access-specific code: errno
+            // FIRST, then code, syscall, path, as node orders them (errno
+            // was set last, after path).
             let message_v8 = v8::String::new(scope, &message)
                 .unwrap_or_else(|| v8::String::new(scope, &code).unwrap());
             let exception = v8::Exception::error(scope, message_v8);
             if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
-                let props: [(&str, &str); 3] =
-                    [("code", &code), ("syscall", "access"), ("path", &path)];
-                for (name, value) in props {
-                    let key = v8::String::new(scope, name).unwrap();
-                    if let Some(value) = v8::String::new(scope, value) {
-                        obj.set(scope, key.into(), value.into());
-                    }
-                }
-                // errno completes node's system-error shape; it was the one
-                // field this hand-rolled error left off.
                 if let Some(errno) = errno
                     && let Some(key) = v8::String::new(scope, "errno")
                 {
                     let value = v8::Integer::new(scope, errno);
                     obj.set(scope, key.into(), value.into());
+                }
+                let shown = oam_core::fs_error_path(&path);
+                let props: [(&str, &str); 3] =
+                    [("code", &code), ("syscall", "access"), ("path", &shown)];
+                for (name, value) in props {
+                    let key = v8::String::new(scope, name).unwrap();
+                    if let Some(value) = v8::String::new(scope, value) {
+                        obj.set(scope, key.into(), value.into());
+                    }
                 }
             }
             scope.throw_exception(exception);
@@ -6645,7 +6685,15 @@ fn op_fs_symlink_sync(
     #[cfg(not(windows))]
     let result = std::os::unix::fs::symlink(&target, &path);
     if let Err(e) = result {
-        throw_node_error(scope, "symlink", &path, &e);
+        // The target is stored as written, so node reports it so; the link's
+        // own path is resolved like any other.
+        throw_node_error_dest(
+            scope,
+            "symlink",
+            &target,
+            &oam_core::fs_error_path(&path),
+            &e,
+        );
     }
 }
 
@@ -6692,7 +6740,14 @@ fn op_fs_link_sync(
         return;
     }
     if let Err(e) = std::fs::hard_link(&existing, &new_path) {
-        throw_node_error(scope, "link", &new_path, &e);
+        let path = oam_core::fs_error_path(&existing);
+        throw_node_error_dest(
+            scope,
+            "link",
+            &path,
+            &oam_core::fs_error_path(&new_path),
+            &e,
+        );
     }
 }
 
@@ -6778,7 +6833,7 @@ fn op_fs_mkdtemp_sync(
                 rv.set(value.into());
             }
         }
-        Err(e) => throw_node_error(scope, "mkdtemp", &prefix, &e),
+        Err(e) => throw_node_error_as_passed(scope, "mkdtemp", &prefix, &e),
     }
 }
 

@@ -2045,6 +2045,7 @@
     err.code = fields.code;
     if (fields.syscall !== undefined) err.syscall = fields.syscall;
     if (fields.path !== undefined) err.path = fields.path;
+    if (fields.dest !== undefined) err.dest = fields.dest;
     if (fields.hostname !== undefined) err.hostname = fields.hostname;
     if (fields.address !== undefined) err.address = fields.address;
     if (fields.port) err.port = fields.port;

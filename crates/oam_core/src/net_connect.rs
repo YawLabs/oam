@@ -1516,11 +1516,12 @@ mod tests {
                 hostname,
                 address,
                 port,
+                dest,
             } => {
                 assert_eq!(code, "ECONNREFUSED");
                 assert_eq!(message, "connect ECONNREFUSED 127.0.0.1:8080");
                 assert_eq!(syscall.as_deref(), Some("connect"));
-                assert_eq!((path, hostname), (None, None));
+                assert_eq!((path, hostname, dest), (None, None, None));
                 assert_eq!(errno, Some(-4078));
                 assert_eq!((address.as_deref(), port), (Some("127.0.0.1"), Some(8080)));
             }

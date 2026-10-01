@@ -177,6 +177,11 @@ pub enum OpOutcome {
         address: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         port: Option<u16>,
+        /// The second path of a two-path fs call (rename, copyfile, link,
+        /// symlink): node names it in the message (`'a' -> 'b'`) and as
+        /// `err.dest`. A serde default, like the three above.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dest: Option<String>,
     },
     /// Every address of a multi-address connect failed: node's
     /// `NodeAggregateError` (lib/net.js `internalConnectMultiple`), one child
@@ -224,6 +229,7 @@ impl OpOutcome {
             hostname: None,
             address: None,
             port: None,
+            dest: None,
         }
     }
 
@@ -239,6 +245,7 @@ impl OpOutcome {
             hostname: err.hostname,
             address: err.address,
             port: err.port,
+            dest: None,
         }
     }
 
@@ -267,6 +274,30 @@ impl OpOutcome {
             hostname: None,
             address: None,
             port: None,
+            dest: None,
+        }
+    }
+
+    /// `node_failed_at` for a two-path call: `path` and `dest` as node reports
+    /// them (see `node_error_message_dest`).
+    pub fn node_failed_dest(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        syscall: &str,
+        path: &str,
+        dest: &str,
+        errno: Option<i32>,
+    ) -> Self {
+        OpOutcome::NodeFailed {
+            code: code.into(),
+            message: message.into(),
+            syscall: Some(syscall.to_string()),
+            path: Some(path.to_string()),
+            errno,
+            hostname: None,
+            address: None,
+            port: None,
+            dest: Some(dest.to_string()),
         }
     }
 }
@@ -2025,6 +2056,321 @@ pub fn node_error_message_fd(code: &str, syscall: &str, error: &std::io::Error) 
     format!("{code}: {reason}, {syscall}")
 }
 
+/// Node-style error message for a TWO-path operation (rename, copyfile,
+/// link, symlink): "ENOENT: no such file or directory, rename 'a' -> 'b'".
+/// The error carries the second path as `dest` too.
+pub fn node_error_message_dest(
+    code: &str,
+    syscall: &str,
+    path: &str,
+    dest: &str,
+    error: &std::io::Error,
+) -> String {
+    let reason = node_error_reason(code, error);
+    format!("{code}: {reason}, {syscall} '{path}' -> '{dest}'")
+}
+
+/// The path a filesystem error names, for a path as the caller passed it.
+///
+/// On Windows node's binding resolves every path before libuv sees it
+/// (`ToNamespacedPath`: `PathResolve`, then the `\\?\` long-path prefix),
+/// and the error reports that path with the prefix taken back off
+/// (`StringFromPath`): `fs.statSync("x")` fails with `stat 'C:\cwd\x'`,
+/// `mkdirSync("a/b")` with `mkdir 'C:\cwd\a\b'`. An empty path is left alone
+/// (`fs.openSync("")` fails `open ''`), and so is one that resolves to two
+/// characters or fewer, as `ToNamespacedPath` leaves those. Elsewhere the path
+/// is reported as passed.
+///
+/// Not for `mkdtemp`, whose template node passes to libuv unresolved, or a
+/// symlink's target, which is stored as written.
+pub fn fs_error_path(path: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        if path.is_empty() {
+            return std::borrow::Cow::Borrowed(path);
+        }
+        let cwd = std::env::current_dir()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let resolved = win32_resolve(path, &cwd, |device| {
+            std::env::var(format!("={device}")).ok()
+        });
+        if resolved.len() <= 2 {
+            return std::borrow::Cow::Borrowed(path);
+        }
+        let shown = if let Some(rest) = resolved.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else if let Some(rest) = resolved.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            resolved
+        };
+        std::borrow::Cow::Owned(shown)
+    }
+    #[cfg(not(windows))]
+    std::borrow::Cow::Borrowed(path)
+}
+
+/// node's `path.win32.resolve(path)` (lib/path.js; src/path.cc `PathResolve`
+/// is the same algorithm): `cwd` is `process.cwd()`, and `drive_cwd(device)`
+/// the per-drive current directory Windows keeps in the `=C:` environment
+/// variables, for a drive-relative path (`D:x`) on another drive.
+///
+/// Pure, so every rule is unit-tested on any host; only `fs_error_path` is
+/// Windows-only.
+pub fn win32_resolve(path: &str, cwd: &str, drive_cwd: impl Fn(&str) -> Option<String>) -> String {
+    let is_sep = |b: u8| b == b'/' || b == b'\\';
+    let mut resolved_device = String::new();
+    let mut resolved_tail = String::new();
+    let mut resolved_absolute = false;
+    // resolve's loop over one argument: the path, then (`i === -1`) the cwd --
+    // or, once a device is known, that drive's own current directory.
+    for step in 0..2 {
+        let candidate = if step == 0 {
+            path.to_string()
+        } else if resolved_device.is_empty() {
+            cwd.to_string()
+        } else {
+            let drive = drive_cwd(&resolved_device).unwrap_or_else(|| cwd.to_string());
+            // Not a directory on that drive: the drive's root instead.
+            let other_drive = drive
+                .get(..2)
+                .is_none_or(|head| !head.eq_ignore_ascii_case(&resolved_device));
+            if other_drive && drive.as_bytes().get(2) == Some(&b'\\') {
+                format!("{resolved_device}\\")
+            } else {
+                drive
+            }
+        };
+        if candidate.is_empty() {
+            continue;
+        }
+        let bytes = candidate.as_bytes();
+        let len = bytes.len();
+        let mut root_end = 0;
+        let mut device = String::new();
+        let mut is_absolute = false;
+        if len == 1 {
+            if is_sep(bytes[0]) {
+                root_end = 1;
+                is_absolute = true;
+            }
+        } else if is_sep(bytes[0]) {
+            // A separator first: absolute, and possibly a UNC root.
+            is_absolute = true;
+            if is_sep(bytes[1]) {
+                let mut j = 2;
+                let mut last = j;
+                while j < len && !is_sep(bytes[j]) {
+                    j += 1;
+                }
+                if j < len && j != last {
+                    let first_part = &candidate[last..j];
+                    last = j;
+                    while j < len && is_sep(bytes[j]) {
+                        j += 1;
+                    }
+                    if j < len && j != last {
+                        last = j;
+                        while j < len && !is_sep(bytes[j]) {
+                            j += 1;
+                        }
+                        if j == len || j != last {
+                            if first_part != "." && first_part != "?" {
+                                device = format!(r"\\{first_part}\{}", &candidate[last..j]);
+                                root_end = j;
+                            } else {
+                                // A device root (`\\.\PHYSICALDRIVE0`).
+                                device = format!(r"\\{first_part}");
+                                root_end = 4;
+                            }
+                        }
+                    }
+                }
+            } else {
+                root_end = 1;
+            }
+        } else if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            device = candidate[..2].to_string();
+            root_end = 2;
+            if len > 2 && is_sep(bytes[2]) {
+                is_absolute = true;
+                root_end = 3;
+            }
+        }
+        if !device.is_empty() {
+            if resolved_device.is_empty() {
+                resolved_device = device;
+            } else if !device.eq_ignore_ascii_case(&resolved_device) {
+                // A path on another device does not apply.
+                continue;
+            }
+        }
+        if resolved_absolute {
+            if !resolved_device.is_empty() {
+                break;
+            }
+        } else {
+            resolved_tail = format!(r"{}\{resolved_tail}", &candidate[root_end..]);
+            resolved_absolute = is_absolute;
+            if is_absolute && !resolved_device.is_empty() {
+                break;
+            }
+        }
+    }
+    let tail = normalize_win32_tail(&resolved_tail, !resolved_absolute);
+    if resolved_absolute {
+        format!(r"{resolved_device}\{tail}")
+    } else {
+        let joined = format!("{resolved_device}{tail}");
+        if joined.is_empty() {
+            ".".to_string()
+        } else {
+            joined
+        }
+    }
+}
+
+/// lib/path.js `normalizeString` with `\` as the separator: collapse `.` and
+/// empty segments, apply `..` (above the root only when `allow_above_root`).
+fn normalize_win32_tail(path: &str, allow_above_root: bool) -> String {
+    let is_sep = |b: u8| b == b'/' || b == b'\\';
+    let bytes = path.as_bytes();
+    let mut res = String::new();
+    let mut last_segment_length = 0usize;
+    let mut last_slash: isize = -1;
+    let mut dots: i32 = 0;
+    let mut code = 0u8;
+    // `res.length - 1 - res.lastIndexOf('\\')`, with lastIndexOf's -1.
+    let segment_length = |res: &str| {
+        (res.len() as isize - 1 - res.rfind('\\').map_or(-1, |at| at as isize)) as usize
+    };
+    for i in 0..=bytes.len() {
+        if i < bytes.len() {
+            code = bytes[i];
+        } else if is_sep(code) {
+            break;
+        } else {
+            code = b'/';
+        }
+        if is_sep(code) {
+            if last_slash == i as isize - 1 || dots == 1 {
+                // An empty or `.` segment.
+            } else if dots == 2 {
+                let ends_in_dotdot =
+                    res.len() >= 2 && last_segment_length == 2 && res.ends_with("..");
+                if !ends_in_dotdot {
+                    if res.len() > 2 {
+                        match res.rfind('\\') {
+                            None => {
+                                res.clear();
+                                last_segment_length = 0;
+                            }
+                            Some(at) => {
+                                res.truncate(at);
+                                last_segment_length = segment_length(&res);
+                            }
+                        }
+                        last_slash = i as isize;
+                        dots = 0;
+                        continue;
+                    } else if !res.is_empty() {
+                        res.clear();
+                        last_segment_length = 0;
+                        last_slash = i as isize;
+                        dots = 0;
+                        continue;
+                    }
+                }
+                if allow_above_root {
+                    res.push_str(if res.is_empty() { ".." } else { r"\.." });
+                    last_segment_length = 2;
+                }
+            } else {
+                if !res.is_empty() {
+                    res.push('\\');
+                }
+                res.push_str(&path[(last_slash + 1) as usize..i]);
+                last_segment_length = (i as isize - last_slash - 1) as usize;
+            }
+            last_slash = i as isize;
+            dots = 0;
+        } else if code == b'.' && dots != -1 {
+            dots += 1;
+        } else {
+            dots = -1;
+        }
+    }
+    res
+}
+
+#[cfg(test)]
+mod win32_resolve_tests {
+    use super::win32_resolve;
+
+    /// `path.win32.resolve(p)` on node v22.22.2 with `process.cwd()` returning
+    /// `C:\work\dir` (and no `=D:`-style drive directories).
+    const NODE: &[(&str, &str)] = &[
+        ("x", "C:\\work\\dir\\x"),
+        ("does-not-exist.txt", "C:\\work\\dir\\does-not-exist.txt"),
+        ("nope/sub", "C:\\work\\dir\\nope\\sub"),
+        ("nope\\a\\b\\", "C:\\work\\dir\\nope\\a\\b"),
+        (".", "C:\\work\\dir"),
+        ("..", "C:\\work"),
+        ("../..", "C:\\"),
+        ("../../../../x", "C:\\x"),
+        ("sub/../x", "C:\\work\\dir\\x"),
+        ("./a/./b/../c", "C:\\work\\dir\\a\\c"),
+        ("a//b\\\\c", "C:\\work\\dir\\a\\b\\c"),
+        ("C:\\abs\\path", "C:\\abs\\path"),
+        ("C:/abs/fwd", "C:\\abs\\fwd"),
+        ("c:\\Lower\\Case", "c:\\Lower\\Case"),
+        ("C:", "C:\\work\\dir"),
+        ("C:rel", "C:\\work\\dir\\rel"),
+        ("D:", "D:\\"),
+        ("D:rel\\x", "D:\\rel\\x"),
+        ("E:rel", "E:\\rel"),
+        ("\\rooted", "C:\\rooted"),
+        ("/rooted/fwd", "C:\\rooted\\fwd"),
+        ("\\", "C:\\"),
+        ("\\\\server\\share\\dir", "\\\\server\\share\\dir"),
+        ("\\\\server\\share", "\\\\server\\share\\"),
+        ("//server/share/x/../y", "\\\\server\\share\\y"),
+        ("\\\\.\\pipe\\name", "\\\\.\\pipe\\name"),
+        ("\\\\?\\C:\\long", "\\\\?\\C:\\long"),
+        ("C:\\a\\..\\..\\..", "C:\\"),
+        ("...", "C:\\work\\dir\\..."),
+        ("a/...", "C:\\work\\dir\\a\\..."),
+        ("a/../..", "C:\\work"),
+        ("C:\\x\\.", "C:\\x"),
+        ("C:\\x\\", "C:\\x"),
+    ];
+
+    #[test]
+    fn matches_node_path_win32_resolve() {
+        for (input, want) in NODE {
+            assert_eq!(
+                win32_resolve(input, r"C:\work\dir", |_| None),
+                *want,
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_drive_relative_path_uses_that_drives_directory() {
+        let drive = |device: &str| (device == "D:").then(|| r"D:\dcwd\sub".to_string());
+        assert_eq!(
+            win32_resolve("D:x", r"C:\work\dir", drive),
+            r"D:\dcwd\sub\x"
+        );
+        // A directory recorded for the drive that is on another drive is not
+        // used: the drive's root is.
+        let wrong = |_: &str| Some(r"C:\elsewhere".to_string());
+        assert_eq!(win32_resolve("D:x", r"C:\work\dir", wrong), r"D:\x");
+    }
+}
+
 /// Error code for an operation on an ALREADY-OPEN descriptor.
 ///
 /// A descriptor was opened successfully, so there is no path left to be denied:
@@ -2134,12 +2480,16 @@ pub fn fd_error_code(error: &std::io::Error) -> &'static str {
 /// from. Without it `fs.access`/`fs.promises.access` rejected with no `errno`
 /// at all (and the async form with no `syscall` or `path` either), where every
 /// sibling fs op carries all four.
+///
+/// The message names the path as `fs_error_path` reports it, and so must the
+/// caller's `path` property.
 pub fn check_access(path: &str, mode: i32) -> Result<(), (String, String, Option<i32>)> {
+    let shown = fs_error_path(path);
     let meta = std::fs::metadata(path).map_err(|e| {
         let code = node_error_code(&e);
         (
             code.to_string(),
-            node_error_message(code, "access", path, &e),
+            node_error_message(code, "access", &shown, &e),
             node_errno(code, &e),
         )
     })?;
@@ -2147,7 +2497,7 @@ pub fn check_access(path: &str, mode: i32) -> Result<(), (String, String, Option
         let code = if cfg!(windows) { "EPERM" } else { "EACCES" };
         return Err((
             code.to_string(),
-            format!("{code}: operation not permitted, access '{path}'"),
+            format!("{code}: operation not permitted, access '{shown}'"),
             // Synthesised (no io::Error behind it): the libuv numbers node
             // reports for these two.
             Some(if cfg!(windows) { -4048 } else { -13 }),
@@ -2756,13 +3106,35 @@ pub mod ops {
         OpOutcome::Done
     }
 
+    /// A failed path operation, naming the path as node does (on Windows the
+    /// resolved one, see `fs_error_path`).
     fn node_fail(error: std::io::Error, syscall: &str, path: &str) -> OpOutcome {
+        node_fail_as_passed(error, syscall, &super::fs_error_path(path))
+    }
+
+    /// `node_fail` naming `path` exactly as given: for mkdtemp, whose
+    /// template node does not resolve.
+    fn node_fail_as_passed(error: std::io::Error, syscall: &str, path: &str) -> OpOutcome {
         let code = super::node_error_code(&error);
         OpOutcome::node_failed_at(
             code,
             super::node_error_message(code, syscall, path, &error),
             syscall,
             Some(path),
+            super::node_errno(code, &error),
+        )
+    }
+
+    /// A failed two-path operation: node names both, `'path' -> 'dest'`, and
+    /// sets `dest`. The caller passes them as they are to be shown.
+    fn node_fail_dest(error: std::io::Error, syscall: &str, path: &str, dest: &str) -> OpOutcome {
+        let code = super::node_error_code(&error);
+        OpOutcome::node_failed_dest(
+            code,
+            super::node_error_message_dest(code, syscall, path, dest, &error),
+            syscall,
+            path,
+            dest,
             super::node_errno(code, &error),
         )
     }
@@ -2776,11 +3148,12 @@ pub mod ops {
         path: &str,
     ) -> OpOutcome {
         let failure = super::fs_error_at(site, syscall, path, &error);
+        let shown = super::fs_error_path(path);
         OpOutcome::node_failed_at(
             failure.code,
-            super::fs_error_message(failure, path, &error),
+            super::fs_error_message(failure, &shown, &error),
             failure.syscall,
-            failure.has_path.then_some(path),
+            failure.has_path.then_some(&*shown),
             super::node_errno(failure.code, &error),
         )
     }
@@ -3415,14 +3788,20 @@ pub mod ops {
     pub async fn fs_rename(from: String, to: String) -> OpOutcome {
         match tokio::fs::rename(&from, &to).await {
             Ok(()) => OpOutcome::Done,
-            Err(e) => node_fail(e, "rename", &from),
+            Err(e) => {
+                let (path, dest) = (super::fs_error_path(&from), super::fs_error_path(&to));
+                node_fail_dest(e, "rename", &path, &dest)
+            }
         }
     }
 
     pub async fn fs_copy_file(from: String, to: String) -> OpOutcome {
         match tokio::fs::copy(&from, &to).await {
             Ok(_) => OpOutcome::Done,
-            Err(e) => node_fail(e, "copyfile", &from),
+            Err(e) => {
+                let (path, dest) = (super::fs_error_path(&from), super::fs_error_path(&to));
+                node_fail_dest(e, "copyfile", &path, &dest)
+            }
         }
     }
 
@@ -3430,7 +3809,8 @@ pub mod ops {
         let result = tokio::task::spawn_blocking(move || match super::check_access(&path, mode) {
             Ok(()) => OpOutcome::Done,
             Err((code, message, errno)) => {
-                OpOutcome::node_failed_at(code, message, "access", Some(path.as_str()), errno)
+                let shown = super::fs_error_path(&path);
+                OpOutcome::node_failed_at(code, message, "access", Some(&*shown), errno)
             }
         })
         .await;
@@ -3467,7 +3847,7 @@ pub mod ops {
     pub async fn fs_mkdtemp(dir: std::path::PathBuf, prefix: String) -> OpOutcome {
         match tokio::fs::create_dir(&dir).await {
             Ok(()) => OpOutcome::Text(super::strip_unc_prefix(&dir)),
-            Err(e) => node_fail(e, "mkdtemp", &prefix),
+            Err(e) => node_fail_as_passed(e, "mkdtemp", &prefix),
         }
     }
 
@@ -3488,7 +3868,9 @@ pub mod ops {
         let result = tokio::fs::symlink(&target, &path).await;
         match result {
             Ok(()) => OpOutcome::Done,
-            Err(e) => node_fail(e, "symlink", &path),
+            // The target is stored as written, so node reports it so; the
+            // link's own path is resolved like any other.
+            Err(e) => node_fail_dest(e, "symlink", &target, &super::fs_error_path(&path)),
         }
     }
 
@@ -3502,7 +3884,10 @@ pub mod ops {
     pub async fn fs_link(existing: String, new_path: String) -> OpOutcome {
         match tokio::fs::hard_link(&existing, &new_path).await {
             Ok(()) => OpOutcome::Done,
-            Err(e) => node_fail(e, "link", &new_path),
+            Err(e) => {
+                let path = super::fs_error_path(&existing);
+                node_fail_dest(e, "link", &path, &super::fs_error_path(&new_path))
+            }
         }
     }
 
@@ -4102,6 +4487,7 @@ pub mod ops {
                 hostname: None,
                 address: None,
                 port: None,
+                dest: None,
             },
             None => OpOutcome::Failed(format!("{context}: {error}")),
         }
@@ -5149,6 +5535,7 @@ mod op_outcome_serde_tests {
                 hostname,
                 address,
                 port,
+                dest,
             } => {
                 assert_eq!(code, "ENOENT");
                 assert_eq!(message, "ENOENT: no such file or directory, open 'x'");
@@ -5156,6 +5543,7 @@ mod op_outcome_serde_tests {
                 assert_eq!(path.as_deref(), Some("x"));
                 assert_eq!(errno, Some(-4058));
                 assert_eq!((hostname, address, port), (None, None, None));
+                assert_eq!(dest, None);
             }
             other => panic!("expected NodeFailed, got {other:?}"),
         }
@@ -5211,11 +5599,12 @@ mod op_outcome_serde_tests {
                 hostname,
                 address,
                 port,
+                dest,
             } => {
                 assert_eq!(code, "ECONNREFUSED");
                 assert_eq!(message, "connect ECONNREFUSED 127.0.0.1:8080");
                 assert_eq!(syscall.as_deref(), Some("connect"));
-                assert_eq!(path, None);
+                assert_eq!((path, dest), (None, None));
                 assert_eq!(errno, Some(-4078));
                 assert_eq!(hostname, None);
                 assert_eq!(address.as_deref(), Some("127.0.0.1"));
