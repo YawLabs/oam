@@ -2213,15 +2213,16 @@ checks them (`conformance/cases/257-*`): `fchmod`'s mode (`parseFileMode`),
 `appendFile` and their `Sync` forms (before the path, too). A write's position is not
 validated, as in node: anything but a safe integer `>= 0` -- `1.5`, `'x'`, a bigint,
 a negative -- writes at the cursor (oam used to round `1.5` down to a pwrite at 1).
+A string write's encoding is node's too: only `'hex'` with an odd-length string is
+refused, and a name the binding does not know (`'bogus'`) writes UTF-8 -- so
+`fs.writeSync(-1, 'x', 0, 'bogus')` is the descriptor error, where oam used to throw
+`ERR_UNKNOWN_ENCODING`.
 What still differs:
 
 - **`writeFile` / `appendFile` options.** node's `getOptions` refuses an `options`
   that is neither a string nor an object, a non-boolean `flush`, and an unknown
   encoding before the descriptor; oam does not check these there (an unknown encoding
   is `ERR_UNKNOWN_ENCODING` when the data is encoded, a bad `flush` is ignored).
-- **`fs.writeSync(fd, string, position, 'bogus')`**: node's binding ignores an encoding
-  it does not know and writes UTF-8 (so with `-1` it is the descriptor error); oam
-  throws `ERR_UNKNOWN_ENCODING`.
 - **An anonymous class instance as the descriptor** reads `Received an instance of
   Object` in the C++ wording on oam, where V8 names it after the variable it was
   assigned to (`an instance of vals`); JS cannot see that inferred name.

@@ -188,6 +188,20 @@ withFd("r+", (fd) => sync("writeSync(fd, W, null)", () => [fs.writeSync(fd, W, n
 withFd("r+", (fd) => sync("writeSync(fd, DataView, 1, 2, 0)", () => [fs.writeSync(fd, new DataView(W.buffer, W.byteOffset, 4), 1, 2, 0), content()]));
 withFd("r+", (fd) => sync("writeSync(fd, Uint16Array, 1, 2, 0)", () => [fs.writeSync(fd, new Uint16Array([0x4141, 0x4242]), 1, 2, 0), content()]));
 withFd("r+", (fd) => sync("writeSync(fd, '4142', 0, 'hex')", () => [fs.writeSync(fd, "4142", 0, "hex"), content()]));
+// An encoding the binding does not know is UTF-8, not an error -- so with a
+// bad descriptor the descriptor is what is reported.
+for (const enc of ["bogus", "buffer", "UTF16LE", 5]) {
+  withFd("r+", (fd) => sync(`writeSync(fd, 'é', 0, ${show(enc)})`, () => [fs.writeSync(fd, "é", 0, enc), content()]));
+}
+sync("writeSync(-1, 'str', 0, 'bogus')", () => fs.writeSync(-1, "str", 0, "bogus"));
+sync("write(-1, 'str', 0, 'bogus', cb)", () => fs.write(-1, "str", 0, "bogus", () => {}));
+{
+  reset();
+  const fd = fs.openSync(file, "r+");
+  await settle("write(fd, 'é', 0, 'bogus', cb)", (cb) => fs.write(fd, "é", 0, "bogus", cb));
+  console.log("  file", content());
+  fs.closeSync(fd);
+}
 for (const [label, args] of [
   ["write(fd, W, 1.5 position)", (fd, cb) => fs.write(fd, W, 0, 1, 1.5, cb)],
   ["write(fd, 'x', 1.5, cb)", (fd, cb) => fs.write(fd, "x", 1.5, cb)],

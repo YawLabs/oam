@@ -10147,13 +10147,15 @@
   }
 
   // validateEncoding: the one encoding a string can be invalid for is hex,
-  // at an odd length.
+  // at an odd length. Any other name is not an error: the binding's
+  // ParseEncoding writes UTF-8 for one it does not know (writeEncoding).
   function validateWriteEncoding(data, encoding) {
     if (typeof encoding === "string" && data.length % 2 !== 0 && encoding.toLowerCase() === "hex") {
       throw codes.ERR_INVALID_ARG_VALUE("encoding", encoding, "is invalid for data of length " + data.length);
     }
   }
-  const writeEncoding = (encoding) => (typeof encoding === "string" ? encoding : "utf8");
+  const writeEncoding = (encoding) =>
+    typeof encoding === "string" && globalThis.Buffer.isEncoding(encoding) ? encoding : "utf8";
 
   // validateOffsetLengthWrite, after the offset itself has been validated.
   function validateWriteRange(offset, length, byteLength) {
@@ -11633,8 +11635,9 @@
       //   (fd, buffer[, offset[, length[, position]]]) or (fd, buffer, options)
       //     -- offset, length and their range checked, the position not (the
       //     binding writes at the cursor for anything but a safe integer >= 0);
-      //   (fd, string[, position[, encoding]]) -- a hex string of odd length
-      //     is refused.
+      //   (fd, string[, position[, encoding]]) -- only a hex string of odd
+      //     length is refused; an encoding the binding does not know writes
+      //     UTF-8.
       // All of it before the descriptor, which the binding checks last. Empty
       // data is still checked: there is no early return.
       writeSync: function writeSync(fd, buffer, offsetOrOptions, length, position) {
