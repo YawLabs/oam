@@ -10,7 +10,8 @@
 // response -- the usual reply to 'timeout' -- fails it with node's
 // ECONNRESET 'socket hang up'; abort() too; destroy(err) with that error.
 //
-// Only the order of events is printed (and whether the response closed):
+// Only the order of events is printed, the response's 'close' among them
+// (node emits it ahead of the request's unless the connection is kept, #194):
 // every server delay is several times the timeout it is measured against.
 import http from "node:http";
 import net from "node:net";
@@ -61,7 +62,6 @@ class WrappingAgent extends http.Agent {
 
 async function run(label, path, setup, extra = {}) {
   const events = [];
-  let resClosed = null;
   await new Promise((resolve) => {
     let req;
     try {
@@ -78,8 +78,7 @@ async function run(label, path, setup, extra = {}) {
       res.on("end", () => events.push("res end"));
       res.on("aborted", () => events.push("res aborted"));
       res.on("error", (e) => events.push(`res error ${e.code} ${e.message}`));
-      resClosed = false;
-      res.on("close", () => (resClosed = true));
+      res.on("close", () => events.push("res close"));
     });
     req.on("error", (e) => events.push(`error ${e.code} ${e.message}`));
     req.on("abort", () => events.push("abort"));
@@ -90,7 +89,7 @@ async function run(label, path, setup, extra = {}) {
     setup(req, events);
     if (!req.writableEnded && !extra.noEnd) req.end();
   });
-  console.log(`${label}: ${JSON.stringify(events)}${resClosed === null ? "" : ` res closed=${resClosed}`}`);
+  console.log(`${label}: ${JSON.stringify(events)}`);
 }
 
 const destroyOnTimeout = (req, events) =>

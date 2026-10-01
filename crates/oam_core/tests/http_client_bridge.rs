@@ -380,40 +380,49 @@ async fn an_unread_response_body_pushes_back_on_the_socket() {
     .await;
 }
 
-/// `request_sent` resolves once hyper has written the whole request -- with
-/// exactly the number of bytes `out` hands over for it, framing included --
-/// and not before; a bridge closed first answers `Done`. JS emits node's
-/// `'finish'` when the socket has written that many.
+/// What `out` hands over until `done` says the progress is where the caller
+/// wants it. A completion with no bytes is progress alone.
+async fn pump_until(reg: &Reg, id: u64, done: impl Fn(bridge::Progress) -> bool) -> Vec<u8> {
+    let mut wire = Vec::new();
+    loop {
+        if bridge::progress(&reg.bridges, id).is_some_and(&done) {
+            return wire;
+        }
+        match bridge::out(reg.bridges.clone(), id).await {
+            OpOutcome::Bytes(bytes) => wire.extend_from_slice(&bytes),
+            other => panic!("out ended early: {other:?} after {} bytes", wire.len()),
+        }
+    }
+}
+
+/// `progress` says the request is complete once hyper has written the whole
+/// of it -- with exactly the number of bytes `out` hands over for it, framing
+/// included -- and not before; a bridge that is gone has none. JS emits
+/// node's `'finish'` when the socket has written that many.
 #[tokio::test(flavor = "multi_thread")]
-async fn request_sent_counts_the_whole_request_once_it_is_written() {
-    async fn sent(reg: &Reg, id: u64) -> u64 {
-        match bridge::request_sent(reg.bridges.clone(), id).await {
-            OpOutcome::Json(n) => n.parse().unwrap(),
-            other => panic!("request_sent: {other:?}"),
-        }
-    }
-    /// Every byte `out` gives until `total` have come.
-    async fn read_exactly(reg: &Reg, id: u64, total: usize) -> Vec<u8> {
-        let mut wire = Vec::new();
-        while wire.len() < total {
-            match bridge::out(reg.bridges.clone(), id).await {
-                OpOutcome::Bytes(bytes) => wire.extend_from_slice(&bytes),
-                other => panic!("out ended early: {other:?} after {} bytes", wire.len()),
-            }
-        }
-        wire
-    }
+async fn progress_counts_the_whole_request_once_it_is_written() {
     within(async {
         let reg = Reg::new();
 
-        // No body: the head is the request.
+        // Nothing has run yet: no bytes, not complete.
         let id = reg.start(json!({ "method": "GET", "target": "/", "headers": [["host", "h"]] }));
-        let _head = reg.response(id);
-        let wire = reg.written_until(id, "\r\n\r\n").await;
-        assert_eq!(sent(&reg, id).await, wire.len() as u64);
-        bridge::close(&reg.bridges, id);
+        assert_eq!(
+            bridge::progress(&reg.bridges, id),
+            Some(bridge::Progress::default())
+        );
 
-        // A buffered body larger than the pipe: every byte of it counts.
+        // No body: the head is the request.
+        let _head = reg.response(id);
+        let wire = pump_until(&reg, id, |p| p.complete).await;
+        assert_eq!(wire, b"GET / HTTP/1.1\r\nhost: h\r\n\r\n");
+        let progress = bridge::progress(&reg.bridges, id).unwrap();
+        assert_eq!(progress.written, wire.len() as u64);
+        assert_eq!(progress.body, 0);
+        bridge::close(&reg.bridges, id);
+        assert_eq!(bridge::progress(&reg.bridges, id), None);
+
+        // A buffered body larger than the pipe: every byte of it counts, and
+        // the request is not complete while any of it is still hyper's.
         let body = vec![b'a'; 300_000];
         let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &body);
         let id = reg.start(json!({
@@ -423,18 +432,30 @@ async fn request_sent_counts_the_whole_request_once_it_is_written() {
             "body_base64": encoded,
         }));
         let _head = reg.response(id);
-        let counted = tokio::spawn(bridge::request_sent(reg.bridges.clone(), id));
         let head_len = "POST /big HTTP/1.1\r\nhost: h\r\ncontent-length: 300000\r\n\r\n".len();
-        let wire = read_exactly(&reg, id, head_len + body.len()).await;
-        assert_eq!(wire.len(), head_len + body.len());
-        match counted.await.unwrap() {
-            OpOutcome::Json(n) => assert_eq!(n, wire.len().to_string()),
-            other => panic!("request_sent: {other:?}"),
+        let first = match bridge::out(reg.bridges.clone(), id).await {
+            OpOutcome::Bytes(bytes) => bytes,
+            other => panic!("out: {other:?}"),
+        };
+        assert!(first.len() < head_len + body.len());
+        assert!(!bridge::progress(&reg.bridges, id).unwrap().complete);
+        let mut rest = pump_until(&reg, id, |p| p.complete).await;
+        let progress = bridge::progress(&reg.bridges, id).unwrap();
+        // Complete means all of it is in the pipe; the last of it may still
+        // be there.
+        while first.len() + rest.len() < head_len + body.len() {
+            match bridge::out(reg.bridges.clone(), id).await {
+                OpOutcome::Bytes(bytes) => rest.extend_from_slice(&bytes),
+                other => panic!("out ended early: {other:?}"),
+            }
         }
+        assert_eq!(first.len() + rest.len(), head_len + body.len());
+        assert_eq!(progress.written, (head_len + body.len()) as u64);
+        assert_eq!(progress.body, body.len() as u64);
         bridge::close(&reg.bridges, id);
 
-        // A streamed body: not written until its end is, then the whole of
-        // it, the last chunk's framing included.
+        // A streamed body: not complete until its end is written, then the
+        // whole of it, the last chunk's framing included.
         let handle = 9100;
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         reg.outbound
@@ -448,48 +469,129 @@ async fn request_sent_counts_the_whole_request_once_it_is_written() {
             "body_stream": handle,
         }));
         let _head = reg.response(id);
-        let counted = tokio::spawn(bridge::request_sent(reg.bridges.clone(), id));
         tx.send(Ok(b"ab".to_vec())).await.unwrap();
-        let first = reg.written_until(id, "ab\r\n").await;
+        let first = pump_until(&reg, id, |p| p.body == 2).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(!counted.is_finished(), "counted before the body ended");
+        assert!(
+            !bridge::progress(&reg.bridges, id).unwrap().complete,
+            "complete before the body ended"
+        );
         drop(tx);
         body::end_outbound(&reg.outbound, handle);
-        let rest = reg.written_until(id, "0\r\n\r\n").await;
-        let total = first.len() + rest.len();
+        let rest = pump_until(&reg, id, |p| p.complete).await;
+        let wire = [first, rest].concat();
         assert_eq!(
-            format!("{first}{rest}"),
+            String::from_utf8(wire.clone()).unwrap(),
             "PUT /s HTTP/1.1\r\nhost: h\r\ntransfer-encoding: chunked\r\n\r\n2\r\nab\r\n0\r\n\r\n"
         );
-        match counted.await.unwrap() {
-            OpOutcome::Json(n) => assert_eq!(n, total.to_string()),
-            other => panic!("request_sent: {other:?}"),
-        }
+        let progress = bridge::progress(&reg.bridges, id).unwrap();
+        assert_eq!(progress.written, wire.len() as u64);
+        assert_eq!(progress.body, 2);
         bridge::close(&reg.bridges, id);
+    })
+    .await;
+}
 
-        // Closed before the request was all written: never sent.
-        let handle = 9101;
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(8);
+/// `progress` places each body chunk in the bytes `out` hands over: once it
+/// reports `body` bytes covered by `written`, the first `written` bytes of
+/// the wire hold that much of the body, framing included. JS calls a
+/// `write()` callback when the socket has written that far (#191), so a
+/// count that ran ahead of the bytes would report a chunk before it left.
+#[tokio::test(flavor = "multi_thread")]
+async fn progress_places_each_chunk_in_the_bytes_handed_over() {
+    within(async {
+        let reg = Reg::new();
+        let handle = 9200;
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
         reg.outbound
             .lock()
             .unwrap()
             .insert(handle, (Some(tx.clone()), Some(rx)));
         let id = reg.start(json!({
-            "method": "PUT",
+            "method": "POST",
             "target": "/s",
             "headers": [["host", "h"]],
             "body_stream": handle,
         }));
         let _head = reg.response(id);
-        let counted = tokio::spawn(bridge::request_sent(reg.bridges.clone(), id));
-        reg.written_until(id, "\r\n\r\n").await;
-        assert!(bridge::close(&reg.bridges, id));
-        assert!(matches!(counted.await.unwrap(), OpOutcome::Done));
+        let head = "POST /s HTTP/1.1\r\nhost: h\r\ntransfer-encoding: chunked\r\n\r\n";
+        let mut wire = Vec::new();
+        let mut expected = head.to_string();
+        let mut body = 0u64;
+        for chunk in ["one", "three", "a-longer-third-chunk"] {
+            tx.send(Ok(chunk.as_bytes().to_vec())).await.unwrap();
+            body += chunk.len() as u64;
+            expected.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
+            // `out` completes for the progress even when the chunk's bytes
+            // were handed over before the flush that counted them.
+            wire.extend(pump_until(&reg, id, |p| p.body == body).await);
+            let progress = bridge::progress(&reg.bridges, id).unwrap();
+            assert!(!progress.complete);
+            assert_eq!(progress.written, expected.len() as u64, "after {chunk:?}");
+            // Everything the progress counts is in the pipe; `out` may not
+            // have handed the last of it over yet.
+            assert!(wire.len() as u64 <= progress.written);
+            assert_eq!(wire, expected.as_bytes()[..wire.len()]);
+        }
         drop(tx);
-        assert!(matches!(
-            bridge::request_sent(reg.bridges.clone(), id).await,
-            OpOutcome::Done
-        ));
+        body::end_outbound(&reg.outbound, handle);
+        wire.extend(pump_until(&reg, id, |p| p.complete).await);
+        expected.push_str("0\r\n\r\n");
+        while wire.len() < expected.len() {
+            match bridge::out(reg.bridges.clone(), id).await {
+                OpOutcome::Bytes(bytes) => wire.extend_from_slice(&bytes),
+                other => panic!("out ended early: {other:?}"),
+            }
+        }
+        assert_eq!(String::from_utf8(wire).unwrap(), expected);
+        assert_eq!(
+            bridge::progress(&reg.bridges, id),
+            Some(bridge::Progress {
+                written: expected.len() as u64,
+                body,
+                complete: true,
+            })
+        );
+        bridge::close(&reg.bridges, id);
+    })
+    .await;
+}
+
+/// The count of a request is there, synchronously, by the time its response
+/// head is: the peer cannot have answered bytes hyper had not flushed. The
+/// socket's hand-back to its agent reads it at the response's end (#190);
+/// when it came on an op of its own, that op's completion could lose the
+/// race to the response's and the socket was pooled late.
+#[tokio::test(flavor = "multi_thread")]
+async fn progress_is_complete_by_the_time_the_response_head_arrives() {
+    within(async {
+        let reg = Reg::new();
+        for round in 0..50 {
+            let id = reg.start(json!({
+                "method": "POST",
+                "target": "/",
+                "headers": [["host", "h"]],
+                "body_base64": "aGVsbG8=",
+            }));
+            let head = reg.response(id);
+            // One read takes the whole request, as the socket does; nothing
+            // asks for the progress until the head is back.
+            let wire = reg.written_until(id, "hello").await;
+            reg.feed(id, b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                .await;
+            let p = payload(head.await.unwrap());
+            assert_eq!(p["status"], 200);
+            assert_eq!(
+                bridge::progress(&reg.bridges, id),
+                Some(bridge::Progress {
+                    written: wire.len() as u64,
+                    body: 5,
+                    complete: true,
+                }),
+                "round {round}"
+            );
+            bridge::close(&reg.bridges, id);
+        }
     })
     .await;
 }

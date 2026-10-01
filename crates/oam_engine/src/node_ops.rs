@@ -321,6 +321,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fetchBodyChannelWrite", op_fetch_body_channel_write),
         ("fetchBodyChannelEnd", op_fetch_body_channel_end),
         ("fetchBodyChannelCancel", op_fetch_body_channel_cancel),
+        ("fetchSentOpen", op_fetch_sent_open),
+        ("fetchSentWait", op_fetch_sent_wait),
+        ("fetchSentClose", op_fetch_sent_close),
         ("httpRequestBodyCancel", op_http_request_body_cancel),
         ("httpAbort", op_http_abort),
         ("httpClose", op_http_close),
@@ -349,7 +352,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpBridgeStart", op_http_bridge_start),
         ("httpBridgeResponse", op_http_bridge_response),
         ("httpBridgeOut", op_http_bridge_out),
-        ("httpBridgeRequestSent", op_http_bridge_request_sent),
+        ("httpBridgeProgress", op_http_bridge_progress),
         ("httpBridgeIn", op_http_bridge_in),
         ("httpBridgeInEnd", op_http_bridge_in_end),
         ("httpBridgeClose", op_http_bridge_close),
@@ -3293,6 +3296,50 @@ fn op_fetch_body_channel_cancel(
     }
 }
 
+/// `__oam.node.fetchSentOpen() -> handle`: a signal for one http.request on
+/// oam's own transport, named in its fetch request as `sent_signal`
+/// (`oam_core::http_client::sent`).
+fn op_fetch_sent_open(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = core_runtime!(scope).new_sent_signal();
+    rv.set(v8::Number::new(scope, handle as f64).into());
+}
+
+/// `__oam.node.fetchSentWait(handle)`: resolves true once the transport has
+/// a connection for the request -- node's 'finish' -- or undefined if the
+/// request ended without one. Unref'd: the fetch itself is what keeps the
+/// process running.
+fn op_fetch_sent_wait(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let signals = core_runtime!(scope).sent_signals();
+    crate::ops::spawn_op_unref(
+        scope,
+        &mut rv,
+        oam_core::http_client::sent::wait(signals, handle),
+    );
+}
+
+/// `__oam.node.fetchSentClose(handle) -> boolean`, synchronous: drop the
+/// signal and say whether it had fired. Read when the fetch settles, so the
+/// answer cannot arrive after the response or the failure it orders.
+fn op_fetch_sent_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let fired = handle >= 0.0
+        && oam_core::http_client::sent::close(&core_runtime!(scope).sent_signals(), handle as u64);
+    rv.set(v8::Boolean::new(scope, fired).into());
+}
+
 fn op_http_request_body_read(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -3786,9 +3833,10 @@ fn op_http_bridge_response(
 }
 
 /// `__oam.node.httpBridgeOut(id)`: the next request bytes for the socket,
-/// or undefined at the end. Unref'd: it waits on hyper, which may never
-/// write again (a response whose body nobody reads), and the socket's own
-/// read is what keeps a live connection's process running, as in node.
+/// or undefined at the end; no bytes at all when only `httpBridgeProgress`
+/// has moved. Unref'd: it waits on hyper, which may never write again (a
+/// response whose body nobody reads), and the socket's own read is what
+/// keeps a live connection's process running, as in node.
 fn op_http_bridge_out(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -3803,22 +3851,31 @@ fn op_http_bridge_out(
     );
 }
 
-/// `__oam.node.httpBridgeRequestSent(id)`: once hyper has written the whole
-/// request, how many of the `httpBridgeOut` bytes it took (node's `'finish'`
-/// follows the socket's write of the last of them); undefined if the
-/// exchange ends first. Unref'd, as httpBridgeOut: it waits on hyper.
-fn op_http_bridge_request_sent(
+/// `__oam.node.httpBridgeProgress(id) -> [written, body, complete]`: of the
+/// bytes `httpBridgeOut` hands over, how many hyper had written at its last
+/// flush, how far into the request body those reach, and whether they are
+/// the whole request (node's `write()` callbacks and `'finish'` follow the
+/// socket's write of them). Undefined for an exchange that is gone.
+/// Synchronous: the answer is read when it is needed, not delivered.
+fn op_http_bridge_progress(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    if id < 0.0 {
+        return;
+    }
     let bridges = core_runtime!(scope).http_bridges();
-    crate::ops::spawn_op_unref(
-        scope,
-        &mut rv,
-        oam_core::http_client::bridge::request_sent(bridges, id),
-    );
+    let Some(progress) = oam_core::http_client::bridge::progress(&bridges, id as u64) else {
+        return;
+    };
+    let written = v8::Number::new(scope, progress.written as f64);
+    let body = v8::Number::new(scope, progress.body as f64);
+    let complete = v8::Boolean::new(scope, progress.complete);
+    let array =
+        v8::Array::new_with_elements(scope, &[written.into(), body.into(), complete.into()]);
+    rv.set(array.into());
 }
 
 /// `__oam.node.httpBridgeIn(id, bytes)`: response bytes the socket read.

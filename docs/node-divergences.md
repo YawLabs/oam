@@ -912,13 +912,14 @@ decode keeps both headers, as in Node: a HEAD or CONNECT request, a 101, 204, 20
 and a coding list holding any other token -- `identity`, an unknown coding, or the empty
 token of `gzip,`.
 
-Why oam still strips them: `http.request` goes through the same native op as `fetch` until
-#148, and it gets the decoded body too. Node's `http` hands over the raw bytes with the
-headers intact, so its callers decode for themselves (`res.pipe(zlib.createGunzip())` when
-`content-encoding` says gzip). Keeping the header on a body oam already decoded would send
-that code into a second, failing decode. The op already has the switch (a request can ask
-for the raw body and the original headers); once `http.request` uses it (#148), `fetch` can
-keep Node's headers.
+This is `fetch` only. `http.request` goes through the same native op but asks it for the
+raw exchange (#148): the body arrives as the server sent it with both headers intact, as
+in Node, so its callers decode for themselves (`res.pipe(zlib.createGunzip())` when
+`content-encoding` says gzip) -- `conformance/cases/192-http-request-raw-body-and-headers.mjs`.
+Up to 0.17.1 it got the decoded body too, which is why the headers had to go: keeping
+`content-encoding` on a body oam had already decoded sent that code into a second, failing
+decode. Nothing shares the decoded payload with `http.request` any more, so `fetch` can
+now keep Node's headers; it does not yet.
 
 What is NOT divergent: which codings are undone, and the decoded bytes. The body is decoded
 as it streams, at most 16 KiB per chunk (zlib's `chunkSize` in Node), so a sync-flushed
@@ -1384,9 +1385,15 @@ What still differs:
   request's `timeout` option, an agent's `timeout`) is re-armed by what the transport does
   for the request -- sending it, each upload chunk, the response head, each body chunk --
   rather than by each read and write on a wire
-  (`conformance/cases/150-http-request-timeouts.mjs`); `'finish'` follows `end()` at once,
-  as Node's does for a socket that is already connected, so it also fires for a request
-  whose connection then fails (Node's never does); it emits `'close'` only when the
+  (`conformance/cases/150-http-request-timeouts.mjs`); `'finish'` and the `write()`
+  callbacks follow the transport having a connection for the request -- dialled or taken
+  from its pool -- so a request whose connection is refused gets no `'finish'`,
+  `req.writableFinished` stays `false` and its callbacks hear
+  `ERR_SOCKET_CLOSED_BEFORE_CONNECTION` after `'close'`, as in Node
+  (`conformance/cases/193-http-request-finish-needs-a-connection.mjs`; up to 0.17.1
+  `'finish'` followed `end()` at once whatever became of the connection), though they
+  mark the request handed to the connection rather than each chunk written by it, so a
+  streamed chunk is called back when the transport takes it; it emits `'close'` only when the
   request is aborted or destroyed; and through an environment proxy its peer is the
   proxy. At the end of a response whose connection stays open,
   `res.socket` is null, as node detaches a kept-alive socket. Up to 0.16.2 it was a fixed object naming the host as
@@ -1598,8 +1605,9 @@ Pinned against Node + undici 6.29.0 by `undici_request_honours_headers_and_body_
   `ERR_INVALID_URL`, `input` and `base`. Case 111 prints only the message.
 - **`http.request` on this transport returns a `3xx` as the response**, as Node's does (it
   asks the transport for `'manual'`); up to 0.16.2 it followed redirects by `fetch`'s rules.
-  It also decodes the body, as `fetch` does (entry 32). Node's `http.request` does not, and
-  neither does a request sent over an agent's socket (entry 43).
+  It does not decode the body either, and adds no `accept`, `user-agent` or
+  `accept-encoding` to the request, as Node's does not (case 192); up to 0.17.1 it did
+  both, as `fetch` does (entry 32).
 - **A hop that lands on a pooled connection the server has just closed.** oam's redirect loop
   has no event-loop tick between the 3xx and the hop, so against a server that sends the 3xx
   with keep-alive and then FINs, the hop can be written before the server's FIN arrives.
@@ -1645,8 +1653,24 @@ Pinned against Node + undici 6.29.0 by `undici_request_honours_headers_and_body_
   5000 ms after `agent.destroy()`; with Node's client, within 500 ms. A pooled request's
   socket also emits no `'close'` when the server ends the connection (a server that answered
   `Connection: close` and closed it: no `'close'` 1.5 s later).
-- **`statusText` is the canonical reason phrase**, not the server's: `200 Custom Reason` reads
-  `OK` in oam, and `299 Whatever` reads `''`. Node reports the reason on the wire.
+- **A reason phrase with a byte above 0x7F reads empty.** `statusText` and `statusMessage`
+  are the phrase the server sent, as in Node -- `200 Custom Reason` reads `Custom Reason`,
+  `299 Whatever` reads `Whatever`, a status line with no phrase reads `''`
+  (`conformance/cases/195-status-reason-phrase.mjs`; up to 0.17.1 oam's own transport
+  reported the status code's canonical phrase). What differs: the parser under hyper
+  drops a phrase carrying obs-text, so `200 caf\xe9` reads `''` on both client paths,
+  where Node's `statusMessage` is `café` and its `statusText` `caf�`. Over HTTP/2,
+  which has no reason phrase (and which Node's fetch never negotiates), `statusText` is
+  the status code's canonical phrase.
+- **A response nobody has read holds the request's `'close'`.** The request's `'close'`
+  follows the response's `'end'` and `'close'` on a connection that is not kept, and comes
+  between them on a kept-alive one, as in Node, on both client paths
+  (`conformance/cases/194-http-request-close-order.mjs`; up to 0.17.1 the request closed
+  first on every connection that was not kept). What differs: Node closes the request
+  when its socket closes, so with a `Connection: close` response left unread the request
+  closes before the response is read; in oam it closes once the response has been. And
+  a small response destroyed from the `'response'` listener reads `complete` `false`
+  where Node, which had already parsed all of it, reads `true`.
 - **The request header count is capped.** More than 24,576 distinct header names (fewer if
   the header table's hash-flooding defence rebuilds it) fails with
   `fetch: too many request headers`; Node has no cap (25,000 distinct names get a 200).
@@ -2129,8 +2153,8 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   `ERR_UNESCAPED_CHARACTERS`; Node writes it raw, so such a path adds header lines to its
   request. A body written in the same tick as `end()` is
   sent with `content-length`, where Node sends `write()`s before `end()` chunked. No
-  `accept`, `user-agent` or `accept-encoding` is added (oam's own client adds all three,
-  #148). Redirects are not followed and bodies are not decoded, as in Node.
+  `accept`, `user-agent` or `accept-encoding` is added, redirects are not followed and
+  bodies are not decoded, as in Node -- and as on oam's own transport (entry 38, case 192).
 - **Errors.** A response that cannot be parsed fails with a coded `Parse Error: ...`
   (`HPE_*`) whose code is the closest llhttp has for what hyper reports; a malformed chunk
   size is `HPE_INVALID_CHUNK_SIZE`, as in Node. A response head is held to the request's
@@ -2156,11 +2180,22 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
 - **`'finish'`.** As in Node, it follows the socket's write of the last request byte, so it
   comes after `'connect'` / `'secureConnect'`, `req.writableFinished` is `false` until
   then, and a request whose socket refused or that was destroyed before it was written
-  gets none (`conformance/cases/151-http-request-finish-order.mjs`). What differs: a
-  `write()` callback runs once the request has taken the chunk, before the socket has
-  connected, where Node's waits for the socket to write it; and a request destroyed from
-  its socket's own `'connect'` / `'secureConnect'` listener gets no `'finish'`, where
-  Node's still reports one from the write it had queued for the connect.
+  gets none (`conformance/cases/151-http-request-finish-order.mjs`). A `write()` callback
+  keeps the same company: called with `null` once the socket has written its chunk, in
+  order and ahead of `'finish'`; with the socket's reason after `'close'` when the chunk
+  was never written (`ERR_SOCKET_CLOSED_BEFORE_CONNECTION` on a refused connection); and
+  not at all for a request destroyed before it had a socket. A request destroyed from its
+  socket's own `'connect'` / `'secureConnect'` listener has its queued writes failed and
+  still gets `'finish'`, as Node's does (same case). Up to 0.17.1 a callback ran as soon
+  as the request had taken the chunk, and that request got no `'finish'`. What differs:
+  the request reaches its socket a turn or two of the loop after `'connect'` (it goes
+  through hyper), where Node writes it inside the event, so a request destroyed in that
+  gap -- on the first immediate after `'connect'`, or a tick after `'socket'` on a reused
+  keep-alive socket -- has its callbacks failed (`ERR_STREAM_DESTROYED`, after `'close'`)
+  and no `'finish'`, where Node had already written it; a write failed by a destroy
+  inside `'secureConnect'` reports `ERR_SOCKET_CLOSED` where Node reports what the TLS
+  stream's write returned (`EBADF` on Windows); and `write()` returns `true` whatever the
+  socket has buffered, so a large upload emits no `'drain'`.
 - **Sockets.** A `'connect'` listener on a TLS socket runs after the handshake, since oam's
   native connect does both (entry 34); a listener that destroys the socket there still
   stops the request before it is written. oam's `net.Socket` emits `'error'` and `'close'`

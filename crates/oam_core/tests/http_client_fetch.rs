@@ -296,6 +296,39 @@ fn chunk(data: &[u8]) -> Vec<u8> {
 
 // ---------------------------------------------------------------- payload
 
+/// `statusText` is the reason phrase the server sent (#160): a custom one,
+/// one for a status code that has no canonical phrase, an empty one and a
+/// missing one -- node's `statusText` / `statusMessage` for each, measured on
+/// v22.22.2. It used to be the status code's canonical phrase whatever the
+/// wire said.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_text_is_the_reason_phrase_on_the_wire() {
+    within(async {
+        for (line, status, expected) in [
+            ("200 Custom Reason", 200, "Custom Reason"),
+            ("200 OK", 200, "OK"),
+            ("299 Whatever", 299, "Whatever"),
+            ("404 Nope Not Here", 404, "Nope Not Here"),
+            ("404 not found", 404, "not found"),
+            ("200 ", 200, ""),
+            ("200", 200, ""),
+        ] {
+            let server = serve_replies(move |_| {
+                format!("HTTP/1.1 {line}\r\ncontent-length: 2\r\nconnection: close\r\n\r\nhi")
+                    .into_bytes()
+            })
+            .await;
+            let reg = Reg::new();
+            let url = format!("http://127.0.0.1:{}/", server.port);
+            let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+            assert_eq!(p["status"], status, "{line:?}");
+            assert_eq!(p["statusText"], expected, "{line:?}");
+            assert_eq!(reg.text(handle_of(&p)).await, "hi");
+        }
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn payload_shape() {
     within(async {
@@ -308,7 +341,8 @@ async fn payload_shape() {
         let url = format!("http://u:p@127.0.0.1:{}/x?y#frag", server.port);
         let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
         assert_eq!(p["status"], 200);
-        assert_eq!(p["statusText"], "OK");
+        // The phrase on the wire, not the status code's canonical one (#160).
+        assert_eq!(p["statusText"], "Custom Reason");
         assert_eq!(
             p["url"],
             format!("http://127.0.0.1:{}/x?y", server.port).as_str()
@@ -2435,6 +2469,106 @@ async fn a_refusal_releases_a_streamed_body() {
 }
 
 // ---------------------------------------------------------------- static
+
+/// `http.request`'s sent signal (#193): fired when the pool has a connection
+/// for the request -- while the response is still to come, on a fresh
+/// connection and on a pooled one -- and never for a request that got none:
+/// its wait ends with `Done` and the signal reads unfired. JS emits node's
+/// `'finish'` on the first and nothing on the second.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sent_signal_fires_with_the_connection_and_never_without_one() {
+    use oam_core::http_client::sent;
+    within(async {
+        // Holds its first answer until released.
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let held = Arc::new(tokio::sync::Mutex::new(Some(held)));
+        let server = serve(move |mut conn, _, _| {
+            let held = held.clone();
+            async move {
+                while conn.request().await.is_some() {
+                    let waiting = held.lock().await.take();
+                    if let Some(waiting) = waiting {
+                        let _ = waiting.await;
+                    }
+                    if !conn.send(&response("200 OK", &[], b"ok")).await {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        let reg = Reg::new();
+        let t = plain();
+        let signals: sent::SentSignals = Arc::new(Mutex::new(HashMap::new()));
+        let start = |handle: u64, url: String| {
+            sent::open(&signals, handle);
+            let mut request: FetchRequest =
+                serde_json::from_value(json!({ "url": url, "sent_signal": handle })).unwrap();
+            assert_eq!(request.sent_signal, Some(handle));
+            // The engine's fetch op does this: the sender is taken once.
+            request.dispatched = sent::take(&signals, handle);
+            assert!(request.dispatched.is_some());
+            assert!(sent::take(&signals, handle).is_none());
+            tokio::spawn(send::fetch(
+                t.clone(),
+                request,
+                reg.bodies.clone(),
+                reg.ids.clone(),
+                reg.outbound.clone(),
+                reg.continuations.clone(),
+                reg.net_check.clone(),
+            ))
+        };
+        let fired =
+            |outcome: OpOutcome| matches!(outcome, OpOutcome::Json(ref text) if text == "true");
+        let url = format!("http://127.0.0.1:{}/", server.port);
+
+        // A fresh connection: fired while the answer is held back.
+        let fetch = start(1, url.clone());
+        assert!(fired(sent::wait(signals.clone(), 1).await));
+        assert!(!fetch.is_finished(), "answered before it was released");
+        release.send(()).unwrap();
+        let p = payload(fetch.await.unwrap());
+        assert_eq!(reg.text(handle_of(&p)).await, "ok");
+        assert!(sent::close(&signals, 1));
+        assert!(!sent::close(&signals, 1), "closed twice");
+
+        // The pooled connection: fired again, for this request's own signal.
+        let_the_pool_settle().await;
+        let fetch = start(2, url);
+        let p = payload(fetch.await.unwrap());
+        assert_eq!(reg.text(handle_of(&p)).await, "ok");
+        assert_eq!(server.accepts(), 1, "the second request dialled again");
+        assert!(fired(sent::wait(signals.clone(), 2).await));
+        assert!(sent::close(&signals, 2));
+
+        // Nothing listens: no connection, so no signal -- the wait ends when
+        // the failed fetch drops its sender.
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let fetch = start(3, format!("http://127.0.0.1:{closed}/"));
+        let waited = tokio::spawn(sent::wait(signals.clone(), 3));
+        assert!(!matches!(fetch.await.unwrap(), OpOutcome::Json(_)));
+        assert!(matches!(waited.await.unwrap(), OpOutcome::Done));
+        assert!(!sent::close(&signals, 3));
+
+        // A signal no fetch took: closing it ends its wait.
+        sent::open(&signals, 4);
+        let waited = tokio::spawn(sent::wait(signals.clone(), 4));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waited.is_finished());
+        assert!(!sent::close(&signals, 4));
+        assert!(matches!(waited.await.unwrap(), OpOutcome::Done));
+        assert!(matches!(
+            sent::wait(signals.clone(), 4).await,
+            OpOutcome::Done
+        ));
+        assert!(signals.lock().unwrap().is_empty());
+    })
+    .await;
+}
 
 fn assert_send<T: Send>() {}
 

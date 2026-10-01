@@ -318,7 +318,7 @@ fn op_fetch(
         return;
     };
     let wire = wire.to_rust_string_lossy(scope);
-    let request = match oam_core::ops::parse_fetch_request(&wire) {
+    let mut request = match oam_core::ops::parse_fetch_request(&wire) {
         Ok(request) => request,
         Err(message) => {
             let message = v8::String::new(scope, &message).unwrap();
@@ -369,6 +369,10 @@ fn op_fetch(
     let ids = core.body_ids();
     let outbound = core.outbound_bodies();
     let continuations = core.fetch_continuations();
+    // http.request's sent signal: its sending half rides with the request.
+    if let Some(handle) = request.sent_signal {
+        request.dispatched = oam_core::http_client::sent::take(&core.sent_signals(), handle);
+    }
     spawn_op(
         scope,
         &mut rv,

@@ -1557,6 +1557,17 @@
     // redirect, and an application that vets a URL before requesting it
     // relies on that.
     if (rawPayload && init.__oamManualRedirect === true) request.redirect = "manual";
+    // ... and, the same way, exactly what was written and exactly what came
+    // back: node's http client adds no `accept` / `user-agent` /
+    // `accept-encoding` to a request and decodes no response body -- a
+    // `content-encoding: gzip` response is the gzip bytes, with its
+    // `content-encoding` and `content-length`, for the program to decode.
+    // The Fetch client's negotiation is fetch()'s alone (and, for now,
+    // undici.request's, which shares its entry).
+    if (rawPayload && init.__oamRawExchange === true) {
+      request.decode = false;
+      request.default_headers = false;
+    }
     // fetch's own `redirect: "manual"` returns the 3xx (its status, headers
     // and body; `redirected` false, `url` the request's) and `"error"` fails
     // on a redirect status with cause `unexpected redirect`, as node's do:
@@ -1567,6 +1578,11 @@
     // the transport applies the process-wide limit).
     if (rawPayload && typeof init.__oamMaxHeaderSize === "number") {
       request.max_header_size = init.__oamMaxHeaderSize;
+    }
+    // http.request's sent signal: fired once the transport has a connection
+    // for the request, which is when node's 'finish' is due (#193).
+    if (rawPayload && typeof init.__oamSentSignal === "number") {
+      request.sent_signal = init.__oamSentSignal;
     }
     // An undici-style dispatcher may carry a connect.lookup hook -- the
     // DNS-rebind / SSRF pin. The oam:undici shim exposes it as
