@@ -1809,6 +1809,13 @@ target). The parser underneath is hyper's, so some heads still get a different a
 - A chunked body's trailer fields are in `req.trailers` and `req.rawTrailers` once the
   body has ended, combined as Node combines them, but `rawTrailers` has the names
   lowercased and a repeated name's values side by side.
+- Header and trailer values now read as Node's parser reads them, one code point per byte
+  (latin1), in `req.headers`, `req.rawHeaders`, `req.trailers`, an `http2.createServer`
+  request's headers and an `oam.serve` Request's `headers`. Up to 0.17.1 they were decoded
+  as UTF-8: the bytes of a UTF-8 `café` read as `café` where Node reads `cafÃ©`, and a lone
+  `0xE9` -- what Node's client writes for `é`, and oam's since #174 -- as U+FFFD. The e2e
+  test `request_header_bytes_round_trip_oam_to_oam_as_latin1` holds an oam-to-oam round
+  trip of `café`.
 - A refused head is answered with `content-length: 0` and `date` headers next to
   `connection: close` (Node: `Connection: close` alone). There is no `'clientError'`
   event for it (an `https` server emits one only for a failed TLS handshake, entry 42).

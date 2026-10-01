@@ -3266,6 +3266,63 @@ fn oam_serve_writes_headers_in_the_order_the_handler_set_them() {
     );
 }
 
+/// A request header value with a byte above 0x7F round-trips from oam to
+/// oam, as from node to node. The client writes one byte per code point
+/// (#174) and both servers read one code point per byte, as node's parser
+/// does: decoded as UTF-8, the 0xE9 of `café` reached the handler as
+/// U+FFFD. Through oam.serve and node:http (headers, rawHeaders and a
+/// chunked request's trailers), from fetch, http.get and a raw socket.
+#[test]
+fn request_header_bytes_round_trip_oam_to_oam_as_latin1() {
+    let stdout = run_ok(
+        "header_latin1_round_trip.mjs",
+        "import http from 'node:http';\n\
+         import net from 'node:net';\n\
+         const cps = (s) => [...String(s)].map((c) => c.codePointAt(0).toString(16)).join(' ');\n\
+         const out = [];\n\
+         const served = await oam.serve({ fetch: (req) => new Response(cps(req.headers.get('x'))) });\n\
+         const su = `http://127.0.0.1:${served.port}/`;\n\
+         out.push('serve/fetch ' + (await (await fetch(su, { headers: { x: 'caf\\u00e9' } })).text()));\n\
+         const get = (u) => new Promise((resolve, reject) => {\n\
+           http.get(u, { headers: { x: 'caf\\u00e9' } }, (res) => {\n\
+             let b = ''; res.setEncoding('latin1');\n\
+             res.on('data', (c) => (b += c)); res.on('end', () => resolve(b));\n\
+           }).on('error', reject);\n\
+         });\n\
+         out.push('serve/http.get ' + (await get(su)));\n\
+         served.close();\n\
+         const server = http.createServer((req, res) => {\n\
+           req.resume();\n\
+           req.on('end', () => res.end([cps(req.headers.x),\n\
+             cps(req.rawHeaders[req.rawHeaders.findIndex((n, i) => i % 2 === 0 && n.toLowerCase() === 'x') + 1]),\n\
+             cps(req.trailers.t ?? '')].join(' / ')));\n\
+         });\n\
+         await new Promise((r) => server.listen(0, '127.0.0.1', r));\n\
+         const nu = `http://127.0.0.1:${server.address().port}/`;\n\
+         out.push('http/fetch ' + (await (await fetch(nu, { headers: { x: 'caf\\u00e9' } })).text()));\n\
+         out.push('http/http.get ' + (await get(nu)));\n\
+         const raw = await new Promise((resolve, reject) => {\n\
+           const socket = net.connect(server.address().port, '127.0.0.1', () => {\n\
+             socket.write(Buffer.from('POST / HTTP/1.1\\r\\nhost: x\\r\\nconnection: close\\r\\n' +\n\
+               'transfer-encoding: chunked\\r\\nx: caf\\u00e9\\r\\n\\r\\n1\\r\\na\\r\\n0\\r\\nt: \\u00ff\\u00e9\\r\\n\\r\\n', 'latin1'));\n\
+           });\n\
+           let text = ''; socket.setEncoding('latin1');\n\
+           socket.on('data', (c) => (text += c));\n\
+           socket.on('end', () => resolve(text.split('\\r\\n\\r\\n').slice(1).join('').split('\\r\\n').find((l) => l.includes('/'))));\n\
+           socket.on('error', reject);\n\
+         });\n\
+         out.push('http/raw ' + raw);\n\
+         server.close();\n\
+         console.log(out.join('|'));",
+    );
+    assert_eq!(
+        stdout,
+        "serve/fetch 63 61 66 e9|serve/http.get 63 61 66 e9|\
+         http/fetch 63 61 66 e9 / 63 61 66 e9 / |http/http.get 63 61 66 e9 / 63 61 66 e9 / |\
+         http/raw 63 61 66 e9 / 63 61 66 e9 / ff e9"
+    );
+}
+
 /// `oam.serve`'s `close()` finishes the requests in flight and closes every
 /// other connection -- one that connected and never sent a request
 /// included. A client pool opens such a connection (fetch's spare, raced

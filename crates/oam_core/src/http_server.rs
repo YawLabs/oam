@@ -1799,16 +1799,19 @@ async fn collect_body(
 }
 
 /// A header map's fields as JS reads them: lowercased names, each value on
-/// its own.
+/// its own, one code point per byte (latin1). node's http parser and its
+/// http2 session both decode a header value that way, and oam's client and
+/// node's write one that way, so `caf\xe9` reads as `café` -- decoding it as
+/// UTF-8 turned the 0xE9 into U+FFFD. Used for request heads and trailers.
 fn header_pairs(map: &hyper::HeaderMap) -> Vec<(String, String)> {
     map.iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_string(),
-                String::from_utf8_lossy(value.as_bytes()).into_owned(),
-            )
-        })
+        .map(|(name, value)| (name.as_str().to_string(), latin1(value.as_bytes())))
         .collect()
+}
+
+/// Bytes as a string of the code points U+0000..=U+00FF, one per byte.
+fn latin1(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| char::from(b)).collect()
 }
 
 /// Service-level error returned only for ResponseBody::Abort: hyper drops
