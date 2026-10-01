@@ -569,7 +569,11 @@
       // oam's own Blob holds its bytes, and they never change. Anything else
       // that passes for one is read through its stream.
       if (object._bytes instanceof Uint8Array) state.bytes = object._bytes;
-      else state.stream = object.stream();
+      else {
+        state.stream = object.stream();
+        // What fetch sends as its content-length, as undici does.
+        state.size = object.size;
+      }
     } else if (object instanceof ArrayBuffer || ArrayBuffer.isView(object)) {
       const view =
         object instanceof ArrayBuffer
@@ -2256,11 +2260,29 @@
       cache: state.cache,
     };
     const body = bodyStates.get(request) ?? null;
+    // A Blob that is not oam's own: its bytes are read before the request
+    // goes out (oamFetch), as `flat.body` stays its stream until then.
+    let collect = false;
     if (body !== null) {
       // The Request already put the body's content-type in its headers.
-      if (body.stream !== null) {
+      //
+      // Only a caller's stream is sent as a stream. Any other body has a
+      // known length and can be sent again on a 307 or 308, and undici keeps
+      // it so (its `source`) even once `.body`, `clone()` or
+      // `new Request(request)` has given it a stream: node sends its
+      // content-length and replays it on the redirect. The stream `.body`
+      // made over the bytes counts for nothing unless someone has read from
+      // it, which the Request constructor has already refused.
+      const untouched =
+        body.stream === null || (!body.stream.locked && body.stream._disturbed !== true);
+      if (body.kind !== "stream" && body.bytes !== null && untouched) {
+        flat.body = body.text ?? body.bytes;
+      } else if (body.stream !== null) {
         flat.body = body.stream;
         flat.duplex = "half";
+        // undici sends a Blob's size as its content-length, and reads it
+        // again for a redirect.
+        if (body.kind === "blob" && untouched) collect = { size: body.size };
       } else {
         flat.body = body.text ?? body.bytes;
       }
@@ -2271,7 +2293,32 @@
     for (const key of Object.keys(init ?? {})) {
       if (key.startsWith("__oam")) flat[key] = init[key];
     }
-    return { url: state.url, init: flat };
+    return { url: state.url, init: flat, collect };
+  }
+
+  // A foreign Blob's bytes, read off its stream: undici sends them with the
+  // Blob's `size` as the content-length (measured on node v22.22.2), each
+  // chunk converted as a streamed upload's is, and a stream that comes out
+  // a different length fails as undici's length check fails it.
+  async function collectBlobStream(stream, size) {
+    const reader = stream.getReader();
+    const chunks = [];
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        chunks.push(uploadChunk(value));
+      }
+    } catch (e) {
+      throw new TypeError("fetch failed", { cause: e });
+    }
+    const bytes = concatBytes(chunks);
+    if (bytes.length !== Number(size)) {
+      const cause = new Error("Request body length does not match content-length header");
+      cause.name = "RequestContentLengthMismatchError";
+      throw new TypeError("fetch failed", { cause });
+    }
+    return bytes;
   }
 
   // The request headers undici's fetch adds of its own (fetch/index.js
@@ -2320,13 +2367,15 @@
     // Internal callers that are not fetch in node (http.request, the http2
     // client, undici.request) opt out of every Fetch-level rule below.
     const fetchSemantics = init?.__oamFetchSemantics !== false;
-    if (fetchSemantics) ({ url: input, init } = fetchRequest(input, init));
+    let collect = false;
+    if (fetchSemantics) ({ url: input, init, collect } = fetchRequest(input, init));
     init = init || {};
     const signal = init.signal;
     // Already-aborted: reject before touching the network (spec).
     if (signal?.aborted) {
       throw signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
     }
+    if (collect) init.body = await collectBlobStream(init.body, collect.size);
     // undici's DISPATCH-level rules are a smaller set that node applies to
     // `undici.request` as well, because both build the same internal Request:
     // the five hop-by-hop header refusals and the content-length check, but
