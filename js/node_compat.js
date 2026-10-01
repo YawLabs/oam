@@ -20261,12 +20261,50 @@
         if (this._header === null) this._header = this._renderHead();
       }
       flushHeaders() {
+        // node sends the head joined to '' (no encoding): as UTF-8.
+        this._noteFirstSend("", undefined, false);
         // The fetch path sends headers with the body. The agent path sends
         // them now, the body following over the channel.
         if (this._agentPath && !this._sent && !this.finished) this._startBodyStream(true);
       }
+      // node keeps the head as a string and writes it joined to the first
+      // thing sent after it (OutgoingMessage#_send), as a server response
+      // does: joined to a string body in utf8 (or no encoding) that no
+      // chunk-size line goes ahead of, the head -- each header value -- goes
+      // out as UTF-8; before anything else, one byte per code point. So
+      // `café` goes out as caf\xc3\xa9 from req.end('text'), a GET's
+      // write('text') or flushHeaders(), and as caf\xe9 from req.end(), a
+      // Buffer, or a POST's write('text') (chunked). Measured on node
+      // v22.22.2; oam sent every value one byte per code point. The first
+      // send decides, once.
+      _noteFirstSend(chunk, encoding, fromEnd) {
+        if (this._utf8Head !== undefined) return;
+        this._utf8Head = false;
+        if (fromEnd && !chunk) return;
+        if (typeof chunk !== "string" || (encoding && encoding !== "utf8")) return;
+        this._utf8Head = chunk.length === 0 || !this._nodeChunks(fromEnd);
+      }
+      // Whether node's head for this request frames the body chunked: a
+      // transfer-encoding header says, a content-length header means no, as
+      // does end() building the head (it knows the length); otherwise node
+      // chunks the body of every method but GET, HEAD, DELETE, OPTIONS,
+      // TRACE and CONNECT (useChunkedEncodingByDefault).
+      _nodeChunks(fromEnd) {
+        var te = this._headers["transfer-encoding"];
+        if (te !== undefined) return CHUNKED_CODING.test(te);
+        if (this._headers["content-length"] !== undefined || fromEnd) return false;
+        return !/^(?:GET|HEAD|DELETE|OPTIONS|TRACE|CONNECT)$/.test(this.method);
+      }
+      // A header value as the transport writes it, one byte per code point:
+      // for a head node sends as UTF-8, the value's UTF-8 bytes. Only a
+      // value outside ASCII differs, and only such a one is copied.
+      _wireValue(value) {
+        if (this._utf8Head !== true || !NON_ASCII.test(value)) return value;
+        return globalThis.Buffer.from(value, "utf8").toString("latin1");
+      }
       write(chunk, encoding, callback) {
         if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+        this._noteFirstSend(chunk, encoding, false);
         var bytes;
         if (typeof chunk === "string") {
           bytes = globalThis.Buffer.from(chunk, encoding || "utf8");
@@ -20391,6 +20429,7 @@
           }
           return this;
         }
+        this._noteFirstSend(data, encoding, true);
         if (data != null) this.write(data, encoding);
         this._ended = true;
         this.finished = true;
@@ -20635,9 +20674,18 @@
         // same both times.
         var headers = self._headers;
         var connection = self._connectionHeader();
-        if (connection !== null) {
+        if (connection !== null || self._utf8Head === true) {
           headers = Object.assign({ __proto__: null }, headers);
-          headers.connection = connection;
+          if (connection !== null) headers.connection = connection;
+          // A head node writes as UTF-8 (_noteFirstSend).
+          if (self._utf8Head === true) {
+            for (var key in headers) {
+              var value = headers[key];
+              headers[key] = Array.isArray(value)
+                ? value.map(function (item) { return self._wireValue(String(item)); })
+                : self._wireValue(String(value));
+            }
+          }
         }
         var fetchOpts = {
           method: self.method,
@@ -21177,10 +21225,13 @@
           this._upgradeOver(socket, bodyData);
           return;
         }
+        var self = this;
         var request = {
           method: this.method,
           target: this.path,
-          headers: this._headerList(true),
+          headers: this._headerList(true).map(function (pair) {
+            return [pair[0], self._wireValue(pair[1])];
+          }),
           max_header_size: this._maxHeaderSizeLimit(),
         };
         if (this._bodyStream !== null) {
@@ -21443,7 +21494,9 @@
           self._requestWritten = true;
           if (self._finishOnWrite) self._emitFinish();
         };
-        var headBytes = globalThis.Buffer.from(head + "\r\n", "latin1");
+        // As node writes it: UTF-8 for a head joined to a UTF-8 string body
+        // (_noteFirstSend), else one byte per code point.
+        var headBytes = globalThis.Buffer.from(head + "\r\n", this._utf8Head === true ? "utf8" : "latin1");
         if (bodyData && bodyData.length > 0) {
           socket.write(headBytes);
           socket.write(bodyData, written);
@@ -22433,6 +22486,9 @@
     // node's `chunked` test of a transfer-encoding value (RE_TE_CHUNKED,
     // and chunkExpression for a request's TE).
     var CHUNKED_CODING = /(?:^|\W)chunked(?:$|\W)/i;
+    // A character outside ASCII: the only kind whose bytes depend on how a
+    // head is written.
+    var NON_ASCII = /[^\x00-\x7f]/;
     // node's validateHeaderName / validateHeaderValue (lib/_http_outgoing.js),
     // exported as http.validateHeaderName / http.validateHeaderValue and run
     // by every outgoing header method, client and server: a name that is not

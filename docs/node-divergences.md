@@ -1854,7 +1854,12 @@ the header methods throw `ERR_HTTP_HEADERS_SENT`. A value up to U+00FF goes on t
 Node writes it, which depends on what is sent first: joined to a string body in utf8 (or no
 encoding) the head is UTF-8 (`café` is `caf\xc3\xa9` from `res.end('text')` or
 `flushHeaders()`), and before anything else -- a chunk-size line, a Buffer, a string in
-another encoding, nothing -- it is one byte per code point (`caf\xe9`). Up to 0.17.1 oam
+another encoding, nothing -- it is one byte per code point (`caf\xe9`). An `http.request`'s
+head follows the same rule, on every path oam sends it by -- its own transport, an agent's
+socket, a head written by hand for an upgrade or CONNECT -- (`req.end('text')`, a GET's
+`write('text')`, `flushHeaders()` send UTF-8; `req.end()`, a Buffer, a POST's chunked
+`write('text')` one byte per code point; `conformance/cases/271-http-request-header-bytes.mjs`),
+where oam's client wrote every value one byte per code point. Up to 0.17.1 oam
 stored any header -- `res.setHeader('y', '€')` did not throw -- and wrote every value as its
 UTF-8; a CR or LF reached hyper and was answered `500`. `appendHeader` wrote to the wrong
 store, and `setHeaders` and `addTrailers` did not exist.
