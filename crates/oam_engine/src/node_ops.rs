@@ -5232,12 +5232,13 @@ fn throw_zlib_coded(scope: &mut v8::PinScope<'_, '_>, coded: &oam_core::zlib::Zl
     scope.throw_exception(exception);
 }
 
-/// zlibSync(bytes, format, level, compress, maxOutputLength?, finishFlush?) —
-/// synchronous transform on the isolate thread (the *Sync API contract).
-/// "unzip" auto-detects on decode. `maxOutputLength` (node's option of that
-/// name) bounds the output: while it is produced for a decode, on the
-/// finished buffer for an encode. `finishFlush` (node's option, Z_FINISH by
-/// default) decides whether a decode that stops inside the stream fails.
+/// zlibSync(bytes, format, level, compress, maxOutputLength?, finishFlush?,
+/// dictionary?) — synchronous transform on the isolate thread (the *Sync API
+/// contract). "unzip" auto-detects on decode. `maxOutputLength` (node's
+/// option of that name) bounds the output: while it is produced for a
+/// decode, on the finished buffer for an encode. `finishFlush` (node's
+/// option, Z_FINISH by default) decides whether a decode that stops inside
+/// the stream fails. `dictionary` is node's option, validated by the shim.
 fn op_zlib_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -5252,15 +5253,23 @@ fn op_zlib_sync(
     let compress = args.get(3).is_true();
     let max_output = arg_max_output(scope, &args, 4);
     let finish_flush = arg_finish_flush(scope, &args, 5);
+    let dictionary = arg_bytes(scope, &args, 6);
+    let dictionary = dictionary.as_deref();
     let result = if !compress && format == "unzip" {
-        oam_core::zlib::unzip_capped(&bytes, max_output, finish_flush)
+        oam_core::zlib::unzip_capped(&bytes, max_output, finish_flush, dictionary)
     } else {
         match oam_core::zlib::Format::parse(&format) {
             Some(parsed) => {
                 if compress {
                     oam_core::zlib::compress_capped(&bytes, parsed, level, max_output)
                 } else {
-                    oam_core::zlib::decompress_capped(&bytes, parsed, max_output, finish_flush)
+                    oam_core::zlib::decompress_capped(
+                        &bytes,
+                        parsed,
+                        max_output,
+                        finish_flush,
+                        dictionary,
+                    )
                 }
             }
             None => {
@@ -5279,8 +5288,8 @@ fn op_zlib_sync(
     }
 }
 
-/// zlibAsync(bytes, format, level, compress, maxOutputLength?, finishFlush?)
-/// -> Promise<Uint8Array>.
+/// zlibAsync(bytes, format, level, compress, maxOutputLength?, finishFlush?,
+/// dictionary?) -> Promise<Uint8Array>.
 fn op_zlib_async(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -5295,14 +5304,23 @@ fn op_zlib_async(
     let compress = args.get(3).is_true();
     let max_output = arg_max_output(scope, &args, 4);
     let finish_flush = arg_finish_flush(scope, &args, 5);
+    let dictionary = arg_bytes(scope, &args, 6);
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::zlib_transform(bytes, format, level, compress, max_output, finish_flush),
+        oam_core::ops::zlib_transform(
+            bytes,
+            format,
+            level,
+            compress,
+            max_output,
+            finish_flush,
+            dictionary,
+        ),
     );
 }
 
-/// zlibStreamCreate(format, level, compress) -> Promise<{handle}>.
+/// zlibStreamCreate(format, level, compress, dictionary?) -> Promise<{handle}>.
 /// Allocates an incremental compressor or decompressor in the stream
 /// registry. The handle is passed to subsequent write/flush/close calls.
 fn op_zlib_stream_create(
@@ -5313,13 +5331,14 @@ fn op_zlib_stream_create(
     let format = arg_string(scope, &args, 0).unwrap_or_default();
     let level = args.get(1).int32_value(scope).unwrap_or(-1);
     let compress = args.get(2).is_true();
+    let dictionary = arg_bytes(scope, &args, 3);
     let core = core_runtime!(scope);
     let streams = core.zlib_streams();
     let ids = core.body_ids();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::zlib_stream_create(streams, ids, format, level, compress),
+        oam_core::ops::zlib_stream_create(streams, ids, format, level, compress, dictionary),
     );
 }
 
@@ -5376,7 +5395,7 @@ fn op_zlib_stream_close(
     oam_core::ops::zlib_stream_close(&streams, handle);
 }
 
-/// zlibHandleCreate(mode, level) -> handle (number).
+/// zlibHandleCreate(mode, level, dictionary?) -> handle (number).
 /// Allocates a low-level flate2 Compress/Decompress for Node's internal
 /// zlib binding interface (ssh2's ZlibHandle pattern).
 fn op_zlib_handle_create(
@@ -5386,10 +5405,11 @@ fn op_zlib_handle_create(
 ) {
     let mode = args.get(0).int32_value(scope).unwrap_or(0);
     let level = args.get(1).int32_value(scope).unwrap_or(-1);
+    let dictionary = arg_bytes(scope, &args, 2);
     let core = core_runtime!(scope);
     let streams = core.zlib_streams();
     let ids = core.body_ids();
-    match oam_core::ops::zlib_handle_create(&streams, &ids, mode, level) {
+    match oam_core::ops::zlib_handle_create(&streams, &ids, mode, level, dictionary.as_deref()) {
         Ok(handle) => {
             let val = v8::Number::new(scope, handle as f64);
             rv.set(val.into());

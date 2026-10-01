@@ -2624,7 +2624,7 @@ pub mod zlib {
     pub const Z_FINISH: i32 = 4;
 
     pub fn decompress(bytes: &[u8], format: Format) -> std::io::Result<Vec<u8>> {
-        decompress_capped(bytes, format, None, Z_FINISH)
+        decompress_capped(bytes, format, None, Z_FINISH, None)
     }
 
     /// Decompress, giving up as soon as the output passes `max_output` bytes.
@@ -2638,19 +2638,21 @@ pub mod zlib {
     /// A decode failure is an `io::Error` wrapping a [`ZlibError`] (see
     /// [`zlib_error`]): node's code, errno and message for it.
     ///
-    /// `finish_flush` is node's `finishFlush` option (see [`inflate_all`]).
+    /// `finish_flush` is node's `finishFlush` option (see [`inflate_all`]),
+    /// `dictionary` its `dictionary` (see [`NodeInflate::with_dictionary`]).
     pub fn decompress_capped(
         bytes: &[u8],
         format: Format,
         max_output: Option<usize>,
         finish_flush: i32,
+        dictionary: Option<&[u8]>,
     ) -> std::io::Result<Vec<u8>> {
         let wrap = match format {
             Format::Gzip => Wrap::Gzip,
             Format::Deflate => Wrap::Zlib,
             Format::DeflateRaw => Wrap::Raw,
         };
-        inflate_all(bytes, wrap, max_output, finish_flush)
+        inflate_all(bytes, wrap, max_output, finish_flush, dictionary)
     }
 
     /// Inflate the whole of `bytes` under node's one-shot finishing flush,
@@ -2668,8 +2670,9 @@ pub mod zlib {
         wrap: Wrap,
         max_output: Option<usize>,
         finish_flush: i32,
+        dictionary: Option<&[u8]>,
     ) -> std::io::Result<Vec<u8>> {
-        let mut dec = NodeInflate::new(wrap);
+        let mut dec = NodeInflate::with_dictionary(wrap, dictionary);
         let mut out = Vec::new();
         let mut buf = vec![0u8; crate::inflate::STEP_OUT];
         let mut input = bytes;
@@ -2712,10 +2715,13 @@ pub mod zlib {
             // 16 MiB; and the cap boundary is exact.
             let size = 16 * 1024 * 1024;
             let bomb = compress(&vec![b' '; size], Format::Gzip, 6).unwrap();
-            let err = decompress_capped(&bomb, Format::Gzip, Some(1024), Z_FINISH).unwrap_err();
+            let err =
+                decompress_capped(&bomb, Format::Gzip, Some(1024), Z_FINISH, None).unwrap_err();
             assert_eq!(err.to_string(), OUTPUT_TOO_LARGE);
-            assert!(decompress_capped(&bomb, Format::Gzip, Some(size), Z_FINISH).is_ok());
-            assert!(decompress_capped(&bomb, Format::Gzip, Some(size - 1), Z_FINISH).is_err());
+            assert!(decompress_capped(&bomb, Format::Gzip, Some(size), Z_FINISH, None).is_ok());
+            assert!(
+                decompress_capped(&bomb, Format::Gzip, Some(size - 1), Z_FINISH, None).is_err()
+            );
         }
 
         #[test]
@@ -2725,19 +2731,20 @@ pub mod zlib {
             let mut two = compress(b"hello", Format::Gzip, 6).unwrap();
             two.extend(compress(b"world", Format::Gzip, 6).unwrap());
             assert_eq!(
-                decompress_capped(&two, Format::Gzip, None, Z_FINISH).unwrap(),
+                decompress_capped(&two, Format::Gzip, None, Z_FINISH, None).unwrap(),
                 b"helloworld"
             );
             assert_eq!(unzip(&two).unwrap(), b"helloworld");
-            let err =
-                decompress_capped(b"not gzip at all", Format::Gzip, None, Z_FINISH).unwrap_err();
+            let err = decompress_capped(b"not gzip at all", Format::Gzip, None, Z_FINISH, None)
+                .unwrap_err();
             let coded = zlib_error(&err).expect("a coded zlib error");
             assert_eq!(
                 (coded.code, coded.errno, coded.message),
                 ("Z_DATA_ERROR", -3, "incorrect header check")
             );
             let packed = compress(b"hello world hello world", Format::Deflate, 6).unwrap();
-            let err = decompress_capped(&packed[..8], Format::Deflate, None, Z_FINISH).unwrap_err();
+            let err =
+                decompress_capped(&packed[..8], Format::Deflate, None, Z_FINISH, None).unwrap_err();
             let coded = zlib_error(&err).expect("a coded zlib error");
             assert_eq!((coded.code, coded.errno), ("Z_BUF_ERROR", -5));
         }
@@ -2752,25 +2759,28 @@ pub mod zlib {
                 let packed = compress(&plain, format, 6).unwrap();
                 let cut = &packed[..packed.len() / 2];
                 for flush in [0, 1, 2, 3, 5] {
-                    let out = decompress_capped(cut, format, None, flush).unwrap();
+                    let out = decompress_capped(cut, format, None, flush, None).unwrap();
                     assert!(
                         !out.is_empty() && plain.starts_with(&out),
                         "{format:?} {flush}"
                     );
-                    let whole = decompress_capped(&packed, format, None, flush).unwrap();
+                    let whole = decompress_capped(&packed, format, None, flush, None).unwrap();
                     assert_eq!(whole, plain, "{format:?} {flush}");
                 }
-                let err = decompress_capped(cut, format, None, Z_FINISH).unwrap_err();
+                let err = decompress_capped(cut, format, None, Z_FINISH, None).unwrap_err();
                 assert_eq!(zlib_error(&err).map(|e| e.code), Some("Z_BUF_ERROR"));
             }
             // A decode error is still one under a lenient flush.
             let junk = [0xffu8, 0x00, 0x01, 0x02, 0x03, 0x04];
-            assert!(decompress_capped(&junk, Format::Gzip, None, 2).is_err());
-            assert!(decompress_capped(&junk, Format::Deflate, None, 2).is_err());
+            assert!(decompress_capped(&junk, Format::Gzip, None, 2, None).is_err());
+            assert!(decompress_capped(&junk, Format::Deflate, None, 2, None).is_err());
             let gz = compress(&plain, Format::Gzip, 6).unwrap();
-            assert_eq!(unzip_capped(&gz[..gz.len() - 4], None, 2).unwrap(), plain);
-            assert!(unzip_capped(&[], None, 2).unwrap().is_empty());
-            assert!(unzip_capped(&[], None, Z_FINISH).is_err());
+            assert_eq!(
+                unzip_capped(&gz[..gz.len() - 4], None, 2, None).unwrap(),
+                plain
+            );
+            assert!(unzip_capped(&[], None, 2, None).unwrap().is_empty());
+            assert!(unzip_capped(&[], None, Z_FINISH, None).is_err());
         }
     }
 
@@ -2792,17 +2802,18 @@ pub mod zlib {
 
     /// Node's unzip*: auto-detect gzip (1f 8b magic) vs zlib-wrapped.
     pub fn unzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
-        unzip_capped(bytes, None, Z_FINISH)
+        unzip_capped(bytes, None, Z_FINISH, None)
     }
 
-    /// `unzip` with node's `maxOutputLength` and `finishFlush`; see
-    /// `decompress_capped`.
+    /// `unzip` with node's `maxOutputLength`, `finishFlush` and
+    /// `dictionary`; see `decompress_capped`.
     pub fn unzip_capped(
         bytes: &[u8],
         max_output: Option<usize>,
         finish_flush: i32,
+        dictionary: Option<&[u8]>,
     ) -> std::io::Result<Vec<u8>> {
-        inflate_all(bytes, Wrap::Auto, max_output, finish_flush)
+        inflate_all(bytes, Wrap::Auto, max_output, finish_flush, dictionary)
     }
 
     // ----------------------------------------------------------------
@@ -2921,22 +2932,15 @@ pub mod zlib {
     }
 
     impl StreamDecompressor {
-        fn with(wrap: Wrap) -> Self {
+        /// An inflate stream reading `wrap`, with node's `dictionary` option;
+        /// see [`NodeInflate::with_dictionary`].
+        pub fn new(wrap: Wrap, dictionary: Option<&[u8]>) -> Self {
             Self {
-                inner: Box::new(NodeInflate::new(wrap)),
+                inner: Box::new(NodeInflate::with_dictionary(wrap, dictionary)),
             }
         }
-        pub fn new_gzip() -> Self {
-            Self::with(Wrap::Gzip)
-        }
-        pub fn new_deflate() -> Self {
-            Self::with(Wrap::Zlib)
-        }
-        pub fn new_deflate_raw() -> Self {
-            Self::with(Wrap::Raw)
-        }
         pub fn new_unzip() -> Self {
-            Self::with(Wrap::Auto)
+            Self::new(Wrap::Auto, None)
         }
 
         /// Feed one chunk of compressed data. Returns the decompressed bytes
@@ -4437,13 +4441,15 @@ pub mod ops {
     /// zlibStreamCreate: allocate an incremental compressor or decompressor.
     /// Returns Json {handle} on success. compress=true for encoding,
     /// false for decoding. format must be "gzip", "deflate", "deflateRaw",
-    /// "unzip" (decompress only), or "brotli".
+    /// "unzip" (decompress only), or "brotli". `dictionary` is node's option
+    /// of that name (brotli has none).
     pub async fn zlib_stream_create(
         streams: super::ZlibRegistry,
         ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
         format: String,
         level: i32,
         compress: bool,
+        dictionary: Option<Vec<u8>>,
     ) -> OpOutcome {
         // Stream allocation is cheap: do it inline (no IO).
         let stream = if format == "brotli" {
@@ -4459,14 +4465,17 @@ pub mod ops {
             };
             super::ZlibStream::Compress(super::zlib::StreamCompressor::new(fmt, level))
         } else {
-            let dec = match format.as_str() {
-                "gzip" => super::zlib::StreamDecompressor::new_gzip(),
-                "deflate" => super::zlib::StreamDecompressor::new_deflate(),
-                "deflateRaw" => super::zlib::StreamDecompressor::new_deflate_raw(),
-                "unzip" => super::zlib::StreamDecompressor::new_unzip(),
+            let wrap = match format.as_str() {
+                "gzip" => super::zlib::Wrap::Gzip,
+                "deflate" => super::zlib::Wrap::Zlib,
+                "deflateRaw" => super::zlib::Wrap::Raw,
+                "unzip" => super::zlib::Wrap::Auto,
                 _ => return OpOutcome::Failed(format!("zlib stream: unknown format '{format}'")),
             };
-            super::ZlibStream::Decompress(dec)
+            super::ZlibStream::Decompress(super::zlib::StreamDecompressor::new(
+                wrap,
+                dictionary.as_deref(),
+            ))
         };
         let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         streams
@@ -4602,12 +4611,14 @@ pub mod ops {
 
     /// zlibHandleCreate: allocate a low-level flate2 Compress or NodeInflate
     /// handle for Node's zlib binding interface (used by ssh2 etc.).
-    /// mode: 1=DEFLATE, 2=INFLATE, 5=DEFLATERAW, 6=INFLATERAW.
+    /// mode: 1=DEFLATE, 2=INFLATE, 5=DEFLATERAW, 6=INFLATERAW. `dictionary`
+    /// is the one node's `handle.init` takes.
     pub fn zlib_handle_create(
         streams: &super::ZlibRegistry,
         ids: &std::sync::Arc<std::sync::atomic::AtomicU64>,
         mode: i32,
         level: i32,
+        dictionary: Option<&[u8]>,
     ) -> Result<u64, String> {
         let zlib_header = mode == 1 || mode == 2;
         let stream = match mode {
@@ -4619,12 +4630,12 @@ pub mod ops {
                 };
                 super::ZlibStream::HandleCompress(flate2::Compress::new(lvl, zlib_header))
             }
-            2 => super::ZlibStream::HandleDecompress(Box::new(super::zlib::NodeInflate::new(
-                super::zlib::Wrap::Zlib,
-            ))),
-            6 => super::ZlibStream::HandleDecompress(Box::new(super::zlib::NodeInflate::new(
-                super::zlib::Wrap::Raw,
-            ))),
+            2 => super::ZlibStream::HandleDecompress(Box::new(
+                super::zlib::NodeInflate::with_dictionary(super::zlib::Wrap::Zlib, dictionary),
+            )),
+            6 => super::ZlibStream::HandleDecompress(Box::new(
+                super::zlib::NodeInflate::with_dictionary(super::zlib::Wrap::Raw, dictionary),
+            )),
             _ => return Err(format!("zlib handle: unknown mode {mode}")),
         };
         let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4705,6 +4716,7 @@ pub mod ops {
     /// `max_output` is node's `maxOutputLength` for a decode; `None` is no cap.
     /// `finish_flush` is node's `finishFlush` for a decode (see
     /// `zlib::decompress_capped`); an encode always finishes the stream.
+    /// `dictionary` is node's option of that name.
     pub async fn zlib_transform(
         bytes: Vec<u8>,
         format: String,
@@ -4712,10 +4724,16 @@ pub mod ops {
         compress: bool,
         max_output: Option<usize>,
         finish_flush: i32,
+        dictionary: Option<Vec<u8>>,
     ) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || {
             if !compress && format == "unzip" {
-                return super::zlib::unzip_capped(&bytes, max_output, finish_flush);
+                return super::zlib::unzip_capped(
+                    &bytes,
+                    max_output,
+                    finish_flush,
+                    dictionary.as_deref(),
+                );
             }
             let Some(parsed) = super::zlib::Format::parse(&format) else {
                 return Err(std::io::Error::new(
@@ -4726,7 +4744,13 @@ pub mod ops {
             if compress {
                 super::zlib::compress_capped(&bytes, parsed, level, max_output)
             } else {
-                super::zlib::decompress_capped(&bytes, parsed, max_output, finish_flush)
+                super::zlib::decompress_capped(
+                    &bytes,
+                    parsed,
+                    max_output,
+                    finish_flush,
+                    dictionary.as_deref(),
+                )
             }
         })
         .await;

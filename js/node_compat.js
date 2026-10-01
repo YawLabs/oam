@@ -17321,7 +17321,7 @@
         this._writeState = writeState;
         this._processCallback = processCallback;
         const effectiveLevel = (this._mode === DEFLATE || this._mode === DEFLATERAW) ? (level != null ? level : -1) : -1;
-        this._nativeHandle = natives.zlibHandleCreate(this._mode, effectiveLevel);
+        this._nativeHandle = natives.zlibHandleCreate(this._mode, effectiveLevel, dictionary);
       }
       writeSync(flush, chunk, inOff, inLen, buffer, outOff, outLen) {
         const input = (chunk && inLen > 0) ? chunk.subarray(inOff, inOff + inLen) : new Uint8Array(0);
@@ -17405,13 +17405,32 @@
     };
     const translate = (err, max) =>
       err instanceof Error && err.message === OUTPUT_TOO_LARGE ? bufferTooLarge(max) : err;
+    // node's Zlib constructor reads options.dictionary for every zlib class
+    // (gzip and gunzip accept it and do not use it): a Buffer, TypedArray or
+    // DataView is used as is, an ArrayBuffer is wrapped, and anything else --
+    // null included -- is ERR_INVALID_ARG_TYPE, thrown before ZlibBase
+    // checks flush, finishFlush and maxOutputLength. Brotli has no such
+    // option. The natives read the view's bytes.
+    const dictionaryOf = (options) => {
+      const value = options?.dictionary;
+      if (value === undefined || ArrayBuffer.isView(value)) return value;
+      if (isAnyArrayBuffer(value)) return new Uint8Array(value);
+      throw codes.ERR_INVALID_ARG_TYPE(
+        "options.dictionary",
+        ["Buffer", "TypedArray", "DataView", "ArrayBuffer"],
+        value,
+      );
+    };
 
     const sync = (format, compress) => (data, options) => {
+      const dictionary = dictionaryOf(options);
       const finishFlush = finishFlushOf(options);
       const max = maxOutputLengthOf(options);
       try {
         return asBuffer(
-          natives.zlibSync(toBytes(data), format, levelOf(options), compress, max, finishFlush),
+          natives.zlibSync(
+            toBytes(data), format, levelOf(options), compress, max, finishFlush, dictionary,
+          ),
         );
       } catch (err) {
         throw translate(err, max);
@@ -17423,9 +17442,12 @@
         options = undefined;
       }
       // Validation throws synchronously, as node's does.
+      const dictionary = dictionaryOf(options);
       const finishFlush = finishFlushOf(options);
       const max = maxOutputLengthOf(options);
-      natives.zlibAsync(toBytes(data), format, levelOf(options), compress, max, finishFlush).then(
+      natives.zlibAsync(
+        toBytes(data), format, levelOf(options), compress, max, finishFlush, dictionary,
+      ).then(
         (bytes) => callback(null, asBuffer(bytes)),
         (err) => callback(translate(err, max)),
       );
@@ -17447,11 +17469,14 @@
       const { Transform } = registry.get("stream");
       return class extends Transform {
         constructor(options) {
-          // brotli's flush values are BROTLI_OPERATION_*, not zlib's.
+          // brotli's flush values are BROTLI_OPERATION_*, not zlib's, and
+          // it has no dictionary option.
+          const dictionary = format === "brotli" ? undefined : dictionaryOf(options);
           const finishFlush = format === "brotli" ? undefined : finishFlushOf(options);
           super({});
           this._zlibLevel = levelOf(options);
           this._zlibFinishFlush = finishFlush;
+          this._zlibDictionary = dictionary;
           // _zlibHandle is null until the first chunk arrives.
           this._zlibHandle = null;
           // Promise serializing back-to-back _transform calls so we
@@ -17463,9 +17488,9 @@
         // Lazily allocate the Rust-side stream on first use.
         _ensureStream() {
           if (this._zlibHandle !== null) return Promise.resolve();
-          return natives.zlibStreamCreate(format, this._zlibLevel, compress).then(
-            (info) => { this._zlibHandle = info.handle; },
-          );
+          return natives.zlibStreamCreate(
+            format, this._zlibLevel, compress, this._zlibDictionary,
+          ).then((info) => { this._zlibHandle = info.handle; });
         }
 
         _transform(chunk, _encoding, cb) {
@@ -17486,7 +17511,9 @@
             if (this._zlibHandle === null) {
               // No data was ever written -- create+immediately flush an
               // empty stream so the output is a valid (empty) archive.
-              return natives.zlibStreamCreate(format, this._zlibLevel, compress)
+              return natives.zlibStreamCreate(
+                format, this._zlibLevel, compress, this._zlibDictionary,
+              )
                 .then((info) => {
                   this._zlibHandle = info.handle;
                   return natives.zlibStreamFlush(this._zlibHandle, this._zlibFinishFlush);
@@ -17613,9 +17640,10 @@
       self._buffer = BufferCtor.allocUnsafe(chunkSize);
       self._outBuffer = self._buffer;
       self._hadError = false;
+      const dictionary = dictionaryOf(opts);
       self._finishFlushFlag = finishFlushOf(opts);
       const handle = new ZlibHandle(mode);
-      handle.init(15, levelOf(opts), 8, 0, self._writeState, () => {}, opts.dictionary);
+      handle.init(15, levelOf(opts), 8, 0, self._writeState, () => {}, dictionary);
       self._handle = handle;
       return self;
     }
