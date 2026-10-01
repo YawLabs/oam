@@ -89,3 +89,24 @@ await new Promise((resolve) => {
     },
   );
 });
+
+// The timer is the runtime's own, not whatever the global setTimeout is now:
+// a fake-timer library's replacement returns a number, and calling unref() on
+// it threw, so AbortSignal.timeout() failed under mocked timers. Node arms it
+// with its internal timers and never calls the global.
+{
+  const saved = globalThis.setTimeout;
+  let calls = 0;
+  globalThis.setTimeout = () => {
+    calls++;
+    return 1;
+  };
+  try {
+    const signal = AbortSignal.timeout(10);
+    console.log("with setTimeout replaced:", signal.aborted, "global called", calls);
+  } catch (e) {
+    console.log("with setTimeout replaced: throws", e.name, e.message);
+  } finally {
+    globalThis.setTimeout = saved;
+  }
+}

@@ -348,7 +348,11 @@
         throw new codes.ERR_OUT_OF_RANGE("delay", ">= 0 && <= 4294967295", delay);
       }
       const signal = new AbortSignal();
-      const timer = globalThis.setTimeout(() => {
+      // The runtime's setTimeout, not the global: a replaced global (fake
+      // timers, which return a number) neither runs this timer nor has an
+      // unref() to call -- node arms it with its internal timers too.
+      const setTimer = globalThis.__oamNode._setTimeout ?? globalThis.setTimeout;
+      const timer = setTimer(() => {
         signal._fire(
           new globalThis.DOMException("The operation was aborted due to timeout", "TimeoutError"),
         );
@@ -358,7 +362,7 @@
       // process alive. Ref'd, `fetch(url, { signal: AbortSignal.timeout(5000) })`
       // held the process open for the full five seconds after the response
       // had been read.
-      timer.unref();
+      if (typeof timer?.unref === "function") timer.unref();
       return signal;
     }
     static any(signals) {

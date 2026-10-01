@@ -34228,6 +34228,11 @@
         clearTimer(handle, nativeClearTimeout);
       };
       registry._Timeout = Timeout;
+      // The runtime's own setTimeout, for internals that must keep working
+      // when a program (or a fake-timer library such as oam:test's
+      // mock.timers) replaces the global: AbortSignal.timeout arms and unrefs
+      // its timer with this, as node's arms it with its internal timers.
+      registry._setTimeout = globalThis.setTimeout;
       // Exported for process.nextTick's per-entry ALS frame binding: each
       // queued tick captures the frame of ITS nextTick() call, not the frame
       // of whichever call scheduled the drain microtask.
