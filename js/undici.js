@@ -99,6 +99,22 @@
         }
       };
     }
+    // undici 6.29.0's (lib/core/errors.js): AbortError is `UND_ERR_ABORT`,
+    // "The operation was aborted", and RequestAbortedError is one -- named
+    // AbortError too, with its own code and message -- so a caller's
+    // `err instanceof errors.AbortError` catches a refused proxy tunnel.
+    class AbortError extends UndiciError {
+      constructor(message) {
+        super(message || "The operation was aborted", "UND_ERR_ABORT");
+        this.name = "AbortError";
+      }
+    }
+    class RequestAbortedError extends AbortError {
+      constructor(message) {
+        super(message || "Request aborted");
+        this.code = "UND_ERR_ABORTED";
+      }
+    }
     const errors = {
       UndiciError,
       ConnectTimeoutError: mkError("ConnectTimeoutError", "UND_ERR_CONNECT_TIMEOUT"),
@@ -107,15 +123,8 @@
       BodyTimeoutError: mkError("BodyTimeoutError", "UND_ERR_BODY_TIMEOUT"),
       RequestContentLengthMismatchError: mkError("RequestContentLengthMismatchError", "UND_ERR_REQ_CONTENT_LENGTH_MISMATCH"),
       ResponseContentLengthMismatchError: mkError("ResponseContentLengthMismatchError", "UND_ERR_RES_CONTENT_LENGTH_MISMATCH"),
-      // undici's RequestAbortedError is an AbortError by name (measured on
-      // undici 6.29.0: name "AbortError", message "Request aborted").
-      RequestAbortedError: class RequestAbortedError extends UndiciError {
-        constructor(message) {
-          super(message || "Request aborted", "UND_ERR_ABORTED");
-          this.name = "AbortError";
-        }
-      },
-      AbortError: mkError("AbortError", "UND_ERR_ABORTED"),
+      RequestAbortedError,
+      AbortError,
       InformationalError: mkError("InformationalError", "UND_ERR_INFO"),
       InvalidArgumentError: mkError("InvalidArgumentError", "UND_ERR_INVALID_ARG"),
       InvalidReturnValueError: mkError("InvalidReturnValueError", "UND_ERR_INVALID_RETURN_VALUE"),

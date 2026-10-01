@@ -5835,6 +5835,9 @@ console.log('mockErrors', e.name, e.code, e instanceof errors.UndiciError);
 console.log('CloseEvent', CloseEvent === globalThis.CloseEvent, typeof EnvHttpProxyAgent);
 const aborted = new errors.RequestAbortedError();
 console.log('RequestAbortedError', aborted.name, aborted.code, aborted.message);
+console.log('RequestAbortedError is', aborted instanceof errors.AbortError, aborted instanceof errors.UndiciError, aborted instanceof Error);
+const abort = new errors.AbortError();
+console.log('AbortError', abort.name, abort.code, abort.message, abort instanceof errors.UndiciError, abort instanceof errors.RequestAbortedError);
 const prx = new errors.SecureProxyConnectionError(new Error('why'));
 console.log('SecureProxyConnectionError', prx.name, prx.code, prx.message, prx.cause.message);
 "##,
@@ -5857,6 +5860,8 @@ factory NotSupportedError UND_ERR_NOT_SUPPORTED A ProxyAgent with a clientFactor
 mockErrors MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED true
 CloseEvent true function
 RequestAbortedError AbortError UND_ERR_ABORTED Request aborted
+RequestAbortedError is true true true
+AbortError AbortError UND_ERR_ABORT The operation was aborted true false
 SecureProxyConnectionError SecureProxyConnectionError UND_ERR_PRX_TLS Secure Proxy Connection failed why"##;
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
