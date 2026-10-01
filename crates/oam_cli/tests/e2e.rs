@@ -26549,6 +26549,97 @@ fn socket_write_signals_backpressure_and_drains() {
     );
 }
 
+// ------------------------------------------------------------------- heap cap
+
+/// `OAM_MAX_HEAP_MB` always yields a cap: a value that is not a positive
+/// number is warned about and ignored, never read as "no cap".
+///
+/// Regression (#223): `0` and any non-numeric value removed oam's cap, which
+/// does not unbound the heap -- V8 then applies its own static limit, about a
+/// third of the 4 GiB default -- and took the near-heap-limit callback with
+/// it, so the death was a raw V8 abort with no `OAM-RT-OOM` banner.
+#[test]
+fn heap_cap_env_always_caps_and_warns_on_an_unusable_value() {
+    let script = write_temp(
+        "heap_cap_env.mjs",
+        "import v8 from 'node:v8';\n\
+         console.log(v8.getHeapStatistics().heap_size_limit);",
+    );
+    let path = script.to_string_lossy().to_string();
+    let limit_of = |value: &str| -> (u64, String) {
+        let out = oam_with_env(&["run", &path], &[("OAM_MAX_HEAP_MB", value)]);
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            out.status.success(),
+            "OAM_MAX_HEAP_MB={value:?}: exit {}; stderr: {stderr}",
+            out.status
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let limit = stdout
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("OAM_MAX_HEAP_MB={value:?}: stdout {stdout:?}: {e}"));
+        (limit, stderr)
+    };
+
+    // Empty is unset: the default cap (4 GiB, or the container-derived one
+    // where the suite runs under a memory limit), and nothing to warn about.
+    let (default_limit, stderr) = limit_of("");
+    assert!(
+        !stderr.contains("OAM_MAX_HEAP_MB"),
+        "an empty value is not a mistake: {stderr}"
+    );
+
+    for bad in ["0", " 0", "-1", "abc", "unlimited"] {
+        let (limit, stderr) = limit_of(bad);
+        assert_eq!(
+            limit, default_limit,
+            "OAM_MAX_HEAP_MB={bad:?} must keep the default cap, not remove it"
+        );
+        let warning = format!(
+            "oam: warning: OAM_MAX_HEAP_MB={bad:?} is not a positive whole number of megabytes"
+        );
+        assert_eq!(
+            stderr.matches(&warning).count(),
+            1,
+            "OAM_MAX_HEAP_MB={bad:?} must be named in exactly one warning: {stderr}"
+        );
+    }
+
+    // A usable value is honoured silently, in both directions.
+    let (small, stderr) = limit_of("64");
+    assert!(
+        small < 128 * 1024 * 1024,
+        "OAM_MAX_HEAP_MB=64 must cap near 64 MB, got {small} bytes"
+    );
+    assert!(!stderr.contains("warning"), "64 is valid: {stderr}");
+    let (large, stderr) = limit_of("8192");
+    assert!(
+        large >= 8192 * 1024 * 1024,
+        "OAM_MAX_HEAP_MB=8192 must raise the cap, got {large} bytes"
+    );
+    assert!(!stderr.contains("warning"), "8192 is valid: {stderr}");
+}
+
+/// Reaching the cap is the `OAM-RT-OOM` banner and exit 134, not a V8 abort.
+#[test]
+fn heap_cap_reached_is_the_oom_banner() {
+    let script = write_temp(
+        "heap_cap_oom.mjs",
+        "const keep = [];\n\
+         for (;;) keep.push(new Array(1e5).fill(keep.length));",
+    );
+    let path = script.to_string_lossy().to_string();
+    let out = oam_with_env(&["run", &path], &[("OAM_MAX_HEAP_MB", "64")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(134), "stderr: {stderr}");
+    assert!(
+        stderr.contains("error[OAM-RT-OOM]: JavaScript heap out of memory")
+            && stderr.contains("(set by OAM_MAX_HEAP_MB)"),
+        "the banner must name the cap and its source: {stderr}"
+    );
+}
+
 // ---------------------------------------------------------------- permissions
 
 /// Run the compiled binary with an explicit environment, bypassing the shared
