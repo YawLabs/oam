@@ -31,9 +31,8 @@
 //
 // Not asserted, because the runtimes genuinely differ (docs/node-divergences.md
 // entry 38): the default request headers oam does not send (`connection`,
-// `accept-language`, `sec-fetch-mode`), the header order, and the undici
-// `code` on a refusal cause (`UND_ERR_INVALID_ARG` and friends) -- oam's cause
-// carries node's `name` and `message` but is a plain `Error`.
+// `accept-language`, `sec-fetch-mode`) and the header order. The class,
+// `code` and brands of a refusal cause are case 209's.
 import http from "node:http";
 
 const srv = http.createServer((req, res) => {

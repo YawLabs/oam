@@ -7905,6 +7905,173 @@ srv.close();
     );
 }
 
+/// The cause of a refused fetch is an instance of the undici error class the
+/// `undici` module exports, with its `code` (#177): node's fetch is undici, so
+/// `e.cause instanceof undici.errors.InvalidArgumentError` and
+/// `e.cause.code === 'UND_ERR_INVALID_ARG'` are how code tells these failures
+/// apart. oam's cause was a plain `Error` with the name set. `undici.request`
+/// rejects with the undici error itself, not wrapped. Every line below is
+/// what node v22.22.2 prints with the npm undici 6.24.1 next to the script.
+#[test]
+fn a_fetch_refusal_cause_is_an_undici_error_class() {
+    let script = write_temp(
+        "undici_error_classes/main.mjs",
+        r#"import http from 'node:http';
+import * as undici from 'undici';
+const E = undici.errors;
+const srv = http.createServer((req, res) => { req.resume(); req.on('end', () => res.end('ok')); });
+await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const U = `http://127.0.0.1:${srv.address().port}/p`;
+const show = (label, wrapped, c) => console.log(
+  label, wrapped, c.constructor.name, c.code,
+  c instanceof E[c.constructor.name], c instanceof E.UndiciError, c instanceof E.InvalidArgumentError,
+  JSON.stringify(Reflect.ownKeys(c).map(String)));
+for (const [label, init] of [
+  ['transfer-encoding', { method: 'POST', body: 'abc', headers: { 'transfer-encoding': 'chunked' } }],
+  ['expect', { method: 'POST', body: 'abc', headers: { expect: '100-continue' } }],
+  ['content-length', { method: 'POST', body: 'abc', headers: { 'content-length': '10' } }],
+]) {
+  try { await fetch(U, init); console.log(label, 'resolved'); }
+  catch (e) { show(label, `fetch:${e.message}`, e.cause); }
+  try { await undici.request(U, init); console.log(label, 'resolved'); }
+  catch (e) { show(label, 'request', e); }
+}
+srv.close();
+// The brand, not the prototype chain, is what instanceof asks: an object
+// carrying another undici copy's brand is an instance, and a subclass
+// inherits the check.
+const foreign = { [Symbol.for('undici.error.UND_ERR_INVALID_ARG')]: true };
+console.log('foreign', foreign instanceof E.InvalidArgumentError, foreign instanceof E.UndiciError, null instanceof E.UndiciError);
+class Sub extends E.InvalidArgumentError {}
+console.log('sub', new Sub('x') instanceof E.InvalidArgumentError, new E.InvalidArgumentError('x') instanceof Sub, new Sub('x').name);
+const aborted = new E.RequestAbortedError();
+console.log('aborted', aborted.name, aborted.code, aborted.message, aborted instanceof E.AbortError, new E.AbortError().code);
+console.log('exports', Object.keys(E).length, new E.BalancedPoolMissingUpstreamError().name, new E.SocketError('s', 7).socket);
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let marks = |code: &str, message_last: bool| {
+        let names = if message_last {
+            r#""stack","name","code","message""#
+        } else {
+            r#""stack","message","name","code""#
+        };
+        format!(r#"[{names},"Symbol(undici.error.UND_ERR)","Symbol(undici.error.{code})"]"#)
+    };
+    let inv = marks("UND_ERR_INVALID_ARG", false);
+    let unsupported = marks("UND_ERR_NOT_SUPPORTED", false);
+    let mismatch = marks("UND_ERR_REQ_CONTENT_LENGTH_MISMATCH", true);
+    let expected = format!(
+        "transfer-encoding fetch:fetch failed InvalidArgumentError UND_ERR_INVALID_ARG true true true {inv}\n\
+         transfer-encoding request InvalidArgumentError UND_ERR_INVALID_ARG true true true {inv}\n\
+         expect fetch:fetch failed NotSupportedError UND_ERR_NOT_SUPPORTED true true false {unsupported}\n\
+         expect request NotSupportedError UND_ERR_NOT_SUPPORTED true true false {unsupported}\n\
+         content-length fetch:fetch failed RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH true true false {mismatch}\n\
+         content-length request RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH true true false {mismatch}\n\
+         foreign true false false\n\
+         sub true true InvalidArgumentError\n\
+         aborted AbortError UND_ERR_ABORTED Request aborted true UND_ERR_ABORT\n\
+         exports 24 MissingUpstreamError 7\n"
+    );
+    assert_eq!(stdout.replace("\r\n", "\n"), expected);
+}
+
+/// A dispatcher's connect timeout is the one a fetch's connections get (#157):
+/// undici gives a connection `connect.timeout` / `connectTimeout` ms (10 s by
+/// default; `connect.timeout` wins) to be connected and, for https,
+/// handshaken, then fails the request with its `ConnectTimeoutError`. oam had
+/// no connect timeout at all and waited for the operating system. The server
+/// accepts and never answers the ClientHello. `undici.request` rejects with
+/// the error itself, and 0 turns the timeout off -- for an Agent's factory
+/// too, whose dispatcher's timeout used to be ignored for undici's 10 s
+/// default. Every line below is what
+/// node v22.22.2 prints with the npm undici 6.24.1 next to the script; the
+/// default 10 s is conformance case 211.
+#[test]
+fn a_dispatchers_connect_timeout_fails_a_fetch_as_undicis() {
+    let script = write_temp(
+        "undici_connect_timeout/main.mjs",
+        r#"import net from 'node:net';
+import * as undici from 'undici';
+const { Agent, Client, Pool } = undici;
+const sockets = new Set();
+const srv = net.createServer((s) => { sockets.add(s); s.on('error', () => {}); });
+await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const port = srv.address().port;
+const U = `https://127.0.0.1:${port}/`;
+const P = (s) => String(s).replaceAll(String(port), 'PORT');
+const show = (label, wrapped, c) => console.log(
+  label, wrapped, c?.constructor?.name, c?.name, c?.code, JSON.stringify(P(c?.message)),
+  c instanceof undici.errors.ConnectTimeoutError, c instanceof undici.errors.UndiciError,
+  JSON.stringify(Reflect.ownKeys(c ?? {}).map(String)));
+for (const [label, options] of [
+  ['connect.timeout', { connect: { timeout: 300 } }],
+  ['connectTimeout', { connectTimeout: 300 }],
+  ['both', { connectTimeout: 60000, connect: { timeout: 300 } }],
+]) {
+  try { await fetch(U, { dispatcher: new Agent(options) }); console.log(label, 'resolved'); }
+  catch (e) { show(label, `fetch:${e.name}:${e.message}`, e.cause); }
+}
+try { await undici.request(U, { dispatcher: new Agent({ connectTimeout: 300 }) }); console.log('request resolved'); }
+catch (e) { show('undici.request', 'request', e); }
+try { await new Pool(U, { connectTimeout: 300 }).request({ path: '/', method: 'GET' }); console.log('pool resolved'); }
+catch (e) { show('pool.request', 'request', e); }
+// An Agent's factory builds each origin's dispatcher from the agent's
+// options: that dispatcher's timeout is the one its connections get.
+const factory = (origin, opts) => new Pool(origin, opts);
+for (const [label, options] of [
+  ['factory connectTimeout', { factory, connectTimeout: 300 }],
+  ['factory connect.timeout', { factory, connect: { timeout: 300 } }],
+]) {
+  try { await fetch(U, { dispatcher: new Agent(options) }); console.log(label, 'resolved'); }
+  catch (e) { show(label, `fetch:${e.name}:${e.message}`, e.cause); }
+}
+{
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 1200);
+  try { await fetch(U, { dispatcher: new Agent({ factory, connectTimeout: 0 }), signal: ac.signal }); console.log('factory zero resolved'); }
+  catch (e) { console.log('factory timeout 0', e.name, e.cause === undefined); }
+}
+{
+  // 0 is no timeout: only the abort ends it.
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 1200);
+  try { await fetch(U, { dispatcher: new Agent({ connect: { timeout: 0 } }), signal: ac.signal }); console.log('zero resolved'); }
+  catch (e) { console.log('timeout 0', e.name, e.cause === undefined); }
+}
+for (const bad of [-1, 'x', NaN]) {
+  let agent = 'ok', client = 'ok', pool = 'ok';
+  try { new Agent({ connectTimeout: bad }); } catch (e) { agent = `${e.name} ${e.message}`; }
+  try { new Client(U, { connectTimeout: bad }); } catch (e) { client = `${e.name} ${e.code} ${e.message}`; }
+  try { new Pool(U, { connectTimeout: bad }); } catch (e) { pool = `${e.name} ${e.message}`; }
+  console.log('connectTimeout', String(bad), '| Agent', agent, '| Client', client, '| Pool', pool);
+}
+for (const s of sockets) s.destroy();
+srv.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let cause = r#"ConnectTimeoutError ConnectTimeoutError UND_ERR_CONNECT_TIMEOUT "Connect Timeout Error (attempted address: 127.0.0.1:PORT, timeout: 300ms)" true true ["stack","message","name","code","Symbol(undici.error.UND_ERR)","Symbol(undici.error.UND_ERR_CONNECT_TIMEOUT)"]"#;
+    let invalid = "InvalidArgumentError UND_ERR_INVALID_ARG invalid connectTimeout";
+    let expected = format!(
+        "connect.timeout fetch:TypeError:fetch failed {cause}\n\
+         connectTimeout fetch:TypeError:fetch failed {cause}\n\
+         both fetch:TypeError:fetch failed {cause}\n\
+         undici.request request {cause}\n\
+         pool.request request {cause}\n\
+         factory connectTimeout fetch:TypeError:fetch failed {cause}\n\
+         factory connect.timeout fetch:TypeError:fetch failed {cause}\n\
+         factory timeout 0 AbortError true\n\
+         timeout 0 AbortError true\n\
+         connectTimeout -1 | Agent ok | Client {invalid} | Pool ok\n\
+         connectTimeout x | Agent ok | Client {invalid} | Pool ok\n\
+         connectTimeout NaN | Agent ok | Client {invalid} | Pool ok\n"
+    );
+    assert_eq!(stdout.replace("\r\n", "\n"), expected);
+}
+
 /// An abort after the response head ends the BODY too, where oam used to keep
 /// reading and hand over the whole thing with a clean end -- so a guard that
 /// aborted on a size limit downloaded everything anyway. node errors the body
@@ -8041,6 +8208,105 @@ process.exit(0);
          text after abort: DOMException AbortError The operation was aborted.\n\
          abort before the head: the server saw the client leave\n\
          abort listeners after 5 finished fetches: 5"
+    );
+}
+
+/// An abort BEFORE the response head takes the request off the wire (#158):
+/// the server sees the client leave without having answered. oam used to
+/// reject the promise and leave the request running until the server
+/// answered it. Conformance case 212 compares the plain shapes with node;
+/// this covers the ones around them -- an abort in the tick of the call (one
+/// that lands before the op has run at all), an abort while a streamed
+/// request body is still going out, and `http.request` torn down by
+/// `destroy()` mid-upload and by `abort()`. Every line below is node
+/// v22.22.2's own output for this script.
+#[test]
+fn an_abort_before_the_head_takes_the_request_off_the_wire() {
+    let script = write_temp(
+        "abort_before_head/main.mjs",
+        r#"import http from 'node:http';
+import { getEventListeners } from 'node:events';
+const arrived = new Map();
+const left = new Map();
+const answered = new Set();
+const server = http.createServer((req, res) => {
+  const path = req.url;
+  if (path === '/warm') { res.end('ok'); return; }
+  const fallback = setTimeout(() => { answered.add(path); res.end('late'); }, 3000);
+  res.on('close', () => { clearTimeout(fallback); left.get(path)?.(res.writableFinished); });
+  req.on('data', () => {});
+  arrived.get(path)?.();
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+const watch = (path) => ({
+  arrived: new Promise((r) => arrived.set(path, r)),
+  left: new Promise((r) => left.set(path, r)),
+});
+await (await fetch(`${base}/warm`)).text();
+{
+  // Aborted in the tick it was called in: the request is cancelled before
+  // or after it reaches the server, and is never answered either way.
+  const ac = new AbortController();
+  const pending = fetch(`${base}/same-tick`, { signal: ac.signal });
+  ac.abort(new Error('mine'));
+  try { await pending; console.log('same tick: RESOLVED'); }
+  catch (e) { console.log('same tick:', e.message, getEventListeners(ac.signal, 'abort').length); }
+  await new Promise((r) => setTimeout(r, 300));
+  console.log('same tick answered:', answered.has('/same-tick'));
+}
+{
+  // Aborted while the request body is still being sent.
+  const seen = watch('/upload');
+  const ac = new AbortController();
+  let pull;
+  const body = new ReadableStream({ pull(c) { if (!pull) { pull = true; c.enqueue(new Uint8Array(1000)); } else return new Promise(() => {}); } });
+  const pending = fetch(`${base}/upload`, { method: 'POST', body, duplex: 'half', signal: ac.signal });
+  await seen.arrived;
+  ac.abort();
+  try { await pending; console.log('upload: RESOLVED'); }
+  catch (e) { console.log('upload:', e.name); }
+  console.log('upload: server saw the client leave, finished', await seen.left);
+}
+{
+  // http.request with a body it never ends, destroyed before a response.
+  const seen = watch('/request-upload');
+  const req = http.request(`${base}/request-upload`, { method: 'POST' }, () => console.log('RESPONSE'));
+  const failed = new Promise((r) => req.on('error', (e) => r(`${e.code} ${e.message}`)));
+  req.write('partial');
+  await seen.arrived;
+  req.destroy();
+  console.log('http.request:', await failed);
+  console.log('http.request: server saw the client leave, finished', await seen.left);
+}
+{
+  // req.abort() is the same teardown.
+  const seen = watch('/request-abort');
+  const req = http.request(`${base}/request-abort`, () => console.log('RESPONSE'));
+  const failed = new Promise((r) => req.on('error', (e) => r(`${e.code} ${e.message}`)));
+  req.end();
+  await seen.arrived;
+  req.abort();
+  console.log('req.abort():', await failed);
+  console.log('req.abort(): server saw the client leave, finished', await seen.left);
+}
+console.log('answered:', [...answered].join(',') || 'none');
+process.exit(0);
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "same tick: mine 0\n\
+         same tick answered: false\n\
+         upload: AbortError\n\
+         upload: server saw the client leave, finished false\n\
+         http.request: ECONNRESET socket hang up\n\
+         http.request: server saw the client leave, finished false\n\
+         req.abort(): ECONNRESET socket hang up\n\
+         req.abort(): server saw the client leave, finished false\n\
+         answered: none"
     );
 }
 

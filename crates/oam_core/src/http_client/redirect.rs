@@ -12,7 +12,7 @@
 //! | cross-origin hop | drops authorization, proxy-authorization, cookie, host -- for good | re-sent them on the next same-host hop; kept a user `host` |
 //! | 303 on GET/HEAD | method and content-type kept | content-type dropped |
 //! | cookie2 / www-authenticate | forwarded cross-origin | dropped |
-//! | unparseable Location | network error `Invalid URL` | returned the 3xx |
+//! | unparseable Location | network error, cause the `ERR_INVALID_URL` TypeError | returned the 3xx |
 //! | non-http(s) Location | `URL scheme must be a HTTP(S) scheme` | `builder error for url (...)` |
 //! | Location with userinfo | network error (see [`CREDENTIALS`]) | converted to Basic auth |
 //! | Location on a bad port (e.g. 25) | network error `bad port`, not sent | followed |
@@ -29,8 +29,10 @@ use super::prepare::{is_bad_port, origin_eq};
 /// fails -- 21 requests go out.
 pub const MAX_REDIRECTS: u32 = 20;
 
-/// A Location that does not parse against the current URL. undici wraps the
-/// `new URL` TypeError, whose message is this.
+/// The message of a Location undici cannot use. One that does not parse
+/// against the current URL is [`Next::InvalidLocation`], whose cause is the
+/// `new URL` TypeError with this message; a header value undici never hands
+/// to `new URL` (see `resolve_location`) fails with this text alone.
 pub const INVALID_URL: &str = "Invalid URL";
 /// fetch/index.js:1242.
 pub const BAD_SCHEME: &str = "URL scheme must be a HTTP(S) scheme";
@@ -71,6 +73,13 @@ pub enum Next {
     ReturnResponse,
     /// A network error with this message as the cause.
     Fail(&'static str),
+    /// The Location does not parse against the current URL. Node's cause is
+    /// the error `new URL(location, currentURL)` throws -- a `TypeError` with
+    /// `code` `ERR_INVALID_URL`, `input` and `base` (measured on v22.22.2) --
+    /// so the text handed to the parser travels with the failure: the header
+    /// value read as UTF-8, as undici reads it. The base is the current URL,
+    /// fragment included, which the caller already holds.
+    InvalidLocation { input: String },
 }
 
 /// True for the statuses undici follows (constants.js:8).
@@ -119,8 +128,9 @@ pub fn next(
         return Next::Done;
     };
     let mut target = match resolve_location(location.as_bytes(), current) {
-        Some(url) => url,
-        None => return Next::Fail(INVALID_URL),
+        Ok(url) => url,
+        Err(Some(input)) => return Next::InvalidLocation { input },
+        Err(None) => return Next::Fail(INVALID_URL),
     };
     if !matches!(target.scheme(), "http" | "https") {
         return Next::Fail(BAD_SCHEME);
@@ -201,14 +211,17 @@ pub fn apply(headers: &mut HeaderMap, from: &url::Url, to: &url::Url, drop_body:
 /// 0x20-0x7E is taken as UTF-8
 /// (`Buffer.from(value, 'binary').toString('utf8')`, replacement characters
 /// for invalid sequences); the result is parsed against the current URL.
-fn resolve_location(raw: &[u8], current: &url::Url) -> Option<url::Url> {
+///
+/// The error is the text that did not parse, or `None` for a value that was
+/// never parsed.
+fn resolve_location(raw: &[u8], current: &url::Url) -> Result<url::Url, Option<String>> {
     let bad_edge = |b: Option<&u8>| matches!(b, Some(b'\t' | b' '));
     if bad_edge(raw.first())
         || bad_edge(raw.last())
         || raw.iter().any(|b| matches!(b, 0 | b'\r' | b'\n'))
     {
-        return None;
+        return Err(None);
     }
     let text = String::from_utf8_lossy(raw);
-    current.join(&text).ok()
+    current.join(&text).map_err(|_| Some(text.into_owned()))
 }

@@ -156,7 +156,8 @@ fn limit_boundary_is_twenty_followed_redirects() {
 fn location_errors_in_undici_order() {
     let cur = url("http://a.test/x");
     let get = Method::GET;
-    // Unparseable (node: cause "Invalid URL").
+    // Unparseable (node: cause the ERR_INVALID_URL TypeError, whose `input`
+    // is the text that did not parse -- it travels with the failure).
     for bad in [
         "http://[::1",
         "http://a b/",
@@ -165,7 +166,9 @@ fn location_errors_in_undici_order() {
     ] {
         assert_eq!(
             redirect::next(302, &get, &cur, Some(&hv(bad)), 0, true),
-            Next::Fail(INVALID_URL),
+            Next::InvalidLocation {
+                input: bad.to_string()
+            },
             "{bad}"
         );
     }
@@ -186,7 +189,9 @@ fn location_errors_in_undici_order() {
     // credentials check.
     assert_eq!(
         redirect::next(302, &get, &cur, Some(&hv("http://[::1")), 20, true),
-        Next::Fail(INVALID_URL)
+        Next::InvalidLocation {
+            input: "http://[::1".to_string()
+        }
     );
     assert_eq!(
         redirect::next(302, &get, &cur, Some(&hv("ftp://a.test/")), 20, true),

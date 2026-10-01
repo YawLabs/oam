@@ -23,7 +23,8 @@ use hyper::body::{Frame, Incoming};
 use hyper_util::client::proxy::matcher::Matcher;
 
 use super::connector::{
-    HostAddrs, OamConnector, Shared, SuppliedConn, SuppliedConns, TlsSetupError, Via, authority_key,
+    ConnectTimedOut, HostAddrs, OamConnector, Shared, SuppliedConn, SuppliedConns, TlsSetupError,
+    Via, authority_key,
 };
 use super::pool::{Pool, PoolError, PoolFail};
 use super::prepare::host_for_connect;
@@ -139,6 +140,7 @@ impl HttpTransport {
         });
         Route {
             attempt_timeout,
+            connect_timeout: None,
             tls_range,
             hooked,
             supplied: None,
@@ -166,6 +168,7 @@ impl HttpTransport {
         );
         Route {
             attempt_timeout,
+            connect_timeout: None,
             tls_range,
             hooked: None,
             supplied: Some(Supplied { conns, pool }),
@@ -208,7 +211,10 @@ impl HttpTransport {
                         .any(|token| token.trim().eq_ignore_ascii_case("close"))
                 })
             });
-        match pool.request(request, close_requested).await {
+        match pool
+            .request(request, close_requested, route.connect_timeout)
+            .await
+        {
             Ok(response) => Ok(response),
             Err(PoolFail {
                 error,
@@ -255,6 +261,9 @@ impl HttpTransport {
 /// How one fetch reaches the network.
 pub struct Route {
     attempt_timeout: Duration,
+    /// undici's connect timeout for the connections this fetch opens (see
+    /// [`Route::with_connect_timeout`]). `None`: no timeout.
+    connect_timeout: Option<Duration>,
     /// The TLS version range its https handshakes run in: node's live
     /// defaults as JS resolved them for this request.
     tls_range: TlsRange,
@@ -273,6 +282,18 @@ struct Supplied {
 }
 
 impl Route {
+    /// Bound every connection this route opens by undici's connect timeout:
+    /// the lookup, the address attempts and an https handshake together have
+    /// `timeout` (`OamConnector::connect_within`), and a connect that runs
+    /// out fails the request as undici's `ConnectTimeoutError`. A route has
+    /// none until told: `http.request` has no such timeout in node. On a
+    /// supplied route it bounds nothing, as the dispatcher's own `connect`
+    /// function made the connection (and applied its own timeout).
+    pub fn with_connect_timeout(mut self, timeout: Option<Duration>) -> Route {
+        self.connect_timeout = timeout;
+        self
+    }
+
     /// The fetch has a `connect.lookup` hook.
     pub fn is_hooked(&self) -> bool {
         self.hooked.is_some()
@@ -371,6 +392,8 @@ impl SendError {
     /// - a connect failure is node's error: `NodeFailed` for a resolver
     ///   failure or a single refused address, `NodeAggregateFailed` for a
     ///   multi-address connect;
+    /// - a connect that outran the route's connect timeout is undici's
+    ///   `UND_ERR_CONNECT_TIMEOUT`;
     /// - TLS that could not be configured is `tls configuration error: ...`;
     /// - everything else -- a TLS handshake or verification failure, a proxy
     ///   that refused the CONNECT, an unsupported proxy scheme, a reset
@@ -380,6 +403,12 @@ impl SendError {
     pub fn to_outcome(&self, url: &url::Url) -> OpOutcome {
         if let Some(connect) = self.connect_error() {
             return connect.to_outcome();
+        }
+        // undici's connect timeout ran out (`Route::with_connect_timeout`):
+        // its ConnectTimeoutError's code and message, which the JS side
+        // turns into the class.
+        if let Some(timed_out) = find_in_chain::<ConnectTimedOut>(&self.error) {
+            return OpOutcome::node_failed("UND_ERR_CONNECT_TIMEOUT", timed_out.to_string());
         }
         // A certificate refused in Node's terms (tls_config's
         // NodeNamedRefusals): its code and message, as tls.connect reports

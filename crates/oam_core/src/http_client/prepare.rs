@@ -51,8 +51,10 @@ pub const DEFAULT_ACCEPT_ENCODING: &str = "gzip,deflate";
 /// A request ready for the transport.
 #[derive(Debug, Clone)]
 pub struct Prepared {
-    /// The target, without userinfo (moved into `authorization`) and without
-    /// a fragment (never sent).
+    /// The target, without userinfo (moved into `authorization`). A fragment
+    /// stays: it is never sent ([`to_uri`] drops it), but undici carries it
+    /// along the redirect chain -- a Location without one inherits it, and it
+    /// is part of the `base` of a Location that does not parse.
     pub url: url::Url,
     pub method: http::Method,
     pub headers: HeaderMap,
@@ -116,7 +118,6 @@ pub fn prepare(
         .map_err(|_| PrepareError::InvalidMethod(method.to_string()))?;
     let mut url = parse_url(raw_url).map_err(|_| PrepareError::Builder)?;
     let basic = take_userinfo(&mut url);
-    url.set_fragment(None);
 
     // Every map operation here is the fallible `try_*` form: the infallible
     // ones panic past `HeaderMap`'s size cap, and JS picks the header count.

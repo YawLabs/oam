@@ -82,60 +82,12 @@
     const G = globalThis;
 
     // ---- errors -----------------------------------------------------------
-    class UndiciError extends Error {
-      constructor(message, code) {
-        super(message);
-        this.name = "UndiciError";
-        this.code = code || "UND_ERR";
-      }
-    }
-    function mkError(name, code) {
-      return class extends UndiciError {
-        constructor(message) {
-          super(message || name, code);
-          this.name = name;
-          this.code = code;
-        }
-      };
-    }
-    const errors = {
-      UndiciError,
-      ConnectTimeoutError: mkError("ConnectTimeoutError", "UND_ERR_CONNECT_TIMEOUT"),
-      HeadersTimeoutError: mkError("HeadersTimeoutError", "UND_ERR_HEADERS_TIMEOUT"),
-      HeadersOverflowError: mkError("HeadersOverflowError", "UND_ERR_HEADERS_OVERFLOW"),
-      BodyTimeoutError: mkError("BodyTimeoutError", "UND_ERR_BODY_TIMEOUT"),
-      RequestContentLengthMismatchError: mkError("RequestContentLengthMismatchError", "UND_ERR_REQ_CONTENT_LENGTH_MISMATCH"),
-      ResponseContentLengthMismatchError: mkError("ResponseContentLengthMismatchError", "UND_ERR_RES_CONTENT_LENGTH_MISMATCH"),
-      RequestAbortedError: mkError("RequestAbortedError", "UND_ERR_ABORTED"),
-      AbortError: mkError("AbortError", "UND_ERR_ABORTED"),
-      InformationalError: mkError("InformationalError", "UND_ERR_INFO"),
-      InvalidArgumentError: mkError("InvalidArgumentError", "UND_ERR_INVALID_ARG"),
-      InvalidReturnValueError: mkError("InvalidReturnValueError", "UND_ERR_INVALID_RETURN_VALUE"),
-      ClientDestroyedError: mkError("ClientDestroyedError", "UND_ERR_DESTROYED"),
-      ClientClosedError: mkError("ClientClosedError", "UND_ERR_CLOSED"),
-      SocketError: mkError("SocketError", "UND_ERR_SOCKET"),
-      NotSupportedError: mkError("NotSupportedError", "UND_ERR_NOT_SUPPORTED"),
-      BalancedPoolMissingUpstreamError: mkError("BalancedPoolMissingUpstreamError", "UND_ERR_BPL_MISSING_UPSTREAM"),
-      ResponseStatusCodeError: class ResponseStatusCodeError extends UndiciError {
-        constructor(message, statusCode, headers, body) {
-          super(message || "Response Status Code Error", "UND_ERR_RESPONSE_STATUS_CODE");
-          this.name = "ResponseStatusCodeError";
-          this.statusCode = statusCode;
-          this.headers = headers;
-          this.body = body;
-        }
-      },
-      RequestRetryError: class RequestRetryError extends UndiciError {
-        constructor(message, code, { headers, data } = {}) {
-          super(message, "UND_ERR_REQ_RETRY");
-          this.name = "RequestRetryError";
-          this.statusCode = code;
-          this.headers = headers;
-          this.data = data;
-        }
-      },
-      SecureProxyConnectionError: mkError("SecureProxyConnectionError", "UND_ERR_PRX_TLS"),
-    };
+    // The classes globalThis.fetch raises (bootstrap.js undiciErrors, which
+    // has their shape), so `e.cause instanceof errors.InvalidArgumentError`
+    // holds for a fetch refusal as it does in node. A fresh object: undici's
+    // `errors` export is an ordinary one, and adding to it must not reach
+    // the locked table.
+    const errors = { ...G.__oamUndiciErrors };
 
     // ---- undici-shaped response body -------------------------------------
     // request().body is a Readable streaming the response bytes, plus the
@@ -230,7 +182,16 @@
         for (const [k, v] of Object.entries(opts.query)) u.searchParams.set(k, String(v));
         url = u.toString();
       }
-      const res = await G.fetch(String(url), init);
+      let res;
+      try {
+        res = await G.fetch(String(url), init);
+      } catch (e) {
+        // A failure undici itself raises on the wire (its connect timeout, a
+        // response head over the limit) rejects request() as that error, not
+        // as fetch's `TypeError: fetch failed` around it.
+        if (e instanceof TypeError && e.cause instanceof errors.UndiciError) throw e.cause;
+        throw e;
+      }
       return {
         statusCode: res.status,
         headers: headersToObject(res.headers),
@@ -389,14 +350,25 @@
         //    transport control instead of a no-op. The hook signature is
         //    Node's lookup(hostname, options, cb) with options
         //    { family, hints, all: true } and cb(null, [{address, family}]).
+        //  - `_oamConnectTimeout`, the connect timeout for the connections
+        //    oam's transport opens for it (ms; null is undici's 10 s default,
+        //    0 none). undici builds its connector from
+        //    `{ timeout: connectTimeout, ...connect }`, so `connect.timeout`
+        //    wins over `connectTimeout` (measured on undici 6.24.1).
         this._oamConnect = null;
         this._oamConnectLookup = null;
+        this._oamConnectTimeout = null;
+        const connectOptions = {
+          timeout: this._options.connectTimeout,
+          ...(typeof connect === "object" ? connect : null),
+        };
         if (typeof connect === "function") {
           this._oamConnect = connect;
         } else if (connect && Object.keys(connect).some((key) => !LOOKUP_ROUTE_KEYS.has(key))) {
-          this._oamConnect = buildConnector(connect);
-        } else if (connect && typeof connect.lookup === "function") {
-          this._oamConnectLookup = connect.lookup;
+          this._oamConnect = buildConnector(connectOptions);
+        } else {
+          if (connect && typeof connect.lookup === "function") this._oamConnectLookup = connect.lookup;
+          this._oamConnectTimeout = connectOptions.timeout ?? null;
         }
         // Dispatch interceptors (undici's `interceptors` option) run inside
         // dispatch(), which oam does not use: a dispatcher that has them is
@@ -454,25 +426,34 @@
         }
         if (typeof factory === "function") {
           const { factory: _factory, maxRedirections: _maxRedirections, ...originOptions } = this._options;
+          // origin -> { dispatcher, connect }: the connector is built once,
+          // from the origin's dispatcher, whose connect timeout (its
+          // `connectTimeout` -- which undici hands the factory -- or
+          // `connect.timeout`) bounds the connection as undici's Pool does.
           const byOrigin = new Map();
-          const plain = buildConnector({});
           this._oamConnectLookup = null;
           this._oamConnect = function viaFactory(params, cb) {
             const origin = params.protocol + "//" + params.host;
-            let dispatcher = byOrigin.get(origin);
-            if (dispatcher === undefined) {
-              dispatcher = factory(origin, originOptions);
-              byOrigin.set(origin, dispatcher);
+            let entry = byOrigin.get(origin);
+            if (entry === undefined) {
+              entry = { dispatcher: factory(origin, originOptions), connect: null };
+              byOrigin.set(origin, entry);
             }
+            const dispatcher = entry.dispatcher;
             const policy = policyOf(dispatcher);
             if (policy.refuse) {
               cb(policy.refuse);
             } else if (policy.connector) {
               policy.connector.fn.call(policy.connector.self, params, cb);
-            } else if (typeof dispatcher._oamConnectLookup === "function") {
-              buildConnector({ lookup: dispatcher._oamConnectLookup })(params, cb);
             } else {
-              plain(params, cb);
+              if (entry.connect === null) {
+                const lookup = typeof dispatcher._oamConnectLookup === "function"
+                  ? dispatcher._oamConnectLookup
+                  : undefined;
+                const timeout = dispatcher._oamConnectTimeout ?? undefined;
+                entry.connect = buildConnector(lookup ? { lookup, timeout } : { timeout });
+              }
+              entry.connect(params, cb);
             }
           };
         }
@@ -483,6 +464,14 @@
     class Client extends Dispatcher {
       constructor(origin, options) {
         super(options);
+        // undici's Client checks the option; a Pool (and so an Agent) takes
+        // it out of the options before its Clients see them, and checks
+        // nothing (measured on undici 6.24.1).
+        const connectTimeout = this._options.connectTimeout;
+        if (!(this instanceof Pool) && connectTimeout != null &&
+            (!Number.isFinite(connectTimeout) || connectTimeout < 0)) {
+          throw new errors.InvalidArgumentError("invalid connectTimeout");
+        }
         this.origin = typeof origin === "string" ? origin : (origin && origin.toString()) || "";
       }
       request(opts, handler) {

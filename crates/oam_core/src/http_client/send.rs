@@ -24,6 +24,13 @@
 //! function returned, piped ([`fetch_supply`]). The request then goes over
 //! that socket and nowhere else; no hop is ever dialled here.
 //!
+//! A fetch can be CANCELLED while its request is on the wire and no response
+//! head has come ([`FetchCancel`], `fetchCancel`): an aborted `fetch()` or a
+//! destroyed `http.request` leaves, as node's does, instead of waiting for a
+//! response nobody will read. The loop drops the request it is sending, which
+//! closes its h1 connection (or resets its h2 stream), and the op fails as
+//! [`ABORTED`].
+//!
 //! Under `--permission`, the engine's net grant ([`NetCheck`]) is applied to
 //! every hop's host at the top of the loop: before the hop parks for its
 //! lookup hook, before anything dials, and whichever route (pooled, hooked,
@@ -34,6 +41,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use base64::Engine as _;
 use bytes::Bytes;
@@ -82,6 +90,15 @@ pub struct FetchRequest {
     /// Missing or not a positive number: node's 250 ms.
     #[serde(default)]
     pub attempt_timeout_ms: Option<f64>,
+    /// undici's connect timeout, in ms: how long each connection this
+    /// request opens has to be connected (for https, handshaken) before the
+    /// request fails with undici's `ConnectTimeoutError`. JS sends it for
+    /// what goes through undici in node -- `fetch()` and `undici.request`,
+    /// 10 s unless the dispatcher says otherwise. Absent, 0 or not a
+    /// positive number: no timeout, which is `http.request` (node has none
+    /// there) and a dispatcher that turned it off.
+    #[serde(default)]
+    pub connect_timeout_ms: Option<f64>,
     /// True for `fetch()`: undici's bad-port block on the initial URL.
     /// `http.request`, `undici.request` and the http2 compat client leave it
     /// false -- node's http.request has no such check. Redirect hops are
@@ -89,7 +106,7 @@ pub struct FetchRequest {
     #[serde(default)]
     pub fetch_semantics: bool,
     /// `fetch`'s `redirect` option; `http.request` always sends `manual`
-    /// (node's http client never follows a redirect).
+    /// (node's http client never follows a redirect). Absent: follow.
     #[serde(default)]
     pub redirect: RedirectMode,
     /// False delivers the body as received and keeps the encoding headers:
@@ -128,6 +145,14 @@ pub struct FetchRequest {
 
 fn yes() -> bool {
     true
+}
+
+/// [`FetchRequest::connect_timeout_ms`] as a duration; `None` is no timeout.
+fn connect_timeout_from_ms(ms: Option<f64>) -> Option<Duration> {
+    let ms = ms.filter(|ms| ms.is_finite() && *ms > 0.0)?;
+    // A JS number far past any real timeout saturates rather than wrapping;
+    // `from_secs_f64` would panic on an overflow.
+    Some(Duration::from_secs_f64(ms.min(u32::MAX as f64) / 1000.0))
 }
 
 /// What a 3xx does.
@@ -182,6 +207,70 @@ impl PendingFetch {
     }
 }
 
+/// In-flight fetches that can be cancelled, by the id JS gave each one.
+pub type FetchCancels = Arc<Mutex<HashMap<u64, Arc<tokio::sync::Notify>>>>;
+
+/// What a cancelled fetch's op fails with. Nothing reads it: JS has already
+/// settled the fetch with the abort reason (or the destroyed request's
+/// error) by the time it cancels.
+pub const ABORTED: &str = "fetch: aborted";
+
+/// One fetch's entry in [`FetchCancels`], registered before the op starts --
+/// synchronously, in the op's native call -- so a cancel can never arrive
+/// ahead of it (`fetch(url, { signal }); controller.abort()` in one tick).
+/// The fetch carries it for as long as it has no response head, parks
+/// included; dropping it takes the entry out, so a cancel after the head (or
+/// after a failure) finds nothing and does nothing.
+pub struct FetchCancel {
+    id: u64,
+    registry: FetchCancels,
+    signal: Arc<tokio::sync::Notify>,
+}
+
+impl FetchCancel {
+    pub fn register(registry: &FetchCancels, id: u64) -> FetchCancel {
+        let signal = Arc::new(tokio::sync::Notify::new());
+        lock(registry).insert(id, signal.clone());
+        FetchCancel {
+            id,
+            registry: registry.clone(),
+            signal,
+        }
+    }
+
+    /// Resolves once the fetch has been cancelled. A cancel that came while
+    /// nothing was waiting (between hops, or while the fetch was parked) is
+    /// kept: `notify_one` stores a permit for the next wait.
+    async fn cancelled(&self) {
+        self.signal.notified().await;
+    }
+}
+
+impl Drop for FetchCancel {
+    fn drop(&mut self) {
+        let mut registry = lock(&self.registry);
+        // Only its own entry: an id JS reused belongs to the later fetch.
+        if registry
+            .get(&self.id)
+            .is_some_and(|signal| Arc::ptr_eq(signal, &self.signal))
+        {
+            registry.remove(&self.id);
+        }
+    }
+}
+
+/// `fetchCancel`: cancel the in-flight fetch registered under `id`. True if
+/// it was still without a response head (and so was there to cancel).
+pub fn fetch_cancel(id: u64, cancels: &FetchCancels) -> bool {
+    match lock(cancels).get(&id) {
+        Some(signal) => {
+            signal.notify_one();
+            true
+        }
+        None => false,
+    }
+}
+
 /// reqwest's h2 retry allowance (retry.rs, `max_retries_per_request`).
 pub const MAX_H2_RETRIES: u32 = 2;
 
@@ -210,6 +299,8 @@ struct LoopState {
     /// Fired by the pool when a connection has a hop's request (see
     /// [`super::sent`]); carried across a park, dropped with the fetch.
     dispatched: Option<Dispatched>,
+    /// The fetch's cancel registration, if JS can cancel it.
+    cancel: Option<FetchCancel>,
 }
 
 enum BodySource {
@@ -267,6 +358,10 @@ fn is_idempotent(method: &http::Method) -> bool {
 /// `net_check` is the `--permission` net grant (`None` when it covers every
 /// host). It is a parameter rather than a [`FetchRequest`] field because the
 /// request is JSON from JS, and nothing JS sends may widen or drop it.
+///
+/// `cancel` is the fetch's [`FetchCancel`], for a fetch JS may cancel before
+/// its response head.
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch(
     transport: HttpTransport,
     req: FetchRequest,
@@ -275,6 +370,7 @@ pub async fn fetch(
     outbound: OutboundBodies,
     continuations: FetchContinuations,
     net_check: Option<NetCheck>,
+    cancel: Option<FetchCancel>,
 ) -> OpOutcome {
     // Claimed first, so every early return below releases the receiver.
     let stream = req
@@ -316,7 +412,9 @@ pub async fn fetch(
     let route = if req.connect_hook {
         transport.supplied_route(attempt_timeout, tls_range)
     } else {
-        transport.route(req.lookup_hook, attempt_timeout, tls_range)
+        transport
+            .route(req.lookup_hook, attempt_timeout, tls_range)
+            .with_connect_timeout(connect_timeout_from_ms(req.connect_timeout_ms))
     };
     let state = LoopState {
         transport,
@@ -334,6 +432,7 @@ pub async fn fetch(
             .unwrap_or_else(crate::http_head::max_http_header_size),
         fetch_semantics: req.fetch_semantics,
         dispatched: req.dispatched,
+        cancel,
     };
     run(state, &bodies, &ids, &continuations).await
 }
@@ -540,7 +639,24 @@ async fn run(
             if let Some(dispatched) = &state.dispatched {
                 request.extensions_mut().insert(dispatched.clone());
             }
-            match state.transport.send(&state.route, request).await {
+            // The one place the loop waits. A cancel drops the send: a
+            // connect in progress is abandoned, an h1 connection the request
+            // went out on is closed (hyper shuts a connection whose response
+            // nobody waits for), an h2 stream is reset -- which is how the
+            // server learns the client left.
+            let sent = match &state.cancel {
+                Some(cancel) => tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => None,
+                    sent = state.transport.send(&state.route, request) => Some(sent),
+                },
+                None => Some(state.transport.send(&state.route, request).await),
+            };
+            let Some(sent) = sent else {
+                state.source.request_failed();
+                return OpOutcome::Failed(ABORTED.to_string());
+            };
+            match sent {
                 Ok(response) => break response,
                 Err(e)
                     if retries < MAX_H2_RETRIES
@@ -630,6 +746,16 @@ async fn run(
             Next::Fail(text) => {
                 state.source.request_failed();
                 return OpOutcome::Failed(text.to_string());
+            }
+            // Not a rejection of the op: the cause is the error node's
+            // `new URL(location, base)` throws, which carries both strings,
+            // and JS builds it from this payload (bootstrap.js settleRaw).
+            Next::InvalidLocation { input } => {
+                state.source.request_failed();
+                let payload = serde_json::json!({
+                    "invalidLocation": { "input": input, "base": state.current.as_str() },
+                });
+                return OpOutcome::Json(payload.to_string());
             }
             Next::Follow {
                 url,
@@ -799,7 +925,8 @@ fn respond(
     let mut url = state.current;
     url.set_fragment(None);
     let handle = ids.fetch_add(1, Ordering::Relaxed);
-    let body = FetchBody::new(response.into_body(), codings.as_deref());
+    let framing = super::body::Framing::of(response.version(), response.headers());
+    let body = FetchBody::new(response.into_body(), codings.as_deref()).with_framing(framing);
     lock(bodies).insert(handle, body);
     let mut payload = serde_json::json!({
         "status": status.as_u16(),

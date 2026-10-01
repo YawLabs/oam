@@ -936,7 +936,7 @@ both backwards:
   neither ends the body there. Both treat the trailing bytes as the start of another
   member and fail on its header. What differs is when: Node hands over NO chunk
   (`TypeError: terminated`, cause `incorrect header check`), oam hands over the chunk that
-  decoded and fails on the next read, with the plain-`Error` text in the bullet below.
+  decoded and fails on the next read, with the same error.
 - **Chunk boundaries are Node's only for the shapes case 112 pins.** A multi-member gzip
   body arrives as one chunk in Node and as one chunk per member in oam
   (`gzip('aa') + gzip('bb')`: Node `[4]`, oam `[2, 2]`). The bytes are the same either
@@ -954,10 +954,37 @@ What else still differs:
   undici `fetch/index.js` 1517-1522). The missing space does not matter to an RFC 9110
   parser, but over https oam does not offer brotli, so a server that honours the header
   sends gzip to oam and br to Node. oam decodes a `br` body a server sends anyway.
-- **A corrupt body.** Reading a body that fails to decode rejects with a plain `Error`,
-  `fetch: body read failed: error decoding response body`, with no `cause`. Node fails the
-  read with `TypeError: terminated`, and the zlib error as the `cause` (for example
-  `invalid distance too far back`, `code` `Z_DATA_ERROR`, `errno` `-3`).
+- **The details of a failed body read.** A body that cannot be read to its end rejects the
+  read as Node's does (case 210): `TypeError: terminated`, with what failed as the `cause`
+  -- the decoder's error for a corrupt encoding (`code` `Z_DATA_ERROR`, `errno` `-3`), undici's
+  `SocketError: other side closed` (`UND_ERR_SOCKET`) for a connection that ends (or fails
+  in TLS) inside the body of a kept-alive response, its `ResponseContentLengthMismatchError`
+  (`UND_ERR_RES_CONTENT_LENGTH_MISMATCH`) when the response was not kept alive
+  (`Connection: close`, HTTP/1.0) and had a content-length -- one with a chunked body
+  instead just ends there, with what arrived --, its `HTTPParserError`
+  (`HPE_INVALID_CHUNK_SIZE`) for a bad chunk-size line, and `read ECONNRESET` for a reset.
+  Up to 0.17.1 all of these were one plain `Error`,
+  `fetch: body read failed: error decoding response body`, with no `cause`. What still
+  differs is detail inside the cause:
+  - zlib's message for a corrupt deflate stream. oam's inflater (miniz) reports one failure
+    where zlib has a dozen messages, so the cause reads `invalid deflate data` where Node's
+    reads `invalid block type`, `invalid code lengths set` and so on (and, for a
+    zlib-wrapped body with a bad header, `incorrect header check`); a copy from before the
+    start of the output is told apart and reads Node's `invalid distance too far back`, as
+    `node:zlib`'s does (the inflater is shared). The gzip header and
+    trailer checks (`incorrect header check`, `unknown compression method`,
+    `unknown header flags set`, `incorrect data check`, `incorrect length check`) are Node's
+    words.
+  - which `ERR__ERROR_FORMAT_*` code a corrupt brotli body gets: the decoder is a port of
+    the C one and does not always pick the same error (`_PADDING_2`, errno `-15`, where
+    Node reports `_PADDING_1`, `-14`). The message, `Decompression failed`, is the same.
+  - `cause.socket` of the `SocketError` carries the connection's addresses but not undici's
+    `bytesWritten` / `bytesRead`, which oam does not count; `HTTPParserError`'s `data` (the
+    bytes that did not parse) is `undefined`.
+  - an HTTP/2 stream error inside a body has hyper's text as the cause.
+  - `http.request` hears a TLS failure inside a response body only as the response's
+    `aborted`; Node's request also emits OpenSSL's error (`ERR_SSL_*`), which rustls has no
+    counterpart for.
 
 _(probed)_ Node v22.22.2 vs oam on Windows, the same raw-socket server: the request
 headers over http and https, and a `deflate` body holding a copy from before the start of
@@ -1325,19 +1352,27 @@ What still differs:
 
 **Connecting**
 
-- **No 10 s connect timeout on `fetch`.** undici gives up on a connect after 10 s. oam waits
-  for the operating system. Measured against a blackholed address on Windows: Node rejects
-  after 10669 ms with a `ConnectTimeoutError` cause (`code` `UND_ERR_CONNECT_TIMEOUT`,
-  `Connect Timeout Error (attempted address: 10.255.255.1:81, timeout: 10000ms)`); oam
-  rejects after 21046 ms with `connect ETIMEDOUT 10.255.255.1:81`. Node's `http.request` has
-  no such timeout, so only `fetch` differs.
-- **Aborting a `fetch` before its response head does not cancel the request.** The promise
-  rejects with the abort reason at once, as in Node, but the request stays on the wire until
-  the response head arrives; that response is then cancelled on arrival, which closes its
-  connection. Measured with a server that answers after 600 ms and an abort at 100 ms: under
-  Node the server sees the client leave (`res` `'close'` with `writableFinished` false, then
-  `req` `'close'`); under oam the response finishes. A server that sends its head late and
-  then streams sees the client leave at the abort in Node and at the head in oam. A `fetch`
+- **`fetch` has undici's 10 s connect timeout** (#157, case 211): a connection that is not
+  connected -- for https, handshaken -- within 10 s fails the fetch with a
+  `ConnectTimeoutError` cause (`code` `UND_ERR_CONNECT_TIMEOUT`, `Connect Timeout Error
+  (attempted address: 10.255.255.1:81, timeout: 10000ms)`, or `attempted addresses: ...` for
+  a name that resolved to several), as in Node. Up to 0.17.1 oam waited for the operating
+  system (21 s on Windows, `connect ETIMEDOUT`). A dispatcher's `connect.timeout` /
+  `connectTimeout` replaces the 10 s, `0` turns it off, and `undici.request` has it too;
+  `http.request` has no such timeout in either runtime. Two things differ. oam's timer is
+  exact, where undici's coarse timer fires up to about a second late (Node measured 10.7 s
+  for the default and 1 s for a 300 ms timeout). And under a `connect.lookup` hook the time
+  the hook itself takes is not counted: the timeout starts when oam dials the addresses it
+  returned.
+- **Aborting a `fetch` before its response head takes the request off the wire** (#158, case
+  212), as in Node: the promise rejects with the abort reason and the connection the request
+  went out on is closed (an h2 stream is reset), so the server sees the client leave (`res`
+  `'close'` with `writableFinished` false) at the abort. So does `req.destroy()` / `req.abort()`
+  on an `http.request` that has no response yet. Up to 0.17.1 the request stayed on the wire
+  until the server answered it. One difference: a `fetch` aborted in the same tick it was
+  called in is cancelled before anything is sent, where Node has already written the request
+  when a pooled connection was at hand (the server then sees a request and the client
+  leaving; under oam it sees nothing). A `fetch`
   waiting on its `connect.lookup` hook (below) is dropped when it aborts. An abort that lands
   AFTER the response head ends the body as in Node, whether or not anything is reading it:
   the connection is closed, a stream being read errors with the abort reason (the chunks
@@ -1544,10 +1579,13 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   `'error'` rejects with `TypeError: fetch failed`, cause `unexpected redirect`, on a 301,
   302, 303, 307 or 308 with or without a `Location`; a value outside the enum is refused
   with Node's `Request constructor: ... is not an accepted type` message. Up to 0.16.2 every
-  redirect was followed whatever the option said. `Response.type` is not implemented.
-- **A `Location` that does not parse** fails the fetch with a plain `Error('Invalid URL')` as
-  the `cause` (own keys `stack`, `message`); Node's is a `TypeError` with `code`
-  `ERR_INVALID_URL`, `input` and `base`. Case 111 prints only the message.
+  redirect was followed whatever the option said. `response.type` is `'basic'` under every
+  mode, as in Node, and `'default'` for a constructed `Response` (case 208); up to 0.17.1 it
+  was `undefined`. `Response.error()` and `Response.redirect()` are not implemented.
+- **A `Location` that does not parse** fails the fetch with Node's `cause` (case 208): a
+  `TypeError('Invalid URL')` with `code` `ERR_INVALID_URL`, `input` (the `Location`, read as
+  UTF-8) and `base` (the URL that answered, with the fragment the request URL carried). Up
+  to 0.17.1 the cause was a plain `Error('Invalid URL')`.
 - **`http.request` on this transport returns a `3xx` as the response**, as Node's does (it
   asks the transport for `'manual'`); up to 0.16.2 it followed redirects by `fetch`'s rules.
   It does not decode the body either, and adds no `accept`, `user-agent` or
@@ -1668,9 +1706,14 @@ an error where oam used to send something)
   neither `close` nor `keep-alive` (case-insensitively -- `close, transfer-encoding`, the
   CL.TE evasion, is the one that matters) are refused with undici's texts
   (`invalid transfer-encoding header`, `invalid keep-alive header`, `invalid upgrade header`,
-  `expect header not supported`, `invalid connection header`), as `cause.name` on a
-  `TypeError: fetch failed`. Node's cause is an instance of the matching undici error class;
-  oam's is a plain `Error` with that `name` and no `UND_ERR_*` code. An accepted `connection`
+  `expect header not supported`, `invalid connection header`), as the `cause` of a
+  `TypeError: fetch failed`. As in Node, the cause is an instance of the matching undici
+  error class (`InvalidArgumentError`, `NotSupportedError`,
+  `RequestContentLengthMismatchError`; `HeadersOverflowError` for a response head over the
+  limit) with its `UND_ERR_*` `code` and undici's `Symbol.for('undici.error.*')` brands, so
+  `cause instanceof undici.errors.InvalidArgumentError` holds for the built-in `undici` and
+  for a copy from `node_modules` (case 209); `undici.request` rejects with the error itself.
+  Up to 0.17.1 the cause was a plain `Error` with that `name` and no code. An accepted `connection`
   goes out lowercased, as node's does; `te`, also hop-by-hop, goes out untouched, because
   node sends it.
 - A `content-length` that disagrees with the body is refused as

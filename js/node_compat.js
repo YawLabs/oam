@@ -20434,6 +20434,9 @@
         this.errored = null;
         this._bodyLength = 0;
         this._bodyStream = null;
+        // Cancels the transport's request while it has no response (set by
+        // _doFetchRequest; see _cancelBodyStream).
+        this._fetchCancel = null;
         // Every operation on the outbound body channel queues behind the one
         // before it (see _channelWrite). Unordered calls race: the write op is
         // ASYNC and the end op is SYNCHRONOUS, so end() drops the channel's
@@ -21223,6 +21226,11 @@
           // decoding, `content-encoding` and `content-length` intact.
           __oamRawExchange: true,
           __oamSentSignal: signal,
+          // What takes the request off the wire if it is aborted or
+          // destroyed before its response (see _cancelBodyStream).
+          __oamCanceller: function (cancel) {
+            self._fetchCancel = cancel;
+          },
         };
         // The request's own response-head limit; without one the transport
         // applies the process-wide default.
@@ -22283,6 +22291,34 @@
                   self.emit("error", err);
                 }
                 err = connResetException("aborted");
+              } else if (err && (err.code === "UND_ERR_SOCKET" || err.syscall === "read" ||
+                  err.code === "UND_ERR_RES_CONTENT_LENGTH_MISMATCH" ||
+                  err.code === "OAM_BODY_ENDED_AT_CLOSE" ||
+                  (typeof err.code === "string" && err.code.indexOf("HPE_") === 0))) {
+                // The shared transport reports a body's wire failure in the
+                // words of undici, which http.request is not. node's request
+                // hears what its socket heard first -- its parser's error
+                // for malformed framing (in node's own words, as on the
+                // agent path), the socket's `read ECONNRESET` for a reset --
+                // and the response is then aborted. A connection that just
+                // ends inside a body only aborts it, whatever undici would
+                // make of it.
+                var heard = null;
+                if (typeof err.code === "string" && err.code.indexOf("HPE_") === 0) {
+                  // undici's sentence carries llhttp's reason in brackets.
+                  var why = /\(([^()]*)\)$/.exec(err.message || "");
+                  heard = new Error("Parse Error: " + (why ? why[1] : err.message));
+                  heard.code = err.code;
+                  heard = withParseReason(heard);
+                } else if (err.syscall === "read") {
+                  heard = err;
+                }
+                if (heard !== null && !self._errorEmitted && !self._aborted) {
+                  self._errorEmitted = true;
+                  self.errored = heard;
+                  self.emit("error", heard);
+                }
+                err = connResetException("aborted");
               }
               res.destroy(err);
             });
@@ -22502,10 +22538,21 @@
       // underlying socket, so an in-flight response stream fails with
       // ECONNRESET -- otherwise `for await (const c of res)` never
       // terminates and the program hangs. 'close' follows, once.
+      //
+      // Before the response, the request itself is cancelled: the transport
+      // closes the connection it went out on (or stops connecting), so the
+      // server sees the client leave when node's would, not after it has
+      // answered a request nobody is waiting for. Once the response head is
+      // in, this is a no-op and the response's own teardown closes it.
       _cancelBodyStream() {
         if (this._bodyStream !== null) {
           natives.fetchBodyChannelCancel(this._bodyStream);
           this._bodyStream = null;
+        }
+        if (this._fetchCancel !== null) {
+          var cancel = this._fetchCancel;
+          this._fetchCancel = null;
+          cancel();
         }
       }
 

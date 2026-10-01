@@ -225,9 +225,16 @@ fn userinfo_credential_leads_and_an_explicit_authorization_wins() {
 }
 
 #[test]
-fn prepared_url_has_no_fragment() {
+fn prepared_url_keeps_its_fragment() {
+    // undici carries the request URL's fragment along the URL list: a
+    // redirect's Location inherits it, and it shows in the `base` of a
+    // Location that does not parse. `to_uri` drops it for the wire.
     let p = prep("https://a.test/x?q=1#frag", "GET", &[], true).unwrap();
-    assert_eq!(p.url.as_str(), "https://a.test/x?q=1");
+    assert_eq!(p.url.as_str(), "https://a.test/x?q=1#frag");
+    assert_eq!(
+        prepare::to_uri(&p.url).unwrap().to_string(),
+        "https://a.test/x?q=1"
+    );
 }
 
 #[test]
