@@ -260,7 +260,6 @@
           "redirected",
           "status",
           "statusText",
-          "type",
           "url"
         ],
         "global:TextDecoder.prototype": [
@@ -754,7 +753,6 @@
           "redirected",
           "status",
           "statusText",
-          "type",
           "url"
         ],
         "global:TextDecoder.prototype": [
@@ -1233,7 +1231,6 @@
           "redirected",
           "status",
           "statusText",
-          "type",
           "url"
         ],
         "global:TextDecoder.prototype": [
