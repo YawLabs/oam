@@ -779,12 +779,20 @@ fn npm_cjs_only_package_runs_via_interop() {
 /// callable defaults, __esModule unwrapping, arbitrary export names, and
 /// the require-condition side of a dual package.
 fn write_cjs_fixtures() -> PathBuf {
+    // Each call gets its OWN project dir, for the reason write_npm_fixtures
+    // gives: six tests write this tree in parallel, and fs::write truncates
+    // before writing, so one test's `oam` could load a fixture another test
+    // had just emptied (`helper is not a function` from an empty helper.js).
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let root = format!("cjsproj{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    let root = root.as_str();
     write_temp(
-        "cjsproj/node_modules/classic/package.json",
+        &format!("{root}/node_modules/classic/package.json"),
         "{\"name\": \"classic\", \"main\": \"lib/index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/classic/lib/index.js",
+        &format!("{root}/node_modules/classic/lib/index.js"),
         "const { helper } = require('./helper');\n\
          const meta = require('../package.json');\n\
          const dep = require('depcjs');\n\
@@ -797,108 +805,127 @@ fn write_cjs_fixtures() -> PathBuf {
          exports.hasGlobal = global === globalThis;\n",
     );
     write_temp(
-        "cjsproj/node_modules/classic/lib/helper.js",
+        &format!("{root}/node_modules/classic/lib/helper.js"),
         "exports.helper = function () { return 'helped'; };",
     );
     write_temp(
-        "cjsproj/node_modules/depcjs/package.json",
+        &format!("{root}/node_modules/depcjs/package.json"),
         "{\"name\": \"depcjs\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/depcjs/index.js",
+        &format!("{root}/node_modules/depcjs/index.js"),
         "module.exports = { name: 'depcjs' };",
     );
     write_temp(
-        "cjsproj/node_modules/counter/package.json",
+        &format!("{root}/node_modules/counter/package.json"),
         "{\"name\": \"counter\", \"main\": \"counter.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/counter/counter.js",
+        &format!("{root}/node_modules/counter/counter.js"),
         "let n = 0;\nmodule.exports = { bump: () => ++n };",
     );
     write_temp(
-        "cjsproj/node_modules/counter/a.js",
+        &format!("{root}/node_modules/counter/a.js"),
         "exports.a = require('./counter').bump();",
     );
     write_temp(
-        "cjsproj/node_modules/counter/b.js",
+        &format!("{root}/node_modules/counter/b.js"),
         "exports.b = require('./counter').bump();",
     );
     write_temp(
-        "cjsproj/node_modules/cycle/package.json",
+        &format!("{root}/node_modules/cycle/package.json"),
         "{\"name\": \"cycle\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/cycle/index.js",
+        &format!("{root}/node_modules/cycle/index.js"),
         "exports.started = true;\n\
          const peer = require('./peer');\n\
          exports.peerSawPartial = peer.sawPartial;\n\
          exports.done = true;",
     );
     write_temp(
-        "cjsproj/node_modules/cycle/peer.js",
+        &format!("{root}/node_modules/cycle/peer.js"),
         "const root = require('./index');\n\
          exports.sawPartial = root.started === true && root.done === undefined;",
     );
     write_temp(
-        "cjsproj/node_modules/fnpkg/package.json",
+        &format!("{root}/node_modules/fnpkg/package.json"),
         "{\"name\": \"fnpkg\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/fnpkg/index.js",
+        &format!("{root}/node_modules/fnpkg/index.js"),
         "module.exports = function shout(s) { return s.toUpperCase(); };\n\
          module.exports.flavor = 'fn';",
     );
     write_temp(
-        "cjsproj/node_modules/transpiled/package.json",
+        &format!("{root}/node_modules/transpiled/package.json"),
         "{\"name\": \"transpiled\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/transpiled/index.js",
+        &format!("{root}/node_modules/transpiled/index.js"),
         "Object.defineProperty(exports, '__esModule', { value: true });\n\
          exports.default = function () { return 'unwrapped-default'; };\n\
          exports.named = 'named-val';",
     );
     write_temp(
-        "cjsproj/node_modules/weird/package.json",
+        &format!("{root}/node_modules/weird/package.json"),
         "{\"name\": \"weird\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/weird/index.js",
+        &format!("{root}/node_modules/weird/index.js"),
         "module.exports = { 'weird-key': 'dash', 'class': 'reserved' };",
     );
     write_temp(
-        "cjsproj/node_modules/dualpkg/package.json",
+        &format!("{root}/node_modules/dualpkg/package.json"),
         "{\"name\": \"dualpkg\", \"exports\": {\".\": {\"import\": \"./esm.mjs\", \"require\": \"./cjs.cjs\"}}}",
     );
     write_temp(
-        "cjsproj/node_modules/dualpkg/esm.mjs",
+        &format!("{root}/node_modules/dualpkg/esm.mjs"),
         "export const flavor = 'esm';",
     );
     write_temp(
-        "cjsproj/node_modules/dualpkg/cjs.cjs",
+        &format!("{root}/node_modules/dualpkg/cjs.cjs"),
         "module.exports = { flavor: 'cjs' };",
     );
     write_temp(
-        "cjsproj/node_modules/wantsdual/package.json",
+        &format!("{root}/node_modules/wantsdual/package.json"),
         "{\"name\": \"wantsdual\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/wantsdual/index.js",
+        &format!("{root}/node_modules/wantsdual/index.js"),
         "exports.dualFlavor = require('dualpkg').flavor;",
     );
     write_temp(
-        "cjsproj/node_modules/boom/package.json",
+        &format!("{root}/node_modules/boom/package.json"),
         "{\"name\": \"boom\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/boom/index.js",
+        &format!("{root}/node_modules/boom/index.js"),
         "throw new Error('cjs-init-boom');",
     );
-    write_temp("cjsproj/.anchor", "")
+    write_temp(&format!("{root}/.anchor"), "")
         .parent()
         .unwrap()
         .to_path_buf()
+}
+
+#[test]
+fn cjs_fixtures_are_written_to_a_root_of_their_own_per_call() {
+    // #186: a shared root let one test truncate a file another test's `oam`
+    // was loading. Two calls must never share a tree.
+    let first = write_cjs_fixtures();
+    let second = write_cjs_fixtures();
+    assert_ne!(first, second);
+    for proj in [&first, &second] {
+        let helper = proj.join("node_modules/classic/lib/helper.js");
+        assert!(
+            std::fs::read_to_string(&helper)
+                .unwrap()
+                .contains("exports.helper"),
+            "{} is incomplete",
+            helper.display()
+        );
+    }
 }
 
 #[test]
