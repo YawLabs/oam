@@ -26,6 +26,11 @@ pub struct TcpState {
     /// Halves currently out of the maps for an await, per stream handle.
     in_flight: HashMap<u64, u32>,
     cancel: HashMap<u64, std::sync::Arc<tokio::sync::Notify>>,
+    /// The back of each stream handle's write queue: the latest `tcp_write`
+    /// or `tcp_shutdown` issued for it and still pending (see [`WriteTurn`]).
+    /// The last turn out removes the entry.
+    write_tail: HashMap<u64, (u64, tokio::sync::oneshot::Receiver<()>)>,
+    write_seq: u64,
 }
 
 impl TcpState {
@@ -78,6 +83,13 @@ impl TcpState {
             self.writers.len(),
         )
     }
+
+    /// Handles with a write or a shutdown still queued: 0 once every one
+    /// issued has finished.
+    #[cfg(test)]
+    pub(crate) fn queued_writes(&self) -> usize {
+        self.write_tail.len()
+    }
 }
 
 pub type TcpRegistry = std::sync::Arc<std::sync::Mutex<TcpState>>;
@@ -97,6 +109,87 @@ impl Drop for InFlight {
             .unwrap_or_else(|e| e.into_inner())
             .release(self.handle);
     }
+}
+
+/// One op's place in its stream handle's write queue.
+///
+/// A write and the shutdown behind it are two ops, and each takes the write
+/// half out of the registry for as long as it runs. With no order between
+/// them, a `tcp_shutdown` issued while a write was in flight found no writer
+/// and returned without sending a FIN -- the half went back afterwards, and
+/// the FIN left only when the socket was closed -- so `socket.end()` had to
+/// wait for the write's promise before it could even ask: the FIN went out
+/// one op round trip late, where libuv queues the shutdown behind the write
+/// and sends it in the same loop turn (#156).
+///
+/// The place is taken when the op is ISSUED -- synchronously, inside
+/// `tcp_write` / `tcp_shutdown`, before the future they return is first
+/// polled -- so the order is the order JS made the calls in, whatever order
+/// the runtime polls the futures in. Each turn waits for the one before it
+/// and releases the next when it is dropped: finished, failed, or abandoned
+/// (a turn abandoned while still waiting releases the next early; that only
+/// happens when the runtime is dropping its tasks).
+///
+/// An op issued while nothing is queued does not take a turn at all when the
+/// socket can finish it on the spot (see [`tcp_write`], [`tcp_shutdown`]).
+struct WriteTurn {
+    registry: TcpRegistry,
+    handle: u64,
+    seq: u64,
+    before: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Never sent on: dropped with the turn, which is what wakes the next.
+    _done: tokio::sync::oneshot::Sender<()>,
+}
+
+impl WriteTurn {
+    /// The next place in `handle`'s queue. `state` is `registry`, locked by
+    /// the caller: whatever it checked before queueing still holds.
+    fn take(state: &mut TcpState, registry: &TcpRegistry, handle: u64) -> WriteTurn {
+        let (done, released) = tokio::sync::oneshot::channel();
+        state.write_seq += 1;
+        let seq = state.write_seq;
+        let before = state
+            .write_tail
+            .insert(handle, (seq, released))
+            .map(|(_, before)| before);
+        WriteTurn {
+            registry: registry.clone(),
+            handle,
+            seq,
+            before,
+            _done: done,
+        }
+    }
+
+    /// Until every write and shutdown issued before this one is done.
+    async fn wait(&mut self) {
+        if let Some(before) = self.before.take() {
+            // Err is the turn before being dropped: exactly the signal.
+            let _ = before.await;
+        }
+    }
+}
+
+impl Drop for WriteTurn {
+    fn drop(&mut self) {
+        let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        if guard
+            .write_tail
+            .get(&self.handle)
+            .is_some_and(|(seq, _)| *seq == self.seq)
+        {
+            guard.write_tail.remove(&self.handle);
+        }
+    }
+}
+
+/// How a write or a shutdown left the call that issued it.
+enum Issued {
+    /// Finished on the spot.
+    Done(OpOutcome),
+    /// Queued behind the handle's earlier writes, `written` bytes of it
+    /// already taken by the socket.
+    Queued { turn: WriteTurn, written: usize },
 }
 
 fn reinsert_reader(registry: &TcpRegistry, handle: u64, reader: OwnedReadHalf) -> bool {
@@ -256,45 +349,130 @@ pub async fn tcp_read(registry: TcpRegistry, handle: u64, len: usize) -> OpOutco
 
 /// Write bytes to a TCP stream. Remove-await-reinsert on the write half
 /// only -- reads proceed independently.
-pub async fn tcp_write(registry: TcpRegistry, handle: u64, data: Vec<u8>) -> OpOutcome {
-    let writer = registry
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take_writer(handle);
-    let Some(mut writer) = writer else {
-        return OpOutcome::Failed(format!("tcp: write handle {handle} is gone"));
-    };
-    let _in_flight = InFlight {
-        registry: registry.clone(),
-        handle,
-    };
-
-    match writer.write_all(&data).await {
-        Ok(()) => {
-            reinsert_writer(&registry, handle, writer);
-            OpOutcome::Done
+///
+/// The write starts HERE, in the call, before the returned future is polled:
+///
+/// - With nothing queued for the handle, the socket is offered the bytes at
+///   once (libuv's `uv_try_write`). What a writable socket takes is on the
+///   wire when this returns, so a write the kernel had room for is complete
+///   whatever happens to the handle next -- as in node, where `write()` then
+///   `destroy()` still delivers the write.
+/// - What is left (or all of it, behind earlier writes) takes the next
+///   place in the handle's write queue ([`WriteTurn`]): writes and the
+///   shutdown of one handle run in the order they were issued.
+pub fn tcp_write(
+    registry: TcpRegistry,
+    handle: u64,
+    data: Vec<u8>,
+) -> impl std::future::Future<Output = OpOutcome> + Send + 'static {
+    let issued = {
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let mut written = 0;
+        let mut finished = None;
+        if !guard.write_tail.contains_key(&handle) {
+            // Nothing queued means nothing in flight either: the half is in
+            // the map unless the handle is closed or already shut down.
+            match guard.writers.get(&handle) {
+                None => {
+                    finished = Some(OpOutcome::Failed(format!(
+                        "tcp: write handle {handle} is gone"
+                    )));
+                }
+                Some(writer) => match writer.try_write(&data) {
+                    Ok(n) if n == data.len() => finished = Some(OpOutcome::Done),
+                    Ok(n) => written = n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => finished = Some(tcp_fail(e, "write", &handle.to_string())),
+                },
+            }
         }
-        Err(e) => tcp_fail(e, "write", &handle.to_string()),
+        match finished {
+            Some(outcome) => Issued::Done(outcome),
+            None => Issued::Queued {
+                turn: WriteTurn::take(&mut guard, &registry, handle),
+                written,
+            },
+        }
+    };
+    async move {
+        let (mut turn, written) = match issued {
+            Issued::Done(outcome) => return outcome,
+            Issued::Queued { turn, written } => (turn, written),
+        };
+        turn.wait().await;
+        let writer = registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_writer(handle);
+        let Some(mut writer) = writer else {
+            return OpOutcome::Failed(format!("tcp: write handle {handle} is gone"));
+        };
+        // Declared after `turn`, so dropped before it: the half is back in
+        // the registry (or gone) by the time the next turn is released.
+        let _in_flight = InFlight {
+            registry: registry.clone(),
+            handle,
+        };
+
+        match writer.write_all(&data[written..]).await {
+            Ok(()) => {
+                reinsert_writer(&registry, handle, writer);
+                OpOutcome::Done
+            }
+            Err(e) => tcp_fail(e, "write", &handle.to_string()),
+        }
     }
 }
 
 /// Half-close the write side (sends FIN). Removes the write half and
-/// drops it after shutdown -- no further writes are possible.
-pub async fn tcp_shutdown(registry: TcpRegistry, handle: u64) -> OpOutcome {
-    let writer = registry
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take_writer(handle);
-    let Some(mut writer) = writer else {
-        return OpOutcome::Done;
+/// drops it -- no further writes are possible.
+///
+/// Like [`tcp_write`], it starts in the call. With nothing queued for the
+/// handle the FIN leaves at once; otherwise the shutdown takes the next
+/// place in the handle's write queue ([`WriteTurn`]), as libuv queues a
+/// shutdown behind its writes, and the FIN leaves as soon as the last byte
+/// before it has been written. Either way a caller asks for the FIN in the
+/// same turn as its last write, without waiting for that write to finish.
+pub fn tcp_shutdown(
+    registry: TcpRegistry,
+    handle: u64,
+) -> impl std::future::Future<Output = OpOutcome> + Send + 'static {
+    let issued = {
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.write_tail.contains_key(&handle) {
+            Issued::Queued {
+                turn: WriteTurn::take(&mut guard, &registry, handle),
+                written: 0,
+            }
+        } else {
+            // Dropping the half IS the shutdown: tokio shuts the write side
+            // of the socket down when an owned write half goes. Nothing to
+            // do for a handle that is closed or already shut down.
+            drop(guard.writers.remove(&handle));
+            Issued::Done(OpOutcome::Done)
+        }
     };
-    let _in_flight = InFlight {
-        registry: registry.clone(),
-        handle,
-    };
-    let _ = writer.shutdown().await;
-    drop(writer);
-    OpOutcome::Done
+    async move {
+        let mut turn = match issued {
+            Issued::Done(outcome) => return outcome,
+            Issued::Queued { turn, .. } => turn,
+        };
+        turn.wait().await;
+        let writer = registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_writer(handle);
+        let Some(mut writer) = writer else {
+            return OpOutcome::Done;
+        };
+        let _in_flight = InFlight {
+            registry: registry.clone(),
+            handle,
+        };
+        let _ = writer.shutdown().await;
+        drop(writer);
+        OpOutcome::Done
+    }
 }
 
 /// Close a TCP stream. Remove both halves and, if one is out for an await,
@@ -680,6 +858,197 @@ mod tests {
             "write half dropped, not reinserted"
         );
         drop(g_write);
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+    }
+
+    /// A blocking peer on its own thread: accepts one connection, waits
+    /// `before_reading`, reads to EOF and reports how many bytes came and
+    /// whether the stream then ended cleanly. It never writes and closes only
+    /// after the EOF, so an EOF it sees is the FIN of a shutdown, not of a
+    /// close.
+    fn reading_peer(
+        before_reading: std::time::Duration,
+    ) -> (u16, std::sync::mpsc::Receiver<std::io::Result<usize>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            std::thread::sleep(before_reading);
+            let mut all = Vec::new();
+            let result = std::io::Read::read_to_end(&mut stream, &mut all).map(|_| all.len());
+            let _ = tx.send(result);
+        });
+        (port, rx)
+    }
+
+    async fn connected(registry: &TcpRegistry, ids: &std::sync::Arc<AtomicU64>, port: u16) -> u64 {
+        let OpOutcome::Json(payload) = tcp_connect(
+            registry.clone(),
+            ids.clone(),
+            "127.0.0.1".into(),
+            port,
+            crate::net_connect::DEFAULT_ATTEMPT_TIMEOUT,
+        )
+        .await
+        else {
+            panic!("connect failed");
+        };
+        let info: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        info["handle"].as_u64().unwrap()
+    }
+
+    /// Writes to `handle` until one does not fit the socket and is queued:
+    /// from here on a write is certainly in flight (the peer is not reading
+    /// yet). How much a socket takes before that is the platform's business
+    /// -- Windows accepts a whole buffer of any size once, Linux fills its
+    /// send buffer -- so the writes are issued until the queue shows one.
+    /// Returns the writes' futures, not yet polled, and the bytes issued.
+    fn write_until_queued(
+        registry: &TcpRegistry,
+        handle: u64,
+    ) -> (
+        Vec<impl std::future::Future<Output = OpOutcome> + Send + 'static>,
+        usize,
+    ) {
+        const CHUNK: usize = 4 * 1024 * 1024;
+        let mut writes = Vec::new();
+        while registry.lock().unwrap().queued_writes() == 0 {
+            assert!(
+                writes.len() < 256,
+                "the socket took 1 GiB without queueing a write"
+            );
+            writes.push(tcp_write(registry.clone(), handle, vec![7u8; CHUNK]));
+        }
+        let issued = writes.len() * CHUNK;
+        (writes, issued)
+    }
+
+    /// #156: a shutdown issued while a write is still in flight sends the
+    /// data and then the FIN. Before the write queue it found the write half
+    /// checked out, returned at once and sent nothing: the peer saw no EOF
+    /// until the handle was closed.
+    ///
+    /// The shutdown is spawned FIRST, to pin that the order is the order of
+    /// the calls, not of the polls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_issued_behind_a_write_in_flight_sends_the_data_then_the_fin() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let (port, peer) = reading_peer(std::time::Duration::from_millis(200));
+        let handle = connected(&registry, &ids, port).await;
+
+        let (writes, issued) = write_until_queued(&registry, handle);
+        let shutdown = tokio::spawn(tcp_shutdown(registry.clone(), handle));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        for write in writes {
+            assert!(matches!(
+                tokio::spawn(write).await.unwrap(),
+                OpOutcome::Done
+            ));
+        }
+        assert!(matches!(shutdown.await.unwrap(), OpOutcome::Done));
+        // The handle is still open: the EOF below is the shutdown's FIN.
+        let received = tokio::task::spawn_blocking(move || {
+            peer.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .unwrap()
+        .expect("the peer saw no EOF: the FIN was never sent")
+        .expect("the peer's read failed");
+        assert_eq!(
+            received, issued,
+            "every byte written arrives before the FIN"
+        );
+
+        // A write issued after the shutdown has no half to write to.
+        assert!(matches!(
+            tcp_write(registry.clone(), handle, b"late".to_vec()).await,
+            OpOutcome::Failed(_)
+        ));
+        assert_eq!(registry.lock().unwrap().queued_writes(), 0);
+        tcp_close(&registry, handle);
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+    }
+
+    /// #156, the common shape (`socket.write(response); socket.end()`): a
+    /// write the socket has room for and the shutdown behind it are both
+    /// done when the calls that issue them return -- the futures are not
+    /// polled until the peer has read the data and seen the FIN. That is
+    /// what lets JS ask for the FIN in the same turn as the write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_that_fits_and_its_shutdown_are_on_the_wire_when_issued() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let (port, peer) = reading_peer(std::time::Duration::ZERO);
+        let handle = connected(&registry, &ids, port).await;
+
+        let write = tcp_write(registry.clone(), handle, b"response".to_vec());
+        let shutdown = tcp_shutdown(registry.clone(), handle);
+        assert_eq!(
+            registry.lock().unwrap().queued_writes(),
+            0,
+            "a connected socket takes a small write at once: nothing is queued"
+        );
+        let received = tokio::task::spawn_blocking(move || {
+            peer.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .unwrap()
+        .expect("the peer saw no EOF before the futures were polled")
+        .expect("the peer's read failed");
+        assert_eq!(received, b"response".len());
+
+        assert!(matches!(write.await, OpOutcome::Done));
+        assert!(matches!(shutdown.await, OpOutcome::Done));
+        tcp_close(&registry, handle);
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+    }
+
+    /// A handle closed while writes and a shutdown are queued leaves nothing
+    /// behind: the write in flight ends (the close marker stops its half
+    /// going back), the ops behind it find no half, and the queue's tail
+    /// entry goes with the last turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_with_writes_queued_leaves_no_bookkeeping_behind() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        // A peer that reads only once the handle has been closed.
+        let (port, peer) = reading_peer(std::time::Duration::from_millis(300));
+        let handle = connected(&registry, &ids, port).await;
+
+        let (writes, _) = write_until_queued(&registry, handle);
+        let writes: Vec<_> = writes.into_iter().map(tokio::spawn).collect();
+        let behind = tokio::spawn(tcp_write(registry.clone(), handle, b"behind".to_vec()));
+        let shutdown = tokio::spawn(tcp_shutdown(registry.clone(), handle));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tcp_close(&registry, handle);
+
+        // The queued write holds its half; once the peer drains (or resets)
+        // it, it ends one way or the other. The ops behind it find the
+        // handle gone.
+        for write in writes {
+            let _ = write.await.unwrap();
+        }
+        assert!(matches!(behind.await.unwrap(), OpOutcome::Failed(_)));
+        assert!(matches!(shutdown.await.unwrap(), OpOutcome::Done));
+        let _ = tokio::task::spawn_blocking(move || {
+            peer.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await;
+        assert_eq!(registry.lock().unwrap().queued_writes(), 0);
         assert_eq!(
             registry.lock().unwrap().bookkeeping(),
             (0, 0, 0, 0, 0),

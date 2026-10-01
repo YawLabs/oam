@@ -26549,6 +26549,105 @@ fn socket_write_signals_backpressure_and_drains() {
     );
 }
 
+/// #156: `socket.write(data); socket.end()` in one callback sends the FIN
+/// right behind the data -- seen from a NODE client, which is who failed
+/// against an oam server (`UND_ERR_SOCKET` on keep-alive fetches racing the
+/// late FIN).
+///
+/// end() used to wait for the write's promise before it asked the natives
+/// for the shutdown, one op round trip after the data. It now asks in the
+/// same turn and the natives queue the shutdown behind the write. The
+/// regression this guards is the one that makes that ordering necessary: a
+/// shutdown issued while a write is in flight used to be dropped, so the
+/// client would get the data and never the 'end'. The large responses below
+/// go to a client that reads nothing for a while, so their writes are still
+/// in flight when the shutdown is issued. The client allows 5 s from the
+/// first 'data' to 'end' per connection (it takes microseconds for a small
+/// response), so a slow box cannot fail this and a lost FIN cannot pass.
+#[test]
+fn net_server_write_then_end_delivers_the_fin_to_a_node_client() {
+    use std::io::BufRead;
+    if !node_available() {
+        eprintln!("skipping: node not installed (the client runs on it)");
+        return;
+    }
+    let server = write_temp(
+        "write_end_fin/server.mjs",
+        "import net from 'node:net';\n\
+         const small = Buffer.from('HTTP/1.1 200 OK\\r\\ncontent-length: 2\\r\\n\\r\\nok');\n\
+         const large = Buffer.alloc(6 * 1024 * 1024, 0x61);\n\
+         const server = net.createServer((sock) => {\n\
+           sock.on('error', () => {});\n\
+           sock.once('data', (d) => {\n\
+             // The writes and the end, all in this one callback.\n\
+             if (String(d).startsWith('large')) { sock.write(large); sock.write(large); sock.write('tail'); }\n\
+             else sock.write(small);\n\
+             sock.end();\n\
+           });\n\
+         });\n\
+         server.listen(0, '127.0.0.1', () => console.log(server.address().port));\n",
+    );
+    let client = write_temp(
+        "write_end_fin/client.mjs",
+        "import net from 'node:net';\n\
+         const port = Number(process.argv[2]);\n\
+         function once(kind) {\n\
+           return new Promise((resolve) => {\n\
+             const s = net.connect(port, '127.0.0.1');\n\
+             let bytes = 0, timer = null, outcome = 'closed without end';\n\
+             s.on('connect', () => {\n\
+               s.write(kind);\n\
+               // Not reading yet: the server's writes back up behind this.\n\
+               if (kind === 'large') { s.pause(); setTimeout(() => s.resume(), 300); }\n\
+             });\n\
+             s.on('data', (d) => {\n\
+               bytes += d.length;\n\
+               if (timer === null) timer = setTimeout(() => { outcome = 'no end within 5s of data'; s.destroy(); }, 5000);\n\
+             });\n\
+             s.on('end', () => { outcome = 'end'; });\n\
+             s.on('error', (e) => { outcome = 'error ' + e.code; });\n\
+             s.on('close', () => { clearTimeout(timer); resolve(outcome + ' after ' + bytes + ' bytes'); });\n\
+           });\n\
+         }\n\
+         const tally = new Map();\n\
+         for (let i = 0; i < 300; i++) {\n\
+           const r = 'small: ' + await once('small');\n\
+           tally.set(r, (tally.get(r) || 0) + 1);\n\
+         }\n\
+         for (let i = 0; i < 5; i++) {\n\
+           const r = 'large: ' + await once('large');\n\
+           tally.set(r, (tally.get(r) || 0) + 1);\n\
+         }\n\
+         for (const [r, n] of tally) console.log(n + ' x ' + r);\n",
+    );
+    let mut serving = oam_command(&["run", server.to_str().unwrap()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("oam binary runs");
+    let mut port = String::new();
+    std::io::BufReader::new(serving.stdout.take().unwrap())
+        .read_line(&mut port)
+        .expect("the server prints its port");
+    let out = bounded_output(
+        std::process::Command::new("node").args([client.to_str().unwrap(), port.trim()]),
+    );
+    let _ = serving.kill();
+    let _ = serving.wait();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "client failed: {stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        "300 x small: end after 40 bytes\n5 x large: end after 12582916 bytes\n",
+        "every connection gets all of its data and then the FIN"
+    );
+}
+
 // ---------------------------------------------------------------- permissions
 
 /// Run the compiled binary with an explicit environment, bypassing the shared

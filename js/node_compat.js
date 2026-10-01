@@ -22513,6 +22513,9 @@
       if (hadError === undefined) self.emit("close");
       else self.emit("close", hadError);
     }
+    // What a queued write or shutdown resolves with when the socket was
+    // destroyed before it could run (see Socket.prototype._issue).
+    const kSocketClosed = Symbol("kSocketClosed");
     // Where libuv runs a closed handle's callback: after the immediates
     // already queued, before any timer. oam's loop has no close phase, so
     // this is an immediate of its own -- taken off the native, not the
@@ -22831,8 +22834,12 @@
         // Distinguishes ERR_SOCKET_CLOSED vs ERR_SOCKET_CLOSED_BEFORE_
         // CONNECTION for callbacks queued on a dead socket (Node parity).
         this._everConnected = false;
-        // Opens the write chain once a connect settles (see connect()).
-        this._connectGate = null;
+        // The native halves of the writes (and of end()) made while a connect
+        // is in flight; null when ops go straight to the natives (see
+        // _issue() and _releaseHeldOps()).
+        this._heldOps = null;
+        // end()'s callbacks, from the first end() until the stream finishes.
+        this._endCallbacks = null;
         if (options && options._handle !== undefined) {
           this._handle = options._handle;
           this.connecting = false;
@@ -22886,15 +22893,11 @@
         // strong Map for the process lifetime (one per socket).
         if (!this.destroyed) registry._activeHandles.set(this, "TCPSocketWrap");
         // Node queues writes (and the end() FIN) issued before the
-        // connection exists; the write chain waits on this gate, which opens
-        // once the connect settles -- or once the socket is destroyed while
-        // its name is still being looked up (destroy() opens it).
-        let openGate;
-        const gate = new Promise((resolve) => {
-          openGate = resolve;
-        });
-        this._connectGate = openGate;
-        this._chain = this._chain.then(() => gate);
+        // connection exists: _issue() holds their native halves from here
+        // on, and _releaseHeldOps() hands them over once the connect
+        // settles -- or once the socket is destroyed while its name is
+        // still being looked up.
+        if (this._heldOps === null) this._heldOps = [];
         const dial = (spec, local) => {
           // lookupAndConnect has validated the port by the time it dials.
           const port = options.port | 0;
@@ -22915,7 +22918,7 @@
             process.nextTick(connectErrorNT, this, err);
             return;
           }
-          this._startConnect(connecting, host, port).then(openGate);
+          this._startConnect(connecting, host, port);
         };
         if (refusePipeConnect(this, options)) return this;
         lookupAndConnect(this, options, host, options.port, dial);
@@ -22953,6 +22956,12 @@
             // without a handle); the remembered flag is applied here, before
             // 'connect' fires and before the first read parks.
             if (this._handleRefed === false) natives.tcpSetRef(this._handle, false);
+            // What was written while connecting goes out first, then
+            // 'connect': a listener that writes -- or destroys the socket --
+            // finds the earlier writes already with the natives (node
+            // flushes its pending data from a 'connect' listener of its
+            // own, registered by that first write).
+            this._releaseHeldOps();
             this.emit("connect");
             this.emit("ready");
             this._readLoop();
@@ -23009,8 +23018,15 @@
             if (!this.destroyed) this.emit("drain");
           }
         };
-        this._chain = this._chain.then(() => {
-          if (this.destroyed) {
+        // The native write is issued now (see _issue); `_chain` only orders
+        // what follows it -- the accounting and the callback, each after
+        // the write before it.
+        const written = this._issue(() => natives.tcpWrite(this._handle, bytes));
+        this._chain = this._chain.then(() => written).then((failure) => {
+          settle();
+          if (failure === undefined) {
+            if (cb) cb();
+          } else if (failure === kSocketClosed) {
             // Node invokes queued write callbacks with the socket-closed
             // error (NOT the connect error -- that went to 'error') --
             // silently dropping them hangs promisified writes forever.
@@ -23025,19 +23041,16 @@
               );
               process.nextTick(() => cb(err));
             }
-            settle();
-            return;
-          }
-          return natives.tcpWrite(this._handle, bytes).then(
-            () => { settle(); if (cb) cb(); },
+          } else {
             // node's afterWriteDispatched: a failed write destroys the
             // socket with its error, callback or not. destroy() defers
             // 'error', so with no listener it is an uncaught exception
             // rather than a throw into this reaction, which would reject
             // `_chain` -- an unhandled rejection, and every later write
             // skipped (#164).
-            (err) => { settle(); this.destroy(err); if (cb) cb(err); },
-          );
+            this.destroy(failure);
+            if (cb) cb(failure);
+          }
         });
         // Node: false once the queue is at or past the high-water mark. The
         // write is still accepted -- false is advisory, asking the producer to
@@ -23047,6 +23060,48 @@
           return false;
         }
         return true;
+      }
+
+      // Hands the native half of a write or of end()'s shutdown -- `run`,
+      // which returns the op's promise -- to the natives: at once on a
+      // socket that has its connection, so the natives are given a write
+      // and the FIN behind it in the same turn and in call order (they
+      // queue per handle, see tcp.rs WriteTurn; #156); once the connect
+      // settles on one still connecting, in the order the calls were made.
+      // The promise returned never rejects: it resolves with undefined, with
+      // the op's error, or with kSocketClosed when the socket was destroyed
+      // before the op could run.
+      _issue(run) {
+        const start = () => {
+          if (this.destroyed) return kSocketClosed;
+          let op;
+          try {
+            op = run();
+          } catch (err) {
+            return err;
+          }
+          if (op === undefined) return undefined;
+          return op.then(
+            () => undefined,
+            // An op queued behind others finds its handle gone when
+            // destroy() closed it first: an error with no code, where a
+            // write the OS failed has one.
+            (err) => (this.destroyed && err.code === undefined ? kSocketClosed : err),
+          );
+        };
+        if (this._heldOps === null) return Promise.resolve(start());
+        return new Promise((resolve) => {
+          this._heldOps.push(() => resolve(start()));
+        });
+      }
+
+      // The connect settled (or the socket was destroyed first): the held
+      // ops start, in the order they were made.
+      _releaseHeldOps() {
+        const held = this._heldOps;
+        if (held === null) return;
+        this._heldOps = null;
+        for (const start of held) start();
       }
 
       // Node's default for a net.Socket. Settable, as Node allows via options.
@@ -23069,7 +23124,11 @@
         // again would otherwise chain a SECOND 'finish' after 'close'). Node:
         // end() after end() is a no-op that still fires the callback.
         if (this._writableState.ended) {
-          if (cb) this.once("finish", cb);
+          if (cb) {
+            if (this._endCallbacks !== null) this._endCallbacks.push(cb);
+            else if (this._writableState.finished) process.nextTick(cb);
+            else process.nextTick(cb, this._writableState.errored ?? codes.ERR_STREAM_DESTROYED("end"));
+          }
           return this;
         }
         if (data !== undefined && data !== null) this.write(data, encoding);
@@ -23077,31 +23136,42 @@
         // state.writable stays untouched (side-existence marker; see destroy).
         this._writableState.ending = true;
         this._writableState.ended = true;
-        this._chain = this._chain.then(() => {
+        // The FIN is asked for now, in the same turn as the writes before
+        // it: the natives send it once the last of them is written, with
+        // no trip back through JS in between (#156; node queues the
+        // shutdown behind its writes in libuv the same way). 'finish' still
+        // waits for every write and for the shutdown.
+        const shut = this._issue(() => {
+          if (this._handle !== null) return natives.tcpShutdown(this._handle);
+        });
+        // node's end(cb): the callbacks of every end() made before the
+        // stream finishes run first, in call order, and then 'finish' is
+        // emitted (Writable's kOnFinished list).
+        const callbacks = this._endCallbacks = cb ? [cb] : [];
+        this._chain = this._chain.then(() => shut).then((failure) => {
           // A failed shutdown is the socket's error (node's afterShutdown
           // destroys with it), not a rejection left on `_chain`.
-          if (this._handle !== null) {
-            return natives.tcpShutdown(this._handle).then(undefined, (err) => { this.destroy(err); });
-          }
-        }).then(() => {
+          if (failure !== undefined && failure !== kSocketClosed) this.destroy(failure);
+          this._endCallbacks = null;
           if (this.destroyed || this._writableState.errored) {
             // Never report success on a socket that died first: Node skips
-            // 'finish' entirely and hands the end callback the error.
-            if (cb) {
-              cb(this._writableState.errored ?? Object.assign(
+            // 'finish' entirely and hands the end callbacks the error.
+            if (callbacks.length > 0) {
+              const err = this._writableState.errored ?? Object.assign(
                 new Error(this._everConnected
                   ? "Socket is closed"
                   : "Socket closed before the connection was established"),
                 { code: this._everConnected
                   ? "ERR_SOCKET_CLOSED"
                   : "ERR_SOCKET_CLOSED_BEFORE_CONNECTION" },
-              ));
+              );
+              for (const callback of callbacks) callback(err);
             }
             return;
           }
           this._writableState.finished = true;
+          for (const callback of callbacks) callback();
           this.emit("finish");
-          if (cb) cb();
           if (!this.readable) this._doClose();
         });
         return this;
@@ -23132,11 +23202,7 @@
         // Destroyed while its name was still being looked up: nothing will
         // settle the connect, so release the writes queued behind it (they
         // fail with ERR_SOCKET_CLOSED_BEFORE_CONNECTION).
-        if (this._connectGate) {
-          const openGate = this._connectGate;
-          this._connectGate = null;
-          openGate();
-        }
+        this._releaseHeldOps();
         const rs = this._readableState;
         const ws = this._writableState;
         rs.destroyed = ws.destroyed = true;

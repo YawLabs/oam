@@ -2082,9 +2082,17 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   up to 0.17.1 both were emitted from inside `destroy()`). What is left: Node emits that
   `'close'` from the handle's close callback, which also runs after an immediate queued
   AFTER `destroy()` in the same turn; oam's loop has no close phase, so there `'close'`
-  comes first. And a `write()` Node's kernel took synchronously reports success to its
-  callback even when `destroy()` follows on the next line, where oam's queued write is
-  dropped and its callback gets `ERR_SOCKET_CLOSED`. After the request ends
+  comes first. A `write()` is handed to the socket inside the call, as Node's is, and
+  `end()` asks for the FIN in the same turn (it is queued behind the writes natively, as
+  libuv queues a shutdown; up to 0.17.1 it waited for the last write to complete first,
+  so the FIN left one round trip late), so a write the socket takes is delivered even
+  when `destroy()` follows on the next line
+  (`conformance/cases/225-net-write-then-end-order.mjs`). What is left there: oam learns
+  that a write completed from its promise, so `write()` returns `false` and
+  `writableLength` counts the bytes until that callback even when the socket took them
+  all at once (Node reports `true` and `0` for those), and the callback of a write made
+  before the connect runs after the `'connect'` listeners rather than among them. After
+  the request ends
   Node clears a closed socket's `localAddress` / `localPort`; oam keeps them on a
   `net.Socket`.
 - **Proxy agents.** The agents that send an http request to a forward proxy in absolute
