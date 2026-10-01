@@ -383,10 +383,11 @@
       EPERM: "operation not permitted",
     };
     const err = new Error(`${code}: ${TEXT[code] ?? code}, ${syscall} '${path}'`);
+    // errno first: node's own order is errno, code, syscall, path.
+    if (ERRNO[code] !== undefined) err.errno = ERRNO[code];
     err.code = code;
     err.syscall = syscall;
     err.path = String(path);
-    if (ERRNO[code] !== undefined) err.errno = ERRNO[code];
     return err;
   }
 
@@ -408,21 +409,63 @@
   /// Buffer stays explicit even though `String(buf)` happened to produce the
   /// same bytes -- that worked only because Buffer's toString defaults to utf8,
   /// which is a coincidence of the class, not a decision this code made.
-  function toPath(path) {
-    if (typeof path === "string") return path;
+  ///
+  /// Anything else is node's `getValidatedPath` refusal (#167): a TypeError
+  /// ERR_INVALID_ARG_TYPE naming the argument (`name`, node's name for it --
+  /// "path", "oldPath", "src", ...), and ERR_INVALID_ARG_VALUE for a path
+  /// holding a NUL byte. `String(path)` used to be the fallback, so
+  /// `fs.statSync(42n)` stat'ed a file named `42`, `fsp.readFile({})` one named
+  /// `[object Object]`, and `fs.writeFileSync(fd, data)` CREATED a file named
+  /// after the descriptor -- a real file a typo could clobber.
+  function toPath(path, name = "path") {
+    if (typeof path === "string") {
+      if (path.includes("\u0000")) throw nulInPath(name, path);
+      return path;
+    }
     // Duck-typed, not `instanceof URL`: a URL minted in another realm (a vm
     // context, a worker message) fails the instanceof and would fall through
-    // to String(). Node checks the protocol the same way.
-    if (path && typeof path === "object" && typeof path.protocol === "string" && typeof path.href === "string") {
+    // to String(). Node checks the protocol the same way, and tells a WHATWG
+    // URL from a legacy url.parse() result by the latter's `auth` / `path`
+    // (lib/internal/url.js isURL).
+    if (
+      path && typeof path === "object" && typeof path.protocol === "string" &&
+      typeof path.href === "string" && path.auth === undefined && path.path === undefined
+    ) {
       if (path.protocol !== "file:") {
         const err = new TypeError("The URL must be of scheme file");
         err.code = "ERR_INVALID_URL_SCHEME";
         throw err;
       }
-      return registry.get("url").fileURLToPath(path);
+      const fromUrl = registry.get("url").fileURLToPath(path);
+      if (fromUrl.includes("\u0000")) throw nulInPath(name, fromUrl);
+      return fromUrl;
     }
-    if (path instanceof Uint8Array) return bufferToUtf8Path(path);
-    return String(path);
+    if (path instanceof Uint8Array) {
+      if (path.includes(0)) throw nulInPath(name, path);
+      return bufferToUtf8Path(path);
+    }
+    throw codes.ERR_INVALID_ARG_TYPE(name, ["string", "Buffer", "URL"], path);
+  }
+
+  function nulInPath(name, path) {
+    return codes.ERR_INVALID_ARG_VALUE(
+      name, path, "must be a string, Uint8Array, or URL without null bytes",
+    );
+  }
+
+  /// The path node names in an error oam builds itself, for a path as the
+  /// caller passed it: on Windows node's binding reports the RESOLVED path
+  /// (`ToNamespacedPath`), so `rmdirSync("file.txt")` fails `rmdir
+  /// 'C:\cwd\file.txt'`. The native ops do the same (oam_core::fs_error_path);
+  /// this is its twin for the errors made in JS. An empty path, and one that
+  /// resolves to two characters or fewer, stay as passed.
+  function fsErrorPath(path) {
+    if (globalThis.__oam.node.platform !== "win32" || path === "") return path;
+    const resolved = registry.get("path").win32.resolve(path);
+    if (resolved.length <= 2) return path;
+    if (resolved.startsWith("\\\\?\\UNC\\")) return "\\\\" + resolved.slice(8);
+    if (resolved.startsWith("\\\\?\\")) return resolved.slice(4);
+    return resolved;
   }
 
   /// Buffer/Uint8Array path -> string. Split out so `toPath` reads as a
@@ -462,6 +505,64 @@
   /// callback layer builds on these so a bad path still throws synchronously,
   /// as node does; only the exported module object is wrapped.
   let rawFsPromises = null;
+
+  /// Every FileHandle `fs/promises.open` hands out, so `readFile` /
+  /// `writeFile` / `appendFile` can tell one from a path (node checks
+  /// `instanceof FileHandle`; oam's handles are plain objects).
+  const fileHandles = new WeakSet();
+
+  /// The error of a native that probed with lstat on rmdir's behalf, as node
+  /// reports it: rmdir is the syscall, in `syscall` AND in the message
+  /// ("ENOENT: no such file or directory, rmdir 'p'"). Relabelling `syscall`
+  /// alone left the message saying lstat.
+  function asRmdirError(e) {
+    if (e && e.syscall === "lstat") {
+      e.syscall = "rmdir";
+      const marker = ", lstat '";
+      const at = typeof e.message === "string" ? e.message.indexOf(marker) : -1;
+      if (at !== -1) e.message = e.message.slice(0, at) + ", rmdir '" + e.message.slice(at + marker.length);
+    }
+    return e;
+  }
+
+  /// node's `fs.realpathSync` / `fs.realpath` (lib/fs.js) are JS: they resolve
+  /// the path and lstat it one component at a time from the root, following
+  /// each symlink they meet, so a failure names `lstat` and the component that
+  /// failed -- `realpathSync("a/missing/x")` fails `lstat '<cwd>/a/missing'`.
+  /// oam asks the OS for the whole path at once (`realpath`, which is what
+  /// node's `.native` forms and `fs/promises.realpath` report). When that
+  /// fails, this walk finds the error node's would have: the first component
+  /// whose lstat fails. If every component stats, the native error stands.
+  /// The walk yields `[op, path]` for the caller to run -- "lstat", "stat" or
+  /// "readlink", sync or async -- so one walk serves both forms.
+  function* realpathWalk(path) {
+    const pathMod = registry.get("path");
+    let full = pathMod.resolve(path);
+    let hops = 0;
+    for (;;) {
+      const root = pathMod.parse(full).root;
+      const parts = full.slice(root.length).split(pathMod.sep).filter(Boolean);
+      // On Windows node checks the root exists first.
+      if (globalThis.__oam.node.platform === "win32") yield ["lstat", root];
+      let current = root;
+      let relinked = false;
+      for (let i = 0; i < parts.length; i++) {
+        current = current === root ? root + parts[i] : current + pathMod.sep + parts[i];
+        const stat = yield ["lstat", current];
+        if (stat.kind === "symlink") {
+          // node stats the link (so a dangling one fails `stat`), reads it,
+          // and starts over from the resolved path.
+          if (++hops > 40) return;
+          yield ["stat", current];
+          const target = yield ["readlink", current];
+          full = pathMod.resolve(pathMod.dirname(current), target, ...parts.slice(i + 1));
+          relinked = true;
+          break;
+        }
+      }
+      if (!relinked) return;
+    }
+  }
 
   /// Captured when node_compat.js is evaluated, so a script that replaces
   /// Promise.prototype.then or Error.captureStackTrace cannot redirect how
@@ -550,40 +651,200 @@
     return `type ${typeof value} (${String(value)})`;
   }
 
-  // Apply Node's coded-error shape to an Error instance: `.code` is set, `.name`
-  // stays the plain base name (RangeError/TypeError -- assert.throws({name})
-  // compares it strictly), and `.toString()`/`.stack` show "BaseName [CODE]: msg"
-  // exactly as Node does (the code is injected into the rendered form, not name).
-  function applyNodeErrorShape(inst, code) {
-    const baseName = inst.name; // plain "TypeError" / "RangeError" / "Error"
-    inst.code = code;
-    Object.defineProperty(inst, "toString", {
-      value: function () {
-        const m = this.message;
-        return baseName + " [" + code + "]" + (m ? ": " + m : "");
-      },
+  // Node's coded-error shape (lib/internal/errors.js makeNodeErrorWithCode,
+  // v22.22.2), which is a CLASS per code -- `class NodeError extends Base`
+  // with a `code = key` field, `message` defined by the constructor, and
+  // `toString()` plus a `constructor` getter on the class prototype. What
+  // that makes observable, and what the helpers below reproduce:
+  //
+  // - Own properties are `stack`, `code`, `message`, in that order (the field
+  //   is initialised before the constructor body defines the message), with
+  //   `message` writable, configurable and NOT enumerable. The common
+  //   `JSON.stringify(err, Object.getOwnPropertyNames(err))` writes its keys
+  //   in this order.
+  // - That is the order for a code whose message is a FUNCTION. A code whose
+  //   message is a string is built with `super(message)` instead, so there
+  //   `message` precedes `code`. Which codes are which is node's table, not
+  //   something to derive here: see NODE_FUNCTION_MESSAGE_CODES.
+  // - `toString` is NOT an own property. It lives on a prototype between the
+  //   instance and Base.prototype, shared by every error of that code, so
+  //   `delete err.toString` changes nothing and
+  //   `Object.getPrototypeOf(err) === RangeError.prototype` is false, while
+  //   `err.constructor === RangeError` and `err instanceof RangeError` hold.
+  // - `.name` stays the plain base name (assert.throws({ name }) compares it
+  //   strictly); the code shows in `toString()` and in the stack header,
+  //   "BaseName [CODE]: msg".
+  //
+  // oam used to set `code` after the base constructor had set `message` and
+  // then define `toString` on the instance, which gave `stack, message, code,
+  // toString` and a flat prototype chain.
+  const kIsNodeError = Symbol("kIsNodeError");
+
+  // The codes node declares with a message FUNCTION
+  // (`E('ERR_X', (a, b) => ..., Base)`), for which `code` is an own property
+  // BEFORE `message` -- and before anything the function sets on `this`.
+  // Every other code has a string message (fixed, or a `%s` format) and is
+  // built with `super(message)`, so there `message` precedes `code`.
+  //
+  // Measured on node v22.22.2 with --expose-internals, by constructing every
+  // code oam's JS names and reading its own property order. A code node does
+  // not have takes the string-message order, which is also the order of an
+  // error node builds natively.
+  const NODE_FUNCTION_MESSAGE_CODES = new Set([
+    "ERR_ACCESS_DENIED",
+    "ERR_BUFFER_OUT_OF_BOUNDS",
+    "ERR_FALSY_VALUE_REJECTION",
+    "ERR_HTTP2_STREAM_CANCEL",
+    "ERR_INVALID_ADDRESS_FAMILY",
+    "ERR_INVALID_ARG_TYPE",
+    "ERR_INVALID_ARG_VALUE",
+    "ERR_INVALID_CHAR",
+    "ERR_INVALID_FILE_URL_PATH",
+    "ERR_INVALID_RETURN_VALUE",
+    "ERR_INVALID_URL",
+    "ERR_INVALID_URL_SCHEME",
+    "ERR_MISSING_ARGS",
+    "ERR_MODULE_NOT_FOUND",
+    "ERR_OUT_OF_RANGE",
+    "ERR_PACKAGE_IMPORT_NOT_DEFINED",
+    "ERR_PACKAGE_PATH_NOT_EXPORTED",
+    "ERR_SOCKET_BAD_PORT",
+    "ERR_TLS_CERT_ALTNAME_INVALID",
+    "ERR_UNHANDLED_ERROR",
+    "ERR_UNSUPPORTED_DIR_IMPORT",
+    "ERR_UNSUPPORTED_ESM_URL_SCHEME",
+  ]);
+
+  // The prototype every error of `code` over `baseProto` shares: node's
+  // NodeError.prototype for that code. Built once per (code, base) pair, as
+  // node builds one class per code.
+  const nodeErrorPrototypes = new Map(); // code -> Map(base prototype -> prototype)
+  function nodeErrorPrototype(baseProto, code) {
+    let byBase = nodeErrorPrototypes.get(code);
+    if (byBase === undefined) {
+      byBase = new Map();
+      nodeErrorPrototypes.set(code, byBase);
+    }
+    let proto = byBase.get(baseProto);
+    if (proto === undefined) {
+      const Base = baseProto.constructor;
+      proto = Object.create(baseProto, {
+        // node: "a workaround for wpt tests that expect that the error
+        // constructor has a `name` property of the base class".
+        constructor: {
+          get() {
+            return Base;
+          },
+          enumerable: false,
+          configurable: true,
+        },
+        [kIsNodeError]: {
+          get() {
+            return true;
+          },
+          enumerable: false,
+          configurable: true,
+        },
+        toString: {
+          value: function toString() {
+            return `${this.name} [${code}]: ${this.message}`;
+          },
+          writable: true,
+          enumerable: false,
+          configurable: true,
+        },
+      });
+      byBase.set(baseProto, proto);
+    }
+    return proto;
+  }
+
+  function defineNodeErrorMessage(inst, message) {
+    Object.defineProperty(inst, "message", {
+      value: message,
+      enumerable: false,
       writable: true,
       configurable: true,
-      enumerable: false,
     });
-    // Node renders the code into the stack header too. Anchor the rewrite to
-    // the first line only -- never risk hitting a "Name:" substring in the
-    // message or a deeper frame.
-    if (typeof inst.stack === "string") {
-      const nl = inst.stack.indexOf("\n");
-      const head = nl === -1 ? inst.stack : inst.stack.slice(0, nl);
-      const rest = nl === -1 ? "" : inst.stack.slice(nl);
-      inst.stack = head.replace(baseName + ":", baseName + " [" + code + "]:") + rest;
+  }
+
+  // The last two steps, once `code` and `message` are in place: move the
+  // instance under its code's prototype, and render the code into the stack
+  // header, which node's prepareStackTrace does for a kIsNodeError error.
+  function finishNodeErrorShape(inst, code) {
+    let baseProto = Object.getPrototypeOf(inst);
+    // Shaped twice (a helper re-coding an error): stay one level deep.
+    if (Object.hasOwn(baseProto, kIsNodeError)) baseProto = Object.getPrototypeOf(baseProto);
+    Object.setPrototypeOf(inst, nodeErrorPrototype(baseProto, code));
+    // Rewrite line 0 only when it is the default render, `Name` or
+    // `Name: message`: a user's Error.prepareStackTrace output is theirs to
+    // keep, exactly as in node. `stack` stays an accessor after the
+    // assignment.
+    try {
+      const stack = inst.stack;
+      const name = inst.name;
+      if (typeof stack === "string" && stack.startsWith(name)) {
+        const rest = stack.slice(name.length);
+        if (rest.startsWith(": ")) {
+          inst.stack = name + " [" + code + "]" + rest;
+        } else if (rest === "" || rest.startsWith("\n")) {
+          // An empty message: V8 writes the bare name, node `Name [CODE]: `.
+          inst.stack = name + " [" + code + "]: " + rest;
+        }
+      }
+    } catch {
+      // A throwing user Error.prepareStackTrace: the error is still whole.
     }
     return inst;
   }
 
+  // Apply node's coded-error shape to an Error instance built elsewhere.
+  // `fields` are the own properties node's message function sets on the error
+  // (ERR_FALSY_VALUE_REJECTION's `reason`): they land where node puts them,
+  // between `code` and `message`. Set on the instance beforehand instead,
+  // they would come before both, since `code` and `message` are re-created.
+  function applyNodeErrorShape(inst, code, fields) {
+    const message = inst.message;
+    // Re-create both so they land in node's order whatever the instance
+    // already carried (the base constructor's own `message`, an earlier code).
+    delete inst.message;
+    delete inst.code;
+    if (NODE_FUNCTION_MESSAGE_CODES.has(code)) {
+      inst.code = code;
+      if (fields) Object.assign(inst, fields);
+      defineNodeErrorMessage(inst, message);
+    } else {
+      defineNodeErrorMessage(inst, message);
+      inst.code = code;
+      if (fields) Object.assign(inst, fields);
+    }
+    return finishNodeErrorShape(inst, code);
+  }
+
+  // The factory behind `codes.ERR_*`. Callable with or without `new` (both
+  // are used throughout this file). `msgFn` is a string or a function of the
+  // constructor's arguments. For a code whose node message is a function,
+  // it runs as node's does: with `this` set to the error under construction,
+  // AFTER `code` is in place and BEFORE `message` is, so a property it sets
+  // (ERR_INVALID_URL's `input`) lands between the two.
   function E(code, Base, msgFn) {
+    const codeFirst = NODE_FUNCTION_MESSAGE_CODES.has(code);
     function NodeError() {
-      var args = Array.prototype.slice.call(arguments);
-      var msg = typeof msgFn === "function" ? msgFn.apply(null, args) : msgFn;
-      var inst = new Base(msg);
-      return applyNodeErrorShape(inst, code);
+      var inst = new Base();
+      if (codeFirst) {
+        inst.code = code;
+        defineNodeErrorMessage(
+          inst,
+          typeof msgFn === "function" ? msgFn.apply(inst, arguments) : msgFn,
+        );
+      } else {
+        defineNodeErrorMessage(
+          inst,
+          typeof msgFn === "function" ? msgFn.apply(inst, arguments) : msgFn,
+        );
+        inst.code = code;
+      }
+      return finishNodeErrorShape(inst, code);
     }
     return NodeError;
   }
@@ -790,8 +1051,12 @@
     return 'Class constructor ' + name + ' cannot be invoked without `new`';
   });
   // Node v22 shape: message is exactly "Invalid URL"; the offending string
-  // rides on err.input (set by the throw sites), not in the message.
-  codes.ERR_INVALID_URL = E("ERR_INVALID_URL", TypeError, function() {
+  // rides on err.input (and a base on err.base), not in the message. Node
+  // sets both from inside the message function, which is why they sit
+  // between `code` and `message` in the own-property order.
+  codes.ERR_INVALID_URL = E("ERR_INVALID_URL", TypeError, function(input, base) {
+    this.input = input;
+    if (base != null) this.base = base;
     return 'Invalid URL';
   });
   codes.ERR_INVALID_URL_SCHEME = E("ERR_INVALID_URL_SCHEME", TypeError, function(expected) {
@@ -819,20 +1084,14 @@
     return registry.get("util").format("Invalid IP address: %s", ip);
   });
   // ---- RangeError family ----
-  // node's message function also sets `host` and `port` on the error; E()
-  // calls a message function with no instance, so they are set after the code,
-  // which keeps node's enumerable order (code, host, port -- measured).
-  {
-    const AddressFamilyError = E("ERR_INVALID_ADDRESS_FAMILY", RangeError, function(addressType, host, port) {
-      return `Invalid address family: ${addressType} ${host}:${port}`;
-    });
-    codes.ERR_INVALID_ADDRESS_FAMILY = function ERR_INVALID_ADDRESS_FAMILY(addressType, host, port) {
-      const err = AddressFamilyError(addressType, host, port);
-      err.host = host;
-      err.port = port;
-      return err;
-    };
-  }
+  // node's message function also sets `host` and `port` on the error, which
+  // puts them between `code` and `message` (own order stack, code, host,
+  // port, message -- measured).
+  codes.ERR_INVALID_ADDRESS_FAMILY = E("ERR_INVALID_ADDRESS_FAMILY", RangeError, function(addressType, host, port) {
+    this.host = host;
+    this.port = port;
+    return `Invalid address family: ${addressType} ${host}:${port}`;
+  });
   // node's addNumericalSeparator (lib/internal/errors.js): group a big
   // integer's digits so 9007199254740992 reports as 9_007_199_254_740_992.
   // Works on the STRING form and is sign-aware -- the leading "-" is never
@@ -870,8 +1129,10 @@
   codes.ERR_BUFFER_OUT_OF_BOUNDS = E("ERR_BUFFER_OUT_OF_BOUNDS", RangeError, function(name) {
     return name ? '"' + name + '" is outside of buffer bounds' : 'Attempt to access memory outside buffer bounds';
   });
-  codes.ERR_CHILD_CLOSED_BEFORE_REPLY = E("ERR_CHILD_CLOSED_BEFORE_REPLY", RangeError, function() {
-    return 'Child closed before reply';
+  // Declared in this family for history; node's is an Error (not a
+  // RangeError) and its text ends in "received" (measured on v22.22.2).
+  codes.ERR_CHILD_CLOSED_BEFORE_REPLY = E("ERR_CHILD_CLOSED_BEFORE_REPLY", Error, function() {
+    return 'Child closed before reply received';
   });
   // node internal/errors.js: `${name} should be ${allowZero ? '>=' : '>'} 0
   // and < 65536. Received ${determineSpecificType(port)}.` -- the name is bare
@@ -991,6 +1252,12 @@
   // 'remove', 'append').
   codes.ERR_HTTP_HEADERS_SENT = E("ERR_HTTP_HEADERS_SENT", Error, function(what) {
     return 'Cannot ' + what + ' headers after they are sent to the client';
+  });
+  // EventEmitter's emit('error', x) with no listener and an x that is not an
+  // Error. `err` arrives already inspected (see emit); none at all is the
+  // bare message.
+  codes.ERR_UNHANDLED_ERROR = E("ERR_UNHANDLED_ERROR", Error, function(err) {
+    return err === undefined ? 'Unhandled error.' : 'Unhandled error. (' + err + ')';
   });
   codes.ERR_STREAM_PREMATURE_CLOSE = E("ERR_STREAM_PREMATURE_CLOSE", Error, function() {
     return 'Premature close';
@@ -2850,9 +3117,20 @@
       if (existing === undefined) {
         if (type === "error") {
           const err = args[0];
-          throw err instanceof Error
-            ? err
-            : new Error(`Unhandled error. (${String(err)})`);
+          if (err instanceof Error) throw err;
+          // Not an Error: node throws ERR_UNHANDLED_ERROR, with the argument
+          // inspected into the message (a string shows its quotes, an object
+          // its contents) and kept, untouched, as `context` -- so a caller
+          // can tell this failure by `code` and still reach what was emitted.
+          let inspected;
+          try {
+            inspected = nodeInspect(err);
+          } catch {
+            inspected = err;
+          }
+          const unhandled = new codes.ERR_UNHANDLED_ERROR(inspected);
+          unhandled.context = err;
+          throw unhandled;
         }
         return false;
       }
@@ -6184,13 +6462,14 @@
     function callbackifyOnRejected(reason, cb) {
       if (!reason) {
         const err = new Error("Promise was rejected with falsy value");
-        err.reason = reason;
         // Capture BEFORE shaping: applyNodeErrorShape rewrites the current
         // stack's first line into the "Error [ERR_FALSY_VALUE_REJECTION]:"
         // header node renders -- capturing afterward would regenerate an
         // unshaped stack.
         Error.captureStackTrace(err, callbackifyOnRejected);
-        applyNodeErrorShape(err, "ERR_FALSY_VALUE_REJECTION");
+        // `reason` is set by node's message function, so it sits between
+        // `code` and `message`: [stack, code, reason, message].
+        applyNodeErrorShape(err, "ERR_FALSY_VALUE_REJECTION", { reason });
         reason = err;
       }
       return cb(reason);
@@ -9949,6 +10228,10 @@
         const opts = readOptions(options);
         const highWaterMark = opts.highWaterMark ?? 65536;
         const supplied = suppliedFd(opts);
+        // node's importFd: with no descriptor, the path is validated here in
+        // the constructor, so a bad one throws from createReadStream itself
+        // rather than failing the open a tick later as an 'error' event.
+        if (!supplied) toPath(path);
         // node's `autoClose` is about the DESCRIPTOR, not the stream object:
         // false means the application owns the fd and the stream must leave it
         // open even at EOF and even on error. It also maps onto the stream
@@ -10059,6 +10342,8 @@
         const opts = readOptions(options);
         const flags = opts.flags === "a" ? "a" : "w";
         const supplied = suppliedFd(opts);
+        // Validated in the constructor, as node's importFd does (see ReadStream).
+        if (!supplied) toPath(path);
         const autoClose = opts.autoClose !== false;
         let handle = supplied ? supplied.handle : null;
         let totalWritten = 0;
@@ -10126,50 +10411,79 @@
     // node, and the opposite of what this branch's own e2e docstring claims.
     // So the raw object is stashed for `registry.factories.fs` and only the
     // exported copy is wrapped.
+    // The async methods take their path through `withPath`, which validates
+    // it BEFORE the first await: the callback forms built on these must throw
+    // a bad path synchronously, as node's do, and an async function turned
+    // that throw into a callback error. (The exported module's wrapper turns
+    // it back into a rejection.)
+    const withPath = (fn) => (path, ...rest) => fn(toPath(path), ...rest);
+    // fs/promises.cp over two validated paths.
+    async function cpRecursive(srcStr, destStr, options) {
+      var opts = options || {};
+      var raw;
+      try { raw = await natives.fsStat(srcStr, false); } catch (e) { throw e; }
+      if (raw.kind === "dir") {
+        if (!opts.recursive) throw makeNodeError("ERR_FS_CP_DIR_TO_NON_DIR", "cp: -r not specified; omitting directory '" + srcStr + "'");
+        try { await natives.fsMkdir(destStr, true); } catch (e) {}
+        var entries = await natives.fsReaddir(srcStr);
+        for (var i = 0; i < entries.length; i++) {
+          var sep = srcStr.endsWith("/") || srcStr.endsWith("\\") ? "" : "/";
+          await cpRecursive(srcStr + sep + entries[i].name, destStr + sep + entries[i].name, opts);
+        }
+      } else {
+        await natives.fsCopyFile(srcStr, destStr);
+      }
+    }
+    const readFileAt = async (file, options) => {
+      const bytes = await natives.fsReadFile(file);
+      return decodeRead(bytes, readOptions(options).encoding ?? null);
+    };
     rawFsPromises = {
-      readFile: async (path, options) => {
-        const bytes = await natives.fsReadFile(toPath(path));
-        return decodeRead(bytes, readOptions(options).encoding ?? null);
-      },
+      // A FileHandle reads / writes through itself, as node's do.
+      readFile: (path, options) =>
+        fileHandles.has(path) ? path.readFile(options) : readFileAt(toPath(path), options),
       writeFile: (path, data, options) =>
-        natives.fsWriteFile(toPath(path), encodeWrite(data, options), false),
+        fileHandles.has(path)
+          ? path.writeFile(data, options)
+          : natives.fsWriteFile(toPath(path), encodeWrite(data, options), false),
       appendFile: (path, data, options) =>
-        natives.fsWriteFile(toPath(path), encodeWrite(data, options), true),
-      stat: async (path) => wrapStat(await natives.fsStat(toPath(path), false)),
-      lstat: async (path) => wrapStat(await natives.fsStat(toPath(path), true)),
-      statfs: async (path, options) => wrapStatFs(await natives.fsStatfs(toPath(path)), options),
-      readdir: async (path, options) => {
+        fileHandles.has(path)
+          ? path.appendFile(data, options)
+          : natives.fsWriteFile(toPath(path), encodeWrite(data, options), true),
+      stat: withPath(async (file) => wrapStat(await natives.fsStat(file, false))),
+      lstat: withPath(async (file) => wrapStat(await natives.fsStat(file, true))),
+      statfs: withPath(async (file, options) => wrapStatFs(await natives.fsStatfs(file), options)),
+      readdir: withPath(async (file, options) => {
         const { withFileTypes } = readOptions(options);
-        const entries = await natives.fsReaddir(toPath(path));
-        return wrapDirents(toPath(path), entries, withFileTypes === true);
-      },
-      mkdir: async (path, options) => {
-        await natives.fsMkdir(toPath(path), readOptions(options).recursive === true);
-      },
-      rm: async (path, options = {}) => {
-        await natives.fsRm(toPath(path), options.recursive === true, options.force === true);
-      },
-      rmdir: async (path) => {
+        const entries = await natives.fsReaddir(file);
+        return wrapDirents(file, entries, withFileTypes === true);
+      }),
+      mkdir: withPath(async (file, options) => {
+        await natives.fsMkdir(file, readOptions(options).recursive === true);
+      }),
+      rm: withPath(async (file, options = {}) => {
+        await natives.fsRm(file, options.recursive === true, options.force === true);
+      }),
+      rmdir: withPath(async (dir) => {
         // Node never deletes a FILE through rmdir (code-probing callers
         // depend on the throw); kind-check first. The probe is an internal
         // detail -- node reports `rmdir` as the failing syscall, so relabel
         // rather than leaking `lstat` (same as the sync twin).
         let raw;
         try {
-          raw = await natives.fsStat(toPath(path), true);
+          raw = await natives.fsStat(dir, true);
         } catch (e) {
-          if (e && e.syscall === "lstat") e.syscall = "rmdir";
-          throw e;
+          throw asRmdirError(e);
         }
         if (raw.kind !== "dir") {
           // As in the sync twin: node's full system-error shape.
-          throw makeSystemError(isWin ? "ENOENT" : "ENOTDIR", "rmdir", path);
+          throw makeSystemError(isWin ? "ENOENT" : "ENOTDIR", "rmdir", fsErrorPath(dir));
         }
-        await natives.fsRm(toPath(path), false, false);
-      },
+        await natives.fsRm(dir, false, false);
+      }),
       unlink: (path) => natives.fsUnlink(toPath(path)),
-      rename: (from, to) => natives.fsRename(toPath(from), toPath(to)),
-      copyFile: (from, to) => natives.fsCopyFile(toPath(from), toPath(to)),
+      rename: (from, to) => natives.fsRename(toPath(from, "oldPath"), toPath(to, "newPath")),
+      copyFile: (from, to) => natives.fsCopyFile(toPath(from, "src"), toPath(to, "dest")),
       // node v22's fs.promises.glob returns an AsyncIterable, not a Promise.
       // Wrap the materialized array so Array.fromAsync() works on both sides.
       glob: (pattern, options) => globAsyncIterable(globSyncRaw(pattern, options, natives)),
@@ -10179,10 +10493,11 @@
       _globAsPromise: (pattern, options) => Promise.resolve().then(() => globSyncRaw(pattern, options, natives)),
       access: (path, mode) => natives.fsAccess(toPath(path), mode ?? 0),
       realpath: (path) => natives.fsRealpath(toPath(path)),
-      mkdtemp: (prefix) => natives.fsMkdtemp(toPath(prefix)),
-      symlink: (target, path) => natives.fsSymlink(toPath(target), toPath(path)),
+      mkdtemp: (prefix) => natives.fsMkdtemp(toPath(prefix, "prefix")),
+      symlink: (target, path) => natives.fsSymlink(toPath(target, "target"), toPath(path)),
       readlink: (path) => natives.fsReadlink(toPath(path)),
-      link: (existing, newPath) => natives.fsLink(toPath(existing), toPath(newPath)),
+      link: (existing, newPath) =>
+        natives.fsLink(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
       chmod: (path, mode) => natives.fsChmod(toPath(path), mode),
       truncate: (path, len) => natives.fsTruncate(toPath(path), len ?? 0),
       chown: (path, uid, gid) => natives.fsChown(toPath(path), uid, gid),
@@ -10203,31 +10518,14 @@
         err.code = "ERR_METHOD_NOT_IMPLEMENTED";
         return Promise.reject(err);
       },
-      opendir: async function (path) {
-        var dirPath = toPath(path);
+      opendir: withPath(async function (dirPath) {
         return new Dir(dirPath, await natives.fsReaddir(dirPath));
-      },
-      cp: async function cpRecursive(src, dest, options) {
-        var srcStr = toPath(src);
-        var destStr = toPath(dest);
-        var opts = options || {};
-        var raw;
-        try { raw = await natives.fsStat(srcStr, false); } catch (e) { throw e; }
-        if (raw.kind === "dir") {
-          if (!opts.recursive) throw makeNodeError("ERR_FS_CP_DIR_TO_NON_DIR", "cp: -r not specified; omitting directory '" + srcStr + "'");
-          try { await natives.fsMkdir(destStr, true); } catch (e) {}
-          var entries = await natives.fsReaddir(srcStr);
-          for (var i = 0; i < entries.length; i++) {
-            var sep = srcStr.endsWith("/") || srcStr.endsWith("\\") ? "" : "/";
-            await cpRecursive(srcStr + sep + entries[i].name, destStr + sep + entries[i].name, opts);
-          }
-        } else {
-          await natives.fsCopyFile(srcStr, destStr);
-        }
-      },
-      open: async function (path, flags, mode) {
+      }),
+      cp: (src, dest, options) => cpRecursive(toPath(src, "src"), toPath(dest, "dest"), options),
+      open: withPath(async function (file, flags, mode) {
         flags = flags || "r";
-        var info = await natives.fsOpen(toPath(path), String(flags));
+        var info = await natives.fsOpen(file, String(flags));
+
         var h = info.handle;
         var closed = false;
         // readableWebStream() locks the handle to its stream FOR LIFE -- see
@@ -10536,8 +10834,9 @@
             await fh.close();
           },
         };
+        fileHandles.add(fh);
         return fh;
-      },
+      }),
       constants: {
         F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
         O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,
@@ -10602,6 +10901,165 @@
           (value) => { fsReqEnd(token); queueMicrotask(() => cb(null, value)); },
           (err) => { fsReqEnd(token); queueMicrotask(() => cb(err)); },
         );
+      };
+    }
+
+    // node's isInt32: what readFile / writeFile / appendFile take as a file
+    // descriptor rather than a path.
+    function isInt32(value) {
+      return value === (value | 0);
+    }
+
+    // node's realpath / realpathSync argument: a file: URL becomes its path,
+    // anything else is stringified (`p += ''`), and a NUL byte is refused.
+    function realpathArg(path) {
+      const isUrl = path && typeof path === "object" && typeof path.href === "string" &&
+        path.auth === undefined && path.path === undefined;
+      return toPath(typeof path === "string" || isUrl ? path : path + "");
+    }
+
+    function realpathWalkErrorSync(path, original) {
+      const walk = realpathWalk(path);
+      let step = walk.next();
+      try {
+        while (!step.done) {
+          const [op, at] = step.value;
+          step = walk.next(op === "readlink" ? natives.fsReadlinkSync(at) : natives.fsStatSync(at, op === "lstat"));
+        }
+      } catch (e) {
+        return e;
+      }
+      return original;
+    }
+
+    async function realpathWalking(path) {
+      try {
+        return await natives.fsRealpath(path);
+      } catch (original) {
+        // A failing lstat / readlink rejects with its own error.
+        const walk = realpathWalk(path);
+        let step = walk.next();
+        while (!step.done) {
+          const [op, at] = step.value;
+          step = walk.next(op === "readlink" ? await natives.fsReadlink(at) : await natives.fsStat(at, op === "lstat"));
+        }
+        throw original;
+      }
+    }
+
+    // DEP0081, once per process as node warns it.
+    let truncateFdWarned = false;
+    function warnTruncateFd() {
+      if (truncateFdWarned) return;
+      truncateFdWarned = true;
+      process.emitWarning(
+        "Using fs.truncate with a file descriptor is deprecated. Please use fs.ftruncate with a file descriptor instead.",
+        "DeprecationWarning",
+        "DEP0081",
+      );
+    }
+
+    // node's getValidatedFd for the int32 a readFile-family call took as a
+    // descriptor: a negative one is out of range.
+    function checkFd(fd) {
+      if (fd < 0) throw codes.ERR_OUT_OF_RANGE("fd", ">= 0 && <= 2147483647", fd);
+    }
+
+    // readFileSync(fd): everything from the descriptor's current position.
+    // fstat first, as node's does, so a bad descriptor fails `fstat`.
+    function readFdSync(fd) {
+      checkFd(fd);
+      fs.fstatSync(fd);
+      const chunks = [];
+      let total = 0;
+      for (;;) {
+        const chunk = globalThis.Buffer.allocUnsafe(65536);
+        const n = fs.readSync(fd, chunk, 0, chunk.length, null);
+        if (n === 0) break;
+        chunks.push(n === chunk.length ? chunk : chunk.subarray(0, n));
+        total += n;
+      }
+      return globalThis.Buffer.concat(chunks, total);
+    }
+
+    // writeFileSync(fd) / appendFileSync(fd): all of the data at the current
+    // position (node does not seek a descriptor it was handed). Node takes
+    // two paths here (v22.22.2 lib/fs.js writeFileSync):
+    // - a string with encoding exactly "utf8" / "utf-8" (the default) goes to
+    //   the binding's writeFileUtf8, which hands any int32 to the write: a
+    //   negative descriptor fails EBADF `write`, its keys errno, code,
+    //   syscall;
+    // - anything else goes through fs.writeSync, which range-checks the
+    //   descriptor first (ERR_OUT_OF_RANGE "fd" for a negative one).
+    function writeFdSync(fd, data, options) {
+      const encoding = readOptions(options).encoding ?? "utf8";
+      const utf8 = typeof data === "string" && (encoding === "utf8" || encoding === "utf-8");
+      const bytes = encodeWrite(data, options);
+      let off = 0;
+      try {
+        while (off < bytes.length) {
+          // Per write, as node's writeSync checks it: empty data writes
+          // nothing and checks nothing.
+          if (!utf8) checkFd(fd);
+          off += fs.writeSync(fd, bytes, off, bytes.length - off, null);
+        }
+      } catch (e) {
+        // writeSync's error has errno, syscall, code (as node's does);
+        // writeFileUtf8's has errno, code, syscall.
+        if (utf8 && e !== null && typeof e === "object" && Object.hasOwn(e, "syscall")) {
+          const syscall = e.syscall;
+          delete e.syscall;
+          e.syscall = syscall;
+        }
+        throw e;
+      }
+    }
+
+    function readFdAsync(fd, cb) {
+      checkFd(fd);
+      fs.fstat(fd, (statErr) => {
+        if (statErr) return cb(statErr);
+        const chunks = [];
+        let total = 0;
+        const next = () => {
+          const chunk = globalThis.Buffer.allocUnsafe(65536);
+          fs.read(fd, chunk, 0, chunk.length, null, (err, n) => {
+            if (err) return cb(err);
+            if (n === 0) return cb(null, globalThis.Buffer.concat(chunks, total));
+            chunks.push(n === chunk.length ? chunk : chunk.subarray(0, n));
+            total += n;
+            next();
+          });
+        };
+        next();
+      });
+    }
+
+    // writeFile / appendFile, callback form: a descriptor is written in place
+    // from its current position, a path goes through fs/promises.
+    function fdOrPathWrite(promiseFn) {
+      return function (path, data, options, cb) {
+        if (typeof options === "function") { cb = options; options = undefined; }
+        if (!isInt32(path)) return callbackify1(promiseFn)(path, data, options, cb);
+        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+        checkFd(path);
+        let bytes;
+        try {
+          bytes = encodeWrite(data, options);
+        } catch (e) {
+          queueMicrotask(() => cb(e));
+          return;
+        }
+        let off = 0;
+        const next = () => {
+          if (off >= bytes.length) return cb(null);
+          fs.write(path, bytes, off, bytes.length - off, null, (err, n) => {
+            if (err) return cb(err);
+            off += n;
+            next();
+          });
+        };
+        next();
       };
     }
 
@@ -10732,7 +11190,12 @@
     }
 
     const fs = {
-      promises,
+      // The exported object is the WRAPPED module, the very object
+      // require("fs/promises") returns (node: `fs.promises ===
+      // require("fs/promises")`), so `fs.promises.stat(bad)` rejects as
+      // node's does. The raw `promises` above, which throws a bad path
+      // synchronously, stays internal to the callback forms.
+      promises: registry.get("fs/promises"),
       constants: {
         F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
         O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,
@@ -10753,8 +11216,11 @@
       F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
       Dir,
 
+      // An int32 `path` is a file descriptor (node's isInt32 test), read or
+      // written from its current position; anything else must be a path.
       readFileSync: (path, options) => {
         const enc = readOptions(options).encoding;
+        if (isInt32(path)) return decodeRead(readFdSync(path), enc ?? null);
         if (enc === "utf8" || enc === "utf-8") {
           return natives.fsReadFileUtf8Sync(toPath(path));
         }
@@ -10762,12 +11228,23 @@
         return decodeRead(bytes, enc ?? null);
       },
       writeFileSync: (path, data, options) => {
+        if (isInt32(path)) return void writeFdSync(path, data, options);
         natives.fsWriteFileSync(toPath(path), encodeWrite(data, options), false);
       },
       appendFileSync: (path, data, options) => {
+        if (isInt32(path)) return void writeFdSync(path, data, options);
         natives.fsWriteFileSync(toPath(path), encodeWrite(data, options), true);
       },
-      existsSync: (path) => natives.fsExistsSync(toPath(path)),
+      // node answers false for a path it cannot even validate.
+      existsSync: (path) => {
+        let file;
+        try {
+          file = toPath(path);
+        } catch {
+          return false;
+        }
+        return natives.fsExistsSync(file);
+      },
       statSync: (path) => wrapStat(natives.fsStatSync(toPath(path), false)),
       lstatSync: (path) => wrapStat(natives.fsStatSync(toPath(path), true)),
       statfsSync: (path, options) => wrapStatFs(natives.fsStatfsSync(toPath(path)), options),
@@ -10790,12 +11267,12 @@
         // The kind probe is an implementation detail: node reports `rmdir` as
         // the failing syscall, so an ENOENT from this internal lstat must not
         // surface as `syscall: "lstat"`.
+        const dir = toPath(path);
         let raw;
         try {
-          raw = natives.fsStatSync(toPath(path), true);
+          raw = natives.fsStatSync(dir, true);
         } catch (e) {
-          if (e && e.syscall === "lstat") e.syscall = "rmdir";
-          throw e;
+          throw asRmdirError(e);
         }
         if (raw.kind !== "dir") {
           // Full system-error shape, not just a code: node sets syscall/path/
@@ -10803,22 +11280,40 @@
           throw makeSystemError(
             natives.platform === "win32" ? "ENOENT" : "ENOTDIR",
             "rmdir",
-            path,
+            fsErrorPath(dir),
           );
         }
-        natives.fsRmSync(toPath(path), false, false);
+        natives.fsRmSync(dir, false, false);
       },
       unlinkSync: (path) => natives.fsUnlinkSync(toPath(path)),
-      renameSync: (from, to) => natives.fsRenameSync(toPath(from), toPath(to)),
-      copyFileSync: (from, to) => natives.fsCopyFileSync(toPath(from), toPath(to)),
+      renameSync: (from, to) =>
+        natives.fsRenameSync(toPath(from, "oldPath"), toPath(to, "newPath")),
+      copyFileSync: (from, to) => natives.fsCopyFileSync(toPath(from, "src"), toPath(to, "dest")),
       accessSync: (path, mode) => natives.fsAccessSync(toPath(path), mode ?? 0),
-      realpathSync: (path) => natives.fsRealpathSync(toPath(path)),
-      mkdtempSync: (prefix) => natives.fsMkdtempSync(toPath(prefix)),
-      symlinkSync: (target, path) => natives.fsSymlinkSync(toPath(target), toPath(path)),
+      // node's realpathSync stringifies rather than type-checks (`p += ''`),
+      // and on failure reports what its component walk hit (realpathWalk).
+      realpathSync: (path) => {
+        const file = realpathArg(path);
+        try {
+          return natives.fsRealpathSync(file);
+        } catch (e) {
+          throw realpathWalkErrorSync(file, e);
+        }
+      },
+      mkdtempSync: (prefix) => natives.fsMkdtempSync(toPath(prefix, "prefix")),
+      symlinkSync: (target, path) => natives.fsSymlinkSync(toPath(target, "target"), toPath(path)),
       readlinkSync: (path) => natives.fsReadlinkSync(toPath(path)),
-      linkSync: (existing, newPath) => natives.fsLinkSync(toPath(existing), toPath(newPath)),
+      linkSync: (existing, newPath) =>
+        natives.fsLinkSync(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
       chmodSync: (path, mode) => natives.fsChmodSync(toPath(path), mode),
-      truncateSync: (path, len) => natives.fsTruncateSync(toPath(path), len ?? 0),
+      // A descriptor is truncated through ftruncate, with node's DEP0081.
+      truncateSync: (path, len) => {
+        if (typeof path === "number") {
+          warnTruncateFd();
+          return void natives.fsFtruncateSync(path, len ?? 0);
+        }
+        natives.fsTruncateSync(toPath(path), len ?? 0);
+      },
       // Classic synchronous fd ops. The native handle (a number) IS the fd.
       // graceful-fs / playwright probe locks via openSync(path,"r+") and rely
       // on err.code === "ENOENT" to tell missing from locked.
@@ -10873,8 +11368,8 @@
         return new Dir(dirPath, natives.fsReaddirSync(dirPath));
       },
       cpSync: function cpSyncRecursive(src, dest, options) {
-        var srcStr = toPath(src);
-        var destStr = toPath(dest);
+        var srcStr = toPath(src, "src");
+        var destStr = toPath(dest, "dest");
         var opts = options || {};
         var raw;
         try { raw = natives.fsStatSync(srcStr, false); } catch (e) { throw e; }
@@ -10891,9 +11386,23 @@
         }
       },
 
-      readFile: callbackify1(promises.readFile),
-      writeFile: callbackify1(promises.writeFile),
-      appendFile: callbackify1(promises.appendFile),
+      readFile: function (path, options, cb) {
+        if (typeof options === "function") { cb = options; options = undefined; }
+        if (!isInt32(path)) return callbackify1(promises.readFile)(path, options, cb);
+        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+        readFdAsync(path, (err, bytes) => {
+          if (err) return cb(err);
+          let out;
+          try {
+            out = decodeRead(bytes, readOptions(options).encoding ?? null);
+          } catch (e) {
+            return cb(e);
+          }
+          cb(null, out);
+        });
+      },
+      writeFile: fdOrPathWrite(promises.writeFile),
+      appendFile: fdOrPathWrite(promises.appendFile),
       stat: callbackify1(promises.stat),
       lstat: callbackify1(promises.lstat),
       statfs: callbackify1(promises.statfs),
@@ -10906,18 +11415,32 @@
       rename: callbackify1(promises.rename),
       copyFile: callbackify1(promises.copyFile),
       access: callbackify1(promises.access),
-      realpath: callbackify1(promises.realpath),
+      // As realpathSync: stringified, and on failure the component walk's
+      // error. fs.realpath.native (below) is the plain native.
+      realpath: function (path, options, cb) {
+        if (typeof options === "function") { cb = options; options = undefined; }
+        const file = realpathArg(path);
+        callbackify1((p) => realpathWalking(p))(file, cb);
+      },
       mkdtemp: callbackify1(promises.mkdtemp),
       symlink: callbackify1(promises.symlink),
       readlink: callbackify1(promises.readlink),
       link: callbackify1(promises.link),
       chmod: callbackify1(promises.chmod),
-      truncate: callbackify1(promises.truncate),
+      truncate: function (path, len, cb) {
+        if (typeof len === "function") { cb = len; len = 0; }
+        if (typeof path === "number") {
+          warnTruncateFd();
+          return fs.ftruncate(path, len, cb);
+        }
+        return callbackify1(promises.truncate)(path, len, cb);
+      },
       opendir: callbackify1(promises.opendir),
       cp: callbackify1(promises.cp),
       exists: (path, cb) => {
-        // Deprecated single-arg callback shape, still in the wild.
-        cb(natives.fsExistsSync(toPath(path)));
+        // Deprecated single-arg callback shape, still in the wild. A path
+        // node cannot validate is simply false, as in existsSync.
+        cb(fs.existsSync(path));
       },
 
       // fd-based callback ops (chokidar etc. do promisify(fs.open)). The
@@ -11270,16 +11793,22 @@
     //     TypeError with code ERR_INVALID_ARG_VALUE, message "Unable to open
     //     file as blob", and `code` as its ONLY own property -- no errno, no
     //     syscall, no path.
-    fs.openAsBlob = async (p, options) => {
+    //   - the arguments are checked SYNCHRONOUSLY -- node's openAsBlob is a
+    //     plain function returning a promise, so a bad type or path throws
+    //     at the call.
+    fs.openAsBlob = (p, options) => {
       const type = (options && options.type) || "";
       if (typeof type !== "string") {
         throw nodeTypeError(
           `The "options.type" argument must be of type string. Received ${describeArg(type)}`,
         );
       }
+      return openAsBlobPath(toPath(p), type);
+    };
+    const openAsBlobPath = async (file, type) => {
       let bytes;
       try {
-        bytes = await natives.fsReadFile(toPath(p));
+        bytes = await natives.fsReadFile(file);
       } catch {
         // Deliberately swallowing the underlying error: node reports none of
         // it, and leaking ENOENT here would be a divergence, not a courtesy.
@@ -11303,7 +11832,10 @@
       return blob;
     };
 
-    fs.realpathSync.native = fs.realpathSync;
+    // The `.native` forms are the OS realpath: node type-checks their path
+    // (getValidatedPath) and reports `realpath` with the whole path.
+    fs.realpathSync.native = (path) => natives.fsRealpathSync(toPath(path));
+    fs.realpath.native = callbackify1(promises.realpath);
     fs.Dirent = Dirent;
     // The real class, so `stat instanceof fs.Stats` holds -- it was a bare
     // placeholder no stat object was ever an instance of.
@@ -12759,7 +13291,7 @@
         }
         if (process._uncaughtCaptureCb) {
           throw applyNodeErrorShape(
-            new Error("`setupUncaughtExceptionCapture()` was called while a capture callback was already active"),
+            new Error("`process.setupUncaughtExceptionCapture()` was called while a capture callback was already active"),
             "ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET",
           );
         }
@@ -13920,6 +14452,22 @@
     // WebIDL identity: usp[Symbol.iterator] IS usp.entries.
     URLSearchParams.prototype[Symbol.iterator] = URLSearchParams.prototype.entries;
 
+    /// What `new URL()` throws for an input that does not parse: node's
+    /// binding builds it natively, so it is a plain TypeError -- prototype
+    /// TypeError.prototype, "TypeError: Invalid URL" as its string -- with
+    /// own `code`, `input`, and `base` only when a base was passed, in that
+    /// order. The input is NOT in the message (it used to be here), which is
+    /// what makes `err.code === 'ERR_INVALID_URL'` the way to test for it.
+    function invalidUrl(input, base) {
+      const err = new TypeError("Invalid URL");
+      err.code = "ERR_INVALID_URL";
+      err.input = input;
+      if (base !== undefined) err.base = base;
+      // Frames start at the caller (`new URL`), not at this helper.
+      Error.captureStackTrace(err, invalidUrl);
+      return err;
+    }
+
     class URL {
       // Un-forgeable brand. `_href` is an ordinary property, so nothing about
       // a URL was distinguishable from a duck-typed copy -- and the legacy
@@ -13930,20 +14478,33 @@
       static [Symbol.for("oam.isURL")](value) {
         return value !== null && typeof value === "object" && #brand in value;
       }
-      constructor(input, base) {
-        this._href = globalThis.__oam.node.urlParseHref(String(input), base ?? undefined);
+      // Argument handling is node's (lib/internal/url.js), for all three
+      // entry points: no argument at all is ERR_MISSING_ARGS; `input` is
+      // converted with a template literal (so a Symbol is the engine's
+      // TypeError, not "Invalid URL"); and `base` counts as passed unless it
+      // is `undefined` -- `null` is the base "null", which does not parse.
+      constructor(input, base = undefined) {
+        if (arguments.length === 0) throw new codes.ERR_MISSING_ARGS("url");
+        input = `${input}`;
+        if (base !== undefined) base = `${base}`;
+        const href = globalThis.__oam.node.urlParseHref(input, base);
+        if (href === undefined) throw invalidUrl(input, base);
+        this._href = href;
         this._c = null;
         this._params = null;
       }
-      static canParse(input, base) {
-        return globalThis.__oam.node.urlCanParse(String(input), base != null ? String(base) : undefined);
+      static canParse(input, base = undefined) {
+        if (arguments.length === 0) throw new codes.ERR_MISSING_ARGS("url");
+        input = `${input}`;
+        if (base !== undefined) base = `${base}`;
+        return globalThis.__oam.node.urlCanParse(input, base);
       }
-      static parse(input, base) {
-        try {
-          return new URL(input, base);
-        } catch {
-          return null;
-        }
+      static parse(input, base = undefined) {
+        if (arguments.length === 0) throw new codes.ERR_MISSING_ARGS("url");
+        input = `${input}`;
+        if (base !== undefined) base = `${base}`;
+        // Only "does not parse" is null; the argument errors above are thrown.
+        return globalThis.__oam.node.urlCanParse(input, base) ? new URL(input, base) : null;
       }
       _ensure() {
         if (!this._c) this._c = globalThis.__oam.node.urlParse(this._href);
@@ -13963,7 +14524,14 @@
         return this._href;
       }
       set href(value) {
-        this._href = globalThis.__oam.node.urlParseHref(String(value));
+        value = `${value}`;
+        const href = globalThis.__oam.node.urlParseHref(value);
+        if (href === undefined) {
+          // The setter's failure is the JS-side ERR_INVALID_URL (a NodeError,
+          // `[ERR_INVALID_URL]` in its toString), not the constructor's.
+          throw new codes.ERR_INVALID_URL(value);
+        }
+        this._href = href;
         this._c = null;
         if (this._params) {
           this._ensure();
@@ -14590,9 +15158,7 @@
         // non-ipv6 'a[b].com' throws rather than being silently cut (that
         // would let a hostname read as ipv6 to the next parser).
         const throwInvalidUrl = () => {
-          const e = new codes.ERR_INVALID_URL();
-          e.input = url;
-          throw e;
+          throw new codes.ERR_INVALID_URL(url);
         };
         if (!ipv6Hostname) rest = getHostname(this, rest, hostname, url);
         if (this.hostname.length > hostnameMaxLen) {
@@ -16738,6 +17304,7 @@
     const Z_SYNC_FLUSH = 2;
     const Z_FULL_FLUSH = 3;
     const Z_FINISH = 4;
+    const Z_BLOCK = 5;
     const DEFLATE = 1;
     const INFLATE = 2;
     const DEFLATERAW = 5;
@@ -16803,6 +17370,34 @@
     // (oam_core::zlib::OUTPUT_TOO_LARGE); node raises ERR_BUFFER_TOO_LARGE
     // naming the caller's value.
     const OUTPUT_TOO_LARGE = "zlib output exceeds maxOutputLength";
+    // node's checkRangesOrGetDefault for options.flush / options.finishFlush
+    // (ZlibBase, which every zlib class and one-shot call constructs):
+    // undefined and NaN take the default, a non-number is
+    // ERR_INVALID_ARG_TYPE, anything outside Z_NO_FLUSH..Z_BLOCK is
+    // ERR_OUT_OF_RANGE. Validated in node's order: flush, finishFlush, then
+    // maxOutputLength.
+    const flushOptionOf = (options, key, def) => {
+      const value = options?.[key];
+      if (value === undefined || Number.isNaN(value)) return def;
+      const name = "options." + key;
+      if (!Number.isFinite(value)) {
+        if (typeof value !== "number") throw codes.ERR_INVALID_ARG_TYPE(name, "number", value);
+        throw codes.ERR_OUT_OF_RANGE(name, "a finite number", value);
+      }
+      if (value < Z_NO_FLUSH || value > Z_BLOCK) {
+        throw codes.ERR_OUT_OF_RANGE(name, ">= " + Z_NO_FLUSH + " and <= " + Z_BLOCK, value);
+      }
+      return value;
+    };
+    // The finishing flush an inflate ends with (node's `finishFlush`). Only
+    // Z_FINISH makes a stream that stops short an error ("unexpected end of
+    // file"); axios and node-fetch pass Z_SYNC_FLUSH to get what decoded. The
+    // natives take it as an int32 (a fraction truncates, as node's binding
+    // does); the deflaters always finish the stream.
+    const finishFlushOf = (options) => {
+      flushOptionOf(options, "flush", Z_NO_FLUSH);
+      return flushOptionOf(options, "finishFlush", Z_FINISH);
+    };
     const bufferTooLarge = (max) => {
       const err = new RangeError("Cannot create a Buffer larger than " + max + " bytes");
       applyNodeErrorShape(err, "ERR_BUFFER_TOO_LARGE");
@@ -16812,9 +17407,12 @@
       err instanceof Error && err.message === OUTPUT_TOO_LARGE ? bufferTooLarge(max) : err;
 
     const sync = (format, compress) => (data, options) => {
+      const finishFlush = finishFlushOf(options);
       const max = maxOutputLengthOf(options);
       try {
-        return asBuffer(natives.zlibSync(toBytes(data), format, levelOf(options), compress, max));
+        return asBuffer(
+          natives.zlibSync(toBytes(data), format, levelOf(options), compress, max, finishFlush),
+        );
       } catch (err) {
         throw translate(err, max);
       }
@@ -16825,8 +17423,9 @@
         options = undefined;
       }
       // Validation throws synchronously, as node's does.
+      const finishFlush = finishFlushOf(options);
       const max = maxOutputLengthOf(options);
-      natives.zlibAsync(toBytes(data), format, levelOf(options), compress, max).then(
+      natives.zlibAsync(toBytes(data), format, levelOf(options), compress, max, finishFlush).then(
         (bytes) => callback(null, asBuffer(bytes)),
         (err) => callback(translate(err, max)),
       );
@@ -16848,8 +17447,11 @@
       const { Transform } = registry.get("stream");
       return class extends Transform {
         constructor(options) {
+          // brotli's flush values are BROTLI_OPERATION_*, not zlib's.
+          const finishFlush = format === "brotli" ? undefined : finishFlushOf(options);
           super({});
           this._zlibLevel = levelOf(options);
+          this._zlibFinishFlush = finishFlush;
           // _zlibHandle is null until the first chunk arrives.
           this._zlibHandle = null;
           // Promise serializing back-to-back _transform calls so we
@@ -16887,10 +17489,10 @@
               return natives.zlibStreamCreate(format, this._zlibLevel, compress)
                 .then((info) => {
                   this._zlibHandle = info.handle;
-                  return natives.zlibStreamFlush(this._zlibHandle);
+                  return natives.zlibStreamFlush(this._zlibHandle, this._zlibFinishFlush);
                 });
             }
-            return natives.zlibStreamFlush(this._zlibHandle);
+            return natives.zlibStreamFlush(this._zlibHandle, this._zlibFinishFlush);
           }).then((tail) => {
             this._zlibHandle = null;
             if (tail && tail.length > 0) cb(null, asBuffer(tail));
@@ -17011,7 +17613,7 @@
       self._buffer = BufferCtor.allocUnsafe(chunkSize);
       self._outBuffer = self._buffer;
       self._hadError = false;
-      self._finishFlushFlag = Z_FINISH;
+      self._finishFlushFlag = finishFlushOf(opts);
       const handle = new ZlibHandle(mode);
       handle.init(15, levelOf(opts), 8, 0, self._writeState, () => {}, opts.dictionary);
       self._handle = handle;
@@ -34366,6 +34968,11 @@
         clearTimer(handle, nativeClearTimeout);
       };
       registry._Timeout = Timeout;
+      // The runtime's own setTimeout, for internals that must keep working
+      // when a program (or a fake-timer library such as oam:test's
+      // mock.timers) replaces the global: AbortSignal.timeout arms and unrefs
+      // its timer with this, as node's arms it with its internal timers.
+      registry._setTimeout = globalThis.setTimeout;
       // Exported for process.nextTick's per-entry ALS frame binding: each
       // queued tick captures the frame of ITS nextTick() call, not the frame
       // of whichever call scheduled the drain microtask.

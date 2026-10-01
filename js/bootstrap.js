@@ -332,11 +332,37 @@
         reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
       return signal;
     }
-    static timeout(ms) {
+    static timeout(delay) {
+      // node: validateUint32(delay, 'delay', false) -- a number, an integer,
+      // and within uint32, each with its own coded error. The codes live in
+      // node_compat.js, which is evaluated after this file, so they are
+      // looked up at call time.
+      const codes = globalThis.__oamNode.get("internal/errors").codes;
+      if (typeof delay !== "number") {
+        throw new codes.ERR_INVALID_ARG_TYPE("delay", "number", delay);
+      }
+      if (!Number.isInteger(delay)) {
+        throw new codes.ERR_OUT_OF_RANGE("delay", "an integer", delay);
+      }
+      if (delay < 0 || delay > 4294967295) {
+        throw new codes.ERR_OUT_OF_RANGE("delay", ">= 0 && <= 4294967295", delay);
+      }
       const signal = new AbortSignal();
-      globalThis.setTimeout(() => {
-        signal._fire(new globalThis.DOMException("The operation timed out", "TimeoutError"));
-      }, ms);
+      // The runtime's setTimeout, not the global: a replaced global (fake
+      // timers, which return a number) neither runs this timer nor has an
+      // unref() to call -- node arms it with its internal timers too.
+      const setTimer = globalThis.__oamNode._setTimeout ?? globalThis.setTimeout;
+      const timer = setTimer(() => {
+        signal._fire(
+          new globalThis.DOMException("The operation was aborted due to timeout", "TimeoutError"),
+        );
+      }, delay);
+      // node unrefs this timer (lib/internal/abort_controller.js
+      // setWeakAbortSignalTimeout): a timeout signal alone never keeps the
+      // process alive. Ref'd, `fetch(url, { signal: AbortSignal.timeout(5000) })`
+      // held the process open for the full five seconds after the response
+      // had been read.
+      if (typeof timer?.unref === "function") timer.unref();
       return signal;
     }
     static any(signals) {
@@ -1456,9 +1482,8 @@
       let parsed;
       try {
         parsed = new URL(rawUrl);
-      } catch {
-        const cause = new TypeError("Invalid URL");
-        cause.code = "ERR_INVALID_URL";
+      } catch (cause) {
+        // The cause is URL's own ERR_INVALID_URL (code, input), as in node.
         throw new TypeError(`Failed to parse URL from ${rawUrl}`, { cause });
       }
       // node: `TypeError: Request cannot be constructed from a URL that
@@ -2080,6 +2105,7 @@
     err.code = fields.code;
     if (fields.syscall !== undefined) err.syscall = fields.syscall;
     if (fields.path !== undefined) err.path = fields.path;
+    if (fields.dest !== undefined) err.dest = fields.dest;
     if (fields.hostname !== undefined) err.hostname = fields.hostname;
     if (fields.address !== undefined) err.address = fields.address;
     if (fields.port) err.port = fields.port;

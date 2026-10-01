@@ -84,9 +84,20 @@
         },
       };
 
-      this._started = Promise.resolve()
-        .then(() => source.start?.(this._controller))
-        .catch((e) => this._controller.error(e));
+      // start() runs SYNCHRONOUSLY, inside the constructor (WHATWG "set up
+      // readable stream default controller from underlying source": the
+      // start algorithm is performed, then its result is wrapped in a
+      // promise). Code relies on it: it captures the controller in start()
+      // and enqueues as soon as `new ReadableStream(...)` returns -- the MCP
+      // SDK's streamable-HTTP server does, and with start() deferred to a
+      // microtask its controller was still undefined, so every response
+      // body it wrote was dropped. A throw from start() is the
+      // constructor's throw; only a REJECTED start promise errors the
+      // stream. Pulls still wait on the start promise.
+      const startResult = source.start?.(this._controller);
+      this._started = Promise.resolve(startResult).catch((e) =>
+        this._controller.error(e),
+      );
     }
 
     get locked() {
@@ -315,8 +326,12 @@
       this._error = undefined;
       this._writer = null;
       // Writes are SERIALIZED: each chains on the previous sink call.
-      this._chain = Promise.resolve().then(() => sink.start?.(this._controllerFor()));
-      this._chain = this._chain.catch((e) => {
+      // start() itself runs synchronously in the constructor, as the
+      // ReadableStream one does and for the same reason; the chain starts
+      // from the promise for its result, so writes wait for an async start.
+      // (TransformStream's transformer.start rides on this one.)
+      const startResult = sink.start?.(this._controllerFor());
+      this._chain = Promise.resolve(startResult).catch((e) => {
         this._state = "errored";
         this._error = e;
       });

@@ -33,7 +33,8 @@ http = { workspace = true }
 percent-encoding = { workspace = true }
 # http_client response decoding: brotli's decoder stream, driven directly.
 brotli-decompressor = { workspace = true }
-# http_client gzip/deflate: miniz_oxide's core inflate (flate2's backend).
+# gzip/deflate inflate for http_client and node:zlib (src/inflate.rs):
+# miniz_oxide's core inflate (flate2's backend).
 miniz_oxide = { workspace = true }
 # V8 Inspector CDP transport: WebSocket framing + the WS accept hash.
 tokio-tungstenite = { workspace = true }

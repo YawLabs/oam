@@ -139,11 +139,12 @@ percent-encoding = "2"
 # stream directly for bounded output. Already compiled: brotli (node:zlib)
 # depends on it with the same features.
 brotli-decompressor = { version = "5", default-features = false, features = ["std"] }
-# fetch's gzip/deflate response decoding drives miniz_oxide's core inflate
-# directly, holding the window itself so a copy from before the start of the
-# output fails as zlib's does (flate2's wrapper keeps a wrapping dictionary
-# that cannot tell). Already compiled: it IS flate2's rust_backend, and
-# flate2 enables with-alloc + simd on it, so no feature changes either.
+# fetch's gzip/deflate response decoding and node:zlib's inflaters drive
+# miniz_oxide's core inflate directly, holding the window themselves so a copy
+# from before the start of the output fails as zlib's does (flate2's wrapper
+# keeps a wrapping dictionary that cannot tell). Already compiled: it IS
+# flate2's rust_backend, and flate2 enables with-alloc + simd on it, so no
+# feature changes either.
 miniz_oxide = { version = "0.8", default-features = false }
 # oam's fetch transport (http_client/{connector,transport,send}.rs, #143 slice
 # C). All three already compile in the graph through oam_loader's reqwest

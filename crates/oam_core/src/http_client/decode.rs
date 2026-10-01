@@ -32,22 +32,18 @@
 //! zlib's inflate.c and node_zlib.cc for which bytes are an error and when.
 //!
 //! Inflate itself is miniz_oxide's core decoder (the one under flate2) driven
-//! with the history held here, not flate2's `Decompress`: that keeps miniz's
-//! wrapping 32 KiB dictionary, where a copy from before the first output byte
-//! is not detected and reads whatever the dictionary holds -- zeros, or the
-//! previous gzip member -- while zlib fails it ("invalid distance too far
-//! back"). See [`Inflater`]. Error TEXTS for corrupt deflate data are not
-//! zlib's: miniz reports one failure for every kind.
+//! with the history held outside it ([`crate::inflate::Inflater`], shared
+//! with node:zlib), not flate2's `Decompress`: that keeps miniz's wrapping
+//! 32 KiB dictionary, where a copy from before the first output byte is not
+//! detected and reads whatever the dictionary holds -- zeros, or the previous
+//! gzip member -- while zlib fails it ("invalid distance too far back").
+//! Other error TEXTS for corrupt deflate data are not zlib's: miniz reports
+//! one failure for every other kind.
 
+use crate::inflate::{self, InflateFailure};
 use brotli_decompressor::{BrotliDecompressStream, BrotliResult, BrotliState, StandardAlloc};
 use bytes::{Buf, Bytes};
 use flate2::Crc;
-use miniz_oxide::inflate::TINFLStatus;
-use miniz_oxide::inflate::core::inflate_flags::{
-    TINFL_FLAG_COMPUTE_ADLER32, TINFL_FLAG_HAS_MORE_INPUT, TINFL_FLAG_IGNORE_ADLER32,
-    TINFL_FLAG_PARSE_ZLIB_HEADER, TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
-};
-use miniz_oxide::inflate::core::{DecompressorOxide, decompress};
 
 /// undici fetch/index.js:2140: more content-codings than this fails the fetch
 /// ("too many content-encodings in response: N, maximum allowed is 5"), a
@@ -413,44 +409,22 @@ impl Stage {
     }
 }
 
-/// The deflate window: the farthest a copy can reach back (RFC 1951), and the
-/// window node's zlib inflates with (windowBits 15 for gunzip and raw; a
-/// zlib header's smaller CINFO does not shrink it, inflate.c keeps `wbits`).
-const WINDOW: usize = 32 * 1024;
-
-/// Raw or zlib inflate with sync-flush semantics over miniz_oxide's core
-/// decoder, in its non-wrapping mode: the output buffer is the history, and
-/// a copy reaching past its start fails -- zlib's "invalid distance too far
-/// back" check (inflate.c `state->offset > state->whave + out - left`).
-///
-/// `hist[..pos]` holds the last `min(output so far, WINDOW)` bytes, and each
-/// step decodes into the [`OUT_CAP`] after them, so a step's output is at
-/// most one chunk -- zlib's granularity with node's 16 KiB `chunkSize`, where
-/// flate2 inflated up to its 32 KiB dictionary per call. When the next step
-/// would not fit, the last `WINDOW` bytes slide to the front; `pos` only
-/// exceeds `WINDOW` once the stream has, so the check stays exact.
-struct Inflater {
-    core: Box<DecompressorOxide>,
-    hist: Box<[u8]>,
-    pos: usize,
-    zlib: bool,
-}
+/// Raw or zlib inflate with sync-flush semantics: the shared [`inflate::Inflater`]
+/// (history held outside miniz, so a copy from before the first output byte
+/// fails as zlib's does), stepped [`OUT_CAP`] at a time. Running out of input
+/// mid-stream is never an error -- truncation is not one (undici's
+/// `finishFlush`).
+struct Inflater(inflate::Inflater);
 
 impl Inflater {
     fn new(zlib: bool) -> Inflater {
-        Inflater {
-            core: Box::default(),
-            hist: vec![0u8; WINDOW + OUT_CAP].into_boxed_slice(),
-            pos: 0,
-            zlib,
-        }
+        Inflater(inflate::Inflater::new(zlib))
     }
 
     /// Start a new stream: zlib's `inflateReset` empties the window too
     /// (`whave = 0`), so the next gzip member cannot copy from this one.
     fn reset(&mut self) {
-        self.core.init();
-        self.pos = 0;
+        self.0.reset();
     }
 
     /// One step: consume from `src`, write at most `dst.len().min(OUT_CAP)`
@@ -458,37 +432,12 @@ impl Inflater {
     /// Adler-32) is complete.
     fn step(&mut self, src: &[u8], dst: &mut [u8]) -> Result<(Step, bool), DecodeError> {
         let room = dst.len().min(OUT_CAP);
-        if self.pos + room > self.hist.len() {
-            self.hist.copy_within(self.pos - WINDOW..self.pos, 0);
-            self.pos = WINDOW;
-        }
-        // HAS_MORE_INPUT: running out of input mid-stream is NeedsMoreInput,
-        // never an error -- truncation is not one (undici's `finishFlush`).
-        let mut flags = TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF | TINFL_FLAG_HAS_MORE_INPUT;
-        flags |= if self.zlib {
-            TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_COMPUTE_ADLER32
-        } else {
-            TINFL_FLAG_IGNORE_ADLER32
-        };
-        let (status, consumed, produced) = decompress(
-            &mut self.core,
-            src,
-            &mut self.hist[..self.pos + room],
-            self.pos,
-            flags,
-        );
-        let out = self.pos..self.pos + produced;
-        dst[..produced].copy_from_slice(&self.hist[out]);
-        self.pos += produced;
-        let step = Step { consumed, produced };
-        match status {
-            TINFLStatus::Done => Ok((step, true)),
-            TINFLStatus::NeedsMoreInput | TINFLStatus::HasMoreOutput => Ok((step, false)),
-            TINFLStatus::Adler32Mismatch => Err(DecodeError("incorrect data check")),
-            // Failed (a bad block, code, length or distance -- including one
-            // from before the start of the output), and the two statuses
-            // these flags rule out (BadParam, FailedCannotMakeProgress).
-            _ => Err(DecodeError("invalid deflate data")),
+        match self.0.step(src, &mut dst[..room]) {
+            Ok((consumed, produced, ended)) => Ok((Step { consumed, produced }, ended)),
+            Err(InflateFailure::DataCheck) => Err(DecodeError("incorrect data check")),
+            Err(InflateFailure::TooFarBack) => Err(DecodeError("invalid distance too far back")),
+            // A bad block, code or length: miniz does not say which.
+            Err(InflateFailure::Invalid) => Err(DecodeError("invalid deflate data")),
         }
     }
 }
@@ -2174,9 +2123,9 @@ mod tests {
     /// the gzip-wrapped body with that cause).
     #[test]
     fn a_copy_from_before_the_output_is_an_error() {
-        // Node's message is "invalid distance too far back"; miniz has one
-        // failure status for every kind of corrupt data.
-        const TOO_FAR: DecodeError = DecodeError("invalid deflate data");
+        // Node's message. miniz has one failure status for every kind of
+        // corrupt data; the shared Inflater tells this one apart.
+        const TOO_FAR: DecodeError = DecodeError("invalid distance too far back");
         // The checksums match the bytes a wrapping dictionary produces, so
         // nothing but the distance check can refuse these.
         let garbage = b"a\0\0\0";
@@ -2228,7 +2177,7 @@ mod tests {
                 } else {
                     assert_eq!(
                         got,
-                        Err(DecodeError("invalid deflate data")),
+                        Err(DecodeError("invalid distance too far back")),
                         "{n} at {size}"
                     );
                 }

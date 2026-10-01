@@ -637,7 +637,21 @@ fn node_errno(code: &str, error: &std::io::Error) -> Option<i32> {
 /// with `path: ''` present. For an operation on a descriptor, which has no
 /// path at all, use `throw_fd_error` -- inferring "no path" from `path == ""`
 /// conflated the two and stripped the quotes off every empty-path error.
+///
+/// On Windows the path is the resolved one node reports (see
+/// `oam_core::fs_error_path`).
 fn throw_node_error(
+    scope: &mut v8::PinScope<'_, '_>,
+    syscall: &str,
+    path: &str,
+    error: &std::io::Error,
+) {
+    throw_node_error_as_passed(scope, syscall, &oam_core::fs_error_path(path), error);
+}
+
+/// `throw_node_error` naming `path` exactly as given: for mkdtemp, whose
+/// template node does not resolve.
+fn throw_node_error_as_passed(
     scope: &mut v8::PinScope<'_, '_>,
     syscall: &str,
     path: &str,
@@ -646,6 +660,28 @@ fn throw_node_error(
     let code = node_error_code(error);
     let message = node_error_message(code, syscall, path, error);
     throw_system_error(scope, code, &message, syscall, Some(path), error);
+}
+
+/// node's system error for a TWO-path operation (rename, copyfile, link,
+/// symlink): `'path' -> 'dest'` in the message, and a `dest` property after
+/// `path`. The caller passes both as they are to be shown.
+fn throw_node_error_dest(
+    scope: &mut v8::PinScope<'_, '_>,
+    syscall: &str,
+    path: &str,
+    dest: &str,
+    error: &std::io::Error,
+) {
+    let code = node_error_code(error);
+    let message = oam_core::node_error_message_dest(code, syscall, path, dest, error);
+    let exception = system_error(scope, code, &message, syscall, Some(path), error);
+    if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception)
+        && let (Some(key), Some(value)) =
+            (v8::String::new(scope, "dest"), v8::String::new(scope, dest))
+    {
+        obj.set(scope, key.into(), value.into());
+    }
+    scope.throw_exception(exception);
 }
 
 /// `throw_node_error` for an operation with call-site error rules: the
@@ -659,13 +695,14 @@ fn throw_fs_error(
     error: &std::io::Error,
 ) {
     let failure = oam_core::fs_error_at(site, syscall, path, error);
-    let message = oam_core::fs_error_message(failure, path, error);
+    let shown = oam_core::fs_error_path(path);
+    let message = oam_core::fs_error_message(failure, &shown, error);
     throw_system_error(
         scope,
         failure.code,
         &message,
         failure.syscall,
-        failure.has_path.then_some(path),
+        failure.has_path.then_some(&*shown),
         error,
     );
 }
@@ -5142,11 +5179,31 @@ fn arg_max_output(
     Some(n.min(usize::MAX as f64) as usize)
 }
 
+/// The optional `finishFlush` argument of the zlib ops (node's option of that
+/// name, range-checked by the shim): zlib's Z_FINISH when absent.
+fn arg_finish_flush(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+) -> i32 {
+    let value = args.get(index);
+    if value.is_null_or_undefined() {
+        return oam_core::zlib::Z_FINISH;
+    }
+    value.int32_value(scope).unwrap_or(oam_core::zlib::Z_FINISH)
+}
+
 /// Throw the error for a one-shot zlib result. An output past
 /// `maxOutputLength` is a plain error carrying that sentinel message alone
 /// (see `oam_core::zlib::OUTPUT_TOO_LARGE`); the shim turns it into node's
 /// `RangeError [ERR_BUFFER_TOO_LARGE]` with the caller's number in it.
+///
+/// A decode failure is node's coded zlib error (#166): see `throw_zlib_coded`.
 fn throw_zlib_error(scope: &mut v8::PinScope<'_, '_>, e: &std::io::Error) {
+    if let Some(coded) = oam_core::zlib::zlib_error(e) {
+        throw_zlib_coded(scope, &coded);
+        return;
+    }
     let text = e.to_string();
     let message = if text == oam_core::zlib::OUTPUT_TOO_LARGE {
         text
@@ -5158,11 +5215,29 @@ fn throw_zlib_error(scope: &mut v8::PinScope<'_, '_>, e: &std::io::Error) {
     scope.throw_exception(exception);
 }
 
-/// zlibSync(bytes, format, level, compress, maxOutputLength?) — synchronous
-/// transform on the isolate thread (the *Sync API contract). "unzip"
-/// auto-detects on decode. `maxOutputLength` (node's option of that name)
-/// bounds the output: while it is produced for a decode, on the finished
-/// buffer for an encode.
+/// Throw node's zlib error: a plain `Error` with zlib's message and own
+/// `errno` then `code` (lib/zlib.js `zlibOnError`), the shape the async forms
+/// reject with too.
+fn throw_zlib_coded(scope: &mut v8::PinScope<'_, '_>, coded: &oam_core::zlib::ZlibError) {
+    let message = v8::String::new(scope, coded.message).unwrap();
+    let exception = v8::Exception::error(scope, message);
+    if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+        let errno_key = v8::String::new(scope, "errno").unwrap();
+        let errno = v8::Integer::new(scope, coded.errno);
+        obj.create_data_property(scope, errno_key.into(), errno.into());
+        let code_key = v8::String::new(scope, "code").unwrap();
+        let code = v8::String::new(scope, coded.code).unwrap();
+        obj.create_data_property(scope, code_key.into(), code.into());
+    }
+    scope.throw_exception(exception);
+}
+
+/// zlibSync(bytes, format, level, compress, maxOutputLength?, finishFlush?) —
+/// synchronous transform on the isolate thread (the *Sync API contract).
+/// "unzip" auto-detects on decode. `maxOutputLength` (node's option of that
+/// name) bounds the output: while it is produced for a decode, on the
+/// finished buffer for an encode. `finishFlush` (node's option, Z_FINISH by
+/// default) decides whether a decode that stops inside the stream fails.
 fn op_zlib_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -5176,15 +5251,16 @@ fn op_zlib_sync(
     let level = args.get(2).int32_value(scope).unwrap_or(-1);
     let compress = args.get(3).is_true();
     let max_output = arg_max_output(scope, &args, 4);
+    let finish_flush = arg_finish_flush(scope, &args, 5);
     let result = if !compress && format == "unzip" {
-        oam_core::zlib::unzip_capped(&bytes, max_output)
+        oam_core::zlib::unzip_capped(&bytes, max_output, finish_flush)
     } else {
         match oam_core::zlib::Format::parse(&format) {
             Some(parsed) => {
                 if compress {
                     oam_core::zlib::compress_capped(&bytes, parsed, level, max_output)
                 } else {
-                    oam_core::zlib::decompress_capped(&bytes, parsed, max_output)
+                    oam_core::zlib::decompress_capped(&bytes, parsed, max_output, finish_flush)
                 }
             }
             None => {
@@ -5203,7 +5279,8 @@ fn op_zlib_sync(
     }
 }
 
-/// zlibAsync(bytes, format, level, compress, maxOutputLength?) -> Promise<Uint8Array>.
+/// zlibAsync(bytes, format, level, compress, maxOutputLength?, finishFlush?)
+/// -> Promise<Uint8Array>.
 fn op_zlib_async(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -5217,10 +5294,11 @@ fn op_zlib_async(
     let level = args.get(2).int32_value(scope).unwrap_or(-1);
     let compress = args.get(3).is_true();
     let max_output = arg_max_output(scope, &args, 4);
+    let finish_flush = arg_finish_flush(scope, &args, 5);
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::zlib_transform(bytes, format, level, compress, max_output),
+        oam_core::ops::zlib_transform(bytes, format, level, compress, max_output, finish_flush),
     );
 }
 
@@ -5266,20 +5344,22 @@ fn op_zlib_stream_write(
     );
 }
 
-/// zlibStreamFlush(handle) -> Promise<Uint8Array>.
+/// zlibStreamFlush(handle, finishFlush?) -> Promise<Uint8Array>.
 /// Finalize the stream and return tail bytes. The stream handle is
-/// removed from the registry after this call.
+/// removed from the registry after this call. `finishFlush` is node's
+/// option for an inflate stream (Z_FINISH by default).
 fn op_zlib_stream_flush(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let finish_flush = arg_finish_flush(scope, &args, 1);
     let streams = core_runtime!(scope).zlib_streams();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::zlib_stream_flush(streams, handle),
+        oam_core::ops::zlib_stream_flush(streams, handle, finish_flush),
     );
 }
 
@@ -5401,7 +5481,11 @@ fn op_zlib_handle_write_sync(
             rv.set(arr.into());
         }
         Err(e) => {
-            let message = v8::String::new(scope, &e).unwrap();
+            if let Some(coded) = oam_core::zlib::zlib_error(&e) {
+                throw_zlib_coded(scope, &coded);
+                return;
+            }
+            let message = v8::String::new(scope, &e.to_string()).unwrap();
             let exception = v8::Exception::error(scope, message);
             scope.throw_exception(exception);
         }
@@ -5429,13 +5513,15 @@ fn op_url_parse_href(
             }
         }
     };
-    match ada_url::Url::parse(&input, base.as_deref()) {
-        Ok(parsed) => {
-            if let Some(s) = v8::String::new(scope, parsed.href()) {
-                rv.set(s.into());
-            }
-        }
-        Err(_) => throw_type_error(scope, &format!("Invalid URL: {input}")),
+    // An input that does not parse leaves the return value `undefined`; it is
+    // not a throw. The caller builds node's ERR_INVALID_URL, whose shape
+    // differs between `new URL()` and the `href` setter and carries the input
+    // and base as properties -- none of which a message thrown from here
+    // could express.
+    if let Ok(parsed) = ada_url::Url::parse(&input, base.as_deref())
+        && let Some(s) = v8::String::new(scope, parsed.href())
+    {
+        rv.set(s.into());
     }
 }
 
@@ -5895,7 +5981,8 @@ fn op_fs_rename_sync(
         return;
     }
     if let Err(e) = std::fs::rename(&from, &to) {
-        throw_node_error(scope, "rename", &from, &e);
+        let (path, dest) = (oam_core::fs_error_path(&from), oam_core::fs_error_path(&to));
+        throw_node_error_dest(scope, "rename", &path, &dest, &e);
     }
 }
 
@@ -5915,7 +6002,8 @@ fn op_fs_copy_file_sync(
         return;
     }
     if let Err(e) = std::fs::copy(&from, &to) {
-        throw_node_error(scope, "copyfile", &from, &e);
+        let (path, dest) = (oam_core::fs_error_path(&from), oam_core::fs_error_path(&to));
+        throw_node_error_dest(scope, "copyfile", &path, &dest, &e);
     }
 }
 
@@ -5953,26 +6041,27 @@ fn op_fs_access_sync(
         Ok(()) => {}
         Err((code, message, errno)) => {
             // EPERM/EACCES with the path attached, same shape as
-            // throw_node_error but with the access-specific code.
+            // throw_node_error but with the access-specific code: errno
+            // FIRST, then code, syscall, path, as node orders them (errno
+            // was set last, after path).
             let message_v8 = v8::String::new(scope, &message)
                 .unwrap_or_else(|| v8::String::new(scope, &code).unwrap());
             let exception = v8::Exception::error(scope, message_v8);
             if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
-                let props: [(&str, &str); 3] =
-                    [("code", &code), ("syscall", "access"), ("path", &path)];
-                for (name, value) in props {
-                    let key = v8::String::new(scope, name).unwrap();
-                    if let Some(value) = v8::String::new(scope, value) {
-                        obj.set(scope, key.into(), value.into());
-                    }
-                }
-                // errno completes node's system-error shape; it was the one
-                // field this hand-rolled error left off.
                 if let Some(errno) = errno
                     && let Some(key) = v8::String::new(scope, "errno")
                 {
                     let value = v8::Integer::new(scope, errno);
                     obj.set(scope, key.into(), value.into());
+                }
+                let shown = oam_core::fs_error_path(&path);
+                let props: [(&str, &str); 3] =
+                    [("code", &code), ("syscall", "access"), ("path", &shown)];
+                for (name, value) in props {
+                    let key = v8::String::new(scope, name).unwrap();
+                    if let Some(value) = v8::String::new(scope, value) {
+                        obj.set(scope, key.into(), value.into());
+                    }
                 }
             }
             scope.throw_exception(exception);
@@ -6796,7 +6885,15 @@ fn op_fs_symlink_sync(
     #[cfg(not(windows))]
     let result = std::os::unix::fs::symlink(&target, &path);
     if let Err(e) = result {
-        throw_node_error(scope, "symlink", &path, &e);
+        // The target is stored as written, so node reports it so; the link's
+        // own path is resolved like any other.
+        throw_node_error_dest(
+            scope,
+            "symlink",
+            &target,
+            &oam_core::fs_error_path(&path),
+            &e,
+        );
     }
 }
 
@@ -6843,7 +6940,14 @@ fn op_fs_link_sync(
         return;
     }
     if let Err(e) = std::fs::hard_link(&existing, &new_path) {
-        throw_node_error(scope, "link", &new_path, &e);
+        let path = oam_core::fs_error_path(&existing);
+        throw_node_error_dest(
+            scope,
+            "link",
+            &path,
+            &oam_core::fs_error_path(&new_path),
+            &e,
+        );
     }
 }
 
@@ -6929,7 +7033,7 @@ fn op_fs_mkdtemp_sync(
                 rv.set(value.into());
             }
         }
-        Err(e) => throw_node_error(scope, "mkdtemp", &prefix, &e),
+        Err(e) => throw_node_error_as_passed(scope, "mkdtemp", &prefix, &e),
     }
 }
 

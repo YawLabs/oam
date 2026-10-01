@@ -788,6 +788,7 @@ pub(crate) fn settle_completion(
             hostname,
             address,
             port,
+            dest,
         } => {
             let fields = SysFields {
                 code: &code,
@@ -795,6 +796,7 @@ pub(crate) fn settle_completion(
                 errno,
                 syscall: syscall.as_deref(),
                 path: path.as_deref(),
+                dest: dest.as_deref(),
                 hostname: hostname.as_deref(),
                 address: address.as_deref(),
                 port,
@@ -824,6 +826,7 @@ pub(crate) fn settle_completion(
                 errno: None,
                 syscall: None,
                 path: None,
+                dest: None,
                 hostname: None,
                 address: None,
                 port: None,
@@ -857,6 +860,8 @@ struct SysFields<'a> {
     errno: Option<i32>,
     syscall: Option<&'a str>,
     path: Option<&'a str>,
+    /// A two-path fs call's second path (`err.dest`).
+    dest: Option<&'a str>,
     hostname: Option<&'a str>,
     address: Option<&'a str>,
     port: Option<u16>,
@@ -870,6 +875,7 @@ impl<'a> SysFields<'a> {
             errno: err.errno,
             syscall: err.syscall.as_deref(),
             path: None,
+            dest: None,
             hostname: err.hostname.as_deref(),
             address: err.address.as_deref(),
             port: err.port,
@@ -934,7 +940,7 @@ fn set_string_array(
 /// fallback, with the same own properties in the same order.
 ///
 /// Property order is observable (`Object.keys(err)`): errno, code, syscall,
-/// path, hostname, address, port -- errno FIRST, as on the sync path
+/// path, dest, hostname, address, port -- errno FIRST, as on the sync path
 /// (throw_node_error) and in node. Setting it last once gave async rejections
 /// ["code","syscall","errno"]. `path` is absent (not empty) for an fd
 /// operation (OpOutcome::node_failed_at); `port` only when non-zero, as node's
@@ -954,6 +960,7 @@ fn sys_error(
         ("code", Some(fields.code)),
         ("syscall", fields.syscall),
         ("path", fields.path),
+        ("dest", fields.dest),
         ("hostname", fields.hostname),
         ("address", fields.address),
     ];

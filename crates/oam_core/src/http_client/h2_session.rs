@@ -224,6 +224,7 @@ fn stream_error(error: &hyper::Error) -> OpOutcome {
             hostname: None,
             address: None,
             port: None,
+            dest: None,
         };
     }
     OpOutcome::node_failed("ERR_HTTP2_SESSION_FAILED", error.to_string())

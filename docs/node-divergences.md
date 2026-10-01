@@ -1029,6 +1029,10 @@ entries below were executed on both runtimes unless marked.
 | `crypto.generateKeyPairSync` | `rsa`, `ec`, `ed25519`. EC curves P-256 and P-384 only. | Also `dsa`, `dh`, `x25519`, `ed448`, `x448`; all named curves. |
 | `crypto.setFips` | Always throws `Cannot set FIPS mode in this environment`; `getFips()` is pinned to `0`. | Settable in a FIPS build. |
 | `zlib.brotliCompressSync` / `brotliDecompressSync` | Throw, pointing at the async forms. | Supported. |
+| `zlib` inflate: corrupt compressed data | The error has node's `code` (`Z_DATA_ERROR`) and `errno` (`-3`), but its message is `invalid deflate data` for every defect inside the deflate data except a copy from before the start of the output, which reads `invalid distance too far back` as in Node. Header, trailer, checksum and truncation errors carry zlib's own text. The inflater is miniz_oxide's, which reports one failure for all of them. | zlib names the defect: `invalid block type`, `invalid code lengths set`, `invalid distance code`, ... |
+| `zlib` inflate: the `dictionary` option | Ignored, so a zlib stream that asks for a preset dictionary fails `Z_NEED_DICT` `Missing dictionary` even when one is passed. | Inflates with the dictionary. |
+| `zlib` inflate: `finishFlush: Z_BLOCK` | Read like the other non-finishing flushes: a one-shot inflate returns everything it decoded and a stream ends with it. (`Z_FINISH`, the default, fails a stream that stops short with `Z_BUF_ERROR` `unexpected end of file`; `Z_NO_FLUSH`, `Z_PARTIAL_FLUSH`, `Z_SYNC_FLUSH` and `Z_FULL_FLUSH` return what decoded, as in Node.) | zlib stops at the first block boundary, so a one-shot inflate under `Z_BLOCK` returns no output. |
+| `zlib` deflate: `finishFlush` | Validated as in Node, but the deflaters always finish the stream, so `deflateSync(data, { finishFlush: Z_SYNC_FLUSH })` returns a complete stream with its trailer. | Ends the output with that flush: a sync-flushed stream with no final block or trailer. |
 | `TextDecoder` | **utf-8 and windows-1252 only** (`fatal` and `ignoreBOM` honored on utf-8; windows-1252 is total, so neither applies). Both take the full standard label set for their encoding, so `latin1` / `iso-8859-1` / `ascii` resolve to windows-1252 as the standard requires. Any other label throws a `RangeError` with `code: 'ERR_ENCODING_NOT_SUPPORTED'`. | Also utf-16le/be, the ISO-8859-* family, the CJK legacy encodings, ... |
 | Web streams queuing strategy | `highWaterMark` counts chunks; a custom `size()` is never called. | `size()` is consulted. |
 | `worker_threads.receiveMessageOnPort` | Always returns `undefined`. | Returns `{ message }`. |
@@ -1651,7 +1655,8 @@ an error where oam used to send something)
   nothing reaches the wire. `http.request` and `https.request` still turn userinfo into
   Basic credentials, because there it IS Node's documented `auth` option.
 - A URL that does not parse throws Node's `TypeError: Failed to parse URL from <input>` with
-  a `TypeError` cause carrying `code` `ERR_INVALID_URL`; a non-`http(s)` scheme rejects with
+  a `TypeError` cause carrying `code` `ERR_INVALID_URL` and `input` (it is the error
+  `new URL()` throws, as in Node; case 237); a non-`http(s)` scheme rejects with
   the cause `Error: unknown scheme`. Both used to be `TypeError: fetch failed` with the cause
   `Error: builder error`, which named neither.
 - A `Request` object as the first argument is NOT a supported input (it never was): the
@@ -2253,22 +2258,24 @@ _(probed)_ Node v22.22.2 vs oam on Windows: lookup and createConnection guards o
 a node-hosted `createSecureServer` for `ca`, `servername`, a refusing lookup, an untrusted
 certificate and `rejectUnauthorized: false`, line for line identical.
 
-### `err.syscall` on `fs.realpath` and `fs.opendir`
+### `err.syscall` on `fs.opendir`
 
-Node's own sync and async forms disagree on these two, and oam is
-self-consistent where node is not:
+Node's own sync and async forms disagree here, and oam is self-consistent where
+node is not:
 
 | call | node | oam |
 |---|---|---|
-| `realpathSync(missing)` | `syscall: "lstat"` (its path-walk uses lstat) | `syscall: "realpath"` |
-| `realpath(missing)` | `syscall: "realpath"` | `syscall: "realpath"` |
 | `opendirSync(missing)` | `syscall: "opendir"`, no `path` | `syscall: "scandir"`, `path` set |
 | `opendir(missing)` | `syscall: "opendir"`, `path` set | `syscall: "scandir"`, `path` set |
 
-Everything else — `code`, `errno`, the message — matches. These are the only
-two fs calls excluded from the async/sync error-parity case
-(`conformance/cases/72-*`), because asserting node's behaviour there would mean
-encoding its inconsistency into a case whose purpose is the rule.
+Everything else — `code`, `errno`, the message — matches. `fs.realpath` used to
+be listed here too; since #167 oam reports what node does for every form:
+`realpathSync` and callback `realpath` fail with the `lstat` of the first
+missing component (node's JS path walk), and `realpathSync.native`,
+`realpath.native` and `fs/promises.realpath` with `realpath` and the whole path
+(`conformance/cases/240-*`). Both are excluded from the async/sync error-parity
+case (`conformance/cases/72-*`), because asserting node's behaviour there would
+mean encoding its inconsistency into a case whose purpose is the rule.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 
