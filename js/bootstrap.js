@@ -1249,8 +1249,11 @@
     read("duplex", oneOf);
     read("dispatcher", same);
     // "init has a key": decides whether a Request input's navigation state
-    // and referrer reset, and whether its headers are refilled.
-    out.hasKey = Object.keys(init).length !== 0;
+    // and referrer reset, and whether its headers are refilled. undici asks
+    // it of the converted dictionary, not of the object it was given: a
+    // member counts when it is one of RequestInit's and is not undefined,
+    // own or inherited, and an unknown key never counts.
+    out.hasKey = Object.keys(out).length !== 0;
     return out;
   }
 
