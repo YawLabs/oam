@@ -10868,13 +10868,36 @@
       return globalThis.Buffer.concat(chunks, total);
     }
 
-    // writeFileSync(fd) / appendFileSync(fd): all of `bytes` at the current
-    // position (node does not seek a descriptor it was handed).
-    function writeFdSync(fd, bytes) {
-      checkFd(fd);
+    // writeFileSync(fd) / appendFileSync(fd): all of the data at the current
+    // position (node does not seek a descriptor it was handed). Node takes
+    // two paths here (v22.22.2 lib/fs.js writeFileSync):
+    // - a string with encoding exactly "utf8" / "utf-8" (the default) goes to
+    //   the binding's writeFileUtf8, which hands any int32 to the write: a
+    //   negative descriptor fails EBADF `write`, its keys errno, code,
+    //   syscall;
+    // - anything else goes through fs.writeSync, which range-checks the
+    //   descriptor first (ERR_OUT_OF_RANGE "fd" for a negative one).
+    function writeFdSync(fd, data, options) {
+      const encoding = readOptions(options).encoding ?? "utf8";
+      const utf8 = typeof data === "string" && (encoding === "utf8" || encoding === "utf-8");
+      const bytes = encodeWrite(data, options);
       let off = 0;
-      while (off < bytes.length) {
-        off += fs.writeSync(fd, bytes, off, bytes.length - off, null);
+      try {
+        while (off < bytes.length) {
+          // Per write, as node's writeSync checks it: empty data writes
+          // nothing and checks nothing.
+          if (!utf8) checkFd(fd);
+          off += fs.writeSync(fd, bytes, off, bytes.length - off, null);
+        }
+      } catch (e) {
+        // writeSync's error has errno, syscall, code (as node's does);
+        // writeFileUtf8's has errno, code, syscall.
+        if (utf8 && e !== null && typeof e === "object" && Object.hasOwn(e, "syscall")) {
+          const syscall = e.syscall;
+          delete e.syscall;
+          e.syscall = syscall;
+        }
+        throw e;
       }
     }
 
@@ -11091,11 +11114,11 @@
         return decodeRead(bytes, enc ?? null);
       },
       writeFileSync: (path, data, options) => {
-        if (isInt32(path)) return void writeFdSync(path, encodeWrite(data, options));
+        if (isInt32(path)) return void writeFdSync(path, data, options);
         natives.fsWriteFileSync(toPath(path), encodeWrite(data, options), false);
       },
       appendFileSync: (path, data, options) => {
-        if (isInt32(path)) return void writeFdSync(path, encodeWrite(data, options));
+        if (isInt32(path)) return void writeFdSync(path, data, options);
         natives.fsWriteFileSync(toPath(path), encodeWrite(data, options), true);
       },
       // node answers false for a path it cannot even validate.

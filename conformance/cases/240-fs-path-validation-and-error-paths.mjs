@@ -186,5 +186,21 @@ for (const [name, args] of [
   console.log(await settled);
 }
 
+// writeFileSync / appendFileSync with a descriptor: utf8 string data goes
+// to the write as is, so a negative descriptor fails EBADF `write`; any other
+// data goes through writeSync, which range-checks it (ERR_OUT_OF_RANGE), and
+// empty data writes, and checks, nothing. readFileSync and the callback
+// writeFile range-check it.
+sync("writeFileSync(-1, string)", () => fs.writeFileSync(-1, "x"));
+sync("writeFileSync(-1, string, utf-8)", () => fs.writeFileSync(-1, "x", "utf-8"));
+sync("writeFileSync(-1, string, latin1)", () => fs.writeFileSync(-1, "x", "latin1"));
+sync("writeFileSync(-1, buffer)", () => fs.writeFileSync(-1, Buffer.from("x")));
+sync("writeFileSync(-1, empty string)", () => fs.writeFileSync(-1, ""));
+sync("writeFileSync(-1, empty buffer)", () => fs.writeFileSync(-1, Buffer.alloc(0)));
+sync("appendFileSync(-1, string)", () => fs.appendFileSync(-1, "x"));
+sync("appendFileSync(-1, buffer)", () => fs.appendFileSync(-1, Buffer.from("x")));
+sync("readFileSync(-1)", () => fs.readFileSync(-1));
+await viaCallback("writeFile(-1)", (cb) => fs.writeFile(-1, "x", cb));
+
 process.chdir(os.tmpdir());
 fs.rmSync(root, { recursive: true, force: true });
