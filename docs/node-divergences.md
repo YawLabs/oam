@@ -2170,7 +2170,13 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   callback gets it on the next tick, then the socket is destroyed with it, and the stream
   does not end (`conformance/cases/260-net-write-without-handle.mjs`; up to 0.17.1 the
   write reached the natives and failed with "tcp: write handle 0 is gone", and `end(data)`
-  ended the stream). An `end()` made before `destroy()` on a socket that has not connected
+  ended the stream). Node's stream getters `writableEnded`, `writableFinished`, `closed`
+  (true from `destroy()` on), `errored`, `readableEnded` and `writableNeedDrain` read as
+  Node's (case 248; up to 0.17.1 a `net.Socket` had none of them). Still absent: the rest of
+  the Readable surface (`isPaused()`, `readableLength`, `readableFlowing`,
+  `readableHighWaterMark`, the iterator helpers such as `map()` and `toArray()`, `wrap()`)
+  and `writableCorked`, `writableBuffer`, `setDefaultEncoding()`, `destroySoon()`. An
+  `end()` made before `destroy()` on a socket that has not connected
   calls back as Node's does: with `null` and a `'finish'` on the next tick on one with no
   connection on the way (there is nothing to shut down); with the stream's error, or
   `ERR_STREAM_DESTROYED`, on the next tick on one still connecting; and, behind a write

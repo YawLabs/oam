@@ -23371,6 +23371,25 @@
       get writableFinished() {
         return this._writableState.finished;
       }
+      // node's stream getters, from the same state: `closed` true once
+      // destroy() has run (the handle closed with it; Readable's getter),
+      // `errored` the error the stream was destroyed or failed with,
+      // `readableEnded` once 'end' is out, and `writableNeedDrain` while a
+      // write() that returned false waits for 'drain' (Writable's: not on
+      // a stream destroyed or ending).
+      get closed() {
+        return this._readableState.closed;
+      }
+      get errored() {
+        return this._readableState.errored;
+      }
+      get readableEnded() {
+        return this._readableState.endEmitted;
+      }
+      get writableNeedDrain() {
+        const ws = this._writableState;
+        return !ws.destroyed && !ws.ending && ws.needDrain;
+      }
 
       end(data, encoding, cb) {
         if (typeof data === "function") { cb = data; data = undefined; encoding = undefined; }

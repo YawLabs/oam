@@ -153,6 +153,46 @@ for (const connected of [false, true]) {
   console.log(`getters: ${log.join(" | ")}`);
 }
 
+// closed / errored / readableEnded / writableNeedDrain, node's Readable and
+// Writable getters (oam's net.Socket had none of them; `closed` read
+// undefined after destroy(), where node's is true at once).
+{
+  const state = (s) =>
+    `closed ${s.closed} errored ${describe(s.errored)} readableEnded ${s.readableEnded} needDrain ${s.writableNeedDrain}`;
+  const log = [];
+  const fresh = new net.Socket();
+  log.push(`fresh: ${state(fresh)}`);
+  fresh.destroy();
+  log.push(`fresh destroy(): ${state(fresh)}`);
+  const failed = net.connect(server.address().port, "127.0.0.1");
+  failed.on("error", () => {});
+  await new Promise((resolve) => failed.once("connect", resolve));
+  log.push(`connected: ${state(failed)}`);
+  failed.destroy(new Error("boom"));
+  log.push(`destroy(err): ${state(failed)}`);
+  await new Promise((resolve) => failed.once("close", resolve));
+  log.push(`after 'close': ${state(failed)}`);
+  // The peer ends: 'end', then the auto end() and the close.
+  // (The server may still be accepting the connections made above.)
+  const peers = [];
+  const onConnection = (p) => peers.push(p);
+  server.on("connection", onConnection);
+  const ended = net.connect(server.address().port, "127.0.0.1");
+  await new Promise((resolve) => ended.once("connect", resolve));
+  let peer;
+  while (!(peer = peers.find((p) => p.remotePort === ended.localPort))) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  server.off("connection", onConnection);
+  ended.resume();
+  peer.end();
+  await new Promise((resolve) => ended.once("end", resolve));
+  log.push(`after 'end': ${state(ended)}`);
+  await new Promise((resolve) => ended.once("close", resolve));
+  log.push(`after 'close': ${state(ended)}`);
+  console.log(`stream state: ${log.join(" | ")}`);
+}
+
 // The error objects themselves, not just code and message: node's coded
 // errors share one prototype per code, between the instance and the base's
 // prototype, whose `constructor` is the base and whose toString renders
