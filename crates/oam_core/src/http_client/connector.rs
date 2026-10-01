@@ -1254,7 +1254,12 @@ mod tests {
             pin: None,
             local: None,
         };
-        (dial("127.0.0.1", port, &opts).await.unwrap(), rx)
+        (
+            dial("127.0.0.1", port, &opts, &AttemptLog::default())
+                .await
+                .unwrap(),
+            rx,
+        )
     }
 
     async fn peer_read_ended(

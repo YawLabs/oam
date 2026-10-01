@@ -90,7 +90,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     // __oam: the internal op table consumed by js/bootstrap.js. Not public
     // API; the bootstrap wraps these in web-shaped surfaces (fetch, ...).
     let internal = v8::Object::new(scope);
-    let internal_bindings: [(&str, v8::Local<v8::Function>); 22] = [
+    let internal_bindings: [(&str, v8::Local<v8::Function>); 23] = [
         ("fetch", v8::Function::new(scope, op_fetch).unwrap()),
         // A fetch whose dispatcher has a `connect.lookup` hook parks before
         // dialling a host name; JS runs the hook and resumes or drops it.
