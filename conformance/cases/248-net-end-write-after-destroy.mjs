@@ -55,7 +55,7 @@ async function run(kind, make) {
     }));
     act(socket, cb);
     sync = false;
-    log.push(`[ended ${socket._writableState.ended}]`);
+    log.push(`[ended ${socket.writableEnded} finished ${socket.writableFinished}]`);
     await closed;
     // Long enough for anything still queued -- a callback node never calls
     // must stay uncalled.
@@ -127,8 +127,30 @@ for (const connected of [false, true]) {
     await closed;
     await new Promise((resolve) => setTimeout(resolve, 50));
     const kind = connected ? "connected" : "connecting";
-    console.log(`${kind} ${name}: ${log.join(" | ")} || close(${hadError}) [ended ${socket._writableState.ended}]`);
+    console.log(`${kind} ${name}: ${log.join(" | ")} || close(${hadError}) [ended ${socket.writableEnded} finished ${socket.writableFinished}]`);
   }
+}
+
+// writableEnded / writableFinished, node's Writable getters (oam's
+// net.Socket had neither): end() called on a stream it could end, and
+// 'finish' emitted. A socket made with writable: false has both from the
+// start, so end() is told it already finished.
+{
+  const state = (s) => `${s.writableEnded}/${s.writableFinished}`;
+  const fresh = new net.Socket();
+  const shut = new net.Socket({ writable: false });
+  const log = [`fresh ${state(fresh)}`, `writable:false ${state(shut)}`];
+  shut.end((e) => log.push(`writable:false end ${describe(e)}`));
+  const socket = net.connect(server.address().port, "127.0.0.1");
+  await new Promise((resolve) => socket.once("connect", resolve));
+  log.push(`connected ${state(socket)}`);
+  const finished = new Promise((resolve) => socket.end(resolve));
+  log.push(`after end() ${state(socket)}`);
+  await finished;
+  log.push(`after 'finish' ${state(socket)}`);
+  socket.destroy();
+  fresh.destroy();
+  console.log(`getters: ${log.join(" | ")}`);
 }
 
 server.close();

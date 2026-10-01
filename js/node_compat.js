@@ -22841,7 +22841,14 @@
         this._releaseScheduled = false;
         // node's Duplex options: a side can be closed from the start.
         if (options && options.readable === false) this.readable = false;
-        if (options && options.writable === false) this.writable = false;
+        if (options && options.writable === false) {
+          // node's Duplex: a side closed from the start has ended and
+          // finished (writableEnded / writableFinished true), so end() and
+          // write() are refused as on any finished stream.
+          this.writable = false;
+          const ws = this._writableState;
+          ws.ending = ws.ended = ws.finished = true;
+        }
         this._pipeHandler = null;
         this._timeoutMs = 0;
         this._timeoutId = null;
@@ -23203,6 +23210,16 @@
       /** Node parity: bytes accepted but not yet flushed to the socket. */
       get writableLength() {
         return this._writableState.length;
+      }
+
+      // node's Writable getters: end() has been called on a stream it could
+      // end (state.ending -- still false after destroy(err); end(), which
+      // does not end an errored stream), and 'finish' has been emitted.
+      get writableEnded() {
+        return this._writableState.ending;
+      }
+      get writableFinished() {
+        return this._writableState.finished;
       }
 
       end(data, encoding, cb) {
