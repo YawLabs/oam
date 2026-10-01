@@ -940,6 +940,54 @@ async fn a_stalled_body_read_fails_after_the_body_timeout() {
     .await;
 }
 
+/// undici's `bodyTimeout` counts from the last bytes off the wire, not from
+/// the start of a read: a gzip body trickled a byte at a time, every byte
+/// well inside the limit, is read whole although the header bytes decode to
+/// nothing and the body takes many limits in all. node v22.22.2 reads such a
+/// body; oam used to time one read out while the decoder was still taking
+/// the gzip header.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_body_timeout_restarts_with_every_frame_off_the_wire() {
+    within(async {
+        const GAP_MS: u64 = 40;
+        const LIMIT_MS: u64 = 250;
+        let compressed = gzip(b"hello world");
+        let total = Duration::from_millis(GAP_MS * compressed.len() as u64);
+        assert!(total > Duration::from_millis(3 * LIMIT_MS), "{total:?}");
+        let server = serve(move |mut conn, _, _| {
+            let compressed = compressed.clone();
+            async move {
+                conn.request().await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\n\r\n",
+                    compressed.len()
+                );
+                conn.send(head.as_bytes()).await;
+                for byte in compressed {
+                    tokio::time::sleep(Duration::from_millis(GAP_MS)).await;
+                    if !conn.send(&[byte]).await {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        let reg = Reg::new();
+        let p = payload(
+            reg.fetch(
+                &plain(),
+                json!({
+                    "url": format!("http://127.0.0.1:{}/", server.port),
+                    "body_timeout_ms": LIMIT_MS,
+                }),
+            )
+            .await,
+        );
+        assert_eq!(reg.text(handle_of(&p)).await, "hello world");
+    })
+    .await;
+}
+
 // ---------------------------------------------------------------- redirects
 
 #[tokio::test(flavor = "multi_thread")]

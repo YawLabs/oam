@@ -44,17 +44,20 @@ pub struct FetchBody {
     /// an agent's socket reads its body here and reports what node's parser
     /// reports. fetch keeps the one text it has always had.
     coded: bool,
-    /// undici's `bodyTimeout`: the longest one read may wait for bytes
-    /// (`fetch`'s and `undici.request`'s; `None` for none).
+    /// undici's `bodyTimeout`: the longest a read may wait for the wire's
+    /// next frame (`fetch`'s and `undici.request`'s; `None` for none).
     timeout: Option<Duration>,
 }
 
 /// The body could not be read (a wire failure or a corrupt encoding). The op
 /// reports [`BODY_READ_FAILED`], or for a coded body whose framing was
-/// malformed (`parse`), node's parse error.
+/// malformed (`parse`), node's parse error, or for a body whose wire went
+/// quiet for its whole `bodyTimeout` (`timed_out`), undici's
+/// `UND_ERR_BODY_TIMEOUT`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BodyReadError {
     pub parse: bool,
+    pub timed_out: bool,
 }
 
 /// hyper reports malformed chunked framing as a body error whose source is an
@@ -111,7 +114,10 @@ impl FetchBody {
             if let Some(decoder) = &mut self.decoder {
                 if self.incoming.is_none() {
                     // The wire is over: drain what is still decodable.
-                    return decoder.finish().map_err(|_| BodyReadError { parse: false });
+                    return decoder.finish().map_err(|_| BodyReadError {
+                        parse: false,
+                        timed_out: false,
+                    });
                 }
                 match decoder.push(&mut self.pending) {
                     Err(_) => return Err(self.fail(false)),
@@ -131,7 +137,23 @@ impl FetchBody {
             let Some(incoming) = self.incoming.as_mut() else {
                 return Ok(None);
             };
-            match incoming.frame().await {
+            // undici's bodyTimeout counts from the last bytes off the wire
+            // (client-h1.js refreshes it on every socket chunk), not from the
+            // start of the read: a frame the decoder takes without yielding
+            // anything yet -- a gzip header trickled a byte at a time -- or an
+            // empty or trailer frame still restarts it.
+            let frame = match self.timeout {
+                None => incoming.frame().await,
+                Some(limit) => match tokio::time::timeout(limit, incoming.frame()).await {
+                    Ok(frame) => frame,
+                    Err(_) => {
+                        let mut error = self.fail(false);
+                        error.timed_out = true;
+                        return Err(error);
+                    }
+                },
+            };
+            match frame {
                 None => {
                     self.incoming = None;
                     if self.decoder.is_none() {
@@ -160,7 +182,10 @@ impl FetchBody {
     fn fail(&mut self, parse: bool) -> BodyReadError {
         self.incoming = None;
         self.pending = Bytes::new();
-        BodyReadError { parse }
+        BodyReadError {
+            parse,
+            timed_out: false,
+        }
     }
 }
 
@@ -170,8 +195,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// `fetchBodyRead`: one chunk of the body under `handle` (`Bytes`), `Done`
 /// at the end, [`BODY_READ_FAILED`] on a failure, and undici's
-/// `UND_ERR_BODY_TIMEOUT` when the body has a `bodyTimeout` and no bytes
-/// came within it.
+/// `UND_ERR_BODY_TIMEOUT` when the body has a `bodyTimeout` and the wire sent
+/// nothing for that long while the read waited ([`FetchBody::next_chunk`]).
 ///
 /// A cancel (`fetchBodyCancel`) that lands while the read is in flight --
 /// the body is out of the registry then -- leaves a tombstone in `cancelled`
@@ -205,25 +230,9 @@ pub async fn read(
     if lock(&cancelled).remove(&handle) {
         return OpOutcome::Done;
     }
-    // undici's bodyTimeout, for this read: it runs while the body is being
-    // read and is cleared by the bytes that answer it. One that lapses fails
-    // the read and drops the body, which closes its connection, as undici
-    // destroys the socket.
-    let timeout = body.timeout;
-    let lapsed = async move {
-        match timeout {
-            Some(limit) => tokio::time::sleep(limit).await,
-            None => std::future::pending().await,
-        }
-    };
-    tokio::pin!(lapsed);
     let result = loop {
         tokio::select! {
             result = body.next_chunk() => break result,
-            () = &mut lapsed => {
-                drop(body);
-                return OpOutcome::node_failed("UND_ERR_BODY_TIMEOUT", "Body Timeout Error");
-            }
             () = cancelled_wake.as_mut() => {
                 cancelled_wake.set(cancel_signal.notified());
                 cancelled_wake.as_mut().enable();
@@ -237,6 +246,14 @@ pub async fn read(
         return OpOutcome::Done;
     }
     match result {
+        // undici's bodyTimeout lapsed: the body is dropped, which closes its
+        // connection, as undici destroys the socket.
+        Err(BodyReadError {
+            timed_out: true, ..
+        }) => {
+            drop(body);
+            OpOutcome::node_failed("UND_ERR_BODY_TIMEOUT", "Body Timeout Error")
+        }
         Ok(Some(chunk)) => {
             lock(&bodies).insert(handle, body);
             // A cancel can land between the tombstone check above and the
@@ -252,7 +269,7 @@ pub async fn read(
         Ok(None) => OpOutcome::Done,
         // llhttp's code and text for a bad chunk-size line, the one framing
         // error hyper leaves in the body.
-        Err(BodyReadError { parse: true }) if body.coded => OpOutcome::node_failed(
+        Err(BodyReadError { parse: true, .. }) if body.coded => OpOutcome::node_failed(
             "HPE_INVALID_CHUNK_SIZE",
             "Parse Error: Invalid character in chunk size",
         ),

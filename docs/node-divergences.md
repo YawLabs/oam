@@ -1585,7 +1585,9 @@ generator as `[object AsyncGenerator]`. What differs:
 per-phase stall limits (#218): a response head that does not arrive within `headersTimeout`
 rejects the request with `HeadersTimeoutError` (`UND_ERR_HEADERS_TIMEOUT`), and a body that
 goes `bodyTimeout` without a byte is destroyed with `BodyTimeoutError`
-(`UND_ERR_BODY_TIMEOUT`), each chunk re-arming it. The request's own value wins, then the
+(`UND_ERR_BODY_TIMEOUT`), each chunk off the wire re-arming it -- one a decoder takes
+without yielding anything yet included, so a compressed body trickled slower than its
+limit as a whole but faster byte by byte is read whole, as in Node. The request's own value wins, then the
 dispatcher's (`new Agent|Pool|Client({ headersTimeout, bodyTimeout })`, the global
 dispatcher included), then undici's default of 300 s; `0` disables. On the request,
 anything but a finite number `>= 0` is `InvalidArgumentError` `invalid headersTimeout` /
@@ -1609,8 +1611,9 @@ terminated`, cause `BodyTimeoutError`; a bad dispatcher value is the dispatcher'
 once `undici` is imported, as an oversized response head's `HeadersOverflowError` is (case
 277), and carries that class's name either way. Both limits run in the transport, one
 implementation for `fetch` and `undici.request`. Pinned against Node + undici 6.29.0 by
-`fetch_rides_its_dispatchers_headers_and_body_timeouts` (e2e) and
-`a_stalled_body_read_fails_after_the_body_timeout` (`http_client_fetch.rs`). Up to 0.17.1 a
+`fetch_rides_its_dispatchers_headers_and_body_timeouts` (e2e),
+`a_stalled_body_read_fails_after_the_body_timeout` and
+`the_body_timeout_restarts_with_every_frame_off_the_wire` (`http_client_fetch.rs`). Up to 0.17.1 a
 `fetch` had no limit at all: a server that never answered held it until its `signal` ended
 it, and a cause from oam's transport was a plain `Error`.
 
