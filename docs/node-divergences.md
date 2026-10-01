@@ -1554,6 +1554,16 @@ Pinned against Node + undici 6.29.0 by `undici_request_honours_headers_and_body_
 
 - **The timers are exact.** undici's are coarse (a 500 ms `headersTimeout` fires after about
   1019 ms in Node); oam's fire at the configured delay.
+- **Without a connect function, `headersTimeout` also covers the connect.** undici starts it
+  once the request is on a connected socket, so DNS, the TCP connect and the TLS handshake do
+  not count. Through a dispatcher with a connect function (a `connect` function or socket /
+  TLS options, an `Agent` `factory`, `ProxyAgent` with its tunnel, `EnvHttpProxyAgent`) oam
+  does the same: the timer stops while the connect function is asked and starts afresh once
+  the socket it hands back carries the request (pinned by
+  `undici_phase_timeouts_measure_what_undici_measures`, e2e). Otherwise oam's own pool dials,
+  and the transport does not tell JS when it has a connection for the request, so the timer
+  starts when the request is dispatched: a slow DNS answer or TLS handshake uses up part of
+  `headersTimeout` in oam and none of it in Node.
 - **A headers timeout does not take the request off the wire**, as for an abort before the
   head (above): the promise rejects at once, and the connection is closed when the head
   arrives or the server gives up. A body timeout closes the connection, as in Node.

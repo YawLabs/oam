@@ -1226,14 +1226,19 @@
   // name up here. A hook that fails fails the fetch CLOSED (its error is the
   // cause, unchanged, as in node) and never falls back to system DNS; an
   // abort while parked drops the parked fetch.
-  async function settleFetch(pending, lookup, signal, connector) {
-    return makeResponse(await settleRaw(pending, lookup, signal, connector), signal);
+  async function settleFetch(pending, lookup, signal, connector, phase) {
+    return makeResponse(await settleRaw(pending, lookup, signal, connector, phase), signal);
   }
 
   // settleFetch's loop, ending at the op's raw payload (the response head
   // with its `bodyHandle`, and the `socket` / `tls` facts of the connection
   // it arrived on) instead of a Response.
-  async function settleRaw(pending, lookup, signal, connector) {
+  //
+  // `phase` (undici.request's, else null) hears when a connector is asked
+  // for a connection (`connecting()`) and when the socket it handed back
+  // carries the request (`connected()`): undici's headersTimeout runs only
+  // while a request is on a connected socket, never across the connect.
+  async function settleRaw(pending, lookup, signal, connector, phase) {
     const internal = globalThis.__oam;
     const aborted = () =>
       signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
@@ -1261,6 +1266,7 @@
         // Aborted before the fetch parked: the listener will never fire (see
         // the lookup branch below), so drop the parked fetch now.
         if (signal?.aborted) abandon();
+        phase?.connecting();
         let socket;
         try {
           socket = await runConnector(connector, {
@@ -1283,6 +1289,7 @@
           throw aborted();
         }
         resumed = true;
+        phase?.connected();
         const supplied = supplySocket(socket);
         try {
           raw = await internal.fetchSupply(token, supplied.id, socket.alpnProtocol === "h2");
@@ -1648,8 +1655,10 @@
     // Started synchronously: a malformed request or a --permission refusal
     // throws from here, as it always has.
     const pending = globalThis.__oam.fetch(JSON.stringify(request));
-    if (rawPayload) return settleRaw(pending, lookup, signal, connector);
-    const op = settleFetch(pending, lookup, signal, connector);
+    if (rawPayload) return settleRaw(pending, lookup, signal, connector, null);
+    // undici.request's connect-phase listener (see settleRaw).
+    const phase = init.__oamConnectPhase && typeof init.__oamConnectPhase === "object" ? init.__oamConnectPhase : null;
+    const op = settleFetch(pending, lookup, signal, connector, phase);
     if (!signal) return op;
     // Race the abort. Wave-1 divergence (documented): the underlying op
     // is not cancelled at the socket — the abort rejects the fetch

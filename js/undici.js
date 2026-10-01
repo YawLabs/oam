@@ -313,14 +313,34 @@
           throw refusal;
         }
       }
+      // undici's headersTimeout runs while the request is on a connected
+      // socket, and not across the connect. A dispatcher with a connect
+      // function (a ProxyAgent's tunnel included) is asked for each
+      // connection, so the timer stops while it is asked and starts afresh
+      // once the socket it hands back carries the request. oam's own pool
+      // does not say when it has a connection for the request, so without a
+      // connect function the timer starts here and also covers the dial
+      // (docs/node-divergences.md).
       let headersTimer = null;
-      if (headersTimeout) {
+      let settled = false;
+      const disarmHeaders = () => {
+        if (headersTimer !== null) {
+          clearTimeout(headersTimer);
+          headersTimer = null;
+        }
+      };
+      const armHeaders = () => {
+        disarmHeaders();
+        if (!headersTimeout || settled) return;
         headersTimer = setTimeout(() => {
+          headersTimer = null;
           controller.abort(new errors.HeadersTimeoutError("Headers Timeout Error"));
         }, headersTimeout);
         // The pending fetch keeps the loop alive; the timer need not.
         if (typeof headersTimer.unref === "function") headersTimer.unref();
-      }
+      };
+      init.__oamConnectPhase = { connecting: disarmHeaders, connected: armHeaders };
+      armHeaders();
       let res;
       try {
         res = await G.fetch(String(url), init);
@@ -328,7 +348,8 @@
         unlink();
         throw err;
       } finally {
-        if (headersTimer !== null) clearTimeout(headersTimer);
+        settled = true;
+        disarmHeaders();
       }
       const body = makeBodyReadable(res.body, bodyTimeout, (err) => controller.abort(err));
       // A signal shared by many requests must not keep one listener per
