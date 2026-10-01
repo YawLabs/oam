@@ -2395,8 +2395,8 @@ pub mod zlib {
     // after each write so memory stays bounded (~64 kB per stream plus
     // the decompressed output for that chunk).
     //
-    // The "unzip" auto-detect variant peeks at the first two bytes on
-    // the initial write_chunk call to resolve the format, then creates
+    // The "unzip" auto-detect variant resolves the format from the first
+    // two bytes of the STREAM, however the writes carve it up, then creates
     // the appropriate decoder.
     //
     // Send requirement: all flate2 encoder/decoder types are Send, and
@@ -2487,9 +2487,9 @@ pub mod zlib {
     // by the chunk size. The full compressed stream never needs to live
     // in memory simultaneously.
     //
-    // The `Unzip` variant defers decoder creation until the first
-    // non-empty write_chunk, at which point it peeks the magic bytes to
-    // choose Gzip or Deflate.
+    // The `Unzip` variant defers decoder creation until two bytes of the
+    // stream have arrived (or it ends), at which point the gzip magic chooses
+    // Gzip or Deflate.
     // ----------------------------------------------------------------
 
     /// Truly incremental flate2 decompressor: memory usage bounded by
@@ -2502,8 +2502,10 @@ pub mod zlib {
         Gzip(flate2::write::GzDecoder<Vec<u8>>),
         Deflate(flate2::write::ZlibDecoder<Vec<u8>>),
         DeflateRaw(flate2::write::DeflateDecoder<Vec<u8>>),
-        /// Pending auto-detect: first chunk resolves to Gzip or Deflate.
-        Unzip,
+        /// Pending auto-detect: the first two bytes of the stream resolve it
+        /// to Gzip or Deflate. Holds the first byte when a write delivered
+        /// only that one.
+        Unzip(Option<u8>),
     }
 
     impl StreamDecompressor {
@@ -2526,7 +2528,7 @@ pub mod zlib {
         }
         pub fn new_unzip() -> Self {
             Self {
-                inner: DecompressorInner::Unzip,
+                inner: DecompressorInner::Unzip(None),
             }
         }
 
@@ -2540,21 +2542,41 @@ pub mod zlib {
             if chunk.is_empty() {
                 return Ok(Vec::new());
             }
-            // Resolve auto-detect on first non-empty chunk.
-            if matches!(self.inner, DecompressorInner::Unzip) {
-                if chunk.starts_with(&[0x1f, 0x8b]) {
-                    self.inner = DecompressorInner::Gzip(flate2::write::GzDecoder::new(Vec::new()));
-                } else {
-                    self.inner =
-                        DecompressorInner::Deflate(flate2::write::ZlibDecoder::new(Vec::new()));
-                }
+            // Resolve auto-detect once two bytes of the stream are in hand.
+            //
+            // The decision is about the STREAM's first two bytes, not the
+            // first write's: a gzip body can arrive `1f`, `8b`, `08`, ... one
+            // byte per write (servers do flush that way), and a one-byte
+            // write can never start with both magic bytes, so deciding on the
+            // first write alone read every such stream as zlib and failed it.
+            // Node's Unzip waits for the second byte too (zlib's inflate
+            // needs 16 bits before its header check). One byte is all that is
+            // ever held.
+            let mut held: Option<[u8; 1]> = None;
+            if let DecompressorInner::Unzip(pending) = &mut self.inner {
+                let (first, second) = match (*pending, chunk) {
+                    (Some(first), [second, ..]) => (first, *second),
+                    (None, [first, second, ..]) => (*first, *second),
+                    (None, [only]) => {
+                        *pending = Some(*only);
+                        return Ok(Vec::new());
+                    }
+                    // An empty chunk returned above.
+                    (_, []) => unreachable!("empty chunk handled above"),
+                };
+                held = pending.map(|byte| [byte]);
+                self.inner = Self::unzip_decoder(first == 0x1f && second == 0x8b);
             }
+            // The held first byte goes in ahead of the chunk that decided.
+            let held: &[u8] = held.as_ref().map_or(&[], |byte| byte.as_slice());
             match &mut self.inner {
                 DecompressorInner::Gzip(dec) => {
+                    dec.write_all(held)?;
                     dec.write_all(chunk)?;
                     Ok(std::mem::take(dec.get_mut()))
                 }
                 DecompressorInner::Deflate(dec) => {
+                    dec.write_all(held)?;
                     dec.write_all(chunk)?;
                     Ok(std::mem::take(dec.get_mut()))
                 }
@@ -2562,7 +2584,16 @@ pub mod zlib {
                     dec.write_all(chunk)?;
                     Ok(std::mem::take(dec.get_mut()))
                 }
-                DecompressorInner::Unzip => unreachable!("resolved above"),
+                DecompressorInner::Unzip(_) => unreachable!("resolved above"),
+            }
+        }
+
+        /// The decoder an `Unzip` stream resolves to.
+        fn unzip_decoder(gzip_magic: bool) -> DecompressorInner {
+            if gzip_magic {
+                DecompressorInner::Gzip(flate2::write::GzDecoder::new(Vec::new()))
+            } else {
+                DecompressorInner::Deflate(flate2::write::ZlibDecoder::new(Vec::new()))
             }
         }
 
@@ -2574,14 +2605,27 @@ pub mod zlib {
                 DecompressorInner::Deflate(dec) => dec.finish(),
                 DecompressorInner::DeflateRaw(dec) => dec.finish(),
                 // No data was ever written (empty stream).
-                DecompressorInner::Unzip => Ok(Vec::new()),
+                DecompressorInner::Unzip(None) => Ok(Vec::new()),
+                // The stream ended one byte in. That is a truncated stream in
+                // either format, and it has to fail as one rather than end
+                // cleanly with the byte dropped: hand it to the decoder its
+                // one byte can still select (a lone `1f` could only have been
+                // gzip) and let that report the missing rest.
+                DecompressorInner::Unzip(Some(byte)) => {
+                    let mut decoder = Self {
+                        inner: Self::unzip_decoder(byte == 0x1f),
+                    };
+                    // Already resolved, so this goes straight to the decoder.
+                    decoder.write_chunk(&[byte])?;
+                    decoder.finish()
+                }
             }
         }
     }
 
     // `StreamDecompressor` is `Send` by auto-derivation: `DecompressorInner`
-    // holds only flate2 write-decoders over `Vec<u8>` (all `Send`) plus the unit
-    // `Unzip` variant. No manual `unsafe impl` -- see the note on
+    // holds only flate2 write-decoders over `Vec<u8>` (all `Send`) plus the
+    // `Unzip` variant's one held byte. No manual `unsafe impl` -- see the note on
     // `StreamCompressor` above.
 
     // Compile-time proof of both notes. A manual `unsafe impl Send` asserts
@@ -2592,6 +2636,67 @@ pub mod zlib {
         assert_send::<StreamCompressor>();
         assert_send::<StreamDecompressor>();
     };
+
+    #[cfg(test)]
+    mod unzip_stream_tests {
+        use super::{Format, StreamDecompressor, compress};
+
+        /// Feed `bytes` to a fresh unzip stream `size` bytes per write.
+        fn unzip_in_chunks(bytes: &[u8], size: usize) -> std::io::Result<Vec<u8>> {
+            let mut dec = StreamDecompressor::new_unzip();
+            let mut out = Vec::new();
+            for chunk in bytes.chunks(size) {
+                out.extend(dec.write_chunk(chunk)?);
+            }
+            out.extend(dec.finish()?);
+            Ok(out)
+        }
+
+        #[test]
+        fn unzip_detects_the_format_however_the_first_bytes_are_split() {
+            // #195: the format was chosen from the first WRITE, and a one-byte
+            // write cannot carry both gzip magic bytes, so a gzip stream fed a
+            // byte at a time was decoded as zlib and failed.
+            let plain = vec![b'x'; 5000];
+            for format in [Format::Gzip, Format::Deflate] {
+                let packed = compress(&plain, format, 6).unwrap();
+                for size in [1, 2, 3, 16, packed.len()] {
+                    let out = unzip_in_chunks(&packed, size)
+                        .unwrap_or_else(|e| panic!("{format:?} in {size}-byte writes: {e}"));
+                    assert_eq!(out, plain, "{format:?} in {size}-byte writes");
+                }
+            }
+        }
+
+        #[test]
+        fn unzip_skips_empty_writes_while_undecided() {
+            let plain = b"hello".to_vec();
+            let packed = compress(&plain, Format::Gzip, 6).unwrap();
+            let mut dec = StreamDecompressor::new_unzip();
+            let mut out = Vec::new();
+            out.extend(dec.write_chunk(&[]).unwrap());
+            out.extend(dec.write_chunk(&packed[..1]).unwrap());
+            out.extend(dec.write_chunk(&[]).unwrap());
+            out.extend(dec.write_chunk(&packed[1..]).unwrap());
+            out.extend(dec.finish().unwrap());
+            assert_eq!(out, plain);
+        }
+
+        #[test]
+        fn unzip_with_no_input_ends_empty() {
+            assert_eq!(unzip_in_chunks(&[], 1).unwrap(), Vec::<u8>::new());
+        }
+
+        #[test]
+        fn unzip_ended_one_byte_in_does_not_drop_the_byte_silently() {
+            // The held byte must reach a decoder at end of stream. A lone gzip
+            // magic byte is a truncated gzip stream, which the gzip decoder
+            // refuses; before the fix this case could not arise (the byte was
+            // written to a zlib decoder at once), and holding it must not turn
+            // it into a clean empty result.
+            assert!(unzip_in_chunks(&[0x1f], 1).is_err());
+        }
+    }
 }
 
 // ----------------------------------------------------------------
