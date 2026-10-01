@@ -2209,8 +2209,12 @@ checks them (`conformance/cases/257-*`): `fchmod`'s mode (`parseFileMode`),
 (`[-1, 2**32-1]`), `futimes`' times, the position of `read` / `readSync` /
 `FileHandle.read` (`validatePosition`: an integer `>= -1` or a bigint), the
 `buffer` / data, options object, `offset` and `length` of `read`, `readSync`,
-`write` and `writeSync` with node's overloads, and the data of `writeFile` /
-`appendFile` and their `Sync` forms (before the path, too). A write's position is not
+`write` and `writeSync` with node's overloads, and the options then the data of
+`writeFile` / `appendFile` in all four forms (`Sync`, callback, `fs/promises`,
+`FileHandle`; `conformance/cases/260-*`), before the path or descriptor: node's
+`getOptions` (a string or an object, a known encoding, an `AbortSignal`), a boolean
+`flush`, then a string or a view -- or, for the promise forms, any other iterable,
+written chunk by chunk. A write's position is not
 validated, as in node: anything but a safe integer `>= 0` -- `1.5`, `'x'`, a bigint,
 a negative -- writes at the cursor (oam used to round `1.5` down to a pwrite at 1).
 A string write's encoding is node's too: only `'hex'` with an odd-length string is
@@ -2219,10 +2223,6 @@ refused, and a name the binding does not know (`'bogus'`) writes UTF-8 -- so
 `ERR_UNKNOWN_ENCODING`.
 What still differs:
 
-- **`writeFile` / `appendFile` options.** node's `getOptions` refuses an `options`
-  that is neither a string nor an object, a non-boolean `flush`, and an unknown
-  encoding before the descriptor; oam does not check these there (an unknown encoding
-  is `ERR_UNKNOWN_ENCODING` when the data is encoded, a bad `flush` is ignored).
 - **An anonymous class instance as the descriptor** reads `Received an instance of
   Object` in the C++ wording on oam, where V8 names it after the variable it was
   assigned to (`an instance of vals`); JS cannot see that inferred name.

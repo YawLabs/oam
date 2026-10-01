@@ -10189,6 +10189,61 @@
   const writeEncoding = (encoding) =>
     typeof encoding === "string" && globalThis.Buffer.isEncoding(encoding) ? encoding : "utf8";
 
+  // node's getOptions (lib/internal/fs/utils.js, v22.22.2): null, undefined
+  // or a function is the defaults, a string is the encoding, anything else
+  // that is not an object is ERR_INVALID_ARG_TYPE; then assertEncoding
+  // (any name Buffer does not know but "buffer") and validateAbortSignal.
+  function fsGetOptions(options, defaults) {
+    if (options == null || typeof options === "function") return defaults;
+    if (typeof options === "string") {
+      options = { ...defaults, encoding: options };
+    } else if (typeof options !== "object") {
+      throw codes.ERR_INVALID_ARG_TYPE("options", ["string", "Object"], options);
+    }
+    const encoding = options.encoding;
+    if (encoding !== "buffer" && encoding && !globalThis.Buffer.isEncoding(encoding)) {
+      throw codes.ERR_INVALID_ARG_VALUE("encoding", encoding, "is invalid encoding");
+    }
+    const signal = options.signal;
+    if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+      throw codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
+    }
+    return options;
+  }
+
+  // The options of writeFile / appendFile in every form -- sync, callback,
+  // fs/promises and FileHandle -- checked as node's are, and before the data:
+  // getOptions over the call's defaults, then `options.flush` a boolean.
+  const kWriteFileDefaults = Object.freeze({ encoding: "utf8", mode: 0o666, flag: "w", flush: false });
+  const kAppendFileDefaults = Object.freeze({ encoding: "utf8", mode: 0o666, flag: "a" });
+  function writeFileOptions(options, append) {
+    options = fsGetOptions(options, append ? kAppendFileDefaults : kWriteFileDefaults);
+    const flush = options.flush ?? false;
+    if (typeof flush !== "boolean") throw codes.ERR_INVALID_ARG_TYPE("options.flush", "boolean", flush);
+    return options;
+  }
+
+  // What fs/promises.writeFile and FileHandle.writeFile take besides a
+  // string or a view (node's isCustomIterable): any other sync or async
+  // iterable, each chunk of it a view or a string.
+  function isCustomIterable(data) {
+    return (
+      data != null &&
+      typeof data !== "string" &&
+      !ArrayBuffer.isView(data) &&
+      (typeof data[Symbol.iterator] === "function" || typeof data[Symbol.asyncIterator] === "function")
+    );
+  }
+
+  // writeFile's data once its options are checked: a view as it is, a string
+  // encoded, anything else ERR_INVALID_ARG_TYPE "data". `iterables`: the
+  // promise forms, which also take isCustomIterable data (returned as is).
+  function writeFileData(data, options, iterables) {
+    if (ArrayBuffer.isView(data) || (iterables && isCustomIterable(data))) return data;
+    validateWriteData(data, "data");
+    return globalThis.Buffer.from(data, options.encoding || "utf8");
+  }
+
   // validateOffsetLengthWrite, after the offset itself has been validated.
   function validateWriteRange(offset, length, byteLength) {
     if (offset > byteLength) throw codes.ERR_OUT_OF_RANGE("offset", "<= " + byteLength, offset);
@@ -10667,18 +10722,44 @@
       const bytes = await natives.fsReadFile(file);
       return decodeRead(bytes, readOptions(options).encoding ?? null);
     };
+    // node's writeFileHandle (lib/internal/fs/promises.js, v22.22.2): a view
+    // in one write -- none at all for an empty one -- or each chunk of an
+    // iterable in turn, a string chunk in the call's encoding.
+    async function writeHandleData(h, data, encoding) {
+      if (!isCustomIterable(data)) {
+        if (data.byteLength !== 0) await natives.fsWriteChunk(h, data);
+        return;
+      }
+      for await (const chunk of data) {
+        const bytes = ArrayBuffer.isView(chunk) ? chunk : globalThis.Buffer.from(chunk, encoding || "utf8");
+        if (bytes.byteLength !== 0) await natives.fsWriteChunk(h, bytes);
+      }
+    }
+    // fs/promises writeFile / appendFile once their options are checked: the
+    // data, then a FileHandle writes through itself and a path is validated.
+    // A view or string is one native write; an iterable is written chunk by
+    // chunk into the file opened for it, as node's is.
+    const writeFileAt = (path, data, options, append) => {
+      data = writeFileData(data, options, true);
+      if (fileHandles.has(path)) return path.writeFile(data, options);
+      const file = toPath(path);
+      parseFileMode(options.mode, "mode", 0o666);
+      if (!isCustomIterable(data)) return natives.fsWriteFile(file, data, append);
+      return (async () => {
+        const { handle } = await natives.fsOpen(file, append ? "a" : "w");
+        try {
+          await writeHandleData(handle, data, options.encoding);
+        } finally {
+          natives.fsClose(handle);
+        }
+      })();
+    };
     rawFsPromises = {
       // A FileHandle reads / writes through itself, as node's do.
       readFile: (path, options) =>
         fileHandles.has(path) ? path.readFile(options) : readFileAt(toPath(path), options),
-      writeFile: (path, data, options) =>
-        fileHandles.has(path)
-          ? path.writeFile(data, options)
-          : natives.fsWriteFile(toPath(path), encodeWrite(data, options), false),
-      appendFile: (path, data, options) =>
-        fileHandles.has(path)
-          ? path.appendFile(data, options)
-          : natives.fsWriteFile(toPath(path), encodeWrite(data, options), true),
+      writeFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, false), false),
+      appendFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, true), true),
       stat: withPath(async (file) => wrapStat(await natives.fsStat(file, false))),
       lstat: withPath(async (file) => wrapStat(await natives.fsStat(file, true))),
       statfs: withPath(async (file, options) => wrapStatFs(await natives.fsStatfs(file), options)),
@@ -10814,11 +10895,13 @@
             }
             return enc ? buf.toString(enc) : buf;
           },
+          // node's fs/promises writeFile over this handle: the options, then
+          // the data (a string, a view or an iterable), as every writeFile
+          // form checks them; the flag and flush do not apply to a handle.
           writeFile: async function (data, options) {
             guard("writeFile");
-            var enc = (options && typeof options === "object") ? options.encoding : (typeof options === "string" ? options : "utf8");
-            if (typeof data === "string") data = globalThis.Buffer.from(data, enc);
-            await natives.fsWriteChunk(h, data);
+            options = writeFileOptions(options, false);
+            await writeHandleData(h, writeFileData(data, options, true), options.encoding);
           },
           // NOT an append. node documents FileHandle.appendFile as an ALIAS of
           // writeFile ("the mode cannot be changed from what it was set to
@@ -11261,6 +11344,24 @@
       }
     }
 
+    // writeFileSync / appendFileSync once their options are checked (node's
+    // order, lib/fs.js v22.22.2: the options, then the data, then the path or
+    // descriptor). A string to write as UTF-8 is node's C++ fast path, which
+    // takes the path first and the mode after it; any other data is checked
+    // and encoded before the path is looked at.
+    function writeFileSyncAt(path, data, options, append) {
+      const enc = options.encoding;
+      const utf8String = typeof data === "string" && (enc === "utf8" || enc === "utf-8");
+      if (!utf8String) data = writeFileData(data, options, false);
+      if (isInt32(path)) {
+        if (utf8String) parseFileMode(options.mode, "mode", 0o666);
+        return void writeFdSync(path, data, options);
+      }
+      const file = toPath(path);
+      parseFileMode(options.mode, "mode", 0o666);
+      natives.fsWriteFileSync(file, encodeWrite(data, options), append);
+    }
+
     // The write under fs.writeSync, past its argument and descriptor checks.
     // fd 1/2 (stdout/stderr) have no native fd-table entry -- route them to
     // the process stdout/stderr sinks so fs.writeSync(1|2, ...) matches Node
@@ -11313,29 +11414,36 @@
 
     // writeFile / appendFile, callback form: a descriptor is written in place
     // from its current position, a path goes through fs/promises.
-    function fdOrPathWrite(promiseFn) {
-      // `options` is never a function by the time it is passed: cb is at 3.
-      const viaPath = callbackify1(promiseFn, 3);
+    function fdOrPathWrite(promiseFn, append) {
       return function (path, data, options, cb) {
         // node's `callback ||= options`: with no callback, the options
         // argument is the one validated as it.
         if (!cb) cb = options;
-        if (typeof options === "function") options = undefined;
-        // node's order: the callback, then the data (a string or a view --
-        // not the iterables fs/promises also takes), then the path or
-        // descriptor.
+        // node's order (lib/fs.js, v22.22.2): the callback, the options, the
+        // data (a string or a view -- not the iterables fs/promises also
+        // takes -- encoded here), then the path or descriptor.
         validateCb(cb);
-        validateWriteData(data, "data");
-        if (!isInt32(path)) return viaPath(path, data, options, cb);
-        // fs.write's descriptor check, which node reaches synchronously.
-        validateFd(path, false);
-        let bytes;
-        try {
-          bytes = encodeWrite(data, options);
-        } catch (e) {
-          queueMicrotask(() => cb(e));
+        options = writeFileOptions(options, append);
+        const bytes = writeFileData(data, options, false);
+        if (!isInt32(path)) {
+          // The path's own checks throw here, at the call, as node's fs.open
+          // does; the write's outcome reaches the callback, with no value.
+          const token = fsReqStart();
+          let p;
+          try {
+            p = promiseFn(path, bytes, options);
+          } catch (e) {
+            fsReqEnd(token);
+            throw e;
+          }
+          p.then(
+            () => { fsReqEnd(token); queueMicrotask(() => cb(null)); },
+            (err) => { fsReqEnd(token); queueMicrotask(() => cb(err)); },
+          );
           return;
         }
+        // fs.write's descriptor check, which node reaches synchronously.
+        validateFd(path, false);
         let off = 0;
         const next = () => {
           if (off >= bytes.byteLength) return cb(null);
@@ -11550,17 +11658,8 @@
         const bytes = natives.fsReadFileSync(toPath(path));
         return decodeRead(bytes, enc ?? null);
       },
-      // The data is checked before the path or descriptor, as node's are.
-      writeFileSync: (path, data, options) => {
-        validateWriteData(data, "data");
-        if (isInt32(path)) return void writeFdSync(path, data, options);
-        natives.fsWriteFileSync(toPath(path), encodeWrite(data, options), false);
-      },
-      appendFileSync: (path, data, options) => {
-        validateWriteData(data, "data");
-        if (isInt32(path)) return void writeFdSync(path, data, options);
-        natives.fsWriteFileSync(toPath(path), encodeWrite(data, options), true);
-      },
+      writeFileSync: (path, data, options) => writeFileSyncAt(path, data, writeFileOptions(options, false), false),
+      appendFileSync: (path, data, options) => writeFileSyncAt(path, data, writeFileOptions(options, true), true),
       // node answers false for a path it cannot even validate.
       existsSync: (path) => {
         let file;
@@ -11735,8 +11834,8 @@
           cb(null, out);
         });
       },
-      writeFile: fdOrPathWrite(promises.writeFile),
-      appendFile: fdOrPathWrite(promises.appendFile),
+      writeFile: fdOrPathWrite(promises.writeFile, false),
+      appendFile: fdOrPathWrite(promises.appendFile, true),
       stat: callbackify1(promises.stat, 1, 1),
       lstat: callbackify1(promises.lstat, 1, 1),
       statfs: callbackify1(promises.statfs, 1, 1),
