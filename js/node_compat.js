@@ -415,9 +415,7 @@
     // to String(). Node checks the protocol the same way.
     if (path && typeof path === "object" && typeof path.protocol === "string" && typeof path.href === "string") {
       if (path.protocol !== "file:") {
-        const err = new TypeError("The URL must be of scheme file");
-        err.code = "ERR_INVALID_URL_SCHEME";
-        throw err;
+        throw codes.ERR_INVALID_URL_SCHEME("file");
       }
       return registry.get("url").fileURLToPath(path);
     }
@@ -1051,11 +1049,19 @@
   codes.ERR_MULTIPLE_CALLBACK = E("ERR_MULTIPLE_CALLBACK", Error, function() {
     return 'Callback called multiple times';
   });
-  codes.ERR_INVALID_FILE_URL_PATH = E("ERR_INVALID_FILE_URL_PATH", Error, function(msg) {
+  // url.fileURLToPath's refusals: TypeErrors in node, as ERR_INVALID_URL_SCHEME.
+  codes.ERR_INVALID_FILE_URL_PATH = E("ERR_INVALID_FILE_URL_PATH", TypeError, function(msg) {
     return 'File URL path ' + msg;
   });
-  codes.ERR_INVALID_FILE_URL_HOST = E("ERR_INVALID_FILE_URL_HOST", Error, function(host) {
-    return 'File URL host must be "localhost" or empty on ' + host;
+  codes.ERR_INVALID_FILE_URL_HOST = E("ERR_INVALID_FILE_URL_HOST", TypeError, function(platform) {
+    return 'File URL host must be "localhost" or empty on ' + platform;
+  });
+  // fs.Dir used after close().
+  codes.ERR_DIR_CLOSED = E("ERR_DIR_CLOSED", Error, "Directory handle was closed");
+  // process.setuid() and friends given a user or group name with no entry
+  // (`kind` is "User" or "Group").
+  codes.ERR_UNKNOWN_CREDENTIAL = E("ERR_UNKNOWN_CREDENTIAL", Error, function(kind, value) {
+    return kind + ' identifier does not exist: ' + value;
   });
   codes.ERR_FS_CP_DIR_TO_NON_DIR = E("ERR_FS_CP_DIR_TO_NON_DIR", Error, function(msg) {
     return msg;
@@ -9168,7 +9174,7 @@
       // end-of-directory. Returning null here instead made a use-after-close
       // bug look like an empty directory.
       if (this.#closed) {
-        throw makeNodeError("ERR_DIR_CLOSED", "Directory handle was closed");
+        throw codes.ERR_DIR_CLOSED();
       }
       if (this.#index >= this.#entries.length) return null;
       return makeDirent(this.path, this.#entries[this.#index++]);
@@ -9176,7 +9182,7 @@
     readSync() { return this.#next(); }
     closeSync() {
       if (this.#closed) {
-        throw makeNodeError("ERR_DIR_CLOSED", "Directory handle was closed");
+        throw codes.ERR_DIR_CLOSED();
       }
       this.#closed = true;
     }
@@ -11412,10 +11418,7 @@
       if (typeof value === "number") return value;
       const id = natives.posixLookupId(kind === "uid" ? 0 : 1, value);
       if (id === null || id === undefined) {
-        throw makeNodeError(
-          "ERR_UNKNOWN_CREDENTIAL",
-          `${credentialKindWord(kind)} identifier does not exist: ${value}`,
-        );
+        throw codes.ERR_UNKNOWN_CREDENTIAL(credentialKindWord(kind), value);
       }
       return id;
     };
@@ -12767,16 +12770,10 @@
           if (typeof user === "number") {
             name = natives.posixLookupId(2, user);
             if (name === null || name === undefined) {
-              throw makeNodeError(
-                "ERR_UNKNOWN_CREDENTIAL",
-                `User identifier does not exist: ${user}`,
-              );
+              throw codes.ERR_UNKNOWN_CREDENTIAL("User", user);
             }
           } else if (natives.posixLookupId(0, user) === null) {
-            throw makeNodeError(
-              "ERR_UNKNOWN_CREDENTIAL",
-              `User identifier does not exist: ${user}`,
-            );
+            throw codes.ERR_UNKNOWN_CREDENTIAL("User", user);
           }
           const err = natives.posixInitGroups(name, gid);
           if (err) throw credentialSyscallError(err, "initgroups");
@@ -14124,11 +14121,14 @@
       }
       const url = typeof input === "string" ? new globalThis.URL(input) : input;
       if (url.protocol !== "file:") {
-        throw makeNodeError(
-          "ERR_INVALID_URL_SCHEME",
-          "The URL must be of scheme file",
-        );
+        throw codes.ERR_INVALID_URL_SCHEME("file");
       }
+      // node's refusals of a path carry the URL as `input`.
+      const badPath = (msg) => {
+        const e = codes.ERR_INVALID_FILE_URL_PATH(msg);
+        e.input = url;
+        return e;
+      };
       // options.windows forces win32/posix semantics regardless of host
       // (Node v22: fileURLToPath(path, { windows }), mirroring
       // pathToFileURL). `null` is explicitly allowed and means host default.
@@ -14141,12 +14141,7 @@
         // Encoded separators would let a URL smuggle path segments past
         // consumers. Windows rejects BOTH, since '\' is a separator there.
         if (/%2f|%5c/i.test(url.pathname)) {
-          const e = makeNodeError(
-            "ERR_INVALID_FILE_URL_PATH",
-            "File URL path must not include encoded \\ or / characters",
-          );
-          e.input = url;
-          throw e;
+          throw badPath("must not include encoded \\ or / characters");
         }
         let pathname = decodeURIComponent(url.pathname).replaceAll("/", "\\");
         if (url.hostname) {
@@ -14156,12 +14151,7 @@
         if (!/^\\[A-Za-z]:/.test(pathname)) {
           // A drive-less path would silently resolve against the cwd's
           // drive â€” fail loud like Node.
-          const e = makeNodeError(
-            "ERR_INVALID_FILE_URL_PATH",
-            "File URL path must be absolute",
-          );
-          e.input = url;
-          throw e;
+          throw badPath("must be absolute");
         }
         return pathname.slice(1); // strip the slash before the drive letter
       }
@@ -14170,25 +14160,15 @@
       // FILENAME CHARACTER here, so rejecting %5C (the Windows rule)
       // made 'file:///foo%5Cbar' -- a real, addressable file -- unopenable.
       if (/%2f/i.test(url.pathname)) {
-        const e = makeNodeError(
-          "ERR_INVALID_FILE_URL_PATH",
-          "File URL path must not include encoded / characters",
-        );
-        e.input = url;
-        throw e;
+        throw badPath("must not include encoded / characters");
       }
       // A host is meaningless for a POSIX file path (no UNC), so Node
       // refuses rather than silently dropping it and returning a path
-      // that points somewhere else entirely.
+      // that points somewhere else entirely. (No `input` on this one.)
       if (url.hostname) {
-        const e = makeNodeError(
-          "ERR_INVALID_FILE_URL_HOST",
-          `File URL host must be "localhost" or empty on ${
-            natives && natives.platform ? natives.platform : "posix"
-          }`,
+        throw codes.ERR_INVALID_FILE_URL_HOST(
+          natives && natives.platform ? natives.platform : "posix",
         );
-        e.input = url;
-        throw e;
       }
       return decodeURIComponent(url.pathname);
     }

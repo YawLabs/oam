@@ -2349,11 +2349,18 @@ from a `net.Socket` and from a `stream.Writable` (or `tls.TLSSocket`) alike
 (`conformance/cases/248-net-end-write-after-destroy.mjs`). Up to 0.17.1 the streams'
 errors were classes named after the code (`constructor.name` `ERR_STREAM_DESTROYED`), the
 rest sat on `Error.prototype` with an own `toString`, and the stack's top frame was oam's
-error factory. What is left: a few errors are still built by hand with a code and no
-factory -- `ERR_DIR_CLOSED`, `ERR_UNKNOWN_CREDENTIAL`, `ERR_INVALID_URL_SCHEME`,
-`ERR_INVALID_FILE_URL_PATH` among them -- and render `Error: message`, on
-`Error.prototype` (node's last two are `TypeError`s); and the `toString` on the
-prototype is oam's function, not node's source text.
+error factory. `url.fileURLToPath`'s refusals (`ERR_INVALID_URL_SCHEME`,
+`ERR_INVALID_FILE_URL_PATH`, `ERR_INVALID_FILE_URL_HOST` -- `TypeError`s, as node's), fs
+given a URL that is not a `file:` one, `ERR_DIR_CLOSED` and `ERR_UNKNOWN_CREDENTIAL` come
+from the same registry (`conformance/cases/265-coded-errors-url-dir.mjs`; up to 0.17.1 they
+were built by hand on `Error.prototype` and rendered `Error: message`, the URL path and host
+ones as `Error`s). What is left: the `toString` on the prototype is oam's function, not
+node's source text; and `fs.cp` / `fs.cpSync` of a directory without `recursive` fails with
+`ERR_FS_CP_DIR_TO_NON_DIR` ("cp: -r not specified; omitting directory '...'"), where node's
+code is `ERR_FS_EISDIR` -- a `SystemError` (`info`, `errno`, `syscall`, `path`; "Path is a
+directory: cp returned EISDIR (... is a directory (not copied)) ...") from `cp` and
+`fs.promises.cp`, a plain `Error` ("Recursive option not enabled, cannot copy a directory:
+...", the path as node's C++ renders it) from `cpSync`. oam has no `SystemError` class yet.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 
