@@ -8,8 +8,10 @@
 // stream was destroyed" on the next tick. end(data, cb) is refused at the
 // write -- "Cannot call write after a stream was destroyed" -- and does not
 // end the stream either. After destroy() with no error, end(cb) ends the
-// stream and parks cb on the 'finish' list, which a destroyed stream never
-// drains: node does not call it (oam called it with ERR_SOCKET_CLOSED).
+// stream and parks cb on the 'finish' list, which a destroyed stream drains
+// only when a write outstanding at destroy() settles: with none, node does
+// not call it (oam called it with ERR_SOCKET_CLOSED); with one, cb gets the
+// stream's error or ERR_STREAM_DESTROYED (oam dropped it).
 //
 // Rows run on a socket that never had a connection ('close' on the next
 // tick, ahead of the callbacks) and on a connected one ('close' from the
@@ -86,6 +88,47 @@ await run("connected", async () => {
   await closed;
   await new Promise((resolve) => setTimeout(resolve, 50));
   console.log(`connected end(cb); destroy(err); end(cb): ${log.join(" | ")}`);
+}
+
+// An end() made after destroy() while a write is still outstanding: node
+// parks its callback, and the write settling hands it the stream's error --
+// the held write's ERR_SOCKET_CLOSED_BEFORE_CONNECTION on a socket destroyed
+// while connecting, ERR_STREAM_DESTROYED on a connected one. With nothing
+// outstanding it is never called (the rows above). oam called none of these
+// callbacks. 'close' is reported apart: on a socket destroyed while
+// connecting, node's held write fails from its 'close' listener, after the
+// one here, and oam's before it (docs/node-divergences.md).
+const outstanding = [
+  ["write(cb); destroy(); end(cb)", (s, cb) => { s.write("x", cb("write")); s.destroy(); s.end(cb("end")); }],
+  // With no callback, a write the connected socket takes whole inside the
+  // call does not count (node's onwrite skips afterWrite for it); one held
+  // behind the connect does. (Whether a big write is taken whole depends on
+  // the OS's send buffer, so no row leans on one.)
+  ["write(); destroy(); end(cb)", (s, cb) => { s.write("x"); s.destroy(); s.end(cb("end")); }],
+  ["write(cb); destroy(); end(cb); end(cb)", (s, cb) => { s.write("x", cb("write")); s.destroy(); s.end(cb("end1")); s.end(cb("end2")); }],
+  ["write(cb); destroy(); end(data, cb); end(cb)", (s, cb) => { s.write("x", cb("write")); s.destroy(); s.end("y", cb("end1")); s.end(cb("end2")); }],
+  // The write has failed by now: its error is the stream's, so end() is
+  // told the stream was destroyed and does not end it.
+  ["write(cb); destroy(); after 'close' end(cb)", async (s, cb, closed) => { s.write("x", cb("write")); s.destroy(); await closed; s.end(cb("end")); }],
+];
+for (const connected of [false, true]) {
+  for (const [name, act] of outstanding) {
+    const socket = net.connect(server.address().port, "127.0.0.1");
+    if (connected) await new Promise((resolve) => socket.once("connect", resolve));
+    const log = [];
+    let sync = true;
+    const cb = (label) => (v) => log.push(`${label}${sync ? " (sync)" : ""} ${describe(v)}`);
+    socket.on("error", (e) => log.push(`error ${describe(e)}`));
+    let hadError;
+    const closed = new Promise((resolve) => socket.once("close", (h) => { hadError = h; resolve(); }));
+    const acted = act(socket, cb, closed);
+    sync = false;
+    await acted;
+    await closed;
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const kind = connected ? "connected" : "connecting";
+    console.log(`${kind} ${name}: ${log.join(" | ")} || close(${hadError}) [ended ${socket._writableState.ended}]`);
+  }
 }
 
 server.close();
