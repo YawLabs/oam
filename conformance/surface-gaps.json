@@ -5,8 +5,8 @@
       "generatedAgainst": "v22.22.2 on darwin-arm64",
       "counts": {
         "nodeExportNames": 1884,
-        "present": 1423,
-        "missing": 361,
+        "present": 1447,
+        "missing": 337,
         "absentModules": 13,
         "absentModuleExportNames": 100
       },
@@ -223,37 +223,13 @@
         ],
         "global:Request.prototype": [
           "attribute",
-          "blob",
-          "bodyUsed",
-          "bytes",
-          "cache",
-          "credentials",
-          "destination",
-          "duplex",
-          "formData",
-          "headers",
-          "integrity",
-          "isHistoryNavigation",
-          "isReloadNavigation",
-          "keepalive",
-          "method",
-          "mode",
-          "redirect",
-          "referrer",
-          "referrerPolicy",
-          "signal",
-          "url"
+          "formData"
         ],
         "global:Response": [
           "error",
           "redirect"
         ],
         "global:Response.prototype": [
-          "arrayBuffer",
-          "blob",
-          "bodyUsed",
-          "bytes",
-          "clone",
           "formData",
           "headers",
           "ok",
@@ -495,8 +471,8 @@
       "generatedAgainst": "v22.22.2 on linux-x64",
       "counts": {
         "nodeExportNames": 1888,
-        "present": 1423,
-        "missing": 365,
+        "present": 1447,
+        "missing": 341,
         "absentModules": 13,
         "absentModuleExportNames": 100
       },
@@ -717,37 +693,13 @@
         ],
         "global:Request.prototype": [
           "attribute",
-          "blob",
-          "bodyUsed",
-          "bytes",
-          "cache",
-          "credentials",
-          "destination",
-          "duplex",
-          "formData",
-          "headers",
-          "integrity",
-          "isHistoryNavigation",
-          "isReloadNavigation",
-          "keepalive",
-          "method",
-          "mode",
-          "redirect",
-          "referrer",
-          "referrerPolicy",
-          "signal",
-          "url"
+          "formData"
         ],
         "global:Response": [
           "error",
           "redirect"
         ],
         "global:Response.prototype": [
-          "arrayBuffer",
-          "blob",
-          "bodyUsed",
-          "bytes",
-          "clone",
           "formData",
           "headers",
           "ok",
@@ -989,8 +941,8 @@
       "generatedAgainst": "v22.22.2 on win32-arm64",
       "counts": {
         "nodeExportNames": 1874,
-        "present": 1423,
-        "missing": 351,
+        "present": 1447,
+        "missing": 327,
         "absentModules": 13,
         "absentModuleExportNames": 100
       },
@@ -1196,37 +1148,13 @@
         ],
         "global:Request.prototype": [
           "attribute",
-          "blob",
-          "bodyUsed",
-          "bytes",
-          "cache",
-          "credentials",
-          "destination",
-          "duplex",
-          "formData",
-          "headers",
-          "integrity",
-          "isHistoryNavigation",
-          "isReloadNavigation",
-          "keepalive",
-          "method",
-          "mode",
-          "redirect",
-          "referrer",
-          "referrerPolicy",
-          "signal",
-          "url"
+          "formData"
         ],
         "global:Response": [
           "error",
           "redirect"
         ],
         "global:Response.prototype": [
-          "arrayBuffer",
-          "blob",
-          "bodyUsed",
-          "bytes",
-          "clone",
           "formData",
           "headers",
           "ok",
