@@ -1562,10 +1562,14 @@ a streamed body that runs past or ends short of its `content-length` with
 errors (or an iterator that throws) with its own error, one that closes before its end with
 undici's `RequestAbortedError`, and any other body type with undici's `InvalidArgumentError`
 `body must be a string, a Buffer, a Readable stream, an iterable, or an async iterable`. The
-caller's abort, a failed request and an origin that answers and closes before the body is
-over all stop it (a generator is returned, a stream destroyed). Pinned against Node + undici
-6.29.0 by `undici_request_sends_every_body_undici_takes` and
-`undici_headers_timeout_starts_when_a_streamed_body_ends` (e2e). Up to 0.17.1 every body that
+caller's abort, a failed request and a response that is over before the body is -- the
+origin closed, or its response body was read to the end or destroyed while the connection
+stays open -- all stop it: a generator is returned, a stream destroyed with no error and
+detached, and the connection closed, as undici resets the socket when a message completes
+mid-write. Pinned against Node + undici 6.29.0 by
+`undici_request_sends_every_body_undici_takes`,
+`undici_headers_timeout_starts_when_a_streamed_body_ends` and
+`undici_request_stops_its_upload_once_the_response_is_over` (e2e). Up to 0.17.1 every body that
 was not a string or a buffer was stringified: a Readable went out as `[object Object]`, a
 generator as `[object AsyncGenerator]`. What differs:
 
@@ -1576,6 +1580,11 @@ generator as `[object AsyncGenerator]`. What differs:
   with the first chunk; oam dispatches the request (DNS, connect, TLS) once the first chunk
   is there, so a body whose first chunk is slow pays the connect after it. Nothing differs
   on the wire.
+- **An early response stops the upload once its body is read.** undici stops a body still
+  going out the moment the whole response has arrived, read or not; oam reads a response
+  body only as it is consumed (see `bodyTimeout` below), so the upload stops when the
+  response body has been read to its end or destroyed. A response nobody reads leaves the
+  upload going until the request otherwise ends.
 - **`strictContentLength: false`** on a dispatcher is not applied: a mismatch is refused as
   under undici's default, where undici would warn and send.
 

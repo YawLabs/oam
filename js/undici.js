@@ -343,6 +343,17 @@
       // A signal shared by many requests must not keep one listener per
       // finished body.
       body.once("close", unlink);
+      // A response that is over while its streamed body is still going out:
+      // undici resets the socket when the message completes mid-write
+      // (client-h1.js onMessageComplete) and destroys the body, so an
+      // origin that answers early and keeps the connection gets no more of
+      // the upload, and an idle source stream is not left attached.
+      const stopUpload = uploads.get(res);
+      if (stopUpload) {
+        uploads.delete(res);
+        body.once("end", stopUpload);
+        body.once("close", stopUpload);
+      }
       return {
         statusCode: res.status,
         headers: headersToObject(res.headers),
@@ -413,6 +424,10 @@
       if (typeof stream.destroy === "function") stream.destroy(err);
       else if (err) queueMicrotask(() => stream.emit("error", err));
     }
+
+    // A streamed upload's stop, by the Response it got: request() runs it
+    // once that response's body is over (sendStreamed's quiet finish).
+    const uploads = new WeakMap();
 
     // Send `init` (a request() fetch init without its body) with `body`:
     // resolves with the fetch's Response, or rejects as undici's request()
@@ -487,7 +502,10 @@
     // A body that fails -- the stream errors or closes before its end, the
     // iterator throws, a chunk is refused -- fails the request with that
     // error, before the head or after it, and the stream is destroyed with
-    // it. A request that fails (or is aborted) stops the body.
+    // it. A request that fails (or is aborted) stops the body, and so does
+    // a response whose body is over first (request() runs the stop): the
+    // stream is destroyed, the iterator returned, and the channel cancelled,
+    // which closes the connection.
     function sendStreamed(url, init, body, stream, declared, expectsPayload, controller) {
       const signal = controller.signal;
       const ops = G.__oam.node;
@@ -521,8 +539,14 @@
               ? { ...init, headers, __oamBodyStream: channel, __oamChunked: length === null }
               : { ...init, headers },
           );
-          // A request that fails takes its body with it.
-          sent.catch(() => finish(null, true));
+          // A request that fails takes its body with it; one that gets its
+          // response hands request() the way to stop it.
+          sent.then(
+            (res) => {
+              if (!over) uploads.set(res, () => finish(null, true));
+            },
+            () => finish(null, true),
+          );
           resolve(sent);
         };
         // The next chunk: `null` when it was empty, else a promise that

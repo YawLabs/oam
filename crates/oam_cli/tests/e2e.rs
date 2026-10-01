@@ -5661,6 +5661,101 @@ cl-late-end-silent finalized=false"##;
     );
 }
 
+/// A streamed `undici.request` body is stopped once the response is over
+/// while it is still going out -- read to its end, or destroyed by the
+/// caller -- against an origin that answers early and keeps the connection:
+/// an idle stream is destroyed (with no error) and detached, a generator is
+/// returned, nothing more is uploaded, and the connection is closed, as
+/// undici resets the socket when a message completes mid-write. Up to this
+/// fix oam went on uploading for as long as the connection lived, and left
+/// an idle stream attached and open. The expected output is node v22.22.2 +
+/// undici 6.29.0's, line for line.
+#[test]
+fn undici_request_stops_its_upload_once_the_response_is_over() {
+    let script = write_temp(
+        "undici_request_stops_its_upload/main.mjs",
+        r##"import net from 'node:net';
+import { PassThrough } from 'node:stream';
+import { request } from 'undici';
+
+// An origin that answers 413 as soon as anything arrives and keeps the
+// connection open.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let srvBytes = 0;
+let srvClosed = 0;
+const server = net.createServer((s) => {
+  s.on('error', () => {});
+  s.on('close', () => { srvClosed++; });
+  let answered = false;
+  s.on('data', (d) => {
+    srvBytes += d.length;
+    if (!answered) { answered = true; s.write('HTTP/1.1 413 Payload Too Large\r\ncontent-length: 2\r\n\r\nno'); }
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+
+// An idle stream: destroyed (no error) and detached once the response is read.
+{
+  srvClosed = 0;
+  const p = new PassThrough();
+  const errs = [];
+  p.on('error', (e) => errs.push(e.name + ':' + e.message));
+  let closeEv = false;
+  p.on('close', () => { closeEv = true; });
+  p.write('x');
+  const r = await request(url, { method: 'POST', body: p });
+  console.log('idle status', r.statusCode, await r.body.text());
+  console.log('idle now destroyed', p.destroyed);
+  await sleep(300);
+  console.log('idle later destroyed', p.destroyed, 'close', closeEv, 'errors', JSON.stringify(errs), 'listeners', p.listenerCount('data'), p.listenerCount('end'), 'srvClosed', srvClosed > 0);
+}
+
+// A generator that keeps producing: returned, and nothing more is uploaded.
+{
+  srvClosed = 0;
+  let produced = 0;
+  let returned = false;
+  const gen = async function* () {
+    try { for (;;) { await sleep(20); produced++; yield Buffer.alloc(1024); } }
+    finally { returned = true; }
+  };
+  const r = await request(url, { method: 'POST', body: gen() });
+  console.log('gen status', r.statusCode, await r.body.text());
+  const p0 = produced, b0 = srvBytes;
+  await sleep(1000);
+  console.log('gen after: produced<=2', produced - p0 <= 2, 'bytes<=2048', srvBytes - b0 <= 2048, 'returned', returned, 'srvClosed', srvClosed > 0);
+}
+
+// A response body the caller destroys before its end.
+{
+  srvClosed = 0;
+  const p = new PassThrough();
+  p.write('x');
+  const r = await request(url, { method: 'POST', body: p });
+  r.body.on('error', () => {});
+  r.body.destroy();
+  await sleep(300);
+  console.log('destroyed-body: stream destroyed', p.destroyed, 'srvClosed', srvClosed > 0);
+}
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"idle status 413 no
+idle now destroyed true
+idle later destroyed true close true errors [] listeners 0 0 srvClosed true
+gen status 413 no
+gen after: produced<=2 true bytes<=2048 true returned true srvClosed true
+destroyed-body: stream destroyed true srvClosed true"##;
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
 /// `fetch()` runs under its dispatcher's `headersTimeout` / `bodyTimeout`, as
 /// node's does: the `dispatcher` option's (global `fetch` and `undici.fetch`),
 /// the global one's after `setGlobalDispatcher`, a ProxyAgent's for the
