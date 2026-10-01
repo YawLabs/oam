@@ -17,7 +17,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::*;
 use hyper_util::client::proxy::matcher::Matcher;
-use oam_core::http_client::body::{self, BODY_READ_FAILED, FetchBodies};
+use oam_core::http_client::body::{self, FetchBodies};
 use oam_core::http_client::decode::OUT_CAP;
 use oam_core::http_client::redirect::{BAD_SCHEME, CREDENTIALS};
 use oam_core::http_client::send::{self, FetchContinuations, FetchRequest};
@@ -96,7 +96,8 @@ impl Reg {
         .await
     }
 
-    /// Every chunk to the end, or the failure text.
+    /// Every chunk to the end, or the failure: its text, or `code: message`
+    /// for a coded one.
     async fn chunks(&self, handle: u64) -> Result<Vec<Vec<u8>>, String> {
         let mut chunks = Vec::new();
         loop {
@@ -107,6 +108,9 @@ impl Reg {
                 }
                 OpOutcome::Done => return Ok(chunks),
                 OpOutcome::Failed(text) => return Err(text),
+                OpOutcome::NodeFailed { code, message, .. } => {
+                    return Err(format!("{code}: {message}"));
+                }
                 other => panic!("{other:?}"),
             }
         }
@@ -1279,10 +1283,134 @@ async fn gzip_then_junk_is_body_read_failed() {
         let reg = Reg::new();
         let url = format!("http://127.0.0.1:{}/", server.port);
         let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+        // zlib's words for the junk read as the next member's header.
         assert_eq!(
             reg.chunks(handle_of(&p)).await,
-            Err(BODY_READ_FAILED.to_string())
+            Err("Z_DATA_ERROR: incorrect header check".to_string())
         );
+    })
+    .await;
+}
+
+/// A failed body read says what failed (#168), in the shape node's `cause`
+/// has: a corrupt encoding is the decoder's error (zlib: `Z_DATA_ERROR`,
+/// errno -3, no syscall), a connection that ends inside the body is undici's
+/// `UND_ERR_SOCKET` / `other side closed` -- under either framing, and with
+/// no decoding involved -- and a bad chunk-size line is undici's parser
+/// error. They used to be one text that blamed decoding for all of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_body_read_says_what_failed() {
+    within(async {
+        let server = serve(|mut conn, _, _| async move {
+            let Some(request) = conn.request().await else {
+                return;
+            };
+            let reply: &[u8] = match request.head.target.as_str() {
+                // A back-reference to before the start of the output.
+                "/deflate" => {
+                    b"HTTP/1.1 200 OK\r\ncontent-encoding: deflate\r\ncontent-length: 4\r\n\r\n\x4b\x04\x12\x00"
+                }
+                "/short" => b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n0123456789",
+                "/chunked-short" => {
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n"
+                }
+                _ => b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\nZZ\r\n",
+            };
+            let reset = request.head.target == "/reset";
+            let reply = if reset {
+                &b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n0123456789"[..]
+            } else {
+                reply
+            };
+            conn.send(reply).await;
+            if reset {
+                // Let the client read what was sent, then close with an RST
+                // (linger 0) instead of a FIN.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                socket2::SockRef::from(&conn.io)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+            }
+            // Dropping the connection closes it: the body ends early.
+        })
+        .await;
+        let reg = Reg::new();
+        let t = plain();
+        let read_to_failure = |path: &'static str| {
+            let reg = &reg;
+            let t = &t;
+            let url = format!("http://127.0.0.1:{}/{path}", server.port);
+            async move {
+                let p = payload(reg.fetch(t, json!({ "url": url })).await);
+                let handle = handle_of(&p);
+                loop {
+                    match reg.read(handle).await {
+                        OpOutcome::Bytes(_) => {}
+                        other => return other,
+                    }
+                }
+            }
+        };
+        match read_to_failure("deflate").await {
+            OpOutcome::NodeFailed {
+                code,
+                message,
+                errno,
+                syscall,
+                ..
+            } => {
+                assert_eq!(code, "Z_DATA_ERROR");
+                assert_eq!(errno, Some(-3));
+                assert_eq!(syscall, None);
+                // miniz has one status for every corrupt deflate stream
+                // (node: "invalid distance too far back").
+                assert_eq!(message, "invalid deflate data");
+            }
+            other => panic!("{other:?}"),
+        }
+        for path in ["short", "chunked-short"] {
+            match read_to_failure(path).await {
+                OpOutcome::NodeFailed {
+                    code,
+                    message,
+                    errno,
+                    syscall,
+                    ..
+                } => {
+                    assert_eq!(
+                        (code.as_str(), message.as_str()),
+                        (body::SOCKET_CODE, body::OTHER_SIDE_CLOSED),
+                        "{path}"
+                    );
+                    assert_eq!((errno, syscall), (None, None), "{path}");
+                }
+                other => panic!("{path}: {other:?}"),
+            }
+        }
+        match read_to_failure("chunked-bad").await {
+            OpOutcome::NodeFailed { code, message, .. } => {
+                assert_eq!(code, body::BAD_CHUNK_SIZE_CODE);
+                assert_eq!(message, body::BAD_CHUNK_SIZE);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A reset inside the body is node's system error, not undici's
+        // SocketError (measured: `read ECONNRESET`, syscall `read`).
+        match read_to_failure("reset").await {
+            OpOutcome::NodeFailed {
+                code,
+                message,
+                errno,
+                syscall,
+                ..
+            } => {
+                assert_eq!(code, "ECONNRESET");
+                assert_eq!(message, "read ECONNRESET");
+                assert_eq!(syscall.as_deref(), Some("read"));
+                assert!(errno.is_some_and(|errno| errno < 0), "{errno:?}");
+            }
+            other => panic!("{other:?}"),
+        }
     })
     .await;
 }

@@ -21257,6 +21257,13 @@
                   self.emit("error", err);
                 }
                 err = connResetException("aborted");
+              } else if (err && (err.code === "UND_ERR_SOCKET" || err.syscall === "read" ||
+                  (typeof err.code === "string" && err.code.indexOf("HPE_") === 0))) {
+                // The shared transport reports a body's wire failure in the
+                // words of undici, which http.request is not: a connection
+                // that ends or fails inside a body aborts the response, as
+                // on the agent path and in node.
+                err = connResetException("aborted");
               }
               res.destroy(err);
             });

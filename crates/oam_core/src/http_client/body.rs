@@ -15,13 +15,18 @@ use bytes::Bytes;
 use http_body_util::BodyExt as _;
 use hyper::body::Incoming;
 
-use super::decode::{Coding, Decoder};
+use super::decode::{Coding, DecodeError, Decoder};
 use crate::{BodyCancelSignal, CancelledBodies, OpOutcome, OutboundBodies};
 
-/// reqwest's text for every failure while reading a body (it reported wire
-/// errors as decode errors too); node_compat.js and user code have only ever
-/// seen this one.
-pub const BODY_READ_FAILED: &str = "fetch: body read failed: error decoding response body";
+/// undici's message for a connection that ended inside a response body
+/// (its `SocketError`, code [`SOCKET_CODE`]).
+pub const OTHER_SIDE_CLOSED: &str = "other side closed";
+pub const SOCKET_CODE: &str = "UND_ERR_SOCKET";
+/// undici's `HTTPParserError` for a bad chunk-size line in a fetch body:
+/// llhttp's code, and its reason in undici's sentence.
+pub const BAD_CHUNK_SIZE_CODE: &str = "HPE_INVALID_CHUNK_SIZE";
+pub const BAD_CHUNK_SIZE: &str =
+    "Response does not match the HTTP/1.1 protocol (Invalid character in chunk size)";
 
 /// Live response bodies by handle. A std Mutex on purpose: a reader REMOVES
 /// its body under a short lock, awaits the chunk with no lock held, then
@@ -38,36 +43,117 @@ pub struct FetchBody {
     decoder: Option<Decoder>,
     /// Compressed input the decoder has not consumed yet.
     pending: Bytes,
-    /// A malformed body (a bad chunk-size line) fails the read with node's
-    /// coded parse error instead of [`BODY_READ_FAILED`]: http.request over
-    /// an agent's socket reads its body here and reports what node's parser
-    /// reports. fetch keeps the one text it has always had.
+    /// A malformed body (a bad chunk-size line) fails the read with the
+    /// parse error of node's own parser instead of undici's: http.request
+    /// over an agent's socket reads its body here and reports what node's
+    /// http client reports.
     coded: bool,
 }
 
-/// The body could not be read (a wire failure or a corrupt encoding). The op
-/// reports [`BODY_READ_FAILED`], or for a coded body whose framing was
-/// malformed (`parse`), node's parse error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BodyReadError {
-    pub parse: bool,
+/// Why a body could not be read. Node's fetch rejects the read with
+/// `TypeError: terminated` whose `cause` says which of these it was, so a
+/// caller can tell a truncated download from a corrupt payload; the op
+/// reports each as that cause ([`BodyReadError::to_outcome`]) and
+/// bootstrap.js wraps it. Measured on node v22.22.2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BodyReadError {
+    /// The encoding is corrupt: the decoder's error (zlib's `Z_DATA_ERROR`,
+    /// brotli's `ERR__ERROR_FORMAT_*`).
+    Decode(DecodeError),
+    /// Malformed chunked framing (a bad chunk-size line).
+    Framing,
+    /// The connection ended before the body did -- inside a `content-length`
+    /// body or between chunks: undici's `SocketError: other side closed`.
+    Closed,
+    /// The connection failed with an OS error (a reset): node's `read
+    /// ECONNRESET`, with this code and its errno.
+    Io {
+        code: &'static str,
+        errno: Option<i32>,
+    },
+    /// Anything else (an h2 stream error, a TLS failure mid-body), in
+    /// hyper's words. Node's cause for these is not mirrored.
+    Other(String),
 }
 
-/// hyper reports malformed chunked framing as a body error whose source is an
-/// `io::Error` of kind InvalidInput / InvalidData ("Invalid chunk size
-/// line"); a connection that ends early is a different kind.
-fn is_framing_error(error: &hyper::Error) -> bool {
-    let mut current: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(error);
-    while let Some(e) = current {
-        if let Some(io) = e.downcast_ref::<std::io::Error>() {
-            return matches!(
-                io.kind(),
-                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData
-            );
+impl BodyReadError {
+    /// hyper reports a body failure as an error whose source chain holds the
+    /// `io::Error` behind it: kind InvalidInput / InvalidData for malformed
+    /// chunked framing ("Invalid chunk size line"), UnexpectedEof for a
+    /// connection that ended early (h1 decode.rs, both framings), and the
+    /// OS error itself for a reset.
+    fn from_hyper(error: &hyper::Error) -> BodyReadError {
+        use std::io::ErrorKind;
+        let mut current: Option<&(dyn std::error::Error + 'static)> =
+            std::error::Error::source(error);
+        while let Some(e) = current {
+            if let Some(io) = e.downcast_ref::<std::io::Error>() {
+                return match io.kind() {
+                    ErrorKind::InvalidInput | ErrorKind::InvalidData => BodyReadError::Framing,
+                    ErrorKind::UnexpectedEof => BodyReadError::Closed,
+                    ErrorKind::ConnectionReset
+                    | ErrorKind::ConnectionAborted
+                    | ErrorKind::BrokenPipe
+                    | ErrorKind::TimedOut => {
+                        let code = crate::node_error_code(io);
+                        BodyReadError::Io {
+                            code,
+                            errno: crate::node_errno(code, io),
+                        }
+                    }
+                    _ => BodyReadError::Other(error.to_string()),
+                };
+            }
+            current = e.source();
         }
-        current = e.source();
+        if error.is_incomplete_message() {
+            return BodyReadError::Closed;
+        }
+        BodyReadError::Other(error.to_string())
     }
-    false
+
+    /// The op outcome: the error JS takes as the cause of `TypeError:
+    /// terminated` (bootstrap.js bodyTerminated turns the undici codes into
+    /// undici's classes). `coded` is [`FetchBody::coded`]: node's own parser's
+    /// code and text for bad framing.
+    fn to_outcome(&self, coded: bool) -> OpOutcome {
+        match self {
+            BodyReadError::Decode(error) => match error.node_code() {
+                // zlib's own shape: errno, then code (node's
+                // zlibOnError); no syscall.
+                Some((code, errno)) => OpOutcome::NodeFailed {
+                    code: code.to_string(),
+                    message: error.message().to_string(),
+                    syscall: None,
+                    path: None,
+                    errno: Some(errno),
+                    hostname: None,
+                    address: None,
+                    port: None,
+                },
+                None => OpOutcome::Failed(error.message().to_string()),
+            },
+            // llhttp's code and text for a bad chunk-size line, the one
+            // framing error hyper leaves in the body.
+            BodyReadError::Framing if coded => OpOutcome::node_failed(
+                BAD_CHUNK_SIZE_CODE,
+                "Parse Error: Invalid character in chunk size",
+            ),
+            BodyReadError::Framing => OpOutcome::node_failed(BAD_CHUNK_SIZE_CODE, BAD_CHUNK_SIZE),
+            BodyReadError::Closed => OpOutcome::node_failed(SOCKET_CODE, OTHER_SIDE_CLOSED),
+            BodyReadError::Io { code, errno } => OpOutcome::NodeFailed {
+                code: code.to_string(),
+                message: format!("read {code}"),
+                syscall: Some("read".to_string()),
+                path: None,
+                errno: *errno,
+                hostname: None,
+                address: None,
+                port: None,
+            },
+            BodyReadError::Other(text) => OpOutcome::Failed(text.clone()),
+        }
+    }
 }
 
 impl FetchBody {
@@ -101,10 +187,10 @@ impl FetchBody {
             if let Some(decoder) = &mut self.decoder {
                 if self.incoming.is_none() {
                     // The wire is over: drain what is still decodable.
-                    return decoder.finish().map_err(|_| BodyReadError { parse: false });
+                    return decoder.finish().map_err(BodyReadError::Decode);
                 }
                 match decoder.push(&mut self.pending) {
-                    Err(_) => return Err(self.fail(false)),
+                    Err(e) => return Err(self.fail(BodyReadError::Decode(e))),
                     Ok(Some(chunk)) => return Ok(Some(chunk)),
                     Ok(None) if decoder.is_done() => {
                         // node ends the body where the compressed stream
@@ -128,7 +214,7 @@ impl FetchBody {
                         return Ok(None);
                     }
                 }
-                Some(Err(e)) => return Err(self.fail(is_framing_error(&e))),
+                Some(Err(e)) => return Err(self.fail(BodyReadError::from_hyper(&e))),
                 Some(Ok(frame)) => {
                     // Trailers carry no body bytes; an empty data frame is
                     // not a chunk.
@@ -147,10 +233,10 @@ impl FetchBody {
         }
     }
 
-    fn fail(&mut self, parse: bool) -> BodyReadError {
+    fn fail(&mut self, error: BodyReadError) -> BodyReadError {
         self.incoming = None;
         self.pending = Bytes::new();
-        BodyReadError { parse }
+        error
     }
 }
 
@@ -159,7 +245,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// `fetchBodyRead`: one chunk of the body under `handle` (`Bytes`), `Done`
-/// at the end, [`BODY_READ_FAILED`] on a failure.
+/// at the end, a [`BodyReadError`]'s outcome on a failure.
 ///
 /// A cancel (`fetchBodyCancel`) that lands while the read is in flight --
 /// the body is out of the registry then -- leaves a tombstone in `cancelled`
@@ -222,13 +308,7 @@ pub async fn read(
             OpOutcome::Bytes(chunk.to_vec())
         }
         Ok(None) => OpOutcome::Done,
-        // llhttp's code and text for a bad chunk-size line, the one framing
-        // error hyper leaves in the body.
-        Err(BodyReadError { parse: true }) if body.coded => OpOutcome::node_failed(
-            "HPE_INVALID_CHUNK_SIZE",
-            "Parse Error: Invalid character in chunk size",
-        ),
-        Err(_) => OpOutcome::Failed(BODY_READ_FAILED.to_string()),
+        Err(error) => error.to_outcome(body.coded),
     }
 }
 

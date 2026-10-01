@@ -899,6 +899,37 @@
     return headers;
   }
 
+  // A body read that failed, as node's fetch reports it: `TypeError:
+  // terminated`, with what failed as the `cause` (measured on v22.22.2), so
+  // a caller can tell a truncated download from a corrupt payload:
+  // - a corrupt encoding: the decoder's error, an Error with zlib's `errno`
+  //   and `code` (-3, Z_DATA_ERROR) or brotli's. The op builds it whole;
+  // - the connection ending inside the body: undici's `SocketError: other
+  //   side closed`, whose `socket` describes the connection. oam fills in the
+  //   addresses; undici's `bytesWritten` / `bytesRead` are not counted here,
+  //   so they are left out rather than made up;
+  // - a bad chunk-size line: undici's HTTPParserError (its `data`, the bytes
+  //   that did not parse, is not available: undefined);
+  // - a reset: node's `read ECONNRESET`, built whole by the op too.
+  // `raw` is the response payload, for the connection's facts.
+  function bodyTerminated(e, raw) {
+    let cause = e;
+    if (e instanceof Error && e.code === "UND_ERR_SOCKET") {
+      const { localAddr, remoteAddr } = raw.socket ?? {};
+      cause = new undiciErrors.SocketError(e.message, {
+        localAddress: localAddr?.address,
+        localPort: localAddr?.port,
+        remoteAddress: remoteAddr?.address,
+        remotePort: remoteAddr?.port,
+        remoteFamily: remoteAddr?.family,
+        timeout: undefined,
+      });
+    } else if (e instanceof Error && typeof e.code === "string" && e.code.startsWith("HPE_")) {
+      cause = new undiciErrors.HTTPParserError(e.message, e.code.slice(4));
+    }
+    return new TypeError("terminated", { cause });
+  }
+
   function makeResponse(raw, signal) {
     const handle = raw.bodyHandle;
     let consumed = false;
@@ -971,7 +1002,7 @@
           } catch (e) {
             if (bodyAborted) return;
             bodyOver();
-            throw e;
+            throw bodyTerminated(e, raw);
           }
           // The read that was in flight when the abort landed returns here
           // against a stream that is already errored; closing or enqueuing

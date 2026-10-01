@@ -39,6 +39,8 @@
 //! back"). See [`Inflater`]. Error TEXTS for corrupt deflate data are not
 //! zlib's: miniz reports one failure for every kind.
 
+use std::borrow::Cow;
+
 use brotli_decompressor::{BrotliDecompressStream, BrotliResult, BrotliState, StandardAlloc};
 use bytes::{Buf, Bytes};
 use flate2::Crc;
@@ -149,21 +151,72 @@ fn trim_js_whitespace(mut s: &[u8]) -> &[u8] {
     s
 }
 
-/// A corrupt body. The message mirrors zlib's (or brotli's) for the same
-/// input where node reports one; the transport maps every decode error to one
-/// body-read failure, so the text is for tests and debugging.
+/// A corrupt body, as node reports it: the `cause` of the `TypeError:
+/// terminated` a body read rejects with is the decoder's own error, an
+/// `Error` carrying `errno` and `code` (measured on v22.22.2).
+///
+/// - zlib (gzip, deflate): every data error is `Z_DATA_ERROR` / -3, and the
+///   message is zlib's. The gzip header and trailer checks, which oam parses
+///   itself, use zlib's words. A corrupt deflate stream does not: miniz
+///   reports one failure status where zlib has a dozen messages (`invalid
+///   block type`, `invalid distance too far back`, ...), so that message is
+///   oam's own `invalid deflate data`.
+/// - brotli: the message is node's `Decompression failed`, the `code` is
+///   `ERR_` followed by the decoder's error name (`ERR__ERROR_FORMAT_PADDING_1`)
+///   and the `errno` its number. brotli-decompressor is a port of the C
+///   decoder with the same error codes, but it does not always pick the
+///   same one for the same corrupt input (measured: `_PADDING_2` where
+///   node's reports `_PADDING_1`), so the exact code is best effort.
+/// - an internal failure (a stage that cannot progress) has no node
+///   counterpart and carries no code.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DecodeError(&'static str);
+pub struct DecodeError {
+    message: &'static str,
+    node: Option<(Cow<'static, str>, i32)>,
+}
 
 impl DecodeError {
+    const fn zlib(message: &'static str) -> DecodeError {
+        DecodeError {
+            message,
+            node: Some((Cow::Borrowed("Z_DATA_ERROR"), -3)),
+        }
+    }
+
+    /// `name` is the decoder's error-code variant, whose names are the C
+    /// enum's (`BROTLI_DECODER_ERROR_FORMAT_PADDING_1`), and `errno` its
+    /// value; node's code is `ERR_` + the name without its `BROTLI_DECODER`
+    /// prefix. (The enum's type is not nameable from here: the crate exports
+    /// it only under its optional C API.)
+    fn brotli(name: &dyn std::fmt::Debug, errno: i32) -> DecodeError {
+        let name = format!("{name:?}");
+        let name = name.strip_prefix("BROTLI_DECODER").unwrap_or(&name);
+        DecodeError {
+            message: "Decompression failed",
+            node: Some((Cow::Owned(format!("ERR_{name}")), errno)),
+        }
+    }
+
+    const fn internal(message: &'static str) -> DecodeError {
+        DecodeError {
+            message,
+            node: None,
+        }
+    }
+
     pub fn message(&self) -> &'static str {
-        self.0
+        self.message
+    }
+
+    /// node's `code` and `errno` for this failure, when it has them.
+    pub fn node_code(&self) -> Option<(&str, i32)> {
+        self.node.as_ref().map(|(code, errno)| (&**code, *errno))
     }
 }
 
 impl std::fmt::Display for DecodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.0)
+        f.write_str(self.message)
     }
 }
 
@@ -322,7 +375,7 @@ impl Decoder {
                     // A stage with input and an empty window always consumes
                     // or produces; stopping here beats looping forever or
                     // clearing a window that still holds data.
-                    return Err(DecodeError("decoder made no progress"));
+                    return Err(DecodeError::internal("decoder made no progress"));
                 }
                 // Stage j is dry. At or below an overrun stage there is nothing
                 // left to want: its stream is over, and decoding what feeds it
@@ -484,11 +537,11 @@ impl Inflater {
         match status {
             TINFLStatus::Done => Ok((step, true)),
             TINFLStatus::NeedsMoreInput | TINFLStatus::HasMoreOutput => Ok((step, false)),
-            TINFLStatus::Adler32Mismatch => Err(DecodeError("incorrect data check")),
+            TINFLStatus::Adler32Mismatch => Err(DecodeError::zlib("incorrect data check")),
             // Failed (a bad block, code, length or distance -- including one
             // from before the start of the output), and the two statuses
             // these flags rule out (BadParam, FailedCannotMakeProgress).
-            _ => Err(DecodeError("invalid deflate data")),
+            _ => Err(DecodeError::zlib("invalid deflate data")),
         }
     }
 }
@@ -625,7 +678,7 @@ impl GzipStage {
             }
             Gz::Id2 => {
                 if self.held != 0x1f || b != 0x8b {
-                    return Err(DecodeError("incorrect header check"));
+                    return Err(DecodeError::zlib("incorrect header check"));
                 }
                 Gz::Cm
             }
@@ -635,10 +688,10 @@ impl GzipStage {
             }
             Gz::Flg => {
                 if self.held != 8 {
-                    return Err(DecodeError("unknown compression method"));
+                    return Err(DecodeError::zlib("unknown compression method"));
                 }
                 if b & FTEXT_RESERVED != 0 {
-                    return Err(DecodeError("unknown header flags set"));
+                    return Err(DecodeError::zlib("unknown header flags set"));
                 }
                 self.flags = b;
                 Gz::Fixed(6)
@@ -670,7 +723,7 @@ impl GzipStage {
             Gz::HcrcHi => {
                 let stored = u16::from_le_bytes([self.held, b]);
                 if u32::from(stored) != self.header_crc.sum() & 0xffff {
-                    return Err(DecodeError("header crc mismatch"));
+                    return Err(DecodeError::zlib("header crc mismatch"));
                 }
                 Gz::Body
             }
@@ -687,7 +740,7 @@ impl GzipStage {
                             self.trailer[3],
                         ]);
                         if stored != self.crc.sum() {
-                            return Err(DecodeError("incorrect data check"));
+                            return Err(DecodeError::zlib("incorrect data check"));
                         }
                         Gz::Trailer(4)
                     }
@@ -699,7 +752,7 @@ impl GzipStage {
                             self.trailer[7],
                         ]);
                         if stored != self.crc.amount() {
-                            return Err(DecodeError("incorrect length check"));
+                            return Err(DecodeError::zlib("incorrect length check"));
                         }
                         Gz::Between
                     }
@@ -841,7 +894,10 @@ impl BrotliStage {
             &mut self.state,
         );
         match result {
-            BrotliResult::ResultFailure => Err(DecodeError("brotli decompression failed")),
+            BrotliResult::ResultFailure => {
+                let code = self.state.error_code;
+                Err(DecodeError::brotli(&code, code as i32))
+            }
             BrotliResult::ResultSuccess => {
                 self.done = true;
                 // The last meta-block ends on a byte boundary; what the
@@ -1124,7 +1180,7 @@ mod tests {
     }
 
     fn err(msg: &'static str) -> Result<Vec<u8>, DecodeError> {
-        Err(DecodeError(msg))
+        Err(DecodeError::zlib(msg))
     }
 
     // -- behaviour ----------------------------------------------------------
@@ -1353,10 +1409,25 @@ mod tests {
             decode_all(&[Coding::Brotli], &cat(&[&br(&a), b"JUNK"])),
             Ok(a.clone())
         );
+        // node: `Decompression failed`, with the decoder's error as the code
+        // (`ERR__ERROR_FORMAT_...`) and its negative number as the errno.
+        let failed = decode_all(&[Coding::Brotli], b"garbage garbage garbage").unwrap_err();
+        assert_eq!(failed.message(), "Decompression failed");
+        let (code, errno) = failed.node_code().unwrap();
+        assert!(code.starts_with("ERR__ERROR_FORMAT_"), "{code}");
+        assert!((-16..=-1).contains(&errno), "{errno}");
+        // Which format error a given input is can differ from the C decoder:
+        // node v22.22.2 reports this one as ERR__ERROR_FORMAT_PADDING_1, -14.
+        let failed =
+            decode_all(&[Coding::Brotli], b"this is not brotli at all, really not").unwrap_err();
         assert_eq!(
-            decode_all(&[Coding::Brotli], b"garbage garbage garbage"),
-            err("brotli decompression failed")
+            failed.node_code(),
+            Some(("ERR__ERROR_FORMAT_PADDING_2", -15))
         );
+        // Every zlib data error is Z_DATA_ERROR / -3.
+        let failed = decode_all(&[Coding::Gzip], b"NOTGZIPATALL").unwrap_err();
+        assert_eq!(failed.message(), "incorrect header check");
+        assert_eq!(failed.node_code(), Some(("Z_DATA_ERROR", -3)));
     }
 
     #[test]
@@ -2176,7 +2247,7 @@ mod tests {
     fn a_copy_from_before_the_output_is_an_error() {
         // Node's message is "invalid distance too far back"; miniz has one
         // failure status for every kind of corrupt data.
-        const TOO_FAR: DecodeError = DecodeError("invalid deflate data");
+        const TOO_FAR: DecodeError = DecodeError::zlib("invalid deflate data");
         // The checksums match the bytes a wrapping dictionary produces, so
         // nothing but the distance check can refuse these.
         let garbage = b"a\0\0\0";
@@ -2228,7 +2299,7 @@ mod tests {
                 } else {
                     assert_eq!(
                         got,
-                        Err(DecodeError("invalid deflate data")),
+                        Err(DecodeError::zlib("invalid deflate data")),
                         "{n} at {size}"
                     );
                 }

@@ -935,7 +935,7 @@ both backwards:
   neither ends the body there. Both treat the trailing bytes as the start of another
   member and fail on its header. What differs is when: Node hands over NO chunk
   (`TypeError: terminated`, cause `incorrect header check`), oam hands over the chunk that
-  decoded and fails on the next read, with the plain-`Error` text in the bullet below.
+  decoded and fails on the next read, with the same error.
 - **Chunk boundaries are Node's only for the shapes case 112 pins.** A multi-member gzip
   body arrives as one chunk in Node and as one chunk per member in oam
   (`gzip('aa') + gzip('bb')`: Node `[4]`, oam `[2, 2]`). The bytes are the same either
@@ -953,10 +953,28 @@ What else still differs:
   undici `fetch/index.js` 1517-1522). The missing space does not matter to an RFC 9110
   parser, but over https oam does not offer brotli, so a server that honours the header
   sends gzip to oam and br to Node. oam decodes a `br` body a server sends anyway.
-- **A corrupt body.** Reading a body that fails to decode rejects with a plain `Error`,
-  `fetch: body read failed: error decoding response body`, with no `cause`. Node fails the
-  read with `TypeError: terminated`, and the zlib error as the `cause` (for example
-  `invalid distance too far back`, `code` `Z_DATA_ERROR`, `errno` `-3`).
+- **The details of a failed body read.** A body that cannot be read to its end rejects the
+  read as Node's does (case 210): `TypeError: terminated`, with what failed as the `cause`
+  -- the decoder's error for a corrupt encoding (`code` `Z_DATA_ERROR`, `errno` `-3`), undici's
+  `SocketError: other side closed` (`UND_ERR_SOCKET`) for a connection that ends inside the
+  body, its `HTTPParserError` (`HPE_INVALID_CHUNK_SIZE`) for a bad chunk-size line, and
+  `read ECONNRESET` for a reset. Up to 0.17.1 all of these were one plain `Error`,
+  `fetch: body read failed: error decoding response body`, with no `cause`. What still
+  differs is detail inside the cause:
+  - zlib's message for a corrupt deflate stream. oam's inflater (miniz) reports one failure
+    where zlib has a dozen messages, so the cause reads `invalid deflate data` where Node's
+    reads `invalid distance too far back`, `invalid block type` and so on (and, for a
+    zlib-wrapped body with a bad header, `incorrect header check`). The gzip header and
+    trailer checks (`incorrect header check`, `unknown compression method`,
+    `unknown header flags set`, `incorrect data check`, `incorrect length check`) are Node's
+    words.
+  - which `ERR__ERROR_FORMAT_*` code a corrupt brotli body gets: the decoder is a port of
+    the C one and does not always pick the same error (`_PADDING_2`, errno `-15`, where
+    Node reports `_PADDING_1`, `-14`). The message, `Decompression failed`, is the same.
+  - `cause.socket` of the `SocketError` carries the connection's addresses but not undici's
+    `bytesWritten` / `bytesRead`, which oam does not count; `HTTPParserError`'s `data` (the
+    bytes that did not parse) is `undefined`.
+  - an HTTP/2 stream error or a TLS failure inside a body has hyper's text as the cause.
 
 _(probed)_ Node v22.22.2 vs oam on Windows, the same raw-socket server: the request
 headers over http and https, and a `deflate` body holding a copy from before the start of
