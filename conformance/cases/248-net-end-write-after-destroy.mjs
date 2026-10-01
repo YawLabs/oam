@@ -96,8 +96,8 @@ await run("connected", async () => {
 // while connecting, ERR_STREAM_DESTROYED on a connected one. With nothing
 // outstanding it is never called (the rows above). oam called none of these
 // callbacks. 'close' is reported apart: on a socket destroyed while
-// connecting, node's held write fails from its 'close' listener, after the
-// one here, and oam's before it (docs/node-divergences.md).
+// connecting, the held write fails from its 'close' listener, after the one
+// here (its order is case 261's).
 const outstanding = [
   ["write(cb); destroy(); end(cb)", (s, cb) => { s.write("x", cb("write")); s.destroy(); s.end(cb("end")); }],
   // With no callback, a write the connected socket takes whole inside the

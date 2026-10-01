@@ -2166,10 +2166,18 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   callback gets it on the next tick, then the socket is destroyed with it, and the stream
   does not end (`conformance/cases/260-net-write-without-handle.mjs`; up to 0.17.1 the
   write reached the natives and failed with "tcp: write handle 0 is gone", and `end(data)`
-  ended the stream). On a socket destroyed while
-  connecting, a write held behind the connect fails -- its callback, then those of such an
-  `end()` -- before `'close'`; Node fails it from a `'close'` listener the `write()` added,
-  so after the `'close'` listeners added before it. What is left there: a write the
+  ended the stream). An `end()` made before `destroy()` on a socket that has not connected
+  calls back as Node's does: with `null` and a `'finish'` on the next tick on one with no
+  connection on the way (there is nothing to shut down); with the stream's error, or
+  `ERR_STREAM_DESTROYED`, on the next tick on one still connecting; and, behind a write
+  held for the connect, once that write has failed. That write fails as Node's: from a
+  `'close'` listener the `write()` added (after the `'close'` listeners added before it),
+  with `ERR_SOCKET_CLOSED_BEFORE_CONNECTION`, the writes behind it and those `end()`
+  callbacks then getting the stream's error. A `tls.TLSSocket` over a `net.Socket` with no
+  connection is `connecting` until that socket connects, as Node's
+  (`conformance/cases/261-net-end-then-destroy-before-connect.mjs`; up to 0.17.1 all of
+  these ran before `'error'` and `'close'`, `end()`'s first, with
+  `ERR_SOCKET_CLOSED_BEFORE_CONNECTION`). What is left there: a write the
   socket could not take at once is still queued natively when `destroy()` closes the
   handle, and its callback gets `ERR_SOCKET_CLOSED` after `'close'` (Node's gets `null`,
   before it); oam settles a write's accounting with its callback, after `write()` has

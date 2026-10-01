@@ -22920,8 +22920,9 @@
         this._pipeHandler = null;
         this._timeoutMs = 0;
         this._timeoutId = null;
-        // Distinguishes ERR_SOCKET_CLOSED vs ERR_SOCKET_CLOSED_BEFORE_
-        // CONNECTION for callbacks queued on a dead socket (Node parity).
+        // Whether the socket ever had its connection: a write a destroy()
+        // stopped before it ran fails with ERR_SOCKET_CLOSED on one that
+        // did, from 'close' (held behind the connect) on one that did not.
         this._everConnected = false;
         // The native halves of the writes (and of end()) made while a connect
         // is in flight; null when ops go straight to the natives (see
@@ -22934,6 +22935,9 @@
         // A write failed for want of a handle: the callbacks of the writes
         // waiting on its next-tick teardown (see _writeWithoutHandle).
         this._noHandleFailure = null;
+        // The callbacks of the writes held behind a connect, failed from
+        // 'close' if the socket closes first (see _holdWrite).
+        this._heldWrites = null;
         if (options && options._handle !== undefined) {
           this._handle = options._handle;
           this.connecting = false;
@@ -23059,6 +23063,12 @@
             // without a handle); the remembered flag is applied here, before
             // 'connect' fires and before the first read parks.
             if (this._handleRefed === false) natives.tcpSetRef(this._handle, false);
+            // The held writes go out: node's 'connect' listener takes its
+            // 'close' listener off.
+            if (this._heldWrites !== null) {
+              this._heldWrites = null;
+              this.removeListener("close", this._failHeldWrites);
+            }
             // What was written while connecting goes out first, then
             // 'connect': a listener that writes -- or destroys the socket --
             // finds the earlier writes already with the natives (node
@@ -23141,6 +23151,9 @@
         // callbacks of an end() parked after destroy() (see below).
         let inCall = true;
         let tookWhole = false;
+        // Held behind the connect: if the socket closes first, the write
+        // fails from 'close' (see _holdWrite).
+        if (this._heldOps !== null) this._holdWrite(cb);
         const written = this._issue(() => {
           const op = natives.tcpWrite(this._handle, bytes);
           if (op === undefined) tookWhole = inCall;
@@ -23152,24 +23165,14 @@
           if (failure === undefined) {
             if (cb) cb(null);
           } else if (failure === kSocketClosed) {
+            // A write held behind a connect the socket never made: its
+            // 'close' listener fails it (_failHeldWrites), with the
+            // callbacks of an end() behind it.
+            if (!this._everConnected) return;
             // Node invokes queued write callbacks with the socket-closed
             // error (NOT the connect error -- that went to 'error') --
             // silently dropping them hangs promisified writes forever.
-            if (cb || !this._everConnected) {
-              const err = this._socketClosedError();
-              if (!this._everConnected) {
-                // node's onwrite: a write held behind a connect the socket
-                // never made fails with this error, and the stream records
-                // it -- so the callbacks of an end() parked after destroy()
-                // get it too, and a later end(cb) is told the stream was
-                // destroyed.
-                const ws = this._writableState;
-                const rs = this._readableState;
-                if (!ws.errored) ws.errored = err;
-                if (!rs.errored) rs.errored = err;
-              }
-              if (cb) process.nextTick(cb, err);
-            }
+            if (cb) process.nextTick(cb, codes.ERR_SOCKET_CLOSED());
           } else {
             // node's afterWriteDispatched: a failed write destroys the
             // socket with its error, callback or not. destroy() defers
@@ -23247,14 +23250,43 @@
           : codes.ERR_STREAM_DESTROYED("write");
       }
 
-      // What a write or end() queued on a socket destroyed before the op
-      // could run fails with: ERR_SOCKET_CLOSED, or -- on a socket that
-      // never connected -- ERR_SOCKET_CLOSED_BEFORE_CONNECTION, node's
-      // error for a write held behind the connect.
-      _socketClosedError() {
-        return this._everConnected
-          ? codes.ERR_SOCKET_CLOSED()
-          : codes.ERR_SOCKET_CLOSED_BEFORE_CONNECTION();
+      // A write made while the connect is in flight. node's _writeGeneric
+      // holds the first such write on a 'connect' listener and adds a
+      // 'close' listener that fails it with
+      // ERR_SOCKET_CLOSED_BEFORE_CONNECTION; the writes after it wait
+      // behind it in the Writable's buffer. So the callbacks wait here, and
+      // the first write adds the 'close' listener -- in the order the
+      // caller's own 'close' listeners were added, as node's -- which the
+      // connect removes (_startConnect). One listener per connect, none on
+      // a connected socket's writes.
+      _holdWrite(cb) {
+        let held = this._heldWrites;
+        if (held === null) {
+          held = this._heldWrites = [];
+          this.once("close", this._failHeldWrites);
+        }
+        held.push(cb);
+      }
+
+      // The socket closed before it connected: node's onClose -> onwrite ->
+      // onwriteError for the held write. Its error is recorded as the
+      // stream's (unless destroy() gave it one), its callback gets it, the
+      // writes behind it and the callbacks of an end() get the stream's
+      // error (errorBuffer), in that order.
+      _failHeldWrites() {
+        const held = this._heldWrites;
+        if (held === null) return;
+        this._heldWrites = null;
+        const err = codes.ERR_SOCKET_CLOSED_BEFORE_CONNECTION();
+        const ws = this._writableState;
+        const rs = this._readableState;
+        if (!ws.errored) ws.errored = err;
+        if (!rs.errored) rs.errored = err;
+        for (let i = 0; i < held.length; i++) {
+          const callback = held[i];
+          if (typeof callback === "function") callback(i === 0 ? err : ws.errored);
+        }
+        if (this._endCallbacks !== null) this._failEndCallbacks(false);
       }
 
       // node's errorBuffer for the callbacks of an end() made after
@@ -23372,6 +23404,7 @@
         if (err !== undefined || ws.ended || ws.errored) {
           if (typeof cb === "function") {
             if (err !== undefined) process.nextTick(cb, err);
+            else if (ws.errored) process.nextTick(cb, ws.errored);
             else if (this._endCallbacks !== null) this._endCallbacks.push(cb);
             else process.nextTick(cb, ws.errored ?? codes.ERR_STREAM_DESTROYED("end"));
           }
@@ -23394,6 +23427,19 @@
           if (typeof cb === "function") this._endCallbacks = [cb];
           return this;
         }
+        // node's end(cb): the callbacks of every end() made before the
+        // stream finishes run first, in call order, and then 'finish' is
+        // emitted (Writable's kOnFinished list). A destroy() before then
+        // hands them its error instead (see there).
+        const callbacks = this._endCallbacks = cb ? [cb] : [];
+        if (this._handle === null && this._heldOps === null) {
+          // No connection and none on the way: node's _final has nothing
+          // to shut down and calls back at once, so the stream finishes on
+          // the next tick (finishMaybe) -- whatever happens to the socket
+          // in between, a destroy() included.
+          process.nextTick(() => this._finish(callbacks));
+          return this;
+        }
         // The FIN is asked for now, in the same turn as the writes before
         // it: the natives send it once the last of them is written, with
         // no trip back through JS in between (#156; node queues the
@@ -23402,30 +23448,33 @@
         const shut = this._issue(() => {
           if (this._handle !== null) return natives.tcpShutdown(this._handle);
         });
-        // node's end(cb): the callbacks of every end() made before the
-        // stream finishes run first, in call order, and then 'finish' is
-        // emitted (Writable's kOnFinished list).
-        const callbacks = this._endCallbacks = cb ? [cb] : [];
         this._chain = this._chain.then(() => shut).then((failure) => {
           // A failed shutdown is the socket's error (node's afterShutdown
           // destroys with it), not a rejection left on `_chain`.
           if (failure !== undefined && failure !== kSocketClosed) this.destroy(failure);
-          this._endCallbacks = null;
-          if (this.destroyed || this._writableState.errored) {
-            // Never report success on a socket that died first: Node skips
-            // 'finish' entirely and hands the end callbacks the error.
-            if (callbacks.length > 0) {
-              const err = this._writableState.errored ?? this._socketClosedError();
-              for (const callback of callbacks) callback(err);
-            }
+          // Never report success on a socket that died first: Node skips
+          // 'finish' entirely, and destroy() has handed the callbacks the
+          // error.
+          if (this.destroyed) return;
+          if (this._writableState.errored) {
+            if (this._endCallbacks === callbacks) this._endCallbacks = null;
+            for (const callback of callbacks.splice(0)) callback(this._writableState.errored);
             return;
           }
-          this._writableState.finished = true;
-          for (const callback of callbacks) callback(null);
-          this.emit("finish");
-          if (!this.readable) this._doClose();
+          this._finish(callbacks);
         });
         return this;
+      }
+
+      // node's finish(): the stream has finished -- the end() callbacks
+      // still waiting run, then 'finish', then a socket whose read side is
+      // done too closes.
+      _finish(callbacks) {
+        if (this._endCallbacks === callbacks) this._endCallbacks = null;
+        this._writableState.finished = true;
+        for (const callback of callbacks.splice(0)) callback(null);
+        this.emit("finish");
+        if (!this.readable) this._doClose();
       }
 
       // node's destroy(): the teardown is synchronous -- `destroyed`, the
@@ -23456,21 +23505,30 @@
         // settle the connect, so release the writes queued behind it (they
         // fail with ERR_SOCKET_CLOSED_BEFORE_CONNECTION).
         this._releaseHeldOps();
-        // node's Writable.destroy -> errorBuffer: the callbacks of an end()
-        // still waiting for 'finish' get the error (or ERR_STREAM_DESTROYED)
-        // on the next tick -- before 'close', not once the shutdown op,
-        // which may be queued behind a write, settles (#156). A socket that
-        // never connected keeps its path through the end() chain: node
-        // hands those callbacks the error of the write held behind the
-        // connect, which fails only once that write is released.
-        if (this._everConnected && this._endCallbacks !== null && this._endCallbacks.length > 0) {
-          const pending = this._endCallbacks.splice(0);
-          const endErr = err || codes.ERR_STREAM_DESTROYED("end");
-          for (const callback of pending) process.nextTick(callback, endErr);
-        }
-        this._endCallbacks = null;
         const rs = this._readableState;
         const ws = this._writableState;
+        // node's Writable.destroy -> errorBuffer: the callbacks of an end()
+        // still waiting for 'finish' get the stream's error (or
+        // ERR_STREAM_DESTROYED "Cannot call end after a stream was
+        // destroyed") on the next tick -- before 'close', not once the
+        // shutdown op, which may be queued behind a write, settles (#156).
+        // Read at that tick, as node's errorBuffer reads them: a 'finish'
+        // already queued (end() on a socket with no connection) takes them
+        // first. While a write is held behind the connect, node's
+        // errorBuffer waits for it: the write fails from 'close' and the
+        // callbacks after it (_failHeldWrites), so they stay where it finds
+        // them.
+        const endCallbacks = this._endCallbacks;
+        if (this._heldWrites === null) {
+          this._endCallbacks = null;
+          if (endCallbacks !== null && endCallbacks.length > 0) {
+            process.nextTick(() => {
+              for (const callback of endCallbacks.splice(0)) {
+                callback(ws.errored ?? codes.ERR_STREAM_DESTROYED("end"));
+              }
+            });
+          }
+        }
         rs.destroyed = ws.destroyed = true;
         // Deliberately NOT flipping rs.readable / ws.writable: Node never
         // mutates those state fields post-construction (they are
@@ -30949,6 +31007,19 @@
       return codes.ERR_SOCKET_CLOSED();
     }
     // A connect-syscall error in Node's shape (`connect EISCONN host:port -
+    // A net.Socket with no connection yet and no connect in flight (node:
+    // `!socket._handle`), which a TLSSocket over it waits on: it is
+    // `connecting` until that socket's 'connect' (node's _init), and its
+    // handshake starts then. Only oam's own net.Socket -- not a TLSSocket,
+    // whose handle lives elsewhere, nor an http client's stand-in, which
+    // holds a native connection in place of a handle.
+    function awaitsConnect(wrap) {
+      var NetSocket = registry.get("net").Socket;
+      return Object.prototype.isPrototypeOf.call(NetSocket.prototype, wrap) &&
+        wrap._handle === null && !wrap.connecting &&
+        wrap[registry._netNativeConnection] === undefined;
+    }
+
     // Local (addr:port)`, code / errno / syscall / address / port), for the
     // one code the TLS path raises itself.
     function connectSyscallError(code, host, port, socket) {
@@ -31096,11 +31167,15 @@
       // 'connect'.
       _wrapOver(over) {
         var net = registry.get("net");
-        var wrap = over instanceof net.Socket ? over : new JSStreamSocket(over);
+        var isNetSocket = over instanceof net.Socket;
+        var wrap = isNetSocket ? over : new JSStreamSocket(over);
         this._wrappedSocket = wrap;
         this._handle = new TLSWrapHandle(wrap);
         this.allowHalfOpen = !!over.allowHalfOpen;
-        this.connecting = !!wrap.connecting;
+        // node's _init: over a net.Socket, connecting until that socket's
+        // 'connect' -- one still connecting, or one with no connection yet
+        // (no handle) that the caller connects later.
+        this.connecting = !!wrap.connecting || (isNetSocket && awaitsConnect(over));
         copyWrapAddresses(this, wrap);
       }
       // Readable EOF. `read(0)` after the null push is what Node's
@@ -31797,7 +31872,7 @@
         releaseContext();
         _settleTlsConnect(socket, connecting, name, options, rejectUnauthorized, identityCheck, name);
       };
-      if (wrap.connecting) {
+      if (wrap.connecting || awaitsConnect(wrap)) {
         wrap.once("connect", () => {
           if (socket.destroyed) return;
           socket.connecting = false;
