@@ -17766,7 +17766,6 @@
           headers ??= message;
         }
         this.statusCode = code;
-        this._wroteHead = true;
         if (this._progressive) {
           if (Array.isArray(headers)) {
             if (headers.length % 2 !== 0) throw codes.ERR_INVALID_ARG_VALUE("headers", headers);
@@ -17784,11 +17783,22 @@
           checkStatusMessage(this.statusMessage);
           if (headers) this._storeGivenHeaders(headers);
         }
+        // node builds the head here: from now on headersSent is true and
+        // every header method, writeHead() included, throws
+        // ERR_HTTP_HEADERS_SENT. A writeHead() that threw above built
+        // nothing, as in node. oam still sends the head with the first
+        // body bytes or end() (docs/node-divergences.md), but nothing can
+        // change it in between: a second writeHead() used to add its
+        // headers to the first one's, and two content-lengths reached hyper.
+        this._wroteHead = true;
+        this.headersSent = true;
         return this;
       }
       // writeHead()'s fast path (node's _storeHeader over the object it was
-      // given): check all, then keep all. Repeated names are kept as a list,
-      // as they go out.
+      // given): check all, then keep all. It runs only on a response no
+      // header method has touched and whose head is not built, so the store
+      // is empty: a name repeated here was given twice in this call, and is
+      // kept as a list, as it goes out.
       _storeGivenHeaders(headers) {
         const pairs = [];
         if (Array.isArray(headers)) {

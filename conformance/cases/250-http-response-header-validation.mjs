@@ -18,7 +18,10 @@
 //     setHeader() / appendHeader() and are checked first.
 //   - addTrailers refuses with `Trailer name` / `trailer content`.
 //   - Once the head is out, set / append / remove / write headers throw
-//     ERR_HTTP_HEADERS_SENT.
+//     ERR_HTTP_HEADERS_SENT. writeHead() puts it out: headersSent turns
+//     true and a second writeHead() throws. oam's second writeHead() added
+//     its headers to the first one's, and two content-lengths made hyper
+//     panic.
 //   - http.validateHeaderName / validateHeaderValue are the same checks.
 //   - getHeader / hasHeader / removeHeader refuse a name that is not a
 //     string (ERR_INVALID_ARG_TYPE), on a response, an OutgoingMessage and a
@@ -198,6 +201,35 @@ run("after the head is out", (res) => {
   attempt("  removeHeader", () => res.removeHeader("x-v"));
   attempt("  writeHead", () => res.writeHead(200));
   attempt("  setHeader invalid", () => res.setHeader("x v", "€"));
+});
+
+for (const [label, before, first, second] of [
+  ["fresh", null, { "x-a": "1", "x-b": "1" }, { "x-a": "2", "x-c": "2" }],
+  ["content-length", null, { "content-length": "2", "x-a": "1" }, { "content-length": "5", "x-a": "2" }],
+  ["bare", null, undefined, undefined],
+  ["flat", null, ["x-a", "1", "x-a", "2"], ["x-a", "3"]],
+  ["after setHeader", "x-s", { "x-a": "1" }, { "x-a": "2", "x-s": "2" }],
+]) {
+  run(`writeHead twice, ${label}`, (res) => {
+    if (before) res.setHeader(before, "1");
+    attempt("  first", () => res.writeHead(200, first) === res);
+    attempt("  headersSent", () => res.headersSent);
+    attempt("  second", () => res.writeHead(201, second));
+    attempt("  setHeader", () => res.setHeader("x-a", "3"));
+    attempt("  appendHeader", () => res.appendHeader("x-a", "3"));
+    attempt("  setHeaders", () => res.setHeaders(new Map([["x-a", "3"]])));
+    attempt("  removeHeader", () => res.removeHeader("x-a"));
+    attempt("  hasHeader string", () => typeof res.hasHeader("x-a"));
+    attempt("  statusCode", () => res.statusCode);
+    res.end("hi");
+  });
+}
+run("writeHead refused, then end", (res) => {
+  attempt("  refused", () => res.writeHead(200, { "x-v": "€" }));
+  attempt("  headersSent", () => res.headersSent);
+  attempt("  setHeader", () => res.setHeader("x-a", "1") === res);
+  attempt("  writeHead", () => res.writeHead(202, { "x-b": "1" }) === res);
+  attempt("  headersSent after", () => res.headersSent);
 });
 
 run("name argument types", (res) => {

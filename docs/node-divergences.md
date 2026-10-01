@@ -1861,13 +1861,15 @@ store, and `setHeaders` and `addTrailers` did not exist.
 `conformance/cases/250-http-response-header-validation.mjs` and
 `251-http-response-header-bytes.mjs` hold this to node v22.22.2. What still differs:
 
-- **`writeHead()` does not send the head.** Node builds it there: `headersSent` turns true,
-  the header methods throw `ERR_HTTP_HEADERS_SENT` from then on, headers given to
-  `writeHead()` on a response no header method has touched never show in `getHeader()`, and
-  a body that follows is framed chunked. oam builds the head when the first body bytes or
-  `end()` go out, so until then `headersSent` is false, the header methods still work,
-  `getHeader()` sees those headers, and `end('text')` after `writeHead()` sends a
-  `content-length`. The bytes a header value goes out as follow Node's framing all the same.
+- **`writeHead()` does not send the head.** As in Node, `headersSent` turns true there and
+  the header methods, a second `writeHead()` among them, throw `ERR_HTTP_HEADERS_SENT` from
+  then on, but oam sends the head with the first body bytes or `end()`. So headers given to
+  `writeHead()` on a response no header method has touched show in `getHeader()` /
+  `hasHeader()`, where Node's never do, and `end('text')` after `writeHead()` sends a
+  `content-length` where Node frames the body chunked. The bytes a header value goes out as
+  follow Node's framing all the same. Up to 0.17.1 `headersSent` stayed false and the header
+  methods kept working after `writeHead()`; a second `writeHead()` replaced the first one's
+  headers.
 - **The status line carries the status code's standard reason phrase**, not
   `res.statusMessage`: a message is checked as Node checks it and stays readable, but is not
   sent.
