@@ -210,6 +210,7 @@ impl BodyReadError {
                     hostname: None,
                     address: None,
                     port: None,
+                    dest: None,
                 },
                 None => OpOutcome::Failed(error.message().to_string()),
             },
@@ -236,6 +237,7 @@ impl BodyReadError {
                 hostname: None,
                 address: None,
                 port: None,
+                dest: None,
             },
             BodyReadError::Other(text) => OpOutcome::Failed(text.clone()),
         }

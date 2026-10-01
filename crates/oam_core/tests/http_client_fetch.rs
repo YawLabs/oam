@@ -2982,6 +2982,7 @@ async fn the_sent_signal_fires_with_the_connection_and_never_without_one() {
                 reg.outbound.clone(),
                 reg.continuations.clone(),
                 reg.net_check.clone(),
+                None,
             ))
         };
         let fired =
