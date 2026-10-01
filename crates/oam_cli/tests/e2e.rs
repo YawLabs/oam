@@ -5661,6 +5661,97 @@ cl-late-end-silent finalized=false"##;
     );
 }
 
+/// `undici.request` rejects with the error itself, as undici's does, never
+/// with fetch's `TypeError: fetch failed`: an oversized response head is
+/// `HeadersOverflowError` (`UND_ERR_HEADERS_OVERFLOW`), counted as undici
+/// counts it -- header names and values, not the reason phrase -- and a body
+/// timeout, a dispatcher's bad option, a refused header and a refused
+/// connect (`ECONNREFUSED`) come as they are. Up to this fix an overflow was
+/// `fetch failed` with node's http-parser cause (`HPE_HEADER_OVERFLOW`, and
+/// node's http.request count, so a head undici takes was refused), and so
+/// was a refused connect. The expected output is node v22.22.2 + undici
+/// 6.29.0's, line for line.
+#[test]
+fn undici_request_rejects_with_the_error_itself() {
+    let script = write_temp(
+        "undici_request_rejects_with_the_error_itself/main.mjs",
+        r##"import net from 'node:net';
+import { request, errors, Agent } from 'undici';
+
+// A head whose names + values come to `nv` bytes, with a reason phrase of
+// `reason` bytes.
+function serve(nv, reason) {
+  return net.createServer((s) => {
+    s.on('error', () => {});
+    s.once('data', () => {
+      // "content-length" (14) + "0" (1) + "x-big" (5) + value
+      const value = 'a'.repeat(nv - 20);
+      s.end(`HTTP/1.1 200 ${'R'.repeat(reason)}\r\ncontent-length: 0\r\nx-big: ${value}\r\n\r\n`);
+    });
+  });
+}
+const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${srv.address().port}/`)));
+function show(label, e) {
+  console.log(label, 'rejected', e.name, e.code, JSON.stringify(e.message.replace(/:\d+$/, ':PORT')),
+    'overflowClass', e instanceof errors.HeadersOverflowError, 'undiciClass', e instanceof errors.UndiciError,
+    'cause', e.cause ? e.cause.name + ' ' + e.cause.code : 'none');
+}
+// undici counts header names and values, not the reason phrase, and
+// request() rejects with HeadersOverflowError itself.
+for (const [nv, reason] of [[16383, 100], [16384, 2], [20000, 2]]) {
+  const url = await listen(serve(nv, reason));
+  try {
+    const r = await request(url);
+    await r.body.text();
+    console.log(`request nv=${nv} reason=${reason}`, 'ok', r.statusCode);
+  } catch (e) { show(`request nv=${nv} reason=${reason}`, e); }
+  try {
+    const r = await fetch(url);
+    await r.text();
+    console.log(`fetch nv=${nv} reason=${reason}`, 'ok', r.status);
+  } catch (e) { show(`fetch nv=${nv} reason=${reason}`, e); }
+}
+// A body timeout, a dispatcher's bad option, a refused header and a refused
+// connect: the error itself, never `TypeError: fetch failed`.
+{
+  const srv = net.createServer((s) => {
+    s.on('error', () => {});
+    s.once('data', () => s.write('HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nab'));
+  });
+  const url = await listen(srv);
+  const r = await request(url, { bodyTimeout: 200 });
+  try { await r.body.text(); console.log('body-timeout ok'); } catch (e) { show('body-timeout', e); }
+}
+try { await request('http://127.0.0.1:1/', { dispatcher: new Agent({ headersTimeout: -1 }) }); } catch (e) { show('bad-dispatcher', e); }
+try { await request('http://127.0.0.1:1/', { headers: { 'transfer-encoding': 'x' } }); } catch (e) { show('te-header', e); }
+{
+  const srv = net.createServer();
+  const url = await listen(srv);
+  await new Promise((r) => srv.close(r));
+  try { await request(url); } catch (e) { show('refused', e); }
+}
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"request nv=16383 reason=100 ok 200
+fetch nv=16383 reason=100 ok 200
+request nv=16384 reason=2 rejected HeadersOverflowError UND_ERR_HEADERS_OVERFLOW "Headers Overflow Error" overflowClass true undiciClass true cause none
+fetch nv=16384 reason=2 rejected TypeError undefined "fetch failed" overflowClass false undiciClass false cause HeadersOverflowError UND_ERR_HEADERS_OVERFLOW
+request nv=20000 reason=2 rejected HeadersOverflowError UND_ERR_HEADERS_OVERFLOW "Headers Overflow Error" overflowClass true undiciClass true cause none
+fetch nv=20000 reason=2 rejected TypeError undefined "fetch failed" overflowClass false undiciClass false cause HeadersOverflowError UND_ERR_HEADERS_OVERFLOW
+body-timeout rejected BodyTimeoutError UND_ERR_BODY_TIMEOUT "Body Timeout Error" overflowClass false undiciClass true cause none
+bad-dispatcher rejected InvalidArgumentError UND_ERR_INVALID_ARG "headersTimeout must be a positive integer or zero" overflowClass false undiciClass true cause none
+te-header rejected InvalidArgumentError UND_ERR_INVALID_ARG "invalid transfer-encoding header" overflowClass false undiciClass true cause none
+refused rejected Error ECONNREFUSED "connect ECONNREFUSED 127.0.0.1:PORT" overflowClass false undiciClass false cause none"##;
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
 /// A streamed `undici.request` body is stopped once the response is over
 /// while it is still going out -- read to its end, or destroyed by the
 /// caller -- against an origin that answers early and keeps the connection:

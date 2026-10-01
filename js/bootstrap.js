@@ -7,7 +7,7 @@
 // http_client::send (__oam.fetch / fetchContinue / fetchAbandon):
 //   request:  JSON string {url, method, headers: [[k,v]],
 //             body | body_base64 | body_stream, attempt_timeout_ms,
-//             fetch_semantics, lookup_hook?}
+//             fetch_semantics, dispatch_semantics, lookup_hook?}
 //   response: {status, statusText, url, redirected, headers: [[k,v]],
 //             bodyHandle} -- or, for a lookup_hook request,
 //             {lookup: {token, host, port}}: run the hook, then
@@ -1550,6 +1550,8 @@
       attempt_timeout_ms: netAttemptTimeoutMs(),
       // undici's Fetch-spec bad-port block on the initial URL.
       fetch_semantics: fetchSemantics,
+      // undici's response-head count and refusal (fetch, undici.request).
+      dispatch_semantics: dispatchSemantics,
     };
     // An https URL handshakes under node's live TLS defaults
     // (tlsDefaultVersions). A default that is not a version fails a fetch as

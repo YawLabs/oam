@@ -1588,6 +1588,24 @@ generator as `[object AsyncGenerator]`. What differs:
 - **`strictContentLength: false`** on a dispatcher is not applied: a mismatch is refused as
   under undici's default, where undici would warn and send.
 
+**How `undici.request` fails**
+
+`undici.request()`, `undici.stream()` and a dispatcher's `request()` reject with the error
+itself, as undici's do -- an undici class (`HeadersTimeoutError`, `BodyTimeoutError`,
+`HeadersOverflowError`, `InvalidArgumentError`, ...) with its `name`, `code` and `message`,
+a connect's `ECONNREFUSED` / `ENOTFOUND` error as given -- never with fetch's `TypeError:
+fetch failed`. An oversized response head is counted as undici counts it, header names and
+values without the status line's reason phrase (node's own `http.request` counts that too).
+Pinned against Node + undici 6.29.0 by `undici_request_rejects_with_the_error_itself` (e2e).
+Up to 0.17.1 only a late head was unwrapped: an oversized head was `fetch failed` with
+node's http-parser cause `HPE_HEADER_OVERFLOW` (under the http-parser count, so a head
+undici takes could be refused), and a refused connect was wrapped too. What differs:
+
+- **A connection the server closes before its response** rejects with a plain `Error`
+  (`error sending request for url (...)`, no `code`), where undici's is `SocketError`
+  (`UND_ERR_SOCKET`, `other side closed`): oam's transport does not yet tell that failure
+  apart from others of its kind.
+
 **`headersTimeout` and `bodyTimeout` on `undici.request` and `fetch`**
 
 `undici.request()`, `undici.stream()` and a dispatcher's `request()` honour undici's two

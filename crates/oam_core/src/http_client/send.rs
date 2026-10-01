@@ -90,6 +90,12 @@ pub struct FetchRequest {
     /// checked either way (redirect::next).
     #[serde(default)]
     pub fetch_semantics: bool,
+    /// True for `undici.request` (and implied by `fetch_semantics`): the
+    /// request goes through undici's dispatcher in node, so an oversized
+    /// response head is counted and refused as undici does
+    /// ([`response_head_overflow`]), not as node's own http parser.
+    #[serde(default)]
+    pub dispatch_semantics: bool,
     /// `fetch`'s `redirect` option; `http.request` always sends `manual`
     /// (node's http client never follows a redirect).
     #[serde(default)]
@@ -240,7 +246,7 @@ struct LoopState {
     /// The response-head limit, and which of node's two counts applies (see
     /// [`response_head_overflow`]).
     max_header_size: u64,
-    fetch_semantics: bool,
+    undici_head: bool,
     /// Fired by the pool when a connection has a hop's request (see
     /// [`super::sent`]); carried across a park, dropped with the fetch.
     /// `http.request`'s, or the loop's own when only `headers_timeout` needs
@@ -397,7 +403,7 @@ pub async fn fetch(
         max_header_size: req
             .max_header_size
             .unwrap_or_else(crate::http_head::max_http_header_size),
-        fetch_semantics: req.fetch_semantics,
+        undici_head: req.fetch_semantics || req.dispatch_semantics,
         dispatched,
         headers_timeout,
         body_timeout: timeout_limit(req.body_timeout_ms),
@@ -685,7 +691,7 @@ async fn run(
         // Every hop's head, a redirect's included: node's parser refuses an
         // oversized head before anything looks at its status.
         if let Some(refusal) =
-            response_head_overflow(&response, state.max_header_size, state.fetch_semantics)
+            response_head_overflow(&response, state.max_header_size, state.undici_head)
         {
             drop(response);
             state.source.request_failed();
@@ -745,9 +751,10 @@ async fn run(
 /// refusal when `response`'s head is at or over `limit`, counted the way the
 /// API that sent the request counts it (measured on node v22.22.2):
 ///
-/// - `fetch` (undici): header names plus values. It fails with
-///   `TypeError: fetch failed`, cause `UND_ERR_HEADERS_OVERFLOW` /
-///   `Headers Overflow Error` (undici's `HeadersOverflowError`).
+/// - `fetch` and `undici.request` (undici, `undici_head`): header names plus
+///   values. It fails with `UND_ERR_HEADERS_OVERFLOW` / `Headers Overflow
+///   Error` (undici's `HeadersOverflowError`): `fetch` as the cause of
+///   `TypeError: fetch failed`, `undici.request` with the error itself.
 /// - `http.request` (node's own parser): the status line's reason phrase
 ///   too. It fails with `Parse Error: Header overflow`, code
 ///   `HPE_HEADER_OVERFLOW`.
@@ -760,14 +767,14 @@ async fn run(
 pub(super) fn response_head_overflow(
     response: &http::Response<Incoming>,
     limit: u64,
-    fetch_semantics: bool,
+    undici_head: bool,
 ) -> Option<OpOutcome> {
     let mut count: u64 = response
         .headers()
         .iter()
         .map(|(name, value)| (name.as_str().len() + value.as_bytes().len()) as u64)
         .sum();
-    if !fetch_semantics && response.version() < http::Version::HTTP_2 {
+    if !undici_head && response.version() < http::Version::HTTP_2 {
         count += match response.extensions().get::<hyper::ext::ReasonPhrase>() {
             Some(reason) => reason.as_bytes().len(),
             None => response
@@ -780,7 +787,7 @@ pub(super) fn response_head_overflow(
     if count < limit {
         return None;
     }
-    Some(if fetch_semantics {
+    Some(if undici_head {
         OpOutcome::node_failed("UND_ERR_HEADERS_OVERFLOW", "Headers Overflow Error")
     } else {
         OpOutcome::node_failed("HPE_HEADER_OVERFLOW", "Parse Error: Header overflow")

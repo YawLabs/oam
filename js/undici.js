@@ -365,11 +365,15 @@
     }
 
     // request()'s failure as undici's request() reports it. oam's fetch wraps
-    // a refusal it makes before sending -- a hop-by-hop header, a
-    // content-length that disagrees with the body -- and a late response
-    // head in `TypeError: fetch failed`; undici's request() rejects with the
-    // error itself (measured on node v22.22.2 + undici 6.29.0: `name`,
-    // `code` and `message` of the undici class, no `cause`).
+    // every failure in `TypeError: fetch failed` -- a refusal it makes before
+    // sending (a hop-by-hop header, a content-length that disagrees with the
+    // body), a late or oversized response head, a refused connect, a failed
+    // lookup; undici's request() rejects with the error itself (measured on
+    // node v22.22.2 + undici 6.29.0: an undici class's `name`, `code` and
+    // `message`, a connect's `ECONNREFUSED` / `ENOTFOUND` error as given, no
+    // `cause` either way). A cause from the transport with undici's code is
+    // already the shim's class (holder.undiciError); a refusal the fetch
+    // path makes carries the class's name only, and gets the class here.
     const UNWRAPPED = {
       InvalidArgumentError: errors.InvalidArgumentError,
       NotSupportedError: errors.NotSupportedError,
@@ -378,11 +382,9 @@
     function requestError(err) {
       if (!(err instanceof TypeError) || err.message !== "fetch failed" || !err.cause) return err;
       const cause = err.cause;
-      // fetch's cause is already undici's class (holder.undiciError).
-      if (cause instanceof errors.HeadersTimeoutError) return cause;
-      if (cause instanceof errors.UndiciError) return err;
+      if (cause instanceof errors.UndiciError) return cause;
       const Class = UNWRAPPED[cause.name];
-      return Class ? new Class(cause.message) : err;
+      return Class ? new Class(cause.message) : cause;
     }
 
     // ---- request bodies ---------------------------------------------------
