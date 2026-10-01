@@ -11053,7 +11053,12 @@
     }
 
     const fs = {
-      promises,
+      // The exported object is the WRAPPED module, the very object
+      // require("fs/promises") returns (node: `fs.promises ===
+      // require("fs/promises")`), so `fs.promises.stat(bad)` rejects as
+      // node's does. The raw `promises` above, which throws a bad path
+      // synchronously, stays internal to the callback forms.
+      promises: registry.get("fs/promises"),
       constants: {
         F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
         O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,

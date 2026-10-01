@@ -155,5 +155,36 @@ await new Promise((resolve) =>
   }),
 );
 
+// fs.promises is the object require("fs/promises") returns, so a bad path
+// REJECTS: it used to be the unwrapped methods, which threw before any
+// promise existed, so `fs.promises.stat(bad).catch(...)` never attached.
+console.log("fs.promises === fs/promises:", fs.promises === fsp);
+for (const [name, args] of [
+  ["stat", [42n]],
+  ["readFile", [42n]],
+  ["access", [42n]],
+  ["unlink", [42n]],
+  ["mkdir", [42n]],
+  ["readdir", [42n]],
+  ["writeFile", [42n, "x"]],
+  ["appendFile", [42n, "x"]],
+  ["rename", [42n, "b"]],
+  ["copyFile", [42n, "b"]],
+  ["open", [42n]],
+  ["rm", [42n]],
+]) {
+  let settled;
+  try {
+    const p = fs.promises[name](...args);
+    settled = p.then(
+      () => `${name}: returned a promise, resolved`,
+      (err) => `${name}: returned a promise, rejected ${shape(err)}`,
+    );
+  } catch (err) {
+    settled = `${name}: threw synchronously ${shape(err)}`;
+  }
+  console.log(await settled);
+}
+
 process.chdir(os.tmpdir());
 fs.rmSync(root, { recursive: true, force: true });
