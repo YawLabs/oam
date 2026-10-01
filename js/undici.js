@@ -271,10 +271,14 @@
       // for the response head, `bodyTimeout` the gap between body bytes. The
       // request's own value wins, then the dispatcher's (the one passed, else
       // the global one -- `new Agent({ headersTimeout })`), then undici's
-      // default of 300 s; 0 disables. Validated as undici's Request does.
-      const dispatcherOptions = (opts.dispatcher || holder.current)?._options;
-      const headersTimeout = phaseTimeout("headersTimeout", opts, dispatcherOptions);
-      const bodyTimeout = phaseTimeout("bodyTimeout", opts, dispatcherOptions);
+      // default of 300 s; 0 disables. The dispatcher's values are checked
+      // first, as undici's Client checks them, then the request's, as its
+      // Request does.
+      const carrier = opts.dispatcher || holder.current;
+      const dispatcherHeadersTimeout = dispatcherTimeout("headersTimeout", carrier);
+      const dispatcherBodyTimeout = dispatcherTimeout("bodyTimeout", carrier);
+      const headersTimeout = phaseTimeout("headersTimeout", opts, dispatcherHeadersTimeout);
+      const bodyTimeout = phaseTimeout("bodyTimeout", opts, dispatcherBodyTimeout);
       // Both limits end the request the way an abort does, so the fetch runs
       // under a signal of the shim's own: aborting it with the timeout error
       // rejects a fetch still waiting for its head with that error, and after
@@ -398,16 +402,41 @@
     }
 
     // One of request()'s phase timeouts, in ms: the request's own, else the
-    // dispatcher's, else undici's 300 s. undici's check and message
+    // dispatcher's (already checked by dispatcherTimeout), else undici's
+    // 300 s. The request's own is checked as undici's Request checks it
     // (lib/core/request.js): anything but a finite number >= 0 is refused.
-    function phaseTimeout(name, opts, dispatcherOptions) {
-      let value = opts[name];
-      if (value == null && dispatcherOptions) value = dispatcherOptions[name];
-      if (value == null) return 300e3;
+    function phaseTimeout(name, opts, fromDispatcher) {
+      const value = opts[name];
+      if (value == null) return fromDispatcher == null ? 300e3 : fromDispatcher;
       if (!Number.isFinite(value) || value < 0) {
         throw new errors.InvalidArgumentError("invalid " + name);
       }
       return value;
+    }
+
+    // undici's Client check of its own headersTimeout / bodyTimeout
+    // (lib/dispatcher/client.js), stricter than the request's: an integer
+    // >= 0, with its own message.
+    function checkClientTimeout(name, value) {
+      if (value != null && (!Number.isInteger(value) || value < 0)) {
+        throw new errors.InvalidArgumentError(name + " must be a positive integer or zero");
+      }
+    }
+
+    // A dispatcher's own headersTimeout / bodyTimeout, or null. A Client
+    // checked it when it was built. An Agent, Pool, BalancedPool, ProxyAgent
+    // or EnvHttpProxyAgent builds its Clients when a request needs one, so
+    // undici refuses a bad value there, on the request; and those pass their
+    // options through JSON first (util.deepClone), so NaN or an Infinity
+    // reaches the Client as null -- the default -- rather than an error.
+    function dispatcherTimeout(name, dispatcher) {
+      if (!dispatcher || !dispatcher._options) return null;
+      let value = dispatcher._options[name];
+      if (!(dispatcher instanceof Client) || dispatcher instanceof Pool) {
+        if (typeof value === "number" && !Number.isFinite(value)) value = null;
+      }
+      checkClientTimeout(name, value);
+      return value == null ? null : value;
     }
 
     // undici.stream(url, opts, factory): pipe the response into the writable
@@ -924,6 +953,13 @@
     // Origin-bound dispatchers: resolve opts.path against the origin.
     class Client extends Dispatcher {
       constructor(origin, options) {
+        // undici's Client refuses a bad headersTimeout / bodyTimeout when it
+        // is built; a Pool (a Client here, a pool of them in undici) builds
+        // its Clients on demand, so its values are checked per request.
+        if (!(new.target === Pool || new.target.prototype instanceof Pool)) {
+          checkClientTimeout("headersTimeout", options && options.headersTimeout);
+          checkClientTimeout("bodyTimeout", options && options.bodyTimeout);
+        }
         super(options);
         this.origin = typeof origin === "string" ? origin : (origin && origin.toString()) || "";
       }

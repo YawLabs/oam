@@ -1547,8 +1547,13 @@ rejects the request with `HeadersTimeoutError` (`UND_ERR_HEADERS_TIMEOUT`), and 
 goes `bodyTimeout` without a byte is destroyed with `BodyTimeoutError`
 (`UND_ERR_BODY_TIMEOUT`), each chunk re-arming it. The request's own value wins, then the
 dispatcher's (`new Agent|Pool|Client({ headersTimeout, bodyTimeout })`, the global
-dispatcher included), then undici's default of 300 s; `0` disables; anything but a finite
-number `>= 0` is `InvalidArgumentError` `invalid headersTimeout` / `invalid bodyTimeout`.
+dispatcher included), then undici's default of 300 s; `0` disables. On the request,
+anything but a finite number `>= 0` is `InvalidArgumentError` `invalid headersTimeout` /
+`invalid bodyTimeout`; a dispatcher's own value is checked first, as undici's `Client`
+checks it -- an integer `>= 0`, else `headersTimeout must be a positive integer or zero` --
+by a `Client` when it is built and by the others on the request (where NaN or an
+Infinity, which undici's `Agent` and `Pool` lose in a JSON copy of their options, is the
+default).
 Pinned against Node + undici 6.29.0 by `undici_request_honours_headers_and_body_timeouts`
 (e2e). Up to 0.17.1 both options were accepted and ignored. What differs:
 

@@ -4892,7 +4892,9 @@ fn undici_shim_request_stream_fetch_over_http() {
 /// with `BodyTimeoutError` (`UND_ERR_BODY_TIMEOUT`) -- re-armed by every
 /// chunk, so a slow but steady body is not cut. The request's own value wins
 /// over the dispatcher's (`new Agent({ headersTimeout })`, the global one
-/// included), 0 disables, and a bad value is undici's `InvalidArgumentError`.
+/// included), 0 disables, and a bad value is undici's `InvalidArgumentError`:
+/// the request's under its Request rule, the dispatcher's under its Client
+/// rule (at construction for a Client, on the request for the others).
 /// Up to 0.17.1 both options were accepted and ignored, so only the caller's
 /// total signal bounded a stalled request. The expected output is node
 /// v22.22.2 + undici 6.29.0's, line for line.
@@ -4901,7 +4903,7 @@ fn undici_request_honours_headers_and_body_timeouts() {
     let script = write_temp(
         "undici_phase_timeouts/main.mjs",
         r##"import net from 'node:net';
-import { request, stream, Agent, Client, errors, setGlobalDispatcher, getGlobalDispatcher } from 'undici';
+import { request, stream, Agent, Client, Pool, ProxyAgent, errors, setGlobalDispatcher, getGlobalDispatcher } from 'undici';
 import { Writable } from 'node:stream';
 
 // Three raw servers: one that never answers, one that sends a head and one
@@ -4964,6 +4966,19 @@ for (const bad of [-1, 'x', NaN, Infinity]) {
   await attempt('invalid bodyTimeout ' + String(bad), () => request(nu, { bodyTimeout: bad, signal: total() }));
 }
 await attempt('fractional', () => request(nu, { headersTimeout: 400.5, bodyTimeout: 1.5, signal: total() }));
+// A dispatcher's own values are checked as undici's Client checks them -- an
+// integer >= 0 -- before the request's: a Client when it is built, the
+// others (which build their Clients on demand) on the request. An Agent's or
+// Pool's options go through JSON first, so NaN there is the default.
+const built = (label, make) => { try { make(); console.log(label, 'built'); } catch (e) { console.log(label, e.name, e.code, e.message); } };
+for (const bad of [-1, 1.5, '5', NaN]) {
+  built('client headersTimeout ' + String(bad), () => new Client(nu, { headersTimeout: bad }));
+  built('client bodyTimeout ' + String(bad), () => new Client(nu, { bodyTimeout: bad }));
+  built('pool headersTimeout ' + String(bad), () => new Pool(nu, { headersTimeout: bad }));
+  await attempt('agent headersTimeout ' + String(bad), () => request(nu, { dispatcher: new Agent({ headersTimeout: bad }), headersTimeout: 400, signal: total() }));
+  await attempt('pool bodyTimeout ' + String(bad), () => new Pool(nu, { bodyTimeout: bad }).request({ path: '/', method: 'GET', headersTimeout: 400, signal: total() }));
+}
+await attempt('proxy-agent bodyTimeout 1.5', () => request(nu, { dispatcher: new ProxyAgent({ uri: 'http://127.0.0.1:1', bodyTimeout: 1.5 }), signal: total() }));
 process.exit(0);
 "##,
     );
@@ -4992,7 +5007,28 @@ invalid headersTimeout NaN InvalidArgumentError UND_ERR_INVALID_ARG invalid head
 invalid bodyTimeout NaN InvalidArgumentError UND_ERR_INVALID_ARG invalid bodyTimeout true early=true
 invalid headersTimeout Infinity InvalidArgumentError UND_ERR_INVALID_ARG invalid headersTimeout true early=true
 invalid bodyTimeout Infinity InvalidArgumentError UND_ERR_INVALID_ARG invalid bodyTimeout true early=true
-fractional HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true";
+fractional HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+client headersTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero
+client bodyTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero
+pool headersTimeout -1 built
+agent headersTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero true early=true
+pool bodyTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero true early=true
+client headersTimeout 1.5 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero
+client bodyTimeout 1.5 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero
+pool headersTimeout 1.5 built
+agent headersTimeout 1.5 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero true early=true
+pool bodyTimeout 1.5 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero true early=true
+client headersTimeout 5 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero
+client bodyTimeout 5 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero
+pool headersTimeout 5 built
+agent headersTimeout 5 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero true early=true
+pool bodyTimeout 5 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero true early=true
+client headersTimeout NaN InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero
+client bodyTimeout NaN InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero
+pool headersTimeout NaN built
+agent headersTimeout NaN HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+pool bodyTimeout NaN HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+proxy-agent bodyTimeout 1.5 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero true early=true";
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
