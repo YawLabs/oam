@@ -4966,7 +4966,13 @@ fn arg_max_output(
 /// `maxOutputLength` is a plain error carrying that sentinel message alone
 /// (see `oam_core::zlib::OUTPUT_TOO_LARGE`); the shim turns it into node's
 /// `RangeError [ERR_BUFFER_TOO_LARGE]` with the caller's number in it.
+///
+/// A decode failure is node's coded zlib error (#166): see `throw_zlib_coded`.
 fn throw_zlib_error(scope: &mut v8::PinScope<'_, '_>, e: &std::io::Error) {
+    if let Some(coded) = oam_core::zlib::zlib_error(e) {
+        throw_zlib_coded(scope, &coded);
+        return;
+    }
     let text = e.to_string();
     let message = if text == oam_core::zlib::OUTPUT_TOO_LARGE {
         text
@@ -4975,6 +4981,23 @@ fn throw_zlib_error(scope: &mut v8::PinScope<'_, '_>, e: &std::io::Error) {
     };
     let message = v8::String::new(scope, &message).unwrap();
     let exception = v8::Exception::error(scope, message);
+    scope.throw_exception(exception);
+}
+
+/// Throw node's zlib error: a plain `Error` with zlib's message and own
+/// `errno` then `code` (lib/zlib.js `zlibOnError`), the shape the async forms
+/// reject with too.
+fn throw_zlib_coded(scope: &mut v8::PinScope<'_, '_>, coded: &oam_core::zlib::ZlibError) {
+    let message = v8::String::new(scope, coded.message).unwrap();
+    let exception = v8::Exception::error(scope, message);
+    if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+        let errno_key = v8::String::new(scope, "errno").unwrap();
+        let errno = v8::Integer::new(scope, coded.errno);
+        obj.create_data_property(scope, errno_key.into(), errno.into());
+        let code_key = v8::String::new(scope, "code").unwrap();
+        let code = v8::String::new(scope, coded.code).unwrap();
+        obj.create_data_property(scope, code_key.into(), code.into());
+    }
     scope.throw_exception(exception);
 }
 
@@ -5221,7 +5244,11 @@ fn op_zlib_handle_write_sync(
             rv.set(arr.into());
         }
         Err(e) => {
-            let message = v8::String::new(scope, &e).unwrap();
+            if let Some(coded) = oam_core::zlib::zlib_error(&e) {
+                throw_zlib_coded(scope, &coded);
+                return;
+            }
+            let message = v8::String::new(scope, &e.to_string()).unwrap();
             let exception = v8::Exception::error(scope, message);
             scope.throw_exception(exception);
         }

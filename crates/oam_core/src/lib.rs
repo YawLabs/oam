@@ -30,6 +30,8 @@ pub mod http_client;
 pub mod http_conn;
 pub mod http_head;
 pub mod http_server;
+/// zlib-faithful inflate shared by fetch's body decoder and node:zlib (#166).
+mod inflate;
 pub mod inspector;
 /// The outbound TCP connector net.connect and tls.connect share: node's
 /// lookupAndConnectMultiple algorithm and its error shapes.
@@ -639,8 +641,10 @@ pub fn adopt_inherited_fd(registry: &SyncFileRegistry, fd: u64) -> bool {
 /// zlibStreamWrite and _flush to zlibStreamFlush.
 ///
 /// Variants:
-/// - Compress/Decompress: flate2 gzip/deflate/deflateRaw, truly incremental.
+/// - Compress/Decompress: gzip/deflate/deflateRaw (flate2 encoders,
+///   NodeInflate decoders), truly incremental.
 /// - BrotliCompress/BrotliDecompress: pure-Rust brotli via the `brotli` crate.
+/// - HandleCompress/HandleDecompress: node's low-level zlib handle.
 pub enum ZlibStream {
     Compress(zlib::StreamCompressor),
     Decompress(zlib::StreamDecompressor),
@@ -651,7 +655,7 @@ pub enum ZlibStream {
     BrotliCompress(Box<BrotliCompressor>),
     BrotliDecompress(Box<BrotliDecompressor>),
     HandleCompress(flate2::Compress),
-    HandleDecompress(flate2::Decompress),
+    HandleDecompress(Box<zlib::NodeInflate>),
 }
 
 pub type ZlibRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, ZlibStream>>>;
@@ -2173,9 +2177,10 @@ pub fn strip_unc_prefix(path: &std::path::Path) -> String {
     s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
 }
 
-/// node:zlib backend (flate2 + brotli). Sync fns serve the *Sync natives
-/// directly; the async ops below wrap them in spawn_blocking -- compression
-/// is CPU work and must not sit on the isolate thread for the callback forms.
+/// node:zlib backend (flate2 encoders, [`inflate::NodeInflate`] decoders,
+/// brotli). Sync fns serve the *Sync natives directly; the async ops below
+/// wrap them in spawn_blocking -- compression is CPU work and must not sit on
+/// the isolate thread for the callback forms.
 ///
 /// Incremental streaming (StreamCompressor / StreamDecompressor /
 /// BrotliCompressor / BrotliDecompressor) backs the JS Transform classes.
@@ -2183,8 +2188,9 @@ pub fn strip_unc_prefix(path: &std::path::Path) -> String {
 /// _transform feeds chunks via zlibStreamWrite and _flush finalizes via
 /// zlibStreamFlush.
 pub mod zlib {
+    pub use crate::inflate::{NodeInflate, Wrap, ZlibError};
     use flate2::Compression;
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Format {
@@ -2245,95 +2251,64 @@ pub mod zlib {
     /// while inflating, not on the finished buffer: a 200 KB gzip of 200 MiB
     /// of spaces must fail after ~`max_output` bytes of work, not after the
     /// whole 200 MiB has been allocated -- that allocation is the OOM the
-    /// option exists to prevent. Reads are bounded by what the cap still
-    /// allows, plus one byte so overflow is seen without a second pass.
+    /// option exists to prevent.
+    ///
+    /// A decode failure is an `io::Error` wrapping a [`ZlibError`] (see
+    /// [`zlib_error`]): node's code, errno and message for it.
     pub fn decompress_capped(
         bytes: &[u8],
         format: Format,
         max_output: Option<usize>,
     ) -> std::io::Result<Vec<u8>> {
-        let mut reader: Box<dyn Read + '_> = match format {
-            Format::Gzip => Box::new(flate2::read::GzDecoder::new(bytes)),
-            Format::Deflate => Box::new(flate2::read::ZlibDecoder::new(bytes)),
-            Format::DeflateRaw => Box::new(flate2::read::DeflateDecoder::new(bytes)),
+        let wrap = match format {
+            Format::Gzip => Wrap::Gzip,
+            Format::Deflate => Wrap::Zlib,
+            Format::DeflateRaw => Wrap::Raw,
         };
-        match max_output {
-            None => {
-                let mut out = Vec::new();
-                reader.read_to_end(&mut out)?;
-                Ok(out)
-            }
-            Some(cap) => read_capped(&mut reader, cap),
-        }
+        inflate_all(bytes, wrap, max_output)
     }
 
-    /// Read `reader` to its end, giving up with [`OUTPUT_TOO_LARGE`] the moment
-    /// the output would pass `cap`. It never buffers more than `cap` (plus one
-    /// byte, and a read buffer capped at 64 KiB), so a reader that inflates
-    /// without bound -- a decompression bomb -- is stopped at the cap, not run
-    /// to exhaustion. Split out from `decompress_capped` so the bound can be
-    /// tested against an endless reader, which a `read_to_end` regression would
-    /// run forever.
-    fn read_capped(reader: &mut dyn Read, cap: usize) -> std::io::Result<Vec<u8>> {
+    /// Inflate the whole of `bytes` with node's one-shot finishing flush
+    /// (Z_FINISH): input that ends inside the stream is Z_BUF_ERROR
+    /// "unexpected end of file", and what follows a complete stream is
+    /// dropped (for gzip: unless it is another member). Output is produced
+    /// [`inflate::STEP_OUT`] at a time, so memory stays within `max_output`
+    /// plus one step whatever the input inflates to.
+    fn inflate_all(
+        bytes: &[u8],
+        wrap: Wrap,
+        max_output: Option<usize>,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut dec = NodeInflate::new(wrap);
         let mut out = Vec::new();
-        // Never hand the decoder more room than the cap plus one byte, so
-        // memory stays bounded by `cap` whatever the input inflates to.
-        let mut buf = vec![0u8; (cap + 1).min(64 * 1024)];
+        let mut buf = vec![0u8; crate::inflate::STEP_OUT];
+        let mut input = bytes;
         loop {
-            let want = (cap + 1 - out.len()).min(buf.len());
-            let n = reader.read(&mut buf[..want])?;
-            if n == 0 {
-                return Ok(out);
+            let (used, produced) = dec.step(input, &mut buf).map_err(std::io::Error::other)?;
+            input = &input[used..];
+            if used == 0 && produced == 0 {
+                break;
             }
-            out.extend_from_slice(&buf[..n]);
-            if out.len() > cap {
+            if max_output.is_some_and(|cap| out.len() + produced > cap) {
                 return Err(std::io::Error::other(OUTPUT_TOO_LARGE));
             }
+            out.extend_from_slice(&buf[..produced]);
         }
+        dec.finish().map_err(std::io::Error::other)?;
+        Ok(out)
     }
 
-    // Kept next to `read_capped` (the code it guards) rather than at the module
+    /// The node:zlib failure an inflate `io::Error` carries, if it is one.
+    pub fn zlib_error(error: &std::io::Error) -> Option<ZlibError> {
+        error.get_ref()?.downcast_ref::<ZlibError>().copied()
+    }
+
+    // Kept next to `inflate_all` (the code it guards) rather than at the module
     // end past the streaming and brotli code.
     #[cfg(test)]
     #[allow(clippy::items_after_test_module)]
     mod capped_tests {
-        use super::{Format, OUTPUT_TOO_LARGE, compress, decompress_capped, read_capped};
-        use std::io::Read;
-
-        /// A reader that never returns 0: `read_to_end` would allocate without
-        /// bound and never return. It counts the bytes it was asked for.
-        struct Endless {
-            byte: u8,
-            pulled: usize,
-        }
-        impl Read for Endless {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                buf.fill(self.byte);
-                self.pulled += buf.len();
-                Ok(buf.len())
-            }
-        }
-
-        #[test]
-        fn read_capped_bounds_an_endless_stream() {
-            let cap = 4096;
-            let mut src = Endless {
-                byte: b' ',
-                pulled: 0,
-            };
-            // The whole point of the fix: an endless (bomb) stream is stopped
-            // at the cap, not inflated to exhaustion. A `read_to_end` regression
-            // would never return here.
-            let err = read_capped(&mut src, cap).unwrap_err();
-            assert_eq!(err.to_string(), OUTPUT_TOO_LARGE);
-            // Memory (and reads) bounded by the cap plus one buffer, not the
-            // unbounded stream.
-            assert!(
-                src.pulled <= cap + 1 + 64 * 1024,
-                "pulled {} bytes past the {cap}-byte cap",
-                src.pulled
-            );
-        }
+        use super::{Format, OUTPUT_TOO_LARGE, compress, decompress_capped, unzip, zlib_error};
 
         #[test]
         fn decompress_capped_stops_a_gzip_bomb_at_the_cap() {
@@ -2346,6 +2321,29 @@ pub mod zlib {
             assert_eq!(err.to_string(), OUTPUT_TOO_LARGE);
             assert!(decompress_capped(&bomb, Format::Gzip, Some(size)).is_ok());
             assert!(decompress_capped(&bomb, Format::Gzip, Some(size - 1)).is_err());
+        }
+
+        #[test]
+        fn one_shot_inflate_reads_every_gzip_member_and_codes_its_errors() {
+            // #166: flate2's read::GzDecoder stopped after the first member,
+            // and every failure was an uncoded io::Error.
+            let mut two = compress(b"hello", Format::Gzip, 6).unwrap();
+            two.extend(compress(b"world", Format::Gzip, 6).unwrap());
+            assert_eq!(
+                decompress_capped(&two, Format::Gzip, None).unwrap(),
+                b"helloworld"
+            );
+            assert_eq!(unzip(&two).unwrap(), b"helloworld");
+            let err = decompress_capped(b"not gzip at all", Format::Gzip, None).unwrap_err();
+            let coded = zlib_error(&err).expect("a coded zlib error");
+            assert_eq!(
+                (coded.code, coded.errno, coded.message),
+                ("Z_DATA_ERROR", -3, "incorrect header check")
+            );
+            let packed = compress(b"hello world hello world", Format::Deflate, 6).unwrap();
+            let err = decompress_capped(&packed[..8], Format::Deflate, None).unwrap_err();
+            let coded = zlib_error(&err).expect("a coded zlib error");
+            assert_eq!((coded.code, coded.errno), ("Z_BUF_ERROR", -5));
         }
     }
 
@@ -2372,11 +2370,7 @@ pub mod zlib {
 
     /// `unzip` with node's `maxOutputLength`; see `decompress_capped`.
     pub fn unzip_capped(bytes: &[u8], max_output: Option<usize>) -> std::io::Result<Vec<u8>> {
-        if bytes.starts_with(&[0x1f, 0x8b]) {
-            decompress_capped(bytes, Format::Gzip, max_output)
-        } else {
-            decompress_capped(bytes, Format::Deflate, max_output)
-        }
+        inflate_all(bytes, Wrap::Auto, max_output)
     }
 
     // ----------------------------------------------------------------
@@ -2388,19 +2382,16 @@ pub mod zlib {
     // incremental: compressed bytes are emitted per-chunk with no need
     // to buffer the full input.
     //
-    // For decompression we likewise use the write-based decoders
-    // (GzDecoder, ZlibDecoder, DeflateDecoder). Each decoder accepts
-    // a chunk, runs it through the inflate state machine, and appends
-    // decompressed bytes to the inner Vec<u8>. We drain via mem::take
-    // after each write so memory stays bounded (~64 kB per stream plus
-    // the decompressed output for that chunk).
+    // Decompression is NodeInflate (crate::inflate): each chunk runs through
+    // the inflate state machine and comes back as that chunk's output, with
+    // ~50 KB of state per stream (the 32 KiB window, one 16 KiB step and
+    // miniz's decoder).
     //
     // The "unzip" auto-detect variant resolves the format from the first
-    // two bytes of the STREAM, however the writes carve it up, then creates
-    // the appropriate decoder.
+    // two bytes of the STREAM, however the writes carve it up.
     //
-    // Send requirement: all flate2 encoder/decoder types are Send, and
-    // our wrappers hold no thread-local state.
+    // Send requirement: all flate2 encoder types and NodeInflate are Send,
+    // and our wrappers hold no thread-local state.
     // ----------------------------------------------------------------
 
     /// Wraps any of the three flate2 write-encoders behind a uniform
@@ -2481,152 +2472,77 @@ pub mod zlib {
     // ----------------------------------------------------------------
     // Truly incremental decompressor -- slice A.
     //
-    // Uses flate2's write-based decoders (GzDecoder, ZlibDecoder,
-    // DeflateDecoder) so each write_chunk call invokes the inflate state
-    // machine immediately and returns whatever bytes were decoded, bounded
-    // by the chunk size. The full compressed stream never needs to live
-    // in memory simultaneously.
+    // Each write_chunk call runs the inflate state machine (NodeInflate)
+    // over the chunk at once and returns whatever bytes it decoded. The full
+    // compressed stream never needs to live in memory simultaneously.
     //
-    // The `Unzip` variant defers decoder creation until two bytes of the
-    // stream have arrived (or it ends), at which point the gzip magic chooses
-    // Gzip or Deflate.
+    // Unzip decides gzip or zlib on the stream's first two bytes however the
+    // writes split them (#195): NodeInflate reads them as one header, as
+    // zlib's inflate does (NEEDBITS(16)).
     // ----------------------------------------------------------------
 
-    /// Truly incremental flate2 decompressor: memory usage bounded by
-    /// ~64 kB scratch per stream regardless of input size.
+    /// Truly incremental decompressor: ~50 KB of state per stream regardless
+    /// of input size. Errors are node's (an `io::Error` wrapping a
+    /// [`ZlibError`]); see [`NodeInflate`] for what each format accepts.
     pub struct StreamDecompressor {
-        inner: DecompressorInner,
-    }
-
-    enum DecompressorInner {
-        Gzip(flate2::write::GzDecoder<Vec<u8>>),
-        Deflate(flate2::write::ZlibDecoder<Vec<u8>>),
-        DeflateRaw(flate2::write::DeflateDecoder<Vec<u8>>),
-        /// Pending auto-detect: the first two bytes of the stream resolve it
-        /// to Gzip or Deflate. Holds the first byte when a write delivered
-        /// only that one.
-        Unzip(Option<u8>),
+        inner: Box<NodeInflate>,
     }
 
     impl StreamDecompressor {
-        pub fn new_gzip() -> Self {
+        fn with(wrap: Wrap) -> Self {
             Self {
-                inner: DecompressorInner::Gzip(flate2::write::GzDecoder::new(Vec::new())),
+                inner: Box::new(NodeInflate::new(wrap)),
             }
+        }
+        pub fn new_gzip() -> Self {
+            Self::with(Wrap::Gzip)
         }
         pub fn new_deflate() -> Self {
-            Self {
-                inner: DecompressorInner::Deflate(flate2::write::ZlibDecoder::new(Vec::new())),
-            }
+            Self::with(Wrap::Zlib)
         }
         pub fn new_deflate_raw() -> Self {
-            Self {
-                inner: DecompressorInner::DeflateRaw(
-                    flate2::write::DeflateDecoder::new(Vec::new()),
-                ),
-            }
+            Self::with(Wrap::Raw)
         }
         pub fn new_unzip() -> Self {
-            Self {
-                inner: DecompressorInner::Unzip(None),
-            }
+            Self::with(Wrap::Auto)
         }
 
         /// Feed one chunk of compressed data. Returns the decompressed bytes
-        /// produced by this chunk (may be smaller than expected if the
-        /// deflate block spans multiple chunks -- the remaining bytes arrive
-        /// on subsequent calls). Memory usage stays bounded: we drain the
-        /// inner Vec via mem::take after each write.
+        /// it made decodable (a deflate block that spans chunks finishes
+        /// arriving on later calls). Input after the end of the stream is
+        /// dropped, as node drops it; for gzip, a following member is
+        /// decoded as part of the same stream.
         #[inline]
         pub fn write_chunk(&mut self, chunk: &[u8]) -> std::io::Result<Vec<u8>> {
-            if chunk.is_empty() {
-                return Ok(Vec::new());
-            }
-            // Resolve auto-detect once two bytes of the stream are in hand.
-            //
-            // The decision is about the STREAM's first two bytes, not the
-            // first write's: a gzip body can arrive `1f`, `8b`, `08`, ... one
-            // byte per write (servers do flush that way), and a one-byte
-            // write can never start with both magic bytes, so deciding on the
-            // first write alone read every such stream as zlib and failed it.
-            // Node's Unzip waits for the second byte too (zlib's inflate
-            // needs 16 bits before its header check). One byte is all that is
-            // ever held.
-            let mut held: Option<[u8; 1]> = None;
-            if let DecompressorInner::Unzip(pending) = &mut self.inner {
-                let (first, second) = match (*pending, chunk) {
-                    (Some(first), [second, ..]) => (first, *second),
-                    (None, [first, second, ..]) => (*first, *second),
-                    (None, [only]) => {
-                        *pending = Some(*only);
-                        return Ok(Vec::new());
-                    }
-                    // An empty chunk returned above.
-                    (_, []) => unreachable!("empty chunk handled above"),
-                };
-                held = pending.map(|byte| [byte]);
-                self.inner = Self::unzip_decoder(first == 0x1f && second == 0x8b);
-            }
-            // The held first byte goes in ahead of the chunk that decided.
-            let held: &[u8] = held.as_ref().map_or(&[], |byte| byte.as_slice());
-            match &mut self.inner {
-                DecompressorInner::Gzip(dec) => {
-                    dec.write_all(held)?;
-                    dec.write_all(chunk)?;
-                    Ok(std::mem::take(dec.get_mut()))
+            let mut out = Vec::new();
+            let mut buf = vec![0u8; crate::inflate::STEP_OUT];
+            let mut input = chunk;
+            loop {
+                let (used, produced) = self
+                    .inner
+                    .step(input, &mut buf)
+                    .map_err(std::io::Error::other)?;
+                input = &input[used..];
+                if used == 0 && produced == 0 {
+                    return Ok(out);
                 }
-                DecompressorInner::Deflate(dec) => {
-                    dec.write_all(held)?;
-                    dec.write_all(chunk)?;
-                    Ok(std::mem::take(dec.get_mut()))
-                }
-                DecompressorInner::DeflateRaw(dec) => {
-                    dec.write_all(chunk)?;
-                    Ok(std::mem::take(dec.get_mut()))
-                }
-                DecompressorInner::Unzip(_) => unreachable!("resolved above"),
+                out.extend_from_slice(&buf[..produced]);
             }
         }
 
-        /// The decoder an `Unzip` stream resolves to.
-        fn unzip_decoder(gzip_magic: bool) -> DecompressorInner {
-            if gzip_magic {
-                DecompressorInner::Gzip(flate2::write::GzDecoder::new(Vec::new()))
-            } else {
-                DecompressorInner::Deflate(flate2::write::ZlibDecoder::new(Vec::new()))
-            }
-        }
-
-        /// Finalize: flush the inflate state and return any remaining
-        /// decompressed bytes. For gzip this verifies the CRC/ISIZE trailer.
+        /// Finalize (node's Z_FINISH at `end()`): every write's output was
+        /// already returned, so this only checks that the stream is complete
+        /// -- input that ended inside it is Z_BUF_ERROR "unexpected end of
+        /// file", an empty stream included.
         pub fn finish(self) -> std::io::Result<Vec<u8>> {
-            match self.inner {
-                DecompressorInner::Gzip(dec) => dec.finish(),
-                DecompressorInner::Deflate(dec) => dec.finish(),
-                DecompressorInner::DeflateRaw(dec) => dec.finish(),
-                // No data was ever written (empty stream).
-                DecompressorInner::Unzip(None) => Ok(Vec::new()),
-                // The stream ended one byte in. That is a truncated stream in
-                // either format, and it has to fail as one rather than end
-                // cleanly with the byte dropped: hand it to the decoder its
-                // one byte can still select (a lone `1f` could only have been
-                // gzip) and let that report the missing rest.
-                DecompressorInner::Unzip(Some(byte)) => {
-                    let mut decoder = Self {
-                        inner: Self::unzip_decoder(byte == 0x1f),
-                    };
-                    // Already resolved, so this goes straight to the decoder.
-                    decoder.write_chunk(&[byte])?;
-                    decoder.finish()
-                }
-            }
+            self.inner.finish().map_err(std::io::Error::other)?;
+            Ok(Vec::new())
         }
     }
 
-    // `StreamDecompressor` is `Send` by auto-derivation: `DecompressorInner`
-    // holds only flate2 write-decoders over `Vec<u8>` (all `Send`) plus the
-    // `Unzip` variant's one held byte. No manual `unsafe impl` -- see the note on
-    // `StreamCompressor` above.
+    // `StreamDecompressor` is `Send` by auto-derivation: `NodeInflate` holds
+    // only owned buffers and miniz/flate2 state, all `Send`. No manual
+    // `unsafe impl` -- see the note on `StreamCompressor` above.
 
     // Compile-time proof of both notes. A manual `unsafe impl Send` asserts
     // `Send` forever; this instead FAILS THE BUILD the day an inner type stops
@@ -2683,8 +2599,15 @@ pub mod zlib {
         }
 
         #[test]
-        fn unzip_with_no_input_ends_empty() {
-            assert_eq!(unzip_in_chunks(&[], 1).unwrap(), Vec::<u8>::new());
+        fn unzip_with_no_input_is_unexpected_end_of_file() {
+            // Node (v22.22.2): createUnzip().end() with no data, or only empty
+            // writes, errors Z_BUF_ERROR "unexpected end of file" -- as every
+            // inflate stream does.
+            let err = unzip_in_chunks(&[], 1).unwrap_err();
+            assert_eq!(
+                super::zlib_error(&err),
+                Some(super::ZlibError::UNEXPECTED_EOF)
+            );
         }
 
         #[test]
@@ -4089,30 +4012,35 @@ pub mod ops {
         let result = tokio::task::spawn_blocking(move || {
             let mut guard = streams.lock().unwrap_or_else(|e| e.into_inner());
             let Some(stream) = guard.get_mut(&handle) else {
-                return Err(format!("zlib stream: handle {handle} not found"));
+                return Err(Box::new(OpOutcome::Failed(format!(
+                    "zlib stream: handle {handle} not found"
+                ))));
             };
+            let failed = |context: &str, e| Box::new(OpOutcome::Failed(format!("{context}: {e}")));
             match stream {
                 super::ZlibStream::Compress(enc) => enc
                     .write_chunk(&chunk)
-                    .map_err(|e| format!("zlib stream write: {e}")),
+                    .map_err(|e| failed("zlib stream write", e)),
                 super::ZlibStream::Decompress(dec) => dec
                     .write_chunk(&chunk)
-                    .map_err(|e| format!("zlib stream write: {e}")),
+                    .map_err(|e| Box::new(zlib_decode_failed("zlib stream write", e))),
                 super::ZlibStream::BrotliCompress(enc) => enc
                     .write_chunk(&chunk)
-                    .map_err(|e| format!("brotli stream write: {e}")),
+                    .map_err(|e| failed("brotli stream write", e)),
                 super::ZlibStream::BrotliDecompress(dec) => dec
                     .write_chunk(&chunk)
-                    .map_err(|e| format!("brotli stream write: {e}")),
+                    .map_err(|e| failed("brotli stream write", e)),
                 super::ZlibStream::HandleCompress(_) | super::ZlibStream::HandleDecompress(_) => {
-                    Err("zlib handle: use zlibHandleWriteSync, not zlibStreamWrite".into())
+                    Err(Box::new(OpOutcome::Failed(
+                        "zlib handle: use zlibHandleWriteSync, not zlibStreamWrite".into(),
+                    )))
                 }
             }
         })
         .await;
         match result {
             Ok(Ok(bytes)) => OpOutcome::Bytes(bytes),
-            Ok(Err(msg)) => OpOutcome::Failed(msg),
+            Ok(Err(failure)) => *failure,
             Err(e) => OpOutcome::Failed(format!("zlib stream write task: {e}")),
         }
     }
@@ -4128,31 +4056,54 @@ pub mod ops {
                 .expect("zlib stream registry lock")
                 .remove(&handle);
             let Some(stream) = stream else {
-                return Err(format!("zlib stream: handle {handle} not found"));
+                return Err(Box::new(OpOutcome::Failed(format!(
+                    "zlib stream: handle {handle} not found"
+                ))));
             };
+            let failed = |context: &str, e| Box::new(OpOutcome::Failed(format!("{context}: {e}")));
             match stream {
                 super::ZlibStream::Compress(enc) => {
-                    enc.finish().map_err(|e| format!("zlib stream flush: {e}"))
+                    enc.finish().map_err(|e| failed("zlib stream flush", e))
                 }
-                super::ZlibStream::Decompress(dec) => {
-                    dec.finish().map_err(|e| format!("zlib stream flush: {e}"))
+                super::ZlibStream::Decompress(dec) => dec
+                    .finish()
+                    .map_err(|e| Box::new(zlib_decode_failed("zlib stream flush", e))),
+                super::ZlibStream::BrotliCompress(enc) => {
+                    enc.finish().map_err(|e| failed("brotli stream flush", e))
                 }
-                super::ZlibStream::BrotliCompress(enc) => enc
-                    .finish()
-                    .map_err(|e| format!("brotli stream flush: {e}")),
-                super::ZlibStream::BrotliDecompress(dec) => dec
-                    .finish()
-                    .map_err(|e| format!("brotli stream flush: {e}")),
+                super::ZlibStream::BrotliDecompress(dec) => {
+                    dec.finish().map_err(|e| failed("brotli stream flush", e))
+                }
                 super::ZlibStream::HandleCompress(_) | super::ZlibStream::HandleDecompress(_) => {
-                    Err("zlib handle: use close(), not zlibStreamFlush".into())
+                    Err(Box::new(OpOutcome::Failed(
+                        "zlib handle: use close(), not zlibStreamFlush".into(),
+                    )))
                 }
             }
         })
         .await;
         match result {
             Ok(Ok(bytes)) => OpOutcome::Bytes(bytes),
-            Ok(Err(msg)) => OpOutcome::Failed(msg),
+            Ok(Err(failure)) => *failure,
             Err(e) => OpOutcome::Failed(format!("zlib stream flush task: {e}")),
+        }
+    }
+
+    /// A decompressor's failure: node's coded zlib error (`code`, `errno`,
+    /// zlib's message) when it is one (#166), else an uncoded failure.
+    fn zlib_decode_failed(context: &str, error: std::io::Error) -> OpOutcome {
+        match super::zlib::zlib_error(&error) {
+            Some(z) => OpOutcome::NodeFailed {
+                code: z.code.into(),
+                message: z.message.into(),
+                syscall: None,
+                path: None,
+                errno: Some(z.errno),
+                hostname: None,
+                address: None,
+                port: None,
+            },
+            None => OpOutcome::Failed(format!("{context}: {error}")),
         }
     }
 
@@ -4166,7 +4117,7 @@ pub mod ops {
             .remove(&handle);
     }
 
-    /// zlibHandleCreate: allocate a low-level flate2 Compress or Decompress
+    /// zlibHandleCreate: allocate a low-level flate2 Compress or NodeInflate
     /// handle for Node's zlib binding interface (used by ssh2 etc.).
     /// mode: 1=DEFLATE, 2=INFLATE, 5=DEFLATERAW, 6=INFLATERAW.
     pub fn zlib_handle_create(
@@ -4185,7 +4136,12 @@ pub mod ops {
                 };
                 super::ZlibStream::HandleCompress(flate2::Compress::new(lvl, zlib_header))
             }
-            2 | 6 => super::ZlibStream::HandleDecompress(flate2::Decompress::new(zlib_header)),
+            2 => super::ZlibStream::HandleDecompress(Box::new(super::zlib::NodeInflate::new(
+                super::zlib::Wrap::Zlib,
+            ))),
+            6 => super::ZlibStream::HandleDecompress(Box::new(super::zlib::NodeInflate::new(
+                super::zlib::Wrap::Raw,
+            ))),
             _ => return Err(format!("zlib handle: unknown mode {mode}")),
         };
         let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4205,11 +4161,11 @@ pub mod ops {
         flush: i32,
         input: &[u8],
         output: &mut [u8],
-    ) -> Result<(usize, usize), String> {
+    ) -> std::io::Result<(usize, usize)> {
         let mut guard = streams.lock().unwrap_or_else(|e| e.into_inner());
         let stream = guard
             .get_mut(&handle)
-            .ok_or_else(|| format!("zlib handle {handle} not found"))?;
+            .ok_or_else(|| std::io::Error::other(format!("zlib handle {handle} not found")))?;
         match stream {
             super::ZlibStream::HandleCompress(c) => {
                 let before_in = c.total_in();
@@ -4223,26 +4179,40 @@ pub mod ops {
                     _ => flate2::FlushCompress::None,
                 };
                 c.compress(input, output, fl)
-                    .map_err(|e| format!("zlib handle compress: {e}"))?;
+                    .map_err(|e| std::io::Error::other(format!("zlib handle compress: {e}")))?;
                 let consumed = (c.total_in() - before_in) as usize;
                 let produced = (c.total_out() - before_out) as usize;
                 Ok((output.len() - produced, input.len() - consumed))
             }
             super::ZlibStream::HandleDecompress(d) => {
-                let before_in = d.total_in();
-                let before_out = d.total_out();
-                let fl = match flush {
-                    2 => flate2::FlushDecompress::Sync,
-                    4 => flate2::FlushDecompress::Finish,
-                    _ => flate2::FlushDecompress::None,
-                };
-                d.decompress(input, output, fl)
-                    .map_err(|e| format!("zlib handle decompress: {e}"))?;
-                let consumed = (d.total_in() - before_in) as usize;
-                let produced = (d.total_out() - before_out) as usize;
+                // Inflate until the output is full or nothing more is
+                // decodable from the input. Failures are node's coded zlib
+                // errors (an io::Error wrapping a ZlibError).
+                let (mut consumed, mut produced) = (0, 0);
+                while produced < output.len() {
+                    let (used, made) = d
+                        .step(&input[consumed..], &mut output[produced..])
+                        .map_err(std::io::Error::other)?;
+                    consumed += used;
+                    produced += made;
+                    if used == 0 && made == 0 {
+                        break;
+                    }
+                }
+                // node_zlib.cc CheckError: under Z_FINISH, a stream that is
+                // not complete when the output still has room has run out of
+                // input -- "unexpected end of file". Other flushes wait for
+                // more.
+                if flush == 4 && produced < output.len() && !d.is_complete() {
+                    return Err(std::io::Error::other(
+                        super::zlib::ZlibError::UNEXPECTED_EOF,
+                    ));
+                }
                 Ok((output.len() - produced, input.len() - consumed))
             }
-            _ => Err(format!("zlib handle {handle} is not a handle variant")),
+            _ => Err(std::io::Error::other(format!(
+                "zlib handle {handle} is not a handle variant"
+            ))),
         }
     }
 
@@ -4281,7 +4251,7 @@ pub mod ops {
             Ok(Err(e)) if e.to_string() == super::zlib::OUTPUT_TOO_LARGE => {
                 OpOutcome::Failed(super::zlib::OUTPUT_TOO_LARGE.to_string())
             }
-            Ok(Err(e)) => OpOutcome::Failed(format!("zlib: {e}")),
+            Ok(Err(e)) => zlib_decode_failed("zlib", e),
             Err(e) => OpOutcome::Failed(format!("zlib task: {e}")),
         }
     }
