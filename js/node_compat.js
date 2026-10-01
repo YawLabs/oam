@@ -550,40 +550,194 @@
     return `type ${typeof value} (${String(value)})`;
   }
 
-  // Apply Node's coded-error shape to an Error instance: `.code` is set, `.name`
-  // stays the plain base name (RangeError/TypeError -- assert.throws({name})
-  // compares it strictly), and `.toString()`/`.stack` show "BaseName [CODE]: msg"
-  // exactly as Node does (the code is injected into the rendered form, not name).
-  function applyNodeErrorShape(inst, code) {
-    const baseName = inst.name; // plain "TypeError" / "RangeError" / "Error"
-    inst.code = code;
-    Object.defineProperty(inst, "toString", {
-      value: function () {
-        const m = this.message;
-        return baseName + " [" + code + "]" + (m ? ": " + m : "");
-      },
+  // Node's coded-error shape (lib/internal/errors.js makeNodeErrorWithCode,
+  // v22.22.2), which is a CLASS per code -- `class NodeError extends Base`
+  // with a `code = key` field, `message` defined by the constructor, and
+  // `toString()` plus a `constructor` getter on the class prototype. What
+  // that makes observable, and what the helpers below reproduce:
+  //
+  // - Own properties are `stack`, `code`, `message`, in that order (the field
+  //   is initialised before the constructor body defines the message), with
+  //   `message` writable, configurable and NOT enumerable. The common
+  //   `JSON.stringify(err, Object.getOwnPropertyNames(err))` writes its keys
+  //   in this order.
+  // - That is the order for a code whose message is a FUNCTION. A code whose
+  //   message is a string is built with `super(message)` instead, so there
+  //   `message` precedes `code`. Which codes are which is node's table, not
+  //   something to derive here: see NODE_FUNCTION_MESSAGE_CODES.
+  // - `toString` is NOT an own property. It lives on a prototype between the
+  //   instance and Base.prototype, shared by every error of that code, so
+  //   `delete err.toString` changes nothing and
+  //   `Object.getPrototypeOf(err) === RangeError.prototype` is false, while
+  //   `err.constructor === RangeError` and `err instanceof RangeError` hold.
+  // - `.name` stays the plain base name (assert.throws({ name }) compares it
+  //   strictly); the code shows in `toString()` and in the stack header,
+  //   "BaseName [CODE]: msg".
+  //
+  // oam used to set `code` after the base constructor had set `message` and
+  // then define `toString` on the instance, which gave `stack, message, code,
+  // toString` and a flat prototype chain.
+  const kIsNodeError = Symbol("kIsNodeError");
+
+  // The codes node declares with a message FUNCTION
+  // (`E('ERR_X', (a, b) => ..., Base)`), for which `code` is an own property
+  // BEFORE `message` -- and before anything the function sets on `this`.
+  // Every other code has a string message (fixed, or a `%s` format) and is
+  // built with `super(message)`, so there `message` precedes `code`.
+  //
+  // Measured on node v22.22.2 with --expose-internals, by constructing every
+  // code oam's JS names and reading its own property order. A code node does
+  // not have takes the string-message order, which is also the order of an
+  // error node builds natively.
+  const NODE_FUNCTION_MESSAGE_CODES = new Set([
+    "ERR_ACCESS_DENIED",
+    "ERR_BUFFER_OUT_OF_BOUNDS",
+    "ERR_FALSY_VALUE_REJECTION",
+    "ERR_HTTP2_STREAM_CANCEL",
+    "ERR_INVALID_ADDRESS_FAMILY",
+    "ERR_INVALID_ARG_TYPE",
+    "ERR_INVALID_ARG_VALUE",
+    "ERR_INVALID_CHAR",
+    "ERR_INVALID_FILE_URL_PATH",
+    "ERR_INVALID_RETURN_VALUE",
+    "ERR_INVALID_URL",
+    "ERR_INVALID_URL_SCHEME",
+    "ERR_MISSING_ARGS",
+    "ERR_MODULE_NOT_FOUND",
+    "ERR_OUT_OF_RANGE",
+    "ERR_PACKAGE_IMPORT_NOT_DEFINED",
+    "ERR_PACKAGE_PATH_NOT_EXPORTED",
+    "ERR_SOCKET_BAD_PORT",
+    "ERR_TLS_CERT_ALTNAME_INVALID",
+    "ERR_UNHANDLED_ERROR",
+    "ERR_UNSUPPORTED_DIR_IMPORT",
+    "ERR_UNSUPPORTED_ESM_URL_SCHEME",
+  ]);
+
+  // The prototype every error of `code` over `baseProto` shares: node's
+  // NodeError.prototype for that code. Built once per (code, base) pair, as
+  // node builds one class per code.
+  const nodeErrorPrototypes = new Map(); // code -> Map(base prototype -> prototype)
+  function nodeErrorPrototype(baseProto, code) {
+    let byBase = nodeErrorPrototypes.get(code);
+    if (byBase === undefined) {
+      byBase = new Map();
+      nodeErrorPrototypes.set(code, byBase);
+    }
+    let proto = byBase.get(baseProto);
+    if (proto === undefined) {
+      const Base = baseProto.constructor;
+      proto = Object.create(baseProto, {
+        // node: "a workaround for wpt tests that expect that the error
+        // constructor has a `name` property of the base class".
+        constructor: {
+          get() {
+            return Base;
+          },
+          enumerable: false,
+          configurable: true,
+        },
+        [kIsNodeError]: {
+          get() {
+            return true;
+          },
+          enumerable: false,
+          configurable: true,
+        },
+        toString: {
+          value: function toString() {
+            return `${this.name} [${code}]: ${this.message}`;
+          },
+          writable: true,
+          enumerable: false,
+          configurable: true,
+        },
+      });
+      byBase.set(baseProto, proto);
+    }
+    return proto;
+  }
+
+  function defineNodeErrorMessage(inst, message) {
+    Object.defineProperty(inst, "message", {
+      value: message,
+      enumerable: false,
       writable: true,
       configurable: true,
-      enumerable: false,
     });
-    // Node renders the code into the stack header too. Anchor the rewrite to
-    // the first line only -- never risk hitting a "Name:" substring in the
-    // message or a deeper frame.
-    if (typeof inst.stack === "string") {
-      const nl = inst.stack.indexOf("\n");
-      const head = nl === -1 ? inst.stack : inst.stack.slice(0, nl);
-      const rest = nl === -1 ? "" : inst.stack.slice(nl);
-      inst.stack = head.replace(baseName + ":", baseName + " [" + code + "]:") + rest;
+  }
+
+  // The last two steps, once `code` and `message` are in place: move the
+  // instance under its code's prototype, and render the code into the stack
+  // header, which node's prepareStackTrace does for a kIsNodeError error.
+  function finishNodeErrorShape(inst, code) {
+    let baseProto = Object.getPrototypeOf(inst);
+    // Shaped twice (a helper re-coding an error): stay one level deep.
+    if (Object.hasOwn(baseProto, kIsNodeError)) baseProto = Object.getPrototypeOf(baseProto);
+    Object.setPrototypeOf(inst, nodeErrorPrototype(baseProto, code));
+    // Rewrite line 0 only when it is the default render, `Name` or
+    // `Name: message`: a user's Error.prepareStackTrace output is theirs to
+    // keep, exactly as in node. `stack` stays an accessor after the
+    // assignment.
+    try {
+      const stack = inst.stack;
+      const name = inst.name;
+      if (typeof stack === "string" && stack.startsWith(name)) {
+        const rest = stack.slice(name.length);
+        if (rest.startsWith(": ")) {
+          inst.stack = name + " [" + code + "]" + rest;
+        } else if (rest === "" || rest.startsWith("\n")) {
+          // An empty message: V8 writes the bare name, node `Name [CODE]: `.
+          inst.stack = name + " [" + code + "]: " + rest;
+        }
+      }
+    } catch {
+      // A throwing user Error.prepareStackTrace: the error is still whole.
     }
     return inst;
   }
 
+  // Apply node's coded-error shape to an Error instance built elsewhere.
+  function applyNodeErrorShape(inst, code) {
+    const message = inst.message;
+    // Re-create both so they land in node's order whatever the instance
+    // already carried (the base constructor's own `message`, an earlier code).
+    delete inst.message;
+    delete inst.code;
+    if (NODE_FUNCTION_MESSAGE_CODES.has(code)) {
+      inst.code = code;
+      defineNodeErrorMessage(inst, message);
+    } else {
+      defineNodeErrorMessage(inst, message);
+      inst.code = code;
+    }
+    return finishNodeErrorShape(inst, code);
+  }
+
+  // The factory behind `codes.ERR_*`. Callable with or without `new` (both
+  // are used throughout this file). `msgFn` is a string or a function of the
+  // constructor's arguments. For a code whose node message is a function,
+  // it runs as node's does: with `this` set to the error under construction,
+  // AFTER `code` is in place and BEFORE `message` is, so a property it sets
+  // (ERR_INVALID_URL's `input`) lands between the two.
   function E(code, Base, msgFn) {
+    const codeFirst = NODE_FUNCTION_MESSAGE_CODES.has(code);
     function NodeError() {
-      var args = Array.prototype.slice.call(arguments);
-      var msg = typeof msgFn === "function" ? msgFn.apply(null, args) : msgFn;
-      var inst = new Base(msg);
-      return applyNodeErrorShape(inst, code);
+      var inst = new Base();
+      if (codeFirst) {
+        inst.code = code;
+        defineNodeErrorMessage(
+          inst,
+          typeof msgFn === "function" ? msgFn.apply(inst, arguments) : msgFn,
+        );
+      } else {
+        defineNodeErrorMessage(
+          inst,
+          typeof msgFn === "function" ? msgFn.apply(inst, arguments) : msgFn,
+        );
+        inst.code = code;
+      }
+      return finishNodeErrorShape(inst, code);
     }
     return NodeError;
   }
@@ -778,8 +932,12 @@
     return 'Class constructor ' + name + ' cannot be invoked without `new`';
   });
   // Node v22 shape: message is exactly "Invalid URL"; the offending string
-  // rides on err.input (set by the throw sites), not in the message.
-  codes.ERR_INVALID_URL = E("ERR_INVALID_URL", TypeError, function() {
+  // rides on err.input (and a base on err.base), not in the message. Node
+  // sets both from inside the message function, which is why they sit
+  // between `code` and `message` in the own-property order.
+  codes.ERR_INVALID_URL = E("ERR_INVALID_URL", TypeError, function(input, base) {
+    this.input = input;
+    if (base != null) this.base = base;
     return 'Invalid URL';
   });
   codes.ERR_INVALID_URL_SCHEME = E("ERR_INVALID_URL_SCHEME", TypeError, function(expected) {
@@ -807,20 +965,14 @@
     return registry.get("util").format("Invalid IP address: %s", ip);
   });
   // ---- RangeError family ----
-  // node's message function also sets `host` and `port` on the error; E()
-  // calls a message function with no instance, so they are set after the code,
-  // which keeps node's enumerable order (code, host, port -- measured).
-  {
-    const AddressFamilyError = E("ERR_INVALID_ADDRESS_FAMILY", RangeError, function(addressType, host, port) {
-      return `Invalid address family: ${addressType} ${host}:${port}`;
-    });
-    codes.ERR_INVALID_ADDRESS_FAMILY = function ERR_INVALID_ADDRESS_FAMILY(addressType, host, port) {
-      const err = AddressFamilyError(addressType, host, port);
-      err.host = host;
-      err.port = port;
-      return err;
-    };
-  }
+  // node's message function also sets `host` and `port` on the error, which
+  // puts them between `code` and `message` (own order stack, code, host,
+  // port, message -- measured).
+  codes.ERR_INVALID_ADDRESS_FAMILY = E("ERR_INVALID_ADDRESS_FAMILY", RangeError, function(addressType, host, port) {
+    this.host = host;
+    this.port = port;
+    return `Invalid address family: ${addressType} ${host}:${port}`;
+  });
   // node's addNumericalSeparator (lib/internal/errors.js): group a big
   // integer's digits so 9007199254740992 reports as 9_007_199_254_740_992.
   // Works on the STRING form and is sign-aware -- the leading "-" is never
@@ -858,8 +1010,10 @@
   codes.ERR_BUFFER_OUT_OF_BOUNDS = E("ERR_BUFFER_OUT_OF_BOUNDS", RangeError, function(name) {
     return name ? '"' + name + '" is outside of buffer bounds' : 'Attempt to access memory outside buffer bounds';
   });
-  codes.ERR_CHILD_CLOSED_BEFORE_REPLY = E("ERR_CHILD_CLOSED_BEFORE_REPLY", RangeError, function() {
-    return 'Child closed before reply';
+  // Declared in this family for history; node's is an Error (not a
+  // RangeError) and its text ends in "received" (measured on v22.22.2).
+  codes.ERR_CHILD_CLOSED_BEFORE_REPLY = E("ERR_CHILD_CLOSED_BEFORE_REPLY", Error, function() {
+    return 'Child closed before reply received';
   });
   // node internal/errors.js: `${name} should be ${allowZero ? '>= 0' : '> 1'}
   // and < 65536. Received ${determineSpecificType(port)}.` -- the name is bare
@@ -12658,7 +12812,7 @@
         }
         if (process._uncaughtCaptureCb) {
           throw applyNodeErrorShape(
-            new Error("`setupUncaughtExceptionCapture()` was called while a capture callback was already active"),
+            new Error("`process.setupUncaughtExceptionCapture()` was called while a capture callback was already active"),
             "ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET",
           );
         }
@@ -14489,9 +14643,7 @@
         // non-ipv6 'a[b].com' throws rather than being silently cut (that
         // would let a hostname read as ipv6 to the next parser).
         const throwInvalidUrl = () => {
-          const e = new codes.ERR_INVALID_URL();
-          e.input = url;
-          throw e;
+          throw new codes.ERR_INVALID_URL(url);
         };
         if (!ipv6Hostname) rest = getHostname(this, rest, hostname, url);
         if (this.hostname.length > hostnameMaxLen) {
