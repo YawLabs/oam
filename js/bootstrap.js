@@ -2136,6 +2136,50 @@
     enumerable: false,
     configurable: false,
   });
+
+  // node's coded errors (lib/internal/errors.js makeNodeErrorWithCode):
+  // between an instance and Base.prototype sits one prototype per code,
+  // whose `constructor` answers Base -- err.constructor.name is "Error" /
+  // "TypeError" / "RangeError" -- whose toString renders
+  // "Name [CODE]: message" (the stack header too: prepareStackTrace below
+  // renders it through toString on the stack's first read), and which is
+  // [kIsNodeError] (measured on v22.22.2). The one registry for both kinds
+  // of coded error oam raises -- node_compat.js's `codes` and the vendored
+  // streams' internal/errors -- so two errors with one code share a
+  // prototype whichever raised them. Made on first use of a code.
+  const nodeErrorPrototypes = new Map(); // Base -> Map(code -> prototype)
+  function nodeErrorPrototype(Base, code) {
+    let byCode = nodeErrorPrototypes.get(Base);
+    if (byCode === undefined) {
+      byCode = new Map();
+      nodeErrorPrototypes.set(Base, byCode);
+    }
+    let proto = byCode.get(code);
+    if (proto === undefined) {
+      class NodeError extends Base {
+        toString() {
+          return `${this.name} [${code}]: ${this.message}`;
+        }
+
+        get ["constructor"]() {
+          return Base;
+        }
+
+        get [kIsNodeError]() {
+          return true;
+        }
+      }
+      proto = NodeError.prototype;
+      byCode.set(code, proto);
+    }
+    return proto;
+  }
+  Object.defineProperty(globalThis, "__oamNodeErrorPrototype", {
+    value: nodeErrorPrototype,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
 })();
 
 // Node reports an uncaught exception as util.inspect(err): the stack, then a

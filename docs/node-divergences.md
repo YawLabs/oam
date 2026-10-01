@@ -2248,6 +2248,25 @@ two fs calls excluded from the async/sync error-parity case
 (`conformance/cases/72-*`), because asserting node's behaviour there would mean
 encoding its inconsistency into a case whose purpose is the rule.
 
+### Coded errors: the error objects
+
+Node builds a coded error (`err.code` `ERR_*`) on a prototype of its own for that code,
+between the instance and the base's prototype: its `constructor` answers the base, so
+`err.constructor.name` is `Error` / `TypeError` / `RangeError`, its `toString` renders
+`Name [CODE]: message` (and so does the stack header), and the instance's own properties
+are `stack`, `message` and `code`. oam's are built the same way, from one registry
+(`js/bootstrap.js`) that `node_compat.js`'s errors and the vendored streams' share, so two
+errors with one code share a prototype whichever raised them -- `ERR_STREAM_DESTROYED`
+from a `net.Socket` and from a `stream.Writable` (or `tls.TLSSocket`) alike
+(`conformance/cases/248-net-end-write-after-destroy.mjs`). Up to 0.17.1 the streams'
+errors were classes named after the code (`constructor.name` `ERR_STREAM_DESTROYED`), the
+rest sat on `Error.prototype` with an own `toString`, and the stack's top frame was oam's
+error factory. What is left: a few errors are still built by hand with a code and no
+factory -- `ERR_DIR_CLOSED`, `ERR_UNKNOWN_CREDENTIAL`, `ERR_INVALID_URL_SCHEME`,
+`ERR_INVALID_FILE_URL_PATH` among them -- and render `Error: message`, on
+`Error.prototype` (node's last two are `TypeError`s); and the `toString` on the
+prototype is oam's function, not node's source text.
+
 ### `fs.realpath` under `--permission` — oam is stricter
 
 Measured against Node v22.22.2: with `--permission` and no grants, node allows

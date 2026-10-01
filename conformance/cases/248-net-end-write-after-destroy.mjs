@@ -153,4 +153,49 @@ for (const connected of [false, true]) {
   console.log(`getters: ${log.join(" | ")}`);
 }
 
+// The error objects themselves, not just code and message: node's coded
+// errors share one prototype per code, between the instance and the base's
+// prototype, whose `constructor` is the base and whose toString renders
+// "Name [CODE]: message". oam built them two ways -- net.Socket's on
+// Error.prototype with an own toString, the vendored streams' (Writable,
+// and tls.TLSSocket over them) as classes named after the code -- so
+// constructor.name was "ERR_STREAM_DESTROYED" on one path and the
+// prototype was Error.prototype on the other.
+{
+  const { Writable } = await import("node:stream");
+  const errs = [];
+  const sock = new net.Socket();
+  sock.on("error", () => {});
+  sock.destroy(new Error("boom"));
+  sock.end((e) => errs.push(["net end", e]));
+  sock.write("x", (e) => errs.push(["net write", e]));
+  const w = new Writable({ write(chunk, enc, cb) { cb(); } });
+  w.on("error", () => {});
+  w.destroy(new Error("boom"));
+  w.end((e) => errs.push(["Writable end", e]));
+  w.write("x", (e) => errs.push(["Writable write", e]));
+  try { net.connect({}); } catch (e) { errs.push(["net.connect({})", e]); }
+  try { new net.Socket().setTimeout(-1); } catch (e) { errs.push(["setTimeout(-1)", e]); }
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const protoOf = new Map();
+  for (const [label, e] of errs) {
+    const proto = Object.getPrototypeOf(e);
+    const base = Object.getPrototypeOf(proto);
+    const first = protoOf.get(e.code);
+    if (first === undefined) protoOf.set(e.code, proto);
+    const desc = (o, k) => {
+      const d = Object.getOwnPropertyDescriptor(o, k);
+      return d ? `${d.writable ? "w" : ""}${d.enumerable ? "e" : ""}${d.configurable ? "c" : ""}` : "-";
+    };
+    console.log(
+      `shape ${label}: ${e.code} ctor=${e.constructor.name} name=${e.name}` +
+      ` proto-is-base=${proto === e.constructor.prototype} base=${base === e.constructor.prototype}` +
+      ` shared=${first === undefined || first === proto}` +
+      ` proto.toString=${desc(proto, "toString")} proto.constructor=${desc(proto, "constructor")}` +
+      ` own=${Object.getOwnPropertyNames(e).sort().join(",")} keys=${Object.keys(e).join(",")}` +
+      ` instanceof=${e instanceof Error} string=${String(e)} stack=${e.stack.split("\n")[0]}`,
+    );
+  }
+}
+
 server.close();

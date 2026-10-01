@@ -550,13 +550,37 @@
     return `type ${typeof value} (${String(value)})`;
   }
 
+  // The native error classes whose instances take node's coded-error
+  // prototype (bootstrap.js __oamNodeErrorPrototype, the registry the
+  // vendored streams' errors share).
+  const kNativeErrorProtos = new Set([
+    Error.prototype, TypeError.prototype, RangeError.prototype,
+    SyntaxError.prototype, URIError.prototype, EvalError.prototype,
+    ReferenceError.prototype,
+  ]);
+  const nodeErrorPrototype = globalThis.__oamNodeErrorPrototype;
+
   // Apply Node's coded-error shape to an Error instance: `.code` is set, `.name`
   // stays the plain base name (RangeError/TypeError -- assert.throws({name})
   // compares it strictly), and `.toString()`/`.stack` show "BaseName [CODE]: msg"
   // exactly as Node does (the code is injected into the rendered form, not name).
   function applyNodeErrorShape(inst, code) {
-    const baseName = inst.name; // plain "TypeError" / "RangeError" / "Error"
     inst.code = code;
+    const base = Object.getPrototypeOf(inst);
+    if (kNativeErrorProtos.has(base)) {
+      // node's prototype for the code: constructor.name stays the base's,
+      // and toString renders the code. V8 renders the stack on its first
+      // read, through toString (bootstrap.js prepareStackTrace), so its
+      // header comes out as node's with nothing rewritten -- and no error
+      // pays for a stack nobody reads.
+      Object.setPrototypeOf(inst, nodeErrorPrototype(base.constructor, code));
+      return inst;
+    }
+    // An instance of some other class: the rendering goes on the instance,
+    // and the stack header is rewritten. Anchor the rewrite to the first
+    // line only -- never risk hitting a "Name:" substring in the message or
+    // a deeper frame.
+    const baseName = inst.name;
     Object.defineProperty(inst, "toString", {
       value: function () {
         const m = this.message;
@@ -566,9 +590,6 @@
       configurable: true,
       enumerable: false,
     });
-    // Node renders the code into the stack header too. Anchor the rewrite to
-    // the first line only -- never risk hitting a "Name:" substring in the
-    // message or a deeper frame.
     if (typeof inst.stack === "string") {
       const nl = inst.stack.indexOf("\n");
       const head = nl === -1 ? inst.stack : inst.stack.slice(0, nl);
@@ -579,11 +600,18 @@
   }
 
   function E(code, Base, msgFn) {
+    let proto;
     function NodeError() {
       var args = Array.prototype.slice.call(arguments);
       var msg = typeof msgFn === "function" ? msgFn.apply(null, args) : msgFn;
-      var inst = new Base(msg);
-      return applyNodeErrorShape(inst, code);
+      // Made with NodeError as new.target: the error is born with node's
+      // prototype for the code (applyNodeErrorShape's), and its stack starts
+      // at the caller -- V8 leaves out the frames up to new.target, so this
+      // one is not the top frame, as node's internal ones are not.
+      if (proto === undefined) NodeError.prototype = proto = nodeErrorPrototype(Base, code);
+      var inst = Reflect.construct(Base, [msg], NodeError);
+      inst.code = code;
+      return inst;
     }
     return NodeError;
   }
