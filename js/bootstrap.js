@@ -332,11 +332,33 @@
         reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
       return signal;
     }
-    static timeout(ms) {
+    static timeout(delay) {
+      // node: validateUint32(delay, 'delay', false) -- a number, an integer,
+      // and within uint32, each with its own coded error. The codes live in
+      // node_compat.js, which is evaluated after this file, so they are
+      // looked up at call time.
+      const codes = globalThis.__oamNode.get("internal/errors").codes;
+      if (typeof delay !== "number") {
+        throw new codes.ERR_INVALID_ARG_TYPE("delay", "number", delay);
+      }
+      if (!Number.isInteger(delay)) {
+        throw new codes.ERR_OUT_OF_RANGE("delay", "an integer", delay);
+      }
+      if (delay < 0 || delay > 4294967295) {
+        throw new codes.ERR_OUT_OF_RANGE("delay", ">= 0 && <= 4294967295", delay);
+      }
       const signal = new AbortSignal();
-      globalThis.setTimeout(() => {
-        signal._fire(new globalThis.DOMException("The operation timed out", "TimeoutError"));
-      }, ms);
+      const timer = globalThis.setTimeout(() => {
+        signal._fire(
+          new globalThis.DOMException("The operation was aborted due to timeout", "TimeoutError"),
+        );
+      }, delay);
+      // node unrefs this timer (lib/internal/abort_controller.js
+      // setWeakAbortSignalTimeout): a timeout signal alone never keeps the
+      // process alive. Ref'd, `fetch(url, { signal: AbortSignal.timeout(5000) })`
+      // held the process open for the full five seconds after the response
+      // had been read.
+      timer.unref();
       return signal;
     }
     static any(signals) {
