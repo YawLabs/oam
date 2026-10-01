@@ -409,6 +409,12 @@ fn read_lockfile(path: &Path) -> Result<Lockfile, Vec<Diagnostic>> {
 // ── HTTP client ─────────────────────────────────────────────────────────
 
 fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    http_client_builder().build()
+}
+
+/// The installer's client, before `build()` (a test adds `no_proxy()`, so a
+/// proxy in the environment cannot stand between it and its loopback server).
+fn http_client_builder() -> reqwest::ClientBuilder {
     // reqwest with rustls-no-provider needs an explicit provider install.
     // The ring provider is already compiled (workspace dep via rustls).
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -417,7 +423,6 @@ fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
         .connect_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(120))
         .user_agent(concat!("oam/", env!("CARGO_PKG_VERSION")))
-        .build()
 }
 
 // ── Fetch + extract ─────────────────────────────────────────────────────
@@ -1303,6 +1308,58 @@ mod tests {
             other => panic!("expected Ok(Partial {{ installed: 0, .. }}); got {other:?}"),
         }
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // The installer's GET, against a one-connection loopback server: it
+    // offers gzip and deflate, as npm's own client does, and hands back the
+    // DECODED bytes of a response that carries `content-encoding: gzip` --
+    // so the integrity check and the extractor see the tarball the registry
+    // published, whatever a mirror or proxy did to it in transit. reqwest's
+    // "gzip" / "deflate" features provide both halves, and this is the
+    // behaviour that changes if they are dropped (#173): the header goes,
+    // and an encoded response would reach verify_integrity still encoded.
+    #[test]
+    fn tarball_download_offers_gzip_and_decodes_an_encoded_response() {
+        use std::io::{Read, Write};
+
+        let payload = b"the bytes the registry published".to_vec();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        gz.write_all(&payload).unwrap();
+        let encoded = gz.finish().unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if conn.read(&mut byte).unwrap() == 0 {
+                    break;
+                }
+                head.push(byte[0]);
+            }
+            write!(
+                conn,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/octet-stream\r\n\
+                 content-encoding: gzip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                encoded.len()
+            )
+            .unwrap();
+            conn.write_all(&encoded).unwrap();
+            String::from_utf8_lossy(&head).to_ascii_lowercase()
+        });
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let client = http_client_builder().no_proxy().build().unwrap();
+        let url = format!("http://127.0.0.1:{port}/pkg/-/pkg-1.0.0.tgz");
+        let got = download_with_retry(&rt, &client, &url, 0).unwrap();
+        let head = server.join().unwrap();
+        assert!(head.contains("accept-encoding: gzip,deflate"), "{head}");
+        assert_eq!(got, payload);
     }
 
     #[test]

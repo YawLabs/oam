@@ -1471,8 +1471,8 @@
   // cannot run faithfully -- a dispatch() override, interceptors, or an
   // object that is not one of the oam:undici shim's dispatchers -- since oam
   // would otherwise send the request without it.
-  function dispatcherPolicy(dispatcher, holder) {
-    if (holder && typeof holder.policy === "function") return holder.policy(dispatcher);
+  function dispatcherPolicy(dispatcher, holder, request) {
+    if (holder && typeof holder.policy === "function") return holder.policy(dispatcher, request);
     const refuse = new undiciErrors.NotSupportedError(
       "a fetch dispatcher that is not one of oam's undici dispatchers is not supported: " +
         "oam cannot run its dispatch(); pass the connection policy as a `connect` function",
@@ -1525,14 +1525,19 @@
   // name up here. A hook that fails fails the fetch CLOSED (its error is the
   // cause, unchanged, as in node) and never falls back to system DNS; an
   // abort while parked drops the parked fetch.
-  async function settleFetch(pending, lookup, signal, connector) {
-    return makeResponse(await settleRaw(pending, lookup, signal, connector), signal);
+  async function settleFetch(pending, lookup, signal, connector, phase) {
+    return makeResponse(await settleRaw(pending, lookup, signal, connector, phase), signal);
   }
 
   // settleFetch's loop, ending at the op's raw payload (the response head
   // with its `bodyHandle`, and the `socket` / `tls` facts of the connection
   // it arrived on) instead of a Response.
-  async function settleRaw(pending, lookup, signal, connector) {
+  //
+  // `phase` (undici.request's, else null) hears when a connector is asked
+  // for a connection (`connecting()`) and when the socket it handed back
+  // carries the request (`connected()`): undici's headersTimeout runs only
+  // while a request is on a connected socket, never across the connect.
+  async function settleRaw(pending, lookup, signal, connector, phase) {
     const internal = globalThis.__oam;
     const aborted = () =>
       signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
@@ -1560,6 +1565,7 @@
         // Aborted before the fetch parked: the listener will never fire (see
         // the lookup branch below), so drop the parked fetch now.
         if (signal?.aborted) abandon();
+        phase?.connecting();
         let socket;
         try {
           socket = await runConnector(connector, {
@@ -1582,6 +1588,7 @@
           throw aborted();
         }
         resumed = true;
+        phase?.connected();
         const supplied = supplySocket(socket);
         try {
           raw = await internal.fetchSupply(token, supplied.id, socket.alpnProtocol === "h2");
@@ -1928,7 +1935,10 @@
     // an undici dispatcher.
     let connector = null;
     if (!rawPayload && dispatcher != null) {
-      const policy = dispatcherPolicy(dispatcher, holder);
+      const policy = dispatcherPolicy(dispatcher, holder, {
+        url: rawUrl,
+        headerNames: headers.map((h) => h[0]),
+      });
       if (policy.refuse) throw new TypeError("fetch failed", { cause: policy.refuse });
       if (policy.connector) {
         connector = policy.connector;
@@ -2001,9 +2011,11 @@
     if (rawPayload) {
       // http.ClientRequest cancels on abort() / destroy().
       if (typeof init.__oamCanceller === "function") init.__oamCanceller(cancel);
-      return settleRaw(pending, lookup, signal, connector);
+      return settleRaw(pending, lookup, signal, connector, null);
     }
-    const op = settleFetch(pending, lookup, signal, connector);
+    // undici.request's connect-phase listener (see settleRaw).
+    const phase = init.__oamConnectPhase && typeof init.__oamConnectPhase === "object" ? init.__oamConnectPhase : null;
+    const op = settleFetch(pending, lookup, signal, connector, phase);
     if (!signal) return op;
     // Race the abort: it rejects the fetch with the reason at once, and
     // cancels the request. The cancelled op then fails, into a race that is

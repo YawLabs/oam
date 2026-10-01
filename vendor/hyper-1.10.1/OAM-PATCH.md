@@ -28,7 +28,9 @@ of an HTTP/2 request (item 10). The root `Cargo.toml` swaps it in with `[patch.c
      from the root `Cargo.toml`.
   3. Run `cargo update -p hyper`.
   4. Keep `crates/oam_core/tests/http_client_stale_pool.rs`. It has to pass
-     on the release that replaces this copy.
+     on the release that replaces this copy -- the h2 race
+     (`an_h2_send_racing_the_dispatcher_teardown_is_answered`) as well as
+     the h1 ones, since an upstream fix may cover only the h1 path.
 
 ## The diff
 
@@ -355,6 +357,13 @@ All counts below are from 2026-09-18.
     66 stranded).
   - Patched: 0 stranded, both platforms. That covers 300,000 extra rounds
     on Windows.
+- `an_h2_send_racing_the_dispatcher_teardown_is_answered` is the same
+  interleaving over HTTP/2 (#184): an idle h2 connection reads
+  `GOAWAY(NO_ERROR)` and a FIN and finishes, then one thread drops it while
+  another sends on its `SendRequest`.
+  - Stock `Receiver::drop` (drain removed, 2026-10-01): failed 8 of 8 runs on
+    Windows arm64, 18 to 37 of 20,000 requests stranded.
+  - Patched: 0 stranded.
 - `a_request_racing_a_closing_pooled_connection_settles` is the end-to-end
   shape, through oam's transport and a loopback server that answers and then
   sends a FIN.

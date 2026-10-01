@@ -1572,6 +1572,91 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   itself; point the code under test at a local server instead. Pinned by
   `undici_mock_dispatchers_refuse_instead_of_reaching_the_network` (e2e).
 
+**`ProxyAgent`, `EnvHttpProxyAgent`, and the undici names oam exports to refuse**
+
+`ProxyAgent` and `EnvHttpProxyAgent` work (#208). undici's `ProxyAgent` sends every request
+-- to an http origin as much as an https one -- through a `CONNECT` tunnel, so oam's is a
+dispatcher whose connect function opens that tunnel: it connects to the proxy (TLS first for
+an `https:` proxy, under `proxyTls`), sends undici's `CONNECT host:port` with `host`,
+`connection: close` and the proxy headers (`headers`, and `proxy-authorization` from
+`token`, `auth` or the proxy URL's userinfo), and on a `200` the request goes over that
+socket, with TLS to the origin inside it under `requestTls`. Every entry point a dispatcher
+has goes through it, redirect hops included, and the credentials go to the proxy only. A
+request carrying its own `Proxy-Authorization` is refused with undici's
+`InvalidArgumentError`; a proxy that answers anything but `200` fails the request with
+undici's `Proxy response (403) !== 200 when HTTP Tunneling`. `EnvHttpProxyAgent` picks, per
+origin, a `ProxyAgent` for `httpProxy` / `httpsProxy` (else `http_proxy` / `HTTP_PROXY` and
+`https_proxy` / `HTTPS_PROXY`) or a plain `Agent` for what `noProxy` / `no_proxy` /
+`NO_PROXY` exempts, with undici's matching, and prints undici's one-time `UNDICI-EHPA`
+warning. Pinned against Node + undici 6.29.0 by
+`undici_proxy_agent_tunnels_every_connection` (e2e). Up to 0.17.1 neither was exported, and
+since a name missing from an ES module is a link-time error, a package that merely imported
+`ProxyAgent` (`@actions/http-client` 4, `@upstash/context7-mcp`) did not start. What differs:
+
+- **Nothing is pooled**, as for any connect function (above): one tunnel per request, where
+  undici reuses a tunnel to the same origin.
+- **`proxyTunnel: false`, `clientFactory` and `factory` are refused at construction** with
+  `NotSupportedError`. The first sends an http origin to an http proxy in absolute form,
+  which oam's transport cannot write over a supplied socket; the other two supply
+  dispatchers whose `dispatch()` oam does not run.
+- **A proxy that refuses the tunnel, seen through `fetch`.** undici calls its connect
+  callback twice in that case and Node's `fetch` reports the second call (`cause` `Error:
+  Request was cancelled.`); oam reports the first, the `Proxy response (...) !== 200` error
+  that `undici.request` reports in both.
+- **Exported, refused at use:** `RetryAgent`, `RetryHandler`, `RedirectHandler`,
+  `DecoratorHandler`, `createRedirectInterceptor`, `connect()`, `upgrade()` and
+  `pipeline()` all work through `dispatch()`. Each is exported so an `import` of it links,
+  and fails with `NotSupportedError` when constructed or called (`connect` / `upgrade`
+  through their callback or promise). `mockErrors.MockNotMatchedError` is exported as a
+  class; nothing raises it, since the Mock* classes refuse. Pinned, with the shim's whole
+  export list, by `undici_exports_link_and_refuse_what_oam_cannot_run` (e2e).
+- **Not exported at all** (an `import` of one is still a link-time `SyntaxError`):
+  `getCookies`, `getSetCookies`, `setCookie`, `deleteCookie`, `parseMIMEType`,
+  `serializeAMimeType`, `util`, `caches`, `EventSource`, `ErrorEvent` and `FileReader`.
+
+**`headersTimeout` and `bodyTimeout` on `undici.request`**
+
+`undici.request()`, `undici.stream()` and a dispatcher's `request()` honour undici's two
+per-phase stall limits (#218): a response head that does not arrive within `headersTimeout`
+rejects the request with `HeadersTimeoutError` (`UND_ERR_HEADERS_TIMEOUT`), and a body that
+goes `bodyTimeout` without a byte is destroyed with `BodyTimeoutError`
+(`UND_ERR_BODY_TIMEOUT`), each chunk re-arming it. The request's own value wins, then the
+dispatcher's (`new Agent|Pool|Client({ headersTimeout, bodyTimeout })`, the global
+dispatcher included), then undici's default of 300 s; `0` disables. On the request,
+anything but a finite number `>= 0` is `InvalidArgumentError` `invalid headersTimeout` /
+`invalid bodyTimeout`; a dispatcher's own value is checked first, as undici's `Client`
+checks it -- an integer `>= 0`, else `headersTimeout must be a positive integer or zero` --
+by a `Client` when it is built and by the others on the request (where NaN or an
+Infinity, which undici's `Agent` and `Pool` lose in a JSON copy of their options, is the
+default).
+Pinned against Node + undici 6.29.0 by `undici_request_honours_headers_and_body_timeouts`
+(e2e). Up to 0.17.1 both options were accepted and ignored. What differs:
+
+- **The timers are exact.** undici's are coarse (a 500 ms `headersTimeout` fires after about
+  1019 ms in Node); oam's fire at the configured delay. A delay above 2^31-1 ms
+  (`headersTimeout: 2 ** 31` and the like, a common way to say "no limit") is held to that
+  ceiling, about 24.8 days, where undici's timestamp-based timers never come due; a plain
+  `setTimeout` would have fired it after 1 ms.
+- **Without a connect function, `headersTimeout` also covers the connect.** undici starts it
+  once the request is on a connected socket, so DNS, the TCP connect and the TLS handshake do
+  not count. Through a dispatcher with a connect function (a `connect` function or socket /
+  TLS options, an `Agent` `factory`, `ProxyAgent` with its tunnel, `EnvHttpProxyAgent`) oam
+  does the same: the timer stops while the connect function is asked and starts afresh once
+  the socket it hands back carries the request (pinned by
+  `undici_phase_timeouts_measure_what_undici_measures`, e2e). Otherwise oam's own pool dials,
+  and the transport does not tell JS when it has a connection for the request, so the timer
+  starts when the request is dispatched: a slow DNS answer or TLS handshake uses up part of
+  `headersTimeout` in oam and none of it in Node.
+- **`bodyTimeout` runs only while the body is being read.** oam reads a `request()` body
+  from the transport when something consumes it; undici reads ahead into the stream's
+  buffer. So a stalled body nobody reads is left alone in oam, where Node destroys it with
+  `BodyTimeoutError` (an uncaught `'error'` if nothing listens). A body that is read --
+  `text()`, `json()`, a `'data'` listener, `pipe()`, `stream()` -- times out in both.
+- **`fetch` through a dispatcher does not get them.** Node applies an `Agent`'s
+  `headersTimeout` / `bodyTimeout` to a `fetch` that rides it (and the 300 s defaults to
+  every `fetch`); oam applies them to `undici.request` / `stream` / `dispatcher.request`
+  only, and a `fetch` is bounded by its `signal`.
+
 **Redirects**
 
 - **`redirect: 'manual'` and `'error'` behave as Node's** (case 126): `'manual'` returns the

@@ -779,12 +779,20 @@ fn npm_cjs_only_package_runs_via_interop() {
 /// callable defaults, __esModule unwrapping, arbitrary export names, and
 /// the require-condition side of a dual package.
 fn write_cjs_fixtures() -> PathBuf {
+    // Each call gets its OWN project dir, for the reason write_npm_fixtures
+    // gives: six tests write this tree in parallel, and fs::write truncates
+    // before writing, so one test's `oam` could load a fixture another test
+    // had just emptied (`helper is not a function` from an empty helper.js).
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let root = format!("cjsproj{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    let root = root.as_str();
     write_temp(
-        "cjsproj/node_modules/classic/package.json",
+        &format!("{root}/node_modules/classic/package.json"),
         "{\"name\": \"classic\", \"main\": \"lib/index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/classic/lib/index.js",
+        &format!("{root}/node_modules/classic/lib/index.js"),
         "const { helper } = require('./helper');\n\
          const meta = require('../package.json');\n\
          const dep = require('depcjs');\n\
@@ -797,108 +805,127 @@ fn write_cjs_fixtures() -> PathBuf {
          exports.hasGlobal = global === globalThis;\n",
     );
     write_temp(
-        "cjsproj/node_modules/classic/lib/helper.js",
+        &format!("{root}/node_modules/classic/lib/helper.js"),
         "exports.helper = function () { return 'helped'; };",
     );
     write_temp(
-        "cjsproj/node_modules/depcjs/package.json",
+        &format!("{root}/node_modules/depcjs/package.json"),
         "{\"name\": \"depcjs\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/depcjs/index.js",
+        &format!("{root}/node_modules/depcjs/index.js"),
         "module.exports = { name: 'depcjs' };",
     );
     write_temp(
-        "cjsproj/node_modules/counter/package.json",
+        &format!("{root}/node_modules/counter/package.json"),
         "{\"name\": \"counter\", \"main\": \"counter.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/counter/counter.js",
+        &format!("{root}/node_modules/counter/counter.js"),
         "let n = 0;\nmodule.exports = { bump: () => ++n };",
     );
     write_temp(
-        "cjsproj/node_modules/counter/a.js",
+        &format!("{root}/node_modules/counter/a.js"),
         "exports.a = require('./counter').bump();",
     );
     write_temp(
-        "cjsproj/node_modules/counter/b.js",
+        &format!("{root}/node_modules/counter/b.js"),
         "exports.b = require('./counter').bump();",
     );
     write_temp(
-        "cjsproj/node_modules/cycle/package.json",
+        &format!("{root}/node_modules/cycle/package.json"),
         "{\"name\": \"cycle\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/cycle/index.js",
+        &format!("{root}/node_modules/cycle/index.js"),
         "exports.started = true;\n\
          const peer = require('./peer');\n\
          exports.peerSawPartial = peer.sawPartial;\n\
          exports.done = true;",
     );
     write_temp(
-        "cjsproj/node_modules/cycle/peer.js",
+        &format!("{root}/node_modules/cycle/peer.js"),
         "const root = require('./index');\n\
          exports.sawPartial = root.started === true && root.done === undefined;",
     );
     write_temp(
-        "cjsproj/node_modules/fnpkg/package.json",
+        &format!("{root}/node_modules/fnpkg/package.json"),
         "{\"name\": \"fnpkg\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/fnpkg/index.js",
+        &format!("{root}/node_modules/fnpkg/index.js"),
         "module.exports = function shout(s) { return s.toUpperCase(); };\n\
          module.exports.flavor = 'fn';",
     );
     write_temp(
-        "cjsproj/node_modules/transpiled/package.json",
+        &format!("{root}/node_modules/transpiled/package.json"),
         "{\"name\": \"transpiled\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/transpiled/index.js",
+        &format!("{root}/node_modules/transpiled/index.js"),
         "Object.defineProperty(exports, '__esModule', { value: true });\n\
          exports.default = function () { return 'unwrapped-default'; };\n\
          exports.named = 'named-val';",
     );
     write_temp(
-        "cjsproj/node_modules/weird/package.json",
+        &format!("{root}/node_modules/weird/package.json"),
         "{\"name\": \"weird\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/weird/index.js",
+        &format!("{root}/node_modules/weird/index.js"),
         "module.exports = { 'weird-key': 'dash', 'class': 'reserved' };",
     );
     write_temp(
-        "cjsproj/node_modules/dualpkg/package.json",
+        &format!("{root}/node_modules/dualpkg/package.json"),
         "{\"name\": \"dualpkg\", \"exports\": {\".\": {\"import\": \"./esm.mjs\", \"require\": \"./cjs.cjs\"}}}",
     );
     write_temp(
-        "cjsproj/node_modules/dualpkg/esm.mjs",
+        &format!("{root}/node_modules/dualpkg/esm.mjs"),
         "export const flavor = 'esm';",
     );
     write_temp(
-        "cjsproj/node_modules/dualpkg/cjs.cjs",
+        &format!("{root}/node_modules/dualpkg/cjs.cjs"),
         "module.exports = { flavor: 'cjs' };",
     );
     write_temp(
-        "cjsproj/node_modules/wantsdual/package.json",
+        &format!("{root}/node_modules/wantsdual/package.json"),
         "{\"name\": \"wantsdual\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/wantsdual/index.js",
+        &format!("{root}/node_modules/wantsdual/index.js"),
         "exports.dualFlavor = require('dualpkg').flavor;",
     );
     write_temp(
-        "cjsproj/node_modules/boom/package.json",
+        &format!("{root}/node_modules/boom/package.json"),
         "{\"name\": \"boom\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/boom/index.js",
+        &format!("{root}/node_modules/boom/index.js"),
         "throw new Error('cjs-init-boom');",
     );
-    write_temp("cjsproj/.anchor", "")
+    write_temp(&format!("{root}/.anchor"), "")
         .parent()
         .unwrap()
         .to_path_buf()
+}
+
+#[test]
+fn cjs_fixtures_are_written_to_a_root_of_their_own_per_call() {
+    // #186: a shared root let one test truncate a file another test's `oam`
+    // was loading. Two calls must never share a tree.
+    let first = write_cjs_fixtures();
+    let second = write_cjs_fixtures();
+    assert_ne!(first, second);
+    for proj in [&first, &second] {
+        let helper = proj.join("node_modules/classic/lib/helper.js");
+        assert!(
+            std::fs::read_to_string(&helper)
+                .unwrap()
+                .contains("exports.helper"),
+            "{} is incomplete",
+            helper.display()
+        );
+    }
 }
 
 #[test]
@@ -4858,6 +4885,249 @@ fn undici_shim_request_stream_fetch_over_http() {
     assert!(stdout.contains("agent true"), "{stdout}");
 }
 
+/// `undici.request()` / `stream()` / `dispatcher.request()` honour undici's
+/// two per-phase stall limits (#218): `headersTimeout` rejects a request whose
+/// response head does not arrive with `HeadersTimeoutError`
+/// (`UND_ERR_HEADERS_TIMEOUT`), `bodyTimeout` fails a body that goes quiet
+/// with `BodyTimeoutError` (`UND_ERR_BODY_TIMEOUT`) -- re-armed by every
+/// chunk, so a slow but steady body is not cut. The request's own value wins
+/// over the dispatcher's (`new Agent({ headersTimeout })`, the global one
+/// included), 0 disables, and a bad value is undici's `InvalidArgumentError`:
+/// the request's under its Request rule, the dispatcher's under its Client
+/// rule (at construction for a Client, on the request for the others).
+/// Up to 0.17.1 both options were accepted and ignored, so only the caller's
+/// total signal bounded a stalled request. The expected output is node
+/// v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_request_honours_headers_and_body_timeouts() {
+    let script = write_temp(
+        "undici_phase_timeouts/main.mjs",
+        r##"import net from 'node:net';
+import { request, stream, Agent, Client, Pool, ProxyAgent, errors, setGlobalDispatcher, getGlobalDispatcher } from 'undici';
+import { Writable } from 'node:stream';
+
+// Three raw servers: one that never answers, one that sends a head and one
+// chunk and then stalls, and one that drips a chunk every 150 ms -- longer in
+// total than the body timeout used against it, never idle that long.
+const never = net.createServer((s) => { s.on('data', () => {}); s.on('error', () => {}); });
+const stall = net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => s.write('HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n'));
+});
+const drip = net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => {
+    s.write('HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n');
+    let n = 0;
+    const t = setInterval(() => {
+      s.write('1\r\nx\r\n');
+      if (++n === 6) { clearInterval(t); s.end('0\r\n\r\n'); }
+    }, 150);
+  });
+});
+const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${srv.address().port}`)));
+const [nu, su, du] = await Promise.all([listen(never), listen(stall), listen(drip)]);
+
+// Every stalled probe also carries a 6 s total budget; `early` says the
+// phase timeout ended it, not that budget.
+const total = () => { const ac = new AbortController(); setTimeout(() => ac.abort(new Error('total budget')), 6000).unref(); return ac.signal; };
+async function attempt(label, fn) {
+  const t0 = Date.now();
+  try {
+    console.log(label, 'ok', JSON.stringify(await fn()));
+  } catch (e) {
+    console.log(label, e.name, e.code, e.message, e instanceof errors.UndiciError, 'early=' + (Date.now() - t0 < 4000));
+  }
+}
+const sink = () => new Writable({ write(c, e, cb) { cb(); } });
+
+await attempt('headers', () => request(nu, { headersTimeout: 400, bodyTimeout: 400, signal: total() }));
+await attempt('body', async () => (await request(su, { headersTimeout: 400, bodyTimeout: 400, signal: total() })).body.text());
+await attempt('body-json', async () => (await request(su, { bodyTimeout: 400, signal: total() })).body.json());
+await attempt('drip', async () => (await request(du, { bodyTimeout: 700 })).body.text());
+await attempt('stream-headers', () => stream(nu, { method: 'GET', headersTimeout: 400, signal: total() }, sink));
+await attempt('stream-body', () => stream(su, { method: 'GET', bodyTimeout: 400, signal: total() }, sink));
+// The dispatcher's own options apply to its requests; the request's win.
+await attempt('agent-option', () => new Agent({ headersTimeout: 400 }).request({ origin: nu, path: '/', method: 'GET', signal: total() }));
+await attempt('client-option', () => new Client(nu, { headersTimeout: 400 }).request({ path: '/', method: 'GET', signal: total() }));
+await attempt('request-wins', () => new Agent({ headersTimeout: 60000 }).request({ origin: nu, path: '/', method: 'GET', headersTimeout: 400, signal: total() }));
+await attempt('dispatcher-option', async () => (await request(su, { dispatcher: new Agent({ bodyTimeout: 400 }), signal: total() })).body.text());
+const previous = getGlobalDispatcher();
+setGlobalDispatcher(new Agent({ headersTimeout: 400 }));
+await attempt('global-option', () => request(nu, { signal: total() }));
+setGlobalDispatcher(previous);
+// 0 disables: only the caller's own signal ends it, with the caller's reason.
+await attempt('zero-disables', () => { const ac = new AbortController(); setTimeout(() => ac.abort(new Error('mine')), 900); return request(nu, { headersTimeout: 0, signal: ac.signal }); });
+await attempt('caller-abort-first', () => { const ac = new AbortController(); setTimeout(() => ac.abort(new Error('mine')), 100); return request(nu, { headersTimeout: 5000, signal: ac.signal }); });
+await attempt('already-aborted', () => request(nu, { headersTimeout: 400, signal: AbortSignal.abort(new Error('before')) }));
+// Validation, as undici's Request does it.
+for (const bad of [-1, 'x', NaN, Infinity]) {
+  await attempt('invalid headersTimeout ' + String(bad), () => request(nu, { headersTimeout: bad, signal: total() }));
+  await attempt('invalid bodyTimeout ' + String(bad), () => request(nu, { bodyTimeout: bad, signal: total() }));
+}
+await attempt('fractional', () => request(nu, { headersTimeout: 400.5, bodyTimeout: 1.5, signal: total() }));
+// A dispatcher's own values are checked as undici's Client checks them -- an
+// integer >= 0 -- before the request's: a Client when it is built, the
+// others (which build their Clients on demand) on the request. An Agent's or
+// Pool's options go through JSON first, so NaN there is the default.
+const built = (label, make) => { try { make(); console.log(label, 'built'); } catch (e) { console.log(label, e.name, e.code, e.message); } };
+for (const bad of [-1, 1.5, '5', NaN]) {
+  built('client headersTimeout ' + String(bad), () => new Client(nu, { headersTimeout: bad }));
+  built('client bodyTimeout ' + String(bad), () => new Client(nu, { bodyTimeout: bad }));
+  built('pool headersTimeout ' + String(bad), () => new Pool(nu, { headersTimeout: bad }));
+  await attempt('agent headersTimeout ' + String(bad), () => request(nu, { dispatcher: new Agent({ headersTimeout: bad }), headersTimeout: 400, signal: total() }));
+  await attempt('pool bodyTimeout ' + String(bad), () => new Pool(nu, { bodyTimeout: bad }).request({ path: '/', method: 'GET', headersTimeout: 400, signal: total() }));
+}
+await attempt('proxy-agent bodyTimeout 1.5', () => request(nu, { dispatcher: new ProxyAgent({ uri: 'http://127.0.0.1:1', bodyTimeout: 1.5 }), signal: total() }));
+process.exit(0);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "\
+headers HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+body BodyTimeoutError UND_ERR_BODY_TIMEOUT Body Timeout Error true early=true
+body-json BodyTimeoutError UND_ERR_BODY_TIMEOUT Body Timeout Error true early=true
+drip ok \"xxxxxx\"
+stream-headers HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+stream-body BodyTimeoutError UND_ERR_BODY_TIMEOUT Body Timeout Error true early=true
+agent-option HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+client-option HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+request-wins HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+dispatcher-option BodyTimeoutError UND_ERR_BODY_TIMEOUT Body Timeout Error true early=true
+global-option HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+zero-disables Error undefined mine false early=true
+caller-abort-first Error undefined mine false early=true
+already-aborted Error undefined before false early=true
+invalid headersTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG invalid headersTimeout true early=true
+invalid bodyTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG invalid bodyTimeout true early=true
+invalid headersTimeout x InvalidArgumentError UND_ERR_INVALID_ARG invalid headersTimeout true early=true
+invalid bodyTimeout x InvalidArgumentError UND_ERR_INVALID_ARG invalid bodyTimeout true early=true
+invalid headersTimeout NaN InvalidArgumentError UND_ERR_INVALID_ARG invalid headersTimeout true early=true
+invalid bodyTimeout NaN InvalidArgumentError UND_ERR_INVALID_ARG invalid bodyTimeout true early=true
+invalid headersTimeout Infinity InvalidArgumentError UND_ERR_INVALID_ARG invalid headersTimeout true early=true
+invalid bodyTimeout Infinity InvalidArgumentError UND_ERR_INVALID_ARG invalid bodyTimeout true early=true
+fractional HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+client headersTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero
+client bodyTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero
+pool headersTimeout -1 built
+agent headersTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero true early=true
+pool bodyTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero true early=true
+client headersTimeout 1.5 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero
+client bodyTimeout 1.5 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero
+pool headersTimeout 1.5 built
+agent headersTimeout 1.5 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero true early=true
+pool bodyTimeout 1.5 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero true early=true
+client headersTimeout 5 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero
+client bodyTimeout 5 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero
+pool headersTimeout 5 built
+agent headersTimeout 5 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero true early=true
+pool bodyTimeout 5 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero true early=true
+client headersTimeout NaN InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero
+client bodyTimeout NaN InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero
+pool headersTimeout NaN built
+agent headersTimeout NaN HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+pool bodyTimeout NaN HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+proxy-agent bodyTimeout 1.5 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero true early=true";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// undici's `headersTimeout` runs while the request is on a connected socket
+/// (client-h1.js resumeH1), never across the connect: a dispatcher whose
+/// connect function takes 800 ms does not use up a 600 ms limit, and the
+/// limit still bounds the wait for the head once the socket is there. Up to
+/// the first cut of #218 oam started the timer before the fetch, so it also
+/// counted the connect. A ProxyAgent's CONNECT exchange is timed by undici's
+/// proxy client, on its 300 s default, not by the ProxyAgent's own
+/// headersTimeout, which bounds the origin's answer only. The expected output
+/// is node v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_phase_timeouts_measure_what_undici_measures() {
+    let script = write_temp(
+        "undici_phase_timeouts_measure/main.mjs",
+        r##"import net from 'node:net';
+import { request, Agent, ProxyAgent, buildConnector } from 'undici';
+
+// An origin that answers 300 ms after the request, and one that never answers.
+const slow = net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => setTimeout(() => s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok'), 300));
+});
+const never = net.createServer((s) => { s.on('data', () => {}); s.on('error', () => {}); });
+const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(srv.address().port)));
+const origin = `http://127.0.0.1:${await listen(slow)}`;
+const silent = `http://127.0.0.1:${await listen(never)}`;
+
+async function attempt(label, fn) {
+  const t0 = Date.now();
+  try {
+    const r = await fn();
+    console.log(label, 'ok', r.statusCode ?? r.status, await (r.body.text ? r.body.text() : r.text()));
+  } catch (e) {
+    const c = e?.cause ?? e;
+    // `late` says the timer ran after the 300 ms connect, not across it.
+    console.log(label, 'failed', c.name, c.code, 'late=' + (Date.now() - t0 >= 650));
+  }
+}
+
+// headersTimeout starts once the request is on a connected socket.
+const plain = buildConnector({});
+const slowConnect = (ms) => (opts, cb) => setTimeout(() => plain(opts, cb), ms);
+await attempt('slow-connect', () => request(origin, { dispatcher: new Agent({ connect: slowConnect(800) }), headersTimeout: 600 }));
+await attempt('slow-connect-agent-option', () => request(origin, { dispatcher: new Agent({ headersTimeout: 600, connect: slowConnect(800) }) }));
+// ...and still bounds the wait for the head once connected.
+await attempt('connected-then-silent', () => request(silent, { dispatcher: new Agent({ connect: slowConnect(300) }), headersTimeout: 400 }));
+
+// A ProxyAgent's CONNECT goes through undici's proxy client, on that
+// client's 300 s default: the ProxyAgent's own headersTimeout is for the
+// origin's answer, so a proxy slower than it still tunnels, fetch included.
+const proxy = net.createServer((c) => {
+  c.on('error', () => {});
+  c.once('data', (d) => {
+    const port = Number(d.toString('latin1').split(' ')[1].split(':').pop());
+    setTimeout(() => {
+      const up = net.connect(port, '127.0.0.1', () => { c.write('HTTP/1.1 200 Connection Established\r\n\r\n'); up.pipe(c); c.pipe(up); });
+      up.on('error', () => c.destroy());
+      c.on('close', () => up.destroy());
+    }, 600);
+  });
+});
+const viaProxy = () => new ProxyAgent({ uri: `http://127.0.0.1:${proxy.address().port}`, headersTimeout: 400 });
+await listen(proxy);
+await attempt('slow-proxy-request', () => request(origin, { dispatcher: viaProxy() }));
+await attempt('slow-proxy-fetch', () => fetch(origin, { dispatcher: viaProxy() }));
+await attempt('slow-proxy-silent-origin', () => request(silent, { dispatcher: viaProxy() }));
+
+// A delay past setTimeout's 2^31-1 ms ceiling is "no limit" (undici's timers
+// compare timestamps), not a timer that fires at once with a warning.
+const warnings = [];
+process.on('warning', (w) => warnings.push(w.name));
+const huge = { headersTimeout: 2 ** 31, bodyTimeout: 2 ** 32 };
+await attempt('huge-request', () => request(origin, huge));
+await attempt('huge-agent', () => request(origin, { dispatcher: new Agent(huge) }));
+await attempt('huge-proxy', () => request(origin, { dispatcher: new ProxyAgent({ uri: `http://127.0.0.1:${proxy.address().port}`, ...huge }) }));
+await attempt('huge-connect', () => request(origin, { dispatcher: new Agent({ connect: buildConnector({ timeout: 2 ** 31 }) }) }));
+console.log('warnings', JSON.stringify(warnings));
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "\
+slow-connect ok 200 ok
+slow-connect-agent-option ok 200 ok
+connected-then-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT late=true
+slow-proxy-request ok 200 ok
+slow-proxy-fetch ok 200 ok
+slow-proxy-silent-origin failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT late=true
+huge-request ok 200 ok
+huge-agent ok 200 ok
+huge-proxy ok 200 ok
+huge-connect ok 200 ok
+warnings []";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 // An undici Agent's connect.lookup hook is honored as a REAL DNS/connect pin
 // (the DNS-rebind / SSRF control @yawlabs/fetch-mcp relies on). Proof: pin a
 // NON-resolvable host to the server's real IP -- the request must connect
@@ -5367,6 +5637,304 @@ A.close(); B.close(); S.close();
          connect-ca 200 secure /c1 [] [\"S/c1\"]\n\
          connect-pin failed Error EPIN pin mismatch [] []\n\
          connect-insecure 200 secure /c3 [] [\"S/c3\"]";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// undici's `ProxyAgent` and `EnvHttpProxyAgent` (#208). A ProxyAgent sends
+/// every request -- to an http origin as much as an https one -- through a
+/// `CONNECT` tunnel, so on oam it is a dispatcher whose connect function
+/// opens that tunnel, and every entry point a dispatcher has goes through the
+/// proxy: fetch's `dispatcher`, the global dispatcher, `undici.fetch`,
+/// `undici.request`, the agent's own `request()`, each redirect hop. The
+/// proxy here splices to 127.0.0.1 whatever host the CONNECT named, so the
+/// requests to `a.test` and `b.test` (which do not resolve) only succeed
+/// through it. Pinned: the CONNECT head on the wire, TLS to the origin inside
+/// the tunnel under `requestTls`, TLS to an https proxy under `proxyTls`,
+/// the credentials (`token`, `auth`, the URL's userinfo) going to the proxy
+/// and never the origin, the refusal of a caller Proxy-Authorization, a proxy
+/// that refuses the tunnel or is not there, undici's constructor checks, and
+/// EnvHttpProxyAgent's choice per origin from its options, the environment
+/// and `no_proxy`. Up to 0.17.1 the shim exported neither class, so
+/// `import { ProxyAgent } from 'undici'` was a link-time SyntaxError.
+///
+/// The expected output is node v22.22.2 + undici 6.29.0's, line for line,
+/// with one exception: `refused` (a fetch whose proxy answers 403). undici
+/// calls its connect callback twice there, and node's fetch reports the
+/// second call's `Request was cancelled.`; oam reports the first, the
+/// `Proxy response (403) !== 200` that `undici.request` reports in both.
+#[test]
+fn undici_proxy_agent_tunnels_every_connection() {
+    let script = write_temp(
+        "undici_proxy_agent/main.mjs",
+        &r##"import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
+import tls from 'node:tls';
+import * as undici from 'undici';
+import { ProxyAgent, EnvHttpProxyAgent } from 'undici';
+
+const redact = (s) => String(s).replace(/\b\d{4,5}\b/g, 'P');
+const hits = [];
+const tunnels = [];
+const O = http.createServer((req, res) => {
+  hits.push(`O${req.url} host=${redact(req.headers.host)} pa=${req.headers['proxy-authorization'] ?? '-'}`);
+  if (req.url === '/hop') { res.writeHead(302, { location: `http://b.test:${O.address().port}/landed` }); res.end(); return; }
+  res.end('plain ' + req.url);
+});
+const S = https.createServer({ key: `__KEY__`, cert: `__CERT__` }, (req, res) => { hits.push(`S${req.url}`); res.end('secure ' + req.url); });
+// A CONNECT proxy: records each tunnel request's head, then splices the
+// client to 127.0.0.1:<the authority's port>, whatever host it named -- so a
+// request to a name that does not resolve only succeeds THROUGH it.
+let verdict = 200;
+const serveTunnel = (tag) => (c) => {
+  c.on('error', () => {});
+  let buf = Buffer.alloc(0);
+  const onData = (d) => {
+    buf = Buffer.concat([buf, d]);
+    const end = buf.indexOf('\r\n\r\n');
+    if (end === -1) return;
+    c.removeListener('data', onData);
+    const head = buf.subarray(0, end).toString('latin1').split('\r\n');
+    tunnels.push(tag + redact(head.join(' | ')));
+    if (verdict !== 200) { c.end(`HTTP/1.1 ${verdict} No\r\ncontent-length: 0\r\n\r\n`); return; }
+    const port = Number(head[0].split(' ')[1].split(':').pop());
+    const up = net.connect(port, '127.0.0.1', () => { c.write('HTTP/1.1 200 Connection Established\r\n\r\n'); up.pipe(c); c.pipe(up); });
+    up.on('error', () => c.destroy());
+    c.on('close', () => up.destroy());
+  };
+  c.on('data', onData);
+};
+const P = net.createServer(serveTunnel(''));
+const TP = tls.createServer({ key: `__KEY__`, cert: `__CERT__` }, serveTunnel('tls:'));
+for (const srv of [O, S, P, TP]) await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const proxy = `http://127.0.0.1:${P.address().port}`;
+const plain = `http://a.test:${O.address().port}`;
+const secure = `https://localhost:${S.address().port}`;
+const ca = `__CA__`;
+
+async function probe(name, run) {
+  hits.length = 0; tunnels.length = 0;
+  let out;
+  try {
+    const r = await run();
+    const body = r.body && typeof r.body.text === 'function' ? await r.body.text() : await r.text();
+    out = `${r.status ?? r.statusCode} ${body}`;
+  } catch (e) {
+    const cause = e?.cause ?? e;
+    out = `failed ${cause?.name} ${cause?.code} ${redact(cause?.message)}`;
+  }
+  console.log(name, out, JSON.stringify(tunnels), JSON.stringify(hits));
+}
+const ctor = (name, make) => {
+  try { const a = make(); console.log(name, 'constructed', a instanceof undici.Dispatcher); } catch (e) { console.log(name, e.name, e.code, e.message); }
+};
+
+// The three spellings of the proxy, on every entry point.
+await probe('fetch-string', () => fetch(plain + '/1', { dispatcher: new ProxyAgent(proxy) }));
+await probe('fetch-url', () => fetch(plain + '/2', { dispatcher: new ProxyAgent(new URL(proxy)) }));
+await probe('fetch-uri', () => fetch(plain + '/3', { dispatcher: new ProxyAgent({ uri: proxy }) }));
+const mk = () => new ProxyAgent(proxy);
+await probe('undici-request', () => undici.request(plain + '/4', { dispatcher: mk() }));
+await probe('agent-request', () => mk().request({ origin: plain, path: '/5', method: 'GET' }));
+const previous = undici.getGlobalDispatcher();
+undici.setGlobalDispatcher(mk());
+await probe('global-fetch', () => fetch(plain + '/6'));
+undici.setGlobalDispatcher(mk());
+await probe('undici-fetch', () => undici.fetch(plain + '/7'));
+undici.setGlobalDispatcher(mk());
+await probe('global-request', () => undici.request(plain + '/8'));
+undici.setGlobalDispatcher(previous);
+await probe('redirect', () => fetch(plain + '/hop', { dispatcher: mk() }));
+
+// An https origin: CONNECT, then TLS to the origin inside the tunnel, under requestTls.
+await probe('https-origin', () => fetch(secure + '/s1', { dispatcher: new ProxyAgent({ uri: proxy, requestTls: { ca } }) }));
+await probe('https-untrusted', () => fetch(secure + '/s2', { dispatcher: new ProxyAgent({ uri: proxy }) }));
+// An https proxy: TLS to the proxy under proxyTls, then the tunnel.
+const tlsProxy = `https://localhost:${TP.address().port}`;
+await probe('tls-proxy', () => fetch(plain + '/t1', { dispatcher: new ProxyAgent({ uri: tlsProxy, proxyTls: { ca } }) }));
+await probe('tls-proxy-https', () => fetch(secure + '/t2', { dispatcher: new ProxyAgent({ uri: tlsProxy, proxyTls: { ca }, requestTls: { ca } }) }));
+await probe('tls-proxy-untrusted', () => fetch(plain + '/t3', { dispatcher: new ProxyAgent({ uri: tlsProxy }) }));
+
+// Credentials go to the proxy on the CONNECT, never to the origin.
+await probe('auth-userinfo', () => fetch(plain + '/a1', { dispatcher: new ProxyAgent(proxy.replace('//', '//us%40er:p%3Ass@')) }));
+await probe('auth-token', () => fetch(plain + '/a2', { dispatcher: new ProxyAgent({ uri: proxy, token: 'Bearer tok' }) }));
+await probe('auth-auth', () => fetch(plain + '/a3', { dispatcher: new ProxyAgent({ uri: proxy, auth: 'dTpw' }) }));
+await probe('headers', () => fetch(plain + '/a4', { dispatcher: new ProxyAgent({ uri: proxy, headers: { 'x-proxy-note': 'n' } }) }));
+await probe('request-proxy-auth', () => undici.request(plain + '/a5', { dispatcher: mk(), headers: { 'Proxy-Authorization': 'Basic x' } }));
+await probe('fetch-proxy-auth', () => fetch(plain + '/a6', { dispatcher: mk(), headers: { 'proxy-authorization': 'Basic x' } }));
+
+// A proxy that refuses the tunnel, and one that is not there.
+verdict = 403;
+await probe('refused', () => fetch(plain + '/r1', { dispatcher: mk() }));
+await probe('refused-request', () => undici.request(plain + '/r2', { dispatcher: mk() }));
+verdict = 407;
+await probe('auth-required', () => undici.request(plain + '/r2b', { dispatcher: mk() }));
+verdict = 200;
+const dead = net.createServer();
+await new Promise((r) => dead.listen(0, '127.0.0.1', r));
+const deadPort = dead.address().port;
+await new Promise((r) => dead.close(r));
+await probe('proxy-down', () => fetch(plain + '/r3', { dispatcher: new ProxyAgent(`http://127.0.0.1:${deadPort}`) }));
+
+// Construction.
+ctor('no-args', () => new ProxyAgent());
+ctor('no-uri', () => new ProxyAgent({}));
+ctor('auth+token', () => new ProxyAgent({ uri: proxy, auth: 'a', token: 'b' }));
+ctor('clientFactory', () => new ProxyAgent({ uri: proxy, clientFactory: 1 }));
+ctor('ok', () => new ProxyAgent({ uri: proxy }));
+
+// EnvHttpProxyAgent: the proxy per scheme from its options, else the
+// environment; no_proxy names go direct.
+const direct = `http://127.0.0.1:${O.address().port}`;
+await probe('env-opts-http', () => fetch(plain + '/e1', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy }) }));
+await probe('env-opts-https-falls-back', () => fetch(secure + '/e2', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy, requestTls: { ca } }) }));
+await probe('env-opts-https', () => fetch(secure + '/e3', { dispatcher: new EnvHttpProxyAgent({ httpsProxy: tlsProxy, proxyTls: { ca }, requestTls: { ca } }) }));
+await probe('env-opts-https-only', () => fetch(direct + '/e4', { dispatcher: new EnvHttpProxyAgent({ httpsProxy: tlsProxy, proxyTls: { ca } }) }));
+await probe('env-none', () => fetch(direct + '/e5', { dispatcher: new EnvHttpProxyAgent() }));
+await probe('env-no-proxy-exact', () => fetch(direct + '/e6', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy, noProxy: 'other.test, 127.0.0.1' }) }));
+await probe('env-no-proxy-port-miss', () => fetch(direct + '/e7', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy, noProxy: '127.0.0.1:1' }) }));
+await probe('env-no-proxy-suffix', () => fetch(plain + '/e8', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy, noProxy: '.test' }) }));
+await probe('env-no-proxy-star', () => fetch(direct + '/e9', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy, noProxy: '*' }) }));
+process.env.http_proxy = proxy;
+const fromEnv = new EnvHttpProxyAgent();
+await probe('env-var', () => fetch(plain + '/e10', { dispatcher: fromEnv }));
+process.env.no_proxy = 'a.test';
+await probe('env-var-no-proxy-live', () => fetch(plain + '/e11', { dispatcher: fromEnv }));
+await probe('env-request', () => undici.request(direct + '/e12', { dispatcher: fromEnv }));
+delete process.env.http_proxy;
+delete process.env.no_proxy;
+
+O.close(); S.close(); P.close(); TP.close();
+"##
+            .replace("__CERT__", TLS_TEST_LEAF_CERT)
+            .replace("__KEY__", TLS_TEST_LEAF_KEY)
+            .replace("__CA__", TLS_TEST_CA_CERT),
+    );
+    // The script names its proxies itself; the environment's must not apply.
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"fetch-string 200 plain /1 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/1 host=a.test:P pa=-"]
+fetch-url 200 plain /2 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/2 host=a.test:P pa=-"]
+fetch-uri 200 plain /3 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/3 host=a.test:P pa=-"]
+undici-request 200 plain /4 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/4 host=a.test:P pa=-"]
+agent-request 200 plain /5 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/5 host=a.test:P pa=-"]
+global-fetch 200 plain /6 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/6 host=a.test:P pa=-"]
+undici-fetch 200 plain /7 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/7 host=a.test:P pa=-"]
+global-request 200 plain /8 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/8 host=a.test:P pa=-"]
+redirect 200 plain /landed ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close","CONNECT b.test:P HTTP/1.1 | host: b.test:P | connection: close"] ["O/hop host=a.test:P pa=-","O/landed host=b.test:P pa=-"]
+https-origin 200 secure /s1 ["CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] ["S/s1"]
+https-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate ["CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] []
+tls-proxy 200 plain /t1 ["tls:CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/t1 host=a.test:P pa=-"]
+tls-proxy-https 200 secure /t2 ["tls:CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] ["S/t2"]
+tls-proxy-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate [] []
+auth-userinfo 200 plain /a1 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | proxy-authorization: Basic dXNAZXI6cDpzcw=="] ["O/a1 host=a.test:P pa=-"]
+auth-token 200 plain /a2 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | proxy-authorization: Bearer tok"] ["O/a2 host=a.test:P pa=-"]
+auth-auth 200 plain /a3 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | proxy-authorization: Basic dTpw"] ["O/a3 host=a.test:P pa=-"]
+headers 200 plain /a4 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | x-proxy-note: n"] ["O/a4 host=a.test:P pa=-"]
+request-proxy-auth failed InvalidArgumentError UND_ERR_INVALID_ARG Proxy-Authorization should be sent in ProxyAgent constructor [] []
+fetch-proxy-auth failed InvalidArgumentError UND_ERR_INVALID_ARG Proxy-Authorization should be sent in ProxyAgent constructor [] []
+refused failed AbortError UND_ERR_ABORTED Proxy response (403) !== 200 when HTTP Tunneling ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] []
+refused-request failed AbortError UND_ERR_ABORTED Proxy response (403) !== 200 when HTTP Tunneling ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] []
+auth-required failed AbortError UND_ERR_ABORTED Proxy response (407) !== 200 when HTTP Tunneling ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] []
+proxy-down failed Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:P [] []
+no-args InvalidArgumentError UND_ERR_INVALID_ARG Proxy uri is mandatory
+no-uri InvalidArgumentError UND_ERR_INVALID_ARG Proxy uri is mandatory
+auth+token InvalidArgumentError UND_ERR_INVALID_ARG opts.auth cannot be used in combination with opts.token
+clientFactory InvalidArgumentError UND_ERR_INVALID_ARG Proxy opts.clientFactory must be a function.
+ok constructed true
+env-opts-http 200 plain /e1 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/e1 host=a.test:P pa=-"]
+env-opts-https-falls-back 200 secure /e2 ["CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] ["S/e2"]
+env-opts-https 200 secure /e3 ["tls:CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] ["S/e3"]
+env-opts-https-only 200 plain /e4 [] ["O/e4 host=127.0.0.1:P pa=-"]
+env-none 200 plain /e5 [] ["O/e5 host=127.0.0.1:P pa=-"]
+env-no-proxy-exact 200 plain /e6 [] ["O/e6 host=127.0.0.1:P pa=-"]
+env-no-proxy-port-miss 200 plain /e7 ["CONNECT 127.0.0.1:P HTTP/1.1 | host: 127.0.0.1:P | connection: close"] ["O/e7 host=127.0.0.1:P pa=-"]
+env-no-proxy-suffix failed Error ENOTFOUND getaddrinfo ENOTFOUND a.test [] []
+env-no-proxy-star 200 plain /e9 [] ["O/e9 host=127.0.0.1:P pa=-"]
+env-var 200 plain /e10 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/e10 host=a.test:P pa=-"]
+env-var-no-proxy-live failed Error ENOTFOUND getaddrinfo ENOTFOUND a.test [] []
+env-request 200 plain /e12 ["CONNECT 127.0.0.1:P HTTP/1.1 | host: 127.0.0.1:P | connection: close"] ["O/e12 host=127.0.0.1:P pa=-"]"##;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+    // undici's one-time notice, as node prints it.
+    assert!(
+        stderr.contains("[UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental"),
+        "{stderr}"
+    );
+}
+
+/// The undici names that work through `dispatch()` -- which oam does not run
+/// -- are exported and refuse when used, as the Mock* classes do (#208): a
+/// name missing from an ES module stops the whole program at import with a
+/// SyntaxError, whether or not the importer ever uses it, so
+/// `@actions/http-client` 4 and `@upstash/context7-mcp` (both `import {
+/// ProxyAgent } from 'undici'`) never started. The sorted export list is
+/// pinned so that a dropped name fails here rather than at a user's import;
+/// what a ProxyAgent cannot do on oam (`proxyTunnel: false`, a
+/// `clientFactory` or `factory`) is refused at construction.
+#[test]
+fn undici_exports_link_and_refuse_what_oam_cannot_run() {
+    let script = write_temp(
+        "undici_exports/main.mjs",
+        r##"// Named imports: each of these is a link-time SyntaxError if the shim does
+// not export it, before a line of the program runs.
+import {
+  ProxyAgent, EnvHttpProxyAgent, RetryAgent, RetryHandler, RedirectHandler, DecoratorHandler,
+  createRedirectInterceptor, connect, upgrade, pipeline, mockErrors, CloseEvent, errors,
+} from 'undici';
+import * as undici from 'undici';
+
+console.log(Object.keys(undici).sort().join(' '));
+const shape = (e) => `${e.name} ${e.code} ${e.message.split(' is not supported')[0]}`;
+const refused = (name, run) => {
+  try { run(); console.log(name, 'ran'); } catch (e) { console.log(name, shape(e)); }
+};
+refused('RetryAgent', () => new RetryAgent(new undici.Agent()));
+refused('RetryHandler', () => new RetryHandler({}, {}));
+refused('RedirectHandler', () => new RedirectHandler());
+refused('DecoratorHandler', () => new DecoratorHandler({}));
+refused('createRedirectInterceptor', () => createRedirectInterceptor({ maxRedirections: 1 }));
+refused('pipeline', () => pipeline('http://127.0.0.1:1/', {}, () => {}));
+await connect({ origin: 'http://127.0.0.1:1', path: '/' }).then(() => console.log('connect ran'), (e) => console.log('connect', shape(e)));
+await upgrade({ origin: 'http://127.0.0.1:1', path: '/' }).then(() => console.log('upgrade ran'), (e) => console.log('upgrade', shape(e)));
+await new Promise((r) => connect({ origin: 'http://127.0.0.1:1', path: '/' }, (e, data) => { console.log('connect-callback', shape(e), data); r(); }));
+// What a ProxyAgent cannot do here is refused when it is built, after
+// undici's own argument checks.
+refused('proxyTunnel-false', () => new ProxyAgent({ uri: 'http://127.0.0.1:1', proxyTunnel: false }));
+refused('clientFactory', () => new ProxyAgent({ uri: 'http://127.0.0.1:1', clientFactory: () => {} }));
+refused('factory', () => new ProxyAgent({ uri: 'http://127.0.0.1:1', factory: () => {} }));
+const e = new mockErrors.MockNotMatchedError();
+console.log('mockErrors', e.name, e.code, e instanceof errors.UndiciError);
+console.log('CloseEvent', CloseEvent === globalThis.CloseEvent, typeof EnvHttpProxyAgent);
+const aborted = new errors.RequestAbortedError();
+console.log('RequestAbortedError', aborted.name, aborted.code, aborted.message);
+console.log('RequestAbortedError is', aborted instanceof errors.AbortError, aborted instanceof errors.UndiciError, aborted instanceof Error);
+const abort = new errors.AbortError();
+console.log('AbortError', abort.name, abort.code, abort.message, abort instanceof errors.UndiciError, abort instanceof errors.RequestAbortedError);
+const prx = new errors.SecureProxyConnectionError(new Error('why'));
+console.log('SecureProxyConnectionError', prx.name, prx.code, prx.message, prx.cause.message);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = r##"Agent BalancedPool Blob Client CloseEvent DecoratorHandler Dispatcher EnvHttpProxyAgent File FormData Headers MessageEvent MockAgent MockClient MockPool Pool ProxyAgent RedirectHandler Request Response RetryAgent RetryHandler WebSocket buildConnector connect createRedirectInterceptor default errors fetch getGlobalDispatcher getGlobalOrigin interceptors mockErrors pipeline request setGlobalDispatcher setGlobalOrigin stream upgrade
+RetryAgent NotSupportedError UND_ERR_NOT_SUPPORTED undici's RetryAgent
+RetryHandler NotSupportedError UND_ERR_NOT_SUPPORTED undici's RetryHandler
+RedirectHandler NotSupportedError UND_ERR_NOT_SUPPORTED undici's RedirectHandler
+DecoratorHandler NotSupportedError UND_ERR_NOT_SUPPORTED undici's DecoratorHandler
+createRedirectInterceptor NotSupportedError UND_ERR_NOT_SUPPORTED undici's createRedirectInterceptor()
+pipeline NotSupportedError UND_ERR_NOT_SUPPORTED undici's pipeline()
+connect NotSupportedError UND_ERR_NOT_SUPPORTED undici's connect()
+upgrade NotSupportedError UND_ERR_NOT_SUPPORTED undici's upgrade()
+connect-callback NotSupportedError UND_ERR_NOT_SUPPORTED undici's connect() null
+proxyTunnel-false NotSupportedError UND_ERR_NOT_SUPPORTED undici's ProxyAgent with proxyTunnel: false
+clientFactory NotSupportedError UND_ERR_NOT_SUPPORTED A ProxyAgent with a clientFactory or factory
+factory NotSupportedError UND_ERR_NOT_SUPPORTED A ProxyAgent with a clientFactory or factory
+mockErrors MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED true
+CloseEvent true function
+RequestAbortedError AbortError UND_ERR_ABORTED Request aborted
+RequestAbortedError is true true true
+AbortError AbortError UND_ERR_ABORT The operation was aborted true false
+SecureProxyConnectionError SecureProxyConnectionError UND_ERR_PRX_TLS Secure Proxy Connection failed why"##;
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
@@ -9975,15 +10543,20 @@ fn check_rejects_an_impostor_tsgo_and_daemon_status_reports_why() {
     // reason and the spawn-failure timestamp instead of a bare
     // {"running":false}. The daemon records its reason from its own
     // process, when its tsgo probe fails; the client stops waiting for it
-    // after SPAWN_WAIT (5 s), marks the spawn failed and falls back. On a
-    // loaded machine the client can get there first, with the daemon still
-    // probing, so status is read until the reason is in (bounded).
+    // after SPAWN_WAIT (5 s), marks the spawn failed with a reason of its
+    // own and falls back. On a loaded machine the client can get there
+    // first, with the daemon still probing, so status is read until the
+    // daemon's own reason has replaced the client's (bounded).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let parsed: serde_json::Value = loop {
         let status = run(&["daemon", "status", proj.to_str().unwrap()]);
         let parsed: serde_json::Value =
             serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim()).unwrap();
-        if parsed["last_error"].is_string() || std::time::Instant::now() >= deadline {
+        if parsed["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("tsgo"))
+            || std::time::Instant::now() >= deadline
+        {
             break parsed;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -9998,6 +10571,75 @@ fn check_rejects_an_impostor_tsgo_and_daemon_status_reports_why() {
     assert!(
         parsed["spawn_failed_ms_ago"].as_u64().is_some(),
         "status must carry the spawn-failure marker: {parsed}"
+    );
+}
+
+#[test]
+fn daemon_status_gives_a_reason_with_every_spawn_failure() {
+    // #209: the client marks a spawn failed after SPAWN_WAIT (5 s), but the
+    // reason used to come only from the daemon, once its tsgo probe failed.
+    // A probe slower than that left `oam daemon status` saying the spawn
+    // failed, with no last_error, for as long as the probe took. This
+    // impostor answers --version only after ~20 s, so the whole window is
+    // open while status is read.
+    let fake = write_fake_tsgo(
+        "sleepy-version-tsgo",
+        "@echo off\r\nping -n 21 127.0.0.1 >nul\r\necho not a compiler\r\nexit /b 0\r\n",
+        "#!/bin/sh\nsleep 20\necho 'not a compiler'\nexit 0\n",
+    );
+    // A DEDICATED cache dir: the spawn-failure marker lives there.
+    let cache = write_temp("sleepy-version-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    write_temp(
+        "sleepyproj/tsconfig.json",
+        "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true}}",
+    );
+    let proj = write_temp("sleepyproj/a.ts", "export const n: number = 1;")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let command = |args: &[&str]| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_oam"));
+        command
+            .args(args)
+            .env("OAM_CACHE_DIR", &cache)
+            .env("OAM_DAEMON_IDLE_MS", "45000")
+            .env("OAM_TSGO_TIMEOUT_MS", "60000")
+            .env("OAM_TSGO", &fake);
+        command
+    };
+
+    let mut check = command(&["check", proj.to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("oam check starts");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let parsed: serde_json::Value = loop {
+        let status = command(&["daemon", "status", proj.to_str().unwrap()])
+            .output()
+            .expect("oam daemon status runs");
+        let parsed: serde_json::Value =
+            serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim()).unwrap();
+        if parsed["spawn_failed_ms_ago"].is_u64() || std::time::Instant::now() >= deadline {
+            break parsed;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let _ = check.kill();
+    let _ = check.wait();
+
+    assert!(
+        parsed["spawn_failed_ms_ago"].is_u64(),
+        "the client never marked the spawn failed: {parsed}"
+    );
+    assert!(
+        parsed["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("did not come up")),
+        "a spawn failure must carry a reason from the moment it is recorded: {parsed}"
     );
 }
 

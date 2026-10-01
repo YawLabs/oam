@@ -647,6 +647,30 @@ else fail "empty/non-numeric readings must be inert"; fi
 # hardcoded 20/10 defaults. They are resolved at SOURCE time, so an override
 # only takes effect in a fresh shell -- assigning after the fact would silently
 # test nothing, which is why these go through `bash -c`.
+# #210: the linux leg's probe could answer nothing with exit 0 (df's failure
+# hidden behind a trailing `tr`), and the check then skipped itself in silence.
+# Every reading is now either a number or a reason.
+it "a df answer in GB reads as its number"
+eq "$(disk_free_reading 0 "$(printf 'Avail\n  37G\n')")" "37"
+it "a df answer that is not a size gives a reason, not a number"
+out="$(disk_free_reading 0 "Avail")" && fail "a header-only answer must not read as a size: $out" \
+  || { case "$out" in *"not a size"*) pass ;; *) fail "no reason given: '$out'" ;; esac; }
+it "a df probe that printed nothing gives a reason"
+out="$(disk_free_reading 0 "")" && fail "an empty answer must not read as a size: $out" \
+  || { case "$out" in *"printed nothing"*) pass ;; *) fail "no reason given: '$out'" ;; esac; }
+it "a failed probe (a dead tunnel's 255) gives a reason naming its status"
+out="$(disk_free_reading 255 "")" && fail "a failed probe must not read as a size: $out" \
+  || { case "$out" in *"exit 255"*) pass ;; *) fail "no reason given: '$out'" ;; esac; }
+it "a failed df with stray digits on stdout is still a failure"
+out="$(disk_free_reading 1 "  12G")" && fail "status 1 must not read as a size: $out" || pass
+it "the linux leg's probe keeps df's status and stderr, and says when it did not run"
+GCPLEG_CODE="$(sed 's/#.*//' scripts/build-platforms-gcp-iap.sh)"
+if grep -qE "df -BG[^\"]*\|" <<<"$GCPLEG_CODE" || grep -qE 'df -BG.*2>/dev/null' <<<"$GCPLEG_CODE"; then
+  fail "the df probe pipes or discards stderr again"
+elif ! grep -q 'disk headroom NOT CHECKED' <<<"$GCPLEG_CODE"; then
+  fail "an unreadable builder disk no longer warns"
+else pass; fi
+
 it "OAM_DISK_RECLAIM_GB moves the reclaim threshold"
 eq "$(OAM_DISK_RECLAIM_GB=50 bash -c '. scripts/lib/iap-helpers.sh; disk_needs_reclaim 40 && echo reclaim || echo skip')" \
    "reclaim"
@@ -1916,6 +1940,40 @@ for st in 0 1 1-noreport 2 3 127 129 130 137 143; do
 done
 if [ "$MX_GOT" = " 0:ok 1:fail-verdict 1-noreport:fail 2:warn 3:warn 127:fail 129:fail 130:fail 137:fail 143:fail" ]; then pass
 else fail "release-local.sh's matrix step read the statuses as:$MX_GOT"; fi
+
+# #220: an INCOMPLETE matrix is a warning, and the rows it could not answer
+# used to be one word each in the matrix's own list, scrolled past -- the fetch
+# row read UPSTREAM through a release that way. Each now gets a warn line of
+# its own from the report; a verified or boot row gets none.
+it "release-local.sh names every sidecar the matrix did not exercise, one line each"
+MX_FN="$(awk '/^matrix_unanswered\(\)\{$/ { f = 1 } f { print } f && /^}$/ { exit }' scripts/release-local.sh)"
+MX_WARN_STUBS='ok(){ echo "ok $*"; }; warn(){ echo "warn $*"; }; fail(){ echo "fail $*"; exit 1; }'
+cat > "$MX_REPORT" <<'JSON'
+{
+  "exitCode": 3,
+  "sidecars": [
+    { "name": "memory", "state": "verified" },
+    { "name": "fetch", "state": "upstream", "why": "node refused the call too" },
+    { "name": "redis", "state": "skip", "why": "no redis-server" },
+    { "name": "ctxlint", "state": "boot", "why": "boot-only by design" }
+  ]
+}
+JSON
+MX_OUT="$(bash -c "$MX_WARN_STUBS; $MX_FN; matrix_report='$MX_REPORT'; (exit 3); $MX_BLOCK" 2>&1)"
+if [ -z "$MX_FN" ]; then fail "matrix_unanswered() not found in release-local.sh"
+elif ! grep -qx 'warn NOT EXERCISED on this build: fetch (UPSTREAM: node refused the call too)' <<<"$MX_OUT"; then
+  fail "the upstream fetch row was not named on its own line:$(printf '\n%s' "$MX_OUT")"
+elif ! grep -qx 'warn NOT EXERCISED on this build: redis (SKIP: no redis-server)' <<<"$MX_OUT"; then
+  fail "the skipped redis row was not named on its own line:$(printf '\n%s' "$MX_OUT")"
+elif grep -qE 'NOT EXERCISED.*(memory|ctxlint)' <<<"$MX_OUT"; then
+  fail "a verified or boot-only row was named as not exercised:$(printf '\n%s' "$MX_OUT")"
+elif grep -q '^fail' <<<"$MX_OUT"; then
+  fail "an INCOMPLETE matrix became fatal:$(printf '\n%s' "$MX_OUT")"
+else pass; fi
+
+it "release-local.sh's unanswered-row reader says nothing for a missing report"
+rm -f "$MX_REPORT"
+eq "$(bash -c "$MX_FN; matrix_unanswered '$MX_REPORT'")" ""
 
 # And the report it reads is this run's. The stash is a fresh mktemp dir per
 # run, so no earlier report is there today; the rm keeps it so if the stash is

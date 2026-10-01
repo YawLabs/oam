@@ -38,9 +38,12 @@
 //! never answers costs 2s, not the whole check budget.
 //!
 //! Sidecar files next to the state file: `<state>.error` (why the last
-//! serve() failed during setup) and `<state>.spawn-failed` (timestamp of
-//! the last spawn that never came up; clients skip spawning for 5 minutes
-//! after it). `oam daemon status` reports both.
+//! start failed) and `<state>.spawn-failed` (timestamp of the last spawn
+//! that never came up; clients skip spawning for 5 minutes after it).
+//! `oam daemon status` reports both. A client that gives up on a spawn
+//! writes its own reason with the marker, unless the daemon has already
+//! recorded one; a daemon that fails later still overwrites it with its
+//! more specific reason. So the marker never stands without a reason.
 
 use crate::{Diagnostic, TsgoHandle, find_tsconfig};
 use serde::{Deserialize, Serialize};
@@ -267,9 +270,24 @@ fn now_millis() -> u128 {
         .unwrap_or(0)
 }
 
-fn mark_spawn_failed(state_file: &Path) {
+/// Record that the spawn this client started never came up, and why.
+///
+/// The reason goes in first, and only if the daemon has not recorded its
+/// own: the daemon writes `<state>.error` from its process, when its setup
+/// fails, and that can be after this client stopped waiting (a slow tsgo
+/// probe under load). Without a reason of the client's own, `oam daemon
+/// status` would answer `spawn_failed_ms_ago` with no `last_error` for that
+/// whole window, while the 5-minute backoff points the user at it.
+fn mark_spawn_failed(state_file: &Path, reason: &str) {
     if let Some(dir) = state_file.parent() {
         let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(sidecar(state_file, "error"))
+    {
+        let _ = file.write_all(reason.as_bytes());
     }
     let _ = std::fs::write(
         sidecar(state_file, "spawn-failed"),
@@ -698,28 +716,34 @@ pub fn check_via_daemon(target: &Path) -> Result<Vec<Diagnostic>, String> {
         }
         let _ = std::fs::remove_file(sidecar(&state_file, "spawn-failed"));
     }
+    // A reason left by an earlier attempt would stand in for this one's:
+    // mark_spawn_failed does not overwrite a reason it finds.
+    let _ = std::fs::remove_file(sidecar(&state_file, "error"));
     let mut child = spawn_daemon(&tsconfig)?;
     let deadline = Instant::now() + SPAWN_WAIT;
     while Instant::now() < deadline {
         // A daemon that dies during setup is reported at once (with the
         // reason it wrote), not after the full wait.
         if let Ok(Some(status)) = child.try_wait() {
-            mark_spawn_failed(&state_file);
+            let exited = format!("daemon exited during startup ({status})");
             let reason = last_error(&state_file)
                 .map(|e| format!(": {e}"))
                 .unwrap_or_default();
-            return Err(format!("daemon exited during startup ({status}){reason}"));
+            mark_spawn_failed(&state_file, &exited);
+            return Err(format!("{exited}{reason}"));
         }
         if let Some(result) = try_existing(&tsconfig) {
             return result;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    mark_spawn_failed(&state_file);
-    Err(format!(
-        "daemon did not come up within {}s",
+    let reason = format!(
+        "daemon did not come up within {}s (a daemon still starting replaces \
+         this with its own reason if it then fails)",
         SPAWN_WAIT.as_secs()
-    ))
+    );
+    mark_spawn_failed(&state_file, &reason);
+    Err(reason)
 }
 
 /// None = no usable daemon (caller spawns). Some(Err) = the daemon answered
@@ -1727,8 +1751,46 @@ mod tests {
         let dir = scratch("marker");
         let state = dir.join("x.json");
         assert!(spawn_failure_age(&state).is_none());
-        mark_spawn_failed(&state);
+        mark_spawn_failed(&state, "gave up");
         let age = spawn_failure_age(&state).expect("marker readable");
         assert!(age < Duration::from_secs(5), "{age:?}");
+    }
+
+    #[test]
+    fn a_spawn_failure_is_recorded_with_its_reason() {
+        // #209: the marker alone let `oam daemon status` report a failed
+        // spawn with no last_error until the daemon got round to its own.
+        let dir = scratch("marker-reason");
+        let state = dir.join("x.json");
+        mark_spawn_failed(&state, "daemon did not come up within 5s");
+        assert!(spawn_failure_age(&state).is_some());
+        assert_eq!(
+            last_error(&state).as_deref(),
+            Some("daemon did not come up within 5s")
+        );
+    }
+
+    #[test]
+    fn a_spawn_failure_keeps_the_daemons_own_reason() {
+        let dir = scratch("marker-keeps");
+        let state = dir.join("x.json");
+        // The daemon failed first and said why: the client's guess must
+        // not replace it.
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(sidecar(&state, "error"), "unexpected tsgo version").unwrap();
+        mark_spawn_failed(&state, "daemon exited during startup (exit code: 1)");
+        assert_eq!(
+            last_error(&state).as_deref(),
+            Some("unexpected tsgo version")
+        );
+        // ...and a daemon that fails after the client gave up overwrites
+        // the client's reason with its own, as serve() does.
+        let late = dir.join("y.json");
+        mark_spawn_failed(&late, "daemon did not come up within 5s");
+        std::fs::write(sidecar(&late, "error"), "unexpected tsgo version").unwrap();
+        assert_eq!(
+            last_error(&late).as_deref(),
+            Some("unexpected tsgo version")
+        );
     }
 }
