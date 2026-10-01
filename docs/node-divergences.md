@@ -2221,6 +2221,12 @@ What still differs:
   parent passed in, see 19), so `fstatSync(0)`, `closeSync(0)`, `readSync(0, ...)` and
   the like are `EBADF` where node operates on the process's stdin. `writeSync(1|2)` is
   routed to stdout / stderr and matches. (`-0` is a valid descriptor 0 on both.)
+- **`fs.rm(path[, options], callback)` without a function callback** throws
+  `ERR_INVALID_ARG_TYPE` for `"cb"` at the call, as every other callback-form `fs`
+  call does. node v22.22.2's `rm` does not check its callback: the call returns, and
+  the rm's completion later dies with an uncaught `TypeError: callback is not a
+  function`. Reproducing that would turn a clear error at the call site into a
+  crash with no user frame, so oam keeps the check.
 - **A closed descriptor in range** behaves as before: `fs.close(fd, cb)` on one oam
   never opened calls back `null` where node reports `EBADF`, and on Windows node's
   `fchown` on any descriptor is a no-op success where oam reports `EBADF`.

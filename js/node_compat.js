@@ -10102,10 +10102,26 @@
   // node's makeCallback / validateFunction(cb, "cb") failure, which oam's fd
   // callback forms used to report as a bare, code-less "Callback must be a
   // function".
-  function validateCb(cb) {
+  function validateCb(cb, name = "cb") {
     if (typeof cb !== "function") {
-      throw nodeTypeError('The "cb" argument must be of type function.' + receivedSuffix(cb));
+      throw nodeTypeError('The "' + name + '" argument must be of type function.' + receivedSuffix(cb));
     }
+  }
+
+  // Where node's callback-form fs calls take their callback from (v22.22.2,
+  // measured per API): the argument after the `required` ones and the
+  // `optional` ones, or an optional slot that already holds a function
+  // (`stat(path, cb)`). Arguments after the callback are ignored, and a
+  // missing callback is "Received undefined" -- not whatever the last
+  // positional argument happened to be. CB_LAST is symlink's rule, which
+  // node writes as `makeCallback(arguments[arguments.length - 1])`.
+  const CB_LAST = -1;
+  function callbackSlot(args, required, optional) {
+    if (required === CB_LAST) return args.length > 0 ? args.length - 1 : 0;
+    const end = required + optional;
+    let at = required;
+    while (at < end && typeof args[at] !== "function") at++;
+    return at;
   }
 
   // ---- vectored-IO primitives, shared by node:fs's readv/writev and by
@@ -10894,10 +10910,14 @@
     const fsReqEnd = (token) => registry._activeRequests.delete(token);
 
     // Callback forms delegate to the promise forms (Node-style (err, value)).
-    function callbackify1(promiseFn) {
+    // `required` / `optional` say where node finds the callback (callbackSlot);
+    // the promise form gets the arguments before it.
+    function callbackify1(promiseFn, required, optional = 0, cbName = "cb") {
       return (...args) => {
-        const cb = args.pop();
-        validateCb(cb);
+        const at = callbackSlot(args, required, optional);
+        const cb = args[at];
+        validateCb(cb, cbName);
+        if (args.length > at) args.length = at;
         const token = fsReqStart();
         // Several promise forms are plain (non-async) arrows, so argument
         // validation throws SYNCHRONOUSLY -- the token must drop before the
@@ -11076,12 +11096,14 @@
     // writeFile / appendFile, callback form: a descriptor is written in place
     // from its current position, a path goes through fs/promises.
     function fdOrPathWrite(promiseFn) {
+      // `options` is never a function by the time it is passed: cb is at 3.
+      const viaPath = callbackify1(promiseFn, 3);
       return function (path, data, options, cb) {
         // node's `callback ||= options`: with no callback, the options
         // argument is the one validated as it.
         if (!cb) cb = options;
         if (typeof options === "function") options = undefined;
-        if (!isInt32(path)) return callbackify1(promiseFn)(path, data, options, cb);
+        if (!isInt32(path)) return viaPath(path, data, options, cb);
         validateCb(cb);
         // fs.write's descriptor check, which node reaches synchronously.
         validateFd(path, false);
@@ -11230,6 +11252,13 @@
       if (acc === 2) return append ? "a+" : "r+";
       return "r";
     }
+
+    // The path halves of callback forms whose own wrapper has already put the
+    // callback in place, built once rather than per call.
+    const readFileByPath = callbackify1(promises.readFile, 2);
+    // realpathArg runs inside, so the callback is checked before the path.
+    const realpathByPath = callbackify1((p) => realpathWalking(realpathArg(p)), 1);
+    const truncateByPath = callbackify1(promises.truncate, 2);
 
     const fs = {
       // The exported object is the WRAPPED module, the very object
@@ -11424,7 +11453,7 @@
         // node's `callback ||= options`, as in writeFile.
         if (!cb) cb = options;
         if (typeof options === "function") options = undefined;
-        if (!isInt32(path)) return callbackify1(promises.readFile)(path, options, cb);
+        if (!isInt32(path)) return readFileByPath(path, options, cb);
         validateCb(cb);
         readFdAsync(path, (err, bytes) => {
           if (err) return cb(err);
@@ -11439,40 +11468,40 @@
       },
       writeFile: fdOrPathWrite(promises.writeFile),
       appendFile: fdOrPathWrite(promises.appendFile),
-      stat: callbackify1(promises.stat),
-      lstat: callbackify1(promises.lstat),
-      statfs: callbackify1(promises.statfs),
-      readdir: callbackify1(promises.readdir),
-      glob: callbackify1(promises._globAsPromise),
-      mkdir: callbackify1(promises.mkdir),
-      rm: callbackify1(promises.rm),
-      rmdir: callbackify1(promises.rmdir),
-      unlink: callbackify1(promises.unlink),
-      rename: callbackify1(promises.rename),
-      copyFile: callbackify1(promises.copyFile),
-      access: callbackify1(promises.access),
+      stat: callbackify1(promises.stat, 1, 1),
+      lstat: callbackify1(promises.lstat, 1, 1),
+      statfs: callbackify1(promises.statfs, 1, 1),
+      readdir: callbackify1(promises.readdir, 1, 1),
+      glob: callbackify1(promises._globAsPromise, 1, 1),
+      mkdir: callbackify1(promises.mkdir, 1, 1),
+      rm: callbackify1(promises.rm, 1, 1),
+      rmdir: callbackify1(promises.rmdir, 1, 1),
+      unlink: callbackify1(promises.unlink, 1),
+      rename: callbackify1(promises.rename, 2),
+      copyFile: callbackify1(promises.copyFile, 2, 1),
+      access: callbackify1(promises.access, 1, 1),
       // As realpathSync: stringified, and on failure the component walk's
       // error. fs.realpath.native (below) is the plain native.
       realpath: function (path, options, cb) {
         if (typeof options === "function") { cb = options; options = undefined; }
-        const file = realpathArg(path);
-        callbackify1((p) => realpathWalking(p))(file, cb);
+        realpathByPath(path, cb);
       },
-      mkdtemp: callbackify1(promises.mkdtemp),
-      symlink: callbackify1(promises.symlink),
-      readlink: callbackify1(promises.readlink),
-      link: callbackify1(promises.link),
-      chmod: callbackify1(promises.chmod),
+      mkdtemp: callbackify1(promises.mkdtemp, 1, 1),
+      symlink: callbackify1(promises.symlink, CB_LAST),
+      readlink: callbackify1(promises.readlink, 1, 1),
+      link: callbackify1(promises.link, 2),
+      chmod: callbackify1(promises.chmod, 2),
       truncate: function (path, len, cb) {
         if (typeof len === "function") { cb = len; len = 0; }
         if (typeof path === "number") {
           warnTruncateFd();
           return fs.ftruncate(path, len, cb);
         }
-        return callbackify1(promises.truncate)(path, len, cb);
+        return truncateByPath(path, len, cb);
       },
-      opendir: callbackify1(promises.opendir),
-      cp: callbackify1(promises.cp),
+      // opendir is the one whose callback node validates as "callback".
+      opendir: callbackify1(promises.opendir, 1, 1, "callback"),
+      cp: callbackify1(promises.cp, 2, 1),
       exists: (path, cb) => {
         // Deprecated single-arg callback shape, still in the wild. A path
         // node cannot validate is simply false, as in existsSync.
@@ -11664,10 +11693,13 @@
     // op. Node reports a bad descriptor through the callback, never at the call
     // site, so the throw has to be caught and re-delivered -- the same shape
     // `fstat` uses above.
-    const voidCallbackOp = (run) =>
+    // `required` is the callback's position, as in callbackify1.
+    const voidCallbackOp = (run, required) =>
       function (...args) {
-        const cb = args.pop();
+        const at = callbackSlot(args, required, 0);
+        const cb = args[at];
         validateCb(cb);
+        if (args.length > at) args.length = at;
         const token = fsReqStart();
         let p;
         try {
@@ -11689,7 +11721,7 @@
     // C++ spelling). Only the operation's own failure -- EBADF for a closed
     // descriptor -- goes to the callback, which voidCallbackOp arranges.
     const fdCallbackOp = (op) => {
-      const run = voidCallbackOp(op);
+      const run = voidCallbackOp(op, 3);
       return (cb, fd, a, b) => {
         validateCb(cb);
         validateFd(fd, true);
@@ -11734,13 +11766,15 @@
     //
     // The `l` forms act on a symlink itself rather than its target, which is
     // the only reason they exist.
-    fs.chown = voidCallbackOp((p, uid, gid) => natives.fsChown(toPath(p), uid, gid));
-    fs.lchown = voidCallbackOp((p, uid, gid) => natives.fsLchown(toPath(p), uid, gid));
-    fs.utimes = voidCallbackOp((p, atime, mtime) =>
-      natives.fsUtimes(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
+    fs.chown = voidCallbackOp((p, uid, gid) => natives.fsChown(toPath(p), uid, gid), 3);
+    fs.lchown = voidCallbackOp((p, uid, gid) => natives.fsLchown(toPath(p), uid, gid), 3);
+    fs.utimes = voidCallbackOp(
+      (p, atime, mtime) => natives.fsUtimes(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
+      3,
     );
-    fs.lutimes = voidCallbackOp((p, atime, mtime) =>
-      natives.fsLutimes(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
+    fs.lutimes = voidCallbackOp(
+      (p, atime, mtime) => natives.fsLutimes(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
+      3,
     );
 
     fs.chownSync = (p, uid, gid) => { natives.fsChownSync(toPath(p), uid, gid); };
@@ -11765,7 +11799,7 @@
     // what node gives. A throwing stub would link the same and then diverge on
     // the message.
     if (process.platform === "darwin") {
-      fs.lchmod = voidCallbackOp((p, mode) => natives.fsLchmod(toPath(p), mode));
+      fs.lchmod = voidCallbackOp((p, mode) => natives.fsLchmod(toPath(p), mode), 2);
       fs.lchmodSync = (p, mode) => { natives.fsLchmodSync(toPath(p), mode); };
     } else {
       fs.lchmod = undefined;
@@ -11904,7 +11938,13 @@
     // The `.native` forms are the OS realpath: node type-checks their path
     // (getValidatedPath) and reports `realpath` with the whole path.
     fs.realpathSync.native = (path) => natives.fsRealpathSync(toPath(path));
-    fs.realpath.native = callbackify1(promises.realpath);
+    // node's `makeCallback(callback || options)`, as readFile's.
+    const realpathNativeByPath = callbackify1(promises.realpath, 2);
+    fs.realpath.native = function (path, options, cb) {
+      if (!cb) cb = options;
+      if (typeof options === "function") options = undefined;
+      realpathNativeByPath(path, options, cb);
+    };
     fs.Dirent = Dirent;
     // The real class, so `stat instanceof fs.Stats` holds -- it was a bare
     // placeholder no stat object was ever an instance of.

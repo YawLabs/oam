@@ -19,7 +19,10 @@
 // A missing callback is node's ERR_INVALID_ARG_TYPE for "cb" (oam's was a
 // bare TypeError with no code), and writeFile / readFile validate their
 // options argument as the callback when none follows it (`callback ||=
-// options`).
+// options`). The path forms take the callback from its position, not by
+// popping the last argument: a missing one is "Received undefined", not the
+// path or uid before it, and an argument after it is ignored (oam threw on
+// it). opendir calls it "callback"; symlink alone takes its last argument.
 import fs from "node:fs";
 
 const B = Buffer.alloc(4);
@@ -119,9 +122,69 @@ for (const name of ["fsync", "fdatasync", "ftruncate", "fchmod", "fchown", "futi
   console.log(`fs.${name}`, fs[name].name, fs[name].length);
 }
 
+// Where the path forms find their callback. A missing one is "Received
+// undefined" -- never the path, uid or time before it -- an optional slot may
+// hold it, and arguments after it are ignored. opendir names it "callback";
+// symlink takes its last argument; readFile and realpath.native use
+// `callback || options`.
+const P = "no-such-dir-247/x";
+const noCallback = {
+  "stat(p)": () => fs.stat(P),
+  "stat(p, {})": () => fs.stat(P, {}),
+  "stat(p, {}, 5)": () => fs.stat(P, {}, 5),
+  "lstat(p, undefined)": () => fs.lstat(P, undefined),
+  "mkdir(p)": () => fs.mkdir(P),
+  "unlink(p)": () => fs.unlink(P),
+  "rename(p, q)": () => fs.rename(P, P),
+  "copyFile(p, q, 0)": () => fs.copyFile(P, P, 0),
+  "access(p, 0)": () => fs.access(P, 0),
+  "chmod(p, 0o644)": () => fs.chmod(P, 0o644),
+  "chown(p, 0, 0)": () => fs.chown(P, 0, 0),
+  "lchown(p, 0, 0)": () => fs.lchown(P, 0, 0),
+  "utimes(p, 1, 1)": () => fs.utimes(P, 1, 1),
+  "lutimes(p, 1, 1)": () => fs.lutimes(P, 1, 1),
+  "opendir('.')": () => fs.opendir("."),
+  "opendir('.', {}, 5)": () => fs.opendir(".", {}, 5),
+  "symlink(p, q)": () => fs.symlink(P, "q"),
+  "symlink(p, q, 'file')": () => fs.symlink(P, "q", "file"),
+  "realpath(p)": () => fs.realpath(P),
+  "realpath.native(p, {})": () => fs.realpath.native(P, {}),
+  "readFile(p, {})": () => fs.readFile(P, {}),
+  "truncate(p, 0)": () => fs.truncate(P, 0),
+  "cp(p, q)": () => fs.cp(P, P),
+};
+for (const [label, fn] of Object.entries(noCallback)) call(label, () => fn());
+const extra = {
+  stat: (cb) => fs.stat(".", cb, "extra"),
+  "stat({})": (cb) => fs.stat(".", {}, cb, "extra"),
+  lstat: (cb) => fs.lstat(".", cb, "extra"),
+  access: (cb) => fs.access(".", cb, "extra"),
+  readdir: (cb) => fs.readdir(".", () => cb(null), "extra"),
+  realpath: (cb) => fs.realpath(".", () => cb(null), "extra"),
+  opendir: (cb) => fs.opendir(".", (err, dir) => { dir.closeSync(); cb(err); }, "extra"),
+  symlink: (cb) => fs.symlink(P, "q", cb, "extra"),
+};
+// One at a time, after the rest, so the order of their callbacks is fixed.
+async function extraArguments() {
+  for (const [name, fn] of Object.entries(extra)) {
+    await new Promise((resolve) => {
+      try {
+        fn((err) => {
+          console.log(`${name}(callback, 'extra') -> callback ${err ? shape(err) : "null"}`);
+          resolve();
+        });
+      } catch (err) {
+        console.log(`${name}(callback, 'extra') threw`, shape(err));
+        resolve();
+      }
+    });
+  }
+}
+
 // readFile(-1, cb): thrown a tick later, as an uncaught exception.
 process.on("uncaughtException", (err) => events.push(`uncaughtException ${shape(err)}`));
 call("readFile(-1)", (cb) => fs.readFile(-1, cb));
 setTimeout(() => {
   for (const line of events) console.log(line);
+  extraArguments();
 }, 50);
