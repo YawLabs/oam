@@ -2436,6 +2436,53 @@ missing component (node's JS path walk), and `realpathSync.native`,
 case (`conformance/cases/72-*`), because asserting node's behaviour there would
 mean encoding its inconsistency into a case whose purpose is the rule.
 
+### `fs` descriptor arguments: what still differs
+
+Every `fs` call that takes a descriptor (`closeSync` / `close`, `fstat`, `read`,
+`write`, `readv`, `writev`, `fsync`, `fdatasync`, `ftruncate`, `fchmod`, `fchown`,
+`futimes`, their `*Sync` forms, `truncate(fd)`, `readFile(fd)` / `writeFile(fd)` /
+`appendFile(fd)` and the streams' `fd` option) refuses one that is not an int32 in
+`[0, 2**31-1]` as node v22.22.2 does: `ERR_OUT_OF_RANGE` / `ERR_INVALID_ARG_TYPE`,
+thrown at the call, never `EBADF` (node's two exceptions included: `readFile(-1, cb)`
+throws a tick later, as an uncaught exception, and `writeFileSync(-1, utf8String)` is
+`EBADF`, see `conformance/cases/240-*`). Both of node's wordings are reproduced -- the JS
+`getValidatedFd` (`read`, `write`, `readv`, `writev`, streams) and the C++ one (every
+`*Sync` form and the other callback forms) -- and so is where each check sits relative
+to the callback and the other arguments (`conformance/cases/246-*`, `247-*`). Before
+this, oam passed `-1`, `1.5`, `"3"` or `undefined` to the OS and reported `EBADF`.
+What still differs:
+
+- **Arguments node validates before the descriptor, which oam does not check there.**
+  `fchmod`'s mode (`ERR_INVALID_ARG_VALUE` for `'zz'`), `ftruncate`'s `len`,
+  `fchown`'s `uid` / `gid`, `writeSync`'s `buffer`, `offset`, `position` and `options`,
+  the `position` of `read` / `readSync` / `FileHandle.read` (node's `validatePosition`:
+  `'zz'`, `-2` and `1.5` are refused), and the callback `writeFile` / `appendFile`'s
+  `data` (oam reports a bad one through the callback). node refuses these first, so
+  `fs.fchmodSync(-1, 'zz')` is the mode error there; oam reports the descriptor. With a
+  valid descriptor oam passes such a value to the OS as before. (`futimes`' times are
+  validated, in node's order; so are the `buffer`, options object, `offset` and `length`
+  of `read`, `readSync` and `FileHandle.read`, with node's overloads -- a bad offset is
+  refused even by a read of length 0.)
+- **`fs.writeSync(fd, string, position, 'bogus')`**: node's binding ignores an encoding
+  it does not know and writes UTF-8 (so with `-1` it is the descriptor error); oam
+  throws `ERR_UNKNOWN_ENCODING`.
+- **An anonymous class instance as the descriptor** reads `Received an instance of
+  Object` in the C++ wording on oam, where V8 names it after the variable it was
+  assigned to (`an instance of vals`); JS cannot see that inferred name.
+- **Descriptors 0-2.** oam's descriptor table holds only what `fs` opened (and fds a
+  parent passed in, see 19), so `fstatSync(0)`, `closeSync(0)`, `readSync(0, ...)` and
+  the like are `EBADF` where node operates on the process's stdin. `writeSync(1|2)` is
+  routed to stdout / stderr and matches. (`-0` is a valid descriptor 0 on both.)
+- **`fs.rm(path[, options], callback)` without a function callback** throws
+  `ERR_INVALID_ARG_TYPE` for `"cb"` at the call, as every other callback-form `fs`
+  call does. node v22.22.2's `rm` does not check its callback: the call returns, and
+  the rm's completion later dies with an uncaught `TypeError: callback is not a
+  function`. Reproducing that would turn a clear error at the call site into a
+  crash with no user frame, so oam keeps the check.
+- **A closed descriptor in range** behaves as before: `fs.close(fd, cb)` on one oam
+  never opened calls back `null` where node reports `EBADF`, and on Windows node's
+  `fchown` on any descriptor is a no-op success where oam reports `EBADF`.
+
 ### `fs.realpath` under `--permission` — oam is stricter
 
 Measured against Node v22.22.2: with `--permission` and no grants, node allows
