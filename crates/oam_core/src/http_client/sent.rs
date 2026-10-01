@@ -38,6 +38,9 @@
 //! fresh one, and that connection's checkout starts it again from zero. undici
 //! re-queues such a request with no timer and arms a new one on the socket
 //! that next carries it, so the re-dial counts for nothing there either.
+//! A streamed request body holds the limit off the same way until its last
+//! chunk is handed over ([`Dispatched::body_open`]), as undici restarts its
+//! timer at the end of the body.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -51,11 +54,21 @@ use crate::OpOutcome;
 pub type SentSignals = Arc<Mutex<HashMap<u64, Signal>>>;
 
 /// Where a request stands with the pool: how many times a connection was
-/// checked out for it, and whether one has it now.
+/// checked out for it, whether one has it now, and whether its streamed body
+/// is still being written.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Checkouts {
     count: u64,
     on_connection: bool,
+    body_open: bool,
+}
+
+impl Checkouts {
+    /// Whether undici's headers timer runs: a connection has the request and
+    /// all of its body has been handed over.
+    fn awaiting_head(&self) -> bool {
+        self.on_connection && !self.body_open
+    }
 }
 
 /// One request's signal. The sender is here until the fetch takes it.
@@ -92,19 +105,35 @@ impl Dispatched {
         self.0.send_modify(|state| state.on_connection = false);
     }
 
+    /// The request's body is streamed and not all written yet (`true`), or
+    /// it is (`false`). undici's headers timer does not count the time a
+    /// streamed body takes: it ignores the timer while its `AsyncWriter` is
+    /// writing and restarts it from zero at `end()` (client-h1.js
+    /// onParserTimeout / AsyncWriter.end).
+    pub(crate) fn body_open(&self, open: bool) {
+        self.0.send_if_modified(|state| {
+            let changed = state.body_open != open;
+            state.body_open = open;
+            changed
+        });
+    }
+
     /// A receiver that hears the next change, not any before it.
     pub(crate) fn subscribe(&self) -> watch::Receiver<Checkouts> {
         self.0.subscribe()
     }
 }
 
-/// The next change on `state`: `Some(true)` for a checkout, `Some(false)` for
-/// a request handed back unsent, `None` once the sender is gone (no change
-/// can follow). An unsent and a re-checkout the receiver had no time to tell
-/// apart read as the checkout, which is what they add up to.
+/// The next change on `state`: `Some(true)` when the request now waits for
+/// its head (a checkout, or the end of a streamed body on a connection that
+/// has it), `Some(false)` when it does not (handed back unsent, or a checkout
+/// while its streamed body is still being written), `None` once the sender
+/// is gone (no change can follow). An unsent and a re-checkout the receiver
+/// had no time to tell apart read as the checkout, which is what they add up
+/// to.
 async fn next_change(state: &mut watch::Receiver<Checkouts>) -> Option<bool> {
     state.changed().await.ok()?;
-    Some(state.borrow_and_update().on_connection)
+    Some(state.borrow_and_update().awaiting_head())
 }
 
 /// undici's `headersTimeout` for one send: resolves `limit` after the pool
@@ -115,11 +144,14 @@ async fn next_change(state: &mut watch::Receiver<Checkouts>) -> Option<bool> {
 /// resumeH1, once the request is on a connected socket, so DNS (a replaced
 /// `dns.lookup` or a `connect.lookup` hook, which park the fetch before it
 /// gets here), the TCP connect (a re-dial's too), a proxy tunnel and the
-/// TLS handshake count for nothing. The caller races it against the
-/// send, so the head that arrives in time drops it.
+/// TLS handshake count for nothing. A streamed body counts for nothing
+/// either: the limit starts once its last chunk is handed over
+/// ([`Dispatched::body_open`]). The caller races it against the send, so the
+/// head that arrives in time drops it.
 pub(crate) async fn headers_deadline(mut state: watch::Receiver<Checkouts>, limit: Duration) {
     loop {
-        // No connection has the request: wait for one.
+        // No connection has the request, or its body is still going out:
+        // wait until one has it all.
         match next_change(&mut state).await {
             Some(true) => {}
             Some(false) => continue,
@@ -132,7 +164,8 @@ pub(crate) async fn headers_deadline(mut state: watch::Receiver<Checkouts>, limi
                 () = &mut sleep => return,
                 change = next_change(&mut state) => match change {
                     Some(true) => sleep.as_mut().reset(tokio::time::Instant::now() + limit),
-                    // Handed back unsent: stop until the re-dial's checkout.
+                    // Handed back unsent: stop until the re-dial's checkout
+                    // (and, for a streamed body, its end).
                     Some(false) => break,
                     // The sender went with the request: no checkout can follow.
                     None => return (&mut sleep).await,
@@ -252,6 +285,27 @@ mod tests {
                 .is_err()
         );
         dispatched.fire();
+        let start = std::time::Instant::now();
+        deadline.await;
+        let elapsed = start.elapsed();
+        assert!(elapsed >= LIMIT && elapsed < LIMIT * 3, "{elapsed:?}");
+    }
+
+    #[tokio::test]
+    async fn a_streamed_body_holds_the_headers_deadline_until_it_ends() {
+        let dispatched = Dispatched::new();
+        dispatched.body_open(true);
+        let deadline = headers_deadline(dispatched.subscribe(), LIMIT);
+        tokio::pin!(deadline);
+        // A connection has the request, but its body takes longer than the
+        // limit to write: none of that counts.
+        dispatched.fire();
+        assert!(
+            tokio::time::timeout(LIMIT * 3, &mut deadline)
+                .await
+                .is_err()
+        );
+        dispatched.body_open(false);
         let start = std::time::Instant::now();
         deadline.await;
         let elapsed = start.elapsed();

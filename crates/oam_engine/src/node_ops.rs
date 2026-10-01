@@ -3236,7 +3236,8 @@ fn op_fetch_body_channel_new(
 }
 
 /// Push a chunk. Resolves when the chunk is accepted, so JS write()
-/// backpressure follows the socket.
+/// backpressure follows the socket -- with `false` when the request no longer
+/// takes its body (it finished or failed), so a writer can stop producing it.
 fn op_fetch_body_channel_write(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -3261,7 +3262,7 @@ fn op_fetch_body_channel_write(
             Ok(()) => oam_core::OpOutcome::Done,
             // Receiver gone: the request finished or failed. Not an error to
             // the writer -- the transport already reported it.
-            Err(_) => oam_core::OpOutcome::Done,
+            Err(_) => oam_core::OpOutcome::Json("false".to_string()),
         }
     });
 }

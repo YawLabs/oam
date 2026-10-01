@@ -297,10 +297,10 @@
           unlink = () => outer.removeEventListener("abort", forward);
         }
       }
+      const method = opts.method || "GET";
       const init = {
-        method: opts.method || "GET",
-        headers: opts.headers || undefined,
-        body: opts.body != null ? opts.body : undefined,
+        method,
+        headers: opts.headers ? headerPairs(opts.headers) : undefined,
         signal: controller.signal,
         redirect: opts.redirect || (opts.maxRedirections > 0 ? "follow" : undefined),
         // The dispatcher carries the connect.lookup hook. undici enforces it
@@ -349,13 +349,13 @@
       if (headersTimeout) init.__oamHeadersTimeout = headersTimeout;
       let res;
       try {
-        res = await G.fetch(String(url), init);
+        // The body, by undici's rules: checked before anything is sent,
+        // framed as undici frames it, and a streamed one sent as it is
+        // produced.
+        res = await sendBody(String(url), init, opts.body, controller);
       } catch (err) {
         unlink();
-        if (err instanceof TypeError && err.cause && err.cause.code === "UND_ERR_HEADERS_TIMEOUT") {
-          throw new errors.HeadersTimeoutError("Headers Timeout Error");
-        }
-        throw err;
+        throw requestError(err);
       }
       const body = makeBodyReadable(res.body, bodyTimeout, (err) => controller.abort(err));
       // A signal shared by many requests must not keep one listener per
@@ -369,6 +369,343 @@
         context: {},
         body,
       };
+    }
+
+    // request()'s failure as undici's request() reports it. oam's fetch wraps
+    // a refusal it makes before sending -- a hop-by-hop header, a
+    // content-length that disagrees with the body -- and a late response
+    // head in `TypeError: fetch failed`; undici's request() rejects with the
+    // error itself (measured on node v22.22.2 + undici 6.29.0: `name`,
+    // `code` and `message` of the undici class, no `cause`).
+    const UNWRAPPED = {
+      InvalidArgumentError: errors.InvalidArgumentError,
+      NotSupportedError: errors.NotSupportedError,
+      RequestContentLengthMismatchError: errors.RequestContentLengthMismatchError,
+    };
+    function requestError(err) {
+      if (!(err instanceof TypeError) || err.message !== "fetch failed" || !err.cause) return err;
+      const cause = err.cause;
+      if (cause.code === "UND_ERR_HEADERS_TIMEOUT") return new errors.HeadersTimeoutError("Headers Timeout Error");
+      if (cause instanceof errors.UndiciError) return err;
+      const Class = UNWRAPPED[cause.name];
+      return Class ? new Class(cause.message) : err;
+    }
+
+    // ---- request bodies ---------------------------------------------------
+    // undici's request() takes a string, a Buffer / typed array / ArrayBuffer,
+    // a Readable (anything with pipe() and on()), an iterable or async
+    // iterable (a web ReadableStream included), a Blob or a FormData, and
+    // refuses anything else (lib/core/request.js). It frames them in
+    // client-h1.js's writeH1: a known length goes out with content-length
+    // (the caller's own `content-length` header is consumed, checked against
+    // it, and never sent as given), a streamed body with the caller's
+    // declared length if there is one and chunked otherwise -- and its head
+    // goes out only with the first non-empty chunk, so a stream that ends
+    // empty is sent as no body at all. A method that expects a payload (POST,
+    // PUT, PATCH, ...) with no body still gets `content-length: 0`.
+    const EXPECTS_PAYLOAD = new Set(["PUT", "POST", "PATCH", "QUERY", "PROPFIND", "PROPPATCH"]);
+    const NO_CONTENT_LENGTH = new Set(["GET", "HEAD", "OPTIONS", "TRACE", "CONNECT"]);
+    const BAD_BODY = "body must be a string, a Buffer, a Readable stream, an iterable, or an async iterable";
+    // undici's util.isStream / isIterable / isBlobLike / isFormDataLike.
+    const isStream = (b) => !!b && typeof b === "object" && typeof b.pipe === "function" && typeof b.on === "function";
+    const isIterable = (b) =>
+      b != null && (typeof b[Symbol.iterator] === "function" || typeof b[Symbol.asyncIterator] === "function");
+    function isBlobLike(b) {
+      if (b === null || typeof b !== "object") return false;
+      if (typeof G.Blob === "function" && b instanceof G.Blob) return true;
+      const tag = b[Symbol.toStringTag];
+      return (tag === "Blob" || tag === "File") &&
+        (typeof b.stream === "function" || typeof b.arrayBuffer === "function");
+    }
+    const isFormDataLike = (b) =>
+      !!b && typeof b === "object" && b[Symbol.toStringTag] === "FormData" &&
+      ["append", "delete", "get", "getAll", "has", "set"].every((m) => typeof b[m] === "function");
+    function mismatch() {
+      return new errors.RequestContentLengthMismatchError("Request body length does not match content-length header");
+    }
+    // undici's util.destroy: a stream is destroyed (with `err`), one without
+    // destroy() is sent the error.
+    function destroyStream(stream, err) {
+      if (!isStream(stream) || stream.destroyed === true) return;
+      if (typeof stream.destroy === "function") stream.destroy(err);
+      else if (err) queueMicrotask(() => stream.emit("error", err));
+    }
+
+    // Send `init` (a request() fetch init without its body) with `body`:
+    // resolves with the fetch's Response, or rejects as undici's request()
+    // would. `controller` is the request's own: the caller's signal and the
+    // shim's timeouts abort it.
+    async function sendBody(url, init, body, controller) {
+      const method = init.method;
+      // The caller's content-length is undici's to frame with (processHeader).
+      let declared = null;
+      let typed = false;
+      const headers = [];
+      for (const pair of init.headers || []) {
+        const name = String(pair[0]).toLowerCase();
+        if (name === "content-length") {
+          if (declared !== null) throw new errors.InvalidArgumentError("duplicate content-length header");
+          declared = parseInt(pair[1], 10);
+          if (!Number.isFinite(declared)) throw new errors.InvalidArgumentError("invalid content-length header");
+          continue;
+        }
+        if (name === "content-type") typed = true;
+        headers.push(pair);
+      }
+      const expectsPayload = EXPECTS_PAYLOAD.has(method);
+      let bytes = null;
+      if (body == null) {
+        bytes = null;
+      } else if (isStream(body)) {
+        return sendStreamed(url, { ...init, headers }, body, true, declared, expectsPayload, controller);
+      } else if (body instanceof Uint8Array || ArrayBuffer.isView(body)) {
+        bytes = body.byteLength ? new Uint8Array(body.buffer, body.byteOffset, body.byteLength) : null;
+      } else if (body instanceof ArrayBuffer) {
+        bytes = body.byteLength ? new Uint8Array(body) : null;
+      } else if (typeof body === "string") {
+        // Sent as the string (the transport encodes it as UTF-8).
+        bytes = body.length ? body : null;
+      } else if (isFormDataLike(body)) {
+        throw new errors.NotSupportedError(
+          "a FormData body is not supported by oam's undici.request(): oam has no multipart/form-data encoder yet. " +
+            "Send it with fetch() through a library that encodes it, or encode it yourself",
+        );
+      } else if (isIterable(body)) {
+        return sendStreamed(url, { ...init, headers }, body, false, declared, expectsPayload, controller);
+      } else if (isBlobLike(body)) {
+        // undici sends a Blob with its size as content-length and its type
+        // as content-type, unless the caller set one.
+        if (!typed && body.type) headers.push(["content-type", String(body.type)]);
+        const read = new Uint8Array(await body.arrayBuffer());
+        bytes = read.byteLength ? read : null;
+      } else {
+        throw new errors.InvalidArgumentError(BAD_BODY);
+      }
+      // A body of known length: undici's writeH1 content-length rules.
+      let length = bytes === null ? 0 : typeof bytes === "string" ? G.Buffer.byteLength(bytes) : bytes.byteLength;
+      if (length === 0 && !expectsPayload) length = null;
+      if (!NO_CONTENT_LENGTH.has(method) && length > 0 && declared !== null && declared !== length) throw mismatch();
+      if (length === 0) headers.push(["content-length", "0"]);
+      return G.fetch(url, { ...init, headers, body: bytes === null ? undefined : bytes });
+    }
+
+    // A Readable (`stream`) or an iterable body, written as undici's
+    // AsyncWriter writes it: each chunk's length is Buffer.byteLength's (so
+    // anything but a string or a buffer fails as there), a chunk that would
+    // go past the content-length is refused before it is sent and a body
+    // that ends short of it fails, and nothing is sent until the first
+    // non-empty chunk. The request is dispatched with that chunk, its body
+    // then following over an outbound channel (with backpressure: the next
+    // chunk is taken once the transport has the last one); a body that ends
+    // with none is sent as no body. Once the body has ended, the transport's
+    // headers timer starts (it holds it off while a streamed body is still
+    // going out, as undici does).
+    //
+    // A body that fails -- the stream errors or closes before its end, the
+    // iterator throws, a chunk is refused -- fails the request with that
+    // error, before the head or after it, and the stream is destroyed with
+    // it. A request that fails (or is aborted) stops the body.
+    function sendStreamed(url, init, body, stream, declared, expectsPayload, controller) {
+      const signal = controller.signal;
+      const ops = G.__oam.node;
+      let length = declared;
+      if (stream) {
+        // undici's util.bodyLength: an ended byte stream's buffered length.
+        if (typeof body.read === "function") body.read(0);
+        const state = body._readableState;
+        if (state && state.objectMode === false && state.ended === true && Number.isFinite(state.length)) {
+          length = state.length;
+        }
+      }
+      if (length === 0 && !expectsPayload) length = null;
+      if (!NO_CONTENT_LENGTH.has(init.method) && length > 0 && declared !== null && declared !== length) {
+        throw mismatch();
+      }
+      return new Promise((resolve, reject) => {
+        let channel = null;
+        let started = false;
+        let over = false;
+        let written = 0;
+        let tail = null;
+        const start = (withBody) => {
+          started = true;
+          const headers = init.headers.slice();
+          if (withBody && length !== null) headers.push(["content-length", String(length)]);
+          if (!withBody && expectsPayload) headers.push(["content-length", "0"]);
+          const sent = G.fetch(
+            url,
+            withBody
+              ? { ...init, headers, __oamBodyStream: channel, __oamChunked: length === null }
+              : { ...init, headers },
+          );
+          // A request that fails takes its body with it.
+          sent.catch(() => finish(null, true));
+          resolve(sent);
+        };
+        // The next chunk: `null` when it was empty, else a promise that
+        // resolves once the transport has it (`false`, or a rejection: the
+        // request is gone).
+        const write = (chunk) => {
+          const len = G.Buffer.byteLength(chunk);
+          if (!len) return null;
+          if (length !== null && written + len > length) throw mismatch();
+          const bytes = typeof chunk === "string"
+            ? G.Buffer.from(chunk)
+            : chunk instanceof ArrayBuffer
+              ? new Uint8Array(chunk)
+              : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+          if (channel === null) {
+            channel = ops.fetchBodyChannelNew();
+            start(true);
+          }
+          written += len;
+          const id = channel;
+          const next = () => ops.fetchBodyChannelWrite(id, bytes);
+          tail = tail === null ? next() : tail.then(next);
+          return tail;
+        };
+        const end = () => {
+          if (length !== null && written !== length) throw mismatch();
+          if (channel === null) {
+            start(false);
+            return;
+          }
+          const id = channel;
+          const close = () => ops.fetchBodyChannelEnd(id);
+          if (tail === null) close();
+          else tail.then(close, close);
+        };
+        // The body is over: ended (`err` null), failed with `err`, or
+        // stopped because the request is over (`quiet`).
+        let stop = () => {};
+        const finish = (err, quiet) => {
+          if (over) return;
+          over = true;
+          signal.removeEventListener("abort", onAbort);
+          if (err === null && !quiet) {
+            try {
+              end();
+            } catch (e) {
+              err = e;
+            }
+          }
+          stop(err ?? undefined);
+          if (err === null && !quiet) return;
+          if (channel !== null) ops.fetchBodyChannelCancel(channel);
+          if (quiet) return;
+          // Before the head the request rejects with it, after the head its
+          // response body errors with it.
+          if (!started) reject(err);
+          else if (!signal.aborted) controller.abort(err);
+        };
+        // An abort (the caller's, or a timeout) stops the body; a request
+        // already sent rejects with its reason by itself.
+        const onAbort = () => {
+          if (!started) reject(signal.reason);
+          finish(null, true);
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        if (stream) stop = pumpStream(body, write, finish);
+        else stop = pumpIterable(body, write, finish);
+        if (signal.aborted) onAbort();
+      });
+    }
+
+    // A Readable body, read as undici's writeStream reads it: 'data' events,
+    // paused while the transport takes a chunk; 'end' ends the body, 'error'
+    // fails it, and a 'close' before either fails it with undici's
+    // RequestAbortedError. Returns the function that detaches it.
+    function pumpStream(body, write, finish) {
+      let done = false;
+      // undici's Request keeps an 'error' listener on its body for good, so
+      // an error after the request is over is not an uncaught one.
+      body.on("error", () => {});
+      const onData = function (chunk) {
+        if (done) return;
+        let pending;
+        try {
+          pending = write(chunk);
+        } catch (err) {
+          destroyStream(body, err);
+          return;
+        }
+        if (pending === null) return;
+        if (typeof body.pause === "function") body.pause();
+        pending.then(
+          (more) => {
+            if (more === false) finish(null, true);
+            else if (!done && typeof body.resume === "function") body.resume();
+          },
+          () => finish(null, true),
+        );
+      };
+      const onEnd = () => over(null);
+      const onError = (err) => over(err);
+      const onClose = () => {
+        if (!done) queueMicrotask(() => over(new errors.RequestAbortedError()));
+      };
+      function over(err) {
+        if (done) return;
+        finish(err, false);
+      }
+      body.on("data", onData).on("end", onEnd).on("error", onError).on("close", onClose);
+      if (typeof body.resume === "function") body.resume();
+      if (body.errorEmitted ?? body.errored) setImmediate(() => over(body.errored));
+      else if (body.endEmitted ?? body.readableEnded) setImmediate(() => over(null));
+      if (body.closeEmitted ?? body.closed) setImmediate(onClose);
+      return function stop(err) {
+        done = true;
+        body.removeListener("data", onData).removeListener("end", onEnd).removeListener("close", onClose);
+        queueMicrotask(() => body.removeListener("error", onError));
+        destroyStream(body, err);
+      };
+    }
+
+    // An iterable or async iterable body (a web ReadableStream too), read as
+    // undici's writeIterable reads it: `for await`, the next value taken once
+    // the transport has the last. Stopping returns the iterator, which ends
+    // a generator and cancels a ReadableStream.
+    function pumpIterable(iterable, write, finish) {
+      let stopped = false;
+      (async () => {
+        for await (const chunk of iterable) {
+          if (stopped) return;
+          const pending = write(chunk);
+          if (pending !== null && (await pending.then(null, () => false)) === false) return finish(null, true);
+          if (stopped) return;
+        }
+        finish(null, false);
+      })().catch((err) => finish(err, false));
+      return function stop() {
+        stopped = true;
+      };
+    }
+
+    // request()'s `headers` option as [name, value] pairs, in any of the
+    // shapes undici takes: an object, a flat [name, value, ...] array, or an
+    // iterable of pairs. As in undici's processHeader, an array value is one
+    // line per element, `null` is an empty value and `undefined` no header.
+    function headerPairs(headers) {
+      let entries;
+      if (typeof headers !== "object") return [];
+      if (Array.isArray(headers) && !(headers.length > 0 && Array.isArray(headers[0]))) {
+        entries = [];
+        for (let i = 0; i + 1 < headers.length; i += 2) entries.push([headers[i], headers[i + 1]]);
+      } else if (typeof headers[Symbol.iterator] === "function") {
+        entries = [...headers];
+      } else {
+        entries = Object.entries(headers);
+      }
+      const pairs = [];
+      for (const [name, value] of entries) {
+        if (value === undefined) continue;
+        if (Array.isArray(value)) {
+          for (const v of value) pairs.push([name, v === null ? "" : v]);
+        } else {
+          pairs.push([name, value === null ? "" : value]);
+        }
+      }
+      return pairs;
     }
 
     // The header names of request()'s `headers` option, in any of the shapes

@@ -49,7 +49,7 @@ use super::prepare::{self, PrepareError};
 use super::redirect::{self, Next};
 use super::sent::Dispatched;
 use super::tls_config::TlsRange;
-use super::transport::{channel_body, empty_body, full_body};
+use super::transport::{channel_body, channel_body_then, empty_body, full_body};
 use super::{HttpTransport, NetCheck, NetTarget, ReqBody, Route};
 use crate::OpOutcome;
 use crate::OutboundBodies;
@@ -259,13 +259,26 @@ impl BodySource {
 
     /// The body for the next send. A stream's receiver is taken here, on the
     /// first send, and never again. The error is the op's failure text.
-    fn build(&mut self) -> Result<ReqBody, String> {
+    ///
+    /// `timed`: the send's signal when a headers timeout runs on it, which
+    /// hears whether this body is still being written -- a streamed one
+    /// until its last chunk goes ([`Dispatched::body_open`]).
+    fn build(&mut self, timed: Option<&Dispatched>) -> Result<ReqBody, String> {
+        if let Some(dispatched) = timed {
+            dispatched.body_open(matches!(self, BodySource::Stream(_)));
+        }
         match self {
             BodySource::Empty => Ok(empty_body()),
             BodySource::Full(bytes) => Ok(full_body(bytes.clone())),
-            BodySource::Stream(slot) => match slot.take() {
-                Some(receiver) => Ok(channel_body(receiver)),
-                None => Err(format!("fetch: unknown body stream {}", slot.handle())),
+            BodySource::Stream(slot) => match (slot.take(), timed) {
+                (Some(receiver), Some(dispatched)) => {
+                    let dispatched = dispatched.clone();
+                    Ok(channel_body_then(receiver, move || {
+                        dispatched.body_open(false)
+                    }))
+                }
+                (Some(receiver), None) => Ok(channel_body(receiver)),
+                (None, _) => Err(format!("fetch: unknown body stream {}", slot.handle())),
             },
         }
     }
@@ -566,7 +579,8 @@ async fn run(
         let mut retries = 0;
         let mut stale_resent = false;
         let response = loop {
-            let body = match state.source.build() {
+            let timed = state.headers_timeout.and(state.dispatched.as_ref());
+            let body = match state.source.build(timed) {
                 Ok(body) => body,
                 Err(text) => return OpOutcome::Failed(text),
             };

@@ -1623,6 +1623,10 @@
     // http.ClientRequest sets it.
     if (typeof init.__oamBodyStream === "number") {
       request.body_stream = init.__oamBodyStream;
+      // undici.request frames a streamed body of unknown length chunked
+      // whatever the method; the transport, asked nothing, sends a GET, HEAD
+      // or CONNECT with no body at all (hyper's rule).
+      if (init.__oamChunked === true) headers.push(["transfer-encoding", "chunked"]);
     } else if (init.body != null) {
       if (init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body)) {
         const bytes = init.body instanceof ArrayBuffer

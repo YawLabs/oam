@@ -581,14 +581,32 @@ pub fn full_body(bytes: Bytes) -> ReqBody {
 /// A request body streamed from JS through an outbound body channel (sent
 /// chunked). An `Err` item aborts the request (`fetchBodyChannelCancel`).
 pub fn channel_body(rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>) -> ReqBody {
-    let chunks = futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| {
-            (
-                item.map(|chunk| Frame::data(Bytes::from(chunk)))
-                    .map_err(BoxError::from),
-                rx,
-            )
-        })
-    });
+    channel_body_then(rx, || {})
+}
+
+/// [`channel_body`], calling `on_end` once JS has ended the body and the
+/// transport has taken its last chunk: the moment undici's `AsyncWriter.end()`
+/// marks a streamed request written. Not called for a body that is aborted
+/// or dropped unfinished.
+pub fn channel_body_then(
+    rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
+    on_end: impl FnOnce() + Send + Sync + 'static,
+) -> ReqBody {
+    let chunks =
+        futures_util::stream::unfold((rx, Some(on_end)), |(mut rx, mut on_end)| async move {
+            match rx.recv().await {
+                Some(item) => Some((
+                    item.map(|chunk| Frame::data(Bytes::from(chunk)))
+                        .map_err(BoxError::from),
+                    (rx, on_end),
+                )),
+                None => {
+                    if let Some(on_end) = on_end.take() {
+                        on_end();
+                    }
+                    None
+                }
+            }
+        });
     StreamBody::new(chunks).boxed()
 }
