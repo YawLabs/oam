@@ -81,6 +81,22 @@ for (const host of ["127.0.0.1", "localhost"]) {
   server.close();
 }
 
+// The constructor wants its type argument, as undici's webidl check does.
+{
+  const port = await closedPort();
+  const seen = await new Promise((resolve) => {
+    new WebSocket(`ws://127.0.0.1:${port}/`).onerror = (ev) => {
+      try {
+        new ev.constructor();
+        resolve("new ErrorEvent() did not throw");
+      } catch (e) {
+        resolve(`new ErrorEvent(): ${e.constructor.name} ${e.message}`);
+      }
+    };
+  });
+  console.log(seen);
+}
+
 // Node v22 has the class and no global for it.
 console.log("typeof ErrorEvent:", typeof ErrorEvent);
 // Let a 'close' that follows the failure pass before leaving.

@@ -1792,11 +1792,18 @@
   // The event a WebSocket that fails to connect dispatches. Node v22 has the
   // class (undici's) and no `ErrorEvent` global, so there is none here
   // either: it is reachable only as an event's constructor.
-  // Its five attributes are prototype getters, as undici's are (an
-  // ErrorEvent has no own enumerable property).
+  // Its five attributes are prototype getters, as undici's are. The Event
+  // base still puts its own state (type, bubbles, target, ...) on every
+  // instance as own enumerable properties, so Object.keys() of any oam
+  // event, this one included, is not node's empty list.
   const kErrorEventInit = Symbol("kErrorEventInit");
   class ErrorEvent extends Event {
     constructor(type, init) {
+      // undici's webidl check. Event's own would never see it: the super()
+      // call below always passes two arguments.
+      if (arguments.length === 0) {
+        throw new TypeError("ErrorEvent constructor: 1 argument required, but 0 found.");
+      }
       super(type, init);
       Object.defineProperty(this, kErrorEventInit, {
         value: {
