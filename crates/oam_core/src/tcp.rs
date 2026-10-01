@@ -36,8 +36,8 @@ pub struct TcpState {
     /// Halves currently out of the maps for an await, per stream handle.
     in_flight: HashMap<u64, u32>,
     /// A parked accept's wake-up, per server id; per stream handle, the
-    /// wake-up of the reads and writes parked on it, which only
-    /// [`tcp_reset`] sends (created by the first read or queued write).
+    /// wake-up of the reads and writes parked on it, which [`tcp_close`]
+    /// and [`tcp_reset`] send (created by the first read or queued write).
     cancel: HashMap<u64, std::sync::Arc<tokio::sync::Notify>>,
     /// The back of each stream handle's write queue: the latest `tcp_write`
     /// or `tcp_shutdown` issued for it and still pending (see [`WriteTurn`]).
@@ -62,9 +62,10 @@ impl TcpState {
         Some((reader, writer))
     }
 
-    /// The wake-up of the ops parked on stream `handle` (see [`tcp_reset`]).
-    /// Taken with the half the op checks out, under the same lock, so a
-    /// reset that comes after the checkout always reaches the op.
+    /// The wake-up of the ops parked on stream `handle` (see [`tcp_close`],
+    /// [`tcp_reset`]). Taken with the half the op checks out, under the same
+    /// lock, so a close or reset that comes after the checkout always
+    /// reaches the op.
     fn wake_for(&mut self, handle: u64) -> std::sync::Arc<tokio::sync::Notify> {
         self.cancel
             .entry(handle)
@@ -544,8 +545,10 @@ pub async fn tcp_read(registry: TcpRegistry, handle: u64, len: usize) -> OpOutco
         biased;
         read = reader.read(&mut buf) => read,
         () = woken => {
-            // tcp_reset: this half is the one keeping the socket open.
-            discard_reader_reset(reader);
+            // tcp_close / tcp_reset: this half is the one keeping the socket
+            // open. The handle is marked closed, so it is dropped here, with
+            // the reset when it was one; the read ends like an EOF.
+            reinsert_reader(&registry, handle, reader);
             return OpOutcome::Done;
         }
     };
@@ -648,13 +651,15 @@ pub fn tcp_write_start(
         };
 
         // A write the peer is not draining parks here for as long as the
-        // peer likes; a reset must not wait for it (see tcp_reset).
+        // peer likes; a close or a reset must not wait for it (see
+        // tcp_close). What it has not handed the socket yet is dropped, as
+        // libuv cancels a write still pending when its handle closes.
         let wrote = tokio::select! {
             biased;
             wrote = writer.write_all(&data[written..]) => wrote,
             () = woken => {
-                discard_writer_reset(writer);
-                return OpOutcome::Failed(format!("tcp: write handle {handle} was reset"));
+                reinsert_writer(&registry, handle, writer);
+                return OpOutcome::Failed(format!("tcp: write handle {handle} is gone"));
             }
         };
         match wrote {
@@ -755,18 +760,31 @@ where
     }
 }
 
-/// Close a TCP stream. Remove both halves and, if one is out for an await,
-/// mark the handle closed so that await does not resurrect it -- the mark
-/// is cleared when the await returns (#139).
+/// Close a TCP stream, at once, as libuv's `uv_close` does: remove both
+/// halves and, if one is out for an await, mark the handle closed so that
+/// await does not resurrect it -- the mark is cleared when the await
+/// returns (#139) -- and wake it, so it drops its half now.
+///
+/// The socket closes when its last half goes. A flowing socket's read is
+/// always parked, and a write the peer is not draining parks too: left to
+/// finish, they kept the descriptor open until the peer answered the FIN
+/// (or drained), so a destroy() of a socket whose peer never reads -- a
+/// paused one -- held it, and the process, open for good. The parked read
+/// ends like an EOF, the parked write fails as a write to a closed handle
+/// (the writes queued behind it find the handle gone).
 pub fn tcp_close(registry: &TcpRegistry, handle: u64) {
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     guard.readers.remove(&handle);
     guard.writers.remove(&handle);
     guard.shut_down.remove(&handle);
     // The ops parked on the handle hold their own reference to it.
-    guard.cancel.remove(&handle);
+    let wake = guard.cancel.remove(&handle);
     if guard.in_flight.get(&handle).is_some_and(|n| *n > 0) {
         guard.closed.insert(handle);
+    }
+    drop(guard);
+    if let Some(wake) = wake {
+        wake.notify_waiters();
     }
 }
 
@@ -1413,6 +1431,70 @@ mod tests {
             (0, 0, 0, 0, 0),
             "(closed, cancel, in_flight, readers, writers)"
         );
+    }
+
+    /// destroy() of a flowing socket (its read parked) whose peer is not
+    /// draining what it was sent: the close ends every op at once, as
+    /// libuv's uv_close does, long before the peer reads -- the descriptor
+    /// goes with the last half -- and the peer then sees an orderly end, not
+    /// a reset. Before, the parked read and the stuck write kept the socket
+    /// open until the peer answered: forever, for a peer that never reads
+    /// (a paused node socket), which kept the process alive with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_wakes_the_parked_read_and_the_stuck_write() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let (port, peer) = reading_peer(std::time::Duration::from_secs(3));
+        let handle = connected(&registry, &ids, port).await;
+
+        let parked = tokio::spawn(tcp_read(registry.clone(), handle, 64));
+        let (writes, _) = write_until_queued(&registry, handle);
+        let writes: Vec<_> = writes.into_iter().map(tokio::spawn).collect();
+        let behind = tokio::spawn(tcp_write(registry.clone(), handle, b"behind".to_vec()));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            registry.lock().unwrap().in_flight.get(&handle).copied(),
+            Some(2),
+            "the read and a write are both out for an await"
+        );
+
+        tcp_close(&registry, handle);
+        let prompt = std::time::Duration::from_secs(1);
+        let read = tokio::time::timeout(prompt, parked)
+            .await
+            .expect("the parked read was not woken by the close")
+            .unwrap();
+        assert!(matches!(read, OpOutcome::Done));
+        let mut outcomes = Vec::new();
+        for write in writes {
+            outcomes.push(
+                tokio::time::timeout(prompt, write)
+                    .await
+                    .expect("the stuck write was not woken by the close")
+                    .unwrap(),
+            );
+        }
+        assert!(
+            matches!(outcomes.last(), Some(OpOutcome::Failed(_))),
+            "the stuck write fails as a write to a closed handle"
+        );
+        assert!(matches!(
+            tokio::time::timeout(prompt, behind).await.unwrap().unwrap(),
+            OpOutcome::Failed(_)
+        ));
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+        let seen = tokio::task::spawn_blocking(move || {
+            peer.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .unwrap()
+        .expect("the peer's read never ended");
+        assert!(seen.is_ok(), "the peer saw a reset, not an end: {seen:?}");
+        assert_eq!(registry.lock().unwrap().queued_writes(), 0);
     }
 
     /// What `reading_peer` saw: the connection reset (node's `read

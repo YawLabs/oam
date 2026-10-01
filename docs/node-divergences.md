@@ -2140,7 +2140,11 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   call, as in Node: `'error'` on the next tick, then `'close'` -- after the immediates
   already queued and before any timer for a socket that was connected or connecting, on
   the next tick for one that never was (`conformance/cases/223-net-socket-destroy-defers-events.mjs`;
-  up to 0.17.1 both were emitted from inside `destroy()`). What is left: Node emits that
+  up to 0.17.1 both were emitted from inside `destroy()`). It closes the connection at
+  once, as Node's does, a read under way and a write the peer is not draining included
+  (`conformance/cases/263-net-destroy-closes-at-once.mjs`; up to 0.17.1 those kept the
+  descriptor open until the peer answered the FIN, so destroying a socket whose peer never
+  read -- one paused -- kept the process alive for good). What is left: Node emits that
   `'close'` from the handle's close callback, which also runs after an immediate queued
   AFTER `destroy()` in the same turn; oam's loop has no close phase, so there `'close'`
   comes first. A `write()` is handed to the socket inside the call, as Node's is, and
