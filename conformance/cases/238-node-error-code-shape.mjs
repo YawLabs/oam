@@ -19,6 +19,7 @@
 // `code` there; one of those is pinned too, as is a code whose message
 // function sets extra fields (they land between `code` and `message`).
 import net from "node:net";
+import util from "node:util";
 
 function caught(fn) {
   try {
@@ -118,3 +119,13 @@ await describe(
 
 console.log("== a code with a string message: message precedes code");
 await describe("Buffer.from('x', 'bogus')", () => caught(() => Buffer.from("x", "bogus")));
+
+console.log("== a field set by the message function of a directly shaped error");
+// ERR_FALSY_VALUE_REJECTION is built outside the E() factory, and its
+// `reason` used to be set before the shape re-created `code` and `message`,
+// so it came first: [stack, reason, code, message]. Node's message function
+// sets it between the two.
+await describe(
+  "util.callbackify rejecting with null",
+  () => new Promise((resolve) => util.callbackify(() => Promise.reject(null))(resolve)),
+);

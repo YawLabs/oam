@@ -799,7 +799,11 @@
   }
 
   // Apply node's coded-error shape to an Error instance built elsewhere.
-  function applyNodeErrorShape(inst, code) {
+  // `fields` are the own properties node's message function sets on the error
+  // (ERR_FALSY_VALUE_REJECTION's `reason`): they land where node puts them,
+  // between `code` and `message`. Set on the instance beforehand instead,
+  // they would come before both, since `code` and `message` are re-created.
+  function applyNodeErrorShape(inst, code, fields) {
     const message = inst.message;
     // Re-create both so they land in node's order whatever the instance
     // already carried (the base constructor's own `message`, an earlier code).
@@ -807,10 +811,12 @@
     delete inst.code;
     if (NODE_FUNCTION_MESSAGE_CODES.has(code)) {
       inst.code = code;
+      if (fields) Object.assign(inst, fields);
       defineNodeErrorMessage(inst, message);
     } else {
       defineNodeErrorMessage(inst, message);
       inst.code = code;
+      if (fields) Object.assign(inst, fields);
     }
     return finishNodeErrorShape(inst, code);
   }
@@ -6355,13 +6361,14 @@
     function callbackifyOnRejected(reason, cb) {
       if (!reason) {
         const err = new Error("Promise was rejected with falsy value");
-        err.reason = reason;
         // Capture BEFORE shaping: applyNodeErrorShape rewrites the current
         // stack's first line into the "Error [ERR_FALSY_VALUE_REJECTION]:"
         // header node renders -- capturing afterward would regenerate an
         // unshaped stack.
         Error.captureStackTrace(err, callbackifyOnRejected);
-        applyNodeErrorShape(err, "ERR_FALSY_VALUE_REJECTION");
+        // `reason` is set by node's message function, so it sits between
+        // `code` and `message`: [stack, code, reason, message].
+        applyNodeErrorShape(err, "ERR_FALSY_VALUE_REJECTION", { reason });
         reason = err;
       }
       return cb(reason);
