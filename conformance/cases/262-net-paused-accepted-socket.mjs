@@ -40,3 +40,36 @@ await new Promise((resolve) => peer.once("close", resolve));
 await new Promise((resolve) => setTimeout(resolve, 50));
 console.log(log.join("\n"));
 server.close();
+
+// A socket whose buffer filled up (paused mode, a 'readable' listener that
+// does not read), then pause()d, switched back to 'data' and resume()d,
+// reads the rest. (oam's read loop, stopped on the full buffer, was still
+// unwinding when resume() asked for it again, and the socket never read
+// past what it had buffered: no more 'data', no 'end'.)
+{
+  const total = 4 * 1024 * 1024;
+  const done = [];
+  const big = net.createServer((p) => {
+    let got = 0;
+    const idle = () => {};
+    p.on("readable", idle);
+    p.on("end", () => done.push(`end after ${got === total ? "every byte" : `${got} of ${total} bytes`}`));
+    p.on("close", () => {
+      done.push("close");
+      big.close();
+    });
+    setTimeout(() => {
+      p.pause();
+      p.removeListener("readable", idle);
+      p.on("data", (d) => { got += d.length; });
+      done.push("resume");
+      p.resume();
+    }, 200);
+  });
+  await new Promise((resolve) => big.listen(0, "127.0.0.1", resolve));
+  const c = net.connect(big.address().port, "127.0.0.1");
+  c.on("error", () => {});
+  c.end(Buffer.alloc(total, 7));
+  await new Promise((resolve) => big.once("close", resolve));
+  console.log(`a paused socket sent ${total} bytes: ${done.join(" | ")}`);
+}

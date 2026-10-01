@@ -22876,6 +22876,10 @@
         };
         this._paused = false;
         this._readLoopActive = false;
+        // A read loop asked for while one was still unwinding (_readLoop),
+        // and whether the handle's EOF has been read.
+        this._readLoopAgain = false;
+        this._readEofSeen = false;
         // Paused-mode reading (node's readableFlowing false / null): a
         // 'readable' listener buffers what arrives here for read(), and once
         // the last one goes the data is held until resume() or a 'data'
@@ -23639,12 +23643,33 @@
         // concurrent reads of the same handle, and the loser rejects with
         // "read handle is gone". The in-flight loop sees _paused cleared and
         // simply carries on, which is what resume() wants anyway.
-        if (this._readLoopActive) return;
+        //
+        // A loop that has already decided to stop (paused, or its buffer
+        // full) is still "active" until its async frame unwinds, a microtask
+        // later -- and the resume() or read() that clears the condition in
+        // between (a tick: the held data's release) found it active and
+        // returned, so nothing read again: a socket paused with a full
+        // buffer never read past it after resume(). Such a call is
+        // remembered, and the loop starts again as it unwinds if it still
+        // may read.
+        if (this._readLoopActive) {
+          this._readLoopAgain = true;
+          return;
+        }
         this._readLoopActive = true;
         try {
           await this._readLoopBody();
         } finally {
           this._readLoopActive = false;
+          if (this._readLoopAgain) {
+            this._readLoopAgain = false;
+            if (
+              !this._readEofSeen && !this.destroyed && !this._paused && !this._readFull &&
+              this._handle !== null
+            ) {
+              this._readLoop();
+            }
+          }
         }
       }
 
@@ -23670,6 +23695,7 @@
           // nobody.
           if (this._paused && !this._readableMode) this._holdData = true;
           if (chunk === undefined) {
+            this._readEofSeen = true;
             if (this._readableMode || this._holdData) {
               // Buffered or held: 'end' follows once what is left is read
               // (read() returns null), as node's does.
