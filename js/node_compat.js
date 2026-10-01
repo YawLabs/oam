@@ -23128,12 +23128,26 @@
         if (typeof data === "function") { cb = data; data = undefined; encoding = undefined; }
         else if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
         // Reentry guard (EOF auto-end + a user 'end' listener calling end()
-        // again would otherwise chain a SECOND 'finish' after 'close'). Node:
-        // end() after end() is a no-op that still fires the callback.
+        // again would otherwise chain a SECOND 'finish' after 'close').
+        // node's Writable.end on a stream already ended: data is a write
+        // after end (ERR_STREAM_WRITE_AFTER_END to the callback, and the
+        // socket destroyed with it); otherwise the callback is told the
+        // stream has finished (ERR_STREAM_ALREADY_FINISHED) or was
+        // destroyed (ERR_STREAM_DESTROYED), and waits for 'finish' only
+        // while neither has happened yet.
         if (this._writableState.ended) {
-          if (cb) {
-            if (this._endCallbacks !== null) this._endCallbacks.push(cb);
-            else if (this._writableState.finished) process.nextTick(cb);
+          let err;
+          if (data !== undefined && data !== null) {
+            err = codes.ERR_STREAM_WRITE_AFTER_END();
+            this.destroy(err);
+          } else if (this._writableState.finished) {
+            err = codes.ERR_STREAM_ALREADY_FINISHED("end");
+          } else if (this.destroyed) {
+            err = codes.ERR_STREAM_DESTROYED("end");
+          }
+          if (typeof cb === "function") {
+            if (err !== undefined) process.nextTick(cb, err);
+            else if (this._endCallbacks !== null) this._endCallbacks.push(cb);
             else process.nextTick(cb, this._writableState.errored ?? codes.ERR_STREAM_DESTROYED("end"));
           }
           return this;
@@ -23177,7 +23191,7 @@
             return;
           }
           this._writableState.finished = true;
-          for (const callback of callbacks) callback();
+          for (const callback of callbacks) callback(null);
           this.emit("finish");
           if (!this.readable) this._doClose();
         });

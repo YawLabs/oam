@@ -14,7 +14,9 @@
 //
 // Also pinned: the callbacks of a write the socket took and of an end()
 // run before the 'close' of a destroy() on the next line (oam ran them a
-// loop turn after it).
+// loop turn after it); an end() after the stream finished hands its
+// callback ERR_STREAM_ALREADY_FINISHED, not a success, and end(data) then
+// is a write after end.
 import net from "node:net";
 
 setTimeout(() => {
@@ -152,6 +154,23 @@ const quietPort = quiet.address().port;
   log.push("destroy() returned");
   await settle();
   flush("write(), end(), destroy()");
+}
+
+{
+  // end() once the stream has finished, half-open so it stays up.
+  const socket = net.connect({ port: quietPort, host: "127.0.0.1", allowHalfOpen: true });
+  socket.on("error", (e) => log.push(`error ${e.code}`));
+  socket.on("close", (hadError) => log.push(`close ${hadError}`));
+  await new Promise((resolve) => socket.end((e) => {
+    log.push(`first end callback ${e}`);
+    socket.end((e2) => log.push(`end() after finish: ${e2 && e2.code} ${JSON.stringify(e2 && e2.message)}`));
+    socket.end("more", (e3) => log.push(`end(data) after finish: ${e3 && e3.code}`));
+    resolve();
+  }));
+  await closed(socket);
+  socket.end((e) => log.push(`end() after close: ${e && e.code}`));
+  await settle();
+  flush("end() after the stream finished");
 }
 
 quiet.close();
