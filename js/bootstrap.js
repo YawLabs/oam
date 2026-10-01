@@ -1550,6 +1550,17 @@
     // redirect, and an application that vets a URL before requesting it
     // relies on that.
     if (rawPayload && init.__oamManualRedirect === true) request.redirect = "manual";
+    // ... and, the same way, exactly what was written and exactly what came
+    // back: node's http client adds no `accept` / `user-agent` /
+    // `accept-encoding` to a request and decodes no response body -- a
+    // `content-encoding: gzip` response is the gzip bytes, with its
+    // `content-encoding` and `content-length`, for the program to decode.
+    // The Fetch client's negotiation is fetch()'s alone (and, for now,
+    // undici.request's, which shares its entry).
+    if (rawPayload && init.__oamRawExchange === true) {
+      request.decode = false;
+      request.default_headers = false;
+    }
     // fetch's own `redirect: "manual"` returns the 3xx (its status, headers
     // and body; `redirected` false, `url` the request's) and `"error"` fails
     // on a redirect status with cause `unexpected redirect`, as node's do:

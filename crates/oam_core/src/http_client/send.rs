@@ -88,15 +88,17 @@ pub struct FetchRequest {
     /// checked either way (redirect::next).
     #[serde(default)]
     pub fetch_semantics: bool,
-    /// #149's knob; JS does not send it yet.
+    /// `fetch`'s `redirect` option; `http.request` always sends `manual`
+    /// (node's http client never follows a redirect).
     #[serde(default)]
     pub redirect: RedirectMode,
-    /// #148's knob: false delivers the body as received and keeps the
-    /// encoding headers. JS does not send it yet.
+    /// False delivers the body as received and keeps the encoding headers:
+    /// what `http.request` sends, node's http client decoding nothing (#148).
     #[serde(default = "yes")]
     pub decode: bool,
-    /// #148's knob: false sends the caller's headers alone. JS does not send
-    /// it yet.
+    /// False sends the caller's headers alone: what `http.request` sends,
+    /// node's http client adding no `accept` / `user-agent` /
+    /// `accept-encoding` of its own (#148).
     #[serde(default = "yes")]
     pub default_headers: bool,
     /// node's `maxHeaderSize` for the response heads of this request:
@@ -747,8 +749,9 @@ fn respond(
         None
     };
     // Divergence #32: a decoded body loses content-encoding and
-    // content-length (node keeps both). http.request shares this op and
-    // would decode a second time from the header.
+    // content-length (node's fetch keeps both). http.request shares this op
+    // but asks for no decoding, so it sees both headers and the encoded
+    // bytes, as node's does.
     let strip = codings.is_some();
     let headers: Vec<(String, String)> = response
         .headers()

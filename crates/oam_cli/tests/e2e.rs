@@ -27563,6 +27563,75 @@ fn fetch_negotiates_and_decodes_content_encoding() {
     );
 }
 
+/// `http.get` is not `fetch`: it advertises nothing and decodes nothing (#148).
+///
+/// Node's http client sends `host` and `connection` plus what the caller
+/// wrote, and hands a `content-encoding: gzip` response over as the gzip
+/// bytes with `content-encoding` and `content-length` intact. oam's own
+/// transport is fetch's, and it gave `http.get` fetch's three default headers
+/// and a decoded body with both headers removed -- so the usual
+/// `res.pipe(zlib.createGunzip())` was handed plain text and failed. The
+/// node-differential half is conformance case 192; this pins the oam side on
+/// its own, next to the fetch test above whose behaviour must not move.
+#[test]
+fn http_get_neither_negotiates_nor_decodes_content_encoding() {
+    let stdout = run_ok(
+        "http_get_raw_gzip.mjs",
+        "import http from 'node:http';\n\
+         import zlib from 'node:zlib';\n\
+         \n\
+         const payload = 'raw body '.repeat(20);\n\
+         const gz = zlib.gzipSync(Buffer.from(payload, 'utf8'));\n\
+         let seen = null;\n\
+         const srv = http.createServer((req, res) => {\n\
+           seen = Object.keys(req.headers).sort().join(',');\n\
+           res.writeHead(200, {\n\
+             'content-encoding': 'gzip',\n\
+             'content-length': String(gz.length),\n\
+           });\n\
+           res.end(gz);\n\
+         });\n\
+         await new Promise((r) => srv.listen(0, '127.0.0.1', r));\n\
+         const port = srv.address().port;\n\
+         \n\
+         const { res, raw } = await new Promise((resolve, reject) => {\n\
+           http.get({ host: '127.0.0.1', port, path: '/' }, (res) => {\n\
+             const chunks = [];\n\
+             res.on('data', (d) => chunks.push(d));\n\
+             res.on('end', () => resolve({ res, raw: Buffer.concat(chunks) }));\n\
+           }).on('error', reject);\n\
+         });\n\
+         console.log('sent:', seen);\n\
+         console.log('content-encoding:', res.headers['content-encoding']);\n\
+         console.log('content-length matches:', res.headers['content-length'] === String(gz.length));\n\
+         console.log('raw bytes:', raw.equals(gz));\n\
+         console.log('caller decodes:', zlib.gunzipSync(raw).toString() === payload);\n\
+         \n\
+         const viaFetch = await fetch('http://127.0.0.1:' + port + '/');\n\
+         console.log('fetch decodes:', (await viaFetch.text()) === payload);\n\
+         console.log('fetch sent:', seen);\n\
+         srv.close();\n",
+    );
+    assert!(
+        stdout.contains("sent: connection,host\n"),
+        "http.get must send host and connection alone -- no accept, user-agent or accept-encoding: {stdout}"
+    );
+    assert!(
+        stdout.contains("content-encoding: gzip\n")
+            && stdout.contains("content-length matches: true"),
+        "http.get must keep the response's content-encoding and content-length: {stdout}"
+    );
+    assert!(
+        stdout.contains("raw bytes: true") && stdout.contains("caller decodes: true"),
+        "http.get must hand over the gzip bytes as sent, for the caller to decode: {stdout}"
+    );
+    assert!(
+        stdout.contains("fetch decodes: true")
+            && stdout.contains("fetch sent: accept,accept-encoding,"),
+        "fetch must keep negotiating and decoding: {stdout}"
+    );
+}
+
 /// `fs/promises` rejects on a bad path argument; it does not throw.
 ///
 /// Node validates the path INSIDE the promise, so

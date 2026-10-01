@@ -20291,6 +20291,11 @@
           // named -- and a `lookup` / 'lookup' guard, which the request's
           // own (literal) host never needed, never saw them.
           __oamManualRedirect: true,
+          // ... and adds no header of its own beyond `host` and
+          // `connection`, and hands the response body over as the server
+          // sent it: no `accept` / `user-agent` / `accept-encoding`, no
+          // decoding, `content-encoding` and `content-length` intact.
+          __oamRawExchange: true,
         };
         // The request's own response-head limit; without one the transport
         // applies the process-wide default.

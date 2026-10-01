@@ -912,13 +912,14 @@ decode keeps both headers, as in Node: a HEAD or CONNECT request, a 101, 204, 20
 and a coding list holding any other token -- `identity`, an unknown coding, or the empty
 token of `gzip,`.
 
-Why oam still strips them: `http.request` goes through the same native op as `fetch` until
-#148, and it gets the decoded body too. Node's `http` hands over the raw bytes with the
-headers intact, so its callers decode for themselves (`res.pipe(zlib.createGunzip())` when
-`content-encoding` says gzip). Keeping the header on a body oam already decoded would send
-that code into a second, failing decode. The op already has the switch (a request can ask
-for the raw body and the original headers); once `http.request` uses it (#148), `fetch` can
-keep Node's headers.
+This is `fetch` only. `http.request` goes through the same native op but asks it for the
+raw exchange (#148): the body arrives as the server sent it with both headers intact, as
+in Node, so its callers decode for themselves (`res.pipe(zlib.createGunzip())` when
+`content-encoding` says gzip) -- `conformance/cases/192-http-request-raw-body-and-headers.mjs`.
+Up to 0.17.1 it got the decoded body too, which is why the headers had to go: keeping
+`content-encoding` on a body oam had already decoded sent that code into a second, failing
+decode. Nothing shares the decoded payload with `http.request` any more, so `fetch` can
+now keep Node's headers; it does not yet.
 
 What is NOT divergent: which codings are undone, and the decoded bytes. The body is decoded
 as it streams, at most 16 KiB per chunk (zlib's `chunkSize` in Node), so a sync-flushed
@@ -1510,8 +1511,9 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   `ERR_INVALID_URL`, `input` and `base`. Case 111 prints only the message.
 - **`http.request` on this transport returns a `3xx` as the response**, as Node's does (it
   asks the transport for `'manual'`); up to 0.16.2 it followed redirects by `fetch`'s rules.
-  It also decodes the body, as `fetch` does (entry 32). Node's `http.request` does not, and
-  neither does a request sent over an agent's socket (entry 43).
+  It does not decode the body either, and adds no `accept`, `user-agent` or
+  `accept-encoding` to the request, as Node's does not (case 192); up to 0.17.1 it did
+  both, as `fetch` does (entry 32).
 - **A hop that lands on a pooled connection the server has just closed.** oam's redirect loop
   has no event-loop tick between the 3xx and the hop, so against a server that sends the 3xx
   with keep-alive and then FINs, the hop can be written before the server's FIN arrives.
@@ -2041,8 +2043,8 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   `ERR_UNESCAPED_CHARACTERS`; Node writes it raw, so such a path adds header lines to its
   request. A body written in the same tick as `end()` is
   sent with `content-length`, where Node sends `write()`s before `end()` chunked. No
-  `accept`, `user-agent` or `accept-encoding` is added (oam's own client adds all three,
-  #148). Redirects are not followed and bodies are not decoded, as in Node.
+  `accept`, `user-agent` or `accept-encoding` is added, redirects are not followed and
+  bodies are not decoded, as in Node -- and as on oam's own transport (entry 38, case 192).
 - **Errors.** A response that cannot be parsed fails with a coded `Parse Error: ...`
   (`HPE_*`) whose code is the closest llhttp has for what hyper reports; a malformed chunk
   size is `HPE_INVALID_CHUNK_SIZE`, as in Node. A response head is held to the request's
