@@ -331,6 +331,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpServerUpgrades", op_http_server_upgrades),
         ("httpConnSetTimeout", op_http_conn_set_timeout),
         ("httpConnDestroy", op_http_conn_destroy),
+        ("httpConnReset", op_http_conn_reset),
         ("httpConnResume", op_http_conn_resume),
         // --max-http-header-size / --insecure-http-parser, as the CLI set them
         ("httpMaxHeaderSize", op_http_max_header_size),
@@ -365,6 +366,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("tcpRead", op_tcp_read),
         ("tcpWrite", op_tcp_write),
         ("tcpClose", op_tcp_close),
+        ("tcpReset", op_tcp_reset),
         ("tcpShutdown", op_tcp_shutdown),
         ("tcpListen", op_tcp_listen),
         ("tcpAccept", op_tcp_accept),
@@ -3198,6 +3200,17 @@ fn op_http_conn_destroy(
     core_runtime!(scope).http().destroy_conn(conn_id, graceful);
 }
 
+/// `httpConnReset(connectionId)`: `socket.resetAndDestroy()` on a server
+/// connection -- closed with a reset (SO_LINGER 0), nothing unsent delivered.
+fn op_http_conn_reset(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let conn_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    core_runtime!(scope).http().reset_conn(conn_id);
+}
+
 /// `httpConnResume(connectionId)`: the server's `'secureConnection'`
 /// listeners have run for this connection, so it may be served. A listener
 /// that destroyed the socket has already said so through `httpConnDestroy`,
@@ -4329,6 +4342,28 @@ fn op_tcp_close(
     let tcp = core_runtime!(scope).tcp();
     oam_core::tcp::tcp_close(&tcp, handle);
     core_runtime_mut!(scope).forget_handle(oam_core::HandleKey::Tcp(handle));
+}
+
+/// `__oam.node.tcpReset(handle, shutdownFinished)`: node's
+/// `socket.resetAndDestroy()` -- the stream closed so that its peer sees a
+/// reset (oam_core::tcp::tcp_reset). `shutdownFinished`: the socket has
+/// emitted 'finish'. Returns undefined, or the errno code of a reset refused
+/// (`"EINVAL"`: its shutdown is under way); the handle is closed either way.
+fn op_tcp_reset(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let shutdown_finished = args.get(1).boolean_value(scope);
+    let tcp = core_runtime!(scope).tcp();
+    let refused = oam_core::tcp::tcp_reset(&tcp, handle, shutdown_finished).err();
+    core_runtime_mut!(scope).forget_handle(oam_core::HandleKey::Tcp(handle));
+    if let Some(oam_core::tcp::ResetRefused(code)) = refused
+        && let Some(code) = v8::String::new(scope, code)
+    {
+        rv.set(code.into());
+    }
 }
 
 /// `__oam.node.tcpSetRef(handle, referenced)`: node's `socket.ref()` /

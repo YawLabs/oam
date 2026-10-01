@@ -28,7 +28,7 @@ use std::future::Future;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin as StdPin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -158,14 +158,19 @@ pub(crate) struct ConnInfo {
     pub(crate) local: Option<SocketAddr>,
     pub(crate) peer: Option<SocketAddr>,
     pub(crate) tls: Option<TlsInfo>,
+    /// The [`ConnCloser`] id JS closes this connection by
+    /// ([`close_connection`]): an HTTP/1 connection the transport dialled.
+    /// None on an h2 connection, which many requests share at once.
+    pub(crate) connection: Option<u64>,
 }
 
 impl ConnInfo {
     fn of(tcp: &EagerTcp) -> ConnInfo {
         ConnInfo {
-            local: tcp.0.local_addr().ok(),
-            peer: tcp.0.peer_addr().ok(),
+            local: tcp.stream.local_addr().ok(),
+            peer: tcp.stream.peer_addr().ok(),
             tls: None,
+            connection: Some(tcp.closer.id),
         }
     }
 
@@ -228,8 +233,13 @@ pub(crate) struct OamConn {
 }
 
 impl OamConn {
-    fn new(io: Box<dyn AsyncIo>, h2: bool, proxied: bool, info: ConnInfo) -> OamConn {
+    fn new(io: Box<dyn AsyncIo>, h2: bool, proxied: bool, mut info: ConnInfo) -> OamConn {
         let stats = ConnStats::new();
+        // An h2 connection carries every request to its origin at once: one
+        // request's socket closing it would end all the others.
+        if h2 {
+            info.connection = None;
+        }
         OamConn {
             io: TokioIo::new(Counted {
                 io,
@@ -817,7 +827,95 @@ async fn dial(host: &str, port: u16, opts: &ConnectOptions) -> Result<EagerTcp, 
         .await
         .map_err(|e| Box::new(e) as BoxError)?;
     tune(&connected.stream);
-    Ok(EagerTcp(connected.stream))
+    Ok(EagerTcp {
+        stream: connected.stream,
+        closer: ConnCloser::new(),
+    })
+}
+
+/// How JS closes one connection the transport dialled: node's `destroy()`
+/// or `resetAndDestroy()` on the `req.socket` of an `http.request` it
+/// carries. The connection's task waits on [`ConnCloser::requested`] beside
+/// hyper's dispatcher and drops the connection when it fires, whether a
+/// response is streaming over it or it sits idle in the pool; a reset arms
+/// SO_LINGER 0 first, through the stream's own drop ([`EagerTcp`]).
+///
+/// Found by id in a process-wide table of weak entries, which the closer
+/// leaves when the connection's last holder (its stream, its task) drops it:
+/// one entry per connection, written at the dial and at the close, nothing
+/// per request.
+pub(crate) struct ConnCloser {
+    id: u64,
+    requested: AtomicBool,
+    reset: AtomicBool,
+    wake: tokio::sync::Notify,
+}
+
+type Closers = Mutex<HashMap<u64, std::sync::Weak<ConnCloser>>>;
+
+fn closers() -> &'static Closers {
+    static CLOSERS: std::sync::OnceLock<Closers> = std::sync::OnceLock::new();
+    CLOSERS.get_or_init(Default::default)
+}
+
+impl ConnCloser {
+    fn new() -> Arc<ConnCloser> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let closer = Arc::new(ConnCloser {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            requested: AtomicBool::new(false),
+            reset: AtomicBool::new(false),
+            wake: tokio::sync::Notify::new(),
+        });
+        closers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(closer.id, Arc::downgrade(&closer));
+        closer
+    }
+
+    /// The closer of a live connection, by the id its responses carry.
+    pub(crate) fn find(id: u64) -> Option<Arc<ConnCloser>> {
+        closers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Resolves once JS has asked for the connection to close.
+    pub(crate) async fn requested(&self) {
+        // One waiter (the connection's task); `notify_one` keeps the permit
+        // for a request made before it first waits.
+        while !self.requested.load(Ordering::Acquire) {
+            self.wake.notified().await;
+        }
+    }
+
+    fn close(&self, reset: bool) {
+        if reset {
+            self.reset.store(true, Ordering::Release);
+        }
+        self.requested.store(true, Ordering::Release);
+        self.wake.notify_one();
+    }
+}
+
+impl Drop for ConnCloser {
+    fn drop(&mut self) {
+        closers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+/// `__oam.fetchConnClose(id, reset)`: close the transport connection with
+/// this id -- with a reset when `reset` -- if it is still open.
+pub fn close_connection(id: u64, reset: bool) {
+    if let Some(closer) = ConnCloser::find(id) {
+        closer.close(reset);
+    }
 }
 
 /// The most one direct read takes. The part of the caller's buffer it reads
@@ -848,7 +946,21 @@ const DIRECT_READ_MAX: usize = 16 * 1024;
 /// still in flight when the request is written is not covered; node loses
 /// that race too, and for an idempotent request the send path's single
 /// resend covers it.
-pub(crate) struct EagerTcp(tokio::net::TcpStream);
+///
+/// It also carries the connection's [`ConnCloser`], and a connection JS
+/// reset is dropped with SO_LINGER 0, so the close is the reset.
+pub(crate) struct EagerTcp {
+    stream: tokio::net::TcpStream,
+    closer: Arc<ConnCloser>,
+}
+
+impl Drop for EagerTcp {
+    fn drop(&mut self) {
+        if self.closer.reset.load(Ordering::Acquire) {
+            crate::tcp::arm_reset(&self.stream);
+        }
+    }
+}
 
 impl AsyncRead for EagerTcp {
     fn poll_read(
@@ -856,7 +968,7 @@ impl AsyncRead for EagerTcp {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let stream = &mut self.get_mut().0;
+        let stream = &mut self.get_mut().stream;
         if let ready @ Poll::Ready(_) = StdPin::new(&mut *stream).poll_read(cx, buf) {
             return ready;
         }
@@ -904,19 +1016,19 @@ impl AsyncWrite for EagerTcp {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        StdPin::new(&mut self.get_mut().0).poll_write(cx, buf)
+        StdPin::new(&mut self.get_mut().stream).poll_write(cx, buf)
     }
 
     fn poll_flush(self: StdPin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        StdPin::new(&mut self.get_mut().0).poll_flush(cx)
+        StdPin::new(&mut self.get_mut().stream).poll_flush(cx)
     }
 
     fn poll_shutdown(self: StdPin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        StdPin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        StdPin::new(&mut self.get_mut().stream).poll_shutdown(cx)
     }
 
     fn is_write_vectored(&self) -> bool {
-        self.0.is_write_vectored()
+        self.stream.is_write_vectored()
     }
 
     fn poll_write_vectored(
@@ -924,7 +1036,7 @@ impl AsyncWrite for EagerTcp {
         cx: &mut Context<'_>,
         bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<std::io::Result<usize>> {
-        StdPin::new(&mut self.get_mut().0).poll_write_vectored(cx, bufs)
+        StdPin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
     }
 }
 
@@ -1029,6 +1141,90 @@ mod tests {
         let socket = socket2::SockRef::from(&stream);
         assert!(socket.tcp_nodelay().unwrap());
         assert!(socket.keepalive().unwrap());
+    }
+
+    /// A dialled connection and a peer that reads it to the end on a thread
+    /// of its own, reporting how that read ended.
+    async fn dialled_with_peer() -> (EagerTcp, std::sync::mpsc::Receiver<std::io::Result<usize>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut all = Vec::new();
+            let _ = tx.send(std::io::Read::read_to_end(&mut peer, &mut all).map(|_| all.len()));
+        });
+        let opts = ConnectOptions {
+            attempt_timeout: Duration::from_millis(250),
+            pin: None,
+            local: None,
+        };
+        (dial("127.0.0.1", port, &opts).await.unwrap(), rx)
+    }
+
+    async fn peer_read_ended(
+        rx: std::sync::mpsc::Receiver<std::io::Result<usize>>,
+    ) -> std::io::Result<usize> {
+        tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(30)))
+            .await
+            .unwrap()
+            .expect("the peer's read never ended")
+    }
+
+    /// `req.socket.resetAndDestroy()` on the fetch path: closing the
+    /// connection by the id its responses carry wakes the connection's task,
+    /// the stream's drop is then a reset, and the id leaves the table with
+    /// the connection -- a late close is a no-op.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_closed_by_its_id_resets_and_leaves_the_table() {
+        let (tcp, peer) = dialled_with_peer().await;
+        let id = ConnInfo::of(&tcp)
+            .connection
+            .expect("an h1 connection is named");
+        let task = ConnCloser::find(id).expect("a live connection is in the table");
+        let waiting = tokio::spawn(async move { task.requested().await });
+        close_connection(id, true);
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the connection's task was woken")
+            .unwrap();
+        drop(tcp);
+        let ended = peer_read_ended(peer).await;
+        assert_eq!(
+            ended.as_ref().map_err(std::io::Error::kind).err(),
+            Some(std::io::ErrorKind::ConnectionReset),
+            "{ended:?}"
+        );
+        assert!(
+            ConnCloser::find(id).is_none(),
+            "the closed connection left the table"
+        );
+        close_connection(id, true);
+    }
+
+    /// `destroy()` rather than `resetAndDestroy()`: the connection still
+    /// closes, with the FIN of an orderly end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_closed_without_a_reset_ends_with_a_fin() {
+        let (tcp, peer) = dialled_with_peer().await;
+        let id = ConnInfo::of(&tcp).connection.unwrap();
+        close_connection(id, false);
+        tokio::time::timeout(Duration::from_secs(5), tcp.closer.requested())
+            .await
+            .expect("the close was asked for");
+        drop(tcp);
+        assert_eq!(peer_read_ended(peer).await.unwrap(), 0);
+    }
+
+    /// An h2 connection carries many requests at once: it is not named, so
+    /// no one request's socket can close it under the others.
+    #[tokio::test]
+    async fn an_h2_connection_is_not_named() {
+        let (tcp, _peer) = dialled_with_peer().await;
+        let info = ConnInfo::of(&tcp);
+        assert!(info.connection.is_some());
+        let conn = OamConn::new(Box::new(tcp), true, false, info);
+        assert_eq!(conn.conn_info().connection, None);
     }
 
     /// The proxy dial takes the URI it is given even when the proxy rules
