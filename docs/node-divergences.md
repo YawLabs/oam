@@ -2317,7 +2317,20 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   when `destroy()` follows on the next line. A write the socket took whole inside the call
   reports `null` to its callback, and the callbacks of an `end()` still waiting get
   `ERR_STREAM_DESTROYED`, before that `'close'`, as in Node
-  (`conformance/cases/225-net-write-then-end-order.mjs`). What is left there: a write the
+  (`conformance/cases/225-net-write-then-end-order.mjs`). An `end()` or `write()` made
+  after `destroy()` is refused as Node refuses it: the callback gets
+  `ERR_STREAM_DESTROYED` ("Cannot call end after a stream was destroyed", or "... write
+  ..." for `write()` and `end(data)`) on the next tick, never `destroy()`'s own error, and
+  the stream does not end; after a `destroy()` with no error, `end(callback)` ends the
+  stream and, as in Node, calls back only once a write still outstanding settles -- with
+  that write's `ERR_SOCKET_CLOSED_BEFORE_CONNECTION` for one held behind the connect,
+  `ERR_STREAM_DESTROYED` otherwise -- and never when none is (a write with no callback
+  that the socket took whole inside the call does not count, as in Node)
+  (`conformance/cases/248-net-end-write-after-destroy.mjs`; up to 0.17.1 those `end()`
+  callbacks got the destroy error, or `ERR_SOCKET_CLOSED`). On a socket destroyed while
+  connecting, a write held behind the connect fails -- its callback, then those of such an
+  `end()` -- before `'close'`; Node fails it from a `'close'` listener the `write()` added,
+  so after the `'close'` listeners added before it. What is left there: a write the
   socket could not take at once is still queued natively when `destroy()` closes the
   handle, and its callback gets `ERR_SOCKET_CLOSED` after `'close'` (Node's gets `null`,
   before it); oam settles a write's accounting with its callback, after `write()` has
@@ -2482,6 +2495,25 @@ What still differs:
 - **A closed descriptor in range** behaves as before: `fs.close(fd, cb)` on one oam
   never opened calls back `null` where node reports `EBADF`, and on Windows node's
   `fchown` on any descriptor is a no-op success where oam reports `EBADF`.
+
+### Coded errors: the error objects
+
+Node builds a coded error (`err.code` `ERR_*`) on a prototype of its own for that code,
+between the instance and the base's prototype: its `constructor` answers the base, so
+`err.constructor.name` is `Error` / `TypeError` / `RangeError`, its `toString` renders
+`Name [CODE]: message` (and so does the stack header), and the instance's own properties
+are `stack`, `message` and `code`. oam's are built the same way, from one registry
+(`js/bootstrap.js`) that `node_compat.js`'s errors and the vendored streams' share, so two
+errors with one code share a prototype whichever raised them -- `ERR_STREAM_DESTROYED`
+from a `net.Socket` and from a `stream.Writable` (or `tls.TLSSocket`) alike
+(`conformance/cases/248-net-end-write-after-destroy.mjs`). Up to 0.17.1 the streams'
+errors were classes named after the code (`constructor.name` `ERR_STREAM_DESTROYED`), the
+rest sat on `Error.prototype` with an own `toString`, and the stack's top frame was oam's
+error factory. What is left: a few errors are still built by hand with a code and no
+factory -- `ERR_DIR_CLOSED`, `ERR_UNKNOWN_CREDENTIAL`, `ERR_INVALID_URL_SCHEME`,
+`ERR_INVALID_FILE_URL_PATH` among them -- and render `Error: message`, on
+`Error.prototype` (node's last two are `TypeError`s); and the `toString` on the
+prototype is oam's function, not node's source text.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 

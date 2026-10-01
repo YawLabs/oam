@@ -667,18 +667,21 @@
   //   `message` precedes `code`. Which codes are which is node's table, not
   //   something to derive here: see NODE_FUNCTION_MESSAGE_CODES.
   // - `toString` is NOT an own property. It lives on a prototype between the
-  //   instance and Base.prototype, shared by every error of that code, so
-  //   `delete err.toString` changes nothing and
+  //   instance and Base.prototype, shared by every error of that code
+  //   whichever module raised it: the prototypes come from the one registry
+  //   bootstrap.js installs (__oamNodeErrorPrototype), which the vendored
+  //   streams' errors use too. So `delete err.toString` changes nothing and
   //   `Object.getPrototypeOf(err) === RangeError.prototype` is false, while
   //   `err.constructor === RangeError` and `err instanceof RangeError` hold.
   // - `.name` stays the plain base name (assert.throws({ name }) compares it
   //   strictly); the code shows in `toString()` and in the stack header,
-  //   "BaseName [CODE]: msg".
+  //   "BaseName [CODE]: msg". V8 renders the stack on its first read, through
+  //   toString (bootstrap.js prepareStackTrace), so an error born on its
+  //   code's prototype needs nothing rewritten.
   //
   // oam used to set `code` after the base constructor had set `message` and
   // then define `toString` on the instance, which gave `stack, message, code,
   // toString` and a flat prototype chain.
-  const kIsNodeError = Symbol("kIsNodeError");
 
   // The codes node declares with a message FUNCTION
   // (`E('ERR_X', (a, b) => ..., Base)`), for which `code` is an own property
@@ -715,49 +718,14 @@
     "ERR_UNSUPPORTED_ESM_URL_SCHEME",
   ]);
 
-  // The prototype every error of `code` over `baseProto` shares: node's
-  // NodeError.prototype for that code. Built once per (code, base) pair, as
-  // node builds one class per code.
-  const nodeErrorPrototypes = new Map(); // code -> Map(base prototype -> prototype)
-  function nodeErrorPrototype(baseProto, code) {
-    let byBase = nodeErrorPrototypes.get(code);
-    if (byBase === undefined) {
-      byBase = new Map();
-      nodeErrorPrototypes.set(code, byBase);
-    }
-    let proto = byBase.get(baseProto);
-    if (proto === undefined) {
-      const Base = baseProto.constructor;
-      proto = Object.create(baseProto, {
-        // node: "a workaround for wpt tests that expect that the error
-        // constructor has a `name` property of the base class".
-        constructor: {
-          get() {
-            return Base;
-          },
-          enumerable: false,
-          configurable: true,
-        },
-        [kIsNodeError]: {
-          get() {
-            return true;
-          },
-          enumerable: false,
-          configurable: true,
-        },
-        toString: {
-          value: function toString() {
-            return `${this.name} [${code}]: ${this.message}`;
-          },
-          writable: true,
-          enumerable: false,
-          configurable: true,
-        },
-      });
-      byBase.set(baseProto, proto);
-    }
-    return proto;
-  }
+  // The native error classes whose instances take node's coded-error
+  // prototype from the shared registry.
+  const kNativeErrorProtos = new Set([
+    Error.prototype, TypeError.prototype, RangeError.prototype,
+    SyntaxError.prototype, URIError.prototype, EvalError.prototype,
+    ReferenceError.prototype,
+  ]);
+  const nodeErrorPrototype = globalThis.__oamNodeErrorPrototype;
 
   function defineNodeErrorMessage(inst, message) {
     Object.defineProperty(inst, "message", {
@@ -769,17 +737,38 @@
   }
 
   // The last two steps, once `code` and `message` are in place: move the
-  // instance under its code's prototype, and render the code into the stack
-  // header, which node's prepareStackTrace does for a kIsNodeError error.
+  // instance under its code's prototype, and make sure the stack header
+  // carries the code.
   function finishNodeErrorShape(inst, code) {
-    let baseProto = Object.getPrototypeOf(inst);
-    // Shaped twice (a helper re-coding an error): stay one level deep.
-    if (Object.hasOwn(baseProto, kIsNodeError)) baseProto = Object.getPrototypeOf(baseProto);
-    Object.setPrototypeOf(inst, nodeErrorPrototype(baseProto, code));
-    // Rewrite line 0 only when it is the default render, `Name` or
-    // `Name: message`: a user's Error.prepareStackTrace output is theirs to
-    // keep, exactly as in node. `stack` stays an accessor after the
-    // assignment.
+    let base = Object.getPrototypeOf(inst);
+    // Shaped twice (a helper re-coding an error): stay one level deep. A
+    // registry prototype sits directly on a native one, with its own
+    // toString.
+    const parent = base === null ? null : Object.getPrototypeOf(base);
+    if (!kNativeErrorProtos.has(base) && kNativeErrorProtos.has(parent) && Object.hasOwn(base, "toString")) {
+      base = parent;
+    }
+    if (kNativeErrorProtos.has(base)) {
+      Object.setPrototypeOf(inst, nodeErrorPrototype(base.constructor, code));
+    } else {
+      // An instance of some other class: the rendering goes on the instance.
+      const baseName = inst.name;
+      Object.defineProperty(inst, "toString", {
+        value: function () {
+          const m = this.message;
+          return baseName + " [" + code + "]" + (m ? ": " + m : "");
+        },
+        writable: true,
+        configurable: true,
+        enumerable: false,
+      });
+    }
+    // The instance was built elsewhere, so its stack may already have been
+    // rendered with the plain header. Rewrite line 0 only when it is that
+    // default render, `Name` or `Name: message`: a user's
+    // Error.prepareStackTrace output is theirs to keep, exactly as in node,
+    // and a header that already shows the code is left alone. `stack` stays
+    // an accessor after the assignment.
     try {
       const stack = inst.stack;
       const name = inst.name;
@@ -827,10 +816,18 @@
   // it runs as node's does: with `this` set to the error under construction,
   // AFTER `code` is in place and BEFORE `message` is, so a property it sets
   // (ERR_INVALID_URL's `input`) lands between the two.
+  //
+  // The error is made with NodeError as new.target on the shared prototype
+  // for its code, so it is born with node's prototype (no stack read and no
+  // rewrite: the header renders through toString on first read), and its
+  // stack starts at the caller -- V8 leaves out the frames up to new.target,
+  // as node's internal ones are not shown.
   function E(code, Base, msgFn) {
     const codeFirst = NODE_FUNCTION_MESSAGE_CODES.has(code);
+    let proto;
     function NodeError() {
-      var inst = new Base();
+      if (proto === undefined) NodeError.prototype = proto = nodeErrorPrototype(Base, code);
+      var inst = Reflect.construct(Base, [], NodeError);
       if (codeFirst) {
         inst.code = code;
         defineNodeErrorMessage(
@@ -844,7 +841,7 @@
         );
         inst.code = code;
       }
-      return finishNodeErrorShape(inst, code);
+      return inst;
     }
     return NodeError;
   }
@@ -1248,6 +1245,13 @@
   codes.ERR_STREAM_DESTROYED = E("ERR_STREAM_DESTROYED", Error, function(name) {
     return 'Cannot call ' + (name || 'write') + ' after a stream was destroyed';
   });
+  // A write, end() or connect-time op on a socket destroyed before it could
+  // run (lib/internal/errors.js; net and tls raise them).
+  codes.ERR_SOCKET_CLOSED = E("ERR_SOCKET_CLOSED", Error, "Socket is closed");
+  codes.ERR_SOCKET_CLOSED_BEFORE_CONNECTION = E(
+    "ERR_SOCKET_CLOSED_BEFORE_CONNECTION", Error,
+    "Socket closed before the connection was established",
+  );
   // node's OutgoingMessage guard: `%s` is the operation ('render', 'set',
   // 'remove', 'append').
   codes.ERR_HTTP_HEADERS_SENT = E("ERR_HTTP_HEADERS_SENT", Error, function(what) {
@@ -24227,7 +24231,14 @@
         this._releaseScheduled = false;
         // node's Duplex options: a side can be closed from the start.
         if (options && options.readable === false) this.readable = false;
-        if (options && options.writable === false) this.writable = false;
+        if (options && options.writable === false) {
+          // node's Duplex: a side closed from the start has ended and
+          // finished (writableEnded / writableFinished true), so end() and
+          // write() are refused as on any finished stream.
+          this.writable = false;
+          const ws = this._writableState;
+          ws.ending = ws.ended = ws.finished = true;
+        }
         this._pipeHandler = null;
         this._timeoutMs = 0;
         this._timeoutId = null;
@@ -24238,7 +24249,9 @@
         // is in flight; null when ops go straight to the natives (see
         // _issue() and _releaseHeldOps()).
         this._heldOps = null;
-        // end()'s callbacks, from the first end() until the stream finishes.
+        // end()'s callbacks, from the first end() until the stream finishes
+        // -- node's kOnFinished list. On a socket destroyed before its first
+        // end(), until a write outstanding at destroy() settles (see end()).
         this._endCallbacks = null;
         if (options && options._handle !== undefined) {
           this._handle = options._handle;
@@ -24387,27 +24400,24 @@
           err.code = "ERR_INVALID_ARG_TYPE";
           throw err;
         }
-        if (this._writableState.ended && this._readableState.endEmitted && !this.allowHalfOpen) {
-          // node's writeAfterFIN (lib/net.js), which replaces write() once
-          // the peer's FIN has been read on a socket that is not half-open:
-          // a write after the auto end() that followed fails with EPIPE,
-          // on the next tick, and destroys the socket with it (#164).
-          const err = new Error("This socket has been ended by the other party");
-          err.code = "EPIPE";
-          if (typeof cb === "function") process.nextTick(cb, err);
-          this.destroy(err);
-          return false;
-        }
         if (this.destroyed || !this.writable) {
-          // node's Writable.write: the callback gets the error on the next
-          // tick, and a write after end() destroys the socket with it
-          // ('error' and 'close' deferred, as every destroy()); a write to
-          // a socket already destroyed reports to the callback alone.
-          // Nothing is emitted inside the call: with no 'error' listener
-          // that emit threw into the caller (#164).
-          const err = this._writableState.ending || !this.destroyed
-            ? codes.ERR_STREAM_WRITE_AFTER_END()
-            : codes.ERR_STREAM_DESTROYED("write");
+          let err;
+          if (this._writableState.ended && this._readableState.endEmitted && !this.allowHalfOpen) {
+            // node's writeAfterFIN (lib/net.js), which replaces write() once
+            // the peer's FIN has been read on a socket that is not
+            // half-open: a write after the auto end() that followed fails
+            // with EPIPE (#164).
+            err = new Error("This socket has been ended by the other party");
+            err.code = "EPIPE";
+          } else {
+            err = this._refusedWriteError();
+          }
+          // The callback gets the error on the next tick, and the socket is
+          // destroyed with it ('error' and 'close' deferred, as every
+          // destroy(); a no-op on a socket already destroyed, so a write to
+          // one reports to the callback alone). Nothing is emitted inside
+          // the call: with no 'error' listener that emit threw into the
+          // caller (#164).
           if (typeof cb === "function") process.nextTick(cb, err);
           this.destroy(err);
           return false;
@@ -24436,7 +24446,18 @@
         // The native write is issued now (see _issue); `_chain` only orders
         // what follows it -- the accounting and the callback, each after
         // the write before it.
-        const written = this._issue(() => natives.tcpWrite(this._handle, bytes));
+        // `tookWhole`: the socket took the write whole inside this call (the
+        // native op finished in it). node's onwrite then skips afterWrite
+        // for a write with no callback, so such a write does not drain the
+        // callbacks of an end() parked after destroy() (see below).
+        let inCall = true;
+        let tookWhole = false;
+        const written = this._issue(() => {
+          const op = natives.tcpWrite(this._handle, bytes);
+          if (op === undefined) tookWhole = inCall;
+          return op;
+        });
+        inCall = false;
         this._chain = this._chain.then(() => written).then((failure) => {
           settle();
           if (failure === undefined) {
@@ -24445,16 +24466,20 @@
             // Node invokes queued write callbacks with the socket-closed
             // error (NOT the connect error -- that went to 'error') --
             // silently dropping them hangs promisified writes forever.
-            if (cb) {
-              const err = Object.assign(
-                new Error(this._everConnected
-                  ? "Socket is closed"
-                  : "Socket closed before the connection was established"),
-                { code: this._everConnected
-                  ? "ERR_SOCKET_CLOSED"
-                  : "ERR_SOCKET_CLOSED_BEFORE_CONNECTION" },
-              );
-              process.nextTick(() => cb(err));
+            if (cb || !this._everConnected) {
+              const err = this._socketClosedError();
+              if (!this._everConnected) {
+                // node's onwrite: a write held behind a connect the socket
+                // never made fails with this error, and the stream records
+                // it -- so the callbacks of an end() parked after destroy()
+                // get it too, and a later end(cb) is told the stream was
+                // destroyed.
+                const ws = this._writableState;
+                const rs = this._readableState;
+                if (!ws.errored) ws.errored = err;
+                if (!rs.errored) rs.errored = err;
+              }
+              if (cb) process.nextTick(cb, err);
             }
           } else {
             // node's afterWriteDispatched: a failed write destroys the
@@ -24466,6 +24491,14 @@
             this.destroy(failure);
             if (cb) cb(failure);
           }
+          // node's afterWrite / onwriteError on a destroyed stream:
+          // errorBuffer hands the callbacks of an end() made after
+          // destroy() their error once a write outstanding at destroy()
+          // settles -- right after that write's own callback. Not for a
+          // write with no callback the socket took whole in the call.
+          if (this.destroyed && this._endCallbacks !== null && (cb || !tookWhole)) {
+            this._failEndCallbacks(failure === kSocketClosed);
+          }
         });
         // Node: false once the queue is at or past the high-water mark. The
         // write is still accepted -- false is advisory, asking the producer to
@@ -24475,6 +24508,43 @@
           return false;
         }
         return true;
+      }
+
+      // Why a chunk handed to write() or end(data) on a socket that is not
+      // writable is refused -- node's Writable _write: after end() it is a
+      // write after end, on a socket destroyed first it is
+      // ERR_STREAM_DESTROYED ("Cannot call write after a stream was
+      // destroyed"). Off the hot path: only a refused chunk gets here.
+      _refusedWriteError() {
+        return this._writableState.ending || !this.destroyed
+          ? codes.ERR_STREAM_WRITE_AFTER_END()
+          : codes.ERR_STREAM_DESTROYED("write");
+      }
+
+      // What a write or end() queued on a socket destroyed before the op
+      // could run fails with: ERR_SOCKET_CLOSED, or -- on a socket that
+      // never connected -- ERR_SOCKET_CLOSED_BEFORE_CONNECTION, node's
+      // error for a write held behind the connect.
+      _socketClosedError() {
+        return this._everConnected
+          ? codes.ERR_SOCKET_CLOSED()
+          : codes.ERR_SOCKET_CLOSED_BEFORE_CONNECTION();
+      }
+
+      // node's errorBuffer for the callbacks of an end() made after
+      // destroy() (end() parks them, see there): each gets the stream's
+      // error, or ERR_STREAM_DESTROYED "Cannot call end after a stream was
+      // destroyed". `deferred` when the write that settled handed its own
+      // callback its error on the next tick, so these run after it.
+      _failEndCallbacks(deferred) {
+        const callbacks = this._endCallbacks;
+        this._endCallbacks = null;
+        const ws = this._writableState;
+        for (const callback of callbacks) {
+          const err = ws.errored ?? codes.ERR_STREAM_DESTROYED("end");
+          if (deferred) process.nextTick(callback, err);
+          else callback(err);
+        }
       }
 
       // Hands the native half of a write or of end()'s shutdown -- `run`,
@@ -24532,39 +24602,70 @@
         return this._writableState.length;
       }
 
+      // node's Writable getters: end() has been called on a stream it could
+      // end (state.ending -- still false after destroy(err); end(), which
+      // does not end an errored stream), and 'finish' has been emitted.
+      get writableEnded() {
+        return this._writableState.ending;
+      }
+      get writableFinished() {
+        return this._writableState.finished;
+      }
+
       end(data, encoding, cb) {
         if (typeof data === "function") { cb = data; data = undefined; encoding = undefined; }
         else if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
-        // Reentry guard (EOF auto-end + a user 'end' listener calling end()
-        // again would otherwise chain a SECOND 'finish' after 'close').
-        // node's Writable.end on a stream already ended: data is a write
-        // after end (ERR_STREAM_WRITE_AFTER_END to the callback, and the
-        // socket destroyed with it); otherwise the callback is told the
-        // stream has finished (ERR_STREAM_ALREADY_FINISHED) or was
-        // destroyed (ERR_STREAM_DESTROYED), and waits for 'finish' only
-        // while neither has happened yet.
-        if (this._writableState.ended) {
-          let err;
-          if (data !== undefined && data !== null) {
-            err = codes.ERR_STREAM_WRITE_AFTER_END();
+        const ws = this._writableState;
+        // node's Writable.end, in its order. A chunk goes through write
+        // first; refused -- after end(), or on a socket destroyed first --
+        // its error is the callback's ("Cannot call write after a stream
+        // was destroyed") and the stream does not end. Then only a stream
+        // neither ended nor errored ends. On one that is (the reentry
+        // guard: the EOF auto-end plus an 'end' listener's end() would
+        // otherwise chain a second 'finish' after 'close'), the callback
+        // is told the stream finished (ERR_STREAM_ALREADY_FINISHED) or was
+        // destroyed (ERR_STREAM_DESTROYED "Cannot call end after a stream
+        // was destroyed") -- never destroy()'s own error, which went to
+        // 'error' and to the callbacks of an end() made before it -- and
+        // waits for 'finish' only while neither has happened yet.
+        let err;
+        if (data !== undefined && data !== null) {
+          if (this.destroyed || !this.writable) {
+            err = this._refusedWriteError();
             this.destroy(err);
-          } else if (this._writableState.finished) {
-            err = codes.ERR_STREAM_ALREADY_FINISHED("end");
-          } else if (this.destroyed) {
-            err = codes.ERR_STREAM_DESTROYED("end");
+          } else {
+            this.write(data, encoding);
           }
+        }
+        if (err === undefined && (ws.ended || ws.errored)) {
+          if (ws.finished) err = codes.ERR_STREAM_ALREADY_FINISHED("end");
+          else if (this.destroyed) err = codes.ERR_STREAM_DESTROYED("end");
+        }
+        if (err !== undefined || ws.ended || ws.errored) {
           if (typeof cb === "function") {
             if (err !== undefined) process.nextTick(cb, err);
             else if (this._endCallbacks !== null) this._endCallbacks.push(cb);
-            else process.nextTick(cb, this._writableState.errored ?? codes.ERR_STREAM_DESTROYED("end"));
+            else process.nextTick(cb, ws.errored ?? codes.ERR_STREAM_DESTROYED("end"));
           }
           return this;
         }
-        if (data !== undefined && data !== null) this.write(data, encoding);
         this.writable = false;
         // state.writable stays untouched (side-existence marker; see destroy).
-        this._writableState.ending = true;
-        this._writableState.ended = true;
+        ws.ending = true;
+        ws.ended = true;
+        if (this.destroyed) {
+          // Destroyed without an error and never ended: node ends the
+          // stream and parks the callback on its 'finish' list. A destroyed
+          // stream drains that list only when a write still outstanding
+          // settles (errorBuffer, see write()): the callback then gets the
+          // stream's error -- ERR_SOCKET_CLOSED_BEFORE_CONNECTION for a
+          // write held behind the connect -- or ERR_STREAM_DESTROYED
+          // "Cannot call end after a stream was destroyed". With nothing
+          // outstanding it is never called (node v22.22.2). Nothing is
+          // issued: there is no connection to shut down.
+          if (typeof cb === "function") this._endCallbacks = [cb];
+          return this;
+        }
         // The FIN is asked for now, in the same turn as the writes before
         // it: the natives send it once the last of them is written, with
         // no trip back through JS in between (#156; node queues the
@@ -24586,14 +24687,7 @@
             // Never report success on a socket that died first: Node skips
             // 'finish' entirely and hands the end callbacks the error.
             if (callbacks.length > 0) {
-              const err = this._writableState.errored ?? Object.assign(
-                new Error(this._everConnected
-                  ? "Socket is closed"
-                  : "Socket closed before the connection was established"),
-                { code: this._everConnected
-                  ? "ERR_SOCKET_CLOSED"
-                  : "ERR_SOCKET_CLOSED_BEFORE_CONNECTION" },
-              );
+              const err = this._writableState.errored ?? this._socketClosedError();
               for (const callback of callbacks) callback(err);
             }
             return;
@@ -32032,14 +32126,10 @@
     const kTlsSocketLike = Symbol.for("oam.tlsSocketLike");
 
     function socketClosedBeforeConnectionError() {
-      var e = new Error("Socket closed before the connection was established");
-      e.code = "ERR_SOCKET_CLOSED_BEFORE_CONNECTION";
-      return e;
+      return codes.ERR_SOCKET_CLOSED_BEFORE_CONNECTION();
     }
     function socketClosedError() {
-      var e = new Error("Socket is closed");
-      e.code = "ERR_SOCKET_CLOSED";
-      return e;
+      return codes.ERR_SOCKET_CLOSED();
     }
     // A connect-syscall error in Node's shape (`connect EISCONN host:port -
     // Local (addr:port)`, code / errno / syscall / address / port), for the
