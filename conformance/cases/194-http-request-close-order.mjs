@@ -26,6 +26,12 @@ const server = http.createServer((req, res) => {
     res.write("part");
     return;
   }
+  if (req.url === "/two-parts") {
+    // The body's second part comes a moment after the first.
+    res.write("line1\n");
+    setTimeout(() => res.end("rest"), 5);
+    return;
+  }
   if (req.url === "/big") {
     res.end(Buffer.alloc(256 * 1024, 97));
     return;
@@ -106,6 +112,43 @@ for (const [name, options] of paths) {
   await run(`${name}, left open, read by an async iterator`, options(), async (req, res, events) => {
     for await (const chunk of res) void chunk;
     events.push("iterated");
+  });
+  // The whole body has arrived by the time the reader leaves, but its 'end'
+  // has not been delivered: the request still closes. A kept-alive one on
+  // oam's own transport, and any over an agent's socket, never did. (Over an
+  // agent socket that is not kept, node closes the request when the server
+  // closes the socket, before the reader has left: docs/node-divergences.md
+  // entry 38, so that path is not compared here.)
+  if (name !== "agent socket") {
+    await run(`${name}, left open, an async iterator that breaks`, { ...options(), path: "/two-parts" }, async (req, res, events) => {
+      for await (const chunk of res) {
+        void chunk;
+        await sleep(50);
+        break;
+      }
+      events.push("broke");
+    });
+    await run(`${name}, left open, response destroyed after its body arrived`, { ...options(), path: "/two-parts" }, (req, res, events) => {
+      res.once("data", () => {
+        res.pause();
+        setTimeout(() => {
+          events.push("res.destroy()");
+          res.destroy();
+        }, 200);
+      });
+    });
+  }
+  // A request already done with ignores a destroy(err): no 'error' (which
+  // with no listener would throw), as node's destroy() returns early.
+  await run(`${name}, destroy(err) after the response's end`, options(), (req, res, events) => {
+    res.resume();
+    res.on("end", () => {
+      setTimeout(() => {
+        events.push(`destroyed=${req.destroyed}, destroy(err)`);
+        req.removeAllListeners("error");
+        req.destroy(new Error("late"));
+      }, 20);
+    });
   });
 }
 // Nobody listens for the response: it is dumped, and the request closes.

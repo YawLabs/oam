@@ -128,6 +128,51 @@ await run("destroyed at once", {}, (req, events, cb) => {
   req.destroy();
 });
 
+// Hung up on mid-upload, with end() called and chunks still on their way to
+// the transport: nothing finishes after the failure. oam emitted 'finish',
+// called end()'s callback and the pending write() callbacks without an
+// error once those chunks settled, after the request's 'error' and 'close'.
+const midUpload = net.createServer((s) => {
+  s.once("data", () => {
+    s.pause();
+    setTimeout(() => s.destroy(), 400);
+  });
+  s.on("error", () => {});
+});
+await new Promise((r) => midUpload.listen(0, "127.0.0.1", r));
+for (const [name, agent] of [["default agent", undefined], ["agent: false", false]]) {
+  let failed = false;
+  const late = [];
+  const note = (what) => {
+    if (failed) late.push(what);
+  };
+  const req = http.request({ host: "127.0.0.1", port: midUpload.address().port, method: "POST", agent });
+  req.on("finish", () => note("finish"));
+  req.on("error", () => (failed = true));
+  await new Promise((resolve) => {
+    req.on("close", () => {
+      failed = true;
+      setTimeout(resolve, 500);
+    });
+    const chunk = Buffer.alloc(1024 * 1024, 97);
+    let i = 0;
+    const more = () => {
+      if (failed) return;
+      if (i++ < 16) {
+        req.write(chunk, (err) => {
+          if (!err) note("write callback");
+        });
+        setTimeout(more, 1);
+      } else {
+        req.end(() => note("end callback"));
+      }
+    };
+    more();
+  });
+  console.log(`hung up on mid-upload, ${name}: after the failure ${late.join(", ") || "nothing"}`);
+}
+midUpload.close();
+
 server.close();
 server.closeAllConnections();
 hangUp.close();
