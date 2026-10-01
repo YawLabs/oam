@@ -445,6 +445,23 @@ pub fn is_upgrade<'a>(headers: impl IntoIterator<Item = (&'a str, &'a [u8])>) ->
     upgrade && connection_upgrade
 }
 
+/// A header value from a JS string, one byte per code point (latin1), as
+/// node writes a header value -- `café` is the four bytes `caf` 0xE9, not
+/// its UTF-8. `None` for a code point above U+00FF, which has no such byte,
+/// or for a byte `HeaderValue` refuses (a control character other than
+/// HTAB). The one conversion for oam's client requests and node:http
+/// server responses (#174).
+pub fn latin1_header_value(text: &str) -> Option<http::HeaderValue> {
+    if text.is_ascii() {
+        return http::HeaderValue::from_bytes(text.as_bytes()).ok();
+    }
+    let bytes = text
+        .chars()
+        .map(|c| u8::try_from(u32::from(c)).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    http::HeaderValue::from_bytes(&bytes).ok()
+}
+
 /// A request head [`parse_request_head`] accepted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedHead {
@@ -918,5 +935,21 @@ mod tests {
         assert_eq!(with(1000).header_field_limit(1500), Some(1000));
         // `maxHeadersCount === 0` is no limit.
         assert_eq!(with(0).header_field_limit(5000), None);
+    }
+
+    #[test]
+    fn a_header_value_is_one_byte_per_code_point() {
+        let bytes = |text: &str| latin1_header_value(text).map(|v| v.as_bytes().to_vec());
+        assert_eq!(bytes("plain"), Some(b"plain".to_vec()));
+        assert_eq!(bytes("a\tb"), Some(b"a\tb".to_vec()));
+        assert_eq!(bytes("caf\u{e9}"), Some(b"caf\xe9".to_vec()));
+        assert_eq!(bytes("\u{ff}\u{80}"), Some(b"\xff\x80".to_vec()));
+        // Above U+00FF there is no byte, and never the UTF-8.
+        assert_eq!(bytes("\u{20ac}"), None);
+        assert_eq!(bytes("a\u{e9}\u{1f600}"), None);
+        // What HeaderValue refuses: control characters other than HTAB.
+        assert_eq!(bytes("a\nb"), None);
+        assert_eq!(bytes("a\u{7f}"), None);
+        assert_eq!(bytes("\u{e9}\r"), None);
     }
 }

@@ -344,7 +344,24 @@ pub enum ResponseBody {
 pub struct ResponseSpec {
     pub status: u16,
     pub headers: Vec<(String, String)>,
+    /// How each header value's code points become bytes.
+    pub header_bytes: HeaderBytes,
     pub body: ResponseBody,
+}
+
+/// How a response's header values go on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderBytes {
+    /// Each value's UTF-8: oam.serve's responses, the http2 compat
+    /// server's, and a node:http response whose head node would send joined
+    /// to a UTF-8 string body.
+    Utf8,
+    /// One byte per code point (latin1), as node writes a response head in
+    /// every other case (`ServerResponse#_headIsUtf8` in node_compat.js has
+    /// the rule). A code point above U+00FF has no byte: JS refuses such a
+    /// value as node does, and one that arrives anyway fails the response
+    /// as any other unsendable header does, never as its UTF-8.
+    Latin1,
 }
 
 struct ServerEntry {
@@ -679,6 +696,7 @@ impl HttpState {
         id: u64,
         status: u16,
         headers: Vec<(String, String)>,
+        header_bytes: HeaderBytes,
         body: Vec<u8>,
     ) -> bool {
         let Some(responder) = self
@@ -693,6 +711,7 @@ impl HttpState {
             .send(ResponseSpec {
                 status,
                 headers,
+                header_bytes,
                 body: ResponseBody::Full(body),
             })
             .is_ok()
@@ -704,6 +723,7 @@ impl HttpState {
         id: u64,
         status: u16,
         headers: Vec<(String, String)>,
+        header_bytes: HeaderBytes,
     ) -> Option<u64> {
         let responder = self
             .pending
@@ -725,6 +745,7 @@ impl HttpState {
             .send(ResponseSpec {
                 status,
                 headers,
+                header_bytes,
                 body: ResponseBody::Stream(rx, closed_tx),
             })
             .is_ok();
@@ -752,6 +773,7 @@ impl HttpState {
             .send(ResponseSpec {
                 status: 0,
                 headers: Vec::new(),
+                header_bytes: HeaderBytes::Utf8,
                 body: ResponseBody::Abort,
             })
             .is_ok()
@@ -840,7 +862,13 @@ type BoxedBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infal
 fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
     let mut builder = hyper::Response::builder().status(spec.status);
     for (name, value) in &spec.headers {
-        builder = builder.header(name, value);
+        builder = match spec.header_bytes {
+            HeaderBytes::Utf8 => builder.header(name, value),
+            HeaderBytes::Latin1 => match crate::http_head::latin1_header_value(value) {
+                Some(value) => builder.header(name, value),
+                None => return bad_response_spec(),
+            },
+        };
     }
     let body: BoxedBody = match spec.body {
         ResponseBody::Full(bytes) => http_body_util::Full::new(Bytes::from(bytes)).boxed(),
@@ -853,12 +881,15 @@ fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
         // building a response); never reaches the spec-to-response path.
         ResponseBody::Abort => http_body_util::Empty::new().boxed(),
     };
-    builder.body(body).unwrap_or_else(|_| {
-        hyper::Response::builder()
-            .status(500)
-            .body(http_body_util::Full::new(Bytes::from_static(b"oam: bad response spec")).boxed())
-            .expect("static 500 builds")
-    })
+    builder.body(body).unwrap_or_else(|_| bad_response_spec())
+}
+
+/// What a response that cannot be sent as given is answered with.
+fn bad_response_spec() -> hyper::Response<BoxedBody> {
+    hyper::Response::builder()
+        .status(500)
+        .body(http_body_util::Full::new(Bytes::from_static(b"oam: bad response spec")).boxed())
+        .expect("static 500 builds")
 }
 
 // ---- Upgrade and CONNECT requests ----
@@ -1638,6 +1669,7 @@ fn refuse_unanswered(state: &HttpState, id: u64, status: u16) {
         let _ = responder.send(ResponseSpec {
             status,
             headers: vec![("connection".to_string(), "close".to_string())],
+            header_bytes: HeaderBytes::Utf8,
             body: ResponseBody::Full(Vec::new()),
         });
     }

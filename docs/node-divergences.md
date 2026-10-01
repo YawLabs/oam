@@ -1840,6 +1840,54 @@ target). The parser underneath is hyper's, so some heads still get a different a
 _(probed)_ Node v22.22.2 (default and `--insecure-http-parser`) and oam, the same 90 raw
 request heads over TCP, 16 chunked bodies, 40 chunk extensions and 15 trailer sections.
 
+### 46. The HTTP server's response head: what still differs
+
+An `http` or `https` server response checks its headers as Node's `OutgoingMessage` does,
+with Node's errors and in Node's order: `setHeader`, `appendHeader`, `setHeaders(Headers |
+Map)`, `writeHead`'s headers (an object, a flat `[name, value, ...]` list or a list of
+pairs), `addTrailers`, `http.validateHeaderName` and `http.validateHeaderValue` refuse a name
+that is not a token (`ERR_INVALID_HTTP_TOKEN`), an `undefined` value
+(`ERR_HTTP_INVALID_HEADER_VALUE`) and a value holding a control character or a code point
+above U+00FF (`ERR_INVALID_CHAR`); `writeHead` and the implicit head refuse a status outside
+100-999 (`ERR_HTTP_INVALID_STATUS_CODE`) and such a status message; and once the head is out
+the header methods throw `ERR_HTTP_HEADERS_SENT`. A value up to U+00FF goes on the wire as
+Node writes it, which depends on what is sent first: joined to a string body in utf8 (or no
+encoding) the head is UTF-8 (`café` is `caf\xc3\xa9` from `res.end('text')` or
+`flushHeaders()`), and before anything else -- a chunk-size line, a Buffer, a string in
+another encoding, nothing -- it is one byte per code point (`caf\xe9`). Up to 0.17.1 oam
+stored any header -- `res.setHeader('y', '€')` did not throw -- and wrote every value as its
+UTF-8; a CR or LF reached hyper and was answered `500`. `appendHeader` wrote to the wrong
+store, and `setHeaders` and `addTrailers` did not exist.
+`conformance/cases/250-http-response-header-validation.mjs` and
+`251-http-response-header-bytes.mjs` hold this to node v22.22.2. What still differs:
+
+- **`writeHead()` does not send the head.** Node builds it there: `headersSent` turns true,
+  the header methods throw `ERR_HTTP_HEADERS_SENT` from then on, headers given to
+  `writeHead()` on a response no header method has touched never show in `getHeader()`, and
+  a body that follows is framed chunked. oam builds the head when the first body bytes or
+  `end()` go out, so until then `headersSent` is false, the header methods still work,
+  `getHeader()` sees those headers, and `end('text')` after `writeHead()` sends a
+  `content-length`. The bytes a header value goes out as follow Node's framing all the same.
+- **The status line carries the status code's standard reason phrase**, not
+  `res.statusMessage`: a message is checked as Node checks it and stays readable, but is not
+  sent.
+- **Response trailers are not sent.** `addTrailers()` checks its names and values as Node
+  does and keeps them, and a `Trailer` header does not switch the response to chunked
+  framing as it does in Node.
+- **A `content-disposition` value is not re-encoded.** When the response's length is known,
+  Node v22.22.2 converts the value with `Buffer.from(value, 'latin1')` and turns it back into
+  a string as UTF-8, so a non-ASCII value is corrupted: `café` goes out as `caf` plus the
+  UTF-8 of U+FFFD after `res.end('text')`, and as `caf\xfd` after `res.end(buffer)`, and
+  `writeHead()` refuses it (`ERR_INVALID_CHAR`) when a `content-length` comes before it. oam
+  writes it as any other header value (`caf\xc3\xa9`, `caf\xe9`).
+- **An HTTP/1.0 request's response.** Node does not chunk one, so a head joined to a UTF-8
+  string body after `writeHead()` is UTF-8 there; oam's `req.httpVersion` is always `'1.1'`,
+  so it writes such a head one byte per code point. Its status line says `HTTP/1.0`, where
+  Node's says `HTTP/1.1`.
+- **Header names go out lowercased**, as hyper writes them; Node keeps the case they were
+  set in, and writes the ones it adds as `Content-Length`, `Transfer-Encoding`, `Date`,
+  `Connection`.
+
 ### 41. The HTTP server's timeouts and connection count: what still differs
 
 `http` and `https` servers hold every connection to Node's timeouts, with Node's options,
