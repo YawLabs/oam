@@ -19,6 +19,8 @@ setTimeout(() => {
 }, 60000).unref();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// Ends the current /two-parts response (see below).
+let releaseRest = () => {};
 const server = http.createServer((req, res) => {
   if (req.url === "/close") res.setHeader("connection", "close");
   if (req.url === "/slow") {
@@ -27,9 +29,12 @@ const server = http.createServer((req, res) => {
     return;
   }
   if (req.url === "/two-parts") {
-    // The body's second part comes a moment after the first.
+    // The body's second part goes out once the reader has the first, which
+    // calls releaseRest(). On a timer of its own (it was 5 ms) the two parts
+    // could arrive as one chunk, or the second after the reader had left,
+    // and the order printed changed with load -- on node as on oam.
     res.write("line1\n");
-    setTimeout(() => res.end("rest"), 5);
+    releaseRest = () => res.end("rest");
     return;
   }
   if (req.url === "/big") {
@@ -123,7 +128,8 @@ for (const [name, options] of paths) {
     await run(`${name}, left open, an async iterator that breaks`, { ...options(), path: "/two-parts" }, async (req, res, events) => {
       for await (const chunk of res) {
         void chunk;
-        await sleep(50);
+        releaseRest();
+        await sleep(200);
         break;
       }
       events.push("broke");
@@ -131,10 +137,11 @@ for (const [name, options] of paths) {
     await run(`${name}, left open, response destroyed after its body arrived`, { ...options(), path: "/two-parts" }, (req, res, events) => {
       res.once("data", () => {
         res.pause();
+        releaseRest();
         setTimeout(() => {
           events.push("res.destroy()");
           res.destroy();
-        }, 200);
+        }, 500);
       });
     });
   }
