@@ -1565,8 +1565,15 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   5000 ms after `agent.destroy()`; with Node's client, within 500 ms. A pooled request's
   socket also emits no `'close'` when the server ends the connection (a server that answered
   `Connection: close` and closed it: no `'close'` 1.5 s later).
-- **`statusText` is the canonical reason phrase**, not the server's: `200 Custom Reason` reads
-  `OK` in oam, and `299 Whatever` reads `''`. Node reports the reason on the wire.
+- **A reason phrase with a byte above 0x7F reads empty.** `statusText` and `statusMessage`
+  are the phrase the server sent, as in Node -- `200 Custom Reason` reads `Custom Reason`,
+  `299 Whatever` reads `Whatever`, a status line with no phrase reads `''`
+  (`conformance/cases/195-status-reason-phrase.mjs`; up to 0.17.1 oam's own transport
+  reported the status code's canonical phrase). What differs: the parser under hyper
+  drops a phrase carrying obs-text, so `200 caf\xe9` reads `''` on both client paths,
+  where Node's `statusMessage` is `café` and its `statusText` `caf�`. Over HTTP/2,
+  which has no reason phrase (and which Node's fetch never negotiates), `statusText` is
+  the status code's canonical phrase.
 - **A response nobody has read holds the request's `'close'`.** The request's `'close'`
   follows the response's `'end'` and `'close'` on a connection that is not kept, and comes
   between them on a kept-alive one, as in Node, on both client paths

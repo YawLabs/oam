@@ -585,11 +585,7 @@ pub async fn response(
         return refusal;
     }
     let status = response.status();
-    let reason = response
-        .extensions()
-        .get::<hyper::ext::ReasonPhrase>()
-        .map(|reason| latin1(reason.as_bytes()))
-        .unwrap_or_else(|| status.canonical_reason().unwrap_or_default().to_string());
+    let reason = super::send::reason_phrase(&response);
     let version = match response.version() {
         http::Version::HTTP_10 => "1.0",
         _ => "1.1",

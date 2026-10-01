@@ -735,6 +735,24 @@ fn latin1(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| char::from(b)).collect()
 }
 
+/// The reason phrase of `response`'s status line, as node reports it in
+/// `statusText` / `statusMessage`: the one the server sent, an empty one
+/// included (#160). hyper keeps a phrase that is not the status code's
+/// canonical one as an extension, so without the extension the canonical
+/// phrase IS what was on the wire. HTTP/2 has no reason phrase, and node has
+/// no answer to copy (its fetch never negotiates h2): the canonical phrase
+/// stands in there.
+pub(super) fn reason_phrase<B>(response: &http::Response<B>) -> String {
+    match response.extensions().get::<hyper::ext::ReasonPhrase>() {
+        Some(reason) => latin1(reason.as_bytes()),
+        None => response
+            .status()
+            .canonical_reason()
+            .unwrap_or_default()
+            .to_string(),
+    }
+}
+
 /// The payload for the final response; its body goes into `bodies`.
 fn respond(
     mut state: LoopState,
@@ -743,6 +761,7 @@ fn respond(
     ids: &AtomicU64,
 ) -> OpOutcome {
     let status = response.status();
+    let reason = reason_phrase(&response);
     let conn = response.extensions().get::<ConnInfo>().cloned();
     let codings = if state.decode {
         let encodings: Vec<&[u8]> = response
@@ -783,7 +802,7 @@ fn respond(
     lock(bodies).insert(handle, body);
     let mut payload = serde_json::json!({
         "status": status.as_u16(),
-        "statusText": status.canonical_reason().unwrap_or_default(),
+        "statusText": reason,
         "url": url.as_str(),
         "redirected": state.hops > 0,
         "headers": headers,

@@ -296,6 +296,39 @@ fn chunk(data: &[u8]) -> Vec<u8> {
 
 // ---------------------------------------------------------------- payload
 
+/// `statusText` is the reason phrase the server sent (#160): a custom one,
+/// one for a status code that has no canonical phrase, an empty one and a
+/// missing one -- node's `statusText` / `statusMessage` for each, measured on
+/// v22.22.2. It used to be the status code's canonical phrase whatever the
+/// wire said.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_text_is_the_reason_phrase_on_the_wire() {
+    within(async {
+        for (line, status, expected) in [
+            ("200 Custom Reason", 200, "Custom Reason"),
+            ("200 OK", 200, "OK"),
+            ("299 Whatever", 299, "Whatever"),
+            ("404 Nope Not Here", 404, "Nope Not Here"),
+            ("404 not found", 404, "not found"),
+            ("200 ", 200, ""),
+            ("200", 200, ""),
+        ] {
+            let server = serve_replies(move |_| {
+                format!("HTTP/1.1 {line}\r\ncontent-length: 2\r\nconnection: close\r\n\r\nhi")
+                    .into_bytes()
+            })
+            .await;
+            let reg = Reg::new();
+            let url = format!("http://127.0.0.1:{}/", server.port);
+            let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+            assert_eq!(p["status"], status, "{line:?}");
+            assert_eq!(p["statusText"], expected, "{line:?}");
+            assert_eq!(reg.text(handle_of(&p)).await, "hi");
+        }
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn payload_shape() {
     within(async {
@@ -308,7 +341,8 @@ async fn payload_shape() {
         let url = format!("http://u:p@127.0.0.1:{}/x?y#frag", server.port);
         let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
         assert_eq!(p["status"], 200);
-        assert_eq!(p["statusText"], "OK");
+        // The phrase on the wire, not the status code's canonical one (#160).
+        assert_eq!(p["statusText"], "Custom Reason");
         assert_eq!(
             p["url"],
             format!("http://127.0.0.1:{}/x?y", server.port).as_str()
