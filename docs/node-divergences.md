@@ -2101,7 +2101,11 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   `net.connect({ path })`, `net.connect(path)`, `tls.connect({ path })` and an http(s)
   request's `socketPath` fail with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` where Node connects
   to the pipe; a non-string `path` throws Node's `ERR_INVALID_ARG_TYPE`. Up to 0.16.2 they
-  connected to `host:port` instead (http.request sent the whole request there).
+  connected to `host:port` instead (http.request sent the whole request there). There is
+  no pipe server either: `server.listen(path)` and `listen({ path })` -- on a `net`, `tls`,
+  `http`, `https` or `http2` server -- emit `'error'` with the same code where Node listens
+  on the pipe. Up to 0.17.1 the name was read as port 0 and the server bound a TCP port
+  nobody had asked for.
 - **`--permission`.** The request is a `net.connect` / `tls.connect`, and its grant is
   checked as theirs is: `host:port`, and each address a `lookup` hook answers as `addr:port`
   (entry 4).

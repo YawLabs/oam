@@ -767,9 +767,21 @@
     return 'Expected ' + input + ' to be returned from the "' + name + '" function but got ' +
       determineSpecificType(value) + ".";
   });
+  // node internal/errors.js, shape for shape: one name is `The "a" argument`,
+  // two `The "a" and "b" arguments`, more `"a", "b", and "c" arguments`, and
+  // an ARRAY in any position is a choice (`"options" or "port" or "path"`,
+  // what net.connect() raises without a port or a path).
   codes.ERR_MISSING_ARGS = E("ERR_MISSING_ARGS", TypeError, function() {
-    var args = Array.prototype.slice.call(arguments);
-    return 'The ' + args.map(function(a) { return '"' + a + '"'; }).join(", ") + ' argument' + (args.length > 1 ? 's' : '') + ' must be specified';
+    var wrap = function(a) { return '"' + a + '"'; };
+    var args = Array.prototype.slice.call(arguments).map(function(a) {
+      return Array.isArray(a) ? a.map(wrap).join(" or ") : wrap(a);
+    });
+    var len = args.length;
+    var msg = "The ";
+    if (len === 1) msg += args[0] + " argument";
+    else if (len === 2) msg += args[0] + " and " + args[1] + " arguments";
+    else msg += args.slice(0, len - 1).join(", ") + ", and " + args[len - 1] + " arguments";
+    return msg + " must be specified";
   });
   codes.ERR_UNKNOWN_ENCODING = E("ERR_UNKNOWN_ENCODING", TypeError, function(enc) {
     return 'Unknown encoding: ' + enc;
@@ -861,19 +873,105 @@
   codes.ERR_CHILD_CLOSED_BEFORE_REPLY = E("ERR_CHILD_CLOSED_BEFORE_REPLY", RangeError, function() {
     return 'Child closed before reply';
   });
-  // node internal/errors.js: `${name} should be ${allowZero ? '>= 0' : '> 1'}
+  // node internal/errors.js: `${name} should be ${allowZero ? '>=' : '>'} 0
   // and < 65536. Received ${determineSpecificType(port)}.` -- the name is bare
   // (not quoted, no " option" suffix) and the value goes through
   // determineSpecificType, so a string shows its quotes. Measured on node
   // v22.22.2: `Port should be >= 0 and < 65536. Received type string ('abc').`
-  // oam carried an older node's wording; nothing raised it before
+  // and, from dgram's send(), `Port should be > 0 and < 65536. Received type
+  // number (0).` oam carried an older node's wording; nothing raised it before
   // ClientRequest's port check, so no call site moves with it.
   codes.ERR_SOCKET_BAD_PORT = E("ERR_SOCKET_BAD_PORT", RangeError, function(name, port, allowZero) {
     var operator = allowZero === false ? '>' : '>=';
-    var floor = allowZero === false ? '1' : '0';
-    return name + ' should be ' + operator + ' ' + floor + ' and < 65536. Received ' +
+    return name + ' should be ' + operator + ' 0 and < 65536. Received ' +
       determineSpecificType(port) + '.';
   });
+  // node internal/validators.js validatePort: a number, or a string that is
+  // not blank, whose numeric value is an integer from 0 (1 when `allowZero`
+  // is false) to 65535 -- so '80' and '0x50' are ports and 1.5, -1, 65536,
+  // 'abc' and '' are not. Answers the port as a number (node's `port | 0`).
+  // net.connect, tls.connect, every server's listen() and dgram's send()
+  // share it (#163): before it, a bad port reached the op and was dialled or
+  // bound as a different, valid one (65536 as 65535, 1.5 as 1).
+  function validatePort(port, name, allowZero) {
+    if (
+      (typeof port !== "number" && typeof port !== "string") ||
+      (typeof port === "string" && port.trim().length === 0) ||
+      +port !== (+port >>> 0) ||
+      port > 0xffff ||
+      (port === 0 && allowZero === false)
+    ) {
+      throw codes.ERR_SOCKET_BAD_PORT(name === undefined ? "Port" : name, port, allowZero);
+    }
+    return port | 0;
+  }
+  // What a server's listen(...args) was asked for, read as node's
+  // Server.prototype.listen reads it (lib/net.js v22.22.2: normalizeArgs,
+  // then the port rules), for every server oam has -- net, tls, http, https
+  // and http2 each bind through their own native, so they share the reading
+  // here instead of a base class:
+  //  - (options[, cb]), (path[, backlog][, cb]) for a string that is not a
+  //    number, else ([port][, host][, backlog][, cb]); the callback is the
+  //    LAST argument when that is a function;
+  //  - no arguments, a callback first, or a port that is null or an
+  //    explicit undefined: port 0, any free one;
+  //  - a number or a string is validated as a port (ERR_SOCKET_BAD_PORT
+  //    naming `options.port`), and '80' is the port 80;
+  //  - a path names a pipe; anything else throws node's
+  //    ERR_INVALID_ARG_VALUE for `options`, synchronously.
+  // Answers { port, host, cb } or { path, cb }; `host` undefined when none
+  // was given.
+  function normalizeListenArgs(args) {
+    var options = {};
+    var arg0 = args[0];
+    if (args.length > 0) {
+      if (typeof arg0 === "object" && arg0 !== null) {
+        options = arg0;
+      } else if (typeof arg0 === "string" && !(Number(arg0) >= 0)) {
+        options.path = arg0;
+      } else {
+        options.port = arg0;
+        if (args.length > 1 && typeof args[1] === "string") options.host = args[1];
+      }
+    }
+    var last = args[args.length - 1];
+    var cb = typeof last === "function" ? last : null;
+    if (
+      args.length === 0 || typeof arg0 === "function" ||
+      (options.port === undefined && "port" in options) || options.port === null
+    ) {
+      options.port = 0;
+    }
+    if (typeof options.port === "number" || typeof options.port === "string") {
+      return {
+        port: validatePort(options.port, "options.port"),
+        host: options.host || undefined,
+        cb: cb,
+      };
+    }
+    if (options.path && typeof options.path === "string" && !(Number(options.path) >= 0)) {
+      return { path: options.path, cb: cb };
+    }
+    if (!("port" in options || "path" in options)) {
+      throw codes.ERR_INVALID_ARG_VALUE("options", options, 'must have the property "port" or "path"');
+    }
+    throw codes.ERR_INVALID_ARG_VALUE("options", options);
+  }
+  // listen(path): node listens on that Unix domain socket or Windows named
+  // pipe. oam has no pipe server, so the listen fails -- on the next tick,
+  // as a bind that fails does -- instead of binding a TCP port nobody asked
+  // for (up to 0.17.1 the name was read as port 0). True when it refused.
+  function refusePipeListen(server, listen) {
+    if (listen.path === undefined) return false;
+    if (listen.cb !== null) server.once("listening", listen.cb);
+    var err = new Error(
+      "The feature listening on a Unix domain socket or named pipe (a `path`) " +
+      "is unavailable on the current platform, which is being used to run oam",
+    );
+    err.code = "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM";
+    process.nextTick(function() { server.emit("error", err); });
+    return true;
+  }
   // ---- Error family ----
   // Node declares this one with three bases (Error, TypeError, RangeError) and
   // reaches the TypeError/RangeError variants through `.TypeError`/`.RangeError`
@@ -18813,23 +18911,13 @@
         this._host = null;
         this.listening = false;
       }
-      listen(port, host, callback) {
-        if (typeof port === "function") {
-          // listen(cb) -- ephemeral port, Node accepts callback-first.
-          callback = port;
-          port = undefined;
-        }
-        if (typeof port === "object" && port !== null) {
-          // listen({ port, host }, cb)
-          callback = host;
-          host = port.host;
-          port = port.port;
-        }
-        if (typeof host === "function") {
-          callback = host;
-          host = undefined;
-        }
-        if (typeof callback === "function") this.once("listening", callback);
+      listen(...args) {
+        // node's reading of the arguments (net.Server's listen is the one
+        // http.Server has); a port that is not one throws from here (#163).
+        const listen = normalizeListenArgs(args);
+        if (refusePipeListen(this, listen)) return this;
+        const { port, host, cb: callback } = listen;
+        if (callback !== null) this.once("listening", callback);
         const hostname = host ?? "127.0.0.1";
         // Stream request bodies: the handler is dispatched on headers and
         // req delivers chunks as they arrive, instead of waiting for the
@@ -18837,7 +18925,7 @@
         const policy = serverHeadPolicy(this);
         natives.httpServe(
           hostname,
-          port ?? 0,
+          port,
           true,
           policy.maxHeaderSize,
           policy.insecure,
@@ -22511,7 +22599,8 @@
     }
     registry._netRefusePipeConnect = refusePipeConnect;
 
-    // `host` is the caller's (net: options.host || 'localhost').
+    // `host` is the caller's (net: options.host || 'localhost'), `port` the
+    // caller's too, validated here; the caller dials `port | 0`.
     // `dial(spec, local)` starts the native connect: spec null for an IP
     // literal, `{ ips }` for a hook's answer, `{ ticket }` for oam's
     // resolver's; `local` the localAddress / localPort the socket is bound
@@ -22533,6 +22622,18 @@
       if (localPort && typeof localPort !== "number") {
         throw codes.ERR_INVALID_ARG_TYPE("options.localPort", "number", localPort);
       }
+      // node validates the port here, after the local end and before the
+      // name is looked up: a value that is neither a number nor a string is
+      // ERR_INVALID_ARG_TYPE, one that is not a port ERR_SOCKET_BAD_PORT,
+      // both thrown from connect() (#163). The op is then handed the number
+      // ('80' and '0x50' are the port 80), never the spelling.
+      if (typeof port !== "undefined") {
+        if (typeof port !== "number" && typeof port !== "string") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.port", ["number", "string"], port);
+        }
+        validatePort(port);
+      }
+      port |= 0;
       const local = localAddress || localPort
         ? JSON.stringify({ address: localAddress || undefined, port: localPort || undefined })
         : undefined;
@@ -22744,7 +22845,11 @@
           options = { port: args[0], host: typeof args[1] === "string" ? args[1] : undefined };
           cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : undefined;
         }
-        const port = options.port;
+        // node: with neither a port nor a path there is nothing to connect
+        // to, and connect() says so before it touches the socket.
+        if (options.port === undefined && options.path == null) {
+          throw codes.ERR_MISSING_ARGS(["options", "port", "path"]);
+        }
         // node: `options.host || 'localhost'`, and the name is looked up like
         // any other (a `lookup` option sees 'localhost').
         const host = options.host || "localhost";
@@ -22769,6 +22874,8 @@
         this._connectGate = openGate;
         this._chain = this._chain.then(() => gate);
         const dial = (spec, local) => {
+          // lookupAndConnect has validated the port by the time it dials.
+          const port = options.port | 0;
           let connecting;
           try {
             connecting = natives.tcpConnect(
@@ -22789,7 +22896,7 @@
           this._startConnect(connecting, host, port).then(openGate);
         };
         if (refusePipeConnect(this, options)) return this;
-        lookupAndConnect(this, options, host, port, dial);
+        lookupAndConnect(this, options, host, options.port, dial);
         return this;
       }
 
@@ -23425,20 +23532,12 @@
       }
 
       listen(...args) {
-        let port, host, cb;
-        if (typeof args[0] === "object" && args[0] !== null) {
-          const opts = args[0];
-          port = opts.port;
-          host = opts.host;
-          cb = typeof args[1] === "function" ? args[1] : undefined;
-        } else {
-          port = args[0];
-          let idx = 1;
-          if (typeof args[idx] === "string") { host = args[idx]; idx++; }
-          if (typeof args[idx] === "number") { idx++; }
-          if (typeof args[idx] === "function") { cb = args[idx]; }
-        }
-        if (typeof cb === "function") this.once("listening", cb);
+        // node's reading of the arguments; a port that is not one throws
+        // from here (#163).
+        const listen = normalizeListenArgs(args);
+        if (refusePipeListen(this, listen)) return this;
+        const { port, host, cb } = listen;
+        if (cb !== null) this.once("listening", cb);
         // Node binds (and so creates the TCPServerWrap) synchronously inside
         // listen(); createServer() alone registers nothing. Probed: after
         // createServer() _getActiveHandles() is [], on the line after
@@ -23448,7 +23547,7 @@
         // its tail cannot unregister this fresh registration.
         this._listenGeneration = (this._listenGeneration || 0) + 1;
         const hostname = host || "0.0.0.0";
-        natives.tcpListen(hostname, port || 0).then(
+        natives.tcpListen(hostname, port).then(
           (bound) => {
             this._serverId = bound.serverId;
             this._port = bound.port;
@@ -25235,23 +25334,19 @@
         super.setSecureContext(options);
         syncTls(this);
       }
-      listen(port, host, callback) {
-        if (typeof port === "object" && port !== null) {
-          callback = host;
-          host = port.host;
-          port = port.port;
-        }
-        if (typeof host === "function") {
-          callback = host;
-          host = undefined;
-        }
-        if (typeof callback === "function") this.once("listening", callback);
+      listen(...args) {
+        // node's reading of the arguments; a port that is not one throws
+        // from here (#163).
+        var listen = normalizeListenArgs(args);
+        if (refusePipeListen(this, listen)) return this;
+        var port = listen.port, host = listen.host, callback = listen.cb;
+        if (callback !== null) this.once("listening", callback);
         var hostname = host || "127.0.0.1";
         var policy = registry._httpParserOptions.policy(this);
         var accept = tlsAcceptArgs(this);
         natives.httpsServe(
           hostname,
-          port || 0,
+          port,
           ...accept,
           policy.maxHeaderSize,
           policy.insecure,
@@ -27299,6 +27394,11 @@
           data = globalThis.Buffer.from(String(msg));
         }
 
+        // node validates the destination port once the message is read,
+        // synchronously, and 0 is not a port a datagram can be sent to
+        // (#163: 65536 was sent to 65535 and 1.5 to 1).
+        port = validatePort(port, "Port", false);
+
         if (offset !== undefined && offset !== 0 || length !== undefined) {
           data = data.slice(offset || 0, length !== undefined ? (offset || 0) + length : undefined);
         }
@@ -28125,20 +28225,16 @@
         this._host = null;
         this.listening = false;
       }
-      listen(port, host, callback) {
-        if (typeof port === "object" && port !== null) {
-          callback = host;
-          host = port.host;
-          port = port.port;
-        }
-        if (typeof host === "function") {
-          callback = host;
-          host = undefined;
-        }
-        if (typeof callback === "function") this.once("listening", callback);
+      listen(...args) {
+        // node's reading of the arguments; a port that is not one throws
+        // from here (#163).
+        var listen = normalizeListenArgs(args);
+        if (refusePipeListen(this, listen)) return this;
+        var port = listen.port, host = listen.host, callback = listen.cb;
+        if (callback !== null) this.once("listening", callback);
         var hostname = host || "127.0.0.1";
         var self = this;
-        natives.http2Serve(hostname, port || 0).then(
+        natives.http2Serve(hostname, port).then(
           function(bound) {
             self._serverId = bound.serverId;
             self._port = bound.port;
@@ -31236,7 +31332,10 @@
     // remoteAddress is the resolved IP, never the host name.
     function _connectTls(socket, options, callback, event) {
       var host = options.host || options.hostname || "localhost";
-      var port = options.port || 443;
+      // As given until lookupAndConnect has validated it; `dial` takes the
+      // number. node's tls.connect has no default port (https's 443 is the
+      // agent's): without one it throws ERR_MISSING_ARGS, below.
+      var port = options.port;
       var serverName = options.servername || host;
       var rejectUnauthorized = options.rejectUnauthorized !== false;
       // node's tls.connect, in its order, synchronously: the identity check
@@ -31271,6 +31370,11 @@
         socket._undestroy();
         socket._reading = false;
       }
+      // node: the TLS socket's connect() is net's, which needs a port or a
+      // path -- after the context is built, as tls.connect builds it first.
+      if (port === undefined && options.path == null) {
+        throw codes.ERR_MISSING_ARGS(["options", "port", "path"]);
+      }
       if (callback) socket.once(event, callback);
       socket._secureContext = context;
       var releaseContext = releaseSecureContext(socket, context, options);
@@ -31295,7 +31399,7 @@
         var connecting;
         try {
           connecting = natives.tlsConnect(
-            host, port, serverName, ca, rejectUnauthorized,
+            host, port | 0, serverName, ca, rejectUnauthorized,
             secure.id === null ? undefined : secure.id, identityCheck === null,
             tlsVersions.min, tlsVersions.max, attemptTimeout,
             spec === null ? undefined : JSON.stringify(spec),
@@ -32178,24 +32282,20 @@
         }
         if (old !== null) natives.tlsServerContextFree(old);
       }
-      listen(port, host, callback) {
-        if (typeof port === "object" && port !== null) {
-          callback = host;
-          host = port.host;
-          port = port.port;
-        }
-        if (typeof host === "function") {
-          callback = host;
-          host = undefined;
-        }
-        if (typeof callback === "function") this.once("listening", callback);
+      listen(...args) {
+        // node's reading of the arguments; a port that is not one throws
+        // from here (#163).
+        var listen = normalizeListenArgs(args);
+        if (refusePipeListen(this, listen)) return this;
+        var port = listen.port, host = listen.host, callback = listen.cb;
+        if (callback !== null) this.once("listening", callback);
         var hostname = host || "0.0.0.0";
         this._closed = false;
 
         // Registered synchronously inside listen(), as net.Server is: Node
         // lists a listening tls.Server as a TCPServerWrap.
         registry._activeHandles.set(this, "TCPServerWrap");
-        natives.tcpListen(hostname, port || 0).then(
+        natives.tcpListen(hostname, port).then(
           (bound) => {
             this._serverId = bound.serverId;
             this._port = bound.port;

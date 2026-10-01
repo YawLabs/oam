@@ -520,6 +520,70 @@ pub(crate) fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) 
     scope.throw_exception(exception);
 }
 
+/// A port, as argument `index` of a socket op: an integer from 0 to 65535,
+/// or nothing at all (undefined), which is 0 -- "any port" for a bind. JS
+/// validates the port as node does before it gets here (`validatePort` in
+/// node_compat.js); this is the backstop under it, so that no caller can
+/// reach a DIFFERENT port than the one it named. An `as u16` cast did just
+/// that (#163): it saturated 65536 and 70000 to 65535, truncated 1.5 to 1 and
+/// turned `'abc'` into 0, and the net grant was then asked about the wrong
+/// port too. Throws a RangeError and returns `None` for anything else.
+fn port_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+    op: &str,
+) -> Option<u16> {
+    let value = args.get(index);
+    if value.is_undefined() {
+        return Some(0);
+    }
+    match value.number_value(scope).and_then(port_from_number) {
+        Some(port) => Some(port),
+        None => {
+            let message = format!("{op}: the port must be an integer from 0 to 65535");
+            let message = v8::String::new(scope, &message).unwrap();
+            let exception = v8::Exception::range_error(scope, message);
+            scope.throw_exception(exception);
+            None
+        }
+    }
+}
+
+/// The port a JS number names, when it names one: no fraction, no NaN, no
+/// infinity, nothing below 0 or above 65535.
+fn port_from_number(n: f64) -> Option<u16> {
+    (n.fract() == 0.0 && (0.0..=65535.0).contains(&n)).then_some(n as u16)
+}
+
+#[cfg(test)]
+mod port_arg_tests {
+    use super::port_from_number;
+
+    /// #163: every value the old `as u16` cast turned into some OTHER port
+    /// is refused, and every port is itself.
+    #[test]
+    fn only_a_port_is_a_port() {
+        for (n, port) in [(0.0, 0), (-0.0, 0), (1.0, 1), (80.0, 80), (65535.0, 65535)] {
+            assert_eq!(port_from_number(n), Some(port), "{n}");
+        }
+        for n in [
+            -1.0,
+            65536.0,
+            70000.0,
+            1.5,
+            0.5,
+            65535.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            4294967376.0, // 2^32 + 80: wraps to 80 under a u32 cast
+        ] {
+            assert_eq!(port_from_number(n), None, "{n}");
+        }
+    }
+}
+
 /// Safely create a V8 string from a dynamic (possibly very large) Rust
 /// string. V8 rejects strings longer than ~1 GB; the fallback avoids a
 /// panic on the FFI boundary.
@@ -3171,7 +3235,9 @@ fn op_http_serve(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 1, "httpServe") else {
+        return;
+    };
     // Net gate: "host:port" is the resource being bound.
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
@@ -3489,7 +3555,9 @@ fn op_http2_serve(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 1, "http2Serve") else {
+        return;
+    };
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
@@ -3558,7 +3626,9 @@ fn op_https_serve(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 1, "httpsServe") else {
+        return;
+    };
     let context_id = args.get(2).number_value(scope).unwrap_or(0.0) as u64;
     // args 3..=6: handshakeTimeout, requestCert, rejectUnauthorized, ALPN.
     let Some(options) = accept_option_args(scope, &args, 3, "httpsServe") else {
@@ -3640,7 +3710,9 @@ fn op_tcp_connect(
         throw_type_error(scope, "tcpConnect requires a host");
         return;
     };
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 1, "tcpConnect") else {
+        return;
+    };
     // net.getDefaultAutoSelectFamilyAttemptTimeout() as JS read it for this
     // connect; JS owns the value, so nothing is cached per runtime.
     let attempt_timeout = attempt_timeout_arg(scope, &args, 2);
@@ -3707,7 +3779,9 @@ fn op_net_resolve(
     // The connect's port: the name is resolved only for a connect the net
     // grant covers (`host:port`, as tcpConnect / tlsConnect ask), so the
     // resolver is never a way to look up a name the grant refuses.
-    let port = args.get(3).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 3, "netResolve") else {
+        return;
+    };
     if !check_net_perm(scope, &format!("{host}:{port}")) {
         return;
     }
@@ -3992,7 +4066,9 @@ fn op_net_check(
         throw_type_error(scope, "netCheck requires a host");
         return;
     };
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 1, "netCheck") else {
+        return;
+    };
     let _ = check_net_perm(scope, &format!("{host}:{port}"));
 }
 
@@ -4275,7 +4351,9 @@ fn op_tcp_listen(
         throw_type_error(scope, "tcpListen requires a host");
         return;
     };
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 1, "tcpListen") else {
+        return;
+    };
     let net_resource = format!("{host}:{port}");
     if !check_net_perm(scope, &net_resource) {
         return;
@@ -4374,7 +4452,9 @@ fn op_udp_send(
         throw_type_error(scope, "udpSend requires a target host");
         return;
     };
-    let port = args.get(3).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 3, "udpSend") else {
+        return;
+    };
     // The DESTINATION is a net subject, by the same rule as `tcpConnect`.
     // Only the bind was checked, and it names the LOCAL address, so any bind
     // grant was a grant to send datagrams anywhere: with a loopback grant to
@@ -4424,7 +4504,9 @@ fn op_tls_connect(
         throw_type_error(scope, "tlsConnect requires a host");
         return;
     };
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 1, "tlsConnect") else {
+        return;
+    };
     let server_name = arg_string(scope, &args, 2).filter(|s| !s.is_empty());
     let ca_pem = arg_string(scope, &args, 3).filter(|s| !s.is_empty());
     let reject_unauthorized = args.get(4).boolean_value(scope);
