@@ -5595,6 +5595,8 @@ async function attempt(label, fn, lateMs) {
   const t0 = Date.now();
   closed = 0;
   finalized = false;
+  // A request that never settles is a failure of its own, not a hung test.
+  const hung = setTimeout(() => { console.log(label, 'never settled'); process.exit(0); }, 5000);
   try {
     const r = await fn();
     console.log(label, 'ok', r.statusCode, await r.body.text());
@@ -5603,6 +5605,7 @@ async function attempt(label, fn, lateMs) {
     await sleep(300);
     console.log(label, 'failed', e.name, e.code, JSON.stringify(e.message), 'late=' + late, 'closed=' + (closed > 0));
   }
+  clearTimeout(hung);
   await sleep(300);
   console.log(label, 'finalized=' + finalized);
 }
@@ -5619,6 +5622,11 @@ await attempt('abort-mid-body', () => { const ac = new AbortController(); setTim
 await attempt('early-answer', () => request(early, { method: 'POST', body: endless() }));
 // A body error after the request is out.
 await attempt('error-mid-body', () => request(silent, { method: 'POST', body: (async function* () { yield 'x'; await sleep(200); throw new Error('mid'); })(), headersTimeout: 5000 }), 0);
+// A body of known length (an ended stream, or the caller's content-length):
+// the timer still starts at the body's end, which is not its last byte.
+await attempt('known-silent', () => { const p = new PassThrough(); p.end('abc'); return request(silent, { method: 'POST', body: p, headersTimeout: 400 }); }, 350);
+await attempt('cl-silent', () => request(silent, { method: 'PUT', body: slowBody(300), headers: { 'content-length': '2' }, headersTimeout: 400 }), 650);
+await attempt('cl-late-end-silent', () => { const p = new PassThrough(); p.write('ab'); setTimeout(() => p.end(), 600); return request(silent, { method: 'PUT', body: p, headers: { 'content-length': '2' }, headersTimeout: 400 }); }, 950);
 process.exit(0);
 "##,
     );
@@ -5639,7 +5647,13 @@ abort-mid-body finalized=true
 early-answer ok 200 early
 early-answer finalized=true
 error-mid-body failed Error undefined "mid" late=true closed=true
-error-mid-body finalized=false"##;
+error-mid-body finalized=false
+known-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT "Headers Timeout Error" late=true closed=true
+known-silent finalized=false
+cl-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT "Headers Timeout Error" late=true closed=true
+cl-silent finalized=true
+cl-late-end-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT "Headers Timeout Error" late=true closed=true
+cl-late-end-silent finalized=false"##;
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
         expected,

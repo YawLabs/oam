@@ -271,7 +271,13 @@ impl BodySource {
     /// `timed`: the send's signal when a headers timeout runs on it, which
     /// hears whether this body is still being written -- a streamed one
     /// until its last chunk goes ([`Dispatched::body_open`]).
-    fn build(&mut self, timed: Option<&Dispatched>) -> Result<ReqBody, String> {
+    ///
+    /// `declared`: the request's `content-length`, if it has one.
+    fn build(
+        &mut self,
+        timed: Option<&Dispatched>,
+        declared: Option<u64>,
+    ) -> Result<ReqBody, String> {
         if let Some(dispatched) = timed {
             dispatched.body_open(matches!(self, BodySource::Stream(_)));
         }
@@ -281,7 +287,7 @@ impl BodySource {
             BodySource::Stream(slot) => match (slot.take(), timed) {
                 (Some(receiver), Some(dispatched)) => {
                     let dispatched = dispatched.clone();
-                    Ok(channel_body_then(receiver, move || {
+                    Ok(channel_body_then(receiver, declared, move || {
                         dispatched.body_open(false)
                     }))
                 }
@@ -589,7 +595,10 @@ async fn run(
         let mut stale_resent = false;
         let response = loop {
             let timed = state.headers_timeout.and(state.dispatched.as_ref());
-            let body = match state.source.build(timed) {
+            let declared = hop_headers
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()?.trim().parse::<u64>().ok());
+            let body = match state.source.build(timed, declared) {
                 Ok(body) => body,
                 Err(text) => return OpOutcome::Failed(text),
             };
