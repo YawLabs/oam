@@ -1355,23 +1355,44 @@
     }
   }
 
-  // Node's common.invalidArgTypeHelper(): builds the " Received ..." suffix of
-  // an ERR_INVALID_ARG_TYPE message. Must match byte-for-byte (tests assert it).
+  // Node's determineSpecificType (lib/internal/errors.js, v22.22.2): the
+  // " Received ..." suffix of an ERR_INVALID_ARG_TYPE message. Must match
+  // byte-for-byte (tests assert it). Only a STRING is shortened -- to 25
+  // characters and "..." INSIDE its quotes -- and one holding a single quote
+  // is JSON-quoted instead; a symbol or bigint is shown whole, -0 as -0, and
+  // an object whose constructor has a `name` (even "") is "an instance of"
+  // it. (oam used to cut the quoted form at 25, losing the closing quote, and
+  // to cut symbols and bigints.)
   function receivedSuffix(input) {
     if (input == null) return " Received " + input;
-    if (typeof input === "function") return " Received function " + input.name;
-    if (typeof input === "object") {
-      const cn = input.constructor && input.constructor.name;
-      if (cn) return " Received an instance of " + cn;
-      return " Received [Object: null prototype] {}";
+    switch (typeof input) {
+      case "function":
+        return " Received function " + input.name;
+      case "object": {
+        const ctor = input.constructor;
+        if (ctor && "name" in ctor) return " Received an instance of " + ctor.name;
+        return " Received [Object: null prototype] {}";
+      }
+      case "string":
+        return " Received type string (" + quoteReceivedString(input, true) + ")";
+      case "bigint":
+        return " Received type bigint (" + input + "n)";
+      case "symbol":
+        return " Received type symbol (" + String(input) + ")";
+      case "number":
+        return " Received type number (" + (Object.is(input, -0) ? "-0" : String(input)) + ")";
+      default:
+        return " Received type " + typeof input + " (" + String(input) + ")";
     }
-    let inspected;
-    if (typeof input === "string") inspected = "'" + input + "'";
-    else if (typeof input === "bigint") inspected = input.toString() + "n";
-    else if (typeof input === "symbol") inspected = input.toString();
-    else inspected = String(input);
-    if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
-    return " Received type " + typeof input + " (" + inspected + ")";
+  }
+
+  // A string as node's "Received" tails quote it: single quotes, or JSON
+  // quotes when it holds one. The JS tail shortens it first; node's C++ tail
+  // (nativeReceivedSuffix) shortens only a string it single-quotes.
+  function quoteReceivedString(s, shortenQuoted) {
+    const hasQuote = s.indexOf("'") !== -1;
+    if (s.length > 28 && (shortenQuoted || !hasQuote)) s = s.slice(0, 25) + "...";
+    return hasQuote ? JSON.stringify(s) : "'" + s + "'";
   }
 
   // Build an ERR_INVALID_ARG_TYPE TypeError whose message follows Node's
@@ -10001,6 +10022,92 @@
     }
   }
 
+  // ---- file-descriptor validation, for every fs API that takes an fd.
+  //
+  // node checks a descriptor in one of two places, and they word the same
+  // failure differently (v22.22.2, measured per API; conformance/cases/246
+  // and 247 pin them):
+  //
+  //   JS  lib/internal/fs/utils.js getValidatedFd -> validateInt32(fd, "fd",
+  //       0): a non-number is ERR_INVALID_ARG_TYPE with the JS "Received"
+  //       tail; a non-integer (1.5, -0.5, NaN, +-Infinity) is ERR_OUT_OF_RANGE
+  //       "an integer"; anything else outside [0, 2**31-1] is ERR_OUT_OF_RANGE
+  //       ">= 0 && <= 2147483647", digits grouped past 2**32. fs.read, write,
+  //       readv, writev and the createReadStream / createWriteStream `fd`
+  //       option check here, FIRST, before any other argument.
+  //   C++ src/node_file.cc GetValidatedFd, on the binding call itself: the
+  //       range is tested BEFORE integrality (-0.5 and 2**53 are ">= 0 && <=",
+  //       only NaN, +-Infinity and in-range fractions are "an integer"), the
+  //       value is V8's detail string (no digit grouping), and a non-number's
+  //       tail is V8's: `Received function`, `Received Symbol(s)`, `type bigint
+  //       (1)` with no `n`, a null-prototype object is `an instance of Object`.
+  //       Every *Sync form and close / fstat / fsync / fdatasync / ftruncate /
+  //       fchmod / fchown / futimes check here, so AFTER the JS-side checks of
+  //       their other arguments and of the callback.
+  //
+  // Before this, oam handed the number to the native as it was and reported
+  // EBADF for -1, 1.5, "3" or undefined alike, so code that branches on
+  // ERR_OUT_OF_RANGE / ERR_INVALID_ARG_TYPE (or on EBADF meaning "this was a
+  // real descriptor that is closed") took the wrong branch.
+  //
+  // The first test is the whole cost on the hot path: a valid descriptor is an
+  // int32 that is not negative (-0 passes, as node maps it to 0). The typeof
+  // comes first so that `| 0` never runs a valueOf or throws on a bigint.
+  function validateFd(fd, native) {
+    if (typeof fd === "number" && (fd | 0) === fd && fd >= 0) return;
+    throw invalidFdError(fd, native);
+  }
+
+  function invalidFdError(fd, native) {
+    if (typeof fd !== "number") {
+      return applyNodeErrorShape(
+        new TypeError(
+          'The "fd" argument must be of type number.' + (native ? nativeReceivedSuffix(fd) : receivedSuffix(fd)),
+        ),
+        "ERR_INVALID_ARG_TYPE",
+      );
+    }
+    const range = ">= 0 && <= 2147483647";
+    if (native) {
+      // String(fd) is V8's detail string for a number, and as a string it
+      // escapes ERR_OUT_OF_RANGE's digit grouping, which node's C++ never does.
+      const outOfRange = (fd < 0 || fd > 2147483647) && fd !== Infinity && fd !== -Infinity;
+      return codes.ERR_OUT_OF_RANGE("fd", outOfRange ? range : "an integer", String(fd));
+    }
+    return codes.ERR_OUT_OF_RANGE("fd", Number.isInteger(fd) ? range : "an integer", fd);
+  }
+
+  // The "Received" tail node's C++ puts on an ERR_INVALID_ARG_TYPE: what
+  // receivedSuffix (the JS one) gives, except that a function or symbol is not
+  // prefixed with its type, a bigint is shown without its `n`, a JSON-quoted
+  // string is not shortened, and an object is named by its prototype's
+  // constructor (V8's GetConstructorName), never by an own `constructor`
+  // property. (V8 also infers a name for an anonymous class from the binding
+  // it was assigned to; that is not observable from JS, so such an instance
+  // reads "an instance of Object" here.)
+  function nativeReceivedSuffix(input) {
+    if (typeof input === "function") return " Received function";
+    if (typeof input === "symbol") return " Received " + input.toString();
+    if (typeof input === "bigint") return " Received type bigint (" + input.toString() + ")";
+    if (input !== null && typeof input === "object") {
+      const proto = Object.getPrototypeOf(input);
+      const ctor = proto === null ? undefined : Object.getOwnPropertyDescriptor(proto, "constructor");
+      const name = ctor && typeof ctor.value === "function" ? ctor.value.name : "";
+      return " Received an instance of " + (name || "Object");
+    }
+    if (typeof input === "string") return " Received type string (" + quoteReceivedString(input, false) + ")";
+    return receivedSuffix(input);
+  }
+
+  // node's makeCallback / validateFunction(cb, "cb") failure, which oam's fd
+  // callback forms used to report as a bare, code-less "Callback must be a
+  // function".
+  function validateCb(cb) {
+    if (typeof cb !== "function") {
+      throw nodeTypeError('The "cb" argument must be of type function.' + receivedSuffix(cb));
+    }
+  }
+
   // ---- vectored-IO primitives, shared by node:fs's readv/writev and by
   // FileHandle.readv/writev.
   //
@@ -10106,14 +10213,23 @@
     // directly would leave the FileHandle believing it was still open, and it
     // would then close the fd a SECOND time -- by which point the number can
     // already have been handed to an unrelated open().
+    //
+    // A number is range-checked by node's JS getValidatedFd, in the
+    // constructor; anything else that is not a FileHandle is refused there
+    // too, where it used to fall through to the path check and blame `path`.
     const suppliedFd = (opts) => {
       const fd = opts.fd;
       if (fd == null) return null;
-      if (typeof fd === "number") return { handle: fd, close: () => natives.fsClose(fd) };
+      if (typeof fd === "number") {
+        validateFd(fd, false);
+        return { handle: fd, close: () => natives.fsClose(fd) };
+      }
       if (typeof fd === "object" && typeof fd.fd === "number" && typeof fd.close === "function") {
         return { handle: fd.fd, close: () => fd.close() };
       }
-      return null;
+      throw nodeTypeError(
+        'The "options.fd" property must be of type number or an instance of FileHandle.' + receivedSuffix(fd),
+      );
     };
 
     class ReadStream extends Readable {
@@ -10781,9 +10897,7 @@
     function callbackify1(promiseFn) {
       return (...args) => {
         const cb = args.pop();
-        if (typeof cb !== "function") {
-          throw new TypeError("Callback must be a function");
-        }
+        validateCb(cb);
         const token = fsReqStart();
         // Several promise forms are plain (non-async) arrows, so argument
         // validation throws SYNCHRONOUSLY -- the token must drop before the
@@ -10858,16 +10972,10 @@
       );
     }
 
-    // node's getValidatedFd for the int32 a readFile-family call took as a
-    // descriptor: a negative one is out of range.
-    function checkFd(fd) {
-      if (fd < 0) throw codes.ERR_OUT_OF_RANGE("fd", ">= 0 && <= 2147483647", fd);
-    }
-
     // readFileSync(fd): everything from the descriptor's current position.
-    // fstat first, as node's does, so a bad descriptor fails `fstat`.
+    // fstat first, as node's does, so a bad descriptor fails `fstat` -- and a
+    // negative one fails fstatSync's descriptor check.
     function readFdSync(fd) {
-      checkFd(fd);
       fs.fstatSync(fd);
       const chunks = [];
       let total = 0;
@@ -10896,11 +11004,12 @@
       const bytes = encodeWrite(data, options);
       let off = 0;
       try {
+        // Per write, as node's writeSync checks it: empty data writes nothing
+        // and checks nothing.
         while (off < bytes.length) {
-          // Per write, as node's writeSync checks it: empty data writes
-          // nothing and checks nothing.
-          if (!utf8) checkFd(fd);
-          off += fs.writeSync(fd, bytes, off, bytes.length - off, null);
+          off += utf8
+            ? writeSyncTo(fd, off === 0 ? bytes : bytes.subarray(off), null)
+            : fs.writeSync(fd, bytes, off, bytes.length - off, null);
         }
       } catch (e) {
         // writeSync's error has errno, syscall, code (as node's does);
@@ -10914,8 +11023,38 @@
       }
     }
 
+    // The write under fs.writeSync, past its argument and descriptor checks.
+    // fd 1/2 (stdout/stderr) have no native fd-table entry -- route them to
+    // the process stdout/stderr sinks so fs.writeSync(1|2, ...) matches Node
+    // instead of throwing EBADF (pino/sonic-boom sync mode writes here). The
+    // sink hands back the error a failed write got, and it throws here as
+    // node's writeSync throws it, in writeSync's key order.
+    function writeSyncTo(fd, buf, pos) {
+      if (fd === 1 || fd === 2) {
+        const failed = fd === 1 ? natives.stdoutWrite(buf) : natives.stderrWrite(buf);
+        if (failed) throw ctxOrderError(failed);
+        return buf.length;
+      }
+      // ctxOrderError only here: fs.write and fs.writevSync route through the
+      // same native but keep node's common errno/code/syscall order.
+      try {
+        return natives.fsWriteSync(fd, buf, pos);
+      } catch (e) {
+        throw ctxOrderError(e);
+      }
+    }
+
+    // readFile(fd, cb). node looks at the descriptor a tick later, in
+    // readFileAfterOpen's binding.fstat, so a negative one is not thrown at
+    // the call and never reaches the callback: it is thrown from that tick,
+    // as an uncaught exception (v22.22.2, measured -- a try/catch around
+    // fs.readFile(-1, cb) does not see it).
     function readFdAsync(fd, cb) {
-      checkFd(fd);
+      if (fd < 0) {
+        const err = invalidFdError(fd, true);
+        process.nextTick(() => { throw err; });
+        return;
+      }
       fs.fstat(fd, (statErr) => {
         if (statErr) return cb(statErr);
         const chunks = [];
@@ -10938,10 +11077,14 @@
     // from its current position, a path goes through fs/promises.
     function fdOrPathWrite(promiseFn) {
       return function (path, data, options, cb) {
-        if (typeof options === "function") { cb = options; options = undefined; }
+        // node's `callback ||= options`: with no callback, the options
+        // argument is the one validated as it.
+        if (!cb) cb = options;
+        if (typeof options === "function") options = undefined;
         if (!isInt32(path)) return callbackify1(promiseFn)(path, data, options, cb);
-        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
-        checkFd(path);
+        validateCb(cb);
+        // fs.write's descriptor check, which node reaches synchronously.
+        validateFd(path, false);
         let bytes;
         try {
           bytes = encodeWrite(data, options);
@@ -11209,7 +11352,7 @@
       truncateSync: (path, len) => {
         if (typeof path === "number") {
           warnTruncateFd();
-          return void natives.fsFtruncateSync(path, len ?? 0);
+          return fs.ftruncateSync(path, len);
         }
         natives.fsTruncateSync(toPath(path), len ?? 0);
       },
@@ -11218,8 +11361,10 @@
       // on err.code === "ENOENT" to tell missing from locked.
       openSync: (path, flags, _mode) =>
         natives.fsOpenSync(toPath(path), typeof flags === "number" ? numericOpenFlags(flags) : (flags ?? "r")),
-      closeSync: (fd) => { natives.fsCloseSync(fd); },
-      fstatSync: (fd) => wrapStat(natives.fsFstatSync(fd)),
+      // The *Sync descriptor checks sit where node's C++ binding makes them:
+      // after every other argument, right before the call (see validateFd).
+      closeSync: (fd) => { validateFd(fd, true); natives.fsCloseSync(fd); },
+      fstatSync: (fd) => { validateFd(fd, true); return wrapStat(natives.fsFstatSync(fd)); },
       readSync: (fd, buffer, offset, length, position) => {
         // (fd, buffer, {offset,length,position}) object form.
         if (offset !== null && typeof offset === "object") {
@@ -11227,7 +11372,11 @@
           offset = o.offset ?? 0; length = o.length ?? (buffer ? buffer.length - offset : 0); position = o.position ?? null;
         }
         const len = length ?? (buffer ? buffer.length - (offset ?? 0) : 0);
+        // node's `length |= 0; if (length === 0) return 0;`: an empty read
+        // into a real buffer returns before the descriptor is looked at.
+        if ((len | 0) === 0 && ArrayBuffer.isView(buffer)) return 0;
         validateReadLength(buffer, offset ?? 0, len);
+        validateFd(fd, true);
         return natives.fsReadSync(fd, buffer, offset ?? 0, len, position ?? null);
       },
       writeSync: (fd, data, offsetOrPosition, length, position) => {
@@ -11244,23 +11393,9 @@
           buf = (offset !== 0 || len !== data.length) ? data.subarray(offset, offset + len) : data;
           pos = typeof position === "number" ? position : null;
         }
-        // fd 1/2 (stdout/stderr) have no native fd-table entry -- route them to
-        // the process stdout/stderr sinks so fs.writeSync(1|2, ...) matches Node
-        // instead of throwing EBADF (pino/sonic-boom sync mode writes here).
-        // The sink hands back the error a failed write got, and it throws
-        // here as node's writeSync throws it, in writeSync's key order.
-        if (fd === 1 || fd === 2) {
-          const failed = fd === 1 ? natives.stdoutWrite(buf) : natives.stderrWrite(buf);
-          if (failed) throw ctxOrderError(failed);
-          return buf.length;
-        }
-        // ctxOrderError only here: fs.write and fs.writevSync route through the
-        // same native but keep node's common errno/code/syscall order.
-        try {
-          return natives.fsWriteSync(fd, buf, pos);
-        } catch (e) {
-          throw ctxOrderError(e);
-        }
+        // Empty data is still checked: node's writeSync has no early return.
+        validateFd(fd, true);
+        return writeSyncTo(fd, buf, pos);
       },
       opendirSync: function (path) {
         var dirPath = toPath(path);
@@ -11286,9 +11421,11 @@
       },
 
       readFile: function (path, options, cb) {
-        if (typeof options === "function") { cb = options; options = undefined; }
+        // node's `callback ||= options`, as in writeFile.
+        if (!cb) cb = options;
+        if (typeof options === "function") options = undefined;
         if (!isInt32(path)) return callbackify1(promises.readFile)(path, options, cb);
-        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+        validateCb(cb);
         readFdAsync(path, (err, bytes) => {
           if (err) return cb(err);
           let out;
@@ -11349,7 +11486,7 @@
       open: function (path, flags, mode, cb) {
         if (typeof flags === "function") { cb = flags; flags = "r"; }
         else if (typeof mode === "function") { cb = mode; }
-        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+        validateCb(cb);
         var flagStr = typeof flags === "number" ? numericOpenFlags(flags) : (flags || "r");
         var token = fsReqStart();
         // toPath(path) can throw (a poisoned toString) -- drop the token
@@ -11366,7 +11503,11 @@
           function (err) { fsReqEnd(token); queueMicrotask(function () { cb(err); }); },
         );
       },
+      // The callback is optional, but one that is passed must be a function,
+      // and node checks it before the descriptor.
       close: function (fd, cb) {
+        if (cb !== undefined) validateCb(cb);
+        validateFd(fd, true);
         var err = null;
         try { natives.fsClose(fd); } catch (e) { err = e; }
         if (typeof cb === "function") queueMicrotask(function () { cb(err); });
@@ -11378,10 +11519,12 @@
       // fd 1/2 route to the stdout/stderr sinks (pino/sonic-boom's default
       // async destination writes here); other fds use the sync native op
       // dispatched on a microtask to preserve the async callback contract.
+      // node's JS getValidatedFd, before any other argument (validateFd).
       write: function (fd, data) {
+        validateFd(fd, false);
         var rest = Array.prototype.slice.call(arguments, 2);
         var cb = rest.length ? rest[rest.length - 1] : undefined;
-        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+        validateCb(cb);
         var mid = rest.slice(0, rest.length - 1);
         var buf, pos;
         try {
@@ -11425,6 +11568,8 @@
         queueMicrotask(function () { cb(null, n, data); });
       },
       read: function (fd, buffer, offset, length, position, cb) {
+        // node's JS getValidatedFd, before any other argument (validateFd).
+        validateFd(fd, false);
         // Variants: (fd, buffer, offset, length, position, cb),
         // (fd, options, cb), and trailing-callback short forms.
         if (typeof buffer === "function") {
@@ -11442,7 +11587,7 @@
         if (typeof offset === "function") { cb = offset; offset = 0; length = buffer ? buffer.length : 16384; }
         if (typeof length === "function") { cb = length; length = buffer ? buffer.length - (offset || 0) : 16384; }
         if (typeof position === "function") { cb = position; }
-        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+        validateCb(cb);
         var want = length != null ? length : (buffer ? buffer.length - (offset || 0) : 16384);
         // Bounded by the destination, exactly as node bounds it -- and thrown
         // SYNCHRONOUSLY even from this callback form, which is what node does.
@@ -11477,7 +11622,8 @@
       // async spelling was missing, and it is the one promisify() reaches for.
       fstat: function (fd, options, cb) {
         if (typeof options === "function") { cb = options; options = undefined; }
-        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+        validateCb(cb);
+        validateFd(fd, true);
         var token = fsReqStart();
         // The ASYNC native, not fsFstatSync: reading metadata inline and then
         // deferring only the callback still blocked the loop for the whole
@@ -11521,7 +11667,7 @@
     const voidCallbackOp = (run) =>
       function (...args) {
         const cb = args.pop();
-        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+        validateCb(cb);
         const token = fsReqStart();
         let p;
         try {
@@ -11538,24 +11684,50 @@
       };
 
 
-    fs.fsync = voidCallbackOp((fd) => natives.fsFsync(fd));
-    fs.fdatasync = voidCallbackOp((fd) => natives.fsFdatasync(fd));
-    // node permits `ftruncate(fd, cb)` with the length omitted, which lands
-    // here as undefined once the callback is popped.
-    fs.ftruncate = voidCallbackOp((fd, len) => natives.fsFtruncate(fd, len ?? 0));
-    fs.fchmod = voidCallbackOp((fd, mode) => natives.fsFchmod(fd, mode));
-    fs.fchown = voidCallbackOp((fd, uid, gid) => natives.fsFchown(fd, uid, gid));
-    fs.futimes = voidCallbackOp((fd, atime, mtime) =>
-      natives.fsFutimes(fd, toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
-    );
+    // The descriptor forms check, in node's order and all synchronously: their
+    // other arguments, then the callback, then the descriptor (validateFd's
+    // C++ spelling). Only the operation's own failure -- EBADF for a closed
+    // descriptor -- goes to the callback, which voidCallbackOp arranges.
+    const fdCallbackOp = (op) => {
+      const run = voidCallbackOp(op);
+      return (cb, fd, a, b) => {
+        validateCb(cb);
+        validateFd(fd, true);
+        run(fd, a, b, cb);
+      };
+    };
+    const fsyncCb = fdCallbackOp((fd) => natives.fsFsync(fd));
+    const fdatasyncCb = fdCallbackOp((fd) => natives.fsFdatasync(fd));
+    const ftruncateCb = fdCallbackOp((fd, len) => natives.fsFtruncate(fd, len));
+    const fchmodCb = fdCallbackOp((fd, mode) => natives.fsFchmod(fd, mode));
+    const fchownCb = fdCallbackOp((fd, uid, gid) => natives.fsFchown(fd, uid, gid));
+    const futimesCb = fdCallbackOp((fd, atime, mtime) => natives.fsFutimes(fd, atime, mtime));
+    fs.fsync = function fsync(fd, cb) { fsyncCb(cb, fd); };
+    fs.fdatasync = function fdatasync(fd, cb) { fdatasyncCb(cb, fd); };
+    // node permits `ftruncate(fd, cb)` with the length omitted. (The default
+    // is node's signature, which makes ftruncate.length 1.)
+    fs.ftruncate = function ftruncate(fd, len = 0, cb) {
+      if (typeof len === "function") { cb = len; len = 0; }
+      ftruncateCb(cb, fd, len ?? 0);
+    };
+    fs.fchmod = function fchmod(fd, mode, cb) { fchmodCb(cb, fd, mode); };
+    fs.fchown = function fchown(fd, uid, gid, cb) { fchownCb(cb, fd, uid, gid); };
+    fs.futimes = function futimes(fd, atime, mtime, cb) {
+      const a = toUnixMs(atime, "atime");
+      const m = toUnixMs(mtime, "mtime");
+      futimesCb(cb, fd, a, m);
+    };
 
-    fs.fsyncSync = (fd) => { natives.fsFsyncSync(fd); };
-    fs.fdatasyncSync = (fd) => { natives.fsFdatasyncSync(fd); };
-    fs.ftruncateSync = (fd, len) => { natives.fsFtruncateSync(fd, len ?? 0); };
-    fs.fchmodSync = (fd, mode) => { natives.fsFchmodSync(fd, mode); };
-    fs.fchownSync = (fd, uid, gid) => { natives.fsFchownSync(fd, uid, gid); };
+    fs.fsyncSync = (fd) => { validateFd(fd, true); natives.fsFsyncSync(fd); };
+    fs.fdatasyncSync = (fd) => { validateFd(fd, true); natives.fsFdatasyncSync(fd); };
+    fs.ftruncateSync = (fd, len) => { validateFd(fd, true); natives.fsFtruncateSync(fd, len ?? 0); };
+    fs.fchmodSync = (fd, mode) => { validateFd(fd, true); natives.fsFchmodSync(fd, mode); };
+    fs.fchownSync = (fd, uid, gid) => { validateFd(fd, true); natives.fsFchownSync(fd, uid, gid); };
     fs.futimesSync = (fd, atime, mtime) => {
-      natives.fsFutimesSync(fd, toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
+      const a = toUnixMs(atime, "atime");
+      const m = toUnixMs(mtime, "mtime");
+      validateFd(fd, true);
+      natives.fsFutimesSync(fd, a, m);
     };
 
     // ---- path-based ownership / time: chown, lchown, utimes, lutimes, lchmod.
@@ -11621,15 +11793,18 @@
     fs.writevSync = (fd, buffers, position) => {
       const total = asViewArray(buffers);
       // node returns 0 without touching the descriptor -- measured: writev([])
-      // on a CLOSED fd does not throw.
+      // on a CLOSED fd, or on -1, does not throw.
       if (emptyList(buffers)) return 0;
+      validateFd(fd, true);
       return natives.fsWriteSync(fd, flattenViews(buffers, total), fsPositionArg(position));
     };
 
     fs.readvSync = (fd, buffers, position) => {
       const total = asViewArray(buffers);
-      // Before the fd check, deliberately: node raises this even for a closed
-      // descriptor.
+      // The descriptor's range is checked first (readvSync(-1, []) is
+      // ERR_OUT_OF_RANGE), but the EINVAL comes before the descriptor is
+      // USED: node raises it even for a closed one.
+      validateFd(fd, true);
       if (emptyList(buffers)) throw einvalRead(natives.platform);
       const tmp = globalThis.Buffer.allocUnsafe(total);
       const n = natives.fsReadSync(fd, tmp, 0, total, fsPositionArg(position));
@@ -11637,24 +11812,17 @@
       return n;
     };
 
-    const vectoredCallback = (cb) => {
-      if (typeof cb !== "function") {
-        throw nodeTypeError(
-          `The "cb" argument must be of type function. Received ${describeArg(cb)}`,
-        );
-      }
-      return cb;
-    };
-
     // The two validation failures land DIFFERENTLY, which is easy to get
     // backwards: node's validateBufferArray runs at the call site and THROWS
     // synchronously (node:fs:758), while the empty-list EINVAL is delivered to
     // the callback. Routing both through the callback meant a try/catch around
-    // fs.readv silently stopped firing.
+    // fs.readv silently stopped firing. node's order is descriptor (its JS
+    // check, see validateFd), buffers, callback.
     fs.writev = function (fd, buffers, position, cb) {
-      if (typeof position === "function") { cb = position; position = null; }
-      cb = vectoredCallback(cb);
+      validateFd(fd, false);
       const total = asViewArray(buffers);
+      if (typeof position === "function") { cb = position; position = null; }
+      validateCb(cb);
       if (emptyList(buffers)) { queueMicrotask(() => cb(null, 0, buffers)); return; }
       // Reuses fs.write, so the position handling lives in exactly one place.
       fs.write(fd, flattenViews(buffers, total), 0, total, fsPositionArg(position), (err, written) =>
@@ -11663,12 +11831,14 @@
     };
 
     fs.readv = function (fd, buffers, position, cb) {
-      if (typeof position === "function") { cb = position; position = null; }
-      cb = vectoredCallback(cb);
+      validateFd(fd, false);
       const total = asViewArray(buffers);
+      if (typeof position === "function") { cb = position; position = null; }
+      validateCb(cb);
       if (emptyList(buffers)) {
-        // This one IS deferred, and beats the fd: node reports EINVAL through
-        // the callback even for a closed descriptor.
+        // This one IS deferred, and beats a closed descriptor: node reports
+        // EINVAL through the callback for one (an out-of-range one has
+        // already thrown above).
         queueMicrotask(() => cb(einvalRead(natives.platform), 0, buffers));
         return;
       }
