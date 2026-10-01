@@ -56,6 +56,21 @@ const values = [
   ["'3'", "3"],
   ["long", "x".repeat(40)],
   ["long quoted", "it's".repeat(10)],
+  // The quote is judged on the CUT string: past the cut it is single-quoted.
+  ["quote after the cut", "a".repeat(30) + "'"],
+  ["quote just after the cut", "a".repeat(25) + "'bcdefghijk"],
+  ["quote just before the cut", "a".repeat(24) + "'bcdefghijk"],
+  ["29 with a quote", "a".repeat(28) + "'"],
+  ["28 with a quote", "a".repeat(27) + "'"],
+  // The C++ wording counts and cuts UTF-8 bytes, and shows a lone surrogate
+  // and a character the cut splits as U+FFFD.
+  ["15 x 2-byte", "é".repeat(15)],
+  ["cut inside a 3-byte", "a".repeat(24) + "€€€"],
+  ["cut inside a 4-byte", "a".repeat(22) + "\u{1F600}\u{1F600}"],
+  ["cut after a 4-byte", "a".repeat(21) + "\u{1F600}\u{1F600}"],
+  ["lone surrogate", "\ud800x"],
+  ["lone surrogate cut", "a".repeat(24) + "\udc00bbbbb"],
+  ["2-byte, quote after the cut", "a".repeat(23) + "é'bbbbb"],
   ["undefined", undefined],
   ["null proto", Object.create(null)],
   ["1n", 1n],

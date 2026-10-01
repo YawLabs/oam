@@ -1358,8 +1358,8 @@
   // Node's determineSpecificType (lib/internal/errors.js, v22.22.2): the
   // " Received ..." suffix of an ERR_INVALID_ARG_TYPE message. Must match
   // byte-for-byte (tests assert it). Only a STRING is shortened -- to 25
-  // characters and "..." INSIDE its quotes -- and one holding a single quote
-  // is JSON-quoted instead; a symbol or bigint is shown whole, -0 as -0, and
+  // characters and "..." INSIDE its quotes -- and one whose shortened form
+  // holds a single quote is JSON-quoted instead; a symbol or bigint is shown whole, -0 as -0, and
   // an object whose constructor has a `name` (even "") is "an instance of"
   // it. (oam used to cut the quoted form at 25, losing the closing quote, and
   // to cut symbols and bigints.)
@@ -1374,7 +1374,7 @@
         return " Received [Object: null prototype] {}";
       }
       case "string":
-        return " Received type string (" + quoteReceivedString(input, true) + ")";
+        return " Received type string (" + quoteReceivedString(input) + ")";
       case "bigint":
         return " Received type bigint (" + input + "n)";
       case "symbol":
@@ -1386,13 +1386,38 @@
     }
   }
 
-  // A string as node's "Received" tails quote it: single quotes, or JSON
-  // quotes when it holds one. The JS tail shortens it first; node's C++ tail
-  // (nativeReceivedSuffix) shortens only a string it single-quotes.
-  function quoteReceivedString(s, shortenQuoted) {
-    const hasQuote = s.indexOf("'") !== -1;
-    if (s.length > 28 && (shortenQuoted || !hasQuote)) s = s.slice(0, 25) + "...";
-    return hasQuote ? JSON.stringify(s) : "'" + s + "'";
+  // A string as node's JS "Received" tail (determineSpecificType) quotes it:
+  // past 28 UTF-16 units it is cut to 25 plus "...", and THEN quoted -- single
+  // quotes, or JSON quotes when the cut string still holds a single quote, so
+  // a quote past the cut does not change the quoting (measured on v22.22.2).
+  // The C++ tail differs; see nativeQuoteReceivedString.
+  function quoteReceivedString(s) {
+    if (s.length > 28) s = s.slice(0, 25) + "...";
+    return s.indexOf("'") === -1 ? "'" + s + "'" : JSON.stringify(s);
+  }
+
+  // The same for node's C++ tail, which works on the string's UTF-8 bytes
+  // (a lone surrogate is U+FFFD): past 28 BYTES it is cut to 25 plus "...",
+  // and a character the cut splits reads as one U+FFFD. If the cut string has
+  // no single quote it is single-quoted; otherwise the WHOLE original string
+  // is JSON-quoted, uncut. All measured on v22.22.2 through fs.closeSync.
+  function nativeQuoteReceivedString(s) {
+    const wf = s.toWellFormed();
+    let bytes = 0;
+    let cutAt = -1;
+    let split = false;
+    for (let i = 0; i < wf.length && bytes <= 28; i++) {
+      const c = wf.charCodeAt(i);
+      const n = c < 0x80 ? 1 : c < 0x800 ? 2 : c >= 0xd800 && c <= 0xdbff ? 4 : 3;
+      if (cutAt < 0 && bytes + n > 25) {
+        cutAt = i;
+        split = bytes < 25;
+      }
+      bytes += n;
+      if (n === 4) i++;
+    }
+    const shown = bytes > 28 ? wf.slice(0, cutAt) + (split ? "�" : "") + "..." : wf;
+    return shown.indexOf("'") === -1 ? "'" + shown + "'" : JSON.stringify(s);
   }
 
   // Build an ERR_INVALID_ARG_TYPE TypeError whose message follows Node's
@@ -10079,8 +10104,9 @@
 
   // The "Received" tail node's C++ puts on an ERR_INVALID_ARG_TYPE: what
   // receivedSuffix (the JS one) gives, except that a function or symbol is not
-  // prefixed with its type, a bigint is shown without its `n`, a JSON-quoted
-  // string is not shortened, and an object is named by its prototype's
+  // prefixed with its type, a bigint is shown without its `n`, a string is
+  // measured and cut in UTF-8 bytes and a JSON-quoted one is not cut
+  // (nativeQuoteReceivedString), and an object is named by its prototype's
   // constructor (V8's GetConstructorName), never by an own `constructor`
   // property. (V8 also infers a name for an anonymous class from the binding
   // it was assigned to; that is not observable from JS, so such an instance
@@ -10095,7 +10121,7 @@
       const name = ctor && typeof ctor.value === "function" ? ctor.value.name : "";
       return " Received an instance of " + (name || "Object");
     }
-    if (typeof input === "string") return " Received type string (" + quoteReceivedString(input, false) + ")";
+    if (typeof input === "string") return " Received type string (" + nativeQuoteReceivedString(input) + ")";
     return receivedSuffix(input);
   }
 
