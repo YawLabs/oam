@@ -22994,6 +22994,17 @@
           err.code = "ERR_INVALID_ARG_TYPE";
           throw err;
         }
+        if (this._writableState.ended && this._readableState.endEmitted && !this.allowHalfOpen) {
+          // node's writeAfterFIN (lib/net.js), which replaces write() once
+          // the peer's FIN has been read on a socket that is not half-open:
+          // a write after the auto end() that followed fails with EPIPE,
+          // on the next tick, and destroys the socket with it (#164).
+          const err = new Error("This socket has been ended by the other party");
+          err.code = "EPIPE";
+          if (typeof cb === "function") process.nextTick(cb, err);
+          this.destroy(err);
+          return false;
+        }
         if (this.destroyed || !this.writable) {
           // node's Writable.write: the callback gets the error on the next
           // tick, and a write after end() destroys the socket with it
@@ -23303,7 +23314,12 @@
               this._eofPending = true;
               if (this._readableMode) this.emit("readable");
             } else {
-              this._onReadEof();
+              // node's endReadableNT: 'end' is emitted from a tick, so what
+              // an 'end' listener defers -- with process.nextTick, or to a
+              // microtask -- runs relative to the auto end() as in node.
+              process.nextTick(() => {
+                if (!this.destroyed && !this._readableState.endEmitted) this._onReadEof();
+              });
             }
             break;
           }
@@ -23340,7 +23356,12 @@
             // (which also double-emitted 'finish').
             this._chain = this._chain.then(() => this._doClose());
           } else {
-            this.end();
+            // node's endWritableNT: the auto end() waits a tick, so a write
+            // an 'end' listener defers with process.nextTick still goes out
+            // (#164); one made later is writeAfterFIN's EPIPE (see write()).
+            process.nextTick(() => {
+              if (!this.destroyed && !this._writableState.ended) this.end();
+            });
           }
         } else if (!this.writable) {
           this._doClose();

@@ -10,6 +10,13 @@
 // any program that handles the two differently. A write after end() emitted
 // (and threw) inside the write() call itself, and a failed write rejected
 // the same chain.
+//
+// And after the peer's FIN on a socket that is not half-open: the auto
+// end() waits a tick (node's endWritableNT), so a write an 'end' listener
+// defers with process.nextTick still goes out, and a later one fails with
+// node's writeAfterFIN EPIPE. oam ran the end() inside the 'end' emit, so
+// the deferred write failed and destroyed the socket, and it reported
+// ERR_STREAM_WRITE_AFTER_END for what node calls EPIPE.
 import net from "node:net";
 import tls from "node:tls";
 
@@ -142,6 +149,33 @@ async function connected() {
   log.push(`write returned ${socket.write("later")}`);
   await settle();
   flush("write after destroy(), no callback");
+}
+
+{
+  // The peer writes and ends; the client writes from its 'end' listener,
+  // at once, on the next tick, or from a microtask.
+  const ending = net.createServer((socket) => {
+    socket.on("error", () => {});
+    socket.end("bye");
+  });
+  await new Promise((resolve) => ending.listen(0, "127.0.0.1", resolve));
+  for (const when of ["inside 'end'", "process.nextTick", "a microtask"]) {
+    const socket = net.connect(ending.address().port, "127.0.0.1");
+    socket.on("data", () => {});
+    socket.on("error", (e) => log.push(`error ${e.code} ${JSON.stringify(e.message)}`));
+    socket.on("end", () => {
+      const write = () => socket.write("x", (e) => log.push(`callback ${e === null ? "null" : `${e.code} ${JSON.stringify(e.message)}`}`));
+      if (when === "process.nextTick") process.nextTick(write);
+      else if (when === "a microtask") Promise.resolve().then(write);
+      else write();
+    });
+    await new Promise((resolve) => socket.on("close", (hadError) => {
+      log.push(`close(${hadError})`);
+      resolve();
+    }));
+    flush(`a write from ${when} after the peer's FIN`);
+  }
+  ending.close();
 }
 
 server.close();
