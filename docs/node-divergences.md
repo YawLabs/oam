@@ -2218,7 +2218,15 @@ written chunk by chunk. `FileHandle`'s `write`, `chmod`, `chown` and `truncate` 
 the same checks as their descriptor twins, after the closed-handle check
 (`conformance/cases/261-*`): `fh.write(string[, position[, encoding]])` takes a
 position, not an offset into the string, and `read`, `readv`, `write` and `writev`
-resolve null-prototype objects, as node's do. A write's position is not
+resolve null-prototype objects, as node's do. The path forms check theirs too
+(`conformance/cases/263-*`): `truncate` opens the path `"r+"` and ftruncates it, so a
+missing file is `ENOENT` before the length is looked at and a bad length leaves the
+file alone; `chmod` takes `parseFileMode`, `chown` / `lchown` the `uid` / `gid`
+bound, `utimes` / `lutimes` name a bad time `"time"`; and the callback forms check
+the path and these arguments at the call, in node's order, not through the callback.
+(One order differs, on macOS only: node's `lchmodSync` and `fs/promises.lchmod` open
+the path before checking the mode, so a missing path with a bad mode is `ENOENT`
+there; oam reports the mode.) A write's position is not
 validated, as in node: anything but a safe integer `>= 0` -- `1.5`, `'x'`, a bigint,
 a negative -- writes at the cursor (oam used to round `1.5` down to a pwrite at 1).
 A string write's encoding is node's too: only `'hex'` with an odd-length string is

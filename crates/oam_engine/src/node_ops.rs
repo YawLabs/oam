@@ -253,13 +253,11 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fsReadlink", op_fs_readlink),
         ("fsLink", op_fs_link),
         ("fsChmod", op_fs_chmod),
-        ("fsTruncate", op_fs_truncate),
         // fs sync (new batch)
         ("fsSymlinkSync", op_fs_symlink_sync),
         ("fsReadlinkSync", op_fs_readlink_sync),
         ("fsLinkSync", op_fs_link_sync),
         ("fsChmodSync", op_fs_chmod_sync),
-        ("fsTruncateSync", op_fs_truncate_sync),
         ("fsMkdtempSync", op_fs_mkdtemp_sync),
         // fs streams (createReadStream/createWriteStream)
         ("fsOpen", op_fs_open),
@@ -6637,22 +6635,6 @@ fn op_fs_chmod(
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_chmod(path, mode));
 }
 
-fn op_fs_truncate(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "truncate requires a path");
-        return;
-    };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
-    let len = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u64;
-    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_truncate(path, len));
-}
-
 fn op_fs_symlink_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -6782,31 +6764,6 @@ fn op_fs_chmod_sync(
             }
             Err(e) => throw_node_error(scope, "chmod", &path, &e),
         }
-    }
-}
-
-fn op_fs_truncate_sync(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "truncateSync requires a path");
-        return;
-    };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
-    let len = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u64;
-    // Which syscall actually failed, as node reports it: open + ftruncate,
-    // so a missing path is `open` (see the async twin in oam_core).
-    match std::fs::OpenOptions::new().write(true).open(&path) {
-        Ok(f) => {
-            if let Err(e) = f.set_len(len) {
-                throw_node_error(scope, "ftruncate", &path, &e);
-            }
-        }
-        Err(e) => throw_node_error(scope, "open", &path, &e),
     }
 }
 

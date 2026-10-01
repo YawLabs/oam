@@ -4230,16 +4230,6 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_truncate(path: String, len: u64) -> OpOutcome {
-        match tokio::fs::OpenOptions::new().write(true).open(&path).await {
-            Ok(f) => match f.set_len(len).await {
-                Ok(()) => OpOutcome::Done,
-                Err(e) => node_fail(e, "ftruncate", &path),
-            },
-            Err(e) => node_fail(e, "open", &path),
-        }
-    }
-
     // ------------------------------------------------- fd-based fs operations
     //
     // Each takes an owned `std::fs::File` the caller cloned out of the sync

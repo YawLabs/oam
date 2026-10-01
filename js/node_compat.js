@@ -10160,8 +10160,17 @@
     }
   }
 
-  // fchown's uid / gid bound: -1 ("leave it") through 2**32-1.
+  // The uid / gid of every chown form: integers from -1 ("leave it") through
+  // 2**32-1, uid checked first. Returns them, for the native call.
   const kMaxUserId = 2 ** 32 - 1;
+  function ownerArgs(uid, gid) {
+    validateInteger(uid, "uid", -1, kMaxUserId);
+    validateInteger(gid, "gid", -1, kMaxUserId);
+    return [uid, gid];
+  }
+  // The two times of utimes / lutimes in every form, in milliseconds for the
+  // natives: node's toUnixTimestamp under its default name ("time").
+  const pathTimes = (atime, mtime) => [toUnixMs(atime), toUnixMs(mtime)];
 
   // validatePosition: an integer >= -1 or a bigint that keeps
   // position + length inside an int64. Returns what the natives take: null
@@ -10821,14 +10830,29 @@
       readlink: (path) => natives.fsReadlink(toPath(path)),
       link: (existing, newPath) =>
         natives.fsLink(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
-      chmod: (path, mode) => natives.fsChmod(toPath(path), mode),
-      truncate: (path, len) => natives.fsTruncate(toPath(path), len ?? 0),
-      chown: (path, uid, gid) => natives.fsChown(toPath(path), uid, gid),
-      lchown: (path, uid, gid) => natives.fsLchown(toPath(path), uid, gid),
-      utimes: (path, atime, mtime) =>
-        natives.fsUtimes(toPath(path), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
-      lutimes: (path, atime, mtime) =>
-        natives.fsLutimes(toPath(path), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
+      // The path first, then node's validators for the rest (lib/internal/
+      // fs/promises.js, v22.22.2) -- each thrown here and turned into a
+      // rejection by the exported module's wrapper, and thrown at the call
+      // by the callback forms built on these.
+      chmod: (path, mode) => natives.fsChmod(toPath(path), parseFileMode(mode, "mode")),
+      // node opens the file "r+" and ftruncates the descriptor, so a missing
+      // file is ENOENT `open` before the length is looked at, and a bad
+      // length leaves the file alone.
+      truncate: withPath(async (file, len = 0) => {
+        const { handle } = await natives.fsOpen(file, "r+");
+        try {
+          validateInteger(len, "len");
+          await natives.fsFtruncate(handle, Math.max(0, len));
+        } finally {
+          natives.fsClose(handle);
+        }
+      }),
+      chown: (path, uid, gid) => natives.fsChown(toPath(path), ...ownerArgs(uid, gid)),
+      lchown: (path, uid, gid) => natives.fsLchown(toPath(path), ...ownerArgs(uid, gid)),
+      // The path forms' times are node's toUnixTimestamp under its default
+      // name ("time"); only the descriptor forms name them atime / mtime.
+      utimes: (path, atime, mtime) => natives.fsUtimes(toPath(path), ...pathTimes(atime, mtime)),
+      lutimes: (path, atime, mtime) => natives.fsLutimes(toPath(path), ...pathTimes(atime, mtime)),
       // lchmod diverges between the two modules, which is easy to get wrong.
       // In `node:fs` the name is bound to UNDEFINED off macOS. Here in
       // `fs/promises` it is ALWAYS a function, and off macOS it REJECTS.
@@ -10836,7 +10860,7 @@
       // and calling it rejects with a plain Error carrying only a `code` own
       // property -- name "Error", not a subclass.
       lchmod: (path, mode) => {
-        if (natives.platform === "darwin") return natives.fsLchmod(toPath(path), mode);
+        if (natives.platform === "darwin") return natives.fsLchmod(toPath(path), parseFileMode(mode, "mode"));
         const err = new Error("The lchmod() method is not implemented");
         err.code = "ERR_METHOD_NOT_IMPLEMENTED";
         return Promise.reject(err);
@@ -11006,9 +11030,7 @@
           // this way. Left unguarded so the resolve/reject shape matches.
           chown: async function (uid, gid) {
             guard("fchown");
-            validateInteger(uid, "uid", -1, kMaxUserId);
-            validateInteger(gid, "gid", -1, kMaxUserId);
-            await natives.fsFchown(h, uid, gid);
+            await natives.fsFchown(h, ...ownerArgs(uid, gid));
           },
           truncate: async function (len = 0) {
             guard("ftruncate");
@@ -11621,6 +11643,7 @@
     // realpathArg runs inside, so the callback is checked before the path.
     const realpathByPath = callbackify1((p) => realpathWalking(realpathArg(p)), 1);
     const truncateByPath = callbackify1(promises.truncate, 2);
+    const chmodByPath = callbackify1(promises.chmod, 2);
 
     // node's callback for fs.close(fd) without one: a failure is thrown.
     function defaultCloseCallback(err) {
@@ -11765,14 +11788,22 @@
       readlinkSync: (path) => natives.fsReadlinkSync(toPath(path)),
       linkSync: (existing, newPath) =>
         natives.fsLinkSync(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
-      chmodSync: (path, mode) => natives.fsChmodSync(toPath(path), mode),
-      // A descriptor is truncated through ftruncate, with node's DEP0081.
+      chmodSync: (path, mode) => natives.fsChmodSync(toPath(path), parseFileMode(mode, "mode")),
+      // A descriptor is truncated through ftruncate, with node's DEP0081. A
+      // path is opened "r+" and its descriptor ftruncated, as node's is: the
+      // open's error (ENOENT) comes before the length's, and a bad length
+      // leaves the file alone.
       truncateSync: (path, len) => {
         if (typeof path === "number") {
           warnTruncateFd();
           return fs.ftruncateSync(path, len);
         }
-        natives.fsTruncateSync(toPath(path), len ?? 0);
+        const fd = fs.openSync(path, "r+");
+        try {
+          fs.ftruncateSync(fd, len);
+        } finally {
+          fs.closeSync(fd);
+        }
       },
       // Classic synchronous fd ops. The native handle (a number) IS the fd.
       // graceful-fs / playwright probe locks via openSync(path,"r+") and rely
@@ -11908,14 +11939,30 @@
       symlink: callbackify1(promises.symlink, CB_LAST),
       readlink: callbackify1(promises.readlink, 1, 1),
       link: callbackify1(promises.link, 2),
-      chmod: callbackify1(promises.chmod, 2),
-      truncate: function (path, len, cb) {
-        if (typeof len === "function") { cb = len; len = 0; }
+      // node's chmod checks the path and the mode before the callback.
+      chmod: function chmod(path, mode, callback) {
+        const file = toPath(path);
+        mode = parseFileMode(mode, "mode");
+        validateCb(callback);
+        chmodByPath(file, mode, callback);
+      },
+      // node's order (lib/fs.js, v22.22.2): a descriptor goes to ftruncate;
+      // otherwise the length (an integer, a negative one 0), the callback,
+      // then the path, all at the call.
+      truncate: function truncate(path, len, cb) {
         if (typeof path === "number") {
           warnTruncateFd();
           return fs.ftruncate(path, len, cb);
         }
-        return truncateByPath(path, len, cb);
+        if (typeof len === "function") {
+          cb = len;
+          len = 0;
+        } else if (len === undefined) {
+          len = 0;
+        }
+        validateInteger(len, "len");
+        validateCb(cb);
+        return truncateByPath(path, Math.max(0, len), cb);
       },
       // opendir is the one whose callback node validates as "callback".
       opendir: callbackify1(promises.opendir, 1, 1, "callback"),
@@ -12169,8 +12216,7 @@
     };
     fs.fchmod = function fchmod(fd, mode, cb) { fchmodCb(cb, fd, parseFileMode(mode, "mode")); };
     fs.fchown = function fchown(fd, uid, gid, cb) {
-      validateInteger(uid, "uid", -1, kMaxUserId);
-      validateInteger(gid, "gid", -1, kMaxUserId);
+      ownerArgs(uid, gid);
       fchownCb(cb, fd, uid, gid);
     };
     fs.futimes = function futimes(fd, atime, mtime, cb) {
@@ -12192,8 +12238,7 @@
       natives.fsFchmodSync(fd, mode);
     };
     fs.fchownSync = function fchownSync(fd, uid, gid) {
-      validateInteger(uid, "uid", -1, kMaxUserId);
-      validateInteger(gid, "gid", -1, kMaxUserId);
+      ownerArgs(uid, gid);
       validateFd(fd, true);
       natives.fsFchownSync(fd, uid, gid);
     };
@@ -12208,25 +12253,27 @@
     //
     // The `l` forms act on a symlink itself rather than its target, which is
     // the only reason they exist.
-    fs.chown = voidCallbackOp((p, uid, gid) => natives.fsChown(toPath(p), uid, gid), 3);
-    fs.lchown = voidCallbackOp((p, uid, gid) => natives.fsLchown(toPath(p), uid, gid), 3);
-    fs.utimes = voidCallbackOp(
-      (p, atime, mtime) => natives.fsUtimes(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
-      3,
-    );
-    fs.lutimes = voidCallbackOp(
-      (p, atime, mtime) => natives.fsLutimes(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
-      3,
-    );
+    //
+    // node's order (lib/fs.js, v22.22.2), all of it thrown at the call: the
+    // callback, the path, then uid / gid or the two times. Only the
+    // operation's own failure reaches the callback.
+    const pathCallbackOp = (run, prepare) => {
+      const settle = voidCallbackOp(run, 3);
+      return function (path, a, b, cb) {
+        validateCb(cb);
+        const file = toPath(path);
+        settle(file, ...prepare(a, b), cb);
+      };
+    };
+    fs.chown = pathCallbackOp((p, uid, gid) => natives.fsChown(p, uid, gid), ownerArgs);
+    fs.lchown = pathCallbackOp((p, uid, gid) => natives.fsLchown(p, uid, gid), ownerArgs);
+    fs.utimes = pathCallbackOp((p, atime, mtime) => natives.fsUtimes(p, atime, mtime), pathTimes);
+    fs.lutimes = pathCallbackOp((p, atime, mtime) => natives.fsLutimes(p, atime, mtime), pathTimes);
 
-    fs.chownSync = (p, uid, gid) => { natives.fsChownSync(toPath(p), uid, gid); };
-    fs.lchownSync = (p, uid, gid) => { natives.fsLchownSync(toPath(p), uid, gid); };
-    fs.utimesSync = (p, atime, mtime) => {
-      natives.fsUtimesSync(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
-    };
-    fs.lutimesSync = (p, atime, mtime) => {
-      natives.fsLutimesSync(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
-    };
+    fs.chownSync = (p, uid, gid) => { natives.fsChownSync(toPath(p), ...ownerArgs(uid, gid)); };
+    fs.lchownSync = (p, uid, gid) => { natives.fsLchownSync(toPath(p), ...ownerArgs(uid, gid)); };
+    fs.utimesSync = (p, atime, mtime) => { natives.fsUtimesSync(toPath(p), ...pathTimes(atime, mtime)); };
+    fs.lutimesSync = (p, atime, mtime) => { natives.fsLutimesSync(toPath(p), ...pathTimes(atime, mtime)); };
 
     // lchmod is macOS-only. node gates its own on O_SYMLINK -- which the BSD
     // family has and Linux does not -- and OFF macOS it publishes the NAME with
@@ -12241,8 +12288,14 @@
     // what node gives. A throwing stub would link the same and then diverge on
     // the message.
     if (process.platform === "darwin") {
-      fs.lchmod = voidCallbackOp((p, mode) => natives.fsLchmod(toPath(p), mode), 2);
-      fs.lchmodSync = (p, mode) => { natives.fsLchmodSync(toPath(p), mode); };
+      // node's lchmod checks the callback, then the mode, then opens the path.
+      const lchmodRun = voidCallbackOp((p, mode) => natives.fsLchmod(p, mode), 2);
+      fs.lchmod = function lchmod(path, mode, cb) {
+        validateCb(cb);
+        mode = parseFileMode(mode, "mode");
+        lchmodRun(toPath(path), mode, cb);
+      };
+      fs.lchmodSync = (p, mode) => { natives.fsLchmodSync(toPath(p), parseFileMode(mode, "mode")); };
     } else {
       fs.lchmod = undefined;
       fs.lchmodSync = undefined;
