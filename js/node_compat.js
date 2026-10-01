@@ -31019,12 +31019,14 @@
     // A net.Socket with no connection yet and no connect in flight (node:
     // `!socket._handle`), which a TLSSocket over it waits on: it is
     // `connecting` until that socket's 'connect' (node's _init), and its
-    // handshake starts then. Only oam's own net.Socket -- not a TLSSocket,
-    // whose handle lives elsewhere, nor an http client's stand-in, which
-    // holds a native connection in place of a handle.
+    // handshake starts then. Only oam's own net.Socket over TCP -- not a
+    // TLSSocket or a JSStreamSocket (a net.Socket over a JS stream, which
+    // is open from the start), whose handles are not TCP ones, nor an http
+    // client's stand-in, which holds a native connection in place of one.
     function awaitsConnect(wrap) {
       var NetSocket = registry.get("net").Socket;
       return Object.prototype.isPrototypeOf.call(NetSocket.prototype, wrap) &&
+        wrap[registry._netNotTcpHandle] !== true &&
         wrap._handle === null && !wrap.connecting &&
         wrap[registry._netNativeConnection] === undefined;
     }
