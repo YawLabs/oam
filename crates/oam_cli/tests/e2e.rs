@@ -26585,6 +26585,54 @@ fn socket_write_signals_backpressure_and_drains() {
     );
 }
 
+/// #156: a connect() retried on a socket its failed connect destroyed (from
+/// the 'error' listener, node's reconnect pattern) must not hold what is
+/// issued after it. oam does not revive a destroyed socket, so that connect
+/// settles without releasing anything; the end() behind it was held for
+/// good -- its callback never ran and the socket's internal `_chain`, which
+/// IPC waits on, never settled. Not a conformance case: node revives the
+/// socket instead, and in this exact shape loses the end() callback itself.
+#[test]
+fn net_end_after_connect_on_a_destroyed_socket_calls_back() {
+    let stdout = run_ok(
+        "net_end_after_reconnect.mjs",
+        "import net from 'node:net';\n\
+         const probe = net.createServer();\n\
+         await new Promise((r) => probe.listen(0, '127.0.0.1', r));\n\
+         const refused = probe.address().port;\n\
+         await new Promise((r) => probe.close(r));\n\
+         const server = net.createServer((s) => { s.on('error', () => {}); s.resume(); });\n\
+         await new Promise((r) => server.listen(0, '127.0.0.1', r));\n\
+         const sock = net.connect(refused, '127.0.0.1');\n\
+         let retried = false;\n\
+         const outcome = await new Promise((resolve) => {\n\
+           const t = setTimeout(() => resolve('end callback never called'), 5000);\n\
+           sock.on('error', () => {\n\
+             if (retried) return;\n\
+             retried = true;\n\
+             sock.connect(server.address().port, '127.0.0.1');\n\
+             sock.end((e) => { clearTimeout(t); resolve(`end callback ${e instanceof Error}`); });\n\
+           });\n\
+         });\n\
+         console.log(outcome);\n\
+         let t2;\n\
+         console.log(await Promise.race([\n\
+           sock._chain.then(() => 'chain settled'),\n\
+           new Promise((r) => { t2 = setTimeout(() => r('chain stuck'), 5000); }),\n\
+         ]));\n\
+         clearTimeout(t2);\n\
+         server.close();",
+    );
+    assert!(
+        stdout.contains("end callback true"),
+        "end(cb) after a connect() on a destroyed socket must call back with an error: {stdout}"
+    );
+    assert!(
+        stdout.contains("chain settled"),
+        "the socket's op chain must settle: {stdout}"
+    );
+}
+
 /// #156: `socket.write(data); socket.end()` in one callback sends the FIN
 /// right behind the data -- seen from a NODE client, which is who failed
 /// against an oam server (`UND_ERR_SOCKET` on keep-alive fetches racing the

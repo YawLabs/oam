@@ -22903,8 +22903,12 @@
         // connection exists: _issue() holds their native halves from here
         // on, and _releaseHeldOps() hands them over once the connect
         // settles -- or once the socket is destroyed while its name is
-        // still being looked up.
-        if (this._heldOps === null) this._heldOps = [];
+        // still being looked up. Not on a socket already destroyed (a
+        // connect() retried from its 'error' listener): destroy() has run
+        // and returns early from now on, and a destroyed socket's connect
+        // settles without releasing anything, so a held end() would never
+        // call back. Its ops start at once and fail as a closed socket's.
+        if (this._heldOps === null && !this.destroyed) this._heldOps = [];
         const dial = (spec, local) => {
           // lookupAndConnect has validated the port by the time it dials.
           const port = options.port | 0;
