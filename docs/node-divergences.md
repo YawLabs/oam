@@ -1065,7 +1065,8 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   a `stream.Duplex` here, so `netSocket instanceof stream.Duplex` is false where Node says
   true.
 - **Node members absent from both classes**, which the mechanical walk cannot see by
-  construction: `destroySoon` and `resetAndDestroy`. `net.Socket` has had `read()`,
+  construction: `destroySoon`. (`resetAndDestroy` is on both now, the same function as in
+  Node -- entry 46.) `net.Socket` has had `read()`,
   `'readable'` and `push()` since 0.16.3 (below); a `TLSSocket`, being a Duplex, always had
   `read`.
 - **A bare `connect()` handshakes.** `new tls.TLSSocket(null, opts).connect(port, host)` runs
@@ -2217,6 +2218,33 @@ oam's shared client. What differs:
 _(probed)_ Node v22.22.2 vs oam on Windows: lookup and createConnection guards over h2c, and
 a node-hosted `createSecureServer` for `ca`, `servername`, a refusing lookup, an untrusted
 certificate and `rejectUnauthorized: false`, line for line identical.
+
+### 46. `socket.resetAndDestroy()` while `end()` is shutting the socket down
+
+`resetAndDestroy()` is Node's otherwise: SO_LINGER 0 and a close, so the peer's read fails
+with `read ECONNRESET` and nothing unsent is delivered; the socket returned, destroyed at
+once, its own `'close'` with `false`; reset once it connects when still connecting;
+`ERR_SOCKET_CLOSED` without a handle; `ERR_INVALID_HANDLE_TYPE` thrown on a `TLSSocket` or a
+pipe (`conformance/cases/252-net-reset-and-destroy.mjs`, `253-net-reset-and-destroy-edges.mjs`).
+What differs is the window where libuv refuses the reset: after `end()` has handed its FIN to
+the socket and before its shutdown callback (`'finish'`) has run.
+
+- **After the refusal oam closes the socket; Node leaves it open.** Both emit `'error'`
+  (`reset EINVAL`, `syscall: 'reset'`) inside the call. Node then never emits `'close'`:
+  libuv returns before closing the handle, `_destroy` drops its reference anyway, and the
+  open TCP handle keeps the process alive for good (measured on v22.22.2, Windows: the
+  process does not exit). oam closes the connection the orderly way -- its FIN is already out
+  -- and emits `'close'` with `true`.
+- **The window opens and closes at different moments.** oam's end() hands the FIN to the
+  socket in the same turn when no write is still queued (#156), and emits `'finish'` a few
+  microtasks later; Node's `'finish'` waits for the next loop turn. So
+  `socket.end(); process.nextTick(() => socket.resetAndDestroy())` is refused with EINVAL on
+  Node and resets (RST after the FIN) on oam. Measured on Windows, where Node's writes complete
+  in the call and every `end()` on a connected socket opens the window at once, as oam's does
+  (`write(); end(); resetAndDestroy()` is EINVAL on both). On Linux and macOS Node defers the
+  shutdown behind a write that has not called back yet, where oam has sent the FIN once the
+  write was taken whole -- not measured there. An `end()` whose FIN is still queued behind a
+  write the peer is not draining is reset on both, the FIN never sent.
 
 ### `err.syscall` on `fs.realpath` and `fs.opendir`
 
