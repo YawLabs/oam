@@ -834,7 +834,6 @@
   codes.ERR_SOCKET_BAD_TYPE = E("ERR_SOCKET_BAD_TYPE", TypeError, function() {
     return 'Bad socket type specified. Valid types are: udp4, udp6';
   });
-  codes.ERR_SOCKET_CLOSED = E("ERR_SOCKET_CLOSED", Error, 'Socket is closed');
   // node's text, which speaks of sending a handle (child_process) wherever
   // the error is raised -- resetAndDestroy() on a non-TCP socket included.
   codes.ERR_INVALID_HANDLE_TYPE = E("ERR_INVALID_HANDLE_TYPE", TypeError, 'This handle type cannot be sent');
