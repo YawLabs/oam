@@ -1504,10 +1504,13 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   `'error'` rejects with `TypeError: fetch failed`, cause `unexpected redirect`, on a 301,
   302, 303, 307 or 308 with or without a `Location`; a value outside the enum is refused
   with Node's `Request constructor: ... is not an accepted type` message. Up to 0.16.2 every
-  redirect was followed whatever the option said. `Response.type` is not implemented.
-- **A `Location` that does not parse** fails the fetch with a plain `Error('Invalid URL')` as
-  the `cause` (own keys `stack`, `message`); Node's is a `TypeError` with `code`
-  `ERR_INVALID_URL`, `input` and `base`. Case 111 prints only the message.
+  redirect was followed whatever the option said. `response.type` is `'basic'` under every
+  mode, as in Node, and `'default'` for a constructed `Response` (case 208); up to 0.17.1 it
+  was `undefined`. `Response.error()` and `Response.redirect()` are not implemented.
+- **A `Location` that does not parse** fails the fetch with Node's `cause` (case 208): a
+  `TypeError('Invalid URL')` with `code` `ERR_INVALID_URL`, `input` (the `Location`, read as
+  UTF-8) and `base` (the URL that answered, with the fragment the request URL carried). Up
+  to 0.17.1 the cause was a plain `Error('Invalid URL')`.
 - **`http.request` on this transport returns a `3xx` as the response**, as Node's does (it
   asks the transport for `'manual'`); up to 0.16.2 it followed redirects by `fetch`'s rules.
   It also decodes the body, as `fetch` does (entry 32). Node's `http.request` does not, and
@@ -1598,7 +1601,7 @@ an error where oam used to send something)
   nothing reaches the wire. `http.request` and `https.request` still turn userinfo into
   Basic credentials, because there it IS Node's documented `auth` option.
 - A URL that does not parse throws Node's `TypeError: Failed to parse URL from <input>` with
-  a `TypeError` cause carrying `code` `ERR_INVALID_URL`; a non-`http(s)` scheme rejects with
+  a `TypeError` cause carrying `code` `ERR_INVALID_URL` and `input`; a non-`http(s)` scheme rejects with
   the cause `Error: unknown scheme`. Both used to be `TypeError: fetch failed` with the cause
   `Error: builder error`, which named neither.
 - A `Request` object as the first argument is NOT a supported input (it never was): the

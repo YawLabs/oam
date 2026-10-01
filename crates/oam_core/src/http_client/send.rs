@@ -88,7 +88,8 @@ pub struct FetchRequest {
     /// checked either way (redirect::next).
     #[serde(default)]
     pub fetch_semantics: bool,
-    /// #149's knob; JS does not send it yet.
+    /// fetch's `redirect` option ("manual" also for `http.request`, which
+    /// never follows). Absent: follow.
     #[serde(default)]
     pub redirect: RedirectMode,
     /// #148's knob: false delivers the body as received and keeps the
@@ -611,6 +612,16 @@ async fn run(
             Next::Fail(text) => {
                 state.source.request_failed();
                 return OpOutcome::Failed(text.to_string());
+            }
+            // Not a rejection of the op: the cause is the error node's
+            // `new URL(location, base)` throws, which carries both strings,
+            // and JS builds it from this payload (bootstrap.js settleRaw).
+            Next::InvalidLocation { input } => {
+                state.source.request_failed();
+                let payload = serde_json::json!({
+                    "invalidLocation": { "input": input, "base": state.current.as_str() },
+                });
+                return OpOutcome::Json(payload.to_string());
             }
             Next::Follow {
                 url,

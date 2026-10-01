@@ -15,9 +15,9 @@
 // cross-origin one, and port 1 dialled.
 //
 // Not printed: user-agent / accept-encoding / accept-language /
-// sec-fetch-mode / connection (oam's defaults are its own), statusText (oam
-// reports the canonical reason), and the class of an "Invalid URL" cause
-// (node: TypeError ERR_INVALID_URL; oam: Error -- a documented divergence).
+// sec-fetch-mode / connection (oam's defaults are its own) and statusText
+// (oam reports the canonical reason). The shape of an "Invalid URL" cause
+// (node's ERR_INVALID_URL TypeError) is case 208's.
 import http from "node:http";
 
 function listen(handler) {
@@ -109,10 +109,8 @@ async function show(label, url, init) {
     console.log(label, res.status, res.redirected, P(res.url), JSON.stringify(text));
   } catch (e) {
     const c = e.cause;
-    // An "Invalid URL" cause is node's ERR_INVALID_URL (code, input, base);
-    // only its message is compared.
-    const keys = c?.message === "Invalid URL" ? "" : JSON.stringify(c && Object.keys(c));
-    console.log(label, e.constructor.name, e.message, "cause:", P(c?.message), keys);
+    // An "Invalid URL" cause is node's ERR_INVALID_URL: code, input, base.
+    console.log(label, e.constructor.name, e.message, "cause:", P(c?.message), JSON.stringify(c && Object.keys(c)));
   }
 }
 

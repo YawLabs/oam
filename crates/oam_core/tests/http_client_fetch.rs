@@ -19,7 +19,7 @@ use common::*;
 use hyper_util::client::proxy::matcher::Matcher;
 use oam_core::http_client::body::{self, BODY_READ_FAILED, FetchBodies};
 use oam_core::http_client::decode::OUT_CAP;
-use oam_core::http_client::redirect::{BAD_SCHEME, CREDENTIALS, INVALID_URL};
+use oam_core::http_client::redirect::{BAD_SCHEME, CREDENTIALS};
 use oam_core::http_client::send::{self, FetchContinuations, FetchRequest};
 use oam_core::http_client::{HttpTransport, NetCheck, NetTarget, ProxySource};
 use oam_core::{AccessDenial, BodyCancelSignal, CancelledBodies, OpOutcome, OutboundBodies};
@@ -1007,11 +1007,15 @@ async fn invalid_and_non_http_locations() {
         port.store(server.port, Ordering::SeqCst);
         let reg = Reg::new();
         let t = plain();
-        for (path, want) in [
-            ("invalid", INVALID_URL),
-            ("ftp", BAD_SCHEME),
-            ("credentials", CREDENTIALS),
-        ] {
+        // An unparseable Location is not a rejection but a payload: the two
+        // strings of node's `new URL(location, base)` error, which JS builds.
+        // The base is the URL that answered, fragment included.
+        let url = format!("http://127.0.0.1:{}/invalid#frag", server.port);
+        assert_eq!(
+            payload(reg.fetch(&t, json!({ "url": url })).await),
+            json!({ "invalidLocation": { "input": "http://[::1", "base": url } })
+        );
+        for (path, want) in [("ftp", BAD_SCHEME), ("credentials", CREDENTIALS)] {
             let url = format!("http://127.0.0.1:{}/{path}", server.port);
             assert_eq!(failed(reg.fetch(&t, json!({ "url": url })).await), want);
         }
@@ -1741,7 +1745,7 @@ async fn outbound_entry_lifecycle() {
             drop(sender);
         };
         let (outcome, ()) = tokio::join!(fetch, ender);
-        assert_eq!(failed(outcome), INVALID_URL);
+        assert!(payload(outcome)["invalidLocation"].is_object());
         assert_eq!(reg.entry(handle), None);
     })
     .await;

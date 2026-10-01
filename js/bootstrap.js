@@ -484,6 +484,11 @@
     get body() {
       return this._body;
     }
+    // A constructed response is "default"; one fetch() returned is "basic"
+    // (makeResponse).
+    get type() {
+      return "default";
+    }
     async text() {
       if (typeof this._body === "string") return this._body;
       if (this._body === null) return "";
@@ -1011,6 +1016,11 @@
     }
 
     return {
+      // node's fetch never produces a filtered response other than "basic":
+      // it is the type under every `redirect` mode, a 3xx returned by
+      // "manual" included (measured on v22.22.2; browsers answer
+      // "opaqueredirect" there).
+      type: "basic",
       status: raw.status,
       statusText: raw.statusText,
       ok: raw.status >= 200 && raw.status <= 299,
@@ -1332,6 +1342,19 @@
         throw fetchFailed(e);
       }
     }
+    // A redirect whose Location does not parse: node's cause is the error
+    // `new URL(location, currentURL)` throws there -- a TypeError with `code`,
+    // `input` and `base`, in that order (measured on v22.22.2) -- and the op
+    // hands both strings up so it can be built here. Not through `new URL`:
+    // the op has already decided the Location does not parse, by the parser
+    // it follows redirects with.
+    if (raw && raw.invalidLocation) {
+      const cause = new TypeError("Invalid URL");
+      cause.code = "ERR_INVALID_URL";
+      cause.input = raw.invalidLocation.input;
+      cause.base = raw.invalidLocation.base;
+      throw new TypeError("fetch failed", { cause });
+    }
     return raw;
   }
 
@@ -1456,8 +1479,11 @@
       try {
         parsed = new URL(rawUrl);
       } catch {
+        // node's ERR_INVALID_URL carries the text that did not parse (and
+        // no `base`, as none was given).
         const cause = new TypeError("Invalid URL");
         cause.code = "ERR_INVALID_URL";
+        cause.input = rawUrl;
         throw new TypeError(`Failed to parse URL from ${rawUrl}`, { cause });
       }
       // node: `TypeError: Request cannot be constructed from a URL that
