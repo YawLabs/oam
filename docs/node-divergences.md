@@ -948,11 +948,6 @@ _(probed)_ Node v22.22.2 vs oam on Windows, a raw-socket server sending
 
 What else still differs:
 
-- **The request header.** oam sends `accept-encoding: gzip,deflate` on every request. Node's
-  `fetch` sends `gzip, deflate` over http and `br, gzip, deflate` over https (measured;
-  undici `fetch/index.js` 1517-1522). The missing space does not matter to an RFC 9110
-  parser, but over https oam does not offer brotli, so a server that honours the header
-  sends gzip to oam and br to Node. oam decodes a `br` body a server sends anyway.
 - **A corrupt body.** Reading a body that fails to decode rejects with a plain `Error`,
   `fetch: body read failed: error decoding response body`, with no `cause`. Node fails the
   read with `TypeError: terminated`, and the zlib error as the `cause` (for example
@@ -1572,28 +1567,32 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   says, where Node neither cancels it nor stops pulling it.
 - **`Request` options oam keeps but does not act on.** `mode`, `credentials`, `cache`,
   `integrity`, `keepalive`, `referrer` and `referrerPolicy` are validated and read back as in
-  Node (#180), but three of them change what Node's `fetch` does and not what oam's does:
-  `cache: 'no-store'` / `'reload'` add `pragma: no-cache` and `cache-control: no-cache`, and
-  `'no-cache'` adds `cache-control: max-age=0`; an `integrity` value is checked against the
-  response body (a mismatch fails the fetch with cause `integrity mismatch`) where oam
-  ignores it; and a `referrer` URL is sent as `referer`, cut down by the referrer policy
-  (Node sends `http://b.test/` for a cross-origin `http://b.test/x?y`, the full URL for a
-  same-origin one or under `unsafe-url`). `credentials`, `keepalive` and `mode` change
-  nothing in either, apart from `sec-fetch-mode` (below). `mode: 'no-cors'` does not drop
+  Node (#180), and `mode` and `cache` shape the request headers as they do in Node (#178).
+  Two change what Node's `fetch` does and not what oam's does: an `integrity` value is
+  checked against the response body (a mismatch fails the fetch with cause
+  `integrity mismatch`) where oam ignores it; and a `referrer` URL is sent as `referer`, cut
+  down by the referrer policy (Node sends `http://b.test/` for a cross-origin
+  `http://b.test/x?y`, the full URL for a same-origin one or under `unsafe-url`).
+  `credentials` and `keepalive` change nothing in either. `mode: 'no-cors'` does not drop
   headers in either runtime.
 - **The request header count is capped.** More than 24,576 distinct header names (fewer if
   the header table's hash-flooding defence rebuilds it) fails with
   `fetch: too many request headers`; Node has no cap (25,000 distinct names get a 200).
-- **Six request-header shapes still differ from Node's `fetch`** -- measured against a
+- **Two request-header shapes still differ from Node's `fetch`** -- measured against a
   raw-socket server, with everything else on the request line and in the header block
-  identical. oam does not send `connection: keep-alive`, `accept-language: *` or
-  `sec-fetch-mode: cors`; it writes `accept-encoding: gzip,deflate` where Node writes
-  `gzip, deflate`; it does not add `content-length: 0` for a body-less or empty-bodied
-  `POST`; and its header ORDER differs (oam ends with `host`, Node begins with it). What now
-  matches, and used to not: a caller `host` header is dropped (Node's one silent drop), a
-  string body gets `content-type: text/plain;charset=UTF-8`, repeated names are combined into
-  one comma-joined line, and a method is uppercased only when it is one of `DELETE`, `GET`,
+  identical. The ORDER differs (oam ends with `host`, Node begins with it; hyper places it),
+  and a streamed body that ends without a chunk goes out chunked, where undici, which holds
+  the head until the first chunk, sends `content-length: 0`. `user-agent` is `oam/<version>`
+  by design. What now matches, and used to not: `connection: keep-alive`,
+  `accept-language: *` and `sec-fetch-mode` (the request's mode) on every fetch,
+  `accept-encoding: gzip, deflate` over http and `br, gzip, deflate` over https,
+  `content-length: 0` on a `POST`, `PUT`, `PATCH`, `QUERY`, `PROPFIND` or `PROPPATCH` with no
+  body or an empty one, the `cache` mode's `pragma` / `cache-control` (#178); a caller `host`
+  header is dropped (Node's one silent drop), a string body gets
+  `content-type: text/plain;charset=UTF-8`, repeated names are combined into one
+  comma-joined line, and a method is uppercased only when it is one of `DELETE`, `GET`,
   `HEAD`, `OPTIONS`, `POST`, `PUT` -- `{method: 'patch'}` goes out as `patch`, as in Node.
+  Over HTTP/2 (below) the transport drops `connection`, which h2 does not have.
 - **`fetch` negotiates HTTP/2 with an https origin; Node's `fetch` does not.** oam's origin
   TLS handshake offers ALPN `h2, http/1.1` and speaks h2 to a server that selects it.
   undici's `Client` defaults `allowH2` to `false` and Node's global dispatcher never turns it

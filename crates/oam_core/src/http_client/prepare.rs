@@ -42,10 +42,10 @@ use percent_encoding::percent_decode_str;
 /// parses the suffix (node_compat.js keys on "error sending request" only).
 pub const BUILDER_ERROR: &str = "builder error";
 
-/// `accept-encoding` as oam has always advertised it. Node's fetch sends
-/// `gzip, deflate` over http and `br, gzip, deflate` over https (undici
-/// fetch/index.js:1517-1522); matching that is a separate decision from owning
-/// the transport, so the value on the wire does not move here.
+/// `accept-encoding` as oam has always advertised it, for a request that
+/// names none. `fetch` names its own -- undici's `gzip, deflate` over http and
+/// `br, gzip, deflate` over https (fetch/index.js:1517-1522, #178) -- in
+/// bootstrap.js, so this default reaches only the callers that are not fetch.
 pub const DEFAULT_ACCEPT_ENCODING: &str = "gzip,deflate";
 
 /// A request ready for the transport.

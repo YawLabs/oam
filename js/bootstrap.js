@@ -2251,6 +2251,9 @@
       signal: state.signal,
       redirect: state.redirect,
       dispatcher: state.dispatcher,
+      // Read by fetchDefaultHeaders.
+      mode: state.mode,
+      cache: state.cache,
     };
     const body = bodyStates.get(request) ?? null;
     if (body !== null) {
@@ -2269,6 +2272,48 @@
       if (key.startsWith("__oam")) flat[key] = init[key];
     }
     return { url: state.url, init: flat };
+  }
+
+  // The request headers undici's fetch adds of its own (fetch/index.js
+  // httpNetworkOrCacheFetch, and core/request.js for the length), each only
+  // when the caller did not set it -- bar `sec-fetch-mode`, which is always
+  // the request's mode (#178). Measured on node v22.22.2 against a raw
+  // socket. Fetch only: http.request and undici.request send none of them.
+  // Where `host` goes and oam's `user-agent` are left as they are.
+  const PAYLOAD_METHODS = new Set(["POST", "PUT", "PATCH", "QUERY", "PROPFIND", "PROPPATCH"]);
+  function fetchDefaultHeaders(headers, request, init, upload) {
+    const has = (name) => headers.some((h) => h[0].toLowerCase() === name);
+    const add = (name, value) => {
+      if (!has(name)) headers.push([name, value]);
+    };
+    // A caller's `connection` (close or keep-alive, lowercased by
+    // dispatchHeader) wins; node writes its own right after `host`.
+    if (!has("connection")) headers.unshift(["connection", "keep-alive"]);
+    add("accept", "*/*");
+    add("accept-language", "*");
+    const mode = headers.findIndex((h) => h[0].toLowerCase() === "sec-fetch-mode");
+    if (mode !== -1) headers.splice(mode, 1);
+    headers.push(["sec-fetch-mode", init.mode ?? "cors"]);
+    if (init.cache === "no-store" || init.cache === "reload") {
+      add("pragma", "no-cache");
+      add("cache-control", "no-cache");
+    } else if (init.cache === "no-cache") {
+      add("cache-control", "max-age=0");
+    }
+    // undici's own list, per scheme: oam decodes br as well (#151).
+    add("accept-encoding", /^https:/i.test(request.url) ? "br, gzip, deflate" : "gzip, deflate");
+    // A request whose method carries a payload says it carries none: no
+    // body, or one whose length is 0 (a stream's length is not known).
+    // undici compares the method as written, so `patch` gets none.
+    if (PAYLOAD_METHODS.has(request.method) && upload === null) {
+      const empty =
+        request.body_base64 !== undefined
+          ? request.body_base64 === ""
+          : request.body !== undefined
+            ? request.body === ""
+            : request.body_stream === undefined;
+      if (empty) add("content-length", "0");
+    }
   }
 
   async function oamFetch(input, init, rawPayload) {
@@ -2464,6 +2509,7 @@
         headers.push(["content-type", impliedType]);
       }
     }
+    if (fetchSemantics) fetchDefaultHeaders(headers, request, init, upload);
     // A caller `content-length` that disagrees with the body is refused, not
     // framed. hyper writes exactly the declared length, so a short one
     // SILENTLY TRUNCATED the body and still returned 200 -- data loss, and

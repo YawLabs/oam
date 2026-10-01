@@ -8188,6 +8188,52 @@ server.close();
     }
 }
 
+/// fetch's default request headers over https (#178): undici's
+/// `accept-encoding` there is `br, gzip, deflate` (oam decodes br since
+/// #151), and the rest of its defaults go out as over http. Against an
+/// HTTP/1.1 server, and against an h2 server, which oam's fetch negotiates
+/// (node's does not): there the `connection` default must not break the
+/// request -- HTTP/2 has no such header, and the transport drops it.
+#[test]
+fn fetch_https_sends_undici_default_headers() {
+    let bundle = write_temp("fetch-https-defaults/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import https from 'node:https';
+import http2 from 'node:http2';
+const names = ['accept-encoding', 'accept-language', 'sec-fetch-mode', 'connection', 'content-length'];
+const echo = (req, res) => res.end(req.httpVersion + ' ' + names.map((n) => n + '=' + (req.headers[n] ?? '-')).join(' '));
+const h1 = https.createServer({ cert: `__CERT__`, key: `__KEY__` }, echo);
+const h2 = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__`, allowHTTP1: true }, echo);
+// fetch's pool keeps its h2 session open, and an http2 server's close()
+// waits for every session: end them, so the run can exit.
+const sessions = new Set();
+h2.on('session', (session) => sessions.add(session));
+for (const [label, server] of [['h1', h1], ['h2', h2]]) {
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `https://localhost:${server.address().port}/`;
+  console.log(label, 'GET', await (await fetch(url)).text());
+  console.log(label, 'POST', await (await fetch(url, { method: 'POST' })).text());
+  server.close();
+}
+for (const session of sessions) session.destroy();
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("fetch_https_defaults/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "h1 GET 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=-\n\
+         h1 POST 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=0\n\
+         h2 GET 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=-\n\
+         h2 POST 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=0",
+        "stderr: {stderr}"
+    );
+}
+
 /// A server-sent-events body compressed with gzip and sync-flushed per event
 /// reaches JavaScript event by event: each flushed unit decodes as soon as it
 /// arrives, instead of waiting for the next unit or the end of the stream.
