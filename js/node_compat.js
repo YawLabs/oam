@@ -11254,8 +11254,14 @@
           fsReqEnd(token);
           throw e;
         }
+        // node's FSReqCallback::Resolve passes the value only when there is
+        // one: an operation with no result (chmod, rename, unlink, ...) calls
+        // back with the single argument null, not (null, undefined).
         p.then(
-          (value) => { fsReqEnd(token); queueMicrotask(() => cb(null, value)); },
+          (value) => {
+            fsReqEnd(token);
+            queueMicrotask(() => (value === undefined ? cb(null) : cb(null, value)));
+          },
           (err) => { fsReqEnd(token); queueMicrotask(() => cb(err)); },
         );
       };
