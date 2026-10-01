@@ -1578,8 +1578,16 @@ generator as `[object AsyncGenerator]`. What differs:
   too), and sending it any other way would put the wrong bytes on the wire.
 - **The connection is made with the first chunk.** undici connects first and writes the head
   with the first chunk; oam dispatches the request (DNS, connect, TLS) once the first chunk
-  is there, so a body whose first chunk is slow pays the connect after it. Nothing differs
-  on the wire.
+  is there, so a body whose first chunk is slow pays the connect after it.
+- **When a stream's framing is decided.** undici frames a Readable when it dispatches the
+  request: an ended byte stream goes with `content-length`, an open one chunked. On a
+  reused connection that is after the immediates already queued; on a fresh one, after the
+  connect. oam decides one immediate after `request()` in both cases, so a stream that ends
+  in that turn of the event loop -- synchronously, on a tick, a microtask or a queued
+  immediate -- is framed as in Node (pinned by
+  `undici_request_frames_a_stream_when_it_dispatches`, e2e), and one that ends while a fresh
+  connection is still being made (a `setTimeout(0)` on loopback, measured) goes with
+  `content-length` in Node and chunked in oam.
 - **An early response stops the upload once its body is read.** undici stops a body still
   going out the moment the whole response has arrived, read or not; oam reads a response
   body only as it is consumed (see `bodyTimeout` below), so the upload stops when the

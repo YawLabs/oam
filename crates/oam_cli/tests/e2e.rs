@@ -5661,6 +5661,94 @@ cl-late-end-silent finalized=false"##;
     );
 }
 
+/// A Readable `undici.request` body is framed when the request is
+/// dispatched, not when `request()` is called: undici asks
+/// `util.bodyLength` then, so a stream that ends in the same turn of the
+/// event loop -- on a tick, a microtask or a queued immediate -- goes out
+/// with `content-length`, one still open goes chunked, and a declared length
+/// the ended stream disagrees with is refused before anything is sent, the
+/// stream destroyed with the error. Up to this fix oam decided at the call,
+/// so such a stream went chunked, which a server that refuses chunked
+/// uploads (`411 Length Required`) turns away. The expected output is node
+/// v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_request_frames_a_stream_when_it_dispatches() {
+    let script = write_temp(
+        "undici_request_frames_a_stream_when_it_dispatches/main.mjs",
+        r##"// A Readable body that ends after request() is called but in the same turn
+// of the event loop is framed with content-length, as undici frames it when
+// it dispatches the request; one that ends later goes chunked.
+import net from 'node:net';
+import { PassThrough } from 'node:stream';
+import { request } from 'undici';
+
+const seen = [];
+const server = net.createServer((s) => {
+  s.on('error', () => {});
+  let buf = '';
+  s.on('data', (d) => {
+    const first = buf === '';
+    buf += d.toString('latin1');
+    if (!first) return;
+    seen.push(buf.split('\r\n').filter((l) => /^(content-length|transfer-encoding)/i.test(l)).join('|') || 'none');
+    setTimeout(() => s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok'), 50);
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+const cases = [
+  ['ended-sync', () => { const p = new PassThrough(); p.end('abc'); return p; }],
+  ['ended-next-tick', () => { const p = new PassThrough(); process.nextTick(() => p.end('abc')); return p; }],
+  ['ended-microtask', () => { const p = new PassThrough(); queueMicrotask(() => p.end('abc')); return p; }],
+  ['ended-immediate', () => { const p = new PassThrough(); setImmediate(() => p.end('abc')); return p; }],
+  ['written-then-ended-next-tick', () => { const p = new PassThrough(); p.write('ab'); process.nextTick(() => p.end('c')); return p; }],
+  ['ended-later', () => { const p = new PassThrough(); p.write('ab'); setTimeout(() => p.end('c'), 100); return p; }],
+  ['empty-next-tick', () => { const p = new PassThrough(); process.nextTick(() => p.end()); return p; }],
+];
+for (const [label, mk] of cases) {
+  const before = seen.length;
+  try {
+    const r = await request(url, { method: 'PUT', body: mk() });
+    await r.body.text();
+    console.log(label, r.statusCode, seen.length > before ? seen.at(-1) : 'nothing sent');
+  } catch (e) {
+    console.log(label, 'rejected', e.name, e.code);
+  }
+}
+// A declared length the ended stream disagrees with.
+{
+  const p = new PassThrough();
+  process.nextTick(() => p.end('abc'));
+  const before = seen.length;
+  try {
+    const r = await request(url, { method: 'PUT', body: p, headers: { 'content-length': '5' } });
+    await r.body.text();
+    console.log('declared-mismatch', r.statusCode);
+  } catch (e) {
+    await new Promise((r) => setTimeout(r, 100));
+    console.log('declared-mismatch rejected', e.name, e.code, 'sent', seen.length > before, 'destroyed', p.destroyed);
+  }
+}
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"ended-sync 200 content-length: 3
+ended-next-tick 200 content-length: 3
+ended-microtask 200 content-length: 3
+ended-immediate 200 content-length: 3
+written-then-ended-next-tick 200 content-length: 3
+ended-later 200 transfer-encoding: chunked
+empty-next-tick 200 content-length: 0
+declared-mismatch rejected RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH sent false destroyed true"##;
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
 /// `undici.request` rejects with the error itself, as undici's does, never
 /// with fetch's `TypeError: fetch failed`: an oversized response head is
 /// `HeadersOverflowError` (`UND_ERR_HEADERS_OVERFLOW`), counted as undici

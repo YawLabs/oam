@@ -508,22 +508,41 @@
     // a response whose body is over first (request() runs the stop): the
     // stream is destroyed, the iterator returned, and the channel cancelled,
     // which closes the connection.
+    //
+    // A stream's framing is undici's util.bodyLength, asked when undici
+    // dispatches the request, not when request() is called: an ended byte
+    // stream goes out with its buffered length, anything else chunked (or
+    // under the caller's content-length). undici dispatches on a reused
+    // connection after the immediates already queued, and on a fresh one
+    // after the connect, so a stream that ends in the same turn of the event
+    // loop -- synchronously, on a tick, a microtask or a queued immediate --
+    // gets content-length (measured on node v22.22.2 + undici 6.29.0). oam
+    // asks at that same point, one immediate on, before it reads the stream.
     function sendStreamed(url, init, body, stream, declared, expectsPayload, controller) {
       const signal = controller.signal;
       const ops = G.__oam.node;
       let length = declared;
       if (stream) {
-        // undici's util.bodyLength: an ended byte stream's buffered length.
-        if (typeof body.read === "function") body.read(0);
-        const state = body._readableState;
-        if (state && state.objectMode === false && state.ended === true && Number.isFinite(state.length)) {
-          length = state.length;
+        // undici's Request keeps an 'error' listener on its body for good,
+        // so an error after the request is over -- or a refusal before the
+        // body is read -- is not an uncaught one.
+        body.on("error", () => {});
+      }
+      const frame = () => {
+        if (stream) {
+          // undici's util.bodyLength: an ended byte stream's buffered length.
+          if (typeof body.read === "function") body.read(0);
+          const state = body._readableState;
+          if (state && state.objectMode === false && state.ended === true && Number.isFinite(state.length)) {
+            length = state.length;
+          }
         }
-      }
-      if (length === 0 && !expectsPayload) length = null;
-      if (!NO_CONTENT_LENGTH.has(init.method) && length > 0 && declared !== null && declared !== length) {
-        throw mismatch();
-      }
+        if (length === 0 && !expectsPayload) length = null;
+        if (!NO_CONTENT_LENGTH.has(init.method) && length > 0 && declared !== null && declared !== length) {
+          return mismatch();
+        }
+        return null;
+      };
       return new Promise((resolve, reject) => {
         let channel = null;
         let started = false;
@@ -585,8 +604,9 @@
           else tail.then(close, close);
         };
         // The body is over: ended (`err` null), failed with `err`, or
-        // stopped because the request is over (`quiet`).
-        let stop = () => {};
+        // stopped because the request is over (`quiet`). A stream not read
+        // yet is destroyed as undici destroys it.
+        let stop = stream ? (err) => destroyStream(body, err) : () => {};
         const finish = (err, quiet) => {
           if (over) return;
           over = true;
@@ -614,8 +634,16 @@
           finish(null, true);
         };
         signal.addEventListener("abort", onAbort, { once: true });
-        if (stream) stop = pumpStream(body, write, finish);
-        else stop = pumpIterable(body, write, finish);
+        const begin = () => {
+          if (over) return;
+          // A length the body disagrees with fails it before anything is
+          // sent, and destroys the stream with it.
+          const refused = frame();
+          if (refused !== null) return finish(refused, false);
+          stop = stream ? pumpStream(body, write, finish) : pumpIterable(body, write, finish);
+        };
+        if (stream) setImmediate(begin);
+        else begin();
         if (signal.aborted) onAbort();
       });
     }
@@ -626,9 +654,6 @@
     // RequestAbortedError. Returns the function that detaches it.
     function pumpStream(body, write, finish) {
       let done = false;
-      // undici's Request keeps an 'error' listener on its body for good, so
-      // an error after the request is over is not an uncaught one.
-      body.on("error", () => {});
       const onData = function (chunk) {
         if (done) return;
         let pending;
