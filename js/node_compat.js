@@ -22975,9 +22975,17 @@
           throw err;
         }
         if (this.destroyed || !this.writable) {
-          const err = new Error("This socket has been ended");
-          if (cb) cb(err);
-          else this.emit("error", err);
+          // node's Writable.write: the callback gets the error on the next
+          // tick, and a write after end() destroys the socket with it
+          // ('error' and 'close' deferred, as every destroy()); a write to
+          // a socket already destroyed reports to the callback alone.
+          // Nothing is emitted inside the call: with no 'error' listener
+          // that emit threw into the caller (#164).
+          const err = this._writableState.ending || !this.destroyed
+            ? codes.ERR_STREAM_WRITE_AFTER_END()
+            : codes.ERR_STREAM_DESTROYED("write");
+          if (typeof cb === "function") process.nextTick(cb, err);
+          this.destroy(err);
           return false;
         }
         if (this._timeoutMs > 0) this._resetTimeout();
@@ -23022,7 +23030,13 @@
           }
           return natives.tcpWrite(this._handle, bytes).then(
             () => { settle(); if (cb) cb(); },
-            (err) => { settle(); if (cb) cb(err); else this.emit("error", err); },
+            // node's afterWriteDispatched: a failed write destroys the
+            // socket with its error, callback or not. destroy() defers
+            // 'error', so with no listener it is an uncaught exception
+            // rather than a throw into this reaction, which would reject
+            // `_chain` -- an unhandled rejection, and every later write
+            // skipped (#164).
+            (err) => { settle(); this.destroy(err); if (cb) cb(err); },
           );
         });
         // Node: false once the queue is at or past the high-water mark. The
@@ -23064,7 +23078,11 @@
         this._writableState.ending = true;
         this._writableState.ended = true;
         this._chain = this._chain.then(() => {
-          if (this._handle !== null) return natives.tcpShutdown(this._handle);
+          // A failed shutdown is the socket's error (node's afterShutdown
+          // destroys with it), not a rejection left on `_chain`.
+          if (this._handle !== null) {
+            return natives.tcpShutdown(this._handle).then(undefined, (err) => { this.destroy(err); });
+          }
         }).then(() => {
           if (this.destroyed || this._writableState.errored) {
             // Never report success on a socket that died first: Node skips
