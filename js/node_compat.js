@@ -17162,6 +17162,7 @@
     const Z_SYNC_FLUSH = 2;
     const Z_FULL_FLUSH = 3;
     const Z_FINISH = 4;
+    const Z_BLOCK = 5;
     const DEFLATE = 1;
     const INFLATE = 2;
     const DEFLATERAW = 5;
@@ -17227,6 +17228,34 @@
     // (oam_core::zlib::OUTPUT_TOO_LARGE); node raises ERR_BUFFER_TOO_LARGE
     // naming the caller's value.
     const OUTPUT_TOO_LARGE = "zlib output exceeds maxOutputLength";
+    // node's checkRangesOrGetDefault for options.flush / options.finishFlush
+    // (ZlibBase, which every zlib class and one-shot call constructs):
+    // undefined and NaN take the default, a non-number is
+    // ERR_INVALID_ARG_TYPE, anything outside Z_NO_FLUSH..Z_BLOCK is
+    // ERR_OUT_OF_RANGE. Validated in node's order: flush, finishFlush, then
+    // maxOutputLength.
+    const flushOptionOf = (options, key, def) => {
+      const value = options?.[key];
+      if (value === undefined || Number.isNaN(value)) return def;
+      const name = "options." + key;
+      if (!Number.isFinite(value)) {
+        if (typeof value !== "number") throw codes.ERR_INVALID_ARG_TYPE(name, "number", value);
+        throw codes.ERR_OUT_OF_RANGE(name, "a finite number", value);
+      }
+      if (value < Z_NO_FLUSH || value > Z_BLOCK) {
+        throw codes.ERR_OUT_OF_RANGE(name, ">= " + Z_NO_FLUSH + " and <= " + Z_BLOCK, value);
+      }
+      return value;
+    };
+    // The finishing flush an inflate ends with (node's `finishFlush`). Only
+    // Z_FINISH makes a stream that stops short an error ("unexpected end of
+    // file"); axios and node-fetch pass Z_SYNC_FLUSH to get what decoded. The
+    // natives take it as an int32 (a fraction truncates, as node's binding
+    // does); the deflaters always finish the stream.
+    const finishFlushOf = (options) => {
+      flushOptionOf(options, "flush", Z_NO_FLUSH);
+      return flushOptionOf(options, "finishFlush", Z_FINISH);
+    };
     const bufferTooLarge = (max) => {
       const err = new RangeError("Cannot create a Buffer larger than " + max + " bytes");
       applyNodeErrorShape(err, "ERR_BUFFER_TOO_LARGE");
@@ -17236,9 +17265,12 @@
       err instanceof Error && err.message === OUTPUT_TOO_LARGE ? bufferTooLarge(max) : err;
 
     const sync = (format, compress) => (data, options) => {
+      const finishFlush = finishFlushOf(options);
       const max = maxOutputLengthOf(options);
       try {
-        return asBuffer(natives.zlibSync(toBytes(data), format, levelOf(options), compress, max));
+        return asBuffer(
+          natives.zlibSync(toBytes(data), format, levelOf(options), compress, max, finishFlush),
+        );
       } catch (err) {
         throw translate(err, max);
       }
@@ -17249,8 +17281,9 @@
         options = undefined;
       }
       // Validation throws synchronously, as node's does.
+      const finishFlush = finishFlushOf(options);
       const max = maxOutputLengthOf(options);
-      natives.zlibAsync(toBytes(data), format, levelOf(options), compress, max).then(
+      natives.zlibAsync(toBytes(data), format, levelOf(options), compress, max, finishFlush).then(
         (bytes) => callback(null, asBuffer(bytes)),
         (err) => callback(translate(err, max)),
       );
@@ -17272,8 +17305,11 @@
       const { Transform } = registry.get("stream");
       return class extends Transform {
         constructor(options) {
+          // brotli's flush values are BROTLI_OPERATION_*, not zlib's.
+          const finishFlush = format === "brotli" ? undefined : finishFlushOf(options);
           super({});
           this._zlibLevel = levelOf(options);
+          this._zlibFinishFlush = finishFlush;
           // _zlibHandle is null until the first chunk arrives.
           this._zlibHandle = null;
           // Promise serializing back-to-back _transform calls so we
@@ -17311,10 +17347,10 @@
               return natives.zlibStreamCreate(format, this._zlibLevel, compress)
                 .then((info) => {
                   this._zlibHandle = info.handle;
-                  return natives.zlibStreamFlush(this._zlibHandle);
+                  return natives.zlibStreamFlush(this._zlibHandle, this._zlibFinishFlush);
                 });
             }
-            return natives.zlibStreamFlush(this._zlibHandle);
+            return natives.zlibStreamFlush(this._zlibHandle, this._zlibFinishFlush);
           }).then((tail) => {
             this._zlibHandle = null;
             if (tail && tail.length > 0) cb(null, asBuffer(tail));
@@ -17435,7 +17471,7 @@
       self._buffer = BufferCtor.allocUnsafe(chunkSize);
       self._outBuffer = self._buffer;
       self._hadError = false;
-      self._finishFlushFlag = Z_FINISH;
+      self._finishFlushFlag = finishFlushOf(opts);
       const handle = new ZlibHandle(mode);
       handle.init(15, levelOf(opts), 8, 0, self._writeState, () => {}, opts.dictionary);
       self._handle = handle;

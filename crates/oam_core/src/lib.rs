@@ -2591,8 +2591,12 @@ pub mod zlib {
     /// node's `RangeError [ERR_BUFFER_TOO_LARGE]`; nothing else produces it.
     pub const OUTPUT_TOO_LARGE: &str = "zlib output exceeds maxOutputLength";
 
+    /// zlib's `Z_FINISH`: node's default `finishFlush`, the one flush under
+    /// which an inflate that stops inside the stream is an error.
+    pub const Z_FINISH: i32 = 4;
+
     pub fn decompress(bytes: &[u8], format: Format) -> std::io::Result<Vec<u8>> {
-        decompress_capped(bytes, format, None)
+        decompress_capped(bytes, format, None, Z_FINISH)
     }
 
     /// Decompress, giving up as soon as the output passes `max_output` bytes.
@@ -2605,29 +2609,37 @@ pub mod zlib {
     ///
     /// A decode failure is an `io::Error` wrapping a [`ZlibError`] (see
     /// [`zlib_error`]): node's code, errno and message for it.
+    ///
+    /// `finish_flush` is node's `finishFlush` option (see [`inflate_all`]).
     pub fn decompress_capped(
         bytes: &[u8],
         format: Format,
         max_output: Option<usize>,
+        finish_flush: i32,
     ) -> std::io::Result<Vec<u8>> {
         let wrap = match format {
             Format::Gzip => Wrap::Gzip,
             Format::Deflate => Wrap::Zlib,
             Format::DeflateRaw => Wrap::Raw,
         };
-        inflate_all(bytes, wrap, max_output)
+        inflate_all(bytes, wrap, max_output, finish_flush)
     }
 
-    /// Inflate the whole of `bytes` with node's one-shot finishing flush
-    /// (Z_FINISH): input that ends inside the stream is Z_BUF_ERROR
-    /// "unexpected end of file", and what follows a complete stream is
-    /// dropped (for gzip: unless it is another member). Output is produced
+    /// Inflate the whole of `bytes` under node's one-shot finishing flush,
+    /// `finish_flush` (the `finishFlush` option, Z_FINISH by default). Under
+    /// Z_FINISH, input that ends inside the stream is Z_BUF_ERROR "unexpected
+    /// end of file"; under any other flush it is not an error and the result
+    /// is what decoded, as node_zlib.cc's CheckError reports Z_BUF_ERROR only
+    /// under Z_FINISH -- the lenient decode HTTP clients ask for with
+    /// Z_SYNC_FLUSH. What follows a complete stream is dropped (for gzip:
+    /// unless it is another member). Output is produced
     /// [`inflate::STEP_OUT`] at a time, so memory stays within `max_output`
     /// plus one step whatever the input inflates to.
     fn inflate_all(
         bytes: &[u8],
         wrap: Wrap,
         max_output: Option<usize>,
+        finish_flush: i32,
     ) -> std::io::Result<Vec<u8>> {
         let mut dec = NodeInflate::new(wrap);
         let mut out = Vec::new();
@@ -2644,7 +2656,9 @@ pub mod zlib {
             }
             out.extend_from_slice(&buf[..produced]);
         }
-        dec.finish().map_err(std::io::Error::other)?;
+        if finish_flush == Z_FINISH {
+            dec.finish().map_err(std::io::Error::other)?;
+        }
         Ok(out)
     }
 
@@ -2658,7 +2672,10 @@ pub mod zlib {
     #[cfg(test)]
     #[allow(clippy::items_after_test_module)]
     mod capped_tests {
-        use super::{Format, OUTPUT_TOO_LARGE, compress, decompress_capped, unzip, zlib_error};
+        use super::{
+            Format, OUTPUT_TOO_LARGE, Z_FINISH, compress, decompress_capped, unzip, unzip_capped,
+            zlib_error,
+        };
 
         #[test]
         fn decompress_capped_stops_a_gzip_bomb_at_the_cap() {
@@ -2667,10 +2684,10 @@ pub mod zlib {
             // 16 MiB; and the cap boundary is exact.
             let size = 16 * 1024 * 1024;
             let bomb = compress(&vec![b' '; size], Format::Gzip, 6).unwrap();
-            let err = decompress_capped(&bomb, Format::Gzip, Some(1024)).unwrap_err();
+            let err = decompress_capped(&bomb, Format::Gzip, Some(1024), Z_FINISH).unwrap_err();
             assert_eq!(err.to_string(), OUTPUT_TOO_LARGE);
-            assert!(decompress_capped(&bomb, Format::Gzip, Some(size)).is_ok());
-            assert!(decompress_capped(&bomb, Format::Gzip, Some(size - 1)).is_err());
+            assert!(decompress_capped(&bomb, Format::Gzip, Some(size), Z_FINISH).is_ok());
+            assert!(decompress_capped(&bomb, Format::Gzip, Some(size - 1), Z_FINISH).is_err());
         }
 
         #[test]
@@ -2680,20 +2697,52 @@ pub mod zlib {
             let mut two = compress(b"hello", Format::Gzip, 6).unwrap();
             two.extend(compress(b"world", Format::Gzip, 6).unwrap());
             assert_eq!(
-                decompress_capped(&two, Format::Gzip, None).unwrap(),
+                decompress_capped(&two, Format::Gzip, None, Z_FINISH).unwrap(),
                 b"helloworld"
             );
             assert_eq!(unzip(&two).unwrap(), b"helloworld");
-            let err = decompress_capped(b"not gzip at all", Format::Gzip, None).unwrap_err();
+            let err =
+                decompress_capped(b"not gzip at all", Format::Gzip, None, Z_FINISH).unwrap_err();
             let coded = zlib_error(&err).expect("a coded zlib error");
             assert_eq!(
                 (coded.code, coded.errno, coded.message),
                 ("Z_DATA_ERROR", -3, "incorrect header check")
             );
             let packed = compress(b"hello world hello world", Format::Deflate, 6).unwrap();
-            let err = decompress_capped(&packed[..8], Format::Deflate, None).unwrap_err();
+            let err = decompress_capped(&packed[..8], Format::Deflate, None, Z_FINISH).unwrap_err();
             let coded = zlib_error(&err).expect("a coded zlib error");
             assert_eq!((coded.code, coded.errno), ("Z_BUF_ERROR", -5));
+        }
+
+        #[test]
+        fn a_finishing_flush_other_than_z_finish_returns_what_decoded() {
+            // Node's `finishFlush: Z_SYNC_FLUSH` (axios, node-fetch): a stream
+            // cut short is not an error, the result is what decoded. Every
+            // other flush value is as lenient; only Z_FINISH checks the end.
+            let plain: Vec<u8> = (0..4000u32).flat_map(|i| i.to_le_bytes()).collect();
+            for format in [Format::Gzip, Format::Deflate, Format::DeflateRaw] {
+                let packed = compress(&plain, format, 6).unwrap();
+                let cut = &packed[..packed.len() / 2];
+                for flush in [0, 1, 2, 3, 5] {
+                    let out = decompress_capped(cut, format, None, flush).unwrap();
+                    assert!(
+                        !out.is_empty() && plain.starts_with(&out),
+                        "{format:?} {flush}"
+                    );
+                    let whole = decompress_capped(&packed, format, None, flush).unwrap();
+                    assert_eq!(whole, plain, "{format:?} {flush}");
+                }
+                let err = decompress_capped(cut, format, None, Z_FINISH).unwrap_err();
+                assert_eq!(zlib_error(&err).map(|e| e.code), Some("Z_BUF_ERROR"));
+            }
+            // A decode error is still one under a lenient flush.
+            let junk = [0xffu8, 0x00, 0x01, 0x02, 0x03, 0x04];
+            assert!(decompress_capped(&junk, Format::Gzip, None, 2).is_err());
+            assert!(decompress_capped(&junk, Format::Deflate, None, 2).is_err());
+            let gz = compress(&plain, Format::Gzip, 6).unwrap();
+            assert_eq!(unzip_capped(&gz[..gz.len() - 4], None, 2).unwrap(), plain);
+            assert!(unzip_capped(&[], None, 2).unwrap().is_empty());
+            assert!(unzip_capped(&[], None, Z_FINISH).is_err());
         }
     }
 
@@ -2715,12 +2764,17 @@ pub mod zlib {
 
     /// Node's unzip*: auto-detect gzip (1f 8b magic) vs zlib-wrapped.
     pub fn unzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
-        unzip_capped(bytes, None)
+        unzip_capped(bytes, None, Z_FINISH)
     }
 
-    /// `unzip` with node's `maxOutputLength`; see `decompress_capped`.
-    pub fn unzip_capped(bytes: &[u8], max_output: Option<usize>) -> std::io::Result<Vec<u8>> {
-        inflate_all(bytes, Wrap::Auto, max_output)
+    /// `unzip` with node's `maxOutputLength` and `finishFlush`; see
+    /// `decompress_capped`.
+    pub fn unzip_capped(
+        bytes: &[u8],
+        max_output: Option<usize>,
+        finish_flush: i32,
+    ) -> std::io::Result<Vec<u8>> {
+        inflate_all(bytes, Wrap::Auto, max_output, finish_flush)
     }
 
     // ----------------------------------------------------------------
@@ -2880,12 +2934,21 @@ pub mod zlib {
             }
         }
 
-        /// Finalize (node's Z_FINISH at `end()`): every write's output was
-        /// already returned, so this only checks that the stream is complete
-        /// -- input that ended inside it is Z_BUF_ERROR "unexpected end of
-        /// file", an empty stream included.
+        /// Finalize under the default finishing flush, Z_FINISH; see
+        /// [`Self::finish_with`].
         pub fn finish(self) -> std::io::Result<Vec<u8>> {
-            self.inner.finish().map_err(std::io::Error::other)?;
+            self.finish_with(Z_FINISH)
+        }
+
+        /// Finalize at `end()` under node's `finishFlush`. Every write's
+        /// output was already returned, so this only checks, under Z_FINISH,
+        /// that the stream is complete -- input that ended inside it is
+        /// Z_BUF_ERROR "unexpected end of file", an empty stream included.
+        /// Under any other flush the stream ends with what decoded.
+        pub fn finish_with(self, finish_flush: i32) -> std::io::Result<Vec<u8>> {
+            if finish_flush == Z_FINISH {
+                self.inner.finish().map_err(std::io::Error::other)?;
+            }
             Ok(Vec::new())
         }
     }
@@ -4433,8 +4496,14 @@ pub mod ops {
     /// zlibStreamFlush: finalize and remove the stream. Returns the tail
     /// bytes. For compressors, this emits the format trailer (CRC etc.).
     /// For decompressors, this finalizes the inflate/brotli state machine
-    /// and returns any remaining output bytes.
-    pub async fn zlib_stream_flush(streams: super::ZlibRegistry, handle: u64) -> OpOutcome {
+    /// and returns any remaining output bytes. `finish_flush` is node's
+    /// `finishFlush` for an inflate stream (only Z_FINISH requires the stream
+    /// to be complete); the deflaters always finish the stream.
+    pub async fn zlib_stream_flush(
+        streams: super::ZlibRegistry,
+        handle: u64,
+        finish_flush: i32,
+    ) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || {
             let stream = streams
                 .lock()
@@ -4451,7 +4520,7 @@ pub mod ops {
                     enc.finish().map_err(|e| failed("zlib stream flush", e))
                 }
                 super::ZlibStream::Decompress(dec) => dec
-                    .finish()
+                    .finish_with(finish_flush)
                     .map_err(|e| Box::new(zlib_decode_failed("zlib stream flush", e))),
                 super::ZlibStream::BrotliCompress(enc) => {
                     enc.finish().map_err(|e| failed("brotli stream flush", e))
@@ -4606,16 +4675,19 @@ pub mod ops {
     /// (Node's threadpool model). compress=true encodes, false decodes;
     /// format "unzip" auto-detects on the decode side.
     /// `max_output` is node's `maxOutputLength` for a decode; `None` is no cap.
+    /// `finish_flush` is node's `finishFlush` for a decode (see
+    /// `zlib::decompress_capped`); an encode always finishes the stream.
     pub async fn zlib_transform(
         bytes: Vec<u8>,
         format: String,
         level: i32,
         compress: bool,
         max_output: Option<usize>,
+        finish_flush: i32,
     ) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || {
             if !compress && format == "unzip" {
-                return super::zlib::unzip_capped(&bytes, max_output);
+                return super::zlib::unzip_capped(&bytes, max_output, finish_flush);
             }
             let Some(parsed) = super::zlib::Format::parse(&format) else {
                 return Err(std::io::Error::new(
@@ -4626,7 +4698,7 @@ pub mod ops {
             if compress {
                 super::zlib::compress_capped(&bytes, parsed, level, max_output)
             } else {
-                super::zlib::decompress_capped(&bytes, parsed, max_output)
+                super::zlib::decompress_capped(&bytes, parsed, max_output, finish_flush)
             }
         })
         .await;

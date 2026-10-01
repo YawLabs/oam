@@ -4999,6 +4999,20 @@ fn arg_max_output(
     Some(n.min(usize::MAX as f64) as usize)
 }
 
+/// The optional `finishFlush` argument of the zlib ops (node's option of that
+/// name, range-checked by the shim): zlib's Z_FINISH when absent.
+fn arg_finish_flush(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+) -> i32 {
+    let value = args.get(index);
+    if value.is_null_or_undefined() {
+        return oam_core::zlib::Z_FINISH;
+    }
+    value.int32_value(scope).unwrap_or(oam_core::zlib::Z_FINISH)
+}
+
 /// Throw the error for a one-shot zlib result. An output past
 /// `maxOutputLength` is a plain error carrying that sentinel message alone
 /// (see `oam_core::zlib::OUTPUT_TOO_LARGE`); the shim turns it into node's
@@ -5038,11 +5052,12 @@ fn throw_zlib_coded(scope: &mut v8::PinScope<'_, '_>, coded: &oam_core::zlib::Zl
     scope.throw_exception(exception);
 }
 
-/// zlibSync(bytes, format, level, compress, maxOutputLength?) — synchronous
-/// transform on the isolate thread (the *Sync API contract). "unzip"
-/// auto-detects on decode. `maxOutputLength` (node's option of that name)
-/// bounds the output: while it is produced for a decode, on the finished
-/// buffer for an encode.
+/// zlibSync(bytes, format, level, compress, maxOutputLength?, finishFlush?) —
+/// synchronous transform on the isolate thread (the *Sync API contract).
+/// "unzip" auto-detects on decode. `maxOutputLength` (node's option of that
+/// name) bounds the output: while it is produced for a decode, on the
+/// finished buffer for an encode. `finishFlush` (node's option, Z_FINISH by
+/// default) decides whether a decode that stops inside the stream fails.
 fn op_zlib_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -5056,15 +5071,16 @@ fn op_zlib_sync(
     let level = args.get(2).int32_value(scope).unwrap_or(-1);
     let compress = args.get(3).is_true();
     let max_output = arg_max_output(scope, &args, 4);
+    let finish_flush = arg_finish_flush(scope, &args, 5);
     let result = if !compress && format == "unzip" {
-        oam_core::zlib::unzip_capped(&bytes, max_output)
+        oam_core::zlib::unzip_capped(&bytes, max_output, finish_flush)
     } else {
         match oam_core::zlib::Format::parse(&format) {
             Some(parsed) => {
                 if compress {
                     oam_core::zlib::compress_capped(&bytes, parsed, level, max_output)
                 } else {
-                    oam_core::zlib::decompress_capped(&bytes, parsed, max_output)
+                    oam_core::zlib::decompress_capped(&bytes, parsed, max_output, finish_flush)
                 }
             }
             None => {
@@ -5083,7 +5099,8 @@ fn op_zlib_sync(
     }
 }
 
-/// zlibAsync(bytes, format, level, compress, maxOutputLength?) -> Promise<Uint8Array>.
+/// zlibAsync(bytes, format, level, compress, maxOutputLength?, finishFlush?)
+/// -> Promise<Uint8Array>.
 fn op_zlib_async(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -5097,10 +5114,11 @@ fn op_zlib_async(
     let level = args.get(2).int32_value(scope).unwrap_or(-1);
     let compress = args.get(3).is_true();
     let max_output = arg_max_output(scope, &args, 4);
+    let finish_flush = arg_finish_flush(scope, &args, 5);
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::zlib_transform(bytes, format, level, compress, max_output),
+        oam_core::ops::zlib_transform(bytes, format, level, compress, max_output, finish_flush),
     );
 }
 
@@ -5146,20 +5164,22 @@ fn op_zlib_stream_write(
     );
 }
 
-/// zlibStreamFlush(handle) -> Promise<Uint8Array>.
+/// zlibStreamFlush(handle, finishFlush?) -> Promise<Uint8Array>.
 /// Finalize the stream and return tail bytes. The stream handle is
-/// removed from the registry after this call.
+/// removed from the registry after this call. `finishFlush` is node's
+/// option for an inflate stream (Z_FINISH by default).
 fn op_zlib_stream_flush(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let finish_flush = arg_finish_flush(scope, &args, 1);
     let streams = core_runtime!(scope).zlib_streams();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::zlib_stream_flush(streams, handle),
+        oam_core::ops::zlib_stream_flush(streams, handle, finish_flush),
     );
 }
 
