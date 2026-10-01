@@ -1075,12 +1075,13 @@
   // platform's AI_ADDRCONFIG -- elsewhere. Measured: node v22.22.2 passes
   // `{ family: undefined, hints, all: true }` with hints 0 on win32, 1024 on
   // macOS 26 arm64 and 32 (0x20) on Debian 12 x64 (glibc 2.36). FreeBSD's
-  // 1024 is its <netdb.h> value, unmeasured. oam's own dns.ADDRCONFIG is
-  // still 0 everywhere (a separate follow-up).
+  // 1024 is its <netdb.h> value, unmeasured. The same values as oam's
+  // dns.ADDRCONFIG off Windows.
   function lookupHints() {
     const platform = globalThis.process?.platform;
     if (platform === "win32") return 0;
-    if (platform === "darwin" || platform === "freebsd") return 1024;
+    // bionic's AI_ADDRCONFIG is the BSD 0x400, not glibc's 0x20.
+    if (platform === "darwin" || platform === "freebsd" || platform === "android") return 1024;
     return 0x20;
   }
 
@@ -1804,6 +1805,40 @@
     globalThis.CloseEvent = CloseEvent;
   }
 
+  // The event a WebSocket that fails to connect dispatches. Node v22 has the
+  // class (undici's) and no `ErrorEvent` global, so there is none here
+  // either: it is reachable only as an event's constructor.
+  // Its five attributes are prototype getters, as undici's are. The Event
+  // base still puts its own state (type, bubbles, target, ...) on every
+  // instance as own enumerable properties, so Object.keys() of any oam
+  // event, this one included, is not node's empty list.
+  const kErrorEventInit = Symbol("kErrorEventInit");
+  class ErrorEvent extends Event {
+    constructor(type, init) {
+      // undici's webidl check. Event's own would never see it: the super()
+      // call below always passes two arguments.
+      if (arguments.length === 0) {
+        throw new TypeError("ErrorEvent constructor: 1 argument required, but 0 found.");
+      }
+      super(type, init);
+      Object.defineProperty(this, kErrorEventInit, {
+        value: {
+          message: (init && init.message) || "",
+          filename: (init && init.filename) || "",
+          lineno: (init && init.lineno) || 0,
+          colno: (init && init.colno) || 0,
+          error: init ? init.error : undefined,
+        },
+      });
+    }
+    get message() { return this[kErrorEventInit].message; }
+    get filename() { return this[kErrorEventInit].filename; }
+    get lineno() { return this[kErrorEventInit].lineno; }
+    get colno() { return this[kErrorEventInit].colno; }
+    get error() { return this[kErrorEventInit].error; }
+  }
+  brand(ErrorEvent, "ErrorEvent");
+
   // ------------------------------------------------------------ WebSocket
   const CONNECTING = 0;
   const OPEN = 1;
@@ -1853,9 +1888,14 @@
           this.dispatchEvent(ev);
           this._recvLoop();
         },
-        (err) => {
+        () => {
           this._readyState = CLOSED;
-          const ev = new Event("error");
+          // node (undici's failWebsocketConnection): an ErrorEvent whose
+          // `message` is this fixed text and whose `error` is an Error
+          // carrying it -- whatever failed, a refused connect or an answer
+          // that is not a 101. It was a bare Event, with neither (#161).
+          const message = "Received network error or non-101 status code.";
+          const ev = new ErrorEvent("error", { error: new Error(message), message });
           if (typeof this.onerror === "function") this.onerror(ev);
           this.dispatchEvent(ev);
           this._fireClose(1006, "", false);

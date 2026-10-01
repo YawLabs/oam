@@ -4902,6 +4902,42 @@ fn undici_dispatcher_connect_lookup_pins_dns() {
     assert!(stdout.contains("control=failed"), "{stdout}");
 }
 
+// #162: a connect.lookup answer with an IPv6 zone id is an address, as node's
+// net.isIP has it, and is dialled: it was refused before the dial (first by
+// the JS isIP filter, then by the pin parser, `pin ip '...' is not an IP`).
+// The zone names no interface on any platform, so libuv's rules make it scope
+// id 0 and the connect reaches the ::1 listener.
+#[test]
+fn undici_dispatcher_connect_lookup_dials_a_zoned_address() {
+    let main = write_temp(
+        "undici_pin_zone/main.mjs",
+        "import http from 'node:http';\n\
+         import { Agent } from 'undici';\n\
+         const server = http.createServer((req, res) => res.end('zoned:' + req.headers.host));\n\
+         await new Promise((r) => server.listen(0, '::1', r));\n\
+         const port = server.address().port;\n\
+         const agent = new Agent({ connect: { lookup: (h, o, cb) => cb(null, [{ address: '::1%oamnone0', family: 6 }]) } });\n\
+         try {\n\
+           const res = await fetch(`http://scoped.invalid:${port}/`, { dispatcher: agent });\n\
+           console.log('fetch=' + res.status + ':' + (await res.text()));\n\
+         } catch (e) { console.log('fetch=ERR:' + e.message + ':' + (e.cause && e.cause.message)); }\n\
+         server.close();\n\
+         process.exit(0);\n",
+    );
+    let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
+    assert!(
+        stdout.contains("fetch=200:zoned:scoped.invalid:"),
+        "expected the zoned answer to be dialled: {stdout}"
+    );
+}
+
 // ------------------------------------ #143: fetch on oam's own transport
 
 /// Run a script with `oam run --no-check` and return (stdout, stderr), failing
@@ -12935,6 +12971,31 @@ exec("echo hello-exec-cb", (err, stdout, stderr) => {
     assert!(stdout.contains("exec-err: null"), "{stdout}");
     assert!(stdout.contains("exec-stdout: hello-exec-cb"), "{stdout}");
     assert!(stdout.contains("exec-stderr-type: string"), "{stdout}");
+}
+
+/// #165: dns.ADDRCONFIG / V4MAPPED / ALL are the platform's AI_* values,
+/// and Android's bionic has the BSD ones (AI_ADDRCONFIG 0x400, AI_V4MAPPED
+/// 0x800, AI_ALL 0x100 -- the libc crate's android/mod.rs), not glibc's 32 /
+/// 8 / 16. oam gave Android glibc's, so node's 1024 was refused as a hint.
+/// The constants are read when node:dns loads, so the platform is set first.
+#[test]
+fn dns_hint_constants_on_android_are_bionic_values() {
+    let stdout = run_ok(
+        "dns_android_hints.cjs",
+        "Object.defineProperty(process, 'platform', { value: 'android' });\n\
+         const dns = require('node:dns');\n\
+         console.log(dns.ADDRCONFIG, dns.V4MAPPED, dns.ALL);\n\
+         try { dns.lookup('localhost', { hints: 1024 }, () => {}); console.log('hint 1024 accepted'); }\n\
+         catch (e) { console.log('hint 1024 refused', e.code); }",
+    );
+    assert!(
+        stdout.contains("1024 2048 256"),
+        "android's AI_ADDRCONFIG / AI_V4MAPPED / AI_ALL: {stdout}"
+    );
+    assert!(
+        stdout.contains("hint 1024 accepted"),
+        "node's dns.ADDRCONFIG on android is a valid hint: {stdout}"
+    );
 }
 
 #[test]
@@ -26618,6 +26679,153 @@ fn socket_write_signals_backpressure_and_drains() {
     assert!(
         stdout.contains("event drain"),
         "'drain' must fire once the peer consumes the backlog: {stdout}"
+    );
+}
+
+/// #156: a connect() retried on a socket its failed connect destroyed (from
+/// the 'error' listener, node's reconnect pattern) must not hold what is
+/// issued after it. oam does not revive a destroyed socket, so that connect
+/// settles without releasing anything; the end() behind it was held for
+/// good -- its callback never ran and the socket's internal `_chain`, which
+/// IPC waits on, never settled. Not a conformance case: node revives the
+/// socket instead, and in this exact shape loses the end() callback itself.
+#[test]
+fn net_end_after_connect_on_a_destroyed_socket_calls_back() {
+    let stdout = run_ok(
+        "net_end_after_reconnect.mjs",
+        "import net from 'node:net';\n\
+         const probe = net.createServer();\n\
+         await new Promise((r) => probe.listen(0, '127.0.0.1', r));\n\
+         const refused = probe.address().port;\n\
+         await new Promise((r) => probe.close(r));\n\
+         const server = net.createServer((s) => { s.on('error', () => {}); s.resume(); });\n\
+         await new Promise((r) => server.listen(0, '127.0.0.1', r));\n\
+         const sock = net.connect(refused, '127.0.0.1');\n\
+         let retried = false;\n\
+         const outcome = await new Promise((resolve) => {\n\
+           const t = setTimeout(() => resolve('end callback never called'), 5000);\n\
+           sock.on('error', () => {\n\
+             if (retried) return;\n\
+             retried = true;\n\
+             sock.connect(server.address().port, '127.0.0.1');\n\
+             sock.end((e) => { clearTimeout(t); resolve(`end callback ${e instanceof Error}`); });\n\
+           });\n\
+         });\n\
+         console.log(outcome);\n\
+         let t2;\n\
+         console.log(await Promise.race([\n\
+           sock._chain.then(() => 'chain settled'),\n\
+           new Promise((r) => { t2 = setTimeout(() => r('chain stuck'), 5000); }),\n\
+         ]));\n\
+         clearTimeout(t2);\n\
+         server.close();",
+    );
+    assert!(
+        stdout.contains("end callback true"),
+        "end(cb) after a connect() on a destroyed socket must call back with an error: {stdout}"
+    );
+    assert!(
+        stdout.contains("chain settled"),
+        "the socket's op chain must settle: {stdout}"
+    );
+}
+
+/// #156: `socket.write(data); socket.end()` in one callback sends the FIN
+/// right behind the data -- seen from a NODE client, which is who failed
+/// against an oam server (`UND_ERR_SOCKET` on keep-alive fetches racing the
+/// late FIN).
+///
+/// end() used to wait for the write's promise before it asked the natives
+/// for the shutdown, one op round trip after the data. It now asks in the
+/// same turn and the natives queue the shutdown behind the write. The
+/// regression this guards is the one that makes that ordering necessary: a
+/// shutdown issued while a write is in flight used to be dropped, so the
+/// client would get the data and never the 'end'. The large responses below
+/// go to a client that reads nothing for a while, so their writes are still
+/// in flight when the shutdown is issued. The client allows 5 s from the
+/// first 'data' to 'end' per connection (it takes microseconds for a small
+/// response), so a slow box cannot fail this and a lost FIN cannot pass.
+#[test]
+fn net_server_write_then_end_delivers_the_fin_to_a_node_client() {
+    use std::io::BufRead;
+    if !node_available() {
+        eprintln!("skipping: node not installed (the client runs on it)");
+        return;
+    }
+    let server = write_temp(
+        "write_end_fin/server.mjs",
+        "import net from 'node:net';\n\
+         const small = Buffer.from('HTTP/1.1 200 OK\\r\\ncontent-length: 2\\r\\n\\r\\nok');\n\
+         const large = Buffer.alloc(6 * 1024 * 1024, 0x61);\n\
+         const server = net.createServer((sock) => {\n\
+           sock.on('error', () => {});\n\
+           sock.once('data', (d) => {\n\
+             // The writes and the end, all in this one callback.\n\
+             if (String(d).startsWith('large')) { sock.write(large); sock.write(large); sock.write('tail'); }\n\
+             else sock.write(small);\n\
+             sock.end();\n\
+           });\n\
+         });\n\
+         server.listen(0, '127.0.0.1', () => console.log(server.address().port));\n",
+    );
+    let client = write_temp(
+        "write_end_fin/client.mjs",
+        "import net from 'node:net';\n\
+         const port = Number(process.argv[2]);\n\
+         function once(kind) {\n\
+           return new Promise((resolve) => {\n\
+             const s = net.connect(port, '127.0.0.1');\n\
+             let bytes = 0, timer = null, outcome = 'closed without end';\n\
+             s.on('connect', () => {\n\
+               s.write(kind);\n\
+               // Not reading yet: the server's writes back up behind this.\n\
+               if (kind === 'large') { s.pause(); setTimeout(() => s.resume(), 300); }\n\
+             });\n\
+             s.on('data', (d) => {\n\
+               bytes += d.length;\n\
+               if (timer === null) timer = setTimeout(() => { outcome = 'no end within 5s of data'; s.destroy(); }, 5000);\n\
+             });\n\
+             s.on('end', () => { outcome = 'end'; });\n\
+             s.on('error', (e) => { outcome = 'error ' + e.code; });\n\
+             s.on('close', () => { clearTimeout(timer); resolve(outcome + ' after ' + bytes + ' bytes'); });\n\
+           });\n\
+         }\n\
+         const tally = new Map();\n\
+         for (let i = 0; i < 300; i++) {\n\
+           const r = 'small: ' + await once('small');\n\
+           tally.set(r, (tally.get(r) || 0) + 1);\n\
+         }\n\
+         for (let i = 0; i < 5; i++) {\n\
+           const r = 'large: ' + await once('large');\n\
+           tally.set(r, (tally.get(r) || 0) + 1);\n\
+         }\n\
+         for (const [r, n] of tally) console.log(n + ' x ' + r);\n",
+    );
+    let mut serving = oam_command(&["run", server.to_str().unwrap()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("oam binary runs");
+    let mut port = String::new();
+    std::io::BufReader::new(serving.stdout.take().unwrap())
+        .read_line(&mut port)
+        .expect("the server prints its port");
+    let out = bounded_output(
+        std::process::Command::new("node").args([client.to_str().unwrap(), port.trim()]),
+    );
+    let _ = serving.kill();
+    let _ = serving.wait();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "client failed: {stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        "300 x small: end after 40 bytes\n5 x large: end after 12582916 bytes\n",
+        "every connection gets all of its data and then the FIN"
     );
 }
 

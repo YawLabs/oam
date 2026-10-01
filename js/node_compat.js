@@ -767,9 +767,21 @@
     return 'Expected ' + input + ' to be returned from the "' + name + '" function but got ' +
       determineSpecificType(value) + ".";
   });
+  // node internal/errors.js, shape for shape: one name is `The "a" argument`,
+  // two `The "a" and "b" arguments`, more `"a", "b", and "c" arguments`, and
+  // an ARRAY in any position is a choice (`"options" or "port" or "path"`,
+  // what net.connect() raises without a port or a path).
   codes.ERR_MISSING_ARGS = E("ERR_MISSING_ARGS", TypeError, function() {
-    var args = Array.prototype.slice.call(arguments);
-    return 'The ' + args.map(function(a) { return '"' + a + '"'; }).join(", ") + ' argument' + (args.length > 1 ? 's' : '') + ' must be specified';
+    var wrap = function(a) { return '"' + a + '"'; };
+    var args = Array.prototype.slice.call(arguments).map(function(a) {
+      return Array.isArray(a) ? a.map(wrap).join(" or ") : wrap(a);
+    });
+    var len = args.length;
+    var msg = "The ";
+    if (len === 1) msg += args[0] + " argument";
+    else if (len === 2) msg += args[0] + " and " + args[1] + " arguments";
+    else msg += args.slice(0, len - 1).join(", ") + ", and " + args[len - 1] + " arguments";
+    return msg + " must be specified";
   });
   codes.ERR_UNKNOWN_ENCODING = E("ERR_UNKNOWN_ENCODING", TypeError, function(enc) {
     return 'Unknown encoding: ' + enc;
@@ -861,19 +873,108 @@
   codes.ERR_CHILD_CLOSED_BEFORE_REPLY = E("ERR_CHILD_CLOSED_BEFORE_REPLY", RangeError, function() {
     return 'Child closed before reply';
   });
-  // node internal/errors.js: `${name} should be ${allowZero ? '>= 0' : '> 1'}
+  // node internal/errors.js: `${name} should be ${allowZero ? '>=' : '>'} 0
   // and < 65536. Received ${determineSpecificType(port)}.` -- the name is bare
   // (not quoted, no " option" suffix) and the value goes through
   // determineSpecificType, so a string shows its quotes. Measured on node
   // v22.22.2: `Port should be >= 0 and < 65536. Received type string ('abc').`
-  // oam carried an older node's wording; nothing raised it before
+  // and, from dgram's send(), `Port should be > 0 and < 65536. Received type
+  // number (0).` oam carried an older node's wording; nothing raised it before
   // ClientRequest's port check, so no call site moves with it.
   codes.ERR_SOCKET_BAD_PORT = E("ERR_SOCKET_BAD_PORT", RangeError, function(name, port, allowZero) {
     var operator = allowZero === false ? '>' : '>=';
-    var floor = allowZero === false ? '1' : '0';
-    return name + ' should be ' + operator + ' ' + floor + ' and < 65536. Received ' +
+    return name + ' should be ' + operator + ' 0 and < 65536. Received ' +
       determineSpecificType(port) + '.';
   });
+  // node internal/validators.js validatePort: a number, or a string that is
+  // not blank, whose numeric value is an integer from 0 (1 when `allowZero`
+  // is false) to 65535 -- so '80' and '0x50' are ports and 1.5, -1, 65536,
+  // 'abc' and '' are not. Answers the port as a number (node's `port | 0`).
+  // net.connect, tls.connect, every server's listen() and dgram's send()
+  // share it (#163): before it, a bad port reached the op and was dialled or
+  // bound as a different, valid one (65536 as 65535, 1.5 as 1).
+  function validatePort(port, name, allowZero) {
+    if (
+      (typeof port !== "number" && typeof port !== "string") ||
+      (typeof port === "string" && port.trim().length === 0) ||
+      +port !== (+port >>> 0) ||
+      port > 0xffff ||
+      (port === 0 && allowZero === false)
+    ) {
+      throw codes.ERR_SOCKET_BAD_PORT(name === undefined ? "Port" : name, port, allowZero);
+    }
+    return port | 0;
+  }
+  // What a server's listen(...args) was asked for, read as node's
+  // Server.prototype.listen reads it (lib/net.js v22.22.2: normalizeArgs,
+  // then the port rules), for every server oam has -- net, tls, http, https
+  // and http2 each bind through their own native, so they share the reading
+  // here instead of a base class:
+  //  - (options[, cb]), (path[, backlog][, cb]) for a string that is not a
+  //    number, else ([port][, host][, backlog][, cb]); the callback is the
+  //    LAST argument when that is a function;
+  //  - no arguments, a callback first, or a port that is null or an
+  //    explicit undefined: port 0, any free one;
+  //  - a number or a string is validated as a port (ERR_SOCKET_BAD_PORT
+  //    naming `options.port`), and '80' is the port 80;
+  //  - a path names a pipe; anything else throws node's
+  //    ERR_INVALID_ARG_VALUE for `options`, synchronously.
+  // Answers { port, host, cb } or { path, cb }; `host` undefined when none
+  // was given.
+  function normalizeListenArgs(args) {
+    var options = {};
+    var arg0 = args[0];
+    if (args.length > 0) {
+      if (typeof arg0 === "object" && arg0 !== null) {
+        options = arg0;
+      } else if (typeof arg0 === "string" && !(Number(arg0) >= 0)) {
+        options.path = arg0;
+      } else {
+        options.port = arg0;
+        if (args.length > 1 && typeof args[1] === "string") options.host = args[1];
+      }
+    }
+    var last = args[args.length - 1];
+    var cb = typeof last === "function" ? last : null;
+    if (
+      args.length === 0 || typeof arg0 === "function" ||
+      (options.port === undefined && "port" in options) || options.port === null
+    ) {
+      options.port = 0;
+    }
+    if (typeof options.port === "number" || typeof options.port === "string") {
+      return {
+        port: validatePort(options.port, "options.port"),
+        host: options.host || undefined,
+        // node's `ipv6Only`: an IPv6 listener (the default `::` included)
+        // takes IPv6 clients only.
+        ipv6Only: !!options.ipv6Only,
+        cb: cb,
+      };
+    }
+    if (options.path && typeof options.path === "string" && !(Number(options.path) >= 0)) {
+      return { path: options.path, cb: cb };
+    }
+    if (!("port" in options || "path" in options)) {
+      throw codes.ERR_INVALID_ARG_VALUE("options", options, 'must have the property "port" or "path"');
+    }
+    throw codes.ERR_INVALID_ARG_VALUE("options", options);
+  }
+  // listen(path): node listens on that Unix domain socket or Windows named
+  // pipe. oam has no pipe server, so the listen fails -- on the next tick,
+  // as a bind that fails does -- instead of binding a TCP port nobody asked
+  // for (up to 0.17.1 the name was read as port 0). True when it refused.
+  function refusePipeListen(server, listen) {
+    if (listen.path === undefined) return false;
+    if (listen.cb !== null) server.once("listening", listen.cb);
+    var err = new Error(
+      "The feature listening on a Unix domain socket or named pipe (a `path`) " +
+      "is unavailable on the current platform, which is being used to run oam",
+    );
+    err.code = "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM";
+    process.nextTick(function() { server.emit("error", err); });
+    return true;
+  }
   // ---- Error family ----
   // Node declares this one with three bases (Error, TypeError, RangeError) and
   // reaches the TypeError/RangeError variants through `.TypeError`/`.RangeError`
@@ -18457,13 +18558,16 @@
     // are now (values set right after listen() returned are in), start the
     // connections check (node does it on 'listening', ahead of the caller's
     // listeners), emit 'listening' and serve.
-    function serverBound(server, bound, hostname, encrypted) {
+    function serverBound(server, bound, encrypted) {
       // A server listening again after a close() is running again.
       server[Symbol.for("oam.serverClosing")] = false;
       server[Symbol.for("oam.serverClosed")] = false;
       server._serverId = bound.serverId;
       server._port = bound.port;
-      server._host = hostname;
+      // Where the listener IS bound: `::` for a listen() without a host
+      // (dual-stack), the looked-up address for a name.
+      server._host = bound.address;
+      server._family = bound.family;
       server.listening = true;
       syncServerTimeouts(server);
       startConnectionsCheck(server);
@@ -18813,31 +18917,21 @@
         this._host = null;
         this.listening = false;
       }
-      listen(port, host, callback) {
-        if (typeof port === "function") {
-          // listen(cb) -- ephemeral port, Node accepts callback-first.
-          callback = port;
-          port = undefined;
-        }
-        if (typeof port === "object" && port !== null) {
-          // listen({ port, host }, cb)
-          callback = host;
-          host = port.host;
-          port = port.port;
-        }
-        if (typeof host === "function") {
-          callback = host;
-          host = undefined;
-        }
-        if (typeof callback === "function") this.once("listening", callback);
-        const hostname = host ?? "127.0.0.1";
+      listen(...args) {
+        // node's reading of the arguments (net.Server's listen is the one
+        // http.Server has); a port that is not one throws from here (#163).
+        const listen = normalizeListenArgs(args);
+        if (refusePipeListen(this, listen)) return this;
+        const { port, host, ipv6Only, cb: callback } = listen;
+        if (callback !== null) this.once("listening", callback);
         // Stream request bodies: the handler is dispatched on headers and
         // req delivers chunks as they arrive, instead of waiting for the
         // last byte (docs/design/streaming-bodies.md).
         const policy = serverHeadPolicy(this);
         natives.httpServe(
-          hostname,
-          port ?? 0,
+          // No host: node's default, dual-stack `::` (#172).
+          host ?? null,
+          port,
           true,
           policy.maxHeaderSize,
           policy.insecure,
@@ -18845,15 +18939,16 @@
           // maxHeadersCount: null (the default) leaves the native 1000-field
           // cap; 0 is no limit; a number is that cap.
           this.maxHeadersCount,
+          ipv6Only,
         ).then(
-          (bound) => serverBound(this, bound, hostname, false),
+          (bound) => serverBound(this, bound, false),
           (err) => this.emit("error", err),
         );
         return this;
       }
       address() {
         return this.listening
-          ? { port: this._port, address: this._host, family: "IPv4" }
+          ? { address: this._host, family: this._family, port: this._port }
           : null;
       }
       close(callback) {
@@ -22796,10 +22891,10 @@
     // node's `dns.ADDRCONFIG`, the hints net passes a lookup off Windows when
     // the caller gave none: the platform's AI_ADDRCONFIG. The table
     // bootstrap.js lookupHints() uses for a fetch's connect.lookup (measured:
-    // 1024 on macOS 26, 0x20 on glibc).
+    // 1024 on macOS 26, 0x20 on glibc; bionic has the BSD value).
     function addrconfigHints() {
       const platform = globalThis.process.platform;
-      if (platform === "darwin" || platform === "freebsd") return 1024;
+      if (platform === "darwin" || platform === "freebsd" || platform === "android") return 1024;
       return 0x20;
     }
 
@@ -22815,6 +22910,31 @@
     function connectErrorNT(self, err) {
       self.destroy(err);
     }
+
+    // destroy()'s two deferred emissions (see Socket.prototype.destroy).
+    // The flags flip before the listeners run, as node's emitErrorNT /
+    // emitCloseNT flip them, so a listener that throws -- or an 'error' with
+    // no listener, which raises 'uncaughtException' from here -- leaves the
+    // state telling the truth.
+    function emitErrorNT(self, err) {
+      self._readableState.errorEmitted = self._writableState.errorEmitted = true;
+      self.emit("error", err);
+    }
+    function emitCloseNT(self, hadError) {
+      self._readableState.closeEmitted = self._writableState.closeEmitted = true;
+      if (hadError === undefined) self.emit("close");
+      else self.emit("close", hadError);
+    }
+    // What a queued write or shutdown resolves with when the socket was
+    // destroyed before it could run (see Socket.prototype._issue).
+    const kSocketClosed = Symbol("kSocketClosed");
+    // Where libuv runs a closed handle's callback: after the immediates
+    // already queued, before any timer. oam's loop has no close phase, so
+    // this is an immediate of its own -- taken off the native, not the
+    // global, so mocked timers do not hold a socket's 'close'.
+    const closeCallback = typeof natives.timerImmediate === "function"
+      ? (fn, self, hadError) => natives.timerImmediate(fn, self, hadError)
+      : (fn, self, hadError) => process.nextTick(fn, self, hadError);
 
     // node's emitLookup for the `all` form (lookupAndConnectMultiple's
     // callback). `dialList(ips)` gets the addresses to attempt, interleaved
@@ -22916,7 +23036,8 @@
     }
     registry._netRefusePipeConnect = refusePipeConnect;
 
-    // `host` is the caller's (net: options.host || 'localhost').
+    // `host` is the caller's (net: options.host || 'localhost'), `port` the
+    // caller's too, validated here; the caller dials `port | 0`.
     // `dial(spec, local)` starts the native connect: spec null for an IP
     // literal, `{ ips }` for a hook's answer, `{ ticket }` for oam's
     // resolver's; `local` the localAddress / localPort the socket is bound
@@ -22938,6 +23059,18 @@
       if (localPort && typeof localPort !== "number") {
         throw codes.ERR_INVALID_ARG_TYPE("options.localPort", "number", localPort);
       }
+      // node validates the port here, after the local end and before the
+      // name is looked up: a value that is neither a number nor a string is
+      // ERR_INVALID_ARG_TYPE, one that is not a port ERR_SOCKET_BAD_PORT,
+      // both thrown from connect() (#163). The op is then handed the number
+      // ('80' and '0x50' are the port 80), never the spelling.
+      if (typeof port !== "undefined") {
+        if (typeof port !== "number" && typeof port !== "string") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.port", ["number", "string"], port);
+        }
+        validatePort(port);
+      }
+      port |= 0;
       const local = localAddress || localPort
         ? JSON.stringify({ address: localAddress || undefined, port: localPort || undefined })
         : undefined;
@@ -23113,8 +23246,12 @@
         // Distinguishes ERR_SOCKET_CLOSED vs ERR_SOCKET_CLOSED_BEFORE_
         // CONNECTION for callbacks queued on a dead socket (Node parity).
         this._everConnected = false;
-        // Opens the write chain once a connect settles (see connect()).
-        this._connectGate = null;
+        // The native halves of the writes (and of end()) made while a connect
+        // is in flight; null when ops go straight to the natives (see
+        // _issue() and _releaseHeldOps()).
+        this._heldOps = null;
+        // end()'s callbacks, from the first end() until the stream finishes.
+        this._endCallbacks = null;
         if (options && options._handle !== undefined) {
           this._handle = options._handle;
           this.connecting = false;
@@ -23149,7 +23286,11 @@
           options = { port: args[0], host: typeof args[1] === "string" ? args[1] : undefined };
           cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : undefined;
         }
-        const port = options.port;
+        // node: with neither a port nor a path there is nothing to connect
+        // to, and connect() says so before it touches the socket.
+        if (options.port === undefined && options.path == null) {
+          throw codes.ERR_MISSING_ARGS(["options", "port", "path"]);
+        }
         // node: `options.host || 'localhost'`, and the name is looked up like
         // any other (a `lookup` option sees 'localhost').
         const host = options.host || "localhost";
@@ -23164,16 +23305,18 @@
         // strong Map for the process lifetime (one per socket).
         if (!this.destroyed) registry._activeHandles.set(this, "TCPSocketWrap");
         // Node queues writes (and the end() FIN) issued before the
-        // connection exists; the write chain waits on this gate, which opens
-        // once the connect settles -- or once the socket is destroyed while
-        // its name is still being looked up (destroy() opens it).
-        let openGate;
-        const gate = new Promise((resolve) => {
-          openGate = resolve;
-        });
-        this._connectGate = openGate;
-        this._chain = this._chain.then(() => gate);
+        // connection exists: _issue() holds their native halves from here
+        // on, and _releaseHeldOps() hands them over once the connect
+        // settles -- or once the socket is destroyed while its name is
+        // still being looked up. Not on a socket already destroyed (a
+        // connect() retried from its 'error' listener): destroy() has run
+        // and returns early from now on, and a destroyed socket's connect
+        // settles without releasing anything, so a held end() would never
+        // call back. Its ops start at once and fail as a closed socket's.
+        if (this._heldOps === null && !this.destroyed) this._heldOps = [];
         const dial = (spec, local) => {
+          // lookupAndConnect has validated the port by the time it dials.
+          const port = options.port | 0;
           let connecting;
           try {
             connecting = natives.tcpConnect(
@@ -23191,10 +23334,10 @@
             process.nextTick(connectErrorNT, this, err);
             return;
           }
-          this._startConnect(connecting, host, port).then(openGate);
+          this._startConnect(connecting, host, port);
         };
         if (refusePipeConnect(this, options)) return this;
-        lookupAndConnect(this, options, host, port, dial);
+        lookupAndConnect(this, options, host, options.port, dial);
         return this;
       }
 
@@ -23229,12 +23372,19 @@
             // without a handle); the remembered flag is applied here, before
             // 'connect' fires and before the first read parks.
             if (this._handleRefed === false) natives.tcpSetRef(this._handle, false);
+            // What was written while connecting goes out first, then
+            // 'connect': a listener that writes -- or destroys the socket --
+            // finds the earlier writes already with the natives (node
+            // flushes its pending data from a 'connect' listener of its
+            // own, registered by that first write).
+            this._releaseHeldOps();
             this.emit("connect");
             this.emit("ready");
             this._readLoop();
           },
           (err) => {
-            this.connecting = false;
+            // Still `connecting` going in: destroy() reads it to tell a
+            // socket with a handle (node's has one from connect() on).
             this.destroy(_shapeConnectError(err, host, port));
           },
         );
@@ -23249,10 +23399,29 @@
           err.code = "ERR_INVALID_ARG_TYPE";
           throw err;
         }
+        if (this._writableState.ended && this._readableState.endEmitted && !this.allowHalfOpen) {
+          // node's writeAfterFIN (lib/net.js), which replaces write() once
+          // the peer's FIN has been read on a socket that is not half-open:
+          // a write after the auto end() that followed fails with EPIPE,
+          // on the next tick, and destroys the socket with it (#164).
+          const err = new Error("This socket has been ended by the other party");
+          err.code = "EPIPE";
+          if (typeof cb === "function") process.nextTick(cb, err);
+          this.destroy(err);
+          return false;
+        }
         if (this.destroyed || !this.writable) {
-          const err = new Error("This socket has been ended");
-          if (cb) cb(err);
-          else this.emit("error", err);
+          // node's Writable.write: the callback gets the error on the next
+          // tick, and a write after end() destroys the socket with it
+          // ('error' and 'close' deferred, as every destroy()); a write to
+          // a socket already destroyed reports to the callback alone.
+          // Nothing is emitted inside the call: with no 'error' listener
+          // that emit threw into the caller (#164).
+          const err = this._writableState.ending || !this.destroyed
+            ? codes.ERR_STREAM_WRITE_AFTER_END()
+            : codes.ERR_STREAM_DESTROYED("write");
+          if (typeof cb === "function") process.nextTick(cb, err);
+          this.destroy(err);
           return false;
         }
         if (this._timeoutMs > 0) this._resetTimeout();
@@ -23276,8 +23445,15 @@
             if (!this.destroyed) this.emit("drain");
           }
         };
-        this._chain = this._chain.then(() => {
-          if (this.destroyed) {
+        // The native write is issued now (see _issue); `_chain` only orders
+        // what follows it -- the accounting and the callback, each after
+        // the write before it.
+        const written = this._issue(() => natives.tcpWrite(this._handle, bytes));
+        this._chain = this._chain.then(() => written).then((failure) => {
+          settle();
+          if (failure === undefined) {
+            if (cb) cb(null);
+          } else if (failure === kSocketClosed) {
             // Node invokes queued write callbacks with the socket-closed
             // error (NOT the connect error -- that went to 'error') --
             // silently dropping them hangs promisified writes forever.
@@ -23292,13 +23468,16 @@
               );
               process.nextTick(() => cb(err));
             }
-            settle();
-            return;
+          } else {
+            // node's afterWriteDispatched: a failed write destroys the
+            // socket with its error, callback or not. destroy() defers
+            // 'error', so with no listener it is an uncaught exception
+            // rather than a throw into this reaction, which would reject
+            // `_chain` -- an unhandled rejection, and every later write
+            // skipped (#164).
+            this.destroy(failure);
+            if (cb) cb(failure);
           }
-          return natives.tcpWrite(this._handle, bytes).then(
-            () => { settle(); if (cb) cb(); },
-            (err) => { settle(); if (cb) cb(err); else this.emit("error", err); },
-          );
         });
         // Node: false once the queue is at or past the high-water mark. The
         // write is still accepted -- false is advisory, asking the producer to
@@ -23308,6 +23487,48 @@
           return false;
         }
         return true;
+      }
+
+      // Hands the native half of a write or of end()'s shutdown -- `run`,
+      // which returns the op's promise -- to the natives: at once on a
+      // socket that has its connection, so the natives are given a write
+      // and the FIN behind it in the same turn and in call order (they
+      // queue per handle, see tcp.rs WriteTurn; #156); once the connect
+      // settles on one still connecting, in the order the calls were made.
+      // The promise returned never rejects: it resolves with undefined, with
+      // the op's error, or with kSocketClosed when the socket was destroyed
+      // before the op could run.
+      _issue(run) {
+        const start = () => {
+          if (this.destroyed) return kSocketClosed;
+          let op;
+          try {
+            op = run();
+          } catch (err) {
+            return err;
+          }
+          if (op === undefined) return undefined;
+          return op.then(
+            () => undefined,
+            // An op queued behind others finds its handle gone when
+            // destroy() closed it first: an error with no code, where a
+            // write the OS failed has one.
+            (err) => (this.destroyed && err.code === undefined ? kSocketClosed : err),
+          );
+        };
+        if (this._heldOps === null) return Promise.resolve(start());
+        return new Promise((resolve) => {
+          this._heldOps.push(() => resolve(start()));
+        });
+      }
+
+      // The connect settled (or the socket was destroyed first): the held
+      // ops start, in the order they were made.
+      _releaseHeldOps() {
+        const held = this._heldOps;
+        if (held === null) return;
+        this._heldOps = null;
+        for (const start of held) start();
       }
 
       // Node's default for a net.Socket. Settable, as Node allows via options.
@@ -23327,10 +23548,28 @@
         if (typeof data === "function") { cb = data; data = undefined; encoding = undefined; }
         else if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
         // Reentry guard (EOF auto-end + a user 'end' listener calling end()
-        // again would otherwise chain a SECOND 'finish' after 'close'). Node:
-        // end() after end() is a no-op that still fires the callback.
+        // again would otherwise chain a SECOND 'finish' after 'close').
+        // node's Writable.end on a stream already ended: data is a write
+        // after end (ERR_STREAM_WRITE_AFTER_END to the callback, and the
+        // socket destroyed with it); otherwise the callback is told the
+        // stream has finished (ERR_STREAM_ALREADY_FINISHED) or was
+        // destroyed (ERR_STREAM_DESTROYED), and waits for 'finish' only
+        // while neither has happened yet.
         if (this._writableState.ended) {
-          if (cb) this.once("finish", cb);
+          let err;
+          if (data !== undefined && data !== null) {
+            err = codes.ERR_STREAM_WRITE_AFTER_END();
+            this.destroy(err);
+          } else if (this._writableState.finished) {
+            err = codes.ERR_STREAM_ALREADY_FINISHED("end");
+          } else if (this.destroyed) {
+            err = codes.ERR_STREAM_DESTROYED("end");
+          }
+          if (typeof cb === "function") {
+            if (err !== undefined) process.nextTick(cb, err);
+            else if (this._endCallbacks !== null) this._endCallbacks.push(cb);
+            else process.nextTick(cb, this._writableState.errored ?? codes.ERR_STREAM_DESTROYED("end"));
+          }
           return this;
         }
         if (data !== undefined && data !== null) this.write(data, encoding);
@@ -23338,34 +23577,63 @@
         // state.writable stays untouched (side-existence marker; see destroy).
         this._writableState.ending = true;
         this._writableState.ended = true;
-        this._chain = this._chain.then(() => {
+        // The FIN is asked for now, in the same turn as the writes before
+        // it: the natives send it once the last of them is written, with
+        // no trip back through JS in between (#156; node queues the
+        // shutdown behind its writes in libuv the same way). 'finish' still
+        // waits for every write and for the shutdown.
+        const shut = this._issue(() => {
           if (this._handle !== null) return natives.tcpShutdown(this._handle);
-        }).then(() => {
+        });
+        // node's end(cb): the callbacks of every end() made before the
+        // stream finishes run first, in call order, and then 'finish' is
+        // emitted (Writable's kOnFinished list).
+        const callbacks = this._endCallbacks = cb ? [cb] : [];
+        this._chain = this._chain.then(() => shut).then((failure) => {
+          // A failed shutdown is the socket's error (node's afterShutdown
+          // destroys with it), not a rejection left on `_chain`.
+          if (failure !== undefined && failure !== kSocketClosed) this.destroy(failure);
+          this._endCallbacks = null;
           if (this.destroyed || this._writableState.errored) {
             // Never report success on a socket that died first: Node skips
-            // 'finish' entirely and hands the end callback the error.
-            if (cb) {
-              cb(this._writableState.errored ?? Object.assign(
+            // 'finish' entirely and hands the end callbacks the error.
+            if (callbacks.length > 0) {
+              const err = this._writableState.errored ?? Object.assign(
                 new Error(this._everConnected
                   ? "Socket is closed"
                   : "Socket closed before the connection was established"),
                 { code: this._everConnected
                   ? "ERR_SOCKET_CLOSED"
                   : "ERR_SOCKET_CLOSED_BEFORE_CONNECTION" },
-              ));
+              );
+              for (const callback of callbacks) callback(err);
             }
             return;
           }
           this._writableState.finished = true;
+          for (const callback of callbacks) callback(null);
           this.emit("finish");
-          if (cb) cb();
           if (!this.readable) this._doClose();
         });
         return this;
       }
 
+      // node's destroy(): the teardown is synchronous -- `destroyed`, the
+      // handle closed, the timer cleared -- and NOTHING is emitted inside
+      // the call. 'error' comes on the next tick (stream destroy's
+      // emitErrorNT) and 'close' after it: from the handle's close callback
+      // for a socket that has one (connected, or still connecting), which
+      // runs after the immediates already queued and before any timer; on
+      // the next tick, with no argument, for a socket that never had one
+      // (lib/net.js Socket.prototype._destroy). So a caller always returns
+      // from destroy() before any listener runs (#189): emitting inside the
+      // call ran a 'close' listener in the middle of whatever loop was
+      // destroying sockets -- node's own Agent.prototype.destroy indexes the
+      // list its 'close' listener splices -- and skipped every second one.
       destroy(err) {
         if (this.destroyed) return this;
+        // node creates the handle in connect(): a connecting socket has one.
+        const hadHandle = this._handle !== null || this.connecting;
         this.destroyed = true;
         this.readable = false;
         this.writable = false;
@@ -23375,11 +23643,20 @@
         // Destroyed while its name was still being looked up: nothing will
         // settle the connect, so release the writes queued behind it (they
         // fail with ERR_SOCKET_CLOSED_BEFORE_CONNECTION).
-        if (this._connectGate) {
-          const openGate = this._connectGate;
-          this._connectGate = null;
-          openGate();
+        this._releaseHeldOps();
+        // node's Writable.destroy -> errorBuffer: the callbacks of an end()
+        // still waiting for 'finish' get the error (or ERR_STREAM_DESTROYED)
+        // on the next tick -- before 'close', not once the shutdown op,
+        // which may be queued behind a write, settles (#156). A socket that
+        // never connected keeps its path through the end() chain: node
+        // hands those callbacks the error of the write held behind the
+        // connect, which fails only once that write is released.
+        if (this._everConnected && this._endCallbacks !== null && this._endCallbacks.length > 0) {
+          const pending = this._endCallbacks.splice(0);
+          const endErr = err || codes.ERR_STREAM_DESTROYED("end");
+          for (const callback of pending) process.nextTick(callback, endErr);
         }
+        this._endCallbacks = null;
         const rs = this._readableState;
         const ws = this._writableState;
         rs.destroyed = ws.destroyed = true;
@@ -23398,13 +23675,10 @@
           try { natives.tcpClose(this._handle); } catch (_) { /* noop */ }
           this._handle = null;
         }
-        if (err) {
-          this.emit("error", err);
-          rs.errorEmitted = ws.errorEmitted = true;
-        }
         rs.closed = ws.closed = true;
-        this.emit("close", !!err);
-        rs.closeEmitted = ws.closeEmitted = true;
+        if (err) process.nextTick(emitErrorNT, this, err);
+        if (hadHandle) closeCallback(emitCloseNT, this, !!err);
+        else process.nextTick(emitCloseNT, this);
         return this;
       }
 
@@ -23434,6 +23708,10 @@
             this.destroy(err);
             return;
           }
+          // Destroyed while the read was parked: closing the handle ends
+          // that read like an EOF, and a destroyed socket emits neither
+          // 'end' nor 'data' (node's handle stops reading in destroy()).
+          if (this.destroyed) return;
           if (chunk === undefined) {
             if (this._readableMode || this._holdData) {
               // Buffered or held: 'end' follows once what is left is read
@@ -23441,7 +23719,12 @@
               this._eofPending = true;
               if (this._readableMode) this.emit("readable");
             } else {
-              this._onReadEof();
+              // node's endReadableNT: 'end' is emitted from a tick, so what
+              // an 'end' listener defers -- with process.nextTick, or to a
+              // microtask -- runs relative to the auto end() as in node.
+              process.nextTick(() => {
+                if (!this.destroyed && !this._readableState.endEmitted) this._onReadEof();
+              });
             }
             break;
           }
@@ -23478,7 +23761,12 @@
             // (which also double-emitted 'finish').
             this._chain = this._chain.then(() => this._doClose());
           } else {
-            this.end();
+            // node's endWritableNT: the auto end() waits a tick, so a write
+            // an 'end' listener defers with process.nextTick still goes out
+            // (#164); one made later is writeAfterFIN's EPIPE (see write()).
+            process.nextTick(() => {
+              if (!this.destroyed && !this._writableState.ended) this.end();
+            });
           }
         } else if (!this.writable) {
           this._doClose();
@@ -23660,22 +23948,12 @@
         if (this.listenerCount("data") > 0) this._scheduleRelease();
       }
 
+      // Both sides are done ('end' and 'finish' are out): node destroys the
+      // socket, so the close is destroy()'s -- 'close' from the handle's
+      // close callback, never inside the write chain or the read loop that
+      // got here.
       _doClose() {
-        registry._activeHandles.delete(this);
-        leaveCount(this);
-        if (this._handle !== null) {
-          try { natives.tcpClose(this._handle); } catch (_) { /* noop */ }
-          this._handle = null;
-        }
-        if (!this.destroyed) {
-          this.destroyed = true;
-          const rs = this._readableState;
-          const ws = this._writableState;
-          rs.destroyed = ws.destroyed = true;
-          rs.closed = ws.closed = true;
-          this.emit("close", false);
-          rs.closeEmitted = ws.closeEmitted = true;
-        }
+        this.destroy();
       }
 
       setEncoding(encoding) { this._encoding = encoding; return this; }
@@ -23830,20 +24108,12 @@
       }
 
       listen(...args) {
-        let port, host, cb;
-        if (typeof args[0] === "object" && args[0] !== null) {
-          const opts = args[0];
-          port = opts.port;
-          host = opts.host;
-          cb = typeof args[1] === "function" ? args[1] : undefined;
-        } else {
-          port = args[0];
-          let idx = 1;
-          if (typeof args[idx] === "string") { host = args[idx]; idx++; }
-          if (typeof args[idx] === "number") { idx++; }
-          if (typeof args[idx] === "function") { cb = args[idx]; }
-        }
-        if (typeof cb === "function") this.once("listening", cb);
+        // node's reading of the arguments; a port that is not one throws
+        // from here (#163).
+        const listen = normalizeListenArgs(args);
+        if (refusePipeListen(this, listen)) return this;
+        const { port, host, ipv6Only, cb } = listen;
+        if (cb !== null) this.once("listening", cb);
         // Node binds (and so creates the TCPServerWrap) synchronously inside
         // listen(); createServer() alone registers nothing. Probed: after
         // createServer() _getActiveHandles() is [], on the line after
@@ -23852,12 +24122,13 @@
         // Supersede any in-flight accept loop from a previous listen() so
         // its tail cannot unregister this fresh registration.
         this._listenGeneration = (this._listenGeneration || 0) + 1;
-        const hostname = host || "0.0.0.0";
-        natives.tcpListen(hostname, port || 0).then(
+        // No host: node's default, dual-stack `::` (#172).
+        natives.tcpListen(host || null, port, ipv6Only).then(
           (bound) => {
             this._serverId = bound.serverId;
             this._port = bound.port;
-            this._host = bound.hostname || hostname;
+            this._host = bound.hostname;
+            this._family = bound.family;
             this.listening = true;
             // unref() before listen(): node remembers it (`this._unref`) and
             // applies it once the handle is bound -- here before the accept
@@ -23932,7 +24203,7 @@
 
       address() {
         return this.listening
-          ? { port: this._port, address: this._host, family: "IPv4" }
+          ? { address: this._host, family: this._family, port: this._port }
           : null;
       }
 
@@ -25640,23 +25911,19 @@
         super.setSecureContext(options);
         syncTls(this);
       }
-      listen(port, host, callback) {
-        if (typeof port === "object" && port !== null) {
-          callback = host;
-          host = port.host;
-          port = port.port;
-        }
-        if (typeof host === "function") {
-          callback = host;
-          host = undefined;
-        }
-        if (typeof callback === "function") this.once("listening", callback);
-        var hostname = host || "127.0.0.1";
+      listen(...args) {
+        // node's reading of the arguments; a port that is not one throws
+        // from here (#163).
+        var listen = normalizeListenArgs(args);
+        if (refusePipeListen(this, listen)) return this;
+        var port = listen.port, host = listen.host, callback = listen.cb;
+        if (callback !== null) this.once("listening", callback);
         var policy = registry._httpParserOptions.policy(this);
         var accept = tlsAcceptArgs(this);
         natives.httpsServe(
-          hostname,
-          port || 0,
+          // No host: node's default, dual-stack `::` (#172).
+          host || null,
+          port,
           ...accept,
           policy.maxHeaderSize,
           policy.insecure,
@@ -25664,10 +25931,11 @@
           // maxHeadersCount: null (the default) leaves the native 1000-field
           // cap; 0 is no limit; a number is that cap.
           this.maxHeadersCount,
+          listen.ipv6Only,
         ).then(
           (bound) => {
             this[kTlsSynced] = JSON.stringify(accept);
-            registry._httpParserOptions.bound(this, bound, hostname, true);
+            registry._httpParserOptions.bound(this, bound, true);
             // Anything changed while the server was binding.
             syncTls(this);
           },
@@ -25683,7 +25951,7 @@
       }
       address() {
         return this.listening
-          ? { port: this._port, address: this._host, family: "IPv4" }
+          ? { address: this._host, family: this._family, port: this._port }
           : null;
       }
       close(callback) {
@@ -27704,6 +27972,11 @@
           data = globalThis.Buffer.from(String(msg));
         }
 
+        // node validates the destination port once the message is read,
+        // synchronously, and 0 is not a port a datagram can be sent to
+        // (#163: 65536 was sent to 65535 and 1.5 to 1).
+        port = validatePort(port, "Port", false);
+
         if (offset !== undefined && offset !== 0 || length !== undefined) {
           data = data.slice(offset || 0, length !== undefined ? (offset || 0) + length : undefined);
         }
@@ -27883,6 +28156,53 @@
       });
     }
 
+    // node's getaddrinfo flags, as `dns.ADDRCONFIG` / `dns.V4MAPPED` /
+    // `dns.ALL` expose them: the system's AI_* values, which are glibc's (and
+    // musl's) on Linux and the BSD ones on Windows, macOS, the BSDs and
+    // Android (bionic's netdb.h has the BSD values: AI_ALL 0x100,
+    // AI_ADDRCONFIG 0x400, AI_V4MAPPED 0x800).
+    const [ADDRCONFIG, V4MAPPED, ALL] =
+      globalThis.process.platform === "linux"
+        ? [0x20, 0x8, 0x10]
+        : [0x400, 0x800, 0x100];
+
+    // node lib/dns.js lookup: `options.hints` must be a number; it is read as
+    // a uint32 and may carry no flag but those three
+    // (internal/dns/utils validateHints). Returns the hints to use.
+    function lookupHints(opts) {
+      if (opts.hints == null) return 0;
+      if (typeof opts.hints !== "number") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.hints", "number", opts.hints);
+      }
+      const hints = opts.hints >>> 0;
+      if ((hints & ~(ADDRCONFIG | ALL | V4MAPPED)) !== 0) {
+        throw codes.ERR_INVALID_ARG_VALUE("hints", hints);
+      }
+      return hints;
+    }
+
+    // dns.lookup with its hints. AI_V4MAPPED and AI_ALL mean something only
+    // for an IPv6 lookup, and getaddrinfo's rule for them is plain enough to
+    // apply to the unfiltered answer: V4MAPPED answers the IPv4 addresses as
+    // `::ffff:a.b.c.d` when there is no IPv6 one, and with ALL as well as the
+    // IPv6 ones. AI_ADDRCONFIG is not applied: oam's resolver is getaddrinfo
+    // without hints (docs/node-divergences.md).
+    function _dnsLookupHinted(hostname, family, all, hints) {
+      if (family !== 6 || (hints & V4MAPPED) === 0 || registry.get("net").isIP(String(hostname))) {
+        return _dnsLookup(hostname, family, all);
+      }
+      return _dnsLookup(hostname, 0, true).then((answers) => {
+        const v6 = answers.filter((a) => a.family === 6);
+        const mapped = answers
+          .filter((a) => a.family === 4)
+          .map((a) => ({ address: `::ffff:${a.address}`, family: 6 }));
+        const merged = hints & ALL ? v6.concat(mapped) : v6.length > 0 ? v6 : mapped;
+        // None at all is the error an IPv6 lookup of the name reports.
+        if (merged.length === 0) return _dnsLookup(hostname, 6, all);
+        return all ? merged : merged[0];
+      });
+    }
+
     function lookup(hostname, options, callback) {
       if (typeof options === "function") {
         callback = options;
@@ -27890,10 +28210,11 @@
       }
       if (typeof options === "number") options = { family: options };
       const opts = options || {};
+      const hints = lookupHints(opts);
       const family = opts.family || 0;
       const all = !!opts.all;
 
-      _dnsLookup(hostname, family, all).then(
+      _dnsLookupHinted(hostname, family, all, hints).then(
         (result) => {
           if (all) {
             callback(null, result);
@@ -28004,9 +28325,11 @@
     const promises = {
       lookup(hostname, options) {
         const opts = typeof options === "number" ? { family: options } : (options || {});
+        // node validates before it returns a promise: a bad `hints` throws.
+        const hints = lookupHints(opts);
         const family = opts.family || 0;
         const all = !!opts.all;
-        return _dnsLookup(hostname, family, all);
+        return _dnsLookupHinted(hostname, family, all, hints);
       },
       resolve(hostname, rrtype) {
         rrtype = (rrtype || "A").toUpperCase();
@@ -28079,10 +28402,6 @@
         throw err;
       }
     }
-
-    const ADDRCONFIG = 0;
-    const V4MAPPED = 0;
-    const ALL = 0;
 
     // net.connect / tls.connect / http read `dns.lookup` at call time, as
     // node does; while it is still this function they use oam's own resolver
@@ -28530,24 +28849,22 @@
         this._host = null;
         this.listening = false;
       }
-      listen(port, host, callback) {
-        if (typeof port === "object" && port !== null) {
-          callback = host;
-          host = port.host;
-          port = port.port;
-        }
-        if (typeof host === "function") {
-          callback = host;
-          host = undefined;
-        }
-        if (typeof callback === "function") this.once("listening", callback);
-        var hostname = host || "127.0.0.1";
+      listen(...args) {
+        // node's reading of the arguments; a port that is not one throws
+        // from here (#163).
+        var listen = normalizeListenArgs(args);
+        if (refusePipeListen(this, listen)) return this;
+        var port = listen.port, host = listen.host, callback = listen.cb;
+        if (callback !== null) this.once("listening", callback);
         var self = this;
-        natives.http2Serve(hostname, port || 0).then(
+        // No host: node's default, dual-stack `::` (#172). Args 2 and 3
+        // (the HTTP/1 head policy) are left to their defaults.
+        natives.http2Serve(host || null, port, undefined, undefined, listen.ipv6Only).then(
           function(bound) {
             self._serverId = bound.serverId;
             self._port = bound.port;
-            self._host = hostname;
+            self._host = bound.address;
+            self._family = bound.family;
             self.listening = true;
             self.emit("listening");
             (async function() {
@@ -28583,7 +28900,7 @@
       }
       address() {
         return this.listening
-          ? { port: this._port, address: this._host, family: "IPv4" }
+          ? { address: this._host, family: this._family, port: this._port }
           : null;
       }
       close(callback) {
@@ -31049,16 +31366,22 @@
         }
         var wrapped = this._releaseWrap();
         callback(err);
-        // node: the transport goes with the TLS socket, after its 'error'.
-        if (wrapped !== null) {
-          process.nextTick(() => {
-            if (!wrapped.destroyed && typeof wrapped.destroy === "function") wrapped.destroy();
-          });
-        }
         // Node emits 'close' from the handle-close callback: a loop turn
         // after 'end' / 'error', with `hadError`, so a listener attached
         // after awaiting 'end' still sees it.
-        globalThis.setImmediate(() => this.emit("close", !!err));
+        var emitClose = () => this.emit("close", !!err);
+        // node: the transport goes with the TLS socket, after its 'error',
+        // and its 'close' comes before this socket's -- the transport's
+        // destroy() defers its own 'close' to the same loop turn (#189), so
+        // this one is queued behind it.
+        if (wrapped !== null) {
+          process.nextTick(() => {
+            if (!wrapped.destroyed && typeof wrapped.destroy === "function") wrapped.destroy();
+            globalThis.setImmediate(emitClose);
+          });
+        } else {
+          globalThis.setImmediate(emitClose);
+        }
       }
       // The handshake getters read Node's TLSWrap handle, which exists from
       // construction and is gone once the socket is destroyed: null then
@@ -31641,7 +31964,10 @@
     // remoteAddress is the resolved IP, never the host name.
     function _connectTls(socket, options, callback, event) {
       var host = options.host || options.hostname || "localhost";
-      var port = options.port || 443;
+      // As given until lookupAndConnect has validated it; `dial` takes the
+      // number. node's tls.connect has no default port (https's 443 is the
+      // agent's): without one it throws ERR_MISSING_ARGS, below.
+      var port = options.port;
       var serverName = options.servername || host;
       var rejectUnauthorized = options.rejectUnauthorized !== false;
       // node's tls.connect, in its order, synchronously: the identity check
@@ -31676,6 +32002,11 @@
         socket._undestroy();
         socket._reading = false;
       }
+      // node: the TLS socket's connect() is net's, which needs a port or a
+      // path -- after the context is built, as tls.connect builds it first.
+      if (port === undefined && options.path == null) {
+        throw codes.ERR_MISSING_ARGS(["options", "port", "path"]);
+      }
       if (callback) socket.once(event, callback);
       socket._secureContext = context;
       var releaseContext = releaseSecureContext(socket, context, options);
@@ -31700,7 +32031,7 @@
         var connecting;
         try {
           connecting = natives.tlsConnect(
-            host, port, serverName, ca, rejectUnauthorized,
+            host, port | 0, serverName, ca, rejectUnauthorized,
             secure.id === null ? undefined : secure.id, identityCheck === null,
             tlsVersions.min, tlsVersions.max, attemptTimeout,
             spec === null ? undefined : JSON.stringify(spec),
@@ -32583,28 +32914,25 @@
         }
         if (old !== null) natives.tlsServerContextFree(old);
       }
-      listen(port, host, callback) {
-        if (typeof port === "object" && port !== null) {
-          callback = host;
-          host = port.host;
-          port = port.port;
-        }
-        if (typeof host === "function") {
-          callback = host;
-          host = undefined;
-        }
-        if (typeof callback === "function") this.once("listening", callback);
-        var hostname = host || "0.0.0.0";
+      listen(...args) {
+        // node's reading of the arguments; a port that is not one throws
+        // from here (#163).
+        var listen = normalizeListenArgs(args);
+        if (refusePipeListen(this, listen)) return this;
+        var port = listen.port, host = listen.host, callback = listen.cb;
+        if (callback !== null) this.once("listening", callback);
         this._closed = false;
 
         // Registered synchronously inside listen(), as net.Server is: Node
         // lists a listening tls.Server as a TCPServerWrap.
         registry._activeHandles.set(this, "TCPServerWrap");
-        natives.tcpListen(hostname, port || 0).then(
+        // No host: node's default, dual-stack `::` (#172).
+        natives.tcpListen(host || null, port, listen.ipv6Only).then(
           (bound) => {
             this._serverId = bound.serverId;
             this._port = bound.port;
-            this._host = bound.hostname || hostname;
+            this._host = bound.hostname;
+            this._family = bound.family;
             this.listening = true;
             // unref() before listen(), applied once bound (as net.Server).
             if (this._handleRefed === false) natives.tcpServerSetRef(bound.serverId, false);
@@ -32793,7 +33121,7 @@
       }
       address() {
         return this.listening
-          ? { port: this._port, address: this._host, family: this._host.includes(":") ? "IPv6" : "IPv4" }
+          ? { address: this._host, family: this._family, port: this._port }
           : null;
       }
       close(callback) {

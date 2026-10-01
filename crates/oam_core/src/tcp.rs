@@ -7,7 +7,7 @@
 //! resurrection when a close races an in-flight read/write -- and holds
 //! nothing else: a marker lives exactly as long as the await it guards.
 
-use crate::{OpOutcome, node_errno, node_error_code, node_error_message};
+use crate::{NodeSysError, OpOutcome, node_errno, node_error_code, node_error_message};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -26,6 +26,11 @@ pub struct TcpState {
     /// Halves currently out of the maps for an await, per stream handle.
     in_flight: HashMap<u64, u32>,
     cancel: HashMap<u64, std::sync::Arc<tokio::sync::Notify>>,
+    /// The back of each stream handle's write queue: the latest `tcp_write`
+    /// or `tcp_shutdown` issued for it and still pending (see [`WriteTurn`]).
+    /// The last turn out removes the entry.
+    write_tail: HashMap<u64, (u64, tokio::sync::oneshot::Receiver<()>)>,
+    write_seq: u64,
 }
 
 impl TcpState {
@@ -78,6 +83,13 @@ impl TcpState {
             self.writers.len(),
         )
     }
+
+    /// Handles with a write or a shutdown still queued: 0 once every one
+    /// issued has finished.
+    #[cfg(test)]
+    pub(crate) fn queued_writes(&self) -> usize {
+        self.write_tail.len()
+    }
 }
 
 pub type TcpRegistry = std::sync::Arc<std::sync::Mutex<TcpState>>;
@@ -97,6 +109,87 @@ impl Drop for InFlight {
             .unwrap_or_else(|e| e.into_inner())
             .release(self.handle);
     }
+}
+
+/// One op's place in its stream handle's write queue.
+///
+/// A write and the shutdown behind it are two ops, and each takes the write
+/// half out of the registry for as long as it runs. With no order between
+/// them, a `tcp_shutdown` issued while a write was in flight found no writer
+/// and returned without sending a FIN -- the half went back afterwards, and
+/// the FIN left only when the socket was closed -- so `socket.end()` had to
+/// wait for the write's promise before it could even ask: the FIN went out
+/// one op round trip late, where libuv queues the shutdown behind the write
+/// and sends it in the same loop turn (#156).
+///
+/// The place is taken when the op is ISSUED -- synchronously, inside
+/// `tcp_write` / `tcp_shutdown`, before the future they return is first
+/// polled -- so the order is the order JS made the calls in, whatever order
+/// the runtime polls the futures in. Each turn waits for the one before it
+/// and releases the next when it is dropped: finished, failed, or abandoned
+/// (a turn abandoned while still waiting releases the next early; that only
+/// happens when the runtime is dropping its tasks).
+///
+/// An op issued while nothing is queued does not take a turn at all when the
+/// socket can finish it on the spot (see [`tcp_write`], [`tcp_shutdown`]).
+struct WriteTurn {
+    registry: TcpRegistry,
+    handle: u64,
+    seq: u64,
+    before: Option<tokio::sync::oneshot::Receiver<()>>,
+    /// Never sent on: dropped with the turn, which is what wakes the next.
+    _done: tokio::sync::oneshot::Sender<()>,
+}
+
+impl WriteTurn {
+    /// The next place in `handle`'s queue. `state` is `registry`, locked by
+    /// the caller: whatever it checked before queueing still holds.
+    fn take(state: &mut TcpState, registry: &TcpRegistry, handle: u64) -> WriteTurn {
+        let (done, released) = tokio::sync::oneshot::channel();
+        state.write_seq += 1;
+        let seq = state.write_seq;
+        let before = state
+            .write_tail
+            .insert(handle, (seq, released))
+            .map(|(_, before)| before);
+        WriteTurn {
+            registry: registry.clone(),
+            handle,
+            seq,
+            before,
+            _done: done,
+        }
+    }
+
+    /// Until every write and shutdown issued before this one is done.
+    async fn wait(&mut self) {
+        if let Some(before) = self.before.take() {
+            // Err is the turn before being dropped: exactly the signal.
+            let _ = before.await;
+        }
+    }
+}
+
+impl Drop for WriteTurn {
+    fn drop(&mut self) {
+        let mut guard = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        if guard
+            .write_tail
+            .get(&self.handle)
+            .is_some_and(|(seq, _)| *seq == self.seq)
+        {
+            guard.write_tail.remove(&self.handle);
+        }
+    }
+}
+
+/// How a write or a shutdown left the call that issued it.
+enum Issued {
+    /// Finished on the spot.
+    Done(OpOutcome),
+    /// Queued behind the handle's earlier writes, `written` bytes of it
+    /// already taken by the socket.
+    Queued { turn: WriteTurn, written: usize },
 }
 
 fn reinsert_reader(registry: &TcpRegistry, handle: u64, reader: OwnedReadHalf) -> bool {
@@ -145,6 +238,129 @@ pub(crate) fn addr_to_json(addr: std::net::SocketAddr) -> serde_json::Value {
         "port": addr.port(),
         "family": if addr.is_ipv6() { "IPv6" } else { "IPv4" },
     })
+}
+
+/// Where a server's `listen()` asked to listen: the host it named (`None`:
+/// none), the port, and node's `ipv6Only` option.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenAt {
+    pub host: Option<String>,
+    pub port: u16,
+    pub ipv6_only: bool,
+}
+
+/// The backlog every listener is created with: node's default (lib/net.js
+/// `backlog || 511`).
+const LISTEN_BACKLOG: i32 = 511;
+
+/// Bind and listen as node's `server.listen()` does (lib/net.js
+/// `setupListenHandle` / `createServerHandle`, libuv underneath), for every
+/// server kind -- net, tls, http, https and http2:
+///
+/// - No host: `::`, dual-stack, so IPv4 clients reach it too (as
+///   `::ffff:a.b.c.d`). Where that socket cannot be had -- no IPv6 on the
+///   host -- `0.0.0.0` instead. An address in use is not a reason to fall
+///   back: libuv reports it at `listen`, after the choice was made, so it
+///   fails on `::`.
+/// - An IPv6 address, `::` included, is dual-stack too unless `ipv6Only`.
+/// - A name is looked up (getaddrinfo, the resolver's order) and the first
+///   address is bound, as node's `lookupAndListen` does.
+///
+/// Returns the listener and the address it is bound at. A failure is node's
+/// `listen` error (`listen EADDRINUSE: address already in use :::8080`), or
+/// the lookup's for a name.
+pub async fn bind_listener(
+    at: &ListenAt,
+) -> Result<(tokio::net::TcpListener, std::net::SocketAddr), NodeSysError> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    let ip = match at.host.as_deref() {
+        None => {
+            let any6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), at.port);
+            match bind_one(any6, at.ipv6_only) {
+                Ok(bound) => return Ok(bound),
+                Err(ListenFailure::Listen(e)) => return Err(listen_error(&e, "::", at.port)),
+                Err(ListenFailure::Bind(e)) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    return Err(listen_error(&e, "::", at.port));
+                }
+                Err(ListenFailure::Bind(_)) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            }
+        }
+        Some(host) => match host.parse::<IpAddr>() {
+            Ok(ip) => ip,
+            Err(_) => match crate::net_connect::resolve(host, None).await {
+                Ok(addrs) => addrs[0],
+                Err(crate::net_connect::ConnectError::Resolve(e)) => return Err(*e),
+                Err(other) => {
+                    return Err(listen_error(&std::io::Error::other(other), host, at.port));
+                }
+            },
+        },
+    };
+    match bind_one(SocketAddr::new(ip, at.port), at.ipv6_only) {
+        Ok(bound) => Ok(bound),
+        Err(ListenFailure::Bind(e) | ListenFailure::Listen(e)) => {
+            Err(listen_error(&e, &ip.to_string(), at.port))
+        }
+    }
+}
+
+/// Which step of [`bind_one`] failed: up to and including the bind, or the
+/// listen after it.
+enum ListenFailure {
+    Bind(std::io::Error),
+    Listen(std::io::Error),
+}
+
+/// One listening socket at `addr`: SO_REUSEADDR off Windows (as libuv and
+/// std set it), IPV6_V6ONLY as `ipv6_only` says for an IPv6 one.
+fn bind_one(
+    addr: std::net::SocketAddr,
+    ipv6_only: bool,
+) -> Result<(tokio::net::TcpListener, std::net::SocketAddr), ListenFailure> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
+        .map_err(ListenFailure::Bind)?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(ipv6_only).map_err(ListenFailure::Bind)?;
+    }
+    #[cfg(not(windows))]
+    socket
+        .set_reuse_address(true)
+        .map_err(ListenFailure::Bind)?;
+    socket.bind(&addr.into()).map_err(ListenFailure::Bind)?;
+    socket
+        .listen(LISTEN_BACKLOG)
+        .map_err(ListenFailure::Listen)?;
+    socket
+        .set_nonblocking(true)
+        .map_err(ListenFailure::Listen)?;
+    let listener =
+        tokio::net::TcpListener::from_std(socket.into()).map_err(ListenFailure::Listen)?;
+    let local = listener.local_addr().map_err(ListenFailure::Listen)?;
+    Ok((listener, local))
+}
+
+/// node's `UVExceptionWithHostPort(err, 'listen', address, port)`: `listen
+/// CODE: <uv message> address:port`, the `:port` (and a `port` key) only for
+/// a non-zero port.
+fn listen_error(error: &std::io::Error, address: &str, port: u16) -> NodeSysError {
+    let code = node_error_code(error);
+    let text = crate::uv_strerror(code)
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string());
+    let mut message = format!("listen {code}: {text} {address}");
+    if port > 0 {
+        message.push_str(&format!(":{port}"));
+    }
+    NodeSysError {
+        code: code.to_string(),
+        message,
+        errno: node_errno(code, error),
+        syscall: Some("listen".to_string()),
+        hostname: None,
+        address: Some(address.to_string()),
+        port: (port > 0).then_some(port),
+    }
 }
 
 /// Map an IO error to a NodeFailed outcome with the appropriate syscall.
@@ -256,45 +472,174 @@ pub async fn tcp_read(registry: TcpRegistry, handle: u64, len: usize) -> OpOutco
 
 /// Write bytes to a TCP stream. Remove-await-reinsert on the write half
 /// only -- reads proceed independently.
-pub async fn tcp_write(registry: TcpRegistry, handle: u64, data: Vec<u8>) -> OpOutcome {
-    let writer = registry
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take_writer(handle);
-    let Some(mut writer) = writer else {
-        return OpOutcome::Failed(format!("tcp: write handle {handle} is gone"));
-    };
-    let _in_flight = InFlight {
-        registry: registry.clone(),
-        handle,
-    };
+///
+/// The write starts HERE, in the call, before the returned future is polled:
+///
+/// - With nothing queued for the handle, the socket is offered the bytes at
+///   once (libuv's `uv_try_write`). What a writable socket takes is on the
+///   wire when this returns, so a write the kernel had room for is complete
+///   whatever happens to the handle next -- as in node, where `write()` then
+///   `destroy()` still delivers the write.
+/// - What is left (or all of it, behind earlier writes) takes the next
+///   place in the handle's write queue ([`WriteTurn`]): writes and the
+///   shutdown of one handle run in the order they were issued.
+pub fn tcp_write(
+    registry: TcpRegistry,
+    handle: u64,
+    data: Vec<u8>,
+) -> impl std::future::Future<Output = OpOutcome> + Send + 'static {
+    started_future(tcp_write_start(registry, handle, data))
+}
 
-    match writer.write_all(&data).await {
-        Ok(()) => {
-            reinsert_writer(&registry, handle, writer);
-            OpOutcome::Done
+/// [`tcp_write`], telling the caller whether the write finished in the
+/// call: [`Started::Done`] when the socket took every byte at once (or the
+/// write failed on the spot), [`Started::Pending`] with the rest of the
+/// write otherwise. The engine settles a write that finished in the call
+/// without a trip through the event loop, as libuv reports a `uv_try_write`
+/// that took everything: node runs that write's callback before the 'close'
+/// of a `destroy()` on the next line, and so must oam (#156).
+pub fn tcp_write_start(
+    registry: TcpRegistry,
+    handle: u64,
+    data: Vec<u8>,
+) -> Started<impl std::future::Future<Output = OpOutcome> + Send + 'static> {
+    let issued = {
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        let mut written = 0;
+        let mut finished = None;
+        if !guard.write_tail.contains_key(&handle) {
+            // Nothing queued means nothing in flight either: the half is in
+            // the map unless the handle is closed or already shut down.
+            match guard.writers.get(&handle) {
+                None => {
+                    finished = Some(OpOutcome::Failed(format!(
+                        "tcp: write handle {handle} is gone"
+                    )));
+                }
+                Some(writer) => match writer.try_write(&data) {
+                    Ok(n) if n == data.len() => finished = Some(OpOutcome::Done),
+                    Ok(n) => written = n,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => finished = Some(tcp_fail(e, "write", &handle.to_string())),
+                },
+            }
         }
-        Err(e) => tcp_fail(e, "write", &handle.to_string()),
-    }
+        match finished {
+            Some(outcome) => Issued::Done(outcome),
+            None => Issued::Queued {
+                turn: WriteTurn::take(&mut guard, &registry, handle),
+                written,
+            },
+        }
+    };
+    let (mut turn, written) = match issued {
+        Issued::Done(outcome) => return Started::Done(outcome),
+        Issued::Queued { turn, written } => (turn, written),
+    };
+    Started::Pending(async move {
+        turn.wait().await;
+        let writer = registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_writer(handle);
+        let Some(mut writer) = writer else {
+            return OpOutcome::Failed(format!("tcp: write handle {handle} is gone"));
+        };
+        // Declared after `turn`, so dropped before it: the half is back in
+        // the registry (or gone) by the time the next turn is released.
+        let _in_flight = InFlight {
+            registry: registry.clone(),
+            handle,
+        };
+
+        match writer.write_all(&data[written..]).await {
+            Ok(()) => {
+                reinsert_writer(&registry, handle, writer);
+                OpOutcome::Done
+            }
+            Err(e) => tcp_fail(e, "write", &handle.to_string()),
+        }
+    })
 }
 
 /// Half-close the write side (sends FIN). Removes the write half and
-/// drops it after shutdown -- no further writes are possible.
-pub async fn tcp_shutdown(registry: TcpRegistry, handle: u64) -> OpOutcome {
-    let writer = registry
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .take_writer(handle);
-    let Some(mut writer) = writer else {
-        return OpOutcome::Done;
+/// drops it -- no further writes are possible.
+///
+/// Like [`tcp_write`], it starts in the call. With nothing queued for the
+/// handle the FIN leaves at once; otherwise the shutdown takes the next
+/// place in the handle's write queue ([`WriteTurn`]), as libuv queues a
+/// shutdown behind its writes, and the FIN leaves as soon as the last byte
+/// before it has been written. Either way a caller asks for the FIN in the
+/// same turn as its last write, without waiting for that write to finish.
+pub fn tcp_shutdown(
+    registry: TcpRegistry,
+    handle: u64,
+) -> impl std::future::Future<Output = OpOutcome> + Send + 'static {
+    started_future(tcp_shutdown_start(registry, handle))
+}
+
+/// [`tcp_shutdown`], telling the caller whether it finished in the call
+/// (see [`tcp_write_start`]): with nothing queued the FIN leaves at once.
+pub fn tcp_shutdown_start(
+    registry: TcpRegistry,
+    handle: u64,
+) -> Started<impl std::future::Future<Output = OpOutcome> + Send + 'static> {
+    let issued = {
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.write_tail.contains_key(&handle) {
+            Issued::Queued {
+                turn: WriteTurn::take(&mut guard, &registry, handle),
+                written: 0,
+            }
+        } else {
+            // Dropping the half IS the shutdown: tokio shuts the write side
+            // of the socket down when an owned write half goes. Nothing to
+            // do for a handle that is closed or already shut down.
+            drop(guard.writers.remove(&handle));
+            Issued::Done(OpOutcome::Done)
+        }
     };
-    let _in_flight = InFlight {
-        registry: registry.clone(),
-        handle,
+    let mut turn = match issued {
+        Issued::Done(outcome) => return Started::Done(outcome),
+        Issued::Queued { turn, .. } => turn,
     };
-    let _ = writer.shutdown().await;
-    drop(writer);
-    OpOutcome::Done
+    Started::Pending(async move {
+        turn.wait().await;
+        let writer = registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take_writer(handle);
+        let Some(mut writer) = writer else {
+            return OpOutcome::Done;
+        };
+        let _in_flight = InFlight {
+            registry: registry.clone(),
+            handle,
+        };
+        let _ = writer.shutdown().await;
+        drop(writer);
+        OpOutcome::Done
+    })
+}
+
+/// How [`tcp_write_start`] or [`tcp_shutdown_start`] left the call.
+pub enum Started<F> {
+    /// Finished in the call, with this outcome.
+    Done(OpOutcome),
+    /// Still to finish: the future completes the op.
+    Pending(F),
+}
+
+/// The single future [`tcp_write`] / [`tcp_shutdown`] return, whichever way
+/// the op left the call.
+async fn started_future<F>(started: Started<F>) -> OpOutcome
+where
+    F: std::future::Future<Output = OpOutcome>,
+{
+    match started {
+        Started::Done(outcome) => outcome,
+        Started::Pending(rest) => rest.await,
+    }
 }
 
 /// Close a TCP stream. Remove both halves and, if one is out for an await,
@@ -309,23 +654,17 @@ pub fn tcp_close(registry: &TcpRegistry, handle: u64) {
     }
 }
 
-/// net.createServer + server.listen: bind a TCP listener.
-/// Returns Json {serverId, port, hostname}.
+/// net.createServer + server.listen: bind a TCP listener ([`bind_listener`]).
+/// Returns Json {serverId, port, hostname, family}.
 pub async fn tcp_listen(
     registry: TcpRegistry,
     ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    host: String,
-    port: u16,
+    at: ListenAt,
 ) -> OpOutcome {
-    let addr = format!("{host}:{port}");
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => return tcp_fail(e, "listen", &addr),
+    let (listener, local_addr) = match bind_listener(&at).await {
+        Ok(bound) => bound,
+        Err(e) => return OpOutcome::sys(e),
     };
-
-    let local_addr = listener.local_addr().ok();
-    let bound_port = local_addr.map(|a| a.port()).unwrap_or(port);
-    let hostname = local_addr.map(|a| a.ip().to_string()).unwrap_or(host);
 
     let server_id = ids.fetch_add(1, Ordering::Relaxed);
     registry
@@ -337,8 +676,9 @@ pub async fn tcp_listen(
     OpOutcome::Json(
         serde_json::json!({
             "serverId": server_id,
-            "port": bound_port,
-            "hostname": hostname,
+            "port": local_addr.port(),
+            "hostname": local_addr.ip().to_string(),
+            "family": if local_addr.is_ipv6() { "IPv6" } else { "IPv4" },
         })
         .to_string(),
     )
@@ -544,8 +884,16 @@ mod tests {
         let ids = std::sync::Arc::new(AtomicU64::new(1));
 
         for shape in 0..3 {
-            let OpOutcome::Json(payload) =
-                tcp_listen(registry.clone(), ids.clone(), "127.0.0.1".into(), 0).await
+            let OpOutcome::Json(payload) = tcp_listen(
+                registry.clone(),
+                ids.clone(),
+                ListenAt {
+                    host: Some("127.0.0.1".into()),
+                    port: 0,
+                    ipv6_only: false,
+                },
+            )
+            .await
             else {
                 panic!("listen failed");
             };
@@ -685,5 +1033,255 @@ mod tests {
             (0, 0, 0, 0, 0),
             "(closed, cancel, in_flight, readers, writers)"
         );
+    }
+
+    /// A blocking peer on its own thread: accepts one connection, waits
+    /// `before_reading`, reads to EOF and reports how many bytes came and
+    /// whether the stream then ended cleanly. It never writes and closes only
+    /// after the EOF, so an EOF it sees is the FIN of a shutdown, not of a
+    /// close.
+    fn reading_peer(
+        before_reading: std::time::Duration,
+    ) -> (u16, std::sync::mpsc::Receiver<std::io::Result<usize>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            std::thread::sleep(before_reading);
+            let mut all = Vec::new();
+            let result = std::io::Read::read_to_end(&mut stream, &mut all).map(|_| all.len());
+            let _ = tx.send(result);
+        });
+        (port, rx)
+    }
+
+    async fn connected(registry: &TcpRegistry, ids: &std::sync::Arc<AtomicU64>, port: u16) -> u64 {
+        let OpOutcome::Json(payload) = tcp_connect(
+            registry.clone(),
+            ids.clone(),
+            "127.0.0.1".into(),
+            port,
+            crate::net_connect::DEFAULT_ATTEMPT_TIMEOUT,
+        )
+        .await
+        else {
+            panic!("connect failed");
+        };
+        let info: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        info["handle"].as_u64().unwrap()
+    }
+
+    /// Writes to `handle` until one does not fit the socket and is queued:
+    /// from here on a write is certainly in flight (the peer is not reading
+    /// yet). How much a socket takes before that is the platform's business
+    /// -- Windows accepts a whole buffer of any size once, Linux fills its
+    /// send buffer -- so the writes are issued until the queue shows one.
+    /// Returns the writes' futures, not yet polled, and the bytes issued.
+    fn write_until_queued(
+        registry: &TcpRegistry,
+        handle: u64,
+    ) -> (
+        Vec<impl std::future::Future<Output = OpOutcome> + Send + 'static>,
+        usize,
+    ) {
+        const CHUNK: usize = 4 * 1024 * 1024;
+        let mut writes = Vec::new();
+        while registry.lock().unwrap().queued_writes() == 0 {
+            assert!(
+                writes.len() < 256,
+                "the socket took 1 GiB without queueing a write"
+            );
+            writes.push(tcp_write(registry.clone(), handle, vec![7u8; CHUNK]));
+        }
+        let issued = writes.len() * CHUNK;
+        (writes, issued)
+    }
+
+    /// #156: a shutdown issued while a write is still in flight sends the
+    /// data and then the FIN. Before the write queue it found the write half
+    /// checked out, returned at once and sent nothing: the peer saw no EOF
+    /// until the handle was closed.
+    ///
+    /// The shutdown is spawned FIRST, to pin that the order is the order of
+    /// the calls, not of the polls.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_issued_behind_a_write_in_flight_sends_the_data_then_the_fin() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let (port, peer) = reading_peer(std::time::Duration::from_millis(200));
+        let handle = connected(&registry, &ids, port).await;
+
+        let (writes, issued) = write_until_queued(&registry, handle);
+        let shutdown = tokio::spawn(tcp_shutdown(registry.clone(), handle));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        for write in writes {
+            assert!(matches!(
+                tokio::spawn(write).await.unwrap(),
+                OpOutcome::Done
+            ));
+        }
+        assert!(matches!(shutdown.await.unwrap(), OpOutcome::Done));
+        // The handle is still open: the EOF below is the shutdown's FIN.
+        let received = tokio::task::spawn_blocking(move || {
+            peer.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .unwrap()
+        .expect("the peer saw no EOF: the FIN was never sent")
+        .expect("the peer's read failed");
+        assert_eq!(
+            received, issued,
+            "every byte written arrives before the FIN"
+        );
+
+        // A write issued after the shutdown has no half to write to.
+        assert!(matches!(
+            tcp_write(registry.clone(), handle, b"late".to_vec()).await,
+            OpOutcome::Failed(_)
+        ));
+        assert_eq!(registry.lock().unwrap().queued_writes(), 0);
+        tcp_close(&registry, handle);
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+    }
+
+    /// #156, the common shape (`socket.write(response); socket.end()`): a
+    /// write the socket has room for and the shutdown behind it are both
+    /// done when the calls that issue them return -- the futures are not
+    /// polled until the peer has read the data and seen the FIN. That is
+    /// what lets JS ask for the FIN in the same turn as the write.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_that_fits_and_its_shutdown_are_on_the_wire_when_issued() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let (port, peer) = reading_peer(std::time::Duration::ZERO);
+        let handle = connected(&registry, &ids, port).await;
+
+        let write = tcp_write(registry.clone(), handle, b"response".to_vec());
+        let shutdown = tcp_shutdown(registry.clone(), handle);
+        assert_eq!(
+            registry.lock().unwrap().queued_writes(),
+            0,
+            "a connected socket takes a small write at once: nothing is queued"
+        );
+        let received = tokio::task::spawn_blocking(move || {
+            peer.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .unwrap()
+        .expect("the peer saw no EOF before the futures were polled")
+        .expect("the peer's read failed");
+        assert_eq!(received, b"response".len());
+
+        assert!(matches!(write.await, OpOutcome::Done));
+        assert!(matches!(shutdown.await, OpOutcome::Done));
+        tcp_close(&registry, handle);
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+    }
+
+    /// A handle closed while writes and a shutdown are queued leaves nothing
+    /// behind: the write in flight ends (the close marker stops its half
+    /// going back), the ops behind it find no half, and the queue's tail
+    /// entry goes with the last turn.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_with_writes_queued_leaves_no_bookkeeping_behind() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        // A peer that reads only once the handle has been closed.
+        let (port, peer) = reading_peer(std::time::Duration::from_millis(300));
+        let handle = connected(&registry, &ids, port).await;
+
+        let (writes, _) = write_until_queued(&registry, handle);
+        let writes: Vec<_> = writes.into_iter().map(tokio::spawn).collect();
+        let behind = tokio::spawn(tcp_write(registry.clone(), handle, b"behind".to_vec()));
+        let shutdown = tokio::spawn(tcp_shutdown(registry.clone(), handle));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tcp_close(&registry, handle);
+
+        // The queued write holds its half; once the peer drains (or resets)
+        // it, it ends one way or the other. The ops behind it find the
+        // handle gone.
+        for write in writes {
+            let _ = write.await.unwrap();
+        }
+        assert!(matches!(behind.await.unwrap(), OpOutcome::Failed(_)));
+        assert!(matches!(shutdown.await.unwrap(), OpOutcome::Done));
+        let _ = tokio::task::spawn_blocking(move || {
+            peer.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await;
+        assert_eq!(registry.lock().unwrap().queued_writes(), 0);
+        assert_eq!(
+            registry.lock().unwrap().bookkeeping(),
+            (0, 0, 0, 0, 0),
+            "(closed, cancel, in_flight, readers, writers)"
+        );
+    }
+
+    /// #172: a listen() without a host is node's dual-stack `::`, an explicit
+    /// `::` too unless `ipv6Only`, and an address in use fails on `::` with
+    /// node's listen error rather than falling back to IPv4.
+    #[tokio::test]
+    async fn a_listener_without_a_host_is_dual_stack_as_node_s() {
+        let at = |host: Option<&str>, port: u16, ipv6_only: bool| ListenAt {
+            host: host.map(str::to_string),
+            port,
+            ipv6_only,
+        };
+        // Through oam's connector: a refused loopback connect is prompt on
+        // Windows there.
+        let options = crate::net_connect::ConnectOptions::default();
+        let reaches = async |port: u16, ip: &str| {
+            crate::net_connect::connect(ip, port, &options)
+                .await
+                .is_ok()
+        };
+        for (host, ipv6_only, v4, v6) in [
+            (None, false, true, true),
+            (Some("::"), false, true, true),
+            (None, true, false, true),
+            (Some("::"), true, false, true),
+            (Some("0.0.0.0"), false, true, false),
+            (Some("127.0.0.1"), false, true, false),
+        ] {
+            let (listener, local) = bind_listener(&at(host, 0, ipv6_only)).await.unwrap();
+            let expected = match host {
+                None => "::",
+                Some(h) => h,
+            };
+            assert_eq!(local.ip().to_string(), expected, "{host:?}");
+            let port = local.port();
+            let (r4, r6) = (reaches(port, "127.0.0.1").await, reaches(port, "::1").await);
+            assert_eq!((r4, r6), (v4, v6), "{host:?} ipv6Only={ipv6_only}");
+            drop(listener);
+        }
+
+        // Port in use: node's `listen EADDRINUSE: address already in use
+        // :::PORT`, on `::` -- libuv reports it at listen, after the
+        // address was chosen.
+        let (held, local) = bind_listener(&at(None, 0, false)).await.unwrap();
+        let Err(error) = bind_listener(&at(None, local.port(), false)).await else {
+            panic!("a second listener on the same port must fail");
+        };
+        assert_eq!(error.code, "EADDRINUSE");
+        assert_eq!(
+            error.message,
+            format!(
+                "listen EADDRINUSE: address already in use :::{}",
+                local.port()
+            )
+        );
+        assert_eq!(error.syscall.as_deref(), Some("listen"));
+        assert_eq!(error.address.as_deref(), Some("::"));
+        assert_eq!(error.port, Some(local.port()));
+        drop(held);
     }
 }

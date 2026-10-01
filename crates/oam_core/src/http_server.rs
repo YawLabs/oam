@@ -1291,8 +1291,8 @@ pub async fn http_serve(
     state: Arc<HttpState>,
     tcp: super::tcp::TcpRegistry,
     tcp_ids: Arc<std::sync::atomic::AtomicU64>,
-    host: String,
-    port: u16,
+    // Where to listen, as node's net.Server does (super::tcp::bind_listener).
+    at: super::tcp::ListenAt,
     // Dispatch the JS handler on headers and stream the body (slice 2 of
     // docs/design/streaming-bodies.md). Off = today's buffered behavior.
     stream_request_body: bool,
@@ -1301,11 +1301,10 @@ pub async fn http_serve(
     // node's server timeouts (headersTimeout, keepAliveTimeout, ...).
     timeouts: TimeoutSettings,
 ) -> super::OpOutcome {
-    let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
-        Ok(listener) => listener,
-        Err(e) => return super::OpOutcome::Failed(format!("listen {host}:{port}: {e}")),
+    let (listener, local) = match super::tcp::bind_listener(&at).await {
+        Ok(bound) => bound,
+        Err(e) => return super::OpOutcome::sys(e),
     };
-    let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     let server_id = state.next_id();
     let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1508,7 +1507,13 @@ pub async fn http_serve(
     });
 
     super::OpOutcome::Json(
-        serde_json::json!({ "serverId": server_id, "port": local_port }).to_string(),
+        serde_json::json!({
+            "serverId": server_id,
+            "port": local.port(),
+            "address": local.ip().to_string(),
+            "family": node_family(&local),
+        })
+        .to_string(),
     )
 }
 
@@ -2126,8 +2131,8 @@ async fn dispatch_request(
 #[allow(clippy::too_many_arguments)]
 pub async fn https_serve(
     state: Arc<HttpState>,
-    host: String,
-    port: u16,
+    // Where to listen, as node's net.Server does (super::tcp::bind_listener).
+    at: super::tcp::ListenAt,
     // The secure context and accept options, replaceable from JS.
     tls: Arc<HttpsTls>,
     // maxHeaderSize / insecureHTTPParser for this server.
@@ -2140,11 +2145,10 @@ pub async fn https_serve(
     tls_registry: crate::tls::TlsRegistry,
     body_ids: Arc<std::sync::atomic::AtomicU64>,
 ) -> super::OpOutcome {
-    let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
-        Ok(listener) => listener,
-        Err(e) => return super::OpOutcome::Failed(format!("listen {host}:{port}: {e}")),
+    let (listener, local) = match super::tcp::bind_listener(&at).await {
+        Ok(bound) => bound,
+        Err(e) => return super::OpOutcome::sys(e),
     };
-    let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     let server_id = state.next_id();
     let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -2317,7 +2321,13 @@ pub async fn https_serve(
     });
 
     super::OpOutcome::Json(
-        serde_json::json!({ "serverId": server_id, "port": local_port }).to_string(),
+        serde_json::json!({
+            "serverId": server_id,
+            "port": local.port(),
+            "address": local.ip().to_string(),
+            "family": node_family(&local),
+        })
+        .to_string(),
     )
 }
 
@@ -2593,16 +2603,15 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 /// semantics: h2c with prior knowledge AND HTTP/1.1 clients both work.
 pub async fn http2_serve(
     state: Arc<HttpState>,
-    host: String,
-    port: u16,
+    // Where to listen, as node's net.Server does (super::tcp::bind_listener).
+    at: super::tcp::ListenAt,
     // Applied to the HTTP/1 connections this server also accepts.
     policy: HeadPolicy,
 ) -> super::OpOutcome {
-    let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
-        Ok(listener) => listener,
-        Err(e) => return super::OpOutcome::Failed(format!("listen {host}:{port}: {e}")),
+    let (listener, local) = match super::tcp::bind_listener(&at).await {
+        Ok(bound) => bound,
+        Err(e) => return super::OpOutcome::sys(e),
     };
-    let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     let server_id = state.next_id();
     let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -2772,7 +2781,13 @@ pub async fn http2_serve(
     });
 
     super::OpOutcome::Json(
-        serde_json::json!({ "serverId": server_id, "port": local_port }).to_string(),
+        serde_json::json!({
+            "serverId": server_id,
+            "port": local.port(),
+            "address": local.ip().to_string(),
+            "family": node_family(&local),
+        })
+        .to_string(),
     )
 }
 

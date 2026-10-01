@@ -1,9 +1,10 @@
 //! WebSocket client: the browser-standard WebSocket global.
 //!
-//! Architecture: `connect_async` establishes the connection, then a bridge
-//! task runs on the tokio runtime pumping frames between two mpsc channels
-//! and the underlying stream. The JS side sends/receives through the
-//! channels via ops; the bridge task owns all async I/O.
+//! Architecture: `ws_connect` dials with the connector net, tls, fetch and
+//! http share (`net_connect`) and runs the handshake over that stream, then
+//! a bridge task runs on the tokio runtime pumping frames between two mpsc
+//! channels and the underlying stream. The JS side sends/receives through
+//! the channels via ops; the bridge task owns all async I/O.
 //!
 //! Channel-based rather than split-stream: avoids storing complex split
 //! types in the registry and lets send+recv proceed independently without
@@ -13,7 +14,6 @@ use crate::OpOutcome;
 use futures_util::{SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 pub enum WsFrame {
@@ -68,23 +68,61 @@ async fn bridge(
     }
 }
 
+/// The host and port a WebSocket URL is dialled at: the URL's own, the
+/// scheme's default port (80 for `ws:`, 443 for `wss:`) without one, and an
+/// IPv6 literal without its URI brackets. `None` for a URL with no host or
+/// another scheme.
+fn dial_target(uri: &tokio_tungstenite::tungstenite::http::Uri) -> Option<(String, u16)> {
+    let host = uri.host()?;
+    let host = host
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(host);
+    let port = match (uri.port_u16(), uri.scheme_str()) {
+        (Some(port), _) => port,
+        (None, Some("ws")) => 80,
+        (None, Some("wss")) => 443,
+        (None, _) => return None,
+    };
+    Some((host.to_string(), port))
+}
+
 pub async fn ws_connect(
     registry: WsRegistry,
     ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
     url: String,
     protocols: Vec<String>,
 ) -> OpOutcome {
-    let result = if protocols.is_empty() {
-        connect_async(&url).await
-    } else {
-        use tokio_tungstenite::tungstenite::http;
-        let mut builder = http::Request::builder().method("GET").uri(&url);
-        builder = builder.header("Sec-WebSocket-Protocol", protocols.join(", "));
-        match builder.body(()) {
-            Ok(req) => connect_async(req).await,
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::http;
+    let mut request = match url.as_str().into_client_request() {
+        Ok(request) => request,
+        Err(e) => return OpOutcome::Failed(format!("WebSocket: invalid request: {e}")),
+    };
+    if !protocols.is_empty() {
+        match http::HeaderValue::from_str(&protocols.join(", ")) {
+            Ok(value) => {
+                request
+                    .headers_mut()
+                    .insert("Sec-WebSocket-Protocol", value);
+            }
             Err(e) => return OpOutcome::Failed(format!("WebSocket: invalid request: {e}")),
         }
+    }
+    // The dial is oam's own (#161), the one net, tls, fetch and http share:
+    // node's per-address connect algorithm, and on Windows no SYN retransmit
+    // to a loopback peer -- `connect_async` opened a plain tokio stream, and
+    // a refused loopback port took ~2 s per resolved address there. The
+    // handshake (and TLS for `wss:`) then runs over that stream as before.
+    let Some((host, port)) = dial_target(request.uri()) else {
+        return OpOutcome::Failed(format!("WebSocket: no host to connect to in {url}"));
     };
+    let options = crate::net_connect::ConnectOptions::default();
+    let stream = match crate::net_connect::connect(&host, port, &options).await {
+        Ok(connected) => connected.stream,
+        Err(e) => return OpOutcome::Failed(format!("WebSocket connection failed: {e}")),
+    };
+    let result = tokio_tungstenite::client_async_tls_with_config(request, stream, None, None).await;
     let (ws_stream, response) = match result {
         Ok(pair) => pair,
         Err(e) => return OpOutcome::Failed(format!("WebSocket connection failed: {e}")),
@@ -192,4 +230,72 @@ pub fn ws_drop(registry: &WsRegistry, handle: u64) {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .remove(&handle);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_tungstenite::tungstenite::http::Uri;
+
+    #[test]
+    fn dial_target_takes_the_urls_host_and_the_schemes_default_port() {
+        let target = |url: &str| dial_target(&url.parse::<Uri>().unwrap());
+        assert_eq!(
+            target("ws://example.test/chat"),
+            Some(("example.test".into(), 80))
+        );
+        assert_eq!(
+            target("wss://example.test/chat"),
+            Some(("example.test".into(), 443))
+        );
+        assert_eq!(
+            target("ws://127.0.0.1:8080/"),
+            Some(("127.0.0.1".into(), 8080))
+        );
+        // An IPv6 literal is dialled without its URI brackets: glibc's
+        // getaddrinfo does not resolve `[::1]`.
+        assert_eq!(target("ws://[::1]:9000/"), Some(("::1".into(), 9000)));
+        assert_eq!(target("wss://[::1]/"), Some(("::1".into(), 443)));
+        assert_eq!(target("http://example.test/"), None);
+        assert_eq!(target("/no-host"), None);
+    }
+
+    /// #161: a refused loopback connect fails at once. Through tokio's own
+    /// connect it took ~2 s per address on Windows (the SYN is retransmitted
+    /// to a loopback peer that already refused it); the shared connector
+    /// turns that off. `localhost` resolves to two addresses there, so the
+    /// bound covers both attempts.
+    #[tokio::test]
+    async fn a_refused_loopback_connect_fails_fast() {
+        let registry: WsRegistry = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let ids = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        for host in ["127.0.0.1", "localhost"] {
+            // A port nothing listens on: bound, read, released.
+            let port = {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            let started = std::time::Instant::now();
+            let outcome = ws_connect(
+                registry.clone(),
+                ids.clone(),
+                format!("ws://{host}:{port}/"),
+                Vec::new(),
+            )
+            .await;
+            let elapsed = started.elapsed();
+            let OpOutcome::Failed(message) = outcome else {
+                panic!("a connect to a closed port must fail");
+            };
+            assert!(
+                message.starts_with("WebSocket connection failed: "),
+                "{message}"
+            );
+            assert!(
+                elapsed < std::time::Duration::from_millis(1500),
+                "{host}: refused after {elapsed:?}; the loopback SYN retransmit is back"
+            );
+        }
+        assert!(registry.lock().unwrap().is_empty());
+    }
 }

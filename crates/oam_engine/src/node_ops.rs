@@ -523,6 +523,70 @@ pub(crate) fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) 
     scope.throw_exception(exception);
 }
 
+/// A port, as argument `index` of a socket op: an integer from 0 to 65535,
+/// or nothing at all (undefined), which is 0 -- "any port" for a bind. JS
+/// validates the port as node does before it gets here (`validatePort` in
+/// node_compat.js); this is the backstop under it, so that no caller can
+/// reach a DIFFERENT port than the one it named. An `as u16` cast did just
+/// that (#163): it saturated 65536 and 70000 to 65535, truncated 1.5 to 1 and
+/// turned `'abc'` into 0, and the net grant was then asked about the wrong
+/// port too. Throws a RangeError and returns `None` for anything else.
+fn port_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+    op: &str,
+) -> Option<u16> {
+    let value = args.get(index);
+    if value.is_undefined() {
+        return Some(0);
+    }
+    match value.number_value(scope).and_then(port_from_number) {
+        Some(port) => Some(port),
+        None => {
+            let message = format!("{op}: the port must be an integer from 0 to 65535");
+            let message = v8::String::new(scope, &message).unwrap();
+            let exception = v8::Exception::range_error(scope, message);
+            scope.throw_exception(exception);
+            None
+        }
+    }
+}
+
+/// The port a JS number names, when it names one: no fraction, no NaN, no
+/// infinity, nothing below 0 or above 65535.
+fn port_from_number(n: f64) -> Option<u16> {
+    (n.fract() == 0.0 && (0.0..=65535.0).contains(&n)).then_some(n as u16)
+}
+
+#[cfg(test)]
+mod port_arg_tests {
+    use super::port_from_number;
+
+    /// #163: every value the old `as u16` cast turned into some OTHER port
+    /// is refused, and every port is itself.
+    #[test]
+    fn only_a_port_is_a_port() {
+        for (n, port) in [(0.0, 0), (-0.0, 0), (1.0, 1), (80.0, 80), (65535.0, 65535)] {
+            assert_eq!(port_from_number(n), Some(port), "{n}");
+        }
+        for n in [
+            -1.0,
+            65536.0,
+            70000.0,
+            1.5,
+            0.5,
+            65535.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            4294967376.0, // 2^32 + 80: wraps to 80 under a u32 cast
+        ] {
+            assert_eq!(port_from_number(n), None, "{n}");
+        }
+    }
+}
+
 /// Safely create a V8 string from a dynamic (possibly very large) Rust
 /// string. V8 rejects strings longer than ~1 GB; the fallback avoids a
 /// panic on the FFI boundary.
@@ -3173,13 +3237,10 @@ fn op_http_serve(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
-    // Net gate: "host:port" is the resource being bound.
-    let net_resource = format!("{host}:{port}");
-    if !check_net_perm(scope, &net_resource) {
+    // Net gate: "host:port" is the resource being bound. arg 12: ipv6Only.
+    let Some(at) = listen_at_arg(scope, &args, 12, "httpServe") else {
         return;
-    }
+    };
     let rt = core_runtime!(scope);
     let state = rt.http();
     let tcp = rt.tcp();
@@ -3197,8 +3258,7 @@ fn op_http_serve(
             state,
             tcp,
             tcp_ids,
-            host,
-            port,
+            at,
             // arg 2: opt into dispatch-on-headers + streamed request bodies.
             args.get(2).is_true(),
             policy,
@@ -3535,19 +3595,17 @@ fn op_http2_serve(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
-    let net_resource = format!("{host}:{port}");
-    if !check_net_perm(scope, &net_resource) {
+    // arg 4: ipv6Only.
+    let Some(at) = listen_at_arg(scope, &args, 4, "http2Serve") else {
         return;
-    }
+    };
     let state = core_runtime!(scope).http();
     // args 2, 3: maxHeaderSize, insecureHTTPParser (HTTP/1 connections).
     let policy = head_policy_args(scope, &args, 2);
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::http_server::http2_serve(state, host, port, policy),
+        oam_core::http_server::http2_serve(state, at, policy),
     );
 }
 
@@ -3593,10 +3651,11 @@ fn op_http2_serve_tls(
 
 // ----------------------------------------------------------------- HTTPS
 
-/// httpsServe(host, port, contextId, handshakeMs, requestCert,
+/// httpsServe(host | null, port, contextId, handshakeMs, requestCert,
 /// rejectUnauthorized, alpnJson, maxHeaderSize, insecureHTTPParser,
-/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs, jsDriven)
-/// -> Promise<{ serverId, port }>: an https server whose connections are
+/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs, jsDriven,
+/// maxHeadersCount, ipv6Only) -> Promise<{ serverId, port, address, family
+/// }>: an https server whose connections are
 /// accepted with the secure context `contextId` (`tlsServerContext`, built
 /// at `https.createServer()`) and those options.
 fn op_https_serve(
@@ -3604,17 +3663,15 @@ fn op_https_serve(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
     let context_id = args.get(2).number_value(scope).unwrap_or(0.0) as u64;
     // args 3..=6: handshakeTimeout, requestCert, rejectUnauthorized, ALPN.
     let Some(options) = accept_option_args(scope, &args, 3, "httpsServe") else {
         return;
     };
-    let net_resource = format!("{host}:{port}");
-    if !check_net_perm(scope, &net_resource) {
+    // args 0, 1 and 16: host, port, ipv6Only.
+    let Some(at) = listen_at_arg(scope, &args, 16, "httpsServe") else {
         return;
-    }
+    };
     let core = core_runtime!(scope);
     let Some(context) = oam_core::tls::server::context(&core.tls(), context_id) else {
         throw_type_error(scope, "httpsServe: the server's secure context is gone");
@@ -3639,8 +3696,7 @@ fn op_https_serve(
         &mut rv,
         oam_core::http_server::https_serve(
             state,
-            host,
-            port,
+            at,
             tls,
             policy,
             timeouts,
@@ -3687,7 +3743,9 @@ fn op_tcp_connect(
         throw_type_error(scope, "tcpConnect requires a host");
         return;
     };
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 1, "tcpConnect") else {
+        return;
+    };
     // net.getDefaultAutoSelectFamilyAttemptTimeout() as JS read it for this
     // connect; JS owns the value, so nothing is cached per runtime.
     let attempt_timeout = attempt_timeout_arg(scope, &args, 2);
@@ -3754,7 +3812,9 @@ fn op_net_resolve(
     // The connect's port: the name is resolved only for a connect the net
     // grant covers (`host:port`, as tcpConnect / tlsConnect ask), so the
     // resolver is never a way to look up a name the grant refuses.
-    let port = args.get(3).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 3, "netResolve") else {
+        return;
+    };
     if !check_net_perm(scope, &format!("{host}:{port}")) {
         return;
     }
@@ -4049,7 +4109,9 @@ fn op_net_check(
         throw_type_error(scope, "netCheck requires a host");
         return;
     };
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 1, "netCheck") else {
+        return;
+    };
     let _ = check_net_perm(scope, &format!("{host}:{port}"));
 }
 
@@ -4148,7 +4210,9 @@ fn connect_pin_arg(
         }) => {
             let mut addrs = Vec::with_capacity(ips.len());
             for ip in &ips {
-                match ip.parse::<std::net::IpAddr>() {
+                // A zone id (`fe80::1%eth0`) is part of the address, as
+                // node's `net.isIP` has it.
+                match ip.parse::<oam_core::net_connect::PinAddr>() {
                     Ok(addr) => addrs.push(addr),
                     Err(_) => {
                         return Some(PinArg::Refused(format!("{op}: pin ip '{ip}' is not an IP")));
@@ -4284,7 +4348,33 @@ fn op_tcp_write(
         return;
     };
     let tcp = core_runtime!(scope).tcp();
-    crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_write(tcp, handle, data));
+    spawn_tcp_started(
+        scope,
+        &mut rv,
+        oam_core::tcp::tcp_write_start(tcp, handle, data),
+    );
+}
+
+/// The return value of `tcpWrite` / `tcpShutdown`: undefined for an op that
+/// finished in the call -- net.Socket settles it without waiting for the
+/// event loop, so a write the socket took reports back before the 'close'
+/// of a destroy() made right after it, as in node (#156) -- and a promise
+/// for one still to finish or one that failed (its rejection carries the
+/// error's shape).
+fn spawn_tcp_started<F>(
+    scope: &mut v8::PinScope<'_, '_>,
+    rv: &mut v8::ReturnValue<'_, v8::Value>,
+    started: oam_core::tcp::Started<F>,
+) where
+    F: std::future::Future<Output = oam_core::OpOutcome> + Send + 'static,
+{
+    match started {
+        oam_core::tcp::Started::Done(oam_core::OpOutcome::Done) => {}
+        oam_core::tcp::Started::Done(outcome) => {
+            crate::ops::spawn_op(scope, rv, async move { outcome });
+        }
+        oam_core::tcp::Started::Pending(rest) => crate::ops::spawn_op(scope, rv, rest),
+    }
 }
 
 fn op_tcp_close(
@@ -4320,31 +4410,60 @@ fn op_tcp_shutdown(
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let tcp = core_runtime!(scope).tcp();
-    crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_shutdown(tcp, handle));
+    spawn_tcp_started(
+        scope,
+        &mut rv,
+        oam_core::tcp::tcp_shutdown_start(tcp, handle),
+    );
 }
 
+/// Where a server op is asked to listen: the host as argument 0 (a string, or
+/// null / undefined for a `listen()` that named none), the port as argument
+/// 1, and node's `ipv6Only` as argument `ipv6_only_index`. Checks the net
+/// grant for it -- `host:port`, and for no host `0.0.0.0:port`, the grant for
+/// every interface (the listener is dual-stack `::`, every interface of both
+/// families). `None` means an exception is pending.
+fn listen_at_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    ipv6_only_index: i32,
+    op: &str,
+) -> Option<oam_core::tcp::ListenAt> {
+    let host = if args.get(0).is_null_or_undefined() {
+        None
+    } else {
+        let Some(host) = arg_string(scope, args, 0) else {
+            throw_type_error(scope, &format!("{op} requires a host string or null"));
+            return None;
+        };
+        Some(host)
+    };
+    let port = port_arg(scope, args, 1, op)?;
+    let net_resource = format!("{}:{port}", host.as_deref().unwrap_or("0.0.0.0"));
+    if !check_net_perm(scope, &net_resource) {
+        return None;
+    }
+    Some(oam_core::tcp::ListenAt {
+        host,
+        port,
+        ipv6_only: args.get(ipv6_only_index).is_true(),
+    })
+}
+
+/// tcpListen(host | null, port, ipv6Only) -> Promise<{ serverId, port,
+/// hostname, family }>: net and tls servers.
 fn op_tcp_listen(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(host) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "tcpListen requires a host");
+    let Some(at) = listen_at_arg(scope, &args, 2, "tcpListen") else {
         return;
     };
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
-    let net_resource = format!("{host}:{port}");
-    if !check_net_perm(scope, &net_resource) {
-        return;
-    }
     let core = core_runtime!(scope);
     let tcp = core.tcp();
     let ids = core.body_ids();
-    crate::ops::spawn_op(
-        scope,
-        &mut rv,
-        oam_core::tcp::tcp_listen(tcp, ids, host, port),
-    );
+    crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_listen(tcp, ids, at));
 }
 
 fn op_tcp_accept(
@@ -4431,7 +4550,9 @@ fn op_udp_send(
         throw_type_error(scope, "udpSend requires a target host");
         return;
     };
-    let port = args.get(3).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 3, "udpSend") else {
+        return;
+    };
     // The DESTINATION is a net subject, by the same rule as `tcpConnect`.
     // Only the bind was checked, and it names the LOCAL address, so any bind
     // grant was a grant to send datagrams anywhere: with a loopback grant to
@@ -4481,7 +4602,9 @@ fn op_tls_connect(
         throw_type_error(scope, "tlsConnect requires a host");
         return;
     };
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 1, "tlsConnect") else {
+        return;
+    };
     let server_name = arg_string(scope, &args, 2).filter(|s| !s.is_empty());
     let ca_pem = arg_string(scope, &args, 3).filter(|s| !s.is_empty());
     let reject_unauthorized = args.get(4).boolean_value(scope);

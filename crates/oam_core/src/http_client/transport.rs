@@ -337,7 +337,7 @@ impl Route {
 
     /// Record the hook's addresses under the `key` [`Route::lookup_needed`]
     /// returned (no-op on a pooled route).
-    pub fn set_addrs(&self, key: &str, addrs: Vec<IpAddr>) {
+    pub fn set_addrs(&self, key: &str, addrs: Vec<crate::net_connect::PinAddr>) {
         if let Some(hooked) = &self.hooked {
             hooked
                 .addrs

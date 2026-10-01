@@ -1254,25 +1254,32 @@ Two things this moved rather than removed:
   `AI_ADDRCONFIG`, so case 110 prints only shape invariants there.
 - **A request to `localhost` now tries `::1` first**, which is Node's order. reqwest's
   client carried an IPv4-first override for `localhost`; the owned transport does not. Against
-  a listener that is IPv4 only -- which is every oam `listen(port)`, entry 36 -- the first
-  request pays the refused `::1` attempt. Measured on Windows, cold first `fetch` through
+  a listener that is IPv4 only (every oam `listen(port)` was, up to 0.17.1: entry 36) the
+  first request pays the refused `::1` attempt. Measured on Windows, cold first `fetch` through
   `localhost`, six runs: 8.9-28.8 ms now against 4.1-7.8 ms before (Node: 22.8-28.3 ms);
   through a dual-stack `::` listener, 8-22 ms now against 305-326 ms before, when reqwest
   waited out its happy-eyeballs delay (Node: 20-33 ms). Pooled requests do not change.
 
-### 36. `listen(port)` binds `0.0.0.0`, and `connect(port)` reaches it over `127.0.0.1`
+### 36. `listen(port)` without a host: closed in 0.17.2
 
-Node's `server.listen(port)` with no host binds dual-stack `::`, and `net.connect(port)` (default
-host `localhost`) reaches it over `::1`, so `server.address()` reports `{ address: '::', family:
-'IPv6' }` and both ends see `remoteFamily` `IPv6`. oam's `listen(port)` binds `0.0.0.0`: same
-program, same data, `IPv4` in every observable. `net.connect(port)`, `tls.connect(port)` and
-`http.request` all default to `localhost`, as Node's do, and resolve it like any other name
-(a `lookup` option sees `'localhost'`); against an oam listener the first attempt goes to `::1`
-and is refused, costing a few milliseconds (entry 35), before `127.0.0.1` connects. Closing
-the gap needs a dual-stack listen default.
+Node's `server.listen(port)` with no host binds dual-stack `::` (falling back to `0.0.0.0`
+where IPv6 is unavailable), `listen(port, '::')` is dual-stack too unless `ipv6Only`, and
+`server.address()` reports the family of the address bound. Since 0.17.2 oam's net, tls,
+http, https and http2 servers do the same (`crates/oam_core/src/tcp.rs` `bind_listener`,
+`conformance/cases/229-listen-default-dual-stack.mjs`): an IPv4 client of a dual-stack
+listener is `::ffff:a.b.c.d` on the server's side, `net.connect(port)` (default host
+`localhost`, as Node's) reaches it over `::1` with no refused attempt, and a listen error is
+Node's (`listen EADDRINUSE: address already in use :::8080`, with `syscall`, `address` and
+`port`). Up to 0.17.1 net and tls bound `0.0.0.0` and http, https and http2 `127.0.0.1` --
+an http server started without a host was unreachable from any other machine -- an explicit
+`::` was IPv6-only, and `address()` said `IPv4` for all of them.
+
+Under `--permission`, a `listen()` without a host is checked against the net grant as
+`0.0.0.0:<port>` (every interface), on every server kind; an http server's used to be checked
+as `127.0.0.1:<port>`, which no longer describes what it binds.
 
 _(probed)_ Node v22.22.2 and oam on the same `createServer().listen(0)` + `connect(port)`
-program.
+program, for each server kind.
 
 ### 37. Name resolution does not pass `AI_ADDRCONFIG` off Windows
 
@@ -1291,12 +1298,17 @@ platform's `AI_ADDRCONFIG` value elsewhere (`1024` on macOS, `32` on glibc Linux
 own resolver leaves the flag out.
 
 Passing the flag means calling `getaddrinfo` by hand, through new `unsafe` code, which is
-why it is not done yet. `dns.lookup` is the same resolver; with no `hints` Node's passes no
-flags either, but oam's `dns.ADDRCONFIG`, `dns.V4MAPPED` and `dns.ALL` are all `0`, where
-Node on Windows reports `1024`, `2048` and `256` (measured), so a caller cannot ask for them.
+why it is not done yet. `dns.lookup` is the same resolver, and its `hints` are handled in
+JS: since 0.17.2 `dns.ADDRCONFIG`, `dns.V4MAPPED` and `dns.ALL` are the platform's `AI_*`
+values (`1024`, `2048`, `256` on Windows, macOS, the BSDs and Android; `32`, `8`, `16` on Linux;
+up to 0.17.1 all three were `0`), `hints` is validated as Node's `validateHints` does
+(`ERR_INVALID_ARG_TYPE` for a non-number, `ERR_INVALID_ARG_VALUE` for any other bit), and
+`V4MAPPED` (with or without `ALL`) on a `family: 6` lookup answers IPv4 addresses as
+`::ffff:a.b.c.d` by getaddrinfo's rule (`conformance/cases/228-dns-lookup-hints.mjs`).
+`dns.ADDRCONFIG` in a caller's `hints` is accepted and not applied, for the reason above.
 
-_(source: `crates/oam_core/src/net_connect.rs`, `dns.rs`; the `dns` constants probed on
-Windows.)_
+_(source: `crates/oam_core/src/net_connect.rs`, `dns.rs`, `js/node_compat.js`
+`registry.factories.dns`; the `dns` constants probed on Windows.)_
 
 ### 38. `fetch` and `http.request` on oam's own client: what still differs (#143)
 
@@ -1398,10 +1410,17 @@ What still differs:
   proxy. At the end of a response whose connection stays open,
   `res.socket` is null, as node detaches a kept-alive socket. Up to 0.16.2 it was a fixed object naming the host as
   written, with `localAddress` `127.0.0.1` and `localPort` `0`.
-- **The WebSocket client is not on this connector.** `new WebSocket(url)` dials on its own,
-  so on Windows a refused loopback connect takes about 2 s (2035 ms measured; Node 7 ms), and
-  the `'error'` event is a plain `Event` where Node's is an `ErrorEvent` with the message
-  `Received network error or non-101 status code.`
+- **The WebSocket client dials on this connector too** (since 0.17.2; up to 0.17.1 it dialled
+  on its own, so on Windows a refused loopback connect took about 2 s per resolved address,
+  and the `'error'` event was a plain `Event`). A connect that fails dispatches Node's
+  `ErrorEvent` -- `message` and `error` both `Received network error or non-101 status
+  code.`, no `ErrorEvent` global, as in Node v22
+  (`conformance/cases/226-websocket-connect-failure-event.mjs`). What is left: oam also
+  fires the `'close'` (1006, `wasClean` false) the WHATWG spec asks for after that
+  `'error'`, where Node v22.22.2 fires none for a connect that failed; the `wss:` handshake
+  verifies the server against the bundled Mozilla roots alone, not `node:tls`'s store
+  (`NODE_EXTRA_CA_CERTS`, `tls.setDefaultCACertificates`); and the dial honours no
+  `connect.lookup` hook or environment proxy.
 
 **`connect.lookup` on an undici `Agent`**
 
@@ -1439,8 +1458,18 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
 - **A hook that calls back twice.** One that answers and then calls back again with an
   error fails the fetch in Node, with that second error as the `cause`; oam keeps the first
   answer and connects.
-- **A scoped IPv6 address** (`fe80::1%lo0`) is refused with `ERR_INVALID_IP_ADDRESS`, because
-  oam's `net.isIP('fe80::1%lo0')` is `0`; Node's is `6` and it dials the address.
+- **A scoped IPv6 address** (`fe80::1%lo0`) is dialled, as in Node, since 0.17.2: the zone
+  becomes the scope id libuv's `uv_ip6_addr` gives it (Windows reads it with `atoi`, so a
+  name is 0; Linux looks the interface up by name, and a name that is no interface is 0),
+  and an error names the address with its zone (`connect EADDRNOTAVAIL ::1%1:PORT`). The
+  same holds for a zoned literal host and a zoned `lookup` answer on `net.connect`
+  (`conformance/cases/227-net-ipv6-zone-id.mjs`). Up to 0.17.1 a zoned answer was refused
+  before the dial (`pin ip '...' is not an IP`), and a zoned literal host was resolved and
+  its errors dropped the zone. What is left: on macOS and the BSDs oam has the system
+  resolver read the zone, which also takes a number (`%1`) as the interface index, where
+  libuv looks a number up as an interface NAME and finds none (scope id 0); and under
+  `--permission` a zoned answer is checked as written, so only an exact grant (or
+  `--allow-net` with no list) admits it.
 - **A refusing hook's error is wrapped on `undici.request` and `agent.request`.** oam's
   `undici.request` runs on `fetch`, so it rejects with `TypeError: fetch failed` carrying the
   hook's error as `cause`; Node rethrows the hook's error itself. `fetch` agrees in both.
@@ -2110,8 +2139,29 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   socket has buffered, so a large upload emits no `'drain'`.
 - **Sockets.** A `'connect'` listener on a TLS socket runs after the handshake, since oam's
   native connect does both (entry 34); a listener that destroys the socket there still
-  stops the request before it is written. oam's `net.Socket` emits `'error'` and `'close'`
-  from `destroy()` synchronously where Node defers them a tick. After the request ends
+  stops the request before it is written. `net.Socket.destroy()` emits nothing inside the
+  call, as in Node: `'error'` on the next tick, then `'close'` -- after the immediates
+  already queued and before any timer for a socket that was connected or connecting, on
+  the next tick for one that never was (`conformance/cases/223-net-socket-destroy-defers-events.mjs`;
+  up to 0.17.1 both were emitted from inside `destroy()`). What is left: Node emits that
+  `'close'` from the handle's close callback, which also runs after an immediate queued
+  AFTER `destroy()` in the same turn; oam's loop has no close phase, so there `'close'`
+  comes first. A `write()` is handed to the socket inside the call, as Node's is, and
+  `end()` asks for the FIN in the same turn (it is queued behind the writes natively, as
+  libuv queues a shutdown; up to 0.17.1 it waited for the last write to complete first,
+  so the FIN left one round trip late), so a write the socket takes is delivered even
+  when `destroy()` follows on the next line. A write the socket took whole inside the call
+  reports `null` to its callback, and the callbacks of an `end()` still waiting get
+  `ERR_STREAM_DESTROYED`, before that `'close'`, as in Node
+  (`conformance/cases/225-net-write-then-end-order.mjs`). What is left there: a write the
+  socket could not take at once is still queued natively when `destroy()` closes the
+  handle, and its callback gets `ERR_SOCKET_CLOSED` after `'close'` (Node's gets `null`,
+  before it); oam settles a write's accounting with its callback, after `write()` has
+  returned, so `write()` returns `false` and `writableLength` counts the bytes until that
+  callback even when the socket took them all at once (Node reports `true` and `0` for
+  those); and the callback of a write made before the connect runs after the `'connect'`
+  listeners rather than among them. After
+  the request ends
   Node clears a closed socket's `localAddress` / `localPort`; oam keeps them on a
   `net.Socket`.
 - **Proxy agents.** The agents that send an http request to a forward proxy in absolute
@@ -2136,7 +2186,11 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   `net.connect({ path })`, `net.connect(path)`, `tls.connect({ path })` and an http(s)
   request's `socketPath` fail with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` where Node connects
   to the pipe; a non-string `path` throws Node's `ERR_INVALID_ARG_TYPE`. Up to 0.16.2 they
-  connected to `host:port` instead (http.request sent the whole request there).
+  connected to `host:port` instead (http.request sent the whole request there). There is
+  no pipe server either: `server.listen(path)` and `listen({ path })` -- on a `net`, `tls`,
+  `http`, `https` or `http2` server -- emit `'error'` with the same code where Node listens
+  on the pipe. Up to 0.17.1 the name was read as port 0 and the server bound a TCP port
+  nobody had asked for.
 - **`--permission`.** The request is a `net.connect` / `tls.connect`, and its grant is
   checked as theirs is: `host:port`, and each address a `lookup` hook answers as `addr:port`
   (entry 4).
