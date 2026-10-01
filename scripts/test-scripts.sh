@@ -647,6 +647,30 @@ else fail "empty/non-numeric readings must be inert"; fi
 # hardcoded 20/10 defaults. They are resolved at SOURCE time, so an override
 # only takes effect in a fresh shell -- assigning after the fact would silently
 # test nothing, which is why these go through `bash -c`.
+# #210: the linux leg's probe could answer nothing with exit 0 (df's failure
+# hidden behind a trailing `tr`), and the check then skipped itself in silence.
+# Every reading is now either a number or a reason.
+it "a df answer in GB reads as its number"
+eq "$(disk_free_reading 0 "$(printf 'Avail\n  37G\n')")" "37"
+it "a df answer that is not a size gives a reason, not a number"
+out="$(disk_free_reading 0 "Avail")" && fail "a header-only answer must not read as a size: $out" \
+  || { case "$out" in *"not a size"*) pass ;; *) fail "no reason given: '$out'" ;; esac; }
+it "a df probe that printed nothing gives a reason"
+out="$(disk_free_reading 0 "")" && fail "an empty answer must not read as a size: $out" \
+  || { case "$out" in *"printed nothing"*) pass ;; *) fail "no reason given: '$out'" ;; esac; }
+it "a failed probe (a dead tunnel's 255) gives a reason naming its status"
+out="$(disk_free_reading 255 "")" && fail "a failed probe must not read as a size: $out" \
+  || { case "$out" in *"exit 255"*) pass ;; *) fail "no reason given: '$out'" ;; esac; }
+it "a failed df with stray digits on stdout is still a failure"
+out="$(disk_free_reading 1 "  12G")" && fail "status 1 must not read as a size: $out" || pass
+it "the linux leg's probe keeps df's status and stderr, and says when it did not run"
+GCPLEG_CODE="$(sed 's/#.*//' scripts/build-platforms-gcp-iap.sh)"
+if grep -qE "df -BG[^\"]*\|" <<<"$GCPLEG_CODE" || grep -qE 'df -BG.*2>/dev/null' <<<"$GCPLEG_CODE"; then
+  fail "the df probe pipes or discards stderr again"
+elif ! grep -q 'disk headroom NOT CHECKED' <<<"$GCPLEG_CODE"; then
+  fail "an unreadable builder disk no longer warns"
+else pass; fi
+
 it "OAM_DISK_RECLAIM_GB moves the reclaim threshold"
 eq "$(OAM_DISK_RECLAIM_GB=50 bash -c '. scripts/lib/iap-helpers.sh; disk_needs_reclaim 40 && echo reclaim || echo skip')" \
    "reclaim"

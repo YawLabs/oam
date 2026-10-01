@@ -102,6 +102,33 @@ disk_below_floor() {
   [ "$1" -lt "$OAM_DISK_MIN_GB" ]
 }
 
+# disk_free_reading <probe-status> <probe-stdout>
+# The probe is `df -BG --output=avail /` run alone on the builder, so its
+# status is df's (or ssh's), not that of a trailing `tr` that always succeeds.
+# Echoes the whole GB free and returns 0 when the probe answered a size;
+# otherwise echoes why the headroom check cannot run and returns 1. Never an
+# empty success: a probe that says nothing must not read as a skipped check
+# nobody hears about (#210). The caller owns what an unusable reading costs.
+disk_free_reading() {
+  local status="$1" last gb
+  last="$(printf '%s\n' "$2" | tail -1 | tr -d '[:space:]')"
+  if [ "$status" != 0 ]; then
+    echo "the df probe failed (exit $status; ssh exits 255 when the tunnel is down)"
+    return 1
+  fi
+  if [ -z "$last" ]; then
+    echo "the df probe printed nothing"
+    return 1
+  fi
+  gb="${last%G}"
+  case "$gb" in
+    "$last" | '' | *[!0-9]*)
+      echo "the df probe answered '$last', not a size in GB"
+      return 1 ;;
+  esac
+  echo "$gb"
+}
+
 # --- instance schedules ------------------------------------------------------
 #
 # A GCE instance schedule (a resource policy with a vmStopSchedule) stops the
