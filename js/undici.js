@@ -9,8 +9,9 @@
 // same approach Bun and Deno take.
 //
 // Surface: fetch, request, stream, Dispatcher/Agent/Pool/Client/BalancedPool,
-// buildConnector, get/setGlobalDispatcher, errors, interceptors (no-op), and
-// the web globals undici re-exports (Headers/Response/Request/FormData/fetch/...).
+// ProxyAgent/EnvHttpProxyAgent, buildConnector, get/setGlobalDispatcher,
+// errors, interceptors (no-op), and the web globals undici re-exports
+// (Headers/Response/Request/FormData/fetch/...).
 //
 // Supported transport control:
 //  - A `connect` FUNCTION (`new Agent|Pool|Client({ connect(opts, cb) })`, a
@@ -106,7 +107,14 @@
       BodyTimeoutError: mkError("BodyTimeoutError", "UND_ERR_BODY_TIMEOUT"),
       RequestContentLengthMismatchError: mkError("RequestContentLengthMismatchError", "UND_ERR_REQ_CONTENT_LENGTH_MISMATCH"),
       ResponseContentLengthMismatchError: mkError("ResponseContentLengthMismatchError", "UND_ERR_RES_CONTENT_LENGTH_MISMATCH"),
-      RequestAbortedError: mkError("RequestAbortedError", "UND_ERR_ABORTED"),
+      // undici's RequestAbortedError is an AbortError by name (measured on
+      // undici 6.29.0: name "AbortError", message "Request aborted").
+      RequestAbortedError: class RequestAbortedError extends UndiciError {
+        constructor(message) {
+          super(message || "Request aborted", "UND_ERR_ABORTED");
+          this.name = "AbortError";
+        }
+      },
       AbortError: mkError("AbortError", "UND_ERR_ABORTED"),
       InformationalError: mkError("InformationalError", "UND_ERR_INFO"),
       InvalidArgumentError: mkError("InvalidArgumentError", "UND_ERR_INVALID_ARG"),
@@ -134,7 +142,13 @@
           this.data = data;
         }
       },
-      SecureProxyConnectionError: mkError("SecureProxyConnectionError", "UND_ERR_PRX_TLS"),
+      SecureProxyConnectionError: class SecureProxyConnectionError extends UndiciError {
+        constructor(cause, message) {
+          super(message || "Secure Proxy Connection failed", "UND_ERR_PRX_TLS");
+          this.name = "SecureProxyConnectionError";
+          this.cause = cause;
+        }
+      },
     };
 
     // ---- undici-shaped response body -------------------------------------
@@ -288,6 +302,17 @@
         for (const [k, v] of Object.entries(opts.query)) u.searchParams.set(k, String(v));
         url = u.toString();
       }
+      // A dispatcher's refusal of this one request (a ProxyAgent's of a
+      // caller Proxy-Authorization) is thrown as undici's request() throws
+      // it; fetch asks the same question and wraps the answer.
+      const riding = opts.dispatcher || holder.current;
+      if (riding && typeof riding._oamVet === "function") {
+        const refusal = riding._oamVet({ url: String(url), headerNames: headerNamesOf(opts.headers) });
+        if (refusal) {
+          unlink();
+          throw refusal;
+        }
+      }
       let headersTimer = null;
       if (headersTimeout) {
         headersTimer = setTimeout(() => {
@@ -317,6 +342,19 @@
         context: {},
         body,
       };
+    }
+
+    // The header names of request()'s `headers` option, in any of the shapes
+    // undici takes: an object, a flat [name, value, ...] array, or an
+    // iterable of pairs.
+    function headerNamesOf(headers) {
+      if (!headers || typeof headers !== "object") return [];
+      if (Array.isArray(headers)) {
+        if (headers.length > 0 && Array.isArray(headers[0])) return headers.map((pair) => pair[0]);
+        return headers.filter((_, i) => i % 2 === 0);
+      }
+      if (typeof headers[Symbol.iterator] === "function") return [...headers].map((pair) => pair[0]);
+      return Object.keys(headers);
     }
 
     // One of request()'s phase timeouts, in ms: the request's own, else the
@@ -546,7 +584,6 @@
         if (typeof factory === "function") {
           const { factory: _factory, maxRedirections: _maxRedirections, ...originOptions } = this._options;
           const byOrigin = new Map();
-          const plain = buildConnector({});
           this._oamConnectLookup = null;
           this._oamConnect = function viaFactory(params, cb) {
             const origin = params.protocol + "//" + params.host;
@@ -555,18 +592,290 @@
               dispatcher = factory(origin, originOptions);
               byOrigin.set(origin, dispatcher);
             }
-            const policy = policyOf(dispatcher);
-            if (policy.refuse) {
-              cb(policy.refuse);
-            } else if (policy.connector) {
-              policy.connector.fn.call(policy.connector.self, params, cb);
-            } else if (typeof dispatcher._oamConnectLookup === "function") {
-              buildConnector({ lookup: dispatcher._oamConnectLookup })(params, cb);
-            } else {
-              plain(params, cb);
-            }
+            connectVia(dispatcher, params, cb);
           };
         }
+      }
+    }
+
+    // One connection made the way `dispatcher` would make it, for a
+    // dispatcher that hands its requests to another one (an Agent's factory,
+    // EnvHttpProxyAgent): that one's connect function, its lookup hook, or
+    // undici's plain connector -- or its refusal, if oam cannot run it.
+    const plainConnect = buildConnector({});
+    function connectVia(dispatcher, params, cb) {
+      const policy = policyOf(dispatcher);
+      if (policy.refuse) {
+        cb(policy.refuse);
+      } else if (policy.connector) {
+        policy.connector.fn.call(policy.connector.self, params, cb);
+      } else if (typeof dispatcher._oamConnectLookup === "function") {
+        buildConnector({ lookup: dispatcher._oamConnectLookup })(params, cb);
+      } else {
+        plainConnect(params, cb);
+      }
+    }
+
+    // ---- ProxyAgent / EnvHttpProxyAgent -----------------------------------
+    // undici's ProxyAgent (lib/dispatcher/proxy-agent.js, 6.29.0) sends every
+    // request -- to an http origin as much as to an https one -- through a
+    // CONNECT tunnel: it connects to the proxy (TLS first for an https proxy,
+    // under `proxyTls`), asks it for `CONNECT host:port`, and on a 200 uses
+    // that socket as the connection to the origin, with TLS to the origin
+    // inside it (under `requestTls`) for https. That is a connect function,
+    // and a dispatcher's connect function is the seam oam's transport already
+    // asks for every connection, redirect hops included -- so a ProxyAgent
+    // here is a Dispatcher whose `_oamConnect` opens the tunnel, on every
+    // entry point a dispatcher has.
+    //
+    // The CONNECT request is undici's, byte for byte: `host` (the origin's
+    // authority), `connection: close`, then the proxy headers -- the
+    // `headers` option and `proxy-authorization` from `token`, `auth`
+    // (Basic), or the proxy URL's userinfo. The credentials go to the proxy
+    // and never to the origin.
+    //
+    // Refused at construction, never ignored: `proxyTunnel: false` (an http
+    // origin sent to an http proxy in absolute form -- oam's transport writes
+    // the request line, and would write it origin-form), and a `clientFactory`
+    // or `factory`, whose dispatchers' dispatch() oam does not run.
+
+    // The CONNECT exchange on a socket to the proxy: write the request, read
+    // the response head off the socket (and only the head -- bytes after it
+    // belong to the tunnel and are put back), and call back once: with
+    // nothing on a 200, with undici's error otherwise. The socket is
+    // destroyed on any failure.
+    function openTunnel(socket, authority, host, proxyHeaders, timeout, done) {
+      let head = "CONNECT " + authority + " HTTP/1.1\r\nhost: " + host + "\r\nconnection: close\r\n";
+      for (const name of Object.keys(proxyHeaders)) {
+        if (name.toLowerCase() === "host") continue;
+        const value = String(proxyHeaders[name]);
+        // A header that could end the head early is refused, not written.
+        if (/[^\t\x20-\x7e\x80-\xff]/.test(value) || !/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(name)) {
+          socket.destroy();
+          done(new errors.InvalidArgumentError("invalid " + name + " header"));
+          return;
+        }
+        head += name + ": " + value + "\r\n";
+      }
+      let received = G.Buffer.alloc(0);
+      let timer = null;
+      const finish = (err) => {
+        socket.removeListener("readable", onReadable);
+        socket.removeListener("end", onEnd);
+        socket.removeListener("close", onEnd);
+        socket.removeListener("error", onError);
+        if (timer !== null) clearTimeout(timer);
+        if (err) socket.destroy();
+        done(err);
+      };
+      const onEnd = () => finish(new errors.SocketError("other side closed"));
+      // buildConnector's own listener stays on the socket, so removing this
+      // one never leaves an 'error' unhandled.
+      const onError = (err) => finish(err);
+      const onReadable = () => {
+        let chunk;
+        while ((chunk = socket.read()) !== null) {
+          received = G.Buffer.concat([received, chunk]);
+          const end = received.indexOf("\r\n\r\n");
+          if (end === -1) {
+            // undici's default maxHeaderSize.
+            if (received.length > 16384) {
+              finish(new errors.HeadersOverflowError("Headers Overflow Error"));
+              return;
+            }
+            continue;
+          }
+          const rest = received.subarray(end + 4);
+          if (rest.length > 0) socket.unshift(rest);
+          const statusLine = received.subarray(0, end).toString("latin1").split("\r\n")[0];
+          const status = /^HTTP\/1\.[01] (\d{3})(?: |$)/.exec(statusLine);
+          if (status === null) {
+            finish(new errors.SocketError("the proxy answered CONNECT with something that is not an HTTP response"));
+          } else if (status[1] !== "200") {
+            finish(new errors.RequestAbortedError(`Proxy response (${Number(status[1])}) !== 200 when HTTP Tunneling`));
+          } else {
+            finish(null);
+          }
+          return;
+        }
+      };
+      socket.on("readable", onReadable);
+      socket.on("end", onEnd);
+      socket.on("close", onEnd);
+      socket.on("error", onError);
+      if (timeout) {
+        timer = setTimeout(() => {
+          timer = null;
+          finish(new errors.HeadersTimeoutError("Headers Timeout Error"));
+        }, timeout);
+        if (typeof timer.unref === "function") timer.unref();
+      }
+      socket.write(head + "\r\n");
+    }
+
+    function proxyAuthorizationSent(headerNames) {
+      return headerNames.some((name) => String(name).toLowerCase() === "proxy-authorization");
+    }
+
+    class ProxyAgent extends Dispatcher {
+      constructor(opts) {
+        // undici's checks, in undici's order.
+        if (!opts || (typeof opts === "object" && !(opts instanceof G.URL) && !opts.uri)) {
+          throw new errors.InvalidArgumentError("Proxy uri is mandatory");
+        }
+        const given = typeof opts === "object" && !(opts instanceof G.URL) ? opts : {};
+        const { clientFactory, proxyTunnel = true } = given;
+        if (clientFactory !== undefined && typeof clientFactory !== "function") {
+          throw new errors.InvalidArgumentError("Proxy opts.clientFactory must be a function.");
+        }
+        const url = typeof opts === "string" ? new G.URL(opts) : opts instanceof G.URL ? opts : new G.URL(opts.uri);
+        const proxyHeaders = { ...(given.headers || {}) };
+        if (given.auth && given.token) {
+          throw new errors.InvalidArgumentError("opts.auth cannot be used in combination with opts.token");
+        } else if (given.auth) {
+          proxyHeaders["proxy-authorization"] = `Basic ${given.auth}`;
+        } else if (given.token) {
+          proxyHeaders["proxy-authorization"] = given.token;
+        } else if (url.username && url.password) {
+          proxyHeaders["proxy-authorization"] = "Basic " + G.Buffer.from(
+            `${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}`,
+          ).toString("base64");
+        }
+        if (!proxyTunnel) {
+          throw new errors.NotSupportedError(
+            "undici's ProxyAgent with proxyTunnel: false is not supported on oam: every request " +
+              "goes through a CONNECT tunnel, the ProxyAgent default",
+          );
+        }
+        if (typeof clientFactory === "function" || given.factory !== undefined) {
+          throw notHonored("A ProxyAgent with a clientFactory or factory");
+        }
+        // `connect` is the tunnel below, as in undici (which overrides it).
+        super({ ...given, connect: undefined, factory: undefined });
+
+        const toProxy = buildConnector({ ...given.proxyTls });
+        const toOrigin = buildConnector({ ...given.requestTls });
+        // undici's Client: the address without an IPv6 literal's brackets.
+        const proxyHostname = url.hostname[0] === "[" ? url.hostname.slice(1, url.hostname.indexOf("]")) : url.hostname;
+        const proxyServername = (given.proxyTls && given.proxyTls.servername) || url.hostname;
+        // The CONNECT's answer is a response head: undici's headersTimeout.
+        const tunnelTimeout = given.headersTimeout == null ? 300e3 : given.headersTimeout;
+        this._oamConnect = (params, callback) => {
+          let authority = params.host;
+          if (!params.port) authority += params.protocol === "https:" ? ":443" : ":80";
+          toProxy(
+            {
+              hostname: proxyHostname,
+              host: url.host,
+              protocol: url.protocol,
+              port: url.port,
+              servername: proxyServername,
+              localAddress: null,
+            },
+            (err, socket) => {
+              if (err) {
+                callback(err.code === "ERR_TLS_CERT_ALTNAME_INVALID" ? new errors.SecureProxyConnectionError(err) : err);
+                return;
+              }
+              openTunnel(socket, authority, params.host, proxyHeaders, tunnelTimeout, (refused) => {
+                if (refused) {
+                  callback(refused);
+                } else if (params.protocol !== "https:") {
+                  callback(null, socket);
+                } else {
+                  const servername = given.requestTls ? given.requestTls.servername : params.servername;
+                  toOrigin({ ...params, servername, httpSocket: socket }, callback);
+                }
+              });
+            },
+          );
+        };
+        // undici's ProxyAgent.dispatch refuses a request that carries its
+        // own Proxy-Authorization: inside the tunnel it would reach the
+        // origin. Asked by request() and by fetch (see policyOf).
+        this._oamVet = ({ headerNames }) =>
+          proxyAuthorizationSent(headerNames)
+            ? new errors.InvalidArgumentError("Proxy-Authorization should be sent in ProxyAgent constructor")
+            : null;
+      }
+    }
+
+    // undici's EnvHttpProxyAgent (lib/dispatcher/env-http-proxy-agent.js,
+    // 6.29.0): a ProxyAgent per scheme from `httpProxy` / `httpsProxy`, else
+    // `http_proxy` / `HTTP_PROXY` and `https_proxy` / `HTTPS_PROXY` (https
+    // falls back to the http proxy), and a plain Agent for the origins
+    // `noProxy` / `no_proxy` / `NO_PROXY` exempts -- undici's matching: `*`,
+    // an exact host, a `.suffix` or `*.suffix`, each optionally `:port`; the
+    // variable is re-read when it changes. Each connection is made by
+    // whichever of the three the origin selects.
+    const DEFAULT_PORTS = { "http:": 80, "https:": 443 };
+    let envProxyWarned = false;
+    class EnvHttpProxyAgent extends Dispatcher {
+      constructor(opts = {}) {
+        const { httpProxy, httpsProxy, noProxy, ...agentOpts } = opts;
+        super({ ...agentOpts, connect: undefined, factory: undefined });
+        if (!envProxyWarned) {
+          envProxyWarned = true;
+          G.process.emitWarning("EnvHttpProxyAgent is experimental, expect them to change at any time.", {
+            code: "UNDICI-EHPA",
+          });
+        }
+        const env = G.process.env;
+        const direct = new Agent(agentOpts);
+        const HTTP_PROXY = httpProxy ?? env.http_proxy ?? env.HTTP_PROXY;
+        const viaHttp = HTTP_PROXY ? new ProxyAgent({ ...agentOpts, uri: HTTP_PROXY }) : direct;
+        const HTTPS_PROXY = httpsProxy ?? env.https_proxy ?? env.HTTPS_PROXY;
+        const viaHttps = HTTPS_PROXY ? new ProxyAgent({ ...agentOpts, uri: HTTPS_PROXY }) : viaHttp;
+
+        let noProxyValue = null;
+        let noProxyEntries = [];
+        const noProxyNow = () => noProxy ?? env.no_proxy ?? env.NO_PROXY ?? "";
+        const parseNoProxy = () => {
+          noProxyValue = noProxyNow();
+          noProxyEntries = [];
+          for (const entry of noProxyValue.split(/[,\s]/)) {
+            if (!entry) continue;
+            const parsed = entry.match(/^(.+):(\d+)$/);
+            noProxyEntries.push({
+              hostname: (parsed ? parsed[1] : entry).toLowerCase(),
+              port: parsed ? Number.parseInt(parsed[2], 10) : 0,
+            });
+          }
+        };
+        parseNoProxy();
+        const shouldProxy = (hostname, port) => {
+          if (noProxy === undefined && noProxyValue !== noProxyNow()) parseNoProxy();
+          if (noProxyEntries.length === 0) return true;
+          if (noProxyValue === "*") return false;
+          for (const entry of noProxyEntries) {
+            if (entry.port && entry.port !== port) continue;
+            if (!/^[.*]/.test(entry.hostname)) {
+              if (hostname === entry.hostname) return false;
+            } else if (hostname.endsWith(entry.hostname.replace(/^\*/, ""))) {
+              return false;
+            }
+          }
+          return true;
+        };
+        // `host` keeps an IPv6 literal's brackets, as undici's match does.
+        const agentFor = (protocol, host, port) => {
+          const hostname = host.replace(/:\d*$/, "").toLowerCase();
+          const portNumber = Number.parseInt(port, 10) || DEFAULT_PORTS[protocol] || 0;
+          if (!shouldProxy(hostname, portNumber)) return direct;
+          return protocol === "https:" ? viaHttps : viaHttp;
+        };
+        this._oamConnectLookup = null;
+        this._oamConnect = (params, cb) => connectVia(agentFor(params.protocol, params.host, params.port), params, cb);
+        this._oamVet = (request) => {
+          let url;
+          try {
+            url = new G.URL(request.url);
+          } catch {
+            return null;
+          }
+          const agent = agentFor(url.protocol, url.host, url.port);
+          return typeof agent._oamVet === "function" ? agent._oamVet(request) : null;
+        };
       }
     }
 
@@ -609,7 +918,12 @@
           "Put the connection policy in a `connect` function, which oam calls for every connection",
       );
     }
-    function policyOf(dispatcher) {
+    //
+    // `request` -- `{ url, headerNames }`, given by fetch for the request it
+    // is about to send -- lets a dispatcher refuse that one request the way
+    // its undici dispatch() would (`_oamVet`: a ProxyAgent's refusal of a
+    // caller Proxy-Authorization).
+    function policyOf(dispatcher, request) {
       if (!(dispatcher instanceof Dispatcher)) {
         return { refuse: notHonored("A dispatcher that is not one of oam's undici classes") };
       }
@@ -618,6 +932,10 @@
       }
       if (dispatcher._oamInterceptors) {
         return { refuse: notHonored("A dispatcher with interceptors") };
+      }
+      if (request && typeof dispatcher._oamVet === "function") {
+        const refusal = dispatcher._oamVet(request);
+        if (refusal) return { refuse: refusal };
       }
       if (typeof dispatcher._oamConnect === "function") {
         return { connector: { fn: dispatcher._oamConnect, self: dispatcher } };
@@ -702,6 +1020,71 @@
       }
     }
 
+    // ---- dispatch-level API: exported, refused at use ----------------------
+    // RetryAgent, the Retry / Redirect / Decorator handlers,
+    // createRedirectInterceptor, and connect() / upgrade() / pipeline() all
+    // work through dispatch(), which oam does not run. They are exported for
+    // the same reason the Mock* classes are: a name missing from an ES
+    // module is a link-time SyntaxError that stops the whole program at
+    // import, whether or not the importer ever uses it -- so each links, and
+    // refuses when used, naming itself.
+    function dispatchOnly(what) {
+      return new errors.NotSupportedError(
+        "undici's " + what + " is not supported on oam: it works through a dispatcher's " +
+          "dispatch(), and oam sends requests itself -- use fetch() or request()",
+      );
+    }
+    class RetryAgent extends Dispatcher {
+      constructor() {
+        throw dispatchOnly("RetryAgent");
+      }
+    }
+    class RetryHandler {
+      constructor() {
+        throw dispatchOnly("RetryHandler");
+      }
+    }
+    class RedirectHandler {
+      constructor() {
+        throw dispatchOnly("RedirectHandler");
+      }
+    }
+    class DecoratorHandler {
+      constructor() {
+        throw dispatchOnly("DecoratorHandler");
+      }
+    }
+    function createRedirectInterceptor() {
+      throw dispatchOnly("createRedirectInterceptor()");
+    }
+    // connect() and upgrade() report through their callback or their
+    // promise, as undici's do; pipeline() returns a stream, so it throws.
+    function refusedCall(what) {
+      return function (opts, callback) {
+        const err = dispatchOnly(what);
+        if (typeof callback === "function") {
+          queueMicrotask(() => callback(err, null));
+          return undefined;
+        }
+        return Promise.reject(err);
+      };
+    }
+    const connect = refusedCall("connect()");
+    const upgrade = refusedCall("upgrade()");
+    function pipeline() {
+      throw dispatchOnly("pipeline()");
+    }
+    // undici's mockErrors, for code that names the class (an `instanceof` in
+    // a catch); nothing on oam raises it, since the Mock* classes refuse.
+    const mockErrors = {
+      MockNotMatchedError: class MockNotMatchedError extends UndiciError {
+        constructor(message) {
+          super(message || "The request does not match any registered mock dispatches", "UND_MOCK_ERR_MOCK_NOT_MATCHED");
+          this.name = "MockNotMatchedError";
+        }
+      },
+    };
+
     // ---- web globals undici re-exports -----------------------------------
     const mod = {
       fetch: (input, init) => G.fetch(input, init),
@@ -720,7 +1103,19 @@
       MockAgent,
       MockPool,
       MockClient,
+      ProxyAgent,
+      EnvHttpProxyAgent,
+      RetryAgent,
+      RetryHandler,
+      RedirectHandler,
+      DecoratorHandler,
+      createRedirectInterceptor,
+      connect,
+      upgrade,
+      pipeline,
+      mockErrors,
       // Web-standard re-exports (oam ships these as globals).
+      CloseEvent: G.CloseEvent,
       Headers: G.Headers,
       Response: G.Response,
       Request: G.Request,

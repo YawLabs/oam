@@ -5445,6 +5445,299 @@ A.close(); B.close(); S.close();
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// undici's `ProxyAgent` and `EnvHttpProxyAgent` (#208). A ProxyAgent sends
+/// every request -- to an http origin as much as an https one -- through a
+/// `CONNECT` tunnel, so on oam it is a dispatcher whose connect function
+/// opens that tunnel, and every entry point a dispatcher has goes through the
+/// proxy: fetch's `dispatcher`, the global dispatcher, `undici.fetch`,
+/// `undici.request`, the agent's own `request()`, each redirect hop. The
+/// proxy here splices to 127.0.0.1 whatever host the CONNECT named, so the
+/// requests to `a.test` and `b.test` (which do not resolve) only succeed
+/// through it. Pinned: the CONNECT head on the wire, TLS to the origin inside
+/// the tunnel under `requestTls`, TLS to an https proxy under `proxyTls`,
+/// the credentials (`token`, `auth`, the URL's userinfo) going to the proxy
+/// and never the origin, the refusal of a caller Proxy-Authorization, a proxy
+/// that refuses the tunnel or is not there, undici's constructor checks, and
+/// EnvHttpProxyAgent's choice per origin from its options, the environment
+/// and `no_proxy`. Up to 0.17.1 the shim exported neither class, so
+/// `import { ProxyAgent } from 'undici'` was a link-time SyntaxError.
+///
+/// The expected output is node v22.22.2 + undici 6.29.0's, line for line,
+/// with one exception: `refused` (a fetch whose proxy answers 403). undici
+/// calls its connect callback twice there, and node's fetch reports the
+/// second call's `Request was cancelled.`; oam reports the first, the
+/// `Proxy response (403) !== 200` that `undici.request` reports in both.
+#[test]
+fn undici_proxy_agent_tunnels_every_connection() {
+    let script = write_temp(
+        "undici_proxy_agent/main.mjs",
+        &r##"import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
+import tls from 'node:tls';
+import * as undici from 'undici';
+import { ProxyAgent, EnvHttpProxyAgent } from 'undici';
+
+const redact = (s) => String(s).replace(/\b\d{4,5}\b/g, 'P');
+const hits = [];
+const tunnels = [];
+const O = http.createServer((req, res) => {
+  hits.push(`O${req.url} host=${redact(req.headers.host)} pa=${req.headers['proxy-authorization'] ?? '-'}`);
+  if (req.url === '/hop') { res.writeHead(302, { location: `http://b.test:${O.address().port}/landed` }); res.end(); return; }
+  res.end('plain ' + req.url);
+});
+const S = https.createServer({ key: `__KEY__`, cert: `__CERT__` }, (req, res) => { hits.push(`S${req.url}`); res.end('secure ' + req.url); });
+// A CONNECT proxy: records each tunnel request's head, then splices the
+// client to 127.0.0.1:<the authority's port>, whatever host it named -- so a
+// request to a name that does not resolve only succeeds THROUGH it.
+let verdict = 200;
+const serveTunnel = (tag) => (c) => {
+  c.on('error', () => {});
+  let buf = Buffer.alloc(0);
+  const onData = (d) => {
+    buf = Buffer.concat([buf, d]);
+    const end = buf.indexOf('\r\n\r\n');
+    if (end === -1) return;
+    c.removeListener('data', onData);
+    const head = buf.subarray(0, end).toString('latin1').split('\r\n');
+    tunnels.push(tag + redact(head.join(' | ')));
+    if (verdict !== 200) { c.end(`HTTP/1.1 ${verdict} No\r\ncontent-length: 0\r\n\r\n`); return; }
+    const port = Number(head[0].split(' ')[1].split(':').pop());
+    const up = net.connect(port, '127.0.0.1', () => { c.write('HTTP/1.1 200 Connection Established\r\n\r\n'); up.pipe(c); c.pipe(up); });
+    up.on('error', () => c.destroy());
+    c.on('close', () => up.destroy());
+  };
+  c.on('data', onData);
+};
+const P = net.createServer(serveTunnel(''));
+const TP = tls.createServer({ key: `__KEY__`, cert: `__CERT__` }, serveTunnel('tls:'));
+for (const srv of [O, S, P, TP]) await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const proxy = `http://127.0.0.1:${P.address().port}`;
+const plain = `http://a.test:${O.address().port}`;
+const secure = `https://localhost:${S.address().port}`;
+const ca = `__CA__`;
+
+async function probe(name, run) {
+  hits.length = 0; tunnels.length = 0;
+  let out;
+  try {
+    const r = await run();
+    const body = r.body && typeof r.body.text === 'function' ? await r.body.text() : await r.text();
+    out = `${r.status ?? r.statusCode} ${body}`;
+  } catch (e) {
+    const cause = e?.cause ?? e;
+    out = `failed ${cause?.name} ${cause?.code} ${redact(cause?.message)}`;
+  }
+  console.log(name, out, JSON.stringify(tunnels), JSON.stringify(hits));
+}
+const ctor = (name, make) => {
+  try { const a = make(); console.log(name, 'constructed', a instanceof undici.Dispatcher); } catch (e) { console.log(name, e.name, e.code, e.message); }
+};
+
+// The three spellings of the proxy, on every entry point.
+await probe('fetch-string', () => fetch(plain + '/1', { dispatcher: new ProxyAgent(proxy) }));
+await probe('fetch-url', () => fetch(plain + '/2', { dispatcher: new ProxyAgent(new URL(proxy)) }));
+await probe('fetch-uri', () => fetch(plain + '/3', { dispatcher: new ProxyAgent({ uri: proxy }) }));
+const mk = () => new ProxyAgent(proxy);
+await probe('undici-request', () => undici.request(plain + '/4', { dispatcher: mk() }));
+await probe('agent-request', () => mk().request({ origin: plain, path: '/5', method: 'GET' }));
+const previous = undici.getGlobalDispatcher();
+undici.setGlobalDispatcher(mk());
+await probe('global-fetch', () => fetch(plain + '/6'));
+undici.setGlobalDispatcher(mk());
+await probe('undici-fetch', () => undici.fetch(plain + '/7'));
+undici.setGlobalDispatcher(mk());
+await probe('global-request', () => undici.request(plain + '/8'));
+undici.setGlobalDispatcher(previous);
+await probe('redirect', () => fetch(plain + '/hop', { dispatcher: mk() }));
+
+// An https origin: CONNECT, then TLS to the origin inside the tunnel, under requestTls.
+await probe('https-origin', () => fetch(secure + '/s1', { dispatcher: new ProxyAgent({ uri: proxy, requestTls: { ca } }) }));
+await probe('https-untrusted', () => fetch(secure + '/s2', { dispatcher: new ProxyAgent({ uri: proxy }) }));
+// An https proxy: TLS to the proxy under proxyTls, then the tunnel.
+const tlsProxy = `https://localhost:${TP.address().port}`;
+await probe('tls-proxy', () => fetch(plain + '/t1', { dispatcher: new ProxyAgent({ uri: tlsProxy, proxyTls: { ca } }) }));
+await probe('tls-proxy-https', () => fetch(secure + '/t2', { dispatcher: new ProxyAgent({ uri: tlsProxy, proxyTls: { ca }, requestTls: { ca } }) }));
+await probe('tls-proxy-untrusted', () => fetch(plain + '/t3', { dispatcher: new ProxyAgent({ uri: tlsProxy }) }));
+
+// Credentials go to the proxy on the CONNECT, never to the origin.
+await probe('auth-userinfo', () => fetch(plain + '/a1', { dispatcher: new ProxyAgent(proxy.replace('//', '//us%40er:p%3Ass@')) }));
+await probe('auth-token', () => fetch(plain + '/a2', { dispatcher: new ProxyAgent({ uri: proxy, token: 'Bearer tok' }) }));
+await probe('auth-auth', () => fetch(plain + '/a3', { dispatcher: new ProxyAgent({ uri: proxy, auth: 'dTpw' }) }));
+await probe('headers', () => fetch(plain + '/a4', { dispatcher: new ProxyAgent({ uri: proxy, headers: { 'x-proxy-note': 'n' } }) }));
+await probe('request-proxy-auth', () => undici.request(plain + '/a5', { dispatcher: mk(), headers: { 'Proxy-Authorization': 'Basic x' } }));
+await probe('fetch-proxy-auth', () => fetch(plain + '/a6', { dispatcher: mk(), headers: { 'proxy-authorization': 'Basic x' } }));
+
+// A proxy that refuses the tunnel, and one that is not there.
+verdict = 403;
+await probe('refused', () => fetch(plain + '/r1', { dispatcher: mk() }));
+await probe('refused-request', () => undici.request(plain + '/r2', { dispatcher: mk() }));
+verdict = 407;
+await probe('auth-required', () => undici.request(plain + '/r2b', { dispatcher: mk() }));
+verdict = 200;
+const dead = net.createServer();
+await new Promise((r) => dead.listen(0, '127.0.0.1', r));
+const deadPort = dead.address().port;
+await new Promise((r) => dead.close(r));
+await probe('proxy-down', () => fetch(plain + '/r3', { dispatcher: new ProxyAgent(`http://127.0.0.1:${deadPort}`) }));
+
+// Construction.
+ctor('no-args', () => new ProxyAgent());
+ctor('no-uri', () => new ProxyAgent({}));
+ctor('auth+token', () => new ProxyAgent({ uri: proxy, auth: 'a', token: 'b' }));
+ctor('clientFactory', () => new ProxyAgent({ uri: proxy, clientFactory: 1 }));
+ctor('ok', () => new ProxyAgent({ uri: proxy }));
+
+// EnvHttpProxyAgent: the proxy per scheme from its options, else the
+// environment; no_proxy names go direct.
+const direct = `http://127.0.0.1:${O.address().port}`;
+await probe('env-opts-http', () => fetch(plain + '/e1', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy }) }));
+await probe('env-opts-https-falls-back', () => fetch(secure + '/e2', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy, requestTls: { ca } }) }));
+await probe('env-opts-https', () => fetch(secure + '/e3', { dispatcher: new EnvHttpProxyAgent({ httpsProxy: tlsProxy, proxyTls: { ca }, requestTls: { ca } }) }));
+await probe('env-opts-https-only', () => fetch(direct + '/e4', { dispatcher: new EnvHttpProxyAgent({ httpsProxy: tlsProxy, proxyTls: { ca } }) }));
+await probe('env-none', () => fetch(direct + '/e5', { dispatcher: new EnvHttpProxyAgent() }));
+await probe('env-no-proxy-exact', () => fetch(direct + '/e6', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy, noProxy: 'other.test, 127.0.0.1' }) }));
+await probe('env-no-proxy-port-miss', () => fetch(direct + '/e7', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy, noProxy: '127.0.0.1:1' }) }));
+await probe('env-no-proxy-suffix', () => fetch(plain + '/e8', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy, noProxy: '.test' }) }));
+await probe('env-no-proxy-star', () => fetch(direct + '/e9', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy, noProxy: '*' }) }));
+process.env.http_proxy = proxy;
+const fromEnv = new EnvHttpProxyAgent();
+await probe('env-var', () => fetch(plain + '/e10', { dispatcher: fromEnv }));
+process.env.no_proxy = 'a.test';
+await probe('env-var-no-proxy-live', () => fetch(plain + '/e11', { dispatcher: fromEnv }));
+await probe('env-request', () => undici.request(direct + '/e12', { dispatcher: fromEnv }));
+delete process.env.http_proxy;
+delete process.env.no_proxy;
+
+O.close(); S.close(); P.close(); TP.close();
+"##
+            .replace("__CERT__", TLS_TEST_LEAF_CERT)
+            .replace("__KEY__", TLS_TEST_LEAF_KEY)
+            .replace("__CA__", TLS_TEST_CA_CERT),
+    );
+    // The script names its proxies itself; the environment's must not apply.
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"fetch-string 200 plain /1 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/1 host=a.test:P pa=-"]
+fetch-url 200 plain /2 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/2 host=a.test:P pa=-"]
+fetch-uri 200 plain /3 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/3 host=a.test:P pa=-"]
+undici-request 200 plain /4 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/4 host=a.test:P pa=-"]
+agent-request 200 plain /5 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/5 host=a.test:P pa=-"]
+global-fetch 200 plain /6 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/6 host=a.test:P pa=-"]
+undici-fetch 200 plain /7 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/7 host=a.test:P pa=-"]
+global-request 200 plain /8 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/8 host=a.test:P pa=-"]
+redirect 200 plain /landed ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close","CONNECT b.test:P HTTP/1.1 | host: b.test:P | connection: close"] ["O/hop host=a.test:P pa=-","O/landed host=b.test:P pa=-"]
+https-origin 200 secure /s1 ["CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] ["S/s1"]
+https-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate ["CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] []
+tls-proxy 200 plain /t1 ["tls:CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/t1 host=a.test:P pa=-"]
+tls-proxy-https 200 secure /t2 ["tls:CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] ["S/t2"]
+tls-proxy-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate [] []
+auth-userinfo 200 plain /a1 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | proxy-authorization: Basic dXNAZXI6cDpzcw=="] ["O/a1 host=a.test:P pa=-"]
+auth-token 200 plain /a2 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | proxy-authorization: Bearer tok"] ["O/a2 host=a.test:P pa=-"]
+auth-auth 200 plain /a3 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | proxy-authorization: Basic dTpw"] ["O/a3 host=a.test:P pa=-"]
+headers 200 plain /a4 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | x-proxy-note: n"] ["O/a4 host=a.test:P pa=-"]
+request-proxy-auth failed InvalidArgumentError UND_ERR_INVALID_ARG Proxy-Authorization should be sent in ProxyAgent constructor [] []
+fetch-proxy-auth failed InvalidArgumentError UND_ERR_INVALID_ARG Proxy-Authorization should be sent in ProxyAgent constructor [] []
+refused failed AbortError UND_ERR_ABORTED Proxy response (403) !== 200 when HTTP Tunneling ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] []
+refused-request failed AbortError UND_ERR_ABORTED Proxy response (403) !== 200 when HTTP Tunneling ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] []
+auth-required failed AbortError UND_ERR_ABORTED Proxy response (407) !== 200 when HTTP Tunneling ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] []
+proxy-down failed Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:P [] []
+no-args InvalidArgumentError UND_ERR_INVALID_ARG Proxy uri is mandatory
+no-uri InvalidArgumentError UND_ERR_INVALID_ARG Proxy uri is mandatory
+auth+token InvalidArgumentError UND_ERR_INVALID_ARG opts.auth cannot be used in combination with opts.token
+clientFactory InvalidArgumentError UND_ERR_INVALID_ARG Proxy opts.clientFactory must be a function.
+ok constructed true
+env-opts-http 200 plain /e1 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/e1 host=a.test:P pa=-"]
+env-opts-https-falls-back 200 secure /e2 ["CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] ["S/e2"]
+env-opts-https 200 secure /e3 ["tls:CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] ["S/e3"]
+env-opts-https-only 200 plain /e4 [] ["O/e4 host=127.0.0.1:P pa=-"]
+env-none 200 plain /e5 [] ["O/e5 host=127.0.0.1:P pa=-"]
+env-no-proxy-exact 200 plain /e6 [] ["O/e6 host=127.0.0.1:P pa=-"]
+env-no-proxy-port-miss 200 plain /e7 ["CONNECT 127.0.0.1:P HTTP/1.1 | host: 127.0.0.1:P | connection: close"] ["O/e7 host=127.0.0.1:P pa=-"]
+env-no-proxy-suffix failed Error ENOTFOUND getaddrinfo ENOTFOUND a.test [] []
+env-no-proxy-star 200 plain /e9 [] ["O/e9 host=127.0.0.1:P pa=-"]
+env-var 200 plain /e10 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/e10 host=a.test:P pa=-"]
+env-var-no-proxy-live failed Error ENOTFOUND getaddrinfo ENOTFOUND a.test [] []
+env-request 200 plain /e12 ["CONNECT 127.0.0.1:P HTTP/1.1 | host: 127.0.0.1:P | connection: close"] ["O/e12 host=127.0.0.1:P pa=-"]"##;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+    // undici's one-time notice, as node prints it.
+    assert!(
+        stderr.contains("[UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental"),
+        "{stderr}"
+    );
+}
+
+/// The undici names that work through `dispatch()` -- which oam does not run
+/// -- are exported and refuse when used, as the Mock* classes do (#208): a
+/// name missing from an ES module stops the whole program at import with a
+/// SyntaxError, whether or not the importer ever uses it, so
+/// `@actions/http-client` 4 and `@upstash/context7-mcp` (both `import {
+/// ProxyAgent } from 'undici'`) never started. The sorted export list is
+/// pinned so that a dropped name fails here rather than at a user's import;
+/// what a ProxyAgent cannot do on oam (`proxyTunnel: false`, a
+/// `clientFactory` or `factory`) is refused at construction.
+#[test]
+fn undici_exports_link_and_refuse_what_oam_cannot_run() {
+    let script = write_temp(
+        "undici_exports/main.mjs",
+        r##"// Named imports: each of these is a link-time SyntaxError if the shim does
+// not export it, before a line of the program runs.
+import {
+  ProxyAgent, EnvHttpProxyAgent, RetryAgent, RetryHandler, RedirectHandler, DecoratorHandler,
+  createRedirectInterceptor, connect, upgrade, pipeline, mockErrors, CloseEvent, errors,
+} from 'undici';
+import * as undici from 'undici';
+
+console.log(Object.keys(undici).sort().join(' '));
+const shape = (e) => `${e.name} ${e.code} ${e.message.split(' is not supported')[0]}`;
+const refused = (name, run) => {
+  try { run(); console.log(name, 'ran'); } catch (e) { console.log(name, shape(e)); }
+};
+refused('RetryAgent', () => new RetryAgent(new undici.Agent()));
+refused('RetryHandler', () => new RetryHandler({}, {}));
+refused('RedirectHandler', () => new RedirectHandler());
+refused('DecoratorHandler', () => new DecoratorHandler({}));
+refused('createRedirectInterceptor', () => createRedirectInterceptor({ maxRedirections: 1 }));
+refused('pipeline', () => pipeline('http://127.0.0.1:1/', {}, () => {}));
+await connect({ origin: 'http://127.0.0.1:1', path: '/' }).then(() => console.log('connect ran'), (e) => console.log('connect', shape(e)));
+await upgrade({ origin: 'http://127.0.0.1:1', path: '/' }).then(() => console.log('upgrade ran'), (e) => console.log('upgrade', shape(e)));
+await new Promise((r) => connect({ origin: 'http://127.0.0.1:1', path: '/' }, (e, data) => { console.log('connect-callback', shape(e), data); r(); }));
+// What a ProxyAgent cannot do here is refused when it is built, after
+// undici's own argument checks.
+refused('proxyTunnel-false', () => new ProxyAgent({ uri: 'http://127.0.0.1:1', proxyTunnel: false }));
+refused('clientFactory', () => new ProxyAgent({ uri: 'http://127.0.0.1:1', clientFactory: () => {} }));
+refused('factory', () => new ProxyAgent({ uri: 'http://127.0.0.1:1', factory: () => {} }));
+const e = new mockErrors.MockNotMatchedError();
+console.log('mockErrors', e.name, e.code, e instanceof errors.UndiciError);
+console.log('CloseEvent', CloseEvent === globalThis.CloseEvent, typeof EnvHttpProxyAgent);
+const aborted = new errors.RequestAbortedError();
+console.log('RequestAbortedError', aborted.name, aborted.code, aborted.message);
+const prx = new errors.SecureProxyConnectionError(new Error('why'));
+console.log('SecureProxyConnectionError', prx.name, prx.code, prx.message, prx.cause.message);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = r##"Agent BalancedPool Blob Client CloseEvent DecoratorHandler Dispatcher EnvHttpProxyAgent File FormData Headers MessageEvent MockAgent MockClient MockPool Pool ProxyAgent RedirectHandler Request Response RetryAgent RetryHandler WebSocket buildConnector connect createRedirectInterceptor default errors fetch getGlobalDispatcher getGlobalOrigin interceptors mockErrors pipeline request setGlobalDispatcher setGlobalOrigin stream upgrade
+RetryAgent NotSupportedError UND_ERR_NOT_SUPPORTED undici's RetryAgent
+RetryHandler NotSupportedError UND_ERR_NOT_SUPPORTED undici's RetryHandler
+RedirectHandler NotSupportedError UND_ERR_NOT_SUPPORTED undici's RedirectHandler
+DecoratorHandler NotSupportedError UND_ERR_NOT_SUPPORTED undici's DecoratorHandler
+createRedirectInterceptor NotSupportedError UND_ERR_NOT_SUPPORTED undici's createRedirectInterceptor()
+pipeline NotSupportedError UND_ERR_NOT_SUPPORTED undici's pipeline()
+connect NotSupportedError UND_ERR_NOT_SUPPORTED undici's connect()
+upgrade NotSupportedError UND_ERR_NOT_SUPPORTED undici's upgrade()
+connect-callback NotSupportedError UND_ERR_NOT_SUPPORTED undici's connect() null
+proxyTunnel-false NotSupportedError UND_ERR_NOT_SUPPORTED undici's ProxyAgent with proxyTunnel: false
+clientFactory NotSupportedError UND_ERR_NOT_SUPPORTED A ProxyAgent with a clientFactory or factory
+factory NotSupportedError UND_ERR_NOT_SUPPORTED A ProxyAgent with a clientFactory or factory
+mockErrors MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED true
+CloseEvent true function
+RequestAbortedError AbortError UND_ERR_ABORTED Request aborted
+SecureProxyConnectionError SecureProxyConnectionError UND_ERR_PRX_TLS Secure Proxy Connection failed why"##;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 /// A dispatcher oam cannot run as undici would -- its dispatch() overridden by
 /// a subclass or a patched instance, dispatch interceptors, or an object that
 /// is not one of the shim's dispatchers -- fails the request with

@@ -1497,6 +1497,48 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   itself; point the code under test at a local server instead. Pinned by
   `undici_mock_dispatchers_refuse_instead_of_reaching_the_network` (e2e).
 
+**`ProxyAgent`, `EnvHttpProxyAgent`, and the undici names oam exports to refuse**
+
+`ProxyAgent` and `EnvHttpProxyAgent` work (#208). undici's `ProxyAgent` sends every request
+-- to an http origin as much as an https one -- through a `CONNECT` tunnel, so oam's is a
+dispatcher whose connect function opens that tunnel: it connects to the proxy (TLS first for
+an `https:` proxy, under `proxyTls`), sends undici's `CONNECT host:port` with `host`,
+`connection: close` and the proxy headers (`headers`, and `proxy-authorization` from
+`token`, `auth` or the proxy URL's userinfo), and on a `200` the request goes over that
+socket, with TLS to the origin inside it under `requestTls`. Every entry point a dispatcher
+has goes through it, redirect hops included, and the credentials go to the proxy only. A
+request carrying its own `Proxy-Authorization` is refused with undici's
+`InvalidArgumentError`; a proxy that answers anything but `200` fails the request with
+undici's `Proxy response (403) !== 200 when HTTP Tunneling`. `EnvHttpProxyAgent` picks, per
+origin, a `ProxyAgent` for `httpProxy` / `httpsProxy` (else `http_proxy` / `HTTP_PROXY` and
+`https_proxy` / `HTTPS_PROXY`) or a plain `Agent` for what `noProxy` / `no_proxy` /
+`NO_PROXY` exempts, with undici's matching, and prints undici's one-time `UNDICI-EHPA`
+warning. Pinned against Node + undici 6.29.0 by
+`undici_proxy_agent_tunnels_every_connection` (e2e). Up to 0.17.1 neither was exported, and
+since a name missing from an ES module is a link-time error, a package that merely imported
+`ProxyAgent` (`@actions/http-client` 4, `@upstash/context7-mcp`) did not start. What differs:
+
+- **Nothing is pooled**, as for any connect function (above): one tunnel per request, where
+  undici reuses a tunnel to the same origin.
+- **`proxyTunnel: false`, `clientFactory` and `factory` are refused at construction** with
+  `NotSupportedError`. The first sends an http origin to an http proxy in absolute form,
+  which oam's transport cannot write over a supplied socket; the other two supply
+  dispatchers whose `dispatch()` oam does not run.
+- **A proxy that refuses the tunnel, seen through `fetch`.** undici calls its connect
+  callback twice in that case and Node's `fetch` reports the second call (`cause` `Error:
+  Request was cancelled.`); oam reports the first, the `Proxy response (...) !== 200` error
+  that `undici.request` reports in both.
+- **Exported, refused at use:** `RetryAgent`, `RetryHandler`, `RedirectHandler`,
+  `DecoratorHandler`, `createRedirectInterceptor`, `connect()`, `upgrade()` and
+  `pipeline()` all work through `dispatch()`. Each is exported so an `import` of it links,
+  and fails with `NotSupportedError` when constructed or called (`connect` / `upgrade`
+  through their callback or promise). `mockErrors.MockNotMatchedError` is exported as a
+  class; nothing raises it, since the Mock* classes refuse. Pinned, with the shim's whole
+  export list, by `undici_exports_link_and_refuse_what_oam_cannot_run` (e2e).
+- **Not exported at all** (an `import` of one is still a link-time `SyntaxError`):
+  `getCookies`, `getSetCookies`, `setCookie`, `deleteCookie`, `parseMIMEType`,
+  `serializeAMimeType`, `util`, `caches`, `EventSource`, `ErrorEvent` and `FileReader`.
+
 **`headersTimeout` and `bodyTimeout` on `undici.request`**
 
 `undici.request()`, `undici.stream()` and a dispatcher's `request()` honour undici's two

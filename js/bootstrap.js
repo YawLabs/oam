@@ -1190,8 +1190,8 @@
   // cannot run faithfully -- a dispatch() override, interceptors, or an
   // object that is not one of the oam:undici shim's dispatchers -- since oam
   // would otherwise send the request without it.
-  function dispatcherPolicy(dispatcher, holder) {
-    if (holder && typeof holder.policy === "function") return holder.policy(dispatcher);
+  function dispatcherPolicy(dispatcher, holder, request) {
+    if (holder && typeof holder.policy === "function") return holder.policy(dispatcher, request);
     const refuse = new Error(
       "a fetch dispatcher that is not one of oam's undici dispatchers is not supported: " +
         "oam cannot run its dispatch(); pass the connection policy as a `connect` function",
@@ -1584,7 +1584,10 @@
     // an undici dispatcher.
     let connector = null;
     if (!rawPayload && dispatcher != null) {
-      const policy = dispatcherPolicy(dispatcher, holder);
+      const policy = dispatcherPolicy(dispatcher, holder, {
+        url: rawUrl,
+        headerNames: headers.map((h) => h[0]),
+      });
       if (policy.refuse) throw new TypeError("fetch failed", { cause: policy.refuse });
       if (policy.connector) {
         connector = policy.connector;
