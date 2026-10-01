@@ -426,25 +426,34 @@
         }
         if (typeof factory === "function") {
           const { factory: _factory, maxRedirections: _maxRedirections, ...originOptions } = this._options;
+          // origin -> { dispatcher, connect }: the connector is built once,
+          // from the origin's dispatcher, whose connect timeout (its
+          // `connectTimeout` -- which undici hands the factory -- or
+          // `connect.timeout`) bounds the connection as undici's Pool does.
           const byOrigin = new Map();
-          const plain = buildConnector({});
           this._oamConnectLookup = null;
           this._oamConnect = function viaFactory(params, cb) {
             const origin = params.protocol + "//" + params.host;
-            let dispatcher = byOrigin.get(origin);
-            if (dispatcher === undefined) {
-              dispatcher = factory(origin, originOptions);
-              byOrigin.set(origin, dispatcher);
+            let entry = byOrigin.get(origin);
+            if (entry === undefined) {
+              entry = { dispatcher: factory(origin, originOptions), connect: null };
+              byOrigin.set(origin, entry);
             }
+            const dispatcher = entry.dispatcher;
             const policy = policyOf(dispatcher);
             if (policy.refuse) {
               cb(policy.refuse);
             } else if (policy.connector) {
               policy.connector.fn.call(policy.connector.self, params, cb);
-            } else if (typeof dispatcher._oamConnectLookup === "function") {
-              buildConnector({ lookup: dispatcher._oamConnectLookup })(params, cb);
             } else {
-              plain(params, cb);
+              if (entry.connect === null) {
+                const lookup = typeof dispatcher._oamConnectLookup === "function"
+                  ? dispatcher._oamConnectLookup
+                  : undefined;
+                const timeout = dispatcher._oamConnectTimeout ?? undefined;
+                entry.connect = buildConnector(lookup ? { lookup, timeout } : { timeout });
+              }
+              entry.connect(params, cb);
             }
           };
         }

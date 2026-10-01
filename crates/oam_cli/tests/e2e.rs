@@ -7875,7 +7875,9 @@ console.log('exports', Object.keys(E).length, new E.BalancedPoolMissingUpstreamE
 /// handshaken, then fails the request with its `ConnectTimeoutError`. oam had
 /// no connect timeout at all and waited for the operating system. The server
 /// accepts and never answers the ClientHello. `undici.request` rejects with
-/// the error itself, and 0 turns the timeout off. Every line below is what
+/// the error itself, and 0 turns the timeout off -- for an Agent's factory
+/// too, whose dispatcher's timeout used to be ignored for undici's 10 s
+/// default. Every line below is what
 /// node v22.22.2 prints with the npm undici 6.24.1 next to the script; the
 /// default 10 s is conformance case 211.
 #[test]
@@ -7907,6 +7909,22 @@ try { await undici.request(U, { dispatcher: new Agent({ connectTimeout: 300 }) }
 catch (e) { show('undici.request', 'request', e); }
 try { await new Pool(U, { connectTimeout: 300 }).request({ path: '/', method: 'GET' }); console.log('pool resolved'); }
 catch (e) { show('pool.request', 'request', e); }
+// An Agent's factory builds each origin's dispatcher from the agent's
+// options: that dispatcher's timeout is the one its connections get.
+const factory = (origin, opts) => new Pool(origin, opts);
+for (const [label, options] of [
+  ['factory connectTimeout', { factory, connectTimeout: 300 }],
+  ['factory connect.timeout', { factory, connect: { timeout: 300 } }],
+]) {
+  try { await fetch(U, { dispatcher: new Agent(options) }); console.log(label, 'resolved'); }
+  catch (e) { show(label, `fetch:${e.name}:${e.message}`, e.cause); }
+}
+{
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 1200);
+  try { await fetch(U, { dispatcher: new Agent({ factory, connectTimeout: 0 }), signal: ac.signal }); console.log('factory zero resolved'); }
+  catch (e) { console.log('factory timeout 0', e.name, e.cause === undefined); }
+}
 {
   // 0 is no timeout: only the abort ends it.
   const ac = new AbortController();
@@ -7935,6 +7953,9 @@ srv.close();
          both fetch:TypeError:fetch failed {cause}\n\
          undici.request request {cause}\n\
          pool.request request {cause}\n\
+         factory connectTimeout fetch:TypeError:fetch failed {cause}\n\
+         factory connect.timeout fetch:TypeError:fetch failed {cause}\n\
+         factory timeout 0 AbortError true\n\
          timeout 0 AbortError true\n\
          connectTimeout -1 | Agent ok | Client {invalid} | Pool ok\n\
          connectTimeout x | Agent ok | Client {invalid} | Pool ok\n\
