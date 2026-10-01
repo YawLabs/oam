@@ -17728,13 +17728,14 @@
         return this;
       }
       getHeader(name) {
-        return this._headers.get(String(name).toLowerCase());
+        checkHeaderNameArg(name);
+        return this._headers.get(name.toLowerCase());
       }
       getHeaderNames() {
         return [...this._headers.keys()];
       }
       removeHeader(name) {
-        if (typeof name !== "string") throw codes.ERR_INVALID_ARG_TYPE("name", "string", name);
+        checkHeaderNameArg(name);
         if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("remove");
         const key = name.toLowerCase();
         // node remembers these two: with content-length removed it frames
@@ -17744,7 +17745,8 @@
         this._headers.delete(key);
       }
       hasHeader(name) {
-        return this._headers.has(String(name).toLowerCase());
+        checkHeaderNameArg(name);
+        return this._headers.has(name.toLowerCase());
       }
       // node's writeHead(statusCode[, statusMessage][, headers]). Headers
       // given to a response no header method has touched are node's fast
@@ -20082,15 +20084,22 @@
         this._headers[key] = value;
         return this;
       }
-      getHeader(name) { return this._headers[name.toLowerCase()]; }
+      getHeader(name) {
+        checkHeaderNameArg(name);
+        return this._headers[name.toLowerCase()];
+      }
       removeHeader(name) {
+        checkHeaderNameArg(name);
         var key = name.toLowerCase();
         // node: a removed Connection header is not sent at all.
         if (key === "connection") this._removedConnection = true;
         delete this._headers[key];
       }
       getHeaders() { return Object.assign({}, this._headers); }
-      hasHeader(name) { return name.toLowerCase() in this._headers; }
+      hasHeader(name) {
+        checkHeaderNameArg(name);
+        return name.toLowerCase() in this._headers;
+      }
       // The request head as it goes on the wire: the request line, every
       // header line, and the blank line that ends it -- node's `_header`.
       _renderHead() {
@@ -22309,6 +22318,13 @@
       validateHeaderName(name);
       validateHeaderValue(name, value);
     }
+    // node's validateString(name, 'name') at the top of every outgoing
+    // message's getHeader / hasHeader / removeHeader: a name that is not a
+    // string throws ERR_INVALID_ARG_TYPE, where `String(name)` or
+    // `name.toLowerCase()` answered undefined / false or a bare TypeError.
+    function checkHeaderNameArg(name) {
+      if (typeof name !== "string") throw codes.ERR_INVALID_ARG_TYPE("name", "string", name);
+    }
     // The same checks as node's _storeHeader makes them on headers given
     // to writeHead() directly: a list value is checked item by item.
     function checkStoredHeader(name, value) {
@@ -22336,11 +22352,21 @@
         this._headers[name.toLowerCase()] = value;
         return this;
       }
-      getHeader(name) { return this._headers[name.toLowerCase()]; }
+      getHeader(name) {
+        checkHeaderNameArg(name);
+        return this._headers[name.toLowerCase()];
+      }
       getHeaderNames() { return Object.keys(this._headers); }
       getHeaders() { return Object.assign({}, this._headers); }
-      hasHeader(name) { return name.toLowerCase() in this._headers; }
-      removeHeader(name) { delete this._headers[name.toLowerCase()]; }
+      hasHeader(name) {
+        checkHeaderNameArg(name);
+        return name.toLowerCase() in this._headers;
+      }
+      removeHeader(name) {
+        checkHeaderNameArg(name);
+        if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("remove");
+        delete this._headers[name.toLowerCase()];
+      }
       flushHeaders() {}
       appendHeader(name, value) {
         if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("append");

@@ -20,6 +20,10 @@
 //   - Once the head is out, set / append / remove / write headers throw
 //     ERR_HTTP_HEADERS_SENT.
 //   - http.validateHeaderName / validateHeaderValue are the same checks.
+//   - getHeader / hasHeader / removeHeader refuse a name that is not a
+//     string (ERR_INVALID_ARG_TYPE), on a response, an OutgoingMessage and a
+//     ClientRequest alike; getHeader(1) answered undefined and hasHeader(1)
+//     false.
 import http from "node:http";
 
 const describe = (e) => `${e.constructor.name}${e.code ? `[${e.code}]` : ""}: ${e.message}`;
@@ -69,6 +73,8 @@ const names = {
   undefined: undefined,
   ok: "X-Ok",
 };
+
+const nameArgs = { number: 1, undefined: undefined, null: null, object: {}, symbol: Symbol("s"), string: "X-V" };
 
 // Each case runs in its own request, on a fresh response.
 const cases = [];
@@ -194,6 +200,14 @@ run("after the head is out", (res) => {
   attempt("  setHeader invalid", () => res.setHeader("x v", "€"));
 });
 
+run("name argument types", (res) => {
+  for (const [k, v] of Object.entries(nameArgs)) {
+    attempt(`  getHeader ${k}`, () => res.getHeader(v));
+    attempt(`  hasHeader ${k}`, () => res.hasHeader(v));
+    attempt(`  removeHeader ${k}`, () => res.removeHeader(v));
+  }
+});
+
 const server = http.createServer((req, res) => {
   const [label, fn] = cases[Number(req.url.slice(1))];
   console.log(label);
@@ -230,3 +244,16 @@ for (const [label, fn] of [
 ]) {
   attempt(label, fn);
 }
+
+// The same name check on the other outgoing messages.
+const outgoing = new http.OutgoingMessage();
+const request = http.request({ host: "127.0.0.1", port, path: "/" });
+request.on("error", () => {});
+for (const [label, message] of [["OutgoingMessage", outgoing], ["ClientRequest", request]]) {
+  for (const [k, v] of Object.entries(nameArgs)) {
+    attempt(`${label} getHeader ${k}`, () => message.getHeader(v));
+    attempt(`${label} hasHeader ${k}`, () => message.hasHeader(v));
+    attempt(`${label} removeHeader ${k}`, () => message.removeHeader(v));
+  }
+}
+request.destroy();
