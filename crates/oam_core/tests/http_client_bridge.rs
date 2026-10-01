@@ -89,6 +89,12 @@ impl Reg {
                 OpOutcome::Bytes(chunk) => out.extend_from_slice(&chunk),
                 OpOutcome::Done => return Ok(out),
                 OpOutcome::Failed(text) => return Err(text),
+                // A body's wire failure in node's words (`UND_ERR_SOCKET`
+                // for a connection that ended inside it, ...): see
+                // http_client::body. JS turns it into the request's error.
+                OpOutcome::NodeFailed { code, message, .. } => {
+                    return Err(format!("{code}: {message}"));
+                }
                 other => panic!("{other:?}"),
             }
         }
@@ -239,7 +245,12 @@ async fn eof_mid_body_fails_the_body() {
             .await;
         let p = payload(head.await.unwrap());
         bridge::input_end(reg.bridges.clone(), id).await;
-        assert!(reg.body(p["bodyHandle"].as_u64().unwrap()).await.is_err());
+        // A kept-alive response cut short: undici's SocketError, which
+        // http.request's response turns into node's 'aborted'.
+        assert_eq!(
+            reg.body(p["bodyHandle"].as_u64().unwrap()).await,
+            Err("UND_ERR_SOCKET: other side closed".to_string())
+        );
     })
     .await;
 }
