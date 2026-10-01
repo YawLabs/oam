@@ -1299,7 +1299,7 @@ own resolver leaves the flag out.
 Passing the flag means calling `getaddrinfo` by hand, through new `unsafe` code, which is
 why it is not done yet. `dns.lookup` is the same resolver, and its `hints` are handled in
 JS: since 0.17.2 `dns.ADDRCONFIG`, `dns.V4MAPPED` and `dns.ALL` are the platform's `AI_*`
-values (`1024`, `2048`, `256` on Windows, macOS and the BSDs; `32`, `8`, `16` on Linux;
+values (`1024`, `2048`, `256` on Windows, macOS, the BSDs and Android; `32`, `8`, `16` on Linux;
 up to 0.17.1 all three were `0`), `hints` is validated as Node's `validateHints` does
 (`ERR_INVALID_ARG_TYPE` for a non-number, `ERR_INVALID_ARG_VALUE` for any other bit), and
 `V4MAPPED` (with or without `ALL`) on a `family: 6` lookup answers IPv4 addresses as

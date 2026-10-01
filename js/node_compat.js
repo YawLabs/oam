@@ -22486,10 +22486,10 @@
     // node's `dns.ADDRCONFIG`, the hints net passes a lookup off Windows when
     // the caller gave none: the platform's AI_ADDRCONFIG. The table
     // bootstrap.js lookupHints() uses for a fetch's connect.lookup (measured:
-    // 1024 on macOS 26, 0x20 on glibc).
+    // 1024 on macOS 26, 0x20 on glibc; bionic has the BSD value).
     function addrconfigHints() {
       const platform = globalThis.process.platform;
-      if (platform === "darwin" || platform === "freebsd") return 1024;
+      if (platform === "darwin" || platform === "freebsd" || platform === "android") return 1024;
       return 0x20;
     }
 
@@ -27753,9 +27753,11 @@
 
     // node's getaddrinfo flags, as `dns.ADDRCONFIG` / `dns.V4MAPPED` /
     // `dns.ALL` expose them: the system's AI_* values, which are glibc's (and
-    // musl's) on Linux and the BSD ones on Windows, macOS and the BSDs.
+    // musl's) on Linux and the BSD ones on Windows, macOS, the BSDs and
+    // Android (bionic's netdb.h has the BSD values: AI_ALL 0x100,
+    // AI_ADDRCONFIG 0x400, AI_V4MAPPED 0x800).
     const [ADDRCONFIG, V4MAPPED, ALL] =
-      globalThis.process.platform === "linux" || globalThis.process.platform === "android"
+      globalThis.process.platform === "linux"
         ? [0x20, 0x8, 0x10]
         : [0x400, 0x800, 0x100];
 

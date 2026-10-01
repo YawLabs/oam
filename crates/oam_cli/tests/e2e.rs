@@ -12901,6 +12901,31 @@ exec("echo hello-exec-cb", (err, stdout, stderr) => {
     assert!(stdout.contains("exec-stderr-type: string"), "{stdout}");
 }
 
+/// #165: dns.ADDRCONFIG / V4MAPPED / ALL are the platform's AI_* values,
+/// and Android's bionic has the BSD ones (AI_ADDRCONFIG 0x400, AI_V4MAPPED
+/// 0x800, AI_ALL 0x100 -- the libc crate's android/mod.rs), not glibc's 32 /
+/// 8 / 16. oam gave Android glibc's, so node's 1024 was refused as a hint.
+/// The constants are read when node:dns loads, so the platform is set first.
+#[test]
+fn dns_hint_constants_on_android_are_bionic_values() {
+    let stdout = run_ok(
+        "dns_android_hints.cjs",
+        "Object.defineProperty(process, 'platform', { value: 'android' });\n\
+         const dns = require('node:dns');\n\
+         console.log(dns.ADDRCONFIG, dns.V4MAPPED, dns.ALL);\n\
+         try { dns.lookup('localhost', { hints: 1024 }, () => {}); console.log('hint 1024 accepted'); }\n\
+         catch (e) { console.log('hint 1024 refused', e.code); }",
+    );
+    assert!(
+        stdout.contains("1024 2048 256"),
+        "android's AI_ADDRCONFIG / AI_V4MAPPED / AI_ALL: {stdout}"
+    );
+    assert!(
+        stdout.contains("hint 1024 accepted"),
+        "node's dns.ADDRCONFIG on android is a valid hint: {stdout}"
+    );
+}
+
 #[test]
 fn dns_lookup_resolves_localhost() {
     let f = write_temp(

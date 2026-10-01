@@ -1080,7 +1080,8 @@
   function lookupHints() {
     const platform = globalThis.process?.platform;
     if (platform === "win32") return 0;
-    if (platform === "darwin" || platform === "freebsd") return 1024;
+    // bionic's AI_ADDRCONFIG is the BSD 0x400, not glibc's 0x20.
+    if (platform === "darwin" || platform === "freebsd" || platform === "android") return 1024;
     return 0x20;
   }
 
