@@ -202,5 +202,17 @@ sync("appendFileSync(-1, buffer)", () => fs.appendFileSync(-1, Buffer.from("x"))
 sync("readFileSync(-1)", () => fs.readFileSync(-1));
 await viaCallback("writeFile(-1)", (cb) => fs.writeFile(-1, "x", cb));
 
+// The stream constructors validate a path (with no fd) before they return,
+// so a bad one throws from createReadStream / createWriteStream itself.
+for (const bad of [42n, {}, undefined]) {
+  for (const make of ["createReadStream", "createWriteStream"]) {
+    sync(`${make}(${typeof bad})`, () => {
+      const stream = fs[make](bad);
+      stream.on("error", () => {});
+      stream.destroy();
+    });
+  }
+}
+
 process.chdir(os.tmpdir());
 fs.rmSync(root, { recursive: true, force: true });

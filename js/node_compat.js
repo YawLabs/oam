@@ -10120,6 +10120,10 @@
         const opts = readOptions(options);
         const highWaterMark = opts.highWaterMark ?? 65536;
         const supplied = suppliedFd(opts);
+        // node's importFd: with no descriptor, the path is validated here in
+        // the constructor, so a bad one throws from createReadStream itself
+        // rather than failing the open a tick later as an 'error' event.
+        if (!supplied) toPath(path);
         // node's `autoClose` is about the DESCRIPTOR, not the stream object:
         // false means the application owns the fd and the stream must leave it
         // open even at EOF and even on error. It also maps onto the stream
@@ -10230,6 +10234,8 @@
         const opts = readOptions(options);
         const flags = opts.flags === "a" ? "a" : "w";
         const supplied = suppliedFd(opts);
+        // Validated in the constructor, as node's importFd does (see ReadStream).
+        if (!supplied) toPath(path);
         const autoClose = opts.autoClose !== false;
         let handle = supplied ? supplied.handle : null;
         let totalWritten = 0;
