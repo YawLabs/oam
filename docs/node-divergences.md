@@ -1407,10 +1407,16 @@ What still differs:
   (`conformance/cases/254-http-reset-and-destroy.mjs`). Up to 0.17.1 neither reached the
   connection: `resetAndDestroy()` failed the socket and the response with
   `ERR_SOCKET_CLOSED`, sent a FIN and left an idle pooled connection open, as `destroy()` did.
-  What differs: the https stand-in is a `tls.TLSSocket`, whose `resetAndDestroy()` throws
-  `ERR_INVALID_HANDLE_TYPE` as Node's does, but whose `destroy()` after the response leaves
-  the kept-alive TLS connection in the pool, where Node closes it; an h2 connection, which
-  carries other requests at once, is never closed through one request's socket. _(source)_
+  The https stand-in is a `tls.TLSSocket`: its `resetAndDestroy()` throws
+  `ERR_INVALID_HANDLE_TYPE` as Node's does, and its `destroy()` closes the TLS connection
+  the same way, kept-alive in the pool included -- the server sees the end and the close,
+  and the next request dials anew (e2e
+  `https_get_socket_destroy_closes_the_pooled_tls_connection`; up to 0.17.1 that
+  connection stayed in the pool and the next request went out on it). What differs: an h2
+  connection, which carries other requests at once, is never closed through one request's
+  socket; and `end()` on either stand-in does nothing, where Node's sends a FIN, so a
+  server that answers it by closing closes Node's socket (`'close'` with `false`) and oam's
+  connection stays pooled. _(probed: Node v22.22.2 and oam, Windows)_
 - **A server's reset before the response head is Node's socket error** (case 254): the
   request's `'error'` and `fetch`'s cause are `read ECONNRESET` with `errno`, `code` and
   `syscall: 'read'`, as Node's socket reports it. Up to 0.17.1 it was `ECONNRESET` `socket

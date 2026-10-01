@@ -20876,10 +20876,11 @@
         }
         socket.connecting = false;
         // The connection the response came on, which destroy() and
-        // resetAndDestroy() close as node's close the socket's handle. A
-        // TLSSocket's (no reset there: ERR_INVALID_HANDLE_TYPE) is not
-        // tracked, nor is an h2 one, which the transport does not name.
-        if (facts.connection !== undefined && !socket.encrypted) {
+        // resetAndDestroy() close as node's close the socket's handle -- a
+        // TLSSocket's through destroy() alone (its resetAndDestroy() throws
+        // ERR_INVALID_HANDLE_TYPE, as node's does). An h2 connection, which
+        // the transport does not name, is not tracked.
+        if (facts.connection !== undefined) {
           socket[registry._netNativeConnection] = facts.connection;
         }
         if (socket.encrypted && raw.tls) {
@@ -31484,6 +31485,14 @@
           var id = tlsIdOf(this);
           if (id !== null) natives.tlsClose(id);
           this._handle = null;
+        }
+        // The fetch path's stand-in (an https request's req.socket): its
+        // connection is the transport's, and closes there, as net.Socket's
+        // stand-in does -- mid-response or idle in the pool alike.
+        var connection = this[registry._netNativeConnection];
+        if (connection !== undefined) {
+          this[registry._netNativeConnection] = undefined;
+          globalThis.__oam.fetchConnClose(connection, false);
         }
         var wrapped = this._releaseWrap();
         callback(err);

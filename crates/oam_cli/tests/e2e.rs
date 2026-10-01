@@ -19719,6 +19719,81 @@ process.exit(0);
     }
 }
 
+/// An option-less https.get rides oam's shared transport, and its
+/// `req.socket` is a stand-in `tls.TLSSocket`. destroy() on it after the
+/// response closes the kept-alive TLS connection the response came on, as
+/// node's closes the socket's handle: the server sees the end and the close,
+/// the socket's 'close' says false, and the next request dials a new
+/// connection. Its resetAndDestroy() throws ERR_INVALID_HANDLE_TYPE, as on
+/// node's TLSSocket. Measured on node v22.22.2 (Windows), same lines. Up to
+/// 0.17.1 the connection stayed in the pool: the server saw nothing and the
+/// next request went out on it. The CA is trusted through
+/// NODE_EXTRA_CA_CERTS, the one way the shared transport trusts a private
+/// root, which is why this is not a conformance case.
+#[test]
+fn https_get_socket_destroy_closes_the_pooled_tls_connection() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+import https from 'node:https';
+const cert = `{cert}`;
+const key = `{key}`;
+const conns = [];
+const server = tls.createServer({{ cert, key }}, (c) => {{
+  const rec = {{ events: [] }};
+  rec.closed = new Promise((r) => c.on('close', (h) => {{ rec.events.push('close ' + h); r(); }}));
+  c.on('end', () => rec.events.push('end'));
+  c.on('error', (e) => rec.events.push('error ' + e.code));
+  conns.push(rec);
+  c.on('data', () => c.write('HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\nx'));
+}});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const get = () => new Promise((resolve, reject) => {{
+  const req = https.get({{ host: 'localhost', port }}, (res) => {{
+    res.resume();
+    res.on('end', () => setImmediate(() => resolve(req.socket)));
+  }});
+  req.on('error', reject);
+}});
+const socket = await get();
+console.log('encrypted=' + socket.encrypted);
+try {{ socket.resetAndDestroy(); console.log('reset=returned'); }} catch (e) {{ console.log('reset=' + e.code); }}
+const closed = new Promise((r) => socket.on('close', (h) => r('close ' + h)));
+socket.destroy();
+const timeout = (ms) => new Promise((r) => setTimeout(() => r('TIMEOUT'), ms));
+console.log('socket=' + await Promise.race([closed, timeout(3000)]));
+console.log('server=' + await Promise.race([conns[0].closed.then(() => conns[0].events.join('+')), timeout(3000)]));
+await get();
+console.log('connections=' + conns.length);
+https.globalAgent.destroy();
+server.close();
+setTimeout(() => process.exit(0), 50);
+"#,
+        cert = FETCH_TEST_LEAF,
+        key = FETCH_TEST_LEAF_KEY,
+    );
+    let file = write_temp("https_stand_in_destroy.mjs", &src);
+    let ca = write_temp("https_stand_in_destroy_ca.pem", FETCH_TEST_CA);
+    let mut cmd = oam_command(&["run", file.to_str().unwrap(), "--no-check"]);
+    cmd.env("NODE_EXTRA_CA_CERTS", &ca);
+    let out = bounded_output(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            "encrypted=true",
+            "reset=ERR_INVALID_HANDLE_TYPE",
+            "socket=close false",
+            "server=end+close false",
+            "connections=2",
+        ],
+        "stderr: {stderr}"
+    );
+}
+
 /// Issue #146: a verifying https request's per-request TLS options reach the
 /// handshake (they route the request over tls.connect), and a handshake the
 /// server refuses with the protocol_version alert takes node's shape: the
