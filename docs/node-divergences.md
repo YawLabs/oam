@@ -2214,7 +2214,11 @@ checks them (`conformance/cases/257-*`): `fchmod`'s mode (`parseFileMode`),
 `FileHandle`; `conformance/cases/260-*`), before the path or descriptor: node's
 `getOptions` (a string or an object, a known encoding, an `AbortSignal`), a boolean
 `flush`, then a string or a view -- or, for the promise forms, any other iterable,
-written chunk by chunk. A write's position is not
+written chunk by chunk. `FileHandle`'s `write`, `chmod`, `chown` and `truncate` run
+the same checks as their descriptor twins, after the closed-handle check
+(`conformance/cases/261-*`): `fh.write(string[, position[, encoding]])` takes a
+position, not an offset into the string, and `read`, `readv`, `write` and `writev`
+resolve null-prototype objects, as node's do. A write's position is not
 validated, as in node: anything but a safe integer `>= 0` -- `1.5`, `'x'`, a bigint,
 a negative -- writes at the cursor (oam used to round `1.5` down to a pwrite at 1).
 A string write's encoding is node's too: only `'hex'` with an odd-length string is

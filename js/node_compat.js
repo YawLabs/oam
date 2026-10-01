@@ -10917,12 +10917,28 @@
           // leaves the cursor alone. Both used to accept the argument and throw
           // it away, because the natives had no position parameter to pass it
           // to -- fh.read(buf, 0, 3, 10) returned the bytes at the cursor.
+          //
+          // node's overloads and checks (lib/internal/fs/promises.js write,
+          // v22.22.2), the same as fs.writeSync's: (buffer[, offset[,
+          // length[, position]]]) or (buffer, options) with bufferWriteArgs,
+          // and (string[, position[, encoding]]) -- the second argument is a
+          // POSITION there, not an offset into the string. An empty view
+          // resolves 0 before anything is checked. The result has a null
+          // prototype, as node's has.
           write: async function (buffer, offset, length, position) {
             guard("write");
-            if (typeof buffer === "string") buffer = globalThis.Buffer.from(buffer);
-            var slice = (offset != null || length != null) ? buffer.subarray(offset || 0, length != null ? (offset || 0) + length : undefined) : buffer;
-            await natives.fsWriteChunk(h, slice, fsPositionArg(position));
-            return { bytesWritten: slice.length, buffer: buffer };
+            if (buffer?.byteLength === 0) return { __proto__: null, bytesWritten: 0, buffer: buffer };
+            var bytes, pos;
+            if (ArrayBuffer.isView(buffer)) {
+              ({ bytes, position: pos } = bufferWriteArgs(buffer, offset, length, position, false));
+            } else {
+              validateWriteData(buffer, "buffer");
+              validateWriteEncoding(buffer, length);
+              bytes = globalThis.Buffer.from(buffer, writeEncoding(length));
+              pos = fsPositionArg(offset);
+            }
+            await natives.fsWriteChunk(h, bytes, pos);
+            return { __proto__: null, bytesWritten: bytes.byteLength, buffer: buffer };
           },
           // node's overloads and checks (lib/internal/fs/promises.js,
           // v22.22.2): read(options), read(buffer, options) and the
@@ -10947,12 +10963,12 @@
             if (offset == null) offset = 0;
             else validateInteger(offset, "offset", 0);
             length ??= buffer.byteLength - offset;
-            if (length === 0) return { bytesRead: 0, buffer: buffer };
+            if (length === 0) return { __proto__: null, bytesRead: 0, buffer: buffer };
             validateReadRange(buffer, offset, length);
             var chunk = await natives.fsReadChunk(h, length, readPosition(position, length));
-            if (chunk === undefined) return { bytesRead: 0, buffer: buffer };
+            if (chunk === undefined) return { __proto__: null, bytesRead: 0, buffer: buffer };
             new Uint8Array(buffer.buffer, buffer.byteOffset + offset, length).set(chunk);
-            return { bytesRead: chunk.length, buffer: buffer };
+            return { __proto__: null, bytesRead: chunk.length, buffer: buffer };
           },
           // FSTAT, not stat. This used to re-stat the PATH the handle was
           // opened from, which is a different object the moment anything moves
@@ -10965,9 +10981,13 @@
             guard("fstat");
             return wrapStat(await natives.fsFstat(h));
           },
+          // node's validators, after the closed-handle check (fsCall runs
+          // first): chmod's mode through parseFileMode, chown's uid / gid
+          // in [-1, 2**32-1], truncate's length an integer (a negative one
+          // is 0) -- the same checks as fchmod / fchown / ftruncate.
           chmod: async function (mode) {
             guard("fchmod");
-            await natives.fsFchmod(h, mode);
+            await natives.fsFchmod(h, parseFileMode(mode, "mode"));
           },
           // POSIX-only in effect. libuv implements uv_fs_fchown on Windows as
           // a successful no-op, and node inherits that -- the call RESOLVES
@@ -10975,11 +10995,14 @@
           // this way. Left unguarded so the resolve/reject shape matches.
           chown: async function (uid, gid) {
             guard("fchown");
+            validateInteger(uid, "uid", -1, kMaxUserId);
+            validateInteger(gid, "gid", -1, kMaxUserId);
             await natives.fsFchown(h, uid, gid);
           },
-          truncate: async function (len) {
+          truncate: async function (len = 0) {
             guard("ftruncate");
-            await natives.fsFtruncate(h, len ?? 0);
+            validateInteger(len, "len");
+            await natives.fsFtruncate(h, Math.max(0, len));
           },
           sync: async function () {
             guard("fsync");
@@ -11012,15 +11035,15 @@
             if (n > 0) tmp.set(chunk);
             scatterViews(buffers, tmp, n);
             // The SAME array instance goes back out; callers compare identity.
-            return { bytesRead: n, buffers: buffers };
+            return { __proto__: null, bytesRead: n, buffers: buffers };
           },
           writev: async function (buffers, position) {
             guard("writev");
             var total = asViewArray(buffers);
             // node reports 0 without touching the descriptor.
-            if (emptyList(buffers)) return { bytesWritten: 0, buffers: buffers };
+            if (emptyList(buffers)) return { __proto__: null, bytesWritten: 0, buffers: buffers };
             await natives.fsWriteChunk(h, flattenViews(buffers, total), fsPositionArg(position));
-            return { bytesWritten: total, buffers: buffers };
+            return { __proto__: null, bytesWritten: total, buffers: buffers };
           },
           // The WEB stream, and not createReadStream in web clothing: node
           // builds it directly over THIS handle's read() (lib/internal/fs/
