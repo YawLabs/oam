@@ -2118,7 +2118,14 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   when `destroy()` follows on the next line. A write the socket took whole inside the call
   reports `null` to its callback, and the callbacks of an `end()` still waiting get
   `ERR_STREAM_DESTROYED`, before that `'close'`, as in Node
-  (`conformance/cases/225-net-write-then-end-order.mjs`). What is left there: a write the
+  (`conformance/cases/225-net-write-then-end-order.mjs`). An `end()` or `write()` made
+  after `destroy()` is refused as Node refuses it: the callback gets
+  `ERR_STREAM_DESTROYED` ("Cannot call end after a stream was destroyed", or "... write
+  ..." for `write()` and `end(data)`) on the next tick, never `destroy()`'s own error, and
+  the stream does not end; after a `destroy()` with no error, `end(callback)` ends the
+  stream and, as in Node, never calls back
+  (`conformance/cases/248-net-end-write-after-destroy.mjs`; up to 0.17.1 those `end()`
+  callbacks got the destroy error, or `ERR_SOCKET_CLOSED`). What is left there: a write the
   socket could not take at once is still queued natively when `destroy()` closes the
   handle, and its callback gets `ERR_SOCKET_CLOSED` after `'close'` (Node's gets `null`,
   before it); oam settles a write's accounting with its callback, after `write()` has

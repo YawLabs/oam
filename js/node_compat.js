@@ -22994,27 +22994,24 @@
           err.code = "ERR_INVALID_ARG_TYPE";
           throw err;
         }
-        if (this._writableState.ended && this._readableState.endEmitted && !this.allowHalfOpen) {
-          // node's writeAfterFIN (lib/net.js), which replaces write() once
-          // the peer's FIN has been read on a socket that is not half-open:
-          // a write after the auto end() that followed fails with EPIPE,
-          // on the next tick, and destroys the socket with it (#164).
-          const err = new Error("This socket has been ended by the other party");
-          err.code = "EPIPE";
-          if (typeof cb === "function") process.nextTick(cb, err);
-          this.destroy(err);
-          return false;
-        }
         if (this.destroyed || !this.writable) {
-          // node's Writable.write: the callback gets the error on the next
-          // tick, and a write after end() destroys the socket with it
-          // ('error' and 'close' deferred, as every destroy()); a write to
-          // a socket already destroyed reports to the callback alone.
-          // Nothing is emitted inside the call: with no 'error' listener
-          // that emit threw into the caller (#164).
-          const err = this._writableState.ending || !this.destroyed
-            ? codes.ERR_STREAM_WRITE_AFTER_END()
-            : codes.ERR_STREAM_DESTROYED("write");
+          let err;
+          if (this._writableState.ended && this._readableState.endEmitted && !this.allowHalfOpen) {
+            // node's writeAfterFIN (lib/net.js), which replaces write() once
+            // the peer's FIN has been read on a socket that is not
+            // half-open: a write after the auto end() that followed fails
+            // with EPIPE (#164).
+            err = new Error("This socket has been ended by the other party");
+            err.code = "EPIPE";
+          } else {
+            err = this._refusedWriteError();
+          }
+          // The callback gets the error on the next tick, and the socket is
+          // destroyed with it ('error' and 'close' deferred, as every
+          // destroy(); a no-op on a socket already destroyed, so a write to
+          // one reports to the callback alone). Nothing is emitted inside
+          // the call: with no 'error' listener that emit threw into the
+          // caller (#164).
           if (typeof cb === "function") process.nextTick(cb, err);
           this.destroy(err);
           return false;
@@ -23084,6 +23081,17 @@
         return true;
       }
 
+      // Why a chunk handed to write() or end(data) on a socket that is not
+      // writable is refused -- node's Writable _write: after end() it is a
+      // write after end, on a socket destroyed first it is
+      // ERR_STREAM_DESTROYED ("Cannot call write after a stream was
+      // destroyed"). Off the hot path: only a refused chunk gets here.
+      _refusedWriteError() {
+        return this._writableState.ending || !this.destroyed
+          ? codes.ERR_STREAM_WRITE_AFTER_END()
+          : codes.ERR_STREAM_DESTROYED("write");
+      }
+
       // Hands the native half of a write or of end()'s shutdown -- `run`,
       // which returns the op's promise -- to the natives: at once on a
       // socket that has its connection, so the natives are given a write
@@ -23142,36 +23150,52 @@
       end(data, encoding, cb) {
         if (typeof data === "function") { cb = data; data = undefined; encoding = undefined; }
         else if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
-        // Reentry guard (EOF auto-end + a user 'end' listener calling end()
-        // again would otherwise chain a SECOND 'finish' after 'close').
-        // node's Writable.end on a stream already ended: data is a write
-        // after end (ERR_STREAM_WRITE_AFTER_END to the callback, and the
-        // socket destroyed with it); otherwise the callback is told the
-        // stream has finished (ERR_STREAM_ALREADY_FINISHED) or was
-        // destroyed (ERR_STREAM_DESTROYED), and waits for 'finish' only
-        // while neither has happened yet.
-        if (this._writableState.ended) {
-          let err;
-          if (data !== undefined && data !== null) {
-            err = codes.ERR_STREAM_WRITE_AFTER_END();
+        const ws = this._writableState;
+        // node's Writable.end, in its order. A chunk goes through write
+        // first; refused -- after end(), or on a socket destroyed first --
+        // its error is the callback's ("Cannot call write after a stream
+        // was destroyed") and the stream does not end. Then only a stream
+        // neither ended nor errored ends. On one that is (the reentry
+        // guard: the EOF auto-end plus an 'end' listener's end() would
+        // otherwise chain a second 'finish' after 'close'), the callback
+        // is told the stream finished (ERR_STREAM_ALREADY_FINISHED) or was
+        // destroyed (ERR_STREAM_DESTROYED "Cannot call end after a stream
+        // was destroyed") -- never destroy()'s own error, which went to
+        // 'error' and to the callbacks of an end() made before it -- and
+        // waits for 'finish' only while neither has happened yet.
+        let err;
+        if (data !== undefined && data !== null) {
+          if (this.destroyed || !this.writable) {
+            err = this._refusedWriteError();
             this.destroy(err);
-          } else if (this._writableState.finished) {
-            err = codes.ERR_STREAM_ALREADY_FINISHED("end");
-          } else if (this.destroyed) {
-            err = codes.ERR_STREAM_DESTROYED("end");
+          } else {
+            this.write(data, encoding);
           }
+        }
+        if (err === undefined && (ws.ended || ws.errored)) {
+          if (ws.finished) err = codes.ERR_STREAM_ALREADY_FINISHED("end");
+          else if (this.destroyed) err = codes.ERR_STREAM_DESTROYED("end");
+        }
+        if (err !== undefined || ws.ended || ws.errored) {
           if (typeof cb === "function") {
             if (err !== undefined) process.nextTick(cb, err);
             else if (this._endCallbacks !== null) this._endCallbacks.push(cb);
-            else process.nextTick(cb, this._writableState.errored ?? codes.ERR_STREAM_DESTROYED("end"));
+            else process.nextTick(cb, ws.errored ?? codes.ERR_STREAM_DESTROYED("end"));
           }
           return this;
         }
-        if (data !== undefined && data !== null) this.write(data, encoding);
         this.writable = false;
         // state.writable stays untouched (side-existence marker; see destroy).
-        this._writableState.ending = true;
-        this._writableState.ended = true;
+        ws.ending = true;
+        ws.ended = true;
+        if (this.destroyed) {
+          // Destroyed without an error and never ended: node ends the
+          // stream and parks the callback on its 'finish' list, which a
+          // destroyed stream never drains -- the callback is not called
+          // (node v22.22.2). Nothing is issued: there is no connection to
+          // shut down, and `_chain` is left as it is.
+          return this;
+        }
         // The FIN is asked for now, in the same turn as the writes before
         // it: the natives send it once the last of them is written, with
         // no trip back through JS in between (#156; node queues the
