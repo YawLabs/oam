@@ -23627,6 +23627,13 @@
           // that read like an EOF, and a destroyed socket emits neither
           // 'end' nor 'data' (node's handle stops reading in destroy()).
           if (this.destroyed) return;
+          // Paused while the read was parked (pause() from outside a 'data'
+          // listener -- a server's 'connection' listener, which runs with
+          // the first read already parked): what it brought is held, as
+          // node's paused stream buffers it, until resume(). Emitting it
+          // handed a paused socket's data to whoever listened then, or to
+          // nobody.
+          if (this._paused && !this._readableMode) this._holdData = true;
           if (chunk === undefined) {
             if (this._readableMode || this._holdData) {
               // Buffered or held: 'end' follows once what is left is read
@@ -23841,7 +23848,9 @@
         this._releaseScheduled = true;
         process.nextTick(() => {
           this._releaseScheduled = false;
-          if (this._holdData && !this._readableMode) this._releaseHeld();
+          // Not into a socket pause()d since (node: a 'data' listener does
+          // not resume an explicitly paused stream).
+          if (this._holdData && !this._readableMode && !this._paused) this._releaseHeld();
         });
       }
       removeListener(type, listener) {

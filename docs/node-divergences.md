@@ -2547,7 +2547,11 @@ comment, **not** something measured. Do not rely on either the claim or its nega
   `'end'` follows the last null), and once the last `'readable'` listener goes, data is
   held until `resume()` or a `'data'` listener, as Node's `readableFlowing` null does
   (case 125). A socket nobody reads still emits `'data'` into the void where Node's would
-  buffer, and `_readableState.length` is `0` except in paused mode.
+  buffer, and `_readableState.length` is `0` except in paused mode. A socket `pause()`d holds
+  what a read already under way brings until `resume()`, as Node's (a server's socket paused
+  in its `'connection'` listener included, `conformance/cases/262-net-paused-accepted-socket.mjs`;
+  up to 0.17.1 that first chunk was emitted while paused); it then reads no further, where
+  Node's goes on reading into its buffer up to the high-water mark.
 - **N-API async surfaces.** `napi_create_async_work`, `napi_queue_async_work`, and the
   threadsafe-function family are reported as stubs, with threadsafe finalizers possibly
   dropped. Only reachable with `OAM_ENABLE_NATIVE_ADDONS=1`.
