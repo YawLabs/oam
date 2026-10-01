@@ -22,6 +22,8 @@ pub use oam_diagnostics as diagnostics;
 pub mod byte_pipe;
 pub mod child;
 pub mod cluster;
+/// zlib-faithful inflate shared by fetch's body decoder and node:zlib (#166).
+mod deflate;
 pub mod dns;
 /// oam's own HTTP client transport for the `fetch` op (#143).
 pub mod http_client;
@@ -30,7 +32,6 @@ pub mod http_client;
 pub mod http_conn;
 pub mod http_head;
 pub mod http_server;
-/// zlib-faithful inflate shared by fetch's body decoder and node:zlib (#166).
 mod inflate;
 pub mod inspector;
 /// The outbound TCP connector net.connect and tls.connect share: node's
@@ -686,6 +687,8 @@ pub enum ZlibStream {
     BrotliCompress(Box<BrotliCompressor>),
     BrotliDecompress(Box<BrotliDecompressor>),
     HandleCompress(flate2::Compress),
+    /// A handle deflating with node's `dictionary` option.
+    HandleDictCompress(Box<zlib::DictDeflate>),
     HandleDecompress(Box<zlib::NodeInflate>),
 }
 
@@ -2566,6 +2569,7 @@ pub fn strip_unc_prefix(path: &std::path::Path) -> String {
 /// _transform feeds chunks via zlibStreamWrite and _flush finalizes via
 /// zlibStreamFlush.
 pub mod zlib {
+    pub use crate::deflate::DictDeflate;
     pub use crate::inflate::{NodeInflate, Wrap, ZlibError};
     use flate2::Compression;
     use std::io::Write;
@@ -2784,16 +2788,33 @@ pub mod zlib {
         }
     }
 
+    /// The deflater for node's `dictionary` option, if it applies: deflate
+    /// and deflateRaw with a non-empty dictionary (node_zlib.cc's
+    /// SetDictionary; gzip ignores the option, and an empty one is none).
+    fn dict_deflate(format: Format, level: i32, dictionary: Option<&[u8]>) -> Option<DictDeflate> {
+        let dictionary = dictionary.filter(|d| !d.is_empty())?;
+        match format {
+            Format::Gzip => None,
+            Format::Deflate => Some(DictDeflate::new(level, true, dictionary)),
+            Format::DeflateRaw => Some(DictDeflate::new(level, false, dictionary)),
+        }
+    }
+
     /// `compress` with node's `maxOutputLength`, which node applies to the
-    /// encoders as well. Checked on the finished buffer: compressed output is
-    /// bounded by the input, so there is no bomb to stop early.
+    /// encoders as well, and its `dictionary` (see [`DictDeflate`]). The cap
+    /// is checked on the finished buffer: compressed output is bounded by the
+    /// input, so there is no bomb to stop early.
     pub fn compress_capped(
         bytes: &[u8],
         format: Format,
         level: i32,
         max_output: Option<usize>,
+        dictionary: Option<&[u8]>,
     ) -> std::io::Result<Vec<u8>> {
-        let out = compress(bytes, format, level)?;
+        let out = match dict_deflate(format, level, dictionary) {
+            Some(mut deflater) => deflater.deflate_vec(bytes, Z_FINISH),
+            None => compress(bytes, format, level)?,
+        };
         match max_output {
             Some(cap) if out.len() > cap => Err(std::io::Error::other(OUTPUT_TOO_LARGE)),
             _ => Ok(out),
@@ -2849,10 +2870,18 @@ pub mod zlib {
         Gzip(flate2::write::GzEncoder<Vec<u8>>),
         Deflate(flate2::write::ZlibEncoder<Vec<u8>>),
         DeflateRaw(flate2::write::DeflateEncoder<Vec<u8>>),
+        /// deflate or deflateRaw with a dictionary.
+        Dict(Box<DictDeflate>),
     }
 
     impl StreamCompressor {
-        pub fn new(format: Format, level: i32) -> Self {
+        /// `dictionary` is node's option (see [`DictDeflate`]).
+        pub fn new(format: Format, level: i32, dictionary: Option<&[u8]>) -> Self {
+            if let Some(deflater) = dict_deflate(format, level, dictionary) {
+                return Self {
+                    inner: CompressorInner::Dict(Box::new(deflater)),
+                };
+            }
             let level = if (0..=9).contains(&level) {
                 Compression::new(level as u32)
             } else {
@@ -2890,6 +2919,7 @@ pub mod zlib {
                     enc.write_all(chunk)?;
                     Ok(std::mem::take(enc.get_mut()))
                 }
+                CompressorInner::Dict(enc) => Ok(enc.deflate_vec(chunk, 0)),
             }
         }
 
@@ -2901,6 +2931,7 @@ pub mod zlib {
                 CompressorInner::Gzip(enc) => enc.finish(),
                 CompressorInner::Deflate(enc) => enc.finish(),
                 CompressorInner::DeflateRaw(enc) => enc.finish(),
+                CompressorInner::Dict(mut enc) => Ok(enc.deflate_vec(&[], Z_FINISH)),
             }
         }
     }
@@ -4463,7 +4494,11 @@ pub mod ops {
             let Some(fmt) = super::zlib::Format::parse(&format) else {
                 return OpOutcome::Failed(format!("zlib stream: unknown format '{format}'"));
             };
-            super::ZlibStream::Compress(super::zlib::StreamCompressor::new(fmt, level))
+            super::ZlibStream::Compress(super::zlib::StreamCompressor::new(
+                fmt,
+                level,
+                dictionary.as_deref(),
+            ))
         } else {
             let wrap = match format.as_str() {
                 "gzip" => super::zlib::Wrap::Gzip,
@@ -4515,11 +4550,11 @@ pub mod ops {
                 super::ZlibStream::BrotliDecompress(dec) => dec
                     .write_chunk(&chunk)
                     .map_err(|e| failed("brotli stream write", e)),
-                super::ZlibStream::HandleCompress(_) | super::ZlibStream::HandleDecompress(_) => {
-                    Err(Box::new(OpOutcome::Failed(
-                        "zlib handle: use zlibHandleWriteSync, not zlibStreamWrite".into(),
-                    )))
-                }
+                super::ZlibStream::HandleCompress(_)
+                | super::ZlibStream::HandleDictCompress(_)
+                | super::ZlibStream::HandleDecompress(_) => Err(Box::new(OpOutcome::Failed(
+                    "zlib handle: use zlibHandleWriteSync, not zlibStreamWrite".into(),
+                ))),
             }
         })
         .await;
@@ -4565,11 +4600,11 @@ pub mod ops {
                 super::ZlibStream::BrotliDecompress(dec) => {
                     dec.finish().map_err(|e| failed("brotli stream flush", e))
                 }
-                super::ZlibStream::HandleCompress(_) | super::ZlibStream::HandleDecompress(_) => {
-                    Err(Box::new(OpOutcome::Failed(
-                        "zlib handle: use close(), not zlibStreamFlush".into(),
-                    )))
-                }
+                super::ZlibStream::HandleCompress(_)
+                | super::ZlibStream::HandleDictCompress(_)
+                | super::ZlibStream::HandleDecompress(_) => Err(Box::new(OpOutcome::Failed(
+                    "zlib handle: use close(), not zlibStreamFlush".into(),
+                ))),
             }
         })
         .await;
@@ -4621,8 +4656,12 @@ pub mod ops {
         dictionary: Option<&[u8]>,
     ) -> Result<u64, String> {
         let zlib_header = mode == 1 || mode == 2;
-        let stream = match mode {
-            1 | 5 => {
+        let dictionary = dictionary.filter(|d| !d.is_empty());
+        let stream = match (mode, dictionary) {
+            (1 | 5, Some(dictionary)) => super::ZlibStream::HandleDictCompress(Box::new(
+                super::zlib::DictDeflate::new(level, zlib_header, dictionary),
+            )),
+            (1 | 5, None) => {
                 let lvl = if (0..=9).contains(&level) {
                     flate2::Compression::new(level as u32)
                 } else {
@@ -4630,10 +4669,10 @@ pub mod ops {
                 };
                 super::ZlibStream::HandleCompress(flate2::Compress::new(lvl, zlib_header))
             }
-            2 => super::ZlibStream::HandleDecompress(Box::new(
+            (2, _) => super::ZlibStream::HandleDecompress(Box::new(
                 super::zlib::NodeInflate::with_dictionary(super::zlib::Wrap::Zlib, dictionary),
             )),
-            6 => super::ZlibStream::HandleDecompress(Box::new(
+            (6, _) => super::ZlibStream::HandleDecompress(Box::new(
                 super::zlib::NodeInflate::with_dictionary(super::zlib::Wrap::Raw, dictionary),
             )),
             _ => return Err(format!("zlib handle: unknown mode {mode}")),
@@ -4676,6 +4715,10 @@ pub mod ops {
                     .map_err(|e| std::io::Error::other(format!("zlib handle compress: {e}")))?;
                 let consumed = (c.total_in() - before_in) as usize;
                 let produced = (c.total_out() - before_out) as usize;
+                Ok((output.len() - produced, input.len() - consumed))
+            }
+            super::ZlibStream::HandleDictCompress(c) => {
+                let (consumed, produced) = c.deflate(input, output, flush);
                 Ok((output.len() - produced, input.len() - consumed))
             }
             super::ZlibStream::HandleDecompress(d) => {
@@ -4742,7 +4785,13 @@ pub mod ops {
                 ));
             };
             if compress {
-                super::zlib::compress_capped(&bytes, parsed, level, max_output)
+                super::zlib::compress_capped(
+                    &bytes,
+                    parsed,
+                    level,
+                    max_output,
+                    dictionary.as_deref(),
+                )
             } else {
                 super::zlib::decompress_capped(
                     &bytes,

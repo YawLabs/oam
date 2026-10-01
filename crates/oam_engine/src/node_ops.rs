@@ -5261,7 +5261,7 @@ fn op_zlib_sync(
         match oam_core::zlib::Format::parse(&format) {
             Some(parsed) => {
                 if compress {
-                    oam_core::zlib::compress_capped(&bytes, parsed, level, max_output)
+                    oam_core::zlib::compress_capped(&bytes, parsed, level, max_output, dictionary)
                 } else {
                     oam_core::zlib::decompress_capped(
                         &bytes,
