@@ -140,21 +140,53 @@
     // ---- undici-shaped response body -------------------------------------
     // request().body is a Readable streaming the response bytes, plus the
     // undici body-mixin helpers, all consuming the same stream.
-    function makeBodyReadable(webStream) {
+    //
+    // `bodyTimeout` (ms, 0 = none) is undici's: the longest the body may go
+    // without a byte while something is reading it. The timer runs for as
+    // long as a read is outstanding and is cleared by the chunk that answers
+    // it, so a slow consumer never trips it -- undici does not count the time
+    // its parser is paused by backpressure either. When it lapses the body is
+    // destroyed with BodyTimeoutError and `abort` lets go of the connection.
+    function makeBodyReadable(webStream, bodyTimeout, abort) {
       const reader = webStream && typeof webStream.getReader === "function" ? webStream.getReader() : null;
+      let timer = null;
+      const disarm = () => {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+      };
       const r = new Readable({
         read() {
           if (!reader) {
             this.push(null);
             return;
           }
+          if (bodyTimeout && timer === null) {
+            timer = setTimeout(() => {
+              timer = null;
+              const err = new errors.BodyTimeoutError("Body Timeout Error");
+              abort(err);
+              r.destroy(err);
+            }, bodyTimeout);
+            // The read it guards keeps the loop alive; the timer need not.
+            if (typeof timer.unref === "function") timer.unref();
+          }
           reader.read().then(
             ({ done, value }) => {
+              disarm();
               if (done) this.push(null);
               else this.push(G.Buffer.from(value));
             },
-            (err) => this.destroy(err instanceof Error ? err : new Error(String(err))),
+            (err) => {
+              disarm();
+              this.destroy(err instanceof Error ? err : new Error(String(err)));
+            },
           );
+        },
+        destroy(err, cb) {
+          disarm();
+          cb(err);
         },
       });
       const collect = async () => {
@@ -200,11 +232,37 @@
         url = String(origin).replace(/\/$/, "") + (opts.path || "/");
       }
       opts = opts || {};
+      // undici's two per-phase stall limits: `headersTimeout` bounds the wait
+      // for the response head, `bodyTimeout` the gap between body bytes. The
+      // request's own value wins, then the dispatcher's (the one passed, else
+      // the global one -- `new Agent({ headersTimeout })`), then undici's
+      // default of 300 s; 0 disables. Validated as undici's Request does.
+      const dispatcherOptions = (opts.dispatcher || holder.current)?._options;
+      const headersTimeout = phaseTimeout("headersTimeout", opts, dispatcherOptions);
+      const bodyTimeout = phaseTimeout("bodyTimeout", opts, dispatcherOptions);
+      // Both limits end the request the way an abort does, so the fetch runs
+      // under a signal of the shim's own: aborting it with the timeout error
+      // rejects a fetch still waiting for its head with that error, and after
+      // the head it errors the body and drops the connection. The caller's
+      // signal is forwarded into it with its reason, so an abort of theirs
+      // still rejects with what they gave.
+      const controller = new G.AbortController();
+      const outer = opts.signal || null;
+      let unlink = () => {};
+      if (outer) {
+        if (outer.aborted) {
+          controller.abort(outer.reason);
+        } else {
+          const forward = () => controller.abort(outer.reason);
+          outer.addEventListener("abort", forward, { once: true });
+          unlink = () => outer.removeEventListener("abort", forward);
+        }
+      }
       const init = {
         method: opts.method || "GET",
         headers: opts.headers || undefined,
         body: opts.body != null ? opts.body : undefined,
-        signal: opts.signal || undefined,
+        signal: controller.signal,
         redirect: opts.redirect || (opts.maxRedirections > 0 ? "follow" : undefined),
         // The dispatcher carries the connect.lookup hook. undici enforces it
         // for request() too, not just fetch(): agent.request() and
@@ -230,15 +288,48 @@
         for (const [k, v] of Object.entries(opts.query)) u.searchParams.set(k, String(v));
         url = u.toString();
       }
-      const res = await G.fetch(String(url), init);
+      let headersTimer = null;
+      if (headersTimeout) {
+        headersTimer = setTimeout(() => {
+          controller.abort(new errors.HeadersTimeoutError("Headers Timeout Error"));
+        }, headersTimeout);
+        // The pending fetch keeps the loop alive; the timer need not.
+        if (typeof headersTimer.unref === "function") headersTimer.unref();
+      }
+      let res;
+      try {
+        res = await G.fetch(String(url), init);
+      } catch (err) {
+        unlink();
+        throw err;
+      } finally {
+        if (headersTimer !== null) clearTimeout(headersTimer);
+      }
+      const body = makeBodyReadable(res.body, bodyTimeout, (err) => controller.abort(err));
+      // A signal shared by many requests must not keep one listener per
+      // finished body.
+      body.once("close", unlink);
       return {
         statusCode: res.status,
         headers: headersToObject(res.headers),
         trailers: { __proto__: null },
         opaque: opts.opaque ?? null,
         context: {},
-        body: makeBodyReadable(res.body),
+        body,
       };
+    }
+
+    // One of request()'s phase timeouts, in ms: the request's own, else the
+    // dispatcher's, else undici's 300 s. undici's check and message
+    // (lib/core/request.js): anything but a finite number >= 0 is refused.
+    function phaseTimeout(name, opts, dispatcherOptions) {
+      let value = opts[name];
+      if (value == null && dispatcherOptions) value = dispatcherOptions[name];
+      if (value == null) return 300e3;
+      if (!Number.isFinite(value) || value < 0) {
+        throw new errors.InvalidArgumentError("invalid " + name);
+      }
+      return value;
     }
 
     // undici.stream(url, opts, factory): pipe the response into the writable

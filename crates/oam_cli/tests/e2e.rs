@@ -4858,6 +4858,117 @@ fn undici_shim_request_stream_fetch_over_http() {
     assert!(stdout.contains("agent true"), "{stdout}");
 }
 
+/// `undici.request()` / `stream()` / `dispatcher.request()` honour undici's
+/// two per-phase stall limits (#218): `headersTimeout` rejects a request whose
+/// response head does not arrive with `HeadersTimeoutError`
+/// (`UND_ERR_HEADERS_TIMEOUT`), `bodyTimeout` fails a body that goes quiet
+/// with `BodyTimeoutError` (`UND_ERR_BODY_TIMEOUT`) -- re-armed by every
+/// chunk, so a slow but steady body is not cut. The request's own value wins
+/// over the dispatcher's (`new Agent({ headersTimeout })`, the global one
+/// included), 0 disables, and a bad value is undici's `InvalidArgumentError`.
+/// Up to 0.17.1 both options were accepted and ignored, so only the caller's
+/// total signal bounded a stalled request. The expected output is node
+/// v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_request_honours_headers_and_body_timeouts() {
+    let script = write_temp(
+        "undici_phase_timeouts/main.mjs",
+        r##"import net from 'node:net';
+import { request, stream, Agent, Client, errors, setGlobalDispatcher, getGlobalDispatcher } from 'undici';
+import { Writable } from 'node:stream';
+
+// Three raw servers: one that never answers, one that sends a head and one
+// chunk and then stalls, and one that drips a chunk every 150 ms -- longer in
+// total than the body timeout used against it, never idle that long.
+const never = net.createServer((s) => { s.on('data', () => {}); s.on('error', () => {}); });
+const stall = net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => s.write('HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n'));
+});
+const drip = net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => {
+    s.write('HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n');
+    let n = 0;
+    const t = setInterval(() => {
+      s.write('1\r\nx\r\n');
+      if (++n === 6) { clearInterval(t); s.end('0\r\n\r\n'); }
+    }, 150);
+  });
+});
+const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${srv.address().port}`)));
+const [nu, su, du] = await Promise.all([listen(never), listen(stall), listen(drip)]);
+
+// Every stalled probe also carries a 6 s total budget; `early` says the
+// phase timeout ended it, not that budget.
+const total = () => { const ac = new AbortController(); setTimeout(() => ac.abort(new Error('total budget')), 6000).unref(); return ac.signal; };
+async function attempt(label, fn) {
+  const t0 = Date.now();
+  try {
+    console.log(label, 'ok', JSON.stringify(await fn()));
+  } catch (e) {
+    console.log(label, e.name, e.code, e.message, e instanceof errors.UndiciError, 'early=' + (Date.now() - t0 < 4000));
+  }
+}
+const sink = () => new Writable({ write(c, e, cb) { cb(); } });
+
+await attempt('headers', () => request(nu, { headersTimeout: 400, bodyTimeout: 400, signal: total() }));
+await attempt('body', async () => (await request(su, { headersTimeout: 400, bodyTimeout: 400, signal: total() })).body.text());
+await attempt('body-json', async () => (await request(su, { bodyTimeout: 400, signal: total() })).body.json());
+await attempt('drip', async () => (await request(du, { bodyTimeout: 700 })).body.text());
+await attempt('stream-headers', () => stream(nu, { method: 'GET', headersTimeout: 400, signal: total() }, sink));
+await attempt('stream-body', () => stream(su, { method: 'GET', bodyTimeout: 400, signal: total() }, sink));
+// The dispatcher's own options apply to its requests; the request's win.
+await attempt('agent-option', () => new Agent({ headersTimeout: 400 }).request({ origin: nu, path: '/', method: 'GET', signal: total() }));
+await attempt('client-option', () => new Client(nu, { headersTimeout: 400 }).request({ path: '/', method: 'GET', signal: total() }));
+await attempt('request-wins', () => new Agent({ headersTimeout: 60000 }).request({ origin: nu, path: '/', method: 'GET', headersTimeout: 400, signal: total() }));
+await attempt('dispatcher-option', async () => (await request(su, { dispatcher: new Agent({ bodyTimeout: 400 }), signal: total() })).body.text());
+const previous = getGlobalDispatcher();
+setGlobalDispatcher(new Agent({ headersTimeout: 400 }));
+await attempt('global-option', () => request(nu, { signal: total() }));
+setGlobalDispatcher(previous);
+// 0 disables: only the caller's own signal ends it, with the caller's reason.
+await attempt('zero-disables', () => { const ac = new AbortController(); setTimeout(() => ac.abort(new Error('mine')), 900); return request(nu, { headersTimeout: 0, signal: ac.signal }); });
+await attempt('caller-abort-first', () => { const ac = new AbortController(); setTimeout(() => ac.abort(new Error('mine')), 100); return request(nu, { headersTimeout: 5000, signal: ac.signal }); });
+await attempt('already-aborted', () => request(nu, { headersTimeout: 400, signal: AbortSignal.abort(new Error('before')) }));
+// Validation, as undici's Request does it.
+for (const bad of [-1, 'x', NaN, Infinity]) {
+  await attempt('invalid headersTimeout ' + String(bad), () => request(nu, { headersTimeout: bad, signal: total() }));
+  await attempt('invalid bodyTimeout ' + String(bad), () => request(nu, { bodyTimeout: bad, signal: total() }));
+}
+await attempt('fractional', () => request(nu, { headersTimeout: 400.5, bodyTimeout: 1.5, signal: total() }));
+process.exit(0);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "\
+headers HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+body BodyTimeoutError UND_ERR_BODY_TIMEOUT Body Timeout Error true early=true
+body-json BodyTimeoutError UND_ERR_BODY_TIMEOUT Body Timeout Error true early=true
+drip ok \"xxxxxx\"
+stream-headers HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+stream-body BodyTimeoutError UND_ERR_BODY_TIMEOUT Body Timeout Error true early=true
+agent-option HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+client-option HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+request-wins HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+dispatcher-option BodyTimeoutError UND_ERR_BODY_TIMEOUT Body Timeout Error true early=true
+global-option HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+zero-disables Error undefined mine false early=true
+caller-abort-first Error undefined mine false early=true
+already-aborted Error undefined before false early=true
+invalid headersTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG invalid headersTimeout true early=true
+invalid bodyTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG invalid bodyTimeout true early=true
+invalid headersTimeout x InvalidArgumentError UND_ERR_INVALID_ARG invalid headersTimeout true early=true
+invalid bodyTimeout x InvalidArgumentError UND_ERR_INVALID_ARG invalid bodyTimeout true early=true
+invalid headersTimeout NaN InvalidArgumentError UND_ERR_INVALID_ARG invalid headersTimeout true early=true
+invalid bodyTimeout NaN InvalidArgumentError UND_ERR_INVALID_ARG invalid bodyTimeout true early=true
+invalid headersTimeout Infinity InvalidArgumentError UND_ERR_INVALID_ARG invalid headersTimeout true early=true
+invalid bodyTimeout Infinity InvalidArgumentError UND_ERR_INVALID_ARG invalid bodyTimeout true early=true
+fractional HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 // An undici Agent's connect.lookup hook is honored as a REAL DNS/connect pin
 // (the DNS-rebind / SSRF control @yawlabs/fetch-mcp relies on). Proof: pin a
 // NON-resolvable host to the server's real IP -- the request must connect

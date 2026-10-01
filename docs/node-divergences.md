@@ -1497,6 +1497,34 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   itself; point the code under test at a local server instead. Pinned by
   `undici_mock_dispatchers_refuse_instead_of_reaching_the_network` (e2e).
 
+**`headersTimeout` and `bodyTimeout` on `undici.request`**
+
+`undici.request()`, `undici.stream()` and a dispatcher's `request()` honour undici's two
+per-phase stall limits (#218): a response head that does not arrive within `headersTimeout`
+rejects the request with `HeadersTimeoutError` (`UND_ERR_HEADERS_TIMEOUT`), and a body that
+goes `bodyTimeout` without a byte is destroyed with `BodyTimeoutError`
+(`UND_ERR_BODY_TIMEOUT`), each chunk re-arming it. The request's own value wins, then the
+dispatcher's (`new Agent|Pool|Client({ headersTimeout, bodyTimeout })`, the global
+dispatcher included), then undici's default of 300 s; `0` disables; anything but a finite
+number `>= 0` is `InvalidArgumentError` `invalid headersTimeout` / `invalid bodyTimeout`.
+Pinned against Node + undici 6.29.0 by `undici_request_honours_headers_and_body_timeouts`
+(e2e). Up to 0.17.1 both options were accepted and ignored. What differs:
+
+- **The timers are exact.** undici's are coarse (a 500 ms `headersTimeout` fires after about
+  1019 ms in Node); oam's fire at the configured delay.
+- **A headers timeout does not take the request off the wire**, as for an abort before the
+  head (above): the promise rejects at once, and the connection is closed when the head
+  arrives or the server gives up. A body timeout closes the connection, as in Node.
+- **`bodyTimeout` runs only while the body is being read.** oam reads a `request()` body
+  from the transport when something consumes it; undici reads ahead into the stream's
+  buffer. So a stalled body nobody reads is left alone in oam, where Node destroys it with
+  `BodyTimeoutError` (an uncaught `'error'` if nothing listens). A body that is read --
+  `text()`, `json()`, a `'data'` listener, `pipe()`, `stream()` -- times out in both.
+- **`fetch` through a dispatcher does not get them.** Node applies an `Agent`'s
+  `headersTimeout` / `bodyTimeout` to a `fetch` that rides it (and the 300 s defaults to
+  every `fetch`); oam applies them to `undici.request` / `stream` / `dispatcher.request`
+  only, and a `fetch` is bounded by its `signal`.
+
 **Redirects**
 
 - **`redirect: 'manual'` and `'error'` behave as Node's** (case 126): `'manual'` returns the
