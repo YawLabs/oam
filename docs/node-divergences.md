@@ -1585,7 +1585,8 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   the head until the first chunk, sends `content-length: 0`. `user-agent` is `oam/<version>`
   by design. What now matches, and used to not: `connection: keep-alive`,
   `accept-language: *` and `sec-fetch-mode` (the request's mode) on every fetch,
-  `accept-encoding: gzip, deflate` over http and `br, gzip, deflate` over https,
+  `accept-encoding: gzip, deflate` over http and `br, gzip, deflate` over https, and
+  `identity` instead (appended to a caller's own value) on a request with `range`,
   `content-length: 0` on a `POST`, `PUT`, `PATCH`, `QUERY`, `PROPFIND` or `PROPPATCH` with no
   body or an empty one, the `cache` mode's `pragma` / `cache-control`, with a conditional
   request (`if-modified-since`, `if-none-match`, `if-unmodified-since`, `if-match`,

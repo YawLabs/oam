@@ -2368,6 +2368,15 @@
     } else if (cache === "no-cache") {
       add("cache-control", "max-age=0");
     }
+    // A range request asks for the bytes as they are, so its offsets are not
+    // into a compressed copy: undici appends `identity` to accept-encoding
+    // (step 18), to a caller's own value too (`gzip` goes out as
+    // `gzip, identity`), and the scheme's default list then stays out.
+    if (has("range")) {
+      const at = headers.findIndex((h) => h[0].toLowerCase() === "accept-encoding");
+      if (at === -1) headers.push(["accept-encoding", "identity"]);
+      else headers[at] = [headers[at][0], `${headers[at][1]}, identity`];
+    }
     // undici's own list, per scheme: oam decodes br as well (#151).
     add("accept-encoding", /^https:/i.test(request.url) ? "br, gzip, deflate" : "gzip, deflate");
     // A request whose method carries a payload says it carries none: no

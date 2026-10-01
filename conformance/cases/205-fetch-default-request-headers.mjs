@@ -17,6 +17,8 @@
 //   - A conditional request (if-modified-since, if-none-match,
 //     if-unmodified-since, if-match or if-range) in the default cache mode
 //     is a no-store one; in any other mode its own rule stands.
+//   - A request with `range` sends `accept-encoding: identity`, appended to
+//     a caller's own accept-encoding (`gzip, identity`).
 //
 // Not asserted: a stream body that ends empty. undici holds the request
 // head until the first chunk and so sends `content-length: 0`; oam sends
@@ -81,6 +83,10 @@ const cases = {
   "if-none-match, cache no-cache": { cache: "no-cache", headers: { "if-none-match": "x" } },
   "if-none-match, cache force-cache": { cache: "force-cache", headers: { "if-none-match": "x" } },
   "if-match, caller cache-control": { headers: { "if-match": "x", "cache-control": "c" } },
+  range: { headers: { range: "bytes=0-1" } },
+  "Range, caller accept-encoding": { headers: { Range: "bytes=0-1", "accept-encoding": "gzip" } },
+  "range, caller identity": { headers: { range: "bytes=0-1", "accept-encoding": "identity" } },
+  "range, if-range": { headers: { range: "bytes=0-1", "if-range": "x" } },
 };
 for (const [label, init] of Object.entries(cases)) {
   let out;
