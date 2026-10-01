@@ -11339,6 +11339,8 @@
       var poll = setInterval(function () {
         if (closed) return;
         natives.fsStat(filePath, false).then(function (stat) {
+          // A stat already in flight when close() ran reports nothing.
+          if (closed) return;
           if (stat.mtimeMs !== prevMtime) {
             prevMtime = stat.mtimeMs;
             var parts = filePath.replace(/\\/g, "/").split("/");
@@ -11347,7 +11349,7 @@
             if (listener) listener("change", base);
           }
         }, function (e) {
-          watcher.emit("error", e);
+          if (!closed) watcher.emit("error", e);
         });
       }, pollInterval);
       watcher.close = function () {
@@ -11411,8 +11413,14 @@
       } catch (e) {
         prev = wrapStat({ kind: "file", size: 0, mtime: 0, atime: 0, mode: 0 });
       }
+      // Stopped by close() / unwatchFile(): a stat already in flight then
+      // reports nothing, as node's stopped StatWatcher calls no listener.
+      // Without it a poll that was slow to complete (a loaded machine)
+      // fired the listener after close.
+      var stopped = false;
       var poll = setInterval(function () {
         natives.fsStat(filePath, false).then(function (raw) {
+          if (stopped) return;
           var curr = wrapStat(raw);
           if (curr.mtimeMs !== prev.mtimeMs) {
             if (listener) listener(curr, prev);
@@ -11420,7 +11428,10 @@
           }
         }, function () {});
       }, interval);
-      var stop = function () { clearInterval(poll); };
+      var stop = function () {
+        stopped = true;
+        clearInterval(poll);
+      };
       var self = { listener: listener, stop: stop };
       var entries = watchFilePollers.get(filePath);
       if (entries) entries.push(self);

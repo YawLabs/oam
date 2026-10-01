@@ -28493,7 +28493,12 @@ fn watch_file_fires_and_close_stops_only_that_watcher() {
          const second = fs.watchFile(file, { interval: 20 }, shared);\n\
          first.close();\n\
          setTimeout(() => fs.writeFileSync(file, 'bbbbbb'), 60);\n\
-         setTimeout(() => {\n\
+         // Up to 5 s for the change to be seen: a loaded machine runs the\n\
+         // 20 ms poller late, and a fixed window failed the test there.\n\
+         const started = Date.now();\n\
+         const check = setInterval(() => {\n\
+           if (hits === 0 && Date.now() - started < 5000) return;\n\
+           clearInterval(check);\n\
            console.log('surviving_watcher_fired:', hits > 0);\n\
            second.close();\n\
            const after = hits;\n\
@@ -28504,7 +28509,7 @@ fn watch_file_fires_and_close_stops_only_that_watcher() {
                fs.rmSync(dir, { recursive: true, force: true });\n\
              }, 120);\n\
            }, 40);\n\
-         }, 400);",
+         }, 20);",
     );
     let out = oam(&["run", script.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
