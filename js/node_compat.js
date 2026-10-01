@@ -22499,6 +22499,28 @@
       self.destroy(err);
     }
 
+    // destroy()'s two deferred emissions (see Socket.prototype.destroy).
+    // The flags flip before the listeners run, as node's emitErrorNT /
+    // emitCloseNT flip them, so a listener that throws -- or an 'error' with
+    // no listener, which raises 'uncaughtException' from here -- leaves the
+    // state telling the truth.
+    function emitErrorNT(self, err) {
+      self._readableState.errorEmitted = self._writableState.errorEmitted = true;
+      self.emit("error", err);
+    }
+    function emitCloseNT(self, hadError) {
+      self._readableState.closeEmitted = self._writableState.closeEmitted = true;
+      if (hadError === undefined) self.emit("close");
+      else self.emit("close", hadError);
+    }
+    // Where libuv runs a closed handle's callback: after the immediates
+    // already queued, before any timer. oam's loop has no close phase, so
+    // this is an immediate of its own -- taken off the native, not the
+    // global, so mocked timers do not hold a socket's 'close'.
+    const closeCallback = typeof natives.timerImmediate === "function"
+      ? (fn, self, hadError) => natives.timerImmediate(fn, self, hadError)
+      : (fn, self, hadError) => process.nextTick(fn, self, hadError);
+
     // node's emitLookup for the `all` form (lookupAndConnectMultiple's
     // callback). `dialList(ips)` gets the addresses to attempt, interleaved
     // by family exactly as node attempts them.
@@ -22936,7 +22958,8 @@
             this._readLoop();
           },
           (err) => {
-            this.connecting = false;
+            // Still `connecting` going in: destroy() reads it to tell a
+            // socket with a handle (node's has one from connect() on).
             this.destroy(_shapeConnectError(err, host, port));
           },
         );
@@ -23066,8 +23089,22 @@
         return this;
       }
 
+      // node's destroy(): the teardown is synchronous -- `destroyed`, the
+      // handle closed, the timer cleared -- and NOTHING is emitted inside
+      // the call. 'error' comes on the next tick (stream destroy's
+      // emitErrorNT) and 'close' after it: from the handle's close callback
+      // for a socket that has one (connected, or still connecting), which
+      // runs after the immediates already queued and before any timer; on
+      // the next tick, with no argument, for a socket that never had one
+      // (lib/net.js Socket.prototype._destroy). So a caller always returns
+      // from destroy() before any listener runs (#189): emitting inside the
+      // call ran a 'close' listener in the middle of whatever loop was
+      // destroying sockets -- node's own Agent.prototype.destroy indexes the
+      // list its 'close' listener splices -- and skipped every second one.
       destroy(err) {
         if (this.destroyed) return this;
+        // node creates the handle in connect(): a connecting socket has one.
+        const hadHandle = this._handle !== null || this.connecting;
         this.destroyed = true;
         this.readable = false;
         this.writable = false;
@@ -23100,13 +23137,10 @@
           try { natives.tcpClose(this._handle); } catch (_) { /* noop */ }
           this._handle = null;
         }
-        if (err) {
-          this.emit("error", err);
-          rs.errorEmitted = ws.errorEmitted = true;
-        }
         rs.closed = ws.closed = true;
-        this.emit("close", !!err);
-        rs.closeEmitted = ws.closeEmitted = true;
+        if (err) process.nextTick(emitErrorNT, this, err);
+        if (hadHandle) closeCallback(emitCloseNT, this, !!err);
+        else process.nextTick(emitCloseNT, this);
         return this;
       }
 
@@ -23136,6 +23170,10 @@
             this.destroy(err);
             return;
           }
+          // Destroyed while the read was parked: closing the handle ends
+          // that read like an EOF, and a destroyed socket emits neither
+          // 'end' nor 'data' (node's handle stops reading in destroy()).
+          if (this.destroyed) return;
           if (chunk === undefined) {
             if (this._readableMode || this._holdData) {
               // Buffered or held: 'end' follows once what is left is read
@@ -23362,22 +23400,12 @@
         if (this.listenerCount("data") > 0) this._scheduleRelease();
       }
 
+      // Both sides are done ('end' and 'finish' are out): node destroys the
+      // socket, so the close is destroy()'s -- 'close' from the handle's
+      // close callback, never inside the write chain or the read loop that
+      // got here.
       _doClose() {
-        registry._activeHandles.delete(this);
-        leaveCount(this);
-        if (this._handle !== null) {
-          try { natives.tcpClose(this._handle); } catch (_) { /* noop */ }
-          this._handle = null;
-        }
-        if (!this.destroyed) {
-          this.destroyed = true;
-          const rs = this._readableState;
-          const ws = this._writableState;
-          rs.destroyed = ws.destroyed = true;
-          rs.closed = ws.closed = true;
-          this.emit("close", false);
-          rs.closeEmitted = ws.closeEmitted = true;
-        }
+        this.destroy();
       }
 
       setEncoding(encoding) { this._encoding = encoding; return this; }
@@ -30740,16 +30768,22 @@
         }
         var wrapped = this._releaseWrap();
         callback(err);
-        // node: the transport goes with the TLS socket, after its 'error'.
-        if (wrapped !== null) {
-          process.nextTick(() => {
-            if (!wrapped.destroyed && typeof wrapped.destroy === "function") wrapped.destroy();
-          });
-        }
         // Node emits 'close' from the handle-close callback: a loop turn
         // after 'end' / 'error', with `hadError`, so a listener attached
         // after awaiting 'end' still sees it.
-        globalThis.setImmediate(() => this.emit("close", !!err));
+        var emitClose = () => this.emit("close", !!err);
+        // node: the transport goes with the TLS socket, after its 'error',
+        // and its 'close' comes before this socket's -- the transport's
+        // destroy() defers its own 'close' to the same loop turn (#189), so
+        // this one is queued behind it.
+        if (wrapped !== null) {
+          process.nextTick(() => {
+            if (!wrapped.destroyed && typeof wrapped.destroy === "function") wrapped.destroy();
+            globalThis.setImmediate(emitClose);
+          });
+        } else {
+          globalThis.setImmediate(emitClose);
+        }
       }
       // The handshake getters read Node's TLSWrap handle, which exists from
       // construction and is gone once the socket is destroyed: null then

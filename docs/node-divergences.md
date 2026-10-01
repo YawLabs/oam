@@ -2075,8 +2075,16 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   Node's still reports one from the write it had queued for the connect.
 - **Sockets.** A `'connect'` listener on a TLS socket runs after the handshake, since oam's
   native connect does both (entry 34); a listener that destroys the socket there still
-  stops the request before it is written. oam's `net.Socket` emits `'error'` and `'close'`
-  from `destroy()` synchronously where Node defers them a tick. After the request ends
+  stops the request before it is written. `net.Socket.destroy()` emits nothing inside the
+  call, as in Node: `'error'` on the next tick, then `'close'` -- after the immediates
+  already queued and before any timer for a socket that was connected or connecting, on
+  the next tick for one that never was (`conformance/cases/223-net-socket-destroy-defers-events.mjs`;
+  up to 0.17.1 both were emitted from inside `destroy()`). What is left: Node emits that
+  `'close'` from the handle's close callback, which also runs after an immediate queued
+  AFTER `destroy()` in the same turn; oam's loop has no close phase, so there `'close'`
+  comes first. And a `write()` Node's kernel took synchronously reports success to its
+  callback even when `destroy()` follows on the next line, where oam's queued write is
+  dropped and its callback gets `ERR_SOCKET_CLOSED`. After the request ends
   Node clears a closed socket's `localAddress` / `localPort`; oam keeps them on a
   `net.Socket`.
 - **Proxy agents.** The agents that send an http request to a forward proxy in absolute
