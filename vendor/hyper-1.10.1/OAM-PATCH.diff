@@ -116,7 +116,24 @@ diff -ruN a/src/ext/mod.rs b/src/ext/mod.rs
 diff -ruN a/src/proto/h1/conn.rs b/src/proto/h1/conn.rs
 --- a/src/proto/h1/conn.rs
 +++ b/src/proto/h1/conn.rs
-@@ -310,19 +310,19 @@
+@@ -11,7 +11,7 @@
+ use crate::rt::{Read, Write};
+ use bytes::{Buf, Bytes};
+ use futures_core::ready;
+-use http::header::{HeaderValue, CONNECTION, TE};
++use http::header::{HeaderValue, CONNECTION};
+ use http::{HeaderMap, Method, Version};
+ use http_body::Frame;
+ use httparse::ParserConfig;
+@@ -82,7 +82,6 @@
+                 // We assume a modern world where the remote speaks HTTP/1.1.
+                 // If they tell us otherwise, we'll downgrade in `read_head`.
+                 version: Version::HTTP_11,
+-                allow_trailer_fields: false,
+             },
+             _marker: PhantomData,
+         }
+@@ -310,27 +309,21 @@
              }
          } else if msg.expect_continue && msg.head.version.gt(&Version::HTTP_10) {
              let h1_max_header_size = None; // TODO: remove this when we land h1_max_header_size support
@@ -145,7 +162,38 @@ diff -ruN a/src/proto/h1/conn.rs b/src/proto/h1/conn.rs
 +            );
          }
  
-         self.state.allow_trailer_fields = msg
+-        self.state.allow_trailer_fields = msg
+-            .head
+-            .headers
+-            .get(TE)
+-            .map_or(false, |te_header| te_header == "trailers");
+-
+         Poll::Ready(Some(Ok((msg.head, msg.decode, wants))))
+     }
+ 
+@@ -726,11 +719,9 @@
+         self.state.writing = state;
+     }
+ 
++    // oam patch: a server sends a response's trailers whether or not the
++    // request said `TE: trailers`, as node's http module does.
+     pub(crate) fn write_trailers(&mut self, trailers: HeaderMap) {
+-        if T::is_server() && !self.state.allow_trailer_fields {
+-            debug!("trailers not allowed to be sent");
+-            return;
+-        }
+         debug_assert!(self.can_write_body() && self.can_buffer_body());
+ 
+         match self.state.writing {
+@@ -956,8 +947,6 @@
+     upgrade: Option<crate::upgrade::Pending>,
+     /// Either HTTP/1.0 or 1.1 connection.
+     version: Version,
+-    /// Flag to track if trailer fields are allowed to be sent.
+-    allow_trailer_fields: bool,
+ }
+ 
+ #[derive(Debug)]
 diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
 --- a/src/proto/h1/decode.rs
 +++ b/src/proto/h1/decode.rs
@@ -517,6 +565,85 @@ diff -ruN a/src/proto/h1/decode.rs b/src/proto/h1/decode.rs
      #[tokio::test]
      async fn test_trailer_max_headers_enforced() {
          let h1_max_headers = 10;
+diff -ruN a/src/proto/h1/encode.rs b/src/proto/h1/encode.rs
+--- a/src/proto/h1/encode.rs
++++ b/src/proto/h1/encode.rs
+@@ -77,6 +77,8 @@
+         Encoder::new(Kind::CloseDelimited)
+     }
+ 
++    // oam patch: only a client's request declares its trailer fields now.
++    #[cfg(any(feature = "client", test))]
+     pub(crate) fn into_chunked_with_trailing_fields(self, trailers: Vec<HeaderName>) -> Encoder {
+         match self.kind {
+             Kind::Chunked(_) => Encoder {
+@@ -109,6 +111,9 @@
+         }
+     }
+ 
++    // oam patch: the client's is the one use left (see
++    // into_chunked_with_trailing_fields).
++    #[cfg(any(feature = "client", test))]
+     pub(crate) fn is_chunked(&self) -> bool {
+         matches!(self.kind, Kind::Chunked(_))
+     }
+@@ -205,9 +210,22 @@
+                     kind: BufKind::Trailers(b"0\r\n".chain(Bytes::from(buf)).chain(b"\r\n")),
+                 })
+             }
++            // oam patch: with no `Trailer` header to name them, every field
++            // is sent, a repeated one as often as it repeats, as node's http
++            // module sends a message's trailers.
+             Kind::Chunked(None) => {
+-                debug!("attempted to encode trailers, but the trailer header is not set");
+-                None
++                let mut buf = Vec::new();
++                if title_case_headers {
++                    write_headers_title_case(&trailers, &mut buf);
++                } else {
++                    write_headers(&trailers, &mut buf);
++                }
++                if buf.is_empty() {
++                    return None;
++                }
++                Some(EncodedBuf {
++                    kind: BufKind::Trailers(b"0\r\n".chain(Bytes::from(buf)).chain(b"\r\n")),
++                })
+             }
+             _ => {
+                 debug!("attempted to encode trailers for non-chunked response");
+@@ -571,15 +589,28 @@
+     fn chunked_with_no_trailer_header() {
+         let encoder = Encoder::chunked();
+ 
+-        let headers = HeaderMap::from_iter(vec![(
++        let mut headers = HeaderMap::from_iter(vec![(
+             HeaderName::from_static("chunky-trailer"),
+             HeaderValue::from_static("header data"),
+         )]);
++        headers.append(
++            HeaderName::from_static("chunky-trailer"),
++            HeaderValue::from_static("more header data"),
++        );
+ 
+-        assert!(encoder
++        // oam patch: with no Trailer header, every field is sent, repeats
++        // included.
++        let buf = encoder
+             .encode_trailers::<&[u8]>(headers.clone(), false)
+-            .is_none());
++            .unwrap();
++        let mut dst = Vec::new();
++        dst.put(buf);
++        assert_eq!(
++            dst,
++            b"0\r\nchunky-trailer: header data\r\nchunky-trailer: more header data\r\n\r\n"
++        );
+ 
++        // A Trailer header that names nothing still lets nothing through.
+         let trailers = vec![];
+         let encoder = encoder.into_chunked_with_trailing_fields(trailers);
+ 
 diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
 --- a/src/proto/h1/role.rs
 +++ b/src/proto/h1/role.rs
@@ -679,7 +806,56 @@ diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
          if let Some(header_case_map) = header_case_map {
              extensions.insert(header_case_map);
          }
-@@ -2172,6 +2200,17 @@
+@@ -651,7 +679,6 @@
+         };
+ 
+         let mut encoder = Encoder::length(0);
+-        let mut allowed_trailer_fields: Option<Vec<HeaderName>> = None;
+         let mut wrote_date = false;
+         let mut cur_name = None;
+         let mut is_name_written = false;
+@@ -861,24 +888,9 @@
+                         extend(dst, value.as_bytes());
+                     }
+ 
+-                    // Parse the Trailer header value into HeaderNames.
+-                    // The value may contain comma-separated names.
+-                    // HeaderName normalizes to lowercase for case-insensitive matching.
+-                    if let Ok(value_str) = value.to_str() {
+-                        let names: Vec<HeaderName> = value_str
+-                            .split(',')
+-                            .filter_map(|s| HeaderName::from_bytes(s.trim().as_bytes()).ok())
+-                            .collect();
+-
+-                        match allowed_trailer_fields {
+-                            Some(ref mut fields) => {
+-                                fields.extend(names);
+-                            }
+-                            None => {
+-                                allowed_trailer_fields = Some(names);
+-                            }
+-                        }
+-                    }
++                    // oam patch: the header does not limit which trailer
++                    // fields a response sends (it sends them all, as node's
++                    // http module does), so its names are not collected.
+ 
+                     continue 'headers;
+                 }
+@@ -967,12 +979,6 @@
+             extend(dst, b"\r\n");
+         }
+ 
+-        if encoder.is_chunked() {
+-            if let Some(allowed_trailer_fields) = allowed_trailer_fields {
+-                encoder = encoder.into_chunked_with_trailing_fields(allowed_trailer_fields);
+-            }
+-        }
+-
+         Ok(encoder.set_last(is_last))
+     }
+ 
+@@ -2172,6 +2178,17 @@
               ",
              "1.0 chunked",
          );

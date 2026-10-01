@@ -1882,9 +1882,13 @@ of it: `I'm a teapot` for Node's `I'm a Teapot`, `<none>` for Node's `unknown`).
   `transfer-encoding` header removed (`res.removeHeader('transfer-encoding')`) and no length
   known, Node sends the body bare and closes the connection after it; hyper, which frames
   oam's responses, has no way to end an HTTP/1.1 body by closing, and chunks it.
-- **Response trailers are not sent.** `addTrailers()` checks its names and values as Node
-  does and keeps them, and a `Trailer` header does not switch the response to chunked
-  framing as it does in Node.
+- **Trailer names go out lowercase.** `addTrailers()`'s fields follow the last chunk of a
+  chunked body as Node sends them -- all of them, a repeated one once per value, whether or
+  not a `Trailer` header names them and whatever the request's `TE` says, and none on a body
+  framed otherwise (case 268; oam sent none up to 0.17.1, as hyper sends only declared
+  trailers to a `TE: trailers` request, `vendor/hyper-1.10.1/OAM-PATCH.md` item 12) -- but
+  hyper writes a trailer name as it writes any header name, with no room for the case it
+  was given in, where Node writes it as given.
 - **A `content-disposition` value is not re-encoded.** When the response's length is known,
   Node v22.22.2 converts the value with `Buffer.from(value, 'latin1')` and turns it back into
   a string as UTF-8, so a non-ASCII value is corrupted: `café` goes out as `caf` plus the

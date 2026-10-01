@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::rt::{Read, Write};
 use bytes::{Buf, Bytes};
 use futures_core::ready;
-use http::header::{HeaderValue, CONNECTION, TE};
+use http::header::{HeaderValue, CONNECTION};
 use http::{HeaderMap, Method, Version};
 use http_body::Frame;
 use httparse::ParserConfig;
@@ -82,7 +82,6 @@ where
                 // We assume a modern world where the remote speaks HTTP/1.1.
                 // If they tell us otherwise, we'll downgrade in `read_head`.
                 version: Version::HTTP_11,
-                allow_trailer_fields: false,
             },
             _marker: PhantomData,
         }
@@ -324,12 +323,6 @@ where
                     .in_request(T::is_server()),
             );
         }
-
-        self.state.allow_trailer_fields = msg
-            .head
-            .headers
-            .get(TE)
-            .map_or(false, |te_header| te_header == "trailers");
 
         Poll::Ready(Some(Ok((msg.head, msg.decode, wants))))
     }
@@ -726,11 +719,9 @@ where
         self.state.writing = state;
     }
 
+    // oam patch: a server sends a response's trailers whether or not the
+    // request said `TE: trailers`, as node's http module does.
     pub(crate) fn write_trailers(&mut self, trailers: HeaderMap) {
-        if T::is_server() && !self.state.allow_trailer_fields {
-            debug!("trailers not allowed to be sent");
-            return;
-        }
         debug_assert!(self.can_write_body() && self.can_buffer_body());
 
         match self.state.writing {
@@ -956,8 +947,6 @@ struct State {
     upgrade: Option<crate::upgrade::Pending>,
     /// Either HTTP/1.0 or 1.1 connection.
     version: Version,
-    /// Flag to track if trailer fields are allowed to be sent.
-    allow_trailer_fields: bool,
 }
 
 #[derive(Debug)]

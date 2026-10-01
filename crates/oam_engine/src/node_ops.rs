@@ -314,6 +314,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpRespond", op_http_respond),
         ("httpRespondStream", op_http_respond_stream),
         ("httpBodyPush", op_http_body_push),
+        ("httpBodyTrailers", op_http_body_trailers),
         ("httpBodyEnd", op_http_body_end),
         ("httpStreamClosed", op_http_stream_closed),
         ("httpRequestBodyRead", op_http_request_body_read),
@@ -3384,18 +3385,30 @@ fn op_http_respond(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
+    use oam_core::http_server::ResponseBody;
     let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let body = arg_bytes(scope, &args, 3).unwrap_or_default();
-    // `true`: the body goes out as one of unknown length (chunked, or ended
-    // by closing for an HTTP/1.0 client), as node:http frames it after
-    // writeHead(); anything else sends its length.
-    let sized = !args.get(5).is_true();
     let head = response_head_args(scope, &args, 4, 6);
-    rv.set_bool(
-        core_runtime!(scope)
-            .http()
-            .respond_full(id, head, body, sized),
-    );
+    // Arg 5 `true`: the body goes out as one of unknown length (chunked, or
+    // ended by closing for an HTTP/1.0 client), as node:http frames it after
+    // writeHead(), followed by the trailer fields in arg 7 (`[[name, value],
+    // ...]` JSON) when there are any; anything else sends its length.
+    let body = if args.get(5).is_true() {
+        let trailers = match arg_string(scope, &args, 7) {
+            None => None,
+            Some(json) => match oam_core::http_server::trailer_fields(&parse_headers_json(&json)) {
+                Some(trailers) => Some(trailers),
+                None => {
+                    throw_type_error(scope, "httpRespond: invalid trailer field");
+                    return;
+                }
+            },
+        };
+        ResponseBody::Unsized(body, trailers)
+    } else {
+        ResponseBody::Full(body)
+    };
+    rv.set_bool(core_runtime!(scope).http().respond_full(id, head, body));
 }
 
 /// The head httpRespond / httpRespondStream are given: the status (arg 1),
@@ -3480,6 +3493,25 @@ fn op_http_body_push(
         scope,
         &mut rv,
         oam_core::http_server::http_body_push(state, stream_id, bytes),
+    );
+}
+
+/// A node:http streaming response's trailer fields (`[[name, value], ...]`
+/// JSON), pushed after its last chunk, before httpBodyEnd.
+fn op_http_body_trailers(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let stream_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let pairs = arg_string(scope, &args, 1)
+        .map(|json| parse_headers_json(&json))
+        .unwrap_or_default();
+    let state = core_runtime!(scope).http();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_server::http_body_trailers(state, stream_id, pairs),
     );
 }
 

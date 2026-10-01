@@ -17909,8 +17909,9 @@
       }
       // node's addTrailers: each name a token ('Trailer name'), each value
       // free of what a header value may not hold ('trailer content'); a
-      // later call replaces an earlier one. oam does not send response
-      // trailers yet (docs/node-divergences.md).
+      // later call replaces an earlier one. They go out with end(), after
+      // the last chunk, when the body is chunked -- with or without a
+      // Trailer header naming them -- and not at all otherwise, as node's.
       addTrailers(headers) {
         const trailers = [];
         const isArray = Array.isArray(headers);
@@ -17930,6 +17931,14 @@
           }
         }
         this._trailers = trailers;
+      }
+      // The trailer fields end() hands the native side: only for a chunked
+      // body (node writes them in its last chunk, and has nowhere to put
+      // them otherwise), and only when there are any.
+      _trailerJson() {
+        const trailers = this._trailers;
+        if (!this._chunked || !this._hasBody || !trailers || trailers.length === 0) return undefined;
+        return JSON.stringify(trailers);
       }
       // node's _implicitHeader: the head a write(), end() or flushHeaders()
       // builds when writeHead() has not -- writeHead(this.statusCode), with
@@ -18118,6 +18127,7 @@
             !this._headIsUtf8(chunk, encoding, true),
             !this._sizedBody,
             this._headMessage,
+            this._trailerJson(),
           );
           queueMicrotask(() => {
             if (this.closed) {
@@ -18137,6 +18147,16 @@
           if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
           this._ended = true;
           const streamId = this._streamId;
+          // node writes the trailers after the last chunk, with end().
+          const trailers = this._trailerJson();
+          if (trailers !== undefined) {
+            this._chain = this._chain.then(() => natives.httpBodyTrailers(streamId, trailers)).then(
+              undefined,
+              (err) => {
+                if (this.listenerCount("error") > 0) this.emit("error", err);
+              },
+            );
+          }
           this._chain = this._chain.then(() => {
             if (this.closed) {
               // The httpStreamClosed watcher already surfaced a premature

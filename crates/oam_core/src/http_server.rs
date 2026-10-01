@@ -340,12 +340,13 @@ pub enum ResponseBody {
     Full(Vec<u8>),
     /// A whole body that goes out as if its length were not known: hyper
     /// frames it chunked, or ends it by closing the connection for an
-    /// HTTP/1.0 client. node:http frames `writeHead(); end('text')` so.
-    Unsized(Vec<u8>),
-    /// Chunk channel plus a drop-signal: the oneshot sender rides inside
+    /// HTTP/1.0 client. node:http frames `writeHead(); end('text')` so. The
+    /// trailers go out after it when it is chunked.
+    Unsized(Vec<u8>, Option<hyper::HeaderMap>),
+    /// Frame channel plus a drop-signal: the oneshot sender rides inside
     /// ChannelBody, so dropping the body (finished OR connection lost)
     /// resolves the paired stream_watch receiver.
-    Stream(mpsc::Receiver<Vec<u8>>, oneshot::Sender<()>),
+    Stream(mpsc::Receiver<Frame<Bytes>>, oneshot::Sender<()>),
     /// JS destroyed the request without responding (req.destroy()): the
     /// connection is torn down instead of synthesizing a response, so the
     /// client observes a connection error (Node's socket-destroy semantics).
@@ -487,7 +488,7 @@ pub struct HttpState {
     /// body removes these (lock order: `bodies`, then this).
     trailers: Mutex<HashMap<u64, Vec<(String, String)>>>,
     /// response-stream id -> chunk sender (JS pushes, hyper drains).
-    streams: Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>,
+    streams: Mutex<HashMap<u64, mpsc::Sender<Frame<Bytes>>>>,
     /// response-stream id -> resolves when hyper drops the response body
     /// (normal completion OR connection loss). httpStreamClosed takes the
     /// receiver; JS tells the two cases apart via its own finished flag.
@@ -734,14 +735,8 @@ impl HttpState {
         }
     }
 
-    pub fn respond_full(
-        &self,
-        id: u64,
-        head: ResponseHead,
-        body: Vec<u8>,
-        // false: frame the body as one of unknown length (ResponseBody::Unsized).
-        sized: bool,
-    ) -> bool {
+    /// Answer with a whole body: `ResponseBody::Full` or `Unsized`.
+    pub fn respond_full(&self, id: u64, head: ResponseHead, body: ResponseBody) -> bool {
         let Some(responder) = self
             .pending
             .lock()
@@ -750,16 +745,7 @@ impl HttpState {
         else {
             return false;
         };
-        responder
-            .send(ResponseSpec {
-                head,
-                body: if sized {
-                    ResponseBody::Full(body)
-                } else {
-                    ResponseBody::Unsized(body)
-                },
-            })
-            .is_ok()
+        responder.send(ResponseSpec { head, body }).is_ok()
     }
 
     /// Start a streaming response; returns the stream handle JS pushes to.
@@ -769,7 +755,7 @@ impl HttpState {
             .lock()
             .expect("http pending lock")
             .remove(&id)?;
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
+        let (tx, rx) = mpsc::channel::<Frame<Bytes>>(16);
         let (closed_tx, closed_rx) = oneshot::channel::<()>();
         let stream_id = self.next_id();
         self.streams
@@ -814,7 +800,7 @@ impl HttpState {
             .is_ok()
     }
 
-    pub fn stream_sender(&self, stream_id: u64) -> Option<mpsc::Sender<Vec<u8>>> {
+    pub fn stream_sender(&self, stream_id: u64) -> Option<mpsc::Sender<Frame<Bytes>>> {
         self.streams
             .lock()
             .expect("http streams lock")
@@ -866,11 +852,12 @@ impl HttpState {
     }
 }
 
-/// hyper Body over the JS-pushed chunk channel. `_closed_tx` is never sent
-/// on: its DROP (body finished or connection torn down) is the signal the
-/// paired stream_watch receiver resolves on.
+/// hyper Body over the JS-pushed frame channel: body chunks, and a node:http
+/// response's trailers last. `_closed_tx` is never sent on: its DROP (body
+/// finished or connection torn down) is the signal the paired stream_watch
+/// receiver resolves on.
 struct ChannelBody {
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<Frame<Bytes>>,
     _closed_tx: oneshot::Sender<()>,
 }
 
@@ -882,21 +869,19 @@ impl hyper::body::Body for ChannelBody {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        match self.rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some(chunk)) => {
-                std::task::Poll::Ready(Some(Ok(Frame::data(Bytes::from(chunk)))))
-            }
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
+        self.rx.poll_recv(cx).map(|frame| frame.map(Ok))
     }
 }
 
 /// A whole body that does not tell hyper its length: its size hint is
 /// hyper's default (unknown) and it is not at its end before it is polled,
 /// so hyper frames it as a streamed one -- chunked, or by closing the
-/// connection for an HTTP/1.0 client -- even when it is empty.
-struct UnsizedBody(Option<Bytes>);
+/// connection for an HTTP/1.0 client -- even when it is empty. Its trailers,
+/// if any, follow the data (hyper sends them only on a chunked body).
+struct UnsizedBody {
+    data: Option<Bytes>,
+    trailers: Option<hyper::HeaderMap>,
+}
 
 impl hyper::body::Body for UnsizedBody {
     type Data = Bytes;
@@ -906,13 +891,25 @@ impl hyper::body::Body for UnsizedBody {
         mut self: std::pin::Pin<&mut Self>,
         _cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        std::task::Poll::Ready(
-            self.0
-                .take()
-                .filter(|bytes| !bytes.is_empty())
-                .map(|bytes| Ok(Frame::data(bytes))),
-        )
+        let data = self.data.take().filter(|bytes| !bytes.is_empty());
+        let frame = data
+            .map(Frame::data)
+            .or_else(|| self.trailers.take().map(Frame::trailers));
+        std::task::Poll::Ready(frame.map(Ok))
     }
+}
+
+/// A node:http response's trailer fields, as hyper sends them: each value
+/// one byte per code point, as node writes its trailer string, and a
+/// repeated field as often as it repeats. `None` when a name or a value is
+/// one JS would have refused (addTrailers checks both as node's does).
+pub fn trailer_fields(pairs: &[(String, String)]) -> Option<hyper::HeaderMap> {
+    let mut map = hyper::HeaderMap::with_capacity(pairs.len());
+    for (name, value) in pairs {
+        let name = hyper::header::HeaderName::from_bytes(name.as_bytes()).ok()?;
+        map.append(name, crate::http_head::latin1_header_value(value)?);
+    }
+    Some(map)
 }
 
 type BoxedBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
@@ -943,7 +940,11 @@ fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
     }
     let body: BoxedBody = match spec.body {
         ResponseBody::Full(bytes) => http_body_util::Full::new(Bytes::from(bytes)).boxed(),
-        ResponseBody::Unsized(bytes) => UnsizedBody(Some(Bytes::from(bytes))).boxed(),
+        ResponseBody::Unsized(bytes, trailers) => UnsizedBody {
+            data: Some(Bytes::from(bytes)),
+            trailers,
+        }
+        .boxed(),
         ResponseBody::Stream(rx, closed_tx) => ChannelBody {
             rx,
             _closed_tx: closed_tx,
@@ -2923,10 +2924,34 @@ pub async fn http_body_push(
     stream_id: u64,
     bytes: Vec<u8>,
 ) -> super::OpOutcome {
+    push_frame(state, stream_id, Frame::data(Bytes::from(bytes))).await
+}
+
+/// A node:http response's trailer fields, pushed after its last chunk;
+/// hyper sends them when it chunks the body, and drops them otherwise, as
+/// node does.
+pub async fn http_body_trailers(
+    state: Arc<HttpState>,
+    stream_id: u64,
+    pairs: Vec<(String, String)>,
+) -> super::OpOutcome {
+    let Some(trailers) = trailer_fields(&pairs) else {
+        return super::OpOutcome::Failed("invalid trailer field".to_string());
+    };
+    push_frame(state, stream_id, Frame::trailers(trailers)).await
+}
+
+/// One frame onto a streaming response's channel, with the backpressure
+/// and the timeout described above.
+async fn push_frame(
+    state: Arc<HttpState>,
+    stream_id: u64,
+    frame: Frame<Bytes>,
+) -> super::OpOutcome {
     let Some(sender) = state.stream_sender(stream_id) else {
         return super::OpOutcome::Failed(format!("http stream {stream_id} is gone"));
     };
-    match tokio::time::timeout(STREAM_PUSH_TIMEOUT, sender.send(bytes)).await {
+    match tokio::time::timeout(STREAM_PUSH_TIMEOUT, sender.send(frame)).await {
         Ok(Ok(())) => super::OpOutcome::Done,
         Ok(Err(_)) => {
             // Receiver dropped (hyper ended the response / connection gone).

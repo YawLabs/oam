@@ -679,7 +679,6 @@ impl Server {
         };
 
         let mut encoder = Encoder::length(0);
-        let mut allowed_trailer_fields: Option<Vec<HeaderName>> = None;
         let mut wrote_date = false;
         let mut cur_name = None;
         let mut is_name_written = false;
@@ -889,24 +888,9 @@ impl Server {
                         extend(dst, value.as_bytes());
                     }
 
-                    // Parse the Trailer header value into HeaderNames.
-                    // The value may contain comma-separated names.
-                    // HeaderName normalizes to lowercase for case-insensitive matching.
-                    if let Ok(value_str) = value.to_str() {
-                        let names: Vec<HeaderName> = value_str
-                            .split(',')
-                            .filter_map(|s| HeaderName::from_bytes(s.trim().as_bytes()).ok())
-                            .collect();
-
-                        match allowed_trailer_fields {
-                            Some(ref mut fields) => {
-                                fields.extend(names);
-                            }
-                            None => {
-                                allowed_trailer_fields = Some(names);
-                            }
-                        }
-                    }
+                    // oam patch: the header does not limit which trailer
+                    // fields a response sends (it sends them all, as node's
+                    // http module does), so its names are not collected.
 
                     continue 'headers;
                 }
@@ -993,12 +977,6 @@ impl Server {
             extend(dst, b"\r\n\r\n");
         } else {
             extend(dst, b"\r\n");
-        }
-
-        if encoder.is_chunked() {
-            if let Some(allowed_trailer_fields) = allowed_trailer_fields {
-                encoder = encoder.into_chunked_with_trailing_fields(allowed_trailer_fields);
-            }
         }
 
         Ok(encoder.set_last(is_last))

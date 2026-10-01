@@ -3,8 +3,10 @@
 This directory is hyper **1.10.1** as published on crates.io, plus a fix
 for a client hang (items 1-3 below), one server extension (item 4), and
 four stricter rules in the chunked-body decoder (items 5 to 8), a
-CONNECT request read without a body (item 9), and the `host` field kept out
-of an HTTP/2 request (item 10). The root `Cargo.toml` swaps it in with `[patch.crates-io]`.
+CONNECT request read without a body (item 9), the `host` field kept out
+of an HTTP/2 request (item 10), an on-demand header buffer (item 11), and a
+server response's trailers sent as node sends them (item 12). The root
+`Cargo.toml` swaps it in with `[patch.crates-io]`.
 
 - **Upstream:** `hyper-1.10.1.crate`, sha256
   `55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498`
@@ -106,6 +108,19 @@ whole of it.
     when a head carries more fields, up to the cap; the cap still bounds it, so
     the accept/reject boundary is unchanged and hyper's own `max_headers` tests
     still hold. See "On-demand header buffer" below.
+12. **`src/proto/h1/conn.rs`, `src/proto/h1/encode.rs` and
+    `src/proto/h1/role.rs`, response trailers.** A chunked body's trailers
+    frame is sent whole: every field, a repeated one as often as it repeats,
+    whether or not a `Trailer` header names it and whether or not the
+    request said `TE: trailers`. `Conn` loses its `allow_trailer_fields`
+    flag (and the `TE` read that set it); `Encoder::encode_trailers` writes
+    all the fields for a chunked encoder with no declared list
+    (`Kind::Chunked(None)`); `Server::encode_headers` still writes a
+    `Trailer` header but no longer collects its names into such a list.
+    `into_chunked_with_trailing_fields` and `is_chunked`, which only the
+    client uses now, are built for `client` (and tests). The crate's
+    `chunked_with_no_trailer_header` test now expects the fields. See
+    "Response trailers" below.
 
 ## Why
 
@@ -395,6 +410,35 @@ on `client` -- its one remaining user, `Client::parse` -- so a server-only
 build stays warning-free. `scripts/check-vendor.sh --build` compiles every
 feature set in OAM-PATCH.features and is where an unused import in one of
 them shows up.
+
+## Response trailers (item 12)
+
+node's `res.addTrailers()` puts its fields after the last chunk of a
+chunked response, every one of them, a repeated field once per value: the
+`Trailer` header is the application's business, and node sends trailers to
+any request. hyper sent a response's trailers only when the request carried
+`TE: trailers` exactly, and then only the fields a `Trailer` header of the
+response named, minus the ones RFC 9110 forbids in a trailer section
+(`content-length`, `host`, ...), each name once (`HeaderMap::insert`). An
+oam server answering a node client, or curl, or a browser, so sent none.
+
+With the patch a server sends the trailers frame its body yields, as node
+would; hyper still sends trailers only on a chunked body (a length-framed
+or close-delimited one has nowhere to put them, which is node's rule too).
+Only node:http's `ServerResponse` yields a trailers frame among oam's
+servers, so `oam.serve` and the http2 compat server are unchanged. The
+client's encoder keeps hyper's rule for a request that declares its
+trailers, and sends every field for one that does not -- which oam's client
+never yields (node's `ClientRequest#addTrailers` would send them all).
+
+The names go out as hyper writes any header name (lowercase, or title case
+on a connection that asks for it); a trailers frame has no room for the
+case the application wrote them in. node writes them as given.
+
+Tested by conformance case 268 (identical to node v22.22.2; fails on stock
+1.10.1) and the crate's `chunked_with_no_trailer_header`. hyper 1.11.0 keeps
+the `TE: trailers` gate and the declared-fields filter (checked 2026-10-01;
+1.11.1 was not checked).
 
 ## Upstream status (checked 2026-09-18)
 
