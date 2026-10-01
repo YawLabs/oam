@@ -402,14 +402,23 @@
         // The stored list, in its order: iterating would sort it, and a
         // Response built from a handler's Headers must reach the wire in the
         // order the handler set them. Nothing a script can iterate differs.
-        for (const [k, v] of init._list) this.append(k, v);
+        for (const [k, v] of init._list) this._append(k, v);
       } else if (typeof init[Symbol.iterator] === "function" && typeof init !== "string") {
         for (const pair of init) this.append(pair[0], pair[1]);
       } else {
         for (const key of Object.keys(init)) this.append(key, init[key]);
       }
     }
+    // A name and a value are ByteStrings, as webidl makes them in node: a
+    // code unit above 0xFF is refused with node's TypeError (#174), since
+    // the wire carries one byte per code point. `_append` is the unchecked
+    // entry for lists oam built itself (a fetched response's latin1 head,
+    // oam.serve's request head, a copy of another Headers).
     append(name, value) {
+      const [key, text] = headerEntry("append", name, value);
+      this._append(key, text);
+    }
+    _append(name, value) {
       const key = String(name).toLowerCase();
       const text = String(value);
       this._sorted = null;
@@ -422,8 +431,8 @@
       else entry[1] = `${entry[1]}, ${text}`;
     }
     set(name, value) {
-      const key = String(name).toLowerCase();
-      const text = String(value);
+      let [key, text] = headerEntry("set", name, value);
+      key = key.toLowerCase();
       this._sorted = null;
       const at = this._list.findIndex((e) => e[0] === key);
       if (at < 0) {
@@ -484,6 +493,23 @@
   Object.defineProperty(Headers.prototype, Symbol.iterator, { enumerable: false });
   brand(Headers, "Headers");
   globalThis.Headers = Headers;
+
+  // undici's Headers.append / set: name and value as ByteStrings, the value
+  // stripped of leading and trailing HTTP whitespace, then a name that is not
+  // a token or a value holding NUL, CR or LF refused with undici's texts
+  // (measured on node v22.22.2).
+  const HEADER_NAME_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+  function headerEntry(method, name, value) {
+    const key = toByteString(name);
+    const text = toByteString(value).replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
+    if (!HEADER_NAME_TOKEN.test(key)) {
+      throw new TypeError(`Headers.${method}: "${key}" is an invalid header name.`);
+    }
+    if (/[\0\r\n]/.test(text)) {
+      throw new TypeError(`Headers.${method}: "${text}" is an invalid header value.`);
+    }
+    return [key, text];
+  }
 
   // node's `Headers Iterator`: an index into the sorted list, read afresh on
   // every next().
@@ -1596,7 +1622,7 @@
 
   function makeHeaders(pairs) {
     const headers = new Headers();
-    for (const [name, value] of pairs) headers.append(name, value);
+    for (const [name, value] of pairs) headers._append(name, value);
     return headers;
   }
 
@@ -2089,6 +2115,12 @@
   //
   // Returns `[name, message]` to refuse with, or the value to send.
   function dispatchHeader(name, value) {
+    // undici's isValidHeaderValue: a control character other than HTAB, or
+    // DEL, cannot go on the wire (a code point above U+00FF never got this
+    // far: the Headers it came through refused it).
+    if (/[^\t\x20-\x7e\x80-\xff]/.test(value)) {
+      return { refuse: ["InvalidArgumentError", `invalid ${name} header`] };
+    }
     switch (name) {
       case "transfer-encoding":
         return { refuse: ["InvalidArgumentError", "invalid transfer-encoding header"] };
@@ -2531,7 +2563,7 @@
     return {
       method: meta.method,
       url: `http://${host}${meta.uri}`,
-      headers: new Headers(meta.headers),
+      headers: makeHeaders(meta.headers),
       get bodyUsed() {
         return consumed;
       },

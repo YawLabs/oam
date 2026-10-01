@@ -19624,6 +19624,9 @@
         if (opts.headers) {
           var keys = Object.keys(opts.headers);
           for (var i = 0; i < keys.length; i++) {
+            // node's constructor sets each through setHeader(), so a bad
+            // name or value throws from http.request itself (#174).
+            checkOutgoingHeader(keys[i], opts.headers[keys[i]]);
             this._headers[keys[i].toLowerCase()] = opts.headers[keys[i]];
           }
         }
@@ -19867,6 +19870,7 @@
       get connection() { return this.socket; }
       set connection(value) { this.socket = value; }
       setHeader(name, value) {
+        checkOutgoingHeader(name, value);
         var key = name.toLowerCase();
         if (key === "connection") this._removedConnection = false;
         this._headers[key] = value;
@@ -22063,6 +22067,23 @@
       var err = new TypeError("Invalid character in header content [\"" + name + "\"]");
       err.code = "ERR_INVALID_CHAR";
       return err;
+    }
+    // node's OutgoingMessage setHeader() checks (lib/_http_outgoing.js
+    // validateHeaderName / validateHeaderValue): a name that is not a token,
+    // an undefined value, and a value carrying a character no header may --
+    // a control character, or one above U+00FF, which latin1 cannot carry --
+    // are refused before anything is sent (#174). oam sent the last as its
+    // UTF-8 bytes.
+    function checkOutgoingHeader(name, value) {
+      if (typeof name !== "string" || !HTTP_TOKEN.test(name)) {
+        throw invalidHttpToken("Header name", name);
+      }
+      if (value === undefined) {
+        var err = new TypeError("Invalid value \"undefined\" for header \"" + name + "\"");
+        err.code = "ERR_HTTP_INVALID_HEADER_VALUE";
+        throw err;
+      }
+      if (INVALID_HEADER_CHAR.test(value)) throw invalidHeaderChar(name);
     }
     function validateHeaderName(name) {
       if (typeof name !== "string" || name.length === 0) throw new TypeError("Header name must be a valid HTTP token [\"" + name + "\"]");

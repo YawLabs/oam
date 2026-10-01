@@ -7167,7 +7167,8 @@ console.log(await upgrade('refused', http, { host: 'ws.test', port: plain.addres
 await new Promise((r) => setTimeout(r, 50));
 console.log('connections after refusal', connections - before);
 // The upgrade head is written by hand: a header value carrying CR / LF is
-// refused, never sent.
+// refused -- by http.request itself, synchronously, as node refuses it (#174) --
+// and never sent.
 console.log(await upgrade('crlf', http, { host: '127.0.0.1', port: plain.address().port }, { 'X-Bad': 'a\r\nX-Injected: 1' }));
 await new Promise((r) => setTimeout(r, 50));
 console.log('injected header reached the server', injected);
@@ -7184,7 +7185,7 @@ secure.close();
          plain request 101 echo=ping tls=false rest=0\n\
          refused error EREFUSED_BY_HOOK\n\
          connections after refusal 0\n\
-         crlf error ERR_INVALID_CHAR\n\
+         crlf threw ERR_INVALID_CHAR\n\
          injected header reached the server false"
     );
 }

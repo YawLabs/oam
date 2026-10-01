@@ -1584,10 +1584,6 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
 - **The request header count is capped.** More than 24,576 distinct header names (fewer if
   the header table's hash-flooding defence rebuilds it) fails with
   `fetch: too many request headers`; Node has no cap (25,000 distinct names get a 200).
-- **Header values on the wire are UTF-8, where undici writes latin1.** A request header value
-  of `café` goes out as `cafÃ©` in oam and `café` in Node. Response header values
-  are decoded as latin1 in both, so the round trip is asymmetric: a value oam sent is not the
-  value oam reads back.
 - **Six request-header shapes still differ from Node's `fetch`** -- measured against a
   raw-socket server, with everything else on the request line and in the header block
   identical. oam does not send `connection: keep-alive`, `accept-language: *` or

@@ -138,11 +138,13 @@ pub fn prepare(
     }
     for (name, value) in user_headers {
         // `HeaderName::from_bytes` lower-cases; `HeaderValue::from_bytes`
-        // admits HTAB, visible ASCII and obs-text (0x80-0xFF) -- the same
-        // `TryFrom<&String>` conversions reqwest's `RequestBuilder::header`
-        // ran.
+        // admits HTAB, visible ASCII and obs-text (0x80-0xFF). The value is
+        // written one byte per code point, as node writes it (#174): `café`
+        // goes out as the four bytes `caf` 0xE9, not as its UTF-8. JS refuses
+        // a code point above U+00FF before it gets here, as node does; one
+        // that arrives anyway is a builder error, never its UTF-8.
         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| PrepareError::Builder)?;
-        let value = HeaderValue::from_bytes(value.as_bytes()).map_err(|_| PrepareError::Builder)?;
+        let value = latin1_value(value).ok_or(PrepareError::Builder)?;
         headers.try_append(name, value).map_err(too_many)?;
     }
     if default_headers {
@@ -170,6 +172,17 @@ pub fn prepare(
         method,
         headers,
     })
+}
+
+/// A header value from a JS string, one byte per code point: `None` for a
+/// code point above U+00FF, or for a byte `HeaderValue` refuses (a control
+/// character).
+fn latin1_value(text: &str) -> Option<HeaderValue> {
+    let bytes = text
+        .chars()
+        .map(|c| u8::try_from(u32::from(c)).ok())
+        .collect::<Option<Vec<u8>>>()?;
+    HeaderValue::from_bytes(&bytes).ok()
 }
 
 /// Remove the userinfo from `url` and return it as a Basic credential.
