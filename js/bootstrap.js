@@ -526,7 +526,9 @@
       // A string, and anything else through String(): a USVString, so a lone
       // surrogate becomes U+FFFD, which is also what encoding it would do.
       state.kind = "string";
-      state.bytes = new TextEncoder().encode(wellFormed(object));
+      // `text` lets fetch hand the transport the string as it is.
+      state.text = wellFormed(object);
+      state.bytes = new TextEncoder().encode(state.text);
       state.type = "text/plain;charset=UTF-8";
     }
     if (state.stream !== null && (state.stream.locked || state.stream._disturbed === true)) {
@@ -789,6 +791,7 @@
       return copy;
     }
   }
+  Object.defineProperty(Response.prototype, "clone", { enumerable: true });
   installBody(Response);
   brand(Response, "Response");
   globalThis.Response = Response;
@@ -1067,59 +1070,415 @@
   }
 
   // ----------------------------------------------------------------- Request
-  // WHATWG Request: the fetch()-input request object. Minimal but spec-shaped:
-  // method, url, headers, body. Used by frameworks that pass Request objects
-  // instead of URLs to fetch().
+  // WHATWG Request, as undici 6's constructor builds it (measured on node
+  // v22.22.2): RequestInit is converted member by member in webidl order --
+  // each enum refused with undici's text -- then the URL is parsed, a Request
+  // input's fields are inherited, and `init` overrides them one by one. Every
+  // attribute is a prototype getter over the state below, as in node; the
+  // `signal` is a fresh one that follows the caller's. `fetch` builds its
+  // request through this same constructor (#180), so `fetch(request, init)`
+  // means what `new Request(request, init)` means.
+  //
+  // Kept and returned, and acted on only by the checks below: mode,
+  // credentials, cache, integrity, keepalive, referrer, referrerPolicy.
+  // node's fetch also turns `cache` into request headers, checks `integrity`
+  // and sends `referrer`; oam does not (docs/node-divergences.md).
+  const requestStates = new WeakMap();
+  const REQUEST_ENUMS = {
+    referrerPolicy: [
+      "",
+      "no-referrer",
+      "no-referrer-when-downgrade",
+      "same-origin",
+      "origin",
+      "strict-origin",
+      "origin-when-cross-origin",
+      "strict-origin-when-cross-origin",
+      "unsafe-url",
+    ],
+    mode: ["navigate", "same-origin", "no-cors", "cors"],
+    credentials: ["omit", "same-origin", "include"],
+    cache: ["default", "no-store", "reload", "no-cache", "force-cache", "only-if-cached"],
+    redirect: ["follow", "manual", "error"],
+    duplex: ["half"],
+  };
+  // undici's normalizedMethodRecords: these six are uppercased, any other
+  // token is kept as written (`patch` goes out as `patch`).
+  const REQUEST_NORMALIZED_METHODS = new Set(["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"]);
+  const REQUEST_FORBIDDEN_METHODS = new Set(["CONNECT", "TRACE", "TRACK"]);
+  const HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+  let patchMethodWarned = false;
+
+  // webidl's ByteString: a code unit above 0xFF is refused.
+  function toByteString(value) {
+    const text = String(value);
+    for (let i = 0; i < text.length; i++) {
+      const code = text.charCodeAt(i);
+      if (code > 255) {
+        throw new TypeError(
+          `Cannot convert argument to a ByteString because the character at index ${i} has a value of ${code} which is greater than 255.`,
+        );
+      }
+    }
+    return text;
+  }
+
+  // RequestInit, converted as undici's webidl dictionary converter does: in
+  // member order, reading each member once.
+  function convertRequestInit(init) {
+    if (init === undefined || init === null) return { hasKey: false };
+    if (typeof init !== "object" && typeof init !== "function") {
+      let shown;
+      try {
+        shown = String(init);
+      } catch {
+        shown = "Symbol";
+      }
+      throw new TypeError(
+        `Request constructor: Expected ${shown} to be one of: Null, Undefined, Object.`,
+      );
+    }
+    const out = {};
+    const read = (key, convert) => {
+      const value = init[key];
+      if (value !== undefined) out[key] = convert(value, key);
+    };
+    const oneOf = (value, key) => {
+      const text = String(value);
+      if (!REQUEST_ENUMS[key].includes(text)) {
+        throw new TypeError(
+          `Request constructor: ${text} is not an accepted type. Expected one of ${REQUEST_ENUMS[key].join(", ")}.`,
+        );
+      }
+      return text;
+    };
+    const same = (value) => value;
+    read("method", toByteString);
+    read("headers", same);
+    read("body", same);
+    read("referrer", (value) => String(value).toWellFormed());
+    read("referrerPolicy", oneOf);
+    read("mode", oneOf);
+    read("credentials", oneOf);
+    read("cache", oneOf);
+    read("redirect", oneOf);
+    read("integrity", String);
+    read("keepalive", Boolean);
+    read("signal", same);
+    read("window", same);
+    read("duplex", oneOf);
+    read("dispatcher", same);
+    // "init has a key": decides whether a Request input's navigation state
+    // and referrer reset, and whether its headers are refilled.
+    out.hasKey = Object.keys(init).length !== 0;
+    return out;
+  }
+
+  // A signal that follows `parent`: aborted with its reason, now or later.
+  // The listener holds the follower weakly and is removed once the follower
+  // is collected, so a long-lived signal shared by many requests does not
+  // collect one listener per request (node does the same).
+  const followCleanup =
+    typeof FinalizationRegistry === "function"
+      ? new FinalizationRegistry(({ parent, listener }) => {
+          parent.removeEventListener("abort", listener);
+        })
+      : null;
+  function followSignal(parent) {
+    const controller = new AbortController();
+    if (parent === null || parent === undefined) return controller.signal;
+    if (
+      typeof parent !== "object" ||
+      typeof parent.aborted !== "boolean" ||
+      typeof parent.addEventListener !== "function"
+    ) {
+      throw new TypeError(
+        "Failed to construct 'Request': member signal is not of type AbortSignal.",
+      );
+    }
+    if (parent.aborted) {
+      controller.abort(parent.reason);
+      return controller.signal;
+    }
+    // Held through the signal, which is what the request keeps: the
+    // controller itself is unreachable once this returns.
+    const follower = controller.signal;
+    const ref = new WeakRef(follower);
+    const listener = () => ref.deref()?._fire(parent.reason);
+    parent.addEventListener("abort", listener, { once: true });
+    followCleanup?.register(follower, { parent, listener });
+    return follower;
+  }
+
+  // undici's cause for a URL that does not parse: node's URL error, whose
+  // message is "Invalid URL" alone (oam's own URL error names the input).
+  function invalidUrlCause(input) {
+    const cause = new TypeError("Invalid URL");
+    cause.code = "ERR_INVALID_URL";
+    cause.input = input;
+    return cause;
+  }
+
+  function requestState(request) {
+    const state = requestStates.get(request);
+    if (state === undefined) throw new TypeError("Illegal invocation");
+    return state;
+  }
+
+  // A copy of a Headers object's stored list, in its stored order.
+  function copyHeaders(from) {
+    const headers = new Headers();
+    for (const [name, value] of from._list) headers._list.push([name, value]);
+    return headers;
+  }
+
   if (typeof globalThis.Request !== "function") {
     class Request {
-      constructor(input, init) {
-        let url, method, headers;
-        let inherited = null;
-        if (input instanceof Request) {
-          url = input.url; method = input.method; headers = new Headers(input.headers);
-          inherited = bodyStates.get(input) ?? null;
+      constructor(input, init = undefined) {
+        if (arguments.length < 1) {
+          throw new TypeError("Request constructor: 1 argument required, but 0 found.");
+        }
+        const fromRequest = input instanceof Request;
+        if (!fromRequest) input = String(input).toWellFormed();
+        const options = convertRequestInit(init);
+        let state;
+        let signal = null;
+        let fallbackMode = null;
+        if (!fromRequest) {
+          let parsed;
+          try {
+            parsed = new URL(input);
+          } catch {
+            throw new TypeError(`Failed to parse URL from ${input}`, {
+              cause: invalidUrlCause(input),
+            });
+          }
+          if (parsed.username !== "" || parsed.password !== "") {
+            throw new TypeError(
+              `Request cannot be constructed from a URL that includes credentials: ${input}`,
+            );
+          }
+          state = {
+            url: parsed.href,
+            method: "GET",
+            headers: null,
+            mode: "no-cors",
+            credentials: "same-origin",
+            cache: "default",
+            redirect: "follow",
+            integrity: "",
+            keepalive: false,
+            referrer: "client",
+            referrerPolicy: "",
+            reloadNavigation: false,
+            historyNavigation: false,
+            dispatcher: options.dispatcher,
+          };
+          fallbackMode = "cors";
         } else {
-          url = String(input);
-          method = "GET"; headers = new Headers();
+          const source = requestState(input);
+          state = { ...source, dispatcher: options.dispatcher ?? source.dispatcher };
+          signal = source.signal;
+        }
+        if (options.window !== undefined && options.window !== null) {
+          throw new TypeError("'window' option 'client' must be null");
+        }
+        if (options.hasKey) {
+          if (state.mode === "navigate") state.mode = "same-origin";
+          state.reloadNavigation = false;
+          state.historyNavigation = false;
+          state.referrer = "client";
+          state.referrerPolicy = "";
+        }
+        if (options.referrer !== undefined) {
+          if (options.referrer === "") state.referrer = "no-referrer";
+          else {
+            let parsed;
+            try {
+              parsed = new URL(options.referrer);
+            } catch {
+              throw new TypeError(`Referrer "${options.referrer}" is not a valid URL.`, {
+                cause: invalidUrlCause(options.referrer),
+              });
+            }
+            state.referrer =
+              parsed.protocol === "about:" && parsed.hostname === "client" ? "client" : parsed.href;
+          }
+        }
+        if (options.referrerPolicy !== undefined) state.referrerPolicy = options.referrerPolicy;
+        const mode = options.mode ?? fallbackMode;
+        if (mode === "navigate") {
+          throw new TypeError("Request constructor: invalid request mode navigate.");
+        }
+        if (mode !== null) state.mode = mode;
+        if (options.credentials !== undefined) state.credentials = options.credentials;
+        if (options.cache !== undefined) state.cache = options.cache;
+        if (state.cache === "only-if-cached" && state.mode !== "same-origin") {
+          throw new TypeError("'only-if-cached' can be set only with 'same-origin' mode");
+        }
+        if (options.redirect !== undefined) state.redirect = options.redirect;
+        if (options.integrity !== undefined) state.integrity = options.integrity;
+        if (options.keepalive !== undefined) state.keepalive = options.keepalive;
+        if (options.method !== undefined) {
+          const method = options.method;
+          const upper = method.toUpperCase();
+          if (REQUEST_NORMALIZED_METHODS.has(upper)) state.method = upper;
+          else {
+            if (!HTTP_TOKEN.test(method)) {
+              throw new TypeError(`'${method}' is not a valid HTTP method.`);
+            }
+            if (REQUEST_FORBIDDEN_METHODS.has(upper)) {
+              throw new TypeError(`'${method}' HTTP method is unsupported.`);
+            }
+            state.method = method;
+          }
+          if (state.method === "patch" && !patchMethodWarned) {
+            patchMethodWarned = true;
+            globalThis.process?.emitWarning?.(
+              "Using `patch` is highly likely to result in a `405 Method Not Allowed`. `PATCH` is much more likely to succeed.",
+              { code: "UNDICI-FETCH-patch" },
+            );
+          }
+        }
+        if (options.signal !== undefined) signal = options.signal;
+        state.signal = followSignal(signal);
+        if (mode === "no-cors" && !["GET", "HEAD", "POST"].includes(state.method)) {
+          throw new TypeError(`'${state.method} is unsupported in no-cors mode.`);
+        }
+        // The input's headers carry over unless init names its own.
+        if (options.hasKey && options.headers !== undefined) {
+          state.headers = copyHeaders(new Headers(options.headers));
+        } else if (fromRequest) {
+          state.headers = copyHeaders(requestState(input).headers);
+        } else {
+          state.headers = new Headers();
+        }
+        const headers = state.headers;
+        const inputBody = fromRequest ? (bodyStates.get(input) ?? null) : null;
+        const initBody = options.body ?? null;
+        if (
+          (initBody !== null || inputBody !== null) &&
+          (state.method === "GET" || state.method === "HEAD")
+        ) {
+          throw new TypeError("Request with GET/HEAD method cannot have body.");
         }
         let body = null;
-        if (init) {
-          if (init.method) method = String(init.method).toUpperCase();
-          if (init.headers) headers = new Headers(init.headers);
-          if (init.body != null) body = init.body;
+        if (initBody !== null) {
+          if (
+            state.keepalive &&
+            typeof initBody === "object" &&
+            !(initBody instanceof globalThis.Blob) &&
+            (initBody instanceof globalThis.ReadableStream ||
+              typeof initBody[Symbol.asyncIterator] === "function")
+          ) {
+            throw new TypeError("keepalive");
+          }
+          body = extractBody(initBody, true);
+          if (body.type !== null && !headers.has("content-type")) {
+            headers.append("content-type", body.type);
+          }
         }
-        this.url = url;
-        this.method = method;
-        this.headers = headers;
-        if (body !== null) {
-          const state = initBody(this, body, headers);
-          if (state.stream !== null && init.duplex !== "half") {
+        const streamed = body ?? inputBody;
+        if (streamed !== null && streamed.kind === "stream") {
+          if (body !== null && options.duplex === undefined) {
             throw new TypeError("RequestInit: duplex option is required when sending a body.");
           }
-        } else if (inherited !== null) {
+          if (state.mode !== "same-origin" && state.mode !== "cors") {
+            throw new TypeError(
+              'If request is made from ReadableStream, mode should be "same-origin" or "cors"',
+            );
+          }
+        }
+        if (body === null && inputBody !== null) {
           // The input Request's body moves to this one, and the input reads
           // as used from here on (measured on node).
-          if (bodyUnusable(inherited)) {
+          if (bodyUnusable(inputBody)) {
             throw new TypeError(
               "Cannot construct a Request with a Request object that has already been used.",
             );
           }
-          bodyStates.set(this, { ...inherited });
-          inherited.used = true;
-          inherited.stream = null;
-        } else {
-          bodyStates.set(this, null);
+          body = { ...inputBody };
+          inputBody.used = true;
+          inputBody.stream = null;
         }
+        requestStates.set(this, state);
+        bodyStates.set(this, body);
       }
       clone() {
-        const state = bodyStates.get(this) ?? null;
+        const state = requestState(this);
+        const body = bodyStates.get(this) ?? null;
         // node's text, as it is.
-        if (state !== null && bodyUnusable(state)) throw new TypeError("unusable");
-        const copy = new Request(this.url, { method: this.method, headers: this.headers });
-        bodyStates.set(copy, cloneBody(state));
+        if (body !== null && bodyUnusable(body)) throw new TypeError("unusable");
+        const copy = Object.create(Request.prototype);
+        requestStates.set(copy, {
+          ...state,
+          headers: copyHeaders(state.headers),
+          signal: followSignal(state.signal),
+        });
+        bodyStates.set(copy, cloneBody(body));
         return copy;
       }
     }
+    const attribute = (name, get) =>
+      Object.defineProperty(Request.prototype, name, {
+        get,
+        enumerable: true,
+        configurable: true,
+      });
+    attribute("method", function method() {
+      return requestState(this).method;
+    });
+    attribute("url", function url() {
+      return requestState(this).url;
+    });
+    attribute("headers", function headers() {
+      return requestState(this).headers;
+    });
+    attribute("destination", function destination() {
+      requestState(this);
+      return "";
+    });
+    attribute("referrer", function referrer() {
+      const value = requestState(this).referrer;
+      if (value === "no-referrer") return "";
+      if (value === "client") return "about:client";
+      return value;
+    });
+    attribute("referrerPolicy", function referrerPolicy() {
+      return requestState(this).referrerPolicy;
+    });
+    attribute("mode", function mode() {
+      return requestState(this).mode;
+    });
+    attribute("credentials", function credentials() {
+      return requestState(this).credentials;
+    });
+    attribute("cache", function cache() {
+      return requestState(this).cache;
+    });
+    attribute("redirect", function redirect() {
+      return requestState(this).redirect;
+    });
+    attribute("integrity", function integrity() {
+      return requestState(this).integrity;
+    });
+    attribute("keepalive", function keepalive() {
+      return requestState(this).keepalive;
+    });
+    attribute("isReloadNavigation", function isReloadNavigation() {
+      return requestState(this).reloadNavigation;
+    });
+    attribute("isHistoryNavigation", function isHistoryNavigation() {
+      return requestState(this).historyNavigation;
+    });
+    attribute("signal", function signal() {
+      return requestState(this).signal;
+    });
+    attribute("duplex", function duplex() {
+      requestState(this);
+      return "half";
+    });
+    Object.defineProperty(Request.prototype, "clone", { enumerable: true });
     installBody(Request);
     brand(Request, "Request");
     globalThis.Request = Request;
@@ -1792,16 +2151,55 @@
     throw new TypeError("Received non-Uint8Array chunk");
   }
 
+  // fetch's own request: node's fetch begins with `new Request(input, init)`
+  // and sends what that Request holds, so a Request input is unwrapped field
+  // by field with `init` winning, every constructor check applies to a plain
+  // URL too (a GET with a body, a bad method, `mode: 'navigate'` ...), and
+  // they run before anything else -- a bad URL beats an aborted signal.
+  // Returns the url and the init oamFetch goes on with: the method, the
+  // headers in their stored order, the body (taken: a Request input reads as
+  // used, unless `init` brought its own body), the request's signal and
+  // redirect mode, and the dispatcher.
+  function fetchRequest(input, init) {
+    const request = new globalThis.Request(input, init);
+    const state = requestStates.get(request);
+    const flat = {
+      method: state.method,
+      headers: state.headers._list.map(([name, value]) => [name, value]),
+      signal: state.signal,
+      redirect: state.redirect,
+      dispatcher: state.dispatcher,
+    };
+    const body = bodyStates.get(request) ?? null;
+    if (body !== null) {
+      // The Request already put the body's content-type in its headers.
+      if (body.stream !== null) {
+        flat.body = body.stream;
+        flat.duplex = "half";
+      } else {
+        flat.body = body.text ?? body.bytes;
+      }
+      bodyStates.set(request, null);
+    }
+    // oam's own knobs (`__oamBodyStream` and the like, which tests and
+    // internal callers set) ride along untouched.
+    for (const key of Object.keys(init ?? {})) {
+      if (key.startsWith("__oam")) flat[key] = init[key];
+    }
+    return { url: state.url, init: flat };
+  }
+
   async function oamFetch(input, init, rawPayload) {
+    // Internal callers that are not fetch in node (http.request, the http2
+    // client, undici.request) opt out of every Fetch-level rule below.
+    const fetchSemantics = init?.__oamFetchSemantics !== false;
+    if (fetchSemantics) ({ url: input, init } = fetchRequest(input, init));
     init = init || {};
     const signal = init.signal;
     // Already-aborted: reject before touching the network (spec).
     if (signal?.aborted) {
       throw signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
     }
-    // Internal callers that are not fetch in node (http.request, the http2
-    // client, undici.request) opt out of every Fetch-level rule below.
-    const fetchSemantics = init.__oamFetchSemantics !== false;
     // undici's DISPATCH-level rules are a smaller set that node applies to
     // `undici.request` as well, because both build the same internal Request:
     // the five hop-by-hop header refusals and the content-length check, but
@@ -1813,47 +2211,16 @@
     // `http.request` and the http2 client set these headers legitimately in
     // node and are not subject to either set.
     const dispatchSemantics = fetchSemantics || init.__oamDispatchSemantics === true;
-    // fetch's `redirect` (RequestInit's RequestRedirect enum): the Request
-    // constructor converts init first, so a value outside the enum is
-    // refused before the URL is even parsed, with webidl's message.
-    let redirectMode;
-    if (fetchSemantics && init.redirect !== undefined) {
-      redirectMode = String(init.redirect);
-      if (redirectMode !== "follow" && redirectMode !== "manual" && redirectMode !== "error") {
-        throw new TypeError(
-          `Request constructor: ${redirectMode} is not an accepted type. Expected one of follow, manual, error.`,
-        );
-      }
-    }
+    // fetch's `redirect`, validated by the Request constructor.
+    const redirectMode = fetchSemantics ? init.redirect : undefined;
     const rawUrl = wellFormed(input);
-    if (fetchSemantics) {
-      // node parses the URL in the Request constructor, so a bad URL is a URL
-      // error and not a network failure -- the caller can tell them apart.
-      // oam reported both as `TypeError: fetch failed` with cause
-      // `Error: builder error`, which named neither.
-      let parsed;
-      try {
-        parsed = new URL(rawUrl);
-      } catch {
-        const cause = new TypeError("Invalid URL");
-        cause.code = "ERR_INVALID_URL";
-        throw new TypeError(`Failed to parse URL from ${rawUrl}`, { cause });
-      }
-      // node: `TypeError: Request cannot be constructed from a URL that
-      // includes credentials` -- nothing reaches the wire. oam converted the
-      // userinfo to `Authorization: Basic ...` and sent it, which is also
-      // inconsistent with this slice's own redirect rule (a Location with
-      // userinfo already fails as `cross origin not allowed ...`). The
-      // http.request path keeps the conversion: there the userinfo IS node's
-      // documented `auth` option.
-      if (parsed.username !== "" || parsed.password !== "") {
-        throw new TypeError(
-          `Request cannot be constructed from a URL that includes credentials: ${rawUrl}`,
-        );
-      }
-      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-        throw new TypeError("fetch failed", { cause: new Error("unknown scheme") });
-      }
+    // The Request constructor has parsed the URL and refused userinfo (node's
+    // `Request cannot be constructed from a URL that includes credentials`;
+    // the http.request path keeps turning userinfo into Basic credentials,
+    // as there it IS node's documented `auth` option). What is left is the
+    // scheme, which node checks when it fetches.
+    if (fetchSemantics && !/^https?:/i.test(rawUrl)) {
+      throw new TypeError("fetch failed", { cause: new Error("unknown scheme") });
     }
     let headers = [];
     if (init.headers) {

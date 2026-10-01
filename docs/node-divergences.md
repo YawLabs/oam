@@ -1570,6 +1570,17 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   response; and when a fetch with a streamed body is aborted or its connection drops, oam
   cancels the source stream (with the abort reason or the failure), as the Fetch Standard
   says, where Node neither cancels it nor stops pulling it.
+- **`Request` options oam keeps but does not act on.** `mode`, `credentials`, `cache`,
+  `integrity`, `keepalive`, `referrer` and `referrerPolicy` are validated and read back as in
+  Node (#180), but three of them change what Node's `fetch` does and not what oam's does:
+  `cache: 'no-store'` / `'reload'` add `pragma: no-cache` and `cache-control: no-cache`, and
+  `'no-cache'` adds `cache-control: max-age=0`; an `integrity` value is checked against the
+  response body (a mismatch fails the fetch with cause `integrity mismatch`) where oam
+  ignores it; and a `referrer` URL is sent as `referer`, cut down by the referrer policy
+  (Node sends `http://b.test/` for a cross-origin `http://b.test/x?y`, the full URL for a
+  same-origin one or under `unsafe-url`). `credentials`, `keepalive` and `mode` change
+  nothing in either, apart from `sec-fetch-mode` (below). `mode: 'no-cors'` does not drop
+  headers in either runtime.
 - **The request header count is capped.** More than 24,576 distinct header names (fewer if
   the header table's hash-flooding defence rebuilds it) fails with
   `fetch: too many request headers`; Node has no cap (25,000 distinct names get a 200).
@@ -1612,11 +1623,14 @@ an error where oam used to send something)
   a `TypeError` cause carrying `code` `ERR_INVALID_URL`; a non-`http(s)` scheme rejects with
   the cause `Error: unknown scheme`. Both used to be `TypeError: fetch failed` with the cause
   `Error: builder error`, which named neither.
-- A `Request` object as the first argument is NOT a supported input (it never was): the
-  argument is stringified, so `fetch(new Request(url))` throws
-  `TypeError: Failed to parse URL from [object Request]`. A string or a `URL` works. This is
-  a gap rather than a refusal -- it is loud, it loses nothing, and half-supporting it (the
-  url and method but not the body) would be worse than throwing. Tracked as a follow-up.
+- Everything the `Request` constructor refuses, because `fetch` builds its request through it
+  as Node's does (#180): a `GET` or `HEAD` with a body (`Request with GET/HEAD method cannot
+  have body.`), a method that is not a token or is `CONNECT` / `TRACE` / `TRACK`, a
+  `RequestInit` enum value outside its list, `mode: 'navigate'`, a streamed body without
+  `duplex: 'half'`, and a re-used `Request` whose body was already read (`Cannot construct a
+  Request with a Request object that has already been used.`). These checks run before an
+  aborted signal is looked at. A `Request` as the first argument is unwrapped field by field
+  with `init` winning, its body is sent, and its signal and redirect mode apply.
 - `transfer-encoding`, `keep-alive`, `upgrade`, `expect`, and a `connection` whose value is
   neither `close` nor `keep-alive` (case-insensitively -- `close, transfer-encoding`, the
   CL.TE evasion, is the one that matters) are refused with undici's texts
