@@ -1874,9 +1874,21 @@ bytes, `writeHead()`'s headers showed in `getHeader()`, a later `statusCode` was
 status message -- `statusMessage`, or `writeHead()`'s reason, in the head's bytes -- where
 oam used to send the standard reason phrase whatever the message said (and hyper's spelling
 of it: `I'm a teapot` for Node's `I'm a Teapot`, `<none>` for Node's `unknown`).
+An HTTP/1.0 request's response is Node's too: `req.httpVersion` (and `httpVersionMajor` /
+`httpVersionMinor`) say `1.0`; the status line says `HTTP/1.1`; `Connection: close` is sent
+unless the handler set a connection header; a body is ended by closing the connection
+(`end('text')` sends no `content-length`) unless the request sent `TE: chunked`, which gets
+the chunked body -- and its trailers -- an HTTP/1.1 client would; a `transfer-encoding` header
+the handler sets is honoured; and a `Trailer` header on a body that cannot be chunked (there,
+on a 204, or beside a `content-length`) throws `ERR_HTTP_TRAILER_INVALID` from whatever builds
+the head, as Node's does (`vendor/hyper-1.10.1/OAM-PATCH.md` item 13 has the hyper side). Up
+to 0.17.1 `req.httpVersion` was always `'1.1'`, the status line said `HTTP/1.0`, no
+`Connection` header went out, `end('text')` sent a `content-length`, a `TE: chunked` client
+got no chunks and a `Trailer` header never threw.
 `conformance/cases/250-http-response-header-validation.mjs`,
-`251-http-response-header-bytes.mjs`, `266-http-writehead-builds-the-head.mjs` and
-`267-http-response-reason-phrase.mjs` hold this to node v22.22.2. What still differs:
+`251-http-response-header-bytes.mjs`, `266-http-writehead-builds-the-head.mjs`,
+`267-http-response-reason-phrase.mjs`, `268-http-response-trailers.mjs` and
+`269-http-response-http10.mjs` hold this to node v22.22.2. What still differs:
 
 - **A body Node ends by closing the connection is chunked over HTTP/1.1.** With its
   `transfer-encoding` header removed (`res.removeHeader('transfer-encoding')`) and no length
@@ -1895,16 +1907,10 @@ of it: `I'm a teapot` for Node's `I'm a Teapot`, `<none>` for Node's `unknown`).
   UTF-8 of U+FFFD after `res.end('text')`, and as `caf\xfd` after `res.end(buffer)`, and
   `writeHead()` refuses it (`ERR_INVALID_CHAR`) when a `content-length` comes before it. oam
   writes it as any other header value (`caf\xc3\xa9`, `caf\xe9`).
-- **An HTTP/1.0 request's response is framed by hyper.** `req.httpVersion` (and
-  `httpVersionMajor` / `httpVersionMinor`) say `1.0` as Node's do, and the header bytes follow
-  Node's framing for it -- a head joined to a UTF-8 string body, from `write('text')` as well
-  as `end('text')`, is UTF-8. But the status line says `HTTP/1.0` where Node's says
-  `HTTP/1.1`; `end('text')` adds a `content-length` where Node closes the connection to end
-  the body; a request saying `TE: chunked` does not get the chunked body Node sends it; and a
-  `Trailer` header does not throw `ERR_HTTP_TRAILER_INVALID` as it does in Node, which cannot
-  chunk the response. Up to 0.17.1 `req.httpVersion` was always `'1.1'` and the server request
-  had no `httpVersionMajor` / `httpVersionMinor`, so such a head went out one byte per code
-  point.
+- **A refused head's `content-length` is not reused.** When `writeHead()` throws (a
+  `Trailer` header beside a `content-length`), Node keeps the length it read and sends it
+  with the next head that does not name one, whatever the body's length; oam sends the
+  body's length (hyper's), which is what the body is.
 - **Header names go out lowercased**, as hyper writes them; Node keeps the case they were
   set in, and writes the ones it adds as `Content-Length`, `Transfer-Encoding`, `Date`,
   `Connection`.

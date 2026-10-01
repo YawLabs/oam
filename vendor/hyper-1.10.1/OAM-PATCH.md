@@ -4,8 +4,9 @@ This directory is hyper **1.10.1** as published on crates.io, plus a fix
 for a client hang (items 1-3 below), one server extension (item 4), and
 four stricter rules in the chunked-body decoder (items 5 to 8), a
 CONNECT request read without a body (item 9), the `host` field kept out
-of an HTTP/2 request (item 10), an on-demand header buffer (item 11), and a
-server response's trailers sent as node sends them (item 12). The root
+of an HTTP/2 request (item 10), an on-demand header buffer (item 11), a
+server response's trailers sent as node sends them (item 12), and an
+HTTP/1.0 request's response framed as node frames it (item 13). The root
 `Cargo.toml` swaps it in with `[patch.crates-io]`.
 
 - **Upstream:** `hyper-1.10.1.crate`, sha256
@@ -23,8 +24,9 @@ server response's trailers sent as node sends them (item 12). The root
   the unsafe-budget scan. After an edit here, `scripts/check-vendor.sh
   --regen` rewrites the diff; review it and commit it with the edit.
 - **Remove it when** a hyper release ships the fix and items 5 to 10, **and**
-  oam no longer needs item 4 (see "The request-head extension" below for what
-  replacing it takes). To do that:
+  oam no longer needs items 4 and 11 to 13 (see "The request-head extension"
+  below for what replacing item 4 takes; items 12 and 13 are node's rules,
+  which hyper has no reason to adopt). To do that:
   1. Delete this directory.
   2. Delete the `[patch.crates-io]` entry and the `exclude = ["vendor"]` line
      from the root `Cargo.toml`.
@@ -121,6 +123,13 @@ whole of it.
     client uses now, are built for `client` (and tests). The crate's
     `chunked_with_no_trailer_header` test now expects the fields. See
     "Response trailers" below.
+13. **`src/proto/h1/role.rs`, `Server::encode` and
+    `Server::encode_headers`, an HTTP/1.0 request's response.** The status
+    line says `HTTP/1.1` whatever the request's version (one match arm), and
+    a response's own `Transfer-Encoding` and `Trailer` headers are honoured
+    for an HTTP/1.0 peer as for an HTTP/1.1 one (the version half of two
+    `can_chunked` checks goes). A body with neither header still ends by
+    closing the connection for a 1.0 peer. See "HTTP/1.0 peers" below.
 
 ## Why
 
@@ -439,6 +448,33 @@ Tested by conformance case 268 (identical to node v22.22.2; fails on stock
 1.10.1) and the crate's `chunked_with_no_trailer_header`. hyper 1.11.0 keeps
 the `TE: trailers` gate and the declared-fields filter (checked 2026-10-01;
 1.11.1 was not checked).
+
+## HTTP/1.0 peers (item 13)
+
+hyper answers an HTTP/1.0 request in HTTP/1.0 (`Conn::enforce_version`
+sets the response's version to the peer's) and, for such a peer, drops a
+response's `Transfer-Encoding` and `Trailer` headers and ends any body of
+unknown length by closing the connection. node's http server always writes
+`HTTP/1.1` -- RFC 9110 2.5 has a server send the highest version it speaks
+-- and frames an HTTP/1.0 client's response by its own rules: by closing
+the connection by default, but chunked when the request sent `TE: chunked`
+or the handler set `Transfer-Encoding: chunked` itself, with the `Trailer`
+header and the trailers that go with it.
+
+With the patch the status line says `HTTP/1.1` for every response, and a
+`Transfer-Encoding` (or `Trailer`) header the response carries is honoured
+for a 1.0 peer: hyper chunks the body. Nothing else moves: the response's
+version stays the peer's for every other decision (keep-alive is still off
+for a 1.0 peer that did not ask for it, and a body of unknown length with no
+such header still ends by closing), and the decoder, which refuses a 1.0
+*request* carrying `Transfer-Encoding`, is untouched. oam's node:http
+`ServerResponse` adds `Transfer-Encoding: chunked` itself where node would
+chunk for a 1.0 client; `oam.serve` and the http2 compat server change only
+in the status line's version (and honour a `Transfer-Encoding` header a
+handler sets for a 1.0 client).
+
+Tested by conformance case 269 (identical to node v22.22.2; fails on stock
+1.10.1). hyper 1.11.0 is unchanged here (checked 2026-10-01).
 
 ## Upstream status (checked 2026-09-18)
 

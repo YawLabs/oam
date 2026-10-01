@@ -894,6 +894,11 @@
   codes.ERR_HTTP_INVALID_STATUS_CODE = E("ERR_HTTP_INVALID_STATUS_CODE", RangeError, function(code) {
     return 'Invalid status code: ' + code;
   });
+  // A Trailer header on a message whose body is not chunked: nowhere for
+  // the trailers it announces to go.
+  codes.ERR_HTTP_TRAILER_INVALID = E("ERR_HTTP_TRAILER_INVALID", Error, function() {
+    return 'Trailers are invalid with this transfer encoding';
+  });
   codes.ERR_STREAM_PREMATURE_CLOSE = E("ERR_STREAM_PREMATURE_CLOSE", Error, function() {
     return 'Premature close';
   });
@@ -17843,11 +17848,15 @@
         let contLen = false;
         let te = false;
         let trailer = false;
+        let connection = false;
         this._chunked = false;
         const note = (name, value) => {
           fields.push([name, String(value)]);
           if (name.length < 4 || name.length > 17) return;
           switch (name.toLowerCase()) {
+            case "connection":
+              connection = true;
+              break;
             case "transfer-encoding":
               te = true;
               this._removedTE = false;
@@ -17874,12 +17883,16 @@
         }
         const code = this.statusCode;
         const req = this.req;
-        const hasBody = !(req && req.method === "HEAD") && code !== 204 && code !== 304 &&
-          !(code >= 100 && code <= 199);
+        // node's _hasBody: false for a HEAD request, and turned false -- for
+        // good, even by a writeHead() that then throws -- by a 204, 304 or
+        // 1xx status.
+        if (this._hasBody === undefined) this._hasBody = !(req && req.method === "HEAD");
+        if (code === 204 || code === 304 || (code >= 100 && code <= 199)) this._hasBody = false;
+        const hasBody = this._hasBody;
+        const http10 = Boolean(req && req.httpVersion === "1.0");
         // node's useChunkedEncodingByDefault: false for an HTTP/1.0 client
         // that did not send `TE: chunked`.
-        const chunksByDefault = !(req && req.httpVersion === "1.0") ||
-          CHUNKED_CODING.test(req.headers && req.headers.te);
+        const chunksByDefault = !http10 || CHUNKED_CODING.test(req.headers && req.headers.te);
         // Whether the native side is handed the body with its length known
         // up front (hyper sends a content-length, or nothing for a body that
         // cannot have one), or not (hyper chunks it, or ends it by closing
@@ -17899,7 +17912,18 @@
           sized = !te;
         }
         if (this._chunked && (code === 204 || code === 304)) this._chunked = false;
-        this._hasBody = hasBody;
+        // A Trailer header announces trailers, which only a chunked body
+        // can carry: node refuses the head (an HTTP/1.0 client's without
+        // `TE: chunked`, a 204's, one with a content-length, ...).
+        if (trailer && !this._chunked) throw codes.ERR_HTTP_TRAILER_INVALID();
+        if (http10) {
+          // node does not keep an HTTP/1.0 client's connection, and says so
+          // when the handler did not. hyper closes it without a word.
+          if (!connection) fields.push(["Connection", "close"]);
+          // node chunks for an HTTP/1.0 client that sent `TE: chunked`;
+          // hyper does that only for a response that says so itself.
+          if (this._chunked && !te) fields.push(["Transfer-Encoding", "chunked"]);
+        }
         this._sizedBody = sized;
         this._headStatus = code;
         // The status line's reason phrase is the message as it stands now,

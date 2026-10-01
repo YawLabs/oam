@@ -437,7 +437,10 @@ impl Http1Transaction for Server {
             extend(dst, b"HTTP/1.1 200 OK\r\n");
         } else {
             match msg.head.version {
-                Version::HTTP_10 => extend(dst, b"HTTP/1.0 "),
+                // oam patch: a response to an HTTP/1.0 request says
+                // HTTP/1.1, the version the server speaks (RFC 9110 2.5), as
+                // node's does; its framing still follows the 1.0 peer.
+                Version::HTTP_10 => extend(dst, b"HTTP/1.1 "),
                 Version::HTTP_11 => extend(dst, b"HTTP/1.1 "),
                 Version::HTTP_2 => {
                     debug!("response with HTTP2 version coerced to HTTP/1.1");
@@ -821,9 +824,11 @@ impl Server {
                         return Err(crate::Error::new_user_header());
                     }
                     // check that we actually can send a chunked body...
-                    if msg.head.version == Version::HTTP_10
-                        || !Server::can_chunked(msg.req_method, msg.head.subject)
-                    {
+                    // oam patch: to an HTTP/1.0 peer too, when the response
+                    // says it is chunked, as node's http module does (for a
+                    // 1.0 request that sent `TE: chunked`, or a handler that
+                    // set the header).
+                    if !Server::can_chunked(msg.req_method, msg.head.subject) {
                         continue;
                     }
                     wrote_len = true;
@@ -869,9 +874,9 @@ impl Server {
                 }
                 header::TRAILER => {
                     // check that we actually can send a chunked body...
-                    if msg.head.version == Version::HTTP_10
-                        || !Server::can_chunked(msg.req_method, msg.head.subject)
-                    {
+                    // oam patch: an HTTP/1.0 peer's chunked response (see
+                    // TRANSFER_ENCODING) announces its trailers too.
+                    if !Server::can_chunked(msg.req_method, msg.head.subject) {
                         continue;
                     }
 
