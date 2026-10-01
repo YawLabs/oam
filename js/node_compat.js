@@ -1267,6 +1267,9 @@
   codes.ERR_UNHANDLED_ERROR = E("ERR_UNHANDLED_ERROR", Error, function(err) {
     return err === undefined ? 'Unhandled error.' : 'Unhandled error. (' + err + ')';
   });
+  codes.ERR_HTTP_INVALID_STATUS_CODE = E("ERR_HTTP_INVALID_STATUS_CODE", RangeError, function(code) {
+    return 'Invalid status code: ' + code;
+  });
   codes.ERR_STREAM_PREMATURE_CLOSE = E("ERR_STREAM_PREMATURE_CLOSE", Error, function() {
     return 'Premature close';
   });
@@ -18497,7 +18500,18 @@
         meta = meta || {};
         this.method = meta.method;
         this.url = meta.uri;
-        this.httpVersion = "1.1";
+        // The request line's version: the accept record names it only when
+        // it is not 1.1. The response frames its body by it, as node's does
+        // (an HTTP/1.0 client gets no chunked body).
+        if (meta.httpVersion === "1.0") {
+          this.httpVersion = "1.0";
+          this.httpVersionMajor = 1;
+          this.httpVersionMinor = 0;
+        } else {
+          this.httpVersion = "1.1";
+          this.httpVersionMajor = 1;
+          this.httpVersionMinor = 1;
+        }
         this.headers = {};
         this.rawHeaders = [];
         for (const [name, value] of meta.headers || []) {
@@ -18693,37 +18707,233 @@
         // finish emission), where Node reports false.
         return this._ended && !(this.closed && !this._finished);
       }
+      // The header methods check what node's OutgoingMessage checks, in its
+      // order, with its errors: a head already sent (ERR_HTTP_HEADERS_SENT),
+      // a name that is not a token (ERR_INVALID_HTTP_TOKEN), an undefined
+      // value (ERR_HTTP_INVALID_HEADER_VALUE), and a value holding a control
+      // character or a code point above U+00FF (ERR_INVALID_CHAR) -- one
+      // the head cannot carry, since it goes out one byte per code point.
+      // They used to store anything, and a value like `€` went out as its
+      // UTF-8 bytes.
       setHeader(name, value) {
-        this._headers.set(String(name).toLowerCase(), value);
+        if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("set");
+        checkOutgoingHeader(name, value);
+        this._progressive = true;
+        this._headers.set(name.toLowerCase(), value);
+        return this;
+      }
+      // node's appendHeader: the first value of a name is set as it is; a
+      // later one turns the stored value into a list and joins it (a list
+      // given is spread into it).
+      appendHeader(name, value) {
+        if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("append");
+        checkOutgoingHeader(name, value);
+        this._progressive = true;
+        const key = name.toLowerCase();
+        if (!this._headers.has(key)) {
+          this._headers.set(key, value);
+        } else {
+          const existing = this._headers.get(key);
+          const list = Array.isArray(existing) ? existing : [existing];
+          if (Array.isArray(value)) list.push(...value);
+          else list.push(value);
+          this._headers.set(key, list);
+        }
+        return this;
+      }
+      // node's setHeaders(Headers | Map): each entry through setHeader(),
+      // the set-cookie values gathered into one list.
+      setHeaders(headers) {
+        if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("set");
+        if (
+          !headers ||
+          Array.isArray(headers) ||
+          typeof headers.keys !== "function" ||
+          typeof headers.get !== "function"
+        ) {
+          throw codes.ERR_INVALID_ARG_TYPE("headers", ["Headers", "Map"], headers);
+        }
+        let cookies = null;
+        for (const { 0: key, 1: value } of headers) {
+          if (key === "set-cookie") {
+            cookies ??= [];
+            if (Array.isArray(value)) cookies.push(...value);
+            else cookies.push(value);
+            continue;
+          }
+          this.setHeader(key, value);
+        }
+        if (cookies !== null) this.setHeader("set-cookie", cookies);
         return this;
       }
       getHeader(name) {
-        return this._headers.get(String(name).toLowerCase());
+        checkHeaderNameArg(name);
+        return this._headers.get(name.toLowerCase());
       }
       getHeaderNames() {
         return [...this._headers.keys()];
       }
       removeHeader(name) {
-        this._headers.delete(String(name).toLowerCase());
+        checkHeaderNameArg(name);
+        if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("remove");
+        const key = name.toLowerCase();
+        // node remembers these two: with content-length removed it frames
+        // the body chunked, and with both removed it frames it by closing.
+        if (key === "content-length") this._removedContLen = true;
+        else if (key === "transfer-encoding") this._removedTE = true;
+        this._headers.delete(key);
       }
       hasHeader(name) {
-        return this._headers.has(String(name).toLowerCase());
+        checkHeaderNameArg(name);
+        return this._headers.has(name.toLowerCase());
       }
+      // node's writeHead(statusCode[, statusMessage][, headers]). Headers
+      // given to a response no header method has touched are node's fast
+      // path: every one is checked before any is kept, a list of pairs
+      // ([[name, value], ...]) is taken too, and an empty name is refused.
+      // Otherwise they go through setHeader() (an object) or, a flat list,
+      // removeHeader() then appendHeader(), keeping those before a refusal
+      // and skipping an empty name, as node's do.
       writeHead(status, message, headers) {
-        if (typeof message === "object" && message !== null) {
-          headers = message;
-          message = undefined;
+        if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("write");
+        const code = status | 0;
+        if (code < 100 || code > 999) throw codes.ERR_HTTP_INVALID_STATUS_CODE(status);
+        if (typeof message === "string") {
+          this.statusMessage = message;
+        } else {
+          this.statusMessage ||= httpExports.STATUS_CODES[code] || "unknown";
+          headers ??= message;
         }
-        this.statusCode = status;
-        if (message) this.statusMessage = message;
-        if (headers) {
+        this.statusCode = code;
+        if (this._progressive) {
           if (Array.isArray(headers)) {
-            for (let i = 0; i + 1 < headers.length; i += 2) this.setHeader(headers[i], headers[i + 1]);
+            if (headers.length % 2 !== 0) throw codes.ERR_INVALID_ARG_VALUE("headers", headers);
+            for (let n = 0; n < headers.length; n += 2) this.removeHeader(headers[n]);
+            for (let n = 0; n < headers.length; n += 2) {
+              if (headers[n]) this.appendHeader(headers[n], headers[n + 1]);
+            }
+          } else if (headers) {
+            for (const key of Object.keys(headers)) {
+              if (key) this.setHeader(key, headers[key]);
+            }
+          }
+          checkStatusMessage(this.statusMessage);
+        } else {
+          checkStatusMessage(this.statusMessage);
+          if (headers) this._storeGivenHeaders(headers);
+        }
+        // node builds the head here: from now on headersSent is true and
+        // every header method, writeHead() included, throws
+        // ERR_HTTP_HEADERS_SENT. A writeHead() that threw above built
+        // nothing, as in node. oam still sends the head with the first
+        // body bytes or end() (docs/node-divergences.md), but nothing can
+        // change it in between: a second writeHead() used to add its
+        // headers to the first one's, and two content-lengths reached hyper.
+        this._wroteHead = true;
+        this.headersSent = true;
+        return this;
+      }
+      // writeHead()'s fast path (node's _storeHeader over the object it was
+      // given): check all, then keep all. It runs only on a response no
+      // header method has touched and whose head is not built, so the store
+      // is empty: a name repeated here was given twice in this call, and is
+      // kept as a list, as it goes out.
+      _storeGivenHeaders(headers) {
+        const pairs = [];
+        if (Array.isArray(headers)) {
+          if (headers.length && Array.isArray(headers[0])) {
+            for (const entry of headers) pairs.push(entry[0], entry[1]);
           } else {
-            for (const key of Object.keys(headers)) this.setHeader(key, headers[key]);
+            if (headers.length % 2 !== 0) throw codes.ERR_INVALID_ARG_VALUE("headers", headers);
+            for (const item of headers) pairs.push(item);
+          }
+        } else {
+          for (const key in headers) {
+            if (Object.hasOwn(headers, key)) pairs.push(key, headers[key]);
           }
         }
-        return this;
+        for (let n = 0; n < pairs.length; n += 2) checkStoredHeader(pairs[n], pairs[n + 1]);
+        for (let n = 0; n < pairs.length; n += 2) {
+          const key = pairs[n].toLowerCase();
+          const existing = this._headers.get(key);
+          if (existing === undefined) this._headers.set(key, pairs[n + 1]);
+          else this._headers.set(key, [].concat(existing, pairs[n + 1]));
+        }
+      }
+      // node's addTrailers: each name a token ('Trailer name'), each value
+      // free of what a header value may not hold ('trailer content'); a
+      // later call replaces an earlier one. oam does not send response
+      // trailers yet (docs/node-divergences.md).
+      addTrailers(headers) {
+        const trailers = [];
+        const isArray = Array.isArray(headers);
+        for (const key of Object.keys(headers)) {
+          const field = isArray ? headers[key][0] : key;
+          let value = isArray ? headers[key][1] : headers[key];
+          validateHeaderName(field, "Trailer name");
+          if (Array.isArray(value) && value.length > 1) {
+            for (const item of value) {
+              if (INVALID_HEADER_CHAR.test(item)) throw invalidChar("trailer content", field);
+              trailers.push([field, String(item)]);
+            }
+          } else {
+            if (Array.isArray(value)) value = value.join("; ");
+            if (INVALID_HEADER_CHAR.test(value)) throw invalidChar("trailer content", field);
+            trailers.push([field, String(value)]);
+          }
+        }
+        this._trailers = trailers;
+      }
+      // What node's implicit writeHead(this.statusCode) checks when the
+      // head goes out without an explicit one, and the status message it
+      // fills in.
+      _implicitHead() {
+        if (this._wroteHead) return;
+        const code = this.statusCode | 0;
+        if (code < 100 || code > 999) throw codes.ERR_HTTP_INVALID_STATUS_CODE(this.statusCode);
+        this.statusMessage ||= httpExports.STATUS_CODES[code] || "unknown";
+        checkStatusMessage(this.statusMessage);
+      }
+      // Whether node writes this response's head as UTF-8, where it
+      // otherwise writes it one byte per code point (latin1), measured on
+      // node v22.22.2. node keeps the head as a string and sends it joined
+      // to the first thing written after it (OutgoingMessage#_send). Joined
+      // to a string body in utf8 or no encoding, the head goes out in that
+      // string's encoding, UTF-8; before a chunk-size line, a Buffer, a
+      // string in another encoding, or nothing at all, it goes out as
+      // latin1. So `café` set with setHeader() reaches the wire as
+      // caf\xc3\xa9 from res.end('text') or flushHeaders(), and as caf\xe9
+      // from res.end(buffer), res.end(), a chunked res.write('text'), a
+      // HEAD request or a 204. `chunk` and `encoding` are the first write's
+      // (or end()'s); `fromEnd` says it is end()'s.
+      _headIsUtf8(chunk, encoding, fromEnd) {
+        const req = this.req;
+        const status = this.statusCode;
+        // node's _hasBody: nothing written goes out, end() sends ''.
+        if ((req && req.method === "HEAD") || status === 204 || status === 304 ||
+            (status >= 100 && status <= 199)) {
+          return false;
+        }
+        if (fromEnd && !chunk) return false;
+        if (typeof chunk !== "string" || (encoding && encoding !== "utf8")) return false;
+        if (chunk.length === 0) return true;
+        return !this._nodeFramesChunked(fromEnd);
+      }
+      // node's choice of chunked framing (_storeHeader), which puts a
+      // chunk-size line ahead of the first body bytes.
+      _nodeFramesChunked(fromEnd) {
+        const te = this._headers.get("transfer-encoding");
+        if (te !== undefined) return CHUNKED_CODING.test(te);
+        if (this._headers.has("content-length")) return false;
+        const req = this.req;
+        if (req && req.httpVersion === "1.0" && !CHUNKED_CODING.test(req.headers && req.headers.te)) {
+          return false;
+        }
+        // end() before any head knows the length, and node sends it.
+        if (fromEnd && !this._wroteHead && !this._removedContLen && !this._headers.has("trailer")) {
+          return false;
+        }
+        return !this._removedTE;
       }
       _headerPairsJson() {
         const pairs = [];
@@ -18748,6 +18958,50 @@
           { code: "ERR_INVALID_ARG_TYPE" },
         );
       }
+      // Send the head and open the body stream; false when the exchange is
+      // already gone. `utf8Head` is _headIsUtf8()'s answer: the native side
+      // writes each header value as its UTF-8, or one byte per code point.
+      _startStream(utf8Head) {
+        this.headersSent = true;
+        this._streamId = natives.httpRespondStream(
+          this._requestId,
+          this.statusCode,
+          this._headerPairsJson(),
+          !utf8Head,
+        ) ?? null;
+        if (this._streamId === null) {
+          // Exchange already gone (req.destroy() aborted it, or the
+          // request was answered elsewhere): Node's post-abort write is
+          // a soft failure, never a synchronous throw. Surface the
+          // premature close once; the caller errors its callback async.
+          // Reap the request body too -- the engine keeps a dispatched
+          // streamed body alive for JS, and this branch is the only
+          // notification JS gets that the exchange is dead.
+          if (!this.closed) {
+            this.closed = true;
+            this._dumpReq();
+            queueMicrotask(() => this.emit("close"));
+          }
+          return false;
+        }
+        // Watch for hyper dropping the response body: on the client
+        // tearing the connection down mid-stream, an unfinished response
+        // surfaces Node's 'close'-without-'finish' shape (eos/pipeline
+        // map it to ERR_STREAM_PREMATURE_CLOSE). Normal completion
+        // resolves the watcher too -- the _finished guard no-ops it.
+        const watchedId = this._streamId;
+        natives.httpStreamClosed(watchedId).then(() => {
+          if (this._finished || this.closed) return;
+          this.closed = true;
+          natives.httpBodyEnd(watchedId);
+          // The connection died mid-response: reap an unconsumed request
+          // body too, or its pump outlives the exchange (the engine keeps
+          // streamed bodies alive once a response is in flight).
+          this._dumpReq();
+          this.emit("close");
+        }, () => {});
+        return true;
+      }
       write(chunk, encoding, cb) {
         if (typeof encoding === "function") {
           cb = encoding;
@@ -18771,25 +19025,8 @@
         if (this._ended) return false;
         const bytes = this._toBytes(chunk, encoding);
         if (this._streamId === null) {
-          this.headersSent = true;
-          this._streamId = natives.httpRespondStream(
-            this._requestId,
-            this.statusCode,
-            this._headerPairsJson(),
-          ) ?? null;
-          if (this._streamId === null) {
-            // Exchange already gone (req.destroy() aborted it, or the
-            // request was answered elsewhere): Node's post-abort write is
-            // a soft failure, never a synchronous throw. Surface the
-            // premature close once and error the callback async. Reap the
-            // request body too -- the engine keeps a dispatched streamed
-            // body alive for JS, and this branch is the only notification
-            // JS gets that the exchange is dead.
-            if (!this.closed) {
-              this.closed = true;
-              this._dumpReq();
-              queueMicrotask(() => this.emit("close"));
-            }
+          this._implicitHead();
+          if (!this._startStream(this._headIsUtf8(chunk, encoding, false))) {
             if (cb) {
               const err = Object.assign(
                 new Error("Cannot call write after a stream was destroyed"),
@@ -18799,22 +19036,6 @@
             }
             return false;
           }
-          // Watch for hyper dropping the response body: on the client
-          // tearing the connection down mid-stream, an unfinished response
-          // surfaces Node's 'close'-without-'finish' shape (eos/pipeline
-          // map it to ERR_STREAM_PREMATURE_CLOSE). Normal completion
-          // resolves the watcher too -- the _finished guard no-ops it.
-          const watchedId = this._streamId;
-          natives.httpStreamClosed(watchedId).then(() => {
-            if (this._finished || this.closed) return;
-            this.closed = true;
-            natives.httpBodyEnd(watchedId);
-            // The connection died mid-response: reap an unconsumed request
-            // body too, or its pump outlives the exchange (the engine keeps
-            // streamed bodies alive once a response is in flight).
-            this._dumpReq();
-            this.emit("close");
-          }, () => {});
         }
         // SERIALIZE: each push chains on the previous one. Independent
         // unawaited ops raced (chunks reordered, dropped, and end() pulled
@@ -18859,13 +19080,16 @@
         if (this._ended) return this;
         if (this._streamId === null) {
           // Single-shot: full body, hyper sets content-length.
+          const bytes = this._toBytes(chunk, encoding);
+          this._implicitHead();
           this._ended = true;
           this.headersSent = true;
           natives.httpRespond(
             this._requestId,
             this.statusCode,
             this._headerPairsJson(),
-            this._toBytes(chunk, encoding),
+            bytes,
+            !this._headIsUtf8(chunk, encoding, true),
           );
           queueMicrotask(() => {
             if (this.closed) {
@@ -18940,9 +19164,14 @@
         if (req._consuming || (rs && rs.resumeScheduled)) return;
         req._dump();
       }
+      // node sends the head joined to an empty string in no encoding: as
+      // UTF-8, whatever follows.
       flushHeaders() {
         if (this._mock) return;
-        if (this._streamId === null && !this._ended) this.write(new Uint8Array(0));
+        if (this._streamId === null && !this._ended) {
+          this._implicitHead();
+          this._startStream(true);
+        }
       }
       assignSocket(socket) {
         // Mock/inject consumers (light-my-request) hand us a throwaway Writable
@@ -20982,15 +21211,22 @@
         this._headers[key] = value;
         return this;
       }
-      getHeader(name) { return this._headers[name.toLowerCase()]; }
+      getHeader(name) {
+        checkHeaderNameArg(name);
+        return this._headers[name.toLowerCase()];
+      }
       removeHeader(name) {
+        checkHeaderNameArg(name);
         var key = name.toLowerCase();
         // node: a removed Connection header is not sent at all.
         if (key === "connection") this._removedConnection = true;
         delete this._headers[key];
       }
       getHeaders() { return Object.assign({}, this._headers); }
-      hasHeader(name) { return name.toLowerCase() in this._headers; }
+      hasHeader(name) {
+        checkHeaderNameArg(name);
+        return name.toLowerCase() in this._headers;
+      }
       // The request head as it goes on the wire: the request line, every
       // header line, and the blank line that ends it -- node's `_header`.
       _renderHead() {
@@ -23574,21 +23810,35 @@
       err.code = "ERR_INVALID_HTTP_TOKEN";
       return err;
     }
-    function invalidHeaderChar(name) {
-      var err = new TypeError("Invalid character in header content [\"" + name + "\"]");
+    // node's ERR_INVALID_CHAR: `Invalid character in <what>[ ["<field>"]]`.
+    function invalidChar(what, field) {
+      var err = new TypeError("Invalid character in " + what + (field !== undefined ? " [\"" + field + "\"]" : ""));
       err.code = "ERR_INVALID_CHAR";
       return err;
     }
-    // node's OutgoingMessage setHeader() checks (lib/_http_outgoing.js
-    // validateHeaderName / validateHeaderValue): a name that is not a token,
-    // an undefined value, and a value carrying a character no header may --
-    // a control character, or one above U+00FF, which latin1 cannot carry --
-    // are refused before anything is sent (#174). oam sent the last as its
-    // UTF-8 bytes.
-    function checkOutgoingHeader(name, value) {
+    function invalidHeaderChar(name) {
+      return invalidChar("header content", name);
+    }
+    // node's writeHead check of the reason phrase it is about to send.
+    function checkStatusMessage(message) {
+      if (INVALID_HEADER_CHAR.test(message)) throw invalidChar("statusMessage");
+    }
+    // node's `chunked` test of a transfer-encoding value (RE_TE_CHUNKED,
+    // and chunkExpression for a request's TE).
+    var CHUNKED_CODING = /(?:^|\W)chunked(?:$|\W)/i;
+    // node's validateHeaderName / validateHeaderValue (lib/_http_outgoing.js),
+    // exported as http.validateHeaderName / http.validateHeaderValue and run
+    // by every outgoing header method, client and server: a name that is not
+    // a token, an undefined value, and a value carrying a character no
+    // header may -- a control character, or one above U+00FF, which a head
+    // written one byte per code point cannot carry -- are refused before
+    // anything is sent (#174). oam sent the last as its UTF-8 bytes.
+    function validateHeaderName(name, label) {
       if (typeof name !== "string" || !HTTP_TOKEN.test(name)) {
-        throw invalidHttpToken("Header name", name);
+        throw invalidHttpToken(label || "Header name", name);
       }
+    }
+    function validateHeaderValue(name, value) {
       if (value === undefined) {
         var err = new TypeError("Invalid value \"undefined\" for header \"" + name + "\"");
         err.code = "ERR_HTTP_INVALID_HEADER_VALUE";
@@ -23596,12 +23846,26 @@
       }
       if (INVALID_HEADER_CHAR.test(value)) throw invalidHeaderChar(name);
     }
-    function validateHeaderName(name) {
-      if (typeof name !== "string" || name.length === 0) throw new TypeError("Header name must be a valid HTTP token [\"" + name + "\"]");
-      if (INVALID_HEADER_CHAR.test(name)) throw new TypeError("Header name must be a valid HTTP token [\"" + name + "\"]");
+    function checkOutgoingHeader(name, value) {
+      validateHeaderName(name);
+      validateHeaderValue(name, value);
     }
-    function validateHeaderValue(name, value) {
-      if (value === undefined) throw new TypeError("Invalid value \"undefined\" for header \"" + name + "\"");
+    // node's validateString(name, 'name') at the top of every outgoing
+    // message's getHeader / hasHeader / removeHeader: a name that is not a
+    // string throws ERR_INVALID_ARG_TYPE, where `String(name)` or
+    // `name.toLowerCase()` answered undefined / false or a bare TypeError.
+    function checkHeaderNameArg(name) {
+      if (typeof name !== "string") throw codes.ERR_INVALID_ARG_TYPE("name", "string", name);
+    }
+    // The same checks as node's _storeHeader makes them on headers given
+    // to writeHead() directly: a list value is checked item by item.
+    function checkStoredHeader(name, value) {
+      validateHeaderName(name);
+      if (!Array.isArray(value)) {
+        validateHeaderValue(name, value);
+        return;
+      }
+      for (var i = 0; i < value.length; i++) validateHeaderValue(name, value[i]);
     }
 
     class OutgoingMessage extends EventEmitter {
@@ -23614,20 +23878,38 @@
         this.writableFinished = false;
         this._headers = {};
       }
-      setHeader(name, value) { this._headers[name.toLowerCase()] = value; }
-      getHeader(name) { return this._headers[name.toLowerCase()]; }
+      setHeader(name, value) {
+        if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("set");
+        checkOutgoingHeader(name, value);
+        this._headers[name.toLowerCase()] = value;
+        return this;
+      }
+      getHeader(name) {
+        checkHeaderNameArg(name);
+        return this._headers[name.toLowerCase()];
+      }
       getHeaderNames() { return Object.keys(this._headers); }
       getHeaders() { return Object.assign({}, this._headers); }
-      hasHeader(name) { return name.toLowerCase() in this._headers; }
-      removeHeader(name) { delete this._headers[name.toLowerCase()]; }
+      hasHeader(name) {
+        checkHeaderNameArg(name);
+        return name.toLowerCase() in this._headers;
+      }
+      removeHeader(name) {
+        checkHeaderNameArg(name);
+        if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("remove");
+        delete this._headers[name.toLowerCase()];
+      }
       flushHeaders() {}
       appendHeader(name, value) {
-        var existing = this._headers[name.toLowerCase()];
-        if (existing !== undefined) {
-          this._headers[name.toLowerCase()] = Array.isArray(existing) ? existing.concat(value) : [existing, value];
+        if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("append");
+        checkOutgoingHeader(name, value);
+        var key = name.toLowerCase();
+        if (Object.hasOwn(this._headers, key)) {
+          this._headers[key] = [].concat(this._headers[key], value);
         } else {
-          this._headers[name.toLowerCase()] = value;
+          this._headers[key] = value;
         }
+        return this;
       }
     }
     Object.setPrototypeOf(ServerResponse.prototype, OutgoingMessage.prototype);

@@ -2064,6 +2064,62 @@ target). The parser underneath is hyper's, so some heads still get a different a
 _(probed)_ Node v22.22.2 (default and `--insecure-http-parser`) and oam, the same 90 raw
 request heads over TCP, 16 chunked bodies, 40 chunk extensions and 15 trailer sections.
 
+### 47. The HTTP server's response head: what still differs
+
+An `http` or `https` server response checks its headers as Node's `OutgoingMessage` does,
+with Node's errors and in Node's order: `setHeader`, `appendHeader`, `setHeaders(Headers |
+Map)`, `writeHead`'s headers (an object, a flat `[name, value, ...]` list or a list of
+pairs), `addTrailers`, `http.validateHeaderName` and `http.validateHeaderValue` refuse a name
+that is not a token (`ERR_INVALID_HTTP_TOKEN`), an `undefined` value
+(`ERR_HTTP_INVALID_HEADER_VALUE`) and a value holding a control character or a code point
+above U+00FF (`ERR_INVALID_CHAR`); `writeHead` and the implicit head refuse a status outside
+100-999 (`ERR_HTTP_INVALID_STATUS_CODE`) and such a status message; and once the head is out
+the header methods throw `ERR_HTTP_HEADERS_SENT`. A value up to U+00FF goes on the wire as
+Node writes it, which depends on what is sent first: joined to a string body in utf8 (or no
+encoding) the head is UTF-8 (`café` is `caf\xc3\xa9` from `res.end('text')` or
+`flushHeaders()`), and before anything else -- a chunk-size line, a Buffer, a string in
+another encoding, nothing -- it is one byte per code point (`caf\xe9`). Up to 0.17.1 oam
+stored any header -- `res.setHeader('y', '€')` did not throw -- and wrote every value as its
+UTF-8; a CR or LF reached hyper and was answered `500`. `appendHeader` wrote to the wrong
+store, and `setHeaders` and `addTrailers` did not exist.
+`conformance/cases/250-http-response-header-validation.mjs` and
+`251-http-response-header-bytes.mjs` hold this to node v22.22.2. What still differs:
+
+- **`writeHead()` does not send the head.** As in Node, `headersSent` turns true there and
+  the header methods, a second `writeHead()` among them, throw `ERR_HTTP_HEADERS_SENT` from
+  then on, but oam sends the head with the first body bytes or `end()`. So headers given to
+  `writeHead()` on a response no header method has touched show in `getHeader()` /
+  `hasHeader()`, where Node's never do, and `end('text')` after `writeHead()` sends a
+  `content-length` where Node frames the body chunked. The bytes a header value goes out as
+  follow Node's framing all the same. Up to 0.17.1 `headersSent` stayed false and the header
+  methods kept working after `writeHead()`; a second `writeHead()` replaced the first one's
+  headers.
+- **The status line carries the status code's standard reason phrase**, not
+  `res.statusMessage`: a message is checked as Node checks it and stays readable, but is not
+  sent.
+- **Response trailers are not sent.** `addTrailers()` checks its names and values as Node
+  does and keeps them, and a `Trailer` header does not switch the response to chunked
+  framing as it does in Node.
+- **A `content-disposition` value is not re-encoded.** When the response's length is known,
+  Node v22.22.2 converts the value with `Buffer.from(value, 'latin1')` and turns it back into
+  a string as UTF-8, so a non-ASCII value is corrupted: `café` goes out as `caf` plus the
+  UTF-8 of U+FFFD after `res.end('text')`, and as `caf\xfd` after `res.end(buffer)`, and
+  `writeHead()` refuses it (`ERR_INVALID_CHAR`) when a `content-length` comes before it. oam
+  writes it as any other header value (`caf\xc3\xa9`, `caf\xe9`).
+- **An HTTP/1.0 request's response is framed by hyper.** `req.httpVersion` (and
+  `httpVersionMajor` / `httpVersionMinor`) say `1.0` as Node's do, and the header bytes follow
+  Node's framing for it -- a head joined to a UTF-8 string body, from `write('text')` as well
+  as `end('text')`, is UTF-8. But the status line says `HTTP/1.0` where Node's says
+  `HTTP/1.1`; `end('text')` adds a `content-length` where Node closes the connection to end
+  the body; a request saying `TE: chunked` does not get the chunked body Node sends it; and a
+  `Trailer` header does not throw `ERR_HTTP_TRAILER_INVALID` as it does in Node, which cannot
+  chunk the response. Up to 0.17.1 `req.httpVersion` was always `'1.1'` and the server request
+  had no `httpVersionMajor` / `httpVersionMinor`, so such a head went out one byte per code
+  point.
+- **Header names go out lowercased**, as hyper writes them; Node keeps the case they were
+  set in, and writes the ones it adds as `Content-Length`, `Transfer-Encoding`, `Date`,
+  `Connection`.
+
 ### 41. The HTTP server's timeouts and connection count: what still differs
 
 `http` and `https` servers hold every connection to Node's timeouts, with Node's options,

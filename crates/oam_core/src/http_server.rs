@@ -96,6 +96,10 @@ pub struct IncomingRequest {
     pub method: String,
     /// Path + query, as received.
     pub uri: String,
+    /// The request line said `HTTP/1.0` (node's `req.httpVersion` '1.0',
+    /// which decides how node frames the response). Anything else is 1.1 to
+    /// the http server's request; an h2 request has its own compat class.
+    pub http10: bool,
     pub headers: Vec<(String, String)>,
     pub is_upgrade: bool,
     pub socket_handle: Option<u64>,
@@ -344,7 +348,24 @@ pub enum ResponseBody {
 pub struct ResponseSpec {
     pub status: u16,
     pub headers: Vec<(String, String)>,
+    /// How each header value's code points become bytes.
+    pub header_bytes: HeaderBytes,
     pub body: ResponseBody,
+}
+
+/// How a response's header values go on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderBytes {
+    /// Each value's UTF-8: oam.serve's responses, the http2 compat
+    /// server's, and a node:http response whose head node would send joined
+    /// to a UTF-8 string body.
+    Utf8,
+    /// One byte per code point (latin1), as node writes a response head in
+    /// every other case (`ServerResponse#_headIsUtf8` in node_compat.js has
+    /// the rule). A code point above U+00FF has no byte: JS refuses such a
+    /// value as node does, and one that arrives anyway fails the response
+    /// as any other unsendable header does, never as its UTF-8.
+    Latin1,
 }
 
 struct ServerEntry {
@@ -687,6 +708,7 @@ impl HttpState {
         id: u64,
         status: u16,
         headers: Vec<(String, String)>,
+        header_bytes: HeaderBytes,
         body: Vec<u8>,
     ) -> bool {
         let Some(responder) = self
@@ -701,6 +723,7 @@ impl HttpState {
             .send(ResponseSpec {
                 status,
                 headers,
+                header_bytes,
                 body: ResponseBody::Full(body),
             })
             .is_ok()
@@ -712,6 +735,7 @@ impl HttpState {
         id: u64,
         status: u16,
         headers: Vec<(String, String)>,
+        header_bytes: HeaderBytes,
     ) -> Option<u64> {
         let responder = self
             .pending
@@ -733,6 +757,7 @@ impl HttpState {
             .send(ResponseSpec {
                 status,
                 headers,
+                header_bytes,
                 body: ResponseBody::Stream(rx, closed_tx),
             })
             .is_ok();
@@ -760,6 +785,7 @@ impl HttpState {
             .send(ResponseSpec {
                 status: 0,
                 headers: Vec::new(),
+                header_bytes: HeaderBytes::Utf8,
                 body: ResponseBody::Abort,
             })
             .is_ok()
@@ -848,7 +874,13 @@ type BoxedBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infal
 fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
     let mut builder = hyper::Response::builder().status(spec.status);
     for (name, value) in &spec.headers {
-        builder = builder.header(name, value);
+        builder = match spec.header_bytes {
+            HeaderBytes::Utf8 => builder.header(name, value),
+            HeaderBytes::Latin1 => match crate::http_head::latin1_header_value(value) {
+                Some(value) => builder.header(name, value),
+                None => return bad_response_spec(),
+            },
+        };
     }
     let body: BoxedBody = match spec.body {
         ResponseBody::Full(bytes) => http_body_util::Full::new(Bytes::from(bytes)).boxed(),
@@ -861,12 +893,15 @@ fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
         // building a response); never reaches the spec-to-response path.
         ResponseBody::Abort => http_body_util::Empty::new().boxed(),
     };
-    builder.body(body).unwrap_or_else(|_| {
-        hyper::Response::builder()
-            .status(500)
-            .body(http_body_util::Full::new(Bytes::from_static(b"oam: bad response spec")).boxed())
-            .expect("static 500 builds")
-    })
+    builder.body(body).unwrap_or_else(|_| bad_response_spec())
+}
+
+/// What a response that cannot be sent as given is answered with.
+fn bad_response_spec() -> hyper::Response<BoxedBody> {
+    hyper::Response::builder()
+        .status(500)
+        .body(http_body_util::Full::new(Bytes::from_static(b"oam: bad response spec")).boxed())
+        .expect("static 500 builds")
 }
 
 // ---- Upgrade and CONNECT requests ----
@@ -1496,6 +1531,7 @@ pub async fn http_serve(
                                 id: takeover.id,
                                 method: takeover.head.method,
                                 uri: takeover.head.target,
+                                http10: takeover.head.http10,
                                 headers: takeover.head.headers,
                                 is_upgrade: true,
                                 socket_handle: Some(handle),
@@ -1656,6 +1692,7 @@ fn refuse_unanswered(state: &HttpState, id: u64, status: u16) {
         let _ = responder.send(ResponseSpec {
             status,
             headers: vec![("connection".to_string(), "close".to_string())],
+            header_bytes: HeaderBytes::Utf8,
             body: ResponseBody::Full(Vec::new()),
         });
     }
@@ -1963,6 +2000,7 @@ async fn dispatch_request(
         .and_then(|raw| crate::http_head::request_target(raw.as_bytes()))
         .map(|target| target.iter().map(|&b| char::from(b)).collect::<String>());
     let (parts, body) = req.into_parts();
+    let http10 = parts.version == hyper::Version::HTTP_10;
     let end_stream =
         parts.version == hyper::Version::HTTP_2 && hyper::body::Body::is_end_stream(&body);
     // Collect the body, enforcing MAX_REQUEST_BODY.  When the cap is hit we
@@ -2100,6 +2138,7 @@ async fn dispatch_request(
             id,
             method: parts.method.as_str().to_string(),
             uri,
+            http10,
             headers,
             is_upgrade: false,
             socket_handle: None,
@@ -2458,6 +2497,7 @@ async fn serve_https_connection(
             id: takeover.id,
             method: takeover.head.method,
             uri: takeover.head.target,
+            http10: takeover.head.http10,
             headers: takeover.head.headers,
             is_upgrade: true,
             socket_handle: Some(handle),
@@ -2522,6 +2562,10 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
                 "uri": request.uri,
                 "headers": request.headers,
             });
+            // Only when it is not 1.1, so the usual request carries nothing more.
+            if request.http10 {
+                meta["httpVersion"] = serde_json::json!("1.0");
+            }
             request.conn.write_meta(&mut meta);
             if request.end_stream {
                 meta["endStream"] = serde_json::json!(true);

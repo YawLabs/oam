@@ -145,7 +145,7 @@ pub fn prepare(
         // a code point above U+00FF before it gets here, as node does; one
         // that arrives anyway is a builder error, never its UTF-8.
         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| PrepareError::Builder)?;
-        let value = latin1_value(value).ok_or(PrepareError::Builder)?;
+        let value = crate::http_head::latin1_header_value(value).ok_or(PrepareError::Builder)?;
         headers.try_append(name, value).map_err(too_many)?;
     }
     if default_headers {
@@ -173,17 +173,6 @@ pub fn prepare(
         method,
         headers,
     })
-}
-
-/// A header value from a JS string, one byte per code point: `None` for a
-/// code point above U+00FF, or for a byte `HeaderValue` refuses (a control
-/// character).
-fn latin1_value(text: &str) -> Option<HeaderValue> {
-    let bytes = text
-        .chars()
-        .map(|c| u8::try_from(u32::from(c)).ok())
-        .collect::<Option<Vec<u8>>>()?;
-    HeaderValue::from_bytes(&bytes).ok()
 }
 
 /// Remove the userinfo from `url` and return it as a Basic credential.
