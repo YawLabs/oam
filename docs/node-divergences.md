@@ -1253,25 +1253,32 @@ Two things this moved rather than removed:
   `AI_ADDRCONFIG`, so case 110 prints only shape invariants there.
 - **A request to `localhost` now tries `::1` first**, which is Node's order. reqwest's
   client carried an IPv4-first override for `localhost`; the owned transport does not. Against
-  a listener that is IPv4 only -- which is every oam `listen(port)`, entry 36 -- the first
-  request pays the refused `::1` attempt. Measured on Windows, cold first `fetch` through
+  a listener that is IPv4 only (every oam `listen(port)` was, up to 0.17.1: entry 36) the
+  first request pays the refused `::1` attempt. Measured on Windows, cold first `fetch` through
   `localhost`, six runs: 8.9-28.8 ms now against 4.1-7.8 ms before (Node: 22.8-28.3 ms);
   through a dual-stack `::` listener, 8-22 ms now against 305-326 ms before, when reqwest
   waited out its happy-eyeballs delay (Node: 20-33 ms). Pooled requests do not change.
 
-### 36. `listen(port)` binds `0.0.0.0`, and `connect(port)` reaches it over `127.0.0.1`
+### 36. `listen(port)` without a host: closed in 0.17.2
 
-Node's `server.listen(port)` with no host binds dual-stack `::`, and `net.connect(port)` (default
-host `localhost`) reaches it over `::1`, so `server.address()` reports `{ address: '::', family:
-'IPv6' }` and both ends see `remoteFamily` `IPv6`. oam's `listen(port)` binds `0.0.0.0`: same
-program, same data, `IPv4` in every observable. `net.connect(port)`, `tls.connect(port)` and
-`http.request` all default to `localhost`, as Node's do, and resolve it like any other name
-(a `lookup` option sees `'localhost'`); against an oam listener the first attempt goes to `::1`
-and is refused, costing a few milliseconds (entry 35), before `127.0.0.1` connects. Closing
-the gap needs a dual-stack listen default.
+Node's `server.listen(port)` with no host binds dual-stack `::` (falling back to `0.0.0.0`
+where IPv6 is unavailable), `listen(port, '::')` is dual-stack too unless `ipv6Only`, and
+`server.address()` reports the family of the address bound. Since 0.17.2 oam's net, tls,
+http, https and http2 servers do the same (`crates/oam_core/src/tcp.rs` `bind_listener`,
+`conformance/cases/229-listen-default-dual-stack.mjs`): an IPv4 client of a dual-stack
+listener is `::ffff:a.b.c.d` on the server's side, `net.connect(port)` (default host
+`localhost`, as Node's) reaches it over `::1` with no refused attempt, and a listen error is
+Node's (`listen EADDRINUSE: address already in use :::8080`, with `syscall`, `address` and
+`port`). Up to 0.17.1 net and tls bound `0.0.0.0` and http, https and http2 `127.0.0.1` --
+an http server started without a host was unreachable from any other machine -- an explicit
+`::` was IPv6-only, and `address()` said `IPv4` for all of them.
+
+Under `--permission`, a `listen()` without a host is checked against the net grant as
+`0.0.0.0:<port>` (every interface), on every server kind; an http server's used to be checked
+as `127.0.0.1:<port>`, which no longer describes what it binds.
 
 _(probed)_ Node v22.22.2 and oam on the same `createServer().listen(0)` + `connect(port)`
-program.
+program, for each server kind.
 
 ### 37. Name resolution does not pass `AI_ADDRCONFIG` off Windows
 

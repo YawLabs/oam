@@ -3234,15 +3234,10 @@ fn op_http_serve(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
-    let Some(port) = port_arg(scope, &args, 1, "httpServe") else {
+    // Net gate: "host:port" is the resource being bound. arg 12: ipv6Only.
+    let Some(at) = listen_at_arg(scope, &args, 12, "httpServe") else {
         return;
     };
-    // Net gate: "host:port" is the resource being bound.
-    let net_resource = format!("{host}:{port}");
-    if !check_net_perm(scope, &net_resource) {
-        return;
-    }
     let rt = core_runtime!(scope);
     let state = rt.http();
     let tcp = rt.tcp();
@@ -3260,8 +3255,7 @@ fn op_http_serve(
             state,
             tcp,
             tcp_ids,
-            host,
-            port,
+            at,
             // arg 2: opt into dispatch-on-headers + streamed request bodies.
             args.get(2).is_true(),
             policy,
@@ -3554,21 +3548,17 @@ fn op_http2_serve(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
-    let Some(port) = port_arg(scope, &args, 1, "http2Serve") else {
+    // arg 4: ipv6Only.
+    let Some(at) = listen_at_arg(scope, &args, 4, "http2Serve") else {
         return;
     };
-    let net_resource = format!("{host}:{port}");
-    if !check_net_perm(scope, &net_resource) {
-        return;
-    }
     let state = core_runtime!(scope).http();
     // args 2, 3: maxHeaderSize, insecureHTTPParser (HTTP/1 connections).
     let policy = head_policy_args(scope, &args, 2);
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::http_server::http2_serve(state, host, port, policy),
+        oam_core::http_server::http2_serve(state, at, policy),
     );
 }
 
@@ -3614,10 +3604,11 @@ fn op_http2_serve_tls(
 
 // ----------------------------------------------------------------- HTTPS
 
-/// httpsServe(host, port, contextId, handshakeMs, requestCert,
+/// httpsServe(host | null, port, contextId, handshakeMs, requestCert,
 /// rejectUnauthorized, alpnJson, maxHeaderSize, insecureHTTPParser,
-/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs, jsDriven)
-/// -> Promise<{ serverId, port }>: an https server whose connections are
+/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs, jsDriven,
+/// maxHeadersCount, ipv6Only) -> Promise<{ serverId, port, address, family
+/// }>: an https server whose connections are
 /// accepted with the secure context `contextId` (`tlsServerContext`, built
 /// at `https.createServer()`) and those options.
 fn op_https_serve(
@@ -3625,19 +3616,15 @@ fn op_https_serve(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
-    let Some(port) = port_arg(scope, &args, 1, "httpsServe") else {
-        return;
-    };
     let context_id = args.get(2).number_value(scope).unwrap_or(0.0) as u64;
     // args 3..=6: handshakeTimeout, requestCert, rejectUnauthorized, ALPN.
     let Some(options) = accept_option_args(scope, &args, 3, "httpsServe") else {
         return;
     };
-    let net_resource = format!("{host}:{port}");
-    if !check_net_perm(scope, &net_resource) {
+    // args 0, 1 and 16: host, port, ipv6Only.
+    let Some(at) = listen_at_arg(scope, &args, 16, "httpsServe") else {
         return;
-    }
+    };
     let core = core_runtime!(scope);
     let Some(context) = oam_core::tls::server::context(&core.tls(), context_id) else {
         throw_type_error(scope, "httpsServe: the server's secure context is gone");
@@ -3662,8 +3649,7 @@ fn op_https_serve(
         &mut rv,
         oam_core::http_server::https_serve(
             state,
-            host,
-            port,
+            at,
             tls,
             policy,
             timeouts,
@@ -4344,30 +4330,53 @@ fn op_tcp_shutdown(
     crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_shutdown(tcp, handle));
 }
 
+/// Where a server op is asked to listen: the host as argument 0 (a string, or
+/// null / undefined for a `listen()` that named none), the port as argument
+/// 1, and node's `ipv6Only` as argument `ipv6_only_index`. Checks the net
+/// grant for it -- `host:port`, and for no host `0.0.0.0:port`, the grant for
+/// every interface (the listener is dual-stack `::`, every interface of both
+/// families). `None` means an exception is pending.
+fn listen_at_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    ipv6_only_index: i32,
+    op: &str,
+) -> Option<oam_core::tcp::ListenAt> {
+    let host = if args.get(0).is_null_or_undefined() {
+        None
+    } else {
+        let Some(host) = arg_string(scope, args, 0) else {
+            throw_type_error(scope, &format!("{op} requires a host string or null"));
+            return None;
+        };
+        Some(host)
+    };
+    let port = port_arg(scope, args, 1, op)?;
+    let net_resource = format!("{}:{port}", host.as_deref().unwrap_or("0.0.0.0"));
+    if !check_net_perm(scope, &net_resource) {
+        return None;
+    }
+    Some(oam_core::tcp::ListenAt {
+        host,
+        port,
+        ipv6_only: args.get(ipv6_only_index).is_true(),
+    })
+}
+
+/// tcpListen(host | null, port, ipv6Only) -> Promise<{ serverId, port,
+/// hostname, family }>: net and tls servers.
 fn op_tcp_listen(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(host) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "tcpListen requires a host");
+    let Some(at) = listen_at_arg(scope, &args, 2, "tcpListen") else {
         return;
     };
-    let Some(port) = port_arg(scope, &args, 1, "tcpListen") else {
-        return;
-    };
-    let net_resource = format!("{host}:{port}");
-    if !check_net_perm(scope, &net_resource) {
-        return;
-    }
     let core = core_runtime!(scope);
     let tcp = core.tcp();
     let ids = core.body_ids();
-    crate::ops::spawn_op(
-        scope,
-        &mut rv,
-        oam_core::tcp::tcp_listen(tcp, ids, host, port),
-    );
+    crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_listen(tcp, ids, at));
 }
 
 fn op_tcp_accept(

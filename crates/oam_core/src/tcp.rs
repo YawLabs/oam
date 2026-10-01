@@ -7,7 +7,7 @@
 //! resurrection when a close races an in-flight read/write -- and holds
 //! nothing else: a marker lives exactly as long as the await it guards.
 
-use crate::{OpOutcome, node_errno, node_error_code, node_error_message};
+use crate::{NodeSysError, OpOutcome, node_errno, node_error_code, node_error_message};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -238,6 +238,129 @@ pub(crate) fn addr_to_json(addr: std::net::SocketAddr) -> serde_json::Value {
         "port": addr.port(),
         "family": if addr.is_ipv6() { "IPv6" } else { "IPv4" },
     })
+}
+
+/// Where a server's `listen()` asked to listen: the host it named (`None`:
+/// none), the port, and node's `ipv6Only` option.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListenAt {
+    pub host: Option<String>,
+    pub port: u16,
+    pub ipv6_only: bool,
+}
+
+/// The backlog every listener is created with: node's default (lib/net.js
+/// `backlog || 511`).
+const LISTEN_BACKLOG: i32 = 511;
+
+/// Bind and listen as node's `server.listen()` does (lib/net.js
+/// `setupListenHandle` / `createServerHandle`, libuv underneath), for every
+/// server kind -- net, tls, http, https and http2:
+///
+/// - No host: `::`, dual-stack, so IPv4 clients reach it too (as
+///   `::ffff:a.b.c.d`). Where that socket cannot be had -- no IPv6 on the
+///   host -- `0.0.0.0` instead. An address in use is not a reason to fall
+///   back: libuv reports it at `listen`, after the choice was made, so it
+///   fails on `::`.
+/// - An IPv6 address, `::` included, is dual-stack too unless `ipv6Only`.
+/// - A name is looked up (getaddrinfo, the resolver's order) and the first
+///   address is bound, as node's `lookupAndListen` does.
+///
+/// Returns the listener and the address it is bound at. A failure is node's
+/// `listen` error (`listen EADDRINUSE: address already in use :::8080`), or
+/// the lookup's for a name.
+pub async fn bind_listener(
+    at: &ListenAt,
+) -> Result<(tokio::net::TcpListener, std::net::SocketAddr), NodeSysError> {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    let ip = match at.host.as_deref() {
+        None => {
+            let any6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), at.port);
+            match bind_one(any6, at.ipv6_only) {
+                Ok(bound) => return Ok(bound),
+                Err(ListenFailure::Listen(e)) => return Err(listen_error(&e, "::", at.port)),
+                Err(ListenFailure::Bind(e)) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    return Err(listen_error(&e, "::", at.port));
+                }
+                Err(ListenFailure::Bind(_)) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            }
+        }
+        Some(host) => match host.parse::<IpAddr>() {
+            Ok(ip) => ip,
+            Err(_) => match crate::net_connect::resolve(host, None).await {
+                Ok(addrs) => addrs[0],
+                Err(crate::net_connect::ConnectError::Resolve(e)) => return Err(*e),
+                Err(other) => {
+                    return Err(listen_error(&std::io::Error::other(other), host, at.port));
+                }
+            },
+        },
+    };
+    match bind_one(SocketAddr::new(ip, at.port), at.ipv6_only) {
+        Ok(bound) => Ok(bound),
+        Err(ListenFailure::Bind(e) | ListenFailure::Listen(e)) => {
+            Err(listen_error(&e, &ip.to_string(), at.port))
+        }
+    }
+}
+
+/// Which step of [`bind_one`] failed: up to and including the bind, or the
+/// listen after it.
+enum ListenFailure {
+    Bind(std::io::Error),
+    Listen(std::io::Error),
+}
+
+/// One listening socket at `addr`: SO_REUSEADDR off Windows (as libuv and
+/// std set it), IPV6_V6ONLY as `ipv6_only` says for an IPv6 one.
+fn bind_one(
+    addr: std::net::SocketAddr,
+    ipv6_only: bool,
+) -> Result<(tokio::net::TcpListener, std::net::SocketAddr), ListenFailure> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
+        .map_err(ListenFailure::Bind)?;
+    if addr.is_ipv6() {
+        socket.set_only_v6(ipv6_only).map_err(ListenFailure::Bind)?;
+    }
+    #[cfg(not(windows))]
+    socket
+        .set_reuse_address(true)
+        .map_err(ListenFailure::Bind)?;
+    socket.bind(&addr.into()).map_err(ListenFailure::Bind)?;
+    socket
+        .listen(LISTEN_BACKLOG)
+        .map_err(ListenFailure::Listen)?;
+    socket
+        .set_nonblocking(true)
+        .map_err(ListenFailure::Listen)?;
+    let listener =
+        tokio::net::TcpListener::from_std(socket.into()).map_err(ListenFailure::Listen)?;
+    let local = listener.local_addr().map_err(ListenFailure::Listen)?;
+    Ok((listener, local))
+}
+
+/// node's `UVExceptionWithHostPort(err, 'listen', address, port)`: `listen
+/// CODE: <uv message> address:port`, the `:port` (and a `port` key) only for
+/// a non-zero port.
+fn listen_error(error: &std::io::Error, address: &str, port: u16) -> NodeSysError {
+    let code = node_error_code(error);
+    let text = crate::uv_strerror(code)
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string());
+    let mut message = format!("listen {code}: {text} {address}");
+    if port > 0 {
+        message.push_str(&format!(":{port}"));
+    }
+    NodeSysError {
+        code: code.to_string(),
+        message,
+        errno: node_errno(code, error),
+        syscall: Some("listen".to_string()),
+        hostname: None,
+        address: Some(address.to_string()),
+        port: (port > 0).then_some(port),
+    }
 }
 
 /// Map an IO error to a NodeFailed outcome with the appropriate syscall.
@@ -487,23 +610,17 @@ pub fn tcp_close(registry: &TcpRegistry, handle: u64) {
     }
 }
 
-/// net.createServer + server.listen: bind a TCP listener.
-/// Returns Json {serverId, port, hostname}.
+/// net.createServer + server.listen: bind a TCP listener ([`bind_listener`]).
+/// Returns Json {serverId, port, hostname, family}.
 pub async fn tcp_listen(
     registry: TcpRegistry,
     ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    host: String,
-    port: u16,
+    at: ListenAt,
 ) -> OpOutcome {
-    let addr = format!("{host}:{port}");
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => return tcp_fail(e, "listen", &addr),
+    let (listener, local_addr) = match bind_listener(&at).await {
+        Ok(bound) => bound,
+        Err(e) => return OpOutcome::sys(e),
     };
-
-    let local_addr = listener.local_addr().ok();
-    let bound_port = local_addr.map(|a| a.port()).unwrap_or(port);
-    let hostname = local_addr.map(|a| a.ip().to_string()).unwrap_or(host);
 
     let server_id = ids.fetch_add(1, Ordering::Relaxed);
     registry
@@ -515,8 +632,9 @@ pub async fn tcp_listen(
     OpOutcome::Json(
         serde_json::json!({
             "serverId": server_id,
-            "port": bound_port,
-            "hostname": hostname,
+            "port": local_addr.port(),
+            "hostname": local_addr.ip().to_string(),
+            "family": if local_addr.is_ipv6() { "IPv6" } else { "IPv4" },
         })
         .to_string(),
     )
@@ -722,8 +840,16 @@ mod tests {
         let ids = std::sync::Arc::new(AtomicU64::new(1));
 
         for shape in 0..3 {
-            let OpOutcome::Json(payload) =
-                tcp_listen(registry.clone(), ids.clone(), "127.0.0.1".into(), 0).await
+            let OpOutcome::Json(payload) = tcp_listen(
+                registry.clone(),
+                ids.clone(),
+                ListenAt {
+                    host: Some("127.0.0.1".into()),
+                    port: 0,
+                    ipv6_only: false,
+                },
+            )
+            .await
             else {
                 panic!("listen failed");
             };
@@ -1054,5 +1180,64 @@ mod tests {
             (0, 0, 0, 0, 0),
             "(closed, cancel, in_flight, readers, writers)"
         );
+    }
+
+    /// #172: a listen() without a host is node's dual-stack `::`, an explicit
+    /// `::` too unless `ipv6Only`, and an address in use fails on `::` with
+    /// node's listen error rather than falling back to IPv4.
+    #[tokio::test]
+    async fn a_listener_without_a_host_is_dual_stack_as_node_s() {
+        let at = |host: Option<&str>, port: u16, ipv6_only: bool| ListenAt {
+            host: host.map(str::to_string),
+            port,
+            ipv6_only,
+        };
+        // Through oam's connector: a refused loopback connect is prompt on
+        // Windows there.
+        let options = crate::net_connect::ConnectOptions::default();
+        let reaches = async |port: u16, ip: &str| {
+            crate::net_connect::connect(ip, port, &options)
+                .await
+                .is_ok()
+        };
+        for (host, ipv6_only, v4, v6) in [
+            (None, false, true, true),
+            (Some("::"), false, true, true),
+            (None, true, false, true),
+            (Some("::"), true, false, true),
+            (Some("0.0.0.0"), false, true, false),
+            (Some("127.0.0.1"), false, true, false),
+        ] {
+            let (listener, local) = bind_listener(&at(host, 0, ipv6_only)).await.unwrap();
+            let expected = match host {
+                None => "::",
+                Some(h) => h,
+            };
+            assert_eq!(local.ip().to_string(), expected, "{host:?}");
+            let port = local.port();
+            let (r4, r6) = (reaches(port, "127.0.0.1").await, reaches(port, "::1").await);
+            assert_eq!((r4, r6), (v4, v6), "{host:?} ipv6Only={ipv6_only}");
+            drop(listener);
+        }
+
+        // Port in use: node's `listen EADDRINUSE: address already in use
+        // :::PORT`, on `::` -- libuv reports it at listen, after the
+        // address was chosen.
+        let (held, local) = bind_listener(&at(None, 0, false)).await.unwrap();
+        let Err(error) = bind_listener(&at(None, local.port(), false)).await else {
+            panic!("a second listener on the same port must fail");
+        };
+        assert_eq!(error.code, "EADDRINUSE");
+        assert_eq!(
+            error.message,
+            format!(
+                "listen EADDRINUSE: address already in use :::{}",
+                local.port()
+            )
+        );
+        assert_eq!(error.syscall.as_deref(), Some("listen"));
+        assert_eq!(error.address.as_deref(), Some("::"));
+        assert_eq!(error.port, Some(local.port()));
+        drop(held);
     }
 }

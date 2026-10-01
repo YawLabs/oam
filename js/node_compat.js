@@ -946,6 +946,9 @@
       return {
         port: validatePort(options.port, "options.port"),
         host: options.host || undefined,
+        // node's `ipv6Only`: an IPv6 listener (the default `::` included)
+        // takes IPv6 clients only.
+        ipv6Only: !!options.ipv6Only,
         cb: cb,
       };
     }
@@ -18555,13 +18558,16 @@
     // are now (values set right after listen() returned are in), start the
     // connections check (node does it on 'listening', ahead of the caller's
     // listeners), emit 'listening' and serve.
-    function serverBound(server, bound, hostname, encrypted) {
+    function serverBound(server, bound, encrypted) {
       // A server listening again after a close() is running again.
       server[Symbol.for("oam.serverClosing")] = false;
       server[Symbol.for("oam.serverClosed")] = false;
       server._serverId = bound.serverId;
       server._port = bound.port;
-      server._host = hostname;
+      // Where the listener IS bound: `::` for a listen() without a host
+      // (dual-stack), the looked-up address for a name.
+      server._host = bound.address;
+      server._family = bound.family;
       server.listening = true;
       syncServerTimeouts(server);
       startConnectionsCheck(server);
@@ -18916,15 +18922,15 @@
         // http.Server has); a port that is not one throws from here (#163).
         const listen = normalizeListenArgs(args);
         if (refusePipeListen(this, listen)) return this;
-        const { port, host, cb: callback } = listen;
+        const { port, host, ipv6Only, cb: callback } = listen;
         if (callback !== null) this.once("listening", callback);
-        const hostname = host ?? "127.0.0.1";
         // Stream request bodies: the handler is dispatched on headers and
         // req delivers chunks as they arrive, instead of waiting for the
         // last byte (docs/design/streaming-bodies.md).
         const policy = serverHeadPolicy(this);
         natives.httpServe(
-          hostname,
+          // No host: node's default, dual-stack `::` (#172).
+          host ?? null,
           port,
           true,
           policy.maxHeaderSize,
@@ -18933,15 +18939,16 @@
           // maxHeadersCount: null (the default) leaves the native 1000-field
           // cap; 0 is no limit; a number is that cap.
           this.maxHeadersCount,
+          ipv6Only,
         ).then(
-          (bound) => serverBound(this, bound, hostname, false),
+          (bound) => serverBound(this, bound, false),
           (err) => this.emit("error", err),
         );
         return this;
       }
       address() {
         return this.listening
-          ? { port: this._port, address: this._host, family: "IPv4" }
+          ? { address: this._host, family: this._family, port: this._port }
           : null;
       }
       close(callback) {
@@ -23648,7 +23655,7 @@
         // from here (#163).
         const listen = normalizeListenArgs(args);
         if (refusePipeListen(this, listen)) return this;
-        const { port, host, cb } = listen;
+        const { port, host, ipv6Only, cb } = listen;
         if (cb !== null) this.once("listening", cb);
         // Node binds (and so creates the TCPServerWrap) synchronously inside
         // listen(); createServer() alone registers nothing. Probed: after
@@ -23658,12 +23665,13 @@
         // Supersede any in-flight accept loop from a previous listen() so
         // its tail cannot unregister this fresh registration.
         this._listenGeneration = (this._listenGeneration || 0) + 1;
-        const hostname = host || "0.0.0.0";
-        natives.tcpListen(hostname, port).then(
+        // No host: node's default, dual-stack `::` (#172).
+        natives.tcpListen(host || null, port, ipv6Only).then(
           (bound) => {
             this._serverId = bound.serverId;
             this._port = bound.port;
-            this._host = bound.hostname || hostname;
+            this._host = bound.hostname;
+            this._family = bound.family;
             this.listening = true;
             // unref() before listen(): node remembers it (`this._unref`) and
             // applies it once the handle is bound -- here before the accept
@@ -23738,7 +23746,7 @@
 
       address() {
         return this.listening
-          ? { port: this._port, address: this._host, family: "IPv4" }
+          ? { address: this._host, family: this._family, port: this._port }
           : null;
       }
 
@@ -25453,11 +25461,11 @@
         if (refusePipeListen(this, listen)) return this;
         var port = listen.port, host = listen.host, callback = listen.cb;
         if (callback !== null) this.once("listening", callback);
-        var hostname = host || "127.0.0.1";
         var policy = registry._httpParserOptions.policy(this);
         var accept = tlsAcceptArgs(this);
         natives.httpsServe(
-          hostname,
+          // No host: node's default, dual-stack `::` (#172).
+          host || null,
           port,
           ...accept,
           policy.maxHeaderSize,
@@ -25466,10 +25474,11 @@
           // maxHeadersCount: null (the default) leaves the native 1000-field
           // cap; 0 is no limit; a number is that cap.
           this.maxHeadersCount,
+          listen.ipv6Only,
         ).then(
           (bound) => {
             this[kTlsSynced] = JSON.stringify(accept);
-            registry._httpParserOptions.bound(this, bound, hostname, true);
+            registry._httpParserOptions.bound(this, bound, true);
             // Anything changed while the server was binding.
             syncTls(this);
           },
@@ -25485,7 +25494,7 @@
       }
       address() {
         return this.listening
-          ? { port: this._port, address: this._host, family: "IPv4" }
+          ? { address: this._host, family: this._family, port: this._port }
           : null;
       }
       close(callback) {
@@ -28388,13 +28397,15 @@
         if (refusePipeListen(this, listen)) return this;
         var port = listen.port, host = listen.host, callback = listen.cb;
         if (callback !== null) this.once("listening", callback);
-        var hostname = host || "127.0.0.1";
         var self = this;
-        natives.http2Serve(hostname, port).then(
+        // No host: node's default, dual-stack `::` (#172). Args 2 and 3
+        // (the HTTP/1 head policy) are left to their defaults.
+        natives.http2Serve(host || null, port, undefined, undefined, listen.ipv6Only).then(
           function(bound) {
             self._serverId = bound.serverId;
             self._port = bound.port;
-            self._host = hostname;
+            self._host = bound.address;
+            self._family = bound.family;
             self.listening = true;
             self.emit("listening");
             (async function() {
@@ -28430,7 +28441,7 @@
       }
       address() {
         return this.listening
-          ? { port: this._port, address: this._host, family: "IPv4" }
+          ? { address: this._host, family: this._family, port: this._port }
           : null;
       }
       close(callback) {
@@ -32451,17 +32462,18 @@
         if (refusePipeListen(this, listen)) return this;
         var port = listen.port, host = listen.host, callback = listen.cb;
         if (callback !== null) this.once("listening", callback);
-        var hostname = host || "0.0.0.0";
         this._closed = false;
 
         // Registered synchronously inside listen(), as net.Server is: Node
         // lists a listening tls.Server as a TCPServerWrap.
         registry._activeHandles.set(this, "TCPServerWrap");
-        natives.tcpListen(hostname, port).then(
+        // No host: node's default, dual-stack `::` (#172).
+        natives.tcpListen(host || null, port, listen.ipv6Only).then(
           (bound) => {
             this._serverId = bound.serverId;
             this._port = bound.port;
-            this._host = bound.hostname || hostname;
+            this._host = bound.hostname;
+            this._family = bound.family;
             this.listening = true;
             // unref() before listen(), applied once bound (as net.Server).
             if (this._handleRefed === false) natives.tcpServerSetRef(bound.serverId, false);
@@ -32650,7 +32662,7 @@
       }
       address() {
         return this.listening
-          ? { port: this._port, address: this._host, family: this._host.includes(":") ? "IPv6" : "IPv4" }
+          ? { address: this._host, family: this._family, port: this._port }
           : null;
       }
       close(callback) {
