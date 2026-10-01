@@ -5249,13 +5249,15 @@ fn op_url_parse_href(
             }
         }
     };
-    match ada_url::Url::parse(&input, base.as_deref()) {
-        Ok(parsed) => {
-            if let Some(s) = v8::String::new(scope, parsed.href()) {
-                rv.set(s.into());
-            }
-        }
-        Err(_) => throw_type_error(scope, &format!("Invalid URL: {input}")),
+    // An input that does not parse leaves the return value `undefined`; it is
+    // not a throw. The caller builds node's ERR_INVALID_URL, whose shape
+    // differs between `new URL()` and the `href` setter and carries the input
+    // and base as properties -- none of which a message thrown from here
+    // could express.
+    if let Ok(parsed) = ada_url::Url::parse(&input, base.as_deref())
+        && let Some(s) = v8::String::new(scope, parsed.href())
+    {
+        rv.set(s.into());
     }
 }
 

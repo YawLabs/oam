@@ -1045,6 +1045,12 @@
   codes.ERR_HTTP_HEADERS_SENT = E("ERR_HTTP_HEADERS_SENT", Error, function(what) {
     return 'Cannot ' + what + ' headers after they are sent to the client';
   });
+  // EventEmitter's emit('error', x) with no listener and an x that is not an
+  // Error. `err` arrives already inspected (see emit); none at all is the
+  // bare message.
+  codes.ERR_UNHANDLED_ERROR = E("ERR_UNHANDLED_ERROR", Error, function(err) {
+    return err === undefined ? 'Unhandled error.' : 'Unhandled error. (' + err + ')';
+  });
   codes.ERR_STREAM_PREMATURE_CLOSE = E("ERR_STREAM_PREMATURE_CLOSE", Error, function() {
     return 'Premature close';
   });
@@ -2903,9 +2909,20 @@
       if (existing === undefined) {
         if (type === "error") {
           const err = args[0];
-          throw err instanceof Error
-            ? err
-            : new Error(`Unhandled error. (${String(err)})`);
+          if (err instanceof Error) throw err;
+          // Not an Error: node throws ERR_UNHANDLED_ERROR, with the argument
+          // inspected into the message (a string shows its quotes, an object
+          // its contents) and kept, untouched, as `context` -- so a caller
+          // can tell this failure by `code` and still reach what was emitted.
+          let inspected;
+          try {
+            inspected = nodeInspect(err);
+          } catch {
+            inspected = err;
+          }
+          const unhandled = new codes.ERR_UNHANDLED_ERROR(inspected);
+          unhandled.context = err;
+          throw unhandled;
         }
         return false;
       }
@@ -13973,6 +13990,22 @@
     // WebIDL identity: usp[Symbol.iterator] IS usp.entries.
     URLSearchParams.prototype[Symbol.iterator] = URLSearchParams.prototype.entries;
 
+    /// What `new URL()` throws for an input that does not parse: node's
+    /// binding builds it natively, so it is a plain TypeError -- prototype
+    /// TypeError.prototype, "TypeError: Invalid URL" as its string -- with
+    /// own `code`, `input`, and `base` only when a base was passed, in that
+    /// order. The input is NOT in the message (it used to be here), which is
+    /// what makes `err.code === 'ERR_INVALID_URL'` the way to test for it.
+    function invalidUrl(input, base) {
+      const err = new TypeError("Invalid URL");
+      err.code = "ERR_INVALID_URL";
+      err.input = input;
+      if (base !== undefined) err.base = base;
+      // Frames start at the caller (`new URL`), not at this helper.
+      Error.captureStackTrace(err, invalidUrl);
+      return err;
+    }
+
     class URL {
       // Un-forgeable brand. `_href` is an ordinary property, so nothing about
       // a URL was distinguishable from a duck-typed copy -- and the legacy
@@ -13983,20 +14016,33 @@
       static [Symbol.for("oam.isURL")](value) {
         return value !== null && typeof value === "object" && #brand in value;
       }
-      constructor(input, base) {
-        this._href = globalThis.__oam.node.urlParseHref(String(input), base ?? undefined);
+      // Argument handling is node's (lib/internal/url.js), for all three
+      // entry points: no argument at all is ERR_MISSING_ARGS; `input` is
+      // converted with a template literal (so a Symbol is the engine's
+      // TypeError, not "Invalid URL"); and `base` counts as passed unless it
+      // is `undefined` -- `null` is the base "null", which does not parse.
+      constructor(input, base = undefined) {
+        if (arguments.length === 0) throw new codes.ERR_MISSING_ARGS("url");
+        input = `${input}`;
+        if (base !== undefined) base = `${base}`;
+        const href = globalThis.__oam.node.urlParseHref(input, base);
+        if (href === undefined) throw invalidUrl(input, base);
+        this._href = href;
         this._c = null;
         this._params = null;
       }
-      static canParse(input, base) {
-        return globalThis.__oam.node.urlCanParse(String(input), base != null ? String(base) : undefined);
+      static canParse(input, base = undefined) {
+        if (arguments.length === 0) throw new codes.ERR_MISSING_ARGS("url");
+        input = `${input}`;
+        if (base !== undefined) base = `${base}`;
+        return globalThis.__oam.node.urlCanParse(input, base);
       }
-      static parse(input, base) {
-        try {
-          return new URL(input, base);
-        } catch {
-          return null;
-        }
+      static parse(input, base = undefined) {
+        if (arguments.length === 0) throw new codes.ERR_MISSING_ARGS("url");
+        input = `${input}`;
+        if (base !== undefined) base = `${base}`;
+        // Only "does not parse" is null; the argument errors above are thrown.
+        return globalThis.__oam.node.urlCanParse(input, base) ? new URL(input, base) : null;
       }
       _ensure() {
         if (!this._c) this._c = globalThis.__oam.node.urlParse(this._href);
@@ -14016,7 +14062,14 @@
         return this._href;
       }
       set href(value) {
-        this._href = globalThis.__oam.node.urlParseHref(String(value));
+        value = `${value}`;
+        const href = globalThis.__oam.node.urlParseHref(value);
+        if (href === undefined) {
+          // The setter's failure is the JS-side ERR_INVALID_URL (a NodeError,
+          // `[ERR_INVALID_URL]` in its toString), not the constructor's.
+          throw new codes.ERR_INVALID_URL(value);
+        }
+        this._href = href;
         this._c = null;
         if (this._params) {
           this._ensure();

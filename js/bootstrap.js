@@ -1477,9 +1477,8 @@
       let parsed;
       try {
         parsed = new URL(rawUrl);
-      } catch {
-        const cause = new TypeError("Invalid URL");
-        cause.code = "ERR_INVALID_URL";
+      } catch (cause) {
+        // The cause is URL's own ERR_INVALID_URL (code, input), as in node.
         throw new TypeError(`Failed to parse URL from ${rawUrl}`, { cause });
       }
       // node: `TypeError: Request cannot be constructed from a URL that

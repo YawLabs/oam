@@ -1598,7 +1598,8 @@ an error where oam used to send something)
   nothing reaches the wire. `http.request` and `https.request` still turn userinfo into
   Basic credentials, because there it IS Node's documented `auth` option.
 - A URL that does not parse throws Node's `TypeError: Failed to parse URL from <input>` with
-  a `TypeError` cause carrying `code` `ERR_INVALID_URL`; a non-`http(s)` scheme rejects with
+  a `TypeError` cause carrying `code` `ERR_INVALID_URL` and `input` (it is the error
+  `new URL()` throws, as in Node; case 237); a non-`http(s)` scheme rejects with
   the cause `Error: unknown scheme`. Both used to be `TypeError: fetch failed` with the cause
   `Error: builder error`, which named neither.
 - A `Request` object as the first argument is NOT a supported input (it never was): the
