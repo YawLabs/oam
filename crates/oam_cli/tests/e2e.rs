@@ -27209,6 +27209,63 @@ fn every_path_fs_op_respects_the_permission_model() {
     }
 }
 
+/// An open that can write needs the write grant whichever API makes it. The
+/// async open (fs/promises.open, the callback fs.open, and the path forms built
+/// on it such as fs/promises.truncate) used to ask only for the read grant for
+/// "r+" and the numeric O_RDWR, which then wrote through the descriptor under
+/// a read-only grant; the sync open already asked for the write grant.
+#[test]
+fn an_open_that_can_write_needs_the_write_grant() {
+    let dir = write_temp("fs_perm_open_rw/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let target = dir.join("target.txt");
+    std::fs::write(&target, "ABC").unwrap();
+    let script = write_temp(
+        "fs_perm_open_rw.mjs",
+        "import fs from 'node:fs';\n\
+         const p = process.argv[2];\n\
+         const t = async (label, fn) => {\n\
+           try { await fn(); console.log(label + '=ALLOWED'); }\n\
+           catch (e) { console.log(label + '=' + e.code); }\n\
+         };\n\
+         await t('promisesOpenRplus', async () => { const h = await fs.promises.open(p, 'r+'); await h.write('Z', 0); await h.close(); });\n\
+         await t('promisesOpenRDWR', () => fs.promises.open(p, fs.constants.O_RDWR));\n\
+         await t('openRplusCb', () => new Promise((res, rej) => fs.open(p, 'r+', (e, fd) => e ? rej(e) : res(fd))));\n\
+         await t('promisesTruncate', () => fs.promises.truncate(p, 0));\n\
+         await t('truncateCb', () => new Promise((res, rej) => fs.truncate(p, 0, (e) => e ? rej(e) : res())));\n\
+         await t('openSyncRplus', () => fs.openSync(p, 'r+'));\n\
+         await t('promisesOpenR', async () => (await fs.promises.open(p, 'r')).close());\n\
+         console.log('content=' + fs.readFileSync(p, 'utf8'));",
+    );
+    let script = script.to_string_lossy().to_string();
+    let target_arg = target.to_string_lossy().to_string();
+    let out = oam(&["--permission", "--allow-fs-read=*", &script, &target_arg]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    for op in [
+        "promisesOpenRplus",
+        "promisesOpenRDWR",
+        "openRplusCb",
+        "promisesTruncate",
+        "truncateCb",
+        "openSyncRplus",
+    ] {
+        assert!(
+            stdout.contains(&format!("{op}=ERR_ACCESS_DENIED")),
+            "{op} must need the write grant:\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("promisesOpenR=ALLOWED"),
+        "a read-only open needs only the read grant:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("content=ABC"),
+        "the file was written under a read-only grant:\n{stdout}"
+    );
+}
+
 /// The `worker` and `child` permissions must stay SEPARATE.
 ///
 /// `--allow-worker` used to imply `--allow-child-process`, because a worker

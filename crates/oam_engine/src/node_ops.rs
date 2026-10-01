@@ -6837,6 +6837,14 @@ fn op_fs_mkdtemp_sync(
 
 // ---------------------------------------------------------- fs stream ops
 
+/// Whether an open with these fopen-style flags can write, and so needs the
+/// write grant rather than the read one: "r+" reads AND writes, as does any
+/// flag with "w", "a" or "x" in it. One answer for fsOpen and fsOpenSync,
+/// which share one descriptor space.
+fn open_flags_write(flags: &str) -> bool {
+    flags.contains('w') || flags.contains('a') || flags.contains('+') || flags.contains('x')
+}
+
 fn op_fs_open(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -6847,9 +6855,7 @@ fn op_fs_open(
         return;
     };
     let mode = arg_string(scope, &args, 1).unwrap_or_else(|| "r".to_string());
-    // Gate on read for read modes ("r", "r+"), write for write modes.
-    let is_write = mode.contains('w') || mode.contains('a');
-    if is_write {
+    if open_flags_write(&mode) {
         if !check_write_perm(scope, &path) {
             return;
         }
@@ -6963,9 +6969,7 @@ fn op_fs_open_sync(
         return;
     };
     let flags = arg_string(scope, &args, 1).unwrap_or_else(|| "r".to_string());
-    let is_write =
-        flags.contains('w') || flags.contains('a') || flags.contains('+') || flags.contains('x');
-    if is_write {
+    if open_flags_write(&flags) {
         if !check_write_perm(scope, &path) {
             return;
         }

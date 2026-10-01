@@ -4684,7 +4684,7 @@
 
   // Node's fs.constants O_* are the platform's fcntl/CRT values: O_CREAT/O_EXCL/
   // O_TRUNC/O_APPEND differ between Linux, Windows (MSVCRT), and macOS (BSD).
-  // (O_RDONLY/O_WRONLY/O_RDWR are 0/1/2 everywhere.) numericOpenFlags() must use
+  // (O_RDONLY/O_WRONLY/O_RDWR are 0/1/2 everywhere.) openFlagString() must use
   // the same per-platform values, so this is the single source for both.
   function platformOFlags(platform) {
     if (platform === "win32") return { O_CREAT: 256, O_EXCL: 1024, O_TRUNC: 512, O_APPEND: 8 };
@@ -4692,6 +4692,17 @@
     // O_NOATIME is Linux-only and must be ABSENT elsewhere -- Node's test
     // asserts both directions, and code feature-detects with `in`.
     return { O_CREAT: 64, O_EXCL: 128, O_TRUNC: 512, O_APPEND: 1024, O_NOATIME: 0x40000 };
+  }
+
+  // Map numeric O_* open flags to the fopen-style string natives.fsOpen /
+  // fsOpenSync take, for fs.open, fs.openSync and fs/promises.open alike.
+  // Most callers pass a string ("r"/"w"/...); chokidar passes numbers.
+  function openFlagString(n, platform) {
+    var acc = n & 3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
+    var append = (n & platformOFlags(platform).O_APPEND) !== 0;
+    if (acc === 1) return append ? "a" : "w";
+    if (acc === 2) return append ? "a+" : "r+";
+    return "r";
   }
 
   // libuv error strings, keyed by code. This list is the AUTHORITY on which
@@ -10835,7 +10846,7 @@
       }),
       cp: (src, dest, options) => cpRecursive(toPath(src, "src"), toPath(dest, "dest"), options),
       open: withPath(async function (file, flags, mode) {
-        flags = flags || "r";
+        flags = typeof flags === "number" ? openFlagString(flags, natives.platform) : flags || "r";
         var info = await natives.fsOpen(file, String(flags));
 
         var h = info.handle;
@@ -11602,15 +11613,7 @@
       };
     }
 
-    // Map numeric O_* open flags to the fopen-style string natives.fsOpen
-    // takes. Most callers pass a string ("r"/"w"/...); chokidar does.
-    function numericOpenFlags(n) {
-      var acc = n & 3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
-      var append = (n & platformOFlags(natives.platform).O_APPEND) !== 0; // O_APPEND
-      if (acc === 1) return append ? "a" : "w";
-      if (acc === 2) return append ? "a+" : "r+";
-      return "r";
-    }
+    const numericOpenFlags = (n) => openFlagString(n, natives.platform);
 
     // The path halves of callback forms whose own wrapper has already put the
     // callback in place, built once rather than per call.
