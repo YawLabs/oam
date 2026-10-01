@@ -1193,6 +1193,200 @@
     return { id: pipe.id, close, error: () => socketError };
   }
 
+  // undici's error classes (lib/core/errors.js, 6.24.1 -- the copy node
+  // v22.22.2 bundles), defined here because fetch raises them with no undici
+  // import in sight: node's fetch IS undici, so the cause of a refused request
+  // is an `InvalidArgumentError` with `code` `UND_ERR_INVALID_ARG`, and code
+  // that tells failures apart reads that `code` or asks `instanceof`. The
+  // oam:undici shim exports these same constructors (js/undici.js), so
+  // `e.cause instanceof undici.errors.InvalidArgumentError` holds.
+  //
+  // The shape is undici's, measured: every class sets `name` and `code` in
+  // its constructor and assigns `message` after `super(message)` -- so the
+  // own names read stack, message, name, code with a message and stack, name,
+  // code, message when the default is used -- and brands the instance with
+  // `Symbol.for('undici.error.<code>')`, which a static Symbol.hasInstance
+  // checks instead of the prototype chain. The symbols are registered ones,
+  // which is what lets `instanceof` hold between two copies of undici: an
+  // error from node's bundled copy is an instance of the npm package's class,
+  // and here an oam error is an instance of a node_modules undici's.
+  // A subclass inherits the check, as in undici.
+  //
+  // Built from intrinsics captured here, as __oamMakeSysError is: a script
+  // that replaces globalThis.Error changes nothing.
+  const undiciErrors = (() => {
+    const ErrorCtor = Error;
+    const mark = (code) => Symbol.for(`undici.error.${code}`);
+    const kUndiciError = mark("UND_ERR");
+    class UndiciError extends ErrorCtor {
+      constructor(message) {
+        super(message);
+        this.name = "UndiciError";
+        this.code = "UND_ERR";
+      }
+      static [Symbol.hasInstance](instance) {
+        return instance && instance[kUndiciError] === true;
+      }
+      [kUndiciError] = true;
+    }
+    // One undici error class: `className` is the constructor's name and
+    // `name` the instance's (they differ for two of them), `fill` sets what a
+    // class adds from its further constructor arguments.
+    function define(className, Base, code, defaultMessage, name = className, fill = null) {
+      const kMark = mark(code);
+      return {
+        [className]: class extends Base {
+          constructor(message, ...rest) {
+            super(message);
+            this.name = name;
+            this.message = message || defaultMessage;
+            this.code = code;
+            if (fill !== null) fill(this, ...rest);
+          }
+          static [Symbol.hasInstance](instance) {
+            return instance && instance[kMark] === true;
+          }
+          [kMark] = true;
+        },
+      }[className];
+    }
+    const AbortError = define("AbortError", UndiciError, "UND_ERR_ABORT", "The operation was aborted");
+    const kHTTPParserError = mark("UND_ERR_HTTP_PARSER");
+    class HTTPParserError extends ErrorCtor {
+      constructor(message, code, data) {
+        super(message);
+        this.name = "HTTPParserError";
+        this.code = code ? `HPE_${code}` : undefined;
+        this.data = data ? data.toString() : undefined;
+      }
+      static [Symbol.hasInstance](instance) {
+        return instance && instance[kHTTPParserError] === true;
+      }
+      [kHTTPParserError] = true;
+    }
+    const retryFill = (self, statusCode, { headers, data }) => {
+      self.statusCode = statusCode;
+      self.data = data;
+      self.headers = headers;
+    };
+    const kSecureProxyConnectionError = mark("UND_ERR_PRX_TLS");
+    class SecureProxyConnectionError extends UndiciError {
+      // undici passes `{ cause, ...options }` on to UndiciError, which takes
+      // a message alone: `cause` is the assignment below, an enumerable own
+      // property set after `code`.
+      constructor(cause, message) {
+        super(message);
+        this.name = "SecureProxyConnectionError";
+        this.message = message || "Secure Proxy Connection failed";
+        this.code = "UND_ERR_PRX_TLS";
+        this.cause = cause;
+      }
+      static [Symbol.hasInstance](instance) {
+        return instance && instance[kSecureProxyConnectionError] === true;
+      }
+      [kSecureProxyConnectionError] = true;
+    }
+    // undici brands this one through a prototype getter, not an own field.
+    const kMessageSizeExceededError = mark("UND_ERR_WS_MESSAGE_SIZE_EXCEEDED");
+    class MessageSizeExceededError extends UndiciError {
+      constructor(message) {
+        super(message);
+        this.name = "MessageSizeExceededError";
+        this.message = message || "Max decompressed message size exceeded";
+        this.code = "UND_ERR_WS_MESSAGE_SIZE_EXCEEDED";
+      }
+      static [Symbol.hasInstance](instance) {
+        return instance && instance[kMessageSizeExceededError] === true;
+      }
+      get [kMessageSizeExceededError]() {
+        return true;
+      }
+    }
+    // In the order undici's module exports them.
+    return Object.freeze({
+      AbortError,
+      HTTPParserError,
+      UndiciError,
+      HeadersTimeoutError: define("HeadersTimeoutError", UndiciError, "UND_ERR_HEADERS_TIMEOUT", "Headers Timeout Error"),
+      HeadersOverflowError: define("HeadersOverflowError", UndiciError, "UND_ERR_HEADERS_OVERFLOW", "Headers Overflow Error"),
+      BodyTimeoutError: define("BodyTimeoutError", UndiciError, "UND_ERR_BODY_TIMEOUT", "Body Timeout Error"),
+      RequestContentLengthMismatchError: define(
+        "RequestContentLengthMismatchError",
+        UndiciError,
+        "UND_ERR_REQ_CONTENT_LENGTH_MISMATCH",
+        "Request body length does not match content-length header",
+      ),
+      ConnectTimeoutError: define("ConnectTimeoutError", UndiciError, "UND_ERR_CONNECT_TIMEOUT", "Connect Timeout Error"),
+      ResponseStatusCodeError: define(
+        "ResponseStatusCodeError",
+        UndiciError,
+        "UND_ERR_RESPONSE_STATUS_CODE",
+        "Response Status Code Error",
+        "ResponseStatusCodeError",
+        (self, statusCode, headers, body) => {
+          self.body = body;
+          self.status = statusCode;
+          self.statusCode = statusCode;
+          self.headers = headers;
+        },
+      ),
+      InvalidArgumentError: define("InvalidArgumentError", UndiciError, "UND_ERR_INVALID_ARG", "Invalid Argument Error"),
+      InvalidReturnValueError: define(
+        "InvalidReturnValueError",
+        UndiciError,
+        "UND_ERR_INVALID_RETURN_VALUE",
+        "Invalid Return Value Error",
+      ),
+      // `name` is the base class's, as in undici.
+      RequestAbortedError: define("RequestAbortedError", AbortError, "UND_ERR_ABORTED", "Request aborted", "AbortError"),
+      ClientDestroyedError: define("ClientDestroyedError", UndiciError, "UND_ERR_DESTROYED", "The client is destroyed"),
+      ClientClosedError: define("ClientClosedError", UndiciError, "UND_ERR_CLOSED", "The client is closed"),
+      InformationalError: define("InformationalError", UndiciError, "UND_ERR_INFO", "Request information"),
+      SocketError: define("SocketError", UndiciError, "UND_ERR_SOCKET", "Socket error", "SocketError", (self, socket) => {
+        self.socket = socket;
+      }),
+      NotSupportedError: define("NotSupportedError", UndiciError, "UND_ERR_NOT_SUPPORTED", "Not supported error"),
+      ResponseContentLengthMismatchError: define(
+        "ResponseContentLengthMismatchError",
+        UndiciError,
+        "UND_ERR_RES_CONTENT_LENGTH_MISMATCH",
+        "Response body length does not match content-length header",
+      ),
+      BalancedPoolMissingUpstreamError: define(
+        "BalancedPoolMissingUpstreamError",
+        UndiciError,
+        "UND_ERR_BPL_MISSING_UPSTREAM",
+        "No upstream has been added to the BalancedPool",
+        "MissingUpstreamError",
+      ),
+      ResponseExceededMaxSizeError: define(
+        "ResponseExceededMaxSizeError",
+        UndiciError,
+        "UND_ERR_RES_EXCEEDED_MAX_SIZE",
+        "Response content exceeded max size",
+      ),
+      RequestRetryError: define(
+        "RequestRetryError",
+        UndiciError,
+        "UND_ERR_REQ_RETRY",
+        "Request retry error",
+        "RequestRetryError",
+        retryFill,
+      ),
+      ResponseError: define("ResponseError", UndiciError, "UND_ERR_RESPONSE", "Response error", "ResponseError", retryFill),
+      SecureProxyConnectionError,
+      MessageSizeExceededError,
+    });
+  })();
+  // Locked, like __oamMakeSysError: the oam:undici shim reads the classes
+  // from here, and user code cannot swap them for others.
+  Object.defineProperty(globalThis, "__oamUndiciErrors", {
+    value: undiciErrors,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+
   // The connection policy of the undici dispatcher a fetch rides (the
   // `dispatcher` option, else the global one): `{ connector }` for one whose
   // `connect` is a function (a connect object carrying socket or TLS options,
@@ -1202,12 +1396,10 @@
   // would otherwise send the request without it.
   function dispatcherPolicy(dispatcher, holder) {
     if (holder && typeof holder.policy === "function") return holder.policy(dispatcher);
-    const refuse = new Error(
+    const refuse = new undiciErrors.NotSupportedError(
       "a fetch dispatcher that is not one of oam's undici dispatchers is not supported: " +
         "oam cannot run its dispatch(); pass the connection policy as a `connect` function",
     );
-    refuse.name = "NotSupportedError";
-    refuse.code = "UND_ERR_NOT_SUPPORTED";
     return { refuse };
   }
 
@@ -1226,7 +1418,23 @@
     // checked when the fetch resumes) has to look the same or a policy
     // failure reads as an unreachable host.
     if (e instanceof Error && e.code === "ERR_ACCESS_DENIED") return e;
-    return new TypeError("fetch failed", { cause: e instanceof Error ? e : new Error(String(e)) });
+    const cause = e instanceof Error ? e : new Error(String(e));
+    return new TypeError("fetch failed", { cause: undiciCause(cause) });
+  }
+
+  // A failure undici itself raises reaches JS as the op's coded error (the
+  // op has no JS classes to build); here it becomes the undici class node's
+  // cause is an instance of, constructed the way undici constructs it.
+  // Anything else is returned as it came.
+  function undiciCause(e) {
+    switch (e.code) {
+      // A response head over node's limit (send.rs response_head_overflow):
+      // undici's parser raises it with no message of its own.
+      case "UND_ERR_HEADERS_OVERFLOW":
+        return new undiciErrors.HeadersOverflowError();
+      default:
+        return e;
+    }
   }
 
   // The op, settled: a response, or -- for a fetch whose dispatcher carries a
@@ -1394,7 +1602,8 @@
   // `access-control-request-*` straight through (all measured), so oam does
   // too. `host` is the one node silently drops.
   //
-  // Returns `[name, message]` to refuse with, or the value to send.
+  // Returns `{ refuse: [name, message] }` -- the undici error class (see
+  // undiciErrors) and its message -- or `{ value }`, the value to send.
   function dispatchHeader(name, value) {
     switch (name) {
       case "transfer-encoding":
@@ -1533,9 +1742,10 @@
           if (fetchSemantics && name === "host") continue;
           const verdict = dispatchHeader(name, value);
           if (verdict.refuse !== undefined) {
-            const cause = new Error(verdict.refuse[1]);
-            cause.name = verdict.refuse[0];
-            throw new TypeError("fetch failed", { cause });
+            // fetch wraps it; `undici.request` rejects with the undici
+            // error itself (measured on node v22.22.2 + undici 6.24.1).
+            const cause = new undiciErrors[verdict.refuse[0]](verdict.refuse[1]);
+            throw fetchSemantics ? new TypeError("fetch failed", { cause }) : cause;
           }
           headers.push([rawName, verdict.value]);
         }
@@ -1662,9 +1872,10 @@
                 ? null
                 : 0;
         if (have !== null && (!Number.isInteger(want) || want < 0 || want !== have)) {
-          const cause = new Error("Request body length does not match content-length header");
-          cause.name = "RequestContentLengthMismatchError";
-          throw new TypeError("fetch failed", { cause });
+          // No message argument, as undici constructs it: the class's
+          // default, which makes `message` the last own name.
+          const cause = new undiciErrors.RequestContentLengthMismatchError();
+          throw fetchSemantics ? new TypeError("fetch failed", { cause }) : cause;
         }
       }
     }

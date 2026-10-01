@@ -7797,6 +7797,78 @@ srv.close();
     );
 }
 
+/// The cause of a refused fetch is an instance of the undici error class the
+/// `undici` module exports, with its `code` (#177): node's fetch is undici, so
+/// `e.cause instanceof undici.errors.InvalidArgumentError` and
+/// `e.cause.code === 'UND_ERR_INVALID_ARG'` are how code tells these failures
+/// apart. oam's cause was a plain `Error` with the name set. `undici.request`
+/// rejects with the undici error itself, not wrapped. Every line below is
+/// what node v22.22.2 prints with the npm undici 6.24.1 next to the script.
+#[test]
+fn a_fetch_refusal_cause_is_an_undici_error_class() {
+    let script = write_temp(
+        "undici_error_classes/main.mjs",
+        r#"import http from 'node:http';
+import * as undici from 'undici';
+const E = undici.errors;
+const srv = http.createServer((req, res) => { req.resume(); req.on('end', () => res.end('ok')); });
+await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const U = `http://127.0.0.1:${srv.address().port}/p`;
+const show = (label, wrapped, c) => console.log(
+  label, wrapped, c.constructor.name, c.code,
+  c instanceof E[c.constructor.name], c instanceof E.UndiciError, c instanceof E.InvalidArgumentError,
+  JSON.stringify(Reflect.ownKeys(c).map(String)));
+for (const [label, init] of [
+  ['transfer-encoding', { method: 'POST', body: 'abc', headers: { 'transfer-encoding': 'chunked' } }],
+  ['expect', { method: 'POST', body: 'abc', headers: { expect: '100-continue' } }],
+  ['content-length', { method: 'POST', body: 'abc', headers: { 'content-length': '10' } }],
+]) {
+  try { await fetch(U, init); console.log(label, 'resolved'); }
+  catch (e) { show(label, `fetch:${e.message}`, e.cause); }
+  try { await undici.request(U, init); console.log(label, 'resolved'); }
+  catch (e) { show(label, 'request', e); }
+}
+srv.close();
+// The brand, not the prototype chain, is what instanceof asks: an object
+// carrying another undici copy's brand is an instance, and a subclass
+// inherits the check.
+const foreign = { [Symbol.for('undici.error.UND_ERR_INVALID_ARG')]: true };
+console.log('foreign', foreign instanceof E.InvalidArgumentError, foreign instanceof E.UndiciError, null instanceof E.UndiciError);
+class Sub extends E.InvalidArgumentError {}
+console.log('sub', new Sub('x') instanceof E.InvalidArgumentError, new E.InvalidArgumentError('x') instanceof Sub, new Sub('x').name);
+const aborted = new E.RequestAbortedError();
+console.log('aborted', aborted.name, aborted.code, aborted.message, aborted instanceof E.AbortError, new E.AbortError().code);
+console.log('exports', Object.keys(E).length, new E.BalancedPoolMissingUpstreamError().name, new E.SocketError('s', 7).socket);
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let marks = |code: &str, message_last: bool| {
+        let names = if message_last {
+            r#""stack","name","code","message""#
+        } else {
+            r#""stack","message","name","code""#
+        };
+        format!(r#"[{names},"Symbol(undici.error.UND_ERR)","Symbol(undici.error.{code})"]"#)
+    };
+    let inv = marks("UND_ERR_INVALID_ARG", false);
+    let unsupported = marks("UND_ERR_NOT_SUPPORTED", false);
+    let mismatch = marks("UND_ERR_REQ_CONTENT_LENGTH_MISMATCH", true);
+    let expected = format!(
+        "transfer-encoding fetch:fetch failed InvalidArgumentError UND_ERR_INVALID_ARG true true true {inv}\n\
+         transfer-encoding request InvalidArgumentError UND_ERR_INVALID_ARG true true true {inv}\n\
+         expect fetch:fetch failed NotSupportedError UND_ERR_NOT_SUPPORTED true true false {unsupported}\n\
+         expect request NotSupportedError UND_ERR_NOT_SUPPORTED true true false {unsupported}\n\
+         content-length fetch:fetch failed RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH true true false {mismatch}\n\
+         content-length request RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH true true false {mismatch}\n\
+         foreign true false false\n\
+         sub true true InvalidArgumentError\n\
+         aborted AbortError UND_ERR_ABORTED Request aborted true UND_ERR_ABORT\n\
+         exports 24 MissingUpstreamError 7\n"
+    );
+    assert_eq!(stdout.replace("\r\n", "\n"), expected);
+}
+
 /// An abort after the response head ends the BODY too, where oam used to keep
 /// reading and hand over the whole thing with a clean end -- so a guard that
 /// aborted on a size limit downloaded everything anyway. node errors the body

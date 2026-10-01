@@ -82,60 +82,12 @@
     const G = globalThis;
 
     // ---- errors -----------------------------------------------------------
-    class UndiciError extends Error {
-      constructor(message, code) {
-        super(message);
-        this.name = "UndiciError";
-        this.code = code || "UND_ERR";
-      }
-    }
-    function mkError(name, code) {
-      return class extends UndiciError {
-        constructor(message) {
-          super(message || name, code);
-          this.name = name;
-          this.code = code;
-        }
-      };
-    }
-    const errors = {
-      UndiciError,
-      ConnectTimeoutError: mkError("ConnectTimeoutError", "UND_ERR_CONNECT_TIMEOUT"),
-      HeadersTimeoutError: mkError("HeadersTimeoutError", "UND_ERR_HEADERS_TIMEOUT"),
-      HeadersOverflowError: mkError("HeadersOverflowError", "UND_ERR_HEADERS_OVERFLOW"),
-      BodyTimeoutError: mkError("BodyTimeoutError", "UND_ERR_BODY_TIMEOUT"),
-      RequestContentLengthMismatchError: mkError("RequestContentLengthMismatchError", "UND_ERR_REQ_CONTENT_LENGTH_MISMATCH"),
-      ResponseContentLengthMismatchError: mkError("ResponseContentLengthMismatchError", "UND_ERR_RES_CONTENT_LENGTH_MISMATCH"),
-      RequestAbortedError: mkError("RequestAbortedError", "UND_ERR_ABORTED"),
-      AbortError: mkError("AbortError", "UND_ERR_ABORTED"),
-      InformationalError: mkError("InformationalError", "UND_ERR_INFO"),
-      InvalidArgumentError: mkError("InvalidArgumentError", "UND_ERR_INVALID_ARG"),
-      InvalidReturnValueError: mkError("InvalidReturnValueError", "UND_ERR_INVALID_RETURN_VALUE"),
-      ClientDestroyedError: mkError("ClientDestroyedError", "UND_ERR_DESTROYED"),
-      ClientClosedError: mkError("ClientClosedError", "UND_ERR_CLOSED"),
-      SocketError: mkError("SocketError", "UND_ERR_SOCKET"),
-      NotSupportedError: mkError("NotSupportedError", "UND_ERR_NOT_SUPPORTED"),
-      BalancedPoolMissingUpstreamError: mkError("BalancedPoolMissingUpstreamError", "UND_ERR_BPL_MISSING_UPSTREAM"),
-      ResponseStatusCodeError: class ResponseStatusCodeError extends UndiciError {
-        constructor(message, statusCode, headers, body) {
-          super(message || "Response Status Code Error", "UND_ERR_RESPONSE_STATUS_CODE");
-          this.name = "ResponseStatusCodeError";
-          this.statusCode = statusCode;
-          this.headers = headers;
-          this.body = body;
-        }
-      },
-      RequestRetryError: class RequestRetryError extends UndiciError {
-        constructor(message, code, { headers, data } = {}) {
-          super(message, "UND_ERR_REQ_RETRY");
-          this.name = "RequestRetryError";
-          this.statusCode = code;
-          this.headers = headers;
-          this.data = data;
-        }
-      },
-      SecureProxyConnectionError: mkError("SecureProxyConnectionError", "UND_ERR_PRX_TLS"),
-    };
+    // The classes globalThis.fetch raises (bootstrap.js undiciErrors, which
+    // has their shape), so `e.cause instanceof errors.InvalidArgumentError`
+    // holds for a fetch refusal as it does in node. A fresh object: undici's
+    // `errors` export is an ordinary one, and adding to it must not reach
+    // the locked table.
+    const errors = { ...G.__oamUndiciErrors };
 
     // ---- undici-shaped response body -------------------------------------
     // request().body is a Readable streaming the response bytes, plus the

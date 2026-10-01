@@ -1613,9 +1613,14 @@ an error where oam used to send something)
   neither `close` nor `keep-alive` (case-insensitively -- `close, transfer-encoding`, the
   CL.TE evasion, is the one that matters) are refused with undici's texts
   (`invalid transfer-encoding header`, `invalid keep-alive header`, `invalid upgrade header`,
-  `expect header not supported`, `invalid connection header`), as `cause.name` on a
-  `TypeError: fetch failed`. Node's cause is an instance of the matching undici error class;
-  oam's is a plain `Error` with that `name` and no `UND_ERR_*` code. An accepted `connection`
+  `expect header not supported`, `invalid connection header`), as the `cause` of a
+  `TypeError: fetch failed`. As in Node, the cause is an instance of the matching undici
+  error class (`InvalidArgumentError`, `NotSupportedError`,
+  `RequestContentLengthMismatchError`; `HeadersOverflowError` for a response head over the
+  limit) with its `UND_ERR_*` `code` and undici's `Symbol.for('undici.error.*')` brands, so
+  `cause instanceof undici.errors.InvalidArgumentError` holds for the built-in `undici` and
+  for a copy from `node_modules` (case 209); `undici.request` rejects with the error itself.
+  Up to 0.17.1 the cause was a plain `Error` with that `name` and no code. An accepted `connection`
   goes out lowercased, as node's does; `te`, also hop-by-hop, goes out untouched, because
   node sends it.
 - A `content-length` that disagrees with the body is refused as
