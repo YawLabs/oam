@@ -52,6 +52,7 @@ use hyper::client::conn::{http1, http2};
 use hyper_util::rt::TokioExecutor;
 
 use super::connector::{ConnInfo, ConnStats, OamConnector};
+use super::sent::Dispatched;
 use super::{BoxError, ReqBody};
 
 /// The pool is keyed on scheme + authority exactly as hyper-util was, so a
@@ -189,6 +190,11 @@ impl Pool {
                 is_h2,
                 key: conn_key,
             } = conn;
+            // The request has a connection, and hyper writes it as soon as
+            // it is handed over: node's 'finish' for http.request (`sent`).
+            if let Some(dispatched) = req.extensions().get::<Dispatched>() {
+                dispatched.fire();
+            }
             *req.uri_mut() = original_uri.clone();
             set_host_header(&mut req, is_h2);
             rewrite_request_uri(req.uri_mut(), is_h2, proxied, is_connect);

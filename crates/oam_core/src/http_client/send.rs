@@ -46,6 +46,7 @@ use super::connector::{ConnInfo, SuppliedConn};
 use super::decode::{self, MAX_CODINGS, Plan};
 use super::prepare::{self, PrepareError};
 use super::redirect::{self, Next};
+use super::sent::Dispatched;
 use super::tls_config::TlsRange;
 use super::transport::{channel_body, empty_body, full_body};
 use super::{HttpTransport, NetCheck, NetTarget, ReqBody, Route};
@@ -116,6 +117,14 @@ pub struct FetchRequest {
     pub tls_min_version: Option<String>,
     #[serde(default)]
     pub tls_max_version: Option<String>,
+    /// Handle of a [`super::sent`] signal to fire once the request has a
+    /// connection: `http.request`'s, for node's `'finish'` (#193).
+    #[serde(default)]
+    pub sent_signal: Option<u64>,
+    /// That signal's sending half. Never from JS: the engine's fetch op
+    /// takes it from the runtime's registry and puts it here.
+    #[serde(skip)]
+    pub dispatched: Option<Dispatched>,
 }
 
 fn yes() -> bool {
@@ -199,6 +208,9 @@ struct LoopState {
     /// [`response_head_overflow`]).
     max_header_size: u64,
     fetch_semantics: bool,
+    /// Fired by the pool when a connection has a hop's request (see
+    /// [`super::sent`]); carried across a park, dropped with the fetch.
+    dispatched: Option<Dispatched>,
 }
 
 enum BodySource {
@@ -322,6 +334,7 @@ pub async fn fetch(
             .max_header_size
             .unwrap_or_else(crate::http_head::max_http_header_size),
         fetch_semantics: req.fetch_semantics,
+        dispatched: req.dispatched,
     };
     run(state, &bodies, &ids, &continuations).await
 }
@@ -523,6 +536,9 @@ async fn run(
             *request.method_mut() = state.method.clone();
             *request.uri_mut() = uri.clone();
             *request.headers_mut() = hop_headers.clone();
+            if let Some(dispatched) = &state.dispatched {
+                request.extensions_mut().insert(dispatched.clone());
+            }
             match state.transport.send(&state.route, request).await {
                 Ok(response) => break response,
                 Err(e)

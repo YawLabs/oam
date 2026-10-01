@@ -19833,9 +19833,19 @@
         this._onSocket = false;
         this._socketConnected = false;
         this._socketFailure = null;
-        // oam's own transport has the request: a callback is called as the
-        // transport takes its chunk.
+        // oam's own transport. `_fetchDispatched`: it has been handed the
+        // request. `_fetchSent`: it has a connection for it (the sent
+        // signal, `_sentSignal` while open) -- from then on the request is
+        // being written, a write() callback is called as the transport takes
+        // its chunk, and 'finish' follows the last of them (`_finishOnSent`:
+        // end() has asked for it; `_channelPending`: chunks the transport
+        // has yet to take). A request that never gets a connection has
+        // neither, as in node.
         this._fetchDispatched = false;
+        this._fetchSent = false;
+        this._sentSignal = null;
+        this._finishOnSent = false;
+        this._channelPending = 0;
         // Inside the socket's 'connect' / 'secureConnect' emit, ahead of the
         // request's own listener; and what a listener there closed the
         // socket with (true: no error), held for that listener to report.
@@ -19977,11 +19987,16 @@
           // follows the wire rather than buffering. On oam's own transport
           // that is also when the callback is called; over a socket it
           // waits for the socket's write (_settleWrites).
+          var entry = callback ? this._queueWriteCallback(callback) : null;
           var taken = this._channelWrite(bytes);
-          if (callback && this._fetchDispatched) {
-            taken.then(() => { callback(); }, () => { callback(); });
+          if (entry !== null && this._fetchDispatched) {
+            var self = this;
+            var settle = function () {
+              entry.taken = true;
+              self._settleFetchWrites();
+            };
+            taken.then(settle, settle);
           } else {
-            if (callback) this._queueWriteCallback(callback);
             taken.then(() => {}, () => {});
           }
           return true;
@@ -20004,12 +20019,51 @@
       // body up to the end of its chunk. (Writes a GET or HEAD drops --
       // _startBodyStream -- are not in the body: theirs wait for the head.)
       _queueWriteCallback(callback) {
-        this._writeCallbacks.push({
+        var entry = {
           at: this._droppedWrites ? 0 : this._bodyQueued,
           callback: callback,
           // Queued on the socket by node's flush in the 'socket' tick.
           flushed: false,
-        });
+          // oam's own transport has taken the chunk.
+          taken: false,
+        };
+        this._writeCallbacks.push(entry);
+        return entry;
+      }
+
+      // oam's own transport: the write() callbacks, in order, of the chunks
+      // it has taken -- once it has a connection to write them to.
+      _settleFetchWrites() {
+        if (!this._fetchSent || this._aborted) return;
+        var queue = this._writeCallbacks;
+        while (queue.length > 0 && queue[0].taken) queue.shift().callback(null);
+      }
+
+      // oam's own transport has a connection for the request (or answered
+      // it, or failed it after having had one): what it was handed is being
+      // written, and 'finish' is due once the last chunk is with it.
+      _fetchRequestSent() {
+        if (this._fetchSent) return;
+        this._fetchSent = true;
+        this._socketConnected = true;
+        this._settleFetchWrites();
+        this._maybeFetchFinish();
+      }
+
+      _maybeFetchFinish() {
+        if (!this._finishOnSent || !this._fetchSent || this._channelPending > 0) return;
+        this._finishOnSent = false;
+        this._emitFinish();
+      }
+
+      // The sent signal is done with: dropped, and whether it had fired --
+      // read here, synchronously, because the wait's own completion may
+      // still be on its way when the fetch settles.
+      _closeSentSignal() {
+        if (this._sentSignal === null) return false;
+        var fired = natives.fetchSentClose(this._sentSignal);
+        this._sentSignal = null;
+        return fired;
       }
 
       // node flushes what the request has queued onto its socket in the tick
@@ -20089,7 +20143,13 @@
             });
         // The tail never rejects: a failed write is the transport's report,
         // not a reason to strand the writes queued behind it.
-        this._channelTail = next.then(function () {}, function () {});
+        var self = this;
+        this._channelPending++;
+        var taken = function () {
+          self._channelPending--;
+          if (!self._agentPath) self._maybeFetchFinish();
+        };
+        this._channelTail = next.then(taken, taken);
         return next;
       }
 
@@ -20229,7 +20289,8 @@
           this._finishAwaitsPath = true;
           return;
         }
-        this._emitFinish();
+        this._finishOnSent = true;
+        this._maybeFetchFinish();
       }
 
       _emitFinish() {
@@ -20403,10 +20464,18 @@
       _doFetchRequest(bodyData) {
         var self = this;
         self._sent = true;
-        // The transport has what was written so far: its callbacks are due
-        // (never inside the write() or end() that got here).
+        // The transport has what was written so far, and says when it has a
+        // connection to write it to (the sent signal): the callbacks of
+        // those chunks, and 'finish', wait for that. Until then they are the
+        // connecting socket's, in node's terms (_handToSocket).
         self._fetchDispatched = true;
-        if (self._writeCallbacks.length > 0) queueMicrotask(function () { self._settleAllWrites(); });
+        for (var wi = 0; wi < self._writeCallbacks.length; wi++) self._writeCallbacks[wi].taken = true;
+        self._handToSocket(self._fetchSocket);
+        var signal = natives.fetchSentOpen();
+        self._sentSignal = signal;
+        natives.fetchSentWait(signal).then(function (sent) {
+          if (sent && self._sentSignal === signal) self._fetchRequestSent();
+        }, function () {});
         self._fetchActivity();
         // node's _storeHeader puts a Connection header on every request it
         // sends -- `close` when the socket is not to be kept alive,
@@ -20448,6 +20517,7 @@
           // sent it: no `accept` / `user-agent` / `accept-encoding`, no
           // decoding, `content-encoding` and `content-length` intact.
           __oamRawExchange: true,
+          __oamSentSignal: signal,
         };
         // The request's own response-head limit; without one the transport
         // applies the process-wide default.
@@ -20458,10 +20528,14 @@
           fetchOpts.body = bodyData;
         }
         oamFetchInternal.fetch(self._url, fetchOpts).then(function (raw) {
+          self._closeSentSignal();
           if (self._aborted) {
             bodyCancel(raw.bodyHandle);
             return;
           }
+          // An answer is an answer to a request that was sent, whether or
+          // not the signal's own completion has arrived.
+          self._fetchRequestSent();
           self._fillFetchSocket(raw);
           self._emitResponse(raw, false);
           if (self._droppedWrites && !self._ended) {
@@ -20481,7 +20555,12 @@
           // A torn-down request swallows the transport failure it caused:
           // Node's abort()/destroy() destroys the socket, and the resulting
           // ECONNRESET is never re-emitted on the destroyed request.
+          var hadConnection = self._closeSentSignal();
           if (self._aborted) return;
+          // Failed on a connection it had: the request was written as far as
+          // node's would have been, and finished first. Failed without one
+          // (refused, unresolvable): nothing was written, and no 'finish'.
+          if (hadConnection) self._fetchRequestSent();
           // Map transport failures to Node-shaped codes: retry logic keys
           // on err.code, and the transport's own texts carry none.
           var msg = typeof err === "string" ? err : (err && err.message) || String(err);
@@ -20550,6 +20629,7 @@
           } else {
             mapped = err instanceof Error ? err : new Error(msg);
           }
+          if (self._socketFailure === null) self._socketFailure = mapped;
           self._failBeforeResponse(mapped);
         });
       }
@@ -21687,6 +21767,7 @@
         // Abort an in-flight upload so the transport tears the request down
         // instead of completing it with a truncated body.
         this._cancelBodyStream();
+        this._closeSentSignal();
         const res = this.res;
         if (res && !res.destroyed) {
           const reset = new Error("aborted");

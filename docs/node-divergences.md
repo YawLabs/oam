@@ -1385,9 +1385,15 @@ What still differs:
   request's `timeout` option, an agent's `timeout`) is re-armed by what the transport does
   for the request -- sending it, each upload chunk, the response head, each body chunk --
   rather than by each read and write on a wire
-  (`conformance/cases/150-http-request-timeouts.mjs`); `'finish'` follows `end()` at once,
-  as Node's does for a socket that is already connected, so it also fires for a request
-  whose connection then fails (Node's never does); it emits `'close'` only when the
+  (`conformance/cases/150-http-request-timeouts.mjs`); `'finish'` and the `write()`
+  callbacks follow the transport having a connection for the request -- dialled or taken
+  from its pool -- so a request whose connection is refused gets no `'finish'`,
+  `req.writableFinished` stays `false` and its callbacks hear
+  `ERR_SOCKET_CLOSED_BEFORE_CONNECTION` after `'close'`, as in Node
+  (`conformance/cases/193-http-request-finish-needs-a-connection.mjs`; up to 0.17.1
+  `'finish'` followed `end()` at once whatever became of the connection), though they
+  mark the request handed to the connection rather than each chunk written by it, so a
+  streamed chunk is called back when the transport takes it; it emits `'close'` only when the
   request is aborted or destroyed; and through an environment proxy its peer is the
   proxy. At the end of a response whose connection stays open,
   `res.socket` is null, as node detaches a kept-alive socket. Up to 0.16.2 it was a fixed object naming the host as

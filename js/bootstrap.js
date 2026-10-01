@@ -1572,6 +1572,11 @@
     if (rawPayload && typeof init.__oamMaxHeaderSize === "number") {
       request.max_header_size = init.__oamMaxHeaderSize;
     }
+    // http.request's sent signal: fired once the transport has a connection
+    // for the request, which is when node's 'finish' is due (#193).
+    if (rawPayload && typeof init.__oamSentSignal === "number") {
+      request.sent_signal = init.__oamSentSignal;
+    }
     // An undici-style dispatcher may carry a connect.lookup hook -- the
     // DNS-rebind / SSRF pin. The oam:undici shim exposes it as
     // `_oamConnectLookup`. node honours that hook however the dispatcher was

@@ -6,8 +6,8 @@
 // oam used to emit it on the tick after end() on every path, before the
 // socket had even connected: timing tools that measure the request phase
 // from 'connect' to 'finish' (got's http-timer) got NaN. On oam's own
-// transport (no agent socket) it still follows end() at once, as node's does
-// for a socket that is already connected.
+// transport (no agent socket) it follows the transport's connection (case
+// 193).
 //
 // A write() callback keeps the same company (second half): it is called
 // once the socket has written its chunk -- after 'connect' /
