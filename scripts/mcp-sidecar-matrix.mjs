@@ -15,7 +15,8 @@
 //
 // resolving the package's REAL bin from its package.json, the way the broker
 // does. A harness that invented its own launch could pass while production
-// fails. Then it speaks MCP over stdio: initialize, notifications/initialized,
+// fails. The broker itself has a row too, launched the way `yaw-mcp install`
+// writes it into a client config: `oam run --no-check <dist/index.js>`. Then it speaks MCP over stdio: initialize, notifications/initialized,
 // tools/list -- and requires a non-empty tool list. Booting is not enough; a
 // sidecar that starts and serves nothing is still broken.
 //
@@ -125,6 +126,14 @@ const RESP_FAKE_VERSION = "7.4.0";
 
 // The oam-hosted set from bundles.json. `github` is the only exclusion left:
 // it is docker-hosted, and the rewrite only ever touches node/npx launches.
+// Plus the broker that does the rewriting (`yaw-mcp`), which is in no bundle:
+// it is the process every client config launches.
+//
+// `oamFlags` go between `run` and the entry, on the oam arm only: the node arm
+// is `node <entry>` whatever the row says. `isolateHome` points HOME,
+// USERPROFILE, APPDATA and LOCALAPPDATA at a scratch home per arm, and runs
+// the arm from inside it, for a sidecar that would otherwise read the box's
+// real config.
 //
 // `args` are the launch args that follow the package spec, and ctxlint is the
 // only sidecar that has any (`npx -y @yawlabs/ctxlint@latest serve`). That
@@ -430,6 +439,62 @@ const SIDECARS = [
       },
     },
   },
+  {
+    // The broker itself (#221). Every row above is a sidecar the broker puts
+    // on oam through the npx rewrite; none of them can see a regression in
+    // how oam hosts the broker -- its stdio framing, its config walk, the
+    // child_process and fetch it uses to start and refresh sidecars. And
+    // `yaw-mcp install` writes exactly this shape into every client config
+    // when oam is installed: `<oam> run --no-check <dist/index.js>`.
+    name: "yaw-mcp",
+    pkg: "@yawlabs/mcp",
+    oamFlags: ["--no-check"],
+    // Every broker path derives from os.homedir(), and its project-config walk
+    // goes from the cwd up to the root, so without this it reads the box's own
+    // ~/.yaw-mcp -- the release box is a box people use.
+    isolateHome: true,
+    envPrefixes: ["YAW_MCP_"],
+    // Nothing reaches the network or spawns unasked: no self-upgrade, no
+    // sidecar refresh, no prewarm, no heal.
+    env: {
+      YAW_MCP_AUTO_UPGRADE: "0",
+      YAW_MCP_SIDECAR_REFRESH: "0",
+      YAW_MCP_AUTO_PREWARM: "0",
+      YAW_MCP_AUTO_HEAL: "0",
+    },
+    call: {
+      // Walks the config locations (the scratch home's, and the cwd up to the
+      // root) and answers from what it found: no network, no sidecar started.
+      tool: "mcp_connect_discover",
+      args: () => ({}),
+      deterministic: true,
+      // The meta-tools, and nothing else: a tool from any other server means
+      // the broker found a bundle outside the scratch home.
+      expectTools: (tools) => {
+        const missing = BROKER_META_TOOLS.filter((t) => !tools.includes(t));
+        if (missing.length > 0) return `the broker no longer serves ${missing.join(", ")}`;
+        const foreign = tools.filter((t) => !t.startsWith("mcp_connect_"));
+        return foreign.length > 0
+          ? `the broker served ${foreign.slice(0, 3).join(", ")} -- it loaded a bundle from outside its scratch home`
+          : null;
+      },
+      expect: (text) =>
+        text.includes("No servers installed")
+          ? null
+          : `mcp_connect_discover did not report the empty scratch home: ${text.slice(0, 120)}`,
+    },
+  },
+];
+
+// The meta-tools a broker with no servers installed serves: the ones a client
+// needs to find, load and drop servers. It serves more (11 at @yawlabs/mcp
+// 1.0.18); these are the ones whose loss would break every session.
+const BROKER_META_TOOLS = [
+  "mcp_connect_discover",
+  "mcp_connect_activate",
+  "mcp_connect_deactivate",
+  "mcp_connect_dispatch",
+  "mcp_connect_health",
 ];
 
 // The install scripts the matrix does not run and has READ, with why skipping
@@ -449,6 +514,12 @@ const REVIEWED_INSTALL_SCRIPTS = [
     event: "postinstall",
     script: "node install.mjs",
     why: "downloads Chrome for Testing into the user cache; the matrix drives the browser already on the box, and PUPPETEER_SKIP_DOWNLOAD=1 made it a no-op before scripts were turned off",
+  },
+  {
+    name: "@yawlabs/mcp",
+    event: "preinstall",
+    script: "node -e \"const major=Number(process.versions.node.split('.')[0]);if(major<20){console.error('@yawlabs/mcp requires Node 20 or newer; this is Node '+process.versions.node+'. Upgrade Node, then re-run the install.');process.exit(1);}\"",
+    why: "refuses an install on node older than 20 and writes nothing; the engines floor check covers the same node, and the installed tree is the same with or without it",
   },
 ];
 
@@ -1129,6 +1200,24 @@ function sidecarEnv(inherited, prefixes, ...layers) {
   return Object.assign(env, { NO_COLOR: "1" }, ...layers);
 }
 
+/** The variables os.homedir() and the per-user app-data lookups read, all
+ *  pointed into `home` (isolateHome). */
+function homeEnv(home) {
+  return {
+    HOME: home,
+    USERPROFILE: home,
+    APPDATA: join(home, "AppData", "Roaming"),
+    LOCALAPPDATA: join(home, "AppData", "Local"),
+  };
+}
+
+/** Create an isolateHome row's scratch home for one arm; returns it, as the
+ *  arm's cwd. */
+function makeHome(home) {
+  for (const env of [homeEnv(home).APPDATA, homeEnv(home).LOCALAPPDATA]) mkdirSync(env, { recursive: true });
+  return home;
+}
+
 /** The `*_RUNTIME=node` layer that pins a launcher's control arm to node. */
 function nodePinFor(pin) {
   return Object.fromEntries(pin.vars.map((v) => [v, "node"]));
@@ -1146,6 +1235,7 @@ function armEnv(host, s, call, ctx, nodePin, inherited) {
   return sidecarEnv(
     inherited,
     s.envPrefixes ?? [],
+    s.isolateHome ? homeEnv(ctx.profileDir) : {},
     s.env ?? {},
     call?.env ? call.env(ctx) : {},
     host === "node" ? nodePin : {},
@@ -2386,6 +2476,82 @@ async function selfTest() {
         for (const [k, v] of Object.entries(fetch.call.env(ctx("oam")))) {
           assertDeep([oamEnv[k], nodeEnv[k]], [v, v], `the call's ${k} reaches both arms, over the box's own value`);
         }
+      },
+    },
+    {
+      name: "a row's oam flags reach the oam arm only, before the entry",
+      run() {
+        assertDeep(probeArgv("oam", "e.js"), ["run", "e.js"], "no flags, no args: a bare run");
+        assertDeep(probeArgv("oam", "e.js", ["serve"]), ["run", "e.js", "--", "serve"], "script args after --");
+        assertDeep(
+          probeArgv("oam", "e.js", [], ["--no-check"]),
+          ["run", "--no-check", "e.js"],
+          "the shape `yaw-mcp install` writes: the flag between run and the entry",
+        );
+        assertDeep(
+          probeArgv("oam", "e.js", ["serve"], ["--no-check"]),
+          ["run", "--no-check", "e.js", "--", "serve"],
+          "flags and script args together",
+        );
+        assertDeep(probeArgv("node", "e.js", ["serve"], ["--no-check"]), ["e.js", "serve"], "the node arm is node's own invocation");
+        const broker = SIDECARS.find((s) => s.name === "yaw-mcp");
+        assertDeep(broker?.oamFlags, ["--no-check"], "the broker row launches as install writes it");
+      },
+    },
+    {
+      name: "the broker row runs in a scratch home, with nothing that reaches out switched on",
+      run() {
+        // #221: every broker path derives from os.homedir(), so an arm that
+        // inherits the box's home reads the box's real ~/.yaw-mcp.
+        const broker = SIDECARS.find((s) => s.name === "yaw-mcp");
+        const inherited = {
+          PATH: "/bin",
+          HOME: "/home/real",
+          USERPROFILE: "C:\\Users\\real",
+          APPDATA: "C:\\Users\\real\\AppData\\Roaming",
+          LOCALAPPDATA: "C:\\Users\\real\\AppData\\Local",
+          YAW_MCP_AUTO_UPGRADE: "1",
+          YAW_MCP_CONFIG: "/home/real/.yaw-mcp/bundles.json",
+        };
+        const nodePin = nodePinFor({ launcher: true, vars: ["YAW_MCP_DEFAULT_RUNTIME"] });
+        for (const host of ["oam", "node"]) {
+          const profileDir = join("scratch", `yaw-mcp-${host}`);
+          const env = armEnv(host, broker, broker.call, { host, profileDir }, nodePin, inherited);
+          assertDeep(
+            [env.HOME, env.USERPROFILE, env.APPDATA, env.LOCALAPPDATA],
+            [profileDir, profileDir, join(profileDir, "AppData", "Roaming"), join(profileDir, "AppData", "Local")],
+            `the ${host} arm's home is its scratch home, not the box's`,
+          );
+          assertDeep(
+            ["YAW_MCP_AUTO_UPGRADE", "YAW_MCP_SIDECAR_REFRESH", "YAW_MCP_AUTO_PREWARM", "YAW_MCP_AUTO_HEAL"].map((k) => env[k]),
+            ["0", "0", "0", "0"],
+            `the ${host} arm starts nothing and fetches nothing unasked`,
+          );
+          assertDeep("YAW_MCP_CONFIG" in env, false, `the box's own YAW_MCP_* settings are scrubbed from the ${host} arm`);
+        }
+        const fetch = SIDECARS.find((s) => s.name === "fetch");
+        const fetchEnv = armEnv("oam", fetch, fetch.call, { host: "oam", loopback: { url: "x" }, profileDir: "p" }, {}, inherited);
+        assertDeep(fetchEnv.HOME, "/home/real", "a row that does not ask for a scratch home keeps the box's");
+      },
+    },
+    {
+      name: "the broker row asserts on its whole tool list",
+      run() {
+        const { expectTools, expect } = SIDECARS.find((s) => s.name === "yaw-mcp").call;
+        const served = [...BROKER_META_TOOLS, "mcp_connect_exec", "mcp_connect_secrets"];
+        assertDeep(expectTools(served), null, "the meta-tools and nothing else");
+        assertDeep(
+          /no longer serves mcp_connect_activate/.test(expectTools(served.filter((t) => t !== "mcp_connect_activate")) ?? ""),
+          true,
+          "a lost meta-tool is named",
+        );
+        assertDeep(
+          /outside its scratch home/.test(expectTools([...served, "github_create_issue"]) ?? ""),
+          true,
+          "a tool from a loaded server means the isolation leaked",
+        );
+        assertDeep(expect("No servers installed. Browse the catalog ..."), null, "the empty home's answer passes");
+        assertDeep(expect("Installed servers (3): ...") !== null, true, "a populated config does not");
       },
     },
     {
@@ -3683,7 +3849,7 @@ async function teardown(child) {
  *  set, and `left` -- the processes it left running (null: not checked).
  *  `drainMs` caps the wait for stderr to close (STDERR_DRAIN_MS); only the
  *  self-test sets it. */
-function probe(host, entry, { env, scriptArgs = [], call = null, ctx, drainMs = STDERR_DRAIN_MS }) {
+function probe(host, entry, { env, scriptArgs = [], oamFlags = [], cwd, call = null, ctx, drainMs = STDERR_DRAIN_MS }) {
   // `--` is REQUIRED before script args: `oam run` declares script_args with
   // clap's `last = true`, so `oam run entry.js serve` is "unexpected argument".
   // This mirrors oam-spawn.ts exactly (`["run", entry, "--", ...rest]` when
@@ -3693,10 +3859,9 @@ function probe(host, entry, { env, scriptArgs = [], call = null, ctx, drainMs = 
   // The node arm is node's own plain invocation, which is what the broker falls
   // back to and therefore the right reference: `node <entry> [...rest]`.
   const cmd = host === "oam" ? oamBin : process.execPath;
-  const oamArgv = scriptArgs.length > 0 ? ["run", entry, "--", ...scriptArgs] : ["run", entry];
-  const argv = host === "oam" ? oamArgv : [entry, ...scriptArgs];
+  const argv = probeArgv(host, entry, scriptArgs, oamFlags);
   return new Promise((resolveP) => {
-    const child = spawn(cmd, argv, { stdio: ["pipe", "pipe", "pipe"], env, windowsHide: true });
+    const child = spawn(cmd, argv, { stdio: ["pipe", "pipe", "pipe"], env, cwd, windowsHide: true });
     // 'exit' can fire before the pipe's last stderr chunk is read, and a
     // sidecar that refuses to start prints why and exits at once -- the
     // refusal nodeHostRefusal reads. Resolving waits for stderr to close,
@@ -3816,6 +3981,12 @@ function probe(host, entry, { env, scriptArgs = [], call = null, ctx, drainMs = 
             });
             return;
           }
+          // A row that asserts on the tool list itself, not just one tool in it.
+          const listWhy = call.expectTools ? call.expectTools(tools) : null;
+          if (listWhy) {
+            done({ ok: true, tools, call: { ok: false, why: `tools/list: ${listWhy}` } });
+            return;
+          }
           nextStep();
         } else if (typeof msg.id === "number" && msg.id >= 3 && msg.id === 3 + step) {
           if (step < steps.length - 1) {
@@ -3845,6 +4016,15 @@ function probe(host, entry, { env, scriptArgs = [], call = null, ctx, drainMs = 
       },
     });
   });
+}
+
+/** One arm's argv after its executable. The oam arm is `run [...oamFlags]
+ *  <entry> [-- ...scriptArgs]`; the node arm is `<entry> [...scriptArgs]`
+ *  whatever the row's oamFlags. Pure, for the self-test. */
+function probeArgv(host, entry, scriptArgs = [], oamFlags = []) {
+  if (host !== "oam") return [entry, ...scriptArgs];
+  const run = ["run", ...oamFlags, entry];
+  return scriptArgs.length > 0 ? [...run, "--", ...scriptArgs] : run;
 }
 
 /** The first line of a sidecar's stderr that looks like a diagnosis.
@@ -4122,9 +4302,11 @@ for (const s of selected) {
   const unmet = s.call?.requires ? await s.call.requires(ctxFor("oam")) : null;
   const call = s.call && !unmet ? s.call : null;
   const scriptArgs = s.args ?? [];
+  const oamFlags = s.oamFlags ?? [];
+  const cwdFor = (host) => (s.isolateHome ? makeHome(ctxFor(host).profileDir) : undefined);
 
   progress(`  ${s.name.padEnd(12)} probing on oam...`);
-  const oam = await probe("oam", bin.entry, { env: envFor("oam", call), scriptArgs, call, ctx: ctxFor("oam") });
+  const oam = await probe("oam", bin.entry, { env: envFor("oam", call), scriptArgs, oamFlags, cwd: cwdFor("oam"), call, ctx: ctxFor("oam") });
 
   if (!oam.ok) {
     // Ask the control here too. A sidecar that fails at boot, initialize or
@@ -4134,7 +4316,7 @@ for (const s of selected) {
     // it. Only the tools/call arm used to be adjudicated, so exactly the shape
     // most likely to be upstream was the one never checked.
     progress(`  ${s.name.padEnd(12)} node control (boot)...`);
-    const control = await probe("node", bin.entry, { env: envFor("node", call), scriptArgs, call, ctx: ctxFor("node") });
+    const control = await probe("node", bin.entry, { env: envFor("node", call), scriptArgs, cwd: cwdFor("node"), call, ctx: ctxFor("node") });
     // A control that cannot run this sidecar on this box's node is no evidence
     // at any depth -- the one shape depth comparison cannot see, since a node
     // refused at boot and an oam that fails at boot both stop at depth 0.
@@ -4165,7 +4347,7 @@ for (const s of selected) {
   // what decides whose bug a red is, and a control taken only after a failure
   // is how "oam broke it" gets asserted first and checked second.
   progress(`  ${s.name.padEnd(12)} node control...`);
-  const control = await probe("node", bin.entry, { env: envFor("node", call), scriptArgs, call, ctx: ctxFor("node") });
+  const control = await probe("node", bin.entry, { env: envFor("node", call), scriptArgs, cwd: cwdFor("node"), call, ctx: ctxFor("node") });
   // probeFailed keeps two very different facts apart. "The control ran the tool
   // and it failed" is evidence the sidecar is broken; "the control never got far
   // enough to invoke anything" is no evidence at all, and folding them together
