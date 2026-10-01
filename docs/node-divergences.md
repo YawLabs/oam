@@ -1061,7 +1061,7 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   true.
 - **Node members absent from both classes**, which the mechanical walk cannot see by
   construction: `destroySoon`. (`resetAndDestroy` is on both now, the same function as in
-  Node -- entry 46.) `net.Socket` has had `read()`,
+  Node -- entry 47.) `net.Socket` has had `read()`,
   `'readable'` and `push()` since 0.16.3 (below); a `TLSSocket`, being a Duplex, always had
   `read`.
 - **A bare `connect()` handshakes.** `new tls.TLSSocket(null, opts).connect(port, host)` runs
@@ -2377,7 +2377,7 @@ _(probed)_ Node v22.22.2 vs oam on Windows: lookup and createConnection guards o
 a node-hosted `createSecureServer` for `ca`, `servername`, a refusing lookup, an untrusted
 certificate and `rejectUnauthorized: false`, line for line identical.
 
-### 46. `socket.resetAndDestroy()` while `end()` is shutting the socket down
+### 47. `socket.resetAndDestroy()` while `end()` is shutting the socket down
 
 `resetAndDestroy()` is Node's otherwise: SO_LINGER 0 and a close, so the peer's read fails
 with `read ECONNRESET` and nothing unsent is delivered; the socket returned, destroyed at
