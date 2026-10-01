@@ -20,7 +20,8 @@
 //
 // Each response is its status line, its header lines other than date
 // (names lowercased and sorted: the order and the case node writes them in
-// are other concerns), and its body as sent.
+// are other concerns), and its body as sent. Trailer names are written in
+// title case, which oam's trailers keep (270 has the case rules).
 import http from "node:http";
 import net from "node:net";
 
@@ -40,7 +41,7 @@ const routes = [
   ["write('a'), end('b')", (res) => { res.write("a"); res.end("b"); }],
   ["content-length, end('text')", (res) => { res.setHeader("content-length", "4"); res.end("text"); }],
   ["writeHead(200), end('text')", (res) => { res.writeHead(200); res.end("text"); }],
-  ["write, addTrailers, end", (res) => { res.write("a"); res.addTrailers({ "x-t": "1" }); res.end(); }],
+  ["write, addTrailers, end", (res) => { res.write("a"); res.addTrailers({ "X-T": "1" }); res.end(); }],
   ["transfer-encoding header, write", (res) => { res.setHeader("transfer-encoding", "chunked"); res.write("a"); res.end(); }],
   // The handler's own connection header is the only one sent.
   ["connection header, end('x')", (res) => { res.setHeader("connection", "close"); res.end("x"); }],
@@ -59,7 +60,7 @@ const routes = [
   )],
   // Chunked (and its trailers sent) only for a request saying `TE: chunked`.
   ["Trailer header, addTrailers, end('x')", refused(
-    (res) => { res.setHeader("trailer", "x-t"); res.addTrailers({ "x-t": "1" }); res.end("x"); },
+    (res) => { res.setHeader("trailer", "x-t"); res.addTrailers({ "X-T": "1" }); res.end("x"); },
     (res) => { res.removeHeader("trailer"); res.end("recovered"); },
   )],
 ];
