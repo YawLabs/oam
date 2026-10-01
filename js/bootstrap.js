@@ -1312,6 +1312,11 @@
     return headers;
   }
 
+  // The Request class fetch builds its own request with. A script may
+  // replace or delete `globalThis.Request` (a polyfill's installGlobals
+  // does), and node's fetch goes on using undici's own class, so fetch must
+  // not read the global.
+  let OamRequest = null;
   if (typeof globalThis.Request !== "function") {
     class Request {
       constructor(input, init = undefined) {
@@ -1562,6 +1567,7 @@
     installBody(Request);
     brand(Request, "Request");
     globalThis.Request = Request;
+    OamRequest = Request;
   }
 
   // --------------------------------------------------------- BroadcastChannel
@@ -2247,7 +2253,7 @@
   // used, unless `init` brought its own body), the request's signal and
   // redirect mode, and the dispatcher.
   function fetchRequest(input, init) {
-    const request = new globalThis.Request(input, init);
+    const request = new OamRequest(input, init);
     const state = requestStates.get(request);
     const flat = {
       method: state.method,
