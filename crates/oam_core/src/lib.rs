@@ -378,13 +378,50 @@ pub type FileRegistry = std::sync::Arc<std::sync::Mutex<FileState>>;
 /// `adopt_inherited_fd`) on first use. The registry lock is held only for the
 /// lookup: the caller does its IO on the returned reference with nothing held.
 pub fn registered_file(registry: &FileRegistry, fd: u64) -> Option<OpenFile> {
+    let lookup = || {
+        registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .files
+            .get(&fd)
+            .cloned()
+    };
+    // One lock on the hot path; adoption only on a miss.
+    lookup().or_else(|| {
+        if adopt_inherited_fd(registry, fd) {
+            lookup()
+        } else {
+            None
+        }
+    })
+}
+
+/// Close `fd` as node's close does; false when it is not open (EBADF).
+///
+/// An adopted descriptor (below OWN_FD_BASE) is a DUP of the parent's, so
+/// dropping ours closes only our copy: the original is closed too, or the
+/// peer of an inherited pipe never sees EOF -- which is precisely how a CDP
+/// child says "no more messages" on fd 4. The one exception is 0-2 on
+/// Windows, which libuv's `fs__close` leaves open (`if (fd > 2)
+/// _close(fd)`): closing one there succeeds and changes nothing, and the
+/// descriptor goes on working, as in node. On unix it is really closed, and
+/// a later call on it is EBADF.
+pub fn close_descriptor(registry: &FileRegistry, fd: u64) -> bool {
     adopt_inherited_fd(registry, fd);
-    registry
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .files
-        .get(&fd)
-        .cloned()
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+    if cfg!(windows) && fd <= 2 {
+        return guard.files.contains_key(&fd);
+    }
+    let removed = guard.files.remove(&fd);
+    drop(guard);
+    let Some(file) = removed else {
+        return false;
+    };
+    drop(file);
+    if fd < OWN_FD_BASE {
+        close_inherited_fd(fd);
+    }
+    true
 }
 
 /// Read into `buf` at `position` -- `pread(2)` -- or from the cursor when it
@@ -524,8 +561,8 @@ pub type SyncFileRegistry = FileRegistry;
 /// inheritable window keeps the two spaces disjoint, so an unknown low fd is
 /// unambiguously "the parent gave me this" rather than "not open yet".
 ///
-/// 0/1/2 never reach the registry -- the JS layer routes them to the process
-/// std sinks -- so the window is 3..OWN_FD_BASE.
+/// 0/1/2 are adopted the same way (see `inherited_eligible`), so the window
+/// is 0..OWN_FD_BASE.
 pub const OWN_FD_BASE: u64 = 64;
 
 /// Largest fd oam will try to adopt from its parent. Above this a miss is a
@@ -711,11 +748,17 @@ fn consume_inherited_fd(fd: u64) {
 /// snapshot decides "the parent gave me this"; the consumed set removes it again
 /// the moment we close it, which is what keeps a reused fd number from being
 /// re-adopted.
+///
+/// 0, 1 and 2 need no snapshot: they are the process's stdin, stdout and
+/// stderr, which node's fd calls operate on (`fstatSync(0)`, `readSync(0)`,
+/// `fsyncSync(1)`), and oam never opens anything of its own there.
 fn inherited_eligible(fd: u64) -> bool {
-    (3..=MAX_INHERITED_FD).contains(&fd)
-        && INHERITED_AT_START
-            .get()
-            .is_some_and(|set| set.contains(&fd))
+    let born_holding = fd <= 2
+        || ((3..=MAX_INHERITED_FD).contains(&fd)
+            && INHERITED_AT_START
+                .get()
+                .is_some_and(|set| set.contains(&fd)));
+    born_holding
         && !INHERITED_CONSUMED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -3381,6 +3424,22 @@ pub mod ops {
     ///
     /// These used to pass the HANDLE NUMBER as the path, so a failed stream
     /// read reported `... read '64'` where node has no path at all.
+    /// A failed fd operation other than a read or write (fstat, fsync,
+    /// ftruncate, fchmod, fchown, futimes): node's code for the error as it is,
+    /// and no path -- node's message ends at the syscall. These used to go
+    /// through `node_fail` with an empty path, which put a `path: ''` on the
+    /// error and `, fsync ''` at the end of its message.
+    fn node_fail_fd_op(error: std::io::Error, syscall: &str) -> OpOutcome {
+        let code = super::node_error_code(&error);
+        OpOutcome::node_failed_at(
+            code,
+            super::node_error_message_fd(code, syscall, &error),
+            syscall,
+            None,
+            super::node_errno(code, &error),
+        )
+    }
+
     fn node_fail_fd(error: std::io::Error, syscall: &str) -> OpOutcome {
         let code = super::fd_error_code(&error);
         OpOutcome::node_failed_at(
@@ -3916,16 +3975,70 @@ pub mod ops {
     /// Takes the descriptor's shared handle rather than the registry, so the
     /// caller never holds the file-registry lock across the blocking read.
     pub async fn fs_fstat(file: super::OpenFile) -> OpOutcome {
-        let result = tokio::task::spawn_blocking(move || {
-            file.metadata()
-                .map(|meta| stat_to_json(&meta, StatSource::File(&file)))
-        })
-        .await;
+        let result = tokio::task::spawn_blocking(move || fstat_to_json(&file)).await;
         match result {
             Ok(Ok(json)) => OpOutcome::Json(json),
-            Ok(Err(e)) => node_fail(e, "fstat", ""),
-            Err(e) => node_fail(std::io::Error::other(e.to_string()), "fstat", ""),
+            Ok(Err(e)) => node_fail_fd_op(e, "fstat"),
+            Err(e) => node_fail_fd_op(std::io::Error::other(e.to_string()), "fstat"),
         }
+    }
+
+    /// The stat payload of an open descriptor, as libuv's fstat builds it --
+    /// shared by the sync and async fstat.
+    ///
+    /// On Windows a descriptor need not be a disk file: 0-2 are often a pipe,
+    /// the console or NUL, which have no file information to read (asking
+    /// failed, and NUL's answer was EISDIR). libuv's `fs__fstat_handle` /
+    /// `fs__stat_assign_statbuf_null` (node v22.22.2) give them fixed shapes,
+    /// reproduced here: a pipe is S_IFIFO with rdev FILE_DEVICE_NAMED_PIPE << 16,
+    /// the console S_IFCHR with FILE_DEVICE_CONSOLE << 16 (both nlink 1 and the
+    /// handle as ino), and any other character device NUL's S_IFCHR | 0o666,
+    /// blksize 4096, rdev FILE_DEVICE_NULL << 16 -- libuv asks the device type
+    /// and gives that shape to NUL alone; a serial port, the one other
+    /// character device a process plausibly holds, gets NUL's here. Every other
+    /// field and every time is 0.
+    pub fn fstat_to_json(file: &std::fs::File) -> std::io::Result<String> {
+        #[cfg(windows)]
+        {
+            use std::io::IsTerminal;
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_PIPE};
+            // FILE_DEVICE_* from winioctl.h.
+            const FILE_DEVICE_CONSOLE: u64 = 0x50;
+            const FILE_DEVICE_NAMED_PIPE: u64 = 0x11;
+            const FILE_DEVICE_NULL: u64 = 0x15;
+            let handle = file.as_raw_handle();
+            let device = match crate::child_win::file_type(handle) {
+                FILE_TYPE_CHAR if file.is_terminal() => {
+                    Some((0o020000, FILE_DEVICE_CONSOLE, handle as u64, 0))
+                }
+                FILE_TYPE_CHAR => Some((0o020666, FILE_DEVICE_NULL, 0, 4096)),
+                FILE_TYPE_PIPE => Some((0o010000, FILE_DEVICE_NAMED_PIPE, handle as u64, 0)),
+                _ => None,
+            };
+            if let Some((mode, device_type, ino, blksize)) = device {
+                return Ok(serde_json::json!({
+                    "kind": "file",
+                    "size": 0,
+                    "mtimeMs": 0,
+                    "atimeMs": 0,
+                    "ctimeMs": 0,
+                    "birthtimeMs": 0,
+                    "mode": mode,
+                    "dev": 0,
+                    "ino": ino,
+                    "nlink": 1,
+                    "uid": 0,
+                    "gid": 0,
+                    "rdev": device_type << 16,
+                    "blksize": blksize,
+                    "blocks": 0,
+                })
+                .to_string());
+            }
+        }
+        file.metadata()
+            .map(|meta| stat_to_json(&meta, StatSource::File(file)))
     }
 
     pub async fn fs_statfs(path: String) -> OpOutcome {
@@ -4263,8 +4376,8 @@ pub mod ops {
         .await;
         match result {
             Ok(Ok(())) => OpOutcome::Done,
-            Ok(Err(e)) => node_fail(e, syscall, ""),
-            Err(e) => node_fail(std::io::Error::other(e.to_string()), syscall, ""),
+            Ok(Err(e)) => node_fail_fd_op(e, syscall),
+            Err(e) => node_fail_fd_op(std::io::Error::other(e.to_string()), syscall),
         }
     }
 
@@ -4272,8 +4385,8 @@ pub mod ops {
         let result = tokio::task::spawn_blocking(move || file.set_len(len)).await;
         match result {
             Ok(Ok(())) => OpOutcome::Done,
-            Ok(Err(e)) => node_fail(e, "ftruncate", ""),
-            Err(e) => node_fail(std::io::Error::other(e.to_string()), "ftruncate", ""),
+            Ok(Err(e)) => node_fail_fd_op(e, "ftruncate"),
+            Err(e) => node_fail_fd_op(std::io::Error::other(e.to_string()), "ftruncate"),
         }
     }
 
@@ -4281,8 +4394,8 @@ pub mod ops {
         let result = tokio::task::spawn_blocking(move || fchmod_file(&file, mode)).await;
         match result {
             Ok(Ok(())) => OpOutcome::Done,
-            Ok(Err(e)) => node_fail(e, "fchmod", ""),
-            Err(e) => node_fail(std::io::Error::other(e.to_string()), "fchmod", ""),
+            Ok(Err(e)) => node_fail_fd_op(e, "fchmod"),
+            Err(e) => node_fail_fd_op(std::io::Error::other(e.to_string()), "fchmod"),
         }
     }
 
@@ -4290,8 +4403,8 @@ pub mod ops {
         let result = tokio::task::spawn_blocking(move || fchown_file(&file, uid, gid)).await;
         match result {
             Ok(Ok(())) => OpOutcome::Done,
-            Ok(Err(e)) => node_fail(e, "fchown", ""),
-            Err(e) => node_fail(std::io::Error::other(e.to_string()), "fchown", ""),
+            Ok(Err(e)) => node_fail_fd_op(e, "fchown"),
+            Err(e) => node_fail_fd_op(std::io::Error::other(e.to_string()), "fchown"),
         }
     }
 
@@ -4300,8 +4413,8 @@ pub mod ops {
             tokio::task::spawn_blocking(move || futimes_file(&file, atime_ms, mtime_ms)).await;
         match result {
             Ok(Ok(())) => OpOutcome::Done,
-            Ok(Err(e)) => node_fail(e, "futime", ""),
-            Err(e) => node_fail(std::io::Error::other(e.to_string()), "futime", ""),
+            Ok(Err(e)) => node_fail_fd_op(e, "futime"),
+            Err(e) => node_fail_fd_op(std::io::Error::other(e.to_string()), "futime"),
         }
     }
 
@@ -5628,6 +5741,23 @@ mod tests {
         assert!(!adopt_inherited_fd(&registry, fd));
     }
 
+    /// Descriptors 0-2 are the process's stdio for the fd calls, adopted on
+    /// first use like an inherited descriptor; they used to be EBADF. Closing
+    /// one on Windows is libuv's no-op, so it stays usable. (Not run on unix,
+    /// where the close is real and would take the test runner's stdin.)
+    #[cfg(windows)]
+    #[test]
+    fn stdio_descriptors_are_adopted_and_survive_close_on_windows() {
+        let registry: FileRegistry =
+            std::sync::Arc::new(std::sync::Mutex::new(FileState::default()));
+        let stderr = registered_file(&registry, 2).expect("stderr is a descriptor");
+        assert!(ops::fstat_to_json(&stderr).is_ok());
+        assert!(close_descriptor(&registry, 2));
+        assert!(registered_file(&registry, 2).is_some());
+        assert!(registered_file(&registry, OWN_FD_BASE + 12345).is_none());
+        assert!(!close_descriptor(&registry, OWN_FD_BASE + 12345));
+    }
+
     /// A descriptor with several ops in flight at once must serve all of them,
     /// as node does. The chunk ops used to take the file out of the registry
     /// for their IO await, so every op that started while another was in
@@ -5647,6 +5777,19 @@ mod tests {
             .unwrap()
             .files
             .insert(OWN_FD_BASE, std::sync::Arc::new(file));
+
+        // A positional read leaves the cursor where it was: a cursor read
+        // after it starts at 0. (Checked alone: on Windows, as in libuv, a
+        // positional op saves and restores the cursor, so where CONCURRENT
+        // ones leave it depends on their interleaving.)
+        let file = registered_file(&files, OWN_FD_BASE).expect("registered");
+        let mut two = [0u8; 2];
+        assert_eq!(read_at(&file, &mut two, Some(10)).unwrap(), 2);
+        assert_eq!(&two, b"KL");
+        let mut head = [0u8; 3];
+        assert_eq!(read_at(&file, &mut head, None).unwrap(), 3);
+        assert_eq!(&head, b"ABC");
+        drop(file);
 
         let mut reads = HashMap::new();
         for i in 0..8u64 {
@@ -5681,13 +5824,6 @@ mod tests {
                 None => assert!(matches!(done.outcome, OpOutcome::Done), "a write failed"),
             }
         }
-
-        // Positional ops leave the cursor where it was: a cursor read starts at 0.
-        let file = registered_file(&files, OWN_FD_BASE).expect("still registered");
-        let mut head = [0u8; 3];
-        assert_eq!(read_at(&file, &mut head, None).unwrap(), 3);
-        assert_eq!(&head, b"ABC");
-        drop(file);
 
         // Closing drops the registry's reference; the next op is EBADF.
         files.lock().unwrap().files.remove(&OWN_FD_BASE);

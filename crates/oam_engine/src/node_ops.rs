@@ -650,6 +650,17 @@ fn throw_fd_error(scope: &mut v8::PinScope<'_, '_>, syscall: &str, error: &std::
     throw_system_error(scope, code, &message, syscall, None, error);
 }
 
+/// A failed fd operation other than a read or write (fstat, fsync, ftruncate,
+/// fchmod, fchown, futimes): the error's own code (a read/write's access
+/// failure is EBADF, these keep EPERM), and no path. These were thrown with an
+/// empty path, which node never sets: `path: ''` and `, fsync ''` in the
+/// message.
+fn throw_fd_op_error(scope: &mut v8::PinScope<'_, '_>, syscall: &str, error: &std::io::Error) {
+    let code = oam_core::node_error_code(error);
+    let message = oam_core::node_error_message_fd(code, syscall, error);
+    throw_system_error(scope, code, &message, syscall, None, error);
+}
+
 fn throw_system_error(
     scope: &mut v8::PinScope<'_, '_>,
     code: &str,
@@ -6021,7 +6032,7 @@ where
         return;
     };
     if let Err(e) = action(&file) {
-        throw_node_error(scope, syscall, "", &e);
+        throw_fd_op_error(scope, syscall, &e);
     }
 }
 
@@ -6903,12 +6914,7 @@ fn op_fs_close(
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let files = core_runtime!(scope).files();
-    let removed = files
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .files
-        .remove(&handle);
-    drop(removed);
+    oam_core::close_descriptor(&files, handle);
 }
 
 /// Throw an `Error` carrying `.code`/`.syscall` for a bad/missing fd. Node
@@ -7108,26 +7114,10 @@ fn op_fs_close_sync(
 ) {
     let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let files = core_runtime!(scope).sync_files();
-    // A low fd missing from the registry cannot be one oam allocated -- the
-    // counter starts above the inheritable window -- so it is the parent's to
-    // adopt. This is what lets oam BE the child of an extra-fd spawn.
-    oam_core::adopt_inherited_fd(&files, fd);
-    let removed = files
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .files
-        .remove(&fd)
-        .is_some();
-    if !removed {
+    // Adopts and closes an inherited descriptor, and treats 0-2 as node does
+    // on each platform: see close_descriptor.
+    if !oam_core::close_descriptor(&files, fd) {
         throw_ebadf(scope, "close");
-        return;
-    }
-    // An adopted fd (below OWN_FD_BASE) is a DUP of the parent's descriptor;
-    // dropping it above closed only our copy. Close the original too, or the
-    // peer of an inherited pipe never sees EOF -- which is precisely how a CDP
-    // child says "no more messages" on fd 4.
-    if fd < oam_core::OWN_FD_BASE {
-        oam_core::close_inherited_fd(fd);
     }
 }
 
@@ -7145,11 +7135,8 @@ fn op_fs_fstat_sync(
     let Some(file) = registered_fd(scope, &files, fd, "fstat") else {
         return;
     };
-    let payload = file
-        .metadata()
-        .map(|meta| oam_core::ops::stat_to_json(&meta, oam_core::ops::StatSource::File(&file)));
-    match payload {
-        Err(e) => throw_fd_error(scope, "fstat", &e),
+    match oam_core::ops::fstat_to_json(&file) {
+        Err(e) => throw_fd_op_error(scope, "fstat", &e),
         Ok(json) => return_json(scope, &mut rv, &json),
     }
 }

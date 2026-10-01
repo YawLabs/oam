@@ -9273,7 +9273,18 @@
     // only ever answer file/dir/symlink -- the other four were hardcoded false,
     // so a POSIX character device, block device, FIFO or socket all reported
     // themselves as none of those.
-    _checkModeProperty(bits) { return (this.mode & S_IFMT) === bits; }
+    // On Windows node answers false for a FIFO, block device or socket
+    // whatever the mode says ("Some types are not available on Windows") --
+    // which is observable, because libuv's fstat of a pipe IS S_IFIFO.
+    _checkModeProperty(bits) {
+      if (
+        (bits === S_IFIFO || bits === S_IFBLK || bits === S_IFSOCK) &&
+        globalThis.__oam.node.platform === "win32"
+      ) {
+        return false;
+      }
+      return (this.mode & S_IFMT) === bits;
+    }
     isDirectory() { return this._checkModeProperty(S_IFDIR); }
     isFile() { return this._checkModeProperty(S_IFREG); }
     isBlockDevice() { return this._checkModeProperty(S_IFBLK); }

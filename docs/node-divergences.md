@@ -2226,10 +2226,16 @@ What still differs:
 - **An anonymous class instance as the descriptor** reads `Received an instance of
   Object` in the C++ wording on oam, where V8 names it after the variable it was
   assigned to (`an instance of vals`); JS cannot see that inferred name.
-- **Descriptors 0-2.** oam's descriptor table holds only what `fs` opened (and fds a
-  parent passed in, see 19), so `fstatSync(0)`, `closeSync(0)`, `readSync(0, ...)` and
-  the like are `EBADF` where node operates on the process's stdin. `writeSync(1|2)` is
-  routed to stdout / stderr and matches. (`-0` is a valid descriptor 0 on both.)
+- **`fchmod` of a Windows pipe or NUL descriptor.** Descriptors 0-2 are the process's
+  stdin, stdout and stderr for every fd call, as in node (`fstatSync(0)`,
+  `readSync(0)`, `readFileSync(0)`, `fsyncSync(1)`; `conformance/cases/258-*`), with
+  libuv's Windows `fstat` shapes for a pipe, the console and NUL, and its close rule
+  (0-2 stay open on Windows, are really closed on unix). libuv's Windows `fchmod`
+  reopens the handle first, which fails for a pipe (`EBUSY`) and NUL (`EINVAL`);
+  oam's sets the attribute on the handle it has, so `fchmodSync(0, mode)` on a piped
+  stdin succeeds and on NUL is `EISDIR`. A character device other than the console
+  and NUL (a serial port) stats with NUL's shape on oam, where libuv reads its file
+  information.
 - **`fs.rm(path[, options], callback)` without a function callback** throws
   `ERR_INVALID_ARG_TYPE` for `"cb"` at the call, as every other callback-form `fs`
   call does. node v22.22.2's `rm` does not check its callback: the call returns, and
