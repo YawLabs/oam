@@ -112,4 +112,27 @@ const viaLocalhost = (text) => (process.platform === "win32" ? text : "connected
   server.close();
 }
 
+// An http server's req.socket on an explicit `::` listener (entry 39): an
+// IPv4 client is accepted, and both ends read as v4-mapped IPv6.
+{
+  const server = http.createServer((req, res) => {
+    const s = req.socket;
+    res.end(`${s.remoteFamily} ${s.remoteAddress}, local ${s.localFamily} ${s.localAddress}`);
+  });
+  const { port } = await listen(server, 0, "::");
+  for (const host of ["127.0.0.1", "::1"]) {
+    const body = await new Promise((resolve) => {
+      http
+        .get({ host, port, agent: false }, (res) => {
+          let text = "";
+          res.on("data", (chunk) => (text += chunk));
+          res.on("end", () => resolve(text));
+        })
+        .on("error", (e) => resolve(`error ${e.code}`));
+    });
+    console.log(`http '::' req.socket from ${host}: ${body}`);
+  }
+  server.close();
+}
+
 console.log("done");

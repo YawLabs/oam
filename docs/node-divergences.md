@@ -1052,7 +1052,7 @@ entries below were executed on both runtimes unless marked.
 | `crypto.setFips` | Always throws `Cannot set FIPS mode in this environment`; `getFips()` is pinned to `0`. | Settable in a FIPS build. |
 | `zlib.brotliCompressSync` / `brotliDecompressSync` | Throw, pointing at the async forms. | Supported. |
 | `zlib` inflate: corrupt compressed data | The error has node's `code` (`Z_DATA_ERROR`) and `errno` (`-3`), but its message is `invalid deflate data` for every defect inside the deflate data except a copy from before the start of the output, which reads `invalid distance too far back` as in Node. Header, trailer, checksum and truncation errors carry zlib's own text. The inflater is miniz_oxide's, which reports one failure for all of them. | zlib names the defect: `invalid block type`, `invalid code lengths set`, `invalid distance code`, ... |
-| `zlib` inflate: the `dictionary` option | Ignored, so a zlib stream that asks for a preset dictionary fails `Z_NEED_DICT` `Missing dictionary` even when one is passed. | Inflates with the dictionary. |
+| `zlib` deflate and inflate: the `dictionary` option | Ignored by every deflater and inflater. `deflateSync(data, { dictionary })` writes a plain zlib stream -- header `78 9c`, no `FDICT`, the dictionary not used -- that inflates with or without the dictionary on either runtime, and `deflateRawSync` raw deflate that needs none; their bytes and size differ from Node's. On the inflate side a zlib stream that asks for a preset dictionary (Node's dictionary output) fails `Z_NEED_DICT` `Missing dictionary` even when one is passed, and Node's raw output made with a dictionary fails `Z_DATA_ERROR` `invalid distance too far back`. The deflater is miniz_oxide's, which has no way to prime its window with a dictionary. | Deflate primes the window with the dictionary (a zlib stream then sets `FDICT` and carries the dictionary's Adler-32); inflate uses it, and a wrong one fails `Z_NEED_DICT` `Bad dictionary`. |
 | `zlib` inflate: `finishFlush: Z_BLOCK` | Read like the other non-finishing flushes: a one-shot inflate returns everything it decoded and a stream ends with it. (`Z_FINISH`, the default, fails a stream that stops short with `Z_BUF_ERROR` `unexpected end of file`; `Z_NO_FLUSH`, `Z_PARTIAL_FLUSH`, `Z_SYNC_FLUSH` and `Z_FULL_FLUSH` return what decoded, as in Node.) | zlib stops at the first block boundary, so a one-shot inflate under `Z_BLOCK` returns no output. |
 | `zlib` deflate: `finishFlush` | Validated as in Node, but the deflaters always finish the stream, so `deflateSync(data, { finishFlush: Z_SYNC_FLUSH })` returns a complete stream with its trailer. | Ends the output with that flush: a sync-flushed stream with no final block or trailer. |
 | `TextDecoder` | **utf-8 and windows-1252 only** (`fatal` and `ignoreBOM` honored on utf-8; windows-1252 is total, so neither applies). Both take the full standard label set for their encoding, so `latin1` / `iso-8859-1` / `ascii` resolve to windows-1252 as the standard requires. Any other label throws a `RangeError` with `code: 'ERR_ENCODING_NOT_SUPPORTED'`. | Also utf-16le/be, the ISO-8859-* family, the CJK legacy encodings, ... |
@@ -1504,9 +1504,9 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
   libuv looks a number up as an interface NAME and finds none (scope id 0); and under
   `--permission` a zoned answer is checked as written, so only an exact grant (or
   `--allow-net` with no list) admits it.
-- **A refusing hook's error is wrapped on `undici.request` and `agent.request`.** oam's
-  `undici.request` runs on `fetch`, so it rejects with `TypeError: fetch failed` carrying the
-  hook's error as `cause`; Node rethrows the hook's error itself. `fetch` agrees in both.
+- **A refusing hook's error** rejects `undici.request` and `agent.request` as itself, as in
+  Node, and `fetch` with it as the `cause` of `TypeError: fetch failed`, as in Node. Up to
+  0.17.1 `undici.request`, which runs on `fetch` in oam, rejected with the `TypeError` too.
 - **A hook's addresses ARE a `--permission` boundary** (not a divergence, but the bullet
   that used to say otherwise is worth replacing rather than deleting). `--allow-net=<name>`
   grants the name, and every address the hook answers with is checked against the same
@@ -1835,10 +1835,15 @@ SENDS a caller `host` header and leaves the method as written, both measured. `h
 they set these headers legitimately. (`http2.connect` refuses node's HTTP/1
 connection-specific headers itself, as node's does.)
 
-The one thing `undici.request` does not reproduce is the error's SHAPE: it runs on `fetch` in
-oam, so a refusal arrives as `TypeError: fetch failed` carrying the undici-named error as
-`cause`, where Node throws that error itself. Same wrapping as the `connect.lookup` bullet
-above.
+`undici.request` runs on `fetch` in oam but rejects as Node's does: with the error itself --
+an undici error for a refusal or a failure undici raises (its connect timeout, a response head
+over the limit), the transport's for a failed connect (`connect ECONNREFUSED`, `getaddrinfo
+ENOTFOUND`, a proxy that refuses the connection) -- not with `TypeError: fetch failed` around
+it; and a body that fails mid-read errors with undici's `SocketError` /
+`ResponseContentLengthMismatchError` / `HTTPParserError` itself, not fetch's
+`TypeError: terminated` (`undici_request_rejects_with_the_error_itself`, e2e). Up to 0.17.1 a
+failed request arrived as `TypeError: fetch failed`, and a failed body as a plain `Error`
+with no `cause`.
 
 **`http.request` argument and option handling**
 
@@ -1903,12 +1908,13 @@ _(source)_; the `connect.lookup` behaviour is pinned by e2e tests.
 `req.socket` on an `http` or `https` server carries the connection's own addresses, spelled as
 Node spells them: `remoteAddress` / `remotePort` / `remoteFamily`, `localAddress` /
 `localPort` / `localFamily`, and `address()` for the local end. An IPv4 client of a
-dual-stack `::` listener is `::ffff:a.b.c.d` with family `IPv6` -- where such a client is
-accepted at all: oam does not clear `IPV6_V6ONLY` on a listening socket (its client sockets
-do clear it), so an oam `::` listener is dual-stack only where the OS makes it so. On
-Windows it is IPv6-only and an IPv4 client of it is refused with `ECONNREFUSED`, on either
-runtime as the client; libuv clears the option, so Node's `::` listener takes IPv4 clients
-everywhere. Entry 36 is the same gap on the `listen(port)` default. A link-local peer carries
+dual-stack `::` listener is `::ffff:a.b.c.d` with family `IPv6`, and so is the local end it
+reached (`localAddress` `::ffff:127.0.0.1` for a client of `127.0.0.1`), as in Node. Since
+0.17.2 oam's listener clears `IPV6_V6ONLY` as libuv does, unless `ipv6Only` is set
+(`crates/oam_core/src/tcp.rs` `bind_listener`, entry 36), so a `::` listener -- and a
+`listen(port)` with no host, which binds `::` -- takes IPv4 clients on every platform; up to
+0.17.1 it was IPv6-only on Windows and an IPv4 client of it was refused with
+`ECONNREFUSED`. A link-local peer carries
 its scope: the interface index on Windows (as Node), the interface name on Linux (as Node),
 and the index elsewhere, where Node writes the name. `req.connection` is the same object.
 

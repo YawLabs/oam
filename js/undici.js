@@ -304,10 +304,15 @@
         res = await G.fetch(String(url), init);
       } catch (err) {
         unlink();
-        // A failure undici itself raises on the wire (its connect timeout, a
-        // response head over the limit) rejects request() as that error, not
-        // as fetch's `TypeError: fetch failed` around it.
-        if (err instanceof TypeError && err.cause instanceof errors.UndiciError) throw err.cause;
+        // request() rejects with what failed -- undici's own error (its
+        // connect timeout, a response head over the limit), a transport one
+        // (`connect ECONNREFUSED`, `getaddrinfo ENOTFOUND`, a proxy that
+        // refuses the connection) or a connect.lookup hook's -- not with
+        // fetch's `TypeError: fetch failed` around it, as node + undici do.
+        // An abort rejects with its reason, which this leaves alone.
+        if (err instanceof TypeError && err.message === "fetch failed" && err.cause instanceof Error) {
+          throw err.cause;
+        }
         throw err;
       } finally {
         settled = true;

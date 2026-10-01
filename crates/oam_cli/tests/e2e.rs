@@ -3811,6 +3811,36 @@ fn small_builtins_wave_smoke() {
     assert_eq!(lines[4], "\"sunk 9\\n\"");
 }
 
+/// The `dictionary` option is ignored by oam's deflaters and inflaters
+/// (docs/node-divergences.md, the zlib `dictionary` row): miniz_oxide's
+/// deflater cannot prime its window. This pins what oam does, so the day
+/// either side honours the option this test and that row change together.
+/// Node's own bytes are `78bb622008b3cb401205b3013b200691` (FDICT set) for
+/// the deflate below, and it inflates them with the dictionary.
+#[test]
+fn zlib_dictionary_option_is_ignored_as_documented() {
+    let stdout = run_ok(
+        "zlib_dictionary.cjs",
+        "const z = require('node:zlib');\n\
+         const dictionary = Buffer.from('hello world dictionary');\n\
+         const out = z.deflateSync('hello world hello', { dictionary });\n\
+         console.log('header', out.subarray(0, 2).toString('hex'), 'fdict', (out[1] & 0x20) !== 0);\n\
+         console.log('plain', z.inflateSync(out).toString());\n\
+         const raw = z.deflateRawSync('hello world hello', { dictionary });\n\
+         console.log('raw plain', z.inflateRawSync(raw).toString());\n\
+         const nodeBytes = Buffer.from('78bb622008b3cb401205b3013b200691', 'hex');\n\
+         try { z.inflateSync(nodeBytes, { dictionary }); console.log('node bytes inflated'); }\n\
+         catch (e) { console.log('node bytes', e.code, e.errno, e.message); }",
+    );
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "header 789c fdict false\n\
+         plain hello world hello\n\
+         raw plain hello world hello\n\
+         node bytes Z_NEED_DICT 2 Missing dictionary"
+    );
+}
+
 #[test]
 fn zlib_incremental_streaming_gzip_roundtrip() {
     // Goal: pipe a large buffer (> 10 MB) through createGzip, verify the
@@ -5171,6 +5201,70 @@ pool headersTimeout NaN built
 agent headersTimeout NaN HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
 pool bodyTimeout NaN HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
 proxy-agent bodyTimeout 1.5 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero true early=true";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// `undici.request` rejects with what failed, not with fetch's wrapper
+/// around it: a body cut off mid-read is undici's SocketError (kept alive),
+/// ResponseContentLengthMismatchError (not kept) or HTTPParserError (bad
+/// framing), and a failed connect -- to the origin or to a ProxyAgent's
+/// proxy -- is the transport's `connect ECONNREFUSED`. oam's request() runs
+/// on fetch, and after #177 these arrived as `TypeError: terminated` and
+/// `TypeError: fetch failed` with the real error only as `cause`. The
+/// expected output is node v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_request_rejects_with_the_error_itself() {
+    let script = write_temp(
+        "undici_request_errors/main.mjs",
+        r##"import net from 'node:net';
+import { request, ProxyAgent, errors } from 'undici';
+
+// A kept-alive response cut off inside its body, the same with
+// `Connection: close`, and a bad chunk-size line.
+const raw = (reply, end) => net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => { s.write(reply); if (end === 'destroy') setTimeout(() => s.destroy(), 20); else s.end(); });
+});
+const servers = {
+  cut: raw('HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nabc', 'destroy'),
+  closed: raw('HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 100\r\n\r\nabc', 'end'),
+  chunk: raw('HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nzz\r\nabc\r\n', 'destroy'),
+};
+const url = {};
+for (const [k, srv] of Object.entries(servers)) {
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  url[k] = `http://127.0.0.1:${srv.address().port}`;
+}
+// A port nothing listens on: bound, read, released.
+const probe = net.createServer();
+await new Promise((r) => probe.listen(0, '127.0.0.1', r));
+const closed = probe.address().port;
+await new Promise((r) => probe.close(r));
+
+async function attempt(label, fn) {
+  try {
+    console.log(label, 'ok', JSON.stringify(await fn()));
+  } catch (e) {
+    const message = String(e.message).replaceAll(String(closed), 'PORT');
+    console.log(label, e.name, e.code, message, e instanceof errors.UndiciError, e instanceof TypeError);
+  }
+}
+await attempt('body cut, kept alive', async () => (await request(url.cut)).body.text());
+await attempt('body cut, connection close', async () => (await request(url.closed)).body.text());
+await attempt('body bad chunk size', async () => (await request(url.chunk)).body.text());
+await attempt('refused', () => request(`http://127.0.0.1:${closed}/`));
+await attempt('refused proxy', () => request(url.cut, { dispatcher: new ProxyAgent(`http://127.0.0.1:${closed}`) }));
+process.exit(0);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "\
+body cut, kept alive SocketError UND_ERR_SOCKET other side closed true false
+body cut, connection close ResponseContentLengthMismatchError UND_ERR_RES_CONTENT_LENGTH_MISMATCH Response body length does not match content-length header true false
+body bad chunk size HTTPParserError HPE_INVALID_CHUNK_SIZE Response does not match the HTTP/1.1 protocol (Invalid character in chunk size) false false
+refused Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
+refused proxy Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false";
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 

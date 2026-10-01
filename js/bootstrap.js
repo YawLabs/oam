@@ -1696,7 +1696,12 @@
   // http_client/body.rs ENDED_AT_CLOSE_CODE.
   const BODY_ENDED_AT_CLOSE = "OAM_BODY_ENDED_AT_CLOSE";
 
-  function bodyTerminated(e, raw) {
+  // `fetchSemantics` false (undici.request's entry): undici's request() body
+  // fails with the error itself, not fetch's `TypeError: terminated` around
+  // it (measured on node v22.22.2 + undici 6.29.0: a cut-off kept-alive body
+  // rejects with SocketError, one not kept with
+  // ResponseContentLengthMismatchError).
+  function bodyTerminated(e, raw, fetchSemantics = true) {
     let cause = e;
     if (e instanceof Error && e.code === "UND_ERR_RES_CONTENT_LENGTH_MISMATCH") {
       cause = new undiciErrors.ResponseContentLengthMismatchError();
@@ -1713,10 +1718,10 @@
     } else if (e instanceof Error && typeof e.code === "string" && e.code.startsWith("HPE_")) {
       cause = new undiciErrors.HTTPParserError(e.message, e.code.slice(4));
     }
-    return new TypeError("terminated", { cause });
+    return fetchSemantics ? new TypeError("terminated", { cause }) : cause;
   }
 
-  function makeResponse(raw, signal) {
+  function makeResponse(raw, signal, fetchSemantics = true) {
     const handle = raw.bodyHandle;
     let consumed = false;
     let bodyStream = null;
@@ -1792,7 +1797,7 @@
             if (e instanceof Error && e.code === BODY_ENDED_AT_CLOSE) chunk = undefined;
             else {
               bodyOver();
-              throw bodyTerminated(e, raw);
+              throw bodyTerminated(e, raw, fetchSemantics);
             }
           }
           // The read that was in flight when the abort landed returns here
@@ -2281,8 +2286,9 @@
   // name up here. A hook that fails fails the fetch CLOSED (its error is the
   // cause, unchanged, as in node) and never falls back to system DNS; an
   // abort while parked drops the parked fetch.
-  async function settleFetch(pending, lookup, signal, connector, phase) {
-    return makeResponse(await settleRaw(pending, lookup, signal, connector, phase), signal);
+  // `fetchSemantics` false is undici.request's entry (see makeResponse).
+  async function settleFetch(pending, lookup, signal, connector, phase, fetchSemantics) {
+    return makeResponse(await settleRaw(pending, lookup, signal, connector, phase), signal, fetchSemantics);
   }
 
   // settleFetch's loop, ending at the op's raw payload (the response head
@@ -2633,17 +2639,49 @@
   // Blob's `size` as the content-length (measured on node v22.22.2), each
   // chunk converted as a streamed upload's is, and a stream that comes out
   // a different length fails as undici's length check fails it.
-  async function collectBlobStream(stream, size) {
+  //
+  // The fetch's `signal` is honoured while the bytes are read: an abort
+  // rejects at once with its reason, stops reading the Blob (its reader is
+  // cancelled with that reason) and sends nothing, as node's fetch does
+  // (measured on v22.22.2: an abort 50 ms into a Blob whose stream takes
+  // 200 ms rejects with the reason at once, and no request reaches the
+  // server).
+  async function collectBlobStream(stream, size, signal) {
     const reader = stream.getReader();
     const chunks = [];
+    const reasonOf = () =>
+      signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+    let onAbort = null;
+    const aborted = signal
+      ? new Promise((_resolve, reject) => {
+          onAbort = () => reject(reasonOf());
+          signal.addEventListener("abort", onAbort, { once: true });
+        })
+      : null;
+    // Never left unhandled: it settles only on an abort, and is raced below.
+    aborted?.catch(() => {});
     try {
       for (;;) {
-        const { value, done } = await reader.read();
+        let step;
+        try {
+          step = aborted ? await Promise.race([reader.read(), aborted]) : await reader.read();
+        } catch (e) {
+          if (signal?.aborted) {
+            reader.cancel(signal.reason).catch(() => {});
+            throw reasonOf();
+          }
+          throw new TypeError("fetch failed", { cause: e });
+        }
+        const { value, done } = step;
         if (done) break;
-        chunks.push(uploadChunk(value));
+        try {
+          chunks.push(uploadChunk(value));
+        } catch (e) {
+          throw new TypeError("fetch failed", { cause: e });
+        }
       }
-    } catch (e) {
-      throw new TypeError("fetch failed", { cause: e });
+    } finally {
+      if (onAbort) signal.removeEventListener("abort", onAbort);
     }
     const bytes = concatBytes(chunks);
     if (bytes.length !== Number(size)) {
@@ -2728,7 +2766,7 @@
     if (signal?.aborted) {
       throw signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
     }
-    if (collect) init.body = await collectBlobStream(init.body, collect.size);
+    if (collect) init.body = await collectBlobStream(init.body, collect.size, signal);
     // undici's DISPATCH-level rules are a smaller set that node applies to
     // `undici.request` as well, because both build the same internal Request:
     // the five hop-by-hop header refusals and the content-length check, but
@@ -3006,7 +3044,7 @@
     }
     // undici.request's connect-phase listener (see settleRaw).
     const phase = init.__oamConnectPhase && typeof init.__oamConnectPhase === "object" ? init.__oamConnectPhase : null;
-    let op = settleFetch(pending, lookup, signal, connector, phase);
+    let op = settleFetch(pending, lookup, signal, connector, phase, fetchSemantics);
     if (pump !== null) {
       // A request that failed, or was aborted, stops reading its body. One
       // that failed because its body did fails with that error as the cause,
