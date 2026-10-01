@@ -22935,6 +22935,8 @@
         // A write failed for want of a handle: the callbacks of the writes
         // waiting on its next-tick teardown (see _writeWithoutHandle).
         this._noHandleFailure = null;
+        // end()'s 'finish' is queued for the loop's next turn (see end()).
+        this._finishPending = false;
         // The callbacks of the writes held behind a connect, failed from
         // 'close' if the socket closes first (see _holdWrite).
         this._heldWrites = null;
@@ -23445,8 +23447,14 @@
         // no trip back through JS in between (#156; node queues the
         // shutdown behind its writes in libuv the same way). 'finish' still
         // waits for every write and for the shutdown.
+        // `doneInCall`: the natives finished the shutdown inside the call
+        // that issued it (nothing was queued before it).
+        let doneInCall = false;
         const shut = this._issue(() => {
-          if (this._handle !== null) return natives.tcpShutdown(this._handle);
+          if (this._handle === null) return undefined;
+          const op = natives.tcpShutdown(this._handle);
+          if (op === undefined) doneInCall = true;
+          return op;
         });
         this._chain = this._chain.then(() => shut).then((failure) => {
           // A failed shutdown is the socket's error (node's afterShutdown
@@ -23461,7 +23469,24 @@
             for (const callback of callbacks.splice(0)) callback(this._writableState.errored);
             return;
           }
-          this._finish(callbacks);
+          if (!doneInCall) {
+            // The shutdown's completion came from the loop: 'finish' follows
+            // it, as node's does from its shutdown callback.
+            this._finish(callbacks);
+            return;
+          }
+          // Finished in the call: node's shutdown still completes from the
+          // loop -- libuv reports the request on its next turn -- so
+          // 'finish' comes after every tick and microtask queued meanwhile
+          // and before any immediate (measured on v22.22.2). Emitted from a
+          // microtask instead, it ran ahead of the ticks the caller queued
+          // after end() -- and of their resetAndDestroy(), which node
+          // refuses with EINVAL in that window.
+          this._finishPending = true;
+          natives.timerPending(() => {
+            this._finishPending = false;
+            if (!this.destroyed && !this._writableState.errored) this._finish(callbacks);
+          });
         });
         return this;
       }
@@ -23680,8 +23705,12 @@
             // route the close through the write chain -- it sequences
             // AFTER the in-flight shutdown + 'finish'. Before the guard,
             // this path re-ran end() and closed via its duplicate chain
-            // (which also double-emitted 'finish').
-            this._chain = this._chain.then(() => this._doClose());
+            // (which also double-emitted 'finish'). A 'finish' still to
+            // come from the loop (see end()) closes the socket itself, as
+            // node's does once both sides are done.
+            this._chain = this._chain.then(() => {
+              if (this._finishPending !== true) this._doClose();
+            });
           } else {
             // node's endWritableNT: the auto end() waits a tick, so a write
             // an 'end' listener defers with process.nextTick still goes out

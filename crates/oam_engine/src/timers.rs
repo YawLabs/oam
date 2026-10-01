@@ -30,6 +30,10 @@ pub(crate) struct TimerEntry {
 pub(crate) struct TimerQueue {
     next_id: u32,
     seq: u64,
+    /// When the queue was made: the deadline of a pending callback
+    /// ([`timer_pending`]), earlier than any timer's or immediate's, so it
+    /// is popped before them.
+    epoch: Instant,
     /// Min-heap of (deadline, insertion seq, id). seq keeps same-deadline
     /// timers FIFO. Cancelled ids are skipped lazily (absent from `active`).
     heap: BinaryHeap<Reverse<(Instant, u64, u32)>>,
@@ -45,6 +49,7 @@ impl Default for TimerQueue {
         Self {
             next_id: 1, // ids start at 1, like Node — 0 stays falsy-safe
             seq: 0,
+            epoch: Instant::now(),
             heap: BinaryHeap::new(),
             active: HashMap::new(),
             ref_count: 0,
@@ -54,14 +59,17 @@ impl Default for TimerQueue {
 
 impl TimerQueue {
     fn schedule(&mut self, entry: TimerEntry, delay: Duration) -> u32 {
+        self.schedule_at(entry, Instant::now() + delay)
+    }
+
+    fn schedule_at(&mut self, entry: TimerEntry, deadline: Instant) -> u32 {
         let mut id = self.next_id;
         while self.active.contains_key(&id) {
             id = id.wrapping_add(1).max(1);
         }
         self.next_id = id.wrapping_add(1).max(1);
         self.seq += 1;
-        self.heap
-            .push(Reverse((Instant::now() + delay, self.seq, id)));
+        self.heap.push(Reverse((deadline, self.seq, id)));
         if entry.is_ref {
             self.ref_count += 1;
         }
@@ -312,6 +320,43 @@ pub(crate) fn timer_immediate(
         .expect("timer queue installed")
         .schedule(entry, Duration::ZERO);
     rv.set_uint32(id);
+}
+
+/// `__oam.node.timerPending(callback, ...args)`: a callback for the loop's
+/// next turn, ahead of every timer and immediate due then -- libuv's pending
+/// requests, which node processes after the poll and before the check phase,
+/// so after every tick and microtask the current callback queued and before
+/// any setImmediate. Pending callbacks run in the order they were queued, one
+/// per turn as timers do, and keep the loop alive until they have run.
+///
+/// For a request oam's natives finished inside the call that made it -- a
+/// socket's shutdown with no write queued -- whose completion node still
+/// reports from the loop: net.Socket's 'finish'.
+pub(crate) fn timer_pending(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Ok(callback) = v8::Local::<v8::Function>::try_from(args.get(0)) else {
+        throw_type_error(scope, "timerPending callback must be a function");
+        return;
+    };
+    let callback = v8::Global::new(scope, callback);
+    let mut extra = Vec::new();
+    for i in 1..args.length() {
+        extra.push(v8::Global::new(scope, args.get(i)));
+    }
+    let entry = TimerEntry {
+        callback,
+        args: extra,
+        interval: None,
+        is_ref: true,
+    };
+    let queue = scope
+        .get_slot_mut::<TimerQueue>()
+        .expect("timer queue installed");
+    let epoch = queue.epoch;
+    queue.schedule_at(entry, epoch);
 }
 
 fn queue_microtask(

@@ -2300,16 +2300,17 @@ the socket and before its shutdown callback (`'finish'`) has run.
   open TCP handle keeps the process alive for good (measured on v22.22.2, Windows: the
   process does not exit). oam closes the connection the orderly way -- its FIN is already out
   -- and emits `'close'` with `true`.
-- **The window opens and closes at different moments.** oam's end() hands the FIN to the
-  socket in the same turn when no write is still queued (#156), and emits `'finish'` a few
-  microtasks later; Node's `'finish'` waits for the next loop turn. So
-  `socket.end(); process.nextTick(() => socket.resetAndDestroy())` is refused with EINVAL on
-  Node and resets (RST after the FIN) on oam. Measured on Windows, where Node's writes complete
-  in the call and every `end()` on a connected socket opens the window at once, as oam's does
-  (`write(); end(); resetAndDestroy()` is EINVAL on both). On Linux and macOS Node defers the
-  shutdown behind a write that has not called back yet, where oam has sent the FIN once the
-  write was taken whole -- not measured there. An `end()` whose FIN is still queued behind a
-  write the peer is not draining is reset on both, the FIN never sent.
+- **Where the window opens and closes.** oam's end() hands the FIN to the socket in the same
+  turn when no write is still queued (#156), and, as Node's, reports it from the loop:
+  `'finish'` comes after every tick and microtask queued meanwhile and before any immediate,
+  so `socket.end(); process.nextTick(() => socket.resetAndDestroy())` is refused with EINVAL
+  on both (`conformance/cases/264-net-finish-after-ticks.mjs`; up to 0.17.1 oam emitted
+  `'finish'` from a microtask and reset the socket there). Measured on Windows, where Node's
+  writes complete in the call and every `end()` on a connected socket opens the window at
+  once, as oam's does (`write(); end(); resetAndDestroy()` is EINVAL on both). On Linux and
+  macOS Node defers the shutdown behind a write that has not called back yet, where oam has
+  sent the FIN once the write was taken whole -- not measured there. An `end()` whose FIN is
+  still queued behind a write the peer is not draining is reset on both, the FIN never sent.
 
 ### `err.syscall` on `fs.realpath` and `fs.opendir`
 
