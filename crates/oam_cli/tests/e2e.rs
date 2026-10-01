@@ -7869,6 +7869,80 @@ console.log('exports', Object.keys(E).length, new E.BalancedPoolMissingUpstreamE
     assert_eq!(stdout.replace("\r\n", "\n"), expected);
 }
 
+/// A dispatcher's connect timeout is the one a fetch's connections get (#157):
+/// undici gives a connection `connect.timeout` / `connectTimeout` ms (10 s by
+/// default; `connect.timeout` wins) to be connected and, for https,
+/// handshaken, then fails the request with its `ConnectTimeoutError`. oam had
+/// no connect timeout at all and waited for the operating system. The server
+/// accepts and never answers the ClientHello. `undici.request` rejects with
+/// the error itself, and 0 turns the timeout off. Every line below is what
+/// node v22.22.2 prints with the npm undici 6.24.1 next to the script; the
+/// default 10 s is conformance case 211.
+#[test]
+fn a_dispatchers_connect_timeout_fails_a_fetch_as_undicis() {
+    let script = write_temp(
+        "undici_connect_timeout/main.mjs",
+        r#"import net from 'node:net';
+import * as undici from 'undici';
+const { Agent, Client, Pool } = undici;
+const sockets = new Set();
+const srv = net.createServer((s) => { sockets.add(s); s.on('error', () => {}); });
+await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const port = srv.address().port;
+const U = `https://127.0.0.1:${port}/`;
+const P = (s) => String(s).replaceAll(String(port), 'PORT');
+const show = (label, wrapped, c) => console.log(
+  label, wrapped, c?.constructor?.name, c?.name, c?.code, JSON.stringify(P(c?.message)),
+  c instanceof undici.errors.ConnectTimeoutError, c instanceof undici.errors.UndiciError,
+  JSON.stringify(Reflect.ownKeys(c ?? {}).map(String)));
+for (const [label, options] of [
+  ['connect.timeout', { connect: { timeout: 300 } }],
+  ['connectTimeout', { connectTimeout: 300 }],
+  ['both', { connectTimeout: 60000, connect: { timeout: 300 } }],
+]) {
+  try { await fetch(U, { dispatcher: new Agent(options) }); console.log(label, 'resolved'); }
+  catch (e) { show(label, `fetch:${e.name}:${e.message}`, e.cause); }
+}
+try { await undici.request(U, { dispatcher: new Agent({ connectTimeout: 300 }) }); console.log('request resolved'); }
+catch (e) { show('undici.request', 'request', e); }
+try { await new Pool(U, { connectTimeout: 300 }).request({ path: '/', method: 'GET' }); console.log('pool resolved'); }
+catch (e) { show('pool.request', 'request', e); }
+{
+  // 0 is no timeout: only the abort ends it.
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 1200);
+  try { await fetch(U, { dispatcher: new Agent({ connect: { timeout: 0 } }), signal: ac.signal }); console.log('zero resolved'); }
+  catch (e) { console.log('timeout 0', e.name, e.cause === undefined); }
+}
+for (const bad of [-1, 'x', NaN]) {
+  let agent = 'ok', client = 'ok', pool = 'ok';
+  try { new Agent({ connectTimeout: bad }); } catch (e) { agent = `${e.name} ${e.message}`; }
+  try { new Client(U, { connectTimeout: bad }); } catch (e) { client = `${e.name} ${e.code} ${e.message}`; }
+  try { new Pool(U, { connectTimeout: bad }); } catch (e) { pool = `${e.name} ${e.message}`; }
+  console.log('connectTimeout', String(bad), '| Agent', agent, '| Client', client, '| Pool', pool);
+}
+for (const s of sockets) s.destroy();
+srv.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let cause = r#"ConnectTimeoutError ConnectTimeoutError UND_ERR_CONNECT_TIMEOUT "Connect Timeout Error (attempted address: 127.0.0.1:PORT, timeout: 300ms)" true true ["stack","message","name","code","Symbol(undici.error.UND_ERR)","Symbol(undici.error.UND_ERR_CONNECT_TIMEOUT)"]"#;
+    let invalid = "InvalidArgumentError UND_ERR_INVALID_ARG invalid connectTimeout";
+    let expected = format!(
+        "connect.timeout fetch:TypeError:fetch failed {cause}\n\
+         connectTimeout fetch:TypeError:fetch failed {cause}\n\
+         both fetch:TypeError:fetch failed {cause}\n\
+         undici.request request {cause}\n\
+         pool.request request {cause}\n\
+         timeout 0 AbortError true\n\
+         connectTimeout -1 | Agent ok | Client {invalid} | Pool ok\n\
+         connectTimeout x | Agent ok | Client {invalid} | Pool ok\n\
+         connectTimeout NaN | Agent ok | Client {invalid} | Pool ok\n"
+    );
+    assert_eq!(stdout.replace("\r\n", "\n"), expected);
+}
+
 /// An abort after the response head ends the BODY too, where oam used to keep
 /// reading and hand over the whole thing with a clean end -- so a guard that
 /// aborted on a size limit downloaded everything anyway. node errors the body

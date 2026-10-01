@@ -188,6 +188,70 @@ pub async fn connect(
     Ok(Connected { stream, attempted })
 }
 
+/// [`connect`], recording in `log` what it attempts as it goes, for a caller
+/// that may give up on the connect before it returns (fetch's connect
+/// timeout, which names the addresses tried so far).
+pub async fn connect_logged(
+    host: &str,
+    port: u16,
+    opts: &ConnectOptions,
+    log: &AttemptLog,
+) -> Result<Connected, ConnectError> {
+    let (stream, attempted) = connect_with(host, port, opts, &LoggedDialer(log)).await?;
+    Ok(Connected { stream, attempted })
+}
+
+/// What a connect in flight has attempted: node's
+/// `socket.autoSelectFamilyAttemptedAddresses`. net.connect creates that list
+/// only when a name resolved to more than one address to try
+/// (lib/net.js `lookupAndConnectMultiple`) and appends each address as its
+/// attempt starts; a single-address connect, an IP literal, or a connect
+/// still resolving has none.
+#[derive(Debug, Clone, Default)]
+pub struct AttemptLog(std::sync::Arc<std::sync::Mutex<Option<Vec<SocketAddr>>>>);
+
+impl AttemptLog {
+    /// The addresses attempted so far, or `None` when the connect is not (or
+    /// not yet) a multi-address one.
+    pub fn attempted(&self) -> Option<Vec<SocketAddr>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn several(&self) {
+        *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+    }
+
+    fn started(&self, target: SocketAddr) {
+        if let Some(list) = self.0.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            list.push(target);
+        }
+    }
+}
+
+/// The real network, writing each attempt into an [`AttemptLog`].
+struct LoggedDialer<'a>(&'a AttemptLog);
+
+impl Dialer for LoggedDialer<'_> {
+    type Stream = tokio::net::TcpStream;
+
+    async fn lookup(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        SystemDialer.lookup(host, port).await
+    }
+
+    async fn dial(
+        &self,
+        target: SocketAddr,
+        local: Option<&LocalBind>,
+    ) -> Result<Self::Stream, DialFailure> {
+        self.0.started(target);
+        SystemDialer.dial(target, local).await
+    }
+
+    fn attempting_several(&self) {
+        self.0.several();
+    }
+}
+
 /// Name resolution ahead of a connect: what node's default `dns.lookup` hands
 /// `net.connect` (lib/net.js `lookupAndConnect`), so JS can emit the socket's
 /// `'lookup'` events -- and let a listener veto the connect -- before anything
@@ -362,6 +426,9 @@ pub(crate) trait Dialer {
         target: SocketAddr,
         local: Option<&LocalBind>,
     ) -> Result<Self::Stream, DialFailure>;
+    /// The connect has more than one address to try and is about to start
+    /// on them (step 5). Nothing to do unless the dialer keeps a log.
+    fn attempting_several(&self) {}
 }
 
 /// The real network.
@@ -450,6 +517,7 @@ pub(crate) async fn connect_with<D: Dialer>(
     }
 
     // 5. Sequential attempts; every one but the last on a timer.
+    dialer.attempting_several();
     let attempt_timeout = opts.attempt_timeout.max(MIN_ATTEMPT_TIMEOUT);
     let last = order.len() - 1;
     let mut attempted = Vec::with_capacity(order.len());

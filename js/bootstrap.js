@@ -7,7 +7,7 @@
 // http_client::send (__oam.fetch / fetchContinue / fetchAbandon):
 //   request:  JSON string {url, method, headers: [[k,v]],
 //             body | body_base64 | body_stream, attempt_timeout_ms,
-//             fetch_semantics, lookup_hook?}
+//             fetch_semantics, lookup_hook?, connect_timeout_ms?}
 //   response: {status, statusText, url, redirected, headers: [[k,v]],
 //             bodyHandle} -- or, for a lookup_hook request,
 //             {lookup: {token, host, port}}: run the hook, then
@@ -1463,6 +1463,10 @@
       // undici's parser raises it with no message of its own.
       case "UND_ERR_HEADERS_OVERFLOW":
         return new undiciErrors.HeadersOverflowError();
+      // undici's connect timeout ran out (connector.rs ConnectTimedOut,
+      // which words the message).
+      case "UND_ERR_CONNECT_TIMEOUT":
+        return new undiciErrors.ConnectTimeoutError(e.message);
       default:
         return e;
     }
@@ -1844,6 +1848,18 @@
     const dispatcher = init.dispatcher ?? holder?.current;
     const lookup = (dispatcher && dispatcher._oamConnectLookup) || replacedDnsLookup();
     if (typeof lookup === "function") request.lookup_hook = true;
+    // undici gives a connection 10 s to be connected (for https, handshaken)
+    // and then fails the request with its ConnectTimeoutError, where the
+    // operating system would keep trying for 21 s (Windows) to two minutes
+    // (Linux). The dispatcher's `connect.timeout` / `connectTimeout` replaces
+    // the 10 s; 0 is no timeout. For everything that goes through undici in
+    // node -- fetch() and undici.request -- and not for http.request or the
+    // http2 client, which have no connect timeout there.
+    if (dispatchSemantics) {
+      const own = dispatcher?._oamConnectTimeout;
+      request.connect_timeout_ms =
+        own == null ? 10000 : typeof own === "number" && own > 0 ? own : 0;
+    }
     // A `connect` FUNCTION is asked for every connection the fetch makes
     // (connector mode, which wins over the lookup hook), and a dispatcher oam
     // cannot run faithfully fails the fetch rather than being ignored. Not for

@@ -35,6 +35,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use base64::Engine as _;
 use bytes::Bytes;
@@ -82,6 +83,15 @@ pub struct FetchRequest {
     /// Missing or not a positive number: node's 250 ms.
     #[serde(default)]
     pub attempt_timeout_ms: Option<f64>,
+    /// undici's connect timeout, in ms: how long each connection this
+    /// request opens has to be connected (for https, handshaken) before the
+    /// request fails with undici's `ConnectTimeoutError`. JS sends it for
+    /// what goes through undici in node -- `fetch()` and `undici.request`,
+    /// 10 s unless the dispatcher says otherwise. Absent, 0 or not a
+    /// positive number: no timeout, which is `http.request` (node has none
+    /// there) and a dispatcher that turned it off.
+    #[serde(default)]
+    pub connect_timeout_ms: Option<f64>,
     /// True for `fetch()`: undici's bad-port block on the initial URL.
     /// `http.request`, `undici.request` and the http2 compat client leave it
     /// false -- node's http.request has no such check. Redirect hops are
@@ -119,6 +129,14 @@ pub struct FetchRequest {
 
 fn yes() -> bool {
     true
+}
+
+/// [`FetchRequest::connect_timeout_ms`] as a duration; `None` is no timeout.
+fn connect_timeout_from_ms(ms: Option<f64>) -> Option<Duration> {
+    let ms = ms.filter(|ms| ms.is_finite() && *ms > 0.0)?;
+    // A JS number far past any real timeout saturates rather than wrapping;
+    // `from_secs_f64` would panic on an overflow.
+    Some(Duration::from_secs_f64(ms.min(u32::MAX as f64) / 1000.0))
 }
 
 /// What a 3xx does.
@@ -304,7 +322,9 @@ pub async fn fetch(
     let route = if req.connect_hook {
         transport.supplied_route(attempt_timeout, tls_range)
     } else {
-        transport.route(req.lookup_hook, attempt_timeout, tls_range)
+        transport
+            .route(req.lookup_hook, attempt_timeout, tls_range)
+            .with_connect_timeout(connect_timeout_from_ms(req.connect_timeout_ms))
     };
     let state = LoopState {
         transport,

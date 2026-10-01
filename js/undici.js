@@ -182,7 +182,16 @@
         for (const [k, v] of Object.entries(opts.query)) u.searchParams.set(k, String(v));
         url = u.toString();
       }
-      const res = await G.fetch(String(url), init);
+      let res;
+      try {
+        res = await G.fetch(String(url), init);
+      } catch (e) {
+        // A failure undici itself raises on the wire (its connect timeout, a
+        // response head over the limit) rejects request() as that error, not
+        // as fetch's `TypeError: fetch failed` around it.
+        if (e instanceof TypeError && e.cause instanceof errors.UndiciError) throw e.cause;
+        throw e;
+      }
       return {
         statusCode: res.status,
         headers: headersToObject(res.headers),
@@ -341,14 +350,25 @@
         //    transport control instead of a no-op. The hook signature is
         //    Node's lookup(hostname, options, cb) with options
         //    { family, hints, all: true } and cb(null, [{address, family}]).
+        //  - `_oamConnectTimeout`, the connect timeout for the connections
+        //    oam's transport opens for it (ms; null is undici's 10 s default,
+        //    0 none). undici builds its connector from
+        //    `{ timeout: connectTimeout, ...connect }`, so `connect.timeout`
+        //    wins over `connectTimeout` (measured on undici 6.24.1).
         this._oamConnect = null;
         this._oamConnectLookup = null;
+        this._oamConnectTimeout = null;
+        const connectOptions = {
+          timeout: this._options.connectTimeout,
+          ...(typeof connect === "object" ? connect : null),
+        };
         if (typeof connect === "function") {
           this._oamConnect = connect;
         } else if (connect && Object.keys(connect).some((key) => !LOOKUP_ROUTE_KEYS.has(key))) {
-          this._oamConnect = buildConnector(connect);
-        } else if (connect && typeof connect.lookup === "function") {
-          this._oamConnectLookup = connect.lookup;
+          this._oamConnect = buildConnector(connectOptions);
+        } else {
+          if (connect && typeof connect.lookup === "function") this._oamConnectLookup = connect.lookup;
+          this._oamConnectTimeout = connectOptions.timeout ?? null;
         }
         // Dispatch interceptors (undici's `interceptors` option) run inside
         // dispatch(), which oam does not use: a dispatcher that has them is
@@ -435,6 +455,14 @@
     class Client extends Dispatcher {
       constructor(origin, options) {
         super(options);
+        // undici's Client checks the option; a Pool (and so an Agent) takes
+        // it out of the options before its Clients see them, and checks
+        // nothing (measured on undici 6.24.1).
+        const connectTimeout = this._options.connectTimeout;
+        if (!(this instanceof Pool) && connectTimeout != null &&
+            (!Number.isFinite(connectTimeout) || connectTimeout < 0)) {
+          throw new errors.InvalidArgumentError("invalid connectTimeout");
+        }
         this.origin = typeof origin === "string" ? origin : (origin && origin.toString()) || "";
       }
       request(opts, handler) {

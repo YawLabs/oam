@@ -1326,12 +1326,18 @@ What still differs:
 
 **Connecting**
 
-- **No 10 s connect timeout on `fetch`.** undici gives up on a connect after 10 s. oam waits
-  for the operating system. Measured against a blackholed address on Windows: Node rejects
-  after 10669 ms with a `ConnectTimeoutError` cause (`code` `UND_ERR_CONNECT_TIMEOUT`,
-  `Connect Timeout Error (attempted address: 10.255.255.1:81, timeout: 10000ms)`); oam
-  rejects after 21046 ms with `connect ETIMEDOUT 10.255.255.1:81`. Node's `http.request` has
-  no such timeout, so only `fetch` differs.
+- **`fetch` has undici's 10 s connect timeout** (#157, case 211): a connection that is not
+  connected -- for https, handshaken -- within 10 s fails the fetch with a
+  `ConnectTimeoutError` cause (`code` `UND_ERR_CONNECT_TIMEOUT`, `Connect Timeout Error
+  (attempted address: 10.255.255.1:81, timeout: 10000ms)`, or `attempted addresses: ...` for
+  a name that resolved to several), as in Node. Up to 0.17.1 oam waited for the operating
+  system (21 s on Windows, `connect ETIMEDOUT`). A dispatcher's `connect.timeout` /
+  `connectTimeout` replaces the 10 s, `0` turns it off, and `undici.request` has it too;
+  `http.request` has no such timeout in either runtime. Two things differ. oam's timer is
+  exact, where undici's coarse timer fires up to about a second late (Node measured 10.7 s
+  for the default and 1 s for a 300 ms timeout). And under a `connect.lookup` hook the time
+  the hook itself takes is not counted: the timeout starts when oam dials the addresses it
+  returned.
 - **Aborting a `fetch` before its response head does not cancel the request.** The promise
   rejects with the abort reason at once, as in Node, but the request stays on the wire until
   the response head arrives; that response is then cancelled on arrival, which closes its

@@ -147,10 +147,14 @@ impl Pool {
 
     /// Send one request on this pool. `close_requested` is set when the request
     /// carried `Connection: close` (h1), so its connection is not re-parked.
+    /// `connect_timeout` bounds a connection this request has to open
+    /// (`OamConnector::connect_within`); it is the request's own, so a fetch
+    /// and an `http.request` sharing the pool each connect under theirs.
     pub(crate) async fn request(
         &self,
         mut req: Request<ReqBody>,
         close_requested: bool,
+        connect_timeout: Option<Duration>,
     ) -> Result<Response<Incoming>, PoolFail> {
         let Some(key) = pool_key(req.uri()) else {
             return Err(PoolFail {
@@ -169,7 +173,7 @@ impl Pool {
         let mut allow_reuse = true;
 
         for _ in 0..MAX_ATTEMPTS {
-            let conn = match self.checkout(&key, allow_reuse).await {
+            let conn = match self.checkout(&key, allow_reuse, connect_timeout).await {
                 Ok(conn) => conn,
                 Err(error) => {
                     return Err(PoolFail {
@@ -244,7 +248,12 @@ impl Pool {
     }
 
     /// Reuse an idle connection for `key`, or open exactly one. Never both.
-    async fn checkout(&self, key: &PoolKey, allow_reuse: bool) -> Result<Conn, BoxError> {
+    async fn checkout(
+        &self,
+        key: &PoolKey,
+        allow_reuse: bool,
+        connect_timeout: Option<Duration>,
+    ) -> Result<Conn, BoxError> {
         if allow_reuse && self.inner.idle_timeout.is_some() {
             if let Some(conn) = self.reuse_h2(key) {
                 return Ok(conn);
@@ -253,7 +262,7 @@ impl Pool {
                 return Ok(conn);
             }
         }
-        self.connect(key).await
+        self.connect(key, connect_timeout).await
     }
 
     fn reuse_h2(&self, key: &PoolKey) -> Option<Conn> {
@@ -305,9 +314,17 @@ impl Pool {
         None
     }
 
-    async fn connect(&self, key: &PoolKey) -> Result<Conn, BoxError> {
+    async fn connect(
+        &self,
+        key: &PoolKey,
+        connect_timeout: Option<Duration>,
+    ) -> Result<Conn, BoxError> {
         let uri = domain_as_uri(key);
-        let conn = self.connector.clone().connect(uri).await?;
+        let conn = self
+            .connector
+            .clone()
+            .connect_within(uri, connect_timeout)
+            .await?;
         let is_h2 = conn.negotiated_h2();
         let proxied = conn.is_proxied();
         let pool_stats = conn.pool_stats();

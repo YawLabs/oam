@@ -47,7 +47,7 @@ use tower_service::Service;
 use super::BoxError;
 use super::prepare::host_for_connect;
 use super::tls_config::{self, TlsConfigs, TlsRange};
-use crate::net_connect::{self, ConnectOptions, Pin};
+use crate::net_connect::{self, AttemptLog, ConnectOptions, Pin};
 use std::sync::atomic::AtomicU8;
 
 /// The byte stream under a connection: TCP, TLS over TCP, or TLS over a
@@ -597,6 +597,50 @@ impl Service<Uri> for OamConnector {
     }
 }
 
+/// undici's connect timeout expired (lib/core/connect.js `onConnectTimeout`,
+/// 6.24.1): the request fails with its `ConnectTimeoutError`, code
+/// `UND_ERR_CONNECT_TIMEOUT`, whose message this is. undici names the
+/// addresses net.connect had attempted when the connect was a multi-address
+/// one (`attempted addresses: ::1:80, 127.0.0.1:80,`), and otherwise the
+/// host and port it asked for (`attempted address: example.test:443,`) --
+/// measured on node v22.22.2 for an IP literal, a name with two addresses,
+/// and the default ports.
+#[derive(Debug)]
+pub(crate) struct ConnectTimedOut(pub(crate) String);
+
+impl ConnectTimedOut {
+    fn new(
+        host: &str,
+        port: u16,
+        attempted: Option<&[std::net::SocketAddr]>,
+        timeout: Duration,
+    ) -> ConnectTimedOut {
+        let tried = match attempted {
+            // node's `${address}:${port}`: an IPv6 address unbracketed.
+            Some(list) => {
+                let list: Vec<String> = list
+                    .iter()
+                    .map(|addr| format!("{}:{}", addr.ip(), addr.port()))
+                    .collect();
+                format!("attempted addresses: {},", list.join(", "))
+            }
+            None => format!("attempted address: {host}:{port},"),
+        };
+        ConnectTimedOut(format!(
+            "Connect Timeout Error ({tried} timeout: {}ms)",
+            timeout.as_millis()
+        ))
+    }
+}
+
+impl std::fmt::Display for ConnectTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConnectTimedOut {}
+
 /// A hooked fetch reached the connector for a host its hook never resolved.
 /// The fetch loop parks for the hook before every send, so this is a
 /// backstop: it fails the request rather than fall back to system DNS.
@@ -636,6 +680,51 @@ impl OamConnector {
     /// The owned pool calls this directly (`self.clone().connect(uri)`) instead
     /// of through the `Service` impl hyper-util used.
     pub(crate) async fn connect(self, dst: Uri) -> Result<OamConn, BoxError> {
+        self.connect_logged(dst, &AttemptLog::default()).await
+    }
+
+    /// [`OamConnector::connect`] under undici's connect timeout: the whole
+    /// connect -- the lookup, every address attempt and, for https, the TLS
+    /// handshake (undici clears its timer on `secureConnect`) -- has
+    /// `timeout` to finish, or fails as [`ConnectTimedOut`]. `None` is no
+    /// timeout (`http.request`, which has none in node, or a dispatcher that
+    /// set 0). Dropping the connect future closes whatever it had open.
+    pub(crate) async fn connect_within(
+        self,
+        dst: Uri,
+        timeout: Option<Duration>,
+    ) -> Result<OamConn, BoxError> {
+        let Some(timeout) = timeout else {
+            return self.connect(dst).await;
+        };
+        // The host undici's message names: the one it handed net.connect --
+        // the origin's, or the proxy's when the request goes through one.
+        let via_proxy = match &self.via {
+            Via::Pooled => self.shared.proxy.as_ref().and_then(|m| m.intercept(&dst)),
+            _ => None,
+        };
+        let dialled = via_proxy.as_ref().map_or(&dst, |intercept| intercept.uri());
+        let host = host_for_connect(dialled).unwrap_or_default();
+        let port = dialled
+            .port_u16()
+            .unwrap_or(if dialled.scheme_str() == Some("https") {
+                443
+            } else {
+                80
+            });
+        let log = AttemptLog::default();
+        match tokio::time::timeout(timeout, self.connect_logged(dst, &log)).await {
+            Ok(connected) => connected,
+            Err(_elapsed) => Err(Box::new(ConnectTimedOut::new(
+                &host,
+                port,
+                log.attempted().as_deref(),
+                timeout,
+            ))),
+        }
+    }
+
+    async fn connect_logged(self, dst: Uri, log: &AttemptLog) -> Result<OamConn, BoxError> {
         let https = dst.scheme_str() == Some("https");
         let host = host_for_connect(&dst).ok_or("request url has no host")?;
         let port = dst.port_u16().unwrap_or(if https { 443 } else { 80 });
@@ -689,7 +778,7 @@ impl OamConnector {
         } else {
             None
         };
-        let tcp = dial(&host, port, &opts).await?;
+        let tcp = dial(&host, port, &opts, log).await?;
         let info = ConnInfo::of(&tcp);
         let Some(name) = name else {
             return Ok(OamConn::new(Box::new(tcp), false, false, info));
@@ -794,7 +883,7 @@ impl Service<Uri> for ProxyTransport {
                 pin: None,
                 local: None,
             };
-            let tcp = dial(&host, port, &opts).await?;
+            let tcp = dial(&host, port, &opts, &AttemptLog::default()).await?;
             // The proxy's endpoints. Its own TLS session is not an origin's
             // and is not reported.
             let info = ConnInfo::of(&tcp);
@@ -811,9 +900,15 @@ impl Service<Uri> for ProxyTransport {
     }
 }
 
-/// `net_connect::connect`, then the socket options.
-async fn dial(host: &str, port: u16, opts: &ConnectOptions) -> Result<EagerTcp, BoxError> {
-    let connected = net_connect::connect(host, port, opts)
+/// `net_connect::connect`, then the socket options. `log` learns what is
+/// attempted while the connect runs (see [`OamConnector::connect_within`]).
+async fn dial(
+    host: &str,
+    port: u16,
+    opts: &ConnectOptions,
+    log: &AttemptLog,
+) -> Result<EagerTcp, BoxError> {
+    let connected = net_connect::connect_logged(host, port, opts, log)
         .await
         .map_err(|e| Box::new(e) as BoxError)?;
     tune(&connected.stream);

@@ -967,6 +967,80 @@ async fn initial_bad_port_only_under_fetch_semantics() {
     .await;
 }
 
+/// undici's connect timeout (#157): a request that carries
+/// `connect_timeout_ms` gives each connection it opens that long to be
+/// connected -- for https, handshaken -- and then fails with undici's
+/// `UND_ERR_CONNECT_TIMEOUT` and its message, which names the host and port
+/// the request asked for (node v22.22.2's text for the same server). A
+/// request without one (`http.request`) waits for as long as the peer does.
+/// The server accepts and never answers the ClientHello, so the connect is
+/// stuck in the handshake without depending on an unroutable address.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connect_that_outruns_the_connect_timeout_fails_as_undicis() {
+    within(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+        let reg = Reg::new();
+        let t = plain();
+        let timed_out = |outcome: OpOutcome| match outcome {
+            OpOutcome::NodeFailed { code, message, .. } => {
+                assert_eq!(code, "UND_ERR_CONNECT_TIMEOUT");
+                message
+            }
+            other => panic!("{other:?}"),
+        };
+
+        let url = format!("https://127.0.0.1:{port}/");
+        let started = std::time::Instant::now();
+        let message = timed_out(
+            reg.fetch(&t, json!({ "url": url, "connect_timeout_ms": 200 }))
+                .await,
+        );
+        assert_eq!(
+            message,
+            format!("Connect Timeout Error (attempted address: 127.0.0.1:{port}, timeout: 200ms)")
+        );
+        assert!(started.elapsed() >= Duration::from_millis(200));
+
+        // A host name the dispatcher's lookup hook resolved to one address
+        // is named as written, as net.connect's single-address connect is.
+        let url = format!("https://stall.test:{port}/");
+        let request = json!({ "url": url, "connect_timeout_ms": 200, "lookup_hook": true });
+        let (token, host, _) = lookup_of(reg.fetch(&t, request).await);
+        assert_eq!(host, "stall.test");
+        let message = timed_out(reg.resume(token, &["127.0.0.1"]).await);
+        assert_eq!(
+            message,
+            format!("Connect Timeout Error (attempted address: stall.test:{port}, timeout: 200ms)")
+        );
+
+        // No timeout of its own, or 0: still handshaking long after.
+        for request in [
+            json!({ "url": format!("https://127.0.0.1:{port}/") }),
+            json!({ "url": format!("https://127.0.0.1:{port}/"), "connect_timeout_ms": 0 }),
+        ] {
+            let pending = reg.fetch(&t, request);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(700), pending)
+                    .await
+                    .is_err(),
+                "a request with no connect timeout was failed by one"
+            );
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 4);
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn redirect_manual_returns_the_3xx() {
     within(async {
