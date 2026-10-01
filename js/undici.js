@@ -779,8 +779,12 @@
         // undici's Client: the address without an IPv6 literal's brackets.
         const proxyHostname = url.hostname[0] === "[" ? url.hostname.slice(1, url.hostname.indexOf("]")) : url.hostname;
         const proxyServername = (given.proxyTls && given.proxyTls.servername) || url.hostname;
-        // The CONNECT's answer is a response head: undici's headersTimeout.
-        const tunnelTimeout = given.headersTimeout == null ? 300e3 : given.headersTimeout;
+        // The CONNECT's answer is a response head, timed as undici times it:
+        // undici sends the CONNECT through its proxy client, built with
+        // `clientFactory(url, { connect })` and nothing else, so it runs on
+        // that Client's default headersTimeout of 300 s. The ProxyAgent's
+        // own headersTimeout goes to its origin requests only.
+        const tunnelTimeout = 300e3;
         this._oamConnect = (params, callback) => {
           let authority = params.host;
           if (!params.port) authority += params.protocol === "https:" ? ":443" : ":80";

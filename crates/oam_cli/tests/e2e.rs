@@ -5001,14 +5001,16 @@ fractional HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error tru
 /// connect function takes 800 ms does not use up a 600 ms limit, and the
 /// limit still bounds the wait for the head once the socket is there. Up to
 /// the first cut of #218 oam started the timer before the fetch, so it also
-/// counted the connect. The expected output is node v22.22.2 + undici
-/// 6.29.0's, line for line.
+/// counted the connect. A ProxyAgent's CONNECT exchange is timed by undici's
+/// proxy client, on its 300 s default, not by the ProxyAgent's own
+/// headersTimeout, which bounds the origin's answer only. The expected output
+/// is node v22.22.2 + undici 6.29.0's, line for line.
 #[test]
 fn undici_phase_timeouts_measure_what_undici_measures() {
     let script = write_temp(
         "undici_phase_timeouts_measure/main.mjs",
         r##"import net from 'node:net';
-import { request, Agent, buildConnector } from 'undici';
+import { request, Agent, ProxyAgent, buildConnector } from 'undici';
 
 // An origin that answers 300 ms after the request, and one that never answers.
 const slow = net.createServer((s) => {
@@ -5039,6 +5041,26 @@ await attempt('slow-connect', () => request(origin, { dispatcher: new Agent({ co
 await attempt('slow-connect-agent-option', () => request(origin, { dispatcher: new Agent({ headersTimeout: 600, connect: slowConnect(800) }) }));
 // ...and still bounds the wait for the head once connected.
 await attempt('connected-then-silent', () => request(silent, { dispatcher: new Agent({ connect: slowConnect(300) }), headersTimeout: 400 }));
+
+// A ProxyAgent's CONNECT goes through undici's proxy client, on that
+// client's 300 s default: the ProxyAgent's own headersTimeout is for the
+// origin's answer, so a proxy slower than it still tunnels, fetch included.
+const proxy = net.createServer((c) => {
+  c.on('error', () => {});
+  c.once('data', (d) => {
+    const port = Number(d.toString('latin1').split(' ')[1].split(':').pop());
+    setTimeout(() => {
+      const up = net.connect(port, '127.0.0.1', () => { c.write('HTTP/1.1 200 Connection Established\r\n\r\n'); up.pipe(c); c.pipe(up); });
+      up.on('error', () => c.destroy());
+      c.on('close', () => up.destroy());
+    }, 600);
+  });
+});
+const viaProxy = () => new ProxyAgent({ uri: `http://127.0.0.1:${proxy.address().port}`, headersTimeout: 400 });
+await listen(proxy);
+await attempt('slow-proxy-request', () => request(origin, { dispatcher: viaProxy() }));
+await attempt('slow-proxy-fetch', () => fetch(origin, { dispatcher: viaProxy() }));
+await attempt('slow-proxy-silent-origin', () => request(silent, { dispatcher: viaProxy() }));
 process.exit(0);
 "##,
     );
@@ -5047,7 +5069,10 @@ process.exit(0);
     let expected = "\
 slow-connect ok 200 ok
 slow-connect-agent-option ok 200 ok
-connected-then-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT late=true";
+connected-then-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT late=true
+slow-proxy-request ok 200 ok
+slow-proxy-fetch ok 200 ok
+slow-proxy-silent-origin failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT late=true";
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
