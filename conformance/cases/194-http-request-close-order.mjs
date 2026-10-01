@@ -129,7 +129,12 @@ for (const [name, options] of paths) {
       for await (const chunk of res) {
         void chunk;
         releaseRest();
-        await sleep(200);
+        // Leaves once the request has closed (a connection that is not kept,
+        // where it closes before the reader leaves), else after a second --
+        // by then the rest has arrived, and on a kept-alive one the request
+        // waits for the reader. Not a fixed sleep: a slow run made the
+        // request's 'close' race it on the paths that are not kept.
+        await Promise.race([sleep(1000), new Promise((resolve) => req.once("close", resolve))]);
         break;
       }
       events.push("broke");
@@ -141,7 +146,7 @@ for (const [name, options] of paths) {
         setTimeout(() => {
           events.push("res.destroy()");
           res.destroy();
-        }, 500);
+        }, 1000);
       });
     });
   }
