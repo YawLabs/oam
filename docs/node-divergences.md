@@ -1882,10 +1882,16 @@ store, and `setHeaders` and `addTrailers` did not exist.
   UTF-8 of U+FFFD after `res.end('text')`, and as `caf\xfd` after `res.end(buffer)`, and
   `writeHead()` refuses it (`ERR_INVALID_CHAR`) when a `content-length` comes before it. oam
   writes it as any other header value (`caf\xc3\xa9`, `caf\xe9`).
-- **An HTTP/1.0 request's response.** Node does not chunk one, so a head joined to a UTF-8
-  string body after `writeHead()` is UTF-8 there; oam's `req.httpVersion` is always `'1.1'`,
-  so it writes such a head one byte per code point. Its status line says `HTTP/1.0`, where
-  Node's says `HTTP/1.1`.
+- **An HTTP/1.0 request's response is framed by hyper.** `req.httpVersion` (and
+  `httpVersionMajor` / `httpVersionMinor`) say `1.0` as Node's do, and the header bytes follow
+  Node's framing for it -- a head joined to a UTF-8 string body, from `write('text')` as well
+  as `end('text')`, is UTF-8. But the status line says `HTTP/1.0` where Node's says
+  `HTTP/1.1`; `end('text')` adds a `content-length` where Node closes the connection to end
+  the body; a request saying `TE: chunked` does not get the chunked body Node sends it; and a
+  `Trailer` header does not throw `ERR_HTTP_TRAILER_INVALID` as it does in Node, which cannot
+  chunk the response. Up to 0.17.1 `req.httpVersion` was always `'1.1'` and the server request
+  had no `httpVersionMajor` / `httpVersionMinor`, so such a head went out one byte per code
+  point.
 - **Header names go out lowercased**, as hyper writes them; Node keeps the case they were
   set in, and writes the ones it adds as `Content-Length`, `Transfer-Encoding`, `Date`,
   `Connection`.

@@ -10,6 +10,12 @@
 // encoding, or nothing at all, it goes out one byte per code point (caf\xe9).
 // The same value therefore reaches the wire both ways from the same
 // setHeader(); this case pins which way each response sends it.
+//
+// An HTTP/1.0 request's response is not chunked unless the request says
+// `TE: chunked`, so a write('text') with no length is joined to the head
+// there too. oam's req.httpVersion was always '1.1', so it wrote that head
+// one byte per code point; the accept record now carries the request
+// line's version (req.httpVersion, httpVersionMajor, httpVersionMinor).
 import http from "node:http";
 import net from "node:net";
 
@@ -110,17 +116,21 @@ for (const [h, head] of Object.entries(heads)) {
   }
 }
 for (const [label, fn] of Object.entries(framed)) routes.push([label, fn]);
+routes.push(["version", (res, req) => {
+  res.setHeader("x-v", `${req.httpVersion} ${req.httpVersionMajor}.${req.httpVersionMinor}`);
+  res.end();
+}]);
 
-const server = http.createServer((req, res) => routes[Number(req.url.slice(1))][1](res));
+const server = http.createServer((req, res) => routes[Number(req.url.slice(1))][1](res, req));
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const port = server.address().port;
 
 // The raw x-v lines of the response head, each byte outside printable
 // ASCII as \xNN.
-const xv = (method, path) =>
+const xv = (method, path, version = "1.1", extra = "") =>
   new Promise((resolve) => {
     const socket = net.connect(port, "127.0.0.1", () =>
-      socket.write(`${method} ${path} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n`),
+      socket.write(`${method} ${path} HTTP/${version}\r\nhost: x\r\n${extra}connection: close\r\n\r\n`),
     );
     let buf = Buffer.alloc(0);
     socket.on("data", (chunk) => (buf = Buffer.concat([buf, chunk])));
@@ -143,4 +153,21 @@ const xv = (method, path) =>
 for (let i = 0; i < routes.length; i++) console.log(routes[i][0].padEnd(40), await xv("GET", `/${i}`));
 // A HEAD response has no body: what end('x') would send is dropped.
 console.log("HEAD: setHeader + end('x')".padEnd(40), await xv("HEAD", `/${routes.findIndex(([l]) => l === "setHeader + end('x')")}`));
+// The same routes over HTTP/1.0, and with `TE: chunked`, which makes node
+// chunk the response again. (oam's status line still says HTTP/1.0 and its
+// framing differs; only the x-v bytes are compared.)
+const at = (label) => `/${routes.findIndex(([l]) => l === label)}`;
+for (const label of [
+  ...Object.keys(bodies).map((b) => `setHeader + ${b}`),
+  ...Object.keys(bodies).map((b) => `writeHeadObject + ${b}`),
+  // node throws ERR_HTTP_TRAILER_INVALID for a trailer it cannot chunk.
+  ...Object.keys(framed).filter((label) => !label.startsWith("trailer")),
+  "version",
+]) {
+  console.log(`1.0: ${label}`.padEnd(45), await xv("GET", at(label), "1.0"));
+}
+for (const label of ["setHeader + write('x')", "setHeader + end('x')", "writeHeadObject + end('x')", "version"]) {
+  console.log(`1.0 te chunked: ${label}`.padEnd(45), await xv("GET", at(label), "1.0", "te: chunked\r\n"));
+}
+console.log("1.1: version".padEnd(45), await xv("GET", at("version")));
 server.close();

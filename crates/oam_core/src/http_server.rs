@@ -96,6 +96,10 @@ pub struct IncomingRequest {
     pub method: String,
     /// Path + query, as received.
     pub uri: String,
+    /// The request line said `HTTP/1.0` (node's `req.httpVersion` '1.0',
+    /// which decides how node frames the response). Anything else is 1.1 to
+    /// the http server's request; an h2 request has its own compat class.
+    pub http10: bool,
     pub headers: Vec<(String, String)>,
     pub is_upgrade: bool,
     pub socket_handle: Option<u64>,
@@ -1515,6 +1519,7 @@ pub async fn http_serve(
                                 id: takeover.id,
                                 method: takeover.head.method,
                                 uri: takeover.head.target,
+                                http10: takeover.head.http10,
                                 headers: takeover.head.headers,
                                 is_upgrade: true,
                                 socket_handle: Some(handle),
@@ -1977,6 +1982,7 @@ async fn dispatch_request(
         .and_then(|raw| crate::http_head::request_target(raw.as_bytes()))
         .map(|target| target.iter().map(|&b| char::from(b)).collect::<String>());
     let (parts, body) = req.into_parts();
+    let http10 = parts.version == hyper::Version::HTTP_10;
     let end_stream =
         parts.version == hyper::Version::HTTP_2 && hyper::body::Body::is_end_stream(&body);
     // Collect the body, enforcing MAX_REQUEST_BODY.  When the cap is hit we
@@ -2114,6 +2120,7 @@ async fn dispatch_request(
             id,
             method: parts.method.as_str().to_string(),
             uri,
+            http10,
             headers,
             is_upgrade: false,
             socket_handle: None,
@@ -2466,6 +2473,7 @@ async fn serve_https_connection(
             id: takeover.id,
             method: takeover.head.method,
             uri: takeover.head.target,
+            http10: takeover.head.http10,
             headers: takeover.head.headers,
             is_upgrade: true,
             socket_handle: Some(handle),
@@ -2530,6 +2538,10 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
                 "uri": request.uri,
                 "headers": request.headers,
             });
+            // Only when it is not 1.1, so the usual request carries nothing more.
+            if request.http10 {
+                meta["httpVersion"] = serde_json::json!("1.0");
+            }
             request.conn.write_meta(&mut meta);
             if request.end_stream {
                 meta["endStream"] = serde_json::json!(true);

@@ -412,6 +412,7 @@ pub fn parse_request_head(head: &[u8], policy: HeadPolicy) -> Result<ParsedHead,
     Ok(ParsedHead {
         method: req.method.unwrap_or_default().to_string(),
         target: req.path.unwrap_or_default().to_string(),
+        http10: req.version == Some(0),
         headers: req
             .headers
             .iter()
@@ -467,6 +468,8 @@ pub fn latin1_header_value(text: &str) -> Option<http::HeaderValue> {
 pub struct ParsedHead {
     pub method: String,
     pub target: String,
+    /// The request line said `HTTP/1.0`.
+    pub http10: bool,
     pub headers: Vec<(String, String)>,
 }
 
@@ -810,6 +813,14 @@ mod tests {
         assert_eq!(ok.method, "GET");
         assert_eq!(ok.target, "/ws");
         assert_eq!(ok.headers.len(), 3);
+        assert!(!ok.http10);
+        // The request line's version reaches req.httpVersion.
+        let http10 = parse_request_head(
+            b"CONNECT x:1 HTTP/1.0\r\nHost: x\r\nConnection: Upgrade\r\nUpgrade: x\r\n\r\n",
+            STRICT,
+        )
+        .unwrap();
+        assert!(http10.http10);
         for head in [
             // obs-fold, NUL, a space in a name, CL + TE, a duplicate CL
             &b"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: x\r\nX-A: a\r\n b\r\n\r\n"[..],

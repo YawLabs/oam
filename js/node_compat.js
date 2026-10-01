@@ -17472,7 +17472,18 @@
         meta = meta || {};
         this.method = meta.method;
         this.url = meta.uri;
-        this.httpVersion = "1.1";
+        // The request line's version: the accept record names it only when
+        // it is not 1.1. The response frames its body by it, as node's does
+        // (an HTTP/1.0 client gets no chunked body).
+        if (meta.httpVersion === "1.0") {
+          this.httpVersion = "1.0";
+          this.httpVersionMajor = 1;
+          this.httpVersionMinor = 0;
+        } else {
+          this.httpVersion = "1.1";
+          this.httpVersionMajor = 1;
+          this.httpVersionMinor = 1;
+        }
         this.headers = {};
         this.rawHeaders = [];
         for (const [name, value] of meta.headers || []) {
