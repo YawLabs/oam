@@ -1188,9 +1188,51 @@
   codes.ERR_FS_CP_DIR_TO_NON_DIR = E("ERR_FS_CP_DIR_TO_NON_DIR", Error, function(msg) {
     return msg;
   });
-  codes.ERR_FS_EISDIR = E("ERR_FS_EISDIR", Error, function(msg) {
-    return msg || 'Path is a directory';
-  });
+  // node's SystemError (lib/internal/errors.js, v22.22.2): the class of the
+  // codes node raises for a failure it decides itself but reports in a
+  // system error's terms (ERR_FS_EISDIR). The message is `<prefix>: <syscall>
+  // returned <code> (<message>) <path>`, `info` is the context object, and
+  // errno / syscall / path are enumerable accessors over it -- own keys
+  // stack, code, name, message, info, errno, syscall, path, in that order.
+  // toString() and the stack header read `SystemError [<key>]: <message>`,
+  // and util.inspect shows the accessors' values.
+  class SystemError extends Error {
+    constructor(key, prefix, context) {
+      super();
+      let message = `${prefix}: ${context.syscall} returned ${context.code} (${context.message})`;
+      if (context.path !== undefined) message += ` ${context.path}`;
+      if (context.dest !== undefined) message += ` => ${context.dest}`;
+      this.code = key;
+      const field = (name) => ({
+        get() { return context[name]; },
+        set(value) { context[name] = value; },
+        enumerable: true,
+        configurable: true,
+      });
+      Object.defineProperties(this, {
+        name: { value: "SystemError", enumerable: false, writable: true, configurable: true },
+        message: { value: message, enumerable: false, writable: true, configurable: true },
+        info: { value: context, enumerable: true, configurable: true, writable: false },
+        errno: field("errno"),
+        syscall: field("syscall"),
+      });
+      if (context.path !== undefined) Object.defineProperty(this, "path", field("path"));
+      if (context.dest !== undefined) Object.defineProperty(this, "dest", field("dest"));
+      try {
+        const stack = this.stack;
+        if (typeof stack === "string" && stack.startsWith("Error")) this.stack = this.toString() + stack.slice(5);
+      } catch {
+        // A throwing user Error.prepareStackTrace: the error is still whole.
+      }
+    }
+    toString() {
+      return `${this.name} [${this.code}]: ${this.message}`;
+    }
+    [Symbol.for("nodejs.util.inspect.custom")](recurseTimes, ctx) {
+      return registry.get("util").inspect(this, { ...ctx, getters: true, customInspect: false });
+    }
+  }
+  codes.ERR_FS_EISDIR = (context) => new SystemError("ERR_FS_EISDIR", "Path is a directory", context);
   codes.ERR_MODULE_NOT_FOUND = E("ERR_MODULE_NOT_FOUND", Error, function(path, base) {
     return 'Cannot find module "' + path + '"' + (base ? ' imported from ' + base : '');
   });
@@ -10140,6 +10182,21 @@
     return value;
   }
 
+  // The lstat half of node's validateRmOptions (lib/internal/fs/utils.js,
+  // v22.22.2), once the options are valid: rm refuses a directory unless
+  // `recursive` is set -- ERR_FS_EISDIR, nothing removed -- and a path whose
+  // lstat fails reports that failure (syscall lstat), except ENOENT under
+  // `force`. `raw` is the lstat result, or the error it failed with.
+  function rmCheckTarget(file, recursive, force, raw, failed) {
+    if (failed !== undefined) {
+      if (force && failed?.code === "ENOENT") return;
+      throw failed;
+    }
+    if (raw.kind === "dir" && !recursive) {
+      throw codes.ERR_FS_EISDIR({ code: "EISDIR", message: "is a directory", path: file, syscall: "rm", errno: 21 });
+    }
+  }
+
   // The synchronous half of node's validateRmOptions (validateRmdirOptions
   // over rm's defaults, then `force`): an options object, if given, with
   // boolean recursive / force, an int32 retryDelay >= 0 and a uint32
@@ -10793,8 +10850,16 @@
       }),
       rm: withPath(async (file, options) => {
         validateRmOptions(options);
-        options ??= {};
-        await natives.fsRm(file, options.recursive === true, options.force === true);
+        const recursive = options?.recursive === true;
+        const force = options?.force === true;
+        let raw, failed;
+        try {
+          raw = await natives.fsStat(file, true);
+        } catch (e) {
+          failed = e;
+        }
+        rmCheckTarget(file, recursive, force, raw, failed);
+        await natives.fsRm(file, recursive, force);
       }),
       rmdir: withPath(async (dir) => {
         // Node never deletes a FILE through rmdir (code-probing callers
@@ -11740,11 +11805,23 @@
       mkdirSync: (path, options) => {
         natives.fsMkdirSync(toPath(path), readOptions(options).recursive === true);
       },
+      // node's rmSync skips the lstat only when both `force` and
+      // `recursive` are set.
       rmSync: (path, options) => {
         const file = toPath(path);
         validateRmOptions(options);
-        options ??= {};
-        natives.fsRmSync(file, options.recursive === true, options.force === true);
+        const recursive = options?.recursive === true;
+        const force = options?.force === true;
+        if (!force || !recursive) {
+          let raw, failed;
+          try {
+            raw = natives.fsStatSync(file, true);
+          } catch (e) {
+            failed = e;
+          }
+          rmCheckTarget(file, recursive, force, raw, failed);
+        }
+        natives.fsRmSync(file, recursive, force);
       },
       rmdirSync: (path) => {
         // The kind probe is an implementation detail: node reports `rmdir` as

@@ -1,4 +1,4 @@
-// fs.close's result for a descriptor that is not open.
+// fs.close's result for a descriptor that is not open, and fs.rm's checks.
 //
 // node reports EBADF to fs.close's callback for a descriptor that was never
 // opened or is already closed, the error closeSync throws; with no callback
@@ -113,5 +113,56 @@ await new Promise((resolve) => fs.rm(a, (...args) => { console.log("rm(file, cb)
 await new Promise((resolve) =>
   fs.rm(a, (...args) => { console.log("rm(missing, cb)", args.length, args[0].code); resolve(); }),
 );
+
+// A directory without `recursive` is ERR_FS_EISDIR, removed by none of the
+// three forms (node's validateRmOptions lstats the path first); a path whose
+// lstat fails reports the lstat, except ENOENT under `force`. oam used to
+// remove an empty directory and fail a full one with ENOTEMPTY.
+const where = (s) => String(s).split(dir).join("<dir>");
+const rmShape = (e) =>
+  `${e.constructor.name} ${e.name} ${e.code} ${e.errno} ${e.syscall} ${where(e.path)} ${JSON.stringify(where(e.message))} ${JSON.stringify(Object.keys(e))}` +
+  (e.info ? ` info ${JSON.stringify({ ...e.info, path: where(e.info.path) })} ${where(String(e))}` : "");
+const tree = path.join(dir, "tree");
+const seed = () => {
+  fs.rmSync(tree, { recursive: true, force: true });
+  fs.mkdirSync(path.join(tree, "empty"), { recursive: true });
+  fs.mkdirSync(path.join(tree, "full"));
+  fs.writeFileSync(path.join(tree, "full", "a"), "");
+  fs.writeFileSync(path.join(tree, "file"), "");
+};
+for (const [name, o] of [
+  ["empty", undefined], ["full", undefined], ["empty", { force: true }], ["empty", { recursive: false }],
+  ["full", { recursive: true }], ["missing", undefined], ["missing", { force: true }], ["file", undefined],
+  ["missing/deeper", undefined], ["file/sub", { force: true }],
+]) {
+  const p = path.join(tree, name);
+  const label = `${name} ${JSON.stringify(o)}`;
+  seed();
+  try {
+    fs.rmSync(p, o);
+    console.log("rmSync", label, "ok", fs.existsSync(p));
+  } catch (e) {
+    console.log("rmSync", label, rmShape(e), fs.existsSync(p));
+  }
+  seed();
+  await new Promise((resolve) =>
+    fs.rm(p, ...(o ? [o] : []), (...args) => {
+      console.log("rm", label, args.length, args[0] ? rmShape(args[0]) : args[0], fs.existsSync(p));
+      resolve();
+    }),
+  );
+  seed();
+  await fs.promises.rm(p, o).then(
+    () => console.log("promises.rm", label, "ok", fs.existsSync(p)),
+    (e) => console.log("promises.rm", label, rmShape(e), fs.existsSync(p)),
+  );
+}
+seed();
+try {
+  fs.rmSync(path.join(tree, "empty"));
+} catch (e) {
+  e.errno = 5;
+  console.log("errno is an accessor over info:", e.info.errno, e.errno);
+}
 
 fs.rmSync(dir, { recursive: true, force: true });

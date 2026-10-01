@@ -2256,7 +2256,10 @@ What still differs:
   `rm` never checks it, so the removal runs and calling the missing callback when
   it settles is an uncaught `TypeError: callback is not a function`; oam does the
   same rather than refusing at the call, which it used to. `rm`, `rmSync` and
-  `fs/promises.rm` validate their options as node's `validateRmOptions` does.)
+  `fs/promises.rm` validate their options as node's `validateRmOptions` does, and
+  lstat the path first as it does: a directory without `recursive` is node's
+  `SystemError` `ERR_FS_EISDIR` and nothing is removed, and a path that cannot be
+  lstat'ed reports the `lstat`, except `ENOENT` under `force`.)
 
 ### `fs.realpath` under `--permission` — oam is stricter
 
