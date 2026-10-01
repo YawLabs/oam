@@ -1639,6 +1639,68 @@
     return headers;
   }
 
+  // The error node's bundled undici (v22.22.2) reports for a connection its
+  // peer closed: `SocketError`, `other side closed`, code `UND_ERR_SOCKET`,
+  // and the socket it was on -- extending `UndiciError`, branded with the
+  // global symbols undici's own `instanceof` checks read, as measured (own
+  // keys `name`, `code`, `socket`; the two brands own symbol fields).
+  const kUndiciError = Symbol.for("undici.error.UND_ERR");
+  const kUndiciSocketError = Symbol.for("undici.error.UND_ERR_SOCKET");
+  class UndiciError extends Error {
+    constructor(message, options) {
+      super(message, options);
+      this.name = "UndiciError";
+      this.code = "UND_ERR";
+    }
+    static [Symbol.hasInstance](instance) {
+      return instance != null && instance[kUndiciError] === true;
+    }
+    [kUndiciError] = true;
+  }
+  class SocketError extends UndiciError {
+    constructor(message, socket) {
+      super(message);
+      this.name = "SocketError";
+      this.code = "UND_ERR_SOCKET";
+      this.socket = socket;
+    }
+    static [Symbol.hasInstance](instance) {
+      return instance != null && instance[kUndiciSocketError] === true;
+    }
+    [kUndiciSocketError] = true;
+  }
+
+  // A transport failure as fetch reports it. The native side rejects a
+  // connection its peer closed with an `UND_ERR_SOCKET` error carrying the
+  // socket's facts; that becomes undici's SocketError, the socket in
+  // undici's `getSocketInfo` shape (a `timeout` key with no value: undici's
+  // socket has none set). Anything else is already in node's shape.
+  function fetchCause(e) {
+    if (!(e instanceof Error) || e.code !== "UND_ERR_SOCKET" || e instanceof SocketError) return e;
+    const facts = e.socket || {};
+    return new SocketError(e.message, {
+      localAddress: facts.localAddress,
+      localPort: facts.localPort,
+      remoteAddress: facts.remoteAddress,
+      remotePort: facts.remotePort,
+      remoteFamily: facts.remoteFamily,
+      timeout: undefined,
+      bytesWritten: facts.bytesWritten,
+      bytesRead: facts.bytesRead,
+    });
+  }
+
+  // A body read the wire failed: undici's fetch errors the stream with
+  // `TypeError: terminated`, the socket's error as the cause -- undici's
+  // `other side closed` for a close, the socket's `read ECONNRESET` for a
+  // reset (measured on v22.22.2). Any other failure is passed on as it is.
+  function bodyReadFailure(e) {
+    if (e instanceof Error && (e.code === "UND_ERR_SOCKET" || e.syscall === "read")) {
+      return new TypeError("terminated", { cause: fetchCause(e) });
+    }
+    return e;
+  }
+
   function makeResponse(raw, signal) {
     const handle = raw.bodyHandle;
     let consumed = false;
@@ -1711,7 +1773,7 @@
           } catch (e) {
             if (bodyAborted) return;
             bodyOver();
-            throw e;
+            throw bodyReadFailure(e);
           }
           // The read that was in flight when the abort landed returns here
           // against a stream that is already errored; closing or enqueuing
@@ -1972,7 +2034,7 @@
     // checked when the fetch resumes) has to look the same or a policy
     // failure reads as an unreachable host.
     if (e instanceof Error && e.code === "ERR_ACCESS_DENIED") return e;
-    return new TypeError("fetch failed", { cause: e instanceof Error ? e : new Error(String(e)) });
+    return new TypeError("fetch failed", { cause: e instanceof Error ? fetchCause(e) : new Error(String(e)) });
   }
 
   // The op, settled: a response, or -- for a fetch whose dispatcher carries a

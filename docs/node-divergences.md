@@ -1421,10 +1421,27 @@ What still differs:
   request's `'error'` and `fetch`'s cause are `read ECONNRESET` with `errno`, `code` and
   `syscall: 'read'`, as Node's socket reports it. Up to 0.17.1 it was `ECONNRESET` `socket
   hang up` with no `errno` / `syscall`, and `fetch`'s cause the uncoded `error sending
-  request for url (...)`. A close without a reset is still that uncoded cause where undici
-  says `UND_ERR_SOCKET` `other side closed`, and a reset in the middle of a `fetch` body
-  rejects with oam's own `fetch: body read failed` where undici's `terminated` carries the
-  same `read ECONNRESET` cause.
+  request for url (...)`.
+- **A server's close (no reset) is undici's `SocketError`; a failure mid-body is
+  `terminated`** (`conformance/cases/273-fetch-server-close-and-reset.mjs`). A connection
+  the server closes before the response head is in, or halfway through it, fails `fetch`
+  with `fetch failed`, cause undici's `SocketError` -- `other side closed`, code
+  `UND_ERR_SOCKET`, its class chain `SocketError < UndiciError < Error` with undici's
+  `instanceof` brands, and the `socket` it was on: `localAddress`, `localPort`,
+  `remoteAddress`, `remotePort`, `remoteFamily`, `timeout` (unset), `bytesWritten`,
+  `bytesRead`; `http.request` fails with `socket hang up`, as before. A body the server
+  closes or resets before its end fails the read with `TypeError: terminated`, the cause
+  that `SocketError` or the socket's `read ECONNRESET`; `http.request` aborts the response
+  (`'aborted'`, then ECONNRESET `aborted`), after a reset first emitting `read ECONNRESET`
+  on the request, as Node's socket error does. Up to 0.17.1 a close was the uncoded `error
+  sending request for url (...)` cause, and a failure mid-body was oam's own `fetch: body
+  read failed: error decoding response body` (on `http.request`, the response's error).
+  What differs: `bytesWritten` counts oam's own request head, whose `user-agent` is oam's
+  (6 bytes longer than Node's `node`) and whose header order is its own; on an `https`
+  connection both counts are of the HTTP bytes inside TLS (Node's are not measured there);
+  a connection a fetch dispatcher's `connect` supplied reports no socket facts; and the
+  `read ECONNRESET` cause is a plain `Error`, where Node's errno errors have a prototype of
+  their own whose `constructor` getter answers `Error`.
 - **The WebSocket client dials on this connector too** (since 0.17.2; up to 0.17.1 it dialled
   on its own, so on Windows a refused loopback connect took about 2 s per resolved address,
   and the `'error'` event was a plain `Event`). A connect that fails dispatches Node's

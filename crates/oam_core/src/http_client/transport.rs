@@ -23,7 +23,8 @@ use hyper::body::{Frame, Incoming};
 use hyper_util::client::proxy::matcher::Matcher;
 
 use super::connector::{
-    HostAddrs, OamConnector, Shared, SuppliedConn, SuppliedConns, TlsSetupError, Via, authority_key,
+    ConnInfo, HostAddrs, OamConnector, Shared, SuppliedConn, SuppliedConns, TlsSetupError, Via,
+    authority_key,
 };
 use super::pool::{Pool, PoolError, PoolFail};
 use super::prepare::host_for_connect;
@@ -214,10 +215,12 @@ impl HttpTransport {
                 error,
                 reused,
                 response_started,
+                conn,
             }) => Err(SendError {
                 error,
                 reused,
                 response_started,
+                conn,
             }),
         }
     }
@@ -357,6 +360,9 @@ pub struct SendError {
     /// Some part of a response arrived on that connection after this request
     /// took it (see `ConnStats`).
     response_started: bool,
+    /// That connection, for the socket a `SocketError` describes; `None`
+    /// when the request never had one.
+    conn: Option<ConnInfo>,
 }
 
 impl SendError {
@@ -438,15 +444,31 @@ impl SendError {
         // before the response head was in: node's socket read fails, and
         // both of its clients report that error -- `read ECONNRESET`, with
         // errno, code and syscall -- http.request as the request's 'error',
-        // fetch as the cause of its `fetch failed` (measured on v22.22.2). A
-        // close without a reset stays the transport's failure (node's 'socket
-        // hang up' / undici's `other side closed`).
+        // fetch as the cause of its `fetch failed` (measured on v22.22.2).
         if let Some(io) = find_in_chain::<std::io::Error>(&self.error)
             && io.kind() == std::io::ErrorKind::ConnectionReset
         {
             return crate::tcp::errno_failure(io, "read");
         }
+        // It closed without a reset -- before a byte of the head, or halfway
+        // through it: undici's `SocketError` `other side closed`, describing
+        // the socket (fetch's cause), and node's `socket hang up` for
+        // http.request, which the JS makes of the same outcome.
+        if let Some(conn) = &self.conn
+            && self.is_closed_by_peer()
+        {
+            return OpOutcome::socket_closed(conn.socket_facts());
+        }
         OpOutcome::Failed(format!("error sending request for url ({url})"))
+    }
+
+    /// The connection ended under the request in an orderly close: hyper's
+    /// `IncompleteMessage`, or a read that met the end of the stream (a TLS
+    /// session closed without its close_notify).
+    fn is_closed_by_peer(&self) -> bool {
+        self.is_incomplete_message()
+            || find_in_chain::<std::io::Error>(&self.error)
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
     }
 
     /// hyper's `IncompleteMessage`, "connection closed before message

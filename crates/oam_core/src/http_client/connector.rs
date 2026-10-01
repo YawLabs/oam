@@ -83,9 +83,13 @@ pub(crate) struct ConnStats {
 }
 
 #[derive(Debug, Default)]
-struct ConnCounters {
+pub(crate) struct ConnCounters {
     uses: AtomicU64,
     read: AtomicU64,
+    /// Every byte of HTTP written onto the connection (above TLS), for the
+    /// `bytesWritten` of the socket facts a failure reports
+    /// ([`ConnInfo::socket_facts`]).
+    written: AtomicU64,
 }
 
 impl ConnStats {
@@ -162,6 +166,9 @@ pub(crate) struct ConnInfo {
     /// ([`close_connection`]): an HTTP/1 connection the transport dialled.
     /// None on an h2 connection, which many requests share at once.
     pub(crate) connection: Option<u64>,
+    /// What the connection has read and written so far (its [`ConnStats`]'
+    /// counters), set once it is handed to the pool.
+    counters: Option<Arc<ConnCounters>>,
 }
 
 impl ConnInfo {
@@ -171,6 +178,29 @@ impl ConnInfo {
             peer: tcp.stream.peer_addr().ok(),
             tls: None,
             connection: Some(tcp.closer.id),
+            counters: None,
+        }
+    }
+
+    /// The connection as undici describes the socket of a `SocketError`
+    /// (`util.getSocketInfo`): its two ends and the bytes it has carried.
+    /// Read when a request fails, never on the way to a response.
+    pub(crate) fn socket_facts(&self) -> crate::SocketFacts {
+        let counted = |pick: fn(&ConnCounters) -> &AtomicU64| {
+            self.counters
+                .as_ref()
+                .map(|counters| pick(counters).load(Ordering::Relaxed))
+        };
+        crate::SocketFacts {
+            local_address: self.local.as_ref().map(crate::http_server::node_ip_string),
+            local_port: self.local.map(|local| local.port()),
+            remote_address: self.peer.as_ref().map(crate::http_server::node_ip_string),
+            remote_port: self.peer.map(|peer| peer.port()),
+            remote_family: self
+                .peer
+                .map(|peer| if peer.is_ipv6() { "IPv6" } else { "IPv4" }.to_string()),
+            bytes_written: counted(|counters| &counters.written),
+            bytes_read: counted(|counters| &counters.read),
         }
     }
 
@@ -240,6 +270,7 @@ impl OamConn {
         if h2 {
             info.connection = None;
         }
+        info.counters = Some(stats.counters.clone());
         OamConn {
             io: TokioIo::new(Counted {
                 io,
@@ -278,12 +309,23 @@ impl OamConn {
     }
 }
 
-/// The byte stream under a connection, counting what is read from it into
-/// the connection's [`ConnStats`]. It sits above TLS, so the count is HTTP
-/// bytes only: a TLS close_notify or session ticket is not a response.
+/// The byte stream under a connection, counting what is read from it and
+/// written onto it into the connection's [`ConnStats`]. It sits above TLS,
+/// so the count is HTTP bytes only: a TLS close_notify or session ticket is
+/// not a response.
 struct Counted {
     io: Box<dyn AsyncIo>,
     counters: Arc<ConnCounters>,
+}
+
+impl Counted {
+    fn count_written(&self, polled: &Poll<std::io::Result<usize>>) {
+        if let Poll::Ready(Ok(written)) = polled {
+            self.counters
+                .written
+                .fetch_add(*written as u64, Ordering::Relaxed);
+        }
+    }
 }
 
 impl AsyncRead for Counted {
@@ -309,7 +351,10 @@ impl AsyncWrite for Counted {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        StdPin::new(&mut self.get_mut().io).poll_write(cx, buf)
+        let this = self.get_mut();
+        let polled = StdPin::new(&mut this.io).poll_write(cx, buf);
+        this.count_written(&polled);
+        polled
     }
 
     fn poll_flush(self: StdPin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -329,7 +374,10 @@ impl AsyncWrite for Counted {
         cx: &mut Context<'_>,
         bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<std::io::Result<usize>> {
-        StdPin::new(&mut self.get_mut().io).poll_write_vectored(cx, bufs)
+        let this = self.get_mut();
+        let polled = StdPin::new(&mut this.io).poll_write_vectored(cx, bufs);
+        this.count_written(&polled);
+        polled
     }
 }
 

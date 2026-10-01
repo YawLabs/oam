@@ -15,6 +15,7 @@ use bytes::Bytes;
 use http_body_util::BodyExt as _;
 use hyper::body::Incoming;
 
+use super::connector::ConnInfo;
 use super::decode::{Coding, Decoder};
 use crate::{BodyCancelSignal, CancelledBodies, OpOutcome, OutboundBodies};
 
@@ -43,41 +44,71 @@ pub struct FetchBody {
     /// an agent's socket reads its body here and reports what node's parser
     /// reports. fetch keeps the one text it has always had.
     coded: bool,
+    /// The connection the body arrives on (the shared transport's): a peer
+    /// that closes it mid-body is undici's `SocketError`, which describes
+    /// it. `None` for a body read off an agent's socket or an h2 stream.
+    conn: Option<ConnInfo>,
 }
 
-/// The body could not be read (a wire failure or a corrupt encoding). The op
-/// reports [`BODY_READ_FAILED`], or for a coded body whose framing was
-/// malformed (`parse`), node's parse error.
+/// Why the body could not be read. The op reports node's error for a wire
+/// failure -- the socket's `read ECONNRESET` for a reset, undici's
+/// `other side closed` for a close -- node's parse error for a coded body
+/// whose framing was malformed, and [`BODY_READ_FAILED`] otherwise (a
+/// corrupt encoding).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct BodyReadError {
-    pub parse: bool,
+pub enum BodyReadError {
+    /// Malformed chunked framing.
+    Framing,
+    /// The peer reset the connection; the OS error, when there was one.
+    Reset(Option<i32>),
+    /// The peer closed the connection before the body's end.
+    Closed,
+    /// Anything else: a corrupt encoding, a transport failure node has no
+    /// name for.
+    Other,
 }
 
-/// hyper reports malformed chunked framing as a body error whose source is an
-/// `io::Error` of kind InvalidInput / InvalidData ("Invalid chunk size
-/// line"); a connection that ends early is a different kind.
-fn is_framing_error(error: &hyper::Error) -> bool {
+/// What a body error from hyper was. hyper reports malformed chunked framing
+/// as a body error whose source is an `io::Error` of kind InvalidInput /
+/// InvalidData ("Invalid chunk size line"); a connection that ends early as
+/// one of kind UnexpectedEof ("end of file before message length reached");
+/// a reset as the read's own ConnectionReset.
+fn classify(error: &hyper::Error) -> BodyReadError {
     let mut current: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(error);
     while let Some(e) = current {
         if let Some(io) = e.downcast_ref::<std::io::Error>() {
-            return matches!(
-                io.kind(),
-                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData
-            );
+            return match io.kind() {
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => {
+                    BodyReadError::Framing
+                }
+                std::io::ErrorKind::ConnectionReset => BodyReadError::Reset(io.raw_os_error()),
+                std::io::ErrorKind::UnexpectedEof => BodyReadError::Closed,
+                _ => BodyReadError::Other,
+            };
         }
         current = e.source();
     }
-    false
+    if error.is_incomplete_message() {
+        BodyReadError::Closed
+    } else {
+        BodyReadError::Other
+    }
 }
 
 impl FetchBody {
     /// `codings`: the plan's codings for a decoded body, `None` for identity.
-    pub fn new(incoming: Incoming, codings: Option<&[Coding]>) -> FetchBody {
+    /// `conn`: the connection it arrives on.
+    pub(crate) fn new(
+        incoming: Incoming,
+        codings: Option<&[Coding]>,
+        conn: Option<ConnInfo>,
+    ) -> FetchBody {
         FetchBody {
             incoming: Some(incoming),
             decoder: codings.map(Decoder::new),
             pending: Bytes::new(),
             coded: false,
+            conn,
         }
     }
 
@@ -86,7 +117,7 @@ impl FetchBody {
     pub fn coded(incoming: Incoming) -> FetchBody {
         FetchBody {
             coded: true,
-            ..FetchBody::new(incoming, None)
+            ..FetchBody::new(incoming, None, None)
         }
     }
 
@@ -101,10 +132,10 @@ impl FetchBody {
             if let Some(decoder) = &mut self.decoder {
                 if self.incoming.is_none() {
                     // The wire is over: drain what is still decodable.
-                    return decoder.finish().map_err(|_| BodyReadError { parse: false });
+                    return decoder.finish().map_err(|_| BodyReadError::Other);
                 }
                 match decoder.push(&mut self.pending) {
-                    Err(_) => return Err(self.fail(false)),
+                    Err(_) => return Err(self.fail(BodyReadError::Other)),
                     Ok(Some(chunk)) => return Ok(Some(chunk)),
                     Ok(None) if decoder.is_done() => {
                         // node ends the body where the compressed stream
@@ -128,7 +159,7 @@ impl FetchBody {
                         return Ok(None);
                     }
                 }
-                Some(Err(e)) => return Err(self.fail(is_framing_error(&e))),
+                Some(Err(e)) => return Err(self.fail(classify(&e))),
                 Some(Ok(frame)) => {
                     // Trailers carry no body bytes; an empty data frame is
                     // not a chunk.
@@ -147,10 +178,40 @@ impl FetchBody {
         }
     }
 
-    fn fail(&mut self, parse: bool) -> BodyReadError {
+    fn fail(&mut self, error: BodyReadError) -> BodyReadError {
         self.incoming = None;
         self.pending = Bytes::new();
-        BodyReadError { parse }
+        error
+    }
+
+    /// The op's failure for `error`, as node's two clients see it on the
+    /// wire (measured on v22.22.2): a reset is the socket's `read
+    /// ECONNRESET` (errno, code, syscall) and a close is undici's `other
+    /// side closed` -- fetch rejects the read with `terminated` and that
+    /// cause, http.request aborts the response -- when the body came over
+    /// the shared transport, whose connection is known. A malformed coded
+    /// body is node's parse error; the rest keep [`BODY_READ_FAILED`].
+    fn failure(&self, error: BodyReadError) -> OpOutcome {
+        match error {
+            // llhttp's code and text for a bad chunk-size line, the one
+            // framing error hyper leaves in the body.
+            BodyReadError::Framing if self.coded => OpOutcome::node_failed(
+                "HPE_INVALID_CHUNK_SIZE",
+                "Parse Error: Invalid character in chunk size",
+            ),
+            BodyReadError::Reset(os) if self.conn.is_some() => {
+                let io = match os {
+                    Some(code) => std::io::Error::from_raw_os_error(code),
+                    None => std::io::ErrorKind::ConnectionReset.into(),
+                };
+                crate::tcp::errno_failure(&io, "read")
+            }
+            BodyReadError::Closed => match &self.conn {
+                Some(conn) => OpOutcome::socket_closed(conn.socket_facts()),
+                None => OpOutcome::Failed(BODY_READ_FAILED.to_string()),
+            },
+            _ => OpOutcome::Failed(BODY_READ_FAILED.to_string()),
+        }
     }
 }
 
@@ -222,13 +283,7 @@ pub async fn read(
             OpOutcome::Bytes(chunk.to_vec())
         }
         Ok(None) => OpOutcome::Done,
-        // llhttp's code and text for a bad chunk-size line, the one framing
-        // error hyper leaves in the body.
-        Err(BodyReadError { parse: true }) if body.coded => OpOutcome::node_failed(
-            "HPE_INVALID_CHUNK_SIZE",
-            "Parse Error: Invalid character in chunk size",
-        ),
-        Err(_) => OpOutcome::Failed(BODY_READ_FAILED.to_string()),
+        Err(error) => body.failure(error),
     }
 }
 

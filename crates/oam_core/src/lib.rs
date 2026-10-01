@@ -129,6 +129,30 @@ pub struct AccessDenial {
     pub resource: String,
 }
 
+/// The socket an HTTP client request went out on, as undici describes it on
+/// a `SocketError` (`util.getSocketInfo`, node v22.22.2's bundled undici):
+/// the two ends in node's spelling and the bytes the socket has carried.
+/// The keys serialise as undici's own (`localAddress`, `bytesWritten`, ...),
+/// which is how the engine hands them to JS.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SocketFacts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_written: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_read: Option<u64>,
+}
+
 /// What an async op produced. v8-free by design; the engine maps these to
 /// promise resolutions (Done -> undefined, Text -> string, Json -> the
 /// parsed value via V8's own JSON parser, Failed -> reject with
@@ -203,6 +227,18 @@ pub enum OpOutcome {
     /// throw. A new variant, so a replay file recorded before it existed still
     /// loads.
     AccessDenied(AccessDenial),
+    /// The peer closed the HTTP client connection a request was on -- an
+    /// orderly close, no reset -- before the response head was in or while
+    /// its body was: undici's `SocketError` (`UND_ERR_SOCKET`, `other side
+    /// closed`), with the socket it describes. The engine rejects with an
+    /// Error carrying `code` and `socket`, which the JS turns into the error
+    /// its caller reports (fetch: the SocketError itself as the cause;
+    /// http.request: node's `socket hang up` / `aborted`). A new variant, so a
+    /// replay file recorded before it existed still loads.
+    SocketClosed {
+        message: String,
+        socket: SocketFacts,
+    },
     /// An inbound OS signal (payload is the Node signal name, e.g. "SIGTERM").
     /// Only ever carried on a completion whose id == SIGNAL_OP_ID; the engine
     /// maps it to `process.emit(name)` rather than resolving a promise. serde-
@@ -211,6 +247,15 @@ pub enum OpOutcome {
 }
 
 impl OpOutcome {
+    /// undici's `SocketError` for a connection its peer closed: `other side
+    /// closed`, the text undici's client reports for an end-of-stream.
+    pub fn socket_closed(socket: SocketFacts) -> Self {
+        OpOutcome::SocketClosed {
+            message: "other side closed".to_string(),
+            socket,
+        }
+    }
+
     /// A coded failure with no filesystem context (dns / net / tls).
     pub fn node_failed(code: impl Into<String>, message: impl Into<String>) -> Self {
         OpOutcome::NodeFailed {
@@ -5180,6 +5225,37 @@ mod op_outcome_serde_tests {
                 assert_eq!(errors[0].port, None);
             }
             other => panic!("expected NodeAggregateFailed, got {other:?}"),
+        }
+    }
+
+    /// The socket facts serialise under undici's own keys -- the engine hands
+    /// that JSON to JS as the error's `socket` -- an absent fact is left out,
+    /// and the outcome survives a replay file.
+    #[test]
+    fn a_peer_close_carries_undicis_socket_keys_and_round_trips() {
+        let socket = SocketFacts {
+            local_address: Some("127.0.0.1".into()),
+            local_port: Some(50000),
+            remote_address: Some("::1".into()),
+            remote_port: Some(8080),
+            remote_family: Some("IPv6".into()),
+            bytes_written: Some(170),
+            bytes_read: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&socket).unwrap(),
+            r#"{"localAddress":"127.0.0.1","localPort":50000,"remoteAddress":"::1","remotePort":8080,"remoteFamily":"IPv6","bytesWritten":170}"#
+        );
+        let json = serde_json::to_string(&OpOutcome::socket_closed(socket.clone())).unwrap();
+        match serde_json::from_str::<OpOutcome>(&json).unwrap() {
+            OpOutcome::SocketClosed {
+                message,
+                socket: back,
+            } => {
+                assert_eq!(message, "other side closed");
+                assert_eq!(back, socket);
+            }
+            other => panic!("expected SocketClosed, got {other:?}"),
         }
     }
 }

@@ -766,8 +766,6 @@ fn respond(
     let mut url = state.current;
     url.set_fragment(None);
     let handle = ids.fetch_add(1, Ordering::Relaxed);
-    let body = FetchBody::new(response.into_body(), codings.as_deref());
-    lock(bodies).insert(handle, body);
     let mut payload = serde_json::json!({
         "status": status.as_u16(),
         "statusText": status.canonical_reason().unwrap_or_default(),
@@ -776,9 +774,12 @@ fn respond(
         "headers": headers,
         "bodyHandle": handle,
     });
-    if let Some(conn) = conn {
-        conn_payload(&mut payload, &conn);
+    if let Some(conn) = &conn {
+        conn_payload(&mut payload, conn);
     }
+    // The body keeps the connection's facts for a failure mid-body.
+    let body = FetchBody::new(response.into_body(), codings.as_deref(), conn);
+    lock(bodies).insert(handle, body);
     OpOutcome::Json(payload.to_string())
 }
 

@@ -852,6 +852,34 @@ pub(crate) fn settle_completion(
             }
             resolver.reject(tc, error);
         }
+        // A connection its peer closed under an HTTP client request: an
+        // `UND_ERR_SOCKET` error with the socket's facts hung on it as
+        // `socket` (undici's keys), from which the JS builds the error its
+        // caller reports -- undici's SocketError for fetch, node's `socket
+        // hang up` / `aborted` for http.request.
+        OpOutcome::SocketClosed { message, socket } => {
+            let fields = SysFields {
+                code: "UND_ERR_SOCKET",
+                message: &message,
+                errno: None,
+                syscall: None,
+                path: None,
+                hostname: None,
+                address: None,
+                port: None,
+            };
+            let error = sys_error(tc, &fields);
+            let error = v8::Local::new(tc, &error);
+            if let Ok(obj) = v8::Local::<v8::Object>::try_from(error)
+                && let Ok(json) = serde_json::to_string(&socket)
+                && let Some(text) = v8::String::new(tc, &json)
+                && let Some(value) = v8::json::parse(tc, text)
+                && let Some(key) = v8::String::new(tc, "socket")
+            {
+                obj.create_data_property(tc, key.into(), value);
+            }
+            resolver.reject(tc, error);
+        }
         // The error a synchronous gate throws, rejected instead: a refusal
         // the op raised mid-flight must read exactly like one raised at entry.
         OpOutcome::AccessDenied(denial) => {

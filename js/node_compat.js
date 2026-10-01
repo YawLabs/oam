@@ -20845,6 +20845,10 @@
               : registry._disconnectedBeforeSecure({
                   path: null, host: self.host, port: self._port, localAddress: self._options.localAddress,
                 });
+          } else if (cause && cause.code === "UND_ERR_SOCKET") {
+            // The server closed the connection before the response head was
+            // in: node's socket ended under the request, `socket hang up`.
+            mapped = connResetException("socket hang up");
           } else if (/connection refused|ECONNREFUSED/i.test(detail)) {
             mapped = Object.assign(new Error("connect ECONNREFUSED"), {
               code: "ECONNREFUSED",
@@ -21718,17 +21722,27 @@
               }
             }, function (err) {
               settled = true;
-              if (agentPath) {
-                // node's parser reports malformed framing on the request
-                // before the response is aborted; a connection that ends
-                // inside a body just aborts it.
-                if (err && typeof err.code === "string" && err.code.indexOf("HPE_") === 0) {
-                  self.errored = withParseReason(err);
+              // node's parser reports malformed framing on the request
+              // before the response is aborted; a connection that ends
+              // inside a body -- closed or reset, over an agent's socket or
+              // oam's own transport -- just aborts it: 'aborted', then
+              // ECONNRESET `aborted`. Up to 0.17.1 the transport's reading
+              // failure (`fetch: body read failed: ...`) was the error.
+              if (agentPath && err && typeof err.code === "string" && err.code.indexOf("HPE_") === 0) {
+                self.errored = withParseReason(err);
+                self.emit("error", err);
+              } else if (!agentPath && err && err.syscall === "read" && typeof err.code === "string") {
+                // A reset: node's socket error reaches the request first
+                // (socketErrorListener), `read ECONNRESET` -- an uncaught
+                // exception when nothing listens, as in node. A close has
+                // no socket error.
+                try {
                   self.emit("error", err);
+                } catch (thrown) {
+                  process.nextTick(function () { throw thrown; });
                 }
-                err = connResetException("aborted");
               }
-              res.destroy(err);
+              res.destroy(connResetException("aborted"));
             });
           },
           // node's IncomingMessage._destroy: an unfinished response is

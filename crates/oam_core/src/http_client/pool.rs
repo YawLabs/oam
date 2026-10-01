@@ -159,6 +159,7 @@ impl Pool {
                 )),
                 reused: false,
                 response_started: false,
+                conn: None,
             });
         };
         let is_connect = req.method() == Method::CONNECT;
@@ -176,6 +177,7 @@ impl Pool {
                         error: PoolError::connect(error),
                         reused: false,
                         response_started: false,
+                        conn: None,
                     });
                 }
             };
@@ -217,6 +219,7 @@ impl Pool {
                         error: PoolError::send(error),
                         reused,
                         response_started,
+                        conn: Some(info),
                     });
                 }
                 SendResult::Sent(error, proto) => {
@@ -227,6 +230,7 @@ impl Pool {
                         error: PoolError::send(error),
                         reused,
                         response_started,
+                        conn: Some(info),
                     });
                 }
             }
@@ -240,6 +244,7 @@ impl Pool {
             )),
             reused: false,
             response_started: false,
+            conn: None,
         })
     }
 
@@ -543,6 +548,8 @@ pub(crate) struct PoolFail {
     pub(crate) error: PoolError,
     pub(crate) reused: bool,
     pub(crate) response_started: bool,
+    /// The connection the request went out on; `None` when none was had.
+    pub(crate) conn: Option<ConnInfo>,
 }
 
 /// The transport's send error, in place of `hyper_util::client::legacy::Error`.
