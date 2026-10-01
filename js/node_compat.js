@@ -23239,6 +23239,19 @@
         // settle the connect, so release the writes queued behind it (they
         // fail with ERR_SOCKET_CLOSED_BEFORE_CONNECTION).
         this._releaseHeldOps();
+        // node's Writable.destroy -> errorBuffer: the callbacks of an end()
+        // still waiting for 'finish' get the error (or ERR_STREAM_DESTROYED)
+        // on the next tick -- before 'close', not once the shutdown op,
+        // which may be queued behind a write, settles (#156). A socket that
+        // never connected keeps its path through the end() chain: node
+        // hands those callbacks the error of the write held behind the
+        // connect, which fails only once that write is released.
+        if (this._everConnected && this._endCallbacks !== null && this._endCallbacks.length > 0) {
+          const pending = this._endCallbacks.splice(0);
+          const endErr = err || codes.ERR_STREAM_DESTROYED("end");
+          for (const callback of pending) process.nextTick(callback, endErr);
+        }
+        this._endCallbacks = null;
         const rs = this._readableState;
         const ws = this._writableState;
         rs.destroyed = ws.destroyed = true;
@@ -23268,19 +23281,6 @@
         // One pump per handle. pause() only takes effect at the top of the
         // next iteration, so a pause/resume while a read is in flight left the
         // original loop awaiting tcpRead and started a second one -- two
-        // node's Writable.destroy -> errorBuffer: the callbacks of an end()
-        // still waiting for 'finish' get the error (or ERR_STREAM_DESTROYED)
-        // on the next tick -- before 'close', not once the shutdown op,
-        // which may be queued behind a write, settles (#156). A socket that
-        // never connected keeps its path through the end() chain: node
-        // hands those callbacks the error of the write held behind the
-        // connect, which fails only once that write is released.
-        if (this._everConnected && this._endCallbacks !== null && this._endCallbacks.length > 0) {
-          const pending = this._endCallbacks.splice(0);
-          const endErr = err || codes.ERR_STREAM_DESTROYED("end");
-          for (const callback of pending) process.nextTick(callback, endErr);
-        }
-        this._endCallbacks = null;
         // concurrent reads of the same handle, and the loser rejects with
         // "read handle is gone". The in-flight loop sees _paused cleared and
         // simply carries on, which is what resume() wants anyway.
