@@ -5061,6 +5061,17 @@ await listen(proxy);
 await attempt('slow-proxy-request', () => request(origin, { dispatcher: viaProxy() }));
 await attempt('slow-proxy-fetch', () => fetch(origin, { dispatcher: viaProxy() }));
 await attempt('slow-proxy-silent-origin', () => request(silent, { dispatcher: viaProxy() }));
+
+// A delay past setTimeout's 2^31-1 ms ceiling is "no limit" (undici's timers
+// compare timestamps), not a timer that fires at once with a warning.
+const warnings = [];
+process.on('warning', (w) => warnings.push(w.name));
+const huge = { headersTimeout: 2 ** 31, bodyTimeout: 2 ** 32 };
+await attempt('huge-request', () => request(origin, huge));
+await attempt('huge-agent', () => request(origin, { dispatcher: new Agent(huge) }));
+await attempt('huge-proxy', () => request(origin, { dispatcher: new ProxyAgent({ uri: `http://127.0.0.1:${proxy.address().port}`, ...huge }) }));
+await attempt('huge-connect', () => request(origin, { dispatcher: new Agent({ connect: buildConnector({ timeout: 2 ** 31 }) }) }));
+console.log('warnings', JSON.stringify(warnings));
 process.exit(0);
 "##,
     );
@@ -5072,7 +5083,12 @@ slow-connect-agent-option ok 200 ok
 connected-then-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT late=true
 slow-proxy-request ok 200 ok
 slow-proxy-fetch ok 200 ok
-slow-proxy-silent-origin failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT late=true";
+slow-proxy-silent-origin failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT late=true
+huge-request ok 200 ok
+huge-agent ok 200 ok
+huge-proxy ok 200 ok
+huge-connect ok 200 ok
+warnings []";
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 

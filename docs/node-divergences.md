@@ -1553,7 +1553,10 @@ Pinned against Node + undici 6.29.0 by `undici_request_honours_headers_and_body_
 (e2e). Up to 0.17.1 both options were accepted and ignored. What differs:
 
 - **The timers are exact.** undici's are coarse (a 500 ms `headersTimeout` fires after about
-  1019 ms in Node); oam's fire at the configured delay.
+  1019 ms in Node); oam's fire at the configured delay. A delay above 2^31-1 ms
+  (`headersTimeout: 2 ** 31` and the like, a common way to say "no limit") is held to that
+  ceiling, about 24.8 days, where undici's timestamp-based timers never come due; a plain
+  `setTimeout` would have fired it after 1 ms.
 - **Without a connect function, `headersTimeout` also covers the connect.** undici starts it
   once the request is on a connected socket, so DNS, the TCP connect and the TLS handshake do
   not count. Through a dispatcher with a connect function (a `connect` function or socket /

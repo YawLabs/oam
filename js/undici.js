@@ -151,6 +151,20 @@
       },
     };
 
+    // One of undici's timeouts, as an unref'd timer: whatever it guards
+    // keeps the loop alive, the timer need not. undici runs these on its
+    // FastTimer, which compares timestamps, so a delay past setTimeout's
+    // 2^31-1 ms ceiling -- `headersTimeout: 2 ** 31`, a common spelling of
+    // "no limit" -- simply never comes due there. A plain setTimeout would
+    // fire it after 1 ms with a TimeoutOverflowWarning, so the delay is
+    // clamped to the ceiling (about 24.8 days).
+    const MAX_TIMER_DELAY = 2147483647;
+    function undiciTimer(fn, ms) {
+      const timer = setTimeout(fn, Math.min(ms, MAX_TIMER_DELAY));
+      if (typeof timer.unref === "function") timer.unref();
+      return timer;
+    }
+
     // ---- undici-shaped response body -------------------------------------
     // request().body is a Readable streaming the response bytes, plus the
     // undici body-mixin helpers, all consuming the same stream.
@@ -177,14 +191,12 @@
             return;
           }
           if (bodyTimeout && timer === null) {
-            timer = setTimeout(() => {
+            timer = undiciTimer(() => {
               timer = null;
               const err = new errors.BodyTimeoutError("Body Timeout Error");
               abort(err);
               r.destroy(err);
             }, bodyTimeout);
-            // The read it guards keeps the loop alive; the timer need not.
-            if (typeof timer.unref === "function") timer.unref();
           }
           reader.read().then(
             ({ done, value }) => {
@@ -332,12 +344,10 @@
       const armHeaders = () => {
         disarmHeaders();
         if (!headersTimeout || settled) return;
-        headersTimer = setTimeout(() => {
+        headersTimer = undiciTimer(() => {
           headersTimer = null;
           controller.abort(new errors.HeadersTimeoutError("Headers Timeout Error"));
         }, headersTimeout);
-        // The pending fetch keeps the loop alive; the timer need not.
-        if (typeof headersTimer.unref === "function") headersTimer.unref();
       };
       init.__oamConnectPhase = { connecting: disarmHeaders, connected: armHeaders };
       armHeaders();
@@ -475,13 +485,12 @@
           }
         };
         if (connectTimeout) {
-          timer = setTimeout(() => {
+          timer = undiciTimer(() => {
             timer = null;
             socket.destroy(new errors.ConnectTimeoutError(
               `Connect Timeout Error (attempted address: ${hostname}:${port}, timeout: ${connectTimeout}ms)`,
             ));
           }, connectTimeout);
-          if (typeof timer.unref === "function") timer.unref();
         }
         socket.setNoDelay(true);
         socket.once(protocol === "https:" ? "secureConnect" : "connect", function () {
@@ -725,11 +734,10 @@
       socket.on("close", onEnd);
       socket.on("error", onError);
       if (timeout) {
-        timer = setTimeout(() => {
+        timer = undiciTimer(() => {
           timer = null;
           finish(new errors.HeadersTimeoutError("Headers Timeout Error"));
         }, timeout);
-        if (typeof timer.unref === "function") timer.unref();
       }
       socket.write(head + "\r\n");
     }
