@@ -949,11 +949,6 @@ _(probed)_ Node v22.22.2 vs oam on Windows, a raw-socket server sending
 
 What else still differs:
 
-- **The request header.** oam sends `accept-encoding: gzip,deflate` on every request. Node's
-  `fetch` sends `gzip, deflate` over http and `br, gzip, deflate` over https (measured;
-  undici `fetch/index.js` 1517-1522). The missing space does not matter to an RFC 9110
-  parser, but over https oam does not offer brotli, so a server that honours the header
-  sends gzip to oam and br to Node. oam decodes a `br` body a server sends anyway.
 - **The details of a failed body read.** A body that cannot be read to its end rejects the
   read as Node's does (case 210): `TypeError: terminated`, with what failed as the `cause`
   -- the decoder's error for a corrupt encoding (`code` `Z_DATA_ERROR`, `errno` `-3`), undici's
@@ -1739,28 +1734,48 @@ Pinned against Node + undici 6.29.0 by `undici_request_honours_headers_and_body_
   closes before the response is read; in oam it closes once the response has been. And
   a small response destroyed from the `'response'` listener reads `complete` `false`
   where Node, which had already parsed all of it, reads `true`.
+- **Bodies are extracted as the Fetch Standard says, with three gaps.** `fetch`, `Request`
+  and `Response` take a `Blob`/`File`, `URLSearchParams`, `FormData`, `ReadableStream` (or
+  any async iterable; `duplex: 'half'` required), buffers and strings, with Node's
+  content-type for each, and a streamed upload's chunks, a failing source and a redirect of
+  a streamed body (every redirect but a 303 fails the fetch) behave as in Node (#154). What
+  differs: a `FormData` body's boundary reads `----formdata-oam-0<11 digits>` where undici's
+  reads `----formdata-undici-0<11 digits>` (same shape, three bytes shorter per occurrence);
+  nothing has `formData()`, neither a constructed `Request` / `Response` nor a fetched
+  response; and when a fetch with a streamed body is aborted or its connection drops, oam
+  cancels the source stream (with the abort reason or the failure), as the Fetch Standard
+  says, where Node neither cancels it nor stops pulling it.
+- **`Request` options oam keeps but does not act on.** `mode`, `credentials`, `cache`,
+  `integrity`, `keepalive`, `referrer` and `referrerPolicy` are validated and read back as in
+  Node (#180), and `mode` and `cache` shape the request headers as they do in Node (#178).
+  Two change what Node's `fetch` does and not what oam's does: an `integrity` value is
+  checked against the response body (a mismatch fails the fetch with cause
+  `integrity mismatch`) where oam ignores it; and a `referrer` URL is sent as `referer`, cut
+  down by the referrer policy (Node sends `http://b.test/` for a cross-origin
+  `http://b.test/x?y`, the full URL for a same-origin one or under `unsafe-url`).
+  `credentials` and `keepalive` change nothing in either. `mode: 'no-cors'` does not drop
+  headers in either runtime.
 - **The request header count is capped.** More than 24,576 distinct header names (fewer if
   the header table's hash-flooding defence rebuilds it) fails with
   `fetch: too many request headers`; Node has no cap (25,000 distinct names get a 200).
-- **`Headers` iteration is in wire order, not sorted.** The Fetch Standard sorts a header
-  list by name on iteration and Node does; oam yields the order the server sent (and, for a
-  `Response` a script builds, the order it set them). `set-cookie` is not combined and
-  `getSetCookie()` is there, so no value is lost -- only the order differs. `oam.serve`
-  writes response headers out in this same order, which is why it is not sorted.
-- **Header values on the wire are UTF-8, where undici writes latin1.** A request header value
-  of `café` goes out as `cafÃ©` in oam and `café` in Node. Response header values
-  are decoded as latin1 in both, so the round trip is asymmetric: a value oam sent is not the
-  value oam reads back.
-- **Six request-header shapes still differ from Node's `fetch`** -- measured against a
+- **Two request-header shapes still differ from Node's `fetch`** -- measured against a
   raw-socket server, with everything else on the request line and in the header block
-  identical. oam does not send `connection: keep-alive`, `accept-language: *` or
-  `sec-fetch-mode: cors`; it writes `accept-encoding: gzip,deflate` where Node writes
-  `gzip, deflate`; it does not add `content-length: 0` for a body-less or empty-bodied
-  `POST`; and its header ORDER differs (oam ends with `host`, Node begins with it). What now
-  matches, and used to not: a caller `host` header is dropped (Node's one silent drop), a
-  string body gets `content-type: text/plain;charset=UTF-8`, repeated names are combined into
-  one comma-joined line, and a method is uppercased only when it is one of `DELETE`, `GET`,
+  identical. The ORDER differs (oam ends with `host`, Node begins with it; hyper places it),
+  and a streamed body that ends without a chunk goes out chunked, where undici, which holds
+  the head until the first chunk, sends `content-length: 0`. `user-agent` is `oam/<version>`
+  by design. What now matches, and used to not: `connection: keep-alive`,
+  `accept-language: *` and `sec-fetch-mode` (the request's mode) on every fetch,
+  `accept-encoding: gzip, deflate` over http and `br, gzip, deflate` over https, and
+  `identity` instead (appended to a caller's own value) on a request with `range`,
+  `content-length: 0` on a `POST`, `PUT`, `PATCH`, `QUERY`, `PROPFIND` or `PROPPATCH` with no
+  body or an empty one, the `cache` mode's `pragma` / `cache-control`, with a conditional
+  request (`if-modified-since`, `if-none-match`, `if-unmodified-since`, `if-match`,
+  `if-range`) in the default mode sent as a `no-store` one (#178); a caller `host`
+  header is dropped (Node's one silent drop), a string body gets
+  `content-type: text/plain;charset=UTF-8`, repeated names are combined into one
+  comma-joined line, and a method is uppercased only when it is one of `DELETE`, `GET`,
   `HEAD`, `OPTIONS`, `POST`, `PUT` -- `{method: 'patch'}` goes out as `patch`, as in Node.
+  Over HTTP/2 (below) the transport drops `connection`, which h2 does not have.
 - **`fetch` negotiates HTTP/2 with an https origin; Node's `fetch` does not.** oam's origin
   TLS handshake offers ALPN `h2, http/1.1` and speaks h2 to a server that selects it.
   undici's `Client` defaults `allowH2` to `false` and Node's global dispatcher never turns it
@@ -1782,11 +1797,14 @@ an error where oam used to send something)
   `new URL()` throws, as in Node; case 237); a non-`http(s)` scheme rejects with
   the cause `Error: unknown scheme`. Both used to be `TypeError: fetch failed` with the cause
   `Error: builder error`, which named neither.
-- A `Request` object as the first argument is NOT a supported input (it never was): the
-  argument is stringified, so `fetch(new Request(url))` throws
-  `TypeError: Failed to parse URL from [object Request]`. A string or a `URL` works. This is
-  a gap rather than a refusal -- it is loud, it loses nothing, and half-supporting it (the
-  url and method but not the body) would be worse than throwing. Tracked as a follow-up.
+- Everything the `Request` constructor refuses, because `fetch` builds its request through it
+  as Node's does (#180): a `GET` or `HEAD` with a body (`Request with GET/HEAD method cannot
+  have body.`), a method that is not a token or is `CONNECT` / `TRACE` / `TRACK`, a
+  `RequestInit` enum value outside its list, `mode: 'navigate'`, a streamed body without
+  `duplex: 'half'`, and a re-used `Request` whose body was already read (`Cannot construct a
+  Request with a Request object that has already been used.`). These checks run before an
+  aborted signal is looked at. A `Request` as the first argument is unwrapped field by field
+  with `init` winning, its body is sent, and its signal and redirect mode apply.
 - `transfer-encoding`, `keep-alive`, `upgrade`, `expect`, and a `connection` whose value is
   neither `close` nor `keep-alive` (case-insensitively -- `close, transfer-encoding`, the
   CL.TE evasion, is the one that matters) are refused with undici's texts
@@ -1977,6 +1995,13 @@ target). The parser underneath is hyper's, so some heads still get a different a
 - A chunked body's trailer fields are in `req.trailers` and `req.rawTrailers` once the
   body has ended, combined as Node combines them, but `rawTrailers` has the names
   lowercased and a repeated name's values side by side.
+- Header and trailer values now read as Node's parser reads them, one code point per byte
+  (latin1), in `req.headers`, `req.rawHeaders`, `req.trailers`, an `http2.createServer`
+  request's headers and an `oam.serve` Request's `headers`. Up to 0.17.1 they were decoded
+  as UTF-8: the bytes of a UTF-8 `café` read as `café` where Node reads `cafÃ©`, and a lone
+  `0xE9` -- what Node's client writes for `é`, and oam's since #174 -- as U+FFFD. The e2e
+  test `request_header_bytes_round_trip_oam_to_oam_as_latin1` holds an oam-to-oam round
+  trip of `café`.
 - A refused head is answered with `content-length: 0` and `date` headers next to
   `connection: close` (Node: `Connection: close` alone). There is no `'clientError'`
   event for it (an `https` server emits one only for a failed TLS handshake, entry 42).

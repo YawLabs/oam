@@ -19,7 +19,7 @@ use common::*;
 use hyper_util::client::proxy::matcher::Matcher;
 use oam_core::http_client::body::{self, FetchBodies};
 use oam_core::http_client::decode::OUT_CAP;
-use oam_core::http_client::redirect::{BAD_SCHEME, CREDENTIALS};
+use oam_core::http_client::redirect::{BAD_SCHEME, CREDENTIALS, UNREPLAYABLE_BODY};
 use oam_core::http_client::send::{self, FetchContinuations, FetchRequest};
 use oam_core::http_client::{HttpTransport, NetCheck, NetTarget, ProxySource};
 use oam_core::{AccessDenial, BodyCancelSignal, CancelledBodies, OpOutcome, OutboundBodies};
@@ -915,20 +915,34 @@ async fn method_rewrite_matrix_on_the_wire() {
     .await;
 }
 
-/// A streamed body cannot be replayed: a 307 is returned as the response; a
-/// 302 turns the POST into a body-less GET and is followed.
+/// A streamed body cannot be replayed, so only a 303 is followed (as a
+/// body-less GET). Any other redirect fails a fetch -- a 302 that would drop
+/// the body of a POST too (undici fetch/index.js:1273-1279, measured on node
+/// v22.22.2) -- and is returned as the response to the callers that are not
+/// fetch.
 #[tokio::test(flavor = "multi_thread")]
 async fn streamed_body_redirects() {
     within(async {
         let server = serve_replies(|r| match r.head.target.as_str() {
             "/307" => response("307 Temporary Redirect", &[("location", "/after")], b""),
             "/302" => response("302 Found", &[("location", "/after")], b""),
+            "/303" => response("303 See Other", &[("location", "/after")], b""),
             _ => response("200 OK", &[], b"ok"),
         })
         .await;
         let reg = Reg::new();
         let t = plain();
-        for (status, want_status, want_redirected) in [("307", 307, false), ("302", 200, true)] {
+        // (status, fetch semantics, the status the caller sees or None for
+        // a failure, redirected)
+        let cases = [
+            ("307", false, Some(307), false),
+            ("302", false, Some(302), false),
+            ("303", false, Some(200), true),
+            ("307", true, None, false),
+            ("302", true, None, false),
+            ("303", true, Some(200), true),
+        ];
+        for (status, fetch_semantics, want_status, want_redirected) in cases {
             let (handle, tx) = reg.channel(8);
             let outbound = reg.outbound.clone();
             let writer = tokio::spawn(async move {
@@ -936,29 +950,54 @@ async fn streamed_body_redirects() {
                 drop(tx);
                 body::end_outbound(&outbound, handle);
             });
-            let p = payload(
-                reg.fetch(
+            let outcome = reg
+                .fetch(
                     &t,
                     json!({
                         "url": format!("http://127.0.0.1:{}/{status}", server.port),
                         "method": "POST",
                         "body_stream": handle,
+                        "fetch_semantics": fetch_semantics,
                     }),
                 )
-                .await,
-            );
+                .await;
             writer.await.unwrap();
-            assert_eq!(p["status"], want_status);
-            assert_eq!(p["redirected"], want_redirected);
-            reg.text(handle_of(&p)).await;
+            match want_status {
+                Some(want) => {
+                    let p = payload(outcome);
+                    assert_eq!(p["status"], want, "{status} fetch={fetch_semantics}");
+                    assert_eq!(p["redirected"], want_redirected);
+                    reg.text(handle_of(&p)).await;
+                }
+                None => assert_eq!(
+                    failed(outcome),
+                    UNREPLAYABLE_BODY,
+                    "{status} fetch={fetch_semantics}"
+                ),
+            }
             assert_eq!(reg.entry(handle), None, "entry left behind");
         }
         let seen = server.seen();
-        assert_eq!(seen.len(), 3);
+        let targets: Vec<_> = seen
+            .iter()
+            .map(|r| format!("{} {}", r.head.method, r.head.target))
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                "POST /307",
+                "POST /302",
+                "POST /303",
+                "GET /after",
+                "POST /307",
+                "POST /302",
+                "POST /303",
+                "GET /after",
+            ]
+        );
         assert_eq!(seen[0].head.get("transfer-encoding"), Some("chunked"));
         assert_eq!(seen[0].body, b"abc");
-        assert_eq!(seen[2].head.method, "GET");
-        assert!(seen[2].body.is_empty());
+        assert!(seen[3].body.is_empty());
     })
     .await;
 }

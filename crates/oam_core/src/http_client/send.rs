@@ -740,8 +740,13 @@ async fn run(
             state.source.replayable(),
         ) {
             // ReturnResponse: the hop must resend a streamed body, which
-            // cannot be replayed -- the 3xx is the result (reqwest's
-            // behaviour, kept until #149/#148).
+            // cannot be replayed. fetch fails, as undici's does; for the
+            // callers that are not fetch the 3xx is the result.
+            Next::ReturnResponse if state.fetch_semantics => {
+                drop(response);
+                state.source.request_failed();
+                return OpOutcome::Failed(redirect::UNREPLAYABLE_BODY.to_string());
+            }
             Next::Done | Next::ReturnResponse => break response,
             Next::Fail(text) => {
                 state.source.request_failed();

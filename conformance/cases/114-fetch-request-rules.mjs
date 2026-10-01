@@ -29,10 +29,10 @@
 //     each line: a cookie's `Expires` attribute contains a comma, so a
 //     joined `a=1, b=2` cannot be split back.
 //
-// Not asserted, because the runtimes genuinely differ (docs/node-divergences.md
-// entry 38): the default request headers oam does not send (`connection`,
-// `accept-language`, `sec-fetch-mode`) and the header order. The class,
-// `code` and brands of a refusal cause are case 209's.
+// The default request headers fetch adds are case 205's, and the class,
+// `code` and brands of a refusal cause are case 209's. Not asserted, because
+// the runtimes genuinely differ (docs/node-divergences.md entry 38): the
+// header order.
 import http from "node:http";
 
 const srv = http.createServer((req, res) => {

@@ -168,11 +168,33 @@ fn default_headers_off_sends_only_the_users() {
     assert!(p.headers.is_empty());
 }
 
+/// A value goes out one byte per code point, as node writes it (#174): U+00E9
+/// is the byte 0xE9, not its UTF-8 `C3 A9`.
 #[test]
-fn obs_text_header_values_pass() {
-    let owned = vec![("x-latin".to_string(), "caf\u{e9}".to_string())];
+fn obs_text_header_values_pass_as_latin1() {
+    let owned = vec![
+        ("x-latin".to_string(), "caf\u{e9}".to_string()),
+        ("x-top".to_string(), "\u{ff}\u{80}".to_string()),
+        ("x-ascii".to_string(), "a\tb".to_string()),
+    ];
     let p = prepare::prepare("http://a.test/", "GET", &owned, false, &ua()).unwrap();
-    assert_eq!(p.headers["x-latin"].as_bytes(), "caf\u{e9}".as_bytes());
+    assert_eq!(p.headers["x-latin"].as_bytes(), b"caf\xe9");
+    assert_eq!(p.headers["x-top"].as_bytes(), b"\xff\x80");
+    assert_eq!(p.headers["x-ascii"].as_bytes(), b"a\tb");
+}
+
+/// A code point latin1 cannot carry is refused, never sent as UTF-8 (JS
+/// refuses it first, as node does; this is the transport's backstop).
+#[test]
+fn header_values_above_u00ff_are_refused() {
+    for value in ["\u{20ac}", "a\u{e9}\u{20ac}", "\u{1f600}", "\u{100}"] {
+        let owned = vec![("x-v".to_string(), value.to_string())];
+        assert_eq!(
+            prepare::prepare("http://a.test/", "GET", &owned, false, &ua()).unwrap_err(),
+            prepare::PrepareError::Builder,
+            "{value:?}"
+        );
+    }
 }
 
 #[test]
