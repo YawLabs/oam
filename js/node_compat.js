@@ -1289,7 +1289,10 @@
   // separators only for magnitudes strictly greater than 2**32 (Node parity --
   // 2**32 itself prints plain, 2**40 gets separators); otherwise String(n).
   function fmtRange(n) {
+    // A bigint is grouped past 2n**32n, as a number is; either way it keeps
+    // its n.
     if (typeof n === "bigint") {
+      if (n <= 2n ** 32n && n >= -(2n ** 32n)) return n + "n";
       const neg = n < 0n;
       const s = (neg ? -n : n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, "_");
       return (neg ? "-" : "") + s + "n";
@@ -10010,12 +10013,14 @@
   }
   const toUnixMs = (time, name) => toUnixSeconds(time, name) * 1000;
 
-  // A read/write POSITION argument, normalised for the natives: a non-negative
-  // number is a pread/pwrite, anything else (null, undefined, a negative) means
-  // "from the current cursor". Shared by the fs and fs/promises factories so
-  // the two cannot drift -- FileHandle.read/write silently DROPPED their
-  // position for as long as the natives had nowhere to put it.
-  const fsPositionArg = (p) => (typeof p === "number" && p >= 0 ? p : null);
+  // A POSITION node does not validate -- a write's, readv's, writev's --
+  // normalised for the natives as the binding's GetOffset does it: a safe
+  // integer >= 0 is a pread/pwrite, anything else (null, 1.5, "x", a bigint, a
+  // negative) means "from the current cursor". A read's position IS
+  // validated first (readPosition). Shared by the fs and fs/promises
+  // factories so the two cannot drift -- FileHandle.read/write silently
+  // DROPPED their position for as long as the natives had nowhere to put it.
+  const fsPositionArg = (p) => (Number.isSafeInteger(p) && p >= 0 ? p : null);
 
   // `Object.keys(err)` order, for the ONE fd call where node's differs.
   //
@@ -10081,6 +10086,103 @@
     if (!ArrayBuffer.isView(buffer)) {
       throw codes.ERR_INVALID_ARG_TYPE("buffer", ["Buffer", "TypedArray", "DataView"], buffer);
     }
+  }
+
+  // ---- the non-descriptor arguments of the fd calls, checked where node
+  // checks them: in JS, before the descriptor reaches the binding. Each is
+  // node's validator of the same name (lib/internal/validators.js and
+  // lib/internal/fs/utils.js, v22.22.2), so a call with a bad descriptor AND
+  // a bad other argument reports the other argument, as node's does.
+
+  // validateInt32 / validateUint32: validateInteger's shape and wording.
+  function validateInt32(value, name, min = -2147483648, max = 2147483647) {
+    validateInteger(value, name, min, max);
+  }
+  function validateUint32(value, name) {
+    validateInteger(value, name, 0, 4294967295);
+  }
+
+  // parseFileMode: an octal string or a uint32, with `def` for null /
+  // undefined. Returns the numeric mode.
+  const OCTAL_MODE = /^[0-7]+$/;
+  function parseFileMode(value, name, def) {
+    value ??= def;
+    if (typeof value === "string") {
+      if (!OCTAL_MODE.test(value)) {
+        throw codes.ERR_INVALID_ARG_VALUE(name, value, "must be a 32-bit unsigned integer or an octal string");
+      }
+      value = Number.parseInt(value, 8);
+    }
+    validateUint32(value, name);
+    return value;
+  }
+
+  // fchown's uid / gid bound: -1 ("leave it") through 2**32-1.
+  const kMaxUserId = 2 ** 32 - 1;
+
+  // validatePosition: an integer >= -1 or a bigint that keeps
+  // position + length inside an int64. Returns what the natives take: null
+  // for -1 (the cursor), else a non-negative number.
+  function readPosition(position, length) {
+    if (position == null) return null;
+    if (typeof position === "number") {
+      validateInteger(position, "position", -1);
+      return position === -1 ? null : position;
+    }
+    if (typeof position === "bigint") {
+      const max = 2n ** 63n - 1n - BigInt(length);
+      if (!(position >= -1n && position <= max)) {
+        throw codes.ERR_OUT_OF_RANGE("position", ">= -1 && <= " + max, fmtRange(position));
+      }
+      return position === -1n ? null : Number(position);
+    }
+    throw codes.ERR_INVALID_ARG_TYPE("position", ["integer", "bigint"], position);
+  }
+
+  // validateStringAfterArrayBufferView: what to write when it is not a view.
+  function validateWriteData(data, name) {
+    if (typeof data !== "string" && !ArrayBuffer.isView(data)) {
+      throw codes.ERR_INVALID_ARG_TYPE(name, ["string", "Buffer", "TypedArray", "DataView"], data);
+    }
+  }
+
+  // validateEncoding: the one encoding a string can be invalid for is hex,
+  // at an odd length.
+  function validateWriteEncoding(data, encoding) {
+    if (typeof encoding === "string" && data.length % 2 !== 0 && encoding.toLowerCase() === "hex") {
+      throw codes.ERR_INVALID_ARG_VALUE("encoding", encoding, "is invalid for data of length " + data.length);
+    }
+  }
+  const writeEncoding = (encoding) => (typeof encoding === "string" ? encoding : "utf8");
+
+  // validateOffsetLengthWrite, after the offset itself has been validated.
+  function validateWriteRange(offset, length, byteLength) {
+    if (offset > byteLength) throw codes.ERR_OUT_OF_RANGE("offset", "<= " + byteLength, offset);
+    if (length > byteLength - offset) throw codes.ERR_OUT_OF_RANGE("length", "<= " + (byteLength - offset), length);
+    if (length < 0) throw codes.ERR_OUT_OF_RANGE("length", ">= 0", length);
+    validateInt32(length, "length", 0);
+  }
+
+  // A buffer write's overloads and checks, shared by fs.write and
+  // fs.writeSync (lib/fs.js, v22.22.2): an options object (or null) in the
+  // offset's place, the offset (null is 0), a length that is not a number
+  // meaning the rest, and the range. Returns the bytes to write, a view on
+  // the caller's memory (a DataView or a wider typed array included), and
+  // the native position. `callbackForm`: fs.write, where an offset slot
+  // holding the callback means 0.
+  function bufferWriteArgs(buffer, offset, length, position, callbackForm) {
+    if (typeof offset === "object") {
+      ({ offset = 0, length = buffer.byteLength - offset, position = null } = offset ?? {});
+    }
+    if (offset == null || (callbackForm && typeof offset === "function")) offset = 0;
+    else validateInteger(offset, "offset", 0);
+    if (typeof length !== "number") length = buffer.byteLength - offset;
+    validateWriteRange(offset, length, buffer.byteLength);
+    const bytes =
+      buffer instanceof Uint8Array && offset === 0 && length === buffer.length
+        ? buffer
+        : new Uint8Array(buffer.buffer, buffer.byteOffset + offset, length);
+    return { bytes, position: fsPositionArg(position) };
   }
 
   // ---- file-descriptor validation, for every fs API that takes an fd.
@@ -10728,7 +10830,7 @@
             length ??= buffer.byteLength - offset;
             if (length === 0) return { bytesRead: 0, buffer: buffer };
             validateReadRange(buffer, offset, length);
-            var chunk = await natives.fsReadChunk(h, length, fsPositionArg(position));
+            var chunk = await natives.fsReadChunk(h, length, readPosition(position, length));
             if (chunk === undefined) return { bytesRead: 0, buffer: buffer };
             new Uint8Array(buffer.buffer, buffer.byteOffset + offset, length).set(chunk);
             return { bytesRead: chunk.length, buffer: buffer };
@@ -11106,10 +11208,10 @@
       try {
         // Per write, as node's writeSync checks it: empty data writes nothing
         // and checks nothing.
-        while (off < bytes.length) {
+        while (off < bytes.byteLength) {
           off += utf8
             ? writeSyncTo(fd, off === 0 ? bytes : bytes.subarray(off), null)
-            : fs.writeSync(fd, bytes, off, bytes.length - off, null);
+            : fs.writeSync(fd, bytes, off, bytes.byteLength - off, null);
         }
       } catch (e) {
         // writeSync's error has errno, syscall, code (as node's does);
@@ -11183,8 +11285,12 @@
         // argument is the one validated as it.
         if (!cb) cb = options;
         if (typeof options === "function") options = undefined;
-        if (!isInt32(path)) return viaPath(path, data, options, cb);
+        // node's order: the callback, then the data (a string or a view --
+        // not the iterables fs/promises also takes), then the path or
+        // descriptor.
         validateCb(cb);
+        validateWriteData(data, "data");
+        if (!isInt32(path)) return viaPath(path, data, options, cb);
         // fs.write's descriptor check, which node reaches synchronously.
         validateFd(path, false);
         let bytes;
@@ -11196,8 +11302,8 @@
         }
         let off = 0;
         const next = () => {
-          if (off >= bytes.length) return cb(null);
-          fs.write(path, bytes, off, bytes.length - off, null, (err, n) => {
+          if (off >= bytes.byteLength) return cb(null);
+          fs.write(path, bytes, off, bytes.byteLength - off, null, (err, n) => {
             if (err) return cb(err);
             off += n;
             next();
@@ -11341,7 +11447,8 @@
     const truncateByPath = callbackify1(promises.truncate, 2);
 
     // The read behind fs.read and fs.readv, arguments already checked: `want`
-    // bytes at `position` into buffer[offset..], then cb(err, bytesRead,
+    // bytes at `position` (the native's: null for the cursor, else a
+    // non-negative number) into buffer[offset..], then cb(err, bytesRead,
     // buffer). It always asks the native, even for 0 bytes -- fs.read returns
     // early for those itself, but readv of empty views must still reach the
     // descriptor (EBADF for a closed one, as node's).
@@ -11350,7 +11457,7 @@
       // position parameter, so `fs.read(fd, buf, 0, 3, 10, cb)` read from the
       // cursor and handed back the wrong bytes with no error. The native now
       // takes one; null still means "from the cursor".
-      Promise.resolve(natives.fsReadChunk(fd, want, fsPositionArg(position))).then(
+      Promise.resolve(natives.fsReadChunk(fd, want, position)).then(
         function (chunk) {
           if (chunk === undefined || chunk === null) {
             queueMicrotask(function () { cb(null, 0, buffer); });
@@ -11402,11 +11509,14 @@
         const bytes = natives.fsReadFileSync(toPath(path));
         return decodeRead(bytes, enc ?? null);
       },
+      // The data is checked before the path or descriptor, as node's are.
       writeFileSync: (path, data, options) => {
+        validateWriteData(data, "data");
         if (isInt32(path)) return void writeFdSync(path, data, options);
         natives.fsWriteFileSync(toPath(path), encodeWrite(data, options), false);
       },
       appendFileSync: (path, data, options) => {
+        validateWriteData(data, "data");
         if (isInt32(path)) return void writeFdSync(path, data, options);
         natives.fsWriteFileSync(toPath(path), encodeWrite(data, options), true);
       },
@@ -11515,26 +11625,30 @@
         if (offset === undefined) offset = 0;
         const len = validateReadSpan(buffer, offset, length);
         if (len === 0) return 0;
+        const pos = readPosition(position, len);
         validateFd(fd, true);
-        return natives.fsReadSync(fd, buffer, offset, len, position ?? null);
+        return natives.fsReadSync(fd, buffer, offset, len, pos);
       },
-      writeSync: (fd, data, offsetOrPosition, length, position) => {
-        // Buffer form: (fd, buffer, offset, length, position).
-        // String form: (fd, string, position, encoding).
-        let buf, pos;
-        if (typeof data === "string") {
-          const enc = typeof length === "string" ? length : "utf8";
-          buf = globalThis.Buffer.from(data, enc);
-          pos = typeof offsetOrPosition === "number" ? offsetOrPosition : null;
+      // node's overloads and order (lib/fs.js, v22.22.2):
+      //   (fd, buffer[, offset[, length[, position]]]) or (fd, buffer, options)
+      //     -- offset, length and their range checked, the position not (the
+      //     binding writes at the cursor for anything but a safe integer >= 0);
+      //   (fd, string[, position[, encoding]]) -- a hex string of odd length
+      //     is refused.
+      // All of it before the descriptor, which the binding checks last. Empty
+      // data is still checked: there is no early return.
+      writeSync: function writeSync(fd, buffer, offsetOrOptions, length, position) {
+        let bytes, pos;
+        if (ArrayBuffer.isView(buffer)) {
+          ({ bytes, position: pos } = bufferWriteArgs(buffer, offsetOrOptions, length, position, false));
         } else {
-          const offset = typeof offsetOrPosition === "number" ? offsetOrPosition : 0;
-          const len = typeof length === "number" ? length : (data.length - offset);
-          buf = (offset !== 0 || len !== data.length) ? data.subarray(offset, offset + len) : data;
-          pos = typeof position === "number" ? position : null;
+          validateWriteData(buffer, "buffer");
+          validateWriteEncoding(buffer, length);
+          bytes = globalThis.Buffer.from(buffer, writeEncoding(length));
+          pos = fsPositionArg(offsetOrOptions);
         }
-        // Empty data is still checked: node's writeSync has no early return.
         validateFd(fd, true);
-        return writeSyncTo(fd, buf, pos);
+        return writeSyncTo(fd, bytes, pos);
       },
       opendirSync: function (path) {
         var dirPath = toPath(path);
@@ -11658,36 +11772,37 @@
       // fd 1/2 route to the stdout/stderr sinks (pino/sonic-boom's default
       // async destination writes here); other fds use the sync native op
       // dispatched on a microtask to preserve the async callback contract.
-      // node's JS getValidatedFd, before any other argument (validateFd).
-      write: function (fd, data) {
+      // node's argument handling (lib/fs.js, v22.22.2), all of it thrown at
+      // the call: the descriptor first (its JS getValidatedFd, validateFd),
+      // then for a buffer the callback -- the last of position, length,
+      // offset that is set -- and writeSync's buffer checks; for a string
+      // (fd, string[, position[, encoding]], cb) the data, the encoding and
+      // then the callback.
+      write: function write(fd, buffer, offsetOrOptions, length, position, callback) {
         validateFd(fd, false);
-        var rest = Array.prototype.slice.call(arguments, 2);
-        var cb = rest.length ? rest[rest.length - 1] : undefined;
-        validateCb(cb);
-        var mid = rest.slice(0, rest.length - 1);
-        var buf, pos;
-        try {
-          if (typeof data === "string") {
-            pos = typeof mid[0] === "number" ? mid[0] : null;
-            var enc = typeof mid[1] === "string" ? mid[1] : (typeof mid[0] === "string" ? mid[0] : "utf8");
-            buf = globalThis.Buffer.from(data, enc);
-          } else {
-            var offset = 0, length, position = null;
-            if (mid[0] !== null && typeof mid[0] === "object" && !ArrayBuffer.isView(mid[0])) {
-              offset = mid[0].offset ?? 0;
-              length = mid[0].length ?? (data.length - offset);
-              position = typeof mid[0].position === "number" ? mid[0].position : null;
+        var data = buffer;
+        var buf, pos, cb;
+        if (ArrayBuffer.isView(buffer)) {
+          cb = callback || position || length || offsetOrOptions;
+          validateCb(cb);
+          ({ bytes: buf, position: pos } = bufferWriteArgs(buffer, offsetOrOptions, length, position, true));
+        } else {
+          validateWriteData(buffer, "buffer");
+          var at = offsetOrOptions;
+          if (typeof position !== "function") {
+            if (typeof offsetOrOptions === "function") {
+              position = offsetOrOptions;
+              at = null;
             } else {
-              offset = typeof mid[0] === "number" ? mid[0] : 0;
-              length = typeof mid[1] === "number" ? mid[1] : (data.length - offset);
-              position = typeof mid[2] === "number" ? mid[2] : null;
+              position = length;
             }
-            buf = (offset !== 0 || length !== data.length) ? data.subarray(offset, offset + length) : data;
-            pos = position;
+            length = "utf8";
           }
-        } catch (e) {
-          queueMicrotask(function () { cb(e); });
-          return;
+          validateWriteEncoding(buffer, length);
+          cb = position;
+          validateCb(cb);
+          buf = globalThis.Buffer.from(buffer, writeEncoding(length));
+          pos = fsPositionArg(at);
         }
         var n, failed;
         try {
@@ -11746,7 +11861,7 @@
           process.nextTick(cb, null, 0, buffer);
           return;
         }
-        readChunkInto(fd, buffer, offset, want, position, cb);
+        readChunkInto(fd, buffer, offset, want, readPosition(position, want), cb);
       },
 
       createReadStream: (path, options) => new (rwStreams(natives).ReadStream)(path, options),
@@ -11843,14 +11958,22 @@
     const futimesCb = fdCallbackOp((fd, atime, mtime) => natives.fsFutimes(fd, atime, mtime));
     fs.fsync = function fsync(fd, cb) { fsyncCb(cb, fd); };
     fs.fdatasync = function fdatasync(fd, cb) { fdatasyncCb(cb, fd); };
+    // Their other arguments are node's validators, checked first: the length
+    // an integer (a negative one is 0), the mode node's parseFileMode (an
+    // octal string or a uint32), uid / gid integers in [-1, 2**32-1].
     // node permits `ftruncate(fd, cb)` with the length omitted. (The default
     // is node's signature, which makes ftruncate.length 1.)
     fs.ftruncate = function ftruncate(fd, len = 0, cb) {
       if (typeof len === "function") { cb = len; len = 0; }
-      ftruncateCb(cb, fd, len ?? 0);
+      validateInteger(len, "len");
+      ftruncateCb(cb, fd, Math.max(0, len));
     };
-    fs.fchmod = function fchmod(fd, mode, cb) { fchmodCb(cb, fd, mode); };
-    fs.fchown = function fchown(fd, uid, gid, cb) { fchownCb(cb, fd, uid, gid); };
+    fs.fchmod = function fchmod(fd, mode, cb) { fchmodCb(cb, fd, parseFileMode(mode, "mode")); };
+    fs.fchown = function fchown(fd, uid, gid, cb) {
+      validateInteger(uid, "uid", -1, kMaxUserId);
+      validateInteger(gid, "gid", -1, kMaxUserId);
+      fchownCb(cb, fd, uid, gid);
+    };
     fs.futimes = function futimes(fd, atime, mtime, cb) {
       const a = toUnixMs(atime, "atime");
       const m = toUnixMs(mtime, "mtime");
@@ -11859,9 +11982,22 @@
 
     fs.fsyncSync = (fd) => { validateFd(fd, true); natives.fsFsyncSync(fd); };
     fs.fdatasyncSync = (fd) => { validateFd(fd, true); natives.fsFdatasyncSync(fd); };
-    fs.ftruncateSync = (fd, len) => { validateFd(fd, true); natives.fsFtruncateSync(fd, len ?? 0); };
-    fs.fchmodSync = (fd, mode) => { validateFd(fd, true); natives.fsFchmodSync(fd, mode); };
-    fs.fchownSync = (fd, uid, gid) => { validateFd(fd, true); natives.fsFchownSync(fd, uid, gid); };
+    fs.ftruncateSync = function ftruncateSync(fd, len = 0) {
+      validateInteger(len, "len");
+      validateFd(fd, true);
+      natives.fsFtruncateSync(fd, len < 0 ? 0 : len);
+    };
+    fs.fchmodSync = function fchmodSync(fd, mode) {
+      mode = parseFileMode(mode, "mode");
+      validateFd(fd, true);
+      natives.fsFchmodSync(fd, mode);
+    };
+    fs.fchownSync = function fchownSync(fd, uid, gid) {
+      validateInteger(uid, "uid", -1, kMaxUserId);
+      validateInteger(gid, "gid", -1, kMaxUserId);
+      validateFd(fd, true);
+      natives.fsFchownSync(fd, uid, gid);
+    };
     fs.futimesSync = (fd, atime, mtime) => {
       const a = toUnixMs(atime, "atime");
       const m = toUnixMs(mtime, "mtime");
@@ -11984,7 +12120,7 @@
         return;
       }
       const tmp = globalThis.Buffer.allocUnsafe(total);
-      readChunkInto(fd, tmp, 0, total, position, (err, n) => {
+      readChunkInto(fd, tmp, 0, total, fsPositionArg(position), (err, n) => {
         if (err) { cb(err, 0, buffers); return; }
         scatterViews(buffers, tmp, n);
         // The SAME array instance goes back, which callers compare by identity.

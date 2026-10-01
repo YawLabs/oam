@@ -2202,19 +2202,23 @@ throws a tick later, as an uncaught exception, and `writeFileSync(-1, utf8String
 `*Sync` form and the other callback forms) -- and so is where each check sits relative
 to the callback and the other arguments (`conformance/cases/246-*`, `247-*`). Before
 this, oam passed `-1`, `1.5`, `"3"` or `undefined` to the OS and reported `EBADF`.
+
+The other arguments are node's too, checked in JS before the descriptor as node
+checks them (`conformance/cases/257-*`): `fchmod`'s mode (`parseFileMode`),
+`ftruncate`'s `len` (an integer; a negative one is 0), `fchown`'s `uid` / `gid`
+(`[-1, 2**32-1]`), `futimes`' times, the position of `read` / `readSync` /
+`FileHandle.read` (`validatePosition`: an integer `>= -1` or a bigint), the
+`buffer` / data, options object, `offset` and `length` of `read`, `readSync`,
+`write` and `writeSync` with node's overloads, and the data of `writeFile` /
+`appendFile` and their `Sync` forms (before the path, too). A write's position is not
+validated, as in node: anything but a safe integer `>= 0` -- `1.5`, `'x'`, a bigint,
+a negative -- writes at the cursor (oam used to round `1.5` down to a pwrite at 1).
 What still differs:
 
-- **Arguments node validates before the descriptor, which oam does not check there.**
-  `fchmod`'s mode (`ERR_INVALID_ARG_VALUE` for `'zz'`), `ftruncate`'s `len`,
-  `fchown`'s `uid` / `gid`, `writeSync`'s `buffer`, `offset`, `position` and `options`,
-  the `position` of `read` / `readSync` / `FileHandle.read` (node's `validatePosition`:
-  `'zz'`, `-2` and `1.5` are refused), and the callback `writeFile` / `appendFile`'s
-  `data` (oam reports a bad one through the callback). node refuses these first, so
-  `fs.fchmodSync(-1, 'zz')` is the mode error there; oam reports the descriptor. With a
-  valid descriptor oam passes such a value to the OS as before. (`futimes`' times are
-  validated, in node's order; so are the `buffer`, options object, `offset` and `length`
-  of `read`, `readSync` and `FileHandle.read`, with node's overloads -- a bad offset is
-  refused even by a read of length 0.)
+- **`writeFile` / `appendFile` options.** node's `getOptions` refuses an `options`
+  that is neither a string nor an object, a non-boolean `flush`, and an unknown
+  encoding before the descriptor; oam does not check these there (an unknown encoding
+  is `ERR_UNKNOWN_ENCODING` when the data is encoded, a bad `flush` is ignored).
 - **`fs.writeSync(fd, string, position, 'bogus')`**: node's binding ignores an encoding
   it does not know and writes UTF-8 (so with `-1` it is the descriptor error); oam
   throws `ERR_UNKNOWN_ENCODING`.
