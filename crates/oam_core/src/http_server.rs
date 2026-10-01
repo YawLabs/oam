@@ -369,6 +369,10 @@ pub struct ResponseHead {
     /// standard one (node:http's `statusMessage`); hyper writes the standard
     /// one itself, so the common response carries none.
     pub reason: Option<String>,
+    /// node:http's: each header name goes out in the case it is spelled in
+    /// here, where hyper writes it lowercase (title case for the names the
+    /// connection adds itself; `http1_builder`).
+    pub name_case: bool,
 }
 
 /// The reason phrase hyper writes for `status` when a response names none
@@ -389,6 +393,7 @@ impl ResponseHead {
             headers,
             header_bytes: HeaderBytes::Utf8,
             reason: None,
+            name_case: false,
         }
     }
 }
@@ -926,6 +931,11 @@ fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
             },
         };
     }
+    if head.name_case
+        && let Some(case) = header_name_case(&head.headers)
+    {
+        builder = builder.extension(case);
+    }
     if let Some(reason) = head.reason {
         // In the same bytes as the header values: node writes the status
         // line as part of the head string.
@@ -955,6 +965,42 @@ fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
         ResponseBody::Abort => http_body_util::Empty::new().boxed(),
     };
     builder.body(body).unwrap_or_else(|_| bad_response_spec())
+}
+
+/// How a node:http response's header names are spelled on the wire, for
+/// hyper: `None` -- nothing allocated -- when every name is already in the
+/// title case its connection writes names in (`Content-Type`, `X-Request-Id`;
+/// `http1_builder`), else every name's spelling, in the order its values go
+/// out. node writes each name as the handler spelled it.
+fn header_name_case(headers: &[(String, String)]) -> Option<hyper::ext::HeaderCaseMap> {
+    if headers
+        .iter()
+        .all(|(name, _)| is_title_case(name.as_bytes()))
+    {
+        return None;
+    }
+    let mut map = hyper::HeaderMap::<Bytes>::with_capacity(headers.len());
+    for (name, _) in headers {
+        if let Ok(key) = hyper::header::HeaderName::from_bytes(name.as_bytes()) {
+            map.append(key, Bytes::copy_from_slice(name.as_bytes()));
+        }
+    }
+    Some(hyper::ext::HeaderCaseMap(map))
+}
+
+/// Whether hyper's title case leaves `name` as it is: an upper-case letter
+/// first and after each `-`, lower case everywhere else.
+fn is_title_case(name: &[u8]) -> bool {
+    let mut prev = b'-';
+    name.iter().all(|&c| {
+        let expected = if prev == b'-' {
+            c.to_ascii_uppercase()
+        } else {
+            c.to_ascii_lowercase()
+        };
+        prev = c;
+        c == expected
+    })
 }
 
 /// What a response that cannot be sent as given is answered with.
@@ -1033,10 +1079,17 @@ fn refused_head_response(error: HeadError) -> hyper::Response<BoxedBody> {
         .expect("static refusal builds")
 }
 
-/// An HTTP/1 connection builder for a server with `policy`.
-fn http1_builder(policy: HeadPolicy) -> hyper::server::conn::http1::Builder {
+/// An HTTP/1 connection builder for a server with `policy`. `node_names`:
+/// the server is a node:http one, whose responses write header names as
+/// node does -- the names it adds itself as `Date`, `Content-Length`,
+/// `Transfer-Encoding`, `Connection` (hyper's title case), and the ones a
+/// handler set in the case it set them in, which a response whose names
+/// are not already in title case carries as a `HeaderCaseMap`
+/// (spec_to_response). Other servers write them lowercase.
+fn http1_builder(policy: HeadPolicy, node_names: bool) -> hyper::server::conn::http1::Builder {
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder.max_buf_size(policy.read_buffer_limit());
+    builder.title_case_headers(node_names);
     // hyper refuses a head of more than 100 fields by default; node refuses one
     // only on its byte size. Lift the field ceiling to the byte budget so the
     // parser stops at the same point node does -- the excess beyond
@@ -1269,7 +1322,8 @@ where
     Svc::Future: Send + 'static,
 {
     let io = hyper_util::rt::TokioIo::new(WatchedIo::new(stream, Arc::clone(&watch)));
-    let mut conn = http1_builder(policy).serve_connection(io, service);
+    // A js-driven server is a node:http (or https) one.
+    let mut conn = http1_builder(policy, js_driven).serve_connection(io, service);
     // A connection no request can take has a receiver that never fires.
     let (mut taken, mut takeable) = match takeover {
         Some(rx) => (rx, true),
@@ -2964,6 +3018,61 @@ async fn push_frame(
             state.end_stream(stream_id);
             super::OpOutcome::Failed("stream stalled: client is not reading".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod name_case_tests {
+    use super::*;
+
+    fn pairs(names: &[&str]) -> Vec<(String, String)> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), "v".to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn title_case_is_what_hyper_writes_by_itself() {
+        for name in [
+            "Content-Type",
+            "X-Request-Id",
+            "Date",
+            "X-1a",
+            "Www-Authenticate",
+        ] {
+            assert!(is_title_case(name.as_bytes()), "{name}");
+        }
+        for name in [
+            "content-type",
+            "X-REQUEST-ID",
+            "x-Request-Id",
+            "WWW-Authenticate",
+            "Etag-",
+        ] {
+            assert_eq!(is_title_case(name.as_bytes()), name == "Etag-", "{name}");
+        }
+    }
+
+    #[test]
+    fn names_already_in_title_case_need_no_map() {
+        assert!(header_name_case(&pairs(&["Content-Type", "X-A"])).is_none());
+        assert!(header_name_case(&[]).is_none());
+    }
+
+    #[test]
+    fn one_name_off_title_case_spells_every_value_in_order() {
+        let map = header_name_case(&pairs(&["X-R", "x-r", "Content-Type", "X-r"]))
+            .expect("a map")
+            .0;
+        let spelled = |name: &str| {
+            map.get_all(name)
+                .iter()
+                .map(|b| String::from_utf8(b.to_vec()).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(spelled("x-r"), ["X-R", "x-r", "X-r"]);
+        assert_eq!(spelled("content-type"), ["Content-Type"]);
     }
 }
 

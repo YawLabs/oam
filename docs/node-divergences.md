@@ -1894,13 +1894,14 @@ got no chunks and a `Trailer` header never threw.
   `transfer-encoding` header removed (`res.removeHeader('transfer-encoding')`) and no length
   known, Node sends the body bare and closes the connection after it; hyper, which frames
   oam's responses, has no way to end an HTTP/1.1 body by closing, and chunks it.
-- **Trailer names go out lowercase.** `addTrailers()`'s fields follow the last chunk of a
+- **Trailer names go out in title case.** `addTrailers()`'s fields follow the last chunk of a
   chunked body as Node sends them -- all of them, a repeated one once per value, whether or
   not a `Trailer` header names them and whatever the request's `TE` says, and none on a body
   framed otherwise (case 268; oam sent none up to 0.17.1, as hyper sends only declared
   trailers to a `TE: trailers` request, `vendor/hyper-1.10.1/OAM-PATCH.md` item 12) -- but
-  hyper writes a trailer name as it writes any header name, with no room for the case it
-  was given in, where Node writes it as given.
+  a trailers frame has no room for the case a name was given in, so hyper writes it in the
+  title case a node:http connection uses for names it has no spelling for (`x-t` goes out
+  as `X-T`), where Node writes it as given.
 - **A `content-disposition` value is not re-encoded.** When the response's length is known,
   Node v22.22.2 converts the value with `Buffer.from(value, 'latin1')` and turns it back into
   a string as UTF-8, so a non-ASCII value is corrupted: `café` goes out as `caf` plus the
@@ -1911,9 +1912,13 @@ got no chunks and a `Trailer` header never threw.
   `Trailer` header beside a `content-length`), Node keeps the length it read and sends it
   with the next head that does not name one, whatever the body's length; oam sends the
   body's length (hyper's), which is what the body is.
-- **Header names go out lowercased**, as hyper writes them; Node keeps the case they were
-  set in, and writes the ones it adds as `Content-Length`, `Transfer-Encoding`, `Date`,
-  `Connection`.
+- **The fields Node adds come in hyper's order.** Node writes the handler's fields, then
+  `Date`, `Connection`, and `Content-Length` or `Transfer-Encoding`; hyper writes the
+  handler's fields (each name's values together, where Node keeps a list's order across
+  names), then `Connection`, the framing field and `Date` last. The names themselves are
+  Node's: each as the handler spelled it (`getRawHeaderNames()` answers them), and the added
+  ones as `Date`, `Content-Length`, `Transfer-Encoding`, `Connection` (case 270,
+  `vendor/hyper-1.10.1/OAM-PATCH.md` item 14). Up to 0.17.1 every name went out lowercase.
 
 ### 41. The HTTP server's timeouts and connection count: what still differs
 

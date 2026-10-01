@@ -3427,17 +3427,21 @@ fn response_head_args(
     let headers = arg_string(scope, args, 2)
         .map(|j| parse_headers_json(&j))
         .unwrap_or_default();
-    let header_bytes = if args.get(bytes_at).is_true() {
+    let bytes = args.get(bytes_at);
+    let header_bytes = if bytes.is_true() {
         oam_core::http_server::HeaderBytes::Latin1
     } else {
         oam_core::http_server::HeaderBytes::Utf8
     };
+    // Only node:http passes the bytes arg; its names keep their case.
+    let name_case = bytes.is_boolean();
     let reason = reason_arg(scope, args.get(reason_at), status);
     oam_core::http_server::ResponseHead {
         status,
         headers,
         header_bytes,
         reason,
+        name_case,
     }
 }
 

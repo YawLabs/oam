@@ -17696,8 +17696,22 @@
         if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("set");
         checkOutgoingHeader(name, value);
         this._progressive = true;
-        this._headers.set(name.toLowerCase(), value);
+        const key = name.toLowerCase();
+        this._headers.set(key, value);
+        this._spell(key, name);
         return this;
+      }
+      // node keeps each stored header's name as it was last set
+      // ([name, value] under the lowercased key) and writes it so. Only a
+      // name that is not its own lowercase is remembered here.
+      _spell(key, name) {
+        if (name !== key) (this._names ??= new Map()).set(key, name);
+        else if (this._names !== undefined) this._names.delete(key);
+      }
+      // node's getRawHeaderNames: the stored names as they were set.
+      getRawHeaderNames() {
+        const names = this._names;
+        return [...this._headers.keys()].map((key) => (names && names.get(key)) || key);
       }
       // node's appendHeader: the first value of a name is set as it is; a
       // later one turns the stored value into a list and joins it (a list
@@ -17709,6 +17723,7 @@
         const key = name.toLowerCase();
         if (!this._headers.has(key)) {
           this._headers.set(key, value);
+          this._spell(key, name);
         } else {
           const existing = this._headers.get(key);
           const list = Array.isArray(existing) ? existing : [existing];
@@ -17759,6 +17774,7 @@
         if (key === "content-length") this._removedContLen = true;
         else if (key === "transfer-encoding") this._removedTE = true;
         this._headers.delete(key);
+        if (this._names !== undefined) this._names.delete(key);
       }
       hasHeader(name) {
         checkHeaderNameArg(name);
@@ -17877,7 +17893,9 @@
           else note(name, value);
         };
         if (given === null) {
-          for (const [key, value] of this._headers) add(key, value);
+          // Each name as it was set: node writes it so.
+          const names = this._names;
+          for (const [key, value] of this._headers) add((names && names.get(key)) || key, value);
         } else {
           for (let n = 0; n < given.length; n += 2) add(given[n], given[n + 1]);
         }

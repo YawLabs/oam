@@ -5,8 +5,9 @@ for a client hang (items 1-3 below), one server extension (item 4), and
 four stricter rules in the chunked-body decoder (items 5 to 8), a
 CONNECT request read without a body (item 9), the `host` field kept out
 of an HTTP/2 request (item 10), an on-demand header buffer (item 11), a
-server response's trailers sent as node sends them (item 12), and an
-HTTP/1.0 request's response framed as node frames it (item 13). The root
+server response's trailers sent as node sends them (item 12), an
+HTTP/1.0 request's response framed as node frames it (item 13), and a public
+`HeaderCaseMap` (item 14). The root
 `Cargo.toml` swaps it in with `[patch.crates-io]`.
 
 - **Upstream:** `hyper-1.10.1.crate`, sha256
@@ -24,8 +25,8 @@ HTTP/1.0 request's response framed as node frames it (item 13). The root
   the unsafe-budget scan. After an edit here, `scripts/check-vendor.sh
   --regen` rewrites the diff; review it and commit it with the edit.
 - **Remove it when** a hyper release ships the fix and items 5 to 10, **and**
-  oam no longer needs items 4 and 11 to 13 (see "The request-head extension"
-  below for what replacing item 4 takes; items 12 and 13 are node's rules,
+  oam no longer needs items 4 and 11 to 14 (see "The request-head extension"
+  below for what replacing item 4 takes; items 12 to 14 serve node's rules,
   which hyper has no reason to adopt). To do that:
   1. Delete this directory.
   2. Delete the `[patch.crates-io]` entry and the `exclude = ["vendor"]` line
@@ -130,6 +131,11 @@ whole of it.
     for an HTTP/1.0 peer as for an HTTP/1.1 one (the version half of two
     `can_chunked` checks goes). A body with neither header still ends by
     closing the connection for a 1.0 peer. See "HTTP/1.0 peers" below.
+14. **`src/ext/mod.rs`, `HeaderCaseMap`.** The type, and its one field, are
+    public, so a server response can carry the spellings of its header
+    names. Visibility and doc comments only: hyper's server already writes
+    a response's names from such a map when its extensions hold one. See
+    "Header name case" below.
 
 ## Why
 
@@ -475,6 +481,28 @@ handler sets for a 1.0 client).
 
 Tested by conformance case 269 (identical to node v22.22.2; fails on stock
 1.10.1). hyper 1.11.0 is unchanged here (checked 2026-10-01).
+
+## Header name case (item 14)
+
+node writes each response header name as the handler spelled it, and the
+ones it adds itself (`Date`, `Content-Length`, `Transfer-Encoding`,
+`Connection`) in title case. hyper's `HeaderName` is lowercase, and its
+server writes names lowercase -- or title case, with the builder's
+`title_case_headers` -- unless the response's extensions hold a
+`HeaderCaseMap`, which `preserve_header_case` fills in on a request but no
+caller could build for a response: the type was crate-private.
+
+oam's node:http connections set `title_case_headers`, which gives node's
+spellings for the names hyper adds and for every name a handler wrote in
+title case, at no cost; a response with a name in any other case
+(`x-request-id`, `ETag`) carries a `HeaderCaseMap` with every name's
+spelling (`http_server::header_name_case`). `oam.serve` and the http2
+compat server are unchanged (lowercase). A trailers frame has no
+extensions, so trailer names follow the connection's case rule (title case
+on a node:http connection), where node writes them as given.
+
+Tested by conformance case 270 (identical to node v22.22.2; does not compile
+against stock 1.10.1) and `http_server::name_case_tests`.
 
 ## Upstream status (checked 2026-09-18)
 
