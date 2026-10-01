@@ -17421,6 +17421,16 @@
         value,
       );
     };
+    // Which formats use the dictionary option, as node's zlib does:
+    // it validates the option for every zlib class but sets it only on a
+    // deflate/inflate stream (zlib's deflateSetDictionary/inflateSetDictionary);
+    // a gzip member never carries one. Brotli has no such option and does
+    // not look at it.
+    const dictionaryFor = (format, options) => {
+      if (format === "brotli") return undefined;
+      const dictionary = dictionaryOf(options);
+      return format === "gzip" ? undefined : dictionary;
+    };
 
     const sync = (format, compress) => (data, options) => {
       const dictionary = dictionaryOf(options);
@@ -17471,7 +17481,7 @@
         constructor(options) {
           // brotli's flush values are BROTLI_OPERATION_*, not zlib's, and
           // it has no dictionary option.
-          const dictionary = format === "brotli" ? undefined : dictionaryOf(options);
+          const dictionary = dictionaryFor(format, options);
           const finishFlush = format === "brotli" ? undefined : finishFlushOf(options);
           super({});
           this._zlibLevel = levelOf(options);
@@ -17629,7 +17639,7 @@
       format === "deflateRaw"
         ? (compress ? DEFLATERAW : INFLATERAW)
         : (compress ? DEFLATE : INFLATE);
-    function initSyncHandleState(self, mode, options) {
+    function initSyncHandleState(self, format, mode, options) {
       const opts = options || {};
       let chunkSize = opts.chunkSize != null ? opts.chunkSize : Z_DEFAULT_CHUNK;
       if (chunkSize < Z_MIN_CHUNK) chunkSize = Z_MIN_CHUNK;
@@ -17640,7 +17650,10 @@
       self._buffer = BufferCtor.allocUnsafe(chunkSize);
       self._outBuffer = self._buffer;
       self._hadError = false;
-      const dictionary = dictionaryOf(opts);
+      // gzip maps to the zlib-wrapped handle (handleModeFor), so its
+      // dictionary must be dropped here, or the handle writes a stream with
+      // FDICT that no inflater reads without it.
+      const dictionary = dictionaryFor(format, opts);
       self._finishFlushFlag = finishFlushOf(opts);
       const handle = new ZlibHandle(mode);
       handle.init(15, levelOf(opts), 8, 0, self._writeState, () => {}, dictionary);
@@ -17654,7 +17667,7 @@
         // `new zlib.Inflate(opts)` -> a real streaming Transform instance.
         if (new.target) return Reflect.construct(Stream, [options], new.target);
         // `zlib.Inflate.call(this, opts)` -> sync-handle state for inheritance.
-        return initSyncHandleState(this, mode, options);
+        return initSyncHandleState(this, format, mode, options);
       }
       // Share the streaming Transform prototype so `new` instances get the
       // streaming methods AND util.inherits(Sub, ZlibClass) chains

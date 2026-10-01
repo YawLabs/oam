@@ -126,3 +126,18 @@ console.log("Inflate handle", handleRun(zlib.Inflate, { dictionary }, z).equals(
 const hr = handleRun(zlib.DeflateRaw, { dictionary }, data);
 console.log("DeflateRaw handle", zlib.inflateRawSync(hr, { dictionary }).equals(data));
 console.log("InflateRaw handle", handleRun(zlib.InflateRaw, { dictionary }, raw).equals(data));
+// gzip's handle takes the option and does not use it: its output inflates
+// with no dictionary. (oam's Gzip handle writes a zlib stream, not a gzip
+// member -- docs/node-divergences.md -- so this checks what unzip reads.)
+const hg = handleRun(zlib.Gzip, { dictionary }, data);
+show("Gzip handle, unzip without", () => zlib.unzipSync(hg).equals(data));
+show("Gzip handle, bad dictionary", () => handleRun(zlib.Gzip, { dictionary: 5 }, data).length);
+show("Unzip handle", () => handleRun(zlib.Unzip, { dictionary }, z).equals(data));
+// Brotli has no dictionary option, so it does not validate one.
+show("BrotliCompress.call, bad dictionary", () => {
+  function Sub() {
+    zlib.BrotliCompress.call(this, { dictionary: 5 });
+  }
+  util.inherits(Sub, zlib.BrotliCompress);
+  return new Sub() instanceof zlib.BrotliCompress;
+});
