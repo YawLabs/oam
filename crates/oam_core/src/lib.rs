@@ -22,7 +22,7 @@ pub use oam_diagnostics as diagnostics;
 pub mod byte_pipe;
 pub mod child;
 pub mod cluster;
-/// zlib-faithful inflate shared by fetch's body decoder and node:zlib (#166).
+/// node:zlib's deflate and deflateRaw with the dictionary option.
 mod deflate;
 pub mod dns;
 /// oam's own HTTP client transport for the `fetch` op (#143).
@@ -32,6 +32,7 @@ pub mod http_client;
 pub mod http_conn;
 pub mod http_head;
 pub mod http_server;
+/// zlib-faithful inflate shared by fetch's body decoder and node:zlib (#166).
 mod inflate;
 pub mod inspector;
 /// The outbound TCP connector net.connect and tls.connect share: node's
