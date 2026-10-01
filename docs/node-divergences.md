@@ -2160,7 +2160,13 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   `ERR_STREAM_DESTROYED` otherwise -- and never when none is (a write with no callback
   that the socket took whole inside the call does not count, as in Node)
   (`conformance/cases/248-net-end-write-after-destroy.mjs`; up to 0.17.1 those `end()`
-  callbacks got the destroy error, or `ERR_SOCKET_CLOSED`). On a socket destroyed while
+  callbacks got the destroy error, or `ERR_SOCKET_CLOSED`). A `write()` or `end(data)` on a
+  socket with no connection and none on the way (`new net.Socket()`, never connected) fails
+  as Node's does: `ERR_SOCKET_CLOSED` "Socket is closed" is the stream's error at once, the
+  callback gets it on the next tick, then the socket is destroyed with it, and the stream
+  does not end (`conformance/cases/260-net-write-without-handle.mjs`; up to 0.17.1 the
+  write reached the natives and failed with "tcp: write handle 0 is gone", and `end(data)`
+  ended the stream). On a socket destroyed while
   connecting, a write held behind the connect fails -- its callback, then those of such an
   `end()` -- before `'close'`; Node fails it from a `'close'` listener the `write()` added,
   so after the `'close'` listeners added before it. What is left there: a write the

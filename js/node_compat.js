@@ -22931,6 +22931,9 @@
         // -- node's kOnFinished list. On a socket destroyed before its first
         // end(), until a write outstanding at destroy() settles (see end()).
         this._endCallbacks = null;
+        // A write failed for want of a handle: the callbacks of the writes
+        // waiting on its next-tick teardown (see _writeWithoutHandle).
+        this._noHandleFailure = null;
         if (options && options._handle !== undefined) {
           this._handle = options._handle;
           this.connecting = false;
@@ -23083,7 +23086,10 @@
           err.code = "ERR_INVALID_ARG_TYPE";
           throw err;
         }
-        if (this.destroyed || !this.writable) {
+        if (this.destroyed || !this.writable || (this._handle === null && this._heldOps === null)) {
+          if (!this.destroyed && (this.writable || this._noHandleFailure !== null)) {
+            return this._writeWithoutHandle(cb);
+          }
           let err;
           if (this._writableState.ended && this._readableState.endEmitted && !this.allowHalfOpen) {
             // node's writeAfterFIN (lib/net.js), which replaces write() once
@@ -23191,6 +23197,43 @@
           return false;
         }
         return true;
+      }
+
+      // A write (or end(data)) on a socket with no connection and none on
+      // the way -- never connected, connect() never called: node's
+      // _writeGeneric has no handle to write to and fails the write with
+      // ERR_SOCKET_CLOSED "Socket is closed". As node's onwrite, the error
+      // is the stream's at once (writable false; a later end() does not end
+      // it, a later write waits on it), and on the next tick the callback
+      // gets it, then the callbacks of an end() made since, then the socket
+      // is destroyed with it ('error', then 'close'). Before this the write
+      // reached the natives with no handle and failed with "tcp: write
+      // handle 0 is gone", a message no caller could act on.
+      //
+      // Until that tick a later write is buffered behind the failed one
+      // (node's writeOrBuffer on an errored stream) and its callback gets
+      // the error right after the first one's (errorBuffer); an end() does
+      // not end the stream and calls back with the error on its own tick
+      // (Writable.end on an errored stream). Off the hot path: only a socket
+      // with no handle and no connect in flight gets here.
+      _writeWithoutHandle(cb) {
+        let callbacks = this._noHandleFailure;
+        if (callbacks === null) {
+          const err = codes.ERR_SOCKET_CLOSED();
+          const ws = this._writableState;
+          const rs = this._readableState;
+          if (!ws.errored) ws.errored = err;
+          if (!rs.errored) rs.errored = err;
+          this.writable = false;
+          callbacks = this._noHandleFailure = [];
+          process.nextTick(() => {
+            this._noHandleFailure = null;
+            for (const callback of callbacks) callback(err);
+            this.destroy(err);
+          });
+        }
+        if (typeof cb === "function") callbacks.push(cb);
+        return false;
       }
 
       // Why a chunk handed to write() or end(data) on a socket that is not
@@ -23313,7 +23356,9 @@
         // waits for 'finish' only while neither has happened yet.
         let err;
         if (data !== undefined && data !== null) {
-          if (this.destroyed || !this.writable) {
+          // A write failed for want of a handle leaves the socket not
+          // writable but not ended: the chunk is buffered behind it (write()).
+          if (this.destroyed || (!this.writable && this._noHandleFailure === null)) {
             err = this._refusedWriteError();
             this.destroy(err);
           } else {
@@ -23433,7 +23478,12 @@
         // key off), and flipping them before emit('close') makes the
         // vendored end-of-stream skip its premature-close detection --
         // pipeline() would report success on a silently truncated transfer.
-        if (err) rs.errored = ws.errored = err;
+        // node's destroy keeps an error the stream already has (a write
+        // that failed for want of a handle).
+        if (err) {
+          if (!ws.errored) ws.errored = err;
+          if (!rs.errored) rs.errored = err;
+        }
         if (this._timeoutId !== null) {
           globalThis.clearTimeout(this._timeoutId);
           this._timeoutId = null;
