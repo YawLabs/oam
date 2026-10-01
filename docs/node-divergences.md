@@ -2236,17 +2236,15 @@ What still differs:
   stdin succeeds and on NUL is `EISDIR`. A character device other than the console
   and NUL (a serial port) stats with NUL's shape on oam, where libuv reads its file
   information.
-- **`fs.rm(path[, options], callback)` without a function callback** throws
-  `ERR_INVALID_ARG_TYPE` for `"cb"` at the call, as every other callback-form `fs`
-  call does. node v22.22.2's `rm` does not check its callback: the call returns, and
-  the rm's completion later dies with an uncaught `TypeError: callback is not a
-  function`. Reproducing that would turn a clear error at the call site into a
-  crash with no user frame, so oam keeps the check.
 - **`fchown` of a closed descriptor on Windows.** node's (libuv's) Windows `fchown`
   is a no-op success for any descriptor, open or not; oam reports `EBADF` for one
   that is not open. (`fs.close` of a descriptor that is not open is `EBADF` through
   the callback, as node's is, and an uncaught exception without one --
-  `conformance/cases/259-*`.)
+  `conformance/cases/259-*`. So is `fs.rm` without a function callback: node's
+  `rm` never checks it, so the removal runs and calling the missing callback when
+  it settles is an uncaught `TypeError: callback is not a function`; oam does the
+  same rather than refusing at the call, which it used to. `rm`, `rmSync` and
+  `fs/promises.rm` validate their options as node's `validateRmOptions` does.)
 
 ### `fs.realpath` under `--permission` — oam is stricter
 

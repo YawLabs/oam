@@ -47,4 +47,71 @@ console.log("returned", fs.close(fs.openSync(file, "r")));
 await new Promise((resolve) => setTimeout(resolve, 20));
 console.log("uncaught", uncaught.length, uncaught.join(" | "));
 
+// fs.rm never checks its callback (lib/fs.js, v22.22.2): the path and the
+// options are validated synchronously, the removal runs, and calling the
+// missing callback when it settles is an uncaught TypeError. oam refused
+// the call with ERR_INVALID_ARG_TYPE for "cb" and removed nothing.
+let onUncaught = null;
+process.on("uncaughtException", () => onUncaught?.());
+function rmWithout(label, run) {
+  return new Promise((resolve) => {
+    uncaught.length = 0;
+    onUncaught = () => {
+      onUncaught = null;
+      console.log(label, "->", uncaught.join(" | "));
+      resolve();
+    };
+    try {
+      console.log(label, "returned", run());
+    } catch (e) {
+      onUncaught = null;
+      console.log(label, "threw", shape(e));
+      resolve();
+    }
+  });
+}
+const a = path.join(dir, "a");
+const b = path.join(dir, "b");
+const d = path.join(dir, "d");
+fs.writeFileSync(a, "a");
+fs.writeFileSync(b, "b");
+fs.mkdirSync(d);
+fs.writeFileSync(path.join(d, "x"), "x");
+await rmWithout("rm(file)", () => fs.rm(a));
+console.log("  removed", !fs.existsSync(a));
+await rmWithout("rm(file, {}, 5)", () => fs.rm(b, {}, 5));
+console.log("  removed", !fs.existsSync(b));
+await rmWithout("rm(missing)", () => fs.rm(path.join(dir, "zz")));
+await rmWithout("rm(missing, {force: true})", () => fs.rm(path.join(dir, "zz"), { force: true }));
+await rmWithout("rm(dir)", () => fs.rm(d));
+await rmWithout("rm(dir, {recursive: true})", () => fs.rm(d, { recursive: true }));
+console.log("  removed", !fs.existsSync(d));
+// Thrown at the call, with or without a callback.
+for (const o of [null, "x", [], { recursive: 1 }, { force: "y" }, { retryDelay: -1 }, { retryDelay: "x" }, { maxRetries: 1.5 }]) {
+  await rmWithout(`rm(p, ${JSON.stringify(o)})`, () => fs.rm(path.join(dir, "q"), o));
+  await rmWithout(`rm(p, ${JSON.stringify(o)}, cb)`, () => fs.rm(path.join(dir, "q"), o, () => {}));
+}
+await rmWithout("rm(5)", () => fs.rm(5));
+// rmSync and fs/promises.rm validate the same options the same way.
+for (const o of [null, { recursive: 1 }, { maxRetries: -1 }]) {
+  try {
+    fs.rmSync(path.join(dir, "q"), o);
+    console.log("rmSync no error");
+  } catch (e) {
+    console.log(`rmSync(p, ${JSON.stringify(o)})`, shape(e));
+  }
+  await fs.promises.rm(path.join(dir, "q"), o).then(
+    () => console.log("promises.rm no error"),
+    (e) => console.log(`promises.rm(p, ${JSON.stringify(o)})`, shape(e)),
+  );
+}
+console.log("rmSync.length", fs.rmSync.length);
+console.log("rm.length", fs.rm.length, fs.rm.name);
+// With a callback: one argument, null on success.
+fs.writeFileSync(a, "a");
+await new Promise((resolve) => fs.rm(a, (...args) => { console.log("rm(file, cb)", args.length, args[0]); resolve(); }));
+await new Promise((resolve) =>
+  fs.rm(a, (...args) => { console.log("rm(missing, cb)", args.length, args[0].code); resolve(); }),
+);
+
 fs.rmSync(dir, { recursive: true, force: true });

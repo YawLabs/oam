@@ -1437,10 +1437,11 @@
 
   // The "must be of type <expected>" variant (used for scalar args like
   // offset/byteLength where Node expects a primitive type, not an instance).
+  // A dotted name ("options.retryDelay") is a "property", as node words it.
   function argTypeOfError(argName, expected, value) {
     return applyNodeErrorShape(
       new TypeError(
-        'The "' + argName + '" argument must be of type ' +
+        'The "' + argName + (argName.includes(".") ? '" property' : '" argument') + " must be of type " +
           expected + "." + receivedSuffix(value),
       ),
       "ERR_INVALID_ARG_TYPE",
@@ -10128,6 +10129,26 @@
     return value;
   }
 
+  // The synchronous half of node's validateRmOptions (validateRmdirOptions
+  // over rm's defaults, then `force`): an options object, if given, with
+  // boolean recursive / force, an int32 retryDelay >= 0 and a uint32
+  // maxRetries.
+  function validateRmOptions(options) {
+    if (options === undefined) return;
+    if (options === null || typeof options !== "object" || Array.isArray(options)) {
+      throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+    }
+    const o = { retryDelay: 100, maxRetries: 0, recursive: false, force: false, ...options };
+    if (typeof o.recursive !== "boolean") {
+      throw codes.ERR_INVALID_ARG_TYPE("options.recursive", "boolean", o.recursive);
+    }
+    validateInt32(o.retryDelay, "options.retryDelay", 0);
+    validateUint32(o.maxRetries, "options.maxRetries");
+    if (typeof o.force !== "boolean") {
+      throw codes.ERR_INVALID_ARG_TYPE("options.force", "boolean", o.force);
+    }
+  }
+
   // fchown's uid / gid bound: -1 ("leave it") through 2**32-1.
   const kMaxUserId = 2 ** 32 - 1;
 
@@ -10669,7 +10690,9 @@
       mkdir: withPath(async (file, options) => {
         await natives.fsMkdir(file, readOptions(options).recursive === true);
       }),
-      rm: withPath(async (file, options = {}) => {
+      rm: withPath(async (file, options) => {
+        validateRmOptions(options);
+        options ??= {};
         await natives.fsRm(file, options.recursive === true, options.force === true);
       }),
       rmdir: withPath(async (dir) => {
@@ -11563,8 +11586,11 @@
       mkdirSync: (path, options) => {
         natives.fsMkdirSync(toPath(path), readOptions(options).recursive === true);
       },
-      rmSync: (path, options = {}) => {
-        natives.fsRmSync(toPath(path), options.recursive === true, options.force === true);
+      rmSync: (path, options) => {
+        const file = toPath(path);
+        validateRmOptions(options);
+        options ??= {};
+        natives.fsRmSync(file, options.recursive === true, options.force === true);
       },
       rmdirSync: (path) => {
         // The kind probe is an implementation detail: node reports `rmdir` as
@@ -11717,7 +11743,25 @@
       readdir: callbackify1(promises.readdir, 1, 1),
       glob: callbackify1(promises._globAsPromise, 1, 1),
       mkdir: callbackify1(promises.mkdir, 1, 1),
-      rm: callbackify1(promises.rm, 1, 1),
+      // node's rm (lib/fs.js, v22.22.2) validates the path and its options
+      // synchronously, and NEVER checks the callback: the removal runs, and
+      // calling a missing one when it settles is an uncaught TypeError
+      // "callback is not a function" -- that is how node reports it, so oam
+      // does too, rather than refusing at the call (which every other
+      // callback form does, because their node counterparts do).
+      rm: function rm(path, options, callback) {
+        if (typeof options === "function") {
+          callback = options;
+          options = undefined;
+        }
+        const file = toPath(path);
+        validateRmOptions(options);
+        const token = fsReqStart();
+        promises.rm(file, options).then(
+          () => { fsReqEnd(token); queueMicrotask(() => callback(null)); },
+          (err) => { fsReqEnd(token); queueMicrotask(() => callback(err)); },
+        );
+      },
       rmdir: callbackify1(promises.rmdir, 1, 1),
       unlink: callbackify1(promises.unlink, 1),
       rename: callbackify1(promises.rename, 2),
