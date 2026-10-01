@@ -32,7 +32,6 @@
 //! loop is where the grant has to be asked again.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -349,7 +348,9 @@ pub async fn fetch_continue(
     };
     let mut addrs = Vec::with_capacity(lookup.ips.len());
     for ip in &lookup.ips {
-        match ip.parse::<IpAddr>() {
+        // A zone id (`fe80::1%eth0`) is part of the address, as node's
+        // `net.isIP` has it, and is dialled as its scope id.
+        match ip.parse::<crate::net_connect::PinAddr>() {
             Ok(addr) => addrs.push(addr),
             Err(e) => {
                 return OpOutcome::Failed(format!(

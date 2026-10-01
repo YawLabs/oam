@@ -518,7 +518,7 @@ impl Shared {
 
 /// A lookup-hooked fetch's resolved authorities: [`authority_key`] -> the
 /// addresses its `connect.lookup` hook returned, in the hook's order.
-pub(crate) type HostAddrs = Arc<Mutex<HashMap<String, Vec<IpAddr>>>>;
+pub(crate) type HostAddrs = Arc<Mutex<HashMap<String, Vec<net_connect::PinAddr>>>>;
 
 /// The key one hook answer is filed under: `host:port`, host lowercased and
 /// unbracketed, port defaulted by scheme so `http://h/` and `http://h:80/`

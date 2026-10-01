@@ -1439,8 +1439,18 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
 - **A hook that calls back twice.** One that answers and then calls back again with an
   error fails the fetch in Node, with that second error as the `cause`; oam keeps the first
   answer and connects.
-- **A scoped IPv6 address** (`fe80::1%lo0`) is refused with `ERR_INVALID_IP_ADDRESS`, because
-  oam's `net.isIP('fe80::1%lo0')` is `0`; Node's is `6` and it dials the address.
+- **A scoped IPv6 address** (`fe80::1%lo0`) is dialled, as in Node, since 0.17.2: the zone
+  becomes the scope id libuv's `uv_ip6_addr` gives it (Windows reads it with `atoi`, so a
+  name is 0; Linux looks the interface up by name, and a name that is no interface is 0),
+  and an error names the address with its zone (`connect EADDRNOTAVAIL ::1%1:PORT`). The
+  same holds for a zoned literal host and a zoned `lookup` answer on `net.connect`
+  (`conformance/cases/227-net-ipv6-zone-id.mjs`). Up to 0.17.1 a zoned answer was refused
+  before the dial (`pin ip '...' is not an IP`), and a zoned literal host was resolved and
+  its errors dropped the zone. What is left: on macOS and the BSDs oam has the system
+  resolver read the zone, which also takes a number (`%1`) as the interface index, where
+  libuv looks a number up as an interface NAME and finds none (scope id 0); and under
+  `--permission` a zoned answer is checked as written, so only an exact grant (or
+  `--allow-net` with no list) admits it.
 - **A refusing hook's error is wrapped on `undici.request` and `agent.request`.** oam's
   `undici.request` runs on `fetch`, so it rejects with `TypeError: fetch failed` carrying the
   hook's error as `cause`; Node rethrows the hook's error itself. `fetch` agrees in both.

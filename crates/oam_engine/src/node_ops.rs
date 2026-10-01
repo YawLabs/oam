@@ -4167,7 +4167,9 @@ fn connect_pin_arg(
         }) => {
             let mut addrs = Vec::with_capacity(ips.len());
             for ip in &ips {
-                match ip.parse::<std::net::IpAddr>() {
+                // A zone id (`fe80::1%eth0`) is part of the address, as
+                // node's `net.isIP` has it.
+                match ip.parse::<oam_core::net_connect::PinAddr>() {
                     Ok(addr) => addrs.push(addr),
                     Err(_) => {
                         return Some(PinArg::Refused(format!("{op}: pin ip '{ip}' is not an IP")));

@@ -4902,6 +4902,42 @@ fn undici_dispatcher_connect_lookup_pins_dns() {
     assert!(stdout.contains("control=failed"), "{stdout}");
 }
 
+// #162: a connect.lookup answer with an IPv6 zone id is an address, as node's
+// net.isIP has it, and is dialled: it was refused before the dial (first by
+// the JS isIP filter, then by the pin parser, `pin ip '...' is not an IP`).
+// The zone names no interface on any platform, so libuv's rules make it scope
+// id 0 and the connect reaches the ::1 listener.
+#[test]
+fn undici_dispatcher_connect_lookup_dials_a_zoned_address() {
+    let main = write_temp(
+        "undici_pin_zone/main.mjs",
+        "import http from 'node:http';\n\
+         import { Agent } from 'undici';\n\
+         const server = http.createServer((req, res) => res.end('zoned:' + req.headers.host));\n\
+         await new Promise((r) => server.listen(0, '::1', r));\n\
+         const port = server.address().port;\n\
+         const agent = new Agent({ connect: { lookup: (h, o, cb) => cb(null, [{ address: '::1%oamnone0', family: 6 }]) } });\n\
+         try {\n\
+           const res = await fetch(`http://scoped.invalid:${port}/`, { dispatcher: agent });\n\
+           console.log('fetch=' + res.status + ':' + (await res.text()));\n\
+         } catch (e) { console.log('fetch=ERR:' + e.message + ':' + (e.cause && e.cause.message)); }\n\
+         server.close();\n\
+         process.exit(0);\n",
+    );
+    let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
+    assert!(
+        stdout.contains("fetch=200:zoned:scoped.invalid:"),
+        "expected the zoned answer to be dialled: {stdout}"
+    );
+}
+
 // ------------------------------------ #143: fetch on oam's own transport
 
 /// Run a script with `oam run --no-check` and return (stdout, stderr), failing

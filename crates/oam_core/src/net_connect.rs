@@ -7,7 +7,8 @@
 //!
 //! 1. An IP literal skips DNS and is ONE attempt. Its `address` in an error is
 //!    the string as the caller wrote it (`0:0:0:0:0:0:0:1` stays that, not
-//!    `::1`).
+//!    `::1`). An IPv6 zone id is part of the literal (`fe80::1%eth0`), read
+//!    into the scope id as libuv reads it ([`zone_scope_id`]).
 //! 2. Otherwise getaddrinfo, in the resolver's (verbatim) order. A resolver
 //!    failure is a `DNSException` (`getaddrinfo ENOTFOUND host`), never
 //!    aggregated.
@@ -110,7 +111,132 @@ pub struct Pin {
     /// Lowercased: fetch's URL host (no URI brackets), or net / tls's host as
     /// the caller spelled it.
     pub host: String,
-    pub addrs: Vec<IpAddr>,
+    pub addrs: Vec<PinAddr>,
+}
+
+/// One address a caller handed over: an IP, and for IPv6 the zone id it was
+/// written with (`fe80::1%eth0`, `::1%1`), as node's `net.isIP` accepts and
+/// libuv's `uv_ip6_addr` dials. The zone is kept as written: it names the
+/// address in an error (`connect EADDRNOTAVAIL ::1%1:80`, as node's does) and
+/// becomes a scope id only when the address is dialled ([`zone_scope_id`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinAddr {
+    pub ip: IpAddr,
+    pub zone: Option<String>,
+}
+
+impl From<IpAddr> for PinAddr {
+    fn from(ip: IpAddr) -> Self {
+        PinAddr { ip, zone: None }
+    }
+}
+
+impl std::str::FromStr for PinAddr {
+    type Err = std::net::AddrParseError;
+
+    /// An IPv4 or IPv6 address, the IPv6 one optionally followed by `%` and a
+    /// zone id in node's grammar (lib/internal/net.js IPv6Reg:
+    /// `%[0-9a-zA-Z-.:]+`). A zone on an IPv4 address, an empty one or one
+    /// with other characters is refused, as `net.isIP` refuses it.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let Some((address, zone)) = text.split_once('%') else {
+            return Ok(PinAddr {
+                ip: text.parse()?,
+                zone: None,
+            });
+        };
+        let ip: std::net::Ipv6Addr = address.parse()?;
+        let zone_ok = !zone.is_empty()
+            && zone
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b':'));
+        if !zone_ok {
+            // An AddrParseError can only come from a parse; this one fails
+            // the same way the whole text would.
+            return Err(text.parse::<IpAddr>().unwrap_err());
+        }
+        Ok(PinAddr {
+            ip: IpAddr::V6(ip),
+            zone: Some(zone.to_string()),
+        })
+    }
+}
+
+impl std::fmt::Display for PinAddr {
+    /// The address as an error names it: the IP's text, then `%zone` as
+    /// written.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.zone {
+            Some(zone) => write!(f, "{}%{zone}", self.ip),
+            None => write!(f, "{}", self.ip),
+        }
+    }
+}
+
+/// The scope id a zone id dials with, as libuv's `uv_ip6_addr` reads it --
+/// node's connect hands it the address string, zone and all:
+///
+/// - Windows: `atoi(zone)`. `1` is interface 1; a name (`lo0`) is 0.
+/// - POSIX: `if_nametoindex(zone)`; an interface that does not exist is 0,
+///   "silently ignored" (libuv's words), as is a number. Linux reads the
+///   index from sysfs (`/sys/class/net/<name>/ifindex`, what
+///   `if_nametoindex`'s ioctl reports), so no new FFI is needed. Elsewhere
+///   (macOS, the BSDs) the system resolver maps the zone, through `lookup`:
+///   their getaddrinfo reads an interface name with `if_nametoindex` too, but
+///   it also takes a numeric zone as the index, where libuv's lookup finds no
+///   interface of that name.
+pub(crate) async fn zone_scope_id<D: Dialer>(
+    dialer: &D,
+    ip: std::net::Ipv6Addr,
+    zone: &str,
+) -> u32 {
+    if cfg!(windows) {
+        c_atoi(zone) as u32
+    } else if cfg!(target_os = "linux") {
+        sysfs_ifindex(zone).unwrap_or(0)
+    } else {
+        match dialer.lookup(&format!("{ip}%{zone}"), 0).await {
+            Ok(resolved) => resolved
+                .iter()
+                .find_map(|addr| match addr {
+                    SocketAddr::V6(v6) => Some(v6.scope_id()),
+                    SocketAddr::V4(_) => None,
+                })
+                .unwrap_or(0),
+            Err(_) => 0,
+        }
+    }
+}
+
+/// C's `atoi` (the Microsoft CRT's): optional leading whitespace and sign,
+/// then the longest run of decimal digits; 0 without one. Out of range it
+/// saturates, as the CRT documents (`INT_MAX` / `INT_MIN`).
+fn c_atoi(text: &str) -> i32 {
+    let text = text.trim_start_matches([' ', '\t', '\n', '\x0b', '\x0c', '\r']);
+    let (negative, digits) = match text.as_bytes().first() {
+        Some(b'-') => (true, &text[1..]),
+        Some(b'+') => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let mut value: i64 = 0;
+    for b in digits.bytes().take_while(u8::is_ascii_digit) {
+        value = (value * 10 + i64::from(b - b'0')).min(i64::from(i32::MAX) + 1);
+    }
+    let value = if negative { -value } else { value };
+    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+/// Linux's interface index for `name`, from sysfs: `None` when there is no
+/// such interface (or no sysfs). A name that is not a single path component
+/// names no interface.
+fn sysfs_ifindex(name: &str) -> Option<u32> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return None;
+    }
+    let path = std::path::Path::new("/sys/class/net")
+        .join(name)
+        .join("ifindex");
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// A connected stream and every address an attempt was made to, in order.
@@ -330,7 +456,7 @@ pub fn redeem_answer(answers: &ResolvedAnswers, token: u64, host: &str) -> Resul
         // connect_with matches a pin against the connect's host as the
         // caller spelled it.
         host: host.to_ascii_lowercase(),
-        addrs: resolved.addrs,
+        addrs: resolved.addrs.into_iter().map(PinAddr::from).collect(),
     })
 }
 
@@ -391,9 +517,10 @@ pub(crate) async fn connect_with<D: Dialer>(
     opts: &ConnectOptions,
     dialer: &D,
 ) -> Result<(D::Stream, Vec<SocketAddr>), ConnectError> {
-    // 1. An IP literal: no DNS, one attempt, the address as written.
-    if let Ok(ip) = host.parse::<IpAddr>() {
-        let target = SocketAddr::new(ip, port);
+    // 1. An IP literal: no DNS, one attempt, the address as written. A zone
+    // id is part of the literal (`fe80::1%eth0`), as `net.isIP` has it.
+    if let Ok(literal) = host.parse::<PinAddr>() {
+        let target = dial_target(dialer, &literal, port).await;
         return match dialer.dial(target, opts.local.as_ref()).await {
             Ok(stream) => Ok((stream, vec![target])),
             Err(failure) => Err(ConnectError::Single(Box::new(attempt_error(
@@ -407,7 +534,10 @@ pub(crate) async fn connect_with<D: Dialer>(
         .pin
         .as_ref()
         .filter(|pin| pin.host.eq_ignore_ascii_case(host));
-    let resolved: Vec<SocketAddr> = match pinned {
+    // Each address with the text an error names it by: a pinned address as
+    // handed over (its zone included), a resolved one as `inet_ntop` writes
+    // it.
+    let resolved: Vec<(SocketAddr, String)> = match pinned {
         Some(pin) if pin.addrs.is_empty() => {
             return Err(ConnectError::Invalid(Box::new(NodeSysError {
                 code: "ERR_INVALID_IP_ADDRESS".to_string(),
@@ -419,13 +549,18 @@ pub(crate) async fn connect_with<D: Dialer>(
                 port: None,
             })));
         }
-        Some(pin) => pin
-            .addrs
-            .iter()
-            .map(|ip| SocketAddr::new(*ip, port))
-            .collect(),
+        Some(pin) => {
+            let mut targets = Vec::with_capacity(pin.addrs.len());
+            for addr in &pin.addrs {
+                targets.push((dial_target(dialer, addr, port).await, addr.to_string()));
+            }
+            targets
+        }
         None => match dialer.lookup(host, port).await {
-            Ok(resolved) => resolved,
+            Ok(resolved) => resolved
+                .into_iter()
+                .map(|addr| (addr, addr.ip().to_string()))
+                .collect(),
             Err(error) => return Err(ConnectError::Resolve(Box::new(resolve_error(host, &error)))),
         },
     };
@@ -438,13 +573,12 @@ pub(crate) async fn connect_with<D: Dialer>(
     }
 
     // 4. Group, dedup, interleave; one left is a single attempt.
-    let order = interleave(&resolved);
-    if let [target] = order[..] {
-        let address = target.ip().to_string();
+    let order = interleave(resolved);
+    if let [(target, ref address)] = order[..] {
         return match dialer.dial(target, opts.local.as_ref()).await {
             Ok(stream) => Ok((stream, vec![target])),
             Err(failure) => Err(ConnectError::Single(Box::new(attempt_error(
-                &address, port, &failure,
+                address, port, &failure,
             )))),
         };
     }
@@ -454,9 +588,8 @@ pub(crate) async fn connect_with<D: Dialer>(
     let last = order.len() - 1;
     let mut attempted = Vec::with_capacity(order.len());
     let mut errors = Vec::with_capacity(order.len());
-    for (i, target) in order.into_iter().enumerate() {
+    for (i, (target, address)) in order.into_iter().enumerate() {
         attempted.push(target);
-        let address = target.ip().to_string();
         let outcome = if i < last {
             match tokio::time::timeout(attempt_timeout, dialer.dial(target, opts.local.as_ref()))
                 .await
@@ -485,24 +618,38 @@ pub(crate) async fn connect_with<D: Dialer>(
     Err(ConnectError::Multi(errors))
 }
 
+/// The socket address `addr` is dialled at: its zone id, if it has one, read
+/// into the scope id ([`zone_scope_id`]).
+async fn dial_target<D: Dialer>(dialer: &D, addr: &PinAddr, port: u16) -> SocketAddr {
+    match (addr.ip, addr.zone.as_deref()) {
+        (IpAddr::V6(ip), Some(zone)) => {
+            let scope_id = zone_scope_id(dialer, ip, zone).await;
+            SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, 0, scope_id))
+        }
+        (ip, _) => SocketAddr::new(ip, port),
+    }
+}
+
 /// lib/net.js `lookupAndConnectMultiple`: the first address's family is group
 /// 0; each family keeps the first occurrence of an address; the result
 /// alternates g0[0], g1[0], g0[1], g1[1], ... and then runs out the longer
-/// group.
-fn interleave(resolved: &[SocketAddr]) -> Vec<SocketAddr> {
-    let Some(first) = resolved.first() else {
+/// group. An address is a duplicate when its text is (node keeps a `Set` of
+/// address strings), so one IP under two zone ids is two addresses.
+fn interleave(resolved: Vec<(SocketAddr, String)>) -> Vec<(SocketAddr, String)> {
+    let Some((first, _)) = resolved.first() else {
         return Vec::new();
     };
     let first_is_v4 = first.is_ipv4();
-    let (mut g0, mut g1): (Vec<SocketAddr>, Vec<SocketAddr>) = (Vec::new(), Vec::new());
-    for addr in resolved {
+    let mut g0: Vec<(SocketAddr, String)> = Vec::new();
+    let mut g1: Vec<(SocketAddr, String)> = Vec::new();
+    for (addr, address) in resolved {
         let group = if addr.is_ipv4() == first_is_v4 {
             &mut g0
         } else {
             &mut g1
         };
-        if !group.iter().any(|seen| seen.ip() == addr.ip()) {
-            group.push(*addr);
+        if !group.iter().any(|(_, seen)| *seen == address) {
+            group.push((addr, address));
         }
     }
     let mut order = Vec::with_capacity(g0.len() + g1.len());
@@ -1353,6 +1500,146 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_pin_address_takes_node_s_zone_id_grammar() {
+        // net.isIP on node v22.22.2: 6 for the zoned ones, 0 for the rest.
+        for (text, ip, zone) in [
+            ("fe80::1%lo0", "fe80::1", Some("lo0")),
+            ("fe80::1%eth0", "fe80::1", Some("eth0")),
+            ("fe80::1%1", "fe80::1", Some("1")),
+            ("::1%1", "::1", Some("1")),
+            ("::%x", "::", Some("x")),
+            ("::ffff:1.2.3.4%3", "::ffff:1.2.3.4", Some("3")),
+            ("fe80::1%a-b.c:d", "fe80::1", Some("a-b.c:d")),
+            ("127.0.0.1", "127.0.0.1", None),
+            ("::1", "::1", None),
+        ] {
+            let addr: PinAddr = text.parse().unwrap_or_else(|_| panic!("{text}"));
+            assert_eq!(addr.ip, ip.parse::<IpAddr>().unwrap(), "{text}");
+            assert_eq!(addr.zone.as_deref(), zone, "{text}");
+        }
+        for text in [
+            "fe80::1%",
+            "fe80::1%a%b",
+            "fe80::1%en 0",
+            "fe80::1%eth_0",
+            "fe80::1%a/b",
+            "fe80::1%\u{e9}",
+            "1.2.3.4%1",
+            "%1",
+            "nope",
+        ] {
+            assert!(text.parse::<PinAddr>().is_err(), "{text}");
+        }
+        // An error names the address by its IP's text and the zone as
+        // written.
+        assert_eq!(
+            "0:0::1%Eth0".parse::<PinAddr>().unwrap().to_string(),
+            "::1%Eth0"
+        );
+    }
+
+    #[test]
+    fn a_windows_zone_id_is_read_as_the_crt_s_atoi_does() {
+        for (zone, value) in [
+            ("1", 1),
+            ("12", 12),
+            ("lo0", 0),
+            ("3abc", 3),
+            ("-1", -1),
+            ("+7", 7),
+            (" 5", 5),
+            ("", 0),
+            ("-", 0),
+            ("99999999999", i32::MAX),
+            ("-99999999999", i32::MIN),
+        ] {
+            assert_eq!(c_atoi(zone), value, "{zone:?}");
+        }
+        // libuv stores the int in sin6_scope_id, an unsigned field.
+        assert_eq!(c_atoi("-1") as u32, u32::MAX);
+    }
+
+    #[test]
+    fn a_zone_that_is_not_one_path_component_names_no_interface() {
+        for zone in ["", ".", "..", "a/b"] {
+            assert_eq!(sysfs_ifindex(zone), None, "{zone:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_zoned_ip_literal_skips_dns_and_is_named_with_its_zone() {
+        // node v22.22.2 on Windows, nothing listening:
+        // net.connect({host: '::1%1', port}) -> `connect EADDRNOTAVAIL
+        // ::1%1:<port>`, address `::1%1`, no 'lookup'.
+        let script = Script::new(&["127.0.0.1"], &[]);
+        let Err(ConnectError::Single(error)) = connect_with("::1%1", 9, &opts(250), &script).await
+        else {
+            panic!("expected a plain error");
+        };
+        assert_eq!(error.message, "connect ECONNREFUSED ::1%1:9");
+        assert_eq!(error.address.as_deref(), Some("::1%1"));
+        assert_eq!(script.dialled(), ["::1"]);
+        if cfg!(windows) {
+            // libuv's atoi: the zone `1` is scope id 1, a name is 0.
+            let _ = connect_with("fe80::1%lo0", 9, &opts(250), &script).await;
+            let dialled = script.dialled.lock().unwrap().clone();
+            let scopes: Vec<u32> = dialled
+                .iter()
+                .map(|addr| match addr {
+                    SocketAddr::V6(v6) => v6.scope_id(),
+                    SocketAddr::V4(_) => panic!("{addr}"),
+                })
+                .collect();
+            assert_eq!(scopes, [1, 0]);
+            // The zone was read, not resolved.
+            assert!(script.lookups.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn a_zoned_pin_is_dialled_and_named_with_its_zone() {
+        // A `lookup` hook (or undici `connect.lookup`) answering zoned
+        // addresses: node names each attempt by the address as answered, and
+        // keeps one IP under two zones as two addresses.
+        let pinned = ConnectOptions {
+            pin: Some(Pin {
+                host: "zoned.test".to_string(),
+                addrs: vec![
+                    "fe80::1%1".parse().unwrap(),
+                    "fe80::1%2".parse().unwrap(),
+                    "fe80::1%1".parse().unwrap(),
+                ],
+            }),
+            ..opts(250)
+        };
+        let script = Script::new(&[], &[]);
+        let Err(ConnectError::Multi(errors)) =
+            connect_with("zoned.test", 9, &pinned, &script).await
+        else {
+            panic!("expected an aggregate");
+        };
+        let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            [
+                "connect ECONNREFUSED fe80::1%1:9",
+                "connect ECONNREFUSED fe80::1%2:9"
+            ]
+        );
+        if cfg!(windows) {
+            let dialled = script.dialled.lock().unwrap().clone();
+            let scopes: Vec<u32> = dialled
+                .iter()
+                .filter_map(|addr| match addr {
+                    SocketAddr::V6(v6) => Some(v6.scope_id()),
+                    SocketAddr::V4(_) => None,
+                })
+                .collect();
+            assert_eq!(scopes, [1, 2]);
+        }
+    }
+
     #[tokio::test]
     async fn port_zero_has_no_port_and_a_synchronous_failure_names_the_local_end() {
         // Measured on node (Windows): net.connect({host:'127.0.0.1', port:0})
@@ -1803,7 +2090,13 @@ mod tests {
         // Case-insensitive, and the pin carries the connect's spelling.
         let pin = redeem_answer(&answers, 7, "GUARD.test").expect("redeems");
         assert_eq!(pin.host, "guard.test");
-        assert_eq!(pin.addrs, addrs);
+        assert_eq!(
+            pin.addrs,
+            addrs
+                .iter()
+                .map(|ip| PinAddr::from(*ip))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(pending_answers(&answers), 0);
         // One-shot.
         let again = redeem_answer(&answers, 7, "guard.test").unwrap_err();
