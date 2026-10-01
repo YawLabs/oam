@@ -349,7 +349,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpBridgeStart", op_http_bridge_start),
         ("httpBridgeResponse", op_http_bridge_response),
         ("httpBridgeOut", op_http_bridge_out),
-        ("httpBridgeRequestSent", op_http_bridge_request_sent),
+        ("httpBridgeProgress", op_http_bridge_progress),
         ("httpBridgeIn", op_http_bridge_in),
         ("httpBridgeInEnd", op_http_bridge_in_end),
         ("httpBridgeClose", op_http_bridge_close),
@@ -3786,9 +3786,10 @@ fn op_http_bridge_response(
 }
 
 /// `__oam.node.httpBridgeOut(id)`: the next request bytes for the socket,
-/// or undefined at the end. Unref'd: it waits on hyper, which may never
-/// write again (a response whose body nobody reads), and the socket's own
-/// read is what keeps a live connection's process running, as in node.
+/// or undefined at the end; no bytes at all when only `httpBridgeProgress`
+/// has moved. Unref'd: it waits on hyper, which may never write again (a
+/// response whose body nobody reads), and the socket's own read is what
+/// keeps a live connection's process running, as in node.
 fn op_http_bridge_out(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -3803,22 +3804,31 @@ fn op_http_bridge_out(
     );
 }
 
-/// `__oam.node.httpBridgeRequestSent(id)`: once hyper has written the whole
-/// request, how many of the `httpBridgeOut` bytes it took (node's `'finish'`
-/// follows the socket's write of the last of them); undefined if the
-/// exchange ends first. Unref'd, as httpBridgeOut: it waits on hyper.
-fn op_http_bridge_request_sent(
+/// `__oam.node.httpBridgeProgress(id) -> [written, body, complete]`: of the
+/// bytes `httpBridgeOut` hands over, how many hyper had written at its last
+/// flush, how far into the request body those reach, and whether they are
+/// the whole request (node's `write()` callbacks and `'finish'` follow the
+/// socket's write of them). Undefined for an exchange that is gone.
+/// Synchronous: the answer is read when it is needed, not delivered.
+fn op_http_bridge_progress(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    if id < 0.0 {
+        return;
+    }
     let bridges = core_runtime!(scope).http_bridges();
-    crate::ops::spawn_op_unref(
-        scope,
-        &mut rv,
-        oam_core::http_client::bridge::request_sent(bridges, id),
-    );
+    let Some(progress) = oam_core::http_client::bridge::progress(&bridges, id as u64) else {
+        return;
+    };
+    let written = v8::Number::new(scope, progress.written as f64);
+    let body = v8::Number::new(scope, progress.body as f64);
+    let complete = v8::Boolean::new(scope, progress.complete);
+    let array =
+        v8::Array::new_with_elements(scope, &[written.into(), body.into(), complete.into()]);
+    rv.set(array.into());
 }
 
 /// `__oam.node.httpBridgeIn(id, bytes)`: response bytes the socket read.

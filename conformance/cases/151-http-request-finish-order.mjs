@@ -9,6 +9,17 @@
 // transport (no agent socket) it still follows end() at once, as node's does
 // for a socket that is already connected.
 //
+// A write() callback keeps the same company (second half): it is called
+// once the socket has written its chunk -- after 'connect' /
+// 'secureConnect', in order, ahead of 'finish' -- and with the socket's
+// reason when the chunk was never written: after 'close' for a socket that
+// closed before it connected, and not at all for a request destroyed before
+// it had a socket. oam used to call it as soon as the request had taken the
+// chunk, before the socket existed, and with no error on a connection that
+// was then refused. And a request destroyed from its socket's own 'connect'
+// / 'secureConnect' listener (a guard vetting the peer) still gets 'finish',
+// behind the failed writes node had queued for that event; oam emitted none.
+//
 // Only the order of events is printed.
 import http from "node:http";
 import https from "node:https";
@@ -240,6 +251,181 @@ await run("destroyed on 'socket'", http, { ...base, agent: new http.Agent() }, (
   });
   up.close();
   console.log(`upgrade: ${events.join(", ")}`);
+}
+
+// write() callbacks, and a request destroyed as its socket connects.
+async function writes(label, mod, options, drive) {
+  const events = [];
+  // `quiet`: the error's code depends on the platform (node reports what
+  // the TLS stream's failed write returned).
+  const cb = (name, quiet) => function (err) {
+    const how = err ? ` ${quiet ? "an error" : err.code}` : ` ${err === null ? "null" : typeof err}`;
+    events.push(`write(${name}) callback${arguments.length === 0 ? "" : how}`);
+  };
+  const req = mod.request({ method: "POST", ...options });
+  req.on("socket", (s) => {
+    events.push("socket");
+    s.on("connect", () => events.push("connect"));
+    s.on("secureConnect", () => events.push("secureConnect"));
+  });
+  req.on("finish", () => events.push(`finish finished=${req.writableFinished}`));
+  req.on("close", () => events.push("close"));
+  await new Promise((resolve) => {
+    req.on("response", (res) => {
+      events.push("response");
+      res.resume();
+      res.on("end", resolve);
+    });
+    // The callbacks of writes that were never made follow 'close'.
+    req.on("error", (e) => {
+      events.push(`error ${e.code}`);
+      setTimeout(resolve, 100);
+    });
+    drive(req, events, cb);
+  });
+  await sleep(30);
+  console.log(`${label}: ${events.join(", ")}`);
+}
+
+const oneChunk = (req, events, cb) => {
+  req.write("hello", cb("hello"));
+  req.end();
+};
+const chunks = (req, events, cb) => {
+  req.write("one", cb("one"));
+  req.write("two", "utf8", cb("two"));
+  req.end("three", cb("end"));
+};
+// A chunk written from the socket's 'connect', behind one written before.
+const onConnect = (req, events, cb) => {
+  req.write("a", cb("a"));
+  req.on("socket", (s) => s.on("connect", () => {
+    req.write("b", cb("b"));
+    req.end();
+  }));
+};
+// Each chunk written a turn of the loop after the last one's callback (a
+// streamer that waits for each chunk before producing the next).
+const overTime = (req, events, cb) => {
+  const report = (name, next) => {
+    const told = cb(name);
+    return function (err) {
+      told.apply(this, arguments);
+      setImmediate(next);
+    };
+  };
+  req.write("a", report("a", () => {
+    events.push("later 1");
+    req.write("b", report("b", () => {
+      events.push("later 2");
+      req.end("c", cb("end"));
+    }));
+  }));
+};
+const withLength = (req, events, cb) => {
+  req.setHeader("content-length", 5);
+  req.write("he", cb("he"));
+  req.write("llo", cb("llo"));
+  req.end();
+};
+// Destroyed from a listener on the socket: `how` does it.
+const destroyedOn = (event, how, quiet) => (req, events, cb) => {
+  req.write("a", cb("a", quiet));
+  req.write("b", cb("b", quiet));
+  req.on("socket", (s) => s.on(event, () => {
+    events.push(how.name);
+    how(req, s);
+  }));
+  req.end(cb("end"));
+};
+const destroy = (req) => req.destroy();
+const abort = (req) => req.abort();
+const destroyWith = (req) => req.destroy(Object.assign(new Error("vetoed"), { code: "E_VETOED" }));
+const socketDestroy = (req, s) => s.destroy();
+
+const wbase = { host: "127.0.0.1", port: P, path: "/" };
+await writes("write callback, one chunk", http, { ...wbase, agent: new WrappingAgent() }, oneChunk);
+await writes("write callback, three chunks", http, { ...wbase, agent: new WrappingAgent() }, chunks);
+await writes("write callback, a chunk written on 'connect'", http, { ...wbase, agent: new WrappingAgent() }, onConnect);
+await writes("write callback, chunks over time", http, { ...wbase, agent: new WrappingAgent() }, overTime);
+await writes("write callback, content-length", http, { ...wbase, agent: new WrappingAgent() }, withLength);
+await writes("write callback, an empty chunk", http, { ...wbase, agent: new WrappingAgent() }, (req, events, cb) => {
+  req.write("", cb("empty"));
+  req.end();
+});
+await writes("write callback, watched socket", http, { ...wbase, agent: new http.Agent() }, chunks);
+await writes("write callback, https one chunk", https, { ...tbase, agent: new WrappingHttpsAgent() }, oneChunk);
+await writes("write callback, https three chunks", https, { ...tbase, agent: new WrappingHttpsAgent() }, chunks);
+await writes("write callback, https chunks over time", https, { ...tbase, agent: new WrappingHttpsAgent() }, overTime);
+{
+  const pool = new WrappingAgent({ keepAlive: true });
+  await writes("write callback, keep-alive first", http, { ...wbase, agent: pool }, oneChunk);
+  await writes("write callback, keep-alive reused", http, { ...wbase, agent: pool }, chunks);
+  await writes("write callback, keep-alive reused, over time", http, { ...wbase, agent: pool }, overTime);
+  pool.destroy();
+}
+await writes("write callback, refused", http, { ...wbase, port: CLOSED, agent: new WrappingAgent() }, oneChunk);
+await writes("write callback, refused, three chunks", http, { ...wbase, port: CLOSED, agent: new WrappingAgent() }, chunks);
+await writes("write callback, refused, one written on 'socket'", http, { ...wbase, port: CLOSED, agent: new WrappingAgent() }, (req, events, cb) => {
+  req.write("a", cb("a"));
+  req.on("socket", () => req.write("b", cb("b")));
+});
+// Destroyed in 'socket', the request never reaches its socket: no callback.
+// A tick later node has queued its writes there, and they fail with it.
+const beforeConnect = (later) => (req, events, cb) => {
+  req.write("a", cb("a"));
+  req.write("b", cb("b"));
+  req.on("socket", () => {
+    if (!later) {
+      events.push("destroy");
+      req.destroy();
+      return;
+    }
+    process.nextTick(() => {
+      events.push("destroy");
+      req.destroy();
+    });
+  });
+  req.end(cb("end"));
+};
+await writes("write callback, destroyed on 'socket'", http, { ...wbase, agent: new WrappingAgent() }, beforeConnect(false));
+await writes("write callback, destroyed a tick after 'socket'", http, { ...wbase, agent: new WrappingAgent() }, beforeConnect(true));
+await writes("write callback, destroyed at once", http, { ...wbase, agent: new WrappingAgent() }, (req, events, cb) => {
+  req.write("a", cb("a"));
+  req.end();
+  req.destroy();
+});
+await writes("destroyed on 'connect'", http, { ...wbase, agent: new WrappingAgent() }, destroyedOn("connect", destroy));
+await writes("destroyed on 'connect', GET", http, { ...wbase, method: "GET", agent: new WrappingAgent() }, (req, events, cb) => {
+  req.on("socket", (s) => s.on("connect", () => {
+    events.push("destroy");
+    req.destroy();
+  }));
+  req.end(cb("end"));
+});
+await writes("destroyed on 'connect', not ended", http, { ...wbase, agent: new WrappingAgent() }, (req, events, cb) => {
+  req.write("a", cb("a"));
+  req.on("socket", (s) => s.on("connect", () => {
+    events.push("destroy");
+    req.destroy();
+  }));
+});
+await writes("destroyed on 'connect', watched socket", http, { ...wbase, agent: new http.Agent() }, destroyedOn("connect", destroy));
+await writes("aborted on 'connect'", http, { ...wbase, agent: new WrappingAgent() }, destroyedOn("connect", abort));
+await writes("destroyed with an error on 'connect'", http, { ...wbase, agent: new WrappingAgent() }, destroyedOn("connect", destroyWith));
+await writes("socket destroyed on 'connect'", http, { ...wbase, agent: new WrappingAgent() }, destroyedOn("connect", socketDestroy));
+await writes("https destroyed on 'connect'", https, { ...tbase, agent: new WrappingHttpsAgent() }, destroyedOn("connect", destroy));
+await writes("https destroyed on 'secureConnect'", https, { ...tbase, agent: new WrappingHttpsAgent() }, destroyedOn("secureConnect", destroy, true));
+await writes("https socket destroyed on 'secureConnect'", https, { ...tbase, agent: new WrappingHttpsAgent() }, destroyedOn("secureConnect", socketDestroy, true));
+// A write to a destroyed request: refused, and its callback told why.
+{
+  const req = http.request({ ...wbase, method: "POST", agent: new WrappingAgent() });
+  req.on("error", () => {});
+  req.destroy();
+  const told = await new Promise((resolve) => {
+    const taken = req.write("late", (err) => resolve(`returned ${taken}, callback ${err && err.code}`));
+  });
+  console.log(`write to a destroyed request: ${told}`);
 }
 
 // got's http-timer: the request phase is 'finish' time minus 'connect' time,

@@ -6787,6 +6787,78 @@ watch.unref();
     assert_eq!(out, "connections=1 reused=false,true,true");
 }
 
+/// The same hand-back for requests with bodies, many in a row: how many bytes
+/// a request is, which the gate above compares against what the socket has
+/// taken, is read off the exchange when the response ends -- not delivered by
+/// an op of its own, whose completion could arrive after the response's
+/// (#190). Buffered and streamed bodies, each acknowledged a turn late, on one
+/// connection throughout; node v22.22.2 prints the line asserted here. The
+/// lost race itself cannot be staged from a script: what pins the count being
+/// there in time is `progress_is_complete_by_the_time_the_response_head_arrives`
+/// (oam_core's http_client_bridge tests); this holds the path end to end.
+#[test]
+fn a_late_write_acknowledgement_pools_the_socket_for_requests_with_bodies() {
+    let src = r#"
+import http from 'node:http';
+import net from 'node:net';
+const server = http.createServer((req, res) => {
+  let n = 0;
+  req.on('data', (d) => { n += d.length; });
+  req.on('end', () => res.end(String(n)));
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+let connections = 0;
+server.on('connection', () => { connections++; });
+class LateAck extends net.Socket {
+  write(chunk, encoding, cb) {
+    if (typeof encoding === 'function') { cb = encoding; encoding = undefined; }
+    return super.write(chunk, encoding, (err) => {
+      if (cb) setTimeout(() => cb(err), 20);
+    });
+  }
+}
+class OwnAgent extends http.Agent {
+  createConnection(options, cb) {
+    const s = new LateAck();
+    s.connect(options, cb);
+    return s;
+  }
+}
+const agent = new OwnAgent({ keepAlive: true });
+let reused = 0;
+const sizes = [];
+for (let i = 0; i < 24; i++) {
+  await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, agent, method: 'POST' }, (res) => {
+      let body = '';
+      res.on('data', (d) => { body += d; });
+      res.on('end', () => { sizes.push(body); resolve(); });
+    });
+    req.on('response', () => { if (req.reusedSocket) reused++; });
+    req.on('error', reject);
+    if (i % 2 === 0) {
+      req.end('x'.repeat(i + 1));
+    } else {
+      // Streamed: the second chunk goes out a turn after the first.
+      req.write('ab');
+      setImmediate(() => req.end('c'.repeat(i)));
+    }
+  });
+}
+console.log(`connections=${connections} reused=${reused} sizes=${sizes.slice(0, 4)}`);
+agent.destroy();
+server.close();
+const watch = setTimeout(() => {
+  console.log('the run did not end on its own');
+  process.exit(3);
+}, 10000);
+watch.unref();
+"#;
+    let out = run_ok("late_write_ack_pool_bodies.mjs", src);
+    assert_eq!(out, "connections=1 reused=23 sizes=1,3,3,5");
+}
+
 /// An http.get on oam's own transport is sent without waiting on a timer,
 /// and setImmediate is due at once. Each used to cost a whole OS timer tick
 /// (about 15 ms on Windows, 1 ms elsewhere): setImmediate was a 1 ms timer,

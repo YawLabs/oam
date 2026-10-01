@@ -2070,11 +2070,22 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
 - **`'finish'`.** As in Node, it follows the socket's write of the last request byte, so it
   comes after `'connect'` / `'secureConnect'`, `req.writableFinished` is `false` until
   then, and a request whose socket refused or that was destroyed before it was written
-  gets none (`conformance/cases/151-http-request-finish-order.mjs`). What differs: a
-  `write()` callback runs once the request has taken the chunk, before the socket has
-  connected, where Node's waits for the socket to write it; and a request destroyed from
-  its socket's own `'connect'` / `'secureConnect'` listener gets no `'finish'`, where
-  Node's still reports one from the write it had queued for the connect.
+  gets none (`conformance/cases/151-http-request-finish-order.mjs`). A `write()` callback
+  keeps the same company: called with `null` once the socket has written its chunk, in
+  order and ahead of `'finish'`; with the socket's reason after `'close'` when the chunk
+  was never written (`ERR_SOCKET_CLOSED_BEFORE_CONNECTION` on a refused connection); and
+  not at all for a request destroyed before it had a socket. A request destroyed from its
+  socket's own `'connect'` / `'secureConnect'` listener has its queued writes failed and
+  still gets `'finish'`, as Node's does (same case). Up to 0.17.1 a callback ran as soon
+  as the request had taken the chunk, and that request got no `'finish'`. What differs:
+  the request reaches its socket a turn or two of the loop after `'connect'` (it goes
+  through hyper), where Node writes it inside the event, so a request destroyed in that
+  gap -- on the first immediate after `'connect'`, or a tick after `'socket'` on a reused
+  keep-alive socket -- has its callbacks failed (`ERR_STREAM_DESTROYED`, after `'close'`)
+  and no `'finish'`, where Node had already written it; a write failed by a destroy
+  inside `'secureConnect'` reports `ERR_SOCKET_CLOSED` where Node reports what the TLS
+  stream's write returned (`EBADF` on Windows); and `write()` returns `true` whatever the
+  socket has buffered, so a large upload emits no `'drain'`.
 - **Sockets.** A `'connect'` listener on a TLS socket runs after the handshake, since oam's
   native connect does both (entry 34); a listener that destroys the socket there still
   stops the request before it is written. oam's `net.Socket` emits `'error'` and `'close'`
