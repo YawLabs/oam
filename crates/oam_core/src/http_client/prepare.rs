@@ -42,10 +42,10 @@ use percent_encoding::percent_decode_str;
 /// parses the suffix (node_compat.js keys on "error sending request" only).
 pub const BUILDER_ERROR: &str = "builder error";
 
-/// `accept-encoding` as oam has always advertised it. Node's fetch sends
-/// `gzip, deflate` over http and `br, gzip, deflate` over https (undici
-/// fetch/index.js:1517-1522); matching that is a separate decision from owning
-/// the transport, so the value on the wire does not move here.
+/// `accept-encoding` as oam has always advertised it, for a request that
+/// names none. `fetch` names its own -- undici's `gzip, deflate` over http and
+/// `br, gzip, deflate` over https (fetch/index.js:1517-1522, #178) -- in
+/// bootstrap.js, so this default reaches only the callers that are not fetch.
 pub const DEFAULT_ACCEPT_ENCODING: &str = "gzip,deflate";
 
 /// A request ready for the transport.
@@ -138,11 +138,13 @@ pub fn prepare(
     }
     for (name, value) in user_headers {
         // `HeaderName::from_bytes` lower-cases; `HeaderValue::from_bytes`
-        // admits HTAB, visible ASCII and obs-text (0x80-0xFF) -- the same
-        // `TryFrom<&String>` conversions reqwest's `RequestBuilder::header`
-        // ran.
+        // admits HTAB, visible ASCII and obs-text (0x80-0xFF). The value is
+        // written one byte per code point, as node writes it (#174): `café`
+        // goes out as the four bytes `caf` 0xE9, not as its UTF-8. JS refuses
+        // a code point above U+00FF before it gets here, as node does; one
+        // that arrives anyway is a builder error, never its UTF-8.
         let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| PrepareError::Builder)?;
-        let value = HeaderValue::from_bytes(value.as_bytes()).map_err(|_| PrepareError::Builder)?;
+        let value = crate::http_head::latin1_header_value(value).ok_or(PrepareError::Builder)?;
         headers.try_append(name, value).map_err(too_many)?;
     }
     if default_headers {

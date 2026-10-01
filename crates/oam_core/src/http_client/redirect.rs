@@ -48,6 +48,11 @@ pub const BAD_PORT: &str = "bad port";
 /// is `makeNetworkError('unexpected redirect')`, Location or not.
 pub const UNEXPECTED_REDIRECT: &str = "unexpected redirect";
 
+/// fetch/index.js:1273-1279: a redirect (not a 303) of a request whose body
+/// is a stream is `makeNetworkError()`, whose cause is an `Error` with no
+/// message -- node's `cause.message` is "" (measured on node v22.22.2).
+pub const UNREPLAYABLE_BODY: &str = "";
+
 /// What to do with a response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Next {
@@ -64,10 +69,11 @@ pub enum Next {
         method: http::Method,
         drop_body: bool,
     },
-    /// The next request must resend a body that cannot be replayed (a
-    /// streamed upload): the 3xx is returned as the response. undici fails
-    /// here instead (fetch/index.js:1273-1279); oam keeps reqwest's behaviour
-    /// until #149/#148 (design-143 decision, section 0).
+    /// The response is a redirect other than a 303 to a request whose body
+    /// was streamed, which cannot be sent again. `fetch` fails with
+    /// [`UNREPLAYABLE_BODY`] (fetch/index.js:1273-1279: a 301/302 that would
+    /// rewrite a POST to GET fails too, measured on node v22.22.2); the
+    /// callers that are not fetch get the 3xx as the response.
     ReturnResponse,
     /// A network error with this message as the cause.
     Fail(&'static str),
@@ -135,6 +141,12 @@ pub fn next(
     // with an empty one -- `URL.hash` is "" for both) takes the current URL's.
     if target.fragment().is_none_or(str::is_empty) {
         target.set_fragment(current.fragment().filter(|f| !f.is_empty()));
+    }
+    // fetch/index.js:1273-1279, before the rewrite and before the next hop's
+    // bad-port check: only a 303 lets a streamed body go -- a 301 or 302
+    // that would turn a POST into a body-less GET still refuses.
+    if status != 303 && !body_replayable {
+        return Next::ReturnResponse;
     }
     // fetch/index.js:1297-1305: only these two cases turn the request into a
     // body-less GET. A 303 answering GET or HEAD keeps its method and

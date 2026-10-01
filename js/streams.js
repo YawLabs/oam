@@ -41,6 +41,11 @@
       this._queueSizes = [];
       this._queueTotalSize = 0;
       this._cancelled = false;
+      // Has anything been read from, or cancelled on, this stream? A fetch
+      // body asks (js/bootstrap.js): a disturbed stream cannot be a body, and
+      // a body whose stream was read is `bodyUsed`. Never reset -- releasing
+      // the reader does not un-read the chunks.
+      this._disturbed = false;
 
       const stream = this;
       this._controller = {
@@ -157,6 +162,7 @@
           if (stream._reader !== reader) {
             return Promise.reject(new TypeError("reader has been released"));
           }
+          stream._disturbed = true;
           if (stream._queue.length > 0) {
             const value = stream._queue.shift();
             stream._queueTotalSize -= stream._queueSizes.shift();
@@ -191,6 +197,7 @@
     }
 
     _cancelInternal(reason) {
+      this._disturbed = true;
       if (this._state === "errored") return Promise.reject(this._error);
       if (this._cancelled || this._state === "closed") return Promise.resolve();
       this._cancelled = true;

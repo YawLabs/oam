@@ -385,27 +385,43 @@
   // `set-cookie` is the one name the standard never combines: a cookie's
   // `Expires` attribute contains a comma, so `a=1, b=2` cannot be split back
   // into the two lines the server sent, and cookie-handling code was silently
-  // reading one broken cookie where node gives it two. Every other name still
-  // combines in place, so iteration order is unchanged for them: wire order,
-  // which is what `oam.serve` writes back out. (The standard also sorts
-  // iteration by name and node does; oam does not -- see
-  // docs/node-divergences.md.)
+  // reading one broken cookie where node gives it two. Every other name
+  // combines in place. The list keeps the order the names arrived in (wire
+  // order, or the order a handler set them), which is what `oam.serve`
+  // writes back out and what a fetch sends; ITERATION is sorted by name, as
+  // the standard's "sort and combine" says and node does (#175), so every
+  // script that walks a Headers sees node's order.
   class Headers {
     constructor(init) {
       /** @type {Array<[string, string]>} */
       this._list = [];
+      // The sorted view iteration reads, rebuilt after a change.
+      this._sorted = null;
       if (init === undefined || init === null) return;
       if (init instanceof Headers) {
-        for (const [k, v] of init) this.append(k, v);
+        // The stored list, in its order: iterating would sort it, and a
+        // Response built from a handler's Headers must reach the wire in the
+        // order the handler set them. Nothing a script can iterate differs.
+        for (const [k, v] of init._list) this._append(k, v);
       } else if (typeof init[Symbol.iterator] === "function" && typeof init !== "string") {
         for (const pair of init) this.append(pair[0], pair[1]);
       } else {
         for (const key of Object.keys(init)) this.append(key, init[key]);
       }
     }
+    // A name and a value are ByteStrings, as webidl makes them in node: a
+    // code unit above 0xFF is refused with node's TypeError (#174), since
+    // the wire carries one byte per code point. `_append` is the unchecked
+    // entry for lists oam built itself (a fetched response's latin1 head,
+    // oam.serve's request head, a copy of another Headers).
     append(name, value) {
+      const [key, text] = headerEntry("append", name, value);
+      this._append(key, text);
+    }
+    _append(name, value) {
       const key = String(name).toLowerCase();
       const text = String(value);
+      this._sorted = null;
       if (key === "set-cookie") {
         this._list.push([key, text]);
         return;
@@ -415,8 +431,9 @@
       else entry[1] = `${entry[1]}, ${text}`;
     }
     set(name, value) {
-      const key = String(name).toLowerCase();
-      const text = String(value);
+      let [key, text] = headerEntry("set", name, value);
+      key = key.toLowerCase();
+      this._sorted = null;
       const at = this._list.findIndex((e) => e[0] === key);
       if (at < 0) {
         this._list.push([key, text]);
@@ -443,61 +460,419 @@
     }
     delete(name) {
       const key = String(name).toLowerCase();
+      this._sorted = null;
       this._list = this._list.filter((e) => e[0] !== key);
     }
+    // The list sorted by name, set-cookie lines kept apart in the order they
+    // came (a stable sort of the stored list does both).
+    _sortedList() {
+      this._sorted ??= this._list.slice().sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+      return this._sorted;
+    }
+    // Live, as webidl's iterable is in node: each step reads the sorted list
+    // as it is now, so a name added or removed mid-walk is seen.
     forEach(fn, thisArg) {
-      for (const [key, value] of this._list.slice()) fn.call(thisArg, value, key, this);
+      for (let i = 0; i < this._sortedList().length; i++) {
+        const [key, value] = this._sortedList()[i];
+        fn.call(thisArg, value, key, this);
+      }
     }
-    *entries() {
-      for (const [key, value] of this._list.slice()) yield [key, value];
+    entries() {
+      return headersIterator(this, "key+value");
     }
-    *keys() {
-      for (const [key] of this._list.slice()) yield key;
+    keys() {
+      return headersIterator(this, "key");
     }
-    *values() {
-      for (const [, value] of this._list.slice()) yield value;
+    values() {
+      return headersIterator(this, "value");
     }
     [Symbol.iterator]() {
-      return this.entries();
+      return headersIterator(this, "key+value");
     }
   }
+  Object.defineProperty(Headers.prototype, Symbol.iterator, { enumerable: false });
   brand(Headers, "Headers");
   globalThis.Headers = Headers;
 
+  // undici's Headers.append / set: name and value as ByteStrings, the value
+  // stripped of leading and trailing HTTP whitespace, then a name that is not
+  // a token or a value holding NUL, CR or LF refused with undici's texts
+  // (measured on node v22.22.2).
+  const HEADER_NAME_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+  function headerEntry(method, name, value) {
+    const key = toByteString(name);
+    const text = toByteString(value).replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
+    if (!HEADER_NAME_TOKEN.test(key)) {
+      throw new TypeError(`Headers.${method}: "${key}" is an invalid header name.`);
+    }
+    if (/[\0\r\n]/.test(text)) {
+      throw new TypeError(`Headers.${method}: "${text}" is an invalid header value.`);
+    }
+    return [key, text];
+  }
+
+  // node's `Headers Iterator`: an index into the sorted list, read afresh on
+  // every next().
+  const HeadersIteratorPrototype = Object.create(
+    Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())),
+    {
+      next: {
+        value: function next() {
+          const state = headersIterators.get(this);
+          if (state === undefined) throw new TypeError("Illegal invocation");
+          const list = state.target._sortedList();
+          if (state.index >= list.length) return { value: undefined, done: true };
+          const [key, value] = list[state.index++];
+          const out = state.kind === "key" ? key : state.kind === "value" ? value : [key, value];
+          return { value: out, done: false };
+        },
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      },
+      [Symbol.toStringTag]: { value: "Headers Iterator", configurable: true },
+    },
+  );
+  const headersIterators = new WeakMap();
+  function headersIterator(target, kind) {
+    const iterator = Object.create(HeadersIteratorPrototype);
+    headersIterators.set(iterator, { target, kind, index: 0 });
+    return iterator;
+  }
+
+  // ------------------------------------------------------------------ bodies
+  // The Fetch Standard's "extract a body", once, for `fetch`, `Request` and
+  // `Response`. Each of them used to handle a string and bytes and hand
+  // everything else to `String()`, so a Blob or a FormData went out as its
+  // `[object ...]` name, a URLSearchParams as text/plain, and
+  // `new Response(blob).text()` threw (#154).
+  //
+  // A body is `{ bytes, stream, type, kind, used }`: `bytes` when the whole
+  // of it is known up front (everything but a stream), `stream` when it is
+  // the caller's ReadableStream -- or, later, the stream `.body` made from
+  // the bytes, which from then on IS the body. `type` is the content-type
+  // the source implies, null when it implies none.
+  //
+  // `copy`: Request and Response keep the body, so a caller's buffer is
+  // copied, as the standard says (measured: mutating the array after
+  // `new Response(u8)` does not change `text()`). `fetch` encodes it before
+  // it returns, and skips the copy.
+  function extractBody(object, copy) {
+    const state = { bytes: null, stream: null, type: null, kind: "bytes", used: false };
+    const Stream = globalThis.ReadableStream;
+    if (object instanceof Stream) {
+      state.kind = "stream";
+      state.stream = object;
+    } else if (object instanceof globalThis.Blob) {
+      state.kind = "blob";
+      if (object.type !== "") state.type = object.type;
+      // oam's own Blob holds its bytes, and they never change. Anything else
+      // that passes for one is read through its stream.
+      if (object._bytes instanceof Uint8Array) state.bytes = object._bytes;
+      else {
+        state.stream = object.stream();
+        // What fetch sends as its content-length, as undici does.
+        state.size = object.size;
+      }
+    } else if (object instanceof ArrayBuffer || ArrayBuffer.isView(object)) {
+      const view =
+        object instanceof ArrayBuffer
+          ? new Uint8Array(object)
+          : new Uint8Array(object.buffer, object.byteOffset, object.byteLength);
+      state.bytes = copy ? view.slice() : view;
+    } else if (object instanceof globalThis.FormData) {
+      state.kind = "formdata";
+      const boundary = multipartBoundary();
+      state.bytes = multipartBytes(object, boundary);
+      state.type = `multipart/form-data; boundary=${boundary}`;
+    } else if (
+      typeof globalThis.URLSearchParams === "function" &&
+      object instanceof globalThis.URLSearchParams
+    ) {
+      state.kind = "params";
+      state.bytes = new TextEncoder().encode(object.toString());
+      state.type = "application/x-www-form-urlencoded;charset=UTF-8";
+    } else if (
+      object !== null &&
+      typeof object === "object" &&
+      typeof object[Symbol.asyncIterator] === "function"
+    ) {
+      // undici takes any async iterable as a streamed body (measured: an
+      // async generator goes out chunked), which is also how a node Readable
+      // is sent.
+      state.kind = "stream";
+      state.stream = Stream.from(object);
+    } else {
+      // A string, and anything else through String(): a USVString, so a lone
+      // surrogate becomes U+FFFD, which is also what encoding it would do.
+      state.kind = "string";
+      // `text` lets fetch hand the transport the string as it is.
+      state.text = wellFormed(object);
+      state.bytes = new TextEncoder().encode(state.text);
+      state.type = "text/plain;charset=UTF-8";
+    }
+    if (state.stream !== null && (state.stream.locked || state.stream._disturbed === true)) {
+      // node's text for a Request body too.
+      throw new TypeError("Response body object should not be disturbed or locked");
+    }
+    return state;
+  }
+
+  // The multipart/form-data encoding of a FormData, as undici writes it
+  // (measured on node v22.22.2, byte for byte apart from the boundary):
+  // line breaks in a name or a string value become CRLF; CR, LF and `"` in a
+  // name or a filename are percent-escaped; a file part always carries a
+  // Content-Type, `application/octet-stream` when the file has none.
+  function multipartBoundary() {
+    const digits = String(Math.floor(Math.random() * 1e11)).padStart(11, "0");
+    return `----formdata-oam-0${digits}`;
+  }
+
+  function multipartBytes(form, boundary) {
+    const encoder = new TextEncoder();
+    const crlf = (text) => text.replace(/\r?\n|\r/g, "\r\n");
+    const escape = (text) =>
+      text.replace(/\n/g, "%0A").replace(/\r/g, "%0D").replace(/"/g, "%22");
+    const parts = [];
+    for (const [name, value] of form) {
+      const head = `--${boundary}\r\nContent-Disposition: form-data; name="${escape(crlf(name))}"`;
+      if (typeof value === "string") {
+        parts.push(encoder.encode(`${head}\r\n\r\n${crlf(value)}\r\n`));
+      } else {
+        const filename = value.name ? `; filename="${escape(value.name)}"` : "";
+        const type = value.type || "application/octet-stream";
+        parts.push(encoder.encode(`${head}${filename}\r\nContent-Type: ${type}\r\n\r\n`));
+        parts.push(value._bytes);
+        parts.push(encoder.encode("\r\n"));
+      }
+    }
+    parts.push(encoder.encode(`--${boundary}--\r\n`));
+    return concatBytes(parts);
+  }
+
+  function concatBytes(chunks) {
+    let total = 0;
+    for (const chunk of chunks) total += chunk.length;
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      out.set(chunk, offset);
+      offset += chunk.length;
+    }
+    return out;
+  }
+
+  // The body of each Request and Response a script constructs: a state as
+  // above, or null for no body. Kept off the object, so `Object.keys` and
+  // `JSON.stringify` never see the payload.
+  const bodyStates = new WeakMap();
+
+  // Extract `object` as `owner`'s body, and give `headers` the content-type
+  // it implies unless the caller set one.
+  function initBody(owner, object, headers) {
+    const state = object === null || object === undefined ? null : extractBody(object, true);
+    bodyStates.set(owner, state);
+    if (state !== null && state.type !== null && !headers.has("content-type")) {
+      headers.set("content-type", state.type);
+    }
+    return state;
+  }
+
+  // Already read, or being read by someone else.
+  function bodyUnusable(state) {
+    return (
+      state.used ||
+      (state.stream !== null && (state.stream.locked || state.stream._disturbed === true))
+    );
+  }
+
+  // `.body`: the caller's stream, or one made over the bytes on first ask.
+  function bodyStreamOf(state) {
+    if (state.stream === null) {
+      const bytes = state.used ? null : state.bytes;
+      state.stream = new globalThis.ReadableStream({
+        start(controller) {
+          if (bytes !== null && bytes.length > 0) controller.enqueue(bytes);
+          controller.close();
+        },
+      });
+      // Already read through text() and friends: what is left is a stream
+      // nobody can read, as node's is (it stays locked to the reader that
+      // drained it).
+      if (state.used) state.stream.getReader();
+    }
+    return state.stream;
+  }
+
+  // Read the whole body, once. A second read, or a read of a body whose
+  // stream somebody else holds or has read from, is node's TypeError.
+  async function consumeBody(owner) {
+    const state = bodyStates.get(owner);
+    if (state === null || state === undefined) return new Uint8Array(0);
+    if (bodyUnusable(state)) {
+      throw new TypeError("Body is unusable: Body has already been read");
+    }
+    if (state.stream === null) {
+      state.used = true;
+      return state.bytes;
+    }
+    // The reader is kept: a consumed body's stream stays locked, as node's.
+    const reader = state.stream.getReader();
+    const chunks = [];
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (!(value instanceof Uint8Array)) throw new TypeError("Received non-Uint8Array chunk");
+      chunks.push(value);
+    }
+    return concatBytes(chunks);
+  }
+
+  // A second body with the same content, for clone(): the bytes are shared
+  // (nothing writes to them), a stream is teed.
+  function cloneBody(state) {
+    if (state === null) return null;
+    const copy = { ...state };
+    if (state.stream !== null) [state.stream, copy.stream] = state.stream.tee();
+    return copy;
+  }
+
+  // The Body mixin both classes share. `bodyUsed` is a prototype getter, as
+  // in node, not an own property.
+  function installBody(Class) {
+    const define = (name, descriptor) =>
+      Object.defineProperty(Class.prototype, name, {
+        enumerable: true,
+        configurable: true,
+        ...descriptor,
+      });
+    const method = (name, value) => define(name, { value, writable: true });
+    define("body", {
+      get() {
+        const state = bodyStates.get(this);
+        return state === null || state === undefined ? null : bodyStreamOf(state);
+      },
+    });
+    define("bodyUsed", {
+      get() {
+        const state = bodyStates.get(this);
+        if (state === null || state === undefined) return false;
+        return state.used || (state.stream !== null && state.stream._disturbed === true);
+      },
+    });
+    method("text", async function text() {
+      return new TextDecoder().decode(await consumeBody(this));
+    });
+    method("json", async function json() {
+      return JSON.parse(new TextDecoder().decode(await consumeBody(this)));
+    });
+    method("arrayBuffer", async function arrayBuffer() {
+      const bytes = await consumeBody(this);
+      return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    });
+    method("bytes", async function bytes() {
+      return (await consumeBody(this)).slice();
+    });
+    method("blob", async function blob() {
+      const type = bodyMimeType(this.headers);
+      return new globalThis.Blob([await consumeBody(this)], { type });
+    });
+  }
+
+  // The type a body's `blob()` carries: the content-type parsed and
+  // re-serialised as the MIME Sniffing Standard says, "" when it does not
+  // parse (undici's bodyMimeType; measured: `A/B; x=1` reads `a/b;x=1`).
+  const MIME_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+  const MIME_QUOTED_VALUE = /^[\t\x20-\x7e\x80-\xff]*$/;
+  function bodyMimeType(headers) {
+    const value = headers.get("content-type");
+    return value === null ? "" : (serializeMimeType(value) ?? "");
+  }
+  function serializeMimeType(input) {
+    const text = input.replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
+    const slash = text.indexOf("/");
+    if (slash <= 0) return null;
+    const type = text.slice(0, slash);
+    let pos = slash + 1;
+    let end = text.indexOf(";", pos);
+    if (end === -1) end = text.length;
+    const subtype = text.slice(pos, end).replace(/[\t\n\r ]+$/, "");
+    if (!MIME_TOKEN.test(type) || !MIME_TOKEN.test(subtype)) return null;
+    let out = `${type.toLowerCase()}/${subtype.toLowerCase()}`;
+    const seen = new Set();
+    pos = end;
+    while (pos < text.length) {
+      pos++; // the ";"
+      while (pos < text.length && /[\t\n\r ]/.test(text[pos])) pos++;
+      let stop = pos;
+      while (stop < text.length && text[stop] !== ";" && text[stop] !== "=") stop++;
+      const name = text.slice(pos, stop).toLowerCase();
+      pos = stop;
+      if (pos >= text.length) break;
+      if (text[pos] === ";") continue;
+      pos++; // the "="
+      let value;
+      if (text[pos] === '"') {
+        value = "";
+        pos++;
+        while (pos < text.length) {
+          const ch = text[pos++];
+          if (ch === '"') break;
+          if (ch === "\\") {
+            if (pos >= text.length) {
+              value += "\\";
+              break;
+            }
+            value += text[pos++];
+          } else value += ch;
+        }
+        while (pos < text.length && text[pos] !== ";") pos++;
+      } else {
+        stop = text.indexOf(";", pos);
+        if (stop === -1) stop = text.length;
+        value = text.slice(pos, stop).replace(/[\t\n\r ]+$/, "");
+        pos = stop;
+        if (value === "") continue;
+      }
+      if (name !== "" && MIME_TOKEN.test(name) && MIME_QUOTED_VALUE.test(value) && !seen.has(name)) {
+        seen.add(name);
+        const shown =
+          value !== "" && MIME_TOKEN.test(value) ? value : `"${value.replace(/["\\]/g, "\\$&")}"`;
+        out += `;${name}=${shown}`;
+      }
+    }
+    return out;
+  }
+
   // Response constructor (the SERVING side; fetch's inbound responses come
-  // from makeResponse below). Body: string | bytes | ReadableStream | null.
+  // from makeResponse below). Body: anything extractBody takes, or null.
   class Response {
     constructor(body, init = {}) {
       this.status = init.status ?? 200;
       this.statusText = init.statusText ?? "";
-      this.headers = init.headers instanceof Headers ? init.headers : new Headers(init.headers);
-      this._body = body ?? null;
+      // A copy, as in node: the body's content-type lands on this response's
+      // headers, not on a Headers object the caller may use again.
+      this.headers = new Headers(init.headers);
       this.ok = this.status >= 200 && this.status <= 299;
+      initBody(this, body, this.headers);
     }
     static json(data, init = {}) {
-      const response = new Response(JSON.stringify(data), init);
-      if (!response.headers.has("content-type")) {
-        response.headers.set("content-type", "application/json");
+      const headers = new Headers(init.headers);
+      if (!headers.has("content-type")) headers.set("content-type", "application/json");
+      return new Response(JSON.stringify(data), { ...init, headers });
+    }
+    clone() {
+      const state = bodyStates.get(this);
+      if (state !== null && state !== undefined && bodyUnusable(state)) {
+        throw new TypeError("Response.clone: Body has already been consumed.");
       }
-      return response;
-    }
-    get body() {
-      return this._body;
-    }
-    async text() {
-      if (typeof this._body === "string") return this._body;
-      if (this._body === null) return "";
-      if (this._body instanceof Uint8Array) return new TextDecoder().decode(this._body);
-      let out = "";
-      for await (const chunk of this._body) {
-        out += typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk);
-      }
-      return out;
-    }
-    async json() {
-      return JSON.parse(await this.text());
+      const copy = new Response(null, this);
+      bodyStates.set(copy, cloneBody(state ?? null));
+      return copy;
     }
   }
+  Object.defineProperty(Response.prototype, "clone", { enumerable: true });
+  installBody(Response);
   brand(Response, "Response");
   globalThis.Response = Response;
 
@@ -755,8 +1130,17 @@
       *keys() { for (const [k] of this._entries) yield k; }
       *values() { for (const [, v] of this._entries) yield v; }
       [Symbol.iterator]() { return this.entries(); }
+      // A Blob entry is a File, as the standard says: named `filename`, or
+      // the File's own name, or "blob" (measured on node). The multipart
+      // encoding writes that name.
       _normalizeValue(value, filename) {
-        if (typeof globalThis.Blob !== "undefined" && value instanceof globalThis.Blob) return value;
+        if (typeof globalThis.Blob !== "undefined" && value instanceof globalThis.Blob) {
+          const isFile = value instanceof globalThis.File;
+          if (isFile && filename === undefined) return value;
+          const options = { type: value.type };
+          if (isFile) options.lastModified = value.lastModified;
+          return new globalThis.File([value], filename === undefined ? "blob" : filename, options);
+        }
         if (typeof value === "string") return value;
         return String(value);
       }
@@ -766,66 +1150,427 @@
   }
 
   // ----------------------------------------------------------------- Request
-  // WHATWG Request: the fetch()-input request object. Minimal but spec-shaped:
-  // method, url, headers, body. Used by frameworks that pass Request objects
-  // instead of URLs to fetch().
-  if (typeof globalThis.Request !== "function") {
-    class Request {
-      constructor(input, init) {
-        let url, method, headers, body;
-        if (input instanceof Request) {
-          url = input.url; method = input.method; headers = new Headers(input.headers);
-          body = input._body;
-        } else {
-          url = String(input);
-          method = "GET"; headers = new Headers(); body = null;
-        }
-        if (init) {
-          if (init.method) method = String(init.method).toUpperCase();
-          if (init.headers) headers = new Headers(init.headers);
-          if (init.body != null) body = init.body;
-        }
-        this.url = url;
-        this.method = method;
-        this.headers = headers;
-        this._body = body;
-        this.bodyUsed = false;
-      }
-      get body() {
-        if (this._body == null) return null;
-        if (typeof ReadableStream !== "undefined" && this._body instanceof ReadableStream) return this._body;
-        const bytes = typeof this._body === "string"
-          ? new TextEncoder().encode(this._body)
-          : this._body;
-        return new ReadableStream({
-          start(controller) { controller.enqueue(bytes); controller.close(); },
-        });
-      }
-      async text() {
-        if (this.bodyUsed) throw new TypeError("Body already consumed");
-        this.bodyUsed = true;
-        if (this._body == null) return "";
-        if (typeof this._body === "string") return this._body;
-        const bytes = this._body instanceof Uint8Array ? this._body
-          : new Uint8Array(this._body);
-        return new TextDecoder().decode(bytes);
-      }
-      async json() { return JSON.parse(await this.text()); }
-      async arrayBuffer() {
-        if (this.bodyUsed) throw new TypeError("Body already consumed");
-        this.bodyUsed = true;
-        if (this._body == null) return new ArrayBuffer(0);
-        if (typeof this._body === "string") return new TextEncoder().encode(this._body).buffer;
-        const bytes = this._body instanceof Uint8Array ? this._body : new Uint8Array(this._body);
-        return bytes.buffer;
-      }
-      clone() {
-        if (this.bodyUsed) throw new TypeError("Cannot clone a Request whose body has already been consumed");
-        return new Request(this);
+  // WHATWG Request, as undici 6's constructor builds it (measured on node
+  // v22.22.2): RequestInit is converted member by member in webidl order --
+  // each enum refused with undici's text -- then the URL is parsed, a Request
+  // input's fields are inherited, and `init` overrides them one by one. Every
+  // attribute is a prototype getter over the state below, as in node; the
+  // `signal` is a fresh one that follows the caller's. `fetch` builds its
+  // request through this same constructor (#180), so `fetch(request, init)`
+  // means what `new Request(request, init)` means.
+  //
+  // Kept and returned, and acted on only by the checks below: mode,
+  // credentials, cache, integrity, keepalive, referrer, referrerPolicy.
+  // node's fetch also turns `cache` into request headers, checks `integrity`
+  // and sends `referrer`; oam does not (docs/node-divergences.md).
+  const requestStates = new WeakMap();
+  const REQUEST_ENUMS = {
+    referrerPolicy: [
+      "",
+      "no-referrer",
+      "no-referrer-when-downgrade",
+      "same-origin",
+      "origin",
+      "strict-origin",
+      "origin-when-cross-origin",
+      "strict-origin-when-cross-origin",
+      "unsafe-url",
+    ],
+    mode: ["navigate", "same-origin", "no-cors", "cors"],
+    credentials: ["omit", "same-origin", "include"],
+    cache: ["default", "no-store", "reload", "no-cache", "force-cache", "only-if-cached"],
+    redirect: ["follow", "manual", "error"],
+    duplex: ["half"],
+  };
+  // undici's normalizedMethodRecords: these six are uppercased, any other
+  // token is kept as written (`patch` goes out as `patch`).
+  const REQUEST_NORMALIZED_METHODS = new Set(["DELETE", "GET", "HEAD", "OPTIONS", "POST", "PUT"]);
+  const REQUEST_FORBIDDEN_METHODS = new Set(["CONNECT", "TRACE", "TRACK"]);
+  const HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+  let patchMethodWarned = false;
+
+  // webidl's ByteString: a code unit above 0xFF is refused.
+  function toByteString(value) {
+    const text = String(value);
+    for (let i = 0; i < text.length; i++) {
+      const code = text.charCodeAt(i);
+      if (code > 255) {
+        throw new TypeError(
+          `Cannot convert argument to a ByteString because the character at index ${i} has a value of ${code} which is greater than 255.`,
+        );
       }
     }
+    return text;
+  }
+
+  // RequestInit, converted as undici's webidl dictionary converter does: in
+  // member order, reading each member once.
+  function convertRequestInit(init) {
+    if (init === undefined || init === null) return { hasKey: false };
+    if (typeof init !== "object" && typeof init !== "function") {
+      let shown;
+      try {
+        shown = String(init);
+      } catch {
+        shown = "Symbol";
+      }
+      throw new TypeError(
+        `Request constructor: Expected ${shown} to be one of: Null, Undefined, Object.`,
+      );
+    }
+    const out = {};
+    const read = (key, convert) => {
+      const value = init[key];
+      if (value !== undefined) out[key] = convert(value, key);
+    };
+    const oneOf = (value, key) => {
+      const text = String(value);
+      if (!REQUEST_ENUMS[key].includes(text)) {
+        throw new TypeError(
+          `Request constructor: ${text} is not an accepted type. Expected one of ${REQUEST_ENUMS[key].join(", ")}.`,
+        );
+      }
+      return text;
+    };
+    const same = (value) => value;
+    read("method", toByteString);
+    read("headers", same);
+    read("body", same);
+    read("referrer", (value) => String(value).toWellFormed());
+    read("referrerPolicy", oneOf);
+    read("mode", oneOf);
+    read("credentials", oneOf);
+    read("cache", oneOf);
+    read("redirect", oneOf);
+    read("integrity", String);
+    read("keepalive", Boolean);
+    read("signal", same);
+    read("window", same);
+    read("duplex", oneOf);
+    read("dispatcher", same);
+    // "init has a key": decides whether a Request input's navigation state
+    // and referrer reset, and whether its headers are refilled. undici asks
+    // it of the converted dictionary, not of the object it was given: a
+    // member counts when it is one of RequestInit's and is not undefined,
+    // own or inherited, and an unknown key never counts.
+    out.hasKey = Object.keys(out).length !== 0;
+    return out;
+  }
+
+  // A signal that follows `parent`: aborted with its reason, now or later.
+  // The listener holds the follower weakly and is removed once the follower
+  // is collected, so a long-lived signal shared by many requests does not
+  // collect one listener per request (node does the same).
+  const followCleanup =
+    typeof FinalizationRegistry === "function"
+      ? new FinalizationRegistry(({ parent, listener }) => {
+          parent.removeEventListener("abort", listener);
+        })
+      : null;
+  function followSignal(parent) {
+    const controller = new AbortController();
+    if (parent === null || parent === undefined) return controller.signal;
+    if (
+      typeof parent !== "object" ||
+      typeof parent.aborted !== "boolean" ||
+      typeof parent.addEventListener !== "function"
+    ) {
+      throw new TypeError(
+        "Failed to construct 'Request': member signal is not of type AbortSignal.",
+      );
+    }
+    if (parent.aborted) {
+      controller.abort(parent.reason);
+      return controller.signal;
+    }
+    // Held through the signal, which is what the request keeps: the
+    // controller itself is unreachable once this returns.
+    const follower = controller.signal;
+    const ref = new WeakRef(follower);
+    const listener = () => ref.deref()?._fire(parent.reason);
+    parent.addEventListener("abort", listener, { once: true });
+    followCleanup?.register(follower, { parent, listener });
+    return follower;
+  }
+
+  // undici's cause for a URL that does not parse: node's URL error, whose
+  // message is "Invalid URL" alone (oam's own URL error names the input).
+  function invalidUrlCause(input) {
+    const cause = new TypeError("Invalid URL");
+    cause.code = "ERR_INVALID_URL";
+    cause.input = input;
+    return cause;
+  }
+
+  function requestState(request) {
+    const state = requestStates.get(request);
+    if (state === undefined) throw new TypeError("Illegal invocation");
+    return state;
+  }
+
+  // A copy of a Headers object's stored list, in its stored order.
+  function copyHeaders(from) {
+    const headers = new Headers();
+    for (const [name, value] of from._list) headers._list.push([name, value]);
+    return headers;
+  }
+
+  // The Request class fetch builds its own request with. A script may
+  // replace or delete `globalThis.Request` (a polyfill's installGlobals
+  // does), and node's fetch goes on using undici's own class, so fetch must
+  // not read the global.
+  let OamRequest = null;
+  if (typeof globalThis.Request !== "function") {
+    class Request {
+      constructor(input, init = undefined) {
+        if (arguments.length < 1) {
+          throw new TypeError("Request constructor: 1 argument required, but 0 found.");
+        }
+        const fromRequest = input instanceof Request;
+        if (!fromRequest) input = String(input).toWellFormed();
+        const options = convertRequestInit(init);
+        let state;
+        let signal = null;
+        let fallbackMode = null;
+        if (!fromRequest) {
+          let parsed;
+          try {
+            parsed = new URL(input);
+          } catch {
+            throw new TypeError(`Failed to parse URL from ${input}`, {
+              cause: invalidUrlCause(input),
+            });
+          }
+          if (parsed.username !== "" || parsed.password !== "") {
+            throw new TypeError(
+              `Request cannot be constructed from a URL that includes credentials: ${input}`,
+            );
+          }
+          state = {
+            url: parsed.href,
+            method: "GET",
+            headers: null,
+            mode: "no-cors",
+            credentials: "same-origin",
+            cache: "default",
+            redirect: "follow",
+            integrity: "",
+            keepalive: false,
+            referrer: "client",
+            referrerPolicy: "",
+            reloadNavigation: false,
+            historyNavigation: false,
+            dispatcher: options.dispatcher,
+          };
+          fallbackMode = "cors";
+        } else {
+          const source = requestState(input);
+          state = { ...source, dispatcher: options.dispatcher ?? source.dispatcher };
+          signal = source.signal;
+        }
+        if (options.window !== undefined && options.window !== null) {
+          throw new TypeError("'window' option 'client' must be null");
+        }
+        if (options.hasKey) {
+          if (state.mode === "navigate") state.mode = "same-origin";
+          state.reloadNavigation = false;
+          state.historyNavigation = false;
+          state.referrer = "client";
+          state.referrerPolicy = "";
+        }
+        if (options.referrer !== undefined) {
+          if (options.referrer === "") state.referrer = "no-referrer";
+          else {
+            let parsed;
+            try {
+              parsed = new URL(options.referrer);
+            } catch {
+              throw new TypeError(`Referrer "${options.referrer}" is not a valid URL.`, {
+                cause: invalidUrlCause(options.referrer),
+              });
+            }
+            state.referrer =
+              parsed.protocol === "about:" && parsed.hostname === "client" ? "client" : parsed.href;
+          }
+        }
+        if (options.referrerPolicy !== undefined) state.referrerPolicy = options.referrerPolicy;
+        const mode = options.mode ?? fallbackMode;
+        if (mode === "navigate") {
+          throw new TypeError("Request constructor: invalid request mode navigate.");
+        }
+        if (mode !== null) state.mode = mode;
+        if (options.credentials !== undefined) state.credentials = options.credentials;
+        if (options.cache !== undefined) state.cache = options.cache;
+        if (state.cache === "only-if-cached" && state.mode !== "same-origin") {
+          throw new TypeError("'only-if-cached' can be set only with 'same-origin' mode");
+        }
+        if (options.redirect !== undefined) state.redirect = options.redirect;
+        if (options.integrity !== undefined) state.integrity = options.integrity;
+        if (options.keepalive !== undefined) state.keepalive = options.keepalive;
+        if (options.method !== undefined) {
+          const method = options.method;
+          const upper = method.toUpperCase();
+          if (REQUEST_NORMALIZED_METHODS.has(upper)) state.method = upper;
+          else {
+            if (!HTTP_TOKEN.test(method)) {
+              throw new TypeError(`'${method}' is not a valid HTTP method.`);
+            }
+            if (REQUEST_FORBIDDEN_METHODS.has(upper)) {
+              throw new TypeError(`'${method}' HTTP method is unsupported.`);
+            }
+            state.method = method;
+          }
+          if (state.method === "patch" && !patchMethodWarned) {
+            patchMethodWarned = true;
+            globalThis.process?.emitWarning?.(
+              "Using `patch` is highly likely to result in a `405 Method Not Allowed`. `PATCH` is much more likely to succeed.",
+              { code: "UNDICI-FETCH-patch" },
+            );
+          }
+        }
+        if (options.signal !== undefined) signal = options.signal;
+        state.signal = followSignal(signal);
+        if (mode === "no-cors" && !["GET", "HEAD", "POST"].includes(state.method)) {
+          throw new TypeError(`'${state.method} is unsupported in no-cors mode.`);
+        }
+        // The input's headers carry over unless init names its own.
+        if (options.hasKey && options.headers !== undefined) {
+          state.headers = copyHeaders(new Headers(options.headers));
+        } else if (fromRequest) {
+          state.headers = copyHeaders(requestState(input).headers);
+        } else {
+          state.headers = new Headers();
+        }
+        const headers = state.headers;
+        const inputBody = fromRequest ? (bodyStates.get(input) ?? null) : null;
+        const initBody = options.body ?? null;
+        if (
+          (initBody !== null || inputBody !== null) &&
+          (state.method === "GET" || state.method === "HEAD")
+        ) {
+          throw new TypeError("Request with GET/HEAD method cannot have body.");
+        }
+        let body = null;
+        if (initBody !== null) {
+          if (
+            state.keepalive &&
+            typeof initBody === "object" &&
+            !(initBody instanceof globalThis.Blob) &&
+            (initBody instanceof globalThis.ReadableStream ||
+              typeof initBody[Symbol.asyncIterator] === "function")
+          ) {
+            throw new TypeError("keepalive");
+          }
+          body = extractBody(initBody, true);
+          if (body.type !== null && !headers.has("content-type")) {
+            headers.append("content-type", body.type);
+          }
+        }
+        const streamed = body ?? inputBody;
+        if (streamed !== null && streamed.kind === "stream") {
+          if (body !== null && options.duplex === undefined) {
+            throw new TypeError("RequestInit: duplex option is required when sending a body.");
+          }
+          if (state.mode !== "same-origin" && state.mode !== "cors") {
+            throw new TypeError(
+              'If request is made from ReadableStream, mode should be "same-origin" or "cors"',
+            );
+          }
+        }
+        if (body === null && inputBody !== null) {
+          // The input Request's body moves to this one, and the input reads
+          // as used from here on (measured on node).
+          if (bodyUnusable(inputBody)) {
+            throw new TypeError(
+              "Cannot construct a Request with a Request object that has already been used.",
+            );
+          }
+          body = { ...inputBody };
+          inputBody.used = true;
+          inputBody.stream = null;
+        }
+        requestStates.set(this, state);
+        bodyStates.set(this, body);
+      }
+      clone() {
+        const state = requestState(this);
+        const body = bodyStates.get(this) ?? null;
+        // node's text, as it is.
+        if (body !== null && bodyUnusable(body)) throw new TypeError("unusable");
+        const copy = Object.create(Request.prototype);
+        requestStates.set(copy, {
+          ...state,
+          headers: copyHeaders(state.headers),
+          signal: followSignal(state.signal),
+        });
+        bodyStates.set(copy, cloneBody(body));
+        return copy;
+      }
+    }
+    const attribute = (name, get) =>
+      Object.defineProperty(Request.prototype, name, {
+        get,
+        enumerable: true,
+        configurable: true,
+      });
+    attribute("method", function method() {
+      return requestState(this).method;
+    });
+    attribute("url", function url() {
+      return requestState(this).url;
+    });
+    attribute("headers", function headers() {
+      return requestState(this).headers;
+    });
+    attribute("destination", function destination() {
+      requestState(this);
+      return "";
+    });
+    attribute("referrer", function referrer() {
+      const value = requestState(this).referrer;
+      if (value === "no-referrer") return "";
+      if (value === "client") return "about:client";
+      return value;
+    });
+    attribute("referrerPolicy", function referrerPolicy() {
+      return requestState(this).referrerPolicy;
+    });
+    attribute("mode", function mode() {
+      return requestState(this).mode;
+    });
+    attribute("credentials", function credentials() {
+      return requestState(this).credentials;
+    });
+    attribute("cache", function cache() {
+      return requestState(this).cache;
+    });
+    attribute("redirect", function redirect() {
+      return requestState(this).redirect;
+    });
+    attribute("integrity", function integrity() {
+      return requestState(this).integrity;
+    });
+    attribute("keepalive", function keepalive() {
+      return requestState(this).keepalive;
+    });
+    attribute("isReloadNavigation", function isReloadNavigation() {
+      return requestState(this).reloadNavigation;
+    });
+    attribute("isHistoryNavigation", function isHistoryNavigation() {
+      return requestState(this).historyNavigation;
+    });
+    attribute("signal", function signal() {
+      return requestState(this).signal;
+    });
+    attribute("duplex", function duplex() {
+      requestState(this);
+      return "half";
+    });
+    Object.defineProperty(Request.prototype, "clone", { enumerable: true });
+    installBody(Request);
     brand(Request, "Request");
     globalThis.Request = Request;
+    OamRequest = Request;
   }
 
   // --------------------------------------------------------- BroadcastChannel
@@ -890,7 +1635,7 @@
 
   function makeHeaders(pairs) {
     const headers = new Headers();
-    for (const [name, value] of pairs) headers.append(name, value);
+    for (const [name, value] of pairs) headers._append(name, value);
     return headers;
   }
 
@@ -986,7 +1731,10 @@
     }
 
     async function drainBytes() {
-      if (consumed) throw new TypeError("Body already consumed");
+      // Read already, or held by a reader someone took from `.body`.
+      if (consumed || (bodyStream !== null && (bodyStream.locked || bodyStream._disturbed))) {
+        throw new TypeError("Body is unusable: Body has already been read");
+      }
       // Consuming a body whose fetch was already aborted fails before it
       // starts, with undici's own AbortError rather than the signal's
       // reason (measured on node v22.22.2: `ac.abort(new Error('why'))` then
@@ -1020,13 +1768,20 @@
       get body() {
         return ensureBody();
       },
+      // Read from, not merely locked: a reader that has not read yet leaves
+      // the body unused, as in node.
       get bodyUsed() {
-        return consumed || (bodyStream !== null && bodyStream.locked);
+        return consumed || (bodyStream !== null && bodyStream._disturbed === true);
       },
       arrayBuffer: async () => (await drainBytes()).buffer,
       bytes: () => drainBytes(),
       text: async () => new TextDecoder().decode(await drainBytes()),
       json: async () => JSON.parse(new TextDecoder().decode(await drainBytes())),
+      // The body's bytes, typed with the response's content-type (#154).
+      blob: async function blob() {
+        const type = bodyMimeType(this.headers);
+        return new globalThis.Blob([await drainBytes()], { type });
+      },
     };
   }
 
@@ -1374,6 +2129,12 @@
   //
   // Returns `[name, message]` to refuse with, or the value to send.
   function dispatchHeader(name, value) {
+    // undici's isValidHeaderValue: a control character other than HTAB, or
+    // DEL, cannot go on the wire (a code point above U+00FF never got this
+    // far: the Headers it came through refused it).
+    if (/[^\t\x20-\x7e\x80-\xff]/.test(value)) {
+      return { refuse: ["InvalidArgumentError", `invalid ${name} header`] };
+    }
     switch (name) {
       case "transfer-encoding":
         return { refuse: ["InvalidArgumentError", "invalid transfer-encoding header"] };
@@ -1414,16 +2175,238 @@
     configurable: false,
   });
 
+  function bytesToBase64(bytes) {
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  }
+
+  // Send a streamed request body: read `stream` to its end and write each
+  // chunk to the outbound body channel, which is what frames it on the wire
+  // (chunked over HTTP/1.1). A write resolves once the transport has taken
+  // the chunk, so the stream is read no faster than the socket accepts it.
+  //
+  // Returns `{ stop, failure }`. `stop(reason)` drops the channel, which
+  // aborts a request still waiting for its body, and cancels the source.
+  // node does neither on an abort or a dropped connection -- it goes on
+  // pulling the source with nowhere to send it (measured) -- and the Fetch
+  // Standard cancels it, as oam does. `failure()` is the error the upload
+  // itself failed with, if it did: the fetch's cause, as in node.
+  function pumpUpload(stream, channel) {
+    const node = globalThis.__oam.node;
+    const reader = stream.getReader();
+    let stopped = false;
+    let failed;
+    const stop = (reason) => {
+      if (stopped) return;
+      stopped = true;
+      try {
+        node.fetchBodyChannelCancel(channel);
+      } catch {
+        /* the request already took and finished it */
+      }
+      reader.cancel(reason).catch(() => {});
+    };
+    (async () => {
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (stopped) return;
+          if (done) break;
+          await node.fetchBodyChannelWrite(channel, uploadChunk(value));
+          if (stopped) return;
+        }
+        stopped = true;
+        node.fetchBodyChannelEnd(channel);
+      } catch (e) {
+        failed = { error: e };
+        stop(e);
+      }
+    })();
+    return { stop, failure: () => failed };
+  }
+
+  // One chunk of a streamed upload as bytes, with node's verdict on each
+  // kind (measured on node v22.22.2): a string is its UTF-8, any typed array
+  // or DataView its bytes as they lie in memory; an ArrayBuffer fails at the
+  // socket write, and anything else at undici's Buffer.byteLength.
+  function uploadChunk(value) {
+    if (typeof value === "string") return new TextEncoder().encode(value);
+    if (ArrayBuffer.isView(value)) {
+      return new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+    }
+    if (value instanceof ArrayBuffer) {
+      const error = new TypeError(
+        'The "chunk" argument must be of type string or an instance of Buffer, TypedArray, or DataView. Received an instance of ArrayBuffer',
+      );
+      error.code = "ERR_INVALID_ARG_TYPE";
+      throw error;
+    }
+    // node's own error for it, from the same call.
+    globalThis.Buffer?.byteLength(value);
+    throw new TypeError("Received non-Uint8Array chunk");
+  }
+
+  // fetch's own request: node's fetch begins with `new Request(input, init)`
+  // and sends what that Request holds, so a Request input is unwrapped field
+  // by field with `init` winning, every constructor check applies to a plain
+  // URL too (a GET with a body, a bad method, `mode: 'navigate'` ...), and
+  // they run before anything else -- a bad URL beats an aborted signal.
+  // Returns the url and the init oamFetch goes on with: the method, the
+  // headers in their stored order, the body (taken: a Request input reads as
+  // used, unless `init` brought its own body), the request's signal and
+  // redirect mode, and the dispatcher.
+  function fetchRequest(input, init) {
+    const request = new OamRequest(input, init);
+    const state = requestStates.get(request);
+    const flat = {
+      method: state.method,
+      headers: state.headers._list.map(([name, value]) => [name, value]),
+      signal: state.signal,
+      redirect: state.redirect,
+      dispatcher: state.dispatcher,
+      // Read by fetchDefaultHeaders.
+      mode: state.mode,
+      cache: state.cache,
+    };
+    const body = bodyStates.get(request) ?? null;
+    // A Blob that is not oam's own: its bytes are read before the request
+    // goes out (oamFetch), as `flat.body` stays its stream until then.
+    let collect = false;
+    if (body !== null) {
+      // The Request already put the body's content-type in its headers.
+      //
+      // Only a caller's stream is sent as a stream. Any other body has a
+      // known length and can be sent again on a 307 or 308, and undici keeps
+      // it so (its `source`) even once `.body`, `clone()` or
+      // `new Request(request)` has given it a stream: node sends its
+      // content-length and replays it on the redirect. The stream `.body`
+      // made over the bytes counts for nothing unless someone has read from
+      // it, which the Request constructor has already refused.
+      const untouched =
+        body.stream === null || (!body.stream.locked && body.stream._disturbed !== true);
+      if (body.kind !== "stream" && body.bytes !== null && untouched) {
+        flat.body = body.text ?? body.bytes;
+      } else if (body.stream !== null) {
+        flat.body = body.stream;
+        flat.duplex = "half";
+        // undici sends a Blob's size as its content-length, and reads it
+        // again for a redirect.
+        if (body.kind === "blob" && untouched) collect = { size: body.size };
+      } else {
+        flat.body = body.text ?? body.bytes;
+      }
+      bodyStates.set(request, null);
+    }
+    // oam's own knobs (`__oamBodyStream` and the like, which tests and
+    // internal callers set) ride along untouched.
+    for (const key of Object.keys(init ?? {})) {
+      if (key.startsWith("__oam")) flat[key] = init[key];
+    }
+    return { url: state.url, init: flat, collect };
+  }
+
+  // A foreign Blob's bytes, read off its stream: undici sends them with the
+  // Blob's `size` as the content-length (measured on node v22.22.2), each
+  // chunk converted as a streamed upload's is, and a stream that comes out
+  // a different length fails as undici's length check fails it.
+  async function collectBlobStream(stream, size) {
+    const reader = stream.getReader();
+    const chunks = [];
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        chunks.push(uploadChunk(value));
+      }
+    } catch (e) {
+      throw new TypeError("fetch failed", { cause: e });
+    }
+    const bytes = concatBytes(chunks);
+    if (bytes.length !== Number(size)) {
+      const cause = new Error("Request body length does not match content-length header");
+      cause.name = "RequestContentLengthMismatchError";
+      throw new TypeError("fetch failed", { cause });
+    }
+    return bytes;
+  }
+
+  // The request headers undici's fetch adds of its own (fetch/index.js
+  // httpNetworkOrCacheFetch, and core/request.js for the length), each only
+  // when the caller did not set it -- bar `sec-fetch-mode`, which is always
+  // the request's mode (#178). Measured on node v22.22.2 against a raw
+  // socket. Fetch only: http.request and undici.request send none of them.
+  // Where `host` goes and oam's `user-agent` are left as they are.
+  const PAYLOAD_METHODS = new Set(["POST", "PUT", "PATCH", "QUERY", "PROPFIND", "PROPPATCH"]);
+  const CONDITIONAL_HEADERS = [
+    "if-modified-since",
+    "if-none-match",
+    "if-unmodified-since",
+    "if-match",
+    "if-range",
+  ];
+  function fetchDefaultHeaders(headers, request, init, upload) {
+    const has = (name) => headers.some((h) => h[0].toLowerCase() === name);
+    const add = (name, value) => {
+      if (!has(name)) headers.push([name, value]);
+    };
+    // A caller's `connection` (close or keep-alive, lowercased by
+    // dispatchHeader) wins; node writes its own right after `host`.
+    if (!has("connection")) headers.unshift(["connection", "keep-alive"]);
+    add("accept", "*/*");
+    add("accept-language", "*");
+    const mode = headers.findIndex((h) => h[0].toLowerCase() === "sec-fetch-mode");
+    if (mode !== -1) headers.splice(mode, 1);
+    headers.push(["sec-fetch-mode", init.mode ?? "cors"]);
+    // A conditional request in the default cache mode is a no-store one
+    // (undici, and the Fetch Standard's HTTP-network-or-cache fetch step 15),
+    // so it says `pragma: no-cache` and `cache-control: no-cache`.
+    let cache = init.cache;
+    if (cache === "default" && CONDITIONAL_HEADERS.some(has)) cache = "no-store";
+    if (cache === "no-store" || cache === "reload") {
+      add("pragma", "no-cache");
+      add("cache-control", "no-cache");
+    } else if (cache === "no-cache") {
+      add("cache-control", "max-age=0");
+    }
+    // A range request asks for the bytes as they are, so its offsets are not
+    // into a compressed copy: undici appends `identity` to accept-encoding
+    // (step 18), to a caller's own value too (`gzip` goes out as
+    // `gzip, identity`), and the scheme's default list then stays out.
+    if (has("range")) {
+      const at = headers.findIndex((h) => h[0].toLowerCase() === "accept-encoding");
+      if (at === -1) headers.push(["accept-encoding", "identity"]);
+      else headers[at] = [headers[at][0], `${headers[at][1]}, identity`];
+    }
+    // undici's own list, per scheme: oam decodes br as well (#151).
+    add("accept-encoding", /^https:/i.test(request.url) ? "br, gzip, deflate" : "gzip, deflate");
+    // A request whose method carries a payload says it carries none: no
+    // body, or one whose length is 0 (a stream's length is not known).
+    // undici compares the method as written, so `patch` gets none.
+    if (PAYLOAD_METHODS.has(request.method) && upload === null) {
+      const empty =
+        request.body_base64 !== undefined
+          ? request.body_base64 === ""
+          : request.body !== undefined
+            ? request.body === ""
+            : request.body_stream === undefined;
+      if (empty) add("content-length", "0");
+    }
+  }
+
   async function oamFetch(input, init, rawPayload) {
+    // Internal callers that are not fetch in node (http.request, the http2
+    // client, undici.request) opt out of every Fetch-level rule below.
+    const fetchSemantics = init?.__oamFetchSemantics !== false;
+    let collect = false;
+    if (fetchSemantics) ({ url: input, init, collect } = fetchRequest(input, init));
     init = init || {};
     const signal = init.signal;
     // Already-aborted: reject before touching the network (spec).
     if (signal?.aborted) {
       throw signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
     }
-    // Internal callers that are not fetch in node (http.request, the http2
-    // client, undici.request) opt out of every Fetch-level rule below.
-    const fetchSemantics = init.__oamFetchSemantics !== false;
+    if (collect) init.body = await collectBlobStream(init.body, collect.size);
     // undici's DISPATCH-level rules are a smaller set that node applies to
     // `undici.request` as well, because both build the same internal Request:
     // the five hop-by-hop header refusals and the content-length check, but
@@ -1435,47 +2418,16 @@
     // `http.request` and the http2 client set these headers legitimately in
     // node and are not subject to either set.
     const dispatchSemantics = fetchSemantics || init.__oamDispatchSemantics === true;
-    // fetch's `redirect` (RequestInit's RequestRedirect enum): the Request
-    // constructor converts init first, so a value outside the enum is
-    // refused before the URL is even parsed, with webidl's message.
-    let redirectMode;
-    if (fetchSemantics && init.redirect !== undefined) {
-      redirectMode = String(init.redirect);
-      if (redirectMode !== "follow" && redirectMode !== "manual" && redirectMode !== "error") {
-        throw new TypeError(
-          `Request constructor: ${redirectMode} is not an accepted type. Expected one of follow, manual, error.`,
-        );
-      }
-    }
+    // fetch's `redirect`, validated by the Request constructor.
+    const redirectMode = fetchSemantics ? init.redirect : undefined;
     const rawUrl = wellFormed(input);
-    if (fetchSemantics) {
-      // node parses the URL in the Request constructor, so a bad URL is a URL
-      // error and not a network failure -- the caller can tell them apart.
-      // oam reported both as `TypeError: fetch failed` with cause
-      // `Error: builder error`, which named neither.
-      let parsed;
-      try {
-        parsed = new URL(rawUrl);
-      } catch {
-        const cause = new TypeError("Invalid URL");
-        cause.code = "ERR_INVALID_URL";
-        throw new TypeError(`Failed to parse URL from ${rawUrl}`, { cause });
-      }
-      // node: `TypeError: Request cannot be constructed from a URL that
-      // includes credentials` -- nothing reaches the wire. oam converted the
-      // userinfo to `Authorization: Basic ...` and sent it, which is also
-      // inconsistent with this slice's own redirect rule (a Location with
-      // userinfo already fails as `cross origin not allowed ...`). The
-      // http.request path keeps the conversion: there the userinfo IS node's
-      // documented `auth` option.
-      if (parsed.username !== "" || parsed.password !== "") {
-        throw new TypeError(
-          `Request cannot be constructed from a URL that includes credentials: ${rawUrl}`,
-        );
-      }
-      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-        throw new TypeError("fetch failed", { cause: new Error("unknown scheme") });
-      }
+    // The Request constructor has parsed the URL and refused userinfo (node's
+    // `Request cannot be constructed from a URL that includes credentials`;
+    // the http.request path keeps turning userinfo into Basic credentials,
+    // as there it IS node's documented `auth` option). What is left is the
+    // scheme, which node checks when it fetches.
+    if (fetchSemantics && !/^https?:/i.test(rawUrl)) {
+      throw new TypeError("fetch failed", { cause: new Error("unknown scheme") });
     }
     let headers = [];
     if (init.headers) {
@@ -1497,7 +2449,8 @@
         if (fetchSemantics) {
           const combined = new Headers();
           for (const [k, v] of pairs) combined.append(k, v);
-          list = [...combined];
+          // In the order the caller gave them, as undici writes them.
+          list = combined._list;
         }
         for (const [rawName, value] of list) {
           const name = fetchSemantics ? rawName : String(rawName).toLowerCase();
@@ -1596,26 +2549,47 @@
     // rides an outbound body channel instead of a materialized body
     // (docs/design/streaming-bodies.md). Not part of the WHATWG surface --
     // http.ClientRequest sets it.
+    //
+    // A ReadableStream body (or any async iterable) rides the same channel:
+    // `upload` is pumped into it once the request has started.
+    let upload = null;
     if (typeof init.__oamBodyStream === "number") {
       request.body_stream = init.__oamBodyStream;
     } else if (init.body != null) {
-      if (init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body)) {
-        const bytes = init.body instanceof ArrayBuffer
-          ? new Uint8Array(init.body)
-          : new Uint8Array(init.body.buffer, init.body.byteOffset, init.body.byteLength);
-        let binary = "";
-        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-        request.body_base64 = btoa(binary);
-      } else {
+      let impliedType;
+      if (typeof init.body === "string") {
         request.body = wellFormed(init.body);
-        // node's "extract a body": a string body's Content-Type is
-        // `text/plain;charset=UTF-8` unless the caller set one (measured).
-        // Servers branch on it, and oam sent none at all.
-        if (fetchSemantics && !headers.some((h) => h[0] === "content-type")) {
-          headers.push(["content-type", "text/plain;charset=UTF-8"]);
+        if (fetchSemantics) impliedType = "text/plain;charset=UTF-8";
+      } else {
+        const body = extractBody(init.body, false);
+        if (body.stream !== null) {
+          // node refuses a streamed body without `duplex: 'half'`. Fetch
+          // only: undici.request takes a stream as it is.
+          if (fetchSemantics && init.duplex !== "half") {
+            throw new TypeError("RequestInit: duplex option is required when sending a body.");
+          }
+          upload = body.stream;
+        } else {
+          request.body_base64 = bytesToBase64(body.bytes);
+        }
+        // undici.request, which is not fetch, names the type of the two
+        // bodies that carry one of their own -- a FormData's boundary is in
+        // it -- and of nothing else.
+        if (fetchSemantics || body.kind === "formdata" || body.kind === "blob") {
+          impliedType = body.type;
         }
       }
+      // node's "extract a body": the body's own Content-Type unless the
+      // caller set one (measured) -- `text/plain;charset=UTF-8` for a string.
+      // Servers branch on it, and oam sent none at all.
+      if (
+        typeof impliedType === "string" &&
+        !headers.some((h) => h[0].toLowerCase() === "content-type")
+      ) {
+        headers.push(["content-type", impliedType]);
+      }
     }
+    if (fetchSemantics) fetchDefaultHeaders(headers, request, init, upload);
     // A caller `content-length` that disagrees with the body is refused, not
     // framed. hyper writes exactly the declared length, so a short one
     // SILENTLY TRUNCATED the body and still returned 200 -- data loss, and
@@ -1633,7 +2607,7 @@
             ? atob(request.body_base64).length
             : request.body !== undefined
               ? new TextEncoder().encode(request.body).length
-              : request.body_stream !== undefined
+              : request.body_stream !== undefined || upload !== null
                 ? null
                 : 0;
         if (have !== null && (!Number.isInteger(want) || want < 0 || want !== have)) {
@@ -1645,9 +2619,37 @@
     }
     // Started synchronously: a malformed request or a --permission refusal
     // throws from here, as it always has.
-    const pending = globalThis.__oam.fetch(JSON.stringify(request));
+    let pending;
+    let pump = null;
+    if (upload === null) {
+      pending = globalThis.__oam.fetch(JSON.stringify(request));
+    } else {
+      // The channel is made last, after everything above that can throw, so
+      // a refused request leaves none behind.
+      const channel = globalThis.__oam.node.fetchBodyChannelNew();
+      request.body_stream = channel;
+      try {
+        pending = globalThis.__oam.fetch(JSON.stringify(request));
+      } catch (e) {
+        globalThis.__oam.node.fetchBodyChannelCancel(channel);
+        throw e;
+      }
+      pump = pumpUpload(upload, channel);
+    }
     if (rawPayload) return settleRaw(pending, lookup, signal, connector);
-    const op = settleFetch(pending, lookup, signal, connector);
+    let op = settleFetch(pending, lookup, signal, connector);
+    if (pump !== null) {
+      // A request that failed, or was aborted, stops reading its body. One
+      // that failed because its body did fails with that error as the cause,
+      // not with what the transport made of the dropped channel.
+      op = op.catch((e) => {
+        pump.stop(e);
+        const failed = pump.failure();
+        if (failed !== undefined) throw new TypeError("fetch failed", { cause: failed.error });
+        throw e;
+      });
+      if (signal) signal.addEventListener("abort", () => pump.stop(signal.reason), { once: true });
+    }
     if (!signal) return op;
     // Race the abort. Wave-1 divergence (documented): the underlying op
     // is not cancelled at the socket — the abort rejects the fetch
@@ -1687,7 +2689,7 @@
     return {
       method: meta.method,
       url: `http://${host}${meta.uri}`,
-      headers: new Headers(meta.headers),
+      headers: makeHeaders(meta.headers),
       get bodyUsed() {
         return consumed;
       },
@@ -1702,11 +2704,25 @@
     const node = globalThis.__oam.node;
     const status = response?.status ?? 200;
     const headerPairs = [];
-    if (response?.headers) {
+    if (response?.headers instanceof Headers) {
+      // The stored order -- the order the handler set them -- not the sorted
+      // order iteration gives a script.
+      for (const [key, value] of response.headers._list) headerPairs.push([key, value]);
+    } else if (response?.headers) {
       response.headers.forEach((value, key) => headerPairs.push([key, value]));
     }
     const headersJson = JSON.stringify(headerPairs);
-    const body = response?.body ?? response?._body ?? null;
+    // A constructed Response whose body is known bytes is written whole,
+    // with a content-length; asking for its `.body` here would turn every
+    // such answer into a stream. Anything else -- a fetched response passed
+    // through, a plain object -- is read as before.
+    const state = bodyStates.get(response);
+    const body =
+      state === undefined
+        ? (response?.body ?? response?._body ?? null)
+        : state === null || state.used
+          ? null
+          : (state.stream ?? state.bytes);
     if (body !== null && typeof body === "object" && typeof body.getReader === "function") {
       // Streaming response: chunks flush as the handler produces them.
       const streamId = node.httpRespondStream(requestId, status, headersJson);

@@ -3181,6 +3181,148 @@ fn oam_serve_handles_get_post_and_errors() {
     assert_eq!(lines[5], "closed");
 }
 
+/// What `oam.serve` writes for each kind of `Response` body (#154): the
+/// content-type the body implies, and a body whose bytes are known goes out
+/// whole under a content-length -- only a stream is chunked. A Blob used to
+/// crash the handler's answer (`_body is not async iterable`) and a
+/// URLSearchParams went out as two NUL-ish bytes with no type.
+#[test]
+fn oam_serve_writes_each_response_body_kind() {
+    let stdout = run_ok(
+        "serve_body_kinds.mjs",
+        "const form = new FormData();\n\
+         form.append('k', 'v');\n\
+         const bodies = {\n\
+           '/string': () => new Response('text'),\n\
+           '/blob': () => new Response(new Blob(['blobdata'], { type: 'application/x-test' })),\n\
+           '/params': () => new Response(new URLSearchParams({ a: '1', b: 'x y' })),\n\
+           '/form': () => new Response(form),\n\
+           '/bytes': () => new Response(new Uint8Array([104, 105])),\n\
+           '/typed': () => new Response('{}', { headers: { 'content-type': 'application/json' } }),\n\
+           '/empty': () => new Response(null, { status: 204 }),\n\
+           '/stream': () => new Response(new ReadableStream({\n\
+             start(c) { c.enqueue(new TextEncoder().encode('streamed')); c.close(); },\n\
+           })),\n\
+         };\n\
+         const server = await oam.serve({ fetch: (req) => bodies[new URL(req.url).pathname]() });\n\
+         for (const path of Object.keys(bodies)) {\n\
+           const res = await fetch(`http://127.0.0.1:${server.port}${path}`);\n\
+           const text = (await res.text()).replace(/----formdata-oam-\\d+/g, '----B');\n\
+           const type = String(res.headers.get('content-type')).replace(/----formdata-oam-\\d+/, '----B');\n\
+           const framing = res.headers.get('transfer-encoding') ?? `cl ${res.headers.get('content-length')}`;\n\
+           console.log(path, res.status, type, framing, JSON.stringify(text));\n\
+         }\n\
+         server.close();",
+    );
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            r#"/string 200 text/plain;charset=UTF-8 cl 4 "text""#,
+            r#"/blob 200 application/x-test cl 8 "blobdata""#,
+            r#"/params 200 application/x-www-form-urlencoded;charset=UTF-8 cl 9 "a=1&b=x+y""#,
+            r#"/form 200 multipart/form-data; boundary=----B cl 115 "------B\r\nContent-Disposition: form-data; name=\"k\"\r\n\r\nv\r\n------B--\r\n""#,
+            r#"/bytes 200 null cl 2 "hi""#,
+            r#"/typed 200 application/json cl 2 "{}""#,
+            r#"/empty 204 null cl null """#,
+            r#"/stream 200 null chunked "streamed""#,
+        ]
+    );
+}
+
+/// `oam.serve` writes a response's headers in the order the handler set them
+/// (#175): `Headers` iteration sorts by name, as node's does, and the server
+/// reads the stored list instead, so sorting did not reorder what it sends.
+/// Read off the wire with a raw socket; `date` is the server's own. The
+/// second set-cookie goes out beside the first: the transport groups a
+/// repeated name, as it always has.
+#[test]
+fn oam_serve_writes_headers_in_the_order_the_handler_set_them() {
+    let stdout = run_ok(
+        "serve_header_order.mjs",
+        "import net from 'node:net';\n\
+         const server = await oam.serve({ fetch: () => {\n\
+           const headers = new Headers({ 'x-z': '1', 'x-a': '2' });\n\
+           headers.append('set-cookie', 'b=2');\n\
+           headers.append('x-m', '3');\n\
+           headers.append('set-cookie', 'a=1');\n\
+           return new Response('ok', { headers });\n\
+         } });\n\
+         const head = await new Promise((resolve, reject) => {\n\
+           const socket = net.connect(server.port, '127.0.0.1', () => {\n\
+             socket.write('GET / HTTP/1.1\\r\\nhost: x\\r\\nconnection: close\\r\\n\\r\\n');\n\
+           });\n\
+           let text = '';\n\
+           socket.on('data', (c) => (text += c));\n\
+           socket.on('end', () => resolve(text.split('\\r\\n\\r\\n')[0]));\n\
+           socket.on('error', reject);\n\
+         });\n\
+         console.log(head.split('\\r\\n').slice(1).map((l) => l.toLowerCase())\n\
+           .filter((l) => !l.startsWith('date:')).join('|'));\n\
+         server.close();",
+    );
+    assert_eq!(
+        stdout,
+        "x-z: 1|x-a: 2|set-cookie: b=2|set-cookie: a=1|x-m: 3|content-type: text/plain;charset=utf-8|connection: close|content-length: 2"
+    );
+}
+
+/// A request header value with a byte above 0x7F round-trips from oam to
+/// oam, as from node to node. The client writes one byte per code point
+/// (#174) and both servers read one code point per byte, as node's parser
+/// does: decoded as UTF-8, the 0xE9 of `café` reached the handler as
+/// U+FFFD. Through oam.serve and node:http (headers, rawHeaders and a
+/// chunked request's trailers), from fetch, http.get and a raw socket.
+#[test]
+fn request_header_bytes_round_trip_oam_to_oam_as_latin1() {
+    let stdout = run_ok(
+        "header_latin1_round_trip.mjs",
+        "import http from 'node:http';\n\
+         import net from 'node:net';\n\
+         const cps = (s) => [...String(s)].map((c) => c.codePointAt(0).toString(16)).join(' ');\n\
+         const out = [];\n\
+         const served = await oam.serve({ fetch: (req) => new Response(cps(req.headers.get('x'))) });\n\
+         const su = `http://127.0.0.1:${served.port}/`;\n\
+         out.push('serve/fetch ' + (await (await fetch(su, { headers: { x: 'caf\\u00e9' } })).text()));\n\
+         const get = (u) => new Promise((resolve, reject) => {\n\
+           http.get(u, { headers: { x: 'caf\\u00e9' } }, (res) => {\n\
+             let b = ''; res.setEncoding('latin1');\n\
+             res.on('data', (c) => (b += c)); res.on('end', () => resolve(b));\n\
+           }).on('error', reject);\n\
+         });\n\
+         out.push('serve/http.get ' + (await get(su)));\n\
+         served.close();\n\
+         const server = http.createServer((req, res) => {\n\
+           req.resume();\n\
+           req.on('end', () => res.end([cps(req.headers.x),\n\
+             cps(req.rawHeaders[req.rawHeaders.findIndex((n, i) => i % 2 === 0 && n.toLowerCase() === 'x') + 1]),\n\
+             cps(req.trailers.t ?? '')].join(' / ')));\n\
+         });\n\
+         await new Promise((r) => server.listen(0, '127.0.0.1', r));\n\
+         const nu = `http://127.0.0.1:${server.address().port}/`;\n\
+         out.push('http/fetch ' + (await (await fetch(nu, { headers: { x: 'caf\\u00e9' } })).text()));\n\
+         out.push('http/http.get ' + (await get(nu)));\n\
+         const raw = await new Promise((resolve, reject) => {\n\
+           const socket = net.connect(server.address().port, '127.0.0.1', () => {\n\
+             socket.write(Buffer.from('POST / HTTP/1.1\\r\\nhost: x\\r\\nconnection: close\\r\\n' +\n\
+               'transfer-encoding: chunked\\r\\nx: caf\\u00e9\\r\\n\\r\\n1\\r\\na\\r\\n0\\r\\nt: \\u00ff\\u00e9\\r\\n\\r\\n', 'latin1'));\n\
+           });\n\
+           let text = ''; socket.setEncoding('latin1');\n\
+           socket.on('data', (c) => (text += c));\n\
+           socket.on('end', () => resolve(text.split('\\r\\n\\r\\n').slice(1).join('').split('\\r\\n').find((l) => l.includes('/'))));\n\
+           socket.on('error', reject);\n\
+         });\n\
+         out.push('http/raw ' + raw);\n\
+         server.close();\n\
+         console.log(out.join('|'));",
+    );
+    assert_eq!(
+        stdout,
+        "serve/fetch 63 61 66 e9|serve/http.get 63 61 66 e9|\
+         http/fetch 63 61 66 e9 / 63 61 66 e9 / |http/http.get 63 61 66 e9 / 63 61 66 e9 / |\
+         http/raw 63 61 66 e9 / 63 61 66 e9 / ff e9"
+    );
+}
+
 /// `oam.serve`'s `close()` finishes the requests in flight and closes every
 /// other connection -- one that connected and never sent a request
 /// included. A client pool opens such a connection (fetch's spare, raced
@@ -7118,7 +7260,8 @@ console.log(await upgrade('refused', http, { host: 'ws.test', port: plain.addres
 await new Promise((r) => setTimeout(r, 50));
 console.log('connections after refusal', connections - before);
 // The upgrade head is written by hand: a header value carrying CR / LF is
-// refused, never sent.
+// refused -- by http.request itself, synchronously, as node refuses it (#174) --
+// and never sent.
 console.log(await upgrade('crlf', http, { host: '127.0.0.1', port: plain.address().port }, { 'X-Bad': 'a\r\nX-Injected: 1' }));
 await new Promise((r) => setTimeout(r, 50));
 console.log('injected header reached the server', injected);
@@ -7135,7 +7278,7 @@ secure.close();
          plain request 101 echo=ping tls=false rest=0\n\
          refused error EREFUSED_BY_HOOK\n\
          connections after refusal 0\n\
-         crlf error ERR_INVALID_CHAR\n\
+         crlf threw ERR_INVALID_CHAR\n\
          injected header reached the server false"
     );
 }
@@ -8136,6 +8279,52 @@ server.close();
             "a private CA must be refused without NODE_EXTRA_CA_CERTS: {stdout}"
         );
     }
+}
+
+/// fetch's default request headers over https (#178): undici's
+/// `accept-encoding` there is `br, gzip, deflate` (oam decodes br since
+/// #151), and the rest of its defaults go out as over http. Against an
+/// HTTP/1.1 server, and against an h2 server, which oam's fetch negotiates
+/// (node's does not): there the `connection` default must not break the
+/// request -- HTTP/2 has no such header, and the transport drops it.
+#[test]
+fn fetch_https_sends_undici_default_headers() {
+    let bundle = write_temp("fetch-https-defaults/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import https from 'node:https';
+import http2 from 'node:http2';
+const names = ['accept-encoding', 'accept-language', 'sec-fetch-mode', 'connection', 'content-length'];
+const echo = (req, res) => res.end(req.httpVersion + ' ' + names.map((n) => n + '=' + (req.headers[n] ?? '-')).join(' '));
+const h1 = https.createServer({ cert: `__CERT__`, key: `__KEY__` }, echo);
+const h2 = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__`, allowHTTP1: true }, echo);
+// fetch's pool keeps its h2 session open, and an http2 server's close()
+// waits for every session: end them, so the run can exit.
+const sessions = new Set();
+h2.on('session', (session) => sessions.add(session));
+for (const [label, server] of [['h1', h1], ['h2', h2]]) {
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `https://localhost:${server.address().port}/`;
+  console.log(label, 'GET', await (await fetch(url)).text());
+  console.log(label, 'POST', await (await fetch(url, { method: 'POST' })).text());
+  server.close();
+}
+for (const session of sessions) session.destroy();
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("fetch_https_defaults/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "h1 GET 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=-\n\
+         h1 POST 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=0\n\
+         h2 GET 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=-\n\
+         h2 POST 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=0",
+        "stderr: {stderr}"
+    );
 }
 
 /// A server-sent-events body compressed with gzip and sync-flushed per event
@@ -9718,7 +9907,7 @@ fn fetch_body_cannot_be_consumed_twice() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "double: Body already consumed\nused: true"
+        "double: Body is unusable: Body has already been read\nused: true"
     );
 }
 

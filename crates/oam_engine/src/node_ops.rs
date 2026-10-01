@@ -3463,11 +3463,27 @@ fn op_http_respond(
         .map(|j| parse_headers_json(&j))
         .unwrap_or_default();
     let body = arg_bytes(scope, &args, 3).unwrap_or_default();
+    let header_bytes = header_bytes_arg(&args, 4);
     rv.set_bool(
         core_runtime!(scope)
             .http()
-            .respond_full(id, status, headers, body),
+            .respond_full(id, status, headers, header_bytes, body),
     );
+}
+
+/// The optional last argument of httpRespond / httpRespondStream: `true`
+/// writes each header value one byte per code point, as node:http's
+/// ServerResponse asks for whenever node would; anything else (oam.serve and
+/// the http2 compat server pass nothing) writes its UTF-8.
+fn header_bytes_arg(
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+) -> oam_core::http_server::HeaderBytes {
+    if args.get(index).is_true() {
+        oam_core::http_server::HeaderBytes::Latin1
+    } else {
+        oam_core::http_server::HeaderBytes::Utf8
+    }
 }
 
 fn op_http_respond_stream(
@@ -3480,12 +3496,14 @@ fn op_http_respond_stream(
     let headers = arg_string(scope, &args, 2)
         .map(|j| parse_headers_json(&j))
         .unwrap_or_default();
+    let header_bytes = header_bytes_arg(&args, 3);
     // Exchange gone (aborted via httpAbort, or already answered) leaves rv
     // undefined, NOT a throw -- Node's post-abort res.write() is a soft
     // failure, and the JS layer maps this to a premature close.
-    if let Some(stream_id) = core_runtime!(scope)
-        .http()
-        .respond_stream(id, status, headers)
+    if let Some(stream_id) =
+        core_runtime!(scope)
+            .http()
+            .respond_stream(id, status, headers, header_bytes)
     {
         rv.set_double(stream_id as f64);
     }
