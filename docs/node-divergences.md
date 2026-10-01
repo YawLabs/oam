@@ -1290,12 +1290,17 @@ platform's `AI_ADDRCONFIG` value elsewhere (`1024` on macOS, `32` on glibc Linux
 own resolver leaves the flag out.
 
 Passing the flag means calling `getaddrinfo` by hand, through new `unsafe` code, which is
-why it is not done yet. `dns.lookup` is the same resolver; with no `hints` Node's passes no
-flags either, but oam's `dns.ADDRCONFIG`, `dns.V4MAPPED` and `dns.ALL` are all `0`, where
-Node on Windows reports `1024`, `2048` and `256` (measured), so a caller cannot ask for them.
+why it is not done yet. `dns.lookup` is the same resolver, and its `hints` are handled in
+JS: since 0.17.2 `dns.ADDRCONFIG`, `dns.V4MAPPED` and `dns.ALL` are the platform's `AI_*`
+values (`1024`, `2048`, `256` on Windows, macOS and the BSDs; `32`, `8`, `16` on Linux;
+up to 0.17.1 all three were `0`), `hints` is validated as Node's `validateHints` does
+(`ERR_INVALID_ARG_TYPE` for a non-number, `ERR_INVALID_ARG_VALUE` for any other bit), and
+`V4MAPPED` (with or without `ALL`) on a `family: 6` lookup answers IPv4 addresses as
+`::ffff:a.b.c.d` by getaddrinfo's rule (`conformance/cases/228-dns-lookup-hints.mjs`).
+`dns.ADDRCONFIG` in a caller's `hints` is accepted and not applied, for the reason above.
 
-_(source: `crates/oam_core/src/net_connect.rs`, `dns.rs`; the `dns` constants probed on
-Windows.)_
+_(source: `crates/oam_core/src/net_connect.rs`, `dns.rs`, `js/node_compat.js`
+`registry.factories.dns`; the `dns` constants probed on Windows.)_
 
 ### 38. `fetch` and `http.request` on oam's own client: what still differs (#143)
 

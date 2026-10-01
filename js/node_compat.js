@@ -27690,6 +27690,51 @@
       });
     }
 
+    // node's getaddrinfo flags, as `dns.ADDRCONFIG` / `dns.V4MAPPED` /
+    // `dns.ALL` expose them: the system's AI_* values, which are glibc's (and
+    // musl's) on Linux and the BSD ones on Windows, macOS and the BSDs.
+    const [ADDRCONFIG, V4MAPPED, ALL] =
+      globalThis.process.platform === "linux" || globalThis.process.platform === "android"
+        ? [0x20, 0x8, 0x10]
+        : [0x400, 0x800, 0x100];
+
+    // node lib/dns.js lookup: `options.hints` must be a number; it is read as
+    // a uint32 and may carry no flag but those three
+    // (internal/dns/utils validateHints). Returns the hints to use.
+    function lookupHints(opts) {
+      if (opts.hints == null) return 0;
+      if (typeof opts.hints !== "number") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.hints", "number", opts.hints);
+      }
+      const hints = opts.hints >>> 0;
+      if ((hints & ~(ADDRCONFIG | ALL | V4MAPPED)) !== 0) {
+        throw codes.ERR_INVALID_ARG_VALUE("hints", hints);
+      }
+      return hints;
+    }
+
+    // dns.lookup with its hints. AI_V4MAPPED and AI_ALL mean something only
+    // for an IPv6 lookup, and getaddrinfo's rule for them is plain enough to
+    // apply to the unfiltered answer: V4MAPPED answers the IPv4 addresses as
+    // `::ffff:a.b.c.d` when there is no IPv6 one, and with ALL as well as the
+    // IPv6 ones. AI_ADDRCONFIG is not applied: oam's resolver is getaddrinfo
+    // without hints (docs/node-divergences.md).
+    function _dnsLookupHinted(hostname, family, all, hints) {
+      if (family !== 6 || (hints & V4MAPPED) === 0 || registry.get("net").isIP(String(hostname))) {
+        return _dnsLookup(hostname, family, all);
+      }
+      return _dnsLookup(hostname, 0, true).then((answers) => {
+        const v6 = answers.filter((a) => a.family === 6);
+        const mapped = answers
+          .filter((a) => a.family === 4)
+          .map((a) => ({ address: `::ffff:${a.address}`, family: 6 }));
+        const merged = hints & ALL ? v6.concat(mapped) : v6.length > 0 ? v6 : mapped;
+        // None at all is the error an IPv6 lookup of the name reports.
+        if (merged.length === 0) return _dnsLookup(hostname, 6, all);
+        return all ? merged : merged[0];
+      });
+    }
+
     function lookup(hostname, options, callback) {
       if (typeof options === "function") {
         callback = options;
@@ -27697,10 +27742,11 @@
       }
       if (typeof options === "number") options = { family: options };
       const opts = options || {};
+      const hints = lookupHints(opts);
       const family = opts.family || 0;
       const all = !!opts.all;
 
-      _dnsLookup(hostname, family, all).then(
+      _dnsLookupHinted(hostname, family, all, hints).then(
         (result) => {
           if (all) {
             callback(null, result);
@@ -27811,9 +27857,11 @@
     const promises = {
       lookup(hostname, options) {
         const opts = typeof options === "number" ? { family: options } : (options || {});
+        // node validates before it returns a promise: a bad `hints` throws.
+        const hints = lookupHints(opts);
         const family = opts.family || 0;
         const all = !!opts.all;
-        return _dnsLookup(hostname, family, all);
+        return _dnsLookupHinted(hostname, family, all, hints);
       },
       resolve(hostname, rrtype) {
         rrtype = (rrtype || "A").toUpperCase();
@@ -27886,10 +27934,6 @@
         throw err;
       }
     }
-
-    const ADDRCONFIG = 0;
-    const V4MAPPED = 0;
-    const ALL = 0;
 
     // net.connect / tls.connect / http read `dns.lookup` at call time, as
     // node does; while it is still this function they use oam's own resolver
