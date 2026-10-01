@@ -46,6 +46,7 @@ use super::connector::{ConnInfo, SuppliedConn};
 use super::decode::{self, MAX_CODINGS, Plan};
 use super::prepare::{self, PrepareError};
 use super::redirect::{self, Next};
+use super::sent::Dispatched;
 use super::tls_config::TlsRange;
 use super::transport::{channel_body, empty_body, full_body};
 use super::{HttpTransport, NetCheck, NetTarget, ReqBody, Route};
@@ -88,15 +89,17 @@ pub struct FetchRequest {
     /// checked either way (redirect::next).
     #[serde(default)]
     pub fetch_semantics: bool,
-    /// #149's knob; JS does not send it yet.
+    /// `fetch`'s `redirect` option; `http.request` always sends `manual`
+    /// (node's http client never follows a redirect).
     #[serde(default)]
     pub redirect: RedirectMode,
-    /// #148's knob: false delivers the body as received and keeps the
-    /// encoding headers. JS does not send it yet.
+    /// False delivers the body as received and keeps the encoding headers:
+    /// what `http.request` sends, node's http client decoding nothing (#148).
     #[serde(default = "yes")]
     pub decode: bool,
-    /// #148's knob: false sends the caller's headers alone. JS does not send
-    /// it yet.
+    /// False sends the caller's headers alone: what `http.request` sends,
+    /// node's http client adding no `accept` / `user-agent` /
+    /// `accept-encoding` of its own (#148).
     #[serde(default = "yes")]
     pub default_headers: bool,
     /// node's `maxHeaderSize` for the response heads of this request:
@@ -114,6 +117,14 @@ pub struct FetchRequest {
     pub tls_min_version: Option<String>,
     #[serde(default)]
     pub tls_max_version: Option<String>,
+    /// Handle of a [`super::sent`] signal to fire once the request has a
+    /// connection: `http.request`'s, for node's `'finish'` (#193).
+    #[serde(default)]
+    pub sent_signal: Option<u64>,
+    /// That signal's sending half. Never from JS: the engine's fetch op
+    /// takes it from the runtime's registry and puts it here.
+    #[serde(skip)]
+    pub dispatched: Option<Dispatched>,
 }
 
 fn yes() -> bool {
@@ -197,6 +208,9 @@ struct LoopState {
     /// [`response_head_overflow`]).
     max_header_size: u64,
     fetch_semantics: bool,
+    /// Fired by the pool when a connection has a hop's request (see
+    /// [`super::sent`]); carried across a park, dropped with the fetch.
+    dispatched: Option<Dispatched>,
 }
 
 enum BodySource {
@@ -320,6 +334,7 @@ pub async fn fetch(
             .max_header_size
             .unwrap_or_else(crate::http_head::max_http_header_size),
         fetch_semantics: req.fetch_semantics,
+        dispatched: req.dispatched,
     };
     run(state, &bodies, &ids, &continuations).await
 }
@@ -521,6 +536,9 @@ async fn run(
             *request.method_mut() = state.method.clone();
             *request.uri_mut() = uri.clone();
             *request.headers_mut() = hop_headers.clone();
+            if let Some(dispatched) = &state.dispatched {
+                request.extensions_mut().insert(dispatched.clone());
+            }
             match state.transport.send(&state.route, request).await {
                 Ok(response) => break response,
                 Err(e)
@@ -717,6 +735,24 @@ fn latin1(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| char::from(b)).collect()
 }
 
+/// The reason phrase of `response`'s status line, as node reports it in
+/// `statusText` / `statusMessage`: the one the server sent, an empty one
+/// included (#160). hyper keeps a phrase that is not the status code's
+/// canonical one as an extension, so without the extension the canonical
+/// phrase IS what was on the wire. HTTP/2 has no reason phrase, and node has
+/// no answer to copy (its fetch never negotiates h2): the canonical phrase
+/// stands in there.
+pub(super) fn reason_phrase<B>(response: &http::Response<B>) -> String {
+    match response.extensions().get::<hyper::ext::ReasonPhrase>() {
+        Some(reason) => latin1(reason.as_bytes()),
+        None => response
+            .status()
+            .canonical_reason()
+            .unwrap_or_default()
+            .to_string(),
+    }
+}
+
 /// The payload for the final response; its body goes into `bodies`.
 fn respond(
     mut state: LoopState,
@@ -725,6 +761,7 @@ fn respond(
     ids: &AtomicU64,
 ) -> OpOutcome {
     let status = response.status();
+    let reason = reason_phrase(&response);
     let conn = response.extensions().get::<ConnInfo>().cloned();
     let codings = if state.decode {
         let encodings: Vec<&[u8]> = response
@@ -747,8 +784,9 @@ fn respond(
         None
     };
     // Divergence #32: a decoded body loses content-encoding and
-    // content-length (node keeps both). http.request shares this op and
-    // would decode a second time from the header.
+    // content-length (node's fetch keeps both). http.request shares this op
+    // but asks for no decoding, so it sees both headers and the encoded
+    // bytes, as node's does.
     let strip = codings.is_some();
     let headers: Vec<(String, String)> = response
         .headers()
@@ -764,7 +802,7 @@ fn respond(
     lock(bodies).insert(handle, body);
     let mut payload = serde_json::json!({
         "status": status.as_u16(),
-        "statusText": status.canonical_reason().unwrap_or_default(),
+        "statusText": reason,
         "url": url.as_str(),
         "redirected": state.hops > 0,
         "headers": headers,

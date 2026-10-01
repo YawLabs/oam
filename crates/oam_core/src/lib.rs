@@ -700,6 +700,9 @@ pub struct CoreRuntime {
     /// Hook-mode fetches parked on their `connect.lookup` hook
     /// (`http_client::send`); dropped with the run.
     fetch_continuations: http_client::send::FetchContinuations,
+    /// `http.request`'s "this request has a connection" signals
+    /// (`http_client::sent`); dropped with the run.
+    sent_signals: http_client::sent::SentSignals,
     /// Names `netResolve` resolved for a net / tls connect, by ticket, until
     /// the connect redeems them (`net_connect::ResolvedAnswers`); dropped
     /// with the run.
@@ -800,6 +803,7 @@ impl CoreRuntime {
             tokio: Some(tokio),
             http,
             fetch_continuations: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sent_signals: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             resolved_answers: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             http_bridges: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             tls_pipes: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -869,6 +873,20 @@ impl CoreRuntime {
     /// Hook-mode fetches waiting on their `connect.lookup` hook (Arc clone).
     pub fn fetch_continuations(&self) -> http_client::send::FetchContinuations {
         self.fetch_continuations.clone()
+    }
+
+    /// Open a sent signal and return its handle (`fetchSentOpen`).
+    pub fn new_sent_signal(&self) -> u64 {
+        let handle = self
+            .next_body
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        http_client::sent::open(&self.sent_signals, handle);
+        handle
+    }
+
+    /// `http.request`'s sent signals (Arc clone).
+    pub fn sent_signals(&self) -> http_client::sent::SentSignals {
+        self.sent_signals.clone()
     }
 
     /// Addresses resolved ahead of a net / tls connect, by ticket (Arc

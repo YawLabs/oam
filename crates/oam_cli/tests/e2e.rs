@@ -6787,6 +6787,78 @@ watch.unref();
     assert_eq!(out, "connections=1 reused=false,true,true");
 }
 
+/// The same hand-back for requests with bodies, many in a row: how many bytes
+/// a request is, which the gate above compares against what the socket has
+/// taken, is read off the exchange when the response ends -- not delivered by
+/// an op of its own, whose completion could arrive after the response's
+/// (#190). Buffered and streamed bodies, each acknowledged a turn late, on one
+/// connection throughout; node v22.22.2 prints the line asserted here. The
+/// lost race itself cannot be staged from a script: what pins the count being
+/// there in time is `progress_is_complete_by_the_time_the_response_head_arrives`
+/// (oam_core's http_client_bridge tests); this holds the path end to end.
+#[test]
+fn a_late_write_acknowledgement_pools_the_socket_for_requests_with_bodies() {
+    let src = r#"
+import http from 'node:http';
+import net from 'node:net';
+const server = http.createServer((req, res) => {
+  let n = 0;
+  req.on('data', (d) => { n += d.length; });
+  req.on('end', () => res.end(String(n)));
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+let connections = 0;
+server.on('connection', () => { connections++; });
+class LateAck extends net.Socket {
+  write(chunk, encoding, cb) {
+    if (typeof encoding === 'function') { cb = encoding; encoding = undefined; }
+    return super.write(chunk, encoding, (err) => {
+      if (cb) setTimeout(() => cb(err), 20);
+    });
+  }
+}
+class OwnAgent extends http.Agent {
+  createConnection(options, cb) {
+    const s = new LateAck();
+    s.connect(options, cb);
+    return s;
+  }
+}
+const agent = new OwnAgent({ keepAlive: true });
+let reused = 0;
+const sizes = [];
+for (let i = 0; i < 24; i++) {
+  await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, agent, method: 'POST' }, (res) => {
+      let body = '';
+      res.on('data', (d) => { body += d; });
+      res.on('end', () => { sizes.push(body); resolve(); });
+    });
+    req.on('response', () => { if (req.reusedSocket) reused++; });
+    req.on('error', reject);
+    if (i % 2 === 0) {
+      req.end('x'.repeat(i + 1));
+    } else {
+      // Streamed: the second chunk goes out a turn after the first.
+      req.write('ab');
+      setImmediate(() => req.end('c'.repeat(i)));
+    }
+  });
+}
+console.log(`connections=${connections} reused=${reused} sizes=${sizes.slice(0, 4)}`);
+agent.destroy();
+server.close();
+const watch = setTimeout(() => {
+  console.log('the run did not end on its own');
+  process.exit(3);
+}, 10000);
+watch.unref();
+"#;
+    let out = run_ok("late_write_ack_pool_bodies.mjs", src);
+    assert_eq!(out, "connections=1 reused=23 sizes=1,3,3,5");
+}
+
 /// An http.get on oam's own transport is sent without waiting on a timer,
 /// and setImmediate is due at once. Each used to cost a whole OS timer tick
 /// (about 15 ms on Windows, 1 ms elsewhere): setImmediate was a 1 ms timer,
@@ -27560,6 +27632,75 @@ fn fetch_negotiates_and_decodes_content_encoding() {
     assert!(
         stdout.contains("parsed: compressed world"),
         "the decoded body must survive JSON.parse: {stdout}"
+    );
+}
+
+/// `http.get` is not `fetch`: it advertises nothing and decodes nothing (#148).
+///
+/// Node's http client sends `host` and `connection` plus what the caller
+/// wrote, and hands a `content-encoding: gzip` response over as the gzip
+/// bytes with `content-encoding` and `content-length` intact. oam's own
+/// transport is fetch's, and it gave `http.get` fetch's three default headers
+/// and a decoded body with both headers removed -- so the usual
+/// `res.pipe(zlib.createGunzip())` was handed plain text and failed. The
+/// node-differential half is conformance case 192; this pins the oam side on
+/// its own, next to the fetch test above whose behaviour must not move.
+#[test]
+fn http_get_neither_negotiates_nor_decodes_content_encoding() {
+    let stdout = run_ok(
+        "http_get_raw_gzip.mjs",
+        "import http from 'node:http';\n\
+         import zlib from 'node:zlib';\n\
+         \n\
+         const payload = 'raw body '.repeat(20);\n\
+         const gz = zlib.gzipSync(Buffer.from(payload, 'utf8'));\n\
+         let seen = null;\n\
+         const srv = http.createServer((req, res) => {\n\
+           seen = Object.keys(req.headers).sort().join(',');\n\
+           res.writeHead(200, {\n\
+             'content-encoding': 'gzip',\n\
+             'content-length': String(gz.length),\n\
+           });\n\
+           res.end(gz);\n\
+         });\n\
+         await new Promise((r) => srv.listen(0, '127.0.0.1', r));\n\
+         const port = srv.address().port;\n\
+         \n\
+         const { res, raw } = await new Promise((resolve, reject) => {\n\
+           http.get({ host: '127.0.0.1', port, path: '/' }, (res) => {\n\
+             const chunks = [];\n\
+             res.on('data', (d) => chunks.push(d));\n\
+             res.on('end', () => resolve({ res, raw: Buffer.concat(chunks) }));\n\
+           }).on('error', reject);\n\
+         });\n\
+         console.log('sent:', seen);\n\
+         console.log('content-encoding:', res.headers['content-encoding']);\n\
+         console.log('content-length matches:', res.headers['content-length'] === String(gz.length));\n\
+         console.log('raw bytes:', raw.equals(gz));\n\
+         console.log('caller decodes:', zlib.gunzipSync(raw).toString() === payload);\n\
+         \n\
+         const viaFetch = await fetch('http://127.0.0.1:' + port + '/');\n\
+         console.log('fetch decodes:', (await viaFetch.text()) === payload);\n\
+         console.log('fetch sent:', seen);\n\
+         srv.close();\n",
+    );
+    assert!(
+        stdout.contains("sent: connection,host\n"),
+        "http.get must send host and connection alone -- no accept, user-agent or accept-encoding: {stdout}"
+    );
+    assert!(
+        stdout.contains("content-encoding: gzip\n")
+            && stdout.contains("content-length matches: true"),
+        "http.get must keep the response's content-encoding and content-length: {stdout}"
+    );
+    assert!(
+        stdout.contains("raw bytes: true") && stdout.contains("caller decodes: true"),
+        "http.get must hand over the gzip bytes as sent, for the caller to decode: {stdout}"
+    );
+    assert!(
+        stdout.contains("fetch decodes: true")
+            && stdout.contains("fetch sent: accept,accept-encoding,"),
+        "fetch must keep negotiating and decoding: {stdout}"
     );
 }
 

@@ -17,9 +17,13 @@
 //! ends, fails, or the request is destroyed. Closing aborts the connection
 //! task, which ends a parked [`out`] read with EOF.
 //!
-//! [`request_sent`] tells JS how many of the bytes [`out`] hands it make up
-//! the whole request, once hyper has written all of them: node emits
-//! `'finish'` when the socket has written the last of those.
+//! [`progress`] tells JS, of the bytes [`out`] hands it, how far into the
+//! request body they reach and -- once hyper has written all of it -- how
+//! many make up the whole request: node calls a `write()` callback when the
+//! socket has written that chunk, and emits `'finish'` when it has written
+//! the last request byte. It is a synchronous read, and [`out`] completes
+//! (with no bytes) whenever it has moved, so JS never waits on a second op
+//! to learn what the bytes it already holds amount to.
 //!
 //! Upgrades (`Connection: upgrade`) and CONNECT requests do not come here:
 //! JS writes and parses those itself so the socket can be handed over after
@@ -61,17 +65,31 @@ pub struct Bridge {
     /// hyper's end of the pipe and the request, until [`response`] starts
     /// the exchange.
     pending: Option<Pending>,
-    /// JS's end, reading what hyper wrote. Out of the map while a read is
-    /// parked (remove-await-reinsert).
-    out: Option<ReadHalf<DuplexStream>>,
+    /// JS's end, reading what hyper wrote, and [`out`]'s own view of the
+    /// progress (what it has already reported). Out of the map while a read
+    /// is parked (remove-await-reinsert).
+    out: Option<(ReadHalf<DuplexStream>, watch::Receiver<Progress>)>,
     /// JS's end, writing what the socket read. Out of the map while a write
     /// is parked.
     input: Option<WriteHalf<DuplexStream>>,
     /// The connection task, once started.
     task: Option<tokio::task::AbortHandle>,
-    /// Set once hyper has written the whole request into the pipe: how many
-    /// bytes it wrote (see [`RequestEnd`]).
-    sent: watch::Receiver<Option<u64>>,
+    /// How much of the request hyper has written into the pipe (see
+    /// [`RequestEnd`]).
+    progress: watch::Receiver<Progress>,
+}
+
+/// How far hyper has got with writing the request, as of its last completed
+/// flush of the pipe.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Progress {
+    /// Bytes written into the pipe: the head, the body so far and its
+    /// framing.
+    pub written: u64,
+    /// Of the request body, the bytes those cover.
+    pub body: u64,
+    /// The whole request is written: `written` is its size.
+    pub complete: bool,
 }
 
 impl Drop for Bridge {
@@ -87,23 +105,25 @@ struct Pending {
     parts: http::request::Parts,
     body: Body,
     max_header_size: u64,
-    sent: watch::Sender<Option<u64>>,
+    progress: watch::Sender<Progress>,
 }
 
-/// How [`request_sent`] learns that the request is all written.
+/// How [`progress`] learns how much of the request is written.
 ///
 /// hyper has no such signal, so two wrappers make one. The request body
-/// ([`EndWatch`]) records that hyper has seen its end -- hyper asks
-/// `is_end_stream` before it encodes the last bytes, or polls the end of a
-/// streamed body -- and the pipe end hyper writes to ([`Counted`]) counts
-/// the bytes and, at the first completed flush after that, publishes the
-/// count. hyper flushes the pipe only once its own write buffer is empty,
-/// so at that flush every request byte, the body's framing end included,
-/// is in the pipe. Each bridge carries one request, so no later request's
-/// bytes are in the count.
+/// ([`EndWatch`]) counts the body bytes hyper has taken, and records that
+/// hyper has seen the body's end -- hyper asks `is_end_stream` before it
+/// encodes the last bytes, or polls the end of a streamed body. The pipe end
+/// hyper writes to ([`Counted`]) counts the bytes and, at every completed
+/// flush, publishes both counts. hyper encodes a body frame into its write
+/// buffer as it takes it, and flushes the pipe only once that buffer is
+/// empty, so at a flush every body byte taken so far is in the pipe, framing
+/// included -- and after the body's end, every request byte. Each bridge
+/// carries one request, so no later request's bytes are in the count.
 struct RequestEnd {
     body_ended: Arc<AtomicBool>,
-    sent: watch::Sender<Option<u64>>,
+    body_taken: Arc<AtomicU64>,
+    progress: watch::Sender<Progress>,
 }
 
 /// hyper's end of the pipe, counting what hyper writes (see [`RequestEnd`]).
@@ -115,15 +135,21 @@ struct Counted {
 
 impl Counted {
     fn flushed(&mut self) {
-        if self.written == 0 || !self.end.body_ended.load(Ordering::Acquire) {
+        if self.written == 0 {
             return;
         }
-        let written = self.written;
-        self.end.sent.send_if_modified(|sent| {
-            if sent.is_some() {
+        let next = Progress {
+            written: self.written,
+            body: self.end.body_taken.load(Ordering::Acquire),
+            complete: self.end.body_ended.load(Ordering::Acquire),
+        };
+        self.end.progress.send_if_modified(|progress| {
+            // Once complete it stays: what hyper writes after the request
+            // (nothing, on a connection that carries one) is not part of it.
+            if progress.complete || *progress == next {
                 return false;
             }
-            *sent = Some(written);
+            *progress = next;
             true
         });
     }
@@ -184,10 +210,11 @@ impl AsyncWrite for Counted {
     }
 }
 
-/// The request body, recording when hyper has reached its end (see
-/// [`RequestEnd`]).
+/// The request body, counting what hyper takes of it and recording when
+/// hyper has reached its end (see [`RequestEnd`]).
 struct EndWatch {
     body: ReqBody,
+    taken: Arc<AtomicU64>,
     ended: Arc<AtomicBool>,
 }
 
@@ -201,8 +228,14 @@ impl hyper::body::Body for EndWatch {
     ) -> Poll<Option<Result<Frame<Bytes>, BoxError>>> {
         let this = self.get_mut();
         let polled = Pin::new(&mut this.body).poll_frame(cx);
-        if let Poll::Ready(None) = &polled {
-            this.ended.store(true, Ordering::Release);
+        match &polled {
+            Poll::Ready(None) => this.ended.store(true, Ordering::Release),
+            Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.taken.fetch_add(data.len() as u64, Ordering::AcqRel);
+                }
+            }
+            _ => {}
         }
         polled
     }
@@ -421,7 +454,7 @@ pub fn start(
     };
     let (near, far) = tokio::io::duplex(PIPE);
     let (out, input) = tokio::io::split(far);
-    let (sent_tx, sent_rx) = watch::channel(None);
+    let (progress_tx, progress_rx) = watch::channel(Progress::default());
     let id = ids.fetch_add(1, Ordering::Relaxed);
     lock(bridges).insert(
         id,
@@ -433,12 +466,12 @@ pub fn start(
                 max_header_size: req
                     .max_header_size
                     .unwrap_or_else(crate::http_head::max_http_header_size),
-                sent: sent_tx,
+                progress: progress_tx,
             }),
-            out: Some(out),
+            out: Some((out, progress_rx.clone())),
             input: Some(input),
             task: None,
-            sent: sent_rx,
+            progress: progress_rx,
         },
     );
     Ok(id)
@@ -482,7 +515,7 @@ pub async fn response(
         parts,
         mut body,
         max_header_size,
-        sent,
+        progress,
     }) = pending
     else {
         return OpOutcome::Failed(format!("httpBridgeResponse: bridge {id} is gone"));
@@ -492,17 +525,23 @@ pub async fn response(
         Err(text) => return OpOutcome::Failed(text),
     };
     let body_ended = Arc::new(AtomicBool::new(false));
+    let body_taken = Arc::new(AtomicU64::new(0));
     let request = http::Request::from_parts(
         parts,
         EndWatch {
             body: request_body,
+            taken: body_taken.clone(),
             ended: body_ended.clone(),
         },
     );
     let io = Counted {
         io,
         written: 0,
-        end: RequestEnd { body_ended, sent },
+        end: RequestEnd {
+            body_ended,
+            body_taken,
+            progress,
+        },
     };
     let (mut sender, connection) = match hyper::client::conn::http1::Builder::new()
         .handshake(TokioIo::new(io))
@@ -546,11 +585,7 @@ pub async fn response(
         return refusal;
     }
     let status = response.status();
-    let reason = response
-        .extensions()
-        .get::<hyper::ext::ReasonPhrase>()
-        .map(|reason| latin1(reason.as_bytes()))
-        .unwrap_or_else(|| status.canonical_reason().unwrap_or_default().to_string());
+    let reason = super::send::reason_phrase(&response);
     let version = match response.version() {
         http::Version::HTTP_10 => "1.0",
         _ => "1.1",
@@ -576,44 +611,55 @@ pub async fn response(
 
 /// `httpBridgeOut`: the next bytes hyper wrote, for the socket; `Done` at
 /// the end (hyper finished with the connection, or the bridge closed).
+///
+/// With nothing to hand over it also completes -- with no bytes -- when
+/// [`progress`] has moved since the last call: the flush that says what the
+/// bytes amount to comes after the write that put them in the pipe, so the
+/// last bytes of a chunk, or of the request, may already have been handed
+/// over when it happens, and JS would otherwise hear of it only with bytes
+/// that may never come.
 pub async fn out(bridges: Bridges, id: u64) -> OpOutcome {
     let half = lock(&bridges)
         .get_mut(&id)
         .and_then(|bridge| bridge.out.take());
-    let Some(mut half) = half else {
+    let Some((mut half, mut seen)) = half else {
         return OpOutcome::Done;
     };
     let mut buf = vec![0u8; OUT_CHUNK];
-    let read = half.read(&mut buf).await;
+    // Bytes first: they are what the progress counts. `read` is cancel-safe
+    // (nothing leaves the pipe unless it completes), and a progress sender
+    // that is gone -- hyper dropped its end -- leaves the read to report the
+    // end.
+    let read = tokio::select! {
+        biased;
+        read = half.read(&mut buf) => Some(read),
+        Ok(()) = seen.changed() => None,
+    };
+    // JS reads the newest progress when this completes, whichever branch
+    // woke it.
+    seen.mark_unchanged();
     if let Some(bridge) = lock(&bridges).get_mut(&id) {
-        bridge.out = Some(half);
+        bridge.out = Some((half, seen));
     }
     match read {
-        Ok(0) | Err(_) => OpOutcome::Done,
-        Ok(n) => {
+        None => OpOutcome::Bytes(Vec::new()),
+        Some(Ok(0) | Err(_)) => OpOutcome::Done,
+        Some(Ok(n)) => {
             buf.truncate(n);
             OpOutcome::Bytes(buf)
         }
     }
 }
 
-/// `httpBridgeRequestSent`: once hyper has written the whole request, how
-/// many bytes that was -- the count of [`out`] bytes the socket has to have
-/// written for node's `'finish'`. `Done` if the exchange ends first (a
-/// failed or destroyed request is never finished).
-pub async fn request_sent(bridges: Bridges, id: u64) -> OpOutcome {
-    let sent = lock(&bridges).get(&id).map(|bridge| bridge.sent.clone());
-    let Some(mut sent) = sent else {
-        return OpOutcome::Done;
-    };
-    let count = match sent.wait_for(Option::is_some).await {
-        Ok(count) => *count,
-        Err(_) => None,
-    };
-    match count {
-        Some(count) => OpOutcome::Json(count.to_string()),
-        None => OpOutcome::Done,
-    }
+/// `httpBridgeProgress`: how much of the request hyper has written into the
+/// pipe as of its last flush; `None` for a bridge that is gone. Synchronous
+/// on purpose: read when the answer is needed (the socket reported a write,
+/// a response ended), it cannot arrive after the event it is needed for, as
+/// the completion of an op of its own could.
+pub fn progress(bridges: &Bridges, id: u64) -> Option<Progress> {
+    lock(bridges)
+        .get(&id)
+        .map(|bridge| *bridge.progress.borrow())
 }
 
 /// `httpBridgeIn`: hand hyper bytes the socket read. Resolves once the pipe

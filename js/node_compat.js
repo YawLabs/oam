@@ -19033,6 +19033,17 @@
       return err;
     }
 
+    // What node's net.Socket tells the callback of a write it never made:
+    // the socket closed while still connecting, or was closed by the time
+    // the write queued for its 'connect' ran.
+    function socketClosedWriteError(connected) {
+      const err = new Error(connected
+        ? "Socket is closed"
+        : "Socket closed before the connection was established");
+      err.code = connected ? "ERR_SOCKET_CLOSED" : "ERR_SOCKET_CLOSED_BEFORE_CONNECTION";
+      return err;
+    }
+
     // node's parser errors (`HPE_*`, `Parse Error: <reason>`) carry the
     // reason on their own as well.
     function withParseReason(err) {
@@ -19800,6 +19811,49 @@
         this._requestOut = 0;
         this._requestAccepted = 0;
         this._requestWritten = false;
+        // write() callbacks, called as node calls them: once the socket has
+        // written the chunk, so never before it connected. Each waits for
+        // its place in the request body (`at`, as `_bodyQueued` counts it)
+        // to be covered by `_bodyWritten`, the body bytes the socket has
+        // written -- read off the bridge's progress (`_marks`: [request
+        // bytes, the body bytes they cover] pairs `_requestOut` has yet to
+        // reach, oldest first; `_markSeen` the newest of them).
+        // `_onSocket`: the request's writes are its socket's, in node's
+        // terms -- from the tick 'socket' is emitted in, when node flushes
+        // what the request queued. A request destroyed before that never has
+        // a callback called; one that fails after it has them called with
+        // the socket's reason once it has closed (_failWriteCallbacks).
+        // `_socketConnected`: that socket connected. `_socketFailure`: the
+        // error it failed with.
+        this._writeCallbacks = [];
+        this._bodyQueued = 0;
+        this._bodyWritten = -1;
+        this._marks = [];
+        this._markSeen = 0;
+        this._onSocket = false;
+        this._socketConnected = false;
+        this._socketFailure = null;
+        // oam's own transport. `_fetchDispatched`: it has been handed the
+        // request. `_fetchSent`: it has a connection for it (the sent
+        // signal, `_sentSignal` while open) -- from then on the request is
+        // being written, a write() callback is called as the transport takes
+        // its chunk, and 'finish' follows the last of them (`_finishOnSent`:
+        // end() has asked for it; `_channelPending`: chunks the transport
+        // has yet to take). A request that never gets a connection has
+        // neither, as in node.
+        this._fetchDispatched = false;
+        this._fetchSent = false;
+        this._sentSignal = null;
+        this._finishOnSent = false;
+        this._channelPending = 0;
+        // The response leaves the transport's connection open: the request
+        // closes from the response's 'end' rather than behind its 'close'.
+        this._fetchKeptAlive = false;
+        // Inside the socket's 'connect' / 'secureConnect' emit, ahead of the
+        // request's own listener; and what a listener there closed the
+        // socket with (true: no error), held for that listener to report.
+        this._inConnectEvent = false;
+        this._closedOnConnect = null;
         this._exchangeQueued = false;
         this._waitingConnect = false;
         this._earlySocketEvents = null;
@@ -19908,6 +19962,18 @@
       }
       write(chunk, encoding, callback) {
         if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+        // node's write_: a destroyed request -- torn down, failed, or closed
+        // by its response before it was ended -- takes nothing, and says so
+        // to the callback on the next tick. Not on oam's own transport once
+        // the response has ended: the upload goes on there, as node's does on
+        // a connection the early response left open.
+        if (this._aborted ||
+            (this.destroyed && !this._ended && !(this._responseEnd && !this._agentPath))) {
+          if (typeof callback === "function") {
+            process.nextTick(function () { callback(codes.ERR_STREAM_DESTROYED("write")); });
+          }
+          return false;
+        }
         var bytes;
         if (typeof chunk === "string") {
           bytes = globalThis.Buffer.from(chunk, encoding || "utf8");
@@ -19917,18 +19983,29 @@
           bytes = globalThis.Buffer.from(chunk);
         }
         this._bodyLength += bytes.length;
+        this._bodyQueued += bytes.length;
         if (this._bodyStream !== null) {
           // Already streaming: hand the chunk to the transport. The op
-          // resolves once the socket accepts it, so write() backpressure
-          // follows the wire rather than buffering.
-          this._channelWrite(bytes).then(
-            () => { if (callback) callback(); },
-            () => { if (callback) callback(); },
-          );
+          // resolves once the transport takes it, so write() backpressure
+          // follows the wire rather than buffering. On oam's own transport
+          // that is also when the callback is called; over a socket it
+          // waits for the socket's write (_settleWrites).
+          var entry = callback ? this._queueWriteCallback(callback) : null;
+          var taken = this._channelWrite(bytes);
+          if (entry !== null && this._fetchDispatched) {
+            var self = this;
+            var settle = function () {
+              entry.taken = true;
+              self._settleFetchWrites();
+            };
+            taken.then(settle, settle);
+          } else {
+            taken.then(() => {}, () => {});
+          }
           return true;
         }
         this._body.push(bytes);
-        if (callback) queueMicrotask(callback);
+        if (callback) this._queueWriteCallback(callback);
         // A body still open on the next tick is INCREMENTAL and has to
         // stream, or the request cannot go out until the producer finishes
         // (the pipeline-into-a-request stall). The common write()+end() in
@@ -19939,6 +20016,126 @@
           queueMicrotask(() => this._startBodyStreamIfOpen());
         }
         return true;
+      }
+
+      // A write() callback waits for the socket to have written the request
+      // body up to the end of its chunk. (Writes a GET or HEAD drops --
+      // _startBodyStream -- are not in the body: theirs wait for the head.)
+      _queueWriteCallback(callback) {
+        var entry = {
+          at: this._droppedWrites ? 0 : this._bodyQueued,
+          callback: callback,
+          // Queued on the socket by node's flush in the 'socket' tick.
+          flushed: false,
+          // oam's own transport has taken the chunk.
+          taken: false,
+        };
+        this._writeCallbacks.push(entry);
+        return entry;
+      }
+
+      // oam's own transport: the write() callbacks, in order, of the chunks
+      // it has taken -- once it has a connection to write them to.
+      _settleFetchWrites() {
+        if (!this._fetchSent || this._aborted || this._errorEmitted) return;
+        var queue = this._writeCallbacks;
+        while (queue.length > 0 && queue[0].taken) queue.shift().callback(null);
+      }
+
+      // oam's own transport has a connection for the request (or answered
+      // it, or failed it after having had one): what it was handed is being
+      // written, and 'finish' is due once the last chunk is with it.
+      _fetchRequestSent() {
+        if (this._fetchSent) return;
+        this._fetchSent = true;
+        this._socketConnected = true;
+        this._settleFetchWrites();
+        this._maybeFetchFinish();
+      }
+
+      // A request that has failed never finishes: a chunk the transport
+      // takes -- or drops, its connection gone -- after the failure is not a
+      // request written, as node's socket destroyed with writes pending
+      // never calls the write that would finish it.
+      _maybeFetchFinish() {
+        if (this._errorEmitted || this._aborted) return;
+        if (!this._finishOnSent || !this._fetchSent || this._channelPending > 0) return;
+        this._finishOnSent = false;
+        this._emitFinish();
+      }
+
+      // The sent signal is done with: dropped, and whether it had fired --
+      // read here, synchronously, because the wait's own completion may
+      // still be on its way when the fetch settles.
+      _closeSentSignal() {
+        if (this._sentSignal === null) return false;
+        var fired = natives.fetchSentClose(this._sentSignal);
+        this._sentSignal = null;
+        return fired;
+      }
+
+      // node flushes what the request has queued onto its socket in the tick
+      // 'socket' is emitted in (onSocketNT's _flush), unless a listener
+      // destroyed either by then: from here a write() callback is the
+      // socket's to call, with an error if it never writes the chunk.
+      _handToSocket(socket) {
+        if (this._onSocket || this._aborted || this.destroyed || socket.destroyed) return;
+        this._onSocket = true;
+        var queue = this._writeCallbacks;
+        for (var i = 0; i < queue.length; i++) queue[i].flushed = true;
+      }
+
+      // The bridge's progress, read now: how many request bytes hyper has
+      // written and how far into the body they reach, and -- once it has
+      // written the whole request -- how many bytes that is.
+      _noteProgress(id) {
+        var progress = natives.httpBridgeProgress(id);
+        if (progress === undefined) return;
+        if (progress[0] > this._markSeen) {
+          this._markSeen = progress[0];
+          this._marks.push([progress[0], progress[1]]);
+        }
+        if (progress[2] && this._requestBytes === null) this._requestBytes = progress[0];
+      }
+
+      // The socket has written more of the request (or, `taken`, the
+      // request is over and what the socket has taken is what counts): the
+      // write() callbacks whose chunks that covers are called, in order,
+      // with node's `null`.
+      _settleWrites(taken) {
+        var reached = taken ? this._requestAccepted : this._requestOut;
+        var marks = this._marks;
+        while (marks.length > 0 && marks[0][0] <= reached) this._bodyWritten = marks.shift()[1];
+        var queue = this._writeCallbacks;
+        while (queue.length > 0 && queue[0].at <= this._bodyWritten) queue.shift().callback(null);
+      }
+
+      // Every write() callback still waiting, called with no error: the
+      // request is with oam's own transport, or its last byte was written.
+      _settleAllWrites() {
+        var queue = this._writeCallbacks;
+        while (queue.length > 0) queue.shift().callback(null);
+      }
+
+      // The request closed with write() callbacks still waiting. One that
+      // never reached a socket is never called, as in node (the request was
+      // destroyed before 'socket', or in it). The others get the reason node's
+      // socket gives a write it did not make: closed before it connected,
+      // for what node's flush had queued on it; the socket's own error for
+      // a write made after that; and for a socket that had connected, the
+      // stream's "destroyed".
+      _failWriteCallbacks() {
+        var queue = this._writeCallbacks;
+        if (queue.length === 0) return;
+        this._writeCallbacks = [];
+        if (!this._onSocket) return;
+        for (var i = 0; i < queue.length; i++) {
+          var err;
+          if (this._socketConnected) err = codes.ERR_STREAM_DESTROYED("write");
+          else if (queue[i].flushed) err = socketClosedWriteError(false);
+          else err = this._socketFailure || codes.ERR_STREAM_DESTROYED("write");
+          queue[i].callback(err);
+        }
       }
 
       // One chunk onto the outbound body channel, after everything already
@@ -19954,7 +20151,13 @@
             });
         // The tail never rejects: a failed write is the transport's report,
         // not a reason to strand the writes queued behind it.
-        this._channelTail = next.then(function () {}, function () {});
+        var self = this;
+        this._channelPending++;
+        var taken = function () {
+          self._channelPending--;
+          if (!self._agentPath) self._maybeFetchFinish();
+        };
+        this._channelTail = next.then(taken, taken);
         return next;
       }
 
@@ -19995,7 +20198,10 @@
           // pipes a Readable into a GET and waits on exactly that).
           if (this._sent) return;
           this._markHeadersSent();
-          if (!headersOnly) this._droppedWrites = true;
+          if (!headersOnly) {
+            this._droppedWrites = true;
+            for (var wi = 0; wi < this._writeCallbacks.length; wi++) this._writeCallbacks[wi].at = 0;
+          }
           this._dispatch(null);
           return;
         }
@@ -20091,11 +20297,15 @@
           this._finishAwaitsPath = true;
           return;
         }
-        this._emitFinish();
+        this._finishOnSent = true;
+        this._maybeFetchFinish();
       }
 
       _emitFinish() {
         if (this._finished || this._aborted) return;
+        // On oam's own transport nothing reports single chunks: what was
+        // written before 'finish' is called back ahead of it, as in node.
+        if (!this._agentPath) this._settleAllWrites();
         this._finished = true;
         this._bodyLength = 0;
         this.emit("finish");
@@ -20129,6 +20339,12 @@
       _requestWritableFinished() {
         if (!this._finishOnWrite) return false;
         if (this._requestWritten) return true;
+        // How many bytes the request is, read off the bridge now: the count
+        // was published when hyper flushed the last of them, which is
+        // before the peer could answer them, so it is there by the time a
+        // response has ended -- with no op completion of its own to lose a
+        // race against the response's (#190).
+        if (this._requestBytes === null && this._bridge !== null) this._noteProgress(this._bridge);
         return this._requestBytes !== null && this._requestAccepted >= this._requestBytes;
       }
 
@@ -20227,6 +20443,7 @@
           agent.totalSocketCount++;
           installListeners(agent, socket, options);
         }
+        this._handToSocket(socket);
         try {
           socket.connect(options);
         } catch (err) {
@@ -20255,6 +20472,18 @@
       _doFetchRequest(bodyData) {
         var self = this;
         self._sent = true;
+        // The transport has what was written so far, and says when it has a
+        // connection to write it to (the sent signal): the callbacks of
+        // those chunks, and 'finish', wait for that. Until then they are the
+        // connecting socket's, in node's terms (_handToSocket).
+        self._fetchDispatched = true;
+        for (var wi = 0; wi < self._writeCallbacks.length; wi++) self._writeCallbacks[wi].taken = true;
+        self._handToSocket(self._fetchSocket);
+        var signal = natives.fetchSentOpen();
+        self._sentSignal = signal;
+        natives.fetchSentWait(signal).then(function (sent) {
+          if (sent && self._sentSignal === signal) self._fetchRequestSent();
+        }, function () {});
         self._fetchActivity();
         // node's _storeHeader puts a Connection header on every request it
         // sends -- `close` when the socket is not to be kept alive,
@@ -20291,6 +20520,12 @@
           // named -- and a `lookup` / 'lookup' guard, which the request's
           // own (literal) host never needed, never saw them.
           __oamManualRedirect: true,
+          // ... and adds no header of its own beyond `host` and
+          // `connection`, and hands the response body over as the server
+          // sent it: no `accept` / `user-agent` / `accept-encoding`, no
+          // decoding, `content-encoding` and `content-length` intact.
+          __oamRawExchange: true,
+          __oamSentSignal: signal,
         };
         // The request's own response-head limit; without one the transport
         // applies the process-wide default.
@@ -20301,10 +20536,14 @@
           fetchOpts.body = bodyData;
         }
         oamFetchInternal.fetch(self._url, fetchOpts).then(function (raw) {
+          self._closeSentSignal();
           if (self._aborted) {
             bodyCancel(raw.bodyHandle);
             return;
           }
+          // An answer is an answer to a request that was sent, whether or
+          // not the signal's own completion has arrived.
+          self._fetchRequestSent();
           self._fillFetchSocket(raw);
           self._emitResponse(raw, false);
           if (self._droppedWrites && !self._ended) {
@@ -20324,7 +20563,12 @@
           // A torn-down request swallows the transport failure it caused:
           // Node's abort()/destroy() destroys the socket, and the resulting
           // ECONNRESET is never re-emitted on the destroyed request.
+          var hadConnection = self._closeSentSignal();
           if (self._aborted) return;
+          // Failed on a connection it had: the request was written as far as
+          // node's would have been, and finished first. Failed without one
+          // (refused, unresolvable): nothing was written, and no 'finish'.
+          if (hadConnection) self._fetchRequestSent();
           // Map transport failures to Node-shaped codes: retry logic keys
           // on err.code, and the transport's own texts carry none.
           var msg = typeof err === "string" ? err : (err && err.message) || String(err);
@@ -20393,6 +20637,7 @@
           } else {
             mapped = err instanceof Error ? err : new Error(msg);
           }
+          if (self._socketFailure === null) self._socketFailure = mapped;
           self._failBeforeResponse(mapped);
         });
       }
@@ -20452,8 +20697,18 @@
           if (err) {
             self._awaitingSocket = false;
             process.nextTick(function () {
-              if (self._aborted) self._emitClose();
-              else self._failBeforeResponse(err);
+              if (!self._aborted) {
+                self._failBeforeResponse(err);
+                return;
+              }
+              // Destroyed while its createConnection was pending: node's
+              // onSocketNT reports the failure then.
+              if (!self._errorEmitted) {
+                self._errorEmitted = true;
+                self.errored = err;
+                self.emit("error", err);
+              }
+              self._emitClose();
             });
           } else {
             self.onSocket(socket);
@@ -20510,7 +20765,7 @@
           // ...and then reports it: a destroy() (not an abort()) as the
           // hang-up, then 'close'.
           if (!this._errorEmitted) {
-            var failure = err || (this.aborted ? null : connResetException("socket hang up"));
+            var failure = err || this.errored || (this.aborted ? null : connResetException("socket hang up"));
             if (failure) {
               this._errorEmitted = true;
               this.errored = failure;
@@ -20532,6 +20787,7 @@
             else this._onSocketClose();
           }
         }
+        this._handToSocket(socket);
         this._maybeStartExchange();
       }
 
@@ -20647,7 +20903,15 @@
       // node's socketErrorListener: before the response, the request fails
       // with the socket's own error object.
       _onSocketError(err) {
+        if (this._socketFailure === null) this._socketFailure = err;
         if (this._aborted) return;
+        if (this._inConnectEvent && !this._responded) {
+          // A listener ahead of the request's own destroyed the socket with
+          // this: reported there, after the writes it failed
+          // (_destroyedOnConnect).
+          if (this._closedOnConnect === null) this._closedOnConnect = err;
+          return;
+        }
         if (!this._responded) {
           this._failBeforeResponse(err);
           // The fetch path's stand-in destroyed with an error aborts the
@@ -20666,6 +20930,10 @@
       // node's socketCloseListener.
       _onSocketClose() {
         if (this._aborted || this._responseDone) return;
+        if (this._inConnectEvent && !this._responded) {
+          if (this._closedOnConnect === null) this._closedOnConnect = true;
+          return;
+        }
         if (this._agentPath) {
           if (this._bridge !== null) {
             // What arrived before the close decides: hyper sees the end of
@@ -20712,6 +20980,7 @@
         this._errorEmitted = true;
         this.errored = err;
         this.destroyed = true;
+        this._finishOnSent = false;
         // node destroys the socket with the error: its idle timer is done.
         this._stopFetchSocketTimer();
         this._closeBridge();
@@ -20739,18 +21008,68 @@
           if (socket.encrypted) socket._writeQueuedBeforeConnect = true;
           if (!this._waitingConnect) {
             this._waitingConnect = true;
-            socket.once(socket.encrypted ? "secureConnect" : "connect", function () {
-              self._waitingConnect = false;
-              self._maybeStartExchange();
+            // The request's listener goes last, as node's queued write's
+            // does (it is added by the flush, after every 'socket' listener
+            // has added its own): by the time it runs, a guard's listener
+            // has had its say. A TLS socket's 'connect' is watched as well,
+            // for a listener that destroys the socket there -- it never
+            // gets to 'secureConnect'. The marker at the front says the
+            // event is being emitted, so a close a listener causes is the
+            // request's own listener's to report (_destroyedOnConnect).
+            var events = socket.encrypted ? ["connect", "secureConnect"] : ["connect"];
+            events.forEach(function (event, index) {
+              var last = index === events.length - 1;
+              socket.prependOnceListener(event, function () {
+                if (self._waitingConnect) self._inConnectEvent = true;
+              });
+              socket.once(event, function () {
+                self._inConnectEvent = false;
+                if (!self._waitingConnect) return;
+                var gone = self._aborted || socket.destroyed;
+                if (!gone && !last) return;
+                self._waitingConnect = false;
+                if (gone) {
+                  self._destroyedOnConnect();
+                  return;
+                }
+                self._socketConnected = true;
+                self._maybeStartExchange();
+              });
             });
           }
           return;
         }
+        if (!this._socketGone) this._socketConnected = true;
         this._exchangeQueued = true;
         process.nextTick(function () {
           if ((socket.destroyed && !self._socketGone) || self._aborted || self.destroyed) return;
           self._startExchange();
         });
+      }
+
+      // A 'connect' / 'secureConnect' listener ahead of the request's own
+      // destroyed the request or its socket (a guard vetting the peer).
+      // Nothing was sent, but node had queued the request's writes on the
+      // socket for this event, and they find it closed: each write()
+      // callback is called with ERR_SOCKET_CLOSED and -- the last write's
+      // callback being what emits it -- an ended request still gets its
+      // 'finish', req.writableFinished true, ahead of the hang-up.
+      _destroyedOnConnect() {
+        var failure = this._closedOnConnect;
+        this._closedOnConnect = null;
+        // Already failed some other way: nothing of node's order is left.
+        if (this.destroyed && !this._aborted) return;
+        var queue = this._writeCallbacks;
+        this._writeCallbacks = [];
+        for (var i = 0; i < queue.length; i++) queue[i].callback(socketClosedWriteError(true));
+        if (this._ended && !this._finished) {
+          this._finished = true;
+          this._bodyLength = 0;
+          this.emit("finish");
+        }
+        if (failure !== null && !this._aborted) {
+          this._failBeforeResponse(failure === true ? connResetException("socket hang up") : failure);
+        }
       }
 
       // The request's header lines in the order they were set -- the
@@ -20956,6 +21275,18 @@
               outDone();
               return;
             }
+            // What these bytes amount to -- how far into the body they
+            // reach, whether they end the request -- is read with them, so
+            // it is known before the socket reports them written.
+            self._noteProgress(id);
+            if (bytes.byteLength === 0) {
+              // Progress alone: the bytes it counts were handed over before
+              // hyper's flush said what they were.
+              self._settleWrites(false);
+              self._requestFlushed();
+              pumpOut();
+              return;
+            }
             // Taken by the socket now; written when it says so, below.
             self._requestAccepted += bytes.byteLength;
             socket.write(
@@ -20966,6 +21297,10 @@
                   return;
                 }
                 self._requestOut += bytes.byteLength;
+                self._noteProgress(id);
+                // node's order: each write() callback as its chunk is
+                // written, then 'finish' behind the last request byte.
+                self._settleWrites(false);
                 self._requestFlushed();
                 pumpOut();
               },
@@ -20973,13 +21308,6 @@
           }, function () { outDone(); });
         };
         pumpOut();
-        // How many of those bytes are the request, once hyper has written it
-        // all: node's 'finish' waits for the socket to have written them.
-        natives.httpBridgeRequestSent(id).then(function (count) {
-          if (count === undefined) return;
-          self._requestBytes = count;
-          self._requestFlushed();
-        }, function () {});
       }
 
       _bridgeInEnd() {
@@ -21082,6 +21410,7 @@
         var written = function (err) {
           if (err) return;
           self._requestWritten = true;
+          self._settleAllWrites();
           if (self._finishOnWrite) self._emitFinish();
         };
         var headBytes = globalThis.Buffer.from(head + "\r\n", "latin1");
@@ -21269,7 +21598,9 @@
               settled = true;
               bodyCancel(handle);
             }
-            if (!res.complete) {
+            // node: aborted unless it was read to its end -- its whole
+            // body having arrived is not enough.
+            if (!res.complete || !res.readableEnded) {
               res.aborted = true;
               res.emit("aborted");
             }
@@ -21297,14 +21628,23 @@
         if (!agentPath) {
           this._fetchActivity();
           // node detaches a kept-alive socket from the response at its end;
-          // the transport's connection stays pooled likewise.
-          if (this.shouldKeepAlive && responseKeepsAlive(raw, this.method)) {
+          // the transport's connection stays pooled likewise. That is also
+          // where the request closes (node's emitFreeNT, a tick after the
+          // response's 'end' and so ahead of the response's own 'close').
+          // A connection that is not kept closes the request when it goes,
+          // which is after both (_responseEnded).
+          this._fetchKeptAlive = this.shouldKeepAlive && responseKeepsAlive(raw, this.method);
+          if (this._fetchKeptAlive) {
             res.on("end", function () {
+              self.destroyed = true;
               res.socket = null;
               res.connection = null;
+              self._emitClose();
             });
           }
-          this.emit("response", res);
+          // A response nobody listens for is read to its end, as node dumps
+          // it: the request closes with it.
+          if (!this.emit("response", res)) res.resume();
           return;
         }
         // node's parserOnIncomingClient: the socket is kept only if the
@@ -21326,8 +21666,16 @@
         var self = this;
         this._responseEnd = true;
         if (!this.shouldKeepAlive) {
+          // A chunk the socket has taken was written, as far as the request
+          // will ever hear: its whole answer has arrived, and the socket is
+          // about to go (the reasoning of _requestWritableFinished).
+          if (this._bridge !== null) this._noteProgress(this._bridge);
+          this._settleWrites(true);
           // The connection is done with once its response is -- closed
           // after the response's own 'end' has been delivered.
+          // The request closes when its socket has, as node's does
+          // (socketCloseListener): behind the response's own 'close', which
+          // follows its 'end' by a tick.
           var socket = this.socket;
           globalThis.setImmediate(function () {
             self._closeBridge();
@@ -21335,9 +21683,9 @@
               socket._httpMessage = null;
               if (!socket.destroyed) socket.destroy();
             }
+            self._emitClose();
           });
           this.destroyed = true;
-          this._emitClose();
         } else if (this._requestWritableFinished() && !res.aborted) {
           this._responseKeepAlive();
         } else {
@@ -21378,15 +21726,35 @@
       // The response stopped before its end (a failed body, a destroy): the
       // connection is done with, and the request closes.
       _responseAborted() {
-        if (this._responseDone) return;
+        if (this._responseDone) {
+          // The body has all arrived. Where the response's 'end' is what
+          // settles the connection and closes the request -- a kept-alive
+          // one on oam's own transport (_emitResponse), any over an agent's
+          // socket (_agentResponseOnEnd) -- a reader that destroys the
+          // response before that 'end' was delivered (a `break` out of
+          // `for await`, a destroy() while paused) would leave the request
+          // open for good. node's response destroys its socket unless it
+          // was read to its end, and the request closes with it: so here.
+          var res0 = this.res;
+          if (this.closed || !res0 || res0.readableEnded) return;
+          if (!this._agentPath && !this._fetchKeptAlive) return;
+          this._fetchKeptAlive = false;
+        }
         this._responseDone = true;
         this._closeBridge();
         var socket = this.socket;
         if (socket && isSocketLike(socket) && !socket.destroyed) socket.destroy();
         this.destroyed = true;
-        this._emitClose();
+        // node: the response closes first (its own destroy), the request
+        // when the socket that destroy took down has closed.
+        var res = this.res;
+        var self = this;
+        if (res && !res.closed) res.once("close", function () { self._emitClose(); });
+        else this._emitClose();
       }
 
+      // The response body has arrived to its end (it may not have been read
+      // yet).
       _responseEnded() {
         this._responseDone = true;
         // The agent path's socket is settled by the response's 'end'
@@ -21394,8 +21762,17 @@
         if (this._agentPath) return;
         this._responseEnd = true;
         this._stopFetchSocketTimer();
+        // A connection kept alive closes the request from the response's
+        // 'end' (_emitResponse), and is destroyed there too: until then
+        // node's request is not, and a destroy() aborts it. One that is not
+        // kept is done with now, and closes the request as node's socket
+        // closing does: a turn of the loop on -- behind the 'end' and
+        // 'close' of a response that is being read, ahead of them for one
+        // nobody has read yet.
+        if (this._fetchKeptAlive) return;
         this.destroyed = true;
-        this._emitClose();
+        var self = this;
+        globalThis.setImmediate(function () { self._emitClose(); });
       }
 
       // The fetch path's stand-in is done with: its idle timer stops, as a
@@ -21417,15 +21794,11 @@
       destroy(err) {
         // Node's ClientRequest.destroy() returns early on an already-
         // destroyed request and does NOT re-emit -- a second destroy(err)
-        // (or one after abort()) is silent.
-        if (this._aborted) return this;
+        // (or one after abort()), or one after the response has ended or
+        // the request has failed, is silent.
+        if (this._aborted || this.destroyed) return this;
         this._aborted = true;
-        this._tearDown(!err);
-        if (err) {
-          this._errorEmitted = true;
-          this.errored = err;
-          this.emit("error", err);
-        }
+        this._tearDown(!err, err);
         return this;
       }
       // Node semantics: aborting or destroying the request destroys the
@@ -21442,14 +21815,37 @@
       // `hangUp`: destroyed without an error of the caller's (destroy(),
       // abort()) -- which before a response fails the request with node's
       // 'socket hang up' (its socketCloseListener), ahead of 'close'.
-      _tearDown(hangUp) {
+      // `err`: the caller's error, emitted a tick later as node's is (it
+      // comes back from the destroyed socket), ahead of 'close'. A request
+      // already destroyed (its response ended, or it failed) is left as it
+      // is: node's destroy() returns early, and so does abort()'s.
+      _tearDown(hangUp, err) {
         if (this.destroyed) return;
+        // An agent-path request still waiting for its socket (queued behind
+        // maxSockets, or its createConnection pending) reports the error
+        // when the socket comes, as node's onSocketNT does (_onSocketNT).
+        var awaiting = this._agentPath && this._awaitingSocket;
+        if (err) {
+          this.errored = err;
+          if (!awaiting) this._errorEmitted = true;
+        }
         this.destroyed = true;
         // Abort an in-flight upload so the transport tears the request down
         // instead of completing it with a truncated body.
         this._cancelBodyStream();
+        this._closeSentSignal();
         const res = this.res;
-        if (res && !res.destroyed) {
+        // node's destroy() dumps the response (res._dump()) and destroys the
+        // socket, whose close aborts the response only if it is incomplete:
+        // a response whose body has all arrived is read out, not aborted.
+        // (This is also what a `break` out of `for await (... of res)`
+        // reaches: the stream's destroyer aborts res.req.)
+        var dumped = false;
+        if (res && !res.destroyed && res.complete) {
+          dumped = true;
+          res.removeAllListeners("data");
+          res.resume();
+        } else if (res && !res.destroyed) {
           const reset = new Error("aborted");
           reset.code = "ECONNRESET";
           if (this._inSocketTimeout) {
@@ -21464,24 +21860,33 @@
         this._closeBridge();
         var socket = this.socket || this._fetchSocket;
         if (socket && isSocketLike(socket) && !socket.destroyed) socket.destroy();
-        // An agent-path request still waiting for its socket (queued behind
-        // maxSockets, or its createConnection pending) closes when the socket
-        // comes, as node's onSocketNT does -- handing that socket back.
-        if (this._agentPath && this._awaitingSocket) return;
-        if (hangUp && !this._responded && !this._errorEmitted) {
-          var self = this;
+        // ...and closes then too, handing that socket back.
+        if (awaiting) return;
+        var self = this;
+        if (err) {
+          process.nextTick(function () { self.emit("error", err); });
+        } else if (hangUp && !this._responded && !this._errorEmitted) {
           var hungUp = connResetException("socket hang up");
           this._errorEmitted = true;
           this.errored = hungUp;
           process.nextTick(function () { self.emit("error", hungUp); });
         }
-        this._emitClose();
+        // A dumped response's request closes from its 'end' if that comes
+        // first, else when node's destroyed socket would have closed (its
+        // socketCloseListener): a turn of the loop on.
+        if (dumped) globalThis.setImmediate(function () { self._emitClose(); });
+        else this._emitClose();
       }
       _emitClose() {
         if (this.closed) return;
         this.closed = true;
         var self = this;
-        process.nextTick(function () { self.emit("close"); });
+        process.nextTick(function () {
+          self.emit("close");
+          // node: a write the socket never made hears of it once the socket
+          // has closed, which is after the request's own 'close'.
+          self._failWriteCallbacks();
+        });
       }
       // node's: nothing once the response has ended; else the request hears
       // its socket's 'timeout' (once) and the socket's idle timeout is set
