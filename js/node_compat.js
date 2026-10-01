@@ -19726,6 +19726,9 @@
         this.errored = null;
         this._bodyLength = 0;
         this._bodyStream = null;
+        // Cancels the transport's request while it has no response (set by
+        // _doFetchRequest; see _cancelBodyStream).
+        this._fetchCancel = null;
         // Every operation on the outbound body channel queues behind the one
         // before it (see _channelWrite). Unordered calls race: the write op is
         // ASYNC and the end op is SYNCHRONOUS, so end() drops the channel's
@@ -20291,6 +20294,11 @@
           // named -- and a `lookup` / 'lookup' guard, which the request's
           // own (literal) host never needed, never saw them.
           __oamManualRedirect: true,
+          // What takes the request off the wire if it is aborted or
+          // destroyed before its response (see _cancelBodyStream).
+          __oamCanceller: function (cancel) {
+            self._fetchCancel = cancel;
+          },
         };
         // The request's own response-head limit; without one the transport
         // applies the process-wide default.
@@ -21439,10 +21447,21 @@
       // underlying socket, so an in-flight response stream fails with
       // ECONNRESET -- otherwise `for await (const c of res)` never
       // terminates and the program hangs. 'close' follows, once.
+      //
+      // Before the response, the request itself is cancelled: the transport
+      // closes the connection it went out on (or stops connecting), so the
+      // server sees the client leave when node's would, not after it has
+      // answered a request nobody is waiting for. Once the response head is
+      // in, this is a no-op and the response's own teardown closes it.
       _cancelBodyStream() {
         if (this._bodyStream !== null) {
           natives.fetchBodyChannelCancel(this._bodyStream);
           this._bodyStream = null;
+        }
+        if (this._fetchCancel !== null) {
+          var cancel = this._fetchCancel;
+          this._fetchCancel = null;
+          cancel();
         }
       }
 

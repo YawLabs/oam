@@ -8082,6 +8082,105 @@ process.exit(0);
     );
 }
 
+/// An abort BEFORE the response head takes the request off the wire (#158):
+/// the server sees the client leave without having answered. oam used to
+/// reject the promise and leave the request running until the server
+/// answered it. Conformance case 212 compares the plain shapes with node;
+/// this covers the ones around them -- an abort in the tick of the call (one
+/// that lands before the op has run at all), an abort while a streamed
+/// request body is still going out, and `http.request` torn down by
+/// `destroy()` mid-upload and by `abort()`. Every line below is node
+/// v22.22.2's own output for this script.
+#[test]
+fn an_abort_before_the_head_takes_the_request_off_the_wire() {
+    let script = write_temp(
+        "abort_before_head/main.mjs",
+        r#"import http from 'node:http';
+import { getEventListeners } from 'node:events';
+const arrived = new Map();
+const left = new Map();
+const answered = new Set();
+const server = http.createServer((req, res) => {
+  const path = req.url;
+  if (path === '/warm') { res.end('ok'); return; }
+  const fallback = setTimeout(() => { answered.add(path); res.end('late'); }, 3000);
+  res.on('close', () => { clearTimeout(fallback); left.get(path)?.(res.writableFinished); });
+  req.on('data', () => {});
+  arrived.get(path)?.();
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+const watch = (path) => ({
+  arrived: new Promise((r) => arrived.set(path, r)),
+  left: new Promise((r) => left.set(path, r)),
+});
+await (await fetch(`${base}/warm`)).text();
+{
+  // Aborted in the tick it was called in: the request is cancelled before
+  // or after it reaches the server, and is never answered either way.
+  const ac = new AbortController();
+  const pending = fetch(`${base}/same-tick`, { signal: ac.signal });
+  ac.abort(new Error('mine'));
+  try { await pending; console.log('same tick: RESOLVED'); }
+  catch (e) { console.log('same tick:', e.message, getEventListeners(ac.signal, 'abort').length); }
+  await new Promise((r) => setTimeout(r, 300));
+  console.log('same tick answered:', answered.has('/same-tick'));
+}
+{
+  // Aborted while the request body is still being sent.
+  const seen = watch('/upload');
+  const ac = new AbortController();
+  let pull;
+  const body = new ReadableStream({ pull(c) { if (!pull) { pull = true; c.enqueue(new Uint8Array(1000)); } else return new Promise(() => {}); } });
+  const pending = fetch(`${base}/upload`, { method: 'POST', body, duplex: 'half', signal: ac.signal });
+  await seen.arrived;
+  ac.abort();
+  try { await pending; console.log('upload: RESOLVED'); }
+  catch (e) { console.log('upload:', e.name); }
+  console.log('upload: server saw the client leave, finished', await seen.left);
+}
+{
+  // http.request with a body it never ends, destroyed before a response.
+  const seen = watch('/request-upload');
+  const req = http.request(`${base}/request-upload`, { method: 'POST' }, () => console.log('RESPONSE'));
+  const failed = new Promise((r) => req.on('error', (e) => r(`${e.code} ${e.message}`)));
+  req.write('partial');
+  await seen.arrived;
+  req.destroy();
+  console.log('http.request:', await failed);
+  console.log('http.request: server saw the client leave, finished', await seen.left);
+}
+{
+  // req.abort() is the same teardown.
+  const seen = watch('/request-abort');
+  const req = http.request(`${base}/request-abort`, () => console.log('RESPONSE'));
+  const failed = new Promise((r) => req.on('error', (e) => r(`${e.code} ${e.message}`)));
+  req.end();
+  await seen.arrived;
+  req.abort();
+  console.log('req.abort():', await failed);
+  console.log('req.abort(): server saw the client leave, finished', await seen.left);
+}
+console.log('answered:', [...answered].join(',') || 'none');
+process.exit(0);
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "same tick: mine 0\n\
+         same tick answered: false\n\
+         upload: AbortError\n\
+         upload: server saw the client leave, finished false\n\
+         http.request: ECONNRESET socket hang up\n\
+         http.request: server saw the client leave, finished false\n\
+         req.abort(): ECONNRESET socket hang up\n\
+         req.abort(): server saw the client leave, finished false\n\
+         answered: none"
+    );
+}
+
 /// A redirect hop that takes a pooled connection the server has already
 /// closed is sent again on a fresh one, and a request whose FRESH connection
 /// dies unanswered is not. Both lines are node v22.22.2's output for this

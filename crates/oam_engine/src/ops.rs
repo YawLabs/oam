@@ -90,7 +90,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     // __oam: the internal op table consumed by js/bootstrap.js. Not public
     // API; the bootstrap wraps these in web-shaped surfaces (fetch, ...).
     let internal = v8::Object::new(scope);
-    let internal_bindings: [(&str, v8::Local<v8::Function>); 21] = [
+    let internal_bindings: [(&str, v8::Local<v8::Function>); 22] = [
         ("fetch", v8::Function::new(scope, op_fetch).unwrap()),
         // A fetch whose dispatcher has a `connect.lookup` hook parks before
         // dialling a host name; JS runs the hook and resumes or drops it.
@@ -107,6 +107,12 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         (
             "fetchAbandon",
             v8::Function::new(scope, op_fetch_abandon).unwrap(),
+        ),
+        // An aborted fetch (or a destroyed http.request) with no response
+        // head yet: take its request off the wire.
+        (
+            "fetchCancel",
+            v8::Function::new(scope, op_fetch_cancel).unwrap(),
         ),
         (
             "fetchBodyRead",
@@ -363,12 +369,21 @@ fn op_fetch(
             return;
         }
     }
+    // The id JS will cancel this fetch by (`fetchCancel`), if it passed one.
+    // Registered here, before the op is spawned, so a cancel in the same
+    // tick as the call finds it.
+    let cancel_id = args.get(1);
+    let cancel_id = cancel_id
+        .is_number()
+        .then(|| cancel_id.number_value(scope).unwrap_or(0.0) as u64);
     let core = core_runtime!(scope);
     let transport = core.http_client();
     let bodies = core.bodies();
     let ids = core.body_ids();
     let outbound = core.outbound_bodies();
     let continuations = core.fetch_continuations();
+    let cancel =
+        cancel_id.map(|id| oam_core::ops::FetchCancel::register(&core.fetch_cancels(), id));
     spawn_op(
         scope,
         &mut rv,
@@ -380,6 +395,7 @@ fn op_fetch(
             outbound,
             continuations,
             net_check,
+            cancel,
         ),
     );
 }
@@ -504,6 +520,22 @@ fn op_fetch_abandon(
     let continuations = core_runtime!(scope).fetch_continuations();
     let dropped = oam_core::ops::fetch_abandon(token, &continuations);
     rv.set(v8::Boolean::new(scope, dropped).into());
+}
+
+/// `__oam.fetchCancel(id)`, synchronous: cancel the fetch started as
+/// `__oam.fetch(request, id)` if it has no response head yet -- its request
+/// comes off the wire (the connection closes, or the h2 stream resets) and
+/// its op fails. Returns whether there was such a fetch; one that already has
+/// its head is not touched (its body has its own cancel).
+fn op_fetch_cancel(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let cancels = core_runtime!(scope).fetch_cancels();
+    let cancelled = oam_core::ops::fetch_cancel(id, &cancels);
+    rv.set(v8::Boolean::new(scope, cancelled).into());
 }
 
 /// `httpTransportDestroy()`: drop every connection the shared fetch transport

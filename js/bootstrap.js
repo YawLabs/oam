@@ -4,7 +4,8 @@
 //
 // fetch: plain-object Response/Headers shapes (real spec classes arrive with
 // oam_web + WPT) over a streamed body. Wire contract with crates/oam_core
-// http_client::send (__oam.fetch / fetchContinue / fetchAbandon):
+// http_client::send (__oam.fetch / fetchContinue / fetchAbandon /
+// fetchCancel):
 //   request:  JSON string {url, method, headers: [[k,v]],
 //             body | body_base64 | body_stream, attempt_timeout_ms,
 //             fetch_semantics, lookup_hook?, connect_timeout_ms?}
@@ -12,6 +13,9 @@
 //             bodyHandle} -- or, for a lookup_hook request,
 //             {lookup: {token, host, port}}: run the hook, then
 //             fetchContinue(token, JSON {ips}) or fetchAbandon(token)
+//   cancel:   fetch(request, id) registers the fetch under `id`;
+//             fetchCancel(id) takes it off the wire while it has no
+//             response head (after the head, fetchBodyCancel(bodyHandle))
 // SNAPSHOT CONSTRAINT: this file is evaluated at BUILD time into the V8
 // startup snapshot, where no native bindings exist. Anything from __oam
 // must be looked up at CALL time, never captured at eval time.
@@ -1680,6 +1684,9 @@
     configurable: false,
   });
 
+  // Ids for `__oam.fetch(request, id)` / `fetchCancel(id)`.
+  let fetchCancelIds = 0;
+
   async function oamFetch(input, init, rawPayload) {
     init = init || {};
     const signal = init.signal;
@@ -1927,25 +1934,37 @@
       }
     }
     // Started synchronously: a malformed request or a --permission refusal
-    // throws from here, as it always has.
-    const pending = globalThis.__oam.fetch(JSON.stringify(request));
-    if (rawPayload) return settleRaw(pending, lookup, signal, connector);
+    // throws from here, as it always has. The id is what cancels it: while
+    // the fetch has no response head, `cancel()` takes the request off the
+    // wire -- the connection closes (an h2 stream resets), so the server sees
+    // the client leave, as node's does. After the head it does nothing (the
+    // body has its own cancel), and a fetch parked on its lookup hook or
+    // connector is dropped by the abandon in settleRaw.
+    const internal = globalThis.__oam;
+    const cancelId = ++fetchCancelIds;
+    const cancel = () => internal.fetchCancel(cancelId);
+    const pending = internal.fetch(JSON.stringify(request), cancelId);
+    if (rawPayload) {
+      // http.ClientRequest cancels on abort() / destroy().
+      if (typeof init.__oamCanceller === "function") init.__oamCanceller(cancel);
+      return settleRaw(pending, lookup, signal, connector);
+    }
     const op = settleFetch(pending, lookup, signal, connector);
     if (!signal) return op;
-    // Race the abort. Wave-1 divergence (documented): the underlying op
-    // is not cancelled at the socket — the abort rejects the fetch
-    // PROMISE promptly (the observable contract), the response is
-    // discarded; full socket-level cancellation lands with the op-handle
-    // rework.
+    // Race the abort: it rejects the fetch with the reason at once, and
+    // cancels the request. The cancelled op then fails, into a race that is
+    // already decided. One listener, as node leaves one per fetch.
     return Promise.race([
       op,
       new Promise((_resolve, reject) => {
         signal.addEventListener(
           "abort",
-          () =>
+          () => {
             reject(
               signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError"),
-            ),
+            );
+            cancel();
+          },
           { once: true },
         );
       }),

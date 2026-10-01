@@ -71,6 +71,7 @@ impl Reg {
             self.outbound.clone(),
             self.continuations.clone(),
             self.net_check.clone(),
+            None,
         )
         .await
     }
@@ -1037,6 +1038,114 @@ async fn a_connect_that_outruns_the_connect_timeout_fails_as_undicis() {
             );
         }
         assert_eq!(accepted.load(Ordering::SeqCst), 4);
+    })
+    .await;
+}
+
+/// A fetch with no response head yet can be cancelled (#158): the request
+/// comes off the wire -- the server reads the end of the connection where it
+/// was still waiting to answer -- and the op fails as `ABORTED`. A cancel
+/// that lands before the op has run at all is kept, and nothing is dialled;
+/// one after the head finds nothing, and the registration is gone either
+/// way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_fetch_leaves_the_wire() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    within(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let count = connections.clone();
+        // `/answer` is answered; anything else is held until the client
+        // leaves, which is reported on `left`.
+        let (arrived_tx, mut arrived) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (left_tx, mut left) = tokio::sync::mpsc::unbounded_channel::<()>();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                let arrived_tx = arrived_tx.clone();
+                let left_tx = left_tx.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).to_string();
+                    let path = head.split(' ').nth(1).unwrap_or_default().to_string();
+                    if path == "/answer" {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                            .await;
+                    }
+                    let _ = arrived_tx.send(path);
+                    // The client closing (or resetting) the connection.
+                    while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+                    let _ = left_tx.send(());
+                });
+            }
+        });
+        let reg = Reg::new();
+        let t = plain();
+        let cancels: send::FetchCancels = Arc::new(Mutex::new(HashMap::new()));
+        let start = |id: u64, path: &str| {
+            let request: FetchRequest =
+                serde_json::from_value(json!({ "url": format!("http://127.0.0.1:{port}{path}") }))
+                    .unwrap();
+            // Registered before the op is spawned, as the engine does.
+            let cancel = send::FetchCancel::register(&cancels, id);
+            tokio::spawn(send::fetch(
+                t.clone(),
+                request,
+                reg.bodies.clone(),
+                reg.ids.clone(),
+                reg.outbound.clone(),
+                reg.continuations.clone(),
+                None,
+                Some(cancel),
+            ))
+        };
+
+        // On the wire, no answer coming: the cancel ends it.
+        let op = start(1, "/held");
+        assert_eq!(arrived.recv().await.unwrap(), "/held");
+        assert!(send::fetch_cancel(1, &cancels));
+        assert_eq!(failed(op.await.unwrap()), send::ABORTED);
+        left.recv().await.unwrap();
+        assert!(cancels.lock().unwrap().is_empty());
+        assert!(!send::fetch_cancel(1, &cancels), "cancelled twice");
+
+        // Cancelled before the op was ever polled: nothing is dialled.
+        let request: FetchRequest =
+            serde_json::from_value(json!({ "url": format!("http://127.0.0.1:{port}/never") }))
+                .unwrap();
+        let cancel = send::FetchCancel::register(&cancels, 2);
+        assert!(send::fetch_cancel(2, &cancels));
+        let outcome = send::fetch(
+            t.clone(),
+            request,
+            reg.bodies.clone(),
+            reg.ids.clone(),
+            reg.outbound.clone(),
+            reg.continuations.clone(),
+            None,
+            Some(cancel),
+        )
+        .await;
+        assert_eq!(failed(outcome), send::ABORTED);
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        assert!(cancels.lock().unwrap().is_empty());
+
+        // Answered: the head ends the registration, and a late cancel does
+        // not touch the response.
+        let op = start(3, "/answer");
+        let value = payload(op.await.unwrap());
+        assert_eq!(arrived.recv().await.unwrap(), "/answer");
+        assert!(!send::fetch_cancel(3, &cancels));
+        assert_eq!(reg.text(handle_of(&value)).await, "ok");
     })
     .await;
 }
@@ -2661,6 +2770,7 @@ fn static_checks() {
         reg.outbound.clone(),
         reg.continuations.clone(),
         reg.net_check.clone(),
+        None,
     ));
     assert_op_future(send::fetch_continue(
         1,

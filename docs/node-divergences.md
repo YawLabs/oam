@@ -1338,13 +1338,15 @@ What still differs:
   for the default and 1 s for a 300 ms timeout). And under a `connect.lookup` hook the time
   the hook itself takes is not counted: the timeout starts when oam dials the addresses it
   returned.
-- **Aborting a `fetch` before its response head does not cancel the request.** The promise
-  rejects with the abort reason at once, as in Node, but the request stays on the wire until
-  the response head arrives; that response is then cancelled on arrival, which closes its
-  connection. Measured with a server that answers after 600 ms and an abort at 100 ms: under
-  Node the server sees the client leave (`res` `'close'` with `writableFinished` false, then
-  `req` `'close'`); under oam the response finishes. A server that sends its head late and
-  then streams sees the client leave at the abort in Node and at the head in oam. A `fetch`
+- **Aborting a `fetch` before its response head takes the request off the wire** (#158, case
+  212), as in Node: the promise rejects with the abort reason and the connection the request
+  went out on is closed (an h2 stream is reset), so the server sees the client leave (`res`
+  `'close'` with `writableFinished` false) at the abort. So does `req.destroy()` / `req.abort()`
+  on an `http.request` that has no response yet. Up to 0.17.1 the request stayed on the wire
+  until the server answered it. One difference: a `fetch` aborted in the same tick it was
+  called in is cancelled before anything is sent, where Node has already written the request
+  when a pooled connection was at hand (the server then sees a request and the client
+  leaving; under oam it sees nothing). A `fetch`
   waiting on its `connect.lookup` hook (below) is dropped when it aborts. An abort that lands
   AFTER the response head ends the body as in Node, whether or not anything is reading it:
   the connection is closed, a stream being read errors with the abort reason (the chunks

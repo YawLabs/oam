@@ -700,6 +700,9 @@ pub struct CoreRuntime {
     /// Hook-mode fetches parked on their `connect.lookup` hook
     /// (`http_client::send`); dropped with the run.
     fetch_continuations: http_client::send::FetchContinuations,
+    /// Fetches with no response head yet that JS can cancel
+    /// (`http_client::send::FetchCancel`).
+    fetch_cancels: http_client::send::FetchCancels,
     /// Names `netResolve` resolved for a net / tls connect, by ticket, until
     /// the connect redeems them (`net_connect::ResolvedAnswers`); dropped
     /// with the run.
@@ -800,6 +803,7 @@ impl CoreRuntime {
             tokio: Some(tokio),
             http,
             fetch_continuations: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            fetch_cancels: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             resolved_answers: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             http_bridges: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             tls_pipes: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -869,6 +873,12 @@ impl CoreRuntime {
     /// Hook-mode fetches waiting on their `connect.lookup` hook (Arc clone).
     pub fn fetch_continuations(&self) -> http_client::send::FetchContinuations {
         self.fetch_continuations.clone()
+    }
+
+    /// In-flight fetches JS can cancel before their response head (Arc
+    /// clone).
+    pub fn fetch_cancels(&self) -> http_client::send::FetchCancels {
+        self.fetch_cancels.clone()
     }
 
     /// Addresses resolved ahead of a net / tls connect, by ticket (Arc
@@ -3926,8 +3936,8 @@ pub mod ops {
     /// The fetch op and its wire request: oam's own transport (#143). The
     /// body reader is [`fetch_body_read`].
     pub use crate::http_client::send::{
-        FetchContinuations, FetchRequest, RedirectMode, fetch, fetch_abandon, fetch_continue,
-        fetch_supply,
+        FetchCancel, FetchCancels, FetchContinuations, FetchRequest, RedirectMode, fetch,
+        fetch_abandon, fetch_cancel, fetch_continue, fetch_supply,
     };
 
     /// zlibStreamCreate: allocate an incremental compressor or decompressor.
