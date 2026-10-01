@@ -1568,9 +1568,14 @@ As in Node, `headersTimeout` starts once the request is on a connected socket --
 replaced `dns.lookup` or a `connect.lookup` hook), the TCP connect, the TLS handshake, a
 connect function and a proxy tunnel count for nothing -- each redirect hop gets its own, and
 a late head closes that connection. The transport runs it from the moment it has a
-connection for the request, oam's own pool's or the socket a connect function handed back
-(pinned by `undici_phase_timeouts_measure_what_undici_measures` and
-`undici_headers_timeout_on_the_pool_starts_once_connected`, e2e). What differs:
+connection for the request, oam's own pool's or the socket a connect function handed back,
+and only while one has it: a pooled connection that hands the request back unsent stops the
+limit, and the fresh connection the pool dials in its place starts it again once connected,
+as undici arms a new timer on the socket that next carries a request it re-queued (pinned by
+`undici_phase_timeouts_measure_what_undici_measures` and
+`undici_headers_timeout_on_the_pool_starts_once_connected`, e2e, and
+`the_headers_timeout_stops_while_an_unsent_request_is_re_dialled` in
+`crates/oam_core/tests/http_client_fetch.rs`). What differs:
 
 - **The timers are exact.** undici's are coarse (a 500 ms `headersTimeout` fires after about
   1019 ms in Node); oam's fire at the configured delay. A delay above 2^31-1 ms

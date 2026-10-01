@@ -756,6 +756,130 @@ fn a_pooled_connection_whose_fin_has_arrived_is_not_written_to() {
     );
 }
 
+/// One request head (and its content-length body) off an async stream, or
+/// `None` at EOF.
+async fn read_request_async<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Option<String> {
+    use tokio::io::AsyncReadExt as _;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+            let len = head
+                .lines()
+                .find_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if buf.len() >= end + 4 + len {
+                return Some(head);
+            }
+        }
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+/// undici's headersTimeout runs only while a connection has the request. A
+/// pooled TLS connection the server has closed hands the request back
+/// unsent (as in the test above), and the pool re-dials: that dial's TLS
+/// handshake, held here for longer than the limit, counts for nothing, and
+/// the limit starts again at the fresh connection's checkout. node + undici
+/// re-queue such a request with no timer and arm a new one on the socket
+/// that next carries it. Before the fix the limit started at the first
+/// checkout kept running through the re-dial and failed the POST with
+/// UND_ERR_HEADERS_TIMEOUT though the origin answered at once.
+#[test]
+fn the_headers_timeout_stops_while_an_unsent_request_is_re_dialled() {
+    use tokio::io::AsyncWriteExt as _;
+    const LIMIT_MS: u64 = 250;
+    install_provider();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
+    let seen = Arc::new(Mutex::new(Vec::<usize>::new()));
+    let server = {
+        let seen = seen.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let acceptor = tls_acceptor(&[b"http/1.1"]);
+                let answer = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+                // Connection 0: answer one request (so it is pooled), then
+                // close it -- close_notify and FIN -- on the test's signal.
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut first = acceptor.accept(tcp).await.unwrap();
+                if read_request_async(&mut first).await.is_some() {
+                    seen.lock().unwrap().push(0);
+                    first.write_all(answer).await.unwrap();
+                    first.flush().await.unwrap();
+                }
+                close_rx.await.unwrap();
+                let _ = first.shutdown().await;
+                drop(first);
+                closed_tx.send(()).unwrap();
+                // Connection 1, the re-dial: its handshake waits past the
+                // limit, then whatever comes next is answered at once.
+                let (tcp, _) = listener.accept().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(LIMIT_MS * 2)).await;
+                let mut second = acceptor.accept(tcp).await.unwrap();
+                while read_request_async(&mut second).await.is_some() {
+                    seen.lock().unwrap().push(1);
+                    second.write_all(answer).await.unwrap();
+                    second.flush().await.unwrap();
+                }
+            });
+        })
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .event_interval(1024)
+        .build()
+        .unwrap();
+    runtime.block_on(within(async {
+        let transport = plain();
+        let reg = Reg::new();
+        let url = format!("https://localhost:{port}/p");
+        let post = json!({
+            "url": &url,
+            "method": "POST",
+            "body": "x",
+            "headers_timeout_ms": LIMIT_MS,
+        });
+        let p = payload(reg.fetch(&transport, post.clone()).await);
+        assert_eq!(reg.text(handle_of(&p)).await, "ok");
+        let_the_pool_settle().await;
+
+        // The server closes; this thread blocks, so nothing polls the
+        // reactor until the POST below has been handed to the connection.
+        close_tx.send(()).unwrap();
+        closed_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let outcome = reg.fetch(&transport, post).await;
+        let p = payload(outcome);
+        assert_eq!(p["status"], 200);
+        assert_eq!(reg.text(handle_of(&p)).await, "ok");
+    }));
+    drop(runtime);
+    server.join().unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [0, 1],
+        "the closed connection never read the second POST: it went back unsent"
+    );
+}
+
 // ---------------------------------------------------------------- redirects
 
 #[tokio::test(flavor = "multi_thread")]

@@ -216,6 +216,11 @@ impl Pool {
                     if reused && allow_reuse {
                         // A pooled connection handed the request back unsent:
                         // re-dial and send it on a fresh one (retry_canceled).
+                        // No connection has it while that one dials, so a
+                        // headers timeout stops until its checkout (`sent`).
+                        if let Some(dispatched) = returned.extensions().get::<Dispatched>() {
+                            dispatched.unsent();
+                        }
                         req = returned;
                         allow_reuse = false;
                         continue;
