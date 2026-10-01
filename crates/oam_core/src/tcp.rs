@@ -257,6 +257,14 @@ fn set_linger_zero(stream: &tokio::net::TcpStream) -> std::io::Result<()> {
     }
 }
 
+/// Arm a stream that is about to be dropped so that its close is a reset:
+/// node's resetAndDestroy() on a socket oam's http server holds rather than
+/// this registry. Best-effort, as a failed close is: the
+/// stream closes either way.
+pub(crate) fn arm_reset(stream: &tokio::net::TcpStream) {
+    let _ = set_linger_zero(stream);
+}
+
 /// A read half of a reset stream, out of the registry for good. The socket
 /// closes (with the reset) when the last half goes, so each half re-arms
 /// the linger on its way out: the reset may have found neither in the maps.

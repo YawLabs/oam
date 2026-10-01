@@ -210,6 +210,46 @@ pub enum CloseReason {
     /// headersTimeout / requestTimeout: answer 408 when no response head went
     /// out, then close.
     RequestTimeout,
+    /// `socket.resetAndDestroy()`: close with a reset (SO_LINGER 0), so the
+    /// peer's read fails with ECONNRESET and nothing unsent is delivered --
+    /// not even a 408 a request timeout asked for.
+    Reset,
+}
+
+/// A server connection's stream, as [`CloseReason::Reset`] closes it: armed
+/// so that the close which follows sends a reset rather than a FIN. Through
+/// TLS it is the TCP socket underneath that is armed, as node's
+/// resetAndDestroy() on the plain socket of an https connection resets it.
+pub trait AbortiveClose {
+    fn arm_reset(&self);
+}
+
+impl AbortiveClose for tokio::net::TcpStream {
+    fn arm_reset(&self) {
+        crate::tcp::arm_reset(self);
+    }
+}
+
+impl AbortiveClose for tokio_rustls::server::TlsStream<crate::tls::server::ServerIo> {
+    fn arm_reset(&self) {
+        crate::tcp::arm_reset(self.get_ref().0.tcp());
+    }
+}
+
+/// An in-memory pipe (the tests' connections): there is no socket to reset,
+/// and dropping it is the only close it has.
+impl AbortiveClose for tokio::io::DuplexStream {
+    fn arm_reset(&self) {}
+}
+
+/// Drop a connection's stream that is being closed without hyper -- refused
+/// from a `'connection'` listener, or never served -- with the reset a
+/// `socket.resetAndDestroy()` asked for.
+pub fn close_unserved<S: AbortiveClose>(stream: S, watch: &ConnWatch) {
+    if watch.close_reason() == Some(CloseReason::Reset) {
+        stream.arm_reset();
+    }
+    drop(stream);
 }
 
 /// A socket timeout that fired (node's socket 'timeout').
@@ -669,13 +709,16 @@ impl ConnWatch {
 
 /// Close a connection whose hyper side is gone: for a request timeout,
 /// node's 408 first when `may_answer` (no response head went out; read
-/// before hyper's side was dropped, which ends the response).
-pub async fn finish_close<S: AsyncWrite + Unpin>(
+/// before hyper's side was dropped, which ends the response); for a reset,
+/// SO_LINGER 0 so the drop sends RST.
+pub async fn finish_close<S: AsyncWrite + AbortiveClose + Unpin>(
     mut stream: S,
     reason: CloseReason,
     may_answer: bool,
 ) {
-    if reason == CloseReason::RequestTimeout && may_answer {
+    if reason == CloseReason::Reset {
+        stream.arm_reset();
+    } else if reason == CloseReason::RequestTimeout && may_answer {
         let _ = tokio::time::timeout(FAREWELL_BUDGET, async {
             stream.write_all(REQUEST_TIMEOUT_RESPONSE).await?;
             stream.shutdown().await
@@ -1011,6 +1054,75 @@ mod tests {
         assert_eq!(
             w.closed(CloseReason::Destroy).await,
             CloseReason::RequestTimeout
+        );
+        // resetAndDestroy() overrides them all -- even a 408 that was due --
+        // and nothing after it takes it back.
+        w.close(CloseReason::Reset);
+        w.close(CloseReason::RequestTimeout);
+        assert_eq!(w.closed(CloseReason::End).await, CloseReason::Reset);
+    }
+
+    /// A peer of a connection `stream`, reading to the end on a thread of
+    /// its own; it reports how that read ended.
+    async fn accepted_with_peer() -> (
+        tokio::net::TcpStream,
+        std::sync::mpsc::Receiver<io::Result<usize>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut peer = std::net::TcpStream::connect(addr).unwrap();
+            let mut all = Vec::new();
+            let _ = tx.send(std::io::Read::read_to_end(&mut peer, &mut all).map(|_| all.len()));
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        (stream, rx)
+    }
+
+    async fn peer_read_ended(
+        rx: std::sync::mpsc::Receiver<io::Result<usize>>,
+    ) -> io::Result<usize> {
+        tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(30)))
+            .await
+            .unwrap()
+            .expect("the peer's read never ended")
+    }
+
+    /// A connection that a `'connection'` listener reset is dropped with
+    /// SO_LINGER 0: the client's read fails with ECONNRESET. One destroyed
+    /// the ordinary way ends with a FIN.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unserved_connection_closes_the_way_js_asked() {
+        let (stream, peer) = accepted_with_peer().await;
+        let w = watch(TimeoutSettings::default());
+        w.close(CloseReason::Reset);
+        close_unserved(stream, &w);
+        let ended = peer_read_ended(peer).await;
+        assert_eq!(
+            ended.as_ref().map_err(io::Error::kind).err(),
+            Some(io::ErrorKind::ConnectionReset),
+            "{ended:?}"
+        );
+
+        let (stream, peer) = accepted_with_peer().await;
+        let w = watch(TimeoutSettings::default());
+        w.close(CloseReason::Destroy);
+        close_unserved(stream, &w);
+        assert_eq!(peer_read_ended(peer).await.unwrap(), 0, "an orderly end");
+    }
+
+    /// finish_close() on a reset: nothing more is written -- not the 408 a
+    /// request timeout would send -- and the close is a reset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reset_connection_finishes_with_an_rst() {
+        let (stream, peer) = accepted_with_peer().await;
+        finish_close(stream, CloseReason::Reset, true).await;
+        let ended = peer_read_ended(peer).await;
+        assert_eq!(
+            ended.as_ref().map_err(io::Error::kind).err(),
+            Some(io::ErrorKind::ConnectionReset),
+            "{ended:?}"
         );
     }
 }

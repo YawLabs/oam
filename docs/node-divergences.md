@@ -1750,8 +1750,8 @@ An `https` connection's socket also reports the handshake (`encrypted`, `authori
 `getPeerX509Certificate()`, `getProtocol()`, `getCipher()`).
 
 What still differs: the socket is an `EventEmitter` with the addresses, `address()`,
-`setTimeout`, `destroy` and `end`, not a stream -- the connection is read and written
-natively -- so it has none of `write`, `pause`, `resume`, `setNoDelay`, `setKeepAlive`,
+`setTimeout`, `destroy`, `end` and `resetAndDestroy`, not a stream -- the connection is read
+and written natively -- so it has none of `write`, `pause`, `resume`, `setNoDelay`, `setKeepAlive`,
 `ref`, `unref`, `cork`, `pipe` or `read`, and `constructor.name` is `EventEmitter`. It
 answers `instanceof net.Socket` (and an `https` connection's also `instanceof
 tls.TLSSocket`) by brand, as oam's own `TLSSocket` does (entry 34), because a check that
@@ -1762,7 +1762,18 @@ connection, and the request's `req.socket` is that socket, as in Node; the socke
 `'connection'` handed out for the same connection closes at the handover rather than with
 the upgraded socket. On an exchange the connection was closed under after its response had
 started, the socket's `'close'` comes after the response's, where Node emits it first (they
-are in Node's order when the response had not started).
+are in Node's order when the response had not started). A socket JS destroys mid-exchange
+(`destroy()`, `resetAndDestroy()`) emits its `'close'` on the next tick, before the request's
+`'aborted'` and the response's `'close'`, where Node emits it after them.
+
+`resetAndDestroy()` is `net.Socket`'s own function (the same object) and does what Node's
+does: the connection closes with a reset -- the client's read fails with `read ECONNRESET`,
+nothing unsent reaches it, a response being written included -- the socket is returned,
+destroyed at once, and its `'close'` says `false`; the request it was carrying is aborted
+(`'aborted'`, then ECONNRESET `aborted`). From a `'connection'` listener it refuses the client
+before a byte is read. An `https` connection's socket throws `ERR_INVALID_HANDLE_TYPE`, as
+Node's server-side `TLSSocket` does (`conformance/cases/254-http-reset-and-destroy.mjs`). Up
+to 0.17.1 the socket had no `resetAndDestroy` and the call threw a `TypeError`.
 
 `req.socket.readable` and `req.socket.writable` are Node's: both true while the connection
 is up -- after the request body has ended, and after the response has been sent, for the
@@ -2226,6 +2237,8 @@ with `read ECONNRESET` and nothing unsent is delivered; the socket returned, des
 once, its own `'close'` with `false`; reset once it connects when still connecting;
 `ERR_SOCKET_CLOSED` without a handle; `ERR_INVALID_HANDLE_TYPE` thrown on a `TLSSocket` or a
 pipe (`conformance/cases/252-net-reset-and-destroy.mjs`, `253-net-reset-and-destroy-edges.mjs`).
+The sockets oam's http server hands out are stand-ins over a native connection, and their
+`resetAndDestroy()` resets that connection the same way (entry 39, case 254).
 What differs is the window where libuv refuses the reset: after `end()` has handed its FIN to
 the socket and before its shutdown callback (`'finish'`) has run.
 

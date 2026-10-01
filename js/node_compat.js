@@ -18114,15 +18114,22 @@
         }
         return this;
       };
-      // Closes the connection. The server's own error handler is always
-      // listening in node, so an error here reaches only the caller's
-      // listeners.
+      // Closes the connection -- with a reset when resetAndDestroy() asked
+      // (_reset). The server's own error handler is always listening in
+      // node, so an error here reaches only the caller's listeners.
       socket.destroy = function destroy(err) {
         if (this.destroyed) return this;
         this.destroyed = true;
         this.readable = false;
         this.writable = false;
-        if (typeof connectionId === "number") natives.httpConnDestroy(connectionId);
+        if (typeof connectionId === "number") {
+          if (this.resetAndClosing === true) {
+            this.resetAndClosing = false;
+            natives.httpConnReset(connectionId);
+          } else {
+            natives.httpConnDestroy(connectionId);
+          }
+        }
         process.nextTick(() => {
           if (err && this.listenerCount("error") > 0) this.emit("error", err);
           this.emit("close", Boolean(err));
@@ -18150,7 +18157,25 @@
         this.writable = false;
         this.destroyed = true;
       };
+      // node's socket.resetAndDestroy(), net.Socket's own function: the
+      // connection is closed with a reset (SO_LINGER 0) -- the client's read
+      // fails with ECONNRESET and nothing unsent reaches it, a response
+      // being written included -- and the socket is destroyed at once, its
+      // 'close' saying false. An https connection's socket is a TLSSocket,
+      // which refuses it with ERR_INVALID_HANDLE_TYPE (serverSocketView).
+      if (typeof connectionId === "number") {
+        socket[registry._netNativeConnection] = connectionId;
+      }
+      socket.resetAndDestroy = registry.get("net").Socket.prototype.resetAndDestroy;
+      socket._reset = serverSocketReset;
       return socket;
+    }
+
+    // node's Socket.prototype._reset, for serverSocket(): the destroy that
+    // resetAndDestroy() asks for.
+    function serverSocketReset() {
+      this.resetAndClosing = true;
+      return this.destroy();
     }
 
     // A duration handed to the native server: node's timer range (a finite
@@ -18525,7 +18550,9 @@
           server._exchanges.delete(meta.requestId);
           const req = exchange.req;
           const socket = req.socket;
-          if (socket && typeof socket._markClosed === "function") {
+          // A socket destroyed from JS -- destroy(), resetAndDestroy() --
+          // has emitted its 'close' already, and does not emit it twice.
+          if (socket && typeof socket._markClosed === "function" && !socket.destroyed) {
             socket._markClosed();
             // node closes the connection's socket before the response it
             // was carrying: the exchange ended because the connection went,
@@ -23684,6 +23711,12 @@
     // -- for the resetAndDestroy() they share with net.Socket.
     const kNotTcpHandle = Symbol("oam.notTcpHandle");
     registry._netNotTcpHandle = kNotTcpHandle;
+    // On a socket that stands in for a connection oam holds natively -- the
+    // socket an http server hands out -- that connection's id. node's socket
+    // has its TCP handle until it is destroyed; this one has the connection,
+    // and its destroy() / _reset() close it.
+    const kNativeConnection = Symbol("oam.nativeConnection");
+    registry._netNativeConnection = kNativeConnection;
 
     // node's resetAndDestroy() (lib/net.js, v22.22.2), assigned the way node
     // assigns it: an enumerable prototype property, a function with no name,
@@ -23692,6 +23725,10 @@
     // still connecting is reset once it connects; one with no handle is
     // destroyed with ERR_SOCKET_CLOSED (a no-op once destroyed); any other
     // handle is ERR_INVALID_HANDLE_TYPE, thrown. Returns the socket.
+    //
+    // Also the very function on the socket stand-in oam's http server hands
+    // out (req.socket, the 'connection' socket): it holds a native
+    // connection (kNativeConnection) in place of a handle, and resets that.
     Socket.prototype.resetAndDestroy = function() {
       // node's handle exists from connect() until the socket is destroyed.
       // oam's TCP handle appears only once connected; its TLS sockets', and
@@ -23700,7 +23737,7 @@
         if (!this.destroyed) throw codes.ERR_INVALID_HANDLE_TYPE();
       } else if (this.connecting) {
         this.once("connect", () => this._reset());
-      } else if (this._handle !== null) {
+      } else if (this._handle != null || (this[kNativeConnection] !== undefined && !this.destroyed)) {
         this._reset();
       } else {
         this.destroy(codes.ERR_SOCKET_CLOSED());
@@ -32855,6 +32892,9 @@
       // it, and Node hands it a TLSSocket.
       socket[kNetSocketLike] = true;
       socket[kTlsSocketLike] = true;
+      // Node's server-side TLSSocket has a TLSWrap, not a TCP handle:
+      // resetAndDestroy() throws ERR_INVALID_HANDLE_TYPE on it.
+      socket[registry._netNotTcpHandle] = true;
       socket.encrypted = true;
       socket.authorized = info.authorized === true;
       socket.authorizationError = info.authorizationError == null ? null : info.authorizationError;
