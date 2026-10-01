@@ -14,6 +14,9 @@
 //     empty one; a DELETE or an OPTIONS gets none.
 //   - `cache: 'no-store'` / `'reload'` add `pragma: no-cache` and
 //     `cache-control: no-cache`, `'no-cache'` adds `cache-control: max-age=0`.
+//   - A conditional request (if-modified-since, if-none-match,
+//     if-unmodified-since, if-match or if-range) in the default cache mode
+//     is a no-store one; in any other mode its own rule stands.
 //
 // Not asserted: a stream body that ends empty. undici holds the request
 // head until the first chunk and so sends `content-length: 0`; oam sends
@@ -69,6 +72,15 @@ const cases = {
   "cache no-cache": { cache: "no-cache" },
   "cache no-cache, caller cache-control": { cache: "no-cache", headers: { "cache-control": "x" } },
   "cache no-store, caller pragma": { cache: "no-store", headers: { pragma: "p" } },
+  "if-modified-since": { headers: { "If-Modified-Since": "x" } },
+  "if-none-match": { headers: { "if-none-match": "x" } },
+  "if-unmodified-since": { headers: { "if-unmodified-since": "x" } },
+  "if-match": { headers: { "if-match": "x" } },
+  "if-range": { headers: { "if-range": "x" } },
+  "if-none-match, cache default": { cache: "default", headers: { "if-none-match": "x" } },
+  "if-none-match, cache no-cache": { cache: "no-cache", headers: { "if-none-match": "x" } },
+  "if-none-match, cache force-cache": { cache: "force-cache", headers: { "if-none-match": "x" } },
+  "if-match, caller cache-control": { headers: { "if-match": "x", "cache-control": "c" } },
 };
 for (const [label, init] of Object.entries(cases)) {
   let out;

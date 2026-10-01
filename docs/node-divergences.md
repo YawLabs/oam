@@ -1587,7 +1587,9 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   `accept-language: *` and `sec-fetch-mode` (the request's mode) on every fetch,
   `accept-encoding: gzip, deflate` over http and `br, gzip, deflate` over https,
   `content-length: 0` on a `POST`, `PUT`, `PATCH`, `QUERY`, `PROPFIND` or `PROPPATCH` with no
-  body or an empty one, the `cache` mode's `pragma` / `cache-control` (#178); a caller `host`
+  body or an empty one, the `cache` mode's `pragma` / `cache-control`, with a conditional
+  request (`if-modified-since`, `if-none-match`, `if-unmodified-since`, `if-match`,
+  `if-range`) in the default mode sent as a `no-store` one (#178); a caller `host`
   header is dropped (Node's one silent drop), a string body gets
   `content-type: text/plain;charset=UTF-8`, repeated names are combined into one
   comma-joined line, and a method is uppercased only when it is one of `DELETE`, `GET`,

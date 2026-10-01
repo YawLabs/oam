@@ -2337,6 +2337,13 @@
   // socket. Fetch only: http.request and undici.request send none of them.
   // Where `host` goes and oam's `user-agent` are left as they are.
   const PAYLOAD_METHODS = new Set(["POST", "PUT", "PATCH", "QUERY", "PROPFIND", "PROPPATCH"]);
+  const CONDITIONAL_HEADERS = [
+    "if-modified-since",
+    "if-none-match",
+    "if-unmodified-since",
+    "if-match",
+    "if-range",
+  ];
   function fetchDefaultHeaders(headers, request, init, upload) {
     const has = (name) => headers.some((h) => h[0].toLowerCase() === name);
     const add = (name, value) => {
@@ -2350,10 +2357,15 @@
     const mode = headers.findIndex((h) => h[0].toLowerCase() === "sec-fetch-mode");
     if (mode !== -1) headers.splice(mode, 1);
     headers.push(["sec-fetch-mode", init.mode ?? "cors"]);
-    if (init.cache === "no-store" || init.cache === "reload") {
+    // A conditional request in the default cache mode is a no-store one
+    // (undici, and the Fetch Standard's HTTP-network-or-cache fetch step 15),
+    // so it says `pragma: no-cache` and `cache-control: no-cache`.
+    let cache = init.cache;
+    if (cache === "default" && CONDITIONAL_HEADERS.some(has)) cache = "no-store";
+    if (cache === "no-store" || cache === "reload") {
       add("pragma", "no-cache");
       add("cache-control", "no-cache");
-    } else if (init.cache === "no-cache") {
+    } else if (cache === "no-cache") {
       add("cache-control", "max-age=0");
     }
     // undici's own list, per scheme: oam decodes br as well (#151).
