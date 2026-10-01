@@ -353,11 +353,43 @@ pub enum ResponseBody {
 }
 
 pub struct ResponseSpec {
+    pub head: ResponseHead,
+    pub body: ResponseBody,
+}
+
+/// What a response's head is made of.
+pub struct ResponseHead {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    /// How each header value's code points become bytes.
+    /// How each header value's code points -- and the reason phrase's --
+    /// become bytes.
     pub header_bytes: HeaderBytes,
-    pub body: ResponseBody,
+    /// The status line's reason phrase when it is not the status code's
+    /// standard one (node:http's `statusMessage`); hyper writes the standard
+    /// one itself, so the common response carries none.
+    pub reason: Option<String>,
+}
+
+/// The reason phrase hyper writes for `status` when a response names none
+/// ([`ResponseHead::reason`] is `None`).
+pub fn standard_reason(status: u16) -> Option<&'static str> {
+    hyper::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|code| code.canonical_reason())
+}
+
+impl ResponseHead {
+    /// A head with the standard reason phrase and UTF-8 header values:
+    /// oam.serve's, the http2 compat server's, and the ones oam answers
+    /// with itself.
+    pub fn plain(status: u16, headers: Vec<(String, String)>) -> Self {
+        ResponseHead {
+            status,
+            headers,
+            header_bytes: HeaderBytes::Utf8,
+            reason: None,
+        }
+    }
 }
 
 /// How a response's header values go on the wire.
@@ -705,9 +737,7 @@ impl HttpState {
     pub fn respond_full(
         &self,
         id: u64,
-        status: u16,
-        headers: Vec<(String, String)>,
-        header_bytes: HeaderBytes,
+        head: ResponseHead,
         body: Vec<u8>,
         // false: frame the body as one of unknown length (ResponseBody::Unsized).
         sized: bool,
@@ -722,9 +752,7 @@ impl HttpState {
         };
         responder
             .send(ResponseSpec {
-                status,
-                headers,
-                header_bytes,
+                head,
                 body: if sized {
                     ResponseBody::Full(body)
                 } else {
@@ -735,13 +763,7 @@ impl HttpState {
     }
 
     /// Start a streaming response; returns the stream handle JS pushes to.
-    pub fn respond_stream(
-        &self,
-        id: u64,
-        status: u16,
-        headers: Vec<(String, String)>,
-        header_bytes: HeaderBytes,
-    ) -> Option<u64> {
+    pub fn respond_stream(&self, id: u64, head: ResponseHead) -> Option<u64> {
         let responder = self
             .pending
             .lock()
@@ -760,9 +782,7 @@ impl HttpState {
             .insert(stream_id, closed_rx);
         let ok = responder
             .send(ResponseSpec {
-                status,
-                headers,
-                header_bytes,
+                head,
                 body: ResponseBody::Stream(rx, closed_tx),
             })
             .is_ok();
@@ -788,9 +808,7 @@ impl HttpState {
         };
         responder
             .send(ResponseSpec {
-                status: 0,
-                headers: Vec::new(),
-                header_bytes: HeaderBytes::Utf8,
+                head: ResponseHead::plain(0, Vec::new()),
                 body: ResponseBody::Abort,
             })
             .is_ok()
@@ -900,15 +918,28 @@ impl hyper::body::Body for UnsizedBody {
 type BoxedBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
 
 fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
-    let mut builder = hyper::Response::builder().status(spec.status);
-    for (name, value) in &spec.headers {
-        builder = match spec.header_bytes {
+    let head = spec.head;
+    let mut builder = hyper::Response::builder().status(head.status);
+    for (name, value) in &head.headers {
+        builder = match head.header_bytes {
             HeaderBytes::Utf8 => builder.header(name, value),
             HeaderBytes::Latin1 => match crate::http_head::latin1_header_value(value) {
                 Some(value) => builder.header(name, value),
                 None => return bad_response_spec(),
             },
         };
+    }
+    if let Some(reason) = head.reason {
+        // In the same bytes as the header values: node writes the status
+        // line as part of the head string.
+        let bytes = match head.header_bytes {
+            HeaderBytes::Utf8 => Some(reason.into_bytes()),
+            HeaderBytes::Latin1 => crate::http_head::latin1_bytes(&reason),
+        };
+        match bytes.map(hyper::ext::ReasonPhrase::try_from) {
+            Some(Ok(reason)) => builder = builder.extension(reason),
+            _ => return bad_response_spec(),
+        }
     }
     let body: BoxedBody = match spec.body {
         ResponseBody::Full(bytes) => http_body_util::Full::new(Bytes::from(bytes)).boxed(),
@@ -1709,9 +1740,10 @@ fn refuse_unanswered(state: &HttpState, id: u64, status: u16) {
         .remove(&id);
     if let Some(responder) = responder {
         let _ = responder.send(ResponseSpec {
-            status,
-            headers: vec![("connection".to_string(), "close".to_string())],
-            header_bytes: HeaderBytes::Utf8,
+            head: ResponseHead::plain(
+                status,
+                vec![("connection".to_string(), "close".to_string())],
+            ),
             body: ResponseBody::Full(Vec::new()),
         });
     }

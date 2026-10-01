@@ -17902,6 +17902,9 @@
         this._hasBody = hasBody;
         this._sizedBody = sized;
         this._headStatus = code;
+        // The status line's reason phrase is the message as it stands now,
+        // as node's statusLine is: writeHead()'s, or statusMessage.
+        this._headMessage = this.statusMessage;
         this._headJson = JSON.stringify(fields);
       }
       // node's addTrailers: each name a token ('Trailer name'), each value
@@ -17982,6 +17985,7 @@
           this._headStatus,
           this._headJson,
           !utf8Head,
+          this._headMessage,
         ) ?? null;
         if (this._streamId === null) {
           // Exchange already gone (req.destroy() aborted it, or the
@@ -18113,6 +18117,7 @@
             bytes,
             !this._headIsUtf8(chunk, encoding, true),
             !this._sizedBody,
+            this._headMessage,
           );
           queueMicrotask(() => {
             if (this.closed) {

@@ -3385,39 +3385,69 @@ fn op_http_respond(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let status = args.get(1).number_value(scope).unwrap_or(200.0) as u16;
-    let headers = arg_string(scope, &args, 2)
-        .map(|j| parse_headers_json(&j))
-        .unwrap_or_default();
     let body = arg_bytes(scope, &args, 3).unwrap_or_default();
-    let header_bytes = header_bytes_arg(&args, 4);
     // `true`: the body goes out as one of unknown length (chunked, or ended
     // by closing for an HTTP/1.0 client), as node:http frames it after
     // writeHead(); anything else sends its length.
     let sized = !args.get(5).is_true();
-    rv.set_bool(core_runtime!(scope).http().respond_full(
-        id,
-        status,
-        headers,
-        header_bytes,
-        body,
-        sized,
-    ));
+    let head = response_head_args(scope, &args, 4, 6);
+    rv.set_bool(
+        core_runtime!(scope)
+            .http()
+            .respond_full(id, head, body, sized),
+    );
 }
 
-/// The optional last argument of httpRespond / httpRespondStream: `true`
-/// writes each header value one byte per code point, as node:http's
-/// ServerResponse asks for whenever node would; anything else (oam.serve and
-/// the http2 compat server pass nothing) writes its UTF-8.
-fn header_bytes_arg(
+/// The head httpRespond / httpRespondStream are given: the status (arg 1),
+/// the `[[name, value], ...]` JSON (arg 2), and two optional args node:http's
+/// ServerResponse passes (oam.serve and the http2 compat server pass
+/// neither): at `bytes_at`, `true` to write each header value -- and the
+/// reason phrase -- one byte per code point, as node does whenever it would
+/// (anything else writes its UTF-8); at `reason_at`, the status message.
+fn response_head_args(
+    scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments<'_>,
-    index: i32,
-) -> oam_core::http_server::HeaderBytes {
-    if args.get(index).is_true() {
+    bytes_at: i32,
+    reason_at: i32,
+) -> oam_core::http_server::ResponseHead {
+    let status = args.get(1).number_value(scope).unwrap_or(200.0) as u16;
+    let headers = arg_string(scope, args, 2)
+        .map(|j| parse_headers_json(&j))
+        .unwrap_or_default();
+    let header_bytes = if args.get(bytes_at).is_true() {
         oam_core::http_server::HeaderBytes::Latin1
     } else {
         oam_core::http_server::HeaderBytes::Utf8
+    };
+    let reason = reason_arg(scope, args.get(reason_at), status);
+    oam_core::http_server::ResponseHead {
+        status,
+        headers,
+        header_bytes,
+        reason,
     }
+}
+
+/// node:http's status message, unless it is the reason phrase hyper writes
+/// for `status` by itself (`OK` for 200, ...): that common case is compared
+/// in place and never copied out of V8.
+fn reason_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+    status: u16,
+) -> Option<String> {
+    let text = v8::Local::<v8::String>::try_from(value).ok()?;
+    if let Some(standard) = oam_core::http_server::standard_reason(status) {
+        let mut buf = [0u8; 64];
+        let len = standard.len();
+        if text.length() == len && len <= buf.len() && text.contains_only_onebyte() {
+            text.write_one_byte_v2(scope, 0, &mut buf[..len], v8::WriteFlags::empty());
+            if &buf[..len] == standard.as_bytes() {
+                return None;
+            }
+        }
+    }
+    Some(text.to_rust_string_lossy(scope))
 }
 
 fn op_http_respond_stream(
@@ -3426,19 +3456,11 @@ fn op_http_respond_stream(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let status = args.get(1).number_value(scope).unwrap_or(200.0) as u16;
-    let headers = arg_string(scope, &args, 2)
-        .map(|j| parse_headers_json(&j))
-        .unwrap_or_default();
-    let header_bytes = header_bytes_arg(&args, 3);
+    let head = response_head_args(scope, &args, 3, 4);
     // Exchange gone (aborted via httpAbort, or already answered) leaves rv
     // undefined, NOT a throw -- Node's post-abort res.write() is a soft
     // failure, and the JS layer maps this to a premature close.
-    if let Some(stream_id) =
-        core_runtime!(scope)
-            .http()
-            .respond_stream(id, status, headers, header_bytes)
-    {
+    if let Some(stream_id) = core_runtime!(scope).http().respond_stream(id, head) {
         rv.set_double(stream_id as f64);
     }
 }

@@ -1870,18 +1870,18 @@ all for a HEAD request or a 204 / 304 (what `end()` was given is dropped, and no
 sends the last chunk alone. Up to 0.17.1 `headersSent` stayed false until the first body
 bytes, `writeHead()`'s headers showed in `getHeader()`, a later `statusCode` was sent, every
 `end()` sent a `content-length` (a HEAD response's for the body it dropped), and a second
-`writeHead()` added its headers to the first one's.
+`writeHead()` added its headers to the first one's. The status line carries the response's
+status message -- `statusMessage`, or `writeHead()`'s reason, in the head's bytes -- where
+oam used to send the standard reason phrase whatever the message said (and hyper's spelling
+of it: `I'm a teapot` for Node's `I'm a Teapot`, `<none>` for Node's `unknown`).
 `conformance/cases/250-http-response-header-validation.mjs`,
-`251-http-response-header-bytes.mjs` and `266-http-writehead-builds-the-head.mjs` hold this
-to node v22.22.2. What still differs:
+`251-http-response-header-bytes.mjs`, `266-http-writehead-builds-the-head.mjs` and
+`267-http-response-reason-phrase.mjs` hold this to node v22.22.2. What still differs:
 
 - **A body Node ends by closing the connection is chunked over HTTP/1.1.** With its
   `transfer-encoding` header removed (`res.removeHeader('transfer-encoding')`) and no length
   known, Node sends the body bare and closes the connection after it; hyper, which frames
   oam's responses, has no way to end an HTTP/1.1 body by closing, and chunks it.
-- **The status line carries the status code's standard reason phrase**, not
-  `res.statusMessage`: a message is checked as Node checks it and stays readable, but is not
-  sent.
 - **Response trailers are not sent.** `addTrailers()` checks its names and values as Node
   does and keeps them, and a `Trailer` header does not switch the response to chunked
   framing as it does in Node.
