@@ -11,6 +11,10 @@
 // the order an application sees changed with it, and two things that did
 // (end()'s callback ran after the 'finish' listeners, and a write followed
 // at once by destroy() was dropped).
+//
+// Also pinned: the callbacks of a write the socket took and of an end()
+// run before the 'close' of a destroy() on the next line (oam ran them a
+// loop turn after it).
 import net from "node:net";
 
 setTimeout(() => {
@@ -127,6 +131,30 @@ function watch(socket) {
   flush("end() twice");
 }
 
+// Reads what it is sent and says nothing, half-open, so the client's own
+// end() is all that finishes its side.
+const quiet = net.createServer({ allowHalfOpen: true }, (socket) => {
+  socket.on("error", () => {});
+  socket.resume();
+});
+await new Promise((resolve) => quiet.listen(0, "127.0.0.1", resolve));
+const quietPort = quiet.address().port;
+
+{
+  // write(), end() and destroy() in a row on a connected socket: the write
+  // and end() callbacks run first, then 'close'.
+  const socket = net.connect(quietPort, "127.0.0.1");
+  await new Promise((resolve) => socket.once("connect", resolve));
+  socket.write("kept", (e) => log.push(`write callback ${e === null ? "null" : e && e.code}`));
+  socket.end((e) => log.push(`end callback ${e && e.code}`));
+  socket.on("close", (hadError) => log.push(`close ${hadError}`));
+  socket.destroy();
+  log.push("destroy() returned");
+  await settle();
+  flush("write(), end(), destroy()");
+}
+
+quiet.close();
 answering.close();
 collecting.close();
 await settle();

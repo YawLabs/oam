@@ -4291,7 +4291,33 @@ fn op_tcp_write(
         return;
     };
     let tcp = core_runtime!(scope).tcp();
-    crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_write(tcp, handle, data));
+    spawn_tcp_started(
+        scope,
+        &mut rv,
+        oam_core::tcp::tcp_write_start(tcp, handle, data),
+    );
+}
+
+/// The return value of `tcpWrite` / `tcpShutdown`: undefined for an op that
+/// finished in the call -- net.Socket settles it without waiting for the
+/// event loop, so a write the socket took reports back before the 'close'
+/// of a destroy() made right after it, as in node (#156) -- and a promise
+/// for one still to finish or one that failed (its rejection carries the
+/// error's shape).
+fn spawn_tcp_started<F>(
+    scope: &mut v8::PinScope<'_, '_>,
+    rv: &mut v8::ReturnValue<'_, v8::Value>,
+    started: oam_core::tcp::Started<F>,
+) where
+    F: std::future::Future<Output = oam_core::OpOutcome> + Send + 'static,
+{
+    match started {
+        oam_core::tcp::Started::Done(oam_core::OpOutcome::Done) => {}
+        oam_core::tcp::Started::Done(outcome) => {
+            crate::ops::spawn_op(scope, rv, async move { outcome });
+        }
+        oam_core::tcp::Started::Pending(rest) => crate::ops::spawn_op(scope, rv, rest),
+    }
 }
 
 fn op_tcp_close(
@@ -4327,7 +4353,11 @@ fn op_tcp_shutdown(
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let tcp = core_runtime!(scope).tcp();
-    crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_shutdown(tcp, handle));
+    spawn_tcp_started(
+        scope,
+        &mut rv,
+        oam_core::tcp::tcp_shutdown_start(tcp, handle),
+    );
 }
 
 /// Where a server op is asked to listen: the host as argument 0 (a string, or

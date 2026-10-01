@@ -488,6 +488,21 @@ pub fn tcp_write(
     handle: u64,
     data: Vec<u8>,
 ) -> impl std::future::Future<Output = OpOutcome> + Send + 'static {
+    started_future(tcp_write_start(registry, handle, data))
+}
+
+/// [`tcp_write`], telling the caller whether the write finished in the
+/// call: [`Started::Done`] when the socket took every byte at once (or the
+/// write failed on the spot), [`Started::Pending`] with the rest of the
+/// write otherwise. The engine settles a write that finished in the call
+/// without a trip through the event loop, as libuv reports a `uv_try_write`
+/// that took everything: node runs that write's callback before the 'close'
+/// of a `destroy()` on the next line, and so must oam (#156).
+pub fn tcp_write_start(
+    registry: TcpRegistry,
+    handle: u64,
+    data: Vec<u8>,
+) -> Started<impl std::future::Future<Output = OpOutcome> + Send + 'static> {
     let issued = {
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
         let mut written = 0;
@@ -517,11 +532,11 @@ pub fn tcp_write(
             },
         }
     };
-    async move {
-        let (mut turn, written) = match issued {
-            Issued::Done(outcome) => return outcome,
-            Issued::Queued { turn, written } => (turn, written),
-        };
+    let (mut turn, written) = match issued {
+        Issued::Done(outcome) => return Started::Done(outcome),
+        Issued::Queued { turn, written } => (turn, written),
+    };
+    Started::Pending(async move {
         turn.wait().await;
         let writer = registry
             .lock()
@@ -544,7 +559,7 @@ pub fn tcp_write(
             }
             Err(e) => tcp_fail(e, "write", &handle.to_string()),
         }
-    }
+    })
 }
 
 /// Half-close the write side (sends FIN). Removes the write half and
@@ -560,6 +575,15 @@ pub fn tcp_shutdown(
     registry: TcpRegistry,
     handle: u64,
 ) -> impl std::future::Future<Output = OpOutcome> + Send + 'static {
+    started_future(tcp_shutdown_start(registry, handle))
+}
+
+/// [`tcp_shutdown`], telling the caller whether it finished in the call
+/// (see [`tcp_write_start`]): with nothing queued the FIN leaves at once.
+pub fn tcp_shutdown_start(
+    registry: TcpRegistry,
+    handle: u64,
+) -> Started<impl std::future::Future<Output = OpOutcome> + Send + 'static> {
     let issued = {
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
         if guard.write_tail.contains_key(&handle) {
@@ -575,11 +599,11 @@ pub fn tcp_shutdown(
             Issued::Done(OpOutcome::Done)
         }
     };
-    async move {
-        let mut turn = match issued {
-            Issued::Done(outcome) => return outcome,
-            Issued::Queued { turn, .. } => turn,
-        };
+    let mut turn = match issued {
+        Issued::Done(outcome) => return Started::Done(outcome),
+        Issued::Queued { turn, .. } => turn,
+    };
+    Started::Pending(async move {
         turn.wait().await;
         let writer = registry
             .lock()
@@ -595,6 +619,26 @@ pub fn tcp_shutdown(
         let _ = writer.shutdown().await;
         drop(writer);
         OpOutcome::Done
+    })
+}
+
+/// How [`tcp_write_start`] or [`tcp_shutdown_start`] left the call.
+pub enum Started<F> {
+    /// Finished in the call, with this outcome.
+    Done(OpOutcome),
+    /// Still to finish: the future completes the op.
+    Pending(F),
+}
+
+/// The single future [`tcp_write`] / [`tcp_shutdown`] return, whichever way
+/// the op left the call.
+async fn started_future<F>(started: Started<F>) -> OpOutcome
+where
+    F: std::future::Future<Output = OpOutcome>,
+{
+    match started {
+        Started::Done(outcome) => outcome,
+        Started::Pending(rest) => rest.await,
     }
 }
 

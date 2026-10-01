@@ -2115,12 +2115,17 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   `end()` asks for the FIN in the same turn (it is queued behind the writes natively, as
   libuv queues a shutdown; up to 0.17.1 it waited for the last write to complete first,
   so the FIN left one round trip late), so a write the socket takes is delivered even
-  when `destroy()` follows on the next line
-  (`conformance/cases/225-net-write-then-end-order.mjs`). What is left there: oam learns
-  that a write completed from its promise, so `write()` returns `false` and
-  `writableLength` counts the bytes until that callback even when the socket took them
-  all at once (Node reports `true` and `0` for those), and the callback of a write made
-  before the connect runs after the `'connect'` listeners rather than among them. After
+  when `destroy()` follows on the next line. A write the socket took whole inside the call
+  reports `null` to its callback, and the callbacks of an `end()` still waiting get
+  `ERR_STREAM_DESTROYED`, before that `'close'`, as in Node
+  (`conformance/cases/225-net-write-then-end-order.mjs`). What is left there: a write the
+  socket could not take at once is still queued natively when `destroy()` closes the
+  handle, and its callback gets `ERR_SOCKET_CLOSED` after `'close'` (Node's gets `null`,
+  before it); oam settles a write's accounting with its callback, after `write()` has
+  returned, so `write()` returns `false` and `writableLength` counts the bytes until that
+  callback even when the socket took them all at once (Node reports `true` and `0` for
+  those); and the callback of a write made before the connect runs after the `'connect'`
+  listeners rather than among them. After
   the request ends
   Node clears a closed socket's `localAddress` / `localPort`; oam keeps them on a
   `net.Socket`.
