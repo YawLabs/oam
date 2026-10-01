@@ -334,7 +334,14 @@ pub enum BodyCheckout {
 }
 
 pub enum ResponseBody {
+    /// A body whose length is known before the head goes out: hyper sends
+    /// a `content-length` (or nothing, where the response cannot have a
+    /// body).
     Full(Vec<u8>),
+    /// A whole body that goes out as if its length were not known: hyper
+    /// frames it chunked, or ends it by closing the connection for an
+    /// HTTP/1.0 client. node:http frames `writeHead(); end('text')` so.
+    Unsized(Vec<u8>),
     /// Chunk channel plus a drop-signal: the oneshot sender rides inside
     /// ChannelBody, so dropping the body (finished OR connection lost)
     /// resolves the paired stream_watch receiver.
@@ -702,6 +709,8 @@ impl HttpState {
         headers: Vec<(String, String)>,
         header_bytes: HeaderBytes,
         body: Vec<u8>,
+        // false: frame the body as one of unknown length (ResponseBody::Unsized).
+        sized: bool,
     ) -> bool {
         let Some(responder) = self
             .pending
@@ -716,7 +725,11 @@ impl HttpState {
                 status,
                 headers,
                 header_bytes,
-                body: ResponseBody::Full(body),
+                body: if sized {
+                    ResponseBody::Full(body)
+                } else {
+                    ResponseBody::Unsized(body)
+                },
             })
             .is_ok()
     }
@@ -861,6 +874,29 @@ impl hyper::body::Body for ChannelBody {
     }
 }
 
+/// A whole body that does not tell hyper its length: its size hint is
+/// hyper's default (unknown) and it is not at its end before it is polled,
+/// so hyper frames it as a streamed one -- chunked, or by closing the
+/// connection for an HTTP/1.0 client -- even when it is empty.
+struct UnsizedBody(Option<Bytes>);
+
+impl hyper::body::Body for UnsizedBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Ready(
+            self.0
+                .take()
+                .filter(|bytes| !bytes.is_empty())
+                .map(|bytes| Ok(Frame::data(bytes))),
+        )
+    }
+}
+
 type BoxedBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
 
 fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
@@ -876,6 +912,7 @@ fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
     }
     let body: BoxedBody = match spec.body {
         ResponseBody::Full(bytes) => http_body_util::Full::new(Bytes::from(bytes)).boxed(),
+        ResponseBody::Unsized(bytes) => UnsizedBody(Some(Bytes::from(bytes))).boxed(),
         ResponseBody::Stream(rx, closed_tx) => ChannelBody {
             rx,
             _closed_tx: closed_tx,

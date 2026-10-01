@@ -17777,6 +17777,7 @@
           headers ??= message;
         }
         this.statusCode = code;
+        let given = null;
         if (this._progressive) {
           if (Array.isArray(headers)) {
             if (headers.length % 2 !== 0) throw codes.ERR_INVALID_ARG_VALUE("headers", headers);
@@ -17792,25 +17793,24 @@
           checkStatusMessage(this.statusMessage);
         } else {
           checkStatusMessage(this.statusMessage);
-          if (headers) this._storeGivenHeaders(headers);
+          if (headers) given = this._givenHeaderPairs(headers);
         }
-        // node builds the head here: from now on headersSent is true and
-        // every header method, writeHead() included, throws
-        // ERR_HTTP_HEADERS_SENT. A writeHead() that threw above built
-        // nothing, as in node. oam still sends the head with the first
-        // body bytes or end() (docs/node-divergences.md), but nothing can
-        // change it in between: a second writeHead() used to add its
-        // headers to the first one's, and two content-lengths reached hyper.
+        // node builds the head here (_storeHeader): from now on headersSent
+        // is true, every header method, writeHead() included, throws
+        // ERR_HTTP_HEADERS_SENT, and the status, the fields and the body's
+        // framing are fixed. It goes on the wire with the first body bytes
+        // or end(), as node's does. A writeHead() that threw built nothing,
+        // as in node.
+        this._storeHead(given);
         this._wroteHead = true;
         this.headersSent = true;
         return this;
       }
       // writeHead()'s fast path (node's _storeHeader over the object it was
-      // given): check all, then keep all. It runs only on a response no
-      // header method has touched and whose head is not built, so the store
-      // is empty: a name repeated here was given twice in this call, and is
-      // kept as a list, as it goes out.
-      _storeGivenHeaders(headers) {
+      // given): every field is checked before the head is built. The
+      // fields go into the head only -- not into the header store, so
+      // getHeader() and the rest never see them, as node's do not.
+      _givenHeaderPairs(headers) {
         const pairs = [];
         if (Array.isArray(headers)) {
           if (headers.length && Array.isArray(headers[0])) {
@@ -17825,12 +17825,84 @@
           }
         }
         for (let n = 0; n < pairs.length; n += 2) checkStoredHeader(pairs[n], pairs[n + 1]);
-        for (let n = 0; n < pairs.length; n += 2) {
-          const key = pairs[n].toLowerCase();
-          const existing = this._headers.get(key);
-          if (existing === undefined) this._headers.set(key, pairs[n + 1]);
-          else this._headers.set(key, [].concat(existing, pairs[n + 1]));
+        return pairs;
+      }
+      // node's _storeHeader: the head the response sends, fixed once and
+      // for all. `given` is writeHead()'s fast-path [name, value, ...] list,
+      // or null for the header store. Each field is noted as node's
+      // matchHeader notes it, and the body's framing follows node's rules:
+      // a content-length or transfer-encoding field decides it; otherwise
+      // no body for a HEAD request or a 204 / 304 / 1xx, closing the
+      // connection for an HTTP/1.0 client that did not ask for chunks
+      // (`TE: chunked`), the length end() worked out when end() built the
+      // head, and chunks for everything else. So writeHead() then
+      // end('text') is chunked, as in node, where oam used to send a
+      // content-length.
+      _storeHead(given) {
+        const fields = [];
+        let contLen = false;
+        let te = false;
+        let trailer = false;
+        this._chunked = false;
+        const note = (name, value) => {
+          fields.push([name, String(value)]);
+          if (name.length < 4 || name.length > 17) return;
+          switch (name.toLowerCase()) {
+            case "transfer-encoding":
+              te = true;
+              this._removedTE = false;
+              if (CHUNKED_CODING.test(value)) this._chunked = true;
+              break;
+            case "content-length":
+              contLen = true;
+              this._contentLength = +value;
+              this._removedContLen = false;
+              break;
+            case "trailer":
+              trailer = true;
+              break;
+          }
+        };
+        const add = (name, value) => {
+          if (Array.isArray(value)) for (const item of value) note(name, item);
+          else note(name, value);
+        };
+        if (given === null) {
+          for (const [key, value] of this._headers) add(key, value);
+        } else {
+          for (let n = 0; n < given.length; n += 2) add(given[n], given[n + 1]);
         }
+        const code = this.statusCode;
+        const req = this.req;
+        const hasBody = !(req && req.method === "HEAD") && code !== 204 && code !== 304 &&
+          !(code >= 100 && code <= 199);
+        // node's useChunkedEncodingByDefault: false for an HTTP/1.0 client
+        // that did not send `TE: chunked`.
+        const chunksByDefault = !(req && req.httpVersion === "1.0") ||
+          CHUNKED_CODING.test(req.headers && req.headers.te);
+        // Whether the native side is handed the body with its length known
+        // up front (hyper sends a content-length, or nothing for a body that
+        // cannot have one), or not (hyper chunks it, or ends it by closing
+        // the connection for an HTTP/1.0 client).
+        let sized = false;
+        if (!contLen && !te) {
+          if (!hasBody) {
+            sized = true;
+          } else if (!chunksByDefault) {
+            sized = false;
+          } else if (!trailer && !this._removedContLen && typeof this._contentLength === "number") {
+            sized = true;
+          } else if (!this._removedTE) {
+            this._chunked = true;
+          }
+        } else {
+          sized = !te;
+        }
+        if (this._chunked && (code === 204 || code === 304)) this._chunked = false;
+        this._hasBody = hasBody;
+        this._sizedBody = sized;
+        this._headStatus = code;
+        this._headJson = JSON.stringify(fields);
       }
       // node's addTrailers: each name a token ('Trailer name'), each value
       // free of what a header value may not hold ('trailer content'); a
@@ -17856,15 +17928,11 @@
         }
         this._trailers = trailers;
       }
-      // What node's implicit writeHead(this.statusCode) checks when the
-      // head goes out without an explicit one, and the status message it
-      // fills in.
+      // node's _implicitHeader: the head a write(), end() or flushHeaders()
+      // builds when writeHead() has not -- writeHead(this.statusCode), with
+      // its checks and the status message it fills in.
       _implicitHead() {
-        if (this._wroteHead) return;
-        const code = this.statusCode | 0;
-        if (code < 100 || code > 999) throw codes.ERR_HTTP_INVALID_STATUS_CODE(this.statusCode);
-        this.statusMessage ||= httpExports.STATUS_CODES[code] || "unknown";
-        checkStatusMessage(this.statusMessage);
+        if (!this._wroteHead) this.writeHead(this.statusCode);
       }
       // Whether node writes this response's head as UTF-8, where it
       // otherwise writes it one byte per code point (latin1), measured on
@@ -17878,42 +17946,16 @@
       // from res.end(buffer), res.end(), a chunked res.write('text'), a
       // HEAD request or a 204. `chunk` and `encoding` are the first write's
       // (or end()'s); `fromEnd` says it is end()'s.
+      // The head is built (_storeHead) before this is asked, so the
+      // framing it chose -- chunks put a chunk-size line ahead of the first
+      // body bytes -- is known.
       _headIsUtf8(chunk, encoding, fromEnd) {
-        const req = this.req;
-        const status = this.statusCode;
         // node's _hasBody: nothing written goes out, end() sends ''.
-        if ((req && req.method === "HEAD") || status === 204 || status === 304 ||
-            (status >= 100 && status <= 199)) {
-          return false;
-        }
+        if (!this._hasBody) return false;
         if (fromEnd && !chunk) return false;
         if (typeof chunk !== "string" || (encoding && encoding !== "utf8")) return false;
         if (chunk.length === 0) return true;
-        return !this._nodeFramesChunked(fromEnd);
-      }
-      // node's choice of chunked framing (_storeHeader), which puts a
-      // chunk-size line ahead of the first body bytes.
-      _nodeFramesChunked(fromEnd) {
-        const te = this._headers.get("transfer-encoding");
-        if (te !== undefined) return CHUNKED_CODING.test(te);
-        if (this._headers.has("content-length")) return false;
-        const req = this.req;
-        if (req && req.httpVersion === "1.0" && !CHUNKED_CODING.test(req.headers && req.headers.te)) {
-          return false;
-        }
-        // end() before any head knows the length, and node sends it.
-        if (fromEnd && !this._wroteHead && !this._removedContLen && !this._headers.has("trailer")) {
-          return false;
-        }
-        return !this._removedTE;
-      }
-      _headerPairsJson() {
-        const pairs = [];
-        for (const [key, value] of this._headers) {
-          if (Array.isArray(value)) for (const item of value) pairs.push([key, String(item)]);
-          else pairs.push([key, String(value)]);
-        }
-        return JSON.stringify(pairs);
+        return !this._chunked;
       }
       _toBytes(chunk, encoding) {
         if (chunk === null || chunk === undefined) return new Uint8Array(0);
@@ -17937,8 +17979,8 @@
         this.headersSent = true;
         this._streamId = natives.httpRespondStream(
           this._requestId,
-          this.statusCode,
-          this._headerPairsJson(),
+          this._headStatus,
+          this._headJson,
           !utf8Head,
         ) ?? null;
         if (this._streamId === null) {
@@ -18051,17 +18093,26 @@
         }
         if (this._ended) return this;
         if (this._streamId === null) {
-          // Single-shot: full body, hyper sets content-length.
-          const bytes = this._toBytes(chunk, encoding);
-          this._implicitHead();
+          // Single-shot: the whole body in one op, framed as the head says.
+          let bytes = this._toBytes(chunk, encoding);
+          if (!this._wroteHead) {
+            // node's end() before any head: the body's length is known, and
+            // the head it builds sends it.
+            this._contentLength = bytes.length;
+            this.writeHead(this.statusCode);
+          }
+          // A response that cannot have a body (HEAD, 204, 304) sends none:
+          // node drops what end() was given, and no content-length goes out.
+          if (!this._hasBody) bytes = new Uint8Array(0);
           this._ended = true;
           this.headersSent = true;
           natives.httpRespond(
             this._requestId,
-            this.statusCode,
-            this._headerPairsJson(),
+            this._headStatus,
+            this._headJson,
             bytes,
             !this._headIsUtf8(chunk, encoding, true),
+            !this._sizedBody,
           );
           queueMicrotask(() => {
             if (this.closed) {

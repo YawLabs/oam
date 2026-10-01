@@ -3391,11 +3391,18 @@ fn op_http_respond(
         .unwrap_or_default();
     let body = arg_bytes(scope, &args, 3).unwrap_or_default();
     let header_bytes = header_bytes_arg(&args, 4);
-    rv.set_bool(
-        core_runtime!(scope)
-            .http()
-            .respond_full(id, status, headers, header_bytes, body),
-    );
+    // `true`: the body goes out as one of unknown length (chunked, or ended
+    // by closing for an HTTP/1.0 client), as node:http frames it after
+    // writeHead(); anything else sends its length.
+    let sized = !args.get(5).is_true();
+    rv.set_bool(core_runtime!(scope).http().respond_full(
+        id,
+        status,
+        headers,
+        header_bytes,
+        body,
+        sized,
+    ));
 }
 
 /// The optional last argument of httpRespond / httpRespondStream: `true`

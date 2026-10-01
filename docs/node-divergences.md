@@ -1858,18 +1858,27 @@ another encoding, nothing -- it is one byte per code point (`caf\xe9`). Up to 0.
 stored any header -- `res.setHeader('y', '€')` did not throw -- and wrote every value as its
 UTF-8; a CR or LF reached hyper and was answered `500`. `appendHeader` wrote to the wrong
 store, and `setHeaders` and `addTrailers` did not exist.
-`conformance/cases/250-http-response-header-validation.mjs` and
-`251-http-response-header-bytes.mjs` hold this to node v22.22.2. What still differs:
+`writeHead()` -- or the first `write()`, `end()` or `flushHeaders()`, when it was not called
+-- builds the head as Node's `_storeHeader` does: `headersSent` turns true, the status, the
+fields and the body's framing are fixed (a later `statusCode` does not change the status
+line), and headers handed to `writeHead()` on a response no header method has touched go into
+the head only, so `getHeader()` and the rest never see them. The body is framed by Node's
+rules: by a `content-length` or `transfer-encoding` field when there is one; otherwise not at
+all for a HEAD request or a 204 / 304 (what `end()` was given is dropped, and no
+`content-length` goes out for it), by length when `end()` built the head, and chunked when
+`writeHead()` did -- so `writeHead(200); end('text')` is chunked, and `writeHead(200); end()`
+sends the last chunk alone. Up to 0.17.1 `headersSent` stayed false until the first body
+bytes, `writeHead()`'s headers showed in `getHeader()`, a later `statusCode` was sent, every
+`end()` sent a `content-length` (a HEAD response's for the body it dropped), and a second
+`writeHead()` added its headers to the first one's.
+`conformance/cases/250-http-response-header-validation.mjs`,
+`251-http-response-header-bytes.mjs` and `266-http-writehead-builds-the-head.mjs` hold this
+to node v22.22.2. What still differs:
 
-- **`writeHead()` does not send the head.** As in Node, `headersSent` turns true there and
-  the header methods, a second `writeHead()` among them, throw `ERR_HTTP_HEADERS_SENT` from
-  then on, but oam sends the head with the first body bytes or `end()`. So headers given to
-  `writeHead()` on a response no header method has touched show in `getHeader()` /
-  `hasHeader()`, where Node's never do, and `end('text')` after `writeHead()` sends a
-  `content-length` where Node frames the body chunked. The bytes a header value goes out as
-  follow Node's framing all the same. Up to 0.17.1 `headersSent` stayed false and the header
-  methods kept working after `writeHead()`; a second `writeHead()` replaced the first one's
-  headers.
+- **A body Node ends by closing the connection is chunked over HTTP/1.1.** With its
+  `transfer-encoding` header removed (`res.removeHeader('transfer-encoding')`) and no length
+  known, Node sends the body bare and closes the connection after it; hyper, which frames
+  oam's responses, has no way to end an HTTP/1.1 body by closing, and chunks it.
 - **The status line carries the status code's standard reason phrase**, not
   `res.statusMessage`: a message is checked as Node checks it and stays readable, but is not
   sent.
