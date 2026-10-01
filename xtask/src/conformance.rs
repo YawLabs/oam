@@ -226,8 +226,9 @@ pub fn run(release: bool) -> Result<()> {
 
     let mut diff_results = Vec::new();
     let mut diff_pass = 0usize;
-    // Cases both runtimes cut short with their own watchdog: not compared,
-    // not counted as identical, and named in a warning of their own.
+    // Cases both runtimes cut short with their own watchdog, agreeing up to
+    // the shorter cut: compared no further, not counted as identical, and
+    // named in a warning of their own.
     let mut diff_watchdog = Vec::new();
     for case in &cases {
         let name = case
@@ -275,7 +276,9 @@ pub fn run(release: bool) -> Result<()> {
         let fired = watchdog_sides(&oam_out, &node_out);
         let verdict = verdict(&oam_out, &node_out);
         if verdict == Verdict::Watchdog {
-            println!("  WATCHDOG {name} (both runtimes cut it short; not compared)");
+            println!(
+                "  WATCHDOG {name} (both runtimes cut it short; compared up to the shorter cut)"
+            );
             diff_results.push(json!({ "case": name, "status": "watchdog", "sides": fired }));
             diff_watchdog.push(name);
         } else if verdict == Verdict::Pass {
@@ -517,7 +520,7 @@ pub fn run(release: bool) -> Result<()> {
     } else {
         println!(
             "node-differential: {diff_pass}/{diff_total} ({} cut short by their own watchdog, \
-             not compared)",
+             compared only up to the cut)",
             diff_watchdog.len()
         );
     }
@@ -572,10 +575,11 @@ pub fn run(release: bool) -> Result<()> {
     // fails the run (non-zero exit) so the conformance CI job can be REQUIRED,
     // not advisory. The scorecard receipts above are still written first.
     //
-    // A case BOTH runtimes cut short with their own watchdog is the host's
-    // clock, not a divergence: it is not compared and does not fail the
-    // run, but it is never counted as identical either, and it is named
-    // here so the number above is never read as covering it.
+    // A case BOTH runtimes cut short with their own watchdog, agreeing on
+    // everything both printed and on the exit code, is the host's clock, not
+    // a divergence: it does not fail the run, but it is never counted as
+    // identical either, and it is named here so the number above is never
+    // read as covering what came after the cut.
     if diff_pass + diff_watchdog.len() < diff_total {
         bail!(
             "node-differential: {diff_pass}/{diff_total} -- {} case(s) diverge from Node",
@@ -1564,25 +1568,48 @@ fn watchdog_sides(oam: &Captured, node: &Captured) -> Option<&'static str> {
 enum Verdict {
     /// Byte-identical stdout and the same exit code, and both ran to the end.
     Pass,
-    /// Both runtimes cut the case short with its own watchdog: what they
-    /// printed is a prefix decided by the host's clock, so it is not
-    /// compared -- neither a pass (the rest was never run) nor a
-    /// divergence (whichever side got further is not a behaviour).
+    /// Both runtimes cut the case short with its own watchdog, agreeing on
+    /// everything both of them printed before the cut and on the exit code.
+    /// How far each got is decided by the host's clock, so the case is
+    /// neither a pass (the rest was never run) nor a divergence (whichever
+    /// side got further is not a behaviour).
     Watchdog,
     Fail,
 }
 
 /// The node-differential verdict for one case (#211). A watchdog on only
 /// one side stays a failure: Node finished and oam did not (or the other
-/// way round), which is a real difference.
+/// way round), which is a real difference. When both sides were cut short,
+/// what both of them did print is still compared: a different exit code,
+/// or a line that differs before the shorter run's cut, is a failure.
 fn verdict(oam: &Captured, node: &Captured) -> Verdict {
     if watchdog_sides(oam, node) == Some("both") {
-        Verdict::Watchdog
+        if oam.code == node.code && cut_runs_agree(&oam.stdout, &node.stdout) {
+            Verdict::Watchdog
+        } else {
+            Verdict::Fail
+        }
     } else if normalize(&oam.stdout) == normalize(&node.stdout) && oam.code == node.code {
         Verdict::Pass
     } else {
         Verdict::Fail
     }
+}
+
+/// For two runs that both ended on their watchdog line: whether the lines
+/// before it agree as far as the shorter run goes. Each side's trailing
+/// `WATCHDOG` line is dropped, and the shorter run's lines are compared with
+/// as many leading lines of the longer one.
+fn cut_runs_agree(oam: &str, node: &str) -> bool {
+    let (oam, node) = (normalize(oam), normalize(node));
+    let before_cut = |text: &str| {
+        let mut lines: Vec<&str> = text.lines().collect();
+        lines.pop();
+        lines.into_iter().map(str::to_string).collect::<Vec<_>>()
+    };
+    let (oam, node) = (before_cut(&oam), before_cut(&node));
+    let common = oam.len().min(node.len());
+    oam[..common] == node[..common]
 }
 
 fn first_difference(a: &str, b: &str) -> Value {
@@ -1757,6 +1784,49 @@ mod tests {
         let further = captured("one\ntwo\nthree\nWATCHDOG\n", 9);
         assert_eq!(verdict(&further, &same), Verdict::Watchdog);
         assert_eq!(watchdog_sides(&further, &same), Some("both"));
+        // The section names on the watchdog lines are where each was cut,
+        // not output to compare.
+        let named = captured("one\nWATCHDOG lookups\n", 9);
+        assert_eq!(verdict(&named, &same), Verdict::Watchdog);
+    }
+
+    /// What both runtimes printed before the cut is still compared: a case
+    /// both cut short that differs inside that common part, or exits
+    /// differently, is a divergence, not a watchdog.
+    #[test]
+    fn a_case_both_runtimes_cut_short_still_fails_on_what_both_printed() {
+        let node = captured("one\ntwo\nWATCHDOG\n", 9);
+        assert_eq!(
+            verdict(&captured("one\nWRONG\nWATCHDOG\n", 9), &node),
+            Verdict::Fail
+        );
+        // Shorter on one side: its lines are compared with the other's
+        // first lines, in either direction.
+        assert_eq!(
+            verdict(&captured("WRONG\nWATCHDOG\n", 9), &node),
+            Verdict::Fail
+        );
+        assert_eq!(
+            verdict(&node, &captured("WRONG\nWATCHDOG\n", 9)),
+            Verdict::Fail
+        );
+        assert_eq!(
+            verdict(
+                &captured("one\ntwo\nthree\nWATCHDOG\n", 9),
+                &captured("one\nTWO\nWATCHDOG\n", 9)
+            ),
+            Verdict::Fail
+        );
+        // Line endings are normalized before the comparison.
+        assert_eq!(
+            verdict(&captured("one\r\nWATCHDOG\r\n", 9), &node),
+            Verdict::Watchdog
+        );
+        // The same prefix with a different exit code.
+        assert_eq!(
+            verdict(&captured("one\ntwo\nWATCHDOG\n", 1), &node),
+            Verdict::Fail
+        );
     }
 
     #[test]
