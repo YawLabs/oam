@@ -10032,15 +10032,20 @@ fn check_rejects_an_impostor_tsgo_and_daemon_status_reports_why() {
     // reason and the spawn-failure timestamp instead of a bare
     // {"running":false}. The daemon records its reason from its own
     // process, when its tsgo probe fails; the client stops waiting for it
-    // after SPAWN_WAIT (5 s), marks the spawn failed and falls back. On a
-    // loaded machine the client can get there first, with the daemon still
-    // probing, so status is read until the reason is in (bounded).
+    // after SPAWN_WAIT (5 s), marks the spawn failed with a reason of its
+    // own and falls back. On a loaded machine the client can get there
+    // first, with the daemon still probing, so status is read until the
+    // daemon's own reason has replaced the client's (bounded).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let parsed: serde_json::Value = loop {
         let status = run(&["daemon", "status", proj.to_str().unwrap()]);
         let parsed: serde_json::Value =
             serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim()).unwrap();
-        if parsed["last_error"].is_string() || std::time::Instant::now() >= deadline {
+        if parsed["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("tsgo"))
+            || std::time::Instant::now() >= deadline
+        {
             break parsed;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -10055,6 +10060,75 @@ fn check_rejects_an_impostor_tsgo_and_daemon_status_reports_why() {
     assert!(
         parsed["spawn_failed_ms_ago"].as_u64().is_some(),
         "status must carry the spawn-failure marker: {parsed}"
+    );
+}
+
+#[test]
+fn daemon_status_gives_a_reason_with_every_spawn_failure() {
+    // #209: the client marks a spawn failed after SPAWN_WAIT (5 s), but the
+    // reason used to come only from the daemon, once its tsgo probe failed.
+    // A probe slower than that left `oam daemon status` saying the spawn
+    // failed, with no last_error, for as long as the probe took. This
+    // impostor answers --version only after ~20 s, so the whole window is
+    // open while status is read.
+    let fake = write_fake_tsgo(
+        "sleepy-version-tsgo",
+        "@echo off\r\nping -n 21 127.0.0.1 >nul\r\necho not a compiler\r\nexit /b 0\r\n",
+        "#!/bin/sh\nsleep 20\necho 'not a compiler'\nexit 0\n",
+    );
+    // A DEDICATED cache dir: the spawn-failure marker lives there.
+    let cache = write_temp("sleepy-version-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    write_temp(
+        "sleepyproj/tsconfig.json",
+        "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true}}",
+    );
+    let proj = write_temp("sleepyproj/a.ts", "export const n: number = 1;")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let command = |args: &[&str]| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_oam"));
+        command
+            .args(args)
+            .env("OAM_CACHE_DIR", &cache)
+            .env("OAM_DAEMON_IDLE_MS", "45000")
+            .env("OAM_TSGO_TIMEOUT_MS", "60000")
+            .env("OAM_TSGO", &fake);
+        command
+    };
+
+    let mut check = command(&["check", proj.to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("oam check starts");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let parsed: serde_json::Value = loop {
+        let status = command(&["daemon", "status", proj.to_str().unwrap()])
+            .output()
+            .expect("oam daemon status runs");
+        let parsed: serde_json::Value =
+            serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim()).unwrap();
+        if parsed["spawn_failed_ms_ago"].is_u64() || std::time::Instant::now() >= deadline {
+            break parsed;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let _ = check.kill();
+    let _ = check.wait();
+
+    assert!(
+        parsed["spawn_failed_ms_ago"].is_u64(),
+        "the client never marked the spawn failed: {parsed}"
+    );
+    assert!(
+        parsed["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("did not come up")),
+        "a spawn failure must carry a reason from the moment it is recorded: {parsed}"
     );
 }
 
