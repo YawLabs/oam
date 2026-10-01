@@ -1788,6 +1788,33 @@
     globalThis.CloseEvent = CloseEvent;
   }
 
+  // The event a WebSocket that fails to connect dispatches. Node v22 has the
+  // class (undici's) and no `ErrorEvent` global, so there is none here
+  // either: it is reachable only as an event's constructor.
+  // Its five attributes are prototype getters, as undici's are (an
+  // ErrorEvent has no own enumerable property).
+  const kErrorEventInit = Symbol("kErrorEventInit");
+  class ErrorEvent extends Event {
+    constructor(type, init) {
+      super(type, init);
+      Object.defineProperty(this, kErrorEventInit, {
+        value: {
+          message: (init && init.message) || "",
+          filename: (init && init.filename) || "",
+          lineno: (init && init.lineno) || 0,
+          colno: (init && init.colno) || 0,
+          error: init ? init.error : undefined,
+        },
+      });
+    }
+    get message() { return this[kErrorEventInit].message; }
+    get filename() { return this[kErrorEventInit].filename; }
+    get lineno() { return this[kErrorEventInit].lineno; }
+    get colno() { return this[kErrorEventInit].colno; }
+    get error() { return this[kErrorEventInit].error; }
+  }
+  brand(ErrorEvent, "ErrorEvent");
+
   // ------------------------------------------------------------ WebSocket
   const CONNECTING = 0;
   const OPEN = 1;
@@ -1837,9 +1864,14 @@
           this.dispatchEvent(ev);
           this._recvLoop();
         },
-        (err) => {
+        () => {
           this._readyState = CLOSED;
-          const ev = new Event("error");
+          // node (undici's failWebsocketConnection): an ErrorEvent whose
+          // `message` is this fixed text and whose `error` is an Error
+          // carrying it -- whatever failed, a refused connect or an answer
+          // that is not a 101. It was a bare Event, with neither (#161).
+          const message = "Received network error or non-101 status code.";
+          const ev = new ErrorEvent("error", { error: new Error(message), message });
           if (typeof this.onerror === "function") this.onerror(ev);
           this.dispatchEvent(ev);
           this._fireClose(1006, "", false);

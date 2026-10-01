@@ -1391,10 +1391,17 @@ What still differs:
   proxy. At the end of a response whose connection stays open,
   `res.socket` is null, as node detaches a kept-alive socket. Up to 0.16.2 it was a fixed object naming the host as
   written, with `localAddress` `127.0.0.1` and `localPort` `0`.
-- **The WebSocket client is not on this connector.** `new WebSocket(url)` dials on its own,
-  so on Windows a refused loopback connect takes about 2 s (2035 ms measured; Node 7 ms), and
-  the `'error'` event is a plain `Event` where Node's is an `ErrorEvent` with the message
-  `Received network error or non-101 status code.`
+- **The WebSocket client dials on this connector too** (since 0.17.2; up to 0.17.1 it dialled
+  on its own, so on Windows a refused loopback connect took about 2 s per resolved address,
+  and the `'error'` event was a plain `Event`). A connect that fails dispatches Node's
+  `ErrorEvent` -- `message` and `error` both `Received network error or non-101 status
+  code.`, no `ErrorEvent` global, as in Node v22
+  (`conformance/cases/226-websocket-connect-failure-event.mjs`). What is left: oam also
+  fires the `'close'` (1006, `wasClean` false) the WHATWG spec asks for after that
+  `'error'`, where Node v22.22.2 fires none for a connect that failed; the `wss:` handshake
+  verifies the server against the bundled Mozilla roots alone, not `node:tls`'s store
+  (`NODE_EXTRA_CA_CERTS`, `tls.setDefaultCACertificates`); and the dial honours no
+  `connect.lookup` hook or environment proxy.
 
 **`connect.lookup` on an undici `Agent`**
 
