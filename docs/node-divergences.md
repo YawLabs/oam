@@ -1567,6 +1567,15 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   `Connection: close` and closed it: no `'close'` 1.5 s later).
 - **`statusText` is the canonical reason phrase**, not the server's: `200 Custom Reason` reads
   `OK` in oam, and `299 Whatever` reads `''`. Node reports the reason on the wire.
+- **A response nobody has read holds the request's `'close'`.** The request's `'close'`
+  follows the response's `'end'` and `'close'` on a connection that is not kept, and comes
+  between them on a kept-alive one, as in Node, on both client paths
+  (`conformance/cases/194-http-request-close-order.mjs`; up to 0.17.1 the request closed
+  first on every connection that was not kept). What differs: Node closes the request
+  when its socket closes, so with a `Connection: close` response left unread the request
+  closes before the response is read; in oam it closes once the response has been. And
+  a small response destroyed from the `'response'` listener reads `complete` `false`
+  where Node, which had already parsed all of it, reads `true`.
 - **The request header count is capped.** More than 24,576 distinct header names (fewer if
   the header table's hash-flooding defence rebuilds it) fails with
   `fetch: too many request headers`; Node has no cap (25,000 distinct names get a 200).

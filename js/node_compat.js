@@ -19846,6 +19846,9 @@
         this._sentSignal = null;
         this._finishOnSent = false;
         this._channelPending = 0;
+        // The response leaves the transport's connection open: the request
+        // closes from the response's 'end' rather than behind its 'close'.
+        this._fetchKeptAlive = false;
         // Inside the socket's 'connect' / 'secureConnect' emit, ahead of the
         // request's own listener; and what a listener there closed the
         // socket with (true: no error), held for that listener to report.
@@ -21607,14 +21610,22 @@
         if (!agentPath) {
           this._fetchActivity();
           // node detaches a kept-alive socket from the response at its end;
-          // the transport's connection stays pooled likewise.
-          if (this.shouldKeepAlive && responseKeepsAlive(raw, this.method)) {
+          // the transport's connection stays pooled likewise. That is also
+          // where the request closes (node's emitFreeNT, a tick after the
+          // response's 'end' and so ahead of the response's own 'close').
+          // A connection that is not kept closes the request when it goes,
+          // which is after both (_responseEnded).
+          this._fetchKeptAlive = this.shouldKeepAlive && responseKeepsAlive(raw, this.method);
+          if (this._fetchKeptAlive) {
             res.on("end", function () {
               res.socket = null;
               res.connection = null;
+              self._emitClose();
             });
           }
-          this.emit("response", res);
+          // A response nobody listens for is read to its end, as node dumps
+          // it: the request closes with it.
+          if (!this.emit("response", res)) res.resume();
           return;
         }
         // node's parserOnIncomingClient: the socket is kept only if the
@@ -21643,6 +21654,9 @@
           this._settleWrites(true);
           // The connection is done with once its response is -- closed
           // after the response's own 'end' has been delivered.
+          // The request closes when its socket has, as node's does
+          // (socketCloseListener): behind the response's own 'close', which
+          // follows its 'end' by a tick.
           var socket = this.socket;
           globalThis.setImmediate(function () {
             self._closeBridge();
@@ -21650,9 +21664,9 @@
               socket._httpMessage = null;
               if (!socket.destroyed) socket.destroy();
             }
+            self._emitClose();
           });
           this.destroyed = true;
-          this._emitClose();
         } else if (this._requestWritableFinished() && !res.aborted) {
           this._responseKeepAlive();
         } else {
@@ -21699,9 +21713,16 @@
         var socket = this.socket;
         if (socket && isSocketLike(socket) && !socket.destroyed) socket.destroy();
         this.destroyed = true;
-        this._emitClose();
+        // node: the response closes first (its own destroy), the request
+        // when the socket that destroy took down has closed.
+        var res = this.res;
+        var self = this;
+        if (res && !res.closed) res.once("close", function () { self._emitClose(); });
+        else this._emitClose();
       }
 
+      // The response body has arrived to its end (it may not have been read
+      // yet).
       _responseEnded() {
         this._responseDone = true;
         // The agent path's socket is settled by the response's 'end'
@@ -21710,7 +21731,14 @@
         this._responseEnd = true;
         this._stopFetchSocketTimer();
         this.destroyed = true;
-        this._emitClose();
+        // A connection kept alive closes the request from the response's
+        // 'end' (_emitResponse). One that is not closes it as node's socket
+        // closing does: a turn of the loop on -- behind the 'end' and
+        // 'close' of a response that is being read, ahead of them for one
+        // nobody has read yet.
+        if (this._fetchKeptAlive) return;
+        var self = this;
+        globalThis.setImmediate(function () { self._emitClose(); });
       }
 
       // The fetch path's stand-in is done with: its idle timer stops, as a
