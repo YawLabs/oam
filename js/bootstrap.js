@@ -385,18 +385,24 @@
   // `set-cookie` is the one name the standard never combines: a cookie's
   // `Expires` attribute contains a comma, so `a=1, b=2` cannot be split back
   // into the two lines the server sent, and cookie-handling code was silently
-  // reading one broken cookie where node gives it two. Every other name still
-  // combines in place, so iteration order is unchanged for them: wire order,
-  // which is what `oam.serve` writes back out. (The standard also sorts
-  // iteration by name and node does; oam does not -- see
-  // docs/node-divergences.md.)
+  // reading one broken cookie where node gives it two. Every other name
+  // combines in place. The list keeps the order the names arrived in (wire
+  // order, or the order a handler set them), which is what `oam.serve`
+  // writes back out and what a fetch sends; ITERATION is sorted by name, as
+  // the standard's "sort and combine" says and node does (#175), so every
+  // script that walks a Headers sees node's order.
   class Headers {
     constructor(init) {
       /** @type {Array<[string, string]>} */
       this._list = [];
+      // The sorted view iteration reads, rebuilt after a change.
+      this._sorted = null;
       if (init === undefined || init === null) return;
       if (init instanceof Headers) {
-        for (const [k, v] of init) this.append(k, v);
+        // The stored list, in its order: iterating would sort it, and a
+        // Response built from a handler's Headers must reach the wire in the
+        // order the handler set them. Nothing a script can iterate differs.
+        for (const [k, v] of init._list) this.append(k, v);
       } else if (typeof init[Symbol.iterator] === "function" && typeof init !== "string") {
         for (const pair of init) this.append(pair[0], pair[1]);
       } else {
@@ -406,6 +412,7 @@
     append(name, value) {
       const key = String(name).toLowerCase();
       const text = String(value);
+      this._sorted = null;
       if (key === "set-cookie") {
         this._list.push([key, text]);
         return;
@@ -417,6 +424,7 @@
     set(name, value) {
       const key = String(name).toLowerCase();
       const text = String(value);
+      this._sorted = null;
       const at = this._list.findIndex((e) => e[0] === key);
       if (at < 0) {
         this._list.push([key, text]);
@@ -443,26 +451,68 @@
     }
     delete(name) {
       const key = String(name).toLowerCase();
+      this._sorted = null;
       this._list = this._list.filter((e) => e[0] !== key);
     }
+    // The list sorted by name, set-cookie lines kept apart in the order they
+    // came (a stable sort of the stored list does both).
+    _sortedList() {
+      this._sorted ??= this._list.slice().sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+      return this._sorted;
+    }
+    // Live, as webidl's iterable is in node: each step reads the sorted list
+    // as it is now, so a name added or removed mid-walk is seen.
     forEach(fn, thisArg) {
-      for (const [key, value] of this._list.slice()) fn.call(thisArg, value, key, this);
+      for (let i = 0; i < this._sortedList().length; i++) {
+        const [key, value] = this._sortedList()[i];
+        fn.call(thisArg, value, key, this);
+      }
     }
-    *entries() {
-      for (const [key, value] of this._list.slice()) yield [key, value];
+    entries() {
+      return headersIterator(this, "key+value");
     }
-    *keys() {
-      for (const [key] of this._list.slice()) yield key;
+    keys() {
+      return headersIterator(this, "key");
     }
-    *values() {
-      for (const [, value] of this._list.slice()) yield value;
+    values() {
+      return headersIterator(this, "value");
     }
     [Symbol.iterator]() {
-      return this.entries();
+      return headersIterator(this, "key+value");
     }
   }
+  Object.defineProperty(Headers.prototype, Symbol.iterator, { enumerable: false });
   brand(Headers, "Headers");
   globalThis.Headers = Headers;
+
+  // node's `Headers Iterator`: an index into the sorted list, read afresh on
+  // every next().
+  const HeadersIteratorPrototype = Object.create(
+    Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())),
+    {
+      next: {
+        value: function next() {
+          const state = headersIterators.get(this);
+          if (state === undefined) throw new TypeError("Illegal invocation");
+          const list = state.target._sortedList();
+          if (state.index >= list.length) return { value: undefined, done: true };
+          const [key, value] = list[state.index++];
+          const out = state.kind === "key" ? key : state.kind === "value" ? value : [key, value];
+          return { value: out, done: false };
+        },
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      },
+      [Symbol.toStringTag]: { value: "Headers Iterator", configurable: true },
+    },
+  );
+  const headersIterators = new WeakMap();
+  function headersIterator(target, kind) {
+    const iterator = Object.create(HeadersIteratorPrototype);
+    headersIterators.set(iterator, { target, kind, index: 0 });
+    return iterator;
+  }
 
   // ------------------------------------------------------------------ bodies
   // The Fetch Standard's "extract a body", once, for `fetch`, `Request` and
@@ -2242,7 +2292,8 @@
         if (fetchSemantics) {
           const combined = new Headers();
           for (const [k, v] of pairs) combined.append(k, v);
-          list = [...combined];
+          // In the order the caller gave them, as undici writes them.
+          list = combined._list;
         }
         for (const [rawName, value] of list) {
           const name = fetchSemantics ? rawName : String(rawName).toLowerCase();
@@ -2495,7 +2546,11 @@
     const node = globalThis.__oam.node;
     const status = response?.status ?? 200;
     const headerPairs = [];
-    if (response?.headers) {
+    if (response?.headers instanceof Headers) {
+      // The stored order -- the order the handler set them -- not the sorted
+      // order iteration gives a script.
+      for (const [key, value] of response.headers._list) headerPairs.push([key, value]);
+    } else if (response?.headers) {
       response.headers.forEach((value, key) => headerPairs.push([key, value]));
     }
     const headersJson = JSON.stringify(headerPairs);

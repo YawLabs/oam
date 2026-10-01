@@ -179,12 +179,17 @@
       return r;
     }
 
+    // In the order the response carried them: the fetch Headers' stored list,
+    // not its iteration, which sorts by name as the Fetch Standard says.
     function headersToObject(headers) {
       const out = { __proto__: null };
-      if (headers && typeof headers.forEach === "function") {
-        headers.forEach((value, key) => {
-          out[key] = key in out ? out[key] + ", " + value : value;
-        });
+      const add = (key, value) => {
+        out[key] = key in out ? out[key] + ", " + value : value;
+      };
+      if (headers && Array.isArray(headers._list)) {
+        for (const [key, value] of headers._list) add(key, value);
+      } else if (headers && typeof headers.forEach === "function") {
+        headers.forEach((value, key) => add(key, value));
       }
       return out;
     }

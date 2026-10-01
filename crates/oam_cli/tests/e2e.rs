@@ -3229,6 +3229,43 @@ fn oam_serve_writes_each_response_body_kind() {
     );
 }
 
+/// `oam.serve` writes a response's headers in the order the handler set them
+/// (#175): `Headers` iteration sorts by name, as node's does, and the server
+/// reads the stored list instead, so sorting did not reorder what it sends.
+/// Read off the wire with a raw socket; `date` is the server's own. The
+/// second set-cookie goes out beside the first: the transport groups a
+/// repeated name, as it always has.
+#[test]
+fn oam_serve_writes_headers_in_the_order_the_handler_set_them() {
+    let stdout = run_ok(
+        "serve_header_order.mjs",
+        "import net from 'node:net';\n\
+         const server = await oam.serve({ fetch: () => {\n\
+           const headers = new Headers({ 'x-z': '1', 'x-a': '2' });\n\
+           headers.append('set-cookie', 'b=2');\n\
+           headers.append('x-m', '3');\n\
+           headers.append('set-cookie', 'a=1');\n\
+           return new Response('ok', { headers });\n\
+         } });\n\
+         const head = await new Promise((resolve, reject) => {\n\
+           const socket = net.connect(server.port, '127.0.0.1', () => {\n\
+             socket.write('GET / HTTP/1.1\\r\\nhost: x\\r\\nconnection: close\\r\\n\\r\\n');\n\
+           });\n\
+           let text = '';\n\
+           socket.on('data', (c) => (text += c));\n\
+           socket.on('end', () => resolve(text.split('\\r\\n\\r\\n')[0]));\n\
+           socket.on('error', reject);\n\
+         });\n\
+         console.log(head.split('\\r\\n').slice(1).map((l) => l.toLowerCase())\n\
+           .filter((l) => !l.startsWith('date:')).join('|'));\n\
+         server.close();",
+    );
+    assert_eq!(
+        stdout,
+        "x-z: 1|x-a: 2|set-cookie: b=2|set-cookie: a=1|x-m: 3|content-type: text/plain;charset=utf-8|connection: close|content-length: 2"
+    );
+}
+
 /// `oam.serve`'s `close()` finishes the requests in flight and closes every
 /// other connection -- one that connected and never sent a request
 /// included. A client pool opens such a connection (fetch's spare, raced

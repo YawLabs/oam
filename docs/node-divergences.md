@@ -1584,11 +1584,6 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
 - **The request header count is capped.** More than 24,576 distinct header names (fewer if
   the header table's hash-flooding defence rebuilds it) fails with
   `fetch: too many request headers`; Node has no cap (25,000 distinct names get a 200).
-- **`Headers` iteration is in wire order, not sorted.** The Fetch Standard sorts a header
-  list by name on iteration and Node does; oam yields the order the server sent (and, for a
-  `Response` a script builds, the order it set them). `set-cookie` is not combined and
-  `getSetCookie()` is there, so no value is lost -- only the order differs. `oam.serve`
-  writes response headers out in this same order, which is why it is not sorted.
 - **Header values on the wire are UTF-8, where undici writes latin1.** A request header value
   of `café` goes out as `cafÃ©` in oam and `café` in Node. Response header values
   are decoded as latin1 in both, so the round trip is asymmetric: a value oam sent is not the

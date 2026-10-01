@@ -19456,17 +19456,18 @@
     }
 
     // The fetch path's headers, as they have always been read: through the
-    // fetch Headers class (sorted, repeated names combined).
+    // fetch Headers class (repeated names combined), in the order they
+    // arrived -- its stored list, not its iteration, which sorts by name.
     function fetchPathHeaders(pairs) {
       const combined = new oamFetchInternal.Headers();
       for (let i = 0; i < pairs.length; i++) combined.append(pairs[i][0], pairs[i][1]);
       const headers = {};
       const raw = [];
-      combined.forEach(function (value, name) {
+      for (const [name, value] of combined._list) {
         const key = name.toLowerCase();
         headers[key] = key in headers ? headers[key] + ", " + value : value;
         raw.push(name, value);
-      });
+      }
       return { headers, raw };
     }
 
