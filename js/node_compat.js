@@ -11340,6 +11340,30 @@
     const realpathByPath = callbackify1((p) => realpathWalking(realpathArg(p)), 1);
     const truncateByPath = callbackify1(promises.truncate, 2);
 
+    // The read behind fs.read and fs.readv, arguments already checked: `want`
+    // bytes at `position` into buffer[offset..], then cb(err, bytesRead,
+    // buffer). It always asks the native, even for 0 bytes -- fs.read returns
+    // early for those itself, but readv of empty views must still reach the
+    // descriptor (EBADF for a closed one, as node's).
+    function readChunkInto(fd, buffer, offset, want, position, cb) {
+      // The position was once parsed and then DROPPED -- fsReadChunk had no
+      // position parameter, so `fs.read(fd, buf, 0, 3, 10, cb)` read from the
+      // cursor and handed back the wrong bytes with no error. The native now
+      // takes one; null still means "from the cursor".
+      Promise.resolve(natives.fsReadChunk(fd, want, fsPositionArg(position))).then(
+        function (chunk) {
+          if (chunk === undefined || chunk === null) {
+            queueMicrotask(function () { cb(null, 0, buffer); });
+            return;
+          }
+          var view = new Uint8Array(buffer.buffer, buffer.byteOffset + offset);
+          view.set(chunk.subarray(0, Math.min(chunk.length, view.length)));
+          queueMicrotask(function () { cb(null, chunk.length, buffer); });
+        },
+        function (err) { queueMicrotask(function () { cb(err); }); },
+      );
+    }
+
     const fs = {
       // The exported object is the WRAPPED module, the very object
       // require("fs/promises") returns (node: `fs.promises ===
@@ -11722,25 +11746,7 @@
           process.nextTick(cb, null, 0, buffer);
           return;
         }
-        // The position was parsed above and then DROPPED -- fsReadChunk had no
-        // position parameter, so `fs.read(fd, buf, 0, 3, 10, cb)` read from the
-        // cursor and handed back the wrong bytes with no error. The native now
-        // takes one; null still means "from the cursor".
-        var readPos = fsPositionArg(position);
-        Promise.resolve(natives.fsReadChunk(fd, want, readPos)).then(
-          function (chunk) {
-            if (chunk === undefined || chunk === null) {
-              queueMicrotask(function () { cb(null, 0, buffer); });
-              return;
-            }
-            if (buffer) {
-              var view = new Uint8Array(buffer.buffer || buffer, (buffer.byteOffset || 0) + (offset || 0));
-              view.set(chunk.subarray(0, Math.min(chunk.length, view.length)));
-            }
-            queueMicrotask(function () { cb(null, chunk.length, buffer); });
-          },
-          function (err) { queueMicrotask(function () { cb(err); }); },
-        );
+        readChunkInto(fd, buffer, offset, want, position, cb);
       },
 
       createReadStream: (path, options) => new (rwStreams(natives).ReadStream)(path, options),
@@ -11978,7 +11984,7 @@
         return;
       }
       const tmp = globalThis.Buffer.allocUnsafe(total);
-      fs.read(fd, tmp, 0, total, fsPositionArg(position), (err, n) => {
+      readChunkInto(fd, tmp, 0, total, position, (err, n) => {
         if (err) { cb(err, 0, buffers); return; }
         scatterViews(buffers, tmp, n);
         // The SAME array instance goes back, which callers compare by identity.
