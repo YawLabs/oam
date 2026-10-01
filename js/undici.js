@@ -339,40 +339,23 @@
         }
       }
       // undici's headersTimeout runs while the request is on a connected
-      // socket, and not across the connect. A dispatcher with a connect
-      // function (a ProxyAgent's tunnel included) is asked for each
-      // connection, so the timer stops while it is asked and starts afresh
-      // once the socket it hands back carries the request. oam's own pool
-      // does not say when it has a connection for the request, so without a
-      // connect function the timer starts here and also covers the dial
-      // (docs/node-divergences.md).
-      let headersTimer = null;
-      let settled = false;
-      const disarmHeaders = () => {
-        if (headersTimer !== null) {
-          clearTimeout(headersTimer);
-          headersTimer = null;
-        }
-      };
-      const armHeaders = () => {
-        disarmHeaders();
-        if (!headersTimeout || settled) return;
-        headersTimer = undiciTimer(() => {
-          headersTimer = null;
-          controller.abort(new errors.HeadersTimeoutError("Headers Timeout Error"));
-        }, headersTimeout);
-      };
-      init.__oamConnectPhase = { connecting: disarmHeaders, connected: armHeaders };
-      armHeaders();
+      // socket: DNS, the connect, a TLS handshake and a connect function
+      // (a ProxyAgent's tunnel included) count for nothing, and each
+      // redirect hop gets its own. The transport runs it, from the moment it
+      // has a connection for the request -- the pool's, or the socket a
+      // connect function handed back -- so it costs no op of its own, and
+      // a late head fails the fetch with UND_ERR_HEADERS_TIMEOUT and closes
+      // that connection, as undici destroys the socket.
+      if (headersTimeout) init.__oamHeadersTimeout = headersTimeout;
       let res;
       try {
         res = await G.fetch(String(url), init);
       } catch (err) {
         unlink();
+        if (err instanceof TypeError && err.cause && err.cause.code === "UND_ERR_HEADERS_TIMEOUT") {
+          throw new errors.HeadersTimeoutError("Headers Timeout Error");
+        }
         throw err;
-      } finally {
-        settled = true;
-        disarmHeaders();
       }
       const body = makeBodyReadable(res.body, bodyTimeout, (err) => controller.abort(err));
       // A signal shared by many requests must not keep one listener per

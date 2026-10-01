@@ -191,7 +191,8 @@ impl Pool {
                 key: conn_key,
             } = conn;
             // The request has a connection, and hyper writes it as soon as
-            // it is handed over: node's 'finish' for http.request (`sent`).
+            // it is handed over: node's 'finish' for http.request, and where
+            // undici's headersTimeout starts (`sent`).
             if let Some(dispatched) = req.extensions().get::<Dispatched>() {
                 dispatched.fire();
             }
