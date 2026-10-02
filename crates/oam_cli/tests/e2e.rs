@@ -7609,6 +7609,56 @@ server.close();
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// `import 'undici'`'s error classes are undici's, and fetch's causes are
+/// instances of them: `err.cause instanceof errors.SocketError` holds for a
+/// connection the server closed, as on node with the npm package (retry
+/// logic is written that way). undici's `instanceof` reads global-symbol
+/// brands (`Symbol.for('undici.error.<code>')`), so an object branded by
+/// another copy of undici passes too. Up to 0.17.1 the shim's classes had
+/// no brands -- both checks were false -- and AbortError's code was
+/// RequestAbortedError's. Expected lines measured on node v22.22.2 with
+/// undici 6.29.0 installed.
+#[test]
+fn undici_errors_are_undicis_classes_with_its_brands() {
+    let script = write_temp(
+        "undici_error_brands/main.mjs",
+        r##"import net from 'node:net';
+import { errors } from 'undici';
+
+const server = net.createServer((c) => { c.on('error', () => {}); c.once('data', () => c.end()); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+try {
+  await fetch(`http://127.0.0.1:${server.address().port}/`);
+} catch (e) {
+  console.log('cause', e.cause.code, e.cause instanceof errors.SocketError, e.cause instanceof errors.UndiciError);
+}
+server.close();
+const foreign = { [Symbol.for('undici.error.UND_ERR')]: true, [Symbol.for('undici.error.UND_ERR_SOCKET')]: true };
+console.log('foreign', foreign instanceof errors.SocketError, foreign instanceof errors.UndiciError);
+console.log('plain', new Error('x') instanceof errors.UndiciError, null instanceof errors.UndiciError);
+for (const name of ['AbortError', 'RequestAbortedError', 'BalancedPoolMissingUpstreamError', 'HTTPParserError']) {
+  const C = errors[name];
+  const e = new C();
+  console.log(name, C.name, e.name, e.code, JSON.stringify(e.message), e instanceof errors.UndiciError,
+    e instanceof errors.AbortError, JSON.stringify(Object.getOwnPropertyNames(e).filter((k) => k !== 'stack')));
+}
+const r = new errors.ResponseStatusCodeError('m', 418, { a: '1' }, 'b');
+console.log('status', r.status, r.statusCode, r.body, JSON.stringify(r.headers));
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "cause UND_ERR_SOCKET true true\n\
+         foreign true true\n\
+         plain false false\n\
+         AbortError AbortError AbortError UND_ERR_ABORT \"The operation was aborted\" true true [\"name\",\"code\",\"message\"]\n\
+         RequestAbortedError RequestAbortedError AbortError UND_ERR_ABORTED \"Request aborted\" true true [\"name\",\"code\",\"message\"]\n\
+         BalancedPoolMissingUpstreamError BalancedPoolMissingUpstreamError MissingUpstreamError UND_ERR_BPL_MISSING_UPSTREAM \"No upstream has been added to the BalancedPool\" true false [\"name\",\"code\",\"message\"]\n\
+         HTTPParserError HTTPParserError HTTPParserError undefined \"\" false false [\"name\",\"code\",\"data\"]\n\
+         status 418 418 b {\"a\":\"1\"}";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 /// An abort ends a hooked fetch where node ends it. Aborted in the same tick
 /// as fetch(), the first host is still passed to the hook (undici has begun
 /// connecting); aborted while a request is on the wire, the redirect it
@@ -22070,6 +22120,149 @@ process.exit(0);
             );
         }
     }
+}
+
+/// An option-less https.get rides oam's shared transport, and its
+/// `req.socket` is a stand-in `tls.TLSSocket`. destroy() on it after the
+/// response closes the kept-alive TLS connection the response came on, as
+/// node's closes the socket's handle: the server sees the end and the close,
+/// the socket's 'close' says false, and the next request dials a new
+/// connection. Its resetAndDestroy() throws ERR_INVALID_HANDLE_TYPE, as on
+/// node's TLSSocket. Measured on node v22.22.2 (Windows), same lines. Up to
+/// 0.17.1 the connection stayed in the pool: the server saw nothing and the
+/// next request went out on it. The CA is trusted through
+/// NODE_EXTRA_CA_CERTS, the one way the shared transport trusts a private
+/// root, which is why this is not a conformance case.
+#[test]
+fn https_get_socket_destroy_closes_the_pooled_tls_connection() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+import https from 'node:https';
+const cert = `{cert}`;
+const key = `{key}`;
+const conns = [];
+const server = tls.createServer({{ cert, key }}, (c) => {{
+  const rec = {{ events: [] }};
+  rec.closed = new Promise((r) => c.on('close', (h) => {{ rec.events.push('close ' + h); r(); }}));
+  c.on('end', () => rec.events.push('end'));
+  c.on('error', (e) => rec.events.push('error ' + e.code));
+  conns.push(rec);
+  c.on('data', () => c.write('HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\nx'));
+}});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const get = () => new Promise((resolve, reject) => {{
+  const req = https.get({{ host: 'localhost', port }}, (res) => {{
+    res.resume();
+    res.on('end', () => setImmediate(() => resolve(req.socket)));
+  }});
+  req.on('error', reject);
+}});
+const socket = await get();
+console.log('encrypted=' + socket.encrypted);
+try {{ socket.resetAndDestroy(); console.log('reset=returned'); }} catch (e) {{ console.log('reset=' + e.code); }}
+const closed = new Promise((r) => socket.on('close', (h) => r('close ' + h)));
+socket.destroy();
+const timeout = (ms) => new Promise((r) => setTimeout(() => r('TIMEOUT'), ms));
+console.log('socket=' + await Promise.race([closed, timeout(3000)]));
+console.log('server=' + await Promise.race([conns[0].closed.then(() => conns[0].events.join('+')), timeout(3000)]));
+await get();
+console.log('connections=' + conns.length);
+https.globalAgent.destroy();
+server.close();
+setTimeout(() => process.exit(0), 50);
+"#,
+        cert = FETCH_TEST_LEAF,
+        key = FETCH_TEST_LEAF_KEY,
+    );
+    let file = write_temp("https_stand_in_destroy.mjs", &src);
+    let ca = write_temp("https_stand_in_destroy_ca.pem", FETCH_TEST_CA);
+    let mut cmd = oam_command(&["run", file.to_str().unwrap(), "--no-check"]);
+    cmd.env("NODE_EXTRA_CA_CERTS", &ca);
+    let out = bounded_output(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            "encrypted=true",
+            "reset=ERR_INVALID_HANDLE_TYPE",
+            "socket=close false",
+            "server=end+close false",
+            "connections=2",
+        ],
+        "stderr: {stderr}"
+    );
+}
+
+/// A finished request's `req.socket` closes its connection only while no
+/// other request has taken it. oam's shared pool hands the kept-alive
+/// connection of an option-less http.get / https.get to the next request
+/// for the origin -- here a fetch() the server answers after 200 ms -- and a
+/// destroy() on the kept socket 50 ms into it used to close the connection
+/// under the fetch ("fetch failed / error sending request for url"). node
+/// (v22.22.2) prints "fetch=ok slow-done" for both: its socket is the first
+/// request's own, and undici's pool is not the agent's. That oam reused the
+/// connection (one server connection, where node dials two) is what puts
+/// the fetch in harm's way, so it is asserted too.
+#[test]
+fn a_kept_req_socket_leaves_a_connection_another_request_took() {
+    let src = format!(
+        r#"
+import http from 'node:http';
+import https from 'node:https';
+const cert = `{cert}`;
+const key = `{key}`;
+for (const secure of [false, true]) {{
+  let conns = 0;
+  const handler = (req, res) => {{
+    req.resume();
+    if (req.url === '/slow') setTimeout(() => res.end('slow-done'), 200);
+    else res.end('hello');
+  }};
+  const server = secure ? https.createServer({{ cert, key }}, handler) : http.createServer(handler);
+  server.on('connection', () => conns++);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = (secure ? 'https' : 'http') + '://localhost:' + server.address().port;
+  const socket = await new Promise((resolve, reject) => {{
+    const req = (secure ? https : http).get(base + '/', (res) => {{
+      res.resume();
+      res.on('end', () => setImmediate(() => resolve(req.socket)));
+    }});
+    req.on('error', reject);
+  }});
+  const fetched = fetch(base + '/slow').then((r) => r.text()).then(
+    (t) => 'ok ' + t,
+    (e) => 'failed ' + e.message + ' / ' + (e.cause && e.cause.message),
+  );
+  await new Promise((r) => setTimeout(r, 50));
+  socket.destroy();
+  console.log((secure ? 'https' : 'http') + ' fetch=' + await fetched + ' connections=' + conns);
+  server.close();
+}}
+setTimeout(() => process.exit(0), 50);
+"#,
+        cert = FETCH_TEST_LEAF,
+        key = FETCH_TEST_LEAF_KEY,
+    );
+    let file = write_temp("kept_req_socket_reused_connection.mjs", &src);
+    let ca = write_temp("kept_req_socket_reused_connection_ca.pem", FETCH_TEST_CA);
+    let mut cmd = oam_command(&["run", file.to_str().unwrap(), "--no-check"]);
+    cmd.env("NODE_EXTRA_CA_CERTS", &ca);
+    let out = bounded_output(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            "http fetch=ok slow-done connections=1",
+            "https fetch=ok slow-done connections=1",
+        ],
+        "stderr: {stderr}"
+    );
 }
 
 /// Issue #146: a verifying https request's per-request TLS options reach the

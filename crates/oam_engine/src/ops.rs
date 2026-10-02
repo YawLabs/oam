@@ -559,10 +559,12 @@ fn op_http_transport_destroy(
     core_runtime!(scope).http_client().destroy_pool();
 }
 
-/// `__oam.fetchConnClose(connection, reset)`, synchronous: close the
+/// `__oam.fetchConnClose(connection, reset, lease)`, synchronous: close the
 /// transport connection a response named as `socket.connection` -- with a
-/// reset (SO_LINGER 0) when `reset` -- whether it is carrying a response or
-/// idle in the pool. One already gone is left alone.
+/// reset (SO_LINGER 0) when `reset` -- whether it is carrying that response
+/// or idle in the pool after it. One already gone, or taken since by
+/// another request (its checkout is no longer `socket.lease`), is left
+/// alone.
 fn op_fetch_conn_close(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -570,7 +572,11 @@ fn op_fetch_conn_close(
 ) {
     let connection = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let reset = args.get(1).is_true();
-    oam_core::http_client::close_connection(connection, reset);
+    let lease = args.get(2);
+    let lease = lease
+        .is_number()
+        .then(|| lease.number_value(scope).unwrap_or(0.0) as u64);
+    oam_core::http_client::close_connection(connection, reset, lease);
 }
 
 fn op_fetch_body_read(
@@ -888,6 +894,35 @@ pub(crate) fn settle_completion(
             if let Ok(obj) = v8::Local::<v8::Object>::try_from(error) {
                 set_string_array(tc, obj, "peerCertificates", &peer_certificates);
                 set_string_array(tc, obj, "storeIssuers", &store_issuers);
+            }
+            resolver.reject(tc, error);
+        }
+        // A connection its peer closed under an HTTP client request: an
+        // `UND_ERR_SOCKET` error with the socket's facts hung on it as
+        // `socket` (undici's keys), from which the JS builds the error its
+        // caller reports -- undici's SocketError for fetch, node's `socket
+        // hang up` / `aborted` for http.request.
+        OpOutcome::SocketClosed { message, socket } => {
+            let fields = SysFields {
+                code: "UND_ERR_SOCKET",
+                message: &message,
+                errno: None,
+                syscall: None,
+                path: None,
+                hostname: None,
+                address: None,
+                port: None,
+                dest: None,
+            };
+            let error = sys_error(tc, &fields);
+            let error = v8::Local::new(tc, &error);
+            if let Ok(obj) = v8::Local::<v8::Object>::try_from(error)
+                && let Ok(json) = serde_json::to_string(&socket)
+                && let Some(text) = v8::String::new(tc, &json)
+                && let Some(value) = v8::json::parse(tc, text)
+                && let Some(key) = v8::String::new(tc, "socket")
+            {
+                obj.create_data_property(tc, key.into(), value);
             }
             resolver.reject(tc, error);
         }

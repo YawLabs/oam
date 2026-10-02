@@ -69,6 +69,11 @@ pub struct FetchBody {
     /// undici's `bodyTimeout`: the longest a read may wait for the wire's
     /// next frame (`fetch`'s and `undici.request`'s; `None` for none).
     timeout: Option<Duration>,
+    /// The connection the body arrives on (the shared transport's), whose
+    /// facts -- bytes written and read included -- undici's `SocketError`
+    /// describes when the peer closes it mid-body (fu2/http-conn-close).
+    /// `None` for a body read off an agent's socket or an h2 stream.
+    conn: Option<super::connector::ConnInfo>,
 }
 
 /// The response facts undici's parser weighs when the connection ends inside
@@ -267,6 +272,7 @@ impl FetchBody {
             framing: None,
             wire_read: 0,
             timeout: None,
+            conn: None,
         }
     }
 
@@ -291,6 +297,11 @@ impl FetchBody {
             },
             _ => BodyReadError::Closed,
         }
+    }
+
+    /// The body with the connection it arrives on ([`FetchBody`]'s `conn`).
+    pub(crate) fn on_conn(self, conn: Option<super::connector::ConnInfo>) -> FetchBody {
+        FetchBody { conn, ..self }
     }
 
     /// The body with undici's `bodyTimeout` (`None`: no limit).
@@ -470,6 +481,12 @@ pub async fn read(
             OpOutcome::Bytes(chunk.to_vec())
         }
         Ok(None) => OpOutcome::Done,
+        // A kept-alive response's connection the peer closed mid-body:
+        // undici's SocketError, with the connection's facts as they stand.
+        Err(BodyReadError::Closed) if body.conn.is_some() => match &body.conn {
+            Some(conn) => OpOutcome::socket_closed(conn.socket_facts()),
+            None => BodyReadError::Closed.to_outcome(body.coded),
+        },
         Err(error) => error.to_outcome(body.coded),
     }
 }
@@ -578,4 +595,64 @@ pub fn end_outbound(outbound: &OutboundBodies, handle: u64) {
     };
     drop(map);
     drop((sender, removed));
+}
+
+// ------------------------------------------------- the server's request bodies
+
+/// What a request body hyper failed on was, on the server side
+/// (http_server.rs `request_body_failure`; fu2/http-conn-close). hyper
+/// reports malformed chunked framing as a body error whose source is an
+/// `io::Error` of kind InvalidInput / InvalidData ("Invalid chunk size
+/// line"); a connection that ends early as one of kind UnexpectedEof ("end
+/// of file before message length reached"); a reset as the read's own
+/// ConnectionReset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServerBodyError {
+    /// Malformed chunked framing.
+    Framing,
+    /// The peer reset the connection; the OS error, when there was one.
+    Reset(Option<i32>),
+    /// The peer closed the connection before the body's end.
+    Closed,
+    /// Anything else.
+    Other,
+}
+
+pub(crate) fn classify_server_body(error: &hyper::Error) -> ServerBodyError {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(error);
+    while let Some(e) = current {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            return match io.kind() {
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => {
+                    ServerBodyError::Framing
+                }
+                std::io::ErrorKind::ConnectionReset => ServerBodyError::Reset(io.raw_os_error()),
+                std::io::ErrorKind::UnexpectedEof => ServerBodyError::Closed,
+                _ => ServerBodyError::Other,
+            };
+        }
+        current = e.source();
+    }
+    if error.is_incomplete_message() {
+        ServerBodyError::Closed
+    } else {
+        ServerBodyError::Other
+    }
+}
+
+/// llhttp's code and text for a bad chunk-size line, the one framing error
+/// hyper leaves in a body (measured on v22.22.2, a request's or a
+/// response's).
+pub(crate) fn invalid_chunk_size() -> OpOutcome {
+    OpOutcome::node_failed(
+        "HPE_INVALID_CHUNK_SIZE",
+        "Parse Error: Invalid character in chunk size",
+    )
+}
+
+/// llhttp's code and text for a connection that ended mid-body: node's
+/// parser refuses the end of the stream there (`parser.finish()`), and the
+/// message carries no reason (v22.22.2).
+pub(crate) fn invalid_eof_state() -> OpOutcome {
+    OpOutcome::node_failed("HPE_INVALID_EOF_STATE", "Parse Error")
 }

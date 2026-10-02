@@ -1749,6 +1749,10 @@
     let cause = e;
     if (e instanceof Error && e.code === "UND_ERR_RES_CONTENT_LENGTH_MISMATCH") {
       cause = new undiciErrors.ResponseContentLengthMismatchError();
+    } else if (e instanceof Error && e.code === "UND_ERR_SOCKET" && e.socket) {
+      // The transport's close, with the connection's facts as they stood
+      // (bytes written and read included).
+      cause = undiciCause(e);
     } else if (e instanceof Error && e.code === "UND_ERR_SOCKET") {
       const { localAddr, remoteAddr } = raw.socket ?? {};
       cause = new undiciErrors.SocketError(e.message, {
@@ -2335,6 +2339,22 @@
         return new undiciErrors.HeadersTimeoutError(e.message);
       case "UND_ERR_BODY_TIMEOUT":
         return new undiciErrors.BodyTimeoutError(e.message);
+      // The peer closed the connection before the head (transport.rs
+      // OpOutcome::SocketClosed): undici's SocketError, with the socket it
+      // describes.
+      case "UND_ERR_SOCKET": {
+        const facts = e.socket || {};
+        return new undiciErrors.SocketError(e.message, {
+          localAddress: facts.localAddress,
+          localPort: facts.localPort,
+          remoteAddress: facts.remoteAddress,
+          remotePort: facts.remotePort,
+          remoteFamily: facts.remoteFamily,
+          timeout: undefined,
+          bytesWritten: facts.bytesWritten,
+          bytesRead: facts.bytesRead,
+        });
+      }
       default:
         return e;
     }

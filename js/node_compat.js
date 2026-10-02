@@ -19127,6 +19127,20 @@
       }
     }
 
+    // A server stand-in socket's own 'close' (serverSocket), and whether it
+    // has been emitted.
+    const kServerSocketClose = Symbol("kServerSocketClose");
+    const kServerSocketClosed = Symbol("kServerSocketClosed");
+    // A server response that closes with its connection's socket: node's
+    // onServerResponseClose, a 'close' listener on the socket from the
+    // moment the response is assigned it until it finishes.
+    const kClosesWithSocket = Symbol("kClosesWithSocket");
+    // The server a connection's socket belongs to, and whether node's
+    // socketOnError -- the server's own 'error' listener, which removes
+    // itself after the first error -- has run on it (serverSocketOnError).
+    const kConnServer = Symbol("kConnServer");
+    const kSocketOnErrorRan = Symbol("kSocketOnErrorRan");
+
     class IncomingMessage extends Readable {
       constructor(meta) {
         // The http layer manages this stream's close lifecycle; opt out of
@@ -19245,11 +19259,38 @@
             // rather than producing a status.
             this._reading = false;
             this._bodyDone = true;
-            // A body the connection failed on -- malformed (node's parser
-            // refused it) or cut short -- ends the exchange the way a lost
-            // socket does in node: 'aborted', then ECONNRESET "aborted".
+            // A body the connection failed on is the connection's failure in
+            // node, not the request's: its parser refused the bytes
+            // (HPE_INVALID_CHUNK_SIZE) or the end of the stream
+            // (HPE_INVALID_EOF_STATE), or the socket's read was reset. The
+            // socket reports it (socketOnError: 'clientError', or the
+            // socket destroyed with it), and the request is aborted when
+            // the socket closes -- 'aborted', the response's 'close', the
+            // socket's, then ECONNRESET "aborted" (measured on v22.22.2).
             const text = err instanceof Error ? err.message : String(err);
-            if (text.startsWith("request body: ")) {
+            const code = err instanceof Error ? err.code : undefined;
+            const parseError = typeof code === "string" && code.startsWith("HPE_");
+            const readReset = code === "ECONNRESET" && err.syscall === "read";
+            if (parseError || readReset || text.startsWith("request body: ")) {
+              const socket = this.socket;
+              if (
+                socket &&
+                socket[kConnServer] !== undefined &&
+                socket[kServerSocketClosed] === false
+              ) {
+                if (parseError) {
+                  serverSocketOnError(socket, withParseReason(err));
+                } else if (readReset) {
+                  // net's own: the socket destroys itself with the read's
+                  // error, and socketOnError hears it as an 'error'.
+                  socket.destroy(err);
+                } else {
+                  // A failure node has no name for: the connection goes,
+                  // and the socket's close aborts the request.
+                  socket.destroy();
+                }
+                return;
+              }
               const reset = new Error("aborted");
               reset.code = "ECONNRESET";
               this.destroy(reset);
@@ -19291,9 +19332,15 @@
         // unanswered exchange surface a connection error client-side.
         if (this.socket && this.aborted && typeof this._requestId === "number") {
           natives.httpAbort(this._requestId);
-          // The connection goes with it: an unfinished response closes
-          // (node's 'close' without 'finish').
-          if (this.res && typeof this.res._connectionLost === "function") {
+          // The connection goes with it, as node's `this.socket.destroy(err)`
+          // -- a response already under way included, which httpAbort no
+          // longer reaches -- and an unfinished response closes with the
+          // socket (node's 'close' without 'finish'). A socket that is no
+          // connection's has no close of its own to wait for.
+          const socket = this.socket;
+          if (socket[kServerSocketClose] !== undefined && socket._isConnectionSocket === true) {
+            socket.destroy(err);
+          } else if (this.res && typeof this.res._connectionLost === "function") {
             this.res._connectionLost();
           }
         }
@@ -19630,7 +19677,10 @@
         // resolves the watcher too -- the _finished guard no-ops it.
         const watchedId = this._streamId;
         natives.httpStreamClosed(watchedId).then(() => {
-          if (this._finished || this.closed) return;
+          // A response on a connection's socket closes with that socket,
+          // where node closes it: after the socket's earlier 'close'
+          // listeners, not ahead of them.
+          if (this._finished || this.closed || this[kClosesWithSocket] === true) return;
           this.closed = true;
           natives.httpBodyEnd(watchedId);
           // The connection died mid-response: reap an unconsumed request
@@ -19684,7 +19734,9 @@
         this._chain = this._chain.then(() => natives.httpBodyPush(streamId, bytes)).then(
           () => cb?.(),
           (err) => {
-            if (this.listenerCount("error") > 0) this.emit("error", err);
+            // A response its connection was closed under has closed, and
+            // node emits no 'error' on it for a write that went nowhere.
+            if (!this.closed && this.listenerCount("error") > 0) this.emit("error", err);
             cb?.(err);
           },
         );
@@ -19905,14 +19957,50 @@
         }
         return this;
       };
+      // node's 'close', once, saying whether the socket was destroyed with
+      // an error. A connection's socket closes when the native side reports
+      // the connection over (releaseConnection), as node's closes when its
+      // handle has: its listeners -- the server's own abortIncoming first,
+      // then the application's and each response's -- run in node's order.
+      // Any other stand-in (a 'timeout' or 'tlsClientError' socket with no
+      // connection record) closes on the next tick after its destroy().
+      let closeEmitted = false;
+      let hadError = false;
+      Object.defineProperty(socket, kServerSocketClose, {
+        value: function emitClose() {
+          if (closeEmitted) return;
+          closeEmitted = true;
+          this.readable = false;
+          this.writable = false;
+          this.destroyed = true;
+          this.emit("close", hadError);
+        },
+      });
+      Object.defineProperty(socket, kServerSocketClosed, {
+        get() {
+          return closeEmitted;
+        },
+      });
       // Closes the connection -- with a reset when resetAndDestroy() asked
-      // (_reset). The server's own error handler is always listening in
-      // node, so an error here reaches only the caller's listeners.
+      // (_reset).
       socket.destroy = function destroy(err) {
         if (this.destroyed) return this;
         this.destroyed = true;
         this.readable = false;
         this.writable = false;
+        if (err) {
+          hadError = true;
+          // node's 'error': on the next tick, ahead of the 'close' the
+          // handle's close brings. On a connection's socket its first
+          // listener is the server's socketOnError, so the server's
+          // 'clientError' hears the first error (the socket destroyed by
+          // then) before the caller's listeners do; with none of those, the
+          // server's own no-op listener keeps it from being thrown.
+          process.nextTick(() => {
+            if (this[kConnServer] !== undefined) serverSocketOnError(this, err);
+            if (this.listenerCount("error") > 0) this.emit("error", err);
+          });
+        }
         if (typeof connectionId === "number") {
           if (this.resetAndClosing === true) {
             this.resetAndClosing = false;
@@ -19921,10 +20009,9 @@
             natives.httpConnDestroy(connectionId);
           }
         }
-        process.nextTick(() => {
-          if (err && this.listenerCount("error") > 0) this.emit("error", err);
-          this.emit("close", Boolean(err));
-        });
+        if (this._isConnectionSocket !== true) {
+          process.nextTick(() => this[kServerSocketClose]());
+        }
         return this;
       };
       // Closes the connection once what is being written is out (no
@@ -19936,17 +20023,6 @@
           natives.httpConnDestroy(connectionId, true);
         }
         return this;
-      };
-      // The connection went away under the exchange (the native side's
-      // 'closed'): node's socket is neither readable nor writable then, and
-      // on-finished reads exactly that to tell an aborted request from one
-      // still arriving. Not destroy(): the connection is already gone, and
-      // node emits the socket's 'close' from the teardown that reported it,
-      // which oam does not surface on this object (divergence 39).
-      socket._markClosed = function markClosed() {
-        this.readable = false;
-        this.writable = false;
-        this.destroyed = true;
       };
       // node's socket.resetAndDestroy(), net.Socket's own function: the
       // connection is closed with a reset (SO_LINGER 0) -- the client's read
@@ -20188,6 +20264,72 @@
       const forget = () => exchanges.delete(requestId);
       res.once("finish", forget);
       res.once("close", forget);
+      // node's res.assignSocket(): until it finishes, the response closes
+      // when its connection's socket does, from a 'close' listener added
+      // before the 'request' listeners run (onServerResponseClose).
+      const socket = req.socket;
+      if (
+        socket &&
+        socket[kServerSocketClosed] === false &&
+        socket === connectionSocket(server, connectionId)
+      ) {
+        const onSocketClose = () => res._connectionLost();
+        socket.on("close", onSocketClose);
+        res[kClosesWithSocket] = true;
+        const detach = () => {
+          res[kClosesWithSocket] = false;
+          socket.removeListener("close", onSocketClose);
+        };
+        res.once("finish", detach);
+        res.once("close", detach);
+      }
+    }
+
+    // node's abortIncoming, the first 'close' listener on the socket a
+    // connection's requests are served through: each request on the
+    // connection whose response is not done is destroyed -- with
+    // ECONNRESET "aborted" ('aborted' now when it was not read to the end,
+    // 'error' and 'close' on the next tick) -- and its response closes from
+    // its own listener on the socket, after this one.
+    function abortIncoming(server, connectionId) {
+      const exchanges = server._exchanges;
+      if (!exchanges) return;
+      for (const [requestId, exchange] of exchanges) {
+        if (exchange.connectionId === connectionId) abortExchange(server, requestId, exchange);
+      }
+    }
+
+    // node's socketOnError, the 'error' listener the http server puts on
+    // every connection's socket ahead of any other, which removes itself
+    // after the first error: the server's 'clientError' gets the error and
+    // the socket, and decides what becomes of the connection; with no
+    // listener the socket is destroyed with the error. (node writes a 400
+    // first when nothing has been answered; for a body the parser refused,
+    // the native server has already answered it.)
+    function serverSocketOnError(socket, err) {
+      if (socket[kSocketOnErrorRan] === true) return;
+      socket[kSocketOnErrorRan] = true;
+      const server = socket[kConnServer];
+      if (server !== undefined && server.emit("clientError", err, socket)) return;
+      socket.destroy(err);
+    }
+
+    function abortExchange(server, requestId, exchange) {
+      server._exchanges.delete(requestId);
+      const req = exchange.req;
+      if (!req.destroyed) {
+        if (req.readableEnded) {
+          // node's request has closed on its own by now (it destroys itself
+          // once read to the end): it closes, and nothing is aborted.
+          req.destroy();
+        } else {
+          const reset = new Error("aborted");
+          reset.code = "ECONNRESET";
+          req.destroy(reset);
+        }
+      }
+      // A response no socket closes (it was never on a connection's).
+      if (exchange.res[kClosesWithSocket] !== true) exchange.res._connectionLost();
     }
 
     // The socket objects a server's live connections are served through, by
@@ -20218,26 +20360,33 @@
 
     // A connection is over for the server: node's socket is neither readable
     // nor writable, 'close' has fired, and nothing holds it any more. Both of
-    // an https connection's sockets close, the TLS one first, as node's
-    // TLSSocket closes before the socket under it. Also what an upgrade or
-    // CONNECT does to the connection it takes over, in the same step as it
-    // counts the socket that carries the connection on.
+    // an https connection's sockets close, the one under the TLS socket
+    // first, as node's do (measured on v22.22.2: whether the client or the
+    // server ended it, or JS destroyed the TLS socket). Also what an upgrade
+    // or CONNECT does to the connection it takes over, in the same step as
+    // it counts the socket that carries the connection on.
     function releaseConnection(server, connectionId) {
       const sockets = server._connSockets;
       const record = sockets && sockets.get(connectionId);
       if (sockets) sockets.delete(connectionId);
-      if (record) {
-        for (const socket of [record.secure, record.conn]) {
-          if (socket && !socket.destroyed) {
-            socket._markClosed();
-            socket.emit("close", false);
-          }
+      if (record) closeRecordSockets(record);
+    }
+
+    // Each socket closes even when a listener on the other throws, as
+    // node's two sockets close apart.
+    function closeRecordSockets(record) {
+      for (const socket of [record.conn, record.secure]) {
+        if (!socket) continue;
+        try {
+          socket[kServerSocketClose]();
+        } catch (e) {
+          raiseFromListener(e);
         }
       }
     }
 
     // A connection event from the native server.
-    function onConnectionEvent(server, meta) {
+    function onConnectionEvent(server, meta, encrypted) {
       const exchange =
         meta.requestId === undefined || !server._exchanges
           ? undefined
@@ -20266,6 +20415,15 @@
         // sees a destroy instead of serving it.
         const socket = serverSocket(meta);
         socket._isConnectionSocket = true;
+        socket[kConnServer] = server;
+        // The requests of an http connection are served through this
+        // socket, and node's abortIncoming is its first 'close' listener,
+        // ahead of any the application adds; an https connection's are
+        // served through its TLS socket ('secureConnection').
+        if (!encrypted) {
+          const connectionId = meta.connectionId;
+          socket.on("close", () => abortIncoming(server, connectionId));
+        }
         // A net.Socket by brand, as oam's own TLSSocket is (#132,
         // divergence 34). Node hands this listener a net.Socket, and a
         // check that filters clients here is often written behind
@@ -20299,6 +20457,9 @@
         // handed out, which node's TLSSocket wraps.
         const socket = registry._tlsServer.serverSocketView(serverSocket(meta), meta.tls);
         socket._isConnectionSocket = true;
+        socket[kConnServer] = server;
+        const connectionId = meta.connectionId;
+        socket.on("close", () => abortIncoming(server, connectionId));
         connectionRecord(server, meta.connectionId).secure = socket;
         try {
           server.emit("secureConnection", socket);
@@ -20338,25 +20499,20 @@
         // not read to the end, 'error' and 'close' on the next tick) --
         // and the response closes without 'finish'.
         if (exchange) {
-          server._exchanges.delete(meta.requestId);
-          const req = exchange.req;
-          const socket = req.socket;
-          // A socket destroyed from JS -- destroy(), resetAndDestroy() --
-          // has emitted its 'close' already, and does not emit it twice.
-          if (socket && typeof socket._markClosed === "function" && !socket.destroyed) {
-            socket._markClosed();
-            // node closes the connection's socket before the response it
-            // was carrying: the exchange ended because the connection went,
-            // and this IS that connection's socket. The `connectionClosed`
-            // that follows finds it already closed and leaves it alone.
-            if (socket._isConnectionSocket) socket.emit("close", false);
+          // The exchange ended because its connection went: the
+          // connection's sockets close now -- the `connectionClosed` that
+          // follows finds them closed -- and abortIncoming, the first of
+          // their 'close' listeners, aborts it. An exchange still here after
+          // that (on a socket that is no connection's, or whose listeners
+          // were taken off) is aborted directly.
+          releaseConnection(server, exchange.connectionId);
+          if (server._exchanges.get(meta.requestId) === exchange) {
+            const socket = exchange.req.socket;
+            if (socket && socket[kServerSocketClose] !== undefined) {
+              socket[kServerSocketClose]();
+            }
+            abortExchange(server, meta.requestId, exchange);
           }
-          if (!req.destroyed) {
-            const reset = new Error("aborted");
-            reset.code = "ECONNRESET";
-            req.destroy(reset);
-          }
-          exchange.res._connectionLost();
         }
         return;
       }
@@ -20419,7 +20575,7 @@
         if (meta === undefined) break;
         if (meta.event !== undefined) {
           try {
-            onConnectionEvent(server, meta);
+            onConnectionEvent(server, meta, encrypted);
           } catch (e) {
             raiseFromListener(e);
           }
@@ -20561,18 +20717,7 @@
       const held = server._connSockets;
       if (held !== undefined) {
         server._connSockets = undefined;
-        for (const record of held.values()) {
-          for (const socket of [record.secure, record.conn]) {
-            if (socket && !socket.destroyed) {
-              socket._markClosed();
-              try {
-                socket.emit("close", false);
-              } catch (e) {
-                raiseFromListener(e);
-              }
-            }
-          }
-        }
+        for (const record of held.values()) closeRecordSockets(record);
       }
       finishClose(server);
     }
@@ -20968,7 +21113,15 @@
         err && typeof err.code === "string" && err.code.indexOf("HPE_") === 0 &&
         err.reason === undefined && typeof err.message === "string"
       ) {
-        err.reason = err.message.replace(/^Parse Error: /, "");
+        if (err.code === "HPE_INVALID_EOF_STATE") {
+          // node's parser.finish(): the stream ended where the message had
+          // not, a message with no reason in it and no bytes of a read
+          // parsed (v22.22.2).
+          err.reason = "Invalid EOF state";
+          err.bytesParsed = 0;
+        } else {
+          err.reason = err.message.replace(/^Parse Error: /, "");
+        }
       }
       return err;
     }
@@ -22606,6 +22759,10 @@
               : registry._disconnectedBeforeSecure({
                   path: null, host: self.host, port: self._port, localAddress: self._options.localAddress,
                 });
+          } else if (cause && cause.code === "UND_ERR_SOCKET") {
+            // The server closed the connection before the response head was
+            // in: node's socket ended under the request, `socket hang up`.
+            mapped = connResetException("socket hang up");
           } else if (/connection refused|ECONNREFUSED/i.test(detail)) {
             mapped = Object.assign(new Error("connect ECONNREFUSED"), {
               code: "ECONNREFUSED",
@@ -22638,11 +22795,15 @@
         }
         socket.connecting = false;
         // The connection the response came on, which destroy() and
-        // resetAndDestroy() close as node's close the socket's handle. A
-        // TLSSocket's (no reset there: ERR_INVALID_HANDLE_TYPE) is not
-        // tracked, nor is an h2 one, which the transport does not name.
-        if (facts.connection !== undefined && !socket.encrypted) {
+        // resetAndDestroy() close as node's close the socket's handle -- a
+        // TLSSocket's through destroy() alone (its resetAndDestroy() throws
+        // ERR_INVALID_HANDLE_TYPE, as node's does). An h2 connection, which
+        // the transport does not name, is not tracked.
+        if (facts.connection !== undefined) {
           socket[registry._netNativeConnection] = facts.connection;
+          // Which checkout of it this request had: once the pool hands the
+          // connection to another request, this socket no longer closes it.
+          socket[registry._netNativeLease] = facts.lease;
         }
         if (socket.encrypted && raw.tls) {
           // Only a verified certificate gets this far on the fetch path.
@@ -23563,45 +23724,49 @@
               }
             }, function (err) {
               settled = true;
-              if (agentPath) {
-                // node's parser reports malformed framing on the request
-                // before the response is aborted; a connection that ends
-                // inside a body just aborts it.
-                if (err && typeof err.code === "string" && err.code.indexOf("HPE_") === 0) {
-                  self.errored = withParseReason(err);
-                  self.emit("error", err);
+              // node's request hears what its socket heard first, then the
+              // response is aborted ('aborted', then ECONNRESET `aborted`).
+              // An uncaught 'error' when nothing listens is thrown on its own
+              // tick, as in node, so the response is still aborted.
+              var raise = function (heard) {
+                if (self._errorEmitted || self._aborted) return;
+                self._errorEmitted = true;
+                self.errored = heard;
+                try {
+                  self.emit("error", heard);
+                } catch (thrown) {
+                  process.nextTick(function () { throw thrown; });
                 }
-                err = connResetException("aborted");
+              };
+              if (agentPath) {
+                // Over an agent's socket the bridge reports node's parser's
+                // error for malformed framing; a connection that ends inside
+                // a body just aborts it.
+                if (err && typeof err.code === "string" && err.code.indexOf("HPE_") === 0) {
+                  raise(withParseReason(err));
+                }
               } else if (err && (err.code === "UND_ERR_SOCKET" || err.syscall === "read" ||
                   err.code === "UND_ERR_RES_CONTENT_LENGTH_MISMATCH" ||
                   err.code === "OAM_BODY_ENDED_AT_CLOSE" ||
                   (typeof err.code === "string" && err.code.indexOf("HPE_") === 0))) {
                 // The shared transport reports a body's wire failure in the
-                // words of undici, which http.request is not. node's request
-                // hears what its socket heard first -- its parser's error
-                // for malformed framing (in node's own words, as on the
-                // agent path), the socket's `read ECONNRESET` for a reset --
-                // and the response is then aborted. A connection that just
-                // ends inside a body only aborts it, whatever undici would
-                // make of it.
-                var heard = null;
+                // words of undici, which http.request is not: node's parser's
+                // error for malformed framing (in node's own words, as on the
+                // agent path), the socket's `read ECONNRESET` for a reset. A
+                // connection that just ends inside a body only aborts it,
+                // whatever undici would make of it.
                 if (typeof err.code === "string" && err.code.indexOf("HPE_") === 0) {
                   // undici's sentence carries llhttp's reason in brackets.
                   var why = /\(([^()]*)\)$/.exec(err.message || "");
-                  heard = new Error("Parse Error: " + (why ? why[1] : err.message));
-                  heard.code = err.code;
-                  heard = withParseReason(heard);
+                  var parse = new Error("Parse Error: " + (why ? why[1] : err.message));
+                  parse.code = err.code;
+                  raise(withParseReason(parse));
                 } else if (err.syscall === "read") {
-                  heard = err;
+                  raise(err);
                 }
-                if (heard !== null && !self._errorEmitted && !self._aborted) {
-                  self._errorEmitted = true;
-                  self.errored = heard;
-                  self.emit("error", heard);
-                }
-                err = connResetException("aborted");
               }
-              res.destroy(err);
+              if (!agentPath) self._wireGone = true;
+              res.destroy(connResetException("aborted"));
             });
           },
           // node's IncomingMessage._destroy: an unfinished response is
@@ -23760,10 +23925,15 @@
         if (socket && isSocketLike(socket) && !socket.destroyed) socket.destroy();
         this.destroyed = true;
         // node: the response closes first (its own destroy), the request
-        // when the socket that destroy took down has closed.
+        // when the socket that destroy took down has closed. When the wire
+        // failed under the body (a close or reset mid-body), the socket has
+        // closed already: the request closes now, before the response's
+        // 'error' and 'close' (socketCloseListener, measured on v22.22.2;
+        // case 273).
         var res = this.res;
         var self = this;
-        if (res && !res.closed) res.once("close", function () { self._emitClose(); });
+        if (this._wireGone) this._emitClose();
+        else if (res && !res.closed) res.once("close", function () { self._emitClose(); });
         else this._emitClose();
       }
 
@@ -25957,7 +26127,7 @@
           this[kNativeConnection] = undefined;
           const reset = this.resetAndClosing === true;
           if (reset) this.resetAndClosing = false;
-          globalThis.__oam.fetchConnClose(connection, reset);
+          globalThis.__oam.fetchConnClose(connection, reset, this[kNativeLease]);
         }
         rs.closed = ws.closed = true;
         if (resetRefused !== undefined) {
@@ -26397,6 +26567,9 @@
     // and `__oam.fetchConnClose`; the server's through its own destroy()).
     const kNativeConnection = Symbol("oam.nativeConnection");
     registry._netNativeConnection = kNativeConnection;
+    // The checkout of that connection the stand-in's request had.
+    const kNativeLease = Symbol("oam.nativeLease");
+    registry._netNativeLease = kNativeLease;
 
     // node's resetAndDestroy() (lib/net.js, v22.22.2), assigned the way node
     // assigns it: an enumerable prototype property, a function with no name,
@@ -33765,6 +33938,14 @@
           var id = tlsIdOf(this);
           if (id !== null) natives.tlsClose(id);
           this._handle = null;
+        }
+        // The fetch path's stand-in (an https request's req.socket): its
+        // connection is the transport's, and closes there, as net.Socket's
+        // stand-in does -- mid-response or idle in the pool alike.
+        var connection = this[registry._netNativeConnection];
+        if (connection !== undefined) {
+          this[registry._netNativeConnection] = undefined;
+          globalThis.__oam.fetchConnClose(connection, false, this[registry._netNativeLease]);
         }
         var wrapped = this._releaseWrap();
         callback(err);

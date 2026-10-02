@@ -164,6 +164,7 @@ impl Pool {
                 )),
                 reused: false,
                 response_started: false,
+                conn: None,
             });
         };
         let is_connect = req.method() == Method::CONNECT;
@@ -181,6 +182,7 @@ impl Pool {
                         error: PoolError::connect(error),
                         reused: false,
                         response_started: false,
+                        conn: None,
                     });
                 }
             };
@@ -189,7 +191,7 @@ impl Pool {
             let Conn {
                 proto,
                 stats: attempt_stats,
-                info,
+                mut info,
                 proxied,
                 is_h2,
                 key: conn_key,
@@ -200,6 +202,7 @@ impl Pool {
             if let Some(dispatched) = req.extensions().get::<Dispatched>() {
                 dispatched.fire_on(info.connection);
             }
+            info.take_lease();
             *req.uri_mut() = original_uri.clone();
             set_host_header(&mut req, is_h2);
             rewrite_request_uri(req.uri_mut(), is_h2, proxied, is_connect);
@@ -233,6 +236,7 @@ impl Pool {
                         error: PoolError::send(error),
                         reused,
                         response_started,
+                        conn: Some(info),
                     });
                 }
                 SendResult::Sent(error, proto) => {
@@ -243,6 +247,7 @@ impl Pool {
                         error: PoolError::send(error),
                         reused,
                         response_started,
+                        conn: Some(info),
                     });
                 }
             }
@@ -256,6 +261,7 @@ impl Pool {
             )),
             reused: false,
             response_started: false,
+            conn: None,
         })
     }
 
@@ -572,6 +578,8 @@ pub(crate) struct PoolFail {
     pub(crate) error: PoolError,
     pub(crate) reused: bool,
     pub(crate) response_started: bool,
+    /// The connection the request went out on; `None` when none was had.
+    pub(crate) conn: Option<ConnInfo>,
 }
 
 /// The transport's send error, in place of `hyper_util::client::legacy::Error`.

@@ -1095,7 +1095,7 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   true.
 - **Node members absent from both classes**, which the mechanical walk cannot see by
   construction: `destroySoon`. (`resetAndDestroy` is on both now, the same function as in
-  Node -- entry 46.) `net.Socket` has had `read()`,
+  Node -- entry 47.) `net.Socket` has had `read()`,
   `'readable'` and `push()` since 0.16.3 (below); a `TLSSocket`, being a Duplex, always had
   `read`.
 - **A bare `connect()` handshakes.** `new tls.TLSSocket(null, opts).connect(port, host)` runs
@@ -1455,18 +1455,59 @@ What still differs:
   (`conformance/cases/254-http-reset-and-destroy.mjs`). Up to 0.17.1 neither reached the
   connection: `resetAndDestroy()` failed the socket and the response with
   `ERR_SOCKET_CLOSED`, sent a FIN and left an idle pooled connection open, as `destroy()` did.
-  What differs: the https stand-in is a `tls.TLSSocket`, whose `resetAndDestroy()` throws
-  `ERR_INVALID_HANDLE_TYPE` as Node's does, but whose `destroy()` after the response leaves
-  the kept-alive TLS connection in the pool, where Node closes it; an h2 connection, which
-  carries other requests at once, is never closed through one request's socket. _(source)_
+  The https stand-in is a `tls.TLSSocket`: its `resetAndDestroy()` throws
+  `ERR_INVALID_HANDLE_TYPE` as Node's does, and its `destroy()` closes the TLS connection
+  the same way, kept-alive in the pool included -- the server sees the end and the close,
+  and the next request dials anew (e2e
+  `https_get_socket_destroy_closes_the_pooled_tls_connection`; up to 0.17.1 that
+  connection stayed in the pool and the next request went out on it). Either stand-in
+  closes the connection only while its own request is the last to have taken it: once the
+  pool has handed the connection to another request -- the next `http.get` or a `fetch()`,
+  which share oam's pool -- a `destroy()` on the kept socket leaves it alone (e2e
+  `a_kept_req_socket_leaves_a_connection_another_request_took`; before 0.17.2 it closed the
+  connection under that request, which failed with `fetch failed`). In Node the next
+  `http.get` on the agent gets the same socket object, so destroying it ends that request
+  too, and a `fetch()` never shares the agent's connection at all. What differs: an h2
+  connection, which carries other requests at once, is never closed through one request's
+  socket; and `end()` on either stand-in does nothing, where Node's sends a FIN, so a
+  server that answers it by closing closes Node's socket (`'close'` with `false`) and oam's
+  connection stays pooled. _(probed: Node v22.22.2 and oam, Windows)_
 - **A server's reset before the response head is Node's socket error** (case 254): the
   request's `'error'` and `fetch`'s cause are `read ECONNRESET` with `errno`, `code` and
   `syscall: 'read'`, as Node's socket reports it. Up to 0.17.1 it was `ECONNRESET` `socket
   hang up` with no `errno` / `syscall`, and `fetch`'s cause the uncoded `error sending
-  request for url (...)`. A close without a reset is still that uncoded cause where undici
-  says `UND_ERR_SOCKET` `other side closed`, and a reset in the middle of a `fetch` body
-  rejects with oam's own `fetch: body read failed` where undici's `terminated` carries the
-  same `read ECONNRESET` cause.
+  request for url (...)`.
+- **A server's close (no reset) is undici's `SocketError`; a failure mid-body is
+  `terminated`** (`conformance/cases/273-fetch-server-close-and-reset.mjs`). A connection
+  the server closes before the response head is in, or halfway through it, fails `fetch`
+  with `fetch failed`, cause undici's `SocketError` -- `other side closed`, code
+  `UND_ERR_SOCKET`, its class chain `SocketError < UndiciError < Error` with undici's
+  `instanceof` brands -- `err.cause instanceof errors.SocketError` (and `UndiciError`)
+  holds against `import('undici')`'s classes, whose `instanceof` reads the same brands
+  (e2e `undici_errors_are_undicis_classes_with_its_brands`; before 0.17.2 the shim's
+  classes had none, and both checks were false) -- and the `socket` it was on:
+  `localAddress`, `localPort`, `remoteAddress`, `remotePort`, `remoteFamily`, `timeout`
+  (unset), `bytesWritten`, `bytesRead`; `http.request` fails with `socket hang up`, as
+  before. A body the server closes or resets before its end fails the read with
+  `TypeError: terminated`, the cause that `SocketError` or the socket's `read ECONNRESET`;
+  `http.request` aborts the response (`'aborted'`, then ECONNRESET `aborted`), after a
+  reset first emitting `read ECONNRESET`
+  on the request, as Node's socket error does. A body whose chunked framing goes bad (a
+  malformed chunk-size line) fails the read with `TypeError: terminated` too, the cause
+  undici's `HTTPParserError` -- `Response does not match the HTTP/1.1 protocol (Invalid
+  character in chunk size)`, code `HPE_INVALID_CHUNK_SIZE`, undici's brand -- and
+  `http.request` emits `Parse Error: Invalid character in chunk size` on the request
+  before aborting the response. Up to 0.17.1 a close was the uncoded `error sending request
+  for url (...)` cause, and a failure mid-body -- a bad chunk included -- was oam's own
+  `fetch: body read failed: error decoding response body` (on `http.request`, the
+  response's error, with no request error). What differs: the `HTTPParserError`'s `data`
+  (the bytes the parser refused, as text) is `undefined`; `bytesWritten` counts oam's own
+  request head, whose `user-agent` is oam's (6 bytes longer than Node's `node`) and whose
+  header order is its own; on an `https`
+  connection both counts are of the HTTP bytes inside TLS (Node's are not measured there);
+  a connection a fetch dispatcher's `connect` supplied reports no socket facts; and the
+  `read ECONNRESET` cause is a plain `Error`, where Node's errno errors have a prototype of
+  their own whose `constructor` getter answers `Error`.
 - **The WebSocket client dials on this connector too** (since 0.17.2; up to 0.17.1 it dialled
   on its own, so on Windows a refused loopback connect took about 2 s per resolved address,
   and the `'error'` event was a plain `Event`). A connect that fails dispatches Node's
@@ -1545,7 +1586,16 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
 **A `connect` function, `buildConnector`, and dispatchers oam refuses**
 
 `import 'undici'` is oam's shim, also when the package is installed (the real one does not
-run on oam). A dispatcher's `connect` FUNCTION -- `new Agent|Pool|Client({ connect(opts,
+run on oam). Its `errors` are undici's classes -- the names, codes, default messages and
+own keys of undici 6's, `HTTPParserError` and `ResponseError` among them -- and the ones
+fetch's causes are made from; each `instanceof` reads undici's `Symbol.for` brand, as
+undici's does, so it agrees with any other copy of undici. Up to 0.17.1 they were
+unbranded classes of the shim's own, `AbortError`'s code was `UND_ERR_ABORTED` (undici:
+`UND_ERR_ABORT`; `RequestAbortedError`, an `AbortError`, has `UND_ERR_ABORTED`), and
+`HTTPParserError`, `ResponseError`, `ResponseExceededMaxSizeError` and
+`MessageSizeExceededError` were missing.
+
+A dispatcher's `connect` FUNCTION -- `new Agent|Pool|Client({ connect(opts,
 cb) })`, a custom connector -- is called before every connection a request makes, redirect
 hops included, IP literals too, with undici's parameters (`host`, `hostname`, `protocol`,
 `port`, `servername`, `localAddress`), on all five entry points above plus `Pool` and
@@ -2118,11 +2168,53 @@ behind exactly that test; code that reads the test as a promise of the stream AP
 the method it reaches for missing. An `'upgrade'` listener gets a real `net.Socket` for the
 connection, and the request's `req.socket` is that socket, as in Node; the socket
 `'connection'` handed out for the same connection closes at the handover rather than with
-the upgraded socket. On an exchange the connection was closed under after its response had
-started, the socket's `'close'` comes after the response's, where Node emits it first (they
-are in Node's order when the response had not started). A socket JS destroys mid-exchange
-(`destroy()`, `resetAndDestroy()`) emits its `'close'` on the next tick, before the request's
-`'aborted'` and the response's `'close'`, where Node emits it after them.
+the upgraded socket.
+
+When the connection closes under an exchange, the socket's `'close'` drives the rest, as in
+Node: it comes once the connection has closed (the native side reports it), and its listeners
+run in the order they were added -- the server's own first (the request's `'aborted'`), then
+a `'connection'` listener's, then the response's (its `'close'` without `'finish'`), then the
+handler's; the request's `'error'` and `'close'` follow on the next tick. A `destroy(err)`
+-- on the socket, or through `req.destroy(err)` -- emits `'error'` on the next tick, the
+server's `'clientError'` hearing it first (Node's socketOnError, the socket's first
+`'error'` listener; once per socket), and `'close'` with `true`. Up to 0.17.1
+`'clientError'` never heard it. An `https` connection's plain socket closes before its TLS
+socket, as Node's does. That holds whoever closed it --
+`destroy()`, `destroy(err)` or `resetAndDestroy()` on the socket, `req.destroy()` (which
+closes the connection even once the response is under way, as Node's does), or the client
+going away after the response started
+(`conformance/cases/272-http-server-connection-close-order.mjs`). Up to 0.17.1 a socket JS
+destroyed emitted `'close'` on the next tick, before `'aborted'` and the response's
+`'close'`; a client that went away after the response started closed the response before the
+socket; and a `req.destroy()` once the response was under way left the connection open and
+the response never closed.
+
+A request body the connection fails on while the handler reads it is the connection's
+failure, as in Node: the client went away mid-body (the parser's `HPE_INVALID_EOF_STATE`,
+`Parse Error`), reset the connection (the socket's `read ECONNRESET`, with `errno` and
+`syscall`), or sent a malformed chunk-size line (`HPE_INVALID_CHUNK_SIZE`, `Parse Error:
+Invalid character in chunk size`). Node's socketOnError gets it: the server's
+`'clientError'` with the error and the connection's socket, or, with no listener, the socket
+destroyed with it -- its `'error'`, then its `'close'` with `true` aborting the request as
+above (case 272). Up to 0.17.1 the request was destroyed directly: `'aborted'`, its
+`'error'` and `'close'`, then the response's `'close'` and the socket's with `false`, and
+no `'clientError'`. What differs: a malformed chunk's parser error has no `bytesParsed` or
+`rawPacket` (Node's count the bytes of the failing read and carry them), and a malformed
+body is answered `400` by the native server even when a `'clientError'` listener is there
+to answer it (Node leaves the answer to the listener).
+
+What still differs around a close: the socket never emits `'end'`, and a client that goes
+away or resets once the request body is all in closes it with `false`, where Node's says
+`true` after a reset (`ECONNRESET`). A client that goes away mid-body after the response has
+finished closes the connection with `false` and aborts the request (`'aborted'`, ECONNRESET
+`aborted`), where Node's socket reports `HPE_INVALID_EOF_STATE` and closes with `true` and
+the request emits nothing. A server request emits `'close'` only when it is destroyed or
+aborted -- Node's destroys itself once read to the end, so its `'close'` follows `'end'` on
+every exchange; a request read to the end whose connection then closes gets its `'close'` there, without an
+error, where Node's came earlier. A client that half-closes or goes away while the handler
+has not read the request body is not noticed until the server's timeouts end the connection;
+Node notices at once (`'aborted'`, the socket's `'close'`). Of two pipelined requests Node
+dispatches both before a `destroy()` in the first one's handler takes effect; oam the first.
 
 `resetAndDestroy()` is `net.Socket`'s own function (the same object) and does what Node's
 does: the connection closes with a reset -- the client's read fails with `read ECONNRESET`,
@@ -2221,7 +2313,7 @@ target). The parser underneath is hyper's, so some heads still get a different a
 _(probed)_ Node v22.22.2 (default and `--insecure-http-parser`) and oam, the same 90 raw
 request heads over TCP, 16 chunked bodies, 40 chunk extensions and 15 trailer sections.
 
-### 47. The HTTP server's response head: what still differs
+### 46. The HTTP server's response head: what still differs
 
 An `http` or `https` server response checks its headers as Node's `OutgoingMessage` does,
 with Node's errors and in Node's order: `setHeader`, `appendHeader`, `setHeaders(Headers |
@@ -2402,11 +2494,12 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
   served as an ordinary request (Node: `'upgrade'`, with the connection handed over) and a
   CONNECT is closed, so `wss://` servers -- `ws`, `socket.io` -- do not work on an oam
   `https` server. An `http` server routes both as Node does (entry 39).
-- **An `https` server emits no HTTP-level `'clientError'`.** A request head it refuses is
-  answered `400` natively, where Node hands the error to a `'clientError'` listener with
-  the connection's socket; the only `'clientError'` an `https` server raises is the one it
-  passes on from `'tlsClientError'` when a handshake fails, and that one carries a fresh
-  socket object rather than the connection's.
+- **An `https` server emits no `'clientError'` for a request head.** A request head it
+  refuses is answered `400` natively, where Node hands the error to a `'clientError'`
+  listener with the connection's socket. It raises `'clientError'` for a request body the
+  connection failed on (entry 39), as an `http` server does, and passes one on from
+  `'tlsClientError'` when a handshake fails; that one carries a fresh socket object rather
+  than the connection's.
 - **A connection a `'connection'` listener destroys raises no `'tlsClientError'`.** On a
   `tls`, `https` or `http2` secure server Node reports it as a `'tlsClientError'`
   (`ECONNRESET`, `socket hang up`) and, on `https` and `http2`, a `'clientError'`; oam emits
@@ -2507,7 +2600,11 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   bodies are not decoded, as in Node -- and as on oam's own transport (entry 38, case 192).
 - **Errors.** A response that cannot be parsed fails with a coded `Parse Error: ...`
   (`HPE_*`) whose code is the closest llhttp has for what hyper reports; a malformed chunk
-  size is `HPE_INVALID_CHUNK_SIZE`, as in Node. A response head is held to the request's
+  size is `HPE_INVALID_CHUNK_SIZE`, emitted on the request before the response is aborted,
+  as in Node -- over an agent's socket and, since 0.17.2, over oam's own transport (an
+  option-less `http.get`; up to 0.17.1 that response was aborted with no request error;
+  `conformance/cases/273-fetch-server-close-and-reset.mjs`) -- but without Node's
+  `bytesParsed` / `rawPacket`. A response head is held to the request's
   `maxHeaderSize` (or 16 KiB), counted as Node's parser counts it -- reason phrase, header
   names and values, refused at a count at or over the limit -- and fails with Node's
   `Parse Error: Header overflow` (`HPE_HEADER_OVERFLOW`, `reason` `Header overflow`), but
@@ -2700,7 +2797,7 @@ _(probed)_ Node v22.22.2 vs oam on Windows: lookup and createConnection guards o
 a node-hosted `createSecureServer` for `ca`, `servername`, a refusing lookup, an untrusted
 certificate and `rejectUnauthorized: false`, line for line identical.
 
-### 46. `socket.resetAndDestroy()` while `end()` is shutting the socket down
+### 47. `socket.resetAndDestroy()` while `end()` is shutting the socket down
 
 `resetAndDestroy()` is Node's otherwise: SO_LINGER 0 and a close, so the peer's read fails
 with `read ECONNRESET` and nothing unsent is delivered; the socket returned, destroyed at

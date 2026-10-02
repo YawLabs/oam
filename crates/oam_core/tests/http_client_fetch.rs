@@ -213,6 +213,18 @@ fn failed(outcome: OpOutcome) -> String {
     }
 }
 
+/// The socket of undici's `other side closed`: the peer closed the
+/// connection under the request.
+fn closed_by_peer(outcome: OpOutcome) -> oam_core::SocketFacts {
+    match outcome {
+        OpOutcome::SocketClosed { message, socket } => {
+            assert_eq!(message, "other side closed");
+            socket
+        }
+        other => panic!("expected the peer's close, got {other:?}"),
+    }
+}
+
 fn handle_of(payload: &Value) -> u64 {
     payload["bodyHandle"].as_u64().unwrap()
 }
@@ -542,11 +554,11 @@ async fn a_request_on_a_closed_pooled_connection_is_sent_again() {
         // cannot know the server ignored it (RFC 9110 s9.2.2, idempotent
         // methods only).
         let_the_pool_settle().await;
-        let text = failed(
+        let socket = closed_by_peer(
             reg.fetch(&transport, json!({ "url": &url, "method": "POST" }))
                 .await,
         );
-        assert_eq!(text, format!("error sending request for url ({url})"));
+        assert_eq!(socket.remote_port, Some(server.port));
         assert_eq!(server.accepts(), 2, "no fresh connection for a POST");
     })
     .await;
@@ -605,8 +617,8 @@ async fn a_stale_resend_is_sent_once() {
         fill_the_pool(&reg, &transport, &url, 2).await;
         assert_eq!(server.accepts(), 2);
 
-        let text = failed(reg.fetch(&transport, json!({ "url": &url })).await);
-        assert_eq!(text, format!("error sending request for url ({url})"));
+        let socket = closed_by_peer(reg.fetch(&transport, json!({ "url": &url })).await);
+        assert_eq!(socket.remote_port, Some(server.port));
         assert_eq!(server.accepts(), 2, "no connection was dialled");
         assert_eq!(
             server.seen().len(),
@@ -647,10 +659,141 @@ async fn a_pooled_connection_that_closes_mid_head_is_not_resent() {
         let_the_pool_settle().await;
         assert_eq!(server.accepts(), 1);
 
-        let text = failed(reg.fetch(&transport, json!({ "url": &url })).await);
-        assert_eq!(text, format!("error sending request for url ({url})"));
+        // undici's socket facts: the connection's two ends and every byte it
+        // has carried -- the first response (40 bytes) and the 27 of the
+        // second head that arrived.
+        let socket = closed_by_peer(reg.fetch(&transport, json!({ "url": &url })).await);
+        assert_eq!(socket.remote_address.as_deref(), Some("127.0.0.1"));
+        assert_eq!(socket.remote_port, Some(server.port));
+        assert_eq!(socket.remote_family.as_deref(), Some("IPv4"));
+        assert_eq!(socket.local_address.as_deref(), Some("127.0.0.1"));
+        assert!(socket.local_port.is_some_and(|port| port != 0));
+        assert_eq!(socket.bytes_read, Some(40 + 27));
+        assert!(socket.bytes_written.is_some_and(|written| written > 0));
         assert_eq!(server.accepts(), 1, "no resend dialled afresh");
         assert_eq!(server.seen().len(), 2, "the GET reached the server once");
+    })
+    .await;
+}
+
+/// The body's one byte (`x`) the server of [`ends_mid_body`] sent.
+fn assert_one_byte(outcome: OpOutcome) {
+    match outcome {
+        OpOutcome::Bytes(chunk) => assert_eq!(chunk, b"x"),
+        other => panic!("expected the body's first byte, got {other:?}"),
+    }
+}
+
+/// A server that sends the head of a 100-byte body and one byte of it, then
+/// closes the connection -- with a reset when `reset`.
+async fn ends_mid_body(reset: bool) -> Server {
+    serve(move |mut conn, _, _| async move {
+        if conn.request().await.is_none() {
+            return;
+        }
+        conn.send(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nx")
+            .await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        if reset {
+            socket2::SockRef::from(&conn.io)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+        }
+        drop(conn);
+    })
+    .await
+}
+
+/// A body whose connection the server closes before its end fails the read
+/// the way undici's does: `other side closed`, with the socket it was on --
+/// its two ends and the bytes it carried (the 40-byte head and one byte of
+/// body). Up to 0.17.1 this was `fetch: body read failed: error decoding
+/// response body`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_the_server_closes_under_is_the_peers_close() {
+    within(async {
+        let server = ends_mid_body(false).await;
+        let reg = Reg::new();
+        let url = format!("http://127.0.0.1:{}/", server.port);
+        let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+        let handle = handle_of(&p);
+        assert_one_byte(reg.read(handle).await);
+        let socket = closed_by_peer(reg.read(handle).await);
+        assert_eq!(socket.remote_port, Some(server.port));
+        assert_eq!(socket.bytes_read, Some(40 + 1));
+    })
+    .await;
+}
+
+/// A body whose connection the server resets before its end fails the read
+/// with the socket's own error, node's `read ECONNRESET` (errno, code,
+/// syscall), which fetch makes the cause of its `terminated`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_the_server_resets_under_is_read_econnreset() {
+    within(async {
+        let server = ends_mid_body(true).await;
+        let reg = Reg::new();
+        let url = format!("http://127.0.0.1:{}/", server.port);
+        let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+        let handle = handle_of(&p);
+        assert_one_byte(reg.read(handle).await);
+        match reg.read(handle).await {
+            OpOutcome::NodeFailed {
+                code,
+                message,
+                syscall,
+                errno,
+                ..
+            } => {
+                assert_eq!(code, "ECONNRESET");
+                assert_eq!(message, "read ECONNRESET");
+                assert_eq!(syscall.as_deref(), Some("read"));
+                assert!(errno.is_some());
+            }
+            other => panic!("expected read ECONNRESET, got {other:?}"),
+        }
+    })
+    .await;
+}
+
+/// A chunked body whose next chunk-size line is malformed fails the read
+/// with node's parser error on the shared transport too (fetch and an
+/// option-less http.get read their bodies here): `HPE_INVALID_CHUNK_SIZE`,
+/// which http.request emits on the request and fetch wraps as undici's
+/// HTTPParserError. Up to 0.17.1 only an agent's body said so; this one
+/// was `fetch: body read failed: error decoding response body`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_chunk_on_the_shared_transport_is_the_parsers_error() {
+    within(async {
+        let server = serve(move |mut conn, _, _| async move {
+            if conn.request().await.is_none() {
+                return;
+            }
+            conn.send(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n1\r\nx\r\n")
+                .await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            conn.send(b"zz\r\n").await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        })
+        .await;
+        let reg = Reg::new();
+        let url = format!("http://127.0.0.1:{}/", server.port);
+        let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+        let handle = handle_of(&p);
+        assert_one_byte(reg.read(handle).await);
+        match reg.read(handle).await {
+            OpOutcome::NodeFailed { code, message, .. } => {
+                // undici's sentence (fetch-errors' body.rs): fetch makes it the
+                // HTTPParserError cause, and http.request turns it into
+                // node's `Parse Error: Invalid character in chunk size`.
+                assert_eq!(code, "HPE_INVALID_CHUNK_SIZE");
+                assert_eq!(
+                    message,
+                    "Response does not match the HTTP/1.1 protocol (Invalid character in chunk size)"
+                );
+            }
+            other => panic!("expected HPE_INVALID_CHUNK_SIZE, got {other:?}"),
+        }
     })
     .await;
 }
@@ -1862,19 +2005,10 @@ async fn a_failed_body_read_says_what_failed() {
         }
         for path in ["short", "chunked-short"] {
             match read_to_failure(path).await {
-                OpOutcome::NodeFailed {
-                    code,
-                    message,
-                    errno,
-                    syscall,
-                    ..
-                } => {
-                    assert_eq!(
-                        (code.as_str(), message.as_str()),
-                        (body::SOCKET_CODE, body::OTHER_SIDE_CLOSED),
-                        "{path}"
-                    );
-                    assert_eq!((errno, syscall), (None, None), "{path}");
+                // fetch's close mid-body: undici's SocketError, with the
+                // connection's facts (fu2/http-conn-close).
+                OpOutcome::SocketClosed { message, .. } => {
+                    assert_eq!(message, body::OTHER_SIDE_CLOSED, "{path}");
                 }
                 other => panic!("{path}: {other:?}"),
             }
@@ -1956,6 +2090,7 @@ async fn a_body_cut_short_on_a_closing_connection_is_undicis_verdict() {
         };
         let code_of = |outcome: &OpOutcome| match outcome {
             OpOutcome::NodeFailed { code, message, .. } => (code.clone(), message.clone()),
+            OpOutcome::SocketClosed { message, .. } => (body::SOCKET_CODE.to_string(), message.clone()),
             OpOutcome::Done => ("done".to_string(), String::new()),
             other => panic!("{other:?}"),
         };
@@ -2049,6 +2184,9 @@ async fn a_tls_failure_inside_a_body_is_the_connection_ending() {
             match outcome {
                 OpOutcome::NodeFailed { code, message, .. } => {
                     assert_eq!((code.as_str(), message.as_str()), want, "{path}");
+                }
+                OpOutcome::SocketClosed { message, .. } => {
+                    assert_eq!((body::SOCKET_CODE, message.as_str()), want, "{path}");
                 }
                 other => panic!("{path}: {other:?}"),
             }

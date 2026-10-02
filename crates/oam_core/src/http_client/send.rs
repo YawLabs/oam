@@ -1037,7 +1037,10 @@ fn respond(
     let framing = super::body::Framing::of(response.version(), response.headers());
     let body = FetchBody::new(response.into_body(), codings.as_deref())
         .with_framing(framing)
-        .timed(state.body_timeout);
+        .timed(state.body_timeout)
+        // A close mid-body carries the connection's facts (undici's
+        // SocketError; http.request makes it node's `aborted`).
+        .on_conn(conn.clone());
     lock(bodies).insert(handle, body);
     let mut payload = serde_json::json!({
         "status": status.as_u16(),
@@ -1047,8 +1050,8 @@ fn respond(
         "headers": headers,
         "bodyHandle": handle,
     });
-    if let Some(conn) = conn {
-        conn_payload(&mut payload, &conn);
+    if let Some(conn) = &conn {
+        conn_payload(&mut payload, conn);
     }
     OpOutcome::Json(payload.to_string())
 }
@@ -1069,6 +1072,11 @@ fn conn_payload(payload: &mut serde_json::Value, conn: &ConnInfo) {
     // (`__oam.fetchConnClose`).
     if let Some(connection) = conn.connection {
         socket.insert("connection".to_string(), connection.into());
+    }
+    // Which checkout of it this response came on: the close is refused once
+    // another request has taken the connection.
+    if let Some(lease) = conn.lease {
+        socket.insert("lease".to_string(), lease.into());
     }
     payload["socket"] = serde_json::Value::Object(socket);
     if let Some(tls) = &conn.tls {

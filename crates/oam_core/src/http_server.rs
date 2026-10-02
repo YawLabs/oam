@@ -306,6 +306,10 @@ impl Drop for BudgetedChunk {
     }
 }
 
+/// One step of a streamed request body: a chunk, or why the body failed --
+/// node's error for it when node has one (see [`request_body_failure`]).
+pub type BodyChunk = Result<BudgetedChunk, crate::OpOutcome>;
+
 pub enum RequestBody {
     /// Collected up front, subject to MAX_REQUEST_BODY + GLOBAL_BODY_BUDGET.
     Full(Vec<u8>),
@@ -316,7 +320,7 @@ pub enum RequestBody {
     /// Taken out for the duration of each read await and reinserted after,
     /// the same remove-await-reinsert the accept queue uses; the JS side is
     /// the single consumer.
-    Stream(mpsc::Receiver<Result<BudgetedChunk, String>>),
+    Stream(mpsc::Receiver<BodyChunk>),
     /// The receiver is checked out by an in-flight read. The entry STAYS in
     /// the registry so a miss can be told apart from "no such body" -- a
     /// bare removal made a checked-out stream look absent, and the buffered
@@ -326,7 +330,7 @@ pub enum RequestBody {
 
 /// Outcome of checking out a streamed body receiver.
 pub enum BodyCheckout {
-    Ready(mpsc::Receiver<Result<BudgetedChunk, String>>),
+    Ready(mpsc::Receiver<BodyChunk>),
     /// Another read holds it; the caller must NOT treat this as EOF.
     InFlight,
     /// No streamed body for this id (buffered, or already finished).
@@ -659,7 +663,7 @@ impl HttpState {
 
     /// Reinsert a receiver taken by `take_body_stream`. Dropped silently if
     /// the request finished while the read was in flight.
-    pub fn put_body_stream(&self, id: u64, rx: mpsc::Receiver<Result<BudgetedChunk, String>>) {
+    pub fn put_body_stream(&self, id: u64, rx: mpsc::Receiver<BodyChunk>) {
         let mut guard = self.bodies.lock().unwrap_or_else(|e| e.into_inner());
         // Reinsert ONLY onto the StreamPending marker left by
         // take_body_stream. A missing entry means the body was cancelled or
@@ -1698,6 +1702,32 @@ fn refuse_unanswered(state: &HttpState, id: u64, status: u16) {
     }
 }
 
+/// What a request body hyper failed on reads as on the connection's socket
+/// in node (measured on v22.22.2): a malformed chunk-size line and a
+/// connection that ended mid-body are its parser's errors
+/// (`HPE_INVALID_CHUNK_SIZE`, `HPE_INVALID_EOF_STATE`), a reset is the
+/// socket's `read ECONNRESET`. node hands each to the server's
+/// socketOnError -- 'clientError', or the socket destroyed with it -- and
+/// the request is aborted when the socket closes; node_compat.js does the
+/// same with these. Anything else keeps the `request body: ` text.
+fn request_body_failure(error: &hyper::Error) -> crate::OpOutcome {
+    use crate::http_client::body::{
+        ServerBodyError, classify_server_body, invalid_chunk_size, invalid_eof_state,
+    };
+    match classify_server_body(error) {
+        ServerBodyError::Framing => invalid_chunk_size(),
+        ServerBodyError::Closed => invalid_eof_state(),
+        ServerBodyError::Reset(os) => {
+            let io = match os {
+                Some(code) => std::io::Error::from_raw_os_error(code),
+                None => std::io::ErrorKind::ConnectionReset.into(),
+            };
+            crate::tcp::errno_failure(&io, "read")
+        }
+        ServerBodyError::Other => crate::OpOutcome::Failed(format!("request body: {error}")),
+    }
+}
+
 /// Feed request chunks to the JS side as they arrive, enforcing
 /// MAX_REQUEST_BODY cumulatively. Exceeding it sends Err (the JS request
 /// stream errors) rather than a 413, because the handler was dispatched on
@@ -1708,7 +1738,7 @@ fn refuse_unanswered(state: &HttpState, id: u64, status: u16) {
 /// handler has not responded yet), then the error reaches the handler.
 async fn pump_request_body(
     mut body: hyper::body::Incoming,
-    chunk_tx: mpsc::Sender<Result<BudgetedChunk, String>>,
+    chunk_tx: mpsc::Sender<BodyChunk>,
     state: std::sync::Arc<HttpState>,
     id: u64,
     // Dropped when the pump ends: the request is all in, as far as node's
@@ -1724,7 +1754,7 @@ async fn pump_request_body(
                 if let Some(status) = refused_body_status(&e) {
                     refuse_unanswered(&state, id, status);
                 }
-                let _ = chunk_tx.send(Err(format!("request body: {e}"))).await;
+                let _ = chunk_tx.send(Err(request_body_failure(&e))).await;
                 return;
             }
         };
@@ -1742,7 +1772,9 @@ async fn pump_request_body(
         total += data.len();
         if total > MAX_REQUEST_BODY {
             let _ = chunk_tx
-                .send(Err("request body too large".to_string()))
+                .send(Err(crate::OpOutcome::Failed(
+                    "request body too large".to_string(),
+                )))
                 .await;
             return;
         }
@@ -1758,7 +1790,9 @@ async fn pump_request_body(
             state.body_bytes.fetch_sub(len, Ordering::AcqRel);
             // The handler was dispatched on headers, so 503 is no longer
             // available; the consumer sees the error instead.
-            let _ = chunk_tx.send(Err("server is busy".to_string())).await;
+            let _ = chunk_tx
+                .send(Err(crate::OpOutcome::Failed("server is busy".to_string())))
+                .await;
             return;
         }
         // send() awaits when the channel is full: that IS the backpressure.
@@ -2099,7 +2133,7 @@ async fn dispatch_request(
         // Bounded: an unconsumed body applies backpressure to hyper rather
         // than growing without limit. This is the memory ceiling that
         // replaces the buffered path's byte reservation.
-        let (chunk_tx, chunk_rx) = mpsc::channel::<Result<BudgetedChunk, String>>(8);
+        let (chunk_tx, chunk_rx) = mpsc::channel::<BodyChunk>(8);
         state
             .bodies
             .lock()
