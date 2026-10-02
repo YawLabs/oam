@@ -2750,7 +2750,7 @@ sg_order scripts/release-upload-local-arm64.sh 'trap cleanup EXIT' 'release_agen
   'upload+=("${tmp}/RELEASE-MANIFEST" "${tmp}/RELEASE-MANIFEST.sig")' 'gh release upload "$TAG"'
 
 it "arm64 upload: the trust root comes from origin/main, before anything decides, signs or verifies"
-sg_order scripts/release-upload-local-arm64.sh 'git rev-parse "${TAG}^{commit}"' \
+sg_order scripts/release-upload-local-arm64.sh 'git rev-parse --verify -q "${TAG}^{commit}"' \
   'git ls-remote origin refs/heads/main' 'release_keys_from_commit "$main_sha" "$trust_dir"' \
   'sign_decision="$(release_signing_decision)"' 'release_agent_start ||' 'release_verify_manifest "$tmp" "$TAG" \'
 
@@ -2884,6 +2884,86 @@ sg_order scripts/release-upload-local-arm64.sh 'release_keys_from_commit "$main_
   ':release-keys/presigning-sums"' 'is a pre-signing release pinned in release-keys/presigning-sums' \
   'cargo build --release -p oam_cli' 'gh release upload'
 
+# Behaviour, not just order. A pinned tag's own tree carries a copy of this
+# script from before the check, so the check only protects anything if
+# main's copy can be run against an old tag WITHOUT checking it out. So: the
+# real script in a fixture repo (with a local bare origin), HEAD on main, two
+# old tags behind it. gh and cargo are stubs that only log, REPO is rewritten
+# to a name that does not exist, and GH_TOKEN is bogus -- three separate
+# things standing between this test and a real release.
+AU="$SUITE_TMP/arm64-upload"
+mkdir -p "$AU/work/scripts/lib" "$AU/work/release-keys" "$AU/bin"
+au_git(){ git -C "$AU/work" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false -c tag.gpgsign=false "$@"; }
+{
+  git init -q --bare "$AU/origin.git"
+  au_git init -q && au_git checkout -q -b main
+  printf 'old\n' >"$AU/work/old.txt"
+  au_git add old.txt && au_git commit -qm old
+  au_git tag v0.16.4   # pinned in release-keys/presigning-sums
+  au_git tag v0.5.0    # before every range and not pinned: patchable unsigned
+  sed 's#^REPO="YawLabs/oam"$#REPO="example-invalid/fixture"#' scripts/release-upload-local-arm64.sh \
+    >"$AU/work/scripts/release-upload-local-arm64.sh"
+  cp scripts/lib/build-locks.sh scripts/lib/signing.sh "$AU/work/scripts/lib/"
+  cp release-keys/allowed_signers release-keys/ranges release-keys/presigning-sums "$AU/work/release-keys/"
+  printf 'target/\n' >"$AU/work/.gitignore"
+  au_git add . && au_git commit -qm main
+  au_git remote add origin "$AU/origin.git"
+  au_git push -q origin main --tags
+} >/dev/null 2>&1
+# gh: view succeeds and lists no manifest; download writes a SHA256SUMS
+# naming another asset; upload just logs. cargo: logs where it ran and on
+# which commit, and writes the binary where --target-dir says.
+cat >"$AU/bin/gh" <<EOF
+#!/bin/sh
+echo "gh \$*" >>"$AU/gh.log"
+case "\$1 \$2" in
+  "release view") case "\$*" in *--json*) echo SHA256SUMS ;; esac; exit 0 ;;
+  "release download")
+    d=""; prev=""; for a in "\$@"; do [ "\$prev" = "--dir" ] && d="\$a"; prev="\$a"; done
+    printf '%s *oam-x86_64-unknown-linux-gnu\n' 0000000000000000000000000000000000000000000000000000000000000000 >"\$d/SHA256SUMS"
+    exit 0 ;;
+  "release upload") exit 0 ;;
+esac
+exit 1
+EOF
+cat >"$AU/bin/cargo" <<EOF
+#!/bin/sh
+t=""; prev=""; for a in "\$@"; do [ "\$prev" = "--target-dir" ] && t="\$a"; prev="\$a"; done
+printf '%s|%s|%s\n' "\$(pwd)" "\$(git rev-parse HEAD)" "\$t" >>"$AU/cargo.log"
+mkdir -p "\$t/release" && printf 'fixture arm64 binary\n' >"\$t/release/oam.exe"
+EOF
+chmod +x "$AU/bin/gh" "$AU/bin/cargo"
+au_run(){ # <tag> -- run main's copy from the fixture's main checkout
+  rm -f "$AU/gh.log" "$AU/cargo.log"
+  AU_RC=0
+  AU_OUT="$(cd "$AU/work" && env -u GITHUB_TOKEN GH_TOKEN=invalid-fixture-token PATH="$AU/bin:$PATH" \
+    bash scripts/release-upload-local-arm64.sh "$1" 2>&1)" || AU_RC=$?
+}
+AU_OLD="$(au_git rev-parse v0.16.4 2>/dev/null)"
+AU_STUBS="$(PATH="$AU/bin:$PATH" command -v gh)|$(PATH="$AU/bin:$PATH" command -v cargo)"
+
+it "arm64 upload fixture: HEAD is main, not the tags; gh and cargo resolve to the stubs; REPO is not the real one"
+if [ -n "$AU_OLD" ] && [ "$(au_git rev-parse HEAD 2>/dev/null)" != "$AU_OLD" ] \
+   && [ "$AU_STUBS" = "$AU/bin/gh|$AU/bin/cargo" ] \
+   && grep -qx 'REPO="example-invalid/fixture"' "$AU/work/scripts/release-upload-local-arm64.sh"; then pass; AU_OK=1
+else fail "fixture not as expected (stubs: $AU_STUBS) -- not running the script"; AU_OK=0; fi
+
+if [ "$AU_OK" = "1" ]; then
+  it "arm64 upload, main's copy: a pinned tag is refused without a checkout of it, before any build or upload"
+  au_run v0.16.4
+  if [ "$AU_RC" != "0" ] && grep -qF 'v0.16.4 is a pre-signing release pinned in release-keys/presigning-sums' <<<"$AU_OUT" \
+     && [ ! -e "$AU/cargo.log" ] && ! grep -q 'release upload' "$AU/gh.log" 2>/dev/null; then pass
+  else fail "rc=$AU_RC cargo=$(cat "$AU/cargo.log" 2>/dev/null) gh=$(tr '\n' ';' <"$AU/gh.log" 2>/dev/null): $AU_OUT"; fi
+
+  it "arm64 upload, main's copy: a patchable tag builds in a worktree of the tag, into this checkout's target/, and cleans it up"
+  au_run v0.5.0
+  IFS='|' read -r AU_CWD AU_HEAD AU_TD <"$AU/cargo.log" 2>/dev/null || true
+  AU_WTS="$(au_git worktree list --porcelain 2>/dev/null | grep -c '^worktree ')"
+  if [ "$AU_RC" = "0" ] && [ "${AU_HEAD:-}" = "$AU_OLD" ] && [ "${AU_CWD:-}" != "$AU/work" ] && [ ! -e "${AU_CWD:-/nonexistent}" ] \
+     && [ "${AU_TD:-}" = "$AU/work/target" ] && [ "$AU_WTS" = "1" ] && grep -q 'release upload v0.5.0' "$AU/gh.log"; then pass
+  else fail "rc=$AU_RC cargo ran in '${AU_CWD:-}' on '${AU_HEAD:-}' (tag $AU_OLD) into '${AU_TD:-}'; worktrees=$AU_WTS: $AU_OUT"; fi
+fi
+
 # =============================================================================
 group "install.sh -- the verify chain, run against a local release fixture"
 # =============================================================================
@@ -2895,12 +2975,14 @@ group "install.sh -- the verify chain, run against a local release fixture"
 IN_SSH=0
 if command -v ssh-keygen >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
   # k1 trusted for v0.18.0..v0.19.5, k2 a staged key with no range, k3 a
-  # stranger to allowed_signers.
-  for k in k1 k2 k3; do
+  # stranger to allowed_signers, k4 trusted from v0.19.6 on (k1's successor:
+  # the lower bound of a range is only exercised by a key that opens ABOVE
+  # the cutoff).
+  for k in k1 k2 k3 k4; do
     ssh-keygen -q -t ed25519 -N '' -C "oam-release-$k" -f "$IN/$k" </dev/null >/dev/null 2>&1 || break
   done
   printf 'probe\n' >"$IN/probe"
-  if [ -f "$IN/k3" ] && ssh-keygen -Y sign -f "$IN/k1" -n oam-release "$IN/probe" </dev/null >/dev/null 2>&1 \
+  if [ -f "$IN/k4" ] && ssh-keygen -Y sign -f "$IN/k1" -n oam-release "$IN/probe" </dev/null >/dev/null 2>&1 \
      && [ -s "$IN/probe.sig" ]; then
     IN_SSH=1
   fi
@@ -2921,8 +3003,9 @@ if [ "$IN_SSH" = "1" ]; then
 
   # The trust root the copies embed.
   { printf 'oam-release-k1 namespaces="oam-release" %s\n' "$(cut -d' ' -f1,2 "$IN/k1.pub")"
-    printf 'oam-release-k2 namespaces="oam-release" %s\n' "$(cut -d' ' -f1,2 "$IN/k2.pub")"; } >"$IN/allowed_signers"
-  printf '# fixture ranges\nk1 v0.18.0 v0.19.5\n' >"$IN/ranges"
+    printf 'oam-release-k2 namespaces="oam-release" %s\n' "$(cut -d' ' -f1,2 "$IN/k2.pub")"
+    printf 'oam-release-k4 namespaces="oam-release" %s\n' "$(cut -d' ' -f1,2 "$IN/k4.pub")"; } >"$IN/allowed_signers"
+  printf '# fixture ranges\nk1 v0.18.0 v0.19.5\nk4 v0.19.6 -\n' >"$IN/ranges"
 
   # in_rel <name> <manifest tag|-> <signing key|-> -- a release directory: the
   # three binaries, license files, SHA256SUMS written the way release-local.sh
@@ -2947,6 +3030,8 @@ if [ "$IN_SSH" = "1" ]; then
   in_rel replay   v0.18.0 k1   # served as v0.18.1: a genuine manifest for another tag
   in_rel retired  v0.20.0 k1   # after k1's range closed
   in_rel staged   v0.18.0 k2   # k2 is in allowed_signers but has no range
+  in_rel early    v0.18.1 k4   # k4 signing a tag before its range opens
+  in_rel succ     v0.20.0 k4   # ...and one inside it
   in_rel unsigned -       -    # a v0.18.0+ release with no manifest at all
   in_rel tampered v0.18.0 k1   # manifest fine, binary swapped after signing
   printf 'evil\n' >>"$IN/rel/tampered/$IN_LINUX"
@@ -3055,6 +3140,14 @@ if [ "$IN_SSH" = "1" ]; then
   it "key out of range: the staged key, which has no range yet"
   in_sh staged v0.18.0 "$IN_PATH_KG"
   in_refused 'oam-release-k2, which has no range'
+  # The rotation property: after "k1 .. v0.19.5 / k4 v0.19.6 -", k4 must not
+  # be able to vouch for a tag from k1's era.
+  it "key out of range: a successor key signing a tag before its range opens"
+  in_sh early v0.18.1 "$IN_PATH_KG"
+  in_refused 'oam-release-k4, which may sign only from v0.19.6 on'
+  it "the successor key installs a tag inside its range"
+  in_sh succ v0.20.0 "$IN_PATH_KG"
+  in_installed succ 'signature ok: v0.20.0, signed by oam-release-k4'
   it "missing manifest on a v0.18.0+ tag is refused"
   in_sh unsigned v0.18.0 "$IN_PATH_KG"
   in_refused 'could not fetch RELEASE-MANIFEST for v0.18.0'
@@ -3095,13 +3188,134 @@ if [ "$IN_SSH" = "1" ]; then
   it "OAM_INSTALL_BASE without OAM_VERSION is refused"
   in_sh good "" "$IN_PATH_KG"
   in_refused 'OAM_INSTALL_BASE needs OAM_VERSION'
-  it "a re-install replaces the binary by rename and leaves no temp file"
+  it "a tag with a trailing newline is not a tag"
+  in_sh pre $'v0.17.1\n' "$IN_PATH_KG"
+  in_refused 'is not a release tag'
+
+  # The rename, not just its end state: a temp file anywhere else (the old
+  # mktemp -d in $TMPDIR) also ends with the right bytes in place, but its mv
+  # is a cross-filesystem copy over a possibly running binary. So a logging mv
+  # goes first on PATH, and the source of the move onto oam must sit in the
+  # install dir itself.
+  IN_MVLOG="$IN/mvlog"; mkdir -p "$IN_MVLOG"
+  printf '#!/bin/sh\nprintf "%%s|" "$@" >>"%s"; echo >>"%s"\nexec "%s" "$@"\n' \
+    "$IN/mv.log" "$IN/mv.log" "$(command -v mv)" >"$IN_MVLOG/mv"
+  chmod +x "$IN_MVLOG/mv"
+  it "a re-install replaces the binary by rename from a temp file in the install dir"
   in_sh good v0.18.0 "$IN_PATH_KG"
   printf 'old\n' >"$IN/dest/oam"
+  rm -f "$IN/mv.log"
   IN_RC=0
-  IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN HOME="$IN" PATH="$IN_PATH_KG" OAM_INSTALL_BASE="$(in_url "$IN/rel/good")" \
+  IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN HOME="$IN" PATH="$IN_MVLOG:$IN_PATH_KG" OAM_INSTALL_BASE="$(in_url "$IN/rel/good")" \
     OAM_VERSION=v0.18.0 OAM_INSTALL_DIR="$IN/dest" "$IN_SH" "$IN/install.sh" 2>&1)" || IN_RC=$?
-  in_installed good 'installed oam v0.18.0'
+  IN_MVSRC="$(D="$IN/dest/oam" awk -F'|' '$(NF-1) == ENVIRON["D"] { print $(NF-2) }' "$IN/mv.log" 2>/dev/null)"
+  case "$IN_MVSRC" in
+    "$IN/dest/.oam."*) in_installed good 'installed oam v0.18.0' ;;
+    *) fail "the move onto $IN/dest/oam came from '${IN_MVSRC:-nowhere}', not a temp file in the install dir (mv log: $(cat "$IN/mv.log" 2>/dev/null))" ;;
+  esac
+
+  # A PATH of exactly the tools install.sh runs, curl among them -- proof the
+  # list is complete for a signed install, so its wget twin below fails only
+  # for wget's sake.
+  in_toolpath(){ # <dir> <tool>...
+    local d="$1" t p; shift; mkdir -p "$d"
+    for t in "$@"; do
+      p="$(command -v "$t" 2>/dev/null)" || continue
+      printf '#!/bin/sh\nexec "%s" "$@"\n' "$p" >"$d/$t"; chmod +x "$d/$t"
+    done
+  }
+  IN_TOOLS="awk sed grep head tail tr cut mktemp chmod mv rm rmdir mkdir cat sha256sum shasum ssh-keygen"
+  # shellcheck disable=SC2086 # IN_TOOLS is a word list
+  in_toolpath "$IN/min-curl" $IN_TOOLS curl
+  it "a minimal PATH (the tools install.sh needs, with curl) installs a signed release"
+  in_sh good v0.18.0 "$IN_STUB:$IN/min-curl"
+  in_installed good 'signature ok: v0.18.0, signed by oam-release-k1'
+
+  # Over HTTP, with the tag resolved through /releases/latest: a local server
+  # stands in for github.com in a copy whose two github.com URLs point at it.
+  # (file:// covers neither the redirect nor wget, which cannot fetch it.)
+  IN_PY=""
+  for p in python3 python; do
+    if command -v "$p" >/dev/null 2>&1 && "$p" -c 'import http.server' >/dev/null 2>&1; then IN_PY="$p"; break; fi
+  done
+  in_wpath(){ if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s' "$1"; fi; }
+  IN_PORT=""
+  if [ -n "$IN_PY" ]; then
+    cat >"$IN/srv.py" <<'PY'
+import http.server, os, sys, time
+root, portfile = sys.argv[1], sys.argv[2]
+rel = '/YawLabs/oam/releases'
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+    def route(self):
+        p = self.path.split('?')[0]
+        if p == rel + '/latest':
+            # Lower-case, as an HTTP/2 front end sends it.
+            return 302, b'', 'http://127.0.0.1:%d%s/tag/v0.18.0' % (self.server.server_address[1], rel)
+        if p == rel + '/tag/v0.18.0':
+            return 200, b'', None
+        pre = rel + '/download/v0.18.0/'
+        name = p[len(pre):] if p.startswith(pre) else ''
+        f = os.path.join(root, name)
+        if name and '/' not in name and '\\' not in name and os.path.isfile(f):
+            with open(f, 'rb') as fh:
+                return 200, fh.read(), None
+        return 404, b'', None
+    def reply(self, body):
+        code, data, loc = self.route()
+        self.send_response(code)
+        if loc:
+            self.send_header('location', loc)
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        if body:
+            self.wfile.write(data)
+    def do_GET(self):
+        self.reply(True)
+    def do_HEAD(self):
+        self.reply(False)
+s = http.server.HTTPServer(('127.0.0.1', 0), H)
+s.timeout = 1
+with open(portfile + '.tmp', 'w') as fh:
+    fh.write(str(s.server_address[1]))
+os.replace(portfile + '.tmp', portfile)
+# Gone by itself when the suite's temp root is, or after ten minutes.
+deadline = time.time() + 600
+while time.time() < deadline and os.path.isdir(root) and not os.path.exists(portfile + '.stop'):
+    s.handle_request()
+PY
+    "$IN_PY" "$(in_wpath "$IN/srv.py")" "$(in_wpath "$IN/rel/good")" "$(in_wpath "$IN/srv.port")" >/dev/null 2>&1 &
+    IN_SRV_PID=$!
+    for _ in $(seq 1 50); do [ -s "$IN/srv.port" ] && break; sleep 0.2; done
+    IN_PORT="$(cat "$IN/srv.port" 2>/dev/null)"
+  fi
+  it "a local HTTP stand-in for github.com is up"
+  if [ -n "$IN_PORT" ]; then pass
+  else skip "no python with http.server here (or it did not start) -- the /releases/latest and wget cases are skipped"; fi
+
+  if [ -n "$IN_PORT" ]; then
+    sed "s#https://github.com/#http://127.0.0.1:$IN_PORT/#g" "$IN/install.sh" >"$IN/install-http.sh"
+    # in_http <PATH> -- the HTTP copy, with no OAM_VERSION or OAM_INSTALL_BASE.
+    in_http(){
+      rm -rf "$IN/dest"
+      IN_RC=0
+      IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API -u OAM_VERSION -u OAM_INSTALL_BASE \
+        HOME="$IN" PATH="$1" OAM_INSTALL_DIR="$IN/dest" "$IN_SH" "$IN/install-http.sh" 2>&1)" || IN_RC=$?
+    }
+    it "latest, curl: the tag comes from the /releases/latest redirect, the assets from /download/<tag>/"
+    if [ "$(grep -c "http://127.0.0.1:$IN_PORT/" "$IN/install-http.sh")" -ge 2 ]; then
+      in_http "$IN_STUB:$IN/min-curl"
+      in_installed good 'signature ok: v0.18.0, signed by oam-release-k1'
+    else fail "the HTTP copy does not point at the local server"; fi
+    it "latest, wget and no curl: the same install through install.sh's wget branch"
+    if command -v wget >/dev/null 2>&1; then
+      # shellcheck disable=SC2086 # IN_TOOLS is a word list
+      in_toolpath "$IN/min-wget" $IN_TOOLS wget
+      in_http "$IN_STUB:$IN/min-wget"
+      in_installed good 'signature ok: v0.18.0, signed by oam-release-k1'
+    else skip "no wget here -- install.sh's wget branch (dl, final_url) is not exercised on this host"; fi
+  fi
 fi
 
 # =============================================================================
@@ -3182,6 +3396,16 @@ if [ -n "$IN_PS64" ]; then
   it "ps1 key out of range: staged, no range"
   in_ps "$IN_PS64" "$IN/install.ps1" staged v0.18.0
   in_ps_refused 'oam-release-k2, which has no range'
+  it "ps1 key out of range: a successor key signing a tag before its range opens"
+  in_ps "$IN_PS64" "$IN/install.ps1" early v0.18.1
+  in_ps_refused 'oam-release-k4, which may sign only from v0.19.6 on'
+  it "ps1 the successor key installs a tag inside its range"
+  in_ps "$IN_PS64" "$IN/install.ps1" succ v0.20.0
+  in_ps_installed 'signature ok: v0.20.0, signed by oam-release-k4'
+  # .NET's $ matches before a final newline; the tag check must not.
+  it "ps1 a tag with a trailing newline is not a tag"
+  in_ps "$IN_PS64" "$IN/install.ps1" pre $'v0.17.1\n'
+  in_ps_refused 'is not a release tag'
   it "ps1 missing manifest on a v0.18.0+ tag"
   in_ps "$IN_PS64" "$IN/install.ps1" unsigned v0.18.0
   in_ps_refused 'could not fetch RELEASE-MANIFEST for v0.18.0'
@@ -3208,6 +3432,24 @@ if [ -n "$IN_PS64" ]; then
   it "ps1 OAM_INSECURE_SKIP_SIGNATURE=1 installs without ssh-keygen, loudly"
   in_ps "$IN_PS64" "$IN/install-nokg.ps1" good v0.18.0 OAM_INSECURE_SKIP_SIGNATURE=1
   in_ps_installed 'installing WITHOUT signature verification'
+
+  it "ps1 latest: the tag comes from the /releases/latest redirect (the local stand-in above)"
+  if [ -n "${IN_PORT:-}" ]; then
+    sed "s#https://github.com/#http://127.0.0.1:$IN_PORT/#g" "$IN/install.ps1" >"$IN/install-http.ps1"
+    rm -rf "$IN/pdest"
+    IN_RC=0
+    IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API -u OAM_VERSION -u OAM_INSTALL_BASE \
+      PATH="$IN_WINPATH" OAM_INSTALL_DIR="$(cygpath -w "$IN/pdest")" \
+      "$IN_PS64" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$IN/install-http.ps1")" 2>&1 | tr -d '\r\n')" || IN_RC=$?
+    in_ps_installed 'signature ok: v0.18.0, signed by oam-release-k1'
+  else skip "no local HTTP stand-in (see the install.sh group)"; fi
+fi
+# The stand-in exits by itself once the temp root is gone; this just makes it
+# prompt.
+if [ -n "${IN_SRV_PID:-}" ]; then
+  : >"$IN/srv.port.stop"
+  kill "$IN_SRV_PID" 2>/dev/null
+  wait "$IN_SRV_PID" 2>/dev/null
 fi
 
 # =============================================================================

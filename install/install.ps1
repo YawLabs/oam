@@ -172,8 +172,9 @@ function Get-DataLines([string]$text) {
 }
 
 # vMAJOR.MINOR.PATCH and nothing else. [0-9], not \d: \d matches any Unicode
-# digit in .NET. -cmatch: the v is lower-case in every tag.
-function Test-PlainTag([string]$t) { return ($t -cmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') }
+# digit in .NET. -cmatch: the v is lower-case in every tag. \z, not $: .NET's
+# $ also matches before a final newline, so "v0.17.1`n" would pass.
+function Test-PlainTag([string]$t) { return ($t -cmatch '^v[0-9]+\.[0-9]+\.[0-9]+\z') }
 
 # 0 when plain tag a <= b, numerically per field.
 function Test-TagLe([string]$a, [string]$b) {

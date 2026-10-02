@@ -206,9 +206,11 @@ if command -v curl >/dev/null 2>&1; then
 elif command -v wget >/dev/null 2>&1; then
   dl() { wget -qO "$2" "$1"; }
   # wget prints each hop's Location: with -S; the last one is where it ended.
+  # GNU wget also logs "Location: <url> [following]"; $2 is the URL either way.
+  # Header names are case-insensitive, and servers differ in what they send.
   final_url() {
     wget -S --spider "$1" 2>&1 | tr -d '\r' \
-      | awk '$1 == "Location:" || $1 == "location:" { u = $2 } END { if (u == "") exit 1; print u }'
+      | awk 'tolower($1) == "location:" { u = $2 } END { if (u == "") exit 1; print u }'
   }
   _wgetrc() {
     _rc="${tmp:-${TMPDIR:-/tmp}}/oam-wgetrc.$$"

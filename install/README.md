@@ -56,7 +56,8 @@ the embedded `release-keys/presigning-sums` (captured 2026-10-02 from the
 published releases; bounded and immutable). The binary's sha256 comes from that
 file. A pre-`v0.18.0` tag that is not pinned is refused. Because of the pins,
 `scripts/release-upload-local-arm64.sh` refuses to patch a pinned release: a
-changed `SHA256SUMS` would break every install of it.
+changed `SHA256SUMS` would break every install of it. Only main's copy has that
+check: the copy in a pinned tag's own tree predates it, so never run that one.
 
 The embedded copies are byte-identical to `release-keys/*`, and
 `scripts/test-scripts.sh` fails on drift. Change a key file, then paste it into
@@ -95,6 +96,15 @@ Docker daemon, so those results are not recorded here rather than guessed. The
 expectation, unverified: slim and minimal images ship no `openssh-client` at
 all, so a `curl | sh` inside one needs the package (or the skip variable), and
 RHEL 8 UBI's OpenSSH 8.0 has no `-Y`.
+
+Also not measured: `install.sh`'s wget branch (used when there is no curl, as
+on a bare `alpine` with busybox wget). `scripts/test-scripts.sh` runs it
+against a local HTTP stand-in for github.com, `/releases/latest` redirect
+included, but only where wget is installed. The box this change was made on
+has none, so that case was skipped there. Resolving the latest tag relies on
+`wget -S --spider` printing each hop's `Location:` header. That is GNU wget's
+behavior and is expected of busybox's too, but busybox has not been checked.
+`OAM_VERSION=vX.Y.Z` skips that step entirely.
 
 ### Not checked yet
 
