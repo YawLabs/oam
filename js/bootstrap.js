@@ -3563,9 +3563,10 @@
   // between an instance and Base.prototype sits one prototype per code,
   // whose `constructor` answers Base -- err.constructor.name is "Error" /
   // "TypeError" / "RangeError" -- whose toString renders
-  // "Name [CODE]: message" (the stack header too: prepareStackTrace below
-  // renders it through toString on the stack's first read), and which is
-  // [kIsNodeError] (measured on v22.22.2). The one registry for both kinds
+  // "Name [CODE]: message", and which is [kIsNodeError] -- what makes
+  // prepareStackTrace below render the stack header as node's
+  // `${name} [${code}]: ${message}` on the stack's first read (measured on
+  // v22.22.2). The one registry for both kinds
   // of coded error oam raises -- node_compat.js's `codes` and the vendored
   // streams' internal/errors -- so two errors with one code share a
   // prototype whichever raised them. Made on first use of a code.
@@ -3596,6 +3597,14 @@
     }
     return proto;
   }
+  // The brand itself, for Error.prepareStackTrace below: node renders a
+  // kIsNodeError error's stack header from name, code and message.
+  Object.defineProperty(globalThis, "__oamKIsNodeError", {
+    value: kIsNodeError,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
   Object.defineProperty(globalThis, "__oamNodeErrorPrototype", {
     value: nodeErrorPrototype,
     writable: false,
@@ -3655,10 +3664,22 @@
 // Userland assigning its own Error.prepareStackTrace overrides this, same
 // as Node. SNAPSHOT CONSTRAINT: __oam is looked up at CALL time.
 (() => {
+  // node's defaultPrepareStackTrace header (lib/internal/errors.js): for a
+  // kIsNodeError error `${name} [${code}]: ${message}`, read when the stack
+  // is first rendered (so a message or code set before that shows); for any
+  // other the intrinsic Error.prototype.toString, never the error's own
+  // toString -- a class that overrides toString does not change its stack,
+  // and AssertionError, whose name carries the code while its stack is
+  // rendered, does not get the code twice. Captured here, before user code.
+  const kIsNodeError = globalThis.__oamKIsNodeError;
+  const errorToString = Error.prototype.toString;
   Error.prepareStackTrace = function (err, frames) {
     let head;
     try {
-      head = `${err}`;
+      head =
+        err !== null && typeof err === "object" && kIsNodeError in err
+          ? `${err.name} [${err.code}]: ${err.message}`
+          : errorToString.call(err);
     } catch {
       head = "<error>";
     }
