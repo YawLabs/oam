@@ -19,6 +19,8 @@
 #   oam-x86_64-unknown-linux-gnu      GCP Linux VM (direct ssh, IAP
 #                                     tunnel fallback), native
 #   SHA256SUMS
+#   RELEASE-MANIFEST, RELEASE-MANIFEST.sig     (tag-bound signed manifest over
+#                                               SHA256SUMS -- see "Signing")
 #   LICENSE, NOTICE, THIRD_PARTY_LICENSES.md   (attribution travels with the
 #                                               binaries -- see the staging step)
 #
@@ -101,17 +103,42 @@
 #                           (release.yml's workflow_dispatch dry-run). Preflight
 #                           still runs in full -- it bumps, commits and tags, so
 #                           the dry-run builds the binaries the real release
-#                           would; only the upload is skipped.
+#                           would; only the upload is skipped. That includes
+#                           signing: a dry run makes a REAL RELEASE-MANIFEST
+#                           signature, bound to a tag that is already public.
+#   OAM_RELEASE_SIGNING_KEY=<path>
+#                           the release key's PRIVATE half (passphrase-protected
+#                           ed25519, "<path>.pub" beside it). Never committed.
+#                           Required as soon as release-keys/allowed_signers
+#                           holds a key; see release-keys/README.md
+#   OAM_SIGN_REQUIRED=0|1   1 makes missing signing setup fatal. Today that only
+#                           changes the bootstrap case (no key committed yet):
+#                           0 warns and ships no manifest, 1 fails in preflight.
+#                           With a key committed, signing is mandatory either
+#                           way -- there is deliberately no knob that skips it
 #
 # The two remote legs run sequentially (simpler failure attribution). If
 # release wall-time becomes a problem, they are independent and could run as
 # background jobs with per-leg logs -- a future knob, not a v1 need.
 #
-# Signing seam: binaries ship UNSIGNED + checksummed (the @yawlabs
-# distribution model -- scoop/curl/brew fetch bypass Gatekeeper/SmartScreen
-# quarantine). To add Apple notarization / Windows Authenticode later, insert
-# a signing step where each binary lands in $RELEASE_DIR, before the
-# SHA256SUMS step. The rest of the pipeline is unchanged.
+# Signing: the binaries themselves still ship without Apple notarization or
+# Windows Authenticode (the @yawlabs distribution model -- scoop/curl/brew
+# fetch bypass Gatekeeper/SmartScreen quarantine). What IS signed is the
+# release: RELEASE-MANIFEST binds the tag to the SHA256SUMS bytes, and
+# RELEASE-MANIFEST.sig is an ssh ed25519 signature over it (scripts/lib/
+# signing.sh has the why; release-keys/README.md the runbook). Placement:
+#   - preflight, before the dirty-tree check, the bump and the tag: start a
+#     private ssh-agent, add the key (the run's one passphrase prompt), and
+#     prove a throwaway signature verifies against the committed keys and that
+#     the key's range covers $TAG -- never tag what we cannot sign;
+#   - right after `sha256sum oam-* > SHA256SUMS`: write, sign and verify the
+#     manifest from disk, then stop the agent. Nothing may change a byte of
+#     SHA256SUMS after that;
+#   - before the draft goes live: every staged file, the manifest pair
+#     included, must be on the draft at its staged size.
+# Binary signing (Authenticode, Developer ID) slots in where each binary lands
+# in $RELEASE_DIR, before the SHA256SUMS step, so the manifest covers the
+# signed bytes.
 # =============================================================================
 
 set -euo pipefail
@@ -269,6 +296,21 @@ assert_tree_clean() {
 # Attribution inputs / comparison / delta, shared with ci-local.sh step 10.
 # shellcheck source=lib/attribution.sh
 . "$SCRIPT_DIR/lib/attribution.sh"
+# The private ssh-agent and the RELEASE-MANIFEST sign/verify.
+# shellcheck source=lib/signing.sh
+. "$SCRIPT_DIR/lib/signing.sh"
+
+# ONE EXIT trap for the whole script (a second `trap ... EXIT` silently
+# replaces the first). What it owns today is the private signing agent, which
+# must not outlive the run holding the release key -- on success, on fail(),
+# and on Ctrl-C alike. Bash runs the EXIT trap for a fatal signal too, and it
+# has to: an asynchronous job of a non-interactive script ignores SIGINT, so a
+# Ctrl-C reaches this script but not the agent. Anything else that must be
+# undone on every exit goes into this function, not into a second trap.
+release_on_exit() {
+  release_agent_stop
+}
+trap release_on_exit EXIT
 
 # free_locked_binary <path> -- park it, or die with something actionable.
 free_locked_binary() {
@@ -341,6 +383,30 @@ if [ "$SKIP_MAC" != "1" ]; then
     || fail "the mac build host cannot be used -- see above. Fix that, or set OAM_SKIP_MAC=1 to drop the mac assets"
 fi
 [ "$SKIP_LINUX" = "1" ] || command -v gcloud >/dev/null 2>&1 || fail "gcloud CLI not found (or set OAM_SKIP_LINUX=1 to drop the linux asset)"
+
+# Release signing, proven HERE for the same reason as the host checks above:
+# the manifest is signed after every build, so a key that is missing, wrong,
+# out of range or behind a forgotten passphrase would otherwise surface hours
+# in, with the tag already public. A REAL throwaway signature, verified
+# against the committed release-keys/, is the only check that cannot pass for
+# a key that would then fail. It is also the run's one passphrase prompt --
+# asked while the operator is still at the keyboard. The probe lives in a
+# temp dir outside the repo; the dirty-tree check right below proves it.
+#
+# RELEASE_SIGNING is read again at the manifest step, against a fresh
+# decision, rather than trusted from here.
+RELEASE_SIGNING=0
+sign_decision="$(release_signing_decision)"
+case "$sign_decision" in
+  sign)
+    release_agent_start || fail "could not load the release signing key -- see above (OAM_RELEASE_SIGNING_KEY; release-keys/README.md)"
+    release_signing_preflight "$TAG" || fail "release signing preflight failed -- see above; nothing has been bumped or tagged"
+    RELEASE_SIGNING=1
+    ;;
+  skip:*) warn "${sign_decision#skip:}" ;;
+  fail:*) fail "${sign_decision#fail:}" ;;
+  *) fail "release_signing_decision returned '$sign_decision' -- refusing to guess whether to sign" ;;
+esac
 
 # --porcelain, not `git diff --quiet`: untracked files count too -- the
 # remote legs tar the WORKING TREE, so an untracked file ships into builds.
@@ -874,6 +940,34 @@ step "Assemble release assets + SHA256SUMS"
 # so they do not appear in a manifest install.sh verifies per-asset.
 ( cd "$RELEASE_DIR" && ls -lh oam-* >&2 && sha256sum oam-* > SHA256SUMS && cat SHA256SUMS >&2 )
 
+# The signed manifest wraps the SHA256SUMS just written -- from disk, so it is
+# the exact bytes that upload -- and binds it to $TAG. Right here, not later:
+# every byte change to SHA256SUMS after this point breaks the signature, and
+# the steps below (license staging, the matrix, the upload) only ADD files.
+# RELEASE-MANIFEST{,.sig} are not oam-* names, so they are in neither the
+# checksum glob above nor any binary glob downstream (refresh-downloads.sh
+# included); `gh release create "$RELEASE_DIR"/*` uploads them with the rest.
+#
+# The decision is re-read rather than trusted from preflight: if a key had
+# somehow appeared in the tree since, shipping unsigned would break the
+# "a committed key means signing is mandatory" rule.
+sign_decision="$(release_signing_decision)"
+if [ "$RELEASE_SIGNING" = "1" ]; then
+  [ "$sign_decision" = "sign" ] \
+    || fail "release-keys/ changed under the run (preflight decided to sign, now: '$sign_decision') -- nothing has been published"
+  step "Sign RELEASE-MANIFEST ($TAG over SHA256SUMS)"
+  release_write_manifest "$RELEASE_DIR" "$TAG" || fail "could not write RELEASE-MANIFEST -- nothing has been published"
+  release_sign_manifest "$RELEASE_DIR" || fail "could not sign RELEASE-MANIFEST -- nothing has been published"
+  release_verify_manifest "$RELEASE_DIR" "$TAG" || fail "RELEASE-MANIFEST does not verify after signing -- nothing has been published"
+  # The key's work is done; it should not sit in memory through the upload.
+  release_agent_stop
+  ok "RELEASE-MANIFEST signed and verified; signing agent stopped"
+else
+  [ "$sign_decision" != "sign" ] \
+    || fail "release-keys/ now holds a key but preflight found none -- signing is mandatory once a key is committed; re-run so preflight loads it. Nothing has been published"
+  warn "no RELEASE-MANIFEST for $TAG (bootstrap: no release key committed) -- this release is checksummed but not signed"
+fi
+
 # A released binary is a BINARY REDISTRIBUTION of V8 (BSD-3), ICU (Unicode),
 # the Node streams port (MIT) and ~380 Rust crates -- every one of which
 # requires its notice travel with the distribution. Apache-2.0 section 4(a)
@@ -965,6 +1059,21 @@ gh release create "$TAG" "$RELEASE_DIR"/* \
   --generate-notes \
   --verify-tag \
   --draft
+# Before it goes live: every staged file is on the draft, at its staged size.
+# `gh release create` stops on a failed upload, but it is the one thing between
+# the signed pair and a published release that cannot be re-checked afterwards
+# without a download -- and a release that lost RELEASE-MANIFEST.sig on the way
+# up would look like an unsigned one to every verifier still in warn mode. One
+# API call; the draft stays a draft
+# (delete it and re-run) when anything is off.
+draft_assets="$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[] | "\(.name) \(.size)"')" \
+  || fail "could not list the draft's assets -- the release is still a DRAFT; inspect it (gh release view $TAG --repo $REPO), delete it and re-run"
+for staged in "$RELEASE_DIR"/*; do
+  want="$(basename "$staged") $(wc -c <"$staged" | tr -d ' ')"
+  grep -qxF -- "$want" <<<"$draft_assets" \
+    || fail "the draft lacks '$want' (name and size) -- the release is still a DRAFT; delete it (gh release delete $TAG --repo $REPO) and re-run"
+done
+ok "draft carries every staged asset at its staged size"
 gh release edit "$TAG" --repo "$REPO" --draft=false
 ok "release $TAG published: https://github.com/$REPO/releases/tag/$TAG"
 ok "staged assets kept at $RELEASE_DIR (safe to delete)"
