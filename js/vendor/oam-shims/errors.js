@@ -101,11 +101,28 @@ function invalidArgTypeMessage(name, expected, actual) {
 // and its toString renders "Name [CODE]: message" (the stack header too: V8
 // renders it through toString on first read). `new codes.X(...)` and
 // `instanceof codes.X` work as with a class.
+//
+// Own keys in node's order, from the table node_compat.js's E() reads too
+// (bootstrap.js __oamNodeErrorCodeFirst): stack, code, message for a code
+// whose node message is a function (ERR_INVALID_ARG_TYPE, ...), stack,
+// message, code for one whose message is a string.
 function makeCode(Base, code, formatter) {
+  const codeFirst = globalThis.__oamNodeErrorCodeFirst(code);
   function NodeError(...args) {
     const message = typeof formatter === "function" ? formatter(...args) : formatter;
-    const err = Reflect.construct(Base, [message], NodeError);
+    if (!codeFirst) {
+      const err = Reflect.construct(Base, [message], NodeError);
+      err.code = code;
+      return err;
+    }
+    const err = Reflect.construct(Base, [], NodeError);
     err.code = code;
+    Object.defineProperty(err, "message", {
+      value: message,
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
     return err;
   }
   NodeError.prototype = globalThis.__oamNodeErrorPrototype(Base, code);

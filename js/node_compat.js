@@ -691,34 +691,11 @@
   // Every other code has a string message (fixed, or a `%s` format) and is
   // built with `super(message)`, so there `message` precedes `code`.
   //
-  // Measured on node v22.22.2 with --expose-internals, by constructing every
-  // code oam's JS names and reading its own property order. A code node does
-  // not have takes the string-message order, which is also the order of an
-  // error node builds natively.
-  const NODE_FUNCTION_MESSAGE_CODES = new Set([
-    "ERR_ACCESS_DENIED",
-    "ERR_BUFFER_OUT_OF_BOUNDS",
-    "ERR_FALSY_VALUE_REJECTION",
-    "ERR_HTTP2_STREAM_CANCEL",
-    "ERR_INVALID_ADDRESS_FAMILY",
-    "ERR_INVALID_ARG_TYPE",
-    "ERR_INVALID_ARG_VALUE",
-    "ERR_INVALID_CHAR",
-    "ERR_INVALID_FILE_URL_PATH",
-    "ERR_INVALID_RETURN_VALUE",
-    "ERR_INVALID_URL",
-    "ERR_INVALID_URL_SCHEME",
-    "ERR_MISSING_ARGS",
-    "ERR_MODULE_NOT_FOUND",
-    "ERR_OUT_OF_RANGE",
-    "ERR_PACKAGE_IMPORT_NOT_DEFINED",
-    "ERR_PACKAGE_PATH_NOT_EXPORTED",
-    "ERR_SOCKET_BAD_PORT",
-    "ERR_TLS_CERT_ALTNAME_INVALID",
-    "ERR_UNHANDLED_ERROR",
-    "ERR_UNSUPPORTED_DIR_IMPORT",
-    "ERR_UNSUPPORTED_ESM_URL_SCHEME",
-  ]);
+  // The table is node's, measured, and lives in bootstrap.js
+  // (__oamNodeErrorCodeFirst) so the vendored streams' makeCode reads the
+  // same one. A code node does not have takes the string-message order,
+  // which is also the order of an error node builds natively.
+  const NODE_FUNCTION_MESSAGE_CODES = { has: globalThis.__oamNodeErrorCodeFirst };
 
   // The native error classes whose instances take node's coded-error
   // prototype from the shared registry.

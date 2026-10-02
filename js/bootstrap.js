@@ -3597,6 +3597,48 @@
     }
     return proto;
   }
+  // The codes node declares with a message FUNCTION
+  // (`E('ERR_X', (a, b) => ..., Base)`): node's NodeError sets `code` (a
+  // class field) before the constructor body defines `message`, so their
+  // own keys are stack, code, message -- and whatever the function sets on
+  // `this` sits between the two. Every other code has a string message
+  // (fixed, or a `%s` format), built with `super(message)`: stack, message,
+  // code. Node's table, not something to derive: measured on v22.22.2 with
+  // --expose-internals, by constructing every code oam names and reading its
+  // own keys. Shared by both factories, node_compat.js's E() and the vendored
+  // streams' makeCode, so an error of one code has one shape whichever
+  // raised it.
+  const functionMessageCodes = new Set([
+    "ERR_ACCESS_DENIED",
+    "ERR_BUFFER_OUT_OF_BOUNDS",
+    "ERR_FALSY_VALUE_REJECTION",
+    "ERR_HTTP2_STREAM_CANCEL",
+    "ERR_INVALID_ADDRESS_FAMILY",
+    "ERR_INVALID_ARG_TYPE",
+    "ERR_INVALID_ARG_VALUE",
+    "ERR_INVALID_CHAR",
+    "ERR_INVALID_FILE_URL_PATH",
+    "ERR_INVALID_RETURN_VALUE",
+    "ERR_INVALID_URL",
+    "ERR_INVALID_URL_SCHEME",
+    "ERR_MISSING_ARGS",
+    "ERR_MODULE_NOT_FOUND",
+    "ERR_OUT_OF_RANGE",
+    "ERR_PACKAGE_IMPORT_NOT_DEFINED",
+    "ERR_PACKAGE_PATH_NOT_EXPORTED",
+    "ERR_SOCKET_BAD_PORT",
+    "ERR_TLS_CERT_ALTNAME_INVALID",
+    "ERR_UNHANDLED_ERROR",
+    "ERR_UNSUPPORTED_DIR_IMPORT",
+    "ERR_UNSUPPORTED_ESM_URL_SCHEME",
+  ]);
+  const setHas = Set.prototype.has;
+  Object.defineProperty(globalThis, "__oamNodeErrorCodeFirst", {
+    value: (code) => setHas.call(functionMessageCodes, code),
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
   // The brand itself, for Error.prepareStackTrace below: node renders a
   // kIsNodeError error's stack header from name, code and message.
   Object.defineProperty(globalThis, "__oamKIsNodeError", {

@@ -62,3 +62,23 @@ for (const [label, fn] of [
   e.message = "CHANGED";
   console.log(label, e.code, head(e));
 }
+
+console.log("== own keys: one shape per code, whichever module raised it");
+// The vendored streams' errors put `message` before `code` for the codes
+// whose node message is a function; node_compat's had node's order.
+const stream = await import("node:stream");
+const keys = (e) => (e ? `${e.code} ${Reflect.ownKeys(e).filter((k) => typeof k === "string").join(",")}` : "no error");
+console.log("stream.pipeline()", keys(caught(() => stream.pipeline())));
+console.log("Readable.from(1)", keys(caught(() => stream.Readable.from(1))));
+console.log("highWaterMark -1", keys(caught(() => new stream.Readable({ highWaterMark: -1 }))));
+console.log("readable.take(-1)", keys(caught(() => new stream.Readable({ read() {} }).take(-1))));
+console.log("stream.compose()", keys(caught(() => stream.compose())));
+console.log("writable.write(1)", keys(caught(() => new stream.Writable({ write(c, e, cb) { cb(); } }).write(1))));
+// A code with a string message: message before code, in both factories.
+console.log("write after end", keys(await new Promise((resolve) => {
+  const w = new stream.Writable({ write(c, e, cb) { cb(); } });
+  w.on("error", () => {});
+  w.end();
+  w.write("x", resolve);
+})));
+console.log("fs.readFileSync(1.5)", keys(caught(() => fs.readFileSync(1.5))));
