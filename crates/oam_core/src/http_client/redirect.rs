@@ -58,15 +58,25 @@ pub const STREAMED_BODY: &str = "";
 /// A request's body, as a redirect sees it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedirectBody {
-    /// None, or a buffered one: it can be sent again.
+    /// None, or a buffered one, on a `fetch`: it can be sent again.
     Replayable,
-    /// Streamed, on a request that is not a fetch (`undici.request` with
-    /// `maxRedirections`): the 3xx comes back as the response, as undici's
-    /// RedirectHandler hands it back for a body it has already read.
+    /// A Readable, on a request that is not a fetch (`undici.request` with
+    /// `maxRedirections`): every 3xx comes back as the response, as undici's
+    /// RedirectHandler hands it back for a stream it has already read
+    /// (`util.isDisturbed`).
     Streamed,
     /// Streamed, on a `fetch`: a network error, unless the redirect is a 303
     /// (which drops the body).
     StreamedFetch,
+    /// None, or a buffered one, on `undici.request`: undici's
+    /// RedirectHandler rule, where only a 303 turns the request into a
+    /// body-less GET and every other redirect resends method and body.
+    UndiciReplayable,
+    /// An iterable or a web stream, on `undici.request`: undici's rule as for
+    /// [`RedirectBody::UndiciReplayable`], but what it sends again is the
+    /// spent iterable -- no bytes, `content-length: 0` (the caller empties
+    /// the body).
+    UndiciIterable,
 }
 
 impl From<bool> for RedirectBody {
@@ -162,6 +172,10 @@ pub fn next(
     let Some(location) = location else {
         return Next::Done;
     };
+    // undici's RedirectHandler: a body it has read makes no redirect at all.
+    if body == RedirectBody::Streamed {
+        return Next::ReturnResponse;
+    }
     let mut target = match resolve_location(location.as_bytes(), current) {
         Ok(url) => url,
         Err(Some(input)) => return Next::InvalidLocation { input },
@@ -190,9 +204,19 @@ pub fn next(
     // fetch/index.js:1297-1305: only these two cases turn the request into a
     // body-less GET. A 303 answering GET or HEAD keeps its method and
     // headers (content-type included -- reqwest dropped it).
-    let rewrite = (matches!(status, 301 | 302) && *method == http::Method::POST)
-        || (status == 303 && *method != http::Method::GET && *method != http::Method::HEAD);
-    if !rewrite && body != RedirectBody::Replayable {
+    // undici's RedirectHandler (`undici.request`): only a 303 does, and for
+    // any method but HEAD (a GET stays a GET).
+    let undici = matches!(
+        body,
+        RedirectBody::UndiciReplayable | RedirectBody::UndiciIterable
+    );
+    let rewrite = if undici {
+        status == 303 && *method != http::Method::HEAD
+    } else {
+        (matches!(status, 301 | 302) && *method == http::Method::POST)
+            || (status == 303 && *method != http::Method::GET && *method != http::Method::HEAD)
+    };
+    if !rewrite && body == RedirectBody::StreamedFetch {
         return Next::ReturnResponse;
     }
     // fetch/index.js:1351 hands the hop to `mainFetch`, whose first network
@@ -225,12 +249,15 @@ pub fn next(
 pub fn apply(headers: &mut HeaderMap, from: &url::Url, to: &url::Url, drop_body: bool) {
     if drop_body {
         // undici constants.js:61-71 `requestBodyHeader`.
+        // `transfer-encoding` too: undici.request's streamed body carries
+        // one oam sets for it, which frames the body that is going.
         for name in [
             CONTENT_ENCODING,
             CONTENT_LANGUAGE,
             CONTENT_LOCATION,
             CONTENT_TYPE,
             CONTENT_LENGTH,
+            http::header::TRANSFER_ENCODING,
         ] {
             headers.remove(name);
         }

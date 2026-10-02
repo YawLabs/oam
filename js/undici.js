@@ -524,6 +524,9 @@
             headers,
             __oamBodyStream: channel,
             __oamChunked: length === null,
+            // undici's RedirectHandler follows a redirect with an iterable
+            // (sending it spent) and never with a Readable it has read.
+            __oamIterableBody: !stream,
             __oamSentSignal: sentSignal,
             // A body that ends with no chunk goes as none: `content-length:
             // 0` where undici expects a payload (a length of its own is

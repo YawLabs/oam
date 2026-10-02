@@ -34,11 +34,13 @@ const ALL_METHODS: &[&str] = &[
     "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "QUERY",
 ];
 
-/// Every redirect status x method x replayability, for a request that is
-/// not a fetch (a fetch's streamed body: `streamed_fetch_*` below): the
-/// rewrite happens only for (301|302 && POST) || (303 && method not
-/// GET/HEAD) (fetch/index.js: 1297-1305); otherwise method and body are
-/// kept, and a kept body that cannot be replayed returns the 3xx.
+/// Every redirect status x method x replayability: with a body that can be
+/// sent again, fetch's rule -- the rewrite happens only for (301|302 &&
+/// POST) || (303 && method not GET/HEAD) (fetch/index.js: 1297-1305),
+/// otherwise method and body are kept; a Readable on undici.request (not a
+/// fetch: a fetch's streamed body is `streamed_fetch_*` below) returns every
+/// 3xx, as undici's RedirectHandler does for a body it has read (node
+/// v22.22.2 + undici 6.29.0).
 #[test]
 fn status_method_body_matrix() {
     for status in [301u16, 302, 303, 307, 308] {
@@ -48,14 +50,14 @@ fn status_method_body_matrix() {
                 let got = follow(status, &method, "http://a.test/x", "/y", replayable);
                 let rewrite = (matches!(status, 301 | 302) && method == Method::POST)
                     || (status == 303 && method != Method::GET && method != Method::HEAD);
-                let want = if rewrite {
+                let want = if !replayable {
+                    Next::ReturnResponse
+                } else if rewrite {
                     Next::Follow {
                         url: url("http://a.test/y"),
                         method: Method::GET,
                         drop_body: true,
                     }
-                } else if !replayable {
-                    Next::ReturnResponse
                 } else {
                     Next::Follow {
                         url: url("http://a.test/y"),
@@ -67,6 +69,43 @@ fn status_method_body_matrix() {
                     got, want,
                     "status {status} method {m} replayable {replayable}"
                 );
+            }
+        }
+    }
+}
+
+/// undici.request's buffered and iterable bodies: undici's RedirectHandler
+/// turns only a 303 (for any method but HEAD) into a body-less GET, and
+/// keeps method and body on every other redirect (node v22.22.2 + undici
+/// 6.29.0; the iterable's body is then empty, which the caller sends).
+#[test]
+fn undici_request_redirect_matrix() {
+    for body in [RedirectBody::UndiciReplayable, RedirectBody::UndiciIterable] {
+        for status in [301u16, 302, 303, 307, 308] {
+            for m in ALL_METHODS {
+                let method = Method::from_bytes(m.as_bytes()).unwrap();
+                let got = redirect::next(
+                    status,
+                    &method,
+                    &url("http://a.test/x"),
+                    Some(&hv("/y")),
+                    0,
+                    body,
+                );
+                let want = if status == 303 && method != Method::HEAD {
+                    Next::Follow {
+                        url: url("http://a.test/y"),
+                        method: Method::GET,
+                        drop_body: true,
+                    }
+                } else {
+                    Next::Follow {
+                        url: url("http://a.test/y"),
+                        method: method.clone(),
+                        drop_body: false,
+                    }
+                };
+                assert_eq!(got, want, "{body:?} status {status} method {m}");
             }
         }
     }
@@ -100,15 +139,14 @@ fn spot_checks_of_the_matrix() {
             drop_body: false
         }
     );
-    // A streamed POST on 301 is dropped by the rewrite, so it follows (not
-    // a fetch: undici.request).
-    assert!(matches!(
-        follow(301, &Method::POST, "http://a.test/", "/b", false),
-        Next::Follow {
-            drop_body: true,
-            ..
-        }
-    ));
+    // A Readable POST on undici.request comes back as the 3xx, 303 included
+    // (undici's RedirectHandler: the stream is disturbed).
+    for status in [301, 303] {
+        assert_eq!(
+            follow(status, &Method::POST, "http://a.test/", "/b", false),
+            Next::ReturnResponse
+        );
+    }
     // A fetch's streamed POST on 301 stops there, although the rewrite would
     // drop its body (measured on node v22.22.2: fetch fails, the GET is
     // never sent); on 303 it is dropped and the GET follows; and the stop

@@ -159,6 +159,11 @@ pub struct FetchRequest {
     /// ends with none goes as no body at all ([`super::transport::HeadAwaitsBody`]).
     #[serde(default)]
     pub defer_head: Option<DeferHead>,
+    /// `undici.request`'s streamed body is an iterable or a web stream, not
+    /// a Readable: undici follows a redirect with it, sending the spent
+    /// iterable ([`redirect::RedirectBody::UndiciIterable`]).
+    #[serde(default)]
+    pub iterable_body: bool,
     /// That signal's sending half. Never from JS: the engine's fetch op
     /// takes it from the runtime's registry and puts it here.
     #[serde(skip)]
@@ -367,6 +372,8 @@ struct LoopState {
     body_timeout: Option<Duration>,
     /// [`FetchRequest::defer_head`], for the first send of a streamed body.
     defer_head: Option<DeferHead>,
+    /// [`FetchRequest::iterable_body`].
+    iterable_body: bool,
 }
 
 enum BodySource {
@@ -527,6 +534,7 @@ pub async fn fetch(
         headers_timeout,
         body_timeout: timeout_limit(req.body_timeout_ms),
         defer_head: req.defer_head,
+        iterable_body: req.iterable_body,
     };
     run(state, &bodies, &ids, &continuations).await
 }
@@ -867,17 +875,22 @@ async fn run(
             RedirectMode::Error | RedirectMode::Follow => {}
         }
         let location = redirect::location(response.headers());
+        // undici.request: undici's dispatcher, and not a fetch.
+        let undici_request = state.undici_head && !state.fetch_rules;
+        let redirect_body = match (state.source.replayable(), state.fetch_rules) {
+            (true, false) if undici_request => redirect::RedirectBody::UndiciReplayable,
+            (true, _) => redirect::RedirectBody::Replayable,
+            (false, true) => redirect::RedirectBody::StreamedFetch,
+            (false, false) if state.iterable_body => redirect::RedirectBody::UndiciIterable,
+            (false, false) => redirect::RedirectBody::Streamed,
+        };
         match redirect::next(
             response.status().as_u16(),
             &state.method,
             &state.current,
             location.as_ref(),
             state.hops,
-            match (state.source.replayable(), state.fetch_rules) {
-                (true, _) => redirect::RedirectBody::Replayable,
-                (false, false) => redirect::RedirectBody::Streamed,
-                (false, true) => redirect::RedirectBody::StreamedFetch,
-            },
+            redirect_body,
         ) {
             // ReturnResponse: the hop must resend a streamed body, which
             // cannot be replayed -- the 3xx is the result, as undici's
@@ -909,6 +922,14 @@ async fn run(
                 redirect::apply(&mut state.carried, &state.current, &url, drop_body);
                 if drop_body {
                     state.source = BodySource::Empty;
+                } else if redirect_body == redirect::RedirectBody::UndiciIterable {
+                    // undici sends the spent iterable again: no bytes, with
+                    // the length that says so.
+                    state.source = BodySource::Empty;
+                    state.carried.remove(http::header::TRANSFER_ENCODING);
+                    state
+                        .carried
+                        .insert(CONTENT_LENGTH, http::HeaderValue::from_static("0"));
                 }
                 state.method = method;
                 state.current = url;

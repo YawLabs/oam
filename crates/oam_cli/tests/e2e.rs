@@ -6262,6 +6262,68 @@ string-duplex-bad rejected TypeError "Request constructor: nope is not an accept
     }
 }
 
+/// `undici.request` with `maxRedirections` follows a redirect as undici's
+/// RedirectHandler does (review 3, finding 9): a Readable it has read comes
+/// back as the 3xx, whatever the status; a buffer, a string, a generator or
+/// a web stream follows, and only a 303 turns the request into a body-less
+/// GET -- a 301 or 302 keeps a POST and its body, which for a spent iterable
+/// is empty (`content-length: 0`). The expected output is node v22.22.2 +
+/// undici 6.29.0's, line for line.
+#[test]
+fn undici_request_redirects_as_undicis_redirect_handler() {
+    let script = write_temp(
+        "undici_request_redirect_handler/main.mjs",
+        r##"import http from 'node:http';
+import { Readable } from 'node:stream';
+import { request } from 'undici';
+
+const log = [];
+const server = http.createServer((q, s) => {
+  let n = 0;
+  q.on('data', (c) => { n += c.length; });
+  q.on('end', () => {
+    log.push(`${q.method} ${q.url} ${n} te=${q.headers['transfer-encoding'] ?? '-'} cl=${q.headers['content-length'] ?? '-'}`);
+    const m = q.url.match(/^\/r(\d+)/);
+    if (m) { s.writeHead(+m[1], { location: '/echo' }); s.end(); } else s.end('ok');
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+const bodies = {
+  readable: () => Readable.from([Buffer.from('abc')]),
+  buffer: () => Buffer.from('abc'),
+  generator: () => (async function* () { yield Buffer.from('abc'); })(),
+  webstream: () => new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('abc')); c.close(); } }),
+};
+for (const status of [302, 303, 307]) {
+  for (const [kind, make] of Object.entries(bodies)) {
+    log.length = 0;
+    const r = await request(`${base}/r${status}`, { method: 'POST', body: make(), maxRedirections: 2 });
+    await r.body.text();
+    console.log(status, kind, r.statusCode, '|', log.join('; '));
+  }
+}
+server.close();
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "\
+302 readable 302 | POST /r302 3 te=chunked cl=-
+302 buffer 200 | POST /r302 3 te=- cl=3; POST /echo 3 te=- cl=3
+302 generator 200 | POST /r302 3 te=chunked cl=-; POST /echo 0 te=- cl=0
+302 webstream 200 | POST /r302 3 te=chunked cl=-; POST /echo 0 te=- cl=0
+303 readable 303 | POST /r303 3 te=chunked cl=-
+303 buffer 200 | POST /r303 3 te=- cl=3; GET /echo 0 te=- cl=-
+303 generator 200 | POST /r303 3 te=chunked cl=-; GET /echo 0 te=- cl=-
+303 webstream 200 | POST /r303 3 te=chunked cl=-; GET /echo 0 te=- cl=-
+307 readable 307 | POST /r307 3 te=chunked cl=-
+307 buffer 200 | POST /r307 3 te=- cl=3; POST /echo 3 te=- cl=3
+307 generator 200 | POST /r307 3 te=chunked cl=-; POST /echo 0 te=- cl=0
+307 webstream 200 | POST /r307 3 te=chunked cl=-; POST /echo 0 te=- cl=0";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 /// A Readable `undici.request` body is framed when the request is
 /// dispatched, not when `request()` is called: undici asks
 /// `util.bodyLength` then, so a stream that ends in the same turn of the

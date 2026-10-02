@@ -3131,6 +3131,8 @@
       // whatever the method; the transport, asked nothing, sends a GET, HEAD
       // or CONNECT with no body at all (hyper's rule).
       if (init.__oamChunked === true) headers.push(["transfer-encoding", "chunked"]);
+      // An iterable, not a Readable: undici follows a redirect with it.
+      if (init.__oamIterableBody === true) request.iterable_body = true;
     } else if (init.body != null) {
       let impliedType;
       if (typeof init.body === "string") {

@@ -1311,10 +1311,12 @@ async fn streamed_body_redirects() {
         let t = plain();
         // (status, fetch semantics, the status the caller sees or None for
         // a failure, redirected)
+        // undici.request (not a fetch) hands every 3xx back for a Readable it
+        // has read (node v22.22.2 + undici 6.29.0, review 3 finding 9).
         let cases = [
             ("307", false, Some(307), false),
-            ("302", false, Some(200), true),
-            ("303", false, Some(200), true),
+            ("302", false, Some(302), false),
+            ("303", false, Some(303), false),
             ("307", true, None, false),
             ("302", true, None, false),
             ("303", true, Some(200), true),
@@ -1364,9 +1366,7 @@ async fn streamed_body_redirects() {
             [
                 "POST /307",
                 "POST /302",
-                "GET /after",
                 "POST /303",
-                "GET /after",
                 "POST /307",
                 "POST /302",
                 "POST /303",
@@ -1375,8 +1375,7 @@ async fn streamed_body_redirects() {
         );
         assert_eq!(seen[0].head.get("transfer-encoding"), Some("chunked"));
         assert_eq!(seen[0].body, b"abc");
-        assert!(seen[2].body.is_empty());
-        assert!(seen[4].body.is_empty());
+        assert!(seen[6].body.is_empty());
     })
     .await;
 }
@@ -2629,6 +2628,9 @@ async fn outbound_entry_lifecycle() {
                 "url": format!("http://127.0.0.1:{}/", bad.port),
                 "method": "POST",
                 "body_stream": handle,
+                // A fetch: it reads the Location, which undici.request's
+                // redirect handler never does for a body it has read.
+                "fetch_semantics": true,
             }),
         );
         let ender = async move {
