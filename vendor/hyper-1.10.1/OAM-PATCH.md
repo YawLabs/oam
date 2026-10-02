@@ -455,8 +455,11 @@ trailers, and sends every field for one that does not -- which oam's client
 never yields (node's `ClientRequest#addTrailers` would send them all).
 
 The names go out as hyper writes any header name (lowercase, or title case
-on a connection that asks for it); a trailers frame has no room for the
-case the application wrote them in. node writes them as given.
+on a connection that asks for it). The trailers frame is a `HeaderMap`,
+which keeps no spelling, and the response's `HeaderCaseMap` is read when
+the head goes out, before the trailers are known, so the case the
+application wrote them in would need a path of its own from the body to
+`Encoder::encode_trailers`; there is none yet. node writes them as given.
 
 Tested by conformance case 268 (identical to node v22.22.2; fails on stock
 1.10.1) and the crate's `chunked_with_no_trailer_header`. hyper 1.11.0 keeps

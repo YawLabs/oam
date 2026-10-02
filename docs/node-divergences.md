@@ -1917,9 +1917,13 @@ threw (`vendor/hyper-1.10.1/OAM-PATCH.md` item 15 has the connection header).
   not a `Trailer` header names them and whatever the request's `TE` says, and none on a body
   framed otherwise (case 268; oam sent none up to 0.17.1, as hyper sends only declared
   trailers to a `TE: trailers` request, `vendor/hyper-1.10.1/OAM-PATCH.md` item 12) -- but
-  a trailers frame has no room for the case a name was given in, so hyper writes it in the
-  title case a node:http connection uses for names it has no spelling for (`x-t` goes out
-  as `X-T`), where Node writes it as given.
+  hyper writes each name in the title case a node:http connection uses for names it has no
+  spelling for (`x-t` goes out as `X-T`, `Content-MD5` as `Content-Md5`), where Node writes
+  it as given. The trailers reach hyper's encoder as a body's trailers frame, a `HeaderMap`,
+  which keeps no spelling, and the head's `HeaderCaseMap` goes out before the trailers are
+  known; carrying the spellings needs a path of their own from the body to the encoder,
+  which oam does not have yet. Lowercase would match only the names given in lowercase, as
+  title case matches only those given in title case.
 - **A `content-disposition` value is not re-encoded.** When the response's length is known,
   Node v22.22.2 converts the value with `Buffer.from(value, 'latin1')` and turns it back into
   a string as UTF-8, so a non-ASCII value is corrupted: `café` goes out as `caf` plus the
