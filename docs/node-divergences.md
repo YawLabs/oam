@@ -1870,7 +1870,8 @@ line), and headers handed to `writeHead()` on a response no header method has to
 the head only, so `getHeader()` and the rest never see them. The body is framed by Node's
 rules: by a `content-length` or `transfer-encoding` field when there is one; otherwise not at
 all for a HEAD request or a 204 / 304 (what `end()` was given is dropped, and no
-`content-length` goes out for it), by length when `end()` built the head, and chunked when
+`content-length` goes out for it; one the handler set goes out as set, a 304's included,
+where hyper used to drop a 204's and a 304's, `vendor/hyper-1.10.1/OAM-PATCH.md` item 16), by length when `end()` built the head, and chunked when
 `writeHead()` did -- so `writeHead(200); end('text')` is chunked, and `writeHead(200); end()`
 sends the last chunk alone. Up to 0.17.1 `headersSent` stayed false until the first body
 bytes, `writeHead()`'s headers showed in `getHeader()`, a later `statusCode` was sent, every

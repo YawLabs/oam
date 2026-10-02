@@ -904,7 +904,27 @@ diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
          let mut wrote_date = false;
          let mut cur_name = None;
          let mut is_name_written = false;
-@@ -794,9 +824,11 @@
+@@ -772,8 +802,19 @@
+                             //
+                             // - The header says the length is `0`.
+                             // - This is a response to a `HEAD` request.
++                            //
++                            // oam patch: and a 204 or 304, which has no body
++                            // whatever its headers say: the value the
++                            // application set goes out as set (a 304's is
++                            // the selected representation's length), as
++                            // node's http module writes it.
+                             if msg.req_method == &Some(Method::HEAD) {
+                                 debug_assert_eq!(encoder, Encoder::length(0));
++                            } else if matches!(
++                                msg.head.subject,
++                                StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
++                            ) {
++                                // written below, as any other field
+                             } else {
+                                 if value.as_bytes() != b"0" {
+                                     warn!(
+@@ -794,9 +835,11 @@
                          return Err(crate::Error::new_user_header());
                      }
                      // check that we actually can send a chunked body...
@@ -919,7 +939,7 @@ diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
                          continue;
                      }
                      wrote_len = true;
-@@ -842,9 +874,9 @@
+@@ -842,9 +885,9 @@
                  }
                  header::TRAILER => {
                      // check that we actually can send a chunked body...
@@ -932,7 +952,7 @@ diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
                          continue;
                      }
  
-@@ -861,24 +893,9 @@
+@@ -861,24 +904,9 @@
                          extend(dst, value.as_bytes());
                      }
  
@@ -960,7 +980,7 @@ diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
  
                      continue 'headers;
                  }
-@@ -967,12 +984,6 @@
+@@ -967,12 +995,6 @@
              extend(dst, b"\r\n");
          }
  
@@ -973,7 +993,7 @@ diff -ruN a/src/proto/h1/role.rs b/src/proto/h1/role.rs
          Ok(encoder.set_last(is_last))
      }
  
-@@ -2172,6 +2183,17 @@
+@@ -2172,6 +2194,17 @@
               ",
              "1.0 chunked",
          );

@@ -802,8 +802,19 @@ impl Server {
                             //
                             // - The header says the length is `0`.
                             // - This is a response to a `HEAD` request.
+                            //
+                            // oam patch: and a 204 or 304, which has no body
+                            // whatever its headers say: the value the
+                            // application set goes out as set (a 304's is
+                            // the selected representation's length), as
+                            // node's http module writes it.
                             if msg.req_method == &Some(Method::HEAD) {
                                 debug_assert_eq!(encoder, Encoder::length(0));
+                            } else if matches!(
+                                msg.head.subject,
+                                StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+                            ) {
+                                // written below, as any other field
                             } else {
                                 if value.as_bytes() != b"0" {
                                     warn!(

@@ -14,7 +14,9 @@
 // - A statusCode or statusMessage set after writeHead() does not change
 //   the status line. oam sent the later one.
 // - A HEAD request's, a 204's and a 304's response carries no body and no
-//   content-length for what end() was given.
+//   content-length for what end() was given. A content-length the handler
+//   set goes out as set on each of them (a 304's is the selected
+//   representation's); oam's hyper dropped a 204's and a 304's.
 //
 // Each response is shown as its status line, its header lines other than
 // date and connection (names lowercased and sorted: the order and the case
@@ -53,6 +55,13 @@ const routes = [
   ["writeHead(204), end()", (res) => { res.writeHead(204); res.end(); }],
   ["writeHead(304), end('x')", (res) => { res.writeHead(304); res.end("x"); }],
   ["statusCode 204, end('x')", (res) => { res.statusCode = 204; res.end("x"); }],
+  ["writeHead(304, content-length), end()", (res) => { res.writeHead(304, { "Content-Length": "5", ETag: "x" }); res.end(); }],
+  ["statusCode 304, setHeader(content-length), end('hello')", (res) => {
+    res.statusCode = 304;
+    res.setHeader("content-length", "5");
+    res.end("hello");
+  }],
+  ["writeHead(204, content-length), end()", (res) => { res.writeHead(204, { "content-length": "5" }); res.end(); }],
   ["end('text')", (res) => res.end("text")],
   ["end()", (res) => res.end()],
   ["write('a'), end('b')", (res) => { res.write("a"); res.end("b"); }],
@@ -60,6 +69,7 @@ const routes = [
 const head = [
   ["HEAD: writeHead(200), end('x')", (res) => { res.writeHead(200); res.end("x"); }],
   ["HEAD: end('x')", (res) => res.end("x")],
+  ["HEAD: writeHead(304, content-length), end()", (res) => { res.writeHead(304, { "content-length": "7" }); res.end(); }],
 ];
 const all = [...routes, ...head];
 
