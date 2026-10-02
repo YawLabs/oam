@@ -1639,16 +1639,23 @@
     return headers;
   }
 
-  // The error node's bundled undici (v22.22.2) reports for a connection its
-  // peer closed: `SocketError`, `other side closed`, code `UND_ERR_SOCKET`,
-  // and the socket it was on -- extending `UndiciError`, branded with the
-  // global symbols undici's own `instanceof` checks read, as measured (own
-  // keys `name`, `code`, `socket`; the two brands own symbol fields).
-  const kUndiciError = Symbol.for("undici.error.UND_ERR");
-  const kUndiciSocketError = Symbol.for("undici.error.UND_ERR_SOCKET");
+  // undici's error classes (lib/core/errors.js, as in node's bundled 6.24.1
+  // and the npm 6.x line), one family for the whole runtime: fetch's causes
+  // are made from it -- `SocketError` for a connection its peer closed
+  // (`other side closed`, code `UND_ERR_SOCKET`, the socket it was on),
+  // `HTTPParserError` for a body the parser refused -- and the `undici`
+  // shim exports the same classes (`__oamUndiciErrors`). undici's
+  // `instanceof` reads global-symbol brands, not the prototype chain: each
+  // class answers for instances carrying `Symbol.for('undici.error.<code>')`
+  // as an own field, so a check against any copy of undici -- the shim, an
+  // installed package bundled into an app, node's own -- holds as in node.
+  const undiciBrand = (code) => Symbol.for("undici.error." + code);
+  const kUndiciError = undiciBrand("UND_ERR");
   class UndiciError extends Error {
-    constructor(message, options) {
-      super(message, options);
+    // undici's takes the message alone: a subclass's options never reach
+    // Error, so its `cause` is an own field set after `message`.
+    constructor(message) {
+      super(message);
       this.name = "UndiciError";
       this.code = "UND_ERR";
     }
@@ -1657,10 +1664,66 @@
     }
     [kUndiciError] = true;
   }
+  // One of undici's plain error classes: the instance's `name` and `code`,
+  // its message when none is given, and the brand its `instanceof` reads --
+  // an own field, as undici's `[kBrand] = true`, or, for its newest
+  // classes, a getter on the prototype.
+  function undiciErrorClass(Base, className, name, code, defaultMessage, brandOnPrototype = false) {
+    const brand = undiciBrand(code);
+    const ErrorClass = class extends Base {
+      constructor(message) {
+        super(message);
+        if (!brandOnPrototype) this[brand] = true;
+        this.name = name;
+        this.message = message || defaultMessage;
+        this.code = code;
+      }
+      static [Symbol.hasInstance](instance) {
+        return instance != null && instance[brand] === true;
+      }
+    };
+    if (brandOnPrototype) {
+      Object.defineProperty(ErrorClass.prototype, brand, { get: () => true, configurable: true });
+    }
+    Object.defineProperty(ErrorClass, "name", { value: className });
+    return ErrorClass;
+  }
+  const undiciErrors = { UndiciError };
+  for (const [className, code, defaultMessage, name = className, brandOnPrototype] of [
+    ["ConnectTimeoutError", "UND_ERR_CONNECT_TIMEOUT", "Connect Timeout Error"],
+    ["HeadersTimeoutError", "UND_ERR_HEADERS_TIMEOUT", "Headers Timeout Error"],
+    ["HeadersOverflowError", "UND_ERR_HEADERS_OVERFLOW", "Headers Overflow Error"],
+    ["BodyTimeoutError", "UND_ERR_BODY_TIMEOUT", "Body Timeout Error"],
+    ["InvalidArgumentError", "UND_ERR_INVALID_ARG", "Invalid Argument Error"],
+    ["InvalidReturnValueError", "UND_ERR_INVALID_RETURN_VALUE", "Invalid Return Value Error"],
+    ["AbortError", "UND_ERR_ABORT", "The operation was aborted"],
+    ["InformationalError", "UND_ERR_INFO", "Request information"],
+    ["RequestContentLengthMismatchError", "UND_ERR_REQ_CONTENT_LENGTH_MISMATCH",
+      "Request body length does not match content-length header"],
+    ["ResponseContentLengthMismatchError", "UND_ERR_RES_CONTENT_LENGTH_MISMATCH",
+      "Response body length does not match content-length header"],
+    ["ClientDestroyedError", "UND_ERR_DESTROYED", "The client is destroyed"],
+    ["ClientClosedError", "UND_ERR_CLOSED", "The client is closed"],
+    ["NotSupportedError", "UND_ERR_NOT_SUPPORTED", "Not supported error"],
+    ["BalancedPoolMissingUpstreamError", "UND_ERR_BPL_MISSING_UPSTREAM",
+      "No upstream has been added to the BalancedPool", "MissingUpstreamError"],
+    ["ResponseExceededMaxSizeError", "UND_ERR_RES_EXCEEDED_MAX_SIZE", "Response content exceeded max size"],
+    ["MessageSizeExceededError", "UND_ERR_WS_MESSAGE_SIZE_EXCEEDED", "Max decompressed message size exceeded",
+      undefined, true],
+  ]) {
+    undiciErrors[className] = undiciErrorClass(
+      UndiciError, className, name, code, defaultMessage, brandOnPrototype);
+  }
+  // undici's RequestAbortedError is an AbortError, named so, with a code of
+  // its own.
+  undiciErrors.RequestAbortedError = undiciErrorClass(
+    undiciErrors.AbortError, "RequestAbortedError", "AbortError", "UND_ERR_ABORTED", "Request aborted");
+  const kUndiciSocketError = undiciBrand("UND_ERR_SOCKET");
   class SocketError extends UndiciError {
     constructor(message, socket) {
       super(message);
       this.name = "SocketError";
+      this.message = message || "Socket error";
       this.code = "UND_ERR_SOCKET";
       this.socket = socket;
     }
@@ -1669,6 +1732,85 @@
     }
     [kUndiciSocketError] = true;
   }
+  undiciErrors.SocketError = SocketError;
+  const kResponseStatusCodeError = undiciBrand("UND_ERR_RESPONSE_STATUS_CODE");
+  undiciErrors.ResponseStatusCodeError = class ResponseStatusCodeError extends UndiciError {
+    constructor(message, statusCode, headers, body) {
+      super(message);
+      this.name = "ResponseStatusCodeError";
+      this.message = message || "Response Status Code Error";
+      this.code = "UND_ERR_RESPONSE_STATUS_CODE";
+      this.body = body;
+      this.status = statusCode;
+      this.statusCode = statusCode;
+      this.headers = headers;
+    }
+    static [Symbol.hasInstance](instance) {
+      return instance != null && instance[kResponseStatusCodeError] === true;
+    }
+    [kResponseStatusCodeError] = true;
+  };
+  // RequestRetryError and ResponseError: a status, its headers and data.
+  for (const [className, code, defaultMessage] of [
+    ["RequestRetryError", "UND_ERR_REQ_RETRY", "Request retry error"],
+    ["ResponseError", "UND_ERR_RESPONSE", "Response error"],
+  ]) {
+    const brand = undiciBrand(code);
+    const ErrorClass = class extends UndiciError {
+      constructor(message, statusCode, { headers, data } = {}) {
+        super(message);
+        this.name = className;
+        this.message = message || defaultMessage;
+        this.code = code;
+        this.statusCode = statusCode;
+        this.data = data;
+        this.headers = headers;
+      }
+      static [Symbol.hasInstance](instance) {
+        return instance != null && instance[brand] === true;
+      }
+      [brand] = true;
+    };
+    Object.defineProperty(ErrorClass, "name", { value: className });
+    undiciErrors[className] = ErrorClass;
+  }
+  const kSecureProxyConnectionError = undiciBrand("UND_ERR_PRX_TLS");
+  undiciErrors.SecureProxyConnectionError = class SecureProxyConnectionError extends UndiciError {
+    constructor(cause, message) {
+      super(message);
+      this.name = "SecureProxyConnectionError";
+      this.message = message || "Secure Proxy Connection failed";
+      this.code = "UND_ERR_PRX_TLS";
+      this.cause = cause;
+    }
+    static [Symbol.hasInstance](instance) {
+      return instance != null && instance[kSecureProxyConnectionError] === true;
+    }
+    [kSecureProxyConnectionError] = true;
+  };
+  // Not an UndiciError: a plain Error with undici's brand, `code` the
+  // llhttp code (`HPE_<code>`) and `data` the bytes it refused, as text.
+  const kHTTPParserError = undiciBrand("UND_ERR_HTTP_PARSER");
+  class HTTPParserError extends Error {
+    constructor(message, code, data) {
+      super(message);
+      this.name = "HTTPParserError";
+      this.code = code ? `HPE_${code}` : undefined;
+      this.data = data ? data.toString() : undefined;
+    }
+    static [Symbol.hasInstance](instance) {
+      return instance != null && instance[kHTTPParserError] === true;
+    }
+    [kHTTPParserError] = true;
+  }
+  undiciErrors.HTTPParserError = HTTPParserError;
+  Object.freeze(undiciErrors);
+  Object.defineProperty(globalThis, "__oamUndiciErrors", {
+    value: undiciErrors,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
 
   // A transport failure as fetch reports it. The native side rejects a
   // connection its peer closed with an `UND_ERR_SOCKET` error carrying the

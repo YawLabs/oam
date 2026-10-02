@@ -1434,7 +1434,10 @@ What still differs:
   the server closes before the response head is in, or halfway through it, fails `fetch`
   with `fetch failed`, cause undici's `SocketError` -- `other side closed`, code
   `UND_ERR_SOCKET`, its class chain `SocketError < UndiciError < Error` with undici's
-  `instanceof` brands, and the `socket` it was on: `localAddress`, `localPort`,
+  `instanceof` brands -- `err.cause instanceof errors.SocketError` (and `UndiciError`)
+  holds against `import('undici')`'s classes, whose `instanceof` reads the same brands
+  (e2e `undici_errors_are_undicis_classes_with_its_brands`; before 0.17.2 the shim's
+  classes had none, and both checks were false) -- and the `socket` it was on: `localAddress`, `localPort`,
   `remoteAddress`, `remotePort`, `remoteFamily`, `timeout` (unset), `bytesWritten`,
   `bytesRead`; `http.request` fails with `socket hang up`, as before. A body the server
   closes or resets before its end fails the read with `TypeError: terminated`, the cause
@@ -1527,7 +1530,14 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
 **A `connect` function, `buildConnector`, and dispatchers oam refuses**
 
 `import 'undici'` is oam's shim, also when the package is installed (the real one does not
-run on oam). A dispatcher's `connect` FUNCTION -- `new Agent|Pool|Client({ connect(opts,
+run on oam). Its `errors` are undici's classes -- the names, codes, default messages and
+own keys of undici 6's, `HTTPParserError` and `ResponseError` among them -- and the ones
+fetch's causes are made from; each `instanceof` reads undici's `Symbol.for` brand, as
+undici's does, so it agrees with any other copy of undici. Up to 0.17.1 they were
+unbranded classes of the shim's own, `AbortError`'s code was `UND_ERR_ABORTED` (undici:
+`UND_ERR_ABORT`; `RequestAbortedError`, an `AbortError`, has `UND_ERR_ABORTED`), and
+`HTTPParserError`, `ResponseError`, `ResponseExceededMaxSizeError` and
+`MessageSizeExceededError` were missing. A dispatcher's `connect` FUNCTION -- `new Agent|Pool|Client({ connect(opts,
 cb) })`, a custom connector -- is called before every connection a request makes, redirect
 hops included, IP literals too, with undici's parameters (`host`, `hostname`, `protocol`,
 `port`, `servername`, `localAddress`), on all five entry points above plus `Pool` and

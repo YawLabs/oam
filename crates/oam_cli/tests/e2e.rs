@@ -5668,6 +5668,56 @@ server.close();
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// `import 'undici'`'s error classes are undici's, and fetch's causes are
+/// instances of them: `err.cause instanceof errors.SocketError` holds for a
+/// connection the server closed, as on node with the npm package (retry
+/// logic is written that way). undici's `instanceof` reads global-symbol
+/// brands (`Symbol.for('undici.error.<code>')`), so an object branded by
+/// another copy of undici passes too. Up to 0.17.1 the shim's classes had
+/// no brands -- both checks were false -- and AbortError's code was
+/// RequestAbortedError's. Expected lines measured on node v22.22.2 with
+/// undici 6.29.0 installed.
+#[test]
+fn undici_errors_are_undicis_classes_with_its_brands() {
+    let script = write_temp(
+        "undici_error_brands/main.mjs",
+        r##"import net from 'node:net';
+import { errors } from 'undici';
+
+const server = net.createServer((c) => { c.on('error', () => {}); c.once('data', () => c.end()); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+try {
+  await fetch(`http://127.0.0.1:${server.address().port}/`);
+} catch (e) {
+  console.log('cause', e.cause.code, e.cause instanceof errors.SocketError, e.cause instanceof errors.UndiciError);
+}
+server.close();
+const foreign = { [Symbol.for('undici.error.UND_ERR')]: true, [Symbol.for('undici.error.UND_ERR_SOCKET')]: true };
+console.log('foreign', foreign instanceof errors.SocketError, foreign instanceof errors.UndiciError);
+console.log('plain', new Error('x') instanceof errors.UndiciError, null instanceof errors.UndiciError);
+for (const name of ['AbortError', 'RequestAbortedError', 'BalancedPoolMissingUpstreamError', 'HTTPParserError']) {
+  const C = errors[name];
+  const e = new C();
+  console.log(name, C.name, e.name, e.code, JSON.stringify(e.message), e instanceof errors.UndiciError,
+    e instanceof errors.AbortError, JSON.stringify(Object.getOwnPropertyNames(e).filter((k) => k !== 'stack')));
+}
+const r = new errors.ResponseStatusCodeError('m', 418, { a: '1' }, 'b');
+console.log('status', r.status, r.statusCode, r.body, JSON.stringify(r.headers));
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "cause UND_ERR_SOCKET true true\n\
+         foreign true true\n\
+         plain false false\n\
+         AbortError AbortError AbortError UND_ERR_ABORT \"The operation was aborted\" true true [\"name\",\"code\",\"message\"]\n\
+         RequestAbortedError RequestAbortedError AbortError UND_ERR_ABORTED \"Request aborted\" true true [\"name\",\"code\",\"message\"]\n\
+         BalancedPoolMissingUpstreamError BalancedPoolMissingUpstreamError MissingUpstreamError UND_ERR_BPL_MISSING_UPSTREAM \"No upstream has been added to the BalancedPool\" true false [\"name\",\"code\",\"message\"]\n\
+         HTTPParserError HTTPParserError HTTPParserError undefined \"\" false false [\"name\",\"code\",\"data\"]\n\
+         status 418 418 b {\"a\":\"1\"}";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 /// An abort ends a hooked fetch where node ends it. Aborted in the same tick
 /// as fetch(), the first host is still passed to the hook (undici has begun
 /// connecting); aborted while a request is on the wire, the redirect it
