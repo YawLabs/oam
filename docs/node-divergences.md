@@ -2400,7 +2400,7 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   the next tick for one that never was (`conformance/cases/223-net-socket-destroy-defers-events.mjs`;
   up to 0.17.1 both were emitted from inside `destroy()`). It closes the connection at
   once, as Node's does, a read under way and a write the peer is not draining included
-  (`conformance/cases/263-net-destroy-closes-at-once.mjs`; up to 0.17.1 those kept the
+  (`conformance/cases/289-net-destroy-closes-at-once.mjs`; up to 0.17.1 those kept the
   descriptor open until the peer answered the FIN, so destroying a socket whose peer never
   read -- one paused -- kept the process alive for good). What is left: Node emits that
   `'close'` from the handle's close callback, which also runs after an immediate queued
@@ -2426,7 +2426,7 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   socket with no connection and none on the way (`new net.Socket()`, never connected) fails
   as Node's does: `ERR_SOCKET_CLOSED` "Socket is closed" is the stream's error at once, the
   callback gets it on the next tick, then the socket is destroyed with it, and the stream
-  does not end (`conformance/cases/260-net-write-without-handle.mjs`; up to 0.17.1 the
+  does not end (`conformance/cases/286-net-write-without-handle.mjs`; up to 0.17.1 the
   write reached the natives and failed with "tcp: write handle 0 is gone", and `end(data)`
   ended the stream). Node's stream getters `writableEnded`, `writableFinished`, `closed`
   (true from `destroy()` on), `errored`, `readableEnded` and `writableNeedDrain` read as
@@ -2443,7 +2443,7 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   with `ERR_SOCKET_CLOSED_BEFORE_CONNECTION`, the writes behind it and those `end()`
   callbacks then getting the stream's error. A `tls.TLSSocket` over a `net.Socket` with no
   connection is `connecting` until that socket connects, as Node's
-  (`conformance/cases/261-net-end-then-destroy-before-connect.mjs`; up to 0.17.1 all of
+  (`conformance/cases/287-net-end-then-destroy-before-connect.mjs`; up to 0.17.1 all of
   these ran before `'error'` and `'close'`, `end()`'s first, with
   `ERR_SOCKET_CLOSED_BEFORE_CONNECTION`). A write the socket takes whole inside the call is
   no longer counted when `write()` returns, as Node's: `writableLength` and `bufferSize` read
@@ -2574,7 +2574,7 @@ the socket and before its shutdown callback (`'finish'`) has run.
   check phase began and the timers due once they are done. So `socket.end();
   process.nextTick(() => socket.resetAndDestroy())`, and a `resetAndDestroy()` in a sibling
   timer or immediate of the `end()`, are refused with EINVAL on both
-  (`conformance/cases/264-net-finish-after-ticks.mjs`; up to 0.17.1 oam emitted `'finish'`
+  (`conformance/cases/290-net-finish-after-ticks.mjs`; up to 0.17.1 oam emitted `'finish'`
   from a microtask and reset the socket there). Measured on Windows, where Node's
   writes complete in the call and every `end()` on a connected socket opens the window at
   once, as oam's does (`write(); end(); resetAndDestroy()` is EINVAL on both). On Linux and
@@ -2715,7 +2715,7 @@ rest sat on `Error.prototype` with an own `toString`, and the stack's top frame 
 error factory. `url.fileURLToPath`'s refusals (`ERR_INVALID_URL_SCHEME`,
 `ERR_INVALID_FILE_URL_PATH`, `ERR_INVALID_FILE_URL_HOST` -- `TypeError`s, as node's), fs
 given a URL that is not a `file:` one, `ERR_DIR_CLOSED` and `ERR_UNKNOWN_CREDENTIAL` come
-from the same registry (`conformance/cases/265-coded-errors-url-dir.mjs`; up to 0.17.1 they
+from the same registry (`conformance/cases/291-coded-errors-url-dir.mjs`; up to 0.17.1 they
 were built by hand on `Error.prototype` and rendered `Error: message`, the URL path and host
 ones as `Error`s). What is left: the `toString` on the prototype is oam's function, not
 node's source text; and `fs.cp` / `fs.cpSync` of a directory without `recursive` fails with
@@ -2726,7 +2726,7 @@ directory: cp returned EISDIR (... is a directory (not copied)) ...") from `cp` 
 ...", the path as node's C++ renders it) from `cpSync`. oam has no `SystemError` class yet.
 A directory copied onto something that exists and is not a directory, or a file onto a
 directory, fails as node's does before anything is copied and ahead of the `recursive` check:
-`ERR_FS_CP_DIR_TO_NON_DIR` / `ERR_FS_CP_NON_DIR_TO_DIR` (`conformance/cases/266-fs-cp-type-mismatch.mjs`;
+`ERR_FS_CP_DIR_TO_NON_DIR` / `ERR_FS_CP_NON_DIR_TO_DIR` (`conformance/cases/292-fs-cp-type-mismatch.mjs`;
 up to 0.17.1 oam failed on the directory's first entry with `ENOENT`, not at all when it was
 empty, and with `EPERM` for a file onto a directory). `cpSync`'s is node's to the byte -- a
 plain `Error` with `code` alone, the paths through `path.toNamespacedPath` as node hands them
@@ -2945,7 +2945,7 @@ comment, **not** something measured. Do not rely on either the claim or its nega
   (case 125). A socket nobody reads still emits `'data'` into the void where Node's would
   buffer, and `_readableState.length` is `0` except in paused mode. A socket `pause()`d holds
   what a read already under way brings until `resume()`, as Node's (a server's socket paused
-  in its `'connection'` listener included, `conformance/cases/262-net-paused-accepted-socket.mjs`;
+  in its `'connection'` listener included, `conformance/cases/288-net-paused-accepted-socket.mjs`;
   up to 0.17.1 that first chunk was emitted while paused); it then reads no further, where
   Node's goes on reading into its buffer up to the high-water mark.
 - **N-API async surfaces.** `napi_create_async_work`, `napi_queue_async_work`, and the
