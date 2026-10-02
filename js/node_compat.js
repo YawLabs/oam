@@ -33690,11 +33690,13 @@
       }
       if (!valid) {
         var mismatch = new Error("Hostname/IP does not match certificate's altnames: " + reason);
-        applyNodeErrorShape(mismatch, "ERR_TLS_CERT_ALTNAME_INVALID");
-        mismatch.reason = reason;
-        mismatch.host = hostname;
-        mismatch.cert = cert;
-        return mismatch;
+        // node's message function sets reason, host and cert on `this`, so
+        // they sit between `code` and `message`.
+        return applyNodeErrorShape(mismatch, "ERR_TLS_CERT_ALTNAME_INVALID", {
+          reason: reason,
+          host: hostname,
+          cert: cert,
+        });
       }
     }
 

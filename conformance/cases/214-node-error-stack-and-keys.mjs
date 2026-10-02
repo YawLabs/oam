@@ -82,3 +82,10 @@ console.log("write after end", keys(await new Promise((resolve) => {
   w.write("x", resolve);
 })));
 console.log("fs.readFileSync(1.5)", keys(caught(() => fs.readFileSync(1.5))));
+
+console.log("== tls.checkServerIdentity: reason, host and cert sit between code and message");
+const tls = await import("node:tls");
+{
+  const e = tls.checkServerIdentity("a.com", { subject: { CN: "b.com" }, subjectaltname: "DNS:b.com" });
+  console.log(e.code, Reflect.ownKeys(e).filter((k) => typeof k === "string").join(","), head(e));
+}
