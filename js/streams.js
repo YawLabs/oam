@@ -143,6 +143,14 @@
       : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
   }
 
+  // node's validateObject for a constructor's source / strategy argument:
+  // an object, a function or an array, and (for a strategy) null.
+  function validateObjectArg(value, name, nullable) {
+    if (value === null ? !nullable : typeof value !== "object" && typeof value !== "function") {
+      throw new (codes().ERR_INVALID_ARG_TYPE)(name, "Object", value);
+    }
+  }
+
   // ------------------------------------------------------- ReadableStream
   class ReadableStreamDefaultController {
     constructor(stream) {
@@ -358,18 +366,45 @@
 
   class ReadableStream {
     constructor(source = {}, strategy = {}) {
-      // A byte stream (`type: 'bytes'`) queues bytes, not chunks, and its
-      // high-water mark defaults to 0: nothing is pulled until a read asks.
-      const isBytes = source?.type === "bytes";
+      validateObjectArg(source, "source", false);
+      validateObjectArg(strategy, "strategy", true);
+      // node's order, which is the standard's: the strategy's size and
+      // highWaterMark are read before anything of the source, then
+      // source.type, which is "bytes" when it stringifies so. A byte stream
+      // queues bytes, so it takes no size(); its high-water mark defaults to
+      // 0: nothing is pulled until a read asks. Any other type is refused.
+      const size = strategy?.size;
+      const highWaterMark = strategy?.highWaterMark;
+      const type = source.type;
+      let isBytes = false;
+      if (`${type}` === "bytes") {
+        if (size !== undefined) {
+          throw new (codes().ERR_INVALID_ARG_VALUE.RangeError)("strategy.size", size);
+        }
+        isBytes = true;
+      } else if (type !== undefined) {
+        throw new (codes().ERR_INVALID_ARG_VALUE)("source.type", type);
+      }
       initReadable(
         this,
-        extractHighWaterMark(strategy?.highWaterMark, isBytes ? 0 : 1),
-        isBytes ? byteChunkSize : makeSizeFn(strategy?.size),
+        extractHighWaterMark(highWaterMark, isBytes ? 0 : 1),
+        isBytes ? byteChunkSize : makeSizeFn(size),
         isBytes,
       );
       const start = source.start;
       const pull = source.pull;
       const cancel = source.cancel;
+      if (isBytes) {
+        // Read, and 0 refused, as node does; there is no byobRequest for
+        // it to size (docs/node-divergences.md).
+        const autoAllocateChunkSize = source.autoAllocateChunkSize;
+        if (autoAllocateChunkSize === 0) {
+          throw new (codes().ERR_INVALID_ARG_VALUE)(
+            "source.autoAllocateChunkSize",
+            autoAllocateChunkSize,
+          );
+        }
+      }
       setupReadable(
         this,
         typeof start === "function" ? (controller) => start.call(source, controller) : nonOpStart,
@@ -1048,6 +1083,13 @@
 
   class WritableStream {
     constructor(sink = {}, strategy = {}) {
+      validateObjectArg(sink, "sink", false);
+      validateObjectArg(strategy, "strategy", true);
+      const type = sink?.type;
+      if (type !== undefined) throw new (codes().ERR_INVALID_ARG_VALUE.RangeError)("type", type);
+      // node's order: size, then highWaterMark.
+      const size = makeSizeFn(strategy?.size);
+      const highWaterMark = extractHighWaterMark(strategy?.highWaterMark, 1);
       initWritable(this);
       const start = sink.start;
       const write = sink.write;
@@ -1059,8 +1101,8 @@
         typeof write === "function" ? promiseCallback(write, sink) : nonOpPromise,
         typeof close === "function" ? promiseCallback(close, sink) : nonOpPromise,
         typeof abort === "function" ? promiseCallback(abort, sink) : nonOpPromise,
-        extractHighWaterMark(strategy?.highWaterMark, 1),
-        makeSizeFn(strategy?.size),
+        highWaterMark,
+        size,
       );
     }
 
@@ -1272,16 +1314,32 @@
 
   class TransformStream {
     constructor(transformer = {}, writableStrategy = {}, readableStrategy = {}) {
+      validateObjectArg(transformer, "transformer", false);
+      validateObjectArg(writableStrategy, "writableStrategy", true);
+      validateObjectArg(readableStrategy, "readableStrategy", true);
+      const readableType = transformer.readableType;
+      const writableType = transformer.writableType;
       const start = transformer.start;
+      if (readableType !== undefined) {
+        throw new (codes().ERR_INVALID_ARG_VALUE.RangeError)("transformer.readableType", readableType);
+      }
+      if (writableType !== undefined) {
+        throw new (codes().ERR_INVALID_ARG_VALUE.RangeError)("transformer.writableType", writableType);
+      }
+      // node reads the four strategy fields, then validates them. Its
+      // defaults: the readable side holds 0 chunks (a transform runs when a
+      // read wants its output), the writable side 1.
+      const readableHighWaterMark = readableStrategy?.highWaterMark;
+      const readableSizeFn = readableStrategy?.size;
+      const writableHighWaterMark = writableStrategy?.highWaterMark;
+      const writableSizeFn = writableStrategy?.size;
+      const readableHWM = extractHighWaterMark(readableHighWaterMark, 0);
+      const readableSize = makeSizeFn(readableSizeFn);
+      const writableHWM = extractHighWaterMark(writableHighWaterMark, 1);
+      const writableSize = makeSizeFn(writableSizeFn);
       const transform = transformer.transform;
       const flush = transformer.flush;
       const cancel = transformer.cancel;
-      // node's defaults: the readable side holds 0 chunks (a transform runs
-      // when a read wants its output), the writable side 1.
-      const readableHWM = extractHighWaterMark(readableStrategy?.highWaterMark, 0);
-      const readableSize = makeSizeFn(readableStrategy?.size);
-      const writableHWM = extractHighWaterMark(writableStrategy?.highWaterMark, 1);
-      const writableSize = makeSizeFn(writableStrategy?.size);
 
       // Both sides start from ONE promise, resolved with transformer.start's
       // result below -- so a throw from start() is this constructor's throw.
