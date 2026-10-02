@@ -7,7 +7,8 @@
 // "buffer.utf8Slice is not a function" on its first response body. Its three
 // wrappers took the wrong defaults and errors. The decoded hex input also
 // stops at the first pair that is not two hex DIGITS, which parseInt let
-// through ("aG", " 1", "+1"). Measured on node v22.22.2.
+// through ("aG", " 1", "+1"), and reads each code unit's low byte as node's
+// one-byte copy does. Measured on node v22.22.2.
 import { Buffer } from "node:buffer";
 
 const show = (label, f) => {
@@ -112,9 +113,19 @@ show("hexWrite odd", () => {
   const out = Buffer.alloc(4);
   return [out.hexWrite("abc"), [...out]];
 });
-for (const h of ["aG", "Ga11", "1g22", "a 11", "0x11", "11zz22", "+1", " 1", "A0fF"]) {
+// Node reads a hex digit from each code unit's LOW byte: U+0661 decodes as
+// "a", U+0130 as "0", U+FF41 as "A"; U+0100 (low byte 0x00) and a surrogate
+// pair (low byte 0x3d) stop the decode.
+const HEX = ["aG", "Ga11", "1g22", "a 11", "0x11", "11zz22", "+1", " 1", "A0fF",
+  "١٢", "aİ", "Łł", "ａｂ", "Āā", "\u{1F600}", "ab١"];
+for (const h of HEX) {
   show(`hex ${JSON.stringify(h)}`, () => [...Buffer.from(h, "hex")]);
   show(`hexWrite ${JSON.stringify(h)}`, () => Buffer.alloc(4).hexWrite(h));
+  show(`write hex ${JSON.stringify(h)}`, () => {
+    const out = Buffer.alloc(4);
+    return [out.write(h, "hex"), [...out]];
+  });
+  show(`fill hex ${JSON.stringify(h)}`, () => [...Buffer.alloc(3).fill(h, "hex")]);
 }
 // undici's chunksDecode: skip a UTF-8 BOM, then utf8Slice the rest.
 const body = Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('{"ok":true}')]);

@@ -1403,12 +1403,15 @@
         const out = new Uint8Array(len);
         let o = 0;
         // Each pair must be two hex DIGITS: parseInt would read "aG", " 1"
-        // or "+1" as a byte where node stops.
+        // or "+1" as a byte where node stops. Node decodes from a one-byte
+        // copy of the string (StringBytes casts each code unit to uint8), so
+        // only a code unit's LOW byte is a digit: U+0661 reads as "a",
+        // U+0130 as "0", and U+0100 (low byte 0x00) stops the decode.
         const digit = (c) =>
           c >= 48 && c <= 57 ? c - 48 : c >= 97 && c <= 102 ? c - 87 : c >= 65 && c <= 70 ? c - 55 : -1;
         for (let i = 0; i + 1 < str.length; i += 2) {
-          const hi = digit(str.charCodeAt(i));
-          const lo = digit(str.charCodeAt(i + 1));
+          const hi = digit(str.charCodeAt(i) & 0xff);
+          const lo = digit(str.charCodeAt(i + 1) & 0xff);
           if (hi < 0 || lo < 0) break;
           out[o++] = (hi << 4) | lo;
         }
