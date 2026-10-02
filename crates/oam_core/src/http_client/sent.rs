@@ -56,6 +56,11 @@ pub type SentSignals = Arc<Mutex<HashMap<u64, Signal>>>;
 pub(crate) struct Checkouts {
     count: u64,
     on_connection: bool,
+    /// The connection the last checkout put the request on, when the
+    /// connector named it (a plain-TCP h1 connection): what JS closes, or
+    /// resets, for `req.socket.destroy()` / `resetAndDestroy()` before the
+    /// response head ([`super::connector::ConnCloser`]).
+    connection: Option<u64>,
 }
 
 /// One request's signal. The sender is here until the fetch takes it.
@@ -78,9 +83,16 @@ impl Dispatched {
 
     /// A connection has the request: one more checkout.
     pub fn fire(&self) {
+        self.fire_on(None);
+    }
+
+    /// [`fire`](Dispatched::fire), naming the connection that has the
+    /// request when the connector gave it an id.
+    pub(crate) fn fire_on(&self, connection: Option<u64>) {
         self.0.send_modify(|state| {
             state.count += 1;
             state.on_connection = true;
+            state.connection = connection;
         });
     }
 
@@ -165,7 +177,8 @@ pub fn take(signals: &SentSignals, handle: u64) -> Option<Dispatched> {
     Some(Dispatched(Arc::new(sender)))
 }
 
-/// `fetchSentWait`: `Json("true")` once the request has a connection; `Done`
+/// `fetchSentWait`: once the request has a connection, `Json` of that
+/// connection's id when the connector named one, else `Json("true")`; `Done`
 /// if it ended without one, or the signal was closed first.
 pub async fn wait(signals: SentSignals, handle: u64) -> OpOutcome {
     let receiver = lock(&signals)
@@ -175,7 +188,11 @@ pub async fn wait(signals: SentSignals, handle: u64) -> OpOutcome {
         return OpOutcome::Done;
     };
     match receiver.wait_for(|state| state.count > 0).await {
-        Ok(_) => OpOutcome::Json("true".to_string()),
+        // The connection's id when the connector named it, else `true`.
+        Ok(state) => OpOutcome::Json(match state.connection {
+            Some(connection) => connection.to_string(),
+            None => "true".to_string(),
+        }),
         Err(_) => OpOutcome::Done,
     }
 }

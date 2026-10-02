@@ -21823,7 +21823,17 @@
         var signal = natives.fetchSentOpen();
         self._sentSignal = signal;
         natives.fetchSentWait(signal).then(function (sent) {
-          if (sent && self._sentSignal === signal) self._fetchRequestSent();
+          if (sent === undefined || sent === false || self._sentSignal !== signal) return;
+          // The connection that has the request, when the transport names
+          // it (plain TCP): from here req.socket.destroy() and
+          // resetAndDestroy() close or reset it, as node's do the socket's
+          // handle, before the response head too. A TLSSocket's is not
+          // tracked (resetAndDestroy() there is ERR_INVALID_HANDLE_TYPE).
+          var standIn = self._fetchSocket;
+          if (typeof sent === "number" && standIn !== null && !standIn.encrypted && !standIn.destroyed) {
+            standIn[registry._netNativeConnection] = sent;
+          }
+          self._fetchRequestSent();
         }, function () {});
         self._fetchActivity();
         // node's _storeHeader puts a Connection header on every request it
@@ -25569,7 +25579,11 @@
       // a pipe's, never do.
       if (this[kNotTcpHandle] === true || this._pipeConnect === true) {
         if (!this.destroyed) throw codes.ERR_INVALID_HANDLE_TYPE();
-      } else if (this.connecting) {
+      } else if (this.connecting && this[kNativeConnection] === undefined) {
+        // (The fetch path's stand-in reads as connecting until the response
+        // head, but holds its connection from the moment the transport has
+        // the request on one: then it is reset now, below, as node's
+        // connected socket is.)
         this.once("connect", () => this._reset());
       } else if (this._handle != null || (this[kNativeConnection] !== undefined && !this.destroyed)) {
         this._reset();

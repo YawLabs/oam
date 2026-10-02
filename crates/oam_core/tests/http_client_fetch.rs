@@ -3148,8 +3148,11 @@ async fn the_sent_signal_fires_with_the_connection_and_never_without_one() {
                 None,
             ))
         };
-        let fired =
-            |outcome: OpOutcome| matches!(outcome, OpOutcome::Json(ref text) if text == "true");
+        // Fired: the plain-TCP connection's id (what JS closes or resets
+        // before the head), or `true` for one the connector did not name.
+        let fired = |outcome: OpOutcome| {
+            matches!(outcome, OpOutcome::Json(ref text) if text == "true" || text.parse::<u64>().is_ok())
+        };
         let url = format!("http://127.0.0.1:{}/", server.port);
 
         // A fresh connection: fired while the answer is held back.

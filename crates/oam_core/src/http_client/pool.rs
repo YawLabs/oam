@@ -198,7 +198,7 @@ impl Pool {
             // it is handed over: node's 'finish' for http.request, and where
             // undici's headersTimeout starts (`sent`).
             if let Some(dispatched) = req.extensions().get::<Dispatched>() {
-                dispatched.fire();
+                dispatched.fire_on(info.connection);
             }
             *req.uri_mut() = original_uri.clone();
             set_host_header(&mut req, is_h2);
