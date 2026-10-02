@@ -18,6 +18,9 @@
 // - A TransformStream runs transform() only while its readable side wants
 //   data: the readable's high-water mark defaults to 0, so a write waits for
 //   a read (backpressure), exactly as node's does.
+// - pipeTo() waits for the destination's `ready` before each read and does
+//   not wait for the write, so the destination fills to its high-water mark;
+//   it watches both sides for errors and closes, as node's does.
 //
 // Scope (documented in docs/node-divergences.md):
 // - Default readers only. `type: 'bytes'` streams get the byte controller's
@@ -418,6 +421,257 @@
     return then(result, noop);
   }
 
+  // A default reader: `closed` follows the stream, `read()` takes the next
+  // chunk. Shared by getReader() and pipeTo().
+  function acquireDefaultReader(stream) {
+    // node tags this ERR_INVALID_STATE, and callers key on the code --
+    // stream/consumers' rejection is asserted by code, not by message.
+    if (stream._reader !== null) throw invalidState("ReadableStream is locked");
+    let closedResolve;
+    let closedReject;
+    const closed = new Promise((resolve, reject) => {
+      closedResolve = resolve;
+      closedReject = reject;
+    });
+    markHandled(closed); // observable via reader.closed; never unhandled
+    if (stream._state === "closed") closedResolve();
+    if (stream._state === "errored") closedReject(stream._error);
+    stream._resolveClosed = closedResolve;
+    stream._rejectClosed = closedReject;
+
+    const reader = {
+      closed,
+      read() {
+        if (stream._reader !== reader) {
+          return Promise.reject(invalidState("The reader is not attached to a stream"));
+        }
+        return new Promise((resolve, reject) => readableReaderRead(stream, { resolve, reject }));
+      },
+      cancel(reason) {
+        if (stream._reader !== reader) {
+          return Promise.reject(invalidState("The reader is not attached to a stream"));
+        }
+        return readableCancel(stream, reason);
+      },
+      // node's ReadableStreamDefaultReaderRelease: the generic release,
+      // then every pending read rejects with "Releasing reader".
+      releaseLock() {
+        if (stream._reader !== reader) return;
+        readableReaderGenericRelease(stream, reader);
+        const releasing = readerReleasingError();
+        while (stream._waiters.length > 0) stream._waiters.shift().reject(releasing);
+      },
+    };
+    stream._reader = reader;
+    return reader;
+  }
+
+  // node's ReadableStreamDefaultReaderRead: a request is {resolve, reject};
+  // resolve takes the {value, done} result, synchronously when a chunk is
+  // queued, or when one is enqueued (a pipe acts on it right there).
+  function readableReaderRead(stream, request) {
+    stream._disturbed = true;
+    if (stream._state === "closed") {
+      request.resolve({ value: undefined, done: true });
+    } else if (stream._state === "errored") {
+      request.reject(stream._error);
+    } else if (stream._queue.length > 0) {
+      const value = stream._queue.shift();
+      if (stream._closeRequested && stream._queue.length === 0) {
+        readableClearAlgorithms(stream);
+        readableClose(stream);
+      } else {
+        readableCallPullIfNeeded(stream);
+      }
+      request.resolve({ value, done: false });
+    } else {
+      stream._waiters.push(request);
+      readableCallPullIfNeeded(stream);
+    }
+  }
+
+  // node's ReadableStreamReaderGenericRelease: `closed` rejects with
+  // "Reader released" (a stream that has already closed or errored gives
+  // the reader a new, rejected `closed`), and the lock is dropped.
+  function readableReaderGenericRelease(stream, reader) {
+    const released = readerReleasedError();
+    if (stream._state === "readable") stream._rejectClosed(released);
+    else reader.closed = Promise.reject(released);
+    markHandled(reader.closed);
+    stream._reader = null;
+    stream._resolveClosed = undefined;
+    stream._rejectClosed = undefined;
+  }
+
+  // node's validateAbortSignal: duck-typed on `aborted`.
+  function validateAbortSignal(signal, name) {
+    if (signal === null || typeof signal !== "object" || !("aborted" in signal)) {
+      throw new (codes().ERR_INVALID_ARG_TYPE)(name, "AbortSignal", signal);
+    }
+  }
+
+  // node's readableStreamPipeTo, the standard's ReadableStreamPipeTo: each
+  // step waits for the destination's `ready`, then reads, then starts the
+  // write without waiting for it -- so the destination's queue fills to its
+  // high-water mark, and the source is pulled as far ahead as node pulls
+  // it. Errors and closes on either side are watched while a read or a
+  // write is pending, and shut the pipe down with node's actions: an
+  // errored source aborts the destination, an errored destination cancels
+  // the source, a closed source closes the destination (each unless
+  // prevented), and an abort signal does both.
+  function readableStreamPipeTo(source, dest, preventClose, preventAbort, preventCancel, signal) {
+    let reader;
+    let writer;
+    try {
+      reader = acquireDefaultReader(source);
+      writer = new WritableStreamDefaultWriter(dest);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    source._disturbed = true;
+    let shuttingDown = false;
+    let removeAbortListener;
+    const promise = deferred();
+    let currentWrite = Promise.resolve();
+
+    function finalize(rejected, error) {
+      writerRelease(writer);
+      readableReaderGenericRelease(source, reader);
+      removeAbortListener?.();
+      if (rejected) promise.reject(error);
+      else promise.resolve();
+    }
+
+    async function waitForCurrentWrite() {
+      const write = currentWrite;
+      await write;
+      if (write !== currentWrite) await waitForCurrentWrite();
+    }
+
+    function shutdownWithAnAction(action, rejected, originalError) {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      const complete = () =>
+        then(
+          action(),
+          () => finalize(rejected, originalError),
+          (error) => finalize(true, error),
+        );
+      if (dest._state === "writable" && !writableCloseQueuedOrInFlight(dest)) {
+        then(waitForCurrentWrite(), complete, (error) => finalize(true, error));
+        return;
+      }
+      complete();
+    }
+
+    function shutdown(rejected, error) {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      if (dest._state === "writable" && !writableCloseQueuedOrInFlight(dest)) {
+        then(
+          waitForCurrentWrite(),
+          () => finalize(rejected, error),
+          (err) => finalize(true, err),
+        );
+        return;
+      }
+      finalize(rejected, error);
+    }
+
+    function abortAlgorithm() {
+      const error = signal.reason;
+      const actions = [];
+      if (!preventAbort) {
+        actions.push(() =>
+          dest._state === "writable" ? writableAbort(dest, error) : Promise.resolve(),
+        );
+      }
+      if (!preventCancel) {
+        actions.push(() =>
+          source._state === "readable" ? readableCancel(source, error) : Promise.resolve(),
+        );
+      }
+      shutdownWithAnAction(() => Promise.all(actions.map((action) => action())), true, error);
+    }
+
+    function watchErrored(stream, closedPromise, storedError, action) {
+      if (stream._state === "errored") action(storedError());
+      else then(closedPromise, undefined, action);
+    }
+
+    function watchClosed(stream, closedPromise, action) {
+      if (stream._state === "closed") action();
+      else then(closedPromise, action, noop);
+    }
+
+    // One read: true once the source is done (or the pipe shutting down).
+    async function step() {
+      if (shuttingDown) return true;
+      await writer._ready.promise;
+      return new Promise((resolve, reject) => {
+        readableReaderRead(source, {
+          resolve(result) {
+            if (result.done) {
+              resolve(true);
+              return;
+            }
+            currentWrite = writerWrite(writer, result.value);
+            markHandled(currentWrite);
+            resolve(false);
+          },
+          reject,
+        });
+      });
+    }
+
+    async function run() {
+      while (!(await step()));
+    }
+
+    if (signal !== undefined) {
+      if (signal.aborted) {
+        abortAlgorithm();
+        return promise.promise;
+      }
+      signal.addEventListener("abort", abortAlgorithm, { once: true });
+      removeAbortListener = () => signal.removeEventListener("abort", abortAlgorithm);
+    }
+
+    markHandled(run());
+
+    watchErrored(source, reader.closed, () => source._error, (error) => {
+      if (!preventAbort) {
+        shutdownWithAnAction(() => writableAbort(dest, error), true, error);
+        return;
+      }
+      shutdown(true, error);
+    });
+
+    watchErrored(dest, writer._closed.promise, () => dest._storedError, (error) => {
+      if (!preventCancel) {
+        shutdownWithAnAction(() => readableCancel(source, error), true, error);
+        return;
+      }
+      shutdown(true, error);
+    });
+
+    watchClosed(source, reader.closed, () => {
+      if (!preventClose) {
+        shutdownWithAnAction(() => writerCloseWithErrorPropagation(writer));
+        return;
+      }
+      shutdown();
+    });
+
+    if (writableCloseQueuedOrInFlight(dest) || dest._state === "closed") {
+      const error = invalidState("Destination WritableStream is closed");
+      if (!preventCancel) shutdownWithAnAction(() => readableCancel(source, error), true, error);
+      else shutdown(true, error);
+    }
+
+    return promise.promise;
+  }
+
   // A stream built over internal algorithms (TransformStream's readable
   // side), as node's createReadableStream builds one.
   function createReadable(startAlgorithm, pullAlgorithm, cancelAlgorithm, highWaterMark, sizeFn) {
@@ -481,75 +735,7 @@
     }
 
     getReader() {
-      // node tags this ERR_INVALID_STATE, and callers key on the code --
-      // stream/consumers' rejection is asserted by code, not by message.
-      if (this._reader !== null) throw invalidState("ReadableStream is locked");
-      const stream = this;
-      let closedResolve;
-      let closedReject;
-      const closed = new Promise((resolve, reject) => {
-        closedResolve = resolve;
-        closedReject = reject;
-      });
-      markHandled(closed); // observable via reader.closed; never unhandled
-      if (stream._state === "closed") closedResolve();
-      if (stream._state === "errored") closedReject(stream._error);
-      stream._resolveClosed = closedResolve;
-      stream._rejectClosed = closedReject;
-
-      const reader = {
-        closed,
-        read() {
-          if (stream._reader !== reader) {
-            return Promise.reject(invalidState("The reader is not attached to a stream"));
-          }
-          stream._disturbed = true;
-          if (stream._state === "closed") {
-            return Promise.resolve({ value: undefined, done: true });
-          }
-          if (stream._state === "errored") {
-            return Promise.reject(stream._error);
-          }
-          if (stream._queue.length > 0) {
-            const value = stream._queue.shift();
-            if (stream._closeRequested && stream._queue.length === 0) {
-              readableClearAlgorithms(stream);
-              readableClose(stream);
-            } else {
-              readableCallPullIfNeeded(stream);
-            }
-            return Promise.resolve({ value, done: false });
-          }
-          return new Promise((resolve, reject) => {
-            stream._waiters.push({ resolve, reject });
-            readableCallPullIfNeeded(stream);
-          });
-        },
-        cancel(reason) {
-          if (stream._reader !== reader) {
-            return Promise.reject(invalidState("The reader is not attached to a stream"));
-          }
-          return readableCancel(stream, reason);
-        },
-        // node's ReadableStreamDefaultReaderRelease: `closed` rejects with
-        // "Reader released" (a stream that has already closed or errored
-        // gets a new, rejected `closed`), the lock is dropped, then every
-        // pending read rejects with "Releasing reader".
-        releaseLock() {
-          if (stream._reader !== reader) return;
-          const released = readerReleasedError();
-          if (stream._state === "readable") stream._rejectClosed(released);
-          else reader.closed = Promise.reject(released);
-          markHandled(reader.closed);
-          stream._reader = null;
-          stream._resolveClosed = undefined;
-          stream._rejectClosed = undefined;
-          const releasing = readerReleasingError();
-          while (stream._waiters.length > 0) stream._waiters.shift().reject(releasing);
-        },
-      };
-      stream._reader = reader;
-      return reader;
+      return acquireDefaultReader(this);
     }
 
     cancel(reason) {
@@ -609,30 +795,56 @@
       return [makeBranch(0), makeBranch(1)];
     }
 
-    async pipeTo(destination, options = {}) {
-      const reader = this.getReader();
-      const writer = destination.getWriter();
+    // node's argument checks, in node's order; a failed check is a
+    // rejected promise from pipeTo and a throw from pipeThrough.
+    pipeTo(destination, options = {}) {
       try {
-        for (;;) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          await writer.write(value);
+        if (!(destination instanceof WritableStream)) {
+          throw new (codes().ERR_INVALID_ARG_TYPE)("transform.writable", "WritableStream", destination);
         }
-        if (options.preventClose !== true) await writer.close();
-      } catch (e) {
-        if (options.preventAbort !== true) await writer.abort(e).catch(() => {});
-        if (options.preventCancel !== true) await reader.cancel(e).catch(() => {});
-        throw e;
-      } finally {
-        reader.releaseLock();
-        writer.releaseLock();
+        validateObjectArg(options, "options", true);
+        const preventAbort = options?.preventAbort;
+        const preventCancel = options?.preventCancel;
+        const preventClose = options?.preventClose;
+        const signal = options?.signal;
+        if (signal !== undefined) validateAbortSignal(signal, "options.signal");
+        if (this.locked) throw invalidState("The ReadableStream is locked");
+        if (destination.locked) throw invalidState("The WritableStream is locked");
+        return readableStreamPipeTo(
+          this,
+          destination,
+          !!preventClose,
+          !!preventAbort,
+          !!preventCancel,
+          signal,
+        );
+      } catch (error) {
+        return Promise.reject(error);
       }
     }
 
-    pipeThrough(pair, options) {
-      // The pump runs detached; errors surface through the readable side.
-      this.pipeTo(pair.writable, options).catch(() => {});
-      return pair.readable;
+    pipeThrough(transform, options = {}) {
+      const readable = transform?.readable;
+      if (!(readable instanceof ReadableStream)) {
+        throw new (codes().ERR_INVALID_ARG_TYPE)("transform.readable", "ReadableStream", readable);
+      }
+      const writable = transform?.writable;
+      if (!(writable instanceof WritableStream)) {
+        throw new (codes().ERR_INVALID_ARG_TYPE)("transform.writable", "WritableStream", writable);
+      }
+      validateObjectArg(options, "options", true);
+      const preventAbort = options?.preventAbort;
+      const preventCancel = options?.preventCancel;
+      const preventClose = options?.preventClose;
+      const signal = options?.signal;
+      if (signal !== undefined) validateAbortSignal(signal, "options.signal");
+      if (this.locked) throw invalidState("The ReadableStream is locked");
+      if (writable.locked) throw invalidState("The WritableStream is locked");
+      // The pipe runs detached; its errors surface through the readable.
+      markHandled(
+        readableStreamPipeTo(this, writable, !!preventClose, !!preventAbort, !!preventCancel, signal),
+      );
+      return readable;
     }
 
     static from(source) {
@@ -1038,6 +1250,43 @@
     markHandled(writer._closed.promise);
   }
 
+  // node's WritableStreamDefaultWriterWrite. Shared by writer.write() and
+  // pipeTo().
+  function writerWrite(writer, chunk) {
+    const stream = writer._stream;
+    const controller = stream._controller;
+    const chunkSize = writableGetChunkSize(controller, chunk);
+    const state = stream._state;
+    if (state === "errored") return Promise.reject(stream._storedError);
+    if (writableCloseQueuedOrInFlight(stream) || state === "closed") {
+      return Promise.reject(invalidState("WritableStream is closed"));
+    }
+    if (state === "erroring") return Promise.reject(stream._storedError);
+    const request = deferred();
+    stream._writeRequests.push(request);
+    writableControllerWrite(controller, chunk, chunkSize);
+    return request.promise;
+  }
+
+  // node's WritableStreamDefaultWriterRelease.
+  function writerRelease(writer) {
+    const released = writerReleasedError();
+    writerEnsureReadyPromiseRejected(writer, released);
+    writerEnsureClosedPromiseRejected(writer, released);
+    writer._stream._writer = undefined;
+    writer._stream = undefined;
+  }
+
+  // node's WritableStreamDefaultWriterCloseWithErrorPropagation: what a
+  // pipe does when its source closes.
+  function writerCloseWithErrorPropagation(writer) {
+    const stream = writer._stream;
+    const state = stream._state;
+    if (writableCloseQueuedOrInFlight(stream) || state === "closed") return Promise.resolve();
+    if (state === "errored") return Promise.reject(stream._storedError);
+    return writableClose(stream);
+  }
+
   class WritableStreamDefaultWriter {
     constructor(stream) {
       if (stream._writer !== undefined) throw invalidState("WritableStream is locked");
@@ -1094,18 +1343,7 @@
       if (stream === undefined) {
         return Promise.reject(invalidState("Writer is not bound to a WritableStream"));
       }
-      const controller = stream._controller;
-      const chunkSize = writableGetChunkSize(controller, chunk);
-      const state = stream._state;
-      if (state === "errored") return Promise.reject(stream._storedError);
-      if (writableCloseQueuedOrInFlight(stream) || state === "closed") {
-        return Promise.reject(invalidState("WritableStream is closed"));
-      }
-      if (state === "erroring") return Promise.reject(stream._storedError);
-      const request = deferred();
-      stream._writeRequests.push(request);
-      writableControllerWrite(controller, chunk, chunkSize);
-      return request.promise;
+      return writerWrite(this, chunk);
     }
 
     close() {
@@ -1128,13 +1366,8 @@
     }
 
     releaseLock() {
-      const stream = this._stream;
-      if (stream === undefined) return;
-      const released = writerReleasedError();
-      writerEnsureReadyPromiseRejected(this, released);
-      writerEnsureClosedPromiseRejected(this, released);
-      stream._writer = undefined;
-      this._stream = undefined;
+      if (this._stream === undefined) return;
+      writerRelease(this);
     }
   }
 
