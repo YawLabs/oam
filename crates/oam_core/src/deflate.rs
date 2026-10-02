@@ -5,10 +5,19 @@
 //! encoders (which served node:zlib until `params()` landed) wrap the same
 //! compressor but keep it private, and their miniz backend has no
 //! `set_level`; miniz itself supports a level change after compression has
-//! started (`CompressorOxide::set_compression_level_raw`). The bytes are the
-//! ones flate2 wrote: the zlib wrapper is miniz's own, and the gzip header
-//! and trailer are written here as flate2's `GzEncoder` writes them (a unit
-//! test holds the two byte-for-byte).
+//! started (`CompressorOxide::set_compression_level_raw`). The deflate data
+//! is the one flate2 wrote, and the gzip header and trailer are written here
+//! as flate2's `GzEncoder` writes them (a unit test holds the two
+//! byte-for-byte).
+//!
+//! The zlib wrapper is written here too, as zlib writes it, not miniz's.
+//! miniz's header follows its own idea of the level: at level 0 it declares
+//! a 256-byte window (`08 1d`, CINFO 0), which held for a stream of stored
+//! blocks; once `params()` raises the level mid-stream the data copies from
+//! up to 32 KiB back, and an inflater that sizes its window from the header
+//! (node's, given any options object) fails it with "invalid distance too
+//! far back". zlib always declares the 32 KiB window, with FLEVEL from the
+//! level the stream starts at: `78 01`, `78 5e`, `78 9c` or `78 da`.
 //!
 //! The `dictionary` option: zlib's `deflateSetDictionary` fills the window
 //! with the dictionary before the first input byte, so the data can copy
@@ -40,9 +49,9 @@ const Z_FINISH: i32 = 4;
 
 /// What follows the raw deflate data, computed here as the data goes by.
 enum Trailer {
-    /// Raw deflate, or a zlib stream whose wrapper miniz writes itself.
+    /// Raw deflate.
     None,
-    /// A zlib stream with a dictionary: the Adler-32 of the data so far.
+    /// A zlib stream: the Adler-32 of the data so far.
     Adler(u32),
     /// A gzip member: the CRC-32 and length of the data so far.
     Gzip(Crc),
@@ -80,22 +89,25 @@ impl NodeDeflate {
         let level = miniz_level(level);
         let dictionary = dictionary.filter(|d| !d.is_empty() && format != Format::Gzip);
         let mut pending = Vec::new();
-        let (data_format, trailer) = match (format, dictionary) {
-            (Format::Deflate, None) => (DataFormat::Zlib, Trailer::None),
-            (Format::Deflate, Some(dictionary)) => {
-                pending.extend_from_slice(&dict_zlib_header(level));
-                pending
-                    .extend_from_slice(&miniz_oxide::mz_adler32_oxide(1, dictionary).to_be_bytes());
-                (DataFormat::Raw, Trailer::Adler(1))
+        // The core always writes raw deflate; the wrappers are written here.
+        let trailer = match format {
+            Format::Deflate => {
+                pending.extend_from_slice(&zlib_header(level, dictionary.is_some()));
+                if let Some(dictionary) = dictionary {
+                    pending.extend_from_slice(
+                        &miniz_oxide::mz_adler32_oxide(1, dictionary).to_be_bytes(),
+                    );
+                }
+                Trailer::Adler(1)
             }
-            (Format::DeflateRaw, _) => (DataFormat::Raw, Trailer::None),
-            (Format::Gzip, _) => {
+            Format::DeflateRaw => Trailer::None,
+            Format::Gzip => {
                 pending.extend_from_slice(&gzip_header(level));
-                (DataFormat::Raw, Trailer::Gzip(Crc::new()))
+                Trailer::Gzip(Crc::new())
             }
         };
         let mut core = Box::<CompressorOxide>::default();
-        core.set_format_and_level(data_format, level);
+        core.set_format_and_level(DataFormat::Raw, level);
         if let Some(dictionary) = dictionary {
             prime(
                 &mut core,
@@ -233,24 +245,24 @@ fn gzip_header(level: u8) -> [u8; 10] {
     [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, xfl, 255]
 }
 
-/// zlib's header for a stream with a preset dictionary, as deflate.c writes
-/// it for node: CMF for a 32 KiB window, FLEVEL from the level (zlib's
-/// default strategy), FDICT, then FCHECK.
-fn dict_zlib_header(level: u8) -> [u8; 2] {
+/// zlib's stream header, as deflate.c writes it for node: CMF for a 32 KiB
+/// window, FLEVEL from the level the stream starts at (zlib's default
+/// strategy), FDICT when there is a preset dictionary, then FCHECK.
+fn zlib_header(level: u8, fdict: bool) -> [u8; 2] {
     let flevel: u16 = match level {
         0 | 1 => 0,
         2..=5 => 1,
         7..=9 => 3,
         _ => 2,
     };
-    let mut header: u16 = 0x7800 | flevel << 6 | 0x20;
+    let mut header: u16 = 0x7800 | flevel << 6 | if fdict { 0x20 } else { 0 };
     header += 31 - header % 31;
     header.to_be_bytes()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{NodeDeflate, dict_zlib_header, miniz_level};
+    use super::{NodeDeflate, miniz_level, zlib_header};
     use crate::inflate::{NodeInflate, Wrap};
     use crate::zlib::Format;
     use std::io::Write;
@@ -339,7 +351,12 @@ mod tests {
         for data in samples() {
             for format in [Format::Gzip, Format::Deflate, Format::DeflateRaw] {
                 for level in -1..=9 {
-                    let want = flate2_bytes(format, level, &data, data.len());
+                    let mut want = flate2_bytes(format, level, &data, data.len());
+                    // The zlib header is zlib's, not miniz's (which flate2
+                    // writes); the data and the Adler-32 are the same.
+                    if format == Format::Deflate {
+                        want[..2].copy_from_slice(&zlib_header(miniz_level(level), false));
+                    }
                     let whole = NodeDeflate::new(format, level, None).finish_vec(&data);
                     assert_eq!(whole, want, "{format:?} level {level} len {}", data.len());
                     // Written in pieces, as a stream is.
@@ -451,11 +468,53 @@ mod tests {
             (9, 0xf9),
         ] {
             assert_eq!(
-                dict_zlib_header(miniz_level(level)),
+                zlib_header(miniz_level(level), true),
                 [0x78, flg],
                 "level {level}"
             );
         }
+        // node v22.22.2's deflateSync('abc', { level }), and the stream's
+        // first two bytes.
+        for (level, flg) in [
+            (-1, 0x9c),
+            (0, 0x01),
+            (1, 0x01),
+            (2, 0x5e),
+            (3, 0x5e),
+            (4, 0x5e),
+            (5, 0x5e),
+            (6, 0x9c),
+            (7, 0xda),
+            (8, 0xda),
+            (9, 0xda),
+        ] {
+            assert_eq!(
+                zlib_header(miniz_level(level), false),
+                [0x78, flg],
+                "level {level}"
+            );
+            let out = NodeDeflate::new(Format::Deflate, level, None).finish_vec(b"abc");
+            assert_eq!(out[..2], [0x78, flg], "stream at level {level}");
+        }
+    }
+
+    #[test]
+    fn a_stream_raised_from_level_0_declares_the_32_kib_window_it_uses() {
+        // node v22.22.2: createDeflate({ level: 0 }), params(6), then 100 KB
+        // that repeats every 1000 bytes; the header is the level-0 one, 78 01
+        // (CINFO 7, a 32 KiB window). miniz's own level-0 header, 08 1d
+        // (CINFO 0, 256 bytes), made node's inflateSync(out, {}) fail
+        // "invalid distance too far back" on the copies params() allows.
+        let unit: Vec<u8> = (0..1000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let data: Vec<u8> = unit.iter().cycle().take(100_000).copied().collect();
+        let mut enc = NodeDeflate::new(Format::Deflate, 0, None);
+        let mut out = enc.params(Some(6));
+        out.extend(enc.finish_vec(&data));
+        assert_eq!(out[..2], [0x78, 0x01]);
+        // CINFO is the window's log2 less 8: every copy fits in it.
+        assert_eq!(out[0] >> 4, 7);
+        assert!(out.len() < data.len() / 10, "compressed: {}", out.len());
+        assert_eq!(inflate(Wrap::Zlib, None, &out), data);
     }
 
     #[test]

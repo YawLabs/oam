@@ -9,10 +9,15 @@
 //
 // Regression guard: oam's zlib streams had no params(), so
 // `deflate.params(9, 0, cb)` was a TypeError, and its deflaters (flate2's
-// encoders) could not change level once started.
+// encoders) could not change level once started. Then a Deflate stream that
+// started at level 0 carried miniz's level-0 header, 08 1d, which declares a
+// 256-byte window; raised by params(), its copies reached 32 KiB back, and
+// node's inflateSync(out, {}) -- any options object sizes the window from
+// the header -- failed it with "invalid distance too far back".
 //
-// Prints validation errors, callback order, round trips, and only coarse
-// sizes (stored or compressed): the compressed bytes are miniz's, not zlib's.
+// Prints validation errors, callback order, round trips, the zlib header,
+// and only coarse sizes (stored or compressed): the compressed bytes are
+// miniz's, not zlib's.
 import zlib from "node:zlib";
 
 const describe = (e) => `${e.constructor.name} ${e.code} ${JSON.stringify(e.message)}`;
@@ -103,4 +108,28 @@ await new Promise((resolve) => {
     stream.resume();
     stream.on("end", resolve);
   });
+});
+
+// The zlib header is zlib's: a 32 KiB window, FLEVEL from the level the
+// stream starts at -- a level-0 stream raised by params() included.
+for (let level = -1; level <= 9; level++) {
+  console.log(`header level ${level}: ${zlib.deflateSync("abc", { level }).subarray(0, 2).toString("hex")}`);
+}
+await new Promise((resolve) => {
+  const unit = Buffer.alloc(1000);
+  for (let i = 0; i < unit.length; i++) unit[i] = (i * 7) % 251;
+  const data = Buffer.concat(Array(100).fill(unit));
+  const stream = zlib.createDeflate({ level: 0 });
+  const out = [];
+  stream.on("data", (c) => out.push(c));
+  stream.on("end", () => {
+    const all = Buffer.concat(out);
+    console.log(`0 -> 6 header: ${all.subarray(0, 2).toString("hex")}, compressed: ${all.length < data.length / 10}`);
+    attempt("0 -> 6 inflateSync(out)", () => zlib.inflateSync(all).equals(data));
+    attempt("0 -> 6 inflateSync(out, {})", () => zlib.inflateSync(all, {}).equals(data));
+    attempt("0 -> 6 inflateSync(out, { windowBits: 0 })", () => zlib.inflateSync(all, { windowBits: 0 }).equals(data));
+    resolve();
+  });
+  // Written from the callback: node applies the level only then.
+  stream.params(6, 0, () => stream.end(data));
 });
