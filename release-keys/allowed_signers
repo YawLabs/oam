@@ -1,0 +1,24 @@
+# oam release keys -- the PUBLIC halves only (ssh-keygen allowed_signers format).
+#
+# Every oam release from the first signed one on carries RELEASE-MANIFEST and
+# RELEASE-MANIFEST.sig; this file names the keys allowed to have made that
+# signature. Read by scripts/lib/signing.sh (release_verify_manifest), and the
+# source of the key set the installers and `oam self-update` will embed.
+#
+# One line per key:
+#
+#   oam-release-<id> namespaces="oam-release" ssh-ed25519 <base64> [comment]
+#
+#   - the principal is exactly "oam-release-<id>"; <id> is the name its line in
+#     ./ranges uses (k1, k2, ...)
+#   - namespaces="oam-release" is required: it stops a signature this key made
+#     for anything else from verifying as a release
+#   - ssh-ed25519 (or sk-ssh-ed25519@openssh.com for a hardware key)
+#
+# EMPTY ON PURPOSE until the keys are generated (README.md, "Generating the
+# keys"). While no key line exists, releases skip the manifest with a loud
+# warning (fatal under OAM_SIGN_REQUIRED=1). Once ANY key line is committed,
+# every release must sign; there is no knob that skips it.
+#
+# Never remove a key line to retire a key: old tags it signed must keep
+# verifying. Close its range in ./ranges instead.
