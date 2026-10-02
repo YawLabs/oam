@@ -27,10 +27,12 @@
 #           returns, so "#OAM-RT0001" and "#OAM-TS" are both this one page.
 #
 #   [hosts] Hosts that appear for some reason other than pointing a reader
-#           at documentation: API endpoint defaults, registry URLs in
-#           lockfile fixtures, parser scaffolds, and the reserved example
-#           names. Host-level, because adding one more example.com literal
-#           to a URL-parsing test is not a decision worth a review cycle.
+#           at oam's documentation: API endpoint defaults, registry URLs in
+#           lockfile fixtures, parser scaffolds, node's own messages that
+#           oam reproduces word for word (they point at node's docs, which
+#           oam does not publish), and the reserved example names.
+#           Host-level, because adding one more example.com literal to a
+#           URL-parsing test is not a decision worth a review cycle.
 #
 # Both are checked in both directions: an entry that no longer occurs in the
 # sources fails too, so this file cannot rot into a list of URLs the code
@@ -53,6 +55,7 @@ example.invalid      # reserved example name (RFC 2606), in the install fixtures
 example.org          # reserved example name (RFC 2606), in the bench URL corpus
 example.test         # reserved example name (RFC 2606), in oam_core websocket.rs unit tests; never dialled
 localhost            # the bench URL corpus
+nodejs.org           # js/node_compat.js: node's own mkdtemp "templates ending with X" warning, reproduced word for word; a page node publishes, not oam
 registry.npmjs.org   # the `resolved` field of lockfile fixtures; never fetched
 x                    # oam_engine node_ops: a throwaway base for ada_url::Url::parse, never fetched
 127.0.0.1            # loopback, in the bench and MCP fixtures
