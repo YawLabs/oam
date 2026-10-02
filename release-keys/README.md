@@ -21,8 +21,8 @@ sign. Nothing secret is ever committed here.
 | `ranges` | One line per key that may sign: `<id> <from-tag> <to-tag or ->`, both ends inclusive |
 
 `scripts/lib/signing.sh` implements signing and verification. It checks both
-files' format before it trusts them. The installers and `oam self-update` will
-embed copies of both files; that work is a later step of the signing plan.
+files' format before it trusts them. `oam self-update` compiles in copies of
+these files and checks every release it installs against them.
 
 ## Current keys
 

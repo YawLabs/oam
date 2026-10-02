@@ -6,6 +6,8 @@
 //! All failures render from ODIF diagnostics: `--json` emits the JSONL
 //! source of truth, the pretty printer is a renderer over the same data.
 
+mod self_update;
+
 use clap::{Parser, Subcommand};
 use oam_diagnostics::{Diagnostic, Origin, Severity};
 use oam_loader::SourceKind;
@@ -178,14 +180,21 @@ enum Command {
         #[command(subcommand)]
         action: CacheAction,
     },
-    /// Update oam in place to the latest release by running the canonical
-    /// oamjs.org installer (verifies via the published SHA256SUMS). Updates the
-    /// currently-running binary's location.
+    /// Update oam in place to the latest release. The release's signed
+    /// RELEASE-MANIFEST is verified against the release keys compiled into
+    /// this binary (tags before v0.18.0: a pinned SHA256SUMS digest), then the
+    /// binary is checked against it and replaces the running one. Any failure
+    /// leaves the installed oam as it was; no flag skips a check.
+    /// OAM_INSTALL_DIR updates `<dir>/oam` instead; OAM_SELF_UPDATE_URL (or,
+    /// when unset, OAM_INSTALL_BASE) fetches the release's files from another
+    /// base (with --version), and they must still carry a valid signature.
     SelfUpdate {
-        /// Install a specific tag (e.g. v0.7.0) instead of the latest.
+        /// Install a specific tag (e.g. v0.18.0) instead of the latest. An
+        /// older tag is allowed only when named here.
         #[arg(long, value_name = "TAG")]
         version: Option<String>,
-        /// Print the installer command that would run, without executing it.
+        /// Verify the release and print what would be installed, without
+        /// downloading the binary or changing anything.
         #[arg(long)]
         dry_run: bool,
     },
@@ -813,7 +822,7 @@ fn dispatch(cli: Cli) -> ExitCode {
         } => compile_command(entry, output, carrier.as_deref()),
         Command::Cache { action } => cache_command(action, cli.json),
         Command::SelfUpdate { version, dry_run } => {
-            self_update_command(version.as_deref(), *dry_run)
+            self_update::command(version.as_deref(), *dry_run)
         }
         Command::DaemonServe { tsconfig } => match oam_ts::daemon::serve(tsconfig) {
             Ok(()) => ExitCode::SUCCESS,
@@ -822,94 +831,6 @@ fn dispatch(cli: Cli) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-    }
-}
-
-/// Build the platform installer invocation for `oam self-update`. Pure (no I/O)
-/// so the per-platform command shape is unit-testable. `url` is the installer
-/// script URL; the installer itself does the download + checksum-verify +
-/// cross-platform self-replace (see install/), so no network code lives here.
-fn build_self_update_cmd(is_windows: bool, url: &str) -> (&'static str, Vec<String>) {
-    if is_windows {
-        (
-            "powershell",
-            vec![
-                "-NoProfile".into(),
-                "-ExecutionPolicy".into(),
-                "Bypass".into(),
-                "-Command".into(),
-                format!("irm {url} | iex"),
-            ],
-        )
-    } else {
-        ("sh", vec!["-c".into(), format!("curl -fsSL {url} | sh")])
-    }
-}
-
-/// `oam self-update`: re-run the canonical oamjs.org installer to replace the
-/// running binary in place. Delegating keeps ONE source of download +
-/// checksum-verify + running-exe-replace logic. We point the installer at the
-/// CURRENT binary's directory (via OAM_INSTALL_DIR) so it updates oam where it
-/// actually lives, and pass through a pinned --version as OAM_VERSION.
-fn self_update_command(version: Option<&str>, dry_run: bool) -> ExitCode {
-    // Update the binary where it currently lives, unless the user pinned a dir.
-    let install_dir = match std::env::var_os("OAM_INSTALL_DIR") {
-        Some(d) => PathBuf::from(d),
-        None => match std::env::current_exe()
-            .ok()
-            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        {
-            Some(dir) => dir,
-            None => {
-                eprintln!("oam self-update: cannot resolve the current binary location");
-                return ExitCode::FAILURE;
-            }
-        },
-    };
-
-    // oamjs.org is the canonical home; it serves both installers as
-    // text/plain, which is what makes `| sh` and `| iex` work.
-    let default_url = if cfg!(target_os = "windows") {
-        "https://oamjs.org/install.ps1"
-    } else {
-        "https://oamjs.org/install.sh"
-    };
-    let url = std::env::var("OAM_SELF_UPDATE_URL").unwrap_or_else(|_| default_url.to_string());
-    let (program, args) = build_self_update_cmd(cfg!(target_os = "windows"), &url);
-
-    println!(
-        "oam self-update: current version {}",
-        env!("CARGO_PKG_VERSION")
-    );
-    println!("oam self-update: updating oam in {}", install_dir.display());
-    match version {
-        Some(v) => println!("oam self-update: pinning to {v}"),
-        None => println!("oam self-update: targeting the latest release"),
-    }
-
-    if dry_run {
-        println!(
-            "oam self-update: (dry-run) would run: {program} {}",
-            args.join(" ")
-        );
-        return ExitCode::SUCCESS;
-    }
-
-    let mut cmd = std::process::Command::new(program);
-    cmd.args(&args).env("OAM_INSTALL_DIR", &install_dir);
-    if let Some(v) = version {
-        cmd.env("OAM_VERSION", v);
-    }
-    match cmd.status() {
-        Ok(s) if s.success() => ExitCode::SUCCESS,
-        Ok(s) => {
-            eprintln!("oam self-update: installer exited with {s}");
-            ExitCode::FAILURE
-        }
-        Err(e) => {
-            eprintln!("oam self-update: failed to launch installer ({program}): {e}");
-            ExitCode::FAILURE
-        }
     }
 }
 
@@ -3460,26 +3381,7 @@ fn cache_command(action: &CacheAction, json: bool) -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_self_update_cmd, resolve_inspect};
-
-    #[test]
-    fn self_update_cmd_unix_pipes_installer_to_sh() {
-        let (prog, args) = build_self_update_cmd(false, "https://oamjs.org/install.sh");
-        assert_eq!(prog, "sh");
-        assert_eq!(args[0], "-c");
-        assert_eq!(args[1], "curl -fsSL https://oamjs.org/install.sh | sh");
-    }
-
-    #[test]
-    fn self_update_cmd_windows_pipes_installer_to_iex() {
-        let (prog, args) = build_self_update_cmd(true, "https://oamjs.org/install.ps1");
-        assert_eq!(prog, "powershell");
-        assert_eq!(
-            args.last().unwrap(),
-            "irm https://oamjs.org/install.ps1 | iex"
-        );
-        assert!(args.contains(&"-NoProfile".to_string()));
-    }
+    use super::resolve_inspect;
 
     #[test]
     fn inspect_bare_port_binds_127_0_0_1() {

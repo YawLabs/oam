@@ -408,7 +408,9 @@ fn read_lockfile(path: &Path) -> Result<Lockfile, Vec<Diagnostic>> {
 
 // ── HTTP client ─────────────────────────────────────────────────────────
 
-fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
+/// The HTTPS client `oam install` fetches with, and `oam self-update` too
+/// (crates/oam_cli/src/self_update.rs): one TLS setup, one user agent.
+pub fn build_http_client() -> Result<reqwest::Client, reqwest::Error> {
     http_client_builder().build()
 }
 

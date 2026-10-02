@@ -64,7 +64,8 @@ irm https://oamjs.org/install.ps1 | iex            # Windows
 
 Both installers pick the binary for your OS/arch, verify it against the published
 `SHA256SUMS`, and install per-user (`~/.oam/bin`, `%LOCALAPPDATA%\oam\bin`) — no sudo, no
-admin. Binaries are unsigned and checksummed. `oam self-update` re-runs the same installer.
+admin. Binaries are unsigned and checksummed. `oam self-update` updates in place and also
+checks the release's signed manifest (`release-keys/`).
 
 Knobs:
 `OAM_VERSION` pins a tag, `OAM_INSTALL_DIR` moves the target directory, `OAM_GH_API` points

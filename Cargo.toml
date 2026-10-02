@@ -38,10 +38,11 @@ thiserror = "2"
 # io-util: AsyncReadExt/AsyncWriteExt for the streaming file ops.
 # net/sync/macros: the HTTP server (TcpListener, channels, select!).
 tokio = { version = "1", features = ["rt-multi-thread", "time", "fs", "io-util", "io-std", "net", "sync", "macros", "process", "signal"] }
-# reqwest is oam_loader's `oam install` client only: `fetch` and
-# `http.request` left it in #143 for oam's own transport (oam_core
-# http_client), which decodes response bodies itself. It stays in the build,
-# and in process.versions, because the installer links it.
+# reqwest is the client of `oam install` (oam_loader) and `oam self-update`
+# (oam_cli, through oam_loader's builder) only: `fetch` and `http.request`
+# left it in #143 for oam's own transport (oam_core http_client), which
+# decodes response bodies itself. It stays in the build, and in
+# process.versions, because those two link it.
 # rustls-no-provider + explicit ring: reqwest's default rustls provider is
 # aws-lc-rs, whose C build (aws-lc-sys) fails under MSVC on ARM64. ring
 # compiles clean on every tier-1 target (same choice Deno ships).
@@ -97,6 +98,12 @@ hkdf = "0.12"
 # to a direct dep adds zero new compilation units.
 ring = "0.17"
 base64 = "0.22"
+# `oam self-update`: SSHSIG verification of a release's RELEASE-MANIFEST.sig
+# (crates/oam_cli/src/self_update.rs). RustCrypto's SSH key/sshsig codec, not
+# a hand-written parser of an attacker-supplied binary format. Only the
+# ed25519 verifier: release keys are ssh-ed25519 (or sk-ssh-ed25519) by
+# release-keys/README.md, so no ecdsa/rsa/dsa/encrypted-key code is linked.
+ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519"] }
 # node:crypto wave 4: RSA encrypt/decrypt (publicEncrypt, privateDecrypt).
 # ring deliberately omits RSA encryption; the rsa crate (pure Rust) fills
 # the gap. rand_core provides OsRng for the encrypt padding randomness.

@@ -39,8 +39,6 @@
 # oam.sh and 0am.sh are rejected outright and CANNOT be listed here.
 
 [urls]
-https://oamjs.org/install.sh      # `oam self-update` on Linux and macOS: the command it runs, echoed before it runs
-https://oamjs.org/install.ps1     # `oam self-update` on Windows: the command it runs, echoed before it runs
 https://oamjs.org/docs/inspector  # stderr on every --inspect / --inspect-brk run, the line after "Debugger listening on"
 https://oamjs.org/docs/errors     # the ODIF `docs` field on every diagnostic, anchored at the code
 https://oamjs.org/docs/odif       # the ODIF envelope spec, cited by the oam_diagnostics module docs
@@ -52,6 +50,7 @@ example.com          # reserved example name (RFC 2606), in fixtures and unit te
 example.invalid      # reserved example name (RFC 2606), in the install fixtures
 example.org          # reserved example name (RFC 2606), in the bench URL corpus
 example.test         # reserved example name (RFC 2606), in oam_core websocket.rs unit tests; never dialled
+github.com           # oam_cli self_update: the release files `oam self-update` fetches (github.com/YawLabs/oam/releases)
 localhost            # the bench URL corpus
 registry.npmjs.org   # the `resolved` field of lockfile fixtures; never fetched
 x                    # oam_engine node_ops: a throwaway base for ada_url::Url::parse, never fetched
