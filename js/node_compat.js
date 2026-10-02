@@ -23490,9 +23490,10 @@
             return;
           }
           // Finished in the call: node's shutdown still completes from the
-          // loop -- libuv reports the request on its next turn -- so
+          // loop -- libuv reports the request in its pending phase -- so
           // 'finish' comes after every tick and microtask queued meanwhile
-          // and before any immediate (measured on v22.22.2). Emitted from a
+          // and after the rest of the timer or immediate phase end() was
+          // called in (measured on v22.22.2; timerPending). Emitted from a
           // microtask instead, it ran ahead of the ticks the caller queued
           // after end() -- and of their resetAndDestroy(), which node
           // refuses with EINVAL in that window.

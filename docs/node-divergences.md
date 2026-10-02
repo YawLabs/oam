@@ -2309,10 +2309,15 @@ the socket and before its shutdown callback (`'finish'`) has run.
   -- and emits `'close'` with `true`.
 - **Where the window opens and closes.** oam's end() hands the FIN to the socket in the same
   turn when no write is still queued (#156), and, as Node's, reports it from the loop:
-  `'finish'` comes after every tick and microtask queued meanwhile and before any immediate,
-  so `socket.end(); process.nextTick(() => socket.resetAndDestroy())` is refused with EINVAL
-  on both (`conformance/cases/264-net-finish-after-ticks.mjs`; up to 0.17.1 oam emitted
-  `'finish'` from a microtask and reset the socket there). Measured on Windows, where Node's
+  `'finish'` comes after every tick and microtask queued meanwhile, in libuv's pending phase:
+  called from the main script, a tick, a microtask or an I/O callback, before any timer or
+  immediate; called from a timer, after the other timers due in that timers phase and before
+  any immediate; called from an immediate, after the other immediates queued before that
+  check phase began and the timers due once they are done. So `socket.end();
+  process.nextTick(() => socket.resetAndDestroy())`, and a `resetAndDestroy()` in a sibling
+  timer or immediate of the `end()`, are refused with EINVAL on both
+  (`conformance/cases/264-net-finish-after-ticks.mjs`; up to 0.17.1 oam emitted `'finish'`
+  from a microtask and reset the socket there). Measured on Windows, where Node's
   writes complete in the call and every `end()` on a connected socket opens the window at
   once, as oam's does (`write(); end(); resetAndDestroy()` is EINVAL on both). On Linux and
   macOS Node defers the shutdown behind a write that has not called back yet, where oam has
