@@ -17,7 +17,10 @@
 // input check threw for null and undefined in the callback forms, which node
 // runs on empty input (its engine's end() writes nothing for either), and a
 // brotli stream that stopped short failed with a plain Error, not node's
-// Z_BUF_ERROR "unexpected end of file".
+// Z_BUF_ERROR "unexpected end of file". And node's DeflateRaw turns the
+// caller's windowBits 8 into 9, which oam left at 8; and a class called
+// without new (zlib.Deflate(opts)) wrote handle state onto its `this` -- the
+// zlib module object -- where node returns a new stream.
 //
 // Prints error class, code and message, and never a compressed byte.
 import zlib from "node:zlib";
@@ -73,8 +76,16 @@ for (let i = 0; i < keys.length; i++) {
 
 // Every way in: the factories, the .call(this) path, the one-shot forms.
 attempt("createGzip level 10", () => zlib.createGzip({ level: 10 }));
-attempt("Inflate.call chunkSize 1", () => zlib.Inflate.call({}, { chunkSize: 1 }));
-attempt("Inflate.call level -2", () => zlib.Inflate.call({}, { level: -2 }));
+// .call(this) on an instance (a subclass, pngjs's pattern); on anything
+// else, and without new, node constructs a new stream.
+const inherited = () => Object.create(zlib.Inflate.prototype);
+attempt("Inflate.call chunkSize 1", () => zlib.Inflate.call(inherited(), { chunkSize: 1 }));
+attempt("Inflate.call level -2", () => zlib.Inflate.call(inherited(), { level: -2 }));
+attempt("Inflate.call({})", () => zlib.Inflate.call({}, {}));
+for (const name of [...classes, "BrotliCompress", "BrotliDecompress"]) {
+  const made = zlib[name]({});
+  console.log(`${name}() without new: ${made.constructor.name} ${made instanceof zlib[name]} ${typeof made.pipe}`);
+}
 attempt("deflateSync level 99", () => zlib.deflateSync("x", { level: 99 }));
 attempt("gzipSync windowBits 8", () => zlib.gzipSync("x", { windowBits: 8 }));
 attempt("deflateRawSync windowBits 8", () => zlib.deflateRawSync("x", { windowBits: 8 }));
@@ -82,6 +93,26 @@ attempt("inflateSync memLevel 0", () => zlib.inflateSync(zlib.deflateSync("x"), 
 attempt("unzipSync strategy 5", () => zlib.unzipSync(zlib.gzipSync("x"), { strategy: 5 }));
 attempt("deflate level 99", () => zlib.deflate("x", { level: 99 }, () => {}));
 attempt("gunzip chunkSize 63", () => zlib.gunzip(zlib.gzipSync("x"), { chunkSize: 63 }, () => {}));
+
+// node's DeflateRaw turns windowBits 8 into 9 in the caller's object before
+// any check, in every form; no other class touches it.
+for (const [label, fn] of [
+  ["new DeflateRaw", (o) => new zlib.DeflateRaw(o)],
+  ["DeflateRaw()", (o) => zlib.DeflateRaw(o)],
+  ["createDeflateRaw", (o) => zlib.createDeflateRaw(o)],
+  ["deflateRawSync", (o) => zlib.deflateRawSync("x", o)],
+  ["deflateRaw", (o) => zlib.deflateRaw("x", o, () => {})],
+  ["new Deflate", (o) => new zlib.Deflate(o)],
+  ["new InflateRaw", (o) => new zlib.InflateRaw(o)],
+  ["new Gzip", (o) => new zlib.Gzip(o)],
+]) {
+  const options = { windowBits: 8 };
+  attempt(`${label} windowBits 8`, () => fn(options));
+  console.log(`  then windowBits ${options.windowBits}`);
+}
+const raw8 = { windowBits: 8, level: 99 };
+attempt("DeflateRaw windowBits 8 level 99", () => new zlib.DeflateRaw(raw8));
+console.log(`  then windowBits ${raw8.windowBits}`);
 
 // Options before input; the input's name and types per form.
 attempt("deflateSync 5 level 99", () => zlib.deflateSync(5, { level: 99 }));

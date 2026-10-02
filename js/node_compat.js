@@ -18578,6 +18578,12 @@
         checkBrotliParams(options, compress);
         flushMax = BROTLI_OPERATION_EMIT_METADATA;
       } else {
+        // node's DeflateRaw constructor turns a windowBits of 8 into 9 in
+        // the caller's object before anything else (zlib's raw deflater has
+        // no 256-byte window), so every DeflateRaw form leaves 9 there.
+        if (compress && format === "deflateRaw" && options.windowBits === 8) {
+          options.windowBits = 9;
+        }
         // On the inflate side (INFLATE, GUNZIP, UNZIP; not INFLATERAW) a
         // windowBits of 0, null or none reads the window size from the
         // stream; a gzip deflater needs 9 or more.
@@ -19015,6 +19021,11 @@
       function ZlibClass(options) {
         // `new zlib.Inflate(opts)` -> a real streaming Transform instance.
         if (new.target) return Reflect.construct(Stream, [options], new.target);
+        // `zlib.Inflate(opts)` without `new` -> a new stream, as node's
+        // constructors answer a `this` that is not one of theirs (it was
+        // the sync-handle state written onto whatever `this` was, the zlib
+        // module object for `zlib.Inflate(opts)`).
+        if (!(this instanceof ZlibClass)) return new ZlibClass(options);
         // `zlib.Inflate.call(this, opts)` -> sync-handle state for inheritance.
         return initSyncHandleState(this, format, compress, mode, options);
       }
