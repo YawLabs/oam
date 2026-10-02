@@ -13,8 +13,11 @@
 # -- patching on top of a manifest that does not verify would launder whatever
 # made it fail under a fresh, valid signature -- and regenerated, re-signed and
 # re-verified after. That needs the release key (OAM_RELEASE_SIGNING_KEY), so
-# its passphrase is asked for up front, before the build. A pre-signing
-# release (no manifest) is patched exactly as before, with a warning.
+# its passphrase is asked for up front, before the build. The trust root for
+# all of it is release-keys/ as committed on origin/main, NOT the tag's own
+# copy: see "trust root" below. A release with no manifest is patched as
+# before, with a warning -- but only if its tag predates every key range; a
+# tag from the signing era with no manifest has lost it, and is refused.
 #
 # Usage (from the repo root, with HEAD on the tag and the release already cut):
 #   scripts/release-upload-local-arm64.sh v0.6.1
@@ -35,9 +38,11 @@ cd "$SCRIPT_DIR/.."
 # ONE EXIT trap: the scratch dir (created after the build) and the private
 # signing agent (started before it) both go on every exit, Ctrl-C included.
 tmp=""
+trust_dir=""
 cleanup() {
   release_agent_stop
   if [ -n "$tmp" ]; then rm -rf "$tmp"; fi
+  if [ -n "$trust_dir" ]; then rm -rf "$trust_dir"; fi
 }
 trap cleanup EXIT
 
@@ -81,6 +86,27 @@ fi
 gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 \
   || { echo "error: release ${TAG} does not exist on ${REPO} -- cut it first with scripts/release-local.sh ${TAG}" >&2; exit 1; }
 
+# The trust root: release-keys/ as committed on origin/main right now. This
+# script stands on the TAG's commit (checked above), and that tree's
+# release-keys/ is frozen at the tag: a key whose range was closed since (the
+# README's compromise step 1) would still verify there, and a key rotated in
+# since would not. Verifying an attacker's v0.18.5 manifest, signed with a
+# key retired at v0.18.3, against v0.18.5's own ranges would pass -- and the
+# re-sign below would launder it. So the keys come from main's tip, read
+# through git's transport like the tag above: ls-remote names the commit,
+# fetch brings it, and the files are read from that exact commit (never
+# FETCH_HEAD, which a concurrent fetch in a shared checkout can move).
+if ! main_ls="$(git ls-remote origin refs/heads/main 2>/dev/null)"; then
+  echo "error: could not reach origin to read main (the signing trust root)" >&2; exit 1
+fi
+main_sha="$(printf '%s\n' "$main_ls" | awk '$2 == "refs/heads/main" {print $1; exit}')"
+[ -n "$main_sha" ] || { echo "error: origin has no main branch to read release-keys/ from" >&2; exit 1; }
+git fetch -q origin main || { echo "error: could not fetch origin/main (the signing trust root)" >&2; exit 1; }
+trust_dir="$(mktemp -d)"
+release_keys_from_commit "$main_sha" "$trust_dir" \
+  || { echo "error: could not read release-keys/ from origin/main ($main_sha) -- see above" >&2; exit 1; }
+echo "  [ok] signing trust root: release-keys/ at origin/main ${main_sha}" >&2
+
 # Signed or pre-signing? Asked of the release's asset list now, so the key's
 # passphrase prompt comes before the build rather than after it. Re-checked
 # against what the download actually returns further down.
@@ -94,15 +120,27 @@ if [ "$has_manifest" != "$has_sig" ]; then
   exit 1
 fi
 SIGNED="$has_manifest"
+sign_decision="$(release_signing_decision)"
+case "$sign_decision" in
+  fail:*) echo "error: ${sign_decision#fail:}" >&2; exit 1 ;;
+esac
 if [ "$SIGNED" = "1" ]; then
   # A signed release can only be re-signed by a committed key: no bootstrap
   # skip applies here, whatever OAM_SIGN_REQUIRED says.
-  sign_decision="$(release_signing_decision)"
   [ "$sign_decision" = "sign" ] \
-    || { echo "error: ${TAG} is signed but this checkout cannot sign (${sign_decision}) -- cannot re-sign the patched manifest" >&2; exit 1; }
+    || { echo "error: ${TAG} is signed but origin/main's release-keys/ cannot sign (${sign_decision}) -- cannot re-sign the patched manifest" >&2; exit 1; }
   release_agent_start || { echo "error: could not load the release signing key (OAM_RELEASE_SIGNING_KEY) -- see above" >&2; exit 1; }
   release_signing_preflight "$TAG" || { echo "error: signing preflight failed for ${TAG} -- see above; nothing was built or uploaded" >&2; exit 1; }
 else
+  # No manifest. Benign only for a release cut before signing existed. Asked
+  # of the committed ranges, never of the asset list alone: the asset list is
+  # exactly what an attacker with upload access controls, and deleting the
+  # pair is how a signed release would be passed off as an unsigned one --
+  # this script would then patch on top of whatever SHA256SUMS they left.
+  if [ "$sign_decision" = "sign" ] && ! release_tag_predates_signing "$TAG"; then
+    echo "error: ${TAG} is at or after the start of a release-keys/ranges window, so it was cut in the signing era, but it carries no RELEASE-MANIFEST -- the manifest pair was removed (or the release was cut unsigned). Investigate before patching anything; nothing was built or uploaded" >&2
+    exit 1
+  fi
   echo "  [warn] ${TAG} has no RELEASE-MANIFEST (a pre-signing release) -- SHA256SUMS is patched unsigned, as before" >&2
 fi
 

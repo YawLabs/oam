@@ -104,8 +104,10 @@
 #                           still runs in full -- it bumps, commits and tags, so
 #                           the dry-run builds the binaries the real release
 #                           would; only the upload is skipped. That includes
-#                           signing: a dry run makes a REAL RELEASE-MANIFEST
-#                           signature, bound to a tag that is already public.
+#                           signing: a dry run makes and verifies a REAL
+#                           RELEASE-MANIFEST signature, then deletes the .sig
+#                           on exit (release_on_exit) -- a valid signature for
+#                           a build nobody published must not lie around.
 #   OAM_RELEASE_SIGNING_KEY=<path>
 #                           the release key's PRIVATE half (passphrase-protected
 #                           ed25519, "<path>.pub" beside it). Never committed.
@@ -135,7 +137,10 @@
 #     manifest from disk, then stop the agent. Nothing may change a byte of
 #     SHA256SUMS after that;
 #   - before the draft goes live: every staged file, the manifest pair
-#     included, must be on the draft at its staged size.
+#     included, must be on the draft at its staged size;
+#   - on any exit before it went live (a dry run, a rejected build, a fail()):
+#     the staged RELEASE-MANIFEST.sig is deleted, so no valid signature for an
+#     unpublished build of $TAG outlives the run (release_on_exit).
 # Binary signing (Authenticode, Developer ID) slots in where each binary lands
 # in $RELEASE_DIR, before the SHA256SUMS step, so the manifest covers the
 # signed bytes.
@@ -301,14 +306,29 @@ assert_tree_clean() {
 . "$SCRIPT_DIR/lib/signing.sh"
 
 # ONE EXIT trap for the whole script (a second `trap ... EXIT` silently
-# replaces the first). What it owns today is the private signing agent, which
-# must not outlive the run holding the release key -- on success, on fail(),
-# and on Ctrl-C alike. Bash runs the EXIT trap for a fatal signal too, and it
-# has to: an asynchronous job of a non-interactive script ignores SIGINT, so a
-# Ctrl-C reaches this script but not the agent. Anything else that must be
-# undone on every exit goes into this function, not into a second trap.
+# replaces the first). Anything that must be undone on every exit goes into
+# this function, not into a second trap. What it owns today:
+#
+#   - the private signing agent, which must not outlive the run holding the
+#     release key. ssh-agent -D handles SIGINT/SIGHUP/SIGTERM itself and
+#     cleans up, so a Ctrl-C that reaches it is covered; but nothing stops it
+#     on a normal exit or a fail(), and Windows console Ctrl-C delivery to an
+#     MSYS background job is not something to rely on. So it is stopped here,
+#     on every exit, and a second stop is harmless.
+#   - RELEASE-MANIFEST.sig of a build that never went live. The manifest binds
+#     the tag NAME, and an unpublished tag is re-pointed freely (see the tag
+#     reconciliation below), so a valid signature for a dry run, for a build
+#     the sidecar matrix rejected, or for a run that died before publishing
+#     would verify as $TAG for whoever later found $RELEASE_DIR -- a known-bad
+#     build that every verifier accepts. Once the draft is live the signature
+#     is public anyway and stays. A draft that was uploaded but never went live
+#     carries its own copy; the fail() messages there say to delete the draft.
+RELEASE_LIVE=0
 release_on_exit() {
   release_agent_stop
+  if [ "$RELEASE_LIVE" != "1" ] && [ -n "${RELEASE_DIR:-}" ]; then
+    rm -f "$RELEASE_DIR/RELEASE-MANIFEST.sig"
+  fi
 }
 trap release_on_exit EXIT
 
@@ -985,7 +1005,7 @@ ok "LICENSE, NOTICE and THIRD_PARTY_LICENSES.md staged"
 if [ "${OAM_DRY_RUN:-0}" = "1" ]; then
   # release.yml's workflow_dispatch dry-run: build + checksum, publish nothing.
   step "DRY RUN -- skipping gh release create"
-  ok "assets staged + checksummed at $RELEASE_DIR (nothing published)"
+  ok "assets staged + checksummed at $RELEASE_DIR (nothing published; the manifest signature is deleted on exit)"
   exit 0
 fi
 
@@ -1075,6 +1095,8 @@ for staged in "$RELEASE_DIR"/*; do
 done
 ok "draft carries every staged asset at its staged size"
 gh release edit "$TAG" --repo "$REPO" --draft=false
+# From here the signature is public; release_on_exit leaves the staged copy.
+RELEASE_LIVE=1
 ok "release $TAG published: https://github.com/$REPO/releases/tag/$TAG"
 ok "staged assets kept at $RELEASE_DIR (safe to delete)"
 

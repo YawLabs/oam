@@ -2179,15 +2179,17 @@ SG="$SUITE_TMP/signing"
 mkdir -p "$SG"
 # sg <keys-dir> <command...> -- run <command> in a subshell with the lib
 # sourced, its trust root pointed at <keys-dir>, and the Windows agent-service
-# probe pointed at $SG_INBOX (default: nothing). A test must never consult the
-# operator's real agent service, let alone depend on what it holds. The
-# subshell's own EXIT trap stops any agent a failing case leaves running.
+# probes pointed at $SG_INBOX and $SG_REG (default: nothing). A test must never
+# consult the operator's real agent service or its registry store, let alone
+# depend on what they hold. The subshell's own EXIT trap stops any agent a
+# failing case leaves running.
 sg(){
   local keys="$1"; shift
   ( # shellcheck source=lib/signing.sh
     . scripts/lib/signing.sh
     RELEASE_KEYS_DIR="$keys"
     RELEASE_INBOX_SSH_ADD="${SG_INBOX:-$SG/no-such-inbox-ssh-add}"
+    RELEASE_INBOX_REG="${SG_REG:-$SG/no-such-reg}"
     trap release_agent_stop EXIT
     "$@" )
 }
@@ -2269,6 +2271,56 @@ eq "$(sg "$SG/closed" sg_in_all oam-release-k1 v0.17.9 v0.18.0 v0.19.5 v0.19.6 v
 
 it "an open range ('-') runs forever; a staged key with no range signs nothing"
 eq "$(sg "$SG/staged" sg_in_all oam-release-k1 v9.0.0 v0.17.0) $(sg "$SG/staged" sg_in oam-release-k2 v0.18.0)" "in out out"
+
+# The arm64 patch path decides "a release with no manifest is benign" from
+# this, never from the asset list alone: deleting the pair is how an attacker
+# with upload access would pass a signed release off as a pre-signing one.
+sg_pre_sig(){ if release_tag_predates_signing "$1" 2>/dev/null; then printf 'pre'; else printf 'era'; fi; }
+sg_pre_sig_all(){ local t out=""; for t in "$@"; do out="$out$(sg_pre_sig "$t") "; done; printf '%s' "${out% }"; }
+it "predates signing: only tags before EVERY range start; a gap between ranges is still the signing era"
+sg_keys "$SG/gap" "oam-release-k1 $SG_NS ssh-ed25519 $SG_K"$'\n'"oam-release-k2 $SG_NS ssh-ed25519 $SG_K"$'\n' \
+  $'k1 v0.18.0 v0.18.3\nk2 v0.18.5 -\n'
+eq "$(sg "$SG/gap" sg_pre_sig_all v0.17.9 v0.18.0 v0.18.4 v0.19.0 v0.9.99)" "pre era era era pre"
+
+it "predates signing: no range at all (bootstrap, or only a staged key) means every tag predates it"
+sg_keys "$SG/staged-only" "oam-release-k2 $SG_NS ssh-ed25519 $SG_K"$'\n' $'# no range yet\n'
+eq "$(sg "$SG_BOOT" sg_pre_sig v9.9.9) $(sg "$SG/staged-only" sg_pre_sig v9.9.9)" "pre pre"
+
+# release_keys_from_commit: the arm64 patch path reads the CURRENT trust root
+# from origin/main rather than the old tag's frozen copy. Against a real git
+# repo with two commits, so "the files at that commit" is tested, not "the
+# files on disk".
+it "release_keys_from_commit reads release-keys/ at the named commit, not the working tree"
+SG_KREPO="$SG/keys-repo"
+mkdir -p "$SG_KREPO/release-keys"
+sg_kgit(){ git -C "$SG_KREPO" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false "$@"; }
+sg_keys "$SG_KREPO/release-keys" "oam-release-k1 $SG_NS ssh-ed25519 $SG_K"$'\n' $'k1 v0.18.0 -\n'
+{ sg_kgit init -q && sg_kgit add release-keys && sg_kgit commit -qm one; } >/dev/null 2>&1
+SG_C1="$(sg_kgit rev-parse HEAD 2>/dev/null)"
+sg_keys "$SG_KREPO/release-keys" "oam-release-k1 $SG_NS ssh-ed25519 $SG_K"$'\n' $'k1 v0.18.0 v0.18.3\n'
+{ sg_kgit add release-keys && sg_kgit commit -qm two; } >/dev/null 2>&1
+SG_C2="$(sg_kgit rev-parse HEAD 2>/dev/null)"
+printf 'k1 v0.1.0 -\n' >"$SG_KREPO/release-keys/ranges"   # uncommitted: must not be read
+sg_from(){ # <commit> <out-dir>
+  mkdir -p "$2"; cd "$SG_KREPO" || return 1
+  release_keys_from_commit "$1" "$2" || return 1
+  printf 'DIR=%s RANGE=%s\n' "$RELEASE_KEYS_DIR" "$(awk '!/^#/' "$RELEASE_KEYS_DIR/ranges")"
+}
+SG_OUT="$(sg "$SG_ONE" sg_from "$SG_C1" "$SG/from1" 2>&1) | $(sg "$SG_ONE" sg_from "$SG_C2" "$SG/from2" 2>&1)"
+eq "$SG_OUT" "DIR=$SG/from1 RANGE=k1 v0.18.0 - | DIR=$SG/from2 RANGE=k1 v0.18.0 v0.18.3"
+
+it "release_keys_from_commit: a commit this clone lacks is refused, and the trust root is left alone"
+sg_from_bad(){
+  cd "$SG_KREPO" || return 1
+  release_keys_from_commit 0123456789abcdef0123456789abcdef01234567 "$SG/from-bad"
+  local rc=$?
+  printf 'DIR=%s\n' "$RELEASE_KEYS_DIR"
+  return $rc
+}
+mkdir -p "$SG/from-bad"
+SG_RC=0; SG_OUT="$(sg "$SG_ONE" sg_from_bad 2>&1)" || SG_RC=$?
+if [ "$SG_RC" != "0" ] && grep -qF 'is not in this clone' <<<"$SG_OUT" && grep -qxF "DIR=$SG_ONE" <<<"$SG_OUT"; then pass
+else fail "rc=$SG_RC: $SG_OUT"; fi
 
 # =============================================================================
 group "signing.sh -- a real ssh-keygen round trip"
@@ -2449,9 +2501,15 @@ if [ "$SG_SSH" = "1" ]; then
 
   # release-local.sh runs the preflight right before its dirty-tree check: a
   # probe file left in the repo would fail that check (or, worse, ship).
+  #
+  # The temp dir is a SHORT one of its own, not nested under SUITE_TMP: on
+  # macOS SUITE_TMP sits under the per-user /var/folders/.../T/, and the agent
+  # socket below it would be ~109 bytes, past sun_path. (release_agent_start
+  # falls back to /tmp then, which would leave this case checking the wrong
+  # directory; its own fallback has its own case below.)
   it "preflight leaves the working tree clean and its temp dir empty"
-  SG_REPO="$SG/repo"; SG_TMP="$SG/tmpdir"
-  mkdir -p "$SG_REPO" "$SG_TMP"
+  SG_REPO="$SG/repo"; SG_TMP="$(mktemp -d /tmp/oamsg.XXXXXX)"
+  mkdir -p "$SG_REPO"
   ( cd "$SG_REPO" && git init -q && printf 'x\n' >f && git add f \
       && git -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -qm init ) >/dev/null 2>&1
   sg_in_repo(){ cd "$SG_REPO" && sg_pre k1 v0.18.0 && release_agent_stop; }
@@ -2460,6 +2518,98 @@ if [ "$SG_SSH" = "1" ]; then
   SG_LEFT="$(ls -A "$SG_TMP")"
   if [ "$SG_RC" = "0" ] && [ -z "$SG_DIRTY" ] && [ -z "$SG_LEFT" ]; then pass
   else fail "rc=$SG_RC dirty='$SG_DIRTY' left-in-tmp='$SG_LEFT': $SG_OUT"; fi
+  rm -rf "$SG_TMP"
+
+  # The macOS shape, forced: a $TMPDIR so long the socket would not fit in
+  # sun_path. ssh-agent would refuse it and exit, and the release would die on
+  # "did not come up"; the lib must pick /tmp instead.
+  it "an over-long TMPDIR: the agent socket goes under /tmp, and the agent comes up"
+  SG_LONG="$SG/$(printf 'd%.0s' $(seq 1 90))"
+  mkdir -p "$SG_LONG"
+  sg_long(){ OAM_RELEASE_SIGNING_KEY="$SG/k1" release_agent_start || return 1; printf 'SOCK=%s\n' "$RELEASE_AGENT_SOCK"; }
+  SG_RC=0; SG_OUT="$(TMPDIR="$SG_LONG" sg "$SG_TRUST" sg_long 2>&1)" || SG_RC=$?
+  if [ "$SG_RC" = "0" ] && grep -q '^SOCK=/tmp/oam-sign\.' <<<"$SG_OUT"; then pass
+  else fail "rc=$SG_RC: $SG_OUT"; fi
+
+  # The service's AT-REST store, as reg.exe prints it: the release key's
+  # public blob, hex, in a subkey's "pub" value. The service itself is absent
+  # here (no inbox ssh-add), which is the stopped-service case: the store
+  # alone must be enough to refuse.
+  SG_HEX="$(cut -d' ' -f2 "$SG/k1.pub" | base64 -d | od -An -v -tx1 | tr -d ' \n' | tr 'a-f' 'A-F')"
+  SG_HEX3="$(cut -d' ' -f2 "$SG/k3.pub" | base64 -d | od -An -v -tx1 | tr -d ' \n' | tr 'a-f' 'A-F')"
+  sg_fake_reg(){ # <out-script> <pub-hex>
+    { printf '%s\n' '' 'HKEY_CURRENT_USER\Software\OpenSSH\Agent\Keys' '' \
+        'HKEY_CURRENT_USER\Software\OpenSSH\Agent\Keys\SHA256-stand-in' \
+        '    (Default)    REG_BINARY    0102030405060708' "    pub    REG_BINARY    $2" \
+        '    type    REG_DWORD    0x3' '    comment    REG_BINARY    6B6579'
+    } >"$1.out"
+    printf '#!/bin/sh\ncat "%s"\n' "$1.out" >"$1"
+    chmod +x "$1"
+  }
+  sg_fake_reg "$SG/reg-k1" "$SG_HEX"
+  sg_fake_reg "$SG/reg-k3" "$SG_HEX3"
+  it "preflight refuses when the agent service's registry store holds the key, service stopped, starting no agent"
+  SG_RC=0; SG_OUT="$(SG_REG="$SG/reg-k1" sg "$SG_TRUST" sg_inbox 2>&1)" || SG_RC=$?
+  if [ "$SG_RC" != "0" ] && grep -qF 'live or in its registry store' <<<"$SG_OUT" \
+     && grep -qF 'PID=[]' <<<"$SG_OUT"; then pass
+  else fail "rc=$SG_RC: $SG_OUT"; fi
+
+  it "a stopped service whose store holds only OTHER keys: warned about, not refused"
+  printf '#!/bin/sh\necho "Error connecting to agent: No such file or directory" >&2\nexit 2\n' >"$SG/inbox-stopped"
+  chmod +x "$SG/inbox-stopped"
+  SG_RC=0; SG_OUT="$(SG_INBOX="$SG/inbox-stopped" SG_REG="$SG/reg-k3" sg "$SG_TRUST" sg_inbox 2>&1)" || SG_RC=$?
+  if [ "$SG_RC" = "0" ] && grep -qF 'is not running, and its key store' <<<"$SG_OUT" \
+     && grep -qF 'holds 1 key(s)' <<<"$SG_OUT"; then pass
+  else fail "rc=$SG_RC: $SG_OUT"; fi
+
+  # --- the release scripts' own EXIT handlers, run for real ----------------------
+  # The wiring group checks the trap LINES exist; this runs the handler BODIES,
+  # extracted verbatim from each script, in a child bash that sources the lib,
+  # starts the agent with k1, traps the handler on EXIT, then dies -- by exit 1
+  # (any fail()) or by SIGTERM. Replace release_agent_stop with ':' in either
+  # handler and a passphrase-unlocked key outlives the run; these go red.
+  sg_handler(){ # <script> <function-name> -- its definition, verbatim
+    awk -v f="$2" '$0 == f "() {" { p = 1 } p { print } p && /^}$/ { exit }' "$1"
+  }
+  sg_handler scripts/release-local.sh release_on_exit >"$SG/h-local.sh"
+  sg_handler scripts/release-upload-local-arm64.sh cleanup >"$SG/h-arm64.sh"
+  cat >"$SG/exit-child.sh" <<'CHILD'
+# $1 handler file, $2 handler name, $3 exit|term, $4 release dir, $5 RELEASE_LIVE
+# shellcheck source=lib/signing.sh
+. scripts/lib/signing.sh
+RELEASE_KEYS_DIR="$SG_TRUST"
+RELEASE_INBOX_SSH_ADD=/nonexistent; RELEASE_INBOX_REG=/nonexistent
+. "$1"
+tmp=""; trust_dir=""; RELEASE_DIR="$4"; RELEASE_LIVE="$5"
+trap "$2" EXIT
+OAM_RELEASE_SIGNING_KEY="$SG/k1" release_agent_start 2>/dev/null || exit 99
+printf 'AGENT %s %s\n' "$RELEASE_AGENT_PID" "$RELEASE_AGENT_DIR"
+case "$3" in
+  exit) exit 1 ;;
+  term) kill -TERM $$; sleep 5; exit 0 ;;
+esac
+CHILD
+  sg_exit_case(){ # <handler-file> <handler-name> <exit|term> <live> -- "agent=.. dir=.. sig=.."
+    local rel="$SG/hrel-$2-$3-$4" child="$SG/exit-child.sh" out pid adir
+    rm -rf "$rel"; mkdir -p "$rel"; printf 'sig\n' >"$rel/RELEASE-MANIFEST.sig"
+    out="$(SG="$SG" SG_TRUST="$SG_TRUST" bash "$child" "$1" "$2" "$3" "$rel" "$4" 2>&1)"
+    read -r _ pid adir <<<"$(grep '^AGENT ' <<<"$out")"
+    [ -n "${pid:-}" ] || { printf 'no-agent-started: %s' "$out"; return 0; }
+    printf 'agent=%s dir=%s sig=%s' \
+      "$(kill -0 "$pid" 2>/dev/null && echo alive || echo gone)" \
+      "$([ -e "$adir" ] && echo left || echo gone)" \
+      "$([ -e "$rel/RELEASE-MANIFEST.sig" ] && echo kept || echo gone)"
+    kill "$pid" 2>/dev/null; rm -rf "$adir"
+  }
+  it "release-local.sh's EXIT handler stops the agent on a fail() exit, and drops the unpublished .sig"
+  eq "$(sg_exit_case "$SG/h-local.sh" release_on_exit exit 0)" "agent=gone dir=gone sig=gone"
+  it "release-local.sh's EXIT handler stops the agent on SIGTERM"
+  eq "$(sg_exit_case "$SG/h-local.sh" release_on_exit term 0)" "agent=gone dir=gone sig=gone"
+  it "release-local.sh's EXIT handler keeps the .sig of a release that went live"
+  eq "$(sg_exit_case "$SG/h-local.sh" release_on_exit exit 1)" "agent=gone dir=gone sig=kept"
+  it "release-upload-local-arm64.sh's EXIT handler stops the agent on exit 1 and on SIGTERM"
+  eq "$(sg_exit_case "$SG/h-arm64.sh" cleanup exit 0) | $(sg_exit_case "$SG/h-arm64.sh" cleanup term 0)" \
+     "agent=gone dir=gone sig=kept | agent=gone dir=gone sig=kept"
 
   # The passphrase is asked for once per run -- and once more only if the
   # agent's lifetime ran out before the manifest step, which is simulated by
@@ -2540,6 +2690,33 @@ sg_order scripts/release-upload-local-arm64.sh 'trap cleanup EXIT' 'release_agen
   'release_verify_manifest "$tmp" "$TAG" \' "if (f != a) print }'" \
   'release_write_manifest "$tmp" "$TAG"' 'release_sign_manifest "$tmp"' \
   'upload+=("${tmp}/RELEASE-MANIFEST" "${tmp}/RELEASE-MANIFEST.sig")' 'gh release upload "$TAG"'
+
+it "arm64 upload: the trust root comes from origin/main, before anything decides, signs or verifies"
+sg_order scripts/release-upload-local-arm64.sh 'git rev-parse "${TAG}^{commit}"' \
+  'git ls-remote origin refs/heads/main' 'release_keys_from_commit "$main_sha" "$trust_dir"' \
+  'sign_decision="$(release_signing_decision)"' 'release_agent_start ||' 'release_verify_manifest "$tmp" "$TAG" \'
+
+it "arm64 upload: a release with no manifest is patched unsigned only when its tag predates every key range"
+SG_BLK="$(awk '/^if \[ "\$SIGNED" = "1" \]; then$/ { f = 1 } f { print } f && /^fi$/ { exit }' scripts/release-upload-local-arm64.sh)"
+if grep -qF '[ "$sign_decision" = "sign" ] && ! release_tag_predates_signing "$TAG"' <<<"$SG_BLK" \
+   && [ "$(grep -n 'release_tag_predates_signing' <<<"$SG_BLK" | head -1 | cut -d: -f1)" -lt "$(grep -n 'a pre-signing release' <<<"$SG_BLK" | head -1 | cut -d: -f1)" ]; then pass
+else fail "the unsigned branch no longer gates on release_tag_predates_signing before its warn:"$'\n'"$SG_BLK"; fi
+
+# The handler BODIES, not just the trap lines: a handler that stopped calling
+# release_agent_stop would leave the unlocked key in an orphaned agent on any
+# fail() between preflight and the manifest step. (The round-trip group runs
+# these bodies for real; this half needs no ssh.)
+it "each script's EXIT handler calls release_agent_stop"
+SG_MISS=""
+SG_H="$(awk '$0 == "release_on_exit() {" { p = 1 } p { print } p && /^}$/ { exit }' scripts/release-local.sh)"
+grep -qE '^[[:space:]]*release_agent_stop$' <<<"$SG_H" || SG_MISS="$SG_MISS release-local.sh:release_on_exit"
+SG_H="$(awk '$0 == "cleanup() {" { p = 1 } p { print } p && /^}$/ { exit }' scripts/release-upload-local-arm64.sh)"
+grep -qE '^[[:space:]]*release_agent_stop$' <<<"$SG_H" || SG_MISS="$SG_MISS release-upload-local-arm64.sh:cleanup"
+if [ -z "$SG_MISS" ]; then pass; else fail "handler does not stop the agent:$SG_MISS"; fi
+
+it "release-local.sh: RELEASE_LIVE flips only after the draft goes live"
+sg_order scripts/release-local.sh 'RELEASE_LIVE=0' 'trap release_on_exit EXIT' \
+  'gh release edit "$TAG" --repo "$REPO" --draft=false' 'RELEASE_LIVE=1'
 
 it "arm64 upload: exactly one gh release upload call"
 SG_UPS="$(grep -v '^[[:space:]]*#' scripts/release-upload-local-arm64.sh | grep -c 'gh release upload')"

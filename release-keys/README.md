@@ -95,13 +95,21 @@ throwaway signature outside the repo and checks it against the committed
 
 Right after `SHA256SUMS` is written, the script writes the manifest, signs it,
 verifies it from disk, and stops the agent. The script's EXIT trap also stops
-the agent on any failure. Preflight refuses to run if the Windows agent
-service holds the key, because that service keeps keys across reboots.
+the agent on any failure. If the release never went live (a dry run, a build
+the sidecar matrix rejected, a failure), the trap also deletes the staged
+`RELEASE-MANIFEST.sig`, so no valid signature for an unpublished build is left
+behind. Preflight refuses to run if the Windows agent service holds the key,
+whether the service is running or not: that service keeps keys in the
+registry across reboots, and preflight looks there too.
 
 `scripts/release-upload-local-arm64.sh` patches a binary into an existing
-release. It verifies the published manifest before it changes anything, then
-re-signs the patched one and uploads the binary, `SHA256SUMS` and both
-manifest files in one call.
+release. It reads `allowed_signers` and `ranges` from `origin/main`, not from
+the tag it builds, so a range closed or a key rotated after that tag applies.
+It verifies the published manifest before it changes anything, then re-signs
+the patched one and uploads the binary, `SHA256SUMS` and both manifest files in
+one call. A release with no manifest is patched unsigned only when its tag is
+older than every range in `ranges`. A newer one is refused, because a missing
+manifest there means someone removed it.
 
 ### Verifying a release by hand
 

@@ -71,12 +71,25 @@ RELEASE_KEY_LIFETIME=21600
 
 # Resolved from this file's own location, NOT from the environment: the trust
 # root a release verifies against is the committed one, and an env knob that
-# could point it elsewhere is a knob that could make a bad key verify. The test
-# suite reassigns it after sourcing, in a subshell.
+# could point it elsewhere is a knob that could make a bad key verify. Two
+# things reassign it after sourcing: release-upload-local-arm64.sh, which runs
+# from an OLD tag's checkout and so points it at origin/main's copy instead
+# (release_keys_from_commit -- the current trust root, not the one frozen into
+# that tag), and the test suite, in a subshell.
 RELEASE_KEYS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/release-keys"
 # The Windows inbox OpenSSH client's ssh-add, used only to ask the agent
-# SERVICE whether it holds the release key. Reassigned by the test suite.
+# SERVICE whether it holds the release key, and reg.exe, used to look in that
+# service's at-rest key store. Both reassigned by the test suite.
 RELEASE_INBOX_SSH_ADD="/c/Windows/System32/OpenSSH/ssh-add.exe"
+RELEASE_INBOX_REG="/c/Windows/System32/reg.exe"
+# Where Win32-OpenSSH's agent service keeps added keys (DPAPI-encrypted), one
+# subkey per key, with the public key blob in a "pub" REG_BINARY value.
+RELEASE_INBOX_REG_KEY='HKCU\Software\OpenSSH\Agent\Keys'
+# Longest agent socket path release_agent_start will use. sun_path is 104
+# bytes on macOS and 108 on Linux, NUL included; ssh-agent refuses a longer
+# path ("too long for Unix domain socket") and exits. macOS's per-user
+# $TMPDIR (/var/folders/xx/<30 chars>/T/) leaves little room under it.
+RELEASE_SOCK_MAX=100
 
 RELEASE_SSH_KEYGEN=""
 RELEASE_SSH_ADD=""
@@ -239,6 +252,43 @@ release_tag_in_range() {
   return 0
 }
 
+# release_tag_predates_signing <tag> -- 0 when <tag> comes before the start of
+# every range in release-keys/ranges: no committed key was ever allowed to
+# sign it, so a release of it without a manifest was cut before signing
+# existed. 1 for a tag at or after any range's start: that release was cut in
+# the signing era, and a missing manifest means it was removed or never made.
+# A closed range counts -- a tag in a gap between ranges is still after
+# signing began. Assumes release_keys_lint passed.
+release_tag_predates_signing() {
+  local tag="$1" from
+  _rs_plain_tag "$tag" || { _rs_fail "'$tag' is not a plain vX.Y.Z tag -- key ranges cannot place it"; return 1; }
+  while read -r _ from _; do
+    [ -n "$from" ] || continue
+    if _rs_tag_le "$from" "$tag"; then return 1; fi
+  done <<<"$(awk '!/^[[:space:]]*(#|$)/' "$RELEASE_KEYS_DIR/ranges")"
+  return 0
+}
+
+# release_keys_from_commit <commit> <dir> -- copy release-keys/allowed_signers
+# and ranges as committed at <commit> into <dir> (which the caller owns and
+# removes) and point RELEASE_KEYS_DIR at it. For a caller whose checkout is not
+# the current trust root: release-upload-local-arm64.sh stands on an old tag,
+# whose release-keys/ predates any later range close or rotation, and
+# verifying against that would accept a key the project has since retired --
+# or refuse the key that replaced it. Run in the caller's shell, never in
+# $(...): the assignment is the point.
+release_keys_from_commit() {
+  local commit="$1" dir="$2" f
+  git cat-file -e "${commit}^{commit}" 2>/dev/null \
+    || { _rs_fail "commit $commit is not in this clone -- fetch it first"; return 1; }
+  for f in allowed_signers ranges; do
+    git show "${commit}:release-keys/$f" >"$dir/$f" 2>/dev/null \
+      || { _rs_fail "release-keys/$f does not exist at $commit -- that commit carries no signing trust root"; return 1; }
+  done
+  RELEASE_KEYS_DIR="$dir"
+  return 0
+}
+
 # release_signing_decision -- whether this run signs, as one line on stdout:
 #   sign            a key is committed: signing is mandatory
 #   skip:<reason>   bootstrap (no key yet) and OAM_SIGN_REQUIRED is not 1
@@ -266,20 +316,49 @@ release_signing_decision() {
 
 # --- the private agent ----------------------------------------------------------
 
-# release_inbox_agent_holds <fingerprint> -- 0 when the Windows OpenSSH agent
-# SERVICE holds the key. That service persists added keys in the registry
-# across reboots (plan 4.4; not verified on this box), so a release key that
-# ever went in there is at rest, decryptable by anything running as this user,
-# for good -- the opposite of a 6-hour private agent. Absent binary (not
-# Windows), stopped service ("Error connecting to agent", exit 2) and an empty
-# agent all read as "not held". SSH_AUTH_SOCK is cleared for the call: the
-# inbox client honors it, and pointed at an MSYS socket it would ask the wrong
-# agent.
+# release_inbox_agent_holds <fingerprint> <public-key-base64> -- 0 when the
+# Windows OpenSSH agent SERVICE holds the key, live or at rest. That service
+# keeps added keys in the registry ($RELEASE_INBOX_REG_KEY), DPAPI-encrypted,
+# across reboots and while it is STOPPED -- decryptable by anything running as
+# this user, for good: the opposite of a 6-hour private agent. So two looks:
+#   1. the running service's listing (ssh-add.exe -l). SSH_AUTH_SOCK is
+#      cleared for the call: the inbox client honors it, and pointed at an
+#      MSYS socket it would ask the wrong agent.
+#   2. the at-rest store, which answers whether or not the service runs: a
+#      value holding this key's public blob. reg.exe prints a REG_BINARY as
+#      one hex string, so the blob is matched as hex.
+# Neither binary present (not Windows) reads as "not held", and so does no
+# store at all. A STOPPED service whose store holds keys that look 2 cannot
+# match is warned about rather than silently passed: the check could not ask
+# the service itself, and the line says so.
 release_inbox_agent_holds() {
-  local fp="$1" listing
-  [ -x "$RELEASE_INBOX_SSH_ADD" ] || return 1
-  listing="$( unset SSH_AUTH_SOCK; "$RELEASE_INBOX_SSH_ADD" -l 2>/dev/null )" || true
-  awk -v fp="$fp" '$2 == fp { found = 1 } END { exit !found }' <<<"$listing"
+  local fp="$1" blob="$2" listing rc=0 store hex n
+  if [ -x "$RELEASE_INBOX_SSH_ADD" ]; then
+    listing="$( unset SSH_AUTH_SOCK; "$RELEASE_INBOX_SSH_ADD" -l 2>/dev/null )" || rc=$?
+    if awk -v fp="$fp" '$2 == fp { found = 1 } END { exit !found }' <<<"$listing"; then
+      return 0
+    fi
+  fi
+  [ -x "$RELEASE_INBOX_REG" ] || return 1
+  # MSYS2_ARG_CONV_EXCL: Git Bash would otherwise rewrite "/s" into a path.
+  store="$(MSYS2_ARG_CONV_EXCL='*' "$RELEASE_INBOX_REG" query "$RELEASE_INBOX_REG_KEY" /s 2>/dev/null)" \
+    || return 1
+  hex="$(printf '%s' "$blob" | base64 -d 2>/dev/null | od -An -v -tx1 | tr -d ' \n' | tr 'a-f' 'A-F')"
+  if [ -z "$hex" ]; then
+    _rs_warn "could not decode the release key's public blob, so the Windows agent's key store ($RELEASE_INBOX_REG_KEY) was not searched"
+    return 1
+  fi
+  if tr -d ' \t\r\n' <<<"$store" | tr 'a-f' 'A-F' | grep -qF -- "$hex"; then
+    return 0
+  fi
+  if [ "$rc" -eq 2 ]; then
+    # Subkey header lines: the store's own path plus "\<name>".
+    n="$(tr -d '\r' <<<"$store" | grep -ciE '^HKEY_CURRENT_USER.+agent.keys.[^[:space:]]')"
+    if [ "${n:-0}" -gt 0 ]; then
+      _rs_warn "the Windows OpenSSH agent service is not running, and its key store ($RELEASE_INBOX_REG_KEY) holds $n key(s) this check did not match to the release key ($fp). If the release key was ever added there, start the service and remove it (ssh-add.exe -d '<key>.pub')"
+    fi
+  fi
+  return 1
 }
 
 # release_agent_holds_key -- 0 when the private agent holds the release key.
@@ -315,7 +394,7 @@ release_agent_start() {
   fi
   # An agent that died under us still has a socket directory to clear.
   release_agent_stop
-  local key="${OAM_RELEASE_SIGNING_KEY:-}" ktype i rc
+  local key="${OAM_RELEASE_SIGNING_KEY:-}" ktype kblob i rc base
   [ -n "$key" ] \
     || { _rs_fail "OAM_RELEASE_SIGNING_KEY is not set -- point it at the release key's PRIVATE half (passphrase-protected ed25519, '<path>.pub' beside it); release-keys/README.md has the runbook"; return 1; }
   # A Windows-style path from the environment works for the MSYS tools once
@@ -323,15 +402,15 @@ release_agent_start() {
   if command -v cygpath >/dev/null 2>&1; then key="$(cygpath -u "$key")"; fi
   [ -f "$key" ] || { _rs_fail "OAM_RELEASE_SIGNING_KEY=$key does not exist"; return 1; }
   [ -f "$key.pub" ] || { _rs_fail "$key.pub does not exist -- signing names the key by its public half (ssh-keygen -Y sign -f <key>.pub)"; return 1; }
-  read -r ktype _ <"$key.pub"
+  read -r ktype kblob _ <"$key.pub"
   case "$ktype" in
     ssh-ed25519 | sk-ssh-ed25519@openssh.com) ;;
     *) _rs_fail "$key.pub is a '$ktype' key -- release keys are ssh-ed25519"; return 1 ;;
   esac
   RELEASE_SIGNING_FP="$("$RELEASE_SSH_KEYGEN" -lf "$key.pub" 2>/dev/null | awk '{print $2; exit}')"
   [ -n "$RELEASE_SIGNING_FP" ] || { _rs_fail "could not fingerprint $key.pub"; return 1; }
-  if release_inbox_agent_holds "$RELEASE_SIGNING_FP"; then
-    _rs_fail "the Windows OpenSSH agent SERVICE holds the release key ($RELEASE_SIGNING_FP) -- it persists keys across reboots. Remove it there ('$RELEASE_INBOX_SSH_ADD' -d '$key.pub', or -D for all) and re-run; release signing uses only its own private agent"
+  if release_inbox_agent_holds "$RELEASE_SIGNING_FP" "$kblob"; then
+    _rs_fail "the Windows OpenSSH agent SERVICE holds the release key ($RELEASE_SIGNING_FP), live or in its registry store -- it keeps keys across reboots and while stopped. Remove it there (start the service, then '$RELEASE_INBOX_SSH_ADD' -d '$key.pub', or -D for all) and re-run; release signing uses only its own private agent"
     return 1
   fi
   # An unencrypted key on disk is the key itself, at rest. The runbook says
@@ -343,10 +422,22 @@ release_agent_start() {
   fi
   RELEASE_SIGNING_KEY="$key"
 
-  RELEASE_AGENT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/oam-sign.XXXXXX")" \
+  # $TMPDIR first (per-user on macOS), /tmp when the socket path would not
+  # fit under it; 22 is "/oam-sign.XXXXXX/agent". /tmp is shared, but the
+  # directory is 0700 either way. The final length is checked too, so a path
+  # that still does not fit fails here, by name, rather than as an agent that
+  # "did not come up".
+  base="${TMPDIR:-/tmp}"
+  if [ $(( ${#base} + 22 )) -gt "$RELEASE_SOCK_MAX" ]; then base=/tmp; fi
+  RELEASE_AGENT_DIR="$(mktemp -d "$base/oam-sign.XXXXXX")" \
     || { _rs_fail "could not create the agent's socket directory"; return 1; }
   chmod 700 "$RELEASE_AGENT_DIR" || { _rs_fail "could not chmod 700 $RELEASE_AGENT_DIR"; release_agent_stop; return 1; }
   RELEASE_AGENT_SOCK="$RELEASE_AGENT_DIR/agent"
+  if [ "${#RELEASE_AGENT_SOCK}" -gt "$RELEASE_SOCK_MAX" ]; then
+    _rs_fail "the agent socket path $RELEASE_AGENT_SOCK is ${#RELEASE_AGENT_SOCK} bytes, over the $RELEASE_SOCK_MAX a unix socket path can safely hold -- set TMPDIR to a shorter directory"
+    release_agent_stop
+    return 1
+  fi
   "$RELEASE_SSH_AGENT" -D -a "$RELEASE_AGENT_SOCK" </dev/null >/dev/null 2>&1 &
   RELEASE_AGENT_PID=$!
   # ssh-add -l: 0 = keys, 1 = reachable and empty, 2 = cannot connect. Poll
