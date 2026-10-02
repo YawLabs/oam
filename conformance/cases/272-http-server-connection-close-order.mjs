@@ -12,7 +12,9 @@
 // body is the connection's failure: its socket reports it first (node's
 // socketOnError: the parser's HPE_ error or the read's ECONNRESET, to
 // 'clientError' when the server listens for it), then the socket's 'close'
-// aborts the request.
+// aborts the request. A handler's destroy(err) -- on the socket, or on the
+// request, which destroys the socket with it -- reaches 'clientError' too,
+// ahead of the socket's own 'error' listeners.
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
@@ -222,4 +224,23 @@ await exchange("https: the client goes away while the handler reads the body", {
   aborts: true,
   handle: (req) => req.resume(),
   afterHandler: (client) => setTimeout(() => client.destroy(), 20),
+});
+await exchange("http: socket.destroy(err), with a 'clientError' listener", {
+  request: POST,
+  aborts: true,
+  clientError: true,
+  handle: (req) => req.socket.destroy(new Error("boom")),
+});
+await exchange("http: req.destroy(err), with a 'clientError' listener", {
+  request: POST,
+  aborts: true,
+  clientError: true,
+  handle: (req) => req.destroy(new Error("boom")),
+});
+await exchange("https: socket.destroy(err), with a 'clientError' listener", {
+  secure: true,
+  request: POST,
+  aborts: true,
+  clientError: true,
+  handle: (req) => req.socket.destroy(new Error("boom")),
 });

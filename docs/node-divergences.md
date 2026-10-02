@@ -1845,7 +1845,10 @@ Node: it comes once the connection has closed (the native side reports it), and 
 run in the order they were added -- the server's own first (the request's `'aborted'`), then
 a `'connection'` listener's, then the response's (its `'close'` without `'finish'`), then the
 handler's; the request's `'error'` and `'close'` follow on the next tick. A `destroy(err)`
-emits `'error'` on the next tick and `'close'` with `true`. An `https` connection's plain
+-- on the socket, or through `req.destroy(err)` -- emits `'error'` on the next tick, the
+server's `'clientError'` hearing it first (Node's socketOnError, the socket's first `'error'`
+listener; once per socket), and `'close'` with `true`. Up to 0.17.1 `'clientError'` never
+heard it. An `https` connection's plain
 socket closes before its TLS socket, as Node's does. That holds whoever closed it --
 `destroy()`, `destroy(err)` or `resetAndDestroy()` on the socket, `req.destroy()` (which
 closes the connection even once the response is under way, as Node's does), or the client

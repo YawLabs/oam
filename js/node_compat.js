@@ -18428,10 +18428,14 @@
         this.writable = false;
         if (err) {
           hadError = true;
-          // node's: on the next tick, ahead of the 'close' the handle's
-          // close brings. The server's own error handler is always
-          // listening in node, so it reaches only the caller's listeners.
+          // node's 'error': on the next tick, ahead of the 'close' the
+          // handle's close brings. On a connection's socket its first
+          // listener is the server's socketOnError, so the server's
+          // 'clientError' hears the first error (the socket destroyed by
+          // then) before the caller's listeners do; with none of those, the
+          // server's own no-op listener keeps it from being thrown.
           process.nextTick(() => {
+            if (this[kConnServer] !== undefined) serverSocketOnError(this, err);
             if (this.listenerCount("error") > 0) this.emit("error", err);
           });
         }
