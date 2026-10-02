@@ -32358,6 +32358,29 @@
       stream._sentTrailers = headers;
       return pairs.length === 0 ? null : trailerFields(pairs);
     }
+    // HTTP/2's initial stream window (RFC 9113 6.9.2): what node's nghttp2
+    // takes in for a stream JS is not reading (its readable buffer fills to
+    // that, past the highWaterMark). oam uses the default; it does not see
+    // the SETTINGS either side sends.
+    var kDefaultInitialWindowSize = 65535;
+    // A body chunk into a stream's readable buffer, the way node's fills
+    // while JS does not read: up to the window, the rest held back for the
+    // next _read(). True when the stream reads on.
+    function pushInWindow(stream, buf) {
+      var room = kDefaultInitialWindowSize - stream.readableLength;
+      if (buf.length > room) {
+        stream._held = buf.subarray(room > 0 ? room : 0);
+        buf = buf.subarray(0, room > 0 ? room : 0);
+      }
+      if (buf.length > 0) stream.push(buf);
+      return stream._held === null && stream.readableLength < kDefaultInitialWindowSize;
+    }
+    // The bytes pushInWindow held back, first on the next read.
+    function pushHeld(stream) {
+      var held = stream._held;
+      stream._held = null;
+      return pushInWindow(stream, held);
+    }
     function emitTrailers(stream, pairs) {
       var raw = [];
       for (var i = 0; i < pairs.length; i++) raw.push(pairs[i][0], pairs[i][1]);
@@ -32709,6 +32732,8 @@
           this._chain = Promise.resolve();
           this._bodyDone = false;
           this._reading = false;
+          // Body bytes past the window, for the next read (pushInWindow).
+          this._held = null;
           this._closed = false;
           this._sentHeaders = undefined;
           // respond()'s waitForTrailers, the 'wantTrailers' moment, and the
@@ -32724,6 +32749,9 @@
           this.headRequest = meta.method === "HEAD";
           this._authority = headers[":authority"] !== undefined ? headers[":authority"] : headers.host;
           this._protocol = headers[":scheme"];
+          // node's: the request body is read as it arrives (_pump), not on
+          // the Readable's own read-ahead, so a _read() is JS asking.
+          this._readableState.readingMore = true;
         }
         get id() { return this._id; }
         get session() { return this[kSession]; }
@@ -32840,11 +32868,22 @@
           this._maybeClose();
         }
         _read() {
+          this._pump();
+        }
+        // node's onStreamRead: the request body is read as it arrives, read
+        // or not, until the readable buffer holds a window's worth (node's
+        // nghttp2 keeps taking frames in while JS does not read, just not
+        // granting more window), and again on the next _read(); its trailer
+        // section is 'trailers' when reached.
+        _pump() {
           if (this._bodyDone || this._reading) return;
+          if (this._held !== null && !pushHeld(this)) return;
           this._reading = true;
           natives.httpRequestBodyRead(this._requestId).then(
             (chunk) => {
               this._reading = false;
+              // Closed meanwhile: the readable side has ended.
+              if (this._bodyDone) return;
               if (chunk && Array.isArray(chunk.trailers)) {
                 this._bodyDone = true;
                 emitTrailers(this, chunk.trailers);
@@ -32857,10 +32896,11 @@
                 return;
               }
               touchIdleTimer(this);
-              this.push(globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.length));
+              if (pushInWindow(this, globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.length))) this._pump();
             },
             () => {
               this._reading = false;
+              if (this._bodyDone) return;
               this._bodyDone = true;
               this._onAborted();
             },
@@ -33419,6 +33459,7 @@
           stream.push(null);
         }
         emitter.emit("stream", stream, parsed.headers, flags, parsed.rawHeaders);
+        stream._pump();
       }
 
       class ServerHttp2Session extends EventEmitter {
@@ -33831,9 +33872,13 @@
         this._sentTrailers = undefined;
         if (this._hasTrailers) this._writableState.autoDestroy = false;
         this._bodyHandle = null;
-        this._readWanted = false;
         this._reading = false;
         this._readEnded = false;
+        // Body bytes past the window, for the next read (pushInWindow).
+        this._held = null;
+        // node's: the response body is read as it arrives (_pumpBody), not
+        // on the Readable's own read-ahead.
+        this._readableState.readingMore = true;
       }
       get id() { return this._id; }
       get pending() { return this._id === undefined; }
@@ -33904,11 +33949,15 @@
         // nghttp2's flags: END_HEADERS, plus END_STREAM for a response with
         // no body.
         this.emit("response", headers, raw.endStream ? 5 : 4, rawHeaders);
-        if (this._readWanted) this._pumpBody();
+        this._pumpBody();
       }
 
+      // node's onStreamRead: the response body is read as it arrives, read or
+      // not, until the readable buffer holds a window's worth, and again on
+      // the next _read(); its trailer section is 'trailers' when reached.
       _pumpBody() {
         if (this._bodyHandle === null || this._reading || this.destroyed) return;
+        if (this._held !== null && !pushHeld(this)) return;
         this._reading = true;
         var self = this;
         var handle = this._bodyHandle;
@@ -33926,8 +33975,7 @@
             self.push(null);
             return;
           }
-          self._readWanted = false;
-          self.push(globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+          if (pushInWindow(self, globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength))) self._pumpBody();
         }, function () {
           self._reading = false;
           if (self.destroyed || self._bodyHandle !== handle) return;
@@ -33937,7 +33985,6 @@
       }
 
       _read() {
-        this._readWanted = true;
         this._pumpBody();
       }
 

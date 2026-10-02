@@ -3574,8 +3574,8 @@ fn op_http_request_body_read(
                 );
             }
             oam_core::http_server::BodyCheckout::Absent => {
-                // Not a streamed body: a buffered one (TLS and http2 still
-                // collect, and so does any server that did not opt in). Hand it
+                // Not a streamed body: a buffered one (an h2c listener's
+                // HTTP/1 requests, and any server that did not opt in). Hand it
                 // over as a single chunk; the take empties the registry so the
                 // next read reports EOF.
                 return match state.take_request_body(id) {

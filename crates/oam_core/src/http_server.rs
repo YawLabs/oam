@@ -3012,7 +3012,11 @@ pub async fn http2_serve(
                                     conn_state.clone(),
                                     conn_queue.clone(),
                                     req,
-                                    false, // http2: buffered until a later slice
+                                    // Streamed, as the secure server's are:
+                                    // node's 'stream' comes with the headers,
+                                    // and the body (and its trailers) can
+                                    // still arrive after the response.
+                                    true,
                                     conn_addrs,
                                     None,
                                     policy,
