@@ -19,6 +19,9 @@
 //!   a lexically resolved target. `/box/allowed` grants `/box/allowed` and
 //!   `/box/allowed/file`, and denies both `/box/allowed-evil` (no separator
 //!   boundary) and `/box/allowed/../../secret` (resolved out of the subtree).
+//!   As in node, a target with no root is resolved against the cwd of the
+//!   moment, and a grant entry with no root against the cwd at startup
+//!   (`resolve_against_cwd`, `fs_grant`).
 //! - net and env are EXACT matches. A prefix there grants names an ATTACKER
 //!   CAN REGISTER: `--allow-net=api.github.com` must not admit
 //!   `api.github.com.attacker.net`, and `--allow-env=API` must not admit
@@ -77,6 +80,41 @@ fn normalize_path(raw: &str) -> String {
         format!("/{joined}")
     } else {
         joined
+    }
+}
+
+/// Resolve a path that has no root against the process's CURRENT working
+/// directory, as node's permission model does before it matches a grant
+/// (its C++ checks run `PathResolve` with the cwd of the moment, so a
+/// `process.chdir` moves what a relative path names). A rooted path is
+/// returned as given and left to `normalize_path`.
+///
+/// Without this a relative target could never match an absolute grant:
+/// `--allow-fs-write=<cwd>` refused `writeFileSync("out.txt")`,
+/// `mkdirSync("d")` and `mkdtempSync("tmp-")` where node allows all three.
+///
+/// "No root" rather than "not absolute": on Windows `\x` is rooted but not
+/// absolute, and node resolves it onto the cwd's drive; keeping it lexical
+/// (`/x`) can never match a drive-qualified grant, so it is denied either
+/// way, and a rooted grant entry still matches a rooted target the same way
+/// it always has. A drive-relative `C:x` has no root and resolves through
+/// `GetFullPathNameW`, which is what the OS opens. The empty path names the
+/// cwd itself, as node's `path.resolve("")` does. If the cwd cannot be read
+/// (deleted under the process), the path stays as given and so matches only
+/// a relative entry -- never more than before.
+fn resolve_against_cwd(raw: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if std::path::Path::new(raw).has_root() {
+        return Cow::Borrowed(raw);
+    }
+    let resolved = if raw.is_empty() {
+        std::env::current_dir()
+    } else {
+        std::path::absolute(raw)
+    };
+    match resolved {
+        Ok(path) => Cow::Owned(path.to_string_lossy().into_owned()),
+        Err(_) => Cow::Borrowed(raw),
     }
 }
 
@@ -152,6 +190,18 @@ impl PermValue {
                     t.starts_with(&with_sep)
                 })
             }
+        }
+    }
+
+    /// `allows_path` for a filesystem target as an fs op passes it: a target
+    /// with no root is first resolved against the current cwd (see
+    /// `resolve_against_cwd`). The cwd is read only for a `List` grant and a
+    /// relative target, so an unrestricted run (`All`) pays nothing.
+    pub fn allows_fs_path(&self, target: &str) -> bool {
+        match self {
+            PermValue::All => true,
+            PermValue::None => false,
+            PermValue::List(_) => self.allows_path(&resolve_against_cwd(target)),
         }
     }
 
@@ -240,8 +290,8 @@ impl Permissions {
             return Self::default();
         };
         Self {
-            read: from_bool_or_list(o.read),
-            write: from_bool_or_list(o.write),
+            read: fs_grant(o.read),
+            write: fs_grant(o.write),
             net: from_bool_or_list(o.net),
             env: from_bool_or_list(o.env),
             ffi: from_bool_or_list(o.ffi),
@@ -252,7 +302,7 @@ impl Permissions {
 
     /// Returns `Err(denial)` when `read` is denied for `path`.
     pub fn check_read(&self, path: &str) -> Result<(), PermissionDenial> {
-        if self.read.allows_path(path) {
+        if self.read.allows_fs_path(path) {
             Ok(())
         } else {
             Err(PermissionDenial {
@@ -264,7 +314,7 @@ impl Permissions {
 
     /// Returns `Err(denial)` when `write` is denied for `path`.
     pub fn check_write(&self, path: &str) -> Result<(), PermissionDenial> {
-        if self.write.allows_path(path) {
+        if self.write.allows_fs_path(path) {
             Ok(())
         } else {
             Err(PermissionDenial {
@@ -369,7 +419,7 @@ impl Permissions {
             // or query() and the op disagree about the same argument.
             Some(t) => {
                 let granted = match name {
-                    "read" | "write" => perm.allows_path(t),
+                    "read" | "write" => perm.allows_fs_path(t),
                     "net" => perm.allows_net(t),
                     _ => perm.allows_exact(t),
                 };
@@ -520,6 +570,30 @@ fn from_bool_or_list(v: BoolOrList) -> PermValue {
                 PermValue::List(list)
             }
         }
+    }
+}
+
+/// `from_bool_or_list` for an fs category: a grant entry with no root is
+/// resolved against the cwd ONCE, here, when the permission set is built --
+/// node resolves `--allow-fs-write=.` or `=../out` at startup, so a later
+/// `process.chdir` does not move the grant (it moves only relative targets).
+/// A worker inherits the already-resolved set. An EMPTY entry stays empty
+/// (and so grants nothing, see `allows_path`): resolving it would turn a
+/// blank list item into a grant over the whole cwd.
+fn fs_grant(v: BoolOrList) -> PermValue {
+    match from_bool_or_list(v) {
+        PermValue::List(list) => PermValue::List(
+            list.into_iter()
+                .map(|entry| {
+                    if entry.is_empty() {
+                        entry
+                    } else {
+                        resolve_against_cwd(&entry).into_owned()
+                    }
+                })
+                .collect(),
+        ),
+        other => other,
     }
 }
 
@@ -1026,6 +1100,77 @@ mod tests {
         assert!(p.check_write("/any/path").is_ok());
         assert!(p.check_net("any.host").is_ok());
         assert!(p.check_env("ANY_VAR").is_ok());
+    }
+
+    // ------------------------------------------- relative paths, node's way
+    //
+    // These read the cwd but never change it: tests share one process.
+
+    fn cwd() -> String {
+        std::env::current_dir()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn opts_write_only(list: Vec<String>) -> PermissionsOptions {
+        PermissionsOptions {
+            write: BoolOrList::List(list),
+            ..opts_read_only(vec![])
+        }
+    }
+
+    #[test]
+    fn relative_target_resolves_against_the_cwd_before_matching() {
+        // node: --allow-fs-write=<cwd> admits writeFileSync("out.txt") and
+        // mkdtempSync("tmp-") (template "tmp-XXXXXX"); oam denied both.
+        let p = Permissions::from_opts(Some(opts_write_only(vec![cwd()])));
+        assert!(p.check_write("out.txt").is_ok());
+        assert!(p.check_write("tmp-XXXXXX").is_ok());
+        assert!(p.check_write("./sub/tmp-XXXXXX").is_ok());
+        assert!(p.check_write("").is_ok(), "the empty path names the cwd");
+        // Resolution does not widen the grant: up and out is still out.
+        assert!(p.check_write("../outside").is_err());
+        assert!(p.check_write("sub/../../outside").is_err());
+        assert_eq!(p.query_state("write", Some("out.txt")), "granted");
+        assert_eq!(p.query_state("write", Some("../outside")), "denied");
+        // The denial names the path as passed, not the resolved one.
+        assert_eq!(
+            p.check_write("../outside").unwrap_err().resource,
+            "../outside"
+        );
+    }
+
+    #[test]
+    fn relative_grant_resolves_against_the_cwd_when_built() {
+        let here = std::path::PathBuf::from(cwd());
+        let name = here.file_name().unwrap().to_string_lossy().into_owned();
+        for grant in [".".to_string(), format!("../{name}")] {
+            let p = Permissions::from_opts(Some(opts_write_only(vec![grant.clone()])));
+            assert!(p.check_write("out.txt").is_ok(), "grant {grant}");
+            assert!(
+                p.check_write(&here.join("out.txt").to_string_lossy())
+                    .is_ok(),
+                "grant {grant} covers the absolute spelling too"
+            );
+            assert!(p.check_write("../sibling").is_err(), "grant {grant}");
+        }
+    }
+
+    #[test]
+    fn blank_grant_entry_still_grants_nothing() {
+        let p = Permissions::from_opts(Some(opts_write_only(vec![String::new()])));
+        assert!(p.check_write("out.txt").is_err());
+        assert!(p.check_write("").is_err());
+    }
+
+    #[test]
+    fn rooted_targets_are_not_moved_onto_the_cwd() {
+        // A rooted target is matched as given, so `/box/allowed` keeps
+        // meaning the same subtree whatever the cwd is.
+        let p = Permissions::from_opts(Some(opts_write_only(vec!["/box/allowed".into()])));
+        assert!(p.check_write("/box/allowed/f").is_ok());
+        assert!(p.check_write("f").is_err());
     }
 
     #[test]

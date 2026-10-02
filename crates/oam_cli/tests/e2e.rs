@@ -30387,6 +30387,88 @@ fn every_path_fs_op_respects_the_permission_model() {
     }
 }
 
+/// A relative path is checked where it points: node resolves it against the
+/// cwd of the moment before matching the grant, and resolves a relative
+/// grant (`--allow-fs-write=.`) once at startup. oam matched the raw string,
+/// so a relative target never matched an absolute grant: under
+/// `--allow-fs-write=<cwd>` mkdtempSync("dt-") (template "dt-XXXXXX", which
+/// node's binding checks unresolved), writeFileSync("wf-x") and
+/// mkdirSync("mk-x") were all denied where node v22.22.2 allows them.
+/// Expected lines measured against node v22.22.2 on Windows.
+#[test]
+fn a_relative_path_is_checked_against_the_cwd_as_node_does() {
+    let script = write_temp(
+        "fs_perm_relative.cjs",
+        "const fs = require('fs'), fsp = require('fs/promises');\n\
+         const t = (label, fn) => {\n\
+           try { const r = fn(); console.log(label + '=' + (typeof r === 'string' ? r.replace(/[A-Za-z0-9]{6}$/, '<6>') : 'OK')); }\n\
+           catch (e) { console.log(label + '=' + e.code + ' ' + JSON.stringify(e.resource ?? e.path)); }\n\
+         };\n\
+         t('mkdtemp', () => fs.mkdtempSync('dt-'));\n\
+         t('mkdtempDot', () => fs.mkdtempSync('./dt-'));\n\
+         t('mkdtempSub', () => fs.mkdtempSync('sub/dt-'));\n\
+         t('mkdtempEmpty', () => fs.mkdtempSync(''));\n\
+         t('mkdtempUp', () => fs.mkdtempSync('../A/dt-'));\n\
+         t('mkdtempUpViaSub', () => fs.mkdtempSync('sub/../../A/dt-'));\n\
+         t('write', () => fs.writeFileSync('wf-x', 'x'));\n\
+         t('mkdir', () => fs.mkdirSync('mk-x'));\n\
+         process.chdir('../A');\n\
+         t('chdirA.writeHere', () => fs.writeFileSync('wf-y', 'x'));\n\
+         t('chdirA.writeBack', () => fs.writeFileSync('../B/wf-z', 'x'));\n\
+         process.chdir('../B/sub');\n\
+         t('chdirSub.write', () => fs.writeFileSync('wf-s', 'x'));\n\
+         fsp.mkdtemp('./pr-').then((r) => console.log('promises=' + r.replace(/[A-Za-z0-9]{6}$/, '<6>')),\n\
+           (e) => console.log('promises=' + e.code));\n",
+    );
+    let script = script.to_string_lossy().to_string();
+    for (case, grant) in [("abs", None), ("dot", Some(".")), ("up", Some("../B"))] {
+        let root = write_temp(&format!("fs_perm_relative_{case}/B/sub/.keep"), "")
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::create_dir_all(root.parent().unwrap().join("A")).unwrap();
+        let abs = root.to_string_lossy().to_string();
+        let grant = format!("--allow-fs-write={}", grant.unwrap_or(&abs));
+        let mut cmd = oam_command(&["--permission", "--allow-fs-read=*", &grant, &script]);
+        cmd.current_dir(&root);
+        let out = bounded_output(&mut cmd);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let expected = [
+            "mkdtemp=dt-<6>",
+            "mkdtempDot=./dt-<6>",
+            "mkdtempSub=sub/dt-<6>",
+            // Admitted, then refused by mkdtemp itself, as node does.
+            "mkdtempEmpty=EINVAL \"XXXXX\"",
+            "mkdtempUp=ERR_ACCESS_DENIED \"../A/dt-XXXXXX\"",
+            "mkdtempUpViaSub=ERR_ACCESS_DENIED \"sub/../../A/dt-XXXXXX\"",
+            "write=OK",
+            "mkdir=OK",
+            "chdirA.writeHere=ERR_ACCESS_DENIED",
+            "chdirA.writeBack=OK",
+            // A relative grant was resolved at startup, not at the check.
+            "chdirSub.write=OK",
+            "promises=./pr-<6>",
+        ];
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(
+            lines.len(),
+            expected.len(),
+            "grant {grant}:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for (line, want) in lines.iter().zip(expected) {
+            assert!(
+                line.starts_with(want),
+                "grant {grant}: want {want}, got {line}\n{stdout}"
+            );
+        }
+        assert!(root.join("wf-x").is_file() && root.join("mk-x").is_dir());
+        assert!(!root.parent().unwrap().join("A").join("wf-y").exists());
+    }
+}
+
 /// An open that can write is checked as a write whichever API makes it. The
 /// async open (fs/promises.open, the callback fs.open, and the path forms built
 /// on it such as fs/promises.truncate) checked "r+" and the numeric O_RDWR as

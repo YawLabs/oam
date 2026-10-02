@@ -269,6 +269,15 @@ Differences from Node's model:
   never as addresses JS could substitute. A fetch's `connect.lookup` answers follow the
   fetch rule (entry 38: bracketed, no port). The name itself is checked before it is
   looked up, so a refused name is never resolved.
+- **A relative path is checked where it points, as in Node.** A path with no root is
+  resolved against the cwd of the moment before it is matched (so `process.chdir` moves
+  it), and a relative grant (`--allow-fs-write=.`, `=../out`) against the cwd at startup.
+  Up to 0.17.1 oam matched the raw string, so `writeFileSync("out.txt")`, `mkdirSync("d")`
+  and `mkdtempSync("tmp-")` were refused under a grant of the cwd that Node honours. What
+  still differs is the denial's `resource`: oam reports the path as the script passed it,
+  where Node's spelling varies by op -- `mkdtempSync` names the template as passed, but
+  `writeFileSync("wf-y")` on Windows names the resolved, `\\?\`-prefixed path
+  (`\\?\C:\work\wf-y`), and a rooted `\x` names `\\?\C:\x` (measured against v22.22.2).
 - **A denied environment read is silent; every other denial throws.** Filesystem,
   network and child-process denials throw `ERR_ACCESS_DENIED` as described above. A
   variable denied by `--allow-env` is instead simply absent from `process.env` and reads
