@@ -6,8 +6,9 @@ four stricter rules in the chunked-body decoder (items 5 to 8), a
 CONNECT request read without a body (item 9), the `host` field kept out
 of an HTTP/2 request (item 10), an on-demand header buffer (item 11), a
 server response's trailers sent as node sends them (item 12), an
-HTTP/1.0 request's response framed as node frames it (item 13), and a public
-`HeaderCaseMap` (item 14). The root
+HTTP/1.0 request's response framed as node frames it (item 13), a public
+`HeaderCaseMap` (item 14), and an HTTP/1.0 peer's response keeping the
+connection header it carries (item 15). The root
 `Cargo.toml` swaps it in with `[patch.crates-io]`.
 
 - **Upstream:** `hyper-1.10.1.crate`, sha256
@@ -25,8 +26,8 @@ HTTP/1.0 request's response framed as node frames it (item 13), and a public
   the unsafe-budget scan. After an edit here, `scripts/check-vendor.sh
   --regen` rewrites the diff; review it and commit it with the edit.
 - **Remove it when** a hyper release ships the fix and items 5 to 10, **and**
-  oam no longer needs items 4 and 11 to 14 (see "The request-head extension"
-  below for what replacing item 4 takes; items 12 to 14 serve node's rules,
+  oam no longer needs items 4 and 11 to 15 (see "The request-head extension"
+  below for what replacing item 4 takes; items 12 to 15 serve node's rules,
   which hyper has no reason to adopt). To do that:
   1. Delete this directory.
   2. Delete the `[patch.crates-io]` entry and the `exclude = ["vendor"]` line
@@ -136,6 +137,13 @@ whole of it.
     names. Visibility and doc comments only: hyper's server already writes
     a response's names from such a map when its extensions hold one. See
     "Header name case" below.
+15. **`src/proto/h1/conn.rs`, `Conn::fix_keep_alive` (and
+    `enforce_version`, which hands it the body's length).** For an HTTP/1.0
+    peer that asked for keep-alive, a response's `Connection` header is no
+    longer replaced with `keep-alive`: hyper adds one only when the response
+    has none, and only before a framed body; one of unknown length with no
+    `Transfer-Encoding` ends by closing, so keep-alive is turned off instead.
+    See "HTTP/1.0 keep-alive" below.
 
 ## Why
 
@@ -503,6 +511,36 @@ on a node:http connection), where node writes them as given.
 
 Tested by conformance case 270 (identical to node v22.22.2; does not compile
 against stock 1.10.1) and `http_server::name_case_tests`.
+
+## HTTP/1.0 keep-alive (item 15)
+
+`Conn::enforce_version` calls `fix_keep_alive` for an HTTP/1.0 peer before it
+sets the response's version to the peer's, so `fix_keep_alive`'s
+`match head.version` sees the response's own `HTTP/1.1` and, when the peer
+asked for keep-alive and the response's `Connection` header is not
+`keep-alive`, inserts `Connection: keep-alive` -- over a `close` the
+application set (and the encoder, seeing `keep-alive`, kept the connection),
+and before a body of unknown length that it then ended by closing the
+connection, so the header said the opposite of the framing. node writes the
+handler's connection header as it was set, and when there is none says
+`keep-alive` only before a framed body (`content-length`, or chunks for a
+`TE: chunked` request) and `close` otherwise.
+
+With the patch the insert happens only when the response carries no
+`Connection` header at all, and only when its body is framed: a body of
+unknown length with no `Transfer-Encoding` turns keep-alive off instead
+(as hyper's `HTTP_10` arm does for a response that does not ask for it), so
+it goes out with no `Connection` header and the connection closes after it.
+A `close` the response carries is written as it is, and the encoder turns
+keep-alive off for it as for an HTTP/1.1 peer. oam's node:http
+`ServerResponse` always sends a connection header to an HTTP/1.0 client
+(node's choice, or the handler's), so hyper's insert is left to `oam.serve`
+and the http2 compat server, whose framed responses to a keep-alive 1.0
+client keep their connection as before.
+
+Tested by conformance case 269 (identical to node v22.22.2; on stock 1.10.1
+a handler's `close` goes out as `keep-alive`). hyper 1.11.0 has the same
+`fix_keep_alive` (checked 2026-10-01).
 
 ## Upstream status (checked 2026-09-18)
 

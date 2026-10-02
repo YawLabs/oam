@@ -11,7 +11,7 @@ use std::time::Duration;
 use crate::rt::{Read, Write};
 use bytes::{Buf, Bytes};
 use futures_core::ready;
-use http::header::{HeaderValue, CONNECTION};
+use http::header::{HeaderValue, CONNECTION, TRANSFER_ENCODING};
 use http::{HeaderMap, Method, Version};
 use http_body::Frame;
 use httparse::ParserConfig;
@@ -608,7 +608,7 @@ where
             self.state.busy();
         }
 
-        self.enforce_version(&mut head);
+        self.enforce_version(&mut head, body.as_ref());
 
         let buf = self.io.headers_buf();
         match super::role::encode_headers::<T>(
@@ -646,7 +646,7 @@ where
     }
 
     // Fix keep-alive when Connection: keep-alive header is not present
-    fn fix_keep_alive(&mut self, head: &mut MessageHead<T::Outgoing>) {
+    fn fix_keep_alive(&mut self, head: &mut MessageHead<T::Outgoing>, body: Option<&BodyLength>) {
         let outgoing_is_keep_alive = head
             .headers
             .get(CONNECTION)
@@ -659,10 +659,23 @@ where
                 Version::HTTP_10 => self.state.disable_keep_alive(),
                 // If response is version 1.1 and keep-alive is wanted, add
                 // Connection: keep-alive header when not present
+                //
+                // oam: only when the message has no Connection header at
+                // all -- one it carries (`close`) is kept, not replaced, and
+                // the encoder turns keep-alive off for it -- and only when
+                // its body is framed: one of unknown length with no
+                // Transfer-Encoding ends by closing the connection to an
+                // HTTP/1.0 peer, which a keep-alive header would contradict.
                 Version::HTTP_11 => {
-                    if self.state.wants_keep_alive() {
-                        head.headers
-                            .insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+                    if self.state.wants_keep_alive() && !head.headers.contains_key(CONNECTION) {
+                        let close_delimited = matches!(body, Some(BodyLength::Unknown))
+                            && !head.headers.contains_key(TRANSFER_ENCODING);
+                        if close_delimited {
+                            self.state.disable_keep_alive();
+                        } else {
+                            head.headers
+                                .insert(CONNECTION, HeaderValue::from_static("keep-alive"));
+                        }
                     }
                 }
                 _ => (),
@@ -672,11 +685,11 @@ where
 
     // If we know the remote speaks an older version, we try to fix up any messages
     // to work with our older peer.
-    fn enforce_version(&mut self, head: &mut MessageHead<T::Outgoing>) {
+    fn enforce_version(&mut self, head: &mut MessageHead<T::Outgoing>, body: Option<&BodyLength>) {
         match self.state.version {
             Version::HTTP_10 => {
                 // Fixes response or connection when keep-alive header is not present
-                self.fix_keep_alive(head);
+                self.fix_keep_alive(head, body);
                 // If the remote only knows HTTP/1.0, we should force ourselves
                 // to do only speak HTTP/1.0 as well.
                 head.version = Version::HTTP_10;

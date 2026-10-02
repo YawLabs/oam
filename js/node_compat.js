@@ -17773,6 +17773,7 @@
         // the body chunked, and with both removed it frames it by closing.
         if (key === "content-length") this._removedContLen = true;
         else if (key === "transfer-encoding") this._removedTE = true;
+        else if (key === "connection") this._removedConnection = true;
         this._headers.delete(key);
         if (this._names !== undefined) this._names.delete(key);
       }
@@ -17872,6 +17873,7 @@
           switch (name.toLowerCase()) {
             case "connection":
               connection = true;
+              this._removedConnection = false;
               break;
             case "transfer-encoding":
               te = true;
@@ -17934,10 +17936,19 @@
         // can carry: node refuses the head (an HTTP/1.0 client's without
         // `TE: chunked`, a 204's, one with a content-length, ...).
         if (trailer && !this._chunked) throw codes.ERR_HTTP_TRAILER_INVALID();
+        if (http10 && !connection && !this._removedConnection) {
+          // node's keep-alive rule for a head with no connection field: an
+          // HTTP/1.0 client's connection is kept when it asked for that
+          // (`Connection: keep-alive`) and the body is framed -- by a
+          // content-length field, or chunked for a `TE: chunked` client --
+          // and closed otherwise, and node says which. hyper keeps what the
+          // head says (vendor/hyper-1.10.1/OAM-PATCH.md item 15). A removed
+          // connection header sends none, as node's does.
+          const keep = (contLen || chunksByDefault) &&
+            KEEP_ALIVE_TOKEN.test((req.headers && req.headers.connection) || "");
+          fields.push(["Connection", keep ? "keep-alive" : "close"]);
+        }
         if (http10) {
-          // node does not keep an HTTP/1.0 client's connection, and says so
-          // when the handler did not. hyper closes it without a word.
-          if (!connection) fields.push(["Connection", "close"]);
           // node chunks for an HTTP/1.0 client that sent `TE: chunked`;
           // hyper does that only for a response that says so itself.
           if (this._chunked && !te) fields.push(["Transfer-Encoding", "chunked"]);
@@ -22486,6 +22497,9 @@
     // node's `chunked` test of a transfer-encoding value (RE_TE_CHUNKED,
     // and chunkExpression for a request's TE).
     var CHUNKED_CODING = /(?:^|\W)chunked(?:$|\W)/i;
+    // A `keep-alive` token in a request's Connection value: what makes
+    // node's parser keep an HTTP/1.0 client's connection.
+    var KEEP_ALIVE_TOKEN = /(?:^|,)[ \t]*keep-alive[ \t]*(?:,|$)/i;
     // A character outside ASCII: the only kind whose bytes depend on how a
     // head is written.
     var NON_ASCII = /[^\x00-\x7f]/;

@@ -1880,16 +1880,21 @@ status message -- `statusMessage`, or `writeHead()`'s reason, in the head's byte
 oam used to send the standard reason phrase whatever the message said (and hyper's spelling
 of it: `I'm a teapot` for Node's `I'm a Teapot`, `<none>` for Node's `unknown`).
 An HTTP/1.0 request's response is Node's too: `req.httpVersion` (and `httpVersionMajor` /
-`httpVersionMinor`) say `1.0`; the status line says `HTTP/1.1`; `Connection: close` is sent
-unless the handler set a connection header; a body is ended by closing the connection
+`httpVersionMinor`) say `1.0`; the status line says `HTTP/1.1`; a connection header the
+handler set goes out as it was set, and otherwise Node's is sent: `Connection: keep-alive`,
+and the connection is kept, when the request said `Connection: keep-alive` and the body is
+framed (a `content-length` field, or chunks for a `TE: chunked` request), else `Connection:
+close`; a body is ended by closing the connection
 (`end('text')` sends no `content-length`) unless the request sent `TE: chunked`, which gets
 the chunked body -- and its trailers -- an HTTP/1.1 client would; a `transfer-encoding` header
 the handler sets is honoured; and a `Trailer` header on a body that cannot be chunked (there,
 on a 204, or beside a `content-length`) throws `ERR_HTTP_TRAILER_INVALID` from whatever builds
 the head, as Node's does (`vendor/hyper-1.10.1/OAM-PATCH.md` item 13 has the hyper side). Up
 to 0.17.1 `req.httpVersion` was always `'1.1'`, the status line said `HTTP/1.0`, no
-`Connection` header went out, `end('text')` sent a `content-length`, a `TE: chunked` client
-got no chunks and a `Trailer` header never threw.
+`Connection` header went out (to a `Connection: keep-alive` request, hyper's `keep-alive`,
+even over a `close` the handler set, and even before a body it ended by closing), `end('text')`
+sent a `content-length`, a `TE: chunked` client got no chunks and a `Trailer` header never
+threw (`vendor/hyper-1.10.1/OAM-PATCH.md` item 15 has the connection header).
 `conformance/cases/250-http-response-header-validation.mjs`,
 `251-http-response-header-bytes.mjs`, `266-http-writehead-builds-the-head.mjs`,
 `267-http-response-reason-phrase.mjs`, `268-http-response-trailers.mjs` and
@@ -1899,6 +1904,14 @@ got no chunks and a `Trailer` header never threw.
   `transfer-encoding` header removed (`res.removeHeader('transfer-encoding')`) and no length
   known, Node sends the body bare and closes the connection after it; hyper, which frames
   oam's responses, has no way to end an HTTP/1.1 body by closing, and chunks it.
+- **A connection header the handler removed, or set on a request that said `close`.** On
+  an HTTP/1.0 request that said `Connection: keep-alive`, after
+  `res.removeHeader('connection')` Node sends no connection header and keeps the connection
+  when the body is framed; hyper sends `Connection: keep-alive` there (and nothing, closing,
+  when it is not, as Node). On an HTTP/1.1 request that said `Connection: close`, a
+  connection header the handler set (`keep-alive`, or any value but `close`) goes out from
+  Node as set and Node keeps the connection; hyper sends `Connection: close` in its place
+  and closes.
 - **Trailer names go out in title case.** `addTrailers()`'s fields follow the last chunk of a
   chunked body as Node sends them -- all of them, a repeated one once per value, whether or
   not a `Trailer` header names them and whatever the request's `TE` says, and none on a body
@@ -1948,8 +1961,9 @@ many are open is closed at once and the server emits `'drop'`. What differs:
   and `end` (which closes the connection once what is being written is out; there is no
   half-close), and answers `instanceof net.Socket` -- and on an `https` server `instanceof
   tls.TLSSocket` -- by brand.
-- Responses carry no `Connection: keep-alive` / `Keep-Alive: timeout=N` headers, so a
-  client cannot learn the keep-alive timeout from them.
+- Responses carry no `Keep-Alive: timeout=N` header, and an HTTP/1.1 response no
+  `Connection: keep-alive` (an HTTP/1.0 one does, as Node's, entry 46), so a client cannot
+  learn the keep-alive timeout from them.
 - When a request timeout closes a connection while the handler is reading the body, the
   request's `'error'` can come before the response's `'close'` (Node emits `'aborted'`,
   then the response's `'close'`, then `'error'`).
