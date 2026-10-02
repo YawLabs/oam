@@ -21223,11 +21223,32 @@
       // node's deprecated alias for `socket`.
       get connection() { return this.socket; }
       set connection(value) { this.socket = value; }
+      // node's OutgoingMessage checks: once the head exists (`_header`: the
+      // first write(), end() or flushHeaders() renders it) a header can no
+      // longer be set, appended or removed -- ERR_HTTP_HEADERS_SENT, checked
+      // first. oam took them, and a header set after a write() in the same
+      // tick still reached the wire.
       setHeader(name, value) {
+        if (this._header) throw codes.ERR_HTTP_HEADERS_SENT("set");
         checkOutgoingHeader(name, value);
         var key = name.toLowerCase();
         if (key === "connection") this._removedConnection = false;
         this._headers[key] = value;
+        return this;
+      }
+      // node's appendHeader: the first value of a name is set as it is; a
+      // later one turns the stored value into a list (a list given is
+      // spread into it).
+      appendHeader(name, value) {
+        if (this._header) throw codes.ERR_HTTP_HEADERS_SENT("append");
+        checkOutgoingHeader(name, value);
+        var key = name.toLowerCase();
+        if (key === "connection") this._removedConnection = false;
+        if (Object.hasOwn(this._headers, key)) {
+          this._headers[key] = [].concat(this._headers[key], value);
+        } else {
+          this._headers[key] = value;
+        }
         return this;
       }
       getHeader(name) {
@@ -21236,6 +21257,7 @@
       }
       removeHeader(name) {
         checkHeaderNameArg(name);
+        if (this._header) throw codes.ERR_HTTP_HEADERS_SENT("remove");
         var key = name.toLowerCase();
         // node: a removed Connection header is not sent at all.
         if (key === "connection") this._removedConnection = true;
@@ -21268,6 +21290,9 @@
         if (this._header === null) this._header = this._renderHead();
       }
       flushHeaders() {
+        // node renders the head here (`_implicitHeader`), so headersSent is
+        // true from now on.
+        if (!this._header && !this._aborted && !this.destroyed) this._markHeadersSent();
         // The fetch path sends headers with the body. The agent path sends
         // them now, the body following over the channel.
         if (this._agentPath && !this._sent && !this.finished) this._startBodyStream(true);
@@ -21286,6 +21311,10 @@
           }
           return false;
         }
+        // node's write_ renders the head on the first write
+        // (`_implicitHeader`): headersSent is true as write() returns, and
+        // the header setters refuse from then on.
+        if (!this._header) this._markHeadersSent();
         var bytes;
         if (typeof chunk === "string") {
           bytes = globalThis.Buffer.from(chunk, encoding || "utf8");
@@ -21815,12 +21844,12 @@
         // the value sent here is the one _header shows; the one side effect,
         // setting shouldKeepAlive for a caller-set non-close header, is the
         // same both times.
-        var headers = self._headers;
-        var connection = self._connectionHeader();
-        if (connection !== null) {
-          headers = Object.assign({ __proto__: null }, headers);
-          headers.connection = connection;
-        }
+        //
+        // As [name, value] lines (_headerList), so a header whose value is a
+        // list -- setHeader(name, [...]), appendHeader() -- goes out one line
+        // per value, as node writes it; a header object handed over here
+        // joined the list with "," into one line.
+        var headers = self._headerList(true);
         var fetchOpts = {
           method: self.method,
           headers: headers,
