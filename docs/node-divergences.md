@@ -2327,47 +2327,100 @@ the header methods throw `ERR_HTTP_HEADERS_SENT`. A value up to U+00FF goes on t
 Node writes it, which depends on what is sent first: joined to a string body in utf8 (or no
 encoding) the head is UTF-8 (`café` is `caf\xc3\xa9` from `res.end('text')` or
 `flushHeaders()`), and before anything else -- a chunk-size line, a Buffer, a string in
-another encoding, nothing -- it is one byte per code point (`caf\xe9`). Up to 0.17.1 oam
+another encoding, nothing -- it is one byte per code point (`caf\xe9`). An `http.request`'s
+head follows the same rule, on every path oam sends it by -- its own transport, an agent's
+socket, a head written by hand for an upgrade or CONNECT -- (`req.end('text')`, a GET's
+`write('text')`, `flushHeaders()` send UTF-8; `req.end()`, a Buffer, a POST's chunked
+`write('text')` one byte per code point; `conformance/cases/271-http-request-header-bytes.mjs`),
+where oam's client wrote every value one byte per code point. Up to 0.17.1 oam
 stored any header -- `res.setHeader('y', '€')` did not throw -- and wrote every value as its
 UTF-8; a CR or LF reached hyper and was answered `500`. `appendHeader` wrote to the wrong
 store, and `setHeaders` and `addTrailers` did not exist.
-`conformance/cases/250-http-response-header-validation.mjs` and
-`251-http-response-header-bytes.mjs` hold this to node v22.22.2. What still differs:
+`writeHead()` -- or the first `write()`, `end()` or `flushHeaders()`, when it was not called
+-- builds the head as Node's `_storeHeader` does: `headersSent` turns true, the status, the
+fields and the body's framing are fixed (a later `statusCode` does not change the status
+line), and headers handed to `writeHead()` on a response no header method has touched go into
+the head only, so `getHeader()` and the rest never see them. The body is framed by Node's
+rules: by a `content-length` or `transfer-encoding` field when there is one; otherwise not at
+all for a HEAD request or a 204 / 304 (what `end()` was given is dropped, and no
+`content-length` goes out for it; one the handler set goes out as set, a 304's included,
+where hyper used to drop a 204's and a 304's, `vendor/hyper-1.10.1/OAM-PATCH.md` item 16), by length when `end()` built the head, and chunked when
+`writeHead()` did -- so `writeHead(200); end('text')` is chunked, and `writeHead(200); end()`
+sends the last chunk alone. Up to 0.17.1 `headersSent` stayed false until the first body
+bytes, `writeHead()`'s headers showed in `getHeader()`, a later `statusCode` was sent, every
+`end()` sent a `content-length` (a HEAD response's for the body it dropped), and a second
+`writeHead()` added its headers to the first one's. The status line carries the response's
+status message -- `statusMessage`, or `writeHead()`'s reason, in the head's bytes -- where
+oam used to send the standard reason phrase whatever the message said (and hyper's spelling
+of it: `I'm a teapot` for Node's `I'm a Teapot`, `<none>` for Node's `unknown`).
+An HTTP/1.0 request's response is Node's too: `req.httpVersion` (and `httpVersionMajor` /
+`httpVersionMinor`) say `1.0`; the status line says `HTTP/1.1`; a connection header the
+handler set goes out as it was set, and otherwise Node's is sent: `Connection: keep-alive`,
+and the connection is kept, when the request said `Connection: keep-alive` and the body is
+framed (a `content-length` field, or chunks for a `TE: chunked` request), else `Connection:
+close`; a body is ended by closing the connection
+(`end('text')` sends no `content-length`) unless the request sent `TE: chunked`, which gets
+the chunked body -- and its trailers -- an HTTP/1.1 client would; a `transfer-encoding` header
+the handler sets is honoured; and a `Trailer` header on a body that cannot be chunked (there,
+on a 204, or beside a `content-length`) throws `ERR_HTTP_TRAILER_INVALID` from whatever builds
+the head, as Node's does (`vendor/hyper-1.10.1/OAM-PATCH.md` item 13 has the hyper side). Up
+to 0.17.1 `req.httpVersion` was always `'1.1'`, the status line said `HTTP/1.0`, no
+`Connection` header went out (to a `Connection: keep-alive` request, hyper's `keep-alive`,
+even over a `close` the handler set, and even before a body it ended by closing), `end('text')`
+sent a `content-length`, a `TE: chunked` client got no chunks and a `Trailer` header never
+threw (`vendor/hyper-1.10.1/OAM-PATCH.md` item 15 has the connection header).
+`conformance/cases/250-http-response-header-validation.mjs`,
+`251-http-response-header-bytes.mjs`, `266-http-writehead-builds-the-head.mjs`,
+`267-http-response-reason-phrase.mjs`, `268-http-response-trailers.mjs` and
+`269-http-response-http10.mjs` hold this to node v22.22.2. What still differs:
 
-- **`writeHead()` does not send the head.** As in Node, `headersSent` turns true there and
-  the header methods, a second `writeHead()` among them, throw `ERR_HTTP_HEADERS_SENT` from
-  then on, but oam sends the head with the first body bytes or `end()`. So headers given to
-  `writeHead()` on a response no header method has touched show in `getHeader()` /
-  `hasHeader()`, where Node's never do, and `end('text')` after `writeHead()` sends a
-  `content-length` where Node frames the body chunked. The bytes a header value goes out as
-  follow Node's framing all the same. Up to 0.17.1 `headersSent` stayed false and the header
-  methods kept working after `writeHead()`; a second `writeHead()` replaced the first one's
-  headers.
-- **The status line carries the status code's standard reason phrase**, not
-  `res.statusMessage`: a message is checked as Node checks it and stays readable, but is not
-  sent.
-- **Response trailers are not sent.** `addTrailers()` checks its names and values as Node
-  does and keeps them, and a `Trailer` header does not switch the response to chunked
-  framing as it does in Node.
+- **A body Node ends by closing the connection is chunked over HTTP/1.1.** With its
+  `transfer-encoding` header removed (`res.removeHeader('transfer-encoding')`) and no length
+  known, Node sends the body bare and closes the connection after it; hyper, which frames
+  oam's responses, has no way to end an HTTP/1.1 body by closing, and chunks it.
+- **A connection header the handler removed, or set on a request that said `close`.** On
+  an HTTP/1.0 request that said `Connection: keep-alive`, after
+  `res.removeHeader('connection')` Node sends no connection header and keeps the connection
+  when the body is framed; hyper sends `Connection: keep-alive` there (and nothing, closing,
+  when it is not, as Node). On an HTTP/1.1 request that said `Connection: close`, a
+  connection header the handler set (`keep-alive`, or any value but `close`) goes out from
+  Node as set and Node keeps the connection; hyper sends `Connection: close` in its place
+  and closes.
+- **An `http.request` body Node chunks can go out with a length.** A POST's `end('text')`
+  after `setHeader('Trailer', ...)` or `removeHeader('content-length')`, and a `write()`
+  followed by `end()` in the same tick, are chunked by Node; oam's client, which has the
+  whole body by then, sends it with a `content-length`. The head's bytes are Node's either
+  way (one byte per code point, case 271). A GET's `Trailer` header makes Node's `end()`
+  throw `ERR_HTTP_TRAILER_INVALID`; oam's client sends the request.
+- **Trailer names go out in title case.** `addTrailers()`'s fields follow the last chunk of a
+  chunked body as Node sends them -- all of them, a repeated one once per value, whether or
+  not a `Trailer` header names them and whatever the request's `TE` says, and none on a body
+  framed otherwise (case 268; oam sent none up to 0.17.1, as hyper sends only declared
+  trailers to a `TE: trailers` request, `vendor/hyper-1.10.1/OAM-PATCH.md` item 12) -- but
+  hyper writes each name in the title case a node:http connection uses for names it has no
+  spelling for (`x-t` goes out as `X-T`, `Content-MD5` as `Content-Md5`), where Node writes
+  it as given. The trailers reach hyper's encoder as a body's trailers frame, a `HeaderMap`,
+  which keeps no spelling, and the head's `HeaderCaseMap` goes out before the trailers are
+  known; carrying the spellings needs a path of their own from the body to the encoder,
+  which oam does not have yet. Lowercase would match only the names given in lowercase, as
+  title case matches only those given in title case.
 - **A `content-disposition` value is not re-encoded.** When the response's length is known,
   Node v22.22.2 converts the value with `Buffer.from(value, 'latin1')` and turns it back into
   a string as UTF-8, so a non-ASCII value is corrupted: `café` goes out as `caf` plus the
   UTF-8 of U+FFFD after `res.end('text')`, and as `caf\xfd` after `res.end(buffer)`, and
   `writeHead()` refuses it (`ERR_INVALID_CHAR`) when a `content-length` comes before it. oam
   writes it as any other header value (`caf\xc3\xa9`, `caf\xe9`).
-- **An HTTP/1.0 request's response is framed by hyper.** `req.httpVersion` (and
-  `httpVersionMajor` / `httpVersionMinor`) say `1.0` as Node's do, and the header bytes follow
-  Node's framing for it -- a head joined to a UTF-8 string body, from `write('text')` as well
-  as `end('text')`, is UTF-8. But the status line says `HTTP/1.0` where Node's says
-  `HTTP/1.1`; `end('text')` adds a `content-length` where Node closes the connection to end
-  the body; a request saying `TE: chunked` does not get the chunked body Node sends it; and a
-  `Trailer` header does not throw `ERR_HTTP_TRAILER_INVALID` as it does in Node, which cannot
-  chunk the response. Up to 0.17.1 `req.httpVersion` was always `'1.1'` and the server request
-  had no `httpVersionMajor` / `httpVersionMinor`, so such a head went out one byte per code
-  point.
-- **Header names go out lowercased**, as hyper writes them; Node keeps the case they were
-  set in, and writes the ones it adds as `Content-Length`, `Transfer-Encoding`, `Date`,
-  `Connection`.
+- **A refused head's `content-length` is not reused.** When `writeHead()` throws (a
+  `Trailer` header beside a `content-length`), Node keeps the length it read and sends it
+  with the next head that does not name one, whatever the body's length; oam sends the
+  body's length (hyper's), which is what the body is.
+- **The fields Node adds come in hyper's order.** Node writes the handler's fields, then
+  `Date`, `Connection`, and `Content-Length` or `Transfer-Encoding`; hyper writes the
+  handler's fields (each name's values together, where Node keeps a list's order across
+  names), then `Connection`, the framing field and `Date` last. The names themselves are
+  Node's: each as the handler spelled it (`getRawHeaderNames()` answers them), and the added
+  ones as `Date`, `Content-Length`, `Transfer-Encoding`, `Connection` (case 270,
+  `vendor/hyper-1.10.1/OAM-PATCH.md` item 14). Up to 0.17.1 every name went out lowercase.
 
 ### 41. The HTTP server's timeouts and connection count: what still differs
 
@@ -2392,8 +2445,9 @@ many are open is closed at once and the server emits `'drop'`. What differs:
   and `end` (which closes the connection once what is being written is out; there is no
   half-close), and answers `instanceof net.Socket` -- and on an `https` server `instanceof
   tls.TLSSocket` -- by brand.
-- Responses carry no `Connection: keep-alive` / `Keep-Alive: timeout=N` headers, so a
-  client cannot learn the keep-alive timeout from them.
+- Responses carry no `Keep-Alive: timeout=N` header, and an HTTP/1.1 response no
+  `Connection: keep-alive` (an HTTP/1.0 one does, as Node's, entry 46), so a client cannot
+  learn the keep-alive timeout from them.
 - When a request timeout closes a connection while the handler is reading the body, the
   request's `'error'` can come before the response's `'close'` (Node emits `'aborted'`,
   then the response's `'close'`, then `'error'`).

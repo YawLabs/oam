@@ -181,9 +181,17 @@ impl fmt::Debug for Protocol {
 /// ```
 ///
 /// [`preserve_header_case`]: /client/struct.Client.html#method.preserve_header_case
+///
+/// oam patch: public, so a server response can carry one: a response whose
+/// extensions hold a map writes each header name as the map spells it (the
+/// spellings of one name in the order its values go out); a name the map
+/// does not hold goes out as it would without one.
 #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
 #[derive(Clone, Debug)]
-pub(crate) struct HeaderCaseMap(HeaderMap<Bytes>);
+pub struct HeaderCaseMap(
+    /// Each lowercased name's spellings.
+    pub HeaderMap<Bytes>,
+);
 
 #[cfg(all(any(feature = "client", feature = "server"), feature = "http1"))]
 impl HeaderCaseMap {

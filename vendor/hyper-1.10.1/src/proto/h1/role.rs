@@ -437,7 +437,10 @@ impl Http1Transaction for Server {
             extend(dst, b"HTTP/1.1 200 OK\r\n");
         } else {
             match msg.head.version {
-                Version::HTTP_10 => extend(dst, b"HTTP/1.0 "),
+                // oam patch: a response to an HTTP/1.0 request says
+                // HTTP/1.1, the version the server speaks (RFC 9110 2.5), as
+                // node's does; its framing still follows the 1.0 peer.
+                Version::HTTP_10 => extend(dst, b"HTTP/1.1 "),
                 Version::HTTP_11 => extend(dst, b"HTTP/1.1 "),
                 Version::HTTP_2 => {
                     debug!("response with HTTP2 version coerced to HTTP/1.1");
@@ -679,7 +682,6 @@ impl Server {
         };
 
         let mut encoder = Encoder::length(0);
-        let mut allowed_trailer_fields: Option<Vec<HeaderName>> = None;
         let mut wrote_date = false;
         let mut cur_name = None;
         let mut is_name_written = false;
@@ -800,8 +802,19 @@ impl Server {
                             //
                             // - The header says the length is `0`.
                             // - This is a response to a `HEAD` request.
+                            //
+                            // oam patch: and a 204 or 304, which has no body
+                            // whatever its headers say: the value the
+                            // application set goes out as set (a 304's is
+                            // the selected representation's length), as
+                            // node's http module writes it.
                             if msg.req_method == &Some(Method::HEAD) {
                                 debug_assert_eq!(encoder, Encoder::length(0));
+                            } else if matches!(
+                                msg.head.subject,
+                                StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+                            ) {
+                                // written below, as any other field
                             } else {
                                 if value.as_bytes() != b"0" {
                                     warn!(
@@ -822,9 +835,11 @@ impl Server {
                         return Err(crate::Error::new_user_header());
                     }
                     // check that we actually can send a chunked body...
-                    if msg.head.version == Version::HTTP_10
-                        || !Server::can_chunked(msg.req_method, msg.head.subject)
-                    {
+                    // oam patch: to an HTTP/1.0 peer too, when the response
+                    // says it is chunked, as node's http module does (for a
+                    // 1.0 request that sent `TE: chunked`, or a handler that
+                    // set the header).
+                    if !Server::can_chunked(msg.req_method, msg.head.subject) {
                         continue;
                     }
                     wrote_len = true;
@@ -870,9 +885,9 @@ impl Server {
                 }
                 header::TRAILER => {
                     // check that we actually can send a chunked body...
-                    if msg.head.version == Version::HTTP_10
-                        || !Server::can_chunked(msg.req_method, msg.head.subject)
-                    {
+                    // oam patch: an HTTP/1.0 peer's chunked response (see
+                    // TRANSFER_ENCODING) announces its trailers too.
+                    if !Server::can_chunked(msg.req_method, msg.head.subject) {
                         continue;
                     }
 
@@ -889,24 +904,9 @@ impl Server {
                         extend(dst, value.as_bytes());
                     }
 
-                    // Parse the Trailer header value into HeaderNames.
-                    // The value may contain comma-separated names.
-                    // HeaderName normalizes to lowercase for case-insensitive matching.
-                    if let Ok(value_str) = value.to_str() {
-                        let names: Vec<HeaderName> = value_str
-                            .split(',')
-                            .filter_map(|s| HeaderName::from_bytes(s.trim().as_bytes()).ok())
-                            .collect();
-
-                        match allowed_trailer_fields {
-                            Some(ref mut fields) => {
-                                fields.extend(names);
-                            }
-                            None => {
-                                allowed_trailer_fields = Some(names);
-                            }
-                        }
-                    }
+                    // oam patch: the header does not limit which trailer
+                    // fields a response sends (it sends them all, as node's
+                    // http module does), so its names are not collected.
 
                     continue 'headers;
                 }
@@ -993,12 +993,6 @@ impl Server {
             extend(dst, b"\r\n\r\n");
         } else {
             extend(dst, b"\r\n");
-        }
-
-        if encoder.is_chunked() {
-            if let Some(allowed_trailer_fields) = allowed_trailer_fields {
-                encoder = encoder.into_chunked_with_trailing_fields(allowed_trailer_fields);
-            }
         }
 
         Ok(encoder.set_last(is_last))

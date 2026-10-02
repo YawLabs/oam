@@ -15247,9 +15247,16 @@ module.exports = function handler(req, res) {
         response1.contains("200 OK"),
         "response1 not 200: {response1}"
     );
-    let body1_start = response1.find('{').expect("JSON body in response1");
+    // The handler answers with writeHead() then end(json), which node -- and
+    // oam -- frame chunked: the JSON sits between the chunk-size line and
+    // the last chunk.
+    let json_in = |response: &str| {
+        let start = response.find('{').expect("JSON body in the response");
+        let end = response.rfind('}').expect("JSON body in the response");
+        response[start..=end].to_string()
+    };
     let body1: serde_json::Value =
-        serde_json::from_str(&response1[body1_start..]).expect("parse response1 JSON");
+        serde_json::from_str(&json_in(&response1)).expect("parse response1 JSON");
     assert_eq!(body1["method"], "GET");
     assert_eq!(body1["url"], "/hello");
     assert!(body1["worker"].as_u64().unwrap() > 0, "worker threadId > 0");
@@ -15259,9 +15266,8 @@ module.exports = function handler(req, res) {
         response2.contains("200 OK"),
         "response2 not 200: {response2}"
     );
-    let body2_start = response2.find('{').expect("JSON body in response2");
     let body2: serde_json::Value =
-        serde_json::from_str(&response2[body2_start..]).expect("parse response2 JSON");
+        serde_json::from_str(&json_in(&response2)).expect("parse response2 JSON");
     assert_eq!(body2["method"], "POST");
     assert_eq!(body2["url"], "/data");
     assert_eq!(body2["body"], r#"{"key":"value"}"#);

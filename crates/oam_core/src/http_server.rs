@@ -338,11 +338,19 @@ pub enum BodyCheckout {
 }
 
 pub enum ResponseBody {
+    /// A body whose length is known before the head goes out: hyper sends
+    /// a `content-length` (or nothing, where the response cannot have a
+    /// body).
     Full(Vec<u8>),
-    /// Chunk channel plus a drop-signal: the oneshot sender rides inside
+    /// A whole body that goes out as if its length were not known: hyper
+    /// frames it chunked, or ends it by closing the connection for an
+    /// HTTP/1.0 client. node:http frames `writeHead(); end('text')` so. The
+    /// trailers go out after it when it is chunked.
+    Unsized(Vec<u8>, Option<hyper::HeaderMap>),
+    /// Frame channel plus a drop-signal: the oneshot sender rides inside
     /// ChannelBody, so dropping the body (finished OR connection lost)
     /// resolves the paired stream_watch receiver.
-    Stream(mpsc::Receiver<Vec<u8>>, oneshot::Sender<()>),
+    Stream(mpsc::Receiver<Frame<Bytes>>, oneshot::Sender<()>),
     /// JS destroyed the request without responding (req.destroy()): the
     /// connection is torn down instead of synthesizing a response, so the
     /// client observes a connection error (Node's socket-destroy semantics).
@@ -350,11 +358,48 @@ pub enum ResponseBody {
 }
 
 pub struct ResponseSpec {
+    pub head: ResponseHead,
+    pub body: ResponseBody,
+}
+
+/// What a response's head is made of.
+pub struct ResponseHead {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    /// How each header value's code points become bytes.
+    /// How each header value's code points -- and the reason phrase's --
+    /// become bytes.
     pub header_bytes: HeaderBytes,
-    pub body: ResponseBody,
+    /// The status line's reason phrase when it is not the status code's
+    /// standard one (node:http's `statusMessage`); hyper writes the standard
+    /// one itself, so the common response carries none.
+    pub reason: Option<String>,
+    /// node:http's: each header name goes out in the case it is spelled in
+    /// here, where hyper writes it lowercase (title case for the names the
+    /// connection adds itself; `http1_builder`).
+    pub name_case: bool,
+}
+
+/// The reason phrase hyper writes for `status` when a response names none
+/// ([`ResponseHead::reason`] is `None`).
+pub fn standard_reason(status: u16) -> Option<&'static str> {
+    hyper::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|code| code.canonical_reason())
+}
+
+impl ResponseHead {
+    /// A head with the standard reason phrase and UTF-8 header values:
+    /// oam.serve's, the http2 compat server's, and the ones oam answers
+    /// with itself.
+    pub fn plain(status: u16, headers: Vec<(String, String)>) -> Self {
+        ResponseHead {
+            status,
+            headers,
+            header_bytes: HeaderBytes::Utf8,
+            reason: None,
+            name_case: false,
+        }
+    }
 }
 
 /// How a response's header values go on the wire.
@@ -452,7 +497,7 @@ pub struct HttpState {
     /// body removes these (lock order: `bodies`, then this).
     trailers: Mutex<HashMap<u64, Vec<(String, String)>>>,
     /// response-stream id -> chunk sender (JS pushes, hyper drains).
-    streams: Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>,
+    streams: Mutex<HashMap<u64, mpsc::Sender<Frame<Bytes>>>>,
     /// response-stream id -> resolves when hyper drops the response body
     /// (normal completion OR connection loss). httpStreamClosed takes the
     /// receiver; JS tells the two cases apart via its own finished flag.
@@ -707,14 +752,8 @@ impl HttpState {
         }
     }
 
-    pub fn respond_full(
-        &self,
-        id: u64,
-        status: u16,
-        headers: Vec<(String, String)>,
-        header_bytes: HeaderBytes,
-        body: Vec<u8>,
-    ) -> bool {
+    /// Answer with a whole body: `ResponseBody::Full` or `Unsized`.
+    pub fn respond_full(&self, id: u64, head: ResponseHead, body: ResponseBody) -> bool {
         let Some(responder) = self
             .pending
             .lock()
@@ -723,30 +762,17 @@ impl HttpState {
         else {
             return false;
         };
-        responder
-            .send(ResponseSpec {
-                status,
-                headers,
-                header_bytes,
-                body: ResponseBody::Full(body),
-            })
-            .is_ok()
+        responder.send(ResponseSpec { head, body }).is_ok()
     }
 
     /// Start a streaming response; returns the stream handle JS pushes to.
-    pub fn respond_stream(
-        &self,
-        id: u64,
-        status: u16,
-        headers: Vec<(String, String)>,
-        header_bytes: HeaderBytes,
-    ) -> Option<u64> {
+    pub fn respond_stream(&self, id: u64, head: ResponseHead) -> Option<u64> {
         let responder = self
             .pending
             .lock()
             .expect("http pending lock")
             .remove(&id)?;
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
+        let (tx, rx) = mpsc::channel::<Frame<Bytes>>(16);
         let (closed_tx, closed_rx) = oneshot::channel::<()>();
         let stream_id = self.next_id();
         self.streams
@@ -759,9 +785,7 @@ impl HttpState {
             .insert(stream_id, closed_rx);
         let ok = responder
             .send(ResponseSpec {
-                status,
-                headers,
-                header_bytes,
+                head,
                 body: ResponseBody::Stream(rx, closed_tx),
             })
             .is_ok();
@@ -787,15 +811,13 @@ impl HttpState {
         };
         responder
             .send(ResponseSpec {
-                status: 0,
-                headers: Vec::new(),
-                header_bytes: HeaderBytes::Utf8,
+                head: ResponseHead::plain(0, Vec::new()),
                 body: ResponseBody::Abort,
             })
             .is_ok()
     }
 
-    pub fn stream_sender(&self, stream_id: u64) -> Option<mpsc::Sender<Vec<u8>>> {
+    pub fn stream_sender(&self, stream_id: u64) -> Option<mpsc::Sender<Frame<Bytes>>> {
         self.streams
             .lock()
             .expect("http streams lock")
@@ -847,11 +869,12 @@ impl HttpState {
     }
 }
 
-/// hyper Body over the JS-pushed chunk channel. `_closed_tx` is never sent
-/// on: its DROP (body finished or connection torn down) is the signal the
-/// paired stream_watch receiver resolves on.
+/// hyper Body over the JS-pushed frame channel: body chunks, and a node:http
+/// response's trailers last. `_closed_tx` is never sent on: its DROP (body
+/// finished or connection torn down) is the signal the paired stream_watch
+/// receiver resolves on.
 struct ChannelBody {
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<Frame<Bytes>>,
     _closed_tx: oneshot::Sender<()>,
 }
 
@@ -863,22 +886,56 @@ impl hyper::body::Body for ChannelBody {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        match self.rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some(chunk)) => {
-                std::task::Poll::Ready(Some(Ok(Frame::data(Bytes::from(chunk)))))
-            }
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
+        self.rx.poll_recv(cx).map(|frame| frame.map(Ok))
     }
+}
+
+/// A whole body that does not tell hyper its length: its size hint is
+/// hyper's default (unknown) and it is not at its end before it is polled,
+/// so hyper frames it as a streamed one -- chunked, or by closing the
+/// connection for an HTTP/1.0 client -- even when it is empty. Its trailers,
+/// if any, follow the data (hyper sends them only on a chunked body).
+struct UnsizedBody {
+    data: Option<Bytes>,
+    trailers: Option<hyper::HeaderMap>,
+}
+
+impl hyper::body::Body for UnsizedBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let data = self.data.take().filter(|bytes| !bytes.is_empty());
+        let frame = data
+            .map(Frame::data)
+            .or_else(|| self.trailers.take().map(Frame::trailers));
+        std::task::Poll::Ready(frame.map(Ok))
+    }
+}
+
+/// A node:http response's trailer fields, as hyper sends them: each value
+/// one byte per code point, as node writes its trailer string, and a
+/// repeated field as often as it repeats. `None` when a name or a value is
+/// one JS would have refused (addTrailers checks both as node's does).
+pub fn trailer_fields(pairs: &[(String, String)]) -> Option<hyper::HeaderMap> {
+    let mut map = hyper::HeaderMap::with_capacity(pairs.len());
+    for (name, value) in pairs {
+        let name = hyper::header::HeaderName::from_bytes(name.as_bytes()).ok()?;
+        map.append(name, crate::http_head::latin1_header_value(value)?);
+    }
+    Some(map)
 }
 
 type BoxedBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
 
 fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
-    let mut builder = hyper::Response::builder().status(spec.status);
-    for (name, value) in &spec.headers {
-        builder = match spec.header_bytes {
+    let head = spec.head;
+    let mut builder = hyper::Response::builder().status(head.status);
+    for (name, value) in &head.headers {
+        builder = match head.header_bytes {
             HeaderBytes::Utf8 => builder.header(name, value),
             HeaderBytes::Latin1 => match crate::http_head::latin1_header_value(value) {
                 Some(value) => builder.header(name, value),
@@ -886,8 +943,30 @@ fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
             },
         };
     }
+    if head.name_case
+        && let Some(case) = header_name_case(&head.headers)
+    {
+        builder = builder.extension(case);
+    }
+    if let Some(reason) = head.reason {
+        // In the same bytes as the header values: node writes the status
+        // line as part of the head string.
+        let bytes = match head.header_bytes {
+            HeaderBytes::Utf8 => Some(reason.into_bytes()),
+            HeaderBytes::Latin1 => crate::http_head::latin1_bytes(&reason),
+        };
+        match bytes.map(hyper::ext::ReasonPhrase::try_from) {
+            Some(Ok(reason)) => builder = builder.extension(reason),
+            _ => return bad_response_spec(),
+        }
+    }
     let body: BoxedBody = match spec.body {
         ResponseBody::Full(bytes) => http_body_util::Full::new(Bytes::from(bytes)).boxed(),
+        ResponseBody::Unsized(bytes, trailers) => UnsizedBody {
+            data: Some(Bytes::from(bytes)),
+            trailers,
+        }
+        .boxed(),
         ResponseBody::Stream(rx, closed_tx) => ChannelBody {
             rx,
             _closed_tx: closed_tx,
@@ -898,6 +977,42 @@ fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
         ResponseBody::Abort => http_body_util::Empty::new().boxed(),
     };
     builder.body(body).unwrap_or_else(|_| bad_response_spec())
+}
+
+/// How a node:http response's header names are spelled on the wire, for
+/// hyper: `None` -- nothing allocated -- when every name is already in the
+/// title case its connection writes names in (`Content-Type`, `X-Request-Id`;
+/// `http1_builder`), else every name's spelling, in the order its values go
+/// out. node writes each name as the handler spelled it.
+fn header_name_case(headers: &[(String, String)]) -> Option<hyper::ext::HeaderCaseMap> {
+    if headers
+        .iter()
+        .all(|(name, _)| is_title_case(name.as_bytes()))
+    {
+        return None;
+    }
+    let mut map = hyper::HeaderMap::<Bytes>::with_capacity(headers.len());
+    for (name, _) in headers {
+        if let Ok(key) = hyper::header::HeaderName::from_bytes(name.as_bytes()) {
+            map.append(key, Bytes::copy_from_slice(name.as_bytes()));
+        }
+    }
+    Some(hyper::ext::HeaderCaseMap(map))
+}
+
+/// Whether hyper's title case leaves `name` as it is: an upper-case letter
+/// first and after each `-`, lower case everywhere else.
+fn is_title_case(name: &[u8]) -> bool {
+    let mut prev = b'-';
+    name.iter().all(|&c| {
+        let expected = if prev == b'-' {
+            c.to_ascii_uppercase()
+        } else {
+            c.to_ascii_lowercase()
+        };
+        prev = c;
+        c == expected
+    })
 }
 
 /// What a response that cannot be sent as given is answered with.
@@ -976,10 +1091,17 @@ fn refused_head_response(error: HeadError) -> hyper::Response<BoxedBody> {
         .expect("static refusal builds")
 }
 
-/// An HTTP/1 connection builder for a server with `policy`.
-fn http1_builder(policy: HeadPolicy) -> hyper::server::conn::http1::Builder {
+/// An HTTP/1 connection builder for a server with `policy`. `node_names`:
+/// the server is a node:http one, whose responses write header names as
+/// node does -- the names it adds itself as `Date`, `Content-Length`,
+/// `Transfer-Encoding`, `Connection` (hyper's title case), and the ones a
+/// handler set in the case it set them in, which a response whose names
+/// are not already in title case carries as a `HeaderCaseMap`
+/// (spec_to_response). Other servers write them lowercase.
+fn http1_builder(policy: HeadPolicy, node_names: bool) -> hyper::server::conn::http1::Builder {
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder.max_buf_size(policy.read_buffer_limit());
+    builder.title_case_headers(node_names);
     // hyper refuses a head of more than 100 fields by default; node refuses one
     // only on its byte size. Lift the field ceiling to the byte budget so the
     // parser stops at the same point node does -- the excess beyond
@@ -1217,7 +1339,8 @@ where
     Svc::Future: Send + 'static,
 {
     let io = hyper_util::rt::TokioIo::new(WatchedIo::new(stream, Arc::clone(&watch)));
-    let mut conn = http1_builder(policy).serve_connection(io, service);
+    // A js-driven server is a node:http (or https) one.
+    let mut conn = http1_builder(policy, js_driven).serve_connection(io, service);
     // A connection no request can take has a receiver that never fires.
     let (mut taken, mut takeable) = match takeover {
         Some(rx) => (rx, true),
@@ -1694,9 +1817,10 @@ fn refuse_unanswered(state: &HttpState, id: u64, status: u16) {
         .remove(&id);
     if let Some(responder) = responder {
         let _ = responder.send(ResponseSpec {
-            status,
-            headers: vec![("connection".to_string(), "close".to_string())],
-            header_bytes: HeaderBytes::Utf8,
+            head: ResponseHead::plain(
+                status,
+                vec![("connection".to_string(), "close".to_string())],
+            ),
             body: ResponseBody::Full(Vec::new()),
         });
     }
@@ -2917,10 +3041,34 @@ pub async fn http_body_push(
     stream_id: u64,
     bytes: Vec<u8>,
 ) -> super::OpOutcome {
+    push_frame(state, stream_id, Frame::data(Bytes::from(bytes))).await
+}
+
+/// A node:http response's trailer fields, pushed after its last chunk;
+/// hyper sends them when it chunks the body, and drops them otherwise, as
+/// node does.
+pub async fn http_body_trailers(
+    state: Arc<HttpState>,
+    stream_id: u64,
+    pairs: Vec<(String, String)>,
+) -> super::OpOutcome {
+    let Some(trailers) = trailer_fields(&pairs) else {
+        return super::OpOutcome::Failed("invalid trailer field".to_string());
+    };
+    push_frame(state, stream_id, Frame::trailers(trailers)).await
+}
+
+/// One frame onto a streaming response's channel, with the backpressure
+/// and the timeout described above.
+async fn push_frame(
+    state: Arc<HttpState>,
+    stream_id: u64,
+    frame: Frame<Bytes>,
+) -> super::OpOutcome {
     let Some(sender) = state.stream_sender(stream_id) else {
         return super::OpOutcome::Failed(format!("http stream {stream_id} is gone"));
     };
-    match tokio::time::timeout(STREAM_PUSH_TIMEOUT, sender.send(bytes)).await {
+    match tokio::time::timeout(STREAM_PUSH_TIMEOUT, sender.send(frame)).await {
         Ok(Ok(())) => super::OpOutcome::Done,
         Ok(Err(_)) => {
             // Receiver dropped (hyper ended the response / connection gone).
@@ -2933,6 +3081,61 @@ pub async fn http_body_push(
             state.end_stream(stream_id);
             super::OpOutcome::Failed("stream stalled: client is not reading".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod name_case_tests {
+    use super::*;
+
+    fn pairs(names: &[&str]) -> Vec<(String, String)> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), "v".to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn title_case_is_what_hyper_writes_by_itself() {
+        for name in [
+            "Content-Type",
+            "X-Request-Id",
+            "Date",
+            "X-1a",
+            "Www-Authenticate",
+        ] {
+            assert!(is_title_case(name.as_bytes()), "{name}");
+        }
+        for name in [
+            "content-type",
+            "X-REQUEST-ID",
+            "x-Request-Id",
+            "WWW-Authenticate",
+            "Etag-",
+        ] {
+            assert_eq!(is_title_case(name.as_bytes()), name == "Etag-", "{name}");
+        }
+    }
+
+    #[test]
+    fn names_already_in_title_case_need_no_map() {
+        assert!(header_name_case(&pairs(&["Content-Type", "X-A"])).is_none());
+        assert!(header_name_case(&[]).is_none());
+    }
+
+    #[test]
+    fn one_name_off_title_case_spells_every_value_in_order() {
+        let map = header_name_case(&pairs(&["X-R", "x-r", "Content-Type", "X-r"]))
+            .expect("a map")
+            .0;
+        let spelled = |name: &str| {
+            map.get_all(name)
+                .iter()
+                .map(|b| String::from_utf8(b.to_vec()).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(spelled("x-r"), ["X-R", "x-r", "X-r"]);
+        assert_eq!(spelled("content-type"), ["Content-Type"]);
     }
 }
 

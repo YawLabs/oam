@@ -456,11 +456,16 @@ pub fn latin1_header_value(text: &str) -> Option<http::HeaderValue> {
     if text.is_ascii() {
         return http::HeaderValue::from_bytes(text.as_bytes()).ok();
     }
-    let bytes = text
-        .chars()
+    http::HeaderValue::from_bytes(&latin1_bytes(text)?).ok()
+}
+
+/// A JS string's code points as one byte each (latin1); `None` when one is
+/// above U+00FF. What [`latin1_header_value`] and a node:http status line's
+/// reason phrase are written as.
+pub fn latin1_bytes(text: &str) -> Option<Vec<u8>> {
+    text.chars()
         .map(|c| u8::try_from(u32::from(c)).ok())
-        .collect::<Option<Vec<u8>>>()?;
-    http::HeaderValue::from_bytes(&bytes).ok()
+        .collect()
 }
 
 /// A request head [`parse_request_head`] accepted.
