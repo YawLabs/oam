@@ -32360,8 +32360,9 @@
     }
     // HTTP/2's initial stream window (RFC 9113 6.9.2): what node's nghttp2
     // takes in for a stream JS is not reading (its readable buffer fills to
-    // that, past the highWaterMark). oam uses the default; it does not see
-    // the SETTINGS either side sends.
+    // that, past the highWaterMark), and the most of a write it sends
+    // before the peer's WINDOW_UPDATE. oam uses the default for both; it
+    // does not see the SETTINGS either side sends.
     var kDefaultInitialWindowSize = 65535;
     // A body chunk into a stream's readable buffer, the way node's fills
     // while JS does not read: up to the window, the rest held back for the
@@ -33870,6 +33871,53 @@
       };
     }
 
+    // A waitForTrailers client stream's writes, for the order of 'finish'
+    // and 'wantTrailers' (measured on node v22.22.2). node shuts the stream
+    // down in _final, once its writes are done; when end() leaves exactly one
+    // write outstanding (end(chunk), or write() then end()) and that write is
+    // under a window (65535 bytes), nghttp2 finds the body's end in the
+    // pass that sends it, and 'wantTrailers' comes before 'finish'. With no
+    // write outstanding (a bare end(), or one after the writes went out),
+    // two or more, or a window's worth, 'finish' comes first. A write is
+    // outstanding until the socket has taken it -- the loop turn after the
+    // one it was made in -- and the writes made before 'ready' (the stream
+    // is corked till then), or while corked, go as one writev.
+    function noteWrite(stream, chunk, encoding) {
+      var size = 0;
+      if (typeof chunk === "string") {
+        size = globalThis.Buffer.byteLength(chunk, typeof encoding === "string" ? encoding : "utf8");
+      } else if (ArrayBuffer.isView(chunk)) {
+        size = chunk.byteLength;
+      }
+      var batch = stream._id === undefined || stream.writableCorked > 0;
+      stream._outBytes += size;
+      if (batch && stream._outBatch !== null) {
+        stream._outBatch.size += size;
+        return;
+      }
+      var write = { size: size };
+      stream._outWrites++;
+      if (!batch) {
+        settleLater(stream, write);
+        return;
+      }
+      stream._outBatch = write;
+      var settle = function () {
+        if (stream._outBatch === write) stream._outBatch = null;
+        settleLater(stream, write);
+      };
+      if (stream._id === undefined) stream.once("ready", settle);
+      else process.nextTick(settle);
+    }
+    // The write the socket takes on the loop turn after this one.
+    function settleLater(stream, write) {
+      globalThis.setImmediate(function () {
+        globalThis.setImmediate(function () {
+          stream._outWrites--;
+          stream._outBytes -= write.size;
+        });
+      });
+    }
     class ClientHttp2Stream extends Duplex {
       constructor(session, prepared, options) {
         // autoDestroy: once the response has ended and the request body is
@@ -33900,6 +33948,13 @@
         this._trailersReady = false;
         this._sentTrailers = undefined;
         if (this._hasTrailers) this._writableState.autoDestroy = false;
+        // noteWrite's accounting: the writes outstanding and their bytes,
+        // the writev the writes join while corked, and at end() the bytes
+        // of its one outstanding write (or -1).
+        this._outWrites = 0;
+        this._outBytes = 0;
+        this._outBatch = null;
+        this._endedWrite = -1;
         this._bodyHandle = null;
         this._reading = false;
         this._readEnded = false;
@@ -34031,6 +34086,19 @@
         next.then(function () { callback(); }, function (err) { callback(err); });
       }
 
+      write(chunk, encoding, callback) {
+        if (this._hasTrailers) noteWrite(this, chunk, encoding);
+        return super.write(chunk, encoding, callback);
+      }
+
+      end(chunk, encoding, callback) {
+        if (this._hasTrailers && !this._writableState.ending) {
+          if (chunk != null && typeof chunk !== "function") noteWrite(this, chunk, encoding);
+          if (this._outWrites === 1) this._endedWrite = this._outBytes;
+        }
+        return super.end(chunk, encoding, callback);
+      }
+
       _final(callback) {
         if (this._bodyStream === null) {
           callback();
@@ -34038,8 +34106,15 @@
         }
         var self = this;
         if (this._hasTrailers) {
-          // The data is all handed over: 'finish', then 'wantTrailers'.
+          // The data is all handed over: 'wantTrailers' first when end() left
+          // one write under a window outstanding (noteWrite), else 'finish'
+          // first.
           this._channelTail.then(function () {
+            if (self._endedWrite >= 0 && self._endedWrite < kDefaultInitialWindowSize) {
+              onStreamTrailers(self);
+              callback();
+              return;
+            }
             callback();
             process.nextTick(onStreamTrailers, self);
           });

@@ -6,11 +6,16 @@
 // 'wantTrailers' end it with no trailing HEADERS. The server stream emits
 // 'trailers' (headers, flags, rawHeaders) before its 'end', and the
 // compatibility API's req.trailers / req.rawTrailers -- {} and [] at the
-// start -- are filled in by then. Measured on node v22.22.2.
+// start -- are filled in by then. 'wantTrailers' comes before 'finish' when
+// end() leaves exactly one write outstanding -- end(chunk) alone, or a write
+// and then end() -- and it is under the peer's window (65535 bytes); after it
+// for a bare end(), one after the writes went out, two writes outstanding
+// (write() then end(chunk)), or a window's worth. Measured on node v22.22.2.
 //
 // Regression guard: oam's http2 client had no waitForTrailers, 'wantTrailers'
 // or sendTrailers(), and its servers dropped a request's trailer section
-// (no 'trailers', req.trailers left empty).
+// (no 'trailers', req.trailers left empty); then it emitted 'finish' before
+// 'wantTrailers' in every case.
 import http2 from "node:http2";
 
 setTimeout(() => {
@@ -32,7 +37,7 @@ server.on("stream", (stream) => {
     S(`trailers nargs=${args.length} ${show(t)} proto=${Object.getPrototypeOf(t)} flags=${flags} raw=${JSON.stringify(raw)}`);
   });
   stream.on("end", () => {
-    S("end " + JSON.stringify(body));
+    S("end " + (body.length > 20 ? body.length + " bytes" : JSON.stringify(body)));
     stream.respond({ ":status": 200 });
     stream.end("ok");
   });
@@ -71,6 +76,16 @@ const runs = [
       }, 20);
     },
   }],
+  ["raw: bare end", client, { waitForTrailers: true }, { want: (r) => r.sendTrailers({ e: "1" }), body: (r) => r.end() }],
+  ["raw: end in a later tick", client, { waitForTrailers: true }, {
+    want: (r) => r.sendTrailers({ e: "2" }),
+    body: (r) => {
+      r.write("p");
+      setTimeout(() => r.end(), 20);
+    },
+  }],
+  ["raw: end with a window's worth", client, { waitForTrailers: true }, { want: (r) => r.sendTrailers({ e: "3" }), body: (r) => r.end("a".repeat(65535)) }],
+  ["raw: end with less", client, { waitForTrailers: true }, { want: (r) => r.sendTrailers({ e: "4" }), body: (r) => r.end("a".repeat(65534)) }],
   ["compat: trailers", compatClient, { waitForTrailers: true }, { want: (r) => r.sendTrailers(fields) }],
   ["compat: none", compatClient, {}, {}],
 ];
@@ -82,6 +97,7 @@ for (const [label, c, options, hooks] of runs) {
     log("sentTrailers at first " + req.sentTrailers);
     if (hooks.want) req.on("wantTrailers", () => { log("wantTrailers"); hooks.want(req, log); });
     req.on("response", (h, flags) => log("response " + flags));
+    req.on("finish", () => log("finish"));
     req.resume();
     req.on("end", () => log("end"));
     req.on("close", () => {

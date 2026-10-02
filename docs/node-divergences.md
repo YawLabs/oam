@@ -2910,7 +2910,12 @@ oam's shared client. What differs:
   SETTINGS and window sizes. Trailers are Node's both ways: `waitForTrailers`,
   `'wantTrailers'`, `sendTrailers()` and `sentTrailers`, and the response's trailer section
   as `'trailers'` (headers, flags, rawHeaders) before `'end'`, read or not (cases 304 to
-  307; their one difference, `[http2.sensitiveHeaders]`, is in entry 42).
+  307; their one difference, `[http2.sensitiveHeaders]`, is in entry 42). `'wantTrailers'`
+  comes before `'finish'` when Node's does -- `end()` leaving exactly one write under 65535
+  bytes outstanding -- and after it otherwise. Node's write is outstanding until its socket
+  has taken it; oam counts it so until the loop turn after the one it was made in, which is
+  when Node's socket takes a write on a local connection. On a slow link Node's can stay
+  outstanding longer, and its order then follows.
 - **A server's early close does not reach a request still sending.** When a server
   responds and ends without reading the request (entry 42), Node's server resets the
   stream with NO_ERROR and Node's client stream closes with it -- a `waitForTrailers`
