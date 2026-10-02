@@ -91,13 +91,17 @@
       }
     }
     function mkError(name, code) {
-      return class extends UndiciError {
+      const Class = class extends UndiciError {
         constructor(message) {
           super(message || name, code);
           this.name = name;
           this.code = code;
         }
       };
+      // The class's own name, as undici's are declared: `err.constructor.name`
+      // and `errors.HeadersTimeoutError.name` read it.
+      Object.defineProperty(Class, "name", { value: name });
+      return Class;
     }
     // undici 6.29.0's (lib/core/errors.js): AbortError is `UND_ERR_ABORT`,
     // "The operation was aborted", and RequestAbortedError is one -- named

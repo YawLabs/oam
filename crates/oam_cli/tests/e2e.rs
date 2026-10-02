@@ -6032,7 +6032,8 @@ declared-mismatch rejected RequestContentLengthMismatchError UND_ERR_REQ_CONTENT
 /// `HeadersOverflowError` (`UND_ERR_HEADERS_OVERFLOW`), counted as undici
 /// counts it -- header names and values, not the reason phrase -- and a body
 /// timeout, a dispatcher's bad option, a refused header and a refused
-/// connect (`ECONNREFUSED`) come as they are. Up to this fix an overflow was
+/// connect (`ECONNREFUSED`) come as they are, and every class in `errors`
+/// carries its own name (`err.constructor.name`). Up to this fix an overflow was
 /// `fetch failed` with node's http-parser cause (`HPE_HEADER_OVERFLOW`, and
 /// node's http.request count, so a head undici takes was refused), and so
 /// was a refused connect. The expected output is node v22.22.2 + undici
@@ -6058,7 +6059,7 @@ function serve(nv, reason) {
 }
 const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${srv.address().port}/`)));
 function show(label, e) {
-  console.log(label, 'rejected', e.name, e.code, JSON.stringify(e.message.replace(/:\d+$/, ':PORT')),
+  console.log(label, 'rejected', e.constructor.name, e.name, e.code, JSON.stringify(e.message.replace(/:\d+$/, ':PORT')),
     'overflowClass', e instanceof errors.HeadersOverflowError, 'undiciClass', e instanceof errors.UndiciError,
     'cause', e.cause ? e.cause.name + ' ' + e.cause.code : 'none');
 }
@@ -6096,6 +6097,7 @@ try { await request('http://127.0.0.1:1/', { headers: { 'transfer-encoding': 'x'
   await new Promise((r) => srv.close(r));
   try { await request(url); } catch (e) { show('refused', e); }
 }
+console.log('class names', Object.keys(errors).filter((k) => typeof errors[k] === 'function' && errors[k].name !== k).join(',') || 'all match');
 process.exit(0);
 "##,
     );
@@ -6103,14 +6105,15 @@ process.exit(0);
     let (stdout, stderr) = run_script_ok(&script, out);
     let expected = r##"request nv=16383 reason=100 ok 200
 fetch nv=16383 reason=100 ok 200
-request nv=16384 reason=2 rejected HeadersOverflowError UND_ERR_HEADERS_OVERFLOW "Headers Overflow Error" overflowClass true undiciClass true cause none
-fetch nv=16384 reason=2 rejected TypeError undefined "fetch failed" overflowClass false undiciClass false cause HeadersOverflowError UND_ERR_HEADERS_OVERFLOW
-request nv=20000 reason=2 rejected HeadersOverflowError UND_ERR_HEADERS_OVERFLOW "Headers Overflow Error" overflowClass true undiciClass true cause none
-fetch nv=20000 reason=2 rejected TypeError undefined "fetch failed" overflowClass false undiciClass false cause HeadersOverflowError UND_ERR_HEADERS_OVERFLOW
-body-timeout rejected BodyTimeoutError UND_ERR_BODY_TIMEOUT "Body Timeout Error" overflowClass false undiciClass true cause none
-bad-dispatcher rejected InvalidArgumentError UND_ERR_INVALID_ARG "headersTimeout must be a positive integer or zero" overflowClass false undiciClass true cause none
-te-header rejected InvalidArgumentError UND_ERR_INVALID_ARG "invalid transfer-encoding header" overflowClass false undiciClass true cause none
-refused rejected Error ECONNREFUSED "connect ECONNREFUSED 127.0.0.1:PORT" overflowClass false undiciClass false cause none"##;
+request nv=16384 reason=2 rejected HeadersOverflowError HeadersOverflowError UND_ERR_HEADERS_OVERFLOW "Headers Overflow Error" overflowClass true undiciClass true cause none
+fetch nv=16384 reason=2 rejected TypeError TypeError undefined "fetch failed" overflowClass false undiciClass false cause HeadersOverflowError UND_ERR_HEADERS_OVERFLOW
+request nv=20000 reason=2 rejected HeadersOverflowError HeadersOverflowError UND_ERR_HEADERS_OVERFLOW "Headers Overflow Error" overflowClass true undiciClass true cause none
+fetch nv=20000 reason=2 rejected TypeError TypeError undefined "fetch failed" overflowClass false undiciClass false cause HeadersOverflowError UND_ERR_HEADERS_OVERFLOW
+body-timeout rejected BodyTimeoutError BodyTimeoutError UND_ERR_BODY_TIMEOUT "Body Timeout Error" overflowClass false undiciClass true cause none
+bad-dispatcher rejected InvalidArgumentError InvalidArgumentError UND_ERR_INVALID_ARG "headersTimeout must be a positive integer or zero" overflowClass false undiciClass true cause none
+te-header rejected InvalidArgumentError InvalidArgumentError UND_ERR_INVALID_ARG "invalid transfer-encoding header" overflowClass false undiciClass true cause none
+refused rejected Error Error ECONNREFUSED "connect ECONNREFUSED 127.0.0.1:PORT" overflowClass false undiciClass false cause none
+class names all match"##;
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
         expected,
