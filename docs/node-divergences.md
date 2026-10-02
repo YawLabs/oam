@@ -2634,13 +2634,19 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
   reach the peer as Node's do (case 306): one byte per UTF-16 unit, a field the receiving
   nghttp2 would drop left out, and an empty section for one with a NUL byte. A trailer
   section is `'trailers'` whether or not the body ahead of it is read, up to a window of
-  unread body (case 307). What differs: no
+  unread body (case 307), and a stream that has responded stays open for a request body
+  and trailers still coming unless JS never asked for the body (case 308). What differs: no
   received field is ever listed in `[http2.sensitiveHeaders]` -- of a stream's headers or
   of its trailers. nghttp2 sends a `cookie` field shorter than 20 bytes as never-indexed and
   Node lists the fields it receives that way; oam reports no received field as
   sensitive, so the list is always `[]`. And the window is always the default 65535 bytes,
   as oam does not see the SETTINGS either side sends: a peer that sets a different
   `initialWindowSize` moves where Node stops taking in an unread body, and oam's stays put.
+- **A stream JS never read closes after its `'finish'`.** When a request has all arrived by
+  the time the response ends and nothing asked for its body, Node's stream closes as both
+  sides end, dumping the body -- `'end'`, `'finish'`, `'close'`; oam closes it once the
+  response is out, so `'end'` (the body dumped) comes after `'finish'`. Both end with
+  `'close'`, `rstCode` 0.
 - **A response stream that ends without trailers emits `'finish'`.** Node's
   `stream.end(data)` (or a write and then `end()`) on a stream responded to without
   `waitForTrailers` sends END_STREAM on the last DATA frame, and the stream closes before
@@ -2905,6 +2911,12 @@ oam's shared client. What differs:
   `'wantTrailers'`, `sendTrailers()` and `sentTrailers`, and the response's trailer section
   as `'trailers'` (headers, flags, rawHeaders) before `'end'`, read or not (cases 304 to
   307; their one difference, `[http2.sensitiveHeaders]`, is in entry 42).
+- **A server's early close does not reach a request still sending.** When a server
+  responds and ends without reading the request (entry 42), Node's server resets the
+  stream with NO_ERROR and Node's client stream closes with it -- a `waitForTrailers`
+  request never emits `'wantTrailers'`. oam's client stream is not told of that reset: it
+  closes only once its own `end()` (and `'wantTrailers'`) has come. Its `rstCode` is 0
+  either way.
 - **A plain `Duplex` from `createConnection` is used as it is.** Node wraps a stream that is
   not a socket in its `JSStreamSocket` and hands that wrapper to `'connect'`; oam runs the
   session over the stream itself and hands it on.

@@ -32732,9 +32732,12 @@
           this._chain = Promise.resolve();
           this._bodyDone = false;
           this._reading = false;
+          // node's didRead: JS has asked for the request body.
+          this._didRead = false;
           // Body bytes past the window, for the next read (pushInWindow).
           this._held = null;
           this._closed = false;
+          this._closeEmitted = false;
           this._sentHeaders = undefined;
           // respond()'s waitForTrailers, the 'wantTrailers' moment, and the
           // section sendTrailers() sent.
@@ -32868,6 +32871,7 @@
           this._maybeClose();
         }
         _read() {
+          this._didRead = true;
           this._pump();
         }
         // node's onStreamRead: the request body is read as it arrives, read
@@ -32888,11 +32892,13 @@
                 this._bodyDone = true;
                 emitTrailers(this, chunk.trailers);
                 this.push(null);
+                this._requestEnded();
                 return;
               }
               if (chunk === undefined || chunk === null || chunk.length === 0) {
                 this._bodyDone = true;
                 this.push(null);
+                this._requestEnded();
                 return;
               }
               touchIdleTimer(this);
@@ -32906,11 +32912,20 @@
             },
           );
         }
-        // The response is done: the stream closes once what was handed over
-        // is on its way (node: nghttp2 closes it after the last frame; a
-        // request body still coming is cut off with it).
+        // The request's END_STREAM: with the response done too, the stream
+        // is over.
+        _requestEnded() {
+          if (this._responseEnded) this._maybeClose();
+        }
+        // The response is done, its trailers too (node's kMaybeDestroy). The
+        // stream closes once what was handed over is on its way: at once when
+        // JS never asked for the request body -- node's own close then cuts
+        // off a body still coming, and drops what was not read -- or else
+        // once the request side has ended too, as nghttp2 closes a
+        // half-closed stream.
         _maybeClose() {
           if (this._closed || this._closeScheduled) return;
+          if (!this._bodyDone && (this._didRead || this.readableFlowing !== null)) return;
           this._closeScheduled = true;
           globalThis.setImmediate(() => this._close(NGHTTP2_NO_ERROR));
         }
@@ -32928,9 +32943,21 @@
             this._responseEnded = true;
             natives.httpBodyEnd(this._responseStream);
           }
-          // The readable side ends with the stream (what was not read is
-          // gone).
-          if (!this.readableEnded) this.push(null);
+          // node's onStreamClose: the readable side ends with the stream, and
+          // 'close' waits for its 'end' -- a body JS never asked for is
+          // dumped to get there, one it did is left for it to read.
+          if (this.readableEnded || this.destroyed) {
+            this._emitClose();
+            return;
+          }
+          this.once("end", this._emitClose);
+          this.push(null);
+          if (!this._didRead && this.readableFlowing === null) this.resume();
+          else this.read(0);
+        }
+        _emitClose() {
+          if (this._closeEmitted) return;
+          this._closeEmitted = true;
           process.nextTick(() => this.emit("close"));
         }
         // The client reset the stream (or the session went away) before the
@@ -32969,6 +32996,8 @@
         }
         _destroy(err, callback) {
           if (!this._closed) this._close(err ? NGHTTP2_INTERNAL_ERROR : NGHTTP2_NO_ERROR);
+          // Closed already, its 'end' still to come: it will not now.
+          else this._emitClose();
           callback(err);
         }
         setTimeout(msecs, callback) {
