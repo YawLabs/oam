@@ -20,7 +20,9 @@
 // Z_BUF_ERROR "unexpected end of file". And node's DeflateRaw turns the
 // caller's windowBits 8 into 9, which oam left at 8; and a class called
 // without new (zlib.Deflate(opts)) wrote handle state onto its `this` -- the
-// zlib module object -- where node returns a new stream.
+// zlib module object -- where node returns a new stream. And the streams
+// were built with no Transform options: highWaterMark, autoDestroy,
+// emitClose, allowHalfOpen and signal went unread and unchecked.
 //
 // Prints error class, code and message, and never a compressed byte.
 import zlib from "node:zlib";
@@ -188,6 +190,92 @@ await new Promise((resolve) => {
     });
   });
 });
+
+// The Transform options: node's ZlibBase hands the caller's to its stream
+// over autoDestroy: true (encoding and object mode turned off), so the
+// stream checks highWaterMark and signal after the zlib options -- in the
+// one-shot forms too, whose engine is such a stream.
+for (const [label, options] of [
+  ["highWaterMark -1", { highWaterMark: -1 }],
+  ["highWaterMark 1.5", { highWaterMark: 1.5 }],
+  ["highWaterMark 'x'", { highWaterMark: "x" }],
+  ["readableHighWaterMark -1", { readableHighWaterMark: -1 }],
+  ["writableHighWaterMark -1", { writableHighWaterMark: -1 }],
+  ["readableHighWaterMark -1 highWaterMark 3", { readableHighWaterMark: -1, highWaterMark: 3 }],
+  ["highWaterMark -1 level 99", { highWaterMark: -1, level: 99 }],
+  ["signal 'x'", { signal: "x" }],
+  ["signal {}", { signal: {} }],
+  ["signal 0", { signal: 0 }],
+]) {
+  attempt(`Deflate ${label}`, () => new zlib.Deflate(options));
+  attempt(`BrotliDecompress ${label}`, () => new zlib.BrotliDecompress(options));
+  attempt(`Inflate.call ${label}`, () => zlib.Inflate.call(inherited(), options));
+  attempt(`deflateSync ${label}`, () => zlib.deflateSync("x", options));
+  attempt(`gunzip ${label}`, () => zlib.gunzip(zlib.gzipSync("x"), options, () => {}));
+  attempt(`brotliCompress ${label}`, () => zlib.brotliCompress("x", options, () => {}));
+}
+attempt("deflateSync null highWaterMark -1", () => zlib.deflateSync(null, { highWaterMark: -1 }));
+const marks = (t) => `${t.readableHighWaterMark}/${t.writableHighWaterMark}`;
+console.log("highWaterMark 7:", marks(new zlib.Deflate({ highWaterMark: 7 })));
+console.log("readable 3, writable 5:", marks(new zlib.Gunzip({ readableHighWaterMark: 3, writableHighWaterMark: 5 })));
+console.log("default:", marks(new zlib.BrotliCompress()));
+const modes = new zlib.Inflate({ objectMode: true, writableObjectMode: true, encoding: "hex" });
+console.log("objectMode, encoding:", modes.readableObjectMode, modes.writableObjectMode, modes.readableEncoding);
+console.log("readableObjectMode:", new zlib.Deflate({ readableObjectMode: true }).readableObjectMode);
+console.log("autoDestroy:", new zlib.Deflate()._readableState.autoDestroy,
+  new zlib.Deflate({ autoDestroy: false })._readableState.autoDestroy);
+console.log("emitClose false:", new zlib.Gzip({ emitClose: false })._readableState.emitClose);
+console.log("allowHalfOpen false:", new zlib.Deflate({ allowHalfOpen: false }).allowHalfOpen);
+await new Promise((resolve) => {
+  const stream = zlib.createDeflate({ encoding: "hex" });
+  const kinds = new Set();
+  stream.on("data", (c) => kinds.add(Buffer.isBuffer(c)));
+  stream.on("end", () => {
+    console.log("encoding 'hex' data are Buffers:", [...kinds].join());
+    resolve();
+  });
+  stream.end("abc");
+});
+// A signal: an aborted one destroys the stream and fails a callback form
+// with AbortError (a sync form ignores it); one aborted while the call runs
+// fails it too, after the abort, on a later tick.
+await new Promise((resolve) => {
+  const stream = new zlib.Deflate({ signal: AbortSignal.abort("why") });
+  console.log("Deflate aborted signal: destroyed", stream.destroyed);
+  stream.on("error", (e) => {
+    console.log(`  error ${describe(e)} cause ${e.cause}`);
+    resolve();
+  });
+});
+attempt("deflateSync aborted signal", () => zlib.deflateSync("x", { signal: AbortSignal.abort() }));
+for (const name of ["deflate", "inflate", "brotliCompress"]) {
+  const input = name === "inflate" ? zlib.deflateSync("x") : "x";
+  await new Promise((resolve) => {
+    let sync = true;
+    zlib[name](input, { signal: AbortSignal.abort("early") }, (e, out) => {
+      console.log(`${name} aborted signal: ${e ? `${describe(e)} cause ${e.cause}` : `ok ${out.length}`}, async ${!sync}`);
+      resolve();
+    });
+    sync = false;
+  });
+  await new Promise((resolve) => {
+    const controller = new AbortController();
+    const events = [];
+    zlib[name](input, { signal: controller.signal }, (e, out) => {
+      events.push(e ? `${describe(e)} cause ${e.cause}` : `ok ${out.length}`);
+      console.log(`${name} aborted while running: ${events.join(" | ")}`);
+      resolve();
+    });
+    controller.abort("late");
+    events.push("aborted");
+  });
+  await new Promise((resolve) => {
+    zlib[name](input, { signal: new AbortController().signal }, (e, out) => {
+      console.log(`${name} live signal: ${e ? describe(e) : `ok ${Buffer.isBuffer(out)}`}`);
+      resolve();
+    });
+  });
+}
 
 // The engines and what they hold.
 const d = new zlib.Deflate({ level: 3, strategy: 1, chunkSize: 100, info: "y" });

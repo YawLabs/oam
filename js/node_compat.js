@@ -18664,11 +18664,76 @@
     // option: node answers `{ buffer, engine }`, the engine being the
     // stream it made for the call.
     const engines = {};
+    // The engine here is made after the work, so the call's signal is left
+    // out: aborting it later must not destroy a stream nobody listens to.
     const withInfo = (s, buffer, name, options, input) => {
       if (!s.info) return buffer;
-      const engine = new engines[name](options);
+      const engine = new engines[name](
+        options.signal ? { ...options, signal: undefined } : options,
+      );
       engine.bytesWritten = input.length;
       return { buffer, engine };
+    };
+
+    // The Transform options node's ZlibBase gives its stream: the caller's,
+    // over `autoDestroy: true`, with encoding and object mode turned off
+    // when set (a zlib stream moves bytes).
+    const transformOptions = (options) => {
+      if (!options) return { autoDestroy: true };
+      if (options.encoding || options.objectMode || options.writableObjectMode) {
+        return {
+          autoDestroy: true, ...options, encoding: null, objectMode: false, writableObjectMode: false,
+        };
+      }
+      return { autoDestroy: true, ...options };
+    };
+    // A one-shot call's engine is a stream given those options, so what the
+    // Transform constructor checks is checked here too, after the zlib
+    // options: highWaterMark (or the readable / writable one) and a truthy
+    // `signal`, which the callback forms then honour. Returns the signal.
+    // The streams' own validators, so the errors are theirs.
+    const engineSignal = (options) => {
+      if (!options) return undefined;
+      if (options.highWaterMark != null || options.readableHighWaterMark != null ||
+          options.writableHighWaterMark != null) {
+        const { getHighWaterMark } = globalThis.__oamVendor.require("internal/streams/state");
+        const state = { objectMode: false };
+        getHighWaterMark(state, options, "readableHighWaterMark", true);
+        getHighWaterMark(state, options, "writableHighWaterMark", true);
+      }
+      const signal = options.signal;
+      if (!signal) return undefined;
+      globalThis.__oamVendor.require("internal/validators").validateAbortSignal(signal, "signal");
+      return signal;
+    };
+    // A callback form's work under its signal, as node's engine runs under
+    // it: an abort before the output destroys the engine, which calls back
+    // an AbortError (its cause the signal's reason) on the next tick, and
+    // the output is then dropped. An already aborted signal skips the work.
+    const underSignal = (signal, work, onOutput, onError) => {
+      if (signal === undefined) {
+        work().then(onOutput, onError);
+        return;
+      }
+      const { AbortError } = globalThis.__oamVendor.require("internal/errors");
+      const aborted = () => new AbortError(undefined, { cause: signal.reason });
+      if (signal.aborted) {
+        process.nextTick(onError, aborted());
+        return;
+      }
+      let settled = false;
+      const onAbort = () => {
+        settled = true;
+        process.nextTick(onError, aborted());
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      const settle = (fn) => (value) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        fn(value);
+      };
+      work().then(settle(onOutput), settle(onError));
     };
 
     // The native op reports an output past the cap with exactly this message
@@ -18690,6 +18755,7 @@
     // always finish the stream.
     const sync = (format, compress, name) => (buffer, options) => {
       const s = zlibSettings(format, compress, options);
+      engineSignal(options);
       const bytes = syncInput(buffer);
       let out;
       try {
@@ -18710,11 +18776,14 @@
       }
       // Validation throws synchronously, as node's does.
       const s = zlibSettings(format, compress, options);
+      const signal = engineSignal(options);
       validateCallback(callback);
       const bytes = asyncInput(buffer);
-      natives.zlibAsync(
-        bytes, format, s.level, compress, s.cap, s.finishFlush, dictionaryFor(format, s),
-      ).then(
+      underSignal(
+        signal,
+        () => natives.zlibAsync(
+          bytes, format, s.level, compress, s.cap, s.finishFlush, dictionaryFor(format, s),
+        ),
         (out) => callback(null, withInfo(s, asBuffer(out), name, options, bytes)),
         (err) => callback(translate(err, s.maxOutputLength)),
       );
@@ -18742,7 +18811,8 @@
       return class extends Transform {
         constructor(options) {
           const s = zlibSettings(format, compress, options);
-          super({});
+          // The Transform options, checked by the stream after the zlib ones.
+          super(transformOptions(options));
           this._zlibLevel = s.level;
           // brotli's flush values are BROTLI_OPERATION_*, not zlib's: its
           // stream always finishes.
@@ -18891,9 +18961,10 @@
       const { Transform } = registry.get("stream");
       return class extends Transform {
         constructor(options) {
-          super({});
+          const level = zlibSettings(format, compress, options).level;
+          super(transformOptions(options));
           this._zlibChunks = [];
-          this._zlibLevel = zlibSettings(format, compress, options).level;
+          this._zlibLevel = level;
         }
         _transform(chunk, _encoding, cb) {
           this._zlibChunks.push(toBytes(chunk));
@@ -18951,9 +19022,12 @@
         options = {};
       }
       const s = zlibSettings("brotli", compress, options);
+      const signal = engineSignal(options);
       validateCallback(callback);
       const bytes = asyncInput(buffer);
-      brotliOneShot(bytes, compress).then(
+      underSignal(
+        signal,
+        () => brotliOneShot(bytes, compress),
         // maxOutputLength is held to the finished buffer here
         // (docs/node-divergences.md); node stops as the output passes it.
         (out) => out.length > s.maxOutputLength
@@ -18966,6 +19040,7 @@
     // refuses is refused the same way here.
     const brotliSyncGate = (compress) => (buffer, options) => {
       zlibSettings("brotli", compress, options);
+      engineSignal(options);
       syncInput(buffer);
       throw new Error(
         "brotliCompressSync/brotliDecompressSync are not supported -- use brotliCompress/brotliDecompress (async) instead"
@@ -18990,6 +19065,8 @@
         : (compress ? DEFLATE : INFLATE);
     function initSyncHandleState(self, format, compress, mode, options) {
       const s = zlibSettings(format, compress, options);
+      // node runs the Transform constructor on `this` here too; its checks.
+      engineSignal(options);
       const chunkSize = s.chunkSize;
       self._chunkSize = chunkSize;
       self._writeState = new Uint32Array(2);
@@ -19027,7 +19104,8 @@
         // module object for `zlib.Inflate(opts)`).
         if (!(this instanceof ZlibClass)) return new ZlibClass(options);
         // `zlib.Inflate.call(this, opts)` -> sync-handle state for inheritance.
-        return initSyncHandleState(this, format, compress, mode, options);
+        // node's constructor, called as a function, returns nothing.
+        initSyncHandleState(this, format, compress, mode, options);
       }
       // Share the streaming Transform prototype so `new` instances get the
       // streaming methods AND util.inherits(Sub, ZlibClass) chains
