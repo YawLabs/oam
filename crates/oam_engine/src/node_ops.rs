@@ -6363,7 +6363,7 @@ fn op_fs_fstat(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let files = core_runtime!(scope).sync_files();
     let Some(file) = registered_fd(scope, &files, fd, "fstat") else {
         return;
@@ -6386,6 +6386,22 @@ fn op_fs_fstat(
 /// The registry comes in as a parameter rather than from `core_runtime!`: that
 /// macro expands to a bare `return;`, which only compiles inside a function
 /// returning `()`. The op callbacks do; this does not.
+/// A descriptor argument as the fd table keys it. node's binding takes an
+/// int32 descriptor, and a negative, fractional or out-of-range number is no
+/// descriptor at all: it reaches the table as [`NO_FD`], which nothing holds or
+/// adopts, so the op fails EBADF. A saturating `as u64` cast turned -1 and
+/// -2147483648 into 0 -- the inherited stdin -- so `writeFileSync(-1, 'x')`
+/// wrote to stdin where node fails EBADF.
+fn fd_arg(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -> u64 {
+    match value.number_value(scope) {
+        Some(n) if n >= 0.0 && n <= f64::from(i32::MAX) && n.fract() == 0.0 => n as u64,
+        _ => NO_FD,
+    }
+}
+
+/// The descriptor [`fd_arg`] gives a value that is not one.
+const NO_FD: u64 = u64::MAX;
+
 fn registered_fd(
     scope: &mut v8::PinScope<'_, '_>,
     files: &oam_core::SyncFileRegistry,
@@ -6430,7 +6446,7 @@ fn op_fs_fsync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let files = core_runtime!(scope).sync_files();
     let Some(file) = registered_fd(scope, &files, fd, "fsync") else {
         return;
@@ -6443,7 +6459,7 @@ fn op_fs_fdatasync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let files = core_runtime!(scope).sync_files();
     let Some(file) = registered_fd(scope, &files, fd, "fdatasync") else {
         return;
@@ -6456,7 +6472,7 @@ fn op_fs_ftruncate(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let len = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u64;
     let files = core_runtime!(scope).sync_files();
     let Some(file) = registered_fd(scope, &files, fd, "ftruncate") else {
@@ -6470,7 +6486,7 @@ fn op_fs_fchmod(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
     let files = core_runtime!(scope).sync_files();
     let Some(file) = registered_fd(scope, &files, fd, "fchmod") else {
@@ -6484,7 +6500,7 @@ fn op_fs_fchown(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let uid = args.get(1).uint32_value(scope).unwrap_or(0);
     let gid = args.get(2).uint32_value(scope).unwrap_or(0);
     let files = core_runtime!(scope).sync_files();
@@ -6499,7 +6515,7 @@ fn op_fs_futimes(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let (atime, mtime) = utime_args(scope, &args, 1);
     let files = core_runtime!(scope).sync_files();
     let Some(file) = registered_fd(scope, &files, fd, "futime") else {
@@ -6517,7 +6533,7 @@ fn op_fs_fsync_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     with_registered_fd(scope, fd, "fsync", |file| file.sync_all());
 }
 
@@ -6526,7 +6542,7 @@ fn op_fs_fdatasync_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     with_registered_fd(scope, fd, "fdatasync", |file| file.sync_data());
 }
 
@@ -6535,7 +6551,7 @@ fn op_fs_ftruncate_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let len = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u64;
     with_registered_fd(scope, fd, "ftruncate", |file| file.set_len(len));
 }
@@ -6545,7 +6561,7 @@ fn op_fs_fchmod_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
     with_registered_fd(scope, fd, "fchmod", |file| {
         oam_core::ops::fs_fchmod_sync(file, mode)
@@ -6557,7 +6573,7 @@ fn op_fs_fchown_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let uid = args.get(1).uint32_value(scope).unwrap_or(0);
     let gid = args.get(2).uint32_value(scope).unwrap_or(0);
     with_registered_fd(scope, fd, "fchown", |file| {
@@ -6570,7 +6586,7 @@ fn op_fs_futimes_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let (atime, mtime) = utime_args(scope, &args, 1);
     with_registered_fd(scope, fd, "futime", |file| {
         oam_core::ops::fs_futimes_sync(file, atime, mtime)
@@ -7213,7 +7229,7 @@ fn op_fs_read_chunk(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = fd_arg(scope, args.get(0));
     let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
     // Optional third arg: a read POSITION. Absent/null means "from the
     // cursor", which is what the stream readers pass.
@@ -7231,7 +7247,7 @@ fn op_fs_write_chunk(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = fd_arg(scope, args.get(0));
     let Some(bytes) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "fsWriteChunk requires data");
         return;
@@ -7254,7 +7270,7 @@ fn op_fs_close(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = fd_arg(scope, args.get(0));
     let files = core_runtime!(scope).files();
     close_fd(&files, handle);
 }
@@ -7340,7 +7356,7 @@ fn op_fs_read_sync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let offset = args.get(2).number_value(scope).unwrap_or(0.0) as usize;
     let length = args.get(3).number_value(scope).unwrap_or(0.0) as usize;
     let pos_seek = optional_position(scope, &args, 4);
@@ -7413,7 +7429,7 @@ fn op_fs_write_sync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let Some(bytes) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "writeSync requires data");
         return;
@@ -7440,7 +7456,7 @@ fn op_fs_close_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let files = core_runtime!(scope).sync_files();
     // Adopts and closes an inherited descriptor, and treats 0-2 as node does
     // on each platform: see close_descriptor.
@@ -7456,7 +7472,7 @@ fn op_fs_fstat_sync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let files = core_runtime!(scope).sync_files();
     // Adopts an inherited fd, as in op_fs_read_sync. fstat has no path to
     // reopen from, so the extra fields come off the descriptor itself.

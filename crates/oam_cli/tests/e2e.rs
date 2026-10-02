@@ -32877,3 +32877,50 @@ const tick = setInterval(() => {
     assert!(status.success(), "exit {status}; stderr: {stderr:?}");
     assert_eq!(stderr, "", "nothing on stderr: no LOOP_FINISHED, no error");
 }
+
+/// A negative descriptor is no descriptor (review 3, finding 21). The native
+/// fd ops cast the number with a saturating `as u64`, so -1 and -2147483648
+/// became 0 -- the inherited stdin -- and `writeFileSync(-1, 'x')` wrote into
+/// it. node v22.22.2 throws EBADF `write` for each of these and leaves stdin
+/// alone. The conformance harness runs cases with a null stdin, where a write
+/// to 0 fails anyway, so this runs oam with a WRITABLE stdin.
+#[test]
+fn a_negative_descriptor_never_reaches_stdin() {
+    let script = write_temp(
+        "negative_fd_stdin.cjs",
+        "const fs = require('fs');\n\
+         const tries = [\n\
+           ['writeFileSync(-1)', () => fs.writeFileSync(-1, 'x')],\n\
+           ['appendFileSync(-1)', () => fs.appendFileSync(-1, 'x')],\n\
+           ['writeFileSync(-2147483648)', () => fs.writeFileSync(-2147483648, 'x')],\n\
+         ];\n\
+         for (const [name, run] of tries) {\n\
+           try { run(); console.log(name + ' ok'); }\n\
+           catch (e) { console.log(name + ' ' + e.code + ' ' + e.syscall); }\n\
+         }\n",
+    );
+    let stdin_path = write_temp("negative_fd_stdin.txt", "");
+    let stdin = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&stdin_path)
+        .expect("open stdin file");
+    let out = oam_command(&[&script.to_string_lossy()])
+        .stdin(std::process::Stdio::from(stdin))
+        .output()
+        .expect("oam runs");
+    let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(
+        stdout,
+        "writeFileSync(-1) EBADF write\n\
+         appendFileSync(-1) EBADF write\n\
+         writeFileSync(-2147483648) EBADF write\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::metadata(&stdin_path).expect("stdin file").len(),
+        0,
+        "nothing was written to stdin"
+    );
+}
