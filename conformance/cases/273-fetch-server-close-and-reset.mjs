@@ -8,7 +8,9 @@
 // the body is being read; a reset mid-body is `terminated` with the socket's
 // `read ECONNRESET` as the cause. http.get: a close before the head is
 // `socket hang up`; a close or reset mid-body aborts the response
-// (ECONNRESET `aborted`).
+// (ECONNRESET `aborted`); a malformed chunk-size line is first the parser's
+// HPE_INVALID_CHUNK_SIZE on the request, over oam's own transport and an
+// agent's socket alike.
 //
 // bytesWritten is a number, not compared: it counts the request head, whose
 // user-agent is the runtime's own.
@@ -43,6 +45,10 @@ const closeAfter = (bytes) => (conn) => {
 const resetAfter = (bytes) => (conn) => {
   conn.write(bytes);
   later(() => conn.resetAndDestroy());
+};
+const badChunk = (conn) => {
+  conn.write(CHUNKED);
+  later(() => conn.write("zz\r\n"));
 };
 
 function describeCause(cause, port) {
@@ -126,7 +132,8 @@ async function viaGet(label, act, agent) {
       })));
       res.resume();
     });
-    req.on("error", (e) => events.push(`req error ${e.code} ${e.message} | syscall ${e.syscall}`));
+    req.on("error", (e) =>
+      events.push(`req error ${e.code} ${e.message} | syscall ${e.syscall} | reason ${e.reason}`));
     req.on("close", () => {
       events.push("req close");
       resolve();
@@ -142,3 +149,5 @@ await viaGet("close before the head", closeAfter(null), false);
 await viaGet("close mid-body", closeAfter(head(100) + "x"), false);
 await viaGet("reset mid-body", resetAfter(head(100) + "x"), false);
 await viaGet("reset mid-body, the default agent", resetAfter(head(100) + "x"), undefined);
+await viaGet("a malformed chunk-size line", badChunk, false);
+await viaGet("a malformed chunk-size line, the default agent", badChunk, undefined);

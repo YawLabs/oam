@@ -1848,8 +1848,8 @@ Invalid character in chunk size`). Node's socketOnError gets it: the server's
 destroyed with it -- its `'error'`, then its `'close'` with `true` aborting the request as
 above (case 272). Up to 0.17.1 the request was destroyed directly: `'aborted'`, its `'error'`
 and `'close'`, then the response's `'close'` and the socket's with `false`, and no
-`'clientError'`. What differs: the parser error has no `rawPacket` (Node's carries the bytes
-it refused), and a malformed body is answered `400` by the native server even when a
+`'clientError'`. What differs: a malformed chunk's parser error has no `bytesParsed` or
+`rawPacket` (Node's count the bytes of the failing read and carry them), and a malformed body is answered `400` by the native server even when a
 `'clientError'` listener is there to answer it (Node leaves the answer to the listener).
 
 What still differs around a close: the socket never emits `'end'`, and a client that goes
@@ -2249,7 +2249,11 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   #148). Redirects are not followed and bodies are not decoded, as in Node.
 - **Errors.** A response that cannot be parsed fails with a coded `Parse Error: ...`
   (`HPE_*`) whose code is the closest llhttp has for what hyper reports; a malformed chunk
-  size is `HPE_INVALID_CHUNK_SIZE`, as in Node. A response head is held to the request's
+  size is `HPE_INVALID_CHUNK_SIZE`, emitted on the request before the response is aborted,
+  as in Node -- over an agent's socket and, since 0.17.2, over oam's own transport (an
+  option-less `http.get`; up to 0.17.1 that response was aborted with no request error;
+  `conformance/cases/273-fetch-server-close-and-reset.mjs`) -- but without Node's
+  `bytesParsed` / `rawPacket`. A response head is held to the request's
   `maxHeaderSize` (or 16 KiB), counted as Node's parser counts it -- reason phrase, header
   names and values, refused at a count at or over the limit -- and fails with Node's
   `Parse Error: Header overflow` (`HPE_HEADER_OVERFLOW`, `reason` `Header overflow`), but

@@ -717,6 +717,42 @@ async fn a_body_the_server_resets_under_is_read_econnreset() {
     .await;
 }
 
+/// A chunked body whose next chunk-size line is malformed fails the read
+/// with node's parser error on the shared transport too (fetch and an
+/// option-less http.get read their bodies here): `HPE_INVALID_CHUNK_SIZE`,
+/// which http.request emits on the request and fetch wraps as undici's
+/// HTTPParserError. Up to 0.17.1 only an agent's body said so; this one
+/// was `fetch: body read failed: error decoding response body`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_chunk_on_the_shared_transport_is_the_parsers_error() {
+    within(async {
+        let server = serve(move |mut conn, _, _| async move {
+            if conn.request().await.is_none() {
+                return;
+            }
+            conn.send(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n1\r\nx\r\n")
+                .await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            conn.send(b"zz\r\n").await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        })
+        .await;
+        let reg = Reg::new();
+        let url = format!("http://127.0.0.1:{}/", server.port);
+        let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+        let handle = handle_of(&p);
+        assert_one_byte(reg.read(handle).await);
+        match reg.read(handle).await {
+            OpOutcome::NodeFailed { code, message, .. } => {
+                assert_eq!(code, "HPE_INVALID_CHUNK_SIZE");
+                assert_eq!(message, "Parse Error: Invalid character in chunk size");
+            }
+            other => panic!("expected HPE_INVALID_CHUNK_SIZE, got {other:?}"),
+        }
+    })
+    .await;
+}
+
 /// A blocking HTTP/1 request read: the head and a content-length body.
 fn read_request_blocking(stream: &mut std::net::TcpStream) -> Option<String> {
     use std::io::Read as _;

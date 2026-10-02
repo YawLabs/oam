@@ -17717,14 +17717,7 @@
                 socket[kServerSocketClosed] === false
               ) {
                 if (parseError) {
-                  // node's parser error: its reason, and the count of bytes
-                  // of the failing read it had taken (none, for a bad
-                  // chunk-size line or the end of the stream).
-                  err.reason = code === "HPE_INVALID_EOF_STATE"
-                    ? "Invalid EOF state"
-                    : text.replace(/^Parse Error: /, "");
-                  err.bytesParsed = 0;
-                  serverSocketOnError(socket, err);
+                  serverSocketOnError(socket, withParseReason(err));
                 } else if (readReset) {
                   // net's own: the socket destroys itself with the read's
                   // error, and socketOnError hears it as an 'error'.
@@ -19543,7 +19536,15 @@
         err && typeof err.code === "string" && err.code.indexOf("HPE_") === 0 &&
         err.reason === undefined && typeof err.message === "string"
       ) {
-        err.reason = err.message.replace(/^Parse Error: /, "");
+        if (err.code === "HPE_INVALID_EOF_STATE") {
+          // node's parser.finish(): the stream ended where the message had
+          // not, a message with no reason in it and no bytes of a read
+          // parsed (v22.22.2).
+          err.reason = "Invalid EOF state";
+          err.bytesParsed = 0;
+        } else {
+          err.reason = err.message.replace(/^Parse Error: /, "");
+        }
       }
       return err;
     }
@@ -21779,19 +21780,20 @@
             }, function (err) {
               settled = true;
               // node's parser reports malformed framing on the request
-              // before the response is aborted; a connection that ends
-              // inside a body -- closed or reset, over an agent's socket or
-              // oam's own transport -- just aborts it: 'aborted', then
+              // before the response is aborted, over an agent's socket or
+              // oam's own transport alike; a connection that ends inside a
+              // body -- closed or reset -- just aborts it: 'aborted', then
               // ECONNRESET `aborted`. Up to 0.17.1 the transport's reading
               // failure (`fetch: body read failed: ...`) was the error.
-              if (agentPath && err && typeof err.code === "string" && err.code.indexOf("HPE_") === 0) {
-                self.errored = withParseReason(err);
-                self.emit("error", err);
-              } else if (!agentPath && err && err.syscall === "read" && typeof err.code === "string") {
-                // A reset: node's socket error reaches the request first
-                // (socketErrorListener), `read ECONNRESET` -- an uncaught
-                // exception when nothing listens, as in node. A close has
-                // no socket error.
+              var parseError = err && typeof err.code === "string" && err.code.indexOf("HPE_") === 0;
+              // A reset: node's socket error reaches the request first
+              // (socketErrorListener), `read ECONNRESET`. A close has no
+              // socket error.
+              var readReset = !agentPath && err && err.syscall === "read" && typeof err.code === "string";
+              if (parseError) self.errored = withParseReason(err);
+              if (parseError || readReset) {
+                // An uncaught exception when nothing listens, as in node --
+                // thrown on its own tick, so the response is still aborted.
                 try {
                   self.emit("error", err);
                 } catch (thrown) {

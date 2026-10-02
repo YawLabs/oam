@@ -305,7 +305,7 @@ pub async fn request(
     let body = response.into_body();
     let end_stream = hyper::body::Body::is_end_stream(&body);
     let handle = ids.fetch_add(1, Ordering::Relaxed);
-    lock(&bodies).insert(handle, FetchBody::coded(body));
+    lock(&bodies).insert(handle, FetchBody::undecoded(body));
     OpOutcome::Json(
         serde_json::json!({
             "status": status.as_u16(),

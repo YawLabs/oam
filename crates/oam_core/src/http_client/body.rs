@@ -39,11 +39,6 @@ pub struct FetchBody {
     decoder: Option<Decoder>,
     /// Compressed input the decoder has not consumed yet.
     pending: Bytes,
-    /// A malformed body (a bad chunk-size line) fails the read with node's
-    /// coded parse error instead of [`BODY_READ_FAILED`]: http.request over
-    /// an agent's socket reads its body here and reports what node's parser
-    /// reports. fetch keeps the one text it has always had.
-    coded: bool,
     /// The connection the body arrives on (the shared transport's): a peer
     /// that closes it mid-body is undici's `SocketError`, which describes
     /// it. `None` for a body read off an agent's socket or an h2 stream.
@@ -125,18 +120,14 @@ impl FetchBody {
             incoming: Some(incoming),
             decoder: codings.map(Decoder::new),
             pending: Bytes::new(),
-            coded: false,
             conn,
         }
     }
 
-    /// An undecoded body whose malformed framing reads as node's coded parse
-    /// error (http.request over an agent's socket).
-    pub fn coded(incoming: Incoming) -> FetchBody {
-        FetchBody {
-            coded: true,
-            ..FetchBody::new(incoming, None, None)
-        }
+    /// An undecoded body off a connection whose facts are not known here:
+    /// http.request over an agent's socket, or an h2 stream.
+    pub fn undecoded(incoming: Incoming) -> FetchBody {
+        FetchBody::new(incoming, None, None)
     }
 
     /// The next chunk: `Some` bytes (never empty), `None` at the end.
@@ -207,11 +198,13 @@ impl FetchBody {
     /// ECONNRESET` (errno, code, syscall) and a close is undici's `other
     /// side closed` -- fetch rejects the read with `terminated` and that
     /// cause, http.request aborts the response -- when the body came over
-    /// the shared transport, whose connection is known. A malformed coded
-    /// body is node's parse error; the rest keep [`BODY_READ_FAILED`].
+    /// the shared transport, whose connection is known. Malformed framing
+    /// is node's parser error on every body -- http.request emits it on the
+    /// request, fetch's `terminated` carries undici's HTTPParserError for
+    /// it; the rest keep [`BODY_READ_FAILED`].
     fn failure(&self, error: BodyReadError) -> OpOutcome {
         match error {
-            BodyReadError::Framing if self.coded => invalid_chunk_size(),
+            BodyReadError::Framing => invalid_chunk_size(),
             BodyReadError::Reset(os) if self.conn.is_some() => {
                 let io = match os {
                     Some(code) => std::io::Error::from_raw_os_error(code),
