@@ -20241,8 +20241,12 @@
       removeHeader(name) {
         checkHeaderNameArg(name);
         var key = name.toLowerCase();
-        // node: a removed Connection header is not sent at all.
+        // node: a removed Connection header is not sent at all; a removed
+        // content-length or transfer-encoding changes how the body is
+        // framed (_nodeChunks).
         if (key === "connection") this._removedConnection = true;
+        else if (key === "content-length") this._removedContLen = true;
+        else if (key === "transfer-encoding") this._removedTE = true;
         delete this._headers[key];
       }
       getHeaders() { return Object.assign({}, this._headers); }
@@ -20295,16 +20299,22 @@
         if (typeof chunk !== "string" || (encoding && encoding !== "utf8")) return;
         this._utf8Head = chunk.length === 0 || !this._nodeChunks(fromEnd);
       }
-      // Whether node's head for this request frames the body chunked: a
-      // transfer-encoding header says, a content-length header means no, as
-      // does end() building the head (it knows the length); otherwise node
-      // chunks the body of every method but GET, HEAD, DELETE, OPTIONS,
-      // TRACE and CONNECT (useChunkedEncodingByDefault).
+      // Whether node's head for this request frames the body chunked
+      // (_storeHeader): a transfer-encoding header says, and a
+      // content-length header means no. Otherwise only the body of a method
+      // other than GET, HEAD, DELETE, OPTIONS, TRACE and CONNECT
+      // (useChunkedEncodingByDefault) is chunked, and not when end() builds
+      // the head -- it knows the length -- unless a Trailer header is set or
+      // the content-length header was removed, nor when the
+      // transfer-encoding header was.
       _nodeChunks(fromEnd) {
-        var te = this._headers["transfer-encoding"];
+        var headers = this._headers;
+        var te = headers["transfer-encoding"];
         if (te !== undefined) return CHUNKED_CODING.test(te);
-        if (this._headers["content-length"] !== undefined || fromEnd) return false;
-        return !/^(?:GET|HEAD|DELETE|OPTIONS|TRACE|CONNECT)$/.test(this.method);
+        if (headers["content-length"] !== undefined) return false;
+        if (/^(?:GET|HEAD|DELETE|OPTIONS|TRACE|CONNECT)$/.test(this.method)) return false;
+        if (fromEnd && headers["trailer"] === undefined && !this._removedContLen) return false;
+        return !this._removedTE;
       }
       // A header value as the transport writes it, one byte per code point:
       // for a head node sends as UTF-8, the value's UTF-8 bytes. Only a

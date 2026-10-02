@@ -7,7 +7,9 @@
 // goes out as UTF-8 (`café` is caf\xc3\xa9); before anything else -- end(),
 // end(''), a Buffer, a string in another encoding, a POST's chunked write --
 // one byte per code point (caf\xe9). oam sent every value one byte per code
-// point.
+// point. end('text') knows its length unless a Trailer header is set or the
+// content-length header was removed: then a POST's body is chunked and its
+// head one byte per code point (oam sent UTF-8 there); a GET's is not.
 //
 // Each request goes out three ways: with no agent (oam's transport), through
 // a keep-alive agent, and as an upgrade request (a head oam writes on the
@@ -50,6 +52,18 @@ const sends = {
   "content-length, write('x')": (req) => { req.setHeader("content-length", "1"); req.write("x"); req.end(); },
   "transfer-encoding, end('x')": (req) => { req.setHeader("transfer-encoding", "chunked"); req.end("x"); },
   "flushHeaders(), end()": (req) => { req.flushHeaders(); req.end(); },
+  "content-length removed, end('x')": (req) => { req.removeHeader("content-length"); req.end("x"); },
+  "both framing headers removed, write('x')": (req) => {
+    req.removeHeader("content-length");
+    req.removeHeader("transfer-encoding");
+    req.write("x");
+    req.end();
+  },
+};
+// node refuses a GET's Trailer header (its body is not chunked) when the
+// head is built: ERR_HTTP_TRAILER_INVALID, which oam's client does not throw.
+const postSends = {
+  "Trailer header, end('x')": (req) => { req.setHeader("trailer", "x-t"); req.end("x"); },
 };
 const kinds = {
   "no agent": () => ({ agent: false }),
@@ -59,7 +73,7 @@ const kinds = {
 
 for (const [kind, options] of Object.entries(kinds)) {
   for (const method of ["GET", "POST"]) {
-    for (const [label, send] of Object.entries(sends)) {
+    for (const [label, send] of Object.entries(method === "POST" ? { ...sends, ...postSends } : sends)) {
       const opts = options();
       const head = new Promise((resolve) => (onHead = resolve));
       const done = new Promise((resolve) => {

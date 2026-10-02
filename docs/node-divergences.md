@@ -1913,6 +1913,12 @@ threw (`vendor/hyper-1.10.1/OAM-PATCH.md` item 15 has the connection header).
   connection header the handler set (`keep-alive`, or any value but `close`) goes out from
   Node as set and Node keeps the connection; hyper sends `Connection: close` in its place
   and closes.
+- **An `http.request` body Node chunks can go out with a length.** A POST's `end('text')`
+  after `setHeader('Trailer', ...)` or `removeHeader('content-length')`, and a `write()`
+  followed by `end()` in the same tick, are chunked by Node; oam's client, which has the
+  whole body by then, sends it with a `content-length`. The head's bytes are Node's either
+  way (one byte per code point, case 271). A GET's `Trailer` header makes Node's `end()`
+  throw `ERR_HTTP_TRAILER_INVALID`; oam's client sends the request.
 - **Trailer names go out in title case.** `addTrailers()`'s fields follow the last chunk of a
   chunked body as Node sends them -- all of them, a repeated one once per value, whether or
   not a `Trailer` header names them and whatever the request's `TE` says, and none on a body
