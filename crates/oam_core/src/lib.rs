@@ -420,8 +420,36 @@ pub fn close_descriptor(registry: &FileRegistry, fd: u64) -> bool {
     drop(file);
     if fd < OWN_FD_BASE {
         close_inherited_fd(fd);
+        if let Some(closed) = STDIO_CLOSED.get(fd as usize) {
+            closed.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
     true
+}
+
+/// Which of descriptors 0-2 `close_descriptor` has really closed -- unix
+/// only, as Windows leaves them open. The runtime's own stdout and stderr
+/// writes do not go through the descriptor table, so they ask here.
+static STDIO_CLOSED: [std::sync::atomic::AtomicBool; 3] = [
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+];
+
+/// The error a write to the process's stdout (1) or stderr (2) gets once the
+/// program has closed that descriptor with `fs.closeSync` / `fs.close`: EBADF,
+/// as node's write(2) gets on unix, where libuv really closes it. `None` while
+/// it is open -- always, on Windows. One relaxed load on the write path.
+pub fn closed_stdio_error(fd: u64) -> Option<std::io::Error> {
+    let closed = STDIO_CLOSED.get(fd as usize)?;
+    if !closed.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    #[cfg(unix)]
+    let errno = libc::EBADF;
+    #[cfg(not(unix))]
+    let errno = 6; // ERROR_INVALID_HANDLE; unreachable, nothing sets the flag
+    Some(std::io::Error::from_raw_os_error(errno))
 }
 
 /// A read or write position as node's binding hands it to libuv (its

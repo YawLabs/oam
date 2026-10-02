@@ -2252,7 +2252,12 @@ What still differs:
   stdin, stdout and stderr for every fd call, as in node (`fstatSync(0)`,
   `readSync(0)`, `readFileSync(0)`, `fsyncSync(1)`; `conformance/cases/258-*`), with
   libuv's Windows `fstat` shapes for a pipe, the console and NUL, and its close rule
-  (0-2 stay open on Windows, are really closed on unix). libuv's Windows `fchmod`
+  (0-2 stay open on Windows, are really closed on unix -- after `fs.closeSync(1)` a
+  pipe's reader sees EOF and every later write to stdout, `console.log` aside, fails
+  `EBADF`, as in node). One unix difference remains: node's descriptors are the OS's,
+  so `fs.closeSync(1)` followed by `fs.openSync(file, 'w')` gets descriptor 1 back
+  and stdout's writes go to the file; oam's `openSync` numbers its own descriptors,
+  and stdout stays closed. libuv's Windows `fchmod`
   reopens the handle first, which fails for a pipe (`EBUSY`) and NUL (`EINVAL`);
   oam's sets the attribute on the handle it has, so `fchmodSync(0, mode)` on a piped
   stdin succeeds and on NUL is `EISDIR`. A character device other than the console

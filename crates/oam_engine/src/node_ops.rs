@@ -1011,8 +1011,15 @@ fn stdio_write_failed(
 /// std's lock is held throughout, so a write from another thread -- a worker
 /// that shares the process's stdout -- cannot land inside this one, and std's
 /// own buffer is flushed first so anything written through it keeps its place.
+///
+/// A stdout the program closed (`fs.closeSync(1)`, unix) is EBADF, as node's
+/// write(2) gets -- checked first, so nothing reaches whatever the OS gave
+/// descriptor 1 to since.
 fn stdout_write_whole(bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    if let Some(e) = oam_core::closed_stdio_error(1) {
+        return Err(e);
+    }
     if bytes.is_empty() {
         return Ok(());
     }
@@ -1023,7 +1030,8 @@ fn stdout_write_whole(bytes: &[u8]) -> std::io::Result<()> {
     if let Some(done) = win_console_write(bytes) {
         return done;
     }
-    match raw_stdout() {
+    let raw = raw_stdout();
+    match raw.as_ref().and_then(Option::as_ref) {
         Some(file) => write_whole(file, bytes),
         // No handle of our own to write through (a detached process with no
         // stdout): std's path, as before.
@@ -1069,10 +1077,15 @@ fn write_whole(mut sink: impl std::io::Write, mut bytes: &[u8]) -> std::io::Resu
 
 /// The process's stdout as a plain `File`: a duplicate of the descriptor /
 /// handle, so the writes skip std's `LineWriter` and still reach the same pipe,
-/// file or terminal. Made once; `None` when there is no stdout to duplicate.
-fn raw_stdout() -> Option<&'static std::fs::File> {
-    static RAW: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
-    RAW.get_or_init(|| {
+/// file or terminal. Made on first use; `None` when there is no stdout to
+/// duplicate, and from the moment the program closes descriptor 1
+/// (`forget_raw_stdout`). Taken under std's stdout lock by every writer, so
+/// the mutex is never contended.
+static RAW_STDOUT: std::sync::Mutex<Option<Option<std::fs::File>>> = std::sync::Mutex::new(None);
+
+fn raw_stdout() -> std::sync::MutexGuard<'static, Option<Option<std::fs::File>>> {
+    let mut raw = RAW_STDOUT.lock().unwrap_or_else(|e| e.into_inner());
+    if raw.is_none() {
         #[cfg(unix)]
         let owned = {
             use std::os::fd::AsFd;
@@ -1083,9 +1096,27 @@ fn raw_stdout() -> Option<&'static std::fs::File> {
             use std::os::windows::io::AsHandle;
             std::io::stdout().as_handle().try_clone_to_owned()
         };
-        owned.ok().map(std::fs::File::from)
-    })
-    .as_ref()
+        *raw = Some(owned.ok().map(std::fs::File::from));
+    }
+    raw
+}
+
+/// Close the duplicate of a stdout the program has closed, so that it is
+/// really closed: a pipe's reader sees EOF at `fs.closeSync(1)`, as under
+/// node, not when the process exits.
+fn forget_raw_stdout() {
+    *RAW_STDOUT.lock().unwrap_or_else(|e| e.into_inner()) = Some(None);
+}
+
+/// `oam_core::close_descriptor`, plus what closing the process's stdout
+/// means for the runtime's own copy of it (unix only: on Windows 0-2 stay
+/// open).
+fn close_fd(files: &oam_core::FileRegistry, fd: u64) -> bool {
+    let closed = oam_core::close_descriptor(files, fd);
+    if closed && fd == 1 && oam_core::closed_stdio_error(1).is_some() {
+        forget_raw_stdout();
+    }
+    closed
 }
 
 /// A Windows console gets UTF-16 through WriteConsoleW, as std and libuv give
@@ -1142,7 +1173,7 @@ fn win_console_write(bytes: &[u8]) -> Option<std::io::Result<()>> {
         Err(_) if kind == UNKNOWN => {
             KIND.store(NOT_CONSOLE, Ordering::Relaxed);
             *carry = Vec::new();
-            Some(match raw_stdout() {
+            Some(match raw_stdout().as_ref().and_then(Option::as_ref) {
                 Some(file) => write_whole(file, &pending),
                 // std's stdout lock is reentrant, so taking it again under
                 // the caller's is fine.
@@ -1426,6 +1457,12 @@ fn op_stderr_write(
 ) {
     if let Some(bytes) = arg_bytes(scope, &args, 0) {
         use std::io::Write;
+        // A stderr the program closed is EBADF, as for stdout: std's stderr
+        // would report the write to a closed descriptor as done.
+        if let Some(e) = oam_core::closed_stdio_error(2) {
+            stdio_write_failed(scope, &mut rv, &e);
+            return;
+        }
         let stderr = std::io::stderr();
         let mut lock = stderr.lock();
         if let Err(e) = write_whole(&mut lock, &bytes).and_then(|()| lock.flush()) {
@@ -6881,7 +6918,7 @@ fn op_fs_close(
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let files = core_runtime!(scope).files();
-    oam_core::close_descriptor(&files, handle);
+    close_fd(&files, handle);
 }
 
 /// Throw an `Error` carrying `.code`/`.syscall` for a bad/missing fd. Node
@@ -7069,7 +7106,7 @@ fn op_fs_close_sync(
     let files = core_runtime!(scope).sync_files();
     // Adopts and closes an inherited descriptor, and treats 0-2 as node does
     // on each platform: see close_descriptor.
-    if !oam_core::close_descriptor(&files, fd) {
+    if !close_fd(&files, fd) {
         throw_ebadf(scope, "close");
     }
 }
