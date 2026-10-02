@@ -24,13 +24,17 @@ sign. Nothing secret is ever committed here.
 files' format before it trusts them. The installers and `oam self-update` will
 embed copies of both files; that work is a later step of the signing plan.
 
-## Bootstrap state (today)
+## Current keys
 
-Both files contain comments only. While `allowed_signers` holds no key line,
-`scripts/release-local.sh` skips the manifest step with a loud warning, and
-`OAM_SIGN_REQUIRED=1` turns that skip into a failure. **Once any key line is
-committed, every release must sign.** No knob skips the manifest step, because
-anyone in control of the release box could set it.
+| Key | Fingerprint | Range | Where |
+|---|---|---|---|
+| `k1` | `SHA256:zB7Aq4Ky/U90VJ4sAEp0e2A65KfQpiyQXJI4FuT2oss` | `v0.18.0` on | release box |
+| `k2` | `SHA256:Uy7nugF5mDzfM/8/fcUti9K+sQMbn/LdRAk+sIbWYs4` | none yet (staged) | offline |
+
+Key lines are committed, so **every release must sign.** No knob skips the
+manifest step, because anyone in control of the release box could set it.
+(Before any key line existed, `scripts/release-local.sh` skipped the manifest
+step with a loud warning; releases up to `v0.17.1` are unsigned.)
 
 ## Generating the keys (once)
 

@@ -21,4 +21,5 @@
 # edit here, not a deletion from allowed_signers, and why it never breaks the
 # old tags the key legitimately signed.
 #
-# Empty until the first key is committed (README.md).
+# k1 signs from v0.18.0, the first signed release. k2 is staged: no line yet.
+k1 v0.18.0 -
