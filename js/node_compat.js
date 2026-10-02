@@ -10080,12 +10080,15 @@
 
   // A POSITION node does not validate -- a write's, readv's, writev's --
   // normalised for the natives as the binding's GetOffset does it: a safe
-  // integer >= 0 is a pread/pwrite, anything else (null, 1.5, "x", a bigint, a
-  // negative) means "from the current cursor". A read's position IS
-  // validated first (readPosition). Shared by the fs and fs/promises
-  // factories so the two cannot drift -- FileHandle.read/write silently
-  // DROPPED their position for as long as the natives had nowhere to put it.
-  const fsPositionArg = (p) => (Number.isSafeInteger(p) && p >= 0 ? p : null);
+  // integer is the position, anything else (null, 1.5, "x", a bigint) is -1,
+  // "from the current cursor", passed as null. A negative position other
+  // than -1 is passed through: libuv treats it as the cursor on unix and
+  // fails it EINVAL on Windows, and the natives do the same
+  // (oam_core::file_offset). A read's position IS validated first
+  // (readPosition). Shared by the fs and fs/promises factories so the two
+  // cannot drift -- FileHandle.read/write silently DROPPED their position for
+  // as long as the natives had nowhere to put it.
+  const fsPositionArg = (p) => (Number.isSafeInteger(p) && p !== -1 ? p : null);
 
   // `Object.keys(err)` order, for the ONE fd call where node's differs.
   //

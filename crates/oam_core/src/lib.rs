@@ -424,9 +424,29 @@ pub fn close_descriptor(registry: &FileRegistry, fd: u64) -> bool {
     true
 }
 
-/// Read into `buf` at `position` -- `pread(2)` -- or from the cursor when it
-/// is None. A positional read does not move the cursor, which is what node's
-/// positional `fs.read` family means.
+/// A read or write position as node's binding hands it to libuv (its
+/// GetOffset: any safe integer, else -1), resolved to what the OS is asked
+/// for: `Some(offset)` for a positional op, `None` for the cursor.
+///
+/// -1 is the cursor everywhere. Any other negative is the cursor on unix,
+/// where libuv's uv__fs_read / uv__fs_write take `off < 0` to mean read(2) /
+/// write(2). On Windows libuv's fs__read / fs__write hand every offset but -1
+/// to the OS as an OVERLAPPED offset, two's complement and all, around a
+/// saved and restored file pointer -- which is what `read_at` / `write_all_at`
+/// do with the `Some` returned here -- and the OS decides (measured on node
+/// v22.22.2): -2 is its FILE_USE_FILE_POINTER_POSITION, so the op happens at
+/// the cursor and the cursor does not move; a handle opened for append writes
+/// at the end; anything else fails ERROR_INVALID_PARAMETER, EINVAL.
+pub fn file_offset(position: Option<i64>) -> Option<u64> {
+    match position {
+        Some(p) if p >= 0 || (p != -1 && cfg!(windows)) => Some(p as u64),
+        _ => None,
+    }
+}
+
+/// Read into `buf` at `position` -- `pread(2)` -- or from the cursor (see
+/// `file_offset` for a negative one). A positional read does not move the
+/// cursor, which is what node's positional `fs.read` family means.
 ///
 /// Unix has a real `pread`, so concurrent positional reads on one descriptor
 /// never see each other. Windows has no read that leaves the file pointer
@@ -436,10 +456,10 @@ pub fn close_descriptor(registry: &FileRegistry, fd: u64) -> bool {
 pub fn read_at(
     file: &std::fs::File,
     buf: &mut [u8],
-    position: Option<u64>,
+    position: Option<i64>,
 ) -> std::io::Result<usize> {
     use std::io::Read;
-    let Some(p) = position else {
+    let Some(p) = file_offset(position) else {
         return (&*file).read(buf);
     };
     #[cfg(unix)]
@@ -464,17 +484,17 @@ pub fn read_at(
     }
 }
 
-/// Write all of `bytes` at `position` -- `pwrite(2)` -- or at the cursor when
-/// it is None, with `write_all_checked`'s rule that an empty write still
+/// Write all of `bytes` at `position` -- `pwrite(2)` -- or at the cursor (see
+/// `file_offset` for a negative one), with `write_all_checked`'s rule that an empty write still
 /// reaches the descriptor. Same platform split as `read_at`. A descriptor
 /// opened for APPEND writes at the end whatever the position, on every
 /// platform node runs on; that is the OS's behaviour and node's.
 pub fn write_all_at(
     file: &std::fs::File,
     bytes: &[u8],
-    position: Option<u64>,
+    position: Option<i64>,
 ) -> std::io::Result<()> {
-    let Some(p) = position else {
+    let Some(p) = file_offset(position) else {
         return write_all_checked(file, bytes);
     };
     #[cfg(unix)]
@@ -495,7 +515,9 @@ pub fn write_all_at(
             }
             let mut done = 0usize;
             while done < bytes.len() {
-                match file.seek_write(&bytes[done..], p + done as u64) {
+                // Wrapping, as libuv's int64 `offset + bytes` does for a
+                // negative offset (see file_offset).
+                match file.seek_write(&bytes[done..], p.wrapping_add(done as u64)) {
                     Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
                     Ok(n) => done += n,
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
@@ -5003,7 +5025,7 @@ pub mod ops {
         files: super::FileRegistry,
         handle: u64,
         len: usize,
-        position: Option<u64>,
+        position: Option<i64>,
     ) -> OpOutcome {
         let Some(file) = super::registered_file(&files, handle) else {
             return node_fail_ebadf("read");
@@ -5052,7 +5074,7 @@ pub mod ops {
         files: super::FileRegistry,
         handle: u64,
         bytes: Vec<u8>,
-        position: Option<u64>,
+        position: Option<i64>,
     ) -> OpOutcome {
         let Some(file) = super::registered_file(&files, handle) else {
             return node_fail_ebadf("write");
@@ -5752,6 +5774,51 @@ mod tests {
     /// as node does. The chunk ops used to take the file out of the registry
     /// for their IO await, so every op that started while another was in
     /// flight found the slot empty and failed with EBADF.
+    /// node's positions through libuv: -1 is the cursor everywhere; any other
+    /// negative is the cursor on unix, and on Windows goes to the OS, which
+    /// takes -2 as "at the cursor, which does not move" and refuses -5 with
+    /// EINVAL, touching nothing.
+    #[test]
+    fn a_negative_position_is_what_libuv_makes_of_it() {
+        assert_eq!(file_offset(None), None);
+        assert_eq!(file_offset(Some(-1)), None);
+        assert_eq!(file_offset(Some(0)), Some(0));
+        assert_eq!(file_offset(Some(7)), Some(7));
+
+        let dir = std::env::temp_dir().join(format!("oam-file-offset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f");
+        std::fs::write(&path, b"ABCDEF").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut one = [0u8; 1];
+        assert_eq!(read_at(&file, &mut one, None).unwrap(), 1); // cursor at 1
+        let refused = write_all_at(&file, b"x", Some(-5));
+        let at_cursor = write_all_at(&file, b"y", Some(-2));
+        let read = read_at(&file, &mut one, Some(-3));
+        if cfg!(windows) {
+            assert_eq!(node_error_code(&refused.unwrap_err()), "EINVAL");
+            at_cursor.unwrap();
+            assert_eq!(node_error_code(&read.unwrap_err()), "EINVAL");
+            // "y" at the cursor (1), which stayed at 1.
+            assert_eq!(std::fs::read(&path).unwrap(), b"AyCDEF");
+            assert_eq!(read_at(&file, &mut one, None).unwrap(), 1);
+            assert_eq!(&one, b"y");
+        } else {
+            assert_eq!(file_offset(Some(-5)), None);
+            refused.unwrap();
+            at_cursor.unwrap();
+            assert_eq!(read.unwrap(), 1);
+            assert_eq!(&one, b"D");
+            assert_eq!(std::fs::read(&path).unwrap(), b"AxyDEF");
+        }
+        drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn concurrent_chunk_ops_on_one_descriptor_all_reach_it() {
         let dir = std::env::temp_dir().join(format!("oam-fd-shared-{}", std::process::id()));
@@ -5782,7 +5849,7 @@ mod tests {
         drop(file);
 
         let mut reads = HashMap::new();
-        for i in 0..8u64 {
+        for i in 0..8i64 {
             let id = core.spawn_op(ops::fs_read_chunk(
                 files.clone(),
                 OWN_FD_BASE,
@@ -5792,7 +5859,7 @@ mod tests {
             reads.insert(id, i);
         }
         let mut writes = Vec::new();
-        for i in 0..4u64 {
+        for i in 0..4i64 {
             writes.push(core.spawn_op(ops::fs_write_chunk(
                 files.clone(),
                 OWN_FD_BASE,

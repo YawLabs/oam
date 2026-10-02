@@ -719,17 +719,21 @@ fn system_error<'s>(
 /// An optional non-negative POSITION argument: a number seeks (pread/pwrite),
 /// absent / null / negative means "from the current cursor". Shared by the four
 /// read/write natives so the coercion cannot drift between them.
+/// A read / write position argument as node's binding reads one (GetOffset):
+/// an integer number is the position -- negative ones included, which
+/// `oam_core::file_offset` resolves per platform -- anything else (null, a
+/// fraction, NaN) is the cursor.
 fn optional_position(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments<'_>,
     index: i32,
-) -> Option<u64> {
+) -> Option<i64> {
     let value = args.get(index);
     if !value.is_number() {
         return None;
     }
-    let p = value.number_value(scope).unwrap_or(-1.0);
-    if p >= 0.0 { Some(p as u64) } else { None }
+    let p = value.number_value(scope).unwrap_or(f64::NAN);
+    (p.is_finite() && p.fract() == 0.0).then_some(p as i64)
 }
 
 pub(crate) fn arg_string(
@@ -6964,13 +6968,7 @@ fn op_fs_read_sync(
     let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let offset = args.get(2).number_value(scope).unwrap_or(0.0) as usize;
     let length = args.get(3).number_value(scope).unwrap_or(0.0) as usize;
-    let position = args.get(4);
-    let pos_seek = if position.is_number() {
-        let p = position.number_value(scope).unwrap_or(-1.0);
-        if p >= 0.0 { Some(p as u64) } else { None }
-    } else {
-        None
-    };
+    let pos_seek = optional_position(scope, &args, 4);
 
     let files = core_runtime!(scope).sync_files();
     // A low fd missing from the registry cannot be one oam allocated -- the
@@ -7045,13 +7043,7 @@ fn op_fs_write_sync(
         throw_type_error(scope, "writeSync requires data");
         return;
     };
-    let position = args.get(2);
-    let pos_seek = if position.is_number() {
-        let p = position.number_value(scope).unwrap_or(-1.0);
-        if p >= 0.0 { Some(p as u64) } else { None }
-    } else {
-        None
-    };
+    let pos_seek = optional_position(scope, &args, 2);
     let files = core_runtime!(scope).sync_files();
     // Adopts an inherited fd, as in op_fs_read_sync.
     let Some(file) = registered_fd(scope, &files, fd, "write") else {

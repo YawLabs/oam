@@ -2226,15 +2226,25 @@ bound, `utimes` / `lutimes` name a bad time `"time"`; and the callback forms che
 the path and these arguments at the call, in node's order, not through the callback.
 (One order differs, on macOS only: node's `lchmodSync` and `fs/promises.lchmod` open
 the path before checking the mode, so a missing path with a bad mode is `ENOENT`
-there; oam reports the mode.) A write's position is not
-validated, as in node: anything but a safe integer `>= 0` -- `1.5`, `'x'`, a bigint,
-a negative -- writes at the cursor (oam used to round `1.5` down to a pwrite at 1).
+there; oam reports the mode.) A write's position (and `readv`'s) is not
+validated, as in node: anything but a safe integer -- `1.5`, `'x'`, a bigint -- and
+`-1` are the cursor (oam used to round `1.5` down to a pwrite at 1). Any other
+negative is what libuv makes of it (`conformance/cases/264-*`): the cursor on unix;
+on Windows libuv hands it to the OS as the offset, so `-2` is the cursor without
+moving it, an append handle appends, and anything else is `EINVAL` with the file
+untouched -- where oam used to write at the cursor and report success.
 A string write's encoding is node's too: only `'hex'` with an odd-length string is
 refused, and a name the binding does not know (`'bogus'`) writes UTF-8 -- so
 `fs.writeSync(-1, 'x', 0, 'bogus')` is the descriptor error, where oam used to throw
 `ERR_UNKNOWN_ENCODING`.
 What still differs:
 
+- **A negative position for `writev` / `readv` of several buffers, on Windows.**
+  libuv offsets each buffer from the position in turn, so with `-2` the second
+  buffer of `writevSync(fd, [a, b], -2)` lands at `-2 + a.length` -- `-1` is the
+  end of the file -- and a `readvSync` stops there. oam gathers the buffers into
+  one write (scatters one read), so all of them land at the cursor. A single
+  buffer, and every position on unix, match.
 - **An anonymous class instance as the descriptor** reads `Received an instance of
   Object` in the C++ wording on oam, where V8 names it after the variable it was
   assigned to (`an instance of vals`); JS cannot see that inferred name.
