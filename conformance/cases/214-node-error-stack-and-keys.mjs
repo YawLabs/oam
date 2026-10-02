@@ -48,3 +48,17 @@ console.log("own toString", head(new OwnToString("m")), String(new OwnToString("
   e.code = "ERR_PLAIN";
   console.log("a plain error with a code", head(e));
 }
+
+console.log("== the header is rendered lazily: a message set before the first read shows");
+// oam's helper that shapes an error built elsewhere read the stack at once,
+// so a message changed before anyone read it never showed there.
+for (const [label, fn] of [
+  ["fs.readFileSync(1.5)", () => fs.readFileSync(1.5)],
+  ["Buffer.from(1)", () => Buffer.from(1)],
+  ["fs.read(1.5, cb)", () => fs.read(1.5, () => {})],
+  ["fs.mkdtempSync(1)", () => fs.mkdtempSync(1)],
+]) {
+  const e = caught(fn);
+  e.message = "CHANGED";
+  console.log(label, e.code, head(e));
+}

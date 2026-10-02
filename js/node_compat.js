@@ -675,9 +675,11 @@
   //   `err.constructor === RangeError` and `err instanceof RangeError` hold.
   // - `.name` stays the plain base name (assert.throws({ name }) compares it
   //   strictly); the code shows in `toString()` and in the stack header,
-  //   "BaseName [CODE]: msg". V8 renders the stack on its first read, through
-  //   toString (bootstrap.js prepareStackTrace), so an error born on its
-  //   code's prototype needs nothing rewritten.
+  //   "BaseName [CODE]: msg". V8 renders the stack on its first read, and
+  //   bootstrap.js prepareStackTrace writes node's `${name} [${code}]:
+  //   ${message}` for an error on a registry prototype ([kIsNodeError]), so
+  //   an error born on (or moved onto) its code's prototype needs nothing
+  //   rewritten.
   //
   // oam used to set `code` after the base constructor had set `message` and
   // then define `toString` on the instance, which gave `stack, message, code,
@@ -749,8 +751,15 @@
       base = parent;
     }
     if (kNativeErrorProtos.has(base)) {
+      // The registry prototype carries [kIsNodeError], so the stack header is
+      // node's `Name [CODE]: message`, rendered on the stack's first read
+      // (bootstrap.js prepareStackTrace) -- as lazily as node's, so a message
+      // set before that read shows, and an error nobody reads the stack of
+      // costs no stack format. The stack is not read here.
       Object.setPrototypeOf(inst, nodeErrorPrototype(base.constructor, code));
-    } else {
+      return inst;
+    }
+    {
       // An instance of some other class: the rendering goes on the instance.
       const baseName = inst.name;
       Object.defineProperty(inst, "toString", {
@@ -763,8 +772,9 @@
         enumerable: false,
       });
     }
-    // The instance was built elsewhere, so its stack may already have been
-    // rendered with the plain header. Rewrite line 0 only when it is that
+    // Not a node error to prepareStackTrace, so its header is the plain
+    // `Name: message` (and the stack may already have been rendered). Rewrite
+    // line 0 only when it is that
     // default render, `Name` or `Name: message`: a user's
     // Error.prepareStackTrace output is theirs to keep, exactly as in node,
     // and a header that already shows the code is left alone. `stack` stays
