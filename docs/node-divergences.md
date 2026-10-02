@@ -2234,10 +2234,14 @@ listeners, and it closes with `true`; the exchange it cut short is aborted from 
 the socket closed with `false` and no error, `'clientError'` heard nothing, and the late
 write called back with no error.
 
-What still differs around a close: the socket never emits `'end'`. A client that goes away mid-body after the response has
-finished closes the connection with `false` and aborts the request (`'aborted'`, ECONNRESET
-`aborted`), where Node's socket reports `HPE_INVALID_EOF_STATE` and closes with `true` and
-the request emits nothing. A server request emits `'close'` only when it is destroyed or
+A client that goes away or resets mid-body after the response has finished is reported on
+the socket as Node reports it -- `HPE_INVALID_EOF_STATE` or `read ECONNRESET`, and `'close'`
+with `true` -- and the request, which Node's server no longer holds, emits nothing
+(`conformance/cases/296-http-server-request-after-response-finished.mjs`); up to 0.17.1 the
+socket closed with `false` and the request was aborted (`'aborted'`, ECONNRESET `aborted`).
+
+What still differs around a close: the socket never emits `'end'`. A server request emits
+`'close'` only when it is destroyed or
 aborted -- Node's destroys itself once read to the end, so its `'close'` follows `'end'` on
 every exchange; a request read to the end whose connection then closes gets its `'close'` there, without an
 error, where Node's came earlier. A client that half-closes or goes away while the handler

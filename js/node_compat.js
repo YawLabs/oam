@@ -19157,6 +19157,10 @@
     // onServerResponseClose, a 'close' listener on the socket from the
     // moment the response is assigned it until it finishes.
     const kClosesWithSocket = Symbol("kClosesWithSocket");
+    // A server request whose response has finished: node's resOnFinish has
+    // taken it off the connection's incoming queue, so the connection's
+    // close aborts it no more.
+    const kResponseFinished = Symbol("kResponseFinished");
     // The server a connection's socket belongs to, and whether node's
     // socketOnError -- the server's own 'error' listener, which removes
     // itself after the first error -- has run on it (serverSocketOnError).
@@ -19313,6 +19317,12 @@
                 }
                 return;
               }
+              // The connection closed first. Its close aborted the request
+              // -- unless the response had finished, when node's
+              // abortIncoming no longer has it, and nothing is emitted on it
+              // (which oam did when the body's failure came in after the
+              // close).
+              if (this[kResponseFinished] === true) return;
               const reset = new Error("aborted");
               reset.code = "ECONNRESET";
               this.destroy(reset);
@@ -20502,6 +20512,9 @@
       // with an exchange still open is not idle.
       exchanges.set(requestId, { req, res, connectionId });
       const forget = () => exchanges.delete(requestId);
+      res.once("finish", () => {
+        req[kResponseFinished] = true;
+      });
       res.once("finish", forget);
       res.once("close", forget);
       // node's res.assignSocket(): until it finishes, the response closes
