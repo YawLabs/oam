@@ -16,6 +16,193 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+## [0.17.2] - YYYY-MM-DD
+
+Node-compat depth across fetch, the http client and server, net, dns, undici, zlib, fs and
+node's coded errors: each change below is held to node v22.22.2 by a conformance case or an
+e2e test.
+
+### Added
+
+- **`undici` exports `ProxyAgent` and `EnvHttpProxyAgent`** (#208). The dispatch-only names
+  (`RetryAgent`, `connect()`, `pipeline()`, ...) now export and refuse with
+  `NotSupportedError`, where they were missing.
+- **`socket.resetAndDestroy()` closes a connection with a reset, as node's does**, on a
+  `net.Socket`, on an http server's `req.socket` and on an `http.request`'s `req.socket`; a
+  `tls.TLSSocket` throws node's `ERR_INVALID_HANDLE_TYPE`.
+- **An http server response has `setHeaders()` and `addTrailers()`**, and `appendHeader()`
+  works where it used to write into the headers object's properties and lose them;
+  `http.validateHeaderName` / `validateHeaderValue` throw node's coded errors.
+- **A fetched `Response` has `blob()`, and `Request` is undici's constructor** (#154, #180):
+  every attribute and check node's has, and `fetch(request)` sends the `Request` itself.
+- **An http server's `req.httpVersion`, `httpVersionMajor` and `httpVersionMinor`** report
+  the request's version, and an HTTP/1.0 request's response head goes out as node's does.
+- **`net.Socket` has `writableEnded` and `writableFinished`**, and `fs.realpath.native` exists.
+- **The MCP sidecar gate hosts the yaw-mcp broker itself**, as `oam run --no-check` (#221).
+
+### Changed
+
+- **`listen()` without a host binds dual-stack `::`, as node's does** (#172). An http, https
+  or http2 server started without a host used to bind `127.0.0.1` and was unreachable from
+  any other machine; net and tls bound `0.0.0.0`. `::` now takes IPv4 clients unless
+  `ipv6Only`, `address()` reports the family bound, and listen errors have node's shape.
+  Under `--permission`, such a listen is checked as `0.0.0.0:<port>` on every server kind.
+
+### Fixed
+
+- **fetch, `Request` and `Response` stringified a `Blob`, `File`, `FormData`,
+  `URLSearchParams` or `ReadableStream` body** (#154). They send it as itself with node's
+  content-type; streamed uploads, a failing upload source and a redirected streamed body
+  behave as in node.
+- **fetch ignored a `Request` passed as its input** (#180); its body, signal and redirect
+  mode now apply, with `init` winning, as in node.
+- **A request header value went out as UTF-8** (#174). fetch and `http.request` send one
+  byte per code point and refuse, with node's errors, the values node refuses; oam's
+  servers read a request header value the same way.
+- **`Headers` iterated in insertion order** (#175). It iterates sorted by name, as node's
+  does; `oam.serve` still writes headers in the order the handler set them.
+- **fetch did not send undici's default request headers** (#178): `connection`,
+  `accept-language`, `sec-fetch-mode`, its `accept-encoding`, `content-length: 0` on an
+  empty POST/PUT/PATCH, and the cache mode's `pragma` / `cache-control`.
+- **`response.type` was undefined, and an unparseable `Location` failed with a plain
+  error** (#149). It is `'basic'`, and the cause is node's `ERR_INVALID_URL` TypeError.
+- **A fetch undici refuses to dispatch rejected with an uncoded cause** (#177). The cause is
+  an undici error class with its `code` and brands, shared with the `undici` shim, so
+  `instanceof undici.errors.X` holds.
+- **A failed body read rejected with `fetch: body read failed: error decoding response
+  body`** (#168). It rejects with `TypeError: terminated` and a cause naming what failed:
+  `SocketError`, `ResponseContentLengthMismatchError`, `HTTPParserError`, a reset or a
+  decoder's error.
+- **fetch had no connect timeout** (#157). A connect over 10 s fails with undici's
+  `ConnectTimeoutError`, or at the dispatcher's own `connectTimeout`, through an Agent
+  `factory` too.
+- **An abort before the response head left the request on the wire** (#158). The connection
+  is closed at the abort, for fetch and for a destroyed `http.request`; an abort while fetch
+  reads a Blob body is honoured at once too.
+- **`statusText` and `statusMessage` were the canonical reason phrase** (#160), whatever the
+  server sent; they are the phrase on the wire.
+- **`http.request` on oam's own transport added `accept`, `user-agent` and
+  `accept-encoding`, and decoded a compressed body behind the caller's back** (#148). It
+  sends the caller's headers and hands the body over undecoded, as node's does.
+- **Over an agent's socket a `write()` callback ran before the socket wrote the chunk**
+  (#191), a request destroyed on `'connect'` emitted no `'finish'` (#192), and the
+  keep-alive hand-back could wait on the request's size (#190).
+- **`http.request` emitted `'finish'` for a request that never had a connection** (#193).
+- **The request's `'close'` came before the response's on a connection that is not kept**
+  (#194). A response left before its `'end'` still closes its request, nothing finishes
+  after a failure, and a late `destroy(err)` is silent.
+- **An http server response took any header** and sent a CR/LF value as a 500 `oam: bad
+  response spec`. It refuses what node refuses, with node's coded errors, and writes a
+  header value's bytes as node does; a second `writeHead()` throws `ERR_HTTP_HEADERS_SENT`
+  where it could crash the server's IO thread.
+- **A port that is not a port was dialled or bound as another one** (#163); it throws
+  `ERR_SOCKET_BAD_PORT`.
+- **`socket.destroy()` emitted `'error'` and `'close'` inside the call** (#189); they come
+  on a later tick.
+- **A socket `'error'` nobody listened for was an unhandled rejection** (#164); it is an
+  uncaught exception, and a write after the peer's FIN fails with node's EPIPE.
+- **`socket.end()` right after `socket.write()` did not ask for the FIN in the same turn**
+  (#156); it is queued behind the write, and `end()` and `write()` before and after
+  `destroy()` call back with node's errors.
+- **A WebSocket's refused loopback connect took about 2 s per address on Windows** (#161),
+  and a failed connect dispatches node's `ErrorEvent`.
+- **An IPv6 address with a zone id was refused or lost its zone** (#162). From a lookup
+  hook, undici's `connect.lookup` or a literal host it is dialled with its scope, and errors
+  name it with the zone.
+- **`dns.ADDRCONFIG`, `dns.V4MAPPED` and `dns.ALL` were `0`** (refs #165). They are the
+  platform's `AI_*` values, `hints` is validated, and `V4MAPPED` applies to a family-6
+  lookup; `AI_ADDRCONFIG` is still not passed to the resolver.
+- **undici `request()` ignored `headersTimeout` and `bodyTimeout`** (#218). It raises
+  `UND_ERR_HEADERS_TIMEOUT` / `UND_ERR_BODY_TIMEOUT`, starting the headers timer once a
+  connection has the request, and reads an Agent factory's dispatcher's own limits.
+- **`undici.request` rejected with `TypeError: fetch failed`**; it rejects with the error
+  itself, and its body fails with undici's error rather than fetch's `terminated`.
+- **Coded errors had the wrong shape** (#170, #171): `code` and `message` are in node's order
+  on a per-code prototype, the stack header is node's `Name [CODE]: message`, `new URL()`
+  throws `ERR_INVALID_URL`, and an unhandled `emit('error')` throws `ERR_UNHANDLED_ERROR`.
+- **`AbortSignal.timeout()` kept the process alive** (#181); it is unref'd, uses node's
+  reason and validates its delay.
+- **Web streams ran `start()` late** (#222), so the MCP SDK's streamable-HTTP server
+  transport hung on `initialize`; `start()` runs synchronously in the constructor.
+- **`OAM_MAX_HEAP_MB=0` or an unusable value removed the heap cap** (#223); it keeps the
+  default cap and warns once.
+- **`zlib.createUnzip()` misread gzip split across writes** (#195), and **inflate decoded a
+  reference before the output's start to zeros and stopped at the first gzip member**
+  (#166). Errors carry node's `code` / `errno` and zlib's message, and a truncated stream is
+  `Z_BUF_ERROR` `unexpected end of file`.
+- **fs path arguments were stringified instead of type-checked** (refs #167):
+  `fs.writeFileSync(fd, data)` created a file named after the descriptor. Paths are checked
+  as node's are, descriptors and FileHandles are accepted, Windows errors name the resolved
+  path, and two-path errors carry `dest`.
+- **A bad file descriptor was `EBADF` from the native side**; it is node's
+  `ERR_OUT_OF_RANGE` / `ERR_INVALID_ARG_TYPE`, checked where node checks it.
+- **A closed `fs.watchFile` / `fs.watch` poller could fire once more** from a stat already in
+  flight.
+- **`oam daemon status` gave no reason for a spawn the client gave up on** (#209).
+- **The conformance harness compared a case both runtimes cut short with their own
+  watchdog** (#211); it is scored `watchdog` and warned about, never `pass`.
+- **The linux release leg skipped its disk-headroom check in silence** (#210), and **an
+  incomplete sidecar matrix did not say which rows it skipped** (#220); both warn by name.
+- **Concurrent fs operations on one descriptor failed `EBADF` for all but the first**; they all
+  reach it. Descriptors 0-2 are the process's stdin, stdout and stderr for every fd call, on
+  unix closing stdout or stderr closes it for oam's own writes too, and `fs.close` of a
+  descriptor that is not open calls back (or throws) `EBADF`.
+- **`writeFile` ignored its `flag`** (`{ flag: 'wx' }` overwrote an existing file); every open
+  checks its flags as node's `stringToFlags` does, `fs/promises.open` maps numeric flags, and
+  under `--permission` every open that can write (`'r+'` included) asks for the write grant.
+- **fs checked a call's other arguments after its path or descriptor, or not at all**:
+  `writeFile` / `appendFile` options, `FileHandle` `write` / `chmod` / `chown` / `truncate`,
+  and the path forms of `truncate`, `chmod`, `chown` and `utimes` now check theirs first, as
+  node's do. `rm` refuses a directory without `recursive` (`ERR_FS_EISDIR`) and validates its
+  options, a negative write or `readv` position is what libuv makes of it, an operation with
+  no result calls back with `null` alone, and a string write in an encoding node's binding
+  does not know writes UTF-8.
+- **`fs.cp` / `cpSync` of a directory onto a file, or a file onto a directory, started
+  copying** and failed on the way with `copyfile`'s `ENOENT` or `EPERM`; they fail first, with
+  nothing copied, with node's `ERR_FS_CP_DIR_TO_NON_DIR` / `ERR_FS_CP_NON_DIR_TO_DIR`.
+- **An http server's connection socket closed before the request was aborted** (it emitted
+  `'close'` a tick after `destroy()`, ahead of `'aborted'` and the response's `'close'`); it
+  closes when the connection has, and that `'close'` drives the abort in node's order.
+  `req.destroy()` closes the connection once the response is under way, a socket's
+  `destroy(err)` reaches the server's `'clientError'`, a request body the connection fails on
+  is the socket's error, and a client's reset is the socket's `read ECONNRESET`, reported
+  before it closes with `true`; a write to a response whose connection closed calls back
+  `ERR_STREAM_DESTROYED`.
+- **A fetch whose server closed the connection before the head failed with an uncoded
+  cause**; it is undici's `SocketError` (`UND_ERR_SOCKET`, with the socket's facts), a failure
+  mid-body is `terminated` (a malformed chunk with undici's `HTTPParserError`), and on oam's
+  own transport a malformed chunk is the parser's error on an `http.request`. An
+  `https.get`'s `req.socket.destroy()` closes its kept-alive TLS connection.
+- **`writeHead()` did not build the response head**: an http server response's status,
+  fields and framing are fixed there, as node's are, so `writeHead()` then `end('text')` is
+  chunked. The status line carries the status message, trailers go out after the last chunk,
+  header names keep the case they were set in, an HTTP/1.0 request's response is framed and
+  kept alive as node's, and a 204's or 304's `content-length` goes out as set.
+- **An `http.request`'s head went out one byte per code point** where node writes it as UTF-8
+  (joined to a UTF-8 string body), and its `end()` with a `Trailer` header or no
+  `content-length` writes node's head bytes.
+- **A `net.Socket` resumed with a full buffer stopped reading**; it reads again. A write on a
+  socket with no connection fails with `ERR_SOCKET_CLOSED`, `end()` and a held write before
+  `destroy()` call back as node's do, `destroy()` closes a parked read at once, and the socket
+  has node's `closed`, `errored`, `readableEnded` and `writableNeedDrain`, with node's
+  `writableLength` accounting and `end()` timing.
+- **A pending callback queued from a timer or an immediate ran inside that phase**; it waits
+  for the phase to finish, as node's does. `url`, `fs.Dir` and credential errors come from
+  the coded-error registry, the URL ones as `TypeError`s.
+- **fetch ignored its dispatcher's `headersTimeout` and `bodyTimeout`**; it runs under them
+  (undici's 300 s by default), restarting the body timer with every frame. A streamed upload
+  sends nothing before its first non-empty chunk (an empty stream is `content-length: 0`), an
+  abort stops reading it without cancelling the source, and an async iterable's values go
+  through `Buffer.from`, as undici's do.
+- **`undici.request()` stringified stream, iterable and `Blob` bodies**; it frames them as
+  undici does when it dispatches the request, starts `headersTimeout` at a streamed body's
+  end, stops the body once the response is over, and every class in the shim's `errors` has
+  its own name. A destroyed upload whose channel is full reaches the server aborted, not
+  whole.
+- **zlib ignored the `dictionary` option**. Inflate and deflate (and their raw forms) use it:
+  a zlib stream carries `FDICT` and the dictionary's `DICTID`, a wrong dictionary is node's
+  `Bad dictionary`, and the option is validated for every zlib class.
+
 ## [0.17.1] - 2026-09-29
 
 Release tooling only; no runtime behavior change.
@@ -3470,6 +3657,7 @@ releases.
 - `io_uring` read chunks grow from 64 KiB to 4 MiB, fixing large-file reads.
 
 [Unreleased]: https://github.com/YawLabs/oam/compare/v0.17.1...HEAD
+[0.17.2]: https://github.com/YawLabs/oam/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/YawLabs/oam/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/YawLabs/oam/compare/v0.16.4...v0.17.0
 [0.16.4]: https://github.com/YawLabs/oam/compare/v0.16.3...v0.16.4
