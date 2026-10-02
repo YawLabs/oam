@@ -10218,21 +10218,31 @@
     throw invalidFdError(fd, native);
   }
 
+  // The C++ path's error is node's THROW_ERR_* (src/node_errors.h): a plain
+  // TypeError / RangeError built from the message, with `code` assigned
+  // after -- own keys stack, message, code, the builtin prototype, and a
+  // stack header with no `[CODE]` (measured on v22.22.2). The JS path's is
+  // lib/internal/errors.js's NodeError, as everywhere else.
+  function nativeCodedError(Ctor, message, code) {
+    const err = new Ctor(message);
+    err.code = code;
+    return err;
+  }
+
   function invalidFdError(fd, native) {
     if (typeof fd !== "number") {
-      return applyNodeErrorShape(
-        new TypeError(
-          'The "fd" argument must be of type number.' + (native ? nativeReceivedSuffix(fd) : receivedSuffix(fd)),
-        ),
-        "ERR_INVALID_ARG_TYPE",
-      );
+      const message =
+        'The "fd" argument must be of type number.' + (native ? nativeReceivedSuffix(fd) : receivedSuffix(fd));
+      if (native) return nativeCodedError(TypeError, message, "ERR_INVALID_ARG_TYPE");
+      return applyNodeErrorShape(new TypeError(message), "ERR_INVALID_ARG_TYPE");
     }
     const range = ">= 0 && <= 2147483647";
     if (native) {
       // String(fd) is V8's detail string for a number, and as a string it
       // escapes ERR_OUT_OF_RANGE's digit grouping, which node's C++ never does.
       const outOfRange = (fd < 0 || fd > 2147483647) && fd !== Infinity && fd !== -Infinity;
-      return codes.ERR_OUT_OF_RANGE("fd", outOfRange ? range : "an integer", String(fd));
+      const message = codes.ERR_OUT_OF_RANGE("fd", outOfRange ? range : "an integer", String(fd)).message;
+      return nativeCodedError(RangeError, message, "ERR_OUT_OF_RANGE");
     }
     return codes.ERR_OUT_OF_RANGE("fd", Number.isInteger(fd) ? range : "an integer", fd);
   }

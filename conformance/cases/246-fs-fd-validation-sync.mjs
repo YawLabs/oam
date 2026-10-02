@@ -148,3 +148,30 @@ sync("fstatSync(fd).size", () => fs.fstatSync(fd).size);
 sync("closeSync(fd)", () => fs.closeSync(fd));
 sync("closeSync(fd) again", () => fs.closeSync(fd));
 fs.rmSync(dir, { recursive: true, force: true });
+
+// The C++ check's error is node's THROW_ERR_*: a plain RangeError /
+// TypeError with `code` assigned after the message -- own keys stack,
+// message, code, the builtin prototype, and no `[CODE]` in the stack header
+// -- where the JS check (fs.read with a callback, case 247) throws its
+// internal NodeError. oam built both the JS way.
+function cppShape(label, fn) {
+  try {
+    fn();
+    console.log(label, "no throw");
+  } catch (err) {
+    const builtin = err instanceof RangeError ? RangeError : TypeError;
+    console.log(
+      label,
+      err.code,
+      Reflect.ownKeys(err).filter((k) => typeof k === "string").join(","),
+      "builtin prototype:",
+      Object.getPrototypeOf(err) === builtin.prototype,
+      JSON.stringify(String(err.stack).split("\n")[0]),
+      JSON.stringify(String(err)),
+    );
+  }
+}
+cppShape("C++ readSync(-1, B)", () => fs.readSync(-1, B));
+cppShape("C++ closeSync(2 ** 31)", () => fs.closeSync(2 ** 31));
+cppShape("C++ fstatSync(1.5)", () => fs.fstatSync(1.5));
+cppShape("C++ closeSync('1')", () => fs.closeSync("1"));
