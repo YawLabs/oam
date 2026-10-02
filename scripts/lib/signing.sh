@@ -72,10 +72,11 @@ RELEASE_KEY_LIFETIME=21600
 # Resolved from this file's own location, NOT from the environment: the trust
 # root a release verifies against is the committed one, and an env knob that
 # could point it elsewhere is a knob that could make a bad key verify. Two
-# things reassign it after sourcing: release-upload-local-arm64.sh, which runs
-# from an OLD tag's checkout and so points it at origin/main's copy instead
+# things reassign it after sourcing: release-upload-local-arm64.sh, which
+# patches an OLD tag's release and points it at origin/main's copy instead
 # (release_keys_from_commit -- the current trust root, not the one frozen into
-# that tag), and the test suite, in a subshell.
+# that tag, nor a local checkout that may lag origin), and the test suite, in
+# a subshell.
 RELEASE_KEYS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/release-keys"
 # The Windows inbox OpenSSH client's ssh-add, used only to ask the agent
 # SERVICE whether it holds the release key, and reg.exe, used to look in that
@@ -272,7 +273,7 @@ release_tag_predates_signing() {
 # release_keys_from_commit <commit> <dir> -- copy release-keys/allowed_signers
 # and ranges as committed at <commit> into <dir> (which the caller owns and
 # removes) and point RELEASE_KEYS_DIR at it. For a caller whose checkout is not
-# the current trust root: release-upload-local-arm64.sh stands on an old tag,
+# the current trust root: release-upload-local-arm64.sh patches an old tag,
 # whose release-keys/ predates any later range close or rotation, and
 # verifying against that would accept a key the project has since retired --
 # or refuse the key that replaced it. Run in the caller's shell, never in

@@ -17,10 +17,21 @@
 # all of it is release-keys/ as committed on origin/main, NOT the tag's own
 # copy: see "trust root" below. A release with no manifest is patched as
 # before, with a warning -- but only if its tag predates every key range; a
-# tag from the signing era with no manifest has lost it, and is refused.
+# tag from the signing era with no manifest has lost it, and is refused. And
+# never a release pinned in release-keys/presigning-sums (every published
+# pre-signing release is): installers verify those by the hash of their
+# SHA256SUMS, which a patch would change.
 #
-# Usage (from the repo root, with HEAD on the tag and the release already cut):
-#   scripts/release-upload-local-arm64.sh v0.6.1
+# Run THIS copy -- main's -- whatever the tag. The binary is built from the
+# tag's commit in a throwaway git worktree, so HEAD stays where it is. Never
+# `git checkout <old tag>` and run the copy that tree carries: a tag's tree
+# holds this script as it was at that tag, and the copy in every pinned
+# release's tree (v0.17.1 and older) patches SHA256SUMS with none of the
+# checks above. Nothing on main can stop an old copy; only running main's
+# does.
+#
+# Usage (from a main checkout, with the release already cut):
+#   scripts/release-upload-local-arm64.sh v0.18.0
 set -euo pipefail
 
 TAG="${1:?usage: release-upload-local-arm64.sh <tag>}"
@@ -39,25 +50,26 @@ cd "$SCRIPT_DIR/.."
 # signing agent (started before it) both go on every exit, Ctrl-C included.
 tmp=""
 trust_dir=""
+wt=""
 cleanup() {
   release_agent_stop
   if [ -n "$tmp" ]; then rm -rf "$tmp"; fi
   if [ -n "$trust_dir" ]; then rm -rf "$trust_dir"; fi
+  if [ -n "$wt" ]; then
+    git worktree remove --force "$wt" >/dev/null 2>&1 || true
+    rm -rf "$wt"
+    git worktree prune >/dev/null 2>&1 || true
+  fi
 }
 trap cleanup EXIT
 
 # The uploaded binary must be built from the tag's commit, not whatever the
-# working tree happens to hold.
-tag_sha="$(git rev-parse "${TAG}^{commit}")"
-head_sha="$(git rev-parse HEAD)"
-if [ "$tag_sha" != "$head_sha" ]; then
-  echo "error: HEAD ($head_sha) is not the tag commit ($tag_sha); checkout the tag first" >&2
-  exit 1
-fi
-if ! git diff --quiet || ! git diff --cached --quiet; then
-  echo "error: working tree is dirty; release binaries build from clean trees" >&2
-  exit 1
-fi
+# working tree happens to hold: it is, in a worktree of that commit (below),
+# which is clean by construction. This checkout supplies only the script, its
+# libs and the target/ cache.
+tag_sha="$(git rev-parse --verify -q "${TAG}^{commit}")" \
+  || { echo "error: no tag ${TAG} in this clone -- fetch it first (git fetch origin tag ${TAG})" >&2; exit 1; }
+REPO_ROOT="$(pwd)"
 
 # Local tag must match the remote tag -- otherwise this clobbers a good asset
 # with a binary built from a commit users' tag will never resolve to.
@@ -86,9 +98,9 @@ fi
 gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 \
   || { echo "error: release ${TAG} does not exist on ${REPO} -- cut it first with scripts/release-local.sh ${TAG}" >&2; exit 1; }
 
-# The trust root: release-keys/ as committed on origin/main right now. This
-# script stands on the TAG's commit (checked above), and that tree's
-# release-keys/ is frozen at the tag: a key whose range was closed since (the
+# The trust root: release-keys/ as committed on origin/main right now -- not
+# this checkout's copy (which may lag origin), and never the tag's, which is
+# frozen at the tag: a key whose range was closed since (the
 # README's compromise step 1) would still verify there, and a key rotated in
 # since would not. Verifying an attacker's v0.18.5 manifest, signed with a
 # key retired at v0.18.3, against v0.18.5's own ranges would pass -- and the
@@ -106,6 +118,24 @@ trust_dir="$(mktemp -d)"
 release_keys_from_commit "$main_sha" "$trust_dir" \
   || { echo "error: could not read release-keys/ from origin/main ($main_sha) -- see above" >&2; exit 1; }
 echo "  [ok] signing trust root: release-keys/ at origin/main ${main_sha}" >&2
+
+# A pre-signing release is never patched. The installers (and `oam
+# self-update`) verify a release cut before signing existed by the SHA-256 of
+# its published SHA256SUMS, pinned in release-keys/presigning-sums and frozen
+# into every installer and binary already out there. Patching its SHA256SUMS
+# changes that hash, and from then on every one of them refuses the release --
+# with no way to re-pin the copies people already have. Read from origin/main,
+# like the keys: the tag's own tree predates the table. (This is also why the
+# build happens in a worktree: from a checkout of the tag, the copy of this
+# script that runs is the tag's, which has no such check.)
+if ! pinned_sums="$(git show "${main_sha}:release-keys/presigning-sums" 2>/dev/null)"; then
+  echo "error: release-keys/presigning-sums does not exist at origin/main (${main_sha}) -- cannot tell whether ${TAG} is a pinned pre-signing release; nothing was built or uploaded" >&2
+  exit 1
+fi
+if awk -v t="$TAG" '!/^[[:space:]]*(#|$)/ && $1 == t { found = 1 } END { exit !found }' <<<"$pinned_sums"; then
+  echo "error: ${TAG} is a pre-signing release pinned in release-keys/presigning-sums: install.sh, install.ps1 and oam self-update accept it only while its SHA256SUMS hashes to the pinned digest, so patching that file would break every install of ${TAG}. Ship the binary in a new release instead; nothing was built or uploaded" >&2
+  exit 1
+fi
 
 # Signed or pre-signing? Asked of the release's asset list now, so the key's
 # passphrase prompt comes before the build rather than after it. Re-checked
@@ -164,7 +194,16 @@ if ! oam_park_file target/release/deps/oam.exe; then
   echo "error: target/release/deps/oam.exe is locked and a rename could not free it" >&2
   exit 1
 fi
-cargo build --release -p oam_cli
+# The tag's tree, checked out beside this one: its Cargo.lock,
+# .cargo/config.toml and rust-toolchain.toml (cargo and rustup read the last
+# two from the cwd) are the ones that built the rest of the release. Output
+# goes to THIS checkout's target/ -- the dirs parked above, and a warm cache.
+wt="$(mktemp -d)"
+git worktree add -q --detach "$wt" "$tag_sha" \
+  || { echo "error: could not check ${TAG} out into a worktree at $wt" >&2; exit 1; }
+[ "$(git -C "$wt" rev-parse HEAD)" = "$tag_sha" ] \
+  || { echo "error: the worktree at $wt is not on ${TAG} ($tag_sha)" >&2; exit 1; }
+(cd "$wt" && cargo build --release -p oam_cli --target-dir "$REPO_ROOT/target")
 
 tmp="$(mktemp -d)"
 cp target/release/oam.exe "${tmp}/${ASSET}"

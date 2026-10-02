@@ -107,13 +107,18 @@ whether the service is running or not: that service keeps keys in the
 registry across reboots, and preflight looks there too.
 
 `scripts/release-upload-local-arm64.sh` patches a binary into an existing
-release. It reads `allowed_signers` and `ranges` from `origin/main`, not from
-the tag it builds, so a range closed or a key rotated after that tag applies.
+release. Run main's copy, whatever the tag: it builds the tag in a throwaway
+git worktree. Do not check out an old tag and run the copy in that tree. Every
+pinned release's copy predates all of the checks below. The script reads
+`allowed_signers` and `ranges` from `origin/main`, not from the tag it builds,
+so a range closed or a key rotated after that tag applies.
 It verifies the published manifest before it changes anything, then re-signs
 the patched one and uploads the binary, `SHA256SUMS` and both manifest files in
 one call. A release with no manifest is patched unsigned only when its tag is
 older than every range in `ranges`. A newer one is refused, because a missing
-manifest there means someone removed it.
+manifest there means someone removed it. A tag listed in `presigning-sums` is
+refused too: installers verify those releases by the hash of their published
+`SHA256SUMS`, which a patch would change.
 
 ### Verifying a release by hand
 
