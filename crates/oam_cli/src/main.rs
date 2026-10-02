@@ -185,9 +185,9 @@ enum Command {
     /// this binary (tags before v0.18.0: a pinned SHA256SUMS digest), then the
     /// binary is checked against it and replaces the running one. Any failure
     /// leaves the installed oam as it was; no flag skips a check.
-    /// OAM_INSTALL_DIR updates `<dir>/oam` instead; OAM_SELF_UPDATE_URL
-    /// fetches the release's files from another base (with --version), and
-    /// they must still carry a valid signature.
+    /// OAM_INSTALL_DIR updates `<dir>/oam` instead; OAM_SELF_UPDATE_URL (or,
+    /// when unset, OAM_INSTALL_BASE) fetches the release's files from another
+    /// base (with --version), and they must still carry a valid signature.
     SelfUpdate {
         /// Install a specific tag (e.g. v0.18.0) instead of the latest. An
         /// older tag is allowed only when named here.

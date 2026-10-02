@@ -1126,10 +1126,12 @@ ok "release $TAG published: https://github.com/$REPO/releases/tag/$TAG"
 ok "staged assets kept at $RELEASE_DIR (safe to delete)"
 
 # --- publish the installers to oamjs.org -----------------------------------------
-# `oam self-update` fetches https://oamjs.org/install.{sh,ps1} and pipes the
-# result into sh / iex. Those files are COPIES of install/ served by a separate
-# repo, so without this step the site can silently drift from the release that
-# ships with it -- and the failure lands in a user's shell, not in CI.
+# The installers at https://oamjs.org/install.{sh,ps1} are what users pipe into
+# sh / iex, and `oam self-update` in binaries before v0.18.0 does the same
+# (from v0.18.0 it verifies and installs natively). Those files are COPIES of
+# install/ served by a separate repo, so without this step the site can
+# silently drift from the release that ships with it -- and the failure lands
+# in a user's shell, not in CI.
 #
 # Skipped rather than fatal when the site checkout is absent: a release is still
 # valid without it, and the verification below says loudly if the live site is
@@ -1277,11 +1279,11 @@ step "Verify oamjs.org serves this release"
 for f in install.sh install.ps1; do
   live="$(curl -fsSL --max-time 30 "https://oamjs.org/$f" 2>/dev/null || true)"
   if [ -z "$live" ]; then
-    warn "https://oamjs.org/$f did not fetch -- self-update is BROKEN until it does"
+    warn "https://oamjs.org/$f did not fetch -- the installers (and self-update in oam before v0.18.0) are BROKEN until it does"
   elif [ "$live" = "$(cat "$REPO_DIR/install/$f")" ]; then
     ok "https://oamjs.org/$f matches install/$f"
   else
-    warn "https://oamjs.org/$f DIFFERS from install/$f -- self-update will run the stale copy"
+    warn "https://oamjs.org/$f DIFFERS from install/$f -- the installers (and self-update in oam before v0.18.0) will run the stale copy"
   fi
 done
 

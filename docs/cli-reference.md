@@ -123,7 +123,7 @@ line; the debugger is not. Full story:
 | `OAM_VERSION` | Pin the version the installer fetches (e.g. `v0.8.0`). |
 | `OAM_INSTALL_DIR` | Install target. Default `~/.oam/bin`, or `%LOCALAPPDATA%\oam\bin`. |
 | `OAM_INSTALL_BASE` | Asset base URL, for a mirror or CDN. Default is GitHub Releases. |
-| `OAM_SELF_UPDATE_URL` | Fetch the release files `oam self-update` installs from this base instead of GitHub Releases (needs `--version`). They must still carry a valid signature. |
+| `OAM_SELF_UPDATE_URL` | Fetch the release files `oam self-update` installs from this base instead of GitHub Releases (needs `--version`). They must still carry a valid signature. When unset, `oam self-update` reads `OAM_INSTALL_BASE` the same way. |
 | `OAM_GH_API` | GitHub API base, for GitHub Enterprise. |
 | `GH_TOKEN` / `GITHUB_TOKEN` | Needed while the repo is private — unauthenticated asset URLs 404. In a pipeline put it on `sh`, not on `curl`: `curl -fsSL … \| GH_TOKEN=… sh`. |
 | `OAM_IGNORE_SCRIPTS` | Skip package lifecycle scripts during install. |

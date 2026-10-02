@@ -653,8 +653,11 @@ pub(crate) struct Request {
     pub(crate) current: Tag,
     /// Where `latest` and `download/<tag>/` live.
     pub(crate) releases_root: String,
-    /// OAM_SELF_UPDATE_URL: fetch the tag's files from here instead.
+    /// OAM_SELF_UPDATE_URL (or the installers' OAM_INSTALL_BASE): fetch the
+    /// tag's files from here instead.
     pub(crate) asset_base: Option<String>,
+    /// Which of the two set `asset_base`, for the messages.
+    pub(crate) asset_base_var: &'static str,
     pub(crate) asset: String,
     /// The file to replace.
     pub(crate) target: PathBuf,
@@ -682,7 +685,10 @@ pub(crate) fn run(
         // Like the installers' OAM_INSTALL_BASE: a base names ONE release's
         // files, so the tag they must be signed for has to come from the user.
         (None, Some(_)) => {
-            return Err("OAM_SELF_UPDATE_URL names one release's files, so it needs --version <tag> (the tag its signature must be for)".into());
+            return Err(format!(
+                "{} names one release's files, so it needs --version <tag> (the tag its signature must be for)",
+                req.asset_base_var
+            ));
         }
         (None, None) => {
             let t = http.latest_tag(&req.releases_root)?;
@@ -701,11 +707,22 @@ pub(crate) fn run(
         }
     };
 
+    // Every release ships SHA256SUMS, so a tag without one was never published
+    // there: a mistyped --version, not an unsigned release.
+    let no_release = || {
+        format!(
+            "there is no published {tag} release at {base} (no SHA256SUMS either) -- check the tag"
+        )
+    };
+
     // Verify first: everything below trusts only what this vouches for.
     let manifest_bytes;
     let sums: &[u8] = if tag >= FIRST_MANIFEST_SIG_TAG {
-        let (Some(m), Some(sig)) = (fetch("RELEASE-MANIFEST")?, fetch("RELEASE-MANIFEST.sig")?)
-        else {
+        let (m, sig) = (fetch("RELEASE-MANIFEST")?, fetch("RELEASE-MANIFEST.sig")?);
+        if m.is_none() && fetch("SHA256SUMS")?.is_none() {
+            return Err(no_release());
+        }
+        let (Some(m), Some(sig)) = (m, sig) else {
             return Err(format!(
                 "{tag} has no RELEASE-MANIFEST / RELEASE-MANIFEST.sig at {base} -- every release from {FIRST_MANIFEST_SIG_TAG} on is signed, so this one is refused"
             ));
@@ -719,7 +736,7 @@ pub(crate) fn run(
         v.sums
     } else {
         let Some(s) = fetch("SHA256SUMS")? else {
-            return Err(format!("{tag} has no SHA256SUMS at {base}"));
+            return Err(no_release());
         };
         trust.verify_presigning(tag, &s)?;
         println!(
@@ -759,15 +776,14 @@ pub(crate) fn run(
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", req.target.display()))?;
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    let staged = Staged::create(&req.target)?;
+    // Written, flushed and chmod-ed through the one handle create_new made,
+    // never reopened by path: a co-tenant of the dir cannot slip a symlink (or
+    // another file) in between, so the bytes hashed are the bytes renamed.
+    let (staged, mut file) = Staged::create(&req.target)?;
     println!("oam self-update: downloading {url}");
-    let actual = {
-        let mut f = staged.file()?;
-        let d = http.download(&url, &mut f)?;
-        f.sync_all()
-            .map_err(|e| format!("flushing {}: {e}", staged.path.display()))?;
-        d
-    };
+    let actual = http.download(&url, &mut file)?;
+    file.sync_all()
+        .map_err(|e| format!("flushing {}: {e}", staged.path.display()))?;
     if actual != expected {
         return Err(format!(
             "{} does not match the signed manifest (expected sha256 {}, got {})",
@@ -786,8 +802,9 @@ pub(crate) fn run(
     let perms = std::fs::metadata(&mode_from)
         .map_err(|e| format!("reading {}: {e}", mode_from.display()))?
         .permissions();
-    std::fs::set_permissions(&staged.path, perms)
+    file.set_permissions(perms)
         .map_err(|e| format!("setting permissions on {}: {e}", staged.path.display()))?;
+    drop(file);
 
     let reported = replace(&req.target, &staged.path, smoke)?;
     refresh_licenses(http, &base, dir);
@@ -812,8 +829,17 @@ fn refresh_licenses(http: &Http, base: &str, dir: &Path) {
             continue;
         };
         let tmp = licenses.join(format!(".{name}.update-{}", std::process::id()));
+        // create_new, as for the binary: never written through whatever a
+        // co-tenant of the dir left at the predictable temp name.
+        let _ = std::fs::remove_file(&tmp);
         let written = std::fs::create_dir_all(&licenses)
-            .and_then(|()| std::fs::write(&tmp, &body))
+            .and_then(|()| {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp)
+            })
+            .and_then(|mut f| f.write_all(&body))
             .and_then(|()| std::fs::rename(&tmp, licenses.join(name)));
         match written {
             Ok(()) => got = true,
@@ -845,24 +871,19 @@ struct Staged {
 }
 
 impl Staged {
-    fn create(target: &Path) -> Result<Staged, String> {
+    /// The temp file and the only handle it is ever written through.
+    /// create_new is O_EXCL: it neither follows nor reuses what is at the path.
+    fn create(target: &Path) -> Result<(Staged, std::fs::File), String> {
         let name = target.file_name().and_then(|n| n.to_str()).unwrap_or("oam");
         let path = target.with_file_name(format!(".{name}.update-{}", std::process::id()));
         // A leftover from a killed run with a recycled pid.
         let _ = std::fs::remove_file(&path);
-        std::fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-        Ok(Staged { path })
-    }
-
-    fn file(&self) -> Result<std::fs::File, String> {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(&self.path)
-            .map_err(|e| format!("cannot open {}: {e}", self.path.display()))
+        Ok((Staged { path }, file))
     }
 }
 
@@ -873,21 +894,53 @@ impl Drop for Staged {
     }
 }
 
-/// `<target>.old`, install.ps1's move-aside name.
+/// `<target>.old-<pid>-<secs>`. install.ps1 moves aside to `<target>.old`,
+/// but one fixed name fails the next update on Windows while an oam started
+/// before the last one (an `oam mcp` server, say) still runs from it.
 fn backup_path(target: &Path) -> PathBuf {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let mut s = target.as_os_str().to_owned();
-    s.push(".old");
+    s.push(format!(".old-{}-{secs}", std::process::id()));
     PathBuf::from(s)
+}
+
+/// Best-effort: delete the move-aside copies earlier updates (and install.ps1)
+/// left next to `target`. One still in use stays until a later run.
+fn sweep_backups(target: &Path) {
+    let (Some(dir), Some(name)) = (target.parent(), target.file_name()) else {
+        return;
+    };
+    let Some(name) = name.to_str() else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let n = e.file_name();
+        let Some(rest) = n.to_str().and_then(|n| n.strip_prefix(name)) else {
+            continue;
+        };
+        let ours = rest == ".old"
+            || rest.strip_prefix(".old-").is_some_and(|r| {
+                !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit() || b == b'-')
+            });
+        if ours {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 /// Put `staged` at `target`, smoke it, and put the old binary back if the
 /// smoke fails. Returns what the new binary's `--version` printed.
 ///
 /// Windows cannot replace or delete a running exe, but it can rename one, so
-/// the running oam moves aside to `<target>.old` first (install.ps1) and that
-/// file is cleared by the next update. Unix renames over the running binary
+/// the running oam moves aside first (as install.ps1 does) and that file is
+/// cleared by a later update. Unix renames over the running binary
 /// atomically; a hard link (or copy) keeps the old one for a rollback.
 fn replace(target: &Path, staged: &Path, smoke: Smoke<'_>) -> Result<String, String> {
+    sweep_backups(target);
     let backup = backup_path(target);
     let _ = std::fs::remove_file(&backup);
     let had_old = target.exists();
@@ -942,21 +995,74 @@ fn replace(target: &Path, staged: &Path, smoke: Smoke<'_>) -> Result<String, Str
     }
 }
 
-/// Run `<path> --version`; it must succeed and say it is oam.
+/// How long the new binary gets to answer `--version`. It runs after the
+/// rename, so a hang must end in the restore path, not wait on a Ctrl-C that
+/// would strand the previous binary at its move-aside name.
+const SMOKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run `<path> --version`; it must succeed in time and say it is oam.
 fn smoke_version(path: &Path) -> Result<String, String> {
-    let out = std::process::Command::new(path)
-        .arg("--version")
-        .output()
-        .map_err(|e| format!("could not run it: {e}"))?;
-    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if !out.status.success() || !stdout.starts_with("oam ") {
+    let mut cmd = std::process::Command::new(path);
+    cmd.arg("--version");
+    let (status, out) = run_with_deadline(cmd, SMOKE_TIMEOUT)?;
+    let stdout = String::from_utf8_lossy(&out).trim().to_string();
+    if !status.success() || !stdout.starts_with("oam ") {
         return Err(format!(
-            "exit {}, stdout '{}'",
-            out.status,
+            "exit {status}, stdout '{}'",
             printable(stdout.as_bytes())
         ));
     }
     Ok(stdout)
+}
+
+/// Run `cmd` with stdout captured (64 KiB kept), killing it at `timeout`.
+fn run_with_deadline(
+    mut cmd: std::process::Command,
+    timeout: Duration,
+) -> Result<(std::process::ExitStatus, Vec<u8>), String> {
+    use std::io::Read as _;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not run it: {e}"))?;
+    // Read on a thread so a full pipe cannot stall the child, and hand the
+    // bytes over a channel so a grandchild holding the pipe open cannot stall
+    // this side either.
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(out) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out.take(64 << 10).read_to_end(&mut buf);
+            let _ = tx.send(buf);
+        });
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "it did not exit within {}s and was killed",
+                    timeout.as_secs()
+                ));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("waiting for it: {e}"));
+            }
+        }
+    };
+    let out = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_default();
+    Ok((status, out))
 }
 
 /// The binary to replace: `$OAM_INSTALL_DIR/oam[.exe]` when set (the
@@ -1028,9 +1134,20 @@ fn command_inner(
             None,
         )
     })?;
-    let asset_base = std::env::var("OAM_SELF_UPDATE_URL")
-        .ok()
-        .filter(|s| !s.is_empty());
+    // OAM_INSTALL_BASE is the installers' mirror knob, and the self-update
+    // that ran them honored it; it means the same thing here (one release's
+    // files), so a mirror user keeps their mirror. OAM_SELF_UPDATE_URL wins.
+    let env_base = |var: &'static str| {
+        std::env::var(var)
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|b| (b, var))
+    };
+    let (asset_base, asset_base_var) =
+        match env_base("OAM_SELF_UPDATE_URL").or_else(|| env_base("OAM_INSTALL_BASE")) {
+            Some((b, var)) => (Some(b), var),
+            None => (None, "OAM_SELF_UPDATE_URL"),
+        };
 
     println!("oam self-update: current version {current}");
     println!("oam self-update: updating {}", target.display());
@@ -1040,7 +1157,7 @@ fn command_inner(
     }
     if let Some(b) = &asset_base {
         println!(
-            "oam self-update: fetching release files from {b} (OAM_SELF_UPDATE_URL; still signature-checked)"
+            "oam self-update: fetching release files from {b} ({asset_base_var}; still signature-checked)"
         );
     }
 
@@ -1049,6 +1166,7 @@ fn command_inner(
         current,
         releases_root: RELEASES_ROOT.to_string(),
         asset_base,
+        asset_base_var,
         asset: asset.to_string(),
         target: target.clone(),
         dry_run,
@@ -1562,6 +1680,7 @@ mod tests {
                 current: t(current),
                 releases_root: format!("{base}/releases"),
                 asset_base: None,
+                asset_base_var: "OAM_SELF_UPDATE_URL",
                 asset: asset_name().unwrap_or("oam-none").to_string(),
                 target: self.target.clone(),
                 dry_run: false,
@@ -1685,6 +1804,22 @@ mod tests {
     }
 
     #[test]
+    fn e2e_a_tag_that_was_never_published_says_so() {
+        // A typo is not a tampered release: no SHA256SUMS means no release.
+        let base = serve(release_routes("valid", fixture("payload.bin")));
+        let s = Scene::new("typo");
+        for tag in ["v0.19.9", "v0.16.0"] {
+            let e = update(&s.request(&base, Some(tag), "v0.17.1")).unwrap_err();
+            assert!(
+                e.contains(&format!("there is no published {tag} release")),
+                "{e}"
+            );
+            assert!(!e.contains("refused"), "{e}");
+        }
+        s.assert_untouched();
+    }
+
+    #[test]
     fn e2e_downgrade_is_refused_unless_pinned() {
         let base = serve(release_routes("valid", fixture("payload.bin")));
         let s = Scene::new("downgrade");
@@ -1779,6 +1914,79 @@ mod tests {
         let mut req = s.request("http://127.0.0.1:9", None, "v0.17.1");
         req.asset_base = Some(good);
         assert!(update(&req).unwrap_err().contains("needs --version"));
+        // The installers' mirror knob is read the same way, and named.
+        req.asset_base_var = "OAM_INSTALL_BASE";
+        assert!(
+            update(&req)
+                .unwrap_err()
+                .starts_with("OAM_INSTALL_BASE names one release's files")
+        );
         s.assert_untouched();
+    }
+
+    // --- replacing the binary --------------------------------------------------
+
+    #[test]
+    fn replace_sweeps_earlier_move_aside_copies_only() {
+        let s = Scene::new("sweep");
+        let stale = ["oam.old", "oam.old-4242", "oam.old-4242-1790000000"];
+        let kept = ["oam.older", "oam.old-x", "oam.old-", "other.old", "oam.bak"];
+        for n in stale.iter().chain(&kept) {
+            std::fs::write(s.dir.join(n), b"x").unwrap();
+        }
+        let staged = s.dir.join(".oam.update-1");
+        std::fs::write(&staged, b"new").unwrap();
+        assert_eq!(
+            replace(&s.target, &staged, &smoke_ok).unwrap(),
+            "oam 0.18.0"
+        );
+        let mut want: Vec<String> = kept.iter().map(|n| n.to_string()).collect();
+        want.sort();
+        // This run's own move-aside goes after the smoke passes too (Windows
+        // keeps it only while it is the running exe, which this one is not).
+        assert_eq!(s.state(), (b"new".to_vec(), want));
+    }
+
+    #[test]
+    fn backup_names_are_unique_per_run() {
+        let b = backup_path(Path::new("/x/oam.exe"));
+        let n = b.file_name().unwrap().to_str().unwrap();
+        let rest = n.strip_prefix("oam.exe.old-").unwrap();
+        assert!(rest.starts_with(&format!("{}-", std::process::id())), "{n}");
+    }
+
+    /// Not a test: the child `deadline_kills_a_hung_smoke` runs, by name.
+    #[test]
+    #[ignore = "a helper process for deadline_kills_a_hung_smoke"]
+    fn smoke_helper_child() {
+        if std::env::var_os("OAM_SELF_UPDATE_SMOKE_HANG").is_some() {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    fn helper(hang: bool) -> std::process::Command {
+        let mut c = std::process::Command::new(std::env::current_exe().unwrap());
+        c.args([
+            "--exact",
+            "self_update::tests::smoke_helper_child",
+            "--ignored",
+            "--test-threads=1",
+        ]);
+        if hang {
+            c.env("OAM_SELF_UPDATE_SMOKE_HANG", "1");
+        } else {
+            c.env_remove("OAM_SELF_UPDATE_SMOKE_HANG");
+        }
+        c
+    }
+
+    #[test]
+    fn deadline_kills_a_hung_smoke() {
+        let (status, _) = run_with_deadline(helper(false), Duration::from_secs(60)).unwrap();
+        assert!(status.success());
+        let started = std::time::Instant::now();
+        let e = run_with_deadline(helper(true), Duration::from_secs(1)).unwrap_err();
+        assert!(e.contains("did not exit within 1s"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(30));
     }
 }
