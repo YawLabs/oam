@@ -3701,10 +3701,12 @@ fn op_http_respond_stream(
 ) {
     let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let head = response_head_args(scope, &args, 3, 4);
+    // node:http's first chunk, written with the head (respond_stream).
+    let first = arg_bytes(scope, &args, 5);
     // Exchange gone (aborted via httpAbort, or already answered) leaves rv
     // undefined, NOT a throw -- Node's post-abort res.write() is a soft
     // failure, and the JS layer maps this to a premature close.
-    if let Some(stream_id) = core_runtime!(scope).http().respond_stream(id, head) {
+    if let Some(stream_id) = core_runtime!(scope).http().respond_stream(id, head, first) {
         rv.set_double(stream_id as f64);
     }
 }

@@ -175,7 +175,7 @@ pub enum ServerEvent {
         conn_id: u64,
         /// The peer reset the connection under a read: node's socket
         /// reports it before it closes (`read ECONNRESET`).
-        reset: Option<crate::http_conn::PeerReset>,
+        reset: Option<crate::http_conn::ConnFailure>,
     },
     /// A connection refused under `server.maxConnections` (node's 'drop').
     Drop {
@@ -188,7 +188,7 @@ pub enum ServerEvent {
     Closed {
         request_id: u64,
         /// As for `ConnectionClosed`: the reset the connection went with.
-        reset: Option<crate::http_conn::PeerReset>,
+        reset: Option<crate::http_conn::ConnFailure>,
     },
 }
 
@@ -771,13 +771,27 @@ impl HttpState {
     }
 
     /// Start a streaming response; returns the stream handle JS pushes to.
-    pub fn respond_stream(&self, id: u64, head: ResponseHead) -> Option<u64> {
+    pub fn respond_stream(
+        &self,
+        id: u64,
+        head: ResponseHead,
+        first: Option<Vec<u8>>,
+    ) -> Option<u64> {
         let responder = self
             .pending
             .lock()
             .expect("http pending lock")
             .remove(&id)?;
         let (tx, rx) = mpsc::channel::<Frame<Bytes>>(16);
+        // node's OutgoingMessage#_send joins the head to the first chunk
+        // written after it, so both go out in one write. In the channel
+        // before hyper has the response, the chunk is there when hyper
+        // writes the head, and goes in the same flush; pushed after, it
+        // could follow in a segment of its own -- which a client that
+        // closed on the head answers with a reset.
+        if let Some(first) = first.filter(|bytes| !bytes.is_empty()) {
+            let _ = tx.try_send(Frame::data(Bytes::from(first)));
+        }
         let (closed_tx, closed_rx) = oneshot::channel::<()>();
         let stream_id = self.next_id();
         self.streams
@@ -1427,7 +1441,13 @@ where
         }
     };
     match ended {
-        Ended::Done => None,
+        Ended::Done => {
+            // The close reports what failed the connection: a body pump
+            // notes a parse error from what hyper left in its body, before
+            // hyper's side (and the handler's exchange) goes below.
+            watch.pumps_settled(PUMPS_SETTLE_BUDGET).await;
+            None
+        }
         Ended::Closed(reason) => {
             // hyper's side ends here: an in-flight handler future is dropped
             // (its RequestGuard tells JS the exchange ended), and the stream
@@ -1461,6 +1481,10 @@ where
         }
     }
 }
+
+/// How long a finished connection waits for its request-body pumps to take
+/// what hyper left them ([`ConnWatch::pumps_settled`]).
+const PUMPS_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// How long close() waits for an accept loop to drop its listening socket.
 const LISTENER_CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
@@ -1587,7 +1611,7 @@ pub async fn http_serve(
                                 let _ = conn_queue
                                     .send(ServerEvent::ConnectionClosed {
                                         conn_id,
-                                        reset: watch.peer_reset(),
+                                        reset: watch.failure(),
                                     })
                                     .await;
                             }
@@ -1653,7 +1677,7 @@ pub async fn http_serve(
                                 let _ = conn_queue
                                     .send(ServerEvent::ConnectionClosed {
                                         conn_id,
-                                        reset: closed_watch.peer_reset(),
+                                        reset: closed_watch.failure(),
                                     })
                                     .await;
                             }
@@ -1748,7 +1772,7 @@ impl Drop for RequestGuard {
             let request_id = self.id;
             // hyper drops the handler's future once the connection has
             // ended, so a reset its read saw is known by now.
-            let reset = watch.peer_reset();
+            let reset = watch.failure();
             runtime.spawn(async move {
                 let _ = queue.send(ServerEvent::Closed { request_id, reset }).await;
             });
@@ -1884,7 +1908,8 @@ async fn pump_request_body(
     id: u64,
     // Dropped when the pump ends: the request is all in, as far as node's
     // headers / request timeouts go.
-    _message_done: MessageDone,
+    message_done: MessageDone,
+    _pump: Option<crate::http_conn::PumpGuard>,
 ) {
     use http_body_util::BodyExt;
     let mut total: usize = 0;
@@ -1894,6 +1919,23 @@ async fn pump_request_body(
             Err(e) => {
                 if let Some(status) = refused_body_status(&e) {
                     refuse_unanswered(&state, id, status);
+                }
+                // The connection's failure in node, which its close reports
+                // whether or not the handler reads this error first.
+                if let Some((watch, _)) = &message_done.0 {
+                    use crate::http_client::body::{
+                        INVALID_CHUNK_SIZE, INVALID_EOF_STATE, ServerBodyError,
+                        classify_server_body,
+                    };
+                    use crate::http_conn::ConnFailure;
+                    let parse = |(code, message): (&'static str, &'static str)| {
+                        ConnFailure::Parse { code, message }
+                    };
+                    match classify_server_body(&e) {
+                        ServerBodyError::Framing => watch.note_failure(parse(INVALID_CHUNK_SIZE)),
+                        ServerBodyError::Closed => watch.note_failure(parse(INVALID_EOF_STATE)),
+                        ServerBodyError::Reset(_) | ServerBodyError::Other => {}
+                    }
                 }
                 let _ = chunk_tx.send(Err(request_body_failure(&e))).await;
                 return;
@@ -2280,12 +2322,19 @@ async fn dispatch_request(
             .lock()
             .expect("http bodies lock")
             .insert(id, RequestBody::Stream(chunk_rx));
+        // Counted from here, so the connection's close waits for it
+        // (ConnWatch::pumps_settled).
+        let pump = message_done
+            .0
+            .as_ref()
+            .map(|(watch, _)| watch.pump_started());
         tokio::spawn(pump_request_body(
             body,
             chunk_tx,
             std::sync::Arc::clone(&state),
             id,
             message_done,
+            pump,
         ));
     } else {
         state
@@ -2539,7 +2588,7 @@ pub async fn https_serve(
                             let _ = conn_queue
                                 .send(ServerEvent::ConnectionClosed {
                                     conn_id,
-                                    reset: watch.peer_reset(),
+                                    reset: watch.failure(),
                                 })
                                 .await;
                         }

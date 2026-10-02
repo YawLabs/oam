@@ -329,23 +329,53 @@ pub struct ConnWatch {
     /// upgrade) waits for them, or they would be lost with hyper's buffer.
     unflushed: AtomicBool,
     flushed: Notify,
-    /// The peer reset the connection under a read: node's socket reports
-    /// it (`read ECONNRESET`, socketOnError) and closes with `true`.
-    peer_reset: Mutex<Option<PeerReset>>,
+    /// What failed the connection, as node's socket reports it
+    /// (socketOnError) before it closes with `true`: the first one.
+    failure: Mutex<Option<ConnFailure>>,
+    /// Request-body pumps still running on this connection
+    /// ([`ConnWatch::pump_started`]).
+    pumps: AtomicUsize,
+    pumps_notify: Notify,
 }
 
-/// A read the peer reset, as node's socket reports it: `read <code>`, with
-/// the code and its errno (`crate::node_error_code` / `crate::node_errno`).
+/// A connection's failure, as node's socket reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PeerReset {
-    pub code: &'static str,
-    pub errno: Option<i32>,
+pub enum ConnFailure {
+    /// The peer reset it under a read: `read <code>`, with the code and its
+    /// errno (`crate::node_error_code` / `crate::node_errno`).
+    Reset {
+        code: &'static str,
+        errno: Option<i32>,
+    },
+    /// The request body's parser refused it: llhttp's code and message
+    /// (`HPE_INVALID_CHUNK_SIZE`, `HPE_INVALID_EOF_STATE`).
+    Parse {
+        code: &'static str,
+        message: &'static str,
+    },
 }
 
-impl PeerReset {
+impl ConnFailure {
     /// The fields JS builds the socket's error from.
     pub fn to_json(self) -> serde_json::Value {
-        serde_json::json!({ "code": self.code, "errno": self.errno, "syscall": "read" })
+        match self {
+            ConnFailure::Reset { code, errno } => {
+                serde_json::json!({ "code": code, "errno": errno, "syscall": "read" })
+            }
+            ConnFailure::Parse { code, message } => {
+                serde_json::json!({ "code": code, "message": message, "parse": true })
+            }
+        }
+    }
+}
+
+/// Held by a request-body pump while it runs ([`ConnWatch::pump_started`]).
+pub struct PumpGuard(Arc<ConnWatch>);
+
+impl Drop for PumpGuard {
+    fn drop(&mut self) {
+        self.0.pumps.fetch_sub(1, Ordering::AcqRel);
+        self.0.pumps_notify.notify_waiters();
     }
 }
 
@@ -384,7 +414,9 @@ impl ConnWatch {
             dispatch_notify: Notify::new(),
             unflushed: AtomicBool::new(false),
             flushed: Notify::new(),
-            peer_reset: Mutex::new(None),
+            failure: Mutex::new(None),
+            pumps: AtomicUsize::new(0),
+            pumps_notify: Notify::new(),
         })
     }
 
@@ -430,18 +462,53 @@ impl ConnWatch {
             return;
         }
         let code = crate::node_error_code(error);
-        let mut slot = self.peer_reset.lock().unwrap_or_else(|e| e.into_inner());
+        self.note_failure(ConnFailure::Reset {
+            code,
+            errno: crate::node_errno(code, error),
+        });
+    }
+
+    /// Keep what failed the connection, unless something already did.
+    pub fn note_failure(&self, failure: ConnFailure) {
+        let mut slot = self.failure.lock().unwrap_or_else(|e| e.into_inner());
         if slot.is_none() {
-            *slot = Some(PeerReset {
-                code,
-                errno: crate::node_errno(code, error),
-            });
+            *slot = Some(failure);
         }
     }
 
-    /// The reset a read saw on this connection, if any.
-    pub fn peer_reset(&self) -> Option<PeerReset> {
-        *self.peer_reset.lock().unwrap_or_else(|e| e.into_inner())
+    /// What failed this connection, if anything did.
+    pub fn failure(&self) -> Option<ConnFailure> {
+        *self.failure.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A request-body pump starts on this connection; it counts until the
+    /// guard drops.
+    pub fn pump_started(self: &Arc<Self>) -> PumpGuard {
+        self.pumps.fetch_add(1, Ordering::AcqRel);
+        PumpGuard(Arc::clone(self))
+    }
+
+    /// Once hyper's side of the connection is over, its body pumps take
+    /// what hyper left in their bodies at once -- a parse error the body
+    /// failed with is noted ([`ConnWatch::note_failure`]) before the
+    /// connection's close is reported, so the close carries it. A pump
+    /// held up by a handler that does not read is waited for no longer
+    /// than `budget`.
+    pub async fn pumps_settled(&self, budget: Duration) {
+        let deadline = tokio::time::sleep(budget);
+        tokio::pin!(deadline);
+        loop {
+            let notified = self.pumps_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.pumps.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            tokio::select! {
+                () = &mut notified => {}
+                () = &mut deadline => return,
+            }
+        }
     }
 
     pub fn note_read(&self, n: usize) {

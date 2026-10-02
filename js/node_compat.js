@@ -19757,7 +19757,9 @@
       // Send the head and open the body stream; false when the exchange is
       // already gone. `utf8Head` is _headIsUtf8()'s answer: the native side
       // writes each header value as its UTF-8, or one byte per code point.
-      _startStream(utf8Head) {
+      // `first`: the chunk the first write() sends, which goes out with the
+      // head in one write, as node's _send joins them.
+      _startStream(utf8Head, first) {
         this.headersSent = true;
         this._streamId = natives.httpRespondStream(
           this._requestId,
@@ -19765,6 +19767,7 @@
           this._headJson,
           !utf8Head,
           this._headMessage,
+          first,
         ) ?? null;
         if (this._streamId === null) {
           // Exchange already gone (req.destroy() aborted it, or the
@@ -19835,9 +19838,11 @@
           return false;
         }
         const bytes = this._toBytes(chunk, encoding);
+        let withHead = false;
         if (this._streamId === null) {
           this._implicitHead();
-          if (!this._startStream(this._headIsUtf8(chunk, encoding, false))) {
+          withHead = true;
+          if (!this._startStream(this._headIsUtf8(chunk, encoding, false), bytes)) {
             if (cb) {
               const err = Object.assign(
                 new Error("Cannot call write after a stream was destroyed"),
@@ -19853,7 +19858,10 @@
         // the stream out from under in-flight writes), corrupting every
         // multi-chunk response. The chain guarantees byte order.
         const streamId = this._streamId;
-        this._chain = this._chain.then(() => natives.httpBodyPush(streamId, bytes)).then(
+        // The first chunk went with the head; its callback runs once the
+        // writes ahead of it have.
+        const push = withHead ? () => undefined : () => natives.httpBodyPush(streamId, bytes);
+        this._chain = this._chain.then(push).then(
           () => cb?.(),
           (err) => {
             // A response its connection was closed under has closed, and
@@ -20534,19 +20542,28 @@
       }
     }
 
-    // The peer reset the connection under a read (the native side's
-    // `reset`: code, errno, syscall). node's socket that reads it -- the
-    // TLS socket on an https connection -- is destroyed with
-    // `read ECONNRESET`, and reports it before it closes (measured on
-    // v22.22.2: a client's resetAndDestroy() of a kept-alive connection,
-    // mid-response, or before the answer).
+    // What failed the connection (the native side's `reset`): the peer
+    // reset it under a read (code, errno, syscall), or the request body's
+    // parser refused it (code, message, `parse`). node's socket that reads
+    // it -- the TLS socket on an https connection -- is destroyed with that
+    // error, and reports it before it closes (measured on v22.22.2: a
+    // client's resetAndDestroy() of a kept-alive connection, mid-response,
+    // or before the answer; a malformed chunk; a client gone mid-body). The
+    // body's own read failure reports the same error when it comes first.
     function peerResetConnection(record, reset) {
       const socket = record.secure || record.conn;
       if (!socket || socket[kServerSocketPeerReset] === undefined) return;
-      const err = new Error(reset.syscall + " " + reset.code);
-      if (reset.errno !== undefined && reset.errno !== null) err.errno = reset.errno;
-      err.code = reset.code;
-      err.syscall = reset.syscall;
+      let err;
+      if (reset.parse === true) {
+        err = new Error(reset.message);
+        err.code = reset.code;
+        withParseReason(err);
+      } else {
+        err = new Error(reset.syscall + " " + reset.code);
+        if (reset.errno !== undefined && reset.errno !== null) err.errno = reset.errno;
+        err.code = reset.code;
+        err.syscall = reset.syscall;
+      }
       try {
         socket[kServerSocketPeerReset](err);
       } catch (e) {

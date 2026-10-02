@@ -644,15 +644,21 @@ pub(crate) fn classify_server_body(error: &hyper::Error) -> ServerBodyError {
 /// hyper leaves in a body (measured on v22.22.2, a request's or a
 /// response's).
 pub(crate) fn invalid_chunk_size() -> OpOutcome {
-    OpOutcome::node_failed(
-        "HPE_INVALID_CHUNK_SIZE",
-        "Parse Error: Invalid character in chunk size",
-    )
+    OpOutcome::node_failed(INVALID_CHUNK_SIZE.0, INVALID_CHUNK_SIZE.1)
 }
+
+/// [`invalid_chunk_size`]'s code and message.
+pub(crate) const INVALID_CHUNK_SIZE: (&str, &str) = (
+    "HPE_INVALID_CHUNK_SIZE",
+    "Parse Error: Invalid character in chunk size",
+);
+
+/// [`invalid_eof_state`]'s code and message.
+pub(crate) const INVALID_EOF_STATE: (&str, &str) = ("HPE_INVALID_EOF_STATE", "Parse Error");
 
 /// llhttp's code and text for a connection that ended mid-body: node's
 /// parser refuses the end of the stream there (`parser.finish()`), and the
 /// message carries no reason (v22.22.2).
 pub(crate) fn invalid_eof_state() -> OpOutcome {
-    OpOutcome::node_failed("HPE_INVALID_EOF_STATE", "Parse Error")
+    OpOutcome::node_failed(INVALID_EOF_STATE.0, INVALID_EOF_STATE.1)
 }
