@@ -18629,9 +18629,10 @@
 
     // The input of a one-shot call, checked after the options, as node's
     // convenience methods construct their engine first. zlibBufferSync
-    // names it "buffer"; the callback forms write it to the engine, whose
+    // names it "buffer"; the callback forms end the engine with it, whose
     // Writable names it "chunk" (zlibBuffer wraps an ArrayBuffer first, so
-    // that passes too).
+    // that passes too) -- and whose end() writes nothing for null or
+    // undefined, so the call runs on empty input.
     const syncInput = (buffer) => {
       if (typeof buffer === "string") return BufferCtor.from(buffer, "utf8");
       if (ArrayBuffer.isView(buffer)) return toBytes(buffer);
@@ -18640,7 +18641,9 @@
         "buffer", ["string", "Buffer", "TypedArray", "DataView", "ArrayBuffer"], buffer,
       );
     };
+    const NO_INPUT = new Uint8Array(0);
     const asyncInput = (buffer) => {
+      if (buffer === null || buffer === undefined) return NO_INPUT;
       if (typeof buffer === "string") return BufferCtor.from(buffer, "utf8");
       if (ArrayBuffer.isView(buffer)) return toBytes(buffer);
       if (isAnyArrayBuffer(buffer)) return new Uint8Array(buffer);

@@ -3584,13 +3584,16 @@ impl BrotliDecompressor {
 
     /// Finalize: close the brotli decompressor and return any remaining
     /// output bytes. `into_inner()` calls `close()` and returns the inner
-    /// Vec; on decompressor error it returns `Err(Vec)` which we convert
-    /// to an io::Error (the partial bytes are discarded on corruption).
+    /// Vec, or `Err(Vec)` when the stream has not ended. Corrupt data fails
+    /// the write that carries it, so a stream that wrote cleanly and does
+    /// not end here stopped short: node's Z_BUF_ERROR "unexpected end of
+    /// file" (node_zlib.cc's brotli `CheckError` under
+    /// BROTLI_OPERATION_FINISH), an empty input included.
     pub fn finish(self) -> std::io::Result<Vec<u8>> {
         self.inner.into_inner().map_err(|_| {
             std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "brotli decompressor: stream is incomplete or corrupt",
+                std::io::ErrorKind::UnexpectedEof,
+                zlib::ZlibError::UNEXPECTED_EOF,
             )
         })
     }
@@ -3608,6 +3611,35 @@ const _: () = {
     assert_send::<BrotliCompressor>();
     assert_send::<BrotliDecompressor>();
 };
+
+// Kept next to the brotli code it guards rather than at the file's end.
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod brotli_tests {
+    use super::{BrotliCompressor, BrotliDecompressor, zlib};
+
+    #[test]
+    fn a_stream_that_stops_short_is_nodes_unexpected_end_of_file() {
+        let mut enc = BrotliCompressor::new();
+        let mut packed = enc.write_chunk(b"hello hello hello").unwrap();
+        packed.extend(enc.finish().unwrap());
+        // Whole: the data. Cut short, or empty: Z_BUF_ERROR, as node's.
+        let mut dec = BrotliDecompressor::new();
+        let mut out = dec.write_chunk(&packed).unwrap();
+        out.extend(dec.finish().unwrap());
+        assert_eq!(out, b"hello hello hello");
+        for cut in [0, 1, 5, packed.len() - 1] {
+            let mut dec = BrotliDecompressor::new();
+            dec.write_chunk(&packed[..cut]).unwrap();
+            let err = dec.finish().unwrap_err();
+            assert_eq!(
+                zlib::zlib_error(&err),
+                Some(zlib::ZlibError::UNEXPECTED_EOF),
+                "cut at {cut}"
+            );
+        }
+    }
+}
 
 /// Built-in op implementations. Plain futures; the engine decides how their
 /// outcomes surface in JS.
@@ -5032,9 +5064,9 @@ pub mod ops {
                 super::ZlibStream::BrotliCompress(enc) => {
                     enc.finish().map_err(|e| failed("brotli stream flush", e))
                 }
-                super::ZlibStream::BrotliDecompress(dec) => {
-                    dec.finish().map_err(|e| failed("brotli stream flush", e))
-                }
+                super::ZlibStream::BrotliDecompress(dec) => dec
+                    .finish()
+                    .map_err(|e| Box::new(zlib_decode_failed("brotli stream flush", e))),
                 super::ZlibStream::HandleCompress(_) | super::ZlibStream::HandleDecompress(_) => {
                     Err(Box::new(OpOutcome::Failed(
                         "zlib handle: use close(), not zlibStreamFlush".into(),

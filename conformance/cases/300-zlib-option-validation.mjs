@@ -13,7 +13,11 @@
 // `deflateSync('x', { level: 99 })` returned data where node throws
 // ERR_OUT_OF_RANGE; no constructor checked level, memLevel, strategy,
 // windowBits or chunkSize; brotli params went unread; the one-shot forms took
-// a number as input (`new Uint8Array(5)`) and ignored `info`.
+// a number as input (`new Uint8Array(5)`) and ignored `info`. Then the
+// input check threw for null and undefined in the callback forms, which node
+// runs on empty input (its engine's end() writes nothing for either), and a
+// brotli stream that stopped short failed with a plain Error, not node's
+// Z_BUF_ERROR "unexpected end of file".
 //
 // Prints error class, code and message, and never a compressed byte.
 import zlib from "node:zlib";
@@ -122,6 +126,37 @@ attempt("brotliCompress input 5", () => zlib.brotliCompress(5, {}, () => {}));
 attempt("brotliCompressSync params 99", () => zlib.brotliCompressSync("x", { params: { 99: 1 } }));
 attempt("brotliDecompressSync params 2", () => zlib.brotliDecompressSync("x", { params: { 2: 1 } }));
 attempt("brotliCompressSync input 5", () => zlib.brotliCompressSync(5));
+
+// null and undefined are no input to a callback form: node ends its engine
+// with them, and end() writes nothing for either, so the call runs on empty
+// input -- an empty stream out of a deflater, Z_BUF_ERROR out of an inflater.
+// A sync form names them "buffer".
+for (const input of [null, undefined]) {
+  for (const name of ["deflate", "gzip", "deflateRaw", "inflate", "gunzip", "inflateRaw", "unzip", "brotliCompress", "brotliDecompress"]) {
+    await new Promise((resolve) => {
+      zlib[name](input, (err, out) => {
+        console.log(`${name}(${input}): ${err ? `${describe(err)} ${err.errno}` : `ok ${out.length}`}`);
+        resolve();
+      });
+    });
+  }
+  attempt(`deflateSync(${input})`, () => zlib.deflateSync(input));
+  attempt(`inflateSync(${input})`, () => zlib.inflateSync(input));
+}
+await new Promise((resolve) => {
+  zlib.brotliCompress("hello hello hello", (err, packed) => {
+    zlib.brotliDecompress(packed.subarray(0, 5), (e) => {
+      console.log(`brotliDecompress cut short: ${describe(e)} ${e.errno}`);
+      const stream = zlib.createBrotliDecompress();
+      stream.on("error", (e2) => {
+        console.log(`BrotliDecompress stream cut short: ${describe(e2)} ${e2.errno}`);
+        resolve();
+      });
+      stream.resume();
+      stream.end(packed.subarray(0, 5));
+    });
+  });
+});
 
 // The engines and what they hold.
 const d = new zlib.Deflate({ level: 3, strategy: 1, chunkSize: 100, info: "y" });
