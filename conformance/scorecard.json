@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "8c177f0",
+  "commit": "1064df5",
   "oamVersion": "oam 0.17.1",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 264,
-      "total": 264,
+      "pass": 281,
+      "total": 281,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -791,7 +791,47 @@
           "status": "pass"
         },
         {
+          "case": "298-web-streams-initial-pull.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "299-web-streams-writable-transform-backpressure.mjs",
+          "status": "pass"
+        },
+        {
           "case": "30-util-getcallsites.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "300-zlib-option-validation.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "301-zlib-params.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "302-fs-mkdtemp-names.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "303-fs-mkdtemp-arguments.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "304-http2-client-receives-trailers.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "305-http2-client-sends-trailers.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "306-webassembly-async-compile-settles.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "307-buffer-encoding-slice-write-methods.mjs",
           "status": "pass"
         },
         {
@@ -808,6 +848,34 @@
         },
         {
           "case": "34-buffer-api-validation.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "340-web-streams-byte-controller-enqueue.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "341-web-streams-constructor-validation.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "342-web-streams-reader-release-lock.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "343-web-streams-pipe-to.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "344-http2-trailer-values.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "345-http2-trailers-unread-body.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "346-http2-server-stream-half-closed.mjs",
           "status": "pass"
         },
         {
@@ -1174,7 +1242,7 @@
         "platform": "win32",
         "noBaseline": false,
         "nodeTotal": 1874,
-        "knownMissing": 319,
+        "knownMissing": 306,
         "newMissing": [],
         "staleRatchet": [],
         "absentModules": [],
@@ -1309,19 +1377,6 @@
             "names": [
               "_parse",
               "_sync"
-            ]
-          },
-          {
-            "module": "global:ReadableStream.prototype",
-            "names": [
-              "_cancelInternal",
-              "_maybePull"
-            ]
-          },
-          {
-            "module": "global:WritableStream.prototype",
-            "names": [
-              "_controllerFor"
             ]
           },
           {
