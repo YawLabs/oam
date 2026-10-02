@@ -2339,6 +2339,12 @@
         return new undiciErrors.HeadersTimeoutError(e.message);
       case "UND_ERR_BODY_TIMEOUT":
         return new undiciErrors.BodyTimeoutError(e.message);
+      // A response head the parser refused (bridge.rs head_parse_error,
+      // which words it as undici does).
+      case "HPE_INVALID_STATUS":
+      case "HPE_INVALID_CONSTANT":
+      case "HPE_INVALID_HEADER_TOKEN":
+        return new undiciErrors.HTTPParserError(e.message, e.code.slice(4));
       // The peer closed the connection before the head (transport.rs
       // OpOutcome::SocketClosed): undici's SocketError, with the socket it
       // describes.

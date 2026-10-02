@@ -482,15 +482,52 @@ pub fn start(
 /// has for what hyper reports), anything else -- the peer closed or reset
 /// before a complete head -- `socket hang up`.
 fn exchange_error(error: &hyper::Error) -> OpOutcome {
-    if error.is_parse_too_large() {
-        OpOutcome::node_failed("HPE_HEADER_OVERFLOW", "Parse Error: Header overflow")
+    head_parse_error(error, false)
+        .unwrap_or_else(|| OpOutcome::node_failed("ECONNRESET", "socket hang up"))
+}
+
+/// A response head hyper could not parse, as the client that sent the
+/// request reports it: llhttp's code (the closest llhttp has for what hyper
+/// reports) with node's http `Parse Error: <reason>`, or -- `undici`, for
+/// fetch and undici.request -- the reason in undici's HTTPParserError
+/// wording (measured on node v22.22.2 + undici 6.29.0). `None` for any
+/// other failure. undici counts an oversized head itself
+/// (send.rs `response_head_overflow`), so that one is node's only.
+pub(crate) fn head_parse_error(error: &hyper::Error, undici: bool) -> Option<OpOutcome> {
+    let (code, reason) = if error.is_parse_too_large() {
+        if undici {
+            return None;
+        }
+        ("HPE_HEADER_OVERFLOW", "Header overflow")
     } else if error.is_parse_status() {
-        OpOutcome::node_failed("HPE_INVALID_STATUS", "Parse Error: Invalid status code")
+        if undici {
+            ("HPE_INVALID_STATUS", "Invalid response status")
+        } else {
+            ("HPE_INVALID_STATUS", "Invalid status code")
+        }
     } else if error.is_parse() {
-        OpOutcome::node_failed("HPE_INVALID_CONSTANT", "Parse Error: Expected HTTP/")
+        // hyper says which part failed only in its text. A version that
+        // does not parse is mostly a head that is not HTTP at all, llhttp's
+        // protocol check (node's wording names the other two protocols it
+        // takes, undici's older llhttp does not); a bad header is llhttp's
+        // token check.
+        let text = error.to_string();
+        if text.starts_with("invalid HTTP header parsed") {
+            ("HPE_INVALID_HEADER_TOKEN", "Invalid header token")
+        } else if undici {
+            ("HPE_INVALID_CONSTANT", "Expected HTTP/")
+        } else {
+            ("HPE_INVALID_CONSTANT", "Expected HTTP/, RTSP/ or ICE/")
+        }
     } else {
-        OpOutcome::node_failed("ECONNRESET", "socket hang up")
-    }
+        return None;
+    };
+    let message = if undici {
+        format!("Response does not match the HTTP/1.1 protocol ({reason})")
+    } else {
+        format!("Parse Error: {reason}")
+    };
+    Some(OpOutcome::node_failed(code, message))
 }
 
 /// A header value as JS sees it: latin1, one code point per byte.

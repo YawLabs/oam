@@ -836,6 +836,11 @@ async fn run(
                 }
                 Err(e) => {
                     state.source.request_failed();
+                    // A malformed response head is the parser's error, as
+                    // bridge.rs exchange_error reports it on the agent paths.
+                    if let Some(parse) = e.head_parse_outcome(state.undici_head) {
+                        return parse;
+                    }
                     return e.to_outcome(&hop_url);
                 }
             }

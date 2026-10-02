@@ -1477,6 +1477,20 @@ What still differs:
   `syscall: 'read'`, as Node's socket reports it. Up to 0.17.1 it was `ECONNRESET` `socket
   hang up` with no `errno` / `syscall`, and `fetch`'s cause the uncoded `error sending
   request for url (...)`.
+- **A response head that does not parse is the parser's error**
+  (`conformance/cases/293-http-client-malformed-response-head.mjs`): `http.request` emits
+  llhttp's code with Node's `Parse Error` -- `HPE_INVALID_STATUS` `Invalid status code` for a
+  status that is not three digits, `HPE_INVALID_CONSTANT` `Expected HTTP/, RTSP/ or ICE/`
+  for a head that is not HTTP -- and `fetch`'s cause is undici's `HTTPParserError`
+  (`Response does not match the HTTP/1.1 protocol (Invalid response status)`). Up to
+  0.17.1 this transport reported ECONNRESET `socket hang up` and an uncoded `error sending
+  request for url (...)` cause. What differs: hyper, which parses the head, says only which
+  part failed, so a status of four digits or more is `Invalid status code` where Node says
+  `Invalid response status`, a version that is not 0.9, 1.0, 1.1 or 2.0 is
+  `HPE_INVALID_CONSTANT` where Node's is `HPE_INVALID_VERSION`, and a malformed header is
+  `HPE_INVALID_HEADER_TOKEN` `Invalid header token` whichever of llhttp's header checks Node
+  fails it with; a status under 100 fails `fetch` with `HTTPParserError` where undici 6.29.0
+  fails an `assert(statusCode >= 100)` of its own.
 - **A server's close (no reset) is undici's `SocketError`; a failure mid-body is
   `terminated`** (`conformance/cases/273-fetch-server-close-and-reset.mjs`). A connection
   the server closes before the response head is in, or halfway through it, fails `fetch`
@@ -1712,9 +1726,6 @@ generator as `[object AsyncGenerator]`. What differs:
 - **A FormData body is refused** with `NotSupportedError`. undici encodes it as
   `multipart/form-data`; oam has no multipart encoder yet (`new Response(formData)` lacks one
   too), and sending it any other way would put the wrong bytes on the wire.
-- **The connection is made with the first chunk.** undici connects first and writes the head
-  with the first chunk; oam dispatches the request (DNS, connect, TLS) once the first chunk
-  is there, so a body whose first chunk is slow pays the connect after it.
 - **When a stream's framing is decided.** undici frames a Readable when it dispatches the
   request: an ended byte stream goes with `content-length`, an open one chunked. On a
   reused connection that is after the immediates already queued; on a fresh one, after the
