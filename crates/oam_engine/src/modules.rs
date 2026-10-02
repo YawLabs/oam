@@ -825,6 +825,9 @@ impl JsRuntime {
                 if let Some(failure) = run_ticks_and_microtasks(tc) {
                     return Err(failure);
                 }
+                if let Some(queue) = tc.get_slot_mut::<crate::timers::TimerQueue>() {
+                    queue.callback_done();
+                }
                 progressed = true;
             }
             if let Some(completion) = tc
@@ -1357,6 +1360,11 @@ pub(crate) fn pump_event_loop(
                 if let Some(failure) = drain_uncaught(tc) {
                     return Err(failure);
                 }
+            }
+            // A pending callback queued from here on (an op completion's
+            // callback below) is in no timer's or immediate's phase.
+            if let Some(queue) = tc.get_slot_mut::<crate::timers::TimerQueue>() {
+                queue.callback_done();
             }
             progressed = true;
         }

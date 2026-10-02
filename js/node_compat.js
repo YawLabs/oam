@@ -432,9 +432,7 @@
       typeof path.href === "string" && path.auth === undefined && path.path === undefined
     ) {
       if (path.protocol !== "file:") {
-        const err = new TypeError("The URL must be of scheme file");
-        err.code = "ERR_INVALID_URL_SCHEME";
-        throw err;
+        throw codes.ERR_INVALID_URL_SCHEME("file");
       }
       const fromUrl = registry.get("url").fileURLToPath(path);
       if (fromUrl.includes("\u0000")) throw nulInPath(name, fromUrl);
@@ -1055,7 +1053,6 @@
   codes.ERR_SOCKET_BAD_TYPE = E("ERR_SOCKET_BAD_TYPE", TypeError, function() {
     return 'Bad socket type specified. Valid types are: udp4, udp6';
   });
-  codes.ERR_SOCKET_CLOSED = E("ERR_SOCKET_CLOSED", Error, 'Socket is closed');
   // node's text, which speaks of sending a handle (child_process) wherever
   // the error is raised -- resetAndDestroy() on a non-TCP socket included.
   codes.ERR_INVALID_HANDLE_TYPE = E("ERR_INVALID_HANDLE_TYPE", TypeError, 'This handle type cannot be sent');
@@ -1289,13 +1286,24 @@
   codes.ERR_MULTIPLE_CALLBACK = E("ERR_MULTIPLE_CALLBACK", Error, function() {
     return 'Callback called multiple times';
   });
-  codes.ERR_INVALID_FILE_URL_PATH = E("ERR_INVALID_FILE_URL_PATH", Error, function(msg) {
+  // url.fileURLToPath's refusals: TypeErrors in node, as ERR_INVALID_URL_SCHEME.
+  codes.ERR_INVALID_FILE_URL_PATH = E("ERR_INVALID_FILE_URL_PATH", TypeError, function(msg) {
     return 'File URL path ' + msg;
   });
-  codes.ERR_INVALID_FILE_URL_HOST = E("ERR_INVALID_FILE_URL_HOST", Error, function(host) {
-    return 'File URL host must be "localhost" or empty on ' + host;
+  codes.ERR_INVALID_FILE_URL_HOST = E("ERR_INVALID_FILE_URL_HOST", TypeError, function(platform) {
+    return 'File URL host must be "localhost" or empty on ' + platform;
+  });
+  // fs.Dir used after close().
+  codes.ERR_DIR_CLOSED = E("ERR_DIR_CLOSED", Error, "Directory handle was closed");
+  // process.setuid() and friends given a user or group name with no entry
+  // (`kind` is "User" or "Group").
+  codes.ERR_UNKNOWN_CREDENTIAL = E("ERR_UNKNOWN_CREDENTIAL", Error, function(kind, value) {
+    return kind + ' identifier does not exist: ' + value;
   });
   codes.ERR_FS_CP_DIR_TO_NON_DIR = E("ERR_FS_CP_DIR_TO_NON_DIR", Error, function(msg) {
+    return msg;
+  });
+  codes.ERR_FS_CP_NON_DIR_TO_DIR = E("ERR_FS_CP_NON_DIR_TO_DIR", Error, function(msg) {
     return msg;
   });
   // node's SystemError (lib/internal/errors.js, v22.22.2): the class of the
@@ -9564,7 +9572,7 @@
       // end-of-directory. Returning null here instead made a use-after-close
       // bug look like an empty directory.
       if (this.#closed) {
-        throw makeNodeError("ERR_DIR_CLOSED", "Directory handle was closed");
+        throw codes.ERR_DIR_CLOSED();
       }
       if (this.#index >= this.#entries.length) return null;
       return makeDirent(this.path, this.#entries[this.#index++]);
@@ -9572,7 +9580,7 @@
     readSync() { return this.#next(); }
     closeSync() {
       if (this.#closed) {
-        throw makeNodeError("ERR_DIR_CLOSED", "Directory handle was closed");
+        throw codes.ERR_DIR_CLOSED();
       }
       this.#closed = true;
     }
@@ -10915,6 +10923,66 @@
     return _rwStreams;
   }
 
+  // node's checkPaths (lib/internal/fs/cp/cp.js) and, for cpSync, its C++
+  // twin cpSyncCheckPaths: copying a directory onto something that exists
+  // and is not a directory fails with ERR_FS_CP_DIR_TO_NON_DIR, the reverse
+  // with ERR_FS_CP_NON_DIR_TO_DIR -- before anything is copied, and before
+  // the check for a directory copied without `recursive`. `destRaw` is the
+  // destination's stat, null when it does not exist. Measured on v22.22.2:
+  // cpSync's is a plain Error with `code` alone, the paths rendered as node
+  // hands them to its C++ (path.toNamespacedPath: absolute, `\\?\`-prefixed
+  // on Windows); cp's and fs.promises.cp's is a SystemError (see
+  // docs/node-divergences.md "Coded errors") naming the paths as given.
+  // Before this a directory copied onto a file failed on the first entry
+  // with ENOENT, or not at all when it was empty, and a file copied onto a
+  // directory failed with EPERM from copyfile.
+  function cpTypeMismatch(srcIsDir, destRaw, src, dest, sync) {
+    if (destRaw === null || srcIsDir === (destRaw.kind === "dir")) return null;
+    const code = srcIsDir ? "ERR_FS_CP_DIR_TO_NON_DIR" : "ERR_FS_CP_NON_DIR_TO_DIR";
+    const kept = srcIsDir ? "non-directory" : "directory";
+    const copied = srcIsDir ? "directory" : "non-directory";
+    if (sync) {
+      const ns = registry.get("path").toNamespacedPath;
+      return makeNodeError(code, `Cannot overwrite ${kept} ${ns(dest)} with ${copied} ${ns(src)}`);
+    }
+    // EISDIR is 21 and ENOTDIR 20 in every platform's os.constants.errno.
+    const info = {
+      message: `cannot overwrite ${kept} ${dest} with ${copied} ${src}`,
+      path: dest,
+      syscall: "cp",
+      errno: srcIsDir ? 21 : 20,
+      code: srcIsDir ? "EISDIR" : "ENOTDIR",
+    };
+    const err = codes[code](
+      `Cannot overwrite ${kept} with ${copied}: cp returned ${info.code} (${info.message}) ${dest}`,
+    );
+    err.info = info;
+    err.errno = info.errno;
+    err.syscall = info.syscall;
+    err.path = dest;
+    return err;
+  }
+
+  // The destination's stat for cpTypeMismatch: lstat, as node's (stat with
+  // `dereference`), null when there is nothing there.
+  function cpDestStatSync(natives, dest, opts) {
+    try {
+      return natives.fsStatSync(dest, !opts.dereference);
+    } catch (e) {
+      if (e && e.code === "ENOENT") return null;
+      throw e;
+    }
+  }
+
+  async function cpDestStat(natives, dest, opts) {
+    try {
+      return await natives.fsStat(dest, !opts.dereference);
+    } catch (e) {
+      if (e && e.code === "ENOENT") return null;
+      throw e;
+    }
+  }
+
   registry.factories["fs/promises"] = (natives) => {
     const isWin = natives.platform === "win32";
     // The callback module is built from these same functions, and node's
@@ -10935,15 +11003,20 @@
     // fs/promises.cp over two validated paths.
     async function cpRecursive(srcStr, destStr, options) {
       var opts = options || {};
-      var raw;
-      try { raw = await natives.fsStat(srcStr, false); } catch (e) { throw e; }
+      var raw = await natives.fsStat(srcStr, false);
+      // A directory onto a file, or a file onto a directory: node's coded
+      // errors, before anything is copied.
+      var mismatch = cpTypeMismatch(raw.kind === "dir", await cpDestStat(natives, destStr, opts), srcStr, destStr, false);
+      if (mismatch !== null) throw mismatch;
       if (raw.kind === "dir") {
         if (!opts.recursive) throw makeNodeError("ERR_FS_CP_DIR_TO_NON_DIR", "cp: -r not specified; omitting directory '" + srcStr + "'");
         try { await natives.fsMkdir(destStr, true); } catch (e) {}
         var entries = await natives.fsReaddir(srcStr);
+        // node joins each entry's paths with path.join, so an error names
+        // them with the platform's separator.
+        var join = registry.get("path").join;
         for (var i = 0; i < entries.length; i++) {
-          var sep = srcStr.endsWith("/") || srcStr.endsWith("\\") ? "" : "/";
-          await cpRecursive(srcStr + sep + entries[i].name, destStr + sep + entries[i].name, opts);
+          await cpRecursive(join(srcStr, entries[i].name), join(destStr, entries[i].name), opts);
         }
       } else {
         await natives.fsCopyFile(srcStr, destStr);
@@ -12131,15 +12204,16 @@
         var srcStr = toPath(src, "src");
         var destStr = toPath(dest, "dest");
         var opts = options || {};
-        var raw;
-        try { raw = natives.fsStatSync(srcStr, false); } catch (e) { throw e; }
+        var raw = natives.fsStatSync(srcStr, false);
+        var mismatch = cpTypeMismatch(raw.kind === "dir", cpDestStatSync(natives, destStr, opts), srcStr, destStr, true);
+        if (mismatch !== null) throw mismatch;
         if (raw.kind === "dir") {
           if (!opts.recursive) throw makeNodeError("ERR_FS_CP_DIR_TO_NON_DIR", "cpSync: -r not specified; omitting directory '" + srcStr + "'");
           try { natives.fsMkdirSync(destStr, true); } catch (e) {}
           var entries = natives.fsReaddirSync(srcStr);
+          var join = registry.get("path").join;
           for (var i = 0; i < entries.length; i++) {
-            var sep = srcStr.endsWith("/") || srcStr.endsWith("\\") ? "" : "/";
-            cpSyncRecursive(srcStr + sep + entries[i].name, destStr + sep + entries[i].name, opts);
+            cpSyncRecursive(join(srcStr, entries[i].name), join(destStr, entries[i].name), opts);
           }
         } else {
           natives.fsCopyFileSync(srcStr, destStr);
@@ -12784,10 +12858,7 @@
       if (typeof value === "number") return value;
       const id = natives.posixLookupId(kind === "uid" ? 0 : 1, value);
       if (id === null || id === undefined) {
-        throw makeNodeError(
-          "ERR_UNKNOWN_CREDENTIAL",
-          `${credentialKindWord(kind)} identifier does not exist: ${value}`,
-        );
+        throw codes.ERR_UNKNOWN_CREDENTIAL(credentialKindWord(kind), value);
       }
       return id;
     };
@@ -14139,16 +14210,10 @@
           if (typeof user === "number") {
             name = natives.posixLookupId(2, user);
             if (name === null || name === undefined) {
-              throw makeNodeError(
-                "ERR_UNKNOWN_CREDENTIAL",
-                `User identifier does not exist: ${user}`,
-              );
+              throw codes.ERR_UNKNOWN_CREDENTIAL("User", user);
             }
           } else if (natives.posixLookupId(0, user) === null) {
-            throw makeNodeError(
-              "ERR_UNKNOWN_CREDENTIAL",
-              `User identifier does not exist: ${user}`,
-            );
+            throw codes.ERR_UNKNOWN_CREDENTIAL("User", user);
           }
           const err = natives.posixInitGroups(name, gid);
           if (err) throw credentialSyscallError(err, "initgroups");
@@ -15532,11 +15597,14 @@
       }
       const url = typeof input === "string" ? new globalThis.URL(input) : input;
       if (url.protocol !== "file:") {
-        throw makeNodeError(
-          "ERR_INVALID_URL_SCHEME",
-          "The URL must be of scheme file",
-        );
+        throw codes.ERR_INVALID_URL_SCHEME("file");
       }
+      // node's refusals of a path carry the URL as `input`.
+      const badPath = (msg) => {
+        const e = codes.ERR_INVALID_FILE_URL_PATH(msg);
+        e.input = url;
+        return e;
+      };
       // options.windows forces win32/posix semantics regardless of host
       // (Node v22: fileURLToPath(path, { windows }), mirroring
       // pathToFileURL). `null` is explicitly allowed and means host default.
@@ -15549,12 +15617,7 @@
         // Encoded separators would let a URL smuggle path segments past
         // consumers. Windows rejects BOTH, since '\' is a separator there.
         if (/%2f|%5c/i.test(url.pathname)) {
-          const e = makeNodeError(
-            "ERR_INVALID_FILE_URL_PATH",
-            "File URL path must not include encoded \\ or / characters",
-          );
-          e.input = url;
-          throw e;
+          throw badPath("must not include encoded \\ or / characters");
         }
         let pathname = decodeURIComponent(url.pathname).replaceAll("/", "\\");
         if (url.hostname) {
@@ -15564,12 +15627,7 @@
         if (!/^\\[A-Za-z]:/.test(pathname)) {
           // A drive-less path would silently resolve against the cwd's
           // drive â€” fail loud like Node.
-          const e = makeNodeError(
-            "ERR_INVALID_FILE_URL_PATH",
-            "File URL path must be absolute",
-          );
-          e.input = url;
-          throw e;
+          throw badPath("must be absolute");
         }
         return pathname.slice(1); // strip the slash before the drive letter
       }
@@ -15578,25 +15636,15 @@
       // FILENAME CHARACTER here, so rejecting %5C (the Windows rule)
       // made 'file:///foo%5Cbar' -- a real, addressable file -- unopenable.
       if (/%2f/i.test(url.pathname)) {
-        const e = makeNodeError(
-          "ERR_INVALID_FILE_URL_PATH",
-          "File URL path must not include encoded / characters",
-        );
-        e.input = url;
-        throw e;
+        throw badPath("must not include encoded / characters");
       }
       // A host is meaningless for a POSIX file path (no UNC), so Node
       // refuses rather than silently dropping it and returning a path
-      // that points somewhere else entirely.
+      // that points somewhere else entirely. (No `input` on this one.)
       if (url.hostname) {
-        const e = makeNodeError(
-          "ERR_INVALID_FILE_URL_HOST",
-          `File URL host must be "localhost" or empty on ${
-            natives && natives.platform ? natives.platform : "posix"
-          }`,
+        throw codes.ERR_INVALID_FILE_URL_HOST(
+          natives && natives.platform ? natives.platform : "posix",
         );
-        e.input = url;
-        throw e;
       }
       return decodeURIComponent(url.pathname);
     }
@@ -25124,6 +25172,10 @@
         };
         this._paused = false;
         this._readLoopActive = false;
+        // A read loop asked for while one was still unwinding (_readLoop),
+        // and whether the handle's EOF has been read.
+        this._readLoopAgain = false;
+        this._readEofSeen = false;
         // Paused-mode reading (node's readableFlowing false / null): a
         // 'readable' listener buffers what arrives here for read(), and once
         // the last one goes the data is held until resume() or a 'data'
@@ -25148,8 +25200,9 @@
         this._pipeHandler = null;
         this._timeoutMs = 0;
         this._timeoutId = null;
-        // Distinguishes ERR_SOCKET_CLOSED vs ERR_SOCKET_CLOSED_BEFORE_
-        // CONNECTION for callbacks queued on a dead socket (Node parity).
+        // Whether the socket ever had its connection: a write a destroy()
+        // stopped before it ran fails with ERR_SOCKET_CLOSED on one that
+        // did, from 'close' (held behind the connect) on one that did not.
         this._everConnected = false;
         // The native halves of the writes (and of end()) made while a connect
         // is in flight; null when ops go straight to the natives (see
@@ -25159,6 +25212,14 @@
         // -- node's kOnFinished list. On a socket destroyed before its first
         // end(), until a write outstanding at destroy() settles (see end()).
         this._endCallbacks = null;
+        // A write failed for want of a handle: the callbacks of the writes
+        // waiting on its next-tick teardown (see _writeWithoutHandle).
+        this._noHandleFailure = null;
+        // end()'s 'finish' is queued for the loop's next turn (see end()).
+        this._finishPending = false;
+        // The callbacks of the writes held behind a connect, failed from
+        // 'close' if the socket closes first (see _holdWrite).
+        this._heldWrites = null;
         if (options && options._handle !== undefined) {
           this._handle = options._handle;
           this.connecting = false;
@@ -25284,6 +25345,12 @@
             // without a handle); the remembered flag is applied here, before
             // 'connect' fires and before the first read parks.
             if (this._handleRefed === false) natives.tcpSetRef(this._handle, false);
+            // The held writes go out: node's 'connect' listener takes its
+            // 'close' listener off.
+            if (this._heldWrites !== null) {
+              this._heldWrites = null;
+              this.removeListener("close", this._failHeldWrites);
+            }
             // What was written while connecting goes out first, then
             // 'connect': a listener that writes -- or destroys the socket --
             // finds the earlier writes already with the natives (node
@@ -25311,7 +25378,10 @@
           err.code = "ERR_INVALID_ARG_TYPE";
           throw err;
         }
-        if (this.destroyed || !this.writable) {
+        if (this.destroyed || !this.writable || (this._handle === null && this._heldOps === null)) {
+          if (!this.destroyed && (this.writable || this._noHandleFailure !== null)) {
+            return this._writeWithoutHandle(data, cb);
+          }
           let err;
           if (this._writableState.ended && this._readableState.endEmitted && !this.allowHalfOpen) {
             // node's writeAfterFIN (lib/net.js), which replaces write() once
@@ -25363,35 +25433,38 @@
         // callbacks of an end() parked after destroy() (see below).
         let inCall = true;
         let tookWhole = false;
+        // Held behind the connect: if the socket closes first, the write
+        // fails from 'close' (see _holdWrite).
+        if (this._heldOps !== null) this._holdWrite(cb);
         const written = this._issue(() => {
           const op = natives.tcpWrite(this._handle, bytes);
           if (op === undefined) tookWhole = inCall;
           return op;
         });
         inCall = false;
+        // Taken whole: as node's, whose onwrite has run by the time write()
+        // returns (libuv's try-write took it all), the bytes are no longer
+        // counted -- writableLength / bufferSize read 0 and write() returns
+        // true below -- though the callback still waits for its turn. No
+        // 'drain' from here: a write before this one still counted settles
+        // after it returns, and emits it.
+        if (tookWhole) {
+          this._writableState.length -= bytes.length;
+          this.bufferSize = this._writableState.length;
+        }
         this._chain = this._chain.then(() => written).then((failure) => {
-          settle();
+          if (!tookWhole) settle();
           if (failure === undefined) {
             if (cb) cb(null);
           } else if (failure === kSocketClosed) {
+            // A write held behind a connect the socket never made: its
+            // 'close' listener fails it (_failHeldWrites), with the
+            // callbacks of an end() behind it.
+            if (!this._everConnected) return;
             // Node invokes queued write callbacks with the socket-closed
             // error (NOT the connect error -- that went to 'error') --
             // silently dropping them hangs promisified writes forever.
-            if (cb || !this._everConnected) {
-              const err = this._socketClosedError();
-              if (!this._everConnected) {
-                // node's onwrite: a write held behind a connect the socket
-                // never made fails with this error, and the stream records
-                // it -- so the callbacks of an end() parked after destroy()
-                // get it too, and a later end(cb) is told the stream was
-                // destroyed.
-                const ws = this._writableState;
-                const rs = this._readableState;
-                if (!ws.errored) ws.errored = err;
-                if (!rs.errored) rs.errored = err;
-              }
-              if (cb) process.nextTick(cb, err);
-            }
+            if (cb) process.nextTick(cb, codes.ERR_SOCKET_CLOSED());
           } else {
             // node's afterWriteDispatched: a failed write destroys the
             // socket with its error, callback or not. destroy() defers
@@ -25411,14 +25484,66 @@
             this._failEndCallbacks(failure === kSocketClosed);
           }
         });
-        // Node: false once the queue is at or past the high-water mark. The
-        // write is still accepted -- false is advisory, asking the producer to
-        // wait for 'drain'.
-        if (this._writableState.length >= this.writableHighWaterMark) {
+        // Node: false once the queue is at or past the high-water mark (and
+        // not empty). The write is still accepted -- false is advisory,
+        // asking the producer to wait for 'drain'.
+        const queued = this._writableState.length;
+        if (queued >= this.writableHighWaterMark && queued !== 0) {
           this._writableState.needDrain = true;
           return false;
         }
         return true;
+      }
+
+      // A write (or end(data)) on a socket with no connection and none on
+      // the way -- never connected, connect() never called: node's
+      // _writeGeneric has no handle to write to and fails the write with
+      // ERR_SOCKET_CLOSED "Socket is closed". As node's onwrite, the error
+      // is the stream's at once (writable false; a later end() does not end
+      // it, a later write waits on it), and on the next tick the callback
+      // gets it, then the callbacks of an end() made since, then the socket
+      // is destroyed with it ('error', then 'close'). Before this the write
+      // reached the natives with no handle and failed with "tcp: write
+      // handle 0 is gone", a message no caller could act on.
+      //
+      // Until that tick a later write is buffered behind the failed one
+      // (node's writeOrBuffer on an errored stream): counted in
+      // writableLength, as node counts a chunk (a string's length, a
+      // buffer's bytes -- net.Socket does not decode strings), and
+      // writableNeedDrain once that reaches the high-water mark. Its
+      // callback gets the error right after the first one's, its chunk
+      // taken off the count just before (errorBuffer). The failed write
+      // itself is not counted: node's onwrite took it off inside the call.
+      // An end() does not end the stream and calls back with the error on
+      // its own tick (Writable.end on an errored stream). Off the hot path:
+      // only a socket with no handle and no connect in flight gets here.
+      _writeWithoutHandle(data, cb) {
+        const ws = this._writableState;
+        let buffered = this._noHandleFailure;
+        if (buffered === null) {
+          const err = codes.ERR_SOCKET_CLOSED();
+          const rs = this._readableState;
+          if (!ws.errored) ws.errored = err;
+          if (!rs.errored) rs.errored = err;
+          this.writable = false;
+          // [chunk length, callback] pairs, the failed write's first.
+          const failed = this._noHandleFailure = [0, cb];
+          process.nextTick(() => {
+            this._noHandleFailure = null;
+            for (let i = 0; i < failed.length; i += 2) {
+              ws.length -= failed[i];
+              const callback = failed[i + 1];
+              if (typeof callback === "function") callback(err);
+            }
+            this.destroy(err);
+          });
+          return false;
+        }
+        const length = typeof data === "string" ? data.length : (data?.byteLength ?? 0);
+        ws.length += length;
+        if (ws.length >= this.writableHighWaterMark) ws.needDrain = true;
+        buffered.push(length, cb);
+        return false;
       }
 
       // Why a chunk handed to write() or end(data) on a socket that is not
@@ -25432,14 +25557,43 @@
           : codes.ERR_STREAM_DESTROYED("write");
       }
 
-      // What a write or end() queued on a socket destroyed before the op
-      // could run fails with: ERR_SOCKET_CLOSED, or -- on a socket that
-      // never connected -- ERR_SOCKET_CLOSED_BEFORE_CONNECTION, node's
-      // error for a write held behind the connect.
-      _socketClosedError() {
-        return this._everConnected
-          ? codes.ERR_SOCKET_CLOSED()
-          : codes.ERR_SOCKET_CLOSED_BEFORE_CONNECTION();
+      // A write made while the connect is in flight. node's _writeGeneric
+      // holds the first such write on a 'connect' listener and adds a
+      // 'close' listener that fails it with
+      // ERR_SOCKET_CLOSED_BEFORE_CONNECTION; the writes after it wait
+      // behind it in the Writable's buffer. So the callbacks wait here, and
+      // the first write adds the 'close' listener -- in the order the
+      // caller's own 'close' listeners were added, as node's -- which the
+      // connect removes (_startConnect). One listener per connect, none on
+      // a connected socket's writes.
+      _holdWrite(cb) {
+        let held = this._heldWrites;
+        if (held === null) {
+          held = this._heldWrites = [];
+          this.once("close", this._failHeldWrites);
+        }
+        held.push(cb);
+      }
+
+      // The socket closed before it connected: node's onClose -> onwrite ->
+      // onwriteError for the held write. Its error is recorded as the
+      // stream's (unless destroy() gave it one), its callback gets it, the
+      // writes behind it and the callbacks of an end() get the stream's
+      // error (errorBuffer), in that order.
+      _failHeldWrites() {
+        const held = this._heldWrites;
+        if (held === null) return;
+        this._heldWrites = null;
+        const err = codes.ERR_SOCKET_CLOSED_BEFORE_CONNECTION();
+        const ws = this._writableState;
+        const rs = this._readableState;
+        if (!ws.errored) ws.errored = err;
+        if (!rs.errored) rs.errored = err;
+        for (let i = 0; i < held.length; i++) {
+          const callback = held[i];
+          if (typeof callback === "function") callback(i === 0 ? err : ws.errored);
+        }
+        if (this._endCallbacks !== null) this._failEndCallbacks(false);
       }
 
       // node's errorBuffer for the callbacks of an end() made after
@@ -25522,6 +25676,25 @@
       get writableFinished() {
         return this._writableState.finished;
       }
+      // node's stream getters, from the same state: `closed` true once
+      // destroy() has run (the handle closed with it; Readable's getter),
+      // `errored` the error the stream was destroyed or failed with,
+      // `readableEnded` once 'end' is out, and `writableNeedDrain` while a
+      // write() that returned false waits for 'drain' (Writable's: not on
+      // a stream destroyed or ending).
+      get closed() {
+        return this._readableState.closed;
+      }
+      get errored() {
+        return this._readableState.errored;
+      }
+      get readableEnded() {
+        return this._readableState.endEmitted;
+      }
+      get writableNeedDrain() {
+        const ws = this._writableState;
+        return !ws.destroyed && !ws.ending && ws.needDrain;
+      }
 
       end(data, encoding, cb) {
         if (typeof data === "function") { cb = data; data = undefined; encoding = undefined; }
@@ -25541,7 +25714,9 @@
         // waits for 'finish' only while neither has happened yet.
         let err;
         if (data !== undefined && data !== null) {
-          if (this.destroyed || !this.writable) {
+          // A write failed for want of a handle leaves the socket not
+          // writable but not ended: the chunk is buffered behind it (write()).
+          if (this.destroyed || (!this.writable && this._noHandleFailure === null)) {
             err = this._refusedWriteError();
             this.destroy(err);
           } else {
@@ -25555,6 +25730,7 @@
         if (err !== undefined || ws.ended || ws.errored) {
           if (typeof cb === "function") {
             if (err !== undefined) process.nextTick(cb, err);
+            else if (ws.errored) process.nextTick(cb, ws.errored);
             else if (this._endCallbacks !== null) this._endCallbacks.push(cb);
             else process.nextTick(cb, ws.errored ?? codes.ERR_STREAM_DESTROYED("end"));
           }
@@ -25577,38 +25753,78 @@
           if (typeof cb === "function") this._endCallbacks = [cb];
           return this;
         }
+        // node's end(cb): the callbacks of every end() made before the
+        // stream finishes run first, in call order, and then 'finish' is
+        // emitted (Writable's kOnFinished list). A destroy() before then
+        // hands them its error instead (see there).
+        const callbacks = this._endCallbacks = cb ? [cb] : [];
+        if (this._handle === null && this._heldOps === null) {
+          // No connection and none on the way: node's _final has nothing
+          // to shut down and calls back at once, so the stream finishes on
+          // the next tick (finishMaybe) -- whatever happens to the socket
+          // in between, a destroy() included.
+          process.nextTick(() => this._finish(callbacks));
+          return this;
+        }
         // The FIN is asked for now, in the same turn as the writes before
         // it: the natives send it once the last of them is written, with
         // no trip back through JS in between (#156; node queues the
         // shutdown behind its writes in libuv the same way). 'finish' still
         // waits for every write and for the shutdown.
+        // `doneInCall`: the natives finished the shutdown inside the call
+        // that issued it (nothing was queued before it).
+        let doneInCall = false;
         const shut = this._issue(() => {
-          if (this._handle !== null) return natives.tcpShutdown(this._handle);
+          if (this._handle === null) return undefined;
+          const op = natives.tcpShutdown(this._handle);
+          if (op === undefined) doneInCall = true;
+          return op;
         });
-        // node's end(cb): the callbacks of every end() made before the
-        // stream finishes run first, in call order, and then 'finish' is
-        // emitted (Writable's kOnFinished list).
-        const callbacks = this._endCallbacks = cb ? [cb] : [];
         this._chain = this._chain.then(() => shut).then((failure) => {
           // A failed shutdown is the socket's error (node's afterShutdown
           // destroys with it), not a rejection left on `_chain`.
           if (failure !== undefined && failure !== kSocketClosed) this.destroy(failure);
-          this._endCallbacks = null;
-          if (this.destroyed || this._writableState.errored) {
-            // Never report success on a socket that died first: Node skips
-            // 'finish' entirely and hands the end callbacks the error.
-            if (callbacks.length > 0) {
-              const err = this._writableState.errored ?? this._socketClosedError();
-              for (const callback of callbacks) callback(err);
-            }
+          // Never report success on a socket that died first: Node skips
+          // 'finish' entirely, and destroy() has handed the callbacks the
+          // error.
+          if (this.destroyed) return;
+          if (this._writableState.errored) {
+            if (this._endCallbacks === callbacks) this._endCallbacks = null;
+            for (const callback of callbacks.splice(0)) callback(this._writableState.errored);
             return;
           }
-          this._writableState.finished = true;
-          for (const callback of callbacks) callback(null);
-          this.emit("finish");
-          if (!this.readable) this._doClose();
+          if (!doneInCall) {
+            // The shutdown's completion came from the loop: 'finish' follows
+            // it, as node's does from its shutdown callback.
+            this._finish(callbacks);
+            return;
+          }
+          // Finished in the call: node's shutdown still completes from the
+          // loop -- libuv reports the request in its pending phase -- so
+          // 'finish' comes after every tick and microtask queued meanwhile
+          // and after the rest of the timer or immediate phase end() was
+          // called in (measured on v22.22.2; timerPending). Emitted from a
+          // microtask instead, it ran ahead of the ticks the caller queued
+          // after end() -- and of their resetAndDestroy(), which node
+          // refuses with EINVAL in that window.
+          this._finishPending = true;
+          natives.timerPending(() => {
+            this._finishPending = false;
+            if (!this.destroyed && !this._writableState.errored) this._finish(callbacks);
+          });
         });
         return this;
+      }
+
+      // node's finish(): the stream has finished -- the end() callbacks
+      // still waiting run, then 'finish', then a socket whose read side is
+      // done too closes.
+      _finish(callbacks) {
+        if (this._endCallbacks === callbacks) this._endCallbacks = null;
+        this._writableState.finished = true;
+        for (const callback of callbacks.splice(0)) callback(null);
+        this.emit("finish");
+        if (!this.readable) this._doClose();
       }
 
       // node's destroy(): the teardown is synchronous -- `destroyed`, the
@@ -25639,21 +25855,30 @@
         // settle the connect, so release the writes queued behind it (they
         // fail with ERR_SOCKET_CLOSED_BEFORE_CONNECTION).
         this._releaseHeldOps();
-        // node's Writable.destroy -> errorBuffer: the callbacks of an end()
-        // still waiting for 'finish' get the error (or ERR_STREAM_DESTROYED)
-        // on the next tick -- before 'close', not once the shutdown op,
-        // which may be queued behind a write, settles (#156). A socket that
-        // never connected keeps its path through the end() chain: node
-        // hands those callbacks the error of the write held behind the
-        // connect, which fails only once that write is released.
-        if (this._everConnected && this._endCallbacks !== null && this._endCallbacks.length > 0) {
-          const pending = this._endCallbacks.splice(0);
-          const endErr = err || codes.ERR_STREAM_DESTROYED("end");
-          for (const callback of pending) process.nextTick(callback, endErr);
-        }
-        this._endCallbacks = null;
         const rs = this._readableState;
         const ws = this._writableState;
+        // node's Writable.destroy -> errorBuffer: the callbacks of an end()
+        // still waiting for 'finish' get the stream's error (or
+        // ERR_STREAM_DESTROYED "Cannot call end after a stream was
+        // destroyed") on the next tick -- before 'close', not once the
+        // shutdown op, which may be queued behind a write, settles (#156).
+        // Read at that tick, as node's errorBuffer reads them: a 'finish'
+        // already queued (end() on a socket with no connection) takes them
+        // first. While a write is held behind the connect, node's
+        // errorBuffer waits for it: the write fails from 'close' and the
+        // callbacks after it (_failHeldWrites), so they stay where it finds
+        // them.
+        const endCallbacks = this._endCallbacks;
+        if (this._heldWrites === null) {
+          this._endCallbacks = null;
+          if (endCallbacks !== null && endCallbacks.length > 0) {
+            process.nextTick(() => {
+              for (const callback of endCallbacks.splice(0)) {
+                callback(ws.errored ?? codes.ERR_STREAM_DESTROYED("end"));
+              }
+            });
+          }
+        }
         rs.destroyed = ws.destroyed = true;
         // Deliberately NOT flipping rs.readable / ws.writable: Node never
         // mutates those state fields post-construction (they are
@@ -25661,7 +25886,12 @@
         // key off), and flipping them before emit('close') makes the
         // vendored end-of-stream skip its premature-close detection --
         // pipeline() would report success on a silently truncated transfer.
-        if (err) rs.errored = ws.errored = err;
+        // node's destroy keeps an error the stream already has (a write
+        // that failed for want of a handle).
+        if (err) {
+          if (!ws.errored) ws.errored = err;
+          if (!rs.errored) rs.errored = err;
+        }
         if (this._timeoutId !== null) {
           globalThis.clearTimeout(this._timeoutId);
           this._timeoutId = null;
@@ -25724,12 +25954,33 @@
         // concurrent reads of the same handle, and the loser rejects with
         // "read handle is gone". The in-flight loop sees _paused cleared and
         // simply carries on, which is what resume() wants anyway.
-        if (this._readLoopActive) return;
+        //
+        // A loop that has already decided to stop (paused, or its buffer
+        // full) is still "active" until its async frame unwinds, a microtask
+        // later -- and the resume() or read() that clears the condition in
+        // between (a tick: the held data's release) found it active and
+        // returned, so nothing read again: a socket paused with a full
+        // buffer never read past it after resume(). Such a call is
+        // remembered, and the loop starts again as it unwinds if it still
+        // may read.
+        if (this._readLoopActive) {
+          this._readLoopAgain = true;
+          return;
+        }
         this._readLoopActive = true;
         try {
           await this._readLoopBody();
         } finally {
           this._readLoopActive = false;
+          if (this._readLoopAgain) {
+            this._readLoopAgain = false;
+            if (
+              !this._readEofSeen && !this.destroyed && !this._paused && !this._readFull &&
+              this._handle !== null
+            ) {
+              this._readLoop();
+            }
+          }
         }
       }
 
@@ -25747,7 +25998,15 @@
           // that read like an EOF, and a destroyed socket emits neither
           // 'end' nor 'data' (node's handle stops reading in destroy()).
           if (this.destroyed) return;
+          // Paused while the read was parked (pause() from outside a 'data'
+          // listener -- a server's 'connection' listener, which runs with
+          // the first read already parked): what it brought is held, as
+          // node's paused stream buffers it, until resume(). Emitting it
+          // handed a paused socket's data to whoever listened then, or to
+          // nobody.
+          if (this._paused && !this._readableMode) this._holdData = true;
           if (chunk === undefined) {
+            this._readEofSeen = true;
             if (this._readableMode || this._holdData) {
               // Buffered or held: 'end' follows once what is left is read
               // (read() returns null), as node's does.
@@ -25793,8 +26052,12 @@
             // route the close through the write chain -- it sequences
             // AFTER the in-flight shutdown + 'finish'. Before the guard,
             // this path re-ran end() and closed via its duplicate chain
-            // (which also double-emitted 'finish').
-            this._chain = this._chain.then(() => this._doClose());
+            // (which also double-emitted 'finish'). A 'finish' still to
+            // come from the loop (see end()) closes the socket itself, as
+            // node's does once both sides are done.
+            this._chain = this._chain.then(() => {
+              if (this._finishPending !== true) this._doClose();
+            });
           } else {
             // node's endWritableNT: the auto end() waits a tick, so a write
             // an 'end' listener defers with process.nextTick still goes out
@@ -25961,7 +26224,9 @@
         this._releaseScheduled = true;
         process.nextTick(() => {
           this._releaseScheduled = false;
-          if (this._holdData && !this._readableMode) this._releaseHeld();
+          // Not into a socket pause()d since (node: a 'data' listener does
+          // not resume an explicitly paused stream).
+          if (this._holdData && !this._readableMode && !this._paused) this._releaseHeld();
         });
       }
       removeListener(type, listener) {
@@ -33131,6 +33396,21 @@
       return codes.ERR_SOCKET_CLOSED();
     }
     // A connect-syscall error in Node's shape (`connect EISCONN host:port -
+    // A net.Socket with no connection yet and no connect in flight (node:
+    // `!socket._handle`), which a TLSSocket over it waits on: it is
+    // `connecting` until that socket's 'connect' (node's _init), and its
+    // handshake starts then. Only oam's own net.Socket over TCP -- not a
+    // TLSSocket or a JSStreamSocket (a net.Socket over a JS stream, which
+    // is open from the start), whose handles are not TCP ones, nor an http
+    // client's stand-in, which holds a native connection in place of one.
+    function awaitsConnect(wrap) {
+      var NetSocket = registry.get("net").Socket;
+      return Object.prototype.isPrototypeOf.call(NetSocket.prototype, wrap) &&
+        wrap[registry._netNotTcpHandle] !== true &&
+        wrap._handle === null && !wrap.connecting &&
+        wrap[registry._netNativeConnection] === undefined;
+    }
+
     // Local (addr:port)`, code / errno / syscall / address / port), for the
     // one code the TLS path raises itself.
     function connectSyscallError(code, host, port, socket) {
@@ -33278,11 +33558,15 @@
       // 'connect'.
       _wrapOver(over) {
         var net = registry.get("net");
-        var wrap = over instanceof net.Socket ? over : new JSStreamSocket(over);
+        var isNetSocket = over instanceof net.Socket;
+        var wrap = isNetSocket ? over : new JSStreamSocket(over);
         this._wrappedSocket = wrap;
         this._handle = new TLSWrapHandle(wrap);
         this.allowHalfOpen = !!over.allowHalfOpen;
-        this.connecting = !!wrap.connecting;
+        // node's _init: over a net.Socket, connecting until that socket's
+        // 'connect' -- one still connecting, or one with no connection yet
+        // (no handle) that the caller connects later.
+        this.connecting = !!wrap.connecting || (isNetSocket && awaitsConnect(over));
         copyWrapAddresses(this, wrap);
       }
       // Readable EOF. `read(0)` after the null push is what Node's
@@ -33979,7 +34263,7 @@
         releaseContext();
         _settleTlsConnect(socket, connecting, name, options, rejectUnauthorized, identityCheck, name);
       };
-      if (wrap.connecting) {
+      if (wrap.connecting || awaitsConnect(wrap)) {
         wrap.once("connect", () => {
           if (socket.destroyed) return;
           socket.connecting = false;

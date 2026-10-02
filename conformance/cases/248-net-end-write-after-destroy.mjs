@@ -96,8 +96,8 @@ await run("connected", async () => {
 // while connecting, ERR_STREAM_DESTROYED on a connected one. With nothing
 // outstanding it is never called (the rows above). oam called none of these
 // callbacks. 'close' is reported apart: on a socket destroyed while
-// connecting, node's held write fails from its 'close' listener, after the
-// one here, and oam's before it (docs/node-divergences.md).
+// connecting, the held write fails from its 'close' listener, after the one
+// here (its order is case 261's).
 const outstanding = [
   ["write(cb); destroy(); end(cb)", (s, cb) => { s.write("x", cb("write")); s.destroy(); s.end(cb("end")); }],
   // With no callback, a write the connected socket takes whole inside the
@@ -151,6 +151,46 @@ for (const connected of [false, true]) {
   socket.destroy();
   fresh.destroy();
   console.log(`getters: ${log.join(" | ")}`);
+}
+
+// closed / errored / readableEnded / writableNeedDrain, node's Readable and
+// Writable getters (oam's net.Socket had none of them; `closed` read
+// undefined after destroy(), where node's is true at once).
+{
+  const state = (s) =>
+    `closed ${s.closed} errored ${describe(s.errored)} readableEnded ${s.readableEnded} needDrain ${s.writableNeedDrain}`;
+  const log = [];
+  const fresh = new net.Socket();
+  log.push(`fresh: ${state(fresh)}`);
+  fresh.destroy();
+  log.push(`fresh destroy(): ${state(fresh)}`);
+  const failed = net.connect(server.address().port, "127.0.0.1");
+  failed.on("error", () => {});
+  await new Promise((resolve) => failed.once("connect", resolve));
+  log.push(`connected: ${state(failed)}`);
+  failed.destroy(new Error("boom"));
+  log.push(`destroy(err): ${state(failed)}`);
+  await new Promise((resolve) => failed.once("close", resolve));
+  log.push(`after 'close': ${state(failed)}`);
+  // The peer ends: 'end', then the auto end() and the close.
+  // (The server may still be accepting the connections made above.)
+  const peers = [];
+  const onConnection = (p) => peers.push(p);
+  server.on("connection", onConnection);
+  const ended = net.connect(server.address().port, "127.0.0.1");
+  await new Promise((resolve) => ended.once("connect", resolve));
+  let peer;
+  while (!(peer = peers.find((p) => p.remotePort === ended.localPort))) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  server.off("connection", onConnection);
+  ended.resume();
+  peer.end();
+  await new Promise((resolve) => ended.once("end", resolve));
+  log.push(`after 'end': ${state(ended)}`);
+  await new Promise((resolve) => ended.once("close", resolve));
+  log.push(`after 'close': ${state(ended)}`);
+  console.log(`stream state: ${log.join(" | ")}`);
 }
 
 // The error objects themselves, not just code and message: node's coded
