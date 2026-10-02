@@ -161,6 +161,9 @@ seed();
 try {
   fs.rmSync(path.join(tree, "empty"));
 } catch (e) {
+  // The stack header names the code, as node's SystemError's does (review
+  // 3, finding 15: oam's read `SystemError: Path is a directory ...`).
+  console.log("stack header:", e.stack.split("\n")[0].split(tree).join("<tree>"));
   e.errno = 5;
   console.log("errno is an accessor over info:", e.info.errno, e.errno);
 }

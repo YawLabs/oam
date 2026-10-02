@@ -47,6 +47,18 @@ shape("fileURLToPath(http:)", () => url.fileURLToPath("http://example.invalid/x"
 shape("fileURLToPath(new URL(http:))", () => url.fileURLToPath(new URL("http://example.invalid/x")));
 shape("fileURLToPath encoded / (windows)", () => url.fileURLToPath("file:///C:/a%2fb", { windows: true }));
 shape("fileURLToPath encoded \\ (windows)", () => url.fileURLToPath("file:///C:/a%5cb", { windows: true }));
+// The own names in node's order: `input` before `message` (node's message
+// function sets it), as every refusal of a path has them.
+for (const [label, input] of [
+  ["encoded / (windows)", "file:///C:/a%2fb"],
+  ["encoded / (posix)", "file:///a%2fb"],
+]) {
+  try {
+    url.fileURLToPath(input, { windows: label.includes("windows") });
+  } catch (e) {
+    console.log(`fileURLToPath ${label} own names: ${Object.getOwnPropertyNames(e).join(",")}`);
+  }
+}
 shape("fileURLToPath no drive (windows)", () => url.fileURLToPath("file:///a/b", { windows: true }));
 shape("fileURLToPath encoded / (posix)", () => url.fileURLToPath("file:///a%2fb", { windows: false }));
 shape("fs.readFileSync(http URL)", () => fs.readFileSync(new URL("http://example.invalid/x")));

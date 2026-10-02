@@ -3049,27 +3049,34 @@ error factory. `url.fileURLToPath`'s refusals (`ERR_INVALID_URL_SCHEME`,
 given a URL that is not a `file:` one, `ERR_DIR_CLOSED` and `ERR_UNKNOWN_CREDENTIAL` come
 from the same registry (`conformance/cases/291-coded-errors-url-dir.mjs`; up to 0.17.1 they
 were built by hand on `Error.prototype` and rendered `Error: message`, the URL path and host
-ones as `Error`s). What is left: the `toString` on the prototype is oam's function, not
-node's source text; and `fs.cp` / `fs.cpSync` of a directory without `recursive` fails with
-`ERR_FS_CP_DIR_TO_NON_DIR` ("cp: -r not specified; omitting directory '...'"), where node's
-code is `ERR_FS_EISDIR` -- a `SystemError` (`info`, `errno`, `syscall`, `path`; "Path is a
-directory: cp returned EISDIR (... is a directory (not copied)) ...") from `cp` and
-`fs.promises.cp`, a plain `Error` ("Recursive option not enabled, cannot copy a directory:
-...", the path as node's C++ renders it) from `cpSync`. oam has no `SystemError` class yet.
-A directory copied onto something that exists and is not a directory, or a file onto a
-directory, fails as node's does before anything is copied and ahead of the `recursive` check:
-`ERR_FS_CP_DIR_TO_NON_DIR` / `ERR_FS_CP_NON_DIR_TO_DIR` (`conformance/cases/292-fs-cp-type-mismatch.mjs`;
-up to 0.17.1 oam failed on the directory's first entry with `ENOENT`, not at all when it was
-empty, and with `EPERM` for a file onto a directory). `cpSync`'s is node's to the byte -- a
-plain `Error` with `code` alone, the paths through `path.toNamespacedPath` as node hands them
-to its C++ (measured on Windows; on Linux and macOS that leaves them as given, not measured).
-`cp`'s and `fs.promises.cp`'s carry node's message, `info`, `errno`, `syscall` and `path`, but
-are not `SystemError`s: `name` is `Error`, not `SystemError`, the constructor is not
-`NodeError`, and `toString` and the stack header read `Error [ERR_FS_CP_...]` where node's
-read `SystemError [ERR_FS_CP_...]`; `errno`, `syscall` and `path` are data properties, where
-node's are accessors over `info`. Below the top of the tree node's `cpSync` copies in C++ and
-fails with the platform's own error (`EIO` "Access is denied." on Windows); oam's checks every
-entry as node's `cp` does, and throws the same coded error.
+ones as `Error`s). The refused URL is the error's `input`, set before its `message` as
+node's message function sets it (own names `stack`, `code`, `input`, `message`).
+
+node's `SystemError` -- the class of the codes node raises for a failure it decides itself
+but reports in a system error's terms -- is oam's too: `name` `SystemError`, `info` with
+`errno`, `syscall` and `path` as enumerable accessors over it, own names `stack`, `code`,
+`name`, `message`, `info`, `errno`, `syscall`, `path`, and `toString` and the stack header
+`SystemError [<code>]: <message>`. `fs.rm` of a directory raises one (`ERR_FS_EISDIR`), and so
+do `fs.cp` and `fs.promises.cp`: a directory without `recursive` is `ERR_FS_EISDIR` ("Path is
+a directory: cp returned EISDIR (... is a directory (not copied)) ..."), and a directory
+copied onto something that exists and is not a directory, or a file onto a directory,
+`ERR_FS_CP_DIR_TO_NON_DIR` / `ERR_FS_CP_NON_DIR_TO_DIR` -- before anything is copied, and
+ahead of the `recursive` check (`conformance/cases/292-fs-cp-type-mismatch.mjs`; up to 0.17.1
+oam failed on the directory's first entry with `ENOENT`, not at all when it was empty, and
+with `EPERM` for a file onto a directory, and its no-`recursive` error was
+`ERR_FS_CP_DIR_TO_NON_DIR` "cp: -r not specified; omitting directory '...'"). `cpSync`'s are
+node's to the byte -- a plain `Error` with `code` alone ("Recursive option not enabled,
+cannot copy a directory: ..." for a directory without `recursive`), the paths through
+`path.toNamespacedPath` as node hands them to its C++, a directory's with a trailing
+separator (measured on Windows; on Linux and macOS the paths are left as given, not
+measured).
+
+What is left: the `toString` on a coded error's prototype is oam's function, not node's
+source text; a `SystemError`'s constructor is `SystemError`, where node's `cp` errors answer
+`NodeError` (its `rm` error answers `SystemError`, as oam's); and below the top of the tree
+node's `cpSync` copies in C++ and fails with the platform's own error (`EIO` "Access is
+denied." on Windows), where oam's checks every entry as node's `cp` does and throws the same
+coded error.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 

@@ -1292,7 +1292,10 @@
     return 'Callback called multiple times';
   });
   // url.fileURLToPath's refusals: TypeErrors in node, as ERR_INVALID_URL_SCHEME.
-  codes.ERR_INVALID_FILE_URL_PATH = E("ERR_INVALID_FILE_URL_PATH", TypeError, function(msg) {
+  // `input`, the URL refused, is set before the message, as node's message
+  // function sets it: own keys stack, code, input, message.
+  codes.ERR_INVALID_FILE_URL_PATH = E("ERR_INVALID_FILE_URL_PATH", TypeError, function(msg, input) {
+    if (input !== undefined) this.input = input;
     return 'File URL path ' + msg;
   });
   codes.ERR_INVALID_FILE_URL_HOST = E("ERR_INVALID_FILE_URL_HOST", TypeError, function(platform) {
@@ -1318,7 +1321,10 @@
   // errno / syscall / path are enumerable accessors over it -- own keys
   // stack, code, name, message, info, errno, syscall, path, in that order.
   // toString() and the stack header read `SystemError [<key>]: <message>`,
-  // and util.inspect shows the accessors' values.
+  // and util.inspect shows the accessors' values. The header is
+  // bootstrap.js's Error.prepareStackTrace's, which renders a kIsNodeError
+  // error's from its name, code and message when the stack is first read.
+  const kIsNodeErrorBrand = globalThis.__oamKIsNodeError;
   class SystemError extends Error {
     constructor(key, prefix, context) {
       super();
@@ -1341,12 +1347,10 @@
       });
       if (context.path !== undefined) Object.defineProperty(this, "path", field("path"));
       if (context.dest !== undefined) Object.defineProperty(this, "dest", field("dest"));
-      try {
-        const stack = this.stack;
-        if (typeof stack === "string" && stack.startsWith("Error")) this.stack = this.toString() + stack.slice(5);
-      } catch {
-        // A throwing user Error.prepareStackTrace: the error is still whole.
-      }
+    }
+    // node's SystemError is kIsNodeError: its stack header names the code.
+    get [kIsNodeErrorBrand]() {
+      return true;
     }
     toString() {
       return `${this.name} [${this.code}]: ${this.message}`;
@@ -10951,21 +10955,34 @@
       return makeNodeError(code, `Cannot overwrite ${kept} ${ns(dest)} with ${copied} ${ns(src)}`);
     }
     // EISDIR is 21 and ENOTDIR 20 in every platform's os.constants.errno.
-    const info = {
+    return new SystemError(code, `Cannot overwrite ${kept} with ${copied}`, {
       message: `cannot overwrite ${kept} ${dest} with ${copied} ${src}`,
       path: dest,
       syscall: "cp",
       errno: srcIsDir ? 21 : 20,
       code: srcIsDir ? "EISDIR" : "ENOTDIR",
-    };
-    const err = codes[code](
-      `Cannot overwrite ${kept} with ${copied}: cp returned ${info.code} (${info.message}) ${dest}`,
-    );
-    err.info = info;
-    err.errno = info.errno;
-    err.syscall = info.syscall;
-    err.path = dest;
-    return err;
+    });
+  }
+
+  // A directory copied without `recursive` (measured on v22.22.2): cp's and
+  // fs.promises.cp's is node's SystemError ERR_FS_EISDIR naming the path as
+  // given; cpSync's, from its C++, a plain Error with `code` alone naming
+  // the path as it reaches the C++ -- on Windows namespaced and with a
+  // trailing separator (`\\?\C:\d\`). Off Windows the path is
+  // rendered as given to the C++, not measured.
+  function cpDirWithoutRecursive(src, sync) {
+    if (sync) {
+      const pathModule = registry.get("path");
+      const shown = process.platform === "win32" ? pathModule.toNamespacedPath(src) + pathModule.sep : src;
+      return makeNodeError("ERR_FS_EISDIR", "Recursive option not enabled, cannot copy a directory: " + shown);
+    }
+    return new SystemError("ERR_FS_EISDIR", "Path is a directory", {
+      message: `${src} is a directory (not copied)`,
+      path: src,
+      syscall: "cp",
+      errno: 21,
+      code: "EISDIR",
+    });
   }
 
   // The destination's stat for cpTypeMismatch: lstat, as node's (stat with
@@ -11014,7 +11031,7 @@
       var mismatch = cpTypeMismatch(raw.kind === "dir", await cpDestStat(natives, destStr, opts), srcStr, destStr, false);
       if (mismatch !== null) throw mismatch;
       if (raw.kind === "dir") {
-        if (!opts.recursive) throw makeNodeError("ERR_FS_CP_DIR_TO_NON_DIR", "cp: -r not specified; omitting directory '" + srcStr + "'");
+        if (!opts.recursive) throw cpDirWithoutRecursive(srcStr, false);
         try { await natives.fsMkdir(destStr, true); } catch (e) {}
         var entries = await natives.fsReaddir(srcStr);
         // node joins each entry's paths with path.join, so an error names
@@ -12213,7 +12230,7 @@
         var mismatch = cpTypeMismatch(raw.kind === "dir", cpDestStatSync(natives, destStr, opts), srcStr, destStr, true);
         if (mismatch !== null) throw mismatch;
         if (raw.kind === "dir") {
-          if (!opts.recursive) throw makeNodeError("ERR_FS_CP_DIR_TO_NON_DIR", "cpSync: -r not specified; omitting directory '" + srcStr + "'");
+          if (!opts.recursive) throw cpDirWithoutRecursive(srcStr, true);
           try { natives.fsMkdirSync(destStr, true); } catch (e) {}
           var entries = natives.fsReaddirSync(srcStr);
           var join = registry.get("path").join;
@@ -15605,11 +15622,7 @@
         throw codes.ERR_INVALID_URL_SCHEME("file");
       }
       // node's refusals of a path carry the URL as `input`.
-      const badPath = (msg) => {
-        const e = codes.ERR_INVALID_FILE_URL_PATH(msg);
-        e.input = url;
-        return e;
-      };
+      const badPath = (msg) => codes.ERR_INVALID_FILE_URL_PATH(msg, url);
       // options.windows forces win32/posix semantics regardless of host
       // (Node v22: fileURLToPath(path, { windows }), mirroring
       // pathToFileURL). `null` is explicitly allowed and means host default.

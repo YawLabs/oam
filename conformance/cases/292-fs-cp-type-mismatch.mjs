@@ -8,10 +8,14 @@
 // (checkPaths, and cpSyncCheckPaths for cpSync): ERR_FS_CP_DIR_TO_NON_DIR
 // and ERR_FS_CP_NON_DIR_TO_DIR, ahead of the `recursive` check, nothing
 // copied. cpSync's error is a plain Error with `code` alone and the paths
-// as node hands them to its C++ (path.toNamespacedPath); cp's carries
-// `info`, `errno`, `syscall` and `path` and names the paths as given.
-// (Its class, SystemError, oam does not have: docs/node-divergences.md,
-// "Coded errors", so the error's name is not printed.)
+// as node hands them to its C++ (path.toNamespacedPath); cp's is node's
+// SystemError -- `info`, `errno`, `syscall` and `path`, the paths as given,
+// its stack header `SystemError [<code>]`. A directory copied without
+// `recursive` is ERR_FS_EISDIR, a SystemError again for cp (review 3,
+// findings 18 and 25: oam's cp errors were plain Errors, and its
+// no-recursive one ERR_FS_CP_DIR_TO_NON_DIR `-r not specified`).
+// cpSync's no-recursive message names the path with a trailing separator,
+// so that one is printed relative only.
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -36,8 +40,11 @@ const describe = (e) => {
   if (e === undefined) return "ok";
   const fields = [
     `code ${e.code}`,
+    `name ${e.name}`,
     `message ${rel(e.message)}`,
     `keys ${Object.keys(e).join(",")}`,
+    `own ${Object.getOwnPropertyNames(e).join(",")}`,
+    `header ${rel(e.stack.split("\n")[0])}`,
     `plain Error ${Object.getPrototypeOf(e) === Error.prototype}`,
   ];
   if (e.info !== undefined) {
@@ -55,6 +62,7 @@ for (const [label, src, dest, options] of [
   ["dir onto a file, force false", "d", "f", { recursive: true, force: false }],
   ["file onto a dir", "f", "dd", {}],
   ["file onto a dir, recursive", "f", "dd", { recursive: true }],
+  ["dir, no recursive", "d", "new", {}],
 ]) {
   let failure;
   try {
