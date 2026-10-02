@@ -53,10 +53,62 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+thread_local! {
+    /// Set on a thread while it runs `Isolate::new` (see [`new_isolate`]).
+    /// Every post that thread makes in that span is for the isolate being
+    /// built, never for an older one.
+    static CREATING_ISOLATE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The isolate's queues for `key`, created on first use: V8 can post while
 /// `Isolate::new` is still running, before [`register`] has the address.
+///
+/// A closed entry is a dead isolate's tombstone. It stays mapped from
+/// [`Registration::close`] until [`Registration::drop`], which runs only
+/// after the isolate is disposed and freed, and it swallows any task posted
+/// for that isolate during its disposal. If the allocator hands the freed
+/// address to a new isolate inside that window, the new isolate's posts
+/// would land in the tombstone and be destroyed, and its loop would read a
+/// queue nothing runs. Only the thread building the new isolate can tell the
+/// two apart, because only that thread posts for an address the allocator
+/// has just handed out. So a post from that thread, and [`register`], swap a
+/// tombstone for a fresh queue. Any other thread's post to a tombstone is
+/// the dead isolate's and is still dropped.
 fn tasks_for(key: IsolateKey) -> Arc<IsolateTasks> {
-    lock(registry()).entry(key).or_default().clone()
+    queue_for(key, CREATING_ISOLATE.with(std::cell::Cell::get))
+}
+
+/// [`tasks_for`]'s registry step. `fresh_if_closed` replaces a closed entry
+/// with a new queue instead of returning it.
+fn queue_for(key: IsolateKey, fresh_if_closed: bool) -> Arc<IsolateTasks> {
+    use std::collections::hash_map::Entry;
+    match lock(registry()).entry(key) {
+        Entry::Occupied(mut slot) => {
+            if fresh_if_closed && slot.get().is_closed() {
+                slot.insert(Arc::default());
+            }
+            slot.get().clone()
+        }
+        Entry::Vacant(slot) => slot.insert(Arc::default()).clone(),
+    }
+}
+
+/// Build an isolate and register its task queues: the one way oam creates
+/// an isolate that runs on [`OamPlatform`].
+pub(crate) fn new_isolate(params: v8::CreateParams) -> (v8::OwnedIsolate, Registration) {
+    /// Clears the flag even if `Isolate::new` unwinds.
+    struct Creating;
+    impl Drop for Creating {
+        fn drop(&mut self) {
+            CREATING_ISOLATE.with(|flag| flag.set(false));
+        }
+    }
+    CREATING_ISOLATE.with(|flag| flag.set(true));
+    let creating = Creating;
+    let mut isolate = v8::Isolate::new(params);
+    drop(creating);
+    let registration = register(&mut isolate);
+    (isolate, registration)
 }
 
 /// The platform V8 is initialized with (see `init_platform_with_flags`).
@@ -199,6 +251,10 @@ impl IsolateTasks {
         }
     }
 
+    fn is_closed(&self) -> bool {
+        lock(&self.state).closed
+    }
+
     /// True when a posted task is waiting to run. One atomic load: this is
     /// the event loop's per-turn check.
     pub(crate) fn has_ready(&self) -> bool {
@@ -256,9 +312,11 @@ pub(crate) struct Registration {
     tasks: Arc<IsolateTasks>,
 }
 
-/// Register `isolate` (call right after `Isolate::new`, on its thread) and
-/// give its loop the handle to its tasks.
-pub(crate) fn register(isolate: &mut v8::OwnedIsolate) -> Registration {
+/// Register `isolate` (right after `Isolate::new`, on its thread; see
+/// [`new_isolate`]) and give its loop the handle to its tasks. A closed
+/// entry under its address is a predecessor's tombstone (see [`tasks_for`])
+/// and is replaced, so the new isolate never holds a closed queue.
+fn register(isolate: &mut v8::OwnedIsolate) -> Registration {
     // SAFETY: as_raw_isolate_ptr only reads the isolate's address; it is
     // used as an opaque map key, compared against the address V8 passes to
     // the PlatformImpl callbacks, and never dereferenced. UnsafeRawIsolatePtr
@@ -266,7 +324,7 @@ pub(crate) fn register(isolate: &mut v8::OwnedIsolate) -> Registration {
     let key = unsafe {
         std::mem::transmute::<v8::UnsafeRawIsolatePtr, *mut c_void>(isolate.as_raw_isolate_ptr())
     } as IsolateKey;
-    let tasks = tasks_for(key);
+    let tasks = queue_for(key, true);
     isolate.set_slot(PlatformTasks(tasks.clone()));
     Registration { key, tasks }
 }
@@ -377,5 +435,88 @@ impl Timer {
                     .unwrap_or_else(|poisoned| poisoned.into_inner()),
             };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Odd keys: a real isolate's address is aligned, so these never collide
+    // with an isolate another test in this process is running.
+    fn entry(key: IsolateKey) -> Option<Arc<IsolateTasks>> {
+        lock(registry()).get(&key).cloned()
+    }
+
+    /// The freed address of a disposed isolate is reused before its
+    /// Registration drops: the new isolate must get a live queue, and the old
+    /// Registration must leave it mapped.
+    #[test]
+    fn a_reused_address_never_inherits_a_closed_queue() {
+        let key: IsolateKey = 0x0bad_0001;
+        let old = Registration {
+            key,
+            tasks: queue_for(key, true),
+        };
+        old.close();
+
+        // The dead isolate's own disposal-time posts still hit its tombstone.
+        let late = queue_for(key, false);
+        assert!(Arc::ptr_eq(&late, &old.tasks));
+        assert!(late.is_closed());
+
+        // The new isolate's thread, inside Isolate::new, gets a fresh queue...
+        CREATING_ISOLATE.with(|flag| flag.set(true));
+        let early = tasks_for(key);
+        CREATING_ISOLATE.with(|flag| flag.set(false));
+        assert!(!early.is_closed());
+        assert!(!Arc::ptr_eq(&early, &old.tasks));
+
+        // ...and register() hands it that same queue.
+        let new_tasks = queue_for(key, true);
+        assert!(Arc::ptr_eq(&new_tasks, &early));
+
+        drop(old);
+        let mapped = entry(key).expect("the new isolate's queue stays mapped");
+        assert!(Arc::ptr_eq(&mapped, &new_tasks));
+
+        drop(Registration {
+            key,
+            tasks: new_tasks,
+        });
+        assert!(entry(key).is_none());
+    }
+
+    /// register() alone (no post during Isolate::new) also replaces the
+    /// tombstone.
+    #[test]
+    fn register_replaces_a_tombstone_without_an_early_post() {
+        let key: IsolateKey = 0x0bad_0003;
+        let old = Registration {
+            key,
+            tasks: queue_for(key, true),
+        };
+        old.close();
+        let new_tasks = queue_for(key, true);
+        assert!(!new_tasks.is_closed());
+        assert!(!Arc::ptr_eq(&new_tasks, &old.tasks));
+        drop(old);
+        assert!(entry(key).is_some_and(|tasks| Arc::ptr_eq(&tasks, &new_tasks)));
+        drop(Registration {
+            key,
+            tasks: new_tasks,
+        });
+        assert!(entry(key).is_none());
+    }
+
+    /// Outside isolate creation, a live entry is shared, not replaced.
+    #[test]
+    fn a_live_queue_is_reused() {
+        let key: IsolateKey = 0x0bad_0005;
+        let first = queue_for(key, false);
+        assert!(Arc::ptr_eq(&first, &tasks_for(key)));
+        assert!(Arc::ptr_eq(&first, &queue_for(key, true)));
+        drop(Registration { key, tasks: first });
+        assert!(entry(key).is_none());
     }
 }

@@ -522,8 +522,7 @@ impl JsRuntime {
         // requested cap -- this is the knob Node's --max-old-space-size maps
         // to -- so OAM_MAX_HEAP_MB=64 actually caps around 64 MB.
         params = params.set_max_old_generation_size_in_bytes(max_bytes);
-        let mut isolate = v8::Isolate::new(params);
-        let platform_tasks = platform::register(&mut isolate);
+        let (mut isolate, platform_tasks) = platform::new_isolate(params);
         // EXPLICIT microtask policy (docs/design/nexttick-engine.md): under
         // the default auto policy V8 flushes the microtask queue itself
         // whenever the API call depth reaches zero -- BEFORE the host can
