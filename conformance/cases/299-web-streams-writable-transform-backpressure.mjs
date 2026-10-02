@@ -276,3 +276,23 @@ for (const s of [1, null, "x"]) {
   try { new ReadableStream({}, { size: s }); console.log("rs size", s, "ok"); } catch (e) { console.log("rs size", s, err(e)); }
   try { new WritableStream({}, { size: s }); console.log("ws size", s, "ok"); } catch (e) { console.log("ws size", s, err(e)); }
 }
+
+// Fractional sizes: the queue total drops by each size, floored at 0 and not
+// reset when the queue empties, so the rounding shows as it does in node.
+{
+  let c;
+  const rs = new ReadableStream({ start(x) { c = x; } }, { highWaterMark: 1, size: (v) => v });
+  c.enqueue(0.1); c.enqueue(0.2); c.enqueue(0.3);
+  const r = rs.getReader();
+  const seen = [c.desiredSize];
+  for (let i = 0; i < 3; i++) { await r.read(); seen.push(c.desiredSize); }
+  console.log("readable desiredSize", seen.join(" "));
+}
+{
+  const w = new WritableStream({ write() { return new Promise((r) => setTimeout(r, 1)); } }, { highWaterMark: 1, size: (v) => v }).getWriter();
+  const seen = [];
+  const ps = [w.write(0.1), w.write(0.2), w.write(0.3)];
+  seen.push(w.desiredSize);
+  for (const p of ps) { await p; seen.push(w.desiredSize); }
+  console.log("writable desiredSize", seen.join(" "));
+}

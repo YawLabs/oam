@@ -4609,6 +4609,48 @@ fn readable_stream_core_and_text_pipeline() {
     assert_eq!(lines[4], "xy xy");
 }
 
+/// The web streams' queues dequeue in O(1). They were drained with
+/// Array#shift, which is O(n) here, so any queue a producer ran ahead of went
+/// quadratic: 160k writer.write() calls issued without awaiting took 45 s
+/// on a debug build, and 300k took 143 s. With an O(1) dequeue, 200k of each
+/// takes well under a second. The checks cover a writable's chunk and
+/// write-request queues, a readable's chunk queue, and its pending reads.
+#[test]
+fn web_stream_queues_drain_in_linear_time() {
+    let started = std::time::Instant::now();
+    let stdout = run_ok(
+        "streams_linear_queues.mjs",
+        "const N = 200000;\n\
+         let written = 0;\n\
+         const w = new WritableStream({ write() { written++; } }).getWriter();\n\
+         let last;\n\
+         for (let i = 0; i < N; i++) last = w.write(i);\n\
+         await last;\n\
+         await w.close();\n\
+         let c;\n\
+         const rs = new ReadableStream({ start(x) { c = x; } }, { highWaterMark: Infinity });\n\
+         for (let i = 0; i < N; i++) c.enqueue(i);\n\
+         c.close();\n\
+         const r = rs.getReader();\n\
+         let read = 0;\n\
+         while (!(await r.read()).done) read++;\n\
+         let d;\n\
+         const rs2 = new ReadableStream({ start(x) { d = x; } });\n\
+         const r2 = rs2.getReader();\n\
+         const pending = [];\n\
+         for (let i = 0; i < N; i++) pending.push(r2.read());\n\
+         for (let i = 0; i < N; i++) d.enqueue(i);\n\
+         const last2 = await pending[N - 1];\n\
+         console.log(written, read, last2.value);",
+    );
+    assert_eq!(stdout, "200000 200000 199999");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "draining 200k-item stream queues took {:?}",
+        started.elapsed()
+    );
+}
+
 #[test]
 fn fetch_body_streams_incrementally() {
     let addr = spawn_echo_server();

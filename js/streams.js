@@ -96,6 +96,65 @@
   const readerReleasingError = () => (releasingError ??= invalidState("Releasing reader"));
   const writerReleasedError = () => (writerReleased ??= invalidState("Writer has been released"));
 
+  // The streams' FIFOs -- a stream's chunk queue, its pending reads, a
+  // writable's write requests -- with an O(1) shift. Array#shift is O(n) in
+  // this engine (it moves every element left), so a queue drained by
+  // shift() went quadratic as soon as a producer ran ahead of its consumer:
+  // 160k unawaited writer.write() calls took 45 s. A head index walks the
+  // backing array instead, and the consumed prefix is dropped when the
+  // queue empties or once it is at least half the array (amortized O(1)).
+  // Each item's size sits alongside it, and the queue keeps the total (the
+  // standard's [[queueTotalSize]]), so size() is never called again at
+  // dequeue.
+  class Queue {
+    constructor() {
+      this._items = [];
+      this._sizes = [];
+      this._head = 0;
+      this.totalSize = 0;
+    }
+    get length() {
+      return this._items.length - this._head;
+    }
+    peek() {
+      return this._items[this._head];
+    }
+    push(item, size = 0) {
+      this._items.push(item);
+      this._sizes.push(size);
+      this.totalSize += size;
+    }
+    // node's DequeueValue: the total drops by the item's size, floored at 0
+    // (and not reset when the queue empties, so rounding shows as node's).
+    shift() {
+      const items = this._items;
+      const sizes = this._sizes;
+      const head = this._head;
+      if (head === items.length) return undefined;
+      const item = items[head];
+      this.totalSize = Math.max(0, this.totalSize - sizes[head]);
+      if (head + 1 === items.length) {
+        items.length = 0;
+        sizes.length = 0;
+        this._head = 0;
+      } else if (head >= 1024 && head * 2 >= items.length) {
+        this._items = items.slice(head + 1);
+        this._sizes = sizes.slice(head + 1);
+        this._head = 0;
+      } else {
+        items[head] = undefined;
+        this._head = head + 1;
+      }
+      return item;
+    }
+    clear() {
+      this._items = [];
+      this._sizes = [];
+      this._head = 0;
+      this.totalSize = 0;
+    }
+  }
+
   // node's extractHighWaterMark: `+value`, and NaN or negative is a
   // RangeError ERR_INVALID_ARG_VALUE (a number inspects as String() does;
   // -0 is not negative).
@@ -191,13 +250,11 @@
   }
 
   function initReadable(stream, highWaterMark, sizeFn, isBytes = false) {
-    stream._queue = [];
-    stream._queueSizes = [];
-    stream._queueTotalSize = 0;
+    stream._queue = new Queue();
     stream._state = "readable"; // readable | closed | errored
     stream._error = undefined;
     stream._reader = null; // the active default reader (lock)
-    stream._waiters = []; // pending read() resolvers: {resolve, reject}
+    stream._waiters = new Queue(); // pending read() resolvers: {resolve, reject}
     stream._highWaterMark = highWaterMark;
     stream._sizeFn = sizeFn;
     // A `type: 'bytes'` stream: its controller enqueues only
@@ -254,7 +311,7 @@
   function readableDesiredSize(stream) {
     if (stream._state === "errored") return null;
     if (stream._state === "closed") return 0;
-    return stream._highWaterMark - stream._queueTotalSize;
+    return stream._highWaterMark - stream._queue.totalSize;
   }
 
   function readableShouldCallPull(stream) {
@@ -299,17 +356,13 @@
         readableError(stream, error);
         throw error;
       }
-      stream._queue.push(chunk);
-      stream._queueSizes.push(size);
-      stream._queueTotalSize += size;
+      stream._queue.push(chunk, size);
     }
     readableCallPullIfNeeded(stream);
   }
 
   function resetReadableQueue(stream) {
-    stream._queue = [];
-    stream._queueSizes = [];
-    stream._queueTotalSize = 0;
+    stream._queue.clear();
   }
 
   function readableClearAlgorithms(stream) {
@@ -459,7 +512,6 @@
           }
           if (stream._queue.length > 0) {
             const value = stream._queue.shift();
-            stream._queueTotalSize = Math.max(0, stream._queueTotalSize - stream._queueSizes.shift());
             if (stream._closeRequested && stream._queue.length === 0) {
               readableClearAlgorithms(stream);
               readableClose(stream);
@@ -528,7 +580,7 @@
 
     tee() {
       const reader = this.getReader();
-      const queues = [[], []];
+      const queues = [new Queue(), new Queue()];
       let pulling = null;
       const makeBranch = (index) =>
         new ReadableStream({
@@ -613,9 +665,7 @@
   class WritableStreamDefaultController {
     constructor(stream, highWaterMark, sizeFn) {
       this._stream = stream;
-      this._queue = [];
-      this._queueSizes = [];
-      this._queueTotalSize = 0;
+      this._queue = new Queue();
       this._highWaterMark = highWaterMark;
       this._sizeFn = sizeFn;
       this._started = false;
@@ -656,7 +706,7 @@
     stream._storedError = undefined;
     stream._writer = undefined;
     stream._controller = undefined;
-    stream._writeRequests = [];
+    stream._writeRequests = new Queue();
     stream._inFlightWriteRequest = undefined;
     stream._closeRequest = undefined;
     stream._inFlightCloseRequest = undefined;
@@ -797,12 +847,10 @@
   function writableFinishErroring(stream) {
     stream._state = "errored";
     const controller = stream._controller;
-    controller._queue = [];
-    controller._queueSizes = [];
-    controller._queueTotalSize = 0;
+    controller._queue.clear();
     const storedError = stream._storedError;
-    for (const request of stream._writeRequests) request.reject(storedError);
-    stream._writeRequests = [];
+    const writeRequests = stream._writeRequests;
+    while (writeRequests.length > 0) writeRequests.shift().reject(storedError);
     const abortRequest = stream._pendingAbortRequest;
     if (abortRequest === undefined) {
       writableRejectCloseAndClosedPromiseIfNeeded(stream);
@@ -889,7 +937,7 @@
   }
 
   function writableDesiredSize(controller) {
-    return controller._highWaterMark - controller._queueTotalSize;
+    return controller._highWaterMark - controller._queue.totalSize;
   }
 
   function writableGetBackpressure(controller) {
@@ -913,9 +961,7 @@
       writableControllerErrorIfNeeded(controller, error);
       return;
     }
-    controller._queue.push(chunk);
-    controller._queueSizes.push(chunkSize);
-    controller._queueTotalSize += chunkSize;
+    controller._queue.push(chunk, chunkSize);
     const stream = controller._stream;
     if (!writableCloseQueuedOrInFlight(stream) && stream._state === "writable") {
       writableUpdateBackpressure(stream, writableGetBackpressure(controller));
@@ -924,14 +970,12 @@
   }
 
   function writableControllerClose(controller) {
-    controller._queue.push(CLOSE_SENTINEL);
-    controller._queueSizes.push(0);
+    controller._queue.push(CLOSE_SENTINEL, 0);
     writableAdvanceQueueIfNeeded(controller);
   }
 
   function writableDequeue(controller) {
     controller._queue.shift();
-    controller._queueTotalSize = Math.max(0, controller._queueTotalSize - controller._queueSizes.shift());
   }
 
   function writableAdvanceQueueIfNeeded(controller) {
@@ -942,7 +986,7 @@
       return;
     }
     if (controller._queue.length === 0) return;
-    const value = controller._queue[0];
+    const value = controller._queue.peek();
     if (value === CLOSE_SENTINEL) writableProcessClose(controller);
     else writableProcessWrite(controller, value);
   }
