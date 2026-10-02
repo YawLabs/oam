@@ -6950,14 +6950,13 @@ fn op_fs_mkdtemp(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let prefix = arg_string(scope, &args, 0).unwrap_or_default();
-    // As in the sync twin: check the resolved target, not the prefix -- and
-    // hand that same resolved path to the op so the checked path IS the
-    // created path (resolving twice would mint two different timestamps).
-    let dir = oam_core::ops::mkdtemp_target(&prefix);
-    if !check_write_perm(scope, &dir.to_string_lossy()) {
+    // As in the sync twin: the template is checked, and that same template
+    // goes to the op.
+    let template = oam_core::mkdtemp_template(&prefix);
+    if !check_write_perm(scope, &template) {
         return;
     }
-    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_mkdtemp(dir, prefix));
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_mkdtemp(template));
 }
 
 fn op_fs_symlink(
@@ -7170,22 +7169,21 @@ fn op_fs_mkdtemp_sync(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let prefix = arg_string(scope, &args, 0).unwrap_or_default();
-    // Gate the directory that is actually created, not the prefix: with a
-    // relative prefix the two are different paths (the prefix resolves under
-    // the system temp dir), so checking the prefix denied writes inside a
-    // correctly-granted temp dir.
-    let dir = oam_core::ops::mkdtemp_target(&prefix);
-    if !check_write_perm(scope, &dir.to_string_lossy()) {
+    // node's binding checks write permission on the template it hands libuv
+    // (prefix + XXXXXX, unresolved): the directory is created beside it.
+    let template = oam_core::mkdtemp_template(&prefix);
+    if !check_write_perm(scope, &template) {
         return;
     }
-    match std::fs::create_dir(&dir) {
-        Ok(()) => {
-            let text = oam_core::strip_unc_prefix(&dir);
-            if let Some(value) = v8::String::new(scope, &text) {
+    match oam_core::mkdtemp(&template) {
+        Ok(dir) => {
+            if let Some(value) = v8::String::new(scope, &dir) {
                 rv.set(value.into());
             }
         }
-        Err(e) => throw_node_error_as_passed(scope, "mkdtemp", &prefix, &e),
+        // node's sync error names the template on every platform, never
+        // the name mkdtemp(3) last tried (see `oam_core::mkdtemp`).
+        Err((e, _)) => throw_node_error_as_passed(scope, "mkdtemp", &template, &e),
     }
 }
 

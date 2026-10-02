@@ -104,6 +104,13 @@ rustls-webpki = { version = "0.103", default-features = false, features = ["ring
 # "all" for the fetch connector's keepalive probe count and TCP_USER_TIMEOUT;
 # hyper-util already builds socket2 with it.
 socket2 = { version = "0.6", features = ["all"] }
+# fs.mkdtemp's names (lib.rs `mkdtemp`): the OS CSPRNG, as libuv draws them
+# from RtlGenRandom and glibc from getrandom(2).
+#
+# NOT new supply chain: getrandom 0.3 already compiles in the graph as
+# oam_engine's node:crypto randomness, on the same version. A new dependency
+# EDGE onto a crate already being built.
+getrandom = { workspace = true }
 
 # Windows extra-fd stdio: raw CreateProcessW + lpReserved2 CRT fd-table so a
 # child (Chromium --remote-debugging-pipe) gets numbered fds 3/4 for CDP. std

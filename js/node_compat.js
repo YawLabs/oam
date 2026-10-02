@@ -10447,6 +10447,34 @@
     return options;
   }
 
+  // node's mkdtemp prologue, the same in mkdtempSync, fs.mkdtemp and
+  // fs/promises.mkdtemp (v22.22.2): getOptions first, so a bad encoding is
+  // refused before a bad prefix; then the prefix (getValidatedPath: a
+  // string, Buffer or file: URL, no NUL byte); then, once per process,
+  // warnOnNonPortableTemplate for a template ending in "X" -- on every
+  // platform, Windows included. Returns [prefix, encoding].
+  let mkdtempWarnNonPortable = true;
+  function mkdtempArgs(prefix, options) {
+    const { encoding } = fsGetOptions(options, {});
+    prefix = toPath(prefix, "prefix");
+    if (mkdtempWarnNonPortable && prefix.endsWith("X")) {
+      mkdtempWarnNonPortable = false;
+      process.emitWarning(
+        "mkdtemp() templates ending with X are not portable. For details see: https://nodejs.org/api/fs.html",
+      );
+    }
+    return [prefix, encoding];
+  }
+
+  // The created path as node's binding returns it (StringBytes::Encode
+  // over the path's UTF-8 bytes): a string by default and for utf8, a
+  // Buffer for "buffer", the bytes spelled in any other encoding.
+  function mkdtempResult(dir, encoding) {
+    if (!encoding || encoding === "utf8" || encoding === "utf-8") return dir;
+    const bytes = globalThis.Buffer.from(dir, "utf8");
+    return encoding === "buffer" ? bytes : bytes.toString(encoding);
+  }
+
   // The options of writeFile / appendFile in every form -- sync, callback,
   // fs/promises and FileHandle -- checked as node's are, and before the data:
   // getOptions over the call's defaults, then `options.flush` a boolean.
@@ -11147,7 +11175,10 @@
       _globAsPromise: (pattern, options) => Promise.resolve().then(() => globSyncRaw(pattern, options, natives)),
       access: (path, mode) => natives.fsAccess(toPath(path), mode ?? 0),
       realpath: (path) => natives.fsRealpath(toPath(path)),
-      mkdtemp: (prefix) => natives.fsMkdtemp(toPath(prefix, "prefix")),
+      mkdtemp: (prefix, options) => {
+        const [valid, encoding] = mkdtempArgs(prefix, options);
+        return natives.fsMkdtemp(valid).then((dir) => mkdtempResult(dir, encoding));
+      },
       symlink: (target, path) => natives.fsSymlink(toPath(target, "target"), toPath(path)),
       readlink: (path) => natives.fsReadlink(toPath(path)),
       link: (existing, newPath) =>
@@ -11986,6 +12017,7 @@
     const readFileByPath = callbackify1(promises.readFile, 2);
     // realpathArg runs inside, so the callback is checked before the path.
     const realpathByPath = callbackify1((p) => realpathWalking(realpathArg(p)), 1);
+    const mkdtempByPrefix = callbackify1(promises.mkdtemp, 1, 1);
     const truncateByPath = callbackify1(promises.truncate, 2);
     const chmodByPath = callbackify1(promises.chmod, 2);
 
@@ -12140,7 +12172,10 @@
           throw realpathWalkErrorSync(file, e);
         }
       },
-      mkdtempSync: (prefix) => natives.fsMkdtempSync(toPath(prefix, "prefix")),
+      mkdtempSync: (prefix, options) => {
+        const [valid, encoding] = mkdtempArgs(prefix, options);
+        return mkdtempResult(natives.fsMkdtempSync(valid), encoding);
+      },
       symlinkSync: (target, path) => natives.fsSymlinkSync(toPath(target, "target"), toPath(path)),
       readlinkSync: (path) => natives.fsReadlinkSync(toPath(path)),
       linkSync: (existing, newPath) =>
@@ -12298,7 +12333,11 @@
         if (typeof options === "function") { cb = options; options = undefined; }
         realpathByPath(path, cb);
       },
-      mkdtemp: callbackify1(promises.mkdtemp, 1, 1),
+      // Named parameters for node's length (3); the callback is checked
+      // first, then the options and prefix (mkdtempArgs).
+      mkdtemp: function mkdtemp(prefix, options, callback) {
+        return mkdtempByPrefix(...arguments);
+      },
       symlink: callbackify1(promises.symlink, CB_LAST),
       readlink: callbackify1(promises.readlink, 1, 1),
       link: callbackify1(promises.link, 2),

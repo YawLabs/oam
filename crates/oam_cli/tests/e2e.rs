@@ -16928,11 +16928,11 @@ fn fs_mkdtemp_symlink_readlink_link_chmod_truncate() {
          import os from 'node:os';\n\
          \n\
          // mkdtemp (sync)\n\
-         const dir = fs.mkdtempSync('oam-test-');\n\
+         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-test-'));\n\
          console.log('mkdtempSync:', dir.includes('oam-test-'));\n\
          \n\
          // mkdtemp (async)\n\
-         const dir2 = await fsp.mkdtemp('oam-async-');\n\
+         const dir2 = await fsp.mkdtemp(path.join(os.tmpdir(), 'oam-async-'));\n\
          console.log('mkdtemp:', dir2.includes('oam-async-'));\n\
          \n\
          // write a file for testing\n\
@@ -17783,7 +17783,7 @@ fn fs_promises_open_file_handle() {
          import path from 'node:path';\n\
          import os from 'node:os';\n\
          \n\
-         const dir = await fsp.mkdtemp('oam-fh-');\n\
+         const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'oam-fh-'));\n\
          const filePath = path.join(dir, 'test.txt');\n\
          \n\
          // Open for write\n\

@@ -3091,6 +3091,28 @@ node's `cpSync` copies in C++ and fails with the platform's own error (`EIO` "Ac
 denied." on Windows), where oam's checks every entry as node's `cp` does and throws the same
 coded error.
 
+### `fs.mkdtemp`: what still differs
+
+`mkdtempSync`, `fs.mkdtemp` and `fs/promises.mkdtemp` follow node v22.22.2's binding and
+libuv's `uv_fs_mkdtemp`: the prefix as given (relative to the cwd, never joined to
+`os.tmpdir()`), six characters of `[A-Za-z0-9]` from the OS CSPRNG, a fresh name only when
+the last one exists, the options and prefix checks in node's order, the result in the
+encoding asked for, the once-per-process warning for a template ending in `X`, and the path
+each failure names (`conformance/cases/302-*`, `303-*`; up to 0.17.1 oam appended a 19-digit
+timestamp and created relative prefixes under the temp directory). Measured on Windows,
+what is left:
+
+- **A Buffer prefix that is not UTF-8** is decoded to a string first, so a byte like `0xff`
+  becomes U+FFFD: oam creates `a�-AbC123` where node on Windows fails `ENOENT`
+  (libuv cannot convert the bytes) and node on Linux creates a name holding the raw byte.
+  Every `fs` path argument shares this decode; a Buffer that is valid UTF-8 behaves as node's.
+- **A Windows template longer than `MAX_PATH`.** node hands libuv the template unresolved and
+  without the `\\?\` prefix it adds to other `fs` paths, so `CreateDirectoryW` fails
+  `ENOENT` once the full path passes the legacy limit (a 300-character prefix, absolute or
+  relative, on a machine with `LongPathsEnabled`). oam creates the directory: Rust's
+  `create_dir` lengthens such paths itself. Refusing a path the file system accepts was not
+  worth reproducing.
+
 ### `fs.realpath` under `--permission` — oam is stricter
 
 Measured against Node v22.22.2: with `--permission` and no grants, node allows
@@ -3307,6 +3329,12 @@ comment, **not** something measured. Do not rely on either the claim or its nega
   `-3008`), the row `WSAHOST_NOT_FOUND` uses. libuv's table has no row for it, so its generic
   translation would say `ENOENT` (`-4058`); the code could not be triggered on the dev box to
   see what Node shows. _(source: `crates/oam_core/src/net_connect.rs` `classify_resolve`)_
+- **`fs.mkdtemp` on Linux and macOS.** Derived from libuv, glibc and node source, not run:
+  an async failure names the last name mkdtemp(3) tried (`mkdtemp 'nope/x-AbC123'`) where
+  Windows names the template, and the sync one names the template everywhere. On macOS an
+  empty prefix (node's binding passes `XXXXX`, five X's) may be accepted by the libc's
+  mkdtemp(3), where oam refuses it `EINVAL` as glibc and Windows do; case 302 skips that line
+  on darwin until it is measured.
 - **`oam run --record` / `--replay`** may not capture `crypto.getRandomValues` /
   `randomUUID`, or wall-clock reads inside timer callbacks.
 

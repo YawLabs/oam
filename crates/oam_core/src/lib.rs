@@ -2416,6 +2416,132 @@ pub fn fs_error_path(path: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(path)
 }
 
+/// The template node's binding hands libuv for `mkdtemp(prefix)` (src/
+/// node_file.cc `Mkdtemp`, v22.22.2): the prefix as given -- NOT resolved,
+/// not joined to any temp directory -- with the `XXXXXX` libuv replaces.
+///
+/// The binding appends the X's with `snprintf(out + len, len + 6, "%s",
+/// "XXXXXX")`, whose size bound is the length of the WHOLE buffer, so an
+/// empty prefix gets only five X's and libuv refuses the template: node's
+/// `mkdtempSync("")` fails `EINVAL: invalid argument, mkdtemp 'XXXXX'`. That
+/// quirk is reproduced here rather than in `mkdtemp`, so the permission check
+/// and the error name the same template node's do.
+pub fn mkdtemp_template(prefix: &str) -> String {
+    let x_count = if prefix.is_empty() { 5 } else { 6 };
+    let mut template = String::with_capacity(prefix.len() + 6);
+    template.push_str(prefix);
+    template.push_str(&"XXXXXX"[..x_count]);
+    template
+}
+
+/// What libuv's mkdtemp puts in place of the template's `XXXXXX`: six
+/// characters of [a-zA-Z0-9], the alphabet of libuv's Windows `fs__make_tmp`
+/// and glibc's `__gen_tempname` alike.
+const MKDTEMP_CHARS: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+/// How many names mkdtemp tries before giving up: the platform's `TMP_MAX`,
+/// as libuv's Windows loop and glibc's both count -- 32767 in the MSVC CRT,
+/// 62^3 in glibc. macOS's libc keeps trying past that; a run of 238328
+/// collisions is not a case anyone reaches.
+#[cfg(windows)]
+const MKDTEMP_TRIES: u32 = 32767;
+#[cfg(not(windows))]
+const MKDTEMP_TRIES: u32 = 238_328;
+
+/// node's `mkdtemp` (libuv `uv_fs_mkdtemp`), the one implementation the sync
+/// op and the async op both run: `template` (from `mkdtemp_template`) must
+/// end in `XXXXXX` or the call fails EINVAL; each try replaces those six
+/// characters with fresh ones from the OS CSPRNG -- one 64-bit draw spelled
+/// in base 62, libuv's Windows scheme -- and creates that directory, trying
+/// again only when the name already exists. The directory is made 0700 on
+/// Unix, as mkdtemp(3) makes it.
+///
+/// Ok is the created path: the template with its X's replaced, separators and
+/// relativity exactly as given (node returns `sub/x-AbC123` for `sub/x-`).
+/// Err carries the path libuv's request holds afterwards (`req->path`), which
+/// is what node's ASYNC error names. On Windows (`fs__mktemp`) libuv writes
+/// the name back only on success, so a failed CreateDirectoryW leaves the
+/// template (`mkdtemp 'nope/x-XXXXXX'`), and a template without six X's, a
+/// failed RtlGenRandom or running out of tries "clobbers" it to the empty
+/// string (`mkdtemp ''`). On Unix mkdtemp(3) fills libuv's copy in place
+/// before creating, so a failed create leaves the last name tried, and a
+/// template without six X's is refused untouched. node's SYNC error names
+/// the template on every platform (`FSReqWrapSync::path_p` is the binding's
+/// own buffer, which libuv never writes), so the sync op ignores this path.
+/// Running out of tries fails EEXIST on both (glibc's answer, and on Windows
+/// the ERROR_ALREADY_EXISTS still in GetLastError); at one collision in 62^6
+/// per try, nothing gets that far.
+pub fn mkdtemp(template: &str) -> Result<String, (std::io::Error, String)> {
+    // libuv reports a failed RtlGenRandom as EIO; io::Error::other is what
+    // node_error_code reads as EIO.
+    mkdtemp_drawing(template, MKDTEMP_TRIES, || {
+        getrandom::u64().map_err(|e| std::io::Error::other(e.to_string()))
+    })
+}
+
+/// `mkdtemp` over a given number of tries and a given source of 64-bit
+/// draws, so the tests can force collisions.
+fn mkdtemp_drawing(
+    template: &str,
+    tries: u32,
+    mut next_draw: impl FnMut() -> std::io::Result<u64>,
+) -> Result<String, (std::io::Error, String)> {
+    let Some(stem) = template.strip_suffix("XXXXXX") else {
+        let e = std::io::Error::from(std::io::ErrorKind::InvalidInput);
+        return Err((e, mkdtemp_refused_path(template)));
+    };
+    let mut path = String::with_capacity(template.len());
+    let mut last_error = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+    for _ in 0..tries {
+        let mut draw = next_draw().map_err(|e| (e, mkdtemp_refused_path(template)))?;
+        path.clear();
+        path.push_str(stem);
+        for _ in 0..6 {
+            path.push(char::from(MKDTEMP_CHARS[(draw % 62) as usize]));
+            draw /= 62;
+        }
+        match create_mkdtemp_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last_error = e,
+            Err(e) => return Err((e, mkdtemp_failed_path(template, &path))),
+        }
+    }
+    let exhausted = if cfg!(windows) { String::new() } else { path };
+    Err((last_error, exhausted))
+}
+
+#[cfg(unix)]
+fn create_mkdtemp_dir(path: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_mkdtemp_dir(path: &str) -> std::io::Result<()> {
+    std::fs::create_dir(path)
+}
+
+/// What libuv's request holds after `mkdtemp` refuses before creating
+/// anything: Windows clobbers it to the empty string, Unix leaves the
+/// template. See `mkdtemp`.
+fn mkdtemp_refused_path(template: &str) -> String {
+    if cfg!(windows) {
+        String::new()
+    } else {
+        template.to_string()
+    }
+}
+
+/// What libuv's request holds after a create fails other than EEXIST: the
+/// template on Windows, the name tried on Unix. See `mkdtemp`.
+fn mkdtemp_failed_path(template: &str, tried: &str) -> String {
+    if cfg!(windows) {
+        template.to_string()
+    } else {
+        tried.to_string()
+    }
+}
+
 /// node's `path.win32.resolve(path)` (lib/path.js; src/path.cc `PathResolve`
 /// is the same algorithm): `cwd` is `process.cwd()`, and `drive_cwd(device)`
 /// the per-drive current directory Windows keeps in the `=C:` environment
@@ -4295,30 +4421,17 @@ pub mod ops {
         }
     }
 
-    /// The directory `mkdtemp(prefix)` will create. Exposed so the op layer
-    /// can permission-check the path that is actually written rather than the
-    /// caller's prefix -- with a relative prefix the two differ (the prefix
-    /// resolves under the system temp dir), so checking the prefix denied
-    /// writes inside a correctly-granted temp dir and vice versa.
-    pub fn mkdtemp_target(prefix: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "{}{}",
-            prefix,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ))
-    }
-
-    /// `dir` comes from `mkdtemp_target(&prefix)`, resolved ONCE by the op
-    /// layer so the path it permission-checked is the path created here.
-    /// Resolving it again would mint a fresh timestamp, leaving the checked
-    /// path and the created path different strings.
-    pub async fn fs_mkdtemp(dir: std::path::PathBuf, prefix: String) -> OpOutcome {
-        match tokio::fs::create_dir(&dir).await {
-            Ok(()) => OpOutcome::Text(super::strip_unc_prefix(&dir)),
-            Err(e) => node_fail_as_passed(e, "mkdtemp", &prefix),
+    /// node's `mkdtemp` on the blocking pool: `template` comes from
+    /// `mkdtemp_template`, built ONCE by the op layer so the template it
+    /// permission-checked is the one created from (node checks the same
+    /// template, X's and all). The work is `super::mkdtemp`, shared with the
+    /// sync op.
+    pub async fn fs_mkdtemp(template: String) -> OpOutcome {
+        let result = tokio::task::spawn_blocking(move || super::mkdtemp(&template)).await;
+        match result {
+            Ok(Ok(dir)) => OpOutcome::Text(dir),
+            Ok(Err((e, path))) => node_fail_as_passed(e, "mkdtemp", &path),
+            Err(e) => OpOutcome::Failed(format!("mkdtemp: {e}")),
         }
     }
 
@@ -5708,6 +5821,97 @@ mod os_error_code_tests {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn mkdtemp_template_matches_node_binding() {
+        assert_eq!(mkdtemp_template("x-"), "x-XXXXXX");
+        assert_eq!(mkdtemp_template("sub/"), "sub/XXXXXX");
+        // node's snprintf bound leaves an empty prefix five X's.
+        assert_eq!(mkdtemp_template(""), "XXXXX");
+    }
+
+    /// A fresh directory for one mkdtemp test, relative names joined to it.
+    fn mkdtemp_test_dir(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("oam-mkdtemp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        format!("{}/", dir.to_str().unwrap())
+    }
+
+    #[test]
+    fn mkdtemp_names_six_characters_of_base62() {
+        let base = mkdtemp_test_dir("shape");
+        let template = mkdtemp_template(&format!("{base}p-"));
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let dir = mkdtemp(&template).unwrap();
+            let suffix = dir.strip_prefix(&format!("{base}p-")).unwrap();
+            assert_eq!(suffix.len(), 6, "{dir}");
+            assert!(suffix.bytes().all(|b| b.is_ascii_alphanumeric()), "{dir}");
+            assert!(std::path::Path::new(&dir).is_dir());
+            assert!(seen.insert(dir));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn mkdtemp_tries_again_only_when_the_name_exists() {
+        let base = mkdtemp_test_dir("retry");
+        let template = format!("{base}r-XXXXXX");
+        // Draw 0 spells "aaaaaa" (libuv's least-significant-first base 62),
+        // draw 1 "baaaaa".
+        std::fs::create_dir(format!("{base}r-aaaaaa")).unwrap();
+        let mut draws = [0u64, 0, 1].into_iter();
+        let dir = mkdtemp_drawing(&template, 10, || Ok(draws.next().unwrap())).unwrap();
+        assert_eq!(dir, format!("{base}r-baaaaa"));
+        assert_eq!(draws.next(), None);
+
+        // Out of tries: EEXIST, after exactly `tries` draws.
+        let mut count = 0;
+        let (e, path) = mkdtemp_drawing(&template, 3, || {
+            count += 1;
+            Ok(0)
+        })
+        .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(count, 3);
+        // libuv's Windows loop clobbers the path to "" when it runs out.
+        let expected = if cfg!(windows) {
+            String::new()
+        } else {
+            format!("{base}r-aaaaaa")
+        };
+        assert_eq!(path, expected);
+
+        // Any other failure stops at once, leaving the template on Windows
+        // (libuv fills it in only on success) and the name tried elsewhere.
+        let missing = format!("{base}nope/q-XXXXXX");
+        let mut count = 0;
+        let (e, path) = mkdtemp_drawing(&missing, 10, || {
+            count += 1;
+            Ok(0)
+        })
+        .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(count, 1);
+        if cfg!(windows) {
+            assert_eq!(path, missing);
+        } else {
+            assert_eq!(path, format!("{base}nope/q-aaaaaa"));
+        }
+
+        // A template not ending in six X's is EINVAL, with no draw.
+        let (e, path) = mkdtemp_drawing("XXXXX", 10, || unreachable!()).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(path, if cfg!(windows) { "" } else { "XXXXX" });
+
+        // A failed draw is EIO-shaped and refuses like EINVAL.
+        let (e, path) = mkdtemp_drawing(&template, 10, || Err(std::io::Error::other("no entropy")))
+            .unwrap_err();
+        assert_eq!(node_error_code(&e), "EIO");
+        assert_eq!(path, if cfg!(windows) { "" } else { template.as_str() });
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn ops_complete_and_inflight_tracks() {
