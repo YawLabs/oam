@@ -1,0 +1,632 @@
+#!/bin/bash
+# =============================================================================
+# Release signing: a tag-bound RELEASE-MANIFEST, signed with an ssh ed25519 key
+# =============================================================================
+# SHA256SUMS proves a download matches the release it came from. It cannot
+# prove the release came from us: whoever can upload to the release (a stolen
+# gh token, a compromised box) uploads a matching SHA256SUMS beside the binary.
+# So every release also carries
+#
+#   RELEASE-MANIFEST        "oam-release-manifest v1\n" + "tag <tag>\n" + the
+#                           SHA256SUMS bytes, verbatim
+#   RELEASE-MANIFEST.sig    an SSHSIG over it (ssh-keygen -Y sign, namespace
+#                           "oam-release"), made with a dedicated release key
+#
+# The tag line is the point of the extra file. A signature over SHA256SUMS
+# alone is valid forever for whatever it covers, so an attacker could serve an
+# OLD, correctly signed release as the latest one (a downgrade to a known-bad
+# version) or replay it under another tag. Binding the tag makes the verifier's
+# question "is this the release I asked for?", not just "did we ever sign
+# this?". SHA256SUMS itself is untouched, so every existing consumer keeps
+# working; the manifest's name sits outside the `oam-*` globs that pick
+# binaries, and it is never listed IN SHA256SUMS (that file covers binaries).
+#
+# Trust is by TAG RANGE, not by time. release-keys/allowed_signers names the
+# keys (public material only), and release-keys/ranges says which tags each may
+# sign ("k1 v0.18.0 -": from v0.18.0 inclusive, open-ended). ssh-keygen's own
+# valid-before= option would be checked against the VERIFY time, so retiring a
+# key would break every pinned old tag it signed; a tag range retires a key
+# for new releases only. release-keys/README.md is the runbook.
+#
+# Custody: the private half lives at $OAM_RELEASE_SIGNING_KEY, passphrase
+# protected. release_agent_start loads it into a PRIVATE ssh-agent -- its own
+# process, its own 0700 socket directory, a 6-hour key lifetime -- with one
+# passphrase prompt, and release_agent_stop kills it. SSH_AUTH_SOCK is NEVER
+# exported: every ssh-add / ssh-keygen call that needs the agent gets it as a
+# per-command prefix. Exporting it would hand the release key to every child of
+# the release -- including the ssh sessions the remote build legs open to the
+# Mac and the GCP VM, which would then offer it to (and, with agent forwarding,
+# lend it to) hosts that have no business seeing it.
+#
+# Bootstrap: until a key is committed to allowed_signers there is nothing to
+# sign with, and the manifest step is skipped with a loud warning (fatal under
+# OAM_SIGN_REQUIRED=1). The moment ANY key is committed, signing is mandatory:
+# there is deliberately no knob that skips it, because a skip knob is exactly
+# what an attacker holding the release box would set.
+#
+# Contract for callers (release-local.sh, release-upload-local-arm64.sh,
+# test-scripts.sh):
+#   - functions print a precise "[fail]" line on stderr and RETURN non-zero;
+#     they never exit. The caller decides what a failure ends.
+#   - nothing here sets a trap. The caller owns its ONE EXIT trap (a second
+#     `trap ... EXIT` silently replaces the first -- see ci-local.sh) and must
+#     call release_agent_stop from it.
+#   - call release_agent_start in the shell that will sign, never inside
+#     $(...): the agent's pid and socket live in shell variables, and a
+#     subshell's copies die with it, leaving the caller with no agent to sign
+#     through -- and an agent nobody stops. (The agent's own stdio goes to
+#     /dev/null, so a substitution would not hang; it would just be wrong.)
+#   - callers run under `set -e`, which `release_x || fail` disables inside the
+#     function, so every step here checks its own status explicitly.
+# =============================================================================
+
+RELEASE_SIGN_NAMESPACE="oam-release"
+RELEASE_MANIFEST_HEADER="oam-release-manifest v1"
+# Principals in allowed_signers are "oam-release-<id>"; ranges names the <id>.
+RELEASE_PRINCIPAL_PREFIX="oam-release-"
+# 6 hours: one release, with headroom. If a long run outlives it anyway,
+# release_sign_manifest re-adds the key (one more prompt) instead of failing
+# after the builds are done.
+RELEASE_KEY_LIFETIME=21600
+
+# Resolved from this file's own location, NOT from the environment: the trust
+# root a release verifies against is the committed one, and an env knob that
+# could point it elsewhere is a knob that could make a bad key verify. Two
+# things reassign it after sourcing: release-upload-local-arm64.sh, which runs
+# from an OLD tag's checkout and so points it at origin/main's copy instead
+# (release_keys_from_commit -- the current trust root, not the one frozen into
+# that tag), and the test suite, in a subshell.
+RELEASE_KEYS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/release-keys"
+# The Windows inbox OpenSSH client's ssh-add, used only to ask the agent
+# SERVICE whether it holds the release key, and reg.exe, used to look in that
+# service's at-rest key store. Both reassigned by the test suite.
+RELEASE_INBOX_SSH_ADD="/c/Windows/System32/OpenSSH/ssh-add.exe"
+RELEASE_INBOX_REG="/c/Windows/System32/reg.exe"
+# Where Win32-OpenSSH's agent service keeps added keys (DPAPI-encrypted), one
+# subkey per key, with the public key blob in a "pub" REG_BINARY value.
+RELEASE_INBOX_REG_KEY='HKCU\Software\OpenSSH\Agent\Keys'
+# Longest agent socket path release_agent_start will use. sun_path is 104
+# bytes on macOS and 108 on Linux, NUL included; ssh-agent refuses a longer
+# path ("too long for Unix domain socket") and exits. macOS's per-user
+# $TMPDIR (/var/folders/xx/<30 chars>/T/) leaves little room under it.
+RELEASE_SOCK_MAX=100
+
+RELEASE_SSH_KEYGEN=""
+RELEASE_SSH_ADD=""
+RELEASE_SSH_AGENT=""
+RELEASE_AGENT_PID=""
+RELEASE_AGENT_DIR=""
+RELEASE_AGENT_SOCK=""
+RELEASE_SIGNING_KEY=""
+RELEASE_SIGNING_FP=""
+
+_rs_fail(){ printf '  [fail] %s\n' "$*" >&2; return 1; }
+_rs_warn(){ printf '  [warn] %s\n' "$*" >&2; return 0; }
+_rs_ok(){   printf '  [ok] %s\n' "$*" >&2; return 0; }
+
+# release_ssh_tools -- resolve ssh-keygen, ssh-add and ssh-agent ONCE, from
+# PATH, and insist they come from the same directory.
+#
+# Same directory, because the halves must speak the same agent protocol over
+# the same kind of socket: a Git Bash (MSYS) ssh-agent listens on an MSYS unix
+# socket that the Windows inbox ssh-add.exe cannot open, and the inbox agent is
+# a named-pipe service. A PATH that mixes the two installs fails with "could
+# not connect to agent" at best, and at worst talks to an agent other than the
+# one this lib started. On this repo's release box that directory is Git for
+# Windows' /usr/bin.
+#
+# -Y: sign/verify arrived in OpenSSH 8.1; the floor here is 8.2 (plan 4.3).
+# The version comes from the sibling `ssh -V`, since ssh-keygen has no version
+# flag, and the functional half -- does this ssh-keygen parse -Y at all -- is
+# asked of ssh-keygen itself: given an operation it does not know, one with -Y
+# answers "Unsupported operation for -Y" (measured on 10.2p1), while one
+# without -Y rejects the option before any operation is looked at.
+release_ssh_tools() {
+  [ -z "$RELEASE_SSH_KEYGEN" ] || return 0
+  local kg add agent dir ver major minor probe
+  kg="$(command -v ssh-keygen 2>/dev/null)" || kg=""
+  add="$(command -v ssh-add 2>/dev/null)" || add=""
+  agent="$(command -v ssh-agent 2>/dev/null)" || agent=""
+  [ -n "$kg" ] && [ -n "$add" ] && [ -n "$agent" ] \
+    || _rs_fail "ssh-keygen, ssh-add and ssh-agent must all be on PATH (found: ${kg:-no ssh-keygen}, ${add:-no ssh-add}, ${agent:-no ssh-agent}) -- install OpenSSH >= 8.2 (on Windows: Git for Windows ships it in /usr/bin)" || return 1
+  dir="$(dirname "$kg")"
+  [ "$(dirname "$add")" = "$dir" ] && [ "$(dirname "$agent")" = "$dir" ] \
+    || _rs_fail "ssh-keygen ($kg), ssh-add ($add) and ssh-agent ($agent) come from different OpenSSH installs -- they cannot share an agent socket. Put one install first on PATH (Git for Windows: /usr/bin)" || return 1
+  if [ -x "$dir/ssh" ] || [ -x "$dir/ssh.exe" ]; then
+    ver="$("$dir/ssh" -V 2>&1)"
+    if [[ "$ver" =~ OpenSSH_([0-9]+)\.([0-9]+) ]]; then
+      major="${BASH_REMATCH[1]}"; minor="${BASH_REMATCH[2]}"
+      if [ "$major" -lt 8 ] || { [ "$major" -eq 8 ] && [ "$minor" -lt 2 ]; }; then
+        _rs_fail "$dir/ssh-keygen is OpenSSH $major.$minor ('$ver') -- release signing needs ssh-keygen -Y from OpenSSH >= 8.2"
+        return 1
+      fi
+    else
+      _rs_warn "could not read an OpenSSH version from '$dir/ssh -V' ('$ver') -- relying on the -Y probe alone"
+    fi
+  fi
+  probe="$("$kg" -Y oam-probe </dev/null 2>&1)"
+  case "$probe" in
+    *'Unsupported operation for -Y'*) ;;
+    *) _rs_fail "$kg does not support -Y (OpenSSH >= 8.2 needed); it said: $(printf '%s' "$probe" | head -1)"; return 1 ;;
+  esac
+  RELEASE_SSH_KEYGEN="$kg"; RELEASE_SSH_ADD="$add"; RELEASE_SSH_AGENT="$agent"
+  return 0
+}
+
+# --- release-keys/ parsing ----------------------------------------------------
+
+# release_key_lines -- the non-comment, non-blank lines of allowed_signers.
+release_key_lines() {
+  awk '!/^[[:space:]]*(#|$)/' "$RELEASE_KEYS_DIR/allowed_signers"
+}
+
+# _rs_plain_tag <tag> -- 0 for a plain vMAJOR.MINOR.PATCH, the only tag shape
+# this repo releases (release-local.sh refuses the rest).
+_rs_plain_tag() { [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+
+# _rs_tag_le <a> <b> -- 0 when tag a <= tag b, both plain. Numeric per field
+# (10# so a leading zero is not read as octal); a string compare would put
+# v0.10.0 before v0.9.0.
+_rs_tag_le() {
+  local a b i
+  IFS=. read -r -a a <<<"${1#v}"
+  IFS=. read -r -a b <<<"${2#v}"
+  for i in 0 1 2; do
+    if [ $((10#${a[i]})) -lt $((10#${b[i]})) ]; then return 0; fi
+    if [ $((10#${a[i]})) -gt $((10#${b[i]})) ]; then return 1; fi
+  done
+  return 0
+}
+
+# release_keys_lint -- the committed key files are well-formed. Checked before
+# anything trusts them, because both are hand-edited and a malformed line must
+# not quietly degrade into "this key is trusted for everything" or "nothing
+# verifies, skip". Rules:
+#   allowed_signers  principal oam-release-<id> (one, no patterns/commas),
+#                    namespaces="oam-release" exactly, an ed25519 key type,
+#                    a base64 blob; each principal once.
+#   ranges           "<id> <from> <to>": plain tags, "-" for an open end,
+#                    from <= to; one line per id.
+# A key with NO range line is legal: that is the staged "next" key (k2),
+# committed early so its public half travels ahead of the rotation. It signs
+# nothing until a range opens for it; release_tag_in_range says so by name.
+release_keys_lint() {
+  local as="$RELEASE_KEYS_DIR/allowed_signers" rg="$RELEASE_KEYS_DIR/ranges"
+  [ -f "$as" ] || { _rs_fail "$as is missing -- it is committed; restore it from git"; return 1; }
+  [ -f "$rg" ] || { _rs_fail "$rg is missing -- it is committed; restore it from git"; return 1; }
+  local line principal opts ktype blob extra id from to seen_p="" seen_r=""
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    read -r principal opts ktype blob extra <<<"$line"
+    case "$principal" in
+      "$RELEASE_PRINCIPAL_PREFIX"*) ;;
+      *) _rs_fail "allowed_signers: principal '$principal' does not start with '$RELEASE_PRINCIPAL_PREFIX'"; return 1 ;;
+    esac
+    id="${principal#"$RELEASE_PRINCIPAL_PREFIX"}"
+    [[ "$id" =~ ^[A-Za-z0-9._-]+$ ]] \
+      || { _rs_fail "allowed_signers: principal '$principal' must be a single literal name (no patterns or lists)"; return 1; }
+    [ "$opts" = "namespaces=\"$RELEASE_SIGN_NAMESPACE\"" ] \
+      || { _rs_fail "allowed_signers: '$principal' must carry namespaces=\"$RELEASE_SIGN_NAMESPACE\" as its only option (got '$opts')"; return 1; }
+    case "$ktype" in
+      ssh-ed25519 | sk-ssh-ed25519@openssh.com) ;;
+      *) _rs_fail "allowed_signers: '$principal' has key type '$ktype' -- release keys are ssh-ed25519 (or sk-ssh-ed25519@openssh.com)"; return 1 ;;
+    esac
+    [[ "$blob" =~ ^[A-Za-z0-9+/]+=*$ ]] \
+      || { _rs_fail "allowed_signers: '$principal' has no base64 key blob"; return 1; }
+    # $extra is the key comment, if any; ssh-keygen ignores it.
+    case " $seen_p " in *" $id "*) _rs_fail "allowed_signers: principal '$principal' appears twice"; return 1 ;; esac
+    seen_p="$seen_p $id"
+  done <<<"$(release_key_lines)"
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    read -r id from to extra <<<"$line"
+    [ -n "$to" ] && [ -z "$extra" ] \
+      || { _rs_fail "ranges: '$line' must be exactly '<id> <from-tag> <to-tag|->'"; return 1; }
+    _rs_plain_tag "$from" || { _rs_fail "ranges: '$id' starts at '$from', not a plain vX.Y.Z tag"; return 1; }
+    if [ "$to" != "-" ]; then
+      _rs_plain_tag "$to" || { _rs_fail "ranges: '$id' ends at '$to', neither '-' nor a plain vX.Y.Z tag"; return 1; }
+      _rs_tag_le "$from" "$to" || { _rs_fail "ranges: '$id' runs backwards ($from > $to)"; return 1; }
+    fi
+    case " $seen_r " in *" $id "*) _rs_fail "ranges: '$id' has more than one line -- one range per key, or a forgotten open line keeps a closed key alive"; return 1 ;; esac
+    seen_r="$seen_r $id"
+  done <<<"$(awk '!/^[[:space:]]*(#|$)/' "$rg")"
+  return 0
+}
+
+# release_tag_in_range <principal> <tag> -- 0 when ranges lets <principal>
+# sign <tag>. Assumes release_keys_lint passed.
+release_tag_in_range() {
+  local principal="$1" tag="$2" id from to
+  id="${principal#"$RELEASE_PRINCIPAL_PREFIX"}"
+  _rs_plain_tag "$tag" || { _rs_fail "'$tag' is not a plain vX.Y.Z tag -- key ranges cannot place it"; return 1; }
+  read -r _ from to <<<"$(awk -v id="$id" '!/^[[:space:]]*(#|$)/ && $1 == id { print; exit }' "$RELEASE_KEYS_DIR/ranges")"
+  [ -n "${from:-}" ] || { _rs_fail "key $principal has no line in release-keys/ranges -- a staged next key signs nothing until its range opens"; return 1; }
+  if ! _rs_tag_le "$from" "$tag"; then
+    _rs_fail "key $principal may sign $from onward (release-keys/ranges), and $tag is before that"
+    return 1
+  fi
+  if [ "$to" != "-" ] && ! _rs_tag_le "$tag" "$to"; then
+    _rs_fail "key $principal was retired after $to (release-keys/ranges) -- it may not sign $tag"
+    return 1
+  fi
+  return 0
+}
+
+# release_tag_predates_signing <tag> -- 0 when <tag> comes before the start of
+# every range in release-keys/ranges: no committed key was ever allowed to
+# sign it, so a release of it without a manifest was cut before signing
+# existed. 1 for a tag at or after any range's start: that release was cut in
+# the signing era, and a missing manifest means it was removed or never made.
+# A closed range counts -- a tag in a gap between ranges is still after
+# signing began. Assumes release_keys_lint passed.
+release_tag_predates_signing() {
+  local tag="$1" from
+  _rs_plain_tag "$tag" || { _rs_fail "'$tag' is not a plain vX.Y.Z tag -- key ranges cannot place it"; return 1; }
+  while read -r _ from _; do
+    [ -n "$from" ] || continue
+    if _rs_tag_le "$from" "$tag"; then return 1; fi
+  done <<<"$(awk '!/^[[:space:]]*(#|$)/' "$RELEASE_KEYS_DIR/ranges")"
+  return 0
+}
+
+# release_keys_from_commit <commit> <dir> -- copy release-keys/allowed_signers
+# and ranges as committed at <commit> into <dir> (which the caller owns and
+# removes) and point RELEASE_KEYS_DIR at it. For a caller whose checkout is not
+# the current trust root: release-upload-local-arm64.sh stands on an old tag,
+# whose release-keys/ predates any later range close or rotation, and
+# verifying against that would accept a key the project has since retired --
+# or refuse the key that replaced it. Run in the caller's shell, never in
+# $(...): the assignment is the point.
+release_keys_from_commit() {
+  local commit="$1" dir="$2" f
+  git cat-file -e "${commit}^{commit}" 2>/dev/null \
+    || { _rs_fail "commit $commit is not in this clone -- fetch it first"; return 1; }
+  for f in allowed_signers ranges; do
+    git show "${commit}:release-keys/$f" >"$dir/$f" 2>/dev/null \
+      || { _rs_fail "release-keys/$f does not exist at $commit -- that commit carries no signing trust root"; return 1; }
+  done
+  RELEASE_KEYS_DIR="$dir"
+  return 0
+}
+
+# release_signing_decision -- whether this run signs, as one line on stdout:
+#   sign            a key is committed: signing is mandatory
+#   skip:<reason>   bootstrap (no key yet) and OAM_SIGN_REQUIRED is not 1
+#   fail:<reason>   bootstrap under OAM_SIGN_REQUIRED=1, a malformed knob, or
+#                   malformed key files
+# Pure function of the committed files and the knob, so the suite drives it
+# with fixtures. Note what is NOT an input: anything that could turn "sign"
+# into "skip" once a key exists.
+release_signing_decision() {
+  local req="${OAM_SIGN_REQUIRED:-0}" lint_err
+  [[ "$req" =~ ^[01]$ ]] || { printf 'fail:OAM_SIGN_REQUIRED must be 0 or 1, not %s\n' "$req"; return 0; }
+  if ! lint_err="$(release_keys_lint 2>&1)"; then
+    printf 'fail:release-keys/ is malformed: %s\n' "$(printf '%s' "$lint_err" | sed 's/^ *\[fail\] //' | head -1)"
+    return 0
+  fi
+  if [ -n "$(release_key_lines)" ]; then
+    printf 'sign\n'
+  elif [ "$req" = "1" ]; then
+    printf 'fail:OAM_SIGN_REQUIRED=1 but release-keys/allowed_signers holds no key yet -- generate and commit one (release-keys/README.md), or unset OAM_SIGN_REQUIRED for a bootstrap release\n'
+  else
+    printf 'skip:release-keys/allowed_signers holds no key yet, so this release ships WITHOUT a signed RELEASE-MANIFEST (bootstrap; see release-keys/README.md). Once a key is committed this step is mandatory\n'
+  fi
+  return 0
+}
+
+# --- the private agent ----------------------------------------------------------
+
+# release_inbox_agent_holds <fingerprint> <public-key-base64> -- 0 when the
+# Windows OpenSSH agent SERVICE holds the key, live or at rest. That service
+# keeps added keys in the registry ($RELEASE_INBOX_REG_KEY), DPAPI-encrypted,
+# across reboots and while it is STOPPED -- decryptable by anything running as
+# this user, for good: the opposite of a 6-hour private agent. So two looks:
+#   1. the running service's listing (ssh-add.exe -l). SSH_AUTH_SOCK is
+#      cleared for the call: the inbox client honors it, and pointed at an
+#      MSYS socket it would ask the wrong agent.
+#   2. the at-rest store, which answers whether or not the service runs: a
+#      value holding this key's public blob. reg.exe prints a REG_BINARY as
+#      one hex string, so the blob is matched as hex.
+# Neither binary present (not Windows) reads as "not held", and so does no
+# store at all. A STOPPED service whose store holds keys that look 2 cannot
+# match is warned about rather than silently passed: the check could not ask
+# the service itself, and the line says so.
+release_inbox_agent_holds() {
+  local fp="$1" blob="$2" listing rc=0 store hex n
+  if [ -x "$RELEASE_INBOX_SSH_ADD" ]; then
+    listing="$( unset SSH_AUTH_SOCK; "$RELEASE_INBOX_SSH_ADD" -l 2>/dev/null )" || rc=$?
+    if awk -v fp="$fp" '$2 == fp { found = 1 } END { exit !found }' <<<"$listing"; then
+      return 0
+    fi
+  fi
+  [ -x "$RELEASE_INBOX_REG" ] || return 1
+  # MSYS2_ARG_CONV_EXCL: Git Bash would otherwise rewrite "/s" into a path.
+  store="$(MSYS2_ARG_CONV_EXCL='*' "$RELEASE_INBOX_REG" query "$RELEASE_INBOX_REG_KEY" /s 2>/dev/null)" \
+    || return 1
+  hex="$(printf '%s' "$blob" | base64 -d 2>/dev/null | od -An -v -tx1 | tr -d ' \n' | tr 'a-f' 'A-F')"
+  if [ -z "$hex" ]; then
+    _rs_warn "could not decode the release key's public blob, so the Windows agent's key store ($RELEASE_INBOX_REG_KEY) was not searched"
+    return 1
+  fi
+  if tr -d ' \t\r\n' <<<"$store" | tr 'a-f' 'A-F' | grep -qF -- "$hex"; then
+    return 0
+  fi
+  if [ "$rc" -eq 2 ]; then
+    # Subkey header lines: the store's own path plus "\<name>".
+    n="$(tr -d '\r' <<<"$store" | grep -ciE '^HKEY_CURRENT_USER.+agent.keys.[^[:space:]]')"
+    if [ "${n:-0}" -gt 0 ]; then
+      _rs_warn "the Windows OpenSSH agent service is not running, and its key store ($RELEASE_INBOX_REG_KEY) holds $n key(s) this check did not match to the release key ($fp). If the release key was ever added there, start the service and remove it (ssh-add.exe -d '<key>.pub')"
+    fi
+  fi
+  return 1
+}
+
+# release_agent_holds_key -- 0 when the private agent holds the release key.
+release_agent_holds_key() {
+  [ -n "$RELEASE_AGENT_SOCK" ] || return 1
+  SSH_AUTH_SOCK="$RELEASE_AGENT_SOCK" "$RELEASE_SSH_ADD" -l 2>/dev/null \
+    | awk -v fp="$RELEASE_SIGNING_FP" '$2 == fp { found = 1 } END { exit !found }'
+}
+
+# _rs_add_key -- one ssh-add with the lifetime; the passphrase prompt is
+# ssh-add's own (it reads the terminal, so stdin is left alone).
+_rs_add_key() {
+  _rs_warn "loading the release key ($RELEASE_SIGNING_FP) into a private agent for $((RELEASE_KEY_LIFETIME / 3600))h -- enter its passphrase if asked"
+  SSH_AUTH_SOCK="$RELEASE_AGENT_SOCK" "$RELEASE_SSH_ADD" -t "$RELEASE_KEY_LIFETIME" "$RELEASE_SIGNING_KEY" >&2 \
+    || { _rs_fail "ssh-add could not load $RELEASE_SIGNING_KEY (wrong passphrase, or not a private key)"; return 1; }
+  release_agent_holds_key \
+    || { _rs_fail "ssh-add reported success but the private agent does not list $RELEASE_SIGNING_FP"; return 1; }
+  return 0
+}
+
+# release_agent_start -- validate $OAM_RELEASE_SIGNING_KEY, start the private
+# agent and add the key once. Idempotent while the agent lives.
+#
+# `ssh-agent -D -a <sock> &`, not `eval "$(ssh-agent -s)"`: -D keeps it in the
+# foreground of a background job, so $! IS the agent and stopping it is a
+# kill, not a parse of its output, and no eval of anything an external
+# program printed; -a puts the socket in a directory this function created
+# 0700.
+release_agent_start() {
+  release_ssh_tools || return 1
+  if [ -n "$RELEASE_AGENT_PID" ] && kill -0 "$RELEASE_AGENT_PID" 2>/dev/null; then
+    return 0
+  fi
+  # An agent that died under us still has a socket directory to clear.
+  release_agent_stop
+  local key="${OAM_RELEASE_SIGNING_KEY:-}" ktype kblob i rc base
+  [ -n "$key" ] \
+    || { _rs_fail "OAM_RELEASE_SIGNING_KEY is not set -- point it at the release key's PRIVATE half (passphrase-protected ed25519, '<path>.pub' beside it); release-keys/README.md has the runbook"; return 1; }
+  # A Windows-style path from the environment works for the MSYS tools once
+  # translated; cygpath exists only where that translation is needed.
+  if command -v cygpath >/dev/null 2>&1; then key="$(cygpath -u "$key")"; fi
+  [ -f "$key" ] || { _rs_fail "OAM_RELEASE_SIGNING_KEY=$key does not exist"; return 1; }
+  [ -f "$key.pub" ] || { _rs_fail "$key.pub does not exist -- signing names the key by its public half (ssh-keygen -Y sign -f <key>.pub)"; return 1; }
+  read -r ktype kblob _ <"$key.pub"
+  case "$ktype" in
+    ssh-ed25519 | sk-ssh-ed25519@openssh.com) ;;
+    *) _rs_fail "$key.pub is a '$ktype' key -- release keys are ssh-ed25519"; return 1 ;;
+  esac
+  RELEASE_SIGNING_FP="$("$RELEASE_SSH_KEYGEN" -lf "$key.pub" 2>/dev/null | awk '{print $2; exit}')"
+  [ -n "$RELEASE_SIGNING_FP" ] || { _rs_fail "could not fingerprint $key.pub"; return 1; }
+  if release_inbox_agent_holds "$RELEASE_SIGNING_FP" "$kblob"; then
+    _rs_fail "the Windows OpenSSH agent SERVICE holds the release key ($RELEASE_SIGNING_FP), live or in its registry store -- it keeps keys across reboots and while stopped. Remove it there (start the service, then '$RELEASE_INBOX_SSH_ADD' -d '$key.pub', or -D for all) and re-run; release signing uses only its own private agent"
+    return 1
+  fi
+  # An unencrypted key on disk is the key itself, at rest. The runbook says
+  # passphrase-protected; this warns rather than refuses because a refusal
+  # would need a test-only bypass for the suite's throwaway keys, and a bypass
+  # in the signing path is worse than a loud line in the release log.
+  if [ "$ktype" = "ssh-ed25519" ] && "$RELEASE_SSH_KEYGEN" -y -P '' -f "$key" >/dev/null 2>&1; then
+    _rs_warn "$key has NO passphrase -- anyone who reads that file can sign oam releases. Add one: ssh-keygen -p -f '$key'"
+  fi
+  RELEASE_SIGNING_KEY="$key"
+
+  # $TMPDIR first (per-user on macOS), /tmp when the socket path would not
+  # fit under it; 22 is "/oam-sign.XXXXXX/agent". /tmp is shared, but the
+  # directory is 0700 either way. The final length is checked too, so a path
+  # that still does not fit fails here, by name, rather than as an agent that
+  # "did not come up".
+  base="${TMPDIR:-/tmp}"
+  if [ $(( ${#base} + 22 )) -gt "$RELEASE_SOCK_MAX" ]; then base=/tmp; fi
+  RELEASE_AGENT_DIR="$(mktemp -d "$base/oam-sign.XXXXXX")" \
+    || { _rs_fail "could not create the agent's socket directory"; return 1; }
+  chmod 700 "$RELEASE_AGENT_DIR" || { _rs_fail "could not chmod 700 $RELEASE_AGENT_DIR"; release_agent_stop; return 1; }
+  RELEASE_AGENT_SOCK="$RELEASE_AGENT_DIR/agent"
+  if [ "${#RELEASE_AGENT_SOCK}" -gt "$RELEASE_SOCK_MAX" ]; then
+    _rs_fail "the agent socket path $RELEASE_AGENT_SOCK is ${#RELEASE_AGENT_SOCK} bytes, over the $RELEASE_SOCK_MAX a unix socket path can safely hold -- set TMPDIR to a shorter directory"
+    release_agent_stop
+    return 1
+  fi
+  "$RELEASE_SSH_AGENT" -D -a "$RELEASE_AGENT_SOCK" </dev/null >/dev/null 2>&1 &
+  RELEASE_AGENT_PID=$!
+  # ssh-add -l: 0 = keys, 1 = reachable and empty, 2 = cannot connect. Poll
+  # for "reachable", ~5s, and notice an agent that died instead of listening.
+  rc=2
+  for ((i = 1; i <= 50; i++)); do
+    SSH_AUTH_SOCK="$RELEASE_AGENT_SOCK" "$RELEASE_SSH_ADD" -l >/dev/null 2>&1 && rc=0 || rc=$?
+    [ "$rc" -eq 2 ] || break
+    kill -0 "$RELEASE_AGENT_PID" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [ "$rc" -eq 2 ]; then
+    _rs_fail "the private ssh-agent did not come up on $RELEASE_AGENT_SOCK (after $i polls)"
+    release_agent_stop
+    return 1
+  fi
+  _rs_add_key || { release_agent_stop; return 1; }
+  _rs_ok "release key $RELEASE_SIGNING_FP held by a private agent (pid $RELEASE_AGENT_PID, ${RELEASE_KEY_LIFETIME}s lifetime)"
+  return 0
+}
+
+# release_agent_stop -- kill the agent, remove its socket directory. Safe to
+# call any number of times and from an EXIT trap; always returns 0.
+#
+# Residual, stated rather than hidden: a release killed so hard that its EXIT
+# trap never runs (taskkill /F, a power cut) orphans the agent with the key in
+# it until the lifetime runs out. The 0700 directory and that lifetime are the
+# bound on it.
+release_agent_stop() {
+  if [ -n "$RELEASE_AGENT_PID" ]; then
+    kill "$RELEASE_AGENT_PID" 2>/dev/null || true
+    wait "$RELEASE_AGENT_PID" 2>/dev/null || true
+  fi
+  if [ -n "$RELEASE_AGENT_DIR" ]; then rm -rf "$RELEASE_AGENT_DIR"; fi
+  RELEASE_AGENT_PID=""; RELEASE_AGENT_DIR=""; RELEASE_AGENT_SOCK=""
+  return 0
+}
+
+# --- sign and verify ------------------------------------------------------------
+
+# _rs_sign_file <file> -- <file>.sig through the private agent. A stale .sig
+# goes first: ssh-keygen stops to ask before overwriting one.
+_rs_sign_file() {
+  local file="$1" out
+  if [ -z "$RELEASE_AGENT_PID" ] || ! kill -0 "$RELEASE_AGENT_PID" 2>/dev/null; then
+    _rs_fail "the private signing agent is not running (release_agent_start first)"
+    return 1
+  fi
+  if ! release_agent_holds_key; then
+    _rs_warn "the release key's ${RELEASE_KEY_LIFETIME}s agent lifetime ran out -- adding it again"
+    _rs_add_key || return 1
+  fi
+  rm -f "$file.sig"
+  out="$(SSH_AUTH_SOCK="$RELEASE_AGENT_SOCK" "$RELEASE_SSH_KEYGEN" -Y sign \
+           -f "$RELEASE_SIGNING_KEY.pub" -n "$RELEASE_SIGN_NAMESPACE" "$file" </dev/null 2>&1)" \
+    || { _rs_fail "ssh-keygen -Y sign failed for $file: $out"; return 1; }
+  [ -s "$file.sig" ] || { _rs_fail "ssh-keygen -Y sign wrote no $file.sig ($out)"; return 1; }
+  return 0
+}
+
+# _rs_verify_sig <file> <sig> -- try every committed principal with -I; print
+# the one the signature verifies for. `-I` per principal rather than
+# find-principals: it is the exact command a consumer runs, so a pass here is
+# a pass there.
+_rs_verify_sig() {
+  local file="$1" sig="$2" principal out last=""
+  while read -r principal _; do
+    [ -n "$principal" ] || continue
+    if out="$("$RELEASE_SSH_KEYGEN" -Y verify -f "$RELEASE_KEYS_DIR/allowed_signers" \
+                -I "$principal" -n "$RELEASE_SIGN_NAMESPACE" -s "$sig" <"$file" 2>&1)"; then
+      printf '%s\n' "$principal"
+      return 0
+    fi
+    last="$out"
+  done <<<"$(release_key_lines)"
+  printf '%s\n' "${last:-no key in allowed_signers}" | tr '\n' ' ' >&2
+  return 1
+}
+
+# release_signing_preflight <tag> -- prove, BEFORE anything is bumped or
+# tagged, that this box can produce a signature a consumer will accept for
+# <tag>: a real throwaway signature, in a temp dir OUTSIDE the repo (the
+# dirty-tree check runs right after), verified against the committed
+# allowed_signers, by a key whose range covers <tag>. Each of those is a way a
+# release used to be able to get all the way to the manifest step and die
+# there with the tag already public.
+release_signing_preflight() {
+  local tag="$1" d principal err
+  _rs_plain_tag "$tag" || { _rs_fail "'$tag' is not a plain vX.Y.Z tag"; return 1; }
+  release_keys_lint || return 1
+  d="$(mktemp -d "${TMPDIR:-/tmp}/oam-sign-probe.XXXXXX")" || { _rs_fail "could not create a temp dir"; return 1; }
+  printf 'oam release signing preflight for %s -- not a release manifest\n' "$tag" >"$d/probe"
+  if ! _rs_sign_file "$d/probe"; then rm -rf "$d"; return 1; fi
+  if ! principal="$(_rs_verify_sig "$d/probe" "$d/probe.sig" 2>"$d/err")"; then
+    err="$(cat "$d/err")"; rm -rf "$d"
+    _rs_fail "a fresh signature by OAM_RELEASE_SIGNING_KEY ($RELEASE_SIGNING_FP) does not verify against release-keys/allowed_signers -- it is not a committed release key ($err)"
+    return 1
+  fi
+  rm -rf "$d"
+  release_tag_in_range "$principal" "$tag" || return 1
+  _rs_ok "signing preflight: $principal ($RELEASE_SIGNING_FP) signs and verifies, and may sign $tag"
+  return 0
+}
+
+# release_write_manifest <dir> <tag> -- <dir>/RELEASE-MANIFEST from
+# <dir>/SHA256SUMS. Any old .sig beside it goes too: it signs bytes that no
+# longer exist.
+release_write_manifest() {
+  local dir="$1" tag="$2"
+  _rs_plain_tag "$tag" || { _rs_fail "'$tag' is not a plain vX.Y.Z tag"; return 1; }
+  [ -s "$dir/SHA256SUMS" ] || { _rs_fail "$dir/SHA256SUMS is missing or empty -- the manifest wraps it"; return 1; }
+  # SHA256SUMS covers binaries. A manifest listed inside it would be a hash of
+  # the thing that carries the hash -- and a sign the two got confused.
+  if grep -q 'RELEASE-MANIFEST' "$dir/SHA256SUMS"; then
+    _rs_fail "$dir/SHA256SUMS lists RELEASE-MANIFEST -- it must cover the oam-* binaries only"
+    return 1
+  fi
+  rm -f "$dir/RELEASE-MANIFEST.sig"
+  { printf '%s\n' "$RELEASE_MANIFEST_HEADER" && printf 'tag %s\n' "$tag" && cat "$dir/SHA256SUMS"; } \
+      >"$dir/RELEASE-MANIFEST" \
+    || { rm -f "$dir/RELEASE-MANIFEST"; _rs_fail "could not write $dir/RELEASE-MANIFEST"; return 1; }
+  return 0
+}
+
+# release_sign_manifest <dir> -- <dir>/RELEASE-MANIFEST.sig.
+release_sign_manifest() {
+  local dir="$1"
+  [ -s "$dir/RELEASE-MANIFEST" ] || { _rs_fail "$dir/RELEASE-MANIFEST is missing -- write it first"; return 1; }
+  _rs_sign_file "$dir/RELEASE-MANIFEST"
+}
+
+# release_verify_manifest <dir> <expected-tag> -- everything a consumer will
+# check, read back from DISK (never from what the caller believes it wrote):
+#   1. the signature verifies for a committed principal, namespace oam-release
+#   2. line 1 is exactly the v1 header
+#   3. line 2 is exactly "tag <expected-tag>"
+#   4. the rest is byte-identical to <dir>/SHA256SUMS
+#   5. the signing key's range covers the tag
+# The content checks come AFTER the signature: until it verifies, the content
+# is attacker-controlled and its parse is not worth reporting.
+release_verify_manifest() {
+  local dir="$1" tag="$2" m s sums principal err line1 line2 prefix_len
+  # Byte lengths below, not character lengths: the header and a plain tag are
+  # ASCII, but a UTF-8 locale is no reason to find out.
+  local LC_ALL=C
+  m="$dir/RELEASE-MANIFEST"; s="$dir/RELEASE-MANIFEST.sig"; sums="$dir/SHA256SUMS"
+  release_ssh_tools || return 1
+  _rs_plain_tag "$tag" || { _rs_fail "expected tag '$tag' is not a plain vX.Y.Z tag"; return 1; }
+  [ -f "$m" ] || { _rs_fail "$m is missing"; return 1; }
+  [ -f "$s" ] || { _rs_fail "$s is missing"; return 1; }
+  [ -f "$sums" ] || { _rs_fail "$sums is missing"; return 1; }
+  release_keys_lint || return 1
+  [ -n "$(release_key_lines)" ] \
+    || { _rs_fail "release-keys/allowed_signers holds no key -- nothing can verify $m"; return 1; }
+  # _rs_verify_sig prints the principal on stdout and ssh-keygen's last
+  # complaint on stderr; each is captured where it belongs.
+  err="$(mktemp)" || { _rs_fail "could not create a temp file"; return 1; }
+  if ! principal="$(_rs_verify_sig "$m" "$s" 2>"$err")"; then
+    _rs_fail "RELEASE-MANIFEST.sig does not verify against any key in release-keys/allowed_signers (namespace $RELEASE_SIGN_NAMESPACE): $(cat "$err")"
+    rm -f "$err"
+    return 1
+  fi
+  rm -f "$err"
+  # The two header lines are compared as BYTES against the expected ones, and
+  # only diagnosed line by line when that fails. A line-level compare alone is
+  # not enough: Git Bash strips CRs from $(...) output, so a CRLF header reads
+  # back there as the right text, and the misplaced boundary would surface as
+  # a confusing SUMS mismatch -- or, with lengths that happened to line up,
+  # not at all.
+  prefix_len=$(( ${#RELEASE_MANIFEST_HEADER} + 1 + ${#tag} + 5 ))
+  if ! printf '%s\ntag %s\n' "$RELEASE_MANIFEST_HEADER" "$tag" | cmp -s - <(head -c "$prefix_len" "$m"); then
+    if [ "$(head -n 2 "$m" | tr -dc '\r' | wc -c)" -gt 0 ]; then
+      _rs_fail "RELEASE-MANIFEST's header has CR line endings -- it is LF-only, byte for byte"
+      return 1
+    fi
+    line1="$(sed -n 1p "$m")"
+    [ "$line1" = "$RELEASE_MANIFEST_HEADER" ] \
+      || { _rs_fail "RELEASE-MANIFEST line 1 is '$line1', not '$RELEASE_MANIFEST_HEADER'"; return 1; }
+    line2="$(sed -n 2p "$m")"
+    case "$line2" in
+      "tag $tag") _rs_fail "RELEASE-MANIFEST's header reads right but is not byte-exact"; return 1 ;;
+      "tag "*) _rs_fail "RELEASE-MANIFEST is signed for tag '${line2#tag }', not $tag -- a replayed or misfiled release"; return 1 ;;
+      *) _rs_fail "RELEASE-MANIFEST line 2 is '$line2', not 'tag $tag'"; return 1 ;;
+    esac
+  fi
+  # Then SHA256SUMS, to the last byte.
+  tail -c +"$((prefix_len + 1))" "$m" | cmp -s - "$sums" \
+    || { _rs_fail "RELEASE-MANIFEST's SUMS section is not byte-identical to $sums"; return 1; }
+  release_tag_in_range "$principal" "$tag" || return 1
+  _rs_ok "RELEASE-MANIFEST verifies: $tag, signed by $principal, SUMS section identical to SHA256SUMS"
+  return 0
+}
