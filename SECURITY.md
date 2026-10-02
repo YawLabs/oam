@@ -78,8 +78,9 @@ the matching tag tells you exactly which V8 you have.
 
 ## Release integrity
 
-Release binaries are currently **unsigned**, published with a `SHA256SUMS`
-file alongside the assets. Verify your download against it:
+Release binaries are not yet code-signed (Authenticode or Apple Developer
+ID). Every release publishes a `SHA256SUMS` file alongside the assets. Verify
+your download against it:
 
 ```
 sha256sum -c SHA256SUMS --ignore-missing
@@ -87,8 +88,20 @@ sha256sum -c SHA256SUMS --ignore-missing
 
 A checksum file served from the same place as the binaries protects against
 corruption and mirror tampering, not against someone who has compromised the
-release channel itself. Code signing is a planned addition; until it lands,
-treat the checksums as integrity, not authenticity.
+release channel itself.
+
+From `v0.18.0` on, each release also carries `RELEASE-MANIFEST` (the tag plus
+the `SHA256SUMS` lines) and `RELEASE-MANIFEST.sig`, an SSH signature made with
+an offline-backed ed25519 release key. The signature is what proves
+authenticity. Check the key fingerprints against this list, which is also
+published in `release-keys/README.md` and the release notes:
+
+| Key | Fingerprint |
+|---|---|
+| `oam-release-k1` (current) | `SHA256:zB7Aq4Ky/U90VJ4sAEp0e2A65KfQpiyQXJI4FuT2oss` |
+| `oam-release-k2` (next, offline) | `SHA256:Uy7nugF5mDzfM/8/fcUti9K+sQMbn/LdRAk+sIbWYs4` |
+
+To verify a release by hand, see `release-keys/README.md`.
 
 ## How fixes are disclosed
 
