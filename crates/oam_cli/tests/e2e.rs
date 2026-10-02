@@ -1180,6 +1180,45 @@ fn top_level_await_settles_on_microtasks() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "settled");
 }
 
+// V8 settles a FinalizationRegistry cleanup and an async WebAssembly compile
+// from FOREGROUND TASKS it posts to the isolate's platform; the isolate's own
+// event loop has to run them (crates/oam_engine/src/platform.rs). Nothing ran
+// them, so the cleanup callback never fired and `WebAssembly.instantiate`
+// never settled -- the hang behind undici 6 from npm, whose first request
+// awaits its llhttp parser's async compile. A worker is its own isolate on
+// its own loop, so it is covered too. Lines are sorted: which of the two
+// lands first is the scheduler's, in node as well.
+#[test]
+fn v8_foreground_tasks_run_on_the_main_and_worker_loops() {
+    let main = write_temp(
+        "v8_foreground_tasks.cjs",
+        r#"const { Worker, isMainThread, parentPort } = require('worker_threads');
+// (module (func (export "f") (result i32) i32.const 42))
+const bytes = new Uint8Array([0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,3,2,1,0,7,5,1,1,102,0,0,10,6,1,4,0,65,42,11]);
+if (isMainThread) {
+  const fr = new FinalizationRegistry((held) => console.log('finalized', held));
+  (() => { fr.register({}, 'garbage'); })();
+  setTimeout(() => gc(), 0);
+  new Worker(__filename).on('message', (m) => console.log('worker compiled', m));
+  setTimeout(() => {}, 300);
+} else {
+  WebAssembly.instantiate(bytes).then(({ instance }) => parentPort.postMessage(instance.exports.f()));
+}
+"#,
+    );
+    let out = oam(&["--expose-gc", "run", main.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "exit {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut lines: Vec<&str> = stdout.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(lines, ["finalized garbage", "worker compiled 42"]);
+}
+
 // ---------------------------------------------------- node: compat wave 1
 
 /// Run a script and return trimmed stdout, failing loudly on a bad exit.
@@ -4568,6 +4607,48 @@ fn readable_stream_core_and_text_pipeline() {
     assert_eq!(lines[2], "ab");
     assert_eq!(lines[3], "true 3");
     assert_eq!(lines[4], "xy xy");
+}
+
+/// The web streams' queues dequeue in O(1). They were drained with
+/// Array#shift, which is O(n) here, so any queue a producer ran ahead of went
+/// quadratic: 160k writer.write() calls issued without awaiting took 45 s
+/// on a debug build, and 300k took 143 s. With an O(1) dequeue, 200k of each
+/// takes well under a second. The checks cover a writable's chunk and
+/// write-request queues, a readable's chunk queue, and its pending reads.
+#[test]
+fn web_stream_queues_drain_in_linear_time() {
+    let started = std::time::Instant::now();
+    let stdout = run_ok(
+        "streams_linear_queues.mjs",
+        "const N = 200000;\n\
+         let written = 0;\n\
+         const w = new WritableStream({ write() { written++; } }).getWriter();\n\
+         let last;\n\
+         for (let i = 0; i < N; i++) last = w.write(i);\n\
+         await last;\n\
+         await w.close();\n\
+         let c;\n\
+         const rs = new ReadableStream({ start(x) { c = x; } }, { highWaterMark: Infinity });\n\
+         for (let i = 0; i < N; i++) c.enqueue(i);\n\
+         c.close();\n\
+         const r = rs.getReader();\n\
+         let read = 0;\n\
+         while (!(await r.read()).done) read++;\n\
+         let d;\n\
+         const rs2 = new ReadableStream({ start(x) { d = x; } });\n\
+         const r2 = rs2.getReader();\n\
+         const pending = [];\n\
+         for (let i = 0; i < N; i++) pending.push(r2.read());\n\
+         for (let i = 0; i < N; i++) d.enqueue(i);\n\
+         const last2 = await pending[N - 1];\n\
+         console.log(written, read, last2.value);",
+    );
+    assert_eq!(stdout, "200000 200000 199999");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "draining 200k-item stream queues took {:?}",
+        started.elapsed()
+    );
 }
 
 #[test]
@@ -16928,11 +17009,11 @@ fn fs_mkdtemp_symlink_readlink_link_chmod_truncate() {
          import os from 'node:os';\n\
          \n\
          // mkdtemp (sync)\n\
-         const dir = fs.mkdtempSync('oam-test-');\n\
+         const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oam-test-'));\n\
          console.log('mkdtempSync:', dir.includes('oam-test-'));\n\
          \n\
          // mkdtemp (async)\n\
-         const dir2 = await fsp.mkdtemp('oam-async-');\n\
+         const dir2 = await fsp.mkdtemp(path.join(os.tmpdir(), 'oam-async-'));\n\
          console.log('mkdtemp:', dir2.includes('oam-async-'));\n\
          \n\
          // write a file for testing\n\
@@ -17783,7 +17864,7 @@ fn fs_promises_open_file_handle() {
          import path from 'node:path';\n\
          import os from 'node:os';\n\
          \n\
-         const dir = await fsp.mkdtemp('oam-fh-');\n\
+         const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'oam-fh-'));\n\
          const filePath = path.join(dir, 'test.txt');\n\
          \n\
          // Open for write\n\
@@ -30384,6 +30465,88 @@ fn every_path_fs_op_respects_the_permission_model() {
             stdout.contains(&format!("{op}=ALLOWED")),
             "{op} must succeed once fs read+write are granted:\n{stdout}"
         );
+    }
+}
+
+/// A relative path is checked where it points: node resolves it against the
+/// cwd of the moment before matching the grant, and resolves a relative
+/// grant (`--allow-fs-write=.`) once at startup. oam matched the raw string,
+/// so a relative target never matched an absolute grant: under
+/// `--allow-fs-write=<cwd>` mkdtempSync("dt-") (template "dt-XXXXXX", which
+/// node's binding checks unresolved), writeFileSync("wf-x") and
+/// mkdirSync("mk-x") were all denied where node v22.22.2 allows them.
+/// Expected lines measured against node v22.22.2 on Windows.
+#[test]
+fn a_relative_path_is_checked_against_the_cwd_as_node_does() {
+    let script = write_temp(
+        "fs_perm_relative.cjs",
+        "const fs = require('fs'), fsp = require('fs/promises');\n\
+         const t = (label, fn) => {\n\
+           try { const r = fn(); console.log(label + '=' + (typeof r === 'string' ? r.replace(/[A-Za-z0-9]{6}$/, '<6>') : 'OK')); }\n\
+           catch (e) { console.log(label + '=' + e.code + ' ' + JSON.stringify(e.resource ?? e.path)); }\n\
+         };\n\
+         t('mkdtemp', () => fs.mkdtempSync('dt-'));\n\
+         t('mkdtempDot', () => fs.mkdtempSync('./dt-'));\n\
+         t('mkdtempSub', () => fs.mkdtempSync('sub/dt-'));\n\
+         t('mkdtempEmpty', () => fs.mkdtempSync(''));\n\
+         t('mkdtempUp', () => fs.mkdtempSync('../A/dt-'));\n\
+         t('mkdtempUpViaSub', () => fs.mkdtempSync('sub/../../A/dt-'));\n\
+         t('write', () => fs.writeFileSync('wf-x', 'x'));\n\
+         t('mkdir', () => fs.mkdirSync('mk-x'));\n\
+         process.chdir('../A');\n\
+         t('chdirA.writeHere', () => fs.writeFileSync('wf-y', 'x'));\n\
+         t('chdirA.writeBack', () => fs.writeFileSync('../B/wf-z', 'x'));\n\
+         process.chdir('../B/sub');\n\
+         t('chdirSub.write', () => fs.writeFileSync('wf-s', 'x'));\n\
+         fsp.mkdtemp('./pr-').then((r) => console.log('promises=' + r.replace(/[A-Za-z0-9]{6}$/, '<6>')),\n\
+           (e) => console.log('promises=' + e.code));\n",
+    );
+    let script = script.to_string_lossy().to_string();
+    for (case, grant) in [("abs", None), ("dot", Some(".")), ("up", Some("../B"))] {
+        let root = write_temp(&format!("fs_perm_relative_{case}/B/sub/.keep"), "")
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        std::fs::create_dir_all(root.parent().unwrap().join("A")).unwrap();
+        let abs = root.to_string_lossy().to_string();
+        let grant = format!("--allow-fs-write={}", grant.unwrap_or(&abs));
+        let mut cmd = oam_command(&["--permission", "--allow-fs-read=*", &grant, &script]);
+        cmd.current_dir(&root);
+        let out = bounded_output(&mut cmd);
+        let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+        let expected = [
+            "mkdtemp=dt-<6>",
+            "mkdtempDot=./dt-<6>",
+            "mkdtempSub=sub/dt-<6>",
+            // Admitted, then refused by mkdtemp itself, as node does.
+            "mkdtempEmpty=EINVAL \"XXXXX\"",
+            "mkdtempUp=ERR_ACCESS_DENIED \"../A/dt-XXXXXX\"",
+            "mkdtempUpViaSub=ERR_ACCESS_DENIED \"sub/../../A/dt-XXXXXX\"",
+            "write=OK",
+            "mkdir=OK",
+            "chdirA.writeHere=ERR_ACCESS_DENIED",
+            "chdirA.writeBack=OK",
+            // A relative grant was resolved at startup, not at the check.
+            "chdirSub.write=OK",
+            "promises=./pr-<6>",
+        ];
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(
+            lines.len(),
+            expected.len(),
+            "grant {grant}:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for (line, want) in lines.iter().zip(expected) {
+            assert!(
+                line.starts_with(want),
+                "grant {grant}: want {want}, got {line}\n{stdout}"
+            );
+        }
+        assert!(root.join("wf-x").is_file() && root.join("mk-x").is_dir());
+        assert!(!root.parent().unwrap().join("A").join("wf-y").exists());
     }
 }
 

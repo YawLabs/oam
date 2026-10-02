@@ -32,6 +32,7 @@ pub mod napi;
 mod node_ops;
 mod ops;
 pub mod permissions;
+mod platform;
 pub mod replay;
 mod timers;
 mod vm_context;
@@ -105,7 +106,15 @@ pub fn init_platform_with_flags(v8_flags: &[&str]) {
         if !v8_flags.is_empty() {
             v8::V8::set_flags_from_string(&v8_flags.join(" "));
         }
-        let platform = v8::new_default_platform(0, false).make_shared();
+        // V8's default platform, with its foreground tasks handed to the
+        // isolate's own event loop (platform.rs) instead of a queue nothing
+        // pumps. The worker pool keeps NewDefaultPlatform's size: one thread
+        // per core but one, between 1 and 16.
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |n| n.get().saturating_sub(1))
+            .clamp(1, 16) as u32;
+        let platform =
+            v8::new_custom_platform(workers, false, false, platform::OamPlatform).make_shared();
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();
     });
@@ -119,6 +128,9 @@ pub struct JsRuntime {
     inspector: Option<inspector::InspectorState>,
     isolate: v8::OwnedIsolate,
     context: v8::Global<v8::Context>,
+    /// The isolate's V8 foreground-task queues. Declared AFTER `isolate` so
+    /// the registry entry outlives the isolate's disposal (see platform.rs).
+    platform_tasks: platform::Registration,
 }
 
 /// process.argv as declared by the embedder ([exe, script, ...script-args]).
@@ -510,7 +522,7 @@ impl JsRuntime {
         // requested cap -- this is the knob Node's --max-old-space-size maps
         // to -- so OAM_MAX_HEAP_MB=64 actually caps around 64 MB.
         params = params.set_max_old_generation_size_in_bytes(max_bytes);
-        let mut isolate = v8::Isolate::new(params);
+        let (mut isolate, platform_tasks) = platform::new_isolate(params);
         // EXPLICIT microtask policy (docs/design/nexttick-engine.md): under
         // the default auto policy V8 flushes the microtask queue itself
         // whenever the API call depth reaches zero -- BEFORE the host can
@@ -599,6 +611,7 @@ impl JsRuntime {
             inspector: None,
             isolate,
             context,
+            platform_tasks,
         }
     }
 
@@ -635,6 +648,7 @@ impl JsRuntime {
         if self.isolate.get_slot::<oam_core::CoreRuntime>().is_none() {
             self.isolate
                 .set_slot(oam_core::CoreRuntime::new().expect("tokio runtime builds"));
+            attach_loop_waker(&mut self.isolate);
         }
     }
 
@@ -932,6 +946,24 @@ impl Drop for JsRuntime {
             let context = scope.get_current_context();
             inspector.teardown(context);
         }
+        // Destroy the V8 tasks still queued while the isolate is alive and
+        // this is its thread; posts from here on are refused.
+        self.platform_tasks.close();
+    }
+}
+
+/// Point the isolate's V8 foreground-task wakes at its current CoreRuntime's
+/// op channel -- the one its event loop blocks on. Call after every
+/// CoreRuntime install.
+pub(crate) fn attach_loop_waker(isolate: &mut v8::Isolate) {
+    let Some(waker) = isolate
+        .get_slot::<oam_core::CoreRuntime>()
+        .map(oam_core::CoreRuntime::loop_waker)
+    else {
+        return;
+    };
+    if let Some(tasks) = isolate.get_slot::<platform::PlatformTasks>() {
+        tasks.0.set_waker(waker);
     }
 }
 

@@ -195,18 +195,7 @@
           "unref"
         ],
         "global:Buffer.prototype": [
-          "asciiSlice",
-          "base64Slice",
-          "base64Write",
-          "base64urlSlice",
-          "base64urlWrite",
-          "hexSlice",
-          "hexWrite",
-          "latin1Slice",
-          "subarray",
-          "ucs2Slice",
-          "ucs2Write",
-          "utf8Slice"
+          "subarray"
         ],
         "global:Event.prototype": [
           "bubbles",
@@ -252,10 +241,6 @@
         ],
         "global:TextEncoderStream.prototype": [
           "encoding",
-          "readable",
-          "writable"
-        ],
-        "global:TransformStream.prototype": [
           "readable",
           "writable"
         ],
@@ -664,18 +649,7 @@
           "unref"
         ],
         "global:Buffer.prototype": [
-          "asciiSlice",
-          "base64Slice",
-          "base64Write",
-          "base64urlSlice",
-          "base64urlWrite",
-          "hexSlice",
-          "hexWrite",
-          "latin1Slice",
-          "subarray",
-          "ucs2Slice",
-          "ucs2Write",
-          "utf8Slice"
+          "subarray"
         ],
         "global:Event.prototype": [
           "bubbles",
@@ -721,10 +695,6 @@
         ],
         "global:TextEncoderStream.prototype": [
           "encoding",
-          "readable",
-          "writable"
-        ],
-        "global:TransformStream.prototype": [
           "readable",
           "writable"
         ],
@@ -1118,18 +1088,7 @@
           "unref"
         ],
         "global:Buffer.prototype": [
-          "asciiSlice",
-          "base64Slice",
-          "base64Write",
-          "base64urlSlice",
-          "base64urlWrite",
-          "hexSlice",
-          "hexWrite",
-          "latin1Slice",
-          "subarray",
-          "ucs2Slice",
-          "ucs2Write",
-          "utf8Slice"
+          "subarray"
         ],
         "global:Event.prototype": [
           "bubbles",
@@ -1175,10 +1134,6 @@
         ],
         "global:TextEncoderStream.prototype": [
           "encoding",
-          "readable",
-          "writable"
-        ],
-        "global:TransformStream.prototype": [
           "readable",
           "writable"
         ],

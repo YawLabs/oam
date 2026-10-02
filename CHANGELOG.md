@@ -16,6 +16,81 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
+Follow-ups to the 0.17.2 batch, across fs, undici and Buffer, web streams, zlib and http2:
+each change below is held to node v22.22.2 by a conformance case or an e2e test.
+
+### Added
+
+- **http2 trailers work both ways, as in node.** A client stream emits `'trailers'` and
+  supports `waitForTrailers`, `'wantTrailers'`, `sendTrailers()` and `sentTrailers`. Server
+  streams, secure and cleartext, send trailers and receive a request's trailer section as
+  `'trailers'` and as `req.trailers` / `req.rawTrailers`; the compatibility response's
+  `setTrailer()` / `addTrailers()` are sent.
+- **Buffer has node's `*Slice` and `*Write` codecs**: `asciiSlice`, `latin1Slice`,
+  `utf8Slice`, `hexSlice`, `base64Slice`, `base64urlSlice`, `ucs2Slice`, `hexWrite`,
+  `base64Write`, `base64urlWrite` and `ucs2Write`, with `asciiWrite`, `latin1Write` and
+  `utf8Write` corrected to node's defaults and errors.
+- **zlib streams have `params()`**, which changes a deflate or deflateRaw stream's level
+  after a sync flush, and a one-shot given `info: true` returns `{ buffer, engine }`.
+
+### Changed
+
+- **`http2.createServer` serves through the same stream implementation as
+  `createSecureServer`**, so it sends and receives trailers and an h2c request body streams
+  as a secure one does. Its streams still have no `session`.
+
+### Fixed
+
+- **undici from npm hung** on `await WebAssembly.compile()`. V8's foreground tasks (async
+  WebAssembly compile and instantiate, `Atomics.waitAsync`, `FinalizationRegistry` cleanup,
+  GC idle tasks) now run on the isolate's event loop, on the main thread and in workers, so
+  undici from npm works. A worker isolate created at a just-freed isolate's address no
+  longer inherits that isolate's closed task queue.
+- **Buffer hex decoding read whole UTF-16 code units**; it reads each one's low byte and
+  stops at the first non-hex pair, as node does, so `Buffer.from('١٢', 'hex')` is
+  `<Buffer ab>`.
+- **`fs.mkdtemp`, `mkdtempSync` and `fs.promises.mkdtemp` made a timestamped name under the
+  temp directory.** They make node's names -- the prefix as given, relative to the cwd, plus
+  six random `[A-Za-z0-9]` characters -- honor the `encoding` option, check their arguments,
+  warn once on a template ending in X, and name node's path when they fail. On macOS the
+  template's whole run of trailing X's is replaced, as Darwin's `mkdtemp(3)` does under node,
+  and an empty prefix is accepted.
+- **Under `--permission`, a relative fs path is resolved against the cwd before it is
+  matched against a grant**, and a relative `--allow-fs-read` / `--allow-fs-write` entry is
+  resolved at startup, as node does. `writeFileSync("out.txt")`, `mkdirSync` and
+  `mkdtempSync` on a relative path were refused under a grant of the cwd.
+- **A `ReadableStream` pulled before `start()` settled, and `WritableStream` /
+  `TransformStream` ignored their strategies.** The initial pull waits for `start()`, the
+  writable side honors `desiredSize`, `ready` and backpressure, and a transform waits for a
+  read, all in node's order. `type: 'bytes'` streams default to a high-water mark of 0 and
+  count bytes, so fetch, `Response` and `Blob` bodies no longer read ahead.
+- **Web streams refused, released and piped differently from node's.** A byte stream refuses
+  a chunk that is not a view without erroring the stream and hands readers `Uint8Array`s;
+  the constructors validate `type` and `size` in node's order; `reader.releaseLock()`
+  rejects `reader.closed` and pending reads with node's coded errors; and `pipeTo()` fills
+  the destination's high-water mark and honors `options.signal`, so an idle source with an
+  erroring destination no longer hangs.
+- **zlib accepted options node refuses.** Every constructor and one-shot validates `level`,
+  `memLevel`, `strategy`, `windowBits`, `chunkSize`, `dictionary` and the brotli params as
+  node does (`deflateSync('x', { level: 99 })` throws `ERR_OUT_OF_RANGE`). The streams take
+  node's Transform options (`highWaterMark`, `autoDestroy`, `emitClose`, `allowHalfOpen`,
+  `signal`), and the one-shot forms check them and honor a signal. `DeflateRaw` turns
+  `windowBits` 8 into 9, and a zlib class called without `new` returns a stream.
+- **A zlib header differed from node's at some levels**; it matches at every level, so a
+  level-0 stream raised by `params()` inflates under node with options. A callback form
+  given `null` or `undefined` runs on empty input, and a brotli stream cut short fails with
+  `Z_BUF_ERROR`.
+- **http2 trailer values could hang a response.** They reach the peer as node's do (one byte
+  per UTF-16 unit, a field the receiving nghttp2 would drop left out, an empty section for
+  one with a NUL byte). `'trailers'` fires whether or not the body ahead of it is read, a
+  server stream that has responded stays open for the rest of the request, and a client's
+  `'wantTrailers'` / `'finish'` order matches node's.
+
+### Performance
+
+- **The web streams' queues dequeue in O(1)**, so a producer that runs ahead no longer goes
+  quadratic: 300k unawaited writes take 0.2 s instead of 143 s.
+
 ## [0.17.2] - YYYY-MM-DD
 
 Node-compat depth across fetch, the http client and server, net, dns, undici, zlib, fs and

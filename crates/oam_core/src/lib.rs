@@ -22,7 +22,8 @@ pub use oam_diagnostics as diagnostics;
 pub mod byte_pipe;
 pub mod child;
 pub mod cluster;
-/// node:zlib's deflate and deflateRaw with the dictionary option.
+/// node:zlib's deflaters: gzip, zlib and raw deflate, with the dictionary
+/// option and `params()`.
 mod deflate;
 pub mod dns;
 /// oam's own HTTP client transport for the `fetch` op (#143).
@@ -84,6 +85,29 @@ pub type OpId = u64;
 /// recognize a signal (which has no parked PromiseResolver and was never
 /// counted in `inflight`) and route it to `process.emit(name)`.
 pub const SIGNAL_OP_ID: OpId = 0;
+
+/// Sentinel op id for a [`LoopWaker`] wake: V8 posted a foreground task (an
+/// async WebAssembly compile finishing, a FinalizationRegistry cleanup, an
+/// `Atomics.waitAsync` notify) for the isolate this channel serves. `next_id`
+/// counts up from 1 and never reaches it. Like a signal it was never counted
+/// in `inflight`, carries no resolver, and is not part of the recorded op
+/// stream: the engine runs the queued tasks at the top of its next turn.
+pub const PLATFORM_TASK_OP_ID: OpId = OpId::MAX;
+
+/// Wakes an event loop blocked on its op channel, from any thread. Held by
+/// the engine's V8 platform glue; a wake for a loop that has gone away is a
+/// no-op.
+#[derive(Clone)]
+pub struct LoopWaker(mpsc::Sender<OpCompletion>);
+
+impl LoopWaker {
+    pub fn wake(&self) {
+        let _ = self.0.send(OpCompletion {
+            id: PLATFORM_TASK_OP_ID,
+            outcome: OpOutcome::Done,
+        });
+    }
+}
 
 /// One Node system error, fully shaped on the native side: the fields node
 /// puts on the error a libuv or resolver failure produces.
@@ -383,12 +407,29 @@ pub type OutboundBodies = std::sync::Arc<
         HashMap<
             u64,
             (
-                Option<tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>>,
-                Option<tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>>,
+                Option<tokio::sync::mpsc::Sender<OutboundItem>>,
+                Option<tokio::sync::mpsc::Receiver<OutboundItem>>,
             ),
         >,
     >,
 >;
+/// One item down an outbound request-body channel: a frame of the body --
+/// the bytes JS wrote, or the trailer section an http2 client stream's
+/// `sendTrailers()` ends it with -- or an `Err` that aborts the request
+/// (`fetchBodyChannelCancel`).
+pub type OutboundItem = Result<hyper::body::Frame<bytes::Bytes>, String>;
+
+/// The [`OutboundItem`] for bytes JS wrote (no copy: the bytes move).
+pub fn outbound_data(bytes: Vec<u8>) -> OutboundItem {
+    Ok(hyper::body::Frame::data(bytes::Bytes::from(bytes)))
+}
+
+/// The [`OutboundItem`] for a trailer section JS hands over as `[name, value]`
+/// pairs (each value one byte per code point, as node's nghttp2 sends it);
+/// `None` when a name or a value cannot go out as a field.
+pub fn outbound_trailers(pairs: &[(String, String)]) -> Option<OutboundItem> {
+    http_server::trailer_fields(pairs).map(|map| Ok(hyper::body::Frame::trailers(map)))
+}
 /// Wakes an in-flight `fetch_body_read`. The tombstone set above is
 /// checked only AFTER `chunk()` resolves, so a server that simply stops
 /// sending leaves the read parked forever and pins the event loop. This
@@ -947,7 +988,7 @@ pub fn adopt_inherited_fd(registry: &SyncFileRegistry, fd: u64) -> bool {
 /// zlibStreamWrite and _flush to zlibStreamFlush.
 ///
 /// Variants:
-/// - Compress/Decompress: gzip/deflate/deflateRaw (flate2 encoders,
+/// - Compress/Decompress: gzip/deflate/deflateRaw (NodeDeflate encoders,
 ///   NodeInflate decoders), truly incremental.
 /// - BrotliCompress/BrotliDecompress: pure-Rust brotli via the `brotli` crate.
 /// - HandleCompress/HandleDecompress: node's low-level zlib handle.
@@ -960,9 +1001,7 @@ pub enum ZlibStream {
     // is paid once per brotli stream, never on the per-chunk write path.
     BrotliCompress(Box<BrotliCompressor>),
     BrotliDecompress(Box<BrotliDecompressor>),
-    HandleCompress(flate2::Compress),
-    /// A handle deflating with node's `dictionary` option.
-    HandleDictCompress(Box<zlib::DictDeflate>),
+    HandleCompress(Box<zlib::NodeDeflate>),
     HandleDecompress(Box<zlib::NodeInflate>),
 }
 
@@ -1162,7 +1201,7 @@ impl CoreRuntime {
         let handle = self
             .next_body
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(8);
+        let (tx, rx) = tokio::sync::mpsc::channel::<OutboundItem>(8);
         self.outbound_bodies
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1471,11 +1510,16 @@ impl CoreRuntime {
         self.inflight > 0
     }
 
+    /// A handle that wakes this runtime's op channel (see [`LoopWaker`]).
+    pub fn loop_waker(&self) -> LoopWaker {
+        LoopWaker(self.tx.clone())
+    }
+
     /// Bookkeeping shared by `try_recv` and `recv_deadline`: a settled op
     /// stops counting, and leaves its handle's in-flight set (its id must
     /// never be re-counted by `set_handle_ref` again).
     fn note_settled(&mut self, completion: &OpCompletion) {
-        if completion.id == SIGNAL_OP_ID {
+        if completion.id == SIGNAL_OP_ID || completion.id == PLATFORM_TASK_OP_ID {
             // Never counted in `inflight` (a bare listener must not pin the
             // loop), so it must not decrement -- that would underflow at 0.
             return;
@@ -2416,6 +2460,170 @@ pub fn fs_error_path(path: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Borrowed(path)
 }
 
+/// The template node's binding hands libuv for `mkdtemp(prefix)` (src/
+/// node_file.cc `Mkdtemp`, v22.22.2): the prefix as given -- NOT resolved,
+/// not joined to any temp directory -- with the `XXXXXX` libuv replaces.
+///
+/// The binding appends the X's with `snprintf(out + len, len + 6, "%s",
+/// "XXXXXX")`, whose size bound is the length of the WHOLE buffer, so an
+/// empty prefix gets only five X's, which libuv refuses on Windows and glibc (macOS's
+/// mkdtemp(3) fills them, see `MKDTEMP_FILLS_X_RUN`): node's
+/// `mkdtempSync("")` fails `EINVAL: invalid argument, mkdtemp 'XXXXX'`. That
+/// quirk is reproduced here rather than in `mkdtemp`, so the permission check
+/// and the error name the same template node's do.
+pub fn mkdtemp_template(prefix: &str) -> String {
+    let x_count = if prefix.is_empty() { 5 } else { 6 };
+    let mut template = String::with_capacity(prefix.len() + 6);
+    template.push_str(prefix);
+    template.push_str(&"XXXXXX"[..x_count]);
+    template
+}
+
+/// What libuv's mkdtemp puts in place of the template's X's: characters of
+/// [a-zA-Z0-9], the alphabet of libuv's Windows `fs__make_tmp`, glibc's
+/// `__gen_tempname` and Darwin's `_gettemp` (`padchar`) alike.
+const MKDTEMP_CHARS: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+/// How many base-62 characters one 64-bit draw spells: 62^10 < 2^64 < 62^11.
+/// Six X's (every platform but macOS, and macOS for a prefix not ending in
+/// X) still take exactly one draw per name.
+const MKDTEMP_CHARS_PER_DRAW: usize = 10;
+
+/// Whether this platform's mkdtemp replaces the template's WHOLE run of
+/// trailing X's rather than exactly the last six. libuv's Unix
+/// `uv__fs_mkdtemp` hands the template to the libc's mkdtemp(3) as given,
+/// and Darwin's (`_gettemp`, Libc's FreeBSD-derived `mktemp.c`) fills
+/// `while (trv >= path && *trv == 'X')` with no minimum: there node's
+/// `mkdtempSync("aX")` (template `aXXXXXXX`) makes `a` plus seven random
+/// characters, and the five-X template of an empty prefix is accepted.
+/// node's fs docs say as much ("some platforms, notably the BSDs, can return
+/// more than six random characters, and replace trailing X characters in
+/// prefix"). glibc and libuv's Windows loop replace exactly six and refuse
+/// fewer. Derived from source, not run on a Mac: conformance cases 302
+/// (empty prefix) and 303 (a prefix of X's) measure it on darwin.
+const MKDTEMP_FILLS_X_RUN: bool = cfg!(target_os = "macos");
+
+/// How many names mkdtemp tries before giving up: the platform's `TMP_MAX`,
+/// as libuv's Windows loop and glibc's both count -- 32767 in the MSVC CRT,
+/// 62^3 in glibc. macOS's libc keeps trying past that; a run of 238328
+/// collisions is not a case anyone reaches.
+#[cfg(windows)]
+const MKDTEMP_TRIES: u32 = 32767;
+#[cfg(not(windows))]
+const MKDTEMP_TRIES: u32 = 238_328;
+
+/// node's `mkdtemp` (libuv `uv_fs_mkdtemp`), the one implementation the sync
+/// op and the async op both run: `template` (from `mkdtemp_template`) must
+/// end in `XXXXXX` or the call fails EINVAL (on macOS it need only be
+/// non-empty); each try replaces those six characters (on macOS the whole
+/// trailing run of X's, see `MKDTEMP_FILLS_X_RUN`) with fresh ones from the
+/// OS CSPRNG -- 64-bit draws spelled in base 62, libuv's Windows scheme --
+/// and creates that directory, trying again only when the name already
+/// exists. The directory is made 0700 on Unix, as mkdtemp(3) makes it.
+///
+/// Ok is the created path: the template with its X's replaced, separators and
+/// relativity exactly as given (node returns `sub/x-AbC123` for `sub/x-`).
+/// Err carries the path libuv's request holds afterwards (`req->path`), which
+/// is what node's ASYNC error names. On Windows (`fs__mktemp`) libuv writes
+/// the name back only on success, so a failed CreateDirectoryW leaves the
+/// template (`mkdtemp 'nope/x-XXXXXX'`), and a template without six X's, a
+/// failed RtlGenRandom or running out of tries "clobbers" it to the empty
+/// string (`mkdtemp ''`). On Unix mkdtemp(3) fills libuv's copy in place
+/// before creating, so a failed create leaves the last name tried, and a
+/// template it refuses is left untouched. node's SYNC error names
+/// the template on every platform (`FSReqWrapSync::path_p` is the binding's
+/// own buffer, which libuv never writes), so the sync op ignores this path.
+/// Running out of tries fails EEXIST on both (glibc's answer, and on Windows
+/// the ERROR_ALREADY_EXISTS still in GetLastError); at one collision in 62^6
+/// per try, nothing gets that far.
+pub fn mkdtemp(template: &str) -> Result<String, (std::io::Error, String)> {
+    // libuv reports a failed RtlGenRandom as EIO; io::Error::other is what
+    // node_error_code reads as EIO.
+    mkdtemp_drawing(template, MKDTEMP_TRIES, MKDTEMP_FILLS_X_RUN, || {
+        getrandom::u64().map_err(|e| std::io::Error::other(e.to_string()))
+    })
+}
+
+/// `mkdtemp` over a given number of tries, either X rule (`fills_x_run`:
+/// macOS's), and a given source of 64-bit draws, so the tests can force
+/// collisions and run both rules on any host.
+fn mkdtemp_drawing(
+    template: &str,
+    tries: u32,
+    fills_x_run: bool,
+    mut next_draw: impl FnMut() -> std::io::Result<u64>,
+) -> Result<String, (std::io::Error, String)> {
+    let x_run = template.bytes().rev().take_while(|&b| b == b'X').count();
+    let refused = if fills_x_run {
+        template.is_empty()
+    } else {
+        x_run < 6
+    };
+    if refused {
+        let e = std::io::Error::from(std::io::ErrorKind::InvalidInput);
+        return Err((e, mkdtemp_refused_path(template)));
+    }
+    let fill = if fills_x_run { x_run } else { 6 };
+    // Darwin tries a template with no X's once: it has no permutation to
+    // cycle through and fails EEXIST. (node's templates always end in X.)
+    let tries = if fill == 0 { 1 } else { tries };
+    // The X's are ASCII, so this is a char boundary.
+    let stem = &template[..template.len() - fill];
+    let mut path = String::with_capacity(template.len());
+    let mut last_error = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
+    for _ in 0..tries {
+        path.clear();
+        path.push_str(stem);
+        let mut draw = 0;
+        for i in 0..fill {
+            if i % MKDTEMP_CHARS_PER_DRAW == 0 {
+                draw = next_draw().map_err(|e| (e, mkdtemp_refused_path(template)))?;
+            }
+            path.push(char::from(MKDTEMP_CHARS[(draw % 62) as usize]));
+            draw /= 62;
+        }
+        match create_mkdtemp_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last_error = e,
+            Err(e) => return Err((e, mkdtemp_failed_path(template, &path))),
+        }
+    }
+    let exhausted = if cfg!(windows) { String::new() } else { path };
+    Err((last_error, exhausted))
+}
+
+#[cfg(unix)]
+fn create_mkdtemp_dir(path: &str) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+#[cfg(not(unix))]
+fn create_mkdtemp_dir(path: &str) -> std::io::Result<()> {
+    std::fs::create_dir(path)
+}
+
+/// What libuv's request holds after `mkdtemp` refuses before creating
+/// anything: Windows clobbers it to the empty string, Unix leaves the
+/// template. See `mkdtemp`.
+fn mkdtemp_refused_path(template: &str) -> String {
+    if cfg!(windows) {
+        String::new()
+    } else {
+        template.to_string()
+    }
+}
+
+/// What libuv's request holds after a create fails other than EEXIST: the
+/// template on Windows, the name tried on Unix. See `mkdtemp`.
+fn mkdtemp_failed_path(template: &str, tried: &str) -> String {
+    if cfg!(windows) {
+        template.to_string()
+    } else {
+        tried.to_string()
+    }
+}
+
 /// node's `path.win32.resolve(path)` (lib/path.js; src/path.cc `PathResolve`
 /// is the same algorithm): `cwd` is `process.cwd()`, and `drive_cwd(device)`
 /// the per-drive current directory Windows keeps in the `=C:` environment
@@ -2844,10 +3052,8 @@ pub fn strip_unc_prefix(path: &std::path::Path) -> String {
 /// _transform feeds chunks via zlibStreamWrite and _flush finalizes via
 /// zlibStreamFlush.
 pub mod zlib {
-    pub use crate::deflate::DictDeflate;
+    pub use crate::deflate::NodeDeflate;
     pub use crate::inflate::{NodeInflate, Wrap, ZlibError};
-    use flate2::Compression;
-    use std::io::Write;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Format {
@@ -2867,30 +3073,10 @@ pub mod zlib {
         }
     }
 
+    /// All of `bytes` deflated in `format` at node's `level` (-1 is zlib's
+    /// default, 6).
     pub fn compress(bytes: &[u8], format: Format, level: i32) -> std::io::Result<Vec<u8>> {
-        // Node levels: -1 default, 0..=9. flate2 default is 6, same as zlib.
-        let level = if (0..=9).contains(&level) {
-            Compression::new(level as u32)
-        } else {
-            Compression::default()
-        };
-        match format {
-            Format::Gzip => {
-                let mut encoder = flate2::write::GzEncoder::new(Vec::new(), level);
-                encoder.write_all(bytes)?;
-                encoder.finish()
-            }
-            Format::Deflate => {
-                let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), level);
-                encoder.write_all(bytes)?;
-                encoder.finish()
-            }
-            Format::DeflateRaw => {
-                let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), level);
-                encoder.write_all(bytes)?;
-                encoder.finish()
-            }
-        }
+        compress_capped(bytes, format, level, None, None)
     }
 
     /// The message of the `io::Error` `decompress_capped` returns when the
@@ -3063,20 +3249,8 @@ pub mod zlib {
         }
     }
 
-    /// The deflater for node's `dictionary` option, if it applies: deflate
-    /// and deflateRaw with a non-empty dictionary (node_zlib.cc's
-    /// SetDictionary; gzip ignores the option, and an empty one is none).
-    fn dict_deflate(format: Format, level: i32, dictionary: Option<&[u8]>) -> Option<DictDeflate> {
-        let dictionary = dictionary.filter(|d| !d.is_empty())?;
-        match format {
-            Format::Gzip => None,
-            Format::Deflate => Some(DictDeflate::new(level, true, dictionary)),
-            Format::DeflateRaw => Some(DictDeflate::new(level, false, dictionary)),
-        }
-    }
-
     /// `compress` with node's `maxOutputLength`, which node applies to the
-    /// encoders as well, and its `dictionary` (see [`DictDeflate`]). The cap
+    /// encoders as well, and its `dictionary` (see [`NodeDeflate`]). The cap
     /// is checked on the finished buffer: compressed output is bounded by the
     /// input, so there is no bomb to stop early.
     pub fn compress_capped(
@@ -3086,10 +3260,7 @@ pub mod zlib {
         max_output: Option<usize>,
         dictionary: Option<&[u8]>,
     ) -> std::io::Result<Vec<u8>> {
-        let out = match dict_deflate(format, level, dictionary) {
-            Some(mut deflater) => deflater.deflate_vec(bytes, Z_FINISH),
-            None => compress(bytes, format, level)?,
-        };
+        let out = NodeDeflate::new(format, level, dictionary).finish_vec(bytes);
         match max_output {
             Some(cap) if out.len() > cap => Err(std::io::Error::other(OUTPUT_TOO_LARGE)),
             _ => Ok(out),
@@ -3115,11 +3286,10 @@ pub mod zlib {
     // ----------------------------------------------------------------
     // Incremental streaming: gzip / deflate / deflateRaw
     //
-    // We use flate2's write-based encoders (GzEncoder, ZlibEncoder,
-    // DeflateEncoder) for compression, draining the backing Vec<u8>
-    // via get_mut() + mem::take() after each write_all. This is truly
-    // incremental: compressed bytes are emitted per-chunk with no need
-    // to buffer the full input.
+    // Compression is NodeDeflate (crate::deflate), miniz's compressor
+    // driven directly: each chunk comes back as the bytes it completed, so
+    // nothing buffers the full input, and params() can change the level
+    // between chunks.
     //
     // Decompression is NodeInflate (crate::inflate): each chunk runs through
     // the inflate state machine and comes back as that chunk's output, with
@@ -3129,51 +3299,24 @@ pub mod zlib {
     // The "unzip" auto-detect variant resolves the format from the first
     // two bytes of the STREAM, however the writes carve it up.
     //
-    // Send requirement: all flate2 encoder types and NodeInflate are Send,
-    // and our wrappers hold no thread-local state.
+    // Send requirement: NodeDeflate and NodeInflate are Send, and our
+    // wrappers hold no thread-local state.
     // ----------------------------------------------------------------
 
-    /// Wraps any of the three flate2 write-encoders behind a uniform
-    /// interface. Created via `StreamCompressor::new`; consumes chunks via
-    /// `write_chunk`; finalizes via `finish` (emits the trailing CRC /
-    /// checksum bytes the format requires).
+    /// An incremental deflater for gzip, deflate or deflateRaw. Created via
+    /// `StreamCompressor::new`; consumes chunks via `write_chunk`;
+    /// finalizes via `finish` (emits the trailing CRC / checksum bytes the
+    /// format requires).
     pub struct StreamCompressor {
-        inner: CompressorInner,
-    }
-
-    enum CompressorInner {
-        Gzip(flate2::write::GzEncoder<Vec<u8>>),
-        Deflate(flate2::write::ZlibEncoder<Vec<u8>>),
-        DeflateRaw(flate2::write::DeflateEncoder<Vec<u8>>),
-        /// deflate or deflateRaw with a dictionary.
-        Dict(Box<DictDeflate>),
+        inner: NodeDeflate,
     }
 
     impl StreamCompressor {
-        /// `dictionary` is node's option (see [`DictDeflate`]).
+        /// `dictionary` is node's option (see [`NodeDeflate`]).
         pub fn new(format: Format, level: i32, dictionary: Option<&[u8]>) -> Self {
-            if let Some(deflater) = dict_deflate(format, level, dictionary) {
-                return Self {
-                    inner: CompressorInner::Dict(Box::new(deflater)),
-                };
+            Self {
+                inner: NodeDeflate::new(format, level, dictionary),
             }
-            let level = if (0..=9).contains(&level) {
-                Compression::new(level as u32)
-            } else {
-                Compression::default()
-            };
-            let inner = match format {
-                Format::Gzip => {
-                    CompressorInner::Gzip(flate2::write::GzEncoder::new(Vec::new(), level))
-                }
-                Format::Deflate => {
-                    CompressorInner::Deflate(flate2::write::ZlibEncoder::new(Vec::new(), level))
-                }
-                Format::DeflateRaw => CompressorInner::DeflateRaw(
-                    flate2::write::DeflateEncoder::new(Vec::new(), level),
-                ),
-            };
-            Self { inner }
         }
 
         /// Feed a chunk. Returns whatever bytes the encoder produced
@@ -3181,39 +3324,26 @@ pub mod zlib {
         /// until it has a full deflate block ready).
         #[inline]
         pub fn write_chunk(&mut self, chunk: &[u8]) -> std::io::Result<Vec<u8>> {
-            match &mut self.inner {
-                CompressorInner::Gzip(enc) => {
-                    enc.write_all(chunk)?;
-                    Ok(std::mem::take(enc.get_mut()))
-                }
-                CompressorInner::Deflate(enc) => {
-                    enc.write_all(chunk)?;
-                    Ok(std::mem::take(enc.get_mut()))
-                }
-                CompressorInner::DeflateRaw(enc) => {
-                    enc.write_all(chunk)?;
-                    Ok(std::mem::take(enc.get_mut()))
-                }
-                CompressorInner::Dict(enc) => Ok(enc.deflate_vec(chunk, 0)),
-            }
+            Ok(self.inner.deflate_vec(chunk, 0))
+        }
+
+        /// node's `params()`: what the encoder holds, under a sync flush,
+        /// then the new level, if any, for what follows.
+        pub fn params(&mut self, level: Option<i32>) -> Vec<u8> {
+            self.inner.params(level)
         }
 
         /// Flush and finalize. Consumes self; returns the tail bytes
         /// (including the gzip/zlib trailer). After this the stream handle
         /// is dropped -- close is implicit.
-        pub fn finish(self) -> std::io::Result<Vec<u8>> {
-            match self.inner {
-                CompressorInner::Gzip(enc) => enc.finish(),
-                CompressorInner::Deflate(enc) => enc.finish(),
-                CompressorInner::DeflateRaw(enc) => enc.finish(),
-                CompressorInner::Dict(mut enc) => Ok(enc.deflate_vec(&[], Z_FINISH)),
-            }
+        pub fn finish(mut self) -> std::io::Result<Vec<u8>> {
+            Ok(self.inner.finish_vec(&[]))
         }
     }
 
-    // `StreamCompressor` is `Send` by auto-derivation: `CompressorInner` holds
-    // only flate2 encoders over `Vec<u8>`, every one of which is `Send`, and the
-    // wrapper adds no thread-affine state. Deliberately NOT a manual
+    // `StreamCompressor` is `Send` by auto-derivation: `NodeDeflate` holds only
+    // miniz's compressor and owned buffers, all `Send`, and the wrapper adds
+    // no thread-affine state. Deliberately NOT a manual
     // `unsafe impl Send` -- that would suppress the compiler's own auto-trait
     // check and silently keep asserting `Send` if the inner types ever stopped
     // being it.
@@ -3471,13 +3601,16 @@ impl BrotliDecompressor {
 
     /// Finalize: close the brotli decompressor and return any remaining
     /// output bytes. `into_inner()` calls `close()` and returns the inner
-    /// Vec; on decompressor error it returns `Err(Vec)` which we convert
-    /// to an io::Error (the partial bytes are discarded on corruption).
+    /// Vec, or `Err(Vec)` when the stream has not ended. Corrupt data fails
+    /// the write that carries it, so a stream that wrote cleanly and does
+    /// not end here stopped short: node's Z_BUF_ERROR "unexpected end of
+    /// file" (node_zlib.cc's brotli `CheckError` under
+    /// BROTLI_OPERATION_FINISH), an empty input included.
     pub fn finish(self) -> std::io::Result<Vec<u8>> {
         self.inner.into_inner().map_err(|_| {
             std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "brotli decompressor: stream is incomplete or corrupt",
+                std::io::ErrorKind::UnexpectedEof,
+                zlib::ZlibError::UNEXPECTED_EOF,
             )
         })
     }
@@ -3495,6 +3628,35 @@ const _: () = {
     assert_send::<BrotliCompressor>();
     assert_send::<BrotliDecompressor>();
 };
+
+// Kept next to the brotli code it guards rather than at the file's end.
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod brotli_tests {
+    use super::{BrotliCompressor, BrotliDecompressor, zlib};
+
+    #[test]
+    fn a_stream_that_stops_short_is_nodes_unexpected_end_of_file() {
+        let mut enc = BrotliCompressor::new();
+        let mut packed = enc.write_chunk(b"hello hello hello").unwrap();
+        packed.extend(enc.finish().unwrap());
+        // Whole: the data. Cut short, or empty: Z_BUF_ERROR, as node's.
+        let mut dec = BrotliDecompressor::new();
+        let mut out = dec.write_chunk(&packed).unwrap();
+        out.extend(dec.finish().unwrap());
+        assert_eq!(out, b"hello hello hello");
+        for cut in [0, 1, 5, packed.len() - 1] {
+            let mut dec = BrotliDecompressor::new();
+            dec.write_chunk(&packed[..cut]).unwrap();
+            let err = dec.finish().unwrap_err();
+            assert_eq!(
+                zlib::zlib_error(&err),
+                Some(zlib::ZlibError::UNEXPECTED_EOF),
+                "cut at {cut}"
+            );
+        }
+    }
+}
 
 /// Built-in op implementations. Plain futures; the engine decides how their
 /// outcomes surface in JS.
@@ -4295,30 +4457,17 @@ pub mod ops {
         }
     }
 
-    /// The directory `mkdtemp(prefix)` will create. Exposed so the op layer
-    /// can permission-check the path that is actually written rather than the
-    /// caller's prefix -- with a relative prefix the two differ (the prefix
-    /// resolves under the system temp dir), so checking the prefix denied
-    /// writes inside a correctly-granted temp dir and vice versa.
-    pub fn mkdtemp_target(prefix: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "{}{}",
-            prefix,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ))
-    }
-
-    /// `dir` comes from `mkdtemp_target(&prefix)`, resolved ONCE by the op
-    /// layer so the path it permission-checked is the path created here.
-    /// Resolving it again would mint a fresh timestamp, leaving the checked
-    /// path and the created path different strings.
-    pub async fn fs_mkdtemp(dir: std::path::PathBuf, prefix: String) -> OpOutcome {
-        match tokio::fs::create_dir(&dir).await {
-            Ok(()) => OpOutcome::Text(super::strip_unc_prefix(&dir)),
-            Err(e) => node_fail_as_passed(e, "mkdtemp", &prefix),
+    /// node's `mkdtemp` on the blocking pool: `template` comes from
+    /// `mkdtemp_template`, built ONCE by the op layer so the template it
+    /// permission-checked is the one created from (node checks the same
+    /// template, X's and all). The work is `super::mkdtemp`, shared with the
+    /// sync op.
+    pub async fn fs_mkdtemp(template: String) -> OpOutcome {
+        let result = tokio::task::spawn_blocking(move || super::mkdtemp(&template)).await;
+        match result {
+            Ok(Ok(dir)) => OpOutcome::Text(dir),
+            Ok(Err((e, path))) => node_fail_as_passed(e, "mkdtemp", &path),
+            Err(e) => OpOutcome::Failed(format!("mkdtemp: {e}")),
         }
     }
 
@@ -4885,11 +5034,11 @@ pub mod ops {
                 super::ZlibStream::BrotliDecompress(dec) => dec
                     .write_chunk(&chunk)
                     .map_err(|e| failed("brotli stream write", e)),
-                super::ZlibStream::HandleCompress(_)
-                | super::ZlibStream::HandleDictCompress(_)
-                | super::ZlibStream::HandleDecompress(_) => Err(Box::new(OpOutcome::Failed(
-                    "zlib handle: use zlibHandleWriteSync, not zlibStreamWrite".into(),
-                ))),
+                super::ZlibStream::HandleCompress(_) | super::ZlibStream::HandleDecompress(_) => {
+                    Err(Box::new(OpOutcome::Failed(
+                        "zlib handle: use zlibHandleWriteSync, not zlibStreamWrite".into(),
+                    )))
+                }
             }
         })
         .await;
@@ -4932,14 +5081,14 @@ pub mod ops {
                 super::ZlibStream::BrotliCompress(enc) => {
                     enc.finish().map_err(|e| failed("brotli stream flush", e))
                 }
-                super::ZlibStream::BrotliDecompress(dec) => {
-                    dec.finish().map_err(|e| failed("brotli stream flush", e))
+                super::ZlibStream::BrotliDecompress(dec) => dec
+                    .finish()
+                    .map_err(|e| Box::new(zlib_decode_failed("brotli stream flush", e))),
+                super::ZlibStream::HandleCompress(_) | super::ZlibStream::HandleDecompress(_) => {
+                    Err(Box::new(OpOutcome::Failed(
+                        "zlib handle: use close(), not zlibStreamFlush".into(),
+                    )))
                 }
-                super::ZlibStream::HandleCompress(_)
-                | super::ZlibStream::HandleDictCompress(_)
-                | super::ZlibStream::HandleDecompress(_) => Err(Box::new(OpOutcome::Failed(
-                    "zlib handle: use close(), not zlibStreamFlush".into(),
-                ))),
             }
         })
         .await;
@@ -4947,6 +5096,32 @@ pub mod ops {
             Ok(Ok(bytes)) => OpOutcome::Bytes(bytes),
             Ok(Err(failure)) => *failure,
             Err(e) => OpOutcome::Failed(format!("zlib stream flush task: {e}")),
+        }
+    }
+
+    /// zlibStreamParams: node's `params()` on a stream. A deflater returns
+    /// what it held, under a sync flush, and compresses what follows at
+    /// `level` if there is one (node changes it on a deflate or deflateRaw
+    /// stream, not gzip); an inflater or brotli stream has nothing to flush,
+    /// and returns no bytes (every write already returned what it decoded).
+    pub async fn zlib_stream_params(
+        streams: super::ZlibRegistry,
+        handle: u64,
+        level: Option<i32>,
+    ) -> OpOutcome {
+        let result = tokio::task::spawn_blocking(move || {
+            let mut guard = streams.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.get_mut(&handle) {
+                Some(super::ZlibStream::Compress(enc)) => Ok(enc.params(level)),
+                Some(_) => Ok(Vec::new()),
+                None => Err(format!("zlib stream: handle {handle} not found")),
+            }
+        })
+        .await;
+        match result {
+            Ok(Ok(bytes)) => OpOutcome::Bytes(bytes),
+            Ok(Err(message)) => OpOutcome::Failed(message),
+            Err(e) => OpOutcome::Failed(format!("zlib stream params task: {e}")),
         }
     }
 
@@ -4979,7 +5154,7 @@ pub mod ops {
             .remove(&handle);
     }
 
-    /// zlibHandleCreate: allocate a low-level flate2 Compress or NodeInflate
+    /// zlibHandleCreate: allocate a low-level NodeDeflate or NodeInflate
     /// handle for Node's zlib binding interface (used by ssh2 etc.).
     /// mode: 1=DEFLATE, 2=INFLATE, 5=DEFLATERAW, 6=INFLATERAW. `dictionary`
     /// is the one node's `handle.init` takes.
@@ -4990,20 +5165,18 @@ pub mod ops {
         level: i32,
         dictionary: Option<&[u8]>,
     ) -> Result<u64, String> {
-        let zlib_header = mode == 1 || mode == 2;
         let dictionary = dictionary.filter(|d| !d.is_empty());
         let stream = match (mode, dictionary) {
-            (1 | 5, Some(dictionary)) => super::ZlibStream::HandleDictCompress(Box::new(
-                super::zlib::DictDeflate::new(level, zlib_header, dictionary),
-            )),
-            (1 | 5, None) => {
-                let lvl = if (0..=9).contains(&level) {
-                    flate2::Compression::new(level as u32)
-                } else {
-                    flate2::Compression::default()
-                };
-                super::ZlibStream::HandleCompress(flate2::Compress::new(lvl, zlib_header))
-            }
+            (1, _) => super::ZlibStream::HandleCompress(Box::new(super::zlib::NodeDeflate::new(
+                super::zlib::Format::Deflate,
+                level,
+                dictionary,
+            ))),
+            (5, _) => super::ZlibStream::HandleCompress(Box::new(super::zlib::NodeDeflate::new(
+                super::zlib::Format::DeflateRaw,
+                level,
+                dictionary,
+            ))),
             (2, _) => super::ZlibStream::HandleDecompress(Box::new(
                 super::zlib::NodeInflate::with_dictionary(super::zlib::Wrap::Zlib, dictionary),
             )),
@@ -5036,23 +5209,6 @@ pub mod ops {
             .ok_or_else(|| std::io::Error::other(format!("zlib handle {handle} not found")))?;
         match stream {
             super::ZlibStream::HandleCompress(c) => {
-                let before_in = c.total_in();
-                let before_out = c.total_out();
-                let fl = match flush {
-                    0 => flate2::FlushCompress::None,
-                    1 => flate2::FlushCompress::Partial,
-                    2 => flate2::FlushCompress::Sync,
-                    3 => flate2::FlushCompress::Full,
-                    4 => flate2::FlushCompress::Finish,
-                    _ => flate2::FlushCompress::None,
-                };
-                c.compress(input, output, fl)
-                    .map_err(|e| std::io::Error::other(format!("zlib handle compress: {e}")))?;
-                let consumed = (c.total_in() - before_in) as usize;
-                let produced = (c.total_out() - before_out) as usize;
-                Ok((output.len() - produced, input.len() - consumed))
-            }
-            super::ZlibStream::HandleDictCompress(c) => {
                 let (consumed, produced) = c.deflate(input, output, flush);
                 Ok((output.len() - produced, input.len() - consumed))
             }
@@ -5708,6 +5864,160 @@ mod os_error_code_tests {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn mkdtemp_template_matches_node_binding() {
+        assert_eq!(mkdtemp_template("x-"), "x-XXXXXX");
+        assert_eq!(mkdtemp_template("sub/"), "sub/XXXXXX");
+        // node's snprintf bound leaves an empty prefix five X's.
+        assert_eq!(mkdtemp_template(""), "XXXXX");
+    }
+
+    /// A fresh directory for one mkdtemp test, relative names joined to it.
+    fn mkdtemp_test_dir(name: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("oam-mkdtemp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        format!("{}/", dir.to_str().unwrap())
+    }
+
+    #[test]
+    fn mkdtemp_names_six_characters_of_base62() {
+        let base = mkdtemp_test_dir("shape");
+        let template = mkdtemp_template(&format!("{base}p-"));
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            let dir = mkdtemp(&template).unwrap();
+            let suffix = dir.strip_prefix(&format!("{base}p-")).unwrap();
+            assert_eq!(suffix.len(), 6, "{dir}");
+            assert!(suffix.bytes().all(|b| b.is_ascii_alphanumeric()), "{dir}");
+            assert!(std::path::Path::new(&dir).is_dir());
+            assert!(seen.insert(dir));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn mkdtemp_tries_again_only_when_the_name_exists() {
+        let base = mkdtemp_test_dir("retry");
+        let template = format!("{base}r-XXXXXX");
+        // Draw 0 spells "aaaaaa" (libuv's least-significant-first base 62),
+        // draw 1 "baaaaa".
+        std::fs::create_dir(format!("{base}r-aaaaaa")).unwrap();
+        let mut draws = [0u64, 0, 1].into_iter();
+        let dir = mkdtemp_drawing(&template, 10, false, || Ok(draws.next().unwrap())).unwrap();
+        assert_eq!(dir, format!("{base}r-baaaaa"));
+        assert_eq!(draws.next(), None);
+
+        // Out of tries: EEXIST, after exactly `tries` draws.
+        let mut count = 0;
+        let (e, path) = mkdtemp_drawing(&template, 3, false, || {
+            count += 1;
+            Ok(0)
+        })
+        .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(count, 3);
+        // libuv's Windows loop clobbers the path to "" when it runs out.
+        let expected = if cfg!(windows) {
+            String::new()
+        } else {
+            format!("{base}r-aaaaaa")
+        };
+        assert_eq!(path, expected);
+
+        // Any other failure stops at once, leaving the template on Windows
+        // (libuv fills it in only on success) and the name tried elsewhere.
+        let missing = format!("{base}nope/q-XXXXXX");
+        let mut count = 0;
+        let (e, path) = mkdtemp_drawing(&missing, 10, false, || {
+            count += 1;
+            Ok(0)
+        })
+        .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(count, 1);
+        if cfg!(windows) {
+            assert_eq!(path, missing);
+        } else {
+            assert_eq!(path, format!("{base}nope/q-aaaaaa"));
+        }
+
+        // A template not ending in six X's is EINVAL, with no draw.
+        let (e, path) = mkdtemp_drawing("XXXXX", 10, false, || unreachable!()).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(path, if cfg!(windows) { "" } else { "XXXXX" });
+
+        // A failed draw is EIO-shaped and refuses like EINVAL.
+        let (e, path) = mkdtemp_drawing(&template, 10, false, || {
+            Err(std::io::Error::other("no entropy"))
+        })
+        .unwrap_err();
+        assert_eq!(node_error_code(&e), "EIO");
+        assert_eq!(path, if cfg!(windows) { "" } else { template.as_str() });
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn mkdtemp_x_rules_six_or_the_whole_run() {
+        let base = mkdtemp_test_dir("xrun");
+        let suffix_of = |dir: &str, stem: &str| {
+            dir.strip_prefix(&format!("{base}{stem}"))
+                .unwrap()
+                .to_string()
+        };
+
+        // Windows / glibc: exactly the last six, prefix X's kept.
+        let six = mkdtemp_drawing(
+            &mkdtemp_template(&format!("{base}xXXXXXX")),
+            10,
+            false,
+            || Ok(0),
+        )
+        .unwrap();
+        assert_eq!(suffix_of(&six, "xXXXXXX"), "aaaaaa");
+
+        // macOS: the whole trailing run, the prefix's own X's included, from
+        // as many draws as it takes (ten characters per draw).
+        let mut draws = 0;
+        let run = mkdtemp_drawing(
+            &mkdtemp_template(&format!("{base}yXXXXXX")),
+            10,
+            true,
+            || {
+                draws += 1;
+                Ok(1)
+            },
+        )
+        .unwrap();
+        assert_eq!(suffix_of(&run, "y"), "baaaaaaaaaba", "12 X's from 2 draws");
+        assert_eq!(draws, 2);
+        let ax =
+            mkdtemp_drawing(&mkdtemp_template(&format!("{base}a")), 10, true, || Ok(0)).unwrap();
+        assert_eq!(
+            suffix_of(&ax, "a"),
+            "aaaaaa",
+            "no X in the prefix: six, as elsewhere"
+        );
+        let ax =
+            mkdtemp_drawing(&mkdtemp_template(&format!("{base}aX")), 10, true, || Ok(0)).unwrap();
+        assert_eq!(suffix_of(&ax, "a"), "aaaaaaa", "aX: a plus seven");
+        assert!(std::path::Path::new(&ax).is_dir());
+        // The empty prefix's five X's are accepted and filled.
+        let empty = format!("{base}XXXXX");
+        let five = mkdtemp_drawing(&empty, 10, true, || Ok(2)).unwrap();
+        assert_eq!(suffix_of(&five, ""), "caaaa");
+        // ...and refused under the six-X rule.
+        let (e, _) = mkdtemp_drawing(&empty, 10, false, || unreachable!()).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        // Only an empty template is refused outright; one with no X's is
+        // tried once, as given.
+        let (e, _) = mkdtemp_drawing("", 10, true, || unreachable!()).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        let (e, _) = mkdtemp_drawing(&five, 10, true, || unreachable!()).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn ops_complete_and_inflight_tracks() {

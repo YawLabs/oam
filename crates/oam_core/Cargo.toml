@@ -33,9 +33,10 @@ http = { workspace = true }
 percent-encoding = { workspace = true }
 # http_client response decoding: brotli's decoder stream, driven directly.
 brotli-decompressor = { workspace = true }
-# gzip/deflate inflate for http_client and node:zlib (src/inflate.rs):
-# miniz_oxide's core inflate (flate2's backend).
-miniz_oxide = { workspace = true }
+# gzip/deflate inflate for http_client and node:zlib (src/inflate.rs), and
+# node:zlib's deflaters (src/deflate.rs): miniz_oxide's core (flate2's
+# backend). `with-alloc` is the deflate module; flate2 enables it already.
+miniz_oxide = { workspace = true, features = ["with-alloc"] }
 # V8 Inspector CDP transport: WebSocket framing + the WS accept hash.
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
@@ -104,6 +105,13 @@ rustls-webpki = { version = "0.103", default-features = false, features = ["ring
 # "all" for the fetch connector's keepalive probe count and TCP_USER_TIMEOUT;
 # hyper-util already builds socket2 with it.
 socket2 = { version = "0.6", features = ["all"] }
+# fs.mkdtemp's names (lib.rs `mkdtemp`): the OS CSPRNG, as libuv draws them
+# from RtlGenRandom and glibc from getrandom(2).
+#
+# NOT new supply chain: getrandom 0.3 already compiles in the graph as
+# oam_engine's node:crypto randomness, on the same version. A new dependency
+# EDGE onto a crate already being built.
+getrandom = { workspace = true }
 
 # Windows extra-fd stdio: raw CreateProcessW + lpReserved2 CRT fd-table so a
 # child (Chromium --remote-debugging-pipe) gets numbered fds 3/4 for CDP. std

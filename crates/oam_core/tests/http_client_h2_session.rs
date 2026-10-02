@@ -128,7 +128,7 @@ impl Reg {
     }
 
     /// A streamed-body channel, as `fetchBodyChannelNew` makes one.
-    fn channel(&self) -> (u64, tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>) {
+    fn channel(&self) -> (u64, tokio::sync::mpsc::Sender<oam_core::OutboundItem>) {
         let handle = self.ids.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         self.outbound
@@ -269,8 +269,8 @@ async fn a_session_carries_its_streams_over_the_pumped_socket() {
         );
         let outbound = reg.outbound.clone();
         let writer = tokio::spawn(async move {
-            tx.send(Ok(b"hello ".to_vec())).await.unwrap();
-            tx.send(Ok(b"world".to_vec())).await.unwrap();
+            tx.send(oam_core::outbound_data(b"hello ".to_vec())).await.unwrap();
+            tx.send(oam_core::outbound_data(b"world".to_vec())).await.unwrap();
             drop(tx);
             // fetchBodyChannelEnd: the body ends.
             body::end_outbound(&outbound, handle);
@@ -317,6 +317,134 @@ async fn a_session_carries_its_streams_over_the_pumped_socket() {
         }
         assert!(h2_session::destroy(&reg.sessions, session));
         assert_eq!(h2_session::open_count(&reg.sessions), 0);
+    })
+    .await;
+}
+
+/// An h2c origin that answers with the request body and, as the response's
+/// trailer section, the request's own trailer fields plus `x-origin: seen`,
+/// or none when the request had none.
+async fn trailers_origin() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let service = hyper::service::service_fn(
+                    |request: http::Request<hyper::body::Incoming>| async move {
+                        let collected = request.into_body().collect().await.unwrap();
+                        let trailers = collected.trailers().cloned();
+                        let body = http_body_util::Full::new(collected.to_bytes());
+                        let response = match trailers {
+                            Some(mut trailers) => {
+                                trailers.append("x-origin", http::HeaderValue::from_static("seen"));
+                                http::Response::new(
+                                    body.with_trailers(async move { Some(Ok(trailers)) })
+                                        .boxed(),
+                                )
+                            }
+                            None => http::Response::new(body.boxed()),
+                        };
+                        Ok::<_, std::convert::Infallible>(response)
+                    },
+                );
+                let _ =
+                    hyper::server::conn::http2::Builder::new(hyper_util::rt::TokioExecutor::new())
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+            });
+        }
+    });
+    port
+}
+
+/// An http2 client stream's trailers both ways: a trailer section JS queues
+/// on the request body's channel (`sendTrailers()`) goes out after the data,
+/// and the response's trailer section is kept for JS to take at the body's
+/// end (`'trailers'`) -- each value one byte per code point, a repeated field
+/// once per value. A response with none has none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_sends_and_receives_trailers() {
+    within(async {
+        let reg = Reg::new();
+        let port = trailers_origin().await;
+        let socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let pipe_id = reg.pump(socket);
+        let session = reg.open(pipe_id).await;
+
+        let (handle, tx) = reg.channel();
+        let posting = reg.request(
+            session,
+            json!({
+                "method": "POST", "scheme": "http", "authority": "guard.test", "path": "/",
+                "body_stream": handle,
+            }),
+        );
+        let outbound = reg.outbound.clone();
+        let writer = tokio::spawn(async move {
+            tx.send(oam_core::outbound_data(b"data".to_vec()))
+                .await
+                .unwrap();
+            let pairs = [
+                ("x-t".to_string(), "caf\u{e9}".to_string()),
+                ("x-arr".to_string(), "a".to_string()),
+                ("x-arr".to_string(), "b".to_string()),
+            ];
+            tx.send(oam_core::outbound_trailers(&pairs).unwrap())
+                .await
+                .unwrap();
+            drop(tx);
+            body::end_outbound(&outbound, handle);
+        });
+        let posted = payload(posting.await);
+        writer.await.unwrap();
+        let body_handle = posted["bodyHandle"].as_u64().unwrap();
+        assert_eq!(reg.text(body_handle).await, "data");
+        let trailers =
+            body::take_trailers(&reg.bodies, body_handle).expect("the response's trailers");
+        let expected: Vec<(String, String)> = [
+            ("x-t", "caf\u{e9}"),
+            ("x-arr", "a"),
+            ("x-arr", "b"),
+            ("x-origin", "seen"),
+        ]
+        .iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect();
+        assert_eq!(trailers, expected);
+        assert!(
+            body::take_trailers(&reg.bodies, body_handle).is_none(),
+            "taken once"
+        );
+
+        // No trailer section either way.
+        let (handle, tx) = reg.channel();
+        let posting = reg.request(
+            session,
+            json!({
+                "method": "POST", "scheme": "http", "authority": "guard.test", "path": "/",
+                "body_stream": handle,
+            }),
+        );
+        let outbound = reg.outbound.clone();
+        tokio::spawn(async move {
+            tx.send(oam_core::outbound_data(b"plain".to_vec()))
+                .await
+                .unwrap();
+            drop(tx);
+            body::end_outbound(&outbound, handle);
+        });
+        let posted = payload(posting.await);
+        let body_handle = posted["bodyHandle"].as_u64().unwrap();
+        assert_eq!(reg.text(body_handle).await, "plain");
+        assert!(body::take_trailers(&reg.bodies, body_handle).is_none());
+
+        // A field that cannot go out is refused before it is queued.
+        assert!(
+            oam_core::outbound_trailers(&[("bad name".to_string(), "v".to_string())]).is_none()
+        );
+        assert!(oam_core::outbound_trailers(&[("x".to_string(), "\u{100}".to_string())]).is_none());
+        assert!(h2_session::destroy(&reg.sessions, session));
     })
     .await;
 }

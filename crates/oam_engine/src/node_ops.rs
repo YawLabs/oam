@@ -304,6 +304,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("zlibStreamCreate", op_zlib_stream_create),
         ("zlibStreamWrite", op_zlib_stream_write),
         ("zlibStreamFlush", op_zlib_stream_flush),
+        ("zlibStreamParams", op_zlib_stream_params),
         ("zlibStreamClose", op_zlib_stream_close),
         // node:zlib handle (sync incremental, for ssh2/native binding compat)
         ("zlibHandleCreate", op_zlib_handle_create),
@@ -322,6 +323,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fetchBodyChannelNew", op_fetch_body_channel_new),
         ("fetchBodyChannelWrite", op_fetch_body_channel_write),
         ("fetchBodyChannelEnd", op_fetch_body_channel_end),
+        ("fetchBodyChannelTrailers", op_fetch_body_channel_trailers),
         ("fetchBodyChannelCancel", op_fetch_body_channel_cancel),
         ("fetchSentOpen", op_fetch_sent_open),
         ("fetchSentWait", op_fetch_sent_wait),
@@ -3422,10 +3424,45 @@ fn op_fetch_body_channel_write(
         let Some(tx) = tx else {
             return oam_core::OpOutcome::Failed(format!("unknown body stream {handle}"));
         };
-        match tx.send(Ok(bytes)).await {
+        match tx.send(oam_core::outbound_data(bytes)).await {
             Ok(()) => oam_core::OpOutcome::Done,
             // Receiver gone: the request finished or failed. Not an error to
             // the writer -- the transport already reported it.
+            Err(_) => oam_core::OpOutcome::Json("false".to_string()),
+        }
+    });
+}
+
+/// `fetchBodyChannelTrailers(handle, pairsJson)`: the body's trailer section
+/// (`[[name, value], ...]`), queued behind the chunks already written -- an
+/// http2 client stream's `sendTrailers()`, followed by `fetchBodyChannelEnd`.
+/// Resolves like a write: `false` when the request no longer takes its body;
+/// rejects for a field that cannot go out (JS's trailerFields already sent
+/// each value as node's reaches the peer, so none should).
+fn op_fetch_body_channel_trailers(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let pairs = arg_string(scope, &args, 1)
+        .map(|json| parse_headers_json(&json))
+        .unwrap_or_default();
+    let outbound = core_runtime!(scope).outbound_bodies();
+    crate::ops::spawn_op(scope, &mut rv, async move {
+        let Some(item) = oam_core::outbound_trailers(&pairs) else {
+            return oam_core::OpOutcome::Failed("invalid trailer field".to_string());
+        };
+        let tx = outbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&handle)
+            .and_then(|slot| slot.0.clone());
+        let Some(tx) = tx else {
+            return oam_core::OpOutcome::Failed(format!("unknown body stream {handle}"));
+        };
+        match tx.send(item).await {
+            Ok(()) => oam_core::OpOutcome::Done,
             Err(_) => oam_core::OpOutcome::Json("false".to_string()),
         }
     });
@@ -3537,8 +3574,8 @@ fn op_http_request_body_read(
                 );
             }
             oam_core::http_server::BodyCheckout::Absent => {
-                // Not a streamed body: a buffered one (TLS and http2 still
-                // collect, and so does any server that did not opt in). Hand it
+                // Not a streamed body: a buffered one (an h2c listener's
+                // HTTP/1 requests, and any server that did not opt in). Hand it
                 // over as a single chunk; the take empties the registry so the
                 // next read reports EOF.
                 return match state.take_request_body(id) {
@@ -5572,6 +5609,30 @@ fn op_zlib_stream_flush(
     );
 }
 
+/// zlibStreamParams(handle, level?) -> Promise<Uint8Array>.
+/// node's `params()` on a stream: a deflater's sync-flushed bytes, after
+/// which it compresses at `level` (an int32, as node's binding reads it).
+/// Without a level the stream only flushes, as node's gzip stream does.
+fn op_zlib_stream_params(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let level = args.get(1);
+    let level = if level.is_undefined() {
+        None
+    } else {
+        Some(level.int32_value(scope).unwrap_or(-1))
+    };
+    let streams = core_runtime!(scope).zlib_streams();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::zlib_stream_params(streams, handle, level),
+    );
+}
+
 /// zlibStreamClose(handle) -> void (synchronous).
 /// Discard the stream without flushing. Used when the stream is destroyed
 /// before it completes normally.
@@ -5586,7 +5647,7 @@ fn op_zlib_stream_close(
 }
 
 /// zlibHandleCreate(mode, level, dictionary?) -> handle (number).
-/// Allocates a low-level flate2 Compress/Decompress for Node's internal
+/// Allocates a low-level deflater or inflater for Node's internal
 /// zlib binding interface (ssh2's ZlibHandle pattern).
 fn op_zlib_handle_create(
     scope: &mut v8::PinScope<'_, '_>,
@@ -6950,14 +7011,13 @@ fn op_fs_mkdtemp(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let prefix = arg_string(scope, &args, 0).unwrap_or_default();
-    // As in the sync twin: check the resolved target, not the prefix -- and
-    // hand that same resolved path to the op so the checked path IS the
-    // created path (resolving twice would mint two different timestamps).
-    let dir = oam_core::ops::mkdtemp_target(&prefix);
-    if !check_write_perm(scope, &dir.to_string_lossy()) {
+    // As in the sync twin: the template is checked, and that same template
+    // goes to the op.
+    let template = oam_core::mkdtemp_template(&prefix);
+    if !check_write_perm(scope, &template) {
         return;
     }
-    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_mkdtemp(dir, prefix));
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_mkdtemp(template));
 }
 
 fn op_fs_symlink(
@@ -7170,22 +7230,21 @@ fn op_fs_mkdtemp_sync(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let prefix = arg_string(scope, &args, 0).unwrap_or_default();
-    // Gate the directory that is actually created, not the prefix: with a
-    // relative prefix the two are different paths (the prefix resolves under
-    // the system temp dir), so checking the prefix denied writes inside a
-    // correctly-granted temp dir.
-    let dir = oam_core::ops::mkdtemp_target(&prefix);
-    if !check_write_perm(scope, &dir.to_string_lossy()) {
+    // node's binding checks write permission on the template it hands libuv
+    // (prefix + XXXXXX, unresolved): the directory is created beside it.
+    let template = oam_core::mkdtemp_template(&prefix);
+    if !check_write_perm(scope, &template) {
         return;
     }
-    match std::fs::create_dir(&dir) {
-        Ok(()) => {
-            let text = oam_core::strip_unc_prefix(&dir);
-            if let Some(value) = v8::String::new(scope, &text) {
+    match oam_core::mkdtemp(&template) {
+        Ok(dir) => {
+            if let Some(value) = v8::String::new(scope, &dir) {
                 rv.set(value.into());
             }
         }
-        Err(e) => throw_node_error_as_passed(scope, "mkdtemp", &prefix, &e),
+        // node's sync error names the template on every platform, never
+        // the name mkdtemp(3) last tried (see `oam_core::mkdtemp`).
+        Err((e, _)) => throw_node_error_as_passed(scope, "mkdtemp", &template, &e),
     }
 }
 

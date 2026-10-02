@@ -598,6 +598,10 @@
   function iterableStream(iterable) {
     let iterator;
     return new globalThis.ReadableStream({
+      // A byte stream, as undici's ReadableStreamFrom builds it: its
+      // high-water mark is 0, so the iterator is not advanced until a read
+      // (the upload, or a reader of `.body`) asks for bytes.
+      type: "bytes",
       start() {
         iterator = iterable[Symbol.asyncIterator]();
       },
@@ -765,6 +769,7 @@
     if (state.stream === null) {
       const bytes = state.used ? null : state.bytes;
       state.stream = new globalThis.ReadableStream({
+        type: "bytes", // undici's body streams are byte streams
         start(controller) {
           if (bytes !== null && bytes.length > 0) controller.enqueue(bytes);
           controller.close();
@@ -1138,6 +1143,7 @@
       stream() {
         const bytes = this._bytes;
         return new ReadableStream({
+          type: "bytes", // node's Blob#stream() is a byte stream
           start(controller) { controller.enqueue(bytes); controller.close(); },
         });
       }
@@ -1839,6 +1845,9 @@
     // a read op; the handle dies with the run's CoreRuntime.
     function ensureBody() {
       bodyStream ??= new ReadableStream({
+        // undici's response body is a byte stream: high-water mark 0, so
+        // touching `.body` does not start a read -- the first read() does.
+        type: "bytes",
         start(controller) {
           streamController = controller;
           // Aborted before anything asked for the body: it starts errored,

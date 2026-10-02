@@ -956,7 +956,7 @@
   codes.ERR_INVALID_ARG_TYPE = E("ERR_INVALID_ARG_TYPE", TypeError, function(name, expected, actual) {
     return buildArgTypeMessage(name, expected, actual);
   });
-  codes.ERR_INVALID_ARG_VALUE = E("ERR_INVALID_ARG_VALUE", TypeError, function(name, value, reason) {
+  function invalidArgValueMessage(name, value, reason) {
     // Node's exact shape: `The ${type} '${name}' ${reason}. Received
     // ${inspect(value)}` -- 'property' when the name contains a dot,
     // 'argument' otherwise, and INSPECT rather than String() so a string
@@ -973,7 +973,13 @@
     if (inspected.length > 128) inspected = `${inspected.slice(0, 128)}...`;
     const type = String(name).includes(".") ? "property" : "argument";
     return `The ${type} '${name}' ${reason ?? "is invalid"}. Received ${inspected}`;
-  });
+  }
+  // node declares it with two bases, `E('ERR_INVALID_ARG_VALUE', fn,
+  // TypeError, RangeError)`: the default is the TypeError, and the
+  // RangeError variant (`.RangeError`) is what web streams raise for a
+  // strategy (an invalid highWaterMark or size).
+  codes.ERR_INVALID_ARG_VALUE = E("ERR_INVALID_ARG_VALUE", TypeError, invalidArgValueMessage);
+  codes.ERR_INVALID_ARG_VALUE.RangeError = E("ERR_INVALID_ARG_VALUE", RangeError, invalidArgValueMessage);
   codes.ERR_INVALID_CALLBACK = E("ERR_INVALID_CALLBACK", TypeError, function(name) {
     return 'Callback must be a function. Received ' + String(name);
   });
@@ -1111,6 +1117,13 @@
     }
     return 'The value of "' + name + '" is out of range. It must be ' + range + '. Received ' + shown;
   });
+  // node:zlib's Brotli constructor: a `params` key that is not a parameter
+  // number (0..kMaxBrotliParam) or names one already set, and a parameter
+  // the brotli library refuses (the decoder knows only 0 and 1).
+  codes.ERR_BROTLI_INVALID_PARAM = E("ERR_BROTLI_INVALID_PARAM", RangeError, function(param) {
+    return param + " is not a valid Brotli parameter";
+  });
+  codes.ERR_ZLIB_INITIALIZATION_FAILED = E("ERR_ZLIB_INITIALIZATION_FAILED", Error, "Initialization failed");
   codes.ERR_BUFFER_OUT_OF_BOUNDS = E("ERR_BUFFER_OUT_OF_BOUNDS", RangeError, function(name) {
     return name ? '"' + name + '" is outside of buffer bounds' : 'Attempt to access memory outside buffer bounds';
   });
@@ -1224,12 +1237,16 @@
   // ---- Error family ----
   // Node declares this one with three bases (Error, TypeError, RangeError) and
   // reaches the TypeError/RangeError variants through `.TypeError`/`.RangeError`
-  // properties; every call site oam has raises the plain-Error default, which
-  // is what `new ERR_INVALID_STATE(msg)` builds. The "Invalid state: " prefix
+  // properties. `new ERR_INVALID_STATE(msg)` builds the plain-Error default;
+  // js/streams.js raises the TypeError one. The "Invalid state: " prefix
   // is part of the format string, not the caller's message.
-  codes.ERR_INVALID_STATE = E("ERR_INVALID_STATE", Error, function(msg) {
+  function invalidStateMessage(msg) {
     return 'Invalid state: ' + msg;
-  });
+  }
+  codes.ERR_INVALID_STATE = E("ERR_INVALID_STATE", Error, invalidStateMessage);
+  // The TypeError variant: what web streams raise (a released reader, a
+  // closed controller, a locked stream).
+  codes.ERR_INVALID_STATE.TypeError = E("ERR_INVALID_STATE", TypeError, invalidStateMessage);
   codes.ERR_STREAM_DESTROYED = E("ERR_STREAM_DESTROYED", Error, function(name) {
     return 'Cannot call ' + (name || 'write') + ' after a stream was destroyed';
   });
@@ -1402,10 +1419,18 @@
         const len = str.length >>> 1;
         const out = new Uint8Array(len);
         let o = 0;
+        // Each pair must be two hex DIGITS: parseInt would read "aG", " 1"
+        // or "+1" as a byte where node stops. Node decodes from a one-byte
+        // copy of the string (StringBytes casts each code unit to uint8), so
+        // only a code unit's LOW byte is a digit: U+0661 reads as "a",
+        // U+0130 as "0", and U+0100 (low byte 0x00) stops the decode.
+        const digit = (c) =>
+          c >= 48 && c <= 57 ? c - 48 : c >= 97 && c <= 102 ? c - 87 : c >= 65 && c <= 70 ? c - 55 : -1;
         for (let i = 0; i + 1 < str.length; i += 2) {
-          const byte = parseInt(str.slice(i, i + 2), 16);
-          if (Number.isNaN(byte)) break;
-          out[o++] = byte;
+          const hi = digit(str.charCodeAt(i) & 0xff);
+          const lo = digit(str.charCodeAt(i + 1) & 0xff);
+          if (hi < 0 || lo < 0) break;
+          out[o++] = (hi << 4) | lo;
         }
         return out.subarray(0, o);
       }
@@ -1441,6 +1466,61 @@
       default:
         throw codes.ERR_UNKNOWN_ENCODING(enc);
     }
+  }
+
+  // Decode `view`'s bytes as `encoding` (any label normalizeEncoding takes).
+  // The one byte-to-string codec behind Buffer#toString and node's native
+  // *Slice family (asciiSlice, utf8Slice, ...) on Buffer.prototype.
+  function decodeSpan(view, encoding) {
+    switch (normalizeEncoding(encoding)) {
+      case "hex":
+        return view.toHex();
+      case "base64":
+        return view.toBase64();
+      case "base64url":
+        return view.toBase64({ alphabet: "base64url", omitPadding: true });
+      case "latin1": {
+        let out = "";
+        for (let i = 0; i < view.length; i++) out += String.fromCharCode(view[i]);
+        return out;
+      }
+      case "ascii": {
+        let out = "";
+        for (let i = 0; i < view.length; i++) out += String.fromCharCode(view[i] & 0x7f);
+        return out;
+      }
+      case "utf16le": {
+        let out = "";
+        for (let i = 0; i + 1 < view.length; i += 2) {
+          out += String.fromCharCode(view[i] | (view[i + 1] << 8));
+        }
+        return out;
+      }
+      case "utf8":
+        return utf8Decoder.decode(view);
+      default:
+        throw codes.ERR_UNKNOWN_ENCODING(encoding);
+    }
+  }
+
+  // Encode `string` as `encoding` into `view` at `offset`, at most `max`
+  // bytes, and return the count written. Node never writes a partial
+  // character: a UTF-8 sequence or a UTF-16 code unit that does not fit is
+  // left out whole. The one string-to-byte write behind Buffer#write and
+  // node's *Write family on Buffer.prototype.
+  function encodeInto(view, string, offset, max, encoding) {
+    const bytes = bytesFromString(string, encoding);
+    let writable = Math.min(bytes.length, max);
+    if (writable < bytes.length) {
+      const norm = normalizeEncoding(encoding);
+      if (norm === "utf8") {
+        while (writable > 0 && (bytes[writable] & 0xc0) === 0x80) writable--;
+      } else if (norm === "utf16le") {
+        writable &= ~1;
+      }
+    }
+    view.set(bytes.subarray(0, writable), offset);
+    return writable;
   }
 
   // Mutable buffer-module state shared between the Buffer class and the
@@ -2110,35 +2190,7 @@
         throw err;
       }
       const view = e <= s ? this.subarray(0, 0) : this.subarray(s, e);
-      switch (normalizeEncoding(encoding)) {
-        case "hex":
-          return view.toHex();
-        case "base64":
-          return view.toBase64();
-        case "base64url":
-          return view.toBase64({ alphabet: "base64url", omitPadding: true });
-        case "latin1": {
-          let out = "";
-          for (let i = 0; i < view.length; i++) out += String.fromCharCode(view[i]);
-          return out;
-        }
-        case "ascii": {
-          let out = "";
-          for (let i = 0; i < view.length; i++) out += String.fromCharCode(view[i] & 0x7f);
-          return out;
-        }
-        case "utf16le": {
-          let out = "";
-          for (let i = 0; i + 1 < view.length; i += 2) {
-            out += String.fromCharCode(view[i] | (view[i + 1] << 8));
-          }
-          return out;
-        }
-        case "utf8":
-          return utf8Decoder.decode(view);
-        default:
-          throw codes.ERR_UNKNOWN_ENCODING(encoding);
-      }
+      return decodeSpan(view, encoding);
     }
 
     // Node Buffer#slice is a VIEW (Uint8Array#slice copies).
@@ -2240,20 +2292,13 @@
           if (length > remaining) length = remaining;
         }
       }
-      const bytes = bytesFromString(String(string), encoding);
-      let writable = Math.min(bytes.length, length ?? this.length - offset, this.length - offset);
-      // Node never writes partial characters: back off to a character
-      // boundary when the encoded string does not fit.
-      if (writable < bytes.length) {
-        const norm = normalizeEncoding(encoding);
-        if (norm === "utf8" || norm === undefined) {
-          while (writable > 0 && (bytes[writable] & 0xc0) === 0x80) writable--;
-        } else if (norm === "utf16le") {
-          writable &= ~1;
-        }
-      }
-      this.set(bytes.subarray(0, writable), offset);
-      return writable;
+      return encodeInto(
+        this,
+        String(string),
+        offset,
+        Math.min(length ?? this.length - offset, this.length - offset),
+        encoding,
+      );
     }
 
     fill(value, start = 0, end = this.length, encoding) {
@@ -2473,49 +2518,121 @@
   // inherit %TypedArray%.prototype.toLocaleString.
   Buffer.prototype.toLocaleString = Buffer.prototype.toString;
 
-  // Node's per-encoding raw write helpers (asciiWrite/latin1Write/utf8Write,
-  // exposed on Buffer.prototype). offset/length are validated against the
-  // buffer bounds and throw ERR_BUFFER_OUT_OF_BOUNDS when out of range (a
-  // negative length, an offset past the end, ...) -- see test-buffer-write.
+  // Node's per-encoding raw codecs on Buffer.prototype (lib/internal/
+  // buffer.js addBufferPrototypeMethods, node v22.22.2). Real packages call
+  // them directly -- undici's body.text() is `buffer.utf8Slice(start, end)`.
+  // The *Slice family and hex/base64/base64url/ucs2 *Write are C++ natives
+  // there (StringSlice / StringWrite in node_buffer.cc), so they are
+  // non-constructable, report length 0, and throw node's native-shaped
+  // errors: a plain TypeError/RangeError carrying `code`, no `[CODE]` in the
+  // name. ascii/latin1/utf8 *Write are JS wrappers that bounds-check offset
+  // and length against byteLength first, then run the same native write.
+  // Every one goes through decodeSpan / encodeInto, the codec Buffer#toString
+  // and Buffer#write use.
   {
-    function rawEncWrite(buf, encoding, string, offset, length) {
-      if (offset === undefined) {
-        offset = 0;
-      } else {
-        offset = +offset;
-        if (Number.isNaN(offset)) offset = 0;
+    const nativeError = (Ctor, code, message) => {
+      const err = new Ctor(message);
+      err.code = code;
+      return err;
+    };
+    const indexOutOfRange = () => nativeError(RangeError, "ERR_OUT_OF_RANGE", "Index out of range");
+    // node's THROW_AND_RETURN_UNLESS_BUFFER: any ArrayBufferView, read as bytes.
+    const receiverBytes = (receiver) => {
+      if (!ArrayBuffer.isView(receiver)) {
+        throw nativeError(TypeError, "ERR_INVALID_ARG_TYPE", "argument must be a buffer");
       }
-      if (offset < 0 || offset > buf.length || Math.floor(offset) !== offset) {
-        throw codes.ERR_BUFFER_OUT_OF_BOUNDS();
-      }
-      const remaining = buf.length - offset;
-      if (length === undefined) {
-        length = remaining;
-      } else {
-        length = +length;
-        if (Number.isNaN(length)) length = 0;
-      }
-      if (length < 0 || Math.floor(length) !== length) {
-        throw codes.ERR_BUFFER_OUT_OF_BOUNDS();
-      }
-      if (length > remaining) length = remaining;
-      const bytes = bytesFromString(String(string), encoding);
-      let writable = Math.min(bytes.length, length);
-      // Never split a multi-byte UTF-8 sequence (1 byte/char for ascii/latin1).
-      if (writable < bytes.length && encoding === "utf8") {
-        while (writable > 0 && (bytes[writable] & 0xc0) === 0x80) writable--;
-      }
-      buf.set(bytes.subarray(0, writable), offset);
-      return writable;
+      return receiver instanceof Uint8Array
+        ? receiver
+        : new Uint8Array(receiver.buffer, receiver.byteOffset, receiver.byteLength);
+    };
+    // node's ParseArrayIndex: undefined takes the default; anything else is
+    // ToNumber'd (a BigInt or a Symbol throws V8's TypeError) and truncated,
+    // NaN reading as 0; a negative index is "Index out of range".
+    const arrayIndex = (value, fallback) => {
+      if (value === undefined) return fallback;
+      const index = Math.trunc(+value);
+      if (index < 0) throw indexOutOfRange();
+      return index || 0;
+    };
+    // StringSlice: an empty view is "" before any argument is read.
+    function rawSlice(receiver, start, end, encoding) {
+      const bytes = receiverBytes(receiver);
+      const length = bytes.length;
+      if (length === 0) return "";
+      const from = arrayIndex(start, 0);
+      let to = arrayIndex(end, length);
+      if (to < from) to = from;
+      if (to > length) throw indexOutOfRange();
+      return decodeSpan(bytes.subarray(from, to), encoding);
     }
-    Buffer.prototype.asciiWrite = function asciiWrite(string, offset, length) {
-      return rawEncWrite(this, "ascii", string, offset, length);
+    // StringWrite: an offset past the end is ERR_BUFFER_OUT_OF_BOUNDS, a
+    // length past it is clamped, and nothing is encoded for zero room.
+    function rawWrite(receiver, string, offset, length, encoding) {
+      const bytes = receiverBytes(receiver);
+      if (typeof string !== "string") {
+        throw nativeError(TypeError, "ERR_INVALID_ARG_TYPE", "argument must be a string");
+      }
+      const at = arrayIndex(offset, 0);
+      if (at > bytes.length) {
+        throw nativeError(
+          RangeError,
+          "ERR_BUFFER_OUT_OF_BOUNDS",
+          '"offset" is outside of buffer bounds',
+        );
+      }
+      const room = bytes.length - at;
+      const max = Math.min(room, arrayIndex(length, room));
+      if (max === 0) return 0;
+      return encodeInto(bytes, string, at, max, encoding);
+    }
+    // Method shorthand gives a native's shape: named, no prototype, `new`
+    // throws. `arguments` rather than named parameters keeps `length` at 0.
+    const natives = {
+      asciiSlice() { return rawSlice(this, arguments[0], arguments[1], "ascii"); },
+      base64Slice() { return rawSlice(this, arguments[0], arguments[1], "base64"); },
+      base64urlSlice() { return rawSlice(this, arguments[0], arguments[1], "base64url"); },
+      latin1Slice() { return rawSlice(this, arguments[0], arguments[1], "latin1"); },
+      hexSlice() { return rawSlice(this, arguments[0], arguments[1], "hex"); },
+      ucs2Slice() { return rawSlice(this, arguments[0], arguments[1], "utf16le"); },
+      utf8Slice() { return rawSlice(this, arguments[0], arguments[1], "utf8"); },
+      base64Write() { return rawWrite(this, arguments[0], arguments[1], arguments[2], "base64"); },
+      base64urlWrite() {
+        return rawWrite(this, arguments[0], arguments[1], arguments[2], "base64url");
+      },
+      hexWrite() { return rawWrite(this, arguments[0], arguments[1], arguments[2], "hex"); },
+      ucs2Write() { return rawWrite(this, arguments[0], arguments[1], arguments[2], "utf16le"); },
     };
-    Buffer.prototype.latin1Write = function latin1Write(string, offset, length) {
-      return rawEncWrite(this, "latin1", string, offset, length);
+    for (const name of Object.keys(natives)) Buffer.prototype[name] = natives[name];
+    // The JS wrappers: length defaults to byteLength (the native clamps it
+    // to the room past offset), and the range checks compare the RAW
+    // arguments -- a NaN, an object or a numeric string passes them and is
+    // coerced by the native, as in node.
+    Buffer.prototype.asciiWrite = function asciiWrite(
+      string,
+      offset = 0,
+      length = this.byteLength,
+    ) {
+      if (offset < 0 || offset > this.byteLength) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("offset");
+      if (length < 0) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("length");
+      return rawWrite(this, string, offset, length, "ascii");
     };
-    Buffer.prototype.utf8Write = function utf8Write(string, offset, length) {
-      return rawEncWrite(this, "utf8", string, offset, length);
+    Buffer.prototype.latin1Write = function latin1Write(
+      string,
+      offset = 0,
+      length = this.byteLength,
+    ) {
+      if (offset < 0 || offset > this.byteLength) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("offset");
+      if (length < 0) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("length");
+      return rawWrite(this, string, offset, length, "latin1");
+    };
+    Buffer.prototype.utf8Write = function utf8Write(
+      string,
+      offset = 0,
+      length = this.byteLength,
+    ) {
+      if (offset < 0 || offset > this.byteLength) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("offset");
+      if (length < 0) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("length");
+      return rawWrite(this, string, offset, length, "utf8");
     };
   }
 
@@ -10447,6 +10564,34 @@
     return options;
   }
 
+  // node's mkdtemp prologue, the same in mkdtempSync, fs.mkdtemp and
+  // fs/promises.mkdtemp (v22.22.2): getOptions first, so a bad encoding is
+  // refused before a bad prefix; then the prefix (getValidatedPath: a
+  // string, Buffer or file: URL, no NUL byte); then, once per process,
+  // warnOnNonPortableTemplate for a template ending in "X" -- on every
+  // platform, Windows included. Returns [prefix, encoding].
+  let mkdtempWarnNonPortable = true;
+  function mkdtempArgs(prefix, options) {
+    const { encoding } = fsGetOptions(options, {});
+    prefix = toPath(prefix, "prefix");
+    if (mkdtempWarnNonPortable && prefix.endsWith("X")) {
+      mkdtempWarnNonPortable = false;
+      process.emitWarning(
+        "mkdtemp() templates ending with X are not portable. For details see: https://nodejs.org/api/fs.html",
+      );
+    }
+    return [prefix, encoding];
+  }
+
+  // The created path as node's binding returns it (StringBytes::Encode
+  // over the path's UTF-8 bytes): a string by default and for utf8, a
+  // Buffer for "buffer", the bytes spelled in any other encoding.
+  function mkdtempResult(dir, encoding) {
+    if (!encoding || encoding === "utf8" || encoding === "utf-8") return dir;
+    const bytes = globalThis.Buffer.from(dir, "utf8");
+    return encoding === "buffer" ? bytes : bytes.toString(encoding);
+  }
+
   // The options of writeFile / appendFile in every form -- sync, callback,
   // fs/promises and FileHandle -- checked as node's are, and before the data:
   // getOptions over the call's defaults, then `options.flush` a boolean.
@@ -11147,7 +11292,10 @@
       _globAsPromise: (pattern, options) => Promise.resolve().then(() => globSyncRaw(pattern, options, natives)),
       access: (path, mode) => natives.fsAccess(toPath(path), mode ?? 0),
       realpath: (path) => natives.fsRealpath(toPath(path)),
-      mkdtemp: (prefix) => natives.fsMkdtemp(toPath(prefix, "prefix")),
+      mkdtemp: (prefix, options) => {
+        const [valid, encoding] = mkdtempArgs(prefix, options);
+        return natives.fsMkdtemp(valid).then((dir) => mkdtempResult(dir, encoding));
+      },
       symlink: (target, path) => natives.fsSymlink(toPath(target, "target"), toPath(path)),
       readlink: (path) => natives.fsReadlink(toPath(path)),
       link: (existing, newPath) =>
@@ -11426,8 +11574,9 @@
           // stream (`type: 'bytes'`, autoAllocateChunkSize 16384), so
           // `getReader({ mode: 'byob' })` there returns a real
           // ReadableStreamBYOBReader. oam's web-streams layer (js/streams.js)
-          // is default-reader-only -- no byte controller, no byobRequest -- so
-          // this returns a DEFAULT ReadableStream carrying the same 16 KiB
+          // is default-reader-only -- a `type: 'bytes'` stream queues bytes
+          // and pulls as node's does, but has no byobRequest -- so this
+          // returns a stream read through a default reader, carrying the same 16 KiB
           // plain-Uint8Array chunks, at the same boundaries, off the same read
           // path. Everything reachable through a default reader or async
           // iteration matches node; a BYOB reader does not. The fix belongs in
@@ -11470,6 +11619,9 @@
             // both runtimes -- so this is not a free tuning knob.
             var CHUNK = 16384;
             return new globalThis.ReadableStream({
+              // High-water mark 0 and byte accounting, as node's byte
+              // stream: nothing is read off the handle until a read asks.
+              type: "bytes",
               pull: async function (controller) {
                 // node wires `this.once('close', () => readableStreamCancel(
                 // readable))`, so closing the handle mid-stream ENDS the
@@ -11986,6 +12138,7 @@
     const readFileByPath = callbackify1(promises.readFile, 2);
     // realpathArg runs inside, so the callback is checked before the path.
     const realpathByPath = callbackify1((p) => realpathWalking(realpathArg(p)), 1);
+    const mkdtempByPrefix = callbackify1(promises.mkdtemp, 1, 1);
     const truncateByPath = callbackify1(promises.truncate, 2);
     const chmodByPath = callbackify1(promises.chmod, 2);
 
@@ -12140,7 +12293,10 @@
           throw realpathWalkErrorSync(file, e);
         }
       },
-      mkdtempSync: (prefix) => natives.fsMkdtempSync(toPath(prefix, "prefix")),
+      mkdtempSync: (prefix, options) => {
+        const [valid, encoding] = mkdtempArgs(prefix, options);
+        return mkdtempResult(natives.fsMkdtempSync(valid), encoding);
+      },
       symlinkSync: (target, path) => natives.fsSymlinkSync(toPath(target, "target"), toPath(path)),
       readlinkSync: (path) => natives.fsReadlinkSync(toPath(path)),
       linkSync: (existing, newPath) =>
@@ -12298,7 +12454,11 @@
         if (typeof options === "function") { cb = options; options = undefined; }
         realpathByPath(path, cb);
       },
-      mkdtemp: callbackify1(promises.mkdtemp, 1, 1),
+      // Named parameters for node's length (3); the callback is checked
+      // first, then the options and prefix (mkdtempArgs).
+      mkdtemp: function mkdtemp(prefix, options, callback) {
+        return mkdtempByPrefix(...arguments);
+      },
       symlink: callbackify1(promises.symlink, CB_LAST),
       readlink: callbackify1(promises.readlink, 1, 1),
       link: callbackify1(promises.link, 2),
@@ -18242,7 +18402,6 @@
             ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
             : new Uint8Array(data);
     const asBuffer = (bytes) => BufferCtor.from(bytes.buffer, bytes.byteOffset, bytes.length);
-    const levelOf = (options) => options?.level ?? -1;
 
     const Z_NO_FLUSH = 0;
     const Z_PARTIAL_FLUSH = 1;
@@ -18291,73 +18450,59 @@
     }
 
 
-    // node's checkRangesOrGetDefault for options.maxOutputLength: undefined and
-    // NaN mean "no cap" (kMaxLength), a non-number is ERR_INVALID_ARG_TYPE,
-    // Infinity is "a finite number", anything outside 1..kMaxLength is
-    // ERR_OUT_OF_RANGE. Fractions pass (node compares the finished buffer to
-    // the raw value). Returned as undefined when there is no cap, so the
-    // native op reads "no argument".
+    // ---- Option validation: node v22.22.2's lib/zlib.js ------------------
+    // One implementation for every constructor, the .call(this) handle path
+    // and the one-shot forms (which, in node, construct an engine first),
+    // in node's order: the Zlib constructor checks windowBits, level,
+    // memLevel, strategy and dictionary (Brotli's checks params instead),
+    // then ZlibBase checks chunkSize, flush, finishFlush and maxOutputLength.
     const K_MAX_LENGTH = 9007199254740991;
-    const maxOutputLengthOf = (options) => {
-      const value = options?.maxOutputLength;
-      if (value === undefined || Number.isNaN(value)) return undefined;
-      const name = "options.maxOutputLength";
-      if (!Number.isFinite(value)) {
-        if (typeof value !== "number") throw codes.ERR_INVALID_ARG_TYPE(name, "number", value);
-        throw codes.ERR_OUT_OF_RANGE(name, "a finite number", value);
-      }
-      if (value < 1 || value > K_MAX_LENGTH) {
-        throw codes.ERR_OUT_OF_RANGE(name, ">= 1 and <= " + K_MAX_LENGTH, value);
+    const Z_DEFAULT_CHUNK = 16384;
+    const Z_MIN_CHUNK = 64;
+    const Z_MIN_WINDOWBITS = 8;
+    const Z_MAX_WINDOWBITS = 15;
+    const Z_DEFAULT_WINDOWBITS = 15;
+    const Z_MIN_LEVEL = -1;
+    const Z_MAX_LEVEL = 9;
+    const Z_DEFAULT_COMPRESSION = -1;
+    const Z_MIN_MEMLEVEL = 1;
+    const Z_MAX_MEMLEVEL = 9;
+    const Z_DEFAULT_MEMLEVEL = 8;
+    const Z_DEFAULT_STRATEGY = 0;
+    const Z_FIXED = 4;
+    const BROTLI_OPERATION_PROCESS = 0;
+    const BROTLI_OPERATION_FINISH = 2;
+    const BROTLI_OPERATION_EMIT_METADATA = 3;
+    // The highest BROTLI_PARAM_* (BROTLI_PARAM_NDIRECT): node's kMaxBrotliParam.
+    const K_MAX_BROTLI_PARAM = 8;
+    // node's brotliInitParamsArray, refilled per constructor: -1 (as a
+    // uint32) is "not set".
+    const brotliInitParams = new Uint32Array(K_MAX_BROTLI_PARAM + 1);
+
+    // node's checkFiniteNumber: undefined and NaN are "not given", a
+    // non-number is ERR_INVALID_ARG_TYPE, +-Infinity "a finite number".
+    const checkFiniteNumber = (value, name) => {
+      if (value === undefined) return false;
+      if (Number.isFinite(value)) return true;
+      if (Number.isNaN(value)) return false;
+      if (typeof value !== "number") throw codes.ERR_INVALID_ARG_TYPE(name, "number", value);
+      throw codes.ERR_OUT_OF_RANGE(name, "a finite number", value);
+    };
+    // node's checkRangesOrGetDefault. A fraction in range passes: the
+    // binding reads the number as an int32, as the natives here do.
+    const checkRangesOrGetDefault = (value, name, lower, upper, def) => {
+      if (!checkFiniteNumber(value, name)) return def;
+      if (value < lower || value > upper) {
+        throw codes.ERR_OUT_OF_RANGE(name, ">= " + lower + " and <= " + upper, value);
       }
       return value;
     };
-    // The native op reports an output past the cap with exactly this message
-    // (oam_core::zlib::OUTPUT_TOO_LARGE); node raises ERR_BUFFER_TOO_LARGE
-    // naming the caller's value.
-    const OUTPUT_TOO_LARGE = "zlib output exceeds maxOutputLength";
-    // node's checkRangesOrGetDefault for options.flush / options.finishFlush
-    // (ZlibBase, which every zlib class and one-shot call constructs):
-    // undefined and NaN take the default, a non-number is
-    // ERR_INVALID_ARG_TYPE, anything outside Z_NO_FLUSH..Z_BLOCK is
-    // ERR_OUT_OF_RANGE. Validated in node's order: flush, finishFlush, then
-    // maxOutputLength.
-    const flushOptionOf = (options, key, def) => {
-      const value = options?.[key];
-      if (value === undefined || Number.isNaN(value)) return def;
-      const name = "options." + key;
-      if (!Number.isFinite(value)) {
-        if (typeof value !== "number") throw codes.ERR_INVALID_ARG_TYPE(name, "number", value);
-        throw codes.ERR_OUT_OF_RANGE(name, "a finite number", value);
-      }
-      if (value < Z_NO_FLUSH || value > Z_BLOCK) {
-        throw codes.ERR_OUT_OF_RANGE(name, ">= " + Z_NO_FLUSH + " and <= " + Z_BLOCK, value);
-      }
-      return value;
-    };
-    // The finishing flush an inflate ends with (node's `finishFlush`). Only
-    // Z_FINISH makes a stream that stops short an error ("unexpected end of
-    // file"); axios and node-fetch pass Z_SYNC_FLUSH to get what decoded. The
-    // natives take it as an int32 (a fraction truncates, as node's binding
-    // does); the deflaters always finish the stream.
-    const finishFlushOf = (options) => {
-      flushOptionOf(options, "flush", Z_NO_FLUSH);
-      return flushOptionOf(options, "finishFlush", Z_FINISH);
-    };
-    const bufferTooLarge = (max) => {
-      const err = new RangeError("Cannot create a Buffer larger than " + max + " bytes");
-      applyNodeErrorShape(err, "ERR_BUFFER_TOO_LARGE");
-      return err;
-    };
-    const translate = (err, max) =>
-      err instanceof Error && err.message === OUTPUT_TOO_LARGE ? bufferTooLarge(max) : err;
-    // node's Zlib constructor reads options.dictionary for every zlib class
-    // (gzip and gunzip accept it and do not use it): a Buffer, TypedArray or
-    // DataView is used as is, an ArrayBuffer is wrapped, and anything else --
-    // null included -- is ERR_INVALID_ARG_TYPE, thrown before ZlibBase
-    // checks flush, finishFlush and maxOutputLength. Brotli has no such
-    // option. The natives read the view's bytes.
+    // options.dictionary, for every zlib class (gzip and gunzip accept it
+    // and do not use it): a Buffer, TypedArray or DataView is used as is,
+    // an ArrayBuffer is wrapped, and anything else -- null included -- is
+    // ERR_INVALID_ARG_TYPE. Brotli has no such option and does not look.
     const dictionaryOf = (options) => {
-      const value = options?.dictionary;
+      const value = options.dictionary;
       if (value === undefined || ArrayBuffer.isView(value)) return value;
       if (isAnyArrayBuffer(value)) return new Uint8Array(value);
       throw codes.ERR_INVALID_ARG_TYPE(
@@ -18366,47 +18511,288 @@
         value,
       );
     };
-    // Which formats use the dictionary option, as node's zlib does:
-    // it validates the option for every zlib class but sets it only on a
-    // deflate/inflate stream (zlib's deflateSetDictionary/inflateSetDictionary);
-    // a gzip member never carries one. Brotli has no such option and does
-    // not look at it.
-    const dictionaryFor = (format, options) => {
-      if (format === "brotli") return undefined;
-      const dictionary = dictionaryOf(options);
-      return format === "gzip" ? undefined : dictionary;
+    // options.params for Brotli, as node reads it: each key must be a
+    // parameter number not already set (so `{ 1: 3, '0x1': 5 }` names 1
+    // twice), each value a number or boolean, and a value of -1 (as a
+    // uint32) is "not set". The encoder takes every parameter; the
+    // decoder's library refuses all but DISABLE_RING_BUFFER_REALLOCATION (0)
+    // and LARGE_WINDOW (1), which node reports as
+    // ERR_ZLIB_INITIALIZATION_FAILED before ZlibBase's checks. The values
+    // are not used: oam's brotli runs at fixed settings
+    // (docs/node-divergences.md).
+    const checkBrotliParams = (options, compress) => {
+      brotliInitParams.fill(-1);
+      const params = options.params;
+      if (params) {
+        for (const origKey of Object.keys(params)) {
+          const key = +origKey;
+          if (Number.isNaN(key) || key < 0 || key > K_MAX_BROTLI_PARAM ||
+              (brotliInitParams[key] | 0) !== -1) {
+            throw codes.ERR_BROTLI_INVALID_PARAM(origKey);
+          }
+          const value = params[origKey];
+          if (typeof value !== "number" && typeof value !== "boolean") {
+            throw codes.ERR_INVALID_ARG_TYPE("options.params[key]", "number", value);
+          }
+          brotliInitParams[key] = value;
+        }
+      }
+      if (!compress) {
+        for (let key = 2; key <= K_MAX_BROTLI_PARAM; key++) {
+          if ((brotliInitParams[key] | 0) !== -1) throw codes.ERR_ZLIB_INITIALIZATION_FAILED();
+        }
+      }
+    };
+    // What a constructor settles on. `cap` is maxOutputLength as the
+    // natives take it: undefined for none.
+    const settings = (level, strategy, dictionary, chunkSize, flush, finishFlush, maxOutputLength, info) => ({
+      level,
+      strategy,
+      dictionary,
+      chunkSize,
+      flush,
+      finishFlush,
+      maxOutputLength,
+      cap: maxOutputLength === K_MAX_LENGTH ? undefined : maxOutputLength,
+      info,
+    });
+    const ZLIB_DEFAULTS = Object.freeze(settings(
+      Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY, undefined, Z_DEFAULT_CHUNK,
+      Z_NO_FLUSH, Z_FINISH, K_MAX_LENGTH, undefined,
+    ));
+    const BROTLI_DEFAULTS = Object.freeze(settings(
+      Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY, undefined, Z_DEFAULT_CHUNK,
+      BROTLI_OPERATION_PROCESS, BROTLI_OPERATION_FINISH, K_MAX_LENGTH, undefined,
+    ));
+    // The options of a zlib or brotli engine, validated as node's
+    // constructors do. `format` is the natives' name ("gzip", "deflate",
+    // "deflateRaw", "unzip", "brotli"); `compress` picks the direction.
+    const zlibSettings = (format, compress, options) => {
+      const brotli = format === "brotli";
+      if (!options) return brotli ? BROTLI_DEFAULTS : ZLIB_DEFAULTS;
+      let level = Z_DEFAULT_COMPRESSION;
+      let strategy = Z_DEFAULT_STRATEGY;
+      let dictionary;
+      let flushMax;
+      if (brotli) {
+        checkBrotliParams(options, compress);
+        flushMax = BROTLI_OPERATION_EMIT_METADATA;
+      } else {
+        // node's DeflateRaw constructor turns a windowBits of 8 into 9 in
+        // the caller's object before anything else (zlib's raw deflater has
+        // no 256-byte window), so every DeflateRaw form leaves 9 there.
+        if (compress && format === "deflateRaw" && options.windowBits === 8) {
+          options.windowBits = 9;
+        }
+        // On the inflate side (INFLATE, GUNZIP, UNZIP; not INFLATERAW) a
+        // windowBits of 0, null or none reads the window size from the
+        // stream; a gzip deflater needs 9 or more.
+        const windowBits = options.windowBits;
+        if (compress || format === "deflateRaw" || (windowBits != null && windowBits !== 0)) {
+          checkRangesOrGetDefault(
+            windowBits, "options.windowBits",
+            Z_MIN_WINDOWBITS + (compress && format === "gzip" ? 1 : 0), Z_MAX_WINDOWBITS,
+            Z_DEFAULT_WINDOWBITS,
+          );
+        }
+        level = checkRangesOrGetDefault(
+          options.level, "options.level", Z_MIN_LEVEL, Z_MAX_LEVEL, Z_DEFAULT_COMPRESSION,
+        );
+        checkRangesOrGetDefault(
+          options.memLevel, "options.memLevel", Z_MIN_MEMLEVEL, Z_MAX_MEMLEVEL, Z_DEFAULT_MEMLEVEL,
+        );
+        strategy = checkRangesOrGetDefault(
+          options.strategy, "options.strategy", Z_DEFAULT_STRATEGY, Z_FIXED, Z_DEFAULT_STRATEGY,
+        );
+        dictionary = dictionaryOf(options);
+        flushMax = Z_BLOCK;
+      }
+      let chunkSize = options.chunkSize;
+      if (!checkFiniteNumber(chunkSize, "options.chunkSize")) {
+        chunkSize = Z_DEFAULT_CHUNK;
+      } else if (chunkSize < Z_MIN_CHUNK) {
+        throw codes.ERR_OUT_OF_RANGE("options.chunkSize", ">= " + Z_MIN_CHUNK, chunkSize);
+      }
+      const flush = checkRangesOrGetDefault(
+        options.flush, "options.flush", 0, flushMax,
+        brotli ? BROTLI_OPERATION_PROCESS : Z_NO_FLUSH,
+      );
+      const finishFlush = checkRangesOrGetDefault(
+        options.finishFlush, "options.finishFlush", 0, flushMax,
+        brotli ? BROTLI_OPERATION_FINISH : Z_FINISH,
+      );
+      const maxOutputLength = checkRangesOrGetDefault(
+        options.maxOutputLength, "options.maxOutputLength", 1, K_MAX_LENGTH, K_MAX_LENGTH,
+      );
+      return settings(
+        level, strategy, dictionary, chunkSize, flush, finishFlush, maxOutputLength, options.info,
+      );
+    };
+    // The dictionary the natives get: node sets it only on a deflate or
+    // inflate stream (zlib's deflateSetDictionary/inflateSetDictionary); a
+    // gzip member never carries one.
+    const dictionaryFor = (format, s) => (format === "gzip" ? undefined : s.dictionary);
+
+    // The input of a one-shot call, checked after the options, as node's
+    // convenience methods construct their engine first. zlibBufferSync
+    // names it "buffer"; the callback forms end the engine with it, whose
+    // Writable names it "chunk" (zlibBuffer wraps an ArrayBuffer first, so
+    // that passes too) -- and whose end() writes nothing for null or
+    // undefined, so the call runs on empty input.
+    const syncInput = (buffer) => {
+      if (typeof buffer === "string") return BufferCtor.from(buffer, "utf8");
+      if (ArrayBuffer.isView(buffer)) return toBytes(buffer);
+      if (isAnyArrayBuffer(buffer)) return new Uint8Array(buffer);
+      throw codes.ERR_INVALID_ARG_TYPE(
+        "buffer", ["string", "Buffer", "TypedArray", "DataView", "ArrayBuffer"], buffer,
+      );
+    };
+    const NO_INPUT = new Uint8Array(0);
+    const asyncInput = (buffer) => {
+      if (buffer === null || buffer === undefined) return NO_INPUT;
+      if (typeof buffer === "string") return BufferCtor.from(buffer, "utf8");
+      if (ArrayBuffer.isView(buffer)) return toBytes(buffer);
+      if (isAnyArrayBuffer(buffer)) return new Uint8Array(buffer);
+      throw codes.ERR_INVALID_ARG_TYPE("chunk", ["string", "Buffer", "TypedArray", "DataView"], buffer);
+    };
+    const validateCallback = (callback) => {
+      if (typeof callback !== "function") {
+        throw codes.ERR_INVALID_ARG_TYPE("callback", "function", callback);
+      }
+    };
+    // The engine classes, filled in below, for the one-shot forms' `info`
+    // option: node answers `{ buffer, engine }`, the engine being the
+    // stream it made for the call.
+    const engines = {};
+    // The engine here is made after the work, so the call's signal is left
+    // out: aborting it later must not destroy a stream nobody listens to.
+    const withInfo = (s, buffer, name, options, input) => {
+      if (!s.info) return buffer;
+      const engine = new engines[name](
+        options.signal ? { ...options, signal: undefined } : options,
+      );
+      engine.bytesWritten = input.length;
+      return { buffer, engine };
     };
 
-    const sync = (format, compress) => (data, options) => {
-      const dictionary = dictionaryOf(options);
-      const finishFlush = finishFlushOf(options);
-      const max = maxOutputLengthOf(options);
+    // The Transform options node's ZlibBase gives its stream: the caller's,
+    // over `autoDestroy: true`, with encoding and object mode turned off
+    // when set (a zlib stream moves bytes).
+    const transformOptions = (options) => {
+      if (!options) return { autoDestroy: true };
+      if (options.encoding || options.objectMode || options.writableObjectMode) {
+        return {
+          autoDestroy: true, ...options, encoding: null, objectMode: false, writableObjectMode: false,
+        };
+      }
+      return { autoDestroy: true, ...options };
+    };
+    // A one-shot call's engine is a stream given those options, so what the
+    // Transform constructor checks is checked here too, after the zlib
+    // options: highWaterMark (or the readable / writable one) and a truthy
+    // `signal`, which the callback forms then honour. Returns the signal.
+    // The streams' own validators, so the errors are theirs.
+    const engineSignal = (options) => {
+      if (!options) return undefined;
+      if (options.highWaterMark != null || options.readableHighWaterMark != null ||
+          options.writableHighWaterMark != null) {
+        const { getHighWaterMark } = globalThis.__oamVendor.require("internal/streams/state");
+        const state = { objectMode: false };
+        getHighWaterMark(state, options, "readableHighWaterMark", true);
+        getHighWaterMark(state, options, "writableHighWaterMark", true);
+      }
+      const signal = options.signal;
+      if (!signal) return undefined;
+      globalThis.__oamVendor.require("internal/validators").validateAbortSignal(signal, "signal");
+      return signal;
+    };
+    // A callback form's work under its signal, as node's engine runs under
+    // it: an abort before the output destroys the engine, which calls back
+    // an AbortError (its cause the signal's reason) on the next tick, and
+    // the output is then dropped. An already aborted signal skips the work.
+    const underSignal = (signal, work, onOutput, onError) => {
+      if (signal === undefined) {
+        work().then(onOutput, onError);
+        return;
+      }
+      const { AbortError } = globalThis.__oamVendor.require("internal/errors");
+      const aborted = () => new AbortError(undefined, { cause: signal.reason });
+      if (signal.aborted) {
+        process.nextTick(onError, aborted());
+        return;
+      }
+      let settled = false;
+      const onAbort = () => {
+        settled = true;
+        process.nextTick(onError, aborted());
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      const settle = (fn) => (value) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        fn(value);
+      };
+      work().then(settle(onOutput), settle(onError));
+    };
+
+    // The native op reports an output past the cap with exactly this message
+    // (oam_core::zlib::OUTPUT_TOO_LARGE); node raises ERR_BUFFER_TOO_LARGE
+    // naming the caller's value.
+    const OUTPUT_TOO_LARGE = "zlib output exceeds maxOutputLength";
+    const bufferTooLarge = (max) => {
+      const err = new RangeError("Cannot create a Buffer larger than " + max + " bytes");
+      applyNodeErrorShape(err, "ERR_BUFFER_TOO_LARGE");
+      return err;
+    };
+    const translate = (err, max) =>
+      err instanceof Error && err.message === OUTPUT_TOO_LARGE ? bufferTooLarge(max) : err;
+
+    // The natives take the level and `finishFlush` as int32s (a fraction
+    // truncates, as node's binding does). Only Z_FINISH makes an inflate
+    // that stops short an error ("unexpected end of file"); axios and
+    // node-fetch pass Z_SYNC_FLUSH to get what decoded. The deflaters
+    // always finish the stream.
+    const sync = (format, compress, name) => (buffer, options) => {
+      const s = zlibSettings(format, compress, options);
+      engineSignal(options);
+      const bytes = syncInput(buffer);
+      let out;
       try {
-        return asBuffer(
+        out = asBuffer(
           natives.zlibSync(
-            toBytes(data), format, levelOf(options), compress, max, finishFlush, dictionary,
+            bytes, format, s.level, compress, s.cap, s.finishFlush, dictionaryFor(format, s),
           ),
         );
       } catch (err) {
-        throw translate(err, max);
+        throw translate(err, s.maxOutputLength);
       }
+      return withInfo(s, out, name, options, bytes);
     };
-    const callbackForm = (format, compress) => (data, options, callback) => {
+    const callbackForm = (format, compress, name) => (buffer, options, callback) => {
       if (typeof options === "function") {
         callback = options;
-        options = undefined;
+        options = {};
       }
       // Validation throws synchronously, as node's does.
-      const dictionary = dictionaryOf(options);
-      const finishFlush = finishFlushOf(options);
-      const max = maxOutputLengthOf(options);
-      natives.zlibAsync(
-        toBytes(data), format, levelOf(options), compress, max, finishFlush, dictionary,
-      ).then(
-        (bytes) => callback(null, asBuffer(bytes)),
-        (err) => callback(translate(err, max)),
+      const s = zlibSettings(format, compress, options);
+      const signal = engineSignal(options);
+      validateCallback(callback);
+      const bytes = asyncInput(buffer);
+      underSignal(
+        signal,
+        () => natives.zlibAsync(
+          bytes, format, s.level, compress, s.cap, s.finishFlush, dictionaryFor(format, s),
+        ),
+        (out) => callback(null, withInfo(s, asBuffer(out), name, options, bytes)),
+        (err) => callback(translate(err, s.maxOutputLength)),
       );
     };
+
+    // params()'s flush marker: node writes one of its kFlushBuffers through
+    // the stream, so the flush and the level change land after the writes
+    // before it. A Buffer, so the Writable hands it to _transform as is.
+    const PARAMS_FLUSH = BufferCtor.alloc(0);
 
     // Incremental streaming Transform: each _transform call feeds one
     // chunk into the Rust-side encoder/decoder immediately via
@@ -18424,14 +18810,29 @@
       const { Transform } = registry.get("stream");
       return class extends Transform {
         constructor(options) {
-          // brotli's flush values are BROTLI_OPERATION_*, not zlib's, and
-          // it has no dictionary option.
-          const dictionary = dictionaryFor(format, options);
-          const finishFlush = format === "brotli" ? undefined : finishFlushOf(options);
-          super({});
-          this._zlibLevel = levelOf(options);
-          this._zlibFinishFlush = finishFlush;
-          this._zlibDictionary = dictionary;
+          const s = zlibSettings(format, compress, options);
+          // The Transform options, checked by the stream after the zlib ones.
+          super(transformOptions(options));
+          this._zlibLevel = s.level;
+          // brotli's flush values are BROTLI_OPERATION_*, not zlib's: its
+          // stream always finishes.
+          this._zlibFinishFlush = format === "brotli" ? undefined : s.finishFlush;
+          this._zlibDictionary = dictionaryFor(format, s);
+          // node's fields (Zlib's _level and _strategy, which params()
+          // compares; ZlibBase's for every class).
+          if (format !== "brotli") {
+            this._level = s.level;
+            this._strategy = s.strategy;
+          }
+          this._chunkSize = s.chunkSize;
+          this._defaultFlushFlag = s.flush;
+          this._finishFlushFlag = s.finishFlush;
+          this._maxOutputLength = s.maxOutputLength;
+          this._info = s.info;
+          // node's count of the input bytes the engine has taken.
+          this.bytesWritten = 0;
+          // params() levels in flight, in write order (see PARAMS_FLUSH).
+          this._zlibParamsLevels = null;
           // _zlibHandle is null until the first chunk arrives.
           this._zlibHandle = null;
           // Promise serializing back-to-back _transform calls so we
@@ -18448,8 +18849,69 @@
           ).then((info) => { this._zlibHandle = info.handle; });
         }
 
+        // node's Zlib.prototype.params (Brotli inherits it): validated, then
+        // -- unless both match what the stream has -- a Z_SYNC_FLUSH through
+        // the stream (so it follows the writes before it) after which a
+        // deflate or deflateRaw stream compresses at the new level. node's
+        // binding reads the level as an int32, so `undefined` and NaN pass
+        // the check and compress at level 0, as there. `strategy` is
+        // validated and remembered but not applied
+        // (docs/node-divergences.md); a gzip, inflate or brotli stream only
+        // flushes.
+        params(level, strategy, callback) {
+          checkRangesOrGetDefault(level, "level", Z_MIN_LEVEL, Z_MAX_LEVEL);
+          checkRangesOrGetDefault(strategy, "strategy", Z_DEFAULT_STRATEGY, Z_FIXED);
+          if (this._level === level && this._strategy === strategy) {
+            process.nextTick(callback);
+            return;
+          }
+          const after = () => {
+            if (this.destroyed) return;
+            this._level = level;
+            this._strategy = strategy;
+            if (callback) callback();
+          };
+          // node's flush(): a finished stream calls back at once, an ended
+          // one at 'end'.
+          if (this.writableFinished) {
+            process.nextTick(after);
+          } else if (this.writableEnded) {
+            this.once("end", after);
+          } else {
+            (this._zlibParamsLevels ??= []).push(level | 0);
+            this.write(PARAMS_FLUSH, after);
+          }
+        }
+
+        // params()'s flush: what the deflater holds, under Z_SYNC_FLUSH,
+        // then the new level for what follows -- on a deflate or deflateRaw
+        // stream: node's binding (ZlibContext::SetParams) leaves a gzip
+        // stream's level as it was.
+        _zlibParams(cb) {
+          const level = this._zlibParamsLevels.shift();
+          if (!compress || format === "brotli") {
+            cb();
+            return;
+          }
+          this._zlibQueue = this._zlibQueue.then(() =>
+            this._ensureStream().then(() =>
+              format === "gzip"
+                ? natives.zlibStreamParams(this._zlibHandle)
+                : natives.zlibStreamParams(this._zlibHandle, level)
+            )
+          ).then((out) => {
+            if (out && out.length > 0) this.push(asBuffer(out));
+            cb();
+          }, cb);
+        }
+
         _transform(chunk, _encoding, cb) {
+          if (chunk === PARAMS_FLUSH) {
+            this._zlibParams(cb);
+            return;
+          }
           const bytes = toBytes(chunk);
+          this.bytesWritten += bytes.length;
           // Chain onto the queue so writes stay in order.
           this._zlibQueue = this._zlibQueue.then(() =>
             this._ensureStream().then(() =>
@@ -18499,9 +18961,10 @@
       const { Transform } = registry.get("stream");
       return class extends Transform {
         constructor(options) {
-          super({});
+          const level = zlibSettings(format, compress, options).level;
+          super(transformOptions(options));
           this._zlibChunks = [];
-          this._zlibLevel = levelOf(options);
+          this._zlibLevel = level;
         }
         _transform(chunk, _encoding, cb) {
           this._zlibChunks.push(toBytes(chunk));
@@ -18553,14 +19016,32 @@
         );
       });
     };
-    const brotliCallbackForm = (compress) => (data, options, callback) => {
-      if (typeof options === "function") { callback = options; }
-      brotliOneShot(data, compress).then(
-        (bytes) => callback(null, bytes),
+    const brotliCallbackForm = (compress, name) => (buffer, options, callback) => {
+      if (typeof options === "function") {
+        callback = options;
+        options = {};
+      }
+      const s = zlibSettings("brotli", compress, options);
+      const signal = engineSignal(options);
+      validateCallback(callback);
+      const bytes = asyncInput(buffer);
+      underSignal(
+        signal,
+        () => brotliOneShot(bytes, compress),
+        // maxOutputLength is held to the finished buffer here
+        // (docs/node-divergences.md); node stops as the output passes it.
+        (out) => out.length > s.maxOutputLength
+          ? callback(bufferTooLarge(s.maxOutputLength))
+          : callback(null, withInfo(s, out, name, options, bytes)),
         (err) => callback(err),
       );
     };
-    const brotliSyncGate = () => {
+    // The options and the input are checked as node's are, so a call node
+    // refuses is refused the same way here.
+    const brotliSyncGate = (compress) => (buffer, options) => {
+      zlibSettings("brotli", compress, options);
+      engineSignal(options);
+      syncInput(buffer);
       throw new Error(
         "brotliCompressSync/brotliDecompressSync are not supported -- use brotliCompress/brotliDecompress (async) instead"
       );
@@ -18574,8 +19055,6 @@
     // are real Transforms / EventEmitters either way:
     //   new zlib.Inflate(opts)        -> async streaming Transform
     //   zlib.Inflate.call(this, opts) -> Node sync-handle state on `this`
-    const Z_DEFAULT_CHUNK = 16384;
-    const Z_MIN_CHUNK = 64;
     // The low-level sync handle (flate2) supports only DEFLATE/INFLATE and
     // their raw forms; gzip/unzip/brotli have no sync-handle mode, so the
     // .call(this) path maps them to the zlib-wrapped deflate handle. No known
@@ -18584,10 +19063,11 @@
       format === "deflateRaw"
         ? (compress ? DEFLATERAW : INFLATERAW)
         : (compress ? DEFLATE : INFLATE);
-    function initSyncHandleState(self, format, mode, options) {
-      const opts = options || {};
-      let chunkSize = opts.chunkSize != null ? opts.chunkSize : Z_DEFAULT_CHUNK;
-      if (chunkSize < Z_MIN_CHUNK) chunkSize = Z_MIN_CHUNK;
+    function initSyncHandleState(self, format, compress, mode, options) {
+      const s = zlibSettings(format, compress, options);
+      // node runs the Transform constructor on `this` here too; its checks.
+      engineSignal(options);
+      const chunkSize = s.chunkSize;
       self._chunkSize = chunkSize;
       self._writeState = new Uint32Array(2);
       self._offset = 0;
@@ -18598,53 +19078,75 @@
       // gzip maps to the zlib-wrapped handle (handleModeFor), so its
       // dictionary must be dropped here, or the handle writes a stream with
       // FDICT that no inflater reads without it.
-      const dictionary = dictionaryFor(format, opts);
-      self._finishFlushFlag = finishFlushOf(opts);
+      self._defaultFlushFlag = s.flush;
+      self._finishFlushFlag = s.finishFlush;
+      self._maxOutputLength = s.maxOutputLength;
+      self._info = s.info;
+      self.bytesWritten = 0;
+      if (format !== "brotli") {
+        self._level = s.level;
+        self._strategy = s.strategy;
+      }
       const handle = new ZlibHandle(mode);
-      handle.init(15, levelOf(opts), 8, 0, self._writeState, () => {}, dictionary);
+      handle.init(15, s.level, 8, 0, self._writeState, () => {}, dictionaryFor(format, s));
       self._handle = handle;
       return self;
     }
-    function makeZlibClass(format, compress) {
+    function makeZlibClass(name, format, compress) {
       const Stream = transformClass(format, compress); // class extends Transform
       const mode = handleModeFor(format, compress);
       function ZlibClass(options) {
         // `new zlib.Inflate(opts)` -> a real streaming Transform instance.
         if (new.target) return Reflect.construct(Stream, [options], new.target);
+        // `zlib.Inflate(opts)` without `new` -> a new stream, as node's
+        // constructors answer a `this` that is not one of theirs (it was
+        // the sync-handle state written onto whatever `this` was, the zlib
+        // module object for `zlib.Inflate(opts)`).
+        if (!(this instanceof ZlibClass)) return new ZlibClass(options);
         // `zlib.Inflate.call(this, opts)` -> sync-handle state for inheritance.
-        return initSyncHandleState(this, format, mode, options);
+        // node's constructor, called as a function, returns nothing.
+        initSyncHandleState(this, format, compress, mode, options);
       }
       // Share the streaming Transform prototype so `new` instances get the
       // streaming methods AND util.inherits(Sub, ZlibClass) chains
       // Sub -> Stream.prototype -> Transform.prototype -> ... -> EventEmitter.
+      // Named as node's classes are, and the instances' `constructor`.
+      Object.defineProperty(ZlibClass, "name", { value: name });
       ZlibClass.prototype = Stream.prototype;
+      Object.defineProperty(Stream.prototype, "constructor", {
+        value: ZlibClass, writable: true, enumerable: false, configurable: true,
+      });
       return ZlibClass;
     }
-    const Gzip = makeZlibClass("gzip", true);
-    const Gunzip = makeZlibClass("gzip", false);
-    const Deflate = makeZlibClass("deflate", true);
-    const Inflate = makeZlibClass("deflate", false);
-    const DeflateRaw = makeZlibClass("deflateRaw", true);
-    const InflateRaw = makeZlibClass("deflateRaw", false);
-    const Unzip = makeZlibClass("unzip", false);
-    const BrotliCompress = makeZlibClass("brotli", true);
-    const BrotliDecompress = makeZlibClass("brotli", false);
+    const Gzip = makeZlibClass("Gzip", "gzip", true);
+    const Gunzip = makeZlibClass("Gunzip", "gzip", false);
+    const Deflate = makeZlibClass("Deflate", "deflate", true);
+    const Inflate = makeZlibClass("Inflate", "deflate", false);
+    const DeflateRaw = makeZlibClass("DeflateRaw", "deflateRaw", true);
+    const InflateRaw = makeZlibClass("InflateRaw", "deflateRaw", false);
+    const Unzip = makeZlibClass("Unzip", "unzip", false);
+    const BrotliCompress = makeZlibClass("BrotliCompress", "brotli", true);
+    const BrotliDecompress = makeZlibClass("BrotliDecompress", "brotli", false);
+    Object.assign(engines, {
+      Gzip, Gunzip, Deflate, Inflate, DeflateRaw, InflateRaw, Unzip,
+      BrotliCompress, BrotliDecompress,
+    });
 
     return {
-      gzipSync: sync("gzip", true),
-      gunzipSync: sync("gzip", false),
-      deflateSync: sync("deflate", true),
-      inflateSync: sync("deflate", false),
-      deflateRawSync: sync("deflateRaw", true),
-      inflateRawSync: sync("deflateRaw", false),
-      unzipSync: sync("unzip", false),
-      gzip: callbackForm("gzip", true),
-      gunzip: callbackForm("gzip", false),
-      deflate: callbackForm("deflate", true),
-      inflate: callbackForm("deflate", false),
-      deflateRaw: callbackForm("deflateRaw", true),
-      inflateRaw: callbackForm("deflateRaw", false),
-      unzip: callbackForm("unzip", false),
+      gzipSync: sync("gzip", true, "Gzip"),
+      gunzipSync: sync("gzip", false, "Gunzip"),
+      deflateSync: sync("deflate", true, "Deflate"),
+      inflateSync: sync("deflate", false, "Inflate"),
+      deflateRawSync: sync("deflateRaw", true, "DeflateRaw"),
+      inflateRawSync: sync("deflateRaw", false, "InflateRaw"),
+      unzipSync: sync("unzip", false, "Unzip"),
+      gzip: callbackForm("gzip", true, "Gzip"),
+      gunzip: callbackForm("gzip", false, "Gunzip"),
+      deflate: callbackForm("deflate", true, "Deflate"),
+      inflate: callbackForm("deflate", false, "Inflate"),
+      deflateRaw: callbackForm("deflateRaw", true, "DeflateRaw"),
+      inflateRaw: callbackForm("deflateRaw", false, "InflateRaw"),
+      unzip: callbackForm("unzip", false, "Unzip"),
       createGzip: (o) => new Gzip(o),
       createGunzip: (o) => new Gunzip(o),
       createDeflate: (o) => new Deflate(o),
@@ -18656,10 +19158,10 @@
       createBrotliDecompress: (o) => new BrotliDecompress(o),
       Gzip, Gunzip, Deflate, Inflate, DeflateRaw, InflateRaw, Unzip,
       BrotliCompress, BrotliDecompress,
-      brotliCompressSync: brotliSyncGate,
-      brotliDecompressSync: brotliSyncGate,
-      brotliCompress: brotliCallbackForm(true),
-      brotliDecompress: brotliCallbackForm(false),
+      brotliCompressSync: brotliSyncGate(true),
+      brotliDecompressSync: brotliSyncGate(false),
+      brotliCompress: brotliCallbackForm(true, "BrotliCompress"),
+      brotliDecompress: brotliCallbackForm(false, "BrotliDecompress"),
       // Top-level chunk/flush constants (Node exposes these on the module
       // itself, not only under `constants`; pngjs reads zlib.Z_MIN_CHUNK).
       Z_MIN_CHUNK,
@@ -31692,115 +32194,201 @@
       }
     }
 
-    class ServerHttp2Stream extends Duplex {
-      constructor(requestId, inHeaders) {
-        // The http2 layer manages this stream's close lifecycle; opt out of
-        // Duplex autoDestroy to keep the prior behavior.
-        super({ allowHalfOpen: true, autoDestroy: false });
-        this._requestId = requestId;
-        this._streamId = null;
-        this._ended = false;
-        this._responded = false;
-        this._chain = Promise.resolve();
-        this.sentHeaders = null;
-        this._inHeaders = inHeaders;
-        this.id = requestId;
-      }
-      respond(headers, options) {
-        if (this._responded) return;
-        this._responded = true;
-        var status = 200;
-        var outPairs = [];
-        if (headers) {
-          var keys = Object.keys(headers);
-          for (var i = 0; i < keys.length; i++) {
-            var k = keys[i];
-            if (k === ":status") {
-              status = Number(headers[k]);
-            } else if (k.charAt(0) !== ":") {
-              outPairs.push([k.toLowerCase(), String(headers[k])]);
-            }
+    // node's kSingleValueHeaders (lib/internal/http2/util.js).
+    const kSingleValueHeaders = new Set([
+      ":status", ":method", ":authority", ":scheme", ":path", ":protocol",
+      "access-control-allow-credentials", "access-control-max-age",
+      "access-control-request-method", "age", "authorization",
+      "content-encoding", "content-language", "content-length",
+      "content-location", "content-md5", "content-range", "content-type",
+      "date", "dnt", "etag", "expires", "from", "host", "if-match",
+      "if-modified-since", "if-none-match", "if-range", "if-unmodified-since",
+      "last-modified", "location", "max-forwards", "proxy-authorization",
+      "range", "referer", "retry-after", "tk", "upgrade-insecure-requests",
+      "user-agent", "x-content-type-options",
+    ]);
+    const kHttpToken = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
+    function pseudoHeaderError(name) {
+      return h2Error("ERR_HTTP2_INVALID_PSEUDOHEADER",
+        '"' + name + '" is an invalid pseudoheader or is used incorrectly', TypeError);
+    }
+
+    // node's buildNgHeaderString, the one path request headers, response
+    // headers and trailers all go out by: `list` is `[name, value]` entries
+    // (an object's keys in order, or a flat array's pairs); a name is
+    // lower-cased, an undefined value or an empty name skipped, an array one
+    // field per value (an empty one none, a one-element one a single
+    // field). It throws node's errors -- a repeated single-value field, a
+    // name that is no HTTP token, an HTTP/1 connection-specific field -- and
+    // hands each pseudo-header to `pseudo`, which throws for one this list
+    // may not carry; the pseudo-headers it may are not in the pairs (each
+    // caller sends those its own way).
+    function headerPairs(list, pseudo) {
+      var pairs = [];
+      var singles = null;
+      for (var i = 0; i < list.length; i++) {
+        var name = list[i][0];
+        var value = list[i][1];
+        if (value === undefined || name === "") continue;
+        name = String(name).toLowerCase();
+        var single = kSingleValueHeaders.has(name);
+        var isArray = Array.isArray(value);
+        if (isArray) {
+          if (value.length === 0) continue;
+          if (value.length === 1) {
+            value = String(value[0]);
+            isArray = false;
+          } else if (single) {
+            throw h2Error("ERR_HTTP2_HEADER_SINGLE_VALUE",
+              'Header field "' + name + '" must only have a single value', TypeError);
           }
-        }
-        this.sentHeaders = headers || {};
-        var endStream = options && options.endStream;
-        if (endStream) {
-          this._ended = true;
-          natives.httpRespond(
-            this._requestId,
-            status,
-            JSON.stringify(outPairs),
-            new Uint8Array(0),
-          );
-          var self = this;
-          queueMicrotask(function() { self.emit("finish"); self.push(null); });
         } else {
-          this._streamId = natives.httpRespondStream(
-            this._requestId,
-            status,
-            JSON.stringify(outPairs),
-          );
+          value = String(value);
         }
-      }
-      additionalHeaders() {}
-      // The compatibility Http2ServerResponse reads `headersSent` and both
-      // req and res call `setTimeout` (#200); the h2c stream has no timeout of
-      // its own.
-      get headersSent() { return this._responded; }
-      setTimeout(msecs, callback) {
-        if (typeof callback === "function") this.once("timeout", callback);
-        return this;
-      }
-      _write(chunk, encoding, callback) {
-        if (this._ended) { callback(); return; }
-        if (!this._responded) {
-          this.respond({ ":status": 200 });
-        }
-        var bytes;
-        if (typeof chunk === "string") {
-          bytes = globalThis.Buffer.from(chunk, encoding || "utf8");
-        } else {
-          bytes = chunk;
-        }
-        if (this._streamId === null) { callback(); return; }
-        var streamId = this._streamId;
-        this._chain = this._chain
-          .then(function() { return natives.httpBodyPush(streamId, bytes); })
-          .then(function() { callback(); }, function(err) { callback(err); });
-      }
-      _final(callback) {
-        if (this._ended) { callback(); return; }
-        this._ended = true;
-        if (!this._responded) {
-          this.respond({ ":status": 200 });
-        }
-        if (this._streamId !== null) {
-          var streamId = this._streamId;
-          var self = this;
-          this._chain = this._chain.then(function() {
-            natives.httpBodyEnd(streamId);
-            self.emit("finish");
-            callback();
-          });
-        } else {
-          callback();
-        }
-      }
-      _read() {
-        if (!this._bodyPushed) {
-          this._bodyPushed = true;
-          var body = natives.httpRequestBody(this._requestId);
-          if (body && body.length > 0) {
-            this.push(globalThis.Buffer.from(body.buffer, body.byteOffset, body.length));
+        if (single) {
+          if (singles === null) singles = new Set();
+          if (singles.has(name)) {
+            throw h2Error("ERR_HTTP2_HEADER_SINGLE_VALUE",
+              'Header field "' + name + '" must only have a single value', TypeError);
           }
-          this.push(null);
+          singles.add(name);
+        }
+        if (name.charAt(0) === ":") {
+          pseudo(name);
+          continue;
+        }
+        if (!kHttpToken.test(name)) {
+          throw h2Error("ERR_INVALID_HTTP_TOKEN", 'Header name must be a valid HTTP token ["' + name + '"]', TypeError);
+        }
+        if (illegalConnectionHeader(name, value)) {
+          throw h2Error("ERR_HTTP2_INVALID_CONNECTION_HEADERS",
+            'HTTP/1 Connection specific headers are forbidden: "' + name + '"', TypeError);
+        }
+        if (isArray) {
+          for (var v = 0; v < value.length; v++) pairs.push([name, String(value[v])]);
+        } else {
+          pairs.push([name, value]);
         }
       }
-      close(code, callback) {
-        if (typeof code === "function") { callback = code; code = 0; }
-        this.end();
-        if (callback) this.once("close", callback);
+      return pairs;
+    }
+    function objectEntries(object) {
+      var keys = Object.keys(object);
+      var list = new Array(keys.length);
+      for (var i = 0; i < keys.length; i++) list[i] = [keys[i], object[keys[i]]];
+      return list;
+    }
+
+    // node's toHeaderObject, over a flat [name, value, ...] list as it came
+    // off the wire: `:status` a number, `set-cookie` an array, a repeated
+    // single-value field its first value, a repeated `cookie` joined with
+    // '; ' and any other repeat with ', ', on a null-prototype object.
+    function toHeaderObject(raw) {
+      var obj = { __proto__: null };
+      for (var n = 0; n < raw.length; n += 2) {
+        var name = raw[n];
+        var value = raw[n + 1];
+        if (name === ":status") value |= 0;
+        var existing = obj[name];
+        if (existing === undefined) {
+          obj[name] = name === "set-cookie" ? [value] : value;
+        } else if (!kSingleValueHeaders.has(name)) {
+          if (name === "cookie") obj[name] = existing + "; " + value;
+          else if (name === "set-cookie") existing.push(value);
+          else obj[name] = existing + ", " + value;
+        }
       }
+      obj[kSensitiveHeaders] = [];
+      return obj;
+    }
+
+    // ---- trailers, the client's and the server's streams alike
+    // (lib/internal/http2/core.js, v22.22.2). A stream opened with
+    // `waitForTrailers` holds its end back once its data is all handed over
+    // and emits 'wantTrailers' (sending an empty section itself when nothing
+    // listens); sendTrailers() then ends it, with a trailing HEADERS frame
+    // for a section with fields and with no frame of its own for an empty
+    // one. A trailer section that arrives is the stream's 'trailers' event
+    // -- (headers, flags, rawHeaders), flags END_STREAM | END_HEADERS -- just
+    // before its readable side ends.
+    function onStreamTrailers(stream) {
+      stream._trailersReady = true;
+      if (stream.destroyed || stream.closed) return;
+      if (!stream.emit("wantTrailers")) stream.sendTrailers({});
+    }
+    // A trailer section's fields as node's reach the peer, which is what
+    // goes out here (measured on node v22.22.2, both ways): each value is
+    // written one byte per UTF-16 unit, its low byte (node encodes the
+    // header block latin1, so U+20AC arrives as 0xAC); the receiving nghttp2
+    // drops a field whose value holds a control byte other than HTAB, or
+    // DEL, or starts or ends with SP or HTAB, and keeps the others; and a
+    // NUL byte anywhere (U+0100, a lone surrogate, every astral character
+    // carry one) leaves the whole section empty -- its HEADERS frame still
+    // arrives, with no fields. hyper could not send those values anyway.
+    var kNonLatin1 = /[^\x00-\xff]/;
+    var kDroppedFieldValue = /[\x01-\x08\x0a-\x1f\x7f]|^[\t ]|[\t ]$/;
+    function trailerFields(pairs) {
+      var fields = [];
+      for (var i = 0; i < pairs.length; i++) {
+        var value = pairs[i][1];
+        if (kNonLatin1.test(value)) value = globalThis.Buffer.from(value, "latin1").toString("latin1");
+        if (value.indexOf("\0") !== -1) return [];
+        if (!kDroppedFieldValue.test(value)) fields.push([pairs[i][0], value]);
+      }
+      return fields;
+    }
+    // sendTrailers()'s checks, in node's order, and the fields to send: null
+    // for a section with none, which goes out with no HEADERS frame of its
+    // own (fields the peer drops still send one). The section is the
+    // stream's sentTrailers from then on.
+    function prepareTrailers(stream, headers) {
+      if (stream.destroyed || stream.closed) {
+        throw h2Error("ERR_HTTP2_INVALID_STREAM", "The stream has been destroyed");
+      }
+      if (stream._sentTrailers !== undefined) {
+        throw h2Error("ERR_HTTP2_TRAILERS_ALREADY_SENT", "Trailing headers have already been sent");
+      }
+      if (!stream._trailersReady) {
+        throw h2Error("ERR_HTTP2_TRAILERS_NOT_READY",
+          "Trailing headers cannot be sent until after the wantTrailers event is emitted");
+      }
+      assertIsObject(headers, "headers");
+      headers = Object.assign({ __proto__: null }, headers);
+      var pairs = headerPairs(objectEntries(headers), function (name) { throw pseudoHeaderError(name); });
+      stream._sentTrailers = headers;
+      return pairs.length === 0 ? null : trailerFields(pairs);
+    }
+    // HTTP/2's initial stream window (RFC 9113 6.9.2): what node's nghttp2
+    // takes in for a stream JS is not reading (its readable buffer fills to
+    // that, past the highWaterMark), and the most of a write it sends
+    // before the peer's WINDOW_UPDATE. oam uses the default for both; it
+    // does not see the SETTINGS either side sends.
+    var kDefaultInitialWindowSize = 65535;
+    // A body chunk into a stream's readable buffer, the way node's fills
+    // while JS does not read: up to the window, the rest held back for the
+    // next _read(). True when the stream reads on.
+    function pushInWindow(stream, buf) {
+      var room = kDefaultInitialWindowSize - stream.readableLength;
+      if (buf.length > room) {
+        stream._held = buf.subarray(room > 0 ? room : 0);
+        buf = buf.subarray(0, room > 0 ? room : 0);
+      }
+      if (buf.length > 0) stream.push(buf);
+      return stream._held === null && stream.readableLength < kDefaultInitialWindowSize;
+    }
+    // The bytes pushInWindow held back, first on the next read.
+    function pushHeld(stream) {
+      var held = stream._held;
+      stream._held = null;
+      return pushInWindow(stream, held);
+    }
+    function emitTrailers(stream, pairs) {
+      var raw = [];
+      for (var i = 0; i < pairs.length; i++) raw.push(pairs[i][0], pairs[i][1]);
+      var headers = toHeaderObject(raw);
+      // Out of the read's promise job, as node emits it: a throwing
+      // listener is an uncaught exception.
+      process.nextTick(function () { stream.emit("trailers", headers, 5, raw); });
     }
 
     class Http2Server extends EventEmitter {
@@ -31841,29 +32429,28 @@
             self._family = bound.family;
             self.listening = true;
             self.emit("listening");
+            var streams = new Map();
             (async function() {
               for (;;) {
                 var meta = await natives.httpAccept(bound.serverId);
                 if (meta === undefined) break;
-                // Requests only: the native side reports no connection events
-                // for this server, and one that ever arrived -- the queue now
-                // runs until the server's last connection has closed -- is
-                // not a stream to serve.
+                // An exchange that ended before it was answered.
+                if (meta.event === "closed") {
+                  var aborted = streams.get(meta.requestId);
+                  if (aborted) aborted._onAborted();
+                  continue;
+                }
+                // Requests only otherwise: the native side reports no
+                // connection events for this server, and one that ever
+                // arrived -- the queue now runs until the server's last
+                // connection has closed -- is not a stream to serve.
                 if (meta.event !== undefined) continue;
-                var hdrs = {};
-                for (var i = 0; i < meta.headers.length; i++) {
-                  var key = meta.headers[i][0].toLowerCase();
-                  hdrs[key] = meta.headers[i][1];
-                }
-                hdrs[":method"] = meta.method;
-                hdrs[":path"] = meta.uri;
-                hdrs[":scheme"] = "http";
-                var rawHeaders = [];
-                for (var r = 0; r < meta.headers.length; r++) {
-                  rawHeaders.push(meta.headers[r][0], meta.headers[r][1]);
-                }
-                var stream = new ServerHttp2Stream(meta.requestId, hdrs);
-                self.emit("stream", stream, hdrs, 0, rawHeaders);
+                // The secure server's stream, the one implementation of
+                // node's ServerHttp2Stream. There is no session object here
+                // (stream.session is undefined), and the stream id is the
+                // request's: the queue does not say which connection a
+                // request came over.
+                secureServer.emitServerStream(self, undefined, streams, meta, meta.requestId);
               }
               self.emit("close");
             })();
@@ -31893,7 +32480,8 @@
     }
 
     // --------------------------------------------- http2.createSecureServer
-    // (Its own scope: the h2c server above has classes of the same names.)
+    // (Its own scope; the h2c server above serves its requests through this
+    // scope's ServerHttp2Stream, by emitServerStream.)
     const secureServer = (() => {
       // Node's Http2SecureServer (lib/internal/http2/core.js), measured on
       // v22.22.2: a tls.Server that offers `h2` by ALPN (and `http/1.1` too
@@ -31929,12 +32517,7 @@
         statusInvalid: (code) => h2Error("ERR_HTTP2_STATUS_INVALID", "Invalid status code: " + code, RangeError),
         infoStatusNotAllowed: () => h2Error("ERR_HTTP2_INFO_STATUS_NOT_ALLOWED",
           "Informational status codes cannot be used", RangeError),
-        connectionHeaders: (name) => h2Error("ERR_HTTP2_INVALID_CONNECTION_HEADERS",
-          'HTTP/1 Connection specific headers are forbidden: "' + name + '"', TypeError),
-        pseudoHeader: (name) => h2Error("ERR_HTTP2_INVALID_PSEUDOHEADER",
-          '"' + name + '" is an invalid pseudoheader or is used incorrectly', TypeError),
-        singleValue: (name) => h2Error("ERR_HTTP2_HEADER_SINGLE_VALUE",
-          'Header field "' + name + '" must only have a single value', TypeError),
+        pseudoHeader: pseudoHeaderError,
         pseudoNotAllowed: () => h2Error("ERR_HTTP2_PSEUDOHEADER_NOT_ALLOWED",
           "Cannot set HTTP/2 pseudo-headers", TypeError),
         headerValue: (value, name) => h2Error("ERR_HTTP2_INVALID_HEADER_VALUE",
@@ -31943,21 +32526,6 @@
           'Header name must be a valid HTTP token ["' + name + '"]', TypeError),
       };
 
-      // node's kSingleValueHeaders (lib/internal/http2/util.js).
-      const kSingleValueHeaders = new Set([
-        ":status", ":method", ":authority", ":scheme", ":path", ":protocol",
-        "access-control-allow-credentials", "access-control-max-age",
-        "access-control-request-method", "age", "authorization",
-        "content-encoding", "content-language", "content-length",
-        "content-location", "content-md5", "content-range", "content-type",
-        "date", "dnt", "etag", "expires", "from", "host", "if-match",
-        "if-modified-since", "if-none-match", "if-range", "if-unmodified-since",
-        "last-modified", "location", "max-forwards", "proxy-authorization",
-        "range", "referer", "retry-after", "tk", "upgrade-insecure-requests",
-        "user-agent", "x-content-type-options",
-      ]);
-      const kHttpToken = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
-      // node's isIllegalConnectionSpecificHeader.
       function utcDate() {
         return new Date().toUTCString();
       }
@@ -31996,43 +32564,15 @@
           list.push(["date", utcDate()]);
         }
         if (status < 200 || status > 599) throw h2Errors.statusInvalid(status);
-        var pairs = [];
-        var singles = new Set();
-        for (var m = 0; m < list.length; m++) {
-          var name = String(list[m][0]).toLowerCase();
-          var value = list[m][1];
-          if (value === undefined || name === "") continue;
-          var isArray = Array.isArray(value);
-          if (isArray) {
-            if (value.length === 0) continue;
-            if (value.length === 1) { value = String(value[0]); isArray = false; }
-            else if (kSingleValueHeaders.has(name)) throw h2Errors.singleValue(name);
-          } else {
-            value = String(value);
-          }
-          if (kSingleValueHeaders.has(name)) {
-            if (singles.has(name)) throw h2Errors.singleValue(name);
-            singles.add(name);
-          }
-          if (name.charAt(0) === ":") {
-            if (name !== ":status") throw h2Errors.pseudoHeader(name);
-            continue;
-          }
-          if (!kHttpToken.test(name)) throw h2Errors.httpToken(name);
-          if (illegalConnectionHeader(name, value)) throw h2Errors.connectionHeaders(name);
-          if (isArray) {
-            for (var v = 0; v < value.length; v++) pairs.push([name, String(value[v])]);
-          } else {
-            pairs.push([name, value]);
-          }
-        }
+        var pairs = headerPairs(list, function (name) {
+          if (name !== ":status") throw pseudoHeaderError(name);
+        });
         return { pairs: pairs, status: status, sent: sent };
       }
 
-      // node's toHeaderObject over a native request: the pseudo-headers, then
-      // the fields -- set-cookie as an array, cookie joined with '; ', a
-      // repeated single-value field keeping the first, any other joined with
-      // ', ' -- on a null-prototype object; and the flat rawHeaders.
+      // A native request's headers as node's server hands them over: the
+      // flat rawHeaders, pseudo-headers first, and node's toHeaderObject of
+      // them.
       function requestHeaders(meta) {
         var raw = [":method", meta.method];
         var fields = [];
@@ -32048,20 +32588,7 @@
         if (scheme !== undefined) raw.push(":scheme", scheme);
         raw.push(":path", meta.uri);
         for (var f = 0; f < fields.length; f++) raw.push(fields[f][0], fields[f][1]);
-        var obj = { __proto__: null };
-        for (var n = 0; n < raw.length; n += 2) {
-          var key = raw[n], val = raw[n + 1];
-          var existing = obj[key];
-          if (existing === undefined) {
-            obj[key] = key === "set-cookie" ? [val] : val;
-          } else if (!kSingleValueHeaders.has(key)) {
-            if (key === "cookie") obj[key] = existing + "; " + val;
-            else if (key === "set-cookie") existing.push(val);
-            else obj[key] = existing + ", " + val;
-          }
-        }
-        obj[kSensitiveHeaders] = [];
-        return { headers: obj, rawHeaders: raw };
+        return { headers: toHeaderObject(raw), rawHeaders: raw };
       }
 
       // node's proxySocketHandler: session.socket, the TLS socket behind a
@@ -32206,8 +32733,18 @@
           this._chain = Promise.resolve();
           this._bodyDone = false;
           this._reading = false;
+          // node's didRead: JS has asked for the request body.
+          this._didRead = false;
+          // Body bytes past the window, for the next read (pushInWindow).
+          this._held = null;
           this._closed = false;
+          this._closeEmitted = false;
           this._sentHeaders = undefined;
+          // respond()'s waitForTrailers, the 'wantTrailers' moment, and the
+          // section sendTrailers() sent.
+          this._hasTrailers = false;
+          this._trailersReady = false;
+          this._sentTrailers = undefined;
           this._idleTimer = null;
           this._idleMs = 0;
           this.rstCode = undefined;
@@ -32216,13 +32753,16 @@
           this.headRequest = meta.method === "HEAD";
           this._authority = headers[":authority"] !== undefined ? headers[":authority"] : headers.host;
           this._protocol = headers[":scheme"];
+          // node's: the request body is read as it arrives (_pump), not on
+          // the Readable's own read-ahead, so a _read() is JS asking.
+          this._readableState.readingMore = true;
         }
         get id() { return this._id; }
         get session() { return this[kSession]; }
         get headersSent() { return this._responded; }
         get sentHeaders() { return this._sentHeaders; }
         get sentInfoHeaders() { return undefined; }
-        get sentTrailers() { return undefined; }
+        get sentTrailers() { return this._sentTrailers; }
         get closed() { return this._closed; }
         get pending() { return false; }
         get bufferSize() { return this.writableLength; }
@@ -32268,6 +32808,7 @@
             return;
           }
           this._responseStream = responseStream;
+          this._hasTrailers = !!options.waitForTrailers;
           natives.httpStreamClosed(responseStream).then(() => {
             // hyper let go of the response body: it was finished, or the
             // client went away mid-response.
@@ -32314,39 +32855,78 @@
           }
           var responseStream = this._responseStream;
           this._chain = this._chain.then(() => {
-            this._responseEnded = true;
-            natives.httpBodyEnd(responseStream);
+            if (this._hasTrailers) {
+              // The data is all handed over: 'finish', then 'wantTrailers';
+              // the response's end waits for the trailers.
+              callback();
+              process.nextTick(onStreamTrailers, this);
+              return;
+            }
+            this._endResponse(responseStream);
             callback();
-            this._maybeClose();
           });
         }
+        _endResponse(responseStream) {
+          this._responseEnded = true;
+          natives.httpBodyEnd(responseStream);
+          this._maybeClose();
+        }
         _read() {
+          this._didRead = true;
+          this._pump();
+        }
+        // node's onStreamRead: the request body is read as it arrives, read
+        // or not, until the readable buffer holds a window's worth (node's
+        // nghttp2 keeps taking frames in while JS does not read, just not
+        // granting more window), and again on the next _read(); its trailer
+        // section is 'trailers' when reached.
+        _pump() {
           if (this._bodyDone || this._reading) return;
+          if (this._held !== null && !pushHeld(this)) return;
           this._reading = true;
           natives.httpRequestBodyRead(this._requestId).then(
             (chunk) => {
               this._reading = false;
-              if (chunk && Array.isArray(chunk.trailers)) chunk = undefined;
+              // Closed meanwhile: the readable side has ended.
+              if (this._bodyDone) return;
+              if (chunk && Array.isArray(chunk.trailers)) {
+                this._bodyDone = true;
+                emitTrailers(this, chunk.trailers);
+                this.push(null);
+                this._requestEnded();
+                return;
+              }
               if (chunk === undefined || chunk === null || chunk.length === 0) {
                 this._bodyDone = true;
                 this.push(null);
+                this._requestEnded();
                 return;
               }
               touchIdleTimer(this);
-              this.push(globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.length));
+              if (pushInWindow(this, globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.length))) this._pump();
             },
             () => {
               this._reading = false;
+              if (this._bodyDone) return;
               this._bodyDone = true;
               this._onAborted();
             },
           );
         }
-        // The response is done: the stream closes once what was handed over
-        // is on its way (node: nghttp2 closes it after the last frame; a
-        // request body still coming is cut off with it).
+        // The request's END_STREAM: with the response done too, the stream
+        // is over.
+        _requestEnded() {
+          if (this._responseEnded) this._maybeClose();
+        }
+        // The response is done, its trailers too (node's kMaybeDestroy). The
+        // stream closes once what was handed over is on its way: at once when
+        // JS never asked for the request body -- node's own close then cuts
+        // off a body still coming, and drops what was not read -- or else
+        // once the request side has ended too, as nghttp2 closes a
+        // half-closed stream.
         _maybeClose() {
           if (this._closed || this._closeScheduled) return;
+          if (!this._bodyDone && (this._didRead || this.readableFlowing !== null)) return;
           this._closeScheduled = true;
           globalThis.setImmediate(() => this._close(NGHTTP2_NO_ERROR));
         }
@@ -32364,9 +32944,21 @@
             this._responseEnded = true;
             natives.httpBodyEnd(this._responseStream);
           }
-          // The readable side ends with the stream (what was not read is
-          // gone).
-          if (!this.readableEnded) this.push(null);
+          // node's onStreamClose: the readable side ends with the stream, and
+          // 'close' waits for its 'end' -- a body JS never asked for is
+          // dumped to get there, one it did is left for it to read.
+          if (this.readableEnded || this.destroyed) {
+            this._emitClose();
+            return;
+          }
+          this.once("end", this._emitClose);
+          this.push(null);
+          if (!this._didRead && this.readableFlowing === null) this.resume();
+          else this.read(0);
+        }
+        _emitClose() {
+          if (this._closeEmitted) return;
+          this._closeEmitted = true;
           process.nextTick(() => this.emit("close"));
         }
         // The client reset the stream (or the session went away) before the
@@ -32379,6 +32971,9 @@
           if (!finished) {
             this.aborted = true;
             this._responseEnded = true;
+            // A response still open goes too (a failed push may have left
+            // it): the peer must not wait on it.
+            if (this._responseStream !== null) natives.httpBodyEnd(this._responseStream);
             this.emit("aborted");
           }
           this._close(finished ? NGHTTP2_NO_ERROR : NGHTTP2_CANCEL);
@@ -32402,6 +32997,8 @@
         }
         _destroy(err, callback) {
           if (!this._closed) this._close(err ? NGHTTP2_INTERNAL_ERROR : NGHTTP2_NO_ERROR);
+          // Closed already, its 'end' still to come: it will not now.
+          else this._emitClose();
           callback(err);
         }
         setTimeout(msecs, callback) {
@@ -32409,9 +33006,16 @@
           armIdleTimer(this, msecs, callback);
           return this;
         }
-        sendTrailers() {
-          throw h2Error("ERR_HTTP2_TRAILERS_NOT_READY",
-            "Trailing headers cannot be sent until after the wantTrailers event is emitted", Error);
+        sendTrailers(headers) {
+          var fields = prepareTrailers(this, headers);
+          touchIdleTimer(this);
+          var responseStream = this._responseStream;
+          var chain = this._chain;
+          if (fields !== null) {
+            chain = chain.then(function() { return natives.httpBodyTrailers(responseStream, JSON.stringify(fields)); });
+          }
+          // A client gone meanwhile: the response is over either way.
+          this._chain = chain.then(() => this._endResponse(responseStream), () => this._onAborted());
         }
       }
 
@@ -32433,11 +33037,26 @@
           request.emit("aborted");
         }
       }
+      // The request's trailer section, as it arrives (node's
+      // onStreamTrailers in compat.js).
+      function onStreamTrailersRequest(trailers, flags, rawTrailers) {
+        var request = this[kRequest];
+        if (request !== undefined) {
+          Object.assign(request[kTrailers], trailers);
+          request._rawTrailers.push.apply(request._rawTrailers, rawTrailers);
+        }
+      }
+      // The response's data is all out: its trailers (res.setTrailer /
+      // addTrailers) end it (node's onStreamTrailersReady).
+      function onStreamTrailersReady() {
+        this.sendTrailers(this[kResponse][kTrailers]);
+      }
       function onStreamCloseResponse() {
         var res = this[kResponse];
         if (res === undefined) return;
         res[kState].closed = true;
         this[kProxySocket] = null;
+        this.removeListener("wantTrailers", onStreamTrailersReady);
         this[kResponse] = undefined;
         res.emit("finish");
         res.emit("close");
@@ -32460,6 +33079,7 @@
             if (request !== undefined) request.push(null);
           });
           stream.on("error", function() {});
+          stream.on("trailers", onStreamTrailersRequest);
           stream.on("aborted", onStreamAbortedRequest);
           stream.on("close", onStreamCloseRequest);
           stream.on("timeout", function() {
@@ -32571,6 +33191,7 @@
             if (response !== undefined) response.emit("drain");
           });
           stream.on("close", onStreamCloseResponse);
+          stream.on("wantTrailers", onStreamTrailersReady);
           stream.on("timeout", function() {
             var response = this[kResponse];
             if (response !== undefined) response.emit("timeout");
@@ -32771,7 +33392,7 @@
           var state = this[kState];
           var headers = this[kHeaders];
           headers[":status"] = state.statusCode;
-          this[kStream].respond(headers, { endStream: state.ending, sendDate: state.sendDate });
+          this[kStream].respond(headers, { endStream: state.ending, waitForTrailers: true, sendDate: state.sendDate });
         }
         writeContinue() {
           return false;
@@ -32851,6 +33472,26 @@
       }
 
       // node's server-side Http2Session.
+      // A request off a native accept queue, as node's server hands it
+      // over: its stream (in `streams` by request id while it is open), then
+      // `emitter`'s 'stream' (stream, headers, flags, rawHeaders). The secure
+      // server's sessions and the cleartext server both come through here.
+      function emitServerStream(emitter, session, streams, meta, id) {
+        var parsed = requestHeaders(meta);
+        var stream = new ServerHttp2Stream(session, meta, id, parsed.headers);
+        streams.set(meta.requestId, stream);
+        stream.once("close", () => streams.delete(meta.requestId));
+        var flags = STREAM_FLAGS_END_HEADERS | (stream.endAfterHeaders ? STREAM_FLAGS_END_STREAM : 0);
+        if (stream.endAfterHeaders) {
+          // No body: the readable side is over before it starts.
+          stream._bodyDone = true;
+          natives.httpRequestBodyCancel(meta.requestId);
+          stream.push(null);
+        }
+        emitter.emit("stream", stream, parsed.headers, flags, parsed.rawHeaders);
+        stream._pump();
+      }
+
       class ServerHttp2Session extends EventEmitter {
         constructor(options, socket, server) {
           super();
@@ -32929,19 +33570,8 @@
         _onStream(meta) {
           var id = this._nextStreamId;
           this._nextStreamId += 2;
-          var parsed = requestHeaders(meta);
-          var stream = new ServerHttp2Stream(this, meta, id, parsed.headers);
-          this._streams.set(meta.requestId, stream);
-          stream.once("close", () => this._streams.delete(meta.requestId));
           touchIdleTimer(this);
-          var flags = STREAM_FLAGS_END_HEADERS | (stream.endAfterHeaders ? STREAM_FLAGS_END_STREAM : 0);
-          if (stream.endAfterHeaders) {
-            // No body: the readable side is over before it starts.
-            stream._bodyDone = true;
-            natives.httpRequestBodyCancel(meta.requestId);
-            stream.push(null);
-          }
-          this.emit("stream", stream, parsed.headers, flags, parsed.rawHeaders);
+          emitServerStream(this, this, this._streams, meta, id);
         }
         _onConnectionEnd() {
           this._closed = true;
@@ -33142,7 +33772,7 @@
         return new Http2SecureServer(options, handler);
       }
 
-      return { createSecureServer, Http2ServerRequest, Http2ServerResponse, installCompat };
+      return { createSecureServer, Http2ServerRequest, Http2ServerResponse, installCompat, emitServerStream };
     })();
     const { createSecureServer, Http2ServerRequest, Http2ServerResponse } = secureServer;
 
@@ -33216,34 +33846,10 @@
       }
     }
 
-    // node's toHeaderObject: `:status` a number, `set-cookie` an array, a
-    // repeated `cookie` joined with '; ', any other repeat with ', '.
-    function toHeaderObject(status, pairs) {
-      var obj = { __proto__: null };
-      obj[":status"] = status;
-      for (var i = 0; i < pairs.length; i++) {
-        var name = pairs[i][0];
-        var value = pairs[i][1];
-        var existing = obj[name];
-        if (existing === undefined) {
-          obj[name] = name === "set-cookie" ? [value] : value;
-        } else if (name === "cookie") {
-          obj[name] = existing + "; " + value;
-        } else if (name === "set-cookie") {
-          existing.push(value);
-        } else {
-          obj[name] = existing + ", " + value;
-        }
-      }
-      obj[kSensitiveHeaders] = [];
-      return obj;
-    }
-
-    // node's prepareRequestHeadersObject + mapToHeaders for the request
-    // headers: the pseudo-headers the session fills in, the header lines
-    // (names lowercased, arrays one line per value, undefined values
-    // skipped), and node's refusals (an unknown pseudo-header, a name with a
-    // space, an HTTP/1 connection-specific header).
+    // node's prepareRequestHeadersObject: the pseudo-headers the session
+    // fills in, and the header lines buildNgHeaderString makes of the rest
+    // (headerPairs, with node's refusals; any known pseudo-header may be
+    // given).
     function prepareRequestHeaders(headersParam, session) {
       var headers = Object.assign({ __proto__: null }, headersParam);
       if (headers[":method"] === undefined) headers[":method"] = "GET";
@@ -33252,31 +33858,9 @@
       }
       if (headers[":scheme"] === undefined) headers[":scheme"] = session._protocol.slice(0, -1);
       if (headers[":path"] === undefined) headers[":path"] = "/";
-      var list = [];
-      var keys = Object.keys(headers);
-      for (var i = 0; i < keys.length; i++) {
-        var key = keys[i];
-        var value = headers[key];
-        if (value === undefined || key === "") continue;
-        key = key.toLowerCase();
-        if (key[0] === ":") {
-          if (!VALID_PSEUDO_HEADERS.has(key)) {
-            throw h2Error("ERR_HTTP2_INVALID_PSEUDOHEADER", '"' + key + '" is an invalid pseudoheader or is used incorrectly', TypeError);
-          }
-          continue;
-        }
-        if (key.indexOf(" ") !== -1) {
-          throw h2Error("ERR_INVALID_HTTP_TOKEN", 'Header name must be a valid HTTP token ["' + key + '"]', TypeError);
-        }
-        var values = Array.isArray(value) ? value : [value];
-        for (var j = 0; j < values.length; j++) {
-          var text = String(values[j]);
-          if (illegalConnectionHeader(key, text)) {
-            throw h2Error("ERR_HTTP2_INVALID_CONNECTION_HEADERS", 'HTTP/1 Connection specific headers are forbidden: "' + key + '"', TypeError);
-          }
-          list.push([key, text]);
-        }
-      }
+      var list = headerPairs(objectEntries(headers), function (name) {
+        if (!VALID_PSEUDO_HEADERS.has(name)) throw pseudoHeaderError(name);
+      });
       return {
         headers: headers,
         list: list,
@@ -33287,6 +33871,53 @@
       };
     }
 
+    // A waitForTrailers client stream's writes, for the order of 'finish'
+    // and 'wantTrailers' (measured on node v22.22.2). node shuts the stream
+    // down in _final, once its writes are done; when end() leaves exactly one
+    // write outstanding (end(chunk), or write() then end()) and that write is
+    // under a window (65535 bytes), nghttp2 finds the body's end in the
+    // pass that sends it, and 'wantTrailers' comes before 'finish'. With no
+    // write outstanding (a bare end(), or one after the writes went out),
+    // two or more, or a window's worth, 'finish' comes first. A write is
+    // outstanding until the socket has taken it -- the loop turn after the
+    // one it was made in -- and the writes made before 'ready' (the stream
+    // is corked till then), or while corked, go as one writev.
+    function noteWrite(stream, chunk, encoding) {
+      var size = 0;
+      if (typeof chunk === "string") {
+        size = globalThis.Buffer.byteLength(chunk, typeof encoding === "string" ? encoding : "utf8");
+      } else if (ArrayBuffer.isView(chunk)) {
+        size = chunk.byteLength;
+      }
+      var batch = stream._id === undefined || stream.writableCorked > 0;
+      stream._outBytes += size;
+      if (batch && stream._outBatch !== null) {
+        stream._outBatch.size += size;
+        return;
+      }
+      var write = { size: size };
+      stream._outWrites++;
+      if (!batch) {
+        settleLater(stream, write);
+        return;
+      }
+      stream._outBatch = write;
+      var settle = function () {
+        if (stream._outBatch === write) stream._outBatch = null;
+        settleLater(stream, write);
+      };
+      if (stream._id === undefined) stream.once("ready", settle);
+      else process.nextTick(settle);
+    }
+    // The write the socket takes on the loop turn after this one.
+    function settleLater(stream, write) {
+      globalThis.setImmediate(function () {
+        globalThis.setImmediate(function () {
+          stream._outWrites--;
+          stream._outBytes -= write.size;
+        });
+      });
+    }
     class ClientHttp2Stream extends Duplex {
       constructor(session, prepared, options) {
         // autoDestroy: once the response has ended and the request body is
@@ -33305,10 +33936,33 @@
         // none.
         this._bodyStream = options.endStream ? null : natives.fetchBodyChannelNew();
         this._channelTail = Promise.resolve();
+        // Set once the channel's end is queued: until then a destroy cancels
+        // the request body.
+        this._channelEnded = false;
+        // waitForTrailers: the body's end waits for sendTrailers(). 'finish'
+        // does not (node emits it once the data is out), so until then the
+        // stream is not destroyed for being done both ways, which would
+        // cancel the body the trailers end (node's stream stays open until
+        // they are sent).
+        this._hasTrailers = !!options.waitForTrailers && this._bodyStream !== null;
+        this._trailersReady = false;
+        this._sentTrailers = undefined;
+        if (this._hasTrailers) this._writableState.autoDestroy = false;
+        // noteWrite's accounting: the writes outstanding and their bytes,
+        // the writev the writes join while corked, and at end() the bytes
+        // of its one outstanding write (or -1).
+        this._outWrites = 0;
+        this._outBytes = 0;
+        this._outBatch = null;
+        this._endedWrite = -1;
         this._bodyHandle = null;
-        this._readWanted = false;
         this._reading = false;
         this._readEnded = false;
+        // Body bytes past the window, for the next read (pushInWindow).
+        this._held = null;
+        // node's: the response body is read as it arrives (_pumpBody), not
+        // on the Readable's own read-ahead.
+        this._readableState.readingMore = true;
       }
       get id() { return this._id; }
       get pending() { return this._id === undefined; }
@@ -33316,6 +33970,7 @@
       get closed() { return this._closed; }
       get aborted() { return this._aborted; }
       get session() { return this._session; }
+      get sentTrailers() { return this._sentTrailers; }
       setTimeout() { return this; }
       priority() {}
 
@@ -33373,16 +34028,20 @@
         }
         var rawHeaders = [":status", String(raw.status)];
         for (var i = 0; i < raw.headers.length; i++) rawHeaders.push(raw.headers[i][0], raw.headers[i][1]);
-        var headers = toHeaderObject(raw.status, raw.headers);
+        var headers = toHeaderObject(rawHeaders);
         this._bodyHandle = raw.bodyHandle;
         // nghttp2's flags: END_HEADERS, plus END_STREAM for a response with
         // no body.
         this.emit("response", headers, raw.endStream ? 5 : 4, rawHeaders);
-        if (this._readWanted) this._pumpBody();
+        this._pumpBody();
       }
 
+      // node's onStreamRead: the response body is read as it arrives, read or
+      // not, until the readable buffer holds a window's worth, and again on
+      // the next _read(); its trailer section is 'trailers' when reached.
       _pumpBody() {
         if (this._bodyHandle === null || this._reading || this.destroyed) return;
+        if (this._held !== null && !pushHeld(this)) return;
         this._reading = true;
         var self = this;
         var handle = this._bodyHandle;
@@ -33393,11 +34052,14 @@
           if (chunk === undefined) {
             self._bodyHandle = null;
             self._readEnded = true;
+            // The response's trailer section, if it had one: 'trailers'
+            // before 'end'.
+            var trailers = globalThis.__oam.fetchBodyTrailers(handle);
+            if (trailers !== undefined) emitTrailers(self, JSON.parse(trailers));
             self.push(null);
             return;
           }
-          self._readWanted = false;
-          self.push(globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+          if (pushInWindow(self, globalThis.Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength))) self._pumpBody();
         }, function () {
           self._reading = false;
           if (self.destroyed || self._bodyHandle !== handle) return;
@@ -33407,7 +34069,6 @@
       }
 
       _read() {
-        this._readWanted = true;
         this._pumpBody();
       }
 
@@ -33425,16 +34086,70 @@
         next.then(function () { callback(); }, function (err) { callback(err); });
       }
 
+      write(chunk, encoding, callback) {
+        if (this._hasTrailers) noteWrite(this, chunk, encoding);
+        return super.write(chunk, encoding, callback);
+      }
+
+      end(chunk, encoding, callback) {
+        if (this._hasTrailers && !this._writableState.ending) {
+          if (chunk != null && typeof chunk !== "function") noteWrite(this, chunk, encoding);
+          if (this._outWrites === 1) this._endedWrite = this._outBytes;
+        }
+        return super.end(chunk, encoding, callback);
+      }
+
       _final(callback) {
         if (this._bodyStream === null) {
           callback();
           return;
         }
+        var self = this;
+        if (this._hasTrailers) {
+          // The data is all handed over: 'wantTrailers' first when end() left
+          // one write under a window outstanding (noteWrite), else 'finish'
+          // first.
+          this._channelTail.then(function () {
+            if (self._endedWrite >= 0 && self._endedWrite < kDefaultInitialWindowSize) {
+              onStreamTrailers(self);
+              callback();
+              return;
+            }
+            callback();
+            process.nextTick(onStreamTrailers, self);
+          });
+          return;
+        }
+        this._endChannel();
+        this._channelTail.then(function () { callback(); });
+      }
+
+      _endChannel() {
         var stream = this._bodyStream;
+        this._channelEnded = true;
         this._channelTail = this._channelTail.then(function () {
           natives.fetchBodyChannelEnd(stream);
         });
-        this._channelTail.then(function () { callback(); });
+      }
+
+      sendTrailers(headers) {
+        var fields = prepareTrailers(this, headers);
+        if (fields !== null) {
+          var self = this;
+          var stream = this._bodyStream;
+          var json = JSON.stringify(fields);
+          // A request that no longer takes its body has ended or failed: the
+          // stream hears of that from the response, as for any write. A
+          // section that could not go out fails the stream, as a failed
+          // write does.
+          this._channelTail = this._channelTail.then(function () {
+            return natives.fetchBodyChannelTrailers(stream, json);
+          }).then(function () {}, function (err) { self.destroy(err); });
+        }
+        this._endChannel();
+        // Done both ways now, the stream goes as any other does.
+        this._writableState.autoDestroy = true;
+        if (this._readableState.endEmitted && this._writableState.finished) this.destroy();
       }
 
       close(code, callback) {
@@ -33502,7 +34217,7 @@
           bodyCancel(this._bodyHandle);
           this._bodyHandle = null;
         }
-        if (this._bodyStream !== null && !this._writableState.finished) {
+        if (this._bodyStream !== null && (!this._channelEnded || !this._writableState.finished)) {
           try { natives.fetchBodyChannelCancel(this._bodyStream); } catch (_) { /* gone */ }
         }
         if (session) {

@@ -196,8 +196,8 @@ async fn a_streamed_body_is_sent_chunked_and_a_chunked_response_is_read() {
             "body_stream": handle,
         }));
         let head = reg.response(id);
-        tx.send(Ok(b"ab".to_vec())).await.unwrap();
-        tx.send(Ok(b"cd".to_vec())).await.unwrap();
+        tx.send(oam_core::outbound_data(b"ab".to_vec())).await.unwrap();
+        tx.send(oam_core::outbound_data(b"cd".to_vec())).await.unwrap();
         drop(tx);
         body::end_outbound(&reg.outbound, handle);
         let wire = reg.written_until(id, "0\r\n\r\n").await;
@@ -480,7 +480,9 @@ async fn progress_counts_the_whole_request_once_it_is_written() {
             "body_stream": handle,
         }));
         let _head = reg.response(id);
-        tx.send(Ok(b"ab".to_vec())).await.unwrap();
+        tx.send(oam_core::outbound_data(b"ab".to_vec()))
+            .await
+            .unwrap();
         let first = pump_until(&reg, id, |p| p.body == 2).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -530,7 +532,9 @@ async fn progress_places_each_chunk_in_the_bytes_handed_over() {
         let mut expected = head.to_string();
         let mut body = 0u64;
         for chunk in ["one", "three", "a-longer-third-chunk"] {
-            tx.send(Ok(chunk.as_bytes().to_vec())).await.unwrap();
+            tx.send(oam_core::outbound_data(chunk.as_bytes().to_vec()))
+                .await
+                .unwrap();
             body += chunk.len() as u64;
             expected.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
             // `out` completes for the progress even when the chunk's bytes

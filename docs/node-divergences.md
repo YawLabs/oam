@@ -269,6 +269,15 @@ Differences from Node's model:
   never as addresses JS could substitute. A fetch's `connect.lookup` answers follow the
   fetch rule (entry 38: bracketed, no port). The name itself is checked before it is
   looked up, so a refused name is never resolved.
+- **A relative path is checked where it points, as in Node.** A path with no root is
+  resolved against the cwd of the moment before it is matched (so `process.chdir` moves
+  it), and a relative grant (`--allow-fs-write=.`, `=../out`) against the cwd at startup.
+  Up to 0.17.1 oam matched the raw string, so `writeFileSync("out.txt")`, `mkdirSync("d")`
+  and `mkdtempSync("tmp-")` were refused under a grant of the cwd that Node honours. What
+  still differs is the denial's `resource`: oam reports the path as the script passed it,
+  where Node's spelling varies by op -- `mkdtempSync` names the template as passed, but
+  `writeFileSync("wf-y")` on Windows names the resolved, `\\?\`-prefixed path
+  (`\\?\C:\work\wf-y`), and a rooted `\x` names `\\?\C:\x` (measured against v22.22.2).
 - **A denied environment read is silent; every other denial throws.** Filesystem,
   network and child-process denials throw `ERR_ACCESS_DENIED` as described above. A
   variable denied by `--allow-env` is instead simply absent from `process.env` and reads
@@ -1053,12 +1062,21 @@ entries below were executed on both runtimes unless marked.
 | `zlib.brotliCompressSync` / `brotliDecompressSync` | Throw, pointing at the async forms. | Supported. |
 | `zlib` inflate: corrupt compressed data | The error has node's `code` (`Z_DATA_ERROR`) and `errno` (`-3`), but its message is `invalid deflate data` for every defect inside the deflate data except a copy from before the start of the output, which reads `invalid distance too far back` as in Node. Header, trailer, checksum and truncation errors carry zlib's own text. The inflater is miniz_oxide's, which reports one failure for all of them. | zlib names the defect: `invalid block type`, `invalid code lengths set`, `invalid distance code`, ... |
 | `zlib` deflate: the `dictionary` option | Used as in Node -- the window starts with the dictionary, so the data copies from it; a zlib stream sets `FDICT`, carries the dictionary's Adler-32 and, with the default `strategy` and `windowBits`, the header's level bits as zlib writes them (see the `strategy` / `windowBits` / `memLevel` row for the rest), and inflates only with that dictionary (gzip takes the option and ignores it, as in Node) -- but the compressed bytes and size are miniz_oxide's, not zlib's, as they are without a dictionary: for 15.9 KB of Markdown after a 4 KB dictionary of the same text, `deflateSync` at levels 1 / 6 / 9 gives 8397 / 6593 / 6593 bytes where Node gives 7055 / 6578 / 6579. Either runtime inflates the other's output. A zlib-identical deflater is not in the dependency tree: flate2's zlib-rs backend (a new package) writes zlib-ng's bytes, which differ from Node's too. | zlib's bytes. |
+| `zlib` gzip header: the OS byte | 255 (unknown) on every platform, as flate2's encoder writes it: `gzipSync('abc')` starts `1f 8b 08 00 00 00 00 00 00 ff`. The rest of the header (no mtime, name or comment; XFL 4 at levels 0 and 1, 2 at 9) is Node's. | zlib's `OS_CODE` for the build platform: `0a` on Windows (Node v22.22.2). |
 | `zlib` `Gzip` / `Gunzip` / `Unzip` `.call(this, options)` (the `_handle` a subclass drives, pngjs's pattern for `Inflate`) | The handle is the zlib-wrapped deflater or inflater: `Gzip`'s writes a zlib stream (`78 9c`), not a gzip member, and `Gunzip`'s and `Unzip`'s read only a zlib stream, so a gzip member is `Z_DATA_ERROR` `incorrect header check`. The `dictionary` option is validated for all three, used by `Unzip`'s and ignored by `Gzip`'s and `Gunzip`'s, as in Node. `new zlib.Gzip()` and the other stream and one-shot forms are not affected. | `Gzip`'s handle writes a gzip member; `Gunzip`'s and `Unzip`'s read one. |
-| `zlib` deflate: `strategy`, `windowBits`, `memLevel` | Ignored: every deflater uses the default strategy, a 32 KiB window and the default memory level, so the zlib header is always the one zlib writes for those defaults -- `deflateSync('hello world hello', { strategy: 2 })` (or `3` or `4`) gives `78 9c` where Node gives `78 01` (zlib sets FLEVEL 0 for `Z_HUFFMAN_ONLY`, `Z_RLE` and `Z_FIXED`), `{ windowBits: 9 }` gives `78 9c` where Node gives `18 95`, and with a `dictionary` both give `78 bb` where Node gives `78 3f` and `18 b4` respectively. The body differs too: `Z_HUFFMAN_ONLY` and `Z_RLE` still find matches. `zlib.constants` has no `Z_FILTERED`, `Z_HUFFMAN_ONLY`, `Z_RLE` or `Z_FIXED`, so passing those names passes `undefined`. Either runtime inflates the other's output. | The strategy, window size and memory level shape the stream and its header. |
+| `zlib` deflate: `strategy`, `windowBits`, `memLevel` | Validated as in Node, then ignored: every deflater uses the default strategy, a 32 KiB window and the default memory level, so the zlib header is always the one zlib writes for those defaults and the level the stream starts at (`78 01`, `78 5e`, `78 9c`, `78 da`, as in Node) -- `deflateSync('hello world hello', { strategy: 2 })` (or `3` or `4`) gives `78 9c` where Node gives `78 01` (zlib sets FLEVEL 0 for `Z_HUFFMAN_ONLY`, `Z_RLE` and `Z_FIXED`), `{ windowBits: 9 }` gives `78 9c` where Node gives `18 95`, and with a `dictionary` both give `78 bb` where Node gives `78 3f` and `18 b4` respectively. The body differs too: `Z_HUFFMAN_ONLY` and `Z_RLE` still find matches. `zlib.constants` has no `Z_FILTERED`, `Z_HUFFMAN_ONLY`, `Z_RLE` or `Z_FIXED`, so passing those names passes `undefined`. `params(level, strategy)` changes the level but not the strategy. Either runtime inflates the other's output. | The strategy, window size and memory level shape the stream and its header. |
 | `zlib` inflate: `finishFlush: Z_BLOCK` | Read like the other non-finishing flushes: a one-shot inflate returns everything it decoded and a stream ends with it. (`Z_FINISH`, the default, fails a stream that stops short with `Z_BUF_ERROR` `unexpected end of file`; `Z_NO_FLUSH`, `Z_PARTIAL_FLUSH`, `Z_SYNC_FLUSH` and `Z_FULL_FLUSH` return what decoded, as in Node.) | zlib stops at the first block boundary, so a one-shot inflate under `Z_BLOCK` returns no output. |
 | `zlib` deflate: `finishFlush` | Validated as in Node, but the deflaters always finish the stream, so `deflateSync(data, { finishFlush: Z_SYNC_FLUSH })` returns a complete stream with its trailer. | Ends the output with that flush: a sync-flushed stream with no final block or trailer. |
+| `zlib` inflate: `windowBits` | Validated as in Node (8..15, or 0 / `null` for `Inflate`, `Gunzip` and `Unzip`), then ignored: every inflater reads with a 32 KiB window, so `inflateSync(deflateSync(data), { windowBits: 9 })` returns the data. | An `Inflate` or `Unzip` given a zlib header that declares a larger window than `windowBits` fails with `Z_DATA_ERROR` `invalid window size`. |
+| `zlib` Brotli: `params` | Validated as in Node (keys 0..8, each once; number or boolean values; `BrotliDecompress` refuses all but 0 and 1 with `ERR_ZLIB_INITIALIZATION_FAILED`), then ignored: the encoder always runs at quality 4 with a 22-bit window. | `BROTLI_PARAM_QUALITY`, `BROTLI_PARAM_LGWIN`, `BROTLI_PARAM_MODE`, `BROTLI_PARAM_SIZE_HINT` and the rest shape the output; the default quality is 11. |
+| `zlib.brotliCompress` / `brotliDecompress`: `maxOutputLength` | Fails with Node's `ERR_BUFFER_TOO_LARGE`, but checked on the finished buffer: the whole output is produced first, so the option does not bound the memory a brotli bomb takes. The zlib one-shot decoders stop as the output passes it, as Node's do. | Stops as the output passes the cap. |
+| `zlib` Brotli decode: corrupt data | Fails with a plain `Error`, `brotli stream write: Invalid Data`, with no `code` or `errno`. A brotli stream that stops short, or empty input, fails as in Node: `Z_BUF_ERROR`, errno `-5`, `unexpected end of file`. | An `Error` with an `ERR__ERROR_FORMAT_*` code and its errno (`brotliDecompress(Buffer.from('ffffffff', 'hex'))` gives `ERR__ERROR_FORMAT_PADDING_2`, `-15`), message `Decompression failed`. |
+| `zlib` one-shot forms (`deflateSync`, `gunzip`, `brotliCompress`, ...): stream options | Checked as Node's engine checks them (`highWaterMark` and its readable / writable forms, then a truthy `signal`), and a callback form honours its `signal`: an abort before the output calls back `AbortError` with the reason as `cause`. Nothing else in the options reaches a stream, because the work is not done by one: a `transform`, `flush` or `final` function in the options is not called. The `info` engine is built without the `signal`. | The call runs on a stream built from the options, so such functions replace the stream's own (`zlib.deflate('x', { transform(c, e, cb) { cb(null, Buffer.from('zz')) } }, cb)` calls back 4 bytes, not the 9 of the deflated `'x'`). |
+| `zlib` stream `params()` with writes before its callback | The `Z_SYNC_FLUSH` and the new level take their place in the write order: every write made after the `params()` call compresses at the new level. Writes made from the callback (or later) behave as in Node. | The level changes when the callback runs, so a write queued behind the flush goes at the old level, and one in progress then fails the stream: `deflate.params(6, 0, cb); deflate.end(data)` is `Z_STREAM_ERROR` (errno `-2`) `stream error`, and the same on a `Gzip` is `Z_OK` `unexpected end of file`. |
+| `zlib` Brotli stream `params()` | Validated as in Node, then a no-op: the stream carries on. | Node's `BrotliCompress` inherits `params()` from the zlib streams; after it, the stream fails with `ERR_BROTLI_COMPRESSION_FAILED` `Compression failed`. |
+| `zlib` stream `flush()`, `reset()`, `close()` | Absent on oam's zlib and brotli streams (`params()` flushes internally). `destroy()` and `end()` work. | Present. |
 | `TextDecoder` | **utf-8 and windows-1252 only** (`fatal` and `ignoreBOM` honored on utf-8; windows-1252 is total, so neither applies). Both take the full standard label set for their encoding, so `latin1` / `iso-8859-1` / `ascii` resolve to windows-1252 as the standard requires. Any other label throws a `RangeError` with `code: 'ERR_ENCODING_NOT_SUPPORTED'`. | Also utf-16le/be, the ISO-8859-* family, the CJK legacy encodings, ... |
-| Web streams queuing strategy | `highWaterMark` counts chunks; a custom `size()` is never called. | `size()` is consulted. |
+| Web streams: start / pull / write / ready ordering | **Matches node** (no longer a divergence). The controllers follow the standard's algorithms in node's shape: a `ReadableStream` makes its initial pull once `start()` settles and fills to its high-water mark; a `WritableStream` honors its strategy (`desiredSize`, `ready`, backpressure) and writes one chunk at a time after `start()`; a `TransformStream`'s readable side defaults to a high-water mark of 0, so `transform()` waits for a read. `size()` is consulted and validated as node validates it. `pipeTo()` / `pipeThrough()` follow node's `readableStreamPipeTo`: each step waits for the destination's `ready` and starts its write without awaiting it, so the destination fills to its high-water mark; errors and closes on either side, and `options.signal`, shut the pipe down with node's actions. Pinned microtask for microtask by `conformance/cases/298-web-streams-initial-pull.mjs`, `299-web-streams-writable-transform-backpressure.mjs` and `343-web-streams-pipe-to.mjs`. | Same. |
 | `worker_threads.receiveMessageOnPort` | Always returns `undefined`. | Returns `{ message }`. |
 | `worker_threads.moveMessagePortToContext` | Throws `not supported in oam`. | Supported. |
 | `http.Server.setTimeout(ms, cb)` | Stores the value; the callback never fires and no `'timeout'` is emitted. The native HTTP layer owns connection sockets. | Fires. |
@@ -1075,7 +1093,7 @@ entries below were executed on both runtimes unless marked.
 | `node:trace_events` | `createTracing().enable()` succeeds but `getEnabledCategories()` stays empty — there is no trace backend. | Real tracing. |
 | `node:repl`, `node:readline` | Minimal: enough to import, construct, and iterate lines. | Full. |
 | Web globals | Missing vs Node 22: `CompressionStream`, `DecompressionStream`, `Crypto`, `CryptoKey`, `SubtleCrypto`, `CustomEvent`, `MessageChannel`, `Navigator`, `Performance`, `PerformanceObserver` (and the `Performance*` entry classes), and the `ReadableStream*`/`WritableStream*`/`TransformStream*` controller and reader constructors. The lowercase instances (`crypto`, `performance`, `navigator`) are present, and `getReader()` works — only the constructors are unexposed. | Present. |
-| `ReadableStream` byte streams | Default readers only. `new ReadableStream({ type: 'bytes' })` builds an ordinary stream — there is no byte controller and no `byobRequest` — and `getReader({ mode: 'byob' })` ignores the mode, returning a default reader rather than a `ReadableStreamBYOBReader`. The one place in the runtime that node builds a byte stream, `fsPromises.FileHandle.readableWebStream()`, is affected: it delivers node's exact chunks (plain `Uint8Array`, node's 16384-byte `autoAllocateChunkSize` boundaries, from the handle's current cursor) so default-reader and `for await` consumption match byte for byte, and only a BYOB reader diverges. | Real byte streams, `byobRequest`, and BYOB readers. |
+| `ReadableStream` byte streams | Default readers only. `new ReadableStream({ type: 'bytes' })` queues as node's byte controller does -- a high-water mark of 0 unless the strategy names one, `desiredSize` counted in bytes, a chunk that is not an `ArrayBufferView` refused with node's `ERR_INVALID_ARG_TYPE` before anything is queued (the stream stays readable, and a read already waiting is not handed it), and every chunk handed to a reader a `Uint8Array` over the enqueued view's bytes -- so it pulls exactly when node's does and reads what node's reads. What it lacks: the controller is a `ReadableStreamDefaultController` with no `byobRequest`, so `source.autoAllocateChunkSize` is read and 0 refused as node refuses it, but otherwise has nothing to size; `getReader({ mode: 'byob' })` ignores the mode and returns a default reader rather than a `ReadableStreamBYOBReader`; an enqueued view's buffer is not transferred (node detaches it, so the caller's view reads `byteLength` 0 afterwards), so the chunk a reader gets shares memory with the enqueued view, and an enqueued `Uint8Array` is handed on as the same object where node hands on a new view; and a zero-length chunk is accepted where node throws `ERR_INVALID_STATE` (`chunk ArrayBuffer is zero-length or detached`). The byte streams the runtime builds -- `fetch` response bodies, `Response`/`Request` bodies, `Blob#stream()`, `fsPromises.FileHandle.readableWebStream()` -- are byte streams in this sense, as node's are, so none of them reads before a read asks; default-reader and `for await` consumption match byte for byte (`readableWebStream()` on node's 16384-byte `autoAllocateChunkSize` boundaries, from the handle's current cursor), and only a BYOB reader diverges. | Real byte streams, `byobRequest`, buffer transfer, and BYOB readers. |
 
 ### 34. `tls.TLSSocket` is a `net.Socket` by brand, not by prototype
 
@@ -2601,14 +2619,45 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
   holds the connection until its keep-alive timeout or `closeIdleConnections()`; and
   requests pipelined behind that one on the same connection are not read, where Node
   answers them. This is the same on an `http` server.
-- **HTTP/2 sessions have no push, 1xx, trailers or settings.** `stream.pushAllowed` is
+- **HTTP/2 sessions have no push, 1xx or settings.** `stream.pushAllowed` is
   `false` and `pushStream()` throws `ERR_HTTP2_PUSH_DISABLED`; `additionalHeaders()` sends
-  nothing and `writeContinue()` / `writeEarlyHints()` return `false`; response trailers
-  (`waitForTrailers`, `addTrailers`) are not sent; `respondWithFD()` / `respondWithFile()`,
+  nothing and `writeContinue()` / `writeEarlyHints()` return `false`; `respondWithFD()` / `respondWithFile()`,
   `session.ping()`, `settings()`, `goaway()`, `altsvc()` and `origin()` are absent, and
   `localSettings` / `remoteSettings` are `undefined`. `server.updateSettings()` is stored
   and not applied (the session runs hyper's defaults). `session.ref()` / `unref()` do
   nothing. `'sessionError'`, `'frameError'` and `'goaway'` are not emitted on the server.
+- **Trailers are Node's, both ways, on this server and on `http2.createServer`'s.**
+  `respond(headers, { waitForTrailers: true })`, `'wantTrailers'`, `sendTrailers()` (Node's
+  checks and errors) and `sentTrailers`, the compatibility API's `setTrailer()` /
+  `addTrailers()`, a request's trailer section as the stream's `'trailers'` and as
+  `req.trailers` / `req.rawTrailers` (conformance cases 304 and 305). A section's values
+  reach the peer as Node's do (case 344): one byte per UTF-16 unit, a field the receiving
+  nghttp2 would drop left out, and an empty section for one with a NUL byte. A trailer
+  section is `'trailers'` whether or not the body ahead of it is read, up to a window of
+  unread body (case 345), and a stream that has responded stays open for a request body
+  and trailers still coming unless JS never asked for the body (case 346). What differs: no
+  received field is ever listed in `[http2.sensitiveHeaders]` -- of a stream's headers or
+  of its trailers. nghttp2 sends a `cookie` field shorter than 20 bytes as never-indexed and
+  Node lists the fields it receives that way; oam reports no received field as
+  sensitive, so the list is always `[]`. And the window is always the default 65535 bytes,
+  as oam does not see the SETTINGS either side sends: a peer that sets a different
+  `initialWindowSize` moves where Node stops taking in an unread body, and oam's stays put.
+- **A stream JS never read closes after its `'finish'`.** When a request has all arrived by
+  the time the response ends and nothing asked for its body, Node's stream closes as both
+  sides end, dumping the body -- `'end'`, `'finish'`, `'close'`; oam closes it once the
+  response is out, so `'end'` (the body dumped) comes after `'finish'`. Both end with
+  `'close'`, `rstCode` 0.
+- **A response stream that ends without trailers emits `'finish'`.** Node's
+  `stream.end(data)` (or a write and then `end()`) on a stream responded to without
+  `waitForTrailers` sends END_STREAM on the last DATA frame, and the stream closes before
+  its `'finish'` comes -- it never does; oam's emits `'finish'`, then `'close'`. Node's
+  stream also ends its response there even when a later write errors the stream
+  (`ERR_STREAM_WRITE_AFTER_END`, as when a `'stream'` listener and a `'request'` listener
+  both answer); oam's response is then never ended, and the client's stream waits.
+- **The cleartext server's streams have no session.** `http2.createServer`'s requests
+  come from oam's own HTTP/2 listener, not a socket per session: there is no `'session'`
+  event, `stream.session` is `undefined`, and a stream's `id` is the server's request
+  number, not the connection's stream id. Its streams are otherwise the secure server's.
 - **Wire details.** Stream ids are numbered in arrival order (1, 3, 5, ...); a stream's
   `rawHeaders` lists the pseudo-headers as `:method`, `:authority`, `:scheme`, `:path`,
   not in the order the client sent them; `stream.close(code)` after `respond()` ends the
@@ -2857,8 +2906,22 @@ oam's shared client. What differs:
   and `type` behave as Node's; `ping()` answers at once without sending a PING frame and
   `setTimeout()` does nothing. `settings()`, `goaway()`, `setLocalWindowSize()`, `state`,
   `localSettings`, `remoteSettings` and `pendingSettingsAck` are absent, and so are a
-  stream's `sendTrailers()`, `sentTrailers`, `sentInfoHeaders`, `state`, `bufferSize` and
-  `endAfterHeaders`. hyper chooses the SETTINGS and window sizes.
+  stream's `sentInfoHeaders`, `state`, `bufferSize` and `endAfterHeaders`. hyper chooses the
+  SETTINGS and window sizes. Trailers are Node's both ways: `waitForTrailers`,
+  `'wantTrailers'`, `sendTrailers()` and `sentTrailers`, and the response's trailer section
+  as `'trailers'` (headers, flags, rawHeaders) before `'end'`, read or not (cases 304, 305,
+  344 and 345; their one difference, `[http2.sensitiveHeaders]`, is in entry 42). `'wantTrailers'`
+  comes before `'finish'` when Node's does -- `end()` leaving exactly one write under 65535
+  bytes outstanding -- and after it otherwise. Node's write is outstanding until its socket
+  has taken it; oam counts it so until the loop turn after the one it was made in, which is
+  when Node's socket takes a write on a local connection. On a slow link Node's can stay
+  outstanding longer, and its order then follows.
+- **A server's early close does not reach a request still sending.** When a server
+  responds and ends without reading the request (entry 42), Node's server resets the
+  stream with NO_ERROR and Node's client stream closes with it -- a `waitForTrailers`
+  request never emits `'wantTrailers'`. oam's client stream is not told of that reset: it
+  closes only once its own `end()` (and `'wantTrailers'`) has come. Its `rstCode` is 0
+  either way.
 - **A plain `Duplex` from `createConnection` is used as it is.** Node wraps a stream that is
   not a socket in its `JSStreamSocket` and hands that wrapper to `'connect'`; oam runs the
   session over the stream itself and hands it on.
@@ -2926,6 +2989,34 @@ the socket and before its shutdown callback (`'finish'`) has run.
   (`conformance/cases/297-net-end-then-reset-while-looking-up.mjs`; oam sent the data and
   the FIN and refused the reset with EINVAL until review 3). Through an IP literal both
   issue the shutdown first and refuse the reset with EINVAL.
+
+### 48. V8's foreground tasks: run on the isolate's loop since 0.17.2, what still differs
+
+V8 settles some promises, and runs some callbacks, from tasks it posts to the embedder for
+the isolate's own thread: an async `WebAssembly.compile` / `WebAssembly.instantiate` once the
+background compile is done, an `Atomics.waitAsync` notify or timeout, a
+`FinalizationRegistry` cleanup. Up to 0.17.1 oam never ran them: those promises stayed
+pending forever and cleanup callbacks never fired. It is what hung undici 6 from npm, whose
+HTTP/1 client awaits its llhttp parser's async compile before its first request, and a
+top-level `await WebAssembly.instantiate(bytes)` failed as a deadlocked await (OAM-RT0003).
+oam now runs them as Node's platform does (`crates/oam_engine/src/platform.rs`): on the
+loop that owns the isolate, a worker's included, each followed by a tick and microtask
+drain; a posted task wakes a waiting loop; neither a posted nor a delayed task keeps the
+process alive, and a waiting `waitAsync` does not; compile work still in flight does, and
+the process exits once its continuation has run
+(`conformance/cases/306-webassembly-async-compile-settles.mjs`, and the e2e test
+`v8_foreground_tasks_run_on_the_main_and_worker_loops` for the cleanup callback and a worker).
+
+- **What keeps the loop alive at its end.** Node's `DrainTasks` blocks until every task on
+  V8's worker pool has finished, whatever it is; oam asks V8
+  (`Isolate::HasPendingBackgroundTasks`), which reports the work that will post a task back --
+  an async WebAssembly compile. The other pool work (concurrent GC, background compiles of
+  JavaScript) never posts anything a program observes, so no difference is known to show.
+- **Not covered here: a `SharedArrayBuffer` does not reach a worker.** Through `workerData`
+  or `postMessage`, a worker receives a plain empty object, not the shared memory (measured:
+  node's worker sees `[object SharedArrayBuffer]` and its writes reach the main thread), so a
+  cross-thread `Atomics.notify` / `waitAsync` pair cannot be set up between threads at all.
+  Same-thread `waitAsync` works as in Node.
 
 ### `err.syscall` on `fs.opendir`
 
@@ -3090,6 +3181,29 @@ source text; a `SystemError`'s constructor is `SystemError`, where node's `cp` e
 node's `cpSync` copies in C++ and fails with the platform's own error (`EIO` "Access is
 denied." on Windows), where oam's checks every entry as node's `cp` does and throws the same
 coded error.
+
+### `fs.mkdtemp`: what still differs
+
+`mkdtempSync`, `fs.mkdtemp` and `fs/promises.mkdtemp` follow node v22.22.2's binding and
+libuv's `uv_fs_mkdtemp`: the prefix as given (relative to the cwd, never joined to
+`os.tmpdir()`), six characters of `[A-Za-z0-9]` from the OS CSPRNG (on macOS the whole trailing
+run of X's, as Darwin's mkdtemp(3) does -- see the Linux and macOS caveat below), a fresh name only when
+the last one exists, the options and prefix checks in node's order, the result in the
+encoding asked for, the once-per-process warning for a template ending in `X`, and the path
+each failure names (`conformance/cases/302-*`, `303-*`; up to 0.17.1 oam appended a 19-digit
+timestamp and created relative prefixes under the temp directory). Measured on Windows,
+what is left:
+
+- **A Buffer prefix that is not UTF-8** is decoded to a string first, so a byte like `0xff`
+  becomes U+FFFD: oam creates `a�-AbC123` where node on Windows fails `ENOENT`
+  (libuv cannot convert the bytes) and node on Linux creates a name holding the raw byte.
+  Every `fs` path argument shares this decode; a Buffer that is valid UTF-8 behaves as node's.
+- **A Windows template longer than `MAX_PATH`.** node hands libuv the template unresolved and
+  without the `\\?\` prefix it adds to other `fs` paths, so `CreateDirectoryW` fails
+  `ENOENT` once the full path passes the legacy limit (a 300-character prefix, absolute or
+  relative, on a machine with `LongPathsEnabled`). oam creates the directory: Rust's
+  `create_dir` lengthens such paths itself. Refusing a path the file system accepts was not
+  worth reproducing.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 
@@ -3307,6 +3421,15 @@ comment, **not** something measured. Do not rely on either the claim or its nega
   `-3008`), the row `WSAHOST_NOT_FOUND` uses. libuv's table has no row for it, so its generic
   translation would say `ENOENT` (`-4058`); the code could not be triggered on the dev box to
   see what Node shows. _(source: `crates/oam_core/src/net_connect.rs` `classify_resolve`)_
+- **`fs.mkdtemp` on Linux and macOS.** Derived from libuv, glibc and node source, not run:
+  an async failure names the last name mkdtemp(3) tried (`mkdtemp 'nope/x-AbC123'`) where
+  Windows names the template, and the sync one names the template everywhere. On macOS,
+  Darwin's mkdtemp(3) replaces the template's whole trailing run of X's, not the last six,
+  and oam does the same there: `mkdtempSync("aX")` makes `a` plus seven random characters
+  (on Windows and Linux `aX` plus six), and an empty prefix's five-X template is filled
+  rather than refused `EINVAL`. That is read from Darwin's Libc `_gettemp` and node's own fs
+  docs, not yet run on a Mac; cases 302 (empty prefix) and 303 (a prefix of X's) check it
+  against node the next time conformance runs on darwin.
 - **`oam run --record` / `--replay`** may not capture `crypto.getRandomValues` /
   `randomUUID`, or wall-clock reads inside timer callbacks.
 

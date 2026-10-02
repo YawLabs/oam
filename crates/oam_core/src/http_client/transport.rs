@@ -648,8 +648,10 @@ pub fn full_body(bytes: Bytes) -> ReqBody {
 }
 
 /// A request body streamed from JS through an outbound body channel (sent
-/// chunked). An `Err` item aborts the request (`fetchBodyChannelCancel`).
-pub fn channel_body(rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>) -> ReqBody {
+/// chunked). An `Err` item aborts the request (`fetchBodyChannelCancel`); a
+/// trailers frame (an http2 client stream's `sendTrailers()`) goes out as
+/// the body's trailer section.
+pub fn channel_body(rx: tokio::sync::mpsc::Receiver<crate::OutboundItem>) -> ReqBody {
     ChannelBody {
         rx: Some(rx),
         remaining: None,
@@ -672,7 +674,7 @@ pub fn channel_body(rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>) ->
 /// that writes its length and never ends gets no headers timeout in node
 /// either (measured on node v22.22.2 + undici 6.29.0).
 pub fn channel_body_then(
-    rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
+    rx: tokio::sync::mpsc::Receiver<crate::OutboundItem>,
     declared: Option<u64>,
     on_end: impl FnOnce() + Send + Sync + 'static,
 ) -> ReqBody {
@@ -758,7 +760,7 @@ impl hyper::body::Body for Primed {
 /// The body [`channel_body_then`] builds.
 struct ChannelBody {
     /// `None` only once dropped.
-    rx: Option<tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>>,
+    rx: Option<tokio::sync::mpsc::Receiver<crate::OutboundItem>>,
     /// The declared length still to come; `None` with no declared length.
     remaining: Option<u64>,
     /// Taken when it runs, or when the body is aborted.
@@ -778,11 +780,11 @@ impl hyper::body::Body for ChannelBody {
             return std::task::Poll::Ready(None);
         };
         std::task::Poll::Ready(match std::task::ready!(rx.poll_recv(cx)) {
-            Some(Ok(chunk)) => {
-                if let Some(remaining) = &mut this.remaining {
-                    *remaining = remaining.saturating_sub(chunk.len() as u64);
+            Some(Ok(frame)) => {
+                if let (Some(remaining), Some(data)) = (&mut this.remaining, frame.data_ref()) {
+                    *remaining = remaining.saturating_sub(data.len() as u64);
                 }
-                Some(Ok(Frame::data(Bytes::from(chunk))))
+                Some(Ok(frame))
             }
             Some(Err(text)) => {
                 this.on_end = None;

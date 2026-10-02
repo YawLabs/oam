@@ -798,6 +798,11 @@ pub(crate) fn settle_completion(
     // means the OS default was already suppressed at install time. If nothing
     // listens, emit is a benign no-op (a signal watcher can outlive its last
     // listener by a turn on the remove path).
+    // A V8 foreground-task wake (platform.rs): it only had to interrupt the
+    // loop's wait; the loop runs the queued tasks itself.
+    if completion.id == oam_core::PLATFORM_TASK_OP_ID {
+        return;
+    }
     if completion.id == oam_core::SIGNAL_OP_ID {
         if let OpOutcome::Signal(name) = completion.outcome {
             crate::modules::emit_process_event(tc, &name, &[]);
