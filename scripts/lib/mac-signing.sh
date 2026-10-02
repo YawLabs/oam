@@ -16,7 +16,16 @@
 # What is signed, and how (mac_sign_binary):
 #   codesign --force --sign <identity> [--keychain <kc>] --options runtime
 #            --timestamp=none --identifier org.oamjs.oam
+#            [-r='designated => identifier "org.oamjs.oam" and
+#                 certificate leaf = H"<pin>"']
 #            --entitlements scripts/macos/oam.entitlements.plist <binary>
+#   * A self-signed identity STATES its designated requirement (-r=) rather
+#     than taking the one codesign derives: for a self-signed certificate the
+#     derived one was measured (Yaw Terminal, same build Mac, macOS 26) to come
+#     out as `certificate leaf = H"..."` for one binary and `certificate root =
+#     H"..."` for another, and the verify gate accepts only the leaf form.
+#     Ad-hoc and Developer ID keep the derived requirement (cdhash; `anchor
+#     apple generic` + team, which is what notarization expects).
 #   * The hardened runtime and the three entitlements go on EVERY signature,
 #     ad-hoc included. An ad-hoc signature can carry both (only the restricted
 #     com.apple.developer.* entitlements need a provisioning profile, and these
@@ -270,7 +279,7 @@ mac_signing_setup(){
 # first). Rewrites the file, so it runs before every execution gate and before
 # anything hashes the bytes.
 mac_sign_binary(){
-  local bin="$1" ts="--timestamp=none" out
+  local bin="$1" ts="--timestamp=none" out dr
   if [ ! -f "$bin" ]; then mac_fatal "no binary to sign at $bin"; return 1; fi
   case "$MAC_SIGN_MODE" in
     skip)
@@ -291,12 +300,16 @@ mac_sign_binary(){
         mac_report_probe_failure "the pinned identity $MAC_SIGN_IDENTITY"
         return 1
       fi
+      # Self-signed: the designated requirement spelled out (see the header),
+      # in the same pass -- a Mach-O is one signature, nothing nested.
+      # Developer ID: a secure timestamp, and the requirement codesign derives.
+      dr="designated => identifier \"$MAC_CODESIGN_IDENTIFIER\" and certificate leaf = H\"$MAC_SIGN_IDENTITY\""
       case "$MAC_SIGN_AUTHORITY" in
-        "Developer ID Application:"*) ts="--timestamp" ;;
+        "Developer ID Application:"*) ts="--timestamp"; dr="" ;;
       esac
       if ! out="$(codesign --force --sign "$MAC_SIGN_IDENTITY" --keychain "$MAC_SIGN_KEYCHAIN" \
             --options runtime "$ts" --identifier "$MAC_CODESIGN_IDENTIFIER" \
-            --entitlements "$MAC_ENTITLEMENTS" "$bin" 2>&1 </dev/null)"; then
+            ${dr:+"-r=$dr"} --entitlements "$MAC_ENTITLEMENTS" "$bin" 2>&1 </dev/null)"; then
         mac_fatal "codesign of $bin with $MAC_SIGN_IDENTITY failed:"; printf '%s\n' "$out" | sed 's/^/    /' >&2
         case "$out" in *errSecInternalComponent*) mac_keychain_remediation ;; esac
         return 1
@@ -339,10 +352,11 @@ mac_entitlement_pairs(){
 #   4. the signer is the one the pin says: ad-hoc while no pin is committed;
 #      with a pin, a designated requirement naming `certificate leaf =
 #      H"<pin>"` (self-signed) or `anchor apple generic` plus a Timestamp
-#      (Developer ID)
+#      (Developer ID), AND on both, the extracted leaf certificate's own SHA-1
+#      equal to the pin
 # Under OAM_SKIP_MAC_SIGN=1 there is nothing of ours to verify: warn, return 0.
 mac_verify_binary(){
-  local bin="$1" out dv flags want got pin dr dr_lc auth
+  local bin="$1" out dv flags want got pin dr dr_lc auth leaf
   if [ "$MAC_SIGN_MODE" = "skip" ]; then
     mac_warn "OAM_SKIP_MAC_SIGN=1 -- signature checks skipped for $bin"
     return 0
@@ -421,8 +435,38 @@ mac_verify_binary(){
         *) mac_fatal "the designated requirement of $bin does not name $MAC_CODESIGN_IDENTIFIER: $dr"; return 1 ;;
       esac ;;
   esac
-  mac_say "$bin verifies: $auth, requirement $dr"
+  # On BOTH certificate paths, the certificate that actually signed is the
+  # pinned one. A Developer ID requirement names only Apple's anchor and a
+  # team, which any certificate of that team (or, in a weaker requirement, any
+  # team) satisfies; this ties the signature to the pin itself.
+  leaf="$(mac_leaf_sha1 "$bin")"
+  if [ "$leaf" != "$pin" ]; then
+    mac_fatal "$bin is signed by certificate ${leaf:-<none extracted>}, not the pinned $pin ($MAC_SIGNING_PIN_FILE)"
+    return 1
+  fi
+  mac_say "$bin verifies: $auth (leaf $leaf), requirement $dr"
   return 0
+}
+
+# mac_leaf_sha1 <binary> -- the SHA-1 of the certificate that signed it (the
+# leaf, which codesign extracts as <prefix>0, DER), lowercase hex; nothing when
+# there is none (ad-hoc). The same fingerprint `security find-identity` and a
+# designated requirement's H"..." use.
+mac_leaf_sha1(){
+  local d
+  d="$(mktemp -d "${TMPDIR:-/tmp}/oam-sign-leaf.XXXXXX")" || return 0
+  codesign -d --extract-certificates="$d/cert" "$1" >/dev/null 2>&1 </dev/null || true
+  [ -s "$d/cert0" ] && mac_sha1 "$d/cert0"
+  rm -rf "$d"
+}
+
+# mac_sha1 <file> -- the hex SHA-1 alone, as mac_sha256 does it.
+mac_sha1(){
+  if command -v sha1sum >/dev/null 2>&1; then
+    sha1sum "$1" | awk '{ print tolower($1) }'
+  else
+    shasum -a 1 "$1" | awk '{ print tolower($1) }'
+  fi
 }
 
 # mac_sha256 <file> -- the hex digest alone, from whichever tool this host has

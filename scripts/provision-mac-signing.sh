@@ -96,12 +96,28 @@ EOF
 normalise_sha1() { tr -d ' :\n\r' | tr 'A-F' 'a-f'; }
 
 keychain_sha1() {
-  # `-Z` prints "SHA-1 hash: <HEX>" for each certificate. A self-signed
-  # identity is the only certificate in this keychain; take the first, and
-  # --check compares it to SHA_FILE so a stray import cannot go unnoticed.
-  security find-certificate -a -Z "$KEYCHAIN" 2>/dev/null </dev/null \
-    | awk -F': ' '/^SHA-1 hash:/ { print $2; exit }' | normalise_sha1
+  # The SHA-1 of the one code-signing IDENTITY (certificate + private key) in
+  # this keychain -- not of whatever certificate lists first. A Developer ID
+  # .p12 usually carries its intermediate CA too, and the order `security
+  # find-certificate` lists them in is not guaranteed. No -v: a self-signed
+  # certificate is not trusted, and -v lists only valid identities. Each
+  # identity reads `  1) <40 HEX> "<name>" [(<trust error>)]`, and may appear
+  # in both the "Matching" and the "Valid identities only" sections, hence
+  # sort -u. Prints nothing and returns 1 unless there is exactly one; the
+  # caller says why that is fatal.
+  local all n
+  all="$(security find-identity -p codesigning "$KEYCHAIN" 2>/dev/null </dev/null \
+    | awk '$1 ~ /^[0-9]+\)$/ && length($2) == 40 && $2 !~ /[^0-9A-Fa-f]/ { print $2 }' \
+    | normalise_lines | sort -u)"
+  n="$(printf '%s' "$all" | grep -c . || true)"
+  if [ "$n" != "1" ]; then
+    note "$KEYCHAIN holds $n code-signing identities; exactly one is expected${all:+: $(printf '%s' "$all" | tr '\n' ' ')}"
+    return 1
+  fi
+  printf '%s\n' "$all"
 }
+# normalise_sha1 per line (it joins lines, for a single fingerprint).
+normalise_lines() { tr -d ' :\r' | tr 'A-F' 'a-f'; }
 
 unlock() {
   [ -f "$KEYCHAIN" ] || fail "signing keychain missing: $KEYCHAIN -- on this host run 'bash scripts/provision-mac-signing.sh --generate' (first time) or '--import <p12> <password-file>' (restore a backup)"
@@ -150,8 +166,7 @@ create_keychain_with() {
   # errSecInternalComponent.
   security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pw" "$KEYCHAIN" >/dev/null \
     || fail "security set-key-partition-list failed"
-  sha="$(keychain_sha1)"
-  [ -n "$sha" ] || fail "imported identity not found in $KEYCHAIN"
+  sha="$(keychain_sha1)" || fail "imported identity not found in $KEYCHAIN as exactly one code-signing identity (a .p12 must hold one certificate + key; its CA chain may ride along)"
   ( umask 077; printf '%s\n' "$sha" > "$SHA_FILE" )
   probe_sign "$sha"
   echo "$sha"
@@ -189,8 +204,7 @@ do_check() {
   unlock
   [ -f "$SHA_FILE" ] || fail "fingerprint file missing: $SHA_FILE"
   want="$(normalise_sha1 < "$SHA_FILE")"
-  have="$(keychain_sha1)"
-  [ -n "$have" ] || fail "no certificate found in $KEYCHAIN"
+  have="$(keychain_sha1)" || fail "no single code-signing identity found in $KEYCHAIN"
   [ "$have" = "$want" ] || fail "keychain identity $have does not match recorded fingerprint $want"
   probe_sign "$have"
   note "identity $have is usable from this session"

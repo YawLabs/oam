@@ -9,7 +9,9 @@ right after it is copied into `dist/` and before anything runs it:
    three entitlements in `oam.entitlements.plist` (JIT, unsigned executable
    memory, and disabled library validation for opt-in native addons).
 2. **Verify** with `codesign --verify --strict`, then check the identifier, the
-   runtime flag, the exact entitlement set and the signer against the pin.
+   runtime flag, the exact entitlement set and the signer against the pin
+   (the designated requirement, and the SHA-1 of the leaf certificate that
+   actually signed).
 3. **JIT smoke**: run `scripts/fixtures/jit-smoke.js` against the signed binary
    (x86_64 under Rosetta). A missing entitlement does not stop `--version`; it
    kills the process at its first JIT.
@@ -69,7 +71,9 @@ Other modes:
   sign from the current session. Once a SHA-1 is pinned, the release preflight
   runs this over ssh before it tags.
 - `bash scripts/provision-mac-signing.sh --import <oam-codesign.p12> <oam-codesign.p12-password>`
-  restores a backup onto a replacement Mac.
+  restores a backup onto a replacement Mac. The `.p12` must hold exactly one
+  signing identity (certificate plus private key). Its CA chain may be
+  included; the fingerprint recorded is the identity's own, never a CA's.
 
 To rotate the identity, move `~/.oam-signing` aside by hand, generate or import
 the new identity, and update the pin in a commit that says why.

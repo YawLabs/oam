@@ -119,8 +119,12 @@
 #                           Required as soon as release-keys/allowed_signers
 #                           holds a key; see release-keys/README.md
 #   OAM_SIGN_REQUIRED=0|1   1 makes missing signing setup fatal. Today that only
-#                           changes the bootstrap case (no key committed yet):
-#                           0 warns and ships no manifest, 1 fails in preflight.
+#                           changes the bootstrap cases: no release key
+#                           committed yet (0 warns and ships no manifest, 1
+#                           fails in preflight), and no SHA-1 yet in
+#                           scripts/mac-signing-identity.sha1 (0 signs the mac
+#                           binaries ad-hoc with a warning, 1 fails the mac
+#                           preflight; see OAM_SKIP_MAC_SIGN).
 #                           With a key committed, signing is mandatory either
 #                           way -- there is deliberately no knob that skips it.
 #                           For Windows Authenticode, 1 makes an unset
@@ -467,7 +471,7 @@ gh auth status >/dev/null 2>&1 || fail "gh not authenticated -- run 'gh auth sta
 if [ "$SKIP_MAC" != "1" ]; then
   [ -n "${OAM_MAC_HOST:-}" ] || fail "OAM_MAC_HOST not set (or set OAM_SKIP_MAC=1 to drop the mac assets)"
   bash "$SCRIPT_DIR/build-platforms-tailnet.sh" --preflight-only \
-    || fail "the mac build host cannot be used -- see above. Fix that, or set OAM_SKIP_MAC=1 to drop the mac assets"
+    || fail "the mac build host or its signing setup cannot be used -- see above. Fix that, or set OAM_SKIP_MAC=1 to drop the mac assets"
 fi
 [ "$SKIP_LINUX" = "1" ] || command -v gcloud >/dev/null 2>&1 || fail "gcloud CLI not found (or set OAM_SKIP_LINUX=1 to drop the linux asset)"
 

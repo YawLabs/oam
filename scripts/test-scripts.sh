@@ -4178,8 +4178,13 @@ MS="$SUITE_TMP/macsign"
 mkdir -p "$MS/bin" "$MS/kc"
 MS_LOG="$MS/log"
 MS_ENTS="$REPO_DIR/scripts/macos/oam.entitlements.plist"
-MS_PIN_A="0123456789abcdef0123456789abcdef01234567"
-MS_PIN_B="89abcdef0123456789abcdef0123456789abcdef"
+# Two stand-in leaf certificates (DER bytes, as `codesign -d
+# --extract-certificates` writes them) and the pins they hash to: the verify
+# gate compares the extracted leaf's SHA-1 with the pin.
+printf 'leaf certificate A' > "$MS/leaf-a"
+printf 'leaf certificate B' > "$MS/leaf-b"
+MS_PIN_A="$(sha1sum "$MS/leaf-a" | cut -c1-40)"
+MS_PIN_B="$(sha1sum "$MS/leaf-b" | cut -c1-40)"
 : > "$MS/kc/oam-codesign.keychain-db"
 printf 'kcpw' > "$MS/kc/pw"
 echo "probe source" > "$MS/true-src"
@@ -4198,6 +4203,11 @@ case " \$* " in
   *" --entitlements - --xml "*) cat "$MS/cs-ents" ;;
   *" -r- "*) echo "Executable=/x/oam" >&2; cat "$MS/cs-dr" ;;
   *" -dv "*|*" -dvv "*) cat "$MS/cs-dv" >&2 ;;
+  *" --extract-certificates="*)
+    # The leaf as <prefix>0 -- none for an ad-hoc signature (no cs-leaf).
+    for a in "\$@"; do
+      case "\$a" in --extract-certificates=*) [ ! -f "$MS/cs-leaf" ] || cp "$MS/cs-leaf" "\${a#*=}0" ;; esac
+    done ;;
 esac
 exit 0
 EOF
@@ -4238,11 +4248,19 @@ ms_good_adhoc(){
   ms_dv org.oamjs.oam '0x10002(adhoc,runtime)' 'Signature=adhoc'
   ms_ents "$MS_K1" "$MS_K2" "$MS_K3"
   echo '# designated => cdhash H"8d3c3e0b1f0a4f0e9b9e1b6b0e0c8f5a2b7c1d00"' > "$MS/cs-dr"
+  rm -f "$MS/cs-leaf"
 }
-ms_good_selfsigned(){  # ms_good_selfsigned <pin as the requirement prints it>
+ms_good_selfsigned(){  # ms_good_selfsigned <pin as the requirement prints it> -- leaf A signed
   ms_dv org.oamjs.oam '0x10000(runtime)' 'Signature size=1234' 'Authority=oam Code Signing (self-signed)' 'Signed Time=Oct 2, 2026 at 10:00:00 AM'
   ms_ents "$MS_K1" "$MS_K2" "$MS_K3"
   echo "designated => identifier \"org.oamjs.oam\" and certificate leaf = H\"$1\"" > "$MS/cs-dr"
+  cp "$MS/leaf-a" "$MS/cs-leaf"
+}
+ms_good_devid(){  # a timestamped Developer ID signature by leaf A
+  ms_dv org.oamjs.oam '0x10000(runtime)' 'Authority=Developer ID Application: Example LLC (ABCDE12345)' 'Authority=Developer ID Certification Authority' 'Timestamp=Oct 2, 2026 at 10:00:00 AM'
+  ms_ents "$MS_K1" "$MS_K2" "$MS_K3"
+  echo 'designated => identifier "org.oamjs.oam" and anchor apple generic and certificate leaf[subject.OU] = ABCDE12345' > "$MS/cs-dr"
+  cp "$MS/leaf-a" "$MS/cs-leaf"
 }
 ms_reset(){
   rm -f "$MS/cs-sign-fail" "$MS/cs-verify-fail" "$MS/sec-fail"
@@ -4288,7 +4306,7 @@ MS_GOT="$(ms mac_sign_decision; echo "$MS_OUT")|$(OAM_SIGN_REQUIRED=1 ms mac_sig
 eq "$MS_GOT" "identity:$MS_PIN_A|identity:$MS_PIN_A"
 
 it "a pin is read case- and separator-insensitively"
-ms_pin "01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67"
+ms_pin "$(sed 's/../&:/g; s/:$//' <<<"$MS_PIN_A" | tr 'a-f' 'A-F')"
 ms mac_sign_decision
 eq "$MS_OUT" "identity:$MS_PIN_A"
 
@@ -4350,10 +4368,13 @@ else fail "rc=$MS_RC log: $(cat "$MS_LOG") stderr: $MS_ERR"; fi
 
 ms_reset; ms_pin "$MS_PIN_A"
 ms ms_then mac_sign_binary "$MS/oam-bin"
-it "the pinned identity: unlock, a fresh probe, then the real signature, with --keychain and no timestamp"
+# The real signature states the leaf-form designated requirement (-r=): left to
+# derive one, codesign can pick `certificate root = H"..."` for a self-signed
+# certificate, which the verify gate would then reject.
+it "the pinned identity: unlock, a fresh probe, then the real signature, with --keychain, no timestamp and an explicit leaf requirement"
 MS_U="$(grep -n '^security unlock-keychain -p kcpw ' "$MS_LOG" | head -1 | cut -d: -f1)"
 MS_P="$(grep -nF "codesign --force --sign $MS_PIN_A --keychain $MS/kc/oam-codesign.keychain-db --options runtime --timestamp=none " "$MS_LOG" | grep '/probe$' | head -1 | cut -d: -f1)"
-MS_S="$(grep -nxF "codesign --force --sign $MS_PIN_A --keychain $MS/kc/oam-codesign.keychain-db --options runtime --timestamp=none --identifier org.oamjs.oam --entitlements $MS_ENTS $MS/oam-bin" "$MS_LOG" | head -1 | cut -d: -f1)"
+MS_S="$(grep -nxF "codesign --force --sign $MS_PIN_A --keychain $MS/kc/oam-codesign.keychain-db --options runtime --timestamp=none --identifier org.oamjs.oam -r=designated => identifier \"org.oamjs.oam\" and certificate leaf = H\"$MS_PIN_A\" --entitlements $MS_ENTS $MS/oam-bin" "$MS_LOG" | head -1 | cut -d: -f1)"
 if [ "$MS_RC" = "0" ] && [ -n "$MS_U" ] && [ -n "$MS_P" ] && [ -n "$MS_S" ] && [ "$MS_U" -lt "$MS_P" ] && [ "$MS_P" -lt "$MS_S" ]; then pass
 else fail "rc=$MS_RC unlock@${MS_U:-none} probe@${MS_P:-none} sign@${MS_S:-none} log: $(cat "$MS_LOG") stderr: $MS_ERR"; fi
 
@@ -4368,8 +4389,9 @@ else fail "rc=$MS_RC log: $(cat "$MS_LOG") stderr: $MS_ERR"; fi
 ms_reset; ms_pin "$MS_PIN_A"
 ms_dv org.oamjs.oam '0x10000(runtime)' 'Authority=Developer ID Application: Example LLC (ABCDE12345)' 'Authority=Developer ID Certification Authority' 'Authority=Apple Root CA'
 ms ms_then mac_sign_binary "$MS/oam-bin"
-it "a Developer ID identity signs with --timestamp"
-if [ "$MS_RC" = "0" ] && grep -qxF "codesign --force --sign $MS_PIN_A --keychain $MS/kc/oam-codesign.keychain-db --options runtime --timestamp --identifier org.oamjs.oam --entitlements $MS_ENTS $MS/oam-bin" "$MS_LOG"; then pass
+it "a Developer ID identity signs with --timestamp and keeps codesign's derived requirement (no -r=)"
+if [ "$MS_RC" = "0" ] && grep -qxF "codesign --force --sign $MS_PIN_A --keychain $MS/kc/oam-codesign.keychain-db --options runtime --timestamp --identifier org.oamjs.oam --entitlements $MS_ENTS $MS/oam-bin" "$MS_LOG" \
+   && ! grep -qF -- ' -r=' "$MS_LOG"; then pass
 else fail "rc=$MS_RC log: $(cat "$MS_LOG")"; fi
 
 ms_reset; ms_pin "$MS_PIN_A"
@@ -4406,19 +4428,28 @@ ms_reset; ms_ents "$MS_K1" "$MS_K2" "$MS_K3" com.apple.security.get-task-allow; 
 ms_reset; ms_pin "$MS_PIN_A"; ms_verify_rejects "pinned, but ad-hoc" "is ad-hoc signed (cdhash requirement), but the repo pins $MS_PIN_A"
 ms_reset; ms_pin "$MS_PIN_A"; ms_good_selfsigned "$MS_PIN_B"; ms_verify_rejects "another certificate" "does not name the pinned certificate $MS_PIN_A"
 ms_reset; ms_dv org.oamjs.oam '0x10000(runtime)' 'Authority=oam Code Signing (self-signed)'; ms_verify_rejects "certificate, no pin" "should be signed ad-hoc"
-ms_reset; ms_pin "$MS_PIN_A"
+ms_reset; ms_pin "$MS_PIN_A"; ms_good_devid
 ms_dv org.oamjs.oam '0x10000(runtime)' 'Authority=Developer ID Application: Example LLC (ABCDE12345)' 'Authority=Developer ID Certification Authority'
-echo 'designated => identifier "org.oamjs.oam" and anchor apple generic and certificate leaf[subject.OU] = ABCDE12345' > "$MS/cs-dr"
 ms_verify_rejects "Developer ID without a timestamp" "without a secure timestamp"
 it "verify rejects each defect, by name"
 if [ -z "$MS_BAD" ]; then pass; else fail "not rejected as expected:$MS_BAD"; fi
 
-ms_reset; ms_pin "$MS_PIN_A"
-ms_dv org.oamjs.oam '0x10000(runtime)' 'Authority=Developer ID Application: Example LLC (ABCDE12345)' 'Authority=Developer ID Certification Authority' 'Timestamp=Oct 2, 2026 at 10:00:00 AM'
-echo 'designated => identifier "org.oamjs.oam" and anchor apple generic and certificate leaf[subject.OU] = ABCDE12345' > "$MS/cs-dr"
+# The requirement is only a statement; the leaf certificate that actually
+# signed is the proof. A Developer ID requirement names a team, not the pin.
+MS_BAD=""
+ms_reset; ms_pin "$MS_PIN_A"; ms_good_selfsigned "$MS_PIN_A"; cp "$MS/leaf-b" "$MS/cs-leaf"
+ms_verify_rejects "self-signed, requirement names the pin, leaf B signed" "signed by certificate $MS_PIN_B, not the pinned $MS_PIN_A"
+ms_reset; ms_pin "$MS_PIN_A"; ms_good_devid; cp "$MS/leaf-b" "$MS/cs-leaf"
+ms_verify_rejects "Developer ID, another certificate of the team" "signed by certificate $MS_PIN_B, not the pinned $MS_PIN_A"
+ms_reset; ms_pin "$MS_PIN_A"; ms_good_devid; rm -f "$MS/cs-leaf"
+ms_verify_rejects "Developer ID, no certificate extracted" "signed by certificate <none extracted>, not the pinned $MS_PIN_A"
+it "verify: with a pin, a leaf certificate that is not the pinned one is rejected on both paths"
+if [ -z "$MS_BAD" ]; then pass; else fail "not rejected as expected:$MS_BAD"; fi
+
+ms_reset; ms_pin "$MS_PIN_A"; ms_good_devid
 ms ms_then mac_verify_binary "$MS/oam-bin"
-it "verify: a timestamped Developer ID signature passes without the self-signed leaf rule"
-if [ "$MS_RC" = "0" ]; then pass; else fail "rc=$MS_RC stderr: $MS_ERR"; fi
+it "verify: a timestamped Developer ID signature by the pinned leaf passes without the self-signed requirement rule"
+if [ "$MS_RC" = "0" ] && grep -qF "(leaf $MS_PIN_A)" <<<"$MS_ERR"; then pass; else fail "rc=$MS_RC stderr: $MS_ERR"; fi
 
 ms_reset
 OAM_SKIP_MAC_SIGN=1 ms ms_then mac_verify_binary "$MS/oam-bin"
@@ -4527,7 +4558,17 @@ cp "$MS/bin/codesign" "$MS/bin/security" "$MS_BR/bin/"
 cat > "$MS_BR/oam-stub" <<EOF
 #!/bin/bash
 echo "oam \$*" >> "$MS_LOG"
-case "\$2" in *jit-smoke.js) echo "jit smoke ok" ;; *) echo "ci smoke 42" ;; esac
+# jit-mode, when present, makes the JIT smoke fail: "crash" dies the way a
+# binary whose entitlements did not take does, "wrong" prints something else.
+case "\$2" in
+  *jit-smoke.js)
+    case "\$(cat "$MS/jit-mode" 2>/dev/null)" in
+      crash) exit 133 ;;
+      wrong) echo "jit smoke ok?" ;;
+      *) echo "jit smoke ok" ;;
+    esac ;;
+  *) echo "ci smoke 42" ;;
+esac
 EOF
 cat > "$MS_BR/bin/cargo" <<EOF
 #!/bin/bash
@@ -4565,6 +4606,24 @@ ms_br aarch64-apple-darwin OAM_SIGN_REQUIRED=1
 it "build on a darwin host under OAM_SIGN_REQUIRED=1 with no pin fails, and nothing smokes"
 if [ "$MS_RC" != "0" ] && grep -qF 'OAM_SIGN_REQUIRED=1 but' <<<"$MS_ERR" && ! grep -q '^oam ' "$MS_LOG"; then pass
 else fail "rc=$MS_RC log: $(cat "$MS_LOG") out: $MS_ERR"; fi
+
+# A failing JIT smoke is a hard stop: the signed binary is never smoked, staged
+# for the hand-back or handed on. Both ways it fails on a real Mac: a crash at
+# the first JIT, and output that is not the one exact line.
+MS_BAD=""
+for MS_MODE in crash wrong; do
+  echo "$MS_MODE" > "$MS/jit-mode"
+  ms_br aarch64-apple-darwin
+  if [ "$MS_RC" = "0" ] || ! grep -qF 'JIT smoke' <<<"$MS_ERR" \
+     || ! grep -q '^oam run scripts/fixtures/jit-smoke.js$' "$MS_LOG" \
+     || grep -v jit-smoke "$MS_LOG" | grep -q '^oam run .*smoke\.js$' \
+     || [ -e "$MS_BR/dist/mac-sha256.txt" ]; then
+    MS_BAD="$MS_BAD [$MS_MODE: rc=$MS_RC log: $(cat "$MS_LOG") out: $MS_ERR]"
+  fi
+done
+rm -f "$MS/jit-mode"
+it "build on a darwin host: a JIT smoke that crashes or answers wrong fails the leg before the smoke and the hand-back"
+if [ -z "$MS_BAD" ]; then pass; else fail "$MS_BAD"; fi
 
 # --- the release box side ---------------------------------------------------------
 it "the mac-release ssh line forwards OAM_SKIP_MAC_X64, OAM_SIGN_REQUIRED and OAM_SKIP_MAC_SIGN"
@@ -4633,6 +4692,13 @@ it "preflight: a signing knob that is not 0 or 1 fails before touching the Air"
 if [ "$MS_RC" != "0" ] && [ -z "$MS_CALLS" ] && grep -qF "OAM_SKIP_MAC_SIGN must be 0 or 1, not 'maybe'" <<<"$MS_ERR"; then pass
 else fail "rc=$MS_RC calls='$MS_CALLS' stderr: $MS_ERR"; fi
 
+# OAM_SKIP_MAC_X64 is checked by nothing else before it reaches the Air's
+# shell on the mac-release ssh line, so this loop is its only guard.
+ms_tn "" OAM_SKIP_MAC_X64=yes
+it "preflight: an OAM_SKIP_MAC_X64 that is not 0 or 1 fails before touching the Air"
+if [ "$MS_RC" != "0" ] && [ -z "$MS_CALLS" ] && grep -qF "OAM_SKIP_MAC_X64 must be 0 or 1" <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC calls='$MS_CALLS' stderr: $MS_ERR"; fi
+
 ms_tn ""
 it "preflight: bootstrap warns ad-hoc and asks the Air nothing about signing"
 if [ "$MS_RC" = "0" ] && [ -z "$MS_OUT" ] && [ "$MS_CALLS" = "probe " ] && grep -qF 'signed AD-HOC' <<<"$MS_ERR"; then pass
@@ -4674,7 +4740,19 @@ cat > "$MS_PV/bin/security" <<EOF
 #!/bin/bash
 cat > /dev/null
 case "\$1" in
-  find-certificate) printf 'keychain: "x"\nSHA-1 hash: %s\n' "\$(tr 'a-f' 'A-F' < "$MS_PV/kc-sha")" ;;
+  # kc-sha lists the keychain's identities. Each is printed in BOTH sections,
+  # as for a trusted identity, and uppercase, as security prints them.
+  find-identity)
+    ids="\$(tr 'a-f' 'A-F' < "$MS_PV/kc-sha")"
+    printf 'Policy: Code Signing\n  Matching identities\n'
+    i=0; for h in \$ids; do i=\$((i + 1)); printf '  %s) %s "oam Code Signing (self-signed)"\n' "\$i" "\$h"; done
+    printf '     %s identities found\n\n  Valid identities only\n' "\$i"
+    i=0; for h in \$ids; do i=\$((i + 1)); printf '  %s) %s "oam Code Signing (self-signed)"\n' "\$i" "\$h"; done
+    printf '     %s valid identities found\n' "\$i" ;;
+  # A p12 with its chain: the intermediate CA lists FIRST. Nothing may take
+  # the identity's fingerprint from here.
+  find-certificate) printf 'keychain: "x"\nSHA-1 hash: 1111111111111111111111111111111111111111\n'
+    for h in \$(cat "$MS_PV/kc-sha"); do printf 'SHA-1 hash: %s\n' "\$h"; done ;;
 esac
 exit 0
 EOF
@@ -4697,6 +4775,15 @@ printf '%s' "$MS_PIN_B" > "$MS_PV/kc-sha"
 ms_pv --check
 it "provision --check: a keychain certificate that is not the one recorded fails"
 if [ "$MS_RC" != "0" ] && [ -z "$MS_OUT" ] && grep -qF "keychain identity $MS_PIN_B does not match recorded fingerprint $MS_PIN_A" <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC out='$MS_OUT' stderr: $MS_ERR"; fi
+
+# Two signing identities in the dedicated keychain: which one is "the" identity
+# is ambiguous, so --check refuses rather than picking the first listed.
+printf '%s %s' "$MS_PIN_B" "$MS_PIN_A" > "$MS_PV/kc-sha"
+ms_pv --check
+it "provision --check: a keychain holding two signing identities fails, naming both"
+if [ "$MS_RC" != "0" ] && [ -z "$MS_OUT" ] && grep -qF "holds 2 code-signing identities; exactly one is expected" <<<"$MS_ERR" \
+   && grep -qF "$MS_PIN_A" <<<"$MS_ERR" && grep -qF "$MS_PIN_B" <<<"$MS_ERR"; then pass
 else fail "rc=$MS_RC out='$MS_OUT' stderr: $MS_ERR"; fi
 
 ms_pv --generate
