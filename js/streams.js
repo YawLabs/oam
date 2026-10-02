@@ -86,6 +86,16 @@
     return new (codes().ERR_INVALID_STATE.TypeError)(message);
   }
 
+  // node makes each of a released reader's two errors, and a released
+  // writer's, once, on first use, and rejects with that one error from
+  // then on.
+  let releasedError;
+  let releasingError;
+  let writerReleased;
+  const readerReleasedError = () => (releasedError ??= invalidState("Reader released"));
+  const readerReleasingError = () => (releasingError ??= invalidState("Releasing reader"));
+  const writerReleasedError = () => (writerReleased ??= invalidState("Writer has been released"));
+
   // node's extractHighWaterMark: `+value`, and NaN or negative is a
   // RangeError ERR_INVALID_ARG_VALUE (a number inspects as String() does;
   // -0 is not negative).
@@ -418,15 +428,9 @@
     }
 
     getReader() {
-      if (this._reader !== null) {
-        // Node tags this ERR_INVALID_STATE, and callers key on the code --
-        // stream/consumers' rejection is asserted by code, not by message.
-        // A bare TypeError left them unable to tell "already locked" apart
-        // from any other TypeError.
-        const err = new TypeError("ReadableStream is locked to a reader");
-        err.code = "ERR_INVALID_STATE";
-        throw err;
-      }
+      // node tags this ERR_INVALID_STATE, and callers key on the code --
+      // stream/consumers' rejection is asserted by code, not by message.
+      if (this._reader !== null) throw invalidState("ReadableStream is locked");
       const stream = this;
       let closedResolve;
       let closedReject;
@@ -444,7 +448,7 @@
         closed,
         read() {
           if (stream._reader !== reader) {
-            return Promise.reject(new TypeError("reader has been released"));
+            return Promise.reject(invalidState("The reader is not attached to a stream"));
           }
           stream._disturbed = true;
           if (stream._state === "closed") {
@@ -470,15 +474,26 @@
           });
         },
         cancel(reason) {
+          if (stream._reader !== reader) {
+            return Promise.reject(invalidState("The reader is not attached to a stream"));
+          }
           return readableCancel(stream, reason);
         },
+        // node's ReadableStreamDefaultReaderRelease: `closed` rejects with
+        // "Reader released" (a stream that has already closed or errored
+        // gets a new, rejected `closed`), the lock is dropped, then every
+        // pending read rejects with "Releasing reader".
         releaseLock() {
-          if (stream._reader === reader) {
-            stream._reader = null;
-            while (stream._waiters.length > 0) {
-              stream._waiters.shift().reject(new TypeError("reader was released"));
-            }
-          }
+          if (stream._reader !== reader) return;
+          const released = readerReleasedError();
+          if (stream._state === "readable") stream._rejectClosed(released);
+          else reader.closed = Promise.reject(released);
+          markHandled(reader.closed);
+          stream._reader = null;
+          stream._resolveClosed = undefined;
+          stream._rejectClosed = undefined;
+          const releasing = readerReleasingError();
+          while (stream._waiters.length > 0) stream._waiters.shift().reject(releasing);
         },
       };
       stream._reader = reader;
@@ -486,9 +501,7 @@
     }
 
     cancel(reason) {
-      if (this.locked) {
-        return Promise.reject(new TypeError("Cannot cancel a locked stream"));
-      }
+      if (this.locked) return Promise.reject(invalidState("ReadableStream is locked"));
       return readableCancel(this, reason);
     }
 
@@ -1073,7 +1086,7 @@
     releaseLock() {
       const stream = this._stream;
       if (stream === undefined) return;
-      const released = invalidState("Writer has been released");
+      const released = writerReleasedError();
       writerEnsureReadyPromiseRejected(this, released);
       writerEnsureClosedPromiseRejected(this, released);
       stream._writer = undefined;
