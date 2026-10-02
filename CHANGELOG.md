@@ -78,7 +78,9 @@ e2e test.
   `factory` too.
 - **An abort before the response head left the request on the wire** (#158). The connection
   is closed at the abort, for fetch and for a destroyed `http.request`; an abort while fetch
-  reads a Blob body is honoured at once too.
+  reads a Blob body is honoured at once too. An `http.request` destroyed while its upload
+  waits on a full channel reaches the server aborted, where the server read a complete
+  request with a truncated body.
 - **`statusText` and `statusMessage` were the canonical reason phrase** (#160), whatever the
   server sent; they are the phrase on the wire.
 - **`http.request` on oam's own transport added `accept`, `user-agent` and
@@ -148,8 +150,8 @@ e2e test.
   unix closing stdout or stderr closes it for oam's own writes too, and `fs.close` of a
   descriptor that is not open calls back (or throws) `EBADF`.
 - **`writeFile` ignored its `flag`** (`{ flag: 'wx' }` overwrote an existing file); every open
-  checks its flags as node's `stringToFlags` does, `fs/promises.open` maps numeric flags, and
-  under `--permission` every open that can write (`'r+'` included) asks for the write grant.
+  checks its flags as node's `stringToFlags` does, every open that can write (`'r+'`
+  included) is checked as a write, and `fs/promises.open` maps numeric flags.
 - **fs checked a call's other arguments after its path or descriptor, or not at all**:
   `writeFile` / `appendFile` options, `FileHandle` `write` / `chmod` / `chown` / `truncate`,
   and the path forms of `truncate`, `chmod`, `chown` and `utimes` now check theirs first, as
@@ -197,8 +199,7 @@ e2e test.
 - **`undici.request()` stringified stream, iterable and `Blob` bodies**; it frames them as
   undici does when it dispatches the request, starts `headersTimeout` at a streamed body's
   end, stops the body once the response is over, and every class in the shim's `errors` has
-  its own name. A destroyed upload whose channel is full reaches the server aborted, not
-  whole.
+  its own name.
 - **zlib ignored the `dictionary` option**. Inflate and deflate (and their raw forms) use it:
   a zlib stream carries `FDICT` and the dictionary's `DICTID`, a wrong dictionary is node's
   `Bad dictionary`, and the option is validated for every zlib class.

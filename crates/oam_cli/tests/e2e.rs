@@ -30289,11 +30289,10 @@ fn every_path_fs_op_respects_the_permission_model() {
     }
 }
 
-/// An open that can write needs the write grant whichever API makes it. The
+/// An open that can write is checked as a write whichever API makes it. The
 /// async open (fs/promises.open, the callback fs.open, and the path forms built
-/// on it such as fs/promises.truncate) used to ask only for the read grant for
-/// "r+" and the numeric O_RDWR, which then wrote through the descriptor under
-/// a read-only grant; the sync open already asked for the write grant.
+/// on it such as fs/promises.truncate) checked "r+" and the numeric O_RDWR as
+/// reads; the sync open already checked them as writes.
 #[test]
 fn an_open_that_can_write_needs_the_write_grant() {
     let dir = write_temp("fs_perm_open_rw/.keep", "")
@@ -30342,7 +30341,7 @@ fn an_open_that_can_write_needs_the_write_grant() {
     );
     assert!(
         stdout.contains("content=ABC"),
-        "the file was written under a read-only grant:\n{stdout}"
+        "the file is left as it was:\n{stdout}"
     );
 }
 
