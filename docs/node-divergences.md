@@ -2584,38 +2584,89 @@ throws a tick later, as an uncaught exception, and `writeFileSync(-1, utf8String
 `*Sync` form and the other callback forms) -- and so is where each check sits relative
 to the callback and the other arguments (`conformance/cases/246-*`, `247-*`). Before
 this, oam passed `-1`, `1.5`, `"3"` or `undefined` to the OS and reported `EBADF`.
+
+The other arguments are node's too, checked in JS before the descriptor as node
+checks them (`conformance/cases/257-*`): `fchmod`'s mode (`parseFileMode`),
+`ftruncate`'s `len` (an integer; a negative one is 0), `fchown`'s `uid` / `gid`
+(`[-1, 2**32-1]`), `futimes`' times, the position of `read` / `readSync` /
+`FileHandle.read` (`validatePosition`: an integer `>= -1` or a bigint), the
+`buffer` / data, options object, `offset` and `length` of `read`, `readSync`,
+`write` and `writeSync` with node's overloads, and the options then the data of
+`writeFile` / `appendFile` in all four forms (`Sync`, callback, `fs/promises`,
+`FileHandle`; `conformance/cases/260-*`), before the path or descriptor: node's
+`getOptions` (a string or an object, a known encoding, an `AbortSignal`), a boolean
+`flush`, then a string or a view -- or, for the promise forms, any other iterable,
+written chunk by chunk. Their `flag` opens the path, and every open's flags are
+node's `stringToFlags` (`conformance/cases/265-*`): an int32 of `O_*` bits, or one
+of node's spellings -- anything else is `ERR_INVALID_ARG_VALUE` "flags", after the
+path and before the mode -- so `writeFileSync(p, d, { flag: 'wx' })` fails `EEXIST`
+on an existing file, where oam used to ignore the flag and overwrite it. `FileHandle`'s `write`, `chmod`, `chown` and `truncate` run
+the same checks as their descriptor twins, after the closed-handle check
+(`conformance/cases/261-*`): `fh.write(string[, position[, encoding]])` takes a
+position, not an offset into the string, and `read`, `readv`, `write` and `writev`
+resolve null-prototype objects, as node's do. The path forms check theirs too
+(`conformance/cases/263-*`): `truncate` opens the path `"r+"` and ftruncates it, so a
+missing file is `ENOENT` before the length is looked at and a bad length leaves the
+file alone; `chmod` takes `parseFileMode`, `chown` / `lchown` the `uid` / `gid`
+bound, `utimes` / `lutimes` name a bad time `"time"`; and the callback forms check
+the path and these arguments at the call, in node's order, not through the callback.
+(One order differs, on macOS only: node's `lchmodSync` and `fs/promises.lchmod` open
+the path before checking the mode, so a missing path with a bad mode is `ENOENT`
+there; oam reports the mode.) A write's position (and `readv`'s) is not
+validated, as in node: anything but a safe integer -- `1.5`, `'x'`, a bigint -- and
+`-1` are the cursor (oam used to round `1.5` down to a pwrite at 1). Any other
+negative is what libuv makes of it (`conformance/cases/264-*`): the cursor on unix;
+on Windows libuv hands it to the OS as the offset, so `-2` is the cursor without
+moving it, an append handle appends, and anything else is `EINVAL` with the file
+untouched -- where oam used to write at the cursor and report success.
+A string write's encoding is node's too: only `'hex'` with an odd-length string is
+refused, and a name the binding does not know (`'bogus'`) writes UTF-8 -- so
+`fs.writeSync(-1, 'x', 0, 'bogus')` is the descriptor error, where oam used to throw
+`ERR_UNKNOWN_ENCODING`.
 What still differs:
 
-- **Arguments node validates before the descriptor, which oam does not check there.**
-  `fchmod`'s mode (`ERR_INVALID_ARG_VALUE` for `'zz'`), `ftruncate`'s `len`,
-  `fchown`'s `uid` / `gid`, `writeSync`'s `buffer`, `offset`, `position` and `options`,
-  the `position` of `read` / `readSync` / `FileHandle.read` (node's `validatePosition`:
-  `'zz'`, `-2` and `1.5` are refused), and the callback `writeFile` / `appendFile`'s
-  `data` (oam reports a bad one through the callback). node refuses these first, so
-  `fs.fchmodSync(-1, 'zz')` is the mode error there; oam reports the descriptor. With a
-  valid descriptor oam passes such a value to the OS as before. (`futimes`' times are
-  validated, in node's order; so are the `buffer`, options object, `offset` and `length`
-  of `read`, `readSync` and `FileHandle.read`, with node's overloads -- a bad offset is
-  refused even by a read of length 0.)
-- **`fs.writeSync(fd, string, position, 'bogus')`**: node's binding ignores an encoding
-  it does not know and writes UTF-8 (so with `-1` it is the descriptor error); oam
-  throws `ERR_UNKNOWN_ENCODING`.
+- **Open flags the natives cannot spell.** oam opens through fopen-style flag
+  strings, so the synchronous spellings (`'rs+'`, `'as'`, ...) open without `O_SYNC`,
+  and a numeric combination no fopen string expresses -- `O_WRONLY` without
+  `O_CREAT`, or `O_WRONLY | O_CREAT` without `O_TRUNC` -- opens as the nearest one
+  (`'w'`, which creates and truncates). Numeric flags with both access bits set
+  (`-1`) are `EINVAL` in node and open read-only in oam.
+- **A negative position for `writev` / `readv` of several buffers, on Windows.**
+  libuv offsets each buffer from the position in turn, so with `-2` the second
+  buffer of `writevSync(fd, [a, b], -2)` lands at `-2 + a.length` -- `-1` is the
+  end of the file -- and a `readvSync` stops there. oam gathers the buffers into
+  one write (scatters one read), so all of them land at the cursor. A single
+  buffer, and every position on unix, match.
 - **An anonymous class instance as the descriptor** reads `Received an instance of
   Object` in the C++ wording on oam, where V8 names it after the variable it was
   assigned to (`an instance of vals`); JS cannot see that inferred name.
-- **Descriptors 0-2.** oam's descriptor table holds only what `fs` opened (and fds a
-  parent passed in, see 19), so `fstatSync(0)`, `closeSync(0)`, `readSync(0, ...)` and
-  the like are `EBADF` where node operates on the process's stdin. `writeSync(1|2)` is
-  routed to stdout / stderr and matches. (`-0` is a valid descriptor 0 on both.)
-- **`fs.rm(path[, options], callback)` without a function callback** throws
-  `ERR_INVALID_ARG_TYPE` for `"cb"` at the call, as every other callback-form `fs`
-  call does. node v22.22.2's `rm` does not check its callback: the call returns, and
-  the rm's completion later dies with an uncaught `TypeError: callback is not a
-  function`. Reproducing that would turn a clear error at the call site into a
-  crash with no user frame, so oam keeps the check.
-- **A closed descriptor in range** behaves as before: `fs.close(fd, cb)` on one oam
-  never opened calls back `null` where node reports `EBADF`, and on Windows node's
-  `fchown` on any descriptor is a no-op success where oam reports `EBADF`.
+- **`fchmod` of a Windows pipe or NUL descriptor.** Descriptors 0-2 are the process's
+  stdin, stdout and stderr for every fd call, as in node (`fstatSync(0)`,
+  `readSync(0)`, `readFileSync(0)`, `fsyncSync(1)`; `conformance/cases/258-*`), with
+  libuv's Windows `fstat` shapes for a pipe, the console and NUL, and its close rule
+  (0-2 stay open on Windows, are really closed on unix -- after `fs.closeSync(1)` a
+  pipe's reader sees EOF and every later write to stdout, `console.log` aside, fails
+  `EBADF`, as in node). One unix difference remains: node's descriptors are the OS's,
+  so `fs.closeSync(1)` followed by `fs.openSync(file, 'w')` gets descriptor 1 back
+  and stdout's writes go to the file; oam's `openSync` numbers its own descriptors,
+  and stdout stays closed. libuv's Windows `fchmod`
+  reopens the handle first, which fails for a pipe (`EBUSY`) and NUL (`EINVAL`);
+  oam's sets the attribute on the handle it has, so `fchmodSync(0, mode)` on a piped
+  stdin succeeds and on NUL is `EISDIR`. A character device other than the console
+  and NUL (a serial port) stats with NUL's shape on oam, where libuv reads its file
+  information.
+- **`fchown` of a closed descriptor on Windows.** node's (libuv's) Windows `fchown`
+  is a no-op success for any descriptor, open or not; oam reports `EBADF` for one
+  that is not open. (`fs.close` of a descriptor that is not open is `EBADF` through
+  the callback, as node's is, and an uncaught exception without one --
+  `conformance/cases/259-*`. So is `fs.rm` without a function callback: node's
+  `rm` never checks it, so the removal runs and calling the missing callback when
+  it settles is an uncaught `TypeError: callback is not a function`; oam does the
+  same rather than refusing at the call, which it used to. `rm`, `rmSync` and
+  `fs/promises.rm` validate their options as node's `validateRmOptions` does, and
+  lstat the path first as it does: a directory without `recursive` is node's
+  `SystemError` `ERR_FS_EISDIR` and nothing is removed, and a path that cannot be
+  lstat'ed reports the `lstat`, except `ENOENT` under `force`.)
 
 ### Coded errors: the error objects
 

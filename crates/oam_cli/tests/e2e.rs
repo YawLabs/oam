@@ -28851,6 +28851,143 @@ fn every_path_fs_op_respects_the_permission_model() {
     }
 }
 
+/// An open that can write needs the write grant whichever API makes it. The
+/// async open (fs/promises.open, the callback fs.open, and the path forms built
+/// on it such as fs/promises.truncate) used to ask only for the read grant for
+/// "r+" and the numeric O_RDWR, which then wrote through the descriptor under
+/// a read-only grant; the sync open already asked for the write grant.
+#[test]
+fn an_open_that_can_write_needs_the_write_grant() {
+    let dir = write_temp("fs_perm_open_rw/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let target = dir.join("target.txt");
+    std::fs::write(&target, "ABC").unwrap();
+    let script = write_temp(
+        "fs_perm_open_rw.mjs",
+        "import fs from 'node:fs';\n\
+         const p = process.argv[2];\n\
+         const t = async (label, fn) => {\n\
+           try { await fn(); console.log(label + '=ALLOWED'); }\n\
+           catch (e) { console.log(label + '=' + e.code); }\n\
+         };\n\
+         await t('promisesOpenRplus', async () => { const h = await fs.promises.open(p, 'r+'); await h.write('Z', 0); await h.close(); });\n\
+         await t('promisesOpenRDWR', () => fs.promises.open(p, fs.constants.O_RDWR));\n\
+         await t('openRplusCb', () => new Promise((res, rej) => fs.open(p, 'r+', (e, fd) => e ? rej(e) : res(fd))));\n\
+         await t('promisesTruncate', () => fs.promises.truncate(p, 0));\n\
+         await t('truncateCb', () => new Promise((res, rej) => fs.truncate(p, 0, (e) => e ? rej(e) : res())));\n\
+         await t('openSyncRplus', () => fs.openSync(p, 'r+'));\n\
+         await t('promisesOpenR', async () => (await fs.promises.open(p, 'r')).close());\n\
+         console.log('content=' + fs.readFileSync(p, 'utf8'));",
+    );
+    let script = script.to_string_lossy().to_string();
+    let target_arg = target.to_string_lossy().to_string();
+    let out = oam(&["--permission", "--allow-fs-read=*", &script, &target_arg]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    for op in [
+        "promisesOpenRplus",
+        "promisesOpenRDWR",
+        "openRplusCb",
+        "promisesTruncate",
+        "truncateCb",
+        "openSyncRplus",
+    ] {
+        assert!(
+            stdout.contains(&format!("{op}=ERR_ACCESS_DENIED")),
+            "{op} must need the write grant:\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("promisesOpenR=ALLOWED"),
+        "a read-only open needs only the read grant:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("content=ABC"),
+        "the file was written under a read-only grant:\n{stdout}"
+    );
+}
+
+/// On unix `fs.closeSync(1)` really closes stdout, as node's does (measured on
+/// node v22.23.2, Linux, stdout a pipe): the reader sees EOF at once, not when
+/// the process exits, and every later write to it -- fs.writeSync(1),
+/// process.stdout.write -- fails EBADF; the same for stderr. oam kept a
+/// duplicate of stdout for its own writes, so output went on flowing after
+/// the close and the pipe stayed open until exit. (Windows leaves 0-2 open,
+/// as libuv does; conformance/cases/258 covers that side.)
+#[cfg(unix)]
+#[test]
+fn closing_stdout_or_stderr_really_closes_it() {
+    for fd in [1, 2] {
+        let other = 3 - fd;
+        let script = write_temp(
+            &format!("close_stdio_{fd}.cjs"),
+            &format!(
+                "const fs = require('fs');\n\
+                 const log = (s) => fs.writeSync({other}, s + '\\n');\n\
+                 console.log('before'); console.error('before');\n\
+                 fs.closeSync({fd});\n\
+                 try {{ fs.writeSync({fd}, 'after\\n'); log('writeSync ok'); }}\n\
+                 catch (e) {{ log('writeSync ' + e.code + ' ' + e.syscall + ' ' + Object.keys(e)); }}\n\
+                 try {{ fs.fstatSync({fd}); log('fstat ok'); }} catch (e) {{ log('fstat ' + e.code); }}\n\
+                 const stream = {fd} === 1 ? process.stdout : process.stderr;\n\
+                 stream.on('error', (e) => log('error ' + e.code));\n\
+                 stream.write('after-stream\\n', (e) => log('cb ' + (e ? e.code : 'ok')));\n\
+                 try {{ fs.closeSync({fd}); }} catch (e) {{ log('close again ' + e.code); }}\n\
+                 setTimeout(() => log('done'), 3000);\n"
+            ),
+        );
+        let script = script.to_string_lossy().to_string();
+        let mut child = oam_command(&[&script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("oam runs");
+        let started = std::time::Instant::now();
+        // The closed side reaches EOF long before the 3s timer ends the run.
+        let closed_side: Box<dyn std::io::Read + Send> = if fd == 1 {
+            Box::new(child.stdout.take().unwrap())
+        } else {
+            Box::new(child.stderr.take().unwrap())
+        };
+        let mut open_side: Box<dyn std::io::Read + Send> = if fd == 1 {
+            Box::new(child.stderr.take().unwrap())
+        } else {
+            Box::new(child.stdout.take().unwrap())
+        };
+        let reader = std::thread::spawn(move || {
+            let mut closed_side = closed_side;
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut closed_side, &mut text).unwrap();
+            (text, started.elapsed())
+        });
+        let mut log = String::new();
+        std::io::Read::read_to_string(&mut open_side, &mut log).unwrap();
+        let status = child.wait().unwrap();
+        let (closed_text, eof_after) = reader.join().unwrap();
+        assert!(status.success(), "fd {fd}: {log}");
+        assert_eq!(
+            closed_text, "before\n",
+            "fd {fd}: nothing after the close reaches it"
+        );
+        assert!(
+            eof_after < std::time::Duration::from_millis(2000),
+            "fd {fd}: the reader saw EOF only after {eof_after:?}, at exit"
+        );
+        for line in [
+            "writeSync EBADF write errno,syscall,code",
+            "fstat EBADF",
+            "cb EBADF",
+            "error EBADF",
+            "close again EBADF",
+            "done",
+        ] {
+            assert!(log.contains(line), "fd {fd}: missing {line:?} in:\n{log}");
+        }
+    }
+}
+
 /// The `worker` and `child` permissions must stay SEPARATE.
 ///
 /// `--allow-worker` used to imply `--allow-child-process`, because a worker

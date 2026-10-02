@@ -1298,9 +1298,51 @@
   codes.ERR_FS_CP_DIR_TO_NON_DIR = E("ERR_FS_CP_DIR_TO_NON_DIR", Error, function(msg) {
     return msg;
   });
-  codes.ERR_FS_EISDIR = E("ERR_FS_EISDIR", Error, function(msg) {
-    return msg || 'Path is a directory';
-  });
+  // node's SystemError (lib/internal/errors.js, v22.22.2): the class of the
+  // codes node raises for a failure it decides itself but reports in a
+  // system error's terms (ERR_FS_EISDIR). The message is `<prefix>: <syscall>
+  // returned <code> (<message>) <path>`, `info` is the context object, and
+  // errno / syscall / path are enumerable accessors over it -- own keys
+  // stack, code, name, message, info, errno, syscall, path, in that order.
+  // toString() and the stack header read `SystemError [<key>]: <message>`,
+  // and util.inspect shows the accessors' values.
+  class SystemError extends Error {
+    constructor(key, prefix, context) {
+      super();
+      let message = `${prefix}: ${context.syscall} returned ${context.code} (${context.message})`;
+      if (context.path !== undefined) message += ` ${context.path}`;
+      if (context.dest !== undefined) message += ` => ${context.dest}`;
+      this.code = key;
+      const field = (name) => ({
+        get() { return context[name]; },
+        set(value) { context[name] = value; },
+        enumerable: true,
+        configurable: true,
+      });
+      Object.defineProperties(this, {
+        name: { value: "SystemError", enumerable: false, writable: true, configurable: true },
+        message: { value: message, enumerable: false, writable: true, configurable: true },
+        info: { value: context, enumerable: true, configurable: true, writable: false },
+        errno: field("errno"),
+        syscall: field("syscall"),
+      });
+      if (context.path !== undefined) Object.defineProperty(this, "path", field("path"));
+      if (context.dest !== undefined) Object.defineProperty(this, "dest", field("dest"));
+      try {
+        const stack = this.stack;
+        if (typeof stack === "string" && stack.startsWith("Error")) this.stack = this.toString() + stack.slice(5);
+      } catch {
+        // A throwing user Error.prepareStackTrace: the error is still whole.
+      }
+    }
+    toString() {
+      return `${this.name} [${this.code}]: ${this.message}`;
+    }
+    [Symbol.for("nodejs.util.inspect.custom")](recurseTimes, ctx) {
+      return registry.get("util").inspect(this, { ...ctx, getters: true, customInspect: false });
+    }
+  }
+  codes.ERR_FS_EISDIR = (context) => new SystemError("ERR_FS_EISDIR", "Path is a directory", context);
   codes.ERR_MODULE_NOT_FOUND = E("ERR_MODULE_NOT_FOUND", Error, function(path, base) {
     return 'Cannot find module "' + path + '"' + (base ? ' imported from ' + base : '');
   });
@@ -1399,7 +1441,10 @@
   // separators only for magnitudes strictly greater than 2**32 (Node parity --
   // 2**32 itself prints plain, 2**40 gets separators); otherwise String(n).
   function fmtRange(n) {
+    // A bigint is grouped past 2n**32n, as a number is; either way it keeps
+    // its n.
     if (typeof n === "bigint") {
+      if (n <= 2n ** 32n && n >= -(2n ** 32n)) return n + "n";
       const neg = n < 0n;
       const s = (neg ? -n : n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, "_");
       return (neg ? "-" : "") + s + "n";
@@ -1544,10 +1589,11 @@
 
   // The "must be of type <expected>" variant (used for scalar args like
   // offset/byteLength where Node expects a primitive type, not an instance).
+  // A dotted name ("options.retryDelay") is a "property", as node words it.
   function argTypeOfError(argName, expected, value) {
     return applyNodeErrorShape(
       new TypeError(
-        'The "' + argName + '" argument must be of type ' +
+        'The "' + argName + (argName.includes(".") ? '" property' : '" argument') + " must be of type " +
           expected + "." + receivedSuffix(value),
       ),
       "ERR_INVALID_ARG_TYPE",
@@ -4790,7 +4836,7 @@
 
   // Node's fs.constants O_* are the platform's fcntl/CRT values: O_CREAT/O_EXCL/
   // O_TRUNC/O_APPEND differ between Linux, Windows (MSVCRT), and macOS (BSD).
-  // (O_RDONLY/O_WRONLY/O_RDWR are 0/1/2 everywhere.) numericOpenFlags() must use
+  // (O_RDONLY/O_WRONLY/O_RDWR are 0/1/2 everywhere.) openFlagString() must use
   // the same per-platform values, so this is the single source for both.
   function platformOFlags(platform) {
     if (platform === "win32") return { O_CREAT: 256, O_EXCL: 1024, O_TRUNC: 512, O_APPEND: 8 };
@@ -4798,6 +4844,46 @@
     // O_NOATIME is Linux-only and must be ABSENT elsewhere -- Node's test
     // asserts both directions, and code feature-detects with `in`.
     return { O_CREAT: 64, O_EXCL: 128, O_TRUNC: 512, O_APPEND: 1024, O_NOATIME: 0x40000 };
+  }
+
+  // Map numeric O_* open flags to the fopen-style string natives.fsOpen /
+  // fsOpenSync take. Most callers pass a string ("r"/"w"/...); chokidar and
+  // lockfile code pass numbers. O_CREAT|O_EXCL is "x" (fail if it exists)
+  // and O_CREAT|O_TRUNC a truncating "w"; a combination no fopen string
+  // spells (O_WRONLY alone, O_WRONLY|O_CREAT) opens as the nearest one.
+  function openFlagString(n, platform) {
+    const { O_APPEND, O_CREAT, O_EXCL } = platformOFlags(platform);
+    const acc = n & 3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
+    const plus = acc === 2 ? "+" : "";
+    const exclusive = (n & O_CREAT) !== 0 && (n & O_EXCL) !== 0;
+    if (acc === 0) return "r";
+    if ((n & O_APPEND) !== 0) return (exclusive ? "ax" : "a") + plus;
+    if (exclusive) return "wx" + plus;
+    return acc === 2 && (n & O_CREAT) === 0 ? "r+" : "w" + plus;
+  }
+
+  // node's stringToFlags (lib/internal/fs/utils.js, v22.22.2), as the
+  // fopen-style strings the natives take: an int32 is O_* bits, null /
+  // undefined is "r", and a string must be one of node's spellings -- the
+  // synchronous ("s") ones open as their plain twins, without O_SYNC -- or it
+  // is ERR_INVALID_ARG_VALUE "flags". Shared by every open: fs.open,
+  // fs.openSync, fs/promises.open and the writeFile family's `flag`.
+  const OPEN_FLAG_STRINGS = {
+    __proto__: null,
+    r: "r", rs: "r", sr: "r", "r+": "r+", "rs+": "r+", "sr+": "r+",
+    w: "w", wx: "wx", xw: "wx", "w+": "w+", "wx+": "wx+", "xw+": "wx+",
+    a: "a", ax: "ax", xa: "ax", as: "a", sa: "a",
+    "a+": "a+", "ax+": "ax+", "xa+": "ax+", "as+": "a+", "sa+": "a+",
+  };
+  function openFlags(flags, platform) {
+    if (typeof flags === "number") {
+      validateInt32(flags, "flags");
+      return openFlagString(flags, platform);
+    }
+    if (flags == null) return "r";
+    const fopen = typeof flags === "string" ? OPEN_FLAG_STRINGS[flags] : undefined;
+    if (fopen === undefined) throw codes.ERR_INVALID_ARG_VALUE("flags", flags);
+    return fopen;
   }
 
   // libuv error strings, keyed by code. This list is the AUTHORITY on which
@@ -9380,7 +9466,18 @@
     // only ever answer file/dir/symlink -- the other four were hardcoded false,
     // so a POSIX character device, block device, FIFO or socket all reported
     // themselves as none of those.
-    _checkModeProperty(bits) { return (this.mode & S_IFMT) === bits; }
+    // On Windows node answers false for a FIFO, block device or socket
+    // whatever the mode says ("Some types are not available on Windows") --
+    // which is observable, because libuv's fstat of a pipe IS S_IFIFO.
+    _checkModeProperty(bits) {
+      if (
+        (bits === S_IFIFO || bits === S_IFBLK || bits === S_IFSOCK) &&
+        globalThis.__oam.node.platform === "win32"
+      ) {
+        return false;
+      }
+      return (this.mode & S_IFMT) === bits;
+    }
     isDirectory() { return this._checkModeProperty(S_IFDIR); }
     isFile() { return this._checkModeProperty(S_IFREG); }
     isBlockDevice() { return this._checkModeProperty(S_IFBLK); }
@@ -10120,12 +10217,17 @@
   }
   const toUnixMs = (time, name) => toUnixSeconds(time, name) * 1000;
 
-  // A read/write POSITION argument, normalised for the natives: a non-negative
-  // number is a pread/pwrite, anything else (null, undefined, a negative) means
-  // "from the current cursor". Shared by the fs and fs/promises factories so
-  // the two cannot drift -- FileHandle.read/write silently DROPPED their
-  // position for as long as the natives had nowhere to put it.
-  const fsPositionArg = (p) => (typeof p === "number" && p >= 0 ? p : null);
+  // A POSITION node does not validate -- a write's, readv's, writev's --
+  // normalised for the natives as the binding's GetOffset does it: a safe
+  // integer is the position, anything else (null, 1.5, "x", a bigint) is -1,
+  // "from the current cursor", passed as null. A negative position other
+  // than -1 is passed through: libuv treats it as the cursor on unix and
+  // fails it EINVAL on Windows, and the natives do the same
+  // (oam_core::file_offset). A read's position IS validated first
+  // (readPosition). Shared by the fs and fs/promises factories so the two
+  // cannot drift -- FileHandle.read/write silently DROPPED their position for
+  // as long as the natives had nowhere to put it.
+  const fsPositionArg = (p) => (Number.isSafeInteger(p) && p !== -1 ? p : null);
 
   // `Object.keys(err)` order, for the ONE fd call where node's differs.
   //
@@ -10191,6 +10293,204 @@
     if (!ArrayBuffer.isView(buffer)) {
       throw codes.ERR_INVALID_ARG_TYPE("buffer", ["Buffer", "TypedArray", "DataView"], buffer);
     }
+  }
+
+  // ---- the non-descriptor arguments of the fd calls, checked where node
+  // checks them: in JS, before the descriptor reaches the binding. Each is
+  // node's validator of the same name (lib/internal/validators.js and
+  // lib/internal/fs/utils.js, v22.22.2), so a call with a bad descriptor AND
+  // a bad other argument reports the other argument, as node's does.
+
+  // validateInt32 / validateUint32: validateInteger's shape and wording.
+  function validateInt32(value, name, min = -2147483648, max = 2147483647) {
+    validateInteger(value, name, min, max);
+  }
+  function validateUint32(value, name) {
+    validateInteger(value, name, 0, 4294967295);
+  }
+
+  // parseFileMode: an octal string or a uint32, with `def` for null /
+  // undefined. Returns the numeric mode.
+  const OCTAL_MODE = /^[0-7]+$/;
+  function parseFileMode(value, name, def) {
+    value ??= def;
+    if (typeof value === "string") {
+      if (!OCTAL_MODE.test(value)) {
+        throw codes.ERR_INVALID_ARG_VALUE(name, value, "must be a 32-bit unsigned integer or an octal string");
+      }
+      value = Number.parseInt(value, 8);
+    }
+    validateUint32(value, name);
+    return value;
+  }
+
+  // The lstat half of node's validateRmOptions (lib/internal/fs/utils.js,
+  // v22.22.2), once the options are valid: rm refuses a directory unless
+  // `recursive` is set -- ERR_FS_EISDIR, nothing removed -- and a path whose
+  // lstat fails reports that failure (syscall lstat), except ENOENT under
+  // `force`. `raw` is the lstat result, or the error it failed with.
+  function rmCheckTarget(file, recursive, force, raw, failed) {
+    if (failed !== undefined) {
+      if (force && failed?.code === "ENOENT") return;
+      throw failed;
+    }
+    if (raw.kind === "dir" && !recursive) {
+      throw codes.ERR_FS_EISDIR({ code: "EISDIR", message: "is a directory", path: file, syscall: "rm", errno: 21 });
+    }
+  }
+
+  // The synchronous half of node's validateRmOptions (validateRmdirOptions
+  // over rm's defaults, then `force`): an options object, if given, with
+  // boolean recursive / force, an int32 retryDelay >= 0 and a uint32
+  // maxRetries.
+  function validateRmOptions(options) {
+    if (options === undefined) return;
+    if (options === null || typeof options !== "object" || Array.isArray(options)) {
+      throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+    }
+    const o = { retryDelay: 100, maxRetries: 0, recursive: false, force: false, ...options };
+    if (typeof o.recursive !== "boolean") {
+      throw codes.ERR_INVALID_ARG_TYPE("options.recursive", "boolean", o.recursive);
+    }
+    validateInt32(o.retryDelay, "options.retryDelay", 0);
+    validateUint32(o.maxRetries, "options.maxRetries");
+    if (typeof o.force !== "boolean") {
+      throw codes.ERR_INVALID_ARG_TYPE("options.force", "boolean", o.force);
+    }
+  }
+
+  // The uid / gid of every chown form: integers from -1 ("leave it") through
+  // 2**32-1, uid checked first. Returns them, for the native call.
+  const kMaxUserId = 2 ** 32 - 1;
+  function ownerArgs(uid, gid) {
+    validateInteger(uid, "uid", -1, kMaxUserId);
+    validateInteger(gid, "gid", -1, kMaxUserId);
+    return [uid, gid];
+  }
+  // The two times of utimes / lutimes in every form, in milliseconds for the
+  // natives: node's toUnixTimestamp under its default name ("time").
+  const pathTimes = (atime, mtime) => [toUnixMs(atime), toUnixMs(mtime)];
+
+  // validatePosition: an integer >= -1 or a bigint that keeps
+  // position + length inside an int64. Returns what the natives take: null
+  // for -1 (the cursor), else a non-negative number.
+  function readPosition(position, length) {
+    if (position == null) return null;
+    if (typeof position === "number") {
+      validateInteger(position, "position", -1);
+      return position === -1 ? null : position;
+    }
+    if (typeof position === "bigint") {
+      const max = 2n ** 63n - 1n - BigInt(length);
+      if (!(position >= -1n && position <= max)) {
+        throw codes.ERR_OUT_OF_RANGE("position", ">= -1 && <= " + max, fmtRange(position));
+      }
+      return position === -1n ? null : Number(position);
+    }
+    throw codes.ERR_INVALID_ARG_TYPE("position", ["integer", "bigint"], position);
+  }
+
+  // validateStringAfterArrayBufferView: what to write when it is not a view.
+  function validateWriteData(data, name) {
+    if (typeof data !== "string" && !ArrayBuffer.isView(data)) {
+      throw codes.ERR_INVALID_ARG_TYPE(name, ["string", "Buffer", "TypedArray", "DataView"], data);
+    }
+  }
+
+  // validateEncoding: the one encoding a string can be invalid for is hex,
+  // at an odd length. Any other name is not an error: the binding's
+  // ParseEncoding writes UTF-8 for one it does not know (writeEncoding).
+  function validateWriteEncoding(data, encoding) {
+    if (typeof encoding === "string" && data.length % 2 !== 0 && encoding.toLowerCase() === "hex") {
+      throw codes.ERR_INVALID_ARG_VALUE("encoding", encoding, "is invalid for data of length " + data.length);
+    }
+  }
+  const writeEncoding = (encoding) =>
+    typeof encoding === "string" && globalThis.Buffer.isEncoding(encoding) ? encoding : "utf8";
+
+  // node's getOptions (lib/internal/fs/utils.js, v22.22.2): null, undefined
+  // or a function is the defaults, a string is the encoding, anything else
+  // that is not an object is ERR_INVALID_ARG_TYPE; then assertEncoding
+  // (any name Buffer does not know but "buffer") and validateAbortSignal.
+  function fsGetOptions(options, defaults) {
+    if (options == null || typeof options === "function") return defaults;
+    if (typeof options === "string") {
+      options = { ...defaults, encoding: options };
+    } else if (typeof options !== "object") {
+      throw codes.ERR_INVALID_ARG_TYPE("options", ["string", "Object"], options);
+    }
+    const encoding = options.encoding;
+    if (encoding !== "buffer" && encoding && !globalThis.Buffer.isEncoding(encoding)) {
+      throw codes.ERR_INVALID_ARG_VALUE("encoding", encoding, "is invalid encoding");
+    }
+    const signal = options.signal;
+    if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+      throw codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
+    }
+    return options;
+  }
+
+  // The options of writeFile / appendFile in every form -- sync, callback,
+  // fs/promises and FileHandle -- checked as node's are, and before the data:
+  // getOptions over the call's defaults, then `options.flush` a boolean.
+  const kWriteFileDefaults = Object.freeze({ encoding: "utf8", mode: 0o666, flag: "w", flush: false });
+  const kAppendFileDefaults = Object.freeze({ encoding: "utf8", mode: 0o666, flag: "a" });
+  function writeFileOptions(options, append) {
+    options = fsGetOptions(options, append ? kAppendFileDefaults : kWriteFileDefaults);
+    const flush = options.flush ?? false;
+    if (typeof flush !== "boolean") throw codes.ERR_INVALID_ARG_TYPE("options.flush", "boolean", flush);
+    return options;
+  }
+
+  // What fs/promises.writeFile and FileHandle.writeFile take besides a
+  // string or a view (node's isCustomIterable): any other sync or async
+  // iterable, each chunk of it a view or a string.
+  function isCustomIterable(data) {
+    return (
+      data != null &&
+      typeof data !== "string" &&
+      !ArrayBuffer.isView(data) &&
+      (typeof data[Symbol.iterator] === "function" || typeof data[Symbol.asyncIterator] === "function")
+    );
+  }
+
+  // writeFile's data once its options are checked: a view as it is, a string
+  // encoded, anything else ERR_INVALID_ARG_TYPE "data". `iterables`: the
+  // promise forms, which also take isCustomIterable data (returned as is).
+  function writeFileData(data, options, iterables) {
+    if (ArrayBuffer.isView(data) || (iterables && isCustomIterable(data))) return data;
+    validateWriteData(data, "data");
+    return globalThis.Buffer.from(data, options.encoding || "utf8");
+  }
+
+  // validateOffsetLengthWrite, after the offset itself has been validated.
+  function validateWriteRange(offset, length, byteLength) {
+    if (offset > byteLength) throw codes.ERR_OUT_OF_RANGE("offset", "<= " + byteLength, offset);
+    if (length > byteLength - offset) throw codes.ERR_OUT_OF_RANGE("length", "<= " + (byteLength - offset), length);
+    if (length < 0) throw codes.ERR_OUT_OF_RANGE("length", ">= 0", length);
+    validateInt32(length, "length", 0);
+  }
+
+  // A buffer write's overloads and checks, shared by fs.write and
+  // fs.writeSync (lib/fs.js, v22.22.2): an options object (or null) in the
+  // offset's place, the offset (null is 0), a length that is not a number
+  // meaning the rest, and the range. Returns the bytes to write, a view on
+  // the caller's memory (a DataView or a wider typed array included), and
+  // the native position. `callbackForm`: fs.write, where an offset slot
+  // holding the callback means 0.
+  function bufferWriteArgs(buffer, offset, length, position, callbackForm) {
+    if (typeof offset === "object") {
+      ({ offset = 0, length = buffer.byteLength - offset, position = null } = offset ?? {});
+    }
+    if (offset == null || (callbackForm && typeof offset === "function")) offset = 0;
+    else validateInteger(offset, "offset", 0);
+    if (typeof length !== "number") length = buffer.byteLength - offset;
+    validateWriteRange(offset, length, buffer.byteLength);
+    const bytes =
+      buffer instanceof Uint8Array && offset === 0 && length === buffer.length
+        ? buffer
+        : new Uint8Array(buffer.buffer, buffer.byteOffset + offset, length);
+    return { bytes, position: fsPositionArg(position) };
   }
 
   // ---- file-descriptor validation, for every fs API that takes an fd.
@@ -10629,7 +10929,9 @@
     // a bad path synchronously, as node's do, and an async function turned
     // that throw into a callback error. (The exported module's wrapper turns
     // it back into a rejection.)
-    const withPath = (fn) => (path, ...rest) => fn(toPath(path), ...rest);
+    // The wrapper keeps the method's `length` (node's fsp.open.length is 3).
+    const withPath = (fn) =>
+      Object.defineProperty((path, ...rest) => fn(toPath(path), ...rest), "length", { value: fn.length });
     // fs/promises.cp over two validated paths.
     async function cpRecursive(srcStr, destStr, options) {
       var opts = options || {};
@@ -10651,18 +10953,52 @@
       const bytes = await natives.fsReadFile(file);
       return decodeRead(bytes, readOptions(options).encoding ?? null);
     };
+    // node's writeFileHandle (lib/internal/fs/promises.js, v22.22.2): a view
+    // in one write -- none at all for an empty one -- or each chunk of an
+    // iterable in turn, a string chunk in the call's encoding.
+    async function writeHandleData(h, data, encoding) {
+      if (!isCustomIterable(data)) {
+        if (data.byteLength !== 0) await natives.fsWriteChunk(h, data);
+        return;
+      }
+      for await (const chunk of data) {
+        const bytes = ArrayBuffer.isView(chunk) ? chunk : globalThis.Buffer.from(chunk, encoding || "utf8");
+        if (bytes.byteLength !== 0) await natives.fsWriteChunk(h, bytes);
+      }
+    }
+    // fs/promises writeFile / appendFile once their options are checked: the
+    // data, then a FileHandle writes through itself and a path is validated.
+    // A view or string is one native write; an iterable is written chunk by
+    // chunk into the file opened for it, as node's is.
+    //
+    // The path is opened with the call's `flag`, checked as open checks it
+    // (after the path, before the mode): "w" and "a" -- the defaults -- are
+    // one native write; any other flag opens the file with it ("wx" fails
+    // EEXIST, "r+" overwrites in place, "r" fails EBADF on the write).
+    const writeFileAt = (path, data, options, append) => {
+      data = writeFileData(data, options, true);
+      if (fileHandles.has(path)) return path.writeFile(data, options);
+      const file = toPath(path);
+      const flag = openFlags(options.flag || (append ? "a" : "w"), natives.platform);
+      parseFileMode(options.mode, "mode", 0o666);
+      if (!isCustomIterable(data) && (flag === "w" || flag === "a")) {
+        return natives.fsWriteFile(file, data, flag === "a");
+      }
+      return (async () => {
+        const { handle } = await natives.fsOpen(file, flag);
+        try {
+          await writeHandleData(handle, data, options.encoding);
+        } finally {
+          natives.fsClose(handle);
+        }
+      })();
+    };
     rawFsPromises = {
       // A FileHandle reads / writes through itself, as node's do.
       readFile: (path, options) =>
         fileHandles.has(path) ? path.readFile(options) : readFileAt(toPath(path), options),
-      writeFile: (path, data, options) =>
-        fileHandles.has(path)
-          ? path.writeFile(data, options)
-          : natives.fsWriteFile(toPath(path), encodeWrite(data, options), false),
-      appendFile: (path, data, options) =>
-        fileHandles.has(path)
-          ? path.appendFile(data, options)
-          : natives.fsWriteFile(toPath(path), encodeWrite(data, options), true),
+      writeFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, false), false),
+      appendFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, true), true),
       stat: withPath(async (file) => wrapStat(await natives.fsStat(file, false))),
       lstat: withPath(async (file) => wrapStat(await natives.fsStat(file, true))),
       statfs: withPath(async (file, options) => wrapStatFs(await natives.fsStatfs(file), options)),
@@ -10674,8 +11010,18 @@
       mkdir: withPath(async (file, options) => {
         await natives.fsMkdir(file, readOptions(options).recursive === true);
       }),
-      rm: withPath(async (file, options = {}) => {
-        await natives.fsRm(file, options.recursive === true, options.force === true);
+      rm: withPath(async (file, options) => {
+        validateRmOptions(options);
+        const recursive = options?.recursive === true;
+        const force = options?.force === true;
+        let raw, failed;
+        try {
+          raw = await natives.fsStat(file, true);
+        } catch (e) {
+          failed = e;
+        }
+        rmCheckTarget(file, recursive, force, raw, failed);
+        await natives.fsRm(file, recursive, force);
       }),
       rmdir: withPath(async (dir) => {
         // Node never deletes a FILE through rmdir (code-probing callers
@@ -10711,14 +11057,29 @@
       readlink: (path) => natives.fsReadlink(toPath(path)),
       link: (existing, newPath) =>
         natives.fsLink(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
-      chmod: (path, mode) => natives.fsChmod(toPath(path), mode),
-      truncate: (path, len) => natives.fsTruncate(toPath(path), len ?? 0),
-      chown: (path, uid, gid) => natives.fsChown(toPath(path), uid, gid),
-      lchown: (path, uid, gid) => natives.fsLchown(toPath(path), uid, gid),
-      utimes: (path, atime, mtime) =>
-        natives.fsUtimes(toPath(path), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
-      lutimes: (path, atime, mtime) =>
-        natives.fsLutimes(toPath(path), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
+      // The path first, then node's validators for the rest (lib/internal/
+      // fs/promises.js, v22.22.2) -- each thrown here and turned into a
+      // rejection by the exported module's wrapper, and thrown at the call
+      // by the callback forms built on these.
+      chmod: (path, mode) => natives.fsChmod(toPath(path), parseFileMode(mode, "mode")),
+      // node opens the file "r+" and ftruncates the descriptor, so a missing
+      // file is ENOENT `open` before the length is looked at, and a bad
+      // length leaves the file alone.
+      truncate: withPath(async (file, len = 0) => {
+        const { handle } = await natives.fsOpen(file, "r+");
+        try {
+          validateInteger(len, "len");
+          await natives.fsFtruncate(handle, Math.max(0, len));
+        } finally {
+          natives.fsClose(handle);
+        }
+      }),
+      chown: (path, uid, gid) => natives.fsChown(toPath(path), ...ownerArgs(uid, gid)),
+      lchown: (path, uid, gid) => natives.fsLchown(toPath(path), ...ownerArgs(uid, gid)),
+      // The path forms' times are node's toUnixTimestamp under its default
+      // name ("time"); only the descriptor forms name them atime / mtime.
+      utimes: (path, atime, mtime) => natives.fsUtimes(toPath(path), ...pathTimes(atime, mtime)),
+      lutimes: (path, atime, mtime) => natives.fsLutimes(toPath(path), ...pathTimes(atime, mtime)),
       // lchmod diverges between the two modules, which is easy to get wrong.
       // In `node:fs` the name is bound to UNDEFINED off macOS. Here in
       // `fs/promises` it is ALWAYS a function, and off macOS it REJECTS.
@@ -10726,7 +11087,7 @@
       // and calling it rejects with a plain Error carrying only a `code` own
       // property -- name "Error", not a subclass.
       lchmod: (path, mode) => {
-        if (natives.platform === "darwin") return natives.fsLchmod(toPath(path), mode);
+        if (natives.platform === "darwin") return natives.fsLchmod(toPath(path), parseFileMode(mode, "mode"));
         const err = new Error("The lchmod() method is not implemented");
         err.code = "ERR_METHOD_NOT_IMPLEMENTED";
         return Promise.reject(err);
@@ -10735,9 +11096,11 @@
         return new Dir(dirPath, await natives.fsReaddir(dirPath));
       }),
       cp: (src, dest, options) => cpRecursive(toPath(src, "src"), toPath(dest, "dest"), options),
+      // node's order: the path, the flags, the mode.
       open: withPath(async function (file, flags, mode) {
-        flags = flags || "r";
-        var info = await natives.fsOpen(file, String(flags));
+        flags = openFlags(flags, natives.platform);
+        parseFileMode(mode, "mode", 0o666);
+        var info = await natives.fsOpen(file, flags);
 
         var h = info.handle;
         var closed = false;
@@ -10796,11 +11159,13 @@
             }
             return enc ? buf.toString(enc) : buf;
           },
+          // node's fs/promises writeFile over this handle: the options, then
+          // the data (a string, a view or an iterable), as every writeFile
+          // form checks them; the flag and flush do not apply to a handle.
           writeFile: async function (data, options) {
             guard("writeFile");
-            var enc = (options && typeof options === "object") ? options.encoding : (typeof options === "string" ? options : "utf8");
-            if (typeof data === "string") data = globalThis.Buffer.from(data, enc);
-            await natives.fsWriteChunk(h, data);
+            options = writeFileOptions(options, false);
+            await writeHandleData(h, writeFileData(data, options, true), options.encoding);
           },
           // NOT an append. node documents FileHandle.appendFile as an ALIAS of
           // writeFile ("the mode cannot be changed from what it was set to
@@ -10816,12 +11181,28 @@
           // leaves the cursor alone. Both used to accept the argument and throw
           // it away, because the natives had no position parameter to pass it
           // to -- fh.read(buf, 0, 3, 10) returned the bytes at the cursor.
+          //
+          // node's overloads and checks (lib/internal/fs/promises.js write,
+          // v22.22.2), the same as fs.writeSync's: (buffer[, offset[,
+          // length[, position]]]) or (buffer, options) with bufferWriteArgs,
+          // and (string[, position[, encoding]]) -- the second argument is a
+          // POSITION there, not an offset into the string. An empty view
+          // resolves 0 before anything is checked. The result has a null
+          // prototype, as node's has.
           write: async function (buffer, offset, length, position) {
             guard("write");
-            if (typeof buffer === "string") buffer = globalThis.Buffer.from(buffer);
-            var slice = (offset != null || length != null) ? buffer.subarray(offset || 0, length != null ? (offset || 0) + length : undefined) : buffer;
-            await natives.fsWriteChunk(h, slice, fsPositionArg(position));
-            return { bytesWritten: slice.length, buffer: buffer };
+            if (buffer?.byteLength === 0) return { __proto__: null, bytesWritten: 0, buffer: buffer };
+            var bytes, pos;
+            if (ArrayBuffer.isView(buffer)) {
+              ({ bytes, position: pos } = bufferWriteArgs(buffer, offset, length, position, false));
+            } else {
+              validateWriteData(buffer, "buffer");
+              validateWriteEncoding(buffer, length);
+              bytes = globalThis.Buffer.from(buffer, writeEncoding(length));
+              pos = fsPositionArg(offset);
+            }
+            await natives.fsWriteChunk(h, bytes, pos);
+            return { __proto__: null, bytesWritten: bytes.byteLength, buffer: buffer };
           },
           // node's overloads and checks (lib/internal/fs/promises.js,
           // v22.22.2): read(options), read(buffer, options) and the
@@ -10846,12 +11227,12 @@
             if (offset == null) offset = 0;
             else validateInteger(offset, "offset", 0);
             length ??= buffer.byteLength - offset;
-            if (length === 0) return { bytesRead: 0, buffer: buffer };
+            if (length === 0) return { __proto__: null, bytesRead: 0, buffer: buffer };
             validateReadRange(buffer, offset, length);
-            var chunk = await natives.fsReadChunk(h, length, fsPositionArg(position));
-            if (chunk === undefined) return { bytesRead: 0, buffer: buffer };
+            var chunk = await natives.fsReadChunk(h, length, readPosition(position, length));
+            if (chunk === undefined) return { __proto__: null, bytesRead: 0, buffer: buffer };
             new Uint8Array(buffer.buffer, buffer.byteOffset + offset, length).set(chunk);
-            return { bytesRead: chunk.length, buffer: buffer };
+            return { __proto__: null, bytesRead: chunk.length, buffer: buffer };
           },
           // FSTAT, not stat. This used to re-stat the PATH the handle was
           // opened from, which is a different object the moment anything moves
@@ -10864,9 +11245,13 @@
             guard("fstat");
             return wrapStat(await natives.fsFstat(h));
           },
+          // node's validators, after the closed-handle check (fsCall runs
+          // first): chmod's mode through parseFileMode, chown's uid / gid
+          // in [-1, 2**32-1], truncate's length an integer (a negative one
+          // is 0) -- the same checks as fchmod / fchown / ftruncate.
           chmod: async function (mode) {
             guard("fchmod");
-            await natives.fsFchmod(h, mode);
+            await natives.fsFchmod(h, parseFileMode(mode, "mode"));
           },
           // POSIX-only in effect. libuv implements uv_fs_fchown on Windows as
           // a successful no-op, and node inherits that -- the call RESOLVES
@@ -10874,11 +11259,12 @@
           // this way. Left unguarded so the resolve/reject shape matches.
           chown: async function (uid, gid) {
             guard("fchown");
-            await natives.fsFchown(h, uid, gid);
+            await natives.fsFchown(h, ...ownerArgs(uid, gid));
           },
-          truncate: async function (len) {
+          truncate: async function (len = 0) {
             guard("ftruncate");
-            await natives.fsFtruncate(h, len ?? 0);
+            validateInteger(len, "len");
+            await natives.fsFtruncate(h, Math.max(0, len));
           },
           sync: async function () {
             guard("fsync");
@@ -10911,15 +11297,15 @@
             if (n > 0) tmp.set(chunk);
             scatterViews(buffers, tmp, n);
             // The SAME array instance goes back out; callers compare identity.
-            return { bytesRead: n, buffers: buffers };
+            return { __proto__: null, bytesRead: n, buffers: buffers };
           },
           writev: async function (buffers, position) {
             guard("writev");
             var total = asViewArray(buffers);
             // node reports 0 without touching the descriptor.
-            if (emptyList(buffers)) return { bytesWritten: 0, buffers: buffers };
+            if (emptyList(buffers)) return { __proto__: null, bytesWritten: 0, buffers: buffers };
             await natives.fsWriteChunk(h, flattenViews(buffers, total), fsPositionArg(position));
-            return { bytesWritten: total, buffers: buffers };
+            return { __proto__: null, bytesWritten: total, buffers: buffers };
           },
           // The WEB stream, and not createReadStream in web clothing: node
           // builds it directly over THIS handle's read() (lib/internal/fs/
@@ -11130,8 +11516,14 @@
           fsReqEnd(token);
           throw e;
         }
+        // node's FSReqCallback::Resolve passes the value only when there is
+        // one: an operation with no result (chmod, rename, unlink, ...) calls
+        // back with the single argument null, not (null, undefined).
         p.then(
-          (value) => { fsReqEnd(token); queueMicrotask(() => cb(null, value)); },
+          (value) => {
+            fsReqEnd(token);
+            queueMicrotask(() => (value === undefined ? cb(null) : cb(null, value)));
+          },
           (err) => { fsReqEnd(token); queueMicrotask(() => cb(err)); },
         );
       };
@@ -11226,10 +11618,10 @@
       try {
         // Per write, as node's writeSync checks it: empty data writes nothing
         // and checks nothing.
-        while (off < bytes.length) {
+        while (off < bytes.byteLength) {
           off += utf8
             ? writeSyncTo(fd, off === 0 ? bytes : bytes.subarray(off), null)
-            : fs.writeSync(fd, bytes, off, bytes.length - off, null);
+            : fs.writeSync(fd, bytes, off, bytes.byteLength - off, null);
         }
       } catch (e) {
         // writeSync's error has errno, syscall, code (as node's does);
@@ -11240,6 +11632,35 @@
           e.syscall = syscall;
         }
         throw e;
+      }
+    }
+
+    // writeFileSync / appendFileSync once their options are checked (node's
+    // order, lib/fs.js v22.22.2: the options, then the data, then the path or
+    // descriptor). A string to write as UTF-8 is node's C++ fast path, which
+    // takes the path first and the mode after it; any other data is checked
+    // and encoded before the path is looked at.
+    function writeFileSyncAt(path, data, options, append) {
+      const enc = options.encoding;
+      const utf8String = typeof data === "string" && (enc === "utf8" || enc === "utf-8");
+      if (!utf8String) data = writeFileData(data, options, false);
+      if (isInt32(path)) {
+        if (utf8String) parseFileMode(options.mode, "mode", 0o666);
+        return void writeFdSync(path, data, options);
+      }
+      const file = toPath(path);
+      const flag = openFlags(options.flag || (append ? "a" : "w"), natives.platform);
+      parseFileMode(options.mode, "mode", 0o666);
+      const bytes = encodeWrite(data, options);
+      if (flag === "w" || flag === "a") return void natives.fsWriteFileSync(file, bytes, flag === "a");
+      // Any other flag: open with it, write it all, close -- node's own
+      // writeFileSync, which writes nothing (and so fails nothing) when the
+      // data is empty.
+      const fd = natives.fsOpenSync(file, flag);
+      try {
+        if (bytes.byteLength !== 0) natives.fsWriteSync(fd, bytes, null);
+      } finally {
+        natives.fsCloseSync(fd);
       }
     }
 
@@ -11295,29 +11716,40 @@
 
     // writeFile / appendFile, callback form: a descriptor is written in place
     // from its current position, a path goes through fs/promises.
-    function fdOrPathWrite(promiseFn) {
-      // `options` is never a function by the time it is passed: cb is at 3.
-      const viaPath = callbackify1(promiseFn, 3);
+    function fdOrPathWrite(promiseFn, append) {
       return function (path, data, options, cb) {
         // node's `callback ||= options`: with no callback, the options
         // argument is the one validated as it.
         if (!cb) cb = options;
-        if (typeof options === "function") options = undefined;
-        if (!isInt32(path)) return viaPath(path, data, options, cb);
+        // node's order (lib/fs.js, v22.22.2): the callback, the options, the
+        // data (a string or a view -- not the iterables fs/promises also
+        // takes -- encoded here), then the path or descriptor.
         validateCb(cb);
-        // fs.write's descriptor check, which node reaches synchronously.
-        validateFd(path, false);
-        let bytes;
-        try {
-          bytes = encodeWrite(data, options);
-        } catch (e) {
-          queueMicrotask(() => cb(e));
+        options = writeFileOptions(options, append);
+        const bytes = writeFileData(data, options, false);
+        if (!isInt32(path)) {
+          // The path's own checks throw here, at the call, as node's fs.open
+          // does; the write's outcome reaches the callback, with no value.
+          const token = fsReqStart();
+          let p;
+          try {
+            p = promiseFn(path, bytes, options);
+          } catch (e) {
+            fsReqEnd(token);
+            throw e;
+          }
+          p.then(
+            () => { fsReqEnd(token); queueMicrotask(() => cb(null)); },
+            (err) => { fsReqEnd(token); queueMicrotask(() => cb(err)); },
+          );
           return;
         }
+        // fs.write's descriptor check, which node reaches synchronously.
+        validateFd(path, false);
         let off = 0;
         const next = () => {
-          if (off >= bytes.length) return cb(null);
-          fs.write(path, bytes, off, bytes.length - off, null, (err, n) => {
+          if (off >= bytes.byteLength) return cb(null);
+          fs.write(path, bytes, off, bytes.byteLength - off, null, (err, n) => {
             if (err) return cb(err);
             off += n;
             next();
@@ -11454,25 +11886,22 @@
       };
     }
 
-    // Map numeric O_* open flags to the fopen-style string natives.fsOpen
-    // takes. Most callers pass a string ("r"/"w"/...); chokidar does.
-    function numericOpenFlags(n) {
-      var acc = n & 3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
-      var append = (n & platformOFlags(natives.platform).O_APPEND) !== 0; // O_APPEND
-      if (acc === 1) return append ? "a" : "w";
-      if (acc === 2) return append ? "a+" : "r+";
-      return "r";
-    }
-
     // The path halves of callback forms whose own wrapper has already put the
     // callback in place, built once rather than per call.
     const readFileByPath = callbackify1(promises.readFile, 2);
     // realpathArg runs inside, so the callback is checked before the path.
     const realpathByPath = callbackify1((p) => realpathWalking(realpathArg(p)), 1);
     const truncateByPath = callbackify1(promises.truncate, 2);
+    const chmodByPath = callbackify1(promises.chmod, 2);
+
+    // node's callback for fs.close(fd) without one: a failure is thrown.
+    function defaultCloseCallback(err) {
+      if (err != null) throw err;
+    }
 
     // The read behind fs.read and fs.readv, arguments already checked: `want`
-    // bytes at `position` into buffer[offset..], then cb(err, bytesRead,
+    // bytes at `position` (the native's: null for the cursor, else a
+    // non-negative number) into buffer[offset..], then cb(err, bytesRead,
     // buffer). It always asks the native, even for 0 bytes -- fs.read returns
     // early for those itself, but readv of empty views must still reach the
     // descriptor (EBADF for a closed one, as node's).
@@ -11481,7 +11910,7 @@
       // position parameter, so `fs.read(fd, buf, 0, 3, 10, cb)` read from the
       // cursor and handed back the wrong bytes with no error. The native now
       // takes one; null still means "from the cursor".
-      Promise.resolve(natives.fsReadChunk(fd, want, fsPositionArg(position))).then(
+      Promise.resolve(natives.fsReadChunk(fd, want, position)).then(
         function (chunk) {
           if (chunk === undefined || chunk === null) {
             queueMicrotask(function () { cb(null, 0, buffer); });
@@ -11533,14 +11962,8 @@
         const bytes = natives.fsReadFileSync(toPath(path));
         return decodeRead(bytes, enc ?? null);
       },
-      writeFileSync: (path, data, options) => {
-        if (isInt32(path)) return void writeFdSync(path, data, options);
-        natives.fsWriteFileSync(toPath(path), encodeWrite(data, options), false);
-      },
-      appendFileSync: (path, data, options) => {
-        if (isInt32(path)) return void writeFdSync(path, data, options);
-        natives.fsWriteFileSync(toPath(path), encodeWrite(data, options), true);
-      },
+      writeFileSync: (path, data, options) => writeFileSyncAt(path, data, writeFileOptions(options, false), false),
+      appendFileSync: (path, data, options) => writeFileSyncAt(path, data, writeFileOptions(options, true), true),
       // node answers false for a path it cannot even validate.
       existsSync: (path) => {
         let file;
@@ -11566,8 +11989,23 @@
       mkdirSync: (path, options) => {
         natives.fsMkdirSync(toPath(path), readOptions(options).recursive === true);
       },
-      rmSync: (path, options = {}) => {
-        natives.fsRmSync(toPath(path), options.recursive === true, options.force === true);
+      // node's rmSync skips the lstat only when both `force` and
+      // `recursive` are set.
+      rmSync: (path, options) => {
+        const file = toPath(path);
+        validateRmOptions(options);
+        const recursive = options?.recursive === true;
+        const force = options?.force === true;
+        if (!force || !recursive) {
+          let raw, failed;
+          try {
+            raw = natives.fsStatSync(file, true);
+          } catch (e) {
+            failed = e;
+          }
+          rmCheckTarget(file, recursive, force, raw, failed);
+        }
+        natives.fsRmSync(file, recursive, force);
       },
       rmdirSync: (path) => {
         // The kind probe is an implementation detail: node reports `rmdir` as
@@ -11611,20 +12049,33 @@
       readlinkSync: (path) => natives.fsReadlinkSync(toPath(path)),
       linkSync: (existing, newPath) =>
         natives.fsLinkSync(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
-      chmodSync: (path, mode) => natives.fsChmodSync(toPath(path), mode),
-      // A descriptor is truncated through ftruncate, with node's DEP0081.
+      chmodSync: (path, mode) => natives.fsChmodSync(toPath(path), parseFileMode(mode, "mode")),
+      // A descriptor is truncated through ftruncate, with node's DEP0081. A
+      // path is opened "r+" and its descriptor ftruncated, as node's is: the
+      // open's error (ENOENT) comes before the length's, and a bad length
+      // leaves the file alone.
       truncateSync: (path, len) => {
         if (typeof path === "number") {
           warnTruncateFd();
           return fs.ftruncateSync(path, len);
         }
-        natives.fsTruncateSync(toPath(path), len ?? 0);
+        const fd = fs.openSync(path, "r+");
+        try {
+          fs.ftruncateSync(fd, len);
+        } finally {
+          fs.closeSync(fd);
+        }
       },
       // Classic synchronous fd ops. The native handle (a number) IS the fd.
       // graceful-fs / playwright probe locks via openSync(path,"r+") and rely
       // on err.code === "ENOENT" to tell missing from locked.
-      openSync: (path, flags, _mode) =>
-        natives.fsOpenSync(toPath(path), typeof flags === "number" ? numericOpenFlags(flags) : (flags ?? "r")),
+      // node's order: the path, the flags, the mode.
+      openSync: (path, flags, mode) => {
+        const file = toPath(path);
+        flags = openFlags(flags, natives.platform);
+        parseFileMode(mode, "mode", 0o666);
+        return natives.fsOpenSync(file, flags);
+      },
       // The *Sync descriptor checks sit where node's C++ binding makes them:
       // after every other argument, right before the call (see validateFd).
       closeSync: (fd) => { validateFd(fd, true); natives.fsCloseSync(fd); },
@@ -11646,26 +12097,31 @@
         if (offset === undefined) offset = 0;
         const len = validateReadSpan(buffer, offset, length);
         if (len === 0) return 0;
+        const pos = readPosition(position, len);
         validateFd(fd, true);
-        return natives.fsReadSync(fd, buffer, offset, len, position ?? null);
+        return natives.fsReadSync(fd, buffer, offset, len, pos);
       },
-      writeSync: (fd, data, offsetOrPosition, length, position) => {
-        // Buffer form: (fd, buffer, offset, length, position).
-        // String form: (fd, string, position, encoding).
-        let buf, pos;
-        if (typeof data === "string") {
-          const enc = typeof length === "string" ? length : "utf8";
-          buf = globalThis.Buffer.from(data, enc);
-          pos = typeof offsetOrPosition === "number" ? offsetOrPosition : null;
+      // node's overloads and order (lib/fs.js, v22.22.2):
+      //   (fd, buffer[, offset[, length[, position]]]) or (fd, buffer, options)
+      //     -- offset, length and their range checked, the position not (the
+      //     binding writes at the cursor for anything but a safe integer >= 0);
+      //   (fd, string[, position[, encoding]]) -- only a hex string of odd
+      //     length is refused; an encoding the binding does not know writes
+      //     UTF-8.
+      // All of it before the descriptor, which the binding checks last. Empty
+      // data is still checked: there is no early return.
+      writeSync: function writeSync(fd, buffer, offsetOrOptions, length, position) {
+        let bytes, pos;
+        if (ArrayBuffer.isView(buffer)) {
+          ({ bytes, position: pos } = bufferWriteArgs(buffer, offsetOrOptions, length, position, false));
         } else {
-          const offset = typeof offsetOrPosition === "number" ? offsetOrPosition : 0;
-          const len = typeof length === "number" ? length : (data.length - offset);
-          buf = (offset !== 0 || len !== data.length) ? data.subarray(offset, offset + len) : data;
-          pos = typeof position === "number" ? position : null;
+          validateWriteData(buffer, "buffer");
+          validateWriteEncoding(buffer, length);
+          bytes = globalThis.Buffer.from(buffer, writeEncoding(length));
+          pos = fsPositionArg(offsetOrOptions);
         }
-        // Empty data is still checked: node's writeSync has no early return.
         validateFd(fd, true);
-        return writeSyncTo(fd, buf, pos);
+        return writeSyncTo(fd, bytes, pos);
       },
       opendirSync: function (path) {
         var dirPath = toPath(path);
@@ -11707,15 +12163,33 @@
           cb(null, out);
         });
       },
-      writeFile: fdOrPathWrite(promises.writeFile),
-      appendFile: fdOrPathWrite(promises.appendFile),
+      writeFile: fdOrPathWrite(promises.writeFile, false),
+      appendFile: fdOrPathWrite(promises.appendFile, true),
       stat: callbackify1(promises.stat, 1, 1),
       lstat: callbackify1(promises.lstat, 1, 1),
       statfs: callbackify1(promises.statfs, 1, 1),
       readdir: callbackify1(promises.readdir, 1, 1),
       glob: callbackify1(promises._globAsPromise, 1, 1),
       mkdir: callbackify1(promises.mkdir, 1, 1),
-      rm: callbackify1(promises.rm, 1, 1),
+      // node's rm (lib/fs.js, v22.22.2) validates the path and its options
+      // synchronously, and NEVER checks the callback: the removal runs, and
+      // calling a missing one when it settles is an uncaught TypeError
+      // "callback is not a function" -- that is how node reports it, so oam
+      // does too, rather than refusing at the call (which every other
+      // callback form does, because their node counterparts do).
+      rm: function rm(path, options, callback) {
+        if (typeof options === "function") {
+          callback = options;
+          options = undefined;
+        }
+        const file = toPath(path);
+        validateRmOptions(options);
+        const token = fsReqStart();
+        promises.rm(file, options).then(
+          () => { fsReqEnd(token); queueMicrotask(() => callback(null)); },
+          (err) => { fsReqEnd(token); queueMicrotask(() => callback(err)); },
+        );
+      },
       rmdir: callbackify1(promises.rmdir, 1, 1),
       unlink: callbackify1(promises.unlink, 1),
       rename: callbackify1(promises.rename, 2),
@@ -11731,14 +12205,30 @@
       symlink: callbackify1(promises.symlink, CB_LAST),
       readlink: callbackify1(promises.readlink, 1, 1),
       link: callbackify1(promises.link, 2),
-      chmod: callbackify1(promises.chmod, 2),
-      truncate: function (path, len, cb) {
-        if (typeof len === "function") { cb = len; len = 0; }
+      // node's chmod checks the path and the mode before the callback.
+      chmod: function chmod(path, mode, callback) {
+        const file = toPath(path);
+        mode = parseFileMode(mode, "mode");
+        validateCb(callback);
+        chmodByPath(file, mode, callback);
+      },
+      // node's order (lib/fs.js, v22.22.2): a descriptor goes to ftruncate;
+      // otherwise the length (an integer, a negative one 0), the callback,
+      // then the path, all at the call.
+      truncate: function truncate(path, len, cb) {
         if (typeof path === "number") {
           warnTruncateFd();
           return fs.ftruncate(path, len, cb);
         }
-        return truncateByPath(path, len, cb);
+        if (typeof len === "function") {
+          cb = len;
+          len = 0;
+        } else if (len === undefined) {
+          len = 0;
+        }
+        validateInteger(len, "len");
+        validateCb(cb);
+        return truncateByPath(path, Math.max(0, len), cb);
       },
       // opendir is the one whose callback node validates as "callback".
       opendir: callbackify1(promises.opendir, 1, 1, "callback"),
@@ -11753,17 +12243,25 @@
       // native open handle (a number) IS the integer fd. fsReadChunk/
       // fsWriteChunk take a position, so the positional (pread/pwrite) forms
       // are honoured here as well as in the sync family.
-      open: function (path, flags, mode, cb) {
-        if (typeof flags === "function") { cb = flags; flags = "r"; }
-        else if (typeof mode === "function") { cb = mode; }
+      // node's order (lib/fs.js, v22.22.2), all thrown at the call: the path;
+      // with fewer than three arguments the second is the callback, else a
+      // function mode is; the mode; the flags; the callback.
+      open: function open(path, flags, mode, cb) {
+        var file = toPath(path);
+        if (arguments.length < 3) {
+          cb = flags;
+          flags = "r";
+        } else if (typeof mode === "function") {
+          cb = mode;
+        } else {
+          parseFileMode(mode, "mode", 0o666);
+        }
+        var flagStr = openFlags(flags, natives.platform);
         validateCb(cb);
-        var flagStr = typeof flags === "number" ? numericOpenFlags(flags) : (flags || "r");
         var token = fsReqStart();
-        // toPath(path) can throw (a poisoned toString) -- drop the token
-        // before the throw escapes, or it is stranded forever.
         var p;
         try {
-          p = Promise.resolve(natives.fsOpen(toPath(path), String(flagStr)));
+          p = Promise.resolve(natives.fsOpen(file, flagStr));
         } catch (e) {
           fsReqEnd(token);
           throw e;
@@ -11774,13 +12272,18 @@
         );
       },
       // The callback is optional, but one that is passed must be a function,
-      // and node checks it before the descriptor.
-      close: function (fd, cb) {
-        if (cb !== undefined) validateCb(cb);
+      // and node checks it before the descriptor. A descriptor that is not
+      // open is EBADF through the callback, as closeSync throws it -- the
+      // same native, so the two cannot disagree (fs.close used to call back
+      // null for one, through the streams' close, which forgives a double
+      // close). With no callback node's default one throws the error, which
+      // makes it an uncaught exception.
+      close: function close(fd, cb = defaultCloseCallback) {
+        if (cb !== defaultCloseCallback) validateCb(cb);
         validateFd(fd, true);
         var err = null;
-        try { natives.fsClose(fd); } catch (e) { err = e; }
-        if (typeof cb === "function") queueMicrotask(function () { cb(err); });
+        try { natives.fsCloseSync(fd); } catch (e) { err = e; }
+        queueMicrotask(function () { cb(err); });
       },
       // Async fd-based write. Node overloads:
       //   fs.write(fd, buffer[, offset[, length[, position]]], cb)
@@ -11789,36 +12292,37 @@
       // fd 1/2 route to the stdout/stderr sinks (pino/sonic-boom's default
       // async destination writes here); other fds use the sync native op
       // dispatched on a microtask to preserve the async callback contract.
-      // node's JS getValidatedFd, before any other argument (validateFd).
-      write: function (fd, data) {
+      // node's argument handling (lib/fs.js, v22.22.2), all of it thrown at
+      // the call: the descriptor first (its JS getValidatedFd, validateFd),
+      // then for a buffer the callback -- the last of position, length,
+      // offset that is set -- and writeSync's buffer checks; for a string
+      // (fd, string[, position[, encoding]], cb) the data, the encoding and
+      // then the callback.
+      write: function write(fd, buffer, offsetOrOptions, length, position, callback) {
         validateFd(fd, false);
-        var rest = Array.prototype.slice.call(arguments, 2);
-        var cb = rest.length ? rest[rest.length - 1] : undefined;
-        validateCb(cb);
-        var mid = rest.slice(0, rest.length - 1);
-        var buf, pos;
-        try {
-          if (typeof data === "string") {
-            pos = typeof mid[0] === "number" ? mid[0] : null;
-            var enc = typeof mid[1] === "string" ? mid[1] : (typeof mid[0] === "string" ? mid[0] : "utf8");
-            buf = globalThis.Buffer.from(data, enc);
-          } else {
-            var offset = 0, length, position = null;
-            if (mid[0] !== null && typeof mid[0] === "object" && !ArrayBuffer.isView(mid[0])) {
-              offset = mid[0].offset ?? 0;
-              length = mid[0].length ?? (data.length - offset);
-              position = typeof mid[0].position === "number" ? mid[0].position : null;
+        var data = buffer;
+        var buf, pos, cb;
+        if (ArrayBuffer.isView(buffer)) {
+          cb = callback || position || length || offsetOrOptions;
+          validateCb(cb);
+          ({ bytes: buf, position: pos } = bufferWriteArgs(buffer, offsetOrOptions, length, position, true));
+        } else {
+          validateWriteData(buffer, "buffer");
+          var at = offsetOrOptions;
+          if (typeof position !== "function") {
+            if (typeof offsetOrOptions === "function") {
+              position = offsetOrOptions;
+              at = null;
             } else {
-              offset = typeof mid[0] === "number" ? mid[0] : 0;
-              length = typeof mid[1] === "number" ? mid[1] : (data.length - offset);
-              position = typeof mid[2] === "number" ? mid[2] : null;
+              position = length;
             }
-            buf = (offset !== 0 || length !== data.length) ? data.subarray(offset, offset + length) : data;
-            pos = position;
+            length = "utf8";
           }
-        } catch (e) {
-          queueMicrotask(function () { cb(e); });
-          return;
+          validateWriteEncoding(buffer, length);
+          cb = position;
+          validateCb(cb);
+          buf = globalThis.Buffer.from(buffer, writeEncoding(length));
+          pos = fsPositionArg(at);
         }
         var n, failed;
         try {
@@ -11877,7 +12381,7 @@
           process.nextTick(cb, null, 0, buffer);
           return;
         }
-        readChunkInto(fd, buffer, offset, want, position, cb);
+        readChunkInto(fd, buffer, offset, want, readPosition(position, want), cb);
       },
 
       createReadStream: (path, options) => new (rwStreams(natives).ReadStream)(path, options),
@@ -11974,14 +12478,21 @@
     const futimesCb = fdCallbackOp((fd, atime, mtime) => natives.fsFutimes(fd, atime, mtime));
     fs.fsync = function fsync(fd, cb) { fsyncCb(cb, fd); };
     fs.fdatasync = function fdatasync(fd, cb) { fdatasyncCb(cb, fd); };
+    // Their other arguments are node's validators, checked first: the length
+    // an integer (a negative one is 0), the mode node's parseFileMode (an
+    // octal string or a uint32), uid / gid integers in [-1, 2**32-1].
     // node permits `ftruncate(fd, cb)` with the length omitted. (The default
     // is node's signature, which makes ftruncate.length 1.)
     fs.ftruncate = function ftruncate(fd, len = 0, cb) {
       if (typeof len === "function") { cb = len; len = 0; }
-      ftruncateCb(cb, fd, len ?? 0);
+      validateInteger(len, "len");
+      ftruncateCb(cb, fd, Math.max(0, len));
     };
-    fs.fchmod = function fchmod(fd, mode, cb) { fchmodCb(cb, fd, mode); };
-    fs.fchown = function fchown(fd, uid, gid, cb) { fchownCb(cb, fd, uid, gid); };
+    fs.fchmod = function fchmod(fd, mode, cb) { fchmodCb(cb, fd, parseFileMode(mode, "mode")); };
+    fs.fchown = function fchown(fd, uid, gid, cb) {
+      ownerArgs(uid, gid);
+      fchownCb(cb, fd, uid, gid);
+    };
     fs.futimes = function futimes(fd, atime, mtime, cb) {
       const a = toUnixMs(atime, "atime");
       const m = toUnixMs(mtime, "mtime");
@@ -11990,9 +12501,21 @@
 
     fs.fsyncSync = (fd) => { validateFd(fd, true); natives.fsFsyncSync(fd); };
     fs.fdatasyncSync = (fd) => { validateFd(fd, true); natives.fsFdatasyncSync(fd); };
-    fs.ftruncateSync = (fd, len) => { validateFd(fd, true); natives.fsFtruncateSync(fd, len ?? 0); };
-    fs.fchmodSync = (fd, mode) => { validateFd(fd, true); natives.fsFchmodSync(fd, mode); };
-    fs.fchownSync = (fd, uid, gid) => { validateFd(fd, true); natives.fsFchownSync(fd, uid, gid); };
+    fs.ftruncateSync = function ftruncateSync(fd, len = 0) {
+      validateInteger(len, "len");
+      validateFd(fd, true);
+      natives.fsFtruncateSync(fd, len < 0 ? 0 : len);
+    };
+    fs.fchmodSync = function fchmodSync(fd, mode) {
+      mode = parseFileMode(mode, "mode");
+      validateFd(fd, true);
+      natives.fsFchmodSync(fd, mode);
+    };
+    fs.fchownSync = function fchownSync(fd, uid, gid) {
+      ownerArgs(uid, gid);
+      validateFd(fd, true);
+      natives.fsFchownSync(fd, uid, gid);
+    };
     fs.futimesSync = (fd, atime, mtime) => {
       const a = toUnixMs(atime, "atime");
       const m = toUnixMs(mtime, "mtime");
@@ -12004,25 +12527,27 @@
     //
     // The `l` forms act on a symlink itself rather than its target, which is
     // the only reason they exist.
-    fs.chown = voidCallbackOp((p, uid, gid) => natives.fsChown(toPath(p), uid, gid), 3);
-    fs.lchown = voidCallbackOp((p, uid, gid) => natives.fsLchown(toPath(p), uid, gid), 3);
-    fs.utimes = voidCallbackOp(
-      (p, atime, mtime) => natives.fsUtimes(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
-      3,
-    );
-    fs.lutimes = voidCallbackOp(
-      (p, atime, mtime) => natives.fsLutimes(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
-      3,
-    );
+    //
+    // node's order (lib/fs.js, v22.22.2), all of it thrown at the call: the
+    // callback, the path, then uid / gid or the two times. Only the
+    // operation's own failure reaches the callback.
+    const pathCallbackOp = (run, prepare) => {
+      const settle = voidCallbackOp(run, 3);
+      return function (path, a, b, cb) {
+        validateCb(cb);
+        const file = toPath(path);
+        settle(file, ...prepare(a, b), cb);
+      };
+    };
+    fs.chown = pathCallbackOp((p, uid, gid) => natives.fsChown(p, uid, gid), ownerArgs);
+    fs.lchown = pathCallbackOp((p, uid, gid) => natives.fsLchown(p, uid, gid), ownerArgs);
+    fs.utimes = pathCallbackOp((p, atime, mtime) => natives.fsUtimes(p, atime, mtime), pathTimes);
+    fs.lutimes = pathCallbackOp((p, atime, mtime) => natives.fsLutimes(p, atime, mtime), pathTimes);
 
-    fs.chownSync = (p, uid, gid) => { natives.fsChownSync(toPath(p), uid, gid); };
-    fs.lchownSync = (p, uid, gid) => { natives.fsLchownSync(toPath(p), uid, gid); };
-    fs.utimesSync = (p, atime, mtime) => {
-      natives.fsUtimesSync(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
-    };
-    fs.lutimesSync = (p, atime, mtime) => {
-      natives.fsLutimesSync(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
-    };
+    fs.chownSync = (p, uid, gid) => { natives.fsChownSync(toPath(p), ...ownerArgs(uid, gid)); };
+    fs.lchownSync = (p, uid, gid) => { natives.fsLchownSync(toPath(p), ...ownerArgs(uid, gid)); };
+    fs.utimesSync = (p, atime, mtime) => { natives.fsUtimesSync(toPath(p), ...pathTimes(atime, mtime)); };
+    fs.lutimesSync = (p, atime, mtime) => { natives.fsLutimesSync(toPath(p), ...pathTimes(atime, mtime)); };
 
     // lchmod is macOS-only. node gates its own on O_SYMLINK -- which the BSD
     // family has and Linux does not -- and OFF macOS it publishes the NAME with
@@ -12037,8 +12562,14 @@
     // what node gives. A throwing stub would link the same and then diverge on
     // the message.
     if (process.platform === "darwin") {
-      fs.lchmod = voidCallbackOp((p, mode) => natives.fsLchmod(toPath(p), mode), 2);
-      fs.lchmodSync = (p, mode) => { natives.fsLchmodSync(toPath(p), mode); };
+      // node's lchmod checks the callback, then the mode, then opens the path.
+      const lchmodRun = voidCallbackOp((p, mode) => natives.fsLchmod(p, mode), 2);
+      fs.lchmod = function lchmod(path, mode, cb) {
+        validateCb(cb);
+        mode = parseFileMode(mode, "mode");
+        lchmodRun(toPath(path), mode, cb);
+      };
+      fs.lchmodSync = (p, mode) => { natives.fsLchmodSync(toPath(p), parseFileMode(mode, "mode")); };
     } else {
       fs.lchmod = undefined;
       fs.lchmodSync = undefined;
@@ -12115,7 +12646,7 @@
         return;
       }
       const tmp = globalThis.Buffer.allocUnsafe(total);
-      readChunkInto(fd, tmp, 0, total, position, (err, n) => {
+      readChunkInto(fd, tmp, 0, total, fsPositionArg(position), (err, n) => {
         if (err) { cb(err, 0, buffers); return; }
         scatterViews(buffers, tmp, n);
         // The SAME array instance goes back, which callers compare by identity.
