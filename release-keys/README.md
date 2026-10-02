@@ -113,7 +113,9 @@ It verifies the published manifest before it changes anything, then re-signs
 the patched one and uploads the binary, `SHA256SUMS` and both manifest files in
 one call. A release with no manifest is patched unsigned only when its tag is
 older than every range in `ranges`. A newer one is refused, because a missing
-manifest there means someone removed it.
+manifest there means someone removed it. A tag listed in `presigning-sums` is
+refused too: installers verify those releases by the hash of their published
+`SHA256SUMS`, which a patch would change.
 
 ### Verifying a release by hand
 

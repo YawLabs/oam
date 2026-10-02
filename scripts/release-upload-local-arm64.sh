@@ -17,10 +17,13 @@
 # all of it is release-keys/ as committed on origin/main, NOT the tag's own
 # copy: see "trust root" below. A release with no manifest is patched as
 # before, with a warning -- but only if its tag predates every key range; a
-# tag from the signing era with no manifest has lost it, and is refused.
+# tag from the signing era with no manifest has lost it, and is refused. And
+# never a release pinned in release-keys/presigning-sums (every published
+# pre-signing release is): installers verify those by the hash of their
+# SHA256SUMS, which a patch would change.
 #
 # Usage (from the repo root, with HEAD on the tag and the release already cut):
-#   scripts/release-upload-local-arm64.sh v0.6.1
+#   scripts/release-upload-local-arm64.sh v0.18.0
 set -euo pipefail
 
 TAG="${1:?usage: release-upload-local-arm64.sh <tag>}"
@@ -106,6 +109,22 @@ trust_dir="$(mktemp -d)"
 release_keys_from_commit "$main_sha" "$trust_dir" \
   || { echo "error: could not read release-keys/ from origin/main ($main_sha) -- see above" >&2; exit 1; }
 echo "  [ok] signing trust root: release-keys/ at origin/main ${main_sha}" >&2
+
+# A pre-signing release is never patched. The installers (and `oam
+# self-update`) verify a release cut before signing existed by the SHA-256 of
+# its published SHA256SUMS, pinned in release-keys/presigning-sums and frozen
+# into every installer and binary already out there. Patching its SHA256SUMS
+# changes that hash, and from then on every one of them refuses the release --
+# with no way to re-pin the copies people already have. Read from origin/main,
+# like the keys: the tag's own checkout predates the table.
+if ! pinned_sums="$(git show "${main_sha}:release-keys/presigning-sums" 2>/dev/null)"; then
+  echo "error: release-keys/presigning-sums does not exist at origin/main (${main_sha}) -- cannot tell whether ${TAG} is a pinned pre-signing release; nothing was built or uploaded" >&2
+  exit 1
+fi
+if awk -v t="$TAG" '!/^[[:space:]]*(#|$)/ && $1 == t { found = 1 } END { exit !found }' <<<"$pinned_sums"; then
+  echo "error: ${TAG} is a pre-signing release pinned in release-keys/presigning-sums: install.sh, install.ps1 and oam self-update accept it only while its SHA256SUMS hashes to the pinned digest, so patching that file would break every install of ${TAG}. Ship the binary in a new release instead; nothing was built or uploaded" >&2
+  exit 1
+fi
 
 # Signed or pre-signing? Asked of the release's asset list now, so the key's
 # passphrase prompt comes before the build rather than after it. Re-checked

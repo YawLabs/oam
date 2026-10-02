@@ -103,6 +103,12 @@ published in `release-keys/README.md` and the release notes:
 
 To verify a release by hand, see `release-keys/README.md`.
 
+`install.sh` and `install.ps1` check this for you, against copies of these keys
+embedded in the scripts: a `v0.18.0`+ release installs only if its manifest
+signature verifies, names the tag being installed, and comes from a key whose
+range covers that tag. Releases before `v0.18.0` are checked against a pinned
+hash of their published `SHA256SUMS`. `install/README.md` has the details.
+
 ## How fixes are disclosed
 
 oam is in beta (pre-1.0), and it is used outside Yaw Labs. A security fix is

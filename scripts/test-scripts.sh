@@ -2801,6 +2801,416 @@ done
 if [ -z "$SG_BAD" ]; then pass; else fail "violations:$SG_BAD"; fi
 
 # =============================================================================
+group "install.sh / install.ps1 -- the embedded trust root"
+# =============================================================================
+# The installers carry their own copies of release-keys/: a key list fetched
+# from the release would be whatever the release says, so it is embedded. And
+# copies drift. Each block is compared with its source byte for byte (CRs
+# dropped first: a tool that ignores .gitattributes may check the .ps1 out
+# CRLF, and the .ps1 normalizes them before use).
+IN="$SUITE_TMP/install"
+mkdir -p "$IN"
+# in_block <file> <start-line> <end-line> -- the lines strictly between the
+# first <start-line> and the <end-line> after it, both matched whole.
+in_block(){ tr -d '\r' <"$1" | awk -v s="$2" -v e="$3" 'f && $0 == e { exit } f { print } !f && $0 == s { f = 1 }'; }
+# in_swap <file> <start-line> <end-line> <body-file> -- that block's body
+# replaced by <body-file>'s lines, in place. This is the suite's ONLY way to
+# point an installer at test keys: it edits a COPY of the script, the way an
+# attacker would have to edit the script itself. There is no env var for it.
+in_swap(){
+  awk -v s="$2" -v e="$3" -v f="$4" '
+    skip && $0 == e { skip = 0 }
+    !skip { print }
+    !done && $0 == s { while ((getline l < f) > 0) print l; close(f); skip = 1; done = 1 }
+  ' "$1" >"$1.swap" && mv "$1.swap" "$1"
+}
+# <source file>|<start line>|<end line>, one block per line.
+IN_SH_BLOCKS="allowed_signers|  cat <<'OAM_EMBED_ALLOWED_SIGNERS'|OAM_EMBED_ALLOWED_SIGNERS
+ranges|  cat <<'OAM_EMBED_RANGES'|OAM_EMBED_RANGES
+presigning-sums|  cat <<'OAM_EMBED_PRESIGNING_SUMS'|OAM_EMBED_PRESIGNING_SUMS"
+IN_PS_BLOCKS="allowed_signers|\$embeddedAllowedSigners = @'|'@
+ranges|\$embeddedRanges = @'|'@
+presigning-sums|\$embeddedPresigningSums = @'|'@"
+# in_drift <script> <blocks> -- each block present once and identical to
+# release-keys/<file>.
+in_drift(){
+  local bad="" name s e
+  while IFS='|' read -r name s e; do
+    [ "$(tr -d '\r' <"$1" | grep -cxF -- "$s")" = "1" ] || { bad="$bad $name(start line not there exactly once)"; continue; }
+    [ -s "release-keys/$name" ] || { bad="$bad $name(release-keys/$name missing)"; continue; }
+    in_block "$1" "$s" "$e" | cmp -s - "release-keys/$name" || bad="$bad $name"
+  done <<<"$2"
+  if [ -z "$bad" ]; then pass; else fail "$1 embeds a copy that differs from release-keys/:$bad -- paste the file in verbatim"; fi
+}
+
+it "install.sh embeds allowed_signers, ranges and presigning-sums byte for byte"
+in_drift install/install.sh "$IN_SH_BLOCKS"
+it "install.ps1 embeds allowed_signers, ranges and presigning-sums byte for byte"
+in_drift install/install.ps1 "$IN_PS_BLOCKS"
+
+# A wrong pin blocks every install of that tag, and a pin for a tag in the
+# signing era would let a manifest-less release of it through. So: plain tags,
+# all before the first range start (the signing cutoff), 64 hex digits each,
+# no tag twice.
+IN_CUT="$(awk '!/^[[:space:]]*(#|$)/ { t = $2; sub(/^v/, "", t); split(t, a, "."); k = a[1] * 1000000 + a[2] * 1000 + a[3]
+  if (min == "" || k < min) { min = k; tag = $2 } } END { print tag }' release-keys/ranges)"
+it "presigning-sums: plain tags before the signing cutoff ($IN_CUT), a sha256 each, no repeats"
+IN_BAD="$(awk -v cut="$IN_CUT" 'function key(t, a) { sub(/^v/, "", t); split(t, a, "."); return a[1] * 1000000 + a[2] * 1000 + a[3] }
+  !/^[[:space:]]*(#|$)/ {
+    if (NF != 2 || $1 !~ /^v[0-9]+\.[0-9]+\.[0-9]+$/ || $2 !~ /^[0-9a-f]+$/ || length($2) != 64 || seen[$1]++ || key($1) >= key(cut)) printf " line %d (%s)", NR, $0
+    n++ }
+  END { if (n == 0) printf " no data lines" }' release-keys/presigning-sums)"
+if [ -n "$IN_CUT" ] && [ -z "$IN_BAD" ]; then pass; else fail "cutoff '$IN_CUT'; bad:$IN_BAD"; fi
+
+it "both installers' signing cutoff is the first tag any key's range opens at"
+IN_CUTS="$(grep -xE 'FIRST_MANIFEST_SIG_TAG="[^"]*"' install/install.sh | cut -d'"' -f2) $(tr -d '\r' <install/install.ps1 | grep -xE "\\\$firstManifestSigTag = '[^']*'" | cut -d"'" -f2)"
+eq "$IN_CUTS" "$IN_CUT $IN_CUT"
+
+# The env vars an installer reads are its whole override surface. One that
+# pointed the key set, the pins or the cutoff elsewhere would be a way round
+# every check below, so the set is pinned here.
+it "install.sh and install.ps1 read only the documented OAM_* variables"
+IN_ENV="$(grep -v '^[[:space:]]*#' install/install.sh | grep -oE '\$\{?OAM_[A-Z0-9_]+' | tr -d '${' | LC_ALL=C sort -u | tr '\n' ' ')|$(tr -d '\r' <install/install.ps1 | grep -v '^[[:space:]]*#' | grep -oE 'env:OAM_[A-Z0-9_]+' | cut -d: -f2 | LC_ALL=C sort -u | tr '\n' ' ')"
+eq "$IN_ENV" "OAM_GH_API OAM_INSECURE_SKIP_SIGNATURE OAM_INSTALL_BASE OAM_INSTALL_DIR OAM_VERSION |OAM_GH_API OAM_INSECURE_SKIP_SIGNATURE OAM_INSTALL_BASE OAM_INSTALL_DIR OAM_VERSION "
+
+it "install.sh parses as POSIX sh"
+ck sh -n install/install.sh
+
+# The arm64 patch path rewrites a release's SHA256SUMS. On a pinned
+# pre-signing release that would change the very hash every installer checks
+# it by, so it must refuse -- before the build, from origin/main's table.
+it "release-upload-local-arm64.sh refuses a pinned pre-signing tag before it builds anything"
+sg_order scripts/release-upload-local-arm64.sh 'release_keys_from_commit "$main_sha" "$trust_dir"' \
+  ':release-keys/presigning-sums"' 'is a pre-signing release pinned in release-keys/presigning-sums' \
+  'cargo build --release -p oam_cli' 'gh release upload'
+
+# =============================================================================
+group "install.sh -- the verify chain, run against a local release fixture"
+# =============================================================================
+# The real installer, end to end: a copy of install.sh whose embedded blocks
+# are swapped (in_swap) for throwaway keys and a fixture pin table, fetching
+# from local directories as file:// URLs through OAM_INSTALL_BASE +
+# OAM_VERSION. A stub uname makes every host a Linux x86_64 one, and a stub gh
+# that always fails keeps the installer's gh fallback off the network.
+IN_SSH=0
+if command -v ssh-keygen >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+  # k1 trusted for v0.18.0..v0.19.5, k2 a staged key with no range, k3 a
+  # stranger to allowed_signers.
+  for k in k1 k2 k3; do
+    ssh-keygen -q -t ed25519 -N '' -C "oam-release-$k" -f "$IN/$k" </dev/null >/dev/null 2>&1 || break
+  done
+  printf 'probe\n' >"$IN/probe"
+  if [ -f "$IN/k3" ] && ssh-keygen -Y sign -f "$IN/k1" -n oam-release "$IN/probe" </dev/null >/dev/null 2>&1 \
+     && [ -s "$IN/probe.sig" ]; then
+    IN_SSH=1
+  fi
+fi
+it "this host can sign a fixture release (ssh-keygen -Y, curl)"
+if [ "$IN_SSH" = "1" ]; then pass
+else skip "no ssh-keygen with -Y or no curl here -- every installer fixture case below is skipped"; fi
+
+if [ "$IN_SSH" = "1" ]; then
+  in_url(){ if command -v cygpath >/dev/null 2>&1; then printf 'file:///%s' "$(cygpath -m "$1")"; else printf 'file://%s' "$1"; fi; }
+  in_sha(){ if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1"; else shasum -a 256 "$1"; fi | awk '{ print $1 }'; }
+  IN_LINUX=oam-x86_64-unknown-linux-gnu
+  # The Windows assets: any small real executable, so install.ps1's closing
+  # `oam --version` smoke has something it can start.
+  IN_WIN_EXE="$IN/fixture.exe"
+  if [ -f /c/Windows/System32/where.exe ]; then cp /c/Windows/System32/where.exe "$IN_WIN_EXE"
+  else printf 'not a windows host\n' >"$IN_WIN_EXE"; fi
+
+  # The trust root the copies embed.
+  { printf 'oam-release-k1 namespaces="oam-release" %s\n' "$(cut -d' ' -f1,2 "$IN/k1.pub")"
+    printf 'oam-release-k2 namespaces="oam-release" %s\n' "$(cut -d' ' -f1,2 "$IN/k2.pub")"; } >"$IN/allowed_signers"
+  printf '# fixture ranges\nk1 v0.18.0 v0.19.5\n' >"$IN/ranges"
+
+  # in_rel <name> <manifest tag|-> <signing key|-> -- a release directory: the
+  # three binaries, license files, SHA256SUMS written the way release-local.sh
+  # writes it ("<hash> *<asset>"), and optionally the manifest and its .sig.
+  in_rel(){
+    local d="$IN/rel/$1" f
+    mkdir -p "$d"
+    printf '#!/bin/sh\necho "oam fixture %s"\n' "$1" >"$d/$IN_LINUX"
+    cp "$IN_WIN_EXE" "$d/oam-x86_64-pc-windows-msvc.exe"
+    cp "$IN_WIN_EXE" "$d/oam-aarch64-pc-windows-msvc.exe"
+    ( cd "$d" && for f in oam-*; do printf '%s *%s\n' "$(in_sha "$f")" "$f"; done >SHA256SUMS )
+    for f in LICENSE NOTICE THIRD_PARTY_LICENSES.md; do printf 'fixture %s\n' "$f" >"$d/$f"; done
+    if [ "$2" != "-" ]; then { printf 'oam-release-manifest v1\ntag %s\n' "$2"; cat "$d/SHA256SUMS"; } >"$d/RELEASE-MANIFEST"; fi
+    if [ "$3" != "-" ]; then ssh-keygen -Y sign -f "$IN/$3" -n oam-release "$d/RELEASE-MANIFEST" </dev/null >/dev/null 2>&1; fi
+  }
+  in_rel good     v0.18.0 k1
+  in_rel stranger v0.18.0 k3   # signed, by a key that is not ours
+  in_rel forged   v0.18.0 k1   # signed by k1, then a SUMS line swapped
+  sed '3s/^./0/' "$IN/rel/forged/RELEASE-MANIFEST" >"$IN/m" && mv "$IN/m" "$IN/rel/forged/RELEASE-MANIFEST"
+  in_rel garbled  v0.18.0 k1   # a .sig that is not a signature at all
+  printf -- '-----BEGIN SSH SIGNATURE-----\nnot base64\n-----END SSH SIGNATURE-----\n' >"$IN/rel/garbled/RELEASE-MANIFEST.sig"
+  in_rel replay   v0.18.0 k1   # served as v0.18.1: a genuine manifest for another tag
+  in_rel retired  v0.20.0 k1   # after k1's range closed
+  in_rel staged   v0.18.0 k2   # k2 is in allowed_signers but has no range
+  in_rel unsigned -       -    # a v0.18.0+ release with no manifest at all
+  in_rel tampered v0.18.0 k1   # manifest fine, binary swapped after signing
+  printf 'evil\n' >>"$IN/rel/tampered/$IN_LINUX"
+  printf 'evil\n' >>"$IN/rel/tampered/oam-x86_64-pc-windows-msvc.exe"
+  printf 'evil\n' >>"$IN/rel/tampered/oam-aarch64-pc-windows-msvc.exe"
+  in_rel pre      -       -    # v0.17.1: pinned, and the pin matches
+  in_rel prebad   -       -    # v0.16.4: pinned, and the pin does not match
+  { printf '# fixture pins\n'
+    printf 'v0.17.1 %s\n' "$(in_sha "$IN/rel/pre/SHA256SUMS")"
+    printf 'v0.16.4 %s\n' "0000000000000000000000000000000000000000000000000000000000000000"; } >"$IN/presigning-sums"
+
+  # The copies under test, and proof the seam took: a copy still carrying the
+  # real keys would fail every case below for the wrong reason.
+  cp install/install.sh "$IN/install.sh"
+  # The .ps1 copy also loses its user-PATH write the moment it exists: the
+  # real script persists its install dir in the registry, and a test run must
+  # never touch the operator's PATH. ENVIRON, not -v: awk -v would read
+  # backslashes as escapes.
+  IN_PS_PATHSET="[Environment]::SetEnvironmentVariable('Path', \$newPath, 'User')"
+  L="    $IN_PS_PATHSET" awk '$0 == ENVIRON["L"] { print "    # (fixture copy: the user PATH is left alone)"; next } { print }' \
+    install/install.ps1 >"$IN/install.ps1"
+  IN_SWAP_BAD=""
+  for in_pair in "$IN/install.sh|$IN_SH_BLOCKS" "$IN/install.ps1|$IN_PS_BLOCKS"; do
+    in_f="${in_pair%%|*}"
+    while IFS='|' read -r name s e; do
+      in_swap "$in_f" "$s" "$e" "$IN/$name"
+      in_block "$in_f" "$s" "$e" | cmp -s - "$IN/$name" || IN_SWAP_BAD="$IN_SWAP_BAD $in_f:$name"
+    done <<<"${in_pair#*|}"
+  done
+  it "the fixture copies carry the throwaway keys and pins"
+  if [ -z "$IN_SWAP_BAD" ]; then pass; else fail "swap did not take:$IN_SWAP_BAD"; fi
+
+  # PATHs. Stubs first: uname (Linux x86_64) and a gh that always fails.
+  IN_STUB="$IN/stub"; mkdir -p "$IN_STUB"
+  printf '#!/bin/sh\ncase "$1" in -s) echo Linux ;; -m) echo x86_64 ;; *) echo Linux ;; esac\n' >"$IN_STUB/uname"
+  printf '#!/bin/sh\nexit 1\n' >"$IN_STUB/gh"
+  # An ssh-keygen from before -Y (OpenSSH 8.0 answers -Y with this).
+  IN_OLDKG="$IN/oldkg"; mkdir -p "$IN_OLDKG"
+  printf '#!/bin/sh\necho "unknown option -- Y" >&2\necho "usage: ssh-keygen [-q] [-b bits]" >&2\nexit 1\n' >"$IN_OLDKG/ssh-keygen"
+  # No ssh-keygen at all: a PATH of wrappers for exactly what install.sh runs.
+  # (Copies of the binaries would lose their DLLs on Windows; a wrapper does
+  # not.) A tool missing from this list fails the no-ssh-keygen cases loudly.
+  IN_NOKG="$IN/nokg"; mkdir -p "$IN_NOKG"
+  for t in awk sed grep head tail tr cut mktemp chmod mv rm rmdir mkdir cat curl sha256sum shasum; do
+    p="$(command -v "$t" 2>/dev/null)" || continue
+    printf '#!/bin/sh\nexec "%s" "$@"\n' "$p" >"$IN_NOKG/$t"
+  done
+  chmod +x "$IN_STUB"/* "$IN_OLDKG"/* "$IN_NOKG"/*
+  IN_PATH_KG="$IN_STUB:$PATH"
+  IN_PATH_OLDKG="$IN_STUB:$IN_OLDKG:$PATH"
+  IN_PATH_NOKG="$IN_STUB:$IN_NOKG"
+  # dash where there is one: it is the /bin/sh that `curl | sh` meets on
+  # Debian and Ubuntu, and it has none of bash's forgiveness.
+  IN_SH="$(command -v dash 2>/dev/null || command -v sh)"
+
+  # in_sh <release> <tag> <PATH> [VAR=value...] -- run the copy into a fresh
+  # $IN/dest; IN_RC and IN_OUT get the result. The operator's own token and
+  # knobs never reach it.
+  in_sh(){
+    local rel="$1" tag="$2" path="$3"; shift 3
+    rm -rf "$IN/dest"
+    IN_RC=0
+    IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API \
+      HOME="$IN" PATH="$path" OAM_INSTALL_BASE="$(in_url "$IN/rel/$rel")" OAM_VERSION="$tag" \
+      OAM_INSTALL_DIR="$IN/dest" "$@" "$IN_SH" "$IN/install.sh" 2>&1)" || IN_RC=$?
+  }
+  # in_refused <needle> -- the run failed, said <needle>, and left nothing in
+  # the install dir: no oam, no half-written temp file.
+  in_refused(){
+    local left
+    left="$(ls -A "$IN/dest" 2>/dev/null | tr '\n' ' ')"
+    if [ "$IN_RC" != "0" ] && grep -qF -- "$1" <<<"$IN_OUT" && [ -z "$left" ]; then pass
+    else fail "rc=$IN_RC, wanted a refusal saying '$1' and an empty install dir (holds: '$left'): $IN_OUT"; fi
+  }
+  # in_installed <release> <needle> -- the run succeeded, said <needle>, and
+  # installed exactly that release's binary, executable.
+  in_installed(){
+    if [ "$IN_RC" = "0" ] && grep -qF -- "$2" <<<"$IN_OUT" && cmp -s "$IN/dest/oam" "$IN/rel/$1/$IN_LINUX" \
+       && [ -x "$IN/dest/oam" ] && ! compgen -G "$IN/dest/.oam.*" >/dev/null; then pass
+    else fail "rc=$IN_RC, wanted '$2' and rel/$1's binary in place: $IN_OUT"; fi
+  }
+
+  it "good: a manifest signed by an in-range key installs, hash from the manifest"
+  in_sh good v0.18.0 "$IN_PATH_KG"
+  in_installed good 'signature ok: v0.18.0, signed by oam-release-k1'
+  it "good: the installed binary runs (the closing --version smoke)"
+  grep -qF 'oam fixture good' <<<"$IN_OUT" && pass || fail "$IN_OUT"
+  it "good: license files land beside the binary"
+  ck cmp -s "$IN/dest/licenses/NOTICE" "$IN/rel/good/NOTICE"
+
+  it "bad signature: signed by a key that is not in allowed_signers"
+  in_sh stranger v0.18.0 "$IN_PATH_KG"
+  in_refused 'does not verify against any oam release key'
+  it "bad signature: a SUMS line changed after signing"
+  in_sh forged v0.18.0 "$IN_PATH_KG"
+  in_refused 'does not verify against any oam release key'
+  it "bad signature: a .sig that does not even parse"
+  in_sh garbled v0.18.0 "$IN_PATH_KG"
+  in_refused 'does not verify against any oam release key'
+  it "tag mismatch: a genuine v0.18.0 manifest served as v0.18.1"
+  in_sh replay v0.18.1 "$IN_PATH_KG"
+  in_refused "signed for tag 'v0.18.0', not v0.18.1"
+  it "key out of range: k1 signing after its range closed"
+  in_sh retired v0.20.0 "$IN_PATH_KG"
+  in_refused 'which was retired after v0.19.5'
+  it "key out of range: the staged key, which has no range yet"
+  in_sh staged v0.18.0 "$IN_PATH_KG"
+  in_refused 'oam-release-k2, which has no range'
+  it "missing manifest on a v0.18.0+ tag is refused"
+  in_sh unsigned v0.18.0 "$IN_PATH_KG"
+  in_refused 'could not fetch RELEASE-MANIFEST for v0.18.0'
+  it "tampered asset: the binary no longer matches the signed manifest"
+  in_sh tampered v0.18.0 "$IN_PATH_KG"
+  in_refused 'checksum mismatch for oam-x86_64-unknown-linux-gnu'
+
+  it "pre-cutoff: SHA256SUMS matching its pin installs"
+  in_sh pre v0.17.1 "$IN_PATH_KG"
+  in_installed pre 'v0.17.1 matches its pinned digest'
+  it "pre-cutoff: SHA256SUMS not matching its pin is refused"
+  in_sh prebad v0.16.4 "$IN_PATH_KG"
+  in_refused "v0.16.4's pinned digest is 0000"
+  it "pre-cutoff: a tag with no pin is refused, even with a SUMS that would verify"
+  in_sh pre v0.17.2 "$IN_PATH_KG"
+  in_refused 'v0.17.2 predates signed releases (v0.18.0) and is not in the pinned table'
+
+  it "no ssh-keygen, v0.18.0+: refused, naming the fix and the override"
+  in_sh good v0.18.0 "$IN_PATH_NOKG"
+  if grep -qF 'apt-get install openssh-client' <<<"$IN_OUT" && grep -qF 'OAM_INSECURE_SKIP_SIGNATURE=1' <<<"$IN_OUT"; then
+    in_refused 'ssh-keygen is not installed'
+  else fail "rc=$IN_RC, no fix/override named: $IN_OUT"; fi
+  it "no ssh-keygen, pre-cutoff: installs by its pin, and says the tool will be needed"
+  in_sh pre v0.17.1 "$IN_PATH_NOKG"
+  in_installed pre 'Not needed for v0.17.1 (verified by its pinned digest)'
+  it "an ssh-keygen without -Y counts as none"
+  in_sh good v0.18.0 "$IN_PATH_OLDKG"
+  in_refused 'has no -Y'
+  it "OAM_INSECURE_SKIP_SIGNATURE=1 installs without ssh-keygen, loudly"
+  in_sh good v0.18.0 "$IN_PATH_NOKG" OAM_INSECURE_SKIP_SIGNATURE=1
+  in_installed good 'installing WITHOUT signature verification'
+  it "OAM_INSECURE_SKIP_SIGNATURE=1 never excuses a bad signature"
+  in_sh stranger v0.18.0 "$IN_PATH_KG" OAM_INSECURE_SKIP_SIGNATURE=1
+  in_refused 'does not verify against any oam release key'
+  it "OAM_INSECURE_SKIP_SIGNATURE=1 never excuses a missing manifest"
+  in_sh unsigned v0.18.0 "$IN_PATH_NOKG" OAM_INSECURE_SKIP_SIGNATURE=1
+  in_refused 'could not fetch RELEASE-MANIFEST for v0.18.0'
+  it "OAM_INSTALL_BASE without OAM_VERSION is refused"
+  in_sh good "" "$IN_PATH_KG"
+  in_refused 'OAM_INSTALL_BASE needs OAM_VERSION'
+  it "a re-install replaces the binary by rename and leaves no temp file"
+  in_sh good v0.18.0 "$IN_PATH_KG"
+  printf 'old\n' >"$IN/dest/oam"
+  IN_RC=0
+  IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN HOME="$IN" PATH="$IN_PATH_KG" OAM_INSTALL_BASE="$(in_url "$IN/rel/good")" \
+    OAM_VERSION=v0.18.0 OAM_INSTALL_DIR="$IN/dest" "$IN_SH" "$IN/install.sh" 2>&1)" || IN_RC=$?
+  in_installed good 'installed oam v0.18.0'
+fi
+
+# =============================================================================
+group "install.ps1 -- the verify chain, run against the same fixture"
+# =============================================================================
+# Windows PowerShell 5.1, 64-bit and 32-bit (the 32-bit one reaches the inbox
+# ssh-keygen only through Sysnative). The copy is the fixture one above, with
+# no user-PATH write; its no-ssh-keygen variant looks in directories that do
+# not exist.
+IN_PS64=/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
+IN_PS32=/c/Windows/SysWOW64/WindowsPowerShell/v1.0/powershell.exe
+it "this host has Windows PowerShell and the fixture"
+if [ "$IN_SSH" = "1" ] && [ -x "$IN_PS64" ] && command -v cygpath >/dev/null 2>&1; then pass
+else skip "not a Windows host with powershell.exe and the fixture above -- every install.ps1 case is skipped"; IN_PS64=""; fi
+
+if [ -n "$IN_PS64" ]; then
+  # The no-ssh-keygen variant: candidates that do not exist (PATH below has no
+  # OpenSSH either).
+  IN_PS_CAND='$sshKeygenCandidates = @("$env:windir\Sysnative\OpenSSH\ssh-keygen.exe", "$env:windir\System32\OpenSSH\ssh-keygen.exe")'
+  L="$IN_PS_CAND" awk '$0 == ENVIRON["L"] { print "$sshKeygenCandidates = @(\"C:\\no-such-dir\\ssh-keygen.exe\")"; next } { print }' \
+    "$IN/install.ps1" >"$IN/install-nokg.ps1"
+  # Asserted, not assumed: a copy that still writes the user PATH must not run.
+  it "the install.ps1 fixture copies dropped the PATH write and (nokg) the ssh-keygen candidates"
+  if ! grep -qF "$IN_PS_PATHSET" "$IN/install.ps1" && grep -qxF "$IN_PS_CAND" "$IN/install.ps1" \
+     && ! grep -qxF "$IN_PS_CAND" "$IN/install-nokg.ps1" && grep -qF 'no-such-dir' "$IN/install-nokg.ps1"; then pass
+  else fail "the copies were not rewritten as expected -- refusing to run install.ps1 against the real user PATH"; IN_PS64=""; fi
+fi
+
+if [ -n "$IN_PS64" ]; then
+  # Windows' own directories only: no OpenSSH, no Git, no gh on it.
+  IN_WINPATH="/c/Windows/System32:/c/Windows:/c/Windows/System32/WindowsPowerShell/v1.0"
+  # in_ps <powershell> <script> <release> <tag> [VAR=value...] -- run it into a
+  # fresh $IN/pdest. PowerShell wraps long error lines at the console width,
+  # mid-word, so the output is joined back up before any needle is looked for.
+  in_ps(){
+    local ps="$1" script="$2" rel="$3" tag="$4"; shift 4
+    rm -rf "$IN/pdest"
+    IN_RC=0
+    IN_OUT="$(env -u GH_TOKEN -u GITHUB_TOKEN -u OAM_INSECURE_SKIP_SIGNATURE -u OAM_GH_API \
+      PATH="$IN_WINPATH" OAM_INSTALL_BASE="$(in_url "$IN/rel/$rel")" OAM_VERSION="$tag" \
+      OAM_INSTALL_DIR="$(cygpath -w "$IN/pdest")" "$@" \
+      "$ps" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$script")" 2>&1 | tr -d '\r\n')" || IN_RC=$?
+  }
+  in_ps_refused(){
+    if [ "$IN_RC" != "0" ] && grep -qF -- "$1" <<<"$IN_OUT" && [ ! -e "$IN/pdest/oam.exe" ]; then pass
+    else fail "rc=$IN_RC, wanted a refusal saying '$1' and no oam.exe: $IN_OUT"; fi
+  }
+  in_ps_installed(){
+    if [ "$IN_RC" = "0" ] && grep -qF -- "$1" <<<"$IN_OUT" && cmp -s "$IN/pdest/oam.exe" "$IN_WIN_EXE"; then pass
+    else fail "rc=$IN_RC, wanted '$1' and the fixture oam.exe in place: $IN_OUT"; fi
+  }
+
+  it "ps1 good: verifies with System32's inbox ssh-keygen and installs"
+  in_ps "$IN_PS64" "$IN/install.ps1" good v0.18.0
+  if grep -qF 'System32\OpenSSH\ssh-keygen.exe' <<<"$IN_OUT"; then in_ps_installed 'signature ok: v0.18.0, signed by oam-release-k1'
+  else fail "did not verify with the System32 ssh-keygen: $IN_OUT"; fi
+  it "ps1 good, 32-bit PowerShell: finds ssh-keygen through Sysnative"
+  if [ -x "$IN_PS32" ]; then
+    in_ps "$IN_PS32" "$IN/install.ps1" good v0.18.0
+    if grep -qF 'Sysnative\OpenSSH\ssh-keygen.exe' <<<"$IN_OUT"; then in_ps_installed 'signature ok: v0.18.0, signed by oam-release-k1'
+    else fail "did not verify with the Sysnative ssh-keygen: $IN_OUT"; fi
+  else skip "no 32-bit Windows PowerShell at $IN_PS32"; fi
+  it "ps1 bad signature: signed by a key that is not ours"
+  in_ps "$IN_PS64" "$IN/install.ps1" stranger v0.18.0
+  in_ps_refused 'does not verify against any oam release key'
+  it "ps1 bad signature: a SUMS line changed after signing"
+  in_ps "$IN_PS64" "$IN/install.ps1" forged v0.18.0
+  in_ps_refused 'does not verify against any oam release key'
+  it "ps1 bad signature: a .sig that does not even parse"
+  in_ps "$IN_PS64" "$IN/install.ps1" garbled v0.18.0
+  in_ps_refused 'does not verify against any oam release key'
+  it "ps1 tag mismatch"
+  in_ps "$IN_PS64" "$IN/install.ps1" replay v0.18.1
+  in_ps_refused "signed for tag 'v0.18.0', not v0.18.1"
+  it "ps1 key out of range: retired"
+  in_ps "$IN_PS64" "$IN/install.ps1" retired v0.20.0
+  in_ps_refused 'which was retired after v0.19.5'
+  it "ps1 key out of range: staged, no range"
+  in_ps "$IN_PS64" "$IN/install.ps1" staged v0.18.0
+  in_ps_refused 'oam-release-k2, which has no range'
+  it "ps1 missing manifest on a v0.18.0+ tag"
+  in_ps "$IN_PS64" "$IN/install.ps1" unsigned v0.18.0
+  in_ps_refused 'could not fetch RELEASE-MANIFEST for v0.18.0'
+  it "ps1 tampered asset"
+  in_ps "$IN_PS64" "$IN/install.ps1" tampered v0.18.0
+  in_ps_refused 'checksum mismatch for oam-'
+  it "ps1 pre-cutoff: pin matches"
+  in_ps "$IN_PS64" "$IN/install.ps1" pre v0.17.1
+  in_ps_installed 'v0.17.1 matches its pinned digest'
+  it "ps1 pre-cutoff: pin does not match"
+  in_ps "$IN_PS64" "$IN/install.ps1" prebad v0.16.4
+  in_ps_refused "v0.16.4's pinned digest is 0000"
+  it "ps1 pre-cutoff: unknown tag"
+  in_ps "$IN_PS64" "$IN/install.ps1" pre v0.17.2
+  in_ps_refused 'v0.17.2 predates signed releases (v0.18.0) and is not in the pinned table'
+  it "ps1 no ssh-keygen, v0.18.0+: refused, naming Add-WindowsCapability"
+  in_ps "$IN_PS64" "$IN/install-nokg.ps1" good v0.18.0
+  if grep -qF 'Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0' <<<"$IN_OUT"; then
+    in_ps_refused 'OAM_INSECURE_SKIP_SIGNATURE=1'
+  else fail "rc=$IN_RC, the fix is not named: $IN_OUT"; fi
+  it "ps1 no ssh-keygen, pre-cutoff: installs by its pin"
+  in_ps "$IN_PS64" "$IN/install-nokg.ps1" pre v0.17.1
+  in_ps_installed 'Not needed for v0.17.1 (verified by its pinned digest)'
+  it "ps1 OAM_INSECURE_SKIP_SIGNATURE=1 installs without ssh-keygen, loudly"
+  in_ps "$IN_PS64" "$IN/install-nokg.ps1" good v0.18.0 OAM_INSECURE_SKIP_SIGNATURE=1
+  in_ps_installed 'installing WITHOUT signature verification'
+fi
+
+# =============================================================================
 group "tap-verify.sh -- what a published tap actually serves"
 # =============================================================================
 # bump-taps.sh's last step decided "did the push land?" from one grep for the
