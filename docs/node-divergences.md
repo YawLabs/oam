@@ -2919,6 +2919,13 @@ the socket and before its shutdown callback (`'finish'`) has run.
   macOS Node defers the shutdown behind a write that has not called back yet, where oam has
   sent the FIN once the write was taken whole -- not measured there. An `end()` whose FIN is
   still queued behind a write the peer is not draining is reset on both, the FIN never sent.
+- **On a socket still connecting.** `end(data)` then `resetAndDestroy()` before the connect
+  resets the connection once it is made when the connect waited for a name lookup -- Node's
+  reset, a `'connect'` listener, runs before the shutdown, which waits for the write ahead
+  of it: the peer sees ECONNRESET and no FIN, the `end()` callback ERR_STREAM_DESTROYED
+  (`conformance/cases/297-net-end-then-reset-while-looking-up.mjs`; oam sent the data and
+  the FIN and refused the reset with EINVAL until review 3). Through an IP literal both
+  issue the shutdown first and refuse the reset with EINVAL.
 
 ### `err.syscall` on `fs.opendir`
 

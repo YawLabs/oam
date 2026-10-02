@@ -25870,6 +25870,8 @@
         const host = options.host || "localhost";
         if (typeof cb === "function") this.once("connect", cb);
         this.connecting = true;
+        // Whether the connect waits for a name lookup (resetAndDestroy).
+        this._connectByName = !isIPv4(host) && !isIPv6(host);
         // Node registers the TCPSocketWrap synchronously inside connect(), well
         // before the connection is established (probe: _getActiveHandles()
         // contains the Socket on the line after net.connect() returns).
@@ -25962,9 +25964,17 @@
             // finds the earlier writes already with the natives (node
             // flushes its pending data from a 'connect' listener of its
             // own, registered by that first write).
-            this._releaseHeldOps();
+            // A resetAndDestroy() made while a looked-up connect was in flight
+            // resets before the end()'s shutdown goes out, as node's does
+            // (its reset is a 'connect' listener and the shutdown waits for
+            // the write ahead of it): the shutdown, and anything after it,
+            // are held until the 'connect' listeners have run. Through an
+            // IP literal node issues the shutdown first and refuses the
+            // reset with EINVAL, and so does oam.
+            const afterConnect = this._releaseHeldOps(this._resetAtConnect === true);
             this.emit("connect");
             this.emit("ready");
+            if (afterConnect !== null) for (const start of afterConnect) start();
             this._readLoop();
           },
           (err) => {
@@ -26227,7 +26237,7 @@
       // The promise returned never rejects: it resolves with undefined, with
       // the op's error, or with kSocketClosed when the socket was destroyed
       // before the op could run.
-      _issue(run) {
+      _issue(run, isShutdown = false) {
         const start = () => {
           if (this.destroyed) return kSocketClosed;
           let op;
@@ -26247,17 +26257,25 @@
         };
         if (this._heldOps === null) return Promise.resolve(start());
         return new Promise((resolve) => {
-          this._heldOps.push(() => resolve(start()));
+          const held = () => resolve(start());
+          held.isShutdown = isShutdown;
+          this._heldOps.push(held);
         });
       }
 
       // The connect settled (or the socket was destroyed first): the held
-      // ops start, in the order they were made.
-      _releaseHeldOps() {
+      // ops start, in the order they were made. With `holdShutdown`, a
+      // shutdown and the ops after it do not, and are returned for the
+      // caller to start; otherwise null.
+      _releaseHeldOps(holdShutdown = false) {
         const held = this._heldOps;
-        if (held === null) return;
+        if (held === null) return null;
         this._heldOps = null;
-        for (const start of held) start();
+        for (let i = 0; i < held.length; i++) {
+          if (holdShutdown && held[i].isShutdown === true) return held.slice(i);
+          held[i]();
+        }
+        return null;
       }
 
       // Node's default for a net.Socket. Settable, as Node allows via options.
@@ -26385,7 +26403,7 @@
           const op = natives.tcpShutdown(this._handle);
           if (op === undefined) doneInCall = true;
           return op;
-        });
+        }, true);
         this._chain = this._chain.then(() => shut).then((failure) => {
           // A failed shutdown is the socket's error (node's afterShutdown
           // destroys with it), not a rejection left on `_chain`.
@@ -26989,6 +27007,7 @@
         // head, but holds its connection from the moment the transport has
         // the request on one: then it is reset now, below, as node's
         // connected socket is.)
+        if (this._connectByName === true) this._resetAtConnect = true;
         this.once("connect", () => this._reset());
       } else if (this._handle != null || (this[kNativeConnection] !== undefined && !this.destroyed)) {
         this._reset();
