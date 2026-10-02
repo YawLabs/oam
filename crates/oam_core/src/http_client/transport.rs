@@ -393,6 +393,13 @@ impl SendError {
         find_in_chain::<ConnectError>(&self.error)
     }
 
+    /// A response head hyper could not parse ([`super::bridge::head_parse_error`]),
+    /// in undici's words for fetch and undici.request.
+    pub fn head_parse_outcome(&self, undici: bool) -> Option<OpOutcome> {
+        let error = find_in_chain::<hyper::Error>(&self.error)?;
+        super::bridge::head_parse_error(error, undici)
+    }
+
     /// The op outcome for this failure of the hop to `url`:
     /// - a connect failure is node's error: `NodeFailed` for a resolver
     ///   failure or a single refused address, `NodeAggregateFailed` for a
@@ -405,13 +412,6 @@ impl SendError {
     ///   before the response head, an aborted streamed body -- keeps
     ///   reqwest's uncoded `error sending request for url (...)`, which
     ///   node_compat's http client maps to `socket hang up`.
-    /// A response head hyper could not parse ([`super::bridge::head_parse_error`]),
-    /// in undici's words for fetch and undici.request.
-    pub fn head_parse_outcome(&self, undici: bool) -> Option<OpOutcome> {
-        let error = find_in_chain::<hyper::Error>(&self.error)?;
-        super::bridge::head_parse_error(error, undici)
-    }
-
     pub fn to_outcome(&self, url: &url::Url) -> OpOutcome {
         if let Some(connect) = self.connect_error() {
             return connect.to_outcome();
