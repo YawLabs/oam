@@ -11557,8 +11557,9 @@
           // stream (`type: 'bytes'`, autoAllocateChunkSize 16384), so
           // `getReader({ mode: 'byob' })` there returns a real
           // ReadableStreamBYOBReader. oam's web-streams layer (js/streams.js)
-          // is default-reader-only -- no byte controller, no byobRequest -- so
-          // this returns a DEFAULT ReadableStream carrying the same 16 KiB
+          // is default-reader-only -- a `type: 'bytes'` stream queues bytes
+          // and pulls as node's does, but has no byobRequest -- so this
+          // returns a stream read through a default reader, carrying the same 16 KiB
           // plain-Uint8Array chunks, at the same boundaries, off the same read
           // path. Everything reachable through a default reader or async
           // iteration matches node; a BYOB reader does not. The fix belongs in
@@ -11601,6 +11602,9 @@
             // both runtimes -- so this is not a free tuning knob.
             var CHUNK = 16384;
             return new globalThis.ReadableStream({
+              // High-water mark 0 and byte accounting, as node's byte
+              // stream: nothing is read off the handle until a read asks.
+              type: "bytes",
               pull: async function (controller) {
                 // node wires `this.once('close', () => readableStreamCancel(
                 // readable))`, so closing the handle mid-stream ENDS the

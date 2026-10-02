@@ -1,11 +1,30 @@
 // oam web streams: ReadableStream / WritableStream / TransformStream +
 // TextEncoderStream / TextDecoderStream (WHATWG Streams, ECMA-429 surface).
 //
-// Scope (documented subset, grows toward full WPT conformance):
-// - Default readers only — no BYOB/byte streams yet.
-// - Count-based queuing: highWaterMark counts CHUNKS; size() functions in
-//   queuing strategies are not consulted.
-// - pipeTo/pipeThrough support preventClose/preventCancel/preventAbort.
+// The controllers follow the standard's algorithms step for step, in the
+// shape node's lib/internal/webstreams uses, so start / pull / write /
+// ready / backpressure settle in node's order, microtask for microtask:
+//
+// - start() runs synchronously in the constructor; once the promise for
+//   its result settles the stream is "started", and a ReadableStream then
+//   makes its INITIAL pull (CallPullIfNeeded) -- with no read pending, it
+//   pulls until the queue reaches the high-water mark.
+// - Every enqueue and every read re-checks "should pull" (a reader is
+//   waiting, or desiredSize > 0); a pull requested while one is in flight
+//   runs once that one settles (pullAgain).
+// - A WritableStream queues writes against its strategy's high-water mark,
+//   reports desiredSize and backpressure through writer.ready, and hands the
+//   sink one chunk at a time once start() has settled.
+// - A TransformStream runs transform() only while its readable side wants
+//   data: the readable's high-water mark defaults to 0, so a write waits for
+//   a read (backpressure), exactly as node's does.
+//
+// Scope (documented in docs/node-divergences.md):
+// - Default readers only. `type: 'bytes'` streams get the byte controller's
+//   queuing -- high-water mark 0 by default, desiredSize in bytes, chunks
+//   must be ArrayBufferViews -- but there is no byobRequest, no BYOB reader,
+//   and an enqueued buffer is not transferred (node detaches it).
+// - The reader, writer and controller classes are not exposed as globals.
 //
 // The async-iteration path is the load-bearing one: `for await (const
 // chunk of response.body)` and TextDecoderStream pipelines are how SSE /
@@ -16,132 +35,324 @@
 // lazily (node_compat.js defines it earlier in the snapshot order).
 "use strict";
 (() => {
+  // A user may replace Promise.prototype.then; the stream machinery must
+  // not route through theirs (node uses primordials for the same reason).
+  const PromiseThen = Promise.prototype.then;
+  const then = (promise, onFulfilled, onRejected) =>
+    PromiseThen.call(promise, onFulfilled, onRejected);
+  const noop = () => {};
+  const markHandled = (promise) => {
+    PromiseThen.call(promise, undefined, noop);
+  };
+
+  // node's nonOp* algorithms: async functions, so each returns a promise.
+  const nonOpPromise = async () => {};
+  const nonOpStart = () => {};
+
+  // node's createPromiseCallback / invokePromiseCallback: the user callback
+  // runs inside an async function, so a sync throw becomes a rejection and
+  // a returned promise is adopted with the same microtask count as node's.
+  const promiseCallback = (fn, thisArg) =>
+    async function (a, b) {
+      return fn.call(thisArg, a, b);
+    };
+
+  // A promise with its resolvers, and whether it has settled (node's
+  // isPromisePending, without the V8 internals call).
+  function deferred() {
+    const d = { promise: undefined, resolve: undefined, reject: undefined, pending: true };
+    d.promise = new Promise((resolve, reject) => {
+      d.resolve = (value) => {
+        d.pending = false;
+        resolve(value);
+      };
+      d.reject = (reason) => {
+        d.pending = false;
+        reject(reason);
+      };
+    });
+    return d;
+  }
+  const settled = (promise) => ({ promise, resolve: undefined, reject: undefined, pending: false });
+
+  function invalidState(message) {
+    const err = new TypeError(`Invalid state: ${message}`);
+    err.code = "ERR_INVALID_STATE";
+    return err;
+  }
+
+  // node's extractHighWaterMark: `+value`, and NaN or negative is a
+  // RangeError ERR_INVALID_ARG_VALUE (a number inspects as String() does;
+  // -0 is not negative).
+  function extractHighWaterMark(value, defaultHWM) {
+    if (value === undefined) return defaultHWM;
+    value = +value;
+    if (Number.isNaN(value) || value < 0) {
+      const err = new RangeError(
+        `The property 'strategy.highWaterMark' is invalid. Received ${value}`,
+      );
+      err.code = "ERR_INVALID_ARG_VALUE";
+      throw err;
+    }
+    return value;
+  }
+
+  // Queue accounting goes through strategy.size (ByteLengthQueuingStrategy
+  // budgets BYTES); a parallel size ledger avoids re-invoking a possibly
+  // impure size() at dequeue. No strategy.size = count semantics (1/chunk).
+  const countSize = () => 1;
+  function makeSizeFn(sizeFn) {
+    if (sizeFn === undefined) return countSize;
+    if (typeof sizeFn !== "function") {
+      const codes = globalThis.__oamNode.get("internal/errors").codes;
+      throw new codes.ERR_INVALID_ARG_TYPE("strategy.size", "Function", sizeFn);
+    }
+    // Called as a plain function, `this` undefined, as node calls it.
+    return (chunk) => sizeFn(chunk);
+  }
+  // node's enqueueValueWithSize: the size is `+size`, and NaN, negative or
+  // Infinity is a RangeError (which errors the stream).
+  function validChunkSize(size) {
+    size = +size;
+    if (Number.isNaN(size) || size < 0 || size === Infinity) {
+      const err = new RangeError(`The argument 'size' is invalid. Received ${size}`);
+      err.code = "ERR_INVALID_ARG_VALUE";
+      throw err;
+    }
+    return size;
+  }
+  // The byte controller's size: a chunk is an ArrayBufferView, and it
+  // counts its bytes. The coded error comes from node_compat.js, which is
+  // evaluated after this file, so it is looked up at call time.
+  function byteChunkSize(chunk) {
+    if (!ArrayBuffer.isView(chunk)) {
+      const codes = globalThis.__oamNode.get("internal/errors").codes;
+      throw new codes.ERR_INVALID_ARG_TYPE("buffer", ["Buffer", "TypedArray", "DataView"], chunk);
+    }
+    return chunk.byteLength;
+  }
+
   // ------------------------------------------------------- ReadableStream
+  class ReadableStreamDefaultController {
+    constructor(stream) {
+      this._stream = stream;
+    }
+    get desiredSize() {
+      return readableDesiredSize(this._stream);
+    }
+    enqueue(chunk) {
+      const stream = this._stream;
+      if (!readableCanCloseOrEnqueue(stream)) throw invalidState("Controller is already closed");
+      readableEnqueue(stream, chunk);
+    }
+    close() {
+      const stream = this._stream;
+      if (!readableCanCloseOrEnqueue(stream)) throw invalidState("Controller is already closed");
+      readableControllerClose(stream);
+    }
+    error(reason) {
+      readableError(this._stream, reason);
+    }
+  }
+
+  function initReadable(stream, highWaterMark, sizeFn) {
+    stream._queue = [];
+    stream._queueSizes = [];
+    stream._queueTotalSize = 0;
+    stream._state = "readable"; // readable | closed | errored
+    stream._error = undefined;
+    stream._reader = null; // the active default reader (lock)
+    stream._waiters = []; // pending read() resolvers: {resolve, reject}
+    stream._highWaterMark = highWaterMark;
+    stream._sizeFn = sizeFn;
+    stream._started = false;
+    stream._pulling = false;
+    stream._pullAgain = false;
+    // close() was called with chunks still queued: the stream closes when
+    // the last of them is read.
+    stream._closeRequested = false;
+    stream._pullAlgorithm = nonOpPromise;
+    stream._cancelAlgorithm = nonOpPromise;
+    // Has anything been read from, or cancelled on, this stream? A fetch
+    // body asks (js/bootstrap.js): a disturbed stream cannot be a body, and
+    // a body whose stream was read is `bodyUsed`. Never reset -- releasing
+    // the reader does not un-read the chunks.
+    stream._disturbed = false;
+    stream._resolveClosed = undefined;
+    stream._rejectClosed = undefined;
+    stream._controller = new ReadableStreamDefaultController(stream);
+  }
+
+  // start() runs SYNCHRONOUSLY, inside the constructor (WHATWG "set up
+  // readable stream default controller": the start algorithm is performed,
+  // then its result is wrapped in a promise). Code relies on it: it
+  // captures the controller in start() and enqueues as soon as `new
+  // ReadableStream(...)` returns -- the MCP SDK's streamable-HTTP server
+  // does, and with start() deferred to a microtask its controller was still
+  // undefined, so every response body it wrote was dropped. A throw from
+  // start() is the constructor's throw; only a REJECTED start promise
+  // errors the stream. Once the start promise settles the stream is
+  // started and makes its first pull -- node wraps the result in `new
+  // Promise((r) => r(result))`, so a thenable or a promise result costs
+  // the same extra microtasks it costs there.
+  function setupReadable(stream, startAlgorithm, pullAlgorithm, cancelAlgorithm) {
+    stream._pullAlgorithm = pullAlgorithm;
+    stream._cancelAlgorithm = cancelAlgorithm;
+    const startResult = startAlgorithm(stream._controller);
+    then(
+      new Promise((resolve) => resolve(startResult)),
+      () => {
+        stream._started = true;
+        readableCallPullIfNeeded(stream);
+      },
+      (error) => readableError(stream, error),
+    );
+  }
+
+  function readableCanCloseOrEnqueue(stream) {
+    return stream._state === "readable" && !stream._closeRequested;
+  }
+
+  function readableDesiredSize(stream) {
+    if (stream._state === "errored") return null;
+    if (stream._state === "closed") return 0;
+    return stream._highWaterMark - stream._queueTotalSize;
+  }
+
+  function readableShouldCallPull(stream) {
+    if (!readableCanCloseOrEnqueue(stream) || !stream._started) return false;
+    if (stream._reader !== null && stream._waiters.length > 0) return true;
+    return readableDesiredSize(stream) > 0;
+  }
+
+  function readableCallPullIfNeeded(stream) {
+    if (!readableShouldCallPull(stream)) return;
+    if (stream._pulling) {
+      stream._pullAgain = true;
+      return;
+    }
+    stream._pulling = true;
+    then(
+      stream._pullAlgorithm(stream._controller),
+      () => {
+        stream._pulling = false;
+        // Re-pull ONLY when something asked during the pull (pullAgain). A
+        // pull that settles without enqueueing, while a read waits, does
+        // not pull again on its own: a source that defers its enqueue (to
+        // process.nextTick, a socket) resolves the waiter when it lands,
+        // and that enqueue asks again.
+        if (stream._pullAgain) {
+          stream._pullAgain = false;
+          readableCallPullIfNeeded(stream);
+        }
+      },
+      (error) => readableError(stream, error),
+    );
+  }
+
+  function readableEnqueue(stream, chunk) {
+    if (stream._waiters.length > 0) {
+      stream._waiters.shift().resolve({ value: chunk, done: false });
+    } else {
+      let size;
+      try {
+        size = validChunkSize(stream._sizeFn(chunk));
+      } catch (error) {
+        readableError(stream, error);
+        throw error;
+      }
+      stream._queue.push(chunk);
+      stream._queueSizes.push(size);
+      stream._queueTotalSize += size;
+    }
+    readableCallPullIfNeeded(stream);
+  }
+
+  function resetReadableQueue(stream) {
+    stream._queue = [];
+    stream._queueSizes = [];
+    stream._queueTotalSize = 0;
+  }
+
+  function readableClearAlgorithms(stream) {
+    stream._pullAlgorithm = nonOpPromise;
+    stream._cancelAlgorithm = nonOpPromise;
+    stream._sizeFn = countSize;
+  }
+
+  function readableControllerClose(stream) {
+    stream._closeRequested = true;
+    if (stream._queue.length === 0) {
+      readableClearAlgorithms(stream);
+      readableClose(stream);
+    }
+  }
+
+  // ReadableStreamClose: the stream is closed, then reader.closed settles,
+  // then the pending reads are done (node's order).
+  function readableClose(stream) {
+    stream._state = "closed";
+    stream._resolveClosed?.();
+    while (stream._waiters.length > 0) {
+      stream._waiters.shift().resolve({ value: undefined, done: true });
+    }
+  }
+
+  function readableError(stream, reason) {
+    if (stream._state !== "readable") return;
+    resetReadableQueue(stream);
+    readableClearAlgorithms(stream);
+    stream._state = "errored";
+    stream._error = reason;
+    stream._rejectClosed?.(reason);
+    while (stream._waiters.length > 0) {
+      stream._waiters.shift().reject(reason);
+    }
+  }
+
+  function readableCancel(stream, reason) {
+    stream._disturbed = true;
+    if (stream._state === "closed") return Promise.resolve();
+    if (stream._state === "errored") return Promise.reject(stream._error);
+    readableClose(stream);
+    resetReadableQueue(stream);
+    const result = stream._cancelAlgorithm(reason);
+    readableClearAlgorithms(stream);
+    return then(result, noop);
+  }
+
+  // A stream built over internal algorithms (TransformStream's readable
+  // side), as node's createReadableStream builds one.
+  function createReadable(startAlgorithm, pullAlgorithm, cancelAlgorithm, highWaterMark, sizeFn) {
+    const stream = Object.create(ReadableStream.prototype);
+    initReadable(stream, highWaterMark, sizeFn);
+    setupReadable(stream, startAlgorithm, pullAlgorithm, cancelAlgorithm);
+    return stream;
+  }
+
   class ReadableStream {
     constructor(source = {}, strategy = {}) {
-      this._queue = [];
-      this._state = "readable"; // readable | closed | errored
-      this._error = undefined;
-      this._reader = null; // the active default reader (lock)
-      this._waiters = []; // pending read() resolvers: {resolve, reject}
-      this._pulling = false;
-      this._pullAgain = false;
-      this._source = source;
-      this._highWaterMark = strategy.highWaterMark ?? 1;
-      // Queue accounting goes through strategy.size (ByteLengthQueuingStrategy
-      // budgets BYTES); a parallel size ledger avoids re-invoking a possibly
-      // impure size() at dequeue. No strategy.size = count semantics (1/chunk).
-      const sizeFn = strategy.size;
-      this._sizeFn = typeof sizeFn === "function"
-        ? (chunk) => {
-            const n = Number(sizeFn(chunk));
-            return Number.isFinite(n) && n >= 0 ? n : 1;
-          }
-        : () => 1;
-      this._queueSizes = [];
-      this._queueTotalSize = 0;
-      this._cancelled = false;
-      // Has anything been read from, or cancelled on, this stream? A fetch
-      // body asks (js/bootstrap.js): a disturbed stream cannot be a body, and
-      // a body whose stream was read is `bodyUsed`. Never reset -- releasing
-      // the reader does not un-read the chunks.
-      this._disturbed = false;
-
-      const stream = this;
-      this._controller = {
-        enqueue(chunk) {
-          if (stream._state !== "readable") {
-            throw new TypeError("Cannot enqueue on a non-readable stream");
-          }
-          if (stream._waiters.length > 0) {
-            stream._waiters.shift().resolve({ value: chunk, done: false });
-          } else {
-            const size = stream._sizeFn(chunk);
-            stream._queue.push(chunk);
-            stream._queueSizes.push(size);
-            stream._queueTotalSize += size;
-          }
-        },
-        close() {
-          if (stream._state !== "readable") return;
-          stream._state = "closed";
-          while (stream._waiters.length > 0) {
-            stream._waiters.shift().resolve({ value: undefined, done: true });
-          }
-          stream._resolveClosed?.();
-        },
-        error(reason) {
-          if (stream._state !== "readable") return;
-          stream._state = "errored";
-          stream._error = reason;
-          stream._queue = [];
-          stream._queueSizes = [];
-          stream._queueTotalSize = 0;
-          while (stream._waiters.length > 0) {
-            stream._waiters.shift().reject(reason);
-          }
-          stream._rejectClosed?.(reason);
-        },
-        get desiredSize() {
-          if (stream._state === "errored") return null;
-          if (stream._state === "closed") return 0;
-          return stream._highWaterMark - stream._queueTotalSize;
-        },
-      };
-
-      // start() runs SYNCHRONOUSLY, inside the constructor (WHATWG "set up
-      // readable stream default controller from underlying source": the
-      // start algorithm is performed, then its result is wrapped in a
-      // promise). Code relies on it: it captures the controller in start()
-      // and enqueues as soon as `new ReadableStream(...)` returns -- the MCP
-      // SDK's streamable-HTTP server does, and with start() deferred to a
-      // microtask its controller was still undefined, so every response
-      // body it wrote was dropped. A throw from start() is the
-      // constructor's throw; only a REJECTED start promise errors the
-      // stream. Pulls still wait on the start promise.
-      const startResult = source.start?.(this._controller);
-      this._started = Promise.resolve(startResult).catch((e) =>
-        this._controller.error(e),
+      // A byte stream (`type: 'bytes'`) queues bytes, not chunks, and its
+      // high-water mark defaults to 0: nothing is pulled until a read asks.
+      const isBytes = source?.type === "bytes";
+      initReadable(
+        this,
+        extractHighWaterMark(strategy?.highWaterMark, isBytes ? 0 : 1),
+        isBytes ? byteChunkSize : makeSizeFn(strategy?.size),
+      );
+      const start = source.start;
+      const pull = source.pull;
+      const cancel = source.cancel;
+      setupReadable(
+        this,
+        typeof start === "function" ? (controller) => start.call(source, controller) : nonOpStart,
+        typeof pull === "function" ? promiseCallback(pull, source) : nonOpPromise,
+        typeof cancel === "function" ? promiseCallback(cancel, source) : nonOpPromise,
       );
     }
 
     get locked() {
       return this._reader !== null;
-    }
-
-    _maybePull() {
-      if (this._state !== "readable" || !this._source.pull) return;
-      if (this._pulling) {
-        this._pullAgain = true;
-        return;
-      }
-      // Pull when a reader is waiting or the queued total is under the HWM.
-      if (this._waiters.length === 0 && this._queueTotalSize >= this._highWaterMark) {
-        return;
-      }
-      this._pulling = true;
-      this._started
-        .then(() => this._source.pull(this._controller))
-        .then(
-          () => {
-            this._pulling = false;
-            // WHATWG re-pull: ONLY when something re-requested during the
-            // pull (_pullAgain). Re-pulling on a still-pending waiter spins
-            // forever on a source that defers its enqueue past the microtask
-            // queue (e.g. into process.nextTick): each pull schedules more
-            // deferred work while the waiter never clears -- unbounded under
-            // host-driven tick points. The deferred enqueue resolves the
-            // waiter directly; no re-pull is needed for it.
-            if (this._pullAgain) {
-              this._pullAgain = false;
-              this._maybePull();
-            }
-          },
-          (e) => {
-            this._pulling = false;
-            this._controller.error(e);
-          },
-        );
     }
 
     getReader() {
@@ -161,7 +372,7 @@
         closedResolve = resolve;
         closedReject = reject;
       });
-      closed.catch(() => {}); // observable via reader.closed; never unhandled
+      markHandled(closed); // observable via reader.closed; never unhandled
       if (stream._state === "closed") closedResolve();
       if (stream._state === "errored") closedReject(stream._error);
       stream._resolveClosed = closedResolve;
@@ -174,25 +385,30 @@
             return Promise.reject(new TypeError("reader has been released"));
           }
           stream._disturbed = true;
-          if (stream._queue.length > 0) {
-            const value = stream._queue.shift();
-            stream._queueTotalSize -= stream._queueSizes.shift();
-            stream._maybePull();
-            return Promise.resolve({ value, done: false });
-          }
           if (stream._state === "closed") {
             return Promise.resolve({ value: undefined, done: true });
           }
           if (stream._state === "errored") {
             return Promise.reject(stream._error);
           }
+          if (stream._queue.length > 0) {
+            const value = stream._queue.shift();
+            stream._queueTotalSize = Math.max(0, stream._queueTotalSize - stream._queueSizes.shift());
+            if (stream._closeRequested && stream._queue.length === 0) {
+              readableClearAlgorithms(stream);
+              readableClose(stream);
+            } else {
+              readableCallPullIfNeeded(stream);
+            }
+            return Promise.resolve({ value, done: false });
+          }
           return new Promise((resolve, reject) => {
             stream._waiters.push({ resolve, reject });
-            stream._maybePull();
+            readableCallPullIfNeeded(stream);
           });
         },
         cancel(reason) {
-          return stream._cancelInternal(reason);
+          return readableCancel(stream, reason);
         },
         releaseLock() {
           if (stream._reader === reader) {
@@ -207,25 +423,11 @@
       return reader;
     }
 
-    _cancelInternal(reason) {
-      this._disturbed = true;
-      if (this._state === "errored") return Promise.reject(this._error);
-      if (this._cancelled || this._state === "closed") return Promise.resolve();
-      this._cancelled = true;
-      this._queue = [];
-      this._queueSizes = [];
-      this._queueTotalSize = 0;
-      this._controller.close();
-      return Promise.resolve()
-        .then(() => this._source.cancel?.(reason))
-        .then(() => undefined);
-    }
-
     cancel(reason) {
       if (this.locked) {
         return Promise.reject(new TypeError("Cannot cancel a locked stream"));
       }
-      return this._cancelInternal(reason);
+      return readableCancel(this, reason);
     }
 
     [Symbol.asyncIterator](options = {}) {
@@ -312,175 +514,794 @@
       if (!iterator) {
         throw new TypeError("ReadableStream.from requires an iterable");
       }
-      return new ReadableStream({
-        async pull(controller) {
-          const { value, done } = await iterator.next();
-          if (done) controller.close();
-          else controller.enqueue(value);
+      // node builds it with a high-water mark of 0: the iterator is not
+      // advanced until a read asks for a value.
+      return new ReadableStream(
+        {
+          async pull(controller) {
+            const { value, done } = await iterator.next();
+            if (done) controller.close();
+            else controller.enqueue(value);
+          },
+          async cancel(reason) {
+            await iterator.return?.(reason);
+          },
         },
-        async cancel(reason) {
-          await iterator.return?.(reason);
-        },
-      });
+        { highWaterMark: 0 },
+      );
     }
   }
 
   // ------------------------------------------------------- WritableStream
-  class WritableStream {
-    constructor(sink = {}, _strategy = {}) {
-      this._sink = sink;
-      this._state = "writable"; // writable | closed | errored
-      this._error = undefined;
-      this._writer = null;
-      // Writes are SERIALIZED: each chains on the previous sink call.
-      // start() itself runs synchronously in the constructor, as the
-      // ReadableStream one does and for the same reason; the chain starts
-      // from the promise for its result, so writes wait for an async start.
-      // (TransformStream's transformer.start rides on this one.)
-      const startResult = sink.start?.(this._controllerFor());
-      this._chain = Promise.resolve(startResult).catch((e) => {
-        this._state = "errored";
-        this._error = e;
-      });
-    }
+  const CLOSE_SENTINEL = {};
 
-    _controllerFor() {
-      const stream = this;
-      return {
-        error(reason) {
-          stream._state = "errored";
-          stream._error = reason;
-        },
-      };
+  class WritableStreamDefaultController {
+    constructor(stream, highWaterMark, sizeFn) {
+      this._stream = stream;
+      this._queue = [];
+      this._queueSizes = [];
+      this._queueTotalSize = 0;
+      this._highWaterMark = highWaterMark;
+      this._sizeFn = sizeFn;
+      this._started = false;
+      this._writeAlgorithm = nonOpPromise;
+      this._closeAlgorithm = nonOpPromise;
+      this._abortAlgorithm = nonOpPromise;
+      // The AbortController behind `signal` is made on first ask:
+      // AbortController is defined by bootstrap.js, and most sinks never
+      // look at the signal. An abort that lands first is remembered.
+      this._abortController = undefined;
+      this._aborted = false;
+      this._abortReason = undefined;
     }
-
-    get locked() {
-      return this._writer !== null;
-    }
-
-    getWriter() {
-      if (this._writer !== null) {
-        throw new TypeError("WritableStream is locked to a writer");
+    get signal() {
+      if (this._abortController === undefined) {
+        this._abortController = new globalThis.AbortController();
+        if (this._aborted) this._abortController.abort(this._abortReason);
       }
-      const stream = this;
-      const writer = {
-        get ready() {
-          return stream._chain.then(() => undefined);
-        },
-        get closed() {
-          return stream._chain.then(() => {
-            if (stream._state === "errored") throw stream._error;
-          });
-        },
-        get desiredSize() {
-          return stream._state === "writable" ? 1 : stream._state === "closed" ? 0 : null;
-        },
-        write(chunk) {
-          if (stream._writer !== writer) {
-            return Promise.reject(new TypeError("writer has been released"));
-          }
-          const next = stream._chain.then(() => {
-            if (stream._state === "errored") throw stream._error;
-            if (stream._state !== "writable") {
-              throw new TypeError("Cannot write to a closed stream");
-            }
-            return stream._sink.write?.(chunk, stream._controllerFor());
-          });
-          stream._chain = next.catch((e) => {
-            stream._state = "errored";
-            stream._error = e;
-          });
-          return next.then(() => undefined);
-        },
-        close() {
-          const next = stream._chain.then(() => {
-            if (stream._state === "errored") throw stream._error;
-            if (stream._state !== "writable") {
-              throw new TypeError("Cannot close a non-writable stream");
-            }
-            stream._state = "closed";
-            return stream._sink.close?.();
-          });
-          stream._chain = next.catch((e) => {
-            stream._state = "errored";
-            stream._error = e;
-          });
-          return next.then(() => undefined);
-        },
-        abort(reason) {
-          stream._state = "errored";
-          stream._error = reason ?? new TypeError("aborted");
-          return Promise.resolve()
-            .then(() => stream._sink.abort?.(reason))
-            .then(() => undefined);
-        },
-        releaseLock() {
-          if (stream._writer === writer) stream._writer = null;
-        },
-      };
-      stream._writer = writer;
-      return writer;
+      return this._abortController.signal;
+    }
+    error(error) {
+      if (this._stream._state !== "writable") return;
+      writableControllerError(this, error);
+    }
+  }
+
+  function writableSignalAbort(controller, reason) {
+    if (controller._abortController !== undefined) {
+      controller._abortController.abort(reason);
+    } else if (!controller._aborted) {
+      controller._aborted = true;
+      controller._abortReason = reason;
+    }
+  }
+
+  function initWritable(stream) {
+    stream._state = "writable"; // writable | erroring | errored | closed
+    stream._storedError = undefined;
+    stream._writer = undefined;
+    stream._controller = undefined;
+    stream._writeRequests = [];
+    stream._inFlightWriteRequest = undefined;
+    stream._closeRequest = undefined;
+    stream._inFlightCloseRequest = undefined;
+    stream._pendingAbortRequest = undefined;
+    stream._backpressure = false;
+  }
+
+  // start() runs synchronously, in the constructor, as the ReadableStream
+  // one does and for the same reason; writes queue until the promise for
+  // its result settles. (TransformStream's transformer.start rides on its
+  // own start promise.)
+  function setupWritable(
+    stream,
+    startAlgorithm,
+    writeAlgorithm,
+    closeAlgorithm,
+    abortAlgorithm,
+    highWaterMark,
+    sizeFn,
+  ) {
+    const controller = new WritableStreamDefaultController(stream, highWaterMark, sizeFn);
+    controller._writeAlgorithm = writeAlgorithm;
+    controller._closeAlgorithm = closeAlgorithm;
+    controller._abortAlgorithm = abortAlgorithm;
+    stream._controller = controller;
+    writableUpdateBackpressure(stream, writableGetBackpressure(controller));
+    const startResult = startAlgorithm(controller);
+    then(
+      new Promise((resolve) => resolve(startResult)),
+      () => {
+        controller._started = true;
+        writableAdvanceQueueIfNeeded(controller);
+      },
+      (error) => {
+        controller._started = true;
+        writableDealWithRejection(stream, error);
+      },
+    );
+  }
+
+  function createWritable(
+    startAlgorithm,
+    writeAlgorithm,
+    closeAlgorithm,
+    abortAlgorithm,
+    highWaterMark,
+    sizeFn,
+  ) {
+    const stream = Object.create(WritableStream.prototype);
+    initWritable(stream);
+    setupWritable(
+      stream,
+      startAlgorithm,
+      writeAlgorithm,
+      closeAlgorithm,
+      abortAlgorithm,
+      highWaterMark,
+      sizeFn,
+    );
+    return stream;
+  }
+
+  function writableCloseQueuedOrInFlight(stream) {
+    return stream._closeRequest !== undefined || stream._inFlightCloseRequest !== undefined;
+  }
+
+  function writableHasOperationMarkedInFlight(stream) {
+    return stream._inFlightWriteRequest !== undefined || stream._inFlightCloseRequest !== undefined;
+  }
+
+  function writableAbort(stream, reason) {
+    const state = stream._state;
+    if (state === "closed" || state === "errored") return Promise.resolve();
+    writableSignalAbort(stream._controller, reason);
+    if (stream._pendingAbortRequest !== undefined) {
+      return stream._pendingAbortRequest.promise;
+    }
+    let wasAlreadyErroring = false;
+    if (state === "erroring") {
+      wasAlreadyErroring = true;
+      reason = undefined;
+    }
+    const request = deferred();
+    request.reason = reason;
+    request.wasAlreadyErroring = wasAlreadyErroring;
+    stream._pendingAbortRequest = request;
+    if (!wasAlreadyErroring) writableStartErroring(stream, reason);
+    return request.promise;
+  }
+
+  function writableClose(stream) {
+    const state = stream._state;
+    if (state === "closed" || state === "errored") {
+      return Promise.reject(invalidState("WritableStream is closed"));
+    }
+    const request = deferred();
+    stream._closeRequest = request;
+    const writer = stream._writer;
+    if (writer !== undefined && stream._backpressure && state === "writable") {
+      writer._ready.resolve?.();
+    }
+    writableControllerClose(stream._controller);
+    return request.promise;
+  }
+
+  function writableUpdateBackpressure(stream, backpressure) {
+    const writer = stream._writer;
+    if (writer !== undefined && stream._backpressure !== backpressure) {
+      if (backpressure) writer._ready = deferred();
+      else writer._ready.resolve?.();
+    }
+    stream._backpressure = backpressure;
+  }
+
+  function writableStartErroring(stream, reason) {
+    const controller = stream._controller;
+    stream._state = "erroring";
+    stream._storedError = reason;
+    const writer = stream._writer;
+    if (writer !== undefined) writerEnsureReadyPromiseRejected(writer, reason);
+    if (!writableHasOperationMarkedInFlight(stream) && controller._started) {
+      writableFinishErroring(stream);
+    }
+  }
+
+  function writableRejectCloseAndClosedPromiseIfNeeded(stream) {
+    if (stream._closeRequest !== undefined) {
+      stream._closeRequest.reject(stream._storedError);
+      stream._closeRequest = undefined;
+    }
+    const writer = stream._writer;
+    if (writer !== undefined) {
+      markHandled(writer._closed.promise);
+      writer._closed.reject?.(stream._storedError);
+    }
+  }
+
+  function writableFinishErroring(stream) {
+    stream._state = "errored";
+    const controller = stream._controller;
+    controller._queue = [];
+    controller._queueSizes = [];
+    controller._queueTotalSize = 0;
+    const storedError = stream._storedError;
+    for (const request of stream._writeRequests) request.reject(storedError);
+    stream._writeRequests = [];
+    const abortRequest = stream._pendingAbortRequest;
+    if (abortRequest === undefined) {
+      writableRejectCloseAndClosedPromiseIfNeeded(stream);
+      return;
+    }
+    stream._pendingAbortRequest = undefined;
+    if (abortRequest.wasAlreadyErroring) {
+      abortRequest.reject(storedError);
+      writableRejectCloseAndClosedPromiseIfNeeded(stream);
+      return;
+    }
+    const result = controller._abortAlgorithm(abortRequest.reason);
+    writableClearAlgorithms(controller);
+    then(
+      result,
+      () => {
+        abortRequest.resolve();
+        writableRejectCloseAndClosedPromiseIfNeeded(stream);
+      },
+      (error) => {
+        abortRequest.reject(error);
+        writableRejectCloseAndClosedPromiseIfNeeded(stream);
+      },
+    );
+  }
+
+  function writableDealWithRejection(stream, error) {
+    if (stream._state === "writable") {
+      writableStartErroring(stream, error);
+      return;
+    }
+    writableFinishErroring(stream);
+  }
+
+  function writableFinishInFlightWrite(stream) {
+    stream._inFlightWriteRequest.resolve();
+    stream._inFlightWriteRequest = undefined;
+  }
+
+  function writableFinishInFlightWriteWithError(stream, error) {
+    stream._inFlightWriteRequest.reject(error);
+    stream._inFlightWriteRequest = undefined;
+    writableDealWithRejection(stream, error);
+  }
+
+  function writableFinishInFlightClose(stream) {
+    stream._inFlightCloseRequest.resolve();
+    stream._inFlightCloseRequest = undefined;
+    if (stream._state === "erroring") {
+      stream._storedError = undefined;
+      if (stream._pendingAbortRequest !== undefined) {
+        stream._pendingAbortRequest.resolve();
+        stream._pendingAbortRequest = undefined;
+      }
+    }
+    stream._state = "closed";
+    stream._writer?._closed.resolve?.();
+  }
+
+  function writableFinishInFlightCloseWithError(stream, error) {
+    stream._inFlightCloseRequest.reject(error);
+    stream._inFlightCloseRequest = undefined;
+    if (stream._pendingAbortRequest !== undefined) {
+      stream._pendingAbortRequest.reject(error);
+      stream._pendingAbortRequest = undefined;
+    }
+    writableDealWithRejection(stream, error);
+  }
+
+  function writableControllerError(controller, error) {
+    writableClearAlgorithms(controller);
+    writableStartErroring(controller._stream, error);
+  }
+
+  function writableControllerErrorIfNeeded(controller, error) {
+    if (controller._stream._state === "writable") writableControllerError(controller, error);
+  }
+
+  function writableClearAlgorithms(controller) {
+    controller._writeAlgorithm = undefined;
+    controller._closeAlgorithm = undefined;
+    controller._abortAlgorithm = undefined;
+    controller._sizeFn = undefined;
+  }
+
+  function writableDesiredSize(controller) {
+    return controller._highWaterMark - controller._queueTotalSize;
+  }
+
+  function writableGetBackpressure(controller) {
+    return writableDesiredSize(controller) <= 0;
+  }
+
+  function writableGetChunkSize(controller, chunk) {
+    if (controller._sizeFn === undefined) return 1;
+    try {
+      return controller._sizeFn(chunk);
+    } catch (error) {
+      writableControllerErrorIfNeeded(controller, error);
+      return 1;
+    }
+  }
+
+  function writableControllerWrite(controller, chunk, chunkSize) {
+    try {
+      chunkSize = validChunkSize(chunkSize);
+    } catch (error) {
+      writableControllerErrorIfNeeded(controller, error);
+      return;
+    }
+    controller._queue.push(chunk);
+    controller._queueSizes.push(chunkSize);
+    controller._queueTotalSize += chunkSize;
+    const stream = controller._stream;
+    if (!writableCloseQueuedOrInFlight(stream) && stream._state === "writable") {
+      writableUpdateBackpressure(stream, writableGetBackpressure(controller));
+    }
+    writableAdvanceQueueIfNeeded(controller);
+  }
+
+  function writableControllerClose(controller) {
+    controller._queue.push(CLOSE_SENTINEL);
+    controller._queueSizes.push(0);
+    writableAdvanceQueueIfNeeded(controller);
+  }
+
+  function writableDequeue(controller) {
+    controller._queue.shift();
+    controller._queueTotalSize = Math.max(0, controller._queueTotalSize - controller._queueSizes.shift());
+  }
+
+  function writableAdvanceQueueIfNeeded(controller) {
+    const stream = controller._stream;
+    if (!controller._started || stream._inFlightWriteRequest !== undefined) return;
+    if (stream._state === "erroring") {
+      writableFinishErroring(stream);
+      return;
+    }
+    if (controller._queue.length === 0) return;
+    const value = controller._queue[0];
+    if (value === CLOSE_SENTINEL) writableProcessClose(controller);
+    else writableProcessWrite(controller, value);
+  }
+
+  function writableProcessClose(controller) {
+    const stream = controller._stream;
+    stream._inFlightCloseRequest = stream._closeRequest;
+    stream._closeRequest = undefined;
+    writableDequeue(controller);
+    const sinkClosePromise = controller._closeAlgorithm();
+    writableClearAlgorithms(controller);
+    then(
+      sinkClosePromise,
+      () => writableFinishInFlightClose(stream),
+      (error) => writableFinishInFlightCloseWithError(stream, error),
+    );
+  }
+
+  function writableProcessWrite(controller, chunk) {
+    const stream = controller._stream;
+    stream._inFlightWriteRequest = stream._writeRequests.shift();
+    then(
+      controller._writeAlgorithm(chunk, controller),
+      () => {
+        writableFinishInFlightWrite(stream);
+        const state = stream._state;
+        writableDequeue(controller);
+        if (!writableCloseQueuedOrInFlight(stream) && state === "writable") {
+          writableUpdateBackpressure(stream, writableGetBackpressure(controller));
+        }
+        writableAdvanceQueueIfNeeded(controller);
+      },
+      (error) => {
+        if (stream._state === "writable") writableClearAlgorithms(controller);
+        writableFinishInFlightWriteWithError(stream, error);
+      },
+    );
+  }
+
+  function writerEnsureReadyPromiseRejected(writer, error) {
+    if (writer._ready.pending) writer._ready.reject(error);
+    else writer._ready = settled(Promise.reject(error));
+    markHandled(writer._ready.promise);
+  }
+
+  function writerEnsureClosedPromiseRejected(writer, error) {
+    if (writer._closed.pending) writer._closed.reject(error);
+    else writer._closed = settled(Promise.reject(error));
+    markHandled(writer._closed.promise);
+  }
+
+  class WritableStreamDefaultWriter {
+    constructor(stream) {
+      if (stream._writer !== undefined) throw invalidState("WritableStream is locked");
+      this._stream = stream;
+      stream._writer = this;
+      switch (stream._state) {
+        case "writable":
+          this._ready =
+            !writableCloseQueuedOrInFlight(stream) && stream._backpressure
+              ? deferred()
+              : settled(Promise.resolve());
+          this._closed = deferred();
+          break;
+        case "erroring":
+          this._ready = settled(Promise.reject(stream._storedError));
+          markHandled(this._ready.promise);
+          this._closed = deferred();
+          break;
+        case "closed":
+          this._ready = settled(Promise.resolve());
+          this._closed = settled(Promise.resolve());
+          break;
+        default:
+          this._ready = settled(Promise.reject(stream._storedError));
+          this._closed = settled(Promise.reject(stream._storedError));
+          markHandled(this._ready.promise);
+          markHandled(this._closed.promise);
+      }
     }
 
-    abort(reason) {
-      if (this.locked) {
-        return Promise.reject(new TypeError("Cannot abort a locked stream"));
+    get closed() {
+      return this._closed.promise;
+    }
+
+    get ready() {
+      return this._ready.promise;
+    }
+
+    get desiredSize() {
+      const stream = this._stream;
+      if (stream === undefined) throw invalidState("Writer is not bound to a WritableStream");
+      switch (stream._state) {
+        case "errored":
+        case "erroring":
+          return null;
+        case "closed":
+          return 0;
       }
-      this._state = "errored";
-      this._error = reason ?? new TypeError("aborted");
-      return Promise.resolve()
-        .then(() => this._sink.abort?.(reason))
-        .then(() => undefined);
+      return writableDesiredSize(stream._controller);
+    }
+
+    write(chunk) {
+      const stream = this._stream;
+      if (stream === undefined) {
+        return Promise.reject(invalidState("Writer is not bound to a WritableStream"));
+      }
+      const controller = stream._controller;
+      const chunkSize = writableGetChunkSize(controller, chunk);
+      const state = stream._state;
+      if (state === "errored") return Promise.reject(stream._storedError);
+      if (writableCloseQueuedOrInFlight(stream) || state === "closed") {
+        return Promise.reject(invalidState("WritableStream is closed"));
+      }
+      if (state === "erroring") return Promise.reject(stream._storedError);
+      const request = deferred();
+      stream._writeRequests.push(request);
+      writableControllerWrite(controller, chunk, chunkSize);
+      return request.promise;
     }
 
     close() {
-      if (this.locked) {
-        return Promise.reject(new TypeError("Cannot close a locked stream"));
+      const stream = this._stream;
+      if (stream === undefined) {
+        return Promise.reject(invalidState("Writer is not bound to a WritableStream"));
       }
-      const writer = this.getWriter();
-      const done = writer.close();
-      writer.releaseLock();
-      return done;
+      if (writableCloseQueuedOrInFlight(stream)) {
+        return Promise.reject(invalidState("Failure to close WritableStream"));
+      }
+      return writableClose(stream);
+    }
+
+    abort(reason) {
+      const stream = this._stream;
+      if (stream === undefined) {
+        return Promise.reject(invalidState("Writer is not bound to a WritableStream"));
+      }
+      return writableAbort(stream, reason);
+    }
+
+    releaseLock() {
+      const stream = this._stream;
+      if (stream === undefined) return;
+      const released = invalidState("Writer has been released");
+      writerEnsureReadyPromiseRejected(this, released);
+      writerEnsureClosedPromiseRejected(this, released);
+      stream._writer = undefined;
+      this._stream = undefined;
+    }
+  }
+
+  class WritableStream {
+    constructor(sink = {}, strategy = {}) {
+      initWritable(this);
+      const start = sink.start;
+      const write = sink.write;
+      const close = sink.close;
+      const abort = sink.abort;
+      setupWritable(
+        this,
+        typeof start === "function" ? (controller) => start.call(sink, controller) : nonOpStart,
+        typeof write === "function" ? promiseCallback(write, sink) : nonOpPromise,
+        typeof close === "function" ? promiseCallback(close, sink) : nonOpPromise,
+        typeof abort === "function" ? promiseCallback(abort, sink) : nonOpPromise,
+        extractHighWaterMark(strategy?.highWaterMark, 1),
+        makeSizeFn(strategy?.size),
+      );
+    }
+
+    get locked() {
+      return this._writer !== undefined;
+    }
+
+    getWriter() {
+      return new WritableStreamDefaultWriter(this);
+    }
+
+    abort(reason) {
+      if (this._writer !== undefined) {
+        return Promise.reject(invalidState("WritableStream is locked"));
+      }
+      return writableAbort(this, reason);
+    }
+
+    close() {
+      if (this._writer !== undefined) {
+        return Promise.reject(invalidState("WritableStream is locked"));
+      }
+      if (writableCloseQueuedOrInFlight(this)) {
+        return Promise.reject(invalidState("Failure closing WritableStream"));
+      }
+      return writableClose(this);
     }
   }
 
   // ------------------------------------------------------ TransformStream
+  class TransformStreamDefaultController {
+    constructor(stream, transformAlgorithm, flushAlgorithm, cancelAlgorithm) {
+      this._stream = stream;
+      this._transformAlgorithm = transformAlgorithm;
+      this._flushAlgorithm = flushAlgorithm;
+      this._cancelAlgorithm = cancelAlgorithm;
+      this._finishPromise = undefined;
+    }
+    get desiredSize() {
+      return readableDesiredSize(this._stream._readable);
+    }
+    enqueue(chunk) {
+      transformEnqueue(this, chunk);
+    }
+    error(reason) {
+      transformError(this._stream, reason);
+    }
+    terminate() {
+      const stream = this._stream;
+      const readable = stream._readable;
+      if (readableCanCloseOrEnqueue(readable)) readableControllerClose(readable);
+      transformErrorWritableAndUnblockWrite(
+        stream,
+        invalidState("TransformStream has been terminated"),
+      );
+    }
+  }
+
+  // No `transform` means the IDENTITY transform, which enqueues the chunk
+  // unchanged -- per spec, and it is the whole point of the bare `new
+  // TransformStream()` used as a plumbing pipe.
+  async function identityTransform(chunk, controller) {
+    transformEnqueue(controller, chunk);
+  }
+
+  function transformSetBackpressure(stream, backpressure) {
+    stream._backpressureChange?.resolve();
+    stream._backpressureChange = deferred();
+    stream._backpressure = backpressure;
+  }
+
+  function transformUnblockWrite(stream) {
+    if (stream._backpressure) transformSetBackpressure(stream, false);
+  }
+
+  function transformClearAlgorithms(controller) {
+    controller._transformAlgorithm = undefined;
+    controller._flushAlgorithm = undefined;
+    controller._cancelAlgorithm = undefined;
+  }
+
+  function transformErrorWritableAndUnblockWrite(stream, error) {
+    transformClearAlgorithms(stream._controller);
+    writableControllerErrorIfNeeded(stream._writable._controller, error);
+    transformUnblockWrite(stream);
+  }
+
+  function transformError(stream, error) {
+    readableError(stream._readable, error);
+    transformErrorWritableAndUnblockWrite(stream, error);
+  }
+
+  function transformEnqueue(controller, chunk) {
+    const stream = controller._stream;
+    const readable = stream._readable;
+    if (!readableCanCloseOrEnqueue(readable)) throw invalidState("Unable to enqueue");
+    try {
+      readableEnqueue(readable, chunk);
+    } catch (error) {
+      transformErrorWritableAndUnblockWrite(stream, error);
+      throw readable._error;
+    }
+    const backpressure = !readableShouldCallPull(readable);
+    if (backpressure !== stream._backpressure) transformSetBackpressure(stream, true);
+  }
+
+  async function transformPerformTransform(controller, chunk) {
+    try {
+      return await controller._transformAlgorithm(chunk, controller);
+    } catch (error) {
+      transformError(controller._stream, error);
+      throw error;
+    }
+  }
+
+  function transformSinkWrite(stream, chunk) {
+    const controller = stream._controller;
+    if (stream._backpressure) {
+      return then(stream._backpressureChange.promise, () => {
+        const writable = stream._writable;
+        if (writable._state === "erroring") throw writable._storedError;
+        return transformPerformTransform(controller, chunk);
+      });
+    }
+    return transformPerformTransform(controller, chunk);
+  }
+
+  async function transformSinkAbort(stream, reason) {
+    const controller = stream._controller;
+    const readable = stream._readable;
+    if (controller._finishPromise !== undefined) return controller._finishPromise;
+    const finish = deferred();
+    controller._finishPromise = finish.promise;
+    const cancelPromise = controller._cancelAlgorithm(reason);
+    transformClearAlgorithms(controller);
+    then(
+      cancelPromise,
+      () => {
+        if (readable._state === "errored") finish.reject(readable._error);
+        else {
+          readableError(readable, reason);
+          finish.resolve();
+        }
+      },
+      (error) => {
+        readableError(readable, error);
+        finish.reject(error);
+      },
+    );
+    return controller._finishPromise;
+  }
+
+  function transformSinkClose(stream) {
+    const controller = stream._controller;
+    const readable = stream._readable;
+    if (controller._finishPromise !== undefined) return controller._finishPromise;
+    const finish = deferred();
+    controller._finishPromise = finish.promise;
+    const flushPromise = controller._flushAlgorithm(controller);
+    transformClearAlgorithms(controller);
+    then(
+      flushPromise,
+      () => {
+        if (readable._state === "errored") finish.reject(readable._error);
+        else {
+          if (readableCanCloseOrEnqueue(readable)) readableControllerClose(readable);
+          finish.resolve();
+        }
+      },
+      (error) => {
+        readableError(readable, error);
+        finish.reject(error);
+      },
+    );
+    return controller._finishPromise;
+  }
+
+  function transformSourcePull(stream) {
+    transformSetBackpressure(stream, false);
+    return stream._backpressureChange.promise;
+  }
+
+  function transformSourceCancel(stream, reason) {
+    const controller = stream._controller;
+    const writable = stream._writable;
+    if (controller._finishPromise !== undefined) return controller._finishPromise;
+    const finish = deferred();
+    controller._finishPromise = finish.promise;
+    const cancelPromise = controller._cancelAlgorithm(reason);
+    transformClearAlgorithms(controller);
+    then(
+      cancelPromise,
+      () => {
+        if (writable._state === "errored") finish.reject(writable._storedError);
+        else {
+          writableControllerErrorIfNeeded(writable._controller, reason);
+          transformUnblockWrite(stream);
+          finish.resolve();
+        }
+      },
+      (error) => {
+        writableControllerErrorIfNeeded(writable._controller, error);
+        transformUnblockWrite(stream);
+        finish.reject(error);
+      },
+    );
+    return controller._finishPromise;
+  }
+
   class TransformStream {
-    constructor(transformer = {}, _writableStrategy, _readableStrategy) {
-      let readableController;
-      this.readable = new ReadableStream({
-        start(controller) {
-          readableController = controller;
-        },
+    constructor(transformer = {}, writableStrategy = {}, readableStrategy = {}) {
+      const start = transformer.start;
+      const transform = transformer.transform;
+      const flush = transformer.flush;
+      const cancel = transformer.cancel;
+      // node's defaults: the readable side holds 0 chunks (a transform runs
+      // when a read wants its output), the writable side 1.
+      const readableHWM = extractHighWaterMark(readableStrategy?.highWaterMark, 0);
+      const readableSize = makeSizeFn(readableStrategy?.size);
+      const writableHWM = extractHighWaterMark(writableStrategy?.highWaterMark, 1);
+      const writableSize = makeSizeFn(writableStrategy?.size);
+
+      // Both sides start from ONE promise, resolved with transformer.start's
+      // result below -- so a throw from start() is this constructor's throw.
+      let resolveStart;
+      const startPromise = new Promise((resolve) => {
+        resolveStart = resolve;
       });
-      const controller = {
-        enqueue: (chunk) => readableController.enqueue(chunk),
-        terminate: () => readableController.close(),
-        error: (reason) => readableController.error(reason),
-        get desiredSize() {
-          return readableController.desiredSize;
-        },
-      };
-      this.writable = new WritableStream({
-        start: () => transformer.start?.(controller),
-        // No `transform` means the IDENTITY transform, which enqueues the
-        // chunk unchanged -- per spec, and it is the whole point of the
-        // bare `new TransformStream()` used as a plumbing pipe. The
-        // optional call alone returned undefined and silently DISCARDED
-        // every chunk, so such a stream read back empty.
-        write: (chunk) => {
-          if (typeof transformer.transform === "function") {
-            return transformer.transform(chunk, controller);
-          }
-          controller.enqueue(chunk);
-          return undefined;
-        },
-        close: async () => {
-          await transformer.flush?.(controller);
-          readableController.close();
-        },
-        abort: (reason) => readableController.error(reason),
-      });
+      const startAlgorithm = () => startPromise;
+
+      this._backpressure = undefined;
+      this._backpressureChange = undefined;
+      this._controller = undefined;
+      this._writable = createWritable(
+        startAlgorithm,
+        (chunk) => transformSinkWrite(this, chunk),
+        () => transformSinkClose(this),
+        (reason) => transformSinkAbort(this, reason),
+        writableHWM,
+        writableSize,
+      );
+      this._readable = createReadable(
+        startAlgorithm,
+        () => transformSourcePull(this),
+        (reason) => transformSourceCancel(this, reason),
+        readableHWM,
+        readableSize,
+      );
+      transformSetBackpressure(this, true);
+
+      const controller = new TransformStreamDefaultController(
+        this,
+        typeof transform === "function" ? promiseCallback(transform, transformer) : identityTransform,
+        typeof flush === "function" ? promiseCallback(flush, transformer) : nonOpPromise,
+        typeof cancel === "function" ? promiseCallback(cancel, transformer) : nonOpPromise,
+      );
+      this._controller = controller;
+
+      if (start !== undefined) resolveStart(start.call(transformer, controller));
+      else resolveStart();
+    }
+
+    get readable() {
+      return this._readable;
+    }
+
+    get writable() {
+      return this._writable;
     }
   }
 
@@ -521,10 +1342,9 @@
     }
   }
 
-  // WHATWG queuing strategies (Node globals since v18). Spec-minimal: the
-  // stream machinery here is count-based and does not consult size() (see
-  // the header note), but the classes must exist and carry the documented
-  // shape -- vendored stream tests construct them directly.
+  // WHATWG queuing strategies (Node globals since v18). The streams above
+  // call size() through makeSizeFn; these carry the documented shape --
+  // vendored stream tests construct them directly.
   class CountQueuingStrategy {
     constructor(init) {
       if (init === null || typeof init !== "object") {

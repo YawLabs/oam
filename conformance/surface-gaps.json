@@ -244,10 +244,6 @@
           "readable",
           "writable"
         ],
-        "global:TransformStream.prototype": [
-          "readable",
-          "writable"
-        ],
         "global:URL": [
           "createObjectURL"
         ],
@@ -702,10 +698,6 @@
           "readable",
           "writable"
         ],
-        "global:TransformStream.prototype": [
-          "readable",
-          "writable"
-        ],
         "global:URL": [
           "createObjectURL"
         ],
@@ -1142,10 +1134,6 @@
         ],
         "global:TextEncoderStream.prototype": [
           "encoding",
-          "readable",
-          "writable"
-        ],
-        "global:TransformStream.prototype": [
           "readable",
           "writable"
         ],
