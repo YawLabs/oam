@@ -1,0 +1,16 @@
+# The SHA-1 of the certificate every macOS release binary must be signed with.
+# Read by scripts/lib/mac-signing.sh (mac_pinned_sha1): '#' comments and blank
+# lines are ignored, and what remains must be empty or exactly one 40-hex-digit
+# fingerprint (colons, spaces and case do not matter).
+#
+# BOOTSTRAP: no fingerprint below yet. The identity has not been provisioned,
+# so the mac leg signs AD-HOC (hardened runtime + the entitlements, no
+# certificate) and warns loudly; OAM_SIGN_REQUIRED=1 refuses that instead.
+# Once a fingerprint is committed here, signing with exactly that certificate
+# is mandatory: a mac leg that cannot use it fails the release.
+#
+# To fill it in: on the build Mac run
+#     bash scripts/provision-mac-signing.sh --generate
+# back up oam-codesign.p12 + oam-codesign.p12-password off that host, and put
+# the printed sha1 on its own line below, in the same commit that says so.
+# Rotating it (a new identity, or the Developer ID) is the same edit.

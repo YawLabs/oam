@@ -93,6 +93,11 @@
 #   OAM_SKIP_WIN_X64=1      drop the win-x64 asset (emulated build is slow)
 #   OAM_SKIP_MAC=1          drop both mac assets (Air unreachable)
 #   OAM_SKIP_MAC_X64=1      drop only the mac-x64 asset
+#   OAM_SKIP_MAC_SIGN=1     ship the mac assets without the mac leg's codesign
+#                           step (loud; honored even with OAM_SIGN_REQUIRED=1,
+#                           which also refuses an ad-hoc mac build while
+#                           scripts/mac-signing-identity.sha1 holds no SHA-1).
+#                           See scripts/lib/mac-signing.sh
 #   OAM_SKIP_LINUX=1        drop the linux asset
 #   OAM_KEEP_VM=1           leave the GCP VM running after the linux leg
 #   OAM_IAP_SSH_MODE=direct|tunnel
@@ -1024,7 +1029,12 @@ else
   MAC_ART=$(bash "$SCRIPT_DIR/build-platforms-tailnet.sh" --mode=release) \
     || fail "mac leg failed -- see its log output above"
   MAC_ART="${MAC_ART##*$'\n'}"   # contract: artifact dir = LAST stdout line
-  cp "$MAC_ART"/oam-*apple-darwin* "$RELEASE_DIR/"
+  # The two exact asset names, never a glob: whatever else lands in the leg's
+  # artifact dir must not ride into SHA256SUMS and onto the release.
+  cp "$MAC_ART/oam-aarch64-apple-darwin" "$RELEASE_DIR/"
+  if [ "${OAM_SKIP_MAC_X64:-0}" != "1" ]; then
+    cp "$MAC_ART/oam-x86_64-apple-darwin" "$RELEASE_DIR/"
+  fi
 fi
 
 if [ "$SKIP_LINUX" = "1" ]; then

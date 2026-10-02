@@ -1463,9 +1463,12 @@ done
 macpf_ssh(){ { echo '#!/bin/bash'; cat; } > "$MACPF_BIN/ssh"; chmod +x "$MACPF_BIN/ssh"; }
 chmod +x "$MACPF_BIN/tailscale" "$MACPF_BIN/scp" "$MACPF_BIN/mktemp"
 # macpf [args...]  -- the preflight against the stubs; stdout to MACPF_OUT,
-# stderr to MACPF_ERR, status to MACPF_RC.
+# stderr to MACPF_ERR, status to MACPF_RC. OAM_SKIP_MAC_SIGN=1 keeps the mac
+# signing preflight (its own group, against a fixture pin) out of these host
+# checks: with a pin committed it would make a second ssh call, which the
+# stubs here treat as the leg going on.
 macpf(){
-  MACPF_OUT="$(PATH="$MACPF_BIN:$PATH" TMPDIR="$MACPF_TMP" OAM_MAC_KEY="$SUITE_TMP/macpf-key" \
+  MACPF_OUT="$(PATH="$MACPF_BIN:$PATH" TMPDIR="$MACPF_TMP" OAM_MAC_KEY="$SUITE_TMP/macpf-key" OAM_SKIP_MAC_SIGN=1 \
     OAM_MAC_HOST=100.90.0.5 OAM_MAC_USER=builder \
     bash scripts/build-platforms-tailnet.sh "$@" 2>"$SUITE_TMP/macpf-err")"
   MACPF_RC=$?
@@ -4155,6 +4158,552 @@ if [ -n "${IN_SRV_PID:-}" ]; then
   kill "$IN_SRV_PID" 2>/dev/null
   wait "$IN_SRV_PID" 2>/dev/null
 fi
+
+# =============================================================================
+group "mac-signing.sh -- the mac leg's signing decision, gate and hand-back"
+# =============================================================================
+# The mac release leg signs both binaries (hardened runtime + three
+# entitlements), verifies the signature and runs a JIT smoke against the signed
+# bytes, all between each binary's cp into dist/ and its smoke; the release box
+# then checks the pulled bytes against the Air's own hashes.
+#
+# This box is Windows: there is no real codesign, security or Mac keychain
+# here. So the lib's functions run against STUBS on PATH that log their argv
+# and answer from fixture files with the shapes codesign prints on macOS
+# (`-dv`'s Identifier/CodeDirectory/Signature/Authority lines, `-d -r-`'s
+# designated requirement, `-d --entitlements - --xml`'s plist). What a real
+# codesign does with these arguments is proven on the Air by the leg itself --
+# its verify gate and JIT smoke fail the release, not this suite.
+MS="$SUITE_TMP/macsign"
+mkdir -p "$MS/bin" "$MS/kc"
+MS_LOG="$MS/log"
+MS_ENTS="$REPO_DIR/scripts/macos/oam.entitlements.plist"
+MS_PIN_A="0123456789abcdef0123456789abcdef01234567"
+MS_PIN_B="89abcdef0123456789abcdef0123456789abcdef"
+: > "$MS/kc/oam-codesign.keychain-db"
+printf 'kcpw' > "$MS/kc/pw"
+echo "probe source" > "$MS/true-src"
+echo "binary" > "$MS/oam-bin"
+
+cat > "$MS/bin/codesign" <<EOF
+#!/bin/bash
+echo "codesign \$*" >> "$MS_LOG"
+case " \$* " in
+  *" --force "*)
+    if [ -f "$MS/cs-sign-fail" ]; then cat "$MS/cs-sign-fail" >&2; exit 1; fi
+    exit 0 ;;
+  *" --verify "*)
+    if [ -f "$MS/cs-verify-fail" ]; then echo "$MS/oam-bin: invalid signature (code or signature have been modified)" >&2; exit 1; fi
+    exit 0 ;;
+  *" --entitlements - --xml "*) cat "$MS/cs-ents" ;;
+  *" -r- "*) echo "Executable=/x/oam" >&2; cat "$MS/cs-dr" ;;
+  *" -dv "*|*" -dvv "*) cat "$MS/cs-dv" >&2 ;;
+esac
+exit 0
+EOF
+cat > "$MS/bin/security" <<EOF
+#!/bin/bash
+echo "security \$*" >> "$MS_LOG"
+[ -f "$MS/sec-fail" ] && exit 51
+exit 0
+EOF
+# The provision script, as the lib sees it: `bash <it> --check`.
+cat > "$MS/provision" <<EOF
+#!/bin/bash
+echo "provision \$*" >> "$MS_LOG"
+cat "$MS/prov-out"
+exit "\$(cat "$MS/prov-rc")"
+EOF
+chmod +x "$MS/bin/codesign" "$MS/bin/security" "$MS/provision"
+
+# ms_pin <line>...  -- the fixture pin file, comments and all.
+ms_pin(){ { echo '# a comment that names deadbeef is not a pin'; printf '%s\n' "$@"; } > "$MS/pin"; }
+# ms_dv <identifier> <flags> <signature-or-authority-lines>...  -- `codesign -dv`.
+ms_dv(){
+  local id="$1" flags="$2"; shift 2
+  { echo "Executable=/x/oam"; echo "Identifier=$id"; echo "Format=Mach-O thin (arm64)"
+    echo "CodeDirectory v=20500 size=1234 flags=$flags hashes=30+7 location=embedded"
+    printf '%s\n' "$@"; echo "TeamIdentifier=not set"; } > "$MS/cs-dv"
+}
+# A codesign-shaped entitlements dump: one line, no comment, as --xml prints.
+ms_ents(){
+  { printf '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict>'
+    local k; for k in "$@"; do printf '<key>%s</key><true/>' "$k"; done
+    printf '</dict></plist>'; } > "$MS/cs-ents"
+}
+MS_K1=com.apple.security.cs.allow-jit
+MS_K2=com.apple.security.cs.allow-unsigned-executable-memory
+MS_K3=com.apple.security.cs.disable-library-validation
+ms_good_adhoc(){
+  ms_dv org.oamjs.oam '0x10002(adhoc,runtime)' 'Signature=adhoc'
+  ms_ents "$MS_K1" "$MS_K2" "$MS_K3"
+  echo '# designated => cdhash H"8d3c3e0b1f0a4f0e9b9e1b6b0e0c8f5a2b7c1d00"' > "$MS/cs-dr"
+}
+ms_good_selfsigned(){  # ms_good_selfsigned <pin as the requirement prints it>
+  ms_dv org.oamjs.oam '0x10000(runtime)' 'Signature size=1234' 'Authority=oam Code Signing (self-signed)' 'Signed Time=Oct 2, 2026 at 10:00:00 AM'
+  ms_ents "$MS_K1" "$MS_K2" "$MS_K3"
+  echo "designated => identifier \"org.oamjs.oam\" and certificate leaf = H\"$1\"" > "$MS/cs-dr"
+}
+ms_reset(){
+  rm -f "$MS/cs-sign-fail" "$MS/cs-verify-fail" "$MS/sec-fail"
+  : > "$MS_LOG"
+  printf 'keychain=%s\nsha1=%s\n' "$MS/kc/oam-codesign.keychain-db" "$MS_PIN_A" > "$MS/prov-out"
+  echo 0 > "$MS/prov-rc"
+  ms_pin
+  ms_good_adhoc
+}
+# ms <cmd> [args...]  -- a fresh shell with the stubs first on PATH, the lib
+# sourced against the fixtures, then <cmd>. stdout to MS_OUT, stderr to
+# MS_ERR, status to MS_RC. A subshell, so no lib state leaks between tests.
+ms(){
+  # The redirect sits INSIDE the substitution: on a bare assignment it would
+  # not reach the substitution's stderr.
+  MS_OUT="$( {
+    PATH="$MS/bin:$PATH"
+    MAC_SIGNING_PIN_FILE="$MS/pin" MAC_PROVISION_SCRIPT="$MS/provision"
+    MAC_ENTITLEMENTS="$MS_ENTS" MAC_PROBE_SOURCE="$MS/true-src" MAC_SIGN_PW_FILE="$MS/kc/pw"
+    # shellcheck source=lib/mac-signing.sh
+    . scripts/lib/mac-signing.sh
+    "$@"
+  } 2>"$MS/err" )"
+  MS_RC=$?
+  MS_ERR="$(cat "$MS/err")"
+}
+# Setup, then the step under test, in the same shell (MAC_SIGN_MODE is state).
+ms_then(){ mac_signing_setup 2>/dev/null || return 90; : > "$MS_LOG"; "$@"; }
+
+ms_reset
+
+it "bootstrap: a pin file holding only comments signs ad-hoc, with a warning"
+ms mac_sign_decision
+case "$MS_OUT" in adhoc:*"holds no SHA-1 yet"*) pass ;; *) fail "decision: $MS_OUT" ;; esac
+
+it "bootstrap under OAM_SIGN_REQUIRED=1 is fatal"
+OAM_SIGN_REQUIRED=1 ms mac_sign_decision
+case "$MS_OUT" in fail:"OAM_SIGN_REQUIRED=1 but "*) pass ;; *) fail "decision: $MS_OUT" ;; esac
+
+it "a committed pin makes that identity mandatory, required or not"
+ms_pin "$MS_PIN_A"
+MS_GOT="$(ms mac_sign_decision; echo "$MS_OUT")|$(OAM_SIGN_REQUIRED=1 ms mac_sign_decision; echo "$MS_OUT")"
+eq "$MS_GOT" "identity:$MS_PIN_A|identity:$MS_PIN_A"
+
+it "a pin is read case- and separator-insensitively"
+ms_pin "01:23:45:67:89:AB:CD:EF:01:23:45:67:89:AB:CD:EF:01:23:45:67"
+ms mac_sign_decision
+eq "$MS_OUT" "identity:$MS_PIN_A"
+
+it "a truncated, doubled or non-hex pin is fatal, never read as no pin"
+MS_BAD=""
+for p in "${MS_PIN_A%?}" "$MS_PIN_A $MS_PIN_B" "${MS_PIN_A%?}g"; do
+  ms_pin "$p"; ms mac_sign_decision
+  case "$MS_OUT" in fail:*) ;; *) MS_BAD="$MS_BAD [$p -> $MS_OUT]" ;; esac
+done
+rm -f "$MS/pin"; ms mac_sign_decision
+case "$MS_OUT" in fail:*"no pin file"*) ;; *) MS_BAD="$MS_BAD [missing file -> $MS_OUT]" ;; esac
+if [ -z "$MS_BAD" ]; then pass; else fail "accepted:$MS_BAD"; fi
+
+it "OAM_SKIP_MAC_SIGN=1 is honored even under OAM_SIGN_REQUIRED=1, and says so"
+ms_pin "$MS_PIN_A"
+OAM_SKIP_MAC_SIGN=1 OAM_SIGN_REQUIRED=1 ms mac_sign_decision
+case "$MS_OUT" in skip:*"even though OAM_SIGN_REQUIRED=1"*) pass ;; *) fail "decision: $MS_OUT" ;; esac
+
+it "a knob that is not 0 or 1 is fatal"
+MS_GOT="$(OAM_SIGN_REQUIRED=yes ms mac_sign_decision; echo "$MS_OUT")|$(OAM_SKIP_MAC_SIGN=true ms mac_sign_decision; echo "$MS_OUT")"
+case "$MS_GOT" in "fail:OAM_SIGN_REQUIRED must be 0 or 1, not yes|fail:OAM_SKIP_MAC_SIGN must be 0 or 1, not true") pass ;; *) fail "got: $MS_GOT" ;; esac
+
+it "the committed pin file parses (empty while bootstrapping, or one SHA-1)"
+MS_COMMITTED="$( MAC_SIGNING_PIN_FILE=scripts/mac-signing-identity.sha1; . scripts/lib/mac-signing.sh; mac_sign_decision )"
+case "$MS_COMMITTED" in adhoc:*|identity:*) pass ;; *) fail "scripts/mac-signing-identity.sha1 -> $MS_COMMITTED" ;; esac
+
+# --- setup: the pinned identity, proven before the build -----------------------
+ms_reset; ms_pin "$MS_PIN_A"
+echo 1 > "$MS/prov-rc"; : > "$MS/prov-out"
+ms mac_signing_setup
+it "a pinned identity whose --check fails is fatal, with the keychain remediation"
+if [ "$MS_RC" != "0" ] && grep -qF "the pinned signing identity $MS_PIN_A is not usable" <<<"$MS_ERR" \
+   && grep -qF 'set-key-partition-list' <<<"$MS_ERR" && grep -qF 'OAM_SKIP_MAC_SIGN=1' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC stderr: $MS_ERR"; fi
+
+ms_reset; ms_pin "$MS_PIN_A"
+printf 'keychain=%s\nsha1=%s\n' "$MS/kc/oam-codesign.keychain-db" "$MS_PIN_B" > "$MS/prov-out"
+ms mac_signing_setup
+it "a host whose certificate is not the pinned one is fatal"
+if [ "$MS_RC" != "0" ] && grep -qF "this host's signing certificate is $MS_PIN_B but the repo pins $MS_PIN_A" <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC stderr: $MS_ERR"; fi
+
+ms_reset; ms_pin "$MS_PIN_A"
+echo 'oam-bin: errSecInternalComponent' > "$MS/cs-sign-fail"
+ms mac_signing_setup
+it "a pinned identity the probe signature cannot use is fatal (errSecInternalComponent -> remediation)"
+if [ "$MS_RC" != "0" ] && grep -qF "the pinned identity $MS_PIN_A cannot sign from this session" <<<"$MS_ERR" \
+   && grep -qF 'errSecInternalComponent' <<<"$MS_ERR" && grep -qF 'dedicated build keychain' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC stderr: $MS_ERR"; fi
+
+# --- signing --------------------------------------------------------------------
+ms_reset
+ms ms_then mac_sign_binary "$MS/oam-bin"
+it "ad-hoc (bootstrap) signs with the hardened runtime, the entitlements and the identifier, and warns"
+if [ "$MS_RC" = "0" ] \
+   && grep -qxF "codesign --force --sign - --options runtime --timestamp=none --identifier org.oamjs.oam --entitlements $MS_ENTS $MS/oam-bin" "$MS_LOG" \
+   && ! grep -q '^security' "$MS_LOG" && grep -qF 'signed AD-HOC' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC log: $(cat "$MS_LOG") stderr: $MS_ERR"; fi
+
+ms_reset; ms_pin "$MS_PIN_A"
+ms ms_then mac_sign_binary "$MS/oam-bin"
+it "the pinned identity: unlock, a fresh probe, then the real signature, with --keychain and no timestamp"
+MS_U="$(grep -n '^security unlock-keychain -p kcpw ' "$MS_LOG" | head -1 | cut -d: -f1)"
+MS_P="$(grep -nF "codesign --force --sign $MS_PIN_A --keychain $MS/kc/oam-codesign.keychain-db --options runtime --timestamp=none " "$MS_LOG" | grep '/probe$' | head -1 | cut -d: -f1)"
+MS_S="$(grep -nxF "codesign --force --sign $MS_PIN_A --keychain $MS/kc/oam-codesign.keychain-db --options runtime --timestamp=none --identifier org.oamjs.oam --entitlements $MS_ENTS $MS/oam-bin" "$MS_LOG" | head -1 | cut -d: -f1)"
+if [ "$MS_RC" = "0" ] && [ -n "$MS_U" ] && [ -n "$MS_P" ] && [ -n "$MS_S" ] && [ "$MS_U" -lt "$MS_P" ] && [ "$MS_P" -lt "$MS_S" ]; then pass
+else fail "rc=$MS_RC unlock@${MS_U:-none} probe@${MS_P:-none} sign@${MS_S:-none} log: $(cat "$MS_LOG") stderr: $MS_ERR"; fi
+
+ms_reset; ms_pin "$MS_PIN_A"
+ms mac_sign_binary "$MS/oam-bin"
+it "signing before setup is refused"
+if [ "$MS_RC" != "0" ] && grep -qF 'run mac_signing_setup first' <<<"$MS_ERR" && ! grep -q '^codesign' "$MS_LOG"; then pass
+else fail "rc=$MS_RC log: $(cat "$MS_LOG") stderr: $MS_ERR"; fi
+
+# A Developer ID certificate in the same slot gets the secure timestamp: the
+# move to it is an identity swap, not an edit here.
+ms_reset; ms_pin "$MS_PIN_A"
+ms_dv org.oamjs.oam '0x10000(runtime)' 'Authority=Developer ID Application: Example LLC (ABCDE12345)' 'Authority=Developer ID Certification Authority' 'Authority=Apple Root CA'
+ms ms_then mac_sign_binary "$MS/oam-bin"
+it "a Developer ID identity signs with --timestamp"
+if [ "$MS_RC" = "0" ] && grep -qxF "codesign --force --sign $MS_PIN_A --keychain $MS/kc/oam-codesign.keychain-db --options runtime --timestamp --identifier org.oamjs.oam --entitlements $MS_ENTS $MS/oam-bin" "$MS_LOG"; then pass
+else fail "rc=$MS_RC log: $(cat "$MS_LOG")"; fi
+
+ms_reset; ms_pin "$MS_PIN_A"
+OAM_SKIP_MAC_SIGN=1 OAM_SIGN_REQUIRED=1 ms ms_then mac_sign_binary "$MS/oam-bin"
+it "OAM_SKIP_MAC_SIGN=1 signs nothing, asks nothing of the keychain, and warns"
+if [ "$MS_RC" = "0" ] && [ ! -s "$MS_LOG" ] && grep -qF 'left as the linker signed it' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC log: $(cat "$MS_LOG") stderr: $MS_ERR"; fi
+
+# --- the verify gate ----------------------------------------------------------
+ms_reset
+ms ms_then mac_verify_binary "$MS/oam-bin"
+it "verify: an ad-hoc signature with runtime + the three entitlements passes while no pin is committed"
+if [ "$MS_RC" = "0" ] && grep -qF 'verifies, AD-HOC' <<<"$MS_ERR"; then pass; else fail "rc=$MS_RC stderr: $MS_ERR"; fi
+
+ms_reset; ms_pin "$MS_PIN_A"
+MS_UPPER="$(tr 'a-f' 'A-F' <<<"$MS_PIN_A")"
+ms_good_selfsigned "$MS_UPPER"
+ms ms_then mac_verify_binary "$MS/oam-bin"
+it "verify: the pinned self-signed certificate in the designated requirement passes (hex case aside)"
+if [ "$MS_RC" = "0" ]; then pass; else fail "rc=$MS_RC stderr: $MS_ERR"; fi
+
+# Each case: one defect on an otherwise passing signature, and the line that
+# must name it.
+MS_BAD=""
+ms_verify_rejects(){  # ms_verify_rejects <label> <expected stderr fragment>
+  ms ms_then mac_verify_binary "$MS/oam-bin"
+  if [ "$MS_RC" = "0" ] || ! grep -qF -- "$2" <<<"$MS_ERR"; then MS_BAD="$MS_BAD [$1: rc=$MS_RC $MS_ERR]"; fi
+}
+ms_reset; touch "$MS/cs-verify-fail"; ms_verify_rejects "broken signature" "does not verify"
+ms_reset; ms_dv org.oamjs.oam '0x2(adhoc)' 'Signature=adhoc'; ms_verify_rejects "no runtime flag" "no hardened runtime flag"
+ms_reset; ms_dv a.out-5555 '0x10002(adhoc,runtime)' 'Signature=adhoc'; ms_verify_rejects "linker identifier" "is not signed as org.oamjs.oam"
+ms_reset; ms_ents "$MS_K1" "$MS_K2"; ms_verify_rejects "missing entitlement" "wrong entitlements"
+ms_reset; ms_ents "$MS_K1" "$MS_K2" "$MS_K3" com.apple.security.get-task-allow; ms_verify_rejects "extra entitlement" "wrong entitlements"
+ms_reset; ms_pin "$MS_PIN_A"; ms_verify_rejects "pinned, but ad-hoc" "is ad-hoc signed (cdhash requirement), but the repo pins $MS_PIN_A"
+ms_reset; ms_pin "$MS_PIN_A"; ms_good_selfsigned "$MS_PIN_B"; ms_verify_rejects "another certificate" "does not name the pinned certificate $MS_PIN_A"
+ms_reset; ms_dv org.oamjs.oam '0x10000(runtime)' 'Authority=oam Code Signing (self-signed)'; ms_verify_rejects "certificate, no pin" "should be signed ad-hoc"
+ms_reset; ms_pin "$MS_PIN_A"
+ms_dv org.oamjs.oam '0x10000(runtime)' 'Authority=Developer ID Application: Example LLC (ABCDE12345)' 'Authority=Developer ID Certification Authority'
+echo 'designated => identifier "org.oamjs.oam" and anchor apple generic and certificate leaf[subject.OU] = ABCDE12345' > "$MS/cs-dr"
+ms_verify_rejects "Developer ID without a timestamp" "without a secure timestamp"
+it "verify rejects each defect, by name"
+if [ -z "$MS_BAD" ]; then pass; else fail "not rejected as expected:$MS_BAD"; fi
+
+ms_reset; ms_pin "$MS_PIN_A"
+ms_dv org.oamjs.oam '0x10000(runtime)' 'Authority=Developer ID Application: Example LLC (ABCDE12345)' 'Authority=Developer ID Certification Authority' 'Timestamp=Oct 2, 2026 at 10:00:00 AM'
+echo 'designated => identifier "org.oamjs.oam" and anchor apple generic and certificate leaf[subject.OU] = ABCDE12345' > "$MS/cs-dr"
+ms ms_then mac_verify_binary "$MS/oam-bin"
+it "verify: a timestamped Developer ID signature passes without the self-signed leaf rule"
+if [ "$MS_RC" = "0" ]; then pass; else fail "rc=$MS_RC stderr: $MS_ERR"; fi
+
+ms_reset
+OAM_SKIP_MAC_SIGN=1 ms ms_then mac_verify_binary "$MS/oam-bin"
+it "verify under OAM_SKIP_MAC_SIGN=1 warns and passes without asking codesign"
+if [ "$MS_RC" = "0" ] && [ ! -s "$MS_LOG" ] && grep -qF 'signature checks skipped' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC log: $(cat "$MS_LOG") stderr: $MS_ERR"; fi
+
+# --- the committed entitlements file ---------------------------------------------
+# plutil is macOS-only, so the plist is read as XML: by the lib's own parser,
+# and independently by line, since the file keeps one element per line.
+it "the entitlements file holds exactly the three keys, each true"
+MS_PAIRS="$( . scripts/lib/mac-signing.sh; mac_entitlement_pairs < scripts/macos/oam.entitlements.plist )"
+MS_WANT="$MS_K1 true"$'\n'"$MS_K2 true"$'\n'"$MS_K3 true"
+MS_LINES="$(grep -cE '^[[:space:]]*<key>' scripts/macos/oam.entitlements.plist)"
+MS_TRUES="$(grep -cE '^[[:space:]]*<true/>[[:space:]]*$' scripts/macos/oam.entitlements.plist)"
+if [ "$MS_PAIRS" = "$MS_WANT" ] && [ "$MS_LINES" = "3" ] && [ "$MS_TRUES" = "3" ]; then pass
+else fail "pairs: '$MS_PAIRS' key lines=$MS_LINES true lines=$MS_TRUES"; fi
+
+it "the entitlements parser ignores a key named inside an XML comment"
+MS_PAIRS="$( . scripts/lib/mac-signing.sh; printf '<dict><!-- <key>com.apple.security.get-task-allow</key><true/> --><key>a</key><true/><key>b</key><string>x</string></dict>' | mac_entitlement_pairs )"
+eq "$MS_PAIRS" "a true"$'\n'"b other"
+
+# --- the JIT smoke fixture ------------------------------------------------------
+# The gate compares its stdout to one exact line. Run under node here (no mac
+# binary on this box): proves the fixture is valid, self-checking and prints
+# exactly that line. The Air runs it under the signed oam.
+it "jit-smoke.js runs to the one line the gate expects"
+if command -v node >/dev/null 2>&1; then
+  eq "$(node scripts/fixtures/jit-smoke.js 2>&1)" "jit smoke ok"
+else
+  skip "no node on this host"
+fi
+
+# --- hash hand-back -------------------------------------------------------------
+MS_HB="$MS/handback"; mkdir -p "$MS_HB/art"
+printf 'arm64 bytes' > "$MS_HB/art/oam-aarch64-apple-darwin"
+printf 'x64 bytes' > "$MS_HB/art/oam-x86_64-apple-darwin"
+( cd "$MS_HB/art" && sha256sum oam-aarch64-apple-darwin oam-x86_64-apple-darwin ) > "$MS_HB/good.txt"
+ms_hb(){ ms mac_handback_check "$@"; }
+ms_hb "$MS_HB/good.txt" "$MS_HB/art" oam-aarch64-apple-darwin oam-x86_64-apple-darwin
+it "hand-back: pulled binaries that match the Air's hashes pass"
+eq "$MS_RC" "0"
+
+MS_BAD=""
+sed 's/  oam-/ *oam-/' "$MS_HB/good.txt" > "$MS_HB/binmode.txt"
+ms_hb "$MS_HB/binmode.txt" "$MS_HB/art" oam-aarch64-apple-darwin oam-x86_64-apple-darwin
+[ "$MS_RC" = "0" ] || MS_BAD="$MS_BAD [binary-mode '*name' rejected: $MS_ERR]"
+grep aarch64 "$MS_HB/good.txt" > "$MS_HB/one.txt"
+ms_hb "$MS_HB/one.txt" "$MS_HB/art" oam-aarch64-apple-darwin oam-x86_64-apple-darwin
+[ "$MS_RC" != "0" ] || MS_BAD="$MS_BAD [an entry missing passed]"
+ms_hb "$MS_HB/good.txt" "$MS_HB/art" oam-aarch64-apple-darwin
+[ "$MS_RC" != "0" ] || MS_BAD="$MS_BAD [an unexpected entry passed]"
+: > "$MS_HB/empty.txt"
+ms_hb "$MS_HB/empty.txt" "$MS_HB/art" oam-aarch64-apple-darwin
+[ "$MS_RC" != "0" ] || MS_BAD="$MS_BAD [an empty hand-back passed]"
+printf 'x64 bytez' > "$MS_HB/art/oam-x86_64-apple-darwin"
+ms_hb "$MS_HB/good.txt" "$MS_HB/art" oam-aarch64-apple-darwin oam-x86_64-apple-darwin
+if [ "$MS_RC" = "0" ] || ! grep -qF 'oam-x86_64-apple-darwin(mac=' <<<"$MS_ERR"; then MS_BAD="$MS_BAD [a changed byte passed or was not named: $MS_ERR]"; fi
+it "hand-back: a changed byte, a missing or extra entry, or an empty file fails; '*name' is accepted"
+if [ -z "$MS_BAD" ]; then pass; else fail "$MS_BAD"; fi
+
+# --- placement: between cp and smoke, darwin only -------------------------------
+# On the code (comments stripped by sg_line), per function: the bytes that
+# ship are signed, then verified, then JIT-smoked, all before the plain smoke
+# -- and on the shared build_host_release only inside the darwin case.
+MS_FN="$MS/fn"
+ms_fn(){ awk -v f="$1() {" '$0 == f { p = 1 } p { print } p && /^}$/ { exit }' scripts/build-remote.sh > "$MS_FN"; }
+
+# "  smoke" with its indent: `jit_smoke "dist/..."` contains `smoke "dist/..."`.
+it "build_host_release: cp < darwin guard < sign < verify < JIT smoke < smoke"
+ms_fn build_host_release
+sg_order "$MS_FN" 'cp "target/release/oam${ext}" "dist/oam-${triple}${ext}"' '*apple-darwin)' 'mac_signing_ready' \
+  'mac_sign_binary "dist/oam-${triple}"' 'mac_verify_binary "dist/oam-${triple}"' 'jit_smoke "dist/oam-${triple}"' \
+  '  smoke "dist/oam-${triple}${ext}"'
+
+# The Linux leg shares build_host_release: every signing call sits inside the
+# darwin arm of the case, and nowhere else in the function.
+it "build_host_release: the signing calls are inside the *apple-darwin) arm only"
+MS_ARM="$(awk '/^[[:space:]]*\*apple-darwin\)$/ { p = 1 } p { print } p && /^[[:space:]]*;;$/ { exit }' "$MS_FN")"
+MS_ALL="$(grep -cE 'mac_signing_ready|mac_sign_binary|mac_verify_binary|jit_smoke' "$MS_FN")"
+MS_IN="$(grep -cE 'mac_signing_ready|mac_sign_binary|mac_verify_binary|jit_smoke' <<<"$MS_ARM")"
+if [ "$MS_IN" = "4" ] && [ "$MS_ALL" = "4" ]; then pass; else fail "in the darwin arm: $MS_IN of 4; in the function: $MS_ALL"$'\n'"$MS_ARM"; fi
+
+it "build_mac_x64: cp < sign < verify < JIT smoke < smoke"
+ms_fn build_mac_x64
+sg_order "$MS_FN" 'cp "target/x64-host/x86_64-apple-darwin/release/oam" "dist/oam-x86_64-apple-darwin"' \
+  'mac_sign_binary "dist/oam-x86_64-apple-darwin"' 'mac_verify_binary "dist/oam-x86_64-apple-darwin"' \
+  'jit_smoke "dist/oam-x86_64-apple-darwin"' '  smoke "dist/oam-x86_64-apple-darwin"'
+
+it "mac-release: drop a stale hand-back, prove signing first, write the hand-back last"
+awk '/^  mac-release\)$/ { p = 1 } p { print } p && /^    ;;$/ { exit }' scripts/build-remote.sh > "$MS_FN"
+sg_order "$MS_FN" 'rm -f dist/mac-sha256.txt' 'mac_signing_ready' 'remote_prep' 'build_host_release' 'build_mac_x64' 'write_mac_hashes'
+
+# The real build-remote.sh `build` dispatch, end to end, against stubs: rustc
+# names the triple, cargo "builds" a stand-in oam (a script that logs and
+# answers), codesign logs. The order on the shared log is the order the leg
+# ran things in. HOME is a fixture so the host's own ~/.cargo/env cannot put a
+# real cargo ahead of the stub.
+MS_BR="$MS/br"
+mkdir -p "$MS_BR/scripts/lib" "$MS_BR/scripts/fixtures" "$MS_BR/scripts/macos" "$MS_BR/home" "$MS_BR/bin"
+cp scripts/build-remote.sh "$MS_BR/scripts/"
+cp scripts/lib/mac-signing.sh "$MS_BR/scripts/lib/"
+cp scripts/fixtures/jit-smoke.js "$MS_BR/scripts/fixtures/"
+cp scripts/macos/oam.entitlements.plist "$MS_BR/scripts/macos/"
+cp "$MS/bin/codesign" "$MS/bin/security" "$MS_BR/bin/"
+cat > "$MS_BR/oam-stub" <<EOF
+#!/bin/bash
+echo "oam \$*" >> "$MS_LOG"
+case "\$2" in *jit-smoke.js) echo "jit smoke ok" ;; *) echo "ci smoke 42" ;; esac
+EOF
+cat > "$MS_BR/bin/cargo" <<EOF
+#!/bin/bash
+mkdir -p target/release && cp "$MS_BR/oam-stub" target/release/oam && chmod +x target/release/oam
+EOF
+chmod +x "$MS_BR/bin/cargo" "$MS_BR/oam-stub"
+ms_br(){  # ms_br <triple> [env...] -- run the build dispatch; MS_RC, MS_ERR
+  printf '#!/bin/bash\necho "host: %s"\n' "$1" > "$MS_BR/bin/rustc"; chmod +x "$MS_BR/bin/rustc"
+  shift
+  ms_reset
+  ( cd "$MS_BR" && rm -rf dist target
+    echo '# bootstrap: no pin' > scripts/mac-signing-identity.sha1
+    env HOME="$MS_BR/home" PATH="$MS_BR/bin:$PATH" "$@" bash scripts/build-remote.sh build ) >"$MS/br-out" 2>&1
+  MS_RC=$?
+  MS_ERR="$(cat "$MS/br-out")"
+}
+
+ms_br aarch64-apple-darwin
+it "build on a darwin host: signs, verifies and JIT-smokes the staged binary, then smokes it"
+MS_SIGN="$(grep -n '^codesign --force --sign - .*dist/oam-aarch64-apple-darwin$' "$MS_LOG" | head -1 | cut -d: -f1)"
+MS_VER="$(grep -n '^codesign --verify --strict' "$MS_LOG" | head -1 | cut -d: -f1)"
+MS_JIT="$(grep -n '^oam run scripts/fixtures/jit-smoke.js$' "$MS_LOG" | head -1 | cut -d: -f1)"
+MS_SMK="$(grep -n '^oam run .*smoke\.js$' "$MS_LOG" | grep -v jit-smoke | head -1 | cut -d: -f1)"
+if [ "$MS_RC" = "0" ] && [ -n "$MS_SIGN" ] && [ -n "$MS_VER" ] && [ -n "$MS_JIT" ] && [ -n "$MS_SMK" ] \
+   && [ "$MS_SIGN" -lt "$MS_VER" ] && [ "$MS_VER" -lt "$MS_JIT" ] && [ "$MS_JIT" -lt "$MS_SMK" ]; then pass
+else fail "rc=$MS_RC sign@${MS_SIGN:-none} verify@${MS_VER:-none} jit@${MS_JIT:-none} smoke@${MS_SMK:-none} log: $(cat "$MS_LOG") out: $MS_ERR"; fi
+
+ms_br x86_64-unknown-linux-gnu
+it "build on a linux host: no codesign, no JIT smoke -- the Linux leg is untouched"
+if [ "$MS_RC" = "0" ] && ! grep -q '^codesign' "$MS_LOG" && ! grep -q 'jit-smoke' "$MS_LOG" \
+   && grep -q '^oam run .*smoke\.js$' "$MS_LOG"; then pass
+else fail "rc=$MS_RC log: $(cat "$MS_LOG") out: $MS_ERR"; fi
+
+ms_br aarch64-apple-darwin OAM_SIGN_REQUIRED=1
+it "build on a darwin host under OAM_SIGN_REQUIRED=1 with no pin fails, and nothing smokes"
+if [ "$MS_RC" != "0" ] && grep -qF 'OAM_SIGN_REQUIRED=1 but' <<<"$MS_ERR" && ! grep -q '^oam ' "$MS_LOG"; then pass
+else fail "rc=$MS_RC log: $(cat "$MS_LOG") out: $MS_ERR"; fi
+
+# --- the release box side ---------------------------------------------------------
+it "the mac-release ssh line forwards OAM_SKIP_MAC_X64, OAM_SIGN_REQUIRED and OAM_SKIP_MAC_SIGN"
+MS_SSH="$(grep -v '^[[:space:]]*#' scripts/build-platforms-tailnet.sh | grep -F 'bash scripts/build-remote.sh mac-release')"
+MS_MISS=""
+for want in 'OAM_SKIP_MAC_X64=$SKIP_MAC_X64' 'OAM_SIGN_REQUIRED=$SIGN_REQUIRED' 'OAM_SKIP_MAC_SIGN=$SKIP_MAC_SIGN'; do
+  grep -qF -- "$want" <<<"$MS_SSH" || MS_MISS="$MS_MISS $want"
+done
+if [ -z "$MS_MISS" ] && [ "$(wc -l <<<"$MS_SSH" | tr -d ' ')" = "1" ]; then pass; else fail "missing:$MS_MISS line: $MS_SSH"; fi
+
+it "the hand-back is pulled beside the artifacts, then checked before the artifact dir is handed out"
+sg_order scripts/build-platforms-tailnet.sh 'HANDBACK_DIR="$STAGE_DIR/handback"' \
+  'pull "$hp" "dist/mac-sha256.txt" "$HANDBACK_DIR/"' 'mac_handback_check "$HANDBACK_DIR/mac-sha256.txt" "$ARTIFACTS_DIR"' \
+  'echo "$ARTIFACTS_DIR"'
+
+it "release-local.sh copies the two exact mac asset names, never a glob"
+MS_RL="$(grep -v '^[[:space:]]*#' scripts/release-local.sh)"
+if grep -qF 'cp "$MAC_ART/oam-aarch64-apple-darwin" "$RELEASE_DIR/"' <<<"$MS_RL" \
+   && grep -qF 'cp "$MAC_ART/oam-x86_64-apple-darwin" "$RELEASE_DIR/"' <<<"$MS_RL" \
+   && ! grep -qF 'apple-darwin*' <<<"$MS_RL"; then pass
+else fail "$(grep -n 'MAC_ART' scripts/release-local.sh)"; fi
+
+# The preflight, run for real from a fixture checkout (its own pin file) with
+# ssh replaced: the host probe (`true`) succeeds, and `bash -s -- --check`
+# answers from fixture files and keeps the stdin it was handed, which must be
+# the checkout's provision script. scp and mktemp record and fail, as above:
+# a preflight that went on to stage or sync is caught.
+MS_TN="$MS/tn"
+mkdir -p "$MS_TN/scripts/lib" "$MS_TN/bin" "$MS_TN/tmp"
+cp scripts/build-platforms-tailnet.sh scripts/provision-mac-signing.sh "$MS_TN/scripts/"
+cp scripts/lib/src-sync.sh scripts/lib/iap-helpers.sh scripts/lib/tailnet-helpers.sh scripts/lib/mac-signing.sh "$MS_TN/scripts/lib/"
+: > "$MS_TN/key"
+cat > "$MS_TN/bin/ssh" <<EOF
+#!/bin/bash
+case " \$* " in
+  *" --check "*)
+    echo check >> "$MS_TN/calls"
+    cat > "$MS_TN/check-stdin"
+    cat "$MS_TN/check-out"
+    exit "\$(cat "$MS_TN/check-rc")" ;;
+  *) echo probe >> "$MS_TN/calls"; exit 0 ;;
+esac
+EOF
+for t in scp mktemp; do printf '#!/bin/bash\necho %s >> "%s/calls"\nexit 98\n' "$t" "$MS_TN" > "$MS_TN/bin/$t"; done
+chmod +x "$MS_TN/bin/ssh" "$MS_TN/bin/scp" "$MS_TN/bin/mktemp"
+ms_tn(){  # ms_tn <pin-line> [env...] -- --preflight-only; MS_OUT, MS_ERR, MS_RC, MS_CALLS
+  { echo '# fixture'; [ -z "$1" ] || echo "$1"; } > "$MS_TN/scripts/mac-signing-identity.sha1"
+  shift
+  : > "$MS_TN/calls"
+  MS_OUT="$(env PATH="$MS_TN/bin:$PATH" TMPDIR="$MS_TN/tmp" OAM_MAC_KEY="$MS_TN/key" \
+    OAM_MAC_HOST=100.90.0.5 OAM_MAC_USER=builder "$@" \
+    bash "$MS_TN/scripts/build-platforms-tailnet.sh" --preflight-only 2>"$MS/tn-err")"
+  MS_RC=$?
+  MS_ERR="$(cat "$MS/tn-err")"
+  MS_CALLS="$(tr '\n' ' ' < "$MS_TN/calls")"
+}
+printf 'keychain=/k\nsha1=%s\n' "$MS_PIN_A" > "$MS_TN/check-out"; echo 0 > "$MS_TN/check-rc"
+
+ms_tn "" OAM_SIGN_REQUIRED=1
+it "preflight: OAM_SIGN_REQUIRED=1 with no pin fails before touching the Air"
+if [ "$MS_RC" != "0" ] && [ -z "$MS_OUT" ] && [ -z "$MS_CALLS" ] && grep -qF 'holds no SHA-1 yet' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC out='$MS_OUT' calls='$MS_CALLS' stderr: $MS_ERR"; fi
+
+ms_tn "" OAM_SKIP_MAC_SIGN=maybe
+it "preflight: a signing knob that is not 0 or 1 fails before touching the Air"
+if [ "$MS_RC" != "0" ] && [ -z "$MS_CALLS" ] && grep -qF "OAM_SKIP_MAC_SIGN must be 0 or 1, not 'maybe'" <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC calls='$MS_CALLS' stderr: $MS_ERR"; fi
+
+ms_tn ""
+it "preflight: bootstrap warns ad-hoc and asks the Air nothing about signing"
+if [ "$MS_RC" = "0" ] && [ -z "$MS_OUT" ] && [ "$MS_CALLS" = "probe " ] && grep -qF 'signed AD-HOC' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC out='$MS_OUT' calls='$MS_CALLS' stderr: $MS_ERR"; fi
+
+ms_tn "$MS_PIN_A"
+it "preflight: a pin runs this checkout's provision --check on the Air, stdout stays silent"
+if [ "$MS_RC" = "0" ] && [ -z "$MS_OUT" ] && [ "$MS_CALLS" = "probe check " ] \
+   && cmp -s "$MS_TN/check-stdin" scripts/provision-mac-signing.sh \
+   && grep -qF "mac signing identity $MS_PIN_A is usable" <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC out='$MS_OUT' calls='$MS_CALLS' stderr: $MS_ERR"; fi
+
+printf 'keychain=/k\nsha1=%s\n' "$MS_PIN_B" > "$MS_TN/check-out"
+ms_tn "$MS_PIN_A"
+it "preflight: an Air holding another certificate fails"
+if [ "$MS_RC" != "0" ] && [ -z "$MS_OUT" ] && grep -qF "the Air signs with certificate '$MS_PIN_B' but this checkout pins $MS_PIN_A" <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC out='$MS_OUT' stderr: $MS_ERR"; fi
+
+echo 1 > "$MS_TN/check-rc"
+ms_tn "$MS_PIN_A"
+it "preflight: an identity --check rejects fails the preflight"
+if [ "$MS_RC" != "0" ] && [ -z "$MS_OUT" ] && grep -qF "the pinned mac signing identity $MS_PIN_A is not usable" <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC out='$MS_OUT' stderr: $MS_ERR"; fi
+
+ms_tn "$MS_PIN_A" OAM_SKIP_MAC_SIGN=1 OAM_SIGN_REQUIRED=1
+it "preflight: OAM_SKIP_MAC_SIGN=1 skips the identity check even under OAM_SIGN_REQUIRED=1, loudly"
+if [ "$MS_RC" = "0" ] && [ "$MS_CALLS" = "probe " ] && grep -qF 'even though OAM_SIGN_REQUIRED=1' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC calls='$MS_CALLS' stderr: $MS_ERR"; fi
+
+# --- provision-mac-signing.sh --check, piped the way the preflight pipes it -----
+# uname says Darwin; security and codesign are stubs, and the security stub
+# DRAINS its stdin, as a command that prompted would. Piped to `bash -s`, a
+# script whose top level ran commands could lose its own remainder that way;
+# this one is functions plus a final `main "$@"`, so it is parsed whole first.
+MS_PV="$MS/pv"
+mkdir -p "$MS_PV/bin" "$MS_PV/home/.oam-signing"
+printf '#!/bin/bash\necho Darwin\n' > "$MS_PV/bin/uname"
+cat > "$MS_PV/bin/security" <<EOF
+#!/bin/bash
+cat > /dev/null
+case "\$1" in
+  find-certificate) printf 'keychain: "x"\nSHA-1 hash: %s\n' "\$(tr 'a-f' 'A-F' < "$MS_PV/kc-sha")" ;;
+esac
+exit 0
+EOF
+printf '#!/bin/bash\ncat > /dev/null\nexit 0\n' > "$MS_PV/bin/codesign"
+chmod +x "$MS_PV/bin/uname" "$MS_PV/bin/security" "$MS_PV/bin/codesign"
+: > "$MS_PV/home/.oam-signing/oam-codesign.keychain-db"
+printf 'pw' > "$MS_PV/home/.oam-signing/oam-codesign.keychain-password"
+printf '%s\n' "$MS_PIN_A" > "$MS_PV/home/.oam-signing/oam-codesign.sha1"
+ms_pv(){  # ms_pv <args...> -- the provision script on stdin; MS_OUT, MS_RC, MS_ERR
+  MS_OUT="$(env HOME="$MS_PV/home" PATH="$MS_PV/bin:$PATH" bash -s -- "$@" < scripts/provision-mac-signing.sh 2>"$MS/pv-err")"
+  MS_RC=$?
+  MS_ERR="$(cat "$MS/pv-err")"
+}
+printf '%s' "$MS_PIN_A" > "$MS_PV/kc-sha"
+ms_pv --check
+it "provision --check over stdin: survives a stdin-draining tool, prints keychain= and the lowercase sha1="
+eq "rc=$MS_RC $MS_OUT" "rc=0 keychain=$MS_PV/home/.oam-signing/oam-codesign.keychain-db"$'\n'"sha1=$MS_PIN_A"
+
+printf '%s' "$MS_PIN_B" > "$MS_PV/kc-sha"
+ms_pv --check
+it "provision --check: a keychain certificate that is not the one recorded fails"
+if [ "$MS_RC" != "0" ] && [ -z "$MS_OUT" ] && grep -qF "keychain identity $MS_PIN_B does not match recorded fingerprint $MS_PIN_A" <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC out='$MS_OUT' stderr: $MS_ERR"; fi
+
+ms_pv --generate
+it "provision --generate refuses an existing identity and deletes nothing"
+if [ "$MS_RC" != "0" ] && grep -qF 'an identity already exists' <<<"$MS_ERR" \
+   && [ -f "$MS_PV/home/.oam-signing/oam-codesign.keychain-db" ] && [ -f "$MS_PV/home/.oam-signing/oam-codesign.keychain-password" ]; then pass
+else fail "rc=$MS_RC stderr: $MS_ERR"; fi
 
 # =============================================================================
 group "tap-verify.sh -- what a published tap actually serves"
