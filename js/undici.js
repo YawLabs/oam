@@ -28,6 +28,11 @@
 //    same way: each origin's dispatcher from it decides that origin's
 //    connections. (See the Dispatcher constructor's _oamConnect bridge and
 //    globalThis.fetch's connector mode.)
+//  - `allowH2` (the dispatcher's own option, or `connect.allowH2`, which wins
+//    as in undici) IS honored: the connections the request opens to an https
+//    origin offer ALPN `http/1.1, h2` and speak HTTP/2 when the origin picks
+//    it. Without it they offer `http/1.1` alone, as undici's do by default
+//    -- node's fetch never speaks HTTP/2 unless asked (#176).
 //  - A Dispatcher/Agent with a `connect.lookup` hook IS honored, as undici
 //    honors it: the hook is called before the fetch connects to a host name
 //    -- the first request AND every redirect hop to another host -- and the
@@ -1006,13 +1011,21 @@
         //    0 none). undici builds its connector from
         //    `{ timeout: connectTimeout, ...connect }`, so `connect.timeout`
         //    wins over `connectTimeout` (measured on undici 6.24.1).
+        //  - `_oamAllowH2`, undici's `allowH2` for those connections: they
+        //    offer ALPN `http/1.1, h2` instead of `http/1.1` alone. undici's
+        //    Client hands its connector `{ allowH2, ...connect }`, so a
+        //    `connect.allowH2` -- false included -- wins over the option, and
+        //    the connector tests the value for truthiness (measured on node
+        //    v22.22.2 + undici 6.24.1).
         this._oamConnect = null;
         this._oamConnectLookup = null;
         this._oamConnectTimeout = null;
         const connectOptions = {
           timeout: this._options.connectTimeout,
+          allowH2: this._options.allowH2,
           ...(typeof connect === "object" ? connect : null),
         };
+        this._oamAllowH2 = !!connectOptions.allowH2;
         if (typeof connect === "function") {
           this._oamConnect = connect;
         } else if (connect && Object.keys(connect).some((key) => !LOOKUP_ROUTE_KEYS.has(key))) {
@@ -1122,7 +1135,8 @@
             ? dispatcher._oamConnectLookup
             : undefined;
           const timeout = dispatcher._oamConnectTimeout ?? undefined;
-          connect = buildConnector(lookup ? { lookup, timeout } : { timeout });
+          const allowH2 = dispatcher._oamAllowH2 === true;
+          connect = buildConnector(lookup ? { lookup, timeout, allowH2 } : { timeout, allowH2 });
           builtConnectors.set(dispatcher, connect);
         }
         connect(params, cb);

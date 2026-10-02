@@ -54,7 +54,7 @@ use super::decode::{self, MAX_CODINGS, Plan};
 use super::prepare::{self, PrepareError};
 use super::redirect::{self, Next};
 use super::sent::Dispatched;
-use super::tls_config::TlsRange;
+use super::tls_config::{Alpn, TlsRange};
 use super::transport::{channel_body, channel_body_then, empty_body, full_body};
 use super::{HttpTransport, NetCheck, NetTarget, ReqBody, Route};
 use crate::OpOutcome;
@@ -148,6 +148,12 @@ pub struct FetchRequest {
     pub tls_min_version: Option<String>,
     #[serde(default)]
     pub tls_max_version: Option<String>,
+    /// For an https URL, what the handshake offers by ALPN: `"http1"`
+    /// (absent: undici's `http/1.1`, for `fetch` and `undici.request`),
+    /// `"allow_h2"` (a dispatcher with undici's `allowH2`) or `"none"`
+    /// (`https.request`, which offers nothing in node). See [`Alpn`].
+    #[serde(default)]
+    pub alpn: Alpn,
     /// Handle of a [`super::sent`] signal to fire once the request has a
     /// connection: `http.request`'s, for node's `'finish'` (#193).
     #[serde(default)]
@@ -526,6 +532,7 @@ pub async fn fetch(
         transport
             .route(req.lookup_hook, attempt_timeout, tls_range)
             .with_connect_timeout(connect_timeout_from_ms(req.connect_timeout_ms))
+            .with_alpn(req.alpn)
     };
     let headers_timeout = timeout_limit(req.headers_timeout_ms);
     let dispatched = match req.dispatched {
@@ -1048,10 +1055,13 @@ fn latin1(bytes: &[u8]) -> String {
 /// `statusText` / `statusMessage`: the one the server sent, an empty one
 /// included (#160). hyper keeps a phrase that is not the status code's
 /// canonical one as an extension, so without the extension the canonical
-/// phrase IS what was on the wire. HTTP/2 has no reason phrase, and node has
-/// no answer to copy (its fetch never negotiates h2): the canonical phrase
-/// stands in there.
+/// phrase IS what was on the wire. HTTP/2 has no reason phrase, and node's
+/// fetch over it -- a dispatcher with `allowH2` -- reports `''` (measured on
+/// v22.22.2 + undici 6.24.1).
 pub(super) fn reason_phrase<B>(response: &http::Response<B>) -> String {
+    if response.version() == http::Version::HTTP_2 {
+        return String::new();
+    }
     match response.extensions().get::<hyper::ext::ReasonPhrase>() {
         Some(reason) => latin1(reason.as_bytes()),
         None => response

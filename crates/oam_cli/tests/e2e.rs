@@ -10918,27 +10918,35 @@ server.close();
 /// fetch's default request headers over https (#178): undici's
 /// `accept-encoding` there is `br, gzip, deflate` (oam decodes br since
 /// #151), and the rest of its defaults go out as over http. Against an
-/// HTTP/1.1 server, and against an h2 server, which oam's fetch negotiates
-/// (node's does not): there the `connection` default must not break the
-/// request -- HTTP/2 has no such header, and the transport drops it.
+/// HTTP/1.1 server, and against an h2 server with allowHTTP1, which a plain
+/// fetch reaches over HTTP/1.1 as node's does (it offers ALPN `http/1.1`
+/// alone, #176) -- and which a dispatcher with `allowH2` reaches over h2:
+/// there the `connection` default must not break the request -- HTTP/2 has
+/// no such header, and the transport drops it, as undici's h2 client does.
+/// Every line was measured on node v22.22.2 + undici 6.24.1. (An empty
+/// `POST` over h2 is left out: node sends it without the `content-length:
+/// 0` it sends over HTTP/1.1, and oam with it; docs/node-divergences.md.)
 #[test]
 fn fetch_https_sends_undici_default_headers() {
     let bundle = write_temp("fetch-https-defaults/ca.pem", TLS_TEST_CA_CERT);
     let src = r#"import https from 'node:https';
 import http2 from 'node:http2';
+import { Agent } from 'undici';
 const names = ['accept-encoding', 'accept-language', 'sec-fetch-mode', 'connection', 'content-length'];
 const echo = (req, res) => res.end(req.httpVersion + ' ' + names.map((n) => n + '=' + (req.headers[n] ?? '-')).join(' '));
 const h1 = https.createServer({ cert: `__CERT__`, key: `__KEY__` }, echo);
 const h2 = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__`, allowHTTP1: true }, echo);
-// fetch's pool keeps its h2 session open, and an http2 server's close()
-// waits for every session: end them, so the run can exit.
+// An allowH2 fetch's pool keeps its h2 session open, and an http2 server's
+// close() waits for every session: end them, so the run can exit.
 const sessions = new Set();
 h2.on('session', (session) => sessions.add(session));
-for (const [label, server] of [['h1', h1], ['h2', h2]]) {
+const allowH2 = new Agent({ allowH2: true });
+for (const [label, server, dispatcher] of [['h1', h1], ['h2', h2], ['h2 allowH2', h2, allowH2]]) {
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const url = `https://localhost:${server.address().port}/`;
-  console.log(label, 'GET', await (await fetch(url)).text());
-  console.log(label, 'POST', await (await fetch(url, { method: 'POST' })).text());
+  console.log(label, 'GET', await (await fetch(url, { dispatcher })).text());
+  const post = dispatcher ? { method: 'POST', body: 'abc', dispatcher } : { method: 'POST' };
+  console.log(label, 'POST', await (await fetch(url, post)).text());
   server.close();
 }
 for (const session of sessions) session.destroy();
@@ -10955,8 +10963,10 @@ for (const session of sessions) session.destroy();
         stdout.trim().replace("\r\n", "\n"),
         "h1 GET 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=-\n\
          h1 POST 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=0\n\
-         h2 GET 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=-\n\
-         h2 POST 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=0",
+         h2 GET 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=-\n\
+         h2 POST 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=0\n\
+         h2 allowH2 GET 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=-\n\
+         h2 allowH2 POST 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=3",
         "stderr: {stderr}"
     );
 }
@@ -27850,15 +27860,18 @@ for (const allowHTTP1 of [false, true]) {
     );
 }
 
-/// oam's own fetch negotiates h2 by ALPN with http2.createSecureServer and
-/// is served over HTTP/2 through the compatibility API (the server trusts
-/// nothing but its own key; the client trusts the test CA through
-/// NODE_EXTRA_CA_CERTS -- on macOS too, see
-/// fetch_https_trusts_node_extra_ca_certs).
+/// A fetch whose dispatcher has undici's `allowH2` negotiates h2 by ALPN
+/// with http2.createSecureServer and is served over HTTP/2 through the
+/// compatibility API (the server trusts nothing but its own key; the client
+/// trusts the test CA through NODE_EXTRA_CA_CERTS -- on macOS too, see
+/// fetch_https_trusts_node_extra_ca_certs). A plain fetch offers
+/// `http/1.1` alone, which this server (no allowHTTP1) refuses in the
+/// handshake, as node's does (#176; measured on v22.22.2 + undici 6.24.1).
 #[test]
-fn http2_secure_server_serves_fetch_over_h2() {
+fn http2_secure_server_serves_an_allow_h2_fetch_over_h2() {
     let bundle = write_temp("h2-secure-extra-ca/ca.pem", TLS_TEST_CA_CERT);
     let src = r#"import http2 from 'node:http2';
+import { Agent } from 'undici';
 const seen = [];
 const server = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__` }, (req, res) => {
   seen.push(req.httpVersion + ' ' + req.method + ' ' + req.url + ' alpn=' + req.socket.alpnProtocol);
@@ -27872,9 +27885,16 @@ const server = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__` }, (r
 server.on('session', (session) => seen.push('session alpn=' + session.alpnProtocol + ' encrypted=' + session.encrypted));
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const port = server.address().port;
-const a = await fetch(`https://localhost:${port}/one`);
+try {
+  await fetch(`https://localhost:${port}/plain`);
+  console.log('plain fetch served');
+} catch (e) {
+  console.log('plain fetch', e.message, e.cause && e.cause.code);
+}
+const dispatcher = new Agent({ allowH2: true });
+const a = await fetch(`https://localhost:${port}/one`, { dispatcher });
 console.log(a.status, a.headers.get('content-type'), await a.text());
-const b = await fetch(`https://localhost:${port}/two`, { method: 'POST', body: 'posted' });
+const b = await fetch(`https://localhost:${port}/two`, { method: 'POST', body: 'posted', dispatcher });
 console.log(b.status, await b.text());
 server.close();
 for (const line of seen) console.log(line);
@@ -27890,12 +27910,79 @@ process.exit(0);
     let (stdout, stderr) = run_script_ok(&script, out);
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
-        "200 text/plain h2 says hi\n\
+        "plain fetch fetch failed ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL\n\
+         200 text/plain h2 says hi\n\
          200 h2 says posted\n\
          session alpn=h2 encrypted=true\n\
          2.0 GET /one alpn=h2\n\
          2.0 POST /two alpn=h2",
         "stderr: {stderr}"
+    );
+}
+
+/// What each https client offers by ALPN, against an h2-capable origin
+/// (http2.createSecureServer with allowHTTP1): undici -- fetch,
+/// undici.request, undici.fetch -- offers `http/1.1` alone and is served
+/// over HTTP/1.1, unless its dispatcher sets `allowH2` (the option, or
+/// `connect.allowH2`, which wins over it even when false; the global
+/// dispatcher too), which offers `http/1.1, h2` and is served over HTTP/2.
+/// The first HTTP/2 connection prints undici's experimental warning, once.
+/// Every line was measured on node v22.22.2 + undici 6.24.1 (#176). The
+/// node-only clients -- fetch and https.request without undici -- are
+/// conformance case 350.
+#[test]
+fn https_clients_offer_what_nodes_offer_by_alpn() {
+    let bundle = write_temp("alpn-offers/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import http2 from 'node:http2';
+import { Agent, request, fetch as undiciFetch, setGlobalDispatcher } from 'undici';
+const server = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__`, allowHTTP1: true }, (req, res) => {
+  res.end(req.httpVersion + ' ' + req.socket.alpnProtocol);
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `https://localhost:${server.address().port}/`;
+const viaFetch = async (label, init) => console.log(label + ': ' + await (await fetch(url, init)).text());
+const viaRequest = async (label, opts) => console.log(label + ': ' + await (await request(url, opts)).body.text());
+await viaFetch('fetch');
+await viaRequest('undici.request');
+console.log('undici.fetch: ' + await (await undiciFetch(url)).text());
+await viaFetch('fetch, Agent allowH2', { dispatcher: new Agent({ allowH2: true }) });
+await viaFetch('fetch, Agent connect.allowH2', { dispatcher: new Agent({ connect: { allowH2: true } }) });
+await viaFetch('fetch, Agent allowH2 with connect.allowH2 false', { dispatcher: new Agent({ allowH2: true, connect: { allowH2: false } }) });
+await viaRequest('undici.request, Agent allowH2', { dispatcher: new Agent({ allowH2: true }) });
+setGlobalDispatcher(new Agent({ allowH2: true }));
+await viaFetch('fetch, global Agent allowH2');
+console.log('undici.fetch, global Agent allowH2: ' + await (await undiciFetch(url)).text());
+await viaRequest('undici.request, global Agent allowH2');
+process.exit(0);
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("alpn_offers/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "fetch: 1.1 http/1.1\n\
+         undici.request: 1.1 http/1.1\n\
+         undici.fetch: 1.1 http/1.1\n\
+         fetch, Agent allowH2: 2.0 h2\n\
+         fetch, Agent connect.allowH2: 2.0 h2\n\
+         fetch, Agent allowH2 with connect.allowH2 false: 1.1 http/1.1\n\
+         undici.request, Agent allowH2: 2.0 h2\n\
+         fetch, global Agent allowH2: 2.0 h2\n\
+         undici.fetch, global Agent allowH2: 2.0 h2\n\
+         undici.request, global Agent allowH2: 2.0 h2",
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        stderr
+            .matches("[UNDICI-H2] Warning: H2 support is experimental, expect them to change at any time.")
+            .count(),
+        1,
+        "undici's warning, once: {stderr}"
     );
 }
 

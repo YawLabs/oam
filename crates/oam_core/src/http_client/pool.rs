@@ -53,13 +53,19 @@ use hyper_util::rt::TokioExecutor;
 
 use super::connector::{ConnCloser, ConnInfo, ConnStats, OamConnector};
 use super::sent::Dispatched;
+use super::tls_config::Alpn;
 use super::transport::HeadAwaitsBody;
 use super::{BoxError, ReqBody};
 
 /// The pool is keyed on scheme + authority exactly as hyper-util was, so a
 /// pooled connection is only ever reused for the origin it was opened to and
-/// `host` and `host:443` stay distinct.
-type PoolKey = (Scheme, Authority);
+/// `host` and `host:443` stay distinct -- and, for https, on the ALPN offer
+/// it was opened with: a request that offers `http/1.1` alone never rides
+/// an h2 connection an `allowH2` request opened to the same origin, and
+/// fetch and `https.request` keep to their own connections, as undici's pool
+/// and an https.Agent do in node. (An http origin offers nothing; its key
+/// carries [`Alpn::None`] whoever asks.)
+type PoolKey = (Scheme, Authority, Alpn);
 type H1Sender = http1::SendRequest<ReqBody>;
 type H2Sender = http2::SendRequest<ReqBody>;
 
@@ -152,13 +158,16 @@ impl Pool {
     /// `connect_timeout` bounds a connection this request has to open
     /// (`OamConnector::connect_within`); it is the request's own, so a fetch
     /// and an `http.request` sharing the pool each connect under theirs.
+    /// `alpn` is what a connection this request opens to an https origin
+    /// offers, and which pooled connections it may take.
     pub(crate) async fn request(
         &self,
         mut req: Request<ReqBody>,
         close_requested: bool,
         connect_timeout: Option<Duration>,
+        alpn: Alpn,
     ) -> Result<Response<Incoming>, PoolFail> {
-        let Some(key) = pool_key(req.uri()) else {
+        let Some(key) = pool_key(req.uri(), alpn) else {
             return Err(PoolFail {
                 error: PoolError::connect(Box::<dyn std::error::Error + Send + Sync>::from(
                     "request url has no scheme or authority",
@@ -357,7 +366,7 @@ impl Pool {
         let conn = self
             .connector
             .clone()
-            .connect_within(uri, connect_timeout)
+            .connect_within(uri, key.2, connect_timeout)
             .await?;
         let is_h2 = conn.negotiated_h2();
         let proxied = conn.is_proxied();
@@ -658,14 +667,21 @@ impl std::error::Error for PoolError {
     }
 }
 
-/// The pool key for a request URI: `(scheme, authority)`, as written.
-fn pool_key(uri: &Uri) -> Option<PoolKey> {
-    Some((uri.scheme()?.clone(), uri.authority()?.clone()))
+/// The pool key for a request URI: `(scheme, authority)`, as written, and the
+/// ALPN offer for an https one.
+fn pool_key(uri: &Uri, alpn: Alpn) -> Option<PoolKey> {
+    let scheme = uri.scheme()?;
+    let alpn = if *scheme == Scheme::HTTPS {
+        alpn
+    } else {
+        Alpn::None
+    };
+    Some((scheme.clone(), uri.authority()?.clone(), alpn))
 }
 
 /// `scheme://authority/` -- the dst the connector dials for `key` (hyper-util's
 /// `domain_as_uri`).
-fn domain_as_uri((scheme, authority): &PoolKey) -> Uri {
+fn domain_as_uri((scheme, authority, _): &PoolKey) -> Uri {
     Uri::builder()
         .scheme(scheme.clone())
         .authority(authority.clone())

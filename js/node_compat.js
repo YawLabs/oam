@@ -23519,6 +23519,10 @@
           // sent it: no `accept` / `user-agent` / `accept-encoding`, no
           // decoding, `content-encoding` and `content-length` intact.
           __oamRawExchange: true,
+          // ... and, for https, offers no ALPN, as node's https.Agent offers
+          // none: an h2-capable server answers it over HTTP/1.1, which is
+          // what res.httpVersion reports (#176).
+          __oamOfferNoAlpn: true,
           __oamSentSignal: signal,
           // What takes the request off the wire if it is aborted or
           // destroyed before its response (see _cancelBodyStream).
@@ -32496,6 +32500,7 @@
       const kSocket = Symbol("kSocket");
       const kServer = Symbol("kServer");
       const kOptions = Symbol("kOptions");
+      const kHttp1Conns = Symbol("kHttp1Conns");
       const kSession = Symbol("kSession");
       const kProxySocket = Symbol("kProxySocket");
       const kRequest = Symbol("kRequest");
@@ -33632,6 +33637,12 @@
           0, ms(server.timeout, 0), ms(server.connectionsCheckingInterval, 30000),
         ));
         takeOver(socket, served.connId);
+        // The server's HTTP/1.1 connections and how many of their requests
+        // are still being answered, for closeIdleConnections().
+        if (!server[kHttp1Conns]) server[kHttp1Conns] = new Map();
+        var conns = server[kHttp1Conns];
+        var conn = { open: 0 };
+        conns.set(socket, conn);
         (async () => {
           for (;;) {
             var meta = await natives.httpAccept(served.sessionId);
@@ -33644,8 +33655,18 @@
             var res = new http.ServerResponse(meta.requestId);
             req.res = res;
             res.req = req;
+            conn.open++;
+            var done = false;
+            var answered = function() {
+              if (done) return;
+              done = true;
+              conn.open--;
+            };
+            res.once("finish", answered);
+            res.once("close", answered);
             server.emit("request", req, res);
           }
+          conns.delete(socket);
           natives.httpClose(served.sessionId);
           if (!socket.destroyed) TLSSocketBase.prototype.destroy.call(socket);
         })();
@@ -33765,6 +33786,23 @@
             throw codes.ERR_INVALID_ARG_TYPE("settings", "Object", settings);
           }
           this[kOptions].settings = Object.assign({}, this[kOptions].settings, settings);
+        }
+        // node's close(): under allowHTTP1, httpServerPreClose first -- the
+        // HTTP/1.1 connections with no request open are closed, as an http
+        // server's close() closes them -- then tls.Server's close. A keep-alive
+        // client (fetch's pool) no longer holds the server, and the process,
+        // open until the client lets go.
+        close() {
+          if (this[kOptions].allowHTTP1 === true) this.closeIdleConnections();
+          return Reflect.apply(TLSServerBase.prototype.close, this, arguments);
+        }
+        // node's: an http server's closeIdleConnections() under allowHTTP1,
+        // over the HTTP/1.1 connections; nothing otherwise.
+        closeIdleConnections() {
+          if (this[kOptions].allowHTTP1 !== true || !this[kHttp1Conns]) return;
+          for (var [socket, conn] of [...this[kHttp1Conns]]) {
+            if (conn.open === 0 && !socket.destroyed) socket.destroy();
+          }
         }
       }
 

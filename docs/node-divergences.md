@@ -1977,9 +1977,8 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   (`conformance/cases/195-status-reason-phrase.mjs`; up to 0.17.1 oam's own transport
   reported the status code's canonical phrase). What differs: the parser under hyper
   drops a phrase carrying obs-text, so `200 caf\xe9` reads `''` on both client paths,
-  where Node's `statusMessage` is `café` and its `statusText` `caf�`. Over HTTP/2,
-  which has no reason phrase (and which Node's fetch never negotiates), `statusText` is
-  the status code's canonical phrase.
+  where Node's `statusMessage` is `café` and its `statusText` `caf�`. Over HTTP/2 (a
+  dispatcher with `allowH2`), which has no reason phrase, `statusText` is `''`, as in Node.
 - **A response nobody has read holds the request's `'close'`.** The request's `'close'`
   follows the response's `'end'` and `'close'` on a connection that is not kept, and comes
   between them on a kept-alive one, as in Node, on both client paths
@@ -2030,13 +2029,24 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   comma-joined line, and a method is uppercased only when it is one of `DELETE`, `GET`,
   `HEAD`, `OPTIONS`, `POST`, `PUT` -- `{method: 'patch'}` goes out as `patch`, as in Node.
   Over HTTP/2 (below) the transport drops `connection`, which h2 does not have.
-- **`fetch` negotiates HTTP/2 with an https origin; Node's `fetch` does not.** oam's origin
-  TLS handshake offers ALPN `h2, http/1.1` and speaks h2 to a server that selects it.
-  undici's `Client` defaults `allowH2` to `false` and Node's global dispatcher never turns it
-  on, so Node's `fetch` is HTTP/1.1 only. Anything a server does differently per protocol
-  version -- trailers, 1xx handling, per-version rate limits, request logs -- differs with
-  it. `http.request` in Node is h1-only as well. _(source: `tls_config.rs` ALPN list;
-  undici 6.24.1 `allowH2` default)_
+- **`fetch`, `undici.request` and `https.request` speak HTTP/1.1 to an https origin, as
+  Node's do** (#176; `conformance/cases/350-https-clients-alpn-offer.mjs`, e2e
+  `https_clients_offer_what_nodes_offer_by_alpn`). undici's connector -- `fetch`,
+  `undici.fetch`, `undici.request` -- offers ALPN `http/1.1` alone, and `https.request`'s
+  agent offers no ALPN at all, so an h2-capable server answers both over HTTP/1.1 and sees
+  `http/1.1` and `false`. Up to 0.17.1 oam's handshake offered `h2, http/1.1` to every
+  origin, so such a server served `fetch` over HTTP/2 -- and `https.request` too, whose
+  `res.httpVersion` still said `1.1`. Each client keeps to connections opened with its own
+  offer, as Node's separate pools do. A dispatcher with undici's `allowH2` -- the option, or
+  `connect.allowH2`, which wins over it even when `false` -- offers `http/1.1, h2`, as
+  undici's does, speaks HTTP/2 when the origin picks it, and prints undici's `[UNDICI-H2]`
+  experimental warning once. Over HTTP/2 the client is hyper's rather than undici's
+  experimental one, and two things differ there: a `POST` (or `PUT`, `PATCH`, ...) with no
+  body carries the `content-length: 0` it carries over HTTP/1.1, where undici's h2 client
+  sends none; and the warning comes with the first response that arrived over HTTP/2,
+  where undici prints it when it connects -- so a redirect chain whose only h2 hop is not
+  the last warns in Node alone. _(probed: Node v22.22.2 + undici 6.24.1 against
+  `http2.createSecureServer({ allowHTTP1: true })`)_
 - **Decoding** keeps its own entry: 32.
 
 **What a `fetch` refuses before it dials** (all matching Node, listed because a caller sees
@@ -2161,8 +2171,8 @@ The variables are read from the OS environment once per run, so assigning
 `REQUEST_METHOD` (a CGI environment) turns them all off for `fetch`. An http
 destination goes to the proxy in absolute form, with `proxy-authorization` from the proxy
 URL's credentials; an https destination goes through a `CONNECT` tunnel carrying those
-credentials and oam's `user-agent`, with h2 still negotiated with the origin inside it. The
-handshake with an `https://` proxy itself offers no ALPN. A refused or unresolvable proxy
+credentials and oam's `user-agent`, with the request's ALPN offer (above) going to the origin
+inside it. The handshake with an `https://` proxy itself offers no ALPN. A refused or unresolvable proxy
 fails with Node's connect error naming the proxy. A `socks` proxy URL is not supported and
 fails every request it applies to: `fetch` with `error sending request for url (...)`,
 `http.request` (under `NODE_USE_ENV_PROXY=1`) with `ECONNRESET` `socket hang up`.
@@ -2667,9 +2677,12 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
 - **`allowHTTP1` serves `http.IncomingMessage` / `http.ServerResponse`** whatever
   `Http1IncomingMessage` / `Http1ServerResponse` name, with the TLS socket as
   `req.socket`, and the HTTP/1 connection is held to the server's `headersTimeout` /
-  `requestTimeout` as they are when it connects. `server.close()` stops the listener and
-  leaves open HTTP/1 connections alone (Node also closes the idle ones), and there is no
-  `closeIdleConnections()`.
+  `requestTimeout` as they are when it connects. `server.close()` closes the idle HTTP/1
+  connections before it stops the listener, and `closeIdleConnections()` closes them on
+  demand, as Node's do (`conformance/cases/351-http2-secure-server-close-idle-http1.mjs`).
+  Up to 0.17.1 `close()` left them open and there was no `closeIdleConnections()`, so a
+  keep-alive client -- `fetch` among them, which reaches such a server over HTTP/1.1 since
+  #176 -- held `close()` until it let go.
 - **Keys rustls cannot sign with** -- DSA among them -- are refused at `createServer()`
   with `ERR_OSSL_UNSUPPORTED`.
 

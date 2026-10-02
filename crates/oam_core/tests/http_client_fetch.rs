@@ -470,20 +470,28 @@ async fn the_payload_names_the_connection_fresh_and_pooled() {
 }
 
 /// An https response carries the origin's TLS session too, in tls.connect's
-/// spelling, h2 included (the extra rides every stream of the connection).
+/// spelling, h2 included (the extra rides every stream of the connection) --
+/// for a fetch that offered h2 (`"alpn": "allow_h2"`, an undici dispatcher
+/// with `allowH2`).
 #[tokio::test(flavor = "multi_thread")]
 async fn the_payload_names_the_tls_session_over_h2() {
     within(async {
         let server = serve_h2_tls("ok").await;
         let reg = Reg::new();
         let url = format!("https://127.0.0.1:{}/", server.port);
-        let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+        let p = payload(
+            reg.fetch(&plain(), json!({ "url": url, "alpn": "allow_h2" }))
+                .await,
+        );
         assert_eq!(reg.text(handle_of(&p)).await, "ok");
         assert_eq!(p["socket"]["remoteAddr"]["address"], "127.0.0.1");
         assert_eq!(p["socket"]["remoteAddr"]["port"], server.port);
         assert!(p["socket"]["localAddr"]["port"].as_u64().unwrap() > 0);
         let tls = &p["tls"];
         assert_eq!(tls["alpnProtocol"], "h2", "{p}");
+        // HTTP/2 has no reason phrase: node's allowH2 fetch reports '' (not
+        // the canonical 'OK' a phrase-less HTTP/1.1 status line would get).
+        assert_eq!(p["statusText"], "", "{p}");
         assert!(
             tls["protocol"] == "TLSv1.3" || tls["protocol"] == "TLSv1.2",
             "{p}"
@@ -2486,8 +2494,11 @@ async fn h2_refused_stream_retry() {
         let (server, streams) = refusing_h2_origin().await;
         let url = format!("https://127.0.0.1:{}/", server.port);
         let p = payload(
-            reg.fetch(&t, json!({ "url": url, "method": "POST", "body": "abc" }))
-                .await,
+            reg.fetch(
+                &t,
+                json!({ "url": url, "method": "POST", "body": "abc", "alpn": "allow_h2" }),
+            )
+            .await,
         );
         assert_eq!(p["status"], 200);
         assert_eq!(reg.text(handle_of(&p)).await, "ok");
@@ -2504,7 +2515,7 @@ async fn h2_refused_stream_retry() {
         let text = failed(
             reg.fetch(
                 &t,
-                json!({ "url": url, "method": "POST", "body_stream": handle }),
+                json!({ "url": url, "method": "POST", "body_stream": handle, "alpn": "allow_h2" }),
             )
             .await,
         );
