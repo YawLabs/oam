@@ -1248,6 +1248,17 @@
   codes.ERR_HTTP_HEADERS_SENT = E("ERR_HTTP_HEADERS_SENT", Error, function(what) {
     return 'Cannot ' + what + ' headers after they are sent to the client';
   });
+  // The outgoing-header validators' errors (lib/_http_outgoing.js
+  // validateHeaderName / validateHeaderValue, checkInvalidHeaderChar).
+  codes.ERR_INVALID_HTTP_TOKEN = E("ERR_INVALID_HTTP_TOKEN", TypeError, function(name, token) {
+    return name + ' must be a valid HTTP token ["' + token + '"]';
+  });
+  codes.ERR_HTTP_INVALID_HEADER_VALUE = E("ERR_HTTP_INVALID_HEADER_VALUE", TypeError, function(value, name) {
+    return 'Invalid value "' + value + '" for header "' + name + '"';
+  });
+  codes.ERR_INVALID_CHAR = E("ERR_INVALID_CHAR", TypeError, function(name, field) {
+    return 'Invalid character in ' + name + (field !== undefined ? ' ["' + field + '"]' : '');
+  });
   // EventEmitter's emit('error', x) with no listener and an x that is not an
   // Error. `err` arrives already inspected (see emit); none at all is the
   // bare message.
@@ -23813,16 +23824,14 @@
     // node's checkIsHttpToken (lib/_http_common.js), and the two errors its
     // header checks throw.
     var HTTP_TOKEN = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
+    // node's errors, through `codes`: the per-code prototype, node's own-key
+    // order and the `[CODE]` in toString and the stack header.
     function invalidHttpToken(name, token) {
-      var err = new TypeError(name + " must be a valid HTTP token [\"" + token + "\"]");
-      err.code = "ERR_INVALID_HTTP_TOKEN";
-      return err;
+      return new codes.ERR_INVALID_HTTP_TOKEN(name, token);
     }
     // node's ERR_INVALID_CHAR: `Invalid character in <what>[ ["<field>"]]`.
     function invalidChar(what, field) {
-      var err = new TypeError("Invalid character in " + what + (field !== undefined ? " [\"" + field + "\"]" : ""));
-      err.code = "ERR_INVALID_CHAR";
-      return err;
+      return new codes.ERR_INVALID_CHAR(what, field);
     }
     function invalidHeaderChar(name) {
       return invalidChar("header content", name);
@@ -23847,11 +23856,7 @@
       }
     }
     function validateHeaderValue(name, value) {
-      if (value === undefined) {
-        var err = new TypeError("Invalid value \"undefined\" for header \"" + name + "\"");
-        err.code = "ERR_HTTP_INVALID_HEADER_VALUE";
-        throw err;
-      }
+      if (value === undefined) throw new codes.ERR_HTTP_INVALID_HEADER_VALUE(value, name);
       if (INVALID_HEADER_CHAR.test(value)) throw invalidHeaderChar(name);
     }
     function checkOutgoingHeader(name, value) {

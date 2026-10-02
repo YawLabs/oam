@@ -289,3 +289,29 @@ for (const [label, message] of [["OutgoingMessage", outgoing], ["ClientRequest",
   }
 }
 request.destroy();
+
+// The errors themselves are node's internal NodeErrors: the per-code
+// prototype (not TypeError.prototype), node's own-key order, and the code in
+// toString and in the stack header. oam built them as plain TypeErrors with
+// a code assigned.
+for (const [label, fn] of [
+  ["setHeader value with LF", () => new http.OutgoingMessage().setHeader("x", "a\nb")],
+  ["validateHeaderName('bad name')", () => http.validateHeaderName("bad name")],
+  ["setHeader('x') with no value", () => new http.OutgoingMessage().setHeader("x")],
+  ["validateHeaderValue('x', undefined)", () => http.validateHeaderValue("x", undefined)],
+]) {
+  try {
+    fn();
+    console.log(label, "no throw");
+  } catch (e) {
+    console.log(
+      label,
+      e.code,
+      Reflect.ownKeys(e).filter((k) => typeof k === "string").join(","),
+      "TypeError.prototype:",
+      Object.getPrototypeOf(e) === TypeError.prototype,
+      JSON.stringify(String(e)),
+      JSON.stringify(String(e.stack).split("\n")[0]),
+    );
+  }
+}
