@@ -1066,6 +1066,9 @@
   codes.ERR_FS_CP_DIR_TO_NON_DIR = E("ERR_FS_CP_DIR_TO_NON_DIR", Error, function(msg) {
     return msg;
   });
+  codes.ERR_FS_CP_NON_DIR_TO_DIR = E("ERR_FS_CP_NON_DIR_TO_DIR", Error, function(msg) {
+    return msg;
+  });
   codes.ERR_FS_EISDIR = E("ERR_FS_EISDIR", Error, function(msg) {
     return msg || 'Path is a directory';
   });
@@ -10161,6 +10164,66 @@
     return _rwStreams;
   }
 
+  // node's checkPaths (lib/internal/fs/cp/cp.js) and, for cpSync, its C++
+  // twin cpSyncCheckPaths: copying a directory onto something that exists
+  // and is not a directory fails with ERR_FS_CP_DIR_TO_NON_DIR, the reverse
+  // with ERR_FS_CP_NON_DIR_TO_DIR -- before anything is copied, and before
+  // the check for a directory copied without `recursive`. `destRaw` is the
+  // destination's stat, null when it does not exist. Measured on v22.22.2:
+  // cpSync's is a plain Error with `code` alone, the paths rendered as node
+  // hands them to its C++ (path.toNamespacedPath: absolute, `\\?\`-prefixed
+  // on Windows); cp's and fs.promises.cp's is a SystemError (see
+  // docs/node-divergences.md "Coded errors") naming the paths as given.
+  // Before this a directory copied onto a file failed on the first entry
+  // with ENOENT, or not at all when it was empty, and a file copied onto a
+  // directory failed with EPERM from copyfile.
+  function cpTypeMismatch(srcIsDir, destRaw, src, dest, sync) {
+    if (destRaw === null || srcIsDir === (destRaw.kind === "dir")) return null;
+    const code = srcIsDir ? "ERR_FS_CP_DIR_TO_NON_DIR" : "ERR_FS_CP_NON_DIR_TO_DIR";
+    const kept = srcIsDir ? "non-directory" : "directory";
+    const copied = srcIsDir ? "directory" : "non-directory";
+    if (sync) {
+      const ns = registry.get("path").toNamespacedPath;
+      return makeNodeError(code, `Cannot overwrite ${kept} ${ns(dest)} with ${copied} ${ns(src)}`);
+    }
+    // EISDIR is 21 and ENOTDIR 20 in every platform's os.constants.errno.
+    const info = {
+      message: `cannot overwrite ${kept} ${dest} with ${copied} ${src}`,
+      path: dest,
+      syscall: "cp",
+      errno: srcIsDir ? 21 : 20,
+      code: srcIsDir ? "EISDIR" : "ENOTDIR",
+    };
+    const err = codes[code](
+      `Cannot overwrite ${kept} with ${copied}: cp returned ${info.code} (${info.message}) ${dest}`,
+    );
+    err.info = info;
+    err.errno = info.errno;
+    err.syscall = info.syscall;
+    err.path = dest;
+    return err;
+  }
+
+  // The destination's stat for cpTypeMismatch: lstat, as node's (stat with
+  // `dereference`), null when there is nothing there.
+  function cpDestStatSync(natives, dest, opts) {
+    try {
+      return natives.fsStatSync(dest, !opts.dereference);
+    } catch (e) {
+      if (e && e.code === "ENOENT") return null;
+      throw e;
+    }
+  }
+
+  async function cpDestStat(natives, dest, opts) {
+    try {
+      return await natives.fsStat(dest, !opts.dereference);
+    } catch (e) {
+      if (e && e.code === "ENOENT") return null;
+      throw e;
+    }
+  }
+
   registry.factories["fs/promises"] = (natives) => {
     const isWin = natives.platform === "win32";
     // The callback module is built from these same functions, and node's
@@ -10255,15 +10318,18 @@
         var srcStr = toPath(src);
         var destStr = toPath(dest);
         var opts = options || {};
-        var raw;
-        try { raw = await natives.fsStat(srcStr, false); } catch (e) { throw e; }
+        var raw = await natives.fsStat(srcStr, false);
+        var mismatch = cpTypeMismatch(raw.kind === "dir", await cpDestStat(natives, destStr, opts), srcStr, destStr, false);
+        if (mismatch !== null) throw mismatch;
         if (raw.kind === "dir") {
           if (!opts.recursive) throw makeNodeError("ERR_FS_CP_DIR_TO_NON_DIR", "cp: -r not specified; omitting directory '" + srcStr + "'");
           try { await natives.fsMkdir(destStr, true); } catch (e) {}
           var entries = await natives.fsReaddir(srcStr);
+          // node joins each entry's paths with path.join, so an error names
+          // them with the platform's separator.
+          var join = registry.get("path").join;
           for (var i = 0; i < entries.length; i++) {
-            var sep = srcStr.endsWith("/") || srcStr.endsWith("\\") ? "" : "/";
-            await cpRecursive(srcStr + sep + entries[i].name, destStr + sep + entries[i].name, opts);
+            await cpRecursive(join(srcStr, entries[i].name), join(destStr, entries[i].name), opts);
           }
         } else {
           await natives.fsCopyFile(srcStr, destStr);
@@ -10920,15 +10986,16 @@
         var srcStr = toPath(src);
         var destStr = toPath(dest);
         var opts = options || {};
-        var raw;
-        try { raw = natives.fsStatSync(srcStr, false); } catch (e) { throw e; }
+        var raw = natives.fsStatSync(srcStr, false);
+        var mismatch = cpTypeMismatch(raw.kind === "dir", cpDestStatSync(natives, destStr, opts), srcStr, destStr, true);
+        if (mismatch !== null) throw mismatch;
         if (raw.kind === "dir") {
           if (!opts.recursive) throw makeNodeError("ERR_FS_CP_DIR_TO_NON_DIR", "cpSync: -r not specified; omitting directory '" + srcStr + "'");
           try { natives.fsMkdirSync(destStr, true); } catch (e) {}
           var entries = natives.fsReaddirSync(srcStr);
+          var join = registry.get("path").join;
           for (var i = 0; i < entries.length; i++) {
-            var sep = srcStr.endsWith("/") || srcStr.endsWith("\\") ? "" : "/";
-            cpSyncRecursive(srcStr + sep + entries[i].name, destStr + sep + entries[i].name, opts);
+            cpSyncRecursive(join(srcStr, entries[i].name), join(destStr, entries[i].name), opts);
           }
         } else {
           natives.fsCopyFileSync(srcStr, destStr);

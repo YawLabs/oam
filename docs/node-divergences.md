@@ -2366,6 +2366,20 @@ code is `ERR_FS_EISDIR` -- a `SystemError` (`info`, `errno`, `syscall`, `path`; 
 directory: cp returned EISDIR (... is a directory (not copied)) ...") from `cp` and
 `fs.promises.cp`, a plain `Error` ("Recursive option not enabled, cannot copy a directory:
 ...", the path as node's C++ renders it) from `cpSync`. oam has no `SystemError` class yet.
+A directory copied onto something that exists and is not a directory, or a file onto a
+directory, fails as node's does before anything is copied and ahead of the `recursive` check:
+`ERR_FS_CP_DIR_TO_NON_DIR` / `ERR_FS_CP_NON_DIR_TO_DIR` (`conformance/cases/266-fs-cp-type-mismatch.mjs`;
+up to 0.17.1 oam failed on the directory's first entry with `ENOENT`, not at all when it was
+empty, and with `EPERM` for a file onto a directory). `cpSync`'s is node's to the byte -- a
+plain `Error` with `code` alone, the paths through `path.toNamespacedPath` as node hands them
+to its C++ (measured on Windows; on Linux and macOS that leaves them as given, not measured).
+`cp`'s and `fs.promises.cp`'s carry node's message, `info`, `errno`, `syscall` and `path`, but
+are not `SystemError`s: `name` is `Error`, not `SystemError`, the constructor is not
+`NodeError`, and `toString` and the stack header read `Error [ERR_FS_CP_...]` where node's
+read `SystemError [ERR_FS_CP_...]`; `errno`, `syscall` and `path` are data properties, where
+node's are accessors over `info`. Below the top of the tree node's `cpSync` copies in C++ and
+fails with the platform's own error (`EIO` "Access is denied." on Windows); oam's checks every
+entry as node's `cp` does, and throws the same coded error.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 
