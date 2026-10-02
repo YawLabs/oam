@@ -631,3 +631,365 @@ release_verify_manifest() {
   _rs_ok "RELEASE-MANIFEST verifies: $tag, signed by $principal, SUMS section identical to SHA256SUMS"
   return 0
 }
+
+# =============================================================================
+# Windows: Authenticode through Azure Artifact Signing
+# =============================================================================
+# The manifest above proves a release came from us; it does nothing for the
+# person who double-clicks oam.exe, or for Smart App Control, which judges the
+# binary alone. So each Windows asset also carries an Authenticode signature,
+# made by Azure Artifact Signing: the key lives in Microsoft's HSM and never
+# touches this box, the certificate is issued to the validated organization
+# name and lives three days, and signtool reaches the service through a
+# client "dlib" plugin. Everything account-specific (endpoint, account name,
+# certificate profile) sits in a metadata.json OUTSIDE the repo, at
+# $OAM_WIN_SIGN_METADATA; the publisher name the signature must carry is
+# $OAM_WIN_SIGN_PUBLISHER. Neither is ever committed: this is a public repo.
+# release-keys/README.md ("Windows Authenticode") is the setup runbook.
+#
+# Three-day certificates make the RFC 3161 timestamp the signature's real
+# lifetime: an untimestamped signature dies with its certificate. So the TSA
+# is not optional, a TSA outage fails the release, and the preflight's real
+# throwaway signature probes it.
+#
+# The verify gate is the point, not the sign call. signtool with this dlib can
+# report success and sign nothing (Microsoft's FAQ: "No error codes, SignTool
+# silently fails" without the matching .NET runtime), so win_verify re-reads
+# the file from disk twice, independently: `signtool verify /pa`, then
+# verify-authenticode.ps1 through Get-AuthenticodeSignature (status Valid, a
+# timestamp, signer CN and O == $OAM_WIN_SIGN_PUBLISHER, the Artifact Signing
+# intermediate in the chain). The second half shares no code with signtool, so
+# a signtool that lies -- or a stub on PATH -- cannot vouch for itself.
+#
+# Bootstrap, like the manifest: with $OAM_WIN_SIGN_METADATA unset the Windows
+# assets ship unsigned, loudly (fatal under OAM_SIGN_REQUIRED=1). Once it is
+# set, signing both .exe assets is mandatory. The one skip knob,
+# OAM_SKIP_WIN_SIGN, is read by the CALLER and handed in as
+# win_sign_decision's argument: this lib reads no skip knob, so nothing here
+# can be talked into skipping the manifest.
+#
+# Tooling on the arm64 release box: the dlib ships x86 and x64 builds only,
+# so it is the x64 signtool, the x64 dlib and the x64 .NET 8 runtime, all
+# under the OS's x64 emulation. Same caller contract as above: [fail] lines on
+# stderr, return non-zero, never exit, no traps.
+# =============================================================================
+
+WIN_SIGN_TSA="http://timestamp.acs.microsoft.com"
+# The token audience the dlib asks Entra for. A token for it proves the az
+# session is live; it does NOT prove the Signer role (only a signature does).
+WIN_SIGN_RESOURCE="https://codesigning.azure.net"
+# Every Artifact Signing (Public Trust) leaf chains through this intermediate
+# (learn.microsoft.com/azure/artifact-signing/faq). Requiring it pins the
+# signature to the service, not merely to "some CA Windows trusts".
+WIN_SIGN_INTERMEDIATE="Microsoft ID Verified Code Signing PCA 2021"
+# signtool floor, as a Windows SDK version. Microsoft's integration page says
+# "10.0.2261.755", which is no SDK that exists; the client tools' own README
+# says "Windows SDK 10.0.22621.0 or higher" -- the docs number with a dropped
+# digit. 10.0.20348.* (Server 2022's SDK) is called out as unsupported by the
+# dlib and is skipped whatever its number.
+WIN_SIGNTOOL_FLOOR="10.0.22621"
+# Search roots and the external programs, reassigned by the test suite.
+WIN_SDK_BIN_ROOT="/c/Program Files (x86)/Windows Kits/10/bin"
+WIN_DOTNET_CANDIDATES=("/c/Program Files/dotnet/x64/dotnet.exe" "/c/Program Files/dotnet/dotnet.exe")
+WIN_AZ="az"
+WIN_POWERSHELL="powershell.exe"
+WIN_VERIFY_PS1="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/verify-authenticode.ps1"
+# Where `winget install Microsoft.Azure.ArtifactSigningClientTools` (0.1.128,
+# measured) puts the dlib: per-user, unversioned. The second name is the one
+# that installer's own signtool.bat still refers to.
+WIN_DLIB_DIRS=()
+if [ -n "${LOCALAPPDATA:-}" ]; then
+  _ws_lad="$LOCALAPPDATA"
+  if command -v cygpath >/dev/null 2>&1; then _ws_lad="$(cygpath -u "$_ws_lad")"; fi
+  WIN_DLIB_DIRS=("$_ws_lad/Microsoft/MicrosoftArtifactSigningClientTools" "$_ws_lad/Microsoft/ArtifactSigningTools")
+  unset _ws_lad
+fi
+
+WIN_SIGNTOOL=""
+WIN_SIGN_DLIB=""
+WIN_DOTNET_X64=""
+
+# _ws_winpath <path> -- the native Windows spelling, for arguments a Windows
+# program reads (signtool, powershell). $RELEASE_DIR is an MSYS /tmp path that
+# no Windows program can open as written.
+_ws_winpath() {
+  if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s\n' "$1"; fi
+}
+
+# _ws_pe_machine <file> -- the COFF Machine field as 4 lowercase hex digits
+# (8664 = x64, aa64 = arm64, 014c = x86); empty for anything that is not a
+# PE. Read with od, so it answers the same for a real binary and a fixture.
+_ws_pe_machine() {
+  local f="$1" mz lfanew sig
+  [ -f "$f" ] || return 0
+  mz="$(od -An -tx1 -N2 "$f" 2>/dev/null | tr -d ' \n')"
+  [ "$mz" = "4d5a" ] || return 0
+  lfanew="$(od -An -tu4 -j60 -N4 "$f" 2>/dev/null | tr -d ' \n')"
+  [[ "$lfanew" =~ ^[0-9]+$ ]] || return 0
+  sig="$(od -An -tx1 -j"$lfanew" -N4 "$f" 2>/dev/null | tr -d ' \n')"
+  [ "$sig" = "50450000" ] || return 0
+  od -An -tx1 -j"$((lfanew + 4))" -N2 "$f" 2>/dev/null | awk '{ print $2 $1 }'
+}
+
+# _ws_ver_ge <a> <b> -- 0 when dotted version a >= b, numeric per field,
+# missing fields read as 0; 1 for anything non-numeric.
+_ws_ver_ge() {
+  local -a a b
+  local i n x y
+  IFS=. read -r -a a <<<"$1"
+  IFS=. read -r -a b <<<"$2"
+  n=${#a[@]}
+  if [ "${#b[@]}" -gt "$n" ]; then n=${#b[@]}; fi
+  for ((i = 0; i < n; i++)); do
+    x="${a[i]:-0}"; y="${b[i]:-0}"
+    [[ "$x" =~ ^[0-9]+$ && "$y" =~ ^[0-9]+$ ]] || return 1
+    if [ $((10#$x)) -gt $((10#$y)) ]; then return 0; fi
+    if [ $((10#$x)) -lt $((10#$y)) ]; then return 1; fi
+  done
+  return 0
+}
+
+# locate_signtool_x64 -- WIN_SIGNTOOL: the x64 signtool from the newest
+# Windows SDK at or above the floor, skipping 10.0.20348.*. The SDK directory
+# names the version; the binary's own PE header must say x64.
+locate_signtool_x64() {
+  [ -z "$WIN_SIGNTOOL" ] || return 0
+  local d v best="" bestv="" seen=""
+  for d in "$WIN_SDK_BIN_ROOT"/10.*/; do
+    d="${d%/}"; v="${d##*/}"
+    [ -f "$d/x64/signtool.exe" ] || continue
+    seen="$seen $v"
+    case "$v" in 10.0.20348.*) continue ;; esac
+    _ws_ver_ge "$v" "$WIN_SIGNTOOL_FLOOR" || continue
+    if [ -z "$bestv" ] || ! _ws_ver_ge "$bestv" "$v"; then best="$d/x64/signtool.exe"; bestv="$v"; fi
+  done
+  [ -n "$best" ] \
+    || { _rs_fail "no x64 signtool.exe from a Windows SDK >= $WIN_SIGNTOOL_FLOOR (and not 10.0.20348) under $WIN_SDK_BIN_ROOT (found:${seen:- none}) -- install the Windows SDK signing tools"; return 1; }
+  [ "$(_ws_pe_machine "$best")" = "8664" ] \
+    || { _rs_fail "$best is not an x64 binary -- the Artifact Signing dlib ships x86/x64 builds only, and this lib pairs it with the x64 signtool"; return 1; }
+  WIN_SIGNTOOL="$best"
+  return 0
+}
+
+# locate_artifact_signing_dlib -- WIN_SIGN_DLIB: Azure.CodeSigning.Dlib.dll
+# from the client tools install, and x64 (it must match signtool's arch).
+locate_artifact_signing_dlib() {
+  [ -z "$WIN_SIGN_DLIB" ] || return 0
+  local d f
+  for d in "${WIN_DLIB_DIRS[@]}"; do
+    f="$d/Azure.CodeSigning.Dlib.dll"
+    [ -f "$f" ] || continue
+    if [ "$(_ws_pe_machine "$f")" != "8664" ]; then
+      _rs_warn "$f is not the x64 build of the dlib -- skipped"
+      continue
+    fi
+    WIN_SIGN_DLIB="$f"
+    return 0
+  done
+  _rs_fail "no x64 Azure.CodeSigning.Dlib.dll in: ${WIN_DLIB_DIRS[*]:-<no LOCALAPPDATA>} -- install it: winget install -e --id Microsoft.Azure.ArtifactSigningClientTools"
+  return 1
+}
+
+# probe_dotnet_x64 -- WIN_DOTNET_X64: an x64 dotnet host that lists a
+# Microsoft.NETCore.App runtime >= 8 (the dlib's runtimeconfig rolls forward
+# across majors). On an arm64 box the x64 host lives in dotnet/x64/ and the
+# top-level dotnet.exe is the arm64 one, whose runtimes are no use to an x64
+# signtool -- hence the PE check rather than trusting either path.
+probe_dotnet_x64() {
+  [ -z "$WIN_DOTNET_X64" ] || return 0
+  local c out
+  for c in "${WIN_DOTNET_CANDIDATES[@]}"; do
+    [ -f "$c" ] || continue
+    [ "$(_ws_pe_machine "$c")" = "8664" ] || continue
+    out="$("$c" --list-runtimes 2>/dev/null)" || continue
+    if grep -qE '^Microsoft\.NETCore\.App ([89]|[1-9][0-9])\.' <<<"$out"; then
+      WIN_DOTNET_X64="$c"
+      return 0
+    fi
+  done
+  _rs_fail "no x64 .NET runtime >= 8 (checked: ${WIN_DOTNET_CANDIDATES[*]}) -- without it signtool + the dlib can exit 0 and sign NOTHING. Install the x64 .NET 8 runtime (winget install -e --id Microsoft.DotNet.Runtime.8 --architecture x64)"
+  return 1
+}
+
+# win_sign_decision <skip-knob> -- whether this run Authenticode-signs, as one
+# line on stdout, in release_signing_decision's vocabulary:
+#   sign            OAM_WIN_SIGN_METADATA and OAM_WIN_SIGN_PUBLISHER are set
+#   skip:<reason>   the caller's OAM_SKIP_WIN_SIGN=1 (honored even when
+#                   required -- it is the loud, deliberate override), or
+#                   bootstrap: nothing configured, not required
+#   fail:<reason>   bootstrap under OAM_SIGN_REQUIRED=1, half a config, or a
+#                   malformed knob
+# Pure function of the environment and its argument, so the suite drives it
+# directly.
+win_sign_decision() {
+  local skip="${1:-0}" req="${OAM_SIGN_REQUIRED:-0}"
+  local meta="${OAM_WIN_SIGN_METADATA:-}" pub="${OAM_WIN_SIGN_PUBLISHER:-}"
+  [[ "$req" =~ ^[01]$ ]] || { printf 'fail:OAM_SIGN_REQUIRED must be 0 or 1, not %s\n' "$req"; return 0; }
+  [[ "$skip" =~ ^[01]$ ]] || { printf 'fail:OAM_SKIP_WIN_SIGN must be 0 or 1, not %s\n' "$skip"; return 0; }
+  if [ "$skip" = "1" ]; then
+    printf 'skip:OAM_SKIP_WIN_SIGN=1 -- the Windows assets ship WITHOUT Authenticode signatures (SmartScreen and Smart App Control will treat them as unsigned)\n'
+  elif [ -n "$meta" ] && [ -n "$pub" ]; then
+    printf 'sign\n'
+  elif [ -n "$meta" ] || [ -n "$pub" ]; then
+    printf 'fail:Windows signing is half configured -- set BOTH OAM_WIN_SIGN_METADATA (the metadata.json path) and OAM_WIN_SIGN_PUBLISHER (the validated publisher name), or neither\n'
+  elif [ "$req" = "1" ]; then
+    printf 'fail:OAM_SIGN_REQUIRED=1 but OAM_WIN_SIGN_METADATA is not set -- configure Windows Authenticode signing (release-keys/README.md), or set OAM_SKIP_WIN_SIGN=1 to ship unsigned Windows assets deliberately\n'
+  else
+    printf 'skip:OAM_WIN_SIGN_METADATA is not set, so the Windows assets ship WITHOUT Authenticode signatures (bootstrap; see release-keys/README.md). OAM_SIGN_REQUIRED=1 makes this fatal\n'
+  fi
+  return 0
+}
+
+# _ws_metadata -- the metadata.json path, Unix spelling, checked for the three
+# fields the dlib needs. Values are never printed: they identify the account.
+_ws_metadata() {
+  local m="${OAM_WIN_SIGN_METADATA:-}" k
+  [ -n "$m" ] || { _rs_fail "OAM_WIN_SIGN_METADATA is not set"; return 1; }
+  if command -v cygpath >/dev/null 2>&1; then m="$(cygpath -u "$m")"; fi
+  [ -f "$m" ] || { _rs_fail "OAM_WIN_SIGN_METADATA=$m does not exist"; return 1; }
+  for k in Endpoint CodeSigningAccountName CertificateProfileName; do
+    grep -qE "\"$k\"[[:space:]]*:[[:space:]]*\"[^\"<]+\"" "$m" \
+      || { _rs_fail "$m has no \"$k\" value (shape: {\"Endpoint\": ..., \"CodeSigningAccountName\": ..., \"CertificateProfileName\": ...})"; return 1; }
+  done
+  printf '%s\n' "$m"
+}
+
+# win_sign_tools -- every local prerequisite, none of them network.
+win_sign_tools() {
+  locate_signtool_x64 || return 1
+  locate_artifact_signing_dlib || return 1
+  probe_dotnet_x64 || return 1
+  [ -f "$WIN_VERIFY_PS1" ] || { _rs_fail "$WIN_VERIFY_PS1 is missing"; return 1; }
+  [ -n "${OAM_WIN_SIGN_PUBLISHER:-}" ] || { _rs_fail "OAM_WIN_SIGN_PUBLISHER is not set -- the CN/O every signature must carry"; return 1; }
+  _ws_metadata >/dev/null || return 1
+  return 0
+}
+
+# win_sign <file> -- Authenticode-sign <file> in place: SHA256 file digest, an
+# RFC 3161 SHA256 timestamp from the Artifact Signing TSA. A staged copy only:
+# signing rewrites the file, and a file under target/ is a build output that
+# cargo, the parked-binary dance and live sessions all assume is unchanged.
+# Success here means signtool SAID so; win_verify is what proves it.
+win_sign() {
+  local file="$1" meta out
+  [ -f "$file" ] || { _rs_fail "win_sign: $file does not exist"; return 1; }
+  case "$file" in
+    */target/* | target/*) _rs_fail "win_sign: refusing to sign $file in place -- sign the staged copy, never a build output under target/"; return 1 ;;
+  esac
+  win_sign_tools || return 1
+  meta="$(_ws_metadata)" || return 1
+  # MSYS_NO_PATHCONV: Git Bash would otherwise rewrite /fd, /tr ... into paths.
+  if ! out="$(MSYS_NO_PATHCONV=1 "$WIN_SIGNTOOL" sign /v /fd SHA256 /tr "$WIN_SIGN_TSA" /td SHA256 \
+                /dlib "$(_ws_winpath "$WIN_SIGN_DLIB")" /dmdf "$(_ws_winpath "$meta")" \
+                "$(_ws_winpath "$file")" </dev/null 2>&1)"; then
+    printf '%s\n' "$out" | tr -d '\r' | tail -n 15 | sed 's/^/        signtool: /' >&2
+    _rs_fail "signtool sign failed for $file (output above). 401/403: run 'az login' and check the Certificate Profile Signer role; a SignerSign() error: metadata.json's Endpoint must be the account's region"
+    return 1
+  fi
+  return 0
+}
+
+# win_verify <file> -- fail-closed proof that <file> AS IT IS ON DISK carries
+# the signature this release requires. Two independent readers:
+#   1. signtool verify /pa: the default Authenticode policy, chain + timestamp
+#   2. verify-authenticode.ps1: Get-AuthenticodeSignature, then the pins --
+#      Valid, embedded (not catalog), timestamped, signer CN and O equal to
+#      $OAM_WIN_SIGN_PUBLISHER, $WIN_SIGN_INTERMEDIATE in the chain.
+# The path and the publisher reach PowerShell as -File ARGUMENTS, never spliced
+# into a command string: a path is data, and so is a publisher with a comma.
+win_verify() {
+  local file="$1" out pub="${OAM_WIN_SIGN_PUBLISHER:-}"
+  [ -f "$file" ] || { _rs_fail "win_verify: $file does not exist"; return 1; }
+  [ -n "$pub" ] || { _rs_fail "win_verify: OAM_WIN_SIGN_PUBLISHER is not set -- nothing to pin the signer to"; return 1; }
+  locate_signtool_x64 || return 1
+  if ! out="$(MSYS_NO_PATHCONV=1 "$WIN_SIGNTOOL" verify /pa /v "$(_ws_winpath "$file")" </dev/null 2>&1)"; then
+    printf '%s\n' "$out" | tr -d '\r' | tail -n 15 | sed 's/^/        signtool: /' >&2
+    _rs_fail "signtool verify /pa rejects $file (output above)"
+    return 1
+  fi
+  if ! out="$(MSYS_NO_PATHCONV=1 "$WIN_POWERSHELL" -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+                -File "$(_ws_winpath "$WIN_VERIFY_PS1")" \
+                -Path "$(_ws_winpath "$file")" -Publisher "$pub" -Intermediate "$WIN_SIGN_INTERMEDIATE" \
+                </dev/null 2>&1)"; then
+    printf '%s\n' "$out" | tr -d '\r' | sed 's/^/        /' >&2
+    _rs_fail "Authenticode verification failed for $file (above) -- whatever signtool reported, the file on disk does not carry the required signature"
+    return 1
+  fi
+  _rs_ok "Authenticode: $(basename "$file") signed by '$pub', timestamped, chained via $WIN_SIGN_INTERMEDIATE"
+  return 0
+}
+
+# win_make_unsigned_pe <out> -- write a minimal, valid, unsigned PE32+ x64
+# image (1024 bytes: headers, then one .text section holding `ret`). It is the
+# preflight's probe and the suite's unsigned fixture, generated rather than
+# committed: a binary blob in a public repo is something a reviewer has to
+# take on trust, and these bytes are all spelled out below.
+win_make_unsigned_pe() {
+  local out="$1" h=""
+  _ws_le() { # <bytes> <value> -- little-endian \xHH escapes onto $h
+    local n="$1" v="$2" i
+    for ((i = 0; i < n; i++)); do h="$h\\x$(printf '%02x' $(( (v >> (8 * i)) & 255 )))"; done
+  }
+  _ws_zero() { local i; for ((i = 0; i < $1; i++)); do h="$h\\x00"; done; }
+  # DOS header: "MZ", zeros, e_lfanew = 0x40.
+  h='\x4d\x5a'; _ws_zero 58; _ws_le 4 0x40
+  # "PE\0\0", then the COFF header: AMD64, 1 section, no symbols, a 240-byte
+  # optional header, EXECUTABLE_IMAGE | LARGE_ADDRESS_AWARE.
+  h="$h"'\x50\x45\x00\x00'
+  _ws_le 2 0x8664; _ws_le 2 1; _ws_le 4 0; _ws_le 4 0; _ws_le 4 0; _ws_le 2 240; _ws_le 2 0x22
+  # Optional header, PE32+.
+  _ws_le 2 0x20b; _ws_le 1 14; _ws_le 1 0          # magic, linker 14.0
+  _ws_le 4 0x200; _ws_le 4 0; _ws_le 4 0           # code / init / uninit sizes
+  _ws_le 4 0x1000; _ws_le 4 0x1000                 # entry point, base of code
+  _ws_le 8 0x140000000                             # image base
+  _ws_le 4 0x1000; _ws_le 4 0x200                  # section / file alignment
+  _ws_le 2 6; _ws_le 2 0; _ws_le 2 0; _ws_le 2 0   # OS version, image version
+  _ws_le 2 6; _ws_le 2 0; _ws_le 4 0               # subsystem version, reserved
+  _ws_le 4 0x2000; _ws_le 4 0x200; _ws_le 4 0      # image size, header size, checksum
+  _ws_le 2 3; _ws_le 2 0x8100                      # console; NX_COMPAT | TS_AWARE
+  _ws_le 8 0x100000; _ws_le 8 0x1000               # stack reserve / commit
+  _ws_le 8 0x100000; _ws_le 8 0x1000               # heap reserve / commit
+  _ws_le 4 0; _ws_le 4 16; _ws_zero 128            # loader flags, 16 empty data dirs
+  # Section header: .text at RVA 0x1000, 0x200 raw bytes at file offset 0x200,
+  # CODE | EXECUTE | READ.
+  h="$h"'\x2e\x74\x65\x78\x74\x00\x00\x00'
+  _ws_le 4 1; _ws_le 4 0x1000; _ws_le 4 0x200; _ws_le 4 0x200
+  _ws_le 4 0; _ws_le 4 0; _ws_le 2 0; _ws_le 2 0; _ws_le 4 0x60000020
+  # The headers end at 0x170; pad to 0x200, then the section: ret, zeros.
+  _ws_zero $((0x200 - 0x170))
+  h="$h"'\xc3'; _ws_zero 511
+  unset -f _ws_le _ws_zero
+  printf '%b' "$h" >"$out" || { _rs_fail "could not write $out"; return 1; }
+  [ "$(wc -c <"$out" | tr -d ' ')" = "1024" ] || { _rs_fail "$out came out $(wc -c <"$out" | tr -d ' ') bytes, not 1024"; return 1; }
+  return 0
+}
+
+# win_sign_preflight -- prove, BEFORE anything is bumped or tagged, that this
+# box can produce a signature win_verify accepts: the tooling, a live az
+# session, then a REAL signature on a throwaway PE in a temp dir outside the
+# repo (the dirty-tree check runs right after). Only a real signature also
+# covers the Signer role, metadata.json's endpoint/account/profile, the .NET
+# runtime and the TSA -- each of which would otherwise fail on the first
+# release asset, after the tag is public.
+win_sign_preflight() {
+  local d out
+  win_sign_tools || return 1
+  command -v "$WIN_AZ" >/dev/null 2>&1 \
+    || { _rs_fail "the Azure CLI ($WIN_AZ) is not on PATH -- install it, then run 'az login'"; return 1; }
+  if ! out="$("$WIN_AZ" account get-access-token --resource "$WIN_SIGN_RESOURCE" -o none </dev/null 2>&1)"; then
+    printf '%s\n' "$out" | tr -d '\r' | tail -n 5 | sed 's/^/        az: /' >&2
+    _rs_fail "no Azure token for $WIN_SIGN_RESOURCE -- run 'az login' as the identity holding the Artifact Signing Certificate Profile Signer role, then re-run"
+    return 1
+  fi
+  d="$(mktemp -d "${TMPDIR:-/tmp}/oam-winsign-probe.XXXXXX")" || { _rs_fail "could not create a temp dir"; return 1; }
+  if ! win_make_unsigned_pe "$d/oam-sign-probe.exe" \
+     || ! win_sign "$d/oam-sign-probe.exe" \
+     || ! win_verify "$d/oam-sign-probe.exe"; then
+    rm -rf "$d"
+    _rs_fail "Windows signing preflight: a throwaway signature did not sign and verify -- see above"
+    return 1
+  fi
+  rm -rf "$d"
+  _rs_ok "Windows signing preflight: signtool (SDK $(basename "$(dirname "$(dirname "$WIN_SIGNTOOL")")")), the dlib and x64 .NET sign, timestamp and verify as '$OAM_WIN_SIGN_PUBLISHER'"
+  return 0
+}

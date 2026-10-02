@@ -174,6 +174,20 @@ else
   echo "  [warn] ${TAG} has no RELEASE-MANIFEST (a pre-signing release) -- SHA256SUMS is patched unsigned, as before" >&2
 fi
 
+# Windows Authenticode for the patched-in binary: same decision, knobs and
+# preflight as release-local.sh (OAM_WIN_SIGN_METADATA / _PUBLISHER,
+# OAM_SKIP_WIN_SIGN, OAM_SIGN_REQUIRED), proven before the build so a lapsed
+# az session costs seconds. Signed whatever the release's other assets carry:
+# a signed binary is never worse than the unsigned one it replaces.
+WIN_SIGNING=0
+win_decision="$(win_sign_decision "${OAM_SKIP_WIN_SIGN:-0}")"
+case "$win_decision" in
+  sign) win_sign_preflight || { echo "error: Windows signing preflight failed -- see above; nothing was built or uploaded" >&2; exit 1; }
+        WIN_SIGNING=1 ;;
+  skip:*) echo "  [warn] ${win_decision#skip:}" >&2 ;;
+  *) echo "error: ${win_decision#fail:}" >&2; exit 1 ;;
+esac
+
 # Live typed-cli sessions run this exact file. `taskkill //F //IM oam.exe`
 # (what this used to do) killed the operator's other agent panes AND made the
 # failure MORE likely: every killed session restarts on --resume, and a process
@@ -207,6 +221,12 @@ git worktree add -q --detach "$wt" "$tag_sha" \
 
 tmp="$(mktemp -d)"
 cp target/release/oam.exe "${tmp}/${ASSET}"
+# Sign the staged copy (never target/release/oam.exe), and prove it from disk,
+# before anything below hashes it into SHA256SUMS.
+if [ "$WIN_SIGNING" = "1" ]; then
+  win_sign "${tmp}/${ASSET}" || { echo "error: Authenticode signing failed for ${ASSET} -- nothing was uploaded" >&2; exit 1; }
+  win_verify "${tmp}/${ASSET}" || { echo "error: ${ASSET} does not verify after signing -- nothing was uploaded" >&2; exit 1; }
+fi
 
 # Re-read SHA256SUMS -- and the manifest pair, when there is one -- from the
 # release at this step boundary, never cached. All three patterns in one call,

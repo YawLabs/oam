@@ -2284,8 +2284,10 @@ it "a committed key makes signing mandatory, whatever OAM_SIGN_REQUIRED says"
 SG_D="$(OAM_SIGN_REQUIRED=0 sg "$SG_ONE" release_signing_decision) $(OAM_SIGN_REQUIRED=1 sg "$SG_ONE" release_signing_decision)"
 eq "$SG_D" "sign sign"
 
+# A READ of the variable ($X or ${X...}), not the name: the Windows decision's
+# messages name OAM_SKIP_WIN_SIGN, which its caller reads and hands in.
 it "the lib has no knob that skips the manifest"
-if grep -v '^[[:space:]]*#' scripts/lib/signing.sh | grep -qE 'OAM_SKIP|OAM_NO_SIGN|SKIP_SIGN|SKIP_MANIFEST'; then
+if grep -v '^[[:space:]]*#' scripts/lib/signing.sh | grep -qE '\$\{?(OAM_SKIP|OAM_NO_SIGN|[A-Z_]*SKIP_SIGN|SKIP_MANIFEST)|printenv'; then
   fail "scripts/lib/signing.sh reads a skip knob"
 else pass; fi
 
@@ -2699,6 +2701,255 @@ CHILD
 fi
 
 # =============================================================================
+group "signing.sh -- Windows Authenticode: decision, locators, the verify gate"
+# =============================================================================
+# The verify gate is what makes Windows signing fail-closed, so most of this
+# group is about IT: a signtool that exits 0 without signing (Microsoft's own
+# FAQ documents that failure, without the x64 .NET runtime) must still fail
+# the release, and the PowerShell half must accept a real signature only for
+# the publisher and intermediate it was told to pin. No Azure here: the
+# account, the az session and the TSA are the preflight's job, on the box.
+#
+# The operator's own configuration must not leak into the fixtures' verdicts.
+unset OAM_WIN_SIGN_METADATA OAM_WIN_SIGN_PUBLISHER OAM_SKIP_WIN_SIGN OAM_SIGN_REQUIRED
+WS="$SUITE_TMP/winsign"
+mkdir -p "$WS/bin" "$WS/stage"
+# wg <command...> -- the lib sourced in a subshell, with every search root and
+# external program pointed at a fixture (or at nothing) unless the case sets
+# the matching WS_* itself. The box's real signtool, dlib, dotnet and az are
+# never consulted by accident.
+wg(){
+  ( # shellcheck source=lib/signing.sh
+    . scripts/lib/signing.sh
+    WIN_SDK_BIN_ROOT="${WS_SDK:-$WS/no-sdk}"
+    WIN_DLIB_DIRS=("${WS_DLIB_DIR:-$WS/no-dlib}")
+    WIN_DOTNET_CANDIDATES=("${WS_DOTNET:-$WS/no-dotnet}")
+    WIN_AZ="${WS_AZ:-$WS/no-az}"
+    WIN_SIGNTOOL="${WS_SIGNTOOL:-}"
+    WIN_SIGN_DLIB="${WS_DLIB:-}"
+    WIN_DOTNET_X64="${WS_DOTNET_OK:-}"
+    WIN_SIGN_INTERMEDIATE="${WS_INTER:-$WIN_SIGN_INTERMEDIATE}"
+    "$@" )
+}
+ws_signtool(){ locate_signtool_x64 && printf '%s\n' "$WIN_SIGNTOOL"; }
+ws_dlib(){ locate_artifact_signing_dlib && printf '%s\n' "$WIN_SIGN_DLIB"; }
+WS_HAVE_PS=0
+if command -v powershell.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then WS_HAVE_PS=1; fi
+
+it "nothing configured: skipped, with a loud bootstrap reason"
+WS_D="$(wg win_sign_decision 0)"
+case "$WS_D" in skip:*"WITHOUT Authenticode"*bootstrap*) pass ;; *) fail "got '$WS_D'" ;; esac
+
+it "nothing configured + OAM_SIGN_REQUIRED=1: fatal"
+WS_D="$(OAM_SIGN_REQUIRED=1 wg win_sign_decision 0)"
+case "$WS_D" in fail:*"OAM_SIGN_REQUIRED=1"*) pass ;; *) fail "got '$WS_D'" ;; esac
+
+it "configured: sign, required or not"
+WS_D="$(OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P wg win_sign_decision 0) $(OAM_SIGN_REQUIRED=1 OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P wg win_sign_decision 0)"
+eq "$WS_D" "sign sign"
+
+it "OAM_SKIP_WIN_SIGN=1 is honored even when configured and required -- loudly"
+WS_D="$(OAM_SIGN_REQUIRED=1 OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P wg win_sign_decision 1)"
+case "$WS_D" in skip:*"OAM_SKIP_WIN_SIGN=1"*"WITHOUT Authenticode"*) pass ;; *) fail "got '$WS_D'" ;; esac
+
+it "half a configuration is fatal, either half"
+WS_D="$(OAM_WIN_SIGN_METADATA=/m wg win_sign_decision 0)|$(OAM_WIN_SIGN_PUBLISHER=P wg win_sign_decision 0)"
+case "$WS_D" in fail:*"half configured"*"|fail:"*"half configured"*) pass ;; *) fail "got '$WS_D'" ;; esac
+
+it "malformed knobs are fatal, not guessed at"
+WS_D="$(wg win_sign_decision yes)|$(OAM_SIGN_REQUIRED=2 wg win_sign_decision 0)"
+case "$WS_D" in fail:*"OAM_SKIP_WIN_SIGN must be 0 or 1"*"|fail:"*"OAM_SIGN_REQUIRED must be 0 or 1"*) pass ;; *) fail "got '$WS_D'" ;; esac
+
+it "the lib ignores OAM_SKIP_WIN_SIGN in its environment -- only the caller's argument counts"
+WS_D="$(OAM_SKIP_WIN_SIGN=1 OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P wg win_sign_decision 0)"
+eq "$WS_D" "sign"
+
+WS_PE="$WS/unsigned.exe"
+it "win_make_unsigned_pe writes a 1024-byte x64 PE image"
+if wg win_make_unsigned_pe "$WS_PE" 2>/dev/null; then
+  eq "$(wg _ws_pe_machine "$WS_PE") $(wc -c <"$WS_PE" | tr -d ' ')" "8664 1024"
+else fail "win_make_unsigned_pe failed"; fi
+
+it "_ws_pe_machine reads nothing from a file that is not a PE"
+eq "$(wg _ws_pe_machine scripts/lib/signing.sh)" ""
+
+# A fake Windows Kits bin/ tree. The generated PE stands in for signtool: the
+# locator reads versions from directory names and the arch from the header.
+WS_SDK_T="$WS/sdk"
+for v in 10.0.17134.0 10.0.20348.0 10.0.22621.0 10.0.26100.0; do
+  mkdir -p "$WS_SDK_T/$v/x64" && cp "$WS_PE" "$WS_SDK_T/$v/x64/signtool.exe"
+done
+it "locate_signtool_x64 takes the newest SDK at or above the floor"
+WS_D="$(WS_SDK="$WS_SDK_T" wg ws_signtool 2>&1)"
+eq "$WS_D" "$WS_SDK_T/10.0.26100.0/x64/signtool.exe"
+
+WS_SDK_OLD="$WS/sdk-old"
+for v in 10.0.17134.0 10.0.20348.0; do
+  mkdir -p "$WS_SDK_OLD/$v/x64" && cp "$WS_PE" "$WS_SDK_OLD/$v/x64/signtool.exe"
+done
+it "locate_signtool_x64 refuses SDKs below the floor and 10.0.20348, naming what it found"
+WS_RC=0; WS_D="$(WS_SDK="$WS_SDK_OLD" wg ws_signtool 2>&1)" || WS_RC=$?
+if [ "$WS_RC" != "0" ] && grep -qF '10.0.22621' <<<"$WS_D" && grep -qF '10.0.20348.0' <<<"$WS_D"; then pass
+else fail "rc=$WS_RC: $WS_D"; fi
+
+WS_SDK_ARM="$WS/sdk-arm"
+mkdir -p "$WS_SDK_ARM/10.0.26100.0/x64" && echo 'not a PE' >"$WS_SDK_ARM/10.0.26100.0/x64/signtool.exe"
+it "locate_signtool_x64 refuses a signtool whose header is not x64"
+WS_RC=0; WS_D="$(WS_SDK="$WS_SDK_ARM" wg ws_signtool 2>&1)" || WS_RC=$?
+if [ "$WS_RC" != "0" ] && grep -qF 'not an x64 binary' <<<"$WS_D"; then pass; else fail "rc=$WS_RC: $WS_D"; fi
+
+mkdir -p "$WS/dlib-ok" "$WS/dlib-bad"
+cp "$WS_PE" "$WS/dlib-ok/Azure.CodeSigning.Dlib.dll"
+echo 'not a PE' >"$WS/dlib-bad/Azure.CodeSigning.Dlib.dll"
+it "locate_artifact_signing_dlib finds the x64 dlib, and refuses one that is not x64"
+WS_D="$(WS_DLIB_DIR="$WS/dlib-ok" wg ws_dlib 2>/dev/null)"
+WS_RC=0; WS_E="$(WS_DLIB_DIR="$WS/dlib-bad" wg ws_dlib 2>&1)" || WS_RC=$?
+if [ "$WS_D" = "$WS/dlib-ok/Azure.CodeSigning.Dlib.dll" ] && [ "$WS_RC" != "0" ] \
+   && grep -qF 'not the x64 build' <<<"$WS_E" && grep -qF 'winget install -e --id Microsoft.Azure.ArtifactSigningClientTools' <<<"$WS_E"; then pass
+else fail "found '$WS_D'; bad dir rc=$WS_RC: $WS_E"; fi
+
+it "probe_dotnet_x64 refuses a host that is not an x64 PE, and names the fix"
+echo 'not a PE' >"$WS/bin/dotnet.exe"
+WS_RC=0; WS_D="$(WS_DOTNET="$WS/bin/dotnet.exe" wg probe_dotnet_x64 2>&1)" || WS_RC=$?
+if [ "$WS_RC" != "0" ] && grep -qF 'sign NOTHING' <<<"$WS_D"; then pass; else fail "rc=$WS_RC: $WS_D"; fi
+
+it "probe_dotnet_x64 accepts this box's x64 .NET >= 8, when it has one"
+if [ -f "/c/Program Files/dotnet/x64/dotnet.exe" ]; then
+  WS_RC=0; WS_D="$(WS_DOTNET="/c/Program Files/dotnet/x64/dotnet.exe" wg probe_dotnet_x64 2>&1)" || WS_RC=$?
+  if [ "$WS_RC" = "0" ]; then pass
+  elif [ "$(wg _ws_pe_machine "/c/Program Files/dotnet/x64/dotnet.exe")" = "8664" ]; then skip "x64 dotnet present but lists no runtime >= 8: $WS_D"
+  else fail "rc=$WS_RC: $WS_D"; fi
+else skip "no /c/Program Files/dotnet/x64/dotnet.exe on this host"; fi
+
+# metadata.json: only the shape is checked, and placeholder values (the
+# sample file's "<...>") do not count as configured.
+printf '{\n  "Endpoint": "https://example.invalid",\n  "CodeSigningAccountName": "example",\n  "CertificateProfileName": "example"\n}\n' >"$WS/metadata.json"
+printf '{\n  "Endpoint": "<Artifact Signing account endpoint>",\n  "CodeSigningAccountName": "example",\n  "CertificateProfileName": "example"\n}\n' >"$WS/metadata-sample.json"
+printf '{\n  "Endpoint": "https://example.invalid",\n  "CodeSigningAccountName": "example"\n}\n' >"$WS/metadata-short.json"
+it "metadata.json needs all three fields, with real values"
+WS_OK=0; OAM_WIN_SIGN_METADATA="$WS/metadata.json" wg _ws_metadata >/dev/null 2>&1 && WS_OK=1
+WS_S="$(OAM_WIN_SIGN_METADATA="$WS/metadata-sample.json" wg _ws_metadata 2>&1)"
+WS_T="$(OAM_WIN_SIGN_METADATA="$WS/metadata-short.json" wg _ws_metadata 2>&1)"
+if [ "$WS_OK" = "1" ] && grep -qF '"Endpoint"' <<<"$WS_S" && grep -qF '"CertificateProfileName"' <<<"$WS_T"; then pass
+else fail "ok=$WS_OK sample='$WS_S' short='$WS_T'"; fi
+
+# The stub: exits 0 for every call and signs nothing -- what signtool + the
+# dlib do without the x64 .NET runtime. It logs its argv for the shape check.
+WS_LOG="$WS/signtool.log"
+{ echo '#!/bin/bash'; echo "printf '%s\\n' \"\$*\" >>'$WS_LOG'"; echo 'exit 0'; } >"$WS/bin/signtool"
+printf '#!/bin/bash\necho "ERROR: Please run '"'"'az login'"'"' to setup account." >&2\nexit 1\n' >"$WS/bin/az-lapsed"
+printf '#!/bin/bash\nexit 0\n' >"$WS/bin/az-live"
+chmod +x "$WS/bin/signtool" "$WS/bin/az-lapsed" "$WS/bin/az-live"
+# ws_stubbed <command...> -- fully configured, with the stub as signtool.
+ws_stubbed(){
+  WS_SIGNTOOL="$WS/bin/signtool" WS_DLIB="$WS/dlib-ok/Azure.CodeSigning.Dlib.dll" WS_DOTNET_OK=stub \
+    OAM_WIN_SIGN_METADATA="$WS/metadata.json" OAM_WIN_SIGN_PUBLISHER="Example Publisher" wg "$@"
+}
+
+it "win_sign hands signtool the documented command: /fd, the ACS TSA, /td, /dlib, /dmdf, native paths"
+cp "$WS_PE" "$WS/stage/oam-stub.exe"
+: >"$WS_LOG"
+WS_RC=0; WS_D="$(ws_stubbed win_sign "$WS/stage/oam-stub.exe" 2>&1)" || WS_RC=$?
+WS_L="$(head -1 "$WS_LOG")"
+WS_WANT="sign /v /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib $(wg _ws_winpath "$WS/dlib-ok/Azure.CodeSigning.Dlib.dll") /dmdf $(wg _ws_winpath "$WS/metadata.json") $(wg _ws_winpath "$WS/stage/oam-stub.exe")"
+if [ "$WS_RC" = "0" ] && [ "$WS_L" = "$WS_WANT" ]; then pass
+else fail "rc=$WS_RC out='$WS_D'"$'\n'"       logged: $WS_L"$'\n'"       wanted: $WS_WANT"; fi
+
+it "a signtool that exits 0 without signing fails the gate: win_verify rejects the file"
+if [ "$WS_HAVE_PS" = "1" ]; then
+  WS_RC=0; WS_D="$(ws_stubbed win_verify "$WS/stage/oam-stub.exe" 2>&1)" || WS_RC=$?
+  if [ "$WS_RC" != "0" ] && grep -qF "'NotSigned'" <<<"$WS_D" && grep -qF 'verify /pa /v' "$WS_LOG"; then pass
+  else fail "rc=$WS_RC: $WS_D"; fi
+else skip "no powershell.exe/cygpath -- the Authenticode reader runs on Windows only"; fi
+
+it "win_sign refuses to sign a build output under target/, and never calls signtool for it"
+mkdir -p "$WS/target/release" && cp "$WS_PE" "$WS/target/release/oam.exe"
+: >"$WS_LOG"
+WS_RC=0; WS_D="$(ws_stubbed win_sign "$WS/target/release/oam.exe" 2>&1)" || WS_RC=$?
+if [ "$WS_RC" != "0" ] && grep -qF 'refusing to sign' <<<"$WS_D" && [ ! -s "$WS_LOG" ]; then pass
+else fail "rc=$WS_RC log='$(cat "$WS_LOG")': $WS_D"; fi
+
+it "win_sign_preflight on a lapsed az session fails, saying to run az login, before signing anything"
+: >"$WS_LOG"
+WS_RC=0; WS_D="$(WS_AZ="$WS/bin/az-lapsed" ws_stubbed win_sign_preflight 2>&1)" || WS_RC=$?
+if [ "$WS_RC" != "0" ] && grep -qF "run 'az login'" <<<"$WS_D" && [ ! -s "$WS_LOG" ]; then pass
+else fail "rc=$WS_RC log='$(cat "$WS_LOG")': $WS_D"; fi
+
+it "win_sign_preflight with a signtool that signs nothing fails, and leaves no probe behind"
+if [ "$WS_HAVE_PS" = "1" ]; then
+  mkdir -p "$WS/pftmp"
+  WS_RC=0; WS_D="$(TMPDIR="$WS/pftmp" WS_AZ="$WS/bin/az-live" ws_stubbed win_sign_preflight 2>&1)" || WS_RC=$?
+  if [ "$WS_RC" != "0" ] && grep -qF 'throwaway signature did not sign and verify' <<<"$WS_D" \
+     && [ -z "$(ls -A "$WS/pftmp")" ]; then pass
+  else fail "rc=$WS_RC left='$(ls -A "$WS/pftmp")': $WS_D"; fi
+else skip "no powershell.exe/cygpath -- the Authenticode reader runs on Windows only"; fi
+
+# verify-authenticode.ps1 against a REAL embedded signature: the box's x64
+# signtool.exe, Microsoft-signed. Its intermediate is read separately (by a
+# chain walk that is not the script under test) so the case follows whatever
+# CA Microsoft signs that SDK with.
+WS_MS="$( . scripts/lib/signing.sh; locate_signtool_x64 2>/dev/null && printf '%s' "$WIN_SIGNTOOL" )"
+WS_INTER_MS=""
+if [ "$WS_HAVE_PS" = "1" ] && [ -n "$WS_MS" ]; then
+  printf '%s\n' 'param([string]$p)' \
+    '$s = Get-AuthenticodeSignature -LiteralPath $p' \
+    '$c = New-Object System.Security.Cryptography.X509Certificates.X509Chain' \
+    "\$c.ChainPolicy.RevocationMode = 'NoCheck'" \
+    '[void]$c.Build($s.SignerCertificate)' \
+    "\$c.ChainElements[1].Certificate.GetNameInfo('SimpleName', \$false)" >"$WS/chain1.ps1"
+  WS_INTER_MS="$(powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$WS/chain1.ps1")" "$(cygpath -w "$WS_MS")" 2>/dev/null | tr -d '\r')"
+fi
+# ws_ps1 <file> <publisher> <intermediate> -- the script alone, as win_verify calls it.
+ws_ps1(){
+  powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w scripts/lib/verify-authenticode.ps1)" \
+    -Path "$(cygpath -w "$1")" -Publisher "$2" -Intermediate "$3" </dev/null 2>&1 | tr -d '\r'
+  return "${PIPESTATUS[0]}"
+}
+if [ "$WS_HAVE_PS" = "1" ] && [ -n "$WS_MS" ] && [ -n "$WS_INTER_MS" ]; then
+  it "verify-authenticode.ps1 passes a real signature for its real publisher and intermediate"
+  WS_RC=0; WS_D="$(ws_ps1 "$WS_MS" "Microsoft Corporation" "$WS_INTER_MS")" || WS_RC=$?
+  if [ "$WS_RC" = "0" ]; then pass; else fail "rc=$WS_RC: $WS_D"; fi
+
+  it "verify-authenticode.ps1 fails the same signature for another publisher (exact, case-sensitive)"
+  WS_RC=0; WS_D="$(ws_ps1 "$WS_MS" "Example Publisher" "$WS_INTER_MS")" || WS_RC=$?
+  WS_RC2=0; WS_E="$(ws_ps1 "$WS_MS" "microsoft corporation" "$WS_INTER_MS")" || WS_RC2=$?
+  if [ "$WS_RC" != "0" ] && grep -qF "signer CN is 'Microsoft Corporation', expected 'Example Publisher'" <<<"$WS_D" \
+     && [ "$WS_RC2" != "0" ]; then pass
+  else fail "rc=$WS_RC/$WS_RC2: $WS_D / $WS_E"; fi
+
+  it "verify-authenticode.ps1 fails a valid signature that does not chain through the Artifact Signing intermediate"
+  WS_RC=0; WS_D="$(ws_ps1 "$WS_MS" "Microsoft Corporation" "Microsoft ID Verified Code Signing PCA 2021")" || WS_RC=$?
+  if [ "$WS_RC" != "0" ] && grep -qF "does not pass through 'Microsoft ID Verified Code Signing PCA 2021'" <<<"$WS_D"; then pass
+  else fail "rc=$WS_RC: $WS_D"; fi
+
+  it "verify-authenticode.ps1 fails an unsigned file"
+  WS_RC=0; WS_D="$(ws_ps1 "$WS_PE" "Microsoft Corporation" "$WS_INTER_MS")" || WS_RC=$?
+  if [ "$WS_RC" != "0" ] && grep -qF "'NotSigned'" <<<"$WS_D"; then pass; else fail "rc=$WS_RC: $WS_D"; fi
+
+  # A path is an argument, never code: quotes, $ and spaces reach the cmdlet
+  # as data and the copy (signature and all) verifies like the original.
+  it "verify-authenticode.ps1 takes a hostile path as data"
+  WS_ODD="$WS/it's a \$(x) dir"
+  mkdir -p "$WS_ODD" && cp "$WS_MS" "$WS_ODD/sign tool;copy.exe"
+  WS_RC=0; WS_D="$(ws_ps1 "$WS_ODD/sign tool;copy.exe" "Microsoft Corporation" "$WS_INTER_MS")" || WS_RC=$?
+  if [ "$WS_RC" = "0" ]; then pass; else fail "rc=$WS_RC: $WS_D"; fi
+
+  it "win_verify end to end: real signtool verify /pa, then the pins, on the real signature"
+  WS_RC=0; WS_D="$(WS_SIGNTOOL="$WS_MS" WS_INTER="$WS_INTER_MS" OAM_WIN_SIGN_PUBLISHER="Microsoft Corporation" wg win_verify "$WS_ODD/sign tool;copy.exe" 2>&1)" || WS_RC=$?
+  WS_RC2=0; WS_E="$(WS_SIGNTOOL="$WS_MS" OAM_WIN_SIGN_PUBLISHER="Microsoft Corporation" wg win_verify "$WS_MS" 2>&1)" || WS_RC2=$?
+  if [ "$WS_RC" = "0" ] && [ "$WS_RC2" != "0" ] && grep -qF 'PCA 2021' <<<"$WS_E"; then pass
+  else fail "pinned rc=$WS_RC: $WS_D"$'\n'"       default-intermediate rc=$WS_RC2: $WS_E"; fi
+else
+  it "verify-authenticode.ps1 against a real Microsoft signature"
+  skip "needs powershell.exe, cygpath and an x64 signtool >= SDK 10.0.22621 (found: '${WS_MS:-none}', intermediate '${WS_INTER_MS:-?}')"
+fi
+
+it "verify-authenticode.ps1 is ASCII and takes its inputs as parameters"
+if LC_ALL=C grep -q '[^[:print:][:space:]]' scripts/lib/verify-authenticode.ps1; then fail "non-ASCII bytes"
+elif grep -qE '^param\(' scripts/lib/verify-authenticode.ps1 && ! grep -qE 'Invoke-Expression|iex[[:space:]]' scripts/lib/verify-authenticode.ps1; then pass
+else fail "no param() block, or an Invoke-Expression"; fi
+
+# =============================================================================
 group "release scripts -- signing wiring and order"
 # =============================================================================
 # Order is the property: a correct signing block that moved after the tag push
@@ -2799,6 +3050,80 @@ for s in scripts/release-local.sh scripts/release-upload-local-arm64.sh scripts/
   grep -qE '(^|[;&|[:space:]])eval[[:space:]]' <<<"$SG_CODE" && SG_BAD="$SG_BAD $s(eval)"
 done
 if [ -z "$SG_BAD" ]; then pass; else fail "violations:$SG_BAD"; fi
+
+it "release-local.sh: the Windows signing preflight follows the release key's, before the dirty-tree check, the bump and the tag"
+sg_order scripts/release-local.sh 'release_signing_preflight "$TAG" || fail' \
+  'win_decision="$(win_sign_decision "$SKIP_WIN_SIGN")"' 'win_sign_preflight || fail' \
+  'restore_gate_artifacts "preflight"' 'bumping Cargo.toml to' 'git tag -a "$TAG" -m "$TAG"'
+
+# Signing between cp and smoke is what makes every later gate (smoke's CRT
+# check, the conpty e2e, the sidecar matrix) run the bytes that ship; the
+# re-verify before SHA256SUMS is what makes the checksums and the manifest
+# cover signed bytes.
+it "release-local.sh: each Windows asset is signed between its cp and its smoke, and re-verified before SHA256SUMS"
+sg_order scripts/release-local.sh \
+  'cp target/release/oam.exe "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"' \
+  'sign_win_asset "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"' \
+  'smoke "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"' \
+  'cp target/x64-host/release/oam.exe "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"' \
+  'sign_win_asset "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"' \
+  'smoke "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"' \
+  'OAM_CONPTY_BIN="$(cygpath -w "$asset")"' \
+  'win_verify "$exe" || fail' 'sha256sum oam-* > SHA256SUMS && cat SHA256SUMS' \
+  'release_write_manifest "$RELEASE_DIR" "$TAG"'
+
+it "release-local.sh: sign_win_asset is a no-op unless preflight decided to sign, and signs before it verifies"
+SG_H="$(awk '$0 == "sign_win_asset() {" { p = 1 } p { print } p && /^}$/ { exit }' scripts/release-local.sh)"
+SG_A="$(grep -nF '[ "$WIN_SIGNING" = "1" ] || return 0' <<<"$SG_H" | cut -d: -f1)"
+SG_S="$(grep -nF 'win_sign "$1" || fail' <<<"$SG_H" | cut -d: -f1)"
+SG_V="$(grep -nF 'win_verify "$1" || fail' <<<"$SG_H" | cut -d: -f1)"
+if [ -n "$SG_A" ] && [ -n "$SG_S" ] && [ -n "$SG_V" ] && [ "$SG_A" -lt "$SG_S" ] && [ "$SG_S" -lt "$SG_V" ]; then pass
+else fail "sign_win_asset body out of shape:"$'\n'"$SG_H"; fi
+
+it "no script signs a build output under target/ in place"
+SG_BAD="$(grep -nE '(win_sign|sign_win_asset)[[:space:]].*target/' scripts/release-local.sh scripts/release-upload-local-arm64.sh | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#')"
+if [ -z "$SG_BAD" ]; then pass; else fail "signs under target/: $SG_BAD"; fi
+
+# The decision block itself, RUN, with the lib's real decision and stand-ins
+# for fail/warn and the (Azure-bound) preflight: required + unconfigured must
+# die here -- which the order assert above puts before any tag work -- and the
+# skip and bootstrap cases must warn and carry on unsigned.
+SG_BLK="$(awk '/^WIN_SIGNING=0$/ { f = 1 } f { print } f && /^esac$/ { exit }' scripts/release-local.sh)"
+printf '%s\n' "$SG_BLK" >"$WS/decision-block.sh"
+ws_block(){ # <SKIP_WIN_SIGN> <preflight rc>
+  ( # shellcheck source=lib/signing.sh
+    . scripts/lib/signing.sh
+    fail(){ echo "FAIL: $*"; exit 1; }
+    warn(){ echo "WARN: $*"; }
+    # shellcheck disable=SC2034  # read by the sourced block
+    SKIP_WIN_SIGN="$1"; WS_PF_RC="$2"
+    win_sign_preflight(){ echo "PREFLIGHT"; return "$WS_PF_RC"; }
+    # shellcheck disable=SC1091
+    . "$WS/decision-block.sh"
+    echo "WIN_SIGNING=$WIN_SIGNING" ) 2>&1
+}
+it "release-local.sh's Windows decision block: required + unconfigured fails; skip and bootstrap warn and go on unsigned"
+WS_A="$(OAM_SIGN_REQUIRED=1 ws_block 0 0)"; WS_RA=$?
+WS_B="$(ws_block 0 0)"
+WS_C="$(OAM_SIGN_REQUIRED=1 OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P ws_block 1 0)"
+if [ "$WS_RA" != "0" ] && grep -q '^FAIL: OAM_SIGN_REQUIRED=1' <<<"$WS_A" && ! grep -q 'WIN_SIGNING=' <<<"$WS_A" \
+   && grep -q '^WARN: .*bootstrap' <<<"$WS_B" && grep -q '^WIN_SIGNING=0$' <<<"$WS_B" \
+   && grep -q '^WARN: OAM_SKIP_WIN_SIGN=1' <<<"$WS_C" && grep -q '^WIN_SIGNING=0$' <<<"$WS_C" \
+   && ! grep -q PREFLIGHT <<<"$WS_B$WS_C"; then pass
+else fail "required: rc=$WS_RA '$WS_A'"$'\n'"       bootstrap: '$WS_B'"$'\n'"       skip: '$WS_C'"; fi
+
+it "release-local.sh's Windows decision block: configured runs the preflight and signs; a failed preflight is fatal"
+WS_A="$(OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P ws_block 0 0)"
+WS_B="$(OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P ws_block 0 1)"; WS_RB=$?
+if grep -q '^PREFLIGHT$' <<<"$WS_A" && grep -q '^WIN_SIGNING=1$' <<<"$WS_A" \
+   && [ "$WS_RB" != "0" ] && grep -q '^FAIL: Windows signing preflight failed' <<<"$WS_B" && ! grep -q 'WIN_SIGNING=' <<<"$WS_B"; then pass
+else fail "configured: '$WS_A'"$'\n'"       preflight fails: rc=$WS_RB '$WS_B'"; fi
+
+it "arm64 upload: Windows preflight before the build; the staged copy signed and verified before SHA256SUMS is patched"
+sg_order scripts/release-upload-local-arm64.sh 'win_decision="$(win_sign_decision' 'win_sign_preflight ||' \
+  'cargo build --release -p oam_cli' 'cp target/release/oam.exe "${tmp}/${ASSET}"' \
+  'win_sign "${tmp}/${ASSET}"' 'win_verify "${tmp}/${ASSET}"' "if (f != a) print }'" \
+  'sha256sum "$ASSET" >> SHA256SUMS.new' 'gh release upload "$TAG"'
 
 # =============================================================================
 group "install.sh / install.ps1 -- the embedded trust root"

@@ -117,16 +117,47 @@
 #                           changes the bootstrap case (no key committed yet):
 #                           0 warns and ships no manifest, 1 fails in preflight.
 #                           With a key committed, signing is mandatory either
-#                           way -- there is deliberately no knob that skips it
+#                           way -- there is deliberately no knob that skips it.
+#                           For Windows Authenticode, 1 makes an unset
+#                           OAM_WIN_SIGN_METADATA fatal instead of a warning
+#   OAM_WIN_SIGN_METADATA=<path>
+#                           Azure Artifact Signing metadata.json (Endpoint,
+#                           CodeSigningAccountName, CertificateProfileName),
+#                           kept OUTSIDE the repo. Set: both .exe assets MUST
+#                           be Authenticode-signed and verified. Unset: they
+#                           ship unsigned with a loud warning (bootstrap)
+#   OAM_WIN_SIGN_PUBLISHER=<name>
+#                           the validated publisher name every Windows
+#                           signature must carry as its CN and O. Set with
+#                           OAM_WIN_SIGN_METADATA, never committed
+#   OAM_SKIP_WIN_SIGN=1     ship the Windows assets WITHOUT Authenticode even
+#                           when configured or required (loud warning). Like
+#                           the other skips, it drops a guarantee, not a check
+#                           that failed: use it only when the service or TSA
+#                           is down and the release cannot wait
 #
 # The two remote legs run sequentially (simpler failure attribution). If
 # release wall-time becomes a problem, they are independent and could run as
 # background jobs with per-leg logs -- a future knob, not a v1 need.
 #
-# Signing: the binaries themselves still ship without Apple notarization or
-# Windows Authenticode (the @yawlabs distribution model -- scoop/curl/brew
-# fetch bypass Gatekeeper/SmartScreen quarantine). What IS signed is the
-# release: RELEASE-MANIFEST binds the tag to the SHA256SUMS bytes, and
+# Signing, two layers. The Windows binaries carry an Authenticode signature
+# from Azure Artifact Signing (scripts/lib/signing.sh, "Windows"), once
+# OAM_WIN_SIGN_METADATA is configured; the mac binaries do not yet carry a
+# Developer ID signature. Placement of the Windows layer:
+#   - preflight, beside the release key's: the tooling, a live `az` session,
+#     and a real throwaway signature + verify on a generated PE in a temp dir
+#     outside the repo -- never tag what we cannot sign;
+#   - each Windows leg: win_sign + win_verify on the STAGED copy, between its
+#     cp and its smoke (never target/release/oam.exe itself), so smoke, the
+#     CRT gate, the conpty e2e and the sidecar matrix all run the signed bytes;
+#   - right before SHA256SUMS: both .exe assets verified again from disk, so
+#     the checksums -- and the manifest -- cover exactly the signed bytes.
+# A dry run signs for real too: Artifact Signing signatures cost nothing to
+# leave behind (they bind no tag), but they do count against the account's
+# monthly signing quota.
+#
+# The second layer is the release: RELEASE-MANIFEST binds the tag to the
+# SHA256SUMS bytes, and
 # RELEASE-MANIFEST.sig is an ssh ed25519 signature over it (scripts/lib/
 # signing.sh has the why; release-keys/README.md the runbook). Placement:
 #   - preflight, before the dirty-tree check, the bump and the tag: start a
@@ -141,7 +172,7 @@
 #   - on any exit before it went live (a dry run, a rejected build, a fail()):
 #     the staged RELEASE-MANIFEST.sig is deleted, so no valid signature for an
 #     unpublished build of $TAG outlives the run (release_on_exit).
-# Binary signing (Authenticode, Developer ID) slots in where each binary lands
+# Mac Developer ID signing will slot in the same way: where each binary lands
 # in $RELEASE_DIR, before the SHA256SUMS step, so the manifest covers the
 # signed bytes.
 # =============================================================================
@@ -196,6 +227,9 @@ SKIP_LOCAL_GATE="${OAM_SKIP_LOCAL_GATE:-0}"
 SKIP_WIN_X64="${OAM_SKIP_WIN_X64:-0}"
 SKIP_MAC="${OAM_SKIP_MAC:-0}"
 SKIP_LINUX="${OAM_SKIP_LINUX:-0}"
+# Handed to win_sign_decision, which validates it (0|1); signing.sh itself
+# reads no skip knob.
+SKIP_WIN_SIGN="${OAM_SKIP_WIN_SIGN:-0}"
 
 RELEASE_DIR="$(mktemp -d -t oam-release-"$TAG"-XXXXXX)"
 # Separate from RELEASE_DIR on purpose: `gh release create "$RELEASE_DIR"/*`
@@ -236,6 +270,17 @@ smoke() {
       ;;
   esac
   ok "smoke ok ($bin)"
+}
+
+# sign_win_asset <staged-exe>: Authenticode-sign a STAGED Windows asset and
+# prove it from disk, when preflight decided this run signs. Called between
+# each Windows leg's cp and its smoke, so every later gate runs signed bytes.
+# win_sign refuses a path under target/ on its own; the staged copy is the
+# only thing signing may rewrite.
+sign_win_asset() {
+  [ "$WIN_SIGNING" = "1" ] || return 0
+  win_sign "$1" || fail "Authenticode signing failed for $(basename "$1") -- see above; nothing has been published"
+  win_verify "$1" || fail "$(basename "$1") does not verify after signing -- see above; nothing has been published"
 }
 
 # The gate's conformance + node-suite steps rewrite these committed artifacts
@@ -323,6 +368,16 @@ assert_tree_clean() {
 #     build that every verifier accepts. Once the draft is live the signature
 #     is public anyway and stays. A draft that was uploaded but never went live
 #     carries its own copy; the fail() messages there say to delete the draft.
+#
+# What it deliberately does NOT do: `az logout`. The Authenticode leg signs
+# through the operator's az CLI session, and that session is global to this
+# Windows user -- shared with every other az use on the box. Logging it out
+# here would break those, and clearing the MSAL cache would sign the operator
+# out of more than this run. The residual, stated: the az session outlives the
+# release, so a process running as this user can sign with the Certificate
+# Profile Signer role until the session expires. Bound it on the Entra side
+# (sign-in frequency, or PIM just-in-time activation of the Signer role), or
+# run `az logout` by hand after a release.
 RELEASE_LIVE=0
 release_on_exit() {
   release_agent_stop
@@ -426,6 +481,25 @@ case "$sign_decision" in
   skip:*) warn "${sign_decision#skip:}" ;;
   fail:*) fail "${sign_decision#fail:}" ;;
   *) fail "release_signing_decision returned '$sign_decision' -- refusing to guess whether to sign" ;;
+esac
+
+# Windows Authenticode, proven here for the same reason: each .exe is signed
+# right after its build, so a lapsed `az login`, a missing x64 .NET runtime, a
+# wrong metadata.json or a TSA outage would otherwise surface after the tag
+# went public. win_sign_preflight makes a REAL signature (Artifact Signing and
+# its TSA, end to end) on a generated PE in a temp dir outside the repo, then
+# verifies it as win_verify will verify the assets. Nothing is skipped
+# silently: the skip knob and the bootstrap case both warn.
+WIN_SIGNING=0
+win_decision="$(win_sign_decision "$SKIP_WIN_SIGN")"
+case "$win_decision" in
+  sign)
+    win_sign_preflight || fail "Windows signing preflight failed -- see above; nothing has been bumped or tagged (OAM_SKIP_WIN_SIGN=1 ships unsigned Windows assets deliberately)"
+    WIN_SIGNING=1
+    ;;
+  skip:*) warn "${win_decision#skip:}" ;;
+  fail:*) fail "${win_decision#fail:}" ;;
+  *) fail "win_sign_decision returned '$win_decision' -- refusing to guess whether to sign" ;;
 esac
 
 # --porcelain, not `git diff --quiet`: untracked files count too -- the
@@ -872,6 +946,7 @@ free_locked_binary target/release/oam.exe
 free_locked_binary target/release/deps/oam.exe
 cargo build --release -p oam_cli
 cp target/release/oam.exe "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"
+sign_win_asset "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"
 smoke "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"
 
 if [ "$SKIP_WIN_X64" = "1" ]; then
@@ -902,6 +977,7 @@ else
   CARGO_TARGET_DIR=target/x64-host \
     cargo +stable-x86_64-pc-windows-msvc build --release -p oam_cli
   cp target/x64-host/release/oam.exe "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"
+  sign_win_asset "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"
   smoke "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"   # runs under the OS's x64 emulation
 fi
 
@@ -958,6 +1034,17 @@ fi
 step "Assemble release assets + SHA256SUMS"
 # Checksums cover the BINARIES only -- the license files are staged after this
 # so they do not appear in a manifest install.sh verifies per-asset.
+#
+# Every staged .exe is verified once more first, from disk: the checksums and
+# the manifest below vouch for these exact bytes, so they must be the signed
+# ones -- whatever ran against them since signing (smoke, conpty, a daemon
+# holding the file) changed nothing.
+if [ "$WIN_SIGNING" = "1" ]; then
+  for exe in "$RELEASE_DIR"/oam-*.exe; do
+    [ -e "$exe" ] || continue
+    win_verify "$exe" || fail "$(basename "$exe") no longer verifies before checksumming -- see above; nothing has been published"
+  done
+fi
 ( cd "$RELEASE_DIR" && ls -lh oam-* >&2 && sha256sum oam-* > SHA256SUMS && cat SHA256SUMS >&2 )
 
 # The signed manifest wraps the SHA256SUMS just written -- from disk, so it is
