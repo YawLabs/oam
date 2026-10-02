@@ -84,17 +84,18 @@ try {
     console.log(`sync parent is a file: ${e.code} path=${e.path}`);
   }
   // node's binding gives an empty prefix five X's, which libuv refuses on
-  // Windows and glibc (macOS's mkdtemp(3) is not measured: see
-  // docs/node-divergences.md).
-  if (process.platform !== "darwin") {
-    try { fs.mkdtempSync(""); console.log("empty prefix: made"); } catch (e) {
-      console.log(`empty prefix: ${e.code} path=${e.path} message=${e.message}`);
-    }
-    await fsp.mkdtemp("").then(
-      () => console.log("promises empty prefix: made"),
-      (e) => console.log(`promises empty prefix: ${e.code} path=${JSON.stringify(e.path)} message=${e.message}`),
-    );
+  // Windows and glibc; macOS's mkdtemp(3) fills them (derived from Libc
+  // source -- this line is what measures it there).
+  try {
+    const got = fs.mkdtempSync("");
+    console.log(`empty prefix: made name=${/^[A-Za-z0-9]{5}$/.test(got)}`);
+  } catch (e) {
+    console.log(`empty prefix: ${e.code} path=${e.path} message=${e.message}`);
   }
+  await fsp.mkdtemp("").then(
+    (got) => console.log(`promises empty prefix: made name=${/^[A-Za-z0-9]{5}$/.test(got)}`),
+    (e) => console.log(`promises empty prefix: ${e.code} path=${JSON.stringify(e.path)} message=${e.message}`),
+  );
 } finally {
   process.chdir(home);
   fs.rmSync(base, { recursive: true, force: true });

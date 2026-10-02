@@ -3104,7 +3104,8 @@ coded error.
 
 `mkdtempSync`, `fs.mkdtemp` and `fs/promises.mkdtemp` follow node v22.22.2's binding and
 libuv's `uv_fs_mkdtemp`: the prefix as given (relative to the cwd, never joined to
-`os.tmpdir()`), six characters of `[A-Za-z0-9]` from the OS CSPRNG, a fresh name only when
+`os.tmpdir()`), six characters of `[A-Za-z0-9]` from the OS CSPRNG (on macOS the whole trailing
+run of X's, as Darwin's mkdtemp(3) does -- see the Linux and macOS caveat below), a fresh name only when
 the last one exists, the options and prefix checks in node's order, the result in the
 encoding asked for, the once-per-process warning for a template ending in `X`, and the path
 each failure names (`conformance/cases/302-*`, `303-*`; up to 0.17.1 oam appended a 19-digit
@@ -3340,10 +3341,13 @@ comment, **not** something measured. Do not rely on either the claim or its nega
   see what Node shows. _(source: `crates/oam_core/src/net_connect.rs` `classify_resolve`)_
 - **`fs.mkdtemp` on Linux and macOS.** Derived from libuv, glibc and node source, not run:
   an async failure names the last name mkdtemp(3) tried (`mkdtemp 'nope/x-AbC123'`) where
-  Windows names the template, and the sync one names the template everywhere. On macOS an
-  empty prefix (node's binding passes `XXXXX`, five X's) may be accepted by the libc's
-  mkdtemp(3), where oam refuses it `EINVAL` as glibc and Windows do; case 302 skips that line
-  on darwin until it is measured.
+  Windows names the template, and the sync one names the template everywhere. On macOS,
+  Darwin's mkdtemp(3) replaces the template's whole trailing run of X's, not the last six,
+  and oam does the same there: `mkdtempSync("aX")` makes `a` plus seven random characters
+  (on Windows and Linux `aX` plus six), and an empty prefix's five-X template is filled
+  rather than refused `EINVAL`. That is read from Darwin's Libc `_gettemp` and node's own fs
+  docs, not yet run on a Mac; cases 302 (empty prefix) and 303 (a prefix of X's) check it
+  against node the next time conformance runs on darwin.
 - **`oam run --record` / `--replay`** may not capture `crypto.getRandomValues` /
   `randomUUID`, or wall-clock reads inside timer callbacks.
 

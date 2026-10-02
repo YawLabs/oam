@@ -2422,7 +2422,8 @@ pub fn fs_error_path(path: &str) -> std::borrow::Cow<'_, str> {
 ///
 /// The binding appends the X's with `snprintf(out + len, len + 6, "%s",
 /// "XXXXXX")`, whose size bound is the length of the WHOLE buffer, so an
-/// empty prefix gets only five X's and libuv refuses the template: node's
+/// empty prefix gets only five X's, which libuv refuses on Windows and glibc (macOS's
+/// mkdtemp(3) fills them, see `MKDTEMP_FILLS_X_RUN`): node's
 /// `mkdtempSync("")` fails `EINVAL: invalid argument, mkdtemp 'XXXXX'`. That
 /// quirk is reproduced here rather than in `mkdtemp`, so the permission check
 /// and the error name the same template node's do.
@@ -2434,10 +2435,29 @@ pub fn mkdtemp_template(prefix: &str) -> String {
     template
 }
 
-/// What libuv's mkdtemp puts in place of the template's `XXXXXX`: six
-/// characters of [a-zA-Z0-9], the alphabet of libuv's Windows `fs__make_tmp`
-/// and glibc's `__gen_tempname` alike.
+/// What libuv's mkdtemp puts in place of the template's X's: characters of
+/// [a-zA-Z0-9], the alphabet of libuv's Windows `fs__make_tmp`, glibc's
+/// `__gen_tempname` and Darwin's `_gettemp` (`padchar`) alike.
 const MKDTEMP_CHARS: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+/// How many base-62 characters one 64-bit draw spells: 62^10 < 2^64 < 62^11.
+/// Six X's (every platform but macOS, and macOS for a prefix not ending in
+/// X) still take exactly one draw per name.
+const MKDTEMP_CHARS_PER_DRAW: usize = 10;
+
+/// Whether this platform's mkdtemp replaces the template's WHOLE run of
+/// trailing X's rather than exactly the last six. libuv's Unix
+/// `uv__fs_mkdtemp` hands the template to the libc's mkdtemp(3) as given,
+/// and Darwin's (`_gettemp`, Libc's FreeBSD-derived `mktemp.c`) fills
+/// `while (trv >= path && *trv == 'X')` with no minimum: there node's
+/// `mkdtempSync("aX")` (template `aXXXXXXX`) makes `a` plus seven random
+/// characters, and the five-X template of an empty prefix is accepted.
+/// node's fs docs say as much ("some platforms, notably the BSDs, can return
+/// more than six random characters, and replace trailing X characters in
+/// prefix"). glibc and libuv's Windows loop replace exactly six and refuse
+/// fewer. Derived from source, not run on a Mac: conformance cases 302
+/// (empty prefix) and 303 (a prefix of X's) measure it on darwin.
+const MKDTEMP_FILLS_X_RUN: bool = cfg!(target_os = "macos");
 
 /// How many names mkdtemp tries before giving up: the platform's `TMP_MAX`,
 /// as libuv's Windows loop and glibc's both count -- 32767 in the MSVC CRT,
@@ -2450,11 +2470,12 @@ const MKDTEMP_TRIES: u32 = 238_328;
 
 /// node's `mkdtemp` (libuv `uv_fs_mkdtemp`), the one implementation the sync
 /// op and the async op both run: `template` (from `mkdtemp_template`) must
-/// end in `XXXXXX` or the call fails EINVAL; each try replaces those six
-/// characters with fresh ones from the OS CSPRNG -- one 64-bit draw spelled
-/// in base 62, libuv's Windows scheme -- and creates that directory, trying
-/// again only when the name already exists. The directory is made 0700 on
-/// Unix, as mkdtemp(3) makes it.
+/// end in `XXXXXX` or the call fails EINVAL (on macOS it need only be
+/// non-empty); each try replaces those six characters (on macOS the whole
+/// trailing run of X's, see `MKDTEMP_FILLS_X_RUN`) with fresh ones from the
+/// OS CSPRNG -- 64-bit draws spelled in base 62, libuv's Windows scheme --
+/// and creates that directory, trying again only when the name already
+/// exists. The directory is made 0700 on Unix, as mkdtemp(3) makes it.
 ///
 /// Ok is the created path: the template with its X's replaced, separators and
 /// relativity exactly as given (node returns `sub/x-AbC123` for `sub/x-`).
@@ -2465,7 +2486,7 @@ const MKDTEMP_TRIES: u32 = 238_328;
 /// failed RtlGenRandom or running out of tries "clobbers" it to the empty
 /// string (`mkdtemp ''`). On Unix mkdtemp(3) fills libuv's copy in place
 /// before creating, so a failed create leaves the last name tried, and a
-/// template without six X's is refused untouched. node's SYNC error names
+/// template it refuses is left untouched. node's SYNC error names
 /// the template on every platform (`FSReqWrapSync::path_p` is the binding's
 /// own buffer, which libuv never writes), so the sync op ignores this path.
 /// Running out of tries fails EEXIST on both (glibc's answer, and on Windows
@@ -2474,29 +2495,46 @@ const MKDTEMP_TRIES: u32 = 238_328;
 pub fn mkdtemp(template: &str) -> Result<String, (std::io::Error, String)> {
     // libuv reports a failed RtlGenRandom as EIO; io::Error::other is what
     // node_error_code reads as EIO.
-    mkdtemp_drawing(template, MKDTEMP_TRIES, || {
+    mkdtemp_drawing(template, MKDTEMP_TRIES, MKDTEMP_FILLS_X_RUN, || {
         getrandom::u64().map_err(|e| std::io::Error::other(e.to_string()))
     })
 }
 
-/// `mkdtemp` over a given number of tries and a given source of 64-bit
-/// draws, so the tests can force collisions.
+/// `mkdtemp` over a given number of tries, either X rule (`fills_x_run`:
+/// macOS's), and a given source of 64-bit draws, so the tests can force
+/// collisions and run both rules on any host.
 fn mkdtemp_drawing(
     template: &str,
     tries: u32,
+    fills_x_run: bool,
     mut next_draw: impl FnMut() -> std::io::Result<u64>,
 ) -> Result<String, (std::io::Error, String)> {
-    let Some(stem) = template.strip_suffix("XXXXXX") else {
+    let x_run = template.bytes().rev().take_while(|&b| b == b'X').count();
+    let refused = if fills_x_run {
+        template.is_empty()
+    } else {
+        x_run < 6
+    };
+    if refused {
         let e = std::io::Error::from(std::io::ErrorKind::InvalidInput);
         return Err((e, mkdtemp_refused_path(template)));
-    };
+    }
+    let fill = if fills_x_run { x_run } else { 6 };
+    // Darwin tries a template with no X's once: it has no permutation to
+    // cycle through and fails EEXIST. (node's templates always end in X.)
+    let tries = if fill == 0 { 1 } else { tries };
+    // The X's are ASCII, so this is a char boundary.
+    let stem = &template[..template.len() - fill];
     let mut path = String::with_capacity(template.len());
     let mut last_error = std::io::Error::from(std::io::ErrorKind::AlreadyExists);
     for _ in 0..tries {
-        let mut draw = next_draw().map_err(|e| (e, mkdtemp_refused_path(template)))?;
         path.clear();
         path.push_str(stem);
-        for _ in 0..6 {
+        let mut draw = 0;
+        for i in 0..fill {
+            if i % MKDTEMP_CHARS_PER_DRAW == 0 {
+                draw = next_draw().map_err(|e| (e, mkdtemp_refused_path(template)))?;
+            }
             path.push(char::from(MKDTEMP_CHARS[(draw % 62) as usize]));
             draw /= 62;
         }
@@ -5862,13 +5900,13 @@ mod tests {
         // draw 1 "baaaaa".
         std::fs::create_dir(format!("{base}r-aaaaaa")).unwrap();
         let mut draws = [0u64, 0, 1].into_iter();
-        let dir = mkdtemp_drawing(&template, 10, || Ok(draws.next().unwrap())).unwrap();
+        let dir = mkdtemp_drawing(&template, 10, false, || Ok(draws.next().unwrap())).unwrap();
         assert_eq!(dir, format!("{base}r-baaaaa"));
         assert_eq!(draws.next(), None);
 
         // Out of tries: EEXIST, after exactly `tries` draws.
         let mut count = 0;
-        let (e, path) = mkdtemp_drawing(&template, 3, || {
+        let (e, path) = mkdtemp_drawing(&template, 3, false, || {
             count += 1;
             Ok(0)
         })
@@ -5887,7 +5925,7 @@ mod tests {
         // (libuv fills it in only on success) and the name tried elsewhere.
         let missing = format!("{base}nope/q-XXXXXX");
         let mut count = 0;
-        let (e, path) = mkdtemp_drawing(&missing, 10, || {
+        let (e, path) = mkdtemp_drawing(&missing, 10, false, || {
             count += 1;
             Ok(0)
         })
@@ -5901,15 +5939,78 @@ mod tests {
         }
 
         // A template not ending in six X's is EINVAL, with no draw.
-        let (e, path) = mkdtemp_drawing("XXXXX", 10, || unreachable!()).unwrap_err();
+        let (e, path) = mkdtemp_drawing("XXXXX", 10, false, || unreachable!()).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(path, if cfg!(windows) { "" } else { "XXXXX" });
 
         // A failed draw is EIO-shaped and refuses like EINVAL.
-        let (e, path) = mkdtemp_drawing(&template, 10, || Err(std::io::Error::other("no entropy")))
-            .unwrap_err();
+        let (e, path) = mkdtemp_drawing(&template, 10, false, || {
+            Err(std::io::Error::other("no entropy"))
+        })
+        .unwrap_err();
         assert_eq!(node_error_code(&e), "EIO");
         assert_eq!(path, if cfg!(windows) { "" } else { template.as_str() });
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn mkdtemp_x_rules_six_or_the_whole_run() {
+        let base = mkdtemp_test_dir("xrun");
+        let suffix_of = |dir: &str, stem: &str| {
+            dir.strip_prefix(&format!("{base}{stem}"))
+                .unwrap()
+                .to_string()
+        };
+
+        // Windows / glibc: exactly the last six, prefix X's kept.
+        let six = mkdtemp_drawing(
+            &mkdtemp_template(&format!("{base}xXXXXXX")),
+            10,
+            false,
+            || Ok(0),
+        )
+        .unwrap();
+        assert_eq!(suffix_of(&six, "xXXXXXX"), "aaaaaa");
+
+        // macOS: the whole trailing run, the prefix's own X's included, from
+        // as many draws as it takes (ten characters per draw).
+        let mut draws = 0;
+        let run = mkdtemp_drawing(
+            &mkdtemp_template(&format!("{base}yXXXXXX")),
+            10,
+            true,
+            || {
+                draws += 1;
+                Ok(1)
+            },
+        )
+        .unwrap();
+        assert_eq!(suffix_of(&run, "y"), "baaaaaaaaaba", "12 X's from 2 draws");
+        assert_eq!(draws, 2);
+        let ax =
+            mkdtemp_drawing(&mkdtemp_template(&format!("{base}a")), 10, true, || Ok(0)).unwrap();
+        assert_eq!(
+            suffix_of(&ax, "a"),
+            "aaaaaa",
+            "no X in the prefix: six, as elsewhere"
+        );
+        let ax =
+            mkdtemp_drawing(&mkdtemp_template(&format!("{base}aX")), 10, true, || Ok(0)).unwrap();
+        assert_eq!(suffix_of(&ax, "a"), "aaaaaaa", "aX: a plus seven");
+        assert!(std::path::Path::new(&ax).is_dir());
+        // The empty prefix's five X's are accepted and filled.
+        let empty = format!("{base}XXXXX");
+        let five = mkdtemp_drawing(&empty, 10, true, || Ok(2)).unwrap();
+        assert_eq!(suffix_of(&five, ""), "caaaa");
+        // ...and refused under the six-X rule.
+        let (e, _) = mkdtemp_drawing(&empty, 10, false, || unreachable!()).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        // Only an empty template is refused outright; one with no X's is
+        // tried once, as given.
+        let (e, _) = mkdtemp_drawing("", 10, true, || unreachable!()).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        let (e, _) = mkdtemp_drawing(&five, 10, true, || unreachable!()).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AlreadyExists);
         let _ = std::fs::remove_dir_all(&base);
     }
 

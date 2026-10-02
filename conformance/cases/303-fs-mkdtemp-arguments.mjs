@@ -89,6 +89,16 @@ try {
   fs.mkdtempSync("aX");
   await fsp.mkdtemp("bX");
   fs.mkdtempSync("plain-");
+  // ...and is why: Windows and glibc replace exactly the six X's node
+  // appends, keeping the prefix's own, while macOS's mkdtemp(3) replaces the
+  // whole trailing run (keeping all six by chance is 1 in 62^6). Up to the
+  // fix oam replaced six everywhere.
+  for (const [label, xs] of [["sync", fs.mkdtempSync("xXXXXXX")], ["promises", await fsp.mkdtemp("yXXXXXX")]]) {
+    console.log(
+      `${label} prefix of X's: length=${xs.length} keptPrefix=${xs.slice(1, 7) === "XXXXXX"}` +
+      ` alnum=${/^[xy][A-Za-z0-9]{12}$/.test(xs)}`,
+    );
+  }
   await new Promise((res) => setImmediate(res));
   console.log(`warnings: ${JSON.stringify(warnings)}`);
 } finally {
