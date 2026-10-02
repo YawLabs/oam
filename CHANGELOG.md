@@ -116,7 +116,9 @@ e2e test.
   lookup; `AI_ADDRCONFIG` is still not passed to the resolver.
 - **undici `request()` ignored `headersTimeout` and `bodyTimeout`** (#218). It raises
   `UND_ERR_HEADERS_TIMEOUT` / `UND_ERR_BODY_TIMEOUT`, starting the headers timer once a
-  connection has the request, and reads an Agent factory's dispatcher's own limits.
+  connection has the request, and reads an Agent factory's dispatcher's own limits. Both
+  lapse on undici's 499 ms FastTimer clock, as node's do (anything up to 998 ms after about
+  1 s), and their errors carry `message` as an own key.
 - **`undici.request` rejected with `TypeError: fetch failed`**; it rejects with the error
   itself, and its body fails with undici's error rather than fetch's `terminated`.
 - **Coded errors had the wrong shape** (#170, #171): `code` and `message` are in node's order
@@ -161,7 +163,9 @@ e2e test.
   does not know writes UTF-8.
 - **`fs.cp` / `cpSync` of a directory onto a file, or a file onto a directory, started
   copying** and failed on the way with `copyfile`'s `ENOENT` or `EPERM`; they fail first, with
-  nothing copied, with node's `ERR_FS_CP_DIR_TO_NON_DIR` / `ERR_FS_CP_NON_DIR_TO_DIR`.
+  nothing copied, with node's `ERR_FS_CP_DIR_TO_NON_DIR` / `ERR_FS_CP_NON_DIR_TO_DIR` -- a
+  `SystemError` from `cp` and `fs.promises.cp` -- and a directory copied without `recursive`
+  is node's `ERR_FS_EISDIR`, where oam said `ERR_FS_CP_DIR_TO_NON_DIR` "-r not specified".
 - **An http server's connection socket closed before the request was aborted** (it emitted
   `'close'` a tick after `destroy()`, ahead of `'aborted'` and the response's `'close'`); it
   closes when the connection has, and that `'close'` drives the abort in node's order.
@@ -203,6 +207,23 @@ e2e test.
 - **zlib ignored the `dictionary` option**. Inflate and deflate (and their raw forms) use it:
   a zlib stream carries `FDICT` and the dictionary's `DICTID`, a wrong dictionary is node's
   `Bad dictionary`, and the option is validated for every zlib class.
+- **A malformed response head on oam's own transport was `socket hang up`** (and fetch's
+  cause a code-less `error sending request`); it is the parser's `HPE_INVALID_STATUS` /
+  `HPE_INVALID_CONSTANT`, undici's `HTTPParserError` for fetch.
+- **A write after `end()` on an http message was silent** -- `true` with a null callback on
+  a client request, `false` with nothing on a server response; both now return `false` and
+  report `ERR_STREAM_WRITE_AFTER_END` to the callback and as `'error'`. A chunk is checked
+  before anything else, `end()` on a response whose connection closed neither builds a head
+  nor calls back, and `flushHeaders()` on a destroyed request renders its head.
+- **An `http.request` response had no `trailers` or `rawTrailers`**; they start as `{}` and
+  `[]` and fill from a chunked body's trailer section.
+- **`undici.request()` ignored `throwOnError`, and a body destroyed early just closed**; a
+  status of 400 or more rejects with `ResponseStatusCodeError` (its body parsed by content
+  type), and the body errors with `RequestAbortedError`. A buffered body follows a 301 or
+  302 keeping its method and body, as undici's RedirectHandler does, and a FormData body is
+  sent as `multipart/form-data`.
+- **A failed `fs.read` called back with the error alone**; it calls back with `(err, 0,
+  buffer)`, as node's does.
 
 ## [0.17.1] - 2026-09-29
 
