@@ -22,7 +22,8 @@ pub use oam_diagnostics as diagnostics;
 pub mod byte_pipe;
 pub mod child;
 pub mod cluster;
-/// node:zlib's deflate and deflateRaw with the dictionary option.
+/// node:zlib's deflaters: gzip, zlib and raw deflate, with the dictionary
+/// option and `params()`.
 mod deflate;
 pub mod dns;
 /// oam's own HTTP client transport for the `fetch` op (#143).
@@ -970,7 +971,7 @@ pub fn adopt_inherited_fd(registry: &SyncFileRegistry, fd: u64) -> bool {
 /// zlibStreamWrite and _flush to zlibStreamFlush.
 ///
 /// Variants:
-/// - Compress/Decompress: gzip/deflate/deflateRaw (flate2 encoders,
+/// - Compress/Decompress: gzip/deflate/deflateRaw (NodeDeflate encoders,
 ///   NodeInflate decoders), truly incremental.
 /// - BrotliCompress/BrotliDecompress: pure-Rust brotli via the `brotli` crate.
 /// - HandleCompress/HandleDecompress: node's low-level zlib handle.
@@ -983,9 +984,7 @@ pub enum ZlibStream {
     // is paid once per brotli stream, never on the per-chunk write path.
     BrotliCompress(Box<BrotliCompressor>),
     BrotliDecompress(Box<BrotliDecompressor>),
-    HandleCompress(flate2::Compress),
-    /// A handle deflating with node's `dictionary` option.
-    HandleDictCompress(Box<zlib::DictDeflate>),
+    HandleCompress(Box<zlib::NodeDeflate>),
     HandleDecompress(Box<zlib::NodeInflate>),
 }
 
@@ -3036,10 +3035,8 @@ pub fn strip_unc_prefix(path: &std::path::Path) -> String {
 /// _transform feeds chunks via zlibStreamWrite and _flush finalizes via
 /// zlibStreamFlush.
 pub mod zlib {
-    pub use crate::deflate::DictDeflate;
+    pub use crate::deflate::NodeDeflate;
     pub use crate::inflate::{NodeInflate, Wrap, ZlibError};
-    use flate2::Compression;
-    use std::io::Write;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Format {
@@ -3059,30 +3056,10 @@ pub mod zlib {
         }
     }
 
+    /// All of `bytes` deflated in `format` at node's `level` (-1 is zlib's
+    /// default, 6).
     pub fn compress(bytes: &[u8], format: Format, level: i32) -> std::io::Result<Vec<u8>> {
-        // Node levels: -1 default, 0..=9. flate2 default is 6, same as zlib.
-        let level = if (0..=9).contains(&level) {
-            Compression::new(level as u32)
-        } else {
-            Compression::default()
-        };
-        match format {
-            Format::Gzip => {
-                let mut encoder = flate2::write::GzEncoder::new(Vec::new(), level);
-                encoder.write_all(bytes)?;
-                encoder.finish()
-            }
-            Format::Deflate => {
-                let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), level);
-                encoder.write_all(bytes)?;
-                encoder.finish()
-            }
-            Format::DeflateRaw => {
-                let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), level);
-                encoder.write_all(bytes)?;
-                encoder.finish()
-            }
-        }
+        compress_capped(bytes, format, level, None, None)
     }
 
     /// The message of the `io::Error` `decompress_capped` returns when the
@@ -3255,20 +3232,8 @@ pub mod zlib {
         }
     }
 
-    /// The deflater for node's `dictionary` option, if it applies: deflate
-    /// and deflateRaw with a non-empty dictionary (node_zlib.cc's
-    /// SetDictionary; gzip ignores the option, and an empty one is none).
-    fn dict_deflate(format: Format, level: i32, dictionary: Option<&[u8]>) -> Option<DictDeflate> {
-        let dictionary = dictionary.filter(|d| !d.is_empty())?;
-        match format {
-            Format::Gzip => None,
-            Format::Deflate => Some(DictDeflate::new(level, true, dictionary)),
-            Format::DeflateRaw => Some(DictDeflate::new(level, false, dictionary)),
-        }
-    }
-
     /// `compress` with node's `maxOutputLength`, which node applies to the
-    /// encoders as well, and its `dictionary` (see [`DictDeflate`]). The cap
+    /// encoders as well, and its `dictionary` (see [`NodeDeflate`]). The cap
     /// is checked on the finished buffer: compressed output is bounded by the
     /// input, so there is no bomb to stop early.
     pub fn compress_capped(
@@ -3278,10 +3243,7 @@ pub mod zlib {
         max_output: Option<usize>,
         dictionary: Option<&[u8]>,
     ) -> std::io::Result<Vec<u8>> {
-        let out = match dict_deflate(format, level, dictionary) {
-            Some(mut deflater) => deflater.deflate_vec(bytes, Z_FINISH),
-            None => compress(bytes, format, level)?,
-        };
+        let out = NodeDeflate::new(format, level, dictionary).finish_vec(bytes);
         match max_output {
             Some(cap) if out.len() > cap => Err(std::io::Error::other(OUTPUT_TOO_LARGE)),
             _ => Ok(out),
@@ -3307,11 +3269,10 @@ pub mod zlib {
     // ----------------------------------------------------------------
     // Incremental streaming: gzip / deflate / deflateRaw
     //
-    // We use flate2's write-based encoders (GzEncoder, ZlibEncoder,
-    // DeflateEncoder) for compression, draining the backing Vec<u8>
-    // via get_mut() + mem::take() after each write_all. This is truly
-    // incremental: compressed bytes are emitted per-chunk with no need
-    // to buffer the full input.
+    // Compression is NodeDeflate (crate::deflate), miniz's compressor
+    // driven directly: each chunk comes back as the bytes it completed, so
+    // nothing buffers the full input, and params() can change the level
+    // between chunks.
     //
     // Decompression is NodeInflate (crate::inflate): each chunk runs through
     // the inflate state machine and comes back as that chunk's output, with
@@ -3321,51 +3282,24 @@ pub mod zlib {
     // The "unzip" auto-detect variant resolves the format from the first
     // two bytes of the STREAM, however the writes carve it up.
     //
-    // Send requirement: all flate2 encoder types and NodeInflate are Send,
-    // and our wrappers hold no thread-local state.
+    // Send requirement: NodeDeflate and NodeInflate are Send, and our
+    // wrappers hold no thread-local state.
     // ----------------------------------------------------------------
 
-    /// Wraps any of the three flate2 write-encoders behind a uniform
-    /// interface. Created via `StreamCompressor::new`; consumes chunks via
-    /// `write_chunk`; finalizes via `finish` (emits the trailing CRC /
-    /// checksum bytes the format requires).
+    /// An incremental deflater for gzip, deflate or deflateRaw. Created via
+    /// `StreamCompressor::new`; consumes chunks via `write_chunk`;
+    /// finalizes via `finish` (emits the trailing CRC / checksum bytes the
+    /// format requires).
     pub struct StreamCompressor {
-        inner: CompressorInner,
-    }
-
-    enum CompressorInner {
-        Gzip(flate2::write::GzEncoder<Vec<u8>>),
-        Deflate(flate2::write::ZlibEncoder<Vec<u8>>),
-        DeflateRaw(flate2::write::DeflateEncoder<Vec<u8>>),
-        /// deflate or deflateRaw with a dictionary.
-        Dict(Box<DictDeflate>),
+        inner: NodeDeflate,
     }
 
     impl StreamCompressor {
-        /// `dictionary` is node's option (see [`DictDeflate`]).
+        /// `dictionary` is node's option (see [`NodeDeflate`]).
         pub fn new(format: Format, level: i32, dictionary: Option<&[u8]>) -> Self {
-            if let Some(deflater) = dict_deflate(format, level, dictionary) {
-                return Self {
-                    inner: CompressorInner::Dict(Box::new(deflater)),
-                };
+            Self {
+                inner: NodeDeflate::new(format, level, dictionary),
             }
-            let level = if (0..=9).contains(&level) {
-                Compression::new(level as u32)
-            } else {
-                Compression::default()
-            };
-            let inner = match format {
-                Format::Gzip => {
-                    CompressorInner::Gzip(flate2::write::GzEncoder::new(Vec::new(), level))
-                }
-                Format::Deflate => {
-                    CompressorInner::Deflate(flate2::write::ZlibEncoder::new(Vec::new(), level))
-                }
-                Format::DeflateRaw => CompressorInner::DeflateRaw(
-                    flate2::write::DeflateEncoder::new(Vec::new(), level),
-                ),
-            };
-            Self { inner }
         }
 
         /// Feed a chunk. Returns whatever bytes the encoder produced
@@ -3373,39 +3307,26 @@ pub mod zlib {
         /// until it has a full deflate block ready).
         #[inline]
         pub fn write_chunk(&mut self, chunk: &[u8]) -> std::io::Result<Vec<u8>> {
-            match &mut self.inner {
-                CompressorInner::Gzip(enc) => {
-                    enc.write_all(chunk)?;
-                    Ok(std::mem::take(enc.get_mut()))
-                }
-                CompressorInner::Deflate(enc) => {
-                    enc.write_all(chunk)?;
-                    Ok(std::mem::take(enc.get_mut()))
-                }
-                CompressorInner::DeflateRaw(enc) => {
-                    enc.write_all(chunk)?;
-                    Ok(std::mem::take(enc.get_mut()))
-                }
-                CompressorInner::Dict(enc) => Ok(enc.deflate_vec(chunk, 0)),
-            }
+            Ok(self.inner.deflate_vec(chunk, 0))
+        }
+
+        /// node's `params()`: what the encoder holds, under a sync flush,
+        /// then the new level, if any, for what follows.
+        pub fn params(&mut self, level: Option<i32>) -> Vec<u8> {
+            self.inner.params(level)
         }
 
         /// Flush and finalize. Consumes self; returns the tail bytes
         /// (including the gzip/zlib trailer). After this the stream handle
         /// is dropped -- close is implicit.
-        pub fn finish(self) -> std::io::Result<Vec<u8>> {
-            match self.inner {
-                CompressorInner::Gzip(enc) => enc.finish(),
-                CompressorInner::Deflate(enc) => enc.finish(),
-                CompressorInner::DeflateRaw(enc) => enc.finish(),
-                CompressorInner::Dict(mut enc) => Ok(enc.deflate_vec(&[], Z_FINISH)),
-            }
+        pub fn finish(mut self) -> std::io::Result<Vec<u8>> {
+            Ok(self.inner.finish_vec(&[]))
         }
     }
 
-    // `StreamCompressor` is `Send` by auto-derivation: `CompressorInner` holds
-    // only flate2 encoders over `Vec<u8>`, every one of which is `Send`, and the
-    // wrapper adds no thread-affine state. Deliberately NOT a manual
+    // `StreamCompressor` is `Send` by auto-derivation: `NodeDeflate` holds only
+    // miniz's compressor and owned buffers, all `Send`, and the wrapper adds
+    // no thread-affine state. Deliberately NOT a manual
     // `unsafe impl Send` -- that would suppress the compiler's own auto-trait
     // check and silently keep asserting `Send` if the inner types ever stopped
     // being it.
@@ -5064,11 +4985,11 @@ pub mod ops {
                 super::ZlibStream::BrotliDecompress(dec) => dec
                     .write_chunk(&chunk)
                     .map_err(|e| failed("brotli stream write", e)),
-                super::ZlibStream::HandleCompress(_)
-                | super::ZlibStream::HandleDictCompress(_)
-                | super::ZlibStream::HandleDecompress(_) => Err(Box::new(OpOutcome::Failed(
-                    "zlib handle: use zlibHandleWriteSync, not zlibStreamWrite".into(),
-                ))),
+                super::ZlibStream::HandleCompress(_) | super::ZlibStream::HandleDecompress(_) => {
+                    Err(Box::new(OpOutcome::Failed(
+                        "zlib handle: use zlibHandleWriteSync, not zlibStreamWrite".into(),
+                    )))
+                }
             }
         })
         .await;
@@ -5114,11 +5035,11 @@ pub mod ops {
                 super::ZlibStream::BrotliDecompress(dec) => {
                     dec.finish().map_err(|e| failed("brotli stream flush", e))
                 }
-                super::ZlibStream::HandleCompress(_)
-                | super::ZlibStream::HandleDictCompress(_)
-                | super::ZlibStream::HandleDecompress(_) => Err(Box::new(OpOutcome::Failed(
-                    "zlib handle: use close(), not zlibStreamFlush".into(),
-                ))),
+                super::ZlibStream::HandleCompress(_) | super::ZlibStream::HandleDecompress(_) => {
+                    Err(Box::new(OpOutcome::Failed(
+                        "zlib handle: use close(), not zlibStreamFlush".into(),
+                    )))
+                }
             }
         })
         .await;
@@ -5126,6 +5047,32 @@ pub mod ops {
             Ok(Ok(bytes)) => OpOutcome::Bytes(bytes),
             Ok(Err(failure)) => *failure,
             Err(e) => OpOutcome::Failed(format!("zlib stream flush task: {e}")),
+        }
+    }
+
+    /// zlibStreamParams: node's `params()` on a stream. A deflater returns
+    /// what it held, under a sync flush, and compresses what follows at
+    /// `level` if there is one (node changes it on a deflate or deflateRaw
+    /// stream, not gzip); an inflater or brotli stream has nothing to flush,
+    /// and returns no bytes (every write already returned what it decoded).
+    pub async fn zlib_stream_params(
+        streams: super::ZlibRegistry,
+        handle: u64,
+        level: Option<i32>,
+    ) -> OpOutcome {
+        let result = tokio::task::spawn_blocking(move || {
+            let mut guard = streams.lock().unwrap_or_else(|e| e.into_inner());
+            match guard.get_mut(&handle) {
+                Some(super::ZlibStream::Compress(enc)) => Ok(enc.params(level)),
+                Some(_) => Ok(Vec::new()),
+                None => Err(format!("zlib stream: handle {handle} not found")),
+            }
+        })
+        .await;
+        match result {
+            Ok(Ok(bytes)) => OpOutcome::Bytes(bytes),
+            Ok(Err(message)) => OpOutcome::Failed(message),
+            Err(e) => OpOutcome::Failed(format!("zlib stream params task: {e}")),
         }
     }
 
@@ -5158,7 +5105,7 @@ pub mod ops {
             .remove(&handle);
     }
 
-    /// zlibHandleCreate: allocate a low-level flate2 Compress or NodeInflate
+    /// zlibHandleCreate: allocate a low-level NodeDeflate or NodeInflate
     /// handle for Node's zlib binding interface (used by ssh2 etc.).
     /// mode: 1=DEFLATE, 2=INFLATE, 5=DEFLATERAW, 6=INFLATERAW. `dictionary`
     /// is the one node's `handle.init` takes.
@@ -5169,20 +5116,18 @@ pub mod ops {
         level: i32,
         dictionary: Option<&[u8]>,
     ) -> Result<u64, String> {
-        let zlib_header = mode == 1 || mode == 2;
         let dictionary = dictionary.filter(|d| !d.is_empty());
         let stream = match (mode, dictionary) {
-            (1 | 5, Some(dictionary)) => super::ZlibStream::HandleDictCompress(Box::new(
-                super::zlib::DictDeflate::new(level, zlib_header, dictionary),
-            )),
-            (1 | 5, None) => {
-                let lvl = if (0..=9).contains(&level) {
-                    flate2::Compression::new(level as u32)
-                } else {
-                    flate2::Compression::default()
-                };
-                super::ZlibStream::HandleCompress(flate2::Compress::new(lvl, zlib_header))
-            }
+            (1, _) => super::ZlibStream::HandleCompress(Box::new(super::zlib::NodeDeflate::new(
+                super::zlib::Format::Deflate,
+                level,
+                dictionary,
+            ))),
+            (5, _) => super::ZlibStream::HandleCompress(Box::new(super::zlib::NodeDeflate::new(
+                super::zlib::Format::DeflateRaw,
+                level,
+                dictionary,
+            ))),
             (2, _) => super::ZlibStream::HandleDecompress(Box::new(
                 super::zlib::NodeInflate::with_dictionary(super::zlib::Wrap::Zlib, dictionary),
             )),
@@ -5215,23 +5160,6 @@ pub mod ops {
             .ok_or_else(|| std::io::Error::other(format!("zlib handle {handle} not found")))?;
         match stream {
             super::ZlibStream::HandleCompress(c) => {
-                let before_in = c.total_in();
-                let before_out = c.total_out();
-                let fl = match flush {
-                    0 => flate2::FlushCompress::None,
-                    1 => flate2::FlushCompress::Partial,
-                    2 => flate2::FlushCompress::Sync,
-                    3 => flate2::FlushCompress::Full,
-                    4 => flate2::FlushCompress::Finish,
-                    _ => flate2::FlushCompress::None,
-                };
-                c.compress(input, output, fl)
-                    .map_err(|e| std::io::Error::other(format!("zlib handle compress: {e}")))?;
-                let consumed = (c.total_in() - before_in) as usize;
-                let produced = (c.total_out() - before_out) as usize;
-                Ok((output.len() - produced, input.len() - consumed))
-            }
-            super::ZlibStream::HandleDictCompress(c) => {
                 let (consumed, produced) = c.deflate(input, output, flush);
                 Ok((output.len() - produced, input.len() - consumed))
             }

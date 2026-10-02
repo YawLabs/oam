@@ -304,6 +304,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("zlibStreamCreate", op_zlib_stream_create),
         ("zlibStreamWrite", op_zlib_stream_write),
         ("zlibStreamFlush", op_zlib_stream_flush),
+        ("zlibStreamParams", op_zlib_stream_params),
         ("zlibStreamClose", op_zlib_stream_close),
         // node:zlib handle (sync incremental, for ssh2/native binding compat)
         ("zlibHandleCreate", op_zlib_handle_create),
@@ -5572,6 +5573,30 @@ fn op_zlib_stream_flush(
     );
 }
 
+/// zlibStreamParams(handle, level?) -> Promise<Uint8Array>.
+/// node's `params()` on a stream: a deflater's sync-flushed bytes, after
+/// which it compresses at `level` (an int32, as node's binding reads it).
+/// Without a level the stream only flushes, as node's gzip stream does.
+fn op_zlib_stream_params(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let level = args.get(1);
+    let level = if level.is_undefined() {
+        None
+    } else {
+        Some(level.int32_value(scope).unwrap_or(-1))
+    };
+    let streams = core_runtime!(scope).zlib_streams();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::zlib_stream_params(streams, handle, level),
+    );
+}
+
 /// zlibStreamClose(handle) -> void (synchronous).
 /// Discard the stream without flushing. Used when the stream is destroyed
 /// before it completes normally.
@@ -5586,7 +5611,7 @@ fn op_zlib_stream_close(
 }
 
 /// zlibHandleCreate(mode, level, dictionary?) -> handle (number).
-/// Allocates a low-level flate2 Compress/Decompress for Node's internal
+/// Allocates a low-level deflater or inflater for Node's internal
 /// zlib binding interface (ssh2's ZlibHandle pattern).
 fn op_zlib_handle_create(
     scope: &mut v8::PinScope<'_, '_>,

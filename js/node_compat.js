@@ -1117,6 +1117,13 @@
     }
     return 'The value of "' + name + '" is out of range. It must be ' + range + '. Received ' + shown;
   });
+  // node:zlib's Brotli constructor: a `params` key that is not a parameter
+  // number (0..kMaxBrotliParam) or names one already set, and a parameter
+  // the brotli library refuses (the decoder knows only 0 and 1).
+  codes.ERR_BROTLI_INVALID_PARAM = E("ERR_BROTLI_INVALID_PARAM", RangeError, function(param) {
+    return param + " is not a valid Brotli parameter";
+  });
+  codes.ERR_ZLIB_INITIALIZATION_FAILED = E("ERR_ZLIB_INITIALIZATION_FAILED", Error, "Initialization failed");
   codes.ERR_BUFFER_OUT_OF_BOUNDS = E("ERR_BUFFER_OUT_OF_BOUNDS", RangeError, function(name) {
     return name ? '"' + name + '" is outside of buffer bounds' : 'Attempt to access memory outside buffer bounds';
   });
@@ -18395,7 +18402,6 @@
             ? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
             : new Uint8Array(data);
     const asBuffer = (bytes) => BufferCtor.from(bytes.buffer, bytes.byteOffset, bytes.length);
-    const levelOf = (options) => options?.level ?? -1;
 
     const Z_NO_FLUSH = 0;
     const Z_PARTIAL_FLUSH = 1;
@@ -18444,73 +18450,59 @@
     }
 
 
-    // node's checkRangesOrGetDefault for options.maxOutputLength: undefined and
-    // NaN mean "no cap" (kMaxLength), a non-number is ERR_INVALID_ARG_TYPE,
-    // Infinity is "a finite number", anything outside 1..kMaxLength is
-    // ERR_OUT_OF_RANGE. Fractions pass (node compares the finished buffer to
-    // the raw value). Returned as undefined when there is no cap, so the
-    // native op reads "no argument".
+    // ---- Option validation: node v22.22.2's lib/zlib.js ------------------
+    // One implementation for every constructor, the .call(this) handle path
+    // and the one-shot forms (which, in node, construct an engine first),
+    // in node's order: the Zlib constructor checks windowBits, level,
+    // memLevel, strategy and dictionary (Brotli's checks params instead),
+    // then ZlibBase checks chunkSize, flush, finishFlush and maxOutputLength.
     const K_MAX_LENGTH = 9007199254740991;
-    const maxOutputLengthOf = (options) => {
-      const value = options?.maxOutputLength;
-      if (value === undefined || Number.isNaN(value)) return undefined;
-      const name = "options.maxOutputLength";
-      if (!Number.isFinite(value)) {
-        if (typeof value !== "number") throw codes.ERR_INVALID_ARG_TYPE(name, "number", value);
-        throw codes.ERR_OUT_OF_RANGE(name, "a finite number", value);
-      }
-      if (value < 1 || value > K_MAX_LENGTH) {
-        throw codes.ERR_OUT_OF_RANGE(name, ">= 1 and <= " + K_MAX_LENGTH, value);
+    const Z_DEFAULT_CHUNK = 16384;
+    const Z_MIN_CHUNK = 64;
+    const Z_MIN_WINDOWBITS = 8;
+    const Z_MAX_WINDOWBITS = 15;
+    const Z_DEFAULT_WINDOWBITS = 15;
+    const Z_MIN_LEVEL = -1;
+    const Z_MAX_LEVEL = 9;
+    const Z_DEFAULT_COMPRESSION = -1;
+    const Z_MIN_MEMLEVEL = 1;
+    const Z_MAX_MEMLEVEL = 9;
+    const Z_DEFAULT_MEMLEVEL = 8;
+    const Z_DEFAULT_STRATEGY = 0;
+    const Z_FIXED = 4;
+    const BROTLI_OPERATION_PROCESS = 0;
+    const BROTLI_OPERATION_FINISH = 2;
+    const BROTLI_OPERATION_EMIT_METADATA = 3;
+    // The highest BROTLI_PARAM_* (BROTLI_PARAM_NDIRECT): node's kMaxBrotliParam.
+    const K_MAX_BROTLI_PARAM = 8;
+    // node's brotliInitParamsArray, refilled per constructor: -1 (as a
+    // uint32) is "not set".
+    const brotliInitParams = new Uint32Array(K_MAX_BROTLI_PARAM + 1);
+
+    // node's checkFiniteNumber: undefined and NaN are "not given", a
+    // non-number is ERR_INVALID_ARG_TYPE, +-Infinity "a finite number".
+    const checkFiniteNumber = (value, name) => {
+      if (value === undefined) return false;
+      if (Number.isFinite(value)) return true;
+      if (Number.isNaN(value)) return false;
+      if (typeof value !== "number") throw codes.ERR_INVALID_ARG_TYPE(name, "number", value);
+      throw codes.ERR_OUT_OF_RANGE(name, "a finite number", value);
+    };
+    // node's checkRangesOrGetDefault. A fraction in range passes: the
+    // binding reads the number as an int32, as the natives here do.
+    const checkRangesOrGetDefault = (value, name, lower, upper, def) => {
+      if (!checkFiniteNumber(value, name)) return def;
+      if (value < lower || value > upper) {
+        throw codes.ERR_OUT_OF_RANGE(name, ">= " + lower + " and <= " + upper, value);
       }
       return value;
     };
-    // The native op reports an output past the cap with exactly this message
-    // (oam_core::zlib::OUTPUT_TOO_LARGE); node raises ERR_BUFFER_TOO_LARGE
-    // naming the caller's value.
-    const OUTPUT_TOO_LARGE = "zlib output exceeds maxOutputLength";
-    // node's checkRangesOrGetDefault for options.flush / options.finishFlush
-    // (ZlibBase, which every zlib class and one-shot call constructs):
-    // undefined and NaN take the default, a non-number is
-    // ERR_INVALID_ARG_TYPE, anything outside Z_NO_FLUSH..Z_BLOCK is
-    // ERR_OUT_OF_RANGE. Validated in node's order: flush, finishFlush, then
-    // maxOutputLength.
-    const flushOptionOf = (options, key, def) => {
-      const value = options?.[key];
-      if (value === undefined || Number.isNaN(value)) return def;
-      const name = "options." + key;
-      if (!Number.isFinite(value)) {
-        if (typeof value !== "number") throw codes.ERR_INVALID_ARG_TYPE(name, "number", value);
-        throw codes.ERR_OUT_OF_RANGE(name, "a finite number", value);
-      }
-      if (value < Z_NO_FLUSH || value > Z_BLOCK) {
-        throw codes.ERR_OUT_OF_RANGE(name, ">= " + Z_NO_FLUSH + " and <= " + Z_BLOCK, value);
-      }
-      return value;
-    };
-    // The finishing flush an inflate ends with (node's `finishFlush`). Only
-    // Z_FINISH makes a stream that stops short an error ("unexpected end of
-    // file"); axios and node-fetch pass Z_SYNC_FLUSH to get what decoded. The
-    // natives take it as an int32 (a fraction truncates, as node's binding
-    // does); the deflaters always finish the stream.
-    const finishFlushOf = (options) => {
-      flushOptionOf(options, "flush", Z_NO_FLUSH);
-      return flushOptionOf(options, "finishFlush", Z_FINISH);
-    };
-    const bufferTooLarge = (max) => {
-      const err = new RangeError("Cannot create a Buffer larger than " + max + " bytes");
-      applyNodeErrorShape(err, "ERR_BUFFER_TOO_LARGE");
-      return err;
-    };
-    const translate = (err, max) =>
-      err instanceof Error && err.message === OUTPUT_TOO_LARGE ? bufferTooLarge(max) : err;
-    // node's Zlib constructor reads options.dictionary for every zlib class
-    // (gzip and gunzip accept it and do not use it): a Buffer, TypedArray or
-    // DataView is used as is, an ArrayBuffer is wrapped, and anything else --
-    // null included -- is ERR_INVALID_ARG_TYPE, thrown before ZlibBase
-    // checks flush, finishFlush and maxOutputLength. Brotli has no such
-    // option. The natives read the view's bytes.
+    // options.dictionary, for every zlib class (gzip and gunzip accept it
+    // and do not use it): a Buffer, TypedArray or DataView is used as is,
+    // an ArrayBuffer is wrapped, and anything else -- null included -- is
+    // ERR_INVALID_ARG_TYPE. Brotli has no such option and does not look.
     const dictionaryOf = (options) => {
-      const value = options?.dictionary;
+      const value = options.dictionary;
       if (value === undefined || ArrayBuffer.isView(value)) return value;
       if (isAnyArrayBuffer(value)) return new Uint8Array(value);
       throw codes.ERR_INVALID_ARG_TYPE(
@@ -18519,47 +18511,210 @@
         value,
       );
     };
-    // Which formats use the dictionary option, as node's zlib does:
-    // it validates the option for every zlib class but sets it only on a
-    // deflate/inflate stream (zlib's deflateSetDictionary/inflateSetDictionary);
-    // a gzip member never carries one. Brotli has no such option and does
-    // not look at it.
-    const dictionaryFor = (format, options) => {
-      if (format === "brotli") return undefined;
-      const dictionary = dictionaryOf(options);
-      return format === "gzip" ? undefined : dictionary;
+    // options.params for Brotli, as node reads it: each key must be a
+    // parameter number not already set (so `{ 1: 3, '0x1': 5 }` names 1
+    // twice), each value a number or boolean, and a value of -1 (as a
+    // uint32) is "not set". The encoder takes every parameter; the
+    // decoder's library refuses all but DISABLE_RING_BUFFER_REALLOCATION (0)
+    // and LARGE_WINDOW (1), which node reports as
+    // ERR_ZLIB_INITIALIZATION_FAILED before ZlibBase's checks. The values
+    // are not used: oam's brotli runs at fixed settings
+    // (docs/node-divergences.md).
+    const checkBrotliParams = (options, compress) => {
+      brotliInitParams.fill(-1);
+      const params = options.params;
+      if (params) {
+        for (const origKey of Object.keys(params)) {
+          const key = +origKey;
+          if (Number.isNaN(key) || key < 0 || key > K_MAX_BROTLI_PARAM ||
+              (brotliInitParams[key] | 0) !== -1) {
+            throw codes.ERR_BROTLI_INVALID_PARAM(origKey);
+          }
+          const value = params[origKey];
+          if (typeof value !== "number" && typeof value !== "boolean") {
+            throw codes.ERR_INVALID_ARG_TYPE("options.params[key]", "number", value);
+          }
+          brotliInitParams[key] = value;
+        }
+      }
+      if (!compress) {
+        for (let key = 2; key <= K_MAX_BROTLI_PARAM; key++) {
+          if ((brotliInitParams[key] | 0) !== -1) throw codes.ERR_ZLIB_INITIALIZATION_FAILED();
+        }
+      }
+    };
+    // What a constructor settles on. `cap` is maxOutputLength as the
+    // natives take it: undefined for none.
+    const settings = (level, strategy, dictionary, chunkSize, flush, finishFlush, maxOutputLength, info) => ({
+      level,
+      strategy,
+      dictionary,
+      chunkSize,
+      flush,
+      finishFlush,
+      maxOutputLength,
+      cap: maxOutputLength === K_MAX_LENGTH ? undefined : maxOutputLength,
+      info,
+    });
+    const ZLIB_DEFAULTS = Object.freeze(settings(
+      Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY, undefined, Z_DEFAULT_CHUNK,
+      Z_NO_FLUSH, Z_FINISH, K_MAX_LENGTH, undefined,
+    ));
+    const BROTLI_DEFAULTS = Object.freeze(settings(
+      Z_DEFAULT_COMPRESSION, Z_DEFAULT_STRATEGY, undefined, Z_DEFAULT_CHUNK,
+      BROTLI_OPERATION_PROCESS, BROTLI_OPERATION_FINISH, K_MAX_LENGTH, undefined,
+    ));
+    // The options of a zlib or brotli engine, validated as node's
+    // constructors do. `format` is the natives' name ("gzip", "deflate",
+    // "deflateRaw", "unzip", "brotli"); `compress` picks the direction.
+    const zlibSettings = (format, compress, options) => {
+      const brotli = format === "brotli";
+      if (!options) return brotli ? BROTLI_DEFAULTS : ZLIB_DEFAULTS;
+      let level = Z_DEFAULT_COMPRESSION;
+      let strategy = Z_DEFAULT_STRATEGY;
+      let dictionary;
+      let flushMax;
+      if (brotli) {
+        checkBrotliParams(options, compress);
+        flushMax = BROTLI_OPERATION_EMIT_METADATA;
+      } else {
+        // On the inflate side (INFLATE, GUNZIP, UNZIP; not INFLATERAW) a
+        // windowBits of 0, null or none reads the window size from the
+        // stream; a gzip deflater needs 9 or more.
+        const windowBits = options.windowBits;
+        if (compress || format === "deflateRaw" || (windowBits != null && windowBits !== 0)) {
+          checkRangesOrGetDefault(
+            windowBits, "options.windowBits",
+            Z_MIN_WINDOWBITS + (compress && format === "gzip" ? 1 : 0), Z_MAX_WINDOWBITS,
+            Z_DEFAULT_WINDOWBITS,
+          );
+        }
+        level = checkRangesOrGetDefault(
+          options.level, "options.level", Z_MIN_LEVEL, Z_MAX_LEVEL, Z_DEFAULT_COMPRESSION,
+        );
+        checkRangesOrGetDefault(
+          options.memLevel, "options.memLevel", Z_MIN_MEMLEVEL, Z_MAX_MEMLEVEL, Z_DEFAULT_MEMLEVEL,
+        );
+        strategy = checkRangesOrGetDefault(
+          options.strategy, "options.strategy", Z_DEFAULT_STRATEGY, Z_FIXED, Z_DEFAULT_STRATEGY,
+        );
+        dictionary = dictionaryOf(options);
+        flushMax = Z_BLOCK;
+      }
+      let chunkSize = options.chunkSize;
+      if (!checkFiniteNumber(chunkSize, "options.chunkSize")) {
+        chunkSize = Z_DEFAULT_CHUNK;
+      } else if (chunkSize < Z_MIN_CHUNK) {
+        throw codes.ERR_OUT_OF_RANGE("options.chunkSize", ">= " + Z_MIN_CHUNK, chunkSize);
+      }
+      const flush = checkRangesOrGetDefault(
+        options.flush, "options.flush", 0, flushMax,
+        brotli ? BROTLI_OPERATION_PROCESS : Z_NO_FLUSH,
+      );
+      const finishFlush = checkRangesOrGetDefault(
+        options.finishFlush, "options.finishFlush", 0, flushMax,
+        brotli ? BROTLI_OPERATION_FINISH : Z_FINISH,
+      );
+      const maxOutputLength = checkRangesOrGetDefault(
+        options.maxOutputLength, "options.maxOutputLength", 1, K_MAX_LENGTH, K_MAX_LENGTH,
+      );
+      return settings(
+        level, strategy, dictionary, chunkSize, flush, finishFlush, maxOutputLength, options.info,
+      );
+    };
+    // The dictionary the natives get: node sets it only on a deflate or
+    // inflate stream (zlib's deflateSetDictionary/inflateSetDictionary); a
+    // gzip member never carries one.
+    const dictionaryFor = (format, s) => (format === "gzip" ? undefined : s.dictionary);
+
+    // The input of a one-shot call, checked after the options, as node's
+    // convenience methods construct their engine first. zlibBufferSync
+    // names it "buffer"; the callback forms write it to the engine, whose
+    // Writable names it "chunk" (zlibBuffer wraps an ArrayBuffer first, so
+    // that passes too).
+    const syncInput = (buffer) => {
+      if (typeof buffer === "string") return BufferCtor.from(buffer, "utf8");
+      if (ArrayBuffer.isView(buffer)) return toBytes(buffer);
+      if (isAnyArrayBuffer(buffer)) return new Uint8Array(buffer);
+      throw codes.ERR_INVALID_ARG_TYPE(
+        "buffer", ["string", "Buffer", "TypedArray", "DataView", "ArrayBuffer"], buffer,
+      );
+    };
+    const asyncInput = (buffer) => {
+      if (typeof buffer === "string") return BufferCtor.from(buffer, "utf8");
+      if (ArrayBuffer.isView(buffer)) return toBytes(buffer);
+      if (isAnyArrayBuffer(buffer)) return new Uint8Array(buffer);
+      throw codes.ERR_INVALID_ARG_TYPE("chunk", ["string", "Buffer", "TypedArray", "DataView"], buffer);
+    };
+    const validateCallback = (callback) => {
+      if (typeof callback !== "function") {
+        throw codes.ERR_INVALID_ARG_TYPE("callback", "function", callback);
+      }
+    };
+    // The engine classes, filled in below, for the one-shot forms' `info`
+    // option: node answers `{ buffer, engine }`, the engine being the
+    // stream it made for the call.
+    const engines = {};
+    const withInfo = (s, buffer, name, options, input) => {
+      if (!s.info) return buffer;
+      const engine = new engines[name](options);
+      engine.bytesWritten = input.length;
+      return { buffer, engine };
     };
 
-    const sync = (format, compress) => (data, options) => {
-      const dictionary = dictionaryOf(options);
-      const finishFlush = finishFlushOf(options);
-      const max = maxOutputLengthOf(options);
+    // The native op reports an output past the cap with exactly this message
+    // (oam_core::zlib::OUTPUT_TOO_LARGE); node raises ERR_BUFFER_TOO_LARGE
+    // naming the caller's value.
+    const OUTPUT_TOO_LARGE = "zlib output exceeds maxOutputLength";
+    const bufferTooLarge = (max) => {
+      const err = new RangeError("Cannot create a Buffer larger than " + max + " bytes");
+      applyNodeErrorShape(err, "ERR_BUFFER_TOO_LARGE");
+      return err;
+    };
+    const translate = (err, max) =>
+      err instanceof Error && err.message === OUTPUT_TOO_LARGE ? bufferTooLarge(max) : err;
+
+    // The natives take the level and `finishFlush` as int32s (a fraction
+    // truncates, as node's binding does). Only Z_FINISH makes an inflate
+    // that stops short an error ("unexpected end of file"); axios and
+    // node-fetch pass Z_SYNC_FLUSH to get what decoded. The deflaters
+    // always finish the stream.
+    const sync = (format, compress, name) => (buffer, options) => {
+      const s = zlibSettings(format, compress, options);
+      const bytes = syncInput(buffer);
+      let out;
       try {
-        return asBuffer(
+        out = asBuffer(
           natives.zlibSync(
-            toBytes(data), format, levelOf(options), compress, max, finishFlush, dictionary,
+            bytes, format, s.level, compress, s.cap, s.finishFlush, dictionaryFor(format, s),
           ),
         );
       } catch (err) {
-        throw translate(err, max);
+        throw translate(err, s.maxOutputLength);
       }
+      return withInfo(s, out, name, options, bytes);
     };
-    const callbackForm = (format, compress) => (data, options, callback) => {
+    const callbackForm = (format, compress, name) => (buffer, options, callback) => {
       if (typeof options === "function") {
         callback = options;
-        options = undefined;
+        options = {};
       }
       // Validation throws synchronously, as node's does.
-      const dictionary = dictionaryOf(options);
-      const finishFlush = finishFlushOf(options);
-      const max = maxOutputLengthOf(options);
+      const s = zlibSettings(format, compress, options);
+      validateCallback(callback);
+      const bytes = asyncInput(buffer);
       natives.zlibAsync(
-        toBytes(data), format, levelOf(options), compress, max, finishFlush, dictionary,
+        bytes, format, s.level, compress, s.cap, s.finishFlush, dictionaryFor(format, s),
       ).then(
-        (bytes) => callback(null, asBuffer(bytes)),
-        (err) => callback(translate(err, max)),
+        (out) => callback(null, withInfo(s, asBuffer(out), name, options, bytes)),
+        (err) => callback(translate(err, s.maxOutputLength)),
       );
     };
+
+    // params()'s flush marker: node writes one of its kFlushBuffers through
+    // the stream, so the flush and the level change land after the writes
+    // before it. A Buffer, so the Writable hands it to _transform as is.
+    const PARAMS_FLUSH = BufferCtor.alloc(0);
 
     // Incremental streaming Transform: each _transform call feeds one
     // chunk into the Rust-side encoder/decoder immediately via
@@ -18577,14 +18732,28 @@
       const { Transform } = registry.get("stream");
       return class extends Transform {
         constructor(options) {
-          // brotli's flush values are BROTLI_OPERATION_*, not zlib's, and
-          // it has no dictionary option.
-          const dictionary = dictionaryFor(format, options);
-          const finishFlush = format === "brotli" ? undefined : finishFlushOf(options);
+          const s = zlibSettings(format, compress, options);
           super({});
-          this._zlibLevel = levelOf(options);
-          this._zlibFinishFlush = finishFlush;
-          this._zlibDictionary = dictionary;
+          this._zlibLevel = s.level;
+          // brotli's flush values are BROTLI_OPERATION_*, not zlib's: its
+          // stream always finishes.
+          this._zlibFinishFlush = format === "brotli" ? undefined : s.finishFlush;
+          this._zlibDictionary = dictionaryFor(format, s);
+          // node's fields (Zlib's _level and _strategy, which params()
+          // compares; ZlibBase's for every class).
+          if (format !== "brotli") {
+            this._level = s.level;
+            this._strategy = s.strategy;
+          }
+          this._chunkSize = s.chunkSize;
+          this._defaultFlushFlag = s.flush;
+          this._finishFlushFlag = s.finishFlush;
+          this._maxOutputLength = s.maxOutputLength;
+          this._info = s.info;
+          // node's count of the input bytes the engine has taken.
+          this.bytesWritten = 0;
+          // params() levels in flight, in write order (see PARAMS_FLUSH).
+          this._zlibParamsLevels = null;
           // _zlibHandle is null until the first chunk arrives.
           this._zlibHandle = null;
           // Promise serializing back-to-back _transform calls so we
@@ -18601,8 +18770,69 @@
           ).then((info) => { this._zlibHandle = info.handle; });
         }
 
+        // node's Zlib.prototype.params (Brotli inherits it): validated, then
+        // -- unless both match what the stream has -- a Z_SYNC_FLUSH through
+        // the stream (so it follows the writes before it) after which a
+        // deflate or deflateRaw stream compresses at the new level. node's
+        // binding reads the level as an int32, so `undefined` and NaN pass
+        // the check and compress at level 0, as there. `strategy` is
+        // validated and remembered but not applied
+        // (docs/node-divergences.md); a gzip, inflate or brotli stream only
+        // flushes.
+        params(level, strategy, callback) {
+          checkRangesOrGetDefault(level, "level", Z_MIN_LEVEL, Z_MAX_LEVEL);
+          checkRangesOrGetDefault(strategy, "strategy", Z_DEFAULT_STRATEGY, Z_FIXED);
+          if (this._level === level && this._strategy === strategy) {
+            process.nextTick(callback);
+            return;
+          }
+          const after = () => {
+            if (this.destroyed) return;
+            this._level = level;
+            this._strategy = strategy;
+            if (callback) callback();
+          };
+          // node's flush(): a finished stream calls back at once, an ended
+          // one at 'end'.
+          if (this.writableFinished) {
+            process.nextTick(after);
+          } else if (this.writableEnded) {
+            this.once("end", after);
+          } else {
+            (this._zlibParamsLevels ??= []).push(level | 0);
+            this.write(PARAMS_FLUSH, after);
+          }
+        }
+
+        // params()'s flush: what the deflater holds, under Z_SYNC_FLUSH,
+        // then the new level for what follows -- on a deflate or deflateRaw
+        // stream: node's binding (ZlibContext::SetParams) leaves a gzip
+        // stream's level as it was.
+        _zlibParams(cb) {
+          const level = this._zlibParamsLevels.shift();
+          if (!compress || format === "brotli") {
+            cb();
+            return;
+          }
+          this._zlibQueue = this._zlibQueue.then(() =>
+            this._ensureStream().then(() =>
+              format === "gzip"
+                ? natives.zlibStreamParams(this._zlibHandle)
+                : natives.zlibStreamParams(this._zlibHandle, level)
+            )
+          ).then((out) => {
+            if (out && out.length > 0) this.push(asBuffer(out));
+            cb();
+          }, cb);
+        }
+
         _transform(chunk, _encoding, cb) {
+          if (chunk === PARAMS_FLUSH) {
+            this._zlibParams(cb);
+            return;
+          }
           const bytes = toBytes(chunk);
+          this.bytesWritten += bytes.length;
           // Chain onto the queue so writes stay in order.
           this._zlibQueue = this._zlibQueue.then(() =>
             this._ensureStream().then(() =>
@@ -18654,7 +18884,7 @@
         constructor(options) {
           super({});
           this._zlibChunks = [];
-          this._zlibLevel = levelOf(options);
+          this._zlibLevel = zlibSettings(format, compress, options).level;
         }
         _transform(chunk, _encoding, cb) {
           this._zlibChunks.push(toBytes(chunk));
@@ -18706,14 +18936,28 @@
         );
       });
     };
-    const brotliCallbackForm = (compress) => (data, options, callback) => {
-      if (typeof options === "function") { callback = options; }
-      brotliOneShot(data, compress).then(
-        (bytes) => callback(null, bytes),
+    const brotliCallbackForm = (compress, name) => (buffer, options, callback) => {
+      if (typeof options === "function") {
+        callback = options;
+        options = {};
+      }
+      const s = zlibSettings("brotli", compress, options);
+      validateCallback(callback);
+      const bytes = asyncInput(buffer);
+      brotliOneShot(bytes, compress).then(
+        // maxOutputLength is held to the finished buffer here
+        // (docs/node-divergences.md); node stops as the output passes it.
+        (out) => out.length > s.maxOutputLength
+          ? callback(bufferTooLarge(s.maxOutputLength))
+          : callback(null, withInfo(s, out, name, options, bytes)),
         (err) => callback(err),
       );
     };
-    const brotliSyncGate = () => {
+    // The options and the input are checked as node's are, so a call node
+    // refuses is refused the same way here.
+    const brotliSyncGate = (compress) => (buffer, options) => {
+      zlibSettings("brotli", compress, options);
+      syncInput(buffer);
       throw new Error(
         "brotliCompressSync/brotliDecompressSync are not supported -- use brotliCompress/brotliDecompress (async) instead"
       );
@@ -18727,8 +18971,6 @@
     // are real Transforms / EventEmitters either way:
     //   new zlib.Inflate(opts)        -> async streaming Transform
     //   zlib.Inflate.call(this, opts) -> Node sync-handle state on `this`
-    const Z_DEFAULT_CHUNK = 16384;
-    const Z_MIN_CHUNK = 64;
     // The low-level sync handle (flate2) supports only DEFLATE/INFLATE and
     // their raw forms; gzip/unzip/brotli have no sync-handle mode, so the
     // .call(this) path maps them to the zlib-wrapped deflate handle. No known
@@ -18737,10 +18979,9 @@
       format === "deflateRaw"
         ? (compress ? DEFLATERAW : INFLATERAW)
         : (compress ? DEFLATE : INFLATE);
-    function initSyncHandleState(self, format, mode, options) {
-      const opts = options || {};
-      let chunkSize = opts.chunkSize != null ? opts.chunkSize : Z_DEFAULT_CHUNK;
-      if (chunkSize < Z_MIN_CHUNK) chunkSize = Z_MIN_CHUNK;
+    function initSyncHandleState(self, format, compress, mode, options) {
+      const s = zlibSettings(format, compress, options);
+      const chunkSize = s.chunkSize;
       self._chunkSize = chunkSize;
       self._writeState = new Uint32Array(2);
       self._offset = 0;
@@ -18751,53 +18992,69 @@
       // gzip maps to the zlib-wrapped handle (handleModeFor), so its
       // dictionary must be dropped here, or the handle writes a stream with
       // FDICT that no inflater reads without it.
-      const dictionary = dictionaryFor(format, opts);
-      self._finishFlushFlag = finishFlushOf(opts);
+      self._defaultFlushFlag = s.flush;
+      self._finishFlushFlag = s.finishFlush;
+      self._maxOutputLength = s.maxOutputLength;
+      self._info = s.info;
+      self.bytesWritten = 0;
+      if (format !== "brotli") {
+        self._level = s.level;
+        self._strategy = s.strategy;
+      }
       const handle = new ZlibHandle(mode);
-      handle.init(15, levelOf(opts), 8, 0, self._writeState, () => {}, dictionary);
+      handle.init(15, s.level, 8, 0, self._writeState, () => {}, dictionaryFor(format, s));
       self._handle = handle;
       return self;
     }
-    function makeZlibClass(format, compress) {
+    function makeZlibClass(name, format, compress) {
       const Stream = transformClass(format, compress); // class extends Transform
       const mode = handleModeFor(format, compress);
       function ZlibClass(options) {
         // `new zlib.Inflate(opts)` -> a real streaming Transform instance.
         if (new.target) return Reflect.construct(Stream, [options], new.target);
         // `zlib.Inflate.call(this, opts)` -> sync-handle state for inheritance.
-        return initSyncHandleState(this, format, mode, options);
+        return initSyncHandleState(this, format, compress, mode, options);
       }
       // Share the streaming Transform prototype so `new` instances get the
       // streaming methods AND util.inherits(Sub, ZlibClass) chains
       // Sub -> Stream.prototype -> Transform.prototype -> ... -> EventEmitter.
+      // Named as node's classes are, and the instances' `constructor`.
+      Object.defineProperty(ZlibClass, "name", { value: name });
       ZlibClass.prototype = Stream.prototype;
+      Object.defineProperty(Stream.prototype, "constructor", {
+        value: ZlibClass, writable: true, enumerable: false, configurable: true,
+      });
       return ZlibClass;
     }
-    const Gzip = makeZlibClass("gzip", true);
-    const Gunzip = makeZlibClass("gzip", false);
-    const Deflate = makeZlibClass("deflate", true);
-    const Inflate = makeZlibClass("deflate", false);
-    const DeflateRaw = makeZlibClass("deflateRaw", true);
-    const InflateRaw = makeZlibClass("deflateRaw", false);
-    const Unzip = makeZlibClass("unzip", false);
-    const BrotliCompress = makeZlibClass("brotli", true);
-    const BrotliDecompress = makeZlibClass("brotli", false);
+    const Gzip = makeZlibClass("Gzip", "gzip", true);
+    const Gunzip = makeZlibClass("Gunzip", "gzip", false);
+    const Deflate = makeZlibClass("Deflate", "deflate", true);
+    const Inflate = makeZlibClass("Inflate", "deflate", false);
+    const DeflateRaw = makeZlibClass("DeflateRaw", "deflateRaw", true);
+    const InflateRaw = makeZlibClass("InflateRaw", "deflateRaw", false);
+    const Unzip = makeZlibClass("Unzip", "unzip", false);
+    const BrotliCompress = makeZlibClass("BrotliCompress", "brotli", true);
+    const BrotliDecompress = makeZlibClass("BrotliDecompress", "brotli", false);
+    Object.assign(engines, {
+      Gzip, Gunzip, Deflate, Inflate, DeflateRaw, InflateRaw, Unzip,
+      BrotliCompress, BrotliDecompress,
+    });
 
     return {
-      gzipSync: sync("gzip", true),
-      gunzipSync: sync("gzip", false),
-      deflateSync: sync("deflate", true),
-      inflateSync: sync("deflate", false),
-      deflateRawSync: sync("deflateRaw", true),
-      inflateRawSync: sync("deflateRaw", false),
-      unzipSync: sync("unzip", false),
-      gzip: callbackForm("gzip", true),
-      gunzip: callbackForm("gzip", false),
-      deflate: callbackForm("deflate", true),
-      inflate: callbackForm("deflate", false),
-      deflateRaw: callbackForm("deflateRaw", true),
-      inflateRaw: callbackForm("deflateRaw", false),
-      unzip: callbackForm("unzip", false),
+      gzipSync: sync("gzip", true, "Gzip"),
+      gunzipSync: sync("gzip", false, "Gunzip"),
+      deflateSync: sync("deflate", true, "Deflate"),
+      inflateSync: sync("deflate", false, "Inflate"),
+      deflateRawSync: sync("deflateRaw", true, "DeflateRaw"),
+      inflateRawSync: sync("deflateRaw", false, "InflateRaw"),
+      unzipSync: sync("unzip", false, "Unzip"),
+      gzip: callbackForm("gzip", true, "Gzip"),
+      gunzip: callbackForm("gzip", false, "Gunzip"),
+      deflate: callbackForm("deflate", true, "Deflate"),
+      inflate: callbackForm("deflate", false, "Inflate"),
+      deflateRaw: callbackForm("deflateRaw", true, "DeflateRaw"),
+      inflateRaw: callbackForm("deflateRaw", false, "InflateRaw"),
+      unzip: callbackForm("unzip", false, "Unzip"),
       createGzip: (o) => new Gzip(o),
       createGunzip: (o) => new Gunzip(o),
       createDeflate: (o) => new Deflate(o),
@@ -18809,10 +19066,10 @@
       createBrotliDecompress: (o) => new BrotliDecompress(o),
       Gzip, Gunzip, Deflate, Inflate, DeflateRaw, InflateRaw, Unzip,
       BrotliCompress, BrotliDecompress,
-      brotliCompressSync: brotliSyncGate,
-      brotliDecompressSync: brotliSyncGate,
-      brotliCompress: brotliCallbackForm(true),
-      brotliDecompress: brotliCallbackForm(false),
+      brotliCompressSync: brotliSyncGate(true),
+      brotliDecompressSync: brotliSyncGate(false),
+      brotliCompress: brotliCallbackForm(true, "BrotliCompress"),
+      brotliDecompress: brotliCallbackForm(false, "BrotliDecompress"),
       // Top-level chunk/flush constants (Node exposes these on the module
       // itself, not only under `constants`; pngjs reads zlib.Z_MIN_CHUNK).
       Z_MIN_CHUNK,
