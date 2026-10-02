@@ -6324,6 +6324,55 @@ server.close();
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// undici's headers and body timeouts (review 3, findings 10 and 11): they
+/// run on undici's FastTimer, so a 200 ms `headersTimeout` lets an 800 ms
+/// answer through and a 100 ms `bodyTimeout` lapses after about 1 s; and
+/// their errors are built with no message argument, so `message` is an own
+/// enumerable key after `name` and `code`, in a cause and thrown alike. oam
+/// fired at the exact delay and passed a message. The expected output is
+/// node v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_timeouts_run_on_undicis_clock_with_undicis_errors() {
+    let script = write_temp(
+        "undici_timeouts_clock_errors/main.mjs",
+        r##"import http from 'node:http';
+import * as U from 'undici';
+
+const server = http.createServer((q, s) => {
+  if (q.url === '/b') { s.writeHead(200); s.write('x'); setTimeout(() => s.end('y'), 1500); }
+  else setTimeout(() => s.end('ok'), q.url === '/fast' ? 800 : 1500);
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+const show = (label, e) => console.log(label, e?.name, Object.keys(e).join(','), JSON.stringify(e));
+async function timed(label, fn) {
+  const t0 = Date.now();
+  try { console.log(label, 'ok', await fn()); }
+  catch (e) { console.log(label, 'failed', (e.cause ?? e).code, 'after 450 ms', Date.now() - t0 >= 450); }
+}
+await timed('fetch headersTimeout 200, 800 ms answer', async () => (await fetch(base + '/fast', { dispatcher: new U.Agent({ headersTimeout: 200 }) })).status);
+await timed('request headersTimeout 200, 800 ms answer', async () => (await U.request(base + '/fast', { headersTimeout: 200 })).statusCode);
+await timed('request bodyTimeout 100, stalled body', async () => (await (await U.request(base + '/b', { bodyTimeout: 100 })).body.text()));
+try { await fetch(base + '/', { dispatcher: new U.Agent({ headersTimeout: 300 }) }); } catch (e) { show('fetch headers cause', e.cause); }
+try { await U.request(base + '/', { headersTimeout: 300 }); } catch (e) { show('request headers', e); }
+try { const r = await U.request(base + '/b', { bodyTimeout: 300 }); await r.body.text(); } catch (e) { show('request body', e); }
+try { const r = await fetch(base + '/b', { dispatcher: new U.Agent({ bodyTimeout: 300 }) }); await r.text(); } catch (e) { show('fetch body cause', e.cause); }
+server.close();
+process.exit(0);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = r#"fetch headersTimeout 200, 800 ms answer ok 200
+request headersTimeout 200, 800 ms answer ok 200
+request bodyTimeout 100, stalled body failed UND_ERR_BODY_TIMEOUT after 450 ms true
+fetch headers cause HeadersTimeoutError name,code,message {"name":"HeadersTimeoutError","code":"UND_ERR_HEADERS_TIMEOUT","message":"Headers Timeout Error"}
+request headers HeadersTimeoutError name,code,message {"name":"HeadersTimeoutError","code":"UND_ERR_HEADERS_TIMEOUT","message":"Headers Timeout Error"}
+request body BodyTimeoutError name,code,message {"name":"BodyTimeoutError","code":"UND_ERR_BODY_TIMEOUT","message":"Body Timeout Error"}
+fetch body cause BodyTimeoutError name,code,message {"name":"BodyTimeoutError","code":"UND_ERR_BODY_TIMEOUT","message":"Body Timeout Error"}"#;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 /// A Readable `undici.request` body is framed when the request is
 /// dispatched, not when `request()` is called: undici asks
 /// `util.bodyLength` then, so a stream that ends in the same turn of the

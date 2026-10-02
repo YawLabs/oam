@@ -127,7 +127,9 @@
               else this.push(G.Buffer.from(value));
             },
             (err) => {
-              if (err instanceof TypeError && err.cause instanceof errors.BodyTimeoutError) err = err.cause;
+              // A fetch-shaped body failure (`TypeError: terminated`) is
+              // its undici cause, as request()'s body fails with it.
+              if (err instanceof TypeError && err.cause instanceof errors.UndiciError) err = err.cause;
               this.destroy(err instanceof Error ? err : new Error(String(err)));
             },
           );
@@ -290,7 +292,7 @@
         // undici's headersTimeout, run by the transport, fails the fetch with
         // UND_ERR_HEADERS_TIMEOUT: request() rejects with undici's error.
         if (err instanceof TypeError && err.cause && err.cause.code === "UND_ERR_HEADERS_TIMEOUT") {
-          throw new errors.HeadersTimeoutError("Headers Timeout Error");
+          throw new errors.HeadersTimeoutError();
         }
         // Anything else rejects with what failed, not fetch's wrapper.
         throw requestError(err);
@@ -328,7 +330,7 @@
     // node v22.22.2 + undici 6.29.0: an undici class's `name`, `code` and
     // `message`, a connect's `ECONNREFUSED` / `ENOTFOUND` error as given, no
     // `cause` either way). A cause from the transport with undici's code is
-    // already the shim's class (holder.undiciError); a refusal the fetch
+    // already the shim's class (bootstrap.js undiciCause); a refusal the fetch
     // path makes carries the class's name only, and gets the class here.
     const UNWRAPPED = {
       InvalidArgumentError: errors.InvalidArgumentError,
@@ -1143,7 +1145,7 @@
       if (timeout) {
         timer = undiciTimer(() => {
           timer = null;
-          finish(new errors.HeadersTimeoutError("Headers Timeout Error"));
+          finish(new errors.HeadersTimeoutError());
         }, timeout);
       }
       socket.write(head + "\r\n");
@@ -1423,22 +1425,6 @@
     if (holder.policy === undefined) {
       Object.defineProperty(holder, "policy", {
         value: policyOf,
-        writable: false,
-        enumerable: false,
-        configurable: false,
-      });
-    }
-    // The undici class of a failure oam's transport raises with undici's
-    // code (a headers or body timeout, an oversized response head), so the
-    // `cause` of a fetch failure is an instance of `errors.*` as in node.
-    if (holder.undiciError === undefined) {
-      const byCode = {
-        UND_ERR_HEADERS_TIMEOUT: errors.HeadersTimeoutError,
-        UND_ERR_BODY_TIMEOUT: errors.BodyTimeoutError,
-        UND_ERR_HEADERS_OVERFLOW: errors.HeadersOverflowError,
-      };
-      Object.defineProperty(holder, "undiciError", {
-        value: (code, message) => (byCode[code] ? new byCode[code](message) : null),
         writable: false,
         enumerable: false,
         configurable: false,

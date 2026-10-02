@@ -2336,9 +2336,11 @@
       // undici's headersTimeout / bodyTimeout, which the transport runs
       // (send.rs headers_deadline, body.rs `timed`).
       case "UND_ERR_HEADERS_TIMEOUT":
-        return new undiciErrors.HeadersTimeoutError(e.message);
+        // No message argument, as undici builds them: its class default
+        // makes `message` an own enumerable key (name, code, message).
+        return new undiciErrors.HeadersTimeoutError();
       case "UND_ERR_BODY_TIMEOUT":
-        return new undiciErrors.BodyTimeoutError(e.message);
+        return new undiciErrors.BodyTimeoutError();
       // A response head the parser refused (bridge.rs head_parse_error,
       // which words it as undici does).
       case "HPE_INVALID_STATUS":

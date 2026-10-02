@@ -1784,8 +1784,8 @@ Pinned against Node + undici 6.29.0 by `undici_request_honours_headers_and_body_
 `fetch()` -- global `fetch` and `undici.fetch` -- runs under the same two limits, as Node's
 does: its dispatcher's (the `dispatcher` option's, else the global one's, a ProxyAgent's
 for the origin's answer), else undici's 300 s, with or without `undici` imported (measured:
-a plain `fetch` to a silent server fails at 300 s in oam and 321 s in Node, whose timers are
-coarse). A `headersTimeout` in the fetch init is not an option, in either runtime. A late
+a plain `fetch` to a silent server fails at about 300.4 s in oam and 321 s in Node, whose
+tick timer drifts; see the timers bullet below). A `headersTimeout` in the fetch init is not an option, in either runtime. A late
 head rejects with `TypeError: fetch failed`, cause `HeadersTimeoutError`; a stalled body
 errors its reader, `text()` / `json()` / `arrayBuffer()` and `for await` with `TypeError:
 terminated`, cause `BodyTimeoutError`; a bad dispatcher value is the dispatcher's
@@ -1820,8 +1820,16 @@ taken (pinned by `undici_headers_timeout_starts_when_a_streamed_body_ends`). Wha
   `HeadersTimeoutError` after `headersTimeout` (measured: 64 MiB to a server that never reads,
   limit 500 ms, under 4 s in Node). oam's timer waits for the body's end, which never comes:
   the request stays open until the caller's signal ends it.
-- **The timers are exact.** undici's are coarse (a 500 ms `headersTimeout` fires after about
-  1019 ms in Node); oam's fire at the configured delay. A delay above 2^31-1 ms
+- **The timers run on undici's clock, from the arm.** undici runs `headersTimeout` and
+  `bodyTimeout` on its FastTimer, which ticks every 499 ms: a timer is taken up at the next
+  tick and fires at the first tick at least its delay after the one before, so anything up to
+  998 ms lapses after about 1 s and longer delays in 499 ms steps (a 200 ms `headersTimeout`
+  lets an 800 ms answer through; 1500 lapses after about 2 s). oam computes the same lapse
+  (send.rs `fast_timer`) as if undici's clock started at the arm, which it does when no other
+  undici timer is running; with one running, undici's next tick comes sooner, so Node can
+  fire up to 499 ms earlier than oam. undici's tick timer also drifts a little each tick
+  (its 300 s default lapses after about 321 s in Node, 300.4 s in oam). Up to 0.17.1 oam
+  fired at the configured delay, failing requests Node completes. A delay above 2^31-1 ms
   (`headersTimeout: 2 ** 31` and the like, a common way to say "no limit") is held to that
   ceiling, about 24.8 days, where undici's timestamp-based timers never come due; a plain
   `setTimeout` would have fired it after 1 ms.

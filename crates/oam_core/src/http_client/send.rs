@@ -186,14 +186,33 @@ pub struct FetchRequest {
 /// `undici.request`'s timers always were in oam (docs/node-divergences.md).
 const MAX_TIMER_MS: f64 = 2_147_483_647.0;
 
-/// A `headers_timeout_ms` / `body_timeout_ms` as a limit: `None` for none
-/// (absent, 0, or not a number), else at least 1 ms -- `setTimeout`'s floor
-/// -- and at most [`MAX_TIMER_MS`].
+/// A `headers_timeout_ms` / `body_timeout_ms` as the time it takes to lapse:
+/// `None` for none (absent, 0, or not a number), else the limit -- at least
+/// 1 ms, `setTimeout`'s floor, and at most [`MAX_TIMER_MS`] -- on undici's
+/// clock ([`fast_timer`]).
 fn timeout_limit(ms: Option<f64>) -> Option<Duration> {
     let ms = ms.filter(|ms| *ms > 0.0)?;
-    Some(Duration::from_secs_f64(
-        ms.clamp(1.0, MAX_TIMER_MS) / 1000.0,
-    ))
+    Some(fast_timer(ms.clamp(1.0, MAX_TIMER_MS)))
+}
+
+/// undici's FastTimer tick (lib/util/timers.js TICK_MS).
+const FAST_TIMER_TICK_MS: f64 = 499.0;
+
+/// How long a `limit_ms` timer on undici's FastTimer takes to lapse. undici
+/// 6.29.0 runs `headersTimeout` and `bodyTimeout` on it (client-h1.js
+/// TIMEOUT_HEADERS / TIMEOUT_BODY | USE_FAST_TIMER): a timer armed, or
+/// refreshed, is taken up at the clock's next 499 ms tick and fires at the
+/// first tick at least `limit` after the one before that. So any limit up
+/// to 998 ms lapses after 998 ms, and longer ones in 499 ms steps -- 1500
+/// after 1996 (measured on node v22.22.2 + undici 6.29.0: about 1010 ms for
+/// 1, 100 and 300, about 2050 ms for 1500). Modelled from the arm, as with
+/// no other undici timer running; with one, undici's next tick can come
+/// sooner (docs/node-divergences.md).
+fn fast_timer(limit_ms: f64) -> Duration {
+    let ticks = ((limit_ms - FAST_TIMER_TICK_MS) / FAST_TIMER_TICK_MS)
+        .ceil()
+        .max(1.0);
+    Duration::from_secs_f64((ticks + 1.0) * FAST_TIMER_TICK_MS / 1000.0)
 }
 
 /// undici's `HeadersTimeoutError`, raised when a hop's head is late. JS
