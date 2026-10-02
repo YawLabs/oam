@@ -1412,7 +1412,14 @@ What still differs:
   the same way, kept-alive in the pool included -- the server sees the end and the close,
   and the next request dials anew (e2e
   `https_get_socket_destroy_closes_the_pooled_tls_connection`; up to 0.17.1 that
-  connection stayed in the pool and the next request went out on it). What differs: an h2
+  connection stayed in the pool and the next request went out on it). Either stand-in
+  closes the connection only while its own request is the last to have taken it: once the
+  pool has handed the connection to another request -- the next `http.get` or a `fetch()`,
+  which share oam's pool -- a `destroy()` on the kept socket leaves it alone (e2e
+  `a_kept_req_socket_leaves_a_connection_another_request_took`; before 0.17.2 it closed the
+  connection under that request, which failed with `fetch failed`). In Node the next
+  `http.get` on the agent gets the same socket object, so destroying it ends that request
+  too, and a `fetch()` never shares the agent's connection at all. What differs: an h2
   connection, which carries other requests at once, is never closed through one request's
   socket; and `end()` on either stand-in does nothing, where Node's sends a FIN, so a
   server that answers it by closing closes Node's socket (`'close'` with `false`) and oam's

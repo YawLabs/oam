@@ -523,10 +523,12 @@ fn op_http_transport_destroy(
     core_runtime!(scope).http_client().destroy_pool();
 }
 
-/// `__oam.fetchConnClose(connection, reset)`, synchronous: close the
+/// `__oam.fetchConnClose(connection, reset, lease)`, synchronous: close the
 /// transport connection a response named as `socket.connection` -- with a
-/// reset (SO_LINGER 0) when `reset` -- whether it is carrying a response or
-/// idle in the pool. One already gone is left alone.
+/// reset (SO_LINGER 0) when `reset` -- whether it is carrying that response
+/// or idle in the pool after it. One already gone, or taken since by
+/// another request (its checkout is no longer `socket.lease`), is left
+/// alone.
 fn op_fetch_conn_close(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -534,7 +536,11 @@ fn op_fetch_conn_close(
 ) {
     let connection = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let reset = args.get(1).is_true();
-    oam_core::http_client::close_connection(connection, reset);
+    let lease = args.get(2);
+    let lease = lease
+        .is_number()
+        .then(|| lease.number_value(scope).unwrap_or(0.0) as u64);
+    oam_core::http_client::close_connection(connection, reset, lease);
 }
 
 fn op_fetch_body_read(

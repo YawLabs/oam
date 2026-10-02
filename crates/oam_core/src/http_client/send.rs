@@ -800,6 +800,11 @@ fn conn_payload(payload: &mut serde_json::Value, conn: &ConnInfo) {
     if let Some(connection) = conn.connection {
         socket.insert("connection".to_string(), connection.into());
     }
+    // Which checkout of it this response came on: the close is refused once
+    // another request has taken the connection.
+    if let Some(lease) = conn.lease {
+        socket.insert("lease".to_string(), lease.into());
+    }
     payload["socket"] = serde_json::Value::Object(socket);
     if let Some(tls) = &conn.tls {
         payload["tls"] = serde_json::json!({

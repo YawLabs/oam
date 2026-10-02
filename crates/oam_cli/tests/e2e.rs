@@ -19794,6 +19794,74 @@ setTimeout(() => process.exit(0), 50);
     );
 }
 
+/// A finished request's `req.socket` closes its connection only while no
+/// other request has taken it. oam's shared pool hands the kept-alive
+/// connection of an option-less http.get / https.get to the next request
+/// for the origin -- here a fetch() the server answers after 200 ms -- and a
+/// destroy() on the kept socket 50 ms into it used to close the connection
+/// under the fetch ("fetch failed / error sending request for url"). node
+/// (v22.22.2) prints "fetch=ok slow-done" for both: its socket is the first
+/// request's own, and undici's pool is not the agent's. That oam reused the
+/// connection (one server connection, where node dials two) is what puts
+/// the fetch in harm's way, so it is asserted too.
+#[test]
+fn a_kept_req_socket_leaves_a_connection_another_request_took() {
+    let src = format!(
+        r#"
+import http from 'node:http';
+import https from 'node:https';
+const cert = `{cert}`;
+const key = `{key}`;
+for (const secure of [false, true]) {{
+  let conns = 0;
+  const handler = (req, res) => {{
+    req.resume();
+    if (req.url === '/slow') setTimeout(() => res.end('slow-done'), 200);
+    else res.end('hello');
+  }};
+  const server = secure ? https.createServer({{ cert, key }}, handler) : http.createServer(handler);
+  server.on('connection', () => conns++);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = (secure ? 'https' : 'http') + '://localhost:' + server.address().port;
+  const socket = await new Promise((resolve, reject) => {{
+    const req = (secure ? https : http).get(base + '/', (res) => {{
+      res.resume();
+      res.on('end', () => setImmediate(() => resolve(req.socket)));
+    }});
+    req.on('error', reject);
+  }});
+  const fetched = fetch(base + '/slow').then((r) => r.text()).then(
+    (t) => 'ok ' + t,
+    (e) => 'failed ' + e.message + ' / ' + (e.cause && e.cause.message),
+  );
+  await new Promise((r) => setTimeout(r, 50));
+  socket.destroy();
+  console.log((secure ? 'https' : 'http') + ' fetch=' + await fetched + ' connections=' + conns);
+  server.close();
+}}
+setTimeout(() => process.exit(0), 50);
+"#,
+        cert = FETCH_TEST_LEAF,
+        key = FETCH_TEST_LEAF_KEY,
+    );
+    let file = write_temp("kept_req_socket_reused_connection.mjs", &src);
+    let ca = write_temp("kept_req_socket_reused_connection_ca.pem", FETCH_TEST_CA);
+    let mut cmd = oam_command(&["run", file.to_str().unwrap(), "--no-check"]);
+    cmd.env("NODE_EXTRA_CA_CERTS", &ca);
+    let out = bounded_output(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            "http fetch=ok slow-done connections=1",
+            "https fetch=ok slow-done connections=1",
+        ],
+        "stderr: {stderr}"
+    );
+}
+
 /// Issue #146: a verifying https request's per-request TLS options reach the
 /// handshake (they route the request over tls.connect), and a handshake the
 /// server refuses with the protocol_version alert takes node's shape: the

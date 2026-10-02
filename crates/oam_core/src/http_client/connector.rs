@@ -166,6 +166,14 @@ pub(crate) struct ConnInfo {
     /// ([`close_connection`]): an HTTP/1 connection the transport dialled.
     /// None on an h2 connection, which many requests share at once.
     pub(crate) connection: Option<u64>,
+    /// How many times the connection has been checked out, shared with its
+    /// [`ConnCloser`] (None where `connection` is).
+    leases: Option<Arc<AtomicU64>>,
+    /// Which checkout the response holding this copy came on
+    /// ([`ConnInfo::take_lease`]): a close JS asks for through that
+    /// response's socket reaches the connection only while no later request
+    /// has taken it.
+    pub(crate) lease: Option<u64>,
     /// What the connection has read and written so far (its [`ConnStats`]'
     /// counters), set once it is handed to the pool.
     counters: Option<Arc<ConnCounters>>,
@@ -178,7 +186,18 @@ impl ConnInfo {
             peer: tcp.stream.peer_addr().ok(),
             tls: None,
             connection: Some(tcp.closer.id),
+            leases: Some(tcp.closer.leases.clone()),
+            lease: None,
             counters: None,
+        }
+    }
+
+    /// One more checkout of the connection: this copy -- the one the
+    /// request's response carries -- records which. One relaxed add per
+    /// request; nothing on an h2 connection.
+    pub(crate) fn take_lease(&mut self) {
+        if let Some(leases) = &self.leases {
+            self.lease = Some(leases.fetch_add(1, Ordering::Relaxed) + 1);
         }
     }
 
@@ -269,6 +288,7 @@ impl OamConn {
         // request's socket closing it would end all the others.
         if h2 {
             info.connection = None;
+            info.leases = None;
         }
         info.counters = Some(stats.counters.clone());
         OamConn {
@@ -892,11 +912,18 @@ async fn dial(host: &str, port: u16, opts: &ConnectOptions) -> Result<EagerTcp, 
 /// leaves when the connection's last holder (its stream, its task) drops it:
 /// one entry per connection, written at the dial and at the close, nothing
 /// per request.
+///
+/// A close names the checkout it was asked through (`lease`): a socket JS
+/// kept from a finished request must not close the connection once the pool
+/// has handed it to another request -- node's `req.socket` is that request's
+/// own, and a `fetch` never shares undici's pool with it.
 pub(crate) struct ConnCloser {
     id: u64,
     requested: AtomicBool,
     reset: AtomicBool,
     wake: tokio::sync::Notify,
+    /// The connection's checkouts so far ([`ConnInfo::take_lease`]).
+    leases: Arc<AtomicU64>,
 }
 
 type Closers = Mutex<HashMap<u64, std::sync::Weak<ConnCloser>>>;
@@ -914,6 +941,7 @@ impl ConnCloser {
             requested: AtomicBool::new(false),
             reset: AtomicBool::new(false),
             wake: tokio::sync::Notify::new(),
+            leases: Arc::new(AtomicU64::new(0)),
         });
         closers()
             .lock()
@@ -958,10 +986,15 @@ impl Drop for ConnCloser {
     }
 }
 
-/// `__oam.fetchConnClose(id, reset)`: close the transport connection with
-/// this id -- with a reset when `reset` -- if it is still open.
-pub fn close_connection(id: u64, reset: bool) {
+/// `__oam.fetchConnClose(id, reset, lease)`: close the transport connection
+/// with this id -- with a reset when `reset` -- if it is still open and,
+/// when `lease` names the checkout of the response asking, no request has
+/// taken it since: mid-response, or idle in the pool after it.
+pub fn close_connection(id: u64, reset: bool, lease: Option<u64>) {
     if let Some(closer) = ConnCloser::find(id) {
+        if lease.is_some_and(|lease| closer.leases.load(Ordering::Relaxed) != lease) {
+            return;
+        }
         closer.close(reset);
     }
 }
@@ -1231,7 +1264,7 @@ mod tests {
             .expect("an h1 connection is named");
         let task = ConnCloser::find(id).expect("a live connection is in the table");
         let waiting = tokio::spawn(async move { task.requested().await });
-        close_connection(id, true);
+        close_connection(id, true, None);
         tokio::time::timeout(Duration::from_secs(5), waiting)
             .await
             .expect("the connection's task was woken")
@@ -1247,7 +1280,7 @@ mod tests {
             ConnCloser::find(id).is_none(),
             "the closed connection left the table"
         );
-        close_connection(id, true);
+        close_connection(id, true, None);
     }
 
     /// `destroy()` rather than `resetAndDestroy()`: the connection still
@@ -1256,12 +1289,39 @@ mod tests {
     async fn a_connection_closed_without_a_reset_ends_with_a_fin() {
         let (tcp, peer) = dialled_with_peer().await;
         let id = ConnInfo::of(&tcp).connection.unwrap();
-        close_connection(id, false);
+        close_connection(id, false, None);
         tokio::time::timeout(Duration::from_secs(5), tcp.closer.requested())
             .await
             .expect("the close was asked for");
         drop(tcp);
         assert_eq!(peer_read_ended(peer).await.unwrap(), 0);
+    }
+
+    /// A close asked through a finished request's socket reaches the
+    /// connection while that request's checkout is its latest -- mid-response
+    /// or idle in the pool after it -- and not once the pool has handed it to
+    /// another request: a socket kept from the first must not fail the
+    /// second, as node's does not (stale.mjs: an `https.get`'s kept
+    /// `req.socket.destroy()` failed a later `fetch()` on the reused
+    /// connection).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_through_an_earlier_checkout_leaves_a_reused_connection_open() {
+        let (tcp, _peer) = dialled_with_peer().await;
+        let mut first = ConnInfo::of(&tcp);
+        first.take_lease();
+        let mut second = first.clone();
+        second.take_lease();
+        assert_eq!((first.lease, second.lease), (Some(1), Some(2)));
+        let id = first.connection.unwrap();
+        close_connection(id, false, first.lease);
+        assert!(
+            !tcp.closer.requested.load(Ordering::Acquire),
+            "the first request's socket closed the second's connection"
+        );
+        close_connection(id, false, second.lease);
+        tokio::time::timeout(Duration::from_secs(5), tcp.closer.requested())
+            .await
+            .expect("the current request's socket closes it");
     }
 
     /// An h2 connection carries many requests at once: it is not named, so
@@ -1273,6 +1333,9 @@ mod tests {
         assert!(info.connection.is_some());
         let conn = OamConn::new(Box::new(tcp), true, false, info);
         assert_eq!(conn.conn_info().connection, None);
+        let mut taken = conn.conn_info();
+        taken.take_lease();
+        assert_eq!(taken.lease, None);
     }
 
     /// The proxy dial takes the URI it is given even when the proxy rules

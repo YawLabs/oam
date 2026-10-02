@@ -20943,6 +20943,9 @@
         // the transport does not name, is not tracked.
         if (facts.connection !== undefined) {
           socket[registry._netNativeConnection] = facts.connection;
+          // Which checkout of it this request had: once the pool hands the
+          // connection to another request, this socket no longer closes it.
+          socket[registry._netNativeLease] = facts.lease;
         }
         if (socket.encrypted && raw.tls) {
           // Only a verified certificate gets this far on the fetch path.
@@ -23803,7 +23806,7 @@
           this[kNativeConnection] = undefined;
           const reset = this.resetAndClosing === true;
           if (reset) this.resetAndClosing = false;
-          globalThis.__oam.fetchConnClose(connection, reset);
+          globalThis.__oam.fetchConnClose(connection, reset, this[kNativeLease]);
         }
         rs.closed = ws.closed = true;
         if (resetRefused !== undefined) {
@@ -24208,6 +24211,9 @@
     // and `__oam.fetchConnClose`; the server's through its own destroy()).
     const kNativeConnection = Symbol("oam.nativeConnection");
     registry._netNativeConnection = kNativeConnection;
+    // The checkout of that connection the stand-in's request had.
+    const kNativeLease = Symbol("oam.nativeLease");
+    registry._netNativeLease = kNativeLease;
 
     // node's resetAndDestroy() (lib/net.js, v22.22.2), assigned the way node
     // assigns it: an enumerable prototype property, a function with no name,
@@ -31564,7 +31570,7 @@
         var connection = this[registry._netNativeConnection];
         if (connection !== undefined) {
           this[registry._netNativeConnection] = undefined;
-          globalThis.__oam.fetchConnClose(connection, false);
+          globalThis.__oam.fetchConnClose(connection, false, this[registry._netNativeLease]);
         }
         var wrapped = this._releaseWrap();
         callback(err);

@@ -186,11 +186,12 @@ impl Pool {
             let Conn {
                 proto,
                 stats: attempt_stats,
-                info,
+                mut info,
                 proxied,
                 is_h2,
                 key: conn_key,
             } = conn;
+            info.take_lease();
             *req.uri_mut() = original_uri.clone();
             set_host_header(&mut req, is_h2);
             rewrite_request_uri(req.uri_mut(), is_h2, proxied, is_connect);
