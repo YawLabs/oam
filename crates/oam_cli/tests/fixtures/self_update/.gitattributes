@@ -1,0 +1,3 @@
+# Signature vectors are byte-exact (one manifest has CRLF on purpose):
+# never let git normalize them.
+* -text

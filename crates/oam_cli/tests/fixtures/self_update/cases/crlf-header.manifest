@@ -1,0 +1,8 @@
+oam-release-manifest v1
+tag v0.18.0
+1a62bad21a77dea75094dd843095384689752bf870472d803a9bd5ac167bd1ea *oam-aarch64-apple-darwin
+1a62bad21a77dea75094dd843095384689752bf870472d803a9bd5ac167bd1ea *oam-aarch64-pc-windows-msvc.exe
+1a62bad21a77dea75094dd843095384689752bf870472d803a9bd5ac167bd1ea *oam-aarch64-unknown-linux-gnu
+1a62bad21a77dea75094dd843095384689752bf870472d803a9bd5ac167bd1ea *oam-x86_64-apple-darwin
+1a62bad21a77dea75094dd843095384689752bf870472d803a9bd5ac167bd1ea *oam-x86_64-pc-windows-msvc.exe
+1a62bad21a77dea75094dd843095384689752bf870472d803a9bd5ac167bd1ea *oam-x86_64-unknown-linux-gnu

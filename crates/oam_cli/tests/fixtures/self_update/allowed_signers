@@ -1,0 +1,4 @@
+# TEST trust root for src/self_update.rs -- throwaway keys, made by generate.mjs.
+oam-release-t1 namespaces="oam-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMxIOepOzB6pbjBVP3RzR/JTE+psIHaR2fWLkftzXmOA
+oam-release-t2 namespaces="oam-release" ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM5tdBUxZeKNnxZOxdTFuH28qZ5Mgn1p9tkH1HLP7mQ
+oam-release-tsk namespaces="oam-release" sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIMVHnqr1h2Tg3pyeu7oAUzn4wh1nPfUKBAPRIngLZx5DAAAABHNzaDo=

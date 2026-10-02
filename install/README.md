@@ -45,7 +45,7 @@ oam-aarch64-unknown-linux-gnu        (not yet shipped -- needs an ARM Linux buil
 SHA256SUMS
 ```
 
-The installers and (forthcoming) `oam self-update` all consume these exact
+The installers and `oam self-update` all consume these exact
 names. If you change a target triple, change it in `scripts/release-local.sh`
 (+ `scripts/build-remote.sh`) and both install scripts together.
 
@@ -63,13 +63,20 @@ supply the cert material locally; the installers don't change.
 ```sh
 oam self-update              # update in place to the latest release
 oam self-update --version v0.7.0   # pin a specific tag
-oam self-update --dry-run    # print the installer command, run nothing
+oam self-update --dry-run    # verify the release, print what would change
 ```
 
-`oam self-update` re-runs the canonical installer above (so there's ONE source
-of download + checksum-verify + running-exe-replace logic). It updates oam where
-it currently lives -- it points the installer at the running binary's directory
-via `OAM_INSTALL_DIR`. Override the installer URL with `OAM_SELF_UPDATE_URL`.
+`oam self-update` is native (crates/oam_cli/src/self_update.rs). It resolves
+the tag once, verifies the release's `RELEASE-MANIFEST.sig` against the keys in
+`release-keys/` (compiled into the binary), checks the binary's sha256 against
+the signed manifest, and renames it over the running oam (on Windows, the
+running exe moves aside to `oam.exe.old` first, as `install.ps1` does). A
+release before v0.18.0 has no signature; its `SHA256SUMS` must match the digest
+pinned in `release-keys/presigning-sums`. Without `--version` it never installs
+an older release than the running one. Any failure leaves the installed binary
+as it was. It updates oam where it currently lives, or `$OAM_INSTALL_DIR/oam`
+when that is set. `OAM_SELF_UPDATE_URL` (with `--version`) fetches the
+release's files from another base; they must still verify.
 
 ## Not yet wired
 

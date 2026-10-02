@@ -18,7 +18,7 @@ overview, plus the environment variables, which `--help` does not list.
 | `oam install --precompile` | `oam install`, plus transpile the TypeScript shipped inside installed packages into `node_modules/.oam/precompile/` so the first run pays no transpile cost. Walks every package in the lockfile — a warm (already-installed) tree is populated or refreshed too, and entries invalidate automatically when a package's source, oam's transpiler, or the effective JSX settings change. |
 | `oam trust` | Manage the trust list for package lifecycle scripts. |
 | `oam compile <file>` | Embed a **pre-bundled** JS file into a standalone executable. Bundle it yourself first (esbuild/rollup); this does not bundle. |
-| `oam self-update` | Re-run the canonical installer from oamjs.org, verifying against the published `SHA256SUMS`. |
+| `oam self-update` | Update in place. Verifies the release's signed `RELEASE-MANIFEST` against the release keys built into oam (before v0.18.0: a pinned `SHA256SUMS` digest), then the binary against it. Refuses a downgrade unless `--version` names the tag. |
 | `oam cache info` / `oam cache clean` | Inspect or delete the V8 bytecode cache (see `OAM_CODE_CACHE` below). |
 
 Global: `--json` emits machine-readable ODIF JSONL on stderr instead of
@@ -123,7 +123,7 @@ line; the debugger is not. Full story:
 | `OAM_VERSION` | Pin the version the installer fetches (e.g. `v0.8.0`). |
 | `OAM_INSTALL_DIR` | Install target. Default `~/.oam/bin`, or `%LOCALAPPDATA%\oam\bin`. |
 | `OAM_INSTALL_BASE` | Asset base URL, for a mirror or CDN. Default is GitHub Releases. |
-| `OAM_SELF_UPDATE_URL` | Override the installer URL `oam self-update` fetches. |
+| `OAM_SELF_UPDATE_URL` | Fetch the release files `oam self-update` installs from this base instead of GitHub Releases (needs `--version`). They must still carry a valid signature. |
 | `OAM_GH_API` | GitHub API base, for GitHub Enterprise. |
 | `GH_TOKEN` / `GITHUB_TOKEN` | Needed while the repo is private — unauthenticated asset URLs 404. In a pipeline put it on `sh`, not on `curl`: `curl -fsSL … \| GH_TOKEN=… sh`. |
 | `OAM_IGNORE_SCRIPTS` | Skip package lifecycle scripts during install. |
