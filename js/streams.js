@@ -22,8 +22,9 @@
 // Scope (documented in docs/node-divergences.md):
 // - Default readers only. `type: 'bytes'` streams get the byte controller's
 //   queuing -- high-water mark 0 by default, desiredSize in bytes, chunks
-//   must be ArrayBufferViews -- but there is no byobRequest, no BYOB reader,
-//   and an enqueued buffer is not transferred (node detaches it).
+//   must be ArrayBufferViews and are read as Uint8Arrays -- but there is no
+//   byobRequest, no BYOB reader, and an enqueued buffer is not transferred
+//   (node detaches it).
 // - The reader, writer and controller classes are not exposed as globals.
 //
 // The async-iteration path is the load-bearing one: `for await (const
@@ -75,10 +76,14 @@
   }
   const settled = (promise) => ({ promise, resolve: undefined, reject: undefined, pending: false });
 
+  // node's coded errors come from node_compat.js's registry
+  // (lib/internal/errors.js), looked up on first use: the registry is not
+  // there yet while this file is evaluated.
+  let errorCodes;
+  const codes = () => (errorCodes ??= globalThis.__oamNode.get("internal/errors").codes);
+
   function invalidState(message) {
-    const err = new TypeError(`Invalid state: ${message}`);
-    err.code = "ERR_INVALID_STATE";
-    return err;
+    return new (codes().ERR_INVALID_STATE.TypeError)(message);
   }
 
   // node's extractHighWaterMark: `+value`, and NaN or negative is a
@@ -88,11 +93,7 @@
     if (value === undefined) return defaultHWM;
     value = +value;
     if (Number.isNaN(value) || value < 0) {
-      const err = new RangeError(
-        `The property 'strategy.highWaterMark' is invalid. Received ${value}`,
-      );
-      err.code = "ERR_INVALID_ARG_VALUE";
-      throw err;
+      throw new (codes().ERR_INVALID_ARG_VALUE.RangeError)("strategy.highWaterMark", value);
     }
     return value;
   }
@@ -104,8 +105,7 @@
   function makeSizeFn(sizeFn) {
     if (sizeFn === undefined) return countSize;
     if (typeof sizeFn !== "function") {
-      const codes = globalThis.__oamNode.get("internal/errors").codes;
-      throw new codes.ERR_INVALID_ARG_TYPE("strategy.size", "Function", sizeFn);
+      throw new (codes().ERR_INVALID_ARG_TYPE)("strategy.size", "Function", sizeFn);
     }
     // Called as a plain function, `this` undefined, as node calls it.
     return (chunk) => sizeFn(chunk);
@@ -115,21 +115,32 @@
   function validChunkSize(size) {
     size = +size;
     if (Number.isNaN(size) || size < 0 || size === Infinity) {
-      const err = new RangeError(`The argument 'size' is invalid. Received ${size}`);
-      err.code = "ERR_INVALID_ARG_VALUE";
-      throw err;
+      throw new (codes().ERR_INVALID_ARG_VALUE.RangeError)("size", size);
     }
     return size;
   }
-  // The byte controller's size: a chunk is an ArrayBufferView, and it
-  // counts its bytes. The coded error comes from node_compat.js, which is
-  // evaluated after this file, so it is looked up at call time.
-  function byteChunkSize(chunk) {
+  // The byte controller queues bytes: a chunk counts its byteLength. Every
+  // chunk in a byte stream's queue is a Uint8Array (byteEnqueueChunk), so
+  // this never throws -- a size error would error the stream.
+  const byteChunkSize = (chunk) => chunk.byteLength;
+
+  // node's ReadableByteStreamController.enqueue checks, in its order, before
+  // anything is queued: the chunk must be an ArrayBufferView (a coded
+  // TypeError that leaves the stream as it was), then the controller must
+  // not be closing and the stream must be readable. A reader is handed a
+  // Uint8Array over the chunk's bytes whatever view was enqueued, on the
+  // queued path and the waiting-read path alike; a Uint8Array goes through
+  // as it is (node hands back a new view over the transferred buffer --
+  // oam does not transfer, docs/node-divergences.md).
+  function byteEnqueueChunk(stream, chunk) {
     if (!ArrayBuffer.isView(chunk)) {
-      const codes = globalThis.__oamNode.get("internal/errors").codes;
-      throw new codes.ERR_INVALID_ARG_TYPE("buffer", ["Buffer", "TypedArray", "DataView"], chunk);
+      throw new (codes().ERR_INVALID_ARG_TYPE)("buffer", ["Buffer", "TypedArray", "DataView"], chunk);
     }
-    return chunk.byteLength;
+    if (stream._closeRequested) throw invalidState("Controller is already closed");
+    if (stream._state !== "readable") throw invalidState("ReadableStream is already closed");
+    return Object.getPrototypeOf(chunk) === Uint8Array.prototype
+      ? chunk
+      : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
   }
 
   // ------------------------------------------------------- ReadableStream
@@ -142,12 +153,18 @@
     }
     enqueue(chunk) {
       const stream = this._stream;
-      if (!readableCanCloseOrEnqueue(stream)) throw invalidState("Controller is already closed");
+      if (stream._isBytes) chunk = byteEnqueueChunk(stream, chunk);
+      else if (!readableCanCloseOrEnqueue(stream)) throw invalidState("Controller is already closed");
       readableEnqueue(stream, chunk);
     }
     close() {
       const stream = this._stream;
-      if (!readableCanCloseOrEnqueue(stream)) throw invalidState("Controller is already closed");
+      // The byte controller tells a closing controller from a stream that is
+      // no longer readable; the default one says the same for both.
+      if (stream._closeRequested || (stream._state !== "readable" && !stream._isBytes)) {
+        throw invalidState("Controller is already closed");
+      }
+      if (stream._state !== "readable") throw invalidState("ReadableStream is already closed");
       readableControllerClose(stream);
     }
     error(reason) {
@@ -155,7 +172,7 @@
     }
   }
 
-  function initReadable(stream, highWaterMark, sizeFn) {
+  function initReadable(stream, highWaterMark, sizeFn, isBytes = false) {
     stream._queue = [];
     stream._queueSizes = [];
     stream._queueTotalSize = 0;
@@ -165,6 +182,9 @@
     stream._waiters = []; // pending read() resolvers: {resolve, reject}
     stream._highWaterMark = highWaterMark;
     stream._sizeFn = sizeFn;
+    // A `type: 'bytes'` stream: its controller enqueues only
+    // ArrayBufferViews, handed on as Uint8Arrays.
+    stream._isBytes = isBytes;
     stream._started = false;
     stream._pulling = false;
     stream._pullAgain = false;
@@ -280,12 +300,18 @@
     stream._sizeFn = countSize;
   }
 
+  // With chunks still queued the close waits for the last of them to be
+  // read (closeRequested); otherwise the stream closes now. closeRequested
+  // is only set in the first case, as node's byte controller sets it: an
+  // enqueue then tells "Controller is already closed" from "ReadableStream
+  // is already closed" (the default controller says the former for both).
   function readableControllerClose(stream) {
-    stream._closeRequested = true;
-    if (stream._queue.length === 0) {
-      readableClearAlgorithms(stream);
-      readableClose(stream);
+    if (stream._queue.length > 0) {
+      stream._closeRequested = true;
+      return;
     }
+    readableClearAlgorithms(stream);
+    readableClose(stream);
   }
 
   // ReadableStreamClose: the stream is closed, then reader.closed settles,
@@ -339,6 +365,7 @@
         this,
         extractHighWaterMark(strategy?.highWaterMark, isBytes ? 0 : 1),
         isBytes ? byteChunkSize : makeSizeFn(strategy?.size),
+        isBytes,
       );
       const start = source.start;
       const pull = source.pull;

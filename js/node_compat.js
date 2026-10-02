@@ -956,7 +956,7 @@
   codes.ERR_INVALID_ARG_TYPE = E("ERR_INVALID_ARG_TYPE", TypeError, function(name, expected, actual) {
     return buildArgTypeMessage(name, expected, actual);
   });
-  codes.ERR_INVALID_ARG_VALUE = E("ERR_INVALID_ARG_VALUE", TypeError, function(name, value, reason) {
+  function invalidArgValueMessage(name, value, reason) {
     // Node's exact shape: `The ${type} '${name}' ${reason}. Received
     // ${inspect(value)}` -- 'property' when the name contains a dot,
     // 'argument' otherwise, and INSPECT rather than String() so a string
@@ -973,7 +973,13 @@
     if (inspected.length > 128) inspected = `${inspected.slice(0, 128)}...`;
     const type = String(name).includes(".") ? "property" : "argument";
     return `The ${type} '${name}' ${reason ?? "is invalid"}. Received ${inspected}`;
-  });
+  }
+  // node declares it with two bases, `E('ERR_INVALID_ARG_VALUE', fn,
+  // TypeError, RangeError)`: the default is the TypeError, and the
+  // RangeError variant (`.RangeError`) is what web streams raise for a
+  // strategy (an invalid highWaterMark or size).
+  codes.ERR_INVALID_ARG_VALUE = E("ERR_INVALID_ARG_VALUE", TypeError, invalidArgValueMessage);
+  codes.ERR_INVALID_ARG_VALUE.RangeError = E("ERR_INVALID_ARG_VALUE", RangeError, invalidArgValueMessage);
   codes.ERR_INVALID_CALLBACK = E("ERR_INVALID_CALLBACK", TypeError, function(name) {
     return 'Callback must be a function. Received ' + String(name);
   });
@@ -1224,12 +1230,16 @@
   // ---- Error family ----
   // Node declares this one with three bases (Error, TypeError, RangeError) and
   // reaches the TypeError/RangeError variants through `.TypeError`/`.RangeError`
-  // properties; every call site oam has raises the plain-Error default, which
-  // is what `new ERR_INVALID_STATE(msg)` builds. The "Invalid state: " prefix
+  // properties. `new ERR_INVALID_STATE(msg)` builds the plain-Error default;
+  // js/streams.js raises the TypeError one. The "Invalid state: " prefix
   // is part of the format string, not the caller's message.
-  codes.ERR_INVALID_STATE = E("ERR_INVALID_STATE", Error, function(msg) {
+  function invalidStateMessage(msg) {
     return 'Invalid state: ' + msg;
-  });
+  }
+  codes.ERR_INVALID_STATE = E("ERR_INVALID_STATE", Error, invalidStateMessage);
+  // The TypeError variant: what web streams raise (a released reader, a
+  // closed controller, a locked stream).
+  codes.ERR_INVALID_STATE.TypeError = E("ERR_INVALID_STATE", TypeError, invalidStateMessage);
   codes.ERR_STREAM_DESTROYED = E("ERR_STREAM_DESTROYED", Error, function(name) {
     return 'Cannot call ' + (name || 'write') + ' after a stream was destroyed';
   });
