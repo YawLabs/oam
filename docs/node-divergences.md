@@ -2630,7 +2630,9 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
   `respond(headers, { waitForTrailers: true })`, `'wantTrailers'`, `sendTrailers()` (Node's
   checks and errors) and `sentTrailers`, the compatibility API's `setTrailer()` /
   `addTrailers()`, a request's trailer section as the stream's `'trailers'` and as
-  `req.trailers` / `req.rawTrailers` (conformance cases 304 and 305). What differs: no
+  `req.trailers` / `req.rawTrailers` (conformance cases 304 and 305). A section's values
+  reach the peer as Node's do (case 306): one byte per UTF-16 unit, a field the receiving
+  nghttp2 would drop left out, and an empty section for one with a NUL byte. What differs: no
   received field is ever listed in `[http2.sensitiveHeaders]` -- of a stream's headers or
   of its trailers. nghttp2 sends a `cookie` field shorter than 20 bytes as never-indexed and
   Node lists the fields it receives that way; oam reports no received field as

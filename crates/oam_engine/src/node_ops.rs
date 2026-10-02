@@ -3437,7 +3437,8 @@ fn op_fetch_body_channel_write(
 /// (`[[name, value], ...]`), queued behind the chunks already written -- an
 /// http2 client stream's `sendTrailers()`, followed by `fetchBodyChannelEnd`.
 /// Resolves like a write: `false` when the request no longer takes its body;
-/// rejects for a field that cannot go out (JS checked the names already).
+/// rejects for a field that cannot go out (JS's trailerFields already sent
+/// each value as node's reaches the peer, so none should).
 fn op_fetch_body_channel_trailers(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,

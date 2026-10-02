@@ -32316,8 +32316,31 @@
       if (stream.destroyed || stream.closed) return;
       if (!stream.emit("wantTrailers")) stream.sendTrailers({});
     }
-    // sendTrailers()'s checks, in node's order, and the pairs to send; the
-    // section is the stream's sentTrailers from then on.
+    // A trailer section's fields as node's reach the peer, which is what
+    // goes out here (measured on node v22.22.2, both ways): each value is
+    // written one byte per UTF-16 unit, its low byte (node encodes the
+    // header block latin1, so U+20AC arrives as 0xAC); the receiving nghttp2
+    // drops a field whose value holds a control byte other than HTAB, or
+    // DEL, or starts or ends with SP or HTAB, and keeps the others; and a
+    // NUL byte anywhere (U+0100, a lone surrogate, every astral character
+    // carry one) leaves the whole section empty -- its HEADERS frame still
+    // arrives, with no fields. hyper could not send those values anyway.
+    var kNonLatin1 = /[^\x00-\xff]/;
+    var kDroppedFieldValue = /[\x01-\x08\x0a-\x1f\x7f]|^[\t ]|[\t ]$/;
+    function trailerFields(pairs) {
+      var fields = [];
+      for (var i = 0; i < pairs.length; i++) {
+        var value = pairs[i][1];
+        if (kNonLatin1.test(value)) value = globalThis.Buffer.from(value, "latin1").toString("latin1");
+        if (value.indexOf("\0") !== -1) return [];
+        if (!kDroppedFieldValue.test(value)) fields.push([pairs[i][0], value]);
+      }
+      return fields;
+    }
+    // sendTrailers()'s checks, in node's order, and the fields to send: null
+    // for a section with none, which goes out with no HEADERS frame of its
+    // own (fields the peer drops still send one). The section is the
+    // stream's sentTrailers from then on.
     function prepareTrailers(stream, headers) {
       if (stream.destroyed || stream.closed) {
         throw h2Error("ERR_HTTP2_INVALID_STREAM", "The stream has been destroyed");
@@ -32333,7 +32356,7 @@
       headers = Object.assign({ __proto__: null }, headers);
       var pairs = headerPairs(objectEntries(headers), function (name) { throw pseudoHeaderError(name); });
       stream._sentTrailers = headers;
-      return pairs;
+      return pairs.length === 0 ? null : trailerFields(pairs);
     }
     function emitTrailers(stream, pairs) {
       var raw = [];
@@ -32880,6 +32903,9 @@
           if (!finished) {
             this.aborted = true;
             this._responseEnded = true;
+            // A response still open goes too (a failed push may have left
+            // it): the peer must not wait on it.
+            if (this._responseStream !== null) natives.httpBodyEnd(this._responseStream);
             this.emit("aborted");
           }
           this._close(finished ? NGHTTP2_NO_ERROR : NGHTTP2_CANCEL);
@@ -32911,12 +32937,12 @@
           return this;
         }
         sendTrailers(headers) {
-          var pairs = prepareTrailers(this, headers);
+          var fields = prepareTrailers(this, headers);
           touchIdleTimer(this);
           var responseStream = this._responseStream;
           var chain = this._chain;
-          if (pairs.length > 0) {
-            chain = chain.then(function() { return natives.httpBodyTrailers(responseStream, JSON.stringify(pairs)); });
+          if (fields !== null) {
+            chain = chain.then(function() { return natives.httpBodyTrailers(responseStream, JSON.stringify(fields)); });
           }
           // A client gone meanwhile: the response is over either way.
           this._chain = chain.then(() => this._endResponse(responseStream), () => this._onAborted());
@@ -33956,15 +33982,18 @@
       }
 
       sendTrailers(headers) {
-        var pairs = prepareTrailers(this, headers);
-        if (pairs.length > 0) {
+        var fields = prepareTrailers(this, headers);
+        if (fields !== null) {
+          var self = this;
           var stream = this._bodyStream;
-          var json = JSON.stringify(pairs);
+          var json = JSON.stringify(fields);
           // A request that no longer takes its body has ended or failed: the
-          // stream hears of that from the response, as for any write.
+          // stream hears of that from the response, as for any write. A
+          // section that could not go out fails the stream, as a failed
+          // write does.
           this._channelTail = this._channelTail.then(function () {
             return natives.fetchBodyChannelTrailers(stream, json);
-          }).then(function () {}, function () {});
+          }).then(function () {}, function (err) { self.destroy(err); });
         }
         this._endChannel();
         // Done both ways now, the stream goes as any other does.

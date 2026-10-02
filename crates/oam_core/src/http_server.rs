@@ -938,7 +938,8 @@ impl hyper::body::Body for UnsizedBody {
 /// A node:http response's trailer fields, as hyper sends them: each value
 /// one byte per code point, as node writes its trailer string, and a
 /// repeated field as often as it repeats. `None` when a name or a value is
-/// one JS would have refused (addTrailers checks both as node's does).
+/// one JS would have refused (addTrailers checks both as node's does; an
+/// http2 stream's trailerFields leaves out the values a peer would drop).
 pub fn trailer_fields(pairs: &[(String, String)]) -> Option<hyper::HeaderMap> {
     let mut map = hyper::HeaderMap::with_capacity(pairs.len());
     for (name, value) in pairs {
