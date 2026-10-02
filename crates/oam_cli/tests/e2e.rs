@@ -5571,9 +5571,8 @@ redirect-hops ok 200 ok";
 /// in undici, with undici's own error and nothing complete on the wire. Up
 /// to this fix oam's fetch stringified every non-string, non-buffer body, so
 /// a Readable went out as `[object Object]`. The expected output is node
-/// v22.22.2 + undici 6.29.0's, line for line, except the last: undici
-/// encodes a FormData as multipart/form-data, which oam cannot yet, so it
-/// refuses one (docs/node-divergences.md).
+/// v22.22.2 + undici 6.29.0's, line for line, a FormData's multipart body
+/// included (oam refused one until review 3, finding 23).
 #[test]
 fn undici_request_sends_every_body_undici_takes() {
     let script = write_temp(
@@ -5744,7 +5743,7 @@ boolean failed InvalidArgumentError UND_ERR_INVALID_ARG "body must be a string, 
 destroyed-stream failed AbortError UND_ERR_ABORTED "Request aborted" seen=false
 ended-stream ok POST length 0 "" ct=null
 url-params failed TypeError ERR_INVALID_ARG_TYPE "The \"string\" argument must be of type string or an instance of Buffer or ArrayBuffer. Received an instance of Array" seen=false
-formdata failed NotSupportedError UND_ERR_NOT_SUPPORTED a FormData body is not supported by oam's undici.request(): oam has no multipart/form-data encoder yet. Send it with fetch() through a library that encodes it, or encode it yourself"##;
+formdata ok length true true"##;
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
         expected,
@@ -6417,6 +6416,58 @@ server.close();
 "--BOUNDARY\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"f\"; filename=\"f.txt\"\r\nContent-Type: text/plain\r\n\r\nxyz\r\n--BOUNDARY--\r\n"
 the caller content-type length true
 "--BOUNDARY\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"f\"; filename=\"f.txt\"\r\nContent-Type: text/plain\r\n\r\nxyz\r\n--BOUNDARY--\r\n""#;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// undici.request()'s body and throwOnError (review 3, finding 13): a body
+/// destroyed before its end errors with RequestAbortedError, as undici's
+/// BodyReadable does; and `throwOnError: true` rejects a status of 400 or
+/// more with ResponseStatusCodeError, its body parsed by content-type (JSON,
+/// text, or none). oam's body just closed, and throwOnError was ignored.
+/// The expected output is node v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_request_body_destroy_and_throw_on_error() {
+    let script = write_temp(
+        "undici_request_throw_on_error/main.mjs",
+        r##"import http from 'node:http';
+import { request } from 'undici';
+
+const server = http.createServer((q, s) => {
+  if (q.url === '/json') { s.writeHead(404, { 'content-type': 'application/json' }); s.end('{"a":1}'); return; }
+  if (q.url === '/text') { s.writeHead(500, 'Broken', { 'content-type': 'text/plain' }); s.end('oops'); return; }
+  if (q.url === '/none') { s.writeHead(403); s.end('no type'); return; }
+  s.writeHead(200);
+  s.write('x'.repeat(100));
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+const r = await request(base + '/stall');
+await new Promise((resolve) => {
+  r.body.on('error', (e) => console.log('destroyed body: error', e.name, e.code, e.message));
+  r.body.on('close', () => { console.log('destroyed body: close'); setTimeout(resolve, 20); });
+  r.body.once('data', () => r.body.destroy());
+});
+for (const path of ['/json', '/text', '/none']) {
+  try {
+    const res = await request(base + path, { throwOnError: true });
+    console.log(path, 'resolved', res.statusCode);
+  } catch (e) {
+    console.log(path, e.name, e.code, e.message, e.status, e.statusCode, JSON.stringify(e.body), e.headers['content-type']);
+  }
+}
+const plain = await request(base + '/json');
+console.log('without throwOnError', plain.statusCode, await plain.body.text());
+process.exit(0);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = r#"destroyed body: error AbortError UND_ERR_ABORTED Request aborted
+destroyed body: close
+/json ResponseStatusCodeError UND_ERR_RESPONSE_STATUS_CODE Response status code 404: Not Found 404 404 {"a":1} application/json
+/text ResponseStatusCodeError UND_ERR_RESPONSE_STATUS_CODE Response status code 500: Broken 500 500 "oops" text/plain
+/none ResponseStatusCodeError UND_ERR_RESPONSE_STATUS_CODE Response status code 403: Forbidden 403 403 undefined undefined
+without throwOnError 404 {"a":1}"#;
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 

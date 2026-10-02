@@ -134,6 +134,14 @@
             },
           );
         },
+        // undici's BodyReadable._destroy: destroyed before its end with no
+        // error of its own, the body errors with RequestAbortedError (name
+        // AbortError, code UND_ERR_ABORTED); the transport's read is let go.
+        destroy(err, callback) {
+          if (!err && !this._readableState.endEmitted) err = new errors.RequestAbortedError();
+          if (reader) reader.cancel().then(undefined, () => {});
+          callback(err);
+        },
       });
       const collect = async () => {
         const chunks = [];
@@ -297,6 +305,19 @@
         // Anything else rejects with what failed, not fetch's wrapper.
         throw requestError(err);
       }
+      // undici's throwOnError: a status of 400 or more rejects with
+      // ResponseStatusCodeError, carrying the body read off the wire (JSON
+      // or text by its content-type, none past 128 KiB or of another type).
+      if (opts.throwOnError === true && res.status >= 400) {
+        unlink();
+        const error = await statusCodeError(res);
+        const stop = uploads.get(res);
+        if (stop) {
+          uploads.delete(res);
+          stop();
+        }
+        throw error;
+      }
       const body = makeBodyReadable(res.body);
       // A signal shared by many requests must not keep one listener per
       // finished body.
@@ -320,6 +341,51 @@
         context: {},
         body,
       };
+    }
+
+    // undici's getResolveErrorBodyCallback (api/util.js, 6.29.0): the
+    // response's body, up to 128 KiB, parsed by its content-type -- JSON for
+    // `application/json...`, a string for `text/...` -- and the error built
+    // with the status line's message.
+    async function statusCodeError(res) {
+      const statusCode = res.status;
+      const headers = headersToObject(res.headers);
+      const contentType = res.headers.get("content-type");
+      const LIMIT = 128 * 1024;
+      let chunks = [];
+      let length = 0;
+      try {
+        if (res.body) {
+          for await (const chunk of res.body) {
+            chunks.push(chunk);
+            length += chunk.length;
+            if (length > LIMIT) {
+              chunks = [];
+              length = 0;
+              break;
+            }
+          }
+        }
+      } catch {
+        chunks = [];
+        length = 0;
+      }
+      const message = `Response status code ${statusCode}${res.statusText ? `: ${res.statusText}` : ""}`;
+      if (statusCode === 204 || !contentType || !length) {
+        return new errors.ResponseStatusCodeError(message, statusCode, headers);
+      }
+      let payload;
+      try {
+        const text = G.Buffer.concat(chunks.map((c) => G.Buffer.from(c.buffer, c.byteOffset, c.byteLength))).toString("utf8");
+        if (contentType.length > 15 && contentType[11] === "/" && contentType.startsWith("application/json")) {
+          payload = JSON.parse(text);
+        } else if (contentType.length > 4 && contentType[4] === "/" && contentType.startsWith("text")) {
+          payload = text;
+        }
+      } catch {
+        // undici leaves the body out when it does not parse.
+      }
+      return new errors.ResponseStatusCodeError(message, statusCode, headers, payload);
     }
 
     // request()'s failure as undici's request() reports it. oam's fetch wraps
