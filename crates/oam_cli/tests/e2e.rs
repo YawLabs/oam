@@ -6373,6 +6373,53 @@ fetch body cause BodyTimeoutError name,code,message {"name":"BodyTimeoutError","
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// `undici.request` sends a FormData body as undici does (review 3, finding
+/// 23): `multipart/form-data` with its boundary in the content-type and a
+/// content-length, the caller's content-type kept when it set one. oam
+/// refused it with NotSupportedError, naming an encoder fetch already had.
+/// The boundary's prefix differs (`----formdata-oam-` for undici's
+/// `----formdata-undici-`), so it is masked. The expected output is node
+/// v22.22.2 + undici 6.29.0's.
+#[test]
+fn undici_request_sends_a_form_data_body() {
+    let script = write_temp(
+        "undici_request_form_data/main.mjs",
+        r##"import http from 'node:http';
+import { request } from 'undici';
+
+const server = http.createServer((q, s) => {
+  const chunks = [];
+  q.on('data', (c) => chunks.push(c));
+  q.on('end', () => {
+    const type = q.headers['content-type'];
+    const boundary = (type.match(/boundary=(.*)$/) || [])[1];
+    let body = Buffer.concat(chunks).toString('latin1');
+    if (boundary) body = body.split(boundary).join('BOUNDARY');
+    const mask = (t) => t.replace(/BOUNDARY|----formdata-\w+-0\d+/g, 'BOUNDARY');
+    console.log(type.endsWith('boundary=mine') ? 'the caller content-type' : mask(type).replace(/boundary=.*/, 'boundary=BOUNDARY'), 'length', q.headers['content-length'] === String(Buffer.concat(chunks).length));
+    console.log(JSON.stringify(mask(body)));
+    s.end('ok');
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+const fd = new FormData();
+fd.append('a', '1');
+fd.append('f', new Blob(['xyz'], { type: 'text/plain' }), 'f.txt');
+await (await request(url, { method: 'POST', body: fd })).body.text();
+await (await request(url, { method: 'POST', body: fd, headers: { 'content-type': 'multipart/form-data; boundary=mine' } })).body.text();
+server.close();
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = r#"multipart/form-data; boundary=BOUNDARY length true
+"--BOUNDARY\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"f\"; filename=\"f.txt\"\r\nContent-Type: text/plain\r\n\r\nxyz\r\n--BOUNDARY--\r\n"
+the caller content-type length true
+"--BOUNDARY\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"f\"; filename=\"f.txt\"\r\nContent-Type: text/plain\r\n\r\nxyz\r\n--BOUNDARY--\r\n""#;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 /// A Readable `undici.request` body is framed when the request is
 /// dispatched, not when `request()` is called: undici asks
 /// `util.bodyLength` then, so a stream that ends in the same turn of the

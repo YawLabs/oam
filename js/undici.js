@@ -427,10 +427,18 @@
         // Sent as the string (the transport encodes it as UTF-8).
         bytes = body.length ? body : null;
       } else if (isFormDataLike(body)) {
-        throw new errors.NotSupportedError(
-          "a FormData body is not supported by oam's undici.request(): oam has no multipart/form-data encoder yet. " +
-            "Send it with fetch() through a library that encodes it, or encode it yourself",
-        );
+        // undici encodes a FormData as multipart/form-data, with its
+        // boundary in the content-type (unless the caller set one) and its
+        // length known up front: fetch's own encoder, through a Response.
+        let form = body;
+        if (!(form instanceof G.FormData)) {
+          form = new G.FormData();
+          for (const [name, value] of body) form.append(name, value);
+        }
+        const encoded = new G.Response(form);
+        if (!typed) headers.push(["content-type", encoded.headers.get("content-type")]);
+        const read = new Uint8Array(await encoded.arrayBuffer());
+        bytes = read.byteLength ? read : null;
       } else if (isIterable(body)) {
         return sendStreamed(url, { ...init, headers }, body, false, declared, expectsPayload, controller);
       } else if (isBlobLike(body)) {

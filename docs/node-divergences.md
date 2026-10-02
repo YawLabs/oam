@@ -1723,9 +1723,9 @@ mid-write. Pinned against Node + undici 6.29.0 by
 was not a string or a buffer was stringified: a Readable went out as `[object Object]`, a
 generator as `[object AsyncGenerator]`. What differs:
 
-- **A FormData body is refused** with `NotSupportedError`. undici encodes it as
-  `multipart/form-data`; oam has no multipart encoder yet (`new Response(formData)` lacks one
-  too), and sending it any other way would put the wrong bytes on the wire.
+- **A FormData body's boundary** reads `----formdata-oam-0<11 digits>` where undici's reads
+  `----formdata-undici-0<11 digits>`: the body is `multipart/form-data` as undici encodes it,
+  with its length, three bytes shorter per boundary.
 - **When a stream's framing is decided.** undici frames a Readable when it dispatches the
   request: an ended byte stream goes with `content-length`, an open one chunked. On a
   reused connection that is after the immediates already queued; on a fresh one, after the
@@ -1754,12 +1754,10 @@ values without the status line's reason phrase (node's own `http.request` counts
 Pinned against Node + undici 6.29.0 by `undici_request_rejects_with_the_error_itself` (e2e).
 Up to 0.17.1 only a late head was unwrapped: an oversized head was `fetch failed` with
 node's http-parser cause `HPE_HEADER_OVERFLOW` (under the http-parser count, so a head
-undici takes could be refused), and a refused connect was wrapped too. What differs:
-
-- **A connection the server closes before its response** rejects with a plain `Error`
-  (`error sending request for url (...)`, no `code`), where undici's is `SocketError`
-  (`UND_ERR_SOCKET`, `other side closed`): oam's transport does not yet tell that failure
-  apart from others of its kind.
+undici takes could be refused), and a refused connect was wrapped too. A connection the
+server closes before its response rejects with undici's `SocketError` (`UND_ERR_SOCKET`,
+`other side closed`), as undici's does; up to 0.17.1 it was a plain `Error` (`error sending
+request for url (...)`, no `code`).
 
 **`headersTimeout` and `bodyTimeout` on `undici.request` and `fetch`**
 
@@ -1852,10 +1850,8 @@ UTF-8, typed `text/plain;charset=UTF-8`; and no body or an empty one with `conte
 on POST, PUT and PATCH, as undici's writeH1 does. Pinned against Node by
 `fetch_sends_blob_search_params_and_empty_bodies_as_node_does` (e2e). Up to 0.17.1 a Blob went
 out as the text `[object Blob]`, a URLSearchParams as `text/plain`, and an empty POST with no
-length. What differs:
-
-- **A FormData body is sent as the text `[object FormData]`.** Node encodes it as
-  `multipart/form-data`; oam has no multipart encoder yet (`undici.request` refuses one, above).
+length. A FormData body is `multipart/form-data`, as Node encodes it (the boundary's prefix
+differs: see the request-body bullets of entry 38).
 
 **Streamed request bodies on `fetch`**
 
@@ -1920,8 +1916,9 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
     1,120 of 64,000 fetches (the one resend met another closing connection) where Node
     failed 15.
   - **FIN at once, `POST` + `307`.** A `POST` is never sent again -- oam did write it and
-    cannot know the server ignored it -- so it fails with `error sending request for url
-    (...)`: 595 and 1,137 of 16,000 fetches in oam, none in Node.
+    cannot know the server ignored it -- so it fails, its cause undici's `SocketError`
+    (`other side closed`; it was the uncoded `error sending request for url (...)` when
+    measured): 595 and 1,137 of 16,000 fetches in oam, none in Node.
   - **FIN 0-5 ms after the 3xx.** Here Node loses the race too, and fails with
     `UND_ERR_SOCKET`: 2,561 of 16,000 `GET`s and 2,587 `POST`s. oam failed no `GET` (its
     one resend) and 1,948 `POST`s.
