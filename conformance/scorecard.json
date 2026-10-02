@@ -1,6 +1,6 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "d9c7610+wip",
+  "commit": "8c177f0",
   "oamVersion": "oam 0.17.1",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 257,
-      "total": 257,
+      "pass": 264,
+      "total": 264,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -731,6 +731,14 @@
           "status": "pass"
         },
         {
+          "case": "284-fetch-streamed-body-dispatches-at-once.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "285-http-response-head-joins-first-chunk.mjs",
+          "status": "pass"
+        },
+        {
           "case": "286-net-write-without-handle.mjs",
           "status": "pass"
         },
@@ -760,6 +768,26 @@
         },
         {
           "case": "292-fs-cp-type-mismatch.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "293-http-client-malformed-response-head.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "294-http-write-after-end-and-close.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "295-http-client-response-trailers.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "296-http-server-request-after-response-finished.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "297-net-end-then-reset-while-looking-up.mjs",
           "status": "pass"
         },
         {
