@@ -11,6 +11,8 @@
 // ('error', then 'close' with no argument). A later write is buffered behind
 // the failed one and gets the same error right after it; end(cb) calls back
 // with it on its own tick. end() with no data on such a socket finishes.
+// The writes buffered behind the failed one count in writableLength (oam
+// counted none) and come off it one by one, each just before its callback.
 import net from "node:net";
 
 setTimeout(() => {
@@ -80,5 +82,53 @@ for (const [name, act] of [
   act(socket, cb);
   await new Promise((resolve) => setTimeout(resolve, 50));
   log.push(`[ended ${socket.writableEnded} finished ${socket.writableFinished} destroyed ${socket.destroyed}]`);
+  console.log(`${name}: ${log.join(" | ")}`);
+}
+
+// writableLength while writes wait behind the failed one: node's
+// writeOrBuffer counts each chunk (a string's length -- net.Socket does not
+// decode strings -- a buffer's bytes; not the failed write, which onwrite
+// took off inside the call), sets needDrain at the high-water mark, and
+// errorBuffer takes each chunk off just before its callback.
+for (const [name, act] of [
+  [
+    "write(cb) x3; end(cb)",
+    (s, cb, at) => {
+      at(`write a ${s.write("a", cb("a"))}`);
+      at(`write bb ${s.write("bb", cb("bb"))}`);
+      at(`write buf3 ${s.write(Buffer.alloc(3), cb("buf3"))}`);
+      s.end(cb("end"));
+      at("after end");
+    },
+  ],
+  [
+    "write() of wide and encoded strings",
+    (s, cb, at) => {
+      s.write("x");
+      at(`write e-acute ${s.write("\xe9")}`);
+      at(`write emoji ${s.write("\u{1F600}")}`);
+      at(`write hex ${s.write("abcd", "hex", cb("hex"))}`);
+    },
+  ],
+  [
+    "write() past the high-water mark",
+    (s, cb, at) => {
+      s.write("x");
+      at(`write 20000 ${s.write(Buffer.alloc(20000), cb("big"))} needDrain ${s.writableNeedDrain}`);
+    },
+  ],
+]) {
+  const socket = new net.Socket();
+  const log = [];
+  const at = (label) => log.push(`${label} [length ${socket.writableLength}]`);
+  const cb = (label) => (v) => at(`${label} ${v?.code}`);
+  socket.on("error", (e) => at(`error ${e.code}`));
+  socket.on("drain", () => at("drain"));
+  const closed = new Promise((resolve) => socket.once("close", () => {
+    at("close");
+    resolve();
+  }));
+  act(socket, cb, at);
+  await closed;
   console.log(`${name}: ${log.join(" | ")}`);
 }

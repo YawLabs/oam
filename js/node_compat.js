@@ -23084,7 +23084,7 @@
         }
         if (this.destroyed || !this.writable || (this._handle === null && this._heldOps === null)) {
           if (!this.destroyed && (this.writable || this._noHandleFailure !== null)) {
-            return this._writeWithoutHandle(cb);
+            return this._writeWithoutHandle(data, cb);
           }
           let err;
           if (this._writableState.ended && this._readableState.endEmitted && !this.allowHalfOpen) {
@@ -23211,28 +23211,42 @@
       // handle 0 is gone", a message no caller could act on.
       //
       // Until that tick a later write is buffered behind the failed one
-      // (node's writeOrBuffer on an errored stream) and its callback gets
-      // the error right after the first one's (errorBuffer); an end() does
-      // not end the stream and calls back with the error on its own tick
-      // (Writable.end on an errored stream). Off the hot path: only a socket
-      // with no handle and no connect in flight gets here.
-      _writeWithoutHandle(cb) {
-        let callbacks = this._noHandleFailure;
-        if (callbacks === null) {
+      // (node's writeOrBuffer on an errored stream): counted in
+      // writableLength, as node counts a chunk (a string's length, a
+      // buffer's bytes -- net.Socket does not decode strings), and
+      // writableNeedDrain once that reaches the high-water mark. Its
+      // callback gets the error right after the first one's, its chunk
+      // taken off the count just before (errorBuffer). The failed write
+      // itself is not counted: node's onwrite took it off inside the call.
+      // An end() does not end the stream and calls back with the error on
+      // its own tick (Writable.end on an errored stream). Off the hot path:
+      // only a socket with no handle and no connect in flight gets here.
+      _writeWithoutHandle(data, cb) {
+        const ws = this._writableState;
+        let buffered = this._noHandleFailure;
+        if (buffered === null) {
           const err = codes.ERR_SOCKET_CLOSED();
-          const ws = this._writableState;
           const rs = this._readableState;
           if (!ws.errored) ws.errored = err;
           if (!rs.errored) rs.errored = err;
           this.writable = false;
-          callbacks = this._noHandleFailure = [];
+          // [chunk length, callback] pairs, the failed write's first.
+          const failed = this._noHandleFailure = [0, cb];
           process.nextTick(() => {
             this._noHandleFailure = null;
-            for (const callback of callbacks) callback(err);
+            for (let i = 0; i < failed.length; i += 2) {
+              ws.length -= failed[i];
+              const callback = failed[i + 1];
+              if (typeof callback === "function") callback(err);
+            }
             this.destroy(err);
           });
+          return false;
         }
-        if (typeof cb === "function") callbacks.push(cb);
+        const length = typeof data === "string" ? data.length : (data?.byteLength ?? 0);
+        ws.length += length;
+        if (ws.length >= this.writableHighWaterMark) ws.needDrain = true;
+        buffered.push(length, cb);
         return false;
       }
 
