@@ -1437,17 +1437,25 @@ What still differs:
   `instanceof` brands -- `err.cause instanceof errors.SocketError` (and `UndiciError`)
   holds against `import('undici')`'s classes, whose `instanceof` reads the same brands
   (e2e `undici_errors_are_undicis_classes_with_its_brands`; before 0.17.2 the shim's
-  classes had none, and both checks were false) -- and the `socket` it was on: `localAddress`, `localPort`,
-  `remoteAddress`, `remotePort`, `remoteFamily`, `timeout` (unset), `bytesWritten`,
-  `bytesRead`; `http.request` fails with `socket hang up`, as before. A body the server
-  closes or resets before its end fails the read with `TypeError: terminated`, the cause
-  that `SocketError` or the socket's `read ECONNRESET`; `http.request` aborts the response
-  (`'aborted'`, then ECONNRESET `aborted`), after a reset first emitting `read ECONNRESET`
-  on the request, as Node's socket error does. Up to 0.17.1 a close was the uncoded `error
-  sending request for url (...)` cause, and a failure mid-body was oam's own `fetch: body
-  read failed: error decoding response body` (on `http.request`, the response's error).
-  What differs: `bytesWritten` counts oam's own request head, whose `user-agent` is oam's
-  (6 bytes longer than Node's `node`) and whose header order is its own; on an `https`
+  classes had none, and both checks were false) -- and the `socket` it was on:
+  `localAddress`, `localPort`, `remoteAddress`, `remotePort`, `remoteFamily`, `timeout`
+  (unset), `bytesWritten`, `bytesRead`; `http.request` fails with `socket hang up`, as
+  before. A body the server closes or resets before its end fails the read with
+  `TypeError: terminated`, the cause that `SocketError` or the socket's `read ECONNRESET`;
+  `http.request` aborts the response (`'aborted'`, then ECONNRESET `aborted`), after a
+  reset first emitting `read ECONNRESET`
+  on the request, as Node's socket error does. A body whose chunked framing goes bad (a
+  malformed chunk-size line) fails the read with `TypeError: terminated` too, the cause
+  undici's `HTTPParserError` -- `Response does not match the HTTP/1.1 protocol (Invalid
+  character in chunk size)`, code `HPE_INVALID_CHUNK_SIZE`, undici's brand -- and
+  `http.request` emits `Parse Error: Invalid character in chunk size` on the request
+  before aborting the response. Up to 0.17.1 a close was the uncoded `error sending request
+  for url (...)` cause, and a failure mid-body -- a bad chunk included -- was oam's own
+  `fetch: body read failed: error decoding response body` (on `http.request`, the
+  response's error, with no request error). What differs: the `HTTPParserError`'s `data`
+  (the bytes the parser refused, as text) is `undefined`; `bytesWritten` counts oam's own
+  request head, whose `user-agent` is oam's (6 bytes longer than Node's `node`) and whose
+  header order is its own; on an `https`
   connection both counts are of the HTTP bytes inside TLS (Node's are not measured there);
   a connection a fetch dispatcher's `connect` supplied reports no socket facts; and the
   `read ECONNRESET` cause is a plain `Error`, where Node's errno errors have a prototype of
@@ -1537,7 +1545,9 @@ undici's does, so it agrees with any other copy of undici. Up to 0.17.1 they wer
 unbranded classes of the shim's own, `AbortError`'s code was `UND_ERR_ABORTED` (undici:
 `UND_ERR_ABORT`; `RequestAbortedError`, an `AbortError`, has `UND_ERR_ABORTED`), and
 `HTTPParserError`, `ResponseError`, `ResponseExceededMaxSizeError` and
-`MessageSizeExceededError` were missing. A dispatcher's `connect` FUNCTION -- `new Agent|Pool|Client({ connect(opts,
+`MessageSizeExceededError` were missing.
+
+A dispatcher's `connect` FUNCTION -- `new Agent|Pool|Client({ connect(opts,
 cb) })`, a custom connector -- is called before every connection a request makes, redirect
 hops included, IP literals too, with undici's parameters (`host`, `hostname`, `protocol`,
 `port`, `servername`, `localAddress`), on all five entry points above plus `Pool` and
@@ -1846,10 +1856,10 @@ run in the order they were added -- the server's own first (the request's `'abor
 a `'connection'` listener's, then the response's (its `'close'` without `'finish'`), then the
 handler's; the request's `'error'` and `'close'` follow on the next tick. A `destroy(err)`
 -- on the socket, or through `req.destroy(err)` -- emits `'error'` on the next tick, the
-server's `'clientError'` hearing it first (Node's socketOnError, the socket's first `'error'`
-listener; once per socket), and `'close'` with `true`. Up to 0.17.1 `'clientError'` never
-heard it. An `https` connection's plain
-socket closes before its TLS socket, as Node's does. That holds whoever closed it --
+server's `'clientError'` hearing it first (Node's socketOnError, the socket's first
+`'error'` listener; once per socket), and `'close'` with `true`. Up to 0.17.1
+`'clientError'` never heard it. An `https` connection's plain socket closes before its TLS
+socket, as Node's does. That holds whoever closed it --
 `destroy()`, `destroy(err)` or `resetAndDestroy()` on the socket, `req.destroy()` (which
 closes the connection even once the response is under way, as Node's does), or the client
 going away after the response started
@@ -1866,20 +1876,21 @@ failure, as in Node: the client went away mid-body (the parser's `HPE_INVALID_EO
 Invalid character in chunk size`). Node's socketOnError gets it: the server's
 `'clientError'` with the error and the connection's socket, or, with no listener, the socket
 destroyed with it -- its `'error'`, then its `'close'` with `true` aborting the request as
-above (case 272). Up to 0.17.1 the request was destroyed directly: `'aborted'`, its `'error'`
-and `'close'`, then the response's `'close'` and the socket's with `false`, and no
-`'clientError'`. What differs: a malformed chunk's parser error has no `bytesParsed` or
-`rawPacket` (Node's count the bytes of the failing read and carry them), and a malformed body is answered `400` by the native server even when a
-`'clientError'` listener is there to answer it (Node leaves the answer to the listener).
+above (case 272). Up to 0.17.1 the request was destroyed directly: `'aborted'`, its
+`'error'` and `'close'`, then the response's `'close'` and the socket's with `false`, and
+no `'clientError'`. What differs: a malformed chunk's parser error has no `bytesParsed` or
+`rawPacket` (Node's count the bytes of the failing read and carry them), and a malformed
+body is answered `400` by the native server even when a `'clientError'` listener is there
+to answer it (Node leaves the answer to the listener).
 
 What still differs around a close: the socket never emits `'end'`, and a client that goes
 away or resets once the request body is all in closes it with `false`, where Node's says
 `true` after a reset (`ECONNRESET`). A client that goes away mid-body after the response has
 finished closes the connection with `false` and aborts the request (`'aborted'`, ECONNRESET
 `aborted`), where Node's socket reports `HPE_INVALID_EOF_STATE` and closes with `true` and
-the request emits nothing. A server request emits `'close'` only when it is destroyed or aborted -- Node's
-destroys itself once read to the end, so its `'close'` follows `'end'` on every exchange; a
-request read to the end whose connection then closes gets its `'close'` there, without an
+the request emits nothing. A server request emits `'close'` only when it is destroyed or
+aborted -- Node's destroys itself once read to the end, so its `'close'` follows `'end'` on
+every exchange; a request read to the end whose connection then closes gets its `'close'` there, without an
 error, where Node's came earlier. A client that half-closes or goes away while the handler
 has not read the request body is not noticed until the server's timeouts end the connection;
 Node notices at once (`'aborted'`, the socket's `'close'`). Of two pipelined requests Node

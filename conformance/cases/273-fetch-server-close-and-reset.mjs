@@ -6,7 +6,8 @@
 // UND_ERR_SOCKET, the socket it was on (its two ends, the bytes it carried)
 // -- the cause of `fetch failed` before the head, and of `terminated` when
 // the body is being read; a reset mid-body is `terminated` with the socket's
-// `read ECONNRESET` as the cause. http.get: a close before the head is
+// `read ECONNRESET` as the cause, a malformed chunk-size line `terminated`
+// with undici's HTTPParserError (HPE_INVALID_CHUNK_SIZE) as the cause. http.get: a close before the head is
 // `socket hang up`; a close or reset mid-body aborts the response
 // (ECONNRESET `aborted`); a malformed chunk-size line is first the parser's
 // HPE_INVALID_CHUNK_SIZE on the request, over oam's own transport and an
@@ -113,6 +114,8 @@ await viaFetch("close mid-body (chunked)", closeAfter(CHUNKED), text);
 await viaFetch("reset mid-body (content-length)", resetAfter(head(100) + "x"), text);
 await viaFetch("reset mid-body (chunked), a reader", resetAfter(CHUNKED), reader);
 await viaFetch("close after a close-delimited body", closeAfter("HTTP/1.1 200 OK\r\n\r\nabc"), text);
+await viaFetch("a malformed chunk-size line, text()", badChunk, text);
+await viaFetch("a malformed chunk-size line, a reader", badChunk, reader);
 
 // Every event on the request and the response, until the request closes
 // and, once there is one, the response too.

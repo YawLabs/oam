@@ -1835,10 +1835,20 @@
   // A body read the wire failed: undici's fetch errors the stream with
   // `TypeError: terminated`, the socket's error as the cause -- undici's
   // `other side closed` for a close, the socket's `read ECONNRESET` for a
-  // reset (measured on v22.22.2). Any other failure is passed on as it is.
+  // reset, undici's HTTPParserError for framing its parser refused -- a
+  // malformed chunk-size line is `Response does not match the HTTP/1.1
+  // protocol (Invalid character in chunk size)`, code
+  // HPE_INVALID_CHUNK_SIZE (measured on v22.22.2). Any other failure is
+  // passed on as it is.
   function bodyReadFailure(e) {
     if (e instanceof Error && (e.code === "UND_ERR_SOCKET" || e.syscall === "read")) {
       return new TypeError("terminated", { cause: fetchCause(e) });
+    }
+    if (e instanceof Error && typeof e.code === "string" && e.code.startsWith("HPE_")) {
+      const reason = e.message.replace(/^Parse Error: /, "");
+      const cause = new HTTPParserError(
+        `Response does not match the HTTP/1.1 protocol (${reason})`, e.code.slice(4));
+      return new TypeError("terminated", { cause });
     }
     return e;
   }
