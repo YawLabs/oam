@@ -47,6 +47,36 @@ pub const BAD_PORT: &str = "bad port";
 /// fetch/index.js `httpFetch`: a redirect status under `redirect: "error"`
 /// is `makeNetworkError('unexpected redirect')`, Location or not.
 pub const UNEXPECTED_REDIRECT: &str = "unexpected redirect";
+/// fetch/index.js httpRedirectFetch step 11: a redirect other than a 303
+/// that would have to resend a streamed body is a network error with no
+/// reason, so the cause is an `Error` with an empty message (measured on node
+/// v22.22.2).
+pub const STREAMED_BODY: &str = "";
+
+/// A request's body, as a redirect sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectBody {
+    /// None, or a buffered one: it can be sent again.
+    Replayable,
+    /// Streamed, on a request that is not a fetch (`undici.request` with
+    /// `maxRedirections`): the 3xx comes back as the response, as undici's
+    /// RedirectHandler hands it back for a body it has already read.
+    Streamed,
+    /// Streamed, on a `fetch`: a network error, unless the redirect is a 303
+    /// (which drops the body).
+    StreamedFetch,
+}
+
+impl From<bool> for RedirectBody {
+    /// `true`: [`RedirectBody::Replayable`]; `false`: [`RedirectBody::Streamed`].
+    fn from(replayable: bool) -> RedirectBody {
+        if replayable {
+            RedirectBody::Replayable
+        } else {
+            RedirectBody::Streamed
+        }
+    }
+}
 
 /// What to do with a response.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,19 +129,21 @@ pub fn location(headers: &HeaderMap) -> Option<HeaderValue> {
 /// Decide the next step for a response with `status` to a request with
 /// `method` for `current`. `location` is [`location`]'s value;
 /// `redirects_so_far` counts the redirects already followed for this fetch;
-/// `body_replayable` is true when the request has no body or a buffered one.
+/// `body` says whether the request's body can be sent again (a bool: `true`
+/// for none or a buffered one).
 ///
 /// The checks run in undici's order: Location parse, scheme, count,
-/// credentials, then the method/body rewrite, and last the bad-port check
-/// `mainFetch` runs on the new URL before it dials.
+/// credentials, a fetch's streamed body, then the method/body rewrite, and
+/// last the bad-port check `mainFetch` runs on the new URL before it dials.
 pub fn next(
     status: u16,
     method: &http::Method,
     current: &url::Url,
     location: Option<&HeaderValue>,
     redirects_so_far: u32,
-    body_replayable: bool,
+    body: impl Into<RedirectBody>,
 ) -> Next {
+    let body = body.into();
     if !is_redirect_status(status) {
         return Next::Done;
     }
@@ -136,12 +168,15 @@ pub fn next(
     if target.fragment().is_none_or(str::is_empty) {
         target.set_fragment(current.fragment().filter(|f| !f.is_empty()));
     }
+    if body == RedirectBody::StreamedFetch && status != 303 {
+        return Next::Fail(STREAMED_BODY);
+    }
     // fetch/index.js:1297-1305: only these two cases turn the request into a
     // body-less GET. A 303 answering GET or HEAD keeps its method and
     // headers (content-type included -- reqwest dropped it).
     let rewrite = (matches!(status, 301 | 302) && *method == http::Method::POST)
         || (status == 303 && *method != http::Method::GET && *method != http::Method::HEAD);
-    if !rewrite && !body_replayable {
+    if !rewrite && body != RedirectBody::Replayable {
         return Next::ReturnResponse;
     }
     // fetch/index.js:1351 hands the hop to `mainFetch`, whose first network

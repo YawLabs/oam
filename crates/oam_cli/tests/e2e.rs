@@ -5661,6 +5661,201 @@ cl-late-end-silent finalized=false"##;
     );
 }
 
+/// `fetch()` streams a ReadableStream or async-iterable request body, as
+/// node's does: chunked unless a `content-length` is declared, nothing sent
+/// before the first chunk and `content-length: 0` for a stream that ends
+/// empty, string and byte chunks taken and anything else refused with
+/// Buffer.from's error, a stream that errors (or a length that disagrees)
+/// failing the fetch with `fetch failed` and the error as the cause, an
+/// abort that does not cancel the source, a 307 that would resend the body
+/// failing the fetch, and a response that is over first stopping the upload
+/// and closing the connection. The Request constructor's refusals come
+/// first: a body on GET or HEAD, a locked stream, a streamed body without
+/// `duplex: 'half'`, a `duplex` outside its enum. A sync iterable is not
+/// streamed. Up to this fix every such body was stringified and sent as
+/// text: `[object ReadableStream]`, with a `text/plain` content-type and a
+/// 200. The expected output is node v22.22.2's, line for line.
+#[test]
+fn fetch_streams_a_readable_stream_or_async_iterable_body() {
+    for (name, js, expected) in [
+        (
+            "fetch_streams_a_body/streams.mjs",
+            r##"// fetch() with a streamed request body (a ReadableStream, an async
+// iterable), as node's fetch sends or refuses it.
+import http from 'node:http';
+
+const server = http.createServer((req, res) => {
+  const chunks = [];
+  req.on('data', (c) => chunks.push(c));
+  req.on('end', () => {
+    res.setHeader('connection', 'close');
+    res.end(JSON.stringify({
+      method: req.method,
+      te: req.headers['transfer-encoding'] ?? null,
+      cl: req.headers['content-length'] ?? null,
+      ct: req.headers['content-type'] ?? null,
+      body: Buffer.concat(chunks).toString(),
+    }));
+  });
+  req.on('error', () => {});
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const enc = new TextEncoder();
+const pulled = (n, gap) => {
+  let i = 0;
+  return new ReadableStream({
+    async pull(c) {
+      if (i >= n) return c.close();
+      await sleep(gap);
+      c.enqueue(enc.encode('x' + ++i));
+    },
+  });
+};
+async function show(label, mk) {
+  try {
+    const r = await mk();
+    console.log(label, r.status, await r.text());
+  } catch (e) {
+    console.log(label, 'rejected', e.name, JSON.stringify(e.message), 'cause', e.cause ? `${e.cause.name} ${JSON.stringify(e.cause.message)}` : 'none');
+  }
+}
+await show('stream-half', () => fetch(url, { method: 'POST', body: pulled(5, 20), duplex: 'half' }));
+await show('stream-no-duplex', () => fetch(url, { method: 'POST', body: pulled(2, 0) }));
+await show('stream-empty', () => fetch(url, { method: 'POST', body: new ReadableStream({ start(c) { c.close(); } }), duplex: 'half' }));
+await show('stream-put-typed', () => fetch(url, { method: 'PUT', body: pulled(2, 0), duplex: 'half', headers: { 'content-type': 'application/octet-stream' } }));
+await show('async-gen', () => fetch(url, { method: 'POST', body: (async function* () { yield enc.encode('a'); yield enc.encode('b'); })(), duplex: 'half' }));
+await show('async-gen-strings', () => fetch(url, { method: 'POST', body: (async function* () { yield 'a'; yield 'b'; })(), duplex: 'half' }));
+await show('stream-string-chunk', () => fetch(url, { method: 'POST', body: new ReadableStream({ start(c) { c.enqueue('str'); c.close(); } }), duplex: 'half' }));
+await show('stream-errors', () => fetch(url, { method: 'POST', body: new ReadableStream({ async pull(c) { await sleep(10); c.error(new Error('boom')); } }), duplex: 'half' }));
+await show('stream-get', () => fetch(url, { method: 'GET', body: pulled(1, 0), duplex: 'half' }));
+{
+  const s = pulled(1, 0);
+  s.getReader();
+  await show('stream-locked', () => fetch(url, { method: 'POST', body: s, duplex: 'half' }));
+}
+await show('stream-cl-header', () => fetch(url, { method: 'POST', body: pulled(2, 0), duplex: 'half', headers: { 'content-length': '4' } }));
+{
+  const ac = new AbortController();
+  let cancelled = 'no';
+  const s = new ReadableStream({ async pull(c) { await sleep(50); c.enqueue(enc.encode('z')); }, cancel(r) { cancelled = String(r?.name ?? r); } });
+  setTimeout(() => ac.abort(), 150);
+  await show('stream-abort', () => fetch(url, { method: 'POST', body: s, duplex: 'half', signal: ac.signal }));
+  await sleep(100);
+  console.log('stream-abort cancelled', cancelled);
+}
+// The 307 a stream body cannot follow.
+{
+  const redir = http.createServer((req, res) => { req.resume(); req.on('end', () => { res.writeHead(307, { location: url, connection: 'close' }); res.end(); }); });
+  await new Promise((r) => redir.listen(0, '127.0.0.1', r));
+  await show('stream-307', () => fetch(`http://127.0.0.1:${redir.address().port}/`, { method: 'POST', body: pulled(1, 0), duplex: 'half' }));
+}
+process.exit(0);
+"##,
+            r##"stream-half 200 {"method":"POST","te":"chunked","cl":null,"ct":null,"body":"x1x2x3x4x5"}
+stream-no-duplex rejected TypeError "RequestInit: duplex option is required when sending a body." cause none
+stream-empty 200 {"method":"POST","te":null,"cl":"0","ct":null,"body":""}
+stream-put-typed 200 {"method":"PUT","te":"chunked","cl":null,"ct":"application/octet-stream","body":"x1x2"}
+async-gen 200 {"method":"POST","te":"chunked","cl":null,"ct":null,"body":"ab"}
+async-gen-strings 200 {"method":"POST","te":"chunked","cl":null,"ct":null,"body":"ab"}
+stream-string-chunk 200 {"method":"POST","te":"chunked","cl":null,"ct":null,"body":"str"}
+stream-errors rejected TypeError "fetch failed" cause Error "boom"
+stream-get rejected TypeError "Request with GET/HEAD method cannot have body." cause none
+stream-locked rejected TypeError "Response body object should not be disturbed or locked" cause none
+stream-cl-header 200 {"method":"POST","te":null,"cl":"4","ct":null,"body":"x1x2"}
+stream-abort rejected AbortError "This operation was aborted" cause none
+stream-abort cancelled no
+stream-307 rejected TypeError "fetch failed" cause Error """##,
+        ),
+        (
+            "fetch_streams_a_body/early.mjs",
+            r##"// A fetch whose response is over while its streamed body is still going out
+// (an origin that answers 413 at once and keeps the connection): the upload
+// stops and the connection is closed; the generator is not returned.
+import net from 'node:net';
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let srvBytes = 0, srvClosed = 0;
+const server = net.createServer((s) => { s.on('error', () => {}); s.on('close', () => { srvClosed++; }); let a = false; s.on('data', (d) => { srvBytes += d.length; if (!a) { a = true; s.write('HTTP/1.1 413 Payload Too Large\r\ncontent-length: 2\r\n\r\nno'); } }); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+let produced = 0, returned = false;
+const gen = async function* () { try { for (;;) { await sleep(20); produced++; yield new Uint8Array(1024); } } finally { returned = true; } };
+const r = await fetch(`http://127.0.0.1:${server.address().port}/`, { method: 'POST', body: gen(), duplex: 'half' });
+console.log('status', r.status, await r.text());
+const p0 = produced, b0 = srvBytes; await sleep(1000);
+console.log('after: produced<=2', produced - p0 <= 2, 'bytes<=2048', srvBytes - b0 <= 2048, 'returned', returned, 'srvClosed', srvClosed);
+process.exit(0);
+"##,
+            r##"status 413 no
+after: produced<=2 true bytes<=2048 true returned false srvClosed 1"##,
+        ),
+        (
+            "fetch_streams_a_body/shapes.mjs",
+            r##"// fetch()'s other body shapes: the chunks a streamed body may yield, what
+// is not streamed, and the Request constructor's refusals.
+import http from 'node:http';
+import { Readable } from 'node:stream';
+const server = http.createServer((req, res) => {
+  const chunks = [];
+  req.on('data', (c) => chunks.push(c));
+  req.on('end', () => {
+    res.setHeader('connection', 'close');
+    res.end(JSON.stringify({ te: req.headers['transfer-encoding'] ?? null, cl: req.headers['content-length'] ?? null, ct: req.headers['content-type'] ?? null, body: Buffer.concat(chunks).toString() }));
+  });
+  req.on('error', () => {});
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+async function show(label, mk) {
+  try {
+    const r = await mk();
+    console.log(label, r.status, await r.text());
+  } catch (e) {
+    console.log(label, 'rejected', e.name, JSON.stringify(e.message), 'cause', e.cause ? `${e.cause.name} ${e.cause.code} ${JSON.stringify(e.cause.message)}` : 'none');
+  }
+}
+const gen = (...items) => (async function* () { for (const i of items) yield i; })();
+await show('gen-no-duplex', () => fetch(url, { method: 'POST', body: gen(new Uint8Array([97])) }));
+await show('sync-iter', () => fetch(url, { method: 'POST', body: [new Uint8Array([97])], duplex: 'half' }));
+await show('gen-number', () => fetch(url, { method: 'POST', body: gen(42), duplex: 'half' }));
+await show('gen-object', () => fetch(url, { method: 'POST', body: gen({}), duplex: 'half' }));
+await show('gen-arraybuffer', () => fetch(url, { method: 'POST', body: gen(new ArrayBuffer(2)), duplex: 'half' }));
+await show('gen-buffer', () => fetch(url, { method: 'POST', body: gen(Buffer.from('buf')), duplex: 'half' }));
+await show('gen-throws-first', () => fetch(url, { method: 'POST', body: (async function* () { throw new Error('first'); })(), duplex: 'half' }));
+await show('readable', () => fetch(url, { method: 'POST', body: Readable.from(['r1', 'r2']), duplex: 'half' }));
+await show('head-body', () => fetch(url, { method: 'HEAD', body: 'x' }));
+await show('get-string', () => fetch(url, { method: 'GET', body: 'x' }));
+await show('stream-cl-mismatch', () => fetch(url, { method: 'POST', body: gen('abc'), duplex: 'half', headers: { 'content-length': '5' } }));
+await show('duplex-full', () => fetch(url, { method: 'POST', body: gen('abc'), duplex: 'full' }));
+await show('string-duplex-bad', () => fetch(url, { method: 'POST', body: 'abc', duplex: 'nope' }));
+process.exit(0);
+"##,
+            r##"gen-no-duplex rejected TypeError "RequestInit: duplex option is required when sending a body." cause none
+sync-iter 200 {"te":null,"cl":"2","ct":"text/plain;charset=UTF-8","body":"97"}
+gen-number rejected TypeError "fetch failed" cause TypeError ERR_INVALID_ARG_TYPE "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received type number (42)"
+gen-object rejected TypeError "fetch failed" cause TypeError ERR_INVALID_ARG_TYPE "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received an instance of Object"
+gen-arraybuffer 200 {"te":"chunked","cl":null,"ct":null,"body":"\u0000\u0000"}
+gen-buffer 200 {"te":"chunked","cl":null,"ct":null,"body":"buf"}
+gen-throws-first rejected TypeError "fetch failed" cause Error undefined "first"
+readable 200 {"te":"chunked","cl":null,"ct":null,"body":"r1r2"}
+head-body rejected TypeError "Request with GET/HEAD method cannot have body." cause none
+get-string rejected TypeError "Request with GET/HEAD method cannot have body." cause none
+stream-cl-mismatch rejected TypeError "fetch failed" cause RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header"
+duplex-full rejected TypeError "Request constructor: full is not an accepted type. Expected one of half." cause none
+string-duplex-bad rejected TypeError "Request constructor: nope is not an accepted type. Expected one of half." cause none"##,
+        ),
+    ] {
+        let script = write_temp(name, js);
+        let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+        let (stdout, stderr) = run_script_ok(&script, out);
+        assert_eq!(
+            stdout.trim().replace("\r\n", "\n"),
+            expected,
+            "{name} stderr: {stderr}"
+        );
+    }
+}
+
 /// A Readable `undici.request` body is framed when the request is
 /// dispatched, not when `request()` is called: undici asks
 /// `util.bodyLength` then, so a stream that ends in the same turn of the

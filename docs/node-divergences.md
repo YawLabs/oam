@@ -1688,6 +1688,36 @@ taken (pinned by `undici_headers_timeout_starts_when_a_streamed_body_ends`). Wha
   bundled undici's classes, which are not the npm package's; oam has one undici, so with
   the shim loaded a cause is an instance of `errors.*` whichever `fetch` raised it.
 
+**Streamed request bodies on `fetch`**
+
+`fetch()` streams a `ReadableStream` or async-iterable body (a generator, a Node Readable) as
+Node's does: chunked, or under the caller's `content-length` (checked as it goes:
+`RequestContentLengthMismatchError` as the cause when it disagrees), nothing sent before the
+first non-empty chunk and `content-length: 0` for a stream that ends empty, string chunks as
+UTF-8 and byte chunks as they are, anything else failing with Buffer.from's
+`ERR_INVALID_ARG_TYPE` as the cause. A stream that errors fails the fetch with `TypeError:
+fetch failed` and its error as the cause; an abort rejects with the reason and stops reading
+without cancelling the source; a response that is over while the body is still going out
+stops it and closes the connection, as undici resets the socket; a redirect other than a 303,
+which would have to resend the body, fails the fetch (cause an `Error` with an empty
+message). The Request constructor's
+refusals come first: a body on `GET` / `HEAD` (any body), a locked stream, a streamed body
+without `duplex: 'half'`, and a `duplex` outside its enum. A sync iterable such as an array is
+not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_iterable_body`
+(e2e) and `a_fetch_cannot_follow_a_redirect_that_resends_its_streamed_body`
+(`http_client_redirect.rs`). Up to 0.17.1 every such body was stringified and sent as text
+(`[object ReadableStream]`, `content-type: text/plain;charset=UTF-8`, a 200), and a body on
+`GET` was sent. What differs:
+
+- **An empty chunk followed by more.** Node's fetch hangs on an async iterable that yields an
+  empty chunk before a non-empty one (measured: `Uint8Array(0)` then `'x'` never settles);
+  oam skips the empty chunk and sends the rest.
+- **A disturbed but unlocked stream** (read from, then released) is sent from where it
+  stands; Node refuses it as `disturbed or locked`.
+- **An early response stops the upload once its body is read**, to its end or cancelled; Node
+  stops it the moment the whole response has arrived, read or not (as for `undici.request`,
+  above).
+
 **Redirects**
 
 - **`redirect: 'manual'` and `'error'` behave as Node's** (case 126): `'manual'` returns the

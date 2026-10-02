@@ -247,6 +247,9 @@ struct LoopState {
     /// [`response_head_overflow`]).
     max_header_size: u64,
     undici_head: bool,
+    /// A `fetch` (not `undici.request` or `http.request`): a redirect that
+    /// would resend a streamed body fails it ([`redirect::RedirectBody`]).
+    fetch_rules: bool,
     /// Fired by the pool when a connection has a hop's request (see
     /// [`super::sent`]); carried across a park, dropped with the fetch.
     /// `http.request`'s, or the loop's own when only `headers_timeout` needs
@@ -404,6 +407,7 @@ pub async fn fetch(
             .max_header_size
             .unwrap_or_else(crate::http_head::max_http_header_size),
         undici_head: req.fetch_semantics || req.dispatch_semantics,
+        fetch_rules: req.fetch_semantics,
         dispatched,
         headers_timeout,
         body_timeout: timeout_limit(req.body_timeout_ms),
@@ -716,11 +720,15 @@ async fn run(
             &state.current,
             location.as_ref(),
             state.hops,
-            state.source.replayable(),
+            match (state.source.replayable(), state.fetch_rules) {
+                (true, _) => redirect::RedirectBody::Replayable,
+                (false, false) => redirect::RedirectBody::Streamed,
+                (false, true) => redirect::RedirectBody::StreamedFetch,
+            },
         ) {
             // ReturnResponse: the hop must resend a streamed body, which
-            // cannot be replayed -- the 3xx is the result (reqwest's
-            // behaviour, kept until #149/#148).
+            // cannot be replayed -- the 3xx is the result, as undici's
+            // RedirectHandler returns it for `undici.request`.
             Next::Done | Next::ReturnResponse => break response,
             Next::Fail(text) => {
                 state.source.request_failed();

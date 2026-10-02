@@ -894,7 +894,9 @@
     return headers;
   }
 
-  function makeResponse(raw, signal) {
+  // `onBodyOver`: called once when the body has been read to its end, has
+  // failed, or was cancelled (a streamed request body stops then).
+  function makeResponse(raw, signal, onBodyOver) {
     const handle = raw.bodyHandle;
     let consumed = false;
     let bodyStream = null;
@@ -925,6 +927,11 @@
     function bodyOver() {
       if (onAbort) signal.removeEventListener("abort", onAbort);
       onAbort = null;
+      if (onBodyOver) {
+        const over = onBodyOver;
+        onBodyOver = null;
+        over();
+      }
     }
     if (signal) {
       onAbort = () => {
@@ -1248,8 +1255,8 @@
   // name up here. A hook that fails fails the fetch CLOSED (its error is the
   // cause, unchanged, as in node) and never falls back to system DNS; an
   // abort while parked drops the parked fetch.
-  async function settleFetch(pending, lookup, signal, connector) {
-    return makeResponse(await settleRaw(pending, lookup, signal, connector), signal);
+  async function settleFetch(pending, lookup, signal, connector, onBodyOver) {
+    return makeResponse(await settleRaw(pending, lookup, signal, connector), signal, onBodyOver);
   }
 
   // settleFetch's loop, ending at the op's raw payload (the response head
@@ -1415,6 +1422,149 @@
     }
   }
 
+  // ---- streamed request bodies -------------------------------------------
+  // node's fetch streams a ReadableStream or an async-iterable body (a
+  // generator, a Node Readable) and materializes every other kind (undici's
+  // extractBody); a sync iterable such as an array is not one.
+  function isReadableStream(body) {
+    const RS = globalThis.ReadableStream;
+    return typeof RS === "function" && body instanceof RS;
+  }
+  function isStreamedBody(body) {
+    return (
+      body != null &&
+      typeof body === "object" &&
+      (isReadableStream(body) || typeof body[Symbol.asyncIterator] === "function")
+    );
+  }
+  // undici's RequestContentLengthMismatchError, by name and code.
+  function contentLengthMismatch() {
+    const cause = new Error("Request body length does not match content-length header");
+    cause.name = "RequestContentLengthMismatchError";
+    cause.code = "UND_ERR_REQ_CONTENT_LENGTH_MISMATCH";
+    return cause;
+  }
+  // A chunk as undici writes it to the socket: a string as UTF-8, bytes as
+  // they are, anything else through Buffer.from (whose ERR_INVALID_ARG_TYPE
+  // is node's failure for a number or a plain object).
+  function chunkBytes(chunk) {
+    if (typeof chunk === "string") return new TextEncoder().encode(chunk);
+    if (chunk instanceof ArrayBuffer) return new Uint8Array(chunk);
+    if (ArrayBuffer.isView(chunk)) return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+    if (typeof globalThis.Buffer?.from === "function") return globalThis.Buffer.from(chunk);
+    throw new TypeError("a request body chunk must be a string or bytes");
+  }
+  // undici's methods that expect a payload: an empty streamed body still
+  // goes with `content-length: 0` on these.
+  const EXPECTS_PAYLOAD = new Set(["PUT", "POST", "PATCH", "QUERY", "PROPFIND", "PROPPATCH"]);
+
+  // Send `request` with a streamed `body`, as undici's writeIterable sends
+  // it: nothing goes out until the first non-empty chunk, which dispatches
+  // the request (`dispatch`), its body then following over an outbound
+  // channel, chunked unless the caller declared a `content-length`
+  // (`declared`, checked as it goes); a body that ends with none goes as no
+  // body, `content-length: 0` for a method that expects one. The next chunk
+  // is taken once the transport has the last. A body that fails -- the
+  // stream errors, a chunk is not bytes, the length disagrees -- fails the
+  // fetch with `TypeError: fetch failed` and the error as its cause. An
+  // abort stops reading the body without cancelling its source, as node's
+  // does (measured on node v22.22.2), and so does a response that is over
+  // first.
+  function fetchStreamed(body, request, declared, signal, dispatch) {
+    const node = globalThis.__oam.node;
+    let next;
+    if (isReadableStream(body)) {
+      const reader = body.getReader();
+      next = () => reader.read();
+    } else {
+      const iterator = body[Symbol.asyncIterator]();
+      next = () => iterator.next();
+    }
+    return new Promise((resolve, reject) => {
+      let channel = null;
+      let started = false;
+      let stopped = false;
+      let failure = null;
+      let written = 0;
+      const aborted = () =>
+        signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      const stop = () => {
+        stopped = true;
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const fail = (err) => {
+        if (stopped) return;
+        failure = err;
+        stop();
+        if (channel !== null) node.fetchBodyChannelCancel(channel);
+        if (!started) reject(new TypeError("fetch failed", { cause: err }));
+      };
+      const onAbort = () => {
+        if (stopped) return;
+        stop();
+        if (channel !== null) node.fetchBodyChannelCancel(channel);
+        if (!started) reject(aborted());
+      };
+      const start = (withBody) => {
+        started = true;
+        const method = String(request.method).toUpperCase();
+        if (withBody) {
+          request.body_stream = channel;
+          if (declared === null) request.headers.push(["transfer-encoding", "chunked"]);
+        } else if (EXPECTS_PAYLOAD.has(method)) {
+          request.body_base64 = "";
+          if (declared === null) request.headers.push(["content-length", "0"]);
+        }
+        // A response whose body is over while the request body is still
+        // going out ends the upload and closes the connection, as undici
+        // resets the socket when a message completes mid-write. oam reads a
+        // response body as it is consumed, so that is when it has been read
+        // to its end or cancelled.
+        const onBodyOver = () => {
+          if (stopped) return;
+          stop();
+          if (channel !== null) node.fetchBodyChannelCancel(channel);
+        };
+        let op;
+        try {
+          op = dispatch(onBodyOver);
+        } catch (e) {
+          op = Promise.reject(e);
+        }
+        op.then(resolve, (e) => {
+          const cause = failure;
+          stop();
+          if (channel !== null) node.fetchBodyChannelCancel(channel);
+          reject(cause !== null ? new TypeError("fetch failed", { cause }) : e);
+        });
+      };
+      if (signal?.aborted) return reject(aborted());
+      signal?.addEventListener("abort", onAbort, { once: true });
+      (async () => {
+        for (;;) {
+          const step = await next();
+          if (stopped) return;
+          if (step.done) break;
+          const bytes = chunkBytes(step.value);
+          if (!bytes.byteLength) continue;
+          if (declared !== null && written + bytes.byteLength > declared) throw contentLengthMismatch();
+          written += bytes.byteLength;
+          if (channel === null) {
+            channel = node.fetchBodyChannelNew();
+            start(true);
+          }
+          const more = await node.fetchBodyChannelWrite(channel, bytes).then(null, () => false);
+          if (stopped) return;
+          if (more === false) return stop();
+        }
+        if (declared !== null && written !== declared) throw contentLengthMismatch();
+        stop();
+        if (channel === null) start(false);
+        else node.fetchBodyChannelEnd(channel);
+      })().catch(fail);
+    });
+  }
+
   globalThis.fetch = async function fetch(input, init) {
     return oamFetch(input, init, false);
   };
@@ -1468,6 +1618,11 @@
         );
       }
     }
+    // RequestInit's `duplex` (RequestDuplex: "half" only), converted with
+    // the rest of init.
+    if (fetchSemantics && init.duplex !== undefined && String(init.duplex) !== "half") {
+      throw new TypeError(`Request constructor: ${String(init.duplex)} is not an accepted type. Expected one of half.`);
+    }
     const rawUrl = wellFormed(input);
     if (fetchSemantics) {
       // node parses the URL in the Request constructor, so a bad URL is a URL
@@ -1496,6 +1651,25 @@
       }
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
         throw new TypeError("fetch failed", { cause: new Error("unknown scheme") });
+      }
+      if (init.body != null) {
+        const asked = init.method === undefined ? "GET" : String(init.method).toUpperCase();
+        if (asked === "GET" || asked === "HEAD") {
+          throw new TypeError("Request with GET/HEAD method cannot have body.");
+        }
+      }
+    }
+    // A ReadableStream or async-iterable body is streamed (fetchStreamed),
+    // as node's fetch streams it, once the Request constructor's checks
+    // pass: a locked stream is refused, and so is any streamed body without
+    // `duplex: 'half'`.
+    const streamed = fetchSemantics && isStreamedBody(init.body);
+    if (streamed) {
+      if (isReadableStream(init.body) && init.body.locked) {
+        throw new TypeError("Response body object should not be disturbed or locked");
+      }
+      if (init.duplex === undefined) {
+        throw new TypeError("RequestInit: duplex option is required when sending a body.");
       }
     }
     let headers = [];
@@ -1665,6 +1839,8 @@
       // whatever the method; the transport, asked nothing, sends a GET, HEAD
       // or CONNECT with no body at all (hyper's rule).
       if (init.__oamChunked === true) headers.push(["transfer-encoding", "chunked"]);
+    } else if (streamed) {
+      // Sent by fetchStreamed below, as it is produced.
     } else if (init.body != null) {
       if (init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body)) {
         const bytes = init.body instanceof ArrayBuffer
@@ -1691,6 +1867,7 @@
     // `RequestContentLengthMismatchError: Request body length does not match
     // content-length header`, a short one hangs until its timeout (measured).
     // oam rejects both with node's long-form error.
+    let streamedLength = null;
     if (dispatchSemantics) {
       const declared = headers.find((h) => h[0].toLowerCase() === "content-length");
       if (declared !== undefined) {
@@ -1700,21 +1877,33 @@
             ? atob(request.body_base64).length
             : request.body !== undefined
               ? new TextEncoder().encode(request.body).length
-              : request.body_stream !== undefined
+              : request.body_stream !== undefined || streamed
                 ? null
                 : 0;
         if (have !== null && (!Number.isInteger(want) || want < 0 || want !== have)) {
-          const cause = new Error("Request body length does not match content-length header");
-          cause.name = "RequestContentLengthMismatchError";
-          throw new TypeError("fetch failed", { cause });
+          throw new TypeError("fetch failed", { cause: contentLengthMismatch() });
+        }
+        if (streamed) {
+          if (!Number.isInteger(want) || want < 0) {
+            throw new TypeError("fetch failed", { cause: contentLengthMismatch() });
+          }
+          streamedLength = want;
         }
       }
     }
     // Started synchronously: a malformed request or a --permission refusal
     // throws from here, as it always has.
-    const pending = globalThis.__oam.fetch(JSON.stringify(request));
-    if (rawPayload) return settleRaw(pending, lookup, signal, connector);
-    const op = settleFetch(pending, lookup, signal, connector);
+    const dispatch = (onBodyOver) => {
+      const pending = globalThis.__oam.fetch(JSON.stringify(request));
+      if (rawPayload) return settleRaw(pending, lookup, signal, connector);
+      return raceAbort(settleFetch(pending, lookup, signal, connector, onBodyOver), signal);
+    };
+    if (streamed) return fetchStreamed(init.body, request, streamedLength, signal, dispatch);
+    return dispatch();
+  }
+
+  // A fetch's settled op, raced against its signal.
+  function raceAbort(op, signal) {
     if (!signal) return op;
     // Race the abort. Wave-1 divergence (documented): the underlying op
     // is not cancelled at the socket — the abort rejects the fetch

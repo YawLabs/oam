@@ -8,6 +8,7 @@ use http::header::{HeaderMap, HeaderName, HeaderValue};
 use oam_core::http_client::prepare;
 use oam_core::http_client::redirect::{
     self, BAD_PORT, BAD_SCHEME, COUNT_EXCEEDED, CREDENTIALS, INVALID_URL, MAX_REDIRECTS, Next,
+    RedirectBody, STREAMED_BODY,
 };
 
 fn url(s: &str) -> url::Url {
@@ -271,8 +272,10 @@ fn a_hop_to_a_bad_port_fails_after_every_other_check() {
         );
     }
     // Every httpRedirectFetch check comes first: the count, the credentials,
-    // and the unreplayable body (undici fails there with a network error of
-    // its own; oam returns the 3xx, design-143 section 0).
+    // and the unreplayable body (a fetch fails there, see
+    // a_fetch_cannot_follow_a_redirect_that_resends_its_streamed_body; for
+    // undici.request the 3xx comes back, as undici's RedirectHandler hands
+    // it back).
     let bad = hv("http://a.test:25/");
     assert_eq!(
         redirect::next(302, &get, &cur, Some(&bad), MAX_REDIRECTS, true),
@@ -578,4 +581,82 @@ fn post_302_cross_origin_end_to_end() {
     assert!(drop_body);
     redirect::apply(&mut h, &from, &to, drop_body);
     assert_eq!(names(&h), vec!["accept: */*".to_string()]);
+}
+
+/// fetch/index.js httpRedirectFetch step 11: a fetch whose streamed body a
+/// redirect would have to resend fails with a network error with no reason
+/// (node v22.22.2: `fetch failed`, cause `Error` with message ""), whatever
+/// the method -- a 301/302 POST included, since the check comes before the
+/// rewrite. A 303 drops the body and is followed. The Location, scheme,
+/// count and credentials checks come first.
+#[test]
+fn a_fetch_cannot_follow_a_redirect_that_resends_its_streamed_body() {
+    let cur = url("http://a.test/x");
+    let target = hv("/y");
+    for status in [301u16, 302, 307, 308] {
+        for m in ALL_METHODS {
+            let method = Method::from_bytes(m.as_bytes()).unwrap();
+            assert_eq!(
+                redirect::next(
+                    status,
+                    &method,
+                    &cur,
+                    Some(&target),
+                    0,
+                    RedirectBody::StreamedFetch
+                ),
+                Next::Fail(STREAMED_BODY),
+                "{status} {m}"
+            );
+        }
+    }
+    assert_eq!(
+        redirect::next(
+            303,
+            &Method::POST,
+            &cur,
+            Some(&target),
+            0,
+            RedirectBody::StreamedFetch
+        ),
+        Next::Follow {
+            url: url("http://a.test/y"),
+            method: Method::GET,
+            drop_body: true,
+        }
+    );
+    assert_eq!(
+        redirect::next(
+            307,
+            &Method::POST,
+            &cur,
+            Some(&hv("http://u@a.test/")),
+            0,
+            RedirectBody::StreamedFetch
+        ),
+        Next::Fail(CREDENTIALS)
+    );
+    assert_eq!(
+        redirect::next(
+            307,
+            &Method::POST,
+            &cur,
+            Some(&target),
+            MAX_REDIRECTS,
+            RedirectBody::StreamedFetch
+        ),
+        Next::Fail(COUNT_EXCEEDED)
+    );
+    // Not a redirect, or no Location: the response is the result.
+    assert_eq!(
+        redirect::next(
+            307,
+            &Method::POST,
+            &cur,
+            None,
+            0,
+            RedirectBody::StreamedFetch
+        ),
+        Next::Done
+    );
 }
