@@ -18,12 +18,13 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::Uri;
 use http::header::HeaderValue;
-use http_body_util::{BodyExt, Empty, Full, StreamBody};
+use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Frame, Incoming};
 use hyper_util::client::proxy::matcher::Matcher;
 
 use super::connector::{
-    HostAddrs, OamConnector, Shared, SuppliedConn, SuppliedConns, TlsSetupError, Via, authority_key,
+    ConnInfo, ConnectTimedOut, HostAddrs, OamConnector, Shared, SuppliedConn, SuppliedConns,
+    TlsSetupError, Via, authority_key,
 };
 use super::pool::{Pool, PoolError, PoolFail};
 use super::prepare::host_for_connect;
@@ -139,6 +140,7 @@ impl HttpTransport {
         });
         Route {
             attempt_timeout,
+            connect_timeout: None,
             tls_range,
             hooked,
             supplied: None,
@@ -166,6 +168,7 @@ impl HttpTransport {
         );
         Route {
             attempt_timeout,
+            connect_timeout: None,
             tls_range,
             hooked: None,
             supplied: Some(Supplied { conns, pool }),
@@ -208,16 +211,21 @@ impl HttpTransport {
                         .any(|token| token.trim().eq_ignore_ascii_case("close"))
                 })
             });
-        match pool.request(request, close_requested).await {
+        match pool
+            .request(request, close_requested, route.connect_timeout)
+            .await
+        {
             Ok(response) => Ok(response),
             Err(PoolFail {
                 error,
                 reused,
                 response_started,
+                conn,
             }) => Err(SendError {
                 error,
                 reused,
                 response_started,
+                conn,
             }),
         }
     }
@@ -255,6 +263,9 @@ impl HttpTransport {
 /// How one fetch reaches the network.
 pub struct Route {
     attempt_timeout: Duration,
+    /// undici's connect timeout for the connections this fetch opens (see
+    /// [`Route::with_connect_timeout`]). `None`: no timeout.
+    connect_timeout: Option<Duration>,
     /// The TLS version range its https handshakes run in: node's live
     /// defaults as JS resolved them for this request.
     tls_range: TlsRange,
@@ -273,6 +284,18 @@ struct Supplied {
 }
 
 impl Route {
+    /// Bound every connection this route opens by undici's connect timeout:
+    /// the lookup, the address attempts and an https handshake together have
+    /// `timeout` (`OamConnector::connect_within`), and a connect that runs
+    /// out fails the request as undici's `ConnectTimeoutError`. A route has
+    /// none until told: `http.request` has no such timeout in node. On a
+    /// supplied route it bounds nothing, as the dispatcher's own `connect`
+    /// function made the connection (and applied its own timeout).
+    pub fn with_connect_timeout(mut self, timeout: Option<Duration>) -> Route {
+        self.connect_timeout = timeout;
+        self
+    }
+
     /// The fetch has a `connect.lookup` hook.
     pub fn is_hooked(&self) -> bool {
         self.hooked.is_some()
@@ -337,7 +360,7 @@ impl Route {
 
     /// Record the hook's addresses under the `key` [`Route::lookup_needed`]
     /// returned (no-op on a pooled route).
-    pub fn set_addrs(&self, key: &str, addrs: Vec<IpAddr>) {
+    pub fn set_addrs(&self, key: &str, addrs: Vec<crate::net_connect::PinAddr>) {
         if let Some(hooked) = &self.hooked {
             hooked
                 .addrs
@@ -357,6 +380,9 @@ pub struct SendError {
     /// Some part of a response arrived on that connection after this request
     /// took it (see `ConnStats`).
     response_started: bool,
+    /// That connection, for the socket a `SocketError` describes; `None`
+    /// when the request never had one.
+    conn: Option<ConnInfo>,
 }
 
 impl SendError {
@@ -367,10 +393,19 @@ impl SendError {
         find_in_chain::<ConnectError>(&self.error)
     }
 
+    /// A response head hyper could not parse ([`super::bridge::head_parse_error`]),
+    /// in undici's words for fetch and undici.request.
+    pub fn head_parse_outcome(&self, undici: bool) -> Option<OpOutcome> {
+        let error = find_in_chain::<hyper::Error>(&self.error)?;
+        super::bridge::head_parse_error(error, undici)
+    }
+
     /// The op outcome for this failure of the hop to `url`:
     /// - a connect failure is node's error: `NodeFailed` for a resolver
     ///   failure or a single refused address, `NodeAggregateFailed` for a
     ///   multi-address connect;
+    /// - a connect that outran the route's connect timeout is undici's
+    ///   `UND_ERR_CONNECT_TIMEOUT`;
     /// - TLS that could not be configured is `tls configuration error: ...`;
     /// - everything else -- a TLS handshake or verification failure, a proxy
     ///   that refused the CONNECT, an unsupported proxy scheme, a reset
@@ -380,6 +415,12 @@ impl SendError {
     pub fn to_outcome(&self, url: &url::Url) -> OpOutcome {
         if let Some(connect) = self.connect_error() {
             return connect.to_outcome();
+        }
+        // undici's connect timeout ran out (`Route::with_connect_timeout`):
+        // its ConnectTimeoutError's code and message, which the JS side
+        // turns into the class.
+        if let Some(timed_out) = find_in_chain::<ConnectTimedOut>(&self.error) {
+            return OpOutcome::node_failed("UND_ERR_CONNECT_TIMEOUT", timed_out.to_string());
         }
         // A certificate refused in Node's terms (tls_config's
         // NodeNamedRefusals): its code and message, as tls.connect reports
@@ -434,7 +475,35 @@ impl SendError {
         if let Some(tls) = find_in_chain::<TlsSetupError>(&self.error) {
             return OpOutcome::Failed(tls.to_string());
         }
+        // The server reset the connection (resetAndDestroy(), SO_LINGER 0)
+        // before the response head was in: node's socket read fails, and
+        // both of its clients report that error -- `read ECONNRESET`, with
+        // errno, code and syscall -- http.request as the request's 'error',
+        // fetch as the cause of its `fetch failed` (measured on v22.22.2).
+        if let Some(io) = find_in_chain::<std::io::Error>(&self.error)
+            && io.kind() == std::io::ErrorKind::ConnectionReset
+        {
+            return crate::tcp::errno_failure(io, "read");
+        }
+        // It closed without a reset -- before a byte of the head, or halfway
+        // through it: undici's `SocketError` `other side closed`, describing
+        // the socket (fetch's cause), and node's `socket hang up` for
+        // http.request, which the JS makes of the same outcome.
+        if let Some(conn) = &self.conn
+            && self.is_closed_by_peer()
+        {
+            return OpOutcome::socket_closed(conn.socket_facts());
+        }
         OpOutcome::Failed(format!("error sending request for url ({url})"))
+    }
+
+    /// The connection ended under the request in an orderly close: hyper's
+    /// `IncompleteMessage`, or a read that met the end of the stream (a TLS
+    /// session closed without its close_notify).
+    fn is_closed_by_peer(&self) -> bool {
+        self.is_incomplete_message()
+            || find_in_chain::<std::io::Error>(&self.error)
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::UnexpectedEof)
     }
 
     /// hyper's `IncompleteMessage`, "connection closed before message
@@ -581,14 +650,178 @@ pub fn full_body(bytes: Bytes) -> ReqBody {
 /// A request body streamed from JS through an outbound body channel (sent
 /// chunked). An `Err` item aborts the request (`fetchBodyChannelCancel`).
 pub fn channel_body(rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>) -> ReqBody {
-    let chunks = futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| {
-            (
-                item.map(|chunk| Frame::data(Bytes::from(chunk)))
-                    .map_err(BoxError::from),
-                rx,
-            )
+    ChannelBody {
+        rx: Some(rx),
+        remaining: None,
+        on_end: None,
+    }
+    .boxed()
+}
+
+/// [`channel_body`], calling `on_end` once JS has ended the body and the
+/// transport has taken its last chunk: the moment undici's `AsyncWriter.end()`
+/// marks a streamed request written. Not called for a body that is aborted
+/// or dropped unfinished.
+///
+/// `declared`: the request's `content-length`, when it has one. hyper writes
+/// such a body with a length encoder that is done at its last byte, and then
+/// drops the body without polling it again -- so the channel's end would never
+/// be seen there. A body dropped with every declared byte handed over keeps
+/// listening for JS's end on a task of its own, and `on_end` runs then: undici
+/// restarts its headers timer at `end()`, not at the last byte, and a stream
+/// that writes its length and never ends gets no headers timeout in node
+/// either (measured on node v22.22.2 + undici 6.29.0).
+pub fn channel_body_then(
+    rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
+    declared: Option<u64>,
+    on_end: impl FnOnce() + Send + Sync + 'static,
+) -> ReqBody {
+    ChannelBody {
+        rx: Some(rx),
+        remaining: declared,
+        on_end: Some(Box::new(on_end)),
+    }
+    .boxed()
+}
+
+type OnEnd = Box<dyn FnOnce() + Send + Sync>;
+
+/// A request extension: the request's head waits for its body's first
+/// non-empty chunk, once the pool has a connection for it
+/// ([`super::send::DeferHead`]). undici dispatches a streamed request at
+/// once -- so a refused connect, a failed lookup or a bad port fail it while
+/// the source is still idle -- and its AsyncWriter writes the head with the
+/// first chunk, or, for a body that ends with none, writes it with no body.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HeadAwaitsBody {
+    pub(crate) empty_content_length: bool,
+}
+
+impl HeadAwaitsBody {
+    /// Wait for the body's first non-empty chunk and put it back in front
+    /// of the rest; or, for a body that ended with none, send no body: no
+    /// `transfer-encoding`, and `content-length: 0` when asked. A body that
+    /// fails first fails the request before its head goes out.
+    pub(crate) async fn prime(self, req: &mut http::Request<ReqBody>) -> Result<(), BoxError> {
+        let mut body = std::mem::replace(req.body_mut(), empty_body());
+        let first = loop {
+            match body.frame().await {
+                Some(Ok(frame)) if frame.data_ref().is_some_and(|data| data.is_empty()) => {}
+                Some(Ok(frame)) => break Some(frame),
+                Some(Err(error)) => return Err(error),
+                None => break None,
+            }
+        };
+        match first {
+            Some(frame) => {
+                *req.body_mut() = Primed {
+                    first: Some(frame),
+                    rest: body,
+                }
+                .boxed();
+            }
+            None => {
+                let headers = req.headers_mut();
+                headers.remove(http::header::TRANSFER_ENCODING);
+                if self.empty_content_length && !headers.contains_key(http::header::CONTENT_LENGTH)
+                {
+                    headers.insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A body whose first frame was read ahead ([`HeadAwaitsBody::prime`]).
+struct Primed {
+    first: Option<Frame<Bytes>>,
+    rest: ReqBody,
+}
+
+impl hyper::body::Body for Primed {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        if let Some(frame) = this.first.take() {
+            return std::task::Poll::Ready(Some(Ok(frame)));
+        }
+        std::pin::Pin::new(&mut this.rest).poll_frame(cx)
+    }
+}
+
+/// The body [`channel_body_then`] builds.
+struct ChannelBody {
+    /// `None` only once dropped.
+    rx: Option<tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>>,
+    /// The declared length still to come; `None` with no declared length.
+    remaining: Option<u64>,
+    /// Taken when it runs, or when the body is aborted.
+    on_end: Option<OnEnd>,
+}
+
+impl hyper::body::Body for ChannelBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        let Some(rx) = this.rx.as_mut() else {
+            return std::task::Poll::Ready(None);
+        };
+        std::task::Poll::Ready(match std::task::ready!(rx.poll_recv(cx)) {
+            Some(Ok(chunk)) => {
+                if let Some(remaining) = &mut this.remaining {
+                    *remaining = remaining.saturating_sub(chunk.len() as u64);
+                }
+                Some(Ok(Frame::data(Bytes::from(chunk))))
+            }
+            Some(Err(text)) => {
+                this.on_end = None;
+                Some(Err(BoxError::from(text)))
+            }
+            None => {
+                if let Some(on_end) = this.on_end.take() {
+                    on_end();
+                }
+                None
+            }
         })
-    });
-    StreamBody::new(chunks).boxed()
+    }
+}
+
+impl Drop for ChannelBody {
+    fn drop(&mut self) {
+        // Only a body hyper dropped because its declared length is all out;
+        // one dropped short of it is unfinished (a failed or abandoned
+        // request), and has no `on_end`.
+        if self.remaining != Some(0) {
+            return;
+        }
+        let (Some(on_end), Some(mut rx)) = (self.on_end.take(), self.rx.take()) else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            loop {
+                match rx.recv().await {
+                    // More than declared is JS's refusal to make; nothing
+                    // reaches the wire.
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => return,
+                    None => return on_end(),
+                }
+            }
+        });
+    }
 }

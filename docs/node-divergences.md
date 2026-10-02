@@ -912,13 +912,14 @@ decode keeps both headers, as in Node: a HEAD or CONNECT request, a 101, 204, 20
 and a coding list holding any other token -- `identity`, an unknown coding, or the empty
 token of `gzip,`.
 
-Why oam still strips them: `http.request` goes through the same native op as `fetch` until
-#148, and it gets the decoded body too. Node's `http` hands over the raw bytes with the
-headers intact, so its callers decode for themselves (`res.pipe(zlib.createGunzip())` when
-`content-encoding` says gzip). Keeping the header on a body oam already decoded would send
-that code into a second, failing decode. The op already has the switch (a request can ask
-for the raw body and the original headers); once `http.request` uses it (#148), `fetch` can
-keep Node's headers.
+This is `fetch` only. `http.request` goes through the same native op but asks it for the
+raw exchange (#148): the body arrives as the server sent it with both headers intact, as
+in Node, so its callers decode for themselves (`res.pipe(zlib.createGunzip())` when
+`content-encoding` says gzip) -- `conformance/cases/192-http-request-raw-body-and-headers.mjs`.
+Up to 0.17.1 it got the decoded body too, which is why the headers had to go: keeping
+`content-encoding` on a body oam had already decoded sent that code into a second, failing
+decode. Nothing shares the decoded payload with `http.request` any more, so `fetch` can
+now keep Node's headers; it does not yet.
 
 What is NOT divergent: which codings are undone, and the decoded bytes. The body is decoded
 as it streams, at most 16 KiB per chunk (zlib's `chunkSize` in Node), so a sync-flushed
@@ -935,7 +936,7 @@ both backwards:
   neither ends the body there. Both treat the trailing bytes as the start of another
   member and fail on its header. What differs is when: Node hands over NO chunk
   (`TypeError: terminated`, cause `incorrect header check`), oam hands over the chunk that
-  decoded and fails on the next read, with the plain-`Error` text in the bullet below.
+  decoded and fails on the next read, with the same error.
 - **Chunk boundaries are Node's only for the shapes case 112 pins.** A multi-member gzip
   body arrives as one chunk in Node and as one chunk per member in oam
   (`gzip('aa') + gzip('bb')`: Node `[4]`, oam `[2, 2]`). The bytes are the same either
@@ -948,15 +949,37 @@ _(probed)_ Node v22.22.2 vs oam on Windows, a raw-socket server sending
 
 What else still differs:
 
-- **The request header.** oam sends `accept-encoding: gzip,deflate` on every request. Node's
-  `fetch` sends `gzip, deflate` over http and `br, gzip, deflate` over https (measured;
-  undici `fetch/index.js` 1517-1522). The missing space does not matter to an RFC 9110
-  parser, but over https oam does not offer brotli, so a server that honours the header
-  sends gzip to oam and br to Node. oam decodes a `br` body a server sends anyway.
-- **A corrupt body.** Reading a body that fails to decode rejects with a plain `Error`,
-  `fetch: body read failed: error decoding response body`, with no `cause`. Node fails the
-  read with `TypeError: terminated`, and the zlib error as the `cause` (for example
-  `invalid distance too far back`, `code` `Z_DATA_ERROR`, `errno` `-3`).
+- **The details of a failed body read.** A body that cannot be read to its end rejects the
+  read as Node's does (case 210): `TypeError: terminated`, with what failed as the `cause`
+  -- the decoder's error for a corrupt encoding (`code` `Z_DATA_ERROR`, `errno` `-3`), undici's
+  `SocketError: other side closed` (`UND_ERR_SOCKET`) for a connection that ends (or fails
+  in TLS) inside the body of a kept-alive response, its `ResponseContentLengthMismatchError`
+  (`UND_ERR_RES_CONTENT_LENGTH_MISMATCH`) when the response was not kept alive
+  (`Connection: close`, HTTP/1.0) and had a content-length -- one with a chunked body
+  instead just ends there, with what arrived --, its `HTTPParserError`
+  (`HPE_INVALID_CHUNK_SIZE`) for a bad chunk-size line, and `read ECONNRESET` for a reset.
+  Up to 0.17.1 all of these were one plain `Error`,
+  `fetch: body read failed: error decoding response body`, with no `cause`. What still
+  differs is detail inside the cause:
+  - zlib's message for a corrupt deflate stream. oam's inflater (miniz) reports one failure
+    where zlib has a dozen messages, so the cause reads `invalid deflate data` where Node's
+    reads `invalid block type`, `invalid code lengths set` and so on (and, for a
+    zlib-wrapped body with a bad header, `incorrect header check`); a copy from before the
+    start of the output is told apart and reads Node's `invalid distance too far back`, as
+    `node:zlib`'s does (the inflater is shared). The gzip header and
+    trailer checks (`incorrect header check`, `unknown compression method`,
+    `unknown header flags set`, `incorrect data check`, `incorrect length check`) are Node's
+    words.
+  - which `ERR__ERROR_FORMAT_*` code a corrupt brotli body gets: the decoder is a port of
+    the C one and does not always pick the same error (`_PADDING_2`, errno `-15`, where
+    Node reports `_PADDING_1`, `-14`). The message, `Decompression failed`, is the same.
+  - `cause.socket` of the `SocketError` carries the connection's addresses but not undici's
+    `bytesWritten` / `bytesRead`, which oam does not count; `HTTPParserError`'s `data` (the
+    bytes that did not parse) is `undefined`.
+  - an HTTP/2 stream error inside a body has hyper's text as the cause.
+  - `http.request` hears a TLS failure inside a response body only as the response's
+    `aborted`; Node's request also emits OpenSSL's error (`ERR_SSL_*`), which rustls has no
+    counterpart for.
 
 _(probed)_ Node v22.22.2 vs oam on Windows, the same raw-socket server: the request
 headers over http and https, and a `deflate` body holding a copy from before the start of
@@ -1028,6 +1051,12 @@ entries below were executed on both runtimes unless marked.
 | `crypto.generateKeyPairSync` | `rsa`, `ec`, `ed25519`. EC curves P-256 and P-384 only. | Also `dsa`, `dh`, `x25519`, `ed448`, `x448`; all named curves. |
 | `crypto.setFips` | Always throws `Cannot set FIPS mode in this environment`; `getFips()` is pinned to `0`. | Settable in a FIPS build. |
 | `zlib.brotliCompressSync` / `brotliDecompressSync` | Throw, pointing at the async forms. | Supported. |
+| `zlib` inflate: corrupt compressed data | The error has node's `code` (`Z_DATA_ERROR`) and `errno` (`-3`), but its message is `invalid deflate data` for every defect inside the deflate data except a copy from before the start of the output, which reads `invalid distance too far back` as in Node. Header, trailer, checksum and truncation errors carry zlib's own text. The inflater is miniz_oxide's, which reports one failure for all of them. | zlib names the defect: `invalid block type`, `invalid code lengths set`, `invalid distance code`, ... |
+| `zlib` deflate: the `dictionary` option | Used as in Node -- the window starts with the dictionary, so the data copies from it; a zlib stream sets `FDICT`, carries the dictionary's Adler-32 and, with the default `strategy` and `windowBits`, the header's level bits as zlib writes them (see the `strategy` / `windowBits` / `memLevel` row for the rest), and inflates only with that dictionary (gzip takes the option and ignores it, as in Node) -- but the compressed bytes and size are miniz_oxide's, not zlib's, as they are without a dictionary: for 15.9 KB of Markdown after a 4 KB dictionary of the same text, `deflateSync` at levels 1 / 6 / 9 gives 8397 / 6593 / 6593 bytes where Node gives 7055 / 6578 / 6579. Either runtime inflates the other's output. A zlib-identical deflater is not in the dependency tree: flate2's zlib-rs backend (a new package) writes zlib-ng's bytes, which differ from Node's too. | zlib's bytes. |
+| `zlib` `Gzip` / `Gunzip` / `Unzip` `.call(this, options)` (the `_handle` a subclass drives, pngjs's pattern for `Inflate`) | The handle is the zlib-wrapped deflater or inflater: `Gzip`'s writes a zlib stream (`78 9c`), not a gzip member, and `Gunzip`'s and `Unzip`'s read only a zlib stream, so a gzip member is `Z_DATA_ERROR` `incorrect header check`. The `dictionary` option is validated for all three, used by `Unzip`'s and ignored by `Gzip`'s and `Gunzip`'s, as in Node. `new zlib.Gzip()` and the other stream and one-shot forms are not affected. | `Gzip`'s handle writes a gzip member; `Gunzip`'s and `Unzip`'s read one. |
+| `zlib` deflate: `strategy`, `windowBits`, `memLevel` | Ignored: every deflater uses the default strategy, a 32 KiB window and the default memory level, so the zlib header is always the one zlib writes for those defaults -- `deflateSync('hello world hello', { strategy: 2 })` (or `3` or `4`) gives `78 9c` where Node gives `78 01` (zlib sets FLEVEL 0 for `Z_HUFFMAN_ONLY`, `Z_RLE` and `Z_FIXED`), `{ windowBits: 9 }` gives `78 9c` where Node gives `18 95`, and with a `dictionary` both give `78 bb` where Node gives `78 3f` and `18 b4` respectively. The body differs too: `Z_HUFFMAN_ONLY` and `Z_RLE` still find matches. `zlib.constants` has no `Z_FILTERED`, `Z_HUFFMAN_ONLY`, `Z_RLE` or `Z_FIXED`, so passing those names passes `undefined`. Either runtime inflates the other's output. | The strategy, window size and memory level shape the stream and its header. |
+| `zlib` inflate: `finishFlush: Z_BLOCK` | Read like the other non-finishing flushes: a one-shot inflate returns everything it decoded and a stream ends with it. (`Z_FINISH`, the default, fails a stream that stops short with `Z_BUF_ERROR` `unexpected end of file`; `Z_NO_FLUSH`, `Z_PARTIAL_FLUSH`, `Z_SYNC_FLUSH` and `Z_FULL_FLUSH` return what decoded, as in Node.) | zlib stops at the first block boundary, so a one-shot inflate under `Z_BLOCK` returns no output. |
+| `zlib` deflate: `finishFlush` | Validated as in Node, but the deflaters always finish the stream, so `deflateSync(data, { finishFlush: Z_SYNC_FLUSH })` returns a complete stream with its trailer. | Ends the output with that flush: a sync-flushed stream with no final block or trailer. |
 | `TextDecoder` | **utf-8 and windows-1252 only** (`fatal` and `ignoreBOM` honored on utf-8; windows-1252 is total, so neither applies). Both take the full standard label set for their encoding, so `latin1` / `iso-8859-1` / `ascii` resolve to windows-1252 as the standard requires. Any other label throws a `RangeError` with `code: 'ERR_ENCODING_NOT_SUPPORTED'`. | Also utf-16le/be, the ISO-8859-* family, the CJK legacy encodings, ... |
 | Web streams queuing strategy | `highWaterMark` counts chunks; a custom `size()` is never called. | `size()` is consulted. |
 | `worker_threads.receiveMessageOnPort` | Always returns `undefined`. | Returns `{ message }`. |
@@ -1065,7 +1094,8 @@ with Node), and `tlsSocket instanceof net.Socket` is true, because `net.Socket` 
   a `stream.Duplex` here, so `netSocket instanceof stream.Duplex` is false where Node says
   true.
 - **Node members absent from both classes**, which the mechanical walk cannot see by
-  construction: `destroySoon` and `resetAndDestroy`. `net.Socket` has had `read()`,
+  construction: `destroySoon`. (`resetAndDestroy` is on both now, the same function as in
+  Node -- entry 47.) `net.Socket` has had `read()`,
   `'readable'` and `push()` since 0.16.3 (below); a `TLSSocket`, being a Duplex, always had
   `read`.
 - **A bare `connect()` handshakes.** `new tls.TLSSocket(null, opts).connect(port, host)` runs
@@ -1253,25 +1283,32 @@ Two things this moved rather than removed:
   `AI_ADDRCONFIG`, so case 110 prints only shape invariants there.
 - **A request to `localhost` now tries `::1` first**, which is Node's order. reqwest's
   client carried an IPv4-first override for `localhost`; the owned transport does not. Against
-  a listener that is IPv4 only -- which is every oam `listen(port)`, entry 36 -- the first
-  request pays the refused `::1` attempt. Measured on Windows, cold first `fetch` through
+  a listener that is IPv4 only (every oam `listen(port)` was, up to 0.17.1: entry 36) the
+  first request pays the refused `::1` attempt. Measured on Windows, cold first `fetch` through
   `localhost`, six runs: 8.9-28.8 ms now against 4.1-7.8 ms before (Node: 22.8-28.3 ms);
   through a dual-stack `::` listener, 8-22 ms now against 305-326 ms before, when reqwest
   waited out its happy-eyeballs delay (Node: 20-33 ms). Pooled requests do not change.
 
-### 36. `listen(port)` binds `0.0.0.0`, and `connect(port)` reaches it over `127.0.0.1`
+### 36. `listen(port)` without a host: closed in 0.17.2
 
-Node's `server.listen(port)` with no host binds dual-stack `::`, and `net.connect(port)` (default
-host `localhost`) reaches it over `::1`, so `server.address()` reports `{ address: '::', family:
-'IPv6' }` and both ends see `remoteFamily` `IPv6`. oam's `listen(port)` binds `0.0.0.0`: same
-program, same data, `IPv4` in every observable. `net.connect(port)`, `tls.connect(port)` and
-`http.request` all default to `localhost`, as Node's do, and resolve it like any other name
-(a `lookup` option sees `'localhost'`); against an oam listener the first attempt goes to `::1`
-and is refused, costing a few milliseconds (entry 35), before `127.0.0.1` connects. Closing
-the gap needs a dual-stack listen default.
+Node's `server.listen(port)` with no host binds dual-stack `::` (falling back to `0.0.0.0`
+where IPv6 is unavailable), `listen(port, '::')` is dual-stack too unless `ipv6Only`, and
+`server.address()` reports the family of the address bound. Since 0.17.2 oam's net, tls,
+http, https and http2 servers do the same (`crates/oam_core/src/tcp.rs` `bind_listener`,
+`conformance/cases/229-listen-default-dual-stack.mjs`): an IPv4 client of a dual-stack
+listener is `::ffff:a.b.c.d` on the server's side, `net.connect(port)` (default host
+`localhost`, as Node's) reaches it over `::1` with no refused attempt, and a listen error is
+Node's (`listen EADDRINUSE: address already in use :::8080`, with `syscall`, `address` and
+`port`). Up to 0.17.1 net and tls bound `0.0.0.0` and http, https and http2 `127.0.0.1` --
+an http server started without a host was unreachable from any other machine -- an explicit
+`::` was IPv6-only, and `address()` said `IPv4` for all of them.
+
+Under `--permission`, a `listen()` without a host is checked against the net grant as
+`0.0.0.0:<port>` (every interface), on every server kind; an http server's used to be checked
+as `127.0.0.1:<port>`, which no longer describes what it binds.
 
 _(probed)_ Node v22.22.2 and oam on the same `createServer().listen(0)` + `connect(port)`
-program.
+program, for each server kind.
 
 ### 37. Name resolution does not pass `AI_ADDRCONFIG` off Windows
 
@@ -1290,12 +1327,17 @@ platform's `AI_ADDRCONFIG` value elsewhere (`1024` on macOS, `32` on glibc Linux
 own resolver leaves the flag out.
 
 Passing the flag means calling `getaddrinfo` by hand, through new `unsafe` code, which is
-why it is not done yet. `dns.lookup` is the same resolver; with no `hints` Node's passes no
-flags either, but oam's `dns.ADDRCONFIG`, `dns.V4MAPPED` and `dns.ALL` are all `0`, where
-Node on Windows reports `1024`, `2048` and `256` (measured), so a caller cannot ask for them.
+why it is not done yet. `dns.lookup` is the same resolver, and its `hints` are handled in
+JS: since 0.17.2 `dns.ADDRCONFIG`, `dns.V4MAPPED` and `dns.ALL` are the platform's `AI_*`
+values (`1024`, `2048`, `256` on Windows, macOS, the BSDs and Android; `32`, `8`, `16` on Linux;
+up to 0.17.1 all three were `0`), `hints` is validated as Node's `validateHints` does
+(`ERR_INVALID_ARG_TYPE` for a non-number, `ERR_INVALID_ARG_VALUE` for any other bit), and
+`V4MAPPED` (with or without `ALL`) on a `family: 6` lookup answers IPv4 addresses as
+`::ffff:a.b.c.d` by getaddrinfo's rule (`conformance/cases/228-dns-lookup-hints.mjs`).
+`dns.ADDRCONFIG` in a caller's `hints` is accepted and not applied, for the reason above.
 
-_(source: `crates/oam_core/src/net_connect.rs`, `dns.rs`; the `dns` constants probed on
-Windows.)_
+_(source: `crates/oam_core/src/net_connect.rs`, `dns.rs`, `js/node_compat.js`
+`registry.factories.dns`; the `dns` constants probed on Windows.)_
 
 ### 38. `fetch` and `http.request` on oam's own client: what still differs (#143)
 
@@ -1308,19 +1350,27 @@ What still differs:
 
 **Connecting**
 
-- **No 10 s connect timeout on `fetch`.** undici gives up on a connect after 10 s. oam waits
-  for the operating system. Measured against a blackholed address on Windows: Node rejects
-  after 10669 ms with a `ConnectTimeoutError` cause (`code` `UND_ERR_CONNECT_TIMEOUT`,
-  `Connect Timeout Error (attempted address: 10.255.255.1:81, timeout: 10000ms)`); oam
-  rejects after 21046 ms with `connect ETIMEDOUT 10.255.255.1:81`. Node's `http.request` has
-  no such timeout, so only `fetch` differs.
-- **Aborting a `fetch` before its response head does not cancel the request.** The promise
-  rejects with the abort reason at once, as in Node, but the request stays on the wire until
-  the response head arrives; that response is then cancelled on arrival, which closes its
-  connection. Measured with a server that answers after 600 ms and an abort at 100 ms: under
-  Node the server sees the client leave (`res` `'close'` with `writableFinished` false, then
-  `req` `'close'`); under oam the response finishes. A server that sends its head late and
-  then streams sees the client leave at the abort in Node and at the head in oam. A `fetch`
+- **`fetch` has undici's 10 s connect timeout** (#157, case 211): a connection that is not
+  connected -- for https, handshaken -- within 10 s fails the fetch with a
+  `ConnectTimeoutError` cause (`code` `UND_ERR_CONNECT_TIMEOUT`, `Connect Timeout Error
+  (attempted address: 10.255.255.1:81, timeout: 10000ms)`, or `attempted addresses: ...` for
+  a name that resolved to several), as in Node. Up to 0.17.1 oam waited for the operating
+  system (21 s on Windows, `connect ETIMEDOUT`). A dispatcher's `connect.timeout` /
+  `connectTimeout` replaces the 10 s, `0` turns it off, and `undici.request` has it too;
+  `http.request` has no such timeout in either runtime. Two things differ. oam's timer is
+  exact, where undici's coarse timer fires up to about a second late (Node measured 10.7 s
+  for the default and 1 s for a 300 ms timeout). And under a `connect.lookup` hook the time
+  the hook itself takes is not counted: the timeout starts when oam dials the addresses it
+  returned.
+- **Aborting a `fetch` before its response head takes the request off the wire** (#158, case
+  212), as in Node: the promise rejects with the abort reason and the connection the request
+  went out on is closed (an h2 stream is reset), so the server sees the client leave (`res`
+  `'close'` with `writableFinished` false) at the abort. So does `req.destroy()` / `req.abort()`
+  on an `http.request` that has no response yet. Up to 0.17.1 the request stayed on the wire
+  until the server answered it. One difference: a `fetch` aborted in the same tick it was
+  called in is cancelled before anything is sent, where Node has already written the request
+  when a pooled connection was at hand (the server then sees a request and the client
+  leaving; under oam it sees nothing). A `fetch`
   waiting on its `connect.lookup` hook (below) is dropped when it aborts. An abort that lands
   AFTER the response head ends the body as in Node, whether or not anything is reading it:
   the connection is closed, a stream being read errors with the abort reason (the chunks
@@ -1384,17 +1434,110 @@ What still differs:
   request's `timeout` option, an agent's `timeout`) is re-armed by what the transport does
   for the request -- sending it, each upload chunk, the response head, each body chunk --
   rather than by each read and write on a wire
-  (`conformance/cases/150-http-request-timeouts.mjs`); `'finish'` follows `end()` at once,
-  as Node's does for a socket that is already connected, so it also fires for a request
-  whose connection then fails (Node's never does); it emits `'close'` only when the
+  (`conformance/cases/150-http-request-timeouts.mjs`); `'finish'` and the `write()`
+  callbacks follow the transport having a connection for the request -- dialled or taken
+  from its pool -- so a request whose connection is refused gets no `'finish'`,
+  `req.writableFinished` stays `false` and its callbacks hear
+  `ERR_SOCKET_CLOSED_BEFORE_CONNECTION` after `'close'`, as in Node
+  (`conformance/cases/193-http-request-finish-needs-a-connection.mjs`; up to 0.17.1
+  `'finish'` followed `end()` at once whatever became of the connection), though they
+  mark the request handed to the connection rather than each chunk written by it, so a
+  streamed chunk is called back when the transport takes it; it emits `'close'` only when the
   request is aborted or destroyed; and through an environment proxy its peer is the
   proxy. At the end of a response whose connection stays open,
   `res.socket` is null, as node detaches a kept-alive socket. Up to 0.16.2 it was a fixed object naming the host as
   written, with `localAddress` `127.0.0.1` and `localPort` `0`.
-- **The WebSocket client is not on this connector.** `new WebSocket(url)` dials on its own,
-  so on Windows a refused loopback connect takes about 2 s (2035 ms measured; Node 7 ms), and
-  the `'error'` event is a plain `Event` where Node's is an `ErrorEvent` with the message
-  `Received network error or non-101 status code.`
+  `destroy()` and `resetAndDestroy()` on the http stand-in close the HTTP/1 connection the
+  response came on, as Node's close the socket's handle, whether the response is still
+  arriving or the connection is back in the pool: `resetAndDestroy()` with a reset (the
+  server's read fails with `read ECONNRESET`; a response still arriving fails with
+  ECONNRESET `aborted`), `destroy()` with a FIN; the socket's `'close'` says `false`
+  (`conformance/cases/254-http-reset-and-destroy.mjs`). Up to 0.17.1 neither reached the
+  connection: `resetAndDestroy()` failed the socket and the response with
+  `ERR_SOCKET_CLOSED`, sent a FIN and left an idle pooled connection open, as `destroy()` did.
+  The https stand-in is a `tls.TLSSocket`: its `resetAndDestroy()` throws
+  `ERR_INVALID_HANDLE_TYPE` as Node's does, and its `destroy()` closes the TLS connection
+  the same way, kept-alive in the pool included -- the server sees the end and the close,
+  and the next request dials anew (e2e
+  `https_get_socket_destroy_closes_the_pooled_tls_connection`; up to 0.17.1 that
+  connection stayed in the pool and the next request went out on it). Either stand-in
+  closes the connection only while its own request is the last to have taken it: once the
+  pool has handed the connection to another request -- the next `http.get` or a `fetch()`,
+  which share oam's pool -- a `destroy()` on the kept socket leaves it alone (e2e
+  `a_kept_req_socket_leaves_a_connection_another_request_took`; before 0.17.2 it closed the
+  connection under that request, which failed with `fetch failed`). In Node the next
+  `http.get` on the agent gets the same socket object, so destroying it ends that request
+  too, and a `fetch()` never shares the agent's connection at all. What differs: an h2
+  connection, which carries other requests at once, is never closed through one request's
+  socket; and `end()` on either stand-in does nothing, where Node's sends a FIN, so a
+  server that answers it by closing closes Node's socket (`'close'` with `false`) and oam's
+  connection stays pooled. _(probed: Node v22.22.2 and oam, Windows)_
+- **A server's reset before the response head is Node's socket error** (case 254): the
+  request's `'error'` and `fetch`'s cause are `read ECONNRESET` with `errno`, `code` and
+  `syscall: 'read'`, as Node's socket reports it. Up to 0.17.1 it was `ECONNRESET` `socket
+  hang up` with no `errno` / `syscall`, and `fetch`'s cause the uncoded `error sending
+  request for url (...)`.
+- **A response head that does not parse is the parser's error**
+  (`conformance/cases/293-http-client-malformed-response-head.mjs`): `http.request` emits
+  llhttp's code with Node's `Parse Error` -- `HPE_INVALID_STATUS` `Invalid status code` for a
+  status that is not three digits, `HPE_INVALID_CONSTANT` `Expected HTTP/, RTSP/ or ICE/`
+  for a head that is not HTTP -- and `fetch`'s cause is undici's `HTTPParserError`
+  (`Response does not match the HTTP/1.1 protocol (Invalid response status)`). Up to
+  0.17.1 this transport reported ECONNRESET `socket hang up` and an uncoded `error sending
+  request for url (...)` cause. What differs: hyper, which parses the head, says only which
+  part failed, so a status of four digits or more is `Invalid status code` where Node says
+  `Invalid response status`, a version that is not 0.9, 1.0, 1.1 or 2.0 is
+  `HPE_INVALID_CONSTANT` where Node's is `HPE_INVALID_VERSION`, and a malformed header is
+  `HPE_INVALID_HEADER_TOKEN` `Invalid header token` whichever of llhttp's header checks Node
+  fails it with; a status under 100 fails `fetch` with `HTTPParserError` where undici 6.29.0
+  fails an `assert(statusCode >= 100)` of its own.
+- **A response's trailers** (`conformance/cases/295-http-client-response-trailers.mjs`):
+  `res.trailers` and `res.rawTrailers` are `{}` and `[]` from the start and a chunked body's
+  trailer section fills them before `'end'`, as in Node; up to 0.17.1 both were `undefined`.
+  What differs: `rawTrailers` names are lowercase (hyper keeps no case), where Node's keep
+  the case they were sent in.
+- **A server's close (no reset) is undici's `SocketError`; a failure mid-body is
+  `terminated`** (`conformance/cases/273-fetch-server-close-and-reset.mjs`). A connection
+  the server closes before the response head is in, or halfway through it, fails `fetch`
+  with `fetch failed`, cause undici's `SocketError` -- `other side closed`, code
+  `UND_ERR_SOCKET`, its class chain `SocketError < UndiciError < Error` with undici's
+  `instanceof` brands -- `err.cause instanceof errors.SocketError` (and `UndiciError`)
+  holds against `import('undici')`'s classes, whose `instanceof` reads the same brands
+  (e2e `undici_errors_are_undicis_classes_with_its_brands`; before 0.17.2 the shim's
+  classes had none, and both checks were false) -- and the `socket` it was on:
+  `localAddress`, `localPort`, `remoteAddress`, `remotePort`, `remoteFamily`, `timeout`
+  (unset), `bytesWritten`, `bytesRead`; `http.request` fails with `socket hang up`, as
+  before. A body the server closes or resets before its end fails the read with
+  `TypeError: terminated`, the cause that `SocketError` or the socket's `read ECONNRESET`;
+  `http.request` aborts the response (`'aborted'`, then ECONNRESET `aborted`), after a
+  reset first emitting `read ECONNRESET`
+  on the request, as Node's socket error does. A body whose chunked framing goes bad (a
+  malformed chunk-size line) fails the read with `TypeError: terminated` too, the cause
+  undici's `HTTPParserError` -- `Response does not match the HTTP/1.1 protocol (Invalid
+  character in chunk size)`, code `HPE_INVALID_CHUNK_SIZE`, undici's brand -- and
+  `http.request` emits `Parse Error: Invalid character in chunk size` on the request
+  before aborting the response. Up to 0.17.1 a close was the uncoded `error sending request
+  for url (...)` cause, and a failure mid-body -- a bad chunk included -- was oam's own
+  `fetch: body read failed: error decoding response body` (on `http.request`, the
+  response's error, with no request error). What differs: the `HTTPParserError`'s `data`
+  (the bytes the parser refused, as text) is `undefined`; `bytesWritten` counts oam's own
+  request head, whose `user-agent` is oam's (6 bytes longer than Node's `node`) and whose
+  header order is its own; on an `https`
+  connection both counts are of the HTTP bytes inside TLS (Node's are not measured there);
+  a connection a fetch dispatcher's `connect` supplied reports no socket facts; and the
+  `read ECONNRESET` cause is a plain `Error`, where Node's errno errors have a prototype of
+  their own whose `constructor` getter answers `Error`.
+- **The WebSocket client dials on this connector too** (since 0.17.2; up to 0.17.1 it dialled
+  on its own, so on Windows a refused loopback connect took about 2 s per resolved address,
+  and the `'error'` event was a plain `Event`). A connect that fails dispatches Node's
+  `ErrorEvent` -- `message` and `error` both `Received network error or non-101 status
+  code.`, no `ErrorEvent` global, as in Node v22
+  (`conformance/cases/226-websocket-connect-failure-event.mjs`). What is left: oam also
+  fires the `'close'` (1006, `wasClean` false) the WHATWG spec asks for after that
+  `'error'`, where Node v22.22.2 fires none for a connect that failed; the `wss:` handshake
+  verifies the server against the bundled Mozilla roots alone, not `node:tls`'s store
+  (`NODE_EXTRA_CA_CERTS`, `tls.setDefaultCACertificates`); and the dial honours no
+  `connect.lookup` hook or environment proxy.
 
 **`connect.lookup` on an undici `Agent`**
 
@@ -1432,11 +1575,21 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
 - **A hook that calls back twice.** One that answers and then calls back again with an
   error fails the fetch in Node, with that second error as the `cause`; oam keeps the first
   answer and connects.
-- **A scoped IPv6 address** (`fe80::1%lo0`) is refused with `ERR_INVALID_IP_ADDRESS`, because
-  oam's `net.isIP('fe80::1%lo0')` is `0`; Node's is `6` and it dials the address.
-- **A refusing hook's error is wrapped on `undici.request` and `agent.request`.** oam's
-  `undici.request` runs on `fetch`, so it rejects with `TypeError: fetch failed` carrying the
-  hook's error as `cause`; Node rethrows the hook's error itself. `fetch` agrees in both.
+- **A scoped IPv6 address** (`fe80::1%lo0`) is dialled, as in Node, since 0.17.2: the zone
+  becomes the scope id libuv's `uv_ip6_addr` gives it (Windows reads it with `atoi`, so a
+  name is 0; Linux looks the interface up by name, and a name that is no interface is 0),
+  and an error names the address with its zone (`connect EADDRNOTAVAIL ::1%1:PORT`). The
+  same holds for a zoned literal host and a zoned `lookup` answer on `net.connect`
+  (`conformance/cases/227-net-ipv6-zone-id.mjs`). Up to 0.17.1 a zoned answer was refused
+  before the dial (`pin ip '...' is not an IP`), and a zoned literal host was resolved and
+  its errors dropped the zone. What is left: on macOS and the BSDs oam has the system
+  resolver read the zone, which also takes a number (`%1`) as the interface index, where
+  libuv looks a number up as an interface NAME and finds none (scope id 0); and under
+  `--permission` a zoned answer is checked as written, so only an exact grant (or
+  `--allow-net` with no list) admits it.
+- **A refusing hook's error** rejects `undici.request` and `agent.request` as itself, as in
+  Node, and `fetch` with it as the `cause` of `TypeError: fetch failed`, as in Node. Up to
+  0.17.1 `undici.request`, which runs on `fetch` in oam, rejected with the `TypeError` too.
 - **A hook's addresses ARE a `--permission` boundary** (not a divergence, but the bullet
   that used to say otherwise is worth replacing rather than deleting). `--allow-net=<name>`
   grants the name, and every address the hook answers with is checked against the same
@@ -1452,7 +1605,16 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
 **A `connect` function, `buildConnector`, and dispatchers oam refuses**
 
 `import 'undici'` is oam's shim, also when the package is installed (the real one does not
-run on oam). A dispatcher's `connect` FUNCTION -- `new Agent|Pool|Client({ connect(opts,
+run on oam). Its `errors` are undici's classes -- the names, codes, default messages and
+own keys of undici 6's, `HTTPParserError` and `ResponseError` among them -- and the ones
+fetch's causes are made from; each `instanceof` reads undici's `Symbol.for` brand, as
+undici's does, so it agrees with any other copy of undici. Up to 0.17.1 they were
+unbranded classes of the shim's own, `AbortError`'s code was `UND_ERR_ABORTED` (undici:
+`UND_ERR_ABORT`; `RequestAbortedError`, an `AbortError`, has `UND_ERR_ABORTED`), and
+`HTTPParserError`, `ResponseError`, `ResponseExceededMaxSizeError` and
+`MessageSizeExceededError` were missing.
+
+A dispatcher's `connect` FUNCTION -- `new Agent|Pool|Client({ connect(opts,
 cb) })`, a custom connector -- is called before every connection a request makes, redirect
 hops included, IP literals too, with undici's parameters (`host`, `hostname`, `protocol`,
 `port`, `servername`, `localAddress`), on all five entry points above plus `Pool` and
@@ -1497,6 +1659,235 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   itself; point the code under test at a local server instead. Pinned by
   `undici_mock_dispatchers_refuse_instead_of_reaching_the_network` (e2e).
 
+**`ProxyAgent`, `EnvHttpProxyAgent`, and the undici names oam exports to refuse**
+
+`ProxyAgent` and `EnvHttpProxyAgent` work (#208). undici's `ProxyAgent` sends every request
+-- to an http origin as much as an https one -- through a `CONNECT` tunnel, so oam's is a
+dispatcher whose connect function opens that tunnel: it connects to the proxy (TLS first for
+an `https:` proxy, under `proxyTls`), sends undici's `CONNECT host:port` with `host`,
+`connection: close` and the proxy headers (`headers`, and `proxy-authorization` from
+`token`, `auth` or the proxy URL's userinfo), and on a `200` the request goes over that
+socket, with TLS to the origin inside it under `requestTls`. Every entry point a dispatcher
+has goes through it, redirect hops included, and the credentials go to the proxy only. A
+request carrying its own `Proxy-Authorization` is refused with undici's
+`InvalidArgumentError`; a proxy that answers anything but `200` fails the request with
+undici's `Proxy response (403) !== 200 when HTTP Tunneling`. `EnvHttpProxyAgent` picks, per
+origin, a `ProxyAgent` for `httpProxy` / `httpsProxy` (else `http_proxy` / `HTTP_PROXY` and
+`https_proxy` / `HTTPS_PROXY`) or a plain `Agent` for what `noProxy` / `no_proxy` /
+`NO_PROXY` exempts, with undici's matching, and prints undici's one-time `UNDICI-EHPA`
+warning. Pinned against Node + undici 6.29.0 by
+`undici_proxy_agent_tunnels_every_connection` (e2e). Up to 0.17.1 neither was exported, and
+since a name missing from an ES module is a link-time error, a package that merely imported
+`ProxyAgent` (`@actions/http-client` 4, `@upstash/context7-mcp`) did not start. What differs:
+
+- **Nothing is pooled**, as for any connect function (above): one tunnel per request, where
+  undici reuses a tunnel to the same origin.
+- **`proxyTunnel: false`, `clientFactory` and `factory` are refused at construction** with
+  `NotSupportedError`. The first sends an http origin to an http proxy in absolute form,
+  which oam's transport cannot write over a supplied socket; the other two supply
+  dispatchers whose `dispatch()` oam does not run.
+- **A proxy that refuses the tunnel, seen through `fetch`.** undici calls its connect
+  callback twice in that case and Node's `fetch` reports the second call (`cause` `Error:
+  Request was cancelled.`); oam reports the first, the `Proxy response (...) !== 200` error
+  that `undici.request` reports in both.
+- **Exported, refused at use:** `RetryAgent`, `RetryHandler`, `RedirectHandler`,
+  `DecoratorHandler`, `createRedirectInterceptor`, `connect()`, `upgrade()` and
+  `pipeline()` all work through `dispatch()`. Each is exported so an `import` of it links,
+  and fails with `NotSupportedError` when constructed or called (`connect` / `upgrade`
+  through their callback or promise). `mockErrors.MockNotMatchedError` is exported as a
+  class; nothing raises it, since the Mock* classes refuse. Pinned, with the shim's whole
+  export list, by `undici_exports_link_and_refuse_what_oam_cannot_run` (e2e).
+- **Not exported at all** (an `import` of one is still a link-time `SyntaxError`):
+  `getCookies`, `getSetCookies`, `setCookie`, `deleteCookie`, `parseMIMEType`,
+  `serializeAMimeType`, `util`, `caches`, `EventSource`, `ErrorEvent` and `FileReader`.
+
+**Request bodies on `undici.request`**
+
+`undici.request()`, `undici.stream()` and a dispatcher's `request()` take every body undici's
+Request takes and frame it as undici's `writeH1` does: a string, a Buffer, a typed array, a
+`DataView` or an `ArrayBuffer` with its `content-length`; a Blob likewise, with its type as
+`content-type` unless the caller set one; a Readable (anything with `pipe()` and `on()`), an
+iterable or async iterable (a web `ReadableStream` included) streamed as it is produced --
+chunked, or under the caller's `content-length` -- with backpressure from the transport. As
+in undici the request goes out with the first non-empty chunk, and a stream that ends with
+none is sent as no body (`content-length: 0` for a method that expects a payload). A chunk
+that is neither a string nor a buffer fails with Buffer.byteLength's `ERR_INVALID_ARG_TYPE`,
+a streamed body that runs past or ends short of its `content-length` with
+`RequestContentLengthMismatchError` before anything complete reaches the wire, a stream that
+errors (or an iterator that throws) with its own error, one that closes before its end with
+undici's `RequestAbortedError`, and any other body type with undici's `InvalidArgumentError`
+`body must be a string, a Buffer, a Readable stream, an iterable, or an async iterable`. The
+caller's abort, a failed request and a response that is over before the body is -- the
+origin closed, or its response body was read to the end or destroyed while the connection
+stays open -- all stop it: a generator is returned, a stream destroyed with no error and
+detached, and the connection closed, as undici resets the socket when a message completes
+mid-write. Pinned against Node + undici 6.29.0 by
+`undici_request_sends_every_body_undici_takes`,
+`undici_headers_timeout_starts_when_a_streamed_body_ends` and
+`undici_request_stops_its_upload_once_the_response_is_over` (e2e). Up to 0.17.1 every body that
+was not a string or a buffer was stringified: a Readable went out as `[object Object]`, a
+generator as `[object AsyncGenerator]`. What differs:
+
+- **A FormData body's boundary** reads `----formdata-oam-0<11 digits>` where undici's reads
+  `----formdata-undici-0<11 digits>`: the body is `multipart/form-data` as undici encodes it,
+  with its length, three bytes shorter per boundary.
+- **When a stream's framing is decided.** undici frames a Readable when it dispatches the
+  request: an ended byte stream goes with `content-length`, an open one chunked. On a
+  reused connection that is after the immediates already queued; on a fresh one, after the
+  connect. oam decides one immediate after `request()` in both cases, so a stream that ends
+  in that turn of the event loop -- synchronously, on a tick, a microtask or a queued
+  immediate -- is framed as in Node (pinned by
+  `undici_request_frames_a_stream_when_it_dispatches`, e2e), and one that ends while a fresh
+  connection is still being made (a `setTimeout(0)` on loopback, measured) goes with
+  `content-length` in Node and chunked in oam.
+- **An early response stops the upload once its body is read.** undici stops a body still
+  going out the moment the whole response has arrived, read or not; oam reads a response
+  body only as it is consumed (see `bodyTimeout` below), so the upload stops when the
+  response body has been read to its end or destroyed. A response nobody reads leaves the
+  upload going until the request otherwise ends.
+- **`strictContentLength: false`** on a dispatcher is not applied: a mismatch is refused as
+  under undici's default, where undici would warn and send.
+
+**How `undici.request` fails**
+
+`undici.request()`, `undici.stream()` and a dispatcher's `request()` reject with the error
+itself, as undici's do -- an undici class (`HeadersTimeoutError`, `BodyTimeoutError`,
+`HeadersOverflowError`, `InvalidArgumentError`, ...) with its `name`, `code` and `message`,
+a connect's `ECONNREFUSED` / `ENOTFOUND` error as given -- never with fetch's `TypeError:
+fetch failed`. An oversized response head is counted as undici counts it, header names and
+values without the status line's reason phrase (node's own `http.request` counts that too).
+Pinned against Node + undici 6.29.0 by `undici_request_rejects_with_the_error_itself` (e2e).
+Up to 0.17.1 only a late head was unwrapped: an oversized head was `fetch failed` with
+node's http-parser cause `HPE_HEADER_OVERFLOW` (under the http-parser count, so a head
+undici takes could be refused), and a refused connect was wrapped too. A connection the
+server closes before its response rejects with undici's `SocketError` (`UND_ERR_SOCKET`,
+`other side closed`), as undici's does; up to 0.17.1 it was a plain `Error` (`error sending
+request for url (...)`, no `code`).
+
+**`headersTimeout` and `bodyTimeout` on `undici.request` and `fetch`**
+
+`undici.request()`, `undici.stream()` and a dispatcher's `request()` honour undici's two
+per-phase stall limits (#218): a response head that does not arrive within `headersTimeout`
+rejects the request with `HeadersTimeoutError` (`UND_ERR_HEADERS_TIMEOUT`), and a body that
+goes `bodyTimeout` without a byte is destroyed with `BodyTimeoutError`
+(`UND_ERR_BODY_TIMEOUT`), each chunk off the wire re-arming it -- one a decoder takes
+without yielding anything yet included, so a compressed body trickled slower than its
+limit as a whole but faster byte by byte is read whole, as in Node. The request's own value wins, then the
+dispatcher's (`new Agent|Pool|Client({ headersTimeout, bodyTimeout })`, the global
+dispatcher included), then undici's default of 300 s; `0` disables. On the request,
+anything but a finite number `>= 0` is `InvalidArgumentError` `invalid headersTimeout` /
+`invalid bodyTimeout`; a dispatcher's own value is checked first, as undici's `Client`
+checks it -- an integer `>= 0`, else `headersTimeout must be a positive integer or zero` --
+by a `Client` when it is built and by the others on the request (where NaN or an
+Infinity, which undici's `Agent` and `Pool` lose in a JSON copy of their options, is the
+default).
+Pinned against Node + undici 6.29.0 by `undici_request_honours_headers_and_body_timeouts`
+(e2e). Up to 0.17.1 both options were accepted and ignored.
+
+`fetch()` -- global `fetch` and `undici.fetch` -- runs under the same two limits, as Node's
+does: its dispatcher's (the `dispatcher` option's, else the global one's, a ProxyAgent's
+for the origin's answer), else undici's 300 s, with or without `undici` imported (measured:
+a plain `fetch` to a silent server fails at about 300.4 s in oam and 321 s in Node, whose
+tick timer drifts; see the timers bullet below). A `headersTimeout` in the fetch init is not an option, in either runtime. A late
+head rejects with `TypeError: fetch failed`, cause `HeadersTimeoutError`; a stalled body
+errors its reader, `text()` / `json()` / `arrayBuffer()` and `for await` with `TypeError:
+terminated`, cause `BodyTimeoutError`; a bad dispatcher value is the dispatcher's
+`InvalidArgumentError` as the cause. Each cause is an instance of the shim's `errors.*`
+once `undici` is imported, as an oversized response head's `HeadersOverflowError` is (case
+277), and carries that class's name either way. Both limits run in the transport, one
+implementation for `fetch` and `undici.request`. Pinned against Node + undici 6.29.0 by
+`fetch_rides_its_dispatchers_headers_and_body_timeouts` (e2e),
+`a_stalled_body_read_fails_after_the_body_timeout` and
+`the_body_timeout_restarts_with_every_frame_off_the_wire` (`http_client_fetch.rs`). Up to 0.17.1 a
+`fetch` had no limit at all: a server that never answered held it until its `signal` ended
+it, and a cause from oam's transport was a plain `Error`.
+
+As in Node, `headersTimeout` starts once the request is on a connected socket -- DNS (a
+replaced `dns.lookup` or a `connect.lookup` hook), the TCP connect, the TLS handshake, a
+connect function and a proxy tunnel count for nothing -- each redirect hop gets its own, and
+a late head closes that connection. The transport runs it from the moment it has a
+connection for the request, oam's own pool's or the socket a connect function handed back,
+and only while one has it: a pooled connection that hands the request back unsent stops the
+limit, and the fresh connection the pool dials in its place starts it again once connected,
+as undici arms a new timer on the socket that next carries a request it re-queued (pinned by
+`undici_phase_timeouts_measure_what_undici_measures` and
+`undici_headers_timeout_on_the_pool_starts_once_connected`, e2e, and
+`the_headers_timeout_stops_while_an_unsent_request_is_re_dialled` in
+`crates/oam_core/tests/http_client_fetch.rs`). A streamed request body counts for nothing
+either: undici ignores the timer while it writes one and restarts it from zero at the body's
+end, and oam's transport holds it off until the body channel has ended and its last chunk is
+taken (pinned by `undici_headers_timeout_starts_when_a_streamed_body_ends`). What differs:
+
+- **An upload the origin stops reading.** undici re-arms the timer on every write the socket
+  backs up on, so a streamed body stuck behind a server that stopped reading fails with
+  `HeadersTimeoutError` after `headersTimeout` (measured: 64 MiB to a server that never reads,
+  limit 500 ms, under 4 s in Node). oam's timer waits for the body's end, which never comes:
+  the request stays open until the caller's signal ends it.
+- **The timers run on undici's clock, from the arm.** undici runs `headersTimeout` and
+  `bodyTimeout` on its FastTimer, which ticks every 499 ms: a timer is taken up at the next
+  tick and fires at the first tick at least its delay after the one before, so anything up to
+  998 ms lapses after about 1 s and longer delays in 499 ms steps (a 200 ms `headersTimeout`
+  lets an 800 ms answer through; 1500 lapses after about 2 s). oam computes the same lapse
+  (send.rs `fast_timer`) as if undici's clock started at the arm, which it does when no other
+  undici timer is running; with one running, undici's next tick comes sooner, so Node can
+  fire up to 499 ms earlier than oam. undici's tick timer also drifts a little each tick
+  (its 300 s default lapses after about 321 s in Node, 300.4 s in oam). Up to 0.17.1 oam
+  fired at the configured delay, failing requests Node completes. A delay above 2^31-1 ms
+  (`headersTimeout: 2 ** 31` and the like, a common way to say "no limit") is held to that
+  ceiling, about 24.8 days, where undici's timestamp-based timers never come due; a plain
+  `setTimeout` would have fired it after 1 ms.
+- **`bodyTimeout` runs only while the body is being read.** oam reads a `request()` or
+  `fetch` body from the transport when something consumes it; undici reads ahead into the
+  stream's buffer. So a stalled body nobody reads is left alone in oam, where Node destroys
+  it with `BodyTimeoutError` (an uncaught `'error'` on a `request()` body if nothing listens)
+  and closes its connection. A body that is read -- `text()`, `json()`, a `'data'` listener,
+  `pipe()`, `stream()`, a `fetch` body's reader -- times out in both.
+- **A cause's class with `undici` not imported.** Node's built-in `fetch` raises its
+  bundled undici's classes, which are not the npm package's; oam has one undici, so with
+  the shim loaded a cause is an instance of `errors.*` whichever `fetch` raised it.
+
+**Request bodies on `fetch`**
+
+`fetch()` sends a Blob or File as its bytes, its `type` as the Content-Type unless the caller
+set one or it is empty; a URLSearchParams as its serialization, typed
+`application/x-www-form-urlencoded;charset=UTF-8` unless the caller set a type; a string as
+UTF-8, typed `text/plain;charset=UTF-8`; and no body or an empty one with `content-length: 0`
+on POST, PUT and PATCH, as undici's writeH1 does. Pinned against Node by
+`fetch_sends_blob_search_params_and_empty_bodies_as_node_does` (e2e). Up to 0.17.1 a Blob went
+out as the text `[object Blob]`, a URLSearchParams as `text/plain`, and an empty POST with no
+length. A FormData body is `multipart/form-data`, as Node encodes it (the boundary's prefix
+differs: see the request-body bullets of entry 38).
+
+**Streamed request bodies on `fetch`**
+
+`fetch()` streams a `ReadableStream` or async-iterable body (a generator, a Node Readable) as
+Node's does: chunked, or under the caller's `content-length` (checked as it goes:
+`RequestContentLengthMismatchError` as the cause when it disagrees), nothing sent before the
+first non-empty chunk and `content-length: 0` for a stream that ends empty, string chunks as
+UTF-8 and byte chunks as they are, anything else failing with Buffer.from's
+`ERR_INVALID_ARG_TYPE` as the cause. A stream that errors fails the fetch with `TypeError:
+fetch failed` and its error as the cause; an abort rejects with the reason and stops reading
+without cancelling the source; a response that is over while the body is still going out
+stops it and closes the connection, as undici resets the socket; a redirect other than a 303,
+which would have to resend the body, fails the fetch (cause an `Error` with an empty
+message). The Request constructor's
+refusals come first: a body on `GET` / `HEAD` (any body), a locked stream, a streamed body
+without `duplex: 'half'`, and a `duplex` outside its enum. A sync iterable such as an array is
+not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_iterable_body`
+(e2e) and `a_fetch_cannot_follow_a_redirect_that_resends_its_streamed_body`
+(`http_client_redirect.rs`). Up to 0.17.1 every such body was stringified and sent as text
+(`[object ReadableStream]`, `content-type: text/plain;charset=UTF-8`, a 200), and a body on
+`GET` was sent. What differs:
+
+- **An empty chunk followed by more.** Node's fetch hangs on an async iterable that yields an
+  empty chunk before a non-empty one (measured: `Uint8Array(0)` then `'x'` never settles);
+  oam skips the empty chunk and sends the rest.
+- **A disturbed but unlocked stream** (read from, then released) is sent from where it
+  stands; Node refuses it as `disturbed or locked`.
+- **An early response stops the upload once its body is read**, to its end or cancelled; Node
+  stops it the moment the whole response has arrived, read or not (as for `undici.request`,
+  above).
+
 **Redirects**
 
 - **`redirect: 'manual'` and `'error'` behave as Node's** (case 126): `'manual'` returns the
@@ -1504,14 +1895,18 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   `'error'` rejects with `TypeError: fetch failed`, cause `unexpected redirect`, on a 301,
   302, 303, 307 or 308 with or without a `Location`; a value outside the enum is refused
   with Node's `Request constructor: ... is not an accepted type` message. Up to 0.16.2 every
-  redirect was followed whatever the option said. `Response.type` is not implemented.
-- **A `Location` that does not parse** fails the fetch with a plain `Error('Invalid URL')` as
-  the `cause` (own keys `stack`, `message`); Node's is a `TypeError` with `code`
-  `ERR_INVALID_URL`, `input` and `base`. Case 111 prints only the message.
+  redirect was followed whatever the option said. `response.type` is `'basic'` under every
+  mode, as in Node, and `'default'` for a constructed `Response` (case 208); up to 0.17.1 it
+  was `undefined`. `Response.error()` and `Response.redirect()` are not implemented.
+- **A `Location` that does not parse** fails the fetch with Node's `cause` (case 208): a
+  `TypeError('Invalid URL')` with `code` `ERR_INVALID_URL`, `input` (the `Location`, read as
+  UTF-8) and `base` (the URL that answered, with the fragment the request URL carried). Up
+  to 0.17.1 the cause was a plain `Error('Invalid URL')`.
 - **`http.request` on this transport returns a `3xx` as the response**, as Node's does (it
   asks the transport for `'manual'`); up to 0.16.2 it followed redirects by `fetch`'s rules.
-  It also decodes the body, as `fetch` does (entry 32). Node's `http.request` does not, and
-  neither does a request sent over an agent's socket (entry 43).
+  It does not decode the body either, and adds no `accept`, `user-agent` or
+  `accept-encoding` to the request, as Node's does not (case 192); up to 0.17.1 it did
+  both, as `fetch` does (entry 32).
 - **A hop that lands on a pooled connection the server has just closed.** oam's redirect loop
   has no event-loop tick between the 3xx and the hop, so against a server that sends the 3xx
   with keep-alive and then FINs, the hop can be written before the server's FIN arrives.
@@ -1526,8 +1921,9 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
     1,120 of 64,000 fetches (the one resend met another closing connection) where Node
     failed 15.
   - **FIN at once, `POST` + `307`.** A `POST` is never sent again -- oam did write it and
-    cannot know the server ignored it -- so it fails with `error sending request for url
-    (...)`: 595 and 1,137 of 16,000 fetches in oam, none in Node.
+    cannot know the server ignored it -- so it fails, its cause undici's `SocketError`
+    (`other side closed`; it was the uncoded `error sending request for url (...)` when
+    measured): 595 and 1,137 of 16,000 fetches in oam, none in Node.
   - **FIN 0-5 ms after the 3xx.** Here Node loses the race too, and fails with
     `UND_ERR_SOCKET`: 2,561 of 16,000 `GET`s and 2,587 `POST`s. oam failed no `GET` (its
     one resend) and 1,948 `POST`s.
@@ -1557,30 +1953,65 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   5000 ms after `agent.destroy()`; with Node's client, within 500 ms. A pooled request's
   socket also emits no `'close'` when the server ends the connection (a server that answered
   `Connection: close` and closed it: no `'close'` 1.5 s later).
-- **`statusText` is the canonical reason phrase**, not the server's: `200 Custom Reason` reads
-  `OK` in oam, and `299 Whatever` reads `''`. Node reports the reason on the wire.
+- **A reason phrase with a byte above 0x7F reads empty.** `statusText` and `statusMessage`
+  are the phrase the server sent, as in Node -- `200 Custom Reason` reads `Custom Reason`,
+  `299 Whatever` reads `Whatever`, a status line with no phrase reads `''`
+  (`conformance/cases/195-status-reason-phrase.mjs`; up to 0.17.1 oam's own transport
+  reported the status code's canonical phrase). What differs: the parser under hyper
+  drops a phrase carrying obs-text, so `200 caf\xe9` reads `''` on both client paths,
+  where Node's `statusMessage` is `café` and its `statusText` `caf�`. Over HTTP/2,
+  which has no reason phrase (and which Node's fetch never negotiates), `statusText` is
+  the status code's canonical phrase.
+- **A response nobody has read holds the request's `'close'`.** The request's `'close'`
+  follows the response's `'end'` and `'close'` on a connection that is not kept, and comes
+  between them on a kept-alive one, as in Node, on both client paths
+  (`conformance/cases/194-http-request-close-order.mjs`; up to 0.17.1 the request closed
+  first on every connection that was not kept). What differs: Node closes the request
+  when its socket closes, so with a `Connection: close` response left unread the request
+  closes before the response is read; in oam it closes once the response has been. And
+  a small response destroyed from the `'response'` listener reads `complete` `false`
+  where Node, which had already parsed all of it, reads `true`.
+- **Bodies are extracted as the Fetch Standard says, with two gaps.** `fetch`, `Request`
+  and `Response` take a `Blob`/`File`, `URLSearchParams`, `FormData`, `ReadableStream` (or
+  any async iterable; `duplex: 'half'` required), buffers and strings, with Node's
+  content-type for each, and a streamed upload's chunks, a failing source and a redirect of
+  a streamed body (every redirect but a 303 fails the fetch) behave as in Node (#154). What
+  differs: a `FormData` body's boundary reads `----formdata-oam-0<11 digits>` where undici's
+  reads `----formdata-undici-0<11 digits>` (same shape, three bytes shorter per occurrence);
+  and nothing has `formData()`, neither a constructed `Request` / `Response` nor a fetched
+  response. (A streamed body aborted or cut off stops being read, its source not cancelled,
+  as in Node: see the streamed-body paragraph above.)
+- **`Request` options oam keeps but does not act on.** `mode`, `credentials`, `cache`,
+  `integrity`, `keepalive`, `referrer` and `referrerPolicy` are validated and read back as in
+  Node (#180), and `mode` and `cache` shape the request headers as they do in Node (#178).
+  Two change what Node's `fetch` does and not what oam's does: an `integrity` value is
+  checked against the response body (a mismatch fails the fetch with cause
+  `integrity mismatch`) where oam ignores it; and a `referrer` URL is sent as `referer`, cut
+  down by the referrer policy (Node sends `http://b.test/` for a cross-origin
+  `http://b.test/x?y`, the full URL for a same-origin one or under `unsafe-url`).
+  `credentials` and `keepalive` change nothing in either. `mode: 'no-cors'` does not drop
+  headers in either runtime.
 - **The request header count is capped.** More than 24,576 distinct header names (fewer if
   the header table's hash-flooding defence rebuilds it) fails with
   `fetch: too many request headers`; Node has no cap (25,000 distinct names get a 200).
-- **`Headers` iteration is in wire order, not sorted.** The Fetch Standard sorts a header
-  list by name on iteration and Node does; oam yields the order the server sent (and, for a
-  `Response` a script builds, the order it set them). `set-cookie` is not combined and
-  `getSetCookie()` is there, so no value is lost -- only the order differs. `oam.serve`
-  writes response headers out in this same order, which is why it is not sorted.
-- **Header values on the wire are UTF-8, where undici writes latin1.** A request header value
-  of `café` goes out as `cafÃ©` in oam and `café` in Node. Response header values
-  are decoded as latin1 in both, so the round trip is asymmetric: a value oam sent is not the
-  value oam reads back.
-- **Six request-header shapes still differ from Node's `fetch`** -- measured against a
+- **Two request-header shapes still differ from Node's `fetch`** -- measured against a
   raw-socket server, with everything else on the request line and in the header block
-  identical. oam does not send `connection: keep-alive`, `accept-language: *` or
-  `sec-fetch-mode: cors`; it writes `accept-encoding: gzip,deflate` where Node writes
-  `gzip, deflate`; it does not add `content-length: 0` for a body-less or empty-bodied
-  `POST`; and its header ORDER differs (oam ends with `host`, Node begins with it). What now
-  matches, and used to not: a caller `host` header is dropped (Node's one silent drop), a
-  string body gets `content-type: text/plain;charset=UTF-8`, repeated names are combined into
-  one comma-joined line, and a method is uppercased only when it is one of `DELETE`, `GET`,
+  identical. The ORDER differs (oam ends with `host`, Node begins with it; hyper places it).
+  (A streamed body that ends without a chunk now goes out with `content-length: 0`, as
+  undici, which holds the head until the first chunk, sends it.) `user-agent` is `oam/<version>`
+  by design. What now matches, and used to not: `connection: keep-alive`,
+  `accept-language: *` and `sec-fetch-mode` (the request's mode) on every fetch,
+  `accept-encoding: gzip, deflate` over http and `br, gzip, deflate` over https, and
+  `identity` instead (appended to a caller's own value) on a request with `range`,
+  `content-length: 0` on a `POST`, `PUT`, `PATCH`, `QUERY`, `PROPFIND` or `PROPPATCH` with no
+  body or an empty one, the `cache` mode's `pragma` / `cache-control`, with a conditional
+  request (`if-modified-since`, `if-none-match`, `if-unmodified-since`, `if-match`,
+  `if-range`) in the default mode sent as a `no-store` one (#178); a caller `host`
+  header is dropped (Node's one silent drop), a string body gets
+  `content-type: text/plain;charset=UTF-8`, repeated names are combined into one
+  comma-joined line, and a method is uppercased only when it is one of `DELETE`, `GET`,
   `HEAD`, `OPTIONS`, `POST`, `PUT` -- `{method: 'patch'}` goes out as `patch`, as in Node.
+  Over HTTP/2 (below) the transport drops `connection`, which h2 does not have.
 - **`fetch` negotiates HTTP/2 with an https origin; Node's `fetch` does not.** oam's origin
   TLS handshake offers ALPN `h2, http/1.1` and speaks h2 to a server that selects it.
   undici's `Client` defaults `allowH2` to `false` and Node's global dispatcher never turns it
@@ -1598,21 +2029,30 @@ an error where oam used to send something)
   nothing reaches the wire. `http.request` and `https.request` still turn userinfo into
   Basic credentials, because there it IS Node's documented `auth` option.
 - A URL that does not parse throws Node's `TypeError: Failed to parse URL from <input>` with
-  a `TypeError` cause carrying `code` `ERR_INVALID_URL`; a non-`http(s)` scheme rejects with
+  a `TypeError` cause carrying `code` `ERR_INVALID_URL` and `input` (it is the error
+  `new URL()` throws, as in Node; case 237); a non-`http(s)` scheme rejects with
   the cause `Error: unknown scheme`. Both used to be `TypeError: fetch failed` with the cause
   `Error: builder error`, which named neither.
-- A `Request` object as the first argument is NOT a supported input (it never was): the
-  argument is stringified, so `fetch(new Request(url))` throws
-  `TypeError: Failed to parse URL from [object Request]`. A string or a `URL` works. This is
-  a gap rather than a refusal -- it is loud, it loses nothing, and half-supporting it (the
-  url and method but not the body) would be worse than throwing. Tracked as a follow-up.
+- Everything the `Request` constructor refuses, because `fetch` builds its request through it
+  as Node's does (#180): a `GET` or `HEAD` with a body (`Request with GET/HEAD method cannot
+  have body.`), a method that is not a token or is `CONNECT` / `TRACE` / `TRACK`, a
+  `RequestInit` enum value outside its list, `mode: 'navigate'`, a streamed body without
+  `duplex: 'half'`, and a re-used `Request` whose body was already read (`Cannot construct a
+  Request with a Request object that has already been used.`). These checks run before an
+  aborted signal is looked at. A `Request` as the first argument is unwrapped field by field
+  with `init` winning, its body is sent, and its signal and redirect mode apply.
 - `transfer-encoding`, `keep-alive`, `upgrade`, `expect`, and a `connection` whose value is
   neither `close` nor `keep-alive` (case-insensitively -- `close, transfer-encoding`, the
   CL.TE evasion, is the one that matters) are refused with undici's texts
   (`invalid transfer-encoding header`, `invalid keep-alive header`, `invalid upgrade header`,
-  `expect header not supported`, `invalid connection header`), as `cause.name` on a
-  `TypeError: fetch failed`. Node's cause is an instance of the matching undici error class;
-  oam's is a plain `Error` with that `name` and no `UND_ERR_*` code. An accepted `connection`
+  `expect header not supported`, `invalid connection header`), as the `cause` of a
+  `TypeError: fetch failed`. As in Node, the cause is an instance of the matching undici
+  error class (`InvalidArgumentError`, `NotSupportedError`,
+  `RequestContentLengthMismatchError`; `HeadersOverflowError` for a response head over the
+  limit) with its `UND_ERR_*` `code` and undici's `Symbol.for('undici.error.*')` brands, so
+  `cause instanceof undici.errors.InvalidArgumentError` holds for the built-in `undici` and
+  for a copy from `node_modules` (case 209); `undici.request` rejects with the error itself.
+  Up to 0.17.1 the cause was a plain `Error` with that `name` and no code. An accepted `connection`
   goes out lowercased, as node's does; `te`, also hop-by-hop, goes out untouched, because
   node sends it.
 - A `content-length` that disagrees with the body is refused as
@@ -1631,10 +2071,28 @@ SENDS a caller `host` header and leaves the method as written, both measured. `h
 they set these headers legitimately. (`http2.connect` refuses node's HTTP/1
 connection-specific headers itself, as node's does.)
 
-The one thing `undici.request` does not reproduce is the error's SHAPE: it runs on `fetch` in
-oam, so a refusal arrives as `TypeError: fetch failed` carrying the undici-named error as
-`cause`, where Node throws that error itself. Same wrapping as the `connect.lookup` bullet
-above.
+`undici.request` runs on `fetch` in oam but rejects as Node's does: with the error itself --
+an undici error for a refusal or a failure undici raises (its connect timeout, a response head
+over the limit), the transport's for a failed connect (`connect ECONNREFUSED`, `getaddrinfo
+ENOTFOUND`, a proxy that refuses the connection) -- not with `TypeError: fetch failed` around
+it; and a body that fails mid-read errors with undici's `SocketError` /
+`ResponseContentLengthMismatchError` / `HTTPParserError` itself, not fetch's
+`TypeError: terminated` (`undici_request_body_and_connect_failures_reject_unwrapped` and
+`undici_request_rejects_with_the_error_itself`, e2e). Up to 0.17.1 a failed request arrived
+as `TypeError: fetch failed`, and a failed body as a plain `Error` with no `cause`.
+
+A refusal is an instance of the shim's undici class
+(`errors.InvalidArgumentError`, `errors.NotSupportedError`,
+`errors.RequestContentLengthMismatchError`) with undici's `code` and message and no `cause` --
+as Node's does. It also applies undici's own content-length rule rather than `fetch`'s: the
+caller's `content-length` is consumed, checked against a body of known length on a method
+that sends one (not on `GET`, `HEAD`, `OPTIONS`, `TRACE`, `CONNECT`), and replaced by the
+real length; a `POST` / `PUT` / `PATCH` with no body goes out with `content-length: 0`, and
+an unparseable value is `invalid content-length header`. Pinned against Node + undici 6.29.0
+by `undici_request_frames_and_refuses_as_undici_does` (e2e). Up to 0.17.1 every refusal
+arrived as `TypeError: fetch failed` with the undici-named error as `cause`, a bodyless `POST`
+carried no `content-length`, and a flat `[name, value, ...]` header array was sent as
+garbage.
 
 **`http.request` argument and option handling**
 
@@ -1699,12 +2157,13 @@ _(source)_; the `connect.lookup` behaviour is pinned by e2e tests.
 `req.socket` on an `http` or `https` server carries the connection's own addresses, spelled as
 Node spells them: `remoteAddress` / `remotePort` / `remoteFamily`, `localAddress` /
 `localPort` / `localFamily`, and `address()` for the local end. An IPv4 client of a
-dual-stack `::` listener is `::ffff:a.b.c.d` with family `IPv6` -- where such a client is
-accepted at all: oam does not clear `IPV6_V6ONLY` on a listening socket (its client sockets
-do clear it), so an oam `::` listener is dual-stack only where the OS makes it so. On
-Windows it is IPv6-only and an IPv4 client of it is refused with `ECONNREFUSED`, on either
-runtime as the client; libuv clears the option, so Node's `::` listener takes IPv4 clients
-everywhere. Entry 36 is the same gap on the `listen(port)` default. A link-local peer carries
+dual-stack `::` listener is `::ffff:a.b.c.d` with family `IPv6`, and so is the local end it
+reached (`localAddress` `::ffff:127.0.0.1` for a client of `127.0.0.1`), as in Node. Since
+0.17.2 oam's listener clears `IPV6_V6ONLY` as libuv does, unless `ipv6Only` is set
+(`crates/oam_core/src/tcp.rs` `bind_listener`, entry 36), so a `::` listener -- and a
+`listen(port)` with no host, which binds `::` -- takes IPv4 clients on every platform; up to
+0.17.1 it was IPv6-only on Windows and an IPv4 client of it was refused with
+`ECONNREFUSED`. A link-local peer carries
 its scope: the interface index on Windows (as Node), the interface name on Linux (as Node),
 and the index elsewhere, where Node writes the name. `req.connection` is the same object.
 
@@ -1720,8 +2179,8 @@ An `https` connection's socket also reports the handshake (`encrypted`, `authori
 `getPeerX509Certificate()`, `getProtocol()`, `getCipher()`).
 
 What still differs: the socket is an `EventEmitter` with the addresses, `address()`,
-`setTimeout`, `destroy` and `end`, not a stream -- the connection is read and written
-natively -- so it has none of `write`, `pause`, `resume`, `setNoDelay`, `setKeepAlive`,
+`setTimeout`, `destroy`, `end` and `resetAndDestroy`, not a stream -- the connection is read
+and written natively -- so it has none of `write`, `pause`, `resume`, `setNoDelay`, `setKeepAlive`,
 `ref`, `unref`, `cork`, `pipe` or `read`, and `constructor.name` is `EventEmitter`. It
 answers `instanceof net.Socket` (and an `https` connection's also `instanceof
 tls.TLSSocket`) by brand, as oam's own `TLSSocket` does (entry 34), because a check that
@@ -1730,9 +2189,74 @@ behind exactly that test; code that reads the test as a promise of the stream AP
 the method it reaches for missing. An `'upgrade'` listener gets a real `net.Socket` for the
 connection, and the request's `req.socket` is that socket, as in Node; the socket
 `'connection'` handed out for the same connection closes at the handover rather than with
-the upgraded socket. On an exchange the connection was closed under after its response had
-started, the socket's `'close'` comes after the response's, where Node emits it first (they
-are in Node's order when the response had not started).
+the upgraded socket.
+
+When the connection closes under an exchange, the socket's `'close'` drives the rest, as in
+Node: it comes once the connection has closed (the native side reports it), and its listeners
+run in the order they were added -- the server's own first (the request's `'aborted'`), then
+a `'connection'` listener's, then the response's (its `'close'` without `'finish'`), then the
+handler's; the request's `'error'` and `'close'` follow on the next tick. A `destroy(err)`
+-- on the socket, or through `req.destroy(err)` -- emits `'error'` on the next tick, the
+server's `'clientError'` hearing it first (Node's socketOnError, the socket's first
+`'error'` listener; once per socket), and `'close'` with `true`. Up to 0.17.1
+`'clientError'` never heard it. An `https` connection's plain socket closes before its TLS
+socket, as Node's does. That holds whoever closed it --
+`destroy()`, `destroy(err)` or `resetAndDestroy()` on the socket, `req.destroy()` (which
+closes the connection even once the response is under way, as Node's does), or the client
+going away after the response started
+(`conformance/cases/272-http-server-connection-close-order.mjs`). Up to 0.17.1 a socket JS
+destroyed emitted `'close'` on the next tick, before `'aborted'` and the response's
+`'close'`; a client that went away after the response started closed the response before the
+socket; and a `req.destroy()` once the response was under way left the connection open and
+the response never closed.
+
+A request body the connection fails on while the handler reads it is the connection's
+failure, as in Node: the client went away mid-body (the parser's `HPE_INVALID_EOF_STATE`,
+`Parse Error`), reset the connection (the socket's `read ECONNRESET`, with `errno` and
+`syscall`), or sent a malformed chunk-size line (`HPE_INVALID_CHUNK_SIZE`, `Parse Error:
+Invalid character in chunk size`). Node's socketOnError gets it: the server's
+`'clientError'` with the error and the connection's socket, or, with no listener, the socket
+destroyed with it -- its `'error'`, then its `'close'` with `true` aborting the request as
+above (case 272). Up to 0.17.1 the request was destroyed directly: `'aborted'`, its
+`'error'` and `'close'`, then the response's `'close'` and the socket's with `false`, and
+no `'clientError'`. What differs: a malformed chunk's parser error has no `bytesParsed` or
+`rawPacket` (Node's count the bytes of the failing read and carry them), and a malformed
+body is answered `400` by the native server even when a `'clientError'` listener is there
+to answer it (Node leaves the answer to the listener).
+
+A client that resets the connection -- between keep-alive requests, with the response under
+way, or before the handler has answered -- is reported as Node reports it: the socket that
+reads it (an `https` connection's TLS socket) gets `read ECONNRESET` (with `errno` and
+`syscall`), the server's `'clientError'` hearing it first, then the socket's own `'error'`
+listeners, and it closes with `true`; the exchange it cut short is aborted from that
+`'close'` as above, and a write to its response then calls back with
+`ERR_STREAM_DESTROYED` (`conformance/cases/282-http-server-peer-reset.mjs`). Up to 0.17.1
+the socket closed with `false` and no error, `'clientError'` heard nothing, and the late
+write called back with no error.
+
+A client that goes away or resets mid-body after the response has finished is reported on
+the socket as Node reports it -- `HPE_INVALID_EOF_STATE` or `read ECONNRESET`, and `'close'`
+with `true` -- and the request, which Node's server no longer holds, emits nothing
+(`conformance/cases/296-http-server-request-after-response-finished.mjs`); up to 0.17.1 the
+socket closed with `false` and the request was aborted (`'aborted'`, ECONNRESET `aborted`).
+
+What still differs around a close: the socket never emits `'end'`. A server request emits
+`'close'` only when it is destroyed or
+aborted -- Node's destroys itself once read to the end, so its `'close'` follows `'end'` on
+every exchange; a request read to the end whose connection then closes gets its `'close'` there, without an
+error, where Node's came earlier. A client that half-closes or goes away while the handler
+has not read the request body is not noticed until the server's timeouts end the connection;
+Node notices at once (`'aborted'`, the socket's `'close'`). Of two pipelined requests Node
+dispatches both before a `destroy()` in the first one's handler takes effect; oam the first.
+
+`resetAndDestroy()` is `net.Socket`'s own function (the same object) and does what Node's
+does: the connection closes with a reset -- the client's read fails with `read ECONNRESET`,
+nothing unsent reaches it, a response being written included -- the socket is returned,
+destroyed at once, and its `'close'` says `false`; the request it was carrying is aborted
+(`'aborted'`, then ECONNRESET `aborted`). From a `'connection'` listener it refuses the client
+before a byte is read. An `https` connection's socket throws `ERR_INVALID_HANDLE_TYPE`, as
+Node's server-side `TLSSocket` does (`conformance/cases/254-http-reset-and-destroy.mjs`). Up
+to 0.17.1 the socket had no `resetAndDestroy` and the call threw a `TypeError`.
 
 `req.socket.readable` and `req.socket.writable` are Node's: both true while the connection
 is up -- after the request body has ended, and after the response has been sent, for the
@@ -1791,6 +2315,13 @@ target). The parser underneath is hyper's, so some heads still get a different a
 - A chunked body's trailer fields are in `req.trailers` and `req.rawTrailers` once the
   body has ended, combined as Node combines them, but `rawTrailers` has the names
   lowercased and a repeated name's values side by side.
+- Header and trailer values now read as Node's parser reads them, one code point per byte
+  (latin1), in `req.headers`, `req.rawHeaders`, `req.trailers`, an `http2.createServer`
+  request's headers and an `oam.serve` Request's `headers`. Up to 0.17.1 they were decoded
+  as UTF-8: the bytes of a UTF-8 `café` read as `café` where Node reads `cafÃ©`, and a lone
+  `0xE9` -- what Node's client writes for `é`, and oam's since #174 -- as U+FFFD. The e2e
+  test `request_header_bytes_round_trip_oam_to_oam_as_latin1` holds an oam-to-oam round
+  trip of `café`.
 - A refused head is answered with `content-length: 0` and `date` headers next to
   `connection: close` (Node: `Connection: close` alone). There is no `'clientError'`
   event for it (an `https` server emits one only for a failed TLS handshake, entry 42).
@@ -1815,6 +2346,115 @@ target). The parser underneath is hyper's, so some heads still get a different a
 _(probed)_ Node v22.22.2 (default and `--insecure-http-parser`) and oam, the same 90 raw
 request heads over TCP, 16 chunked bodies, 40 chunk extensions and 15 trailer sections.
 
+### 46. The HTTP server's response head: what still differs
+
+An `http` or `https` server response checks its headers as Node's `OutgoingMessage` does,
+with Node's errors and in Node's order: `setHeader`, `appendHeader`, `setHeaders(Headers |
+Map)`, `writeHead`'s headers (an object, a flat `[name, value, ...]` list or a list of
+pairs), `addTrailers`, `http.validateHeaderName` and `http.validateHeaderValue` refuse a name
+that is not a token (`ERR_INVALID_HTTP_TOKEN`), an `undefined` value
+(`ERR_HTTP_INVALID_HEADER_VALUE`) and a value holding a control character or a code point
+above U+00FF (`ERR_INVALID_CHAR`); `writeHead` and the implicit head refuse a status outside
+100-999 (`ERR_HTTP_INVALID_STATUS_CODE`) and such a status message; and once the head is out
+the header methods throw `ERR_HTTP_HEADERS_SENT`. A value up to U+00FF goes on the wire as
+Node writes it, which depends on what is sent first: joined to a string body in utf8 (or no
+encoding) the head is UTF-8 (`café` is `caf\xc3\xa9` from `res.end('text')` or
+`flushHeaders()`), and before anything else -- a chunk-size line, a Buffer, a string in
+another encoding, nothing -- it is one byte per code point (`caf\xe9`). An `http.request`'s
+head follows the same rule, on every path oam sends it by -- its own transport, an agent's
+socket, a head written by hand for an upgrade or CONNECT -- (`req.end('text')`, a GET's
+`write('text')`, `flushHeaders()` send UTF-8; `req.end()`, a Buffer, a POST's chunked
+`write('text')` one byte per code point; `conformance/cases/271-http-request-header-bytes.mjs`),
+where oam's client wrote every value one byte per code point. Up to 0.17.1 oam
+stored any header -- `res.setHeader('y', '€')` did not throw -- and wrote every value as its
+UTF-8; a CR or LF reached hyper and was answered `500`. `appendHeader` wrote to the wrong
+store, and `setHeaders` and `addTrailers` did not exist.
+`writeHead()` -- or the first `write()`, `end()` or `flushHeaders()`, when it was not called
+-- builds the head as Node's `_storeHeader` does: `headersSent` turns true, the status, the
+fields and the body's framing are fixed (a later `statusCode` does not change the status
+line), and headers handed to `writeHead()` on a response no header method has touched go into
+the head only, so `getHeader()` and the rest never see them. The body is framed by Node's
+rules: by a `content-length` or `transfer-encoding` field when there is one; otherwise not at
+all for a HEAD request or a 204 / 304 (what `end()` was given is dropped, and no
+`content-length` goes out for it; one the handler set goes out as set, a 304's included,
+where hyper used to drop a 204's and a 304's, `vendor/hyper-1.10.1/OAM-PATCH.md` item 16), by length when `end()` built the head, and chunked when
+`writeHead()` did -- so `writeHead(200); end('text')` is chunked, and `writeHead(200); end()`
+sends the last chunk alone. Up to 0.17.1 `headersSent` stayed false until the first body
+bytes, `writeHead()`'s headers showed in `getHeader()`, a later `statusCode` was sent, every
+`end()` sent a `content-length` (a HEAD response's for the body it dropped), and a second
+`writeHead()` added its headers to the first one's. The status line carries the response's
+status message -- `statusMessage`, or `writeHead()`'s reason, in the head's bytes -- where
+oam used to send the standard reason phrase whatever the message said (and hyper's spelling
+of it: `I'm a teapot` for Node's `I'm a Teapot`, `<none>` for Node's `unknown`).
+An HTTP/1.0 request's response is Node's too: `req.httpVersion` (and `httpVersionMajor` /
+`httpVersionMinor`) say `1.0`; the status line says `HTTP/1.1`; a connection header the
+handler set goes out as it was set, and otherwise Node's is sent: `Connection: keep-alive`,
+and the connection is kept, when the request said `Connection: keep-alive` and the body is
+framed (a `content-length` field, or chunks for a `TE: chunked` request), else `Connection:
+close`; a body is ended by closing the connection
+(`end('text')` sends no `content-length`) unless the request sent `TE: chunked`, which gets
+the chunked body -- and its trailers -- an HTTP/1.1 client would; a `transfer-encoding` header
+the handler sets is honoured; and a `Trailer` header on a body that cannot be chunked (there,
+on a 204, or beside a `content-length`) throws `ERR_HTTP_TRAILER_INVALID` from whatever builds
+the head, as Node's does (`vendor/hyper-1.10.1/OAM-PATCH.md` item 13 has the hyper side). Up
+to 0.17.1 `req.httpVersion` was always `'1.1'`, the status line said `HTTP/1.0`, no
+`Connection` header went out (to a `Connection: keep-alive` request, hyper's `keep-alive`,
+even over a `close` the handler set, and even before a body it ended by closing), `end('text')`
+sent a `content-length`, a `TE: chunked` client got no chunks and a `Trailer` header never
+threw (`vendor/hyper-1.10.1/OAM-PATCH.md` item 15 has the connection header).
+`conformance/cases/250-http-response-header-validation.mjs`,
+`251-http-response-header-bytes.mjs`, `266-http-writehead-builds-the-head.mjs`,
+`267-http-response-reason-phrase.mjs`, `268-http-response-trailers.mjs` and
+`269-http-response-http10.mjs` hold this to node v22.22.2. What still differs:
+
+- **A body Node ends by closing the connection is chunked over HTTP/1.1.** With its
+  `transfer-encoding` header removed (`res.removeHeader('transfer-encoding')`) and no length
+  known, Node sends the body bare and closes the connection after it; hyper, which frames
+  oam's responses, has no way to end an HTTP/1.1 body by closing, and chunks it.
+- **A connection header the handler removed, or set on a request that said `close`.** On
+  an HTTP/1.0 request that said `Connection: keep-alive`, after
+  `res.removeHeader('connection')` Node sends no connection header and keeps the connection
+  when the body is framed; hyper sends `Connection: keep-alive` there (and nothing, closing,
+  when it is not, as Node). On an HTTP/1.1 request that said `Connection: close`, a
+  connection header the handler set (`keep-alive`, or any value but `close`) goes out from
+  Node as set and Node keeps the connection; hyper sends `Connection: close` in its place
+  and closes.
+- **An `http.request` body Node chunks can go out with a length.** A POST's `end('text')`
+  after `setHeader('Trailer', ...)` or `removeHeader('content-length')`, and a `write()`
+  followed by `end()` in the same tick, are chunked by Node; oam's client, which has the
+  whole body by then, sends it with a `content-length`. The head's bytes are Node's either
+  way (one byte per code point, case 271). A GET's `Trailer` header makes Node's `end()`
+  throw `ERR_HTTP_TRAILER_INVALID`; oam's client sends the request.
+- **Trailer names go out in title case.** `addTrailers()`'s fields follow the last chunk of a
+  chunked body as Node sends them -- all of them, a repeated one once per value, whether or
+  not a `Trailer` header names them and whatever the request's `TE` says, and none on a body
+  framed otherwise (case 268; oam sent none up to 0.17.1, as hyper sends only declared
+  trailers to a `TE: trailers` request, `vendor/hyper-1.10.1/OAM-PATCH.md` item 12) -- but
+  hyper writes each name in the title case a node:http connection uses for names it has no
+  spelling for (`x-t` goes out as `X-T`, `Content-MD5` as `Content-Md5`), where Node writes
+  it as given. The trailers reach hyper's encoder as a body's trailers frame, a `HeaderMap`,
+  which keeps no spelling, and the head's `HeaderCaseMap` goes out before the trailers are
+  known; carrying the spellings needs a path of their own from the body to the encoder,
+  which oam does not have yet. Lowercase would match only the names given in lowercase, as
+  title case matches only those given in title case.
+- **A `content-disposition` value is not re-encoded.** When the response's length is known,
+  Node v22.22.2 converts the value with `Buffer.from(value, 'latin1')` and turns it back into
+  a string as UTF-8, so a non-ASCII value is corrupted: `café` goes out as `caf` plus the
+  UTF-8 of U+FFFD after `res.end('text')`, and as `caf\xfd` after `res.end(buffer)`, and
+  `writeHead()` refuses it (`ERR_INVALID_CHAR`) when a `content-length` comes before it. oam
+  writes it as any other header value (`caf\xc3\xa9`, `caf\xe9`).
+- **A refused head's `content-length` is not reused.** When `writeHead()` throws (a
+  `Trailer` header beside a `content-length`), Node keeps the length it read and sends it
+  with the next head that does not name one, whatever the body's length; oam sends the
+  body's length (hyper's), which is what the body is.
+- **The fields Node adds come in hyper's order.** Node writes the handler's fields, then
+  `Date`, `Connection`, and `Content-Length` or `Transfer-Encoding`; hyper writes the
+  handler's fields (each name's values together, where Node keeps a list's order across
+  names), then `Connection`, the framing field and `Date` last. The names themselves are
+  Node's: each as the handler spelled it (`getRawHeaderNames()` answers them), and the added
+  ones as `Date`, `Content-Length`, `Transfer-Encoding`, `Connection` (case 270,
+  `vendor/hyper-1.10.1/OAM-PATCH.md` item 14). Up to 0.17.1 every name went out lowercase.
+
 ### 41. The HTTP server's timeouts and connection count: what still differs
 
 `http` and `https` servers hold every connection to Node's timeouts, with Node's options,
@@ -1838,8 +2478,9 @@ many are open is closed at once and the server emits `'drop'`. What differs:
   and `end` (which closes the connection once what is being written is out; there is no
   half-close), and answers `instanceof net.Socket` -- and on an `https` server `instanceof
   tls.TLSSocket` -- by brand.
-- Responses carry no `Connection: keep-alive` / `Keep-Alive: timeout=N` headers, so a
-  client cannot learn the keep-alive timeout from them.
+- Responses carry no `Keep-Alive: timeout=N` header, and an HTTP/1.1 response no
+  `Connection: keep-alive` (an HTTP/1.0 one does, as Node's, entry 46), so a client cannot
+  learn the keep-alive timeout from them.
 - When a request timeout closes a connection while the handler is reading the body, the
   request's `'error'` can come before the response's `'close'` (Node emits `'aborted'`,
   then the response's `'close'`, then `'error'`).
@@ -1940,11 +2581,12 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
   served as an ordinary request (Node: `'upgrade'`, with the connection handed over) and a
   CONNECT is closed, so `wss://` servers -- `ws`, `socket.io` -- do not work on an oam
   `https` server. An `http` server routes both as Node does (entry 39).
-- **An `https` server emits no HTTP-level `'clientError'`.** A request head it refuses is
-  answered `400` natively, where Node hands the error to a `'clientError'` listener with
-  the connection's socket; the only `'clientError'` an `https` server raises is the one it
-  passes on from `'tlsClientError'` when a handshake fails, and that one carries a fresh
-  socket object rather than the connection's.
+- **An `https` server emits no `'clientError'` for a request head.** A request head it
+  refuses is answered `400` natively, where Node hands the error to a `'clientError'`
+  listener with the connection's socket. It raises `'clientError'` for a request body the
+  connection failed on (entry 39), as an `http` server does, and passes one on from
+  `'tlsClientError'` when a handshake fails; that one carries a fresh socket object rather
+  than the connection's.
 - **A connection a `'connection'` listener destroys raises no `'tlsClientError'`.** On a
   `tls`, `https` or `http2` secure server Node reports it as a `'tlsClientError'`
   (`ECONNRESET`, `socket hang up`) and, on `https` and `http2`, a `'clientError'`; oam emits
@@ -2041,11 +2683,15 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   `ERR_UNESCAPED_CHARACTERS`; Node writes it raw, so such a path adds header lines to its
   request. A body written in the same tick as `end()` is
   sent with `content-length`, where Node sends `write()`s before `end()` chunked. No
-  `accept`, `user-agent` or `accept-encoding` is added (oam's own client adds all three,
-  #148). Redirects are not followed and bodies are not decoded, as in Node.
+  `accept`, `user-agent` or `accept-encoding` is added, redirects are not followed and
+  bodies are not decoded, as in Node -- and as on oam's own transport (entry 38, case 192).
 - **Errors.** A response that cannot be parsed fails with a coded `Parse Error: ...`
   (`HPE_*`) whose code is the closest llhttp has for what hyper reports; a malformed chunk
-  size is `HPE_INVALID_CHUNK_SIZE`, as in Node. A response head is held to the request's
+  size is `HPE_INVALID_CHUNK_SIZE`, emitted on the request before the response is aborted,
+  as in Node -- over an agent's socket and, since 0.17.2, over oam's own transport (an
+  option-less `http.get`; up to 0.17.1 that response was aborted with no request error;
+  `conformance/cases/273-fetch-server-close-and-reset.mjs`) -- but without Node's
+  `bytesParsed` / `rawPacket`. A response head is held to the request's
   `maxHeaderSize` (or 16 KiB), counted as Node's parser counts it -- reason phrase, header
   names and values, refused at a count at or over the limit -- and fails with Node's
   `Parse Error: Header overflow` (`HPE_HEADER_OVERFLOW`, `reason` `Header overflow`), but
@@ -2068,15 +2714,85 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
 - **`'finish'`.** As in Node, it follows the socket's write of the last request byte, so it
   comes after `'connect'` / `'secureConnect'`, `req.writableFinished` is `false` until
   then, and a request whose socket refused or that was destroyed before it was written
-  gets none (`conformance/cases/151-http-request-finish-order.mjs`). What differs: a
-  `write()` callback runs once the request has taken the chunk, before the socket has
-  connected, where Node's waits for the socket to write it; and a request destroyed from
-  its socket's own `'connect'` / `'secureConnect'` listener gets no `'finish'`, where
-  Node's still reports one from the write it had queued for the connect.
+  gets none (`conformance/cases/151-http-request-finish-order.mjs`). A `write()` callback
+  keeps the same company: called with `null` once the socket has written its chunk, in
+  order and ahead of `'finish'`; with the socket's reason after `'close'` when the chunk
+  was never written (`ERR_SOCKET_CLOSED_BEFORE_CONNECTION` on a refused connection); and
+  not at all for a request destroyed before it had a socket. A request destroyed from its
+  socket's own `'connect'` / `'secureConnect'` listener has its queued writes failed and
+  still gets `'finish'`, as Node's does (same case). Up to 0.17.1 a callback ran as soon
+  as the request had taken the chunk, and that request got no `'finish'`. What differs:
+  the request reaches its socket a turn or two of the loop after `'connect'` (it goes
+  through hyper), where Node writes it inside the event, so a request destroyed in that
+  gap -- on the first immediate after `'connect'`, or a tick after `'socket'` on a reused
+  keep-alive socket -- has its callbacks failed (`ERR_STREAM_DESTROYED`, after `'close'`)
+  and no `'finish'`, where Node had already written it; a write failed by a destroy
+  inside `'secureConnect'` reports `ERR_SOCKET_CLOSED` where Node reports what the TLS
+  stream's write returned (`EBADF` on Windows); and `write()` returns `true` whatever the
+  socket has buffered, so a large upload emits no `'drain'`.
 - **Sockets.** A `'connect'` listener on a TLS socket runs after the handshake, since oam's
   native connect does both (entry 34); a listener that destroys the socket there still
-  stops the request before it is written. oam's `net.Socket` emits `'error'` and `'close'`
-  from `destroy()` synchronously where Node defers them a tick. After the request ends
+  stops the request before it is written. `net.Socket.destroy()` emits nothing inside the
+  call, as in Node: `'error'` on the next tick, then `'close'` -- after the immediates
+  already queued and before any timer for a socket that was connected or connecting, on
+  the next tick for one that never was (`conformance/cases/223-net-socket-destroy-defers-events.mjs`;
+  up to 0.17.1 both were emitted from inside `destroy()`). It closes the connection at
+  once, as Node's does, a read under way and a write the peer is not draining included
+  (`conformance/cases/289-net-destroy-closes-at-once.mjs`; up to 0.17.1 those kept the
+  descriptor open until the peer answered the FIN, so destroying a socket whose peer never
+  read -- one paused -- kept the process alive for good). What is left: Node emits that
+  `'close'` from the handle's close callback, which also runs after an immediate queued
+  AFTER `destroy()` in the same turn; oam's loop has no close phase, so there `'close'`
+  comes first. A `write()` is handed to the socket inside the call, as Node's is, and
+  `end()` asks for the FIN in the same turn (it is queued behind the writes natively, as
+  libuv queues a shutdown; up to 0.17.1 it waited for the last write to complete first,
+  so the FIN left one round trip late), so a write the socket takes is delivered even
+  when `destroy()` follows on the next line. A write the socket took whole inside the call
+  reports `null` to its callback, and the callbacks of an `end()` still waiting get
+  `ERR_STREAM_DESTROYED`, before that `'close'`, as in Node
+  (`conformance/cases/225-net-write-then-end-order.mjs`). An `end()` or `write()` made
+  after `destroy()` is refused as Node refuses it: the callback gets
+  `ERR_STREAM_DESTROYED` ("Cannot call end after a stream was destroyed", or "... write
+  ..." for `write()` and `end(data)`) on the next tick, never `destroy()`'s own error, and
+  the stream does not end; after a `destroy()` with no error, `end(callback)` ends the
+  stream and, as in Node, calls back only once a write still outstanding settles -- with
+  that write's `ERR_SOCKET_CLOSED_BEFORE_CONNECTION` for one held behind the connect,
+  `ERR_STREAM_DESTROYED` otherwise -- and never when none is (a write with no callback
+  that the socket took whole inside the call does not count, as in Node)
+  (`conformance/cases/248-net-end-write-after-destroy.mjs`; up to 0.17.1 those `end()`
+  callbacks got the destroy error, or `ERR_SOCKET_CLOSED`). A `write()` or `end(data)` on a
+  socket with no connection and none on the way (`new net.Socket()`, never connected) fails
+  as Node's does: `ERR_SOCKET_CLOSED` "Socket is closed" is the stream's error at once, the
+  callback gets it on the next tick, then the socket is destroyed with it, and the stream
+  does not end (`conformance/cases/286-net-write-without-handle.mjs`; up to 0.17.1 the
+  write reached the natives and failed with "tcp: write handle 0 is gone", and `end(data)`
+  ended the stream). Node's stream getters `writableEnded`, `writableFinished`, `closed`
+  (true from `destroy()` on), `errored`, `readableEnded` and `writableNeedDrain` read as
+  Node's (case 248; up to 0.17.1 a `net.Socket` had none of them). Still absent: the rest of
+  the Readable surface (`isPaused()`, `readableLength`, `readableFlowing`,
+  `readableHighWaterMark`, the iterator helpers such as `map()` and `toArray()`, `wrap()`)
+  and `writableCorked`, `writableBuffer`, `setDefaultEncoding()`, `destroySoon()`. An
+  `end()` made before `destroy()` on a socket that has not connected
+  calls back as Node's does: with `null` and a `'finish'` on the next tick on one with no
+  connection on the way (there is nothing to shut down); with the stream's error, or
+  `ERR_STREAM_DESTROYED`, on the next tick on one still connecting; and, behind a write
+  held for the connect, once that write has failed. That write fails as Node's: from a
+  `'close'` listener the `write()` added (after the `'close'` listeners added before it),
+  with `ERR_SOCKET_CLOSED_BEFORE_CONNECTION`, the writes behind it and those `end()`
+  callbacks then getting the stream's error. A `tls.TLSSocket` over a `net.Socket` with no
+  connection is `connecting` until that socket connects, as Node's
+  (`conformance/cases/287-net-end-then-destroy-before-connect.mjs`; up to 0.17.1 all of
+  these ran before `'error'` and `'close'`, `end()`'s first, with
+  `ERR_SOCKET_CLOSED_BEFORE_CONNECTION`). A write the socket takes whole inside the call is
+  no longer counted when `write()` returns, as Node's: `writableLength` and `bufferSize` read
+  `0` and `write()` returns `true` (case 225; up to 0.17.1 oam counted the bytes until the
+  callback, so `write()` could return `false` for a write already on the wire). What is
+  left there: a write the socket could not take at once, still queued when `destroy()`
+  closes the handle, calls back with `ERR_SOCKET_CLOSED` after `'close'`, where Node's is
+  cancelled -- `write ECANCELED` (`errno`, `code`, `syscall`) before `'close'` (measured on
+  Windows); and the callback of a write made before the connect runs after the `'connect'`
+  listeners rather than among them. After
+  the request ends
   Node clears a closed socket's `localAddress` / `localPort`; oam keeps them on a
   `net.Socket`.
 - **Proxy agents.** The agents that send an http request to a forward proxy in absolute
@@ -2101,7 +2817,11 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   `net.connect({ path })`, `net.connect(path)`, `tls.connect({ path })` and an http(s)
   request's `socketPath` fail with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` where Node connects
   to the pipe; a non-string `path` throws Node's `ERR_INVALID_ARG_TYPE`. Up to 0.16.2 they
-  connected to `host:port` instead (http.request sent the whole request there).
+  connected to `host:port` instead (http.request sent the whole request there). There is
+  no pipe server either: `server.listen(path)` and `listen({ path })` -- on a `net`, `tls`,
+  `http`, `https` or `http2` server -- emit `'error'` with the same code where Node listens
+  on the pipe. Up to 0.17.1 the name was read as port 0 and the server bound a TCP port
+  nobody had asked for.
 - **`--permission`.** The request is a `net.connect` / `tls.connect`, and its grant is
   checked as theirs is: `host:port`, and each address a `lookup` hook answers as `addr:port`
   (entry 4).
@@ -2164,22 +2884,212 @@ _(probed)_ Node v22.22.2 vs oam on Windows: lookup and createConnection guards o
 a node-hosted `createSecureServer` for `ca`, `servername`, a refusing lookup, an untrusted
 certificate and `rejectUnauthorized: false`, line for line identical.
 
-### `err.syscall` on `fs.realpath` and `fs.opendir`
+### 47. `socket.resetAndDestroy()` while `end()` is shutting the socket down
 
-Node's own sync and async forms disagree on these two, and oam is
-self-consistent where node is not:
+`resetAndDestroy()` is Node's otherwise: SO_LINGER 0 and a close, so the peer's read fails
+with `read ECONNRESET` and nothing unsent is delivered; the socket returned, destroyed at
+once, its own `'close'` with `false`; reset once it connects when still connecting;
+`ERR_SOCKET_CLOSED` without a handle; `ERR_INVALID_HANDLE_TYPE` thrown on a `TLSSocket` or a
+pipe (`conformance/cases/252-net-reset-and-destroy.mjs`, `253-net-reset-and-destroy-edges.mjs`).
+The sockets oam's http server and http client hand out are stand-ins over a native
+connection, and their `resetAndDestroy()` resets that connection the same way (entries 38 and
+39, case 254).
+What differs is the window where libuv refuses the reset: after `end()` has handed its FIN to
+the socket and before its shutdown callback (`'finish'`) has run.
+
+- **After the refusal oam closes the socket; Node leaves it open.** Both emit `'error'`
+  (`reset EINVAL`, `syscall: 'reset'`) inside the call. Node then never emits `'close'`:
+  libuv returns before closing the handle, `_destroy` drops its reference anyway, and the
+  open TCP handle keeps the process alive for good (measured on v22.22.2, Windows: the
+  process does not exit). oam closes the connection the orderly way -- its FIN is already out
+  -- and emits `'close'` with `true`.
+- **Where the window opens and closes.** oam's end() hands the FIN to the socket in the same
+  turn when no write is still queued (#156), and, as Node's, reports it from the loop:
+  `'finish'` comes after every tick and microtask queued meanwhile, in libuv's pending phase:
+  called from the main script, a tick, a microtask or an I/O callback, before any timer or
+  immediate; called from a timer, after the other timers due in that timers phase and before
+  any immediate; called from an immediate, after the other immediates queued before that
+  check phase began and the timers due once they are done. So `socket.end();
+  process.nextTick(() => socket.resetAndDestroy())`, and a `resetAndDestroy()` in a sibling
+  timer or immediate of the `end()`, are refused with EINVAL on both
+  (`conformance/cases/290-net-finish-after-ticks.mjs`; up to 0.17.1 oam emitted `'finish'`
+  from a microtask and reset the socket there). Measured on Windows, where Node's
+  writes complete in the call and every `end()` on a connected socket opens the window at
+  once, as oam's does (`write(); end(); resetAndDestroy()` is EINVAL on both). On Linux and
+  macOS Node defers the shutdown behind a write that has not called back yet, where oam has
+  sent the FIN once the write was taken whole -- not measured there. An `end()` whose FIN is
+  still queued behind a write the peer is not draining is reset on both, the FIN never sent.
+- **On a socket still connecting.** `end(data)` then `resetAndDestroy()` before the connect
+  resets the connection once it is made when the connect waited for a name lookup -- Node's
+  reset, a `'connect'` listener, runs before the shutdown, which waits for the write ahead
+  of it: the peer sees ECONNRESET and no FIN, the `end()` callback ERR_STREAM_DESTROYED
+  (`conformance/cases/297-net-end-then-reset-while-looking-up.mjs`; oam sent the data and
+  the FIN and refused the reset with EINVAL until review 3). Through an IP literal both
+  issue the shutdown first and refuse the reset with EINVAL.
+
+### `err.syscall` on `fs.opendir`
+
+Node's own sync and async forms disagree here, and oam is self-consistent where
+node is not:
 
 | call | node | oam |
 |---|---|---|
-| `realpathSync(missing)` | `syscall: "lstat"` (its path-walk uses lstat) | `syscall: "realpath"` |
-| `realpath(missing)` | `syscall: "realpath"` | `syscall: "realpath"` |
 | `opendirSync(missing)` | `syscall: "opendir"`, no `path` | `syscall: "scandir"`, `path` set |
 | `opendir(missing)` | `syscall: "opendir"`, `path` set | `syscall: "scandir"`, `path` set |
 
-Everything else — `code`, `errno`, the message — matches. These are the only
-two fs calls excluded from the async/sync error-parity case
-(`conformance/cases/72-*`), because asserting node's behaviour there would mean
-encoding its inconsistency into a case whose purpose is the rule.
+Everything else — `code`, `errno`, the message — matches. `fs.realpath` used to
+be listed here too; since #167 oam reports what node does for every form:
+`realpathSync` and callback `realpath` fail with the `lstat` of the first
+missing component (node's JS path walk), and `realpathSync.native`,
+`realpath.native` and `fs/promises.realpath` with `realpath` and the whole path
+(`conformance/cases/240-*`). Both are excluded from the async/sync error-parity
+case (`conformance/cases/72-*`), because asserting node's behaviour there would
+mean encoding its inconsistency into a case whose purpose is the rule.
+
+### `fs` descriptor arguments: what still differs
+
+Every `fs` call that takes a descriptor (`closeSync` / `close`, `fstat`, `read`,
+`write`, `readv`, `writev`, `fsync`, `fdatasync`, `ftruncate`, `fchmod`, `fchown`,
+`futimes`, their `*Sync` forms, `truncate(fd)`, `readFile(fd)` / `writeFile(fd)` /
+`appendFile(fd)` and the streams' `fd` option) refuses one that is not an int32 in
+`[0, 2**31-1]` as node v22.22.2 does: `ERR_OUT_OF_RANGE` / `ERR_INVALID_ARG_TYPE`,
+thrown at the call, never `EBADF` (node's two exceptions included: `readFile(-1, cb)`
+throws a tick later, as an uncaught exception, and `writeFileSync(-1, utf8String)` is
+`EBADF`, see `conformance/cases/240-*`). Both of node's wordings are reproduced -- the JS
+`getValidatedFd` (`read`, `write`, `readv`, `writev`, streams) and the C++ one (every
+`*Sync` form and the other callback forms) -- and so is where each check sits relative
+to the callback and the other arguments (`conformance/cases/246-*`, `247-*`). Before
+this, oam passed `-1`, `1.5`, `"3"` or `undefined` to the OS and reported `EBADF`.
+
+The other arguments are node's too, checked in JS before the descriptor as node
+checks them (`conformance/cases/257-*`): `fchmod`'s mode (`parseFileMode`),
+`ftruncate`'s `len` (an integer; a negative one is 0), `fchown`'s `uid` / `gid`
+(`[-1, 2**32-1]`), `futimes`' times, the position of `read` / `readSync` /
+`FileHandle.read` (`validatePosition`: an integer `>= -1` or a bigint), the
+`buffer` / data, options object, `offset` and `length` of `read`, `readSync`,
+`write` and `writeSync` with node's overloads, and the options then the data of
+`writeFile` / `appendFile` in all four forms (`Sync`, callback, `fs/promises`,
+`FileHandle`; `conformance/cases/260-*`), before the path or descriptor: node's
+`getOptions` (a string or an object, a known encoding, an `AbortSignal`), a boolean
+`flush`, then a string or a view -- or, for the promise forms, any other iterable,
+written chunk by chunk. Their `flag` opens the path, and every open's flags are
+node's `stringToFlags` (`conformance/cases/265-*`): an int32 of `O_*` bits, or one
+of node's spellings -- anything else is `ERR_INVALID_ARG_VALUE` "flags", after the
+path and before the mode -- so `writeFileSync(p, d, { flag: 'wx' })` fails `EEXIST`
+on an existing file, where oam used to ignore the flag and overwrite it. `FileHandle`'s `write`, `chmod`, `chown` and `truncate` run
+the same checks as their descriptor twins, after the closed-handle check
+(`conformance/cases/261-*`): `fh.write(string[, position[, encoding]])` takes a
+position, not an offset into the string, and `read`, `readv`, `write` and `writev`
+resolve null-prototype objects, as node's do. The path forms check theirs too
+(`conformance/cases/263-*`): `truncate` opens the path `"r+"` and ftruncates it, so a
+missing file is `ENOENT` before the length is looked at and a bad length leaves the
+file alone; `chmod` takes `parseFileMode`, `chown` / `lchown` the `uid` / `gid`
+bound, `utimes` / `lutimes` name a bad time `"time"`; and the callback forms check
+the path and these arguments at the call, in node's order, not through the callback.
+(One order differs, on macOS only: node's `lchmodSync` and `fs/promises.lchmod` open
+the path before checking the mode, so a missing path with a bad mode is `ENOENT`
+there; oam reports the mode.) A write's position (and `readv`'s) is not
+validated, as in node: anything but a safe integer -- `1.5`, `'x'`, a bigint -- and
+`-1` are the cursor (oam used to round `1.5` down to a pwrite at 1). Any other
+negative is what libuv makes of it (`conformance/cases/264-*`): the cursor on unix;
+on Windows libuv hands it to the OS as the offset, so `-2` is the cursor without
+moving it, an append handle appends, and anything else is `EINVAL` with the file
+untouched -- where oam used to write at the cursor and report success.
+A string write's encoding is node's too: only `'hex'` with an odd-length string is
+refused, and a name the binding does not know (`'bogus'`) writes UTF-8 -- so
+`fs.writeSync(-1, 'x', 0, 'bogus')` is the descriptor error, where oam used to throw
+`ERR_UNKNOWN_ENCODING`.
+What still differs:
+
+- **Open flags the natives cannot spell.** oam opens through fopen-style flag
+  strings, so the synchronous spellings (`'rs+'`, `'as'`, ...) open without `O_SYNC`,
+  and a numeric combination no fopen string expresses -- `O_WRONLY` without
+  `O_CREAT`, or `O_WRONLY | O_CREAT` without `O_TRUNC` -- opens as the nearest one
+  (`'w'`, which creates and truncates). Numeric flags with both access bits set
+  (`-1`) are `EINVAL` in node and open read-only in oam.
+- **A negative position for `writev` / `readv` of several buffers, on Windows.**
+  libuv offsets each buffer from the position in turn, so with `-2` the second
+  buffer of `writevSync(fd, [a, b], -2)` lands at `-2 + a.length` -- `-1` is the
+  end of the file -- and a `readvSync` stops there. oam gathers the buffers into
+  one write (scatters one read), so all of them land at the cursor. A single
+  buffer, and every position on unix, match.
+- **An anonymous class instance as the descriptor** reads `Received an instance of
+  Object` in the C++ wording on oam, where V8 names it after the variable it was
+  assigned to (`an instance of vals`); JS cannot see that inferred name.
+- **`fchmod` of a Windows pipe or NUL descriptor.** Descriptors 0-2 are the process's
+  stdin, stdout and stderr for every fd call, as in node (`fstatSync(0)`,
+  `readSync(0)`, `readFileSync(0)`, `fsyncSync(1)`; `conformance/cases/258-*`), with
+  libuv's Windows `fstat` shapes for a pipe, the console and NUL, and its close rule
+  (0-2 stay open on Windows, are really closed on unix -- after `fs.closeSync(1)` a
+  pipe's reader sees EOF and every later write to stdout, `console.log` aside, fails
+  `EBADF`, as in node). One unix difference remains: node's descriptors are the OS's,
+  so `fs.closeSync(1)` followed by `fs.openSync(file, 'w')` gets descriptor 1 back
+  and stdout's writes go to the file; oam's `openSync` numbers its own descriptors,
+  and stdout stays closed. libuv's Windows `fchmod`
+  reopens the handle first, which fails for a pipe (`EBUSY`) and NUL (`EINVAL`);
+  oam's sets the attribute on the handle it has, so `fchmodSync(0, mode)` on a piped
+  stdin succeeds and on NUL is `EISDIR`. A character device other than the console
+  and NUL (a serial port) stats with NUL's shape on oam, where libuv reads its file
+  information.
+- **`fchown` of a closed descriptor on Windows.** node's (libuv's) Windows `fchown`
+  is a no-op success for any descriptor, open or not; oam reports `EBADF` for one
+  that is not open. (`fs.close` of a descriptor that is not open is `EBADF` through
+  the callback, as node's is, and an uncaught exception without one --
+  `conformance/cases/259-*`. So is `fs.rm` without a function callback: node's
+  `rm` never checks it, so the removal runs and calling the missing callback when
+  it settles is an uncaught `TypeError: callback is not a function`; oam does the
+  same rather than refusing at the call, which it used to. `rm`, `rmSync` and
+  `fs/promises.rm` validate their options as node's `validateRmOptions` does, and
+  lstat the path first as it does: a directory without `recursive` is node's
+  `SystemError` `ERR_FS_EISDIR` and nothing is removed, and a path that cannot be
+  lstat'ed reports the `lstat`, except `ENOENT` under `force`.)
+
+### Coded errors: the error objects
+
+Node builds a coded error (`err.code` `ERR_*`) on a prototype of its own for that code,
+between the instance and the base's prototype: its `constructor` answers the base, so
+`err.constructor.name` is `Error` / `TypeError` / `RangeError`, its `toString` renders
+`Name [CODE]: message` (and so does the stack header), and the instance's own properties
+are `stack`, `message` and `code`. oam's are built the same way, from one registry
+(`js/bootstrap.js`) that `node_compat.js`'s errors and the vendored streams' share, so two
+errors with one code share a prototype whichever raised them -- `ERR_STREAM_DESTROYED`
+from a `net.Socket` and from a `stream.Writable` (or `tls.TLSSocket`) alike
+(`conformance/cases/248-net-end-write-after-destroy.mjs`). Up to 0.17.1 the streams'
+errors were classes named after the code (`constructor.name` `ERR_STREAM_DESTROYED`), the
+rest sat on `Error.prototype` with an own `toString`, and the stack's top frame was oam's
+error factory. `url.fileURLToPath`'s refusals (`ERR_INVALID_URL_SCHEME`,
+`ERR_INVALID_FILE_URL_PATH`, `ERR_INVALID_FILE_URL_HOST` -- `TypeError`s, as node's), fs
+given a URL that is not a `file:` one, `ERR_DIR_CLOSED` and `ERR_UNKNOWN_CREDENTIAL` come
+from the same registry (`conformance/cases/291-coded-errors-url-dir.mjs`; up to 0.17.1 they
+were built by hand on `Error.prototype` and rendered `Error: message`, the URL path and host
+ones as `Error`s). The refused URL is the error's `input`, set before its `message` as
+node's message function sets it (own names `stack`, `code`, `input`, `message`).
+
+node's `SystemError` -- the class of the codes node raises for a failure it decides itself
+but reports in a system error's terms -- is oam's too: `name` `SystemError`, `info` with
+`errno`, `syscall` and `path` as enumerable accessors over it, own names `stack`, `code`,
+`name`, `message`, `info`, `errno`, `syscall`, `path`, and `toString` and the stack header
+`SystemError [<code>]: <message>`. `fs.rm` of a directory raises one (`ERR_FS_EISDIR`), and so
+do `fs.cp` and `fs.promises.cp`: a directory without `recursive` is `ERR_FS_EISDIR` ("Path is
+a directory: cp returned EISDIR (... is a directory (not copied)) ..."), and a directory
+copied onto something that exists and is not a directory, or a file onto a directory,
+`ERR_FS_CP_DIR_TO_NON_DIR` / `ERR_FS_CP_NON_DIR_TO_DIR` -- before anything is copied, and
+ahead of the `recursive` check (`conformance/cases/292-fs-cp-type-mismatch.mjs`; up to 0.17.1
+oam failed on the directory's first entry with `ENOENT`, not at all when it was empty, and
+with `EPERM` for a file onto a directory, and its no-`recursive` error was
+`ERR_FS_CP_DIR_TO_NON_DIR` "cp: -r not specified; omitting directory '...'"). `cpSync`'s are
+node's to the byte -- a plain `Error` with `code` alone ("Recursive option not enabled,
+cannot copy a directory: ..." for a directory without `recursive`), the paths through
+`path.toNamespacedPath` as node hands them to its C++, a directory's with a trailing
+separator (measured on Windows; on Linux and macOS the paths are left as given, not
+measured).
+
+What is left: the `toString` on a coded error's prototype is oam's function, not node's
+source text; a `SystemError`'s constructor is `SystemError`, where node's `cp` errors answer
+`NodeError` (its `rm` error answers `SystemError`, as oam's); and below the top of the tree
+node's `cpSync` copies in C++ and fails with the platform's own error (`EIO` "Access is
+denied." on Windows), where oam's checks every entry as node's `cp` does and throws the same
+coded error.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 
@@ -2385,7 +3295,11 @@ comment, **not** something measured. Do not rely on either the claim or its nega
   `'end'` follows the last null), and once the last `'readable'` listener goes, data is
   held until `resume()` or a `'data'` listener, as Node's `readableFlowing` null does
   (case 125). A socket nobody reads still emits `'data'` into the void where Node's would
-  buffer, and `_readableState.length` is `0` except in paused mode.
+  buffer, and `_readableState.length` is `0` except in paused mode. A socket `pause()`d holds
+  what a read already under way brings until `resume()`, as Node's (a server's socket paused
+  in its `'connection'` listener included, `conformance/cases/288-net-paused-accepted-socket.mjs`;
+  up to 0.17.1 that first chunk was emitted while paused); it then reads no further, where
+  Node's goes on reading into its buffer up to the high-water mark.
 - **N-API async surfaces.** `napi_create_async_work`, `napi_queue_async_work`, and the
   threadsafe-function family are reported as stubs, with threadsafe finalizers possibly
   dropped. Only reachable with `OAM_ENABLE_NATIVE_ADDONS=1`.

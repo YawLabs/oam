@@ -5,7 +5,7 @@
 
 mod common;
 
-use std::net::IpAddr;
+use oam_core::net_connect::PinAddr;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -72,7 +72,9 @@ async fn refused_ip_literal_is_node_s_connect_error() {
                 port: got_port,
                 hostname,
                 path,
+                dest,
             } => {
+                assert_eq!(dest, None);
                 assert_eq!(code, "ECONNREFUSED");
                 assert_eq!(message, format!("connect ECONNREFUSED 127.0.0.1:{port}"));
                 assert_eq!(syscall.as_deref(), Some("connect"));
@@ -107,8 +109,8 @@ async fn hooked_route_two_refused_addresses_is_an_aggregate() {
         route.set_addrs(
             &key,
             vec![
-                "127.0.0.1".parse::<IpAddr>().unwrap(),
-                "::1".parse::<IpAddr>().unwrap(),
+                "127.0.0.1".parse::<PinAddr>().unwrap(),
+                "::1".parse::<PinAddr>().unwrap(),
             ],
         );
         assert_eq!(route.lookup_needed(&uri), None);
@@ -185,7 +187,7 @@ async fn a_hooked_route_asks_the_hook_again_for_the_same_host_on_another_port() 
             (key.as_str(), host.as_str()),
             ("guarded.test:8443", "guarded.test")
         );
-        route.set_addrs(&key, vec!["127.0.0.1".parse::<IpAddr>().unwrap()]);
+        route.set_addrs(&key, vec!["127.0.0.1".parse::<PinAddr>().unwrap()]);
         assert_eq!(route.lookup_needed(&first), None);
 
         // Same host, different port: the hook must be asked again.
@@ -197,7 +199,7 @@ async fn a_hooked_route_asks_the_hook_again_for_the_same_host_on_another_port() 
         // so answering one covers the other and the hook is not asked twice.
         let (default_key, _) = route.lookup_needed(&default_port).unwrap();
         assert_eq!(default_key, "guarded.test:80");
-        route.set_addrs(&default_key, vec!["127.0.0.1".parse::<IpAddr>().unwrap()]);
+        route.set_addrs(&default_key, vec!["127.0.0.1".parse::<PinAddr>().unwrap()]);
         assert_eq!(route.lookup_needed(&explicit_80), None);
         // ... and https:443 is a third authority of its own.
         assert_eq!(

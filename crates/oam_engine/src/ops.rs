@@ -90,7 +90,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     // __oam: the internal op table consumed by js/bootstrap.js. Not public
     // API; the bootstrap wraps these in web-shaped surfaces (fetch, ...).
     let internal = v8::Object::new(scope);
-    let internal_bindings: [(&str, v8::Local<v8::Function>); 21] = [
+    let internal_bindings: [(&str, v8::Local<v8::Function>); 24] = [
         ("fetch", v8::Function::new(scope, op_fetch).unwrap()),
         // A fetch whose dispatcher has a `connect.lookup` hook parks before
         // dialling a host name; JS runs the hook and resumes or drops it.
@@ -108,6 +108,12 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
             "fetchAbandon",
             v8::Function::new(scope, op_fetch_abandon).unwrap(),
         ),
+        // An aborted fetch (or a destroyed http.request) with no response
+        // head yet: take its request off the wire.
+        (
+            "fetchCancel",
+            v8::Function::new(scope, op_fetch_cancel).unwrap(),
+        ),
         (
             "fetchBodyRead",
             v8::Function::new(scope, op_fetch_body_read).unwrap(),
@@ -115,6 +121,16 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         (
             "fetchBodyCancel",
             v8::Function::new(scope, op_fetch_body_cancel).unwrap(),
+        ),
+        (
+            "fetchBodyTrailers",
+            v8::Function::new(scope, op_fetch_body_trailers).unwrap(),
+        ),
+        // `destroy()` / `resetAndDestroy()` on the req.socket of an
+        // http.request the transport carries: close its connection.
+        (
+            "fetchConnClose",
+            v8::Function::new(scope, op_fetch_conn_close).unwrap(),
         ),
         // `agent.destroy()` for an agent that runs on the shared fetch
         // transport: drop every connection it has pooled (divergence 38).
@@ -318,7 +334,7 @@ fn op_fetch(
         return;
     };
     let wire = wire.to_rust_string_lossy(scope);
-    let request = match oam_core::ops::parse_fetch_request(&wire) {
+    let mut request = match oam_core::ops::parse_fetch_request(&wire) {
         Ok(request) => request,
         Err(message) => {
             let message = v8::String::new(scope, &message).unwrap();
@@ -363,12 +379,25 @@ fn op_fetch(
             return;
         }
     }
+    // The id JS will cancel this fetch by (`fetchCancel`), if it passed one.
+    // Registered here, before the op is spawned, so a cancel in the same
+    // tick as the call finds it.
+    let cancel_id = args.get(1);
+    let cancel_id = cancel_id
+        .is_number()
+        .then(|| cancel_id.number_value(scope).unwrap_or(0.0) as u64);
     let core = core_runtime!(scope);
     let transport = core.http_client();
     let bodies = core.bodies();
     let ids = core.body_ids();
     let outbound = core.outbound_bodies();
     let continuations = core.fetch_continuations();
+    // http.request's sent signal: its sending half rides with the request.
+    if let Some(handle) = request.sent_signal {
+        request.dispatched = oam_core::http_client::sent::take(&core.sent_signals(), handle);
+    }
+    let cancel =
+        cancel_id.map(|id| oam_core::ops::FetchCancel::register(&core.fetch_cancels(), id));
     spawn_op(
         scope,
         &mut rv,
@@ -380,6 +409,7 @@ fn op_fetch(
             outbound,
             continuations,
             net_check,
+            cancel,
         ),
     );
 }
@@ -506,6 +536,22 @@ fn op_fetch_abandon(
     rv.set(v8::Boolean::new(scope, dropped).into());
 }
 
+/// `__oam.fetchCancel(id)`, synchronous: cancel the fetch started as
+/// `__oam.fetch(request, id)` if it has no response head yet -- its request
+/// comes off the wire (the connection closes, or the h2 stream resets) and
+/// its op fails. Returns whether there was such a fetch; one that already has
+/// its head is not touched (its body has its own cancel).
+fn op_fetch_cancel(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let cancels = core_runtime!(scope).fetch_cancels();
+    let cancelled = oam_core::ops::fetch_cancel(id, &cancels);
+    rv.set(v8::Boolean::new(scope, cancelled).into());
+}
+
 /// `httpTransportDestroy()`: drop every connection the shared fetch transport
 /// has pooled -- `agent.destroy()` for an agent that runs on it (divergence
 /// 38). The owned pool (#216) evicts promptly where hyper-util's could not.
@@ -515,6 +561,26 @@ fn op_http_transport_destroy(
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     core_runtime!(scope).http_client().destroy_pool();
+}
+
+/// `__oam.fetchConnClose(connection, reset, lease)`, synchronous: close the
+/// transport connection a response named as `socket.connection` -- with a
+/// reset (SO_LINGER 0) when `reset` -- whether it is carrying that response
+/// or idle in the pool after it. One already gone, or taken since by
+/// another request (its checkout is no longer `socket.lease`), is left
+/// alone.
+fn op_fetch_conn_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let connection = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let reset = args.get(1).is_true();
+    let lease = args.get(2);
+    let lease = lease
+        .is_number()
+        .then(|| lease.number_value(scope).unwrap_or(0.0) as u64);
+    oam_core::http_client::close_connection(connection, reset, lease);
 }
 
 fn op_fetch_body_read(
@@ -531,6 +597,29 @@ fn op_fetch_body_read(
         &mut rv,
         oam_core::ops::fetch_body_read(bodies, cancelled, cancel_signal, handle),
     );
+}
+
+/// Synchronous: `fetchBodyTrailers(handle)` -> JSON `[[name, value], ...]`
+/// of the trailer section of a body read to its end, or undefined when it
+/// had none (`oam_core::ops::fetch_body_trailers`). http.request's response
+/// fills `trailers` / `rawTrailers` from it.
+fn op_fetch_body_trailers(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(-1.0);
+    if handle < 0.0 {
+        return;
+    }
+    let bodies = core_runtime!(scope).bodies();
+    let Some(pairs) = oam_core::ops::fetch_body_trailers(&bodies, handle as u64) else {
+        return;
+    };
+    let json = serde_json::to_string(&pairs).unwrap_or_else(|_| "[]".to_string());
+    if let Some(value) = v8::String::new(scope, &json) {
+        rv.set(value.into());
+    }
 }
 
 /// Synchronous: drop the stored body (connection closes). Safe to call
@@ -784,6 +873,7 @@ pub(crate) fn settle_completion(
             hostname,
             address,
             port,
+            dest,
         } => {
             let fields = SysFields {
                 code: &code,
@@ -791,6 +881,7 @@ pub(crate) fn settle_completion(
                 errno,
                 syscall: syscall.as_deref(),
                 path: path.as_deref(),
+                dest: dest.as_deref(),
                 hostname: hostname.as_deref(),
                 address: address.as_deref(),
                 port,
@@ -820,6 +911,7 @@ pub(crate) fn settle_completion(
                 errno: None,
                 syscall: None,
                 path: None,
+                dest: None,
                 hostname: None,
                 address: None,
                 port: None,
@@ -829,6 +921,35 @@ pub(crate) fn settle_completion(
             if let Ok(obj) = v8::Local::<v8::Object>::try_from(error) {
                 set_string_array(tc, obj, "peerCertificates", &peer_certificates);
                 set_string_array(tc, obj, "storeIssuers", &store_issuers);
+            }
+            resolver.reject(tc, error);
+        }
+        // A connection its peer closed under an HTTP client request: an
+        // `UND_ERR_SOCKET` error with the socket's facts hung on it as
+        // `socket` (undici's keys), from which the JS builds the error its
+        // caller reports -- undici's SocketError for fetch, node's `socket
+        // hang up` / `aborted` for http.request.
+        OpOutcome::SocketClosed { message, socket } => {
+            let fields = SysFields {
+                code: "UND_ERR_SOCKET",
+                message: &message,
+                errno: None,
+                syscall: None,
+                path: None,
+                hostname: None,
+                address: None,
+                port: None,
+                dest: None,
+            };
+            let error = sys_error(tc, &fields);
+            let error = v8::Local::new(tc, &error);
+            if let Ok(obj) = v8::Local::<v8::Object>::try_from(error)
+                && let Ok(json) = serde_json::to_string(&socket)
+                && let Some(text) = v8::String::new(tc, &json)
+                && let Some(value) = v8::json::parse(tc, text)
+                && let Some(key) = v8::String::new(tc, "socket")
+            {
+                obj.create_data_property(tc, key.into(), value);
             }
             resolver.reject(tc, error);
         }
@@ -853,6 +974,8 @@ struct SysFields<'a> {
     errno: Option<i32>,
     syscall: Option<&'a str>,
     path: Option<&'a str>,
+    /// A two-path fs call's second path (`err.dest`).
+    dest: Option<&'a str>,
     hostname: Option<&'a str>,
     address: Option<&'a str>,
     port: Option<u16>,
@@ -866,6 +989,7 @@ impl<'a> SysFields<'a> {
             errno: err.errno,
             syscall: err.syscall.as_deref(),
             path: None,
+            dest: None,
             hostname: err.hostname.as_deref(),
             address: err.address.as_deref(),
             port: err.port,
@@ -930,7 +1054,7 @@ fn set_string_array(
 /// fallback, with the same own properties in the same order.
 ///
 /// Property order is observable (`Object.keys(err)`): errno, code, syscall,
-/// path, hostname, address, port -- errno FIRST, as on the sync path
+/// path, dest, hostname, address, port -- errno FIRST, as on the sync path
 /// (throw_node_error) and in node. Setting it last once gave async rejections
 /// ["code","syscall","errno"]. `path` is absent (not empty) for an fd
 /// operation (OpOutcome::node_failed_at); `port` only when non-zero, as node's
@@ -950,6 +1074,7 @@ fn sys_error(
         ("code", Some(fields.code)),
         ("syscall", fields.syscall),
         ("path", fields.path),
+        ("dest", fields.dest),
         ("hostname", fields.hostname),
         ("address", fields.address),
     ];

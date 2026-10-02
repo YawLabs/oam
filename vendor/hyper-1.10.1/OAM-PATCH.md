@@ -3,8 +3,14 @@
 This directory is hyper **1.10.1** as published on crates.io, plus a fix
 for a client hang (items 1-3 below), one server extension (item 4), and
 four stricter rules in the chunked-body decoder (items 5 to 8), a
-CONNECT request read without a body (item 9), and the `host` field kept out
-of an HTTP/2 request (item 10). The root `Cargo.toml` swaps it in with `[patch.crates-io]`.
+CONNECT request read without a body (item 9), the `host` field kept out
+of an HTTP/2 request (item 10), an on-demand header buffer (item 11), a
+server response's trailers sent as node sends them (item 12), an
+HTTP/1.0 request's response framed as node frames it (item 13), a public
+`HeaderCaseMap` (item 14), an HTTP/1.0 peer's response keeping the
+connection header it carries (item 15), and a 204's or 304's own
+`content-length` written (item 16). The root
+`Cargo.toml` swaps it in with `[patch.crates-io]`.
 
 - **Upstream:** `hyper-1.10.1.crate`, sha256
   `55281c53a1894c864990125767da440a4e630446785086f52523b20033b74498`
@@ -21,14 +27,17 @@ of an HTTP/2 request (item 10). The root `Cargo.toml` swaps it in with `[patch.c
   the unsafe-budget scan. After an edit here, `scripts/check-vendor.sh
   --regen` rewrites the diff; review it and commit it with the edit.
 - **Remove it when** a hyper release ships the fix and items 5 to 10, **and**
-  oam no longer needs item 4 (see "The request-head extension" below for what
-  replacing it takes). To do that:
+  oam no longer needs items 4 and 11 to 16 (see "The request-head extension"
+  below for what replacing item 4 takes; items 12 to 16 serve node's rules,
+  which hyper has no reason to adopt). To do that:
   1. Delete this directory.
   2. Delete the `[patch.crates-io]` entry and the `exclude = ["vendor"]` line
      from the root `Cargo.toml`.
   3. Run `cargo update -p hyper`.
   4. Keep `crates/oam_core/tests/http_client_stale_pool.rs`. It has to pass
-     on the release that replaces this copy.
+     on the release that replaces this copy -- the h2 race
+     (`an_h2_send_racing_the_dispatcher_teardown_is_answered`) as well as
+     the h1 ones, since an upstream fix may cover only the h1 path.
 
 ## The diff
 
@@ -106,6 +115,42 @@ whole of it.
     when a head carries more fields, up to the cap; the cap still bounds it, so
     the accept/reject boundary is unchanged and hyper's own `max_headers` tests
     still hold. See "On-demand header buffer" below.
+12. **`src/proto/h1/conn.rs`, `src/proto/h1/encode.rs` and
+    `src/proto/h1/role.rs`, response trailers.** A chunked body's trailers
+    frame is sent whole: every field, a repeated one as often as it repeats,
+    whether or not a `Trailer` header names it and whether or not the
+    request said `TE: trailers`. `Conn` loses its `allow_trailer_fields`
+    flag (and the `TE` read that set it); `Encoder::encode_trailers` writes
+    all the fields for a chunked encoder with no declared list
+    (`Kind::Chunked(None)`); `Server::encode_headers` still writes a
+    `Trailer` header but no longer collects its names into such a list.
+    `into_chunked_with_trailing_fields` and `is_chunked`, which only the
+    client uses now, are built for `client` (and tests). The crate's
+    `chunked_with_no_trailer_header` test now expects the fields. See
+    "Response trailers" below.
+13. **`src/proto/h1/role.rs`, `Server::encode` and
+    `Server::encode_headers`, an HTTP/1.0 request's response.** The status
+    line says `HTTP/1.1` whatever the request's version (one match arm), and
+    a response's own `Transfer-Encoding` and `Trailer` headers are honoured
+    for an HTTP/1.0 peer as for an HTTP/1.1 one (the version half of two
+    `can_chunked` checks goes). A body with neither header still ends by
+    closing the connection for a 1.0 peer. See "HTTP/1.0 peers" below.
+14. **`src/ext/mod.rs`, `HeaderCaseMap`.** The type, and its one field, are
+    public, so a server response can carry the spellings of its header
+    names. Visibility and doc comments only: hyper's server already writes
+    a response's names from such a map when its extensions hold one. See
+    "Header name case" below.
+15. **`src/proto/h1/conn.rs`, `Conn::fix_keep_alive` (and
+    `enforce_version`, which hands it the body's length).** For an HTTP/1.0
+    peer that asked for keep-alive, a response's `Connection` header is no
+    longer replaced with `keep-alive`: hyper adds one only when the response
+    has none, and only before a framed body; one of unknown length with no
+    `Transfer-Encoding` ends by closing, so keep-alive is turned off instead.
+    See "HTTP/1.0 keep-alive" below.
+16. **`src/proto/h1/role.rs`, `Server::encode_headers`, a 204's or 304's
+    `content-length`.** A `Content-Length` header on a 204 or 304 response
+    with no body is written as the application set it, where hyper dropped
+    it. See "A 204's or 304's content-length" below.
 
 ## Why
 
@@ -355,6 +400,13 @@ All counts below are from 2026-09-18.
     66 stranded).
   - Patched: 0 stranded, both platforms. That covers 300,000 extra rounds
     on Windows.
+- `an_h2_send_racing_the_dispatcher_teardown_is_answered` is the same
+  interleaving over HTTP/2 (#184): an idle h2 connection reads
+  `GOAWAY(NO_ERROR)` and a FIN and finishes, then one thread drops it while
+  another sends on its `SendRequest`.
+  - Stock `Receiver::drop` (drain removed, 2026-10-01): failed 8 of 8 runs on
+    Windows arm64, 18 to 37 of 20,000 requests stranded.
+  - Patched: 0 stranded.
 - `a_request_racing_a_closing_pooled_connection_settles` is the end-to-end
   shape, through oam's transport and a loopback server that answers and then
   sends a FIN.
@@ -395,6 +447,134 @@ on `client` -- its one remaining user, `Client::parse` -- so a server-only
 build stays warning-free. `scripts/check-vendor.sh --build` compiles every
 feature set in OAM-PATCH.features and is where an unused import in one of
 them shows up.
+
+## Response trailers (item 12)
+
+node's `res.addTrailers()` puts its fields after the last chunk of a
+chunked response, every one of them, a repeated field once per value: the
+`Trailer` header is the application's business, and node sends trailers to
+any request. hyper sent a response's trailers only when the request carried
+`TE: trailers` exactly, and then only the fields a `Trailer` header of the
+response named, minus the ones RFC 9110 forbids in a trailer section
+(`content-length`, `host`, ...), each name once (`HeaderMap::insert`). An
+oam server answering a node client, or curl, or a browser, so sent none.
+
+With the patch a server sends the trailers frame its body yields, as node
+would; hyper still sends trailers only on a chunked body (a length-framed
+or close-delimited one has nowhere to put them, which is node's rule too).
+Only node:http's `ServerResponse` yields a trailers frame among oam's
+servers, so `oam.serve` and the http2 compat server are unchanged. The
+client's encoder keeps hyper's rule for a request that declares its
+trailers, and sends every field for one that does not -- which oam's client
+never yields (node's `ClientRequest#addTrailers` would send them all).
+
+The names go out as hyper writes any header name (lowercase, or title case
+on a connection that asks for it). The trailers frame is a `HeaderMap`,
+which keeps no spelling, and the response's `HeaderCaseMap` is read when
+the head goes out, before the trailers are known, so the case the
+application wrote them in would need a path of its own from the body to
+`Encoder::encode_trailers`; there is none yet. node writes them as given.
+
+Tested by conformance case 268 (identical to node v22.22.2; fails on stock
+1.10.1) and the crate's `chunked_with_no_trailer_header`. hyper 1.11.0 keeps
+the `TE: trailers` gate and the declared-fields filter (checked 2026-10-01;
+1.11.1 was not checked).
+
+## HTTP/1.0 peers (item 13)
+
+hyper answers an HTTP/1.0 request in HTTP/1.0 (`Conn::enforce_version`
+sets the response's version to the peer's) and, for such a peer, drops a
+response's `Transfer-Encoding` and `Trailer` headers and ends any body of
+unknown length by closing the connection. node's http server always writes
+`HTTP/1.1` -- RFC 9110 2.5 has a server send the highest version it speaks
+-- and frames an HTTP/1.0 client's response by its own rules: by closing
+the connection by default, but chunked when the request sent `TE: chunked`
+or the handler set `Transfer-Encoding: chunked` itself, with the `Trailer`
+header and the trailers that go with it.
+
+With the patch the status line says `HTTP/1.1` for every response, and a
+`Transfer-Encoding` (or `Trailer`) header the response carries is honoured
+for a 1.0 peer: hyper chunks the body. Nothing else moves: the response's
+version stays the peer's for every other decision (keep-alive is still off
+for a 1.0 peer that did not ask for it, and a body of unknown length with no
+such header still ends by closing), and the decoder, which refuses a 1.0
+*request* carrying `Transfer-Encoding`, is untouched. oam's node:http
+`ServerResponse` adds `Transfer-Encoding: chunked` itself where node would
+chunk for a 1.0 client; `oam.serve` and the http2 compat server change only
+in the status line's version (and honour a `Transfer-Encoding` header a
+handler sets for a 1.0 client).
+
+Tested by conformance case 269 (identical to node v22.22.2; fails on stock
+1.10.1). hyper 1.11.0 is unchanged here (checked 2026-10-01).
+
+## Header name case (item 14)
+
+node writes each response header name as the handler spelled it, and the
+ones it adds itself (`Date`, `Content-Length`, `Transfer-Encoding`,
+`Connection`) in title case. hyper's `HeaderName` is lowercase, and its
+server writes names lowercase -- or title case, with the builder's
+`title_case_headers` -- unless the response's extensions hold a
+`HeaderCaseMap`, which `preserve_header_case` fills in on a request but no
+caller could build for a response: the type was crate-private.
+
+oam's node:http connections set `title_case_headers`, which gives node's
+spellings for the names hyper adds and for every name a handler wrote in
+title case, at no cost; a response with a name in any other case
+(`x-request-id`, `ETag`) carries a `HeaderCaseMap` with every name's
+spelling (`http_server::header_name_case`). `oam.serve` and the http2
+compat server are unchanged (lowercase). A trailers frame has no
+extensions, so trailer names follow the connection's case rule (title case
+on a node:http connection), where node writes them as given.
+
+Tested by conformance case 270 (identical to node v22.22.2; does not compile
+against stock 1.10.1) and `http_server::name_case_tests`.
+
+## HTTP/1.0 keep-alive (item 15)
+
+`Conn::enforce_version` calls `fix_keep_alive` for an HTTP/1.0 peer before it
+sets the response's version to the peer's, so `fix_keep_alive`'s
+`match head.version` sees the response's own `HTTP/1.1` and, when the peer
+asked for keep-alive and the response's `Connection` header is not
+`keep-alive`, inserts `Connection: keep-alive` -- over a `close` the
+application set (and the encoder, seeing `keep-alive`, kept the connection),
+and before a body of unknown length that it then ended by closing the
+connection, so the header said the opposite of the framing. node writes the
+handler's connection header as it was set, and when there is none says
+`keep-alive` only before a framed body (`content-length`, or chunks for a
+`TE: chunked` request) and `close` otherwise.
+
+With the patch the insert happens only when the response carries no
+`Connection` header at all, and only when its body is framed: a body of
+unknown length with no `Transfer-Encoding` turns keep-alive off instead
+(as hyper's `HTTP_10` arm does for a response that does not ask for it), so
+it goes out with no `Connection` header and the connection closes after it.
+A `close` the response carries is written as it is, and the encoder turns
+keep-alive off for it as for an HTTP/1.1 peer. oam's node:http
+`ServerResponse` always sends a connection header to an HTTP/1.0 client
+(node's choice, or the handler's), so hyper's insert is left to `oam.serve`
+and the http2 compat server, whose framed responses to a keep-alive 1.0
+client keep their connection as before.
+
+Tested by conformance case 269 (identical to node v22.22.2; on stock 1.10.1
+a handler's `close` goes out as `keep-alive`). hyper 1.11.0 has the same
+`fix_keep_alive` (checked 2026-10-01).
+
+## A 204's or 304's content-length (item 16)
+
+When a response has no body to send (`BodyLength` `None`), hyper writes a
+`Content-Length` header the application set only for a HEAD request, and
+drops it otherwise -- a 204's and a 304's included. A 304 answering a
+conditional GET carries the selected representation's length (RFC 9110
+8.6), and node's http module writes whatever `content-length` a 204 or 304
+was given (`writeHead(304, {'Content-Length': '5'})` sends
+`Content-Length: 5`). With the patch a 204's or 304's goes out as it was
+set; the body stays empty (`can_have_body`), and a status that can have a
+body still loses a non-zero length it has no body for, as before. This
+applies to every server (`oam.serve` and the http2 compat server's
+HTTP/1 connections too): they now send what the handler set.
+
+Tested by conformance case 266 (identical to node v22.22.2; on stock 1.10.1
+the field is missing). hyper 1.11.0 is unchanged here (checked 2026-10-01).
 
 ## Upstream status (checked 2026-09-18)
 

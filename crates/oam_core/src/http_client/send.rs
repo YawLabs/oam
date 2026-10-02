@@ -24,6 +24,13 @@
 //! function returned, piped ([`fetch_supply`]). The request then goes over
 //! that socket and nowhere else; no hop is ever dialled here.
 //!
+//! A fetch can be CANCELLED while its request is on the wire and no response
+//! head has come ([`FetchCancel`], `fetchCancel`): an aborted `fetch()` or a
+//! destroyed `http.request` leaves, as node's does, instead of waiting for a
+//! response nobody will read. The loop drops the request it is sending, which
+//! closes its h1 connection (or resets its h2 stream), and the op fails as
+//! [`ABORTED`].
+//!
 //! Under `--permission`, the engine's net grant ([`NetCheck`]) is applied to
 //! every hop's host at the top of the loop: before the hop parks for its
 //! lookup hook, before anything dials, and whichever route (pooled, hooked,
@@ -32,9 +39,9 @@
 //! loop is where the grant has to be asked again.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use base64::Engine as _;
 use bytes::Bytes;
@@ -46,12 +53,22 @@ use super::connector::{ConnInfo, SuppliedConn};
 use super::decode::{self, MAX_CODINGS, Plan};
 use super::prepare::{self, PrepareError};
 use super::redirect::{self, Next};
+use super::sent::Dispatched;
 use super::tls_config::TlsRange;
-use super::transport::{channel_body, empty_body, full_body};
+use super::transport::{channel_body, channel_body_then, empty_body, full_body};
 use super::{HttpTransport, NetCheck, NetTarget, ReqBody, Route};
 use crate::OpOutcome;
 use crate::OutboundBodies;
 use crate::net_connect::attempt_timeout_from_ms;
+
+/// [`FetchRequest::defer_head`].
+#[derive(serde::Deserialize, Debug, Clone, Copy, Default)]
+pub struct DeferHead {
+    /// A body that ends with no chunk goes out as `content-length: 0` (a
+    /// method undici expects a payload for, with no length of its own).
+    #[serde(default)]
+    pub empty_content_length: bool,
+}
 
 /// The request `js/bootstrap.js` sends (serde; unknown fields are ignored).
 #[derive(serde::Deserialize)]
@@ -82,21 +99,38 @@ pub struct FetchRequest {
     /// Missing or not a positive number: node's 250 ms.
     #[serde(default)]
     pub attempt_timeout_ms: Option<f64>,
+    /// undici's connect timeout, in ms: how long each connection this
+    /// request opens has to be connected (for https, handshaken) before the
+    /// request fails with undici's `ConnectTimeoutError`. JS sends it for
+    /// what goes through undici in node -- `fetch()` and `undici.request`,
+    /// 10 s unless the dispatcher says otherwise. Absent, 0 or not a
+    /// positive number: no timeout, which is `http.request` (node has none
+    /// there) and a dispatcher that turned it off.
+    #[serde(default)]
+    pub connect_timeout_ms: Option<f64>,
     /// True for `fetch()`: undici's bad-port block on the initial URL.
     /// `http.request`, `undici.request` and the http2 compat client leave it
     /// false -- node's http.request has no such check. Redirect hops are
     /// checked either way (redirect::next).
     #[serde(default)]
     pub fetch_semantics: bool,
-    /// #149's knob; JS does not send it yet.
+    /// True for `undici.request` (and implied by `fetch_semantics`): the
+    /// request goes through undici's dispatcher in node, so an oversized
+    /// response head is counted and refused as undici does
+    /// ([`response_head_overflow`]), not as node's own http parser.
+    #[serde(default)]
+    pub dispatch_semantics: bool,
+    /// `fetch`'s `redirect` option; `http.request` always sends `manual`
+    /// (node's http client never follows a redirect). Absent: follow.
     #[serde(default)]
     pub redirect: RedirectMode,
-    /// #148's knob: false delivers the body as received and keeps the
-    /// encoding headers. JS does not send it yet.
+    /// False delivers the body as received and keeps the encoding headers:
+    /// what `http.request` sends, node's http client decoding nothing (#148).
     #[serde(default = "yes")]
     pub decode: bool,
-    /// #148's knob: false sends the caller's headers alone. JS does not send
-    /// it yet.
+    /// False sends the caller's headers alone: what `http.request` sends,
+    /// node's http client adding no `accept` / `user-agent` /
+    /// `accept-encoding` of its own (#148).
     #[serde(default = "yes")]
     pub default_headers: bool,
     /// node's `maxHeaderSize` for the response heads of this request:
@@ -114,10 +148,89 @@ pub struct FetchRequest {
     pub tls_min_version: Option<String>,
     #[serde(default)]
     pub tls_max_version: Option<String>,
+    /// Handle of a [`super::sent`] signal to fire once the request has a
+    /// connection: `http.request`'s, for node's `'finish'` (#193).
+    #[serde(default)]
+    pub sent_signal: Option<u64>,
+    /// A streamed body (`body_stream`) whose head waits for it, as undici's
+    /// AsyncWriter writes it: the request is dispatched -- the bad-port
+    /// check, the lookup and the connect run at once -- but nothing goes on
+    /// the wire before the body's first non-empty chunk, and a body that
+    /// ends with none goes as no body at all ([`super::transport::HeadAwaitsBody`]).
+    #[serde(default)]
+    pub defer_head: Option<DeferHead>,
+    /// `undici.request`'s streamed body is an iterable or a web stream, not
+    /// a Readable: undici follows a redirect with it, sending the spent
+    /// iterable ([`redirect::RedirectBody::UndiciIterable`]).
+    #[serde(default)]
+    pub iterable_body: bool,
+    /// That signal's sending half. Never from JS: the engine's fetch op
+    /// takes it from the runtime's registry and puts it here.
+    #[serde(skip)]
+    pub dispatched: Option<Dispatched>,
+    /// undici's `headersTimeout` in ms (`fetch`'s and `undici.request`'s;
+    /// fractional allowed, absent or 0 for no limit): the longest a hop's
+    /// response head may take once a connection has the request
+    /// ([`super::sent`]).
+    #[serde(default)]
+    pub headers_timeout_ms: Option<f64>,
+    /// undici's `bodyTimeout` in ms (absent or 0 for no limit): the longest
+    /// one read of the response body may wait for bytes
+    /// ([`super::body::read`]).
+    #[serde(default)]
+    pub body_timeout_ms: Option<f64>,
+}
+
+/// The longest timer JS can set (2^31-1 ms, about 24.8 days). A
+/// `headersTimeout` or `bodyTimeout` above it is held to it, as
+/// `undici.request`'s timers always were in oam (docs/node-divergences.md).
+const MAX_TIMER_MS: f64 = 2_147_483_647.0;
+
+/// A `headers_timeout_ms` / `body_timeout_ms` as the time it takes to lapse:
+/// `None` for none (absent, 0, or not a number), else the limit -- at least
+/// 1 ms, `setTimeout`'s floor, and at most [`MAX_TIMER_MS`] -- on undici's
+/// clock ([`fast_timer`]).
+fn timeout_limit(ms: Option<f64>) -> Option<Duration> {
+    let ms = ms.filter(|ms| *ms > 0.0)?;
+    Some(fast_timer(ms.clamp(1.0, MAX_TIMER_MS)))
+}
+
+/// undici's FastTimer tick (lib/util/timers.js TICK_MS).
+const FAST_TIMER_TICK_MS: f64 = 499.0;
+
+/// How long a `limit_ms` timer on undici's FastTimer takes to lapse. undici
+/// 6.29.0 runs `headersTimeout` and `bodyTimeout` on it (client-h1.js
+/// TIMEOUT_HEADERS / TIMEOUT_BODY | USE_FAST_TIMER): a timer armed, or
+/// refreshed, is taken up at the clock's next 499 ms tick and fires at the
+/// first tick at least `limit` after the one before that. So any limit up
+/// to 998 ms lapses after 998 ms, and longer ones in 499 ms steps -- 1500
+/// after 1996 (measured on node v22.22.2 + undici 6.29.0: about 1010 ms for
+/// 1, 100 and 300, about 2050 ms for 1500). Modelled from the arm, as with
+/// no other undici timer running; with one, undici's next tick can come
+/// sooner (docs/node-divergences.md).
+fn fast_timer(limit_ms: f64) -> Duration {
+    let ticks = ((limit_ms - FAST_TIMER_TICK_MS) / FAST_TIMER_TICK_MS)
+        .ceil()
+        .max(1.0);
+    Duration::from_secs_f64((ticks + 1.0) * FAST_TIMER_TICK_MS / 1000.0)
+}
+
+/// undici's `HeadersTimeoutError`, raised when a hop's head is late. JS
+/// gives it that class (bootstrap.js `undiciCause`).
+fn headers_timed_out() -> OpOutcome {
+    OpOutcome::node_failed("UND_ERR_HEADERS_TIMEOUT", "Headers Timeout Error")
 }
 
 fn yes() -> bool {
     true
+}
+
+/// [`FetchRequest::connect_timeout_ms`] as a duration; `None` is no timeout.
+fn connect_timeout_from_ms(ms: Option<f64>) -> Option<Duration> {
+    let ms = ms.filter(|ms| ms.is_finite() && *ms > 0.0)?;
+    // A JS number far past any real timeout saturates rather than wrapping;
+    // `from_secs_f64` would panic on an overflow.
+    Some(Duration::from_secs_f64(ms.min(u32::MAX as f64) / 1000.0))
 }
 
 /// What a 3xx does.
@@ -172,6 +285,70 @@ impl PendingFetch {
     }
 }
 
+/// In-flight fetches that can be cancelled, by the id JS gave each one.
+pub type FetchCancels = Arc<Mutex<HashMap<u64, Arc<tokio::sync::Notify>>>>;
+
+/// What a cancelled fetch's op fails with. Nothing reads it: JS has already
+/// settled the fetch with the abort reason (or the destroyed request's
+/// error) by the time it cancels.
+pub const ABORTED: &str = "fetch: aborted";
+
+/// One fetch's entry in [`FetchCancels`], registered before the op starts --
+/// synchronously, in the op's native call -- so a cancel can never arrive
+/// ahead of it (`fetch(url, { signal }); controller.abort()` in one tick).
+/// The fetch carries it for as long as it has no response head, parks
+/// included; dropping it takes the entry out, so a cancel after the head (or
+/// after a failure) finds nothing and does nothing.
+pub struct FetchCancel {
+    id: u64,
+    registry: FetchCancels,
+    signal: Arc<tokio::sync::Notify>,
+}
+
+impl FetchCancel {
+    pub fn register(registry: &FetchCancels, id: u64) -> FetchCancel {
+        let signal = Arc::new(tokio::sync::Notify::new());
+        lock(registry).insert(id, signal.clone());
+        FetchCancel {
+            id,
+            registry: registry.clone(),
+            signal,
+        }
+    }
+
+    /// Resolves once the fetch has been cancelled. A cancel that came while
+    /// nothing was waiting (between hops, or while the fetch was parked) is
+    /// kept: `notify_one` stores a permit for the next wait.
+    async fn cancelled(&self) {
+        self.signal.notified().await;
+    }
+}
+
+impl Drop for FetchCancel {
+    fn drop(&mut self) {
+        let mut registry = lock(&self.registry);
+        // Only its own entry: an id JS reused belongs to the later fetch.
+        if registry
+            .get(&self.id)
+            .is_some_and(|signal| Arc::ptr_eq(signal, &self.signal))
+        {
+            registry.remove(&self.id);
+        }
+    }
+}
+
+/// `fetchCancel`: cancel the in-flight fetch registered under `id`. True if
+/// it was still without a response head (and so was there to cancel).
+pub fn fetch_cancel(id: u64, cancels: &FetchCancels) -> bool {
+    match lock(cancels).get(&id) {
+        Some(signal) => {
+            signal.notify_one();
+            true
+        }
+        None => false,
+    }
+}
+
 /// reqwest's h2 retry allowance (retry.rs, `max_retries_per_request`).
 pub const MAX_H2_RETRIES: u32 = 2;
 
@@ -196,7 +373,26 @@ struct LoopState {
     /// The response-head limit, and which of node's two counts applies (see
     /// [`response_head_overflow`]).
     max_header_size: u64,
-    fetch_semantics: bool,
+    undici_head: bool,
+    /// A `fetch` (not `undici.request` or `http.request`): a redirect that
+    /// would resend a streamed body fails it ([`redirect::RedirectBody`]).
+    fetch_rules: bool,
+    /// Fired by the pool when a connection has a hop's request (see
+    /// [`super::sent`]); carried across a park, dropped with the fetch.
+    /// `http.request`'s, or the loop's own when only `headers_timeout` needs
+    /// it.
+    dispatched: Option<Dispatched>,
+    /// The fetch's cancel registration, if JS can cancel it.
+    cancel: Option<FetchCancel>,
+    /// undici's `headersTimeout`, run from each checkout
+    /// ([`super::sent::headers_deadline`]). `None`: no limit, and no timer.
+    headers_timeout: Option<Duration>,
+    /// undici's `bodyTimeout`, handed to the response body. `None`: no limit.
+    body_timeout: Option<Duration>,
+    /// [`FetchRequest::defer_head`], for the first send of a streamed body.
+    defer_head: Option<DeferHead>,
+    /// [`FetchRequest::iterable_body`].
+    iterable_body: bool,
 }
 
 enum BodySource {
@@ -213,13 +409,32 @@ impl BodySource {
 
     /// The body for the next send. A stream's receiver is taken here, on the
     /// first send, and never again. The error is the op's failure text.
-    fn build(&mut self) -> Result<ReqBody, String> {
+    ///
+    /// `timed`: the send's signal when a headers timeout runs on it, which
+    /// hears whether this body is still being written -- a streamed one
+    /// until its last chunk goes ([`Dispatched::body_open`]).
+    ///
+    /// `declared`: the request's `content-length`, if it has one.
+    fn build(
+        &mut self,
+        timed: Option<&Dispatched>,
+        declared: Option<u64>,
+    ) -> Result<ReqBody, String> {
+        if let Some(dispatched) = timed {
+            dispatched.body_open(matches!(self, BodySource::Stream(_)));
+        }
         match self {
             BodySource::Empty => Ok(empty_body()),
             BodySource::Full(bytes) => Ok(full_body(bytes.clone())),
-            BodySource::Stream(slot) => match slot.take() {
-                Some(receiver) => Ok(channel_body(receiver)),
-                None => Err(format!("fetch: unknown body stream {}", slot.handle())),
+            BodySource::Stream(slot) => match (slot.take(), timed) {
+                (Some(receiver), Some(dispatched)) => {
+                    let dispatched = dispatched.clone();
+                    Ok(channel_body_then(receiver, declared, move || {
+                        dispatched.body_open(false)
+                    }))
+                }
+                (Some(receiver), None) => Ok(channel_body(receiver)),
+                (None, _) => Err(format!("fetch: unknown body stream {}", slot.handle())),
             },
         }
     }
@@ -254,6 +469,10 @@ fn is_idempotent(method: &http::Method) -> bool {
 /// `net_check` is the `--permission` net grant (`None` when it covers every
 /// host). It is a parameter rather than a [`FetchRequest`] field because the
 /// request is JSON from JS, and nothing JS sends may widen or drop it.
+///
+/// `cancel` is the fetch's [`FetchCancel`], for a fetch JS may cancel before
+/// its response head.
+#[allow(clippy::too_many_arguments)]
 pub async fn fetch(
     transport: HttpTransport,
     req: FetchRequest,
@@ -262,6 +481,7 @@ pub async fn fetch(
     outbound: OutboundBodies,
     continuations: FetchContinuations,
     net_check: Option<NetCheck>,
+    cancel: Option<FetchCancel>,
 ) -> OpOutcome {
     // Claimed first, so every early return below releases the receiver.
     let stream = req
@@ -303,7 +523,14 @@ pub async fn fetch(
     let route = if req.connect_hook {
         transport.supplied_route(attempt_timeout, tls_range)
     } else {
-        transport.route(req.lookup_hook, attempt_timeout, tls_range)
+        transport
+            .route(req.lookup_hook, attempt_timeout, tls_range)
+            .with_connect_timeout(connect_timeout_from_ms(req.connect_timeout_ms))
+    };
+    let headers_timeout = timeout_limit(req.headers_timeout_ms);
+    let dispatched = match req.dispatched {
+        Some(dispatched) => Some(dispatched),
+        None => headers_timeout.map(|_| Dispatched::new()),
     };
     let state = LoopState {
         transport,
@@ -319,7 +546,14 @@ pub async fn fetch(
         max_header_size: req
             .max_header_size
             .unwrap_or_else(crate::http_head::max_http_header_size),
-        fetch_semantics: req.fetch_semantics,
+        undici_head: req.fetch_semantics || req.dispatch_semantics,
+        fetch_rules: req.fetch_semantics,
+        dispatched,
+        cancel,
+        headers_timeout,
+        body_timeout: timeout_limit(req.body_timeout_ms),
+        defer_head: req.defer_head,
+        iterable_body: req.iterable_body,
     };
     run(state, &bodies, &ids, &continuations).await
 }
@@ -349,7 +583,9 @@ pub async fn fetch_continue(
     };
     let mut addrs = Vec::with_capacity(lookup.ips.len());
     for ip in &lookup.ips {
-        match ip.parse::<IpAddr>() {
+        // A zone id (`fe80::1%eth0`) is part of the address, as node's
+        // `net.isIP` has it, and is dialled as its scope id.
+        match ip.parse::<crate::net_connect::PinAddr>() {
             Ok(addr) => addrs.push(addr),
             Err(e) => {
                 return OpOutcome::Failed(format!(
@@ -513,7 +749,11 @@ async fn run(
         let mut retries = 0;
         let mut stale_resent = false;
         let response = loop {
-            let body = match state.source.build() {
+            let timed = state.headers_timeout.and(state.dispatched.as_ref());
+            let declared = hop_headers
+                .get(CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()?.trim().parse::<u64>().ok());
+            let body = match state.source.build(timed, declared) {
                 Ok(body) => body,
                 Err(text) => return OpOutcome::Failed(text),
             };
@@ -521,7 +761,60 @@ async fn run(
             *request.method_mut() = state.method.clone();
             *request.uri_mut() = uri.clone();
             *request.headers_mut() = hop_headers.clone();
-            match state.transport.send(&state.route, request).await {
+            if let Some(dispatched) = &state.dispatched {
+                request.extensions_mut().insert(dispatched.clone());
+            }
+            if matches!(state.source, BodySource::Stream(_))
+                && let Some(defer) = state.defer_head.take()
+            {
+                request
+                    .extensions_mut()
+                    .insert(super::transport::HeadAwaitsBody {
+                        empty_content_length: defer.empty_content_length,
+                    });
+            }
+            // The one place the loop waits. Each send (a hop, a resend) gets
+            // its own headersTimeout, started by its own checkout: a head that
+            // is late fails the hop, and dropping the send drops the request
+            // (hyper closes its connection, as undici destroys the socket). A
+            // cancel drops the send too: a connect in progress is abandoned,
+            // an h1 connection the request went out on is closed (hyper shuts
+            // a connection whose response nobody waits for), an h2 stream is
+            // reset -- which is how the server learns the client left.
+            let send = state.transport.send(&state.route, request);
+            let headers_timeout = state.headers_timeout;
+            let dispatched = state.dispatched.as_ref();
+            let timed = async move {
+                match (headers_timeout, dispatched) {
+                    (Some(limit), Some(dispatched)) => {
+                        let deadline = super::sent::headers_deadline(dispatched.subscribe(), limit);
+                        tokio::select! {
+                            biased;
+                            sent = send => Some(sent),
+                            () = deadline => None,
+                        }
+                    }
+                    _ => Some(send.await),
+                }
+            };
+            // Outer None: cancelled. Inner None: the head was late.
+            let sent = match &state.cancel {
+                Some(cancel) => tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => None,
+                    sent = timed => Some(sent),
+                },
+                None => Some(timed.await),
+            };
+            let Some(sent) = sent else {
+                state.source.request_failed();
+                return OpOutcome::Failed(ABORTED.to_string());
+            };
+            let Some(sent) = sent else {
+                state.source.request_failed();
+                return headers_timed_out();
+            };
+            match sent {
                 Ok(response) => break response,
                 Err(e)
                     if retries < MAX_H2_RETRIES
@@ -570,6 +863,11 @@ async fn run(
                 }
                 Err(e) => {
                     state.source.request_failed();
+                    // A malformed response head is the parser's error, as
+                    // bridge.rs exchange_error reports it on the agent paths.
+                    if let Some(parse) = e.head_parse_outcome(state.undici_head) {
+                        return parse;
+                    }
                     return e.to_outcome(&hop_url);
                 }
             }
@@ -577,7 +875,7 @@ async fn run(
         // Every hop's head, a redirect's included: node's parser refuses an
         // oversized head before anything looks at its status.
         if let Some(refusal) =
-            response_head_overflow(&response, state.max_header_size, state.fetch_semantics)
+            response_head_overflow(&response, state.max_header_size, state.undici_head)
         {
             drop(response);
             state.source.request_failed();
@@ -596,21 +894,41 @@ async fn run(
             RedirectMode::Error | RedirectMode::Follow => {}
         }
         let location = redirect::location(response.headers());
+        // undici.request: undici's dispatcher, and not a fetch.
+        let undici_request = state.undici_head && !state.fetch_rules;
+        let redirect_body = match (state.source.replayable(), state.fetch_rules) {
+            (true, false) if undici_request => redirect::RedirectBody::UndiciReplayable,
+            (true, _) => redirect::RedirectBody::Replayable,
+            (false, true) => redirect::RedirectBody::StreamedFetch,
+            (false, false) if state.iterable_body => redirect::RedirectBody::UndiciIterable,
+            (false, false) => redirect::RedirectBody::Streamed,
+        };
         match redirect::next(
             response.status().as_u16(),
             &state.method,
             &state.current,
             location.as_ref(),
             state.hops,
-            state.source.replayable(),
+            redirect_body,
         ) {
             // ReturnResponse: the hop must resend a streamed body, which
-            // cannot be replayed -- the 3xx is the result (reqwest's
-            // behaviour, kept until #149/#148).
+            // cannot be replayed -- the 3xx is the result, as undici's
+            // RedirectHandler returns it for `undici.request`. (A fetch's
+            // streamed body fails the hop instead: RedirectBody::StreamedFetch.)
             Next::Done | Next::ReturnResponse => break response,
             Next::Fail(text) => {
                 state.source.request_failed();
                 return OpOutcome::Failed(text.to_string());
+            }
+            // Not a rejection of the op: the cause is the error node's
+            // `new URL(location, base)` throws, which carries both strings,
+            // and JS builds it from this payload (bootstrap.js settleRaw).
+            Next::InvalidLocation { input } => {
+                state.source.request_failed();
+                let payload = serde_json::json!({
+                    "invalidLocation": { "input": input, "base": state.current.as_str() },
+                });
+                return OpOutcome::Json(payload.to_string());
             }
             Next::Follow {
                 url,
@@ -623,6 +941,14 @@ async fn run(
                 redirect::apply(&mut state.carried, &state.current, &url, drop_body);
                 if drop_body {
                     state.source = BodySource::Empty;
+                } else if redirect_body == redirect::RedirectBody::UndiciIterable {
+                    // undici sends the spent iterable again: no bytes, with
+                    // the length that says so.
+                    state.source = BodySource::Empty;
+                    state.carried.remove(http::header::TRANSFER_ENCODING);
+                    state
+                        .carried
+                        .insert(CONTENT_LENGTH, http::HeaderValue::from_static("0"));
                 }
                 state.method = method;
                 state.current = url;
@@ -637,9 +963,10 @@ async fn run(
 /// refusal when `response`'s head is at or over `limit`, counted the way the
 /// API that sent the request counts it (measured on node v22.22.2):
 ///
-/// - `fetch` (undici): header names plus values. It fails with
-///   `TypeError: fetch failed`, cause `UND_ERR_HEADERS_OVERFLOW` /
-///   `Headers Overflow Error` (undici's `HeadersOverflowError`).
+/// - `fetch` and `undici.request` (undici, `undici_head`): header names plus
+///   values. It fails with `UND_ERR_HEADERS_OVERFLOW` / `Headers Overflow
+///   Error` (undici's `HeadersOverflowError`): `fetch` as the cause of
+///   `TypeError: fetch failed`, `undici.request` with the error itself.
 /// - `http.request` (node's own parser): the status line's reason phrase
 ///   too. It fails with `Parse Error: Header overflow`, code
 ///   `HPE_HEADER_OVERFLOW`.
@@ -652,14 +979,14 @@ async fn run(
 pub(super) fn response_head_overflow(
     response: &http::Response<Incoming>,
     limit: u64,
-    fetch_semantics: bool,
+    undici_head: bool,
 ) -> Option<OpOutcome> {
     let mut count: u64 = response
         .headers()
         .iter()
         .map(|(name, value)| (name.as_str().len() + value.as_bytes().len()) as u64)
         .sum();
-    if !fetch_semantics && response.version() < http::Version::HTTP_2 {
+    if !undici_head && response.version() < http::Version::HTTP_2 {
         count += match response.extensions().get::<hyper::ext::ReasonPhrase>() {
             Some(reason) => reason.as_bytes().len(),
             None => response
@@ -672,7 +999,7 @@ pub(super) fn response_head_overflow(
     if count < limit {
         return None;
     }
-    Some(if fetch_semantics {
+    Some(if undici_head {
         OpOutcome::node_failed("UND_ERR_HEADERS_OVERFLOW", "Headers Overflow Error")
     } else {
         OpOutcome::node_failed("HPE_HEADER_OVERFLOW", "Parse Error: Header overflow")
@@ -717,6 +1044,24 @@ fn latin1(bytes: &[u8]) -> String {
     bytes.iter().map(|&b| char::from(b)).collect()
 }
 
+/// The reason phrase of `response`'s status line, as node reports it in
+/// `statusText` / `statusMessage`: the one the server sent, an empty one
+/// included (#160). hyper keeps a phrase that is not the status code's
+/// canonical one as an extension, so without the extension the canonical
+/// phrase IS what was on the wire. HTTP/2 has no reason phrase, and node has
+/// no answer to copy (its fetch never negotiates h2): the canonical phrase
+/// stands in there.
+pub(super) fn reason_phrase<B>(response: &http::Response<B>) -> String {
+    match response.extensions().get::<hyper::ext::ReasonPhrase>() {
+        Some(reason) => latin1(reason.as_bytes()),
+        None => response
+            .status()
+            .canonical_reason()
+            .unwrap_or_default()
+            .to_string(),
+    }
+}
+
 /// The payload for the final response; its body goes into `bodies`.
 fn respond(
     mut state: LoopState,
@@ -725,6 +1070,7 @@ fn respond(
     ids: &AtomicU64,
 ) -> OpOutcome {
     let status = response.status();
+    let reason = reason_phrase(&response);
     let conn = response.extensions().get::<ConnInfo>().cloned();
     let codings = if state.decode {
         let encodings: Vec<&[u8]> = response
@@ -747,8 +1093,9 @@ fn respond(
         None
     };
     // Divergence #32: a decoded body loses content-encoding and
-    // content-length (node keeps both). http.request shares this op and
-    // would decode a second time from the header.
+    // content-length (node's fetch keeps both). http.request shares this op
+    // but asks for no decoding, so it sees both headers and the encoded
+    // bytes, as node's does.
     let strip = codings.is_some();
     let headers: Vec<(String, String)> = response
         .headers()
@@ -760,18 +1107,27 @@ fn respond(
     let mut url = state.current;
     url.set_fragment(None);
     let handle = ids.fetch_add(1, Ordering::Relaxed);
-    let body = FetchBody::new(response.into_body(), codings.as_deref());
+    let framing = super::body::Framing::of(response.version(), response.headers());
+    let body = FetchBody::new(response.into_body(), codings.as_deref())
+        .with_framing(framing)
+        .timed(state.body_timeout)
+        // A close mid-body carries the connection's facts (undici's
+        // SocketError; http.request makes it node's `aborted`).
+        .on_conn(conn.clone())
+        // http.request (the one caller that reads the body undecoded) fills
+        // its response's trailers from the body's trailer section.
+        .keeping_trailers(!state.decode);
     lock(bodies).insert(handle, body);
     let mut payload = serde_json::json!({
         "status": status.as_u16(),
-        "statusText": status.canonical_reason().unwrap_or_default(),
+        "statusText": reason,
         "url": url.as_str(),
         "redirected": state.hops > 0,
         "headers": headers,
         "bodyHandle": handle,
     });
-    if let Some(conn) = conn {
-        conn_payload(&mut payload, &conn);
+    if let Some(conn) = &conn {
+        conn_payload(&mut payload, conn);
     }
     OpOutcome::Json(payload.to_string())
 }
@@ -787,6 +1143,16 @@ fn conn_payload(payload: &mut serde_json::Value, conn: &ConnInfo) {
     }
     if let Some(local) = conn.local {
         socket.insert("localAddr".to_string(), crate::tcp::addr_to_json(local));
+    }
+    // What `req.socket.destroy()` / `resetAndDestroy()` close it by
+    // (`__oam.fetchConnClose`).
+    if let Some(connection) = conn.connection {
+        socket.insert("connection".to_string(), connection.into());
+    }
+    // Which checkout of it this response came on: the close is refused once
+    // another request has taken the connection.
+    if let Some(lease) = conn.lease {
+        socket.insert("lease".to_string(), lease.into());
     }
     payload["socket"] = serde_json::Value::Object(socket);
     if let Some(tls) = &conn.tls {

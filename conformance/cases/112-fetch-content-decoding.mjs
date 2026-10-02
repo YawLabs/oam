@@ -19,8 +19,7 @@
 // content-length. oam strips content-encoding and content-length from a
 // DECODED response (divergence #32), so those headers are printed only where
 // node and oam both keep them: undecoded bodies and HEAD / 204 / 304. A decode
-// failure is printed as `rejected` only: node's is a TypeError "terminated",
-// oam's a plain Error.
+// failure is printed as `rejected` only; what it rejects with is case 210's.
 //
 // `/junk` (a valid gzip member followed by bytes that are not one) has no
 // content-length and the server holds its close for 250 ms, so the decode

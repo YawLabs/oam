@@ -210,6 +210,46 @@ pub enum CloseReason {
     /// headersTimeout / requestTimeout: answer 408 when no response head went
     /// out, then close.
     RequestTimeout,
+    /// `socket.resetAndDestroy()`: close with a reset (SO_LINGER 0), so the
+    /// peer's read fails with ECONNRESET and nothing unsent is delivered --
+    /// not even a 408 a request timeout asked for.
+    Reset,
+}
+
+/// A server connection's stream, as [`CloseReason::Reset`] closes it: armed
+/// so that the close which follows sends a reset rather than a FIN. Through
+/// TLS it is the TCP socket underneath that is armed, as node's
+/// resetAndDestroy() on the plain socket of an https connection resets it.
+pub trait AbortiveClose {
+    fn arm_reset(&self);
+}
+
+impl AbortiveClose for tokio::net::TcpStream {
+    fn arm_reset(&self) {
+        crate::tcp::arm_reset(self);
+    }
+}
+
+impl AbortiveClose for tokio_rustls::server::TlsStream<crate::tls::server::ServerIo> {
+    fn arm_reset(&self) {
+        crate::tcp::arm_reset(self.get_ref().0.tcp());
+    }
+}
+
+/// An in-memory pipe (the tests' connections): there is no socket to reset,
+/// and dropping it is the only close it has.
+impl AbortiveClose for tokio::io::DuplexStream {
+    fn arm_reset(&self) {}
+}
+
+/// Drop a connection's stream that is being closed without hyper -- refused
+/// from a `'connection'` listener, or never served -- with the reset a
+/// `socket.resetAndDestroy()` asked for.
+pub fn close_unserved<S: AbortiveClose>(stream: S, watch: &ConnWatch) {
+    if watch.close_reason() == Some(CloseReason::Reset) {
+        stream.arm_reset();
+    }
+    drop(stream);
 }
 
 /// A socket timeout that fired (node's socket 'timeout').
@@ -289,6 +329,54 @@ pub struct ConnWatch {
     /// upgrade) waits for them, or they would be lost with hyper's buffer.
     unflushed: AtomicBool,
     flushed: Notify,
+    /// What failed the connection, as node's socket reports it
+    /// (socketOnError) before it closes with `true`: the first one.
+    failure: Mutex<Option<ConnFailure>>,
+    /// Request-body pumps still running on this connection
+    /// ([`ConnWatch::pump_started`]).
+    pumps: AtomicUsize,
+    pumps_notify: Notify,
+}
+
+/// A connection's failure, as node's socket reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnFailure {
+    /// The peer reset it under a read: `read <code>`, with the code and its
+    /// errno (`crate::node_error_code` / `crate::node_errno`).
+    Reset {
+        code: &'static str,
+        errno: Option<i32>,
+    },
+    /// The request body's parser refused it: llhttp's code and message
+    /// (`HPE_INVALID_CHUNK_SIZE`, `HPE_INVALID_EOF_STATE`).
+    Parse {
+        code: &'static str,
+        message: &'static str,
+    },
+}
+
+impl ConnFailure {
+    /// The fields JS builds the socket's error from.
+    pub fn to_json(self) -> serde_json::Value {
+        match self {
+            ConnFailure::Reset { code, errno } => {
+                serde_json::json!({ "code": code, "errno": errno, "syscall": "read" })
+            }
+            ConnFailure::Parse { code, message } => {
+                serde_json::json!({ "code": code, "message": message, "parse": true })
+            }
+        }
+    }
+}
+
+/// Held by a request-body pump while it runs ([`ConnWatch::pump_started`]).
+pub struct PumpGuard(Arc<ConnWatch>);
+
+impl Drop for PumpGuard {
+    fn drop(&mut self) {
+        self.0.pumps.fetch_sub(1, Ordering::AcqRel);
+        self.0.pumps_notify.notify_waiters();
+    }
 }
 
 impl ConnWatch {
@@ -326,6 +414,9 @@ impl ConnWatch {
             dispatch_notify: Notify::new(),
             unflushed: AtomicBool::new(false),
             flushed: Notify::new(),
+            failure: Mutex::new(None),
+            pumps: AtomicUsize::new(0),
+            pumps_notify: Notify::new(),
         })
     }
 
@@ -363,6 +454,63 @@ impl ConnWatch {
     /// Bytes arrived. The first byte of a request starts its clock again
     /// (node's `on_message_begin` resets the start the accept set), and the
     /// first byte after a request was all in begins the next one.
+    /// A read failed. A reset is kept (the first one) for the connection's
+    /// close to report; hyper itself treats a reset between requests as the
+    /// connection ending, and says nothing of it.
+    pub fn note_read_error(&self, error: &io::Error) {
+        if error.kind() != io::ErrorKind::ConnectionReset {
+            return;
+        }
+        let code = crate::node_error_code(error);
+        self.note_failure(ConnFailure::Reset {
+            code,
+            errno: crate::node_errno(code, error),
+        });
+    }
+
+    /// Keep what failed the connection, unless something already did.
+    pub fn note_failure(&self, failure: ConnFailure) {
+        let mut slot = self.failure.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(failure);
+        }
+    }
+
+    /// What failed this connection, if anything did.
+    pub fn failure(&self) -> Option<ConnFailure> {
+        *self.failure.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A request-body pump starts on this connection; it counts until the
+    /// guard drops.
+    pub fn pump_started(self: &Arc<Self>) -> PumpGuard {
+        self.pumps.fetch_add(1, Ordering::AcqRel);
+        PumpGuard(Arc::clone(self))
+    }
+
+    /// Once hyper's side of the connection is over, its body pumps take
+    /// what hyper left in their bodies at once -- a parse error the body
+    /// failed with is noted ([`ConnWatch::note_failure`]) before the
+    /// connection's close is reported, so the close carries it. A pump
+    /// held up by a handler that does not read is waited for no longer
+    /// than `budget`.
+    pub async fn pumps_settled(&self, budget: Duration) {
+        let deadline = tokio::time::sleep(budget);
+        tokio::pin!(deadline);
+        loop {
+            let notified = self.pumps_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.pumps.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            tokio::select! {
+                () = &mut notified => {}
+                () = &mut deadline => return,
+            }
+        }
+    }
+
     pub fn note_read(&self, n: usize) {
         if n == 0 {
             return;
@@ -669,13 +817,16 @@ impl ConnWatch {
 
 /// Close a connection whose hyper side is gone: for a request timeout,
 /// node's 408 first when `may_answer` (no response head went out; read
-/// before hyper's side was dropped, which ends the response).
-pub async fn finish_close<S: AsyncWrite + Unpin>(
+/// before hyper's side was dropped, which ends the response); for a reset,
+/// SO_LINGER 0 so the drop sends RST.
+pub async fn finish_close<S: AsyncWrite + AbortiveClose + Unpin>(
     mut stream: S,
     reason: CloseReason,
     may_answer: bool,
 ) {
-    if reason == CloseReason::RequestTimeout && may_answer {
+    if reason == CloseReason::Reset {
+        stream.arm_reset();
+    } else if reason == CloseReason::RequestTimeout && may_answer {
         let _ = tokio::time::timeout(FAREWELL_BUDGET, async {
             stream.write_all(REQUEST_TIMEOUT_RESPONSE).await?;
             stream.shutdown().await
@@ -708,8 +859,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for WatchedIo<S> {
     ) -> Poll<io::Result<()>> {
         let before = buf.filled().len();
         let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &polled {
-            self.watch.note_read(buf.filled().len() - before);
+        match &polled {
+            Poll::Ready(Ok(())) => self.watch.note_read(buf.filled().len() - before),
+            Poll::Ready(Err(error)) => self.watch.note_read_error(error),
+            Poll::Pending => {}
         }
         polled
     }
@@ -1011,6 +1164,75 @@ mod tests {
         assert_eq!(
             w.closed(CloseReason::Destroy).await,
             CloseReason::RequestTimeout
+        );
+        // resetAndDestroy() overrides them all -- even a 408 that was due --
+        // and nothing after it takes it back.
+        w.close(CloseReason::Reset);
+        w.close(CloseReason::RequestTimeout);
+        assert_eq!(w.closed(CloseReason::End).await, CloseReason::Reset);
+    }
+
+    /// A peer of a connection `stream`, reading to the end on a thread of
+    /// its own; it reports how that read ended.
+    async fn accepted_with_peer() -> (
+        tokio::net::TcpStream,
+        std::sync::mpsc::Receiver<io::Result<usize>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut peer = std::net::TcpStream::connect(addr).unwrap();
+            let mut all = Vec::new();
+            let _ = tx.send(std::io::Read::read_to_end(&mut peer, &mut all).map(|_| all.len()));
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        (stream, rx)
+    }
+
+    async fn peer_read_ended(
+        rx: std::sync::mpsc::Receiver<io::Result<usize>>,
+    ) -> io::Result<usize> {
+        tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(30)))
+            .await
+            .unwrap()
+            .expect("the peer's read never ended")
+    }
+
+    /// A connection that a `'connection'` listener reset is dropped with
+    /// SO_LINGER 0: the client's read fails with ECONNRESET. One destroyed
+    /// the ordinary way ends with a FIN.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unserved_connection_closes_the_way_js_asked() {
+        let (stream, peer) = accepted_with_peer().await;
+        let w = watch(TimeoutSettings::default());
+        w.close(CloseReason::Reset);
+        close_unserved(stream, &w);
+        let ended = peer_read_ended(peer).await;
+        assert_eq!(
+            ended.as_ref().map_err(io::Error::kind).err(),
+            Some(io::ErrorKind::ConnectionReset),
+            "{ended:?}"
+        );
+
+        let (stream, peer) = accepted_with_peer().await;
+        let w = watch(TimeoutSettings::default());
+        w.close(CloseReason::Destroy);
+        close_unserved(stream, &w);
+        assert_eq!(peer_read_ended(peer).await.unwrap(), 0, "an orderly end");
+    }
+
+    /// finish_close() on a reset: nothing more is written -- not the 408 a
+    /// request timeout would send -- and the close is a reset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reset_connection_finishes_with_an_rst() {
+        let (stream, peer) = accepted_with_peer().await;
+        finish_close(stream, CloseReason::Reset, true).await;
+        let ended = peer_read_ended(peer).await;
+        assert_eq!(
+            ended.as_ref().map_err(io::Error::kind).err(),
+            Some(io::ErrorKind::ConnectionReset),
+            "{ended:?}"
         );
     }
 }

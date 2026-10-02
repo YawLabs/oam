@@ -17,9 +17,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use common::*;
 use hyper_util::client::proxy::matcher::Matcher;
-use oam_core::http_client::body::{self, BODY_READ_FAILED, FetchBodies};
+use oam_core::http_client::body::{self, FetchBodies};
 use oam_core::http_client::decode::OUT_CAP;
-use oam_core::http_client::redirect::{BAD_SCHEME, CREDENTIALS, INVALID_URL};
+use oam_core::http_client::redirect::{BAD_SCHEME, CREDENTIALS, UNREPLAYABLE_BODY};
 use oam_core::http_client::send::{self, FetchContinuations, FetchRequest};
 use oam_core::http_client::{HttpTransport, NetCheck, NetTarget, ProxySource};
 use oam_core::{AccessDenial, BodyCancelSignal, CancelledBodies, OpOutcome, OutboundBodies};
@@ -71,6 +71,7 @@ impl Reg {
             self.outbound.clone(),
             self.continuations.clone(),
             self.net_check.clone(),
+            None,
         )
         .await
     }
@@ -96,7 +97,8 @@ impl Reg {
         .await
     }
 
-    /// Every chunk to the end, or the failure text.
+    /// Every chunk to the end, or the failure: its text, or `code: message`
+    /// for a coded one.
     async fn chunks(&self, handle: u64) -> Result<Vec<Vec<u8>>, String> {
         let mut chunks = Vec::new();
         loop {
@@ -107,6 +109,9 @@ impl Reg {
                 }
                 OpOutcome::Done => return Ok(chunks),
                 OpOutcome::Failed(text) => return Err(text),
+                OpOutcome::NodeFailed { code, message, .. } => {
+                    return Err(format!("{code}: {message}"));
+                }
                 other => panic!("{other:?}"),
             }
         }
@@ -208,6 +213,18 @@ fn failed(outcome: OpOutcome) -> String {
     }
 }
 
+/// The socket of undici's `other side closed`: the peer closed the
+/// connection under the request.
+fn closed_by_peer(outcome: OpOutcome) -> oam_core::SocketFacts {
+    match outcome {
+        OpOutcome::SocketClosed { message, socket } => {
+            assert_eq!(message, "other side closed");
+            socket
+        }
+        other => panic!("expected the peer's close, got {other:?}"),
+    }
+}
+
 fn handle_of(payload: &Value) -> u64 {
     payload["bodyHandle"].as_u64().unwrap()
 }
@@ -296,6 +313,39 @@ fn chunk(data: &[u8]) -> Vec<u8> {
 
 // ---------------------------------------------------------------- payload
 
+/// `statusText` is the reason phrase the server sent (#160): a custom one,
+/// one for a status code that has no canonical phrase, an empty one and a
+/// missing one -- node's `statusText` / `statusMessage` for each, measured on
+/// v22.22.2. It used to be the status code's canonical phrase whatever the
+/// wire said.
+#[tokio::test(flavor = "multi_thread")]
+async fn status_text_is_the_reason_phrase_on_the_wire() {
+    within(async {
+        for (line, status, expected) in [
+            ("200 Custom Reason", 200, "Custom Reason"),
+            ("200 OK", 200, "OK"),
+            ("299 Whatever", 299, "Whatever"),
+            ("404 Nope Not Here", 404, "Nope Not Here"),
+            ("404 not found", 404, "not found"),
+            ("200 ", 200, ""),
+            ("200", 200, ""),
+        ] {
+            let server = serve_replies(move |_| {
+                format!("HTTP/1.1 {line}\r\ncontent-length: 2\r\nconnection: close\r\n\r\nhi")
+                    .into_bytes()
+            })
+            .await;
+            let reg = Reg::new();
+            let url = format!("http://127.0.0.1:{}/", server.port);
+            let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+            assert_eq!(p["status"], status, "{line:?}");
+            assert_eq!(p["statusText"], expected, "{line:?}");
+            assert_eq!(reg.text(handle_of(&p)).await, "hi");
+        }
+    })
+    .await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn payload_shape() {
     within(async {
@@ -308,7 +358,8 @@ async fn payload_shape() {
         let url = format!("http://u:p@127.0.0.1:{}/x?y#frag", server.port);
         let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
         assert_eq!(p["status"], 200);
-        assert_eq!(p["statusText"], "OK");
+        // The phrase on the wire, not the status code's canonical one (#160).
+        assert_eq!(p["statusText"], "Custom Reason");
         assert_eq!(
             p["url"],
             format!("http://127.0.0.1:{}/x?y", server.port).as_str()
@@ -503,11 +554,11 @@ async fn a_request_on_a_closed_pooled_connection_is_sent_again() {
         // cannot know the server ignored it (RFC 9110 s9.2.2, idempotent
         // methods only).
         let_the_pool_settle().await;
-        let text = failed(
+        let socket = closed_by_peer(
             reg.fetch(&transport, json!({ "url": &url, "method": "POST" }))
                 .await,
         );
-        assert_eq!(text, format!("error sending request for url ({url})"));
+        assert_eq!(socket.remote_port, Some(server.port));
         assert_eq!(server.accepts(), 2, "no fresh connection for a POST");
     })
     .await;
@@ -566,8 +617,8 @@ async fn a_stale_resend_is_sent_once() {
         fill_the_pool(&reg, &transport, &url, 2).await;
         assert_eq!(server.accepts(), 2);
 
-        let text = failed(reg.fetch(&transport, json!({ "url": &url })).await);
-        assert_eq!(text, format!("error sending request for url ({url})"));
+        let socket = closed_by_peer(reg.fetch(&transport, json!({ "url": &url })).await);
+        assert_eq!(socket.remote_port, Some(server.port));
         assert_eq!(server.accepts(), 2, "no connection was dialled");
         assert_eq!(
             server.seen().len(),
@@ -608,10 +659,141 @@ async fn a_pooled_connection_that_closes_mid_head_is_not_resent() {
         let_the_pool_settle().await;
         assert_eq!(server.accepts(), 1);
 
-        let text = failed(reg.fetch(&transport, json!({ "url": &url })).await);
-        assert_eq!(text, format!("error sending request for url ({url})"));
+        // undici's socket facts: the connection's two ends and every byte it
+        // has carried -- the first response (40 bytes) and the 27 of the
+        // second head that arrived.
+        let socket = closed_by_peer(reg.fetch(&transport, json!({ "url": &url })).await);
+        assert_eq!(socket.remote_address.as_deref(), Some("127.0.0.1"));
+        assert_eq!(socket.remote_port, Some(server.port));
+        assert_eq!(socket.remote_family.as_deref(), Some("IPv4"));
+        assert_eq!(socket.local_address.as_deref(), Some("127.0.0.1"));
+        assert!(socket.local_port.is_some_and(|port| port != 0));
+        assert_eq!(socket.bytes_read, Some(40 + 27));
+        assert!(socket.bytes_written.is_some_and(|written| written > 0));
         assert_eq!(server.accepts(), 1, "no resend dialled afresh");
         assert_eq!(server.seen().len(), 2, "the GET reached the server once");
+    })
+    .await;
+}
+
+/// The body's one byte (`x`) the server of [`ends_mid_body`] sent.
+fn assert_one_byte(outcome: OpOutcome) {
+    match outcome {
+        OpOutcome::Bytes(chunk) => assert_eq!(chunk, b"x"),
+        other => panic!("expected the body's first byte, got {other:?}"),
+    }
+}
+
+/// A server that sends the head of a 100-byte body and one byte of it, then
+/// closes the connection -- with a reset when `reset`.
+async fn ends_mid_body(reset: bool) -> Server {
+    serve(move |mut conn, _, _| async move {
+        if conn.request().await.is_none() {
+            return;
+        }
+        conn.send(b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nx")
+            .await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        if reset {
+            socket2::SockRef::from(&conn.io)
+                .set_linger(Some(Duration::ZERO))
+                .unwrap();
+        }
+        drop(conn);
+    })
+    .await
+}
+
+/// A body whose connection the server closes before its end fails the read
+/// the way undici's does: `other side closed`, with the socket it was on --
+/// its two ends and the bytes it carried (the 40-byte head and one byte of
+/// body). Up to 0.17.1 this was `fetch: body read failed: error decoding
+/// response body`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_the_server_closes_under_is_the_peers_close() {
+    within(async {
+        let server = ends_mid_body(false).await;
+        let reg = Reg::new();
+        let url = format!("http://127.0.0.1:{}/", server.port);
+        let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+        let handle = handle_of(&p);
+        assert_one_byte(reg.read(handle).await);
+        let socket = closed_by_peer(reg.read(handle).await);
+        assert_eq!(socket.remote_port, Some(server.port));
+        assert_eq!(socket.bytes_read, Some(40 + 1));
+    })
+    .await;
+}
+
+/// A body whose connection the server resets before its end fails the read
+/// with the socket's own error, node's `read ECONNRESET` (errno, code,
+/// syscall), which fetch makes the cause of its `terminated`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_the_server_resets_under_is_read_econnreset() {
+    within(async {
+        let server = ends_mid_body(true).await;
+        let reg = Reg::new();
+        let url = format!("http://127.0.0.1:{}/", server.port);
+        let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+        let handle = handle_of(&p);
+        assert_one_byte(reg.read(handle).await);
+        match reg.read(handle).await {
+            OpOutcome::NodeFailed {
+                code,
+                message,
+                syscall,
+                errno,
+                ..
+            } => {
+                assert_eq!(code, "ECONNRESET");
+                assert_eq!(message, "read ECONNRESET");
+                assert_eq!(syscall.as_deref(), Some("read"));
+                assert!(errno.is_some());
+            }
+            other => panic!("expected read ECONNRESET, got {other:?}"),
+        }
+    })
+    .await;
+}
+
+/// A chunked body whose next chunk-size line is malformed fails the read
+/// with node's parser error on the shared transport too (fetch and an
+/// option-less http.get read their bodies here): `HPE_INVALID_CHUNK_SIZE`,
+/// which http.request emits on the request and fetch wraps as undici's
+/// HTTPParserError. Up to 0.17.1 only an agent's body said so; this one
+/// was `fetch: body read failed: error decoding response body`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_malformed_chunk_on_the_shared_transport_is_the_parsers_error() {
+    within(async {
+        let server = serve(move |mut conn, _, _| async move {
+            if conn.request().await.is_none() {
+                return;
+            }
+            conn.send(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n1\r\nx\r\n")
+                .await;
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            conn.send(b"zz\r\n").await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        })
+        .await;
+        let reg = Reg::new();
+        let url = format!("http://127.0.0.1:{}/", server.port);
+        let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+        let handle = handle_of(&p);
+        assert_one_byte(reg.read(handle).await);
+        match reg.read(handle).await {
+            OpOutcome::NodeFailed { code, message, .. } => {
+                // undici's sentence (fetch-errors' body.rs): fetch makes it the
+                // HTTPParserError cause, and http.request turns it into
+                // node's `Parse Error: Invalid character in chunk size`.
+                assert_eq!(code, "HPE_INVALID_CHUNK_SIZE");
+                assert_eq!(
+                    message,
+                    "Response does not match the HTTP/1.1 protocol (Invalid character in chunk size)"
+                );
+            }
+            other => panic!("expected HPE_INVALID_CHUNK_SIZE, got {other:?}"),
+        }
     })
     .await;
 }
@@ -720,6 +902,238 @@ fn a_pooled_connection_whose_fin_has_arrived_is_not_written_to() {
         [0, 1],
         "one POST per connection: the closed one never read the second"
     );
+}
+
+/// One request head (and its content-length body) off an async stream, or
+/// `None` at EOF.
+async fn read_request_async<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Option<String> {
+    use tokio::io::AsyncReadExt as _;
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+            let len = head
+                .lines()
+                .find_map(|l| {
+                    let (name, value) = l.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if buf.len() >= end + 4 + len {
+                return Some(head);
+            }
+        }
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+/// undici's headersTimeout runs only while a connection has the request. A
+/// pooled TLS connection the server has closed hands the request back
+/// unsent (as in the test above), and the pool re-dials: that dial's TLS
+/// handshake, held here for longer than the limit, counts for nothing, and
+/// the limit starts again at the fresh connection's checkout. node + undici
+/// re-queue such a request with no timer and arm a new one on the socket
+/// that next carries it. Before the fix the limit started at the first
+/// checkout kept running through the re-dial and failed the POST with
+/// UND_ERR_HEADERS_TIMEOUT though the origin answered at once.
+#[test]
+fn the_headers_timeout_stops_while_an_unsent_request_is_re_dialled() {
+    use tokio::io::AsyncWriteExt as _;
+    const LIMIT_MS: u64 = 250;
+    install_provider();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (close_tx, close_rx) = tokio::sync::oneshot::channel::<()>();
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel::<()>();
+    let seen = Arc::new(Mutex::new(Vec::<usize>::new()));
+    let server = {
+        let seen = seen.clone();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let acceptor = tls_acceptor(&[b"http/1.1"]);
+                let answer = b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok";
+                // Connection 0: answer one request (so it is pooled), then
+                // close it -- close_notify and FIN -- on the test's signal.
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut first = acceptor.accept(tcp).await.unwrap();
+                if read_request_async(&mut first).await.is_some() {
+                    seen.lock().unwrap().push(0);
+                    first.write_all(answer).await.unwrap();
+                    first.flush().await.unwrap();
+                }
+                close_rx.await.unwrap();
+                let _ = first.shutdown().await;
+                drop(first);
+                closed_tx.send(()).unwrap();
+                // Connection 1, the re-dial: its handshake waits past the
+                // limit, then whatever comes next is answered at once.
+                let (tcp, _) = listener.accept().await.unwrap();
+                tokio::time::sleep(Duration::from_millis(LIMIT_MS * 2)).await;
+                let mut second = acceptor.accept(tcp).await.unwrap();
+                while read_request_async(&mut second).await.is_some() {
+                    seen.lock().unwrap().push(1);
+                    second.write_all(answer).await.unwrap();
+                    second.flush().await.unwrap();
+                }
+            });
+        })
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .event_interval(1024)
+        .build()
+        .unwrap();
+    runtime.block_on(within(async {
+        let transport = plain();
+        let reg = Reg::new();
+        let url = format!("https://localhost:{port}/p");
+        let post = json!({
+            "url": &url,
+            "method": "POST",
+            "body": "x",
+            "headers_timeout_ms": LIMIT_MS,
+        });
+        let p = payload(reg.fetch(&transport, post.clone()).await);
+        assert_eq!(reg.text(handle_of(&p)).await, "ok");
+        let_the_pool_settle().await;
+
+        // The server closes; this thread blocks, so nothing polls the
+        // reactor until the POST below has been handed to the connection.
+        close_tx.send(()).unwrap();
+        closed_rx.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let outcome = reg.fetch(&transport, post).await;
+        let p = payload(outcome);
+        assert_eq!(p["status"], 200);
+        assert_eq!(reg.text(handle_of(&p)).await, "ok");
+    }));
+    drop(runtime);
+    server.join().unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [0, 1],
+        "the closed connection never read the second POST: it went back unsent"
+    );
+}
+
+/// undici's `bodyTimeout` on a response body: a read that waits longer than
+/// the limit for bytes fails with `UND_ERR_BODY_TIMEOUT` and closes the
+/// connection, as undici destroys the socket; the bytes that came in time
+/// were delivered, and a body read with no limit is left alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_body_read_fails_after_the_body_timeout() {
+    within(async {
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let closed_tx = Arc::new(Mutex::new(Some(closed_tx)));
+        let server = serve(move |mut conn, _, _| {
+            let closed_tx = closed_tx.clone();
+            async move {
+                conn.request().await;
+                conn.send(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n")
+                    .await;
+                // Then nothing: the client has to give up on its own.
+                let closed = conn.closed_within(Duration::from_secs(5)).await;
+                if let Some(tx) = closed_tx.lock().unwrap().take() {
+                    let _ = tx.send(closed);
+                }
+            }
+        })
+        .await;
+        let transport = transport(ProxySource::None);
+        let reg = Reg::new();
+        const LIMIT_MS: u64 = 200;
+        let p = payload(
+            reg.fetch(
+                &transport,
+                json!({
+                    "url": format!("http://127.0.0.1:{}/", server.port),
+                    "body_timeout_ms": LIMIT_MS,
+                }),
+            )
+            .await,
+        );
+        let handle = handle_of(&p);
+        assert!(matches!(reg.read(handle).await, OpOutcome::Bytes(ref b) if b == b"hello"));
+        let start = std::time::Instant::now();
+        match reg.read(handle).await {
+            OpOutcome::NodeFailed { code, message, .. } => {
+                assert_eq!(code, "UND_ERR_BODY_TIMEOUT");
+                assert_eq!(message, "Body Timeout Error");
+            }
+            other => panic!("expected a body timeout, got {other:?}"),
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(LIMIT_MS) && elapsed < Duration::from_secs(3),
+            "{elapsed:?}"
+        );
+        assert!(closed_rx.await.unwrap(), "the connection was not closed");
+        assert!(
+            matches!(reg.read(handle).await, OpOutcome::Failed(ref t) if t.contains("is gone")),
+            "the timed-out body is gone"
+        );
+    })
+    .await;
+}
+
+/// undici's `bodyTimeout` counts from the last bytes off the wire, not from
+/// the start of a read: a gzip body trickled a byte at a time, every byte
+/// well inside the limit, is read whole although the header bytes decode to
+/// nothing and the body takes many limits in all. node v22.22.2 reads such a
+/// body; oam used to time one read out while the decoder was still taking
+/// the gzip header.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_body_timeout_restarts_with_every_frame_off_the_wire() {
+    within(async {
+        const GAP_MS: u64 = 40;
+        const LIMIT_MS: u64 = 250;
+        let compressed = gzip(b"hello world");
+        let total = Duration::from_millis(GAP_MS * compressed.len() as u64);
+        assert!(total > Duration::from_millis(3 * LIMIT_MS), "{total:?}");
+        let server = serve(move |mut conn, _, _| {
+            let compressed = compressed.clone();
+            async move {
+                conn.request().await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\n\r\n",
+                    compressed.len()
+                );
+                conn.send(head.as_bytes()).await;
+                for byte in compressed {
+                    tokio::time::sleep(Duration::from_millis(GAP_MS)).await;
+                    if !conn.send(&[byte]).await {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        let reg = Reg::new();
+        let p = payload(
+            reg.fetch(
+                &plain(),
+                json!({
+                    "url": format!("http://127.0.0.1:{}/", server.port),
+                    "body_timeout_ms": LIMIT_MS,
+                }),
+            )
+            .await,
+        );
+        assert_eq!(reg.text(handle_of(&p)).await, "hello world");
+    })
+    .await;
 }
 
 // ---------------------------------------------------------------- redirects
@@ -876,20 +1290,38 @@ async fn method_rewrite_matrix_on_the_wire() {
     .await;
 }
 
-/// A streamed body cannot be replayed: a 307 is returned as the response; a
-/// 302 turns the POST into a body-less GET and is followed.
+/// A streamed body cannot be replayed, so a fetch follows only a 303 (as a
+/// body-less GET): any other redirect fails it -- a 302 that would drop the
+/// body of a POST too (undici fetch/index.js:1273-1279, measured on node
+/// v22.22.2). For the callers that are not fetch (undici.request) a redirect
+/// that keeps the body is the response, and one that drops it -- a 302 on a
+/// POST, a 303 -- is followed as a body-less GET, as undici's
+/// RedirectHandler does.
 #[tokio::test(flavor = "multi_thread")]
 async fn streamed_body_redirects() {
     within(async {
         let server = serve_replies(|r| match r.head.target.as_str() {
             "/307" => response("307 Temporary Redirect", &[("location", "/after")], b""),
             "/302" => response("302 Found", &[("location", "/after")], b""),
+            "/303" => response("303 See Other", &[("location", "/after")], b""),
             _ => response("200 OK", &[], b"ok"),
         })
         .await;
         let reg = Reg::new();
         let t = plain();
-        for (status, want_status, want_redirected) in [("307", 307, false), ("302", 200, true)] {
+        // (status, fetch semantics, the status the caller sees or None for
+        // a failure, redirected)
+        // undici.request (not a fetch) hands every 3xx back for a Readable it
+        // has read (node v22.22.2 + undici 6.29.0, review 3 finding 9).
+        let cases = [
+            ("307", false, Some(307), false),
+            ("302", false, Some(302), false),
+            ("303", false, Some(303), false),
+            ("307", true, None, false),
+            ("302", true, None, false),
+            ("303", true, Some(200), true),
+        ];
+        for (status, fetch_semantics, want_status, want_redirected) in cases {
             let (handle, tx) = reg.channel(8);
             let outbound = reg.outbound.clone();
             let writer = tokio::spawn(async move {
@@ -897,29 +1329,53 @@ async fn streamed_body_redirects() {
                 drop(tx);
                 body::end_outbound(&outbound, handle);
             });
-            let p = payload(
-                reg.fetch(
+            let outcome = reg
+                .fetch(
                     &t,
                     json!({
                         "url": format!("http://127.0.0.1:{}/{status}", server.port),
                         "method": "POST",
                         "body_stream": handle,
+                        "fetch_semantics": fetch_semantics,
                     }),
                 )
-                .await,
-            );
+                .await;
             writer.await.unwrap();
-            assert_eq!(p["status"], want_status);
-            assert_eq!(p["redirected"], want_redirected);
-            reg.text(handle_of(&p)).await;
+            match want_status {
+                Some(want) => {
+                    let p = payload(outcome);
+                    assert_eq!(p["status"], want, "{status} fetch={fetch_semantics}");
+                    assert_eq!(p["redirected"], want_redirected);
+                    reg.text(handle_of(&p)).await;
+                }
+                None => assert_eq!(
+                    failed(outcome),
+                    UNREPLAYABLE_BODY,
+                    "{status} fetch={fetch_semantics}"
+                ),
+            }
             assert_eq!(reg.entry(handle), None, "entry left behind");
         }
         let seen = server.seen();
-        assert_eq!(seen.len(), 3);
+        let targets: Vec<_> = seen
+            .iter()
+            .map(|r| format!("{} {}", r.head.method, r.head.target))
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                "POST /307",
+                "POST /302",
+                "POST /303",
+                "POST /307",
+                "POST /302",
+                "POST /303",
+                "GET /after",
+            ]
+        );
         assert_eq!(seen[0].head.get("transfer-encoding"), Some("chunked"));
         assert_eq!(seen[0].body, b"abc");
-        assert_eq!(seen[2].head.method, "GET");
-        assert!(seen[2].body.is_empty());
+        assert!(seen[6].body.is_empty());
     })
     .await;
 }
@@ -959,6 +1415,188 @@ async fn initial_bad_port_only_under_fetch_semantics() {
             }
             other => panic!("{other:?}"),
         }
+    })
+    .await;
+}
+
+/// undici's connect timeout (#157): a request that carries
+/// `connect_timeout_ms` gives each connection it opens that long to be
+/// connected -- for https, handshaken -- and then fails with undici's
+/// `UND_ERR_CONNECT_TIMEOUT` and its message, which names the host and port
+/// the request asked for (node v22.22.2's text for the same server). A
+/// request without one (`http.request`) waits for as long as the peer does.
+/// The server accepts and never answers the ClientHello, so the connect is
+/// stuck in the handshake without depending on an unroutable address.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connect_that_outruns_the_connect_timeout_fails_as_undicis() {
+    within(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+        let reg = Reg::new();
+        let t = plain();
+        let timed_out = |outcome: OpOutcome| match outcome {
+            OpOutcome::NodeFailed { code, message, .. } => {
+                assert_eq!(code, "UND_ERR_CONNECT_TIMEOUT");
+                message
+            }
+            other => panic!("{other:?}"),
+        };
+
+        let url = format!("https://127.0.0.1:{port}/");
+        let started = std::time::Instant::now();
+        let message = timed_out(
+            reg.fetch(&t, json!({ "url": url, "connect_timeout_ms": 200 }))
+                .await,
+        );
+        assert_eq!(
+            message,
+            format!("Connect Timeout Error (attempted address: 127.0.0.1:{port}, timeout: 200ms)")
+        );
+        assert!(started.elapsed() >= Duration::from_millis(200));
+
+        // A host name the dispatcher's lookup hook resolved to one address
+        // is named as written, as net.connect's single-address connect is.
+        let url = format!("https://stall.test:{port}/");
+        let request = json!({ "url": url, "connect_timeout_ms": 200, "lookup_hook": true });
+        let (token, host, _) = lookup_of(reg.fetch(&t, request).await);
+        assert_eq!(host, "stall.test");
+        let message = timed_out(reg.resume(token, &["127.0.0.1"]).await);
+        assert_eq!(
+            message,
+            format!("Connect Timeout Error (attempted address: stall.test:{port}, timeout: 200ms)")
+        );
+
+        // No timeout of its own, or 0: still handshaking long after.
+        for request in [
+            json!({ "url": format!("https://127.0.0.1:{port}/") }),
+            json!({ "url": format!("https://127.0.0.1:{port}/"), "connect_timeout_ms": 0 }),
+        ] {
+            let pending = reg.fetch(&t, request);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(700), pending)
+                    .await
+                    .is_err(),
+                "a request with no connect timeout was failed by one"
+            );
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 4);
+    })
+    .await;
+}
+
+/// A fetch with no response head yet can be cancelled (#158): the request
+/// comes off the wire -- the server reads the end of the connection where it
+/// was still waiting to answer -- and the op fails as `ABORTED`. A cancel
+/// that lands before the op has run at all is kept, and nothing is dialled;
+/// one after the head finds nothing, and the registration is gone either
+/// way.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_fetch_leaves_the_wire() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    within(async {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let count = connections.clone();
+        // `/answer` is answered; anything else is held until the client
+        // leaves, which is reported on `left`.
+        let (arrived_tx, mut arrived) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (left_tx, mut left) = tokio::sync::mpsc::unbounded_channel::<()>();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                let arrived_tx = arrived_tx.clone();
+                let left_tx = left_tx.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&head).to_string();
+                    let path = head.split(' ').nth(1).unwrap_or_default().to_string();
+                    if path == "/answer" {
+                        let _ = stream
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                            .await;
+                    }
+                    let _ = arrived_tx.send(path);
+                    // The client closing (or resetting) the connection.
+                    while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {}
+                    let _ = left_tx.send(());
+                });
+            }
+        });
+        let reg = Reg::new();
+        let t = plain();
+        let cancels: send::FetchCancels = Arc::new(Mutex::new(HashMap::new()));
+        let start = |id: u64, path: &str| {
+            let request: FetchRequest =
+                serde_json::from_value(json!({ "url": format!("http://127.0.0.1:{port}{path}") }))
+                    .unwrap();
+            // Registered before the op is spawned, as the engine does.
+            let cancel = send::FetchCancel::register(&cancels, id);
+            tokio::spawn(send::fetch(
+                t.clone(),
+                request,
+                reg.bodies.clone(),
+                reg.ids.clone(),
+                reg.outbound.clone(),
+                reg.continuations.clone(),
+                None,
+                Some(cancel),
+            ))
+        };
+
+        // On the wire, no answer coming: the cancel ends it.
+        let op = start(1, "/held");
+        assert_eq!(arrived.recv().await.unwrap(), "/held");
+        assert!(send::fetch_cancel(1, &cancels));
+        assert_eq!(failed(op.await.unwrap()), send::ABORTED);
+        left.recv().await.unwrap();
+        assert!(cancels.lock().unwrap().is_empty());
+        assert!(!send::fetch_cancel(1, &cancels), "cancelled twice");
+
+        // Cancelled before the op was ever polled: nothing is dialled.
+        let request: FetchRequest =
+            serde_json::from_value(json!({ "url": format!("http://127.0.0.1:{port}/never") }))
+                .unwrap();
+        let cancel = send::FetchCancel::register(&cancels, 2);
+        assert!(send::fetch_cancel(2, &cancels));
+        let outcome = send::fetch(
+            t.clone(),
+            request,
+            reg.bodies.clone(),
+            reg.ids.clone(),
+            reg.outbound.clone(),
+            reg.continuations.clone(),
+            None,
+            Some(cancel),
+        )
+        .await;
+        assert_eq!(failed(outcome), send::ABORTED);
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        assert!(cancels.lock().unwrap().is_empty());
+
+        // Answered: the head ends the registration, and a late cancel does
+        // not touch the response.
+        let op = start(3, "/answer");
+        let value = payload(op.await.unwrap());
+        assert_eq!(arrived.recv().await.unwrap(), "/answer");
+        assert!(!send::fetch_cancel(3, &cancels));
+        assert_eq!(reg.text(handle_of(&value)).await, "ok");
     })
     .await;
 }
@@ -1007,11 +1645,15 @@ async fn invalid_and_non_http_locations() {
         port.store(server.port, Ordering::SeqCst);
         let reg = Reg::new();
         let t = plain();
-        for (path, want) in [
-            ("invalid", INVALID_URL),
-            ("ftp", BAD_SCHEME),
-            ("credentials", CREDENTIALS),
-        ] {
+        // An unparseable Location is not a rejection but a payload: the two
+        // strings of node's `new URL(location, base)` error, which JS builds.
+        // The base is the URL that answered, fragment included.
+        let url = format!("http://127.0.0.1:{}/invalid#frag", server.port);
+        assert_eq!(
+            payload(reg.fetch(&t, json!({ "url": url })).await),
+            json!({ "invalidLocation": { "input": "http://[::1", "base": url } })
+        );
+        for (path, want) in [("ftp", BAD_SCHEME), ("credentials", CREDENTIALS)] {
             let url = format!("http://127.0.0.1:{}/{path}", server.port);
             assert_eq!(failed(reg.fetch(&t, json!({ "url": url })).await), want);
         }
@@ -1275,10 +1917,279 @@ async fn gzip_then_junk_is_body_read_failed() {
         let reg = Reg::new();
         let url = format!("http://127.0.0.1:{}/", server.port);
         let p = payload(reg.fetch(&plain(), json!({ "url": url })).await);
+        // zlib's words for the junk read as the next member's header.
         assert_eq!(
             reg.chunks(handle_of(&p)).await,
-            Err(BODY_READ_FAILED.to_string())
+            Err("Z_DATA_ERROR: incorrect header check".to_string())
         );
+    })
+    .await;
+}
+
+/// A failed body read says what failed (#168), in the shape node's `cause`
+/// has: a corrupt encoding is the decoder's error (zlib: `Z_DATA_ERROR`,
+/// errno -3, no syscall), a connection that ends inside the body is undici's
+/// `UND_ERR_SOCKET` / `other side closed` -- under either framing, and with
+/// no decoding involved -- and a bad chunk-size line is undici's parser
+/// error. They used to be one text that blamed decoding for all of them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_body_read_says_what_failed() {
+    within(async {
+        let server = serve(|mut conn, _, _| async move {
+            let Some(request) = conn.request().await else {
+                return;
+            };
+            let reply: &[u8] = match request.head.target.as_str() {
+                // A back-reference to before the start of the output.
+                "/deflate" => {
+                    b"HTTP/1.1 200 OK\r\ncontent-encoding: deflate\r\ncontent-length: 4\r\n\r\n\x4b\x04\x12\x00"
+                }
+                "/short" => b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n0123456789",
+                "/chunked-short" => {
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n"
+                }
+                _ => b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\nZZ\r\n",
+            };
+            let reset = request.head.target == "/reset";
+            let reply = if reset {
+                &b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n0123456789"[..]
+            } else {
+                reply
+            };
+            conn.send(reply).await;
+            if reset {
+                // Let the client read what was sent, then close with an RST
+                // (linger 0) instead of a FIN.
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                socket2::SockRef::from(&conn.io)
+                    .set_linger(Some(Duration::ZERO))
+                    .unwrap();
+            }
+            // Dropping the connection closes it: the body ends early.
+        })
+        .await;
+        let reg = Reg::new();
+        let t = plain();
+        let read_to_failure = |path: &'static str| {
+            let reg = &reg;
+            let t = &t;
+            let url = format!("http://127.0.0.1:{}/{path}", server.port);
+            async move {
+                let p = payload(reg.fetch(t, json!({ "url": url })).await);
+                let handle = handle_of(&p);
+                loop {
+                    match reg.read(handle).await {
+                        OpOutcome::Bytes(_) => {}
+                        other => return other,
+                    }
+                }
+            }
+        };
+        match read_to_failure("deflate").await {
+            OpOutcome::NodeFailed {
+                code,
+                message,
+                errno,
+                syscall,
+                ..
+            } => {
+                assert_eq!(code, "Z_DATA_ERROR");
+                assert_eq!(errno, Some(-3));
+                assert_eq!(syscall, None);
+                // A copy from before the start of the output: the shared
+                // inflater tells it apart, so the message is node's.
+                assert_eq!(message, "invalid distance too far back");
+            }
+            other => panic!("{other:?}"),
+        }
+        for path in ["short", "chunked-short"] {
+            match read_to_failure(path).await {
+                // fetch's close mid-body: undici's SocketError, with the
+                // connection's facts (fu2/http-conn-close).
+                OpOutcome::SocketClosed { message, .. } => {
+                    assert_eq!(message, body::OTHER_SIDE_CLOSED, "{path}");
+                }
+                other => panic!("{path}: {other:?}"),
+            }
+        }
+        match read_to_failure("chunked-bad").await {
+            OpOutcome::NodeFailed { code, message, .. } => {
+                assert_eq!(code, body::BAD_CHUNK_SIZE_CODE);
+                assert_eq!(message, body::BAD_CHUNK_SIZE);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A reset inside the body is node's system error, not undici's
+        // SocketError (measured: `read ECONNRESET`, syscall `read`).
+        match read_to_failure("reset").await {
+            OpOutcome::NodeFailed {
+                code,
+                message,
+                errno,
+                syscall,
+                ..
+            } => {
+                assert_eq!(code, "ECONNRESET");
+                assert_eq!(message, "read ECONNRESET");
+                assert_eq!(syscall.as_deref(), Some("read"));
+                assert!(errno.is_some_and(|errno| errno < 0), "{errno:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+    })
+    .await;
+}
+
+/// A connection that ends inside the body of a response the server did not
+/// keep alive is what undici's socket 'end' handler makes of it (measured on
+/// node v22.22.2): the content-length mismatch for a content-length body,
+/// the end of the body for a chunked one -- not `other side closed`, which
+/// is the kept-alive response's. `Connection: close` and HTTP/1.0 both say
+/// so; HTTP/1.0 with `keep-alive` does not.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_cut_short_on_a_closing_connection_is_undicis_verdict() {
+    within(async {
+        let server = serve(|mut conn, _, _| async move {
+            let Some(request) = conn.request().await else {
+                return;
+            };
+            let reply: &[u8] = match request.head.target.as_str() {
+                "/cl-close" => {
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\nconnection: close\r\n\r\n0123456789"
+                }
+                "/cl-http10" => b"HTTP/1.0 200 OK\r\ncontent-length: 100\r\n\r\n0123456789",
+                "/cl-http10-keep-alive" => {
+                    b"HTTP/1.0 200 OK\r\ncontent-length: 100\r\nconnection: keep-alive\r\n\r\n0123456789"
+                }
+                "/chunked-close" => {
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: Keep-Alive, Close\r\n\r\n5\r\nhello\r\n"
+                }
+                _ => b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\nconnection: close\r\n\r\n0123456789",
+            };
+            conn.send(reply).await;
+        })
+        .await;
+        let reg = Reg::new();
+        let t = plain();
+        let read_all = |path: &'static str| {
+            let reg = &reg;
+            let t = &t;
+            let url = format!("http://127.0.0.1:{}/{path}", server.port);
+            async move {
+                let p = payload(reg.fetch(t, json!({ "url": url })).await);
+                let handle = handle_of(&p);
+                let mut got = Vec::new();
+                loop {
+                    match reg.read(handle).await {
+                        OpOutcome::Bytes(bytes) => got.extend(bytes),
+                        other => return (String::from_utf8(got).unwrap(), other),
+                    }
+                }
+            }
+        };
+        let code_of = |outcome: &OpOutcome| match outcome {
+            OpOutcome::NodeFailed { code, message, .. } => (code.clone(), message.clone()),
+            OpOutcome::SocketClosed { message, .. } => (body::SOCKET_CODE.to_string(), message.clone()),
+            OpOutcome::Done => ("done".to_string(), String::new()),
+            other => panic!("{other:?}"),
+        };
+        for path in ["cl-close", "cl-http10"] {
+            let (got, outcome) = read_all(path).await;
+            assert_eq!(got, "0123456789", "{path}");
+            assert_eq!(
+                code_of(&outcome),
+                (body::LENGTH_MISMATCH_CODE.to_string(), body::LENGTH_MISMATCH.to_string()),
+                "{path}"
+            );
+        }
+        let (_, outcome) = read_all("cl-http10-keep-alive").await;
+        assert_eq!(
+            code_of(&outcome),
+            (body::SOCKET_CODE.to_string(), body::OTHER_SIDE_CLOSED.to_string())
+        );
+        let (got, outcome) = read_all("chunked-close").await;
+        assert_eq!(got, "hello");
+        assert_eq!(
+            code_of(&outcome),
+            (body::ENDED_AT_CLOSE_CODE.to_string(), body::OTHER_SIDE_CLOSED.to_string())
+        );
+        // A body that arrived whole is not cut short.
+        let (got, outcome) = read_all("whole").await;
+        assert_eq!((got.as_str(), code_of(&outcome).0.as_str()), ("0123456789", "done"));
+    })
+    .await;
+}
+
+/// A TLS failure inside a response body -- here a record that does not
+/// decrypt -- is the connection ending there, as node's fetch reports it
+/// (measured on v22.22.2): `other side closed` on a kept-alive response, the
+/// content-length mismatch on one that is not kept. tokio-rustls reports
+/// it as an io error of kind InvalidData, which the body read used to take
+/// for a bad chunk-size line.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tls_failure_inside_a_body_is_the_connection_ending() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    within(async {
+        let acceptor = tls_acceptor(&[b"http/1.1"]);
+        let server = serve(move |conn, _, _| {
+            let acceptor = acceptor.clone();
+            async move {
+                let Ok(mut tls) = acceptor.accept(conn.io).await else {
+                    return;
+                };
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match tls.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let close = String::from_utf8_lossy(&head).starts_with("GET /close ");
+                let reply: &[u8] = if close {
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\nconnection: close\r\n\r\n0123456789"
+                } else {
+                    b"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\n0123456789"
+                };
+                if tls.write_all(reply).await.is_err() || tls.flush().await.is_err() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                // An application-data record that is not one: the client's
+                // decryption fails on it.
+                let (tcp, _) = tls.get_mut();
+                let mut record = vec![0x17, 0x03, 0x03, 0x00, 0x20];
+                record.extend_from_slice(&[0xa5; 0x20]);
+                let _ = tcp.write_all(&record).await;
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        })
+        .await;
+        let reg = Reg::new();
+        let t = plain();
+        for (path, want) in [
+            ("keep", (body::SOCKET_CODE, body::OTHER_SIDE_CLOSED)),
+            ("close", (body::LENGTH_MISMATCH_CODE, body::LENGTH_MISMATCH)),
+        ] {
+            let url = format!("https://127.0.0.1:{}/{path}", server.port);
+            let p = payload(reg.fetch(&t, json!({ "url": url })).await);
+            let handle = handle_of(&p);
+            let outcome = loop {
+                match reg.read(handle).await {
+                    OpOutcome::Bytes(_) => {}
+                    other => break other,
+                }
+            };
+            match outcome {
+                OpOutcome::NodeFailed { code, message, .. } => {
+                    assert_eq!((code.as_str(), message.as_str()), want, "{path}");
+                }
+                OpOutcome::SocketClosed { message, .. } => {
+                    assert_eq!((body::SOCKET_CODE, message.as_str()), want, "{path}");
+                }
+                other => panic!("{path}: {other:?}"),
+            }
+        }
     })
     .await;
 }
@@ -1717,6 +2628,9 @@ async fn outbound_entry_lifecycle() {
                 "url": format!("http://127.0.0.1:{}/", bad.port),
                 "method": "POST",
                 "body_stream": handle,
+                // A fetch: it reads the Location, which undici.request's
+                // redirect handler never does for a body it has read.
+                "fetch_semantics": true,
             }),
         );
         let ender = async move {
@@ -1741,7 +2655,7 @@ async fn outbound_entry_lifecycle() {
             drop(sender);
         };
         let (outcome, ()) = tokio::join!(fetch, ender);
-        assert_eq!(failed(outcome), INVALID_URL);
+        assert!(payload(outcome)["invalidLocation"].is_object());
         assert_eq!(reg.entry(handle), None);
     })
     .await;
@@ -2436,6 +3350,110 @@ async fn a_refusal_releases_a_streamed_body() {
 
 // ---------------------------------------------------------------- static
 
+/// `http.request`'s sent signal (#193): fired when the pool has a connection
+/// for the request -- while the response is still to come, on a fresh
+/// connection and on a pooled one -- and never for a request that got none:
+/// its wait ends with `Done` and the signal reads unfired. JS emits node's
+/// `'finish'` on the first and nothing on the second.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sent_signal_fires_with_the_connection_and_never_without_one() {
+    use oam_core::http_client::sent;
+    within(async {
+        // Holds its first answer until released.
+        let (release, held) = tokio::sync::oneshot::channel::<()>();
+        let held = Arc::new(tokio::sync::Mutex::new(Some(held)));
+        let server = serve(move |mut conn, _, _| {
+            let held = held.clone();
+            async move {
+                while conn.request().await.is_some() {
+                    let waiting = held.lock().await.take();
+                    if let Some(waiting) = waiting {
+                        let _ = waiting.await;
+                    }
+                    if !conn.send(&response("200 OK", &[], b"ok")).await {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        let reg = Reg::new();
+        let t = plain();
+        let signals: sent::SentSignals = Arc::new(Mutex::new(HashMap::new()));
+        let start = |handle: u64, url: String| {
+            sent::open(&signals, handle);
+            let mut request: FetchRequest =
+                serde_json::from_value(json!({ "url": url, "sent_signal": handle })).unwrap();
+            assert_eq!(request.sent_signal, Some(handle));
+            // The engine's fetch op does this: the sender is taken once.
+            request.dispatched = sent::take(&signals, handle);
+            assert!(request.dispatched.is_some());
+            assert!(sent::take(&signals, handle).is_none());
+            tokio::spawn(send::fetch(
+                t.clone(),
+                request,
+                reg.bodies.clone(),
+                reg.ids.clone(),
+                reg.outbound.clone(),
+                reg.continuations.clone(),
+                reg.net_check.clone(),
+                None,
+            ))
+        };
+        // Fired: the plain-TCP connection's id (what JS closes or resets
+        // before the head), or `true` for one the connector did not name.
+        let fired = |outcome: OpOutcome| {
+            matches!(outcome, OpOutcome::Json(ref text) if text == "true" || text.parse::<u64>().is_ok())
+        };
+        let url = format!("http://127.0.0.1:{}/", server.port);
+
+        // A fresh connection: fired while the answer is held back.
+        let fetch = start(1, url.clone());
+        assert!(fired(sent::wait(signals.clone(), 1).await));
+        assert!(!fetch.is_finished(), "answered before it was released");
+        release.send(()).unwrap();
+        let p = payload(fetch.await.unwrap());
+        assert_eq!(reg.text(handle_of(&p)).await, "ok");
+        assert!(sent::close(&signals, 1));
+        assert!(!sent::close(&signals, 1), "closed twice");
+
+        // The pooled connection: fired again, for this request's own signal.
+        let_the_pool_settle().await;
+        let fetch = start(2, url);
+        let p = payload(fetch.await.unwrap());
+        assert_eq!(reg.text(handle_of(&p)).await, "ok");
+        assert_eq!(server.accepts(), 1, "the second request dialled again");
+        assert!(fired(sent::wait(signals.clone(), 2).await));
+        assert!(sent::close(&signals, 2));
+
+        // Nothing listens: no connection, so no signal -- the wait ends when
+        // the failed fetch drops its sender.
+        let closed = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let fetch = start(3, format!("http://127.0.0.1:{closed}/"));
+        let waited = tokio::spawn(sent::wait(signals.clone(), 3));
+        assert!(!matches!(fetch.await.unwrap(), OpOutcome::Json(_)));
+        assert!(matches!(waited.await.unwrap(), OpOutcome::Done));
+        assert!(!sent::close(&signals, 3));
+
+        // A signal no fetch took: closing it ends its wait.
+        sent::open(&signals, 4);
+        let waited = tokio::spawn(sent::wait(signals.clone(), 4));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waited.is_finished());
+        assert!(!sent::close(&signals, 4));
+        assert!(matches!(waited.await.unwrap(), OpOutcome::Done));
+        assert!(matches!(
+            sent::wait(signals.clone(), 4).await,
+            OpOutcome::Done
+        ));
+        assert!(signals.lock().unwrap().is_empty());
+    })
+    .await;
+}
+
 fn assert_send<T: Send>() {}
 
 fn assert_op_future<F: std::future::Future + Send + 'static>(_: F) {}
@@ -2455,6 +3473,7 @@ fn static_checks() {
         reg.outbound.clone(),
         reg.continuations.clone(),
         reg.net_check.clone(),
+        None,
     ));
     assert_op_future(send::fetch_continue(
         1,

@@ -21,7 +21,7 @@ use crate::crypto_ops::{
     op_crypto_scrypt_sync, op_crypto_sign, op_crypto_sign_pss, op_crypto_timing_safe_equal,
     op_crypto_verify, op_crypto_verify_pss, op_crypto_x509_parse,
 };
-use crate::timers::{timer_immediate, timer_ref, timer_unref};
+use crate::timers::{timer_immediate, timer_pending, timer_ref, timer_unref};
 use crate::vm_context::{
     op_vm_compile, op_vm_create_context, op_vm_is_context, op_vm_run_in_context,
     op_vm_run_in_this_context,
@@ -211,6 +211,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("timerUnref", timer_unref),
         // setImmediate: due at once, never an OS timer wait.
         ("timerImmediate", timer_immediate),
+        // libuv's pending requests: the loop's next turn, ahead of timers
+        // and immediates (a shutdown finished in the call, reported later).
+        ("timerPending", timer_pending),
         // Inbound OS signals: install/remove native delivery of a Node signal
         // name (SIGTERM/SIGINT/SIGHUP/...). Gated JS-side on process
         // listenerCount so start fires on the FIRST listener and stop on the
@@ -253,13 +256,11 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fsReadlink", op_fs_readlink),
         ("fsLink", op_fs_link),
         ("fsChmod", op_fs_chmod),
-        ("fsTruncate", op_fs_truncate),
         // fs sync (new batch)
         ("fsSymlinkSync", op_fs_symlink_sync),
         ("fsReadlinkSync", op_fs_readlink_sync),
         ("fsLinkSync", op_fs_link_sync),
         ("fsChmodSync", op_fs_chmod_sync),
-        ("fsTruncateSync", op_fs_truncate_sync),
         ("fsMkdtempSync", op_fs_mkdtemp_sync),
         // fs streams (createReadStream/createWriteStream)
         ("fsOpen", op_fs_open),
@@ -314,6 +315,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpRespond", op_http_respond),
         ("httpRespondStream", op_http_respond_stream),
         ("httpBodyPush", op_http_body_push),
+        ("httpBodyTrailers", op_http_body_trailers),
         ("httpBodyEnd", op_http_body_end),
         ("httpStreamClosed", op_http_stream_closed),
         ("httpRequestBodyRead", op_http_request_body_read),
@@ -321,6 +323,9 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fetchBodyChannelWrite", op_fetch_body_channel_write),
         ("fetchBodyChannelEnd", op_fetch_body_channel_end),
         ("fetchBodyChannelCancel", op_fetch_body_channel_cancel),
+        ("fetchSentOpen", op_fetch_sent_open),
+        ("fetchSentWait", op_fetch_sent_wait),
+        ("fetchSentClose", op_fetch_sent_close),
         ("httpRequestBodyCancel", op_http_request_body_cancel),
         ("httpAbort", op_http_abort),
         ("httpClose", op_http_close),
@@ -331,6 +336,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpServerUpgrades", op_http_server_upgrades),
         ("httpConnSetTimeout", op_http_conn_set_timeout),
         ("httpConnDestroy", op_http_conn_destroy),
+        ("httpConnReset", op_http_conn_reset),
         ("httpConnResume", op_http_conn_resume),
         // --max-http-header-size / --insecure-http-parser, as the CLI set them
         ("httpMaxHeaderSize", op_http_max_header_size),
@@ -349,7 +355,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("httpBridgeStart", op_http_bridge_start),
         ("httpBridgeResponse", op_http_bridge_response),
         ("httpBridgeOut", op_http_bridge_out),
-        ("httpBridgeRequestSent", op_http_bridge_request_sent),
+        ("httpBridgeProgress", op_http_bridge_progress),
         ("httpBridgeIn", op_http_bridge_in),
         ("httpBridgeInEnd", op_http_bridge_in_end),
         ("httpBridgeClose", op_http_bridge_close),
@@ -365,6 +371,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("tcpRead", op_tcp_read),
         ("tcpWrite", op_tcp_write),
         ("tcpClose", op_tcp_close),
+        ("tcpReset", op_tcp_reset),
         ("tcpShutdown", op_tcp_shutdown),
         ("tcpListen", op_tcp_listen),
         ("tcpAccept", op_tcp_accept),
@@ -520,6 +527,70 @@ pub(crate) fn throw_type_error(scope: &mut v8::PinScope<'_, '_>, message: &str) 
     scope.throw_exception(exception);
 }
 
+/// A port, as argument `index` of a socket op: an integer from 0 to 65535,
+/// or nothing at all (undefined), which is 0 -- "any port" for a bind. JS
+/// validates the port as node does before it gets here (`validatePort` in
+/// node_compat.js); this is the backstop under it, so that no caller can
+/// reach a DIFFERENT port than the one it named. An `as u16` cast did just
+/// that (#163): it saturated 65536 and 70000 to 65535, truncated 1.5 to 1 and
+/// turned `'abc'` into 0, and the net grant was then asked about the wrong
+/// port too. Throws a RangeError and returns `None` for anything else.
+fn port_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+    op: &str,
+) -> Option<u16> {
+    let value = args.get(index);
+    if value.is_undefined() {
+        return Some(0);
+    }
+    match value.number_value(scope).and_then(port_from_number) {
+        Some(port) => Some(port),
+        None => {
+            let message = format!("{op}: the port must be an integer from 0 to 65535");
+            let message = v8::String::new(scope, &message).unwrap();
+            let exception = v8::Exception::range_error(scope, message);
+            scope.throw_exception(exception);
+            None
+        }
+    }
+}
+
+/// The port a JS number names, when it names one: no fraction, no NaN, no
+/// infinity, nothing below 0 or above 65535.
+fn port_from_number(n: f64) -> Option<u16> {
+    (n.fract() == 0.0 && (0.0..=65535.0).contains(&n)).then_some(n as u16)
+}
+
+#[cfg(test)]
+mod port_arg_tests {
+    use super::port_from_number;
+
+    /// #163: every value the old `as u16` cast turned into some OTHER port
+    /// is refused, and every port is itself.
+    #[test]
+    fn only_a_port_is_a_port() {
+        for (n, port) in [(0.0, 0), (-0.0, 0), (1.0, 1), (80.0, 80), (65535.0, 65535)] {
+            assert_eq!(port_from_number(n), Some(port), "{n}");
+        }
+        for n in [
+            -1.0,
+            65536.0,
+            70000.0,
+            1.5,
+            0.5,
+            65535.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            4294967376.0, // 2^32 + 80: wraps to 80 under a u32 cast
+        ] {
+            assert_eq!(port_from_number(n), None, "{n}");
+        }
+    }
+}
+
 /// Safely create a V8 string from a dynamic (possibly very large) Rust
 /// string. V8 rejects strings longer than ~1 GB; the fallback avoids a
 /// panic on the FFI boundary.
@@ -570,7 +641,21 @@ fn node_errno(code: &str, error: &std::io::Error) -> Option<i32> {
 /// with `path: ''` present. For an operation on a descriptor, which has no
 /// path at all, use `throw_fd_error` -- inferring "no path" from `path == ""`
 /// conflated the two and stripped the quotes off every empty-path error.
+///
+/// On Windows the path is the resolved one node reports (see
+/// `oam_core::fs_error_path`).
 fn throw_node_error(
+    scope: &mut v8::PinScope<'_, '_>,
+    syscall: &str,
+    path: &str,
+    error: &std::io::Error,
+) {
+    throw_node_error_as_passed(scope, syscall, &oam_core::fs_error_path(path), error);
+}
+
+/// `throw_node_error` naming `path` exactly as given: for mkdtemp, whose
+/// template node does not resolve.
+fn throw_node_error_as_passed(
     scope: &mut v8::PinScope<'_, '_>,
     syscall: &str,
     path: &str,
@@ -579,6 +664,28 @@ fn throw_node_error(
     let code = node_error_code(error);
     let message = node_error_message(code, syscall, path, error);
     throw_system_error(scope, code, &message, syscall, Some(path), error);
+}
+
+/// node's system error for a TWO-path operation (rename, copyfile, link,
+/// symlink): `'path' -> 'dest'` in the message, and a `dest` property after
+/// `path`. The caller passes both as they are to be shown.
+fn throw_node_error_dest(
+    scope: &mut v8::PinScope<'_, '_>,
+    syscall: &str,
+    path: &str,
+    dest: &str,
+    error: &std::io::Error,
+) {
+    let code = node_error_code(error);
+    let message = oam_core::node_error_message_dest(code, syscall, path, dest, error);
+    let exception = system_error(scope, code, &message, syscall, Some(path), error);
+    if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception)
+        && let (Some(key), Some(value)) =
+            (v8::String::new(scope, "dest"), v8::String::new(scope, dest))
+    {
+        obj.set(scope, key.into(), value.into());
+    }
+    scope.throw_exception(exception);
 }
 
 /// `throw_node_error` for an operation with call-site error rules: the
@@ -592,13 +699,14 @@ fn throw_fs_error(
     error: &std::io::Error,
 ) {
     let failure = oam_core::fs_error_at(site, syscall, path, error);
-    let message = oam_core::fs_error_message(failure, path, error);
+    let shown = oam_core::fs_error_path(path);
+    let message = oam_core::fs_error_message(failure, &shown, error);
     throw_system_error(
         scope,
         failure.code,
         &message,
         failure.syscall,
-        failure.has_path.then_some(path),
+        failure.has_path.then_some(&*shown),
         error,
     );
 }
@@ -609,6 +717,17 @@ fn throw_fs_error(
 /// `oam_core::fd_error_code`).
 fn throw_fd_error(scope: &mut v8::PinScope<'_, '_>, syscall: &str, error: &std::io::Error) {
     let code = oam_core::fd_error_code(error);
+    let message = oam_core::node_error_message_fd(code, syscall, error);
+    throw_system_error(scope, code, &message, syscall, None, error);
+}
+
+/// A failed fd operation other than a read or write (fstat, fsync, ftruncate,
+/// fchmod, fchown, futimes): the error's own code (a read/write's access
+/// failure is EBADF, these keep EPERM), and no path. These were thrown with an
+/// empty path, which node never sets: `path: ''` and `, fsync ''` in the
+/// message.
+fn throw_fd_op_error(scope: &mut v8::PinScope<'_, '_>, syscall: &str, error: &std::io::Error) {
+    let code = oam_core::node_error_code(error);
     let message = oam_core::node_error_message_fd(code, syscall, error);
     throw_system_error(scope, code, &message, syscall, None, error);
 }
@@ -673,17 +792,21 @@ fn system_error<'s>(
 /// An optional non-negative POSITION argument: a number seeks (pread/pwrite),
 /// absent / null / negative means "from the current cursor". Shared by the four
 /// read/write natives so the coercion cannot drift between them.
+/// A read / write position argument as node's binding reads one (GetOffset):
+/// an integer number is the position -- negative ones included, which
+/// `oam_core::file_offset` resolves per platform -- anything else (null, a
+/// fraction, NaN) is the cursor.
 fn optional_position(
     scope: &mut v8::PinScope<'_, '_>,
     args: &v8::FunctionCallbackArguments<'_>,
     index: i32,
-) -> Option<u64> {
+) -> Option<i64> {
     let value = args.get(index);
     if !value.is_number() {
         return None;
     }
-    let p = value.number_value(scope).unwrap_or(-1.0);
-    if p >= 0.0 { Some(p as u64) } else { None }
+    let p = value.number_value(scope).unwrap_or(f64::NAN);
+    (p.is_finite() && p.fract() == 0.0).then_some(p as i64)
 }
 
 pub(crate) fn arg_string(
@@ -961,8 +1084,15 @@ fn stdio_write_failed(
 /// std's lock is held throughout, so a write from another thread -- a worker
 /// that shares the process's stdout -- cannot land inside this one, and std's
 /// own buffer is flushed first so anything written through it keeps its place.
+///
+/// A stdout the program closed (`fs.closeSync(1)`, unix) is EBADF, as node's
+/// write(2) gets -- checked first, so nothing reaches whatever the OS gave
+/// descriptor 1 to since.
 fn stdout_write_whole(bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    if let Some(e) = oam_core::closed_stdio_error(1) {
+        return Err(e);
+    }
     if bytes.is_empty() {
         return Ok(());
     }
@@ -973,7 +1103,8 @@ fn stdout_write_whole(bytes: &[u8]) -> std::io::Result<()> {
     if let Some(done) = win_console_write(bytes) {
         return done;
     }
-    match raw_stdout() {
+    let raw = raw_stdout();
+    match raw.as_ref().and_then(Option::as_ref) {
         Some(file) => write_whole(file, bytes),
         // No handle of our own to write through (a detached process with no
         // stdout): std's path, as before.
@@ -1019,10 +1150,15 @@ fn write_whole(mut sink: impl std::io::Write, mut bytes: &[u8]) -> std::io::Resu
 
 /// The process's stdout as a plain `File`: a duplicate of the descriptor /
 /// handle, so the writes skip std's `LineWriter` and still reach the same pipe,
-/// file or terminal. Made once; `None` when there is no stdout to duplicate.
-fn raw_stdout() -> Option<&'static std::fs::File> {
-    static RAW: std::sync::OnceLock<Option<std::fs::File>> = std::sync::OnceLock::new();
-    RAW.get_or_init(|| {
+/// file or terminal. Made on first use; `None` when there is no stdout to
+/// duplicate, and from the moment the program closes descriptor 1
+/// (`forget_raw_stdout`). Taken under std's stdout lock by every writer, so
+/// the mutex is never contended.
+static RAW_STDOUT: std::sync::Mutex<Option<Option<std::fs::File>>> = std::sync::Mutex::new(None);
+
+fn raw_stdout() -> std::sync::MutexGuard<'static, Option<Option<std::fs::File>>> {
+    let mut raw = RAW_STDOUT.lock().unwrap_or_else(|e| e.into_inner());
+    if raw.is_none() {
         #[cfg(unix)]
         let owned = {
             use std::os::fd::AsFd;
@@ -1033,9 +1169,27 @@ fn raw_stdout() -> Option<&'static std::fs::File> {
             use std::os::windows::io::AsHandle;
             std::io::stdout().as_handle().try_clone_to_owned()
         };
-        owned.ok().map(std::fs::File::from)
-    })
-    .as_ref()
+        *raw = Some(owned.ok().map(std::fs::File::from));
+    }
+    raw
+}
+
+/// Close the duplicate of a stdout the program has closed, so that it is
+/// really closed: a pipe's reader sees EOF at `fs.closeSync(1)`, as under
+/// node, not when the process exits.
+fn forget_raw_stdout() {
+    *RAW_STDOUT.lock().unwrap_or_else(|e| e.into_inner()) = Some(None);
+}
+
+/// `oam_core::close_descriptor`, plus what closing the process's stdout
+/// means for the runtime's own copy of it (unix only: on Windows 0-2 stay
+/// open).
+fn close_fd(files: &oam_core::FileRegistry, fd: u64) -> bool {
+    let closed = oam_core::close_descriptor(files, fd);
+    if closed && fd == 1 && oam_core::closed_stdio_error(1).is_some() {
+        forget_raw_stdout();
+    }
+    closed
 }
 
 /// A Windows console gets UTF-16 through WriteConsoleW, as std and libuv give
@@ -1092,7 +1246,7 @@ fn win_console_write(bytes: &[u8]) -> Option<std::io::Result<()>> {
         Err(_) if kind == UNKNOWN => {
             KIND.store(NOT_CONSOLE, Ordering::Relaxed);
             *carry = Vec::new();
-            Some(match raw_stdout() {
+            Some(match raw_stdout().as_ref().and_then(Option::as_ref) {
                 Some(file) => write_whole(file, &pending),
                 // std's stdout lock is reentrant, so taking it again under
                 // the caller's is fine.
@@ -1376,6 +1530,12 @@ fn op_stderr_write(
 ) {
     if let Some(bytes) = arg_bytes(scope, &args, 0) {
         use std::io::Write;
+        // A stderr the program closed is EBADF, as for stdout: std's stderr
+        // would report the write to a closed descriptor as done.
+        if let Some(e) = oam_core::closed_stdio_error(2) {
+            stdio_write_failed(scope, &mut rv, &e);
+            return;
+        }
         let stderr = std::io::stderr();
         let mut lock = stderr.lock();
         if let Err(e) = write_whole(&mut lock, &bytes).and_then(|()| lock.flush()) {
@@ -3134,6 +3294,17 @@ fn op_http_conn_destroy(
     core_runtime!(scope).http().destroy_conn(conn_id, graceful);
 }
 
+/// `httpConnReset(connectionId)`: `socket.resetAndDestroy()` on a server
+/// connection -- closed with a reset (SO_LINGER 0), nothing unsent delivered.
+fn op_http_conn_reset(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let conn_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    core_runtime!(scope).http().reset_conn(conn_id);
+}
+
 /// `httpConnResume(connectionId)`: the server's `'secureConnection'`
 /// listeners have run for this connection, so it may be served. A listener
 /// that destroyed the socket has already said so through `httpConnDestroy`,
@@ -3170,13 +3341,10 @@ fn op_http_serve(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
-    // Net gate: "host:port" is the resource being bound.
-    let net_resource = format!("{host}:{port}");
-    if !check_net_perm(scope, &net_resource) {
+    // Net gate: "host:port" is the resource being bound. arg 12: ipv6Only.
+    let Some(at) = listen_at_arg(scope, &args, 12, "httpServe") else {
         return;
-    }
+    };
     let rt = core_runtime!(scope);
     let state = rt.http();
     let tcp = rt.tcp();
@@ -3194,8 +3362,7 @@ fn op_http_serve(
             state,
             tcp,
             tcp_ids,
-            host,
-            port,
+            at,
             // arg 2: opt into dispatch-on-headers + streamed request bodies.
             args.get(2).is_true(),
             policy,
@@ -3233,7 +3400,8 @@ fn op_fetch_body_channel_new(
 }
 
 /// Push a chunk. Resolves when the chunk is accepted, so JS write()
-/// backpressure follows the socket.
+/// backpressure follows the socket -- with `false` when the request no longer
+/// takes its body (it finished or failed), so a writer can stop producing it.
 fn op_fetch_body_channel_write(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -3258,7 +3426,7 @@ fn op_fetch_body_channel_write(
             Ok(()) => oam_core::OpOutcome::Done,
             // Receiver gone: the request finished or failed. Not an error to
             // the writer -- the transport already reported it.
-            Err(_) => oam_core::OpOutcome::Done,
+            Err(_) => oam_core::OpOutcome::Json("false".to_string()),
         }
     });
 }
@@ -3280,7 +3448,7 @@ fn op_fetch_body_channel_end(
 fn op_fetch_body_channel_cancel(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let entry = core_runtime!(scope)
@@ -3289,8 +3457,66 @@ fn op_fetch_body_channel_cancel(
         .unwrap_or_else(|e| e.into_inner())
         .remove(&handle);
     if let Some((Some(tx), _)) = entry {
-        let _ = tx.try_send(Err("request aborted".to_string()));
+        // The error has to REACH the transport: a sender dropped without it
+        // ends the body, and hyper would finish a chunked request whose
+        // upload was cut short as if it were whole. When the channel is full
+        // the error waits behind the chunks already queued -- on a task that
+        // does not hold the event loop open, since a server that stopped
+        // reading may never take them.
+        if let Err(full) = tx.try_send(Err("request aborted".to_string()))
+            && !tx.is_closed()
+        {
+            let item = full.into_inner();
+            crate::ops::spawn_op_unref(scope, &mut rv, async move {
+                let _ = tx.send(item).await;
+                oam_core::OpOutcome::Done
+            });
+        }
     }
+}
+
+/// `__oam.node.fetchSentOpen() -> handle`: a signal for one http.request on
+/// oam's own transport, named in its fetch request as `sent_signal`
+/// (`oam_core::http_client::sent`).
+fn op_fetch_sent_open(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = core_runtime!(scope).new_sent_signal();
+    rv.set(v8::Number::new(scope, handle as f64).into());
+}
+
+/// `__oam.node.fetchSentWait(handle)`: resolves true once the transport has
+/// a connection for the request -- node's 'finish' -- or undefined if the
+/// request ended without one. Unref'd: the fetch itself is what keeps the
+/// process running.
+fn op_fetch_sent_wait(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let signals = core_runtime!(scope).sent_signals();
+    crate::ops::spawn_op_unref(
+        scope,
+        &mut rv,
+        oam_core::http_client::sent::wait(signals, handle),
+    );
+}
+
+/// `__oam.node.fetchSentClose(handle) -> boolean`, synchronous: drop the
+/// signal and say whether it had fired. Read when the fetch settles, so the
+/// answer cannot arrive after the response or the failure it orders.
+fn op_fetch_sent_close(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let fired = handle >= 0.0
+        && oam_core::http_client::sent::close(&core_runtime!(scope).sent_signals(), handle as u64);
+    rv.set(v8::Boolean::new(scope, fired).into());
 }
 
 fn op_http_request_body_read(
@@ -3333,9 +3559,11 @@ fn op_http_request_body_read(
                 // into_data releases the chunk's budget reservation.
                 oam_core::OpOutcome::Bytes(chunk.into_data())
             }
-            Some(Err(e)) => {
+            // The pump's failure as it built it: node's parse or socket
+            // error for the wire, or the text of an oam limit.
+            Some(Err(failure)) => {
                 state.cancel_body_stream(id);
-                oam_core::OpOutcome::Failed(e)
+                failure
             }
             None => body_end(state.finish_request_body(id)),
         }
@@ -3384,17 +3612,86 @@ fn op_http_respond(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
+    use oam_core::http_server::ResponseBody;
     let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let body = arg_bytes(scope, &args, 3).unwrap_or_default();
+    let head = response_head_args(scope, &args, 4, 6);
+    // Arg 5 `true`: the body goes out as one of unknown length (chunked, or
+    // ended by closing for an HTTP/1.0 client), as node:http frames it after
+    // writeHead(), followed by the trailer fields in arg 7 (`[[name, value],
+    // ...]` JSON) when there are any; anything else sends its length.
+    let body = if args.get(5).is_true() {
+        let trailers = match arg_string(scope, &args, 7) {
+            None => None,
+            Some(json) => match oam_core::http_server::trailer_fields(&parse_headers_json(&json)) {
+                Some(trailers) => Some(trailers),
+                None => {
+                    throw_type_error(scope, "httpRespond: invalid trailer field");
+                    return;
+                }
+            },
+        };
+        ResponseBody::Unsized(body, trailers)
+    } else {
+        ResponseBody::Full(body)
+    };
+    rv.set_bool(core_runtime!(scope).http().respond_full(id, head, body));
+}
+
+/// The head httpRespond / httpRespondStream are given: the status (arg 1),
+/// the `[[name, value], ...]` JSON (arg 2), and two optional args node:http's
+/// ServerResponse passes (oam.serve and the http2 compat server pass
+/// neither): at `bytes_at`, `true` to write each header value -- and the
+/// reason phrase -- one byte per code point, as node does whenever it would
+/// (anything else writes its UTF-8); at `reason_at`, the status message.
+fn response_head_args(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    bytes_at: i32,
+    reason_at: i32,
+) -> oam_core::http_server::ResponseHead {
     let status = args.get(1).number_value(scope).unwrap_or(200.0) as u16;
-    let headers = arg_string(scope, &args, 2)
+    let headers = arg_string(scope, args, 2)
         .map(|j| parse_headers_json(&j))
         .unwrap_or_default();
-    let body = arg_bytes(scope, &args, 3).unwrap_or_default();
-    rv.set_bool(
-        core_runtime!(scope)
-            .http()
-            .respond_full(id, status, headers, body),
-    );
+    let bytes = args.get(bytes_at);
+    let header_bytes = if bytes.is_true() {
+        oam_core::http_server::HeaderBytes::Latin1
+    } else {
+        oam_core::http_server::HeaderBytes::Utf8
+    };
+    // Only node:http passes the bytes arg; its names keep their case.
+    let name_case = bytes.is_boolean();
+    let reason = reason_arg(scope, args.get(reason_at), status);
+    oam_core::http_server::ResponseHead {
+        status,
+        headers,
+        header_bytes,
+        reason,
+        name_case,
+    }
+}
+
+/// node:http's status message, unless it is the reason phrase hyper writes
+/// for `status` by itself (`OK` for 200, ...): that common case is compared
+/// in place and never copied out of V8.
+fn reason_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+    status: u16,
+) -> Option<String> {
+    let text = v8::Local::<v8::String>::try_from(value).ok()?;
+    if let Some(standard) = oam_core::http_server::standard_reason(status) {
+        let mut buf = [0u8; 64];
+        let len = standard.len();
+        if text.length() == len && len <= buf.len() && text.contains_only_onebyte() {
+            text.write_one_byte_v2(scope, 0, &mut buf[..len], v8::WriteFlags::empty());
+            if &buf[..len] == standard.as_bytes() {
+                return None;
+            }
+        }
+    }
+    Some(text.to_rust_string_lossy(scope))
 }
 
 fn op_http_respond_stream(
@@ -3403,17 +3700,13 @@ fn op_http_respond_stream(
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
-    let status = args.get(1).number_value(scope).unwrap_or(200.0) as u16;
-    let headers = arg_string(scope, &args, 2)
-        .map(|j| parse_headers_json(&j))
-        .unwrap_or_default();
+    let head = response_head_args(scope, &args, 3, 4);
+    // node:http's first chunk, written with the head (respond_stream).
+    let first = arg_bytes(scope, &args, 5);
     // Exchange gone (aborted via httpAbort, or already answered) leaves rv
     // undefined, NOT a throw -- Node's post-abort res.write() is a soft
     // failure, and the JS layer maps this to a premature close.
-    if let Some(stream_id) = core_runtime!(scope)
-        .http()
-        .respond_stream(id, status, headers)
-    {
+    if let Some(stream_id) = core_runtime!(scope).http().respond_stream(id, head, first) {
         rv.set_double(stream_id as f64);
     }
 }
@@ -3433,6 +3726,25 @@ fn op_http_body_push(
         scope,
         &mut rv,
         oam_core::http_server::http_body_push(state, stream_id, bytes),
+    );
+}
+
+/// A node:http streaming response's trailer fields (`[[name, value], ...]`
+/// JSON), pushed after its last chunk, before httpBodyEnd.
+fn op_http_body_trailers(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let stream_id = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let pairs = arg_string(scope, &args, 1)
+        .map(|json| parse_headers_json(&json))
+        .unwrap_or_default();
+    let state = core_runtime!(scope).http();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::http_server::http_body_trailers(state, stream_id, pairs),
     );
 }
 
@@ -3488,19 +3800,17 @@ fn op_http2_serve(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
-    let net_resource = format!("{host}:{port}");
-    if !check_net_perm(scope, &net_resource) {
+    // arg 4: ipv6Only.
+    let Some(at) = listen_at_arg(scope, &args, 4, "http2Serve") else {
         return;
-    }
+    };
     let state = core_runtime!(scope).http();
     // args 2, 3: maxHeaderSize, insecureHTTPParser (HTTP/1 connections).
     let policy = head_policy_args(scope, &args, 2);
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::http_server::http2_serve(state, host, port, policy),
+        oam_core::http_server::http2_serve(state, at, policy),
     );
 }
 
@@ -3546,10 +3856,11 @@ fn op_http2_serve_tls(
 
 // ----------------------------------------------------------------- HTTPS
 
-/// httpsServe(host, port, contextId, handshakeMs, requestCert,
+/// httpsServe(host | null, port, contextId, handshakeMs, requestCert,
 /// rejectUnauthorized, alpnJson, maxHeaderSize, insecureHTTPParser,
-/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs, jsDriven)
-/// -> Promise<{ serverId, port }>: an https server whose connections are
+/// headersMs, requestMs, keepAliveMs, socketMs, checkIntervalMs, jsDriven,
+/// maxHeadersCount, ipv6Only) -> Promise<{ serverId, port, address, family
+/// }>: an https server whose connections are
 /// accepted with the secure context `contextId` (`tlsServerContext`, built
 /// at `https.createServer()`) and those options.
 fn op_https_serve(
@@ -3557,17 +3868,15 @@ fn op_https_serve(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let host = arg_string(scope, &args, 0).unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
     let context_id = args.get(2).number_value(scope).unwrap_or(0.0) as u64;
     // args 3..=6: handshakeTimeout, requestCert, rejectUnauthorized, ALPN.
     let Some(options) = accept_option_args(scope, &args, 3, "httpsServe") else {
         return;
     };
-    let net_resource = format!("{host}:{port}");
-    if !check_net_perm(scope, &net_resource) {
+    // args 0, 1 and 16: host, port, ipv6Only.
+    let Some(at) = listen_at_arg(scope, &args, 16, "httpsServe") else {
         return;
-    }
+    };
     let core = core_runtime!(scope);
     let Some(context) = oam_core::tls::server::context(&core.tls(), context_id) else {
         throw_type_error(scope, "httpsServe: the server's secure context is gone");
@@ -3592,8 +3901,7 @@ fn op_https_serve(
         &mut rv,
         oam_core::http_server::https_serve(
             state,
-            host,
-            port,
+            at,
             tls,
             policy,
             timeouts,
@@ -3640,7 +3948,9 @@ fn op_tcp_connect(
         throw_type_error(scope, "tcpConnect requires a host");
         return;
     };
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 1, "tcpConnect") else {
+        return;
+    };
     // net.getDefaultAutoSelectFamilyAttemptTimeout() as JS read it for this
     // connect; JS owns the value, so nothing is cached per runtime.
     let attempt_timeout = attempt_timeout_arg(scope, &args, 2);
@@ -3707,7 +4017,9 @@ fn op_net_resolve(
     // The connect's port: the name is resolved only for a connect the net
     // grant covers (`host:port`, as tcpConnect / tlsConnect ask), so the
     // resolver is never a way to look up a name the grant refuses.
-    let port = args.get(3).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 3, "netResolve") else {
+        return;
+    };
     if !check_net_perm(scope, &format!("{host}:{port}")) {
         return;
     }
@@ -3786,9 +4098,10 @@ fn op_http_bridge_response(
 }
 
 /// `__oam.node.httpBridgeOut(id)`: the next request bytes for the socket,
-/// or undefined at the end. Unref'd: it waits on hyper, which may never
-/// write again (a response whose body nobody reads), and the socket's own
-/// read is what keeps a live connection's process running, as in node.
+/// or undefined at the end; no bytes at all when only `httpBridgeProgress`
+/// has moved. Unref'd: it waits on hyper, which may never write again (a
+/// response whose body nobody reads), and the socket's own read is what
+/// keeps a live connection's process running, as in node.
 fn op_http_bridge_out(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -3803,22 +4116,31 @@ fn op_http_bridge_out(
     );
 }
 
-/// `__oam.node.httpBridgeRequestSent(id)`: once hyper has written the whole
-/// request, how many of the `httpBridgeOut` bytes it took (node's `'finish'`
-/// follows the socket's write of the last of them); undefined if the
-/// exchange ends first. Unref'd, as httpBridgeOut: it waits on hyper.
-fn op_http_bridge_request_sent(
+/// `__oam.node.httpBridgeProgress(id) -> [written, body, complete]`: of the
+/// bytes `httpBridgeOut` hands over, how many hyper had written at its last
+/// flush, how far into the request body those reach, and whether they are
+/// the whole request (node's `write()` callbacks and `'finish'` follow the
+/// socket's write of them). Undefined for an exchange that is gone.
+/// Synchronous: the answer is read when it is needed, not delivered.
+fn op_http_bridge_progress(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    if id < 0.0 {
+        return;
+    }
     let bridges = core_runtime!(scope).http_bridges();
-    crate::ops::spawn_op_unref(
-        scope,
-        &mut rv,
-        oam_core::http_client::bridge::request_sent(bridges, id),
-    );
+    let Some(progress) = oam_core::http_client::bridge::progress(&bridges, id as u64) else {
+        return;
+    };
+    let written = v8::Number::new(scope, progress.written as f64);
+    let body = v8::Number::new(scope, progress.body as f64);
+    let complete = v8::Boolean::new(scope, progress.complete);
+    let array =
+        v8::Array::new_with_elements(scope, &[written.into(), body.into(), complete.into()]);
+    rv.set(array.into());
 }
 
 /// `__oam.node.httpBridgeIn(id, bytes)`: response bytes the socket read.
@@ -3992,7 +4314,9 @@ fn op_net_check(
         throw_type_error(scope, "netCheck requires a host");
         return;
     };
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 1, "netCheck") else {
+        return;
+    };
     let _ = check_net_perm(scope, &format!("{host}:{port}"));
 }
 
@@ -4091,7 +4415,9 @@ fn connect_pin_arg(
         }) => {
             let mut addrs = Vec::with_capacity(ips.len());
             for ip in &ips {
-                match ip.parse::<std::net::IpAddr>() {
+                // A zone id (`fe80::1%eth0`) is part of the address, as
+                // node's `net.isIP` has it.
+                match ip.parse::<oam_core::net_connect::PinAddr>() {
                     Ok(addr) => addrs.push(addr),
                     Err(_) => {
                         return Some(PinArg::Refused(format!("{op}: pin ip '{ip}' is not an IP")));
@@ -4227,7 +4553,33 @@ fn op_tcp_write(
         return;
     };
     let tcp = core_runtime!(scope).tcp();
-    crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_write(tcp, handle, data));
+    spawn_tcp_started(
+        scope,
+        &mut rv,
+        oam_core::tcp::tcp_write_start(tcp, handle, data),
+    );
+}
+
+/// The return value of `tcpWrite` / `tcpShutdown`: undefined for an op that
+/// finished in the call -- net.Socket settles it without waiting for the
+/// event loop, so a write the socket took reports back before the 'close'
+/// of a destroy() made right after it, as in node (#156) -- and a promise
+/// for one still to finish or one that failed (its rejection carries the
+/// error's shape).
+fn spawn_tcp_started<F>(
+    scope: &mut v8::PinScope<'_, '_>,
+    rv: &mut v8::ReturnValue<'_, v8::Value>,
+    started: oam_core::tcp::Started<F>,
+) where
+    F: std::future::Future<Output = oam_core::OpOutcome> + Send + 'static,
+{
+    match started {
+        oam_core::tcp::Started::Done(oam_core::OpOutcome::Done) => {}
+        oam_core::tcp::Started::Done(outcome) => {
+            crate::ops::spawn_op(scope, rv, async move { outcome });
+        }
+        oam_core::tcp::Started::Pending(rest) => crate::ops::spawn_op(scope, rv, rest),
+    }
 }
 
 fn op_tcp_close(
@@ -4239,6 +4591,28 @@ fn op_tcp_close(
     let tcp = core_runtime!(scope).tcp();
     oam_core::tcp::tcp_close(&tcp, handle);
     core_runtime_mut!(scope).forget_handle(oam_core::HandleKey::Tcp(handle));
+}
+
+/// `__oam.node.tcpReset(handle, shutdownFinished)`: node's
+/// `socket.resetAndDestroy()` -- the stream closed so that its peer sees a
+/// reset (oam_core::tcp::tcp_reset). `shutdownFinished`: the socket has
+/// emitted 'finish'. Returns undefined, or the errno code of a reset refused
+/// (`"EINVAL"`: its shutdown is under way); the handle is closed either way.
+fn op_tcp_reset(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let shutdown_finished = args.get(1).boolean_value(scope);
+    let tcp = core_runtime!(scope).tcp();
+    let refused = oam_core::tcp::tcp_reset(&tcp, handle, shutdown_finished).err();
+    core_runtime_mut!(scope).forget_handle(oam_core::HandleKey::Tcp(handle));
+    if let Some(oam_core::tcp::ResetRefused(code)) = refused
+        && let Some(code) = v8::String::new(scope, code)
+    {
+        rv.set(code.into());
+    }
 }
 
 /// `__oam.node.tcpSetRef(handle, referenced)`: node's `socket.ref()` /
@@ -4263,31 +4637,60 @@ fn op_tcp_shutdown(
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let tcp = core_runtime!(scope).tcp();
-    crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_shutdown(tcp, handle));
+    spawn_tcp_started(
+        scope,
+        &mut rv,
+        oam_core::tcp::tcp_shutdown_start(tcp, handle),
+    );
 }
 
+/// Where a server op is asked to listen: the host as argument 0 (a string, or
+/// null / undefined for a `listen()` that named none), the port as argument
+/// 1, and node's `ipv6Only` as argument `ipv6_only_index`. Checks the net
+/// grant for it -- `host:port`, and for no host `0.0.0.0:port`, the grant for
+/// every interface (the listener is dual-stack `::`, every interface of both
+/// families). `None` means an exception is pending.
+fn listen_at_arg(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    ipv6_only_index: i32,
+    op: &str,
+) -> Option<oam_core::tcp::ListenAt> {
+    let host = if args.get(0).is_null_or_undefined() {
+        None
+    } else {
+        let Some(host) = arg_string(scope, args, 0) else {
+            throw_type_error(scope, &format!("{op} requires a host string or null"));
+            return None;
+        };
+        Some(host)
+    };
+    let port = port_arg(scope, args, 1, op)?;
+    let net_resource = format!("{}:{port}", host.as_deref().unwrap_or("0.0.0.0"));
+    if !check_net_perm(scope, &net_resource) {
+        return None;
+    }
+    Some(oam_core::tcp::ListenAt {
+        host,
+        port,
+        ipv6_only: args.get(ipv6_only_index).is_true(),
+    })
+}
+
+/// tcpListen(host | null, port, ipv6Only) -> Promise<{ serverId, port,
+/// hostname, family }>: net and tls servers.
 fn op_tcp_listen(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let Some(host) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "tcpListen requires a host");
+    let Some(at) = listen_at_arg(scope, &args, 2, "tcpListen") else {
         return;
     };
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
-    let net_resource = format!("{host}:{port}");
-    if !check_net_perm(scope, &net_resource) {
-        return;
-    }
     let core = core_runtime!(scope);
     let tcp = core.tcp();
     let ids = core.body_ids();
-    crate::ops::spawn_op(
-        scope,
-        &mut rv,
-        oam_core::tcp::tcp_listen(tcp, ids, host, port),
-    );
+    crate::ops::spawn_op(scope, &mut rv, oam_core::tcp::tcp_listen(tcp, ids, at));
 }
 
 fn op_tcp_accept(
@@ -4374,7 +4777,9 @@ fn op_udp_send(
         throw_type_error(scope, "udpSend requires a target host");
         return;
     };
-    let port = args.get(3).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 3, "udpSend") else {
+        return;
+    };
     // The DESTINATION is a net subject, by the same rule as `tcpConnect`.
     // Only the bind was checked, and it names the LOCAL address, so any bind
     // grant was a grant to send datagrams anywhere: with a loopback grant to
@@ -4424,7 +4829,9 @@ fn op_tls_connect(
         throw_type_error(scope, "tlsConnect requires a host");
         return;
     };
-    let port = args.get(1).number_value(scope).unwrap_or(0.0) as u16;
+    let Some(port) = port_arg(scope, &args, 1, "tlsConnect") else {
+        return;
+    };
     let server_name = arg_string(scope, &args, 2).filter(|s| !s.is_empty());
     let ca_pem = arg_string(scope, &args, 3).filter(|s| !s.is_empty());
     let reject_unauthorized = args.get(4).boolean_value(scope);
@@ -4962,11 +5369,31 @@ fn arg_max_output(
     Some(n.min(usize::MAX as f64) as usize)
 }
 
+/// The optional `finishFlush` argument of the zlib ops (node's option of that
+/// name, range-checked by the shim): zlib's Z_FINISH when absent.
+fn arg_finish_flush(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: &v8::FunctionCallbackArguments<'_>,
+    index: i32,
+) -> i32 {
+    let value = args.get(index);
+    if value.is_null_or_undefined() {
+        return oam_core::zlib::Z_FINISH;
+    }
+    value.int32_value(scope).unwrap_or(oam_core::zlib::Z_FINISH)
+}
+
 /// Throw the error for a one-shot zlib result. An output past
 /// `maxOutputLength` is a plain error carrying that sentinel message alone
 /// (see `oam_core::zlib::OUTPUT_TOO_LARGE`); the shim turns it into node's
 /// `RangeError [ERR_BUFFER_TOO_LARGE]` with the caller's number in it.
+///
+/// A decode failure is node's coded zlib error (#166): see `throw_zlib_coded`.
 fn throw_zlib_error(scope: &mut v8::PinScope<'_, '_>, e: &std::io::Error) {
+    if let Some(coded) = oam_core::zlib::zlib_error(e) {
+        throw_zlib_coded(scope, &coded);
+        return;
+    }
     let text = e.to_string();
     let message = if text == oam_core::zlib::OUTPUT_TOO_LARGE {
         text
@@ -4978,11 +5405,30 @@ fn throw_zlib_error(scope: &mut v8::PinScope<'_, '_>, e: &std::io::Error) {
     scope.throw_exception(exception);
 }
 
-/// zlibSync(bytes, format, level, compress, maxOutputLength?) — synchronous
-/// transform on the isolate thread (the *Sync API contract). "unzip"
-/// auto-detects on decode. `maxOutputLength` (node's option of that name)
-/// bounds the output: while it is produced for a decode, on the finished
-/// buffer for an encode.
+/// Throw node's zlib error: a plain `Error` with zlib's message and own
+/// `errno` then `code` (lib/zlib.js `zlibOnError`), the shape the async forms
+/// reject with too.
+fn throw_zlib_coded(scope: &mut v8::PinScope<'_, '_>, coded: &oam_core::zlib::ZlibError) {
+    let message = v8::String::new(scope, coded.message).unwrap();
+    let exception = v8::Exception::error(scope, message);
+    if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
+        let errno_key = v8::String::new(scope, "errno").unwrap();
+        let errno = v8::Integer::new(scope, coded.errno);
+        obj.create_data_property(scope, errno_key.into(), errno.into());
+        let code_key = v8::String::new(scope, "code").unwrap();
+        let code = v8::String::new(scope, coded.code).unwrap();
+        obj.create_data_property(scope, code_key.into(), code.into());
+    }
+    scope.throw_exception(exception);
+}
+
+/// zlibSync(bytes, format, level, compress, maxOutputLength?, finishFlush?,
+/// dictionary?) — synchronous transform on the isolate thread (the *Sync API
+/// contract). "unzip" auto-detects on decode. `maxOutputLength` (node's
+/// option of that name) bounds the output: while it is produced for a
+/// decode, on the finished buffer for an encode. `finishFlush` (node's
+/// option, Z_FINISH by default) decides whether a decode that stops inside
+/// the stream fails. `dictionary` is node's option, validated by the shim.
 fn op_zlib_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -4996,15 +5442,24 @@ fn op_zlib_sync(
     let level = args.get(2).int32_value(scope).unwrap_or(-1);
     let compress = args.get(3).is_true();
     let max_output = arg_max_output(scope, &args, 4);
+    let finish_flush = arg_finish_flush(scope, &args, 5);
+    let dictionary = arg_bytes(scope, &args, 6);
+    let dictionary = dictionary.as_deref();
     let result = if !compress && format == "unzip" {
-        oam_core::zlib::unzip_capped(&bytes, max_output)
+        oam_core::zlib::unzip_capped(&bytes, max_output, finish_flush, dictionary)
     } else {
         match oam_core::zlib::Format::parse(&format) {
             Some(parsed) => {
                 if compress {
-                    oam_core::zlib::compress_capped(&bytes, parsed, level, max_output)
+                    oam_core::zlib::compress_capped(&bytes, parsed, level, max_output, dictionary)
                 } else {
-                    oam_core::zlib::decompress_capped(&bytes, parsed, max_output)
+                    oam_core::zlib::decompress_capped(
+                        &bytes,
+                        parsed,
+                        max_output,
+                        finish_flush,
+                        dictionary,
+                    )
                 }
             }
             None => {
@@ -5023,7 +5478,8 @@ fn op_zlib_sync(
     }
 }
 
-/// zlibAsync(bytes, format, level, compress, maxOutputLength?) -> Promise<Uint8Array>.
+/// zlibAsync(bytes, format, level, compress, maxOutputLength?, finishFlush?,
+/// dictionary?) -> Promise<Uint8Array>.
 fn op_zlib_async(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -5037,14 +5493,24 @@ fn op_zlib_async(
     let level = args.get(2).int32_value(scope).unwrap_or(-1);
     let compress = args.get(3).is_true();
     let max_output = arg_max_output(scope, &args, 4);
+    let finish_flush = arg_finish_flush(scope, &args, 5);
+    let dictionary = arg_bytes(scope, &args, 6);
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::zlib_transform(bytes, format, level, compress, max_output),
+        oam_core::ops::zlib_transform(
+            bytes,
+            format,
+            level,
+            compress,
+            max_output,
+            finish_flush,
+            dictionary,
+        ),
     );
 }
 
-/// zlibStreamCreate(format, level, compress) -> Promise<{handle}>.
+/// zlibStreamCreate(format, level, compress, dictionary?) -> Promise<{handle}>.
 /// Allocates an incremental compressor or decompressor in the stream
 /// registry. The handle is passed to subsequent write/flush/close calls.
 fn op_zlib_stream_create(
@@ -5055,13 +5521,14 @@ fn op_zlib_stream_create(
     let format = arg_string(scope, &args, 0).unwrap_or_default();
     let level = args.get(1).int32_value(scope).unwrap_or(-1);
     let compress = args.get(2).is_true();
+    let dictionary = arg_bytes(scope, &args, 3);
     let core = core_runtime!(scope);
     let streams = core.zlib_streams();
     let ids = core.body_ids();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::zlib_stream_create(streams, ids, format, level, compress),
+        oam_core::ops::zlib_stream_create(streams, ids, format, level, compress, dictionary),
     );
 }
 
@@ -5086,20 +5553,22 @@ fn op_zlib_stream_write(
     );
 }
 
-/// zlibStreamFlush(handle) -> Promise<Uint8Array>.
+/// zlibStreamFlush(handle, finishFlush?) -> Promise<Uint8Array>.
 /// Finalize the stream and return tail bytes. The stream handle is
-/// removed from the registry after this call.
+/// removed from the registry after this call. `finishFlush` is node's
+/// option for an inflate stream (Z_FINISH by default).
 fn op_zlib_stream_flush(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let finish_flush = arg_finish_flush(scope, &args, 1);
     let streams = core_runtime!(scope).zlib_streams();
     crate::ops::spawn_op(
         scope,
         &mut rv,
-        oam_core::ops::zlib_stream_flush(streams, handle),
+        oam_core::ops::zlib_stream_flush(streams, handle, finish_flush),
     );
 }
 
@@ -5116,7 +5585,7 @@ fn op_zlib_stream_close(
     oam_core::ops::zlib_stream_close(&streams, handle);
 }
 
-/// zlibHandleCreate(mode, level) -> handle (number).
+/// zlibHandleCreate(mode, level, dictionary?) -> handle (number).
 /// Allocates a low-level flate2 Compress/Decompress for Node's internal
 /// zlib binding interface (ssh2's ZlibHandle pattern).
 fn op_zlib_handle_create(
@@ -5126,10 +5595,11 @@ fn op_zlib_handle_create(
 ) {
     let mode = args.get(0).int32_value(scope).unwrap_or(0);
     let level = args.get(1).int32_value(scope).unwrap_or(-1);
+    let dictionary = arg_bytes(scope, &args, 2);
     let core = core_runtime!(scope);
     let streams = core.zlib_streams();
     let ids = core.body_ids();
-    match oam_core::ops::zlib_handle_create(&streams, &ids, mode, level) {
+    match oam_core::ops::zlib_handle_create(&streams, &ids, mode, level, dictionary.as_deref()) {
         Ok(handle) => {
             let val = v8::Number::new(scope, handle as f64);
             rv.set(val.into());
@@ -5221,7 +5691,11 @@ fn op_zlib_handle_write_sync(
             rv.set(arr.into());
         }
         Err(e) => {
-            let message = v8::String::new(scope, &e).unwrap();
+            if let Some(coded) = oam_core::zlib::zlib_error(&e) {
+                throw_zlib_coded(scope, &coded);
+                return;
+            }
+            let message = v8::String::new(scope, &e.to_string()).unwrap();
             let exception = v8::Exception::error(scope, message);
             scope.throw_exception(exception);
         }
@@ -5249,13 +5723,15 @@ fn op_url_parse_href(
             }
         }
     };
-    match ada_url::Url::parse(&input, base.as_deref()) {
-        Ok(parsed) => {
-            if let Some(s) = v8::String::new(scope, parsed.href()) {
-                rv.set(s.into());
-            }
-        }
-        Err(_) => throw_type_error(scope, &format!("Invalid URL: {input}")),
+    // An input that does not parse leaves the return value `undefined`; it is
+    // not a throw. The caller builds node's ERR_INVALID_URL, whose shape
+    // differs between `new URL()` and the `href` setter and carries the input
+    // and base as properties -- none of which a message thrown from here
+    // could express.
+    if let Ok(parsed) = ada_url::Url::parse(&input, base.as_deref())
+        && let Some(s) = v8::String::new(scope, parsed.href())
+    {
+        rv.set(s.into());
     }
 }
 
@@ -5715,7 +6191,8 @@ fn op_fs_rename_sync(
         return;
     }
     if let Err(e) = std::fs::rename(&from, &to) {
-        throw_node_error(scope, "rename", &from, &e);
+        let (path, dest) = (oam_core::fs_error_path(&from), oam_core::fs_error_path(&to));
+        throw_node_error_dest(scope, "rename", &path, &dest, &e);
     }
 }
 
@@ -5735,7 +6212,8 @@ fn op_fs_copy_file_sync(
         return;
     }
     if let Err(e) = std::fs::copy(&from, &to) {
-        throw_node_error(scope, "copyfile", &from, &e);
+        let (path, dest) = (oam_core::fs_error_path(&from), oam_core::fs_error_path(&to));
+        throw_node_error_dest(scope, "copyfile", &path, &dest, &e);
     }
 }
 
@@ -5773,26 +6251,27 @@ fn op_fs_access_sync(
         Ok(()) => {}
         Err((code, message, errno)) => {
             // EPERM/EACCES with the path attached, same shape as
-            // throw_node_error but with the access-specific code.
+            // throw_node_error but with the access-specific code: errno
+            // FIRST, then code, syscall, path, as node orders them (errno
+            // was set last, after path).
             let message_v8 = v8::String::new(scope, &message)
                 .unwrap_or_else(|| v8::String::new(scope, &code).unwrap());
             let exception = v8::Exception::error(scope, message_v8);
             if let Ok(obj) = v8::Local::<v8::Object>::try_from(exception) {
-                let props: [(&str, &str); 3] =
-                    [("code", &code), ("syscall", "access"), ("path", &path)];
-                for (name, value) in props {
-                    let key = v8::String::new(scope, name).unwrap();
-                    if let Some(value) = v8::String::new(scope, value) {
-                        obj.set(scope, key.into(), value.into());
-                    }
-                }
-                // errno completes node's system-error shape; it was the one
-                // field this hand-rolled error left off.
                 if let Some(errno) = errno
                     && let Some(key) = v8::String::new(scope, "errno")
                 {
                     let value = v8::Integer::new(scope, errno);
                     obj.set(scope, key.into(), value.into());
+                }
+                let shown = oam_core::fs_error_path(&path);
+                let props: [(&str, &str); 3] =
+                    [("code", &code), ("syscall", "access"), ("path", &shown)];
+                for (name, value) in props {
+                    let key = v8::String::new(scope, name).unwrap();
+                    if let Some(value) = v8::String::new(scope, value) {
+                        obj.set(scope, key.into(), value.into());
+                    }
                 }
             }
             scope.throw_exception(exception);
@@ -5886,31 +6365,12 @@ fn op_fs_fstat(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let files = core_runtime!(scope).sync_files();
-    // Same adoption rule as the sync twin: a low fd we never allocated is the
-    // parent's, passed in at spawn.
-    oam_core::adopt_inherited_fd(&files, fd);
-    // Clone the handle under the lock and drop the lock immediately -- the
-    // metadata read then happens on a blocking thread with nothing held, so a
-    // slow device cannot stall every other fd op.
-    let cloned = {
-        let guard = files.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.files.get(&fd) {
-            None => {
-                throw_ebadf(scope, "fstat");
-                return;
-            }
-            Some(file) => match file.try_clone() {
-                Ok(cloned) => cloned,
-                Err(e) => {
-                    throw_fd_error(scope, "fstat", &e);
-                    return;
-                }
-            },
-        }
+    let Some(file) = registered_fd(scope, &files, fd, "fstat") else {
+        return;
     };
-    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fstat(cloned));
+    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fstat(file));
 }
 
 // --------------------------------------------------------- fd-based fs ops
@@ -5919,53 +6379,55 @@ fn op_fs_fstat(
 // All exempt-by-capability in `permission_audit`: the fd can only have come
 // from an `open` that was checked, and there is no path here to re-check.
 
-/// Resolve an fd to an owned `File` for an op that will hand it to a blocking
-/// thread. Throws EBADF and returns None when the fd is not open.
+/// Resolve an fd to its shared handle (see `oam_core::OpenFile`), adopting a
+/// descriptor the parent passed in. Throws EBADF and returns None when the fd
+/// is not open. The registry lock is held only for the lookup, never for the
+/// op's IO, so a slow descriptor stalls nothing else -- and nothing is taken
+/// out of the table, so concurrent ops on one descriptor all find it.
 ///
 /// The registry comes in as a parameter rather than from `core_runtime!`: that
 /// macro expands to a bare `return;`, which only compiles inside a function
 /// returning `()`. The op callbacks do; this does not.
-fn clone_registered_fd(
+/// A descriptor argument as the fd table keys it. node's binding takes an
+/// int32 descriptor, and a negative, fractional or out-of-range number is no
+/// descriptor at all: it reaches the table as [`NO_FD`], which nothing holds or
+/// adopts, so the op fails EBADF. A saturating `as u64` cast turned -1 and
+/// -2147483648 into 0 -- the inherited stdin -- so `writeFileSync(-1, 'x')`
+/// wrote to stdin where node fails EBADF.
+fn fd_arg(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<'_, v8::Value>) -> u64 {
+    match value.number_value(scope) {
+        Some(n) if n >= 0.0 && n <= f64::from(i32::MAX) && n.fract() == 0.0 => n as u64,
+        _ => NO_FD,
+    }
+}
+
+/// The descriptor [`fd_arg`] gives a value that is not one.
+const NO_FD: u64 = u64::MAX;
+
+fn registered_fd(
     scope: &mut v8::PinScope<'_, '_>,
     files: &oam_core::SyncFileRegistry,
     fd: u64,
     syscall: &str,
-) -> Option<std::fs::File> {
-    // Same adoption rule as fstat: a low fd we never allocated came from the
-    // parent at spawn.
-    oam_core::adopt_inherited_fd(files, fd);
-    let cloned = {
-        let guard = files.lock().unwrap_or_else(|e| e.into_inner());
-        guard.files.get(&fd).map(|file| file.try_clone())
-    };
-    match cloned {
-        None => {
-            throw_ebadf(scope, syscall);
-            None
-        }
-        Some(Err(e)) => {
-            throw_node_error(scope, syscall, "", &e);
-            None
-        }
-        Some(Ok(file)) => Some(file),
+) -> Option<oam_core::OpenFile> {
+    let file = oam_core::registered_file(files, fd);
+    if file.is_none() {
+        throw_ebadf(scope, syscall);
     }
+    file
 }
 
-/// Run a synchronous fd operation against the registry, throwing on failure.
+/// Run a synchronous fd operation, throwing on failure.
 fn with_registered_fd<F>(scope: &mut v8::PinScope<'_, '_>, fd: u64, syscall: &str, action: F)
 where
     F: FnOnce(&std::fs::File) -> std::io::Result<()>,
 {
     let files = core_runtime!(scope).sync_files();
-    oam_core::adopt_inherited_fd(&files, fd);
-    let outcome = {
-        let guard = files.lock().unwrap_or_else(|e| e.into_inner());
-        guard.files.get(&fd).map(action)
+    let Some(file) = registered_fd(scope, &files, fd, syscall) else {
+        return;
     };
-    match outcome {
-        None => throw_ebadf(scope, syscall),
-        Some(Err(e)) => throw_node_error(scope, syscall, "", &e),
-        Some(Ok(())) => {}
+    if let Err(e) = action(&file) {
+        throw_fd_op_error(scope, syscall, &e);
     }
 }
 
@@ -5986,9 +6448,9 @@ fn op_fs_fsync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let files = core_runtime!(scope).sync_files();
-    let Some(file) = clone_registered_fd(scope, &files, fd, "fsync") else {
+    let Some(file) = registered_fd(scope, &files, fd, "fsync") else {
         return;
     };
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fsync(file, false));
@@ -5999,9 +6461,9 @@ fn op_fs_fdatasync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let files = core_runtime!(scope).sync_files();
-    let Some(file) = clone_registered_fd(scope, &files, fd, "fdatasync") else {
+    let Some(file) = registered_fd(scope, &files, fd, "fdatasync") else {
         return;
     };
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fsync(file, true));
@@ -6012,10 +6474,10 @@ fn op_fs_ftruncate(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let len = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u64;
     let files = core_runtime!(scope).sync_files();
-    let Some(file) = clone_registered_fd(scope, &files, fd, "ftruncate") else {
+    let Some(file) = registered_fd(scope, &files, fd, "ftruncate") else {
         return;
     };
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_ftruncate(file, len));
@@ -6026,10 +6488,10 @@ fn op_fs_fchmod(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
     let files = core_runtime!(scope).sync_files();
-    let Some(file) = clone_registered_fd(scope, &files, fd, "fchmod") else {
+    let Some(file) = registered_fd(scope, &files, fd, "fchmod") else {
         return;
     };
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fchmod(file, mode));
@@ -6040,11 +6502,11 @@ fn op_fs_fchown(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let uid = args.get(1).uint32_value(scope).unwrap_or(0);
     let gid = args.get(2).uint32_value(scope).unwrap_or(0);
     let files = core_runtime!(scope).sync_files();
-    let Some(file) = clone_registered_fd(scope, &files, fd, "fchown") else {
+    let Some(file) = registered_fd(scope, &files, fd, "fchown") else {
         return;
     };
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_fchown(file, uid, gid));
@@ -6055,10 +6517,10 @@ fn op_fs_futimes(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let (atime, mtime) = utime_args(scope, &args, 1);
     let files = core_runtime!(scope).sync_files();
-    let Some(file) = clone_registered_fd(scope, &files, fd, "futime") else {
+    let Some(file) = registered_fd(scope, &files, fd, "futime") else {
         return;
     };
     crate::ops::spawn_op(
@@ -6073,7 +6535,7 @@ fn op_fs_fsync_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     with_registered_fd(scope, fd, "fsync", |file| file.sync_all());
 }
 
@@ -6082,7 +6544,7 @@ fn op_fs_fdatasync_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     with_registered_fd(scope, fd, "fdatasync", |file| file.sync_data());
 }
 
@@ -6091,7 +6553,7 @@ fn op_fs_ftruncate_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let len = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u64;
     with_registered_fd(scope, fd, "ftruncate", |file| file.set_len(len));
 }
@@ -6101,7 +6563,7 @@ fn op_fs_fchmod_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let mode = args.get(1).uint32_value(scope).unwrap_or(0o644);
     with_registered_fd(scope, fd, "fchmod", |file| {
         oam_core::ops::fs_fchmod_sync(file, mode)
@@ -6113,7 +6575,7 @@ fn op_fs_fchown_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let uid = args.get(1).uint32_value(scope).unwrap_or(0);
     let gid = args.get(2).uint32_value(scope).unwrap_or(0);
     with_registered_fd(scope, fd, "fchown", |file| {
@@ -6126,7 +6588,7 @@ fn op_fs_futimes_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let (atime, mtime) = utime_args(scope, &args, 1);
     with_registered_fd(scope, fd, "futime", |file| {
         oam_core::ops::fs_futimes_sync(file, atime, mtime)
@@ -6570,22 +7032,6 @@ fn op_fs_chmod(
     crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_chmod(path, mode));
 }
 
-fn op_fs_truncate(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    mut rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "truncate requires a path");
-        return;
-    };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
-    let len = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u64;
-    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_truncate(path, len));
-}
-
 fn op_fs_symlink_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -6616,7 +7062,15 @@ fn op_fs_symlink_sync(
     #[cfg(not(windows))]
     let result = std::os::unix::fs::symlink(&target, &path);
     if let Err(e) = result {
-        throw_node_error(scope, "symlink", &path, &e);
+        // The target is stored as written, so node reports it so; the link's
+        // own path is resolved like any other.
+        throw_node_error_dest(
+            scope,
+            "symlink",
+            &target,
+            &oam_core::fs_error_path(&path),
+            &e,
+        );
     }
 }
 
@@ -6663,7 +7117,14 @@ fn op_fs_link_sync(
         return;
     }
     if let Err(e) = std::fs::hard_link(&existing, &new_path) {
-        throw_node_error(scope, "link", &new_path, &e);
+        let path = oam_core::fs_error_path(&existing);
+        throw_node_error_dest(
+            scope,
+            "link",
+            &path,
+            &oam_core::fs_error_path(&new_path),
+            &e,
+        );
     }
 }
 
@@ -6703,31 +7164,6 @@ fn op_fs_chmod_sync(
     }
 }
 
-fn op_fs_truncate_sync(
-    scope: &mut v8::PinScope<'_, '_>,
-    args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
-) {
-    let Some(path) = arg_string(scope, &args, 0) else {
-        throw_type_error(scope, "truncateSync requires a path");
-        return;
-    };
-    if !check_write_perm(scope, &path) {
-        return;
-    }
-    let len = args.get(1).integer_value(scope).unwrap_or(0).max(0) as u64;
-    // Which syscall actually failed, as node reports it: open + ftruncate,
-    // so a missing path is `open` (see the async twin in oam_core).
-    match std::fs::OpenOptions::new().write(true).open(&path) {
-        Ok(f) => {
-            if let Err(e) = f.set_len(len) {
-                throw_node_error(scope, "ftruncate", &path, &e);
-            }
-        }
-        Err(e) => throw_node_error(scope, "open", &path, &e),
-    }
-}
-
 fn op_fs_mkdtemp_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -6749,11 +7185,19 @@ fn op_fs_mkdtemp_sync(
                 rv.set(value.into());
             }
         }
-        Err(e) => throw_node_error(scope, "mkdtemp", &prefix, &e),
+        Err(e) => throw_node_error_as_passed(scope, "mkdtemp", &prefix, &e),
     }
 }
 
 // ---------------------------------------------------------- fs stream ops
+
+/// Whether an open with these fopen-style flags can write, and so needs the
+/// write grant rather than the read one: "r+" reads AND writes, as does any
+/// flag with "w", "a" or "x" in it. One answer for fsOpen and fsOpenSync,
+/// which share one descriptor space.
+fn open_flags_write(flags: &str) -> bool {
+    flags.contains('w') || flags.contains('a') || flags.contains('+') || flags.contains('x')
+}
 
 fn op_fs_open(
     scope: &mut v8::PinScope<'_, '_>,
@@ -6765,9 +7209,7 @@ fn op_fs_open(
         return;
     };
     let mode = arg_string(scope, &args, 1).unwrap_or_else(|| "r".to_string());
-    // Gate on read for read modes ("r", "r+"), write for write modes.
-    let is_write = mode.contains('w') || mode.contains('a');
-    if is_write {
+    if open_flags_write(&mode) {
         if !check_write_perm(scope, &path) {
             return;
         }
@@ -6789,7 +7231,7 @@ fn op_fs_read_chunk(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = fd_arg(scope, args.get(0));
     let len = args.get(1).number_value(scope).unwrap_or(65536.0) as usize;
     // Optional third arg: a read POSITION. Absent/null means "from the
     // cursor", which is what the stream readers pass.
@@ -6807,7 +7249,7 @@ fn op_fs_write_chunk(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = fd_arg(scope, args.get(0));
     let Some(bytes) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "fsWriteChunk requires data");
         return;
@@ -6823,21 +7265,16 @@ fn op_fs_write_chunk(
     );
 }
 
-/// Synchronous: dropping the File closes it (flush happens in write ops).
+/// Synchronous: dropping the registry's reference closes the file once no op
+/// in flight on it still holds one (see `oam_core::OpenFile`).
 fn op_fs_close(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let handle = fd_arg(scope, args.get(0));
     let files = core_runtime!(scope).files();
-    let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
-    // If the File is in flight (removed by a chunk op for its IO await),
-    // it is absent here -- record the close so the op's reinsert drops it
-    // instead of resurrecting a leaked fd (destroy()-during-read race).
-    if guard.files.remove(&handle).is_none() {
-        guard.closed.insert(handle);
-    }
+    close_fd(&files, handle);
 }
 
 /// Throw an `Error` carrying `.code`/`.syscall` for a bad/missing fd. Node
@@ -6886,9 +7323,7 @@ fn op_fs_open_sync(
         return;
     };
     let flags = arg_string(scope, &args, 1).unwrap_or_else(|| "r".to_string());
-    let is_write =
-        flags.contains('w') || flags.contains('a') || flags.contains('+') || flags.contains('x');
-    if is_write {
+    if open_flags_write(&flags) {
         if !check_write_perm(scope, &path) {
             return;
         }
@@ -6905,7 +7340,7 @@ fn op_fs_open_sync(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .files
-                .insert(id, file);
+                .insert(id, std::sync::Arc::new(file));
             let val = v8::Number::new(scope, id as f64);
             rv.set(val.into());
         }
@@ -6914,81 +7349,28 @@ fn op_fs_open_sync(
 }
 
 /// fsReadSync(fd, buffer, offset, length, position) -> bytesRead. Reads into
-/// buffer's backing store at `offset`; `position` (a number) seeks first,
-/// null reads from the current position.
-/// Read at an explicit position WITHOUT moving the descriptor's cursor, which
-/// is what `pread(2)` does and what node's positional `fs.read` family means.
-///
-/// This used to seek and leave the cursor there. The bug is silent and nasty:
-/// node gives `readSync(fd, b, 0, 3, 10)` then `readSync(fd, b, 0, 3, null)`
-/// -> "KLM" then "ABC" (the sequential read still starts at 0), while oam gave
-/// "KLM" then "NOP". A program that positionally probes a file and then reads
-/// sequentially got the wrong bytes with no error anywhere.
-///
-/// Save/seek/act/restore rather than a real pread: std has no positional read
-/// on the stable cross-platform surface (`FileExt` is per-OS and differs in
-/// name between unix `read_at` and windows `seek_read`), and the registry is
-/// already serialised behind its mutex here, so nothing else can observe the
-/// cursor mid-operation.
-fn read_at(
-    file: &mut std::fs::File,
-    buf: &mut [u8],
-    position: Option<u64>,
-) -> std::io::Result<usize> {
-    use std::io::{Read, Seek, SeekFrom};
-    let Some(p) = position else {
-        return file.read(buf);
-    };
-    let saved = file.stream_position();
-    file.seek(SeekFrom::Start(p))?;
-    let result = file.read(buf);
-    if let Ok(prev) = saved {
-        let _ = file.seek(SeekFrom::Start(prev));
-    }
-    result
-}
-
-/// Write at an explicit position without moving the cursor -- `pwrite(2)`.
-/// Same bug and same reasoning as `read_at`.
-///
-/// A descriptor opened in APPEND mode ignores the position entirely and always
-/// writes at the end; that is the OS's behaviour, node's too, and restoring the
-/// cursor afterwards does not change it.
-fn write_at(file: &mut std::fs::File, bytes: &[u8], position: Option<u64>) -> std::io::Result<()> {
-    use std::io::{Seek, SeekFrom};
-    let Some(p) = position else {
-        return oam_core::write_all_checked(file, bytes);
-    };
-    let saved = file.stream_position();
-    file.seek(SeekFrom::Start(p))?;
-    let result = oam_core::write_all_checked(file, bytes);
-    if let Ok(prev) = saved {
-        let _ = file.seek(SeekFrom::Start(prev));
-    }
-    result
-}
-
+/// buffer's backing store at `offset`; a numeric `position` is a `pread`
+/// (`oam_core::read_at`: the cursor does not move -- node gives
+/// `readSync(fd, b, 0, 3, 10)` then `readSync(fd, b, 0, 3, null)` -> "KLM" then
+/// "ABC"), null reads from the cursor.
 fn op_fs_read_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let offset = args.get(2).number_value(scope).unwrap_or(0.0) as usize;
     let length = args.get(3).number_value(scope).unwrap_or(0.0) as usize;
-    let position = args.get(4);
-    let pos_seek = if position.is_number() {
-        let p = position.number_value(scope).unwrap_or(-1.0);
-        if p >= 0.0 { Some(p as u64) } else { None }
-    } else {
-        None
-    };
+    let pos_seek = optional_position(scope, &args, 4);
 
     let files = core_runtime!(scope).sync_files();
     // A low fd missing from the registry cannot be one oam allocated -- the
     // counter starts above the inheritable window -- so it is the parent's to
-    // adopt. This is what lets oam BE the child of an extra-fd spawn.
-    oam_core::adopt_inherited_fd(&files, fd);
+    // adopt (`registered_file` does). This is what lets oam BE the child of an
+    // extra-fd spawn.
+    let Some(file) = registered_fd(scope, &files, fd, "read") else {
+        return;
+    };
     // `length` is an unvalidated JS number; its saturating f64->usize cast can
     // reach usize::MAX, and `vec![0u8; length]` would abort this non-unwindable
     // callback (capacity-overflow panic). A read can never usefully exceed the
@@ -6999,17 +7381,9 @@ fn op_fs_read_sync(
             .unwrap_or(0),
     );
     let mut tmp = vec![0u8; length];
-    let read_result = {
-        let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .files
-            .get_mut(&fd)
-            .map(|file| read_at(file, &mut tmp, pos_seek))
-    };
-    match read_result {
-        None => throw_ebadf(scope, "read"),
-        Some(Err(e)) => throw_fd_error(scope, "read", &e),
-        Some(Ok(n)) => {
+    match oam_core::read_at(&file, &mut tmp, pos_seek) {
+        Err(e) => throw_fd_error(scope, "read", &e),
+        Ok(n) => {
             if n > 0 {
                 let buf_value = args.get(1);
                 if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(buf_value)
@@ -7050,41 +7424,27 @@ fn op_fs_read_sync(
 }
 
 /// fsWriteSync(fd, data, position?) -> bytesWritten. `data` is bytes (Buffer)
-/// or a string (UTF-8). `position` (a number) seeks first; null appends at the
-/// current position.
+/// or a string (UTF-8). A numeric `position` is a `pwrite`
+/// (`oam_core::write_all_at`); null writes at the cursor.
 fn op_fs_write_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let Some(bytes) = arg_bytes(scope, &args, 1) else {
         throw_type_error(scope, "writeSync requires data");
         return;
     };
-    let position = args.get(2);
-    let pos_seek = if position.is_number() {
-        let p = position.number_value(scope).unwrap_or(-1.0);
-        if p >= 0.0 { Some(p as u64) } else { None }
-    } else {
-        None
-    };
+    let pos_seek = optional_position(scope, &args, 2);
     let files = core_runtime!(scope).sync_files();
-    // A low fd missing from the registry cannot be one oam allocated -- the
-    // counter starts above the inheritable window -- so it is the parent's to
-    // adopt. This is what lets oam BE the child of an extra-fd spawn.
-    oam_core::adopt_inherited_fd(&files, fd);
-    let write_result = {
-        let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
-        guard
-            .files
-            .get_mut(&fd)
-            .map(|file| write_at(file, &bytes, pos_seek))
+    // Adopts an inherited fd, as in op_fs_read_sync.
+    let Some(file) = registered_fd(scope, &files, fd, "write") else {
+        return;
     };
-    match write_result {
-        None => throw_ebadf(scope, "write"),
-        Some(Err(e)) => throw_fd_error(scope, "write", &e),
-        Some(Ok(())) => {
+    match oam_core::write_all_at(&file, &bytes, pos_seek) {
+        Err(e) => throw_fd_error(scope, "write", &e),
+        Ok(()) => {
             let val = v8::Number::new(scope, bytes.len() as f64);
             rv.set(val.into());
         }
@@ -7098,28 +7458,12 @@ fn op_fs_close_sync(
     args: v8::FunctionCallbackArguments<'_>,
     _rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let files = core_runtime!(scope).sync_files();
-    // A low fd missing from the registry cannot be one oam allocated -- the
-    // counter starts above the inheritable window -- so it is the parent's to
-    // adopt. This is what lets oam BE the child of an extra-fd spawn.
-    oam_core::adopt_inherited_fd(&files, fd);
-    let removed = files
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .files
-        .remove(&fd)
-        .is_some();
-    if !removed {
+    // Adopts and closes an inherited descriptor, and treats 0-2 as node does
+    // on each platform: see close_descriptor.
+    if !close_fd(&files, fd) {
         throw_ebadf(scope, "close");
-        return;
-    }
-    // An adopted fd (below OWN_FD_BASE) is a DUP of the parent's descriptor;
-    // dropping it above closed only our copy. Close the original too, or the
-    // peer of an inherited pipe never sees EOF -- which is precisely how a CDP
-    // child says "no more messages" on fd 4.
-    if fd < oam_core::OWN_FD_BASE {
-        oam_core::close_inherited_fd(fd);
     }
 }
 
@@ -7130,23 +7474,16 @@ fn op_fs_fstat_sync(
     args: v8::FunctionCallbackArguments<'_>,
     mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
-    let fd = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let fd = fd_arg(scope, args.get(0));
     let files = core_runtime!(scope).sync_files();
-    // A low fd missing from the registry cannot be one oam allocated -- the
-    // counter starts above the inheritable window -- so it is the parent's to
-    // adopt. This is what lets oam BE the child of an extra-fd spawn.
-    oam_core::adopt_inherited_fd(&files, fd);
-    // Held across the whole read: fstat has no path to reopen from, so the
-    // extra fields have to come off the descriptor the caller already owns.
-    let guard = files.lock().unwrap_or_else(|e| e.into_inner());
-    let payload = guard.files.get(&fd).map(|file| {
-        file.metadata()
-            .map(|meta| oam_core::ops::stat_to_json(&meta, oam_core::ops::StatSource::File(file)))
-    });
-    match payload {
-        None => throw_ebadf(scope, "fstat"),
-        Some(Err(e)) => throw_fd_error(scope, "fstat", &e),
-        Some(Ok(json)) => return_json(scope, &mut rv, &json),
+    // Adopts an inherited fd, as in op_fs_read_sync. fstat has no path to
+    // reopen from, so the extra fields come off the descriptor itself.
+    let Some(file) = registered_fd(scope, &files, fd, "fstat") else {
+        return;
+    };
+    match oam_core::ops::fstat_to_json(&file) {
+        Err(e) => throw_fd_op_error(scope, "fstat", &e),
+        Ok(json) => return_json(scope, &mut rv, &json),
     }
 }
 

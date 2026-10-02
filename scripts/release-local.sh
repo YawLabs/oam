@@ -1020,6 +1020,22 @@ fi
 # and `oam self-update` could already resolve -- the gate reported a verdict on
 # something it could no longer stop. The assets it needs exist from "Assemble
 # release assets" onward, so nothing forces it downstream of publishing.
+# matrix_unanswered <report>  -- one line per sidecar whose tool call was NOT
+# checked on oam in this run: its name, state and why. Nothing for a missing or
+# unreadable report. A row that stops calling reads as one word in the
+# matrix's own "not answered" list, scrolled past -- fetch-mcp 0.7.1's loopback
+# refusal kept the fetch row UPSTREAM through a release that way (#220).
+matrix_unanswered(){
+  node -e '
+    const report = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+    for (const s of report.sidecars ?? []) {
+      if (["upstream", "demoted", "skip"].includes(s.state)) {
+        console.log(`${s.name} (${s.state.toUpperCase()}${s.why ? `: ${s.why}` : ""})`);
+      }
+    }
+  ' "$1" 2>/dev/null
+}
+
 step "MCP sidecar regression matrix"
 if ! command -v node >/dev/null 2>&1; then
   warn "node not on PATH -- sidecar matrix skipped (it hosts the harness, not the test)"
@@ -1064,7 +1080,16 @@ else
         fail "sidecar matrix ended before its verdict (status 1 and no report: killed by taskkill /F, or crashed -- see above) -- stopping; nothing has been published"
       fi
       ;;
-    *) warn "sidecar matrix could not complete (status $matrix_status) -- result is INCOMPLETE, not clean; the unanswered sidecars are named above" ;;
+    *)
+      warn "sidecar matrix could not complete (status $matrix_status) -- result is INCOMPLETE, not clean"
+      # Each row on a line of its own: a hosting regression in any of these
+      # would NOT have stopped this release. This stays a warning -- whether
+      # an unanswered row should block a release is the maintainer's call
+      # (#220) -- but it is never a quiet one.
+      while IFS= read -r unanswered; do
+        warn "NOT EXERCISED on this build: $unanswered"
+      done < <(matrix_unanswered "$matrix_report")
+      ;;
   esac
 fi
 

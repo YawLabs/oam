@@ -77,6 +77,8 @@ impl Encoder {
         Encoder::new(Kind::CloseDelimited)
     }
 
+    // oam patch: only a client's request declares its trailer fields now.
+    #[cfg(any(feature = "client", test))]
     pub(crate) fn into_chunked_with_trailing_fields(self, trailers: Vec<HeaderName>) -> Encoder {
         match self.kind {
             Kind::Chunked(_) => Encoder {
@@ -109,6 +111,9 @@ impl Encoder {
         }
     }
 
+    // oam patch: the client's is the one use left (see
+    // into_chunked_with_trailing_fields).
+    #[cfg(any(feature = "client", test))]
     pub(crate) fn is_chunked(&self) -> bool {
         matches!(self.kind, Kind::Chunked(_))
     }
@@ -205,9 +210,22 @@ impl Encoder {
                     kind: BufKind::Trailers(b"0\r\n".chain(Bytes::from(buf)).chain(b"\r\n")),
                 })
             }
+            // oam patch: with no `Trailer` header to name them, every field
+            // is sent, a repeated one as often as it repeats, as node's http
+            // module sends a message's trailers.
             Kind::Chunked(None) => {
-                debug!("attempted to encode trailers, but the trailer header is not set");
-                None
+                let mut buf = Vec::new();
+                if title_case_headers {
+                    write_headers_title_case(&trailers, &mut buf);
+                } else {
+                    write_headers(&trailers, &mut buf);
+                }
+                if buf.is_empty() {
+                    return None;
+                }
+                Some(EncodedBuf {
+                    kind: BufKind::Trailers(b"0\r\n".chain(Bytes::from(buf)).chain(b"\r\n")),
+                })
             }
             _ => {
                 debug!("attempted to encode trailers for non-chunked response");
@@ -571,15 +589,28 @@ mod tests {
     fn chunked_with_no_trailer_header() {
         let encoder = Encoder::chunked();
 
-        let headers = HeaderMap::from_iter(vec![(
+        let mut headers = HeaderMap::from_iter(vec![(
             HeaderName::from_static("chunky-trailer"),
             HeaderValue::from_static("header data"),
         )]);
+        headers.append(
+            HeaderName::from_static("chunky-trailer"),
+            HeaderValue::from_static("more header data"),
+        );
 
-        assert!(encoder
+        // oam patch: with no Trailer header, every field is sent, repeats
+        // included.
+        let buf = encoder
             .encode_trailers::<&[u8]>(headers.clone(), false)
-            .is_none());
+            .unwrap();
+        let mut dst = Vec::new();
+        dst.put(buf);
+        assert_eq!(
+            dst,
+            b"0\r\nchunky-trailer: header data\r\nchunky-trailer: more header data\r\n\r\n"
+        );
 
+        // A Trailer header that names nothing still lets nothing through.
         let trailers = vec![];
         let encoder = encoder.into_chunked_with_trailing_fields(trailers);
 

@@ -28,7 +28,7 @@ use std::future::Future;
 use std::mem::MaybeUninit;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin as StdPin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -47,7 +47,7 @@ use tower_service::Service;
 use super::BoxError;
 use super::prepare::host_for_connect;
 use super::tls_config::{self, TlsConfigs, TlsRange};
-use crate::net_connect::{self, ConnectOptions, Pin};
+use crate::net_connect::{self, AttemptLog, ConnectOptions, Pin};
 use std::sync::atomic::AtomicU8;
 
 /// The byte stream under a connection: TCP, TLS over TCP, or TLS over a
@@ -83,9 +83,13 @@ pub(crate) struct ConnStats {
 }
 
 #[derive(Debug, Default)]
-struct ConnCounters {
+pub(crate) struct ConnCounters {
     uses: AtomicU64,
     read: AtomicU64,
+    /// Every byte of HTTP written onto the connection (above TLS), for the
+    /// `bytesWritten` of the socket facts a failure reports
+    /// ([`ConnInfo::socket_facts`]).
+    written: AtomicU64,
 }
 
 impl ConnStats {
@@ -158,14 +162,64 @@ pub(crate) struct ConnInfo {
     pub(crate) local: Option<SocketAddr>,
     pub(crate) peer: Option<SocketAddr>,
     pub(crate) tls: Option<TlsInfo>,
+    /// The [`ConnCloser`] id JS closes this connection by
+    /// ([`close_connection`]): an HTTP/1 connection the transport dialled.
+    /// None on an h2 connection, which many requests share at once.
+    pub(crate) connection: Option<u64>,
+    /// How many times the connection has been checked out, shared with its
+    /// [`ConnCloser`] (None where `connection` is).
+    leases: Option<Arc<AtomicU64>>,
+    /// Which checkout the response holding this copy came on
+    /// ([`ConnInfo::take_lease`]): a close JS asks for through that
+    /// response's socket reaches the connection only while no later request
+    /// has taken it.
+    pub(crate) lease: Option<u64>,
+    /// What the connection has read and written so far (its [`ConnStats`]'
+    /// counters), set once it is handed to the pool.
+    counters: Option<Arc<ConnCounters>>,
 }
 
 impl ConnInfo {
     fn of(tcp: &EagerTcp) -> ConnInfo {
         ConnInfo {
-            local: tcp.0.local_addr().ok(),
-            peer: tcp.0.peer_addr().ok(),
+            local: tcp.stream.local_addr().ok(),
+            peer: tcp.stream.peer_addr().ok(),
             tls: None,
+            connection: Some(tcp.closer.id),
+            leases: Some(tcp.closer.leases.clone()),
+            lease: None,
+            counters: None,
+        }
+    }
+
+    /// One more checkout of the connection: this copy -- the one the
+    /// request's response carries -- records which. One relaxed add per
+    /// request; nothing on an h2 connection.
+    pub(crate) fn take_lease(&mut self) {
+        if let Some(leases) = &self.leases {
+            self.lease = Some(leases.fetch_add(1, Ordering::Relaxed) + 1);
+        }
+    }
+
+    /// The connection as undici describes the socket of a `SocketError`
+    /// (`util.getSocketInfo`): its two ends and the bytes it has carried.
+    /// Read when a request fails, never on the way to a response.
+    pub(crate) fn socket_facts(&self) -> crate::SocketFacts {
+        let counted = |pick: fn(&ConnCounters) -> &AtomicU64| {
+            self.counters
+                .as_ref()
+                .map(|counters| pick(counters).load(Ordering::Relaxed))
+        };
+        crate::SocketFacts {
+            local_address: self.local.as_ref().map(crate::http_server::node_ip_string),
+            local_port: self.local.map(|local| local.port()),
+            remote_address: self.peer.as_ref().map(crate::http_server::node_ip_string),
+            remote_port: self.peer.map(|peer| peer.port()),
+            remote_family: self
+                .peer
+                .map(|peer| if peer.is_ipv6() { "IPv6" } else { "IPv4" }.to_string()),
+            bytes_written: counted(|counters| &counters.written),
+            bytes_read: counted(|counters| &counters.read),
         }
     }
 
@@ -228,8 +282,15 @@ pub(crate) struct OamConn {
 }
 
 impl OamConn {
-    fn new(io: Box<dyn AsyncIo>, h2: bool, proxied: bool, info: ConnInfo) -> OamConn {
+    fn new(io: Box<dyn AsyncIo>, h2: bool, proxied: bool, mut info: ConnInfo) -> OamConn {
         let stats = ConnStats::new();
+        // An h2 connection carries every request to its origin at once: one
+        // request's socket closing it would end all the others.
+        if h2 {
+            info.connection = None;
+            info.leases = None;
+        }
+        info.counters = Some(stats.counters.clone());
         OamConn {
             io: TokioIo::new(Counted {
                 io,
@@ -268,12 +329,23 @@ impl OamConn {
     }
 }
 
-/// The byte stream under a connection, counting what is read from it into
-/// the connection's [`ConnStats`]. It sits above TLS, so the count is HTTP
-/// bytes only: a TLS close_notify or session ticket is not a response.
+/// The byte stream under a connection, counting what is read from it and
+/// written onto it into the connection's [`ConnStats`]. It sits above TLS,
+/// so the count is HTTP bytes only: a TLS close_notify or session ticket is
+/// not a response.
 struct Counted {
     io: Box<dyn AsyncIo>,
     counters: Arc<ConnCounters>,
+}
+
+impl Counted {
+    fn count_written(&self, polled: &Poll<std::io::Result<usize>>) {
+        if let Poll::Ready(Ok(written)) = polled {
+            self.counters
+                .written
+                .fetch_add(*written as u64, Ordering::Relaxed);
+        }
+    }
 }
 
 impl AsyncRead for Counted {
@@ -299,7 +371,10 @@ impl AsyncWrite for Counted {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        StdPin::new(&mut self.get_mut().io).poll_write(cx, buf)
+        let this = self.get_mut();
+        let polled = StdPin::new(&mut this.io).poll_write(cx, buf);
+        this.count_written(&polled);
+        polled
     }
 
     fn poll_flush(self: StdPin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
@@ -319,7 +394,10 @@ impl AsyncWrite for Counted {
         cx: &mut Context<'_>,
         bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<std::io::Result<usize>> {
-        StdPin::new(&mut self.get_mut().io).poll_write_vectored(cx, bufs)
+        let this = self.get_mut();
+        let polled = StdPin::new(&mut this.io).poll_write_vectored(cx, bufs);
+        this.count_written(&polled);
+        polled
     }
 }
 
@@ -518,7 +596,7 @@ impl Shared {
 
 /// A lookup-hooked fetch's resolved authorities: [`authority_key`] -> the
 /// addresses its `connect.lookup` hook returned, in the hook's order.
-pub(crate) type HostAddrs = Arc<Mutex<HashMap<String, Vec<IpAddr>>>>;
+pub(crate) type HostAddrs = Arc<Mutex<HashMap<String, Vec<net_connect::PinAddr>>>>;
 
 /// The key one hook answer is filed under: `host:port`, host lowercased and
 /// unbracketed, port defaulted by scheme so `http://h/` and `http://h:80/`
@@ -597,6 +675,50 @@ impl Service<Uri> for OamConnector {
     }
 }
 
+/// undici's connect timeout expired (lib/core/connect.js `onConnectTimeout`,
+/// 6.24.1): the request fails with its `ConnectTimeoutError`, code
+/// `UND_ERR_CONNECT_TIMEOUT`, whose message this is. undici names the
+/// addresses net.connect had attempted when the connect was a multi-address
+/// one (`attempted addresses: ::1:80, 127.0.0.1:80,`), and otherwise the
+/// host and port it asked for (`attempted address: example.test:443,`) --
+/// measured on node v22.22.2 for an IP literal, a name with two addresses,
+/// and the default ports.
+#[derive(Debug)]
+pub(crate) struct ConnectTimedOut(pub(crate) String);
+
+impl ConnectTimedOut {
+    fn new(
+        host: &str,
+        port: u16,
+        attempted: Option<&[std::net::SocketAddr]>,
+        timeout: Duration,
+    ) -> ConnectTimedOut {
+        let tried = match attempted {
+            // node's `${address}:${port}`: an IPv6 address unbracketed.
+            Some(list) => {
+                let list: Vec<String> = list
+                    .iter()
+                    .map(|addr| format!("{}:{}", addr.ip(), addr.port()))
+                    .collect();
+                format!("attempted addresses: {},", list.join(", "))
+            }
+            None => format!("attempted address: {host}:{port},"),
+        };
+        ConnectTimedOut(format!(
+            "Connect Timeout Error ({tried} timeout: {}ms)",
+            timeout.as_millis()
+        ))
+    }
+}
+
+impl std::fmt::Display for ConnectTimedOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ConnectTimedOut {}
+
 /// A hooked fetch reached the connector for a host its hook never resolved.
 /// The fetch loop parks for the hook before every send, so this is a
 /// backstop: it fails the request rather than fall back to system DNS.
@@ -636,6 +758,51 @@ impl OamConnector {
     /// The owned pool calls this directly (`self.clone().connect(uri)`) instead
     /// of through the `Service` impl hyper-util used.
     pub(crate) async fn connect(self, dst: Uri) -> Result<OamConn, BoxError> {
+        self.connect_logged(dst, &AttemptLog::default()).await
+    }
+
+    /// [`OamConnector::connect`] under undici's connect timeout: the whole
+    /// connect -- the lookup, every address attempt and, for https, the TLS
+    /// handshake (undici clears its timer on `secureConnect`) -- has
+    /// `timeout` to finish, or fails as [`ConnectTimedOut`]. `None` is no
+    /// timeout (`http.request`, which has none in node, or a dispatcher that
+    /// set 0). Dropping the connect future closes whatever it had open.
+    pub(crate) async fn connect_within(
+        self,
+        dst: Uri,
+        timeout: Option<Duration>,
+    ) -> Result<OamConn, BoxError> {
+        let Some(timeout) = timeout else {
+            return self.connect(dst).await;
+        };
+        // The host undici's message names: the one it handed net.connect --
+        // the origin's, or the proxy's when the request goes through one.
+        let via_proxy = match &self.via {
+            Via::Pooled => self.shared.proxy.as_ref().and_then(|m| m.intercept(&dst)),
+            _ => None,
+        };
+        let dialled = via_proxy.as_ref().map_or(&dst, |intercept| intercept.uri());
+        let host = host_for_connect(dialled).unwrap_or_default();
+        let port = dialled
+            .port_u16()
+            .unwrap_or(if dialled.scheme_str() == Some("https") {
+                443
+            } else {
+                80
+            });
+        let log = AttemptLog::default();
+        match tokio::time::timeout(timeout, self.connect_logged(dst, &log)).await {
+            Ok(connected) => connected,
+            Err(_elapsed) => Err(Box::new(ConnectTimedOut::new(
+                &host,
+                port,
+                log.attempted().as_deref(),
+                timeout,
+            ))),
+        }
+    }
+
+    async fn connect_logged(self, dst: Uri, log: &AttemptLog) -> Result<OamConn, BoxError> {
         let https = dst.scheme_str() == Some("https");
         let host = host_for_connect(&dst).ok_or("request url has no host")?;
         let port = dst.port_u16().unwrap_or(if https { 443 } else { 80 });
@@ -689,7 +856,7 @@ impl OamConnector {
         } else {
             None
         };
-        let tcp = dial(&host, port, &opts).await?;
+        let tcp = dial(&host, port, &opts, log).await?;
         let info = ConnInfo::of(&tcp);
         let Some(name) = name else {
             return Ok(OamConn::new(Box::new(tcp), false, false, info));
@@ -794,7 +961,7 @@ impl Service<Uri> for ProxyTransport {
                 pin: None,
                 local: None,
             };
-            let tcp = dial(&host, port, &opts).await?;
+            let tcp = dial(&host, port, &opts, &AttemptLog::default()).await?;
             // The proxy's endpoints. Its own TLS session is not an origin's
             // and is not reported.
             let info = ConnInfo::of(&tcp);
@@ -811,13 +978,120 @@ impl Service<Uri> for ProxyTransport {
     }
 }
 
-/// `net_connect::connect`, then the socket options.
-async fn dial(host: &str, port: u16, opts: &ConnectOptions) -> Result<EagerTcp, BoxError> {
-    let connected = net_connect::connect(host, port, opts)
+/// `net_connect::connect`, then the socket options. `log` learns what is
+/// attempted while the connect runs (see [`OamConnector::connect_within`]).
+async fn dial(
+    host: &str,
+    port: u16,
+    opts: &ConnectOptions,
+    log: &AttemptLog,
+) -> Result<EagerTcp, BoxError> {
+    let connected = net_connect::connect_logged(host, port, opts, log)
         .await
         .map_err(|e| Box::new(e) as BoxError)?;
     tune(&connected.stream);
-    Ok(EagerTcp(connected.stream))
+    Ok(EagerTcp {
+        stream: connected.stream,
+        closer: ConnCloser::new(),
+    })
+}
+
+/// How JS closes one connection the transport dialled: node's `destroy()`
+/// or `resetAndDestroy()` on the `req.socket` of an `http.request` it
+/// carries. The connection's task waits on [`ConnCloser::requested`] beside
+/// hyper's dispatcher and drops the connection when it fires, whether a
+/// response is streaming over it or it sits idle in the pool; a reset arms
+/// SO_LINGER 0 first, through the stream's own drop ([`EagerTcp`]).
+///
+/// Found by id in a process-wide table of weak entries, which the closer
+/// leaves when the connection's last holder (its stream, its task) drops it:
+/// one entry per connection, written at the dial and at the close, nothing
+/// per request.
+///
+/// A close names the checkout it was asked through (`lease`): a socket JS
+/// kept from a finished request must not close the connection once the pool
+/// has handed it to another request -- node's `req.socket` is that request's
+/// own, and a `fetch` never shares undici's pool with it.
+pub(crate) struct ConnCloser {
+    id: u64,
+    requested: AtomicBool,
+    reset: AtomicBool,
+    wake: tokio::sync::Notify,
+    /// The connection's checkouts so far ([`ConnInfo::take_lease`]).
+    leases: Arc<AtomicU64>,
+}
+
+type Closers = Mutex<HashMap<u64, std::sync::Weak<ConnCloser>>>;
+
+fn closers() -> &'static Closers {
+    static CLOSERS: std::sync::OnceLock<Closers> = std::sync::OnceLock::new();
+    CLOSERS.get_or_init(Default::default)
+}
+
+impl ConnCloser {
+    fn new() -> Arc<ConnCloser> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let closer = Arc::new(ConnCloser {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            requested: AtomicBool::new(false),
+            reset: AtomicBool::new(false),
+            wake: tokio::sync::Notify::new(),
+            leases: Arc::new(AtomicU64::new(0)),
+        });
+        closers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(closer.id, Arc::downgrade(&closer));
+        closer
+    }
+
+    /// The closer of a live connection, by the id its responses carry.
+    pub(crate) fn find(id: u64) -> Option<Arc<ConnCloser>> {
+        closers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&id)
+            .and_then(std::sync::Weak::upgrade)
+    }
+
+    /// Resolves once JS has asked for the connection to close.
+    pub(crate) async fn requested(&self) {
+        // One waiter (the connection's task); `notify_one` keeps the permit
+        // for a request made before it first waits.
+        while !self.requested.load(Ordering::Acquire) {
+            self.wake.notified().await;
+        }
+    }
+
+    fn close(&self, reset: bool) {
+        if reset {
+            self.reset.store(true, Ordering::Release);
+        }
+        self.requested.store(true, Ordering::Release);
+        self.wake.notify_one();
+    }
+}
+
+impl Drop for ConnCloser {
+    fn drop(&mut self) {
+        closers()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+
+/// `__oam.fetchConnClose(id, reset, lease)`: close the transport connection
+/// with this id -- with a reset when `reset` -- if it is still open and,
+/// when `lease` names the checkout of the response asking, no request has
+/// taken it since: mid-response, or idle in the pool after it.
+pub fn close_connection(id: u64, reset: bool, lease: Option<u64>) {
+    if let Some(closer) = ConnCloser::find(id) {
+        if lease.is_some_and(|lease| closer.leases.load(Ordering::Relaxed) != lease) {
+            return;
+        }
+        closer.close(reset);
+    }
 }
 
 /// The most one direct read takes. The part of the caller's buffer it reads
@@ -848,7 +1122,21 @@ const DIRECT_READ_MAX: usize = 16 * 1024;
 /// still in flight when the request is written is not covered; node loses
 /// that race too, and for an idempotent request the send path's single
 /// resend covers it.
-pub(crate) struct EagerTcp(tokio::net::TcpStream);
+///
+/// It also carries the connection's [`ConnCloser`], and a connection JS
+/// reset is dropped with SO_LINGER 0, so the close is the reset.
+pub(crate) struct EagerTcp {
+    stream: tokio::net::TcpStream,
+    closer: Arc<ConnCloser>,
+}
+
+impl Drop for EagerTcp {
+    fn drop(&mut self) {
+        if self.closer.reset.load(Ordering::Acquire) {
+            crate::tcp::arm_reset(&self.stream);
+        }
+    }
+}
 
 impl AsyncRead for EagerTcp {
     fn poll_read(
@@ -856,7 +1144,7 @@ impl AsyncRead for EagerTcp {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let stream = &mut self.get_mut().0;
+        let stream = &mut self.get_mut().stream;
         if let ready @ Poll::Ready(_) = StdPin::new(&mut *stream).poll_read(cx, buf) {
             return ready;
         }
@@ -904,19 +1192,19 @@ impl AsyncWrite for EagerTcp {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        StdPin::new(&mut self.get_mut().0).poll_write(cx, buf)
+        StdPin::new(&mut self.get_mut().stream).poll_write(cx, buf)
     }
 
     fn poll_flush(self: StdPin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        StdPin::new(&mut self.get_mut().0).poll_flush(cx)
+        StdPin::new(&mut self.get_mut().stream).poll_flush(cx)
     }
 
     fn poll_shutdown(self: StdPin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        StdPin::new(&mut self.get_mut().0).poll_shutdown(cx)
+        StdPin::new(&mut self.get_mut().stream).poll_shutdown(cx)
     }
 
     fn is_write_vectored(&self) -> bool {
-        self.0.is_write_vectored()
+        self.stream.is_write_vectored()
     }
 
     fn poll_write_vectored(
@@ -924,7 +1212,7 @@ impl AsyncWrite for EagerTcp {
         cx: &mut Context<'_>,
         bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<std::io::Result<usize>> {
-        StdPin::new(&mut self.get_mut().0).poll_write_vectored(cx, bufs)
+        StdPin::new(&mut self.get_mut().stream).poll_write_vectored(cx, bufs)
     }
 }
 
@@ -1029,6 +1317,125 @@ mod tests {
         let socket = socket2::SockRef::from(&stream);
         assert!(socket.tcp_nodelay().unwrap());
         assert!(socket.keepalive().unwrap());
+    }
+
+    /// A dialled connection and a peer that reads it to the end on a thread
+    /// of its own, reporting how that read ended.
+    async fn dialled_with_peer() -> (EagerTcp, std::sync::mpsc::Receiver<std::io::Result<usize>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            let mut all = Vec::new();
+            let _ = tx.send(std::io::Read::read_to_end(&mut peer, &mut all).map(|_| all.len()));
+        });
+        let opts = ConnectOptions {
+            attempt_timeout: Duration::from_millis(250),
+            pin: None,
+            local: None,
+        };
+        (
+            dial("127.0.0.1", port, &opts, &AttemptLog::default())
+                .await
+                .unwrap(),
+            rx,
+        )
+    }
+
+    async fn peer_read_ended(
+        rx: std::sync::mpsc::Receiver<std::io::Result<usize>>,
+    ) -> std::io::Result<usize> {
+        tokio::task::spawn_blocking(move || rx.recv_timeout(Duration::from_secs(30)))
+            .await
+            .unwrap()
+            .expect("the peer's read never ended")
+    }
+
+    /// `req.socket.resetAndDestroy()` on the fetch path: closing the
+    /// connection by the id its responses carry wakes the connection's task,
+    /// the stream's drop is then a reset, and the id leaves the table with
+    /// the connection -- a late close is a no-op.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_closed_by_its_id_resets_and_leaves_the_table() {
+        let (tcp, peer) = dialled_with_peer().await;
+        let id = ConnInfo::of(&tcp)
+            .connection
+            .expect("an h1 connection is named");
+        let task = ConnCloser::find(id).expect("a live connection is in the table");
+        let waiting = tokio::spawn(async move { task.requested().await });
+        close_connection(id, true, None);
+        tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .expect("the connection's task was woken")
+            .unwrap();
+        drop(tcp);
+        let ended = peer_read_ended(peer).await;
+        assert_eq!(
+            ended.as_ref().map_err(std::io::Error::kind).err(),
+            Some(std::io::ErrorKind::ConnectionReset),
+            "{ended:?}"
+        );
+        assert!(
+            ConnCloser::find(id).is_none(),
+            "the closed connection left the table"
+        );
+        close_connection(id, true, None);
+    }
+
+    /// `destroy()` rather than `resetAndDestroy()`: the connection still
+    /// closes, with the FIN of an orderly end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_closed_without_a_reset_ends_with_a_fin() {
+        let (tcp, peer) = dialled_with_peer().await;
+        let id = ConnInfo::of(&tcp).connection.unwrap();
+        close_connection(id, false, None);
+        tokio::time::timeout(Duration::from_secs(5), tcp.closer.requested())
+            .await
+            .expect("the close was asked for");
+        drop(tcp);
+        assert_eq!(peer_read_ended(peer).await.unwrap(), 0);
+    }
+
+    /// A close asked through a finished request's socket reaches the
+    /// connection while that request's checkout is its latest -- mid-response
+    /// or idle in the pool after it -- and not once the pool has handed it to
+    /// another request: a socket kept from the first must not fail the
+    /// second, as node's does not (stale.mjs: an `https.get`'s kept
+    /// `req.socket.destroy()` failed a later `fetch()` on the reused
+    /// connection).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_close_through_an_earlier_checkout_leaves_a_reused_connection_open() {
+        let (tcp, _peer) = dialled_with_peer().await;
+        let mut first = ConnInfo::of(&tcp);
+        first.take_lease();
+        let mut second = first.clone();
+        second.take_lease();
+        assert_eq!((first.lease, second.lease), (Some(1), Some(2)));
+        let id = first.connection.unwrap();
+        close_connection(id, false, first.lease);
+        assert!(
+            !tcp.closer.requested.load(Ordering::Acquire),
+            "the first request's socket closed the second's connection"
+        );
+        close_connection(id, false, second.lease);
+        tokio::time::timeout(Duration::from_secs(5), tcp.closer.requested())
+            .await
+            .expect("the current request's socket closes it");
+    }
+
+    /// An h2 connection carries many requests at once: it is not named, so
+    /// no one request's socket can close it under the others.
+    #[tokio::test]
+    async fn an_h2_connection_is_not_named() {
+        let (tcp, _peer) = dialled_with_peer().await;
+        let info = ConnInfo::of(&tcp);
+        assert!(info.connection.is_some());
+        let conn = OamConn::new(Box::new(tcp), true, false, info);
+        assert_eq!(conn.conn_info().connection, None);
+        let mut taken = conn.conn_info();
+        taken.take_lease();
+        assert_eq!(taken.lease, None);
     }
 
     /// The proxy dial takes the URI it is given even when the proxy rules

@@ -96,6 +96,10 @@ pub struct IncomingRequest {
     pub method: String,
     /// Path + query, as received.
     pub uri: String,
+    /// The request line said `HTTP/1.0` (node's `req.httpVersion` '1.0',
+    /// which decides how node frames the response). Anything else is 1.1 to
+    /// the http server's request; an h2 request has its own compat class.
+    pub http10: bool,
     pub headers: Vec<(String, String)>,
     pub is_upgrade: bool,
     pub socket_handle: Option<u64>,
@@ -169,6 +173,9 @@ pub enum ServerEvent {
     /// closes them (node's socket 'close').
     ConnectionClosed {
         conn_id: u64,
+        /// The peer reset the connection under a read: node's socket
+        /// reports it before it closes (`read ECONNRESET`).
+        reset: Option<crate::http_conn::ConnFailure>,
     },
     /// A connection refused under `server.maxConnections` (node's 'drop').
     Drop {
@@ -180,6 +187,8 @@ pub enum ServerEvent {
     /// 'close' without 'finish').
     Closed {
         request_id: u64,
+        /// As for `ConnectionClosed`: the reset the connection went with.
+        reset: Option<crate::http_conn::ConnFailure>,
     },
 }
 
@@ -302,6 +311,10 @@ impl Drop for BudgetedChunk {
     }
 }
 
+/// One step of a streamed request body: a chunk, or why the body failed --
+/// node's error for it when node has one (see [`request_body_failure`]).
+pub type BodyChunk = Result<BudgetedChunk, crate::OpOutcome>;
+
 pub enum RequestBody {
     /// Collected up front, subject to MAX_REQUEST_BODY + GLOBAL_BODY_BUDGET.
     Full(Vec<u8>),
@@ -312,7 +325,7 @@ pub enum RequestBody {
     /// Taken out for the duration of each read await and reinserted after,
     /// the same remove-await-reinsert the accept queue uses; the JS side is
     /// the single consumer.
-    Stream(mpsc::Receiver<Result<BudgetedChunk, String>>),
+    Stream(mpsc::Receiver<BodyChunk>),
     /// The receiver is checked out by an in-flight read. The entry STAYS in
     /// the registry so a miss can be told apart from "no such body" -- a
     /// bare removal made a checked-out stream look absent, and the buffered
@@ -322,7 +335,7 @@ pub enum RequestBody {
 
 /// Outcome of checking out a streamed body receiver.
 pub enum BodyCheckout {
-    Ready(mpsc::Receiver<Result<BudgetedChunk, String>>),
+    Ready(mpsc::Receiver<BodyChunk>),
     /// Another read holds it; the caller must NOT treat this as EOF.
     InFlight,
     /// No streamed body for this id (buffered, or already finished).
@@ -330,11 +343,19 @@ pub enum BodyCheckout {
 }
 
 pub enum ResponseBody {
+    /// A body whose length is known before the head goes out: hyper sends
+    /// a `content-length` (or nothing, where the response cannot have a
+    /// body).
     Full(Vec<u8>),
-    /// Chunk channel plus a drop-signal: the oneshot sender rides inside
+    /// A whole body that goes out as if its length were not known: hyper
+    /// frames it chunked, or ends it by closing the connection for an
+    /// HTTP/1.0 client. node:http frames `writeHead(); end('text')` so. The
+    /// trailers go out after it when it is chunked.
+    Unsized(Vec<u8>, Option<hyper::HeaderMap>),
+    /// Frame channel plus a drop-signal: the oneshot sender rides inside
     /// ChannelBody, so dropping the body (finished OR connection lost)
     /// resolves the paired stream_watch receiver.
-    Stream(mpsc::Receiver<Vec<u8>>, oneshot::Sender<()>),
+    Stream(mpsc::Receiver<Frame<Bytes>>, oneshot::Sender<()>),
     /// JS destroyed the request without responding (req.destroy()): the
     /// connection is torn down instead of synthesizing a response, so the
     /// client observes a connection error (Node's socket-destroy semantics).
@@ -342,9 +363,63 @@ pub enum ResponseBody {
 }
 
 pub struct ResponseSpec {
+    pub head: ResponseHead,
+    pub body: ResponseBody,
+}
+
+/// What a response's head is made of.
+pub struct ResponseHead {
     pub status: u16,
     pub headers: Vec<(String, String)>,
-    pub body: ResponseBody,
+    /// How each header value's code points -- and the reason phrase's --
+    /// become bytes.
+    pub header_bytes: HeaderBytes,
+    /// The status line's reason phrase when it is not the status code's
+    /// standard one (node:http's `statusMessage`); hyper writes the standard
+    /// one itself, so the common response carries none.
+    pub reason: Option<String>,
+    /// node:http's: each header name goes out in the case it is spelled in
+    /// here, where hyper writes it lowercase (title case for the names the
+    /// connection adds itself; `http1_builder`).
+    pub name_case: bool,
+}
+
+/// The reason phrase hyper writes for `status` when a response names none
+/// ([`ResponseHead::reason`] is `None`).
+pub fn standard_reason(status: u16) -> Option<&'static str> {
+    hyper::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|code| code.canonical_reason())
+}
+
+impl ResponseHead {
+    /// A head with the standard reason phrase and UTF-8 header values:
+    /// oam.serve's, the http2 compat server's, and the ones oam answers
+    /// with itself.
+    pub fn plain(status: u16, headers: Vec<(String, String)>) -> Self {
+        ResponseHead {
+            status,
+            headers,
+            header_bytes: HeaderBytes::Utf8,
+            reason: None,
+            name_case: false,
+        }
+    }
+}
+
+/// How a response's header values go on the wire.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HeaderBytes {
+    /// Each value's UTF-8: oam.serve's responses, the http2 compat
+    /// server's, and a node:http response whose head node would send joined
+    /// to a UTF-8 string body.
+    Utf8,
+    /// One byte per code point (latin1), as node writes a response head in
+    /// every other case (`ServerResponse#_headIsUtf8` in node_compat.js has
+    /// the rule). A code point above U+00FF has no byte: JS refuses such a
+    /// value as node does, and one that arrives anyway fails the response
+    /// as any other unsendable header does, never as its UTF-8.
+    Latin1,
 }
 
 struct ServerEntry {
@@ -427,7 +502,7 @@ pub struct HttpState {
     /// body removes these (lock order: `bodies`, then this).
     trailers: Mutex<HashMap<u64, Vec<(String, String)>>>,
     /// response-stream id -> chunk sender (JS pushes, hyper drains).
-    streams: Mutex<HashMap<u64, mpsc::Sender<Vec<u8>>>>,
+    streams: Mutex<HashMap<u64, mpsc::Sender<Frame<Bytes>>>>,
     /// response-stream id -> resolves when hyper drops the response body
     /// (normal completion OR connection loss). httpStreamClosed takes the
     /// receiver; JS tells the two cases apart via its own finished flag.
@@ -582,6 +657,14 @@ impl HttpState {
         }
     }
 
+    /// `socket.resetAndDestroy()` on a server connection: closed with a
+    /// reset, whatever it was doing ([`CloseReason::Reset`]).
+    pub fn reset_conn(&self, conn_id: u64) {
+        if let Some(watch) = self.conn(conn_id) {
+            watch.close(CloseReason::Reset);
+        }
+    }
+
     /// Sync (isolate-thread) helpers consumed by the engine natives.
     /// Take the fully-collected body. Returns None for a request whose body
     /// is being streamed (no such request yet -- see slice 2), so callers
@@ -630,7 +713,7 @@ impl HttpState {
 
     /// Reinsert a receiver taken by `take_body_stream`. Dropped silently if
     /// the request finished while the read was in flight.
-    pub fn put_body_stream(&self, id: u64, rx: mpsc::Receiver<Result<BudgetedChunk, String>>) {
+    pub fn put_body_stream(&self, id: u64, rx: mpsc::Receiver<BodyChunk>) {
         let mut guard = self.bodies.lock().unwrap_or_else(|e| e.into_inner());
         // Reinsert ONLY onto the StreamPending marker left by
         // take_body_stream. A missing entry means the body was cancelled or
@@ -674,13 +757,8 @@ impl HttpState {
         }
     }
 
-    pub fn respond_full(
-        &self,
-        id: u64,
-        status: u16,
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
-    ) -> bool {
+    /// Answer with a whole body: `ResponseBody::Full` or `Unsized`.
+    pub fn respond_full(&self, id: u64, head: ResponseHead, body: ResponseBody) -> bool {
         let Some(responder) = self
             .pending
             .lock()
@@ -689,28 +767,31 @@ impl HttpState {
         else {
             return false;
         };
-        responder
-            .send(ResponseSpec {
-                status,
-                headers,
-                body: ResponseBody::Full(body),
-            })
-            .is_ok()
+        responder.send(ResponseSpec { head, body }).is_ok()
     }
 
     /// Start a streaming response; returns the stream handle JS pushes to.
     pub fn respond_stream(
         &self,
         id: u64,
-        status: u16,
-        headers: Vec<(String, String)>,
+        head: ResponseHead,
+        first: Option<Vec<u8>>,
     ) -> Option<u64> {
         let responder = self
             .pending
             .lock()
             .expect("http pending lock")
             .remove(&id)?;
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(16);
+        let (tx, rx) = mpsc::channel::<Frame<Bytes>>(16);
+        // node's OutgoingMessage#_send joins the head to the first chunk
+        // written after it, so both go out in one write. In the channel
+        // before hyper has the response, the chunk is there when hyper
+        // writes the head, and goes in the same flush; pushed after, it
+        // could follow in a segment of its own -- which a client that
+        // closed on the head answers with a reset.
+        if let Some(first) = first.filter(|bytes| !bytes.is_empty()) {
+            let _ = tx.try_send(Frame::data(Bytes::from(first)));
+        }
         let (closed_tx, closed_rx) = oneshot::channel::<()>();
         let stream_id = self.next_id();
         self.streams
@@ -723,8 +804,7 @@ impl HttpState {
             .insert(stream_id, closed_rx);
         let ok = responder
             .send(ResponseSpec {
-                status,
-                headers,
+                head,
                 body: ResponseBody::Stream(rx, closed_tx),
             })
             .is_ok();
@@ -750,14 +830,13 @@ impl HttpState {
         };
         responder
             .send(ResponseSpec {
-                status: 0,
-                headers: Vec::new(),
+                head: ResponseHead::plain(0, Vec::new()),
                 body: ResponseBody::Abort,
             })
             .is_ok()
     }
 
-    pub fn stream_sender(&self, stream_id: u64) -> Option<mpsc::Sender<Vec<u8>>> {
+    pub fn stream_sender(&self, stream_id: u64) -> Option<mpsc::Sender<Frame<Bytes>>> {
         self.streams
             .lock()
             .expect("http streams lock")
@@ -809,11 +888,12 @@ impl HttpState {
     }
 }
 
-/// hyper Body over the JS-pushed chunk channel. `_closed_tx` is never sent
-/// on: its DROP (body finished or connection torn down) is the signal the
-/// paired stream_watch receiver resolves on.
+/// hyper Body over the JS-pushed frame channel: body chunks, and a node:http
+/// response's trailers last. `_closed_tx` is never sent on: its DROP (body
+/// finished or connection torn down) is the signal the paired stream_watch
+/// receiver resolves on.
 struct ChannelBody {
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<Frame<Bytes>>,
     _closed_tx: oneshot::Sender<()>,
 }
 
@@ -825,25 +905,87 @@ impl hyper::body::Body for ChannelBody {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        match self.rx.poll_recv(cx) {
-            std::task::Poll::Ready(Some(chunk)) => {
-                std::task::Poll::Ready(Some(Ok(Frame::data(Bytes::from(chunk)))))
-            }
-            std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
-            std::task::Poll::Pending => std::task::Poll::Pending,
-        }
+        self.rx.poll_recv(cx).map(|frame| frame.map(Ok))
     }
+}
+
+/// A whole body that does not tell hyper its length: its size hint is
+/// hyper's default (unknown) and it is not at its end before it is polled,
+/// so hyper frames it as a streamed one -- chunked, or by closing the
+/// connection for an HTTP/1.0 client -- even when it is empty. Its trailers,
+/// if any, follow the data (hyper sends them only on a chunked body).
+struct UnsizedBody {
+    data: Option<Bytes>,
+    trailers: Option<hyper::HeaderMap>,
+}
+
+impl hyper::body::Body for UnsizedBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let data = self.data.take().filter(|bytes| !bytes.is_empty());
+        let frame = data
+            .map(Frame::data)
+            .or_else(|| self.trailers.take().map(Frame::trailers));
+        std::task::Poll::Ready(frame.map(Ok))
+    }
+}
+
+/// A node:http response's trailer fields, as hyper sends them: each value
+/// one byte per code point, as node writes its trailer string, and a
+/// repeated field as often as it repeats. `None` when a name or a value is
+/// one JS would have refused (addTrailers checks both as node's does).
+pub fn trailer_fields(pairs: &[(String, String)]) -> Option<hyper::HeaderMap> {
+    let mut map = hyper::HeaderMap::with_capacity(pairs.len());
+    for (name, value) in pairs {
+        let name = hyper::header::HeaderName::from_bytes(name.as_bytes()).ok()?;
+        map.append(name, crate::http_head::latin1_header_value(value)?);
+    }
+    Some(map)
 }
 
 type BoxedBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
 
 fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
-    let mut builder = hyper::Response::builder().status(spec.status);
-    for (name, value) in &spec.headers {
-        builder = builder.header(name, value);
+    let head = spec.head;
+    let mut builder = hyper::Response::builder().status(head.status);
+    for (name, value) in &head.headers {
+        builder = match head.header_bytes {
+            HeaderBytes::Utf8 => builder.header(name, value),
+            HeaderBytes::Latin1 => match crate::http_head::latin1_header_value(value) {
+                Some(value) => builder.header(name, value),
+                None => return bad_response_spec(),
+            },
+        };
+    }
+    if head.name_case
+        && let Some(case) = header_name_case(&head.headers)
+    {
+        builder = builder.extension(case);
+    }
+    if let Some(reason) = head.reason {
+        // In the same bytes as the header values: node writes the status
+        // line as part of the head string.
+        let bytes = match head.header_bytes {
+            HeaderBytes::Utf8 => Some(reason.into_bytes()),
+            HeaderBytes::Latin1 => crate::http_head::latin1_bytes(&reason),
+        };
+        match bytes.map(hyper::ext::ReasonPhrase::try_from) {
+            Some(Ok(reason)) => builder = builder.extension(reason),
+            _ => return bad_response_spec(),
+        }
     }
     let body: BoxedBody = match spec.body {
         ResponseBody::Full(bytes) => http_body_util::Full::new(Bytes::from(bytes)).boxed(),
+        ResponseBody::Unsized(bytes, trailers) => UnsizedBody {
+            data: Some(Bytes::from(bytes)),
+            trailers,
+        }
+        .boxed(),
         ResponseBody::Stream(rx, closed_tx) => ChannelBody {
             rx,
             _closed_tx: closed_tx,
@@ -853,12 +995,51 @@ fn spec_to_response(spec: ResponseSpec) -> hyper::Response<BoxedBody> {
         // building a response); never reaches the spec-to-response path.
         ResponseBody::Abort => http_body_util::Empty::new().boxed(),
     };
-    builder.body(body).unwrap_or_else(|_| {
-        hyper::Response::builder()
-            .status(500)
-            .body(http_body_util::Full::new(Bytes::from_static(b"oam: bad response spec")).boxed())
-            .expect("static 500 builds")
+    builder.body(body).unwrap_or_else(|_| bad_response_spec())
+}
+
+/// How a node:http response's header names are spelled on the wire, for
+/// hyper: `None` -- nothing allocated -- when every name is already in the
+/// title case its connection writes names in (`Content-Type`, `X-Request-Id`;
+/// `http1_builder`), else every name's spelling, in the order its values go
+/// out. node writes each name as the handler spelled it.
+fn header_name_case(headers: &[(String, String)]) -> Option<hyper::ext::HeaderCaseMap> {
+    if headers
+        .iter()
+        .all(|(name, _)| is_title_case(name.as_bytes()))
+    {
+        return None;
+    }
+    let mut map = hyper::HeaderMap::<Bytes>::with_capacity(headers.len());
+    for (name, _) in headers {
+        if let Ok(key) = hyper::header::HeaderName::from_bytes(name.as_bytes()) {
+            map.append(key, Bytes::copy_from_slice(name.as_bytes()));
+        }
+    }
+    Some(hyper::ext::HeaderCaseMap(map))
+}
+
+/// Whether hyper's title case leaves `name` as it is: an upper-case letter
+/// first and after each `-`, lower case everywhere else.
+fn is_title_case(name: &[u8]) -> bool {
+    let mut prev = b'-';
+    name.iter().all(|&c| {
+        let expected = if prev == b'-' {
+            c.to_ascii_uppercase()
+        } else {
+            c.to_ascii_lowercase()
+        };
+        prev = c;
+        c == expected
     })
+}
+
+/// What a response that cannot be sent as given is answered with.
+fn bad_response_spec() -> hyper::Response<BoxedBody> {
+    hyper::Response::builder()
+        .status(500)
+        .body(http_body_util::Full::new(Bytes::from_static(b"oam: bad response spec")).boxed())
+        .expect("static 500 builds")
 }
 
 // ---- Upgrade and CONNECT requests ----
@@ -929,10 +1110,17 @@ fn refused_head_response(error: HeadError) -> hyper::Response<BoxedBody> {
         .expect("static refusal builds")
 }
 
-/// An HTTP/1 connection builder for a server with `policy`.
-fn http1_builder(policy: HeadPolicy) -> hyper::server::conn::http1::Builder {
+/// An HTTP/1 connection builder for a server with `policy`. `node_names`:
+/// the server is a node:http one, whose responses write header names as
+/// node does -- the names it adds itself as `Date`, `Content-Length`,
+/// `Transfer-Encoding`, `Connection` (hyper's title case), and the ones a
+/// handler set in the case it set them in, which a response whose names
+/// are not already in title case carries as a `HeaderCaseMap`
+/// (spec_to_response). Other servers write them lowercase.
+fn http1_builder(policy: HeadPolicy, node_names: bool) -> hyper::server::conn::http1::Builder {
     let mut builder = hyper::server::conn::http1::Builder::new();
     builder.max_buf_size(policy.read_buffer_limit());
+    builder.title_case_headers(node_names);
     // hyper refuses a head of more than 100 fields by default; node refuses one
     // only on its byte size. Lift the field ceiling to the byte budget so the
     // parser stops at the same point node does -- the excess beyond
@@ -1154,7 +1342,12 @@ async fn serve_http1<S, Svc>(
     takeover: Option<oneshot::Receiver<Takeover>>,
 ) -> Option<(S, Bytes, Takeover)>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead
+        + tokio::io::AsyncWrite
+        + crate::http_conn::AbortiveClose
+        + Unpin
+        + Send
+        + 'static,
     Svc: hyper::service::Service<
             hyper::Request<hyper::body::Incoming>,
             Response = hyper::Response<BoxedBody>,
@@ -1165,7 +1358,8 @@ where
     Svc::Future: Send + 'static,
 {
     let io = hyper_util::rt::TokioIo::new(WatchedIo::new(stream, Arc::clone(&watch)));
-    let mut conn = http1_builder(policy).serve_connection(io, service);
+    // A js-driven server is a node:http (or https) one.
+    let mut conn = http1_builder(policy, js_driven).serve_connection(io, service);
     // A connection no request can take has a receiver that never fires.
     let (mut taken, mut takeable) = match takeover {
         Some(rx) => (rx, true),
@@ -1247,7 +1441,13 @@ where
         }
     };
     match ended {
-        Ended::Done => None,
+        Ended::Done => {
+            // The close reports what failed the connection: a body pump
+            // notes a parse error from what hyper left in its body, before
+            // hyper's side (and the handler's exchange) goes below.
+            watch.pumps_settled(PUMPS_SETTLE_BUDGET).await;
+            None
+        }
         Ended::Closed(reason) => {
             // hyper's side ends here: an in-flight handler future is dropped
             // (its RequestGuard tells JS the exchange ended), and the stream
@@ -1282,6 +1482,10 @@ where
     }
 }
 
+/// How long a finished connection waits for its request-body pumps to take
+/// what hyper left them ([`ConnWatch::pumps_settled`]).
+const PUMPS_SETTLE_BUDGET: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// How long close() waits for an accept loop to drop its listening socket.
 const LISTENER_CLOSE_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -1291,8 +1495,8 @@ pub async fn http_serve(
     state: Arc<HttpState>,
     tcp: super::tcp::TcpRegistry,
     tcp_ids: Arc<std::sync::atomic::AtomicU64>,
-    host: String,
-    port: u16,
+    // Where to listen, as node's net.Server does (super::tcp::bind_listener).
+    at: super::tcp::ListenAt,
     // Dispatch the JS handler on headers and stream the body (slice 2 of
     // docs/design/streaming-bodies.md). Off = today's buffered behavior.
     stream_request_body: bool,
@@ -1301,11 +1505,10 @@ pub async fn http_serve(
     // node's server timeouts (headersTimeout, keepAliveTimeout, ...).
     timeouts: TimeoutSettings,
 ) -> super::OpOutcome {
-    let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
-        Ok(listener) => listener,
-        Err(e) => return super::OpOutcome::Failed(format!("listen {host}:{port}: {e}")),
+    let (listener, local) = match super::tcp::bind_listener(&at).await {
+        Ok(bound) => bound,
+        Err(e) => return super::OpOutcome::sys(e),
     };
-    let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     let server_id = state.next_id();
     let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -1403,10 +1606,13 @@ pub async fn http_serve(
                             // went away under it: the connection closes
                             // without a request ever reaching the handler,
                             // and without an answer on the wire.
-                            drop(stream);
+                            crate::http_conn::close_unserved(stream, &watch);
                             if announcement.announced {
                                 let _ = conn_queue
-                                    .send(ServerEvent::ConnectionClosed { conn_id })
+                                    .send(ServerEvent::ConnectionClosed {
+                                        conn_id,
+                                        reset: watch.failure(),
+                                    })
                                     .await;
                             }
                             drop(registration);
@@ -1437,6 +1643,7 @@ pub async fn http_serve(
                                 upgrades.clone(),
                             )
                         });
+                        let closed_watch = Arc::clone(&watch);
                         let taken = serve_http1(
                             stream,
                             watch,
@@ -1468,7 +1675,10 @@ pub async fn http_serve(
                         let Some((stream, head, takeover)) = taken else {
                             if announcement.announced {
                                 let _ = conn_queue
-                                    .send(ServerEvent::ConnectionClosed { conn_id })
+                                    .send(ServerEvent::ConnectionClosed {
+                                        conn_id,
+                                        reset: closed_watch.failure(),
+                                    })
                                     .await;
                             }
                             return;
@@ -1484,6 +1694,7 @@ pub async fn http_serve(
                                 id: takeover.id,
                                 method: takeover.head.method,
                                 uri: takeover.head.target,
+                                http10: takeover.head.http10,
                                 headers: takeover.head.headers,
                                 is_upgrade: true,
                                 socket_handle: Some(handle),
@@ -1508,7 +1719,13 @@ pub async fn http_serve(
     });
 
     super::OpOutcome::Json(
-        serde_json::json!({ "serverId": server_id, "port": local_port }).to_string(),
+        serde_json::json!({
+            "serverId": server_id,
+            "port": local.port(),
+            "address": local.ip().to_string(),
+            "family": node_family(&local),
+        })
+        .to_string(),
     )
 }
 
@@ -1531,7 +1748,9 @@ struct RequestGuard {
     /// Where to report an exchange that ends before JS answered it (the
     /// connection was closed under it), for a server whose JS keeps the
     /// request / response pair.
-    closed_to: Option<mpsc::Sender<ServerEvent>>,
+    /// Where to report an exchange that ends before JS answered it, and
+    /// the connection's watch, which knows whether the peer reset it.
+    closed_to: Option<(mpsc::Sender<ServerEvent>, Arc<ConnWatch>)>,
 }
 
 impl Drop for RequestGuard {
@@ -1547,12 +1766,15 @@ impl Drop for RequestGuard {
         // rather than one that can be dropped.
         if unanswered
             && self.dispatched
-            && let Some(queue) = self.closed_to.take()
+            && let Some((queue, watch)) = self.closed_to.take()
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
             let request_id = self.id;
+            // hyper drops the handler's future once the connection has
+            // ended, so a reset its read saw is known by now.
+            let reset = watch.failure();
             runtime.spawn(async move {
-                let _ = queue.send(ServerEvent::Closed { request_id }).await;
+                let _ = queue.send(ServerEvent::Closed { request_id, reset }).await;
             });
         }
         let mut bodies = self.state.bodies.lock().expect("http bodies lock");
@@ -1636,10 +1858,38 @@ fn refuse_unanswered(state: &HttpState, id: u64, status: u16) {
         .remove(&id);
     if let Some(responder) = responder {
         let _ = responder.send(ResponseSpec {
-            status,
-            headers: vec![("connection".to_string(), "close".to_string())],
+            head: ResponseHead::plain(
+                status,
+                vec![("connection".to_string(), "close".to_string())],
+            ),
             body: ResponseBody::Full(Vec::new()),
         });
+    }
+}
+
+/// What a request body hyper failed on reads as on the connection's socket
+/// in node (measured on v22.22.2): a malformed chunk-size line and a
+/// connection that ended mid-body are its parser's errors
+/// (`HPE_INVALID_CHUNK_SIZE`, `HPE_INVALID_EOF_STATE`), a reset is the
+/// socket's `read ECONNRESET`. node hands each to the server's
+/// socketOnError -- 'clientError', or the socket destroyed with it -- and
+/// the request is aborted when the socket closes; node_compat.js does the
+/// same with these. Anything else keeps the `request body: ` text.
+fn request_body_failure(error: &hyper::Error) -> crate::OpOutcome {
+    use crate::http_client::body::{
+        ServerBodyError, classify_server_body, invalid_chunk_size, invalid_eof_state,
+    };
+    match classify_server_body(error) {
+        ServerBodyError::Framing => invalid_chunk_size(),
+        ServerBodyError::Closed => invalid_eof_state(),
+        ServerBodyError::Reset(os) => {
+            let io = match os {
+                Some(code) => std::io::Error::from_raw_os_error(code),
+                None => std::io::ErrorKind::ConnectionReset.into(),
+            };
+            crate::tcp::errno_failure(&io, "read")
+        }
+        ServerBodyError::Other => crate::OpOutcome::Failed(format!("request body: {error}")),
     }
 }
 
@@ -1653,12 +1903,13 @@ fn refuse_unanswered(state: &HttpState, id: u64, status: u16) {
 /// handler has not responded yet), then the error reaches the handler.
 async fn pump_request_body(
     mut body: hyper::body::Incoming,
-    chunk_tx: mpsc::Sender<Result<BudgetedChunk, String>>,
+    chunk_tx: mpsc::Sender<BodyChunk>,
     state: std::sync::Arc<HttpState>,
     id: u64,
     // Dropped when the pump ends: the request is all in, as far as node's
     // headers / request timeouts go.
-    _message_done: MessageDone,
+    message_done: MessageDone,
+    _pump: Option<crate::http_conn::PumpGuard>,
 ) {
     use http_body_util::BodyExt;
     let mut total: usize = 0;
@@ -1669,7 +1920,24 @@ async fn pump_request_body(
                 if let Some(status) = refused_body_status(&e) {
                     refuse_unanswered(&state, id, status);
                 }
-                let _ = chunk_tx.send(Err(format!("request body: {e}"))).await;
+                // The connection's failure in node, which its close reports
+                // whether or not the handler reads this error first.
+                if let Some((watch, _)) = &message_done.0 {
+                    use crate::http_client::body::{
+                        INVALID_CHUNK_SIZE, INVALID_EOF_STATE, ServerBodyError,
+                        classify_server_body,
+                    };
+                    use crate::http_conn::ConnFailure;
+                    let parse = |(code, message): (&'static str, &'static str)| {
+                        ConnFailure::Parse { code, message }
+                    };
+                    match classify_server_body(&e) {
+                        ServerBodyError::Framing => watch.note_failure(parse(INVALID_CHUNK_SIZE)),
+                        ServerBodyError::Closed => watch.note_failure(parse(INVALID_EOF_STATE)),
+                        ServerBodyError::Reset(_) | ServerBodyError::Other => {}
+                    }
+                }
+                let _ = chunk_tx.send(Err(request_body_failure(&e))).await;
                 return;
             }
         };
@@ -1687,7 +1955,9 @@ async fn pump_request_body(
         total += data.len();
         if total > MAX_REQUEST_BODY {
             let _ = chunk_tx
-                .send(Err("request body too large".to_string()))
+                .send(Err(crate::OpOutcome::Failed(
+                    "request body too large".to_string(),
+                )))
                 .await;
             return;
         }
@@ -1703,7 +1973,9 @@ async fn pump_request_body(
             state.body_bytes.fetch_sub(len, Ordering::AcqRel);
             // The handler was dispatched on headers, so 503 is no longer
             // available; the consumer sees the error instead.
-            let _ = chunk_tx.send(Err("server is busy".to_string())).await;
+            let _ = chunk_tx
+                .send(Err(crate::OpOutcome::Failed("server is busy".to_string())))
+                .await;
             return;
         }
         // send() awaits when the channel is full: that IS the backpressure.
@@ -1799,16 +2071,19 @@ async fn collect_body(
 }
 
 /// A header map's fields as JS reads them: lowercased names, each value on
-/// its own.
+/// its own, one code point per byte (latin1). node's http parser and its
+/// http2 session both decode a header value that way, and oam's client and
+/// node's write one that way, so `caf\xe9` reads as `café` -- decoding it as
+/// UTF-8 turned the 0xE9 into U+FFFD. Used for request heads and trailers.
 fn header_pairs(map: &hyper::HeaderMap) -> Vec<(String, String)> {
     map.iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_string(),
-                String::from_utf8_lossy(value.as_bytes()).into_owned(),
-            )
-        })
+        .map(|(name, value)| (name.as_str().to_string(), latin1(value.as_bytes())))
         .collect()
+}
+
+/// Bytes as a string of the code points U+0000..=U+00FF, one per byte.
+fn latin1(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| char::from(b)).collect()
 }
 
 /// Service-level error returned only for ResponseBody::Abort: hyper drops
@@ -1850,7 +2125,7 @@ async fn handle_request(
             .map(|w| (Arc::clone(w), w.headers_complete(id))),
     );
     let conn_id = watch.as_ref().map(|w| w.id);
-    let notify_closed = watch.as_ref().is_some_and(|w| w.js_driven());
+    let notify_closed = watch.as_ref().filter(|w| w.js_driven()).map(Arc::clone);
     let response = dispatch_request(
         state,
         queue,
@@ -1882,8 +2157,8 @@ async fn dispatch_request(
     message_done: MessageDone,
     conn_id: Option<u64>,
     // Tell JS when the exchange ends without its response (a node:http
-    // server keeps the pair until then).
-    notify_closed: bool,
+    // server keeps the pair until then): the connection's watch.
+    notify_closed: Option<Arc<ConnWatch>>,
     upgrades: Upgrades,
 ) -> Result<hyper::Response<BoxedBody>, RequestAborted> {
     // node's rules for the head, on the bytes hyper parsed (HTTP/1 only;
@@ -1942,6 +2217,7 @@ async fn dispatch_request(
         .and_then(|raw| crate::http_head::request_target(raw.as_bytes()))
         .map(|target| target.iter().map(|&b| char::from(b)).collect::<String>());
     let (parts, body) = req.into_parts();
+    let http10 = parts.version == hyper::Version::HTTP_10;
     let end_stream =
         parts.version == hyper::Version::HTTP_2 && hyper::body::Body::is_end_stream(&body);
     // Collect the body, enforcing MAX_REQUEST_BODY.  When the cap is hit we
@@ -2040,18 +2316,25 @@ async fn dispatch_request(
         // Bounded: an unconsumed body applies backpressure to hyper rather
         // than growing without limit. This is the memory ceiling that
         // replaces the buffered path's byte reservation.
-        let (chunk_tx, chunk_rx) = mpsc::channel::<Result<BudgetedChunk, String>>(8);
+        let (chunk_tx, chunk_rx) = mpsc::channel::<BodyChunk>(8);
         state
             .bodies
             .lock()
             .expect("http bodies lock")
             .insert(id, RequestBody::Stream(chunk_rx));
+        // Counted from here, so the connection's close waits for it
+        // (ConnWatch::pumps_settled).
+        let pump = message_done
+            .0
+            .as_ref()
+            .map(|(watch, _)| watch.pump_started());
         tokio::spawn(pump_request_body(
             body,
             chunk_tx,
             std::sync::Arc::clone(&state),
             id,
             message_done,
+            pump,
         ));
     } else {
         state
@@ -2071,7 +2354,7 @@ async fn dispatch_request(
         id,
         reserved: body_len,
         dispatched: false,
-        closed_to: notify_closed.then(|| queue.clone()),
+        closed_to: notify_closed.map(|watch| (queue.clone(), watch)),
     };
 
     let sent = queue
@@ -2079,6 +2362,7 @@ async fn dispatch_request(
             id,
             method: parts.method.as_str().to_string(),
             uri,
+            http10,
             headers,
             is_upgrade: false,
             socket_handle: None,
@@ -2126,8 +2410,8 @@ async fn dispatch_request(
 #[allow(clippy::too_many_arguments)]
 pub async fn https_serve(
     state: Arc<HttpState>,
-    host: String,
-    port: u16,
+    // Where to listen, as node's net.Server does (super::tcp::bind_listener).
+    at: super::tcp::ListenAt,
     // The secure context and accept options, replaceable from JS.
     tls: Arc<HttpsTls>,
     // maxHeaderSize / insecureHTTPParser for this server.
@@ -2140,11 +2424,10 @@ pub async fn https_serve(
     tls_registry: crate::tls::TlsRegistry,
     body_ids: Arc<std::sync::atomic::AtomicU64>,
 ) -> super::OpOutcome {
-    let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
-        Ok(listener) => listener,
-        Err(e) => return super::OpOutcome::Failed(format!("listen {host}:{port}: {e}")),
+    let (listener, local) = match super::tcp::bind_listener(&at).await {
+        Ok(bound) => bound,
+        Err(e) => return super::OpOutcome::sys(e),
     };
-    let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     let server_id = state.next_id();
     let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -2235,7 +2518,7 @@ pub async fn https_serve(
                             // run and no
                             // 'tlsClientError' is raised -- node's client
                             // sees the connection close mid-handshake.
-                            drop(stream);
+                            crate::http_conn::close_unserved(stream, &watch);
                             None
                         } else {
                             // A handshake under way when close() is called
@@ -2303,7 +2586,10 @@ pub async fn https_serve(
                         // connection, however it ended.
                         if announced {
                             let _ = conn_queue
-                                .send(ServerEvent::ConnectionClosed { conn_id })
+                                .send(ServerEvent::ConnectionClosed {
+                                    conn_id,
+                                    reset: watch.failure(),
+                                })
                                 .await;
                         }
                     });
@@ -2317,7 +2603,13 @@ pub async fn https_serve(
     });
 
     super::OpOutcome::Json(
-        serde_json::json!({ "serverId": server_id, "port": local_port }).to_string(),
+        serde_json::json!({
+            "serverId": server_id,
+            "port": local.port(),
+            "address": local.ip().to_string(),
+            "family": node_family(&local),
+        })
+        .to_string(),
     )
 }
 
@@ -2361,7 +2653,8 @@ async fn serve_https_connection(
     // request ever reaching the handler,
     // and without an answer on the wire.
     if !announcement.serve {
-        drop(tls_stream);
+        // The plain socket 'connection' handed out may have been reset.
+        crate::http_conn::close_unserved(tls_stream, &watch);
         return announcement.announced;
     }
     // node's http timeouts start where its http side takes the connection:
@@ -2431,6 +2724,7 @@ async fn serve_https_connection(
             id: takeover.id,
             method: takeover.head.method,
             uri: takeover.head.target,
+            http10: takeover.head.http10,
             headers: takeover.head.headers,
             is_upgrade: true,
             socket_handle: Some(handle),
@@ -2495,6 +2789,10 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
                 "uri": request.uri,
                 "headers": request.headers,
             });
+            // Only when it is not 1.1, so the usual request carries nothing more.
+            if request.http10 {
+                meta["httpVersion"] = serde_json::json!("1.0");
+            }
             request.conn.write_meta(&mut meta);
             if request.end_stream {
                 meta["endStream"] = serde_json::json!(true);
@@ -2550,9 +2848,14 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
             conn.write_meta(&mut meta);
             super::OpOutcome::Json(meta.to_string())
         }
-        Some(ServerEvent::ConnectionClosed { conn_id }) => super::OpOutcome::Json(
-            serde_json::json!({ "event": "connectionClosed", "connectionId": conn_id }).to_string(),
-        ),
+        Some(ServerEvent::ConnectionClosed { conn_id, reset }) => {
+            let mut meta =
+                serde_json::json!({ "event": "connectionClosed", "connectionId": conn_id });
+            if let Some(reset) = reset {
+                meta["reset"] = reset.to_json();
+            }
+            super::OpOutcome::Json(meta.to_string())
+        }
         Some(ServerEvent::Drop { conn }) => {
             let mut meta = serde_json::json!({ "event": "drop" });
             conn.write_meta(&mut meta);
@@ -2571,9 +2874,13 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
             conn.write_meta(&mut meta);
             super::OpOutcome::Json(meta.to_string())
         }
-        Some(ServerEvent::Closed { request_id }) => super::OpOutcome::Json(
-            serde_json::json!({ "event": "closed", "requestId": request_id }).to_string(),
-        ),
+        Some(ServerEvent::Closed { request_id, reset }) => {
+            let mut meta = serde_json::json!({ "event": "closed", "requestId": request_id });
+            if let Some(reset) = reset {
+                meta["reset"] = reset.to_json();
+            }
+            super::OpOutcome::Json(meta.to_string())
+        }
         None => super::OpOutcome::Done,
     }
 }
@@ -2593,16 +2900,15 @@ const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
 /// semantics: h2c with prior knowledge AND HTTP/1.1 clients both work.
 pub async fn http2_serve(
     state: Arc<HttpState>,
-    host: String,
-    port: u16,
+    // Where to listen, as node's net.Server does (super::tcp::bind_listener).
+    at: super::tcp::ListenAt,
     // Applied to the HTTP/1 connections this server also accepts.
     policy: HeadPolicy,
 ) -> super::OpOutcome {
-    let listener = match tokio::net::TcpListener::bind((host.as_str(), port)).await {
-        Ok(listener) => listener,
-        Err(e) => return super::OpOutcome::Failed(format!("listen {host}:{port}: {e}")),
+    let (listener, local) = match super::tcp::bind_listener(&at).await {
+        Ok(bound) => bound,
+        Err(e) => return super::OpOutcome::sys(e),
     };
-    let local_port = listener.local_addr().map(|a| a.port()).unwrap_or(port);
     let server_id = state.next_id();
     let (queue_tx, queue_rx) = mpsc::channel::<ServerEvent>(64);
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -2772,7 +3078,13 @@ pub async fn http2_serve(
     });
 
     super::OpOutcome::Json(
-        serde_json::json!({ "serverId": server_id, "port": local_port }).to_string(),
+        serde_json::json!({
+            "serverId": server_id,
+            "port": local.port(),
+            "address": local.ip().to_string(),
+            "family": node_family(&local),
+        })
+        .to_string(),
     )
 }
 
@@ -2807,10 +3119,34 @@ pub async fn http_body_push(
     stream_id: u64,
     bytes: Vec<u8>,
 ) -> super::OpOutcome {
+    push_frame(state, stream_id, Frame::data(Bytes::from(bytes))).await
+}
+
+/// A node:http response's trailer fields, pushed after its last chunk;
+/// hyper sends them when it chunks the body, and drops them otherwise, as
+/// node does.
+pub async fn http_body_trailers(
+    state: Arc<HttpState>,
+    stream_id: u64,
+    pairs: Vec<(String, String)>,
+) -> super::OpOutcome {
+    let Some(trailers) = trailer_fields(&pairs) else {
+        return super::OpOutcome::Failed("invalid trailer field".to_string());
+    };
+    push_frame(state, stream_id, Frame::trailers(trailers)).await
+}
+
+/// One frame onto a streaming response's channel, with the backpressure
+/// and the timeout described above.
+async fn push_frame(
+    state: Arc<HttpState>,
+    stream_id: u64,
+    frame: Frame<Bytes>,
+) -> super::OpOutcome {
     let Some(sender) = state.stream_sender(stream_id) else {
         return super::OpOutcome::Failed(format!("http stream {stream_id} is gone"));
     };
-    match tokio::time::timeout(STREAM_PUSH_TIMEOUT, sender.send(bytes)).await {
+    match tokio::time::timeout(STREAM_PUSH_TIMEOUT, sender.send(frame)).await {
         Ok(Ok(())) => super::OpOutcome::Done,
         Ok(Err(_)) => {
             // Receiver dropped (hyper ended the response / connection gone).
@@ -2823,6 +3159,61 @@ pub async fn http_body_push(
             state.end_stream(stream_id);
             super::OpOutcome::Failed("stream stalled: client is not reading".to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod name_case_tests {
+    use super::*;
+
+    fn pairs(names: &[&str]) -> Vec<(String, String)> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), "v".to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn title_case_is_what_hyper_writes_by_itself() {
+        for name in [
+            "Content-Type",
+            "X-Request-Id",
+            "Date",
+            "X-1a",
+            "Www-Authenticate",
+        ] {
+            assert!(is_title_case(name.as_bytes()), "{name}");
+        }
+        for name in [
+            "content-type",
+            "X-REQUEST-ID",
+            "x-Request-Id",
+            "WWW-Authenticate",
+            "Etag-",
+        ] {
+            assert_eq!(is_title_case(name.as_bytes()), name == "Etag-", "{name}");
+        }
+    }
+
+    #[test]
+    fn names_already_in_title_case_need_no_map() {
+        assert!(header_name_case(&pairs(&["Content-Type", "X-A"])).is_none());
+        assert!(header_name_case(&[]).is_none());
+    }
+
+    #[test]
+    fn one_name_off_title_case_spells_every_value_in_order() {
+        let map = header_name_case(&pairs(&["X-R", "x-r", "Content-Type", "X-r"]))
+            .expect("a map")
+            .0;
+        let spelled = |name: &str| {
+            map.get_all(name)
+                .iter()
+                .map(|b| String::from_utf8(b.to_vec()).unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(spelled("x-r"), ["X-R", "x-r", "X-r"]);
+        assert_eq!(spelled("content-type"), ["Content-Type"]);
     }
 }
 

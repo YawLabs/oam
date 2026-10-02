@@ -148,7 +148,9 @@ const DEFAULT_HEAP_MB: usize = 4096;
 enum HeapCapSource {
     /// User set `OAM_MAX_HEAP_MB` to a positive number.
     User,
-    /// Built-in 4 GiB default (env var unset, empty, or "0").
+    /// Built-in 4 GiB default (env var unset, empty, or holding something
+    /// that is not a positive number -- "0" included -- which is warned about
+    /// and ignored).
     Default,
     /// Derived from this process's cgroup memory limit, because the env var
     /// was unset and we are running under a container limit smaller than the
@@ -168,13 +170,13 @@ thread_local! {
     static HEAP_CAP_SOURCE: std::cell::Cell<HeapCapSource> = const { std::cell::Cell::new(HeapCapSource::Default) };
 }
 
-/// Resolved heap-cap configuration. The `Option<usize>` is the cap in MiB
-/// (`None` -> V8 default, no cap). The [`source`] tag is the provenance, used
-/// by the OOM banner so it attributes the cap to the user-set env var or the
-/// built-in default truthfully -- re-reading the env at OOM time would lie
-/// if the user mutated it after startup.
+/// Resolved heap-cap configuration: the cap in MiB, and there always is one.
+/// The [`source`] tag is the provenance, used by the OOM banner so it
+/// attributes the cap to the user-set env var or the built-in default
+/// truthfully -- re-reading the env at OOM time would lie if the user mutated
+/// it after startup.
 struct HeapCap {
-    mb: Option<usize>,
+    mb: usize,
     source: HeapCapSource,
 }
 
@@ -296,59 +298,104 @@ fn parse_cgroup_limit(raw: &str) -> Option<u64> {
     Some(bytes)
 }
 
-/// Parse `OAM_MAX_HEAP_MB` into a hard V8 heap cap, in megabytes.
+/// What `OAM_MAX_HEAP_MB` asks for, before any default is applied.
+#[derive(Debug, PartialEq, Eq)]
+enum HeapCapRequest {
+    /// Unset, empty or all whitespace: nothing was asked for.
+    Unset,
+    /// A positive whole number of megabytes.
+    Mb(usize),
+    /// Anything else: `0`, a negative number, a word, a number too large for
+    /// a `usize`.
+    Invalid,
+}
+
+/// Read the VALUE of `OAM_MAX_HEAP_MB`. Split from the environment read so
+/// every row of the table is testable without touching process-wide state.
+fn parse_heap_cap_request(raw: Option<&str>) -> HeapCapRequest {
+    let raw = raw.map(str::trim).unwrap_or("");
+    if raw.is_empty() {
+        return HeapCapRequest::Unset;
+    }
+    match raw.parse::<usize>() {
+        Ok(mb) if mb > 0 => HeapCapRequest::Mb(mb),
+        _ => HeapCapRequest::Invalid,
+    }
+}
+
+/// Resolve `OAM_MAX_HEAP_MB` into a hard V8 heap cap, in megabytes.
 ///
 /// Node parity: this is oam's `--max-old-space-size` analogue. Resolution:
-///   * unset or empty -> [`DEFAULT_HEAP_MB`] (4 GiB on 64-bit).
-///   * `0` -> no cap (V8 default; explicit opt-out).
-///   * non-numeric -> no cap, matching the pre-default behavior so a typo
-///     never silently pins the heap to a tiny ceiling.
+///   * unset or empty -> the container-derived cap when there is one, else
+///     [`DEFAULT_HEAP_MB`] (4 GiB on 64-bit).
 ///   * `n > 0` -> n MB cap. A very small value is honored as-is; it trips
 ///     the OOM callback during startup, printing the clean banner rather
 ///     than aborting raw.
+///   * `0`, a negative or a non-numeric value -> the same cap as unset, plus
+///     one warning on stderr naming the value.
+///
+/// There is deliberately no "no cap" outcome. Leaving V8's resource
+/// constraints alone does not make the heap unbounded: V8 then applies its own
+/// static limit (about 1.5 GiB on a 16 GiB machine), which is SMALLER than the
+/// default here, and with no cap of ours the near-heap-limit callback had
+/// nothing to be registered against, so the process died of a raw V8 abort
+/// with no `OAM-RT-OOM` banner. `0` used to select exactly that: the reader
+/// who set it meaning "unlimited" got about a third of the default heap and
+/// lost the one message that says which knob to turn.
 fn resolve_heap_cap() -> HeapCap {
     let raw = std::env::var("OAM_MAX_HEAP_MB").ok();
-    let raw = match raw {
-        Some(s) if !s.is_empty() => s,
-        _ => {
-            // Nothing asked for. Prefer what the CONTAINER says over the
-            // built-in default: a 512Mi pod running a heap that believes it
-            // has 4 GiB does not OOM through V8's callback, it gets killed by
-            // the kernel -- exit 137, no banner, no crash file, no ODIF, and
-            // nothing in the logs tying the death to memory. Reading the
-            // cgroup turns that back into the deterministic, attributable exit
-            // the OOM path already knows how to render.
-            //
-            // Node does not do this (its --max-old-space-size default ignores
-            // cgroups), which is exactly why every Node-on-Kubernetes runbook
-            // carries a hand-set flag. Doing it by default is a real difference
-            // in oam's favour, not parity work.
-            if let Some(mb) = cgroup_heap_mb() {
-                return HeapCap {
-                    mb: Some(mb),
-                    source: HeapCapSource::Cgroup,
-                };
-            }
-            return HeapCap {
-                mb: Some(DEFAULT_HEAP_MB),
+    let fallback = || {
+        // Nothing usable asked for. Prefer what the CONTAINER says over the
+        // built-in default: a 512Mi pod running a heap that believes it
+        // has 4 GiB does not OOM through V8's callback, it gets killed by
+        // the kernel -- exit 137, no banner, no crash file, no ODIF, and
+        // nothing in the logs tying the death to memory. Reading the
+        // cgroup turns that back into the deterministic, attributable exit
+        // the OOM path already knows how to render.
+        //
+        // Node does not do this (its --max-old-space-size default ignores
+        // cgroups), which is exactly why every Node-on-Kubernetes runbook
+        // carries a hand-set flag. Doing it by default is a real difference
+        // in oam's favour, not parity work.
+        match cgroup_heap_mb() {
+            Some(mb) => HeapCap {
+                mb,
+                source: HeapCapSource::Cgroup,
+            },
+            None => HeapCap {
+                mb: DEFAULT_HEAP_MB,
                 source: HeapCapSource::Default,
-            };
+            },
         }
     };
-    match raw.trim().parse::<usize>() {
-        Ok(0) => HeapCap {
-            mb: None,
-            source: HeapCapSource::Default,
-        },
-        Ok(_mb) => HeapCap {
-            mb: Some(raw.trim().parse().unwrap()),
+    match parse_heap_cap_request(raw.as_deref()) {
+        HeapCapRequest::Unset => fallback(),
+        HeapCapRequest::Mb(mb) => HeapCap {
+            mb,
             source: HeapCapSource::User,
         },
-        Err(_) => HeapCap {
-            mb: None,
-            source: HeapCapSource::Default,
-        },
+        HeapCapRequest::Invalid => {
+            let cap = fallback();
+            warn_invalid_heap_cap(raw.as_deref().unwrap_or(""), cap.mb);
+            cap
+        }
     }
+}
+
+/// Say, once per process, that `OAM_MAX_HEAP_MB` held something unusable.
+///
+/// Once, because every isolate resolves the cap for itself (workers, `oam
+/// serve` workers, the fork pre-warm pool) and one bad value is one mistake.
+/// On stderr, which keeps an MCP sidecar's stdout protocol channel clean.
+fn warn_invalid_heap_cap(raw: &str, used_mb: usize) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "oam: warning: OAM_MAX_HEAP_MB={raw:?} is not a positive whole number of megabytes; \
+         ignoring it and keeping the {used_mb} MB heap cap"
+    );
 }
 
 /// V8 `NearHeapLimitCallback`: fires when the heap approaches the
@@ -443,10 +490,8 @@ impl JsRuntime {
         // analogue). Applied at isolate creation so EVERY isolate -- top-level,
         // `oam serve` workers, and fork-prewarm threads -- inherits the cap;
         // a runaway MCP sidecar can't grow the heap unbounded. The default
-        // (4 GiB) is set by `resolve_heap_cap`; only `OAM_MAX_HEAP_MB=0` opts
-        // out to the V8 default.
+        // (4 GiB) is set by `resolve_heap_cap`, which always yields a cap.
         let heap_cap = resolve_heap_cap();
-        let heap_cap_mb = heap_cap.mb;
         // Publish the cap's provenance to the OOM callback before registering
         // it. V8 invokes the callback on the same thread that owns the
         // isolate, so the thread-local is the right scope -- a worker thread
@@ -454,19 +499,17 @@ impl JsRuntime {
         HEAP_CAP_SOURCE.with(|s| s.set(heap_cap.source));
         let mut params =
             v8::CreateParams::default().snapshot_blob(v8::StartupData::from(OAM_SNAPSHOT));
-        if let Some(mb) = heap_cap_mb {
-            // initial = 0 lets V8 grow from its small default; max is the hard
-            // ceiling. Saturate so an absurd MB value can't overflow usize.
-            let max_bytes = mb.saturating_mul(1024 * 1024);
-            params = params.heap_limits(0, max_bytes);
-            // configure_defaults_from_heap_size splits `max` across the young
-            // AND old generations, so the effective old-space ceiling (what the
-            // near-heap-limit callback trips on) ends up well above `mb` and a
-            // small cap never fires. Pin the old generation directly to the
-            // requested cap -- this is the knob Node's --max-old-space-size maps
-            // to -- so OAM_MAX_HEAP_MB=64 actually caps around 64 MB.
-            params = params.set_max_old_generation_size_in_bytes(max_bytes);
-        }
+        // initial = 0 lets V8 grow from its small default; max is the hard
+        // ceiling. Saturate so an absurd MB value can't overflow usize.
+        let max_bytes = heap_cap.mb.saturating_mul(1024 * 1024);
+        params = params.heap_limits(0, max_bytes);
+        // configure_defaults_from_heap_size splits `max` across the young
+        // AND old generations, so the effective old-space ceiling (what the
+        // near-heap-limit callback trips on) ends up well above the cap and a
+        // small cap never fires. Pin the old generation directly to the
+        // requested cap -- this is the knob Node's --max-old-space-size maps
+        // to -- so OAM_MAX_HEAP_MB=64 actually caps around 64 MB.
+        params = params.set_max_old_generation_size_in_bytes(max_bytes);
         let mut isolate = v8::Isolate::new(params);
         // EXPLICIT microtask policy (docs/design/nexttick-engine.md): under
         // the default auto policy V8 flushes the microtask queue itself
@@ -475,11 +518,10 @@ impl JsRuntime {
         // ahead of ticks. The engine owns every checkpoint via
         // modules::run_ticks_and_microtasks (Node's tick-point loop).
         isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
-        if heap_cap_mb.is_some() {
-            // Preempt V8's FatalProcessOutOfMemory with a clean, deterministic
-            // exit + ODIF banner (see near_heap_limit_oom).
-            isolate.add_near_heap_limit_callback(near_heap_limit_oom, std::ptr::null_mut());
-        }
+        // Preempt V8's FatalProcessOutOfMemory with a clean, deterministic
+        // exit + ODIF banner (see near_heap_limit_oom). Unconditional: there
+        // is always a cap, so there is always a limit to be near.
+        isolate.add_near_heap_limit_callback(near_heap_limit_oom, std::ptr::null_mut());
         isolate.set_promise_reject_callback(modules::promise_reject_callback);
         isolate.add_message_listener(modules::message_listener);
         isolate.set_host_initialize_import_meta_object_callback(modules::import_meta_callback);
@@ -1025,14 +1067,13 @@ mod tests {
         // the feature working as if it were a regression.
         match cap.source {
             HeapCapSource::Default => assert_eq!(
-                cap.mb,
-                Some(4096),
+                cap.mb, 4096,
                 "unset OAM_MAX_HEAP_MB with no container limit must default to \
                  4 GiB; the pre-default behavior (no cap) is what caused the \
                  1.4 GiB mark-compact OOMs in the crash log",
             ),
             HeapCapSource::Cgroup => {
-                let mb = cap.mb.expect("a cgroup-derived cap is always Some");
+                let mb = cap.mb;
                 assert!(
                     (CGROUP_HEAP_FLOOR_MB..DEFAULT_HEAP_MB).contains(&mb),
                     "a cgroup-derived cap must sit inside the band the policy \
@@ -1133,22 +1174,61 @@ mod tests {
     }
 
     #[test]
-    fn heap_cap_zero_opts_out() {
+    fn heap_cap_request_table() {
+        // Every row of the table in #223, without touching the environment.
+        use HeapCapRequest::*;
+        for (raw, want) in [
+            (None, Unset),
+            (Some(""), Unset),
+            (Some("   "), Unset),
+            (Some("64"), Mb(64)),
+            (Some(" 64 "), Mb(64)),
+            (Some("8192"), Mb(8192)),
+            (Some("0"), Invalid),
+            (Some(" 0"), Invalid),
+            (Some("-1"), Invalid),
+            (Some("abc"), Invalid),
+            (Some("64mb"), Invalid),
+            (Some("12.5"), Invalid),
+            (Some("unlimited"), Invalid),
+            // Past usize: not a size anyone can mean.
+            (Some("99999999999999999999999999"), Invalid),
+        ] {
+            assert_eq!(parse_heap_cap_request(raw), want, "OAM_MAX_HEAP_MB={raw:?}");
+        }
+    }
+
+    /// The cap an unset variable yields on THIS host (4 GiB, or the
+    /// container-derived one) and whether it is attributed to the user, for
+    /// the rows that must equal it.
+    fn unset_heap_cap() -> (usize, bool) {
+        let _g = HeapCapEnvGuard::unset();
+        let cap = resolve_heap_cap();
+        (cap.mb, matches!(cap.source, HeapCapSource::User))
+    }
+
+    #[test]
+    fn heap_cap_zero_falls_back_to_default() {
+        let unset = unset_heap_cap();
         let _g = HeapCapEnvGuard::set("0");
+        let cap = resolve_heap_cap();
         assert_eq!(
-            resolve_heap_cap().mb,
-            None,
-            "OAM_MAX_HEAP_MB=0 must mean no cap (V8 default); this is the \
-             explicit opt-out for callers that genuinely want the heap unbounded",
+            (cap.mb, matches!(cap.source, HeapCapSource::User)),
+            unset,
+            "OAM_MAX_HEAP_MB=0 must keep the default cap: with no cap of ours \
+             V8 applies its own ~1.5 GiB limit, smaller than the default, and \
+             the OAM-RT-OOM banner is lost with the callback",
         );
     }
 
     #[test]
     fn heap_cap_empty_string_falls_back_to_default() {
+        let unset = unset_heap_cap();
         let _g = HeapCapEnvGuard::set("");
+        let cap = resolve_heap_cap();
         assert_eq!(
-            resolve_heap_cap().mb,
-            Some(4096),
+            (cap.mb, matches!(cap.source, HeapCapSource::User)),
+            unset,
             "an empty OAM_MAX_HEAP_MB is treated the same as unset",
         );
     }
@@ -1156,7 +1236,7 @@ mod tests {
     #[test]
     fn heap_cap_honors_explicit_value() {
         let _g = HeapCapEnvGuard::set("256");
-        assert_eq!(resolve_heap_cap().mb, Some(256));
+        assert_eq!(resolve_heap_cap().mb, 256);
         assert!(
             matches!(resolve_heap_cap().source, HeapCapSource::User),
             "explicit positive value -> User source so the OOM banner attributes \
@@ -1165,14 +1245,19 @@ mod tests {
     }
 
     #[test]
-    fn heap_cap_garbage_value_opts_out() {
-        let _g = HeapCapEnvGuard::set("not-a-number");
-        assert_eq!(
-            resolve_heap_cap().mb,
-            None,
-            "a non-numeric OAM_MAX_HEAP_MB opts out (typo-safe) rather than \
-             silently pinning the heap to a tiny ceiling",
-        );
+    fn heap_cap_garbage_value_falls_back_to_default() {
+        let unset = unset_heap_cap();
+        for raw in ["not-a-number", "-1", " 0"] {
+            let _g = HeapCapEnvGuard::set(raw);
+            let cap = resolve_heap_cap();
+            assert_eq!(
+                (cap.mb, matches!(cap.source, HeapCapSource::User)),
+                unset,
+                "OAM_MAX_HEAP_MB={raw:?} is a typo, not a request: it must \
+                 neither pin the heap to a tiny ceiling nor remove the cap, \
+                 and the banner must not say the user set it",
+            );
+        }
     }
 
     #[test]

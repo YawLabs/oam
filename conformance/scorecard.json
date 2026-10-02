@@ -1,7 +1,7 @@
 {
   "schema": "oam-conformance/1",
-  "commit": "1cfc7bb+wip",
-  "oamVersion": "oam 0.16.4",
+  "commit": "8c177f0",
+  "oamVersion": "oam 0.17.1",
   "nodeVersion": "v22.22.2",
   "host": "windows-aarch64",
   "suites": {
@@ -19,8 +19,8 @@
       "source": "web-platform-tests url/resources (vendored snapshot; see conformance/vendor/wpt/url/README.md)"
     },
     "nodeDifferential": {
-      "pass": 183,
-      "total": 183,
+      "pass": 264,
+      "total": 264,
       "cases": [
         {
           "case": "01-buffer.mjs",
@@ -427,7 +427,63 @@
           "status": "pass"
         },
         {
+          "case": "192-http-request-raw-body-and-headers.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "193-http-request-finish-needs-a-connection.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "194-http-request-close-order.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "195-status-reason-phrase.mjs",
+          "status": "pass"
+        },
+        {
           "case": "20-constants.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "200-fetch-body-extraction.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "201-fetch-stream-upload.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "202-fetch-request-input.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "203-fetch-headers-iteration-order.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "204-request-header-latin1.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "205-fetch-default-request-headers.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "206-fetch-request-body-replay.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "207-fetch-request-global-and-init.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "208-fetch-response-type-and-invalid-location.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "209-fetch-undici-error-classes.mjs",
           "status": "pass"
         },
         {
@@ -435,7 +491,63 @@
           "status": "pass"
         },
         {
+          "case": "210-fetch-body-read-failures.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "211-fetch-connect-timeout.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "212-fetch-abort-before-head.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "213-fetch-abort-during-blob-read.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "214-node-error-stack-and-keys.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "215-http-client-headers-sent.mjs",
+          "status": "pass"
+        },
+        {
           "case": "22-fs-fd-sync.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "222-socket-bad-port.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "223-net-socket-destroy-defers-events.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "224-net-unhandled-error-is-uncaught.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "225-net-write-then-end-order.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "226-websocket-connect-failure-event.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "227-net-ipv6-zone-id.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "228-dns-lookup-hints.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "229-listen-default-dual-stack.mjs",
           "status": "pass"
         },
         {
@@ -443,7 +555,47 @@
           "status": "pass"
         },
         {
+          "case": "234-web-streams-start-is-synchronous.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "235-abort-signal-timeout.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "236-zlib-unzip-split-magic.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "237-url-and-unhandled-error-codes.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "238-node-error-code-shape.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "239-zlib-inflate-errors-and-members.mjs",
+          "status": "pass"
+        },
+        {
           "case": "24-readline-stream.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "240-fs-path-validation-and-error-paths.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "246-fs-fd-validation-sync.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "247-fs-fd-validation-callbacks.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "248-net-end-write-after-destroy.mjs",
           "status": "pass"
         },
         {
@@ -451,7 +603,83 @@
           "status": "pass"
         },
         {
+          "case": "250-http-response-header-validation.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "251-http-response-header-bytes.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "252-net-reset-and-destroy.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "253-net-reset-and-destroy-edges.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "254-http-reset-and-destroy.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "256-fs-concurrent-ops-one-descriptor.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "257-fs-fd-call-arguments.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "258-fs-stdio-descriptors.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "259-fs-close-and-rm-callbacks.mjs",
+          "status": "pass"
+        },
+        {
           "case": "26-child-extra-fd-enoent.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "260-fs-writefile-options.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "261-fs-filehandle-arguments.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "262-fs-callback-results.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "263-fs-path-call-arguments.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "264-fs-negative-positions.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "265-fs-open-flags.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "266-http-writehead-builds-the-head.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "267-http-response-reason-phrase.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "268-http-response-trailers.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "269-http-response-http10.mjs",
           "status": "pass"
         },
         {
@@ -459,11 +687,107 @@
           "status": "pass"
         },
         {
+          "case": "270-http-response-header-name-case.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "271-http-request-header-bytes.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "272-http-server-connection-close-order.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "273-fetch-server-close-and-reset.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "276-http-request-destroyed-upload-is-not-delivered-whole.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "277-fetch-transport-failure-causes-carry-undici-class-names.mjs",
+          "status": "pass"
+        },
+        {
           "case": "28-fs-error-errno.mjs",
           "status": "pass"
         },
         {
+          "case": "280-zlib-inflate-dictionary.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "281-zlib-deflate-dictionary.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "282-http-server-peer-reset.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "283-http-request-reset-before-head.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "284-fetch-streamed-body-dispatches-at-once.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "285-http-response-head-joins-first-chunk.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "286-net-write-without-handle.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "287-net-end-then-destroy-before-connect.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "288-net-paused-accepted-socket.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "289-net-destroy-closes-at-once.mjs",
+          "status": "pass"
+        },
+        {
           "case": "29-net-autoselect-timeout.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "290-net-finish-after-ticks.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "291-coded-errors-url-dir.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "292-fs-cp-type-mismatch.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "293-http-client-malformed-response-head.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "294-http-write-after-end-and-close.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "295-http-client-response-trailers.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "296-http-server-request-after-response-finished.mjs",
+          "status": "pass"
+        },
+        {
+          "case": "297-net-end-then-reset-while-looking-up.mjs",
           "status": "pass"
         },
         {
@@ -850,7 +1174,7 @@
         "platform": "win32",
         "noBaseline": false,
         "nodeTotal": 1874,
-        "knownMissing": 344,
+        "knownMissing": 319,
         "newMissing": [],
         "staleRatchet": [],
         "absentModules": [],
@@ -1055,6 +1379,13 @@
             "module": "global:FormData.prototype",
             "names": [
               "_normalizeValue"
+            ]
+          },
+          {
+            "module": "global:Headers.prototype",
+            "names": [
+              "_append",
+              "_sortedList"
             ]
           },
           {

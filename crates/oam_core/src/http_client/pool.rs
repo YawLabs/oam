@@ -51,7 +51,9 @@ use hyper::body::Incoming;
 use hyper::client::conn::{http1, http2};
 use hyper_util::rt::TokioExecutor;
 
-use super::connector::{ConnInfo, ConnStats, OamConnector};
+use super::connector::{ConnCloser, ConnInfo, ConnStats, OamConnector};
+use super::sent::Dispatched;
+use super::transport::HeadAwaitsBody;
 use super::{BoxError, ReqBody};
 
 /// The pool is keyed on scheme + authority exactly as hyper-util was, so a
@@ -147,10 +149,14 @@ impl Pool {
 
     /// Send one request on this pool. `close_requested` is set when the request
     /// carried `Connection: close` (h1), so its connection is not re-parked.
+    /// `connect_timeout` bounds a connection this request has to open
+    /// (`OamConnector::connect_within`); it is the request's own, so a fetch
+    /// and an `http.request` sharing the pool each connect under theirs.
     pub(crate) async fn request(
         &self,
         mut req: Request<ReqBody>,
         close_requested: bool,
+        connect_timeout: Option<Duration>,
     ) -> Result<Response<Incoming>, PoolFail> {
         let Some(key) = pool_key(req.uri()) else {
             return Err(PoolFail {
@@ -159,6 +165,7 @@ impl Pool {
                 )),
                 reused: false,
                 response_started: false,
+                conn: None,
             });
         };
         let is_connect = req.method() == Method::CONNECT;
@@ -169,13 +176,14 @@ impl Pool {
         let mut allow_reuse = true;
 
         for _ in 0..MAX_ATTEMPTS {
-            let conn = match self.checkout(&key, allow_reuse).await {
+            let conn = match self.checkout(&key, allow_reuse, connect_timeout).await {
                 Ok(conn) => conn,
                 Err(error) => {
                     return Err(PoolFail {
                         error: PoolError::connect(error),
                         reused: false,
                         response_started: false,
+                        conn: None,
                     });
                 }
             };
@@ -184,11 +192,33 @@ impl Pool {
             let Conn {
                 proto,
                 stats: attempt_stats,
-                info,
+                mut info,
                 proxied,
                 is_h2,
                 key: conn_key,
             } = conn;
+            // The request has a connection, and hyper writes it as soon as
+            // it is handed over: node's 'finish' for http.request, and where
+            // undici's headersTimeout starts (`sent`).
+            if let Some(dispatched) = req.extensions().get::<Dispatched>() {
+                dispatched.fire_on(info.connection);
+            }
+            info.take_lease();
+            // A streamed body whose head waits for it: the connection is
+            // there, and nothing goes out before the first chunk. A body
+            // that fails first fails the request unsent; the connection,
+            // which carried nothing, goes with it.
+            if let Some(gate) = req.extensions_mut().remove::<HeadAwaitsBody>()
+                && let Err(error) = gate.prime(&mut req).await
+            {
+                drop(proto);
+                return Err(PoolFail {
+                    error: PoolError::body(error),
+                    reused: false,
+                    response_started: false,
+                    conn: Some(info),
+                });
+            }
             *req.uri_mut() = original_uri.clone();
             set_host_header(&mut req, is_h2);
             rewrite_request_uri(req.uri_mut(), is_h2, proxied, is_connect);
@@ -209,6 +239,11 @@ impl Pool {
                     if reused && allow_reuse {
                         // A pooled connection handed the request back unsent:
                         // re-dial and send it on a fresh one (retry_canceled).
+                        // No connection has it while that one dials, so a
+                        // headers timeout stops until its checkout (`sent`).
+                        if let Some(dispatched) = returned.extensions().get::<Dispatched>() {
+                            dispatched.unsent();
+                        }
                         req = returned;
                         allow_reuse = false;
                         continue;
@@ -217,6 +252,7 @@ impl Pool {
                         error: PoolError::send(error),
                         reused,
                         response_started,
+                        conn: Some(info),
                     });
                 }
                 SendResult::Sent(error, proto) => {
@@ -227,6 +263,7 @@ impl Pool {
                         error: PoolError::send(error),
                         reused,
                         response_started,
+                        conn: Some(info),
                     });
                 }
             }
@@ -240,11 +277,17 @@ impl Pool {
             )),
             reused: false,
             response_started: false,
+            conn: None,
         })
     }
 
     /// Reuse an idle connection for `key`, or open exactly one. Never both.
-    async fn checkout(&self, key: &PoolKey, allow_reuse: bool) -> Result<Conn, BoxError> {
+    async fn checkout(
+        &self,
+        key: &PoolKey,
+        allow_reuse: bool,
+        connect_timeout: Option<Duration>,
+    ) -> Result<Conn, BoxError> {
         if allow_reuse && self.inner.idle_timeout.is_some() {
             if let Some(conn) = self.reuse_h2(key) {
                 return Ok(conn);
@@ -253,7 +296,7 @@ impl Pool {
                 return Ok(conn);
             }
         }
-        self.connect(key).await
+        self.connect(key, connect_timeout).await
     }
 
     fn reuse_h2(&self, key: &PoolKey) -> Option<Conn> {
@@ -305,9 +348,17 @@ impl Pool {
         None
     }
 
-    async fn connect(&self, key: &PoolKey) -> Result<Conn, BoxError> {
+    async fn connect(
+        &self,
+        key: &PoolKey,
+        connect_timeout: Option<Duration>,
+    ) -> Result<Conn, BoxError> {
         let uri = domain_as_uri(key);
-        let conn = self.connector.clone().connect(uri).await?;
+        let conn = self
+            .connector
+            .clone()
+            .connect_within(uri, connect_timeout)
+            .await?;
         let is_h2 = conn.negotiated_h2();
         let proxied = conn.is_proxied();
         let pool_stats = conn.pool_stats();
@@ -345,8 +396,27 @@ impl Pool {
             let (sender, connection) = http1::handshake(conn)
                 .await
                 .map_err(|e| Box::new(e) as BoxError)?;
+            // JS may close the connection through a response it carried
+            // (`req.socket.destroy()` / `resetAndDestroy()`): the task then
+            // drops it, mid-response or idle in the pool alike.
+            let closer = info.connection.and_then(ConnCloser::find);
             tokio::spawn(async move {
-                let _ = connection.with_upgrades().await;
+                match closer {
+                    Some(closer) => {
+                        // The close first: a body JS drops right after asking
+                        // (the destroyed socket's response) must not get
+                        // hyper to shut the connection down with a FIN ahead
+                        // of the reset.
+                        tokio::select! {
+                            biased;
+                            () = closer.requested() => {}
+                            _ = connection.with_upgrades() => {}
+                        }
+                    }
+                    None => {
+                        let _ = connection.with_upgrades().await;
+                    }
+                }
             });
             Ok(Conn {
                 proto: Proto::H1(sender, pool_stats),
@@ -524,6 +594,8 @@ pub(crate) struct PoolFail {
     pub(crate) error: PoolError,
     pub(crate) reused: bool,
     pub(crate) response_started: bool,
+    /// The connection the request went out on; `None` when none was had.
+    pub(crate) conn: Option<ConnInfo>,
 }
 
 /// The transport's send error, in place of `hyper_util::client::legacy::Error`.
@@ -541,6 +613,8 @@ pub struct PoolError {
 enum PoolErrorKind {
     Connect(BoxError),
     Send(hyper::Error),
+    /// The body failed before the head went out ([`HeadAwaitsBody`]).
+    Body(BoxError),
 }
 
 impl PoolError {
@@ -555,13 +629,21 @@ impl PoolError {
             kind: PoolErrorKind::Send(error),
         }
     }
+
+    fn body(error: BoxError) -> PoolError {
+        PoolError {
+            kind: PoolErrorKind::Body(error),
+        }
+    }
 }
 
 impl std::fmt::Display for PoolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.kind {
             PoolErrorKind::Connect(_) => f.write_str("error connecting for url"),
-            PoolErrorKind::Send(_) => f.write_str("error sending request for url"),
+            PoolErrorKind::Send(_) | PoolErrorKind::Body(_) => {
+                f.write_str("error sending request for url")
+            }
         }
     }
 }
@@ -571,6 +653,7 @@ impl std::error::Error for PoolError {
         match &self.kind {
             PoolErrorKind::Connect(error) => Some(&**error),
             PoolErrorKind::Send(error) => Some(error),
+            PoolErrorKind::Body(error) => Some(&**error),
         }
     }
 }

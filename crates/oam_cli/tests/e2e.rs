@@ -779,12 +779,20 @@ fn npm_cjs_only_package_runs_via_interop() {
 /// callable defaults, __esModule unwrapping, arbitrary export names, and
 /// the require-condition side of a dual package.
 fn write_cjs_fixtures() -> PathBuf {
+    // Each call gets its OWN project dir, for the reason write_npm_fixtures
+    // gives: six tests write this tree in parallel, and fs::write truncates
+    // before writing, so one test's `oam` could load a fixture another test
+    // had just emptied (`helper is not a function` from an empty helper.js).
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let root = format!("cjsproj{}", NEXT.fetch_add(1, Ordering::Relaxed));
+    let root = root.as_str();
     write_temp(
-        "cjsproj/node_modules/classic/package.json",
+        &format!("{root}/node_modules/classic/package.json"),
         "{\"name\": \"classic\", \"main\": \"lib/index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/classic/lib/index.js",
+        &format!("{root}/node_modules/classic/lib/index.js"),
         "const { helper } = require('./helper');\n\
          const meta = require('../package.json');\n\
          const dep = require('depcjs');\n\
@@ -797,108 +805,127 @@ fn write_cjs_fixtures() -> PathBuf {
          exports.hasGlobal = global === globalThis;\n",
     );
     write_temp(
-        "cjsproj/node_modules/classic/lib/helper.js",
+        &format!("{root}/node_modules/classic/lib/helper.js"),
         "exports.helper = function () { return 'helped'; };",
     );
     write_temp(
-        "cjsproj/node_modules/depcjs/package.json",
+        &format!("{root}/node_modules/depcjs/package.json"),
         "{\"name\": \"depcjs\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/depcjs/index.js",
+        &format!("{root}/node_modules/depcjs/index.js"),
         "module.exports = { name: 'depcjs' };",
     );
     write_temp(
-        "cjsproj/node_modules/counter/package.json",
+        &format!("{root}/node_modules/counter/package.json"),
         "{\"name\": \"counter\", \"main\": \"counter.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/counter/counter.js",
+        &format!("{root}/node_modules/counter/counter.js"),
         "let n = 0;\nmodule.exports = { bump: () => ++n };",
     );
     write_temp(
-        "cjsproj/node_modules/counter/a.js",
+        &format!("{root}/node_modules/counter/a.js"),
         "exports.a = require('./counter').bump();",
     );
     write_temp(
-        "cjsproj/node_modules/counter/b.js",
+        &format!("{root}/node_modules/counter/b.js"),
         "exports.b = require('./counter').bump();",
     );
     write_temp(
-        "cjsproj/node_modules/cycle/package.json",
+        &format!("{root}/node_modules/cycle/package.json"),
         "{\"name\": \"cycle\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/cycle/index.js",
+        &format!("{root}/node_modules/cycle/index.js"),
         "exports.started = true;\n\
          const peer = require('./peer');\n\
          exports.peerSawPartial = peer.sawPartial;\n\
          exports.done = true;",
     );
     write_temp(
-        "cjsproj/node_modules/cycle/peer.js",
+        &format!("{root}/node_modules/cycle/peer.js"),
         "const root = require('./index');\n\
          exports.sawPartial = root.started === true && root.done === undefined;",
     );
     write_temp(
-        "cjsproj/node_modules/fnpkg/package.json",
+        &format!("{root}/node_modules/fnpkg/package.json"),
         "{\"name\": \"fnpkg\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/fnpkg/index.js",
+        &format!("{root}/node_modules/fnpkg/index.js"),
         "module.exports = function shout(s) { return s.toUpperCase(); };\n\
          module.exports.flavor = 'fn';",
     );
     write_temp(
-        "cjsproj/node_modules/transpiled/package.json",
+        &format!("{root}/node_modules/transpiled/package.json"),
         "{\"name\": \"transpiled\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/transpiled/index.js",
+        &format!("{root}/node_modules/transpiled/index.js"),
         "Object.defineProperty(exports, '__esModule', { value: true });\n\
          exports.default = function () { return 'unwrapped-default'; };\n\
          exports.named = 'named-val';",
     );
     write_temp(
-        "cjsproj/node_modules/weird/package.json",
+        &format!("{root}/node_modules/weird/package.json"),
         "{\"name\": \"weird\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/weird/index.js",
+        &format!("{root}/node_modules/weird/index.js"),
         "module.exports = { 'weird-key': 'dash', 'class': 'reserved' };",
     );
     write_temp(
-        "cjsproj/node_modules/dualpkg/package.json",
+        &format!("{root}/node_modules/dualpkg/package.json"),
         "{\"name\": \"dualpkg\", \"exports\": {\".\": {\"import\": \"./esm.mjs\", \"require\": \"./cjs.cjs\"}}}",
     );
     write_temp(
-        "cjsproj/node_modules/dualpkg/esm.mjs",
+        &format!("{root}/node_modules/dualpkg/esm.mjs"),
         "export const flavor = 'esm';",
     );
     write_temp(
-        "cjsproj/node_modules/dualpkg/cjs.cjs",
+        &format!("{root}/node_modules/dualpkg/cjs.cjs"),
         "module.exports = { flavor: 'cjs' };",
     );
     write_temp(
-        "cjsproj/node_modules/wantsdual/package.json",
+        &format!("{root}/node_modules/wantsdual/package.json"),
         "{\"name\": \"wantsdual\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/wantsdual/index.js",
+        &format!("{root}/node_modules/wantsdual/index.js"),
         "exports.dualFlavor = require('dualpkg').flavor;",
     );
     write_temp(
-        "cjsproj/node_modules/boom/package.json",
+        &format!("{root}/node_modules/boom/package.json"),
         "{\"name\": \"boom\", \"main\": \"index.js\"}",
     );
     write_temp(
-        "cjsproj/node_modules/boom/index.js",
+        &format!("{root}/node_modules/boom/index.js"),
         "throw new Error('cjs-init-boom');",
     );
-    write_temp("cjsproj/.anchor", "")
+    write_temp(&format!("{root}/.anchor"), "")
         .parent()
         .unwrap()
         .to_path_buf()
+}
+
+#[test]
+fn cjs_fixtures_are_written_to_a_root_of_their_own_per_call() {
+    // #186: a shared root let one test truncate a file another test's `oam`
+    // was loading. Two calls must never share a tree.
+    let first = write_cjs_fixtures();
+    let second = write_cjs_fixtures();
+    assert_ne!(first, second);
+    for proj in [&first, &second] {
+        let helper = proj.join("node_modules/classic/lib/helper.js");
+        assert!(
+            std::fs::read_to_string(&helper)
+                .unwrap()
+                .contains("exports.helper"),
+            "{} is incomplete",
+            helper.display()
+        );
+    }
 }
 
 #[test]
@@ -3181,6 +3208,148 @@ fn oam_serve_handles_get_post_and_errors() {
     assert_eq!(lines[5], "closed");
 }
 
+/// What `oam.serve` writes for each kind of `Response` body (#154): the
+/// content-type the body implies, and a body whose bytes are known goes out
+/// whole under a content-length -- only a stream is chunked. A Blob used to
+/// crash the handler's answer (`_body is not async iterable`) and a
+/// URLSearchParams went out as two NUL-ish bytes with no type.
+#[test]
+fn oam_serve_writes_each_response_body_kind() {
+    let stdout = run_ok(
+        "serve_body_kinds.mjs",
+        "const form = new FormData();\n\
+         form.append('k', 'v');\n\
+         const bodies = {\n\
+           '/string': () => new Response('text'),\n\
+           '/blob': () => new Response(new Blob(['blobdata'], { type: 'application/x-test' })),\n\
+           '/params': () => new Response(new URLSearchParams({ a: '1', b: 'x y' })),\n\
+           '/form': () => new Response(form),\n\
+           '/bytes': () => new Response(new Uint8Array([104, 105])),\n\
+           '/typed': () => new Response('{}', { headers: { 'content-type': 'application/json' } }),\n\
+           '/empty': () => new Response(null, { status: 204 }),\n\
+           '/stream': () => new Response(new ReadableStream({\n\
+             start(c) { c.enqueue(new TextEncoder().encode('streamed')); c.close(); },\n\
+           })),\n\
+         };\n\
+         const server = await oam.serve({ fetch: (req) => bodies[new URL(req.url).pathname]() });\n\
+         for (const path of Object.keys(bodies)) {\n\
+           const res = await fetch(`http://127.0.0.1:${server.port}${path}`);\n\
+           const text = (await res.text()).replace(/----formdata-oam-\\d+/g, '----B');\n\
+           const type = String(res.headers.get('content-type')).replace(/----formdata-oam-\\d+/, '----B');\n\
+           const framing = res.headers.get('transfer-encoding') ?? `cl ${res.headers.get('content-length')}`;\n\
+           console.log(path, res.status, type, framing, JSON.stringify(text));\n\
+         }\n\
+         server.close();",
+    );
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            r#"/string 200 text/plain;charset=UTF-8 cl 4 "text""#,
+            r#"/blob 200 application/x-test cl 8 "blobdata""#,
+            r#"/params 200 application/x-www-form-urlencoded;charset=UTF-8 cl 9 "a=1&b=x+y""#,
+            r#"/form 200 multipart/form-data; boundary=----B cl 115 "------B\r\nContent-Disposition: form-data; name=\"k\"\r\n\r\nv\r\n------B--\r\n""#,
+            r#"/bytes 200 null cl 2 "hi""#,
+            r#"/typed 200 application/json cl 2 "{}""#,
+            r#"/empty 204 null cl null """#,
+            r#"/stream 200 null chunked "streamed""#,
+        ]
+    );
+}
+
+/// `oam.serve` writes a response's headers in the order the handler set them
+/// (#175): `Headers` iteration sorts by name, as node's does, and the server
+/// reads the stored list instead, so sorting did not reorder what it sends.
+/// Read off the wire with a raw socket; `date` is the server's own. The
+/// second set-cookie goes out beside the first: the transport groups a
+/// repeated name, as it always has.
+#[test]
+fn oam_serve_writes_headers_in_the_order_the_handler_set_them() {
+    let stdout = run_ok(
+        "serve_header_order.mjs",
+        "import net from 'node:net';\n\
+         const server = await oam.serve({ fetch: () => {\n\
+           const headers = new Headers({ 'x-z': '1', 'x-a': '2' });\n\
+           headers.append('set-cookie', 'b=2');\n\
+           headers.append('x-m', '3');\n\
+           headers.append('set-cookie', 'a=1');\n\
+           return new Response('ok', { headers });\n\
+         } });\n\
+         const head = await new Promise((resolve, reject) => {\n\
+           const socket = net.connect(server.port, '127.0.0.1', () => {\n\
+             socket.write('GET / HTTP/1.1\\r\\nhost: x\\r\\nconnection: close\\r\\n\\r\\n');\n\
+           });\n\
+           let text = '';\n\
+           socket.on('data', (c) => (text += c));\n\
+           socket.on('end', () => resolve(text.split('\\r\\n\\r\\n')[0]));\n\
+           socket.on('error', reject);\n\
+         });\n\
+         console.log(head.split('\\r\\n').slice(1).map((l) => l.toLowerCase())\n\
+           .filter((l) => !l.startsWith('date:')).join('|'));\n\
+         server.close();",
+    );
+    assert_eq!(
+        stdout,
+        "x-z: 1|x-a: 2|set-cookie: b=2|set-cookie: a=1|x-m: 3|content-type: text/plain;charset=utf-8|connection: close|content-length: 2"
+    );
+}
+
+/// A request header value with a byte above 0x7F round-trips from oam to
+/// oam, as from node to node. The client writes one byte per code point
+/// (#174) and both servers read one code point per byte, as node's parser
+/// does: decoded as UTF-8, the 0xE9 of `café` reached the handler as
+/// U+FFFD. Through oam.serve and node:http (headers, rawHeaders and a
+/// chunked request's trailers), from fetch, http.get and a raw socket.
+#[test]
+fn request_header_bytes_round_trip_oam_to_oam_as_latin1() {
+    let stdout = run_ok(
+        "header_latin1_round_trip.mjs",
+        "import http from 'node:http';\n\
+         import net from 'node:net';\n\
+         const cps = (s) => [...String(s)].map((c) => c.codePointAt(0).toString(16)).join(' ');\n\
+         const out = [];\n\
+         const served = await oam.serve({ fetch: (req) => new Response(cps(req.headers.get('x'))) });\n\
+         const su = `http://127.0.0.1:${served.port}/`;\n\
+         out.push('serve/fetch ' + (await (await fetch(su, { headers: { x: 'caf\\u00e9' } })).text()));\n\
+         const get = (u) => new Promise((resolve, reject) => {\n\
+           http.get(u, { headers: { x: 'caf\\u00e9' } }, (res) => {\n\
+             let b = ''; res.setEncoding('latin1');\n\
+             res.on('data', (c) => (b += c)); res.on('end', () => resolve(b));\n\
+           }).on('error', reject);\n\
+         });\n\
+         out.push('serve/http.get ' + (await get(su)));\n\
+         served.close();\n\
+         const server = http.createServer((req, res) => {\n\
+           req.resume();\n\
+           req.on('end', () => res.end([cps(req.headers.x),\n\
+             cps(req.rawHeaders[req.rawHeaders.findIndex((n, i) => i % 2 === 0 && n.toLowerCase() === 'x') + 1]),\n\
+             cps(req.trailers.t ?? '')].join(' / ')));\n\
+         });\n\
+         await new Promise((r) => server.listen(0, '127.0.0.1', r));\n\
+         const nu = `http://127.0.0.1:${server.address().port}/`;\n\
+         out.push('http/fetch ' + (await (await fetch(nu, { headers: { x: 'caf\\u00e9' } })).text()));\n\
+         out.push('http/http.get ' + (await get(nu)));\n\
+         const raw = await new Promise((resolve, reject) => {\n\
+           const socket = net.connect(server.address().port, '127.0.0.1', () => {\n\
+             socket.write(Buffer.from('POST / HTTP/1.1\\r\\nhost: x\\r\\nconnection: close\\r\\n' +\n\
+               'transfer-encoding: chunked\\r\\nx: caf\\u00e9\\r\\n\\r\\n1\\r\\na\\r\\n0\\r\\nt: \\u00ff\\u00e9\\r\\n\\r\\n', 'latin1'));\n\
+           });\n\
+           let text = ''; socket.setEncoding('latin1');\n\
+           socket.on('data', (c) => (text += c));\n\
+           socket.on('end', () => resolve(text.split('\\r\\n\\r\\n').slice(1).join('').split('\\r\\n').find((l) => l.includes('/'))));\n\
+           socket.on('error', reject);\n\
+         });\n\
+         out.push('http/raw ' + raw);\n\
+         server.close();\n\
+         console.log(out.join('|'));",
+    );
+    assert_eq!(
+        stdout,
+        "serve/fetch 63 61 66 e9|serve/http.get 63 61 66 e9|\
+         http/fetch 63 61 66 e9 / 63 61 66 e9 / |http/http.get 63 61 66 e9 / 63 61 66 e9 / |\
+         http/raw 63 61 66 e9 / 63 61 66 e9 / ff e9"
+    );
+}
+
 /// `oam.serve`'s `close()` finishes the requests in flight and closes every
 /// other connection -- one that connected and never sent a request
 /// included. A client pool opens such a connection (fetch's spare, raced
@@ -3640,6 +3809,51 @@ fn small_builtins_wave_smoke() {
     assert_eq!(lines[2], "a=x%20y&b=1&b=2 x y \"\"");
     assert_eq!(lines[3], "waited");
     assert_eq!(lines[4], "\"sunk 9\\n\"");
+}
+
+/// The `dictionary` option, used by oam's deflaters and inflaters as node's
+/// zlib uses it (conformance cases 280 and 281 have the details;
+/// docs/node-divergences.md, the zlib `dictionary` row, says what still
+/// differs: the deflated bytes are miniz's). Node's own bytes are
+/// `78bb622008b3cb401205b3013b200691` (FDICT set) and raw `cb401205b301`
+/// for the deflates below. The last line pins the `strategy` / `windowBits`
+/// / `memLevel` row: oam ignores both, so its header stays `78bb` where
+/// node writes `783f` and `18b4`. If either is ever honoured, update that
+/// row and the dictionary row with it.
+#[test]
+fn zlib_dictionary_option_is_used_as_documented() {
+    let stdout = run_ok(
+        "zlib_dictionary.cjs",
+        "const z = require('node:zlib');\n\
+         const dictionary = Buffer.from('hello world dictionary');\n\
+         const tryIt = (f) => { try { return f().toString(); } catch (e) { return [e.code, e.errno, e.message].join(' '); } };\n\
+         const out = z.deflateSync('hello world hello', { dictionary });\n\
+         console.log('header', out.subarray(0, 2).toString('hex'), 'fdict', (out[1] & 0x20) !== 0);\n\
+         console.log('with', tryIt(() => z.inflateSync(out, { dictionary })));\n\
+         console.log('without', tryIt(() => z.inflateSync(out)));\n\
+         const raw = z.deflateRawSync('hello world hello', { dictionary });\n\
+         console.log('raw with', tryIt(() => z.inflateRawSync(raw, { dictionary })));\n\
+         console.log('raw without', tryIt(() => z.inflateRawSync(raw)));\n\
+         const nodeBytes = Buffer.from('78bb622008b3cb401205b3013b200691', 'hex');\n\
+         console.log('node bytes', tryIt(() => z.inflateSync(nodeBytes, { dictionary })));\n\
+         const nodeRaw = Buffer.from('cb401205b301', 'hex');\n\
+         console.log('node raw', tryIt(() => z.inflateRawSync(nodeRaw, { dictionary })));\n\
+         console.log('wrong', tryIt(() => z.inflateSync(nodeBytes, { dictionary: Buffer.from('nope') })));\n\
+         const hdr = (o) => z.deflateSync('hello world hello', { dictionary, ...o }).subarray(0, 2).toString('hex');\n\
+         console.log('ignored', hdr({ strategy: 2 }), hdr({ windowBits: 9 }));",
+    );
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "header 78bb fdict true\n\
+         with hello world hello\n\
+         without Z_NEED_DICT 2 Missing dictionary\n\
+         raw with hello world hello\n\
+         raw without Z_DATA_ERROR -3 invalid distance too far back\n\
+         node bytes hello world hello\n\
+         node raw hello world hello\n\
+         wrong Z_NEED_DICT 2 Bad dictionary\n\
+         ignored 78bb 78bb"
+    );
 }
 
 #[test]
@@ -4858,6 +5072,1801 @@ fn undici_shim_request_stream_fetch_over_http() {
     assert!(stdout.contains("agent true"), "{stdout}");
 }
 
+/// `undici.request()` / `stream()` / `dispatcher.request()` honour undici's
+/// two per-phase stall limits (#218): `headersTimeout` rejects a request whose
+/// response head does not arrive with `HeadersTimeoutError`
+/// (`UND_ERR_HEADERS_TIMEOUT`), `bodyTimeout` fails a body that goes quiet
+/// with `BodyTimeoutError` (`UND_ERR_BODY_TIMEOUT`) -- re-armed by every
+/// chunk, so a slow but steady body is not cut. The request's own value wins
+/// over the dispatcher's (`new Agent({ headersTimeout })`, the global one
+/// included), 0 disables, and a bad value is undici's `InvalidArgumentError`:
+/// the request's under its Request rule, the dispatcher's under its Client
+/// rule (at construction for a Client, on the request for the others).
+/// Up to 0.17.1 both options were accepted and ignored, so only the caller's
+/// total signal bounded a stalled request. The expected output is node
+/// v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_request_honours_headers_and_body_timeouts() {
+    let script = write_temp(
+        "undici_phase_timeouts/main.mjs",
+        r##"import net from 'node:net';
+import { request, stream, Agent, Client, Pool, ProxyAgent, errors, setGlobalDispatcher, getGlobalDispatcher } from 'undici';
+import { Writable } from 'node:stream';
+
+// Three raw servers: one that never answers, one that sends a head and one
+// chunk and then stalls, and one that drips a chunk every 150 ms -- longer in
+// total than the body timeout used against it, never idle that long.
+const never = net.createServer((s) => { s.on('data', () => {}); s.on('error', () => {}); });
+const stall = net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => s.write('HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n'));
+});
+const drip = net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => {
+    s.write('HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n');
+    let n = 0;
+    const t = setInterval(() => {
+      s.write('1\r\nx\r\n');
+      if (++n === 6) { clearInterval(t); s.end('0\r\n\r\n'); }
+    }, 150);
+  });
+});
+const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${srv.address().port}`)));
+const [nu, su, du] = await Promise.all([listen(never), listen(stall), listen(drip)]);
+
+// Every stalled probe also carries a 6 s total budget; `early` says the
+// phase timeout ended it, not that budget.
+const total = () => { const ac = new AbortController(); setTimeout(() => ac.abort(new Error('total budget')), 6000).unref(); return ac.signal; };
+async function attempt(label, fn) {
+  const t0 = Date.now();
+  try {
+    console.log(label, 'ok', JSON.stringify(await fn()));
+  } catch (e) {
+    console.log(label, e.name, e.code, e.message, e instanceof errors.UndiciError, 'early=' + (Date.now() - t0 < 4000));
+  }
+}
+const sink = () => new Writable({ write(c, e, cb) { cb(); } });
+
+await attempt('headers', () => request(nu, { headersTimeout: 400, bodyTimeout: 400, signal: total() }));
+await attempt('body', async () => (await request(su, { headersTimeout: 400, bodyTimeout: 400, signal: total() })).body.text());
+await attempt('body-json', async () => (await request(su, { bodyTimeout: 400, signal: total() })).body.json());
+await attempt('drip', async () => (await request(du, { bodyTimeout: 700 })).body.text());
+await attempt('stream-headers', () => stream(nu, { method: 'GET', headersTimeout: 400, signal: total() }, sink));
+await attempt('stream-body', () => stream(su, { method: 'GET', bodyTimeout: 400, signal: total() }, sink));
+// The dispatcher's own options apply to its requests; the request's win.
+await attempt('agent-option', () => new Agent({ headersTimeout: 400 }).request({ origin: nu, path: '/', method: 'GET', signal: total() }));
+await attempt('client-option', () => new Client(nu, { headersTimeout: 400 }).request({ path: '/', method: 'GET', signal: total() }));
+await attempt('request-wins', () => new Agent({ headersTimeout: 60000 }).request({ origin: nu, path: '/', method: 'GET', headersTimeout: 400, signal: total() }));
+await attempt('dispatcher-option', async () => (await request(su, { dispatcher: new Agent({ bodyTimeout: 400 }), signal: total() })).body.text());
+const previous = getGlobalDispatcher();
+setGlobalDispatcher(new Agent({ headersTimeout: 400 }));
+await attempt('global-option', () => request(nu, { signal: total() }));
+setGlobalDispatcher(previous);
+// 0 disables: only the caller's own signal ends it, with the caller's reason.
+await attempt('zero-disables', () => { const ac = new AbortController(); setTimeout(() => ac.abort(new Error('mine')), 900); return request(nu, { headersTimeout: 0, signal: ac.signal }); });
+await attempt('caller-abort-first', () => { const ac = new AbortController(); setTimeout(() => ac.abort(new Error('mine')), 100); return request(nu, { headersTimeout: 5000, signal: ac.signal }); });
+await attempt('already-aborted', () => request(nu, { headersTimeout: 400, signal: AbortSignal.abort(new Error('before')) }));
+// Validation, as undici's Request does it.
+for (const bad of [-1, 'x', NaN, Infinity]) {
+  await attempt('invalid headersTimeout ' + String(bad), () => request(nu, { headersTimeout: bad, signal: total() }));
+  await attempt('invalid bodyTimeout ' + String(bad), () => request(nu, { bodyTimeout: bad, signal: total() }));
+}
+await attempt('fractional', () => request(nu, { headersTimeout: 400.5, bodyTimeout: 1.5, signal: total() }));
+// A dispatcher's own values are checked as undici's Client checks them -- an
+// integer >= 0 -- before the request's: a Client when it is built, the
+// others (which build their Clients on demand) on the request. An Agent's or
+// Pool's options go through JSON first, so NaN there is the default.
+const built = (label, make) => { try { make(); console.log(label, 'built'); } catch (e) { console.log(label, e.name, e.code, e.message); } };
+for (const bad of [-1, 1.5, '5', NaN]) {
+  built('client headersTimeout ' + String(bad), () => new Client(nu, { headersTimeout: bad }));
+  built('client bodyTimeout ' + String(bad), () => new Client(nu, { bodyTimeout: bad }));
+  built('pool headersTimeout ' + String(bad), () => new Pool(nu, { headersTimeout: bad }));
+  await attempt('agent headersTimeout ' + String(bad), () => request(nu, { dispatcher: new Agent({ headersTimeout: bad }), headersTimeout: 400, signal: total() }));
+  await attempt('pool bodyTimeout ' + String(bad), () => new Pool(nu, { bodyTimeout: bad }).request({ path: '/', method: 'GET', headersTimeout: 400, signal: total() }));
+}
+await attempt('proxy-agent bodyTimeout 1.5', () => request(nu, { dispatcher: new ProxyAgent({ uri: 'http://127.0.0.1:1', bodyTimeout: 1.5 }), signal: total() }));
+process.exit(0);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "\
+headers HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+body BodyTimeoutError UND_ERR_BODY_TIMEOUT Body Timeout Error true early=true
+body-json BodyTimeoutError UND_ERR_BODY_TIMEOUT Body Timeout Error true early=true
+drip ok \"xxxxxx\"
+stream-headers HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+stream-body BodyTimeoutError UND_ERR_BODY_TIMEOUT Body Timeout Error true early=true
+agent-option HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+client-option HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+request-wins HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+dispatcher-option BodyTimeoutError UND_ERR_BODY_TIMEOUT Body Timeout Error true early=true
+global-option HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+zero-disables Error undefined mine false early=true
+caller-abort-first Error undefined mine false early=true
+already-aborted Error undefined before false early=true
+invalid headersTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG invalid headersTimeout true early=true
+invalid bodyTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG invalid bodyTimeout true early=true
+invalid headersTimeout x InvalidArgumentError UND_ERR_INVALID_ARG invalid headersTimeout true early=true
+invalid bodyTimeout x InvalidArgumentError UND_ERR_INVALID_ARG invalid bodyTimeout true early=true
+invalid headersTimeout NaN InvalidArgumentError UND_ERR_INVALID_ARG invalid headersTimeout true early=true
+invalid bodyTimeout NaN InvalidArgumentError UND_ERR_INVALID_ARG invalid bodyTimeout true early=true
+invalid headersTimeout Infinity InvalidArgumentError UND_ERR_INVALID_ARG invalid headersTimeout true early=true
+invalid bodyTimeout Infinity InvalidArgumentError UND_ERR_INVALID_ARG invalid bodyTimeout true early=true
+fractional HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+client headersTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero
+client bodyTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero
+pool headersTimeout -1 built
+agent headersTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero true early=true
+pool bodyTimeout -1 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero true early=true
+client headersTimeout 1.5 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero
+client bodyTimeout 1.5 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero
+pool headersTimeout 1.5 built
+agent headersTimeout 1.5 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero true early=true
+pool bodyTimeout 1.5 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero true early=true
+client headersTimeout 5 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero
+client bodyTimeout 5 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero
+pool headersTimeout 5 built
+agent headersTimeout 5 InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero true early=true
+pool bodyTimeout 5 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero true early=true
+client headersTimeout NaN InvalidArgumentError UND_ERR_INVALID_ARG headersTimeout must be a positive integer or zero
+client bodyTimeout NaN InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero
+pool headersTimeout NaN built
+agent headersTimeout NaN HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+pool bodyTimeout NaN HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+proxy-agent bodyTimeout 1.5 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout must be a positive integer or zero true early=true";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// An Agent `factory`'s dispatcher serves its origin, so ITS headersTimeout
+/// and bodyTimeout apply, as undici's Agent dispatches to it: the Agent's
+/// own reach it only through the options the factory passes on. oam read
+/// the Agent's options alone, so a factory-built Client or Pool with its own
+/// limit waited out undici's 300 s default. The expected output is node
+/// v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_agent_factory_dispatchers_own_timeouts_apply() {
+    let script = write_temp(
+        "undici_factory_timeouts/main.mjs",
+        r##"import net from 'node:net';
+import { request, Agent, Pool, Client, errors } from 'undici';
+
+const silent = net.createServer((s) => { s.on('error', () => {}); s.on('data', () => {}); });
+const stall = net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => s.write('HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nx'));
+});
+const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${srv.address().port}`)));
+const [su, tu] = [await listen(silent), await listen(stall)];
+
+const total = () => { const ac = new AbortController(); setTimeout(() => ac.abort(new Error('total budget')), 6000).unref(); return ac.signal; };
+async function attempt(label, fn) {
+  const t0 = Date.now();
+  try {
+    console.log(label, 'ok', JSON.stringify(await fn()));
+  } catch (e) {
+    console.log(label, e.name, e.code, e.message, e instanceof errors.UndiciError, 'early=' + (Date.now() - t0 < 4000));
+  }
+}
+await attempt('factory Client headersTimeout', () =>
+  request(su, { signal: total(), dispatcher: new Agent({ factory: (o, opts) => new Client(o, { ...opts, headersTimeout: 400 }) }) }));
+await attempt('factory Pool headersTimeout', () =>
+  request(su, { signal: total(), dispatcher: new Agent({ factory: (o, opts) => new Pool(o, { ...opts, headersTimeout: 400 }) }) }));
+await attempt('factory Pool bodyTimeout', async () =>
+  (await request(tu, { signal: total(), dispatcher: new Agent({ factory: (o, opts) => new Pool(o, { ...opts, bodyTimeout: 400 }) }) })).body.text());
+await attempt('Agent headersTimeout passed on', () =>
+  request(su, { signal: total(), dispatcher: new Agent({ headersTimeout: 400, factory: (o, opts) => new Pool(o, opts) }) }));
+await attempt('Agent headersTimeout dropped', () =>
+  request(su, { signal: total(), dispatcher: new Agent({ headersTimeout: 400, factory: (o) => new Pool(o) }) }));
+await attempt('request wins over the factory', () =>
+  request(su, { headersTimeout: 400, signal: total(), dispatcher: new Agent({ factory: (o, opts) => new Pool(o, { ...opts, headersTimeout: 60000 }) }) }));
+process.exit(0);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "\
+factory Client headersTimeout HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+factory Pool headersTimeout HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+factory Pool bodyTimeout BodyTimeoutError UND_ERR_BODY_TIMEOUT Body Timeout Error true early=true
+Agent headersTimeout passed on HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+Agent headersTimeout dropped Error undefined total budget false early=false
+request wins over the factory HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// `undici.request` rejects with what failed, not with fetch's wrapper
+/// around it: a body cut off mid-read is undici's SocketError (kept alive),
+/// ResponseContentLengthMismatchError (not kept) or HTTPParserError (bad
+/// framing), and a failed connect -- to the origin or to a ProxyAgent's
+/// proxy -- is the transport's `connect ECONNREFUSED`. oam's request() runs
+/// on fetch, and after #177 these arrived as `TypeError: terminated` and
+/// `TypeError: fetch failed` with the real error only as `cause`. The
+/// expected output is node v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_request_body_and_connect_failures_reject_unwrapped() {
+    let script = write_temp(
+        "undici_request_errors/main.mjs",
+        r##"import net from 'node:net';
+import { request, ProxyAgent, errors } from 'undici';
+
+// A kept-alive response cut off inside its body, the same with
+// `Connection: close`, and a bad chunk-size line.
+const raw = (reply, end) => net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => { s.write(reply); if (end === 'destroy') setTimeout(() => s.destroy(), 20); else s.end(); });
+});
+const servers = {
+  cut: raw('HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nabc', 'destroy'),
+  closed: raw('HTTP/1.1 200 OK\r\nconnection: close\r\ncontent-length: 100\r\n\r\nabc', 'end'),
+  chunk: raw('HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\nzz\r\nabc\r\n', 'destroy'),
+};
+const url = {};
+for (const [k, srv] of Object.entries(servers)) {
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  url[k] = `http://127.0.0.1:${srv.address().port}`;
+}
+// A port nothing listens on: bound, read, released.
+const probe = net.createServer();
+await new Promise((r) => probe.listen(0, '127.0.0.1', r));
+const closed = probe.address().port;
+await new Promise((r) => probe.close(r));
+
+async function attempt(label, fn) {
+  try {
+    console.log(label, 'ok', JSON.stringify(await fn()));
+  } catch (e) {
+    const message = String(e.message).replaceAll(String(closed), 'PORT');
+    console.log(label, e.name, e.code, message, e instanceof errors.UndiciError, e instanceof TypeError);
+  }
+}
+await attempt('body cut, kept alive', async () => (await request(url.cut)).body.text());
+await attempt('body cut, connection close', async () => (await request(url.closed)).body.text());
+await attempt('body bad chunk size', async () => (await request(url.chunk)).body.text());
+await attempt('refused', () => request(`http://127.0.0.1:${closed}/`));
+await attempt('refused proxy', () => request(url.cut, { dispatcher: new ProxyAgent(`http://127.0.0.1:${closed}`) }));
+// A streamed body that produces nothing: the request is dispatched at once
+// and fails on the connect, and a body never connected is never started
+// (review 3, finding 8: oam waited for the first chunk and hung).
+const { Readable } = await import('node:stream');
+const idle = new Readable({ read() {} });
+await attempt('refused, idle stream', () => request(`http://127.0.0.1:${closed}/`, { method: 'POST', body: idle }));
+console.log('idle stream destroyed', idle.destroyed);
+let started = 0;
+async function* never() { started++; await new Promise(() => {}); }
+await attempt('refused, idle generator', () => request(`http://127.0.0.1:${closed}/`, { method: 'POST', body: never() }));
+console.log('generator started', started);
+process.exit(0);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "\
+body cut, kept alive SocketError UND_ERR_SOCKET other side closed true false
+body cut, connection close ResponseContentLengthMismatchError UND_ERR_RES_CONTENT_LENGTH_MISMATCH Response body length does not match content-length header true false
+body bad chunk size HTTPParserError HPE_INVALID_CHUNK_SIZE Response does not match the HTTP/1.1 protocol (Invalid character in chunk size) false false
+refused Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
+refused proxy Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
+refused, idle stream Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
+idle stream destroyed true
+refused, idle generator Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
+generator started 0";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// undici's `headersTimeout` runs while the request is on a connected socket
+/// (client-h1.js resumeH1), never across the connect: a dispatcher whose
+/// connect function takes 800 ms does not use up a 600 ms limit, and the
+/// limit still bounds the wait for the head once the socket is there. Up to
+/// the first cut of #218 oam started the timer before the fetch, so it also
+/// counted the connect. A ProxyAgent's CONNECT exchange is timed by undici's
+/// proxy client, on its 300 s default, not by the ProxyAgent's own
+/// headersTimeout, which bounds the origin's answer only. The expected output
+/// is node v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_phase_timeouts_measure_what_undici_measures() {
+    let script = write_temp(
+        "undici_phase_timeouts_measure/main.mjs",
+        r##"import net from 'node:net';
+import { request, Agent, ProxyAgent, buildConnector } from 'undici';
+
+// An origin that answers 300 ms after the request, and one that never answers.
+const slow = net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => setTimeout(() => s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok'), 300));
+});
+const never = net.createServer((s) => { s.on('data', () => {}); s.on('error', () => {}); });
+const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(srv.address().port)));
+const origin = `http://127.0.0.1:${await listen(slow)}`;
+const silent = `http://127.0.0.1:${await listen(never)}`;
+
+async function attempt(label, fn) {
+  const t0 = Date.now();
+  try {
+    const r = await fn();
+    console.log(label, 'ok', r.statusCode ?? r.status, await (r.body.text ? r.body.text() : r.text()));
+  } catch (e) {
+    const c = e?.cause ?? e;
+    // `late` says the timer ran after the 300 ms connect, not across it.
+    console.log(label, 'failed', c.name, c.code, 'late=' + (Date.now() - t0 >= 650));
+  }
+}
+
+// headersTimeout starts once the request is on a connected socket.
+const plain = buildConnector({});
+const slowConnect = (ms) => (opts, cb) => setTimeout(() => plain(opts, cb), ms);
+await attempt('slow-connect', () => request(origin, { dispatcher: new Agent({ connect: slowConnect(800) }), headersTimeout: 600 }));
+await attempt('slow-connect-agent-option', () => request(origin, { dispatcher: new Agent({ headersTimeout: 600, connect: slowConnect(800) }) }));
+// ...and still bounds the wait for the head once connected.
+await attempt('connected-then-silent', () => request(silent, { dispatcher: new Agent({ connect: slowConnect(300) }), headersTimeout: 400 }));
+
+// A ProxyAgent's CONNECT goes through undici's proxy client, on that
+// client's 300 s default: the ProxyAgent's own headersTimeout is for the
+// origin's answer, so a proxy slower than it still tunnels, fetch included.
+const proxy = net.createServer((c) => {
+  c.on('error', () => {});
+  c.once('data', (d) => {
+    const port = Number(d.toString('latin1').split(' ')[1].split(':').pop());
+    setTimeout(() => {
+      const up = net.connect(port, '127.0.0.1', () => { c.write('HTTP/1.1 200 Connection Established\r\n\r\n'); up.pipe(c); c.pipe(up); });
+      up.on('error', () => c.destroy());
+      c.on('close', () => up.destroy());
+    }, 600);
+  });
+});
+const viaProxy = () => new ProxyAgent({ uri: `http://127.0.0.1:${proxy.address().port}`, headersTimeout: 400 });
+await listen(proxy);
+await attempt('slow-proxy-request', () => request(origin, { dispatcher: viaProxy() }));
+await attempt('slow-proxy-fetch', () => fetch(origin, { dispatcher: viaProxy() }));
+await attempt('slow-proxy-silent-origin', () => request(silent, { dispatcher: viaProxy() }));
+
+// A delay past setTimeout's 2^31-1 ms ceiling is "no limit" (undici's timers
+// compare timestamps), not a timer that fires at once with a warning.
+const warnings = [];
+process.on('warning', (w) => warnings.push(w.name));
+const huge = { headersTimeout: 2 ** 31, bodyTimeout: 2 ** 32 };
+await attempt('huge-request', () => request(origin, huge));
+await attempt('huge-agent', () => request(origin, { dispatcher: new Agent(huge) }));
+await attempt('huge-proxy', () => request(origin, { dispatcher: new ProxyAgent({ uri: `http://127.0.0.1:${proxy.address().port}`, ...huge }) }));
+await attempt('huge-connect', () => request(origin, { dispatcher: new Agent({ connect: buildConnector({ timeout: 2 ** 31 }) }) }));
+console.log('warnings', JSON.stringify(warnings));
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "\
+slow-connect ok 200 ok
+slow-connect-agent-option ok 200 ok
+connected-then-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT late=true
+slow-proxy-request ok 200 ok
+slow-proxy-fetch ok 200 ok
+slow-proxy-silent-origin failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT late=true
+huge-request ok 200 ok
+huge-agent ok 200 ok
+huge-proxy ok 200 ok
+huge-connect ok 200 ok
+warnings []";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// The same rule on oam's own connection pool, with no connect function:
+/// `headersTimeout` starts once the pool has a connection for the request,
+/// so a slow DNS answer (a replaced `dns.lookup`, 800 ms) or a slow TLS
+/// handshake (a relay that holds the ClientHello for 800 ms) does not use up
+/// a 600 ms limit on an origin that answers 300 ms after the request. A
+/// silent origin still times out after the connect, and the timeout closes
+/// that connection, as undici destroys the socket. Each redirect hop gets its
+/// own limit. Up to this fix the timer started when the request was
+/// dispatched there: every `ok` line below failed with HeadersTimeoutError,
+/// the silent ones came early and left the connection open. The expected
+/// output is node v22.22.2 + undici 6.29.0's, line for line (the CA trusted
+/// through NODE_EXTRA_CA_CERTS in both).
+#[test]
+fn undici_headers_timeout_on_the_pool_starts_once_connected() {
+    let bundle = write_temp("undici-headers-timeout-pool/ca.pem", TLS_TEST_CA_CERT);
+    let src = r##"import net from 'node:net';
+import tls from 'node:tls';
+import dns from 'node:dns';
+import { request, Agent } from 'undici';
+
+const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(srv.address().port)));
+// An origin that answers `delay` ms after the request head; never for null.
+let closed = 0;
+function answering(delay) {
+  return (s) => {
+    s.on('error', () => {});
+    s.on('close', () => { closed++; });
+    s.once('data', () => {
+      if (delay !== null) setTimeout(() => s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok'), delay);
+    });
+  };
+}
+// A TCP relay that holds the client's first bytes (its ClientHello) for
+// `hold` ms: a slow TLS handshake.
+function relay(target, hold) {
+  return net.createServer((c) => {
+    c.on('error', () => {});
+    const up = net.connect(target, '127.0.0.1');
+    up.on('error', () => {});
+    c.pause();
+    c.once('readable', () => setTimeout(() => { c.pipe(up); up.pipe(c); c.resume(); }, hold));
+  });
+}
+const cert = `__CERT__`;
+const key = `__KEY__`;
+const plain = await listen(net.createServer(answering(300)));
+const silent = await listen(net.createServer(answering(null)));
+const slowTls = await listen(relay(await listen(tls.createServer({ cert, key }, answering(300))), 800));
+const slowTlsSilent = await listen(relay(await listen(tls.createServer({ cert, key }, answering(null))), 800));
+
+async function attempt(label, fn) {
+  const t0 = Date.now();
+  closed = 0;
+  try {
+    const r = await fn();
+    console.log(label, 'ok', r.statusCode, await r.body.text());
+  } catch (e) {
+    // `late`: the limit ran after the 800 ms connect, not across it.
+    const late = Date.now() - t0 >= 1150;
+    await new Promise((r) => setTimeout(r, 500));
+    console.log(label, 'failed', e.name, e.code, 'late=' + late, 'closed=' + (closed > 0));
+  }
+}
+
+const realLookup = dns.lookup;
+dns.lookup = function (host, opts, cb) {
+  if (typeof opts === 'function') { cb = opts; opts = {}; }
+  setTimeout(() => realLookup.call(dns, host, opts, cb), 800);
+};
+await attempt('slow-dns', () => request(`http://localhost:${plain}/`, { headersTimeout: 600, dispatcher: new Agent() }));
+await attempt('slow-dns-agent-option', () => request(`http://localhost:${plain}/`, { dispatcher: new Agent({ headersTimeout: 600 }) }));
+await attempt('slow-dns-silent', () => request(`http://localhost:${silent}/`, { headersTimeout: 400, dispatcher: new Agent() }));
+dns.lookup = realLookup;
+await attempt('slow-tls', () => request(`https://localhost:${slowTls}/`, { headersTimeout: 600, dispatcher: new Agent() }));
+await attempt('slow-tls-global', () => request(`https://localhost:${slowTls}/`, { headersTimeout: 600 }));
+await attempt('slow-tls-silent', () => request(`https://localhost:${slowTlsSilent}/`, { headersTimeout: 400, dispatcher: new Agent() }));
+
+// Two hops of 300 ms each under a 500 ms limit: each hop has its own.
+const target = await listen(net.createServer(answering(300)));
+const redirector = await listen(net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => setTimeout(() => s.end(`HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:${target}/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n`), 300));
+}));
+await attempt('redirect-hops', () => request(`http://127.0.0.1:${redirector}/`, { headersTimeout: 500, maxRedirections: 1, dispatcher: new Agent() }));
+process.exit(0);
+"##
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("undici_headers_timeout_pool/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = "\
+slow-dns ok 200 ok
+slow-dns-agent-option ok 200 ok
+slow-dns-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT late=true closed=true
+slow-tls ok 200 ok
+slow-tls-global ok 200 ok
+slow-tls-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT late=true closed=true
+redirect-hops ok 200 ok";
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
+/// `undici.request()` takes every body undici's Request takes -- a string, a
+/// Buffer / typed array / DataView / ArrayBuffer, a Readable, an iterable or
+/// async iterable (a web ReadableStream included), a Blob -- and frames it as
+/// undici's writeH1 does: a known length with content-length, a streamed
+/// body chunked (or with the caller's content-length), an empty one as
+/// `content-length: 0` on a method that expects a payload. A chunk that is
+/// not a string or a buffer, a body that disagrees with its content-length,
+/// a stream that errors or closes early and a body of any other type fail as
+/// in undici, with undici's own error and nothing complete on the wire. Up
+/// to this fix oam's fetch stringified every non-string, non-buffer body, so
+/// a Readable went out as `[object Object]`. The expected output is node
+/// v22.22.2 + undici 6.29.0's, line for line, a FormData's multipart body
+/// included (oam refused one until review 3, finding 23).
+#[test]
+fn undici_request_sends_every_body_undici_takes() {
+    let script = write_temp(
+        "undici_request_bodies/main.mjs",
+        r##"import net from 'node:net';
+import { Readable, PassThrough } from 'node:stream';
+import { request } from 'undici';
+
+// A raw server that reports how each request was framed and what its body was.
+const seen = new Map();
+const server = net.createServer((s) => {
+  s.on('error', () => {});
+  let buf = Buffer.alloc(0);
+  let done = false;
+  const finish = (rec) => {
+    if (done) return;
+    done = true;
+    seen.set(rec.path, rec);
+    s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok');
+  };
+  s.on('data', (d) => {
+    buf = Buffer.concat([buf, d]);
+    const end = buf.indexOf('\r\n\r\n');
+    if (end < 0) return;
+    const lines = buf.subarray(0, end).toString('latin1').split('\r\n');
+    const [method, path] = lines[0].split(' ');
+    const headers = {};
+    for (const l of lines.slice(1)) {
+      const i = l.indexOf(':');
+      headers[l.slice(0, i).toLowerCase()] = l.slice(i + 1).trim();
+    }
+    const rest = buf.subarray(end + 4);
+    const rec = { method, path, ct: headers['content-type'] ?? null };
+    if (headers['content-length'] !== undefined) {
+      const n = Number(headers['content-length']);
+      rec.framing = 'length ' + n;
+      if (rest.length < n) return;
+      rec.body = rest.subarray(0, n).toString('utf8');
+      return finish(rec);
+    }
+    if (/chunked/i.test(headers['transfer-encoding'] ?? '')) {
+      rec.framing = 'chunked';
+      let off = 0;
+      const parts = [];
+      for (;;) {
+        const nl = rest.indexOf('\r\n', off);
+        if (nl < 0) return;
+        const size = parseInt(rest.subarray(off, nl).toString('latin1'), 16);
+        if (rest.length < nl + 2 + size + 2) return;
+        if (size === 0) break;
+        parts.push(rest.subarray(nl + 2, nl + 2 + size));
+        off = nl + 2 + size + 2;
+      }
+      rec.body = Buffer.concat(parts).toString('utf8');
+      return finish(rec);
+    }
+    rec.framing = 'none';
+    rec.body = '';
+    finish(rec);
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+
+async function attempt(label, opts) {
+  const path = '/' + label;
+  try {
+    const r = await request(base + path, { method: 'POST', ...opts });
+    await r.body.text();
+    const rec = seen.get(path);
+    console.log(label, 'ok', rec ? `${rec.method} ${rec.framing} ${JSON.stringify(rec.body)} ct=${rec.ct}` : 'unseen');
+  } catch (e) {
+    await new Promise((r) => setTimeout(r, 50));
+    console.log(label, 'failed', e.name, e.code, JSON.stringify(e.message), 'seen=' + seen.has(path));
+  }
+}
+
+const gen = async function* (chunks, delay = 0) {
+  for (const c of chunks) {
+    if (delay) await new Promise((r) => setTimeout(r, delay));
+    yield c;
+  }
+};
+
+await attempt('string', { body: 'héllo' });
+await attempt('empty-string', { body: '' });
+await attempt('buffer', { body: Buffer.from('buf') });
+await attempt('uint8array', { body: new Uint8Array([97, 98, 99]) });
+await attempt('dataview', { body: new DataView(new Uint8Array([100, 101]).buffer) });
+await attempt('arraybuffer', { body: new Uint8Array([120, 121]).buffer });
+await attempt('readable', { body: Readable.from(['a', 'bc', 'déf']) });
+await attempt('readable-buffers', { body: Readable.from([Buffer.from('x'), Buffer.from('yz')]) });
+await attempt('readable-cl', { body: Readable.from(['ab', 'cd']), headers: { 'content-length': '4' } });
+await attempt('readable-empty', { body: Readable.from([]) });
+await attempt('readable-empty-get', { method: 'GET', body: Readable.from([]) });
+await attempt('readable-get', { method: 'GET', body: Readable.from(['g']) });
+await attempt('readable-put', { method: 'PUT', body: Readable.from(['p']) });
+await attempt('passthrough', { body: (() => { const p = new PassThrough(); setTimeout(() => { p.write('one'); p.end('two'); }, 50); return p; })() });
+await attempt('async-gen', { body: gen(['g1', 'g2'], 20) });
+await attempt('async-gen-buffers', { body: gen([Buffer.from('b1'), new Uint8Array([98, 50])]) });
+await attempt('sync-iterable', { body: ['s1', 's2'] });
+await attempt('sync-iterable-buffers', { body: [Buffer.from('i1'), Buffer.from('i2')] });
+await attempt('set-iterable', { body: new Set(['z1']) });
+await attempt('web-stream', { body: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('w1')); c.enqueue(new TextEncoder().encode('w2')); c.close(); } }) });
+await attempt('blob', { body: new Blob(['bl'], { type: 'text/x-blob' }) });
+await attempt('blob-untyped', { body: new Blob(['bu']) });
+await attempt('cl-too-long', { body: Readable.from(['abc']), headers: { 'content-length': '5' } });
+await attempt('cl-too-short', { body: Readable.from(['abcdef']), headers: { 'content-length': '2' } });
+await attempt('cl-iter-too-short', { body: gen(['abcdef']), headers: { 'content-length': '2' } });
+await attempt('cl-iter-too-long', { body: gen(['ab']), headers: { 'content-length': '5' } });
+await attempt('stream-error', { body: new Readable({ read() { this.destroy(new Error('boom')); } }) });
+await attempt('stream-error-later', { body: (() => { let n = 0; return new Readable({ read() { if (n++ === 0) this.push('first'); else setTimeout(() => this.destroy(new Error('later')), 20); } }); })() });
+await attempt('gen-throws', { body: (async function* () { yield 'x'; throw new Error('gen boom'); })() });
+await attempt('gen-number', { body: gen([5]) });
+await attempt('gen-object', { body: gen([{ a: 1 }]) });
+await attempt('number', { body: 5 });
+await attempt('object', { body: { a: 1 } });
+await attempt('boolean', { body: true });
+await attempt('destroyed-stream', { body: (() => { const r = Readable.from(['q']); r.destroy(); return r; })() });
+await attempt('ended-stream', { body: await (async () => { const r = Readable.from(['e']); for await (const _ of r); return r; })() });
+await attempt('url-params', { body: new URLSearchParams('a=1') });
+const fd = new FormData(); fd.set('k', 'v');
+try {
+  const r = await request(base + '/formdata', { method: 'POST', body: fd });
+  await r.body.text();
+  const rec = seen.get('/formdata');
+  console.log('formdata ok', rec.framing.split(' ')[0], /^multipart\/form-data; boundary=/.test(rec.ct), rec.body.includes('name="k"\r\n\r\nv\r\n'));
+} catch (e) { console.log('formdata failed', e.name, e.code, e.message); }
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"string ok POST length 6 "héllo" ct=null
+empty-string ok POST length 0 "" ct=null
+buffer ok POST length 3 "buf" ct=null
+uint8array ok POST length 3 "abc" ct=null
+dataview ok POST length 2 "de" ct=null
+arraybuffer ok POST length 2 "xy" ct=null
+readable ok POST chunked "abcdéf" ct=null
+readable-buffers ok POST chunked "xyz" ct=null
+readable-cl ok POST length 4 "abcd" ct=null
+readable-empty ok POST length 0 "" ct=null
+readable-empty-get ok GET none "" ct=null
+readable-get ok GET chunked "g" ct=null
+readable-put ok PUT chunked "p" ct=null
+passthrough ok POST chunked "onetwo" ct=null
+async-gen ok POST chunked "g1g2" ct=null
+async-gen-buffers ok POST chunked "b1b2" ct=null
+sync-iterable ok POST chunked "s1s2" ct=null
+sync-iterable-buffers ok POST chunked "i1i2" ct=null
+set-iterable ok POST chunked "z1" ct=null
+web-stream ok POST chunked "w1w2" ct=null
+blob ok POST length 2 "bl" ct=text/x-blob
+blob-untyped ok POST length 2 "bu" ct=null
+cl-too-long failed RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header" seen=false
+cl-too-short failed RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header" seen=false
+cl-iter-too-short failed RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header" seen=false
+cl-iter-too-long failed RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header" seen=false
+stream-error failed Error undefined "boom" seen=false
+stream-error-later failed Error undefined "later" seen=false
+gen-throws failed Error undefined "gen boom" seen=false
+gen-number failed TypeError ERR_INVALID_ARG_TYPE "The \"string\" argument must be of type string or an instance of Buffer or ArrayBuffer. Received type number (5)" seen=false
+gen-object failed TypeError ERR_INVALID_ARG_TYPE "The \"string\" argument must be of type string or an instance of Buffer or ArrayBuffer. Received an instance of Object" seen=false
+number failed InvalidArgumentError UND_ERR_INVALID_ARG "body must be a string, a Buffer, a Readable stream, an iterable, or an async iterable" seen=false
+object failed InvalidArgumentError UND_ERR_INVALID_ARG "body must be a string, a Buffer, a Readable stream, an iterable, or an async iterable" seen=false
+boolean failed InvalidArgumentError UND_ERR_INVALID_ARG "body must be a string, a Buffer, a Readable stream, an iterable, or an async iterable" seen=false
+destroyed-stream failed AbortError UND_ERR_ABORTED "Request aborted" seen=false
+ended-stream ok POST length 0 "" ct=null
+url-params failed TypeError ERR_INVALID_ARG_TYPE "The \"string\" argument must be of type string or an instance of Buffer or ArrayBuffer. Received an instance of Array" seen=false
+formdata ok length true true"##;
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
+/// `undici.request()` consumes the caller's `content-length` as undici does:
+/// checked against a body of known length (a mismatch on a method that
+/// sends one is undici's RequestContentLengthMismatchError), never sent as
+/// given, and replaced by `content-length: 0` for a POST / PUT / PATCH with
+/// no body. Its refusals -- that one, a hop-by-hop header, a bad
+/// content-length -- reject with undici's error itself, not wrapped in
+/// `TypeError: fetch failed`, and header arrays are one line per value, a
+/// flat [name, value, ...] array included. The expected output is node
+/// v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_request_frames_and_refuses_as_undici_does() {
+    let script = write_temp(
+        "undici_request_refusals/main.mjs",
+        r##"import net from 'node:net';
+import { request, errors } from 'undici';
+const heads = [];
+const srv = net.createServer((s) => {
+  let buf = '';
+  s.on('error', () => {});
+  s.on('data', (c) => {
+    buf += c.toString('latin1');
+    const i = buf.indexOf('\r\n\r\n');
+    if (i < 0) return;
+    heads.push(buf.slice(0, i).split('\r\n').filter((l) => !/^(host|connection|user-agent|accept|accept-encoding|accept-language|sec-fetch-mode):/i.test(l)).join(' | '));
+    s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok');
+    buf = '';
+  });
+});
+await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const U = `http://127.0.0.1:${srv.address().port}/p`;
+for (const [n, opts] of [
+  ['transfer-encoding', { method: 'POST', body: 'AB', headers: { 'transfer-encoding': 'chunked' } }],
+  ['expect', { headers: { expect: '100-continue' } }],
+  ['cl-mismatch', { method: 'POST', body: 'AB', headers: { 'content-length': '9' } }],
+  ['cl-mismatch-short', { method: 'POST', body: 'ABCD', headers: { 'content-length': '2' } }],
+  ['cl-no-body-post', { method: 'POST', headers: { 'content-length': '5' } }],
+  ['cl-zero-body', { method: 'POST', body: 'AB', headers: { 'content-length': '0' } }],
+  ['cl-bad', { method: 'POST', body: 'AB', headers: { 'content-length': 'x' } }],
+  ['no-body-post', { method: 'POST' }],
+  ['no-body-put', { method: 'PUT' }],
+  ['no-body-patch', { method: 'PATCH' }],
+  ['no-body-delete', { method: 'DELETE' }],
+  ['no-body-get', { method: 'GET' }],
+  ['flat-array', { headers: ['x-a', '1', 'x-b', '2'] }],
+  ['array-value', { headers: { 'x-m': ['1', '2'] } }],
+]) {
+  const before = heads.length;
+  try {
+    const r = await request(U, opts);
+    await r.body.text();
+    console.log(n, 'ok', heads[heads.length - 1]);
+  } catch (e) {
+    console.log(n, 'throw', e.name, e.code, JSON.stringify(e.message), 'cause=' + (e.cause ? e.cause.name : 'none'), 'undici=' + (e instanceof errors.UndiciError), '| wire:', heads.length > before ? 'SENT' : 'nothing');
+  }
+}
+srv.close();
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"transfer-encoding throw InvalidArgumentError UND_ERR_INVALID_ARG "invalid transfer-encoding header" cause=none undici=true | wire: nothing
+expect throw NotSupportedError UND_ERR_NOT_SUPPORTED "expect header not supported" cause=none undici=true | wire: nothing
+cl-mismatch throw RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header" cause=none undici=true | wire: nothing
+cl-mismatch-short throw RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header" cause=none undici=true | wire: nothing
+cl-no-body-post ok POST /p HTTP/1.1 | content-length: 0
+cl-zero-body throw RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header" cause=none undici=true | wire: nothing
+cl-bad throw InvalidArgumentError UND_ERR_INVALID_ARG "invalid content-length header" cause=none undici=true | wire: nothing
+no-body-post ok POST /p HTTP/1.1 | content-length: 0
+no-body-put ok PUT /p HTTP/1.1 | content-length: 0
+no-body-patch ok PATCH /p HTTP/1.1 | content-length: 0
+no-body-delete ok DELETE /p HTTP/1.1
+no-body-get ok GET /p HTTP/1.1
+flat-array ok GET /p HTTP/1.1 | x-a: 1 | x-b: 2
+array-value ok GET /p HTTP/1.1 | x-m: 1 | x-m: 2"##;
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
+/// undici's `headersTimeout` does not count the time a streamed request body
+/// takes: undici ignores the timer while its AsyncWriter is writing and
+/// restarts it at the body's end, so an 800 ms upload under a 500 ms limit
+/// succeeds against an origin that answers 300 ms after the body, and a
+/// silent origin still times out once the body is over (and its connection
+/// is closed). The caller's abort, a body error and an origin that answers
+/// before the body ends all stop the body (`finalized`: the generator was
+/// returned). The transport holds the timer off until the body channel's
+/// end; without that the slow-* lines failed with HeadersTimeoutError. The
+/// expected output is node v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_headers_timeout_starts_when_a_streamed_body_ends() {
+    let script = write_temp(
+        "undici_headers_timeout_streamed_body/main.mjs",
+        r##"import net from 'node:net';
+import { PassThrough } from 'node:stream';
+import { request } from 'undici';
+
+// An origin that answers `delay` ms after the request body has fully arrived
+// (chunked or content-length), or never (null), or as soon as the head is in
+// ('early').
+let closed = 0;
+function origin(delay) {
+  return net.createServer((s) => {
+    s.on('error', () => {});
+    s.on('close', () => { closed++; });
+    let buf = Buffer.alloc(0);
+    let answered = false;
+    s.on('data', (d) => {
+      buf = Buffer.concat([buf, d]);
+      const end = buf.indexOf('\r\n\r\n');
+      if (end < 0 || answered) return;
+      if (delay === 'early') {
+        answered = true;
+        s.end('HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nearly');
+        return;
+      }
+      const head = buf.subarray(0, end).toString('latin1');
+      const rest = buf.subarray(end + 4);
+      const cl = /content-length: (\d+)/i.exec(head);
+      const complete = cl ? rest.length >= Number(cl[1]) : rest.includes('0\r\n\r\n') || !/chunked/i.test(head);
+      if (!complete) return;
+      answered = true;
+      if (delay !== null) setTimeout(() => s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok'), delay);
+    });
+  });
+}
+const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${srv.address().port}`)));
+const answers = await listen(origin(300));
+const silent = await listen(origin(null));
+const early = await listen(origin('early'));
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let finalized = false;
+async function* slowBody(gap) {
+  try {
+    yield 'a';
+    await sleep(gap);
+    yield 'b';
+  } finally {
+    finalized = true;
+  }
+}
+async function* lateFirst(gap) {
+  await sleep(gap);
+  yield 'late';
+}
+function slowReadable(gap) {
+  const p = new PassThrough();
+  p.write('a');
+  setTimeout(() => p.end('b'), gap);
+  return p;
+}
+async function* endless() {
+  try {
+    for (;;) { yield 'x'; await sleep(50); }
+  } finally {
+    finalized = true;
+  }
+}
+
+async function attempt(label, fn, lateMs) {
+  const t0 = Date.now();
+  closed = 0;
+  finalized = false;
+  // A request that never settles is a failure of its own, not a hung test.
+  const hung = setTimeout(() => { console.log(label, 'never settled'); process.exit(0); }, 5000);
+  try {
+    const r = await fn();
+    console.log(label, 'ok', r.statusCode, await r.body.text());
+  } catch (e) {
+    const late = Date.now() - t0 >= lateMs;
+    await sleep(300);
+    console.log(label, 'failed', e.name, e.code, JSON.stringify(e.message), 'late=' + late, 'closed=' + (closed > 0));
+  }
+  clearTimeout(hung);
+  await sleep(300);
+  console.log(label, 'finalized=' + finalized);
+}
+
+// The headers timer counts from the end of a streamed body, not its start.
+await attempt('slow-iterable', () => request(answers, { method: 'POST', body: slowBody(800), headersTimeout: 500 }));
+await attempt('slow-readable', () => request(answers, { method: 'POST', body: slowReadable(800), headersTimeout: 500 }));
+await attempt('late-first-chunk', () => request(answers, { method: 'POST', body: lateFirst(800), headersTimeout: 500 }));
+await attempt('slow-cl', () => request(answers, { method: 'PUT', body: slowBody(800), headers: { 'content-length': '2' }, headersTimeout: 500 }));
+await attempt('slow-silent', () => request(silent, { method: 'POST', body: slowBody(800), headersTimeout: 400 }), 1150);
+// The caller's abort while the body is still going out.
+await attempt('abort-mid-body', () => { const ac = new AbortController(); setTimeout(() => ac.abort(new Error('mine')), 300); return request(silent, { method: 'POST', body: endless(), signal: ac.signal }); }, 0);
+// A server that answers before the body is over.
+await attempt('early-answer', () => request(early, { method: 'POST', body: endless() }));
+// A body error after the request is out.
+await attempt('error-mid-body', () => request(silent, { method: 'POST', body: (async function* () { yield 'x'; await sleep(200); throw new Error('mid'); })(), headersTimeout: 5000 }), 0);
+// A body of known length (an ended stream, or the caller's content-length):
+// the timer still starts at the body's end, which is not its last byte.
+await attempt('known-silent', () => { const p = new PassThrough(); p.end('abc'); return request(silent, { method: 'POST', body: p, headersTimeout: 400 }); }, 350);
+await attempt('cl-silent', () => request(silent, { method: 'PUT', body: slowBody(300), headers: { 'content-length': '2' }, headersTimeout: 400 }), 650);
+await attempt('cl-late-end-silent', () => { const p = new PassThrough(); p.write('ab'); setTimeout(() => p.end(), 600); return request(silent, { method: 'PUT', body: p, headers: { 'content-length': '2' }, headersTimeout: 400 }); }, 950);
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"slow-iterable ok 200 ok
+slow-iterable finalized=true
+slow-readable ok 200 ok
+slow-readable finalized=false
+late-first-chunk ok 200 ok
+late-first-chunk finalized=false
+slow-cl ok 200 ok
+slow-cl finalized=true
+slow-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT "Headers Timeout Error" late=true closed=true
+slow-silent finalized=true
+abort-mid-body failed Error undefined "mine" late=true closed=true
+abort-mid-body finalized=true
+early-answer ok 200 early
+early-answer finalized=true
+error-mid-body failed Error undefined "mid" late=true closed=true
+error-mid-body finalized=false
+known-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT "Headers Timeout Error" late=true closed=true
+known-silent finalized=false
+cl-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT "Headers Timeout Error" late=true closed=true
+cl-silent finalized=true
+cl-late-end-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT "Headers Timeout Error" late=true closed=true
+cl-late-end-silent finalized=false"##;
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
+/// `fetch()` sends a Blob or File as its bytes, with its `type` as the
+/// Content-Type unless the caller set one or it is empty; a URLSearchParams
+/// as its serialization, `application/x-www-form-urlencoded;charset=UTF-8`
+/// unless the caller set a type; and no body or an empty one with
+/// `content-length: 0` on POST, PUT and PATCH, as undici's writeH1 does.
+/// Up to this fix a Blob went out as the text "[object Blob]", a
+/// URLSearchParams as `text/plain`, and an empty POST with no length at all.
+/// The expected output is node v22.22.2's, line for line.
+#[test]
+fn fetch_sends_blob_search_params_and_empty_bodies_as_node_does() {
+    for (name, js, expected) in [
+        (
+            "fetch_extracts_bodies/kinds.mjs",
+            r##"// fetch()'s Blob, File and URLSearchParams bodies: their bytes and their
+// Content-Type, unless the caller set one.
+import http from 'node:http';
+const server = http.createServer((req, res) => { const c = []; req.on('data', (d) => c.push(d)); req.on('end', () => { res.setHeader('connection', 'close'); res.end(JSON.stringify({ cl: req.headers['content-length'] ?? null, ct: req.headers['content-type'] ?? null, body: Buffer.concat(c).toString('latin1') })); }); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+for (const [label, body, headers] of [
+  ['usp', new URLSearchParams({ a: '1', b: 'x y', c: 'é&' })],
+  ['usp-typed', new URLSearchParams({ a: '1' }), { 'content-type': 'text/x-mine' }],
+  ['blob', new Blob(['hi'], { type: 'text/x-hi' })],
+  ['blob-untyped', new Blob([new Uint8Array([0, 255, 1])])],
+  ['blob-typed', new Blob(['hi'], { type: 'text/x-hi' }), { 'content-type': 'application/x-caller' }],
+  ['blob-empty', new Blob([])],
+  ['file', new File(['f!'], 'a.txt', { type: 'text/plain' })],
+  ['blob-cl-wrong', new Blob(['abc']), { 'content-length': '5' }],
+]) {
+  try { const r = await fetch(url, { method: 'POST', body, headers }); console.log(label, await r.text()); } catch (e) { console.log(label, 'rejected', e.name, e.message, e.cause?.name); }
+}
+process.exit(0);
+"##,
+            r##"usp {"cl":"21","ct":"application/x-www-form-urlencoded;charset=UTF-8","body":"a=1&b=x+y&c=%C3%A9%26"}
+usp-typed {"cl":"3","ct":"text/x-mine","body":"a=1"}
+blob {"cl":"2","ct":"text/x-hi","body":"hi"}
+blob-untyped {"cl":"3","ct":null,"body":"\u0000ÿ\u0001"}
+blob-typed {"cl":"2","ct":"application/x-caller","body":"hi"}
+blob-empty {"cl":"0","ct":null,"body":""}
+file {"cl":"2","ct":"text/plain","body":"f!"}
+blob-cl-wrong rejected TypeError fetch failed RequestContentLengthMismatchError"##,
+        ),
+        (
+            "fetch_extracts_bodies/empty.mjs",
+            r##"// fetch() with no body or an empty one: `content-length: 0` on a method
+// that expects a payload, nothing on the others.
+import http from 'node:http';
+const server = http.createServer((req, res) => { req.resume(); req.on('end', () => { res.setHeader('connection', 'close'); res.end(JSON.stringify({ cl: req.headers['content-length'] ?? null, te: req.headers['transfer-encoding'] ?? null })); }); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+for (const m of ['POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH']) for (const [label, body] of [['none', undefined], ['str', ''], ['u8', new Uint8Array(0)]]) {
+  const r = await fetch(url, { method: m, body }); console.log(m, label, await r.text());
+}
+process.exit(0);
+"##,
+            r##"POST none {"cl":"0","te":null}
+POST str {"cl":"0","te":null}
+POST u8 {"cl":"0","te":null}
+PUT none {"cl":"0","te":null}
+PUT str {"cl":"0","te":null}
+PUT u8 {"cl":"0","te":null}
+DELETE none {"cl":null,"te":null}
+DELETE str {"cl":null,"te":null}
+DELETE u8 {"cl":null,"te":null}
+OPTIONS none {"cl":null,"te":null}
+OPTIONS str {"cl":null,"te":null}
+OPTIONS u8 {"cl":null,"te":null}
+PATCH none {"cl":"0","te":null}
+PATCH str {"cl":"0","te":null}
+PATCH u8 {"cl":"0","te":null}"##,
+        ),
+    ] {
+        let script = write_temp(name, js);
+        let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+        let (stdout, stderr) = run_script_ok(&script, out);
+        assert_eq!(
+            stdout.trim().replace("\r\n", "\n"),
+            expected,
+            "{name} stderr: {stderr}"
+        );
+    }
+}
+
+/// `fetch()` streams a ReadableStream or async-iterable request body, as
+/// node's does: chunked unless a `content-length` is declared, nothing sent
+/// before the first chunk and `content-length: 0` for a stream that ends
+/// empty, string and byte chunks taken and anything else refused with
+/// Buffer.from's error, a stream that errors (or a length that disagrees)
+/// failing the fetch with `fetch failed` and the error as the cause, an
+/// abort that does not cancel the source, a 307 that would resend the body
+/// failing the fetch, and a response that is over first stopping the upload
+/// and closing the connection. The Request constructor's refusals come
+/// first: a body on GET or HEAD, a locked stream, a streamed body without
+/// `duplex: 'half'`, a `duplex` outside its enum. A sync iterable is not
+/// streamed. Up to this fix every such body was stringified and sent as
+/// text: `[object ReadableStream]`, with a `text/plain` content-type and a
+/// 200. The expected output is node v22.22.2's, line for line.
+#[test]
+fn fetch_streams_a_readable_stream_or_async_iterable_body() {
+    for (name, js, expected) in [
+        (
+            "fetch_streams_a_body/streams.mjs",
+            r##"// fetch() with a streamed request body (a ReadableStream, an async
+// iterable), as node's fetch sends or refuses it.
+import http from 'node:http';
+
+const server = http.createServer((req, res) => {
+  const chunks = [];
+  req.on('data', (c) => chunks.push(c));
+  req.on('end', () => {
+    res.setHeader('connection', 'close');
+    res.end(JSON.stringify({
+      method: req.method,
+      te: req.headers['transfer-encoding'] ?? null,
+      cl: req.headers['content-length'] ?? null,
+      ct: req.headers['content-type'] ?? null,
+      body: Buffer.concat(chunks).toString(),
+    }));
+  });
+  req.on('error', () => {});
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const enc = new TextEncoder();
+const pulled = (n, gap) => {
+  let i = 0;
+  return new ReadableStream({
+    async pull(c) {
+      if (i >= n) return c.close();
+      await sleep(gap);
+      c.enqueue(enc.encode('x' + ++i));
+    },
+  });
+};
+async function show(label, mk) {
+  try {
+    const r = await mk();
+    console.log(label, r.status, await r.text());
+  } catch (e) {
+    console.log(label, 'rejected', e.name, JSON.stringify(e.message), 'cause', e.cause ? `${e.cause.name} ${JSON.stringify(e.cause.message)}` : 'none');
+  }
+}
+await show('stream-half', () => fetch(url, { method: 'POST', body: pulled(5, 20), duplex: 'half' }));
+await show('stream-no-duplex', () => fetch(url, { method: 'POST', body: pulled(2, 0) }));
+await show('stream-empty', () => fetch(url, { method: 'POST', body: new ReadableStream({ start(c) { c.close(); } }), duplex: 'half' }));
+await show('stream-put-typed', () => fetch(url, { method: 'PUT', body: pulled(2, 0), duplex: 'half', headers: { 'content-type': 'application/octet-stream' } }));
+await show('async-gen', () => fetch(url, { method: 'POST', body: (async function* () { yield enc.encode('a'); yield enc.encode('b'); })(), duplex: 'half' }));
+await show('async-gen-strings', () => fetch(url, { method: 'POST', body: (async function* () { yield 'a'; yield 'b'; })(), duplex: 'half' }));
+await show('stream-string-chunk', () => fetch(url, { method: 'POST', body: new ReadableStream({ start(c) { c.enqueue('str'); c.close(); } }), duplex: 'half' }));
+await show('stream-errors', () => fetch(url, { method: 'POST', body: new ReadableStream({ async pull(c) { await sleep(10); c.error(new Error('boom')); } }), duplex: 'half' }));
+await show('stream-get', () => fetch(url, { method: 'GET', body: pulled(1, 0), duplex: 'half' }));
+{
+  const s = pulled(1, 0);
+  s.getReader();
+  await show('stream-locked', () => fetch(url, { method: 'POST', body: s, duplex: 'half' }));
+}
+await show('stream-cl-header', () => fetch(url, { method: 'POST', body: pulled(2, 0), duplex: 'half', headers: { 'content-length': '4' } }));
+{
+  const ac = new AbortController();
+  let cancelled = 'no';
+  const s = new ReadableStream({ async pull(c) { await sleep(50); c.enqueue(enc.encode('z')); }, cancel(r) { cancelled = String(r?.name ?? r); } });
+  setTimeout(() => ac.abort(), 150);
+  await show('stream-abort', () => fetch(url, { method: 'POST', body: s, duplex: 'half', signal: ac.signal }));
+  await sleep(100);
+  console.log('stream-abort cancelled', cancelled);
+}
+// The 307 a stream body cannot follow.
+{
+  const redir = http.createServer((req, res) => { req.resume(); req.on('end', () => { res.writeHead(307, { location: url, connection: 'close' }); res.end(); }); });
+  await new Promise((r) => redir.listen(0, '127.0.0.1', r));
+  await show('stream-307', () => fetch(`http://127.0.0.1:${redir.address().port}/`, { method: 'POST', body: pulled(1, 0), duplex: 'half' }));
+}
+process.exit(0);
+"##,
+            r##"stream-half 200 {"method":"POST","te":"chunked","cl":null,"ct":null,"body":"x1x2x3x4x5"}
+stream-no-duplex rejected TypeError "RequestInit: duplex option is required when sending a body." cause none
+stream-empty 200 {"method":"POST","te":null,"cl":"0","ct":null,"body":""}
+stream-put-typed 200 {"method":"PUT","te":"chunked","cl":null,"ct":"application/octet-stream","body":"x1x2"}
+async-gen 200 {"method":"POST","te":"chunked","cl":null,"ct":null,"body":"ab"}
+async-gen-strings 200 {"method":"POST","te":"chunked","cl":null,"ct":null,"body":"ab"}
+stream-string-chunk 200 {"method":"POST","te":"chunked","cl":null,"ct":null,"body":"str"}
+stream-errors rejected TypeError "fetch failed" cause Error "boom"
+stream-get rejected TypeError "Request with GET/HEAD method cannot have body." cause none
+stream-locked rejected TypeError "Response body object should not be disturbed or locked" cause none
+stream-cl-header 200 {"method":"POST","te":null,"cl":"4","ct":null,"body":"x1x2"}
+stream-abort rejected AbortError "This operation was aborted" cause none
+stream-abort cancelled no
+stream-307 rejected TypeError "fetch failed" cause Error """##,
+        ),
+        (
+            "fetch_streams_a_body/early.mjs",
+            r##"// A fetch whose response is over while its streamed body is still going out
+// (an origin that answers 413 at once and keeps the connection): the upload
+// stops and the connection is closed; the generator is not returned.
+import net from 'node:net';
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let srvBytes = 0, srvClosed = 0;
+const server = net.createServer((s) => { s.on('error', () => {}); s.on('close', () => { srvClosed++; }); let a = false; s.on('data', (d) => { srvBytes += d.length; if (!a) { a = true; s.write('HTTP/1.1 413 Payload Too Large\r\ncontent-length: 2\r\n\r\nno'); } }); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+let produced = 0, returned = false;
+const gen = async function* () { try { for (;;) { await sleep(20); produced++; yield new Uint8Array(1024); } } finally { returned = true; } };
+const r = await fetch(`http://127.0.0.1:${server.address().port}/`, { method: 'POST', body: gen(), duplex: 'half' });
+console.log('status', r.status, await r.text());
+const p0 = produced, b0 = srvBytes; await sleep(1000);
+console.log('after: produced<=2', produced - p0 <= 2, 'bytes<=2048', srvBytes - b0 <= 2048, 'returned', returned, 'srvClosed', srvClosed);
+process.exit(0);
+"##,
+            r##"status 413 no
+after: produced<=2 true bytes<=2048 true returned false srvClosed 1"##,
+        ),
+        (
+            "fetch_streams_a_body/shapes.mjs",
+            r##"// fetch()'s other body shapes: the chunks a streamed body may yield, what
+// is not streamed, and the Request constructor's refusals.
+import http from 'node:http';
+import { Readable } from 'node:stream';
+const server = http.createServer((req, res) => {
+  const chunks = [];
+  req.on('data', (c) => chunks.push(c));
+  req.on('end', () => {
+    res.setHeader('connection', 'close');
+    res.end(JSON.stringify({ te: req.headers['transfer-encoding'] ?? null, cl: req.headers['content-length'] ?? null, ct: req.headers['content-type'] ?? null, body: Buffer.concat(chunks).toString() }));
+  });
+  req.on('error', () => {});
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+async function show(label, mk) {
+  try {
+    const r = await mk();
+    console.log(label, r.status, await r.text());
+  } catch (e) {
+    console.log(label, 'rejected', e.name, JSON.stringify(e.message), 'cause', e.cause ? `${e.cause.name} ${e.cause.code} ${JSON.stringify(e.cause.message)}` : 'none');
+  }
+}
+const gen = (...items) => (async function* () { for (const i of items) yield i; })();
+await show('gen-no-duplex', () => fetch(url, { method: 'POST', body: gen(new Uint8Array([97])) }));
+await show('sync-iter', () => fetch(url, { method: 'POST', body: [new Uint8Array([97])], duplex: 'half' }));
+await show('gen-number', () => fetch(url, { method: 'POST', body: gen(42), duplex: 'half' }));
+await show('gen-object', () => fetch(url, { method: 'POST', body: gen({}), duplex: 'half' }));
+await show('gen-arraybuffer', () => fetch(url, { method: 'POST', body: gen(new ArrayBuffer(2)), duplex: 'half' }));
+await show('gen-buffer', () => fetch(url, { method: 'POST', body: gen(Buffer.from('buf')), duplex: 'half' }));
+await show('gen-throws-first', () => fetch(url, { method: 'POST', body: (async function* () { throw new Error('first'); })(), duplex: 'half' }));
+await show('readable', () => fetch(url, { method: 'POST', body: Readable.from(['r1', 'r2']), duplex: 'half' }));
+await show('head-body', () => fetch(url, { method: 'HEAD', body: 'x' }));
+await show('get-string', () => fetch(url, { method: 'GET', body: 'x' }));
+await show('stream-cl-mismatch', () => fetch(url, { method: 'POST', body: gen('abc'), duplex: 'half', headers: { 'content-length': '5' } }));
+await show('duplex-full', () => fetch(url, { method: 'POST', body: gen('abc'), duplex: 'full' }));
+await show('string-duplex-bad', () => fetch(url, { method: 'POST', body: 'abc', duplex: 'nope' }));
+process.exit(0);
+"##,
+            r##"gen-no-duplex rejected TypeError "RequestInit: duplex option is required when sending a body." cause none
+sync-iter 200 {"te":null,"cl":"2","ct":"text/plain;charset=UTF-8","body":"97"}
+gen-number rejected TypeError "fetch failed" cause TypeError ERR_INVALID_ARG_TYPE "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received type number (42)"
+gen-object rejected TypeError "fetch failed" cause TypeError ERR_INVALID_ARG_TYPE "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received an instance of Object"
+gen-arraybuffer 200 {"te":"chunked","cl":null,"ct":null,"body":"\u0000\u0000"}
+gen-buffer 200 {"te":"chunked","cl":null,"ct":null,"body":"buf"}
+gen-throws-first rejected TypeError "fetch failed" cause Error undefined "first"
+readable 200 {"te":"chunked","cl":null,"ct":null,"body":"r1r2"}
+head-body rejected TypeError "Request with GET/HEAD method cannot have body." cause none
+get-string rejected TypeError "Request with GET/HEAD method cannot have body." cause none
+stream-cl-mismatch rejected TypeError "fetch failed" cause RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header"
+duplex-full rejected TypeError "Request constructor: full is not an accepted type. Expected one of half." cause none
+string-duplex-bad rejected TypeError "Request constructor: nope is not an accepted type. Expected one of half." cause none"##,
+        ),
+    ] {
+        let script = write_temp(name, js);
+        let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+        let (stdout, stderr) = run_script_ok(&script, out);
+        assert_eq!(
+            stdout.trim().replace("\r\n", "\n"),
+            expected,
+            "{name} stderr: {stderr}"
+        );
+    }
+}
+
+/// `undici.request` with `maxRedirections` follows a redirect as undici's
+/// RedirectHandler does (review 3, finding 9): a Readable it has read comes
+/// back as the 3xx, whatever the status; a buffer, a string, a generator or
+/// a web stream follows, and only a 303 turns the request into a body-less
+/// GET -- a 301 or 302 keeps a POST and its body, which for a spent iterable
+/// is empty (`content-length: 0`). The expected output is node v22.22.2 +
+/// undici 6.29.0's, line for line.
+#[test]
+fn undici_request_redirects_as_undicis_redirect_handler() {
+    let script = write_temp(
+        "undici_request_redirect_handler/main.mjs",
+        r##"import http from 'node:http';
+import { Readable } from 'node:stream';
+import { request } from 'undici';
+
+const log = [];
+const server = http.createServer((q, s) => {
+  let n = 0;
+  q.on('data', (c) => { n += c.length; });
+  q.on('end', () => {
+    log.push(`${q.method} ${q.url} ${n} te=${q.headers['transfer-encoding'] ?? '-'} cl=${q.headers['content-length'] ?? '-'}`);
+    const m = q.url.match(/^\/r(\d+)/);
+    if (m) { s.writeHead(+m[1], { location: '/echo' }); s.end(); } else s.end('ok');
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+const bodies = {
+  readable: () => Readable.from([Buffer.from('abc')]),
+  buffer: () => Buffer.from('abc'),
+  generator: () => (async function* () { yield Buffer.from('abc'); })(),
+  webstream: () => new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('abc')); c.close(); } }),
+};
+for (const status of [302, 303, 307]) {
+  for (const [kind, make] of Object.entries(bodies)) {
+    log.length = 0;
+    const r = await request(`${base}/r${status}`, { method: 'POST', body: make(), maxRedirections: 2 });
+    await r.body.text();
+    console.log(status, kind, r.statusCode, '|', log.join('; '));
+  }
+}
+server.close();
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "\
+302 readable 302 | POST /r302 3 te=chunked cl=-
+302 buffer 200 | POST /r302 3 te=- cl=3; POST /echo 3 te=- cl=3
+302 generator 200 | POST /r302 3 te=chunked cl=-; POST /echo 0 te=- cl=0
+302 webstream 200 | POST /r302 3 te=chunked cl=-; POST /echo 0 te=- cl=0
+303 readable 303 | POST /r303 3 te=chunked cl=-
+303 buffer 200 | POST /r303 3 te=- cl=3; GET /echo 0 te=- cl=-
+303 generator 200 | POST /r303 3 te=chunked cl=-; GET /echo 0 te=- cl=-
+303 webstream 200 | POST /r303 3 te=chunked cl=-; GET /echo 0 te=- cl=-
+307 readable 307 | POST /r307 3 te=chunked cl=-
+307 buffer 200 | POST /r307 3 te=- cl=3; POST /echo 3 te=- cl=3
+307 generator 200 | POST /r307 3 te=chunked cl=-; POST /echo 0 te=- cl=0
+307 webstream 200 | POST /r307 3 te=chunked cl=-; POST /echo 0 te=- cl=0";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// undici's headers and body timeouts (review 3, findings 10 and 11): they
+/// run on undici's FastTimer, so a 200 ms `headersTimeout` lets an 800 ms
+/// answer through and a 100 ms `bodyTimeout` lapses after about 1 s; and
+/// their errors are built with no message argument, so `message` is an own
+/// enumerable key after `name` and `code`, in a cause and thrown alike. oam
+/// fired at the exact delay and passed a message. The expected output is
+/// node v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_timeouts_run_on_undicis_clock_with_undicis_errors() {
+    let script = write_temp(
+        "undici_timeouts_clock_errors/main.mjs",
+        r##"import http from 'node:http';
+import * as U from 'undici';
+
+const server = http.createServer((q, s) => {
+  if (q.url === '/b') { s.writeHead(200); s.write('x'); setTimeout(() => s.end('y'), 1500); }
+  else setTimeout(() => s.end('ok'), q.url === '/fast' ? 800 : 1500);
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+const show = (label, e) => console.log(label, e?.name, Object.keys(e).join(','), JSON.stringify(e));
+async function timed(label, fn) {
+  const t0 = Date.now();
+  try { console.log(label, 'ok', await fn()); }
+  catch (e) { console.log(label, 'failed', (e.cause ?? e).code, 'after 450 ms', Date.now() - t0 >= 450); }
+}
+await timed('fetch headersTimeout 200, 800 ms answer', async () => (await fetch(base + '/fast', { dispatcher: new U.Agent({ headersTimeout: 200 }) })).status);
+await timed('request headersTimeout 200, 800 ms answer', async () => (await U.request(base + '/fast', { headersTimeout: 200 })).statusCode);
+await timed('request bodyTimeout 100, stalled body', async () => (await (await U.request(base + '/b', { bodyTimeout: 100 })).body.text()));
+try { await fetch(base + '/', { dispatcher: new U.Agent({ headersTimeout: 300 }) }); } catch (e) { show('fetch headers cause', e.cause); }
+try { await U.request(base + '/', { headersTimeout: 300 }); } catch (e) { show('request headers', e); }
+try { const r = await U.request(base + '/b', { bodyTimeout: 300 }); await r.body.text(); } catch (e) { show('request body', e); }
+try { const r = await fetch(base + '/b', { dispatcher: new U.Agent({ bodyTimeout: 300 }) }); await r.text(); } catch (e) { show('fetch body cause', e.cause); }
+server.close();
+process.exit(0);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = r#"fetch headersTimeout 200, 800 ms answer ok 200
+request headersTimeout 200, 800 ms answer ok 200
+request bodyTimeout 100, stalled body failed UND_ERR_BODY_TIMEOUT after 450 ms true
+fetch headers cause HeadersTimeoutError name,code,message {"name":"HeadersTimeoutError","code":"UND_ERR_HEADERS_TIMEOUT","message":"Headers Timeout Error"}
+request headers HeadersTimeoutError name,code,message {"name":"HeadersTimeoutError","code":"UND_ERR_HEADERS_TIMEOUT","message":"Headers Timeout Error"}
+request body BodyTimeoutError name,code,message {"name":"BodyTimeoutError","code":"UND_ERR_BODY_TIMEOUT","message":"Body Timeout Error"}
+fetch body cause BodyTimeoutError name,code,message {"name":"BodyTimeoutError","code":"UND_ERR_BODY_TIMEOUT","message":"Body Timeout Error"}"#;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// `undici.request` sends a FormData body as undici does (review 3, finding
+/// 23): `multipart/form-data` with its boundary in the content-type and a
+/// content-length, the caller's content-type kept when it set one. oam
+/// refused it with NotSupportedError, naming an encoder fetch already had.
+/// The boundary's prefix differs (`----formdata-oam-` for undici's
+/// `----formdata-undici-`), so it is masked. The expected output is node
+/// v22.22.2 + undici 6.29.0's.
+#[test]
+fn undici_request_sends_a_form_data_body() {
+    let script = write_temp(
+        "undici_request_form_data/main.mjs",
+        r##"import http from 'node:http';
+import { request } from 'undici';
+
+const server = http.createServer((q, s) => {
+  const chunks = [];
+  q.on('data', (c) => chunks.push(c));
+  q.on('end', () => {
+    const type = q.headers['content-type'];
+    const boundary = (type.match(/boundary=(.*)$/) || [])[1];
+    let body = Buffer.concat(chunks).toString('latin1');
+    if (boundary) body = body.split(boundary).join('BOUNDARY');
+    const mask = (t) => t.replace(/BOUNDARY|----formdata-\w+-0\d+/g, 'BOUNDARY');
+    console.log(type.endsWith('boundary=mine') ? 'the caller content-type' : mask(type).replace(/boundary=.*/, 'boundary=BOUNDARY'), 'length', q.headers['content-length'] === String(Buffer.concat(chunks).length));
+    console.log(JSON.stringify(mask(body)));
+    s.end('ok');
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+const fd = new FormData();
+fd.append('a', '1');
+fd.append('f', new Blob(['xyz'], { type: 'text/plain' }), 'f.txt');
+await (await request(url, { method: 'POST', body: fd })).body.text();
+await (await request(url, { method: 'POST', body: fd, headers: { 'content-type': 'multipart/form-data; boundary=mine' } })).body.text();
+server.close();
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = r#"multipart/form-data; boundary=BOUNDARY length true
+"--BOUNDARY\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"f\"; filename=\"f.txt\"\r\nContent-Type: text/plain\r\n\r\nxyz\r\n--BOUNDARY--\r\n"
+the caller content-type length true
+"--BOUNDARY\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--BOUNDARY\r\nContent-Disposition: form-data; name=\"f\"; filename=\"f.txt\"\r\nContent-Type: text/plain\r\n\r\nxyz\r\n--BOUNDARY--\r\n""#;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// undici.request()'s body and throwOnError (review 3, finding 13): a body
+/// destroyed before its end errors with RequestAbortedError, as undici's
+/// BodyReadable does; and `throwOnError: true` rejects a status of 400 or
+/// more with ResponseStatusCodeError, its body parsed by content-type (JSON,
+/// text, or none). oam's body just closed, and throwOnError was ignored.
+/// The expected output is node v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_request_body_destroy_and_throw_on_error() {
+    let script = write_temp(
+        "undici_request_throw_on_error/main.mjs",
+        r##"import http from 'node:http';
+import { request } from 'undici';
+
+const server = http.createServer((q, s) => {
+  if (q.url === '/json') { s.writeHead(404, { 'content-type': 'application/json' }); s.end('{"a":1}'); return; }
+  if (q.url === '/text') { s.writeHead(500, 'Broken', { 'content-type': 'text/plain' }); s.end('oops'); return; }
+  if (q.url === '/none') { s.writeHead(403); s.end('no type'); return; }
+  s.writeHead(200);
+  s.write('x'.repeat(100));
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+const r = await request(base + '/stall');
+await new Promise((resolve) => {
+  r.body.on('error', (e) => console.log('destroyed body: error', e.name, e.code, e.message));
+  r.body.on('close', () => { console.log('destroyed body: close'); setTimeout(resolve, 20); });
+  r.body.once('data', () => r.body.destroy());
+});
+for (const path of ['/json', '/text', '/none']) {
+  try {
+    const res = await request(base + path, { throwOnError: true });
+    console.log(path, 'resolved', res.statusCode);
+  } catch (e) {
+    console.log(path, e.name, e.code, e.message, e.status, e.statusCode, JSON.stringify(e.body), e.headers['content-type']);
+  }
+}
+const plain = await request(base + '/json');
+console.log('without throwOnError', plain.statusCode, await plain.body.text());
+process.exit(0);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = r#"destroyed body: error AbortError UND_ERR_ABORTED Request aborted
+destroyed body: close
+/json ResponseStatusCodeError UND_ERR_RESPONSE_STATUS_CODE Response status code 404: Not Found 404 404 {"a":1} application/json
+/text ResponseStatusCodeError UND_ERR_RESPONSE_STATUS_CODE Response status code 500: Broken 500 500 "oops" text/plain
+/none ResponseStatusCodeError UND_ERR_RESPONSE_STATUS_CODE Response status code 403: Forbidden 403 403 undefined undefined
+without throwOnError 404 {"a":1}"#;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// A Readable `undici.request` body is framed when the request is
+/// dispatched, not when `request()` is called: undici asks
+/// `util.bodyLength` then, so a stream that ends in the same turn of the
+/// event loop -- on a tick, a microtask or a queued immediate -- goes out
+/// with `content-length`, one still open goes chunked, and a declared length
+/// the ended stream disagrees with is refused before anything is sent, the
+/// stream destroyed with the error. Up to this fix oam decided at the call,
+/// so such a stream went chunked, which a server that refuses chunked
+/// uploads (`411 Length Required`) turns away. The expected output is node
+/// v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_request_frames_a_stream_when_it_dispatches() {
+    let script = write_temp(
+        "undici_request_frames_a_stream_when_it_dispatches/main.mjs",
+        r##"// A Readable body that ends after request() is called but in the same turn
+// of the event loop is framed with content-length, as undici frames it when
+// it dispatches the request; one that ends later goes chunked.
+import net from 'node:net';
+import { PassThrough } from 'node:stream';
+import { request } from 'undici';
+
+const seen = [];
+const server = net.createServer((s) => {
+  s.on('error', () => {});
+  let buf = '';
+  s.on('data', (d) => {
+    const first = buf === '';
+    buf += d.toString('latin1');
+    if (!first) return;
+    seen.push(buf.split('\r\n').filter((l) => /^(content-length|transfer-encoding)/i.test(l)).join('|') || 'none');
+    setTimeout(() => s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok'), 50);
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+const cases = [
+  ['ended-sync', () => { const p = new PassThrough(); p.end('abc'); return p; }],
+  ['ended-next-tick', () => { const p = new PassThrough(); process.nextTick(() => p.end('abc')); return p; }],
+  ['ended-microtask', () => { const p = new PassThrough(); queueMicrotask(() => p.end('abc')); return p; }],
+  ['ended-immediate', () => { const p = new PassThrough(); setImmediate(() => p.end('abc')); return p; }],
+  ['written-then-ended-next-tick', () => { const p = new PassThrough(); p.write('ab'); process.nextTick(() => p.end('c')); return p; }],
+  ['ended-later', () => { const p = new PassThrough(); p.write('ab'); setTimeout(() => p.end('c'), 100); return p; }],
+  ['empty-next-tick', () => { const p = new PassThrough(); process.nextTick(() => p.end()); return p; }],
+];
+for (const [label, mk] of cases) {
+  const before = seen.length;
+  try {
+    const r = await request(url, { method: 'PUT', body: mk() });
+    await r.body.text();
+    console.log(label, r.statusCode, seen.length > before ? seen.at(-1) : 'nothing sent');
+  } catch (e) {
+    console.log(label, 'rejected', e.name, e.code);
+  }
+}
+// A declared length the ended stream disagrees with.
+{
+  const p = new PassThrough();
+  process.nextTick(() => p.end('abc'));
+  const before = seen.length;
+  try {
+    const r = await request(url, { method: 'PUT', body: p, headers: { 'content-length': '5' } });
+    await r.body.text();
+    console.log('declared-mismatch', r.statusCode);
+  } catch (e) {
+    await new Promise((r) => setTimeout(r, 100));
+    console.log('declared-mismatch rejected', e.name, e.code, 'sent', seen.length > before, 'destroyed', p.destroyed);
+  }
+}
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"ended-sync 200 content-length: 3
+ended-next-tick 200 content-length: 3
+ended-microtask 200 content-length: 3
+ended-immediate 200 content-length: 3
+written-then-ended-next-tick 200 content-length: 3
+ended-later 200 transfer-encoding: chunked
+empty-next-tick 200 content-length: 0
+declared-mismatch rejected RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH sent false destroyed true"##;
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
+/// `undici.request` rejects with the error itself, as undici's does, never
+/// with fetch's `TypeError: fetch failed`: an oversized response head is
+/// `HeadersOverflowError` (`UND_ERR_HEADERS_OVERFLOW`), counted as undici
+/// counts it -- header names and values, not the reason phrase -- and a body
+/// timeout, a dispatcher's bad option, a refused header and a refused
+/// connect (`ECONNREFUSED`) come as they are, and every class in `errors`
+/// carries its own name (`err.constructor.name`). Up to this fix an overflow was
+/// `fetch failed` with node's http-parser cause (`HPE_HEADER_OVERFLOW`, and
+/// node's http.request count, so a head undici takes was refused), and so
+/// was a refused connect. The expected output is node v22.22.2 + undici
+/// 6.29.0's, line for line.
+#[test]
+fn undici_request_rejects_with_the_error_itself() {
+    let script = write_temp(
+        "undici_request_rejects_with_the_error_itself/main.mjs",
+        r##"import net from 'node:net';
+import { request, errors, Agent } from 'undici';
+
+// A head whose names + values come to `nv` bytes, with a reason phrase of
+// `reason` bytes.
+function serve(nv, reason) {
+  return net.createServer((s) => {
+    s.on('error', () => {});
+    s.once('data', () => {
+      // "content-length" (14) + "0" (1) + "x-big" (5) + value
+      const value = 'a'.repeat(nv - 20);
+      s.end(`HTTP/1.1 200 ${'R'.repeat(reason)}\r\ncontent-length: 0\r\nx-big: ${value}\r\n\r\n`);
+    });
+  });
+}
+const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${srv.address().port}/`)));
+function show(label, e) {
+  console.log(label, 'rejected', e.constructor.name, e.name, e.code, JSON.stringify(e.message.replace(/:\d+$/, ':PORT')),
+    'overflowClass', e instanceof errors.HeadersOverflowError, 'undiciClass', e instanceof errors.UndiciError,
+    'cause', e.cause ? e.cause.name + ' ' + e.cause.code : 'none');
+}
+// undici counts header names and values, not the reason phrase, and
+// request() rejects with HeadersOverflowError itself.
+for (const [nv, reason] of [[16383, 100], [16384, 2], [20000, 2]]) {
+  const url = await listen(serve(nv, reason));
+  try {
+    const r = await request(url);
+    await r.body.text();
+    console.log(`request nv=${nv} reason=${reason}`, 'ok', r.statusCode);
+  } catch (e) { show(`request nv=${nv} reason=${reason}`, e); }
+  try {
+    const r = await fetch(url);
+    await r.text();
+    console.log(`fetch nv=${nv} reason=${reason}`, 'ok', r.status);
+  } catch (e) { show(`fetch nv=${nv} reason=${reason}`, e); }
+}
+// A body timeout, a dispatcher's bad option, a refused header and a refused
+// connect: the error itself, never `TypeError: fetch failed`.
+{
+  const srv = net.createServer((s) => {
+    s.on('error', () => {});
+    s.once('data', () => s.write('HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nab'));
+  });
+  const url = await listen(srv);
+  const r = await request(url, { bodyTimeout: 200 });
+  try { await r.body.text(); console.log('body-timeout ok'); } catch (e) { show('body-timeout', e); }
+}
+try { await request('http://127.0.0.1:1/', { dispatcher: new Agent({ headersTimeout: -1 }) }); } catch (e) { show('bad-dispatcher', e); }
+try { await request('http://127.0.0.1:1/', { headers: { 'transfer-encoding': 'x' } }); } catch (e) { show('te-header', e); }
+{
+  const srv = net.createServer();
+  const url = await listen(srv);
+  await new Promise((r) => srv.close(r));
+  try { await request(url); } catch (e) { show('refused', e); }
+}
+console.log('class names', Object.keys(errors).filter((k) => typeof errors[k] === 'function' && errors[k].name !== k).join(',') || 'all match');
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"request nv=16383 reason=100 ok 200
+fetch nv=16383 reason=100 ok 200
+request nv=16384 reason=2 rejected HeadersOverflowError HeadersOverflowError UND_ERR_HEADERS_OVERFLOW "Headers Overflow Error" overflowClass true undiciClass true cause none
+fetch nv=16384 reason=2 rejected TypeError TypeError undefined "fetch failed" overflowClass false undiciClass false cause HeadersOverflowError UND_ERR_HEADERS_OVERFLOW
+request nv=20000 reason=2 rejected HeadersOverflowError HeadersOverflowError UND_ERR_HEADERS_OVERFLOW "Headers Overflow Error" overflowClass true undiciClass true cause none
+fetch nv=20000 reason=2 rejected TypeError TypeError undefined "fetch failed" overflowClass false undiciClass false cause HeadersOverflowError UND_ERR_HEADERS_OVERFLOW
+body-timeout rejected BodyTimeoutError BodyTimeoutError UND_ERR_BODY_TIMEOUT "Body Timeout Error" overflowClass false undiciClass true cause none
+bad-dispatcher rejected InvalidArgumentError InvalidArgumentError UND_ERR_INVALID_ARG "headersTimeout must be a positive integer or zero" overflowClass false undiciClass true cause none
+te-header rejected InvalidArgumentError InvalidArgumentError UND_ERR_INVALID_ARG "invalid transfer-encoding header" overflowClass false undiciClass true cause none
+refused rejected Error Error ECONNREFUSED "connect ECONNREFUSED 127.0.0.1:PORT" overflowClass false undiciClass false cause none
+class names all match"##;
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
+/// A streamed `undici.request` body is stopped once the response is over
+/// while it is still going out -- read to its end, or destroyed by the
+/// caller -- against an origin that answers early and keeps the connection:
+/// an idle stream is destroyed (with no error) and detached, a generator is
+/// returned, nothing more is uploaded, and the connection is closed, as
+/// undici resets the socket when a message completes mid-write. Up to this
+/// fix oam went on uploading for as long as the connection lived, and left
+/// an idle stream attached and open. The expected output is node v22.22.2 +
+/// undici 6.29.0's, line for line.
+#[test]
+fn undici_request_stops_its_upload_once_the_response_is_over() {
+    let script = write_temp(
+        "undici_request_stops_its_upload/main.mjs",
+        r##"import net from 'node:net';
+import { PassThrough } from 'node:stream';
+import { request } from 'undici';
+
+// An origin that answers 413 as soon as anything arrives and keeps the
+// connection open.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let srvBytes = 0;
+let srvClosed = 0;
+const server = net.createServer((s) => {
+  s.on('error', () => {});
+  s.on('close', () => { srvClosed++; });
+  let answered = false;
+  s.on('data', (d) => {
+    srvBytes += d.length;
+    if (!answered) { answered = true; s.write('HTTP/1.1 413 Payload Too Large\r\ncontent-length: 2\r\n\r\nno'); }
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+
+// An idle stream: destroyed (no error) and detached once the response is read.
+{
+  srvClosed = 0;
+  const p = new PassThrough();
+  const errs = [];
+  p.on('error', (e) => errs.push(e.name + ':' + e.message));
+  let closeEv = false;
+  p.on('close', () => { closeEv = true; });
+  p.write('x');
+  const r = await request(url, { method: 'POST', body: p });
+  console.log('idle status', r.statusCode, await r.body.text());
+  console.log('idle now destroyed', p.destroyed);
+  await sleep(300);
+  console.log('idle later destroyed', p.destroyed, 'close', closeEv, 'errors', JSON.stringify(errs), 'listeners', p.listenerCount('data'), p.listenerCount('end'), 'srvClosed', srvClosed > 0);
+}
+
+// A generator that keeps producing: returned, and nothing more is uploaded.
+{
+  srvClosed = 0;
+  let produced = 0;
+  let returned = false;
+  const gen = async function* () {
+    try { for (;;) { await sleep(20); produced++; yield Buffer.alloc(1024); } }
+    finally { returned = true; }
+  };
+  const r = await request(url, { method: 'POST', body: gen() });
+  console.log('gen status', r.statusCode, await r.body.text());
+  const p0 = produced, b0 = srvBytes;
+  await sleep(1000);
+  console.log('gen after: produced<=2', produced - p0 <= 2, 'bytes<=2048', srvBytes - b0 <= 2048, 'returned', returned, 'srvClosed', srvClosed > 0);
+}
+
+// A response body the caller destroys before its end.
+{
+  srvClosed = 0;
+  const p = new PassThrough();
+  p.write('x');
+  const r = await request(url, { method: 'POST', body: p });
+  r.body.on('error', () => {});
+  r.body.destroy();
+  await sleep(300);
+  console.log('destroyed-body: stream destroyed', p.destroyed, 'srvClosed', srvClosed > 0);
+}
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"idle status 413 no
+idle now destroyed true
+idle later destroyed true close true errors [] listeners 0 0 srvClosed true
+gen status 413 no
+gen after: produced<=2 true bytes<=2048 true returned true srvClosed true
+destroyed-body: stream destroyed true srvClosed true"##;
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
+/// `fetch()` runs under its dispatcher's `headersTimeout` / `bodyTimeout`, as
+/// node's does: the `dispatcher` option's (global `fetch` and `undici.fetch`),
+/// the global one's after `setGlobalDispatcher`, a ProxyAgent's for the
+/// origin's answer, else undici's 300 s. A late head fails the fetch with
+/// `TypeError: fetch failed`, cause HeadersTimeoutError; a stalled body
+/// errors its reader, `text()` and `for await` with `TypeError: terminated`,
+/// cause BodyTimeoutError -- instances of the shim's `errors.*`. The limit
+/// starts once connected (a slow connect function counts for nothing), each
+/// redirect hop gets its own, 0 disables, a `headersTimeout` in the fetch
+/// init is not an option, and a bad dispatcher value is undici's
+/// InvalidArgumentError as the cause. Up to this fix a fetch got no limit at
+/// all and only its own signal ended it. The expected output is node
+/// v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn fetch_rides_its_dispatchers_headers_and_body_timeouts() {
+    let script = write_temp(
+        "fetch_dispatcher_timeouts/main.mjs",
+        r##"import net from 'node:net';
+import * as undici from 'undici';
+const { Agent, ProxyAgent, errors, setGlobalDispatcher, getGlobalDispatcher, buildConnector } = undici;
+
+const never = net.createServer((s) => { s.on('data', () => {}); s.on('error', () => {}); });
+const stall = net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => s.write('HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n'));
+});
+const slow = net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => setTimeout(() => s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok'), 300));
+});
+const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${srv.address().port}`)));
+const [nu, su, lu] = await Promise.all([listen(never), listen(stall), listen(slow)]);
+
+const describe = (e) => {
+  const c = e?.cause;
+  return [e?.name, JSON.stringify(e?.message), e instanceof TypeError,
+    c ? `cause=${c.name}/${c.code}/${JSON.stringify(c.message)}/undici=${c instanceof errors.UndiciError}/cls=${c instanceof (errors[c.name] ?? Object)}` : 'nocause'].join(' ');
+};
+async function attempt(label, fn) {
+  const t0 = Date.now();
+  try {
+    console.log(label, 'ok', await fn());
+  } catch (e) {
+    console.log(label, 'failed', describe(e), 'early=' + (Date.now() - t0 < 4000));
+  }
+}
+// A budget that ends a probe the phase timeout did not end, with its own reason.
+const budget = (ms) => { const ac = new AbortController(); setTimeout(() => ac.abort(new Error('budget')), ms).unref(); return ac.signal; };
+const total = () => budget(6000);
+
+await attempt('headers-dispatcher', () => fetch(nu, { dispatcher: new Agent({ headersTimeout: 400 }), signal: total() }).then((r) => r.status));
+await attempt('headers-undici-fetch', () => undici.fetch(nu, { dispatcher: new Agent({ headersTimeout: 400 }), signal: total() }).then((r) => r.status));
+await attempt('headers-zero', () => fetch(nu, { dispatcher: new Agent({ headersTimeout: 0 }), signal: budget(900) }).then((r) => r.status));
+await attempt('headers-in-time', () => fetch(lu, { dispatcher: new Agent({ headersTimeout: 600 }) }).then((r) => r.text()));
+await attempt('headers-slow-connect', () => fetch(lu, { dispatcher: new Agent({ headersTimeout: 600, connect: (o, cb) => setTimeout(() => buildConnector({})(o, cb), 800) }) }).then((r) => r.text()));
+await attempt('headers-init-option-ignored', () => fetch(nu, { headersTimeout: 400, signal: budget(900) }).then((r) => r.status));
+await attempt('body-text', async () => (await fetch(su, { dispatcher: new Agent({ bodyTimeout: 400 }), signal: total() })).text());
+await attempt('body-reader', async () => {
+  const r = await fetch(su, { dispatcher: new Agent({ bodyTimeout: 400 }), signal: total() });
+  const reader = r.body.getReader();
+  const got = [];
+  for (;;) { const { done, value } = await reader.read(); if (done) break; got.push(new TextDecoder().decode(value)); }
+  return got.join('');
+});
+await attempt('body-for-await', async () => {
+  const r = await fetch(su, { dispatcher: new Agent({ bodyTimeout: 400 }), signal: total() });
+  let s = ''; for await (const c of r.body) s += new TextDecoder().decode(c); return s;
+});
+const previous = getGlobalDispatcher();
+setGlobalDispatcher(new Agent({ headersTimeout: 400, bodyTimeout: 400 }));
+await attempt('global-headers', () => fetch(nu, { signal: total() }).then((r) => r.status));
+await attempt('global-body', async () => (await fetch(su, { signal: total() })).arrayBuffer().then((b) => b.byteLength));
+setGlobalDispatcher(previous);
+await attempt('dispatcher-bad', () => fetch(nu, { dispatcher: new Agent({ headersTimeout: -1 }), signal: total() }).then((r) => r.status));
+// Redirect hops each get their own limit.
+const target = lu;
+const redirector = await listen(net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => setTimeout(() => s.end(`HTTP/1.1 302 Found\r\nlocation: ${target}/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n`), 300));
+}));
+await attempt('redirect-hops', () => fetch(redirector, { dispatcher: new Agent({ headersTimeout: 500 }) }).then((r) => r.text()));
+// A ProxyAgent's headersTimeout bounds the origin's answer.
+const proxy = net.createServer((c) => {
+  c.on('error', () => {});
+  c.once('data', (d) => {
+    const port = Number(d.toString('latin1').split(' ')[1].split(':').pop());
+    const up = net.connect(port, '127.0.0.1', () => { c.write('HTTP/1.1 200 Connection Established\r\n\r\n'); up.pipe(c); c.pipe(up); });
+    up.on('error', () => c.destroy());
+    c.on('close', () => up.destroy());
+  });
+});
+const pu = await listen(proxy);
+await attempt('proxy-silent-origin', () => fetch(nu, { dispatcher: new ProxyAgent({ uri: pu, headersTimeout: 400 }), signal: total() }).then((r) => r.status));
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"headers-dispatcher failed TypeError "fetch failed" true cause=HeadersTimeoutError/UND_ERR_HEADERS_TIMEOUT/"Headers Timeout Error"/undici=true/cls=true early=true
+headers-undici-fetch failed TypeError "fetch failed" true cause=HeadersTimeoutError/UND_ERR_HEADERS_TIMEOUT/"Headers Timeout Error"/undici=true/cls=true early=true
+headers-zero failed Error "budget" false nocause early=true
+headers-in-time ok ok
+headers-slow-connect ok ok
+headers-init-option-ignored failed Error "budget" false nocause early=true
+body-text failed TypeError "terminated" true cause=BodyTimeoutError/UND_ERR_BODY_TIMEOUT/"Body Timeout Error"/undici=true/cls=true early=true
+body-reader failed TypeError "terminated" true cause=BodyTimeoutError/UND_ERR_BODY_TIMEOUT/"Body Timeout Error"/undici=true/cls=true early=true
+body-for-await failed TypeError "terminated" true cause=BodyTimeoutError/UND_ERR_BODY_TIMEOUT/"Body Timeout Error"/undici=true/cls=true early=true
+global-headers failed TypeError "fetch failed" true cause=HeadersTimeoutError/UND_ERR_HEADERS_TIMEOUT/"Headers Timeout Error"/undici=true/cls=true early=true
+global-body failed TypeError "terminated" true cause=BodyTimeoutError/UND_ERR_BODY_TIMEOUT/"Body Timeout Error"/undici=true/cls=true early=true
+dispatcher-bad failed TypeError "fetch failed" true cause=InvalidArgumentError/UND_ERR_INVALID_ARG/"headersTimeout must be a positive integer or zero"/undici=true/cls=true early=true
+redirect-hops ok ok
+proxy-silent-origin failed TypeError "fetch failed" true cause=HeadersTimeoutError/UND_ERR_HEADERS_TIMEOUT/"Headers Timeout Error"/undici=true/cls=true early=true"##;
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
 // An undici Agent's connect.lookup hook is honored as a REAL DNS/connect pin
 // (the DNS-rebind / SSRF control @yawlabs/fetch-mcp relies on). Proof: pin a
 // NON-resolvable host to the server's real IP -- the request must connect
@@ -4900,6 +6909,42 @@ fn undici_dispatcher_connect_lookup_pins_dns() {
     );
     // Control proves the pin was load-bearing: the unpinned request can't resolve.
     assert!(stdout.contains("control=failed"), "{stdout}");
+}
+
+// #162: a connect.lookup answer with an IPv6 zone id is an address, as node's
+// net.isIP has it, and is dialled: it was refused before the dial (first by
+// the JS isIP filter, then by the pin parser, `pin ip '...' is not an IP`).
+// The zone names no interface on any platform, so libuv's rules make it scope
+// id 0 and the connect reaches the ::1 listener.
+#[test]
+fn undici_dispatcher_connect_lookup_dials_a_zoned_address() {
+    let main = write_temp(
+        "undici_pin_zone/main.mjs",
+        "import http from 'node:http';\n\
+         import { Agent } from 'undici';\n\
+         const server = http.createServer((req, res) => res.end('zoned:' + req.headers.host));\n\
+         await new Promise((r) => server.listen(0, '::1', r));\n\
+         const port = server.address().port;\n\
+         const agent = new Agent({ connect: { lookup: (h, o, cb) => cb(null, [{ address: '::1%oamnone0', family: 6 }]) } });\n\
+         try {\n\
+           const res = await fetch(`http://scoped.invalid:${port}/`, { dispatcher: agent });\n\
+           console.log('fetch=' + res.status + ':' + (await res.text()));\n\
+         } catch (e) { console.log('fetch=ERR:' + e.message + ':' + (e.cause && e.cause.message)); }\n\
+         server.close();\n\
+         process.exit(0);\n",
+    );
+    let out = oam(&["run", "--no-check", main.to_str().unwrap()]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "exit {}: {stdout}\n{stderr}",
+        out.status
+    );
+    assert!(
+        stdout.contains("fetch=200:zoned:scoped.invalid:"),
+        "expected the zoned answer to be dialled: {stdout}"
+    );
 }
 
 // ------------------------------------ #143: fetch on oam's own transport
@@ -5334,6 +7379,304 @@ A.close(); B.close(); S.close();
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// undici's `ProxyAgent` and `EnvHttpProxyAgent` (#208). A ProxyAgent sends
+/// every request -- to an http origin as much as an https one -- through a
+/// `CONNECT` tunnel, so on oam it is a dispatcher whose connect function
+/// opens that tunnel, and every entry point a dispatcher has goes through the
+/// proxy: fetch's `dispatcher`, the global dispatcher, `undici.fetch`,
+/// `undici.request`, the agent's own `request()`, each redirect hop. The
+/// proxy here splices to 127.0.0.1 whatever host the CONNECT named, so the
+/// requests to `a.test` and `b.test` (which do not resolve) only succeed
+/// through it. Pinned: the CONNECT head on the wire, TLS to the origin inside
+/// the tunnel under `requestTls`, TLS to an https proxy under `proxyTls`,
+/// the credentials (`token`, `auth`, the URL's userinfo) going to the proxy
+/// and never the origin, the refusal of a caller Proxy-Authorization, a proxy
+/// that refuses the tunnel or is not there, undici's constructor checks, and
+/// EnvHttpProxyAgent's choice per origin from its options, the environment
+/// and `no_proxy`. Up to 0.17.1 the shim exported neither class, so
+/// `import { ProxyAgent } from 'undici'` was a link-time SyntaxError.
+///
+/// The expected output is node v22.22.2 + undici 6.29.0's, line for line,
+/// with one exception: `refused` (a fetch whose proxy answers 403). undici
+/// calls its connect callback twice there, and node's fetch reports the
+/// second call's `Request was cancelled.`; oam reports the first, the
+/// `Proxy response (403) !== 200` that `undici.request` reports in both.
+#[test]
+fn undici_proxy_agent_tunnels_every_connection() {
+    let script = write_temp(
+        "undici_proxy_agent/main.mjs",
+        &r##"import http from 'node:http';
+import https from 'node:https';
+import net from 'node:net';
+import tls from 'node:tls';
+import * as undici from 'undici';
+import { ProxyAgent, EnvHttpProxyAgent } from 'undici';
+
+const redact = (s) => String(s).replace(/\b\d{4,5}\b/g, 'P');
+const hits = [];
+const tunnels = [];
+const O = http.createServer((req, res) => {
+  hits.push(`O${req.url} host=${redact(req.headers.host)} pa=${req.headers['proxy-authorization'] ?? '-'}`);
+  if (req.url === '/hop') { res.writeHead(302, { location: `http://b.test:${O.address().port}/landed` }); res.end(); return; }
+  res.end('plain ' + req.url);
+});
+const S = https.createServer({ key: `__KEY__`, cert: `__CERT__` }, (req, res) => { hits.push(`S${req.url}`); res.end('secure ' + req.url); });
+// A CONNECT proxy: records each tunnel request's head, then splices the
+// client to 127.0.0.1:<the authority's port>, whatever host it named -- so a
+// request to a name that does not resolve only succeeds THROUGH it.
+let verdict = 200;
+const serveTunnel = (tag) => (c) => {
+  c.on('error', () => {});
+  let buf = Buffer.alloc(0);
+  const onData = (d) => {
+    buf = Buffer.concat([buf, d]);
+    const end = buf.indexOf('\r\n\r\n');
+    if (end === -1) return;
+    c.removeListener('data', onData);
+    const head = buf.subarray(0, end).toString('latin1').split('\r\n');
+    tunnels.push(tag + redact(head.join(' | ')));
+    if (verdict !== 200) { c.end(`HTTP/1.1 ${verdict} No\r\ncontent-length: 0\r\n\r\n`); return; }
+    const port = Number(head[0].split(' ')[1].split(':').pop());
+    const up = net.connect(port, '127.0.0.1', () => { c.write('HTTP/1.1 200 Connection Established\r\n\r\n'); up.pipe(c); c.pipe(up); });
+    up.on('error', () => c.destroy());
+    c.on('close', () => up.destroy());
+  };
+  c.on('data', onData);
+};
+const P = net.createServer(serveTunnel(''));
+const TP = tls.createServer({ key: `__KEY__`, cert: `__CERT__` }, serveTunnel('tls:'));
+for (const srv of [O, S, P, TP]) await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const proxy = `http://127.0.0.1:${P.address().port}`;
+const plain = `http://a.test:${O.address().port}`;
+const secure = `https://localhost:${S.address().port}`;
+const ca = `__CA__`;
+
+async function probe(name, run) {
+  hits.length = 0; tunnels.length = 0;
+  let out;
+  try {
+    const r = await run();
+    const body = r.body && typeof r.body.text === 'function' ? await r.body.text() : await r.text();
+    out = `${r.status ?? r.statusCode} ${body}`;
+  } catch (e) {
+    const cause = e?.cause ?? e;
+    out = `failed ${cause?.name} ${cause?.code} ${redact(cause?.message)}`;
+  }
+  console.log(name, out, JSON.stringify(tunnels), JSON.stringify(hits));
+}
+const ctor = (name, make) => {
+  try { const a = make(); console.log(name, 'constructed', a instanceof undici.Dispatcher); } catch (e) { console.log(name, e.name, e.code, e.message); }
+};
+
+// The three spellings of the proxy, on every entry point.
+await probe('fetch-string', () => fetch(plain + '/1', { dispatcher: new ProxyAgent(proxy) }));
+await probe('fetch-url', () => fetch(plain + '/2', { dispatcher: new ProxyAgent(new URL(proxy)) }));
+await probe('fetch-uri', () => fetch(plain + '/3', { dispatcher: new ProxyAgent({ uri: proxy }) }));
+const mk = () => new ProxyAgent(proxy);
+await probe('undici-request', () => undici.request(plain + '/4', { dispatcher: mk() }));
+await probe('agent-request', () => mk().request({ origin: plain, path: '/5', method: 'GET' }));
+const previous = undici.getGlobalDispatcher();
+undici.setGlobalDispatcher(mk());
+await probe('global-fetch', () => fetch(plain + '/6'));
+undici.setGlobalDispatcher(mk());
+await probe('undici-fetch', () => undici.fetch(plain + '/7'));
+undici.setGlobalDispatcher(mk());
+await probe('global-request', () => undici.request(plain + '/8'));
+undici.setGlobalDispatcher(previous);
+await probe('redirect', () => fetch(plain + '/hop', { dispatcher: mk() }));
+
+// An https origin: CONNECT, then TLS to the origin inside the tunnel, under requestTls.
+await probe('https-origin', () => fetch(secure + '/s1', { dispatcher: new ProxyAgent({ uri: proxy, requestTls: { ca } }) }));
+await probe('https-untrusted', () => fetch(secure + '/s2', { dispatcher: new ProxyAgent({ uri: proxy }) }));
+// An https proxy: TLS to the proxy under proxyTls, then the tunnel.
+const tlsProxy = `https://localhost:${TP.address().port}`;
+await probe('tls-proxy', () => fetch(plain + '/t1', { dispatcher: new ProxyAgent({ uri: tlsProxy, proxyTls: { ca } }) }));
+await probe('tls-proxy-https', () => fetch(secure + '/t2', { dispatcher: new ProxyAgent({ uri: tlsProxy, proxyTls: { ca }, requestTls: { ca } }) }));
+await probe('tls-proxy-untrusted', () => fetch(plain + '/t3', { dispatcher: new ProxyAgent({ uri: tlsProxy }) }));
+
+// Credentials go to the proxy on the CONNECT, never to the origin.
+await probe('auth-userinfo', () => fetch(plain + '/a1', { dispatcher: new ProxyAgent(proxy.replace('//', '//us%40er:p%3Ass@')) }));
+await probe('auth-token', () => fetch(plain + '/a2', { dispatcher: new ProxyAgent({ uri: proxy, token: 'Bearer tok' }) }));
+await probe('auth-auth', () => fetch(plain + '/a3', { dispatcher: new ProxyAgent({ uri: proxy, auth: 'dTpw' }) }));
+await probe('headers', () => fetch(plain + '/a4', { dispatcher: new ProxyAgent({ uri: proxy, headers: { 'x-proxy-note': 'n' } }) }));
+await probe('request-proxy-auth', () => undici.request(plain + '/a5', { dispatcher: mk(), headers: { 'Proxy-Authorization': 'Basic x' } }));
+await probe('fetch-proxy-auth', () => fetch(plain + '/a6', { dispatcher: mk(), headers: { 'proxy-authorization': 'Basic x' } }));
+
+// A proxy that refuses the tunnel, and one that is not there.
+verdict = 403;
+await probe('refused', () => fetch(plain + '/r1', { dispatcher: mk() }));
+await probe('refused-request', () => undici.request(plain + '/r2', { dispatcher: mk() }));
+verdict = 407;
+await probe('auth-required', () => undici.request(plain + '/r2b', { dispatcher: mk() }));
+verdict = 200;
+const dead = net.createServer();
+await new Promise((r) => dead.listen(0, '127.0.0.1', r));
+const deadPort = dead.address().port;
+await new Promise((r) => dead.close(r));
+await probe('proxy-down', () => fetch(plain + '/r3', { dispatcher: new ProxyAgent(`http://127.0.0.1:${deadPort}`) }));
+
+// Construction.
+ctor('no-args', () => new ProxyAgent());
+ctor('no-uri', () => new ProxyAgent({}));
+ctor('auth+token', () => new ProxyAgent({ uri: proxy, auth: 'a', token: 'b' }));
+ctor('clientFactory', () => new ProxyAgent({ uri: proxy, clientFactory: 1 }));
+ctor('ok', () => new ProxyAgent({ uri: proxy }));
+
+// EnvHttpProxyAgent: the proxy per scheme from its options, else the
+// environment; no_proxy names go direct.
+const direct = `http://127.0.0.1:${O.address().port}`;
+await probe('env-opts-http', () => fetch(plain + '/e1', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy }) }));
+await probe('env-opts-https-falls-back', () => fetch(secure + '/e2', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy, requestTls: { ca } }) }));
+await probe('env-opts-https', () => fetch(secure + '/e3', { dispatcher: new EnvHttpProxyAgent({ httpsProxy: tlsProxy, proxyTls: { ca }, requestTls: { ca } }) }));
+await probe('env-opts-https-only', () => fetch(direct + '/e4', { dispatcher: new EnvHttpProxyAgent({ httpsProxy: tlsProxy, proxyTls: { ca } }) }));
+await probe('env-none', () => fetch(direct + '/e5', { dispatcher: new EnvHttpProxyAgent() }));
+await probe('env-no-proxy-exact', () => fetch(direct + '/e6', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy, noProxy: 'other.test, 127.0.0.1' }) }));
+await probe('env-no-proxy-port-miss', () => fetch(direct + '/e7', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy, noProxy: '127.0.0.1:1' }) }));
+await probe('env-no-proxy-suffix', () => fetch(plain + '/e8', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy, noProxy: '.test' }) }));
+await probe('env-no-proxy-star', () => fetch(direct + '/e9', { dispatcher: new EnvHttpProxyAgent({ httpProxy: proxy, noProxy: '*' }) }));
+process.env.http_proxy = proxy;
+const fromEnv = new EnvHttpProxyAgent();
+await probe('env-var', () => fetch(plain + '/e10', { dispatcher: fromEnv }));
+process.env.no_proxy = 'a.test';
+await probe('env-var-no-proxy-live', () => fetch(plain + '/e11', { dispatcher: fromEnv }));
+await probe('env-request', () => undici.request(direct + '/e12', { dispatcher: fromEnv }));
+delete process.env.http_proxy;
+delete process.env.no_proxy;
+
+O.close(); S.close(); P.close(); TP.close();
+"##
+            .replace("__CERT__", TLS_TEST_LEAF_CERT)
+            .replace("__KEY__", TLS_TEST_LEAF_KEY)
+            .replace("__CA__", TLS_TEST_CA_CERT),
+    );
+    // The script names its proxies itself; the environment's must not apply.
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"fetch-string 200 plain /1 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/1 host=a.test:P pa=-"]
+fetch-url 200 plain /2 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/2 host=a.test:P pa=-"]
+fetch-uri 200 plain /3 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/3 host=a.test:P pa=-"]
+undici-request 200 plain /4 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/4 host=a.test:P pa=-"]
+agent-request 200 plain /5 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/5 host=a.test:P pa=-"]
+global-fetch 200 plain /6 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/6 host=a.test:P pa=-"]
+undici-fetch 200 plain /7 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/7 host=a.test:P pa=-"]
+global-request 200 plain /8 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/8 host=a.test:P pa=-"]
+redirect 200 plain /landed ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close","CONNECT b.test:P HTTP/1.1 | host: b.test:P | connection: close"] ["O/hop host=a.test:P pa=-","O/landed host=b.test:P pa=-"]
+https-origin 200 secure /s1 ["CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] ["S/s1"]
+https-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate ["CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] []
+tls-proxy 200 plain /t1 ["tls:CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/t1 host=a.test:P pa=-"]
+tls-proxy-https 200 secure /t2 ["tls:CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] ["S/t2"]
+tls-proxy-untrusted failed Error UNABLE_TO_VERIFY_LEAF_SIGNATURE unable to verify the first certificate [] []
+auth-userinfo 200 plain /a1 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | proxy-authorization: Basic dXNAZXI6cDpzcw=="] ["O/a1 host=a.test:P pa=-"]
+auth-token 200 plain /a2 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | proxy-authorization: Bearer tok"] ["O/a2 host=a.test:P pa=-"]
+auth-auth 200 plain /a3 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | proxy-authorization: Basic dTpw"] ["O/a3 host=a.test:P pa=-"]
+headers 200 plain /a4 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close | x-proxy-note: n"] ["O/a4 host=a.test:P pa=-"]
+request-proxy-auth failed InvalidArgumentError UND_ERR_INVALID_ARG Proxy-Authorization should be sent in ProxyAgent constructor [] []
+fetch-proxy-auth failed InvalidArgumentError UND_ERR_INVALID_ARG Proxy-Authorization should be sent in ProxyAgent constructor [] []
+refused failed AbortError UND_ERR_ABORTED Proxy response (403) !== 200 when HTTP Tunneling ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] []
+refused-request failed AbortError UND_ERR_ABORTED Proxy response (403) !== 200 when HTTP Tunneling ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] []
+auth-required failed AbortError UND_ERR_ABORTED Proxy response (407) !== 200 when HTTP Tunneling ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] []
+proxy-down failed Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:P [] []
+no-args InvalidArgumentError UND_ERR_INVALID_ARG Proxy uri is mandatory
+no-uri InvalidArgumentError UND_ERR_INVALID_ARG Proxy uri is mandatory
+auth+token InvalidArgumentError UND_ERR_INVALID_ARG opts.auth cannot be used in combination with opts.token
+clientFactory InvalidArgumentError UND_ERR_INVALID_ARG Proxy opts.clientFactory must be a function.
+ok constructed true
+env-opts-http 200 plain /e1 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/e1 host=a.test:P pa=-"]
+env-opts-https-falls-back 200 secure /e2 ["CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] ["S/e2"]
+env-opts-https 200 secure /e3 ["tls:CONNECT localhost:P HTTP/1.1 | host: localhost:P | connection: close"] ["S/e3"]
+env-opts-https-only 200 plain /e4 [] ["O/e4 host=127.0.0.1:P pa=-"]
+env-none 200 plain /e5 [] ["O/e5 host=127.0.0.1:P pa=-"]
+env-no-proxy-exact 200 plain /e6 [] ["O/e6 host=127.0.0.1:P pa=-"]
+env-no-proxy-port-miss 200 plain /e7 ["CONNECT 127.0.0.1:P HTTP/1.1 | host: 127.0.0.1:P | connection: close"] ["O/e7 host=127.0.0.1:P pa=-"]
+env-no-proxy-suffix failed Error ENOTFOUND getaddrinfo ENOTFOUND a.test [] []
+env-no-proxy-star 200 plain /e9 [] ["O/e9 host=127.0.0.1:P pa=-"]
+env-var 200 plain /e10 ["CONNECT a.test:P HTTP/1.1 | host: a.test:P | connection: close"] ["O/e10 host=a.test:P pa=-"]
+env-var-no-proxy-live failed Error ENOTFOUND getaddrinfo ENOTFOUND a.test [] []
+env-request 200 plain /e12 ["CONNECT 127.0.0.1:P HTTP/1.1 | host: 127.0.0.1:P | connection: close"] ["O/e12 host=127.0.0.1:P pa=-"]"##;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+    // undici's one-time notice, as node prints it.
+    assert!(
+        stderr.contains("[UNDICI-EHPA] Warning: EnvHttpProxyAgent is experimental"),
+        "{stderr}"
+    );
+}
+
+/// The undici names that work through `dispatch()` -- which oam does not run
+/// -- are exported and refuse when used, as the Mock* classes do (#208): a
+/// name missing from an ES module stops the whole program at import with a
+/// SyntaxError, whether or not the importer ever uses it, so
+/// `@actions/http-client` 4 and `@upstash/context7-mcp` (both `import {
+/// ProxyAgent } from 'undici'`) never started. The sorted export list is
+/// pinned so that a dropped name fails here rather than at a user's import;
+/// what a ProxyAgent cannot do on oam (`proxyTunnel: false`, a
+/// `clientFactory` or `factory`) is refused at construction.
+#[test]
+fn undici_exports_link_and_refuse_what_oam_cannot_run() {
+    let script = write_temp(
+        "undici_exports/main.mjs",
+        r##"// Named imports: each of these is a link-time SyntaxError if the shim does
+// not export it, before a line of the program runs.
+import {
+  ProxyAgent, EnvHttpProxyAgent, RetryAgent, RetryHandler, RedirectHandler, DecoratorHandler,
+  createRedirectInterceptor, connect, upgrade, pipeline, mockErrors, CloseEvent, errors,
+} from 'undici';
+import * as undici from 'undici';
+
+console.log(Object.keys(undici).sort().join(' '));
+const shape = (e) => `${e.name} ${e.code} ${e.message.split(' is not supported')[0]}`;
+const refused = (name, run) => {
+  try { run(); console.log(name, 'ran'); } catch (e) { console.log(name, shape(e)); }
+};
+refused('RetryAgent', () => new RetryAgent(new undici.Agent()));
+refused('RetryHandler', () => new RetryHandler({}, {}));
+refused('RedirectHandler', () => new RedirectHandler());
+refused('DecoratorHandler', () => new DecoratorHandler({}));
+refused('createRedirectInterceptor', () => createRedirectInterceptor({ maxRedirections: 1 }));
+refused('pipeline', () => pipeline('http://127.0.0.1:1/', {}, () => {}));
+await connect({ origin: 'http://127.0.0.1:1', path: '/' }).then(() => console.log('connect ran'), (e) => console.log('connect', shape(e)));
+await upgrade({ origin: 'http://127.0.0.1:1', path: '/' }).then(() => console.log('upgrade ran'), (e) => console.log('upgrade', shape(e)));
+await new Promise((r) => connect({ origin: 'http://127.0.0.1:1', path: '/' }, (e, data) => { console.log('connect-callback', shape(e), data); r(); }));
+// What a ProxyAgent cannot do here is refused when it is built, after
+// undici's own argument checks.
+refused('proxyTunnel-false', () => new ProxyAgent({ uri: 'http://127.0.0.1:1', proxyTunnel: false }));
+refused('clientFactory', () => new ProxyAgent({ uri: 'http://127.0.0.1:1', clientFactory: () => {} }));
+refused('factory', () => new ProxyAgent({ uri: 'http://127.0.0.1:1', factory: () => {} }));
+const e = new mockErrors.MockNotMatchedError();
+console.log('mockErrors', e.name, e.code, e instanceof errors.UndiciError);
+console.log('CloseEvent', CloseEvent === globalThis.CloseEvent, typeof EnvHttpProxyAgent);
+const aborted = new errors.RequestAbortedError();
+console.log('RequestAbortedError', aborted.name, aborted.code, aborted.message);
+console.log('RequestAbortedError is', aborted instanceof errors.AbortError, aborted instanceof errors.UndiciError, aborted instanceof Error);
+const abort = new errors.AbortError();
+console.log('AbortError', abort.name, abort.code, abort.message, abort instanceof errors.UndiciError, abort instanceof errors.RequestAbortedError);
+const prx = new errors.SecureProxyConnectionError(new Error('why'));
+console.log('SecureProxyConnectionError', prx.name, prx.code, prx.message, prx.cause.message);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = r##"Agent BalancedPool Blob Client CloseEvent DecoratorHandler Dispatcher EnvHttpProxyAgent File FormData Headers MessageEvent MockAgent MockClient MockPool Pool ProxyAgent RedirectHandler Request Response RetryAgent RetryHandler WebSocket buildConnector connect createRedirectInterceptor default errors fetch getGlobalDispatcher getGlobalOrigin interceptors mockErrors pipeline request setGlobalDispatcher setGlobalOrigin stream upgrade
+RetryAgent NotSupportedError UND_ERR_NOT_SUPPORTED undici's RetryAgent
+RetryHandler NotSupportedError UND_ERR_NOT_SUPPORTED undici's RetryHandler
+RedirectHandler NotSupportedError UND_ERR_NOT_SUPPORTED undici's RedirectHandler
+DecoratorHandler NotSupportedError UND_ERR_NOT_SUPPORTED undici's DecoratorHandler
+createRedirectInterceptor NotSupportedError UND_ERR_NOT_SUPPORTED undici's createRedirectInterceptor()
+pipeline NotSupportedError UND_ERR_NOT_SUPPORTED undici's pipeline()
+connect NotSupportedError UND_ERR_NOT_SUPPORTED undici's connect()
+upgrade NotSupportedError UND_ERR_NOT_SUPPORTED undici's upgrade()
+connect-callback NotSupportedError UND_ERR_NOT_SUPPORTED undici's connect() null
+proxyTunnel-false NotSupportedError UND_ERR_NOT_SUPPORTED undici's ProxyAgent with proxyTunnel: false
+clientFactory NotSupportedError UND_ERR_NOT_SUPPORTED A ProxyAgent with a clientFactory or factory
+factory NotSupportedError UND_ERR_NOT_SUPPORTED A ProxyAgent with a clientFactory or factory
+mockErrors MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED true
+CloseEvent true function
+RequestAbortedError AbortError UND_ERR_ABORTED Request aborted
+RequestAbortedError is true true true
+AbortError AbortError UND_ERR_ABORT The operation was aborted true false
+SecureProxyConnectionError SecureProxyConnectionError UND_ERR_PRX_TLS Secure Proxy Connection failed why"##;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 /// A dispatcher oam cannot run as undici would -- its dispatch() overridden by
 /// a subclass or a patched instance, dispatch interceptors, or an object that
 /// is not one of the shim's dispatchers -- fails the request with
@@ -5487,6 +7830,56 @@ server.close();
          exported function function function\n\
          names itself true\n\
          still serves 200 [\"/live\"]";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// `import 'undici'`'s error classes are undici's, and fetch's causes are
+/// instances of them: `err.cause instanceof errors.SocketError` holds for a
+/// connection the server closed, as on node with the npm package (retry
+/// logic is written that way). undici's `instanceof` reads global-symbol
+/// brands (`Symbol.for('undici.error.<code>')`), so an object branded by
+/// another copy of undici passes too. Up to 0.17.1 the shim's classes had
+/// no brands -- both checks were false -- and AbortError's code was
+/// RequestAbortedError's. Expected lines measured on node v22.22.2 with
+/// undici 6.29.0 installed.
+#[test]
+fn undici_errors_are_undicis_classes_with_its_brands() {
+    let script = write_temp(
+        "undici_error_brands/main.mjs",
+        r##"import net from 'node:net';
+import { errors } from 'undici';
+
+const server = net.createServer((c) => { c.on('error', () => {}); c.once('data', () => c.end()); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+try {
+  await fetch(`http://127.0.0.1:${server.address().port}/`);
+} catch (e) {
+  console.log('cause', e.cause.code, e.cause instanceof errors.SocketError, e.cause instanceof errors.UndiciError);
+}
+server.close();
+const foreign = { [Symbol.for('undici.error.UND_ERR')]: true, [Symbol.for('undici.error.UND_ERR_SOCKET')]: true };
+console.log('foreign', foreign instanceof errors.SocketError, foreign instanceof errors.UndiciError);
+console.log('plain', new Error('x') instanceof errors.UndiciError, null instanceof errors.UndiciError);
+for (const name of ['AbortError', 'RequestAbortedError', 'BalancedPoolMissingUpstreamError', 'HTTPParserError']) {
+  const C = errors[name];
+  const e = new C();
+  console.log(name, C.name, e.name, e.code, JSON.stringify(e.message), e instanceof errors.UndiciError,
+    e instanceof errors.AbortError, JSON.stringify(Object.getOwnPropertyNames(e).filter((k) => k !== 'stack')));
+}
+const r = new errors.ResponseStatusCodeError('m', 418, { a: '1' }, 'b');
+console.log('status', r.status, r.statusCode, r.body, JSON.stringify(r.headers));
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "cause UND_ERR_SOCKET true true\n\
+         foreign true true\n\
+         plain false false\n\
+         AbortError AbortError AbortError UND_ERR_ABORT \"The operation was aborted\" true true [\"name\",\"code\",\"message\"]\n\
+         RequestAbortedError RequestAbortedError AbortError UND_ERR_ABORTED \"Request aborted\" true true [\"name\",\"code\",\"message\"]\n\
+         BalancedPoolMissingUpstreamError BalancedPoolMissingUpstreamError MissingUpstreamError UND_ERR_BPL_MISSING_UPSTREAM \"No upstream has been added to the BalancedPool\" true false [\"name\",\"code\",\"message\"]\n\
+         HTTPParserError HTTPParserError HTTPParserError undefined \"\" false false [\"name\",\"code\",\"data\"]\n\
+         status 418 418 b {\"a\":\"1\"}";
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
@@ -6787,6 +9180,78 @@ watch.unref();
     assert_eq!(out, "connections=1 reused=false,true,true");
 }
 
+/// The same hand-back for requests with bodies, many in a row: how many bytes
+/// a request is, which the gate above compares against what the socket has
+/// taken, is read off the exchange when the response ends -- not delivered by
+/// an op of its own, whose completion could arrive after the response's
+/// (#190). Buffered and streamed bodies, each acknowledged a turn late, on one
+/// connection throughout; node v22.22.2 prints the line asserted here. The
+/// lost race itself cannot be staged from a script: what pins the count being
+/// there in time is `progress_is_complete_by_the_time_the_response_head_arrives`
+/// (oam_core's http_client_bridge tests); this holds the path end to end.
+#[test]
+fn a_late_write_acknowledgement_pools_the_socket_for_requests_with_bodies() {
+    let src = r#"
+import http from 'node:http';
+import net from 'node:net';
+const server = http.createServer((req, res) => {
+  let n = 0;
+  req.on('data', (d) => { n += d.length; });
+  req.on('end', () => res.end(String(n)));
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+let connections = 0;
+server.on('connection', () => { connections++; });
+class LateAck extends net.Socket {
+  write(chunk, encoding, cb) {
+    if (typeof encoding === 'function') { cb = encoding; encoding = undefined; }
+    return super.write(chunk, encoding, (err) => {
+      if (cb) setTimeout(() => cb(err), 20);
+    });
+  }
+}
+class OwnAgent extends http.Agent {
+  createConnection(options, cb) {
+    const s = new LateAck();
+    s.connect(options, cb);
+    return s;
+  }
+}
+const agent = new OwnAgent({ keepAlive: true });
+let reused = 0;
+const sizes = [];
+for (let i = 0; i < 24; i++) {
+  await new Promise((resolve, reject) => {
+    const req = http.request({ host: '127.0.0.1', port, agent, method: 'POST' }, (res) => {
+      let body = '';
+      res.on('data', (d) => { body += d; });
+      res.on('end', () => { sizes.push(body); resolve(); });
+    });
+    req.on('response', () => { if (req.reusedSocket) reused++; });
+    req.on('error', reject);
+    if (i % 2 === 0) {
+      req.end('x'.repeat(i + 1));
+    } else {
+      // Streamed: the second chunk goes out a turn after the first.
+      req.write('ab');
+      setImmediate(() => req.end('c'.repeat(i)));
+    }
+  });
+}
+console.log(`connections=${connections} reused=${reused} sizes=${sizes.slice(0, 4)}`);
+agent.destroy();
+server.close();
+const watch = setTimeout(() => {
+  console.log('the run did not end on its own');
+  process.exit(3);
+}, 10000);
+watch.unref();
+"#;
+    let out = run_ok("late_write_ack_pool_bodies.mjs", src);
+    assert_eq!(out, "connections=1 reused=23 sizes=1,3,3,5");
+}
+
 /// An http.get on oam's own transport is sent without waiting on a timer,
 /// and setImmediate is due at once. Each used to cost a whole OS timer tick
 /// (about 15 ms on Windows, 1 ms elsewhere): setImmediate was a 1 ms timer,
@@ -7082,7 +9547,8 @@ console.log(await upgrade('refused', http, { host: 'ws.test', port: plain.addres
 await new Promise((r) => setTimeout(r, 50));
 console.log('connections after refusal', connections - before);
 // The upgrade head is written by hand: a header value carrying CR / LF is
-// refused, never sent.
+// refused -- by http.request itself, synchronously, as node refuses it (#174) --
+// and never sent.
 console.log(await upgrade('crlf', http, { host: '127.0.0.1', port: plain.address().port }, { 'X-Bad': 'a\r\nX-Injected: 1' }));
 await new Promise((r) => setTimeout(r, 50));
 console.log('injected header reached the server', injected);
@@ -7099,7 +9565,7 @@ secure.close();
          plain request 101 echo=ping tls=false rest=0\n\
          refused error EREFUSED_BY_HOOK\n\
          connections after refusal 0\n\
-         crlf error ERR_INVALID_CHAR\n\
+         crlf threw ERR_INVALID_CHAR\n\
          injected header reached the server false"
     );
 }
@@ -7797,6 +10263,173 @@ srv.close();
     );
 }
 
+/// The cause of a refused fetch is an instance of the undici error class the
+/// `undici` module exports, with its `code` (#177): node's fetch is undici, so
+/// `e.cause instanceof undici.errors.InvalidArgumentError` and
+/// `e.cause.code === 'UND_ERR_INVALID_ARG'` are how code tells these failures
+/// apart. oam's cause was a plain `Error` with the name set. `undici.request`
+/// rejects with the undici error itself, not wrapped. Every line below is
+/// what node v22.22.2 prints with the npm undici 6.24.1 next to the script.
+#[test]
+fn a_fetch_refusal_cause_is_an_undici_error_class() {
+    let script = write_temp(
+        "undici_error_classes/main.mjs",
+        r#"import http from 'node:http';
+import * as undici from 'undici';
+const E = undici.errors;
+const srv = http.createServer((req, res) => { req.resume(); req.on('end', () => res.end('ok')); });
+await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const U = `http://127.0.0.1:${srv.address().port}/p`;
+const show = (label, wrapped, c) => console.log(
+  label, wrapped, c.constructor.name, c.code,
+  c instanceof E[c.constructor.name], c instanceof E.UndiciError, c instanceof E.InvalidArgumentError,
+  JSON.stringify(Reflect.ownKeys(c).map(String)));
+for (const [label, init] of [
+  ['transfer-encoding', { method: 'POST', body: 'abc', headers: { 'transfer-encoding': 'chunked' } }],
+  ['expect', { method: 'POST', body: 'abc', headers: { expect: '100-continue' } }],
+  ['content-length', { method: 'POST', body: 'abc', headers: { 'content-length': '10' } }],
+]) {
+  try { await fetch(U, init); console.log(label, 'resolved'); }
+  catch (e) { show(label, `fetch:${e.message}`, e.cause); }
+  try { await undici.request(U, init); console.log(label, 'resolved'); }
+  catch (e) { show(label, 'request', e); }
+}
+srv.close();
+// The brand, not the prototype chain, is what instanceof asks: an object
+// carrying another undici copy's brand is an instance, and a subclass
+// inherits the check.
+const foreign = { [Symbol.for('undici.error.UND_ERR_INVALID_ARG')]: true };
+console.log('foreign', foreign instanceof E.InvalidArgumentError, foreign instanceof E.UndiciError, null instanceof E.UndiciError);
+class Sub extends E.InvalidArgumentError {}
+console.log('sub', new Sub('x') instanceof E.InvalidArgumentError, new E.InvalidArgumentError('x') instanceof Sub, new Sub('x').name);
+const aborted = new E.RequestAbortedError();
+console.log('aborted', aborted.name, aborted.code, aborted.message, aborted instanceof E.AbortError, new E.AbortError().code);
+console.log('exports', Object.keys(E).length, new E.BalancedPoolMissingUpstreamError().name, new E.SocketError('s', 7).socket);
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let marks = |code: &str, message_last: bool| {
+        let names = if message_last {
+            r#""stack","name","code","message""#
+        } else {
+            r#""stack","message","name","code""#
+        };
+        format!(r#"[{names},"Symbol(undici.error.UND_ERR)","Symbol(undici.error.{code})"]"#)
+    };
+    let inv = marks("UND_ERR_INVALID_ARG", false);
+    let unsupported = marks("UND_ERR_NOT_SUPPORTED", false);
+    let mismatch = marks("UND_ERR_REQ_CONTENT_LENGTH_MISMATCH", true);
+    let expected = format!(
+        "transfer-encoding fetch:fetch failed InvalidArgumentError UND_ERR_INVALID_ARG true true true {inv}\n\
+         transfer-encoding request InvalidArgumentError UND_ERR_INVALID_ARG true true true {inv}\n\
+         expect fetch:fetch failed NotSupportedError UND_ERR_NOT_SUPPORTED true true false {unsupported}\n\
+         expect request NotSupportedError UND_ERR_NOT_SUPPORTED true true false {unsupported}\n\
+         content-length fetch:fetch failed RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH true true false {mismatch}\n\
+         content-length request RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH true true false {mismatch}\n\
+         foreign true false false\n\
+         sub true true InvalidArgumentError\n\
+         aborted AbortError UND_ERR_ABORTED Request aborted true UND_ERR_ABORT\n\
+         exports 24 MissingUpstreamError 7\n"
+    );
+    assert_eq!(stdout.replace("\r\n", "\n"), expected);
+}
+
+/// A dispatcher's connect timeout is the one a fetch's connections get (#157):
+/// undici gives a connection `connect.timeout` / `connectTimeout` ms (10 s by
+/// default; `connect.timeout` wins) to be connected and, for https,
+/// handshaken, then fails the request with its `ConnectTimeoutError`. oam had
+/// no connect timeout at all and waited for the operating system. The server
+/// accepts and never answers the ClientHello. `undici.request` rejects with
+/// the error itself, and 0 turns the timeout off -- for an Agent's factory
+/// too, whose dispatcher's timeout used to be ignored for undici's 10 s
+/// default. Every line below is what
+/// node v22.22.2 prints with the npm undici 6.24.1 next to the script; the
+/// default 10 s is conformance case 211.
+#[test]
+fn a_dispatchers_connect_timeout_fails_a_fetch_as_undicis() {
+    let script = write_temp(
+        "undici_connect_timeout/main.mjs",
+        r#"import net from 'node:net';
+import * as undici from 'undici';
+const { Agent, Client, Pool } = undici;
+const sockets = new Set();
+const srv = net.createServer((s) => { sockets.add(s); s.on('error', () => {}); });
+await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const port = srv.address().port;
+const U = `https://127.0.0.1:${port}/`;
+const P = (s) => String(s).replaceAll(String(port), 'PORT');
+const show = (label, wrapped, c) => console.log(
+  label, wrapped, c?.constructor?.name, c?.name, c?.code, JSON.stringify(P(c?.message)),
+  c instanceof undici.errors.ConnectTimeoutError, c instanceof undici.errors.UndiciError,
+  JSON.stringify(Reflect.ownKeys(c ?? {}).map(String)));
+for (const [label, options] of [
+  ['connect.timeout', { connect: { timeout: 300 } }],
+  ['connectTimeout', { connectTimeout: 300 }],
+  ['both', { connectTimeout: 60000, connect: { timeout: 300 } }],
+]) {
+  try { await fetch(U, { dispatcher: new Agent(options) }); console.log(label, 'resolved'); }
+  catch (e) { show(label, `fetch:${e.name}:${e.message}`, e.cause); }
+}
+try { await undici.request(U, { dispatcher: new Agent({ connectTimeout: 300 }) }); console.log('request resolved'); }
+catch (e) { show('undici.request', 'request', e); }
+try { await new Pool(U, { connectTimeout: 300 }).request({ path: '/', method: 'GET' }); console.log('pool resolved'); }
+catch (e) { show('pool.request', 'request', e); }
+// An Agent's factory builds each origin's dispatcher from the agent's
+// options: that dispatcher's timeout is the one its connections get.
+const factory = (origin, opts) => new Pool(origin, opts);
+for (const [label, options] of [
+  ['factory connectTimeout', { factory, connectTimeout: 300 }],
+  ['factory connect.timeout', { factory, connect: { timeout: 300 } }],
+]) {
+  try { await fetch(U, { dispatcher: new Agent(options) }); console.log(label, 'resolved'); }
+  catch (e) { show(label, `fetch:${e.name}:${e.message}`, e.cause); }
+}
+{
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 1200);
+  try { await fetch(U, { dispatcher: new Agent({ factory, connectTimeout: 0 }), signal: ac.signal }); console.log('factory zero resolved'); }
+  catch (e) { console.log('factory timeout 0', e.name, e.cause === undefined); }
+}
+{
+  // 0 is no timeout: only the abort ends it.
+  const ac = new AbortController();
+  setTimeout(() => ac.abort(), 1200);
+  try { await fetch(U, { dispatcher: new Agent({ connect: { timeout: 0 } }), signal: ac.signal }); console.log('zero resolved'); }
+  catch (e) { console.log('timeout 0', e.name, e.cause === undefined); }
+}
+for (const bad of [-1, 'x', NaN]) {
+  let agent = 'ok', client = 'ok', pool = 'ok';
+  try { new Agent({ connectTimeout: bad }); } catch (e) { agent = `${e.name} ${e.message}`; }
+  try { new Client(U, { connectTimeout: bad }); } catch (e) { client = `${e.name} ${e.code} ${e.message}`; }
+  try { new Pool(U, { connectTimeout: bad }); } catch (e) { pool = `${e.name} ${e.message}`; }
+  console.log('connectTimeout', String(bad), '| Agent', agent, '| Client', client, '| Pool', pool);
+}
+for (const s of sockets) s.destroy();
+srv.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let cause = r#"ConnectTimeoutError ConnectTimeoutError UND_ERR_CONNECT_TIMEOUT "Connect Timeout Error (attempted address: 127.0.0.1:PORT, timeout: 300ms)" true true ["stack","message","name","code","Symbol(undici.error.UND_ERR)","Symbol(undici.error.UND_ERR_CONNECT_TIMEOUT)"]"#;
+    let invalid = "InvalidArgumentError UND_ERR_INVALID_ARG invalid connectTimeout";
+    let expected = format!(
+        "connect.timeout fetch:TypeError:fetch failed {cause}\n\
+         connectTimeout fetch:TypeError:fetch failed {cause}\n\
+         both fetch:TypeError:fetch failed {cause}\n\
+         undici.request request {cause}\n\
+         pool.request request {cause}\n\
+         factory connectTimeout fetch:TypeError:fetch failed {cause}\n\
+         factory connect.timeout fetch:TypeError:fetch failed {cause}\n\
+         factory timeout 0 AbortError true\n\
+         timeout 0 AbortError true\n\
+         connectTimeout -1 | Agent ok | Client {invalid} | Pool ok\n\
+         connectTimeout x | Agent ok | Client {invalid} | Pool ok\n\
+         connectTimeout NaN | Agent ok | Client {invalid} | Pool ok\n"
+    );
+    assert_eq!(stdout.replace("\r\n", "\n"), expected);
+}
+
 /// An abort after the response head ends the BODY too, where oam used to keep
 /// reading and hand over the whole thing with a clean end -- so a guard that
 /// aborted on a size limit downloaded everything anyway. node errors the body
@@ -7933,6 +10566,105 @@ process.exit(0);
          text after abort: DOMException AbortError The operation was aborted.\n\
          abort before the head: the server saw the client leave\n\
          abort listeners after 5 finished fetches: 5"
+    );
+}
+
+/// An abort BEFORE the response head takes the request off the wire (#158):
+/// the server sees the client leave without having answered. oam used to
+/// reject the promise and leave the request running until the server
+/// answered it. Conformance case 212 compares the plain shapes with node;
+/// this covers the ones around them -- an abort in the tick of the call (one
+/// that lands before the op has run at all), an abort while a streamed
+/// request body is still going out, and `http.request` torn down by
+/// `destroy()` mid-upload and by `abort()`. Every line below is node
+/// v22.22.2's own output for this script.
+#[test]
+fn an_abort_before_the_head_takes_the_request_off_the_wire() {
+    let script = write_temp(
+        "abort_before_head/main.mjs",
+        r#"import http from 'node:http';
+import { getEventListeners } from 'node:events';
+const arrived = new Map();
+const left = new Map();
+const answered = new Set();
+const server = http.createServer((req, res) => {
+  const path = req.url;
+  if (path === '/warm') { res.end('ok'); return; }
+  const fallback = setTimeout(() => { answered.add(path); res.end('late'); }, 3000);
+  res.on('close', () => { clearTimeout(fallback); left.get(path)?.(res.writableFinished); });
+  req.on('data', () => {});
+  arrived.get(path)?.();
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+const watch = (path) => ({
+  arrived: new Promise((r) => arrived.set(path, r)),
+  left: new Promise((r) => left.set(path, r)),
+});
+await (await fetch(`${base}/warm`)).text();
+{
+  // Aborted in the tick it was called in: the request is cancelled before
+  // or after it reaches the server, and is never answered either way.
+  const ac = new AbortController();
+  const pending = fetch(`${base}/same-tick`, { signal: ac.signal });
+  ac.abort(new Error('mine'));
+  try { await pending; console.log('same tick: RESOLVED'); }
+  catch (e) { console.log('same tick:', e.message, getEventListeners(ac.signal, 'abort').length); }
+  await new Promise((r) => setTimeout(r, 300));
+  console.log('same tick answered:', answered.has('/same-tick'));
+}
+{
+  // Aborted while the request body is still being sent.
+  const seen = watch('/upload');
+  const ac = new AbortController();
+  let pull;
+  const body = new ReadableStream({ pull(c) { if (!pull) { pull = true; c.enqueue(new Uint8Array(1000)); } else return new Promise(() => {}); } });
+  const pending = fetch(`${base}/upload`, { method: 'POST', body, duplex: 'half', signal: ac.signal });
+  await seen.arrived;
+  ac.abort();
+  try { await pending; console.log('upload: RESOLVED'); }
+  catch (e) { console.log('upload:', e.name); }
+  console.log('upload: server saw the client leave, finished', await seen.left);
+}
+{
+  // http.request with a body it never ends, destroyed before a response.
+  const seen = watch('/request-upload');
+  const req = http.request(`${base}/request-upload`, { method: 'POST' }, () => console.log('RESPONSE'));
+  const failed = new Promise((r) => req.on('error', (e) => r(`${e.code} ${e.message}`)));
+  req.write('partial');
+  await seen.arrived;
+  req.destroy();
+  console.log('http.request:', await failed);
+  console.log('http.request: server saw the client leave, finished', await seen.left);
+}
+{
+  // req.abort() is the same teardown.
+  const seen = watch('/request-abort');
+  const req = http.request(`${base}/request-abort`, () => console.log('RESPONSE'));
+  const failed = new Promise((r) => req.on('error', (e) => r(`${e.code} ${e.message}`)));
+  req.end();
+  await seen.arrived;
+  req.abort();
+  console.log('req.abort():', await failed);
+  console.log('req.abort(): server saw the client leave, finished', await seen.left);
+}
+console.log('answered:', [...answered].join(',') || 'none');
+process.exit(0);
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "same tick: mine 0\n\
+         same tick answered: false\n\
+         upload: AbortError\n\
+         upload: server saw the client leave, finished false\n\
+         http.request: ECONNRESET socket hang up\n\
+         http.request: server saw the client leave, finished false\n\
+         req.abort(): ECONNRESET socket hang up\n\
+         req.abort(): server saw the client leave, finished false\n\
+         answered: none"
     );
 }
 
@@ -8100,6 +10832,52 @@ server.close();
             "a private CA must be refused without NODE_EXTRA_CA_CERTS: {stdout}"
         );
     }
+}
+
+/// fetch's default request headers over https (#178): undici's
+/// `accept-encoding` there is `br, gzip, deflate` (oam decodes br since
+/// #151), and the rest of its defaults go out as over http. Against an
+/// HTTP/1.1 server, and against an h2 server, which oam's fetch negotiates
+/// (node's does not): there the `connection` default must not break the
+/// request -- HTTP/2 has no such header, and the transport drops it.
+#[test]
+fn fetch_https_sends_undici_default_headers() {
+    let bundle = write_temp("fetch-https-defaults/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import https from 'node:https';
+import http2 from 'node:http2';
+const names = ['accept-encoding', 'accept-language', 'sec-fetch-mode', 'connection', 'content-length'];
+const echo = (req, res) => res.end(req.httpVersion + ' ' + names.map((n) => n + '=' + (req.headers[n] ?? '-')).join(' '));
+const h1 = https.createServer({ cert: `__CERT__`, key: `__KEY__` }, echo);
+const h2 = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__`, allowHTTP1: true }, echo);
+// fetch's pool keeps its h2 session open, and an http2 server's close()
+// waits for every session: end them, so the run can exit.
+const sessions = new Set();
+h2.on('session', (session) => sessions.add(session));
+for (const [label, server] of [['h1', h1], ['h2', h2]]) {
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const url = `https://localhost:${server.address().port}/`;
+  console.log(label, 'GET', await (await fetch(url)).text());
+  console.log(label, 'POST', await (await fetch(url, { method: 'POST' })).text());
+  server.close();
+}
+for (const session of sessions) session.destroy();
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("fetch_https_defaults/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "h1 GET 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=-\n\
+         h1 POST 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=0\n\
+         h2 GET 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=-\n\
+         h2 POST 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=0",
+        "stderr: {stderr}"
+    );
 }
 
 /// A server-sent-events body compressed with gzip and sync-flushed per event
@@ -9601,15 +12379,20 @@ fn check_rejects_an_impostor_tsgo_and_daemon_status_reports_why() {
     // reason and the spawn-failure timestamp instead of a bare
     // {"running":false}. The daemon records its reason from its own
     // process, when its tsgo probe fails; the client stops waiting for it
-    // after SPAWN_WAIT (5 s), marks the spawn failed and falls back. On a
-    // loaded machine the client can get there first, with the daemon still
-    // probing, so status is read until the reason is in (bounded).
+    // after SPAWN_WAIT (5 s), marks the spawn failed with a reason of its
+    // own and falls back. On a loaded machine the client can get there
+    // first, with the daemon still probing, so status is read until the
+    // daemon's own reason has replaced the client's (bounded).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let parsed: serde_json::Value = loop {
         let status = run(&["daemon", "status", proj.to_str().unwrap()]);
         let parsed: serde_json::Value =
             serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim()).unwrap();
-        if parsed["last_error"].is_string() || std::time::Instant::now() >= deadline {
+        if parsed["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("tsgo"))
+            || std::time::Instant::now() >= deadline
+        {
             break parsed;
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -9624,6 +12407,75 @@ fn check_rejects_an_impostor_tsgo_and_daemon_status_reports_why() {
     assert!(
         parsed["spawn_failed_ms_ago"].as_u64().is_some(),
         "status must carry the spawn-failure marker: {parsed}"
+    );
+}
+
+#[test]
+fn daemon_status_gives_a_reason_with_every_spawn_failure() {
+    // #209: the client marks a spawn failed after SPAWN_WAIT (5 s), but the
+    // reason used to come only from the daemon, once its tsgo probe failed.
+    // A probe slower than that left `oam daemon status` saying the spawn
+    // failed, with no last_error, for as long as the probe took. This
+    // impostor answers --version only after ~20 s, so the whole window is
+    // open while status is read.
+    let fake = write_fake_tsgo(
+        "sleepy-version-tsgo",
+        "@echo off\r\nping -n 21 127.0.0.1 >nul\r\necho not a compiler\r\nexit /b 0\r\n",
+        "#!/bin/sh\nsleep 20\necho 'not a compiler'\nexit 0\n",
+    );
+    // A DEDICATED cache dir: the spawn-failure marker lives there.
+    let cache = write_temp("sleepy-version-cache/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    write_temp(
+        "sleepyproj/tsconfig.json",
+        "{\"compilerOptions\": {\"strict\": true, \"noEmit\": true}}",
+    );
+    let proj = write_temp("sleepyproj/a.ts", "export const n: number = 1;")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let command = |args: &[&str]| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_oam"));
+        command
+            .args(args)
+            .env("OAM_CACHE_DIR", &cache)
+            .env("OAM_DAEMON_IDLE_MS", "45000")
+            .env("OAM_TSGO_TIMEOUT_MS", "60000")
+            .env("OAM_TSGO", &fake);
+        command
+    };
+
+    let mut check = command(&["check", proj.to_str().unwrap()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("oam check starts");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let parsed: serde_json::Value = loop {
+        let status = command(&["daemon", "status", proj.to_str().unwrap()])
+            .output()
+            .expect("oam daemon status runs");
+        let parsed: serde_json::Value =
+            serde_json::from_str(String::from_utf8_lossy(&status.stdout).trim()).unwrap();
+        if parsed["spawn_failed_ms_ago"].is_u64() || std::time::Instant::now() >= deadline {
+            break parsed;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let _ = check.kill();
+    let _ = check.wait();
+
+    assert!(
+        parsed["spawn_failed_ms_ago"].is_u64(),
+        "the client never marked the spawn failed: {parsed}"
+    );
+    assert!(
+        parsed["last_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("did not come up")),
+        "a spawn failure must carry a reason from the moment it is recorded: {parsed}"
     );
 }
 
@@ -9682,7 +12534,7 @@ fn fetch_body_cannot_be_consumed_twice() {
     );
     assert_eq!(
         String::from_utf8_lossy(&out.stdout).trim(),
-        "double: Body already consumed\nused: true"
+        "double: Body is unusable: Body has already been read\nused: true"
     );
 }
 
@@ -12619,9 +15471,16 @@ module.exports = function handler(req, res) {
         response1.contains("200 OK"),
         "response1 not 200: {response1}"
     );
-    let body1_start = response1.find('{').expect("JSON body in response1");
+    // The handler answers with writeHead() then end(json), which node -- and
+    // oam -- frame chunked: the JSON sits between the chunk-size line and
+    // the last chunk.
+    let json_in = |response: &str| {
+        let start = response.find('{').expect("JSON body in the response");
+        let end = response.rfind('}').expect("JSON body in the response");
+        response[start..=end].to_string()
+    };
     let body1: serde_json::Value =
-        serde_json::from_str(&response1[body1_start..]).expect("parse response1 JSON");
+        serde_json::from_str(&json_in(&response1)).expect("parse response1 JSON");
     assert_eq!(body1["method"], "GET");
     assert_eq!(body1["url"], "/hello");
     assert!(body1["worker"].as_u64().unwrap() > 0, "worker threadId > 0");
@@ -12631,9 +15490,8 @@ module.exports = function handler(req, res) {
         response2.contains("200 OK"),
         "response2 not 200: {response2}"
     );
-    let body2_start = response2.find('{').expect("JSON body in response2");
     let body2: serde_json::Value =
-        serde_json::from_str(&response2[body2_start..]).expect("parse response2 JSON");
+        serde_json::from_str(&json_in(&response2)).expect("parse response2 JSON");
     assert_eq!(body2["method"], "POST");
     assert_eq!(body2["url"], "/data");
     assert_eq!(body2["body"], r#"{"key":"value"}"#);
@@ -12863,6 +15721,31 @@ exec("echo hello-exec-cb", (err, stdout, stderr) => {
     assert!(stdout.contains("exec-err: null"), "{stdout}");
     assert!(stdout.contains("exec-stdout: hello-exec-cb"), "{stdout}");
     assert!(stdout.contains("exec-stderr-type: string"), "{stdout}");
+}
+
+/// #165: dns.ADDRCONFIG / V4MAPPED / ALL are the platform's AI_* values,
+/// and Android's bionic has the BSD ones (AI_ADDRCONFIG 0x400, AI_V4MAPPED
+/// 0x800, AI_ALL 0x100 -- the libc crate's android/mod.rs), not glibc's 32 /
+/// 8 / 16. oam gave Android glibc's, so node's 1024 was refused as a hint.
+/// The constants are read when node:dns loads, so the platform is set first.
+#[test]
+fn dns_hint_constants_on_android_are_bionic_values() {
+    let stdout = run_ok(
+        "dns_android_hints.cjs",
+        "Object.defineProperty(process, 'platform', { value: 'android' });\n\
+         const dns = require('node:dns');\n\
+         console.log(dns.ADDRCONFIG, dns.V4MAPPED, dns.ALL);\n\
+         try { dns.lookup('localhost', { hints: 1024 }, () => {}); console.log('hint 1024 accepted'); }\n\
+         catch (e) { console.log('hint 1024 refused', e.code); }",
+    );
+    assert!(
+        stdout.contains("1024 2048 256"),
+        "android's AI_ADDRCONFIG / AI_V4MAPPED / AI_ALL: {stdout}"
+    );
+    assert!(
+        stdout.contains("hint 1024 accepted"),
+        "node's dns.ADDRCONFIG on android is a valid hint: {stdout}"
+    );
 }
 
 #[test]
@@ -19467,6 +22350,149 @@ process.exit(0);
             );
         }
     }
+}
+
+/// An option-less https.get rides oam's shared transport, and its
+/// `req.socket` is a stand-in `tls.TLSSocket`. destroy() on it after the
+/// response closes the kept-alive TLS connection the response came on, as
+/// node's closes the socket's handle: the server sees the end and the close,
+/// the socket's 'close' says false, and the next request dials a new
+/// connection. Its resetAndDestroy() throws ERR_INVALID_HANDLE_TYPE, as on
+/// node's TLSSocket. Measured on node v22.22.2 (Windows), same lines. Up to
+/// 0.17.1 the connection stayed in the pool: the server saw nothing and the
+/// next request went out on it. The CA is trusted through
+/// NODE_EXTRA_CA_CERTS, the one way the shared transport trusts a private
+/// root, which is why this is not a conformance case.
+#[test]
+fn https_get_socket_destroy_closes_the_pooled_tls_connection() {
+    let src = format!(
+        r#"
+import tls from 'node:tls';
+import https from 'node:https';
+const cert = `{cert}`;
+const key = `{key}`;
+const conns = [];
+const server = tls.createServer({{ cert, key }}, (c) => {{
+  const rec = {{ events: [] }};
+  rec.closed = new Promise((r) => c.on('close', (h) => {{ rec.events.push('close ' + h); r(); }}));
+  c.on('end', () => rec.events.push('end'));
+  c.on('error', (e) => rec.events.push('error ' + e.code));
+  conns.push(rec);
+  c.on('data', () => c.write('HTTP/1.1 200 OK\r\ncontent-length: 1\r\n\r\nx'));
+}});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const get = () => new Promise((resolve, reject) => {{
+  const req = https.get({{ host: 'localhost', port }}, (res) => {{
+    res.resume();
+    res.on('end', () => setImmediate(() => resolve(req.socket)));
+  }});
+  req.on('error', reject);
+}});
+const socket = await get();
+console.log('encrypted=' + socket.encrypted);
+try {{ socket.resetAndDestroy(); console.log('reset=returned'); }} catch (e) {{ console.log('reset=' + e.code); }}
+const closed = new Promise((r) => socket.on('close', (h) => r('close ' + h)));
+socket.destroy();
+const timeout = (ms) => new Promise((r) => setTimeout(() => r('TIMEOUT'), ms));
+console.log('socket=' + await Promise.race([closed, timeout(3000)]));
+console.log('server=' + await Promise.race([conns[0].closed.then(() => conns[0].events.join('+')), timeout(3000)]));
+await get();
+console.log('connections=' + conns.length);
+https.globalAgent.destroy();
+server.close();
+setTimeout(() => process.exit(0), 50);
+"#,
+        cert = FETCH_TEST_LEAF,
+        key = FETCH_TEST_LEAF_KEY,
+    );
+    let file = write_temp("https_stand_in_destroy.mjs", &src);
+    let ca = write_temp("https_stand_in_destroy_ca.pem", FETCH_TEST_CA);
+    let mut cmd = oam_command(&["run", file.to_str().unwrap(), "--no-check"]);
+    cmd.env("NODE_EXTRA_CA_CERTS", &ca);
+    let out = bounded_output(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            "encrypted=true",
+            "reset=ERR_INVALID_HANDLE_TYPE",
+            "socket=close false",
+            "server=end+close false",
+            "connections=2",
+        ],
+        "stderr: {stderr}"
+    );
+}
+
+/// A finished request's `req.socket` closes its connection only while no
+/// other request has taken it. oam's shared pool hands the kept-alive
+/// connection of an option-less http.get / https.get to the next request
+/// for the origin -- here a fetch() the server answers after 200 ms -- and a
+/// destroy() on the kept socket 50 ms into it used to close the connection
+/// under the fetch ("fetch failed / error sending request for url"). node
+/// (v22.22.2) prints "fetch=ok slow-done" for both: its socket is the first
+/// request's own, and undici's pool is not the agent's. That oam reused the
+/// connection (one server connection, where node dials two) is what puts
+/// the fetch in harm's way, so it is asserted too.
+#[test]
+fn a_kept_req_socket_leaves_a_connection_another_request_took() {
+    let src = format!(
+        r#"
+import http from 'node:http';
+import https from 'node:https';
+const cert = `{cert}`;
+const key = `{key}`;
+for (const secure of [false, true]) {{
+  let conns = 0;
+  const handler = (req, res) => {{
+    req.resume();
+    if (req.url === '/slow') setTimeout(() => res.end('slow-done'), 200);
+    else res.end('hello');
+  }};
+  const server = secure ? https.createServer({{ cert, key }}, handler) : http.createServer(handler);
+  server.on('connection', () => conns++);
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = (secure ? 'https' : 'http') + '://localhost:' + server.address().port;
+  const socket = await new Promise((resolve, reject) => {{
+    const req = (secure ? https : http).get(base + '/', (res) => {{
+      res.resume();
+      res.on('end', () => setImmediate(() => resolve(req.socket)));
+    }});
+    req.on('error', reject);
+  }});
+  const fetched = fetch(base + '/slow').then((r) => r.text()).then(
+    (t) => 'ok ' + t,
+    (e) => 'failed ' + e.message + ' / ' + (e.cause && e.cause.message),
+  );
+  await new Promise((r) => setTimeout(r, 50));
+  socket.destroy();
+  console.log((secure ? 'https' : 'http') + ' fetch=' + await fetched + ' connections=' + conns);
+  server.close();
+}}
+setTimeout(() => process.exit(0), 50);
+"#,
+        cert = FETCH_TEST_LEAF,
+        key = FETCH_TEST_LEAF_KEY,
+    );
+    let file = write_temp("kept_req_socket_reused_connection.mjs", &src);
+    let ca = write_temp("kept_req_socket_reused_connection_ca.pem", FETCH_TEST_CA);
+    let mut cmd = oam_command(&["run", file.to_str().unwrap(), "--no-check"]);
+    cmd.env("NODE_EXTRA_CA_CERTS", &ca);
+    let out = bounded_output(&mut cmd);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout.lines().collect::<Vec<_>>(),
+        [
+            "http fetch=ok slow-done connections=1",
+            "https fetch=ok slow-done connections=1",
+        ],
+        "stderr: {stderr}"
+    );
 }
 
 /// Issue #146: a verifying https request's per-request TLS options reach the
@@ -26549,6 +29575,244 @@ fn socket_write_signals_backpressure_and_drains() {
     );
 }
 
+/// #156: a connect() retried on a socket its failed connect destroyed (from
+/// the 'error' listener, node's reconnect pattern) must not hold what is
+/// issued after it. oam does not revive a destroyed socket, so that connect
+/// settles without releasing anything; the end() behind it was held for
+/// good -- its callback never ran and the socket's internal `_chain`, which
+/// IPC waits on, never settled. Not a conformance case: node revives the
+/// socket instead, and in this exact shape loses the end() callback itself.
+#[test]
+fn net_end_after_connect_on_a_destroyed_socket_calls_back() {
+    let stdout = run_ok(
+        "net_end_after_reconnect.mjs",
+        "import net from 'node:net';\n\
+         const probe = net.createServer();\n\
+         await new Promise((r) => probe.listen(0, '127.0.0.1', r));\n\
+         const refused = probe.address().port;\n\
+         await new Promise((r) => probe.close(r));\n\
+         const server = net.createServer((s) => { s.on('error', () => {}); s.resume(); });\n\
+         await new Promise((r) => server.listen(0, '127.0.0.1', r));\n\
+         const sock = net.connect(refused, '127.0.0.1');\n\
+         let retried = false;\n\
+         const outcome = await new Promise((resolve) => {\n\
+           const t = setTimeout(() => resolve('end callback never called'), 5000);\n\
+           sock.on('error', () => {\n\
+             if (retried) return;\n\
+             retried = true;\n\
+             sock.connect(server.address().port, '127.0.0.1');\n\
+             sock.end((e) => { clearTimeout(t); resolve(`end callback ${e instanceof Error}`); });\n\
+           });\n\
+         });\n\
+         console.log(outcome);\n\
+         let t2;\n\
+         console.log(await Promise.race([\n\
+           sock._chain.then(() => 'chain settled'),\n\
+           new Promise((r) => { t2 = setTimeout(() => r('chain stuck'), 5000); }),\n\
+         ]));\n\
+         clearTimeout(t2);\n\
+         server.close();",
+    );
+    assert!(
+        stdout.contains("end callback true"),
+        "end(cb) after a connect() on a destroyed socket must call back with an error: {stdout}"
+    );
+    assert!(
+        stdout.contains("chain settled"),
+        "the socket's op chain must settle: {stdout}"
+    );
+}
+
+/// #156: `socket.write(data); socket.end()` in one callback sends the FIN
+/// right behind the data -- seen from a NODE client, which is who failed
+/// against an oam server (`UND_ERR_SOCKET` on keep-alive fetches racing the
+/// late FIN).
+///
+/// end() used to wait for the write's promise before it asked the natives
+/// for the shutdown, one op round trip after the data. It now asks in the
+/// same turn and the natives queue the shutdown behind the write. The
+/// regression this guards is the one that makes that ordering necessary: a
+/// shutdown issued while a write is in flight used to be dropped, so the
+/// client would get the data and never the 'end'. The large responses below
+/// go to a client that reads nothing for a while, so their writes are still
+/// in flight when the shutdown is issued. The client allows 5 s from the
+/// first 'data' to 'end' per connection (it takes microseconds for a small
+/// response), so a slow box cannot fail this and a lost FIN cannot pass.
+#[test]
+fn net_server_write_then_end_delivers_the_fin_to_a_node_client() {
+    use std::io::BufRead;
+    if !node_available() {
+        eprintln!("skipping: node not installed (the client runs on it)");
+        return;
+    }
+    let server = write_temp(
+        "write_end_fin/server.mjs",
+        "import net from 'node:net';\n\
+         const small = Buffer.from('HTTP/1.1 200 OK\\r\\ncontent-length: 2\\r\\n\\r\\nok');\n\
+         const large = Buffer.alloc(6 * 1024 * 1024, 0x61);\n\
+         const server = net.createServer((sock) => {\n\
+           sock.on('error', () => {});\n\
+           sock.once('data', (d) => {\n\
+             // The writes and the end, all in this one callback.\n\
+             if (String(d).startsWith('large')) { sock.write(large); sock.write(large); sock.write('tail'); }\n\
+             else sock.write(small);\n\
+             sock.end();\n\
+           });\n\
+         });\n\
+         server.listen(0, '127.0.0.1', () => console.log(server.address().port));\n",
+    );
+    let client = write_temp(
+        "write_end_fin/client.mjs",
+        "import net from 'node:net';\n\
+         const port = Number(process.argv[2]);\n\
+         function once(kind) {\n\
+           return new Promise((resolve) => {\n\
+             const s = net.connect(port, '127.0.0.1');\n\
+             let bytes = 0, timer = null, outcome = 'closed without end';\n\
+             s.on('connect', () => {\n\
+               s.write(kind);\n\
+               // Not reading yet: the server's writes back up behind this.\n\
+               if (kind === 'large') { s.pause(); setTimeout(() => s.resume(), 300); }\n\
+             });\n\
+             s.on('data', (d) => {\n\
+               bytes += d.length;\n\
+               if (timer === null) timer = setTimeout(() => { outcome = 'no end within 5s of data'; s.destroy(); }, 5000);\n\
+             });\n\
+             s.on('end', () => { outcome = 'end'; });\n\
+             s.on('error', (e) => { outcome = 'error ' + e.code; });\n\
+             s.on('close', () => { clearTimeout(timer); resolve(outcome + ' after ' + bytes + ' bytes'); });\n\
+           });\n\
+         }\n\
+         const tally = new Map();\n\
+         for (let i = 0; i < 300; i++) {\n\
+           const r = 'small: ' + await once('small');\n\
+           tally.set(r, (tally.get(r) || 0) + 1);\n\
+         }\n\
+         for (let i = 0; i < 5; i++) {\n\
+           const r = 'large: ' + await once('large');\n\
+           tally.set(r, (tally.get(r) || 0) + 1);\n\
+         }\n\
+         for (const [r, n] of tally) console.log(n + ' x ' + r);\n",
+    );
+    let mut serving = oam_command(&["run", server.to_str().unwrap()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("oam binary runs");
+    let mut port = String::new();
+    std::io::BufReader::new(serving.stdout.take().unwrap())
+        .read_line(&mut port)
+        .expect("the server prints its port");
+    let out = bounded_output(
+        std::process::Command::new("node").args([client.to_str().unwrap(), port.trim()]),
+    );
+    let _ = serving.kill();
+    let _ = serving.wait();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "client failed: {stdout}{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout.replace("\r\n", "\n"),
+        "300 x small: end after 40 bytes\n5 x large: end after 12582916 bytes\n",
+        "every connection gets all of its data and then the FIN"
+    );
+}
+
+// ------------------------------------------------------------------- heap cap
+
+/// `OAM_MAX_HEAP_MB` always yields a cap: a value that is not a positive
+/// number is warned about and ignored, never read as "no cap".
+///
+/// Regression (#223): `0` and any non-numeric value removed oam's cap, which
+/// does not unbound the heap -- V8 then applies its own static limit, about a
+/// third of the 4 GiB default -- and took the near-heap-limit callback with
+/// it, so the death was a raw V8 abort with no `OAM-RT-OOM` banner.
+#[test]
+fn heap_cap_env_always_caps_and_warns_on_an_unusable_value() {
+    let script = write_temp(
+        "heap_cap_env.mjs",
+        "import v8 from 'node:v8';\n\
+         console.log(v8.getHeapStatistics().heap_size_limit);",
+    );
+    let path = script.to_string_lossy().to_string();
+    let limit_of = |value: &str| -> (u64, String) {
+        let out = oam_with_env(&["run", &path], &[("OAM_MAX_HEAP_MB", value)]);
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        assert!(
+            out.status.success(),
+            "OAM_MAX_HEAP_MB={value:?}: exit {}; stderr: {stderr}",
+            out.status
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let limit = stdout
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("OAM_MAX_HEAP_MB={value:?}: stdout {stdout:?}: {e}"));
+        (limit, stderr)
+    };
+
+    // Empty is unset: the default cap (4 GiB, or the container-derived one
+    // where the suite runs under a memory limit), and nothing to warn about.
+    let (default_limit, stderr) = limit_of("");
+    assert!(
+        !stderr.contains("OAM_MAX_HEAP_MB"),
+        "an empty value is not a mistake: {stderr}"
+    );
+
+    for bad in ["0", " 0", "-1", "abc", "unlimited"] {
+        let (limit, stderr) = limit_of(bad);
+        assert_eq!(
+            limit, default_limit,
+            "OAM_MAX_HEAP_MB={bad:?} must keep the default cap, not remove it"
+        );
+        let warning = format!(
+            "oam: warning: OAM_MAX_HEAP_MB={bad:?} is not a positive whole number of megabytes"
+        );
+        assert_eq!(
+            stderr.matches(&warning).count(),
+            1,
+            "OAM_MAX_HEAP_MB={bad:?} must be named in exactly one warning: {stderr}"
+        );
+    }
+
+    // A usable value is honoured silently, in both directions.
+    let (small, stderr) = limit_of("64");
+    assert!(
+        small < 128 * 1024 * 1024,
+        "OAM_MAX_HEAP_MB=64 must cap near 64 MB, got {small} bytes"
+    );
+    assert!(!stderr.contains("warning"), "64 is valid: {stderr}");
+    let (large, stderr) = limit_of("8192");
+    assert!(
+        large >= 8192 * 1024 * 1024,
+        "OAM_MAX_HEAP_MB=8192 must raise the cap, got {large} bytes"
+    );
+    assert!(!stderr.contains("warning"), "8192 is valid: {stderr}");
+}
+
+/// Reaching the cap is the `OAM-RT-OOM` banner and exit 134, not a V8 abort.
+#[test]
+fn heap_cap_reached_is_the_oom_banner() {
+    let script = write_temp(
+        "heap_cap_oom.mjs",
+        "const keep = [];\n\
+         for (;;) keep.push(new Array(1e5).fill(keep.length));",
+    );
+    let path = script.to_string_lossy().to_string();
+    let out = oam_with_env(&["run", &path], &[("OAM_MAX_HEAP_MB", "64")]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(134), "stderr: {stderr}");
+    assert!(
+        stderr.contains("error[OAM-RT-OOM]: JavaScript heap out of memory")
+            && stderr.contains("(set by OAM_MAX_HEAP_MB)"),
+        "the banner must name the cap and its source: {stderr}"
+    );
+}
+
 // ---------------------------------------------------------------- permissions
 
 /// Run the compiled binary with an explicit environment, bypassing the shared
@@ -26822,7 +30086,12 @@ fn watch_file_fires_and_close_stops_only_that_watcher() {
          const second = fs.watchFile(file, { interval: 20 }, shared);\n\
          first.close();\n\
          setTimeout(() => fs.writeFileSync(file, 'bbbbbb'), 60);\n\
-         setTimeout(() => {\n\
+         // Up to 5 s for the change to be seen: a loaded machine runs the\n\
+         // 20 ms poller late, and a fixed window failed the test there.\n\
+         const started = Date.now();\n\
+         const check = setInterval(() => {\n\
+           if (hits === 0 && Date.now() - started < 5000) return;\n\
+           clearInterval(check);\n\
            console.log('surviving_watcher_fired:', hits > 0);\n\
            second.close();\n\
            const after = hits;\n\
@@ -26833,7 +30102,7 @@ fn watch_file_fires_and_close_stops_only_that_watcher() {
                fs.rmSync(dir, { recursive: true, force: true });\n\
              }, 120);\n\
            }, 40);\n\
-         }, 400);",
+         }, 20);",
     );
     let out = oam(&["run", script.to_str().unwrap()]);
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -27115,6 +30384,142 @@ fn every_path_fs_op_respects_the_permission_model() {
             stdout.contains(&format!("{op}=ALLOWED")),
             "{op} must succeed once fs read+write are granted:\n{stdout}"
         );
+    }
+}
+
+/// An open that can write is checked as a write whichever API makes it. The
+/// async open (fs/promises.open, the callback fs.open, and the path forms built
+/// on it such as fs/promises.truncate) checked "r+" and the numeric O_RDWR as
+/// reads; the sync open already checked them as writes.
+#[test]
+fn an_open_that_can_write_needs_the_write_grant() {
+    let dir = write_temp("fs_perm_open_rw/.keep", "")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let target = dir.join("target.txt");
+    std::fs::write(&target, "ABC").unwrap();
+    let script = write_temp(
+        "fs_perm_open_rw.mjs",
+        "import fs from 'node:fs';\n\
+         const p = process.argv[2];\n\
+         const t = async (label, fn) => {\n\
+           try { await fn(); console.log(label + '=ALLOWED'); }\n\
+           catch (e) { console.log(label + '=' + e.code); }\n\
+         };\n\
+         await t('promisesOpenRplus', async () => { const h = await fs.promises.open(p, 'r+'); await h.write('Z', 0); await h.close(); });\n\
+         await t('promisesOpenRDWR', () => fs.promises.open(p, fs.constants.O_RDWR));\n\
+         await t('openRplusCb', () => new Promise((res, rej) => fs.open(p, 'r+', (e, fd) => e ? rej(e) : res(fd))));\n\
+         await t('promisesTruncate', () => fs.promises.truncate(p, 0));\n\
+         await t('truncateCb', () => new Promise((res, rej) => fs.truncate(p, 0, (e) => e ? rej(e) : res())));\n\
+         await t('openSyncRplus', () => fs.openSync(p, 'r+'));\n\
+         await t('promisesOpenR', async () => (await fs.promises.open(p, 'r')).close());\n\
+         console.log('content=' + fs.readFileSync(p, 'utf8'));",
+    );
+    let script = script.to_string_lossy().to_string();
+    let target_arg = target.to_string_lossy().to_string();
+    let out = oam(&["--permission", "--allow-fs-read=*", &script, &target_arg]);
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    for op in [
+        "promisesOpenRplus",
+        "promisesOpenRDWR",
+        "openRplusCb",
+        "promisesTruncate",
+        "truncateCb",
+        "openSyncRplus",
+    ] {
+        assert!(
+            stdout.contains(&format!("{op}=ERR_ACCESS_DENIED")),
+            "{op} must need the write grant:\n{stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("promisesOpenR=ALLOWED"),
+        "a read-only open needs only the read grant:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("content=ABC"),
+        "the file is left as it was:\n{stdout}"
+    );
+}
+
+/// On unix `fs.closeSync(1)` really closes stdout, as node's does (measured on
+/// node v22.23.2, Linux, stdout a pipe): the reader sees EOF at once, not when
+/// the process exits, and every later write to it -- fs.writeSync(1),
+/// process.stdout.write -- fails EBADF; the same for stderr. oam kept a
+/// duplicate of stdout for its own writes, so output went on flowing after
+/// the close and the pipe stayed open until exit. (Windows leaves 0-2 open,
+/// as libuv does; conformance/cases/258 covers that side.)
+#[cfg(unix)]
+#[test]
+fn closing_stdout_or_stderr_really_closes_it() {
+    for fd in [1, 2] {
+        let other = 3 - fd;
+        let script = write_temp(
+            &format!("close_stdio_{fd}.cjs"),
+            &format!(
+                "const fs = require('fs');\n\
+                 const log = (s) => fs.writeSync({other}, s + '\\n');\n\
+                 console.log('before'); console.error('before');\n\
+                 fs.closeSync({fd});\n\
+                 try {{ fs.writeSync({fd}, 'after\\n'); log('writeSync ok'); }}\n\
+                 catch (e) {{ log('writeSync ' + e.code + ' ' + e.syscall + ' ' + Object.keys(e)); }}\n\
+                 try {{ fs.fstatSync({fd}); log('fstat ok'); }} catch (e) {{ log('fstat ' + e.code); }}\n\
+                 const stream = {fd} === 1 ? process.stdout : process.stderr;\n\
+                 stream.on('error', (e) => log('error ' + e.code));\n\
+                 stream.write('after-stream\\n', (e) => log('cb ' + (e ? e.code : 'ok')));\n\
+                 try {{ fs.closeSync({fd}); }} catch (e) {{ log('close again ' + e.code); }}\n\
+                 setTimeout(() => log('done'), 3000);\n"
+            ),
+        );
+        let script = script.to_string_lossy().to_string();
+        let mut child = oam_command(&[&script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("oam runs");
+        let started = std::time::Instant::now();
+        // The closed side reaches EOF long before the 3s timer ends the run.
+        let closed_side: Box<dyn std::io::Read + Send> = if fd == 1 {
+            Box::new(child.stdout.take().unwrap())
+        } else {
+            Box::new(child.stderr.take().unwrap())
+        };
+        let mut open_side: Box<dyn std::io::Read + Send> = if fd == 1 {
+            Box::new(child.stderr.take().unwrap())
+        } else {
+            Box::new(child.stdout.take().unwrap())
+        };
+        let reader = std::thread::spawn(move || {
+            let mut closed_side = closed_side;
+            let mut text = String::new();
+            std::io::Read::read_to_string(&mut closed_side, &mut text).unwrap();
+            (text, started.elapsed())
+        });
+        let mut log = String::new();
+        std::io::Read::read_to_string(&mut open_side, &mut log).unwrap();
+        let status = child.wait().unwrap();
+        let (closed_text, eof_after) = reader.join().unwrap();
+        assert!(status.success(), "fd {fd}: {log}");
+        assert_eq!(
+            closed_text, "before\n",
+            "fd {fd}: nothing after the close reaches it"
+        );
+        assert!(
+            eof_after < std::time::Duration::from_millis(2000),
+            "fd {fd}: the reader saw EOF only after {eof_after:?}, at exit"
+        );
+        for line in [
+            "writeSync EBADF write errno,syscall,code",
+            "fstat EBADF",
+            "cb EBADF",
+            "error EBADF",
+            "close again EBADF",
+            "done",
+        ] {
+            assert!(log.contains(line), "fd {fd}: missing {line:?} in:\n{log}");
+        }
     }
 }
 
@@ -27560,6 +30965,75 @@ fn fetch_negotiates_and_decodes_content_encoding() {
     assert!(
         stdout.contains("parsed: compressed world"),
         "the decoded body must survive JSON.parse: {stdout}"
+    );
+}
+
+/// `http.get` is not `fetch`: it advertises nothing and decodes nothing (#148).
+///
+/// Node's http client sends `host` and `connection` plus what the caller
+/// wrote, and hands a `content-encoding: gzip` response over as the gzip
+/// bytes with `content-encoding` and `content-length` intact. oam's own
+/// transport is fetch's, and it gave `http.get` fetch's three default headers
+/// and a decoded body with both headers removed -- so the usual
+/// `res.pipe(zlib.createGunzip())` was handed plain text and failed. The
+/// node-differential half is conformance case 192; this pins the oam side on
+/// its own, next to the fetch test above whose behaviour must not move.
+#[test]
+fn http_get_neither_negotiates_nor_decodes_content_encoding() {
+    let stdout = run_ok(
+        "http_get_raw_gzip.mjs",
+        "import http from 'node:http';\n\
+         import zlib from 'node:zlib';\n\
+         \n\
+         const payload = 'raw body '.repeat(20);\n\
+         const gz = zlib.gzipSync(Buffer.from(payload, 'utf8'));\n\
+         let seen = null;\n\
+         const srv = http.createServer((req, res) => {\n\
+           seen = Object.keys(req.headers).sort().join(',');\n\
+           res.writeHead(200, {\n\
+             'content-encoding': 'gzip',\n\
+             'content-length': String(gz.length),\n\
+           });\n\
+           res.end(gz);\n\
+         });\n\
+         await new Promise((r) => srv.listen(0, '127.0.0.1', r));\n\
+         const port = srv.address().port;\n\
+         \n\
+         const { res, raw } = await new Promise((resolve, reject) => {\n\
+           http.get({ host: '127.0.0.1', port, path: '/' }, (res) => {\n\
+             const chunks = [];\n\
+             res.on('data', (d) => chunks.push(d));\n\
+             res.on('end', () => resolve({ res, raw: Buffer.concat(chunks) }));\n\
+           }).on('error', reject);\n\
+         });\n\
+         console.log('sent:', seen);\n\
+         console.log('content-encoding:', res.headers['content-encoding']);\n\
+         console.log('content-length matches:', res.headers['content-length'] === String(gz.length));\n\
+         console.log('raw bytes:', raw.equals(gz));\n\
+         console.log('caller decodes:', zlib.gunzipSync(raw).toString() === payload);\n\
+         \n\
+         const viaFetch = await fetch('http://127.0.0.1:' + port + '/');\n\
+         console.log('fetch decodes:', (await viaFetch.text()) === payload);\n\
+         console.log('fetch sent:', seen);\n\
+         srv.close();\n",
+    );
+    assert!(
+        stdout.contains("sent: connection,host\n"),
+        "http.get must send host and connection alone -- no accept, user-agent or accept-encoding: {stdout}"
+    );
+    assert!(
+        stdout.contains("content-encoding: gzip\n")
+            && stdout.contains("content-length matches: true"),
+        "http.get must keep the response's content-encoding and content-length: {stdout}"
+    );
+    assert!(
+        stdout.contains("raw bytes: true") && stdout.contains("caller decodes: true"),
+        "http.get must hand over the gzip bytes as sent, for the caller to decode: {stdout}"
+    );
+    assert!(
+        stdout.contains("fetch decodes: true")
+            && stdout.contains("fetch sent: accept,accept-encoding,"),
+        "fetch must keep negotiating and decoding: {stdout}"
     );
 }
 
@@ -29625,4 +33099,51 @@ const tick = setInterval(() => {
     let stderr = stderr_text(&stderr);
     assert!(status.success(), "exit {status}; stderr: {stderr:?}");
     assert_eq!(stderr, "", "nothing on stderr: no LOOP_FINISHED, no error");
+}
+
+/// A negative descriptor is no descriptor (review 3, finding 21). The native
+/// fd ops cast the number with a saturating `as u64`, so -1 and -2147483648
+/// became 0 -- the inherited stdin -- and `writeFileSync(-1, 'x')` wrote into
+/// it. node v22.22.2 throws EBADF `write` for each of these and leaves stdin
+/// alone. The conformance harness runs cases with a null stdin, where a write
+/// to 0 fails anyway, so this runs oam with a WRITABLE stdin.
+#[test]
+fn a_negative_descriptor_never_reaches_stdin() {
+    let script = write_temp(
+        "negative_fd_stdin.cjs",
+        "const fs = require('fs');\n\
+         const tries = [\n\
+           ['writeFileSync(-1)', () => fs.writeFileSync(-1, 'x')],\n\
+           ['appendFileSync(-1)', () => fs.appendFileSync(-1, 'x')],\n\
+           ['writeFileSync(-2147483648)', () => fs.writeFileSync(-2147483648, 'x')],\n\
+         ];\n\
+         for (const [name, run] of tries) {\n\
+           try { run(); console.log(name + ' ok'); }\n\
+           catch (e) { console.log(name + ' ' + e.code + ' ' + e.syscall); }\n\
+         }\n",
+    );
+    let stdin_path = write_temp("negative_fd_stdin.txt", "");
+    let stdin = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&stdin_path)
+        .expect("open stdin file");
+    let out = oam_command(&[&script.to_string_lossy()])
+        .stdin(std::process::Stdio::from(stdin))
+        .output()
+        .expect("oam runs");
+    let stdout = String::from_utf8_lossy(&out.stdout).replace('\r', "");
+    assert_eq!(
+        stdout,
+        "writeFileSync(-1) EBADF write\n\
+         appendFileSync(-1) EBADF write\n\
+         writeFileSync(-2147483648) EBADF write\n",
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::metadata(&stdin_path).expect("stdin file").len(),
+        0,
+        "nothing was written to stdin"
+    );
 }

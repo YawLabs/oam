@@ -22,6 +22,8 @@ pub use oam_diagnostics as diagnostics;
 pub mod byte_pipe;
 pub mod child;
 pub mod cluster;
+/// node:zlib's deflate and deflateRaw with the dictionary option.
+mod deflate;
 pub mod dns;
 /// oam's own HTTP client transport for the `fetch` op (#143).
 pub mod http_client;
@@ -30,6 +32,8 @@ pub mod http_client;
 pub mod http_conn;
 pub mod http_head;
 pub mod http_server;
+/// zlib-faithful inflate shared by fetch's body decoder and node:zlib (#166).
+mod inflate;
 pub mod inspector;
 /// The outbound TCP connector net.connect and tls.connect share: node's
 /// lookupAndConnectMultiple algorithm and its error shapes.
@@ -129,6 +133,30 @@ pub struct AccessDenial {
     pub resource: String,
 }
 
+/// The socket an HTTP client request went out on, as undici describes it on
+/// a `SocketError` (`util.getSocketInfo`, node v22.22.2's bundled undici):
+/// the two ends in node's spelling and the bytes the socket has carried.
+/// The keys serialise as undici's own (`localAddress`, `bytesWritten`, ...),
+/// which is how the engine hands them to JS.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SocketFacts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_address: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_family: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_written: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes_read: Option<u64>,
+}
+
 /// What an async op produced. v8-free by design; the engine maps these to
 /// promise resolutions (Done -> undefined, Text -> string, Json -> the
 /// parsed value via V8's own JSON parser, Failed -> reject with
@@ -175,6 +203,11 @@ pub enum OpOutcome {
         address: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         port: Option<u16>,
+        /// The second path of a two-path fs call (rename, copyfile, link,
+        /// symlink): node names it in the message (`'a' -> 'b'`) and as
+        /// `err.dest`. A serde default, like the three above.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dest: Option<String>,
     },
     /// Every address of a multi-address connect failed: node's
     /// `NodeAggregateError` (lib/net.js `internalConnectMultiple`), one child
@@ -203,6 +236,18 @@ pub enum OpOutcome {
     /// throw. A new variant, so a replay file recorded before it existed still
     /// loads.
     AccessDenied(AccessDenial),
+    /// The peer closed the HTTP client connection a request was on -- an
+    /// orderly close, no reset -- before the response head was in or while
+    /// its body was: undici's `SocketError` (`UND_ERR_SOCKET`, `other side
+    /// closed`), with the socket it describes. The engine rejects with an
+    /// Error carrying `code` and `socket`, which the JS turns into the error
+    /// its caller reports (fetch: the SocketError itself as the cause;
+    /// http.request: node's `socket hang up` / `aborted`). A new variant, so a
+    /// replay file recorded before it existed still loads.
+    SocketClosed {
+        message: String,
+        socket: SocketFacts,
+    },
     /// An inbound OS signal (payload is the Node signal name, e.g. "SIGTERM").
     /// Only ever carried on a completion whose id == SIGNAL_OP_ID; the engine
     /// maps it to `process.emit(name)` rather than resolving a promise. serde-
@@ -211,6 +256,15 @@ pub enum OpOutcome {
 }
 
 impl OpOutcome {
+    /// undici's `SocketError` for a connection its peer closed: `other side
+    /// closed`, the text undici's client reports for an end-of-stream.
+    pub fn socket_closed(socket: SocketFacts) -> Self {
+        OpOutcome::SocketClosed {
+            message: "other side closed".to_string(),
+            socket,
+        }
+    }
+
     /// A coded failure with no filesystem context (dns / net / tls).
     pub fn node_failed(code: impl Into<String>, message: impl Into<String>) -> Self {
         OpOutcome::NodeFailed {
@@ -222,6 +276,7 @@ impl OpOutcome {
             hostname: None,
             address: None,
             port: None,
+            dest: None,
         }
     }
 
@@ -237,6 +292,7 @@ impl OpOutcome {
             hostname: err.hostname,
             address: err.address,
             port: err.port,
+            dest: None,
         }
     }
 
@@ -265,6 +321,30 @@ impl OpOutcome {
             hostname: None,
             address: None,
             port: None,
+            dest: None,
+        }
+    }
+
+    /// `node_failed_at` for a two-path call: `path` and `dest` as node reports
+    /// them (see `node_error_message_dest`).
+    pub fn node_failed_dest(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        syscall: &str,
+        path: &str,
+        dest: &str,
+        errno: Option<i32>,
+    ) -> Self {
+        OpOutcome::NodeFailed {
+            code: code.into(),
+            message: message.into(),
+            syscall: Some(syscall.to_string()),
+            path: Some(path.to_string()),
+            errno,
+            hostname: None,
+            address: None,
+            port: None,
+            dest: Some(dest.to_string()),
         }
     }
 }
@@ -315,19 +395,241 @@ pub type OutboundBodies = std::sync::Arc<
 /// notifier makes cancellation preemptive.
 pub type BodyCancelSignal = std::sync::Arc<tokio::sync::Notify>;
 
-/// Open file handles for fs streams -- same remove-await-reinsert
-/// discipline as BodyRegistry (node:stream's write queue serializes
-/// access per handle). The `closed` set is the generation guard: a chunk
-/// op removes the File, awaits IO unlocked, then reinserts -- but if
-/// fsClose landed during that await (stream.destroy() racing an in-flight
-/// read), the reinsert would resurrect a leaked fd. closed tracks ids
-/// retired mid-flight so the reinsert drops the File instead.
+/// One open descriptor, shared by every op in flight on it.
+///
+/// An `Arc` so an op can take its own reference under the registry lock and
+/// drop the lock before any IO. The registry used to hold a bare `File` and
+/// the async read / write REMOVED it for the length of the IO await, then put
+/// it back -- so a second `fs.read` on the same descriptor, fired before the
+/// first completed, found the slot empty and called back EBADF. node serves
+/// every one of them (libuv runs them on its thread pool against the one
+/// descriptor), and so does this: nothing takes the file out, and every op --
+/// positional ones through `read_at` / `write_all_at`, which never move the
+/// cursor on unix -- works through a shared `&File`.
+///
+/// Closing removes the registry's reference. An op already holding its own
+/// finishes against the still-open handle, and the OS descriptor closes when
+/// the last reference drops -- the same outcome node gives a read that its
+/// thread had already started when the close arrived. No lock is held across
+/// any IO, so a slow descriptor never stalls another.
+pub type OpenFile = std::sync::Arc<std::fs::File>;
+
+/// The descriptor table every fd-taking `fs` op resolves through.
 #[derive(Default)]
 pub struct FileState {
-    pub files: HashMap<u64, std::fs::File>,
-    pub closed: std::collections::HashSet<u64>,
+    pub files: HashMap<u64, OpenFile>,
 }
 pub type FileRegistry = std::sync::Arc<std::sync::Mutex<FileState>>;
+
+/// The open file behind `fd`, adopting a descriptor the parent handed us (see
+/// `adopt_inherited_fd`) on first use. The registry lock is held only for the
+/// lookup: the caller does its IO on the returned reference with nothing held.
+pub fn registered_file(registry: &FileRegistry, fd: u64) -> Option<OpenFile> {
+    let lookup = || {
+        registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .files
+            .get(&fd)
+            .cloned()
+    };
+    // One lock on the hot path; adoption only on a miss.
+    lookup().or_else(|| {
+        if adopt_inherited_fd(registry, fd) {
+            lookup()
+        } else {
+            None
+        }
+    })
+}
+
+/// Close `fd` as node's close does; false when it is not open (EBADF).
+///
+/// An adopted descriptor (below OWN_FD_BASE) is a DUP of the parent's, so
+/// dropping ours closes only our copy: the original is closed too, or the
+/// peer of an inherited pipe never sees EOF -- which is precisely how a CDP
+/// child says "no more messages" on fd 4. The one exception is 0-2 on
+/// Windows, which libuv's `fs__close` leaves open (`if (fd > 2)
+/// _close(fd)`): closing one there succeeds and changes nothing, and the
+/// descriptor goes on working, as in node. On unix it is really closed, and
+/// a later call on it is EBADF.
+pub fn close_descriptor(registry: &FileRegistry, fd: u64) -> bool {
+    adopt_inherited_fd(registry, fd);
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+    if cfg!(windows) && fd <= 2 {
+        return guard.files.contains_key(&fd);
+    }
+    let removed = guard.files.remove(&fd);
+    drop(guard);
+    let Some(file) = removed else {
+        return false;
+    };
+    drop(file);
+    if fd < OWN_FD_BASE {
+        close_inherited_fd(fd);
+        if let Some(closed) = STDIO_CLOSED.get(fd as usize) {
+            closed.store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+    true
+}
+
+/// Which of descriptors 0-2 `close_descriptor` has really closed -- unix
+/// only, as Windows leaves them open. The runtime's own stdout and stderr
+/// writes do not go through the descriptor table, so they ask here.
+static STDIO_CLOSED: [std::sync::atomic::AtomicBool; 3] = [
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+    std::sync::atomic::AtomicBool::new(false),
+];
+
+/// The error a write to the process's stdout (1) or stderr (2) gets once the
+/// program has closed that descriptor with `fs.closeSync` / `fs.close`: EBADF,
+/// as node's write(2) gets on unix, where libuv really closes it. `None` while
+/// it is open -- always, on Windows. One relaxed load on the write path.
+pub fn closed_stdio_error(fd: u64) -> Option<std::io::Error> {
+    let closed = STDIO_CLOSED.get(fd as usize)?;
+    if !closed.load(std::sync::atomic::Ordering::Acquire) {
+        return None;
+    }
+    #[cfg(unix)]
+    let errno = libc::EBADF;
+    #[cfg(not(unix))]
+    let errno = 6; // ERROR_INVALID_HANDLE; unreachable, nothing sets the flag
+    Some(std::io::Error::from_raw_os_error(errno))
+}
+
+/// A read or write position as node's binding hands it to libuv (its
+/// GetOffset: any safe integer, else -1), resolved to what the OS is asked
+/// for: `Some(offset)` for a positional op, `None` for the cursor.
+///
+/// -1 is the cursor everywhere. Any other negative is the cursor on unix,
+/// where libuv's uv__fs_read / uv__fs_write take `off < 0` to mean read(2) /
+/// write(2). On Windows libuv's fs__read / fs__write hand every offset but -1
+/// to the OS as an OVERLAPPED offset, two's complement and all, around a
+/// saved and restored file pointer -- which is what `read_at` / `write_all_at`
+/// do with the `Some` returned here -- and the OS decides (measured on node
+/// v22.22.2): -2 is its FILE_USE_FILE_POINTER_POSITION, so the op happens at
+/// the cursor and the cursor does not move; a handle opened for append writes
+/// at the end; anything else fails ERROR_INVALID_PARAMETER, EINVAL.
+pub fn file_offset(position: Option<i64>) -> Option<u64> {
+    match position {
+        Some(p) if p >= 0 || (p != -1 && cfg!(windows)) => Some(p as u64),
+        _ => None,
+    }
+}
+
+/// Read into `buf` at `position` -- `pread(2)` -- or from the cursor (see
+/// `file_offset` for a negative one). A positional read does not move the
+/// cursor, which is what node's positional `fs.read` family means.
+///
+/// Unix has a real `pread`, so concurrent positional reads on one descriptor
+/// never see each other. Windows has no read that leaves the file pointer
+/// alone (a ReadFile with an OVERLAPPED offset on a synchronous handle moves
+/// it), so this does what libuv's `fs__read` does there: note the pointer,
+/// read at the offset, put the pointer back.
+pub fn read_at(
+    file: &std::fs::File,
+    buf: &mut [u8],
+    position: Option<i64>,
+) -> std::io::Result<usize> {
+    use std::io::Read;
+    let Some(p) = file_offset(position) else {
+        return (&*file).read(buf);
+    };
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_at(file, buf, p)
+    }
+    #[cfg(windows)]
+    {
+        let saved = stream_position_of(file);
+        let result = std::os::windows::fs::FileExt::seek_read(file, buf, p);
+        restore_position(file, saved);
+        result
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::io::{Seek, SeekFrom};
+        let saved = stream_position_of(file);
+        (&*file).seek(SeekFrom::Start(p))?;
+        let result = (&*file).read(buf);
+        restore_position(file, saved);
+        result
+    }
+}
+
+/// Write all of `bytes` at `position` -- `pwrite(2)` -- or at the cursor (see
+/// `file_offset` for a negative one), with `write_all_checked`'s rule that an empty write still
+/// reaches the descriptor. Same platform split as `read_at`. A descriptor
+/// opened for APPEND writes at the end whatever the position, on every
+/// platform node runs on; that is the OS's behaviour and node's.
+pub fn write_all_at(
+    file: &std::fs::File,
+    bytes: &[u8],
+    position: Option<i64>,
+) -> std::io::Result<()> {
+    let Some(p) = file_offset(position) else {
+        return write_all_checked(file, bytes);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        if bytes.is_empty() {
+            return file.write_at(bytes, p).map(|_| ());
+        }
+        file.write_all_at(bytes, p)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let saved = stream_position_of(file);
+        let result = (|| {
+            if bytes.is_empty() {
+                return file.seek_write(bytes, p).map(|_| ());
+            }
+            let mut done = 0usize;
+            while done < bytes.len() {
+                // Wrapping, as libuv's int64 `offset + bytes` does for a
+                // negative offset (see file_offset).
+                match file.seek_write(&bytes[done..], p.wrapping_add(done as u64)) {
+                    Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                    Ok(n) => done += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(())
+        })();
+        restore_position(file, saved);
+        result
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        use std::io::{Seek, SeekFrom};
+        let saved = stream_position_of(file);
+        (&*file).seek(SeekFrom::Start(p))?;
+        let result = write_all_checked(file, bytes);
+        restore_position(file, saved);
+        result
+    }
+}
+
+#[cfg(not(unix))]
+fn stream_position_of(file: &std::fs::File) -> Option<u64> {
+    use std::io::Seek;
+    (&*file).stream_position().ok()
+}
+
+/// Put the cursor back where `stream_position_of` found it. A descriptor that
+/// cannot seek (a pipe) reported no position, and there is nothing to restore.
+#[cfg(not(unix))]
+fn restore_position(file: &std::fs::File, saved: Option<u64>) {
+    use std::io::{Seek, SeekFrom};
+    if let Some(prev) = saved {
+        let _ = (&*file).seek(SeekFrom::Start(prev));
+    }
+}
 
 /// The SAME registry as `FileRegistry`, kept as a name because the sync fs
 /// family reads better with it at the call sites.
@@ -356,8 +658,8 @@ pub type SyncFileRegistry = FileRegistry;
 /// inheritable window keeps the two spaces disjoint, so an unknown low fd is
 /// unambiguously "the parent gave me this" rather than "not open yet".
 ///
-/// 0/1/2 never reach the registry -- the JS layer routes them to the process
-/// std sinks -- so the window is 3..OWN_FD_BASE.
+/// 0/1/2 are adopted the same way (see `inherited_eligible`), so the window
+/// is 0..OWN_FD_BASE.
 pub const OWN_FD_BASE: u64 = 64;
 
 /// Largest fd oam will try to adopt from its parent. Above this a miss is a
@@ -543,11 +845,17 @@ fn consume_inherited_fd(fd: u64) {
 /// snapshot decides "the parent gave me this"; the consumed set removes it again
 /// the moment we close it, which is what keeps a reused fd number from being
 /// re-adopted.
+///
+/// 0, 1 and 2 need no snapshot: they are the process's stdin, stdout and
+/// stderr, which node's fd calls operate on (`fstatSync(0)`, `readSync(0)`,
+/// `fsyncSync(1)`), and oam never opens anything of its own there.
 fn inherited_eligible(fd: u64) -> bool {
-    (3..=MAX_INHERITED_FD).contains(&fd)
-        && INHERITED_AT_START
-            .get()
-            .is_some_and(|set| set.contains(&fd))
+    let born_holding = fd <= 2
+        || ((3..=MAX_INHERITED_FD).contains(&fd)
+            && INHERITED_AT_START
+                .get()
+                .is_some_and(|set| set.contains(&fd)));
+    born_holding
         && !INHERITED_CONSUMED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -627,7 +935,7 @@ pub fn adopt_inherited_fd(registry: &SyncFileRegistry, fd: u64) -> bool {
     // Held across the dup so two ops racing on the same fd cannot both adopt.
     match dup_inherited(fd) {
         Some(file) => {
-            guard.files.insert(fd, file);
+            guard.files.insert(fd, std::sync::Arc::new(file));
             true
         }
         None => false,
@@ -639,8 +947,10 @@ pub fn adopt_inherited_fd(registry: &SyncFileRegistry, fd: u64) -> bool {
 /// zlibStreamWrite and _flush to zlibStreamFlush.
 ///
 /// Variants:
-/// - Compress/Decompress: flate2 gzip/deflate/deflateRaw, truly incremental.
+/// - Compress/Decompress: gzip/deflate/deflateRaw (flate2 encoders,
+///   NodeInflate decoders), truly incremental.
 /// - BrotliCompress/BrotliDecompress: pure-Rust brotli via the `brotli` crate.
+/// - HandleCompress/HandleDecompress: node's low-level zlib handle.
 pub enum ZlibStream {
     Compress(zlib::StreamCompressor),
     Decompress(zlib::StreamDecompressor),
@@ -651,7 +961,9 @@ pub enum ZlibStream {
     BrotliCompress(Box<BrotliCompressor>),
     BrotliDecompress(Box<BrotliDecompressor>),
     HandleCompress(flate2::Compress),
-    HandleDecompress(flate2::Decompress),
+    /// A handle deflating with node's `dictionary` option.
+    HandleDictCompress(Box<zlib::DictDeflate>),
+    HandleDecompress(Box<zlib::NodeInflate>),
 }
 
 pub type ZlibRegistry = std::sync::Arc<std::sync::Mutex<HashMap<u64, ZlibStream>>>;
@@ -700,6 +1012,12 @@ pub struct CoreRuntime {
     /// Hook-mode fetches parked on their `connect.lookup` hook
     /// (`http_client::send`); dropped with the run.
     fetch_continuations: http_client::send::FetchContinuations,
+    /// `http.request`'s "this request has a connection" signals
+    /// (`http_client::sent`); dropped with the run.
+    sent_signals: http_client::sent::SentSignals,
+    /// Fetches with no response head yet that JS can cancel
+    /// (`http_client::send::FetchCancel`).
+    fetch_cancels: http_client::send::FetchCancels,
     /// Names `netResolve` resolved for a net / tls connect, by ticket, until
     /// the connect redeems them (`net_connect::ResolvedAnswers`); dropped
     /// with the run.
@@ -800,6 +1118,8 @@ impl CoreRuntime {
             tokio: Some(tokio),
             http,
             fetch_continuations: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sent_signals: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            fetch_cancels: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             resolved_answers: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             http_bridges: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             tls_pipes: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -869,6 +1189,26 @@ impl CoreRuntime {
     /// Hook-mode fetches waiting on their `connect.lookup` hook (Arc clone).
     pub fn fetch_continuations(&self) -> http_client::send::FetchContinuations {
         self.fetch_continuations.clone()
+    }
+
+    /// Open a sent signal and return its handle (`fetchSentOpen`).
+    pub fn new_sent_signal(&self) -> u64 {
+        let handle = self
+            .next_body
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        http_client::sent::open(&self.sent_signals, handle);
+        handle
+    }
+
+    /// `http.request`'s sent signals (Arc clone).
+    pub fn sent_signals(&self) -> http_client::sent::SentSignals {
+        self.sent_signals.clone()
+    }
+
+    /// In-flight fetches JS can cancel before their response head (Arc
+    /// clone).
+    pub fn fetch_cancels(&self) -> http_client::send::FetchCancels {
+        self.fetch_cancels.clone()
     }
 
     /// Addresses resolved ahead of a net / tls connect, by ticket (Arc
@@ -2021,6 +2361,321 @@ pub fn node_error_message_fd(code: &str, syscall: &str, error: &std::io::Error) 
     format!("{code}: {reason}, {syscall}")
 }
 
+/// Node-style error message for a TWO-path operation (rename, copyfile,
+/// link, symlink): "ENOENT: no such file or directory, rename 'a' -> 'b'".
+/// The error carries the second path as `dest` too.
+pub fn node_error_message_dest(
+    code: &str,
+    syscall: &str,
+    path: &str,
+    dest: &str,
+    error: &std::io::Error,
+) -> String {
+    let reason = node_error_reason(code, error);
+    format!("{code}: {reason}, {syscall} '{path}' -> '{dest}'")
+}
+
+/// The path a filesystem error names, for a path as the caller passed it.
+///
+/// On Windows node's binding resolves every path before libuv sees it
+/// (`ToNamespacedPath`: `PathResolve`, then the `\\?\` long-path prefix),
+/// and the error reports that path with the prefix taken back off
+/// (`StringFromPath`): `fs.statSync("x")` fails with `stat 'C:\cwd\x'`,
+/// `mkdirSync("a/b")` with `mkdir 'C:\cwd\a\b'`. An empty path is left alone
+/// (`fs.openSync("")` fails `open ''`), and so is one that resolves to two
+/// characters or fewer, as `ToNamespacedPath` leaves those. Elsewhere the path
+/// is reported as passed.
+///
+/// Not for `mkdtemp`, whose template node passes to libuv unresolved, or a
+/// symlink's target, which is stored as written.
+pub fn fs_error_path(path: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        if path.is_empty() {
+            return std::borrow::Cow::Borrowed(path);
+        }
+        let cwd = std::env::current_dir()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let resolved = win32_resolve(path, &cwd, |device| {
+            std::env::var(format!("={device}")).ok()
+        });
+        if resolved.len() <= 2 {
+            return std::borrow::Cow::Borrowed(path);
+        }
+        let shown = if let Some(rest) = resolved.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else if let Some(rest) = resolved.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            resolved
+        };
+        std::borrow::Cow::Owned(shown)
+    }
+    #[cfg(not(windows))]
+    std::borrow::Cow::Borrowed(path)
+}
+
+/// node's `path.win32.resolve(path)` (lib/path.js; src/path.cc `PathResolve`
+/// is the same algorithm): `cwd` is `process.cwd()`, and `drive_cwd(device)`
+/// the per-drive current directory Windows keeps in the `=C:` environment
+/// variables, for a drive-relative path (`D:x`) on another drive.
+///
+/// Pure, so every rule is unit-tested on any host; only `fs_error_path` is
+/// Windows-only.
+pub fn win32_resolve(path: &str, cwd: &str, drive_cwd: impl Fn(&str) -> Option<String>) -> String {
+    let is_sep = |b: u8| b == b'/' || b == b'\\';
+    let mut resolved_device = String::new();
+    let mut resolved_tail = String::new();
+    let mut resolved_absolute = false;
+    // resolve's loop over one argument: the path, then (`i === -1`) the cwd --
+    // or, once a device is known, that drive's own current directory.
+    for step in 0..2 {
+        let candidate = if step == 0 {
+            path.to_string()
+        } else if resolved_device.is_empty() {
+            cwd.to_string()
+        } else {
+            let drive = drive_cwd(&resolved_device).unwrap_or_else(|| cwd.to_string());
+            // Not a directory on that drive: the drive's root instead.
+            let other_drive = drive
+                .get(..2)
+                .is_none_or(|head| !head.eq_ignore_ascii_case(&resolved_device));
+            if other_drive && drive.as_bytes().get(2) == Some(&b'\\') {
+                format!("{resolved_device}\\")
+            } else {
+                drive
+            }
+        };
+        if candidate.is_empty() {
+            continue;
+        }
+        let bytes = candidate.as_bytes();
+        let len = bytes.len();
+        let mut root_end = 0;
+        let mut device = String::new();
+        let mut is_absolute = false;
+        if len == 1 {
+            if is_sep(bytes[0]) {
+                root_end = 1;
+                is_absolute = true;
+            }
+        } else if is_sep(bytes[0]) {
+            // A separator first: absolute, and possibly a UNC root.
+            is_absolute = true;
+            if is_sep(bytes[1]) {
+                let mut j = 2;
+                let mut last = j;
+                while j < len && !is_sep(bytes[j]) {
+                    j += 1;
+                }
+                if j < len && j != last {
+                    let first_part = &candidate[last..j];
+                    last = j;
+                    while j < len && is_sep(bytes[j]) {
+                        j += 1;
+                    }
+                    if j < len && j != last {
+                        last = j;
+                        while j < len && !is_sep(bytes[j]) {
+                            j += 1;
+                        }
+                        if j == len || j != last {
+                            if first_part != "." && first_part != "?" {
+                                device = format!(r"\\{first_part}\{}", &candidate[last..j]);
+                                root_end = j;
+                            } else {
+                                // A device root (`\\.\PHYSICALDRIVE0`).
+                                device = format!(r"\\{first_part}");
+                                root_end = 4;
+                            }
+                        }
+                    }
+                }
+            } else {
+                root_end = 1;
+            }
+        } else if bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            device = candidate[..2].to_string();
+            root_end = 2;
+            if len > 2 && is_sep(bytes[2]) {
+                is_absolute = true;
+                root_end = 3;
+            }
+        }
+        if !device.is_empty() {
+            if resolved_device.is_empty() {
+                resolved_device = device;
+            } else if !device.eq_ignore_ascii_case(&resolved_device) {
+                // A path on another device does not apply.
+                continue;
+            }
+        }
+        if resolved_absolute {
+            if !resolved_device.is_empty() {
+                break;
+            }
+        } else {
+            resolved_tail = format!(r"{}\{resolved_tail}", &candidate[root_end..]);
+            resolved_absolute = is_absolute;
+            if is_absolute && !resolved_device.is_empty() {
+                break;
+            }
+        }
+    }
+    let tail = normalize_win32_tail(&resolved_tail, !resolved_absolute);
+    if resolved_absolute {
+        format!(r"{resolved_device}\{tail}")
+    } else {
+        let joined = format!("{resolved_device}{tail}");
+        if joined.is_empty() {
+            ".".to_string()
+        } else {
+            joined
+        }
+    }
+}
+
+/// lib/path.js `normalizeString` with `\` as the separator: collapse `.` and
+/// empty segments, apply `..` (above the root only when `allow_above_root`).
+fn normalize_win32_tail(path: &str, allow_above_root: bool) -> String {
+    let is_sep = |b: u8| b == b'/' || b == b'\\';
+    let bytes = path.as_bytes();
+    let mut res = String::new();
+    let mut last_segment_length = 0usize;
+    let mut last_slash: isize = -1;
+    let mut dots: i32 = 0;
+    let mut code = 0u8;
+    // `res.length - 1 - res.lastIndexOf('\\')`, with lastIndexOf's -1.
+    let segment_length = |res: &str| {
+        (res.len() as isize - 1 - res.rfind('\\').map_or(-1, |at| at as isize)) as usize
+    };
+    for i in 0..=bytes.len() {
+        if i < bytes.len() {
+            code = bytes[i];
+        } else if is_sep(code) {
+            break;
+        } else {
+            code = b'/';
+        }
+        if is_sep(code) {
+            if last_slash == i as isize - 1 || dots == 1 {
+                // An empty or `.` segment.
+            } else if dots == 2 {
+                let ends_in_dotdot =
+                    res.len() >= 2 && last_segment_length == 2 && res.ends_with("..");
+                if !ends_in_dotdot {
+                    if res.len() > 2 {
+                        match res.rfind('\\') {
+                            None => {
+                                res.clear();
+                                last_segment_length = 0;
+                            }
+                            Some(at) => {
+                                res.truncate(at);
+                                last_segment_length = segment_length(&res);
+                            }
+                        }
+                        last_slash = i as isize;
+                        dots = 0;
+                        continue;
+                    } else if !res.is_empty() {
+                        res.clear();
+                        last_segment_length = 0;
+                        last_slash = i as isize;
+                        dots = 0;
+                        continue;
+                    }
+                }
+                if allow_above_root {
+                    res.push_str(if res.is_empty() { ".." } else { r"\.." });
+                    last_segment_length = 2;
+                }
+            } else {
+                if !res.is_empty() {
+                    res.push('\\');
+                }
+                res.push_str(&path[(last_slash + 1) as usize..i]);
+                last_segment_length = (i as isize - last_slash - 1) as usize;
+            }
+            last_slash = i as isize;
+            dots = 0;
+        } else if code == b'.' && dots != -1 {
+            dots += 1;
+        } else {
+            dots = -1;
+        }
+    }
+    res
+}
+
+#[cfg(test)]
+mod win32_resolve_tests {
+    use super::win32_resolve;
+
+    /// `path.win32.resolve(p)` on node v22.22.2 with `process.cwd()` returning
+    /// `C:\work\dir` (and no `=D:`-style drive directories).
+    const NODE: &[(&str, &str)] = &[
+        ("x", "C:\\work\\dir\\x"),
+        ("does-not-exist.txt", "C:\\work\\dir\\does-not-exist.txt"),
+        ("nope/sub", "C:\\work\\dir\\nope\\sub"),
+        ("nope\\a\\b\\", "C:\\work\\dir\\nope\\a\\b"),
+        (".", "C:\\work\\dir"),
+        ("..", "C:\\work"),
+        ("../..", "C:\\"),
+        ("../../../../x", "C:\\x"),
+        ("sub/../x", "C:\\work\\dir\\x"),
+        ("./a/./b/../c", "C:\\work\\dir\\a\\c"),
+        ("a//b\\\\c", "C:\\work\\dir\\a\\b\\c"),
+        ("C:\\abs\\path", "C:\\abs\\path"),
+        ("C:/abs/fwd", "C:\\abs\\fwd"),
+        ("c:\\Lower\\Case", "c:\\Lower\\Case"),
+        ("C:", "C:\\work\\dir"),
+        ("C:rel", "C:\\work\\dir\\rel"),
+        ("D:", "D:\\"),
+        ("D:rel\\x", "D:\\rel\\x"),
+        ("E:rel", "E:\\rel"),
+        ("\\rooted", "C:\\rooted"),
+        ("/rooted/fwd", "C:\\rooted\\fwd"),
+        ("\\", "C:\\"),
+        ("\\\\server\\share\\dir", "\\\\server\\share\\dir"),
+        ("\\\\server\\share", "\\\\server\\share\\"),
+        ("//server/share/x/../y", "\\\\server\\share\\y"),
+        ("\\\\.\\pipe\\name", "\\\\.\\pipe\\name"),
+        ("\\\\?\\C:\\long", "\\\\?\\C:\\long"),
+        ("C:\\a\\..\\..\\..", "C:\\"),
+        ("...", "C:\\work\\dir\\..."),
+        ("a/...", "C:\\work\\dir\\a\\..."),
+        ("a/../..", "C:\\work"),
+        ("C:\\x\\.", "C:\\x"),
+        ("C:\\x\\", "C:\\x"),
+    ];
+
+    #[test]
+    fn matches_node_path_win32_resolve() {
+        for (input, want) in NODE {
+            assert_eq!(
+                win32_resolve(input, r"C:\work\dir", |_| None),
+                *want,
+                "{input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_drive_relative_path_uses_that_drives_directory() {
+        let drive = |device: &str| (device == "D:").then(|| r"D:\dcwd\sub".to_string());
+        assert_eq!(
+            win32_resolve("D:x", r"C:\work\dir", drive),
+            r"D:\dcwd\sub\x"
+        );
+        // A directory recorded for the drive that is on another drive is not
+        // used: the drive's root is.
+        let wrong = |_: &str| Some(r"C:\elsewhere".to_string());
+        assert_eq!(win32_resolve("D:x", r"C:\work\dir", wrong), r"D:\x");
+    }
+}
+
 /// Error code for an operation on an ALREADY-OPEN descriptor.
 ///
 /// A descriptor was opened successfully, so there is no path left to be denied:
@@ -2091,8 +2746,9 @@ pub fn open_options_for(flags: &str) -> std::fs::OpenOptions {
 /// `writevSync(fd, [Buffer.alloc(0)])` reports EBADF on a closed or wrong-mode
 /// fd rather than quietly returning 0. Only an EMPTY LIST skips the descriptor
 /// entirely, and that case never gets here.
-pub fn write_all_checked(file: &mut std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
+pub fn write_all_checked(file: &std::fs::File, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    let mut file = file;
     if bytes.is_empty() {
         return file.write(bytes).map(|_| ());
     }
@@ -2130,12 +2786,16 @@ pub fn fd_error_code(error: &std::io::Error) -> &'static str {
 /// from. Without it `fs.access`/`fs.promises.access` rejected with no `errno`
 /// at all (and the async form with no `syscall` or `path` either), where every
 /// sibling fs op carries all four.
+///
+/// The message names the path as `fs_error_path` reports it, and so must the
+/// caller's `path` property.
 pub fn check_access(path: &str, mode: i32) -> Result<(), (String, String, Option<i32>)> {
+    let shown = fs_error_path(path);
     let meta = std::fs::metadata(path).map_err(|e| {
         let code = node_error_code(&e);
         (
             code.to_string(),
-            node_error_message(code, "access", path, &e),
+            node_error_message(code, "access", &shown, &e),
             node_errno(code, &e),
         )
     })?;
@@ -2143,7 +2803,7 @@ pub fn check_access(path: &str, mode: i32) -> Result<(), (String, String, Option
         let code = if cfg!(windows) { "EPERM" } else { "EACCES" };
         return Err((
             code.to_string(),
-            format!("{code}: operation not permitted, access '{path}'"),
+            format!("{code}: operation not permitted, access '{shown}'"),
             // Synthesised (no io::Error behind it): the libuv numbers node
             // reports for these two.
             Some(if cfg!(windows) { -4048 } else { -13 }),
@@ -2173,9 +2833,10 @@ pub fn strip_unc_prefix(path: &std::path::Path) -> String {
     s.strip_prefix(r"\\?\").unwrap_or(&s).to_string()
 }
 
-/// node:zlib backend (flate2 + brotli). Sync fns serve the *Sync natives
-/// directly; the async ops below wrap them in spawn_blocking -- compression
-/// is CPU work and must not sit on the isolate thread for the callback forms.
+/// node:zlib backend (flate2 encoders, [`inflate::NodeInflate`] decoders,
+/// brotli). Sync fns serve the *Sync natives directly; the async ops below
+/// wrap them in spawn_blocking -- compression is CPU work and must not sit on
+/// the isolate thread for the callback forms.
 ///
 /// Incremental streaming (StreamCompressor / StreamDecompressor /
 /// BrotliCompressor / BrotliDecompressor) backs the JS Transform classes.
@@ -2183,8 +2844,10 @@ pub fn strip_unc_prefix(path: &std::path::Path) -> String {
 /// _transform feeds chunks via zlibStreamWrite and _flush finalizes via
 /// zlibStreamFlush.
 pub mod zlib {
+    pub use crate::deflate::DictDeflate;
+    pub use crate::inflate::{NodeInflate, Wrap, ZlibError};
     use flate2::Compression;
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Format {
@@ -2235,8 +2898,12 @@ pub mod zlib {
     /// node's `RangeError [ERR_BUFFER_TOO_LARGE]`; nothing else produces it.
     pub const OUTPUT_TOO_LARGE: &str = "zlib output exceeds maxOutputLength";
 
+    /// zlib's `Z_FINISH`: node's default `finishFlush`, the one flush under
+    /// which an inflate that stops inside the stream is an error.
+    pub const Z_FINISH: i32 = 4;
+
     pub fn decompress(bytes: &[u8], format: Format) -> std::io::Result<Vec<u8>> {
-        decompress_capped(bytes, format, None)
+        decompress_capped(bytes, format, None, Z_FINISH, None)
     }
 
     /// Decompress, giving up as soon as the output passes `max_output` bytes.
@@ -2245,95 +2912,80 @@ pub mod zlib {
     /// while inflating, not on the finished buffer: a 200 KB gzip of 200 MiB
     /// of spaces must fail after ~`max_output` bytes of work, not after the
     /// whole 200 MiB has been allocated -- that allocation is the OOM the
-    /// option exists to prevent. Reads are bounded by what the cap still
-    /// allows, plus one byte so overflow is seen without a second pass.
+    /// option exists to prevent.
+    ///
+    /// A decode failure is an `io::Error` wrapping a [`ZlibError`] (see
+    /// [`zlib_error`]): node's code, errno and message for it.
+    ///
+    /// `finish_flush` is node's `finishFlush` option (see [`inflate_all`]),
+    /// `dictionary` its `dictionary` (see [`NodeInflate::with_dictionary`]).
     pub fn decompress_capped(
         bytes: &[u8],
         format: Format,
         max_output: Option<usize>,
+        finish_flush: i32,
+        dictionary: Option<&[u8]>,
     ) -> std::io::Result<Vec<u8>> {
-        let mut reader: Box<dyn Read + '_> = match format {
-            Format::Gzip => Box::new(flate2::read::GzDecoder::new(bytes)),
-            Format::Deflate => Box::new(flate2::read::ZlibDecoder::new(bytes)),
-            Format::DeflateRaw => Box::new(flate2::read::DeflateDecoder::new(bytes)),
+        let wrap = match format {
+            Format::Gzip => Wrap::Gzip,
+            Format::Deflate => Wrap::Zlib,
+            Format::DeflateRaw => Wrap::Raw,
         };
-        match max_output {
-            None => {
-                let mut out = Vec::new();
-                reader.read_to_end(&mut out)?;
-                Ok(out)
-            }
-            Some(cap) => read_capped(&mut reader, cap),
-        }
+        inflate_all(bytes, wrap, max_output, finish_flush, dictionary)
     }
 
-    /// Read `reader` to its end, giving up with [`OUTPUT_TOO_LARGE`] the moment
-    /// the output would pass `cap`. It never buffers more than `cap` (plus one
-    /// byte, and a read buffer capped at 64 KiB), so a reader that inflates
-    /// without bound -- a decompression bomb -- is stopped at the cap, not run
-    /// to exhaustion. Split out from `decompress_capped` so the bound can be
-    /// tested against an endless reader, which a `read_to_end` regression would
-    /// run forever.
-    fn read_capped(reader: &mut dyn Read, cap: usize) -> std::io::Result<Vec<u8>> {
+    /// Inflate the whole of `bytes` under node's one-shot finishing flush,
+    /// `finish_flush` (the `finishFlush` option, Z_FINISH by default). Under
+    /// Z_FINISH, input that ends inside the stream is Z_BUF_ERROR "unexpected
+    /// end of file"; under any other flush it is not an error and the result
+    /// is what decoded, as node_zlib.cc's CheckError reports Z_BUF_ERROR only
+    /// under Z_FINISH -- the lenient decode HTTP clients ask for with
+    /// Z_SYNC_FLUSH. What follows a complete stream is dropped (for gzip:
+    /// unless it is another member). Output is produced
+    /// [`inflate::STEP_OUT`] at a time, so memory stays within `max_output`
+    /// plus one step whatever the input inflates to.
+    fn inflate_all(
+        bytes: &[u8],
+        wrap: Wrap,
+        max_output: Option<usize>,
+        finish_flush: i32,
+        dictionary: Option<&[u8]>,
+    ) -> std::io::Result<Vec<u8>> {
+        let mut dec = NodeInflate::with_dictionary(wrap, dictionary);
         let mut out = Vec::new();
-        // Never hand the decoder more room than the cap plus one byte, so
-        // memory stays bounded by `cap` whatever the input inflates to.
-        let mut buf = vec![0u8; (cap + 1).min(64 * 1024)];
+        let mut buf = vec![0u8; crate::inflate::STEP_OUT];
+        let mut input = bytes;
         loop {
-            let want = (cap + 1 - out.len()).min(buf.len());
-            let n = reader.read(&mut buf[..want])?;
-            if n == 0 {
-                return Ok(out);
+            let (used, produced) = dec.step(input, &mut buf).map_err(std::io::Error::other)?;
+            input = &input[used..];
+            if used == 0 && produced == 0 {
+                break;
             }
-            out.extend_from_slice(&buf[..n]);
-            if out.len() > cap {
+            if max_output.is_some_and(|cap| out.len() + produced > cap) {
                 return Err(std::io::Error::other(OUTPUT_TOO_LARGE));
             }
+            out.extend_from_slice(&buf[..produced]);
         }
+        if finish_flush == Z_FINISH {
+            dec.finish().map_err(std::io::Error::other)?;
+        }
+        Ok(out)
     }
 
-    // Kept next to `read_capped` (the code it guards) rather than at the module
+    /// The node:zlib failure an inflate `io::Error` carries, if it is one.
+    pub fn zlib_error(error: &std::io::Error) -> Option<ZlibError> {
+        error.get_ref()?.downcast_ref::<ZlibError>().copied()
+    }
+
+    // Kept next to `inflate_all` (the code it guards) rather than at the module
     // end past the streaming and brotli code.
     #[cfg(test)]
     #[allow(clippy::items_after_test_module)]
     mod capped_tests {
-        use super::{Format, OUTPUT_TOO_LARGE, compress, decompress_capped, read_capped};
-        use std::io::Read;
-
-        /// A reader that never returns 0: `read_to_end` would allocate without
-        /// bound and never return. It counts the bytes it was asked for.
-        struct Endless {
-            byte: u8,
-            pulled: usize,
-        }
-        impl Read for Endless {
-            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                buf.fill(self.byte);
-                self.pulled += buf.len();
-                Ok(buf.len())
-            }
-        }
-
-        #[test]
-        fn read_capped_bounds_an_endless_stream() {
-            let cap = 4096;
-            let mut src = Endless {
-                byte: b' ',
-                pulled: 0,
-            };
-            // The whole point of the fix: an endless (bomb) stream is stopped
-            // at the cap, not inflated to exhaustion. A `read_to_end` regression
-            // would never return here.
-            let err = read_capped(&mut src, cap).unwrap_err();
-            assert_eq!(err.to_string(), OUTPUT_TOO_LARGE);
-            // Memory (and reads) bounded by the cap plus one buffer, not the
-            // unbounded stream.
-            assert!(
-                src.pulled <= cap + 1 + 64 * 1024,
-                "pulled {} bytes past the {cap}-byte cap",
-                src.pulled
-            );
-        }
+        use super::{
+            Format, OUTPUT_TOO_LARGE, Z_FINISH, compress, decompress_capped, unzip, unzip_capped,
+            zlib_error,
+        };
 
         #[test]
         fn decompress_capped_stops_a_gzip_bomb_at_the_cap() {
@@ -2342,23 +2994,102 @@ pub mod zlib {
             // 16 MiB; and the cap boundary is exact.
             let size = 16 * 1024 * 1024;
             let bomb = compress(&vec![b' '; size], Format::Gzip, 6).unwrap();
-            let err = decompress_capped(&bomb, Format::Gzip, Some(1024)).unwrap_err();
+            let err =
+                decompress_capped(&bomb, Format::Gzip, Some(1024), Z_FINISH, None).unwrap_err();
             assert_eq!(err.to_string(), OUTPUT_TOO_LARGE);
-            assert!(decompress_capped(&bomb, Format::Gzip, Some(size)).is_ok());
-            assert!(decompress_capped(&bomb, Format::Gzip, Some(size - 1)).is_err());
+            assert!(decompress_capped(&bomb, Format::Gzip, Some(size), Z_FINISH, None).is_ok());
+            assert!(
+                decompress_capped(&bomb, Format::Gzip, Some(size - 1), Z_FINISH, None).is_err()
+            );
+        }
+
+        #[test]
+        fn one_shot_inflate_reads_every_gzip_member_and_codes_its_errors() {
+            // #166: flate2's read::GzDecoder stopped after the first member,
+            // and every failure was an uncoded io::Error.
+            let mut two = compress(b"hello", Format::Gzip, 6).unwrap();
+            two.extend(compress(b"world", Format::Gzip, 6).unwrap());
+            assert_eq!(
+                decompress_capped(&two, Format::Gzip, None, Z_FINISH, None).unwrap(),
+                b"helloworld"
+            );
+            assert_eq!(unzip(&two).unwrap(), b"helloworld");
+            let err = decompress_capped(b"not gzip at all", Format::Gzip, None, Z_FINISH, None)
+                .unwrap_err();
+            let coded = zlib_error(&err).expect("a coded zlib error");
+            assert_eq!(
+                (coded.code, coded.errno, coded.message),
+                ("Z_DATA_ERROR", -3, "incorrect header check")
+            );
+            let packed = compress(b"hello world hello world", Format::Deflate, 6).unwrap();
+            let err =
+                decompress_capped(&packed[..8], Format::Deflate, None, Z_FINISH, None).unwrap_err();
+            let coded = zlib_error(&err).expect("a coded zlib error");
+            assert_eq!((coded.code, coded.errno), ("Z_BUF_ERROR", -5));
+        }
+
+        #[test]
+        fn a_finishing_flush_other_than_z_finish_returns_what_decoded() {
+            // Node's `finishFlush: Z_SYNC_FLUSH` (axios, node-fetch): a stream
+            // cut short is not an error, the result is what decoded. Every
+            // other flush value is as lenient; only Z_FINISH checks the end.
+            let plain: Vec<u8> = (0..4000u32).flat_map(|i| i.to_le_bytes()).collect();
+            for format in [Format::Gzip, Format::Deflate, Format::DeflateRaw] {
+                let packed = compress(&plain, format, 6).unwrap();
+                let cut = &packed[..packed.len() / 2];
+                for flush in [0, 1, 2, 3, 5] {
+                    let out = decompress_capped(cut, format, None, flush, None).unwrap();
+                    assert!(
+                        !out.is_empty() && plain.starts_with(&out),
+                        "{format:?} {flush}"
+                    );
+                    let whole = decompress_capped(&packed, format, None, flush, None).unwrap();
+                    assert_eq!(whole, plain, "{format:?} {flush}");
+                }
+                let err = decompress_capped(cut, format, None, Z_FINISH, None).unwrap_err();
+                assert_eq!(zlib_error(&err).map(|e| e.code), Some("Z_BUF_ERROR"));
+            }
+            // A decode error is still one under a lenient flush.
+            let junk = [0xffu8, 0x00, 0x01, 0x02, 0x03, 0x04];
+            assert!(decompress_capped(&junk, Format::Gzip, None, 2, None).is_err());
+            assert!(decompress_capped(&junk, Format::Deflate, None, 2, None).is_err());
+            let gz = compress(&plain, Format::Gzip, 6).unwrap();
+            assert_eq!(
+                unzip_capped(&gz[..gz.len() - 4], None, 2, None).unwrap(),
+                plain
+            );
+            assert!(unzip_capped(&[], None, 2, None).unwrap().is_empty());
+            assert!(unzip_capped(&[], None, Z_FINISH, None).is_err());
+        }
+    }
+
+    /// The deflater for node's `dictionary` option, if it applies: deflate
+    /// and deflateRaw with a non-empty dictionary (node_zlib.cc's
+    /// SetDictionary; gzip ignores the option, and an empty one is none).
+    fn dict_deflate(format: Format, level: i32, dictionary: Option<&[u8]>) -> Option<DictDeflate> {
+        let dictionary = dictionary.filter(|d| !d.is_empty())?;
+        match format {
+            Format::Gzip => None,
+            Format::Deflate => Some(DictDeflate::new(level, true, dictionary)),
+            Format::DeflateRaw => Some(DictDeflate::new(level, false, dictionary)),
         }
     }
 
     /// `compress` with node's `maxOutputLength`, which node applies to the
-    /// encoders as well. Checked on the finished buffer: compressed output is
-    /// bounded by the input, so there is no bomb to stop early.
+    /// encoders as well, and its `dictionary` (see [`DictDeflate`]). The cap
+    /// is checked on the finished buffer: compressed output is bounded by the
+    /// input, so there is no bomb to stop early.
     pub fn compress_capped(
         bytes: &[u8],
         format: Format,
         level: i32,
         max_output: Option<usize>,
+        dictionary: Option<&[u8]>,
     ) -> std::io::Result<Vec<u8>> {
-        let out = compress(bytes, format, level)?;
+        let out = match dict_deflate(format, level, dictionary) {
+            Some(mut deflater) => deflater.deflate_vec(bytes, Z_FINISH),
+            None => compress(bytes, format, level)?,
+        };
         match max_output {
             Some(cap) if out.len() > cap => Err(std::io::Error::other(OUTPUT_TOO_LARGE)),
             _ => Ok(out),
@@ -2367,16 +3098,18 @@ pub mod zlib {
 
     /// Node's unzip*: auto-detect gzip (1f 8b magic) vs zlib-wrapped.
     pub fn unzip(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
-        unzip_capped(bytes, None)
+        unzip_capped(bytes, None, Z_FINISH, None)
     }
 
-    /// `unzip` with node's `maxOutputLength`; see `decompress_capped`.
-    pub fn unzip_capped(bytes: &[u8], max_output: Option<usize>) -> std::io::Result<Vec<u8>> {
-        if bytes.starts_with(&[0x1f, 0x8b]) {
-            decompress_capped(bytes, Format::Gzip, max_output)
-        } else {
-            decompress_capped(bytes, Format::Deflate, max_output)
-        }
+    /// `unzip` with node's `maxOutputLength`, `finishFlush` and
+    /// `dictionary`; see `decompress_capped`.
+    pub fn unzip_capped(
+        bytes: &[u8],
+        max_output: Option<usize>,
+        finish_flush: i32,
+        dictionary: Option<&[u8]>,
+    ) -> std::io::Result<Vec<u8>> {
+        inflate_all(bytes, Wrap::Auto, max_output, finish_flush, dictionary)
     }
 
     // ----------------------------------------------------------------
@@ -2388,19 +3121,16 @@ pub mod zlib {
     // incremental: compressed bytes are emitted per-chunk with no need
     // to buffer the full input.
     //
-    // For decompression we likewise use the write-based decoders
-    // (GzDecoder, ZlibDecoder, DeflateDecoder). Each decoder accepts
-    // a chunk, runs it through the inflate state machine, and appends
-    // decompressed bytes to the inner Vec<u8>. We drain via mem::take
-    // after each write so memory stays bounded (~64 kB per stream plus
-    // the decompressed output for that chunk).
+    // Decompression is NodeInflate (crate::inflate): each chunk runs through
+    // the inflate state machine and comes back as that chunk's output, with
+    // ~50 KB of state per stream (the 32 KiB window, one 16 KiB step and
+    // miniz's decoder).
     //
-    // The "unzip" auto-detect variant peeks at the first two bytes on
-    // the initial write_chunk call to resolve the format, then creates
-    // the appropriate decoder.
+    // The "unzip" auto-detect variant resolves the format from the first
+    // two bytes of the STREAM, however the writes carve it up.
     //
-    // Send requirement: all flate2 encoder/decoder types are Send, and
-    // our wrappers hold no thread-local state.
+    // Send requirement: all flate2 encoder types and NodeInflate are Send,
+    // and our wrappers hold no thread-local state.
     // ----------------------------------------------------------------
 
     /// Wraps any of the three flate2 write-encoders behind a uniform
@@ -2415,10 +3145,18 @@ pub mod zlib {
         Gzip(flate2::write::GzEncoder<Vec<u8>>),
         Deflate(flate2::write::ZlibEncoder<Vec<u8>>),
         DeflateRaw(flate2::write::DeflateEncoder<Vec<u8>>),
+        /// deflate or deflateRaw with a dictionary.
+        Dict(Box<DictDeflate>),
     }
 
     impl StreamCompressor {
-        pub fn new(format: Format, level: i32) -> Self {
+        /// `dictionary` is node's option (see [`DictDeflate`]).
+        pub fn new(format: Format, level: i32, dictionary: Option<&[u8]>) -> Self {
+            if let Some(deflater) = dict_deflate(format, level, dictionary) {
+                return Self {
+                    inner: CompressorInner::Dict(Box::new(deflater)),
+                };
+            }
             let level = if (0..=9).contains(&level) {
                 Compression::new(level as u32)
             } else {
@@ -2456,6 +3194,7 @@ pub mod zlib {
                     enc.write_all(chunk)?;
                     Ok(std::mem::take(enc.get_mut()))
                 }
+                CompressorInner::Dict(enc) => Ok(enc.deflate_vec(chunk, 0)),
             }
         }
 
@@ -2467,6 +3206,7 @@ pub mod zlib {
                 CompressorInner::Gzip(enc) => enc.finish(),
                 CompressorInner::Deflate(enc) => enc.finish(),
                 CompressorInner::DeflateRaw(enc) => enc.finish(),
+                CompressorInner::Dict(mut enc) => Ok(enc.deflate_vec(&[], Z_FINISH)),
             }
         }
     }
@@ -2481,108 +3221,79 @@ pub mod zlib {
     // ----------------------------------------------------------------
     // Truly incremental decompressor -- slice A.
     //
-    // Uses flate2's write-based decoders (GzDecoder, ZlibDecoder,
-    // DeflateDecoder) so each write_chunk call invokes the inflate state
-    // machine immediately and returns whatever bytes were decoded, bounded
-    // by the chunk size. The full compressed stream never needs to live
-    // in memory simultaneously.
+    // Each write_chunk call runs the inflate state machine (NodeInflate)
+    // over the chunk at once and returns whatever bytes it decoded. The full
+    // compressed stream never needs to live in memory simultaneously.
     //
-    // The `Unzip` variant defers decoder creation until the first
-    // non-empty write_chunk, at which point it peeks the magic bytes to
-    // choose Gzip or Deflate.
+    // Unzip decides gzip or zlib on the stream's first two bytes however the
+    // writes split them (#195): NodeInflate reads them as one header, as
+    // zlib's inflate does (NEEDBITS(16)).
     // ----------------------------------------------------------------
 
-    /// Truly incremental flate2 decompressor: memory usage bounded by
-    /// ~64 kB scratch per stream regardless of input size.
+    /// Truly incremental decompressor: ~50 KB of state per stream regardless
+    /// of input size. Errors are node's (an `io::Error` wrapping a
+    /// [`ZlibError`]); see [`NodeInflate`] for what each format accepts.
     pub struct StreamDecompressor {
-        inner: DecompressorInner,
-    }
-
-    enum DecompressorInner {
-        Gzip(flate2::write::GzDecoder<Vec<u8>>),
-        Deflate(flate2::write::ZlibDecoder<Vec<u8>>),
-        DeflateRaw(flate2::write::DeflateDecoder<Vec<u8>>),
-        /// Pending auto-detect: first chunk resolves to Gzip or Deflate.
-        Unzip,
+        inner: Box<NodeInflate>,
     }
 
     impl StreamDecompressor {
-        pub fn new_gzip() -> Self {
+        /// An inflate stream reading `wrap`, with node's `dictionary` option;
+        /// see [`NodeInflate::with_dictionary`].
+        pub fn new(wrap: Wrap, dictionary: Option<&[u8]>) -> Self {
             Self {
-                inner: DecompressorInner::Gzip(flate2::write::GzDecoder::new(Vec::new())),
-            }
-        }
-        pub fn new_deflate() -> Self {
-            Self {
-                inner: DecompressorInner::Deflate(flate2::write::ZlibDecoder::new(Vec::new())),
-            }
-        }
-        pub fn new_deflate_raw() -> Self {
-            Self {
-                inner: DecompressorInner::DeflateRaw(
-                    flate2::write::DeflateDecoder::new(Vec::new()),
-                ),
+                inner: Box::new(NodeInflate::with_dictionary(wrap, dictionary)),
             }
         }
         pub fn new_unzip() -> Self {
-            Self {
-                inner: DecompressorInner::Unzip,
-            }
+            Self::new(Wrap::Auto, None)
         }
 
         /// Feed one chunk of compressed data. Returns the decompressed bytes
-        /// produced by this chunk (may be smaller than expected if the
-        /// deflate block spans multiple chunks -- the remaining bytes arrive
-        /// on subsequent calls). Memory usage stays bounded: we drain the
-        /// inner Vec via mem::take after each write.
+        /// it made decodable (a deflate block that spans chunks finishes
+        /// arriving on later calls). Input after the end of the stream is
+        /// dropped, as node drops it; for gzip, a following member is
+        /// decoded as part of the same stream.
         #[inline]
         pub fn write_chunk(&mut self, chunk: &[u8]) -> std::io::Result<Vec<u8>> {
-            if chunk.is_empty() {
-                return Ok(Vec::new());
-            }
-            // Resolve auto-detect on first non-empty chunk.
-            if matches!(self.inner, DecompressorInner::Unzip) {
-                if chunk.starts_with(&[0x1f, 0x8b]) {
-                    self.inner = DecompressorInner::Gzip(flate2::write::GzDecoder::new(Vec::new()));
-                } else {
-                    self.inner =
-                        DecompressorInner::Deflate(flate2::write::ZlibDecoder::new(Vec::new()));
+            let mut out = Vec::new();
+            let mut buf = vec![0u8; crate::inflate::STEP_OUT];
+            let mut input = chunk;
+            loop {
+                let (used, produced) = self
+                    .inner
+                    .step(input, &mut buf)
+                    .map_err(std::io::Error::other)?;
+                input = &input[used..];
+                if used == 0 && produced == 0 {
+                    return Ok(out);
                 }
-            }
-            match &mut self.inner {
-                DecompressorInner::Gzip(dec) => {
-                    dec.write_all(chunk)?;
-                    Ok(std::mem::take(dec.get_mut()))
-                }
-                DecompressorInner::Deflate(dec) => {
-                    dec.write_all(chunk)?;
-                    Ok(std::mem::take(dec.get_mut()))
-                }
-                DecompressorInner::DeflateRaw(dec) => {
-                    dec.write_all(chunk)?;
-                    Ok(std::mem::take(dec.get_mut()))
-                }
-                DecompressorInner::Unzip => unreachable!("resolved above"),
+                out.extend_from_slice(&buf[..produced]);
             }
         }
 
-        /// Finalize: flush the inflate state and return any remaining
-        /// decompressed bytes. For gzip this verifies the CRC/ISIZE trailer.
+        /// Finalize under the default finishing flush, Z_FINISH; see
+        /// [`Self::finish_with`].
         pub fn finish(self) -> std::io::Result<Vec<u8>> {
-            match self.inner {
-                DecompressorInner::Gzip(dec) => dec.finish(),
-                DecompressorInner::Deflate(dec) => dec.finish(),
-                DecompressorInner::DeflateRaw(dec) => dec.finish(),
-                // No data was ever written (empty stream).
-                DecompressorInner::Unzip => Ok(Vec::new()),
+            self.finish_with(Z_FINISH)
+        }
+
+        /// Finalize at `end()` under node's `finishFlush`. Every write's
+        /// output was already returned, so this only checks, under Z_FINISH,
+        /// that the stream is complete -- input that ended inside it is
+        /// Z_BUF_ERROR "unexpected end of file", an empty stream included.
+        /// Under any other flush the stream ends with what decoded.
+        pub fn finish_with(self, finish_flush: i32) -> std::io::Result<Vec<u8>> {
+            if finish_flush == Z_FINISH {
+                self.inner.finish().map_err(std::io::Error::other)?;
             }
+            Ok(Vec::new())
         }
     }
 
-    // `StreamDecompressor` is `Send` by auto-derivation: `DecompressorInner`
-    // holds only flate2 write-decoders over `Vec<u8>` (all `Send`) plus the unit
-    // `Unzip` variant. No manual `unsafe impl` -- see the note on
-    // `StreamCompressor` above.
+    // `StreamDecompressor` is `Send` by auto-derivation: `NodeInflate` holds
+    // only owned buffers and miniz/flate2 state, all `Send`. No manual
+    // `unsafe impl` -- see the note on `StreamCompressor` above.
 
     // Compile-time proof of both notes. A manual `unsafe impl Send` asserts
     // `Send` forever; this instead FAILS THE BUILD the day an inner type stops
@@ -2592,6 +3303,74 @@ pub mod zlib {
         assert_send::<StreamCompressor>();
         assert_send::<StreamDecompressor>();
     };
+
+    #[cfg(test)]
+    mod unzip_stream_tests {
+        use super::{Format, StreamDecompressor, compress};
+
+        /// Feed `bytes` to a fresh unzip stream `size` bytes per write.
+        fn unzip_in_chunks(bytes: &[u8], size: usize) -> std::io::Result<Vec<u8>> {
+            let mut dec = StreamDecompressor::new_unzip();
+            let mut out = Vec::new();
+            for chunk in bytes.chunks(size) {
+                out.extend(dec.write_chunk(chunk)?);
+            }
+            out.extend(dec.finish()?);
+            Ok(out)
+        }
+
+        #[test]
+        fn unzip_detects_the_format_however_the_first_bytes_are_split() {
+            // #195: the format was chosen from the first WRITE, and a one-byte
+            // write cannot carry both gzip magic bytes, so a gzip stream fed a
+            // byte at a time was decoded as zlib and failed.
+            let plain = vec![b'x'; 5000];
+            for format in [Format::Gzip, Format::Deflate] {
+                let packed = compress(&plain, format, 6).unwrap();
+                for size in [1, 2, 3, 16, packed.len()] {
+                    let out = unzip_in_chunks(&packed, size)
+                        .unwrap_or_else(|e| panic!("{format:?} in {size}-byte writes: {e}"));
+                    assert_eq!(out, plain, "{format:?} in {size}-byte writes");
+                }
+            }
+        }
+
+        #[test]
+        fn unzip_skips_empty_writes_while_undecided() {
+            let plain = b"hello".to_vec();
+            let packed = compress(&plain, Format::Gzip, 6).unwrap();
+            let mut dec = StreamDecompressor::new_unzip();
+            let mut out = Vec::new();
+            out.extend(dec.write_chunk(&[]).unwrap());
+            out.extend(dec.write_chunk(&packed[..1]).unwrap());
+            out.extend(dec.write_chunk(&[]).unwrap());
+            out.extend(dec.write_chunk(&packed[1..]).unwrap());
+            out.extend(dec.finish().unwrap());
+            assert_eq!(out, plain);
+        }
+
+        #[test]
+        fn unzip_with_no_input_is_unexpected_end_of_file() {
+            // Node (v22.22.2): createUnzip().end() with no data, or only empty
+            // writes, errors Z_BUF_ERROR "unexpected end of file" -- as every
+            // inflate stream does.
+            let err = unzip_in_chunks(&[], 1).unwrap_err();
+            assert_eq!(
+                super::zlib_error(&err),
+                Some(super::ZlibError::UNEXPECTED_EOF)
+            );
+        }
+
+        #[test]
+        fn unzip_ended_one_byte_in_does_not_drop_the_byte_silently() {
+            // The held byte must reach a decoder at end of stream. A lone gzip
+            // magic byte is a truncated gzip stream, which the gzip decoder
+            // refuses; before the fix this case could not arise (the byte was
+            // written to a zlib decoder at once), and holding it must not turn
+            // it into a clean empty result.
+            assert!(unzip_in_chunks(&[0x1f], 1).is_err());
+        }
+    }
 }
 
 // ----------------------------------------------------------------
@@ -2728,13 +3507,35 @@ pub mod ops {
         OpOutcome::Done
     }
 
+    /// A failed path operation, naming the path as node does (on Windows the
+    /// resolved one, see `fs_error_path`).
     fn node_fail(error: std::io::Error, syscall: &str, path: &str) -> OpOutcome {
+        node_fail_as_passed(error, syscall, &super::fs_error_path(path))
+    }
+
+    /// `node_fail` naming `path` exactly as given: for mkdtemp, whose
+    /// template node does not resolve.
+    fn node_fail_as_passed(error: std::io::Error, syscall: &str, path: &str) -> OpOutcome {
         let code = super::node_error_code(&error);
         OpOutcome::node_failed_at(
             code,
             super::node_error_message(code, syscall, path, &error),
             syscall,
             Some(path),
+            super::node_errno(code, &error),
+        )
+    }
+
+    /// A failed two-path operation: node names both, `'path' -> 'dest'`, and
+    /// sets `dest`. The caller passes them as they are to be shown.
+    fn node_fail_dest(error: std::io::Error, syscall: &str, path: &str, dest: &str) -> OpOutcome {
+        let code = super::node_error_code(&error);
+        OpOutcome::node_failed_dest(
+            code,
+            super::node_error_message_dest(code, syscall, path, dest, &error),
+            syscall,
+            path,
+            dest,
             super::node_errno(code, &error),
         )
     }
@@ -2748,11 +3549,12 @@ pub mod ops {
         path: &str,
     ) -> OpOutcome {
         let failure = super::fs_error_at(site, syscall, path, &error);
+        let shown = super::fs_error_path(path);
         OpOutcome::node_failed_at(
             failure.code,
-            super::fs_error_message(failure, path, &error),
+            super::fs_error_message(failure, &shown, &error),
             failure.syscall,
-            failure.has_path.then_some(path),
+            failure.has_path.then_some(&*shown),
             super::node_errno(failure.code, &error),
         )
     }
@@ -2781,6 +3583,22 @@ pub mod ops {
     ///
     /// These used to pass the HANDLE NUMBER as the path, so a failed stream
     /// read reported `... read '64'` where node has no path at all.
+    /// A failed fd operation other than a read or write (fstat, fsync,
+    /// ftruncate, fchmod, fchown, futimes): node's code for the error as it is,
+    /// and no path -- node's message ends at the syscall. These used to go
+    /// through `node_fail` with an empty path, which put a `path: ''` on the
+    /// error and `, fsync ''` at the end of its message.
+    fn node_fail_fd_op(error: std::io::Error, syscall: &str) -> OpOutcome {
+        let code = super::node_error_code(&error);
+        OpOutcome::node_failed_at(
+            code,
+            super::node_error_message_fd(code, syscall, &error),
+            syscall,
+            None,
+            super::node_errno(code, &error),
+        )
+    }
+
     fn node_fail_fd(error: std::io::Error, syscall: &str) -> OpOutcome {
         let code = super::fd_error_code(&error);
         OpOutcome::node_failed_at(
@@ -3313,19 +4131,73 @@ pub mod ops {
 
     /// fstat of an already-open descriptor, off the loop thread.
     ///
-    /// Takes an OWNED (try_clone'd) handle rather than the registry so the
+    /// Takes the descriptor's shared handle rather than the registry, so the
     /// caller never holds the file-registry lock across the blocking read.
-    pub async fn fs_fstat(file: std::fs::File) -> OpOutcome {
-        let result = tokio::task::spawn_blocking(move || {
-            file.metadata()
-                .map(|meta| stat_to_json(&meta, StatSource::File(&file)))
-        })
-        .await;
+    pub async fn fs_fstat(file: super::OpenFile) -> OpOutcome {
+        let result = tokio::task::spawn_blocking(move || fstat_to_json(&file)).await;
         match result {
             Ok(Ok(json)) => OpOutcome::Json(json),
-            Ok(Err(e)) => node_fail(e, "fstat", ""),
-            Err(e) => node_fail(std::io::Error::other(e.to_string()), "fstat", ""),
+            Ok(Err(e)) => node_fail_fd_op(e, "fstat"),
+            Err(e) => node_fail_fd_op(std::io::Error::other(e.to_string()), "fstat"),
         }
+    }
+
+    /// The stat payload of an open descriptor, as libuv's fstat builds it --
+    /// shared by the sync and async fstat.
+    ///
+    /// On Windows a descriptor need not be a disk file: 0-2 are often a pipe,
+    /// the console or NUL, which have no file information to read (asking
+    /// failed, and NUL's answer was EISDIR). libuv's `fs__fstat_handle` /
+    /// `fs__stat_assign_statbuf_null` (node v22.22.2) give them fixed shapes,
+    /// reproduced here: a pipe is S_IFIFO with rdev FILE_DEVICE_NAMED_PIPE << 16,
+    /// the console S_IFCHR with FILE_DEVICE_CONSOLE << 16 (both nlink 1 and the
+    /// handle as ino), and any other character device NUL's S_IFCHR | 0o666,
+    /// blksize 4096, rdev FILE_DEVICE_NULL << 16 -- libuv asks the device type
+    /// and gives that shape to NUL alone; a serial port, the one other
+    /// character device a process plausibly holds, gets NUL's here. Every other
+    /// field and every time is 0.
+    pub fn fstat_to_json(file: &std::fs::File) -> std::io::Result<String> {
+        #[cfg(windows)]
+        {
+            use std::io::IsTerminal;
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_PIPE};
+            // FILE_DEVICE_* from winioctl.h.
+            const FILE_DEVICE_CONSOLE: u64 = 0x50;
+            const FILE_DEVICE_NAMED_PIPE: u64 = 0x11;
+            const FILE_DEVICE_NULL: u64 = 0x15;
+            let handle = file.as_raw_handle();
+            let device = match crate::child_win::file_type(handle) {
+                FILE_TYPE_CHAR if file.is_terminal() => {
+                    Some((0o020000, FILE_DEVICE_CONSOLE, handle as u64, 0))
+                }
+                FILE_TYPE_CHAR => Some((0o020666, FILE_DEVICE_NULL, 0, 4096)),
+                FILE_TYPE_PIPE => Some((0o010000, FILE_DEVICE_NAMED_PIPE, handle as u64, 0)),
+                _ => None,
+            };
+            if let Some((mode, device_type, ino, blksize)) = device {
+                return Ok(serde_json::json!({
+                    "kind": "file",
+                    "size": 0,
+                    "mtimeMs": 0,
+                    "atimeMs": 0,
+                    "ctimeMs": 0,
+                    "birthtimeMs": 0,
+                    "mode": mode,
+                    "dev": 0,
+                    "ino": ino,
+                    "nlink": 1,
+                    "uid": 0,
+                    "gid": 0,
+                    "rdev": device_type << 16,
+                    "blksize": blksize,
+                    "blocks": 0,
+                })
+                .to_string());
+            }
+        }
+        file.metadata()
+            .map(|meta| stat_to_json(&meta, StatSource::File(file)))
     }
 
     pub async fn fs_statfs(path: String) -> OpOutcome {
@@ -3387,14 +4259,20 @@ pub mod ops {
     pub async fn fs_rename(from: String, to: String) -> OpOutcome {
         match tokio::fs::rename(&from, &to).await {
             Ok(()) => OpOutcome::Done,
-            Err(e) => node_fail(e, "rename", &from),
+            Err(e) => {
+                let (path, dest) = (super::fs_error_path(&from), super::fs_error_path(&to));
+                node_fail_dest(e, "rename", &path, &dest)
+            }
         }
     }
 
     pub async fn fs_copy_file(from: String, to: String) -> OpOutcome {
         match tokio::fs::copy(&from, &to).await {
             Ok(_) => OpOutcome::Done,
-            Err(e) => node_fail(e, "copyfile", &from),
+            Err(e) => {
+                let (path, dest) = (super::fs_error_path(&from), super::fs_error_path(&to));
+                node_fail_dest(e, "copyfile", &path, &dest)
+            }
         }
     }
 
@@ -3402,7 +4280,8 @@ pub mod ops {
         let result = tokio::task::spawn_blocking(move || match super::check_access(&path, mode) {
             Ok(()) => OpOutcome::Done,
             Err((code, message, errno)) => {
-                OpOutcome::node_failed_at(code, message, "access", Some(path.as_str()), errno)
+                let shown = super::fs_error_path(&path);
+                OpOutcome::node_failed_at(code, message, "access", Some(&*shown), errno)
             }
         })
         .await;
@@ -3439,7 +4318,7 @@ pub mod ops {
     pub async fn fs_mkdtemp(dir: std::path::PathBuf, prefix: String) -> OpOutcome {
         match tokio::fs::create_dir(&dir).await {
             Ok(()) => OpOutcome::Text(super::strip_unc_prefix(&dir)),
-            Err(e) => node_fail(e, "mkdtemp", &prefix),
+            Err(e) => node_fail_as_passed(e, "mkdtemp", &prefix),
         }
     }
 
@@ -3460,7 +4339,9 @@ pub mod ops {
         let result = tokio::fs::symlink(&target, &path).await;
         match result {
             Ok(()) => OpOutcome::Done,
-            Err(e) => node_fail(e, "symlink", &path),
+            // The target is stored as written, so node reports it so; the
+            // link's own path is resolved like any other.
+            Err(e) => node_fail_dest(e, "symlink", &target, &super::fs_error_path(&path)),
         }
     }
 
@@ -3474,7 +4355,10 @@ pub mod ops {
     pub async fn fs_link(existing: String, new_path: String) -> OpOutcome {
         match tokio::fs::hard_link(&existing, &new_path).await {
             Ok(()) => OpOutcome::Done,
-            Err(e) => node_fail(e, "link", &new_path),
+            Err(e) => {
+                let path = super::fs_error_path(&existing);
+                node_fail_dest(e, "link", &path, &super::fs_error_path(&new_path))
+            }
         }
     }
 
@@ -3502,16 +4386,6 @@ pub mod ops {
                 }
                 Err(e) => node_fail(e, "chmod", &path),
             }
-        }
-    }
-
-    pub async fn fs_truncate(path: String, len: u64) -> OpOutcome {
-        match tokio::fs::OpenOptions::new().write(true).open(&path).await {
-            Ok(f) => match f.set_len(len).await {
-                Ok(()) => OpOutcome::Done,
-                Err(e) => node_fail(e, "ftruncate", &path),
-            },
-            Err(e) => node_fail(e, "open", &path),
         }
     }
 
@@ -3639,7 +4513,7 @@ pub mod ops {
     /// `fsync(2)` / `fdatasync(2)`. std spells them `sync_all` and `sync_data`
     /// and handles the platform mapping (`FlushFileBuffers` on Windows, where
     /// there is no data-only variant and both collapse to the same call).
-    pub async fn fs_fsync(file: std::fs::File, data_only: bool) -> OpOutcome {
+    pub async fn fs_fsync(file: super::OpenFile, data_only: bool) -> OpOutcome {
         let syscall = if data_only { "fdatasync" } else { "fsync" };
         let result = tokio::task::spawn_blocking(move || {
             if data_only {
@@ -3651,45 +4525,45 @@ pub mod ops {
         .await;
         match result {
             Ok(Ok(())) => OpOutcome::Done,
-            Ok(Err(e)) => node_fail(e, syscall, ""),
-            Err(e) => node_fail(std::io::Error::other(e.to_string()), syscall, ""),
+            Ok(Err(e)) => node_fail_fd_op(e, syscall),
+            Err(e) => node_fail_fd_op(std::io::Error::other(e.to_string()), syscall),
         }
     }
 
-    pub async fn fs_ftruncate(file: std::fs::File, len: u64) -> OpOutcome {
+    pub async fn fs_ftruncate(file: super::OpenFile, len: u64) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || file.set_len(len)).await;
         match result {
             Ok(Ok(())) => OpOutcome::Done,
-            Ok(Err(e)) => node_fail(e, "ftruncate", ""),
-            Err(e) => node_fail(std::io::Error::other(e.to_string()), "ftruncate", ""),
+            Ok(Err(e)) => node_fail_fd_op(e, "ftruncate"),
+            Err(e) => node_fail_fd_op(std::io::Error::other(e.to_string()), "ftruncate"),
         }
     }
 
-    pub async fn fs_fchmod(file: std::fs::File, mode: u32) -> OpOutcome {
+    pub async fn fs_fchmod(file: super::OpenFile, mode: u32) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || fchmod_file(&file, mode)).await;
         match result {
             Ok(Ok(())) => OpOutcome::Done,
-            Ok(Err(e)) => node_fail(e, "fchmod", ""),
-            Err(e) => node_fail(std::io::Error::other(e.to_string()), "fchmod", ""),
+            Ok(Err(e)) => node_fail_fd_op(e, "fchmod"),
+            Err(e) => node_fail_fd_op(std::io::Error::other(e.to_string()), "fchmod"),
         }
     }
 
-    pub async fn fs_fchown(file: std::fs::File, uid: u32, gid: u32) -> OpOutcome {
+    pub async fn fs_fchown(file: super::OpenFile, uid: u32, gid: u32) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || fchown_file(&file, uid, gid)).await;
         match result {
             Ok(Ok(())) => OpOutcome::Done,
-            Ok(Err(e)) => node_fail(e, "fchown", ""),
-            Err(e) => node_fail(std::io::Error::other(e.to_string()), "fchown", ""),
+            Ok(Err(e)) => node_fail_fd_op(e, "fchown"),
+            Err(e) => node_fail_fd_op(std::io::Error::other(e.to_string()), "fchown"),
         }
     }
 
-    pub async fn fs_futimes(file: std::fs::File, atime_ms: f64, mtime_ms: f64) -> OpOutcome {
+    pub async fn fs_futimes(file: super::OpenFile, atime_ms: f64, mtime_ms: f64) -> OpOutcome {
         let result =
             tokio::task::spawn_blocking(move || futimes_file(&file, atime_ms, mtime_ms)).await;
         match result {
             Ok(Ok(())) => OpOutcome::Done,
-            Ok(Err(e)) => node_fail(e, "futime", ""),
-            Err(e) => node_fail(std::io::Error::other(e.to_string()), "futime", ""),
+            Ok(Err(e)) => node_fail_fd_op(e, "futime"),
+            Err(e) => node_fail_fd_op(std::io::Error::other(e.to_string()), "futime"),
         }
     }
 
@@ -3926,20 +4800,22 @@ pub mod ops {
     /// The fetch op and its wire request: oam's own transport (#143). The
     /// body reader is [`fetch_body_read`].
     pub use crate::http_client::send::{
-        FetchContinuations, FetchRequest, RedirectMode, fetch, fetch_abandon, fetch_continue,
-        fetch_supply,
+        FetchCancel, FetchCancels, FetchContinuations, FetchRequest, RedirectMode, fetch,
+        fetch_abandon, fetch_cancel, fetch_continue, fetch_supply,
     };
 
     /// zlibStreamCreate: allocate an incremental compressor or decompressor.
     /// Returns Json {handle} on success. compress=true for encoding,
     /// false for decoding. format must be "gzip", "deflate", "deflateRaw",
-    /// "unzip" (decompress only), or "brotli".
+    /// "unzip" (decompress only), or "brotli". `dictionary` is node's option
+    /// of that name (brotli has none).
     pub async fn zlib_stream_create(
         streams: super::ZlibRegistry,
         ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
         format: String,
         level: i32,
         compress: bool,
+        dictionary: Option<Vec<u8>>,
     ) -> OpOutcome {
         // Stream allocation is cheap: do it inline (no IO).
         let stream = if format == "brotli" {
@@ -3953,16 +4829,23 @@ pub mod ops {
             let Some(fmt) = super::zlib::Format::parse(&format) else {
                 return OpOutcome::Failed(format!("zlib stream: unknown format '{format}'"));
             };
-            super::ZlibStream::Compress(super::zlib::StreamCompressor::new(fmt, level))
+            super::ZlibStream::Compress(super::zlib::StreamCompressor::new(
+                fmt,
+                level,
+                dictionary.as_deref(),
+            ))
         } else {
-            let dec = match format.as_str() {
-                "gzip" => super::zlib::StreamDecompressor::new_gzip(),
-                "deflate" => super::zlib::StreamDecompressor::new_deflate(),
-                "deflateRaw" => super::zlib::StreamDecompressor::new_deflate_raw(),
-                "unzip" => super::zlib::StreamDecompressor::new_unzip(),
+            let wrap = match format.as_str() {
+                "gzip" => super::zlib::Wrap::Gzip,
+                "deflate" => super::zlib::Wrap::Zlib,
+                "deflateRaw" => super::zlib::Wrap::Raw,
+                "unzip" => super::zlib::Wrap::Auto,
                 _ => return OpOutcome::Failed(format!("zlib stream: unknown format '{format}'")),
             };
-            super::ZlibStream::Decompress(dec)
+            super::ZlibStream::Decompress(super::zlib::StreamDecompressor::new(
+                wrap,
+                dictionary.as_deref(),
+            ))
         };
         let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         streams
@@ -3984,30 +4867,35 @@ pub mod ops {
         let result = tokio::task::spawn_blocking(move || {
             let mut guard = streams.lock().unwrap_or_else(|e| e.into_inner());
             let Some(stream) = guard.get_mut(&handle) else {
-                return Err(format!("zlib stream: handle {handle} not found"));
+                return Err(Box::new(OpOutcome::Failed(format!(
+                    "zlib stream: handle {handle} not found"
+                ))));
             };
+            let failed = |context: &str, e| Box::new(OpOutcome::Failed(format!("{context}: {e}")));
             match stream {
                 super::ZlibStream::Compress(enc) => enc
                     .write_chunk(&chunk)
-                    .map_err(|e| format!("zlib stream write: {e}")),
+                    .map_err(|e| failed("zlib stream write", e)),
                 super::ZlibStream::Decompress(dec) => dec
                     .write_chunk(&chunk)
-                    .map_err(|e| format!("zlib stream write: {e}")),
+                    .map_err(|e| Box::new(zlib_decode_failed("zlib stream write", e))),
                 super::ZlibStream::BrotliCompress(enc) => enc
                     .write_chunk(&chunk)
-                    .map_err(|e| format!("brotli stream write: {e}")),
+                    .map_err(|e| failed("brotli stream write", e)),
                 super::ZlibStream::BrotliDecompress(dec) => dec
                     .write_chunk(&chunk)
-                    .map_err(|e| format!("brotli stream write: {e}")),
-                super::ZlibStream::HandleCompress(_) | super::ZlibStream::HandleDecompress(_) => {
-                    Err("zlib handle: use zlibHandleWriteSync, not zlibStreamWrite".into())
-                }
+                    .map_err(|e| failed("brotli stream write", e)),
+                super::ZlibStream::HandleCompress(_)
+                | super::ZlibStream::HandleDictCompress(_)
+                | super::ZlibStream::HandleDecompress(_) => Err(Box::new(OpOutcome::Failed(
+                    "zlib handle: use zlibHandleWriteSync, not zlibStreamWrite".into(),
+                ))),
             }
         })
         .await;
         match result {
             Ok(Ok(bytes)) => OpOutcome::Bytes(bytes),
-            Ok(Err(msg)) => OpOutcome::Failed(msg),
+            Ok(Err(failure)) => *failure,
             Err(e) => OpOutcome::Failed(format!("zlib stream write task: {e}")),
         }
     }
@@ -4015,39 +4903,69 @@ pub mod ops {
     /// zlibStreamFlush: finalize and remove the stream. Returns the tail
     /// bytes. For compressors, this emits the format trailer (CRC etc.).
     /// For decompressors, this finalizes the inflate/brotli state machine
-    /// and returns any remaining output bytes.
-    pub async fn zlib_stream_flush(streams: super::ZlibRegistry, handle: u64) -> OpOutcome {
+    /// and returns any remaining output bytes. `finish_flush` is node's
+    /// `finishFlush` for an inflate stream (only Z_FINISH requires the stream
+    /// to be complete); the deflaters always finish the stream.
+    pub async fn zlib_stream_flush(
+        streams: super::ZlibRegistry,
+        handle: u64,
+        finish_flush: i32,
+    ) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || {
             let stream = streams
                 .lock()
                 .expect("zlib stream registry lock")
                 .remove(&handle);
             let Some(stream) = stream else {
-                return Err(format!("zlib stream: handle {handle} not found"));
+                return Err(Box::new(OpOutcome::Failed(format!(
+                    "zlib stream: handle {handle} not found"
+                ))));
             };
+            let failed = |context: &str, e| Box::new(OpOutcome::Failed(format!("{context}: {e}")));
             match stream {
                 super::ZlibStream::Compress(enc) => {
-                    enc.finish().map_err(|e| format!("zlib stream flush: {e}"))
+                    enc.finish().map_err(|e| failed("zlib stream flush", e))
                 }
-                super::ZlibStream::Decompress(dec) => {
-                    dec.finish().map_err(|e| format!("zlib stream flush: {e}"))
+                super::ZlibStream::Decompress(dec) => dec
+                    .finish_with(finish_flush)
+                    .map_err(|e| Box::new(zlib_decode_failed("zlib stream flush", e))),
+                super::ZlibStream::BrotliCompress(enc) => {
+                    enc.finish().map_err(|e| failed("brotli stream flush", e))
                 }
-                super::ZlibStream::BrotliCompress(enc) => enc
-                    .finish()
-                    .map_err(|e| format!("brotli stream flush: {e}")),
-                super::ZlibStream::BrotliDecompress(dec) => dec
-                    .finish()
-                    .map_err(|e| format!("brotli stream flush: {e}")),
-                super::ZlibStream::HandleCompress(_) | super::ZlibStream::HandleDecompress(_) => {
-                    Err("zlib handle: use close(), not zlibStreamFlush".into())
+                super::ZlibStream::BrotliDecompress(dec) => {
+                    dec.finish().map_err(|e| failed("brotli stream flush", e))
                 }
+                super::ZlibStream::HandleCompress(_)
+                | super::ZlibStream::HandleDictCompress(_)
+                | super::ZlibStream::HandleDecompress(_) => Err(Box::new(OpOutcome::Failed(
+                    "zlib handle: use close(), not zlibStreamFlush".into(),
+                ))),
             }
         })
         .await;
         match result {
             Ok(Ok(bytes)) => OpOutcome::Bytes(bytes),
-            Ok(Err(msg)) => OpOutcome::Failed(msg),
+            Ok(Err(failure)) => *failure,
             Err(e) => OpOutcome::Failed(format!("zlib stream flush task: {e}")),
+        }
+    }
+
+    /// A decompressor's failure: node's coded zlib error (`code`, `errno`,
+    /// zlib's message) when it is one (#166), else an uncoded failure.
+    fn zlib_decode_failed(context: &str, error: std::io::Error) -> OpOutcome {
+        match super::zlib::zlib_error(&error) {
+            Some(z) => OpOutcome::NodeFailed {
+                code: z.code.into(),
+                message: z.message.into(),
+                syscall: None,
+                path: None,
+                errno: Some(z.errno),
+                hostname: None,
+                address: None,
+                port: None,
+                dest: None,
+            },
+            None => OpOutcome::Failed(format!("{context}: {error}")),
         }
     }
 
@@ -4061,18 +4979,24 @@ pub mod ops {
             .remove(&handle);
     }
 
-    /// zlibHandleCreate: allocate a low-level flate2 Compress or Decompress
+    /// zlibHandleCreate: allocate a low-level flate2 Compress or NodeInflate
     /// handle for Node's zlib binding interface (used by ssh2 etc.).
-    /// mode: 1=DEFLATE, 2=INFLATE, 5=DEFLATERAW, 6=INFLATERAW.
+    /// mode: 1=DEFLATE, 2=INFLATE, 5=DEFLATERAW, 6=INFLATERAW. `dictionary`
+    /// is the one node's `handle.init` takes.
     pub fn zlib_handle_create(
         streams: &super::ZlibRegistry,
         ids: &std::sync::Arc<std::sync::atomic::AtomicU64>,
         mode: i32,
         level: i32,
+        dictionary: Option<&[u8]>,
     ) -> Result<u64, String> {
         let zlib_header = mode == 1 || mode == 2;
-        let stream = match mode {
-            1 | 5 => {
+        let dictionary = dictionary.filter(|d| !d.is_empty());
+        let stream = match (mode, dictionary) {
+            (1 | 5, Some(dictionary)) => super::ZlibStream::HandleDictCompress(Box::new(
+                super::zlib::DictDeflate::new(level, zlib_header, dictionary),
+            )),
+            (1 | 5, None) => {
                 let lvl = if (0..=9).contains(&level) {
                     flate2::Compression::new(level as u32)
                 } else {
@@ -4080,7 +5004,12 @@ pub mod ops {
                 };
                 super::ZlibStream::HandleCompress(flate2::Compress::new(lvl, zlib_header))
             }
-            2 | 6 => super::ZlibStream::HandleDecompress(flate2::Decompress::new(zlib_header)),
+            (2, _) => super::ZlibStream::HandleDecompress(Box::new(
+                super::zlib::NodeInflate::with_dictionary(super::zlib::Wrap::Zlib, dictionary),
+            )),
+            (6, _) => super::ZlibStream::HandleDecompress(Box::new(
+                super::zlib::NodeInflate::with_dictionary(super::zlib::Wrap::Raw, dictionary),
+            )),
             _ => return Err(format!("zlib handle: unknown mode {mode}")),
         };
         let handle = ids.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4100,11 +5029,11 @@ pub mod ops {
         flush: i32,
         input: &[u8],
         output: &mut [u8],
-    ) -> Result<(usize, usize), String> {
+    ) -> std::io::Result<(usize, usize)> {
         let mut guard = streams.lock().unwrap_or_else(|e| e.into_inner());
         let stream = guard
             .get_mut(&handle)
-            .ok_or_else(|| format!("zlib handle {handle} not found"))?;
+            .ok_or_else(|| std::io::Error::other(format!("zlib handle {handle} not found")))?;
         match stream {
             super::ZlibStream::HandleCompress(c) => {
                 let before_in = c.total_in();
@@ -4118,26 +5047,44 @@ pub mod ops {
                     _ => flate2::FlushCompress::None,
                 };
                 c.compress(input, output, fl)
-                    .map_err(|e| format!("zlib handle compress: {e}"))?;
+                    .map_err(|e| std::io::Error::other(format!("zlib handle compress: {e}")))?;
                 let consumed = (c.total_in() - before_in) as usize;
                 let produced = (c.total_out() - before_out) as usize;
                 Ok((output.len() - produced, input.len() - consumed))
             }
-            super::ZlibStream::HandleDecompress(d) => {
-                let before_in = d.total_in();
-                let before_out = d.total_out();
-                let fl = match flush {
-                    2 => flate2::FlushDecompress::Sync,
-                    4 => flate2::FlushDecompress::Finish,
-                    _ => flate2::FlushDecompress::None,
-                };
-                d.decompress(input, output, fl)
-                    .map_err(|e| format!("zlib handle decompress: {e}"))?;
-                let consumed = (d.total_in() - before_in) as usize;
-                let produced = (d.total_out() - before_out) as usize;
+            super::ZlibStream::HandleDictCompress(c) => {
+                let (consumed, produced) = c.deflate(input, output, flush);
                 Ok((output.len() - produced, input.len() - consumed))
             }
-            _ => Err(format!("zlib handle {handle} is not a handle variant")),
+            super::ZlibStream::HandleDecompress(d) => {
+                // Inflate until the output is full or nothing more is
+                // decodable from the input. Failures are node's coded zlib
+                // errors (an io::Error wrapping a ZlibError).
+                let (mut consumed, mut produced) = (0, 0);
+                while produced < output.len() {
+                    let (used, made) = d
+                        .step(&input[consumed..], &mut output[produced..])
+                        .map_err(std::io::Error::other)?;
+                    consumed += used;
+                    produced += made;
+                    if used == 0 && made == 0 {
+                        break;
+                    }
+                }
+                // node_zlib.cc CheckError: under Z_FINISH, a stream that is
+                // not complete when the output still has room has run out of
+                // input -- "unexpected end of file". Other flushes wait for
+                // more.
+                if flush == 4 && produced < output.len() && !d.is_complete() {
+                    return Err(std::io::Error::other(
+                        super::zlib::ZlibError::UNEXPECTED_EOF,
+                    ));
+                }
+                Ok((output.len() - produced, input.len() - consumed))
+            }
+            _ => Err(std::io::Error::other(format!(
+                "zlib handle {handle} is not a handle variant"
+            ))),
         }
     }
 
@@ -4145,16 +5092,26 @@ pub mod ops {
     /// (Node's threadpool model). compress=true encodes, false decodes;
     /// format "unzip" auto-detects on the decode side.
     /// `max_output` is node's `maxOutputLength` for a decode; `None` is no cap.
+    /// `finish_flush` is node's `finishFlush` for a decode (see
+    /// `zlib::decompress_capped`); an encode always finishes the stream.
+    /// `dictionary` is node's option of that name.
     pub async fn zlib_transform(
         bytes: Vec<u8>,
         format: String,
         level: i32,
         compress: bool,
         max_output: Option<usize>,
+        finish_flush: i32,
+        dictionary: Option<Vec<u8>>,
     ) -> OpOutcome {
         let result = tokio::task::spawn_blocking(move || {
             if !compress && format == "unzip" {
-                return super::zlib::unzip_capped(&bytes, max_output);
+                return super::zlib::unzip_capped(
+                    &bytes,
+                    max_output,
+                    finish_flush,
+                    dictionary.as_deref(),
+                );
             }
             let Some(parsed) = super::zlib::Format::parse(&format) else {
                 return Err(std::io::Error::new(
@@ -4163,9 +5120,21 @@ pub mod ops {
                 ));
             };
             if compress {
-                super::zlib::compress_capped(&bytes, parsed, level, max_output)
+                super::zlib::compress_capped(
+                    &bytes,
+                    parsed,
+                    level,
+                    max_output,
+                    dictionary.as_deref(),
+                )
             } else {
-                super::zlib::decompress_capped(&bytes, parsed, max_output)
+                super::zlib::decompress_capped(
+                    &bytes,
+                    parsed,
+                    max_output,
+                    finish_flush,
+                    dictionary.as_deref(),
+                )
             }
         })
         .await;
@@ -4176,7 +5145,7 @@ pub mod ops {
             Ok(Err(e)) if e.to_string() == super::zlib::OUTPUT_TOO_LARGE => {
                 OpOutcome::Failed(super::zlib::OUTPUT_TOO_LARGE.to_string())
             }
-            Ok(Err(e)) => OpOutcome::Failed(format!("zlib: {e}")),
+            Ok(Err(e)) => zlib_decode_failed("zlib", e),
             Err(e) => OpOutcome::Failed(format!("zlib task: {e}")),
         }
     }
@@ -4208,51 +5177,32 @@ pub mod ops {
                     .lock()
                     .expect("file registry lock")
                     .files
-                    .insert(handle, file);
+                    .insert(handle, std::sync::Arc::new(file));
                 OpOutcome::Json(serde_json::json!({ "handle": handle }).to_string())
             }
             Err(e) => node_fail_at(super::FsSite::Open(&mode), e, "open", &path),
         }
     }
 
-    /// Reinsert a File ONLY if it was not closed mid-flight. Returns
-    /// whether it was kept (false = the handle was retired by fsClose
-    /// during the IO await, so the File is dropped here, closing the fd).
-    fn reinsert_file(files: &super::FileRegistry, handle: u64, file: std::fs::File) -> bool {
-        let mut guard = files.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.closed.remove(&handle) {
-            drop(file); // closed during the await: do not resurrect
-            false
-        } else {
-            guard.files.insert(handle, file);
-            true
-        }
-    }
-
-    /// Read up to `len` bytes. Bytes = data, Done = EOF (handle stays open
-    /// until fs_close — the JS side closes explicitly).
     /// Read up to `len` bytes. `position` = None reads from (and advances) the
     /// cursor; Some(p) is a `pread` -- reads at p and leaves the cursor alone.
+    /// Bytes = data, Done = EOF (the handle stays open until fsClose).
     ///
     /// The position parameter used to not exist, so the JS `fs.read` callback
     /// form had nowhere to put the one it was given and silently dropped it:
     /// `fs.read(fd, buf, 0, 3, 10, cb)` read from the CURSOR instead of offset
-    /// 10 and returned the wrong bytes with no error. Worse than the sync twin
-    /// fixed alongside it, which at least read the right bytes and only left
-    /// the cursor misplaced.
+    /// 10 and returned the wrong bytes with no error.
+    ///
+    /// The descriptor stays in the registry for the whole read (see
+    /// `OpenFile`): any number of reads, writes and stats on it can be in
+    /// flight at once, as in node, and a failed read leaves it open.
     pub async fn fs_read_chunk(
         files: super::FileRegistry,
         handle: u64,
         len: usize,
-        position: Option<u64>,
+        position: Option<i64>,
     ) -> OpOutcome {
-        use std::io::{Read, Seek, SeekFrom};
-        let file = files
-            .lock()
-            .expect("file registry lock")
-            .files
-            .remove(&handle);
-        let Some(mut file) = file else {
+        let Some(file) = super::registered_file(&files, handle) else {
             return node_fail_ebadf("read");
         };
         // Exactly `len`, unclamped -- same as the sync twin's `vec![0u8; length]`.
@@ -4261,34 +5211,13 @@ pub mod ops {
         // 10485760), and the old min-of-1 turned a zero-length read into a
         // one-byte one. `len` is bounded by the caller's own destination buffer
         // on the JS side, which is where node bounds it too (ERR_OUT_OF_RANGE).
-        let mut buf = vec![0u8; len];
-        // The File moves onto the blocking pool and comes back with the read's
-        // result, because the remove-operate-reinsert dance needs it returned
-        // whichever way the read went.
         let done = tokio::task::spawn_blocking(move || {
-            // pread when a position is given: save, seek, read, restore. Same
-            // rule the sync family follows -- node's positional read does not
-            // disturb the cursor.
-            let r = match position {
-                None => file.read(&mut buf),
-                Some(p) => {
-                    let saved = file.stream_position();
-                    match file.seek(SeekFrom::Start(p)) {
-                        Ok(_) => {
-                            let r = file.read(&mut buf);
-                            if let Ok(prev) = saved {
-                                let _ = file.seek(SeekFrom::Start(prev));
-                            }
-                            r
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-            };
-            (file, buf, r)
+            let mut buf = vec![0u8; len];
+            let r = super::read_at(&file, &mut buf, position);
+            (buf, r)
         })
         .await;
-        let (file, mut buf, result) = match done {
+        let (mut buf, result) = match done {
             Ok(t) => t,
             Err(e) => {
                 return node_fail(
@@ -4298,12 +5227,6 @@ pub mod ops {
                 );
             }
         };
-        // Reinstate the descriptor BEFORE branching on the outcome. A failed
-        // read does not close the file in node, but the error arm used to drop
-        // `file` here: the OS handle closed and the registry entry vanished, so
-        // the fd that had just reported EBADF was then genuinely dead and every
-        // later write/close on it failed too. Only fsClose retires a handle.
-        reinsert_file(&files, handle, file);
         match result {
             Ok(0) => OpOutcome::Done,
             Ok(n) => {
@@ -4314,27 +5237,21 @@ pub mod ops {
         }
     }
 
-    /// Write one chunk to an open handle (the node:stream write queue
-    /// serializes callers).
+    /// Write one chunk to an open handle.
     ///
     /// `position` = None appends at the cursor; Some(p) is a `pwrite` -- writes
     /// at p and leaves the cursor alone, which is what a positional
     /// `FileHandle.write` means. A descriptor opened in APPEND mode ignores the
     /// position and always writes at the end; that is the OS's behaviour and
-    /// node's, and restoring the cursor afterwards does not change it.
+    /// node's. Like `fs_read_chunk`, the descriptor stays registered for the
+    /// whole write, so concurrent writes on it all reach it.
     pub async fn fs_write_chunk(
         files: super::FileRegistry,
         handle: u64,
         bytes: Vec<u8>,
-        position: Option<u64>,
+        position: Option<i64>,
     ) -> OpOutcome {
-        use std::io::{Seek, SeekFrom};
-        let file = files
-            .lock()
-            .expect("file registry lock")
-            .files
-            .remove(&handle);
-        let Some(mut file) = file else {
+        let Some(file) = super::registered_file(&files, handle) else {
             return node_fail_ebadf("write");
         };
         // Node's contract is callback-after-syscall.
@@ -4351,40 +5268,12 @@ pub mod ops {
         // already returned by the time the blocking task completes. The race
         // cannot be reintroduced by forgetting a flush, because there is no
         // buffer to forget about.
-        let done = tokio::task::spawn_blocking(move || {
-            // pwrite when a position is given: save, seek, write, restore --
-            // the same rule `fs_read_chunk` and the sync family follow.
-            let r = match position {
-                None => super::write_all_checked(&mut file, &bytes),
-                Some(p) => {
-                    let saved = file.stream_position();
-                    match file.seek(SeekFrom::Start(p)) {
-                        Ok(_) => {
-                            let r = super::write_all_checked(&mut file, &bytes);
-                            if let Ok(prev) = saved {
-                                let _ = file.seek(SeekFrom::Start(prev));
-                            }
-                            r
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-            };
-            (file, r)
-        })
-        .await;
-        let (file, written) = match done {
-            Ok(t) => t,
-            Err(e) => {
-                return node_fail_fd(std::io::Error::other(e.to_string()), "write");
-            }
-        };
-        // Reinstated before branching: a failed write must not retire the
-        // descriptor. See the matching note in `fs_read_chunk`.
-        reinsert_file(&files, handle, file);
-        match written {
-            Ok(()) => OpOutcome::Done,
-            Err(e) => node_fail_fd(e, "write"),
+        let done =
+            tokio::task::spawn_blocking(move || super::write_all_at(&file, &bytes, position)).await;
+        match done {
+            Ok(Ok(())) => OpOutcome::Done,
+            Ok(Err(e)) => node_fail_fd(e, "write"),
+            Err(e) => node_fail_fd(std::io::Error::other(e.to_string()), "write"),
         }
     }
 
@@ -4394,6 +5283,7 @@ pub mod ops {
     /// that landed while the read was in flight drops the body instead of
     /// reinserting it.
     pub use crate::http_client::body::read as fetch_body_read;
+    pub use crate::http_client::body::take_trailers as fetch_body_trailers;
 
     #[cfg(test)]
     mod statfs_wire_tests {
@@ -5038,6 +5928,150 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(FileState::default()));
         assert!(!adopt_inherited_fd(&registry, fd));
     }
+
+    /// Descriptors 0-2 are the process's stdio for the fd calls, adopted on
+    /// first use like an inherited descriptor; they used to be EBADF. Closing
+    /// one on Windows is libuv's no-op, so it stays usable. (Not run on unix,
+    /// where the close is real and would take the test runner's stdin.)
+    #[cfg(windows)]
+    #[test]
+    fn stdio_descriptors_are_adopted_and_survive_close_on_windows() {
+        let registry: FileRegistry =
+            std::sync::Arc::new(std::sync::Mutex::new(FileState::default()));
+        let stderr = registered_file(&registry, 2).expect("stderr is a descriptor");
+        assert!(ops::fstat_to_json(&stderr).is_ok());
+        assert!(close_descriptor(&registry, 2));
+        assert!(registered_file(&registry, 2).is_some());
+        assert!(registered_file(&registry, OWN_FD_BASE + 12345).is_none());
+        assert!(!close_descriptor(&registry, OWN_FD_BASE + 12345));
+    }
+
+    /// A descriptor with several ops in flight at once must serve all of them,
+    /// as node does. The chunk ops used to take the file out of the registry
+    /// for their IO await, so every op that started while another was in
+    /// flight found the slot empty and failed with EBADF.
+    /// node's positions through libuv: -1 is the cursor everywhere; any other
+    /// negative is the cursor on unix, and on Windows goes to the OS, which
+    /// takes -2 as "at the cursor, which does not move" and refuses -5 with
+    /// EINVAL, touching nothing.
+    #[test]
+    fn a_negative_position_is_what_libuv_makes_of_it() {
+        assert_eq!(file_offset(None), None);
+        assert_eq!(file_offset(Some(-1)), None);
+        assert_eq!(file_offset(Some(0)), Some(0));
+        assert_eq!(file_offset(Some(7)), Some(7));
+
+        let dir = std::env::temp_dir().join(format!("oam-file-offset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f");
+        std::fs::write(&path, b"ABCDEF").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let mut one = [0u8; 1];
+        assert_eq!(read_at(&file, &mut one, None).unwrap(), 1); // cursor at 1
+        let refused = write_all_at(&file, b"x", Some(-5));
+        let at_cursor = write_all_at(&file, b"y", Some(-2));
+        let read = read_at(&file, &mut one, Some(-3));
+        if cfg!(windows) {
+            assert_eq!(node_error_code(&refused.unwrap_err()), "EINVAL");
+            at_cursor.unwrap();
+            assert_eq!(node_error_code(&read.unwrap_err()), "EINVAL");
+            // "y" at the cursor (1), which stayed at 1.
+            assert_eq!(std::fs::read(&path).unwrap(), b"AyCDEF");
+            assert_eq!(read_at(&file, &mut one, None).unwrap(), 1);
+            assert_eq!(&one, b"y");
+        } else {
+            assert_eq!(file_offset(Some(-5)), None);
+            refused.unwrap();
+            at_cursor.unwrap();
+            assert_eq!(read.unwrap(), 1);
+            assert_eq!(&one, b"D");
+            assert_eq!(std::fs::read(&path).unwrap(), b"AxyDEF");
+        }
+        drop(file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn concurrent_chunk_ops_on_one_descriptor_all_reach_it() {
+        let dir = std::env::temp_dir().join(format!("oam-fd-shared-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f.txt");
+        std::fs::write(&path, b"ABCDEFGHIJKLMNOPQRSTUVWXYZ").unwrap();
+
+        let mut core = CoreRuntime::new().unwrap();
+        let files = core.files();
+        let file = open_options_for("r+").open(&path).unwrap();
+        files
+            .lock()
+            .unwrap()
+            .files
+            .insert(OWN_FD_BASE, std::sync::Arc::new(file));
+
+        // A positional read leaves the cursor where it was: a cursor read
+        // after it starts at 0. (Checked alone: on Windows, as in libuv, a
+        // positional op saves and restores the cursor, so where CONCURRENT
+        // ones leave it depends on their interleaving.)
+        let file = registered_file(&files, OWN_FD_BASE).expect("registered");
+        let mut two = [0u8; 2];
+        assert_eq!(read_at(&file, &mut two, Some(10)).unwrap(), 2);
+        assert_eq!(&two, b"KL");
+        let mut head = [0u8; 3];
+        assert_eq!(read_at(&file, &mut head, None).unwrap(), 3);
+        assert_eq!(&head, b"ABC");
+        drop(file);
+
+        let mut reads = HashMap::new();
+        for i in 0..8i64 {
+            let id = core.spawn_op(ops::fs_read_chunk(
+                files.clone(),
+                OWN_FD_BASE,
+                2,
+                Some(i * 2),
+            ));
+            reads.insert(id, i);
+        }
+        let mut writes = Vec::new();
+        for i in 0..4i64 {
+            writes.push(core.spawn_op(ops::fs_write_chunk(
+                files.clone(),
+                OWN_FD_BASE,
+                vec![b'0' + i as u8],
+                Some(20 + i),
+            )));
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for _ in 0..12 {
+            let done = core.recv_deadline(Some(deadline)).expect("op completes");
+            match reads.get(&done.id) {
+                Some(&i) => match done.outcome {
+                    OpOutcome::Bytes(b) => {
+                        let at = (i * 2) as usize;
+                        assert_eq!(b, &b"ABCDEFGHIJKLMNOPQRSTUVWXYZ"[at..at + 2], "read {i}");
+                    }
+                    _ => panic!("read {i} did not return bytes"),
+                },
+                None => assert!(matches!(done.outcome, OpOutcome::Done), "a write failed"),
+            }
+        }
+
+        // Closing drops the registry's reference; the next op is EBADF.
+        files.lock().unwrap().files.remove(&OWN_FD_BASE);
+        core.spawn_op(ops::fs_read_chunk(files.clone(), OWN_FD_BASE, 2, None));
+        let done = core.recv_deadline(Some(deadline)).expect("op completes");
+        assert!(
+            matches!(&done.outcome, OpOutcome::NodeFailed { code, .. } if code == "EBADF"),
+            "a closed descriptor is EBADF"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"ABCDEFGHIJKLMNOPQRST0123YZ".to_vec()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// The op-outcome error contract as record/replay persists it: replay.rs
@@ -5074,6 +6108,7 @@ mod op_outcome_serde_tests {
                 hostname,
                 address,
                 port,
+                dest,
             } => {
                 assert_eq!(code, "ENOENT");
                 assert_eq!(message, "ENOENT: no such file or directory, open 'x'");
@@ -5081,6 +6116,7 @@ mod op_outcome_serde_tests {
                 assert_eq!(path.as_deref(), Some("x"));
                 assert_eq!(errno, Some(-4058));
                 assert_eq!((hostname, address, port), (None, None, None));
+                assert_eq!(dest, None);
             }
             other => panic!("expected NodeFailed, got {other:?}"),
         }
@@ -5136,11 +6172,12 @@ mod op_outcome_serde_tests {
                 hostname,
                 address,
                 port,
+                dest,
             } => {
                 assert_eq!(code, "ECONNREFUSED");
                 assert_eq!(message, "connect ECONNREFUSED 127.0.0.1:8080");
                 assert_eq!(syscall.as_deref(), Some("connect"));
-                assert_eq!(path, None);
+                assert_eq!((path, dest), (None, None));
                 assert_eq!(errno, Some(-4078));
                 assert_eq!(hostname, None);
                 assert_eq!(address.as_deref(), Some("127.0.0.1"));
@@ -5180,6 +6217,37 @@ mod op_outcome_serde_tests {
                 assert_eq!(errors[0].port, None);
             }
             other => panic!("expected NodeAggregateFailed, got {other:?}"),
+        }
+    }
+
+    /// The socket facts serialise under undici's own keys -- the engine hands
+    /// that JSON to JS as the error's `socket` -- an absent fact is left out,
+    /// and the outcome survives a replay file.
+    #[test]
+    fn a_peer_close_carries_undicis_socket_keys_and_round_trips() {
+        let socket = SocketFacts {
+            local_address: Some("127.0.0.1".into()),
+            local_port: Some(50000),
+            remote_address: Some("::1".into()),
+            remote_port: Some(8080),
+            remote_family: Some("IPv6".into()),
+            bytes_written: Some(170),
+            bytes_read: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&socket).unwrap(),
+            r#"{"localAddress":"127.0.0.1","localPort":50000,"remoteAddress":"::1","remotePort":8080,"remoteFamily":"IPv6","bytesWritten":170}"#
+        );
+        let json = serde_json::to_string(&OpOutcome::socket_closed(socket.clone())).unwrap();
+        match serde_json::from_str::<OpOutcome>(&json).unwrap() {
+            OpOutcome::SocketClosed {
+                message,
+                socket: back,
+            } => {
+                assert_eq!(message, "other side closed");
+                assert_eq!(back, socket);
+            }
+            other => panic!("expected SocketClosed, got {other:?}"),
         }
     }
 }

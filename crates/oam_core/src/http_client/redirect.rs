@@ -12,7 +12,7 @@
 //! | cross-origin hop | drops authorization, proxy-authorization, cookie, host -- for good | re-sent them on the next same-host hop; kept a user `host` |
 //! | 303 on GET/HEAD | method and content-type kept | content-type dropped |
 //! | cookie2 / www-authenticate | forwarded cross-origin | dropped |
-//! | unparseable Location | network error `Invalid URL` | returned the 3xx |
+//! | unparseable Location | network error, cause the `ERR_INVALID_URL` TypeError | returned the 3xx |
 //! | non-http(s) Location | `URL scheme must be a HTTP(S) scheme` | `builder error for url (...)` |
 //! | Location with userinfo | network error (see [`CREDENTIALS`]) | converted to Basic auth |
 //! | Location on a bad port (e.g. 25) | network error `bad port`, not sent | followed |
@@ -29,8 +29,10 @@ use super::prepare::{is_bad_port, origin_eq};
 /// fails -- 21 requests go out.
 pub const MAX_REDIRECTS: u32 = 20;
 
-/// A Location that does not parse against the current URL. undici wraps the
-/// `new URL` TypeError, whose message is this.
+/// The message of a Location undici cannot use. One that does not parse
+/// against the current URL is [`Next::InvalidLocation`], whose cause is the
+/// `new URL` TypeError with this message; a header value undici never hands
+/// to `new URL` (see `resolve_location`) fails with this text alone.
 pub const INVALID_URL: &str = "Invalid URL";
 /// fetch/index.js:1242.
 pub const BAD_SCHEME: &str = "URL scheme must be a HTTP(S) scheme";
@@ -47,6 +49,49 @@ pub const BAD_PORT: &str = "bad port";
 /// fetch/index.js `httpFetch`: a redirect status under `redirect: "error"`
 /// is `makeNetworkError('unexpected redirect')`, Location or not.
 pub const UNEXPECTED_REDIRECT: &str = "unexpected redirect";
+/// fetch/index.js httpRedirectFetch step 11: a redirect other than a 303
+/// that would have to resend a streamed body is a network error with no
+/// reason, so the cause is an `Error` with an empty message (measured on node
+/// v22.22.2).
+pub const STREAMED_BODY: &str = "";
+
+/// A request's body, as a redirect sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedirectBody {
+    /// None, or a buffered one, on a `fetch`: it can be sent again.
+    Replayable,
+    /// A Readable, on a request that is not a fetch (`undici.request` with
+    /// `maxRedirections`): every 3xx comes back as the response, as undici's
+    /// RedirectHandler hands it back for a stream it has already read
+    /// (`util.isDisturbed`).
+    Streamed,
+    /// Streamed, on a `fetch`: a network error, unless the redirect is a 303
+    /// (which drops the body).
+    StreamedFetch,
+    /// None, or a buffered one, on `undici.request`: undici's
+    /// RedirectHandler rule, where only a 303 turns the request into a
+    /// body-less GET and every other redirect resends method and body.
+    UndiciReplayable,
+    /// An iterable or a web stream, on `undici.request`: undici's rule as for
+    /// [`RedirectBody::UndiciReplayable`], but what it sends again is the
+    /// spent iterable -- no bytes, `content-length: 0` (the caller empties
+    /// the body).
+    UndiciIterable,
+}
+
+impl From<bool> for RedirectBody {
+    /// `true`: [`RedirectBody::Replayable`]; `false`: [`RedirectBody::Streamed`].
+    fn from(replayable: bool) -> RedirectBody {
+        if replayable {
+            RedirectBody::Replayable
+        } else {
+            RedirectBody::Streamed
+        }
+    }
+}
+
+/// [`STREAMED_BODY`] by the name fetch-body-headers' tests use for it.
+pub const UNREPLAYABLE_BODY: &str = STREAMED_BODY;
 
 /// What to do with a response.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,13 +109,20 @@ pub enum Next {
         method: http::Method,
         drop_body: bool,
     },
-    /// The next request must resend a body that cannot be replayed (a
-    /// streamed upload): the 3xx is returned as the response. undici fails
-    /// here instead (fetch/index.js:1273-1279); oam keeps reqwest's behaviour
-    /// until #149/#148 (design-143 decision, section 0).
+    /// The response is a redirect that would have to send a streamed body
+    /// again, on a request that is not a fetch (`undici.request`): the 3xx is
+    /// the response, as undici's RedirectHandler hands it back. A fetch's
+    /// fails with [`STREAMED_BODY`] instead ([`RedirectBody::StreamedFetch`]).
     ReturnResponse,
     /// A network error with this message as the cause.
     Fail(&'static str),
+    /// The Location does not parse against the current URL. Node's cause is
+    /// the error `new URL(location, currentURL)` throws -- a `TypeError` with
+    /// `code` `ERR_INVALID_URL`, `input` and `base` (measured on v22.22.2) --
+    /// so the text handed to the parser travels with the failure: the header
+    /// value read as UTF-8, as undici reads it. The base is the current URL,
+    /// fragment included, which the caller already holds.
+    InvalidLocation { input: String },
 }
 
 /// True for the statuses undici follows (constants.js:8).
@@ -99,28 +151,35 @@ pub fn location(headers: &HeaderMap) -> Option<HeaderValue> {
 /// Decide the next step for a response with `status` to a request with
 /// `method` for `current`. `location` is [`location`]'s value;
 /// `redirects_so_far` counts the redirects already followed for this fetch;
-/// `body_replayable` is true when the request has no body or a buffered one.
+/// `body` says whether the request's body can be sent again (a bool: `true`
+/// for none or a buffered one).
 ///
 /// The checks run in undici's order: Location parse, scheme, count,
-/// credentials, then the method/body rewrite, and last the bad-port check
-/// `mainFetch` runs on the new URL before it dials.
+/// credentials, a fetch's streamed body, then the method/body rewrite, and
+/// last the bad-port check `mainFetch` runs on the new URL before it dials.
 pub fn next(
     status: u16,
     method: &http::Method,
     current: &url::Url,
     location: Option<&HeaderValue>,
     redirects_so_far: u32,
-    body_replayable: bool,
+    body: impl Into<RedirectBody>,
 ) -> Next {
+    let body = body.into();
     if !is_redirect_status(status) {
         return Next::Done;
     }
     let Some(location) = location else {
         return Next::Done;
     };
+    // undici's RedirectHandler: a body it has read makes no redirect at all.
+    if body == RedirectBody::Streamed {
+        return Next::ReturnResponse;
+    }
     let mut target = match resolve_location(location.as_bytes(), current) {
-        Some(url) => url,
-        None => return Next::Fail(INVALID_URL),
+        Ok(url) => url,
+        Err(Some(input)) => return Next::InvalidLocation { input },
+        Err(None) => return Next::Fail(INVALID_URL),
     };
     if !matches!(target.scheme(), "http" | "https") {
         return Next::Fail(BAD_SCHEME);
@@ -136,12 +195,28 @@ pub fn next(
     if target.fragment().is_none_or(str::is_empty) {
         target.set_fragment(current.fragment().filter(|f| !f.is_empty()));
     }
+    // fetch/index.js:1273-1279, before the rewrite and before the next hop's
+    // bad-port check: only a 303 lets a fetch's streamed body go -- a 301 or
+    // 302 that would turn a POST into a body-less GET still refuses.
+    if body == RedirectBody::StreamedFetch && status != 303 {
+        return Next::Fail(STREAMED_BODY);
+    }
     // fetch/index.js:1297-1305: only these two cases turn the request into a
     // body-less GET. A 303 answering GET or HEAD keeps its method and
     // headers (content-type included -- reqwest dropped it).
-    let rewrite = (matches!(status, 301 | 302) && *method == http::Method::POST)
-        || (status == 303 && *method != http::Method::GET && *method != http::Method::HEAD);
-    if !rewrite && !body_replayable {
+    // undici's RedirectHandler (`undici.request`): only a 303 does, and for
+    // any method but HEAD (a GET stays a GET).
+    let undici = matches!(
+        body,
+        RedirectBody::UndiciReplayable | RedirectBody::UndiciIterable
+    );
+    let rewrite = if undici {
+        status == 303 && *method != http::Method::HEAD
+    } else {
+        (matches!(status, 301 | 302) && *method == http::Method::POST)
+            || (status == 303 && *method != http::Method::GET && *method != http::Method::HEAD)
+    };
+    if !rewrite && body == RedirectBody::StreamedFetch {
         return Next::ReturnResponse;
     }
     // fetch/index.js:1351 hands the hop to `mainFetch`, whose first network
@@ -174,12 +249,15 @@ pub fn next(
 pub fn apply(headers: &mut HeaderMap, from: &url::Url, to: &url::Url, drop_body: bool) {
     if drop_body {
         // undici constants.js:61-71 `requestBodyHeader`.
+        // `transfer-encoding` too: undici.request's streamed body carries
+        // one oam sets for it, which frames the body that is going.
         for name in [
             CONTENT_ENCODING,
             CONTENT_LANGUAGE,
             CONTENT_LOCATION,
             CONTENT_TYPE,
             CONTENT_LENGTH,
+            http::header::TRANSFER_ENCODING,
         ] {
             headers.remove(name);
         }
@@ -201,14 +279,17 @@ pub fn apply(headers: &mut HeaderMap, from: &url::Url, to: &url::Url, drop_body:
 /// 0x20-0x7E is taken as UTF-8
 /// (`Buffer.from(value, 'binary').toString('utf8')`, replacement characters
 /// for invalid sequences); the result is parsed against the current URL.
-fn resolve_location(raw: &[u8], current: &url::Url) -> Option<url::Url> {
+///
+/// The error is the text that did not parse, or `None` for a value that was
+/// never parsed.
+fn resolve_location(raw: &[u8], current: &url::Url) -> Result<url::Url, Option<String>> {
     let bad_edge = |b: Option<&u8>| matches!(b, Some(b'\t' | b' '));
     if bad_edge(raw.first())
         || bad_edge(raw.last())
         || raw.iter().any(|b| matches!(b, 0 | b'\r' | b'\n'))
     {
-        return None;
+        return Err(None);
     }
     let text = String::from_utf8_lossy(raw);
-    current.join(&text).ok()
+    current.join(&text).map_err(|_| Some(text.into_owned()))
 }

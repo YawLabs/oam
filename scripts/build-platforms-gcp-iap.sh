@@ -886,9 +886,23 @@ sync_src
 # like a compiler bug. One clean debug+release build of this tree needs ~7GB,
 # and target/ accretes across runs (observed 2026-08-22: 39GB, / at 10GB free).
 step "Check builder disk headroom"
-builder_free_gb(){ gcp_ssh "df -BG --output=avail / | tail -1 | tr -dc '0-9'" 2>/dev/null; }
-DISK_FREE_GB="$(builder_free_gb)"
-if [ -n "$DISK_FREE_GB" ]; then
+#
+# The probe used to be `df ... | tail -1 | tr -dc '0-9'` with its stderr thrown
+# away: tr's status hid df's, so a df that failed answered "" with exit 0 and
+# the whole check below was skipped without a word; and an ssh failure ended
+# the script under set -e, its diagnostic already discarded (#210). Now df runs
+# alone, its stderr and ssh's reach the log, and an unusable answer is said
+# out loud. It WARNS rather than fails: whether an unreadable builder should
+# stop a release is the maintainer's call, and the mac leg warns too.
+read_builder_disk(){  # sets DISK_FREE_GB; 1 (after a warning) when unreadable
+  local out rc=0
+  out="$(gcp_ssh "df -BG --output=avail /")" || rc=$?
+  if DISK_FREE_GB="$(disk_free_reading "$rc" "$out")"; then return 0; fi
+  warn "builder disk headroom NOT CHECKED: ${DISK_FREE_GB}. A full builder will not fail here -- it fails ~20 min into cargo with 'os error 28'."
+  DISK_FREE_GB=""
+  return 1
+}
+if read_builder_disk; then
   # Tight headroom used to just print advice telling the operator to ssh in and
   # delete things by hand -- a nag that never fixed anything, so the tree kept
   # growing until a run hard-failed here. Reclaim it instead; the build cache
@@ -897,14 +911,14 @@ if [ -n "$DISK_FREE_GB" ]; then
     warn "builder has ${DISK_FREE_GB}GB free on / -- reclaiming accreted cargo output before building"
     gcp_ssh "cd $REMOTE_DIR && bash scripts/build-remote.sh gc" >&2 2>&1 \
       || warn "pre-build reclaim failed -- continuing to the threshold check"
-    DISK_FREE_GB="$(builder_free_gb)"
+    read_builder_disk || true
   fi
   # Judge AFTER the reclaim: the cheap fix has already run, so anything still
   # short needs a real one.
   if disk_below_floor "$DISK_FREE_GB"; then
     fail "builder still has only ${DISK_FREE_GB}GB free on / after reclaiming prunable cargo output -- a build needs ~7GB. Grow the boot disk, or ssh in and look for space outside ~/${REMOTE_DIR}/target."
   fi
-  [ -n "$DISK_FREE_GB" ] && ok "builder disk headroom: ${DISK_FREE_GB}GB free on /"
+  if [ -n "$DISK_FREE_GB" ]; then ok "builder disk headroom: ${DISK_FREE_GB}GB free on /"; fi
 fi
 
 remote_step prep

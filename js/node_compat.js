@@ -383,10 +383,11 @@
       EPERM: "operation not permitted",
     };
     const err = new Error(`${code}: ${TEXT[code] ?? code}, ${syscall} '${path}'`);
+    // errno first: node's own order is errno, code, syscall, path.
+    if (ERRNO[code] !== undefined) err.errno = ERRNO[code];
     err.code = code;
     err.syscall = syscall;
     err.path = String(path);
-    if (ERRNO[code] !== undefined) err.errno = ERRNO[code];
     return err;
   }
 
@@ -408,21 +409,61 @@
   /// Buffer stays explicit even though `String(buf)` happened to produce the
   /// same bytes -- that worked only because Buffer's toString defaults to utf8,
   /// which is a coincidence of the class, not a decision this code made.
-  function toPath(path) {
-    if (typeof path === "string") return path;
+  ///
+  /// Anything else is node's `getValidatedPath` refusal (#167): a TypeError
+  /// ERR_INVALID_ARG_TYPE naming the argument (`name`, node's name for it --
+  /// "path", "oldPath", "src", ...), and ERR_INVALID_ARG_VALUE for a path
+  /// holding a NUL byte. `String(path)` used to be the fallback, so
+  /// `fs.statSync(42n)` stat'ed a file named `42`, `fsp.readFile({})` one named
+  /// `[object Object]`, and `fs.writeFileSync(fd, data)` CREATED a file named
+  /// after the descriptor -- a real file a typo could clobber.
+  function toPath(path, name = "path") {
+    if (typeof path === "string") {
+      if (path.includes("\u0000")) throw nulInPath(name, path);
+      return path;
+    }
     // Duck-typed, not `instanceof URL`: a URL minted in another realm (a vm
     // context, a worker message) fails the instanceof and would fall through
-    // to String(). Node checks the protocol the same way.
-    if (path && typeof path === "object" && typeof path.protocol === "string" && typeof path.href === "string") {
+    // to String(). Node checks the protocol the same way, and tells a WHATWG
+    // URL from a legacy url.parse() result by the latter's `auth` / `path`
+    // (lib/internal/url.js isURL).
+    if (
+      path && typeof path === "object" && typeof path.protocol === "string" &&
+      typeof path.href === "string" && path.auth === undefined && path.path === undefined
+    ) {
       if (path.protocol !== "file:") {
-        const err = new TypeError("The URL must be of scheme file");
-        err.code = "ERR_INVALID_URL_SCHEME";
-        throw err;
+        throw codes.ERR_INVALID_URL_SCHEME("file");
       }
-      return registry.get("url").fileURLToPath(path);
+      const fromUrl = registry.get("url").fileURLToPath(path);
+      if (fromUrl.includes("\u0000")) throw nulInPath(name, fromUrl);
+      return fromUrl;
     }
-    if (path instanceof Uint8Array) return bufferToUtf8Path(path);
-    return String(path);
+    if (path instanceof Uint8Array) {
+      if (path.includes(0)) throw nulInPath(name, path);
+      return bufferToUtf8Path(path);
+    }
+    throw codes.ERR_INVALID_ARG_TYPE(name, ["string", "Buffer", "URL"], path);
+  }
+
+  function nulInPath(name, path) {
+    return codes.ERR_INVALID_ARG_VALUE(
+      name, path, "must be a string, Uint8Array, or URL without null bytes",
+    );
+  }
+
+  /// The path node names in an error oam builds itself, for a path as the
+  /// caller passed it: on Windows node's binding reports the RESOLVED path
+  /// (`ToNamespacedPath`), so `rmdirSync("file.txt")` fails `rmdir
+  /// 'C:\cwd\file.txt'`. The native ops do the same (oam_core::fs_error_path);
+  /// this is its twin for the errors made in JS. An empty path, and one that
+  /// resolves to two characters or fewer, stay as passed.
+  function fsErrorPath(path) {
+    if (globalThis.__oam.node.platform !== "win32" || path === "") return path;
+    const resolved = registry.get("path").win32.resolve(path);
+    if (resolved.length <= 2) return path;
+    if (resolved.startsWith("\\\\?\\UNC\\")) return "\\\\" + resolved.slice(8);
+    if (resolved.startsWith("\\\\?\\")) return resolved.slice(4);
+    return resolved;
   }
 
   /// Buffer/Uint8Array path -> string. Split out so `toPath` reads as a
@@ -462,6 +503,64 @@
   /// callback layer builds on these so a bad path still throws synchronously,
   /// as node does; only the exported module object is wrapped.
   let rawFsPromises = null;
+
+  /// Every FileHandle `fs/promises.open` hands out, so `readFile` /
+  /// `writeFile` / `appendFile` can tell one from a path (node checks
+  /// `instanceof FileHandle`; oam's handles are plain objects).
+  const fileHandles = new WeakSet();
+
+  /// The error of a native that probed with lstat on rmdir's behalf, as node
+  /// reports it: rmdir is the syscall, in `syscall` AND in the message
+  /// ("ENOENT: no such file or directory, rmdir 'p'"). Relabelling `syscall`
+  /// alone left the message saying lstat.
+  function asRmdirError(e) {
+    if (e && e.syscall === "lstat") {
+      e.syscall = "rmdir";
+      const marker = ", lstat '";
+      const at = typeof e.message === "string" ? e.message.indexOf(marker) : -1;
+      if (at !== -1) e.message = e.message.slice(0, at) + ", rmdir '" + e.message.slice(at + marker.length);
+    }
+    return e;
+  }
+
+  /// node's `fs.realpathSync` / `fs.realpath` (lib/fs.js) are JS: they resolve
+  /// the path and lstat it one component at a time from the root, following
+  /// each symlink they meet, so a failure names `lstat` and the component that
+  /// failed -- `realpathSync("a/missing/x")` fails `lstat '<cwd>/a/missing'`.
+  /// oam asks the OS for the whole path at once (`realpath`, which is what
+  /// node's `.native` forms and `fs/promises.realpath` report). When that
+  /// fails, this walk finds the error node's would have: the first component
+  /// whose lstat fails. If every component stats, the native error stands.
+  /// The walk yields `[op, path]` for the caller to run -- "lstat", "stat" or
+  /// "readlink", sync or async -- so one walk serves both forms.
+  function* realpathWalk(path) {
+    const pathMod = registry.get("path");
+    let full = pathMod.resolve(path);
+    let hops = 0;
+    for (;;) {
+      const root = pathMod.parse(full).root;
+      const parts = full.slice(root.length).split(pathMod.sep).filter(Boolean);
+      // On Windows node checks the root exists first.
+      if (globalThis.__oam.node.platform === "win32") yield ["lstat", root];
+      let current = root;
+      let relinked = false;
+      for (let i = 0; i < parts.length; i++) {
+        current = current === root ? root + parts[i] : current + pathMod.sep + parts[i];
+        const stat = yield ["lstat", current];
+        if (stat.kind === "symlink") {
+          // node stats the link (so a dangling one fails `stat`), reads it,
+          // and starts over from the resolved path.
+          if (++hops > 40) return;
+          yield ["stat", current];
+          const target = yield ["readlink", current];
+          full = pathMod.resolve(pathMod.dirname(current), target, ...parts.slice(i + 1));
+          relinked = true;
+          break;
+        }
+      }
+      if (!relinked) return;
+    }
+  }
 
   /// Captured when node_compat.js is evaluated, so a script that replaces
   /// Promise.prototype.then or Error.captureStackTrace cannot redirect how
@@ -550,40 +649,184 @@
     return `type ${typeof value} (${String(value)})`;
   }
 
-  // Apply Node's coded-error shape to an Error instance: `.code` is set, `.name`
-  // stays the plain base name (RangeError/TypeError -- assert.throws({name})
-  // compares it strictly), and `.toString()`/`.stack` show "BaseName [CODE]: msg"
-  // exactly as Node does (the code is injected into the rendered form, not name).
-  function applyNodeErrorShape(inst, code) {
-    const baseName = inst.name; // plain "TypeError" / "RangeError" / "Error"
-    inst.code = code;
-    Object.defineProperty(inst, "toString", {
-      value: function () {
-        const m = this.message;
-        return baseName + " [" + code + "]" + (m ? ": " + m : "");
-      },
+  // Node's coded-error shape (lib/internal/errors.js makeNodeErrorWithCode,
+  // v22.22.2), which is a CLASS per code -- `class NodeError extends Base`
+  // with a `code = key` field, `message` defined by the constructor, and
+  // `toString()` plus a `constructor` getter on the class prototype. What
+  // that makes observable, and what the helpers below reproduce:
+  //
+  // - Own properties are `stack`, `code`, `message`, in that order (the field
+  //   is initialised before the constructor body defines the message), with
+  //   `message` writable, configurable and NOT enumerable. The common
+  //   `JSON.stringify(err, Object.getOwnPropertyNames(err))` writes its keys
+  //   in this order.
+  // - That is the order for a code whose message is a FUNCTION. A code whose
+  //   message is a string is built with `super(message)` instead, so there
+  //   `message` precedes `code`. Which codes are which is node's table, not
+  //   something to derive here: see NODE_FUNCTION_MESSAGE_CODES.
+  // - `toString` is NOT an own property. It lives on a prototype between the
+  //   instance and Base.prototype, shared by every error of that code
+  //   whichever module raised it: the prototypes come from the one registry
+  //   bootstrap.js installs (__oamNodeErrorPrototype), which the vendored
+  //   streams' errors use too. So `delete err.toString` changes nothing and
+  //   `Object.getPrototypeOf(err) === RangeError.prototype` is false, while
+  //   `err.constructor === RangeError` and `err instanceof RangeError` hold.
+  // - `.name` stays the plain base name (assert.throws({ name }) compares it
+  //   strictly); the code shows in `toString()` and in the stack header,
+  //   "BaseName [CODE]: msg". V8 renders the stack on its first read, and
+  //   bootstrap.js prepareStackTrace writes node's `${name} [${code}]:
+  //   ${message}` for an error on a registry prototype ([kIsNodeError]), so
+  //   an error born on (or moved onto) its code's prototype needs nothing
+  //   rewritten.
+  //
+  // oam used to set `code` after the base constructor had set `message` and
+  // then define `toString` on the instance, which gave `stack, message, code,
+  // toString` and a flat prototype chain.
+
+  // The codes node declares with a message FUNCTION
+  // (`E('ERR_X', (a, b) => ..., Base)`), for which `code` is an own property
+  // BEFORE `message` -- and before anything the function sets on `this`.
+  // Every other code has a string message (fixed, or a `%s` format) and is
+  // built with `super(message)`, so there `message` precedes `code`.
+  //
+  // The table is node's, measured, and lives in bootstrap.js
+  // (__oamNodeErrorCodeFirst) so the vendored streams' makeCode reads the
+  // same one. A code node does not have takes the string-message order,
+  // which is also the order of an error node builds natively.
+  const NODE_FUNCTION_MESSAGE_CODES = { has: globalThis.__oamNodeErrorCodeFirst };
+
+  // The native error classes whose instances take node's coded-error
+  // prototype from the shared registry.
+  const kNativeErrorProtos = new Set([
+    Error.prototype, TypeError.prototype, RangeError.prototype,
+    SyntaxError.prototype, URIError.prototype, EvalError.prototype,
+    ReferenceError.prototype,
+  ]);
+  const nodeErrorPrototype = globalThis.__oamNodeErrorPrototype;
+
+  function defineNodeErrorMessage(inst, message) {
+    Object.defineProperty(inst, "message", {
+      value: message,
+      enumerable: false,
       writable: true,
       configurable: true,
-      enumerable: false,
     });
-    // Node renders the code into the stack header too. Anchor the rewrite to
-    // the first line only -- never risk hitting a "Name:" substring in the
-    // message or a deeper frame.
-    if (typeof inst.stack === "string") {
-      const nl = inst.stack.indexOf("\n");
-      const head = nl === -1 ? inst.stack : inst.stack.slice(0, nl);
-      const rest = nl === -1 ? "" : inst.stack.slice(nl);
-      inst.stack = head.replace(baseName + ":", baseName + " [" + code + "]:") + rest;
+  }
+
+  // The last two steps, once `code` and `message` are in place: move the
+  // instance under its code's prototype, and make sure the stack header
+  // carries the code.
+  function finishNodeErrorShape(inst, code) {
+    let base = Object.getPrototypeOf(inst);
+    // Shaped twice (a helper re-coding an error): stay one level deep. A
+    // registry prototype sits directly on a native one, with its own
+    // toString.
+    const parent = base === null ? null : Object.getPrototypeOf(base);
+    if (!kNativeErrorProtos.has(base) && kNativeErrorProtos.has(parent) && Object.hasOwn(base, "toString")) {
+      base = parent;
+    }
+    if (kNativeErrorProtos.has(base)) {
+      // The registry prototype carries [kIsNodeError], so the stack header is
+      // node's `Name [CODE]: message`, rendered on the stack's first read
+      // (bootstrap.js prepareStackTrace) -- as lazily as node's, so a message
+      // set before that read shows, and an error nobody reads the stack of
+      // costs no stack format. The stack is not read here.
+      Object.setPrototypeOf(inst, nodeErrorPrototype(base.constructor, code));
+      return inst;
+    }
+    {
+      // An instance of some other class: the rendering goes on the instance.
+      const baseName = inst.name;
+      Object.defineProperty(inst, "toString", {
+        value: function () {
+          const m = this.message;
+          return baseName + " [" + code + "]" + (m ? ": " + m : "");
+        },
+        writable: true,
+        configurable: true,
+        enumerable: false,
+      });
+    }
+    // Not a node error to prepareStackTrace, so its header is the plain
+    // `Name: message` (and the stack may already have been rendered). Rewrite
+    // line 0 only when it is that
+    // default render, `Name` or `Name: message`: a user's
+    // Error.prepareStackTrace output is theirs to keep, exactly as in node,
+    // and a header that already shows the code is left alone. `stack` stays
+    // an accessor after the assignment.
+    try {
+      const stack = inst.stack;
+      const name = inst.name;
+      if (typeof stack === "string" && stack.startsWith(name)) {
+        const rest = stack.slice(name.length);
+        if (rest.startsWith(": ")) {
+          inst.stack = name + " [" + code + "]" + rest;
+        } else if (rest === "" || rest.startsWith("\n")) {
+          // An empty message: V8 writes the bare name, node `Name [CODE]: `.
+          inst.stack = name + " [" + code + "]: " + rest;
+        }
+      }
+    } catch {
+      // A throwing user Error.prepareStackTrace: the error is still whole.
     }
     return inst;
   }
 
+  // Apply node's coded-error shape to an Error instance built elsewhere.
+  // `fields` are the own properties node's message function sets on the error
+  // (ERR_FALSY_VALUE_REJECTION's `reason`): they land where node puts them,
+  // between `code` and `message`. Set on the instance beforehand instead,
+  // they would come before both, since `code` and `message` are re-created.
+  function applyNodeErrorShape(inst, code, fields) {
+    const message = inst.message;
+    // Re-create both so they land in node's order whatever the instance
+    // already carried (the base constructor's own `message`, an earlier code).
+    delete inst.message;
+    delete inst.code;
+    if (NODE_FUNCTION_MESSAGE_CODES.has(code)) {
+      inst.code = code;
+      if (fields) Object.assign(inst, fields);
+      defineNodeErrorMessage(inst, message);
+    } else {
+      defineNodeErrorMessage(inst, message);
+      inst.code = code;
+      if (fields) Object.assign(inst, fields);
+    }
+    return finishNodeErrorShape(inst, code);
+  }
+
+  // The factory behind `codes.ERR_*`. Callable with or without `new` (both
+  // are used throughout this file). `msgFn` is a string or a function of the
+  // constructor's arguments. For a code whose node message is a function,
+  // it runs as node's does: with `this` set to the error under construction,
+  // AFTER `code` is in place and BEFORE `message` is, so a property it sets
+  // (ERR_INVALID_URL's `input`) lands between the two.
+  //
+  // The error is made with NodeError as new.target on the shared prototype
+  // for its code, so it is born with node's prototype (no stack read and no
+  // rewrite: the header renders through toString on first read), and its
+  // stack starts at the caller -- V8 leaves out the frames up to new.target,
+  // as node's internal ones are not shown.
   function E(code, Base, msgFn) {
+    const codeFirst = NODE_FUNCTION_MESSAGE_CODES.has(code);
+    let proto;
     function NodeError() {
-      var args = Array.prototype.slice.call(arguments);
-      var msg = typeof msgFn === "function" ? msgFn.apply(null, args) : msgFn;
-      var inst = new Base(msg);
-      return applyNodeErrorShape(inst, code);
+      if (proto === undefined) NodeError.prototype = proto = nodeErrorPrototype(Base, code);
+      var inst = Reflect.construct(Base, [], NodeError);
+      if (codeFirst) {
+        inst.code = code;
+        defineNodeErrorMessage(
+          inst,
+          typeof msgFn === "function" ? msgFn.apply(inst, arguments) : msgFn,
+        );
+      } else {
+        defineNodeErrorMessage(
+          inst,
+          typeof msgFn === "function" ? msgFn.apply(inst, arguments) : msgFn,
+        );
+        inst.code = code;
+      }
+      return inst;
     }
     return NodeError;
   }
@@ -767,9 +1010,21 @@
     return 'Expected ' + input + ' to be returned from the "' + name + '" function but got ' +
       determineSpecificType(value) + ".";
   });
+  // node internal/errors.js, shape for shape: one name is `The "a" argument`,
+  // two `The "a" and "b" arguments`, more `"a", "b", and "c" arguments`, and
+  // an ARRAY in any position is a choice (`"options" or "port" or "path"`,
+  // what net.connect() raises without a port or a path).
   codes.ERR_MISSING_ARGS = E("ERR_MISSING_ARGS", TypeError, function() {
-    var args = Array.prototype.slice.call(arguments);
-    return 'The ' + args.map(function(a) { return '"' + a + '"'; }).join(", ") + ' argument' + (args.length > 1 ? 's' : '') + ' must be specified';
+    var wrap = function(a) { return '"' + a + '"'; };
+    var args = Array.prototype.slice.call(arguments).map(function(a) {
+      return Array.isArray(a) ? a.map(wrap).join(" or ") : wrap(a);
+    });
+    var len = args.length;
+    var msg = "The ";
+    if (len === 1) msg += args[0] + " argument";
+    else if (len === 2) msg += args[0] + " and " + args[1] + " arguments";
+    else msg += args.slice(0, len - 1).join(", ") + ", and " + args[len - 1] + " arguments";
+    return msg + " must be specified";
   });
   codes.ERR_UNKNOWN_ENCODING = E("ERR_UNKNOWN_ENCODING", TypeError, function(enc) {
     return 'Unknown encoding: ' + enc;
@@ -778,8 +1033,12 @@
     return 'Class constructor ' + name + ' cannot be invoked without `new`';
   });
   // Node v22 shape: message is exactly "Invalid URL"; the offending string
-  // rides on err.input (set by the throw sites), not in the message.
-  codes.ERR_INVALID_URL = E("ERR_INVALID_URL", TypeError, function() {
+  // rides on err.input (and a base on err.base), not in the message. Node
+  // sets both from inside the message function, which is why they sit
+  // between `code` and `message` in the own-property order.
+  codes.ERR_INVALID_URL = E("ERR_INVALID_URL", TypeError, function(input, base) {
+    this.input = input;
+    if (base != null) this.base = base;
     return 'Invalid URL';
   });
   codes.ERR_INVALID_URL_SCHEME = E("ERR_INVALID_URL_SCHEME", TypeError, function(expected) {
@@ -794,6 +1053,9 @@
   codes.ERR_SOCKET_BAD_TYPE = E("ERR_SOCKET_BAD_TYPE", TypeError, function() {
     return 'Bad socket type specified. Valid types are: udp4, udp6';
   });
+  // node's text, which speaks of sending a handle (child_process) wherever
+  // the error is raised -- resetAndDestroy() on a non-TCP socket included.
+  codes.ERR_INVALID_HANDLE_TYPE = E("ERR_INVALID_HANDLE_TYPE", TypeError, 'This handle type cannot be sent');
   codes.ERR_UNKNOWN_SIGNAL = E("ERR_UNKNOWN_SIGNAL", TypeError, function(signal) {
     return 'Unknown signal: ' + signal;
   });
@@ -807,20 +1069,14 @@
     return registry.get("util").format("Invalid IP address: %s", ip);
   });
   // ---- RangeError family ----
-  // node's message function also sets `host` and `port` on the error; E()
-  // calls a message function with no instance, so they are set after the code,
-  // which keeps node's enumerable order (code, host, port -- measured).
-  {
-    const AddressFamilyError = E("ERR_INVALID_ADDRESS_FAMILY", RangeError, function(addressType, host, port) {
-      return `Invalid address family: ${addressType} ${host}:${port}`;
-    });
-    codes.ERR_INVALID_ADDRESS_FAMILY = function ERR_INVALID_ADDRESS_FAMILY(addressType, host, port) {
-      const err = AddressFamilyError(addressType, host, port);
-      err.host = host;
-      err.port = port;
-      return err;
-    };
-  }
+  // node's message function also sets `host` and `port` on the error, which
+  // puts them between `code` and `message` (own order stack, code, host,
+  // port, message -- measured).
+  codes.ERR_INVALID_ADDRESS_FAMILY = E("ERR_INVALID_ADDRESS_FAMILY", RangeError, function(addressType, host, port) {
+    this.host = host;
+    this.port = port;
+    return `Invalid address family: ${addressType} ${host}:${port}`;
+  });
   // node's addNumericalSeparator (lib/internal/errors.js): group a big
   // integer's digits so 9007199254740992 reports as 9_007_199_254_740_992.
   // Works on the STRING form and is sign-aware -- the leading "-" is never
@@ -858,22 +1114,113 @@
   codes.ERR_BUFFER_OUT_OF_BOUNDS = E("ERR_BUFFER_OUT_OF_BOUNDS", RangeError, function(name) {
     return name ? '"' + name + '" is outside of buffer bounds' : 'Attempt to access memory outside buffer bounds';
   });
-  codes.ERR_CHILD_CLOSED_BEFORE_REPLY = E("ERR_CHILD_CLOSED_BEFORE_REPLY", RangeError, function() {
-    return 'Child closed before reply';
+  // Declared in this family for history; node's is an Error (not a
+  // RangeError) and its text ends in "received" (measured on v22.22.2).
+  codes.ERR_CHILD_CLOSED_BEFORE_REPLY = E("ERR_CHILD_CLOSED_BEFORE_REPLY", Error, function() {
+    return 'Child closed before reply received';
   });
-  // node internal/errors.js: `${name} should be ${allowZero ? '>= 0' : '> 1'}
+  // node internal/errors.js: `${name} should be ${allowZero ? '>=' : '>'} 0
   // and < 65536. Received ${determineSpecificType(port)}.` -- the name is bare
   // (not quoted, no " option" suffix) and the value goes through
   // determineSpecificType, so a string shows its quotes. Measured on node
   // v22.22.2: `Port should be >= 0 and < 65536. Received type string ('abc').`
-  // oam carried an older node's wording; nothing raised it before
+  // and, from dgram's send(), `Port should be > 0 and < 65536. Received type
+  // number (0).` oam carried an older node's wording; nothing raised it before
   // ClientRequest's port check, so no call site moves with it.
   codes.ERR_SOCKET_BAD_PORT = E("ERR_SOCKET_BAD_PORT", RangeError, function(name, port, allowZero) {
     var operator = allowZero === false ? '>' : '>=';
-    var floor = allowZero === false ? '1' : '0';
-    return name + ' should be ' + operator + ' ' + floor + ' and < 65536. Received ' +
+    return name + ' should be ' + operator + ' 0 and < 65536. Received ' +
       determineSpecificType(port) + '.';
   });
+  // node internal/validators.js validatePort: a number, or a string that is
+  // not blank, whose numeric value is an integer from 0 (1 when `allowZero`
+  // is false) to 65535 -- so '80' and '0x50' are ports and 1.5, -1, 65536,
+  // 'abc' and '' are not. Answers the port as a number (node's `port | 0`).
+  // net.connect, tls.connect, every server's listen() and dgram's send()
+  // share it (#163): before it, a bad port reached the op and was dialled or
+  // bound as a different, valid one (65536 as 65535, 1.5 as 1).
+  function validatePort(port, name, allowZero) {
+    if (
+      (typeof port !== "number" && typeof port !== "string") ||
+      (typeof port === "string" && port.trim().length === 0) ||
+      +port !== (+port >>> 0) ||
+      port > 0xffff ||
+      (port === 0 && allowZero === false)
+    ) {
+      throw codes.ERR_SOCKET_BAD_PORT(name === undefined ? "Port" : name, port, allowZero);
+    }
+    return port | 0;
+  }
+  // What a server's listen(...args) was asked for, read as node's
+  // Server.prototype.listen reads it (lib/net.js v22.22.2: normalizeArgs,
+  // then the port rules), for every server oam has -- net, tls, http, https
+  // and http2 each bind through their own native, so they share the reading
+  // here instead of a base class:
+  //  - (options[, cb]), (path[, backlog][, cb]) for a string that is not a
+  //    number, else ([port][, host][, backlog][, cb]); the callback is the
+  //    LAST argument when that is a function;
+  //  - no arguments, a callback first, or a port that is null or an
+  //    explicit undefined: port 0, any free one;
+  //  - a number or a string is validated as a port (ERR_SOCKET_BAD_PORT
+  //    naming `options.port`), and '80' is the port 80;
+  //  - a path names a pipe; anything else throws node's
+  //    ERR_INVALID_ARG_VALUE for `options`, synchronously.
+  // Answers { port, host, cb } or { path, cb }; `host` undefined when none
+  // was given.
+  function normalizeListenArgs(args) {
+    var options = {};
+    var arg0 = args[0];
+    if (args.length > 0) {
+      if (typeof arg0 === "object" && arg0 !== null) {
+        options = arg0;
+      } else if (typeof arg0 === "string" && !(Number(arg0) >= 0)) {
+        options.path = arg0;
+      } else {
+        options.port = arg0;
+        if (args.length > 1 && typeof args[1] === "string") options.host = args[1];
+      }
+    }
+    var last = args[args.length - 1];
+    var cb = typeof last === "function" ? last : null;
+    if (
+      args.length === 0 || typeof arg0 === "function" ||
+      (options.port === undefined && "port" in options) || options.port === null
+    ) {
+      options.port = 0;
+    }
+    if (typeof options.port === "number" || typeof options.port === "string") {
+      return {
+        port: validatePort(options.port, "options.port"),
+        host: options.host || undefined,
+        // node's `ipv6Only`: an IPv6 listener (the default `::` included)
+        // takes IPv6 clients only.
+        ipv6Only: !!options.ipv6Only,
+        cb: cb,
+      };
+    }
+    if (options.path && typeof options.path === "string" && !(Number(options.path) >= 0)) {
+      return { path: options.path, cb: cb };
+    }
+    if (!("port" in options || "path" in options)) {
+      throw codes.ERR_INVALID_ARG_VALUE("options", options, 'must have the property "port" or "path"');
+    }
+    throw codes.ERR_INVALID_ARG_VALUE("options", options);
+  }
+  // listen(path): node listens on that Unix domain socket or Windows named
+  // pipe. oam has no pipe server, so the listen fails -- on the next tick,
+  // as a bind that fails does -- instead of binding a TCP port nobody asked
+  // for (up to 0.17.1 the name was read as port 0). True when it refused.
+  function refusePipeListen(server, listen) {
+    if (listen.path === undefined) return false;
+    if (listen.cb !== null) server.once("listening", listen.cb);
+    var err = new Error(
+      "The feature listening on a Unix domain socket or named pipe (a `path`) " +
+      "is unavailable on the current platform, which is being used to run oam",
+    );
+    err.code = "ERR_FEATURE_UNAVAILABLE_ON_PLATFORM";
+    process.nextTick(function() { server.emit("error", err); });
+    return true;
+  }
   // ---- Error family ----
   // Node declares this one with three bases (Error, TypeError, RangeError) and
   // reaches the TypeError/RangeError variants through `.TypeError`/`.RangeError`
@@ -886,10 +1233,42 @@
   codes.ERR_STREAM_DESTROYED = E("ERR_STREAM_DESTROYED", Error, function(name) {
     return 'Cannot call ' + (name || 'write') + ' after a stream was destroyed';
   });
+  // A write, end() or connect-time op on a socket destroyed before it could
+  // run (lib/internal/errors.js; net and tls raise them).
+  codes.ERR_SOCKET_CLOSED = E("ERR_SOCKET_CLOSED", Error, "Socket is closed");
+  codes.ERR_SOCKET_CLOSED_BEFORE_CONNECTION = E(
+    "ERR_SOCKET_CLOSED_BEFORE_CONNECTION", Error,
+    "Socket closed before the connection was established",
+  );
   // node's OutgoingMessage guard: `%s` is the operation ('render', 'set',
   // 'remove', 'append').
   codes.ERR_HTTP_HEADERS_SENT = E("ERR_HTTP_HEADERS_SENT", Error, function(what) {
     return 'Cannot ' + what + ' headers after they are sent to the client';
+  });
+  // The outgoing-header validators' errors (lib/_http_outgoing.js
+  // validateHeaderName / validateHeaderValue, checkInvalidHeaderChar).
+  codes.ERR_INVALID_HTTP_TOKEN = E("ERR_INVALID_HTTP_TOKEN", TypeError, function(name, token) {
+    return name + ' must be a valid HTTP token ["' + token + '"]';
+  });
+  codes.ERR_HTTP_INVALID_HEADER_VALUE = E("ERR_HTTP_INVALID_HEADER_VALUE", TypeError, function(value, name) {
+    return 'Invalid value "' + value + '" for header "' + name + '"';
+  });
+  codes.ERR_INVALID_CHAR = E("ERR_INVALID_CHAR", TypeError, function(name, field) {
+    return 'Invalid character in ' + name + (field !== undefined ? ' ["' + field + '"]' : '');
+  });
+  // EventEmitter's emit('error', x) with no listener and an x that is not an
+  // Error. `err` arrives already inspected (see emit); none at all is the
+  // bare message.
+  codes.ERR_UNHANDLED_ERROR = E("ERR_UNHANDLED_ERROR", Error, function(err) {
+    return err === undefined ? 'Unhandled error.' : 'Unhandled error. (' + err + ')';
+  });
+  codes.ERR_HTTP_INVALID_STATUS_CODE = E("ERR_HTTP_INVALID_STATUS_CODE", RangeError, function(code) {
+    return 'Invalid status code: ' + code;
+  });
+  // A Trailer header on a message whose body is not chunked: nowhere for
+  // the trailers it announces to go.
+  codes.ERR_HTTP_TRAILER_INVALID = E("ERR_HTTP_TRAILER_INVALID", Error, function() {
+    return 'Trailers are invalid with this transfer encoding';
   });
   codes.ERR_STREAM_PREMATURE_CLOSE = E("ERR_STREAM_PREMATURE_CLOSE", Error, function() {
     return 'Premature close';
@@ -912,18 +1291,75 @@
   codes.ERR_MULTIPLE_CALLBACK = E("ERR_MULTIPLE_CALLBACK", Error, function() {
     return 'Callback called multiple times';
   });
-  codes.ERR_INVALID_FILE_URL_PATH = E("ERR_INVALID_FILE_URL_PATH", Error, function(msg) {
+  // url.fileURLToPath's refusals: TypeErrors in node, as ERR_INVALID_URL_SCHEME.
+  // `input`, the URL refused, is set before the message, as node's message
+  // function sets it: own keys stack, code, input, message.
+  codes.ERR_INVALID_FILE_URL_PATH = E("ERR_INVALID_FILE_URL_PATH", TypeError, function(msg, input) {
+    if (input !== undefined) this.input = input;
     return 'File URL path ' + msg;
   });
-  codes.ERR_INVALID_FILE_URL_HOST = E("ERR_INVALID_FILE_URL_HOST", Error, function(host) {
-    return 'File URL host must be "localhost" or empty on ' + host;
+  codes.ERR_INVALID_FILE_URL_HOST = E("ERR_INVALID_FILE_URL_HOST", TypeError, function(platform) {
+    return 'File URL host must be "localhost" or empty on ' + platform;
+  });
+  // fs.Dir used after close().
+  codes.ERR_DIR_CLOSED = E("ERR_DIR_CLOSED", Error, "Directory handle was closed");
+  // process.setuid() and friends given a user or group name with no entry
+  // (`kind` is "User" or "Group").
+  codes.ERR_UNKNOWN_CREDENTIAL = E("ERR_UNKNOWN_CREDENTIAL", Error, function(kind, value) {
+    return kind + ' identifier does not exist: ' + value;
   });
   codes.ERR_FS_CP_DIR_TO_NON_DIR = E("ERR_FS_CP_DIR_TO_NON_DIR", Error, function(msg) {
     return msg;
   });
-  codes.ERR_FS_EISDIR = E("ERR_FS_EISDIR", Error, function(msg) {
-    return msg || 'Path is a directory';
+  codes.ERR_FS_CP_NON_DIR_TO_DIR = E("ERR_FS_CP_NON_DIR_TO_DIR", Error, function(msg) {
+    return msg;
   });
+  // node's SystemError (lib/internal/errors.js, v22.22.2): the class of the
+  // codes node raises for a failure it decides itself but reports in a
+  // system error's terms (ERR_FS_EISDIR). The message is `<prefix>: <syscall>
+  // returned <code> (<message>) <path>`, `info` is the context object, and
+  // errno / syscall / path are enumerable accessors over it -- own keys
+  // stack, code, name, message, info, errno, syscall, path, in that order.
+  // toString() and the stack header read `SystemError [<key>]: <message>`,
+  // and util.inspect shows the accessors' values. The header is
+  // bootstrap.js's Error.prepareStackTrace's, which renders a kIsNodeError
+  // error's from its name, code and message when the stack is first read.
+  const kIsNodeErrorBrand = globalThis.__oamKIsNodeError;
+  class SystemError extends Error {
+    constructor(key, prefix, context) {
+      super();
+      let message = `${prefix}: ${context.syscall} returned ${context.code} (${context.message})`;
+      if (context.path !== undefined) message += ` ${context.path}`;
+      if (context.dest !== undefined) message += ` => ${context.dest}`;
+      this.code = key;
+      const field = (name) => ({
+        get() { return context[name]; },
+        set(value) { context[name] = value; },
+        enumerable: true,
+        configurable: true,
+      });
+      Object.defineProperties(this, {
+        name: { value: "SystemError", enumerable: false, writable: true, configurable: true },
+        message: { value: message, enumerable: false, writable: true, configurable: true },
+        info: { value: context, enumerable: true, configurable: true, writable: false },
+        errno: field("errno"),
+        syscall: field("syscall"),
+      });
+      if (context.path !== undefined) Object.defineProperty(this, "path", field("path"));
+      if (context.dest !== undefined) Object.defineProperty(this, "dest", field("dest"));
+    }
+    // node's SystemError is kIsNodeError: its stack header names the code.
+    get [kIsNodeErrorBrand]() {
+      return true;
+    }
+    toString() {
+      return `${this.name} [${this.code}]: ${this.message}`;
+    }
+    [Symbol.for("nodejs.util.inspect.custom")](recurseTimes, ctx) {
+      return registry.get("util").inspect(this, { ...ctx, getters: true, customInspect: false });
+    }
+  }
+  codes.ERR_FS_EISDIR = (context) => new SystemError("ERR_FS_EISDIR", "Path is a directory", context);
   codes.ERR_MODULE_NOT_FOUND = E("ERR_MODULE_NOT_FOUND", Error, function(path, base) {
     return 'Cannot find module "' + path + '"' + (base ? ' imported from ' + base : '');
   });
@@ -1022,7 +1458,10 @@
   // separators only for magnitudes strictly greater than 2**32 (Node parity --
   // 2**32 itself prints plain, 2**40 gets separators); otherwise String(n).
   function fmtRange(n) {
+    // A bigint is grouped past 2n**32n, as a number is; either way it keeps
+    // its n.
     if (typeof n === "bigint") {
+      if (n <= 2n ** 32n && n >= -(2n ** 32n)) return n + "n";
       const neg = n < 0n;
       const s = (neg ? -n : n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, "_");
       return (neg ? "-" : "") + s + "n";
@@ -1088,23 +1527,69 @@
     }
   }
 
-  // Node's common.invalidArgTypeHelper(): builds the " Received ..." suffix of
-  // an ERR_INVALID_ARG_TYPE message. Must match byte-for-byte (tests assert it).
+  // Node's determineSpecificType (lib/internal/errors.js, v22.22.2): the
+  // " Received ..." suffix of an ERR_INVALID_ARG_TYPE message. Must match
+  // byte-for-byte (tests assert it). Only a STRING is shortened -- to 25
+  // characters and "..." INSIDE its quotes -- and one whose shortened form
+  // holds a single quote is JSON-quoted instead; a symbol or bigint is shown whole, -0 as -0, and
+  // an object whose constructor has a `name` (even "") is "an instance of"
+  // it. (oam used to cut the quoted form at 25, losing the closing quote, and
+  // to cut symbols and bigints.)
   function receivedSuffix(input) {
     if (input == null) return " Received " + input;
-    if (typeof input === "function") return " Received function " + input.name;
-    if (typeof input === "object") {
-      const cn = input.constructor && input.constructor.name;
-      if (cn) return " Received an instance of " + cn;
-      return " Received [Object: null prototype] {}";
+    switch (typeof input) {
+      case "function":
+        return " Received function " + input.name;
+      case "object": {
+        const ctor = input.constructor;
+        if (ctor && "name" in ctor) return " Received an instance of " + ctor.name;
+        return " Received [Object: null prototype] {}";
+      }
+      case "string":
+        return " Received type string (" + quoteReceivedString(input) + ")";
+      case "bigint":
+        return " Received type bigint (" + input + "n)";
+      case "symbol":
+        return " Received type symbol (" + String(input) + ")";
+      case "number":
+        return " Received type number (" + (Object.is(input, -0) ? "-0" : String(input)) + ")";
+      default:
+        return " Received type " + typeof input + " (" + String(input) + ")";
     }
-    let inspected;
-    if (typeof input === "string") inspected = "'" + input + "'";
-    else if (typeof input === "bigint") inspected = input.toString() + "n";
-    else if (typeof input === "symbol") inspected = input.toString();
-    else inspected = String(input);
-    if (inspected.length > 28) inspected = inspected.slice(0, 25) + "...";
-    return " Received type " + typeof input + " (" + inspected + ")";
+  }
+
+  // A string as node's JS "Received" tail (determineSpecificType) quotes it:
+  // past 28 UTF-16 units it is cut to 25 plus "...", and THEN quoted -- single
+  // quotes, or JSON quotes when the cut string still holds a single quote, so
+  // a quote past the cut does not change the quoting (measured on v22.22.2).
+  // The C++ tail differs; see nativeQuoteReceivedString.
+  function quoteReceivedString(s) {
+    if (s.length > 28) s = s.slice(0, 25) + "...";
+    return s.indexOf("'") === -1 ? "'" + s + "'" : JSON.stringify(s);
+  }
+
+  // The same for node's C++ tail, which works on the string's UTF-8 bytes
+  // (a lone surrogate is U+FFFD): past 28 BYTES it is cut to 25 plus "...",
+  // and a character the cut splits reads as one U+FFFD. If the cut string has
+  // no single quote it is single-quoted; otherwise the WHOLE original string
+  // is JSON-quoted, uncut. All measured on v22.22.2 through fs.closeSync.
+  function nativeQuoteReceivedString(s) {
+    const wf = s.toWellFormed();
+    let bytes = 0;
+    let cutAt = -1;
+    let split = false;
+    for (let i = 0; i < wf.length && bytes <= 28; i++) {
+      const c = wf.charCodeAt(i);
+      const n = c < 0x80 ? 1 : c < 0x800 ? 2 : c >= 0xd800 && c <= 0xdbff ? 4 : 3;
+      if (cutAt < 0 && bytes + n > 25) {
+        cutAt = i;
+        split = bytes < 25;
+      }
+      bytes += n;
+      if (n === 4) i++;
+    }
+    const shown = bytes > 28 ? wf.slice(0, cutAt) + (split ? "�" : "") + "..." : wf;
+    return shown.indexOf("'") === -1 ? "'" + shown + "'" : JSON.stringify(s);
   }
 
   // Build an ERR_INVALID_ARG_TYPE TypeError whose message follows Node's
@@ -1121,10 +1606,11 @@
 
   // The "must be of type <expected>" variant (used for scalar args like
   // offset/byteLength where Node expects a primitive type, not an instance).
+  // A dotted name ("options.retryDelay") is a "property", as node words it.
   function argTypeOfError(argName, expected, value) {
     return applyNodeErrorShape(
       new TypeError(
-        'The "' + argName + '" argument must be of type ' +
+        'The "' + argName + (argName.includes(".") ? '" property' : '" argument') + " must be of type " +
           expected + "." + receivedSuffix(value),
       ),
       "ERR_INVALID_ARG_TYPE",
@@ -1297,16 +1783,19 @@
     }
   }
 
-  // Node's validateInteger: number-typed integer >= min (copyBytesFrom offsets).
-  function validateInteger(value, name, min) {
+  // Node's validateInteger: a number-typed integer in [min, max], both
+  // defaulting to the safe-integer bounds, and a range failure names both
+  // ("It must be >= 0 && <= 9007199254740991", as copyBytesFrom and
+  // fs.read's offset report it on v22.22.2).
+  function validateInteger(value, name, min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER) {
     if (typeof value !== "number") {
       throw argTypeOfError(name, "number", value);
     }
     if (!Number.isInteger(value)) {
       throw codes.ERR_OUT_OF_RANGE(name, "an integer", fmtRange(value));
     }
-    if (min !== undefined && value < min) {
-      throw codes.ERR_OUT_OF_RANGE(name, ">= " + min, fmtRange(value));
+    if (value < min || value > max) {
+      throw codes.ERR_OUT_OF_RANGE(name, ">= " + min + " && <= " + max, fmtRange(value));
     }
   }
 
@@ -2749,9 +3238,20 @@
       if (existing === undefined) {
         if (type === "error") {
           const err = args[0];
-          throw err instanceof Error
-            ? err
-            : new Error(`Unhandled error. (${String(err)})`);
+          if (err instanceof Error) throw err;
+          // Not an Error: node throws ERR_UNHANDLED_ERROR, with the argument
+          // inspected into the message (a string shows its quotes, an object
+          // its contents) and kept, untouched, as `context` -- so a caller
+          // can tell this failure by `code` and still reach what was emitted.
+          let inspected;
+          try {
+            inspected = nodeInspect(err);
+          } catch {
+            inspected = err;
+          }
+          const unhandled = new codes.ERR_UNHANDLED_ERROR(inspected);
+          unhandled.context = err;
+          throw unhandled;
         }
         return false;
       }
@@ -4353,7 +4853,7 @@
 
   // Node's fs.constants O_* are the platform's fcntl/CRT values: O_CREAT/O_EXCL/
   // O_TRUNC/O_APPEND differ between Linux, Windows (MSVCRT), and macOS (BSD).
-  // (O_RDONLY/O_WRONLY/O_RDWR are 0/1/2 everywhere.) numericOpenFlags() must use
+  // (O_RDONLY/O_WRONLY/O_RDWR are 0/1/2 everywhere.) openFlagString() must use
   // the same per-platform values, so this is the single source for both.
   function platformOFlags(platform) {
     if (platform === "win32") return { O_CREAT: 256, O_EXCL: 1024, O_TRUNC: 512, O_APPEND: 8 };
@@ -4361,6 +4861,46 @@
     // O_NOATIME is Linux-only and must be ABSENT elsewhere -- Node's test
     // asserts both directions, and code feature-detects with `in`.
     return { O_CREAT: 64, O_EXCL: 128, O_TRUNC: 512, O_APPEND: 1024, O_NOATIME: 0x40000 };
+  }
+
+  // Map numeric O_* open flags to the fopen-style string natives.fsOpen /
+  // fsOpenSync take. Most callers pass a string ("r"/"w"/...); chokidar and
+  // lockfile code pass numbers. O_CREAT|O_EXCL is "x" (fail if it exists)
+  // and O_CREAT|O_TRUNC a truncating "w"; a combination no fopen string
+  // spells (O_WRONLY alone, O_WRONLY|O_CREAT) opens as the nearest one.
+  function openFlagString(n, platform) {
+    const { O_APPEND, O_CREAT, O_EXCL } = platformOFlags(platform);
+    const acc = n & 3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
+    const plus = acc === 2 ? "+" : "";
+    const exclusive = (n & O_CREAT) !== 0 && (n & O_EXCL) !== 0;
+    if (acc === 0) return "r";
+    if ((n & O_APPEND) !== 0) return (exclusive ? "ax" : "a") + plus;
+    if (exclusive) return "wx" + plus;
+    return acc === 2 && (n & O_CREAT) === 0 ? "r+" : "w" + plus;
+  }
+
+  // node's stringToFlags (lib/internal/fs/utils.js, v22.22.2), as the
+  // fopen-style strings the natives take: an int32 is O_* bits, null /
+  // undefined is "r", and a string must be one of node's spellings -- the
+  // synchronous ("s") ones open as their plain twins, without O_SYNC -- or it
+  // is ERR_INVALID_ARG_VALUE "flags". Shared by every open: fs.open,
+  // fs.openSync, fs/promises.open and the writeFile family's `flag`.
+  const OPEN_FLAG_STRINGS = {
+    __proto__: null,
+    r: "r", rs: "r", sr: "r", "r+": "r+", "rs+": "r+", "sr+": "r+",
+    w: "w", wx: "wx", xw: "wx", "w+": "w+", "wx+": "wx+", "xw+": "wx+",
+    a: "a", ax: "ax", xa: "ax", as: "a", sa: "a",
+    "a+": "a+", "ax+": "ax+", "xa+": "ax+", "as+": "a+", "sa+": "a+",
+  };
+  function openFlags(flags, platform) {
+    if (typeof flags === "number") {
+      validateInt32(flags, "flags");
+      return openFlagString(flags, platform);
+    }
+    if (flags == null) return "r";
+    const fopen = typeof flags === "string" ? OPEN_FLAG_STRINGS[flags] : undefined;
+    if (fopen === undefined) throw codes.ERR_INVALID_ARG_VALUE("flags", flags);
+    return fopen;
   }
 
   // libuv error strings, keyed by code. This list is the AUTHORITY on which
@@ -6083,13 +6623,14 @@
     function callbackifyOnRejected(reason, cb) {
       if (!reason) {
         const err = new Error("Promise was rejected with falsy value");
-        err.reason = reason;
         // Capture BEFORE shaping: applyNodeErrorShape rewrites the current
         // stack's first line into the "Error [ERR_FALSY_VALUE_REJECTION]:"
         // header node renders -- capturing afterward would regenerate an
         // unshaped stack.
         Error.captureStackTrace(err, callbackifyOnRejected);
-        applyNodeErrorShape(err, "ERR_FALSY_VALUE_REJECTION");
+        // `reason` is set by node's message function, so it sits between
+        // `code` and `message`: [stack, code, reason, message].
+        applyNodeErrorShape(err, "ERR_FALSY_VALUE_REJECTION", { reason });
         reason = err;
       }
       return cb(reason);
@@ -8942,7 +9483,18 @@
     // only ever answer file/dir/symlink -- the other four were hardcoded false,
     // so a POSIX character device, block device, FIFO or socket all reported
     // themselves as none of those.
-    _checkModeProperty(bits) { return (this.mode & S_IFMT) === bits; }
+    // On Windows node answers false for a FIFO, block device or socket
+    // whatever the mode says ("Some types are not available on Windows") --
+    // which is observable, because libuv's fstat of a pipe IS S_IFIFO.
+    _checkModeProperty(bits) {
+      if (
+        (bits === S_IFIFO || bits === S_IFBLK || bits === S_IFSOCK) &&
+        globalThis.__oam.node.platform === "win32"
+      ) {
+        return false;
+      }
+      return (this.mode & S_IFMT) === bits;
+    }
     isDirectory() { return this._checkModeProperty(S_IFDIR); }
     isFile() { return this._checkModeProperty(S_IFREG); }
     isBlockDevice() { return this._checkModeProperty(S_IFBLK); }
@@ -9029,7 +9581,7 @@
       // end-of-directory. Returning null here instead made a use-after-close
       // bug look like an empty directory.
       if (this.#closed) {
-        throw makeNodeError("ERR_DIR_CLOSED", "Directory handle was closed");
+        throw codes.ERR_DIR_CLOSED();
       }
       if (this.#index >= this.#entries.length) return null;
       return makeDirent(this.path, this.#entries[this.#index++]);
@@ -9037,7 +9589,7 @@
     readSync() { return this.#next(); }
     closeSync() {
       if (this.#closed) {
-        throw makeNodeError("ERR_DIR_CLOSED", "Directory handle was closed");
+        throw codes.ERR_DIR_CLOSED();
       }
       this.#closed = true;
     }
@@ -9682,12 +10234,17 @@
   }
   const toUnixMs = (time, name) => toUnixSeconds(time, name) * 1000;
 
-  // A read/write POSITION argument, normalised for the natives: a non-negative
-  // number is a pread/pwrite, anything else (null, undefined, a negative) means
-  // "from the current cursor". Shared by the fs and fs/promises factories so
-  // the two cannot drift -- FileHandle.read/write silently DROPPED their
-  // position for as long as the natives had nowhere to put it.
-  const fsPositionArg = (p) => (typeof p === "number" && p >= 0 ? p : null);
+  // A POSITION node does not validate -- a write's, readv's, writev's --
+  // normalised for the natives as the binding's GetOffset does it: a safe
+  // integer is the position, anything else (null, 1.5, "x", a bigint) is -1,
+  // "from the current cursor", passed as null. A negative position other
+  // than -1 is passed through: libuv treats it as the cursor on unix and
+  // fails it EINVAL on Windows, and the natives do the same
+  // (oam_core::file_offset). A read's position IS validated first
+  // (readPosition). Shared by the fs and fs/promises factories so the two
+  // cannot drift -- FileHandle.read/write silently DROPPED their position for
+  // as long as the natives had nowhere to put it.
+  const fsPositionArg = (p) => (Number.isSafeInteger(p) && p !== -1 ? p : null);
 
   // `Object.keys(err)` order, for the ONE fd call where node's differs.
   //
@@ -9710,16 +10267,360 @@
     return out;
   }
 
-  // node's ERR_OUT_OF_RANGE guard on a read into a caller-supplied buffer.
-  // Without it an over-long `length` reaches the native, which then allocates
-  // it -- `fs.read(fd, Buffer.alloc(4), 0, 1e9)` is a gigabyte on our side and
-  // a synchronous throw on node's.
-  function validateReadLength(buffer, offset, length) {
-    if (!buffer || typeof length !== "number") return;
-    const room = buffer.byteLength - (offset || 0);
-    if (length > room) {
-      throw codes.ERR_OUT_OF_RANGE("length", "<= " + room, length);
+  // The checks fs.read and fs.readSync share once their overloads are
+  // resolved (lib/fs.js, v22.22.2): the offset first -- an integer in [0,
+  // 2**53-1], so a bad one is refused even by a zero-length read -- then
+  // `length |= 0` and, for a read that is not empty, validateReadRange. All
+  // before the descriptor is used. Returns the int32 length; 0 means
+  // "return 0".
+  function validateReadSpan(buffer, offset, length) {
+    validateInteger(offset, "offset", 0);
+    length |= 0;
+    if (length === 0) return 0;
+    validateReadRange(buffer, offset, length);
+    return length;
+  }
+
+  // What every read into a caller's buffer (fs.read, fs.readSync,
+  // FileHandle.read) checks once the offset is valid and the read is not
+  // empty: an empty buffer, then node's validateOffsetLengthRead. Without it
+  // an over-long length reaches the native, which allocates it --
+  // `fs.read(fd, Buffer.alloc(4), 0, 1e9)` would be a gigabyte on our side
+  // and is a synchronous throw on node's.
+  function validateReadRange(buffer, offset, length) {
+    const size = buffer.byteLength;
+    if (size === 0) {
+      throw codes.ERR_INVALID_ARG_VALUE("buffer", buffer, "is empty and cannot be written");
     }
+    if (length < 0) throw codes.ERR_OUT_OF_RANGE("length", ">= 0", length);
+    if (offset + length > size) throw codes.ERR_OUT_OF_RANGE("length", "<= " + (size - offset), length);
+  }
+
+  // node's validateObject(options, "options", kValidateObjectAllowNullable),
+  // for the options forms of fs.read and fs.readSync: null passes, an array
+  // does not.
+  function validateReadOptions(options) {
+    if (options !== null && (typeof options !== "object" || Array.isArray(options))) {
+      throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+    }
+  }
+
+  // node's validateBuffer, the first check of fs.read and fs.readSync.
+  function validateReadBuffer(buffer) {
+    if (!ArrayBuffer.isView(buffer)) {
+      throw codes.ERR_INVALID_ARG_TYPE("buffer", ["Buffer", "TypedArray", "DataView"], buffer);
+    }
+  }
+
+  // ---- the non-descriptor arguments of the fd calls, checked where node
+  // checks them: in JS, before the descriptor reaches the binding. Each is
+  // node's validator of the same name (lib/internal/validators.js and
+  // lib/internal/fs/utils.js, v22.22.2), so a call with a bad descriptor AND
+  // a bad other argument reports the other argument, as node's does.
+
+  // validateInt32 / validateUint32: validateInteger's shape and wording.
+  function validateInt32(value, name, min = -2147483648, max = 2147483647) {
+    validateInteger(value, name, min, max);
+  }
+  function validateUint32(value, name) {
+    validateInteger(value, name, 0, 4294967295);
+  }
+
+  // parseFileMode: an octal string or a uint32, with `def` for null /
+  // undefined. Returns the numeric mode.
+  const OCTAL_MODE = /^[0-7]+$/;
+  function parseFileMode(value, name, def) {
+    value ??= def;
+    if (typeof value === "string") {
+      if (!OCTAL_MODE.test(value)) {
+        throw codes.ERR_INVALID_ARG_VALUE(name, value, "must be a 32-bit unsigned integer or an octal string");
+      }
+      value = Number.parseInt(value, 8);
+    }
+    validateUint32(value, name);
+    return value;
+  }
+
+  // The lstat half of node's validateRmOptions (lib/internal/fs/utils.js,
+  // v22.22.2), once the options are valid: rm refuses a directory unless
+  // `recursive` is set -- ERR_FS_EISDIR, nothing removed -- and a path whose
+  // lstat fails reports that failure (syscall lstat), except ENOENT under
+  // `force`. `raw` is the lstat result, or the error it failed with.
+  function rmCheckTarget(file, recursive, force, raw, failed) {
+    if (failed !== undefined) {
+      if (force && failed?.code === "ENOENT") return;
+      throw failed;
+    }
+    if (raw.kind === "dir" && !recursive) {
+      throw codes.ERR_FS_EISDIR({ code: "EISDIR", message: "is a directory", path: file, syscall: "rm", errno: 21 });
+    }
+  }
+
+  // The synchronous half of node's validateRmOptions (validateRmdirOptions
+  // over rm's defaults, then `force`): an options object, if given, with
+  // boolean recursive / force, an int32 retryDelay >= 0 and a uint32
+  // maxRetries.
+  function validateRmOptions(options) {
+    if (options === undefined) return;
+    if (options === null || typeof options !== "object" || Array.isArray(options)) {
+      throw codes.ERR_INVALID_ARG_TYPE("options", "object", options);
+    }
+    const o = { retryDelay: 100, maxRetries: 0, recursive: false, force: false, ...options };
+    if (typeof o.recursive !== "boolean") {
+      throw codes.ERR_INVALID_ARG_TYPE("options.recursive", "boolean", o.recursive);
+    }
+    validateInt32(o.retryDelay, "options.retryDelay", 0);
+    validateUint32(o.maxRetries, "options.maxRetries");
+    if (typeof o.force !== "boolean") {
+      throw codes.ERR_INVALID_ARG_TYPE("options.force", "boolean", o.force);
+    }
+  }
+
+  // The uid / gid of every chown form: integers from -1 ("leave it") through
+  // 2**32-1, uid checked first. Returns them, for the native call.
+  const kMaxUserId = 2 ** 32 - 1;
+  function ownerArgs(uid, gid) {
+    validateInteger(uid, "uid", -1, kMaxUserId);
+    validateInteger(gid, "gid", -1, kMaxUserId);
+    return [uid, gid];
+  }
+  // The two times of utimes / lutimes in every form, in milliseconds for the
+  // natives: node's toUnixTimestamp under its default name ("time").
+  const pathTimes = (atime, mtime) => [toUnixMs(atime), toUnixMs(mtime)];
+
+  // validatePosition: an integer >= -1 or a bigint that keeps
+  // position + length inside an int64. Returns what the natives take: null
+  // for -1 (the cursor), else a non-negative number.
+  function readPosition(position, length) {
+    if (position == null) return null;
+    if (typeof position === "number") {
+      validateInteger(position, "position", -1);
+      return position === -1 ? null : position;
+    }
+    if (typeof position === "bigint") {
+      const max = 2n ** 63n - 1n - BigInt(length);
+      if (!(position >= -1n && position <= max)) {
+        throw codes.ERR_OUT_OF_RANGE("position", ">= -1 && <= " + max, fmtRange(position));
+      }
+      return position === -1n ? null : Number(position);
+    }
+    throw codes.ERR_INVALID_ARG_TYPE("position", ["integer", "bigint"], position);
+  }
+
+  // validateStringAfterArrayBufferView: what to write when it is not a view.
+  function validateWriteData(data, name) {
+    if (typeof data !== "string" && !ArrayBuffer.isView(data)) {
+      throw codes.ERR_INVALID_ARG_TYPE(name, ["string", "Buffer", "TypedArray", "DataView"], data);
+    }
+  }
+
+  // validateEncoding: the one encoding a string can be invalid for is hex,
+  // at an odd length. Any other name is not an error: the binding's
+  // ParseEncoding writes UTF-8 for one it does not know (writeEncoding).
+  function validateWriteEncoding(data, encoding) {
+    if (typeof encoding === "string" && data.length % 2 !== 0 && encoding.toLowerCase() === "hex") {
+      throw codes.ERR_INVALID_ARG_VALUE("encoding", encoding, "is invalid for data of length " + data.length);
+    }
+  }
+  const writeEncoding = (encoding) =>
+    typeof encoding === "string" && globalThis.Buffer.isEncoding(encoding) ? encoding : "utf8";
+
+  // node's getOptions (lib/internal/fs/utils.js, v22.22.2): null, undefined
+  // or a function is the defaults, a string is the encoding, anything else
+  // that is not an object is ERR_INVALID_ARG_TYPE; then assertEncoding
+  // (any name Buffer does not know but "buffer") and validateAbortSignal.
+  function fsGetOptions(options, defaults) {
+    if (options == null || typeof options === "function") return defaults;
+    if (typeof options === "string") {
+      options = { ...defaults, encoding: options };
+    } else if (typeof options !== "object") {
+      throw codes.ERR_INVALID_ARG_TYPE("options", ["string", "Object"], options);
+    }
+    const encoding = options.encoding;
+    if (encoding !== "buffer" && encoding && !globalThis.Buffer.isEncoding(encoding)) {
+      throw codes.ERR_INVALID_ARG_VALUE("encoding", encoding, "is invalid encoding");
+    }
+    const signal = options.signal;
+    if (signal !== undefined && (signal === null || typeof signal !== "object" || !("aborted" in signal))) {
+      throw codes.ERR_INVALID_ARG_TYPE("options.signal", "AbortSignal", signal);
+    }
+    return options;
+  }
+
+  // The options of writeFile / appendFile in every form -- sync, callback,
+  // fs/promises and FileHandle -- checked as node's are, and before the data:
+  // getOptions over the call's defaults, then `options.flush` a boolean.
+  const kWriteFileDefaults = Object.freeze({ encoding: "utf8", mode: 0o666, flag: "w", flush: false });
+  const kAppendFileDefaults = Object.freeze({ encoding: "utf8", mode: 0o666, flag: "a" });
+  function writeFileOptions(options, append) {
+    options = fsGetOptions(options, append ? kAppendFileDefaults : kWriteFileDefaults);
+    const flush = options.flush ?? false;
+    if (typeof flush !== "boolean") throw codes.ERR_INVALID_ARG_TYPE("options.flush", "boolean", flush);
+    return options;
+  }
+
+  // What fs/promises.writeFile and FileHandle.writeFile take besides a
+  // string or a view (node's isCustomIterable): any other sync or async
+  // iterable, each chunk of it a view or a string.
+  function isCustomIterable(data) {
+    return (
+      data != null &&
+      typeof data !== "string" &&
+      !ArrayBuffer.isView(data) &&
+      (typeof data[Symbol.iterator] === "function" || typeof data[Symbol.asyncIterator] === "function")
+    );
+  }
+
+  // writeFile's data once its options are checked: a view as it is, a string
+  // encoded, anything else ERR_INVALID_ARG_TYPE "data". `iterables`: the
+  // promise forms, which also take isCustomIterable data (returned as is).
+  function writeFileData(data, options, iterables) {
+    if (ArrayBuffer.isView(data) || (iterables && isCustomIterable(data))) return data;
+    validateWriteData(data, "data");
+    return globalThis.Buffer.from(data, options.encoding || "utf8");
+  }
+
+  // validateOffsetLengthWrite, after the offset itself has been validated.
+  function validateWriteRange(offset, length, byteLength) {
+    if (offset > byteLength) throw codes.ERR_OUT_OF_RANGE("offset", "<= " + byteLength, offset);
+    if (length > byteLength - offset) throw codes.ERR_OUT_OF_RANGE("length", "<= " + (byteLength - offset), length);
+    if (length < 0) throw codes.ERR_OUT_OF_RANGE("length", ">= 0", length);
+    validateInt32(length, "length", 0);
+  }
+
+  // A buffer write's overloads and checks, shared by fs.write and
+  // fs.writeSync (lib/fs.js, v22.22.2): an options object (or null) in the
+  // offset's place, the offset (null is 0), a length that is not a number
+  // meaning the rest, and the range. Returns the bytes to write, a view on
+  // the caller's memory (a DataView or a wider typed array included), and
+  // the native position. `callbackForm`: fs.write, where an offset slot
+  // holding the callback means 0.
+  function bufferWriteArgs(buffer, offset, length, position, callbackForm) {
+    if (typeof offset === "object") {
+      ({ offset = 0, length = buffer.byteLength - offset, position = null } = offset ?? {});
+    }
+    if (offset == null || (callbackForm && typeof offset === "function")) offset = 0;
+    else validateInteger(offset, "offset", 0);
+    if (typeof length !== "number") length = buffer.byteLength - offset;
+    validateWriteRange(offset, length, buffer.byteLength);
+    const bytes =
+      buffer instanceof Uint8Array && offset === 0 && length === buffer.length
+        ? buffer
+        : new Uint8Array(buffer.buffer, buffer.byteOffset + offset, length);
+    return { bytes, position: fsPositionArg(position) };
+  }
+
+  // ---- file-descriptor validation, for every fs API that takes an fd.
+  //
+  // node checks a descriptor in one of two places, and they word the same
+  // failure differently (v22.22.2, measured per API; conformance/cases/246
+  // and 247 pin them):
+  //
+  //   JS  lib/internal/fs/utils.js getValidatedFd -> validateInt32(fd, "fd",
+  //       0): a non-number is ERR_INVALID_ARG_TYPE with the JS "Received"
+  //       tail; a non-integer (1.5, -0.5, NaN, +-Infinity) is ERR_OUT_OF_RANGE
+  //       "an integer"; anything else outside [0, 2**31-1] is ERR_OUT_OF_RANGE
+  //       ">= 0 && <= 2147483647", digits grouped past 2**32. fs.read, write,
+  //       readv, writev and the createReadStream / createWriteStream `fd`
+  //       option check here, FIRST, before any other argument.
+  //   C++ src/node_file.cc GetValidatedFd, on the binding call itself: the
+  //       range is tested BEFORE integrality (-0.5 and 2**53 are ">= 0 && <=",
+  //       only NaN, +-Infinity and in-range fractions are "an integer"), the
+  //       value is V8's detail string (no digit grouping), and a non-number's
+  //       tail is V8's: `Received function`, `Received Symbol(s)`, `type bigint
+  //       (1)` with no `n`, a null-prototype object is `an instance of Object`.
+  //       Every *Sync form and close / fstat / fsync / fdatasync / ftruncate /
+  //       fchmod / fchown / futimes check here, so AFTER the JS-side checks of
+  //       their other arguments and of the callback.
+  //
+  // Before this, oam handed the number to the native as it was and reported
+  // EBADF for -1, 1.5, "3" or undefined alike, so code that branches on
+  // ERR_OUT_OF_RANGE / ERR_INVALID_ARG_TYPE (or on EBADF meaning "this was a
+  // real descriptor that is closed") took the wrong branch.
+  //
+  // The first test is the whole cost on the hot path: a valid descriptor is an
+  // int32 that is not negative (-0 passes, as node maps it to 0). The typeof
+  // comes first so that `| 0` never runs a valueOf or throws on a bigint.
+  function validateFd(fd, native) {
+    if (typeof fd === "number" && (fd | 0) === fd && fd >= 0) return;
+    throw invalidFdError(fd, native);
+  }
+
+  // The C++ path's error is node's THROW_ERR_* (src/node_errors.h): a plain
+  // TypeError / RangeError built from the message, with `code` assigned
+  // after -- own keys stack, message, code, the builtin prototype, and a
+  // stack header with no `[CODE]` (measured on v22.22.2). The JS path's is
+  // lib/internal/errors.js's NodeError, as everywhere else.
+  function nativeCodedError(Ctor, message, code) {
+    const err = new Ctor(message);
+    err.code = code;
+    return err;
+  }
+
+  function invalidFdError(fd, native) {
+    if (typeof fd !== "number") {
+      const message =
+        'The "fd" argument must be of type number.' + (native ? nativeReceivedSuffix(fd) : receivedSuffix(fd));
+      if (native) return nativeCodedError(TypeError, message, "ERR_INVALID_ARG_TYPE");
+      return applyNodeErrorShape(new TypeError(message), "ERR_INVALID_ARG_TYPE");
+    }
+    const range = ">= 0 && <= 2147483647";
+    if (native) {
+      // String(fd) is V8's detail string for a number, and as a string it
+      // escapes ERR_OUT_OF_RANGE's digit grouping, which node's C++ never does.
+      const outOfRange = (fd < 0 || fd > 2147483647) && fd !== Infinity && fd !== -Infinity;
+      const message = codes.ERR_OUT_OF_RANGE("fd", outOfRange ? range : "an integer", String(fd)).message;
+      return nativeCodedError(RangeError, message, "ERR_OUT_OF_RANGE");
+    }
+    return codes.ERR_OUT_OF_RANGE("fd", Number.isInteger(fd) ? range : "an integer", fd);
+  }
+
+  // The "Received" tail node's C++ puts on an ERR_INVALID_ARG_TYPE: what
+  // receivedSuffix (the JS one) gives, except that a function or symbol is not
+  // prefixed with its type, a bigint is shown without its `n`, a string is
+  // measured and cut in UTF-8 bytes and a JSON-quoted one is not cut
+  // (nativeQuoteReceivedString), and an object is named by its prototype's
+  // constructor (V8's GetConstructorName), never by an own `constructor`
+  // property. (V8 also infers a name for an anonymous class from the binding
+  // it was assigned to; that is not observable from JS, so such an instance
+  // reads "an instance of Object" here.)
+  function nativeReceivedSuffix(input) {
+    if (typeof input === "function") return " Received function";
+    if (typeof input === "symbol") return " Received " + input.toString();
+    if (typeof input === "bigint") return " Received type bigint (" + input.toString() + ")";
+    if (input !== null && typeof input === "object") {
+      const proto = Object.getPrototypeOf(input);
+      const ctor = proto === null ? undefined : Object.getOwnPropertyDescriptor(proto, "constructor");
+      const name = ctor && typeof ctor.value === "function" ? ctor.value.name : "";
+      return " Received an instance of " + (name || "Object");
+    }
+    if (typeof input === "string") return " Received type string (" + nativeQuoteReceivedString(input) + ")";
+    return receivedSuffix(input);
+  }
+
+  // node's makeCallback / validateFunction(cb, "cb") failure, which oam's fd
+  // callback forms used to report as a bare, code-less "Callback must be a
+  // function".
+  function validateCb(cb, name = "cb") {
+    if (typeof cb !== "function") {
+      throw nodeTypeError('The "' + name + '" argument must be of type function.' + receivedSuffix(cb));
+    }
+  }
+
+  // Where node's callback-form fs calls take their callback from (v22.22.2,
+  // measured per API): the argument after the `required` ones and the
+  // `optional` ones, or an optional slot that already holds a function
+  // (`stat(path, cb)`). Arguments after the callback are ignored, and a
+  // missing callback is "Received undefined" -- not whatever the last
+  // positional argument happened to be. CB_LAST is symlink's rule, which
+  // node writes as `makeCallback(arguments[arguments.length - 1])`.
+  const CB_LAST = -1;
+  function callbackSlot(args, required, optional) {
+    if (required === CB_LAST) return args.length > 0 ? args.length - 1 : 0;
+    const end = required + optional;
+    let at = required;
+    while (at < end && typeof args[at] !== "function") at++;
+    return at;
   }
 
   // ---- vectored-IO primitives, shared by node:fs's readv/writev and by
@@ -9827,14 +10728,23 @@
     // directly would leave the FileHandle believing it was still open, and it
     // would then close the fd a SECOND time -- by which point the number can
     // already have been handed to an unrelated open().
+    //
+    // A number is range-checked by node's JS getValidatedFd, in the
+    // constructor; anything else that is not a FileHandle is refused there
+    // too, where it used to fall through to the path check and blame `path`.
     const suppliedFd = (opts) => {
       const fd = opts.fd;
       if (fd == null) return null;
-      if (typeof fd === "number") return { handle: fd, close: () => natives.fsClose(fd) };
+      if (typeof fd === "number") {
+        validateFd(fd, false);
+        return { handle: fd, close: () => natives.fsClose(fd) };
+      }
       if (typeof fd === "object" && typeof fd.fd === "number" && typeof fd.close === "function") {
         return { handle: fd.fd, close: () => fd.close() };
       }
-      return null;
+      throw nodeTypeError(
+        'The "options.fd" property must be of type number or an instance of FileHandle.' + receivedSuffix(fd),
+      );
     };
 
     class ReadStream extends Readable {
@@ -9848,6 +10758,10 @@
         const opts = readOptions(options);
         const highWaterMark = opts.highWaterMark ?? 65536;
         const supplied = suppliedFd(opts);
+        // node's importFd: with no descriptor, the path is validated here in
+        // the constructor, so a bad one throws from createReadStream itself
+        // rather than failing the open a tick later as an 'error' event.
+        if (!supplied) toPath(path);
         // node's `autoClose` is about the DESCRIPTOR, not the stream object:
         // false means the application owns the fd and the stream must leave it
         // open even at EOF and even on error. It also maps onto the stream
@@ -9958,6 +10872,8 @@
         const opts = readOptions(options);
         const flags = opts.flags === "a" ? "a" : "w";
         const supplied = suppliedFd(opts);
+        // Validated in the constructor, as node's importFd does (see ReadStream).
+        if (!supplied) toPath(path);
         const autoClose = opts.autoClose !== false;
         let handle = supplied ? supplied.handle : null;
         let totalWritten = 0;
@@ -10016,6 +10932,79 @@
     return _rwStreams;
   }
 
+  // node's checkPaths (lib/internal/fs/cp/cp.js) and, for cpSync, its C++
+  // twin cpSyncCheckPaths: copying a directory onto something that exists
+  // and is not a directory fails with ERR_FS_CP_DIR_TO_NON_DIR, the reverse
+  // with ERR_FS_CP_NON_DIR_TO_DIR -- before anything is copied, and before
+  // the check for a directory copied without `recursive`. `destRaw` is the
+  // destination's stat, null when it does not exist. Measured on v22.22.2:
+  // cpSync's is a plain Error with `code` alone, the paths rendered as node
+  // hands them to its C++ (path.toNamespacedPath: absolute, `\\?\`-prefixed
+  // on Windows); cp's and fs.promises.cp's is a SystemError (see
+  // docs/node-divergences.md "Coded errors") naming the paths as given.
+  // Before this a directory copied onto a file failed on the first entry
+  // with ENOENT, or not at all when it was empty, and a file copied onto a
+  // directory failed with EPERM from copyfile.
+  function cpTypeMismatch(srcIsDir, destRaw, src, dest, sync) {
+    if (destRaw === null || srcIsDir === (destRaw.kind === "dir")) return null;
+    const code = srcIsDir ? "ERR_FS_CP_DIR_TO_NON_DIR" : "ERR_FS_CP_NON_DIR_TO_DIR";
+    const kept = srcIsDir ? "non-directory" : "directory";
+    const copied = srcIsDir ? "directory" : "non-directory";
+    if (sync) {
+      const ns = registry.get("path").toNamespacedPath;
+      return makeNodeError(code, `Cannot overwrite ${kept} ${ns(dest)} with ${copied} ${ns(src)}`);
+    }
+    // EISDIR is 21 and ENOTDIR 20 in every platform's os.constants.errno.
+    return new SystemError(code, `Cannot overwrite ${kept} with ${copied}`, {
+      message: `cannot overwrite ${kept} ${dest} with ${copied} ${src}`,
+      path: dest,
+      syscall: "cp",
+      errno: srcIsDir ? 21 : 20,
+      code: srcIsDir ? "EISDIR" : "ENOTDIR",
+    });
+  }
+
+  // A directory copied without `recursive` (measured on v22.22.2): cp's and
+  // fs.promises.cp's is node's SystemError ERR_FS_EISDIR naming the path as
+  // given; cpSync's, from its C++, a plain Error with `code` alone naming
+  // the path as it reaches the C++ -- on Windows namespaced and with a
+  // trailing separator (`\\?\C:\d\`). Off Windows the path is
+  // rendered as given to the C++, not measured.
+  function cpDirWithoutRecursive(src, sync) {
+    if (sync) {
+      const pathModule = registry.get("path");
+      const shown = process.platform === "win32" ? pathModule.toNamespacedPath(src) + pathModule.sep : src;
+      return makeNodeError("ERR_FS_EISDIR", "Recursive option not enabled, cannot copy a directory: " + shown);
+    }
+    return new SystemError("ERR_FS_EISDIR", "Path is a directory", {
+      message: `${src} is a directory (not copied)`,
+      path: src,
+      syscall: "cp",
+      errno: 21,
+      code: "EISDIR",
+    });
+  }
+
+  // The destination's stat for cpTypeMismatch: lstat, as node's (stat with
+  // `dereference`), null when there is nothing there.
+  function cpDestStatSync(natives, dest, opts) {
+    try {
+      return natives.fsStatSync(dest, !opts.dereference);
+    } catch (e) {
+      if (e && e.code === "ENOENT") return null;
+      throw e;
+    }
+  }
+
+  async function cpDestStat(natives, dest, opts) {
+    try {
+      return await natives.fsStat(dest, !opts.dereference);
+    } catch (e) {
+      if (e && e.code === "ENOENT") return null;
+      throw e;
+    }
+  }
+
   registry.factories["fs/promises"] = (natives) => {
     const isWin = natives.platform === "win32";
     // The callback module is built from these same functions, and node's
@@ -10025,50 +11014,130 @@
     // node, and the opposite of what this branch's own e2e docstring claims.
     // So the raw object is stashed for `registry.factories.fs` and only the
     // exported copy is wrapped.
+    // The async methods take their path through `withPath`, which validates
+    // it BEFORE the first await: the callback forms built on these must throw
+    // a bad path synchronously, as node's do, and an async function turned
+    // that throw into a callback error. (The exported module's wrapper turns
+    // it back into a rejection.)
+    // The wrapper keeps the method's `length` (node's fsp.open.length is 3).
+    const withPath = (fn) =>
+      Object.defineProperty((path, ...rest) => fn(toPath(path), ...rest), "length", { value: fn.length });
+    // fs/promises.cp over two validated paths.
+    async function cpRecursive(srcStr, destStr, options) {
+      var opts = options || {};
+      var raw = await natives.fsStat(srcStr, false);
+      // A directory onto a file, or a file onto a directory: node's coded
+      // errors, before anything is copied.
+      var mismatch = cpTypeMismatch(raw.kind === "dir", await cpDestStat(natives, destStr, opts), srcStr, destStr, false);
+      if (mismatch !== null) throw mismatch;
+      if (raw.kind === "dir") {
+        if (!opts.recursive) throw cpDirWithoutRecursive(srcStr, false);
+        try { await natives.fsMkdir(destStr, true); } catch (e) {}
+        var entries = await natives.fsReaddir(srcStr);
+        // node joins each entry's paths with path.join, so an error names
+        // them with the platform's separator.
+        var join = registry.get("path").join;
+        for (var i = 0; i < entries.length; i++) {
+          await cpRecursive(join(srcStr, entries[i].name), join(destStr, entries[i].name), opts);
+        }
+      } else {
+        await natives.fsCopyFile(srcStr, destStr);
+      }
+    }
+    const readFileAt = async (file, options) => {
+      const bytes = await natives.fsReadFile(file);
+      return decodeRead(bytes, readOptions(options).encoding ?? null);
+    };
+    // node's writeFileHandle (lib/internal/fs/promises.js, v22.22.2): a view
+    // in one write -- none at all for an empty one -- or each chunk of an
+    // iterable in turn, a string chunk in the call's encoding.
+    async function writeHandleData(h, data, encoding) {
+      if (!isCustomIterable(data)) {
+        if (data.byteLength !== 0) await natives.fsWriteChunk(h, data);
+        return;
+      }
+      for await (const chunk of data) {
+        const bytes = ArrayBuffer.isView(chunk) ? chunk : globalThis.Buffer.from(chunk, encoding || "utf8");
+        if (bytes.byteLength !== 0) await natives.fsWriteChunk(h, bytes);
+      }
+    }
+    // fs/promises writeFile / appendFile once their options are checked: the
+    // data, then a FileHandle writes through itself and a path is validated.
+    // A view or string is one native write; an iterable is written chunk by
+    // chunk into the file opened for it, as node's is.
+    //
+    // The path is opened with the call's `flag`, checked as open checks it
+    // (after the path, before the mode): "w" and "a" -- the defaults -- are
+    // one native write; any other flag opens the file with it ("wx" fails
+    // EEXIST, "r+" overwrites in place, "r" fails EBADF on the write).
+    const writeFileAt = (path, data, options, append) => {
+      data = writeFileData(data, options, true);
+      if (fileHandles.has(path)) return path.writeFile(data, options);
+      const file = toPath(path);
+      const flag = openFlags(options.flag || (append ? "a" : "w"), natives.platform);
+      parseFileMode(options.mode, "mode", 0o666);
+      if (!isCustomIterable(data) && (flag === "w" || flag === "a")) {
+        return natives.fsWriteFile(file, data, flag === "a");
+      }
+      return (async () => {
+        const { handle } = await natives.fsOpen(file, flag);
+        try {
+          await writeHandleData(handle, data, options.encoding);
+        } finally {
+          natives.fsClose(handle);
+        }
+      })();
+    };
     rawFsPromises = {
-      readFile: async (path, options) => {
-        const bytes = await natives.fsReadFile(toPath(path));
-        return decodeRead(bytes, readOptions(options).encoding ?? null);
-      },
-      writeFile: (path, data, options) =>
-        natives.fsWriteFile(toPath(path), encodeWrite(data, options), false),
-      appendFile: (path, data, options) =>
-        natives.fsWriteFile(toPath(path), encodeWrite(data, options), true),
-      stat: async (path) => wrapStat(await natives.fsStat(toPath(path), false)),
-      lstat: async (path) => wrapStat(await natives.fsStat(toPath(path), true)),
-      statfs: async (path, options) => wrapStatFs(await natives.fsStatfs(toPath(path)), options),
-      readdir: async (path, options) => {
+      // A FileHandle reads / writes through itself, as node's do.
+      readFile: (path, options) =>
+        fileHandles.has(path) ? path.readFile(options) : readFileAt(toPath(path), options),
+      writeFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, false), false),
+      appendFile: (path, data, options) => writeFileAt(path, data, writeFileOptions(options, true), true),
+      stat: withPath(async (file) => wrapStat(await natives.fsStat(file, false))),
+      lstat: withPath(async (file) => wrapStat(await natives.fsStat(file, true))),
+      statfs: withPath(async (file, options) => wrapStatFs(await natives.fsStatfs(file), options)),
+      readdir: withPath(async (file, options) => {
         const { withFileTypes } = readOptions(options);
-        const entries = await natives.fsReaddir(toPath(path));
-        return wrapDirents(toPath(path), entries, withFileTypes === true);
-      },
-      mkdir: async (path, options) => {
-        await natives.fsMkdir(toPath(path), readOptions(options).recursive === true);
-      },
-      rm: async (path, options = {}) => {
-        await natives.fsRm(toPath(path), options.recursive === true, options.force === true);
-      },
-      rmdir: async (path) => {
+        const entries = await natives.fsReaddir(file);
+        return wrapDirents(file, entries, withFileTypes === true);
+      }),
+      mkdir: withPath(async (file, options) => {
+        await natives.fsMkdir(file, readOptions(options).recursive === true);
+      }),
+      rm: withPath(async (file, options) => {
+        validateRmOptions(options);
+        const recursive = options?.recursive === true;
+        const force = options?.force === true;
+        let raw, failed;
+        try {
+          raw = await natives.fsStat(file, true);
+        } catch (e) {
+          failed = e;
+        }
+        rmCheckTarget(file, recursive, force, raw, failed);
+        await natives.fsRm(file, recursive, force);
+      }),
+      rmdir: withPath(async (dir) => {
         // Node never deletes a FILE through rmdir (code-probing callers
         // depend on the throw); kind-check first. The probe is an internal
         // detail -- node reports `rmdir` as the failing syscall, so relabel
         // rather than leaking `lstat` (same as the sync twin).
         let raw;
         try {
-          raw = await natives.fsStat(toPath(path), true);
+          raw = await natives.fsStat(dir, true);
         } catch (e) {
-          if (e && e.syscall === "lstat") e.syscall = "rmdir";
-          throw e;
+          throw asRmdirError(e);
         }
         if (raw.kind !== "dir") {
           // As in the sync twin: node's full system-error shape.
-          throw makeSystemError(isWin ? "ENOENT" : "ENOTDIR", "rmdir", path);
+          throw makeSystemError(isWin ? "ENOENT" : "ENOTDIR", "rmdir", fsErrorPath(dir));
         }
-        await natives.fsRm(toPath(path), false, false);
-      },
+        await natives.fsRm(dir, false, false);
+      }),
       unlink: (path) => natives.fsUnlink(toPath(path)),
-      rename: (from, to) => natives.fsRename(toPath(from), toPath(to)),
-      copyFile: (from, to) => natives.fsCopyFile(toPath(from), toPath(to)),
+      rename: (from, to) => natives.fsRename(toPath(from, "oldPath"), toPath(to, "newPath")),
+      copyFile: (from, to) => natives.fsCopyFile(toPath(from, "src"), toPath(to, "dest")),
       // node v22's fs.promises.glob returns an AsyncIterable, not a Promise.
       // Wrap the materialized array so Array.fromAsync() works on both sides.
       glob: (pattern, options) => globAsyncIterable(globSyncRaw(pattern, options, natives)),
@@ -10078,18 +11147,34 @@
       _globAsPromise: (pattern, options) => Promise.resolve().then(() => globSyncRaw(pattern, options, natives)),
       access: (path, mode) => natives.fsAccess(toPath(path), mode ?? 0),
       realpath: (path) => natives.fsRealpath(toPath(path)),
-      mkdtemp: (prefix) => natives.fsMkdtemp(toPath(prefix)),
-      symlink: (target, path) => natives.fsSymlink(toPath(target), toPath(path)),
+      mkdtemp: (prefix) => natives.fsMkdtemp(toPath(prefix, "prefix")),
+      symlink: (target, path) => natives.fsSymlink(toPath(target, "target"), toPath(path)),
       readlink: (path) => natives.fsReadlink(toPath(path)),
-      link: (existing, newPath) => natives.fsLink(toPath(existing), toPath(newPath)),
-      chmod: (path, mode) => natives.fsChmod(toPath(path), mode),
-      truncate: (path, len) => natives.fsTruncate(toPath(path), len ?? 0),
-      chown: (path, uid, gid) => natives.fsChown(toPath(path), uid, gid),
-      lchown: (path, uid, gid) => natives.fsLchown(toPath(path), uid, gid),
-      utimes: (path, atime, mtime) =>
-        natives.fsUtimes(toPath(path), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
-      lutimes: (path, atime, mtime) =>
-        natives.fsLutimes(toPath(path), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
+      link: (existing, newPath) =>
+        natives.fsLink(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
+      // The path first, then node's validators for the rest (lib/internal/
+      // fs/promises.js, v22.22.2) -- each thrown here and turned into a
+      // rejection by the exported module's wrapper, and thrown at the call
+      // by the callback forms built on these.
+      chmod: (path, mode) => natives.fsChmod(toPath(path), parseFileMode(mode, "mode")),
+      // node opens the file "r+" and ftruncates the descriptor, so a missing
+      // file is ENOENT `open` before the length is looked at, and a bad
+      // length leaves the file alone.
+      truncate: withPath(async (file, len = 0) => {
+        const { handle } = await natives.fsOpen(file, "r+");
+        try {
+          validateInteger(len, "len");
+          await natives.fsFtruncate(handle, Math.max(0, len));
+        } finally {
+          natives.fsClose(handle);
+        }
+      }),
+      chown: (path, uid, gid) => natives.fsChown(toPath(path), ...ownerArgs(uid, gid)),
+      lchown: (path, uid, gid) => natives.fsLchown(toPath(path), ...ownerArgs(uid, gid)),
+      // The path forms' times are node's toUnixTimestamp under its default
+      // name ("time"); only the descriptor forms name them atime / mtime.
+      utimes: (path, atime, mtime) => natives.fsUtimes(toPath(path), ...pathTimes(atime, mtime)),
+      lutimes: (path, atime, mtime) => natives.fsLutimes(toPath(path), ...pathTimes(atime, mtime)),
       // lchmod diverges between the two modules, which is easy to get wrong.
       // In `node:fs` the name is bound to UNDEFINED off macOS. Here in
       // `fs/promises` it is ALWAYS a function, and off macOS it REJECTS.
@@ -10097,36 +11182,21 @@
       // and calling it rejects with a plain Error carrying only a `code` own
       // property -- name "Error", not a subclass.
       lchmod: (path, mode) => {
-        if (natives.platform === "darwin") return natives.fsLchmod(toPath(path), mode);
+        if (natives.platform === "darwin") return natives.fsLchmod(toPath(path), parseFileMode(mode, "mode"));
         const err = new Error("The lchmod() method is not implemented");
         err.code = "ERR_METHOD_NOT_IMPLEMENTED";
         return Promise.reject(err);
       },
-      opendir: async function (path) {
-        var dirPath = toPath(path);
+      opendir: withPath(async function (dirPath) {
         return new Dir(dirPath, await natives.fsReaddir(dirPath));
-      },
-      cp: async function cpRecursive(src, dest, options) {
-        var srcStr = toPath(src);
-        var destStr = toPath(dest);
-        var opts = options || {};
-        var raw;
-        try { raw = await natives.fsStat(srcStr, false); } catch (e) { throw e; }
-        if (raw.kind === "dir") {
-          if (!opts.recursive) throw makeNodeError("ERR_FS_CP_DIR_TO_NON_DIR", "cp: -r not specified; omitting directory '" + srcStr + "'");
-          try { await natives.fsMkdir(destStr, true); } catch (e) {}
-          var entries = await natives.fsReaddir(srcStr);
-          for (var i = 0; i < entries.length; i++) {
-            var sep = srcStr.endsWith("/") || srcStr.endsWith("\\") ? "" : "/";
-            await cpRecursive(srcStr + sep + entries[i].name, destStr + sep + entries[i].name, opts);
-          }
-        } else {
-          await natives.fsCopyFile(srcStr, destStr);
-        }
-      },
-      open: async function (path, flags, mode) {
-        flags = flags || "r";
-        var info = await natives.fsOpen(toPath(path), String(flags));
+      }),
+      cp: (src, dest, options) => cpRecursive(toPath(src, "src"), toPath(dest, "dest"), options),
+      // node's order: the path, the flags, the mode.
+      open: withPath(async function (file, flags, mode) {
+        flags = openFlags(flags, natives.platform);
+        parseFileMode(mode, "mode", 0o666);
+        var info = await natives.fsOpen(file, flags);
+
         var h = info.handle;
         var closed = false;
         // readableWebStream() locks the handle to its stream FOR LIFE -- see
@@ -10184,11 +11254,13 @@
             }
             return enc ? buf.toString(enc) : buf;
           },
+          // node's fs/promises writeFile over this handle: the options, then
+          // the data (a string, a view or an iterable), as every writeFile
+          // form checks them; the flag and flush do not apply to a handle.
           writeFile: async function (data, options) {
             guard("writeFile");
-            var enc = (options && typeof options === "object") ? options.encoding : (typeof options === "string" ? options : "utf8");
-            if (typeof data === "string") data = globalThis.Buffer.from(data, enc);
-            await natives.fsWriteChunk(h, data);
+            options = writeFileOptions(options, false);
+            await writeHandleData(h, writeFileData(data, options, true), options.encoding);
           },
           // NOT an append. node documents FileHandle.appendFile as an ALIAS of
           // writeFile ("the mode cannot be changed from what it was set to
@@ -10204,24 +11276,58 @@
           // leaves the cursor alone. Both used to accept the argument and throw
           // it away, because the natives had no position parameter to pass it
           // to -- fh.read(buf, 0, 3, 10) returned the bytes at the cursor.
+          //
+          // node's overloads and checks (lib/internal/fs/promises.js write,
+          // v22.22.2), the same as fs.writeSync's: (buffer[, offset[,
+          // length[, position]]]) or (buffer, options) with bufferWriteArgs,
+          // and (string[, position[, encoding]]) -- the second argument is a
+          // POSITION there, not an offset into the string. An empty view
+          // resolves 0 before anything is checked. The result has a null
+          // prototype, as node's has.
           write: async function (buffer, offset, length, position) {
             guard("write");
-            if (typeof buffer === "string") buffer = globalThis.Buffer.from(buffer);
-            var slice = (offset != null || length != null) ? buffer.subarray(offset || 0, length != null ? (offset || 0) + length : undefined) : buffer;
-            await natives.fsWriteChunk(h, slice, fsPositionArg(position));
-            return { bytesWritten: slice.length, buffer: buffer };
+            if (buffer?.byteLength === 0) return { __proto__: null, bytesWritten: 0, buffer: buffer };
+            var bytes, pos;
+            if (ArrayBuffer.isView(buffer)) {
+              ({ bytes, position: pos } = bufferWriteArgs(buffer, offset, length, position, false));
+            } else {
+              validateWriteData(buffer, "buffer");
+              validateWriteEncoding(buffer, length);
+              bytes = globalThis.Buffer.from(buffer, writeEncoding(length));
+              pos = fsPositionArg(offset);
+            }
+            await natives.fsWriteChunk(h, bytes, pos);
+            return { __proto__: null, bytesWritten: bytes.byteLength, buffer: buffer };
           },
+          // node's overloads and checks (lib/internal/fs/promises.js,
+          // v22.22.2): read(options), read(buffer, options) and the
+          // positional form; then the offset, which an empty read checks
+          // too, and the range. Unlike fs.read the length is not `| 0`'d:
+          // a missing one is the rest of the buffer.
           read: async function (buffer, offset, length, position) {
             guard("read");
-            validateReadLength(buffer, offset, length);
-            var want = length != null ? length : (buffer ? buffer.byteLength - (offset || 0) : 65536);
-            var chunk = await natives.fsReadChunk(h, want, fsPositionArg(position));
-            if (chunk === undefined) return { bytesRead: 0, buffer: buffer };
-            if (buffer) {
-              var dest = new Uint8Array(buffer.buffer || buffer, (buffer.byteOffset || 0) + (offset || 0));
-              dest.set(chunk);
+            if (!ArrayBuffer.isView(buffer)) {
+              if (buffer !== undefined) validateReadOptions(buffer);
+              ({
+                buffer = globalThis.Buffer.alloc(16384),
+                offset = 0,
+                length = buffer.byteLength - offset,
+                position = null,
+              } = buffer ?? {});
+              validateReadBuffer(buffer);
             }
-            return { bytesRead: chunk.length, buffer: buffer || globalThis.Buffer.from(chunk) };
+            if (offset !== null && typeof offset === "object") {
+              ({ offset = 0, length = buffer.byteLength - offset, position = null } = offset);
+            }
+            if (offset == null) offset = 0;
+            else validateInteger(offset, "offset", 0);
+            length ??= buffer.byteLength - offset;
+            if (length === 0) return { __proto__: null, bytesRead: 0, buffer: buffer };
+            validateReadRange(buffer, offset, length);
+            var chunk = await natives.fsReadChunk(h, length, readPosition(position, length));
+            if (chunk === undefined) return { __proto__: null, bytesRead: 0, buffer: buffer };
+            new Uint8Array(buffer.buffer, buffer.byteOffset + offset, length).set(chunk);
+            return { __proto__: null, bytesRead: chunk.length, buffer: buffer };
           },
           // FSTAT, not stat. This used to re-stat the PATH the handle was
           // opened from, which is a different object the moment anything moves
@@ -10234,9 +11340,13 @@
             guard("fstat");
             return wrapStat(await natives.fsFstat(h));
           },
+          // node's validators, after the closed-handle check (fsCall runs
+          // first): chmod's mode through parseFileMode, chown's uid / gid
+          // in [-1, 2**32-1], truncate's length an integer (a negative one
+          // is 0) -- the same checks as fchmod / fchown / ftruncate.
           chmod: async function (mode) {
             guard("fchmod");
-            await natives.fsFchmod(h, mode);
+            await natives.fsFchmod(h, parseFileMode(mode, "mode"));
           },
           // POSIX-only in effect. libuv implements uv_fs_fchown on Windows as
           // a successful no-op, and node inherits that -- the call RESOLVES
@@ -10244,11 +11354,12 @@
           // this way. Left unguarded so the resolve/reject shape matches.
           chown: async function (uid, gid) {
             guard("fchown");
-            await natives.fsFchown(h, uid, gid);
+            await natives.fsFchown(h, ...ownerArgs(uid, gid));
           },
-          truncate: async function (len) {
+          truncate: async function (len = 0) {
             guard("ftruncate");
-            await natives.fsFtruncate(h, len ?? 0);
+            validateInteger(len, "len");
+            await natives.fsFtruncate(h, Math.max(0, len));
           },
           sync: async function () {
             guard("fsync");
@@ -10281,15 +11392,15 @@
             if (n > 0) tmp.set(chunk);
             scatterViews(buffers, tmp, n);
             // The SAME array instance goes back out; callers compare identity.
-            return { bytesRead: n, buffers: buffers };
+            return { __proto__: null, bytesRead: n, buffers: buffers };
           },
           writev: async function (buffers, position) {
             guard("writev");
             var total = asViewArray(buffers);
             // node reports 0 without touching the descriptor.
-            if (emptyList(buffers)) return { bytesWritten: 0, buffers: buffers };
+            if (emptyList(buffers)) return { __proto__: null, bytesWritten: 0, buffers: buffers };
             await natives.fsWriteChunk(h, flattenViews(buffers, total), fsPositionArg(position));
-            return { bytesWritten: total, buffers: buffers };
+            return { __proto__: null, bytesWritten: total, buffers: buffers };
           },
           // The WEB stream, and not createReadStream in web clothing: node
           // builds it directly over THIS handle's read() (lib/internal/fs/
@@ -10435,8 +11546,9 @@
             await fh.close();
           },
         };
+        fileHandles.add(fh);
         return fh;
-      },
+      }),
       constants: {
         F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
         O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,
@@ -10479,12 +11591,14 @@
     const fsReqEnd = (token) => registry._activeRequests.delete(token);
 
     // Callback forms delegate to the promise forms (Node-style (err, value)).
-    function callbackify1(promiseFn) {
+    // `required` / `optional` say where node finds the callback (callbackSlot);
+    // the promise form gets the arguments before it.
+    function callbackify1(promiseFn, required, optional = 0, cbName = "cb") {
       return (...args) => {
-        const cb = args.pop();
-        if (typeof cb !== "function") {
-          throw new TypeError("Callback must be a function");
-        }
+        const at = callbackSlot(args, required, optional);
+        const cb = args[at];
+        validateCb(cb, cbName);
+        if (args.length > at) args.length = at;
         const token = fsReqStart();
         // Several promise forms are plain (non-async) arrows, so argument
         // validation throws SYNCHRONOUSLY -- the token must drop before the
@@ -10497,10 +11611,246 @@
           fsReqEnd(token);
           throw e;
         }
+        // node's FSReqCallback::Resolve passes the value only when there is
+        // one: an operation with no result (chmod, rename, unlink, ...) calls
+        // back with the single argument null, not (null, undefined).
         p.then(
-          (value) => { fsReqEnd(token); queueMicrotask(() => cb(null, value)); },
+          (value) => {
+            fsReqEnd(token);
+            queueMicrotask(() => (value === undefined ? cb(null) : cb(null, value)));
+          },
           (err) => { fsReqEnd(token); queueMicrotask(() => cb(err)); },
         );
+      };
+    }
+
+    // node's isInt32: what readFile / writeFile / appendFile take as a file
+    // descriptor rather than a path.
+    function isInt32(value) {
+      return value === (value | 0);
+    }
+
+    // node's realpath / realpathSync argument: a file: URL becomes its path,
+    // anything else is stringified (`p += ''`), and a NUL byte is refused.
+    function realpathArg(path) {
+      const isUrl = path && typeof path === "object" && typeof path.href === "string" &&
+        path.auth === undefined && path.path === undefined;
+      return toPath(typeof path === "string" || isUrl ? path : path + "");
+    }
+
+    function realpathWalkErrorSync(path, original) {
+      const walk = realpathWalk(path);
+      let step = walk.next();
+      try {
+        while (!step.done) {
+          const [op, at] = step.value;
+          step = walk.next(op === "readlink" ? natives.fsReadlinkSync(at) : natives.fsStatSync(at, op === "lstat"));
+        }
+      } catch (e) {
+        return e;
+      }
+      return original;
+    }
+
+    async function realpathWalking(path) {
+      try {
+        return await natives.fsRealpath(path);
+      } catch (original) {
+        // A failing lstat / readlink rejects with its own error.
+        const walk = realpathWalk(path);
+        let step = walk.next();
+        while (!step.done) {
+          const [op, at] = step.value;
+          step = walk.next(op === "readlink" ? await natives.fsReadlink(at) : await natives.fsStat(at, op === "lstat"));
+        }
+        throw original;
+      }
+    }
+
+    // DEP0081, once per process as node warns it.
+    let truncateFdWarned = false;
+    function warnTruncateFd() {
+      if (truncateFdWarned) return;
+      truncateFdWarned = true;
+      process.emitWarning(
+        "Using fs.truncate with a file descriptor is deprecated. Please use fs.ftruncate with a file descriptor instead.",
+        "DeprecationWarning",
+        "DEP0081",
+      );
+    }
+
+    // readFileSync(fd): everything from the descriptor's current position.
+    // fstat first, as node's does, so a bad descriptor fails `fstat` -- and a
+    // negative one fails fstatSync's descriptor check.
+    function readFdSync(fd) {
+      fs.fstatSync(fd);
+      const chunks = [];
+      let total = 0;
+      for (;;) {
+        const chunk = globalThis.Buffer.allocUnsafe(65536);
+        const n = fs.readSync(fd, chunk, 0, chunk.length, null);
+        if (n === 0) break;
+        chunks.push(n === chunk.length ? chunk : chunk.subarray(0, n));
+        total += n;
+      }
+      return globalThis.Buffer.concat(chunks, total);
+    }
+
+    // writeFileSync(fd) / appendFileSync(fd): all of the data at the current
+    // position (node does not seek a descriptor it was handed). Node takes
+    // two paths here (v22.22.2 lib/fs.js writeFileSync):
+    // - a string with encoding exactly "utf8" / "utf-8" (the default) goes to
+    //   the binding's writeFileUtf8, which hands any int32 to the write: a
+    //   negative descriptor fails EBADF `write`, its keys errno, code,
+    //   syscall;
+    // - anything else goes through fs.writeSync, which range-checks the
+    //   descriptor first (ERR_OUT_OF_RANGE "fd" for a negative one).
+    function writeFdSync(fd, data, options) {
+      const encoding = readOptions(options).encoding ?? "utf8";
+      const utf8 = typeof data === "string" && (encoding === "utf8" || encoding === "utf-8");
+      const bytes = encodeWrite(data, options);
+      let off = 0;
+      try {
+        // Per write, as node's writeSync checks it: empty data writes nothing
+        // and checks nothing.
+        while (off < bytes.byteLength) {
+          off += utf8
+            ? writeSyncTo(fd, off === 0 ? bytes : bytes.subarray(off), null)
+            : fs.writeSync(fd, bytes, off, bytes.byteLength - off, null);
+        }
+      } catch (e) {
+        // writeSync's error has errno, syscall, code (as node's does);
+        // writeFileUtf8's has errno, code, syscall.
+        if (utf8 && e !== null && typeof e === "object" && Object.hasOwn(e, "syscall")) {
+          const syscall = e.syscall;
+          delete e.syscall;
+          e.syscall = syscall;
+        }
+        throw e;
+      }
+    }
+
+    // writeFileSync / appendFileSync once their options are checked (node's
+    // order, lib/fs.js v22.22.2: the options, then the data, then the path or
+    // descriptor). A string to write as UTF-8 is node's C++ fast path, which
+    // takes the path first and the mode after it; any other data is checked
+    // and encoded before the path is looked at.
+    function writeFileSyncAt(path, data, options, append) {
+      const enc = options.encoding;
+      const utf8String = typeof data === "string" && (enc === "utf8" || enc === "utf-8");
+      if (!utf8String) data = writeFileData(data, options, false);
+      if (isInt32(path)) {
+        if (utf8String) parseFileMode(options.mode, "mode", 0o666);
+        return void writeFdSync(path, data, options);
+      }
+      const file = toPath(path);
+      const flag = openFlags(options.flag || (append ? "a" : "w"), natives.platform);
+      parseFileMode(options.mode, "mode", 0o666);
+      const bytes = encodeWrite(data, options);
+      if (flag === "w" || flag === "a") return void natives.fsWriteFileSync(file, bytes, flag === "a");
+      // Any other flag: open with it, write it all, close -- node's own
+      // writeFileSync, which writes nothing (and so fails nothing) when the
+      // data is empty.
+      const fd = natives.fsOpenSync(file, flag);
+      try {
+        if (bytes.byteLength !== 0) natives.fsWriteSync(fd, bytes, null);
+      } finally {
+        natives.fsCloseSync(fd);
+      }
+    }
+
+    // The write under fs.writeSync, past its argument and descriptor checks.
+    // fd 1/2 (stdout/stderr) have no native fd-table entry -- route them to
+    // the process stdout/stderr sinks so fs.writeSync(1|2, ...) matches Node
+    // instead of throwing EBADF (pino/sonic-boom sync mode writes here). The
+    // sink hands back the error a failed write got, and it throws here as
+    // node's writeSync throws it, in writeSync's key order.
+    function writeSyncTo(fd, buf, pos) {
+      if (fd === 1 || fd === 2) {
+        const failed = fd === 1 ? natives.stdoutWrite(buf) : natives.stderrWrite(buf);
+        if (failed) throw ctxOrderError(failed);
+        return buf.length;
+      }
+      // ctxOrderError only here: fs.write and fs.writevSync route through the
+      // same native but keep node's common errno/code/syscall order.
+      try {
+        return natives.fsWriteSync(fd, buf, pos);
+      } catch (e) {
+        throw ctxOrderError(e);
+      }
+    }
+
+    // readFile(fd, cb). node looks at the descriptor a tick later, in
+    // readFileAfterOpen's binding.fstat, so a negative one is not thrown at
+    // the call and never reaches the callback: it is thrown from that tick,
+    // as an uncaught exception (v22.22.2, measured -- a try/catch around
+    // fs.readFile(-1, cb) does not see it).
+    function readFdAsync(fd, cb) {
+      if (fd < 0) {
+        const err = invalidFdError(fd, true);
+        process.nextTick(() => { throw err; });
+        return;
+      }
+      fs.fstat(fd, (statErr) => {
+        if (statErr) return cb(statErr);
+        const chunks = [];
+        let total = 0;
+        const next = () => {
+          const chunk = globalThis.Buffer.allocUnsafe(65536);
+          fs.read(fd, chunk, 0, chunk.length, null, (err, n) => {
+            if (err) return cb(err);
+            if (n === 0) return cb(null, globalThis.Buffer.concat(chunks, total));
+            chunks.push(n === chunk.length ? chunk : chunk.subarray(0, n));
+            total += n;
+            next();
+          });
+        };
+        next();
+      });
+    }
+
+    // writeFile / appendFile, callback form: a descriptor is written in place
+    // from its current position, a path goes through fs/promises.
+    function fdOrPathWrite(promiseFn, append) {
+      return function (path, data, options, cb) {
+        // node's `callback ||= options`: with no callback, the options
+        // argument is the one validated as it.
+        if (!cb) cb = options;
+        // node's order (lib/fs.js, v22.22.2): the callback, the options, the
+        // data (a string or a view -- not the iterables fs/promises also
+        // takes -- encoded here), then the path or descriptor.
+        validateCb(cb);
+        options = writeFileOptions(options, append);
+        const bytes = writeFileData(data, options, false);
+        if (!isInt32(path)) {
+          // The path's own checks throw here, at the call, as node's fs.open
+          // does; the write's outcome reaches the callback, with no value.
+          const token = fsReqStart();
+          let p;
+          try {
+            p = promiseFn(path, bytes, options);
+          } catch (e) {
+            fsReqEnd(token);
+            throw e;
+          }
+          p.then(
+            () => { fsReqEnd(token); queueMicrotask(() => cb(null)); },
+            (err) => { fsReqEnd(token); queueMicrotask(() => cb(err)); },
+          );
+          return;
+        }
+        // fs.write's descriptor check, which node reaches synchronously.
+        validateFd(path, false);
+        let off = 0;
+        const next = () => {
+          if (off >= bytes.byteLength) return cb(null);
+          fs.write(path, bytes, off, bytes.byteLength - off, null, (err, n) => {
+            if (err) return cb(err);
+            off += n;
+            next();
+          });
+        };
+        next();
       };
     }
 
@@ -10524,6 +11874,8 @@
       var poll = setInterval(function () {
         if (closed) return;
         natives.fsStat(filePath, false).then(function (stat) {
+          // A stat already in flight when close() ran reports nothing.
+          if (closed) return;
           if (stat.mtimeMs !== prevMtime) {
             prevMtime = stat.mtimeMs;
             var parts = filePath.replace(/\\/g, "/").split("/");
@@ -10532,7 +11884,7 @@
             if (listener) listener("change", base);
           }
         }, function (e) {
-          watcher.emit("error", e);
+          if (!closed) watcher.emit("error", e);
         });
       }, pollInterval);
       watcher.close = function () {
@@ -10596,8 +11948,14 @@
       } catch (e) {
         prev = wrapStat({ kind: "file", size: 0, mtime: 0, atime: 0, mode: 0 });
       }
+      // Stopped by close() / unwatchFile(): a stat already in flight then
+      // reports nothing, as node's stopped StatWatcher calls no listener.
+      // Without it a poll that was slow to complete (a loaded machine)
+      // fired the listener after close.
+      var stopped = false;
       var poll = setInterval(function () {
         natives.fsStat(filePath, false).then(function (raw) {
+          if (stopped) return;
           var curr = wrapStat(raw);
           if (curr.mtimeMs !== prev.mtimeMs) {
             if (listener) listener(curr, prev);
@@ -10605,7 +11963,10 @@
           }
         }, function () {});
       }, interval);
-      var stop = function () { clearInterval(poll); };
+      var stop = function () {
+        stopped = true;
+        clearInterval(poll);
+      };
       var self = { listener: listener, stop: stop };
       var entries = watchFilePollers.get(filePath);
       if (entries) entries.push(self);
@@ -10620,18 +11981,52 @@
       };
     }
 
-    // Map numeric O_* open flags to the fopen-style string natives.fsOpen
-    // takes. Most callers pass a string ("r"/"w"/...); chokidar does.
-    function numericOpenFlags(n) {
-      var acc = n & 3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
-      var append = (n & platformOFlags(natives.platform).O_APPEND) !== 0; // O_APPEND
-      if (acc === 1) return append ? "a" : "w";
-      if (acc === 2) return append ? "a+" : "r+";
-      return "r";
+    // The path halves of callback forms whose own wrapper has already put the
+    // callback in place, built once rather than per call.
+    const readFileByPath = callbackify1(promises.readFile, 2);
+    // realpathArg runs inside, so the callback is checked before the path.
+    const realpathByPath = callbackify1((p) => realpathWalking(realpathArg(p)), 1);
+    const truncateByPath = callbackify1(promises.truncate, 2);
+    const chmodByPath = callbackify1(promises.chmod, 2);
+
+    // node's callback for fs.close(fd) without one: a failure is thrown.
+    function defaultCloseCallback(err) {
+      if (err != null) throw err;
+    }
+
+    // The read behind fs.read and fs.readv, arguments already checked: `want`
+    // bytes at `position` (the native's: null for the cursor, else a
+    // non-negative number) into buffer[offset..], then cb(err, bytesRead,
+    // buffer). It always asks the native, even for 0 bytes -- fs.read returns
+    // early for those itself, but readv of empty views must still reach the
+    // descriptor (EBADF for a closed one, as node's).
+    function readChunkInto(fd, buffer, offset, want, position, cb) {
+      // The position was once parsed and then DROPPED -- fsReadChunk had no
+      // position parameter, so `fs.read(fd, buf, 0, 3, 10, cb)` read from the
+      // cursor and handed back the wrong bytes with no error. The native now
+      // takes one; null still means "from the cursor".
+      Promise.resolve(natives.fsReadChunk(fd, want, position)).then(
+        function (chunk) {
+          if (chunk === undefined || chunk === null) {
+            queueMicrotask(function () { cb(null, 0, buffer); });
+            return;
+          }
+          var view = new Uint8Array(buffer.buffer, buffer.byteOffset + offset);
+          view.set(chunk.subarray(0, Math.min(chunk.length, view.length)));
+          queueMicrotask(function () { cb(null, chunk.length, buffer); });
+        },
+        // node calls a failed read back with (err, 0, buffer), as a write.
+        function (err) { queueMicrotask(function () { cb(err, 0, buffer); }); },
+      );
     }
 
     const fs = {
-      promises,
+      // The exported object is the WRAPPED module, the very object
+      // require("fs/promises") returns (node: `fs.promises ===
+      // require("fs/promises")`), so `fs.promises.stat(bad)` rejects as
+      // node's does. The raw `promises` above, which throws a bad path
+      // synchronously, stays internal to the callback forms.
+      promises: registry.get("fs/promises"),
       constants: {
         F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
         O_RDONLY: 0, O_WRONLY: 1, O_RDWR: 2,
@@ -10652,21 +12047,29 @@
       F_OK: 0, X_OK: 1, W_OK: 2, R_OK: 4,
       Dir,
 
+      // An int32 `path` is a file descriptor (node's isInt32 test), read or
+      // written from its current position; anything else must be a path.
       readFileSync: (path, options) => {
         const enc = readOptions(options).encoding;
+        if (isInt32(path)) return decodeRead(readFdSync(path), enc ?? null);
         if (enc === "utf8" || enc === "utf-8") {
           return natives.fsReadFileUtf8Sync(toPath(path));
         }
         const bytes = natives.fsReadFileSync(toPath(path));
         return decodeRead(bytes, enc ?? null);
       },
-      writeFileSync: (path, data, options) => {
-        natives.fsWriteFileSync(toPath(path), encodeWrite(data, options), false);
+      writeFileSync: (path, data, options) => writeFileSyncAt(path, data, writeFileOptions(options, false), false),
+      appendFileSync: (path, data, options) => writeFileSyncAt(path, data, writeFileOptions(options, true), true),
+      // node answers false for a path it cannot even validate.
+      existsSync: (path) => {
+        let file;
+        try {
+          file = toPath(path);
+        } catch {
+          return false;
+        }
+        return natives.fsExistsSync(file);
       },
-      appendFileSync: (path, data, options) => {
-        natives.fsWriteFileSync(toPath(path), encodeWrite(data, options), true);
-      },
-      existsSync: (path) => natives.fsExistsSync(toPath(path)),
       statSync: (path) => wrapStat(natives.fsStatSync(toPath(path), false)),
       lstatSync: (path) => wrapStat(natives.fsStatSync(toPath(path), true)),
       statfsSync: (path, options) => wrapStatFs(natives.fsStatfsSync(toPath(path)), options),
@@ -10682,19 +12085,34 @@
       mkdirSync: (path, options) => {
         natives.fsMkdirSync(toPath(path), readOptions(options).recursive === true);
       },
-      rmSync: (path, options = {}) => {
-        natives.fsRmSync(toPath(path), options.recursive === true, options.force === true);
+      // node's rmSync skips the lstat only when both `force` and
+      // `recursive` are set.
+      rmSync: (path, options) => {
+        const file = toPath(path);
+        validateRmOptions(options);
+        const recursive = options?.recursive === true;
+        const force = options?.force === true;
+        if (!force || !recursive) {
+          let raw, failed;
+          try {
+            raw = natives.fsStatSync(file, true);
+          } catch (e) {
+            failed = e;
+          }
+          rmCheckTarget(file, recursive, force, raw, failed);
+        }
+        natives.fsRmSync(file, recursive, force);
       },
       rmdirSync: (path) => {
         // The kind probe is an implementation detail: node reports `rmdir` as
         // the failing syscall, so an ENOENT from this internal lstat must not
         // surface as `syscall: "lstat"`.
+        const dir = toPath(path);
         let raw;
         try {
-          raw = natives.fsStatSync(toPath(path), true);
+          raw = natives.fsStatSync(dir, true);
         } catch (e) {
-          if (e && e.syscall === "lstat") e.syscall = "rmdir";
-          throw e;
+          throw asRmdirError(e);
         }
         if (raw.kind !== "dir") {
           // Full system-error shape, not just a code: node sets syscall/path/
@@ -10702,138 +12120,245 @@
           throw makeSystemError(
             natives.platform === "win32" ? "ENOENT" : "ENOTDIR",
             "rmdir",
-            path,
+            fsErrorPath(dir),
           );
         }
-        natives.fsRmSync(toPath(path), false, false);
+        natives.fsRmSync(dir, false, false);
       },
       unlinkSync: (path) => natives.fsUnlinkSync(toPath(path)),
-      renameSync: (from, to) => natives.fsRenameSync(toPath(from), toPath(to)),
-      copyFileSync: (from, to) => natives.fsCopyFileSync(toPath(from), toPath(to)),
+      renameSync: (from, to) =>
+        natives.fsRenameSync(toPath(from, "oldPath"), toPath(to, "newPath")),
+      copyFileSync: (from, to) => natives.fsCopyFileSync(toPath(from, "src"), toPath(to, "dest")),
       accessSync: (path, mode) => natives.fsAccessSync(toPath(path), mode ?? 0),
-      realpathSync: (path) => natives.fsRealpathSync(toPath(path)),
-      mkdtempSync: (prefix) => natives.fsMkdtempSync(toPath(prefix)),
-      symlinkSync: (target, path) => natives.fsSymlinkSync(toPath(target), toPath(path)),
+      // node's realpathSync stringifies rather than type-checks (`p += ''`),
+      // and on failure reports what its component walk hit (realpathWalk).
+      realpathSync: (path) => {
+        const file = realpathArg(path);
+        try {
+          return natives.fsRealpathSync(file);
+        } catch (e) {
+          throw realpathWalkErrorSync(file, e);
+        }
+      },
+      mkdtempSync: (prefix) => natives.fsMkdtempSync(toPath(prefix, "prefix")),
+      symlinkSync: (target, path) => natives.fsSymlinkSync(toPath(target, "target"), toPath(path)),
       readlinkSync: (path) => natives.fsReadlinkSync(toPath(path)),
-      linkSync: (existing, newPath) => natives.fsLinkSync(toPath(existing), toPath(newPath)),
-      chmodSync: (path, mode) => natives.fsChmodSync(toPath(path), mode),
-      truncateSync: (path, len) => natives.fsTruncateSync(toPath(path), len ?? 0),
+      linkSync: (existing, newPath) =>
+        natives.fsLinkSync(toPath(existing, "existingPath"), toPath(newPath, "newPath")),
+      chmodSync: (path, mode) => natives.fsChmodSync(toPath(path), parseFileMode(mode, "mode")),
+      // A descriptor is truncated through ftruncate, with node's DEP0081. A
+      // path is opened "r+" and its descriptor ftruncated, as node's is: the
+      // open's error (ENOENT) comes before the length's, and a bad length
+      // leaves the file alone.
+      truncateSync: (path, len) => {
+        if (typeof path === "number") {
+          warnTruncateFd();
+          return fs.ftruncateSync(path, len);
+        }
+        const fd = fs.openSync(path, "r+");
+        try {
+          fs.ftruncateSync(fd, len);
+        } finally {
+          fs.closeSync(fd);
+        }
+      },
       // Classic synchronous fd ops. The native handle (a number) IS the fd.
       // graceful-fs / playwright probe locks via openSync(path,"r+") and rely
       // on err.code === "ENOENT" to tell missing from locked.
-      openSync: (path, flags, _mode) =>
-        natives.fsOpenSync(toPath(path), typeof flags === "number" ? numericOpenFlags(flags) : (flags ?? "r")),
-      closeSync: (fd) => { natives.fsCloseSync(fd); },
-      fstatSync: (fd) => wrapStat(natives.fsFstatSync(fd)),
-      readSync: (fd, buffer, offset, length, position) => {
-        // (fd, buffer, {offset,length,position}) object form.
-        if (offset !== null && typeof offset === "object") {
-          const o = offset;
-          offset = o.offset ?? 0; length = o.length ?? (buffer ? buffer.length - offset : 0); position = o.position ?? null;
-        }
-        const len = length ?? (buffer ? buffer.length - (offset ?? 0) : 0);
-        validateReadLength(buffer, offset ?? 0, len);
-        return natives.fsReadSync(fd, buffer, offset ?? 0, len, position ?? null);
+      // node's order: the path, the flags, the mode.
+      openSync: (path, flags, mode) => {
+        const file = toPath(path);
+        flags = openFlags(flags, natives.platform);
+        parseFileMode(mode, "mode", 0o666);
+        return natives.fsOpenSync(file, flags);
       },
-      writeSync: (fd, data, offsetOrPosition, length, position) => {
-        // Buffer form: (fd, buffer, offset, length, position).
-        // String form: (fd, string, position, encoding).
-        let buf, pos;
-        if (typeof data === "string") {
-          const enc = typeof length === "string" ? length : "utf8";
-          buf = globalThis.Buffer.from(data, enc);
-          pos = typeof offsetOrPosition === "number" ? offsetOrPosition : null;
+      // The *Sync descriptor checks sit where node's C++ binding makes them:
+      // after every other argument, right before the call (see validateFd).
+      closeSync: (fd) => { validateFd(fd, true); natives.fsCloseSync(fd); },
+      fstatSync: (fd) => { validateFd(fd, true); return wrapStat(natives.fsFstatSync(fd)); },
+      // node's argument order (lib/fs.js, v22.22.2): the buffer, the options
+      // object, the offset, the length, and only then the descriptor -- so a
+      // bad offset is refused even by a read of length 0, which returns 0
+      // without looking at the descriptor.
+      readSync: function readSync(fd, buffer, offsetOrOptions, length, position) {
+        validateReadBuffer(buffer);
+        let offset = offsetOrOptions;
+        // The (fd, buffer[, options]) form: node takes it for three arguments
+        // or fewer, and whenever the third is an object (null included, which
+        // reads as no options at all).
+        if (arguments.length <= 3 || typeof offsetOrOptions === "object") {
+          if (offsetOrOptions !== undefined) validateReadOptions(offsetOrOptions);
+          ({ offset = 0, length = buffer.byteLength - offset, position = null } = offsetOrOptions ?? {});
+        }
+        if (offset === undefined) offset = 0;
+        const len = validateReadSpan(buffer, offset, length);
+        if (len === 0) return 0;
+        const pos = readPosition(position, len);
+        validateFd(fd, true);
+        return natives.fsReadSync(fd, buffer, offset, len, pos);
+      },
+      // node's overloads and order (lib/fs.js, v22.22.2):
+      //   (fd, buffer[, offset[, length[, position]]]) or (fd, buffer, options)
+      //     -- offset, length and their range checked, the position not (the
+      //     binding writes at the cursor for anything but a safe integer >= 0);
+      //   (fd, string[, position[, encoding]]) -- only a hex string of odd
+      //     length is refused; an encoding the binding does not know writes
+      //     UTF-8.
+      // All of it before the descriptor, which the binding checks last. Empty
+      // data is still checked: there is no early return.
+      writeSync: function writeSync(fd, buffer, offsetOrOptions, length, position) {
+        let bytes, pos;
+        if (ArrayBuffer.isView(buffer)) {
+          ({ bytes, position: pos } = bufferWriteArgs(buffer, offsetOrOptions, length, position, false));
         } else {
-          const offset = typeof offsetOrPosition === "number" ? offsetOrPosition : 0;
-          const len = typeof length === "number" ? length : (data.length - offset);
-          buf = (offset !== 0 || len !== data.length) ? data.subarray(offset, offset + len) : data;
-          pos = typeof position === "number" ? position : null;
+          validateWriteData(buffer, "buffer");
+          validateWriteEncoding(buffer, length);
+          bytes = globalThis.Buffer.from(buffer, writeEncoding(length));
+          pos = fsPositionArg(offsetOrOptions);
         }
-        // fd 1/2 (stdout/stderr) have no native fd-table entry -- route them to
-        // the process stdout/stderr sinks so fs.writeSync(1|2, ...) matches Node
-        // instead of throwing EBADF (pino/sonic-boom sync mode writes here).
-        // The sink hands back the error a failed write got, and it throws
-        // here as node's writeSync throws it, in writeSync's key order.
-        if (fd === 1 || fd === 2) {
-          const failed = fd === 1 ? natives.stdoutWrite(buf) : natives.stderrWrite(buf);
-          if (failed) throw ctxOrderError(failed);
-          return buf.length;
-        }
-        // ctxOrderError only here: fs.write and fs.writevSync route through the
-        // same native but keep node's common errno/code/syscall order.
-        try {
-          return natives.fsWriteSync(fd, buf, pos);
-        } catch (e) {
-          throw ctxOrderError(e);
-        }
+        validateFd(fd, true);
+        return writeSyncTo(fd, bytes, pos);
       },
       opendirSync: function (path) {
         var dirPath = toPath(path);
         return new Dir(dirPath, natives.fsReaddirSync(dirPath));
       },
       cpSync: function cpSyncRecursive(src, dest, options) {
-        var srcStr = toPath(src);
-        var destStr = toPath(dest);
+        var srcStr = toPath(src, "src");
+        var destStr = toPath(dest, "dest");
         var opts = options || {};
-        var raw;
-        try { raw = natives.fsStatSync(srcStr, false); } catch (e) { throw e; }
+        var raw = natives.fsStatSync(srcStr, false);
+        var mismatch = cpTypeMismatch(raw.kind === "dir", cpDestStatSync(natives, destStr, opts), srcStr, destStr, true);
+        if (mismatch !== null) throw mismatch;
         if (raw.kind === "dir") {
-          if (!opts.recursive) throw makeNodeError("ERR_FS_CP_DIR_TO_NON_DIR", "cpSync: -r not specified; omitting directory '" + srcStr + "'");
+          if (!opts.recursive) throw cpDirWithoutRecursive(srcStr, true);
           try { natives.fsMkdirSync(destStr, true); } catch (e) {}
           var entries = natives.fsReaddirSync(srcStr);
+          var join = registry.get("path").join;
           for (var i = 0; i < entries.length; i++) {
-            var sep = srcStr.endsWith("/") || srcStr.endsWith("\\") ? "" : "/";
-            cpSyncRecursive(srcStr + sep + entries[i].name, destStr + sep + entries[i].name, opts);
+            cpSyncRecursive(join(srcStr, entries[i].name), join(destStr, entries[i].name), opts);
           }
         } else {
           natives.fsCopyFileSync(srcStr, destStr);
         }
       },
 
-      readFile: callbackify1(promises.readFile),
-      writeFile: callbackify1(promises.writeFile),
-      appendFile: callbackify1(promises.appendFile),
-      stat: callbackify1(promises.stat),
-      lstat: callbackify1(promises.lstat),
-      statfs: callbackify1(promises.statfs),
-      readdir: callbackify1(promises.readdir),
-      glob: callbackify1(promises._globAsPromise),
-      mkdir: callbackify1(promises.mkdir),
-      rm: callbackify1(promises.rm),
-      rmdir: callbackify1(promises.rmdir),
-      unlink: callbackify1(promises.unlink),
-      rename: callbackify1(promises.rename),
-      copyFile: callbackify1(promises.copyFile),
-      access: callbackify1(promises.access),
-      realpath: callbackify1(promises.realpath),
-      mkdtemp: callbackify1(promises.mkdtemp),
-      symlink: callbackify1(promises.symlink),
-      readlink: callbackify1(promises.readlink),
-      link: callbackify1(promises.link),
-      chmod: callbackify1(promises.chmod),
-      truncate: callbackify1(promises.truncate),
-      opendir: callbackify1(promises.opendir),
-      cp: callbackify1(promises.cp),
+      readFile: function (path, options, cb) {
+        // node's `callback ||= options`, as in writeFile.
+        if (!cb) cb = options;
+        if (typeof options === "function") options = undefined;
+        if (!isInt32(path)) return readFileByPath(path, options, cb);
+        validateCb(cb);
+        readFdAsync(path, (err, bytes) => {
+          if (err) return cb(err);
+          let out;
+          try {
+            out = decodeRead(bytes, readOptions(options).encoding ?? null);
+          } catch (e) {
+            return cb(e);
+          }
+          cb(null, out);
+        });
+      },
+      writeFile: fdOrPathWrite(promises.writeFile, false),
+      appendFile: fdOrPathWrite(promises.appendFile, true),
+      stat: callbackify1(promises.stat, 1, 1),
+      lstat: callbackify1(promises.lstat, 1, 1),
+      statfs: callbackify1(promises.statfs, 1, 1),
+      readdir: callbackify1(promises.readdir, 1, 1),
+      glob: callbackify1(promises._globAsPromise, 1, 1),
+      mkdir: callbackify1(promises.mkdir, 1, 1),
+      // node's rm (lib/fs.js, v22.22.2) validates the path and its options
+      // synchronously, and NEVER checks the callback: the removal runs, and
+      // calling a missing one when it settles is an uncaught TypeError
+      // "callback is not a function" -- that is how node reports it, so oam
+      // does too, rather than refusing at the call (which every other
+      // callback form does, because their node counterparts do).
+      rm: function rm(path, options, callback) {
+        if (typeof options === "function") {
+          callback = options;
+          options = undefined;
+        }
+        const file = toPath(path);
+        validateRmOptions(options);
+        const token = fsReqStart();
+        promises.rm(file, options).then(
+          () => { fsReqEnd(token); queueMicrotask(() => callback(null)); },
+          (err) => { fsReqEnd(token); queueMicrotask(() => callback(err)); },
+        );
+      },
+      rmdir: callbackify1(promises.rmdir, 1, 1),
+      unlink: callbackify1(promises.unlink, 1),
+      rename: callbackify1(promises.rename, 2),
+      copyFile: callbackify1(promises.copyFile, 2, 1),
+      access: callbackify1(promises.access, 1, 1),
+      // As realpathSync: stringified, and on failure the component walk's
+      // error. fs.realpath.native (below) is the plain native.
+      realpath: function (path, options, cb) {
+        if (typeof options === "function") { cb = options; options = undefined; }
+        realpathByPath(path, cb);
+      },
+      mkdtemp: callbackify1(promises.mkdtemp, 1, 1),
+      symlink: callbackify1(promises.symlink, CB_LAST),
+      readlink: callbackify1(promises.readlink, 1, 1),
+      link: callbackify1(promises.link, 2),
+      // node's chmod checks the path and the mode before the callback.
+      chmod: function chmod(path, mode, callback) {
+        const file = toPath(path);
+        mode = parseFileMode(mode, "mode");
+        validateCb(callback);
+        chmodByPath(file, mode, callback);
+      },
+      // node's order (lib/fs.js, v22.22.2): a descriptor goes to ftruncate;
+      // otherwise the length (an integer, a negative one 0), the callback,
+      // then the path, all at the call.
+      truncate: function truncate(path, len, cb) {
+        if (typeof path === "number") {
+          warnTruncateFd();
+          return fs.ftruncate(path, len, cb);
+        }
+        if (typeof len === "function") {
+          cb = len;
+          len = 0;
+        } else if (len === undefined) {
+          len = 0;
+        }
+        validateInteger(len, "len");
+        validateCb(cb);
+        return truncateByPath(path, Math.max(0, len), cb);
+      },
+      // opendir is the one whose callback node validates as "callback".
+      opendir: callbackify1(promises.opendir, 1, 1, "callback"),
+      cp: callbackify1(promises.cp, 2, 1),
       exists: (path, cb) => {
-        // Deprecated single-arg callback shape, still in the wild.
-        cb(natives.fsExistsSync(toPath(path)));
+        // Deprecated single-arg callback shape, still in the wild. A path
+        // node cannot validate is simply false, as in existsSync.
+        cb(fs.existsSync(path));
       },
 
       // fd-based callback ops (chokidar etc. do promisify(fs.open)). The
       // native open handle (a number) IS the integer fd. fsReadChunk/
       // fsWriteChunk take a position, so the positional (pread/pwrite) forms
       // are honoured here as well as in the sync family.
-      open: function (path, flags, mode, cb) {
-        if (typeof flags === "function") { cb = flags; flags = "r"; }
-        else if (typeof mode === "function") { cb = mode; }
-        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
-        var flagStr = typeof flags === "number" ? numericOpenFlags(flags) : (flags || "r");
+      // node's order (lib/fs.js, v22.22.2), all thrown at the call: the path;
+      // with fewer than three arguments the second is the callback, else a
+      // function mode is; the mode; the flags; the callback.
+      open: function open(path, flags, mode, cb) {
+        var file = toPath(path);
+        if (arguments.length < 3) {
+          cb = flags;
+          flags = "r";
+        } else if (typeof mode === "function") {
+          cb = mode;
+        } else {
+          parseFileMode(mode, "mode", 0o666);
+        }
+        var flagStr = openFlags(flags, natives.platform);
+        validateCb(cb);
         var token = fsReqStart();
-        // toPath(path) can throw (a poisoned toString) -- drop the token
-        // before the throw escapes, or it is stranded forever.
         var p;
         try {
-          p = Promise.resolve(natives.fsOpen(toPath(path), String(flagStr)));
+          p = Promise.resolve(natives.fsOpen(file, flagStr));
         } catch (e) {
           fsReqEnd(token);
           throw e;
@@ -10843,10 +12368,19 @@
           function (err) { fsReqEnd(token); queueMicrotask(function () { cb(err); }); },
         );
       },
-      close: function (fd, cb) {
+      // The callback is optional, but one that is passed must be a function,
+      // and node checks it before the descriptor. A descriptor that is not
+      // open is EBADF through the callback, as closeSync throws it -- the
+      // same native, so the two cannot disagree (fs.close used to call back
+      // null for one, through the streams' close, which forgives a double
+      // close). With no callback node's default one throws the error, which
+      // makes it an uncaught exception.
+      close: function close(fd, cb = defaultCloseCallback) {
+        if (cb !== defaultCloseCallback) validateCb(cb);
+        validateFd(fd, true);
         var err = null;
-        try { natives.fsClose(fd); } catch (e) { err = e; }
-        if (typeof cb === "function") queueMicrotask(function () { cb(err); });
+        try { natives.fsCloseSync(fd); } catch (e) { err = e; }
+        queueMicrotask(function () { cb(err); });
       },
       // Async fd-based write. Node overloads:
       //   fs.write(fd, buffer[, offset[, length[, position]]], cb)
@@ -10855,34 +12389,37 @@
       // fd 1/2 route to the stdout/stderr sinks (pino/sonic-boom's default
       // async destination writes here); other fds use the sync native op
       // dispatched on a microtask to preserve the async callback contract.
-      write: function (fd, data) {
-        var rest = Array.prototype.slice.call(arguments, 2);
-        var cb = rest.length ? rest[rest.length - 1] : undefined;
-        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
-        var mid = rest.slice(0, rest.length - 1);
-        var buf, pos;
-        try {
-          if (typeof data === "string") {
-            pos = typeof mid[0] === "number" ? mid[0] : null;
-            var enc = typeof mid[1] === "string" ? mid[1] : (typeof mid[0] === "string" ? mid[0] : "utf8");
-            buf = globalThis.Buffer.from(data, enc);
-          } else {
-            var offset = 0, length, position = null;
-            if (mid[0] !== null && typeof mid[0] === "object" && !ArrayBuffer.isView(mid[0])) {
-              offset = mid[0].offset ?? 0;
-              length = mid[0].length ?? (data.length - offset);
-              position = typeof mid[0].position === "number" ? mid[0].position : null;
+      // node's argument handling (lib/fs.js, v22.22.2), all of it thrown at
+      // the call: the descriptor first (its JS getValidatedFd, validateFd),
+      // then for a buffer the callback -- the last of position, length,
+      // offset that is set -- and writeSync's buffer checks; for a string
+      // (fd, string[, position[, encoding]], cb) the data, the encoding and
+      // then the callback.
+      write: function write(fd, buffer, offsetOrOptions, length, position, callback) {
+        validateFd(fd, false);
+        var data = buffer;
+        var buf, pos, cb;
+        if (ArrayBuffer.isView(buffer)) {
+          cb = callback || position || length || offsetOrOptions;
+          validateCb(cb);
+          ({ bytes: buf, position: pos } = bufferWriteArgs(buffer, offsetOrOptions, length, position, true));
+        } else {
+          validateWriteData(buffer, "buffer");
+          var at = offsetOrOptions;
+          if (typeof position !== "function") {
+            if (typeof offsetOrOptions === "function") {
+              position = offsetOrOptions;
+              at = null;
             } else {
-              offset = typeof mid[0] === "number" ? mid[0] : 0;
-              length = typeof mid[1] === "number" ? mid[1] : (data.length - offset);
-              position = typeof mid[2] === "number" ? mid[2] : null;
+              position = length;
             }
-            buf = (offset !== 0 || length !== data.length) ? data.subarray(offset, offset + length) : data;
-            pos = position;
+            length = "utf8";
           }
-        } catch (e) {
-          queueMicrotask(function () { cb(e); });
-          return;
+          validateWriteEncoding(buffer, length);
+          cb = position;
+          validateCb(cb);
+          buf = globalThis.Buffer.from(buffer, writeEncoding(length));
+          pos = fsPositionArg(at);
         }
         var n, failed;
         try {
@@ -10901,48 +12438,47 @@
         }
         queueMicrotask(function () { cb(null, n, data); });
       },
-      read: function (fd, buffer, offset, length, position, cb) {
-        // Variants: (fd, buffer, offset, length, position, cb),
-        // (fd, options, cb), and trailing-callback short forms.
-        if (typeof buffer === "function") {
-          cb = buffer; buffer = globalThis.Buffer.alloc(16384); offset = 0; length = buffer.length;
-        } else if (buffer && typeof buffer === "object" && !ArrayBuffer.isView(buffer)) {
-          var o = buffer; cb = offset;
-          buffer = o.buffer || globalThis.Buffer.alloc(o.length || 16384);
-          offset = o.offset || 0;
-          length = o.length != null ? o.length : buffer.length - offset;
-          // o.position was the one field this form never read, so the options
-          // overload kept reading from the cursor after the positional overload
-          // below was fixed. readSync's object form has always honoured it.
-          position = o.position ?? null;
+      read: function read(fd, buffer, offsetOrOptions, length, position, cb) {
+        // node's JS getValidatedFd, before any other argument (validateFd).
+        validateFd(fd, false);
+        // node's overloads (lib/fs.js, v22.22.2) go by argument count:
+        //   (fd, buffer, offset, length, position, cb) for five or more;
+        //   (fd, buffer, options, cb) for four -- options an object or null;
+        //   (fd, buffer, cb) or (fd, { buffer, ... }, cb) for three;
+        //   (fd, cb) for two, into a new 16 KiB buffer.
+        // The short forms take offset / length / position from the options,
+        // defaulting to the whole buffer and the cursor.
+        let offset = offsetOrOptions;
+        if (arguments.length <= 4) {
+          let params = null;
+          if (arguments.length === 4) {
+            validateReadOptions(offsetOrOptions);
+            cb = length;
+            params = offsetOrOptions;
+          } else if (arguments.length === 3) {
+            if (!ArrayBuffer.isView(buffer)) {
+              params = buffer;
+              ({ buffer = globalThis.Buffer.alloc(16384) } = params ?? {});
+            }
+            cb = offsetOrOptions;
+          } else {
+            cb = buffer;
+            buffer = globalThis.Buffer.alloc(16384);
+          }
+          ({ offset = 0, length = buffer?.byteLength - offset, position = null } = params ?? {});
         }
-        if (typeof offset === "function") { cb = offset; offset = 0; length = buffer ? buffer.length : 16384; }
-        if (typeof length === "function") { cb = length; length = buffer ? buffer.length - (offset || 0) : 16384; }
-        if (typeof position === "function") { cb = position; }
-        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
-        var want = length != null ? length : (buffer ? buffer.length - (offset || 0) : 16384);
-        // Bounded by the destination, exactly as node bounds it -- and thrown
-        // SYNCHRONOUSLY even from this callback form, which is what node does.
-        validateReadLength(buffer, offset, want);
-        // The position was parsed above and then DROPPED -- fsReadChunk had no
-        // position parameter, so `fs.read(fd, buf, 0, 3, 10, cb)` read from the
-        // cursor and handed back the wrong bytes with no error. The native now
-        // takes one; null still means "from the cursor".
-        var readPos = fsPositionArg(position);
-        Promise.resolve(natives.fsReadChunk(fd, want, readPos)).then(
-          function (chunk) {
-            if (chunk === undefined || chunk === null) {
-              queueMicrotask(function () { cb(null, 0, buffer); });
-              return;
-            }
-            if (buffer) {
-              var view = new Uint8Array(buffer.buffer || buffer, (buffer.byteOffset || 0) + (offset || 0));
-              view.set(chunk.subarray(0, Math.min(chunk.length, view.length)));
-            }
-            queueMicrotask(function () { cb(null, chunk.length, buffer); });
-          },
-          function (err) { queueMicrotask(function () { cb(err); }); },
-        );
+        validateReadBuffer(buffer);
+        validateCb(cb);
+        // The offset (null is 0 here, unlike readSync) and the length, bounded
+        // by the destination -- thrown SYNCHRONOUSLY even from this callback
+        // form, as node does. An empty read calls back 0 without the fd.
+        if (offset == null) offset = 0;
+        var want = validateReadSpan(buffer, offset, length);
+        if (want === 0) {
+          process.nextTick(cb, null, 0, buffer);
+          return;
+        }
+        readChunkInto(fd, buffer, offset, want, readPosition(position, want), cb);
       },
 
       createReadStream: (path, options) => new (rwStreams(natives).ReadStream)(path, options),
@@ -10954,7 +12490,8 @@
       // async spelling was missing, and it is the one promisify() reaches for.
       fstat: function (fd, options, cb) {
         if (typeof options === "function") { cb = options; options = undefined; }
-        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+        validateCb(cb);
+        validateFd(fd, true);
         var token = fsReqStart();
         // The ASYNC native, not fsFstatSync: reading metadata inline and then
         // deferring only the callback still blocked the loop for the whole
@@ -10995,10 +12532,13 @@
     // op. Node reports a bad descriptor through the callback, never at the call
     // site, so the throw has to be caught and re-delivered -- the same shape
     // `fstat` uses above.
-    const voidCallbackOp = (run) =>
+    // `required` is the callback's position, as in callbackify1.
+    const voidCallbackOp = (run, required) =>
       function (...args) {
-        const cb = args.pop();
-        if (typeof cb !== "function") throw new TypeError("Callback must be a function");
+        const at = callbackSlot(args, required, 0);
+        const cb = args[at];
+        validateCb(cb);
+        if (args.length > at) args.length = at;
         const token = fsReqStart();
         let p;
         try {
@@ -11015,47 +12555,96 @@
       };
 
 
-    fs.fsync = voidCallbackOp((fd) => natives.fsFsync(fd));
-    fs.fdatasync = voidCallbackOp((fd) => natives.fsFdatasync(fd));
-    // node permits `ftruncate(fd, cb)` with the length omitted, which lands
-    // here as undefined once the callback is popped.
-    fs.ftruncate = voidCallbackOp((fd, len) => natives.fsFtruncate(fd, len ?? 0));
-    fs.fchmod = voidCallbackOp((fd, mode) => natives.fsFchmod(fd, mode));
-    fs.fchown = voidCallbackOp((fd, uid, gid) => natives.fsFchown(fd, uid, gid));
-    fs.futimes = voidCallbackOp((fd, atime, mtime) =>
-      natives.fsFutimes(fd, toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
-    );
+    // The descriptor forms check, in node's order and all synchronously: their
+    // other arguments, then the callback, then the descriptor (validateFd's
+    // C++ spelling). Only the operation's own failure -- EBADF for a closed
+    // descriptor -- goes to the callback, which voidCallbackOp arranges.
+    const fdCallbackOp = (op) => {
+      const run = voidCallbackOp(op, 3);
+      return (cb, fd, a, b) => {
+        validateCb(cb);
+        validateFd(fd, true);
+        run(fd, a, b, cb);
+      };
+    };
+    const fsyncCb = fdCallbackOp((fd) => natives.fsFsync(fd));
+    const fdatasyncCb = fdCallbackOp((fd) => natives.fsFdatasync(fd));
+    const ftruncateCb = fdCallbackOp((fd, len) => natives.fsFtruncate(fd, len));
+    const fchmodCb = fdCallbackOp((fd, mode) => natives.fsFchmod(fd, mode));
+    const fchownCb = fdCallbackOp((fd, uid, gid) => natives.fsFchown(fd, uid, gid));
+    const futimesCb = fdCallbackOp((fd, atime, mtime) => natives.fsFutimes(fd, atime, mtime));
+    fs.fsync = function fsync(fd, cb) { fsyncCb(cb, fd); };
+    fs.fdatasync = function fdatasync(fd, cb) { fdatasyncCb(cb, fd); };
+    // Their other arguments are node's validators, checked first: the length
+    // an integer (a negative one is 0), the mode node's parseFileMode (an
+    // octal string or a uint32), uid / gid integers in [-1, 2**32-1].
+    // node permits `ftruncate(fd, cb)` with the length omitted. (The default
+    // is node's signature, which makes ftruncate.length 1.)
+    fs.ftruncate = function ftruncate(fd, len = 0, cb) {
+      if (typeof len === "function") { cb = len; len = 0; }
+      validateInteger(len, "len");
+      ftruncateCb(cb, fd, Math.max(0, len));
+    };
+    fs.fchmod = function fchmod(fd, mode, cb) { fchmodCb(cb, fd, parseFileMode(mode, "mode")); };
+    fs.fchown = function fchown(fd, uid, gid, cb) {
+      ownerArgs(uid, gid);
+      fchownCb(cb, fd, uid, gid);
+    };
+    fs.futimes = function futimes(fd, atime, mtime, cb) {
+      const a = toUnixMs(atime, "atime");
+      const m = toUnixMs(mtime, "mtime");
+      futimesCb(cb, fd, a, m);
+    };
 
-    fs.fsyncSync = (fd) => { natives.fsFsyncSync(fd); };
-    fs.fdatasyncSync = (fd) => { natives.fsFdatasyncSync(fd); };
-    fs.ftruncateSync = (fd, len) => { natives.fsFtruncateSync(fd, len ?? 0); };
-    fs.fchmodSync = (fd, mode) => { natives.fsFchmodSync(fd, mode); };
-    fs.fchownSync = (fd, uid, gid) => { natives.fsFchownSync(fd, uid, gid); };
+    fs.fsyncSync = (fd) => { validateFd(fd, true); natives.fsFsyncSync(fd); };
+    fs.fdatasyncSync = (fd) => { validateFd(fd, true); natives.fsFdatasyncSync(fd); };
+    fs.ftruncateSync = function ftruncateSync(fd, len = 0) {
+      validateInteger(len, "len");
+      validateFd(fd, true);
+      natives.fsFtruncateSync(fd, len < 0 ? 0 : len);
+    };
+    fs.fchmodSync = function fchmodSync(fd, mode) {
+      mode = parseFileMode(mode, "mode");
+      validateFd(fd, true);
+      natives.fsFchmodSync(fd, mode);
+    };
+    fs.fchownSync = function fchownSync(fd, uid, gid) {
+      ownerArgs(uid, gid);
+      validateFd(fd, true);
+      natives.fsFchownSync(fd, uid, gid);
+    };
     fs.futimesSync = (fd, atime, mtime) => {
-      natives.fsFutimesSync(fd, toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
+      const a = toUnixMs(atime, "atime");
+      const m = toUnixMs(mtime, "mtime");
+      validateFd(fd, true);
+      natives.fsFutimesSync(fd, a, m);
     };
 
     // ---- path-based ownership / time: chown, lchown, utimes, lutimes, lchmod.
     //
     // The `l` forms act on a symlink itself rather than its target, which is
     // the only reason they exist.
-    fs.chown = voidCallbackOp((p, uid, gid) => natives.fsChown(toPath(p), uid, gid));
-    fs.lchown = voidCallbackOp((p, uid, gid) => natives.fsLchown(toPath(p), uid, gid));
-    fs.utimes = voidCallbackOp((p, atime, mtime) =>
-      natives.fsUtimes(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
-    );
-    fs.lutimes = voidCallbackOp((p, atime, mtime) =>
-      natives.fsLutimes(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime")),
-    );
+    //
+    // node's order (lib/fs.js, v22.22.2), all of it thrown at the call: the
+    // callback, the path, then uid / gid or the two times. Only the
+    // operation's own failure reaches the callback.
+    const pathCallbackOp = (run, prepare) => {
+      const settle = voidCallbackOp(run, 3);
+      return function (path, a, b, cb) {
+        validateCb(cb);
+        const file = toPath(path);
+        settle(file, ...prepare(a, b), cb);
+      };
+    };
+    fs.chown = pathCallbackOp((p, uid, gid) => natives.fsChown(p, uid, gid), ownerArgs);
+    fs.lchown = pathCallbackOp((p, uid, gid) => natives.fsLchown(p, uid, gid), ownerArgs);
+    fs.utimes = pathCallbackOp((p, atime, mtime) => natives.fsUtimes(p, atime, mtime), pathTimes);
+    fs.lutimes = pathCallbackOp((p, atime, mtime) => natives.fsLutimes(p, atime, mtime), pathTimes);
 
-    fs.chownSync = (p, uid, gid) => { natives.fsChownSync(toPath(p), uid, gid); };
-    fs.lchownSync = (p, uid, gid) => { natives.fsLchownSync(toPath(p), uid, gid); };
-    fs.utimesSync = (p, atime, mtime) => {
-      natives.fsUtimesSync(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
-    };
-    fs.lutimesSync = (p, atime, mtime) => {
-      natives.fsLutimesSync(toPath(p), toUnixMs(atime, "atime"), toUnixMs(mtime, "mtime"));
-    };
+    fs.chownSync = (p, uid, gid) => { natives.fsChownSync(toPath(p), ...ownerArgs(uid, gid)); };
+    fs.lchownSync = (p, uid, gid) => { natives.fsLchownSync(toPath(p), ...ownerArgs(uid, gid)); };
+    fs.utimesSync = (p, atime, mtime) => { natives.fsUtimesSync(toPath(p), ...pathTimes(atime, mtime)); };
+    fs.lutimesSync = (p, atime, mtime) => { natives.fsLutimesSync(toPath(p), ...pathTimes(atime, mtime)); };
 
     // lchmod is macOS-only. node gates its own on O_SYMLINK -- which the BSD
     // family has and Linux does not -- and OFF macOS it publishes the NAME with
@@ -11070,8 +12659,14 @@
     // what node gives. A throwing stub would link the same and then diverge on
     // the message.
     if (process.platform === "darwin") {
-      fs.lchmod = voidCallbackOp((p, mode) => natives.fsLchmod(toPath(p), mode));
-      fs.lchmodSync = (p, mode) => { natives.fsLchmodSync(toPath(p), mode); };
+      // node's lchmod checks the callback, then the mode, then opens the path.
+      const lchmodRun = voidCallbackOp((p, mode) => natives.fsLchmod(p, mode), 2);
+      fs.lchmod = function lchmod(path, mode, cb) {
+        validateCb(cb);
+        mode = parseFileMode(mode, "mode");
+        lchmodRun(toPath(path), mode, cb);
+      };
+      fs.lchmodSync = (p, mode) => { natives.fsLchmodSync(toPath(p), parseFileMode(mode, "mode")); };
     } else {
       fs.lchmod = undefined;
       fs.lchmodSync = undefined;
@@ -11098,15 +12693,18 @@
     fs.writevSync = (fd, buffers, position) => {
       const total = asViewArray(buffers);
       // node returns 0 without touching the descriptor -- measured: writev([])
-      // on a CLOSED fd does not throw.
+      // on a CLOSED fd, or on -1, does not throw.
       if (emptyList(buffers)) return 0;
+      validateFd(fd, true);
       return natives.fsWriteSync(fd, flattenViews(buffers, total), fsPositionArg(position));
     };
 
     fs.readvSync = (fd, buffers, position) => {
       const total = asViewArray(buffers);
-      // Before the fd check, deliberately: node raises this even for a closed
-      // descriptor.
+      // The descriptor's range is checked first (readvSync(-1, []) is
+      // ERR_OUT_OF_RANGE), but the EINVAL comes before the descriptor is
+      // USED: node raises it even for a closed one.
+      validateFd(fd, true);
       if (emptyList(buffers)) throw einvalRead(natives.platform);
       const tmp = globalThis.Buffer.allocUnsafe(total);
       const n = natives.fsReadSync(fd, tmp, 0, total, fsPositionArg(position));
@@ -11114,24 +12712,17 @@
       return n;
     };
 
-    const vectoredCallback = (cb) => {
-      if (typeof cb !== "function") {
-        throw nodeTypeError(
-          `The "cb" argument must be of type function. Received ${describeArg(cb)}`,
-        );
-      }
-      return cb;
-    };
-
     // The two validation failures land DIFFERENTLY, which is easy to get
     // backwards: node's validateBufferArray runs at the call site and THROWS
     // synchronously (node:fs:758), while the empty-list EINVAL is delivered to
     // the callback. Routing both through the callback meant a try/catch around
-    // fs.readv silently stopped firing.
+    // fs.readv silently stopped firing. node's order is descriptor (its JS
+    // check, see validateFd), buffers, callback.
     fs.writev = function (fd, buffers, position, cb) {
-      if (typeof position === "function") { cb = position; position = null; }
-      cb = vectoredCallback(cb);
+      validateFd(fd, false);
       const total = asViewArray(buffers);
+      if (typeof position === "function") { cb = position; position = null; }
+      validateCb(cb);
       if (emptyList(buffers)) { queueMicrotask(() => cb(null, 0, buffers)); return; }
       // Reuses fs.write, so the position handling lives in exactly one place.
       fs.write(fd, flattenViews(buffers, total), 0, total, fsPositionArg(position), (err, written) =>
@@ -11140,17 +12731,19 @@
     };
 
     fs.readv = function (fd, buffers, position, cb) {
-      if (typeof position === "function") { cb = position; position = null; }
-      cb = vectoredCallback(cb);
+      validateFd(fd, false);
       const total = asViewArray(buffers);
+      if (typeof position === "function") { cb = position; position = null; }
+      validateCb(cb);
       if (emptyList(buffers)) {
-        // This one IS deferred, and beats the fd: node reports EINVAL through
-        // the callback even for a closed descriptor.
+        // This one IS deferred, and beats a closed descriptor: node reports
+        // EINVAL through the callback for one (an out-of-range one has
+        // already thrown above).
         queueMicrotask(() => cb(einvalRead(natives.platform), 0, buffers));
         return;
       }
       const tmp = globalThis.Buffer.allocUnsafe(total);
-      fs.read(fd, tmp, 0, total, fsPositionArg(position), (err, n) => {
+      readChunkInto(fd, tmp, 0, total, fsPositionArg(position), (err, n) => {
         if (err) { cb(err, 0, buffers); return; }
         scatterViews(buffers, tmp, n);
         // The SAME array instance goes back, which callers compare by identity.
@@ -11169,16 +12762,22 @@
     //     TypeError with code ERR_INVALID_ARG_VALUE, message "Unable to open
     //     file as blob", and `code` as its ONLY own property -- no errno, no
     //     syscall, no path.
-    fs.openAsBlob = async (p, options) => {
+    //   - the arguments are checked SYNCHRONOUSLY -- node's openAsBlob is a
+    //     plain function returning a promise, so a bad type or path throws
+    //     at the call.
+    fs.openAsBlob = (p, options) => {
       const type = (options && options.type) || "";
       if (typeof type !== "string") {
         throw nodeTypeError(
           `The "options.type" argument must be of type string. Received ${describeArg(type)}`,
         );
       }
+      return openAsBlobPath(toPath(p), type);
+    };
+    const openAsBlobPath = async (file, type) => {
       let bytes;
       try {
-        bytes = await natives.fsReadFile(toPath(p));
+        bytes = await natives.fsReadFile(file);
       } catch {
         // Deliberately swallowing the underlying error: node reports none of
         // it, and leaking ENOENT here would be a divergence, not a courtesy.
@@ -11202,7 +12801,16 @@
       return blob;
     };
 
-    fs.realpathSync.native = fs.realpathSync;
+    // The `.native` forms are the OS realpath: node type-checks their path
+    // (getValidatedPath) and reports `realpath` with the whole path.
+    fs.realpathSync.native = (path) => natives.fsRealpathSync(toPath(path));
+    // node's `makeCallback(callback || options)`, as readFile's.
+    const realpathNativeByPath = callbackify1(promises.realpath, 2);
+    fs.realpath.native = function (path, options, cb) {
+      if (!cb) cb = options;
+      if (typeof options === "function") options = undefined;
+      realpathNativeByPath(path, options, cb);
+    };
     fs.Dirent = Dirent;
     // The real class, so `stat instanceof fs.Stats` holds -- it was a bare
     // placeholder no stat object was ever an instance of.
@@ -11273,10 +12881,7 @@
       if (typeof value === "number") return value;
       const id = natives.posixLookupId(kind === "uid" ? 0 : 1, value);
       if (id === null || id === undefined) {
-        throw makeNodeError(
-          "ERR_UNKNOWN_CREDENTIAL",
-          `${credentialKindWord(kind)} identifier does not exist: ${value}`,
-        );
+        throw codes.ERR_UNKNOWN_CREDENTIAL(credentialKindWord(kind), value);
       }
       return id;
     };
@@ -12628,16 +14233,10 @@
           if (typeof user === "number") {
             name = natives.posixLookupId(2, user);
             if (name === null || name === undefined) {
-              throw makeNodeError(
-                "ERR_UNKNOWN_CREDENTIAL",
-                `User identifier does not exist: ${user}`,
-              );
+              throw codes.ERR_UNKNOWN_CREDENTIAL("User", user);
             }
           } else if (natives.posixLookupId(0, user) === null) {
-            throw makeNodeError(
-              "ERR_UNKNOWN_CREDENTIAL",
-              `User identifier does not exist: ${user}`,
-            );
+            throw codes.ERR_UNKNOWN_CREDENTIAL("User", user);
           }
           const err = natives.posixInitGroups(name, gid);
           if (err) throw credentialSyscallError(err, "initgroups");
@@ -12658,7 +14257,7 @@
         }
         if (process._uncaughtCaptureCb) {
           throw applyNodeErrorShape(
-            new Error("`setupUncaughtExceptionCapture()` was called while a capture callback was already active"),
+            new Error("`process.setupUncaughtExceptionCapture()` was called while a capture callback was already active"),
             "ERR_UNCAUGHT_EXCEPTION_CAPTURE_ALREADY_SET",
           );
         }
@@ -13819,6 +15418,22 @@
     // WebIDL identity: usp[Symbol.iterator] IS usp.entries.
     URLSearchParams.prototype[Symbol.iterator] = URLSearchParams.prototype.entries;
 
+    /// What `new URL()` throws for an input that does not parse: node's
+    /// binding builds it natively, so it is a plain TypeError -- prototype
+    /// TypeError.prototype, "TypeError: Invalid URL" as its string -- with
+    /// own `code`, `input`, and `base` only when a base was passed, in that
+    /// order. The input is NOT in the message (it used to be here), which is
+    /// what makes `err.code === 'ERR_INVALID_URL'` the way to test for it.
+    function invalidUrl(input, base) {
+      const err = new TypeError("Invalid URL");
+      err.code = "ERR_INVALID_URL";
+      err.input = input;
+      if (base !== undefined) err.base = base;
+      // Frames start at the caller (`new URL`), not at this helper.
+      Error.captureStackTrace(err, invalidUrl);
+      return err;
+    }
+
     class URL {
       // Un-forgeable brand. `_href` is an ordinary property, so nothing about
       // a URL was distinguishable from a duck-typed copy -- and the legacy
@@ -13829,20 +15444,33 @@
       static [Symbol.for("oam.isURL")](value) {
         return value !== null && typeof value === "object" && #brand in value;
       }
-      constructor(input, base) {
-        this._href = globalThis.__oam.node.urlParseHref(String(input), base ?? undefined);
+      // Argument handling is node's (lib/internal/url.js), for all three
+      // entry points: no argument at all is ERR_MISSING_ARGS; `input` is
+      // converted with a template literal (so a Symbol is the engine's
+      // TypeError, not "Invalid URL"); and `base` counts as passed unless it
+      // is `undefined` -- `null` is the base "null", which does not parse.
+      constructor(input, base = undefined) {
+        if (arguments.length === 0) throw new codes.ERR_MISSING_ARGS("url");
+        input = `${input}`;
+        if (base !== undefined) base = `${base}`;
+        const href = globalThis.__oam.node.urlParseHref(input, base);
+        if (href === undefined) throw invalidUrl(input, base);
+        this._href = href;
         this._c = null;
         this._params = null;
       }
-      static canParse(input, base) {
-        return globalThis.__oam.node.urlCanParse(String(input), base != null ? String(base) : undefined);
+      static canParse(input, base = undefined) {
+        if (arguments.length === 0) throw new codes.ERR_MISSING_ARGS("url");
+        input = `${input}`;
+        if (base !== undefined) base = `${base}`;
+        return globalThis.__oam.node.urlCanParse(input, base);
       }
-      static parse(input, base) {
-        try {
-          return new URL(input, base);
-        } catch {
-          return null;
-        }
+      static parse(input, base = undefined) {
+        if (arguments.length === 0) throw new codes.ERR_MISSING_ARGS("url");
+        input = `${input}`;
+        if (base !== undefined) base = `${base}`;
+        // Only "does not parse" is null; the argument errors above are thrown.
+        return globalThis.__oam.node.urlCanParse(input, base) ? new URL(input, base) : null;
       }
       _ensure() {
         if (!this._c) this._c = globalThis.__oam.node.urlParse(this._href);
@@ -13862,7 +15490,14 @@
         return this._href;
       }
       set href(value) {
-        this._href = globalThis.__oam.node.urlParseHref(String(value));
+        value = `${value}`;
+        const href = globalThis.__oam.node.urlParseHref(value);
+        if (href === undefined) {
+          // The setter's failure is the JS-side ERR_INVALID_URL (a NodeError,
+          // `[ERR_INVALID_URL]` in its toString), not the constructor's.
+          throw new codes.ERR_INVALID_URL(value);
+        }
+        this._href = href;
         this._c = null;
         if (this._params) {
           this._ensure();
@@ -13985,11 +15620,10 @@
       }
       const url = typeof input === "string" ? new globalThis.URL(input) : input;
       if (url.protocol !== "file:") {
-        throw makeNodeError(
-          "ERR_INVALID_URL_SCHEME",
-          "The URL must be of scheme file",
-        );
+        throw codes.ERR_INVALID_URL_SCHEME("file");
       }
+      // node's refusals of a path carry the URL as `input`.
+      const badPath = (msg) => codes.ERR_INVALID_FILE_URL_PATH(msg, url);
       // options.windows forces win32/posix semantics regardless of host
       // (Node v22: fileURLToPath(path, { windows }), mirroring
       // pathToFileURL). `null` is explicitly allowed and means host default.
@@ -14002,12 +15636,7 @@
         // Encoded separators would let a URL smuggle path segments past
         // consumers. Windows rejects BOTH, since '\' is a separator there.
         if (/%2f|%5c/i.test(url.pathname)) {
-          const e = makeNodeError(
-            "ERR_INVALID_FILE_URL_PATH",
-            "File URL path must not include encoded \\ or / characters",
-          );
-          e.input = url;
-          throw e;
+          throw badPath("must not include encoded \\ or / characters");
         }
         let pathname = decodeURIComponent(url.pathname).replaceAll("/", "\\");
         if (url.hostname) {
@@ -14017,12 +15646,7 @@
         if (!/^\\[A-Za-z]:/.test(pathname)) {
           // A drive-less path would silently resolve against the cwd's
           // drive â€” fail loud like Node.
-          const e = makeNodeError(
-            "ERR_INVALID_FILE_URL_PATH",
-            "File URL path must be absolute",
-          );
-          e.input = url;
-          throw e;
+          throw badPath("must be absolute");
         }
         return pathname.slice(1); // strip the slash before the drive letter
       }
@@ -14031,25 +15655,15 @@
       // FILENAME CHARACTER here, so rejecting %5C (the Windows rule)
       // made 'file:///foo%5Cbar' -- a real, addressable file -- unopenable.
       if (/%2f/i.test(url.pathname)) {
-        const e = makeNodeError(
-          "ERR_INVALID_FILE_URL_PATH",
-          "File URL path must not include encoded / characters",
-        );
-        e.input = url;
-        throw e;
+        throw badPath("must not include encoded / characters");
       }
       // A host is meaningless for a POSIX file path (no UNC), so Node
       // refuses rather than silently dropping it and returning a path
-      // that points somewhere else entirely.
+      // that points somewhere else entirely. (No `input` on this one.)
       if (url.hostname) {
-        const e = makeNodeError(
-          "ERR_INVALID_FILE_URL_HOST",
-          `File URL host must be "localhost" or empty on ${
-            natives && natives.platform ? natives.platform : "posix"
-          }`,
+        throw codes.ERR_INVALID_FILE_URL_HOST(
+          natives && natives.platform ? natives.platform : "posix",
         );
-        e.input = url;
-        throw e;
       }
       return decodeURIComponent(url.pathname);
     }
@@ -14489,9 +16103,7 @@
         // non-ipv6 'a[b].com' throws rather than being silently cut (that
         // would let a hostname read as ipv6 to the next parser).
         const throwInvalidUrl = () => {
-          const e = new codes.ERR_INVALID_URL();
-          e.input = url;
-          throw e;
+          throw new codes.ERR_INVALID_URL(url);
         };
         if (!ipv6Hostname) rest = getHostname(this, rest, hostname, url);
         if (this.hostname.length > hostnameMaxLen) {
@@ -16637,6 +18249,7 @@
     const Z_SYNC_FLUSH = 2;
     const Z_FULL_FLUSH = 3;
     const Z_FINISH = 4;
+    const Z_BLOCK = 5;
     const DEFLATE = 1;
     const INFLATE = 2;
     const DEFLATERAW = 5;
@@ -16653,7 +18266,7 @@
         this._writeState = writeState;
         this._processCallback = processCallback;
         const effectiveLevel = (this._mode === DEFLATE || this._mode === DEFLATERAW) ? (level != null ? level : -1) : -1;
-        this._nativeHandle = natives.zlibHandleCreate(this._mode, effectiveLevel);
+        this._nativeHandle = natives.zlibHandleCreate(this._mode, effectiveLevel, dictionary);
       }
       writeSync(flush, chunk, inOff, inLen, buffer, outOff, outLen) {
         const input = (chunk && inLen > 0) ? chunk.subarray(inOff, inOff + inLen) : new Uint8Array(0);
@@ -16702,6 +18315,34 @@
     // (oam_core::zlib::OUTPUT_TOO_LARGE); node raises ERR_BUFFER_TOO_LARGE
     // naming the caller's value.
     const OUTPUT_TOO_LARGE = "zlib output exceeds maxOutputLength";
+    // node's checkRangesOrGetDefault for options.flush / options.finishFlush
+    // (ZlibBase, which every zlib class and one-shot call constructs):
+    // undefined and NaN take the default, a non-number is
+    // ERR_INVALID_ARG_TYPE, anything outside Z_NO_FLUSH..Z_BLOCK is
+    // ERR_OUT_OF_RANGE. Validated in node's order: flush, finishFlush, then
+    // maxOutputLength.
+    const flushOptionOf = (options, key, def) => {
+      const value = options?.[key];
+      if (value === undefined || Number.isNaN(value)) return def;
+      const name = "options." + key;
+      if (!Number.isFinite(value)) {
+        if (typeof value !== "number") throw codes.ERR_INVALID_ARG_TYPE(name, "number", value);
+        throw codes.ERR_OUT_OF_RANGE(name, "a finite number", value);
+      }
+      if (value < Z_NO_FLUSH || value > Z_BLOCK) {
+        throw codes.ERR_OUT_OF_RANGE(name, ">= " + Z_NO_FLUSH + " and <= " + Z_BLOCK, value);
+      }
+      return value;
+    };
+    // The finishing flush an inflate ends with (node's `finishFlush`). Only
+    // Z_FINISH makes a stream that stops short an error ("unexpected end of
+    // file"); axios and node-fetch pass Z_SYNC_FLUSH to get what decoded. The
+    // natives take it as an int32 (a fraction truncates, as node's binding
+    // does); the deflaters always finish the stream.
+    const finishFlushOf = (options) => {
+      flushOptionOf(options, "flush", Z_NO_FLUSH);
+      return flushOptionOf(options, "finishFlush", Z_FINISH);
+    };
     const bufferTooLarge = (max) => {
       const err = new RangeError("Cannot create a Buffer larger than " + max + " bytes");
       applyNodeErrorShape(err, "ERR_BUFFER_TOO_LARGE");
@@ -16709,11 +18350,43 @@
     };
     const translate = (err, max) =>
       err instanceof Error && err.message === OUTPUT_TOO_LARGE ? bufferTooLarge(max) : err;
+    // node's Zlib constructor reads options.dictionary for every zlib class
+    // (gzip and gunzip accept it and do not use it): a Buffer, TypedArray or
+    // DataView is used as is, an ArrayBuffer is wrapped, and anything else --
+    // null included -- is ERR_INVALID_ARG_TYPE, thrown before ZlibBase
+    // checks flush, finishFlush and maxOutputLength. Brotli has no such
+    // option. The natives read the view's bytes.
+    const dictionaryOf = (options) => {
+      const value = options?.dictionary;
+      if (value === undefined || ArrayBuffer.isView(value)) return value;
+      if (isAnyArrayBuffer(value)) return new Uint8Array(value);
+      throw codes.ERR_INVALID_ARG_TYPE(
+        "options.dictionary",
+        ["Buffer", "TypedArray", "DataView", "ArrayBuffer"],
+        value,
+      );
+    };
+    // Which formats use the dictionary option, as node's zlib does:
+    // it validates the option for every zlib class but sets it only on a
+    // deflate/inflate stream (zlib's deflateSetDictionary/inflateSetDictionary);
+    // a gzip member never carries one. Brotli has no such option and does
+    // not look at it.
+    const dictionaryFor = (format, options) => {
+      if (format === "brotli") return undefined;
+      const dictionary = dictionaryOf(options);
+      return format === "gzip" ? undefined : dictionary;
+    };
 
     const sync = (format, compress) => (data, options) => {
+      const dictionary = dictionaryOf(options);
+      const finishFlush = finishFlushOf(options);
       const max = maxOutputLengthOf(options);
       try {
-        return asBuffer(natives.zlibSync(toBytes(data), format, levelOf(options), compress, max));
+        return asBuffer(
+          natives.zlibSync(
+            toBytes(data), format, levelOf(options), compress, max, finishFlush, dictionary,
+          ),
+        );
       } catch (err) {
         throw translate(err, max);
       }
@@ -16724,8 +18397,12 @@
         options = undefined;
       }
       // Validation throws synchronously, as node's does.
+      const dictionary = dictionaryOf(options);
+      const finishFlush = finishFlushOf(options);
       const max = maxOutputLengthOf(options);
-      natives.zlibAsync(toBytes(data), format, levelOf(options), compress, max).then(
+      natives.zlibAsync(
+        toBytes(data), format, levelOf(options), compress, max, finishFlush, dictionary,
+      ).then(
         (bytes) => callback(null, asBuffer(bytes)),
         (err) => callback(translate(err, max)),
       );
@@ -16747,8 +18424,14 @@
       const { Transform } = registry.get("stream");
       return class extends Transform {
         constructor(options) {
+          // brotli's flush values are BROTLI_OPERATION_*, not zlib's, and
+          // it has no dictionary option.
+          const dictionary = dictionaryFor(format, options);
+          const finishFlush = format === "brotli" ? undefined : finishFlushOf(options);
           super({});
           this._zlibLevel = levelOf(options);
+          this._zlibFinishFlush = finishFlush;
+          this._zlibDictionary = dictionary;
           // _zlibHandle is null until the first chunk arrives.
           this._zlibHandle = null;
           // Promise serializing back-to-back _transform calls so we
@@ -16760,9 +18443,9 @@
         // Lazily allocate the Rust-side stream on first use.
         _ensureStream() {
           if (this._zlibHandle !== null) return Promise.resolve();
-          return natives.zlibStreamCreate(format, this._zlibLevel, compress).then(
-            (info) => { this._zlibHandle = info.handle; },
-          );
+          return natives.zlibStreamCreate(
+            format, this._zlibLevel, compress, this._zlibDictionary,
+          ).then((info) => { this._zlibHandle = info.handle; });
         }
 
         _transform(chunk, _encoding, cb) {
@@ -16783,13 +18466,15 @@
             if (this._zlibHandle === null) {
               // No data was ever written -- create+immediately flush an
               // empty stream so the output is a valid (empty) archive.
-              return natives.zlibStreamCreate(format, this._zlibLevel, compress)
+              return natives.zlibStreamCreate(
+                format, this._zlibLevel, compress, this._zlibDictionary,
+              )
                 .then((info) => {
                   this._zlibHandle = info.handle;
-                  return natives.zlibStreamFlush(this._zlibHandle);
+                  return natives.zlibStreamFlush(this._zlibHandle, this._zlibFinishFlush);
                 });
             }
-            return natives.zlibStreamFlush(this._zlibHandle);
+            return natives.zlibStreamFlush(this._zlibHandle, this._zlibFinishFlush);
           }).then((tail) => {
             this._zlibHandle = null;
             if (tail && tail.length > 0) cb(null, asBuffer(tail));
@@ -16899,7 +18584,7 @@
       format === "deflateRaw"
         ? (compress ? DEFLATERAW : INFLATERAW)
         : (compress ? DEFLATE : INFLATE);
-    function initSyncHandleState(self, mode, options) {
+    function initSyncHandleState(self, format, mode, options) {
       const opts = options || {};
       let chunkSize = opts.chunkSize != null ? opts.chunkSize : Z_DEFAULT_CHUNK;
       if (chunkSize < Z_MIN_CHUNK) chunkSize = Z_MIN_CHUNK;
@@ -16910,9 +18595,13 @@
       self._buffer = BufferCtor.allocUnsafe(chunkSize);
       self._outBuffer = self._buffer;
       self._hadError = false;
-      self._finishFlushFlag = Z_FINISH;
+      // gzip maps to the zlib-wrapped handle (handleModeFor), so its
+      // dictionary must be dropped here, or the handle writes a stream with
+      // FDICT that no inflater reads without it.
+      const dictionary = dictionaryFor(format, opts);
+      self._finishFlushFlag = finishFlushOf(opts);
       const handle = new ZlibHandle(mode);
-      handle.init(15, levelOf(opts), 8, 0, self._writeState, () => {}, opts.dictionary);
+      handle.init(15, levelOf(opts), 8, 0, self._writeState, () => {}, dictionary);
       self._handle = handle;
       return self;
     }
@@ -16923,7 +18612,7 @@
         // `new zlib.Inflate(opts)` -> a real streaming Transform instance.
         if (new.target) return Reflect.construct(Stream, [options], new.target);
         // `zlib.Inflate.call(this, opts)` -> sync-handle state for inheritance.
-        return initSyncHandleState(this, mode, options);
+        return initSyncHandleState(this, format, mode, options);
       }
       // Share the streaming Transform prototype so `new` instances get the
       // streaming methods AND util.inherits(Sub, ZlibClass) chains
@@ -17457,6 +19146,27 @@
       }
     }
 
+    // A server stand-in socket's own 'close' (serverSocket), and whether it
+    // has been emitted.
+    const kServerSocketClose = Symbol("kServerSocketClose");
+    const kServerSocketClosed = Symbol("kServerSocketClosed");
+    // A connection's socket hears that the peer reset the connection under
+    // a read, just ahead of its 'close' (peerResetConnection).
+    const kServerSocketPeerReset = Symbol("kServerSocketPeerReset");
+    // A server response that closes with its connection's socket: node's
+    // onServerResponseClose, a 'close' listener on the socket from the
+    // moment the response is assigned it until it finishes.
+    const kClosesWithSocket = Symbol("kClosesWithSocket");
+    // A server request whose response has finished: node's resOnFinish has
+    // taken it off the connection's incoming queue, so the connection's
+    // close aborts it no more.
+    const kResponseFinished = Symbol("kResponseFinished");
+    // The server a connection's socket belongs to, and whether node's
+    // socketOnError -- the server's own 'error' listener, which removes
+    // itself after the first error -- has run on it (serverSocketOnError).
+    const kConnServer = Symbol("kConnServer");
+    const kSocketOnErrorRan = Symbol("kSocketOnErrorRan");
+
     class IncomingMessage extends Readable {
       constructor(meta) {
         // The http layer manages this stream's close lifecycle; opt out of
@@ -17469,7 +19179,18 @@
         meta = meta || {};
         this.method = meta.method;
         this.url = meta.uri;
-        this.httpVersion = "1.1";
+        // The request line's version: the accept record names it only when
+        // it is not 1.1. The response frames its body by it, as node's does
+        // (an HTTP/1.0 client gets no chunked body).
+        if (meta.httpVersion === "1.0") {
+          this.httpVersion = "1.0";
+          this.httpVersionMajor = 1;
+          this.httpVersionMinor = 0;
+        } else {
+          this.httpVersion = "1.1";
+          this.httpVersionMajor = 1;
+          this.httpVersionMinor = 1;
+        }
         this.headers = {};
         this.rawHeaders = [];
         for (const [name, value] of meta.headers || []) {
@@ -17564,11 +19285,44 @@
             // rather than producing a status.
             this._reading = false;
             this._bodyDone = true;
-            // A body the connection failed on -- malformed (node's parser
-            // refused it) or cut short -- ends the exchange the way a lost
-            // socket does in node: 'aborted', then ECONNRESET "aborted".
+            // A body the connection failed on is the connection's failure in
+            // node, not the request's: its parser refused the bytes
+            // (HPE_INVALID_CHUNK_SIZE) or the end of the stream
+            // (HPE_INVALID_EOF_STATE), or the socket's read was reset. The
+            // socket reports it (socketOnError: 'clientError', or the
+            // socket destroyed with it), and the request is aborted when
+            // the socket closes -- 'aborted', the response's 'close', the
+            // socket's, then ECONNRESET "aborted" (measured on v22.22.2).
             const text = err instanceof Error ? err.message : String(err);
-            if (text.startsWith("request body: ")) {
+            const code = err instanceof Error ? err.code : undefined;
+            const parseError = typeof code === "string" && code.startsWith("HPE_");
+            const readReset = code === "ECONNRESET" && err.syscall === "read";
+            if (parseError || readReset || text.startsWith("request body: ")) {
+              const socket = this.socket;
+              if (
+                socket &&
+                socket[kConnServer] !== undefined &&
+                socket[kServerSocketClosed] === false
+              ) {
+                if (parseError) {
+                  serverSocketOnError(socket, withParseReason(err));
+                } else if (readReset) {
+                  // net's own: the socket destroys itself with the read's
+                  // error, and socketOnError hears it as an 'error'.
+                  socket.destroy(err);
+                } else {
+                  // A failure node has no name for: the connection goes,
+                  // and the socket's close aborts the request.
+                  socket.destroy();
+                }
+                return;
+              }
+              // The connection closed first. Its close aborted the request
+              // -- unless the response had finished, when node's
+              // abortIncoming no longer has it, and nothing is emitted on it
+              // (which oam did when the body's failure came in after the
+              // close).
+              if (this[kResponseFinished] === true) return;
               const reset = new Error("aborted");
               reset.code = "ECONNRESET";
               this.destroy(reset);
@@ -17610,14 +19364,49 @@
         // unanswered exchange surface a connection error client-side.
         if (this.socket && this.aborted && typeof this._requestId === "number") {
           natives.httpAbort(this._requestId);
-          // The connection goes with it: an unfinished response closes
-          // (node's 'close' without 'finish').
-          if (this.res && typeof this.res._connectionLost === "function") {
+          // The connection goes with it, as node's `this.socket.destroy(err)`
+          // -- a response already under way included, which httpAbort no
+          // longer reaches -- and an unfinished response closes with the
+          // socket (node's 'close' without 'finish'). A socket that is no
+          // connection's has no close of its own to wait for.
+          const socket = this.socket;
+          if (socket[kServerSocketClose] !== undefined && socket._isConnectionSocket === true) {
+            socket.destroy(err);
+          } else if (this.res && typeof this.res._connectionLost === "function") {
             this.res._connectionLost();
           }
         }
         callback(err);
       }
+    }
+
+    // node's write_ check of a chunk (OutgoingMessage): null is
+    // ERR_STREAM_NULL_VALUES, anything but a string or a Uint8Array
+    // ERR_INVALID_ARG_TYPE -- before anything looks at the message's state.
+    function checkWriteChunk(chunk) {
+      if (chunk === null) throw codes.ERR_STREAM_NULL_VALUES();
+      if (typeof chunk !== "string" && !(chunk instanceof Uint8Array)) {
+        throw codes.ERR_INVALID_ARG_TYPE("chunk", ["string", "Buffer", "Uint8Array"], chunk);
+      }
+    }
+
+    // node's onError for a write after end(): on the next tick the callback
+    // hears ERR_STREAM_WRITE_AFTER_END, and then -- unless the message is
+    // destroyed by then -- so does its 'error' (thrown when nothing
+    // listens, as node's). On a destroyed (closed) message only the
+    // callback does.
+    function responseWriteAfterEnd(res, cb) {
+      const err = codes.ERR_STREAM_WRITE_AFTER_END();
+      if (res.closed) {
+        if (typeof cb === "function") process.nextTick(() => cb(err));
+        return;
+      }
+      // oam closes a finished response a tick sooner than node destroys
+      // one, so the state is read once, here.
+      process.nextTick(() => {
+        if (typeof cb === "function") cb(err);
+        res.emit("error", err);
+      });
     }
 
     class ServerResponse extends EventEmitter {
@@ -17665,45 +19454,343 @@
         // finish emission), where Node reports false.
         return this._ended && !(this.closed && !this._finished);
       }
+      // The header methods check what node's OutgoingMessage checks, in its
+      // order, with its errors: a head already sent (ERR_HTTP_HEADERS_SENT),
+      // a name that is not a token (ERR_INVALID_HTTP_TOKEN), an undefined
+      // value (ERR_HTTP_INVALID_HEADER_VALUE), and a value holding a control
+      // character or a code point above U+00FF (ERR_INVALID_CHAR) -- one
+      // the head cannot carry, since it goes out one byte per code point.
+      // They used to store anything, and a value like `€` went out as its
+      // UTF-8 bytes.
       setHeader(name, value) {
-        this._headers.set(String(name).toLowerCase(), value);
+        if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("set");
+        checkOutgoingHeader(name, value);
+        this._progressive = true;
+        const key = name.toLowerCase();
+        this._headers.set(key, value);
+        this._spell(key, name);
+        return this;
+      }
+      // node keeps each stored header's name as it was last set
+      // ([name, value] under the lowercased key) and writes it so. Only a
+      // name that is not its own lowercase is remembered here.
+      _spell(key, name) {
+        if (name !== key) (this._names ??= new Map()).set(key, name);
+        else if (this._names !== undefined) this._names.delete(key);
+      }
+      // node's getRawHeaderNames: the stored names as they were set.
+      getRawHeaderNames() {
+        const names = this._names;
+        return [...this._headers.keys()].map((key) => (names && names.get(key)) || key);
+      }
+      // node's appendHeader: the first value of a name is set as it is; a
+      // later one turns the stored value into a list and joins it (a list
+      // given is spread into it).
+      appendHeader(name, value) {
+        if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("append");
+        checkOutgoingHeader(name, value);
+        this._progressive = true;
+        const key = name.toLowerCase();
+        if (!this._headers.has(key)) {
+          this._headers.set(key, value);
+          this._spell(key, name);
+        } else {
+          const existing = this._headers.get(key);
+          const list = Array.isArray(existing) ? existing : [existing];
+          if (Array.isArray(value)) list.push(...value);
+          else list.push(value);
+          this._headers.set(key, list);
+        }
+        return this;
+      }
+      // node's setHeaders(Headers | Map): each entry through setHeader(),
+      // the set-cookie values gathered into one list.
+      setHeaders(headers) {
+        if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("set");
+        if (
+          !headers ||
+          Array.isArray(headers) ||
+          typeof headers.keys !== "function" ||
+          typeof headers.get !== "function"
+        ) {
+          throw codes.ERR_INVALID_ARG_TYPE("headers", ["Headers", "Map"], headers);
+        }
+        let cookies = null;
+        for (const { 0: key, 1: value } of headers) {
+          if (key === "set-cookie") {
+            cookies ??= [];
+            if (Array.isArray(value)) cookies.push(...value);
+            else cookies.push(value);
+            continue;
+          }
+          this.setHeader(key, value);
+        }
+        if (cookies !== null) this.setHeader("set-cookie", cookies);
         return this;
       }
       getHeader(name) {
-        return this._headers.get(String(name).toLowerCase());
+        checkHeaderNameArg(name);
+        return this._headers.get(name.toLowerCase());
       }
       getHeaderNames() {
         return [...this._headers.keys()];
       }
       removeHeader(name) {
-        this._headers.delete(String(name).toLowerCase());
+        checkHeaderNameArg(name);
+        if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("remove");
+        const key = name.toLowerCase();
+        // node remembers these two: with content-length removed it frames
+        // the body chunked, and with both removed it frames it by closing.
+        if (key === "content-length") this._removedContLen = true;
+        else if (key === "transfer-encoding") this._removedTE = true;
+        else if (key === "connection") this._removedConnection = true;
+        this._headers.delete(key);
+        if (this._names !== undefined) this._names.delete(key);
       }
       hasHeader(name) {
-        return this._headers.has(String(name).toLowerCase());
+        checkHeaderNameArg(name);
+        return this._headers.has(name.toLowerCase());
       }
+      // node's writeHead(statusCode[, statusMessage][, headers]). Headers
+      // given to a response no header method has touched are node's fast
+      // path: every one is checked before any is kept, a list of pairs
+      // ([[name, value], ...]) is taken too, and an empty name is refused.
+      // Otherwise they go through setHeader() (an object) or, a flat list,
+      // removeHeader() then appendHeader(), keeping those before a refusal
+      // and skipping an empty name, as node's do.
       writeHead(status, message, headers) {
-        if (typeof message === "object" && message !== null) {
-          headers = message;
-          message = undefined;
+        if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("write");
+        const code = status | 0;
+        if (code < 100 || code > 999) throw codes.ERR_HTTP_INVALID_STATUS_CODE(status);
+        if (typeof message === "string") {
+          this.statusMessage = message;
+        } else {
+          this.statusMessage ||= httpExports.STATUS_CODES[code] || "unknown";
+          headers ??= message;
         }
-        this.statusCode = status;
-        if (message) this.statusMessage = message;
-        if (headers) {
+        this.statusCode = code;
+        let given = null;
+        if (this._progressive) {
           if (Array.isArray(headers)) {
-            for (let i = 0; i + 1 < headers.length; i += 2) this.setHeader(headers[i], headers[i + 1]);
-          } else {
-            for (const key of Object.keys(headers)) this.setHeader(key, headers[key]);
+            if (headers.length % 2 !== 0) throw codes.ERR_INVALID_ARG_VALUE("headers", headers);
+            for (let n = 0; n < headers.length; n += 2) this.removeHeader(headers[n]);
+            for (let n = 0; n < headers.length; n += 2) {
+              if (headers[n]) this.appendHeader(headers[n], headers[n + 1]);
+            }
+          } else if (headers) {
+            for (const key of Object.keys(headers)) {
+              if (key) this.setHeader(key, headers[key]);
+            }
           }
+          checkStatusMessage(this.statusMessage);
+        } else {
+          checkStatusMessage(this.statusMessage);
+          if (headers) given = this._givenHeaderPairs(headers);
         }
+        // node builds the head here (_storeHeader): from now on headersSent
+        // is true, every header method, writeHead() included, throws
+        // ERR_HTTP_HEADERS_SENT, and the status, the fields and the body's
+        // framing are fixed. It goes on the wire with the first body bytes
+        // or end(), as node's does. A writeHead() that threw built nothing,
+        // as in node.
+        this._storeHead(given);
+        this._wroteHead = true;
+        this.headersSent = true;
         return this;
       }
-      _headerPairsJson() {
+      // writeHead()'s fast path (node's _storeHeader over the object it was
+      // given): every field is checked before the head is built. The
+      // fields go into the head only -- not into the header store, so
+      // getHeader() and the rest never see them, as node's do not.
+      _givenHeaderPairs(headers) {
         const pairs = [];
-        for (const [key, value] of this._headers) {
-          if (Array.isArray(value)) for (const item of value) pairs.push([key, String(item)]);
-          else pairs.push([key, String(value)]);
+        if (Array.isArray(headers)) {
+          if (headers.length && Array.isArray(headers[0])) {
+            for (const entry of headers) pairs.push(entry[0], entry[1]);
+          } else {
+            if (headers.length % 2 !== 0) throw codes.ERR_INVALID_ARG_VALUE("headers", headers);
+            for (const item of headers) pairs.push(item);
+          }
+        } else {
+          for (const key in headers) {
+            if (Object.hasOwn(headers, key)) pairs.push(key, headers[key]);
+          }
         }
-        return JSON.stringify(pairs);
+        for (let n = 0; n < pairs.length; n += 2) checkStoredHeader(pairs[n], pairs[n + 1]);
+        return pairs;
+      }
+      // node's _storeHeader: the head the response sends, fixed once and
+      // for all. `given` is writeHead()'s fast-path [name, value, ...] list,
+      // or null for the header store. Each field is noted as node's
+      // matchHeader notes it, and the body's framing follows node's rules:
+      // a content-length or transfer-encoding field decides it; otherwise
+      // no body for a HEAD request or a 204 / 304 / 1xx, closing the
+      // connection for an HTTP/1.0 client that did not ask for chunks
+      // (`TE: chunked`), the length end() worked out when end() built the
+      // head, and chunks for everything else. So writeHead() then
+      // end('text') is chunked, as in node, where oam used to send a
+      // content-length.
+      _storeHead(given) {
+        const fields = [];
+        let contLen = false;
+        let te = false;
+        let trailer = false;
+        let connection = false;
+        this._chunked = false;
+        const note = (name, value) => {
+          fields.push([name, String(value)]);
+          if (name.length < 4 || name.length > 17) return;
+          switch (name.toLowerCase()) {
+            case "connection":
+              connection = true;
+              this._removedConnection = false;
+              break;
+            case "transfer-encoding":
+              te = true;
+              this._removedTE = false;
+              if (CHUNKED_CODING.test(value)) this._chunked = true;
+              break;
+            case "content-length":
+              contLen = true;
+              this._contentLength = +value;
+              this._removedContLen = false;
+              break;
+            case "trailer":
+              trailer = true;
+              break;
+          }
+        };
+        const add = (name, value) => {
+          if (Array.isArray(value)) for (const item of value) note(name, item);
+          else note(name, value);
+        };
+        if (given === null) {
+          // Each name as it was set: node writes it so.
+          const names = this._names;
+          for (const [key, value] of this._headers) add((names && names.get(key)) || key, value);
+        } else {
+          for (let n = 0; n < given.length; n += 2) add(given[n], given[n + 1]);
+        }
+        const code = this.statusCode;
+        const req = this.req;
+        // node's _hasBody: false for a HEAD request, and turned false -- for
+        // good, even by a writeHead() that then throws -- by a 204, 304 or
+        // 1xx status.
+        if (this._hasBody === undefined) this._hasBody = !(req && req.method === "HEAD");
+        if (code === 204 || code === 304 || (code >= 100 && code <= 199)) this._hasBody = false;
+        const hasBody = this._hasBody;
+        const http10 = Boolean(req && req.httpVersion === "1.0");
+        // node's useChunkedEncodingByDefault: false for an HTTP/1.0 client
+        // that did not send `TE: chunked`.
+        const chunksByDefault = !http10 || CHUNKED_CODING.test(req.headers && req.headers.te);
+        // Whether the native side is handed the body with its length known
+        // up front (hyper sends a content-length, or nothing for a body that
+        // cannot have one), or not (hyper chunks it, or ends it by closing
+        // the connection for an HTTP/1.0 client).
+        let sized = false;
+        if (!contLen && !te) {
+          if (!hasBody) {
+            sized = true;
+          } else if (!chunksByDefault) {
+            sized = false;
+          } else if (!trailer && !this._removedContLen && typeof this._contentLength === "number") {
+            sized = true;
+          } else if (!this._removedTE) {
+            this._chunked = true;
+          }
+        } else {
+          sized = !te;
+        }
+        if (this._chunked && (code === 204 || code === 304)) this._chunked = false;
+        // A Trailer header announces trailers, which only a chunked body
+        // can carry: node refuses the head (an HTTP/1.0 client's without
+        // `TE: chunked`, a 204's, one with a content-length, ...).
+        if (trailer && !this._chunked) throw codes.ERR_HTTP_TRAILER_INVALID();
+        if (http10 && !connection && !this._removedConnection) {
+          // node's keep-alive rule for a head with no connection field: an
+          // HTTP/1.0 client's connection is kept when it asked for that
+          // (`Connection: keep-alive`) and the body is framed -- by a
+          // content-length field, or chunked for a `TE: chunked` client --
+          // and closed otherwise, and node says which. hyper keeps what the
+          // head says (vendor/hyper-1.10.1/OAM-PATCH.md item 15). A removed
+          // connection header sends none, as node's does.
+          const keep = (contLen || chunksByDefault) &&
+            KEEP_ALIVE_TOKEN.test((req.headers && req.headers.connection) || "");
+          fields.push(["Connection", keep ? "keep-alive" : "close"]);
+        }
+        if (http10) {
+          // node chunks for an HTTP/1.0 client that sent `TE: chunked`;
+          // hyper does that only for a response that says so itself.
+          if (this._chunked && !te) fields.push(["Transfer-Encoding", "chunked"]);
+        }
+        this._sizedBody = sized;
+        this._headStatus = code;
+        // The status line's reason phrase is the message as it stands now,
+        // as node's statusLine is: writeHead()'s, or statusMessage.
+        this._headMessage = this.statusMessage;
+        this._headJson = JSON.stringify(fields);
+      }
+      // node's addTrailers: each name a token ('Trailer name'), each value
+      // free of what a header value may not hold ('trailer content'); a
+      // later call replaces an earlier one. They go out with end(), after
+      // the last chunk, when the body is chunked -- with or without a
+      // Trailer header naming them -- and not at all otherwise, as node's.
+      addTrailers(headers) {
+        const trailers = [];
+        const isArray = Array.isArray(headers);
+        for (const key of Object.keys(headers)) {
+          const field = isArray ? headers[key][0] : key;
+          let value = isArray ? headers[key][1] : headers[key];
+          validateHeaderName(field, "Trailer name");
+          if (Array.isArray(value) && value.length > 1) {
+            for (const item of value) {
+              if (INVALID_HEADER_CHAR.test(item)) throw invalidChar("trailer content", field);
+              trailers.push([field, String(item)]);
+            }
+          } else {
+            if (Array.isArray(value)) value = value.join("; ");
+            if (INVALID_HEADER_CHAR.test(value)) throw invalidChar("trailer content", field);
+            trailers.push([field, String(value)]);
+          }
+        }
+        this._trailers = trailers;
+      }
+      // The trailer fields end() hands the native side: only for a chunked
+      // body (node writes them in its last chunk, and has nowhere to put
+      // them otherwise), and only when there are any.
+      _trailerJson() {
+        const trailers = this._trailers;
+        if (!this._chunked || !this._hasBody || !trailers || trailers.length === 0) return undefined;
+        return JSON.stringify(trailers);
+      }
+      // node's _implicitHeader: the head a write(), end() or flushHeaders()
+      // builds when writeHead() has not -- writeHead(this.statusCode), with
+      // its checks and the status message it fills in.
+      _implicitHead() {
+        if (!this._wroteHead) this.writeHead(this.statusCode);
+      }
+      // Whether node writes this response's head as UTF-8, where it
+      // otherwise writes it one byte per code point (latin1), measured on
+      // node v22.22.2. node keeps the head as a string and sends it joined
+      // to the first thing written after it (OutgoingMessage#_send). Joined
+      // to a string body in utf8 or no encoding, the head goes out in that
+      // string's encoding, UTF-8; before a chunk-size line, a Buffer, a
+      // string in another encoding, or nothing at all, it goes out as
+      // latin1. So `café` set with setHeader() reaches the wire as
+      // caf\xc3\xa9 from res.end('text') or flushHeaders(), and as caf\xe9
+      // from res.end(buffer), res.end(), a chunked res.write('text'), a
+      // HEAD request or a 204. `chunk` and `encoding` are the first write's
+      // (or end()'s); `fromEnd` says it is end()'s.
+      // The head is built (_storeHead) before this is asked, so the
+      // framing it chose -- chunks put a chunk-size line ahead of the first
+      // body bytes -- is known.
+      _headIsUtf8(chunk, encoding, fromEnd) {
+        // node's _hasBody: nothing written goes out, end() sends ''.
+        if (!this._hasBody) return false;
+        if (fromEnd && !chunk) return false;
+        if (typeof chunk !== "string" || (encoding && encoding !== "utf8")) return false;
+        if (chunk.length === 0) return true;
+        return !this._chunked;
       }
       _toBytes(chunk, encoding) {
         if (chunk === null || chunk === undefined) return new Uint8Array(0);
@@ -17719,6 +19806,57 @@
           ),
           { code: "ERR_INVALID_ARG_TYPE" },
         );
+      }
+      // Send the head and open the body stream; false when the exchange is
+      // already gone. `utf8Head` is _headIsUtf8()'s answer: the native side
+      // writes each header value as its UTF-8, or one byte per code point.
+      // `first`: the chunk the first write() sends, which goes out with the
+      // head in one write, as node's _send joins them.
+      _startStream(utf8Head, first) {
+        this.headersSent = true;
+        this._streamId = natives.httpRespondStream(
+          this._requestId,
+          this._headStatus,
+          this._headJson,
+          !utf8Head,
+          this._headMessage,
+          first,
+        ) ?? null;
+        if (this._streamId === null) {
+          // Exchange already gone (req.destroy() aborted it, or the
+          // request was answered elsewhere): Node's post-abort write is
+          // a soft failure, never a synchronous throw. Surface the
+          // premature close once; the caller errors its callback async.
+          // Reap the request body too -- the engine keeps a dispatched
+          // streamed body alive for JS, and this branch is the only
+          // notification JS gets that the exchange is dead.
+          if (!this.closed) {
+            this.closed = true;
+            this._dumpReq();
+            queueMicrotask(() => this.emit("close"));
+          }
+          return false;
+        }
+        // Watch for hyper dropping the response body: on the client
+        // tearing the connection down mid-stream, an unfinished response
+        // surfaces Node's 'close'-without-'finish' shape (eos/pipeline
+        // map it to ERR_STREAM_PREMATURE_CLOSE). Normal completion
+        // resolves the watcher too -- the _finished guard no-ops it.
+        const watchedId = this._streamId;
+        natives.httpStreamClosed(watchedId).then(() => {
+          // A response on a connection's socket closes with that socket,
+          // where node closes it: after the socket's earlier 'close'
+          // listeners, not ahead of them.
+          if (this._finished || this.closed || this[kClosesWithSocket] === true) return;
+          this.closed = true;
+          natives.httpBodyEnd(watchedId);
+          // The connection died mid-response: reap an unconsumed request
+          // body too, or its pump outlives the exchange (the engine keeps
+          // streamed bodies alive once a response is in flight).
+          this._dumpReq();
+          this.emit("close");
+        }, () => {});
+        return true;
       }
       write(chunk, encoding, cb) {
         if (typeof encoding === "function") {
@@ -17740,28 +19878,31 @@
           if (cb) queueMicrotask(cb);
           return true;
         }
-        if (this._ended) return false;
+        // node's write_: the chunk is checked first, whatever the state.
+        checkWriteChunk(chunk);
+        // Then a write after end() -- ERR_STREAM_WRITE_AFTER_END to the
+        // callback and, while the response is not destroyed, as its
+        // 'error', on the next tick -- and a write on a response whose
+        // connection closed under it (a reset, a destroyed socket, a client
+        // gone): nothing is sent, and the callback hears
+        // ERR_STREAM_DESTROYED on the next tick. oam returned false
+        // silently after end() and, once closed, called back with no error.
+        if (this._ended) {
+          responseWriteAfterEnd(this, cb);
+          return false;
+        }
+        if (this.closed) {
+          if (typeof cb === "function") {
+            process.nextTick(() => cb(codes.ERR_STREAM_DESTROYED("write")));
+          }
+          return false;
+        }
         const bytes = this._toBytes(chunk, encoding);
+        let withHead = false;
         if (this._streamId === null) {
-          this.headersSent = true;
-          this._streamId = natives.httpRespondStream(
-            this._requestId,
-            this.statusCode,
-            this._headerPairsJson(),
-          ) ?? null;
-          if (this._streamId === null) {
-            // Exchange already gone (req.destroy() aborted it, or the
-            // request was answered elsewhere): Node's post-abort write is
-            // a soft failure, never a synchronous throw. Surface the
-            // premature close once and error the callback async. Reap the
-            // request body too -- the engine keeps a dispatched streamed
-            // body alive for JS, and this branch is the only notification
-            // JS gets that the exchange is dead.
-            if (!this.closed) {
-              this.closed = true;
-              this._dumpReq();
-              queueMicrotask(() => this.emit("close"));
-            }
+          this._implicitHead();
+          withHead = true;
+          if (!this._startStream(this._headIsUtf8(chunk, encoding, false), bytes)) {
             if (cb) {
               const err = Object.assign(
                 new Error("Cannot call write after a stream was destroyed"),
@@ -17771,32 +19912,21 @@
             }
             return false;
           }
-          // Watch for hyper dropping the response body: on the client
-          // tearing the connection down mid-stream, an unfinished response
-          // surfaces Node's 'close'-without-'finish' shape (eos/pipeline
-          // map it to ERR_STREAM_PREMATURE_CLOSE). Normal completion
-          // resolves the watcher too -- the _finished guard no-ops it.
-          const watchedId = this._streamId;
-          natives.httpStreamClosed(watchedId).then(() => {
-            if (this._finished || this.closed) return;
-            this.closed = true;
-            natives.httpBodyEnd(watchedId);
-            // The connection died mid-response: reap an unconsumed request
-            // body too, or its pump outlives the exchange (the engine keeps
-            // streamed bodies alive once a response is in flight).
-            this._dumpReq();
-            this.emit("close");
-          }, () => {});
         }
         // SERIALIZE: each push chains on the previous one. Independent
         // unawaited ops raced (chunks reordered, dropped, and end() pulled
         // the stream out from under in-flight writes), corrupting every
         // multi-chunk response. The chain guarantees byte order.
         const streamId = this._streamId;
-        this._chain = this._chain.then(() => natives.httpBodyPush(streamId, bytes)).then(
+        // The first chunk went with the head; its callback runs once the
+        // writes ahead of it have.
+        const push = withHead ? () => undefined : () => natives.httpBodyPush(streamId, bytes);
+        this._chain = this._chain.then(push).then(
           () => cb?.(),
           (err) => {
-            if (this.listenerCount("error") > 0) this.emit("error", err);
+            // A response its connection was closed under has closed, and
+            // node emits no 'error' on it for a write that went nowhere.
+            if (!this.closed && this.listenerCount("error") > 0) this.emit("error", err);
             cb?.(err);
           },
         );
@@ -17828,22 +19958,59 @@
           }
           return this;
         }
-        if (this._ended) return this;
+        const hasChunk = chunk !== undefined && chunk !== null;
+        if (this._ended) {
+          // node's end() again: a chunk is a write after end (its callback
+          // and 'error' hear it); without one the callback waits for
+          // 'finish', or hears ERR_STREAM_ALREADY_FINISHED once it is past.
+          if (hasChunk) {
+            responseWriteAfterEnd(this, cb);
+          } else if (typeof cb === "function") {
+            if (!this._finished) this.once("finish", cb);
+            else process.nextTick(() => cb(codes.ERR_STREAM_ALREADY_FINISHED("end")));
+          }
+          return this;
+        }
+        if (this.closed) {
+          // A response whose connection closed under it: node's write_ sends
+          // nothing and builds no head for a chunk (headersSent stays false;
+          // end() with none builds it), the response is ended, and the
+          // callback waits for a 'finish' that never comes. oam built the
+          // head and called it back with no error.
+          if (hasChunk) checkWriteChunk(chunk);
+          else if (!this._wroteHead) this.writeHead(this.statusCode);
+          if (typeof cb === "function") this.once("finish", cb);
+          this._ended = true;
+          return this;
+        }
         if (this._streamId === null) {
-          // Single-shot: full body, hyper sets content-length.
+          // Single-shot: the whole body in one op, framed as the head says.
+          let bytes = this._toBytes(chunk, encoding);
+          if (!this._wroteHead) {
+            // node's end() before any head: the body's length is known, and
+            // the head it builds sends it.
+            this._contentLength = bytes.length;
+            this.writeHead(this.statusCode);
+          }
+          // A response that cannot have a body (HEAD, 204, 304) sends none:
+          // node drops what end() was given, and no content-length goes out.
+          if (!this._hasBody) bytes = new Uint8Array(0);
           this._ended = true;
           this.headersSent = true;
           natives.httpRespond(
             this._requestId,
-            this.statusCode,
-            this._headerPairsJson(),
-            this._toBytes(chunk, encoding),
+            this._headStatus,
+            this._headJson,
+            bytes,
+            !this._headIsUtf8(chunk, encoding, true),
+            !this._sizedBody,
+            this._headMessage,
+            this._trailerJson(),
           );
           queueMicrotask(() => {
-            if (this.closed) {
-              cb?.();
-              return;
-            }
+            // Closed under it in the meantime: no 'finish', so the callback,
+            // as node's waits on 'finish', is never called.
+            if (this.closed) return;
             this._finished = true;
             this._dumpReq();
             this.emit("finish");
@@ -17857,12 +20024,22 @@
           if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
           this._ended = true;
           const streamId = this._streamId;
+          // node writes the trailers after the last chunk, with end().
+          const trailers = this._trailerJson();
+          if (trailers !== undefined) {
+            this._chain = this._chain.then(() => natives.httpBodyTrailers(streamId, trailers)).then(
+              undefined,
+              (err) => {
+                if (this.listenerCount("error") > 0) this.emit("error", err);
+              },
+            );
+          }
           this._chain = this._chain.then(() => {
             if (this.closed) {
               // The httpStreamClosed watcher already surfaced a premature
               // 'close' (client abort mid-stream): never follow it with a
-              // spurious 'finish' or a second 'close'.
-              cb?.();
+              // spurious 'finish' or a second 'close' -- and the callback,
+              // which waits on 'finish' in node, is never called.
               return;
             }
             natives.httpBodyEnd(streamId);
@@ -17912,9 +20089,14 @@
         if (req._consuming || (rs && rs.resumeScheduled)) return;
         req._dump();
       }
+      // node sends the head joined to an empty string in no encoding: as
+      // UTF-8, whatever follows.
       flushHeaders() {
         if (this._mock) return;
-        if (this._streamId === null && !this._ended) this.write(new Uint8Array(0));
+        if (this._streamId === null && !this._ended) {
+          this._implicitHead();
+          this._startStream(true);
+        }
       }
       assignSocket(socket) {
         // Mock/inject consumers (light-my-request) hand us a throwaway Writable
@@ -18009,19 +20191,77 @@
         }
         return this;
       };
-      // Closes the connection. The server's own error handler is always
-      // listening in node, so an error here reaches only the caller's
-      // listeners.
+      // node's 'close', once, saying whether the socket was destroyed with
+      // an error. A connection's socket closes when the native side reports
+      // the connection over (releaseConnection), as node's closes when its
+      // handle has: its listeners -- the server's own abortIncoming first,
+      // then the application's and each response's -- run in node's order.
+      // Any other stand-in (a 'timeout' or 'tlsClientError' socket with no
+      // connection record) closes on the next tick after its destroy().
+      let closeEmitted = false;
+      let hadError = false;
+      Object.defineProperty(socket, kServerSocketClose, {
+        value: function emitClose() {
+          if (closeEmitted) return;
+          closeEmitted = true;
+          this.readable = false;
+          this.writable = false;
+          this.destroyed = true;
+          this.emit("close", hadError);
+        },
+      });
+      Object.defineProperty(socket, kServerSocketClosed, {
+        get() {
+          return closeEmitted;
+        },
+      });
+      // node's socket when its read is reset: destroyed with the read's
+      // error, which it emits -- socketOnError, the server's 'clientError',
+      // hearing it first -- in the same tick as the 'close' (saying true)
+      // that releaseConnection brings next. A socket JS has destroyed
+      // already says nothing more.
+      Object.defineProperty(socket, kServerSocketPeerReset, {
+        value: function peerReset(err) {
+          if (closeEmitted || this.destroyed) return;
+          this.destroyed = true;
+          this.readable = false;
+          this.writable = false;
+          hadError = true;
+          if (this[kConnServer] !== undefined) serverSocketOnError(this, err);
+          if (this.listenerCount("error") > 0) this.emit("error", err);
+        },
+      });
+      // Closes the connection -- with a reset when resetAndDestroy() asked
+      // (_reset).
       socket.destroy = function destroy(err) {
         if (this.destroyed) return this;
         this.destroyed = true;
         this.readable = false;
         this.writable = false;
-        if (typeof connectionId === "number") natives.httpConnDestroy(connectionId);
-        process.nextTick(() => {
-          if (err && this.listenerCount("error") > 0) this.emit("error", err);
-          this.emit("close", Boolean(err));
-        });
+        if (err) {
+          hadError = true;
+          // node's 'error': on the next tick, ahead of the 'close' the
+          // handle's close brings. On a connection's socket its first
+          // listener is the server's socketOnError, so the server's
+          // 'clientError' hears the first error (the socket destroyed by
+          // then) before the caller's listeners do; with none of those, the
+          // server's own no-op listener keeps it from being thrown.
+          process.nextTick(() => {
+            if (this[kConnServer] !== undefined) serverSocketOnError(this, err);
+            if (this.listenerCount("error") > 0) this.emit("error", err);
+          });
+        }
+        if (typeof connectionId === "number") {
+          if (this.resetAndClosing === true) {
+            this.resetAndClosing = false;
+            natives.httpConnReset(connectionId);
+          } else {
+            natives.httpConnDestroy(connectionId);
+          }
+        }
+        if (this._isConnectionSocket !== true) {
+          process.nextTick(() => this[kServerSocketClose]());
+        }
         return this;
       };
       // Closes the connection once what is being written is out (no
@@ -18034,18 +20274,25 @@
         }
         return this;
       };
-      // The connection went away under the exchange (the native side's
-      // 'closed'): node's socket is neither readable nor writable then, and
-      // on-finished reads exactly that to tell an aborted request from one
-      // still arriving. Not destroy(): the connection is already gone, and
-      // node emits the socket's 'close' from the teardown that reported it,
-      // which oam does not surface on this object (divergence 39).
-      socket._markClosed = function markClosed() {
-        this.readable = false;
-        this.writable = false;
-        this.destroyed = true;
-      };
+      // node's socket.resetAndDestroy(), net.Socket's own function: the
+      // connection is closed with a reset (SO_LINGER 0) -- the client's read
+      // fails with ECONNRESET and nothing unsent reaches it, a response
+      // being written included -- and the socket is destroyed at once, its
+      // 'close' saying false. An https connection's socket is a TLSSocket,
+      // which refuses it with ERR_INVALID_HANDLE_TYPE (serverSocketView).
+      if (typeof connectionId === "number") {
+        socket[registry._netNativeConnection] = connectionId;
+      }
+      socket.resetAndDestroy = registry.get("net").Socket.prototype.resetAndDestroy;
+      socket._reset = serverSocketReset;
       return socket;
+    }
+
+    // node's Socket.prototype._reset, for serverSocket(): the destroy that
+    // resetAndDestroy() asks for.
+    function serverSocketReset() {
+      this.resetAndClosing = true;
+      return this.destroy();
     }
 
     // A duration handed to the native server: node's timer range (a finite
@@ -18265,8 +20512,77 @@
       // with an exchange still open is not idle.
       exchanges.set(requestId, { req, res, connectionId });
       const forget = () => exchanges.delete(requestId);
+      res.once("finish", () => {
+        req[kResponseFinished] = true;
+      });
       res.once("finish", forget);
       res.once("close", forget);
+      // node's res.assignSocket(): until it finishes, the response closes
+      // when its connection's socket does, from a 'close' listener added
+      // before the 'request' listeners run (onServerResponseClose).
+      const socket = req.socket;
+      if (
+        socket &&
+        socket[kServerSocketClosed] === false &&
+        socket === connectionSocket(server, connectionId)
+      ) {
+        const onSocketClose = () => res._connectionLost();
+        socket.on("close", onSocketClose);
+        res[kClosesWithSocket] = true;
+        const detach = () => {
+          res[kClosesWithSocket] = false;
+          socket.removeListener("close", onSocketClose);
+        };
+        res.once("finish", detach);
+        res.once("close", detach);
+      }
+    }
+
+    // node's abortIncoming, the first 'close' listener on the socket a
+    // connection's requests are served through: each request on the
+    // connection whose response is not done is destroyed -- with
+    // ECONNRESET "aborted" ('aborted' now when it was not read to the end,
+    // 'error' and 'close' on the next tick) -- and its response closes from
+    // its own listener on the socket, after this one.
+    function abortIncoming(server, connectionId) {
+      const exchanges = server._exchanges;
+      if (!exchanges) return;
+      for (const [requestId, exchange] of exchanges) {
+        if (exchange.connectionId === connectionId) abortExchange(server, requestId, exchange);
+      }
+    }
+
+    // node's socketOnError, the 'error' listener the http server puts on
+    // every connection's socket ahead of any other, which removes itself
+    // after the first error: the server's 'clientError' gets the error and
+    // the socket, and decides what becomes of the connection; with no
+    // listener the socket is destroyed with the error. (node writes a 400
+    // first when nothing has been answered; for a body the parser refused,
+    // the native server has already answered it.)
+    function serverSocketOnError(socket, err) {
+      if (socket[kSocketOnErrorRan] === true) return;
+      socket[kSocketOnErrorRan] = true;
+      const server = socket[kConnServer];
+      if (server !== undefined && server.emit("clientError", err, socket)) return;
+      socket.destroy(err);
+    }
+
+    function abortExchange(server, requestId, exchange) {
+      server._exchanges.delete(requestId);
+      const req = exchange.req;
+      if (!req.destroyed) {
+        if (req.readableEnded) {
+          // node's request has closed on its own by now (it destroys itself
+          // once read to the end): it closes, and nothing is aborted.
+          req.destroy();
+        } else {
+          const reset = new Error("aborted");
+          reset.code = "ECONNRESET";
+          req.destroy(reset);
+        }
+      }
+      // A response no socket closes (it was never on a connection's).
+      if (exchange.res[kClosesWithSocket] !== true) exchange.res._connectionLost();
     }
 
     // The socket objects a server's live connections are served through, by
@@ -18297,26 +20613,65 @@
 
     // A connection is over for the server: node's socket is neither readable
     // nor writable, 'close' has fired, and nothing holds it any more. Both of
-    // an https connection's sockets close, the TLS one first, as node's
-    // TLSSocket closes before the socket under it. Also what an upgrade or
-    // CONNECT does to the connection it takes over, in the same step as it
-    // counts the socket that carries the connection on.
-    function releaseConnection(server, connectionId) {
+    // an https connection's sockets close, the one under the TLS socket
+    // first, as node's do (measured on v22.22.2: whether the client or the
+    // server ended it, or JS destroyed the TLS socket). Also what an upgrade
+    // or CONNECT does to the connection it takes over, in the same step as
+    // it counts the socket that carries the connection on.
+    function releaseConnection(server, connectionId, reset) {
       const sockets = server._connSockets;
       const record = sockets && sockets.get(connectionId);
       if (sockets) sockets.delete(connectionId);
       if (record) {
-        for (const socket of [record.secure, record.conn]) {
-          if (socket && !socket.destroyed) {
-            socket._markClosed();
-            socket.emit("close", false);
-          }
+        if (reset) peerResetConnection(record, reset);
+        closeRecordSockets(record);
+      }
+    }
+
+    // What failed the connection (the native side's `reset`): the peer
+    // reset it under a read (code, errno, syscall), or the request body's
+    // parser refused it (code, message, `parse`). node's socket that reads
+    // it -- the TLS socket on an https connection -- is destroyed with that
+    // error, and reports it before it closes (measured on v22.22.2: a
+    // client's resetAndDestroy() of a kept-alive connection, mid-response,
+    // or before the answer; a malformed chunk; a client gone mid-body). The
+    // body's own read failure reports the same error when it comes first.
+    function peerResetConnection(record, reset) {
+      const socket = record.secure || record.conn;
+      if (!socket || socket[kServerSocketPeerReset] === undefined) return;
+      let err;
+      if (reset.parse === true) {
+        err = new Error(reset.message);
+        err.code = reset.code;
+        withParseReason(err);
+      } else {
+        err = new Error(reset.syscall + " " + reset.code);
+        if (reset.errno !== undefined && reset.errno !== null) err.errno = reset.errno;
+        err.code = reset.code;
+        err.syscall = reset.syscall;
+      }
+      try {
+        socket[kServerSocketPeerReset](err);
+      } catch (e) {
+        raiseFromListener(e);
+      }
+    }
+
+    // Each socket closes even when a listener on the other throws, as
+    // node's two sockets close apart.
+    function closeRecordSockets(record) {
+      for (const socket of [record.conn, record.secure]) {
+        if (!socket) continue;
+        try {
+          socket[kServerSocketClose]();
+        } catch (e) {
+          raiseFromListener(e);
         }
       }
     }
 
     // A connection event from the native server.
-    function onConnectionEvent(server, meta) {
+    function onConnectionEvent(server, meta, encrypted) {
       const exchange =
         meta.requestId === undefined || !server._exchanges
           ? undefined
@@ -18345,6 +20700,15 @@
         // sees a destroy instead of serving it.
         const socket = serverSocket(meta);
         socket._isConnectionSocket = true;
+        socket[kConnServer] = server;
+        // The requests of an http connection are served through this
+        // socket, and node's abortIncoming is its first 'close' listener,
+        // ahead of any the application adds; an https connection's are
+        // served through its TLS socket ('secureConnection').
+        if (!encrypted) {
+          const connectionId = meta.connectionId;
+          socket.on("close", () => abortIncoming(server, connectionId));
+        }
         // A net.Socket by brand, as oam's own TLSSocket is (#132,
         // divergence 34). Node hands this listener a net.Socket, and a
         // check that filters clients here is often written behind
@@ -18378,6 +20742,9 @@
         // handed out, which node's TLSSocket wraps.
         const socket = registry._tlsServer.serverSocketView(serverSocket(meta), meta.tls);
         socket._isConnectionSocket = true;
+        socket[kConnServer] = server;
+        const connectionId = meta.connectionId;
+        socket.on("close", () => abortIncoming(server, connectionId));
         connectionRecord(server, meta.connectionId).secure = socket;
         try {
           server.emit("secureConnection", socket);
@@ -18387,7 +20754,7 @@
         return;
       }
       if (meta.event === "connectionClosed") {
-        releaseConnection(server, meta.connectionId);
+        releaseConnection(server, meta.connectionId, meta.reset);
         return;
       }
       if (meta.event === "tlsClientError") {
@@ -18417,23 +20784,20 @@
         // not read to the end, 'error' and 'close' on the next tick) --
         // and the response closes without 'finish'.
         if (exchange) {
-          server._exchanges.delete(meta.requestId);
-          const req = exchange.req;
-          const socket = req.socket;
-          if (socket && typeof socket._markClosed === "function") {
-            socket._markClosed();
-            // node closes the connection's socket before the response it
-            // was carrying: the exchange ended because the connection went,
-            // and this IS that connection's socket. The `connectionClosed`
-            // that follows finds it already closed and leaves it alone.
-            if (socket._isConnectionSocket) socket.emit("close", false);
+          // The exchange ended because its connection went: the
+          // connection's sockets close now -- the `connectionClosed` that
+          // follows finds them closed -- and abortIncoming, the first of
+          // their 'close' listeners, aborts it. An exchange still here after
+          // that (on a socket that is no connection's, or whose listeners
+          // were taken off) is aborted directly.
+          releaseConnection(server, exchange.connectionId, meta.reset);
+          if (server._exchanges.get(meta.requestId) === exchange) {
+            const socket = exchange.req.socket;
+            if (socket && socket[kServerSocketClose] !== undefined) {
+              socket[kServerSocketClose]();
+            }
+            abortExchange(server, meta.requestId, exchange);
           }
-          if (!req.destroyed) {
-            const reset = new Error("aborted");
-            reset.code = "ECONNRESET";
-            req.destroy(reset);
-          }
-          exchange.res._connectionLost();
         }
         return;
       }
@@ -18457,13 +20821,16 @@
     // are now (values set right after listen() returned are in), start the
     // connections check (node does it on 'listening', ahead of the caller's
     // listeners), emit 'listening' and serve.
-    function serverBound(server, bound, hostname, encrypted) {
+    function serverBound(server, bound, encrypted) {
       // A server listening again after a close() is running again.
       server[Symbol.for("oam.serverClosing")] = false;
       server[Symbol.for("oam.serverClosed")] = false;
       server._serverId = bound.serverId;
       server._port = bound.port;
-      server._host = hostname;
+      // Where the listener IS bound: `::` for a listen() without a host
+      // (dual-stack), the looked-up address for a name.
+      server._host = bound.address;
+      server._family = bound.family;
       server.listening = true;
       syncServerTimeouts(server);
       startConnectionsCheck(server);
@@ -18493,7 +20860,7 @@
         if (meta === undefined) break;
         if (meta.event !== undefined) {
           try {
-            onConnectionEvent(server, meta);
+            onConnectionEvent(server, meta, encrypted);
           } catch (e) {
             raiseFromListener(e);
           }
@@ -18635,18 +21002,7 @@
       const held = server._connSockets;
       if (held !== undefined) {
         server._connSockets = undefined;
-        for (const record of held.values()) {
-          for (const socket of [record.secure, record.conn]) {
-            if (socket && !socket.destroyed) {
-              socket._markClosed();
-              try {
-                socket.emit("close", false);
-              } catch (e) {
-                raiseFromListener(e);
-              }
-            }
-          }
-        }
+        for (const record of held.values()) closeRecordSockets(record);
       }
       finishClose(server);
     }
@@ -18813,31 +21169,21 @@
         this._host = null;
         this.listening = false;
       }
-      listen(port, host, callback) {
-        if (typeof port === "function") {
-          // listen(cb) -- ephemeral port, Node accepts callback-first.
-          callback = port;
-          port = undefined;
-        }
-        if (typeof port === "object" && port !== null) {
-          // listen({ port, host }, cb)
-          callback = host;
-          host = port.host;
-          port = port.port;
-        }
-        if (typeof host === "function") {
-          callback = host;
-          host = undefined;
-        }
-        if (typeof callback === "function") this.once("listening", callback);
-        const hostname = host ?? "127.0.0.1";
+      listen(...args) {
+        // node's reading of the arguments (net.Server's listen is the one
+        // http.Server has); a port that is not one throws from here (#163).
+        const listen = normalizeListenArgs(args);
+        if (refusePipeListen(this, listen)) return this;
+        const { port, host, ipv6Only, cb: callback } = listen;
+        if (callback !== null) this.once("listening", callback);
         // Stream request bodies: the handler is dispatched on headers and
         // req delivers chunks as they arrive, instead of waiting for the
         // last byte (docs/design/streaming-bodies.md).
         const policy = serverHeadPolicy(this);
         natives.httpServe(
-          hostname,
-          port ?? 0,
+          // No host: node's default, dual-stack `::` (#172).
+          host ?? null,
+          port,
           true,
           policy.maxHeaderSize,
           policy.insecure,
@@ -18845,15 +21191,16 @@
           // maxHeadersCount: null (the default) leaves the native 1000-field
           // cap; 0 is no limit; a number is that cap.
           this.maxHeadersCount,
+          ipv6Only,
         ).then(
-          (bound) => serverBound(this, bound, hostname, false),
+          (bound) => serverBound(this, bound, false),
           (err) => this.emit("error", err),
         );
         return this;
       }
       address() {
         return this.listening
-          ? { port: this._port, address: this._host, family: "IPv4" }
+          ? { address: this._host, family: this._family, port: this._port }
           : null;
       }
       close(callback) {
@@ -19033,6 +21380,17 @@
       return err;
     }
 
+    // What node's net.Socket tells the callback of a write it never made:
+    // the socket closed while still connecting, or was closed by the time
+    // the write queued for its 'connect' ran.
+    function socketClosedWriteError(connected) {
+      const err = new Error(connected
+        ? "Socket is closed"
+        : "Socket closed before the connection was established");
+      err.code = connected ? "ERR_SOCKET_CLOSED" : "ERR_SOCKET_CLOSED_BEFORE_CONNECTION";
+      return err;
+    }
+
     // node's parser errors (`HPE_*`, `Parse Error: <reason>`) carry the
     // reason on their own as well.
     function withParseReason(err) {
@@ -19040,7 +21398,15 @@
         err && typeof err.code === "string" && err.code.indexOf("HPE_") === 0 &&
         err.reason === undefined && typeof err.message === "string"
       ) {
-        err.reason = err.message.replace(/^Parse Error: /, "");
+        if (err.code === "HPE_INVALID_EOF_STATE") {
+          // node's parser.finish(): the stream ended where the message had
+          // not, a message with no reason in it and no bytes of a read
+          // parsed (v22.22.2).
+          err.reason = "Invalid EOF state";
+          err.bytesParsed = 0;
+        } else {
+          err.reason = err.message.replace(/^Parse Error: /, "");
+        }
       }
       return err;
     }
@@ -19456,17 +21822,18 @@
     }
 
     // The fetch path's headers, as they have always been read: through the
-    // fetch Headers class (sorted, repeated names combined).
+    // fetch Headers class (repeated names combined), in the order they
+    // arrived -- its stored list, not its iteration, which sorts by name.
     function fetchPathHeaders(pairs) {
       const combined = new oamFetchInternal.Headers();
       for (let i = 0; i < pairs.length; i++) combined.append(pairs[i][0], pairs[i][1]);
       const headers = {};
       const raw = [];
-      combined.forEach(function (value, name) {
+      for (const [name, value] of combined._list) {
         const key = name.toLowerCase();
         headers[key] = key in headers ? headers[key] + ", " + value : value;
         raw.push(name, value);
-      });
+      }
       return { headers, raw };
     }
 
@@ -19516,6 +21883,20 @@
       socket.end = fetchSocketEnd;
       socket.address = fetchSocketAddress;
       return socket;
+    }
+
+    // responseWriteAfterEnd for a ClientRequest, whose destroyed state is
+    // its own `destroyed`.
+    function requestWriteAfterEnd(req, cb) {
+      const err = codes.ERR_STREAM_WRITE_AFTER_END();
+      if (req.destroyed) {
+        if (typeof cb === "function") process.nextTick(() => cb(err));
+        return;
+      }
+      process.nextTick(() => {
+        if (typeof cb === "function") cb(err);
+        if (!req.destroyed) req.emit("error", err);
+      });
     }
 
     class ClientRequest extends EventEmitter {
@@ -19623,6 +22004,9 @@
         if (opts.headers) {
           var keys = Object.keys(opts.headers);
           for (var i = 0; i < keys.length; i++) {
+            // node's constructor sets each through setHeader(), so a bad
+            // name or value throws from http.request itself (#174).
+            checkOutgoingHeader(keys[i], opts.headers[keys[i]]);
             this._headers[keys[i].toLowerCase()] = opts.headers[keys[i]];
           }
         }
@@ -19726,6 +22110,9 @@
         this.errored = null;
         this._bodyLength = 0;
         this._bodyStream = null;
+        // Cancels the transport's request while it has no response (set by
+        // _doFetchRequest; see _cancelBodyStream).
+        this._fetchCancel = null;
         // Every operation on the outbound body channel queues behind the one
         // before it (see _channelWrite). Unordered calls race: the write op is
         // ASYNC and the end op is SYNCHRONOUS, so end() drops the channel's
@@ -19800,6 +22187,49 @@
         this._requestOut = 0;
         this._requestAccepted = 0;
         this._requestWritten = false;
+        // write() callbacks, called as node calls them: once the socket has
+        // written the chunk, so never before it connected. Each waits for
+        // its place in the request body (`at`, as `_bodyQueued` counts it)
+        // to be covered by `_bodyWritten`, the body bytes the socket has
+        // written -- read off the bridge's progress (`_marks`: [request
+        // bytes, the body bytes they cover] pairs `_requestOut` has yet to
+        // reach, oldest first; `_markSeen` the newest of them).
+        // `_onSocket`: the request's writes are its socket's, in node's
+        // terms -- from the tick 'socket' is emitted in, when node flushes
+        // what the request queued. A request destroyed before that never has
+        // a callback called; one that fails after it has them called with
+        // the socket's reason once it has closed (_failWriteCallbacks).
+        // `_socketConnected`: that socket connected. `_socketFailure`: the
+        // error it failed with.
+        this._writeCallbacks = [];
+        this._bodyQueued = 0;
+        this._bodyWritten = -1;
+        this._marks = [];
+        this._markSeen = 0;
+        this._onSocket = false;
+        this._socketConnected = false;
+        this._socketFailure = null;
+        // oam's own transport. `_fetchDispatched`: it has been handed the
+        // request. `_fetchSent`: it has a connection for it (the sent
+        // signal, `_sentSignal` while open) -- from then on the request is
+        // being written, a write() callback is called as the transport takes
+        // its chunk, and 'finish' follows the last of them (`_finishOnSent`:
+        // end() has asked for it; `_channelPending`: chunks the transport
+        // has yet to take). A request that never gets a connection has
+        // neither, as in node.
+        this._fetchDispatched = false;
+        this._fetchSent = false;
+        this._sentSignal = null;
+        this._finishOnSent = false;
+        this._channelPending = 0;
+        // The response leaves the transport's connection open: the request
+        // closes from the response's 'end' rather than behind its 'close'.
+        this._fetchKeptAlive = false;
+        // Inside the socket's 'connect' / 'secureConnect' emit, ahead of the
+        // request's own listener; and what a listener there closed the
+        // socket with (true: no error), held for that listener to report.
+        this._inConnectEvent = false;
+        this._closedOnConnect = null;
         this._exchangeQueued = false;
         this._waitingConnect = false;
         this._earlySocketEvents = null;
@@ -19865,21 +22295,55 @@
       // node's deprecated alias for `socket`.
       get connection() { return this.socket; }
       set connection(value) { this.socket = value; }
+      // node's OutgoingMessage checks: once the head exists (`_header`: the
+      // first write(), end() or flushHeaders() renders it) a header can no
+      // longer be set, appended or removed -- ERR_HTTP_HEADERS_SENT, checked
+      // first. oam took them, and a header set after a write() in the same
+      // tick still reached the wire.
       setHeader(name, value) {
+        if (this._header) throw codes.ERR_HTTP_HEADERS_SENT("set");
+        checkOutgoingHeader(name, value);
         var key = name.toLowerCase();
         if (key === "connection") this._removedConnection = false;
         this._headers[key] = value;
         return this;
       }
-      getHeader(name) { return this._headers[name.toLowerCase()]; }
-      removeHeader(name) {
+      // node's appendHeader: the first value of a name is set as it is; a
+      // later one turns the stored value into a list (a list given is
+      // spread into it).
+      appendHeader(name, value) {
+        if (this._header) throw codes.ERR_HTTP_HEADERS_SENT("append");
+        checkOutgoingHeader(name, value);
         var key = name.toLowerCase();
-        // node: a removed Connection header is not sent at all.
+        if (key === "connection") this._removedConnection = false;
+        if (Object.hasOwn(this._headers, key)) {
+          this._headers[key] = [].concat(this._headers[key], value);
+        } else {
+          this._headers[key] = value;
+        }
+        return this;
+      }
+      getHeader(name) {
+        checkHeaderNameArg(name);
+        return this._headers[name.toLowerCase()];
+      }
+      removeHeader(name) {
+        checkHeaderNameArg(name);
+        if (this._header) throw codes.ERR_HTTP_HEADERS_SENT("remove");
+        var key = name.toLowerCase();
+        // node: a removed Connection header is not sent at all; a removed
+        // content-length or transfer-encoding changes how the body is
+        // framed (_nodeChunks).
         if (key === "connection") this._removedConnection = true;
+        else if (key === "content-length") this._removedContLen = true;
+        else if (key === "transfer-encoding") this._removedTE = true;
         delete this._headers[key];
       }
       getHeaders() { return Object.assign({}, this._headers); }
-      hasHeader(name) { return name.toLowerCase() in this._headers; }
+      hasHeader(name) {
+        checkHeaderNameArg(name);
+        return name.toLowerCase() in this._headers;
+      }
       // The request head as it goes on the wire: the request line, every
       // header line, and the blank line that ends it -- node's `_header`.
       _renderHead() {
@@ -19902,12 +22366,85 @@
         if (this._header === null) this._header = this._renderHead();
       }
       flushHeaders() {
+        // node sends the head joined to '' (no encoding): as UTF-8.
+        this._noteFirstSend("", undefined, false);
+        // node renders the head here (`_implicitHeader`), whatever the
+        // request's state, so headersSent is true from now on -- on a
+        // destroyed request too, which sends nothing.
+        if (!this._header) this._markHeadersSent();
         // The fetch path sends headers with the body. The agent path sends
         // them now, the body following over the channel.
         if (this._agentPath && !this._sent && !this.finished) this._startBodyStream(true);
       }
+      // node keeps the head as a string and writes it joined to the first
+      // thing sent after it (OutgoingMessage#_send), as a server response
+      // does: joined to a string body in utf8 (or no encoding) that no
+      // chunk-size line goes ahead of, the head -- each header value -- goes
+      // out as UTF-8; before anything else, one byte per code point. So
+      // `café` goes out as caf\xc3\xa9 from req.end('text'), a GET's
+      // write('text') or flushHeaders(), and as caf\xe9 from req.end(), a
+      // Buffer, or a POST's write('text') (chunked). Measured on node
+      // v22.22.2; oam sent every value one byte per code point. The first
+      // send decides, once.
+      _noteFirstSend(chunk, encoding, fromEnd) {
+        if (this._utf8Head !== undefined) return;
+        this._utf8Head = false;
+        if (fromEnd && !chunk) return;
+        if (typeof chunk !== "string" || (encoding && encoding !== "utf8")) return;
+        this._utf8Head = chunk.length === 0 || !this._nodeChunks(fromEnd);
+      }
+      // Whether node's head for this request frames the body chunked
+      // (_storeHeader): a transfer-encoding header says, and a
+      // content-length header means no. Otherwise only the body of a method
+      // other than GET, HEAD, DELETE, OPTIONS, TRACE and CONNECT
+      // (useChunkedEncodingByDefault) is chunked, and not when end() builds
+      // the head -- it knows the length -- unless a Trailer header is set or
+      // the content-length header was removed, nor when the
+      // transfer-encoding header was.
+      _nodeChunks(fromEnd) {
+        var headers = this._headers;
+        var te = headers["transfer-encoding"];
+        if (te !== undefined) return CHUNKED_CODING.test(te);
+        if (headers["content-length"] !== undefined) return false;
+        if (/^(?:GET|HEAD|DELETE|OPTIONS|TRACE|CONNECT)$/.test(this.method)) return false;
+        if (fromEnd && headers["trailer"] === undefined && !this._removedContLen) return false;
+        return !this._removedTE;
+      }
+      // A header value as the transport writes it, one byte per code point:
+      // for a head node sends as UTF-8, the value's UTF-8 bytes. Only a
+      // value outside ASCII differs, and only such a one is copied.
+      _wireValue(value) {
+        if (this._utf8Head !== true || !NON_ASCII.test(value)) return value;
+        return globalThis.Buffer.from(value, "utf8").toString("latin1");
+      }
       write(chunk, encoding, callback) {
         if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+        // node's write_: the chunk is checked first; then a write after
+        // end() is ERR_STREAM_WRITE_AFTER_END -- the callback's and, while
+        // the request is not destroyed, its 'error', on the next tick (oam
+        // returned true and called back with no error).
+        checkWriteChunk(chunk);
+        if (this.finished) {
+          requestWriteAfterEnd(this, callback);
+          return false;
+        }
+        // A destroyed request -- torn down, failed, or closed
+        // by its response before it was ended -- takes nothing, and says so
+        // to the callback on the next tick. Not on oam's own transport once
+        // the response has ended: the upload goes on there, as node's does on
+        // a connection the early response left open.
+        if (this._aborted ||
+            (this.destroyed && !this._ended && !(this._responseEnd && !this._agentPath))) {
+          if (typeof callback === "function") {
+            process.nextTick(function () { callback(codes.ERR_STREAM_DESTROYED("write")); });
+          }
+          return false;
+        }
+        this._noteFirstSend(chunk, encoding, false);
+        // node's write_ renders the head on the first write
+        // (`_implicitHeader`): headersSent is true as write() returns, and
+        // the header setters refuse from then on.
+        if (!this._header) this._markHeadersSent();
         var bytes;
         if (typeof chunk === "string") {
           bytes = globalThis.Buffer.from(chunk, encoding || "utf8");
@@ -19917,18 +22454,29 @@
           bytes = globalThis.Buffer.from(chunk);
         }
         this._bodyLength += bytes.length;
+        this._bodyQueued += bytes.length;
         if (this._bodyStream !== null) {
           // Already streaming: hand the chunk to the transport. The op
-          // resolves once the socket accepts it, so write() backpressure
-          // follows the wire rather than buffering.
-          this._channelWrite(bytes).then(
-            () => { if (callback) callback(); },
-            () => { if (callback) callback(); },
-          );
+          // resolves once the transport takes it, so write() backpressure
+          // follows the wire rather than buffering. On oam's own transport
+          // that is also when the callback is called; over a socket it
+          // waits for the socket's write (_settleWrites).
+          var entry = callback ? this._queueWriteCallback(callback) : null;
+          var taken = this._channelWrite(bytes);
+          if (entry !== null && this._fetchDispatched) {
+            var self = this;
+            var settle = function () {
+              entry.taken = true;
+              self._settleFetchWrites();
+            };
+            taken.then(settle, settle);
+          } else {
+            taken.then(() => {}, () => {});
+          }
           return true;
         }
         this._body.push(bytes);
-        if (callback) queueMicrotask(callback);
+        if (callback) this._queueWriteCallback(callback);
         // A body still open on the next tick is INCREMENTAL and has to
         // stream, or the request cannot go out until the producer finishes
         // (the pipeline-into-a-request stall). The common write()+end() in
@@ -19939,6 +22487,126 @@
           queueMicrotask(() => this._startBodyStreamIfOpen());
         }
         return true;
+      }
+
+      // A write() callback waits for the socket to have written the request
+      // body up to the end of its chunk. (Writes a GET or HEAD drops --
+      // _startBodyStream -- are not in the body: theirs wait for the head.)
+      _queueWriteCallback(callback) {
+        var entry = {
+          at: this._droppedWrites ? 0 : this._bodyQueued,
+          callback: callback,
+          // Queued on the socket by node's flush in the 'socket' tick.
+          flushed: false,
+          // oam's own transport has taken the chunk.
+          taken: false,
+        };
+        this._writeCallbacks.push(entry);
+        return entry;
+      }
+
+      // oam's own transport: the write() callbacks, in order, of the chunks
+      // it has taken -- once it has a connection to write them to.
+      _settleFetchWrites() {
+        if (!this._fetchSent || this._aborted || this._errorEmitted) return;
+        var queue = this._writeCallbacks;
+        while (queue.length > 0 && queue[0].taken) queue.shift().callback(null);
+      }
+
+      // oam's own transport has a connection for the request (or answered
+      // it, or failed it after having had one): what it was handed is being
+      // written, and 'finish' is due once the last chunk is with it.
+      _fetchRequestSent() {
+        if (this._fetchSent) return;
+        this._fetchSent = true;
+        this._socketConnected = true;
+        this._settleFetchWrites();
+        this._maybeFetchFinish();
+      }
+
+      // A request that has failed never finishes: a chunk the transport
+      // takes -- or drops, its connection gone -- after the failure is not a
+      // request written, as node's socket destroyed with writes pending
+      // never calls the write that would finish it.
+      _maybeFetchFinish() {
+        if (this._errorEmitted || this._aborted) return;
+        if (!this._finishOnSent || !this._fetchSent || this._channelPending > 0) return;
+        this._finishOnSent = false;
+        this._emitFinish();
+      }
+
+      // The sent signal is done with: dropped, and whether it had fired --
+      // read here, synchronously, because the wait's own completion may
+      // still be on its way when the fetch settles.
+      _closeSentSignal() {
+        if (this._sentSignal === null) return false;
+        var fired = natives.fetchSentClose(this._sentSignal);
+        this._sentSignal = null;
+        return fired;
+      }
+
+      // node flushes what the request has queued onto its socket in the tick
+      // 'socket' is emitted in (onSocketNT's _flush), unless a listener
+      // destroyed either by then: from here a write() callback is the
+      // socket's to call, with an error if it never writes the chunk.
+      _handToSocket(socket) {
+        if (this._onSocket || this._aborted || this.destroyed || socket.destroyed) return;
+        this._onSocket = true;
+        var queue = this._writeCallbacks;
+        for (var i = 0; i < queue.length; i++) queue[i].flushed = true;
+      }
+
+      // The bridge's progress, read now: how many request bytes hyper has
+      // written and how far into the body they reach, and -- once it has
+      // written the whole request -- how many bytes that is.
+      _noteProgress(id) {
+        var progress = natives.httpBridgeProgress(id);
+        if (progress === undefined) return;
+        if (progress[0] > this._markSeen) {
+          this._markSeen = progress[0];
+          this._marks.push([progress[0], progress[1]]);
+        }
+        if (progress[2] && this._requestBytes === null) this._requestBytes = progress[0];
+      }
+
+      // The socket has written more of the request (or, `taken`, the
+      // request is over and what the socket has taken is what counts): the
+      // write() callbacks whose chunks that covers are called, in order,
+      // with node's `null`.
+      _settleWrites(taken) {
+        var reached = taken ? this._requestAccepted : this._requestOut;
+        var marks = this._marks;
+        while (marks.length > 0 && marks[0][0] <= reached) this._bodyWritten = marks.shift()[1];
+        var queue = this._writeCallbacks;
+        while (queue.length > 0 && queue[0].at <= this._bodyWritten) queue.shift().callback(null);
+      }
+
+      // Every write() callback still waiting, called with no error: the
+      // request is with oam's own transport, or its last byte was written.
+      _settleAllWrites() {
+        var queue = this._writeCallbacks;
+        while (queue.length > 0) queue.shift().callback(null);
+      }
+
+      // The request closed with write() callbacks still waiting. One that
+      // never reached a socket is never called, as in node (the request was
+      // destroyed before 'socket', or in it). The others get the reason node's
+      // socket gives a write it did not make: closed before it connected,
+      // for what node's flush had queued on it; the socket's own error for
+      // a write made after that; and for a socket that had connected, the
+      // stream's "destroyed".
+      _failWriteCallbacks() {
+        var queue = this._writeCallbacks;
+        if (queue.length === 0) return;
+        this._writeCallbacks = [];
+        if (!this._onSocket) return;
+        for (var i = 0; i < queue.length; i++) {
+          var err;
+          if (this._socketConnected) err = codes.ERR_STREAM_DESTROYED("write");
+          else if (queue[i].flushed) err = socketClosedWriteError(false);
+          else err = this._socketFailure || codes.ERR_STREAM_DESTROYED("write");
+          queue[i].callback(err);
+        }
       }
 
       // One chunk onto the outbound body channel, after everything already
@@ -19954,7 +22622,13 @@
             });
         // The tail never rejects: a failed write is the transport's report,
         // not a reason to strand the writes queued behind it.
-        this._channelTail = next.then(function () {}, function () {});
+        var self = this;
+        this._channelPending++;
+        var taken = function () {
+          self._channelPending--;
+          if (!self._agentPath) self._maybeFetchFinish();
+        };
+        this._channelTail = next.then(taken, taken);
         return next;
       }
 
@@ -19995,7 +22669,10 @@
           // pipes a Readable into a GET and waits on exactly that).
           if (this._sent) return;
           this._markHeadersSent();
-          if (!headersOnly) this._droppedWrites = true;
+          if (!headersOnly) {
+            this._droppedWrites = true;
+            for (var wi = 0; wi < this._writeCallbacks.length; wi++) this._writeCallbacks[wi].at = 0;
+          }
           this._dispatch(null);
           return;
         }
@@ -20019,8 +22696,13 @@
         // pipeline ends the destination, then the caller ends it too --
         // fires a SECOND request over the wire.
         if (this._ended) {
-          // node: the callback of a second end() waits for 'finish', or is
-          // told the message already finished.
+          // node: a second end() with a chunk is a write after end; the
+          // callback of one without waits for 'finish', or is told the
+          // message already finished.
+          if (data !== undefined && data !== null) {
+            requestWriteAfterEnd(this, callback);
+            return this;
+          }
           if (typeof callback === "function") {
             if (!this._finished) {
               this.once("finish", callback);
@@ -20032,6 +22714,7 @@
           }
           return this;
         }
+        this._noteFirstSend(data, encoding, true);
         if (data != null) this.write(data, encoding);
         this._ended = true;
         this.finished = true;
@@ -20091,11 +22774,15 @@
           this._finishAwaitsPath = true;
           return;
         }
-        this._emitFinish();
+        this._finishOnSent = true;
+        this._maybeFetchFinish();
       }
 
       _emitFinish() {
         if (this._finished || this._aborted) return;
+        // On oam's own transport nothing reports single chunks: what was
+        // written before 'finish' is called back ahead of it, as in node.
+        if (!this._agentPath) this._settleAllWrites();
         this._finished = true;
         this._bodyLength = 0;
         this.emit("finish");
@@ -20129,6 +22816,12 @@
       _requestWritableFinished() {
         if (!this._finishOnWrite) return false;
         if (this._requestWritten) return true;
+        // How many bytes the request is, read off the bridge now: the count
+        // was published when hyper flushed the last of them, which is
+        // before the peer could answer them, so it is there by the time a
+        // response has ended -- with no op completion of its own to lose a
+        // race against the response's (#190).
+        if (this._requestBytes === null && this._bridge !== null) this._noteProgress(this._bridge);
         return this._requestBytes !== null && this._requestAccepted >= this._requestBytes;
       }
 
@@ -20227,6 +22920,7 @@
           agent.totalSocketCount++;
           installListeners(agent, socket, options);
         }
+        this._handToSocket(socket);
         try {
           socket.connect(options);
         } catch (err) {
@@ -20255,6 +22949,28 @@
       _doFetchRequest(bodyData) {
         var self = this;
         self._sent = true;
+        // The transport has what was written so far, and says when it has a
+        // connection to write it to (the sent signal): the callbacks of
+        // those chunks, and 'finish', wait for that. Until then they are the
+        // connecting socket's, in node's terms (_handToSocket).
+        self._fetchDispatched = true;
+        for (var wi = 0; wi < self._writeCallbacks.length; wi++) self._writeCallbacks[wi].taken = true;
+        self._handToSocket(self._fetchSocket);
+        var signal = natives.fetchSentOpen();
+        self._sentSignal = signal;
+        natives.fetchSentWait(signal).then(function (sent) {
+          if (sent === undefined || sent === false || self._sentSignal !== signal) return;
+          // The connection that has the request, when the transport names
+          // it (plain TCP): from here req.socket.destroy() and
+          // resetAndDestroy() close or reset it, as node's do the socket's
+          // handle, before the response head too. A TLSSocket's is not
+          // tracked (resetAndDestroy() there is ERR_INVALID_HANDLE_TYPE).
+          var standIn = self._fetchSocket;
+          if (typeof sent === "number" && standIn !== null && !standIn.encrypted && !standIn.destroyed) {
+            standIn[registry._netNativeConnection] = sent;
+          }
+          self._fetchRequestSent();
+        }, function () {});
         self._fetchActivity();
         // node's _storeHeader puts a Connection header on every request it
         // sends -- `close` when the socket is not to be kept alive,
@@ -20274,11 +22990,16 @@
         // the value sent here is the one _header shows; the one side effect,
         // setting shouldKeepAlive for a caller-set non-close header, is the
         // same both times.
-        var headers = self._headers;
-        var connection = self._connectionHeader();
-        if (connection !== null) {
-          headers = Object.assign({ __proto__: null }, headers);
-          headers.connection = connection;
+        //
+        // As [name, value] lines (_headerList), so a header whose value is a
+        // list -- setHeader(name, [...]), appendHeader() -- goes out one line
+        // per value, as node writes it; a header object handed over here
+        // joined the list with "," into one line.
+        var headers = self._headerList(true);
+        // A head node writes as UTF-8 (_noteFirstSend): each value's UTF-8
+        // bytes, one byte per code point on the wire.
+        if (self._utf8Head === true) {
+          headers = headers.map(function (pair) { return [pair[0], self._wireValue(pair[1])]; });
         }
         var fetchOpts = {
           method: self.method,
@@ -20291,6 +23012,17 @@
           // named -- and a `lookup` / 'lookup' guard, which the request's
           // own (literal) host never needed, never saw them.
           __oamManualRedirect: true,
+          // ... and adds no header of its own beyond `host` and
+          // `connection`, and hands the response body over as the server
+          // sent it: no `accept` / `user-agent` / `accept-encoding`, no
+          // decoding, `content-encoding` and `content-length` intact.
+          __oamRawExchange: true,
+          __oamSentSignal: signal,
+          // What takes the request off the wire if it is aborted or
+          // destroyed before its response (see _cancelBodyStream).
+          __oamCanceller: function (cancel) {
+            self._fetchCancel = cancel;
+          },
         };
         // The request's own response-head limit; without one the transport
         // applies the process-wide default.
@@ -20301,10 +23033,14 @@
           fetchOpts.body = bodyData;
         }
         oamFetchInternal.fetch(self._url, fetchOpts).then(function (raw) {
+          self._closeSentSignal();
           if (self._aborted) {
             bodyCancel(raw.bodyHandle);
             return;
           }
+          // An answer is an answer to a request that was sent, whether or
+          // not the signal's own completion has arrived.
+          self._fetchRequestSent();
           self._fillFetchSocket(raw);
           self._emitResponse(raw, false);
           if (self._droppedWrites && !self._ended) {
@@ -20324,7 +23060,12 @@
           // A torn-down request swallows the transport failure it caused:
           // Node's abort()/destroy() destroys the socket, and the resulting
           // ECONNRESET is never re-emitted on the destroyed request.
+          var hadConnection = self._closeSentSignal();
           if (self._aborted) return;
+          // Failed on a connection it had: the request was written as far as
+          // node's would have been, and finished first. Failed without one
+          // (refused, unresolvable): nothing was written, and no 'finish'.
+          if (hadConnection) self._fetchRequestSent();
           // Map transport failures to Node-shaped codes: retry logic keys
           // on err.code, and the transport's own texts carry none.
           var msg = typeof err === "string" ? err : (err && err.message) || String(err);
@@ -20338,7 +23079,10 @@
           var cause = err && err.cause;
           var detail = cause && cause.message ? cause.message : msg;
           var mapped;
-          if (cause && cause.code && (cause.syscall === "connect" || cause.syscall === "getaddrinfo")) {
+          if (cause && cause.code &&
+              (cause.syscall === "connect" || cause.syscall === "getaddrinfo" || cause.syscall === "read")) {
+            // A read failure is the server's reset before the response
+            // head: node's socket error, `read ECONNRESET`.
             mapped = cause;
           } else if (cause instanceof AggregateError && cause.code) {
             mapped = cause;
@@ -20383,6 +23127,10 @@
               : registry._disconnectedBeforeSecure({
                   path: null, host: self.host, port: self._port, localAddress: self._options.localAddress,
                 });
+          } else if (cause && cause.code === "UND_ERR_SOCKET") {
+            // The server closed the connection before the response head was
+            // in: node's socket ended under the request, `socket hang up`.
+            mapped = connResetException("socket hang up");
           } else if (/connection refused|ECONNREFUSED/i.test(detail)) {
             mapped = Object.assign(new Error("connect ECONNREFUSED"), {
               code: "ECONNREFUSED",
@@ -20393,6 +23141,7 @@
           } else {
             mapped = err instanceof Error ? err : new Error(msg);
           }
+          if (self._socketFailure === null) self._socketFailure = mapped;
           self._failBeforeResponse(mapped);
         });
       }
@@ -20413,6 +23162,17 @@
           socket.localFamily = facts.localAddr.family;
         }
         socket.connecting = false;
+        // The connection the response came on, which destroy() and
+        // resetAndDestroy() close as node's close the socket's handle -- a
+        // TLSSocket's through destroy() alone (its resetAndDestroy() throws
+        // ERR_INVALID_HANDLE_TYPE, as node's does). An h2 connection, which
+        // the transport does not name, is not tracked.
+        if (facts.connection !== undefined) {
+          socket[registry._netNativeConnection] = facts.connection;
+          // Which checkout of it this request had: once the pool hands the
+          // connection to another request, this socket no longer closes it.
+          socket[registry._netNativeLease] = facts.lease;
+        }
         if (socket.encrypted && raw.tls) {
           // Only a verified certificate gets this far on the fetch path.
           socket.authorized = true;
@@ -20452,8 +23212,18 @@
           if (err) {
             self._awaitingSocket = false;
             process.nextTick(function () {
-              if (self._aborted) self._emitClose();
-              else self._failBeforeResponse(err);
+              if (!self._aborted) {
+                self._failBeforeResponse(err);
+                return;
+              }
+              // Destroyed while its createConnection was pending: node's
+              // onSocketNT reports the failure then.
+              if (!self._errorEmitted) {
+                self._errorEmitted = true;
+                self.errored = err;
+                self.emit("error", err);
+              }
+              self._emitClose();
             });
           } else {
             self.onSocket(socket);
@@ -20510,7 +23280,7 @@
           // ...and then reports it: a destroy() (not an abort()) as the
           // hang-up, then 'close'.
           if (!this._errorEmitted) {
-            var failure = err || (this.aborted ? null : connResetException("socket hang up"));
+            var failure = err || this.errored || (this.aborted ? null : connResetException("socket hang up"));
             if (failure) {
               this._errorEmitted = true;
               this.errored = failure;
@@ -20532,6 +23302,7 @@
             else this._onSocketClose();
           }
         }
+        this._handToSocket(socket);
         this._maybeStartExchange();
       }
 
@@ -20647,7 +23418,15 @@
       // node's socketErrorListener: before the response, the request fails
       // with the socket's own error object.
       _onSocketError(err) {
+        if (this._socketFailure === null) this._socketFailure = err;
         if (this._aborted) return;
+        if (this._inConnectEvent && !this._responded) {
+          // A listener ahead of the request's own destroyed the socket with
+          // this: reported there, after the writes it failed
+          // (_destroyedOnConnect).
+          if (this._closedOnConnect === null) this._closedOnConnect = err;
+          return;
+        }
         if (!this._responded) {
           this._failBeforeResponse(err);
           // The fetch path's stand-in destroyed with an error aborts the
@@ -20666,6 +23445,10 @@
       // node's socketCloseListener.
       _onSocketClose() {
         if (this._aborted || this._responseDone) return;
+        if (this._inConnectEvent && !this._responded) {
+          if (this._closedOnConnect === null) this._closedOnConnect = true;
+          return;
+        }
         if (this._agentPath) {
           if (this._bridge !== null) {
             // What arrived before the close decides: hyper sees the end of
@@ -20712,6 +23495,7 @@
         this._errorEmitted = true;
         this.errored = err;
         this.destroyed = true;
+        this._finishOnSent = false;
         // node destroys the socket with the error: its idle timer is done.
         this._stopFetchSocketTimer();
         this._closeBridge();
@@ -20739,18 +23523,68 @@
           if (socket.encrypted) socket._writeQueuedBeforeConnect = true;
           if (!this._waitingConnect) {
             this._waitingConnect = true;
-            socket.once(socket.encrypted ? "secureConnect" : "connect", function () {
-              self._waitingConnect = false;
-              self._maybeStartExchange();
+            // The request's listener goes last, as node's queued write's
+            // does (it is added by the flush, after every 'socket' listener
+            // has added its own): by the time it runs, a guard's listener
+            // has had its say. A TLS socket's 'connect' is watched as well,
+            // for a listener that destroys the socket there -- it never
+            // gets to 'secureConnect'. The marker at the front says the
+            // event is being emitted, so a close a listener causes is the
+            // request's own listener's to report (_destroyedOnConnect).
+            var events = socket.encrypted ? ["connect", "secureConnect"] : ["connect"];
+            events.forEach(function (event, index) {
+              var last = index === events.length - 1;
+              socket.prependOnceListener(event, function () {
+                if (self._waitingConnect) self._inConnectEvent = true;
+              });
+              socket.once(event, function () {
+                self._inConnectEvent = false;
+                if (!self._waitingConnect) return;
+                var gone = self._aborted || socket.destroyed;
+                if (!gone && !last) return;
+                self._waitingConnect = false;
+                if (gone) {
+                  self._destroyedOnConnect();
+                  return;
+                }
+                self._socketConnected = true;
+                self._maybeStartExchange();
+              });
             });
           }
           return;
         }
+        if (!this._socketGone) this._socketConnected = true;
         this._exchangeQueued = true;
         process.nextTick(function () {
           if ((socket.destroyed && !self._socketGone) || self._aborted || self.destroyed) return;
           self._startExchange();
         });
+      }
+
+      // A 'connect' / 'secureConnect' listener ahead of the request's own
+      // destroyed the request or its socket (a guard vetting the peer).
+      // Nothing was sent, but node had queued the request's writes on the
+      // socket for this event, and they find it closed: each write()
+      // callback is called with ERR_SOCKET_CLOSED and -- the last write's
+      // callback being what emits it -- an ended request still gets its
+      // 'finish', req.writableFinished true, ahead of the hang-up.
+      _destroyedOnConnect() {
+        var failure = this._closedOnConnect;
+        this._closedOnConnect = null;
+        // Already failed some other way: nothing of node's order is left.
+        if (this.destroyed && !this._aborted) return;
+        var queue = this._writeCallbacks;
+        this._writeCallbacks = [];
+        for (var i = 0; i < queue.length; i++) queue[i].callback(socketClosedWriteError(true));
+        if (this._ended && !this._finished) {
+          this._finished = true;
+          this._bodyLength = 0;
+          this.emit("finish");
+        }
+        if (failure !== null && !this._aborted) {
+          this._failBeforeResponse(failure === true ? connResetException("socket hang up") : failure);
+        }
       }
 
       // The request's header lines in the order they were set -- the
@@ -20818,10 +23652,13 @@
           this._upgradeOver(socket, bodyData);
           return;
         }
+        var self = this;
         var request = {
           method: this.method,
           target: this.path,
-          headers: this._headerList(true),
+          headers: this._headerList(true).map(function (pair) {
+            return [pair[0], self._wireValue(pair[1])];
+          }),
           max_header_size: this._maxHeaderSizeLimit(),
         };
         if (this._bodyStream !== null) {
@@ -20956,6 +23793,18 @@
               outDone();
               return;
             }
+            // What these bytes amount to -- how far into the body they
+            // reach, whether they end the request -- is read with them, so
+            // it is known before the socket reports them written.
+            self._noteProgress(id);
+            if (bytes.byteLength === 0) {
+              // Progress alone: the bytes it counts were handed over before
+              // hyper's flush said what they were.
+              self._settleWrites(false);
+              self._requestFlushed();
+              pumpOut();
+              return;
+            }
             // Taken by the socket now; written when it says so, below.
             self._requestAccepted += bytes.byteLength;
             socket.write(
@@ -20966,6 +23815,10 @@
                   return;
                 }
                 self._requestOut += bytes.byteLength;
+                self._noteProgress(id);
+                // node's order: each write() callback as its chunk is
+                // written, then 'finish' behind the last request byte.
+                self._settleWrites(false);
                 self._requestFlushed();
                 pumpOut();
               },
@@ -20973,13 +23826,6 @@
           }, function () { outDone(); });
         };
         pumpOut();
-        // How many of those bytes are the request, once hyper has written it
-        // all: node's 'finish' waits for the socket to have written them.
-        natives.httpBridgeRequestSent(id).then(function (count) {
-          if (count === undefined) return;
-          self._requestBytes = count;
-          self._requestFlushed();
-        }, function () {});
       }
 
       _bridgeInEnd() {
@@ -21082,9 +23928,12 @@
         var written = function (err) {
           if (err) return;
           self._requestWritten = true;
+          self._settleAllWrites();
           if (self._finishOnWrite) self._emitFinish();
         };
-        var headBytes = globalThis.Buffer.from(head + "\r\n", "latin1");
+        // As node writes it: UTF-8 for a head joined to a UTF-8 string body
+        // (_noteFirstSend), else one byte per code point.
+        var headBytes = globalThis.Buffer.from(head + "\r\n", this._utf8Head === true ? "utf8" : "latin1");
         if (bodyData && bodyData.length > 0) {
           socket.write(headBytes);
           socket.write(bodyData, written);
@@ -21160,6 +24009,8 @@
           res.httpVersion = headReader.major + "." + headReader.minor;
           res.headers = parsed.headers;
           res.rawHeaders = parsed.raw;
+          res.trailers = {};
+          res.rawTrailers = [];
           res.socket = res.connection = socket;
           res.req = self;
           self._responded = true;
@@ -21240,6 +24091,16 @@
               if (chunk === undefined) {
                 settled = true;
                 res.complete = true;
+                // A chunked body's trailer section, as node's parser fills
+                // them in before 'end'.
+                var trailers = globalThis.__oam.fetchBodyTrailers(handle);
+                if (trailers !== undefined) {
+                  var pairs = JSON.parse(trailers);
+                  for (var ti = 0; ti < pairs.length; ti++) {
+                    res.rawTrailers.push(pairs[ti][0], pairs[ti][1]);
+                    addHeaderLine(res.trailers, pairs[ti][0], pairs[ti][1]);
+                  }
+                }
                 res.push(null);
                 self._responseEnded();
               } else {
@@ -21248,17 +24109,49 @@
               }
             }, function (err) {
               settled = true;
-              if (agentPath) {
-                // node's parser reports malformed framing on the request
-                // before the response is aborted; a connection that ends
-                // inside a body just aborts it.
-                if (err && typeof err.code === "string" && err.code.indexOf("HPE_") === 0) {
-                  self.errored = withParseReason(err);
-                  self.emit("error", err);
+              // node's request hears what its socket heard first, then the
+              // response is aborted ('aborted', then ECONNRESET `aborted`).
+              // An uncaught 'error' when nothing listens is thrown on its own
+              // tick, as in node, so the response is still aborted.
+              var raise = function (heard) {
+                if (self._errorEmitted || self._aborted) return;
+                self._errorEmitted = true;
+                self.errored = heard;
+                try {
+                  self.emit("error", heard);
+                } catch (thrown) {
+                  process.nextTick(function () { throw thrown; });
                 }
-                err = connResetException("aborted");
+              };
+              if (agentPath) {
+                // Over an agent's socket the bridge reports node's parser's
+                // error for malformed framing; a connection that ends inside
+                // a body just aborts it.
+                if (err && typeof err.code === "string" && err.code.indexOf("HPE_") === 0) {
+                  raise(withParseReason(err));
+                }
+              } else if (err && (err.code === "UND_ERR_SOCKET" || err.syscall === "read" ||
+                  err.code === "UND_ERR_RES_CONTENT_LENGTH_MISMATCH" ||
+                  err.code === "OAM_BODY_ENDED_AT_CLOSE" ||
+                  (typeof err.code === "string" && err.code.indexOf("HPE_") === 0))) {
+                // The shared transport reports a body's wire failure in the
+                // words of undici, which http.request is not: node's parser's
+                // error for malformed framing (in node's own words, as on the
+                // agent path), the socket's `read ECONNRESET` for a reset. A
+                // connection that just ends inside a body only aborts it,
+                // whatever undici would make of it.
+                if (typeof err.code === "string" && err.code.indexOf("HPE_") === 0) {
+                  // undici's sentence carries llhttp's reason in brackets.
+                  var why = /\(([^()]*)\)$/.exec(err.message || "");
+                  var parse = new Error("Parse Error: " + (why ? why[1] : err.message));
+                  parse.code = err.code;
+                  raise(withParseReason(parse));
+                } else if (err.syscall === "read") {
+                  raise(err);
+                }
               }
-              res.destroy(err);
+              if (!agentPath) self._wireGone = true;
+              res.destroy(connResetException("aborted"));
             });
           },
           // node's IncomingMessage._destroy: an unfinished response is
@@ -21269,7 +24162,9 @@
               settled = true;
               bodyCancel(handle);
             }
-            if (!res.complete) {
+            // node: aborted unless it was read to its end -- its whole
+            // body having arrived is not enough.
+            if (!res.complete || !res.readableEnded) {
               res.aborted = true;
               res.emit("aborted");
             }
@@ -21286,6 +24181,10 @@
         res.httpVersion = agentPath && raw.httpVersion ? raw.httpVersion : "1.1";
         res.headers = parsed.headers;
         res.rawHeaders = parsed.raw;
+        // node's IncomingMessage has both from the start, empty unless a
+        // chunked body ends with a trailer section.
+        res.trailers = {};
+        res.rawTrailers = [];
         res.complete = false;
         res.socket = res.connection = this.socket;
         res.req = this;
@@ -21297,14 +24196,23 @@
         if (!agentPath) {
           this._fetchActivity();
           // node detaches a kept-alive socket from the response at its end;
-          // the transport's connection stays pooled likewise.
-          if (this.shouldKeepAlive && responseKeepsAlive(raw, this.method)) {
+          // the transport's connection stays pooled likewise. That is also
+          // where the request closes (node's emitFreeNT, a tick after the
+          // response's 'end' and so ahead of the response's own 'close').
+          // A connection that is not kept closes the request when it goes,
+          // which is after both (_responseEnded).
+          this._fetchKeptAlive = this.shouldKeepAlive && responseKeepsAlive(raw, this.method);
+          if (this._fetchKeptAlive) {
             res.on("end", function () {
+              self.destroyed = true;
               res.socket = null;
               res.connection = null;
+              self._emitClose();
             });
           }
-          this.emit("response", res);
+          // A response nobody listens for is read to its end, as node dumps
+          // it: the request closes with it.
+          if (!this.emit("response", res)) res.resume();
           return;
         }
         // node's parserOnIncomingClient: the socket is kept only if the
@@ -21326,8 +24234,16 @@
         var self = this;
         this._responseEnd = true;
         if (!this.shouldKeepAlive) {
+          // A chunk the socket has taken was written, as far as the request
+          // will ever hear: its whole answer has arrived, and the socket is
+          // about to go (the reasoning of _requestWritableFinished).
+          if (this._bridge !== null) this._noteProgress(this._bridge);
+          this._settleWrites(true);
           // The connection is done with once its response is -- closed
           // after the response's own 'end' has been delivered.
+          // The request closes when its socket has, as node's does
+          // (socketCloseListener): behind the response's own 'close', which
+          // follows its 'end' by a tick.
           var socket = this.socket;
           globalThis.setImmediate(function () {
             self._closeBridge();
@@ -21335,9 +24251,9 @@
               socket._httpMessage = null;
               if (!socket.destroyed) socket.destroy();
             }
+            self._emitClose();
           });
           this.destroyed = true;
-          this._emitClose();
         } else if (this._requestWritableFinished() && !res.aborted) {
           this._responseKeepAlive();
         } else {
@@ -21378,15 +24294,40 @@
       // The response stopped before its end (a failed body, a destroy): the
       // connection is done with, and the request closes.
       _responseAborted() {
-        if (this._responseDone) return;
+        if (this._responseDone) {
+          // The body has all arrived. Where the response's 'end' is what
+          // settles the connection and closes the request -- a kept-alive
+          // one on oam's own transport (_emitResponse), any over an agent's
+          // socket (_agentResponseOnEnd) -- a reader that destroys the
+          // response before that 'end' was delivered (a `break` out of
+          // `for await`, a destroy() while paused) would leave the request
+          // open for good. node's response destroys its socket unless it
+          // was read to its end, and the request closes with it: so here.
+          var res0 = this.res;
+          if (this.closed || !res0 || res0.readableEnded) return;
+          if (!this._agentPath && !this._fetchKeptAlive) return;
+          this._fetchKeptAlive = false;
+        }
         this._responseDone = true;
         this._closeBridge();
         var socket = this.socket;
         if (socket && isSocketLike(socket) && !socket.destroyed) socket.destroy();
         this.destroyed = true;
-        this._emitClose();
+        // node: the response closes first (its own destroy), the request
+        // when the socket that destroy took down has closed. When the wire
+        // failed under the body (a close or reset mid-body), the socket has
+        // closed already: the request closes now, before the response's
+        // 'error' and 'close' (socketCloseListener, measured on v22.22.2;
+        // case 273).
+        var res = this.res;
+        var self = this;
+        if (this._wireGone) this._emitClose();
+        else if (res && !res.closed) res.once("close", function () { self._emitClose(); });
+        else this._emitClose();
       }
 
+      // The response body has arrived to its end (it may not have been read
+      // yet).
       _responseEnded() {
         this._responseDone = true;
         // The agent path's socket is settled by the response's 'end'
@@ -21394,8 +24335,17 @@
         if (this._agentPath) return;
         this._responseEnd = true;
         this._stopFetchSocketTimer();
+        // A connection kept alive closes the request from the response's
+        // 'end' (_emitResponse), and is destroyed there too: until then
+        // node's request is not, and a destroy() aborts it. One that is not
+        // kept is done with now, and closes the request as node's socket
+        // closing does: a turn of the loop on -- behind the 'end' and
+        // 'close' of a response that is being read, ahead of them for one
+        // nobody has read yet.
+        if (this._fetchKeptAlive) return;
         this.destroyed = true;
-        this._emitClose();
+        var self = this;
+        globalThis.setImmediate(function () { self._emitClose(); });
       }
 
       // The fetch path's stand-in is done with: its idle timer stops, as a
@@ -21417,39 +24367,69 @@
       destroy(err) {
         // Node's ClientRequest.destroy() returns early on an already-
         // destroyed request and does NOT re-emit -- a second destroy(err)
-        // (or one after abort()) is silent.
-        if (this._aborted) return this;
+        // (or one after abort()), or one after the response has ended or
+        // the request has failed, is silent.
+        if (this._aborted || this.destroyed) return this;
         this._aborted = true;
-        this._tearDown(!err);
-        if (err) {
-          this._errorEmitted = true;
-          this.errored = err;
-          this.emit("error", err);
-        }
+        this._tearDown(!err, err);
         return this;
       }
       // Node semantics: aborting or destroying the request destroys the
       // underlying socket, so an in-flight response stream fails with
       // ECONNRESET -- otherwise `for await (const c of res)` never
       // terminates and the program hangs. 'close' follows, once.
+      //
+      // Before the response, the request itself is cancelled: the transport
+      // closes the connection it went out on (or stops connecting), so the
+      // server sees the client leave when node's would, not after it has
+      // answered a request nobody is waiting for. Once the response head is
+      // in, this is a no-op and the response's own teardown closes it.
       _cancelBodyStream() {
         if (this._bodyStream !== null) {
           natives.fetchBodyChannelCancel(this._bodyStream);
           this._bodyStream = null;
+        }
+        if (this._fetchCancel !== null) {
+          var cancel = this._fetchCancel;
+          this._fetchCancel = null;
+          cancel();
         }
       }
 
       // `hangUp`: destroyed without an error of the caller's (destroy(),
       // abort()) -- which before a response fails the request with node's
       // 'socket hang up' (its socketCloseListener), ahead of 'close'.
-      _tearDown(hangUp) {
+      // `err`: the caller's error, emitted a tick later as node's is (it
+      // comes back from the destroyed socket), ahead of 'close'. A request
+      // already destroyed (its response ended, or it failed) is left as it
+      // is: node's destroy() returns early, and so does abort()'s.
+      _tearDown(hangUp, err) {
         if (this.destroyed) return;
+        // An agent-path request still waiting for its socket (queued behind
+        // maxSockets, or its createConnection pending) reports the error
+        // when the socket comes, as node's onSocketNT does (_onSocketNT).
+        var awaiting = this._agentPath && this._awaitingSocket;
+        if (err) {
+          this.errored = err;
+          if (!awaiting) this._errorEmitted = true;
+        }
         this.destroyed = true;
         // Abort an in-flight upload so the transport tears the request down
         // instead of completing it with a truncated body.
         this._cancelBodyStream();
+        this._closeSentSignal();
         const res = this.res;
-        if (res && !res.destroyed) {
+        // node's destroy() dumps the response (res._dump()) and destroys the
+        // socket, whose close aborts the response only if it is incomplete:
+        // a response whose body has all arrived is read out, not aborted.
+        // (This is also what a `break` out of `for await (... of res)`
+        // reaches: the stream's destroyer aborts res.req.)
+        var dumped = false;
+        if (res && !res.destroyed && res.complete) {
+          dumped = true;
+          res.removeAllListeners("data");
+          res.resume();
+        } else if (res && !res.destroyed) {
           const reset = new Error("aborted");
           reset.code = "ECONNRESET";
           if (this._inSocketTimeout) {
@@ -21464,24 +24444,33 @@
         this._closeBridge();
         var socket = this.socket || this._fetchSocket;
         if (socket && isSocketLike(socket) && !socket.destroyed) socket.destroy();
-        // An agent-path request still waiting for its socket (queued behind
-        // maxSockets, or its createConnection pending) closes when the socket
-        // comes, as node's onSocketNT does -- handing that socket back.
-        if (this._agentPath && this._awaitingSocket) return;
-        if (hangUp && !this._responded && !this._errorEmitted) {
-          var self = this;
+        // ...and closes then too, handing that socket back.
+        if (awaiting) return;
+        var self = this;
+        if (err) {
+          process.nextTick(function () { self.emit("error", err); });
+        } else if (hangUp && !this._responded && !this._errorEmitted) {
           var hungUp = connResetException("socket hang up");
           this._errorEmitted = true;
           this.errored = hungUp;
           process.nextTick(function () { self.emit("error", hungUp); });
         }
-        this._emitClose();
+        // A dumped response's request closes from its 'end' if that comes
+        // first, else when node's destroyed socket would have closed (its
+        // socketCloseListener): a turn of the loop on.
+        if (dumped) globalThis.setImmediate(function () { self._emitClose(); });
+        else this._emitClose();
       }
       _emitClose() {
         if (this.closed) return;
         this.closed = true;
         var self = this;
-        process.nextTick(function () { self.emit("close"); });
+        process.nextTick(function () {
+          self.emit("close");
+          // node: a write the socket never made hears of it once the socket
+          // has closed, which is after the request's own 'close'.
+          self._failWriteCallbacks();
+        });
       }
       // node's: nothing once the response has ended; else the request hears
       // its socket's 'timeout' (once) and the socket's idle timeout is set
@@ -22053,22 +25042,67 @@
     // node's checkIsHttpToken (lib/_http_common.js), and the two errors its
     // header checks throw.
     var HTTP_TOKEN = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
+    // node's errors, through `codes`: the per-code prototype, node's own-key
+    // order and the `[CODE]` in toString and the stack header.
     function invalidHttpToken(name, token) {
-      var err = new TypeError(name + " must be a valid HTTP token [\"" + token + "\"]");
-      err.code = "ERR_INVALID_HTTP_TOKEN";
-      return err;
+      return new codes.ERR_INVALID_HTTP_TOKEN(name, token);
+    }
+    // node's ERR_INVALID_CHAR: `Invalid character in <what>[ ["<field>"]]`.
+    function invalidChar(what, field) {
+      return new codes.ERR_INVALID_CHAR(what, field);
     }
     function invalidHeaderChar(name) {
-      var err = new TypeError("Invalid character in header content [\"" + name + "\"]");
-      err.code = "ERR_INVALID_CHAR";
-      return err;
+      return invalidChar("header content", name);
     }
-    function validateHeaderName(name) {
-      if (typeof name !== "string" || name.length === 0) throw new TypeError("Header name must be a valid HTTP token [\"" + name + "\"]");
-      if (INVALID_HEADER_CHAR.test(name)) throw new TypeError("Header name must be a valid HTTP token [\"" + name + "\"]");
+    // node's writeHead check of the reason phrase it is about to send.
+    function checkStatusMessage(message) {
+      if (INVALID_HEADER_CHAR.test(message)) throw invalidChar("statusMessage");
+    }
+    // node's `chunked` test of a transfer-encoding value (RE_TE_CHUNKED,
+    // and chunkExpression for a request's TE).
+    var CHUNKED_CODING = /(?:^|\W)chunked(?:$|\W)/i;
+    // A `keep-alive` token in a request's Connection value: what makes
+    // node's parser keep an HTTP/1.0 client's connection.
+    var KEEP_ALIVE_TOKEN = /(?:^|,)[ \t]*keep-alive[ \t]*(?:,|$)/i;
+    // A character outside ASCII: the only kind whose bytes depend on how a
+    // head is written.
+    var NON_ASCII = /[^\x00-\x7f]/;
+    // node's validateHeaderName / validateHeaderValue (lib/_http_outgoing.js),
+    // exported as http.validateHeaderName / http.validateHeaderValue and run
+    // by every outgoing header method, client and server: a name that is not
+    // a token, an undefined value, and a value carrying a character no
+    // header may -- a control character, or one above U+00FF, which a head
+    // written one byte per code point cannot carry -- are refused before
+    // anything is sent (#174). oam sent the last as its UTF-8 bytes.
+    function validateHeaderName(name, label) {
+      if (typeof name !== "string" || !HTTP_TOKEN.test(name)) {
+        throw invalidHttpToken(label || "Header name", name);
+      }
     }
     function validateHeaderValue(name, value) {
-      if (value === undefined) throw new TypeError("Invalid value \"undefined\" for header \"" + name + "\"");
+      if (value === undefined) throw new codes.ERR_HTTP_INVALID_HEADER_VALUE(value, name);
+      if (INVALID_HEADER_CHAR.test(value)) throw invalidHeaderChar(name);
+    }
+    function checkOutgoingHeader(name, value) {
+      validateHeaderName(name);
+      validateHeaderValue(name, value);
+    }
+    // node's validateString(name, 'name') at the top of every outgoing
+    // message's getHeader / hasHeader / removeHeader: a name that is not a
+    // string throws ERR_INVALID_ARG_TYPE, where `String(name)` or
+    // `name.toLowerCase()` answered undefined / false or a bare TypeError.
+    function checkHeaderNameArg(name) {
+      if (typeof name !== "string") throw codes.ERR_INVALID_ARG_TYPE("name", "string", name);
+    }
+    // The same checks as node's _storeHeader makes them on headers given
+    // to writeHead() directly: a list value is checked item by item.
+    function checkStoredHeader(name, value) {
+      validateHeaderName(name);
+      if (!Array.isArray(value)) {
+        validateHeaderValue(name, value);
+        return;
+      }
+      for (var i = 0; i < value.length; i++) validateHeaderValue(name, value[i]);
     }
 
     class OutgoingMessage extends EventEmitter {
@@ -22081,20 +25115,38 @@
         this.writableFinished = false;
         this._headers = {};
       }
-      setHeader(name, value) { this._headers[name.toLowerCase()] = value; }
-      getHeader(name) { return this._headers[name.toLowerCase()]; }
+      setHeader(name, value) {
+        if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("set");
+        checkOutgoingHeader(name, value);
+        this._headers[name.toLowerCase()] = value;
+        return this;
+      }
+      getHeader(name) {
+        checkHeaderNameArg(name);
+        return this._headers[name.toLowerCase()];
+      }
       getHeaderNames() { return Object.keys(this._headers); }
       getHeaders() { return Object.assign({}, this._headers); }
-      hasHeader(name) { return name.toLowerCase() in this._headers; }
-      removeHeader(name) { delete this._headers[name.toLowerCase()]; }
+      hasHeader(name) {
+        checkHeaderNameArg(name);
+        return name.toLowerCase() in this._headers;
+      }
+      removeHeader(name) {
+        checkHeaderNameArg(name);
+        if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("remove");
+        delete this._headers[name.toLowerCase()];
+      }
       flushHeaders() {}
       appendHeader(name, value) {
-        var existing = this._headers[name.toLowerCase()];
-        if (existing !== undefined) {
-          this._headers[name.toLowerCase()] = Array.isArray(existing) ? existing.concat(value) : [existing, value];
+        if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("append");
+        checkOutgoingHeader(name, value);
+        var key = name.toLowerCase();
+        if (Object.hasOwn(this._headers, key)) {
+          this._headers[key] = [].concat(this._headers[key], value);
         } else {
-          this._headers[name.toLowerCase()] = value;
+          this._headers[key] = value;
         }
+        return this;
       }
     }
     Object.setPrototypeOf(ServerResponse.prototype, OutgoingMessage.prototype);
@@ -22391,10 +25443,10 @@
     // node's `dns.ADDRCONFIG`, the hints net passes a lookup off Windows when
     // the caller gave none: the platform's AI_ADDRCONFIG. The table
     // bootstrap.js lookupHints() uses for a fetch's connect.lookup (measured:
-    // 1024 on macOS 26, 0x20 on glibc).
+    // 1024 on macOS 26, 0x20 on glibc; bionic has the BSD value).
     function addrconfigHints() {
       const platform = globalThis.process.platform;
-      if (platform === "darwin" || platform === "freebsd") return 1024;
+      if (platform === "darwin" || platform === "freebsd" || platform === "android") return 1024;
       return 0x20;
     }
 
@@ -22410,6 +25462,31 @@
     function connectErrorNT(self, err) {
       self.destroy(err);
     }
+
+    // destroy()'s two deferred emissions (see Socket.prototype.destroy).
+    // The flags flip before the listeners run, as node's emitErrorNT /
+    // emitCloseNT flip them, so a listener that throws -- or an 'error' with
+    // no listener, which raises 'uncaughtException' from here -- leaves the
+    // state telling the truth.
+    function emitErrorNT(self, err) {
+      self._readableState.errorEmitted = self._writableState.errorEmitted = true;
+      self.emit("error", err);
+    }
+    function emitCloseNT(self, hadError) {
+      self._readableState.closeEmitted = self._writableState.closeEmitted = true;
+      if (hadError === undefined) self.emit("close");
+      else self.emit("close", hadError);
+    }
+    // What a queued write or shutdown resolves with when the socket was
+    // destroyed before it could run (see Socket.prototype._issue).
+    const kSocketClosed = Symbol("kSocketClosed");
+    // Where libuv runs a closed handle's callback: after the immediates
+    // already queued, before any timer. oam's loop has no close phase, so
+    // this is an immediate of its own -- taken off the native, not the
+    // global, so mocked timers do not hold a socket's 'close'.
+    const closeCallback = typeof natives.timerImmediate === "function"
+      ? (fn, self, hadError) => natives.timerImmediate(fn, self, hadError)
+      : (fn, self, hadError) => process.nextTick(fn, self, hadError);
 
     // node's emitLookup for the `all` form (lookupAndConnectMultiple's
     // callback). `dialList(ips)` gets the addresses to attempt, interleaved
@@ -22511,7 +25588,8 @@
     }
     registry._netRefusePipeConnect = refusePipeConnect;
 
-    // `host` is the caller's (net: options.host || 'localhost').
+    // `host` is the caller's (net: options.host || 'localhost'), `port` the
+    // caller's too, validated here; the caller dials `port | 0`.
     // `dial(spec, local)` starts the native connect: spec null for an IP
     // literal, `{ ips }` for a hook's answer, `{ ticket }` for oam's
     // resolver's; `local` the localAddress / localPort the socket is bound
@@ -22533,6 +25611,18 @@
       if (localPort && typeof localPort !== "number") {
         throw codes.ERR_INVALID_ARG_TYPE("options.localPort", "number", localPort);
       }
+      // node validates the port here, after the local end and before the
+      // name is looked up: a value that is neither a number nor a string is
+      // ERR_INVALID_ARG_TYPE, one that is not a port ERR_SOCKET_BAD_PORT,
+      // both thrown from connect() (#163). The op is then handed the number
+      // ('80' and '0x50' are the port 80), never the spelling.
+      if (typeof port !== "undefined") {
+        if (typeof port !== "number" && typeof port !== "string") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.port", ["number", "string"], port);
+        }
+        validatePort(port);
+      }
+      port |= 0;
       const local = localAddress || localPort
         ? JSON.stringify({ address: localAddress || undefined, port: localPort || undefined })
         : undefined;
@@ -22688,6 +25778,10 @@
         };
         this._paused = false;
         this._readLoopActive = false;
+        // A read loop asked for while one was still unwinding (_readLoop),
+        // and whether the handle's EOF has been read.
+        this._readLoopAgain = false;
+        this._readEofSeen = false;
         // Paused-mode reading (node's readableFlowing false / null): a
         // 'readable' listener buffers what arrives here for read(), and once
         // the last one goes the data is held until resume() or a 'data'
@@ -22701,15 +25795,37 @@
         this._releaseScheduled = false;
         // node's Duplex options: a side can be closed from the start.
         if (options && options.readable === false) this.readable = false;
-        if (options && options.writable === false) this.writable = false;
+        if (options && options.writable === false) {
+          // node's Duplex: a side closed from the start has ended and
+          // finished (writableEnded / writableFinished true), so end() and
+          // write() are refused as on any finished stream.
+          this.writable = false;
+          const ws = this._writableState;
+          ws.ending = ws.ended = ws.finished = true;
+        }
         this._pipeHandler = null;
         this._timeoutMs = 0;
         this._timeoutId = null;
-        // Distinguishes ERR_SOCKET_CLOSED vs ERR_SOCKET_CLOSED_BEFORE_
-        // CONNECTION for callbacks queued on a dead socket (Node parity).
+        // Whether the socket ever had its connection: a write a destroy()
+        // stopped before it ran fails with ERR_SOCKET_CLOSED on one that
+        // did, from 'close' (held behind the connect) on one that did not.
         this._everConnected = false;
-        // Opens the write chain once a connect settles (see connect()).
-        this._connectGate = null;
+        // The native halves of the writes (and of end()) made while a connect
+        // is in flight; null when ops go straight to the natives (see
+        // _issue() and _releaseHeldOps()).
+        this._heldOps = null;
+        // end()'s callbacks, from the first end() until the stream finishes
+        // -- node's kOnFinished list. On a socket destroyed before its first
+        // end(), until a write outstanding at destroy() settles (see end()).
+        this._endCallbacks = null;
+        // A write failed for want of a handle: the callbacks of the writes
+        // waiting on its next-tick teardown (see _writeWithoutHandle).
+        this._noHandleFailure = null;
+        // end()'s 'finish' is queued for the loop's next turn (see end()).
+        this._finishPending = false;
+        // The callbacks of the writes held behind a connect, failed from
+        // 'close' if the socket closes first (see _holdWrite).
+        this._heldWrites = null;
         if (options && options._handle !== undefined) {
           this._handle = options._handle;
           this.connecting = false;
@@ -22744,12 +25860,18 @@
           options = { port: args[0], host: typeof args[1] === "string" ? args[1] : undefined };
           cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : undefined;
         }
-        const port = options.port;
+        // node: with neither a port nor a path there is nothing to connect
+        // to, and connect() says so before it touches the socket.
+        if (options.port === undefined && options.path == null) {
+          throw codes.ERR_MISSING_ARGS(["options", "port", "path"]);
+        }
         // node: `options.host || 'localhost'`, and the name is looked up like
         // any other (a `lookup` option sees 'localhost').
         const host = options.host || "localhost";
         if (typeof cb === "function") this.once("connect", cb);
         this.connecting = true;
+        // Whether the connect waits for a name lookup (resetAndDestroy).
+        this._connectByName = !isIPv4(host) && !isIPv6(host);
         // Node registers the TCPSocketWrap synchronously inside connect(), well
         // before the connection is established (probe: _getActiveHandles()
         // contains the Socket on the line after net.connect() returns).
@@ -22759,16 +25881,18 @@
         // strong Map for the process lifetime (one per socket).
         if (!this.destroyed) registry._activeHandles.set(this, "TCPSocketWrap");
         // Node queues writes (and the end() FIN) issued before the
-        // connection exists; the write chain waits on this gate, which opens
-        // once the connect settles -- or once the socket is destroyed while
-        // its name is still being looked up (destroy() opens it).
-        let openGate;
-        const gate = new Promise((resolve) => {
-          openGate = resolve;
-        });
-        this._connectGate = openGate;
-        this._chain = this._chain.then(() => gate);
+        // connection exists: _issue() holds their native halves from here
+        // on, and _releaseHeldOps() hands them over once the connect
+        // settles -- or once the socket is destroyed while its name is
+        // still being looked up. Not on a socket already destroyed (a
+        // connect() retried from its 'error' listener): destroy() has run
+        // and returns early from now on, and a destroyed socket's connect
+        // settles without releasing anything, so a held end() would never
+        // call back. Its ops start at once and fail as a closed socket's.
+        if (this._heldOps === null && !this.destroyed) this._heldOps = [];
         const dial = (spec, local) => {
+          // lookupAndConnect has validated the port by the time it dials.
+          const port = options.port | 0;
           let connecting;
           try {
             connecting = natives.tcpConnect(
@@ -22786,10 +25910,15 @@
             process.nextTick(connectErrorNT, this, err);
             return;
           }
-          this._startConnect(connecting, host, port).then(openGate);
+          this._startConnect(connecting, host, port);
         };
-        if (refusePipeConnect(this, options)) return this;
-        lookupAndConnect(this, options, host, port, dial);
+        if (refusePipeConnect(this, options)) {
+          // node's socket holds a Pipe handle from here: resetAndDestroy()
+          // refuses it.
+          this._pipeConnect = true;
+          return this;
+        }
+        lookupAndConnect(this, options, host, options.port, dial);
         return this;
       }
 
@@ -22824,12 +25953,33 @@
             // without a handle); the remembered flag is applied here, before
             // 'connect' fires and before the first read parks.
             if (this._handleRefed === false) natives.tcpSetRef(this._handle, false);
+            // The held writes go out: node's 'connect' listener takes its
+            // 'close' listener off.
+            if (this._heldWrites !== null) {
+              this._heldWrites = null;
+              this.removeListener("close", this._failHeldWrites);
+            }
+            // What was written while connecting goes out first, then
+            // 'connect': a listener that writes -- or destroys the socket --
+            // finds the earlier writes already with the natives (node
+            // flushes its pending data from a 'connect' listener of its
+            // own, registered by that first write).
+            // A resetAndDestroy() made while a looked-up connect was in flight
+            // resets before the end()'s shutdown goes out, as node's does
+            // (its reset is a 'connect' listener and the shutdown waits for
+            // the write ahead of it): the shutdown, and anything after it,
+            // are held until the 'connect' listeners have run. Through an
+            // IP literal node issues the shutdown first and refuses the
+            // reset with EINVAL, and so does oam.
+            const afterConnect = this._releaseHeldOps(this._resetAtConnect === true);
             this.emit("connect");
             this.emit("ready");
+            if (afterConnect !== null) for (const start of afterConnect) start();
             this._readLoop();
           },
           (err) => {
-            this.connecting = false;
+            // Still `connecting` going in: destroy() reads it to tell a
+            // socket with a handle (node's has one from connect() on).
             this.destroy(_shapeConnectError(err, host, port));
           },
         );
@@ -22844,10 +25994,29 @@
           err.code = "ERR_INVALID_ARG_TYPE";
           throw err;
         }
-        if (this.destroyed || !this.writable) {
-          const err = new Error("This socket has been ended");
-          if (cb) cb(err);
-          else this.emit("error", err);
+        if (this.destroyed || !this.writable || (this._handle === null && this._heldOps === null)) {
+          if (!this.destroyed && (this.writable || this._noHandleFailure !== null)) {
+            return this._writeWithoutHandle(data, cb);
+          }
+          let err;
+          if (this._writableState.ended && this._readableState.endEmitted && !this.allowHalfOpen) {
+            // node's writeAfterFIN (lib/net.js), which replaces write() once
+            // the peer's FIN has been read on a socket that is not
+            // half-open: a write after the auto end() that followed fails
+            // with EPIPE (#164).
+            err = new Error("This socket has been ended by the other party");
+            err.code = "EPIPE";
+          } else {
+            err = this._refusedWriteError();
+          }
+          // The callback gets the error on the next tick, and the socket is
+          // destroyed with it ('error' and 'close' deferred, as every
+          // destroy(); a no-op on a socket already destroyed, so a write to
+          // one reports to the callback alone). Nothing is emitted inside
+          // the call: with no 'error' listener that emit threw into the
+          // caller (#164).
+          if (typeof cb === "function") process.nextTick(cb, err);
+          this.destroy(err);
           return false;
         }
         if (this._timeoutMs > 0) this._resetTimeout();
@@ -22871,38 +26040,242 @@
             if (!this.destroyed) this.emit("drain");
           }
         };
-        this._chain = this._chain.then(() => {
-          if (this.destroyed) {
+        // The native write is issued now (see _issue); `_chain` only orders
+        // what follows it -- the accounting and the callback, each after
+        // the write before it.
+        // `tookWhole`: the socket took the write whole inside this call (the
+        // native op finished in it). node's onwrite then skips afterWrite
+        // for a write with no callback, so such a write does not drain the
+        // callbacks of an end() parked after destroy() (see below).
+        let inCall = true;
+        let tookWhole = false;
+        // Held behind the connect: if the socket closes first, the write
+        // fails from 'close' (see _holdWrite).
+        if (this._heldOps !== null) this._holdWrite(cb);
+        const written = this._issue(() => {
+          const op = natives.tcpWrite(this._handle, bytes);
+          if (op === undefined) tookWhole = inCall;
+          return op;
+        });
+        inCall = false;
+        // Taken whole: as node's, whose onwrite has run by the time write()
+        // returns (libuv's try-write took it all), the bytes are no longer
+        // counted -- writableLength / bufferSize read 0 and write() returns
+        // true below -- though the callback still waits for its turn. No
+        // 'drain' from here: a write before this one still counted settles
+        // after it returns, and emits it.
+        if (tookWhole) {
+          this._writableState.length -= bytes.length;
+          this.bufferSize = this._writableState.length;
+        }
+        this._chain = this._chain.then(() => written).then((failure) => {
+          if (!tookWhole) settle();
+          if (failure === undefined) {
+            if (cb) cb(null);
+          } else if (failure === kSocketClosed) {
+            // A write held behind a connect the socket never made: its
+            // 'close' listener fails it (_failHeldWrites), with the
+            // callbacks of an end() behind it.
+            if (!this._everConnected) return;
             // Node invokes queued write callbacks with the socket-closed
             // error (NOT the connect error -- that went to 'error') --
             // silently dropping them hangs promisified writes forever.
-            if (cb) {
-              const err = Object.assign(
-                new Error(this._everConnected
-                  ? "Socket is closed"
-                  : "Socket closed before the connection was established"),
-                { code: this._everConnected
-                  ? "ERR_SOCKET_CLOSED"
-                  : "ERR_SOCKET_CLOSED_BEFORE_CONNECTION" },
-              );
-              process.nextTick(() => cb(err));
-            }
-            settle();
-            return;
+            if (cb) process.nextTick(cb, codes.ERR_SOCKET_CLOSED());
+          } else {
+            // node's afterWriteDispatched: a failed write destroys the
+            // socket with its error, callback or not. destroy() defers
+            // 'error', so with no listener it is an uncaught exception
+            // rather than a throw into this reaction, which would reject
+            // `_chain` -- an unhandled rejection, and every later write
+            // skipped (#164).
+            this.destroy(failure);
+            if (cb) cb(failure);
           }
-          return natives.tcpWrite(this._handle, bytes).then(
-            () => { settle(); if (cb) cb(); },
-            (err) => { settle(); if (cb) cb(err); else this.emit("error", err); },
-          );
+          // node's afterWrite / onwriteError on a destroyed stream:
+          // errorBuffer hands the callbacks of an end() made after
+          // destroy() their error once a write outstanding at destroy()
+          // settles -- right after that write's own callback. Not for a
+          // write with no callback the socket took whole in the call.
+          if (this.destroyed && this._endCallbacks !== null && (cb || !tookWhole)) {
+            this._failEndCallbacks(failure === kSocketClosed);
+          }
         });
-        // Node: false once the queue is at or past the high-water mark. The
-        // write is still accepted -- false is advisory, asking the producer to
-        // wait for 'drain'.
-        if (this._writableState.length >= this.writableHighWaterMark) {
+        // Node: false once the queue is at or past the high-water mark (and
+        // not empty). The write is still accepted -- false is advisory,
+        // asking the producer to wait for 'drain'.
+        const queued = this._writableState.length;
+        if (queued >= this.writableHighWaterMark && queued !== 0) {
           this._writableState.needDrain = true;
           return false;
         }
         return true;
+      }
+
+      // A write (or end(data)) on a socket with no connection and none on
+      // the way -- never connected, connect() never called: node's
+      // _writeGeneric has no handle to write to and fails the write with
+      // ERR_SOCKET_CLOSED "Socket is closed". As node's onwrite, the error
+      // is the stream's at once (writable false; a later end() does not end
+      // it, a later write waits on it), and on the next tick the callback
+      // gets it, then the callbacks of an end() made since, then the socket
+      // is destroyed with it ('error', then 'close'). Before this the write
+      // reached the natives with no handle and failed with "tcp: write
+      // handle 0 is gone", a message no caller could act on.
+      //
+      // Until that tick a later write is buffered behind the failed one
+      // (node's writeOrBuffer on an errored stream): counted in
+      // writableLength, as node counts a chunk (a string's length, a
+      // buffer's bytes -- net.Socket does not decode strings), and
+      // writableNeedDrain once that reaches the high-water mark. Its
+      // callback gets the error right after the first one's, its chunk
+      // taken off the count just before (errorBuffer). The failed write
+      // itself is not counted: node's onwrite took it off inside the call.
+      // An end() does not end the stream and calls back with the error on
+      // its own tick (Writable.end on an errored stream). Off the hot path:
+      // only a socket with no handle and no connect in flight gets here.
+      _writeWithoutHandle(data, cb) {
+        const ws = this._writableState;
+        let buffered = this._noHandleFailure;
+        if (buffered === null) {
+          const err = codes.ERR_SOCKET_CLOSED();
+          const rs = this._readableState;
+          if (!ws.errored) ws.errored = err;
+          if (!rs.errored) rs.errored = err;
+          this.writable = false;
+          // [chunk length, callback] pairs, the failed write's first.
+          const failed = this._noHandleFailure = [0, cb];
+          process.nextTick(() => {
+            this._noHandleFailure = null;
+            for (let i = 0; i < failed.length; i += 2) {
+              ws.length -= failed[i];
+              const callback = failed[i + 1];
+              if (typeof callback === "function") callback(err);
+            }
+            this.destroy(err);
+          });
+          return false;
+        }
+        const length = typeof data === "string" ? data.length : (data?.byteLength ?? 0);
+        ws.length += length;
+        if (ws.length >= this.writableHighWaterMark) ws.needDrain = true;
+        buffered.push(length, cb);
+        return false;
+      }
+
+      // Why a chunk handed to write() or end(data) on a socket that is not
+      // writable is refused -- node's Writable _write: after end() it is a
+      // write after end, on a socket destroyed first it is
+      // ERR_STREAM_DESTROYED ("Cannot call write after a stream was
+      // destroyed"). Off the hot path: only a refused chunk gets here.
+      _refusedWriteError() {
+        return this._writableState.ending || !this.destroyed
+          ? codes.ERR_STREAM_WRITE_AFTER_END()
+          : codes.ERR_STREAM_DESTROYED("write");
+      }
+
+      // A write made while the connect is in flight. node's _writeGeneric
+      // holds the first such write on a 'connect' listener and adds a
+      // 'close' listener that fails it with
+      // ERR_SOCKET_CLOSED_BEFORE_CONNECTION; the writes after it wait
+      // behind it in the Writable's buffer. So the callbacks wait here, and
+      // the first write adds the 'close' listener -- in the order the
+      // caller's own 'close' listeners were added, as node's -- which the
+      // connect removes (_startConnect). One listener per connect, none on
+      // a connected socket's writes.
+      _holdWrite(cb) {
+        let held = this._heldWrites;
+        if (held === null) {
+          held = this._heldWrites = [];
+          this.once("close", this._failHeldWrites);
+        }
+        held.push(cb);
+      }
+
+      // The socket closed before it connected: node's onClose -> onwrite ->
+      // onwriteError for the held write. Its error is recorded as the
+      // stream's (unless destroy() gave it one), its callback gets it, the
+      // writes behind it and the callbacks of an end() get the stream's
+      // error (errorBuffer), in that order.
+      _failHeldWrites() {
+        const held = this._heldWrites;
+        if (held === null) return;
+        this._heldWrites = null;
+        const err = codes.ERR_SOCKET_CLOSED_BEFORE_CONNECTION();
+        const ws = this._writableState;
+        const rs = this._readableState;
+        if (!ws.errored) ws.errored = err;
+        if (!rs.errored) rs.errored = err;
+        for (let i = 0; i < held.length; i++) {
+          const callback = held[i];
+          if (typeof callback === "function") callback(i === 0 ? err : ws.errored);
+        }
+        if (this._endCallbacks !== null) this._failEndCallbacks(false);
+      }
+
+      // node's errorBuffer for the callbacks of an end() made after
+      // destroy() (end() parks them, see there): each gets the stream's
+      // error, or ERR_STREAM_DESTROYED "Cannot call end after a stream was
+      // destroyed". `deferred` when the write that settled handed its own
+      // callback its error on the next tick, so these run after it.
+      _failEndCallbacks(deferred) {
+        const callbacks = this._endCallbacks;
+        this._endCallbacks = null;
+        const ws = this._writableState;
+        for (const callback of callbacks) {
+          const err = ws.errored ?? codes.ERR_STREAM_DESTROYED("end");
+          if (deferred) process.nextTick(callback, err);
+          else callback(err);
+        }
+      }
+
+      // Hands the native half of a write or of end()'s shutdown -- `run`,
+      // which returns the op's promise -- to the natives: at once on a
+      // socket that has its connection, so the natives are given a write
+      // and the FIN behind it in the same turn and in call order (they
+      // queue per handle, see tcp.rs WriteTurn; #156); once the connect
+      // settles on one still connecting, in the order the calls were made.
+      // The promise returned never rejects: it resolves with undefined, with
+      // the op's error, or with kSocketClosed when the socket was destroyed
+      // before the op could run.
+      _issue(run, isShutdown = false) {
+        const start = () => {
+          if (this.destroyed) return kSocketClosed;
+          let op;
+          try {
+            op = run();
+          } catch (err) {
+            return err;
+          }
+          if (op === undefined) return undefined;
+          return op.then(
+            () => undefined,
+            // An op queued behind others finds its handle gone when
+            // destroy() closed it first: an error with no code, where a
+            // write the OS failed has one.
+            (err) => (this.destroyed && err.code === undefined ? kSocketClosed : err),
+          );
+        };
+        if (this._heldOps === null) return Promise.resolve(start());
+        return new Promise((resolve) => {
+          const held = () => resolve(start());
+          held.isShutdown = isShutdown;
+          this._heldOps.push(held);
+        });
+      }
+
+      // The connect settled (or the socket was destroyed first): the held
+      // ops start, in the order they were made. With `holdShutdown`, a
+      // shutdown and the ops after it do not, and are returned for the
+      // caller to start; otherwise null.
+      _releaseHeldOps(holdShutdown = false) {
+        const held = this._heldOps;
+        if (held === null) return null;
+        this._heldOps = null;
+        for (let i = 0; i < held.length; i++) {
+          if (holdShutdown && held[i].isShutdown === true) return held.slice(i);
+          held[i]();
+        }
+        return null;
       }
 
       // Node's default for a net.Socket. Settable, as Node allows via options.
@@ -22918,49 +26291,184 @@
         return this._writableState.length;
       }
 
+      // node's Writable getters: end() has been called on a stream it could
+      // end (state.ending -- still false after destroy(err); end(), which
+      // does not end an errored stream), and 'finish' has been emitted.
+      get writableEnded() {
+        return this._writableState.ending;
+      }
+      get writableFinished() {
+        return this._writableState.finished;
+      }
+      // node's stream getters, from the same state: `closed` true once
+      // destroy() has run (the handle closed with it; Readable's getter),
+      // `errored` the error the stream was destroyed or failed with,
+      // `readableEnded` once 'end' is out, and `writableNeedDrain` while a
+      // write() that returned false waits for 'drain' (Writable's: not on
+      // a stream destroyed or ending).
+      get closed() {
+        return this._readableState.closed;
+      }
+      get errored() {
+        return this._readableState.errored;
+      }
+      get readableEnded() {
+        return this._readableState.endEmitted;
+      }
+      get writableNeedDrain() {
+        const ws = this._writableState;
+        return !ws.destroyed && !ws.ending && ws.needDrain;
+      }
+
       end(data, encoding, cb) {
         if (typeof data === "function") { cb = data; data = undefined; encoding = undefined; }
         else if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
-        // Reentry guard (EOF auto-end + a user 'end' listener calling end()
-        // again would otherwise chain a SECOND 'finish' after 'close'). Node:
-        // end() after end() is a no-op that still fires the callback.
-        if (this._writableState.ended) {
-          if (cb) this.once("finish", cb);
+        const ws = this._writableState;
+        // node's Writable.end, in its order. A chunk goes through write
+        // first; refused -- after end(), or on a socket destroyed first --
+        // its error is the callback's ("Cannot call write after a stream
+        // was destroyed") and the stream does not end. Then only a stream
+        // neither ended nor errored ends. On one that is (the reentry
+        // guard: the EOF auto-end plus an 'end' listener's end() would
+        // otherwise chain a second 'finish' after 'close'), the callback
+        // is told the stream finished (ERR_STREAM_ALREADY_FINISHED) or was
+        // destroyed (ERR_STREAM_DESTROYED "Cannot call end after a stream
+        // was destroyed") -- never destroy()'s own error, which went to
+        // 'error' and to the callbacks of an end() made before it -- and
+        // waits for 'finish' only while neither has happened yet.
+        let err;
+        if (data !== undefined && data !== null) {
+          // A write failed for want of a handle leaves the socket not
+          // writable but not ended: the chunk is buffered behind it (write()).
+          if (this.destroyed || (!this.writable && this._noHandleFailure === null)) {
+            err = this._refusedWriteError();
+            this.destroy(err);
+          } else {
+            this.write(data, encoding);
+          }
+        }
+        if (err === undefined && (ws.ended || ws.errored)) {
+          if (ws.finished) err = codes.ERR_STREAM_ALREADY_FINISHED("end");
+          else if (this.destroyed) err = codes.ERR_STREAM_DESTROYED("end");
+        }
+        if (err !== undefined || ws.ended || ws.errored) {
+          if (typeof cb === "function") {
+            if (err !== undefined) process.nextTick(cb, err);
+            else if (ws.errored) process.nextTick(cb, ws.errored);
+            else if (this._endCallbacks !== null) this._endCallbacks.push(cb);
+            else process.nextTick(cb, ws.errored ?? codes.ERR_STREAM_DESTROYED("end"));
+          }
           return this;
         }
-        if (data !== undefined && data !== null) this.write(data, encoding);
         this.writable = false;
         // state.writable stays untouched (side-existence marker; see destroy).
-        this._writableState.ending = true;
-        this._writableState.ended = true;
-        this._chain = this._chain.then(() => {
-          if (this._handle !== null) return natives.tcpShutdown(this._handle);
-        }).then(() => {
-          if (this.destroyed || this._writableState.errored) {
-            // Never report success on a socket that died first: Node skips
-            // 'finish' entirely and hands the end callback the error.
-            if (cb) {
-              cb(this._writableState.errored ?? Object.assign(
-                new Error(this._everConnected
-                  ? "Socket is closed"
-                  : "Socket closed before the connection was established"),
-                { code: this._everConnected
-                  ? "ERR_SOCKET_CLOSED"
-                  : "ERR_SOCKET_CLOSED_BEFORE_CONNECTION" },
-              ));
-            }
+        ws.ending = true;
+        ws.ended = true;
+        if (this.destroyed) {
+          // Destroyed without an error and never ended: node ends the
+          // stream and parks the callback on its 'finish' list. A destroyed
+          // stream drains that list only when a write still outstanding
+          // settles (errorBuffer, see write()): the callback then gets the
+          // stream's error -- ERR_SOCKET_CLOSED_BEFORE_CONNECTION for a
+          // write held behind the connect -- or ERR_STREAM_DESTROYED
+          // "Cannot call end after a stream was destroyed". With nothing
+          // outstanding it is never called (node v22.22.2). Nothing is
+          // issued: there is no connection to shut down.
+          if (typeof cb === "function") this._endCallbacks = [cb];
+          return this;
+        }
+        // node's end(cb): the callbacks of every end() made before the
+        // stream finishes run first, in call order, and then 'finish' is
+        // emitted (Writable's kOnFinished list). A destroy() before then
+        // hands them its error instead (see there).
+        const callbacks = this._endCallbacks = cb ? [cb] : [];
+        if (this._handle === null && this._heldOps === null) {
+          // No connection and none on the way: node's _final has nothing
+          // to shut down and calls back at once, so the stream finishes on
+          // the next tick (finishMaybe) -- whatever happens to the socket
+          // in between, a destroy() included.
+          process.nextTick(() => this._finish(callbacks));
+          return this;
+        }
+        // The FIN is asked for now, in the same turn as the writes before
+        // it: the natives send it once the last of them is written, with
+        // no trip back through JS in between (#156; node queues the
+        // shutdown behind its writes in libuv the same way). 'finish' still
+        // waits for every write and for the shutdown.
+        // `doneInCall`: the natives finished the shutdown inside the call
+        // that issued it (nothing was queued before it).
+        let doneInCall = false;
+        const shut = this._issue(() => {
+          if (this._handle === null) return undefined;
+          const op = natives.tcpShutdown(this._handle);
+          if (op === undefined) doneInCall = true;
+          return op;
+        }, true);
+        this._chain = this._chain.then(() => shut).then((failure) => {
+          // A failed shutdown is the socket's error (node's afterShutdown
+          // destroys with it), not a rejection left on `_chain`.
+          if (failure !== undefined && failure !== kSocketClosed) this.destroy(failure);
+          // Never report success on a socket that died first: Node skips
+          // 'finish' entirely, and destroy() has handed the callbacks the
+          // error.
+          if (this.destroyed) return;
+          if (this._writableState.errored) {
+            if (this._endCallbacks === callbacks) this._endCallbacks = null;
+            for (const callback of callbacks.splice(0)) callback(this._writableState.errored);
             return;
           }
-          this._writableState.finished = true;
-          this.emit("finish");
-          if (cb) cb();
-          if (!this.readable) this._doClose();
+          if (!doneInCall) {
+            // The shutdown's completion came from the loop: 'finish' follows
+            // it, as node's does from its shutdown callback.
+            this._finish(callbacks);
+            return;
+          }
+          // Finished in the call: node's shutdown still completes from the
+          // loop -- libuv reports the request in its pending phase -- so
+          // 'finish' comes after every tick and microtask queued meanwhile
+          // and after the rest of the timer or immediate phase end() was
+          // called in (measured on v22.22.2; timerPending). Emitted from a
+          // microtask instead, it ran ahead of the ticks the caller queued
+          // after end() -- and of their resetAndDestroy(), which node
+          // refuses with EINVAL in that window.
+          this._finishPending = true;
+          natives.timerPending(() => {
+            this._finishPending = false;
+            if (!this.destroyed && !this._writableState.errored) this._finish(callbacks);
+          });
         });
         return this;
       }
 
+      // node's finish(): the stream has finished -- the end() callbacks
+      // still waiting run, then 'finish', then a socket whose read side is
+      // done too closes.
+      _finish(callbacks) {
+        if (this._endCallbacks === callbacks) this._endCallbacks = null;
+        this._writableState.finished = true;
+        for (const callback of callbacks.splice(0)) callback(null);
+        this.emit("finish");
+        if (!this.readable) this._doClose();
+      }
+
+      // node's destroy(): the teardown is synchronous -- `destroyed`, the
+      // handle closed, the timer cleared -- and NOTHING is emitted inside
+      // the call. 'error' comes on the next tick (stream destroy's
+      // emitErrorNT) and 'close' after it: from the handle's close callback
+      // for a socket that has one (connected, or still connecting), which
+      // runs after the immediates already queued and before any timer; on
+      // the next tick, with no argument, for a socket that never had one
+      // (lib/net.js Socket.prototype._destroy). So a caller always returns
+      // from destroy() before any listener runs (#189): emitting inside the
+      // call ran a 'close' listener in the middle of whatever loop was
+      // destroying sockets -- node's own Agent.prototype.destroy indexes the
+      // list its 'close' listener splices -- and skipped every second one.
       destroy(err) {
         if (this.destroyed) return this;
+        // node creates the handle in connect(): a connecting socket has one.
+        // So does the fetch path's stand-in while its connection is open.
+        const connection = this[kNativeConnection];
+        const hadHandle = this._handle !== null || this.connecting || connection !== undefined;
         this.destroyed = true;
         this.readable = false;
         this.writable = false;
@@ -22970,13 +26478,31 @@
         // Destroyed while its name was still being looked up: nothing will
         // settle the connect, so release the writes queued behind it (they
         // fail with ERR_SOCKET_CLOSED_BEFORE_CONNECTION).
-        if (this._connectGate) {
-          const openGate = this._connectGate;
-          this._connectGate = null;
-          openGate();
-        }
+        this._releaseHeldOps();
         const rs = this._readableState;
         const ws = this._writableState;
+        // node's Writable.destroy -> errorBuffer: the callbacks of an end()
+        // still waiting for 'finish' get the stream's error (or
+        // ERR_STREAM_DESTROYED "Cannot call end after a stream was
+        // destroyed") on the next tick -- before 'close', not once the
+        // shutdown op, which may be queued behind a write, settles (#156).
+        // Read at that tick, as node's errorBuffer reads them: a 'finish'
+        // already queued (end() on a socket with no connection) takes them
+        // first. While a write is held behind the connect, node's
+        // errorBuffer waits for it: the write fails from 'close' and the
+        // callbacks after it (_failHeldWrites), so they stay where it finds
+        // them.
+        const endCallbacks = this._endCallbacks;
+        if (this._heldWrites === null) {
+          this._endCallbacks = null;
+          if (endCallbacks !== null && endCallbacks.length > 0) {
+            process.nextTick(() => {
+              for (const callback of endCallbacks.splice(0)) {
+                callback(ws.errored ?? codes.ERR_STREAM_DESTROYED("end"));
+              }
+            });
+          }
+        }
         rs.destroyed = ws.destroyed = true;
         // Deliberately NOT flipping rs.readable / ws.writable: Node never
         // mutates those state fields post-construction (they are
@@ -22984,23 +26510,65 @@
         // key off), and flipping them before emit('close') makes the
         // vendored end-of-stream skip its premature-close detection --
         // pipeline() would report success on a silently truncated transfer.
-        if (err) rs.errored = ws.errored = err;
+        // node's destroy keeps an error the stream already has (a write
+        // that failed for want of a handle).
+        if (err) {
+          if (!ws.errored) ws.errored = err;
+          if (!rs.errored) rs.errored = err;
+        }
         if (this._timeoutId !== null) {
           globalThis.clearTimeout(this._timeoutId);
           this._timeoutId = null;
         }
+        // resetAndDestroy(): node's _destroy closes the handle with a reset
+        // instead. A refused one (EINVAL: end()'s FIN is out and 'finish'
+        // has not been emitted -- libuv's shutdown still pending) is an
+        // 'error' emitted inside the call, as node's is.
+        let resetRefused;
         if (this._handle !== null) {
-          try { natives.tcpClose(this._handle); } catch (_) { /* noop */ }
+          if (this.resetAndClosing) {
+            this.resetAndClosing = false;
+            resetRefused = natives.tcpReset(this._handle, ws.finished);
+          } else {
+            try { natives.tcpClose(this._handle); } catch (_) { /* noop */ }
+          }
           this._handle = null;
-        }
-        if (err) {
-          this.emit("error", err);
-          rs.errorEmitted = ws.errorEmitted = true;
+        } else if (connection !== undefined) {
+          // The fetch path's stand-in: its connection is the transport's,
+          // closed there -- with a reset for resetAndDestroy(), mid-response
+          // or idle in the pool alike.
+          this[kNativeConnection] = undefined;
+          const reset = this.resetAndClosing === true;
+          if (reset) this.resetAndClosing = false;
+          globalThis.__oam.fetchConnClose(connection, reset, this[kNativeLease]);
         }
         rs.closed = ws.closed = true;
-        this.emit("close", !!err);
-        rs.closeEmitted = ws.closeEmitted = true;
+        if (resetRefused !== undefined) {
+          // node's `new ErrnoException(err, 'reset')`. node then never emits
+          // 'close' -- libuv leaves the handle open, and the process with it
+          // -- where oam has closed the handle and says so (see
+          // docs/node-divergences.md).
+          const entry = Array.from(uvErrnoTable(natives)).find(([, e]) => e[0] === resetRefused);
+          const resetErr = new Error("reset " + resetRefused);
+          if (entry !== undefined) resetErr.errno = entry[0];
+          resetErr.code = resetRefused;
+          resetErr.syscall = "reset";
+          // Queued first: an 'error' with no listener throws out of here.
+          closeCallback(emitCloseNT, this, true);
+          this.emit("error", resetErr);
+          return this;
+        }
+        if (err) process.nextTick(emitErrorNT, this, err);
+        if (hadHandle) closeCallback(emitCloseNT, this, !!err);
+        else process.nextTick(emitCloseNT, this);
         return this;
+      }
+
+      // node's Socket.prototype._reset: the destroy that resetAndDestroy()
+      // asks for once the socket has its TCP handle.
+      _reset() {
+        this.resetAndClosing = true;
+        return this.destroy();
       }
 
       async _readLoop() {
@@ -23010,12 +26578,33 @@
         // concurrent reads of the same handle, and the loser rejects with
         // "read handle is gone". The in-flight loop sees _paused cleared and
         // simply carries on, which is what resume() wants anyway.
-        if (this._readLoopActive) return;
+        //
+        // A loop that has already decided to stop (paused, or its buffer
+        // full) is still "active" until its async frame unwinds, a microtask
+        // later -- and the resume() or read() that clears the condition in
+        // between (a tick: the held data's release) found it active and
+        // returned, so nothing read again: a socket paused with a full
+        // buffer never read past it after resume(). Such a call is
+        // remembered, and the loop starts again as it unwinds if it still
+        // may read.
+        if (this._readLoopActive) {
+          this._readLoopAgain = true;
+          return;
+        }
         this._readLoopActive = true;
         try {
           await this._readLoopBody();
         } finally {
           this._readLoopActive = false;
+          if (this._readLoopAgain) {
+            this._readLoopAgain = false;
+            if (
+              !this._readEofSeen && !this.destroyed && !this._paused && !this._readFull &&
+              this._handle !== null
+            ) {
+              this._readLoop();
+            }
+          }
         }
       }
 
@@ -23029,14 +26618,31 @@
             this.destroy(err);
             return;
           }
+          // Destroyed while the read was parked: closing the handle ends
+          // that read like an EOF, and a destroyed socket emits neither
+          // 'end' nor 'data' (node's handle stops reading in destroy()).
+          if (this.destroyed) return;
+          // Paused while the read was parked (pause() from outside a 'data'
+          // listener -- a server's 'connection' listener, which runs with
+          // the first read already parked): what it brought is held, as
+          // node's paused stream buffers it, until resume(). Emitting it
+          // handed a paused socket's data to whoever listened then, or to
+          // nobody.
+          if (this._paused && !this._readableMode) this._holdData = true;
           if (chunk === undefined) {
+            this._readEofSeen = true;
             if (this._readableMode || this._holdData) {
               // Buffered or held: 'end' follows once what is left is read
               // (read() returns null), as node's does.
               this._eofPending = true;
               if (this._readableMode) this.emit("readable");
             } else {
-              this._onReadEof();
+              // node's endReadableNT: 'end' is emitted from a tick, so what
+              // an 'end' listener defers -- with process.nextTick, or to a
+              // microtask -- runs relative to the auto end() as in node.
+              process.nextTick(() => {
+                if (!this.destroyed && !this._readableState.endEmitted) this._onReadEof();
+              });
             }
             break;
           }
@@ -23070,10 +26676,19 @@
             // route the close through the write chain -- it sequences
             // AFTER the in-flight shutdown + 'finish'. Before the guard,
             // this path re-ran end() and closed via its duplicate chain
-            // (which also double-emitted 'finish').
-            this._chain = this._chain.then(() => this._doClose());
+            // (which also double-emitted 'finish'). A 'finish' still to
+            // come from the loop (see end()) closes the socket itself, as
+            // node's does once both sides are done.
+            this._chain = this._chain.then(() => {
+              if (this._finishPending !== true) this._doClose();
+            });
           } else {
-            this.end();
+            // node's endWritableNT: the auto end() waits a tick, so a write
+            // an 'end' listener defers with process.nextTick still goes out
+            // (#164); one made later is writeAfterFIN's EPIPE (see write()).
+            process.nextTick(() => {
+              if (!this.destroyed && !this._writableState.ended) this.end();
+            });
           }
         } else if (!this.writable) {
           this._doClose();
@@ -23233,7 +26848,9 @@
         this._releaseScheduled = true;
         process.nextTick(() => {
           this._releaseScheduled = false;
-          if (this._holdData && !this._readableMode) this._releaseHeld();
+          // Not into a socket pause()d since (node: a 'data' listener does
+          // not resume an explicitly paused stream).
+          if (this._holdData && !this._readableMode && !this._paused) this._releaseHeld();
         });
       }
       removeListener(type, listener) {
@@ -23255,22 +26872,12 @@
         if (this.listenerCount("data") > 0) this._scheduleRelease();
       }
 
+      // Both sides are done ('end' and 'finish' are out): node destroys the
+      // socket, so the close is destroy()'s -- 'close' from the handle's
+      // close callback, never inside the write chain or the read loop that
+      // got here.
       _doClose() {
-        registry._activeHandles.delete(this);
-        leaveCount(this);
-        if (this._handle !== null) {
-          try { natives.tcpClose(this._handle); } catch (_) { /* noop */ }
-          this._handle = null;
-        }
-        if (!this.destroyed) {
-          this.destroyed = true;
-          const rs = this._readableState;
-          const ws = this._writableState;
-          rs.destroyed = ws.destroyed = true;
-          rs.closed = ws.closed = true;
-          this.emit("close", false);
-          rs.closeEmitted = ws.closeEmitted = true;
-        }
+        this.destroy();
       }
 
       setEncoding(encoding) { this._encoding = encoding; return this; }
@@ -23360,6 +26967,56 @@
       uncork() { return this; }
     }
 
+    // On a prototype whose sockets node gives a handle that is not TCP --
+    // tls.TLSSocket's TLSWrap, the JSStream under a socket over a JS stream
+    // -- for the resetAndDestroy() they share with net.Socket.
+    const kNotTcpHandle = Symbol("oam.notTcpHandle");
+    registry._netNotTcpHandle = kNotTcpHandle;
+    // On a socket that stands in for a connection oam holds natively -- the
+    // req.socket of an http.request on the fetch path, the socket an http
+    // server hands out -- that connection's id. node's socket has its TCP
+    // handle until it is destroyed; this one has the connection, and its
+    // destroy() / _reset() close it (the fetch path's through Socket#destroy
+    // and `__oam.fetchConnClose`; the server's through its own destroy()).
+    const kNativeConnection = Symbol("oam.nativeConnection");
+    registry._netNativeConnection = kNativeConnection;
+    // The checkout of that connection the stand-in's request had.
+    const kNativeLease = Symbol("oam.nativeLease");
+    registry._netNativeLease = kNativeLease;
+
+    // node's resetAndDestroy() (lib/net.js, v22.22.2), assigned the way node
+    // assigns it: an enumerable prototype property, a function with no name,
+    // the same function on tls.TLSSocket. A TCP socket is destroyed with a
+    // reset (the peer sees ECONNRESET, nothing unsent is delivered); one
+    // still connecting is reset once it connects; one with no handle is
+    // destroyed with ERR_SOCKET_CLOSED (a no-op once destroyed); any other
+    // handle is ERR_INVALID_HANDLE_TYPE, thrown. Returns the socket.
+    //
+    // Also the very function on the socket stand-ins oam's http server
+    // (req.socket, the 'connection' socket) and http client (the fetch
+    // path's req.socket) hand out: each holds a native connection
+    // (kNativeConnection) in place of a handle, and resets that.
+    Socket.prototype.resetAndDestroy = function() {
+      // node's handle exists from connect() until the socket is destroyed.
+      // oam's TCP handle appears only once connected; its TLS sockets', and
+      // a pipe's, never do.
+      if (this[kNotTcpHandle] === true || this._pipeConnect === true) {
+        if (!this.destroyed) throw codes.ERR_INVALID_HANDLE_TYPE();
+      } else if (this.connecting && this[kNativeConnection] === undefined) {
+        // (The fetch path's stand-in reads as connecting until the response
+        // head, but holds its connection from the moment the transport has
+        // the request on one: then it is reset now, below, as node's
+        // connected socket is.)
+        if (this._connectByName === true) this._resetAtConnect = true;
+        this.once("connect", () => this._reset());
+      } else if (this._handle != null || (this[kNativeConnection] !== undefined && !this.destroyed)) {
+        this._reset();
+      } else {
+        this.destroy(codes.ERR_SOCKET_CLOSED());
+      }
+      return this;
+    };
+
     // net.Socket's brand (above), for servers. node's http, https and tls
     // servers ARE net.Servers -- `http.Server extends net.Server`,
     // `tls.Server extends net.Server`, `https.Server extends tls.Server` --
@@ -23425,20 +27082,12 @@
       }
 
       listen(...args) {
-        let port, host, cb;
-        if (typeof args[0] === "object" && args[0] !== null) {
-          const opts = args[0];
-          port = opts.port;
-          host = opts.host;
-          cb = typeof args[1] === "function" ? args[1] : undefined;
-        } else {
-          port = args[0];
-          let idx = 1;
-          if (typeof args[idx] === "string") { host = args[idx]; idx++; }
-          if (typeof args[idx] === "number") { idx++; }
-          if (typeof args[idx] === "function") { cb = args[idx]; }
-        }
-        if (typeof cb === "function") this.once("listening", cb);
+        // node's reading of the arguments; a port that is not one throws
+        // from here (#163).
+        const listen = normalizeListenArgs(args);
+        if (refusePipeListen(this, listen)) return this;
+        const { port, host, ipv6Only, cb } = listen;
+        if (cb !== null) this.once("listening", cb);
         // Node binds (and so creates the TCPServerWrap) synchronously inside
         // listen(); createServer() alone registers nothing. Probed: after
         // createServer() _getActiveHandles() is [], on the line after
@@ -23447,12 +27096,13 @@
         // Supersede any in-flight accept loop from a previous listen() so
         // its tail cannot unregister this fresh registration.
         this._listenGeneration = (this._listenGeneration || 0) + 1;
-        const hostname = host || "0.0.0.0";
-        natives.tcpListen(hostname, port || 0).then(
+        // No host: node's default, dual-stack `::` (#172).
+        natives.tcpListen(host || null, port, ipv6Only).then(
           (bound) => {
             this._serverId = bound.serverId;
             this._port = bound.port;
-            this._host = bound.hostname || hostname;
+            this._host = bound.hostname;
+            this._family = bound.family;
             this.listening = true;
             // unref() before listen(): node remembers it (`this._unref`) and
             // applies it once the handle is bound -- here before the accept
@@ -23527,7 +27177,7 @@
 
       address() {
         return this.listening
-          ? { port: this._port, address: this._host, family: "IPv4" }
+          ? { address: this._host, family: this._family, port: this._port }
           : null;
       }
 
@@ -25235,23 +28885,19 @@
         super.setSecureContext(options);
         syncTls(this);
       }
-      listen(port, host, callback) {
-        if (typeof port === "object" && port !== null) {
-          callback = host;
-          host = port.host;
-          port = port.port;
-        }
-        if (typeof host === "function") {
-          callback = host;
-          host = undefined;
-        }
-        if (typeof callback === "function") this.once("listening", callback);
-        var hostname = host || "127.0.0.1";
+      listen(...args) {
+        // node's reading of the arguments; a port that is not one throws
+        // from here (#163).
+        var listen = normalizeListenArgs(args);
+        if (refusePipeListen(this, listen)) return this;
+        var port = listen.port, host = listen.host, callback = listen.cb;
+        if (callback !== null) this.once("listening", callback);
         var policy = registry._httpParserOptions.policy(this);
         var accept = tlsAcceptArgs(this);
         natives.httpsServe(
-          hostname,
-          port || 0,
+          // No host: node's default, dual-stack `::` (#172).
+          host || null,
+          port,
           ...accept,
           policy.maxHeaderSize,
           policy.insecure,
@@ -25259,10 +28905,11 @@
           // maxHeadersCount: null (the default) leaves the native 1000-field
           // cap; 0 is no limit; a number is that cap.
           this.maxHeadersCount,
+          listen.ipv6Only,
         ).then(
           (bound) => {
             this[kTlsSynced] = JSON.stringify(accept);
-            registry._httpParserOptions.bound(this, bound, hostname, true);
+            registry._httpParserOptions.bound(this, bound, true);
             // Anything changed while the server was binding.
             syncTls(this);
           },
@@ -25278,7 +28925,7 @@
       }
       address() {
         return this.listening
-          ? { port: this._port, address: this._host, family: "IPv4" }
+          ? { address: this._host, family: this._family, port: this._port }
           : null;
       }
       close(callback) {
@@ -27299,6 +30946,11 @@
           data = globalThis.Buffer.from(String(msg));
         }
 
+        // node validates the destination port once the message is read,
+        // synchronously, and 0 is not a port a datagram can be sent to
+        // (#163: 65536 was sent to 65535 and 1.5 to 1).
+        port = validatePort(port, "Port", false);
+
         if (offset !== undefined && offset !== 0 || length !== undefined) {
           data = data.slice(offset || 0, length !== undefined ? (offset || 0) + length : undefined);
         }
@@ -27478,6 +31130,53 @@
       });
     }
 
+    // node's getaddrinfo flags, as `dns.ADDRCONFIG` / `dns.V4MAPPED` /
+    // `dns.ALL` expose them: the system's AI_* values, which are glibc's (and
+    // musl's) on Linux and the BSD ones on Windows, macOS, the BSDs and
+    // Android (bionic's netdb.h has the BSD values: AI_ALL 0x100,
+    // AI_ADDRCONFIG 0x400, AI_V4MAPPED 0x800).
+    const [ADDRCONFIG, V4MAPPED, ALL] =
+      globalThis.process.platform === "linux"
+        ? [0x20, 0x8, 0x10]
+        : [0x400, 0x800, 0x100];
+
+    // node lib/dns.js lookup: `options.hints` must be a number; it is read as
+    // a uint32 and may carry no flag but those three
+    // (internal/dns/utils validateHints). Returns the hints to use.
+    function lookupHints(opts) {
+      if (opts.hints == null) return 0;
+      if (typeof opts.hints !== "number") {
+        throw codes.ERR_INVALID_ARG_TYPE("options.hints", "number", opts.hints);
+      }
+      const hints = opts.hints >>> 0;
+      if ((hints & ~(ADDRCONFIG | ALL | V4MAPPED)) !== 0) {
+        throw codes.ERR_INVALID_ARG_VALUE("hints", hints);
+      }
+      return hints;
+    }
+
+    // dns.lookup with its hints. AI_V4MAPPED and AI_ALL mean something only
+    // for an IPv6 lookup, and getaddrinfo's rule for them is plain enough to
+    // apply to the unfiltered answer: V4MAPPED answers the IPv4 addresses as
+    // `::ffff:a.b.c.d` when there is no IPv6 one, and with ALL as well as the
+    // IPv6 ones. AI_ADDRCONFIG is not applied: oam's resolver is getaddrinfo
+    // without hints (docs/node-divergences.md).
+    function _dnsLookupHinted(hostname, family, all, hints) {
+      if (family !== 6 || (hints & V4MAPPED) === 0 || registry.get("net").isIP(String(hostname))) {
+        return _dnsLookup(hostname, family, all);
+      }
+      return _dnsLookup(hostname, 0, true).then((answers) => {
+        const v6 = answers.filter((a) => a.family === 6);
+        const mapped = answers
+          .filter((a) => a.family === 4)
+          .map((a) => ({ address: `::ffff:${a.address}`, family: 6 }));
+        const merged = hints & ALL ? v6.concat(mapped) : v6.length > 0 ? v6 : mapped;
+        // None at all is the error an IPv6 lookup of the name reports.
+        if (merged.length === 0) return _dnsLookup(hostname, 6, all);
+        return all ? merged : merged[0];
+      });
+    }
+
     function lookup(hostname, options, callback) {
       if (typeof options === "function") {
         callback = options;
@@ -27485,10 +31184,11 @@
       }
       if (typeof options === "number") options = { family: options };
       const opts = options || {};
+      const hints = lookupHints(opts);
       const family = opts.family || 0;
       const all = !!opts.all;
 
-      _dnsLookup(hostname, family, all).then(
+      _dnsLookupHinted(hostname, family, all, hints).then(
         (result) => {
           if (all) {
             callback(null, result);
@@ -27599,9 +31299,11 @@
     const promises = {
       lookup(hostname, options) {
         const opts = typeof options === "number" ? { family: options } : (options || {});
+        // node validates before it returns a promise: a bad `hints` throws.
+        const hints = lookupHints(opts);
         const family = opts.family || 0;
         const all = !!opts.all;
-        return _dnsLookup(hostname, family, all);
+        return _dnsLookupHinted(hostname, family, all, hints);
       },
       resolve(hostname, rrtype) {
         rrtype = (rrtype || "A").toUpperCase();
@@ -27674,10 +31376,6 @@
         throw err;
       }
     }
-
-    const ADDRCONFIG = 0;
-    const V4MAPPED = 0;
-    const ALL = 0;
 
     // net.connect / tls.connect / http read `dns.lookup` at call time, as
     // node does; while it is still this function they use oam's own resolver
@@ -28125,24 +31823,22 @@
         this._host = null;
         this.listening = false;
       }
-      listen(port, host, callback) {
-        if (typeof port === "object" && port !== null) {
-          callback = host;
-          host = port.host;
-          port = port.port;
-        }
-        if (typeof host === "function") {
-          callback = host;
-          host = undefined;
-        }
-        if (typeof callback === "function") this.once("listening", callback);
-        var hostname = host || "127.0.0.1";
+      listen(...args) {
+        // node's reading of the arguments; a port that is not one throws
+        // from here (#163).
+        var listen = normalizeListenArgs(args);
+        if (refusePipeListen(this, listen)) return this;
+        var port = listen.port, host = listen.host, callback = listen.cb;
+        if (callback !== null) this.once("listening", callback);
         var self = this;
-        natives.http2Serve(hostname, port || 0).then(
+        // No host: node's default, dual-stack `::` (#172). Args 2 and 3
+        // (the HTTP/1 head policy) are left to their defaults.
+        natives.http2Serve(host || null, port, undefined, undefined, listen.ipv6Only).then(
           function(bound) {
             self._serverId = bound.serverId;
             self._port = bound.port;
-            self._host = hostname;
+            self._host = bound.address;
+            self._family = bound.family;
             self.listening = true;
             self.emit("listening");
             (async function() {
@@ -28178,7 +31874,7 @@
       }
       address() {
         return this.listening
-          ? { port: this._port, address: this._host, family: "IPv4" }
+          ? { address: this._host, family: this._family, port: this._port }
           : null;
       }
       close(callback) {
@@ -30322,16 +34018,27 @@
     const kTlsSocketLike = Symbol.for("oam.tlsSocketLike");
 
     function socketClosedBeforeConnectionError() {
-      var e = new Error("Socket closed before the connection was established");
-      e.code = "ERR_SOCKET_CLOSED_BEFORE_CONNECTION";
-      return e;
+      return codes.ERR_SOCKET_CLOSED_BEFORE_CONNECTION();
     }
     function socketClosedError() {
-      var e = new Error("Socket is closed");
-      e.code = "ERR_SOCKET_CLOSED";
-      return e;
+      return codes.ERR_SOCKET_CLOSED();
     }
     // A connect-syscall error in Node's shape (`connect EISCONN host:port -
+    // A net.Socket with no connection yet and no connect in flight (node:
+    // `!socket._handle`), which a TLSSocket over it waits on: it is
+    // `connecting` until that socket's 'connect' (node's _init), and its
+    // handshake starts then. Only oam's own net.Socket over TCP -- not a
+    // TLSSocket or a JSStreamSocket (a net.Socket over a JS stream, which
+    // is open from the start), whose handles are not TCP ones, nor an http
+    // client's stand-in, which holds a native connection in place of one.
+    function awaitsConnect(wrap) {
+      var NetSocket = registry.get("net").Socket;
+      return Object.prototype.isPrototypeOf.call(NetSocket.prototype, wrap) &&
+        wrap[registry._netNotTcpHandle] !== true &&
+        wrap._handle === null && !wrap.connecting &&
+        wrap[registry._netNativeConnection] === undefined;
+    }
+
     // Local (addr:port)`, code / errno / syscall / address / port), for the
     // one code the TLS path raises itself.
     function connectSyscallError(code, host, port, socket) {
@@ -30479,11 +34186,15 @@
       // 'connect'.
       _wrapOver(over) {
         var net = registry.get("net");
-        var wrap = over instanceof net.Socket ? over : new JSStreamSocket(over);
+        var isNetSocket = over instanceof net.Socket;
+        var wrap = isNetSocket ? over : new JSStreamSocket(over);
         this._wrappedSocket = wrap;
         this._handle = new TLSWrapHandle(wrap);
         this.allowHalfOpen = !!over.allowHalfOpen;
-        this.connecting = !!wrap.connecting;
+        // node's _init: over a net.Socket, connecting until that socket's
+        // 'connect' -- one still connecting, or one with no connection yet
+        // (no handle) that the caller connects later.
+        this.connecting = !!wrap.connecting || (isNetSocket && awaitsConnect(over));
         copyWrapAddresses(this, wrap);
       }
       // Readable EOF. `read(0)` after the null push is what Node's
@@ -30642,18 +34353,32 @@
           if (id !== null) natives.tlsClose(id);
           this._handle = null;
         }
+        // The fetch path's stand-in (an https request's req.socket): its
+        // connection is the transport's, and closes there, as net.Socket's
+        // stand-in does -- mid-response or idle in the pool alike.
+        var connection = this[registry._netNativeConnection];
+        if (connection !== undefined) {
+          this[registry._netNativeConnection] = undefined;
+          globalThis.__oam.fetchConnClose(connection, false, this[registry._netNativeLease]);
+        }
         var wrapped = this._releaseWrap();
         callback(err);
-        // node: the transport goes with the TLS socket, after its 'error'.
-        if (wrapped !== null) {
-          process.nextTick(() => {
-            if (!wrapped.destroyed && typeof wrapped.destroy === "function") wrapped.destroy();
-          });
-        }
         // Node emits 'close' from the handle-close callback: a loop turn
         // after 'end' / 'error', with `hadError`, so a listener attached
         // after awaiting 'end' still sees it.
-        globalThis.setImmediate(() => this.emit("close", !!err));
+        var emitClose = () => this.emit("close", !!err);
+        // node: the transport goes with the TLS socket, after its 'error',
+        // and its 'close' comes before this socket's -- the transport's
+        // destroy() defers its own 'close' to the same loop turn (#189), so
+        // this one is queued behind it.
+        if (wrapped !== null) {
+          process.nextTick(() => {
+            if (!wrapped.destroyed && typeof wrapped.destroy === "function") wrapped.destroy();
+            globalThis.setImmediate(emitClose);
+          });
+        } else {
+          globalThis.setImmediate(emitClose);
+        }
       }
       // The handshake getters read Node's TLSWrap handle, which exists from
       // construction and is gone once the socket is destroyed: null then
@@ -31111,6 +34836,14 @@
       address() { return {}; }
     }
 
+    // net.Socket's resetAndDestroy(), the very function, as TLSSocket
+    // inherits it in node -- where a TLS socket's TLSWrap and a
+    // JSStreamSocket's JSStream are not TCP handles, so it throws
+    // ERR_INVALID_HANDLE_TYPE on any socket not yet destroyed.
+    TLSSocket.prototype.resetAndDestroy = registry.get("net").Socket.prototype.resetAndDestroy;
+    TLSSocket.prototype[registry._netNotTcpHandle] = true;
+    JSStreamSocket.prototype[registry._netNotTcpHandle] = true;
+
     function copyWrapAddresses(socket, wrap) {
       if (wrap.remoteAddress === undefined) return;
       socket.remoteAddress = wrap.remoteAddress;
@@ -31166,7 +34899,7 @@
         releaseContext();
         _settleTlsConnect(socket, connecting, name, options, rejectUnauthorized, identityCheck, name);
       };
-      if (wrap.connecting) {
+      if (wrap.connecting || awaitsConnect(wrap)) {
         wrap.once("connect", () => {
           if (socket.destroyed) return;
           socket.connecting = false;
@@ -31236,7 +34969,10 @@
     // remoteAddress is the resolved IP, never the host name.
     function _connectTls(socket, options, callback, event) {
       var host = options.host || options.hostname || "localhost";
-      var port = options.port || 443;
+      // As given until lookupAndConnect has validated it; `dial` takes the
+      // number. node's tls.connect has no default port (https's 443 is the
+      // agent's): without one it throws ERR_MISSING_ARGS, below.
+      var port = options.port;
       var serverName = options.servername || host;
       var rejectUnauthorized = options.rejectUnauthorized !== false;
       // node's tls.connect, in its order, synchronously: the identity check
@@ -31271,6 +35007,11 @@
         socket._undestroy();
         socket._reading = false;
       }
+      // node: the TLS socket's connect() is net's, which needs a port or a
+      // path -- after the context is built, as tls.connect builds it first.
+      if (port === undefined && options.path == null) {
+        throw codes.ERR_MISSING_ARGS(["options", "port", "path"]);
+      }
       if (callback) socket.once(event, callback);
       socket._secureContext = context;
       var releaseContext = releaseSecureContext(socket, context, options);
@@ -31295,7 +35036,7 @@
         var connecting;
         try {
           connecting = natives.tlsConnect(
-            host, port, serverName, ca, rejectUnauthorized,
+            host, port | 0, serverName, ca, rejectUnauthorized,
             secure.id === null ? undefined : secure.id, identityCheck === null,
             tlsVersions.min, tlsVersions.max, attemptTimeout,
             spec === null ? undefined : JSON.stringify(spec),
@@ -31443,11 +35184,13 @@
       }
       if (!valid) {
         var mismatch = new Error("Hostname/IP does not match certificate's altnames: " + reason);
-        applyNodeErrorShape(mismatch, "ERR_TLS_CERT_ALTNAME_INVALID");
-        mismatch.reason = reason;
-        mismatch.host = hostname;
-        mismatch.cert = cert;
-        return mismatch;
+        // node's message function sets reason, host and cert on `this`, so
+        // they sit between `code` and `message`.
+        return applyNodeErrorShape(mismatch, "ERR_TLS_CERT_ALTNAME_INVALID", {
+          reason: reason,
+          host: hostname,
+          cert: cert,
+        });
       }
     }
 
@@ -32178,28 +35921,25 @@
         }
         if (old !== null) natives.tlsServerContextFree(old);
       }
-      listen(port, host, callback) {
-        if (typeof port === "object" && port !== null) {
-          callback = host;
-          host = port.host;
-          port = port.port;
-        }
-        if (typeof host === "function") {
-          callback = host;
-          host = undefined;
-        }
-        if (typeof callback === "function") this.once("listening", callback);
-        var hostname = host || "0.0.0.0";
+      listen(...args) {
+        // node's reading of the arguments; a port that is not one throws
+        // from here (#163).
+        var listen = normalizeListenArgs(args);
+        if (refusePipeListen(this, listen)) return this;
+        var port = listen.port, host = listen.host, callback = listen.cb;
+        if (callback !== null) this.once("listening", callback);
         this._closed = false;
 
         // Registered synchronously inside listen(), as net.Server is: Node
         // lists a listening tls.Server as a TCPServerWrap.
         registry._activeHandles.set(this, "TCPServerWrap");
-        natives.tcpListen(hostname, port || 0).then(
+        // No host: node's default, dual-stack `::` (#172).
+        natives.tcpListen(host || null, port, listen.ipv6Only).then(
           (bound) => {
             this._serverId = bound.serverId;
             this._port = bound.port;
-            this._host = bound.hostname || hostname;
+            this._host = bound.hostname;
+            this._family = bound.family;
             this.listening = true;
             // unref() before listen(), applied once bound (as net.Server).
             if (this._handleRefed === false) natives.tcpServerSetRef(bound.serverId, false);
@@ -32388,7 +36128,7 @@
       }
       address() {
         return this.listening
-          ? { port: this._port, address: this._host, family: this._host.includes(":") ? "IPv6" : "IPv4" }
+          ? { address: this._host, family: this._family, port: this._port }
           : null;
       }
       close(callback) {
@@ -32449,6 +36189,9 @@
       // it, and Node hands it a TLSSocket.
       socket[kNetSocketLike] = true;
       socket[kTlsSocketLike] = true;
+      // Node's server-side TLSSocket has a TLSWrap, not a TCP handle:
+      // resetAndDestroy() throws ERR_INVALID_HANDLE_TYPE on it.
+      socket[registry._netNotTcpHandle] = true;
       socket.encrypted = true;
       socket.authorized = info.authorized === true;
       socket.authorizationError = info.authorizationError == null ? null : info.authorizationError;
@@ -33633,6 +37376,11 @@
         clearTimer(handle, nativeClearTimeout);
       };
       registry._Timeout = Timeout;
+      // The runtime's own setTimeout, for internals that must keep working
+      // when a program (or a fake-timer library such as oam:test's
+      // mock.timers) replaces the global: AbortSignal.timeout arms and unrefs
+      // its timer with this, as node's arms it with its internal timers.
+      registry._setTimeout = globalThis.setTimeout;
       // Exported for process.nextTick's per-entry ALS frame binding: each
       // queued tick captures the frame of ITS nextTick() call, not the frame
       // of whichever call scheduled the drain microtask.

@@ -5,6 +5,8 @@
 // lexical `codes` registry (unreachable from a separate snapshot file, and
 // coupling would drift both). Message fidelity is close-not-byte-exact;
 // byte-parity gaps surface in the node-suite triage (slice 4), not here.
+// The error objects' prototypes are shared, though: both take them from the
+// one registry bootstrap.js installs (see makeCode).
 "use strict";
 
 // v22 determineSpecificType, approximated without util.inspect.
@@ -92,18 +94,39 @@ function invalidArgTypeMessage(name, expected, actual) {
   );
 }
 
+// v22's coded-error shape (makeNodeErrorWithCode): the instance's prototype
+// is the one node_compat.js's `codes` use for the same code, from the shared
+// registry bootstrap.js installs -- its `constructor` answers the base, so
+// err.constructor.name is "Error" / "TypeError" / "RangeError" as in node,
+// and its toString renders "Name [CODE]: message" (the stack header too: V8
+// renders it through toString on first read). `new codes.X(...)` and
+// `instanceof codes.X` work as with a class.
+//
+// Own keys in node's order, from the table node_compat.js's E() reads too
+// (bootstrap.js __oamNodeErrorCodeFirst): stack, code, message for a code
+// whose node message is a function (ERR_INVALID_ARG_TYPE, ...), stack,
+// message, code for one whose message is a string.
 function makeCode(Base, code, formatter) {
-  const cls = class extends Base {
-    constructor(...args) {
-      super(typeof formatter === "function" ? formatter(...args) : formatter);
-      this.code = code;
+  const codeFirst = globalThis.__oamNodeErrorCodeFirst(code);
+  function NodeError(...args) {
+    const message = typeof formatter === "function" ? formatter(...args) : formatter;
+    if (!codeFirst) {
+      const err = Reflect.construct(Base, [message], NodeError);
+      err.code = code;
+      return err;
     }
-    toString() {
-      return `${this.name} [${code}]: ${this.message}`;
-    }
-  };
-  Object.defineProperty(cls, "name", { value: code, configurable: true });
-  return cls;
+    const err = Reflect.construct(Base, [], NodeError);
+    err.code = code;
+    Object.defineProperty(err, "message", {
+      value: message,
+      enumerable: false,
+      writable: true,
+      configurable: true,
+    });
+    return err;
+  }
+  NodeError.prototype = globalThis.__oamNodeErrorPrototype(Base, code);
+  return NodeError;
 }
 
 const codes = {
