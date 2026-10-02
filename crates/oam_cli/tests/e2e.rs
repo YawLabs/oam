@@ -5661,6 +5661,89 @@ cl-late-end-silent finalized=false"##;
     );
 }
 
+/// `fetch()` sends a Blob or File as its bytes, with its `type` as the
+/// Content-Type unless the caller set one or it is empty; a URLSearchParams
+/// as its serialization, `application/x-www-form-urlencoded;charset=UTF-8`
+/// unless the caller set a type; and no body or an empty one with
+/// `content-length: 0` on POST, PUT and PATCH, as undici's writeH1 does.
+/// Up to this fix a Blob went out as the text "[object Blob]", a
+/// URLSearchParams as `text/plain`, and an empty POST with no length at all.
+/// The expected output is node v22.22.2's, line for line.
+#[test]
+fn fetch_sends_blob_search_params_and_empty_bodies_as_node_does() {
+    for (name, js, expected) in [
+        (
+            "fetch_extracts_bodies/kinds.mjs",
+            r##"// fetch()'s Blob, File and URLSearchParams bodies: their bytes and their
+// Content-Type, unless the caller set one.
+import http from 'node:http';
+const server = http.createServer((req, res) => { const c = []; req.on('data', (d) => c.push(d)); req.on('end', () => { res.setHeader('connection', 'close'); res.end(JSON.stringify({ cl: req.headers['content-length'] ?? null, ct: req.headers['content-type'] ?? null, body: Buffer.concat(c).toString('latin1') })); }); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+for (const [label, body, headers] of [
+  ['usp', new URLSearchParams({ a: '1', b: 'x y', c: 'é&' })],
+  ['usp-typed', new URLSearchParams({ a: '1' }), { 'content-type': 'text/x-mine' }],
+  ['blob', new Blob(['hi'], { type: 'text/x-hi' })],
+  ['blob-untyped', new Blob([new Uint8Array([0, 255, 1])])],
+  ['blob-typed', new Blob(['hi'], { type: 'text/x-hi' }), { 'content-type': 'application/x-caller' }],
+  ['blob-empty', new Blob([])],
+  ['file', new File(['f!'], 'a.txt', { type: 'text/plain' })],
+  ['blob-cl-wrong', new Blob(['abc']), { 'content-length': '5' }],
+]) {
+  try { const r = await fetch(url, { method: 'POST', body, headers }); console.log(label, await r.text()); } catch (e) { console.log(label, 'rejected', e.name, e.message, e.cause?.name); }
+}
+process.exit(0);
+"##,
+            r##"usp {"cl":"21","ct":"application/x-www-form-urlencoded;charset=UTF-8","body":"a=1&b=x+y&c=%C3%A9%26"}
+usp-typed {"cl":"3","ct":"text/x-mine","body":"a=1"}
+blob {"cl":"2","ct":"text/x-hi","body":"hi"}
+blob-untyped {"cl":"3","ct":null,"body":"\u0000ÿ\u0001"}
+blob-typed {"cl":"2","ct":"application/x-caller","body":"hi"}
+blob-empty {"cl":"0","ct":null,"body":""}
+file {"cl":"2","ct":"text/plain","body":"f!"}
+blob-cl-wrong rejected TypeError fetch failed RequestContentLengthMismatchError"##,
+        ),
+        (
+            "fetch_extracts_bodies/empty.mjs",
+            r##"// fetch() with no body or an empty one: `content-length: 0` on a method
+// that expects a payload, nothing on the others.
+import http from 'node:http';
+const server = http.createServer((req, res) => { req.resume(); req.on('end', () => { res.setHeader('connection', 'close'); res.end(JSON.stringify({ cl: req.headers['content-length'] ?? null, te: req.headers['transfer-encoding'] ?? null })); }); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+for (const m of ['POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH']) for (const [label, body] of [['none', undefined], ['str', ''], ['u8', new Uint8Array(0)]]) {
+  const r = await fetch(url, { method: m, body }); console.log(m, label, await r.text());
+}
+process.exit(0);
+"##,
+            r##"POST none {"cl":"0","te":null}
+POST str {"cl":"0","te":null}
+POST u8 {"cl":"0","te":null}
+PUT none {"cl":"0","te":null}
+PUT str {"cl":"0","te":null}
+PUT u8 {"cl":"0","te":null}
+DELETE none {"cl":null,"te":null}
+DELETE str {"cl":null,"te":null}
+DELETE u8 {"cl":null,"te":null}
+OPTIONS none {"cl":null,"te":null}
+OPTIONS str {"cl":null,"te":null}
+OPTIONS u8 {"cl":null,"te":null}
+PATCH none {"cl":"0","te":null}
+PATCH str {"cl":"0","te":null}
+PATCH u8 {"cl":"0","te":null}"##,
+        ),
+    ] {
+        let script = write_temp(name, js);
+        let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+        let (stdout, stderr) = run_script_ok(&script, out);
+        assert_eq!(
+            stdout.trim().replace("\r\n", "\n"),
+            expected,
+            "{name} stderr: {stderr}"
+        );
+    }
+}
+
 /// `fetch()` streams a ReadableStream or async-iterable request body, as
 /// node's does: chunked unless a `content-length` is declared, nothing sent
 /// before the first chunk and `content-length: 0` for a stream that ends

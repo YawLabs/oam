@@ -1688,6 +1688,20 @@ taken (pinned by `undici_headers_timeout_starts_when_a_streamed_body_ends`). Wha
   bundled undici's classes, which are not the npm package's; oam has one undici, so with
   the shim loaded a cause is an instance of `errors.*` whichever `fetch` raised it.
 
+**Request bodies on `fetch`**
+
+`fetch()` sends a Blob or File as its bytes, its `type` as the Content-Type unless the caller
+set one or it is empty; a URLSearchParams as its serialization, typed
+`application/x-www-form-urlencoded;charset=UTF-8` unless the caller set a type; a string as
+UTF-8, typed `text/plain;charset=UTF-8`; and no body or an empty one with `content-length: 0`
+on POST, PUT and PATCH, as undici's writeH1 does. Pinned against Node by
+`fetch_sends_blob_search_params_and_empty_bodies_as_node_does` (e2e). Up to 0.17.1 a Blob went
+out as the text `[object Blob]`, a URLSearchParams as `text/plain`, and an empty POST with no
+length. What differs:
+
+- **A FormData body is sent as the text `[object FormData]`.** Node encodes it as
+  `multipart/form-data`; oam has no multipart encoder yet (`undici.request` refuses one, above).
+
 **Streamed request bodies on `fetch`**
 
 `fetch()` streams a `ReadableStream` or async-iterable body (a generator, a Node Readable) as

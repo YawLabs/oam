@@ -1422,6 +1422,13 @@
     }
   }
 
+  // A request body's bytes as the wire contract's `body_base64`.
+  function bytesBase64(bytes) {
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  }
+
   // ---- streamed request bodies -------------------------------------------
   // node's fetch streams a ReadableStream or an async-iterable body (a
   // generator, a Node Readable) and materializes every other kind (undici's
@@ -1454,8 +1461,8 @@
     if (typeof globalThis.Buffer?.from === "function") return globalThis.Buffer.from(chunk);
     throw new TypeError("a request body chunk must be a string or bytes");
   }
-  // undici's methods that expect a payload: an empty streamed body still
-  // goes with `content-length: 0` on these.
+  // undici's methods that expect a payload (writeH1, compared as written):
+  // an empty or absent body still goes with `content-length: 0` on these.
   const EXPECTS_PAYLOAD = new Set(["PUT", "POST", "PATCH", "QUERY", "PROPFIND", "PROPPATCH"]);
 
   // Send `request` with a streamed `body`, as undici's writeIterable sends
@@ -1507,11 +1514,10 @@
       };
       const start = (withBody) => {
         started = true;
-        const method = String(request.method).toUpperCase();
         if (withBody) {
           request.body_stream = channel;
           if (declared === null) request.headers.push(["transfer-encoding", "chunked"]);
-        } else if (EXPECTS_PAYLOAD.has(method)) {
+        } else if (EXPECTS_PAYLOAD.has(request.method)) {
           request.body_base64 = "";
           if (declared === null) request.headers.push(["content-length", "0"]);
         }
@@ -1842,22 +1848,48 @@
     } else if (streamed) {
       // Sent by fetchStreamed below, as it is produced.
     } else if (init.body != null) {
+      const typed = headers.some((h) => h[0] === "content-type");
+      const URLSP = globalThis.URLSearchParams;
+      const BlobCtor = globalThis.Blob;
       if (init.body instanceof ArrayBuffer || ArrayBuffer.isView(init.body)) {
         const bytes = init.body instanceof ArrayBuffer
           ? new Uint8Array(init.body)
           : new Uint8Array(init.body.buffer, init.body.byteOffset, init.body.byteLength);
-        let binary = "";
-        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-        request.body_base64 = btoa(binary);
+        request.body_base64 = bytesBase64(bytes);
+      } else if (fetchSemantics && typeof BlobCtor === "function" && init.body instanceof BlobCtor) {
+        // node's "extract a body": a Blob (or File) is its bytes, and its
+        // `type` is the Content-Type unless the caller set one or it is
+        // empty (measured). oam sent "[object Blob]" as text.
+        request.body_base64 = bytesBase64(new Uint8Array(await init.body.arrayBuffer()));
+        if (!typed && init.body.type) headers.push(["content-type", String(init.body.type)]);
+      } else if (fetchSemantics && typeof URLSP === "function" && init.body instanceof URLSP) {
+        // ... and URLSearchParams is its serialization, sent as
+        // `application/x-www-form-urlencoded;charset=UTF-8` unless the caller
+        // set a Content-Type (measured; oam sent text/plain).
+        request.body = init.body.toString();
+        if (!typed) headers.push(["content-type", "application/x-www-form-urlencoded;charset=UTF-8"]);
       } else {
         request.body = wellFormed(init.body);
         // node's "extract a body": a string body's Content-Type is
         // `text/plain;charset=UTF-8` unless the caller set one (measured).
         // Servers branch on it, and oam sent none at all.
-        if (fetchSemantics && !headers.some((h) => h[0] === "content-type")) {
+        if (fetchSemantics && !typed) {
           headers.push(["content-type", "text/plain;charset=UTF-8"]);
         }
       }
+    }
+    // undici's writeH1: a fetch with no body, or an empty one, still says
+    // `content-length: 0` on a method that expects a payload (measured; hyper,
+    // asked nothing, sends no length at all).
+    if (
+      fetchSemantics &&
+      !streamed &&
+      request.body_stream === undefined &&
+      EXPECTS_PAYLOAD.has(request.method) &&
+      (request.body_base64 ?? request.body ?? "") === "" &&
+      !headers.some((h) => h[0] === "content-length")
+    ) {
+      headers.push(["content-length", "0"]);
     }
     // A caller `content-length` that disagrees with the body is refused, not
     // framed. hyper writes exactly the declared length, so a short one
