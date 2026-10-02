@@ -5204,6 +5204,63 @@ proxy-agent bodyTimeout 1.5 InvalidArgumentError UND_ERR_INVALID_ARG bodyTimeout
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// An Agent `factory`'s dispatcher serves its origin, so ITS headersTimeout
+/// and bodyTimeout apply, as undici's Agent dispatches to it: the Agent's
+/// own reach it only through the options the factory passes on. oam read
+/// the Agent's options alone, so a factory-built Client or Pool with its own
+/// limit waited out undici's 300 s default. The expected output is node
+/// v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_agent_factory_dispatchers_own_timeouts_apply() {
+    let script = write_temp(
+        "undici_factory_timeouts/main.mjs",
+        r##"import net from 'node:net';
+import { request, Agent, Pool, Client, errors } from 'undici';
+
+const silent = net.createServer((s) => { s.on('error', () => {}); s.on('data', () => {}); });
+const stall = net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => s.write('HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nx'));
+});
+const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${srv.address().port}`)));
+const [su, tu] = [await listen(silent), await listen(stall)];
+
+const total = () => { const ac = new AbortController(); setTimeout(() => ac.abort(new Error('total budget')), 6000).unref(); return ac.signal; };
+async function attempt(label, fn) {
+  const t0 = Date.now();
+  try {
+    console.log(label, 'ok', JSON.stringify(await fn()));
+  } catch (e) {
+    console.log(label, e.name, e.code, e.message, e instanceof errors.UndiciError, 'early=' + (Date.now() - t0 < 4000));
+  }
+}
+await attempt('factory Client headersTimeout', () =>
+  request(su, { signal: total(), dispatcher: new Agent({ factory: (o, opts) => new Client(o, { ...opts, headersTimeout: 400 }) }) }));
+await attempt('factory Pool headersTimeout', () =>
+  request(su, { signal: total(), dispatcher: new Agent({ factory: (o, opts) => new Pool(o, { ...opts, headersTimeout: 400 }) }) }));
+await attempt('factory Pool bodyTimeout', async () =>
+  (await request(tu, { signal: total(), dispatcher: new Agent({ factory: (o, opts) => new Pool(o, { ...opts, bodyTimeout: 400 }) }) })).body.text());
+await attempt('Agent headersTimeout passed on', () =>
+  request(su, { signal: total(), dispatcher: new Agent({ headersTimeout: 400, factory: (o, opts) => new Pool(o, opts) }) }));
+await attempt('Agent headersTimeout dropped', () =>
+  request(su, { signal: total(), dispatcher: new Agent({ headersTimeout: 400, factory: (o) => new Pool(o) }) }));
+await attempt('request wins over the factory', () =>
+  request(su, { headersTimeout: 400, signal: total(), dispatcher: new Agent({ factory: (o, opts) => new Pool(o, { ...opts, headersTimeout: 60000 }) }) }));
+process.exit(0);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = "\
+factory Client headersTimeout HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+factory Pool headersTimeout HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+factory Pool bodyTimeout BodyTimeoutError UND_ERR_BODY_TIMEOUT Body Timeout Error true early=true
+Agent headersTimeout passed on HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true
+Agent headersTimeout dropped Error undefined total budget false early=false
+request wins over the factory HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Headers Timeout Error true early=true";
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 /// `undici.request` rejects with what failed, not with fetch's wrapper
 /// around it: a body cut off mid-read is undici's SocketError (kept alive),
 /// ResponseContentLengthMismatchError (not kept) or HTTPParserError (bad

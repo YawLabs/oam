@@ -209,9 +209,24 @@
       // default of 300 s; 0 disables. The dispatcher's values are checked
       // first, as undici's Client checks them, then the request's, as its
       // Request does.
+      //
+      // The dispatcher is the one that serves the request: for an Agent with
+      // a `factory`, the factory's dispatcher for the request's origin, as
+      // undici's Agent dispatches to it -- the Agent's own options reach it
+      // only if the factory passes them on.
       const carrier = opts.dispatcher || holder.current;
-      const dispatcherHeadersTimeout = dispatcherTimeout("headersTimeout", carrier);
-      const dispatcherBodyTimeout = dispatcherTimeout("bodyTimeout", carrier);
+      let serving = carrier;
+      if (carrier && typeof carrier._oamForOrigin === "function") {
+        let origin = null;
+        try {
+          origin = new G.URL(String(url)).origin;
+        } catch {
+          // fetch reports a URL that does not parse.
+        }
+        if (origin !== null && origin !== "null") serving = carrier._oamForOrigin(origin);
+      }
+      const dispatcherHeadersTimeout = dispatcherTimeout("headersTimeout", serving);
+      const dispatcherBodyTimeout = dispatcherTimeout("bodyTimeout", serving);
       const headersTimeout = phaseTimeout("headersTimeout", opts, dispatcherHeadersTimeout);
       const bodyTimeout = phaseTimeout("bodyTimeout", opts, dispatcherBodyTimeout);
       // Both limits end the request the way an abort does, so the fetch runs
@@ -594,15 +609,21 @@
           // origin -> the factory's dispatcher for it, whose connections
           // connectVia makes (with its connect timeout).
           const byOrigin = new Map();
-          this._oamConnectLookup = null;
-          this._oamConnect = function viaFactory(params, cb) {
-            const origin = params.protocol + "//" + params.host;
+          // The dispatcher that serves `origin` (undici's Agent hands each
+          // request to it): its connections, and its own headersTimeout /
+          // bodyTimeout (request() reads them through this).
+          this._oamForOrigin = function (origin) {
             let dispatcher = byOrigin.get(origin);
             if (dispatcher === undefined) {
               dispatcher = factory(origin, originOptions);
               byOrigin.set(origin, dispatcher);
             }
-            connectVia(dispatcher, params, cb);
+            return dispatcher;
+          };
+          const forOrigin = this._oamForOrigin;
+          this._oamConnectLookup = null;
+          this._oamConnect = function viaFactory(params, cb) {
+            connectVia(forOrigin(params.protocol + "//" + params.host), params, cb);
           };
         }
       }
