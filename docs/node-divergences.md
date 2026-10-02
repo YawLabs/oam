@@ -2631,11 +2631,11 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
   checks and errors) and `sentTrailers`, the compatibility API's `setTrailer()` /
   `addTrailers()`, a request's trailer section as the stream's `'trailers'` and as
   `req.trailers` / `req.rawTrailers` (conformance cases 304 and 305). A section's values
-  reach the peer as Node's do (case 306): one byte per UTF-16 unit, a field the receiving
+  reach the peer as Node's do (case 344): one byte per UTF-16 unit, a field the receiving
   nghttp2 would drop left out, and an empty section for one with a NUL byte. A trailer
   section is `'trailers'` whether or not the body ahead of it is read, up to a window of
-  unread body (case 307), and a stream that has responded stays open for a request body
-  and trailers still coming unless JS never asked for the body (case 308). What differs: no
+  unread body (case 345), and a stream that has responded stays open for a request body
+  and trailers still coming unless JS never asked for the body (case 346). What differs: no
   received field is ever listed in `[http2.sensitiveHeaders]` -- of a stream's headers or
   of its trailers. nghttp2 sends a `cookie` field shorter than 20 bytes as never-indexed and
   Node lists the fields it receives that way; oam reports no received field as
@@ -2909,8 +2909,8 @@ oam's shared client. What differs:
   stream's `sentInfoHeaders`, `state`, `bufferSize` and `endAfterHeaders`. hyper chooses the
   SETTINGS and window sizes. Trailers are Node's both ways: `waitForTrailers`,
   `'wantTrailers'`, `sendTrailers()` and `sentTrailers`, and the response's trailer section
-  as `'trailers'` (headers, flags, rawHeaders) before `'end'`, read or not (cases 304 to
-  307; their one difference, `[http2.sensitiveHeaders]`, is in entry 42). `'wantTrailers'`
+  as `'trailers'` (headers, flags, rawHeaders) before `'end'`, read or not (cases 304, 305,
+  344 and 345; their one difference, `[http2.sensitiveHeaders]`, is in entry 42). `'wantTrailers'`
   comes before `'finish'` when Node's does -- `end()` leaving exactly one write under 65535
   bytes outstanding -- and after it otherwise. Node's write is outstanding until its socket
   has taken it; oam counts it so until the loop turn after the one it was made in, which is
