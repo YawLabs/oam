@@ -12015,7 +12015,8 @@
           view.set(chunk.subarray(0, Math.min(chunk.length, view.length)));
           queueMicrotask(function () { cb(null, chunk.length, buffer); });
         },
-        function (err) { queueMicrotask(function () { cb(err); }); },
+        // node calls a failed read back with (err, 0, buffer), as a write.
+        function (err) { queueMicrotask(function () { cb(err, 0, buffer); }); },
       );
     }
 
@@ -23995,6 +23996,8 @@
           res.httpVersion = headReader.major + "." + headReader.minor;
           res.headers = parsed.headers;
           res.rawHeaders = parsed.raw;
+          res.trailers = {};
+          res.rawTrailers = [];
           res.socket = res.connection = socket;
           res.req = self;
           self._responded = true;
@@ -24075,6 +24078,16 @@
               if (chunk === undefined) {
                 settled = true;
                 res.complete = true;
+                // A chunked body's trailer section, as node's parser fills
+                // them in before 'end'.
+                var trailers = globalThis.__oam.fetchBodyTrailers(handle);
+                if (trailers !== undefined) {
+                  var pairs = JSON.parse(trailers);
+                  for (var ti = 0; ti < pairs.length; ti++) {
+                    res.rawTrailers.push(pairs[ti][0], pairs[ti][1]);
+                    addHeaderLine(res.trailers, pairs[ti][0], pairs[ti][1]);
+                  }
+                }
                 res.push(null);
                 self._responseEnded();
               } else {
@@ -24155,6 +24168,10 @@
         res.httpVersion = agentPath && raw.httpVersion ? raw.httpVersion : "1.1";
         res.headers = parsed.headers;
         res.rawHeaders = parsed.raw;
+        // node's IncomingMessage has both from the start, empty unless a
+        // chunked body ends with a trailer section.
+        res.trailers = {};
+        res.rawTrailers = [];
         res.complete = false;
         res.socket = res.connection = this.socket;
         res.req = this;

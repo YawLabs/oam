@@ -74,6 +74,12 @@ pub struct FetchBody {
     /// describes when the peer closes it mid-body (fu2/http-conn-close).
     /// `None` for a body read off an agent's socket or an h2 stream.
     conn: Option<super::connector::ConnInfo>,
+    /// Keep the body's trailer section for JS to take at its end
+    /// ([`take_trailers`]): http.request's response, whose `trailers` and
+    /// `rawTrailers` node fills from it. A fetch has no use for them.
+    keep_trailers: bool,
+    /// The trailer section, once read (when `keep_trailers`).
+    trailers: Option<http::HeaderMap>,
 }
 
 /// The response facts undici's parser weighs when the connection ends inside
@@ -273,6 +279,16 @@ impl FetchBody {
             wire_read: 0,
             timeout: None,
             conn: None,
+            keep_trailers: false,
+            trailers: None,
+        }
+    }
+
+    /// The body keeping its trailer section for [`take_trailers`].
+    pub fn keeping_trailers(self, keep: bool) -> FetchBody {
+        FetchBody {
+            keep_trailers: keep,
+            ..self
         }
     }
 
@@ -382,10 +398,18 @@ impl FetchBody {
                     return Err(self.fail(error));
                 }
                 Some(Ok(frame)) => {
-                    // Trailers carry no body bytes; an empty data frame is
-                    // not a chunk.
-                    let Ok(data) = frame.into_data() else {
-                        continue;
+                    // Trailers carry no body bytes (they are kept for a body
+                    // that wants them); an empty data frame is not a chunk.
+                    let data = match frame.into_data() {
+                        Ok(data) => data,
+                        Err(frame) => {
+                            if self.keep_trailers
+                                && let Ok(trailers) = frame.into_trailers()
+                            {
+                                self.trailers = Some(trailers);
+                            }
+                            continue;
+                        }
                     };
                     if data.is_empty() {
                         continue;
@@ -480,7 +504,13 @@ pub async fn read(
             }
             OpOutcome::Bytes(chunk.to_vec())
         }
-        Ok(None) => OpOutcome::Done,
+        Ok(None) => {
+            // A trailer section waits for JS to take it (take_trailers).
+            if body.trailers.is_some() {
+                lock(&bodies).insert(handle, body);
+            }
+            OpOutcome::Done
+        }
         // A kept-alive response's connection the peer closed mid-body:
         // undici's SocketError, with the connection's facts as they stand.
         Err(BodyReadError::Closed) if body.conn.is_some() => match &body.conn {
@@ -489,6 +519,28 @@ pub async fn read(
         },
         Err(error) => error.to_outcome(body.coded),
     }
+}
+
+/// `fetchBodyTrailers`: the trailer section of the body under `handle`, read
+/// to its end, as `[name, value]` pairs (each value one byte per code point),
+/// and the body let go. `None` when it had none, or was not kept for them.
+pub fn take_trailers(bodies: &FetchBodies, handle: u64) -> Option<Vec<(String, String)>> {
+    let mut map = lock(bodies);
+    if map.get(&handle).is_none_or(|body| body.trailers.is_none()) {
+        return None;
+    }
+    let trailers = map.remove(&handle)?.trailers?;
+    Some(
+        trailers
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value.as_bytes().iter().map(|&b| char::from(b)).collect(),
+                )
+            })
+            .collect(),
+    )
 }
 
 /// A streamed request body's claim on its [`OutboundBodies`] entry

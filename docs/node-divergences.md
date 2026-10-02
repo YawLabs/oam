@@ -1491,6 +1491,11 @@ What still differs:
   `HPE_INVALID_HEADER_TOKEN` `Invalid header token` whichever of llhttp's header checks Node
   fails it with; a status under 100 fails `fetch` with `HTTPParserError` where undici 6.29.0
   fails an `assert(statusCode >= 100)` of its own.
+- **A response's trailers** (`conformance/cases/295-http-client-response-trailers.mjs`):
+  `res.trailers` and `res.rawTrailers` are `{}` and `[]` from the start and a chunked body's
+  trailer section fills them before `'end'`, as in Node; up to 0.17.1 both were `undefined`.
+  What differs: `rawTrailers` names are lowercase (hyper keeps no case), where Node's keep
+  the case they were sent in.
 - **A server's close (no reset) is undici's `SocketError`; a failure mid-body is
   `terminated`** (`conformance/cases/273-fetch-server-close-and-reset.mjs`). A connection
   the server closes before the response head is in, or halfway through it, fails `fetch`

@@ -5283,6 +5283,7 @@ pub mod ops {
     /// that landed while the read was in flight drops the body instead of
     /// reinserting it.
     pub use crate::http_client::body::read as fetch_body_read;
+    pub use crate::http_client::body::take_trailers as fetch_body_trailers;
 
     #[cfg(test)]
     mod statfs_wire_tests {

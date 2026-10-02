@@ -90,7 +90,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     // __oam: the internal op table consumed by js/bootstrap.js. Not public
     // API; the bootstrap wraps these in web-shaped surfaces (fetch, ...).
     let internal = v8::Object::new(scope);
-    let internal_bindings: [(&str, v8::Local<v8::Function>); 23] = [
+    let internal_bindings: [(&str, v8::Local<v8::Function>); 24] = [
         ("fetch", v8::Function::new(scope, op_fetch).unwrap()),
         // A fetch whose dispatcher has a `connect.lookup` hook parks before
         // dialling a host name; JS runs the hook and resumes or drops it.
@@ -121,6 +121,10 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         (
             "fetchBodyCancel",
             v8::Function::new(scope, op_fetch_body_cancel).unwrap(),
+        ),
+        (
+            "fetchBodyTrailers",
+            v8::Function::new(scope, op_fetch_body_trailers).unwrap(),
         ),
         // `destroy()` / `resetAndDestroy()` on the req.socket of an
         // http.request the transport carries: close its connection.
@@ -593,6 +597,29 @@ fn op_fetch_body_read(
         &mut rv,
         oam_core::ops::fetch_body_read(bodies, cancelled, cancel_signal, handle),
     );
+}
+
+/// Synchronous: `fetchBodyTrailers(handle)` -> JSON `[[name, value], ...]`
+/// of the trailer section of a body read to its end, or undefined when it
+/// had none (`oam_core::ops::fetch_body_trailers`). http.request's response
+/// fills `trailers` / `rawTrailers` from it.
+fn op_fetch_body_trailers(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(-1.0);
+    if handle < 0.0 {
+        return;
+    }
+    let bodies = core_runtime!(scope).bodies();
+    let Some(pairs) = oam_core::ops::fetch_body_trailers(&bodies, handle as u64) else {
+        return;
+    };
+    let json = serde_json::to_string(&pairs).unwrap_or_else(|_| "[]".to_string());
+    if let Some(value) = v8::String::new(scope, &json) {
+        rv.set(value.into());
+    }
 }
 
 /// Synchronous: drop the stored body (connection closes). Safe to call

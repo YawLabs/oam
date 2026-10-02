@@ -44,4 +44,20 @@ for (const [name, op] of ops) {
   );
 }
 
+// A failed read or write calls back with (err, 0, buffer) (review 3,
+// finding 20: oam's fs.read called back with the error alone).
+const fd = fs.openSync(f, "r");
+fs.closeSync(fd);
+for (const [name, op] of [
+  ["read on a closed fd", (cb) => fs.read(fd, Buffer.alloc(2), 0, 2, 0, cb)],
+  ["write on a closed fd", (cb) => fs.write(fd, Buffer.from("xy"), 0, 2, 0, cb)],
+]) {
+  await new Promise((resolve) =>
+    op(function (...args) {
+      console.log(name, args.length, args[0] && args[0].code, args[1], Buffer.isBuffer(args[2]));
+      resolve();
+    }),
+  );
+}
+
 fs.rmSync(dir, { recursive: true, force: true });

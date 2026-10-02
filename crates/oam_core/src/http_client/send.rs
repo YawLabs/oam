@@ -1113,7 +1113,10 @@ fn respond(
         .timed(state.body_timeout)
         // A close mid-body carries the connection's facts (undici's
         // SocketError; http.request makes it node's `aborted`).
-        .on_conn(conn.clone());
+        .on_conn(conn.clone())
+        // http.request (the one caller that reads the body undecoded) fills
+        // its response's trailers from the body's trailer section.
+        .keeping_trailers(!state.decode);
     lock(bodies).insert(handle, body);
     let mut payload = serde_json::json!({
         "status": status.as_u16(),
