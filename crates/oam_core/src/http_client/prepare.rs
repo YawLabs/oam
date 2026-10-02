@@ -263,6 +263,8 @@ pub fn origin_eq(a: &url::Url, b: &url::Url) -> bool {
 
 /// The Fetch Standard's "bad port" list as undici 6.24.1 ships it
 /// (fetch/constants.js:14-21, `badPortsSet`), sorted. Port 0 is not on it.
+/// `js/bootstrap.js` FETCH_BAD_PORTS holds the same list, for a streamed body
+/// fetch leaves unread on a bad port.
 const BAD_PORTS: [u16; 82] = [
     1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101, 102,
     103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427, 465,

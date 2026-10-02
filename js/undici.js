@@ -452,11 +452,15 @@
     // AsyncWriter writes it: each chunk's length is Buffer.byteLength's (so
     // anything but a string or a buffer fails as there), a chunk that would
     // go past the content-length is refused before it is sent and a body
-    // that ends short of it fails, and nothing is sent until the first
-    // non-empty chunk. The request is dispatched with that chunk, its body
-    // then following over an outbound channel (with backpressure: the next
-    // chunk is taken once the transport has the last one); a body that ends
-    // with none is sent as no body. Once the body has ended, the transport's
+    // that ends short of it fails. The request is dispatched at once -- a
+    // refused connect or a failed lookup fails it while the body is idle --
+    // and the body is read once it has a connection (the sent signal), as
+    // undici's writeIterable / writeStream start on a connected socket. The
+    // head waits for the first non-empty chunk (`__oamDeferHead`, as
+    // undici's AsyncWriter writes it), the body following over an outbound
+    // channel (with backpressure: the next chunk is taken once the transport
+    // has the last one); a body that ends with none is sent as no body.
+    // Once the body has ended, the transport's
     // headers timer starts (it holds it off while a streamed body is still
     // going out, as undici does).
     //
@@ -508,24 +512,42 @@
         let over = false;
         let written = 0;
         let tail = null;
-        const start = (withBody) => {
+        let sentSignal = null;
+        const start = () => {
           started = true;
+          channel = ops.fetchBodyChannelNew();
+          sentSignal = ops.fetchSentOpen();
           const headers = init.headers.slice();
-          if (withBody && length !== null) headers.push(["content-length", String(length)]);
-          if (!withBody && expectsPayload) headers.push(["content-length", "0"]);
-          const sent = G.fetch(
-            url,
-            withBody
-              ? { ...init, headers, __oamBodyStream: channel, __oamChunked: length === null }
-              : { ...init, headers },
-          );
+          if (length !== null) headers.push(["content-length", String(length)]);
+          const sent = G.fetch(url, {
+            ...init,
+            headers,
+            __oamBodyStream: channel,
+            __oamChunked: length === null,
+            __oamSentSignal: sentSignal,
+            // A body that ends with no chunk goes as none: `content-length:
+            // 0` where undici expects a payload (a length of its own is
+            // already there).
+            __oamDeferHead: { emptyContentLength: expectsPayload && length === null },
+          });
+          const settled = () => {
+            try {
+              ops.fetchSentClose(sentSignal);
+            } catch {
+              /* already closed */
+            }
+          };
           // A request that fails takes its body with it; one that gets its
           // response hands request() the way to stop it.
           sent.then(
             (res) => {
+              settled();
               if (!over) uploads.set(res, () => finish(null, true));
             },
-            () => finish(null, true),
+            () => {
+              settled();
+              finish(null, true);
+            },
           );
           resolve(sent);
         };
@@ -541,10 +563,6 @@
             : chunk instanceof ArrayBuffer
               ? new Uint8Array(chunk)
               : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
-          if (channel === null) {
-            channel = ops.fetchBodyChannelNew();
-            start(true);
-          }
           written += len;
           const id = channel;
           const next = () => ops.fetchBodyChannelWrite(id, bytes);
@@ -553,10 +571,6 @@
         };
         const end = () => {
           if (length !== null && written !== length) throw mismatch();
-          if (channel === null) {
-            start(false);
-            return;
-          }
           const id = channel;
           const close = () => ops.fetchBodyChannelEnd(id);
           if (tail === null) close();
@@ -581,7 +595,7 @@
           if (err === null && !quiet) return;
           if (channel !== null) ops.fetchBodyChannelCancel(channel);
           if (quiet) return;
-          // Before the head the request rejects with it, after the head its
+          // Before the response the request rejects with it, after it its
           // response body errors with it.
           if (!started) reject(err);
           else if (!signal.aborted) controller.abort(err);
@@ -599,7 +613,16 @@
           // sent, and destroys the stream with it.
           const refused = frame();
           if (refused !== null) return finish(refused, false);
-          stop = stream ? pumpStream(body, write, finish) : pumpIterable(body, write, finish);
+          start();
+          // The body is read once the request has a connection; one that
+          // ends without one never reads it.
+          ops.fetchSentWait(sentSignal).then(
+            (sent) => {
+              if (sent === undefined || sent === false || over) return;
+              stop = stream ? pumpStream(body, write, finish) : pumpIterable(body, write, finish);
+            },
+            () => {},
+          );
         };
         if (stream) setImmediate(begin);
         else begin();

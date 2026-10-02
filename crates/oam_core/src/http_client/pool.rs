@@ -53,6 +53,7 @@ use hyper_util::rt::TokioExecutor;
 
 use super::connector::{ConnCloser, ConnInfo, ConnStats, OamConnector};
 use super::sent::Dispatched;
+use super::transport::HeadAwaitsBody;
 use super::{BoxError, ReqBody};
 
 /// The pool is keyed on scheme + authority exactly as hyper-util was, so a
@@ -203,6 +204,21 @@ impl Pool {
                 dispatched.fire_on(info.connection);
             }
             info.take_lease();
+            // A streamed body whose head waits for it: the connection is
+            // there, and nothing goes out before the first chunk. A body
+            // that fails first fails the request unsent; the connection,
+            // which carried nothing, goes with it.
+            if let Some(gate) = req.extensions_mut().remove::<HeadAwaitsBody>()
+                && let Err(error) = gate.prime(&mut req).await
+            {
+                drop(proto);
+                return Err(PoolFail {
+                    error: PoolError::body(error),
+                    reused: false,
+                    response_started: false,
+                    conn: Some(info),
+                });
+            }
             *req.uri_mut() = original_uri.clone();
             set_host_header(&mut req, is_h2);
             rewrite_request_uri(req.uri_mut(), is_h2, proxied, is_connect);
@@ -597,6 +613,8 @@ pub struct PoolError {
 enum PoolErrorKind {
     Connect(BoxError),
     Send(hyper::Error),
+    /// The body failed before the head went out ([`HeadAwaitsBody`]).
+    Body(BoxError),
 }
 
 impl PoolError {
@@ -611,13 +629,21 @@ impl PoolError {
             kind: PoolErrorKind::Send(error),
         }
     }
+
+    fn body(error: BoxError) -> PoolError {
+        PoolError {
+            kind: PoolErrorKind::Body(error),
+        }
+    }
 }
 
 impl std::fmt::Display for PoolError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.kind {
             PoolErrorKind::Connect(_) => f.write_str("error connecting for url"),
-            PoolErrorKind::Send(_) => f.write_str("error sending request for url"),
+            PoolErrorKind::Send(_) | PoolErrorKind::Body(_) => {
+                f.write_str("error sending request for url")
+            }
         }
     }
 }
@@ -627,6 +653,7 @@ impl std::error::Error for PoolError {
         match &self.kind {
             PoolErrorKind::Connect(error) => Some(&**error),
             PoolErrorKind::Send(error) => Some(error),
+            PoolErrorKind::Body(error) => Some(&**error),
         }
     }
 }

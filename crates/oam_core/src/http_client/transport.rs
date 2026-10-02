@@ -679,6 +679,75 @@ pub fn channel_body_then(
 
 type OnEnd = Box<dyn FnOnce() + Send + Sync>;
 
+/// A request extension: the request's head waits for its body's first
+/// non-empty chunk, once the pool has a connection for it
+/// ([`super::send::DeferHead`]). undici dispatches a streamed request at
+/// once -- so a refused connect, a failed lookup or a bad port fail it while
+/// the source is still idle -- and its AsyncWriter writes the head with the
+/// first chunk, or, for a body that ends with none, writes it with no body.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HeadAwaitsBody {
+    pub(crate) empty_content_length: bool,
+}
+
+impl HeadAwaitsBody {
+    /// Wait for the body's first non-empty chunk and put it back in front
+    /// of the rest; or, for a body that ended with none, send no body: no
+    /// `transfer-encoding`, and `content-length: 0` when asked. A body that
+    /// fails first fails the request before its head goes out.
+    pub(crate) async fn prime(self, req: &mut http::Request<ReqBody>) -> Result<(), BoxError> {
+        let mut body = std::mem::replace(req.body_mut(), empty_body());
+        let first = loop {
+            match body.frame().await {
+                Some(Ok(frame)) if frame.data_ref().is_some_and(|data| data.is_empty()) => {}
+                Some(Ok(frame)) => break Some(frame),
+                Some(Err(error)) => return Err(error),
+                None => break None,
+            }
+        };
+        match first {
+            Some(frame) => {
+                *req.body_mut() = Primed {
+                    first: Some(frame),
+                    rest: body,
+                }
+                .boxed();
+            }
+            None => {
+                let headers = req.headers_mut();
+                headers.remove(http::header::TRANSFER_ENCODING);
+                if self.empty_content_length && !headers.contains_key(http::header::CONTENT_LENGTH)
+                {
+                    headers.insert(http::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A body whose first frame was read ahead ([`HeadAwaitsBody::prime`]).
+struct Primed {
+    first: Option<Frame<Bytes>>,
+    rest: ReqBody,
+}
+
+impl hyper::body::Body for Primed {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        if let Some(frame) = this.first.take() {
+            return std::task::Poll::Ready(Some(Ok(frame)));
+        }
+        std::pin::Pin::new(&mut this.rest).poll_frame(cx)
+    }
+}
+
 /// The body [`channel_body_then`] builds.
 struct ChannelBody {
     /// `None` only once dropped.

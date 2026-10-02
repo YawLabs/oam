@@ -2584,40 +2584,43 @@
     return btoa(binary);
   }
 
-  // A fetch with a streamed body, as undici's writeIterable sends it
-  // (measured on node v22.22.2): nothing goes out until the first non-empty
-  // chunk, which dispatches the request (`dispatch(onBodyOver)`, which
-  // returns the settled op), its body then following over an outbound
+  // A fetch with a streamed body, as undici sends it (measured on node
+  // v22.22.2 + undici 6.29.0): the request is dispatched at once -- a bad
+  // port, a failed lookup or a refused connect fail the fetch while the
+  // source is still idle -- and the source is read from the start (fetch
+  // reads it ahead of the connect, where undici.request waits for the
+  // connection). Its AsyncWriter writes the head with the first
+  // non-empty chunk, and the transport does the same (`defer_head`): a body
+  // that ends with none goes as no body at all, `content-length: 0` on a
+  // method that expects a payload. The body follows over an outbound
   // channel -- chunked unless the caller declared a content-length
-  // (`declared`, checked as it goes). A body that ends with none goes as no
-  // body at all, `content-length: 0` on a method that expects a payload. A
-  // write resolves once the transport has the chunk, so the source is read
-  // no faster than the socket takes it. A body that fails -- the stream
-  // errors, a chunk node would not write, the length disagrees -- fails the
-  // fetch with `TypeError: fetch failed` and that error as its cause. An
-  // abort, or a response whose body is over while the upload is still going,
-  // stops reading the source without cancelling it, as node's does.
-  //
-  // From the undici lane's fetchStreamed (fu2/undici-bodies-timeouts), over
-  // fetch-body-headers' Request-built body stream and its uploadChunk.
+  // (`declared`, checked as it goes) -- and a write resolves once the
+  // transport has the chunk, so the source is read no faster than the
+  // socket takes it. A body that fails -- the stream errors, a chunk node
+  // would not write, the length disagrees -- fails the fetch with
+  // `TypeError: fetch failed` and that error as its cause. An abort, or a
+  // response whose body is over while the upload is still going, stops
+  // reading the source without cancelling it, as node's does.
   const PAYLOAD_METHODS_STREAMED = new Set(["POST", "PUT", "PATCH", "QUERY", "PROPFIND", "PROPPATCH"]);
   function fetchUpload(stream, request, declared, signal, dispatch) {
     const node = globalThis.__oam.node;
-    const reader = stream.getReader();
     return new Promise((resolve, reject) => {
-      let channel = null;
-      let started = false;
       let stopped = false;
       let failure = null;
       let written = 0;
       const aborted = () =>
         signal.reason ?? new globalThis.DOMException("This operation was aborted", "AbortError");
+      if (signal?.aborted) return reject(aborted());
+      const channel = node.fetchBodyChannelNew();
+      request.body_stream = channel;
+      request.defer_head = {
+        empty_content_length: PAYLOAD_METHODS_STREAMED.has(request.method) && declared === null,
+      };
       const stop = () => {
         stopped = true;
         signal?.removeEventListener("abort", onAbort);
       };
       const dropChannel = () => {
-        if (channel === null) return;
         try {
           node.fetchBodyChannelCancel(channel);
         } catch {
@@ -2630,42 +2633,32 @@
         failure = err;
         stop();
         dropChannel();
-        if (!started) reject(new TypeError("fetch failed", { cause: err }));
       };
       const onAbort = () => {
         if (stopped) return;
         stop();
         dropChannel();
-        if (!started) reject(aborted());
       };
-      const start = (withBody) => {
-        started = true;
-        if (withBody) {
-          request.body_stream = channel;
-        } else if (PAYLOAD_METHODS_STREAMED.has(request.method) && declared === null) {
-          request.headers.push(["content-length", "0"]);
-        }
-        const onBodyOver = () => {
-          if (stopped) return;
-          stop();
-          dropChannel();
-        };
-        let op;
-        try {
-          op = dispatch(onBodyOver);
-        } catch (e) {
-          op = Promise.reject(e);
-        }
-        op.then(resolve, (e) => {
-          const cause = failure;
-          stop();
-          dropChannel();
-          reject(cause !== null ? new TypeError("fetch failed", { cause }) : e);
-        });
-      };
-      if (signal?.aborted) return reject(aborted());
       signal?.addEventListener("abort", onAbort, { once: true });
-      (async () => {
+      const onBodyOver = () => {
+        if (stopped) return;
+        stop();
+        dropChannel();
+      };
+      let op;
+      try {
+        op = dispatch(onBodyOver);
+      } catch (e) {
+        op = Promise.reject(e);
+      }
+      op.then(resolve, (e) => {
+        const cause = failure;
+        stop();
+        dropChannel();
+        reject(cause !== null ? new TypeError("fetch failed", { cause }) : e);
+      });
+      const pump = async () => {
+        const reader = stream.getReader();
         for (;;) {
           const step = await reader.read();
           if (stopped) return;
@@ -2674,20 +2667,38 @@
           if (!bytes.byteLength) continue;
           if (declared !== null && written + bytes.byteLength > declared) throw mismatch();
           written += bytes.byteLength;
-          if (channel === null) {
-            channel = node.fetchBodyChannelNew();
-            start(true);
-          }
           const more = await node.fetchBodyChannelWrite(channel, bytes).then(null, () => false);
           if (stopped) return;
           if (more === false) return stop();
         }
         if (declared !== null && written !== declared) throw mismatch();
         stop();
-        if (channel === null) start(false);
-        else node.fetchBodyChannelEnd(channel);
-      })().catch(fail);
+        node.fetchBodyChannelEnd(channel);
+      };
+      // undici refuses a bad port in mainFetch, before the body is touched;
+      // the transport makes the same refusal, and the source is left alone.
+      if (!(request.fetch_semantics && fetchBadPort(request.url))) pump().catch(fail);
     });
+  }
+
+  // The Fetch spec's bad ports, as undici's requestBadPort checks them
+  // (oam_core http_client::prepare::BAD_PORTS is the same list).
+  const FETCH_BAD_PORTS = new Set([
+    1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101, 102,
+    103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427, 465,
+    512, 513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990, 993,
+    995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668,
+    6669, 6679, 6697, 10080,
+  ]);
+  function fetchBadPort(href) {
+    let url;
+    try {
+      url = new URL(href);
+    } catch {
+      return false;
+    }
+    return (url.protocol === "http:" || url.protocol === "https:") && url.port !== "" &&
+      FETCH_BAD_PORTS.has(Number(url.port));
   }
 
   // One chunk of a streamed upload as bytes, with node's verdict on each
@@ -3026,8 +3037,13 @@
     }
     // http.request's sent signal: fired once the transport has a connection
     // for the request, which is when node's 'finish' is due (#193).
-    if (rawPayload && typeof init.__oamSentSignal === "number") {
+    if (typeof init.__oamSentSignal === "number") {
       request.sent_signal = init.__oamSentSignal;
+    }
+    // undici.request's streamed body: its head waits for the first chunk
+    // (fetchUpload says why).
+    if (init.__oamDeferHead !== undefined && init.__oamDeferHead !== null) {
+      request.defer_head = { empty_content_length: init.__oamDeferHead.emptyContentLength === true };
     }
     // An undici-style dispatcher may carry a connect.lookup hook -- the
     // DNS-rebind / SSRF pin. The oam:undici shim exposes it as
@@ -3199,8 +3215,8 @@
     }
     const dispatch = (onBodyOver) =>
       settleFetch(internal.fetch(JSON.stringify(request), cancelId), lookup, signal, connector, fetchSemantics, onBodyOver);
-    // A streamed body goes out as it is produced, and only once it has a
-    // first chunk (fetchUpload); any other is sent with the request.
+    // A streamed body goes out as it is produced, its head with its first
+    // chunk (fetchUpload); any other is sent with the request.
     const op = upload === null ? dispatch() : fetchUpload(upload, request, streamedLength, signal, dispatch);
     if (!signal) return op;
     // Race the abort: it rejects the fetch with the reason at once, and

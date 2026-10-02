@@ -61,6 +61,15 @@ use crate::OpOutcome;
 use crate::OutboundBodies;
 use crate::net_connect::attempt_timeout_from_ms;
 
+/// [`FetchRequest::defer_head`].
+#[derive(serde::Deserialize, Debug, Clone, Copy, Default)]
+pub struct DeferHead {
+    /// A body that ends with no chunk goes out as `content-length: 0` (a
+    /// method undici expects a payload for, with no length of its own).
+    #[serde(default)]
+    pub empty_content_length: bool,
+}
+
 /// The request `js/bootstrap.js` sends (serde; unknown fields are ignored).
 #[derive(serde::Deserialize)]
 pub struct FetchRequest {
@@ -143,6 +152,13 @@ pub struct FetchRequest {
     /// connection: `http.request`'s, for node's `'finish'` (#193).
     #[serde(default)]
     pub sent_signal: Option<u64>,
+    /// A streamed body (`body_stream`) whose head waits for it, as undici's
+    /// AsyncWriter writes it: the request is dispatched -- the bad-port
+    /// check, the lookup and the connect run at once -- but nothing goes on
+    /// the wire before the body's first non-empty chunk, and a body that
+    /// ends with none goes as no body at all ([`super::transport::HeadAwaitsBody`]).
+    #[serde(default)]
+    pub defer_head: Option<DeferHead>,
     /// That signal's sending half. Never from JS: the engine's fetch op
     /// takes it from the runtime's registry and puts it here.
     #[serde(skip)]
@@ -349,6 +365,8 @@ struct LoopState {
     headers_timeout: Option<Duration>,
     /// undici's `bodyTimeout`, handed to the response body. `None`: no limit.
     body_timeout: Option<Duration>,
+    /// [`FetchRequest::defer_head`], for the first send of a streamed body.
+    defer_head: Option<DeferHead>,
 }
 
 enum BodySource {
@@ -508,6 +526,7 @@ pub async fn fetch(
         cancel,
         headers_timeout,
         body_timeout: timeout_limit(req.body_timeout_ms),
+        defer_head: req.defer_head,
     };
     run(state, &bodies, &ids, &continuations).await
 }
@@ -717,6 +736,15 @@ async fn run(
             *request.headers_mut() = hop_headers.clone();
             if let Some(dispatched) = &state.dispatched {
                 request.extensions_mut().insert(dispatched.clone());
+            }
+            if matches!(state.source, BodySource::Stream(_))
+                && let Some(defer) = state.defer_head.take()
+            {
+                request
+                    .extensions_mut()
+                    .insert(super::transport::HeadAwaitsBody {
+                        empty_content_length: defer.empty_content_length,
+                    });
             }
             // The one place the loop waits. Each send (a hop, a resend) gets
             // its own headersTimeout, started by its own checkout: a head that

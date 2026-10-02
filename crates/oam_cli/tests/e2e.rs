@@ -5326,6 +5326,17 @@ await attempt('body cut, connection close', async () => (await request(url.close
 await attempt('body bad chunk size', async () => (await request(url.chunk)).body.text());
 await attempt('refused', () => request(`http://127.0.0.1:${closed}/`));
 await attempt('refused proxy', () => request(url.cut, { dispatcher: new ProxyAgent(`http://127.0.0.1:${closed}`) }));
+// A streamed body that produces nothing: the request is dispatched at once
+// and fails on the connect, and a body never connected is never started
+// (review 3, finding 8: oam waited for the first chunk and hung).
+const { Readable } = await import('node:stream');
+const idle = new Readable({ read() {} });
+await attempt('refused, idle stream', () => request(`http://127.0.0.1:${closed}/`, { method: 'POST', body: idle }));
+console.log('idle stream destroyed', idle.destroyed);
+let started = 0;
+async function* never() { started++; await new Promise(() => {}); }
+await attempt('refused, idle generator', () => request(`http://127.0.0.1:${closed}/`, { method: 'POST', body: never() }));
+console.log('generator started', started);
 process.exit(0);
 "##,
     );
@@ -5336,7 +5347,11 @@ body cut, kept alive SocketError UND_ERR_SOCKET other side closed true false
 body cut, connection close ResponseContentLengthMismatchError UND_ERR_RES_CONTENT_LENGTH_MISMATCH Response body length does not match content-length header true false
 body bad chunk size HTTPParserError HPE_INVALID_CHUNK_SIZE Response does not match the HTTP/1.1 protocol (Invalid character in chunk size) false false
 refused Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
-refused proxy Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false";
+refused proxy Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
+refused, idle stream Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
+idle stream destroyed true
+refused, idle generator Error ECONNREFUSED connect ECONNREFUSED 127.0.0.1:PORT false false
+generator started 0";
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
