@@ -688,6 +688,11 @@ WIN_SIGN_INTERMEDIATE="Microsoft ID Verified Code Signing PCA 2021"
 # digit. 10.0.20348.* (Server 2022's SDK) is called out as unsupported by the
 # dlib and is skipped whatever its number.
 WIN_SIGNTOOL_FLOOR="10.0.22621"
+# Seconds any one signtool or verify call may take. signtool + the dlib do not
+# time out on their own: against an unreachable endpoint they print
+# "Submitting digest for signing..." and wait forever (measured, dlib 1.0.119).
+# A stalled service mid-release must be a clean failure, not a hang.
+WIN_SIGN_TIMEOUT="${OAM_WIN_SIGN_TIMEOUT:-300}"
 # Search roots and the external programs, reassigned by the test suite.
 WIN_SDK_BIN_ROOT="/c/Program Files (x86)/Windows Kits/10/bin"
 WIN_DOTNET_CANDIDATES=("/c/Program Files/dotnet/x64/dotnet.exe" "/c/Program Files/dotnet/dotnet.exe")
@@ -714,6 +719,37 @@ WIN_DOTNET_X64=""
 # no Windows program can open as written.
 _ws_winpath() {
   if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s\n' "$1"; fi
+}
+
+# _ws_run <command...> -- run under WIN_SIGN_TIMEOUT, stdout and stderr both on
+# stdout; returns the command's rc (124 or 137: killed for taking too long).
+_ws_run() {
+  timeout "$WIN_SIGN_TIMEOUT" "$@" </dev/null 2>&1
+}
+
+# _ws_timed_out <rc> -- whether rc is timeout(1) killing the command.
+_ws_timed_out() { [ "$1" = "124" ] || [ "$1" = "137" ]; }
+
+# _ws_redact <metadata.json> -- stdin to stdout with every value metadata.json
+# holds (and the endpoint / account / profile shapes the service echoes back)
+# replaced by <redacted>. signtool /v prints the dlib's whole metadata block,
+# and failure output is exactly what an operator pastes into a public issue.
+_ws_redact() {
+  local m="$1" k v line
+  local -a vals=()
+  if [ -f "$m" ]; then
+    for k in Endpoint CodeSigningAccountName CertificateProfileName; do
+      v="$(sed -nE "s/.*\"$k\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p" "$m" | head -1)"
+      if [ -n "$v" ]; then vals+=("$v" "${v,,}"); fi
+    done
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    for v in "${vals[@]}"; do line="${line//"$v"/<redacted>}"; done
+    printf '%s\n' "$line"
+  done | sed -E \
+    -e 's/("(Endpoint|CodeSigningAccountName|CertificateProfileName)"[[:space:]]*:[[:space:]]*)"[^"]*"/\1"<redacted>"/g' \
+    -e 's#[A-Za-z0-9-]+\.codesigning\.azure\.net#<redacted>.codesigning.azure.net#g' \
+    -e 's#(codesigningaccounts|certificateprofiles)/[^/[:space:]"]+#\1/<redacted>#Ig'
 }
 
 # _ws_pe_machine <file> -- the COFF Machine field as 4 lowercase hex digits
@@ -854,12 +890,22 @@ _ws_metadata() {
   printf '%s\n' "$m"
 }
 
+# _ws_timeout_ok -- WIN_SIGN_TIMEOUT is a positive number of seconds, and
+# timeout(1) is there to enforce it.
+_ws_timeout_ok() {
+  [[ "$WIN_SIGN_TIMEOUT" =~ ^[1-9][0-9]*$ ]] \
+    || { _rs_fail "OAM_WIN_SIGN_TIMEOUT must be a positive number of seconds, not '$WIN_SIGN_TIMEOUT'"; return 1; }
+  command -v timeout >/dev/null 2>&1 \
+    || { _rs_fail "timeout(1) is not on PATH -- it bounds every signtool call"; return 1; }
+}
+
 # win_sign_tools -- every local prerequisite, none of them network.
 win_sign_tools() {
   locate_signtool_x64 || return 1
   locate_artifact_signing_dlib || return 1
   probe_dotnet_x64 || return 1
   [ -f "$WIN_VERIFY_PS1" ] || { _rs_fail "$WIN_VERIFY_PS1 is missing"; return 1; }
+  _ws_timeout_ok || return 1
   [ -n "${OAM_WIN_SIGN_PUBLISHER:-}" ] || { _rs_fail "OAM_WIN_SIGN_PUBLISHER is not set -- the CN/O every signature must carry"; return 1; }
   _ws_metadata >/dev/null || return 1
   return 0
@@ -871,7 +917,7 @@ win_sign_tools() {
 # cargo, the parked-binary dance and live sessions all assume is unchanged.
 # Success here means signtool SAID so; win_verify is what proves it.
 win_sign() {
-  local file="$1" meta out
+  local file="$1" meta out rc
   [ -f "$file" ] || { _rs_fail "win_sign: $file does not exist"; return 1; }
   case "$file" in
     */target/* | target/*) _rs_fail "win_sign: refusing to sign $file in place -- sign the staged copy, never a build output under target/"; return 1 ;;
@@ -879,14 +925,19 @@ win_sign() {
   win_sign_tools || return 1
   meta="$(_ws_metadata)" || return 1
   # MSYS_NO_PATHCONV: Git Bash would otherwise rewrite /fd, /tr ... into paths.
-  if ! out="$(MSYS_NO_PATHCONV=1 "$WIN_SIGNTOOL" sign /v /fd SHA256 /tr "$WIN_SIGN_TSA" /td SHA256 \
-                /dlib "$(_ws_winpath "$WIN_SIGN_DLIB")" /dmdf "$(_ws_winpath "$meta")" \
-                "$(_ws_winpath "$file")" </dev/null 2>&1)"; then
-    printf '%s\n' "$out" | tr -d '\r' | tail -n 15 | sed 's/^/        signtool: /' >&2
+  rc=0
+  out="$(MSYS_NO_PATHCONV=1 _ws_run "$WIN_SIGNTOOL" sign /v /fd SHA256 /tr "$WIN_SIGN_TSA" /td SHA256 \
+           /dlib "$(_ws_winpath "$WIN_SIGN_DLIB")" /dmdf "$(_ws_winpath "$meta")" \
+           "$(_ws_winpath "$file")")" || rc=$?
+  [ "$rc" = "0" ] && return 0
+  # Redacted: /v echoes metadata.json, and metadata.json names the account.
+  printf '%s\n' "$out" | tr -d '\r' | tail -n 15 | _ws_redact "$meta" | sed 's/^/        signtool: /' >&2
+  if _ws_timed_out "$rc"; then
+    _rs_fail "signtool sign for $file did not finish in ${WIN_SIGN_TIMEOUT}s and was killed (output above) -- the Artifact Signing endpoint or the TSA ($WIN_SIGN_TSA) is unreachable or stalled; OAM_WIN_SIGN_TIMEOUT sets the limit"
+  else
     _rs_fail "signtool sign failed for $file (output above). 401/403: run 'az login' and check the Certificate Profile Signer role; a SignerSign() error: metadata.json's Endpoint must be the account's region"
-    return 1
   fi
-  return 0
+  return 1
 }
 
 # win_verify <file> -- fail-closed proof that <file> AS IT IS ON DISK carries
@@ -898,25 +949,57 @@ win_sign() {
 # The path and the publisher reach PowerShell as -File ARGUMENTS, never spliced
 # into a command string: a path is data, and so is a publisher with a comma.
 win_verify() {
-  local file="$1" out pub="${OAM_WIN_SIGN_PUBLISHER:-}"
+  local file="$1" out rc late="" pub="${OAM_WIN_SIGN_PUBLISHER:-}"
   [ -f "$file" ] || { _rs_fail "win_verify: $file does not exist"; return 1; }
   [ -n "$pub" ] || { _rs_fail "win_verify: OAM_WIN_SIGN_PUBLISHER is not set -- nothing to pin the signer to"; return 1; }
   locate_signtool_x64 || return 1
-  if ! out="$(MSYS_NO_PATHCONV=1 "$WIN_SIGNTOOL" verify /pa /v "$(_ws_winpath "$file")" </dev/null 2>&1)"; then
+  _ws_timeout_ok || return 1
+  rc=0
+  out="$(MSYS_NO_PATHCONV=1 _ws_run "$WIN_SIGNTOOL" verify /pa /v "$(_ws_winpath "$file")")" || rc=$?
+  if [ "$rc" != "0" ]; then
+    if _ws_timed_out "$rc"; then late=" -- killed after ${WIN_SIGN_TIMEOUT}s"; fi
     printf '%s\n' "$out" | tr -d '\r' | tail -n 15 | sed 's/^/        signtool: /' >&2
-    _rs_fail "signtool verify /pa rejects $file (output above)"
+    _rs_fail "signtool verify /pa rejects $file (output above)$late"
     return 1
   fi
-  if ! out="$(MSYS_NO_PATHCONV=1 "$WIN_POWERSHELL" -NoProfile -NonInteractive -ExecutionPolicy Bypass \
-                -File "$(_ws_winpath "$WIN_VERIFY_PS1")" \
-                -Path "$(_ws_winpath "$file")" -Publisher "$pub" -Intermediate "$WIN_SIGN_INTERMEDIATE" \
-                </dev/null 2>&1)"; then
+  rc=0
+  out="$(MSYS_NO_PATHCONV=1 _ws_run "$WIN_POWERSHELL" -NoProfile -NonInteractive -ExecutionPolicy Bypass \
+           -File "$(_ws_winpath "$WIN_VERIFY_PS1")" \
+           -Path "$(_ws_winpath "$file")" -Publisher "$pub" -Intermediate "$WIN_SIGN_INTERMEDIATE")" || rc=$?
+  if [ "$rc" != "0" ]; then
+    if _ws_timed_out "$rc"; then late=" -- killed after ${WIN_SIGN_TIMEOUT}s"; fi
     printf '%s\n' "$out" | tr -d '\r' | sed 's/^/        /' >&2
-    _rs_fail "Authenticode verification failed for $file (above) -- whatever signtool reported, the file on disk does not carry the required signature"
+    _rs_fail "Authenticode verification failed for $file (above)$late -- whatever signtool reported, the file on disk does not carry the required signature"
     return 1
   fi
   _rs_ok "Authenticode: $(basename "$file") signed by '$pub', timestamped, chained via $WIN_SIGN_INTERMEDIATE"
   return 0
+}
+
+# win_pe_signature_state <file> -- "signed" when the PE's certificate table
+# (data directory 4, IMAGE_DIRECTORY_ENTRY_SECURITY) is non-empty, i.e. it
+# carries an embedded Authenticode signature of SOME kind; "unsigned" when it
+# is a PE without one; "unknown" for anything else. Structure only, no trust
+# decision -- it answers "would replacing this file drop a signature?", which
+# needs no Windows tooling and no network.
+win_pe_signature_state() {
+  local f="$1" lfanew magic dd ndirs size
+  if [ -z "$(_ws_pe_machine "$f")" ]; then echo unknown; return 0; fi
+  lfanew="$(od -An -tu4 -j60 -N4 "$f" 2>/dev/null | tr -d ' \n')"
+  # The optional header starts 24 bytes past "PE\0\0"; its data directories
+  # sit 112 (PE32+) or 96 (PE32) bytes in, 8 bytes each.
+  magic="$(od -An -tx1 -j"$((lfanew + 24))" -N2 "$f" 2>/dev/null | awk '{ print $2 $1 }')"
+  case "$magic" in
+    020b) dd=$((lfanew + 24 + 112)) ;;
+    010b) dd=$((lfanew + 24 + 96)) ;;
+    *) echo unknown; return 0 ;;
+  esac
+  ndirs="$(od -An -tu4 -j"$((dd - 4))" -N4 "$f" 2>/dev/null | tr -d ' \n')"
+  [[ "$ndirs" =~ ^[0-9]+$ ]] || { echo unknown; return 0; }
+  if [ "$ndirs" -le 4 ]; then echo unsigned; return 0; fi
+  size="$(od -An -tu4 -j"$((dd + 4 * 8 + 4))" -N4 "$f" 2>/dev/null | tr -d ' \n')"
+  [[ "$size" =~ ^[0-9]+$ ]] || { echo unknown; return 0; }
+  if [ "$size" -gt 0 ]; then echo signed; else echo unsigned; fi
 }
 
 # win_make_unsigned_pe <out> -- write a minimal, valid, unsigned PE32+ x64

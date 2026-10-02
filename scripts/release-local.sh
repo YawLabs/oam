@@ -135,6 +135,11 @@
 #                           the other skips, it drops a guarantee, not a check
 #                           that failed: use it only when the service or TSA
 #                           is down and the release cannot wait
+#   OAM_WIN_SIGN_TIMEOUT=<s>
+#                           seconds any one signtool sign/verify call may run
+#                           (default 300). signtool + the dlib never time out
+#                           on their own: a stalled endpoint or TSA would hang
+#                           the release mid-leg instead of failing it
 #
 # The two remote legs run sequentially (simpler failure attribution). If
 # release wall-time becomes a problem, they are independent and could run as

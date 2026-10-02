@@ -179,6 +179,13 @@ fi
 # OAM_SKIP_WIN_SIGN, OAM_SIGN_REQUIRED), proven before the build so a lapsed
 # az session costs seconds. Signed whatever the release's other assets carry:
 # a signed binary is never worse than the unsigned one it replaces.
+#
+# The other direction is not symmetric. A run that will NOT sign (bootstrap:
+# a shell without the knobs) must not --clobber a published asset that IS
+# signed -- SmartScreen and Smart App Control would start blocking a binary
+# they trusted, under a freshly re-signed manifest. So the current asset is
+# fetched and its PE certificate table read; a signed one is replaced unsigned
+# only on an explicit OAM_SKIP_WIN_SIGN=1, and "cannot tell" counts as signed.
 WIN_SIGNING=0
 win_decision="$(win_sign_decision "${OAM_SKIP_WIN_SIGN:-0}")"
 case "$win_decision" in
@@ -187,6 +194,22 @@ case "$win_decision" in
   skip:*) echo "  [warn] ${win_decision#skip:}" >&2 ;;
   *) echo "error: ${win_decision#fail:}" >&2; exit 1 ;;
 esac
+if [ "$WIN_SIGNING" = "0" ] && grep -qxF "$ASSET" <<<"$published_assets"; then
+  prior_dir="$(mktemp -d)"
+  prior_state=unknown
+  if gh release download "$TAG" --repo "$REPO" --dir "$prior_dir" --pattern "$ASSET"; then
+    prior_state="$(win_pe_signature_state "${prior_dir}/${ASSET}")"
+  fi
+  rm -rf "$prior_dir"
+  if [ "$prior_state" != "unsigned" ]; then
+    if [ "${OAM_SKIP_WIN_SIGN:-0}" = "1" ]; then
+      echo "  [warn] ${TAG}'s published ${ASSET} is Authenticode-signed (${prior_state}); OAM_SKIP_WIN_SIGN=1 replaces it with an UNSIGNED build" >&2
+    else
+      echo "error: ${TAG}'s published ${ASSET} is Authenticode-signed (or could not be read: ${prior_state}), and this run would replace it with an UNSIGNED build -- set OAM_WIN_SIGN_METADATA and OAM_WIN_SIGN_PUBLISHER (release-keys/README.md), or OAM_SKIP_WIN_SIGN=1 to downgrade it deliberately; nothing was built or uploaded" >&2
+      exit 1
+    fi
+  fi
+fi
 
 # Live typed-cli sessions run this exact file. `taskkill //F //IM oam.exe`
 # (what this used to do) killed the operator's other agent panes AND made the

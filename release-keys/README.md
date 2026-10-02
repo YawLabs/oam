@@ -240,6 +240,17 @@ without signing fails the release.
 configured or required, with a loud warning. Use it only when the service or
 the timestamp server is down and the release cannot wait.
 
+`scripts/release-upload-local-arm64.sh` follows the same rules, with one
+addition. If it will not sign, and the release's current arm64 asset is
+signed, it stops before building. Replacing a signed binary with an unsigned
+one takes `OAM_SKIP_WIN_SIGN=1`.
+
+Each signtool call is limited to `OAM_WIN_SIGN_TIMEOUT` seconds (default
+300), because signtool waits forever on an endpoint that does not answer.
+When signing fails, the output is printed with the metadata values replaced
+by `<redacted>`. signtool's verbose output repeats `metadata.json`, so this
+keeps the account names out of anything you paste into an issue.
+
 To check a downloaded binary by hand, in PowerShell:
 
 ```powershell
