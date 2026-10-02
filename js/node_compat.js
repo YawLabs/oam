@@ -19136,6 +19136,9 @@
     // has been emitted.
     const kServerSocketClose = Symbol("kServerSocketClose");
     const kServerSocketClosed = Symbol("kServerSocketClosed");
+    // A connection's socket hears that the peer reset the connection under
+    // a read, just ahead of its 'close' (peerResetConnection).
+    const kServerSocketPeerReset = Symbol("kServerSocketPeerReset");
     // A server response that closes with its connection's socket: node's
     // onServerResponseClose, a 'close' listener on the socket from the
     // moment the response is assigned it until it finishes.
@@ -19820,6 +19823,17 @@
           return true;
         }
         if (this._ended) return false;
+        // node's write_ on a response whose connection closed under it (a
+        // reset, a destroyed socket, a client gone): nothing is sent, and
+        // the callback hears ERR_STREAM_DESTROYED on the next tick. oam
+        // handed the bytes to a stream nobody reads and called it with no
+        // error.
+        if (this.closed) {
+          if (typeof cb === "function") {
+            process.nextTick(() => cb(codes.ERR_STREAM_DESTROYED("write")));
+          }
+          return false;
+        }
         const bytes = this._toBytes(chunk, encoding);
         if (this._streamId === null) {
           this._implicitHead();
@@ -20108,6 +20122,22 @@
       Object.defineProperty(socket, kServerSocketClosed, {
         get() {
           return closeEmitted;
+        },
+      });
+      // node's socket when its read is reset: destroyed with the read's
+      // error, which it emits -- socketOnError, the server's 'clientError',
+      // hearing it first -- in the same tick as the 'close' (saying true)
+      // that releaseConnection brings next. A socket JS has destroyed
+      // already says nothing more.
+      Object.defineProperty(socket, kServerSocketPeerReset, {
+        value: function peerReset(err) {
+          if (closeEmitted || this.destroyed) return;
+          this.destroyed = true;
+          this.readable = false;
+          this.writable = false;
+          hadError = true;
+          if (this[kConnServer] !== undefined) serverSocketOnError(this, err);
+          if (this.listenerCount("error") > 0) this.emit("error", err);
         },
       });
       // Closes the connection -- with a reset when resetAndDestroy() asked
@@ -20494,11 +20524,34 @@
     // server ended it, or JS destroyed the TLS socket). Also what an upgrade
     // or CONNECT does to the connection it takes over, in the same step as
     // it counts the socket that carries the connection on.
-    function releaseConnection(server, connectionId) {
+    function releaseConnection(server, connectionId, reset) {
       const sockets = server._connSockets;
       const record = sockets && sockets.get(connectionId);
       if (sockets) sockets.delete(connectionId);
-      if (record) closeRecordSockets(record);
+      if (record) {
+        if (reset) peerResetConnection(record, reset);
+        closeRecordSockets(record);
+      }
+    }
+
+    // The peer reset the connection under a read (the native side's
+    // `reset`: code, errno, syscall). node's socket that reads it -- the
+    // TLS socket on an https connection -- is destroyed with
+    // `read ECONNRESET`, and reports it before it closes (measured on
+    // v22.22.2: a client's resetAndDestroy() of a kept-alive connection,
+    // mid-response, or before the answer).
+    function peerResetConnection(record, reset) {
+      const socket = record.secure || record.conn;
+      if (!socket || socket[kServerSocketPeerReset] === undefined) return;
+      const err = new Error(reset.syscall + " " + reset.code);
+      if (reset.errno !== undefined && reset.errno !== null) err.errno = reset.errno;
+      err.code = reset.code;
+      err.syscall = reset.syscall;
+      try {
+        socket[kServerSocketPeerReset](err);
+      } catch (e) {
+        raiseFromListener(e);
+      }
     }
 
     // Each socket closes even when a listener on the other throws, as
@@ -20598,7 +20651,7 @@
         return;
       }
       if (meta.event === "connectionClosed") {
-        releaseConnection(server, meta.connectionId);
+        releaseConnection(server, meta.connectionId, meta.reset);
         return;
       }
       if (meta.event === "tlsClientError") {
@@ -20634,7 +20687,7 @@
           // their 'close' listeners, aborts it. An exchange still here after
           // that (on a socket that is no connection's, or whose listeners
           // were taken off) is aborted directly.
-          releaseConnection(server, exchange.connectionId);
+          releaseConnection(server, exchange.connectionId, meta.reset);
           if (server._exchanges.get(meta.requestId) === exchange) {
             const socket = exchange.req.socket;
             if (socket && socket[kServerSocketClose] !== undefined) {

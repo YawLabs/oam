@@ -173,6 +173,9 @@ pub enum ServerEvent {
     /// closes them (node's socket 'close').
     ConnectionClosed {
         conn_id: u64,
+        /// The peer reset the connection under a read: node's socket
+        /// reports it before it closes (`read ECONNRESET`).
+        reset: Option<crate::http_conn::PeerReset>,
     },
     /// A connection refused under `server.maxConnections` (node's 'drop').
     Drop {
@@ -184,6 +187,8 @@ pub enum ServerEvent {
     /// 'close' without 'finish').
     Closed {
         request_id: u64,
+        /// As for `ConnectionClosed`: the reset the connection went with.
+        reset: Option<crate::http_conn::PeerReset>,
     },
 }
 
@@ -1580,7 +1585,10 @@ pub async fn http_serve(
                             crate::http_conn::close_unserved(stream, &watch);
                             if announcement.announced {
                                 let _ = conn_queue
-                                    .send(ServerEvent::ConnectionClosed { conn_id })
+                                    .send(ServerEvent::ConnectionClosed {
+                                        conn_id,
+                                        reset: watch.peer_reset(),
+                                    })
                                     .await;
                             }
                             drop(registration);
@@ -1611,6 +1619,7 @@ pub async fn http_serve(
                                 upgrades.clone(),
                             )
                         });
+                        let closed_watch = Arc::clone(&watch);
                         let taken = serve_http1(
                             stream,
                             watch,
@@ -1642,7 +1651,10 @@ pub async fn http_serve(
                         let Some((stream, head, takeover)) = taken else {
                             if announcement.announced {
                                 let _ = conn_queue
-                                    .send(ServerEvent::ConnectionClosed { conn_id })
+                                    .send(ServerEvent::ConnectionClosed {
+                                        conn_id,
+                                        reset: closed_watch.peer_reset(),
+                                    })
                                     .await;
                             }
                             return;
@@ -1712,7 +1724,9 @@ struct RequestGuard {
     /// Where to report an exchange that ends before JS answered it (the
     /// connection was closed under it), for a server whose JS keeps the
     /// request / response pair.
-    closed_to: Option<mpsc::Sender<ServerEvent>>,
+    /// Where to report an exchange that ends before JS answered it, and
+    /// the connection's watch, which knows whether the peer reset it.
+    closed_to: Option<(mpsc::Sender<ServerEvent>, Arc<ConnWatch>)>,
 }
 
 impl Drop for RequestGuard {
@@ -1728,12 +1742,15 @@ impl Drop for RequestGuard {
         // rather than one that can be dropped.
         if unanswered
             && self.dispatched
-            && let Some(queue) = self.closed_to.take()
+            && let Some((queue, watch)) = self.closed_to.take()
             && let Ok(runtime) = tokio::runtime::Handle::try_current()
         {
             let request_id = self.id;
+            // hyper drops the handler's future once the connection has
+            // ended, so a reset its read saw is known by now.
+            let reset = watch.peer_reset();
             runtime.spawn(async move {
-                let _ = queue.send(ServerEvent::Closed { request_id }).await;
+                let _ = queue.send(ServerEvent::Closed { request_id, reset }).await;
             });
         }
         let mut bodies = self.state.bodies.lock().expect("http bodies lock");
@@ -2066,7 +2083,7 @@ async fn handle_request(
             .map(|w| (Arc::clone(w), w.headers_complete(id))),
     );
     let conn_id = watch.as_ref().map(|w| w.id);
-    let notify_closed = watch.as_ref().is_some_and(|w| w.js_driven());
+    let notify_closed = watch.as_ref().filter(|w| w.js_driven()).map(Arc::clone);
     let response = dispatch_request(
         state,
         queue,
@@ -2098,8 +2115,8 @@ async fn dispatch_request(
     message_done: MessageDone,
     conn_id: Option<u64>,
     // Tell JS when the exchange ends without its response (a node:http
-    // server keeps the pair until then).
-    notify_closed: bool,
+    // server keeps the pair until then): the connection's watch.
+    notify_closed: Option<Arc<ConnWatch>>,
     upgrades: Upgrades,
 ) -> Result<hyper::Response<BoxedBody>, RequestAborted> {
     // node's rules for the head, on the bytes hyper parsed (HTTP/1 only;
@@ -2288,7 +2305,7 @@ async fn dispatch_request(
         id,
         reserved: body_len,
         dispatched: false,
-        closed_to: notify_closed.then(|| queue.clone()),
+        closed_to: notify_closed.map(|watch| (queue.clone(), watch)),
     };
 
     let sent = queue
@@ -2520,7 +2537,10 @@ pub async fn https_serve(
                         // connection, however it ended.
                         if announced {
                             let _ = conn_queue
-                                .send(ServerEvent::ConnectionClosed { conn_id })
+                                .send(ServerEvent::ConnectionClosed {
+                                    conn_id,
+                                    reset: watch.peer_reset(),
+                                })
                                 .await;
                         }
                     });
@@ -2779,9 +2799,14 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
             conn.write_meta(&mut meta);
             super::OpOutcome::Json(meta.to_string())
         }
-        Some(ServerEvent::ConnectionClosed { conn_id }) => super::OpOutcome::Json(
-            serde_json::json!({ "event": "connectionClosed", "connectionId": conn_id }).to_string(),
-        ),
+        Some(ServerEvent::ConnectionClosed { conn_id, reset }) => {
+            let mut meta =
+                serde_json::json!({ "event": "connectionClosed", "connectionId": conn_id });
+            if let Some(reset) = reset {
+                meta["reset"] = reset.to_json();
+            }
+            super::OpOutcome::Json(meta.to_string())
+        }
         Some(ServerEvent::Drop { conn }) => {
             let mut meta = serde_json::json!({ "event": "drop" });
             conn.write_meta(&mut meta);
@@ -2800,9 +2825,13 @@ pub async fn http_accept(state: Arc<HttpState>, server_id: u64) -> super::OpOutc
             conn.write_meta(&mut meta);
             super::OpOutcome::Json(meta.to_string())
         }
-        Some(ServerEvent::Closed { request_id }) => super::OpOutcome::Json(
-            serde_json::json!({ "event": "closed", "requestId": request_id }).to_string(),
-        ),
+        Some(ServerEvent::Closed { request_id, reset }) => {
+            let mut meta = serde_json::json!({ "event": "closed", "requestId": request_id });
+            if let Some(reset) = reset {
+                meta["reset"] = reset.to_json();
+            }
+            super::OpOutcome::Json(meta.to_string())
+        }
         None => super::OpOutcome::Done,
     }
 }

@@ -2203,9 +2203,17 @@ no `'clientError'`. What differs: a malformed chunk's parser error has no `bytes
 body is answered `400` by the native server even when a `'clientError'` listener is there
 to answer it (Node leaves the answer to the listener).
 
-What still differs around a close: the socket never emits `'end'`, and a client that goes
-away or resets once the request body is all in closes it with `false`, where Node's says
-`true` after a reset (`ECONNRESET`). A client that goes away mid-body after the response has
+A client that resets the connection -- between keep-alive requests, with the response under
+way, or before the handler has answered -- is reported as Node reports it: the socket that
+reads it (an `https` connection's TLS socket) gets `read ECONNRESET` (with `errno` and
+`syscall`), the server's `'clientError'` hearing it first, then the socket's own `'error'`
+listeners, and it closes with `true`; the exchange it cut short is aborted from that
+`'close'` as above, and a write to its response then calls back with
+`ERR_STREAM_DESTROYED` (`conformance/cases/282-http-server-peer-reset.mjs`). Up to 0.17.1
+the socket closed with `false` and no error, `'clientError'` heard nothing, and the late
+write called back with no error.
+
+What still differs around a close: the socket never emits `'end'`. A client that goes away mid-body after the response has
 finished closes the connection with `false` and aborts the request (`'aborted'`, ECONNRESET
 `aborted`), where Node's socket reports `HPE_INVALID_EOF_STATE` and closes with `true` and
 the request emits nothing. A server request emits `'close'` only when it is destroyed or

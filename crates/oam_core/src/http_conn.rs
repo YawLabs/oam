@@ -329,6 +329,24 @@ pub struct ConnWatch {
     /// upgrade) waits for them, or they would be lost with hyper's buffer.
     unflushed: AtomicBool,
     flushed: Notify,
+    /// The peer reset the connection under a read: node's socket reports
+    /// it (`read ECONNRESET`, socketOnError) and closes with `true`.
+    peer_reset: Mutex<Option<PeerReset>>,
+}
+
+/// A read the peer reset, as node's socket reports it: `read <code>`, with
+/// the code and its errno (`crate::node_error_code` / `crate::node_errno`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerReset {
+    pub code: &'static str,
+    pub errno: Option<i32>,
+}
+
+impl PeerReset {
+    /// The fields JS builds the socket's error from.
+    pub fn to_json(self) -> serde_json::Value {
+        serde_json::json!({ "code": self.code, "errno": self.errno, "syscall": "read" })
+    }
 }
 
 impl ConnWatch {
@@ -366,6 +384,7 @@ impl ConnWatch {
             dispatch_notify: Notify::new(),
             unflushed: AtomicBool::new(false),
             flushed: Notify::new(),
+            peer_reset: Mutex::new(None),
         })
     }
 
@@ -403,6 +422,28 @@ impl ConnWatch {
     /// Bytes arrived. The first byte of a request starts its clock again
     /// (node's `on_message_begin` resets the start the accept set), and the
     /// first byte after a request was all in begins the next one.
+    /// A read failed. A reset is kept (the first one) for the connection's
+    /// close to report; hyper itself treats a reset between requests as the
+    /// connection ending, and says nothing of it.
+    pub fn note_read_error(&self, error: &io::Error) {
+        if error.kind() != io::ErrorKind::ConnectionReset {
+            return;
+        }
+        let code = crate::node_error_code(error);
+        let mut slot = self.peer_reset.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some(PeerReset {
+                code,
+                errno: crate::node_errno(code, error),
+            });
+        }
+    }
+
+    /// The reset a read saw on this connection, if any.
+    pub fn peer_reset(&self) -> Option<PeerReset> {
+        *self.peer_reset.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn note_read(&self, n: usize) {
         if n == 0 {
             return;
@@ -751,8 +792,10 @@ impl<S: AsyncRead + Unpin> AsyncRead for WatchedIo<S> {
     ) -> Poll<io::Result<()>> {
         let before = buf.filled().len();
         let polled = Pin::new(&mut self.inner).poll_read(cx, buf);
-        if let Poll::Ready(Ok(())) = &polled {
-            self.watch.note_read(buf.filled().len() - before);
+        match &polled {
+            Poll::Ready(Ok(())) => self.watch.note_read(buf.filled().len() - before),
+            Poll::Ready(Err(error)) => self.watch.note_read_error(error),
+            Poll::Pending => {}
         }
         polled
     }
