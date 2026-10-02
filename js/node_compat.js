@@ -32194,115 +32194,154 @@
       }
     }
 
-    class ServerHttp2Stream extends Duplex {
-      constructor(requestId, inHeaders) {
-        // The http2 layer manages this stream's close lifecycle; opt out of
-        // Duplex autoDestroy to keep the prior behavior.
-        super({ allowHalfOpen: true, autoDestroy: false });
-        this._requestId = requestId;
-        this._streamId = null;
-        this._ended = false;
-        this._responded = false;
-        this._chain = Promise.resolve();
-        this.sentHeaders = null;
-        this._inHeaders = inHeaders;
-        this.id = requestId;
-      }
-      respond(headers, options) {
-        if (this._responded) return;
-        this._responded = true;
-        var status = 200;
-        var outPairs = [];
-        if (headers) {
-          var keys = Object.keys(headers);
-          for (var i = 0; i < keys.length; i++) {
-            var k = keys[i];
-            if (k === ":status") {
-              status = Number(headers[k]);
-            } else if (k.charAt(0) !== ":") {
-              outPairs.push([k.toLowerCase(), String(headers[k])]);
-            }
+    // node's kSingleValueHeaders (lib/internal/http2/util.js).
+    const kSingleValueHeaders = new Set([
+      ":status", ":method", ":authority", ":scheme", ":path", ":protocol",
+      "access-control-allow-credentials", "access-control-max-age",
+      "access-control-request-method", "age", "authorization",
+      "content-encoding", "content-language", "content-length",
+      "content-location", "content-md5", "content-range", "content-type",
+      "date", "dnt", "etag", "expires", "from", "host", "if-match",
+      "if-modified-since", "if-none-match", "if-range", "if-unmodified-since",
+      "last-modified", "location", "max-forwards", "proxy-authorization",
+      "range", "referer", "retry-after", "tk", "upgrade-insecure-requests",
+      "user-agent", "x-content-type-options",
+    ]);
+    const kHttpToken = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
+    function pseudoHeaderError(name) {
+      return h2Error("ERR_HTTP2_INVALID_PSEUDOHEADER",
+        '"' + name + '" is an invalid pseudoheader or is used incorrectly', TypeError);
+    }
+
+    // node's buildNgHeaderString, the one path request headers, response
+    // headers and trailers all go out by: `list` is `[name, value]` entries
+    // (an object's keys in order, or a flat array's pairs); a name is
+    // lower-cased, an undefined value or an empty name skipped, an array one
+    // field per value (an empty one none, a one-element one a single
+    // field). It throws node's errors -- a repeated single-value field, a
+    // name that is no HTTP token, an HTTP/1 connection-specific field -- and
+    // hands each pseudo-header to `pseudo`, which throws for one this list
+    // may not carry; the pseudo-headers it may are not in the pairs (each
+    // caller sends those its own way).
+    function headerPairs(list, pseudo) {
+      var pairs = [];
+      var singles = null;
+      for (var i = 0; i < list.length; i++) {
+        var name = list[i][0];
+        var value = list[i][1];
+        if (value === undefined || name === "") continue;
+        name = String(name).toLowerCase();
+        var single = kSingleValueHeaders.has(name);
+        var isArray = Array.isArray(value);
+        if (isArray) {
+          if (value.length === 0) continue;
+          if (value.length === 1) {
+            value = String(value[0]);
+            isArray = false;
+          } else if (single) {
+            throw h2Error("ERR_HTTP2_HEADER_SINGLE_VALUE",
+              'Header field "' + name + '" must only have a single value', TypeError);
           }
-        }
-        this.sentHeaders = headers || {};
-        var endStream = options && options.endStream;
-        if (endStream) {
-          this._ended = true;
-          natives.httpRespond(
-            this._requestId,
-            status,
-            JSON.stringify(outPairs),
-            new Uint8Array(0),
-          );
-          var self = this;
-          queueMicrotask(function() { self.emit("finish"); self.push(null); });
         } else {
-          this._streamId = natives.httpRespondStream(
-            this._requestId,
-            status,
-            JSON.stringify(outPairs),
-          );
+          value = String(value);
         }
-      }
-      additionalHeaders() {}
-      // The compatibility Http2ServerResponse reads `headersSent` and both
-      // req and res call `setTimeout` (#200); the h2c stream has no timeout of
-      // its own.
-      get headersSent() { return this._responded; }
-      setTimeout(msecs, callback) {
-        if (typeof callback === "function") this.once("timeout", callback);
-        return this;
-      }
-      _write(chunk, encoding, callback) {
-        if (this._ended) { callback(); return; }
-        if (!this._responded) {
-          this.respond({ ":status": 200 });
-        }
-        var bytes;
-        if (typeof chunk === "string") {
-          bytes = globalThis.Buffer.from(chunk, encoding || "utf8");
-        } else {
-          bytes = chunk;
-        }
-        if (this._streamId === null) { callback(); return; }
-        var streamId = this._streamId;
-        this._chain = this._chain
-          .then(function() { return natives.httpBodyPush(streamId, bytes); })
-          .then(function() { callback(); }, function(err) { callback(err); });
-      }
-      _final(callback) {
-        if (this._ended) { callback(); return; }
-        this._ended = true;
-        if (!this._responded) {
-          this.respond({ ":status": 200 });
-        }
-        if (this._streamId !== null) {
-          var streamId = this._streamId;
-          var self = this;
-          this._chain = this._chain.then(function() {
-            natives.httpBodyEnd(streamId);
-            self.emit("finish");
-            callback();
-          });
-        } else {
-          callback();
-        }
-      }
-      _read() {
-        if (!this._bodyPushed) {
-          this._bodyPushed = true;
-          var body = natives.httpRequestBody(this._requestId);
-          if (body && body.length > 0) {
-            this.push(globalThis.Buffer.from(body.buffer, body.byteOffset, body.length));
+        if (single) {
+          if (singles === null) singles = new Set();
+          if (singles.has(name)) {
+            throw h2Error("ERR_HTTP2_HEADER_SINGLE_VALUE",
+              'Header field "' + name + '" must only have a single value', TypeError);
           }
-          this.push(null);
+          singles.add(name);
+        }
+        if (name.charAt(0) === ":") {
+          pseudo(name);
+          continue;
+        }
+        if (!kHttpToken.test(name)) {
+          throw h2Error("ERR_INVALID_HTTP_TOKEN", 'Header name must be a valid HTTP token ["' + name + '"]', TypeError);
+        }
+        if (illegalConnectionHeader(name, value)) {
+          throw h2Error("ERR_HTTP2_INVALID_CONNECTION_HEADERS",
+            'HTTP/1 Connection specific headers are forbidden: "' + name + '"', TypeError);
+        }
+        if (isArray) {
+          for (var v = 0; v < value.length; v++) pairs.push([name, String(value[v])]);
+        } else {
+          pairs.push([name, value]);
         }
       }
-      close(code, callback) {
-        if (typeof code === "function") { callback = code; code = 0; }
-        this.end();
-        if (callback) this.once("close", callback);
+      return pairs;
+    }
+    function objectEntries(object) {
+      var keys = Object.keys(object);
+      var list = new Array(keys.length);
+      for (var i = 0; i < keys.length; i++) list[i] = [keys[i], object[keys[i]]];
+      return list;
+    }
+
+    // node's toHeaderObject, over a flat [name, value, ...] list as it came
+    // off the wire: `:status` a number, `set-cookie` an array, a repeated
+    // single-value field its first value, a repeated `cookie` joined with
+    // '; ' and any other repeat with ', ', on a null-prototype object.
+    function toHeaderObject(raw) {
+      var obj = { __proto__: null };
+      for (var n = 0; n < raw.length; n += 2) {
+        var name = raw[n];
+        var value = raw[n + 1];
+        if (name === ":status") value |= 0;
+        var existing = obj[name];
+        if (existing === undefined) {
+          obj[name] = name === "set-cookie" ? [value] : value;
+        } else if (!kSingleValueHeaders.has(name)) {
+          if (name === "cookie") obj[name] = existing + "; " + value;
+          else if (name === "set-cookie") existing.push(value);
+          else obj[name] = existing + ", " + value;
+        }
       }
+      obj[kSensitiveHeaders] = [];
+      return obj;
+    }
+
+    // ---- trailers, the client's and the server's streams alike
+    // (lib/internal/http2/core.js, v22.22.2). A stream opened with
+    // `waitForTrailers` holds its end back once its data is all handed over
+    // and emits 'wantTrailers' (sending an empty section itself when nothing
+    // listens); sendTrailers() then ends it, with a trailing HEADERS frame
+    // for a section with fields and with no frame of its own for an empty
+    // one. A trailer section that arrives is the stream's 'trailers' event
+    // -- (headers, flags, rawHeaders), flags END_STREAM | END_HEADERS -- just
+    // before its readable side ends.
+    function onStreamTrailers(stream) {
+      stream._trailersReady = true;
+      if (stream.destroyed || stream.closed) return;
+      if (!stream.emit("wantTrailers")) stream.sendTrailers({});
+    }
+    // sendTrailers()'s checks, in node's order, and the pairs to send; the
+    // section is the stream's sentTrailers from then on.
+    function prepareTrailers(stream, headers) {
+      if (stream.destroyed || stream.closed) {
+        throw h2Error("ERR_HTTP2_INVALID_STREAM", "The stream has been destroyed");
+      }
+      if (stream._sentTrailers !== undefined) {
+        throw h2Error("ERR_HTTP2_TRAILERS_ALREADY_SENT", "Trailing headers have already been sent");
+      }
+      if (!stream._trailersReady) {
+        throw h2Error("ERR_HTTP2_TRAILERS_NOT_READY",
+          "Trailing headers cannot be sent until after the wantTrailers event is emitted");
+      }
+      assertIsObject(headers, "headers");
+      headers = Object.assign({ __proto__: null }, headers);
+      var pairs = headerPairs(objectEntries(headers), function (name) { throw pseudoHeaderError(name); });
+      stream._sentTrailers = headers;
+      return pairs;
+    }
+    function emitTrailers(stream, pairs) {
+      var raw = [];
+      for (var i = 0; i < pairs.length; i++) raw.push(pairs[i][0], pairs[i][1]);
+      var headers = toHeaderObject(raw);
+      // Out of the read's promise job, as node emits it: a throwing
+      // listener is an uncaught exception.
+      process.nextTick(function () { stream.emit("trailers", headers, 5, raw); });
     }
 
     class Http2Server extends EventEmitter {
@@ -32343,29 +32382,28 @@
             self._family = bound.family;
             self.listening = true;
             self.emit("listening");
+            var streams = new Map();
             (async function() {
               for (;;) {
                 var meta = await natives.httpAccept(bound.serverId);
                 if (meta === undefined) break;
-                // Requests only: the native side reports no connection events
-                // for this server, and one that ever arrived -- the queue now
-                // runs until the server's last connection has closed -- is
-                // not a stream to serve.
+                // An exchange that ended before it was answered.
+                if (meta.event === "closed") {
+                  var aborted = streams.get(meta.requestId);
+                  if (aborted) aborted._onAborted();
+                  continue;
+                }
+                // Requests only otherwise: the native side reports no
+                // connection events for this server, and one that ever
+                // arrived -- the queue now runs until the server's last
+                // connection has closed -- is not a stream to serve.
                 if (meta.event !== undefined) continue;
-                var hdrs = {};
-                for (var i = 0; i < meta.headers.length; i++) {
-                  var key = meta.headers[i][0].toLowerCase();
-                  hdrs[key] = meta.headers[i][1];
-                }
-                hdrs[":method"] = meta.method;
-                hdrs[":path"] = meta.uri;
-                hdrs[":scheme"] = "http";
-                var rawHeaders = [];
-                for (var r = 0; r < meta.headers.length; r++) {
-                  rawHeaders.push(meta.headers[r][0], meta.headers[r][1]);
-                }
-                var stream = new ServerHttp2Stream(meta.requestId, hdrs);
-                self.emit("stream", stream, hdrs, 0, rawHeaders);
+                // The secure server's stream, the one implementation of
+                // node's ServerHttp2Stream. There is no session object here
+                // (stream.session is undefined), and the stream id is the
+                // request's: the queue does not say which connection a
+                // request came over.
+                secureServer.emitServerStream(self, undefined, streams, meta, meta.requestId);
               }
               self.emit("close");
             })();
@@ -32395,7 +32433,8 @@
     }
 
     // --------------------------------------------- http2.createSecureServer
-    // (Its own scope: the h2c server above has classes of the same names.)
+    // (Its own scope; the h2c server above serves its requests through this
+    // scope's ServerHttp2Stream, by emitServerStream.)
     const secureServer = (() => {
       // Node's Http2SecureServer (lib/internal/http2/core.js), measured on
       // v22.22.2: a tls.Server that offers `h2` by ALPN (and `http/1.1` too
@@ -32431,12 +32470,7 @@
         statusInvalid: (code) => h2Error("ERR_HTTP2_STATUS_INVALID", "Invalid status code: " + code, RangeError),
         infoStatusNotAllowed: () => h2Error("ERR_HTTP2_INFO_STATUS_NOT_ALLOWED",
           "Informational status codes cannot be used", RangeError),
-        connectionHeaders: (name) => h2Error("ERR_HTTP2_INVALID_CONNECTION_HEADERS",
-          'HTTP/1 Connection specific headers are forbidden: "' + name + '"', TypeError),
-        pseudoHeader: (name) => h2Error("ERR_HTTP2_INVALID_PSEUDOHEADER",
-          '"' + name + '" is an invalid pseudoheader or is used incorrectly', TypeError),
-        singleValue: (name) => h2Error("ERR_HTTP2_HEADER_SINGLE_VALUE",
-          'Header field "' + name + '" must only have a single value', TypeError),
+        pseudoHeader: pseudoHeaderError,
         pseudoNotAllowed: () => h2Error("ERR_HTTP2_PSEUDOHEADER_NOT_ALLOWED",
           "Cannot set HTTP/2 pseudo-headers", TypeError),
         headerValue: (value, name) => h2Error("ERR_HTTP2_INVALID_HEADER_VALUE",
@@ -32445,21 +32479,6 @@
           'Header name must be a valid HTTP token ["' + name + '"]', TypeError),
       };
 
-      // node's kSingleValueHeaders (lib/internal/http2/util.js).
-      const kSingleValueHeaders = new Set([
-        ":status", ":method", ":authority", ":scheme", ":path", ":protocol",
-        "access-control-allow-credentials", "access-control-max-age",
-        "access-control-request-method", "age", "authorization",
-        "content-encoding", "content-language", "content-length",
-        "content-location", "content-md5", "content-range", "content-type",
-        "date", "dnt", "etag", "expires", "from", "host", "if-match",
-        "if-modified-since", "if-none-match", "if-range", "if-unmodified-since",
-        "last-modified", "location", "max-forwards", "proxy-authorization",
-        "range", "referer", "retry-after", "tk", "upgrade-insecure-requests",
-        "user-agent", "x-content-type-options",
-      ]);
-      const kHttpToken = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
-      // node's isIllegalConnectionSpecificHeader.
       function utcDate() {
         return new Date().toUTCString();
       }
@@ -32498,43 +32517,15 @@
           list.push(["date", utcDate()]);
         }
         if (status < 200 || status > 599) throw h2Errors.statusInvalid(status);
-        var pairs = [];
-        var singles = new Set();
-        for (var m = 0; m < list.length; m++) {
-          var name = String(list[m][0]).toLowerCase();
-          var value = list[m][1];
-          if (value === undefined || name === "") continue;
-          var isArray = Array.isArray(value);
-          if (isArray) {
-            if (value.length === 0) continue;
-            if (value.length === 1) { value = String(value[0]); isArray = false; }
-            else if (kSingleValueHeaders.has(name)) throw h2Errors.singleValue(name);
-          } else {
-            value = String(value);
-          }
-          if (kSingleValueHeaders.has(name)) {
-            if (singles.has(name)) throw h2Errors.singleValue(name);
-            singles.add(name);
-          }
-          if (name.charAt(0) === ":") {
-            if (name !== ":status") throw h2Errors.pseudoHeader(name);
-            continue;
-          }
-          if (!kHttpToken.test(name)) throw h2Errors.httpToken(name);
-          if (illegalConnectionHeader(name, value)) throw h2Errors.connectionHeaders(name);
-          if (isArray) {
-            for (var v = 0; v < value.length; v++) pairs.push([name, String(value[v])]);
-          } else {
-            pairs.push([name, value]);
-          }
-        }
+        var pairs = headerPairs(list, function (name) {
+          if (name !== ":status") throw pseudoHeaderError(name);
+        });
         return { pairs: pairs, status: status, sent: sent };
       }
 
-      // node's toHeaderObject over a native request: the pseudo-headers, then
-      // the fields -- set-cookie as an array, cookie joined with '; ', a
-      // repeated single-value field keeping the first, any other joined with
-      // ', ' -- on a null-prototype object; and the flat rawHeaders.
+      // A native request's headers as node's server hands them over: the
+      // flat rawHeaders, pseudo-headers first, and node's toHeaderObject of
+      // them.
       function requestHeaders(meta) {
         var raw = [":method", meta.method];
         var fields = [];
@@ -32550,20 +32541,7 @@
         if (scheme !== undefined) raw.push(":scheme", scheme);
         raw.push(":path", meta.uri);
         for (var f = 0; f < fields.length; f++) raw.push(fields[f][0], fields[f][1]);
-        var obj = { __proto__: null };
-        for (var n = 0; n < raw.length; n += 2) {
-          var key = raw[n], val = raw[n + 1];
-          var existing = obj[key];
-          if (existing === undefined) {
-            obj[key] = key === "set-cookie" ? [val] : val;
-          } else if (!kSingleValueHeaders.has(key)) {
-            if (key === "cookie") obj[key] = existing + "; " + val;
-            else if (key === "set-cookie") existing.push(val);
-            else obj[key] = existing + ", " + val;
-          }
-        }
-        obj[kSensitiveHeaders] = [];
-        return { headers: obj, rawHeaders: raw };
+        return { headers: toHeaderObject(raw), rawHeaders: raw };
       }
 
       // node's proxySocketHandler: session.socket, the TLS socket behind a
@@ -32710,6 +32688,11 @@
           this._reading = false;
           this._closed = false;
           this._sentHeaders = undefined;
+          // respond()'s waitForTrailers, the 'wantTrailers' moment, and the
+          // section sendTrailers() sent.
+          this._hasTrailers = false;
+          this._trailersReady = false;
+          this._sentTrailers = undefined;
           this._idleTimer = null;
           this._idleMs = 0;
           this.rstCode = undefined;
@@ -32724,7 +32707,7 @@
         get headersSent() { return this._responded; }
         get sentHeaders() { return this._sentHeaders; }
         get sentInfoHeaders() { return undefined; }
-        get sentTrailers() { return undefined; }
+        get sentTrailers() { return this._sentTrailers; }
         get closed() { return this._closed; }
         get pending() { return false; }
         get bufferSize() { return this.writableLength; }
@@ -32770,6 +32753,7 @@
             return;
           }
           this._responseStream = responseStream;
+          this._hasTrailers = !!options.waitForTrailers;
           natives.httpStreamClosed(responseStream).then(() => {
             // hyper let go of the response body: it was finished, or the
             // client went away mid-response.
@@ -32816,11 +32800,21 @@
           }
           var responseStream = this._responseStream;
           this._chain = this._chain.then(() => {
-            this._responseEnded = true;
-            natives.httpBodyEnd(responseStream);
+            if (this._hasTrailers) {
+              // The data is all handed over: 'finish', then 'wantTrailers';
+              // the response's end waits for the trailers.
+              callback();
+              process.nextTick(onStreamTrailers, this);
+              return;
+            }
+            this._endResponse(responseStream);
             callback();
-            this._maybeClose();
           });
+        }
+        _endResponse(responseStream) {
+          this._responseEnded = true;
+          natives.httpBodyEnd(responseStream);
+          this._maybeClose();
         }
         _read() {
           if (this._bodyDone || this._reading) return;
@@ -32828,7 +32822,12 @@
           natives.httpRequestBodyRead(this._requestId).then(
             (chunk) => {
               this._reading = false;
-              if (chunk && Array.isArray(chunk.trailers)) chunk = undefined;
+              if (chunk && Array.isArray(chunk.trailers)) {
+                this._bodyDone = true;
+                emitTrailers(this, chunk.trailers);
+                this.push(null);
+                return;
+              }
               if (chunk === undefined || chunk === null || chunk.length === 0) {
                 this._bodyDone = true;
                 this.push(null);
@@ -32911,9 +32910,16 @@
           armIdleTimer(this, msecs, callback);
           return this;
         }
-        sendTrailers() {
-          throw h2Error("ERR_HTTP2_TRAILERS_NOT_READY",
-            "Trailing headers cannot be sent until after the wantTrailers event is emitted", Error);
+        sendTrailers(headers) {
+          var pairs = prepareTrailers(this, headers);
+          touchIdleTimer(this);
+          var responseStream = this._responseStream;
+          var chain = this._chain;
+          if (pairs.length > 0) {
+            chain = chain.then(function() { return natives.httpBodyTrailers(responseStream, JSON.stringify(pairs)); });
+          }
+          // A client gone meanwhile: the response is over either way.
+          this._chain = chain.then(() => this._endResponse(responseStream), () => this._onAborted());
         }
       }
 
@@ -32935,11 +32941,26 @@
           request.emit("aborted");
         }
       }
+      // The request's trailer section, as it arrives (node's
+      // onStreamTrailers in compat.js).
+      function onStreamTrailersRequest(trailers, flags, rawTrailers) {
+        var request = this[kRequest];
+        if (request !== undefined) {
+          Object.assign(request[kTrailers], trailers);
+          request._rawTrailers.push.apply(request._rawTrailers, rawTrailers);
+        }
+      }
+      // The response's data is all out: its trailers (res.setTrailer /
+      // addTrailers) end it (node's onStreamTrailersReady).
+      function onStreamTrailersReady() {
+        this.sendTrailers(this[kResponse][kTrailers]);
+      }
       function onStreamCloseResponse() {
         var res = this[kResponse];
         if (res === undefined) return;
         res[kState].closed = true;
         this[kProxySocket] = null;
+        this.removeListener("wantTrailers", onStreamTrailersReady);
         this[kResponse] = undefined;
         res.emit("finish");
         res.emit("close");
@@ -32962,6 +32983,7 @@
             if (request !== undefined) request.push(null);
           });
           stream.on("error", function() {});
+          stream.on("trailers", onStreamTrailersRequest);
           stream.on("aborted", onStreamAbortedRequest);
           stream.on("close", onStreamCloseRequest);
           stream.on("timeout", function() {
@@ -33073,6 +33095,7 @@
             if (response !== undefined) response.emit("drain");
           });
           stream.on("close", onStreamCloseResponse);
+          stream.on("wantTrailers", onStreamTrailersReady);
           stream.on("timeout", function() {
             var response = this[kResponse];
             if (response !== undefined) response.emit("timeout");
@@ -33273,7 +33296,7 @@
           var state = this[kState];
           var headers = this[kHeaders];
           headers[":status"] = state.statusCode;
-          this[kStream].respond(headers, { endStream: state.ending, sendDate: state.sendDate });
+          this[kStream].respond(headers, { endStream: state.ending, waitForTrailers: true, sendDate: state.sendDate });
         }
         writeContinue() {
           return false;
@@ -33353,6 +33376,25 @@
       }
 
       // node's server-side Http2Session.
+      // A request off a native accept queue, as node's server hands it
+      // over: its stream (in `streams` by request id while it is open), then
+      // `emitter`'s 'stream' (stream, headers, flags, rawHeaders). The secure
+      // server's sessions and the cleartext server both come through here.
+      function emitServerStream(emitter, session, streams, meta, id) {
+        var parsed = requestHeaders(meta);
+        var stream = new ServerHttp2Stream(session, meta, id, parsed.headers);
+        streams.set(meta.requestId, stream);
+        stream.once("close", () => streams.delete(meta.requestId));
+        var flags = STREAM_FLAGS_END_HEADERS | (stream.endAfterHeaders ? STREAM_FLAGS_END_STREAM : 0);
+        if (stream.endAfterHeaders) {
+          // No body: the readable side is over before it starts.
+          stream._bodyDone = true;
+          natives.httpRequestBodyCancel(meta.requestId);
+          stream.push(null);
+        }
+        emitter.emit("stream", stream, parsed.headers, flags, parsed.rawHeaders);
+      }
+
       class ServerHttp2Session extends EventEmitter {
         constructor(options, socket, server) {
           super();
@@ -33431,19 +33473,8 @@
         _onStream(meta) {
           var id = this._nextStreamId;
           this._nextStreamId += 2;
-          var parsed = requestHeaders(meta);
-          var stream = new ServerHttp2Stream(this, meta, id, parsed.headers);
-          this._streams.set(meta.requestId, stream);
-          stream.once("close", () => this._streams.delete(meta.requestId));
           touchIdleTimer(this);
-          var flags = STREAM_FLAGS_END_HEADERS | (stream.endAfterHeaders ? STREAM_FLAGS_END_STREAM : 0);
-          if (stream.endAfterHeaders) {
-            // No body: the readable side is over before it starts.
-            stream._bodyDone = true;
-            natives.httpRequestBodyCancel(meta.requestId);
-            stream.push(null);
-          }
-          this.emit("stream", stream, parsed.headers, flags, parsed.rawHeaders);
+          emitServerStream(this, this, this._streams, meta, id);
         }
         _onConnectionEnd() {
           this._closed = true;
@@ -33644,7 +33675,7 @@
         return new Http2SecureServer(options, handler);
       }
 
-      return { createSecureServer, Http2ServerRequest, Http2ServerResponse, installCompat };
+      return { createSecureServer, Http2ServerRequest, Http2ServerResponse, installCompat, emitServerStream };
     })();
     const { createSecureServer, Http2ServerRequest, Http2ServerResponse } = secureServer;
 
@@ -33718,34 +33749,10 @@
       }
     }
 
-    // node's toHeaderObject: `:status` a number, `set-cookie` an array, a
-    // repeated `cookie` joined with '; ', any other repeat with ', '.
-    function toHeaderObject(status, pairs) {
-      var obj = { __proto__: null };
-      obj[":status"] = status;
-      for (var i = 0; i < pairs.length; i++) {
-        var name = pairs[i][0];
-        var value = pairs[i][1];
-        var existing = obj[name];
-        if (existing === undefined) {
-          obj[name] = name === "set-cookie" ? [value] : value;
-        } else if (name === "cookie") {
-          obj[name] = existing + "; " + value;
-        } else if (name === "set-cookie") {
-          existing.push(value);
-        } else {
-          obj[name] = existing + ", " + value;
-        }
-      }
-      obj[kSensitiveHeaders] = [];
-      return obj;
-    }
-
-    // node's prepareRequestHeadersObject + mapToHeaders for the request
-    // headers: the pseudo-headers the session fills in, the header lines
-    // (names lowercased, arrays one line per value, undefined values
-    // skipped), and node's refusals (an unknown pseudo-header, a name with a
-    // space, an HTTP/1 connection-specific header).
+    // node's prepareRequestHeadersObject: the pseudo-headers the session
+    // fills in, and the header lines buildNgHeaderString makes of the rest
+    // (headerPairs, with node's refusals; any known pseudo-header may be
+    // given).
     function prepareRequestHeaders(headersParam, session) {
       var headers = Object.assign({ __proto__: null }, headersParam);
       if (headers[":method"] === undefined) headers[":method"] = "GET";
@@ -33754,31 +33761,9 @@
       }
       if (headers[":scheme"] === undefined) headers[":scheme"] = session._protocol.slice(0, -1);
       if (headers[":path"] === undefined) headers[":path"] = "/";
-      var list = [];
-      var keys = Object.keys(headers);
-      for (var i = 0; i < keys.length; i++) {
-        var key = keys[i];
-        var value = headers[key];
-        if (value === undefined || key === "") continue;
-        key = key.toLowerCase();
-        if (key[0] === ":") {
-          if (!VALID_PSEUDO_HEADERS.has(key)) {
-            throw h2Error("ERR_HTTP2_INVALID_PSEUDOHEADER", '"' + key + '" is an invalid pseudoheader or is used incorrectly', TypeError);
-          }
-          continue;
-        }
-        if (key.indexOf(" ") !== -1) {
-          throw h2Error("ERR_INVALID_HTTP_TOKEN", 'Header name must be a valid HTTP token ["' + key + '"]', TypeError);
-        }
-        var values = Array.isArray(value) ? value : [value];
-        for (var j = 0; j < values.length; j++) {
-          var text = String(values[j]);
-          if (illegalConnectionHeader(key, text)) {
-            throw h2Error("ERR_HTTP2_INVALID_CONNECTION_HEADERS", 'HTTP/1 Connection specific headers are forbidden: "' + key + '"', TypeError);
-          }
-          list.push([key, text]);
-        }
-      }
+      var list = headerPairs(objectEntries(headers), function (name) {
+        if (!VALID_PSEUDO_HEADERS.has(name)) throw pseudoHeaderError(name);
+      });
       return {
         headers: headers,
         list: list,
@@ -33807,6 +33792,18 @@
         // none.
         this._bodyStream = options.endStream ? null : natives.fetchBodyChannelNew();
         this._channelTail = Promise.resolve();
+        // Set once the channel's end is queued: until then a destroy cancels
+        // the request body.
+        this._channelEnded = false;
+        // waitForTrailers: the body's end waits for sendTrailers(). 'finish'
+        // does not (node emits it once the data is out), so until then the
+        // stream is not destroyed for being done both ways, which would
+        // cancel the body the trailers end (node's stream stays open until
+        // they are sent).
+        this._hasTrailers = !!options.waitForTrailers && this._bodyStream !== null;
+        this._trailersReady = false;
+        this._sentTrailers = undefined;
+        if (this._hasTrailers) this._writableState.autoDestroy = false;
         this._bodyHandle = null;
         this._readWanted = false;
         this._reading = false;
@@ -33818,6 +33815,7 @@
       get closed() { return this._closed; }
       get aborted() { return this._aborted; }
       get session() { return this._session; }
+      get sentTrailers() { return this._sentTrailers; }
       setTimeout() { return this; }
       priority() {}
 
@@ -33875,7 +33873,7 @@
         }
         var rawHeaders = [":status", String(raw.status)];
         for (var i = 0; i < raw.headers.length; i++) rawHeaders.push(raw.headers[i][0], raw.headers[i][1]);
-        var headers = toHeaderObject(raw.status, raw.headers);
+        var headers = toHeaderObject(rawHeaders);
         this._bodyHandle = raw.bodyHandle;
         // nghttp2's flags: END_HEADERS, plus END_STREAM for a response with
         // no body.
@@ -33895,6 +33893,10 @@
           if (chunk === undefined) {
             self._bodyHandle = null;
             self._readEnded = true;
+            // The response's trailer section, if it had one: 'trailers'
+            // before 'end'.
+            var trailers = globalThis.__oam.fetchBodyTrailers(handle);
+            if (trailers !== undefined) emitTrailers(self, JSON.parse(trailers));
             self.push(null);
             return;
           }
@@ -33932,11 +33934,42 @@
           callback();
           return;
         }
+        var self = this;
+        if (this._hasTrailers) {
+          // The data is all handed over: 'finish', then 'wantTrailers'.
+          this._channelTail.then(function () {
+            callback();
+            process.nextTick(onStreamTrailers, self);
+          });
+          return;
+        }
+        this._endChannel();
+        this._channelTail.then(function () { callback(); });
+      }
+
+      _endChannel() {
         var stream = this._bodyStream;
+        this._channelEnded = true;
         this._channelTail = this._channelTail.then(function () {
           natives.fetchBodyChannelEnd(stream);
         });
-        this._channelTail.then(function () { callback(); });
+      }
+
+      sendTrailers(headers) {
+        var pairs = prepareTrailers(this, headers);
+        if (pairs.length > 0) {
+          var stream = this._bodyStream;
+          var json = JSON.stringify(pairs);
+          // A request that no longer takes its body has ended or failed: the
+          // stream hears of that from the response, as for any write.
+          this._channelTail = this._channelTail.then(function () {
+            return natives.fetchBodyChannelTrailers(stream, json);
+          }).then(function () {}, function () {});
+        }
+        this._endChannel();
+        // Done both ways now, the stream goes as any other does.
+        this._writableState.autoDestroy = true;
+        if (this._readableState.endEmitted && this._writableState.finished) this.destroy();
       }
 
       close(code, callback) {
@@ -34004,7 +34037,7 @@
           bodyCancel(this._bodyHandle);
           this._bodyHandle = null;
         }
-        if (this._bodyStream !== null && !this._writableState.finished) {
+        if (this._bodyStream !== null && (!this._channelEnded || !this._writableState.finished)) {
           try { natives.fetchBodyChannelCancel(this._bodyStream); } catch (_) { /* gone */ }
         }
         if (session) {

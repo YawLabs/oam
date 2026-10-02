@@ -306,7 +306,8 @@ pub async fn request(
     let body = response.into_body();
     let end_stream = hyper::body::Body::is_end_stream(&body);
     let handle = ids.fetch_add(1, Ordering::Relaxed);
-    lock(&bodies).insert(handle, FetchBody::coded(body));
+    // Its trailer section is kept for JS: the stream's 'trailers' event.
+    lock(&bodies).insert(handle, FetchBody::coded(body).keeping_trailers(true));
     OpOutcome::Json(
         serde_json::json!({
             "status": status.as_u16(),

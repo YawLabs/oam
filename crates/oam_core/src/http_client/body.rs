@@ -589,7 +589,7 @@ impl StreamSlot {
 
     /// Take the receiver (once). `None` if the channel is unknown or was
     /// already taken.
-    pub(crate) fn take(&mut self) -> Option<tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>> {
+    pub(crate) fn take(&mut self) -> Option<tokio::sync::mpsc::Receiver<crate::OutboundItem>> {
         if self.state != SlotState::Untaken {
             return None;
         }

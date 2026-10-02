@@ -407,12 +407,29 @@ pub type OutboundBodies = std::sync::Arc<
         HashMap<
             u64,
             (
-                Option<tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>>,
-                Option<tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>>,
+                Option<tokio::sync::mpsc::Sender<OutboundItem>>,
+                Option<tokio::sync::mpsc::Receiver<OutboundItem>>,
             ),
         >,
     >,
 >;
+/// One item down an outbound request-body channel: a frame of the body --
+/// the bytes JS wrote, or the trailer section an http2 client stream's
+/// `sendTrailers()` ends it with -- or an `Err` that aborts the request
+/// (`fetchBodyChannelCancel`).
+pub type OutboundItem = Result<hyper::body::Frame<bytes::Bytes>, String>;
+
+/// The [`OutboundItem`] for bytes JS wrote (no copy: the bytes move).
+pub fn outbound_data(bytes: Vec<u8>) -> OutboundItem {
+    Ok(hyper::body::Frame::data(bytes::Bytes::from(bytes)))
+}
+
+/// The [`OutboundItem`] for a trailer section JS hands over as `[name, value]`
+/// pairs (each value one byte per code point, as node's nghttp2 sends it);
+/// `None` when a name or a value cannot go out as a field.
+pub fn outbound_trailers(pairs: &[(String, String)]) -> Option<OutboundItem> {
+    http_server::trailer_fields(pairs).map(|map| Ok(hyper::body::Frame::trailers(map)))
+}
 /// Wakes an in-flight `fetch_body_read`. The tombstone set above is
 /// checked only AFTER `chunk()` resolves, so a server that simply stops
 /// sending leaves the read parked forever and pins the event loop. This
@@ -1184,7 +1201,7 @@ impl CoreRuntime {
         let handle = self
             .next_body
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, String>>(8);
+        let (tx, rx) = tokio::sync::mpsc::channel::<OutboundItem>(8);
         self.outbound_bodies
             .lock()
             .unwrap_or_else(|e| e.into_inner())

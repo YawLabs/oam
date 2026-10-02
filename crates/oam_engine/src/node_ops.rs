@@ -323,6 +323,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fetchBodyChannelNew", op_fetch_body_channel_new),
         ("fetchBodyChannelWrite", op_fetch_body_channel_write),
         ("fetchBodyChannelEnd", op_fetch_body_channel_end),
+        ("fetchBodyChannelTrailers", op_fetch_body_channel_trailers),
         ("fetchBodyChannelCancel", op_fetch_body_channel_cancel),
         ("fetchSentOpen", op_fetch_sent_open),
         ("fetchSentWait", op_fetch_sent_wait),
@@ -3423,10 +3424,44 @@ fn op_fetch_body_channel_write(
         let Some(tx) = tx else {
             return oam_core::OpOutcome::Failed(format!("unknown body stream {handle}"));
         };
-        match tx.send(Ok(bytes)).await {
+        match tx.send(oam_core::outbound_data(bytes)).await {
             Ok(()) => oam_core::OpOutcome::Done,
             // Receiver gone: the request finished or failed. Not an error to
             // the writer -- the transport already reported it.
+            Err(_) => oam_core::OpOutcome::Json("false".to_string()),
+        }
+    });
+}
+
+/// `fetchBodyChannelTrailers(handle, pairsJson)`: the body's trailer section
+/// (`[[name, value], ...]`), queued behind the chunks already written -- an
+/// http2 client stream's `sendTrailers()`, followed by `fetchBodyChannelEnd`.
+/// Resolves like a write: `false` when the request no longer takes its body;
+/// rejects for a field that cannot go out (JS checked the names already).
+fn op_fetch_body_channel_trailers(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
+    let pairs = arg_string(scope, &args, 1)
+        .map(|json| parse_headers_json(&json))
+        .unwrap_or_default();
+    let outbound = core_runtime!(scope).outbound_bodies();
+    crate::ops::spawn_op(scope, &mut rv, async move {
+        let Some(item) = oam_core::outbound_trailers(&pairs) else {
+            return oam_core::OpOutcome::Failed("invalid trailer field".to_string());
+        };
+        let tx = outbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&handle)
+            .and_then(|slot| slot.0.clone());
+        let Some(tx) = tx else {
+            return oam_core::OpOutcome::Failed(format!("unknown body stream {handle}"));
+        };
+        match tx.send(item).await {
+            Ok(()) => oam_core::OpOutcome::Done,
             Err(_) => oam_core::OpOutcome::Json("false".to_string()),
         }
     });

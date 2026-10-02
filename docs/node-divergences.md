@@ -2619,14 +2619,33 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
   holds the connection until its keep-alive timeout or `closeIdleConnections()`; and
   requests pipelined behind that one on the same connection are not read, where Node
   answers them. This is the same on an `http` server.
-- **HTTP/2 sessions have no push, 1xx, trailers or settings.** `stream.pushAllowed` is
+- **HTTP/2 sessions have no push, 1xx or settings.** `stream.pushAllowed` is
   `false` and `pushStream()` throws `ERR_HTTP2_PUSH_DISABLED`; `additionalHeaders()` sends
-  nothing and `writeContinue()` / `writeEarlyHints()` return `false`; response trailers
-  (`waitForTrailers`, `addTrailers`) are not sent; `respondWithFD()` / `respondWithFile()`,
+  nothing and `writeContinue()` / `writeEarlyHints()` return `false`; `respondWithFD()` / `respondWithFile()`,
   `session.ping()`, `settings()`, `goaway()`, `altsvc()` and `origin()` are absent, and
   `localSettings` / `remoteSettings` are `undefined`. `server.updateSettings()` is stored
   and not applied (the session runs hyper's defaults). `session.ref()` / `unref()` do
   nothing. `'sessionError'`, `'frameError'` and `'goaway'` are not emitted on the server.
+- **Trailers are Node's, both ways, on this server and on `http2.createServer`'s.**
+  `respond(headers, { waitForTrailers: true })`, `'wantTrailers'`, `sendTrailers()` (Node's
+  checks and errors) and `sentTrailers`, the compatibility API's `setTrailer()` /
+  `addTrailers()`, a request's trailer section as the stream's `'trailers'` and as
+  `req.trailers` / `req.rawTrailers` (conformance cases 304 and 305). What differs: no
+  received field is ever listed in `[http2.sensitiveHeaders]` -- of a stream's headers or
+  of its trailers. nghttp2 sends a `cookie` field shorter than 20 bytes as never-indexed and
+  Node lists the fields it receives that way; oam reports no received field as
+  sensitive, so the list is always `[]`.
+- **A response stream that ends without trailers emits `'finish'`.** Node's
+  `stream.end(data)` (or a write and then `end()`) on a stream responded to without
+  `waitForTrailers` sends END_STREAM on the last DATA frame, and the stream closes before
+  its `'finish'` comes -- it never does; oam's emits `'finish'`, then `'close'`. Node's
+  stream also ends its response there even when a later write errors the stream
+  (`ERR_STREAM_WRITE_AFTER_END`, as when a `'stream'` listener and a `'request'` listener
+  both answer); oam's response is then never ended, and the client's stream waits.
+- **The cleartext server's streams have no session.** `http2.createServer`'s requests
+  come from oam's own HTTP/2 listener, not a socket per session: there is no `'session'`
+  event, `stream.session` is `undefined`, and a stream's `id` is the server's request
+  number, not the connection's stream id. Its streams are otherwise the secure server's.
 - **Wire details.** Stream ids are numbered in arrival order (1, 3, 5, ...); a stream's
   `rawHeaders` lists the pseudo-headers as `:method`, `:authority`, `:scheme`, `:path`,
   not in the order the client sent them; `stream.close(code)` after `respond()` ends the
@@ -2875,8 +2894,11 @@ oam's shared client. What differs:
   and `type` behave as Node's; `ping()` answers at once without sending a PING frame and
   `setTimeout()` does nothing. `settings()`, `goaway()`, `setLocalWindowSize()`, `state`,
   `localSettings`, `remoteSettings` and `pendingSettingsAck` are absent, and so are a
-  stream's `sendTrailers()`, `sentTrailers`, `sentInfoHeaders`, `state`, `bufferSize` and
-  `endAfterHeaders`. hyper chooses the SETTINGS and window sizes.
+  stream's `sentInfoHeaders`, `state`, `bufferSize` and `endAfterHeaders`. hyper chooses the
+  SETTINGS and window sizes. Trailers are Node's both ways: `waitForTrailers`,
+  `'wantTrailers'`, `sendTrailers()` and `sentTrailers`, and the response's trailer section
+  as `'trailers'` (headers, flags, rawHeaders) before `'end'` (cases 304 and 305; their one
+  difference, `[http2.sensitiveHeaders]`, is in entry 42).
 - **A plain `Duplex` from `createConnection` is used as it is.** Node wraps a stream that is
   not a socket in its `JSStreamSocket` and hands that wrapper to `'connect'`; oam runs the
   session over the stream itself and hands it on.

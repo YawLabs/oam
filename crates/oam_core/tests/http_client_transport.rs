@@ -610,8 +610,12 @@ async fn request_body_shapes_match_today() {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         let streamed = request("POST", &target, channel_body(rx));
         let writer = tokio::spawn(async move {
-            tx.send(Ok(b"ab".to_vec())).await.unwrap();
-            tx.send(Ok(b"cde".to_vec())).await.unwrap();
+            tx.send(oam_core::outbound_data(b"ab".to_vec()))
+                .await
+                .unwrap();
+            tx.send(oam_core::outbound_data(b"cde".to_vec()))
+                .await
+                .unwrap();
         });
         body_text(send(&transport, &route, streamed).await.unwrap()).await;
         writer.await.unwrap();

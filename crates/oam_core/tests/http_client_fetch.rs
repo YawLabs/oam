@@ -123,10 +123,7 @@ impl Reg {
     }
 
     /// A streamed-body channel, as `fetchBodyChannelNew` makes one.
-    fn channel(
-        &self,
-        capacity: usize,
-    ) -> (u64, tokio::sync::mpsc::Sender<Result<Vec<u8>, String>>) {
+    fn channel(&self, capacity: usize) -> (u64, tokio::sync::mpsc::Sender<oam_core::OutboundItem>) {
         let handle = self.ids.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         self.outbound
@@ -1325,7 +1322,9 @@ async fn streamed_body_redirects() {
             let (handle, tx) = reg.channel(8);
             let outbound = reg.outbound.clone();
             let writer = tokio::spawn(async move {
-                tx.send(Ok(b"abc".to_vec())).await.unwrap();
+                tx.send(oam_core::outbound_data(b"abc".to_vec()))
+                    .await
+                    .unwrap();
                 drop(tx);
                 body::end_outbound(&outbound, handle);
             });
@@ -2497,7 +2496,9 @@ async fn h2_refused_stream_retry() {
         let (server, streams) = refusing_h2_origin().await;
         let url = format!("https://127.0.0.1:{}/", server.port);
         let (handle, tx) = reg.channel(8);
-        tx.send(Ok(b"abc".to_vec())).await.unwrap();
+        tx.send(oam_core::outbound_data(b"abc".to_vec()))
+            .await
+            .unwrap();
         drop(tx);
         body::end_outbound(&reg.outbound, handle);
         let text = failed(
@@ -2527,10 +2528,15 @@ async fn outbound_entry_lifecycle() {
         // A failure before the take drops the receiver: a write blocked on a
         // full channel resolves.
         let (handle, tx) = reg.channel(1);
-        tx.try_send(Ok(b"fill".to_vec())).unwrap();
+        tx.try_send(oam_core::outbound_data(b"fill".to_vec()))
+            .unwrap();
         let blocked = tokio::spawn({
             let tx = tx.clone();
-            async move { tx.send(Ok(b"more".to_vec())).await.is_err() }
+            async move {
+                tx.send(oam_core::outbound_data(b"more".to_vec()))
+                    .await
+                    .is_err()
+            }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(!blocked.is_finished());
@@ -2573,7 +2579,9 @@ async fn outbound_entry_lifecycle() {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         assert_eq!(reg.entry(handle), Some((true, false)), "never taken");
-        tx.send(Ok(b"x".to_vec())).await.unwrap();
+        tx.send(oam_core::outbound_data(b"x".to_vec()))
+            .await
+            .unwrap();
         drop(tx);
         body::end_outbound(&reg.outbound, handle);
         assert_eq!(reg.entry(handle), None);
@@ -2582,7 +2590,9 @@ async fn outbound_entry_lifecycle() {
 
         // Ended before the take: the take removes it.
         let (handle, tx) = reg.channel(8);
-        tx.send(Ok(b"y".to_vec())).await.unwrap();
+        tx.send(oam_core::outbound_data(b"y".to_vec()))
+            .await
+            .unwrap();
         drop(tx);
         body::end_outbound(&reg.outbound, handle);
         assert_eq!(reg.entry(handle), Some((false, true)));
@@ -2620,7 +2630,9 @@ async fn outbound_entry_lifecycle() {
         let bad =
             serve_replies(|_| response("302 Found", &[("location", "http://[::1")], b"")).await;
         let (handle, tx) = reg.channel(8);
-        tx.send(Ok(b"z".to_vec())).await.unwrap();
+        tx.send(oam_core::outbound_data(b"z".to_vec()))
+            .await
+            .unwrap();
         let outbound = reg.outbound.clone();
         let fetch = reg.fetch(
             &t,
@@ -2912,10 +2924,15 @@ async fn lookup_abandon_drops_the_stream_slot() {
         let server = serve_replies(|_| response("200 OK", &[], b"ok")).await;
         let reg = Reg::new();
         let (handle, tx) = reg.channel(1);
-        tx.try_send(Ok(b"fill".to_vec())).unwrap();
+        tx.try_send(oam_core::outbound_data(b"fill".to_vec()))
+            .unwrap();
         let blocked = tokio::spawn({
             let tx = tx.clone();
-            async move { tx.send(Ok(b"more".to_vec())).await.is_err() }
+            async move {
+                tx.send(oam_core::outbound_data(b"more".to_vec()))
+                    .await
+                    .is_err()
+            }
         });
         let (token, _, _) = lookup_of(
             reg.fetch(
@@ -3326,10 +3343,15 @@ async fn a_refusal_releases_a_streamed_body() {
         let (check, _) = recording_check(&[]);
         let reg = Reg::with_net_check(check);
         let (handle, tx) = reg.channel(1);
-        tx.try_send(Ok(b"fill".to_vec())).unwrap();
+        tx.try_send(oam_core::outbound_data(b"fill".to_vec()))
+            .unwrap();
         let blocked = tokio::spawn({
             let tx = tx.clone();
-            async move { tx.send(Ok(b"more".to_vec())).await.is_err() }
+            async move {
+                tx.send(oam_core::outbound_data(b"more".to_vec()))
+                    .await
+                    .is_err()
+            }
         });
         let outcome = reg
             .fetch(
