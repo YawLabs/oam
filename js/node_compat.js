@@ -19369,6 +19369,35 @@
       }
     }
 
+    // node's write_ check of a chunk (OutgoingMessage): null is
+    // ERR_STREAM_NULL_VALUES, anything but a string or a Uint8Array
+    // ERR_INVALID_ARG_TYPE -- before anything looks at the message's state.
+    function checkWriteChunk(chunk) {
+      if (chunk === null) throw codes.ERR_STREAM_NULL_VALUES();
+      if (typeof chunk !== "string" && !(chunk instanceof Uint8Array)) {
+        throw codes.ERR_INVALID_ARG_TYPE("chunk", ["string", "Buffer", "Uint8Array"], chunk);
+      }
+    }
+
+    // node's onError for a write after end(): on the next tick the callback
+    // hears ERR_STREAM_WRITE_AFTER_END, and then -- unless the message is
+    // destroyed by then -- so does its 'error' (thrown when nothing
+    // listens, as node's). On a destroyed (closed) message only the
+    // callback does.
+    function responseWriteAfterEnd(res, cb) {
+      const err = codes.ERR_STREAM_WRITE_AFTER_END();
+      if (res.closed) {
+        if (typeof cb === "function") process.nextTick(() => cb(err));
+        return;
+      }
+      // oam closes a finished response a tick sooner than node destroys
+      // one, so the state is read once, here.
+      process.nextTick(() => {
+        if (typeof cb === "function") cb(err);
+        res.emit("error", err);
+      });
+    }
+
     class ServerResponse extends EventEmitter {
       constructor(requestId) {
         super();
@@ -19838,12 +19867,19 @@
           if (cb) queueMicrotask(cb);
           return true;
         }
-        if (this._ended) return false;
-        // node's write_ on a response whose connection closed under it (a
-        // reset, a destroyed socket, a client gone): nothing is sent, and
-        // the callback hears ERR_STREAM_DESTROYED on the next tick. oam
-        // handed the bytes to a stream nobody reads and called it with no
-        // error.
+        // node's write_: the chunk is checked first, whatever the state.
+        checkWriteChunk(chunk);
+        // Then a write after end() -- ERR_STREAM_WRITE_AFTER_END to the
+        // callback and, while the response is not destroyed, as its
+        // 'error', on the next tick -- and a write on a response whose
+        // connection closed under it (a reset, a destroyed socket, a client
+        // gone): nothing is sent, and the callback hears
+        // ERR_STREAM_DESTROYED on the next tick. oam returned false
+        // silently after end() and, once closed, called back with no error.
+        if (this._ended) {
+          responseWriteAfterEnd(this, cb);
+          return false;
+        }
         if (this.closed) {
           if (typeof cb === "function") {
             process.nextTick(() => cb(codes.ERR_STREAM_DESTROYED("write")));
@@ -19911,7 +19947,31 @@
           }
           return this;
         }
-        if (this._ended) return this;
+        const hasChunk = chunk !== undefined && chunk !== null;
+        if (this._ended) {
+          // node's end() again: a chunk is a write after end (its callback
+          // and 'error' hear it); without one the callback waits for
+          // 'finish', or hears ERR_STREAM_ALREADY_FINISHED once it is past.
+          if (hasChunk) {
+            responseWriteAfterEnd(this, cb);
+          } else if (typeof cb === "function") {
+            if (!this._finished) this.once("finish", cb);
+            else process.nextTick(() => cb(codes.ERR_STREAM_ALREADY_FINISHED("end")));
+          }
+          return this;
+        }
+        if (this.closed) {
+          // A response whose connection closed under it: node's write_ sends
+          // nothing and builds no head for a chunk (headersSent stays false;
+          // end() with none builds it), the response is ended, and the
+          // callback waits for a 'finish' that never comes. oam built the
+          // head and called it back with no error.
+          if (hasChunk) checkWriteChunk(chunk);
+          else if (!this._wroteHead) this.writeHead(this.statusCode);
+          if (typeof cb === "function") this.once("finish", cb);
+          this._ended = true;
+          return this;
+        }
         if (this._streamId === null) {
           // Single-shot: the whole body in one op, framed as the head says.
           let bytes = this._toBytes(chunk, encoding);
@@ -19937,10 +19997,9 @@
             this._trailerJson(),
           );
           queueMicrotask(() => {
-            if (this.closed) {
-              cb?.();
-              return;
-            }
+            // Closed under it in the meantime: no 'finish', so the callback,
+            // as node's waits on 'finish', is never called.
+            if (this.closed) return;
             this._finished = true;
             this._dumpReq();
             this.emit("finish");
@@ -19968,8 +20027,8 @@
             if (this.closed) {
               // The httpStreamClosed watcher already surfaced a premature
               // 'close' (client abort mid-stream): never follow it with a
-              // spurious 'finish' or a second 'close'.
-              cb?.();
+              // spurious 'finish' or a second 'close' -- and the callback,
+              // which waits on 'finish' in node, is never called.
               return;
             }
             natives.httpBodyEnd(streamId);
@@ -21812,6 +21871,20 @@
       return socket;
     }
 
+    // responseWriteAfterEnd for a ClientRequest, whose destroyed state is
+    // its own `destroyed`.
+    function requestWriteAfterEnd(req, cb) {
+      const err = codes.ERR_STREAM_WRITE_AFTER_END();
+      if (req.destroyed) {
+        if (typeof cb === "function") process.nextTick(() => cb(err));
+        return;
+      }
+      process.nextTick(() => {
+        if (typeof cb === "function") cb(err);
+        if (!req.destroyed) req.emit("error", err);
+      });
+    }
+
     class ClientRequest extends EventEmitter {
       constructor(input, options, callback) {
         super();
@@ -22281,9 +22354,10 @@
       flushHeaders() {
         // node sends the head joined to '' (no encoding): as UTF-8.
         this._noteFirstSend("", undefined, false);
-        // node renders the head here (`_implicitHeader`), so headersSent is
-        // true from now on.
-        if (!this._header && !this._aborted && !this.destroyed) this._markHeadersSent();
+        // node renders the head here (`_implicitHeader`), whatever the
+        // request's state, so headersSent is true from now on -- on a
+        // destroyed request too, which sends nothing.
+        if (!this._header) this._markHeadersSent();
         // The fetch path sends headers with the body. The agent path sends
         // them now, the body following over the channel.
         if (this._agentPath && !this._sent && !this.finished) this._startBodyStream(true);
@@ -22331,7 +22405,16 @@
       }
       write(chunk, encoding, callback) {
         if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
-        // node's write_: a destroyed request -- torn down, failed, or closed
+        // node's write_: the chunk is checked first; then a write after
+        // end() is ERR_STREAM_WRITE_AFTER_END -- the callback's and, while
+        // the request is not destroyed, its 'error', on the next tick (oam
+        // returned true and called back with no error).
+        checkWriteChunk(chunk);
+        if (this.finished) {
+          requestWriteAfterEnd(this, callback);
+          return false;
+        }
+        // A destroyed request -- torn down, failed, or closed
         // by its response before it was ended -- takes nothing, and says so
         // to the callback on the next tick. Not on oam's own transport once
         // the response has ended: the upload goes on there, as node's does on
@@ -22599,8 +22682,13 @@
         // pipeline ends the destination, then the caller ends it too --
         // fires a SECOND request over the wire.
         if (this._ended) {
-          // node: the callback of a second end() waits for 'finish', or is
-          // told the message already finished.
+          // node: a second end() with a chunk is a write after end; the
+          // callback of one without waits for 'finish', or is told the
+          // message already finished.
+          if (data !== undefined && data !== null) {
+            requestWriteAfterEnd(this, callback);
+            return this;
+          }
           if (typeof callback === "function") {
             if (!this._finished) {
               this.once("finish", callback);
