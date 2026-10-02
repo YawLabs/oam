@@ -2936,6 +2936,34 @@ the socket and before its shutdown callback (`'finish'`) has run.
   the FIN and refused the reset with EINVAL until review 3). Through an IP literal both
   issue the shutdown first and refuse the reset with EINVAL.
 
+### 48. V8's foreground tasks: run on the isolate's loop since 0.17.2, what still differs
+
+V8 settles some promises, and runs some callbacks, from tasks it posts to the embedder for
+the isolate's own thread: an async `WebAssembly.compile` / `WebAssembly.instantiate` once the
+background compile is done, an `Atomics.waitAsync` notify or timeout, a
+`FinalizationRegistry` cleanup. Up to 0.17.1 oam never ran them: those promises stayed
+pending forever and cleanup callbacks never fired. It is what hung undici 6 from npm, whose
+HTTP/1 client awaits its llhttp parser's async compile before its first request, and a
+top-level `await WebAssembly.instantiate(bytes)` failed as a deadlocked await (OAM-RT0003).
+oam now runs them as Node's platform does (`crates/oam_engine/src/platform.rs`): on the
+loop that owns the isolate, a worker's included, each followed by a tick and microtask
+drain; a posted task wakes a waiting loop; neither a posted nor a delayed task keeps the
+process alive, and a waiting `waitAsync` does not; compile work still in flight does, and
+the process exits once its continuation has run
+(`conformance/cases/306-webassembly-async-compile-settles.mjs`, and the e2e test
+`v8_foreground_tasks_run_on_the_main_and_worker_loops` for the cleanup callback and a worker).
+
+- **What keeps the loop alive at its end.** Node's `DrainTasks` blocks until every task on
+  V8's worker pool has finished, whatever it is; oam asks V8
+  (`Isolate::HasPendingBackgroundTasks`), which reports the work that will post a task back --
+  an async WebAssembly compile. The other pool work (concurrent GC, background compiles of
+  JavaScript) never posts anything a program observes, so no difference is known to show.
+- **Not covered here: a `SharedArrayBuffer` does not reach a worker.** Through `workerData`
+  or `postMessage`, a worker receives a plain empty object, not the shared memory (measured:
+  node's worker sees `[object SharedArrayBuffer]` and its writes reach the main thread), so a
+  cross-thread `Atomics.notify` / `waitAsync` pair cannot be set up between threads at all.
+  Same-thread `waitAsync` works as in Node.
+
 ### `err.syscall` on `fs.opendir`
 
 Node's own sync and async forms disagree here, and oam is self-consistent where

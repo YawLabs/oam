@@ -1402,10 +1402,15 @@
         const len = str.length >>> 1;
         const out = new Uint8Array(len);
         let o = 0;
+        // Each pair must be two hex DIGITS: parseInt would read "aG", " 1"
+        // or "+1" as a byte where node stops.
+        const digit = (c) =>
+          c >= 48 && c <= 57 ? c - 48 : c >= 97 && c <= 102 ? c - 87 : c >= 65 && c <= 70 ? c - 55 : -1;
         for (let i = 0; i + 1 < str.length; i += 2) {
-          const byte = parseInt(str.slice(i, i + 2), 16);
-          if (Number.isNaN(byte)) break;
-          out[o++] = byte;
+          const hi = digit(str.charCodeAt(i));
+          const lo = digit(str.charCodeAt(i + 1));
+          if (hi < 0 || lo < 0) break;
+          out[o++] = (hi << 4) | lo;
         }
         return out.subarray(0, o);
       }
@@ -1441,6 +1446,61 @@
       default:
         throw codes.ERR_UNKNOWN_ENCODING(enc);
     }
+  }
+
+  // Decode `view`'s bytes as `encoding` (any label normalizeEncoding takes).
+  // The one byte-to-string codec behind Buffer#toString and node's native
+  // *Slice family (asciiSlice, utf8Slice, ...) on Buffer.prototype.
+  function decodeSpan(view, encoding) {
+    switch (normalizeEncoding(encoding)) {
+      case "hex":
+        return view.toHex();
+      case "base64":
+        return view.toBase64();
+      case "base64url":
+        return view.toBase64({ alphabet: "base64url", omitPadding: true });
+      case "latin1": {
+        let out = "";
+        for (let i = 0; i < view.length; i++) out += String.fromCharCode(view[i]);
+        return out;
+      }
+      case "ascii": {
+        let out = "";
+        for (let i = 0; i < view.length; i++) out += String.fromCharCode(view[i] & 0x7f);
+        return out;
+      }
+      case "utf16le": {
+        let out = "";
+        for (let i = 0; i + 1 < view.length; i += 2) {
+          out += String.fromCharCode(view[i] | (view[i + 1] << 8));
+        }
+        return out;
+      }
+      case "utf8":
+        return utf8Decoder.decode(view);
+      default:
+        throw codes.ERR_UNKNOWN_ENCODING(encoding);
+    }
+  }
+
+  // Encode `string` as `encoding` into `view` at `offset`, at most `max`
+  // bytes, and return the count written. Node never writes a partial
+  // character: a UTF-8 sequence or a UTF-16 code unit that does not fit is
+  // left out whole. The one string-to-byte write behind Buffer#write and
+  // node's *Write family on Buffer.prototype.
+  function encodeInto(view, string, offset, max, encoding) {
+    const bytes = bytesFromString(string, encoding);
+    let writable = Math.min(bytes.length, max);
+    if (writable < bytes.length) {
+      const norm = normalizeEncoding(encoding);
+      if (norm === "utf8") {
+        while (writable > 0 && (bytes[writable] & 0xc0) === 0x80) writable--;
+      } else if (norm === "utf16le") {
+        writable &= ~1;
+      }
+    }
+    view.set(bytes.subarray(0, writable), offset);
+    return writable;
   }
 
   // Mutable buffer-module state shared between the Buffer class and the
@@ -2110,35 +2170,7 @@
         throw err;
       }
       const view = e <= s ? this.subarray(0, 0) : this.subarray(s, e);
-      switch (normalizeEncoding(encoding)) {
-        case "hex":
-          return view.toHex();
-        case "base64":
-          return view.toBase64();
-        case "base64url":
-          return view.toBase64({ alphabet: "base64url", omitPadding: true });
-        case "latin1": {
-          let out = "";
-          for (let i = 0; i < view.length; i++) out += String.fromCharCode(view[i]);
-          return out;
-        }
-        case "ascii": {
-          let out = "";
-          for (let i = 0; i < view.length; i++) out += String.fromCharCode(view[i] & 0x7f);
-          return out;
-        }
-        case "utf16le": {
-          let out = "";
-          for (let i = 0; i + 1 < view.length; i += 2) {
-            out += String.fromCharCode(view[i] | (view[i + 1] << 8));
-          }
-          return out;
-        }
-        case "utf8":
-          return utf8Decoder.decode(view);
-        default:
-          throw codes.ERR_UNKNOWN_ENCODING(encoding);
-      }
+      return decodeSpan(view, encoding);
     }
 
     // Node Buffer#slice is a VIEW (Uint8Array#slice copies).
@@ -2240,20 +2272,13 @@
           if (length > remaining) length = remaining;
         }
       }
-      const bytes = bytesFromString(String(string), encoding);
-      let writable = Math.min(bytes.length, length ?? this.length - offset, this.length - offset);
-      // Node never writes partial characters: back off to a character
-      // boundary when the encoded string does not fit.
-      if (writable < bytes.length) {
-        const norm = normalizeEncoding(encoding);
-        if (norm === "utf8" || norm === undefined) {
-          while (writable > 0 && (bytes[writable] & 0xc0) === 0x80) writable--;
-        } else if (norm === "utf16le") {
-          writable &= ~1;
-        }
-      }
-      this.set(bytes.subarray(0, writable), offset);
-      return writable;
+      return encodeInto(
+        this,
+        String(string),
+        offset,
+        Math.min(length ?? this.length - offset, this.length - offset),
+        encoding,
+      );
     }
 
     fill(value, start = 0, end = this.length, encoding) {
@@ -2473,49 +2498,121 @@
   // inherit %TypedArray%.prototype.toLocaleString.
   Buffer.prototype.toLocaleString = Buffer.prototype.toString;
 
-  // Node's per-encoding raw write helpers (asciiWrite/latin1Write/utf8Write,
-  // exposed on Buffer.prototype). offset/length are validated against the
-  // buffer bounds and throw ERR_BUFFER_OUT_OF_BOUNDS when out of range (a
-  // negative length, an offset past the end, ...) -- see test-buffer-write.
+  // Node's per-encoding raw codecs on Buffer.prototype (lib/internal/
+  // buffer.js addBufferPrototypeMethods, node v22.22.2). Real packages call
+  // them directly -- undici's body.text() is `buffer.utf8Slice(start, end)`.
+  // The *Slice family and hex/base64/base64url/ucs2 *Write are C++ natives
+  // there (StringSlice / StringWrite in node_buffer.cc), so they are
+  // non-constructable, report length 0, and throw node's native-shaped
+  // errors: a plain TypeError/RangeError carrying `code`, no `[CODE]` in the
+  // name. ascii/latin1/utf8 *Write are JS wrappers that bounds-check offset
+  // and length against byteLength first, then run the same native write.
+  // Every one goes through decodeSpan / encodeInto, the codec Buffer#toString
+  // and Buffer#write use.
   {
-    function rawEncWrite(buf, encoding, string, offset, length) {
-      if (offset === undefined) {
-        offset = 0;
-      } else {
-        offset = +offset;
-        if (Number.isNaN(offset)) offset = 0;
+    const nativeError = (Ctor, code, message) => {
+      const err = new Ctor(message);
+      err.code = code;
+      return err;
+    };
+    const indexOutOfRange = () => nativeError(RangeError, "ERR_OUT_OF_RANGE", "Index out of range");
+    // node's THROW_AND_RETURN_UNLESS_BUFFER: any ArrayBufferView, read as bytes.
+    const receiverBytes = (receiver) => {
+      if (!ArrayBuffer.isView(receiver)) {
+        throw nativeError(TypeError, "ERR_INVALID_ARG_TYPE", "argument must be a buffer");
       }
-      if (offset < 0 || offset > buf.length || Math.floor(offset) !== offset) {
-        throw codes.ERR_BUFFER_OUT_OF_BOUNDS();
-      }
-      const remaining = buf.length - offset;
-      if (length === undefined) {
-        length = remaining;
-      } else {
-        length = +length;
-        if (Number.isNaN(length)) length = 0;
-      }
-      if (length < 0 || Math.floor(length) !== length) {
-        throw codes.ERR_BUFFER_OUT_OF_BOUNDS();
-      }
-      if (length > remaining) length = remaining;
-      const bytes = bytesFromString(String(string), encoding);
-      let writable = Math.min(bytes.length, length);
-      // Never split a multi-byte UTF-8 sequence (1 byte/char for ascii/latin1).
-      if (writable < bytes.length && encoding === "utf8") {
-        while (writable > 0 && (bytes[writable] & 0xc0) === 0x80) writable--;
-      }
-      buf.set(bytes.subarray(0, writable), offset);
-      return writable;
+      return receiver instanceof Uint8Array
+        ? receiver
+        : new Uint8Array(receiver.buffer, receiver.byteOffset, receiver.byteLength);
+    };
+    // node's ParseArrayIndex: undefined takes the default; anything else is
+    // ToNumber'd (a BigInt or a Symbol throws V8's TypeError) and truncated,
+    // NaN reading as 0; a negative index is "Index out of range".
+    const arrayIndex = (value, fallback) => {
+      if (value === undefined) return fallback;
+      const index = Math.trunc(+value);
+      if (index < 0) throw indexOutOfRange();
+      return index || 0;
+    };
+    // StringSlice: an empty view is "" before any argument is read.
+    function rawSlice(receiver, start, end, encoding) {
+      const bytes = receiverBytes(receiver);
+      const length = bytes.length;
+      if (length === 0) return "";
+      const from = arrayIndex(start, 0);
+      let to = arrayIndex(end, length);
+      if (to < from) to = from;
+      if (to > length) throw indexOutOfRange();
+      return decodeSpan(bytes.subarray(from, to), encoding);
     }
-    Buffer.prototype.asciiWrite = function asciiWrite(string, offset, length) {
-      return rawEncWrite(this, "ascii", string, offset, length);
+    // StringWrite: an offset past the end is ERR_BUFFER_OUT_OF_BOUNDS, a
+    // length past it is clamped, and nothing is encoded for zero room.
+    function rawWrite(receiver, string, offset, length, encoding) {
+      const bytes = receiverBytes(receiver);
+      if (typeof string !== "string") {
+        throw nativeError(TypeError, "ERR_INVALID_ARG_TYPE", "argument must be a string");
+      }
+      const at = arrayIndex(offset, 0);
+      if (at > bytes.length) {
+        throw nativeError(
+          RangeError,
+          "ERR_BUFFER_OUT_OF_BOUNDS",
+          '"offset" is outside of buffer bounds',
+        );
+      }
+      const room = bytes.length - at;
+      const max = Math.min(room, arrayIndex(length, room));
+      if (max === 0) return 0;
+      return encodeInto(bytes, string, at, max, encoding);
+    }
+    // Method shorthand gives a native's shape: named, no prototype, `new`
+    // throws. `arguments` rather than named parameters keeps `length` at 0.
+    const natives = {
+      asciiSlice() { return rawSlice(this, arguments[0], arguments[1], "ascii"); },
+      base64Slice() { return rawSlice(this, arguments[0], arguments[1], "base64"); },
+      base64urlSlice() { return rawSlice(this, arguments[0], arguments[1], "base64url"); },
+      latin1Slice() { return rawSlice(this, arguments[0], arguments[1], "latin1"); },
+      hexSlice() { return rawSlice(this, arguments[0], arguments[1], "hex"); },
+      ucs2Slice() { return rawSlice(this, arguments[0], arguments[1], "utf16le"); },
+      utf8Slice() { return rawSlice(this, arguments[0], arguments[1], "utf8"); },
+      base64Write() { return rawWrite(this, arguments[0], arguments[1], arguments[2], "base64"); },
+      base64urlWrite() {
+        return rawWrite(this, arguments[0], arguments[1], arguments[2], "base64url");
+      },
+      hexWrite() { return rawWrite(this, arguments[0], arguments[1], arguments[2], "hex"); },
+      ucs2Write() { return rawWrite(this, arguments[0], arguments[1], arguments[2], "utf16le"); },
     };
-    Buffer.prototype.latin1Write = function latin1Write(string, offset, length) {
-      return rawEncWrite(this, "latin1", string, offset, length);
+    for (const name of Object.keys(natives)) Buffer.prototype[name] = natives[name];
+    // The JS wrappers: length defaults to byteLength (the native clamps it
+    // to the room past offset), and the range checks compare the RAW
+    // arguments -- a NaN, an object or a numeric string passes them and is
+    // coerced by the native, as in node.
+    Buffer.prototype.asciiWrite = function asciiWrite(
+      string,
+      offset = 0,
+      length = this.byteLength,
+    ) {
+      if (offset < 0 || offset > this.byteLength) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("offset");
+      if (length < 0) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("length");
+      return rawWrite(this, string, offset, length, "ascii");
     };
-    Buffer.prototype.utf8Write = function utf8Write(string, offset, length) {
-      return rawEncWrite(this, "utf8", string, offset, length);
+    Buffer.prototype.latin1Write = function latin1Write(
+      string,
+      offset = 0,
+      length = this.byteLength,
+    ) {
+      if (offset < 0 || offset > this.byteLength) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("offset");
+      if (length < 0) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("length");
+      return rawWrite(this, string, offset, length, "latin1");
+    };
+    Buffer.prototype.utf8Write = function utf8Write(
+      string,
+      offset = 0,
+      length = this.byteLength,
+    ) {
+      if (offset < 0 || offset > this.byteLength) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("offset");
+      if (length < 0) throw codes.ERR_BUFFER_OUT_OF_BOUNDS("length");
+      return rawWrite(this, string, offset, length, "utf8");
     };
   }
 

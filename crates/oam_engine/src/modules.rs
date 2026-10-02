@@ -639,6 +639,7 @@ impl JsRuntime {
             oam_core::CoreRuntime::new()
                 .map_err(|e| rt_diag("OAM-RT0002", format!("io runtime failed to start: {e}")))?,
         );
+        crate::attach_loop_waker(&mut self.isolate);
         self.isolate.set_slot(crate::ops::PendingOps::default());
         Ok(())
     }
@@ -806,7 +807,7 @@ impl JsRuntime {
             if now >= deadline {
                 return Ok(());
             }
-            let mut progressed = false;
+            let mut progressed = run_platform_tasks(tc)?;
             let due = tc
                 .get_slot_mut::<crate::timers::TimerQueue>()
                 .and_then(|queue| queue.pop_due(now));
@@ -1182,6 +1183,31 @@ pub(crate) fn run_ticks_and_microtasks(
     }
 }
 
+/// Run every V8 foreground task that is ready (platform.rs), in posting
+/// order, each followed by a tick + microtask drain -- node runs each inside
+/// an InternalCallbackScope, which drains the same way when it closes.
+/// Returns whether any ran. The common case is one slot read and one atomic
+/// load.
+pub(crate) fn run_platform_tasks(
+    tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
+) -> Result<bool, Vec<Diagnostic>> {
+    let tasks = match tc.get_slot::<crate::platform::PlatformTasks>() {
+        Some(slot) if slot.0.has_ready() => slot.0.take_ready(),
+        _ => return Ok(false),
+    };
+    let ran = !tasks.is_empty();
+    for task in tasks {
+        task.run();
+        if let Some(failure) = run_ticks_and_microtasks(tc) {
+            return Err(failure);
+        }
+        if let Some(failure) = drain_uncaught(tc) {
+            return Err(failure);
+        }
+    }
+    Ok(ran)
+}
+
 /// True when the JS nextTick queue has entries (absent globals = empty).
 pub(crate) fn has_pending_ticks(
     tc: &mut v8::PinnedRef<'_, v8::TryCatch<'_, '_, v8::HandleScope<'_>>>,
@@ -1369,6 +1395,12 @@ pub(crate) fn pump_event_loop(
             progressed = true;
         }
 
+        // V8's foreground tasks (platform.rs) -- node runs them from its
+        // loop's poll phase, each followed by a tick + microtask drain.
+        if run_platform_tasks(tc)? {
+            progressed = true;
+        }
+
         if let Some(completion) = tc
             .get_slot_mut::<oam_core::CoreRuntime>()
             .and_then(|core| core.try_recv())
@@ -1416,7 +1448,35 @@ pub(crate) fn pump_event_loop(
             }
             continue;
         }
-        // Node: only ref'd timers and inflight ops keep the loop alive. When
+        if !has_ref_timers && !has_inflight && tc.has_pending_background_tasks() {
+            // node's DrainTasks: background work V8 still owes this isolate a
+            // foreground task for (an async WebAssembly compile) holds the
+            // loop open until it posts, and the post wakes the op channel.
+            // A post that lands before the wait is not lost (the wake sits
+            // in the channel); the slice only bounds how long V8's answer
+            // goes unasked again.
+            const DRAIN_SLICE: std::time::Duration = std::time::Duration::from_millis(50);
+            let completion = tc
+                .get_slot_mut::<oam_core::CoreRuntime>()
+                .and_then(|core| core.recv_deadline(Some(std::time::Instant::now() + DRAIN_SLICE)));
+            if let Some(completion) = completion {
+                let completion =
+                    if let Some(state) = tc.get_slot_mut::<crate::replay::ReplayState>() {
+                        crate::replay::intercept_completion(state, completion)
+                    } else {
+                        completion
+                    };
+                crate::ops::settle_completion(tc, completion);
+                if let Some(failure) = run_ticks_and_microtasks(tc) {
+                    return Err(failure);
+                }
+                if let Some(failure) = drain_uncaught(tc) {
+                    return Err(failure);
+                }
+            }
+            continue;
+        }
+        // Past that, node: only ref'd timers and inflight ops keep the loop alive. When
         // the sole remaining work is unref'd timers, exit WITHOUT firing them.
         // (An unref'd timer due BEFORE this point still fired above via pop_due,
         // since `next_deadline` below still wakes us for it while other work

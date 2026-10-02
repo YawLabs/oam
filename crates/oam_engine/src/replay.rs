@@ -267,7 +267,8 @@ impl ReplayState {
 pub fn intercept_completion(state: &mut ReplayState, completion: OpCompletion) -> OpCompletion {
     // OS signals are environmental, not part of the deterministic op stream:
     // never record or replay them. Pass through untouched in every mode.
-    if completion.id == oam_core::SIGNAL_OP_ID {
+    // Nor are V8 foreground-task wakes: they carry no outcome, only timing.
+    if completion.id == oam_core::SIGNAL_OP_ID || completion.id == oam_core::PLATFORM_TASK_OP_ID {
         return completion;
     }
     if let Some(recorder) = &mut state.recorder {

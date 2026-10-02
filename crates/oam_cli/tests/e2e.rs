@@ -1180,6 +1180,45 @@ fn top_level_await_settles_on_microtasks() {
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "settled");
 }
 
+// V8 settles a FinalizationRegistry cleanup and an async WebAssembly compile
+// from FOREGROUND TASKS it posts to the isolate's platform; the isolate's own
+// event loop has to run them (crates/oam_engine/src/platform.rs). Nothing ran
+// them, so the cleanup callback never fired and `WebAssembly.instantiate`
+// never settled -- the hang behind undici 6 from npm, whose first request
+// awaits its llhttp parser's async compile. A worker is its own isolate on
+// its own loop, so it is covered too. Lines are sorted: which of the two
+// lands first is the scheduler's, in node as well.
+#[test]
+fn v8_foreground_tasks_run_on_the_main_and_worker_loops() {
+    let main = write_temp(
+        "v8_foreground_tasks.cjs",
+        r#"const { Worker, isMainThread, parentPort } = require('worker_threads');
+// (module (func (export "f") (result i32) i32.const 42))
+const bytes = new Uint8Array([0,97,115,109,1,0,0,0,1,5,1,96,0,1,127,3,2,1,0,7,5,1,1,102,0,0,10,6,1,4,0,65,42,11]);
+if (isMainThread) {
+  const fr = new FinalizationRegistry((held) => console.log('finalized', held));
+  (() => { fr.register({}, 'garbage'); })();
+  setTimeout(() => gc(), 0);
+  new Worker(__filename).on('message', (m) => console.log('worker compiled', m));
+  setTimeout(() => {}, 300);
+} else {
+  WebAssembly.instantiate(bytes).then(({ instance }) => parentPort.postMessage(instance.exports.f()));
+}
+"#,
+    );
+    let out = oam(&["--expose-gc", "run", main.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success(),
+        "exit {:?}\nstdout:\n{stdout}\nstderr:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut lines: Vec<&str> = stdout.lines().collect();
+    lines.sort_unstable();
+    assert_eq!(lines, ["finalized garbage", "worker compiled 42"]);
+}
+
 // ---------------------------------------------------- node: compat wave 1
 
 /// Run a script and return trimmed stdout, failing loudly on a bad exit.

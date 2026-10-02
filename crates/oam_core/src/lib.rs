@@ -85,6 +85,29 @@ pub type OpId = u64;
 /// counted in `inflight`) and route it to `process.emit(name)`.
 pub const SIGNAL_OP_ID: OpId = 0;
 
+/// Sentinel op id for a [`LoopWaker`] wake: V8 posted a foreground task (an
+/// async WebAssembly compile finishing, a FinalizationRegistry cleanup, an
+/// `Atomics.waitAsync` notify) for the isolate this channel serves. `next_id`
+/// counts up from 1 and never reaches it. Like a signal it was never counted
+/// in `inflight`, carries no resolver, and is not part of the recorded op
+/// stream: the engine runs the queued tasks at the top of its next turn.
+pub const PLATFORM_TASK_OP_ID: OpId = OpId::MAX;
+
+/// Wakes an event loop blocked on its op channel, from any thread. Held by
+/// the engine's V8 platform glue; a wake for a loop that has gone away is a
+/// no-op.
+#[derive(Clone)]
+pub struct LoopWaker(mpsc::Sender<OpCompletion>);
+
+impl LoopWaker {
+    pub fn wake(&self) {
+        let _ = self.0.send(OpCompletion {
+            id: PLATFORM_TASK_OP_ID,
+            outcome: OpOutcome::Done,
+        });
+    }
+}
+
 /// One Node system error, fully shaped on the native side: the fields node
 /// puts on the error a libuv or resolver failure produces.
 ///
@@ -1471,11 +1494,16 @@ impl CoreRuntime {
         self.inflight > 0
     }
 
+    /// A handle that wakes this runtime's op channel (see [`LoopWaker`]).
+    pub fn loop_waker(&self) -> LoopWaker {
+        LoopWaker(self.tx.clone())
+    }
+
     /// Bookkeeping shared by `try_recv` and `recv_deadline`: a settled op
     /// stops counting, and leaves its handle's in-flight set (its id must
     /// never be re-counted by `set_handle_ref` again).
     fn note_settled(&mut self, completion: &OpCompletion) {
-        if completion.id == SIGNAL_OP_ID {
+        if completion.id == SIGNAL_OP_ID || completion.id == PLATFORM_TASK_OP_ID {
             // Never counted in `inflight` (a bare listener must not pin the
             // loop), so it must not decrement -- that would underflow at 0.
             return;
