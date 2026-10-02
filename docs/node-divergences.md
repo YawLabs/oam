@@ -1630,13 +1630,83 @@ since a name missing from an ES module is a link-time error, a package that mere
   `getCookies`, `getSetCookies`, `setCookie`, `deleteCookie`, `parseMIMEType`,
   `serializeAMimeType`, `util`, `caches`, `EventSource`, `ErrorEvent` and `FileReader`.
 
-**`headersTimeout` and `bodyTimeout` on `undici.request`**
+**Request bodies on `undici.request`**
+
+`undici.request()`, `undici.stream()` and a dispatcher's `request()` take every body undici's
+Request takes and frame it as undici's `writeH1` does: a string, a Buffer, a typed array, a
+`DataView` or an `ArrayBuffer` with its `content-length`; a Blob likewise, with its type as
+`content-type` unless the caller set one; a Readable (anything with `pipe()` and `on()`), an
+iterable or async iterable (a web `ReadableStream` included) streamed as it is produced --
+chunked, or under the caller's `content-length` -- with backpressure from the transport. As
+in undici the request goes out with the first non-empty chunk, and a stream that ends with
+none is sent as no body (`content-length: 0` for a method that expects a payload). A chunk
+that is neither a string nor a buffer fails with Buffer.byteLength's `ERR_INVALID_ARG_TYPE`,
+a streamed body that runs past or ends short of its `content-length` with
+`RequestContentLengthMismatchError` before anything complete reaches the wire, a stream that
+errors (or an iterator that throws) with its own error, one that closes before its end with
+undici's `RequestAbortedError`, and any other body type with undici's `InvalidArgumentError`
+`body must be a string, a Buffer, a Readable stream, an iterable, or an async iterable`. The
+caller's abort, a failed request and a response that is over before the body is -- the
+origin closed, or its response body was read to the end or destroyed while the connection
+stays open -- all stop it: a generator is returned, a stream destroyed with no error and
+detached, and the connection closed, as undici resets the socket when a message completes
+mid-write. Pinned against Node + undici 6.29.0 by
+`undici_request_sends_every_body_undici_takes`,
+`undici_headers_timeout_starts_when_a_streamed_body_ends` and
+`undici_request_stops_its_upload_once_the_response_is_over` (e2e). Up to 0.17.1 every body that
+was not a string or a buffer was stringified: a Readable went out as `[object Object]`, a
+generator as `[object AsyncGenerator]`. What differs:
+
+- **A FormData body is refused** with `NotSupportedError`. undici encodes it as
+  `multipart/form-data`; oam has no multipart encoder yet (`new Response(formData)` lacks one
+  too), and sending it any other way would put the wrong bytes on the wire.
+- **The connection is made with the first chunk.** undici connects first and writes the head
+  with the first chunk; oam dispatches the request (DNS, connect, TLS) once the first chunk
+  is there, so a body whose first chunk is slow pays the connect after it.
+- **When a stream's framing is decided.** undici frames a Readable when it dispatches the
+  request: an ended byte stream goes with `content-length`, an open one chunked. On a
+  reused connection that is after the immediates already queued; on a fresh one, after the
+  connect. oam decides one immediate after `request()` in both cases, so a stream that ends
+  in that turn of the event loop -- synchronously, on a tick, a microtask or a queued
+  immediate -- is framed as in Node (pinned by
+  `undici_request_frames_a_stream_when_it_dispatches`, e2e), and one that ends while a fresh
+  connection is still being made (a `setTimeout(0)` on loopback, measured) goes with
+  `content-length` in Node and chunked in oam.
+- **An early response stops the upload once its body is read.** undici stops a body still
+  going out the moment the whole response has arrived, read or not; oam reads a response
+  body only as it is consumed (see `bodyTimeout` below), so the upload stops when the
+  response body has been read to its end or destroyed. A response nobody reads leaves the
+  upload going until the request otherwise ends.
+- **`strictContentLength: false`** on a dispatcher is not applied: a mismatch is refused as
+  under undici's default, where undici would warn and send.
+
+**How `undici.request` fails**
+
+`undici.request()`, `undici.stream()` and a dispatcher's `request()` reject with the error
+itself, as undici's do -- an undici class (`HeadersTimeoutError`, `BodyTimeoutError`,
+`HeadersOverflowError`, `InvalidArgumentError`, ...) with its `name`, `code` and `message`,
+a connect's `ECONNREFUSED` / `ENOTFOUND` error as given -- never with fetch's `TypeError:
+fetch failed`. An oversized response head is counted as undici counts it, header names and
+values without the status line's reason phrase (node's own `http.request` counts that too).
+Pinned against Node + undici 6.29.0 by `undici_request_rejects_with_the_error_itself` (e2e).
+Up to 0.17.1 only a late head was unwrapped: an oversized head was `fetch failed` with
+node's http-parser cause `HPE_HEADER_OVERFLOW` (under the http-parser count, so a head
+undici takes could be refused), and a refused connect was wrapped too. What differs:
+
+- **A connection the server closes before its response** rejects with a plain `Error`
+  (`error sending request for url (...)`, no `code`), where undici's is `SocketError`
+  (`UND_ERR_SOCKET`, `other side closed`): oam's transport does not yet tell that failure
+  apart from others of its kind.
+
+**`headersTimeout` and `bodyTimeout` on `undici.request` and `fetch`**
 
 `undici.request()`, `undici.stream()` and a dispatcher's `request()` honour undici's two
 per-phase stall limits (#218): a response head that does not arrive within `headersTimeout`
 rejects the request with `HeadersTimeoutError` (`UND_ERR_HEADERS_TIMEOUT`), and a body that
 goes `bodyTimeout` without a byte is destroyed with `BodyTimeoutError`
-(`UND_ERR_BODY_TIMEOUT`), each chunk re-arming it. The request's own value wins, then the
+(`UND_ERR_BODY_TIMEOUT`), each chunk off the wire re-arming it -- one a decoder takes
+without yielding anything yet included, so a compressed body trickled slower than its
+limit as a whole but faster byte by byte is read whole, as in Node. The request's own value wins, then the
 dispatcher's (`new Agent|Pool|Client({ headersTimeout, bodyTimeout })`, the global
 dispatcher included), then undici's default of 300 s; `0` disables. On the request,
 anything but a finite number `>= 0` is `InvalidArgumentError` `invalid headersTimeout` /
@@ -1647,6 +1717,24 @@ Infinity, which undici's `Agent` and `Pool` lose in a JSON copy of their options
 default).
 Pinned against Node + undici 6.29.0 by `undici_request_honours_headers_and_body_timeouts`
 (e2e). Up to 0.17.1 both options were accepted and ignored.
+
+`fetch()` -- global `fetch` and `undici.fetch` -- runs under the same two limits, as Node's
+does: its dispatcher's (the `dispatcher` option's, else the global one's, a ProxyAgent's
+for the origin's answer), else undici's 300 s, with or without `undici` imported (measured:
+a plain `fetch` to a silent server fails at 300 s in oam and 321 s in Node, whose timers are
+coarse). A `headersTimeout` in the fetch init is not an option, in either runtime. A late
+head rejects with `TypeError: fetch failed`, cause `HeadersTimeoutError`; a stalled body
+errors its reader, `text()` / `json()` / `arrayBuffer()` and `for await` with `TypeError:
+terminated`, cause `BodyTimeoutError`; a bad dispatcher value is the dispatcher's
+`InvalidArgumentError` as the cause. Each cause is an instance of the shim's `errors.*`
+once `undici` is imported, as an oversized response head's `HeadersOverflowError` is (case
+277), and carries that class's name either way. Both limits run in the transport, one
+implementation for `fetch` and `undici.request`. Pinned against Node + undici 6.29.0 by
+`fetch_rides_its_dispatchers_headers_and_body_timeouts` (e2e),
+`a_stalled_body_read_fails_after_the_body_timeout` and
+`the_body_timeout_restarts_with_every_frame_off_the_wire` (`http_client_fetch.rs`). Up to 0.17.1 a
+`fetch` had no limit at all: a server that never answered held it until its `signal` ended
+it, and a cause from oam's transport was a plain `Error`.
 
 As in Node, `headersTimeout` starts once the request is on a connected socket -- DNS (a
 replaced `dns.lookup` or a `connect.lookup` hook), the TCP connect, the TLS handshake, a
@@ -1659,22 +1747,74 @@ as undici arms a new timer on the socket that next carries a request it re-queue
 `undici_phase_timeouts_measure_what_undici_measures` and
 `undici_headers_timeout_on_the_pool_starts_once_connected`, e2e, and
 `the_headers_timeout_stops_while_an_unsent_request_is_re_dialled` in
-`crates/oam_core/tests/http_client_fetch.rs`). What differs:
+`crates/oam_core/tests/http_client_fetch.rs`). A streamed request body counts for nothing
+either: undici ignores the timer while it writes one and restarts it from zero at the body's
+end, and oam's transport holds it off until the body channel has ended and its last chunk is
+taken (pinned by `undici_headers_timeout_starts_when_a_streamed_body_ends`). What differs:
 
+- **An upload the origin stops reading.** undici re-arms the timer on every write the socket
+  backs up on, so a streamed body stuck behind a server that stopped reading fails with
+  `HeadersTimeoutError` after `headersTimeout` (measured: 64 MiB to a server that never reads,
+  limit 500 ms, under 4 s in Node). oam's timer waits for the body's end, which never comes:
+  the request stays open until the caller's signal ends it.
 - **The timers are exact.** undici's are coarse (a 500 ms `headersTimeout` fires after about
   1019 ms in Node); oam's fire at the configured delay. A delay above 2^31-1 ms
   (`headersTimeout: 2 ** 31` and the like, a common way to say "no limit") is held to that
   ceiling, about 24.8 days, where undici's timestamp-based timers never come due; a plain
   `setTimeout` would have fired it after 1 ms.
-- **`bodyTimeout` runs only while the body is being read.** oam reads a `request()` body
-  from the transport when something consumes it; undici reads ahead into the stream's
-  buffer. So a stalled body nobody reads is left alone in oam, where Node destroys it with
-  `BodyTimeoutError` (an uncaught `'error'` if nothing listens). A body that is read --
-  `text()`, `json()`, a `'data'` listener, `pipe()`, `stream()` -- times out in both.
-- **`fetch` through a dispatcher does not get them.** Node applies an `Agent`'s
-  `headersTimeout` / `bodyTimeout` to a `fetch` that rides it (and the 300 s defaults to
-  every `fetch`); oam applies them to `undici.request` / `stream` / `dispatcher.request`
-  only, and a `fetch` is bounded by its `signal`.
+- **`bodyTimeout` runs only while the body is being read.** oam reads a `request()` or
+  `fetch` body from the transport when something consumes it; undici reads ahead into the
+  stream's buffer. So a stalled body nobody reads is left alone in oam, where Node destroys
+  it with `BodyTimeoutError` (an uncaught `'error'` on a `request()` body if nothing listens)
+  and closes its connection. A body that is read -- `text()`, `json()`, a `'data'` listener,
+  `pipe()`, `stream()`, a `fetch` body's reader -- times out in both.
+- **A cause's class with `undici` not imported.** Node's built-in `fetch` raises its
+  bundled undici's classes, which are not the npm package's; oam has one undici, so with
+  the shim loaded a cause is an instance of `errors.*` whichever `fetch` raised it.
+
+**Request bodies on `fetch`**
+
+`fetch()` sends a Blob or File as its bytes, its `type` as the Content-Type unless the caller
+set one or it is empty; a URLSearchParams as its serialization, typed
+`application/x-www-form-urlencoded;charset=UTF-8` unless the caller set a type; a string as
+UTF-8, typed `text/plain;charset=UTF-8`; and no body or an empty one with `content-length: 0`
+on POST, PUT and PATCH, as undici's writeH1 does. Pinned against Node by
+`fetch_sends_blob_search_params_and_empty_bodies_as_node_does` (e2e). Up to 0.17.1 a Blob went
+out as the text `[object Blob]`, a URLSearchParams as `text/plain`, and an empty POST with no
+length. What differs:
+
+- **A FormData body is sent as the text `[object FormData]`.** Node encodes it as
+  `multipart/form-data`; oam has no multipart encoder yet (`undici.request` refuses one, above).
+
+**Streamed request bodies on `fetch`**
+
+`fetch()` streams a `ReadableStream` or async-iterable body (a generator, a Node Readable) as
+Node's does: chunked, or under the caller's `content-length` (checked as it goes:
+`RequestContentLengthMismatchError` as the cause when it disagrees), nothing sent before the
+first non-empty chunk and `content-length: 0` for a stream that ends empty, string chunks as
+UTF-8 and byte chunks as they are, anything else failing with Buffer.from's
+`ERR_INVALID_ARG_TYPE` as the cause. A stream that errors fails the fetch with `TypeError:
+fetch failed` and its error as the cause; an abort rejects with the reason and stops reading
+without cancelling the source; a response that is over while the body is still going out
+stops it and closes the connection, as undici resets the socket; a redirect other than a 303,
+which would have to resend the body, fails the fetch (cause an `Error` with an empty
+message). The Request constructor's
+refusals come first: a body on `GET` / `HEAD` (any body), a locked stream, a streamed body
+without `duplex: 'half'`, and a `duplex` outside its enum. A sync iterable such as an array is
+not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_iterable_body`
+(e2e) and `a_fetch_cannot_follow_a_redirect_that_resends_its_streamed_body`
+(`http_client_redirect.rs`). Up to 0.17.1 every such body was stringified and sent as text
+(`[object ReadableStream]`, `content-type: text/plain;charset=UTF-8`, a 200), and a body on
+`GET` was sent. What differs:
+
+- **An empty chunk followed by more.** Node's fetch hangs on an async iterable that yields an
+  empty chunk before a non-empty one (measured: `Uint8Array(0)` then `'x'` never settles);
+  oam skips the empty chunk and sends the rest.
+- **A disturbed but unlocked stream** (read from, then released) is sent from where it
+  stands; Node refuses it as `disturbed or locked`.
+- **An early response stops the upload once its body is read**, to its end or cancelled; Node
+  stops it the moment the whole response has arrived, read or not (as for `undici.request`,
+  above).
 
 **Redirects**
 
@@ -1758,17 +1898,16 @@ as undici arms a new timer on the socket that next carries a request it re-queue
   closes before the response is read; in oam it closes once the response has been. And
   a small response destroyed from the `'response'` listener reads `complete` `false`
   where Node, which had already parsed all of it, reads `true`.
-- **Bodies are extracted as the Fetch Standard says, with three gaps.** `fetch`, `Request`
+- **Bodies are extracted as the Fetch Standard says, with two gaps.** `fetch`, `Request`
   and `Response` take a `Blob`/`File`, `URLSearchParams`, `FormData`, `ReadableStream` (or
   any async iterable; `duplex: 'half'` required), buffers and strings, with Node's
   content-type for each, and a streamed upload's chunks, a failing source and a redirect of
   a streamed body (every redirect but a 303 fails the fetch) behave as in Node (#154). What
   differs: a `FormData` body's boundary reads `----formdata-oam-0<11 digits>` where undici's
   reads `----formdata-undici-0<11 digits>` (same shape, three bytes shorter per occurrence);
-  nothing has `formData()`, neither a constructed `Request` / `Response` nor a fetched
-  response; and when a fetch with a streamed body is aborted or its connection drops, oam
-  cancels the source stream (with the abort reason or the failure), as the Fetch Standard
-  says, where Node neither cancels it nor stops pulling it.
+  and nothing has `formData()`, neither a constructed `Request` / `Response` nor a fetched
+  response. (A streamed body aborted or cut off stops being read, its source not cancelled,
+  as in Node: see the streamed-body paragraph above.)
 - **`Request` options oam keeps but does not act on.** `mode`, `credentials`, `cache`,
   `integrity`, `keepalive`, `referrer` and `referrerPolicy` are validated and read back as in
   Node (#180), and `mode` and `cache` shape the request headers as they do in Node (#178).
@@ -1784,9 +1923,9 @@ as undici arms a new timer on the socket that next carries a request it re-queue
   `fetch: too many request headers`; Node has no cap (25,000 distinct names get a 200).
 - **Two request-header shapes still differ from Node's `fetch`** -- measured against a
   raw-socket server, with everything else on the request line and in the header block
-  identical. The ORDER differs (oam ends with `host`, Node begins with it; hyper places it),
-  and a streamed body that ends without a chunk goes out chunked, where undici, which holds
-  the head until the first chunk, sends `content-length: 0`. `user-agent` is `oam/<version>`
+  identical. The ORDER differs (oam ends with `host`, Node begins with it; hyper places it).
+  (A streamed body that ends without a chunk now goes out with `content-length: 0`, as
+  undici, which holds the head until the first chunk, sends it.) `user-agent` is `oam/<version>`
   by design. What now matches, and used to not: `connection: keep-alive`,
   `accept-language: *` and `sec-fetch-mode` (the request's mode) on every fetch,
   `accept-encoding: gzip, deflate` over http and `br, gzip, deflate` over https, and
@@ -1865,9 +2004,22 @@ over the limit), the transport's for a failed connect (`connect ECONNREFUSED`, `
 ENOTFOUND`, a proxy that refuses the connection) -- not with `TypeError: fetch failed` around
 it; and a body that fails mid-read errors with undici's `SocketError` /
 `ResponseContentLengthMismatchError` / `HTTPParserError` itself, not fetch's
-`TypeError: terminated` (`undici_request_rejects_with_the_error_itself`, e2e). Up to 0.17.1 a
-failed request arrived as `TypeError: fetch failed`, and a failed body as a plain `Error`
-with no `cause`.
+`TypeError: terminated` (`undici_request_body_and_connect_failures_reject_unwrapped` and
+`undici_request_rejects_with_the_error_itself`, e2e). Up to 0.17.1 a failed request arrived
+as `TypeError: fetch failed`, and a failed body as a plain `Error` with no `cause`.
+
+A refusal is an instance of the shim's undici class
+(`errors.InvalidArgumentError`, `errors.NotSupportedError`,
+`errors.RequestContentLengthMismatchError`) with undici's `code` and message and no `cause` --
+as Node's does. It also applies undici's own content-length rule rather than `fetch`'s: the
+caller's `content-length` is consumed, checked against a body of known length on a method
+that sends one (not on `GET`, `HEAD`, `OPTIONS`, `TRACE`, `CONNECT`), and replaced by the
+real length; a `POST` / `PUT` / `PATCH` with no body goes out with `content-length: 0`, and
+an unparseable value is `invalid content-length header`. Pinned against Node + undici 6.29.0
+by `undici_request_frames_and_refuses_as_undici_does` (e2e). Up to 0.17.1 every refusal
+arrived as `TypeError: fetch failed` with the undici-named error as `cause`, a bodyless `POST`
+carried no `content-length`, and a flat `[name, value, ...]` header array was sent as
+garbage.
 
 **`http.request` argument and option handling**
 

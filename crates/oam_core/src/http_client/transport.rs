@@ -18,7 +18,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use http::Uri;
 use http::header::HeaderValue;
-use http_body_util::{BodyExt, Empty, Full, StreamBody};
+use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::{Frame, Incoming};
 use hyper_util::client::proxy::matcher::Matcher;
 
@@ -622,14 +622,109 @@ pub fn full_body(bytes: Bytes) -> ReqBody {
 /// A request body streamed from JS through an outbound body channel (sent
 /// chunked). An `Err` item aborts the request (`fetchBodyChannelCancel`).
 pub fn channel_body(rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>) -> ReqBody {
-    let chunks = futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| {
-            (
-                item.map(|chunk| Frame::data(Bytes::from(chunk)))
-                    .map_err(BoxError::from),
-                rx,
-            )
+    ChannelBody {
+        rx: Some(rx),
+        remaining: None,
+        on_end: None,
+    }
+    .boxed()
+}
+
+/// [`channel_body`], calling `on_end` once JS has ended the body and the
+/// transport has taken its last chunk: the moment undici's `AsyncWriter.end()`
+/// marks a streamed request written. Not called for a body that is aborted
+/// or dropped unfinished.
+///
+/// `declared`: the request's `content-length`, when it has one. hyper writes
+/// such a body with a length encoder that is done at its last byte, and then
+/// drops the body without polling it again -- so the channel's end would never
+/// be seen there. A body dropped with every declared byte handed over keeps
+/// listening for JS's end on a task of its own, and `on_end` runs then: undici
+/// restarts its headers timer at `end()`, not at the last byte, and a stream
+/// that writes its length and never ends gets no headers timeout in node
+/// either (measured on node v22.22.2 + undici 6.29.0).
+pub fn channel_body_then(
+    rx: tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
+    declared: Option<u64>,
+    on_end: impl FnOnce() + Send + Sync + 'static,
+) -> ReqBody {
+    ChannelBody {
+        rx: Some(rx),
+        remaining: declared,
+        on_end: Some(Box::new(on_end)),
+    }
+    .boxed()
+}
+
+type OnEnd = Box<dyn FnOnce() + Send + Sync>;
+
+/// The body [`channel_body_then`] builds.
+struct ChannelBody {
+    /// `None` only once dropped.
+    rx: Option<tokio::sync::mpsc::Receiver<Result<Vec<u8>, String>>>,
+    /// The declared length still to come; `None` with no declared length.
+    remaining: Option<u64>,
+    /// Taken when it runs, or when the body is aborted.
+    on_end: Option<OnEnd>,
+}
+
+impl hyper::body::Body for ChannelBody {
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Bytes>, BoxError>>> {
+        let this = self.get_mut();
+        let Some(rx) = this.rx.as_mut() else {
+            return std::task::Poll::Ready(None);
+        };
+        std::task::Poll::Ready(match std::task::ready!(rx.poll_recv(cx)) {
+            Some(Ok(chunk)) => {
+                if let Some(remaining) = &mut this.remaining {
+                    *remaining = remaining.saturating_sub(chunk.len() as u64);
+                }
+                Some(Ok(Frame::data(Bytes::from(chunk))))
+            }
+            Some(Err(text)) => {
+                this.on_end = None;
+                Some(Err(BoxError::from(text)))
+            }
+            None => {
+                if let Some(on_end) = this.on_end.take() {
+                    on_end();
+                }
+                None
+            }
         })
-    });
-    StreamBody::new(chunks).boxed()
+    }
+}
+
+impl Drop for ChannelBody {
+    fn drop(&mut self) {
+        // Only a body hyper dropped because its declared length is all out;
+        // one dropped short of it is unfinished (a failed or abandoned
+        // request), and has no `on_end`.
+        if self.remaining != Some(0) {
+            return;
+        }
+        let (Some(on_end), Some(mut rx)) = (self.on_end.take(), self.rx.take()) else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        runtime.spawn(async move {
+            loop {
+                match rx.recv().await {
+                    // More than declared is JS's refusal to make; nothing
+                    // reaches the wire.
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => return,
+                    None => return on_end(),
+                }
+            }
+        });
+    }
 }

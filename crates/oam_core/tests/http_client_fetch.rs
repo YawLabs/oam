@@ -885,6 +885,114 @@ fn the_headers_timeout_stops_while_an_unsent_request_is_re_dialled() {
     );
 }
 
+/// undici's `bodyTimeout` on a response body: a read that waits longer than
+/// the limit for bytes fails with `UND_ERR_BODY_TIMEOUT` and closes the
+/// connection, as undici destroys the socket; the bytes that came in time
+/// were delivered, and a body read with no limit is left alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_body_read_fails_after_the_body_timeout() {
+    within(async {
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let closed_tx = Arc::new(Mutex::new(Some(closed_tx)));
+        let server = serve(move |mut conn, _, _| {
+            let closed_tx = closed_tx.clone();
+            async move {
+                conn.request().await;
+                conn.send(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n")
+                    .await;
+                // Then nothing: the client has to give up on its own.
+                let closed = conn.closed_within(Duration::from_secs(5)).await;
+                if let Some(tx) = closed_tx.lock().unwrap().take() {
+                    let _ = tx.send(closed);
+                }
+            }
+        })
+        .await;
+        let transport = transport(ProxySource::None);
+        let reg = Reg::new();
+        const LIMIT_MS: u64 = 200;
+        let p = payload(
+            reg.fetch(
+                &transport,
+                json!({
+                    "url": format!("http://127.0.0.1:{}/", server.port),
+                    "body_timeout_ms": LIMIT_MS,
+                }),
+            )
+            .await,
+        );
+        let handle = handle_of(&p);
+        assert!(matches!(reg.read(handle).await, OpOutcome::Bytes(ref b) if b == b"hello"));
+        let start = std::time::Instant::now();
+        match reg.read(handle).await {
+            OpOutcome::NodeFailed { code, message, .. } => {
+                assert_eq!(code, "UND_ERR_BODY_TIMEOUT");
+                assert_eq!(message, "Body Timeout Error");
+            }
+            other => panic!("expected a body timeout, got {other:?}"),
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(LIMIT_MS) && elapsed < Duration::from_secs(3),
+            "{elapsed:?}"
+        );
+        assert!(closed_rx.await.unwrap(), "the connection was not closed");
+        assert!(
+            matches!(reg.read(handle).await, OpOutcome::Failed(ref t) if t.contains("is gone")),
+            "the timed-out body is gone"
+        );
+    })
+    .await;
+}
+
+/// undici's `bodyTimeout` counts from the last bytes off the wire, not from
+/// the start of a read: a gzip body trickled a byte at a time, every byte
+/// well inside the limit, is read whole although the header bytes decode to
+/// nothing and the body takes many limits in all. node v22.22.2 reads such a
+/// body; oam used to time one read out while the decoder was still taking
+/// the gzip header.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_body_timeout_restarts_with_every_frame_off_the_wire() {
+    within(async {
+        const GAP_MS: u64 = 40;
+        const LIMIT_MS: u64 = 250;
+        let compressed = gzip(b"hello world");
+        let total = Duration::from_millis(GAP_MS * compressed.len() as u64);
+        assert!(total > Duration::from_millis(3 * LIMIT_MS), "{total:?}");
+        let server = serve(move |mut conn, _, _| {
+            let compressed = compressed.clone();
+            async move {
+                conn.request().await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\n\r\n",
+                    compressed.len()
+                );
+                conn.send(head.as_bytes()).await;
+                for byte in compressed {
+                    tokio::time::sleep(Duration::from_millis(GAP_MS)).await;
+                    if !conn.send(&[byte]).await {
+                        return;
+                    }
+                }
+            }
+        })
+        .await;
+        let reg = Reg::new();
+        let p = payload(
+            reg.fetch(
+                &plain(),
+                json!({
+                    "url": format!("http://127.0.0.1:{}/", server.port),
+                    "body_timeout_ms": LIMIT_MS,
+                }),
+            )
+            .await,
+        );
+        assert_eq!(reg.text(handle_of(&p)).await, "hello world");
+    })
+    .await;
+}
+
 // ---------------------------------------------------------------- redirects
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1039,11 +1147,13 @@ async fn method_rewrite_matrix_on_the_wire() {
     .await;
 }
 
-/// A streamed body cannot be replayed, so only a 303 is followed (as a
-/// body-less GET). Any other redirect fails a fetch -- a 302 that would drop
-/// the body of a POST too (undici fetch/index.js:1273-1279, measured on node
-/// v22.22.2) -- and is returned as the response to the callers that are not
-/// fetch.
+/// A streamed body cannot be replayed, so a fetch follows only a 303 (as a
+/// body-less GET): any other redirect fails it -- a 302 that would drop the
+/// body of a POST too (undici fetch/index.js:1273-1279, measured on node
+/// v22.22.2). For the callers that are not fetch (undici.request) a redirect
+/// that keeps the body is the response, and one that drops it -- a 302 on a
+/// POST, a 303 -- is followed as a body-less GET, as undici's
+/// RedirectHandler does.
 #[tokio::test(flavor = "multi_thread")]
 async fn streamed_body_redirects() {
     within(async {
@@ -1060,7 +1170,7 @@ async fn streamed_body_redirects() {
         // a failure, redirected)
         let cases = [
             ("307", false, Some(307), false),
-            ("302", false, Some(302), false),
+            ("302", false, Some(200), true),
             ("303", false, Some(200), true),
             ("307", true, None, false),
             ("302", true, None, false),
@@ -1111,6 +1221,7 @@ async fn streamed_body_redirects() {
             [
                 "POST /307",
                 "POST /302",
+                "GET /after",
                 "POST /303",
                 "GET /after",
                 "POST /307",
@@ -1121,7 +1232,8 @@ async fn streamed_body_redirects() {
         );
         assert_eq!(seen[0].head.get("transfer-encoding"), Some("chunked"));
         assert_eq!(seen[0].body, b"abc");
-        assert!(seen[3].body.is_empty());
+        assert!(seen[2].body.is_empty());
+        assert!(seen[4].body.is_empty());
     })
     .await;
 }

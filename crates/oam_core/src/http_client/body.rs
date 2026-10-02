@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::BodyExt as _;
@@ -65,6 +66,9 @@ pub struct FetchBody {
     /// Body bytes off the wire so far, before any decoding: what undici
     /// compares with the content-length.
     wire_read: u64,
+    /// undici's `bodyTimeout`: the longest a read may wait for the wire's
+    /// next frame (`fetch`'s and `undici.request`'s; `None` for none).
+    timeout: Option<Duration>,
 }
 
 /// The response facts undici's parser weighs when the connection ends inside
@@ -122,6 +126,11 @@ pub enum BodyReadError {
     /// `SocketError: other side closed` on a kept-alive response
     /// ([`FetchBody::closed`] for the others).
     Closed,
+    /// The wire sent nothing for the body's whole `bodyTimeout` while a read
+    /// waited: undici's `BodyTimeoutError` (`UND_ERR_BODY_TIMEOUT`). The body
+    /// is dropped, which closes its connection, as undici destroys the
+    /// socket.
+    TimedOut,
     /// The connection failed with an OS error (a reset): node's `read
     /// ECONNRESET`, with this code and its errno.
     Io {
@@ -239,6 +248,9 @@ impl BodyReadError {
                 port: None,
                 dest: None,
             },
+            BodyReadError::TimedOut => {
+                OpOutcome::node_failed("UND_ERR_BODY_TIMEOUT", "Body Timeout Error")
+            }
             BodyReadError::Other(text) => OpOutcome::Failed(text.clone()),
         }
     }
@@ -254,6 +266,7 @@ impl FetchBody {
             coded: false,
             framing: None,
             wire_read: 0,
+            timeout: None,
         }
     }
 
@@ -278,6 +291,11 @@ impl FetchBody {
             },
             _ => BodyReadError::Closed,
         }
+    }
+
+    /// The body with undici's `bodyTimeout` (`None`: no limit).
+    pub fn timed(self, timeout: Option<Duration>) -> FetchBody {
+        FetchBody { timeout, ..self }
     }
 
     /// An undecoded body whose malformed framing reads as node's coded parse
@@ -320,7 +338,19 @@ impl FetchBody {
             let Some(incoming) = self.incoming.as_mut() else {
                 return Ok(None);
             };
-            match incoming.frame().await {
+            // undici's bodyTimeout counts from the last bytes off the wire
+            // (client-h1.js refreshes it on every socket chunk), not from the
+            // start of the read: a frame the decoder takes without yielding
+            // anything yet -- a gzip header trickled a byte at a time -- or an
+            // empty or trailer frame still restarts it.
+            let frame = match self.timeout {
+                None => incoming.frame().await,
+                Some(limit) => match tokio::time::timeout(limit, incoming.frame()).await {
+                    Ok(frame) => frame,
+                    Err(_) => return Err(self.fail(BodyReadError::TimedOut)),
+                },
+            };
+            match frame {
                 None => {
                     self.incoming = None;
                     if self.decoder.is_none() {
@@ -421,6 +451,12 @@ pub async fn read(
         return OpOutcome::Done;
     }
     match result {
+        // undici's bodyTimeout lapsed: the body is dropped, which closes its
+        // connection, as undici destroys the socket.
+        Err(BodyReadError::TimedOut) => {
+            drop(body);
+            OpOutcome::node_failed("UND_ERR_BODY_TIMEOUT", "Body Timeout Error")
+        }
         Ok(Some(chunk)) => {
             lock(&bodies).insert(handle, body);
             // A cancel can land between the tombstone check above and the

@@ -5270,7 +5270,7 @@ request wins over the factory HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT Header
 /// `TypeError: fetch failed` with the real error only as `cause`. The
 /// expected output is node v22.22.2 + undici 6.29.0's, line for line.
 #[test]
-fn undici_request_rejects_with_the_error_itself() {
+fn undici_request_body_and_connect_failures_reject_unwrapped() {
     let script = write_temp(
         "undici_request_errors/main.mjs",
         r##"import net from 'node:net';
@@ -5523,6 +5523,1104 @@ slow-tls ok 200 ok
 slow-tls-global ok 200 ok
 slow-tls-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT late=true closed=true
 redirect-hops ok 200 ok";
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
+/// `undici.request()` takes every body undici's Request takes -- a string, a
+/// Buffer / typed array / DataView / ArrayBuffer, a Readable, an iterable or
+/// async iterable (a web ReadableStream included), a Blob -- and frames it as
+/// undici's writeH1 does: a known length with content-length, a streamed
+/// body chunked (or with the caller's content-length), an empty one as
+/// `content-length: 0` on a method that expects a payload. A chunk that is
+/// not a string or a buffer, a body that disagrees with its content-length,
+/// a stream that errors or closes early and a body of any other type fail as
+/// in undici, with undici's own error and nothing complete on the wire. Up
+/// to this fix oam's fetch stringified every non-string, non-buffer body, so
+/// a Readable went out as `[object Object]`. The expected output is node
+/// v22.22.2 + undici 6.29.0's, line for line, except the last: undici
+/// encodes a FormData as multipart/form-data, which oam cannot yet, so it
+/// refuses one (docs/node-divergences.md).
+#[test]
+fn undici_request_sends_every_body_undici_takes() {
+    let script = write_temp(
+        "undici_request_bodies/main.mjs",
+        r##"import net from 'node:net';
+import { Readable, PassThrough } from 'node:stream';
+import { request } from 'undici';
+
+// A raw server that reports how each request was framed and what its body was.
+const seen = new Map();
+const server = net.createServer((s) => {
+  s.on('error', () => {});
+  let buf = Buffer.alloc(0);
+  let done = false;
+  const finish = (rec) => {
+    if (done) return;
+    done = true;
+    seen.set(rec.path, rec);
+    s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok');
+  };
+  s.on('data', (d) => {
+    buf = Buffer.concat([buf, d]);
+    const end = buf.indexOf('\r\n\r\n');
+    if (end < 0) return;
+    const lines = buf.subarray(0, end).toString('latin1').split('\r\n');
+    const [method, path] = lines[0].split(' ');
+    const headers = {};
+    for (const l of lines.slice(1)) {
+      const i = l.indexOf(':');
+      headers[l.slice(0, i).toLowerCase()] = l.slice(i + 1).trim();
+    }
+    const rest = buf.subarray(end + 4);
+    const rec = { method, path, ct: headers['content-type'] ?? null };
+    if (headers['content-length'] !== undefined) {
+      const n = Number(headers['content-length']);
+      rec.framing = 'length ' + n;
+      if (rest.length < n) return;
+      rec.body = rest.subarray(0, n).toString('utf8');
+      return finish(rec);
+    }
+    if (/chunked/i.test(headers['transfer-encoding'] ?? '')) {
+      rec.framing = 'chunked';
+      let off = 0;
+      const parts = [];
+      for (;;) {
+        const nl = rest.indexOf('\r\n', off);
+        if (nl < 0) return;
+        const size = parseInt(rest.subarray(off, nl).toString('latin1'), 16);
+        if (rest.length < nl + 2 + size + 2) return;
+        if (size === 0) break;
+        parts.push(rest.subarray(nl + 2, nl + 2 + size));
+        off = nl + 2 + size + 2;
+      }
+      rec.body = Buffer.concat(parts).toString('utf8');
+      return finish(rec);
+    }
+    rec.framing = 'none';
+    rec.body = '';
+    finish(rec);
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+
+async function attempt(label, opts) {
+  const path = '/' + label;
+  try {
+    const r = await request(base + path, { method: 'POST', ...opts });
+    await r.body.text();
+    const rec = seen.get(path);
+    console.log(label, 'ok', rec ? `${rec.method} ${rec.framing} ${JSON.stringify(rec.body)} ct=${rec.ct}` : 'unseen');
+  } catch (e) {
+    await new Promise((r) => setTimeout(r, 50));
+    console.log(label, 'failed', e.name, e.code, JSON.stringify(e.message), 'seen=' + seen.has(path));
+  }
+}
+
+const gen = async function* (chunks, delay = 0) {
+  for (const c of chunks) {
+    if (delay) await new Promise((r) => setTimeout(r, delay));
+    yield c;
+  }
+};
+
+await attempt('string', { body: 'héllo' });
+await attempt('empty-string', { body: '' });
+await attempt('buffer', { body: Buffer.from('buf') });
+await attempt('uint8array', { body: new Uint8Array([97, 98, 99]) });
+await attempt('dataview', { body: new DataView(new Uint8Array([100, 101]).buffer) });
+await attempt('arraybuffer', { body: new Uint8Array([120, 121]).buffer });
+await attempt('readable', { body: Readable.from(['a', 'bc', 'déf']) });
+await attempt('readable-buffers', { body: Readable.from([Buffer.from('x'), Buffer.from('yz')]) });
+await attempt('readable-cl', { body: Readable.from(['ab', 'cd']), headers: { 'content-length': '4' } });
+await attempt('readable-empty', { body: Readable.from([]) });
+await attempt('readable-empty-get', { method: 'GET', body: Readable.from([]) });
+await attempt('readable-get', { method: 'GET', body: Readable.from(['g']) });
+await attempt('readable-put', { method: 'PUT', body: Readable.from(['p']) });
+await attempt('passthrough', { body: (() => { const p = new PassThrough(); setTimeout(() => { p.write('one'); p.end('two'); }, 50); return p; })() });
+await attempt('async-gen', { body: gen(['g1', 'g2'], 20) });
+await attempt('async-gen-buffers', { body: gen([Buffer.from('b1'), new Uint8Array([98, 50])]) });
+await attempt('sync-iterable', { body: ['s1', 's2'] });
+await attempt('sync-iterable-buffers', { body: [Buffer.from('i1'), Buffer.from('i2')] });
+await attempt('set-iterable', { body: new Set(['z1']) });
+await attempt('web-stream', { body: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode('w1')); c.enqueue(new TextEncoder().encode('w2')); c.close(); } }) });
+await attempt('blob', { body: new Blob(['bl'], { type: 'text/x-blob' }) });
+await attempt('blob-untyped', { body: new Blob(['bu']) });
+await attempt('cl-too-long', { body: Readable.from(['abc']), headers: { 'content-length': '5' } });
+await attempt('cl-too-short', { body: Readable.from(['abcdef']), headers: { 'content-length': '2' } });
+await attempt('cl-iter-too-short', { body: gen(['abcdef']), headers: { 'content-length': '2' } });
+await attempt('cl-iter-too-long', { body: gen(['ab']), headers: { 'content-length': '5' } });
+await attempt('stream-error', { body: new Readable({ read() { this.destroy(new Error('boom')); } }) });
+await attempt('stream-error-later', { body: (() => { let n = 0; return new Readable({ read() { if (n++ === 0) this.push('first'); else setTimeout(() => this.destroy(new Error('later')), 20); } }); })() });
+await attempt('gen-throws', { body: (async function* () { yield 'x'; throw new Error('gen boom'); })() });
+await attempt('gen-number', { body: gen([5]) });
+await attempt('gen-object', { body: gen([{ a: 1 }]) });
+await attempt('number', { body: 5 });
+await attempt('object', { body: { a: 1 } });
+await attempt('boolean', { body: true });
+await attempt('destroyed-stream', { body: (() => { const r = Readable.from(['q']); r.destroy(); return r; })() });
+await attempt('ended-stream', { body: await (async () => { const r = Readable.from(['e']); for await (const _ of r); return r; })() });
+await attempt('url-params', { body: new URLSearchParams('a=1') });
+const fd = new FormData(); fd.set('k', 'v');
+try {
+  const r = await request(base + '/formdata', { method: 'POST', body: fd });
+  await r.body.text();
+  const rec = seen.get('/formdata');
+  console.log('formdata ok', rec.framing.split(' ')[0], /^multipart\/form-data; boundary=/.test(rec.ct), rec.body.includes('name="k"\r\n\r\nv\r\n'));
+} catch (e) { console.log('formdata failed', e.name, e.code, e.message); }
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"string ok POST length 6 "héllo" ct=null
+empty-string ok POST length 0 "" ct=null
+buffer ok POST length 3 "buf" ct=null
+uint8array ok POST length 3 "abc" ct=null
+dataview ok POST length 2 "de" ct=null
+arraybuffer ok POST length 2 "xy" ct=null
+readable ok POST chunked "abcdéf" ct=null
+readable-buffers ok POST chunked "xyz" ct=null
+readable-cl ok POST length 4 "abcd" ct=null
+readable-empty ok POST length 0 "" ct=null
+readable-empty-get ok GET none "" ct=null
+readable-get ok GET chunked "g" ct=null
+readable-put ok PUT chunked "p" ct=null
+passthrough ok POST chunked "onetwo" ct=null
+async-gen ok POST chunked "g1g2" ct=null
+async-gen-buffers ok POST chunked "b1b2" ct=null
+sync-iterable ok POST chunked "s1s2" ct=null
+sync-iterable-buffers ok POST chunked "i1i2" ct=null
+set-iterable ok POST chunked "z1" ct=null
+web-stream ok POST chunked "w1w2" ct=null
+blob ok POST length 2 "bl" ct=text/x-blob
+blob-untyped ok POST length 2 "bu" ct=null
+cl-too-long failed RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header" seen=false
+cl-too-short failed RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header" seen=false
+cl-iter-too-short failed RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header" seen=false
+cl-iter-too-long failed RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header" seen=false
+stream-error failed Error undefined "boom" seen=false
+stream-error-later failed Error undefined "later" seen=false
+gen-throws failed Error undefined "gen boom" seen=false
+gen-number failed TypeError ERR_INVALID_ARG_TYPE "The \"string\" argument must be of type string or an instance of Buffer or ArrayBuffer. Received type number (5)" seen=false
+gen-object failed TypeError ERR_INVALID_ARG_TYPE "The \"string\" argument must be of type string or an instance of Buffer or ArrayBuffer. Received an instance of Object" seen=false
+number failed InvalidArgumentError UND_ERR_INVALID_ARG "body must be a string, a Buffer, a Readable stream, an iterable, or an async iterable" seen=false
+object failed InvalidArgumentError UND_ERR_INVALID_ARG "body must be a string, a Buffer, a Readable stream, an iterable, or an async iterable" seen=false
+boolean failed InvalidArgumentError UND_ERR_INVALID_ARG "body must be a string, a Buffer, a Readable stream, an iterable, or an async iterable" seen=false
+destroyed-stream failed AbortError UND_ERR_ABORTED "Request aborted" seen=false
+ended-stream ok POST length 0 "" ct=null
+url-params failed TypeError ERR_INVALID_ARG_TYPE "The \"string\" argument must be of type string or an instance of Buffer or ArrayBuffer. Received an instance of Array" seen=false
+formdata failed NotSupportedError UND_ERR_NOT_SUPPORTED a FormData body is not supported by oam's undici.request(): oam has no multipart/form-data encoder yet. Send it with fetch() through a library that encodes it, or encode it yourself"##;
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
+/// `undici.request()` consumes the caller's `content-length` as undici does:
+/// checked against a body of known length (a mismatch on a method that
+/// sends one is undici's RequestContentLengthMismatchError), never sent as
+/// given, and replaced by `content-length: 0` for a POST / PUT / PATCH with
+/// no body. Its refusals -- that one, a hop-by-hop header, a bad
+/// content-length -- reject with undici's error itself, not wrapped in
+/// `TypeError: fetch failed`, and header arrays are one line per value, a
+/// flat [name, value, ...] array included. The expected output is node
+/// v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_request_frames_and_refuses_as_undici_does() {
+    let script = write_temp(
+        "undici_request_refusals/main.mjs",
+        r##"import net from 'node:net';
+import { request, errors } from 'undici';
+const heads = [];
+const srv = net.createServer((s) => {
+  let buf = '';
+  s.on('error', () => {});
+  s.on('data', (c) => {
+    buf += c.toString('latin1');
+    const i = buf.indexOf('\r\n\r\n');
+    if (i < 0) return;
+    heads.push(buf.slice(0, i).split('\r\n').filter((l) => !/^(host|connection|user-agent|accept|accept-encoding|accept-language|sec-fetch-mode):/i.test(l)).join(' | '));
+    s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok');
+    buf = '';
+  });
+});
+await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const U = `http://127.0.0.1:${srv.address().port}/p`;
+for (const [n, opts] of [
+  ['transfer-encoding', { method: 'POST', body: 'AB', headers: { 'transfer-encoding': 'chunked' } }],
+  ['expect', { headers: { expect: '100-continue' } }],
+  ['cl-mismatch', { method: 'POST', body: 'AB', headers: { 'content-length': '9' } }],
+  ['cl-mismatch-short', { method: 'POST', body: 'ABCD', headers: { 'content-length': '2' } }],
+  ['cl-no-body-post', { method: 'POST', headers: { 'content-length': '5' } }],
+  ['cl-zero-body', { method: 'POST', body: 'AB', headers: { 'content-length': '0' } }],
+  ['cl-bad', { method: 'POST', body: 'AB', headers: { 'content-length': 'x' } }],
+  ['no-body-post', { method: 'POST' }],
+  ['no-body-put', { method: 'PUT' }],
+  ['no-body-patch', { method: 'PATCH' }],
+  ['no-body-delete', { method: 'DELETE' }],
+  ['no-body-get', { method: 'GET' }],
+  ['flat-array', { headers: ['x-a', '1', 'x-b', '2'] }],
+  ['array-value', { headers: { 'x-m': ['1', '2'] } }],
+]) {
+  const before = heads.length;
+  try {
+    const r = await request(U, opts);
+    await r.body.text();
+    console.log(n, 'ok', heads[heads.length - 1]);
+  } catch (e) {
+    console.log(n, 'throw', e.name, e.code, JSON.stringify(e.message), 'cause=' + (e.cause ? e.cause.name : 'none'), 'undici=' + (e instanceof errors.UndiciError), '| wire:', heads.length > before ? 'SENT' : 'nothing');
+  }
+}
+srv.close();
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"transfer-encoding throw InvalidArgumentError UND_ERR_INVALID_ARG "invalid transfer-encoding header" cause=none undici=true | wire: nothing
+expect throw NotSupportedError UND_ERR_NOT_SUPPORTED "expect header not supported" cause=none undici=true | wire: nothing
+cl-mismatch throw RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header" cause=none undici=true | wire: nothing
+cl-mismatch-short throw RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header" cause=none undici=true | wire: nothing
+cl-no-body-post ok POST /p HTTP/1.1 | content-length: 0
+cl-zero-body throw RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header" cause=none undici=true | wire: nothing
+cl-bad throw InvalidArgumentError UND_ERR_INVALID_ARG "invalid content-length header" cause=none undici=true | wire: nothing
+no-body-post ok POST /p HTTP/1.1 | content-length: 0
+no-body-put ok PUT /p HTTP/1.1 | content-length: 0
+no-body-patch ok PATCH /p HTTP/1.1 | content-length: 0
+no-body-delete ok DELETE /p HTTP/1.1
+no-body-get ok GET /p HTTP/1.1
+flat-array ok GET /p HTTP/1.1 | x-a: 1 | x-b: 2
+array-value ok GET /p HTTP/1.1 | x-m: 1 | x-m: 2"##;
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
+/// undici's `headersTimeout` does not count the time a streamed request body
+/// takes: undici ignores the timer while its AsyncWriter is writing and
+/// restarts it at the body's end, so an 800 ms upload under a 500 ms limit
+/// succeeds against an origin that answers 300 ms after the body, and a
+/// silent origin still times out once the body is over (and its connection
+/// is closed). The caller's abort, a body error and an origin that answers
+/// before the body ends all stop the body (`finalized`: the generator was
+/// returned). The transport holds the timer off until the body channel's
+/// end; without that the slow-* lines failed with HeadersTimeoutError. The
+/// expected output is node v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_headers_timeout_starts_when_a_streamed_body_ends() {
+    let script = write_temp(
+        "undici_headers_timeout_streamed_body/main.mjs",
+        r##"import net from 'node:net';
+import { PassThrough } from 'node:stream';
+import { request } from 'undici';
+
+// An origin that answers `delay` ms after the request body has fully arrived
+// (chunked or content-length), or never (null), or as soon as the head is in
+// ('early').
+let closed = 0;
+function origin(delay) {
+  return net.createServer((s) => {
+    s.on('error', () => {});
+    s.on('close', () => { closed++; });
+    let buf = Buffer.alloc(0);
+    let answered = false;
+    s.on('data', (d) => {
+      buf = Buffer.concat([buf, d]);
+      const end = buf.indexOf('\r\n\r\n');
+      if (end < 0 || answered) return;
+      if (delay === 'early') {
+        answered = true;
+        s.end('HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nearly');
+        return;
+      }
+      const head = buf.subarray(0, end).toString('latin1');
+      const rest = buf.subarray(end + 4);
+      const cl = /content-length: (\d+)/i.exec(head);
+      const complete = cl ? rest.length >= Number(cl[1]) : rest.includes('0\r\n\r\n') || !/chunked/i.test(head);
+      if (!complete) return;
+      answered = true;
+      if (delay !== null) setTimeout(() => s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok'), delay);
+    });
+  });
+}
+const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${srv.address().port}`)));
+const answers = await listen(origin(300));
+const silent = await listen(origin(null));
+const early = await listen(origin('early'));
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let finalized = false;
+async function* slowBody(gap) {
+  try {
+    yield 'a';
+    await sleep(gap);
+    yield 'b';
+  } finally {
+    finalized = true;
+  }
+}
+async function* lateFirst(gap) {
+  await sleep(gap);
+  yield 'late';
+}
+function slowReadable(gap) {
+  const p = new PassThrough();
+  p.write('a');
+  setTimeout(() => p.end('b'), gap);
+  return p;
+}
+async function* endless() {
+  try {
+    for (;;) { yield 'x'; await sleep(50); }
+  } finally {
+    finalized = true;
+  }
+}
+
+async function attempt(label, fn, lateMs) {
+  const t0 = Date.now();
+  closed = 0;
+  finalized = false;
+  // A request that never settles is a failure of its own, not a hung test.
+  const hung = setTimeout(() => { console.log(label, 'never settled'); process.exit(0); }, 5000);
+  try {
+    const r = await fn();
+    console.log(label, 'ok', r.statusCode, await r.body.text());
+  } catch (e) {
+    const late = Date.now() - t0 >= lateMs;
+    await sleep(300);
+    console.log(label, 'failed', e.name, e.code, JSON.stringify(e.message), 'late=' + late, 'closed=' + (closed > 0));
+  }
+  clearTimeout(hung);
+  await sleep(300);
+  console.log(label, 'finalized=' + finalized);
+}
+
+// The headers timer counts from the end of a streamed body, not its start.
+await attempt('slow-iterable', () => request(answers, { method: 'POST', body: slowBody(800), headersTimeout: 500 }));
+await attempt('slow-readable', () => request(answers, { method: 'POST', body: slowReadable(800), headersTimeout: 500 }));
+await attempt('late-first-chunk', () => request(answers, { method: 'POST', body: lateFirst(800), headersTimeout: 500 }));
+await attempt('slow-cl', () => request(answers, { method: 'PUT', body: slowBody(800), headers: { 'content-length': '2' }, headersTimeout: 500 }));
+await attempt('slow-silent', () => request(silent, { method: 'POST', body: slowBody(800), headersTimeout: 400 }), 1150);
+// The caller's abort while the body is still going out.
+await attempt('abort-mid-body', () => { const ac = new AbortController(); setTimeout(() => ac.abort(new Error('mine')), 300); return request(silent, { method: 'POST', body: endless(), signal: ac.signal }); }, 0);
+// A server that answers before the body is over.
+await attempt('early-answer', () => request(early, { method: 'POST', body: endless() }));
+// A body error after the request is out.
+await attempt('error-mid-body', () => request(silent, { method: 'POST', body: (async function* () { yield 'x'; await sleep(200); throw new Error('mid'); })(), headersTimeout: 5000 }), 0);
+// A body of known length (an ended stream, or the caller's content-length):
+// the timer still starts at the body's end, which is not its last byte.
+await attempt('known-silent', () => { const p = new PassThrough(); p.end('abc'); return request(silent, { method: 'POST', body: p, headersTimeout: 400 }); }, 350);
+await attempt('cl-silent', () => request(silent, { method: 'PUT', body: slowBody(300), headers: { 'content-length': '2' }, headersTimeout: 400 }), 650);
+await attempt('cl-late-end-silent', () => { const p = new PassThrough(); p.write('ab'); setTimeout(() => p.end(), 600); return request(silent, { method: 'PUT', body: p, headers: { 'content-length': '2' }, headersTimeout: 400 }); }, 950);
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"slow-iterable ok 200 ok
+slow-iterable finalized=true
+slow-readable ok 200 ok
+slow-readable finalized=false
+late-first-chunk ok 200 ok
+late-first-chunk finalized=false
+slow-cl ok 200 ok
+slow-cl finalized=true
+slow-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT "Headers Timeout Error" late=true closed=true
+slow-silent finalized=true
+abort-mid-body failed Error undefined "mine" late=true closed=true
+abort-mid-body finalized=true
+early-answer ok 200 early
+early-answer finalized=true
+error-mid-body failed Error undefined "mid" late=true closed=true
+error-mid-body finalized=false
+known-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT "Headers Timeout Error" late=true closed=true
+known-silent finalized=false
+cl-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT "Headers Timeout Error" late=true closed=true
+cl-silent finalized=true
+cl-late-end-silent failed HeadersTimeoutError UND_ERR_HEADERS_TIMEOUT "Headers Timeout Error" late=true closed=true
+cl-late-end-silent finalized=false"##;
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
+/// `fetch()` sends a Blob or File as its bytes, with its `type` as the
+/// Content-Type unless the caller set one or it is empty; a URLSearchParams
+/// as its serialization, `application/x-www-form-urlencoded;charset=UTF-8`
+/// unless the caller set a type; and no body or an empty one with
+/// `content-length: 0` on POST, PUT and PATCH, as undici's writeH1 does.
+/// Up to this fix a Blob went out as the text "[object Blob]", a
+/// URLSearchParams as `text/plain`, and an empty POST with no length at all.
+/// The expected output is node v22.22.2's, line for line.
+#[test]
+fn fetch_sends_blob_search_params_and_empty_bodies_as_node_does() {
+    for (name, js, expected) in [
+        (
+            "fetch_extracts_bodies/kinds.mjs",
+            r##"// fetch()'s Blob, File and URLSearchParams bodies: their bytes and their
+// Content-Type, unless the caller set one.
+import http from 'node:http';
+const server = http.createServer((req, res) => { const c = []; req.on('data', (d) => c.push(d)); req.on('end', () => { res.setHeader('connection', 'close'); res.end(JSON.stringify({ cl: req.headers['content-length'] ?? null, ct: req.headers['content-type'] ?? null, body: Buffer.concat(c).toString('latin1') })); }); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+for (const [label, body, headers] of [
+  ['usp', new URLSearchParams({ a: '1', b: 'x y', c: 'é&' })],
+  ['usp-typed', new URLSearchParams({ a: '1' }), { 'content-type': 'text/x-mine' }],
+  ['blob', new Blob(['hi'], { type: 'text/x-hi' })],
+  ['blob-untyped', new Blob([new Uint8Array([0, 255, 1])])],
+  ['blob-typed', new Blob(['hi'], { type: 'text/x-hi' }), { 'content-type': 'application/x-caller' }],
+  ['blob-empty', new Blob([])],
+  ['file', new File(['f!'], 'a.txt', { type: 'text/plain' })],
+  ['blob-cl-wrong', new Blob(['abc']), { 'content-length': '5' }],
+]) {
+  try { const r = await fetch(url, { method: 'POST', body, headers }); console.log(label, await r.text()); } catch (e) { console.log(label, 'rejected', e.name, e.message, e.cause?.name); }
+}
+process.exit(0);
+"##,
+            r##"usp {"cl":"21","ct":"application/x-www-form-urlencoded;charset=UTF-8","body":"a=1&b=x+y&c=%C3%A9%26"}
+usp-typed {"cl":"3","ct":"text/x-mine","body":"a=1"}
+blob {"cl":"2","ct":"text/x-hi","body":"hi"}
+blob-untyped {"cl":"3","ct":null,"body":"\u0000ÿ\u0001"}
+blob-typed {"cl":"2","ct":"application/x-caller","body":"hi"}
+blob-empty {"cl":"0","ct":null,"body":""}
+file {"cl":"2","ct":"text/plain","body":"f!"}
+blob-cl-wrong rejected TypeError fetch failed RequestContentLengthMismatchError"##,
+        ),
+        (
+            "fetch_extracts_bodies/empty.mjs",
+            r##"// fetch() with no body or an empty one: `content-length: 0` on a method
+// that expects a payload, nothing on the others.
+import http from 'node:http';
+const server = http.createServer((req, res) => { req.resume(); req.on('end', () => { res.setHeader('connection', 'close'); res.end(JSON.stringify({ cl: req.headers['content-length'] ?? null, te: req.headers['transfer-encoding'] ?? null })); }); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+for (const m of ['POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH']) for (const [label, body] of [['none', undefined], ['str', ''], ['u8', new Uint8Array(0)]]) {
+  const r = await fetch(url, { method: m, body }); console.log(m, label, await r.text());
+}
+process.exit(0);
+"##,
+            r##"POST none {"cl":"0","te":null}
+POST str {"cl":"0","te":null}
+POST u8 {"cl":"0","te":null}
+PUT none {"cl":"0","te":null}
+PUT str {"cl":"0","te":null}
+PUT u8 {"cl":"0","te":null}
+DELETE none {"cl":null,"te":null}
+DELETE str {"cl":null,"te":null}
+DELETE u8 {"cl":null,"te":null}
+OPTIONS none {"cl":null,"te":null}
+OPTIONS str {"cl":null,"te":null}
+OPTIONS u8 {"cl":null,"te":null}
+PATCH none {"cl":"0","te":null}
+PATCH str {"cl":"0","te":null}
+PATCH u8 {"cl":"0","te":null}"##,
+        ),
+    ] {
+        let script = write_temp(name, js);
+        let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+        let (stdout, stderr) = run_script_ok(&script, out);
+        assert_eq!(
+            stdout.trim().replace("\r\n", "\n"),
+            expected,
+            "{name} stderr: {stderr}"
+        );
+    }
+}
+
+/// `fetch()` streams a ReadableStream or async-iterable request body, as
+/// node's does: chunked unless a `content-length` is declared, nothing sent
+/// before the first chunk and `content-length: 0` for a stream that ends
+/// empty, string and byte chunks taken and anything else refused with
+/// Buffer.from's error, a stream that errors (or a length that disagrees)
+/// failing the fetch with `fetch failed` and the error as the cause, an
+/// abort that does not cancel the source, a 307 that would resend the body
+/// failing the fetch, and a response that is over first stopping the upload
+/// and closing the connection. The Request constructor's refusals come
+/// first: a body on GET or HEAD, a locked stream, a streamed body without
+/// `duplex: 'half'`, a `duplex` outside its enum. A sync iterable is not
+/// streamed. Up to this fix every such body was stringified and sent as
+/// text: `[object ReadableStream]`, with a `text/plain` content-type and a
+/// 200. The expected output is node v22.22.2's, line for line.
+#[test]
+fn fetch_streams_a_readable_stream_or_async_iterable_body() {
+    for (name, js, expected) in [
+        (
+            "fetch_streams_a_body/streams.mjs",
+            r##"// fetch() with a streamed request body (a ReadableStream, an async
+// iterable), as node's fetch sends or refuses it.
+import http from 'node:http';
+
+const server = http.createServer((req, res) => {
+  const chunks = [];
+  req.on('data', (c) => chunks.push(c));
+  req.on('end', () => {
+    res.setHeader('connection', 'close');
+    res.end(JSON.stringify({
+      method: req.method,
+      te: req.headers['transfer-encoding'] ?? null,
+      cl: req.headers['content-length'] ?? null,
+      ct: req.headers['content-type'] ?? null,
+      body: Buffer.concat(chunks).toString(),
+    }));
+  });
+  req.on('error', () => {});
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const enc = new TextEncoder();
+const pulled = (n, gap) => {
+  let i = 0;
+  return new ReadableStream({
+    async pull(c) {
+      if (i >= n) return c.close();
+      await sleep(gap);
+      c.enqueue(enc.encode('x' + ++i));
+    },
+  });
+};
+async function show(label, mk) {
+  try {
+    const r = await mk();
+    console.log(label, r.status, await r.text());
+  } catch (e) {
+    console.log(label, 'rejected', e.name, JSON.stringify(e.message), 'cause', e.cause ? `${e.cause.name} ${JSON.stringify(e.cause.message)}` : 'none');
+  }
+}
+await show('stream-half', () => fetch(url, { method: 'POST', body: pulled(5, 20), duplex: 'half' }));
+await show('stream-no-duplex', () => fetch(url, { method: 'POST', body: pulled(2, 0) }));
+await show('stream-empty', () => fetch(url, { method: 'POST', body: new ReadableStream({ start(c) { c.close(); } }), duplex: 'half' }));
+await show('stream-put-typed', () => fetch(url, { method: 'PUT', body: pulled(2, 0), duplex: 'half', headers: { 'content-type': 'application/octet-stream' } }));
+await show('async-gen', () => fetch(url, { method: 'POST', body: (async function* () { yield enc.encode('a'); yield enc.encode('b'); })(), duplex: 'half' }));
+await show('async-gen-strings', () => fetch(url, { method: 'POST', body: (async function* () { yield 'a'; yield 'b'; })(), duplex: 'half' }));
+await show('stream-string-chunk', () => fetch(url, { method: 'POST', body: new ReadableStream({ start(c) { c.enqueue('str'); c.close(); } }), duplex: 'half' }));
+await show('stream-errors', () => fetch(url, { method: 'POST', body: new ReadableStream({ async pull(c) { await sleep(10); c.error(new Error('boom')); } }), duplex: 'half' }));
+await show('stream-get', () => fetch(url, { method: 'GET', body: pulled(1, 0), duplex: 'half' }));
+{
+  const s = pulled(1, 0);
+  s.getReader();
+  await show('stream-locked', () => fetch(url, { method: 'POST', body: s, duplex: 'half' }));
+}
+await show('stream-cl-header', () => fetch(url, { method: 'POST', body: pulled(2, 0), duplex: 'half', headers: { 'content-length': '4' } }));
+{
+  const ac = new AbortController();
+  let cancelled = 'no';
+  const s = new ReadableStream({ async pull(c) { await sleep(50); c.enqueue(enc.encode('z')); }, cancel(r) { cancelled = String(r?.name ?? r); } });
+  setTimeout(() => ac.abort(), 150);
+  await show('stream-abort', () => fetch(url, { method: 'POST', body: s, duplex: 'half', signal: ac.signal }));
+  await sleep(100);
+  console.log('stream-abort cancelled', cancelled);
+}
+// The 307 a stream body cannot follow.
+{
+  const redir = http.createServer((req, res) => { req.resume(); req.on('end', () => { res.writeHead(307, { location: url, connection: 'close' }); res.end(); }); });
+  await new Promise((r) => redir.listen(0, '127.0.0.1', r));
+  await show('stream-307', () => fetch(`http://127.0.0.1:${redir.address().port}/`, { method: 'POST', body: pulled(1, 0), duplex: 'half' }));
+}
+process.exit(0);
+"##,
+            r##"stream-half 200 {"method":"POST","te":"chunked","cl":null,"ct":null,"body":"x1x2x3x4x5"}
+stream-no-duplex rejected TypeError "RequestInit: duplex option is required when sending a body." cause none
+stream-empty 200 {"method":"POST","te":null,"cl":"0","ct":null,"body":""}
+stream-put-typed 200 {"method":"PUT","te":"chunked","cl":null,"ct":"application/octet-stream","body":"x1x2"}
+async-gen 200 {"method":"POST","te":"chunked","cl":null,"ct":null,"body":"ab"}
+async-gen-strings 200 {"method":"POST","te":"chunked","cl":null,"ct":null,"body":"ab"}
+stream-string-chunk 200 {"method":"POST","te":"chunked","cl":null,"ct":null,"body":"str"}
+stream-errors rejected TypeError "fetch failed" cause Error "boom"
+stream-get rejected TypeError "Request with GET/HEAD method cannot have body." cause none
+stream-locked rejected TypeError "Response body object should not be disturbed or locked" cause none
+stream-cl-header 200 {"method":"POST","te":null,"cl":"4","ct":null,"body":"x1x2"}
+stream-abort rejected AbortError "This operation was aborted" cause none
+stream-abort cancelled no
+stream-307 rejected TypeError "fetch failed" cause Error """##,
+        ),
+        (
+            "fetch_streams_a_body/early.mjs",
+            r##"// A fetch whose response is over while its streamed body is still going out
+// (an origin that answers 413 at once and keeps the connection): the upload
+// stops and the connection is closed; the generator is not returned.
+import net from 'node:net';
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let srvBytes = 0, srvClosed = 0;
+const server = net.createServer((s) => { s.on('error', () => {}); s.on('close', () => { srvClosed++; }); let a = false; s.on('data', (d) => { srvBytes += d.length; if (!a) { a = true; s.write('HTTP/1.1 413 Payload Too Large\r\ncontent-length: 2\r\n\r\nno'); } }); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+let produced = 0, returned = false;
+const gen = async function* () { try { for (;;) { await sleep(20); produced++; yield new Uint8Array(1024); } } finally { returned = true; } };
+const r = await fetch(`http://127.0.0.1:${server.address().port}/`, { method: 'POST', body: gen(), duplex: 'half' });
+console.log('status', r.status, await r.text());
+const p0 = produced, b0 = srvBytes; await sleep(1000);
+console.log('after: produced<=2', produced - p0 <= 2, 'bytes<=2048', srvBytes - b0 <= 2048, 'returned', returned, 'srvClosed', srvClosed);
+process.exit(0);
+"##,
+            r##"status 413 no
+after: produced<=2 true bytes<=2048 true returned false srvClosed 1"##,
+        ),
+        (
+            "fetch_streams_a_body/shapes.mjs",
+            r##"// fetch()'s other body shapes: the chunks a streamed body may yield, what
+// is not streamed, and the Request constructor's refusals.
+import http from 'node:http';
+import { Readable } from 'node:stream';
+const server = http.createServer((req, res) => {
+  const chunks = [];
+  req.on('data', (c) => chunks.push(c));
+  req.on('end', () => {
+    res.setHeader('connection', 'close');
+    res.end(JSON.stringify({ te: req.headers['transfer-encoding'] ?? null, cl: req.headers['content-length'] ?? null, ct: req.headers['content-type'] ?? null, body: Buffer.concat(chunks).toString() }));
+  });
+  req.on('error', () => {});
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+async function show(label, mk) {
+  try {
+    const r = await mk();
+    console.log(label, r.status, await r.text());
+  } catch (e) {
+    console.log(label, 'rejected', e.name, JSON.stringify(e.message), 'cause', e.cause ? `${e.cause.name} ${e.cause.code} ${JSON.stringify(e.cause.message)}` : 'none');
+  }
+}
+const gen = (...items) => (async function* () { for (const i of items) yield i; })();
+await show('gen-no-duplex', () => fetch(url, { method: 'POST', body: gen(new Uint8Array([97])) }));
+await show('sync-iter', () => fetch(url, { method: 'POST', body: [new Uint8Array([97])], duplex: 'half' }));
+await show('gen-number', () => fetch(url, { method: 'POST', body: gen(42), duplex: 'half' }));
+await show('gen-object', () => fetch(url, { method: 'POST', body: gen({}), duplex: 'half' }));
+await show('gen-arraybuffer', () => fetch(url, { method: 'POST', body: gen(new ArrayBuffer(2)), duplex: 'half' }));
+await show('gen-buffer', () => fetch(url, { method: 'POST', body: gen(Buffer.from('buf')), duplex: 'half' }));
+await show('gen-throws-first', () => fetch(url, { method: 'POST', body: (async function* () { throw new Error('first'); })(), duplex: 'half' }));
+await show('readable', () => fetch(url, { method: 'POST', body: Readable.from(['r1', 'r2']), duplex: 'half' }));
+await show('head-body', () => fetch(url, { method: 'HEAD', body: 'x' }));
+await show('get-string', () => fetch(url, { method: 'GET', body: 'x' }));
+await show('stream-cl-mismatch', () => fetch(url, { method: 'POST', body: gen('abc'), duplex: 'half', headers: { 'content-length': '5' } }));
+await show('duplex-full', () => fetch(url, { method: 'POST', body: gen('abc'), duplex: 'full' }));
+await show('string-duplex-bad', () => fetch(url, { method: 'POST', body: 'abc', duplex: 'nope' }));
+process.exit(0);
+"##,
+            r##"gen-no-duplex rejected TypeError "RequestInit: duplex option is required when sending a body." cause none
+sync-iter 200 {"te":null,"cl":"2","ct":"text/plain;charset=UTF-8","body":"97"}
+gen-number rejected TypeError "fetch failed" cause TypeError ERR_INVALID_ARG_TYPE "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received type number (42)"
+gen-object rejected TypeError "fetch failed" cause TypeError ERR_INVALID_ARG_TYPE "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object. Received an instance of Object"
+gen-arraybuffer 200 {"te":"chunked","cl":null,"ct":null,"body":"\u0000\u0000"}
+gen-buffer 200 {"te":"chunked","cl":null,"ct":null,"body":"buf"}
+gen-throws-first rejected TypeError "fetch failed" cause Error undefined "first"
+readable 200 {"te":"chunked","cl":null,"ct":null,"body":"r1r2"}
+head-body rejected TypeError "Request with GET/HEAD method cannot have body." cause none
+get-string rejected TypeError "Request with GET/HEAD method cannot have body." cause none
+stream-cl-mismatch rejected TypeError "fetch failed" cause RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH "Request body length does not match content-length header"
+duplex-full rejected TypeError "Request constructor: full is not an accepted type. Expected one of half." cause none
+string-duplex-bad rejected TypeError "Request constructor: nope is not an accepted type. Expected one of half." cause none"##,
+        ),
+    ] {
+        let script = write_temp(name, js);
+        let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+        let (stdout, stderr) = run_script_ok(&script, out);
+        assert_eq!(
+            stdout.trim().replace("\r\n", "\n"),
+            expected,
+            "{name} stderr: {stderr}"
+        );
+    }
+}
+
+/// A Readable `undici.request` body is framed when the request is
+/// dispatched, not when `request()` is called: undici asks
+/// `util.bodyLength` then, so a stream that ends in the same turn of the
+/// event loop -- on a tick, a microtask or a queued immediate -- goes out
+/// with `content-length`, one still open goes chunked, and a declared length
+/// the ended stream disagrees with is refused before anything is sent, the
+/// stream destroyed with the error. Up to this fix oam decided at the call,
+/// so such a stream went chunked, which a server that refuses chunked
+/// uploads (`411 Length Required`) turns away. The expected output is node
+/// v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_request_frames_a_stream_when_it_dispatches() {
+    let script = write_temp(
+        "undici_request_frames_a_stream_when_it_dispatches/main.mjs",
+        r##"// A Readable body that ends after request() is called but in the same turn
+// of the event loop is framed with content-length, as undici frames it when
+// it dispatches the request; one that ends later goes chunked.
+import net from 'node:net';
+import { PassThrough } from 'node:stream';
+import { request } from 'undici';
+
+const seen = [];
+const server = net.createServer((s) => {
+  s.on('error', () => {});
+  let buf = '';
+  s.on('data', (d) => {
+    const first = buf === '';
+    buf += d.toString('latin1');
+    if (!first) return;
+    seen.push(buf.split('\r\n').filter((l) => /^(content-length|transfer-encoding)/i.test(l)).join('|') || 'none');
+    setTimeout(() => s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok'), 50);
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+const cases = [
+  ['ended-sync', () => { const p = new PassThrough(); p.end('abc'); return p; }],
+  ['ended-next-tick', () => { const p = new PassThrough(); process.nextTick(() => p.end('abc')); return p; }],
+  ['ended-microtask', () => { const p = new PassThrough(); queueMicrotask(() => p.end('abc')); return p; }],
+  ['ended-immediate', () => { const p = new PassThrough(); setImmediate(() => p.end('abc')); return p; }],
+  ['written-then-ended-next-tick', () => { const p = new PassThrough(); p.write('ab'); process.nextTick(() => p.end('c')); return p; }],
+  ['ended-later', () => { const p = new PassThrough(); p.write('ab'); setTimeout(() => p.end('c'), 100); return p; }],
+  ['empty-next-tick', () => { const p = new PassThrough(); process.nextTick(() => p.end()); return p; }],
+];
+for (const [label, mk] of cases) {
+  const before = seen.length;
+  try {
+    const r = await request(url, { method: 'PUT', body: mk() });
+    await r.body.text();
+    console.log(label, r.statusCode, seen.length > before ? seen.at(-1) : 'nothing sent');
+  } catch (e) {
+    console.log(label, 'rejected', e.name, e.code);
+  }
+}
+// A declared length the ended stream disagrees with.
+{
+  const p = new PassThrough();
+  process.nextTick(() => p.end('abc'));
+  const before = seen.length;
+  try {
+    const r = await request(url, { method: 'PUT', body: p, headers: { 'content-length': '5' } });
+    await r.body.text();
+    console.log('declared-mismatch', r.statusCode);
+  } catch (e) {
+    await new Promise((r) => setTimeout(r, 100));
+    console.log('declared-mismatch rejected', e.name, e.code, 'sent', seen.length > before, 'destroyed', p.destroyed);
+  }
+}
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"ended-sync 200 content-length: 3
+ended-next-tick 200 content-length: 3
+ended-microtask 200 content-length: 3
+ended-immediate 200 content-length: 3
+written-then-ended-next-tick 200 content-length: 3
+ended-later 200 transfer-encoding: chunked
+empty-next-tick 200 content-length: 0
+declared-mismatch rejected RequestContentLengthMismatchError UND_ERR_REQ_CONTENT_LENGTH_MISMATCH sent false destroyed true"##;
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
+/// `undici.request` rejects with the error itself, as undici's does, never
+/// with fetch's `TypeError: fetch failed`: an oversized response head is
+/// `HeadersOverflowError` (`UND_ERR_HEADERS_OVERFLOW`), counted as undici
+/// counts it -- header names and values, not the reason phrase -- and a body
+/// timeout, a dispatcher's bad option, a refused header and a refused
+/// connect (`ECONNREFUSED`) come as they are, and every class in `errors`
+/// carries its own name (`err.constructor.name`). Up to this fix an overflow was
+/// `fetch failed` with node's http-parser cause (`HPE_HEADER_OVERFLOW`, and
+/// node's http.request count, so a head undici takes was refused), and so
+/// was a refused connect. The expected output is node v22.22.2 + undici
+/// 6.29.0's, line for line.
+#[test]
+fn undici_request_rejects_with_the_error_itself() {
+    let script = write_temp(
+        "undici_request_rejects_with_the_error_itself/main.mjs",
+        r##"import net from 'node:net';
+import { request, errors, Agent } from 'undici';
+
+// A head whose names + values come to `nv` bytes, with a reason phrase of
+// `reason` bytes.
+function serve(nv, reason) {
+  return net.createServer((s) => {
+    s.on('error', () => {});
+    s.once('data', () => {
+      // "content-length" (14) + "0" (1) + "x-big" (5) + value
+      const value = 'a'.repeat(nv - 20);
+      s.end(`HTTP/1.1 200 ${'R'.repeat(reason)}\r\ncontent-length: 0\r\nx-big: ${value}\r\n\r\n`);
+    });
+  });
+}
+const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${srv.address().port}/`)));
+function show(label, e) {
+  console.log(label, 'rejected', e.constructor.name, e.name, e.code, JSON.stringify(e.message.replace(/:\d+$/, ':PORT')),
+    'overflowClass', e instanceof errors.HeadersOverflowError, 'undiciClass', e instanceof errors.UndiciError,
+    'cause', e.cause ? e.cause.name + ' ' + e.cause.code : 'none');
+}
+// undici counts header names and values, not the reason phrase, and
+// request() rejects with HeadersOverflowError itself.
+for (const [nv, reason] of [[16383, 100], [16384, 2], [20000, 2]]) {
+  const url = await listen(serve(nv, reason));
+  try {
+    const r = await request(url);
+    await r.body.text();
+    console.log(`request nv=${nv} reason=${reason}`, 'ok', r.statusCode);
+  } catch (e) { show(`request nv=${nv} reason=${reason}`, e); }
+  try {
+    const r = await fetch(url);
+    await r.text();
+    console.log(`fetch nv=${nv} reason=${reason}`, 'ok', r.status);
+  } catch (e) { show(`fetch nv=${nv} reason=${reason}`, e); }
+}
+// A body timeout, a dispatcher's bad option, a refused header and a refused
+// connect: the error itself, never `TypeError: fetch failed`.
+{
+  const srv = net.createServer((s) => {
+    s.on('error', () => {});
+    s.once('data', () => s.write('HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\nab'));
+  });
+  const url = await listen(srv);
+  const r = await request(url, { bodyTimeout: 200 });
+  try { await r.body.text(); console.log('body-timeout ok'); } catch (e) { show('body-timeout', e); }
+}
+try { await request('http://127.0.0.1:1/', { dispatcher: new Agent({ headersTimeout: -1 }) }); } catch (e) { show('bad-dispatcher', e); }
+try { await request('http://127.0.0.1:1/', { headers: { 'transfer-encoding': 'x' } }); } catch (e) { show('te-header', e); }
+{
+  const srv = net.createServer();
+  const url = await listen(srv);
+  await new Promise((r) => srv.close(r));
+  try { await request(url); } catch (e) { show('refused', e); }
+}
+console.log('class names', Object.keys(errors).filter((k) => typeof errors[k] === 'function' && errors[k].name !== k).join(',') || 'all match');
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"request nv=16383 reason=100 ok 200
+fetch nv=16383 reason=100 ok 200
+request nv=16384 reason=2 rejected HeadersOverflowError HeadersOverflowError UND_ERR_HEADERS_OVERFLOW "Headers Overflow Error" overflowClass true undiciClass true cause none
+fetch nv=16384 reason=2 rejected TypeError TypeError undefined "fetch failed" overflowClass false undiciClass false cause HeadersOverflowError UND_ERR_HEADERS_OVERFLOW
+request nv=20000 reason=2 rejected HeadersOverflowError HeadersOverflowError UND_ERR_HEADERS_OVERFLOW "Headers Overflow Error" overflowClass true undiciClass true cause none
+fetch nv=20000 reason=2 rejected TypeError TypeError undefined "fetch failed" overflowClass false undiciClass false cause HeadersOverflowError UND_ERR_HEADERS_OVERFLOW
+body-timeout rejected BodyTimeoutError BodyTimeoutError UND_ERR_BODY_TIMEOUT "Body Timeout Error" overflowClass false undiciClass true cause none
+bad-dispatcher rejected InvalidArgumentError InvalidArgumentError UND_ERR_INVALID_ARG "headersTimeout must be a positive integer or zero" overflowClass false undiciClass true cause none
+te-header rejected InvalidArgumentError InvalidArgumentError UND_ERR_INVALID_ARG "invalid transfer-encoding header" overflowClass false undiciClass true cause none
+refused rejected Error Error ECONNREFUSED "connect ECONNREFUSED 127.0.0.1:PORT" overflowClass false undiciClass false cause none
+class names all match"##;
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
+/// A streamed `undici.request` body is stopped once the response is over
+/// while it is still going out -- read to its end, or destroyed by the
+/// caller -- against an origin that answers early and keeps the connection:
+/// an idle stream is destroyed (with no error) and detached, a generator is
+/// returned, nothing more is uploaded, and the connection is closed, as
+/// undici resets the socket when a message completes mid-write. Up to this
+/// fix oam went on uploading for as long as the connection lived, and left
+/// an idle stream attached and open. The expected output is node v22.22.2 +
+/// undici 6.29.0's, line for line.
+#[test]
+fn undici_request_stops_its_upload_once_the_response_is_over() {
+    let script = write_temp(
+        "undici_request_stops_its_upload/main.mjs",
+        r##"import net from 'node:net';
+import { PassThrough } from 'node:stream';
+import { request } from 'undici';
+
+// An origin that answers 413 as soon as anything arrives and keeps the
+// connection open.
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let srvBytes = 0;
+let srvClosed = 0;
+const server = net.createServer((s) => {
+  s.on('error', () => {});
+  s.on('close', () => { srvClosed++; });
+  let answered = false;
+  s.on('data', (d) => {
+    srvBytes += d.length;
+    if (!answered) { answered = true; s.write('HTTP/1.1 413 Payload Too Large\r\ncontent-length: 2\r\n\r\nno'); }
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+
+// An idle stream: destroyed (no error) and detached once the response is read.
+{
+  srvClosed = 0;
+  const p = new PassThrough();
+  const errs = [];
+  p.on('error', (e) => errs.push(e.name + ':' + e.message));
+  let closeEv = false;
+  p.on('close', () => { closeEv = true; });
+  p.write('x');
+  const r = await request(url, { method: 'POST', body: p });
+  console.log('idle status', r.statusCode, await r.body.text());
+  console.log('idle now destroyed', p.destroyed);
+  await sleep(300);
+  console.log('idle later destroyed', p.destroyed, 'close', closeEv, 'errors', JSON.stringify(errs), 'listeners', p.listenerCount('data'), p.listenerCount('end'), 'srvClosed', srvClosed > 0);
+}
+
+// A generator that keeps producing: returned, and nothing more is uploaded.
+{
+  srvClosed = 0;
+  let produced = 0;
+  let returned = false;
+  const gen = async function* () {
+    try { for (;;) { await sleep(20); produced++; yield Buffer.alloc(1024); } }
+    finally { returned = true; }
+  };
+  const r = await request(url, { method: 'POST', body: gen() });
+  console.log('gen status', r.statusCode, await r.body.text());
+  const p0 = produced, b0 = srvBytes;
+  await sleep(1000);
+  console.log('gen after: produced<=2', produced - p0 <= 2, 'bytes<=2048', srvBytes - b0 <= 2048, 'returned', returned, 'srvClosed', srvClosed > 0);
+}
+
+// A response body the caller destroys before its end.
+{
+  srvClosed = 0;
+  const p = new PassThrough();
+  p.write('x');
+  const r = await request(url, { method: 'POST', body: p });
+  r.body.on('error', () => {});
+  r.body.destroy();
+  await sleep(300);
+  console.log('destroyed-body: stream destroyed', p.destroyed, 'srvClosed', srvClosed > 0);
+}
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"idle status 413 no
+idle now destroyed true
+idle later destroyed true close true errors [] listeners 0 0 srvClosed true
+gen status 413 no
+gen after: produced<=2 true bytes<=2048 true returned true srvClosed true
+destroyed-body: stream destroyed true srvClosed true"##;
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        expected,
+        "stderr: {stderr}"
+    );
+}
+
+/// `fetch()` runs under its dispatcher's `headersTimeout` / `bodyTimeout`, as
+/// node's does: the `dispatcher` option's (global `fetch` and `undici.fetch`),
+/// the global one's after `setGlobalDispatcher`, a ProxyAgent's for the
+/// origin's answer, else undici's 300 s. A late head fails the fetch with
+/// `TypeError: fetch failed`, cause HeadersTimeoutError; a stalled body
+/// errors its reader, `text()` and `for await` with `TypeError: terminated`,
+/// cause BodyTimeoutError -- instances of the shim's `errors.*`. The limit
+/// starts once connected (a slow connect function counts for nothing), each
+/// redirect hop gets its own, 0 disables, a `headersTimeout` in the fetch
+/// init is not an option, and a bad dispatcher value is undici's
+/// InvalidArgumentError as the cause. Up to this fix a fetch got no limit at
+/// all and only its own signal ended it. The expected output is node
+/// v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn fetch_rides_its_dispatchers_headers_and_body_timeouts() {
+    let script = write_temp(
+        "fetch_dispatcher_timeouts/main.mjs",
+        r##"import net from 'node:net';
+import * as undici from 'undici';
+const { Agent, ProxyAgent, errors, setGlobalDispatcher, getGlobalDispatcher, buildConnector } = undici;
+
+const never = net.createServer((s) => { s.on('data', () => {}); s.on('error', () => {}); });
+const stall = net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => s.write('HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\n'));
+});
+const slow = net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => setTimeout(() => s.end('HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok'), 300));
+});
+const listen = (srv) => new Promise((r) => srv.listen(0, '127.0.0.1', () => r(`http://127.0.0.1:${srv.address().port}`)));
+const [nu, su, lu] = await Promise.all([listen(never), listen(stall), listen(slow)]);
+
+const describe = (e) => {
+  const c = e?.cause;
+  return [e?.name, JSON.stringify(e?.message), e instanceof TypeError,
+    c ? `cause=${c.name}/${c.code}/${JSON.stringify(c.message)}/undici=${c instanceof errors.UndiciError}/cls=${c instanceof (errors[c.name] ?? Object)}` : 'nocause'].join(' ');
+};
+async function attempt(label, fn) {
+  const t0 = Date.now();
+  try {
+    console.log(label, 'ok', await fn());
+  } catch (e) {
+    console.log(label, 'failed', describe(e), 'early=' + (Date.now() - t0 < 4000));
+  }
+}
+// A budget that ends a probe the phase timeout did not end, with its own reason.
+const budget = (ms) => { const ac = new AbortController(); setTimeout(() => ac.abort(new Error('budget')), ms).unref(); return ac.signal; };
+const total = () => budget(6000);
+
+await attempt('headers-dispatcher', () => fetch(nu, { dispatcher: new Agent({ headersTimeout: 400 }), signal: total() }).then((r) => r.status));
+await attempt('headers-undici-fetch', () => undici.fetch(nu, { dispatcher: new Agent({ headersTimeout: 400 }), signal: total() }).then((r) => r.status));
+await attempt('headers-zero', () => fetch(nu, { dispatcher: new Agent({ headersTimeout: 0 }), signal: budget(900) }).then((r) => r.status));
+await attempt('headers-in-time', () => fetch(lu, { dispatcher: new Agent({ headersTimeout: 600 }) }).then((r) => r.text()));
+await attempt('headers-slow-connect', () => fetch(lu, { dispatcher: new Agent({ headersTimeout: 600, connect: (o, cb) => setTimeout(() => buildConnector({})(o, cb), 800) }) }).then((r) => r.text()));
+await attempt('headers-init-option-ignored', () => fetch(nu, { headersTimeout: 400, signal: budget(900) }).then((r) => r.status));
+await attempt('body-text', async () => (await fetch(su, { dispatcher: new Agent({ bodyTimeout: 400 }), signal: total() })).text());
+await attempt('body-reader', async () => {
+  const r = await fetch(su, { dispatcher: new Agent({ bodyTimeout: 400 }), signal: total() });
+  const reader = r.body.getReader();
+  const got = [];
+  for (;;) { const { done, value } = await reader.read(); if (done) break; got.push(new TextDecoder().decode(value)); }
+  return got.join('');
+});
+await attempt('body-for-await', async () => {
+  const r = await fetch(su, { dispatcher: new Agent({ bodyTimeout: 400 }), signal: total() });
+  let s = ''; for await (const c of r.body) s += new TextDecoder().decode(c); return s;
+});
+const previous = getGlobalDispatcher();
+setGlobalDispatcher(new Agent({ headersTimeout: 400, bodyTimeout: 400 }));
+await attempt('global-headers', () => fetch(nu, { signal: total() }).then((r) => r.status));
+await attempt('global-body', async () => (await fetch(su, { signal: total() })).arrayBuffer().then((b) => b.byteLength));
+setGlobalDispatcher(previous);
+await attempt('dispatcher-bad', () => fetch(nu, { dispatcher: new Agent({ headersTimeout: -1 }), signal: total() }).then((r) => r.status));
+// Redirect hops each get their own limit.
+const target = lu;
+const redirector = await listen(net.createServer((s) => {
+  s.on('error', () => {});
+  s.once('data', () => setTimeout(() => s.end(`HTTP/1.1 302 Found\r\nlocation: ${target}/\r\ncontent-length: 0\r\nconnection: close\r\n\r\n`), 300));
+}));
+await attempt('redirect-hops', () => fetch(redirector, { dispatcher: new Agent({ headersTimeout: 500 }) }).then((r) => r.text()));
+// A ProxyAgent's headersTimeout bounds the origin's answer.
+const proxy = net.createServer((c) => {
+  c.on('error', () => {});
+  c.once('data', (d) => {
+    const port = Number(d.toString('latin1').split(' ')[1].split(':').pop());
+    const up = net.connect(port, '127.0.0.1', () => { c.write('HTTP/1.1 200 Connection Established\r\n\r\n'); up.pipe(c); c.pipe(up); });
+    up.on('error', () => c.destroy());
+    c.on('close', () => up.destroy());
+  });
+});
+const pu = await listen(proxy);
+await attempt('proxy-silent-origin', () => fetch(nu, { dispatcher: new ProxyAgent({ uri: pu, headersTimeout: 400 }), signal: total() }).then((r) => r.status));
+process.exit(0);
+"##,
+    );
+    let out = oam_without_proxy_env(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let expected = r##"headers-dispatcher failed TypeError "fetch failed" true cause=HeadersTimeoutError/UND_ERR_HEADERS_TIMEOUT/"Headers Timeout Error"/undici=true/cls=true early=true
+headers-undici-fetch failed TypeError "fetch failed" true cause=HeadersTimeoutError/UND_ERR_HEADERS_TIMEOUT/"Headers Timeout Error"/undici=true/cls=true early=true
+headers-zero failed Error "budget" false nocause early=true
+headers-in-time ok ok
+headers-slow-connect ok ok
+headers-init-option-ignored failed Error "budget" false nocause early=true
+body-text failed TypeError "terminated" true cause=BodyTimeoutError/UND_ERR_BODY_TIMEOUT/"Body Timeout Error"/undici=true/cls=true early=true
+body-reader failed TypeError "terminated" true cause=BodyTimeoutError/UND_ERR_BODY_TIMEOUT/"Body Timeout Error"/undici=true/cls=true early=true
+body-for-await failed TypeError "terminated" true cause=BodyTimeoutError/UND_ERR_BODY_TIMEOUT/"Body Timeout Error"/undici=true/cls=true early=true
+global-headers failed TypeError "fetch failed" true cause=HeadersTimeoutError/UND_ERR_HEADERS_TIMEOUT/"Headers Timeout Error"/undici=true/cls=true early=true
+global-body failed TypeError "terminated" true cause=BodyTimeoutError/UND_ERR_BODY_TIMEOUT/"Body Timeout Error"/undici=true/cls=true early=true
+dispatcher-bad failed TypeError "fetch failed" true cause=InvalidArgumentError/UND_ERR_INVALID_ARG/"headersTimeout must be a positive integer or zero"/undici=true/cls=true early=true
+redirect-hops ok ok
+proxy-silent-origin failed TypeError "fetch failed" true cause=HeadersTimeoutError/UND_ERR_HEADERS_TIMEOUT/"Headers Timeout Error"/undici=true/cls=true early=true"##;
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
         expected,

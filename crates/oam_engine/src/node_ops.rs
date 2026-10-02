@@ -3399,7 +3399,8 @@ fn op_fetch_body_channel_new(
 }
 
 /// Push a chunk. Resolves when the chunk is accepted, so JS write()
-/// backpressure follows the socket.
+/// backpressure follows the socket -- with `false` when the request no longer
+/// takes its body (it finished or failed), so a writer can stop producing it.
 fn op_fetch_body_channel_write(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -3424,7 +3425,7 @@ fn op_fetch_body_channel_write(
             Ok(()) => oam_core::OpOutcome::Done,
             // Receiver gone: the request finished or failed. Not an error to
             // the writer -- the transport already reported it.
-            Err(_) => oam_core::OpOutcome::Done,
+            Err(_) => oam_core::OpOutcome::Json("false".to_string()),
         }
     });
 }
@@ -3446,7 +3447,7 @@ fn op_fetch_body_channel_end(
 fn op_fetch_body_channel_cancel(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
-    _rv: v8::ReturnValue<'_, v8::Value>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
 ) {
     let handle = args.get(0).number_value(scope).unwrap_or(0.0) as u64;
     let entry = core_runtime!(scope)
@@ -3455,7 +3456,21 @@ fn op_fetch_body_channel_cancel(
         .unwrap_or_else(|e| e.into_inner())
         .remove(&handle);
     if let Some((Some(tx), _)) = entry {
-        let _ = tx.try_send(Err("request aborted".to_string()));
+        // The error has to REACH the transport: a sender dropped without it
+        // ends the body, and hyper would finish a chunked request whose
+        // upload was cut short as if it were whole. When the channel is full
+        // the error waits behind the chunks already queued -- on a task that
+        // does not hold the event loop open, since a server that stopped
+        // reading may never take them.
+        if let Err(full) = tx.try_send(Err("request aborted".to_string()))
+            && !tx.is_closed()
+        {
+            let item = full.into_inner();
+            crate::ops::spawn_op_unref(scope, &mut rv, async move {
+                let _ = tx.send(item).await;
+                oam_core::OpOutcome::Done
+            });
+        }
     }
 }
 
