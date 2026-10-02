@@ -1839,10 +1839,25 @@ destroyed emitted `'close'` on the next tick, before `'aborted'` and the respons
 socket; and a `req.destroy()` once the response was under way left the connection open and
 the response never closed.
 
+A request body the connection fails on while the handler reads it is the connection's
+failure, as in Node: the client went away mid-body (the parser's `HPE_INVALID_EOF_STATE`,
+`Parse Error`), reset the connection (the socket's `read ECONNRESET`, with `errno` and
+`syscall`), or sent a malformed chunk-size line (`HPE_INVALID_CHUNK_SIZE`, `Parse Error:
+Invalid character in chunk size`). Node's socketOnError gets it: the server's
+`'clientError'` with the error and the connection's socket, or, with no listener, the socket
+destroyed with it -- its `'error'`, then its `'close'` with `true` aborting the request as
+above (case 272). Up to 0.17.1 the request was destroyed directly: `'aborted'`, its `'error'`
+and `'close'`, then the response's `'close'` and the socket's with `false`, and no
+`'clientError'`. What differs: the parser error has no `rawPacket` (Node's carries the bytes
+it refused), and a malformed body is answered `400` by the native server even when a
+`'clientError'` listener is there to answer it (Node leaves the answer to the listener).
+
 What still differs around a close: the socket never emits `'end'`, and a client that goes
-away closes it with `false` -- Node's says `true` when its read failed (`ECONNRESET`) or the
-request was cut short (`HPE_INVALID_EOF_STATE`, which Node also emits as the socket's
-`'error'`). A server request emits `'close'` only when it is destroyed or aborted -- Node's
+away or resets once the request body is all in closes it with `false`, where Node's says
+`true` after a reset (`ECONNRESET`). A client that goes away mid-body after the response has
+finished closes the connection with `false` and aborts the request (`'aborted'`, ECONNRESET
+`aborted`), where Node's socket reports `HPE_INVALID_EOF_STATE` and closes with `true` and
+the request emits nothing. A server request emits `'close'` only when it is destroyed or aborted -- Node's
 destroys itself once read to the end, so its `'close'` follows `'end'` on every exchange; a
 request read to the end whose connection then closes gets its `'close'` there, without an
 error, where Node's came earlier. A client that half-closes or goes away while the handler
@@ -2128,11 +2143,12 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
   served as an ordinary request (Node: `'upgrade'`, with the connection handed over) and a
   CONNECT is closed, so `wss://` servers -- `ws`, `socket.io` -- do not work on an oam
   `https` server. An `http` server routes both as Node does (entry 39).
-- **An `https` server emits no HTTP-level `'clientError'`.** A request head it refuses is
-  answered `400` natively, where Node hands the error to a `'clientError'` listener with
-  the connection's socket; the only `'clientError'` an `https` server raises is the one it
-  passes on from `'tlsClientError'` when a handshake fails, and that one carries a fresh
-  socket object rather than the connection's.
+- **An `https` server emits no `'clientError'` for a request head.** A request head it
+  refuses is answered `400` natively, where Node hands the error to a `'clientError'`
+  listener with the connection's socket. It raises `'clientError'` for a request body the
+  connection failed on (entry 39), as an `http` server does, and passes one on from
+  `'tlsClientError'` when a handshake fails; that one carries a fresh socket object rather
+  than the connection's.
 - **A connection a `'connection'` listener destroys raises no `'tlsClientError'`.** On a
   `tls`, `https` or `http2` secure server Node reports it as a `'tlsClientError'`
   (`ECONNRESET`, `socket hang up`) and, on `https` and `http2`, a `'clientError'`; oam emits

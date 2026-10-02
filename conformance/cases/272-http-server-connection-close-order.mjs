@@ -7,7 +7,12 @@
 // the socket under the TLS socket closes first. This holds whether the
 // handler destroys the socket (destroy(), destroy(err), resetAndDestroy()),
 // destroys the request while the response is under way, or the client goes
-// away after the response has started.
+// away after the response has started. A client that goes away -- or resets
+// the connection, or sends a malformed chunk -- while the handler reads the
+// body is the connection's failure: its socket reports it first (node's
+// socketOnError: the parser's HPE_ error or the read's ECONNRESET, to
+// 'clientError' when the server listens for it), then the socket's 'close'
+// aborts the request.
 import http from "node:http";
 import https from "node:https";
 import net from "node:net";
@@ -60,7 +65,15 @@ const listen = (server) =>
 // request is aborted (it has not been read to the end), so its 'error' and
 // 'close' are part of the story; a request that was read to the end is left
 // out of it.
-async function exchange(label, { secure = false, request, aborts, handle, client: act }) {
+async function exchange(label, {
+  secure = false,
+  request,
+  aborts,
+  handle,
+  client: act,
+  afterHandler,
+  clientError = false,
+}) {
   const events = [];
   const waits = [];
   const settles = (emitter, name) =>
@@ -70,7 +83,7 @@ async function exchange(label, { secure = false, request, aborts, handle, client
   const handler = (req, res) => {
     const socket = req.socket;
     socket.on("close", (hadError) => events.push(`socket close ${hadError}`));
-    socket.on("error", (e) => events.push(`socket error ${e.message}`));
+    socket.on("error", (e) => events.push(`socket error ${e.code} ${e.message}`));
     req.on("aborted", () => events.push("req aborted"));
     res.on("close", () => events.push("res close"));
     res.on("finish", () => events.push("res finish"));
@@ -87,6 +100,12 @@ async function exchange(label, { secure = false, request, aborts, handle, client
   const server = secure
     ? https.createServer({ cert: CERT, key: KEY }, handler)
     : http.createServer(handler);
+  if (clientError) {
+    server.on("clientError", (e, socket) => {
+      events.push(`clientError ${e.code} destroyed=${socket.destroyed}`);
+      socket.destroy();
+    });
+  }
   server.on("connection", (socket) =>
     socket.on("close", (hadError) => events.push(`'connection' socket close ${hadError}`)));
   server.on("secureConnection", (socket) =>
@@ -99,6 +118,7 @@ async function exchange(label, { secure = false, request, aborts, handle, client
   client.write(request);
   if (act) act(client);
   await inHandler;
+  if (afterHandler) afterHandler(client);
   await Promise.all(waits);
   // Anything still to come on these objects comes on the next ticks.
   await new Promise((resolve) => setImmediate(resolve));
@@ -170,4 +190,36 @@ await exchange("https: the client goes away after the response started", {
     res.write("x");
   },
   client: (client) => client.once("data", () => client.destroy()),
+});
+await exchange("http: the client goes away while the handler reads the body", {
+  request: POST,
+  aborts: true,
+  handle: (req) => req.resume(),
+  afterHandler: (client) => setTimeout(() => client.destroy(), 20),
+});
+await exchange("http: the client goes away mid-body, with a 'clientError' listener", {
+  request: POST,
+  aborts: true,
+  clientError: true,
+  handle: (req) => req.resume(),
+  afterHandler: (client) => setTimeout(() => client.destroy(), 20),
+});
+await exchange("http: the client resets while the handler reads the body", {
+  request: POST,
+  aborts: true,
+  handle: (req) => req.resume(),
+  afterHandler: (client) => setTimeout(() => client.resetAndDestroy(), 20),
+});
+await exchange("http: a malformed chunk while the handler reads the body", {
+  request: "POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n",
+  aborts: true,
+  handle: (req) => req.resume(),
+  afterHandler: (client) => setTimeout(() => client.write("zz\r\n"), 20),
+});
+await exchange("https: the client goes away while the handler reads the body", {
+  secure: true,
+  request: POST,
+  aborts: true,
+  handle: (req) => req.resume(),
+  afterHandler: (client) => setTimeout(() => client.destroy(), 20),
 });

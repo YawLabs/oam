@@ -3406,9 +3406,11 @@ fn op_http_request_body_read(
                 // into_data releases the chunk's budget reservation.
                 oam_core::OpOutcome::Bytes(chunk.into_data())
             }
-            Some(Err(e)) => {
+            // The pump's failure as it built it: node's parse or socket
+            // error for the wire, or the text of an oam limit.
+            Some(Err(failure)) => {
                 state.cancel_body_stream(id);
-                oam_core::OpOutcome::Failed(e)
+                failure
             }
             None => body_end(state.finish_request_body(id)),
         }

@@ -72,8 +72,9 @@ pub enum BodyReadError {
 /// as a body error whose source is an `io::Error` of kind InvalidInput /
 /// InvalidData ("Invalid chunk size line"); a connection that ends early as
 /// one of kind UnexpectedEof ("end of file before message length reached");
-/// a reset as the read's own ConnectionReset.
-fn classify(error: &hyper::Error) -> BodyReadError {
+/// a reset as the read's own ConnectionReset. The server's request bodies
+/// (http_server.rs) are hyper's too and are told apart the same way.
+pub(crate) fn classify(error: &hyper::Error) -> BodyReadError {
     let mut current: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(error);
     while let Some(e) = current {
         if let Some(io) = e.downcast_ref::<std::io::Error>() {
@@ -93,6 +94,23 @@ fn classify(error: &hyper::Error) -> BodyReadError {
     } else {
         BodyReadError::Other
     }
+}
+
+/// llhttp's code and text for a bad chunk-size line, the one framing error
+/// hyper leaves in a body (measured on v22.22.2, a request's or a
+/// response's).
+pub(crate) fn invalid_chunk_size() -> OpOutcome {
+    OpOutcome::node_failed(
+        "HPE_INVALID_CHUNK_SIZE",
+        "Parse Error: Invalid character in chunk size",
+    )
+}
+
+/// llhttp's code and text for a connection that ended mid-body: node's
+/// parser refuses the end of the stream there (`parser.finish()`), and the
+/// message carries no reason (v22.22.2).
+pub(crate) fn invalid_eof_state() -> OpOutcome {
+    OpOutcome::node_failed("HPE_INVALID_EOF_STATE", "Parse Error")
 }
 
 impl FetchBody {
@@ -193,12 +211,7 @@ impl FetchBody {
     /// body is node's parse error; the rest keep [`BODY_READ_FAILED`].
     fn failure(&self, error: BodyReadError) -> OpOutcome {
         match error {
-            // llhttp's code and text for a bad chunk-size line, the one
-            // framing error hyper leaves in the body.
-            BodyReadError::Framing if self.coded => OpOutcome::node_failed(
-                "HPE_INVALID_CHUNK_SIZE",
-                "Parse Error: Invalid character in chunk size",
-            ),
+            BodyReadError::Framing if self.coded => invalid_chunk_size(),
             BodyReadError::Reset(os) if self.conn.is_some() => {
                 let io = match os {
                     Some(code) => std::io::Error::from_raw_os_error(code),

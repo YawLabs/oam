@@ -17573,6 +17573,11 @@
     // onServerResponseClose, a 'close' listener on the socket from the
     // moment the response is assigned it until it finishes.
     const kClosesWithSocket = Symbol("kClosesWithSocket");
+    // The server a connection's socket belongs to, and whether node's
+    // socketOnError -- the server's own 'error' listener, which removes
+    // itself after the first error -- has run on it (serverSocketOnError).
+    const kConnServer = Symbol("kConnServer");
+    const kSocketOnErrorRan = Symbol("kSocketOnErrorRan");
 
     class IncomingMessage extends Readable {
       constructor(meta) {
@@ -17692,11 +17697,45 @@
             // rather than producing a status.
             this._reading = false;
             this._bodyDone = true;
-            // A body the connection failed on -- malformed (node's parser
-            // refused it) or cut short -- ends the exchange the way a lost
-            // socket does in node: 'aborted', then ECONNRESET "aborted".
+            // A body the connection failed on is the connection's failure in
+            // node, not the request's: its parser refused the bytes
+            // (HPE_INVALID_CHUNK_SIZE) or the end of the stream
+            // (HPE_INVALID_EOF_STATE), or the socket's read was reset. The
+            // socket reports it (socketOnError: 'clientError', or the
+            // socket destroyed with it), and the request is aborted when
+            // the socket closes -- 'aborted', the response's 'close', the
+            // socket's, then ECONNRESET "aborted" (measured on v22.22.2).
             const text = err instanceof Error ? err.message : String(err);
-            if (text.startsWith("request body: ")) {
+            const code = err instanceof Error ? err.code : undefined;
+            const parseError = typeof code === "string" && code.startsWith("HPE_");
+            const readReset = code === "ECONNRESET" && err.syscall === "read";
+            if (parseError || readReset || text.startsWith("request body: ")) {
+              const socket = this.socket;
+              if (
+                socket &&
+                socket[kConnServer] !== undefined &&
+                socket[kServerSocketClosed] === false
+              ) {
+                if (parseError) {
+                  // node's parser error: its reason, and the count of bytes
+                  // of the failing read it had taken (none, for a bad
+                  // chunk-size line or the end of the stream).
+                  err.reason = code === "HPE_INVALID_EOF_STATE"
+                    ? "Invalid EOF state"
+                    : text.replace(/^Parse Error: /, "");
+                  err.bytesParsed = 0;
+                  serverSocketOnError(socket, err);
+                } else if (readReset) {
+                  // net's own: the socket destroys itself with the read's
+                  // error, and socketOnError hears it as an 'error'.
+                  socket.destroy(err);
+                } else {
+                  // A failure node has no name for: the connection goes,
+                  // and the socket's close aborts the request.
+                  socket.destroy();
+                }
+                return;
+              }
               const reset = new Error("aborted");
               reset.code = "ECONNRESET";
               this.destroy(reset);
@@ -18701,6 +18740,21 @@
       }
     }
 
+    // node's socketOnError, the 'error' listener the http server puts on
+    // every connection's socket ahead of any other, which removes itself
+    // after the first error: the server's 'clientError' gets the error and
+    // the socket, and decides what becomes of the connection; with no
+    // listener the socket is destroyed with the error. (node writes a 400
+    // first when nothing has been answered; for a body the parser refused,
+    // the native server has already answered it.)
+    function serverSocketOnError(socket, err) {
+      if (socket[kSocketOnErrorRan] === true) return;
+      socket[kSocketOnErrorRan] = true;
+      const server = socket[kConnServer];
+      if (server !== undefined && server.emit("clientError", err, socket)) return;
+      socket.destroy(err);
+    }
+
     function abortExchange(server, requestId, exchange) {
       server._exchanges.delete(requestId);
       const req = exchange.req;
@@ -18802,6 +18856,7 @@
         // sees a destroy instead of serving it.
         const socket = serverSocket(meta);
         socket._isConnectionSocket = true;
+        socket[kConnServer] = server;
         // The requests of an http connection are served through this
         // socket, and node's abortIncoming is its first 'close' listener,
         // ahead of any the application adds; an https connection's are
@@ -18843,6 +18898,7 @@
         // handed out, which node's TLSSocket wraps.
         const socket = registry._tlsServer.serverSocketView(serverSocket(meta), meta.tls);
         socket._isConnectionSocket = true;
+        socket[kConnServer] = server;
         const connectionId = meta.connectionId;
         socket.on("close", () => abortIncoming(server, connectionId));
         connectionRecord(server, meta.connectionId).secure = socket;
