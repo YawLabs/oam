@@ -4737,14 +4737,43 @@
   }
 
   // Map numeric O_* open flags to the fopen-style string natives.fsOpen /
-  // fsOpenSync take, for fs.open, fs.openSync and fs/promises.open alike.
-  // Most callers pass a string ("r"/"w"/...); chokidar passes numbers.
+  // fsOpenSync take. Most callers pass a string ("r"/"w"/...); chokidar and
+  // lockfile code pass numbers. O_CREAT|O_EXCL is "x" (fail if it exists)
+  // and O_CREAT|O_TRUNC a truncating "w"; a combination no fopen string
+  // spells (O_WRONLY alone, O_WRONLY|O_CREAT) opens as the nearest one.
   function openFlagString(n, platform) {
-    var acc = n & 3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
-    var append = (n & platformOFlags(platform).O_APPEND) !== 0;
-    if (acc === 1) return append ? "a" : "w";
-    if (acc === 2) return append ? "a+" : "r+";
-    return "r";
+    const { O_APPEND, O_CREAT, O_EXCL } = platformOFlags(platform);
+    const acc = n & 3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
+    const plus = acc === 2 ? "+" : "";
+    const exclusive = (n & O_CREAT) !== 0 && (n & O_EXCL) !== 0;
+    if (acc === 0) return "r";
+    if ((n & O_APPEND) !== 0) return (exclusive ? "ax" : "a") + plus;
+    if (exclusive) return "wx" + plus;
+    return acc === 2 && (n & O_CREAT) === 0 ? "r+" : "w" + plus;
+  }
+
+  // node's stringToFlags (lib/internal/fs/utils.js, v22.22.2), as the
+  // fopen-style strings the natives take: an int32 is O_* bits, null /
+  // undefined is "r", and a string must be one of node's spellings -- the
+  // synchronous ("s") ones open as their plain twins, without O_SYNC -- or it
+  // is ERR_INVALID_ARG_VALUE "flags". Shared by every open: fs.open,
+  // fs.openSync, fs/promises.open and the writeFile family's `flag`.
+  const OPEN_FLAG_STRINGS = {
+    __proto__: null,
+    r: "r", rs: "r", sr: "r", "r+": "r+", "rs+": "r+", "sr+": "r+",
+    w: "w", wx: "wx", xw: "wx", "w+": "w+", "wx+": "wx+", "xw+": "wx+",
+    a: "a", ax: "ax", xa: "ax", as: "a", sa: "a",
+    "a+": "a+", "ax+": "ax+", "xa+": "ax+", "as+": "a+", "sa+": "a+",
+  };
+  function openFlags(flags, platform) {
+    if (typeof flags === "number") {
+      validateInt32(flags, "flags");
+      return openFlagString(flags, platform);
+    }
+    if (flags == null) return "r";
+    const fopen = typeof flags === "string" ? OPEN_FLAG_STRINGS[flags] : undefined;
+    if (fopen === undefined) throw codes.ERR_INVALID_ARG_VALUE("flags", flags);
+    return fopen;
   }
 
   // libuv error strings, keyed by code. This list is the AUTHORITY on which
@@ -10780,7 +10809,9 @@
     // a bad path synchronously, as node's do, and an async function turned
     // that throw into a callback error. (The exported module's wrapper turns
     // it back into a rejection.)
-    const withPath = (fn) => (path, ...rest) => fn(toPath(path), ...rest);
+    // The wrapper keeps the method's `length` (node's fsp.open.length is 3).
+    const withPath = (fn) =>
+      Object.defineProperty((path, ...rest) => fn(toPath(path), ...rest), "length", { value: fn.length });
     // fs/promises.cp over two validated paths.
     async function cpRecursive(srcStr, destStr, options) {
       var opts = options || {};
@@ -10819,14 +10850,22 @@
     // data, then a FileHandle writes through itself and a path is validated.
     // A view or string is one native write; an iterable is written chunk by
     // chunk into the file opened for it, as node's is.
+    //
+    // The path is opened with the call's `flag`, checked as open checks it
+    // (after the path, before the mode): "w" and "a" -- the defaults -- are
+    // one native write; any other flag opens the file with it ("wx" fails
+    // EEXIST, "r+" overwrites in place, "r" fails EBADF on the write).
     const writeFileAt = (path, data, options, append) => {
       data = writeFileData(data, options, true);
       if (fileHandles.has(path)) return path.writeFile(data, options);
       const file = toPath(path);
+      const flag = openFlags(options.flag || (append ? "a" : "w"), natives.platform);
       parseFileMode(options.mode, "mode", 0o666);
-      if (!isCustomIterable(data)) return natives.fsWriteFile(file, data, append);
+      if (!isCustomIterable(data) && (flag === "w" || flag === "a")) {
+        return natives.fsWriteFile(file, data, flag === "a");
+      }
       return (async () => {
-        const { handle } = await natives.fsOpen(file, append ? "a" : "w");
+        const { handle } = await natives.fsOpen(file, flag);
         try {
           await writeHandleData(handle, data, options.encoding);
         } finally {
@@ -10937,9 +10976,11 @@
         return new Dir(dirPath, await natives.fsReaddir(dirPath));
       }),
       cp: (src, dest, options) => cpRecursive(toPath(src, "src"), toPath(dest, "dest"), options),
+      // node's order: the path, the flags, the mode.
       open: withPath(async function (file, flags, mode) {
-        flags = typeof flags === "number" ? openFlagString(flags, natives.platform) : flags || "r";
-        var info = await natives.fsOpen(file, String(flags));
+        flags = openFlags(flags, natives.platform);
+        parseFileMode(mode, "mode", 0o666);
+        var info = await natives.fsOpen(file, flags);
 
         var h = info.handle;
         var closed = false;
@@ -11488,8 +11529,19 @@
         return void writeFdSync(path, data, options);
       }
       const file = toPath(path);
+      const flag = openFlags(options.flag || (append ? "a" : "w"), natives.platform);
       parseFileMode(options.mode, "mode", 0o666);
-      natives.fsWriteFileSync(file, encodeWrite(data, options), append);
+      const bytes = encodeWrite(data, options);
+      if (flag === "w" || flag === "a") return void natives.fsWriteFileSync(file, bytes, flag === "a");
+      // Any other flag: open with it, write it all, close -- node's own
+      // writeFileSync, which writes nothing (and so fails nothing) when the
+      // data is empty.
+      const fd = natives.fsOpenSync(file, flag);
+      try {
+        if (bytes.byteLength !== 0) natives.fsWriteSync(fd, bytes, null);
+      } finally {
+        natives.fsCloseSync(fd);
+      }
     }
 
     // The write under fs.writeSync, past its argument and descriptor checks.
@@ -11703,8 +11755,6 @@
       };
     }
 
-    const numericOpenFlags = (n) => openFlagString(n, natives.platform);
-
     // The path halves of callback forms whose own wrapper has already put the
     // callback in place, built once rather than per call.
     const readFileByPath = callbackify1(promises.readFile, 2);
@@ -11888,8 +11938,13 @@
       // Classic synchronous fd ops. The native handle (a number) IS the fd.
       // graceful-fs / playwright probe locks via openSync(path,"r+") and rely
       // on err.code === "ENOENT" to tell missing from locked.
-      openSync: (path, flags, _mode) =>
-        natives.fsOpenSync(toPath(path), typeof flags === "number" ? numericOpenFlags(flags) : (flags ?? "r")),
+      // node's order: the path, the flags, the mode.
+      openSync: (path, flags, mode) => {
+        const file = toPath(path);
+        flags = openFlags(flags, natives.platform);
+        parseFileMode(mode, "mode", 0o666);
+        return natives.fsOpenSync(file, flags);
+      },
       // The *Sync descriptor checks sit where node's C++ binding makes them:
       // after every other argument, right before the call (see validateFd).
       closeSync: (fd) => { validateFd(fd, true); natives.fsCloseSync(fd); },
@@ -12057,17 +12112,25 @@
       // native open handle (a number) IS the integer fd. fsReadChunk/
       // fsWriteChunk take a position, so the positional (pread/pwrite) forms
       // are honoured here as well as in the sync family.
-      open: function (path, flags, mode, cb) {
-        if (typeof flags === "function") { cb = flags; flags = "r"; }
-        else if (typeof mode === "function") { cb = mode; }
+      // node's order (lib/fs.js, v22.22.2), all thrown at the call: the path;
+      // with fewer than three arguments the second is the callback, else a
+      // function mode is; the mode; the flags; the callback.
+      open: function open(path, flags, mode, cb) {
+        var file = toPath(path);
+        if (arguments.length < 3) {
+          cb = flags;
+          flags = "r";
+        } else if (typeof mode === "function") {
+          cb = mode;
+        } else {
+          parseFileMode(mode, "mode", 0o666);
+        }
+        var flagStr = openFlags(flags, natives.platform);
         validateCb(cb);
-        var flagStr = typeof flags === "number" ? numericOpenFlags(flags) : (flags || "r");
         var token = fsReqStart();
-        // toPath(path) can throw (a poisoned toString) -- drop the token
-        // before the throw escapes, or it is stranded forever.
         var p;
         try {
-          p = Promise.resolve(natives.fsOpen(toPath(path), String(flagStr)));
+          p = Promise.resolve(natives.fsOpen(file, flagStr));
         } catch (e) {
           fsReqEnd(token);
           throw e;

@@ -2214,7 +2214,11 @@ checks them (`conformance/cases/257-*`): `fchmod`'s mode (`parseFileMode`),
 `FileHandle`; `conformance/cases/260-*`), before the path or descriptor: node's
 `getOptions` (a string or an object, a known encoding, an `AbortSignal`), a boolean
 `flush`, then a string or a view -- or, for the promise forms, any other iterable,
-written chunk by chunk. `FileHandle`'s `write`, `chmod`, `chown` and `truncate` run
+written chunk by chunk. Their `flag` opens the path, and every open's flags are
+node's `stringToFlags` (`conformance/cases/265-*`): an int32 of `O_*` bits, or one
+of node's spellings -- anything else is `ERR_INVALID_ARG_VALUE` "flags", after the
+path and before the mode -- so `writeFileSync(p, d, { flag: 'wx' })` fails `EEXIST`
+on an existing file, where oam used to ignore the flag and overwrite it. `FileHandle`'s `write`, `chmod`, `chown` and `truncate` run
 the same checks as their descriptor twins, after the closed-handle check
 (`conformance/cases/261-*`): `fh.write(string[, position[, encoding]])` takes a
 position, not an offset into the string, and `read`, `readv`, `write` and `writev`
@@ -2239,6 +2243,12 @@ refused, and a name the binding does not know (`'bogus'`) writes UTF-8 -- so
 `ERR_UNKNOWN_ENCODING`.
 What still differs:
 
+- **Open flags the natives cannot spell.** oam opens through fopen-style flag
+  strings, so the synchronous spellings (`'rs+'`, `'as'`, ...) open without `O_SYNC`,
+  and a numeric combination no fopen string expresses -- `O_WRONLY` without
+  `O_CREAT`, or `O_WRONLY | O_CREAT` without `O_TRUNC` -- opens as the nearest one
+  (`'w'`, which creates and truncates). Numeric flags with both access bits set
+  (`-1`) are `EINVAL` in node and open read-only in oam.
 - **A negative position for `writev` / `readv` of several buffers, on Windows.**
   libuv offsets each buffer from the position in turn, so with `-2` the second
   buffer of `writevSync(fd, [a, b], -2)` lands at `-2 + a.length` -- `-1` is the
