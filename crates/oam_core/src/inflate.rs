@@ -84,6 +84,17 @@ impl Inflater {
         self.pos = 0;
     }
 
+    /// Prime the window with a preset dictionary before the stream's first
+    /// byte, as zlib's `inflateSetDictionary` does: its last [`WINDOW`]
+    /// bytes become history a copy may reach into, and they count toward
+    /// the "too far back" check. The output is unchanged.
+    pub(crate) fn prime(&mut self, dictionary: &[u8]) {
+        debug_assert_eq!(self.pos, 0, "a dictionary primes a fresh stream");
+        let tail = &dictionary[dictionary.len().saturating_sub(WINDOW)..];
+        self.hist[..tail.len()].copy_from_slice(tail);
+        self.pos = tail.len();
+    }
+
     /// One step: consume from `src`, write at most `dst.len().min(STEP_OUT)`
     /// bytes to `dst`. Returns (consumed, produced, ended): `ended` is true
     /// once the deflate stream (and for zlib its Adler-32) is complete.
@@ -202,6 +213,15 @@ impl ZlibError {
         errno: 2,
         message: "Missing dictionary",
     };
+
+    /// A zlib header asking for a preset dictionary whose Adler-32 is not
+    /// the supplied one's (node_zlib.cc: inflateSetDictionary's Z_DATA_ERROR
+    /// reported as Z_NEED_DICT with this message).
+    pub const BAD_DICT: ZlibError = ZlibError {
+        code: "Z_NEED_DICT",
+        errno: 2,
+        message: "Bad dictionary",
+    };
 }
 
 impl std::fmt::Display for ZlibError {
@@ -302,10 +322,32 @@ pub struct NodeInflate {
     flags: u8,
     xlen: u16,
     trailer: [u8; 8],
+    /// node's `dictionary` option, kept for a zlib header that asks for one
+    /// (FDICT). A raw stream is primed with it up front instead, and a gzip
+    /// member never uses one, so neither keeps it.
+    dictionary: Option<Box<[u8]>>,
 }
 
 impl NodeInflate {
     pub fn new(wrap: Wrap) -> NodeInflate {
+        NodeInflate::with_dictionary(wrap, None)
+    }
+
+    /// An inflate stream with node's `dictionary` option, as node_zlib.cc
+    /// uses it: a raw stream's window starts primed with it
+    /// (`inflateSetDictionary` at init); a zlib stream uses it only when its
+    /// header asks for a preset dictionary, and fails `Bad dictionary` when
+    /// the header's Adler-32 is not this one's. An empty dictionary is none
+    /// (node checks `dictionary_.empty()`).
+    pub fn with_dictionary(wrap: Wrap, dictionary: Option<&[u8]>) -> NodeInflate {
+        let dictionary = dictionary.filter(|d| !d.is_empty());
+        let mut inflate = Inflater::new(false);
+        let mut kept = None;
+        match (wrap, dictionary) {
+            (Wrap::Raw, Some(dictionary)) => inflate.prime(dictionary),
+            (Wrap::Zlib | Wrap::Auto, Some(dictionary)) => kept = Some(dictionary.into()),
+            _ => {}
+        }
         NodeInflate {
             wrap,
             at: if wrap == Wrap::Raw {
@@ -314,13 +356,14 @@ impl NodeInflate {
                 At::Head0
             },
             members: wrap == Wrap::Gzip,
-            inflate: Inflater::new(false),
+            inflate,
             check: Check::None,
             header_crc: Crc::new(),
             held: 0,
             flags: 0,
             xlen: 0,
             trailer: [0; 8],
+            dictionary: kept,
         }
     }
 
@@ -423,8 +466,14 @@ impl NodeInflate {
                     self.zlib_header(self.held, b)?
                 }
             }
-            At::DictId(n) if n < 3 => At::DictId(n + 1),
-            At::DictId(_) => return Err(ZlibError::NEED_DICT),
+            At::DictId(n) => {
+                self.trailer[usize::from(n)] = b;
+                if n < 3 {
+                    At::DictId(n + 1)
+                } else {
+                    self.preset_dictionary()?
+                }
+            }
             At::GzCm => {
                 self.held = b;
                 At::GzFlg
@@ -542,6 +591,30 @@ impl NodeInflate {
         if flg & ZLIB_FDICT != 0 {
             return Ok(At::DictId(0));
         }
+        self.check = Check::Adler(1);
+        Ok(At::Body)
+    }
+
+    /// inflate.c DICT, with node_zlib.cc's answer to its Z_NEED_DICT: the
+    /// header's DICTID (in `trailer[..4]`) names the dictionary by its
+    /// Adler-32. Without a dictionary that is "Missing dictionary"; with
+    /// one whose Adler-32 differs, "Bad dictionary"; with the right one the
+    /// window is primed with it and the body inflates. The data's own
+    /// Adler-32 does not cover the dictionary.
+    fn preset_dictionary(&mut self) -> Result<At, ZlibError> {
+        let Some(dictionary) = self.dictionary.take() else {
+            return Err(ZlibError::NEED_DICT);
+        };
+        let id = u32::from_be_bytes([
+            self.trailer[0],
+            self.trailer[1],
+            self.trailer[2],
+            self.trailer[3],
+        ]);
+        if miniz_oxide::mz_adler32_oxide(1, &dictionary) != id {
+            return Err(ZlibError::BAD_DICT);
+        }
+        self.inflate.prime(&dictionary);
         self.check = Check::Adler(1);
         Ok(At::Body)
     }
@@ -717,6 +790,124 @@ mod tests {
         assert_eq!(
             run(Wrap::Zlib, &[0x78, 0xbb, 0, 0, 0, 1], 6),
             Err(ZlibError::NEED_DICT)
+        );
+    }
+
+    /// Feed `input` in `size`-byte writes to a stream made with `dictionary`.
+    fn run_dict(
+        wrap: Wrap,
+        dictionary: &[u8],
+        input: &[u8],
+        size: usize,
+    ) -> Result<Vec<u8>, ZlibError> {
+        let mut dec = NodeInflate::with_dictionary(wrap, Some(dictionary));
+        let mut out = Vec::new();
+        let mut buf = vec![0u8; 1000];
+        for chunk in input.chunks(size.max(1)) {
+            let mut off = 0;
+            loop {
+                let (used, produced) = dec.step(&chunk[off..], &mut buf)?;
+                off += used;
+                out.extend_from_slice(&buf[..produced]);
+                if used == 0 && produced == 0 {
+                    break;
+                }
+            }
+        }
+        dec.finish()?;
+        Ok(out)
+    }
+
+    /// node v22.22.2's `deflateSync('hello world hello', { dictionary })`
+    /// and `deflateRawSync` with the same dictionary: both copy from it.
+    const DICT: &[u8] = b"hello world dictionary";
+    const NODE_FDICT: [u8; 16] = [
+        0x78, 0xbb, 0x62, 0x20, 0x08, 0xb3, 0xcb, 0x40, 0x12, 0x05, 0xb3, 0x01, 0x3b, 0x20, 0x06,
+        0x91,
+    ];
+    const NODE_RAW_DICT: [u8; 6] = [0xcb, 0x40, 0x12, 0x05, 0xb3, 0x01];
+
+    #[test]
+    fn a_preset_dictionary_primes_the_window() {
+        for size in [1, 3, NODE_FDICT.len()] {
+            for wrap in [Wrap::Zlib, Wrap::Auto] {
+                assert_eq!(
+                    run_dict(wrap, DICT, &NODE_FDICT, size).unwrap(),
+                    b"hello world hello"
+                );
+            }
+            assert_eq!(
+                run_dict(Wrap::Raw, DICT, &NODE_RAW_DICT, size).unwrap(),
+                b"hello world hello"
+            );
+        }
+        // A dictionary longer than the window: only its last 32 KiB is
+        // history.
+        let long: Vec<u8> = (0..70_000u32).map(|i| (i * 131 % 251) as u8).collect();
+        let dec = NodeInflate::with_dictionary(Wrap::Raw, Some(&long));
+        assert_eq!(dec.inflate.pos, super::WINDOW);
+        assert_eq!(
+            dec.inflate.hist[..super::WINDOW],
+            long[long.len() - super::WINDOW..]
+        );
+    }
+
+    #[test]
+    fn a_preset_dictionary_fails_as_node_reports_it() {
+        let bad = |wrap, dictionary: &[u8], input: &[u8], want: ZlibError| {
+            assert_eq!(run_dict(wrap, dictionary, input, 2), Err(want), "{wrap:?}");
+        };
+        // No dictionary (an empty one is none), or one with another Adler-32.
+        assert_eq!(run(Wrap::Zlib, &NODE_FDICT, 2), Err(ZlibError::NEED_DICT));
+        bad(Wrap::Zlib, b"", &NODE_FDICT, ZlibError::NEED_DICT);
+        bad(Wrap::Auto, b"", &NODE_FDICT, ZlibError::NEED_DICT);
+        bad(Wrap::Zlib, b"nope", &NODE_FDICT, ZlibError::BAD_DICT);
+        bad(Wrap::Auto, b"nope", &NODE_FDICT, ZlibError::BAD_DICT);
+        // Checked as soon as DICTID is in, before the body arrives.
+        bad(Wrap::Zlib, b"nope", &NODE_FDICT[..6], ZlibError::BAD_DICT);
+        bad(
+            Wrap::Zlib,
+            DICT,
+            &NODE_FDICT[..6],
+            ZlibError::UNEXPECTED_EOF,
+        );
+        bad(
+            Wrap::Zlib,
+            DICT,
+            &NODE_FDICT[..4],
+            ZlibError::UNEXPECTED_EOF,
+        );
+        // A raw stream cannot tell: a short wrong dictionary leaves a copy
+        // reaching before it, a long one is copied from.
+        bad(
+            Wrap::Raw,
+            b"x",
+            &NODE_RAW_DICT,
+            data_error("invalid distance too far back").unwrap_err(),
+        );
+        assert_eq!(
+            run_dict(Wrap::Raw, &[b'x'; 41], &NODE_RAW_DICT, 6).unwrap(),
+            b"hxxxxxxxxxxxhxxxx"
+        );
+        assert_eq!(
+            run(Wrap::Raw, &NODE_RAW_DICT, 6),
+            data_error("invalid distance too far back")
+        );
+    }
+
+    #[test]
+    fn a_dictionary_nothing_asks_for_is_unused() {
+        let plain = b"hello world hello";
+        assert_eq!(run_dict(Wrap::Zlib, DICT, &zlib(plain), 3).unwrap(), plain);
+        assert_eq!(run_dict(Wrap::Gzip, DICT, &gzip(plain), 3).unwrap(), plain);
+        assert_eq!(run_dict(Wrap::Auto, DICT, &gzip(plain), 3).unwrap(), plain);
+        // Not primed for a stream without FDICT: a copy before its start
+        // still fails.
+        let mut z = vec![0x78, 0x9c];
+        z.extend_from_slice(&TOO_FAR);
+        assert_eq!(
+            run_dict(Wrap::Zlib, DICT, &z, z.len()),
+            data_error("invalid distance too far back")
         );
     }
 

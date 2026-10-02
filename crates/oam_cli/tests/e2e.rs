@@ -3811,33 +3811,48 @@ fn small_builtins_wave_smoke() {
     assert_eq!(lines[4], "\"sunk 9\\n\"");
 }
 
-/// The `dictionary` option is ignored by oam's deflaters and inflaters
-/// (docs/node-divergences.md, the zlib `dictionary` row): miniz_oxide's
-/// deflater cannot prime its window. This pins what oam does, so the day
-/// either side honours the option this test and that row change together.
-/// Node's own bytes are `78bb622008b3cb401205b3013b200691` (FDICT set) for
-/// the deflate below, and it inflates them with the dictionary.
+/// The `dictionary` option, used by oam's deflaters and inflaters as node's
+/// zlib uses it (conformance cases 280 and 281 have the details;
+/// docs/node-divergences.md, the zlib `dictionary` row, says what still
+/// differs: the deflated bytes are miniz's). Node's own bytes are
+/// `78bb622008b3cb401205b3013b200691` (FDICT set) and raw `cb401205b301`
+/// for the deflates below. The last line pins the `strategy` / `windowBits`
+/// / `memLevel` row: oam ignores both, so its header stays `78bb` where
+/// node writes `783f` and `18b4`. If either is ever honoured, update that
+/// row and the dictionary row with it.
 #[test]
-fn zlib_dictionary_option_is_ignored_as_documented() {
+fn zlib_dictionary_option_is_used_as_documented() {
     let stdout = run_ok(
         "zlib_dictionary.cjs",
         "const z = require('node:zlib');\n\
          const dictionary = Buffer.from('hello world dictionary');\n\
+         const tryIt = (f) => { try { return f().toString(); } catch (e) { return [e.code, e.errno, e.message].join(' '); } };\n\
          const out = z.deflateSync('hello world hello', { dictionary });\n\
          console.log('header', out.subarray(0, 2).toString('hex'), 'fdict', (out[1] & 0x20) !== 0);\n\
-         console.log('plain', z.inflateSync(out).toString());\n\
+         console.log('with', tryIt(() => z.inflateSync(out, { dictionary })));\n\
+         console.log('without', tryIt(() => z.inflateSync(out)));\n\
          const raw = z.deflateRawSync('hello world hello', { dictionary });\n\
-         console.log('raw plain', z.inflateRawSync(raw).toString());\n\
+         console.log('raw with', tryIt(() => z.inflateRawSync(raw, { dictionary })));\n\
+         console.log('raw without', tryIt(() => z.inflateRawSync(raw)));\n\
          const nodeBytes = Buffer.from('78bb622008b3cb401205b3013b200691', 'hex');\n\
-         try { z.inflateSync(nodeBytes, { dictionary }); console.log('node bytes inflated'); }\n\
-         catch (e) { console.log('node bytes', e.code, e.errno, e.message); }",
+         console.log('node bytes', tryIt(() => z.inflateSync(nodeBytes, { dictionary })));\n\
+         const nodeRaw = Buffer.from('cb401205b301', 'hex');\n\
+         console.log('node raw', tryIt(() => z.inflateRawSync(nodeRaw, { dictionary })));\n\
+         console.log('wrong', tryIt(() => z.inflateSync(nodeBytes, { dictionary: Buffer.from('nope') })));\n\
+         const hdr = (o) => z.deflateSync('hello world hello', { dictionary, ...o }).subarray(0, 2).toString('hex');\n\
+         console.log('ignored', hdr({ strategy: 2 }), hdr({ windowBits: 9 }));",
     );
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
-        "header 789c fdict false\n\
-         plain hello world hello\n\
-         raw plain hello world hello\n\
-         node bytes Z_NEED_DICT 2 Missing dictionary"
+        "header 78bb fdict true\n\
+         with hello world hello\n\
+         without Z_NEED_DICT 2 Missing dictionary\n\
+         raw with hello world hello\n\
+         raw without Z_DATA_ERROR -3 invalid distance too far back\n\
+         node bytes hello world hello\n\
+         node raw hello world hello\n\
+         wrong Z_NEED_DICT 2 Bad dictionary\n\
+         ignored 78bb 78bb"
     );
 }
 
