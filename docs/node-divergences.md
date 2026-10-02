@@ -239,7 +239,7 @@ Differences from Node's model:
   read as the script path.
 - **`--allow-net` is checked on every host an HTTP request reaches**, not only the one
   the script named. `fetch` and `undici.request` run on oam's HTTP client, which follows
-  redirects itself (entry 38), and each hop's host is checked against the grant before it
+  redirects itself (entry 38), and each hop's host and port are checked against the grant before it
   is dialled, before a `connect.lookup` hook is asked to resolve it, and whether or not
   the request goes through an environment proxy (the destination is checked, not the
   proxy). A refused hop is never contacted, and the request fails with the same
@@ -248,16 +248,26 @@ Differences from Node's model:
   was refused. Up to 0.16.1 only the initial URL was checked, and a granted host's
   redirect reached any host. `http.request` and `https.request`, which followed redirects
   on the same client up to 0.16.2, follow none now, as in Node; on oam's own client they
-  are checked like `fetch`, and emit a refusal as `'error'`. What these requests compare
-  is the URL's host as the
-  URL parser normalises it, without the port: `LOCALHOST`, `%6c%6fcalhost` and `0x7f.1`
-  are checked as `localhost`, `localhost` and `127.0.0.1`, and an IPv6 literal as
-  `[::1]` (so a grant names it in brackets). A trailing dot is not dropped, so
-  `localhost.` is refused under `--allow-net=localhost`. Because the port is not part of
-  their resource, a port-scoped entry such as `--allow-net=127.0.0.1:8080` admits
-  `net.connect` and `tls.connect` to that port but none of these requests; grant the
-  bare host to allow them. An `http.request` / `https.request` that goes over an agent's
-  socket (entry 43) is a `net.connect` / `tls.connect` and is checked as one (`host:port`).
+  are checked like `fetch`, and emit a refusal as `'error'`. What these requests -- and
+  `new WebSocket()` -- compare is `host:port`, as `net.connect` does: the URL's host as
+  the URL parser normalises it, and the port the hop is dialled on, the URL's own or the
+  scheme's default (80 for `http:` / `ws:`, 443 for `https:` / `wss:`). `LOCALHOST`,
+  `%6c%6fcalhost` and `0x7f.1` are checked as `localhost`, `localhost` and `127.0.0.1`,
+  and an IPv6 literal as `[::1]` (so a grant names it in brackets, `[::1]` or
+  `[::1]:8080`). A trailing dot is not dropped, so `localhost.` is refused under
+  `--allow-net=localhost`. An entry without a port admits the host on every port; a
+  port-scoped entry admits its own port alone, so `--allow-net=example.com:443` admits
+  `https://example.com/` and refuses `http://example.com/` and a redirect to
+  `example.com:8443`. A refusal's `resource` names `host:port` (`"example.com:80"`).
+  Up to 0.17.1 these requests were checked on the host alone: a port-scoped entry
+  admitted `net.connect` and `tls.connect` to its port but no HTTP request or WebSocket
+  at all, and a refusal named the bare host. An `http.request` / `https.request` that
+  goes over an agent's socket (entry 43) is a `net.connect` / `tls.connect` and is
+  checked as one. One spelling still differs between the two families: a raw socket to
+  an IPv6 address is checked unbracketed (`net.connect(8080, '::1')` asks about
+  `::1:8080`, as the next bullet says), an HTTP request bracketed (`[::1]:8080`). So
+  `[::1]` and `[::1]:8080` admit `fetch('http://[::1]:8080/')` but not that
+  `net.connect`, which only the entry `::1:8080` admits, and that entry admits no fetch.
 - **A `lookup` hook's answers are checked too.** A `lookup` option or a replaced
   `dns.lookup` decides which addresses a granted name is dialled at, so for `net.connect`,
   `tls.connect` and a request over an agent's socket every address it answers is checked
@@ -267,7 +277,7 @@ Differences from Node's model:
   dialled, and `--allow-net=granted.test,127.0.0.1` allows it. oam's own resolver keeps a
   hostname grant working: its answer is handed to the connection as a one-shot ticket,
   never as addresses JS could substitute. A fetch's `connect.lookup` answers follow the
-  fetch rule (entry 38: bracketed, no port). The name itself is checked before it is
+  fetch rule (entry 38: bracketed, on the hop's port). The name itself is checked before it is
   looked up, so a refused name is never resolved.
 - **A relative path is checked where it points, as in Node.** A path with no root is
   resolved against the cwd of the moment before it is matched (so `process.chdir` moves
@@ -1611,12 +1621,14 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
 - **A hook's addresses ARE a `--permission` boundary** (not a divergence, but the bullet
   that used to say otherwise is worth replacing rather than deleting). `--allow-net=<name>`
   grants the name, and every address the hook answers with is checked against the same
-  grant, exactly as a URL naming that address directly would be -- so
+  grant, exactly as a URL naming that address directly would be, on the port the hop is
+  dialled on (`127.0.0.1:8080` for `http://granted.invalid:8080/`; the port is read from
+  the parked fetch, never from JS, and a refusal names it) -- so
   `--allow-net=granted.invalid` plus a hook answering `127.0.0.1` is refused with
   `ERR_ACCESS_DENIED` and nothing is dialled, while `--allow-net=granted.invalid,127.0.0.1`
   allows it. An IPv6 answer is checked bracketed and canonical, as a URL's host is: a hook
   answering `::1` (or `0:0:0:0:0:0:0:1`) needs the same `[::1]` grant that
-  `http://[::1]/` does. A redirect hop's host is checked against the grant too (entry 4), before the
+  `http://[::1]/` does. A redirect hop's host and port are checked against the grant too (entry 4), before the
   hop's lookup, so the hook is only ever asked about names the grant covers. Node has no
   `--permission` net grant to compare against.
 

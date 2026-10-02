@@ -637,6 +637,20 @@ pub async fn fetch_supply(
     run(state, &bodies, &ids, &continuations).await
 }
 
+/// The port the fetch parked under `token` for its lookup hook will dial --
+/// the hop's URL's own, or the scheme's default, the port [`NetTarget`] gave
+/// the net grant before it parked -- or `None` when no such fetch is parked.
+/// The engine checks each address the hook answers as `address:port` with
+/// it, so a port-scoped grant that admitted the hop admits its answer too.
+/// Read from the parked state, never from JS.
+pub fn fetch_parked_port(token: u64, continuations: &FetchContinuations) -> Option<u16> {
+    let map = lock(continuations);
+    let pending = map.get(&token)?;
+    (pending.wants == Wants::Addresses)
+        .then(|| pending.state.current.port_or_known_default())
+        .flatten()
+}
+
 /// `fetchAbandon`: drop the fetch parked under `token`. True if it was there.
 pub fn fetch_abandon(token: u64, continuations: &FetchContinuations) -> bool {
     let pending = lock(continuations).remove(&token);
