@@ -1664,6 +1664,17 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   destination check, for one -- could not run; up to 0.16.2 the request was sent without it.
   The same policy written as a `connect` function works. `http.request` is not affected: it
   never goes through an undici dispatcher, in Node or here. `compose()` is not provided.
+- **A `Pool` or `Client` is bound to its origin**, as undici's: `fetch(url, { dispatcher:
+  pool })` and `undici.request(url, { dispatcher: pool })` for a URL on another origin go to
+  the pool's own, with its `host` (a caller's own `host` on `undici.request` is sent, as in
+  undici), the URL staying the response's `url`
+  (`a_pool_sends_every_request_to_its_own_origin_mocked_or_not`, e2e, Node + undici 6.29.0
+  output; up to 0.17.1 they went to the URL's host). Such a request's connections are made
+  through the pool's connection policy, so none is pooled (above). One difference is left:
+  a request to the pool's own origin that is redirected to another goes to that other host,
+  where undici's sends the hop to the pool's origin too; pinning every request through a
+  `Pool` would give up pooling for all of them. A `MockPool` / `MockClient` pins its hops as
+  well (below).
 **`MockAgent`, `MockPool` and `MockClient`**
 
 They answer requests from their interceptors, as undici's do (#206; up to 0.17.1 they refused
@@ -1689,9 +1700,13 @@ TLS over it), redirect hops included.
 It fails **closed**: every byte of a request goes to the in-memory socket first, and only a
 request no interceptor matches, while `enableNetConnect()` allows its origin (or with the
 agent deactivated), is then sent to the network, over the connection the agent it wraps
-would make. Pinned against Node + undici 6.29.0 by `undici_mock_agent_answers_as_undicis_does`
-and `undici_mock_agent_never_reaches_the_network_unless_allowed` (e2e; a local server counts
-what reaches it). What differs:
+would make -- to the mock pool's own origin, the one net connect was asked about, whatever
+host the request named (a pool passed as the dispatcher of a request to another host, a
+mocked redirect hop), with that origin's `host`, as undici's `MockPool` hands it to its
+`Pool`. Pinned against Node + undici 6.29.0 by `undici_mock_agent_answers_as_undicis_does`,
+`undici_mock_agent_never_reaches_the_network_unless_allowed` and
+`a_pool_sends_every_request_to_its_own_origin_mocked_or_not` (e2e; local servers count
+what reaches them). What differs:
 
 - **What the matchers and a reply callback see is the request as sent.** The body is the
   bytes that went out, as a UTF-8 string (`null` with none), where undici's fetch hands them

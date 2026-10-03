@@ -1486,7 +1486,51 @@
       if (typeof dispatcher._oamConnect === "function") {
         policy.connector = { fn: dispatcher._oamConnect, self: dispatcher };
       }
+      // A Client or Pool (a MockPool / MockClient too) is bound to its
+      // origin: undici's sends every request it dispatches there, whatever
+      // origin the request's URL names, with that origin as the `host`
+      // (measured on node v22.22.2 + undici 6.29.0: fetch(urlB, {
+      // dispatcher: poolA }) and undici.request alike reach A). For a URL
+      // on another origin each connection the request asks for is made to
+      // the dispatcher's own, the way it would make it, and fetch sends
+      // `host` (pinnedHost); a URL on its own origin is the plain path, at
+      // no cost.
+      if (request && dispatcher instanceof Client) {
+        const own = originParams(dispatcher.origin);
+        if (own !== null && own.origin !== originOf(request.url)) {
+          policy.connector = {
+            fn: (params, cb) => connectVia(dispatcher, { ...params, ...own.params }, cb),
+            self: dispatcher,
+          };
+          policy.pinnedHost = own.params.host;
+        }
+      }
       return policy;
+    }
+    // undici's connector parameters for `origin` (a URL string): the host
+    // with its port when it names one, the hostname unbracketed, the port a
+    // string, '' for the scheme's default -- what the transport hands a
+    // connect function -- and the origin itself; null for one that does not
+    // parse.
+    function originParams(origin) {
+      let url;
+      try {
+        url = new G.URL(String(origin));
+      } catch {
+        return null;
+      }
+      const hostname = url.hostname.startsWith("[") ? url.hostname.slice(1, -1) : url.hostname;
+      return {
+        origin: url.origin,
+        params: { host: url.host, hostname, protocol: url.protocol, port: url.port },
+      };
+    }
+    function originOf(url) {
+      try {
+        return new G.URL(String(url)).origin;
+      } catch {
+        return null;
+      }
     }
 
     // ---- global dispatcher ------------------------------------------------
@@ -2103,8 +2147,33 @@
       // Net connect allows the origin (or the agent is inactive): the
       // request goes to it as it was written, over the connection the
       // dispatcher would have made, and its answer comes back as it is.
+      // That is a connection to the scope's own origin -- the one net
+      // connect was asked about -- whatever host the request named, as
+      // undici's MockPool hands an unmatched request to its Pool, which
+      // dials its own origin: a pool for an allowed origin passed as the
+      // dispatcher of a request to another host must not reach that host.
       function passThrough() {
-        scope[kRealConnect](params, (err, connection) => {
+        const own = originParams(origin);
+        if (own === null) {
+          fail(new errors.InvalidArgumentError("invalid origin"));
+          return;
+        }
+        // The `host` undici's Client writes is its own origin's: a request
+        // the transport addressed to the other host (a redirect hop through
+        // this pool) carries that one's, which is swapped for it. A caller's
+        // own `host` (undici.request sends one) is left as it is.
+        // (The parser has read the whole request by now, so the head is in.)
+        const sent = own.params.host.toLowerCase() !== String(params.host).toLowerCase() ? G.Buffer.concat(raw) : null;
+        const end = sent === null ? -1 : sent.indexOf("\r\n\r\n");
+        if (end !== -1) {
+          const head = sent.toString("latin1", 0, end);
+          const swapped = head.replace(/\r\nhost:[ \t]*([^\r\n]*)/i, (line, value) =>
+            value.trim().toLowerCase() === String(params.host).toLowerCase() ? "\r\nhost: " + own.params.host : line,
+          );
+          raw.length = 0;
+          raw.push(G.Buffer.concat([G.Buffer.from(swapped, "latin1"), sent.subarray(end)]));
+        }
+        scope[kRealConnect]({ ...params, ...own.params }, (err, connection) => {
           if (err) {
             fail(err);
             return;

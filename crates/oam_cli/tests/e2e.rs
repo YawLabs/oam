@@ -8153,6 +8153,73 @@ reached the server ["POST /k","GET /l","GET /mocked"]"##;
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// A Client or Pool is bound to its origin: undici's sends every request it
+/// dispatches there, with that origin as `host`, whatever origin the URL
+/// names. So a MockPool for an origin net connect allows, passed as the
+/// dispatcher of a request to another host, passes an unmatched request
+/// through to its OWN origin -- the one net connect was asked about -- and
+/// never to the host the URL named; the same for a mocked redirect hop to
+/// another host, and for a plain Pool. Up to the review of #206 oam checked
+/// net connect against the pool's origin and then dialled the URL's host,
+/// so the allowlist was bypassed, and a plain Pool sent the request to the
+/// URL's host. Expected output is node v22.22.2 + undici 6.29.0's, line for
+/// line (ports elided); two local servers count what reaches each.
+#[test]
+fn a_pool_sends_every_request_to_its_own_origin_mocked_or_not() {
+    let script = write_temp(
+        "undici_pool_own_origin/main.mjs",
+        r##"import http from 'node:http';
+import { MockAgent, Pool, request } from 'undici';
+const hits = { A: [], B: [] };
+const mk = (n) => http.createServer((q, s) => { hits[n].push(q.url + ' host=' + q.headers.host.replace(/\d+$/, 'N')); s.end(n); });
+const A = mk('A'), B = mk('B');
+await new Promise((r) => A.listen(0, '127.0.0.1', r));
+await new Promise((r) => B.listen(0, 'localhost', r));
+const oA = 'http://127.0.0.1:' + A.address().port, oB = 'http://localhost:' + B.address().port;
+const out = async (p) => {
+  try {
+    const r = await p;
+    const url = r.url === undefined ? '' : ' ' + r.url.replace(/:\d+/, ':N');
+    return (r.status ?? r.statusCode) + url + ' ' + await (r.text ? r.text() : r.body.text());
+  } catch (e) {
+    return 'failed ' + (e.cause?.code ?? e.code);
+  }
+};
+const agent = new MockAgent();
+agent.enableNetConnect('127.0.0.1:' + A.address().port);
+const pool = agent.get(oA);
+pool.intercept({ path: '/m' }).reply(200, 'mocked');
+pool.intercept({ path: '/r' }).reply(302, '', { headers: { location: oB + '/hop' } });
+console.log('fetch matched', await out(fetch(oB + '/m', { dispatcher: pool })));
+console.log('fetch passed through', await out(fetch(oB + '/x?q=1', { dispatcher: pool })));
+console.log('request passed through', await out(request(oB + '/y', { dispatcher: pool })));
+console.log('pool.request passed through', await out(pool.request({ origin: oB, path: '/z', method: 'GET' })));
+console.log('mocked redirect to the other host', await out(fetch(oA + '/r', { dispatcher: pool })));
+const plain = new Pool(oA);
+console.log('plain pool fetch', await out(fetch(oB + '/p', { dispatcher: plain })));
+console.log('plain pool request', await out(request(oB + '/q', { dispatcher: plain })));
+const other = new MockAgent();
+other.enableNetConnect('localhost:' + B.address().port);
+console.log('pool origin not allowed', await out(fetch(oB + '/w', { dispatcher: other.get(oA) })));
+console.log(JSON.stringify(hits));
+A.close();
+B.close();
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = r##"fetch matched 200 http://localhost:N/m mocked
+fetch passed through 200 http://localhost:N/x?q=1 A
+request passed through 200 A
+pool.request passed through 200 A
+mocked redirect to the other host 200 http://localhost:N/hop A
+plain pool fetch 200 http://localhost:N/p A
+plain pool request 200 A
+pool origin not allowed failed UND_MOCK_ERR_MOCK_NOT_MATCHED
+{"A":["/x?q=1 host=127.0.0.1:N","/y host=127.0.0.1:N","/z host=127.0.0.1:N","/hop host=127.0.0.1:N","/p host=127.0.0.1:N","/q host=127.0.0.1:N"],"B":[]}"##;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 /// A dispatcher another copy of undici -- the npm package loaded by path, or
 /// one bundled into a dependency -- installed as the global dispatcher with
 /// that copy's setGlobalDispatcher(), in the slot every copy shares

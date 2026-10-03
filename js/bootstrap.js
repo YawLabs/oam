@@ -3218,6 +3218,13 @@
         headerNames: headers.map((h) => h[0]),
       });
       if (policy.refuse) throw new TypeError("fetch failed", { cause: policy.refuse });
+      // A Client or Pool bound to another origin than the URL's: its
+      // connections go there (its connector), and the request carries that
+      // origin as `host`, as undici's Client writes it -- unless the caller
+      // set one, which undici.request sends (fetch has dropped any).
+      if (policy.pinnedHost !== undefined && !request.headers.some((h) => String(h[0]).toLowerCase() === "host")) {
+        request.headers = [...request.headers, ["host", policy.pinnedHost]];
+      }
       if (policy.connector) {
         connector = policy.connector;
         request.connect_hook = true;
