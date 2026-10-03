@@ -323,6 +323,8 @@ mod tests {
     /// piped in -- carries the handshake as it is: nothing is dialled (the
     /// URL's host does not exist), no TLS is added for `wss:` (the
     /// connector's is the connection's), and the init headers go out.
+    // The accept callback's Err type is tungstenite's own error response.
+    #[allow(clippy::result_large_err)]
     #[tokio::test]
     async fn a_supplied_connection_carries_the_handshake_as_it_is() {
         let registry: WsRegistry = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
