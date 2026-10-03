@@ -22527,7 +22527,10 @@ setTimeout(() => process.exit(0), 50);
 /// (v22.22.2) prints "fetch=ok slow-done" for both: its socket is the first
 /// request's own, and undici's pool is not the agent's. That oam reused the
 /// connection (one server connection, where node dials two) is what puts
-/// the fetch in harm's way, so it is asserted too.
+/// the fetch in harm's way, so it is asserted too. Over https it no longer
+/// does: since #176 https.get offers no ALPN and fetch offers `http/1.1`, as
+/// node's do, and a connection serves only requests with its own offer, so
+/// the fetch dials its own -- two connections, as node's.
 #[test]
 fn a_kept_req_socket_leaves_a_connection_another_request_took() {
     let src = format!(
@@ -22580,7 +22583,7 @@ setTimeout(() => process.exit(0), 50);
         stdout.lines().collect::<Vec<_>>(),
         [
             "http fetch=ok slow-done connections=1",
-            "https fetch=ok slow-done connections=1",
+            "https fetch=ok slow-done connections=2",
         ],
         "stderr: {stderr}"
     );
