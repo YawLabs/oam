@@ -1672,16 +1672,14 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   The same policy written as a `connect` function works. `http.request` is not affected: it
   never goes through an undici dispatcher, in Node or here. `compose()` is not provided.
 - **A `Pool` or `Client` is bound to its origin**, as undici's: `fetch(url, { dispatcher:
-  pool })` and `undici.request(url, { dispatcher: pool })` for a URL on another origin go to
-  the pool's own, with its `host` (a caller's own `host` on `undici.request` is sent, as in
-  undici), the URL staying the response's `url`
-  (`a_pool_sends_every_request_to_its_own_origin_mocked_or_not`, e2e, Node + undici 6.29.0
-  output; up to 0.17.1 they went to the URL's host). Such a request's connections are made
-  through the pool's connection policy, so none is pooled (above). One difference is left:
-  a request to the pool's own origin that is redirected to another goes to that other host,
-  where undici's sends the hop to the pool's origin too; pinning every request through a
-  `Pool` would give up pooling for all of them. A `MockPool` / `MockClient` pins its hops as
-  well (below).
+  pool })` and `undici.request(url, { dispatcher: pool })` go to the pool's own origin, with
+  its `host`, whatever origin the URL names -- every redirect hop included, wherever its
+  Location points (a caller's own `host` on `undici.request` is sent, as in undici) -- the URL
+  staying the response's `url` (`a_pool_sends_every_request_to_its_own_origin_mocked_or_not`,
+  e2e, Node + undici 6.29.0 output; up to 0.17.1 they went to the URL's host). The transport
+  pins each hop to that origin, so its connections are pooled as any other; a pool with a
+  `connect` function makes them with it (above). A `MockPool` / `MockClient` pins its hops
+  as well (below).
 - **A closed or destroyed dispatcher sends nothing**, as undici's: after `close()` (or
   `destroy()`) every request through an `Agent`, `Pool`, `Client`, proxy agent or
   `MockAgent` -- passed, or the global one -- fails with `ClientDestroyedError` (wrapped by

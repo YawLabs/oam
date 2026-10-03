@@ -8343,27 +8343,38 @@ reached []"##;
 
 /// A Client or Pool is bound to its origin: undici's sends every request it
 /// dispatches there, with that origin as `host`, whatever origin the URL
-/// names. So a MockPool for an origin net connect allows, passed as the
-/// dispatcher of a request to another host, passes an unmatched request
-/// through to its OWN origin -- the one net connect was asked about -- and
-/// never to the host the URL named; the same for a mocked redirect hop to
-/// another host, and for a plain Pool. Up to the review of #206 oam checked
-/// net connect against the pool's origin and then dialled the URL's host,
-/// so the allowlist was bypassed, and a plain Pool sent the request to the
-/// URL's host. Expected output is node v22.22.2 + undici 6.29.0's, line for
-/// line (ports elided); two local servers count what reaches each.
+/// names -- redirect hops included. So a MockPool for an origin net connect
+/// allows, passed as the dispatcher of a request to another host, passes an
+/// unmatched request through to its OWN origin -- the one net connect was
+/// asked about -- and never to the host the URL named; the same for a mocked
+/// redirect hop to another host, and for a plain Pool or Client, whose
+/// redirect hops stay on its origin with its `host` whether the first URL was
+/// on that origin or not. Up to the review of #206 oam checked net connect
+/// against the pool's origin and then dialled the URL's host, so the
+/// allowlist was bypassed, and a plain Pool sent the request to the URL's
+/// host; after it, a Pool's redirect from its own origin still left for the
+/// Location's host, and a hop from another origin carried that host as
+/// `host`. Expected output is node v22.22.2 + undici 6.29.0's, line for line
+/// (ports elided); two local servers count what reaches each.
 #[test]
 fn a_pool_sends_every_request_to_its_own_origin_mocked_or_not() {
     let script = write_temp(
         "undici_pool_own_origin/main.mjs",
         r##"import http from 'node:http';
-import { MockAgent, Pool, request } from 'undici';
+import { MockAgent, Pool, Client, request } from 'undici';
 const hits = { A: [], B: [] };
-const mk = (n) => http.createServer((q, s) => { hits[n].push(q.url + ' host=' + q.headers.host.replace(/\d+$/, 'N')); s.end(n); });
+let oB;
+const mk = (n) => http.createServer((q, s) => {
+  hits[n].push(q.url + ' host=' + q.headers.host.replace(/\d+$/, 'N'));
+  if (n === 'A' && q.url === '/start') s.writeHead(302, { location: oB + '/fromA' });
+  else if (n === 'A' && q.url === '/away') s.writeHead(302, { location: 'http://example.invalid:81/x' });
+  s.end(n);
+});
 const A = mk('A'), B = mk('B');
 await new Promise((r) => A.listen(0, '127.0.0.1', r));
 await new Promise((r) => B.listen(0, 'localhost', r));
-const oA = 'http://127.0.0.1:' + A.address().port, oB = 'http://localhost:' + B.address().port;
+const oA = 'http://127.0.0.1:' + A.address().port;
+oB = 'http://localhost:' + B.address().port;
 const out = async (p) => {
   try {
     const r = await p;
@@ -8386,12 +8397,20 @@ console.log('mocked redirect to the other host', await out(fetch(oA + '/r', { di
 const plain = new Pool(oA);
 console.log('plain pool fetch', await out(fetch(oB + '/p', { dispatcher: plain })));
 console.log('plain pool request', await out(request(oB + '/q', { dispatcher: plain })));
+console.log('plain pool redirect to the other host', await out(fetch(oA + '/start', { dispatcher: plain })));
+console.log('plain pool request redirect', await out(request(oA + '/start', { dispatcher: plain, maxRedirections: 1 })));
+const client = new Client(oA);
+console.log('client redirect to the other host', await out(fetch(oA + '/start', { dispatcher: client })));
+const portA = A.address().port;
+console.log('redirect away from another origin', await out(fetch('http://localhost:' + portA + '/away', { dispatcher: plain })));
 const other = new MockAgent();
 other.enableNetConnect('localhost:' + B.address().port);
 console.log('pool origin not allowed', await out(fetch(oB + '/w', { dispatcher: other.get(oA) })));
 console.log(JSON.stringify(hits));
 A.close();
 B.close();
+await plain.close();
+await client.close();
 "##,
     );
     let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
@@ -8403,8 +8422,12 @@ pool.request passed through 200 A
 mocked redirect to the other host 200 http://localhost:N/hop A
 plain pool fetch 200 http://localhost:N/p A
 plain pool request 200 A
+plain pool redirect to the other host 200 http://localhost:N/fromA A
+plain pool request redirect 200 A
+client redirect to the other host 200 http://localhost:N/fromA A
+redirect away from another origin 200 http://example.invalid:N/x A
 pool origin not allowed failed UND_MOCK_ERR_MOCK_NOT_MATCHED
-{"A":["/x?q=1 host=127.0.0.1:N","/y host=127.0.0.1:N","/z host=127.0.0.1:N","/hop host=127.0.0.1:N","/p host=127.0.0.1:N","/q host=127.0.0.1:N"],"B":[]}"##;
+{"A":["/x?q=1 host=127.0.0.1:N","/y host=127.0.0.1:N","/z host=127.0.0.1:N","/hop host=127.0.0.1:N","/p host=127.0.0.1:N","/q host=127.0.0.1:N","/start host=127.0.0.1:N","/fromA host=127.0.0.1:N","/start host=127.0.0.1:N","/fromA host=127.0.0.1:N","/start host=127.0.0.1:N","/fromA host=127.0.0.1:N","/away host=127.0.0.1:N","/x host=127.0.0.1:N"],"B":[]}"##;
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 

@@ -1506,22 +1506,16 @@
       }
       // A Client or Pool (a MockPool / MockClient too) is bound to its
       // origin: undici's sends every request it dispatches there, whatever
-      // origin the request's URL names, with that origin as the `host`
-      // (measured on node v22.22.2 + undici 6.29.0: fetch(urlB, {
-      // dispatcher: poolA }) and undici.request alike reach A). For a URL
-      // on another origin each connection the request asks for is made to
-      // the dispatcher's own, the way it would make it, and fetch sends
-      // `host` (pinnedHost); a URL on its own origin is the plain path, at
-      // no cost.
+      // origin the request's URL names -- redirect hops included -- with
+      // that origin as the `host` (measured on node v22.22.2 + undici
+      // 6.29.0: fetch(urlB, { dispatcher: poolA }), a redirect from A to B
+      // through poolA, and undici.request alike reach A, with A's `host`).
+      // The transport pins every hop there (pinnedOrigin): the connection,
+      // its connector's parameters, and the `host` it writes are A's, and
+      // a hop to A's own origin is the plain path, pooled as ever.
       if (request && dispatcher instanceof Client) {
-        const own = originParams(dispatcher.origin);
-        if (own !== null && own.origin !== originOf(request.url)) {
-          policy.connector = {
-            fn: (params, cb) => connectVia(dispatcher, { ...params, ...own.params }, cb),
-            self: dispatcher,
-          };
-          policy.pinnedHost = own.params.host;
-        }
+        const own = originOf(dispatcher.origin);
+        if (own !== null && own !== "null") policy.pinnedOrigin = own;
       }
       return policy;
     }
@@ -2184,25 +2178,13 @@
           fail(new errors.ClientClosedError());
           return;
         }
+        // The request was written for this scope's own origin -- the
+        // transport sends every hop through a MockPool / MockClient there
+        // (pinnedOrigin), with its `host` -- so it goes as it is.
         const own = originParams(origin);
         if (own === null) {
           fail(new errors.InvalidArgumentError("invalid origin"));
           return;
-        }
-        // The `host` undici's Client writes is its own origin's: a request
-        // the transport addressed to the other host (a redirect hop through
-        // this pool) carries that one's, which is swapped for it. A caller's
-        // own `host` (undici.request sends one) is left as it is.
-        // (The parser has read the whole request by now, so the head is in.)
-        const sent = own.params.host.toLowerCase() !== String(params.host).toLowerCase() ? G.Buffer.concat(raw) : null;
-        const end = sent === null ? -1 : sent.indexOf("\r\n\r\n");
-        if (end !== -1) {
-          const head = sent.toString("latin1", 0, end);
-          const swapped = head.replace(/\r\nhost:[ \t]*([^\r\n]*)/i, (line, value) =>
-            value.trim().toLowerCase() === String(params.host).toLowerCase() ? "\r\nhost: " + own.params.host : line,
-          );
-          raw.length = 0;
-          raw.push(G.Buffer.concat([G.Buffer.from(swapped, "latin1"), sent.subarray(end)]));
         }
         scope[kRealConnect]({ ...params, ...own.params }, (err, connection) => {
           if (err) {

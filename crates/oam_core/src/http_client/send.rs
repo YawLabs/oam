@@ -179,6 +179,17 @@ pub struct FetchRequest {
     /// ([`super::body::read`]).
     #[serde(default)]
     pub body_timeout_ms: Option<f64>,
+    /// The origin of the undici `Client` or `Pool` the request rides
+    /// (`http://host:port`): every hop, redirect hops included, is sent
+    /// there -- dialled there, and carrying it as `host` unless the caller
+    /// set one -- whatever origin the hop's URL names, as undici's Client
+    /// sends everything it dispatches to its own origin (measured on node
+    /// v22.22.2 + undici 6.29.0: a redirect to another origin through a
+    /// Pool reaches the Pool's origin, with its `host`). The URL stays the
+    /// request's: `Response.url`, Location resolution and the cross-origin
+    /// header strip all go by it. Absent: each hop goes where its URL says.
+    #[serde(default)]
+    pub pin_origin: Option<String>,
 }
 
 /// The longest timer JS can set (2^31-1 ms, about 24.8 days). A
@@ -359,6 +370,9 @@ struct LoopState {
     method: http::Method,
     /// This hop's URL (no userinfo; a fragment is carried, never sent).
     current: url::Url,
+    /// [`FetchRequest::pin_origin`]: where every hop is sent, if not to
+    /// its URL's origin.
+    pin: Option<url::Url>,
     /// The headers every hop starts from. A redirect's strip is applied here,
     /// so it is permanent for the rest of the fetch.
     carried: HeaderMap,
@@ -527,6 +541,11 @@ pub async fn fetch(
             .route(req.lookup_hook, attempt_timeout, tls_range)
             .with_connect_timeout(connect_timeout_from_ms(req.connect_timeout_ms))
     };
+    let pin = match req.pin_origin.as_deref().map(pin_origin) {
+        None => None,
+        Some(Ok(pin)) => Some(pin),
+        Some(Err(text)) => return OpOutcome::Failed(text),
+    };
     let headers_timeout = timeout_limit(req.headers_timeout_ms);
     let dispatched = match req.dispatched {
         Some(dispatched) => Some(dispatched),
@@ -537,6 +556,7 @@ pub async fn fetch(
         route,
         method: prepared.method,
         current: prepared.url,
+        pin,
         carried: prepared.headers,
         source,
         hops: 0,
@@ -657,13 +677,22 @@ async fn run(
         // checked, on its own parse of the URL JS sent) and each redirect
         // target. A hop resumed after a park is asked again -- the grant
         // cannot have changed, and asking is cheaper than tracking it.
-        if let Some(denial) = net_denial(&state) {
+        //
+        // The hop goes to its URL, or to the pinned origin (FetchRequest::
+        // pin_origin) with the URL's path and query: what is dialled, asked
+        // about, handed to a connector and sent as `host` is that target.
+        let pinned = state
+            .pin
+            .as_ref()
+            .map(|pin| pinned_url(&state.current, pin));
+        let target = pinned.as_ref().unwrap_or(&state.current);
+        if let Some(denial) = net_denial(state.net_check.as_ref(), target) {
             state.source.request_failed();
             return OpOutcome::AccessDenied(denial);
         }
         // A Follow URL can hold a host `http::Uri` refuses (`"`, `` ` ``,
         // `{`, `}`): reqwest failed those as a builder error too.
-        let uri = match prepare::to_uri(&state.current) {
+        let uri = match prepare::to_uri(target) {
             Ok(uri) => uri,
             Err(text) => return OpOutcome::Failed(text.to_string()),
         };
@@ -672,7 +701,7 @@ async fn run(
             // `host` / `hostname` / `protocol` / `port` of the origin URL --
             // the host with its port when the URL names one, the hostname
             // unbracketed, the port a string, '' for the scheme's default.
-            let url = &state.current;
+            let url = target;
             let hostname = url.host_str().unwrap_or_default();
             let unbracketed = hostname
                 .strip_prefix('[')
@@ -733,7 +762,7 @@ async fn run(
             );
             return OpOutcome::Json(payload.to_string());
         }
-        let mut hop_url = state.current.clone();
+        let mut hop_url = target.clone();
         hop_url.set_fragment(None);
 
         // proxy-authorization is per hop and never carried: it is computed
@@ -1006,8 +1035,8 @@ pub(super) fn response_head_overflow(
     })
 }
 
-/// The net grant's verdict on the hop in `state`, or `None` when it may be
-/// dialled (or no grant restricts it).
+/// The net grant's verdict on the hop to `url` (the hop's URL, or its pinned
+/// target), or `None` when it may be dialled (or no grant restricts it).
 ///
 /// The host is the one the connector will resolve: `host_str` of the same
 /// `url::Url` [`prepare::to_uri`] turns into the request URI, so no spelling
@@ -1016,14 +1045,32 @@ pub(super) fn response_head_overflow(
 /// front of the dialler. An http(s) URL always has a host; were one ever to
 /// lack it, the check is asked about the empty host, which no allow-list
 /// grants.
-fn net_denial(state: &LoopState) -> Option<crate::AccessDenial> {
-    let check = state.net_check.as_ref()?;
-    let url = &state.current;
+fn net_denial(check: Option<&NetCheck>, url: &url::Url) -> Option<crate::AccessDenial> {
+    let check = check?;
     let target = NetTarget {
         host: url.host_str().unwrap_or_default(),
         port: url.port_or_known_default().unwrap_or_default(),
     };
     check(&target).err()
+}
+
+/// [`FetchRequest::pin_origin`], parsed: an http or https origin.
+fn pin_origin(origin: &str) -> Result<url::Url, String> {
+    match url::Url::parse(origin) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") && url.host().is_some() => Ok(url),
+        _ => Err(format!("fetch: invalid dispatcher origin {origin}")),
+    }
+}
+
+/// `url` sent to `pin`'s origin: its scheme, host and port, with `url`'s
+/// path and query.
+fn pinned_url(url: &url::Url, pin: &url::Url) -> url::Url {
+    let mut out = url.clone();
+    // Both are http(s) URLs with a host, so none of these can fail.
+    let _ = out.set_scheme(pin.scheme());
+    let _ = out.set_host(pin.host_str());
+    let _ = out.set_port(pin.port());
+    out
 }
 
 /// A response header value as JS sees it: latin1, one code point per byte.
