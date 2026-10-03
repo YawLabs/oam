@@ -16,6 +16,10 @@
   Do not add get-task-allow (notarization rejects it) or copy Node's or Bun's
   supersets. This set must stay a subset of Yaw Terminal's, which re-signs the
   oam it bundles.
+
+  Editing this comment: no double hyphen, no angle brackets, no ampersand.
+  codesign reads this file with a stricter parser than plutil, and
+  scripts/test-scripts.sh fails on any of them.
 -->
 <plist version="1.0">
 <dict>

@@ -57,6 +57,15 @@
 #                                    quiet fallback to the weaker thing.
 #   The pin lives in scripts/mac-signing-identity.sha1.
 #
+# OAM_SIGN_REQUIRED is ONE knob for two bootstraps. It is the same variable
+# scripts/lib/signing.sh reads for the release manifest, and it gates the mac
+# pin bootstrap too: with it set to 1, an empty pin file fails the mac
+# preflight, before anything is tagged. Release key k1 is committed, so the
+# manifest half no longer depends on it; an operator who keeps exporting
+# OAM_SIGN_REQUIRED=1 out of habit is therefore asking for exactly one thing
+# today, a pinned mac identity, and every release fails in preflight until a
+# SHA-1 is committed (or OAM_SKIP_MAC_SIGN=1 is set for that release).
+#
 # The verify gate (mac_verify_binary) re-reads the pin from the file rather
 # than trusting what setup chose, so a selection step that was skipped or lost
 # its state still cannot let a weaker signature through.
@@ -153,7 +162,7 @@ mac_sign_decision(){
   elif [ -n "$pin" ]; then
     printf 'identity:%s\n' "$pin"
   elif [ "$req" = "1" ]; then
-    printf 'fail:OAM_SIGN_REQUIRED=1 but %s holds no SHA-1 yet -- provision the identity (bash scripts/provision-mac-signing.sh --generate on the build Mac) and commit its sha1, or unset OAM_SIGN_REQUIRED for a bootstrap release\n' "$MAC_SIGNING_PIN_FILE"
+    printf 'fail:OAM_SIGN_REQUIRED=1 but %s holds no SHA-1 yet -- provision the identity (ssh <mac> '\''bash -s -- --generate'\'' < scripts/provision-mac-signing.sh) and commit its sha1, or unset OAM_SIGN_REQUIRED for a bootstrap release\n' "$MAC_SIGNING_PIN_FILE"
   else
     printf 'adhoc:%s holds no SHA-1 yet, so the mac binaries are signed AD-HOC (hardened runtime + entitlements, no certificate). Bootstrap only: once a SHA-1 is committed the pinned identity is mandatory\n' "$MAC_SIGNING_PIN_FILE"
   fi
@@ -206,6 +215,13 @@ mac_report_probe_failure(){
 # first and take long enough for a keychain to relock, which reads as
 # errSecInternalComponent. (The keychain is provisioned with no idle timeout;
 # this is the belt to that brace.)
+#
+# The password goes to `security unlock-keychain -p` as an argument, so for
+# the instant that command runs it is visible to other local users of the
+# build Mac in the process list. Accepted, with the at-rest custody the
+# provision script's header describes: security(1) offers no documented way
+# to take it on stdin or from a file for a non-interactive unlock, and the
+# identity it guards is self-signed. Revisit with the Developer ID.
 mac_unlock_keychain(){
   local kc="${1:-$MAC_SIGN_KEYCHAIN}"
   if [ -z "$kc" ] || [ ! -f "$kc" ]; then
@@ -452,12 +468,28 @@ mac_verify_binary(){
 # leaf, which codesign extracts as <prefix>0, DER), lowercase hex; nothing when
 # there is none (ad-hoc). The same fingerprint `security find-identity` and a
 # designated requirement's H"..." use.
+#
+# When no certificate comes out, codesign's exit status and its own output go
+# to stderr: the caller's "<none extracted>" alone gives nothing to diagnose.
+# The work runs in a subshell so its traps are its own: the temp dir (public
+# certificate DER only) is removed on an interrupt too, and the caller's traps
+# -- build-remote.sh's, the probe's -- are neither replaced nor reset.
 mac_leaf_sha1(){
-  local d
-  d="$(mktemp -d "${TMPDIR:-/tmp}/oam-sign-leaf.XXXXXX")" || return 0
-  codesign -d --extract-certificates="$d/cert" "$1" >/dev/null 2>&1 </dev/null || true
-  [ -s "$d/cert0" ] && mac_sha1 "$d/cert0"
-  rm -rf "$d"
+  (
+    d=""
+    trap '[ -z "$d" ] || rm -rf "$d"' EXIT
+    trap 'exit 130' INT TERM HUP
+    d="$(mktemp -d "${TMPDIR:-/tmp}/oam-sign-leaf.XXXXXX")" \
+      || { d=""; mac_warn "mktemp failed -- cannot extract the certificate of $1"; exit 0; }
+    rc=0
+    codesign -d --extract-certificates="$d/cert" "$1" >"$d/out" 2>&1 </dev/null || rc=$?
+    if [ -s "$d/cert0" ]; then
+      mac_sha1 "$d/cert0"
+    else
+      mac_warn "codesign extracted no certificate from $1 (exit $rc):"
+      if [ -s "$d/out" ]; then sed 's/^/    /' "$d/out" >&2; else echo "    <codesign printed nothing>" >&2; fi
+    fi
+  )
 }
 
 # mac_sha1 <file> -- the hex SHA-1 alone, as mac_sha256 does it.

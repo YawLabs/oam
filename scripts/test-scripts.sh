@@ -4190,9 +4190,15 @@ printf 'kcpw' > "$MS/kc/pw"
 echo "probe source" > "$MS/true-src"
 echo "binary" > "$MS/oam-bin"
 
+# MS_LOG joins argv with spaces, which hides argv boundaries; MS_ARGV keeps
+# them: one line per codesign call, each element as <element>. An unquoted
+# expansion that word-split the -r= requirement would show there as many
+# elements.
+MS_ARGV="$MS/argv"
 cat > "$MS/bin/codesign" <<EOF
 #!/bin/bash
 echo "codesign \$*" >> "$MS_LOG"
+{ printf '<%s>' "\$@"; echo; } >> "$MS_ARGV"
 case " \$* " in
   *" --force "*)
     if [ -f "$MS/cs-sign-fail" ]; then cat "$MS/cs-sign-fail" >&2; exit 1; fi
@@ -4204,6 +4210,9 @@ case " \$* " in
   *" -r- "*) echo "Executable=/x/oam" >&2; cat "$MS/cs-dr" ;;
   *" -dv "*|*" -dvv "*) cat "$MS/cs-dv" >&2 ;;
   *" --extract-certificates="*)
+    if [ -f "$MS/cs-extract-fail" ]; then cat "$MS/cs-extract-fail" >&2; exit 1; fi
+    # An interrupt mid-extraction: TERM the shell that ran us.
+    if [ -f "$MS/cs-extract-term" ]; then kill -TERM "\$PPID"; exit 0; fi
     # The leaf as <prefix>0 -- none for an ad-hoc signature (no cs-leaf).
     for a in "\$@"; do
       case "\$a" in --extract-certificates=*) [ ! -f "$MS/cs-leaf" ] || cp "$MS/cs-leaf" "\${a#*=}0" ;; esac
@@ -4263,8 +4272,8 @@ ms_good_devid(){  # a timestamped Developer ID signature by leaf A
   cp "$MS/leaf-a" "$MS/cs-leaf"
 }
 ms_reset(){
-  rm -f "$MS/cs-sign-fail" "$MS/cs-verify-fail" "$MS/sec-fail"
-  : > "$MS_LOG"
+  rm -f "$MS/cs-sign-fail" "$MS/cs-verify-fail" "$MS/sec-fail" "$MS/cs-extract-fail" "$MS/cs-extract-term"
+  : > "$MS_LOG"; : > "$MS_ARGV"
   printf 'keychain=%s\nsha1=%s\n' "$MS/kc/oam-codesign.keychain-db" "$MS_PIN_A" > "$MS/prov-out"
   echo 0 > "$MS/prov-rc"
   ms_pin
@@ -4288,7 +4297,7 @@ ms(){
   MS_ERR="$(cat "$MS/err")"
 }
 # Setup, then the step under test, in the same shell (MAC_SIGN_MODE is state).
-ms_then(){ mac_signing_setup 2>/dev/null || return 90; : > "$MS_LOG"; "$@"; }
+ms_then(){ mac_signing_setup 2>/dev/null || return 90; : > "$MS_LOG"; : > "$MS_ARGV"; "$@"; }
 
 ms_reset
 
@@ -4378,6 +4387,13 @@ MS_S="$(grep -nxF "codesign --force --sign $MS_PIN_A --keychain $MS/kc/oam-codes
 if [ "$MS_RC" = "0" ] && [ -n "$MS_U" ] && [ -n "$MS_P" ] && [ -n "$MS_S" ] && [ "$MS_U" -lt "$MS_P" ] && [ "$MS_P" -lt "$MS_S" ]; then pass
 else fail "rc=$MS_RC unlock@${MS_U:-none} probe@${MS_P:-none} sign@${MS_S:-none} log: $(cat "$MS_LOG") stderr: $MS_ERR"; fi
 
+# The joined log above cannot tell `-r=designated => ...` passed as one
+# argument from the same words passed as ten. codesign needs ONE.
+it "the pinned identity's -r= requirement reaches codesign as exactly one argv element"
+MS_WANT_ARGV="<--force><--sign><$MS_PIN_A><--keychain><$MS/kc/oam-codesign.keychain-db><--options><runtime><--timestamp=none><--identifier><org.oamjs.oam><-r=designated => identifier \"org.oamjs.oam\" and certificate leaf = H\"$MS_PIN_A\"><--entitlements><$MS_ENTS><$MS/oam-bin>"
+if grep -qxF -- "$MS_WANT_ARGV" "$MS_ARGV"; then pass
+else fail "want: $MS_WANT_ARGV"$'\n'"argv log: $(cat "$MS_ARGV")"; fi
+
 ms_reset; ms_pin "$MS_PIN_A"
 ms mac_sign_binary "$MS/oam-bin"
 it "signing before setup is refused"
@@ -4427,6 +4443,12 @@ ms_reset; ms_ents "$MS_K1" "$MS_K2"; ms_verify_rejects "missing entitlement" "wr
 ms_reset; ms_ents "$MS_K1" "$MS_K2" "$MS_K3" com.apple.security.get-task-allow; ms_verify_rejects "extra entitlement" "wrong entitlements"
 ms_reset; ms_pin "$MS_PIN_A"; ms_verify_rejects "pinned, but ad-hoc" "is ad-hoc signed (cdhash requirement), but the repo pins $MS_PIN_A"
 ms_reset; ms_pin "$MS_PIN_A"; ms_good_selfsigned "$MS_PIN_B"; ms_verify_rejects "another certificate" "does not name the pinned certificate $MS_PIN_A"
+# The form codesign was measured to DERIVE for a self-signed certificate, and
+# the reason -r= is stated: the pin as the ROOT is not the leaf rule. Leaf A
+# really signed, so only the requirement check can reject this.
+ms_reset; ms_pin "$MS_PIN_A"; ms_good_selfsigned "$MS_PIN_A"
+echo "designated => identifier \"org.oamjs.oam\" and certificate root = H\"$MS_PIN_A\"" > "$MS/cs-dr"
+ms_verify_rejects "the pin as certificate root" "does not name the pinned certificate $MS_PIN_A"
 ms_reset; ms_dv org.oamjs.oam '0x10000(runtime)' 'Authority=oam Code Signing (self-signed)'; ms_verify_rejects "certificate, no pin" "should be signed ad-hoc"
 ms_reset; ms_pin "$MS_PIN_A"; ms_good_devid
 ms_dv org.oamjs.oam '0x10000(runtime)' 'Authority=Developer ID Application: Example LLC (ABCDE12345)' 'Authority=Developer ID Certification Authority'
@@ -4443,8 +4465,32 @@ ms_reset; ms_pin "$MS_PIN_A"; ms_good_devid; cp "$MS/leaf-b" "$MS/cs-leaf"
 ms_verify_rejects "Developer ID, another certificate of the team" "signed by certificate $MS_PIN_B, not the pinned $MS_PIN_A"
 ms_reset; ms_pin "$MS_PIN_A"; ms_good_devid; rm -f "$MS/cs-leaf"
 ms_verify_rejects "Developer ID, no certificate extracted" "signed by certificate <none extracted>, not the pinned $MS_PIN_A"
+# When extraction itself fails, codesign's own words must reach the operator.
+ms_reset; ms_pin "$MS_PIN_A"; ms_good_selfsigned "$MS_PIN_A"
+echo "oam-bin: code object is not signed at all (fixture)" > "$MS/cs-extract-fail"
+ms_verify_rejects "extraction failed, codesign's reason shown" "code object is not signed at all (fixture)"
+ms_verify_rejects "extraction failed, its exit status shown" "codesign extracted no certificate from $MS/oam-bin (exit 1)"
+ms_verify_rejects "extraction failed, still rejected" "signed by certificate <none extracted>, not the pinned $MS_PIN_A"
 it "verify: with a pin, a leaf certificate that is not the pinned one is rejected on both paths"
 if [ -z "$MS_BAD" ]; then pass; else fail "not rejected as expected:$MS_BAD"; fi
+
+# mac_leaf_sha1 runs inside build-remote.sh and the mac probe, both of which
+# own their traps: its temp dir must go on every path, its traps must stay its
+# own.
+MS_LT="$MS/leaf-tmp"
+ms_leaf_probe(){ trap 'echo caller-int' INT; mac_leaf_sha1 "$MS/oam-bin"; echo "rc=$?"; trap -p INT; }
+MS_BAD=""
+rm -rf "$MS_LT"; mkdir -p "$MS_LT"
+ms_reset; cp "$MS/leaf-a" "$MS/cs-leaf"
+TMPDIR="$MS_LT" ms ms_leaf_probe
+[ "$MS_OUT" = "$MS_PIN_A"$'\n'"rc=0"$'\n'"trap -- 'echo caller-int' SIGINT" ] || MS_BAD="$MS_BAD [success: out='$MS_OUT' err: $MS_ERR]"
+[ -z "$(ls -A "$MS_LT")" ] || MS_BAD="$MS_BAD [success left: $(ls -A "$MS_LT")]"
+ms_reset; touch "$MS/cs-extract-term"
+TMPDIR="$MS_LT" ms ms_leaf_probe
+[ "$MS_OUT" = "rc=130"$'\n'"trap -- 'echo caller-int' SIGINT" ] || MS_BAD="$MS_BAD [interrupted: out='$MS_OUT' err: $MS_ERR]"
+[ -z "$(ls -A "$MS_LT")" ] || MS_BAD="$MS_BAD [interrupt left: $(ls -A "$MS_LT")]"
+it "mac_leaf_sha1 removes its temp dir on success and on an interrupt, and leaves the caller's traps alone"
+if [ -z "$MS_BAD" ]; then pass; else fail "$MS_BAD"; fi
 
 ms_reset; ms_pin "$MS_PIN_A"; ms_good_devid
 ms ms_then mac_verify_binary "$MS/oam-bin"
@@ -4467,6 +4513,26 @@ MS_LINES="$(grep -cE '^[[:space:]]*<key>' scripts/macos/oam.entitlements.plist)"
 MS_TRUES="$(grep -cE '^[[:space:]]*<true/>[[:space:]]*$' scripts/macos/oam.entitlements.plist)"
 if [ "$MS_PAIRS" = "$MS_WANT" ] && [ "$MS_LINES" = "3" ] && [ "$MS_TRUES" = "3" ]; then pass
 else fail "pairs: '$MS_PAIRS' key lines=$MS_LINES true lines=$MS_TRUES"; fi
+
+# codesign parses --entitlements with a stricter XML parser than plutil: a
+# comment holding "--" (say, quoting `--options runtime`) is reported to fail
+# the real signature while ad-hoc bootstrap signing on another day looked
+# fine. Ban "--" and the markup characters inside every comment body, and any
+# comment opener that is never closed.
+it "the entitlements file's XML comments hold no '--', '<', '>' or '&'"
+MS_CMT_BAD="$(tr '\r\n' '  ' < scripts/macos/oam.entitlements.plist | awk '{
+  s = $0; n = 0
+  while ((i = index(s, "<!--")) > 0) {
+    rest = substr(s, i + 4); j = index(rest, "-->")
+    if (j == 0) { print "unclosed comment"; exit }
+    body = substr(rest, 1, j - 1); n++
+    if (index(body, "--") > 0) print "comment " n " holds --"
+    if (body ~ /[<>&]/) print "comment " n " holds < > or &"
+    if (substr(body, length(body), 1) == "-") print "comment " n " ends in -"
+    s = substr(rest, j + 3)
+  }
+}')"
+if [ -z "$MS_CMT_BAD" ]; then pass; else fail "$MS_CMT_BAD"; fi
 
 it "the entitlements parser ignores a key named inside an XML comment"
 MS_PAIRS="$( . scripts/lib/mac-signing.sh; printf '<dict><!-- <key>com.apple.security.get-task-allow</key><true/> --><key>a</key><true/><key>b</key><string>x</string></dict>' | mac_entitlement_pairs )"
@@ -4559,11 +4625,13 @@ cat > "$MS_BR/oam-stub" <<EOF
 #!/bin/bash
 echo "oam \$*" >> "$MS_LOG"
 # jit-mode, when present, makes the JIT smoke fail: "crash" dies the way a
-# binary whose entitlements did not take does, "wrong" prints something else.
+# binary whose entitlements did not take does, "wrong" prints something else,
+# "okcrash" prints the success line and THEN dies (a late JIT, or teardown).
 case "\$2" in
   *jit-smoke.js)
     case "\$(cat "$MS/jit-mode" 2>/dev/null)" in
       crash) exit 133 ;;
+      okcrash) echo "jit smoke ok"; exit 133 ;;
       wrong) echo "jit smoke ok?" ;;
       *) echo "jit smoke ok" ;;
     esac ;;
@@ -4608,13 +4676,15 @@ if [ "$MS_RC" != "0" ] && grep -qF 'OAM_SIGN_REQUIRED=1 but' <<<"$MS_ERR" && ! g
 else fail "rc=$MS_RC log: $(cat "$MS_LOG") out: $MS_ERR"; fi
 
 # A failing JIT smoke is a hard stop: the signed binary is never smoked, staged
-# for the hand-back or handed on. Both ways it fails on a real Mac: a crash at
-# the first JIT, and output that is not the one exact line.
+# for the hand-back or handed on. Every way it fails on a real Mac: a crash at
+# the first JIT, output that is not the one exact line, and the right line
+# followed by a non-zero exit -- the exit status is checked, not just stdout.
 MS_BAD=""
-for MS_MODE in crash wrong; do
+for MS_MODE in crash wrong okcrash; do
   echo "$MS_MODE" > "$MS/jit-mode"
+  case "$MS_MODE" in wrong) MS_WHY='JIT smoke output unexpected' ;; *) MS_WHY='JIT smoke failed' ;; esac
   ms_br aarch64-apple-darwin
-  if [ "$MS_RC" = "0" ] || ! grep -qF 'JIT smoke' <<<"$MS_ERR" \
+  if [ "$MS_RC" = "0" ] || ! grep -qF "$MS_WHY" <<<"$MS_ERR" \
      || ! grep -q '^oam run scripts/fixtures/jit-smoke.js$' "$MS_LOG" \
      || grep -v jit-smoke "$MS_LOG" | grep -q '^oam run .*smoke\.js$' \
      || [ -e "$MS_BR/dist/mac-sha256.txt" ]; then
@@ -4622,7 +4692,7 @@ for MS_MODE in crash wrong; do
   fi
 done
 rm -f "$MS/jit-mode"
-it "build on a darwin host: a JIT smoke that crashes or answers wrong fails the leg before the smoke and the hand-back"
+it "build on a darwin host: a JIT smoke that crashes, answers wrong, or answers right then crashes fails the leg before the smoke"
 if [ -z "$MS_BAD" ]; then pass; else fail "$MS_BAD"; fi
 
 # --- the release box side ---------------------------------------------------------
@@ -4740,15 +4810,30 @@ cat > "$MS_PV/bin/security" <<EOF
 #!/bin/bash
 cat > /dev/null
 case "\$1" in
-  # kc-sha lists the keychain's identities. Each is printed in BOTH sections,
-  # as for a trusted identity, and uppercase, as security prints them.
+  # kc-sha lists the keychain's identities, uppercase, as security prints
+  # them. fi-shape picks the listing:
+  #   trusted    (default) each in BOTH sections, no suffix: a Developer ID
+  #   selfsigned the real self-signed shape -- a (CSSMERR_TP_NOT_TRUSTED)
+  #              suffix, under "Matching" only, 0 valid identities
+  #   cutshort   one identity printed, then a non-zero exit
   find-identity)
     ids="\$(tr 'a-f' 'A-F' < "$MS_PV/kc-sha")"
+    shape="\$(cat "$MS_PV/fi-shape" 2>/dev/null)"
     printf 'Policy: Code Signing\n  Matching identities\n'
-    i=0; for h in \$ids; do i=\$((i + 1)); printf '  %s) %s "oam Code Signing (self-signed)"\n' "\$i" "\$h"; done
+    if [ "\$shape" = cutshort ]; then
+      printf '  1) %s "oam Code Signing (self-signed)"\n' "\${ids%% *}"
+      echo 'security: SecKeychainSearchCopyNext: The specified keychain could not be found.' >&2
+      exit 1
+    fi
+    suffix=""; [ "\$shape" = selfsigned ] && suffix=' (CSSMERR_TP_NOT_TRUSTED)'
+    i=0; for h in \$ids; do i=\$((i + 1)); printf '  %s) %s "oam Code Signing (self-signed)"%s\n' "\$i" "\$h" "\$suffix"; done
     printf '     %s identities found\n\n  Valid identities only\n' "\$i"
-    i=0; for h in \$ids; do i=\$((i + 1)); printf '  %s) %s "oam Code Signing (self-signed)"\n' "\$i" "\$h"; done
-    printf '     %s valid identities found\n' "\$i" ;;
+    if [ "\$shape" = selfsigned ]; then
+      printf '     0 valid identities found\n'
+    else
+      i=0; for h in \$ids; do i=\$((i + 1)); printf '  %s) %s "oam Code Signing (self-signed)"\n' "\$i" "\$h"; done
+      printf '     %s valid identities found\n' "\$i"
+    fi ;;
   # A p12 with its chain: the intermediate CA lists FIRST. Nothing may take
   # the identity's fingerprint from here.
   find-certificate) printf 'keychain: "x"\nSHA-1 hash: 1111111111111111111111111111111111111111\n'
@@ -4771,6 +4856,23 @@ ms_pv --check
 it "provision --check over stdin: survives a stdin-draining tool, prints keychain= and the lowercase sha1="
 eq "rc=$MS_RC $MS_OUT" "rc=0 keychain=$MS_PV/home/.oam-signing/oam-codesign.keychain-db"$'\n'"sha1=$MS_PIN_A"
 
+# What `security find-identity -p codesigning` really prints for oam's
+# self-signed identity: untrusted, so only under "Matching", with a trust
+# error after the name, and "0 valid identities found".
+echo selfsigned > "$MS_PV/fi-shape"
+ms_pv --check
+it "provision --check: reads the identity from the real self-signed listing (trust-error suffix, 0 valid)"
+eq "rc=$MS_RC $MS_OUT" "rc=0 keychain=$MS_PV/home/.oam-signing/oam-codesign.keychain-db"$'\n'"sha1=$MS_PIN_A"
+
+# A listing that printed the one identity and then failed is not a listing.
+echo cutshort > "$MS_PV/fi-shape"
+ms_pv --check
+it "provision --check: a find-identity that exits non-zero fails, even with one identity printed"
+if [ "$MS_RC" != "0" ] && [ -z "$MS_OUT" ] && grep -qF "security find-identity -p codesigning" <<<"$MS_ERR" \
+   && grep -qF 'SecKeychainSearchCopyNext' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC out='$MS_OUT' stderr: $MS_ERR"; fi
+rm -f "$MS_PV/fi-shape"
+
 printf '%s' "$MS_PIN_B" > "$MS_PV/kc-sha"
 ms_pv --check
 it "provision --check: a keychain certificate that is not the one recorded fails"
@@ -4788,9 +4890,26 @@ else fail "rc=$MS_RC out='$MS_OUT' stderr: $MS_ERR"; fi
 
 ms_pv --generate
 it "provision --generate refuses an existing identity and deletes nothing"
-if [ "$MS_RC" != "0" ] && grep -qF 'an identity already exists' <<<"$MS_ERR" \
+if [ "$MS_RC" != "0" ] && grep -qF 'an identity (or part of one) already exists' <<<"$MS_ERR" \
    && [ -f "$MS_PV/home/.oam-signing/oam-codesign.keychain-db" ] && [ -f "$MS_PV/home/.oam-signing/oam-codesign.keychain-password" ]; then pass
 else fail "rc=$MS_RC stderr: $MS_ERR"; fi
+
+# The failure trap deletes all five identity files, so any ONE left over from
+# an earlier attempt must stop --generate / --import before the trap is armed:
+# otherwise a later failure would delete a file this run never created.
+MS_BAD=""
+for MS_STALE in oam-codesign.keychain-password oam-codesign.sha1 oam-codesign.p12-password; do
+  rm -rf "$MS_PV/stale"; mkdir -p "$MS_PV/stale"
+  printf 'stale' > "$MS_PV/stale/$MS_STALE"
+  OAM_SIGNING_DIR="$MS_PV/stale" ms_pv --generate
+  if [ "$MS_RC" = "0" ] || ! grep -qF "already exists in $MS_PV/stale: $MS_PV/stale/$MS_STALE" <<<"$MS_ERR" \
+     || [ "$(cat "$MS_PV/stale/$MS_STALE" 2>/dev/null)" != "stale" ] || [ "$(ls -A "$MS_PV/stale")" != "$MS_STALE" ]; then
+    MS_BAD="$MS_BAD [$MS_STALE: rc=$MS_RC left: $(ls -A "$MS_PV/stale" | tr '\n' ' ') stderr: $MS_ERR]"
+  fi
+done
+rm -rf "$MS_PV/stale"
+it "provision --generate refuses a lone stale password or fingerprint file and leaves it untouched"
+if [ -z "$MS_BAD" ]; then pass; else fail "$MS_BAD"; fi
 
 # =============================================================================
 group "tap-verify.sh -- what a published tap actually serves"

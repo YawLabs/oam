@@ -22,8 +22,17 @@
 # headless SSH session can unlock -- the standard CI signing pattern. The login
 # keychain is locked in an SSH session, and a codesign against it fails with
 # errSecInternalComponent while `security find-identity` still lists the
-# identity as fine. `codesign --keychain <file>` finds the key without touching
-# the user's keychain search list, so nothing else on the host is affected.
+# identity as fine. Every codesign names the keychain (`--keychain <file>`)
+# and the identity by SHA-1, so which certificate signs never depends on the
+# keychain search list. The keychain IS on that list, though:
+# `security create-keychain` adds every keychain it creates to the user's
+# search list (security(1): "Create keychains and add them to the search
+# list"), and it is left there, as Yaw Terminal leaves its own. Taking it off
+# would mean rewriting the user's list (`security list-keychains -d user -s
+# ...`), where a parsing slip drops the login keychain, and codesign still
+# consults the search list while building a certificate chain. The cost: a
+# tool on this host that picks a code-signing identity by name or "first
+# match" can now see oam's too. The default keychain is not changed.
 #
 # Generation is an explicit operator action, NEVER something a release does on
 # its own (a release only ever runs `--check`). The certificate's SHA-1 is
@@ -39,6 +48,14 @@
 # that buys nothing at Gatekeeper the file is accepted; revisit when the
 # Developer ID moves in.
 #
+# The same passwords also pass through argv: `security create-keychain -p`,
+# `unlock-keychain -p`, `set-key-partition-list -k` and `import -P` take them
+# as arguments, so each is visible in the process list to other local users
+# for the moment that command runs. security(1) documents no stdin or file form
+# for these non-interactively, so this is accepted alongside the at-rest file
+# above; a build Mac whose other local accounts are not trusted should not
+# hold the identity at all.
+#
 # bash 3.2 compatible (the build Mac's /bin/bash). The whole script is
 # functions plus one `main "$@"` line, because the release box's preflight runs
 # `--check` by piping THIS file to `ssh <mac> 'bash -s -- --check'` (it syncs
@@ -53,7 +70,9 @@
 #       problem. Generates nothing. This is what the release calls.
 #   bash scripts/provision-mac-signing.sh --generate
 #       First-time setup: create the keychain and a new identity. Refuses if one
-#       already exists. Prints the SHA-1 to commit.
+#       already exists. Prints the SHA-1 to commit. Needs no checkout on the
+#       Mac; stream it from the release box's checkout:
+#         ssh <mac> 'bash -s -- --generate' < scripts/provision-mac-signing.sh
 #   bash scripts/provision-mac-signing.sh --import <identity.p12> <password-file>
 #       Restore a backed-up identity onto this host. Refuses if one already
 #       exists.
@@ -105,8 +124,15 @@ keychain_sha1() {
   # in both the "Matching" and the "Valid identities only" sections, hence
   # sort -u. Prints nothing and returns 1 unless there is exactly one; the
   # caller says why that is fatal.
-  local all n
-  all="$(security find-identity -p codesigning "$KEYCHAIN" 2>/dev/null </dev/null \
+  # A non-zero exit is fatal even if what it printed holds one identity: a
+  # listing cut short must not pass for a complete one.
+  local out all n
+  if ! out="$(security find-identity -p codesigning "$KEYCHAIN" 2>&1 </dev/null)"; then
+    note "security find-identity -p codesigning $KEYCHAIN failed:"
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    return 1
+  fi
+  all="$(printf '%s\n' "$out" \
     | awk '$1 ~ /^[0-9]+\)$/ && length($2) == 40 && $2 !~ /[^0-9A-Fa-f]/ { print $2 }' \
     | normalise_lines | sort -u)"
   n="$(printf '%s' "$all" | grep -c . || true)"
@@ -167,24 +193,33 @@ create_keychain_with() {
   security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$kc_pw" "$KEYCHAIN" >/dev/null \
     || fail "security set-key-partition-list failed"
   sha="$(keychain_sha1)" || fail "imported identity not found in $KEYCHAIN as exactly one code-signing identity (a .p12 must hold one certificate + key; its CA chain may ride along)"
-  ( umask 077; printf '%s\n' "$sha" > "$SHA_FILE" )
+  ( umask 077; printf '%s\n' "$sha" > "$SHA_FILE" ) || fail "could not write $SHA_FILE"
   probe_sign "$sha"
   echo "$sha"
 }
 
+# Refuses on ANY of the five files, not just the keychain and the p12: the
+# cleanup trap below deletes all five, so a stale password or fingerprint file
+# from some earlier attempt must stop the run here rather than be deleted by a
+# failure later -- the trap may only ever delete what this run created.
 refuse_if_provisioned() {
-  if [ -e "$KEYCHAIN" ] || [ -e "$P12_FILE" ]; then
-    fail "an identity already exists in $SIGN_DIR. Replacing it changes the certificate every oam release is pinned to (scripts/mac-signing-identity.sha1). If that is really intended, move $SIGN_DIR aside by hand first."
+  local f found=""
+  for f in "$KEYCHAIN" "$P12_FILE" "$PW_FILE" "$SHA_FILE" "$P12_PW_FILE"; do
+    if [ -e "$f" ]; then found="$found $f"; fi
+  done
+  if [ -n "$found" ]; then
+    fail "an identity (or part of one) already exists in $SIGN_DIR:$found. Replacing it changes the certificate every oam release is pinned to (scripts/mac-signing-identity.sha1). If that is really intended, move $SIGN_DIR aside by hand first."
   fi
 }
 
 # Undo a --generate / --import that did not finish. Without this a failure
 # partway (a wrong p12 password, a dropped ssh session, a probe signature that
 # does not work) leaves a half-built keychain and a p12 behind, and the NEXT
-# attempt dies in refuse_if_provisioned claiming "an identity already exists".
-# It would also strand the freshly generated private key in a temp dir.
+# attempt dies in refuse_if_provisioned claiming "an identity (or part of
+# one) already exists". It would also strand the freshly generated private
+# key in a temp dir.
 #
-# Armed only AFTER refuse_if_provisioned has proved none of these files
+# Armed only AFTER refuse_if_provisioned has proved none of these five files
 # existed, so it can only ever delete what this run created. Disarmed on
 # success. `fail` inside a $(...) exits only that subshell; this EXIT trap
 # belongs to the parent and still runs when `set -e` then ends the script.

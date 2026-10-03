@@ -119,6 +119,9 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 . "$SCRIPT_DIR/lib/tailnet-helpers.sh"
 # mac_sign_decision for the preflight, mac_handback_check for the pulled
 # binaries. The pin is THIS checkout's: it is what the sync ships to the Air.
+# Read by the sourced lib (mac_pinned_sha1), which shellcheck does not follow
+# when run from the repo root, so it reports the variable as unused.
+# shellcheck disable=SC2034
 MAC_SIGNING_PIN_FILE="$REPO_DIR/scripts/mac-signing-identity.sha1"
 # shellcheck source=lib/mac-signing.sh
 . "$SCRIPT_DIR/lib/mac-signing.sh"
@@ -300,7 +303,7 @@ case "$MAC_SIGN_DECISION" in
     mac_pin="${MAC_SIGN_DECISION#identity:}"
     mac_check_out="$(ssh "${SSH_OPTS[@]}" "$MAC_USER@$MAC_HOST" 'bash -s -- --check' \
       < "$SCRIPT_DIR/provision-mac-signing.sh")" \
-      || fail "the pinned mac signing identity $mac_pin is not usable on $MAC_USER@$MAC_HOST -- provision-mac-signing.sh --check said why, above.\n  First-time setup, on the Air:  bash scripts/provision-mac-signing.sh --generate\n  Replacement Air:               bash scripts/provision-mac-signing.sh --import <p12> <password-file>\n  To ship without signing on purpose: OAM_SKIP_MAC_SIGN=1"
+      || fail "the pinned mac signing identity $mac_pin is not usable on $MAC_USER@$MAC_HOST -- provision-mac-signing.sh --check said why, above.\n  First-time setup:  ssh <air> 'bash -s -- --generate' < scripts/provision-mac-signing.sh\n  Replacement Air:   ssh <air> 'bash -s -- --import <p12> <password-file>' < scripts/provision-mac-signing.sh\n  To ship without signing on purpose: OAM_SKIP_MAC_SIGN=1"
     mac_have="$(printf '%s\n' "$mac_check_out" | sed -n 's/^sha1=//p' | head -n 1)"
     [ "$mac_have" = "$mac_pin" ] \
       || fail "the Air signs with certificate '${mac_have:-<none reported>}' but this checkout pins $mac_pin (scripts/mac-signing-identity.sha1). Restore the pinned identity on the Air (provision-mac-signing.sh --import), or update the pin in a change that says why"

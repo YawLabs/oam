@@ -97,7 +97,19 @@
 #                           step (loud; honored even with OAM_SIGN_REQUIRED=1,
 #                           which also refuses an ad-hoc mac build while
 #                           scripts/mac-signing-identity.sha1 holds no SHA-1).
-#                           See scripts/lib/mac-signing.sh
+#                           See scripts/lib/mac-signing.sh.
+#                           The mac signing GATES (sign, verify, JIT smoke)
+#                           run inside the mac leg, AFTER the tag is pushed;
+#                           preflight checks only the signing decision and,
+#                           with a pin, the keychain -- whether a hardened-
+#                           runtime oam can JIT needs a built oam. So the
+#                           FIRST release after the signing code landed must
+#                           be preceded by a run of the out-of-repo mac probe
+#                           (mac-probe.sh) against the build Mac; see
+#                           scripts/macos/README.md. Should a gate still fail,
+#                           nothing is published: fix it and re-run with the
+#                           same tag (the unpublished tag is re-pointed), or
+#                           ship that release with OAM_SKIP_MAC_SIGN=1
 #   OAM_SKIP_LINUX=1        drop the linux asset
 #   OAM_KEEP_VM=1           leave the GCP VM running after the linux leg
 #   OAM_IAP_SSH_MODE=direct|tunnel
@@ -124,7 +136,10 @@
 #                           fails in preflight), and no SHA-1 yet in
 #                           scripts/mac-signing-identity.sha1 (0 signs the mac
 #                           binaries ad-hoc with a warning, 1 fails the mac
-#                           preflight; see OAM_SKIP_MAC_SIGN).
+#                           preflight; see OAM_SKIP_MAC_SIGN). Release key k1
+#                           is committed, so today 1 changes ONLY the mac
+#                           case: every release fails in preflight until the
+#                           mac pin is committed.
 #                           With a key committed, signing is mandatory either
 #                           way -- there is deliberately no knob that skips it.
 #                           For Windows Authenticode, 1 makes an unset
