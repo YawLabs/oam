@@ -1594,27 +1594,36 @@ fn merge_filtered_run(
                 && measured_runtimes.contains(&field(r, "runtime").as_str()))
         })
         .collect();
+    // A fresh row carries the version of the binary that measured it, beside
+    // its commit stamp: the runtimes list keeps describing the full run
+    // behind every other row.
+    let fresh_runtimes = fresh["runtimes"].as_array().cloned().unwrap_or_default();
     rows.extend(
         fresh["results"]
             .as_array()
             .iter()
-            .flat_map(|a| a.iter().cloned()),
+            .flat_map(|a| a.iter().cloned())
+            .map(|mut row| {
+                if let Some(rt) = fresh_runtimes.iter().find(|rt| rt["name"] == row["runtime"]) {
+                    row["version"] = rt["version"].clone();
+                }
+                row
+            }),
     );
 
-    // Runtimes: refresh an entry only when this run put a fresh MAIN-table
-    // row under it. The list describes the binaries behind the main table, so
-    // a ts-cold-start-only run must not relabel acec-era rows with today's
-    // versions -- the TypeScript section stamps its own.
+    // Runtimes: the list names the binaries behind the main table's rows,
+    // and most of them are the last full run's, so an entry is never
+    // replaced -- re-measured rows say their own version. A runtime the
+    // full run did not have joins when this run put a row under it; the
+    // TypeScript section stamps its own.
     let mut runtimes: Vec<serde_json::Value> =
         doc["runtimes"].as_array().cloned().unwrap_or_default();
     let fresh_main_rows = fresh["results"].as_array().cloned().unwrap_or_default();
-    for rt in fresh["runtimes"].as_array().cloned().unwrap_or_default() {
-        if !fresh_main_rows.iter().any(|r| r["runtime"] == rt["name"]) {
-            continue;
-        }
-        match runtimes.iter_mut().find(|r| r["name"] == rt["name"]) {
-            Some(slot) => *slot = rt,
-            None => runtimes.push(rt),
+    for rt in fresh_runtimes {
+        if fresh_main_rows.iter().any(|r| r["runtime"] == rt["name"])
+            && !runtimes.iter().any(|r| r["name"] == rt["name"])
+        {
+            runtimes.push(rt);
         }
     }
 
@@ -2227,7 +2236,11 @@ fn build_markdown(doc: &serde_json::Value) -> String {
         .filter_map(|(case, name)| {
             let row = find(case, name)?;
             let row_commit = row["commit"].as_str()?;
-            (row_commit != commit).then(|| format!("{case}/{name} at `{row_commit}`"))
+            let version = row["version"]
+                .as_str()
+                .map(|v| format!(" ({v})"))
+                .unwrap_or_default();
+            (row_commit != commit).then(|| format!("{case}/{name} at `{row_commit}`{version}"))
         })
         .collect();
     if !remeasured.is_empty() {
@@ -2646,6 +2659,7 @@ mod filtered_runs {
         };
         assert_eq!(find("cold-start", "oam")["p50"], 40.0);
         assert_eq!(find("cold-start", "oam")["commit"], "01bee57+wip");
+        assert_eq!(find("cold-start", "oam")["version"], "oam 0.13.0");
         // node was not measured (no --compare), so its row and its lack of a
         // per-row stamp survive untouched.
         assert_eq!(find("cold-start", "node")["p50"], 113.0);
@@ -2653,12 +2667,43 @@ mod filtered_runs {
         assert_eq!(find("url-parse", "oam")["p50"], 6.5);
         assert_eq!(rows.len(), 3);
 
-        // Runtimes: oam refreshed, node kept, so the columns do not shift.
+        // Runtimes: kept as the full run had them -- url-parse/oam is still
+        // that run's oam 0.9.0 -- so the columns do not shift and no old row
+        // is relabelled; the fresh row says its own version.
         let runtimes = merged["runtimes"].as_array().unwrap();
-        assert_eq!(runtimes[0]["version"], "oam 0.13.0");
+        assert_eq!(runtimes[0]["version"], "oam 0.9.0");
         assert_eq!(runtimes[1]["name"], "node");
+        assert!(find("url-parse", "oam")["version"].is_null());
 
         assert_eq!(merged["ts_cold_start"]["commit"], "01bee57+wip");
+    }
+
+    #[test]
+    fn merge_adds_a_runtime_the_full_run_lacked_and_relabels_none() {
+        let mut fresh = fresh(
+            vec![
+                row("cold-start", "oam", 40.0, Some("01bee57")),
+                row("cold-start", "bun", 20.0, Some("01bee57")),
+            ],
+            None,
+        );
+        fresh["runtimes"] = json!([
+            {"name": "oam", "version": "oam 0.13.0", "exe": "oam"},
+            {"name": "bun", "version": "1.2", "exe": "bun"},
+        ]);
+        let merged =
+            merge_filtered_run(existing(), fresh, &["cold-start"], &["oam", "bun"]).unwrap();
+        let names: Vec<&str> = merged["runtimes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|rt| rt["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["oam", "node", "bun"]);
+        assert_eq!(merged["runtimes"][0]["version"], "oam 0.9.0");
+        let md = build_markdown(&merged);
+        assert!(md.contains("cold-start/oam at `01bee57` (oam 0.13.0)"), "{md}");
+        assert!(md.contains("cold-start/bun at `01bee57` (1.2)"), "{md}");
     }
 
     #[test]
@@ -2725,7 +2770,8 @@ mod filtered_runs {
 
         assert!(md.contains("Commit `acec008` | release | host test-host"));
         assert!(md.contains("| cold-start | 40.00 | 113.00 | 0.35x |"));
-        assert!(md.contains("cold-start/oam at `01bee57+wip`"));
+        assert!(md.contains("cold-start/oam at `01bee57+wip` (oam 0.13.0)"));
+        assert!(md.contains("- **oam** oam 0.9.0"), "{md}");
         assert!(md.contains("## TypeScript load path"));
         assert!(md.contains("Commit `01bee57+wip` | release | host test-host | oam 0.13.0 | v22"));
         assert!(md.contains("| oam no-cache | 70.00 |"));

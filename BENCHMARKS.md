@@ -28,7 +28,7 @@ Commit `acec008` | release | host windows-aarch64
 
 ## Runtimes
 
-- **oam** oam 0.17.1
+- **oam** oam 0.9.0
 - **node** v22.22.2
 - **bun** 1.3.14
 
@@ -49,7 +49,7 @@ All times in milliseconds. Lower is better.
 | mcp-idle-rss | 25.23 | 61.34 | 98.43 | 0.41x |
 | mcp-first-call-latency | 0.34 | 2.40 | 5.04 | 0.14x |
 
-Re-measured by a filtered run (`--case`), so from a different tree than the `Commit` line above: http-keepalive-latency/oam at `697595d+wip`, http-keepalive-latency/node at `697595d+wip`, http-keepalive-latency/bun at `697595d+wip`.
+Re-measured by a filtered run (`--case`), so from a different tree than the `Commit` line above: http-keepalive-latency/oam at `697595d+wip` (oam 0.17.1), http-keepalive-latency/node at `697595d+wip` (v22.22.2), http-keepalive-latency/bun at `697595d+wip` (1.3.14).
 
 ## TypeScript load path
 

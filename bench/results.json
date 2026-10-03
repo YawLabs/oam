@@ -208,7 +208,8 @@
       "p99": 0.29454199999999997,
       "min": 0.16611274999999995,
       "max": 0.29454199999999997,
-      "commit": "697595d+wip"
+      "commit": "697595d+wip",
+      "version": "oam 0.17.1"
     },
     {
       "runtime": "node",
@@ -233,7 +234,8 @@
       "p99": 0.3427382499999999,
       "min": 0.17645950000000013,
       "max": 0.3427382499999999,
-      "commit": "697595d+wip"
+      "commit": "697595d+wip",
+      "version": "v22.22.2"
     },
     {
       "runtime": "bun",
@@ -258,7 +260,8 @@
       "p99": 0.14653500000000008,
       "min": 0.04439024999999998,
       "max": 0.14653500000000008,
-      "commit": "697595d+wip"
+      "commit": "697595d+wip",
+      "version": "1.3.14"
     },
     {
       "case": "fs-read",
@@ -650,19 +653,19 @@
   ],
   "runtimes": [
     {
+      "exe": "C:\\Users\\jeff\\AppData\\Local\\Temp\\oam-bench-stage-3684\\oam.exe",
       "name": "oam",
-      "version": "oam 0.17.1",
-      "exe": "C:\\Users\\jeff\\AppData\\Local\\Temp\\oam-bench-stage-59564\\oam.exe"
+      "version": "oam 0.9.0"
     },
     {
+      "exe": "C:\\Users\\jeff\\scoop\\apps\\nodejs22\\current\\node.exe",
       "name": "node",
-      "version": "v22.22.2",
-      "exe": "C:\\Users\\jeff\\scoop\\apps\\nodejs22\\current\\node.exe"
+      "version": "v22.22.2"
     },
     {
+      "exe": "C:\\Users\\jeff\\.bun\\bin\\bun.exe",
       "name": "bun",
-      "version": "1.3.14",
-      "exe": "C:\\Users\\jeff\\.bun\\bin\\bun.exe"
+      "version": "1.3.14"
     }
   ],
   "schema": "oam-bench/4",
