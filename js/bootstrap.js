@@ -1913,7 +1913,7 @@
       return out;
     }
 
-    return {
+    const response = {
       // node's fetch never produces a filtered response other than "basic":
       // it is the type under every `redirect` mode, a 3xx returned by
       // "manual" included (measured on v22.22.2; browsers answer
@@ -1943,6 +1943,12 @@
         return new globalThis.Blob([await drainBytes()], { type });
       },
     };
+    // A connect function's reply trailers (kConnectorReply), for
+    // undici.request; fetch has nowhere to show them, as in node.
+    if (raw.trailers !== undefined && raw.trailers.length > 0) {
+      Object.defineProperty(response, kConnectorReply, { value: { trailers: raw.trailers } });
+    }
+    return response;
   }
 
   // Lone surrogates would survive JSON.stringify (escaped) but be rejected
@@ -2495,11 +2501,12 @@
   // A socket a connect function hands back may carry, under this key, the
   // reply it is about to write as the header lines its author meant -- the
   // oam:undici shim's MockAgent connection does, as undici's mock hands its
-  // handler a reply's headers and body apart: `{ headers }`, a flat list of
-  // names and values, the `content-length` / `transfer-encoding` it set
-  // among them, which it kept off the wire so they could not frame (or cut
-  // short) the body. They are the response's headers then
-  // (connectorReplyHeaders).
+  // handler a reply's headers and body apart: `{ headers, trailers }`, flat
+  // lists of names and values, the `content-length` / `transfer-encoding`
+  // it set among the headers, which it kept off the wire so they could not
+  // frame (or cut short) the body. They are the response's headers then
+  // (connectorReplyHeaders), and the trailers ride the response under the
+  // same key for undici.request, which reports them.
   const kConnectorReply = Symbol("oam connector reply");
 
   // The response's headers for a reply left under kConnectorReply: the
@@ -2653,6 +2660,7 @@
     // it follows redirects with.
     if (reply !== undefined && raw && Array.isArray(raw.headers)) {
       raw.headers = connectorReplyHeaders(raw.headers, reply.headers);
+      raw.trailers = reply.trailers;
     }
     if (raw && raw.invalidLocation) {
       const cause = new TypeError("Invalid URL");

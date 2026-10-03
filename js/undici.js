@@ -331,6 +331,24 @@
         throw error;
       }
       const body = makeBodyReadable(res.body);
+      // A mock reply's trailers (the transport hands no others up), as
+      // undici's parseHeaders files them: names lowercased, a repeated one
+      // an array. undici fills `trailers` when the response completes, which
+      // for a mock is as it is dispatched, before request() resolves
+      // (measured on node v22.22.2 + undici 6.29.0: they are there before
+      // the body is read).
+      const trailers = { __proto__: null };
+      const replied = res[kConnectorReply];
+      if (replied !== undefined) {
+        const lines = replied.trailers;
+        for (let i = 0; i < lines.length; i += 2) {
+          const name = lines[i].toLowerCase();
+          const had = trailers[name];
+          if (had === undefined) trailers[name] = lines[i + 1];
+          else if (Array.isArray(had)) had.push(lines[i + 1]);
+          else trailers[name] = [had, lines[i + 1]];
+        }
+      }
       // A signal shared by many requests must not keep one listener per
       // finished body.
       body.once("close", unlink);
@@ -348,7 +366,7 @@
       return {
         statusCode: res.status,
         headers: headersToObject(res.headers),
-        trailers: { __proto__: null },
+        trailers,
         opaque: opts.opaque ?? null,
         context: {},
         body,
@@ -2121,7 +2139,7 @@
         if (mockDispatch.data.callback) {
           mockDispatch.data = { ...mockDispatch.data, ...mockDispatch.data.callback(opts) };
         }
-        const { data: { statusCode, data, headers: replyHeaders, error }, delay, persist } = mockDispatch;
+        const { data: { statusCode, data, headers: replyHeaders, trailers, error }, delay, persist } = mockDispatch;
         const { timesInvoked, times } = mockDispatch;
         mockDispatch.consumed = !persist && timesInvoked >= times;
         mockDispatch.pending = timesInvoked < times;
@@ -2142,7 +2160,8 @@
             }, (err) => fail(err));
             return;
           }
-          respond(opts.method, statusCode, generateKeyValues(replyHeaders), getResponseData(replyBody));
+          respond(opts.method, statusCode, generateKeyValues(replyHeaders), getResponseData(replyBody),
+            generateKeyValues(trailers || {}));
           deleteMockDispatch(scope[kDispatches], key);
         };
         if (typeof delay === "number" && delay > 0) {
@@ -2168,16 +2187,17 @@
       // 'abcdef' delivers 'abcdef'; replyContentLength() counts a string's
       // UTF-16 units, short of a non-ASCII body's bytes). The reply's lines,
       // those two included, are left on the socket for fetch to report as
-      // the response's headers. A body is not sent where HTTP has none
-      // (HEAD, 1xx, 204, 304).
-      function respond(method, statusCode, lines, data) {
+      // the response's headers, and its trailer lines (`trailers`, from
+      // reply() or defaultReplyTrailers()) for undici.request's `trailers`.
+      // A body is not sent where HTTP has none (HEAD, 1xx, 204, 304).
+      function respond(method, statusCode, lines, data, trailers) {
         let head = `HTTP/1.1 ${statusCode} ${getStatusText(statusCode)}\r\n`;
         for (let i = 0; i < lines.length; i += 2) {
           const name = lines[i].toLowerCase();
           if (name === "content-length" || name === "transfer-encoding") continue;
           head += lines[i] + ": " + lines[i + 1] + "\r\n";
         }
-        socket[kConnectorReply] = { headers: lines };
+        socket[kConnectorReply] = { headers: lines, trailers };
         socket.push(G.Buffer.from(head + "\r\n", "utf8"));
         const noBody = method === "HEAD" || statusCode === 204 || statusCode === 304 ||
           (statusCode >= 100 && statusCode < 200);

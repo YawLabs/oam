@@ -7859,8 +7859,9 @@ server.close();
 /// error until the review of #206), a reply whose `content-length` or
 /// `transfer-encoding` disagrees with its body -- the whole body arrives and
 /// the headers read as the reply set them (until the review of #206 they
-/// framed the body: cut short, or failed with "terminated") --
-/// pendingInterceptors() and
+/// framed the body: cut short, or failed with "terminated") -- reply
+/// trailers in undici.request's `trailers` once the body has ended (always
+/// empty until the review of #206), pendingInterceptors() and
 /// assertNoPendingInterceptors(), and undici's argument checks. Up to 0.17.1
 /// the three refused at construction. The expected lines are node v22.22.2's
 /// with undici 6.29.0 installed, running the same script.
@@ -7972,6 +7973,16 @@ console.log('https', await (await fetch('https://secure.invalid/s')).text());
 
 agent.get(/\.wild\.invalid$/).intercept({ path: '/w' }).reply(200, 'wildcard').times(2);
 console.log('origin matcher', await (await fetch('http://a.wild.invalid/w')).text(), await (await fetch('http://b.wild.invalid/w')).text());
+pool.intercept({ path: '/tr' }).reply(200, 'body', { trailers: { 'x-t': 'tv', 'X-Up': ['a', 'b'] } });
+const withTrailers = await request('http://example.invalid/tr');
+const trailersBefore = JSON.stringify(withTrailers.trailers);
+console.log('request trailers', trailersBefore, await withTrailers.body.text(), JSON.stringify(withTrailers.trailers));
+pool.intercept({ path: '/dtr' }).defaultReplyTrailers({ 'x-d': 'dv' }).reply(200, 'body');
+const defaultTrailers = await request('http://example.invalid/dtr');
+console.log('request default trailers', await defaultTrailers.body.text(), JSON.stringify(defaultTrailers.trailers));
+pool.intercept({ path: '/ftr' }).reply(200, 'body', { trailers: { 'x-t': 'tv' } });
+const fetchTrailers = await fetch('http://example.invalid/ftr');
+console.log('fetch with trailers', JSON.stringify([...fetchTrailers.headers]), await fetchTrailers.text());
 const framed = async (label, path, init) => {
   try {
     const res = await fetch('http://example.invalid' + path, init);
@@ -8053,6 +8064,9 @@ gzip zipped
 defaults [["content-length","4"],["x-def","d"]] abcd
 https secure
 origin matcher wildcard wildcard
+request trailers {"x-t":"tv","x-up":["a","b"]} body {"x-t":"tv","x-up":["a","b"]}
+request default trailers body {"x-d":"dv"}
+fetch with trailers [] body
 replyContentLength, non-ASCII [["content-length","11"]] "héllo wörld"
 content-length short of the body [["content-length","3"]] "abcdef"
 content-length past the body [["content-length","10"],["x-after","z"]] "abc"

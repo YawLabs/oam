@@ -1737,8 +1737,11 @@ what reaches them). What differs:
   `accept-encoding`, which undici's request() does not send; entry 32.) A reply
   callback's `opts` carry `origin`, `path`, `method`, `body` and `headers`; undici's fetch also
   passes `maxRedirections` and `upgrade`.
-- **Trailers** set with `reply(..., { trailers })` or `defaultReplyTrailers()` are not sent:
-  `undici.request()`'s `trailers` is `{}` on oam whatever the response (above).
+- **Trailers** set with `reply(..., { trailers })` or `defaultReplyTrailers()` are
+  `undici.request()`'s `trailers` -- names lowercased, a repeated one an array -- there as
+  soon as the request resolves, as undici's mock fills them (until the review of #206 they
+  were always `{}`). A real server's trailer section is still not reported: there
+  `trailers` stays `{}`, where undici's holds the fields once the body has ended.
 - **A reply's body runs to the end of the connection**, so a response carries no framing
   field the reply did not set, as with undici, and the whole body arrives whatever the
   reply's own `content-length` or `transfer-encoding` say -- one short of the body's bytes
