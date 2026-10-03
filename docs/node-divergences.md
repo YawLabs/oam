@@ -1429,16 +1429,12 @@ What still differs:
   for a leaf sent alone). The verifier is built on the first https request, so a machine
   without a usable certificate store still runs; its https requests then fail with `tls
   configuration error: ...`. _(source)_
-- **The happy-eyeballs attempt timeout is latched at the dial, not at the request.** Both
-  runtimes take it from one process-wide value
-  (`net.setDefaultAutoSelectFamilyAttemptTimeout`), and for the usual case -- every caller
-  reading the same default -- they agree. Node latches it per socket when `net.connect` is
-  called; on a POOLED `fetch` route oam stores it for the shared connector, which reads it
-  when and if hyper decides it needs a new connection. A request that changes the default
-  between another request's start and that request's dial therefore applies its stagger to
-  the other one. The consequence is a wrong 10-250 ms stagger on one multi-address connect,
-  never a wrong address or a wrong error, and a `connect.lookup`-hooked route is unaffected
-  (its connector carries its own value). _(source)_
+- **The happy-eyeballs attempt timeout** (`net.setDefaultAutoSelectFamilyAttemptTimeout`)
+  is read when the request starts and carried by that request to the dial it makes, so a
+  connection is dialled with the value its own request was sent with, as Node latches it per
+  socket. Up to 0.17.1 the pooled `fetch` route stored it in state its shared connector read
+  later, so a request that changed the default between another request's start and that
+  request's dial gave the other one its stagger (#179). _(source)_
 - **`req.socket` on this transport is a stand-in.** It is a real `net.Socket` (a
   `tls.TLSSocket` for https), `null` until `'socket'` as in Node, and by `'response'` it
   carries the connection the transport used: the dialled peer's address, port and family,
@@ -1559,9 +1555,12 @@ What still differs:
 
 **`connect.lookup` on an undici `Agent`**
 
-An `Agent({ connect: { lookup } })` hook is called for the first host and every redirect hop
-to another host name, never for an IP literal and never for
-a URL on a bad port, with `{ family: undefined, hints, all: true }`. All five ways undici
+An `Agent({ connect: { lookup } })` hook is called for every connection the `Agent` opens to
+a host name -- the first request's, and each redirect hop's that needs a new one -- never for
+an IP literal and never for a URL on a bad port, with `{ family: undefined, hints, all: true }`.
+The `Agent`'s connections are pooled across its fetches, as undici's are, so a request that
+finds an idle connection to its origin calls no hook (#179). A replaced `dns.lookup` is called
+the same way for global `fetch`'s connections (`conformance/cases/358-fetch-lookup-once-per-connection.mjs`). All five ways undici
 installs a dispatcher carry the hook, as they do in Node: `fetch`'s `dispatcher` option,
 `setGlobalDispatcher` + global `fetch`, `undici.fetch`, `agent.request()`, and
 `undici.request(url, { dispatcher })`. The connection dials only
@@ -1571,25 +1570,32 @@ that fails -- or throws -- fails the fetch closed with its error as the `cause`,
 kept. A hooked fetch never goes through the environment proxy (below): an undici `Agent`
 does not read it, and a proxy that resolved the name again would undo the pin. What differs:
 
-- **How often it is called.** Node calls the hook once per connection it opens, oam once per
-  AUTHORITY per `fetch`. Within one `fetch` that is usually the same number: the same host
-  on another port parks again in both (measured: a 302 from `localhost:P1` to
-  `localhost:P2` calls the hook twice in each runtime), so a guard whose policy turns on the
-  port is asked about every port the chain reaches. Where they part is reuse: a redirect
-  chain `a -> a -> b` made 3 calls in Node (its pool opened a second connection for the
-  same-host hop) and 2 in oam; a hop to the same authority spelled in another case makes 2
-  calls in Node and 1 in oam; and a second `fetch` on the same `Agent` made 0 calls in Node
-  (a pooled connection) and calls again in oam, whose hooked client is per-`fetch` and so
-  pools within one `fetch` but never across two. Every connection oam opens still dials only
-  addresses the hook returned for that authority.
-- **How many connections it opens.** Because the hooked client and its pool end with the
-  `fetch`, every hooked `fetch` opens a new connection and closes it from the client side,
-  which leaves the client's end in TIME_WAIT. Measured: 5,000 sequential `fetch`es through
-  one hooked `Agent` to a keep-alive server opened 5,000 connections in oam and 2 in Node.
-  Under sustained hooked load that can use up the ephemeral port range (16,384 ports on
-  Windows): back to back with other runs, a hooked loop failed with `fetch failed` <-
-  `EADDRINUSE` on nearly every request. The same loop without the hook opens one
-  connection.
+- **How many connections it opens, and so how often it is called.** Both runtimes call the
+  hook exactly once per connection (`fetch_connect_lookup_asks_once_per_connection_and_pools_per_agent`,
+  e2e), and both reuse an `Agent`'s connections: 50 sequential `fetch`es through one hooked
+  `Agent` opened 2 connections and called the hook twice in Node, 1 and once in oam. Up to
+  0.17.1 oam ran every hooked `fetch` on a client of its own, so each one called the hook,
+  opened a connection and closed it again -- 5,000 sequential fetches made 5,000 connections,
+  left that many client ends in TIME_WAIT, and under sustained load could use up the
+  ephemeral port range (`fetch failed` <- `EADDRINUSE`). The counts still differ where undici
+  has not let go of a socket yet: it releases a response's socket after the next request has
+  been dispatched, so sequential fetches alternate between two connections, a redirect chain
+  `a -> a -> b` opens 3 (the same-host hop gets a second connection) and a 5-hop chain on one
+  host 2, while oam hands the response's connection back to the pool first and reuses it (1
+  for the fetches, 2 and 1 for the chains: one call per connection either way). A connection
+  that answered a 302 whose next hop the hook then refused is torn down in Node and kept in
+  oam's pool. The same host on another port is another connection in both (a 302 from
+  `localhost:P1` to `localhost:P2` calls the hook twice in each), so a guard whose policy
+  turns on the port is asked about every port a chain reaches.
+- **Which connections a request may reuse.** A pooled connection carries requests for the
+  origin it was opened to and no other -- the same scheme, host (in any case) and port --
+  so a connection the hook's answer for one name opened is never lent to another name that
+  answers with the same address, which asks the hook and opens its own, as in Node. An IP
+  literal on the same `Agent` never asks the hook and gets its own connection. Each `Agent`
+  has its own pool: another `Agent`'s hook never sees its connections used. An answer opens
+  exactly the connection it was asked for. The pool closes its idle connections after 90 s
+  (the shared pool's idle timeout; undici's keep-alive default is 4 s), and all of them when
+  the `Agent` is `close()`d or `destroy()`ed, or garbage-collected without either.
 - **A hook that calls back twice.** One that answers and then calls back again with an
   error fails the fetch in Node, with that second error as the `cause`; oam keeps the first
   answer and connects.

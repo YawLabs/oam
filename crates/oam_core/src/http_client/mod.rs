@@ -20,10 +20,12 @@
 //!
 //! - [`tls_config`]: the process-wide rustls client configs.
 //! - `connector` (crate-private): node's connect algorithm
-//!   (`net_connect`), TLS, the environment proxy and CONNECT tunnel, and a
-//!   lookup-hooked fetch's own addresses.
-//! - [`transport`]: the pooled hyper-util client, a hooked fetch's one-off
-//!   client, the request bodies, and the send-failure mapping.
+//!   (`net_connect`), TLS, the environment proxy and CONNECT tunnel, and
+//!   the addresses a `connect.lookup` hook answered for one connection.
+//! - `pool` (crate-private): oam's connection pool.
+//! - [`transport`]: the shared pool, one pool per lookup-hooked undici
+//!   dispatcher, a connector-hooked fetch's non-pooling one, the request
+//!   bodies, and the send-failure mapping.
 //!
 //! And the op on top of it:
 //!

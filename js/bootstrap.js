@@ -8,12 +8,13 @@
 // fetchCancel):
 //   request:  JSON string {url, method, headers: [[k,v]],
 //             body | body_base64 | body_stream, attempt_timeout_ms,
-//             fetch_semantics, dispatch_semantics, lookup_hook?, connect_timeout_ms?,
-//             alpn? ("http1" when absent | "allow_h2" | "none")}
+//             fetch_semantics, dispatch_semantics, lookup_hook?, lookup_pool?,
+//             connect_timeout_ms?, alpn? ("http1" when absent | "allow_h2" | "none")}
 //   response: {status, statusText, url, redirected, headers: [[k,v]],
 //             bodyHandle} -- or, for a lookup_hook request,
-//             {lookup: {token, host, port}}: run the hook, then
-//             fetchContinue(token, JSON {ips}) or fetchAbandon(token)
+//             {lookup: {token, host, port}} when a new connection needs the
+//             hook: run it, then fetchContinue(token, JSON {ips}) or
+//             fetchAbandon(token)
 //   cancel:   fetch(request, id) registers the fetch under `id`;
 //             fetchCancel(id) takes it off the wire while it has no
 //             response head (after the head, fetchBodyCancel(bodyHandle))
@@ -3093,7 +3094,21 @@
     const holder = globalThis.__oamUndiciDispatcher;
     const dispatcher = init.dispatcher ?? holder?.current;
     const lookup = (dispatcher && dispatcher._oamConnectLookup) || replacedDnsLookup();
-    if (typeof lookup === "function") request.lookup_hook = true;
+    if (typeof lookup === "function") {
+      request.lookup_hook = true;
+      // The pool the connections come from: the dispatcher's own, reused
+      // across its fetches as undici's Agent reuses its sockets (the hook
+      // runs once per new connection), or, with no dispatcher, the one
+      // global fetch's default dispatcher would have. http.request never
+      // gets here with a hook (a replaced dns.lookup sends it over an
+      // agent's socket), and keeps a pool of its own if it ever does; so
+      // does a fetch through a dispatcher already closed, whose pool is gone
+      // and would never be closed again.
+      if (!rawPayload && dispatcher?.closed !== true) {
+        const id = dispatcher?._oamPoolId;
+        request.lookup_pool = typeof id === "number" ? id : 0;
+      }
+    }
     // What the handshake with an https origin offers by ALPN, as each of
     // node's clients offers it (measured on v22.22.2 against an allowHTTP1
     // http2 server, #176): undici -- fetch() and undici.request -- offers

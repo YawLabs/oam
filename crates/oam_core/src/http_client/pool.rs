@@ -51,7 +51,9 @@ use hyper::body::Incoming;
 use hyper::client::conn::{http1, http2};
 use hyper_util::rt::TokioExecutor;
 
-use super::connector::{ConnCloser, ConnInfo, ConnStats, OamConnector};
+use super::connector::{
+    ConnCloser, ConnInfo, ConnStats, DialParams, HookPin, NeedsLookup, OamConnector,
+};
 use super::redirect::{self, Rules};
 use super::sent::Dispatched;
 use super::tls_config::Alpn;
@@ -77,6 +79,25 @@ const MIN_REAP_TICK: Duration = Duration::from_millis(90);
 /// At most one retry after a reused connection hands a request back unsent; a
 /// fresh connection is never retried, so the loop settles in two.
 const MAX_ATTEMPTS: usize = 3;
+
+/// How one request may get a connection it has to open: the request's own
+/// connect parameters, which every request sharing a pool carries for
+/// itself.
+pub(crate) struct Dial {
+    /// undici's connect timeout (`OamConnector::connect_within`); `None` is
+    /// none.
+    pub(crate) connect_timeout: Option<Duration>,
+    /// What a connection this request opens to an https origin offers, and
+    /// which pooled connections it may take.
+    pub(crate) alpn: Alpn,
+    /// node's happy-eyeballs attempt timeout, for this request's dials.
+    pub(crate) attempt_timeout: Duration,
+    /// On a lookup-hooked pool, the hook's answer the request was resumed
+    /// with: it OPENS a connection (the hook was asked for one, and undici
+    /// asks it once per connection), so the request takes no idle one, and
+    /// it is spent on that one dial.
+    pub(crate) pin: Option<HookPin>,
+}
 
 /// A runtime's owned connection pool. Cloning shares the connections.
 #[derive(Clone)]
@@ -156,23 +177,25 @@ impl Pool {
 
     /// Send one request on this pool. `close_requested` is set when the request
     /// carried `Connection: close` (h1), so its connection is not re-parked.
-    /// `connect_timeout` bounds a connection this request has to open
-    /// (`OamConnector::connect_within`); it is the request's own, so a fetch
-    /// and an `http.request` sharing the pool each connect under theirs.
-    /// `alpn` is what a connection this request opens to an https origin
-    /// offers, and which pooled connections it may take. `follows` names the
-    /// rules a 3xx answer to it is followed by, if it is: a redirect whose
-    /// next hop keeps a method that is not idempotent never sends that hop
-    /// on this connection ([`retires_for_the_hop`]).
+    /// `dial` is how a connection this request has to open is made; it is
+    /// the request's own, so a fetch and an `http.request` sharing the pool
+    /// each connect under theirs. `follows` names the rules a 3xx answer to
+    /// it is followed by, if it is: a redirect whose next hop keeps a method
+    /// that is not idempotent never sends that hop on this connection
+    /// ([`retires_for_the_hop`]).
+    ///
+    /// On a lookup-hooked pool, a request that has to open a connection to
+    /// a host name without a hook answer for it fails with [`NeedsLookup`]
+    /// and the request handed back unsent ([`PoolFail::returned`]), for the
+    /// caller to send again with the answer.
     pub(crate) async fn request(
         &self,
         mut req: Request<ReqBody>,
         close_requested: bool,
-        connect_timeout: Option<Duration>,
-        alpn: Alpn,
+        mut dial: Dial,
         follows: Option<Rules>,
     ) -> Result<Response<Incoming>, PoolFail> {
-        let Some(key) = pool_key(req.uri(), alpn) else {
+        let Some(key) = pool_key(req.uri(), dial.alpn) else {
             return Err(PoolFail {
                 error: PoolError::connect(Box::<dyn std::error::Error + Send + Sync>::from(
                     "request url has no scheme or authority",
@@ -180,6 +203,7 @@ impl Pool {
                 reused: false,
                 response_started: false,
                 conn: None,
+                returned: None,
             });
         };
         let is_connect = req.method() == Method::CONNECT;
@@ -192,17 +216,31 @@ impl Pool {
         // each attempt's origin/absolute rewrite, so a retry does not rewrite an
         // already-rewritten URI.
         let original_uri = req.uri().clone();
-        let mut allow_reuse = true;
+        // A hook answer opens a connection of its own: see `Dial::pin`.
+        let mut allow_reuse = dial.pin.is_none();
 
         for _ in 0..MAX_ATTEMPTS {
-            let conn = match self.checkout(&key, allow_reuse, connect_timeout).await {
+            let conn = match self.checkout(&key, allow_reuse, &mut dial).await {
                 Ok(conn) => conn,
-                Err(error) => {
+                Err(Checkout::NeedsLookup(needed)) => {
+                    // Unsent, and as the caller built it: a retry below
+                    // handed it back with its URI already rewritten.
+                    *req.uri_mut() = original_uri;
+                    return Err(PoolFail {
+                        error: PoolError::connect(Box::new(needed)),
+                        reused: false,
+                        response_started: false,
+                        conn: None,
+                        returned: Some(req),
+                    });
+                }
+                Err(Checkout::Failed(error)) => {
                     return Err(PoolFail {
                         error: PoolError::connect(error),
                         reused: false,
                         response_started: false,
                         conn: None,
+                        returned: None,
                     });
                 }
             };
@@ -236,6 +274,7 @@ impl Pool {
                     reused: false,
                     response_started: false,
                     conn: Some(info),
+                    returned: None,
                 });
             }
             *req.uri_mut() = original_uri.clone();
@@ -256,7 +295,7 @@ impl Pool {
                         conn_key,
                         info,
                         proxied,
-                        &response,
+                        &mut response,
                         close_requested || retire,
                     );
                     return Ok(response);
@@ -282,6 +321,7 @@ impl Pool {
                         reused,
                         response_started,
                         conn: Some(info),
+                        returned: None,
                     });
                 }
                 SendResult::Sent(error, proto) => {
@@ -293,6 +333,7 @@ impl Pool {
                         reused,
                         response_started,
                         conn: Some(info),
+                        returned: None,
                     });
                 }
             }
@@ -307,16 +348,19 @@ impl Pool {
             reused: false,
             response_started: false,
             conn: None,
+            returned: None,
         })
     }
 
     /// Reuse an idle connection for `key`, or open exactly one. Never both.
+    /// A hooked pool opens one to a host name only with the hook's answer
+    /// for it, which the dial spends.
     async fn checkout(
         &self,
         key: &PoolKey,
         allow_reuse: bool,
-        connect_timeout: Option<Duration>,
-    ) -> Result<Conn, BoxError> {
+        dial: &mut Dial,
+    ) -> Result<Conn, Checkout> {
         if allow_reuse && self.inner.idle_timeout.is_some() {
             if let Some(conn) = self.reuse_h2(key) {
                 return Ok(conn);
@@ -325,7 +369,21 @@ impl Pool {
                 return Ok(conn);
             }
         }
-        self.connect(key, connect_timeout).await
+        let uri = domain_as_uri(key);
+        let pin = match self.connector.needs_lookup(&uri) {
+            None => None,
+            Some(needed) => match dial.pin.take() {
+                Some(pin) if pin.key == needed.key => Some(pin),
+                _ => return Err(Checkout::NeedsLookup(needed)),
+            },
+        };
+        let params = DialParams {
+            attempt_timeout: dial.attempt_timeout,
+            pin,
+        };
+        self.connect(key, uri, dial.connect_timeout, params)
+            .await
+            .map_err(Checkout::Failed)
     }
 
     fn reuse_h2(&self, key: &PoolKey) -> Option<Conn> {
@@ -345,6 +403,44 @@ impl Pool {
             is_h2: true,
             key: key.clone(),
         })
+    }
+
+    /// Whether a request for `uri` offering `alpn` would find a connection
+    /// to reuse right now: a live h2 connection to the origin, or a live,
+    /// unexpired idle h1 one. A look, not a reservation -- another request
+    /// can take it first, and the checkout then decides afresh.
+    pub(crate) fn has_idle(&self, uri: &Uri, alpn: Alpn) -> bool {
+        let Some(key) = pool_key(uri, alpn) else {
+            return false;
+        };
+        if self.inner.idle_timeout.is_none() {
+            return false;
+        }
+        let h2_live = self
+            .inner
+            .h2
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .is_some_and(|entry| !entry.sender.is_closed());
+        if h2_live {
+            return true;
+        }
+        let now = Instant::now();
+        self.inner
+            .idle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .is_some_and(|deque| {
+                deque.iter().any(|entry| {
+                    !entry.sender.is_closed()
+                        && self
+                            .inner
+                            .idle_timeout
+                            .is_none_or(|timeout| now.duration_since(entry.parked_at) <= timeout)
+                })
+            })
     }
 
     fn reuse_h1(&self, key: &PoolKey) -> Option<Conn> {
@@ -380,13 +476,14 @@ impl Pool {
     async fn connect(
         &self,
         key: &PoolKey,
+        uri: Uri,
         connect_timeout: Option<Duration>,
+        params: DialParams,
     ) -> Result<Conn, BoxError> {
-        let uri = domain_as_uri(key);
         let conn = self
             .connector
             .clone()
-            .connect_within(uri, key.2, connect_timeout)
+            .connect_within(uri, key.2, connect_timeout, params)
             .await?;
         let is_h2 = conn.negotiated_h2();
         let proxied = conn.is_proxied();
@@ -460,14 +557,16 @@ impl Pool {
 
     /// After an `Ok` send: park an h1 connection once its sender re-arms (the
     /// response drained) unless the request or response asked to close it; an
-    /// h2 connection stays in its entry for the next stream.
+    /// h2 connection stays in its entry for the next stream. An h1 response
+    /// carries a [`Released`] that settles once the connection is parked or
+    /// closed.
     fn on_success(
         &self,
         sender: Proto,
         key: PoolKey,
         info: ConnInfo,
         proxied: bool,
-        response: &Response<Incoming>,
+        response: &mut Response<Incoming>,
         close_requested: bool,
     ) {
         let Proto::H1(mut sender, stats) = sender else {
@@ -476,7 +575,12 @@ impl Pool {
         let should_park = !close_requested && !says_close(response.headers());
         let inner = Arc::downgrade(&self.inner);
         let gen_id = self.inner.generation.load(Ordering::Relaxed);
+        let (released, settles) = tokio::sync::watch::channel(());
+        response.extensions_mut().insert(Released(settles));
         tokio::spawn(async move {
+            // Dropped on every way out of this task -- after the park, or
+            // with the connection -- which is what `Released` waits for.
+            let _released = released;
             // Wait until the dispatcher wants the next request -- it has drained
             // the response body -- or errors (a dropped/half-read body, or a
             // dead connection), in which case the sender drops and closes it.
@@ -565,6 +669,34 @@ impl PoolInner {
     }
 }
 
+/// Settles once the h1 connection a response came on is done with it: parked
+/// in the pool for the next request, or closed. The fetch loop waits for it
+/// between a 3xx and the hop it follows with, so that hop finds the
+/// connection idle whenever it can be reused, every time: parking runs on a
+/// task of its own, and without the wait the hop raced it (and, on a hooked
+/// route, called the hook for a connection it then opened only some of the
+/// time). It settles promptly -- the response is dropped first, so the
+/// connection either re-arms at once (an empty body) or closes.
+#[derive(Clone)]
+pub(crate) struct Released(tokio::sync::watch::Receiver<()>);
+
+impl Released {
+    pub(crate) async fn settled(mut self) {
+        // The task holds the sender and never sends: `changed` returns once
+        // it is dropped.
+        let _ = self.0.changed().await;
+    }
+}
+
+/// Why a checkout produced no connection.
+enum Checkout {
+    /// The dial failed.
+    Failed(BoxError),
+    /// A hooked pool has no idle connection for the authority and no hook
+    /// answer to open one with.
+    NeedsLookup(NeedsLookup),
+}
+
 /// A checked-out connection, ready for one request.
 struct Conn {
     proto: Proto,
@@ -625,6 +757,10 @@ pub(crate) struct PoolFail {
     pub(crate) response_started: bool,
     /// The connection the request went out on; `None` when none was had.
     pub(crate) conn: Option<ConnInfo>,
+    /// The request, unsent, when the failure is a [`NeedsLookup`]: the
+    /// caller sends it again once the hook has answered (a streamed body
+    /// cannot be built twice).
+    pub(crate) returned: Option<Request<ReqBody>>,
 }
 
 /// The transport's send error, in place of `hyper_util::client::legacy::Error`.

@@ -1,6 +1,7 @@
-//! The transport a fetch sends through: hyper-util's legacy client over
-//! oam's connector (`connector.rs`), one pooled client per runtime plus a one-off
-//! client for a fetch whose dispatcher carries a `connect.lookup` hook.
+//! The transport a fetch sends through: oam's pool (`pool.rs`) over oam's
+//! connector (`connector.rs`) -- one pool per runtime, one per undici
+//! dispatcher that carries a `connect.lookup` hook, and a non-pooling one
+//! per fetch whose dispatcher has a `connect` function.
 //!
 //! The pooled client is built the way reqwest 0.13.4 built oam's
 //! (async_impl/client.rs:940-1000): hyper-util's defaults except the tokio
@@ -11,7 +12,6 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,14 +23,14 @@ use hyper::body::{Frame, Incoming};
 use hyper_util::client::proxy::matcher::Matcher;
 
 use super::connector::{
-    ConnInfo, ConnectTimedOut, HostAddrs, OamConnector, Shared, SuppliedConn, SuppliedConns,
-    TlsSetupError, Via, authority_key,
+    ConnInfo, ConnectTimedOut, HookPin, NeedsLookup, OamConnector, Shared, SuppliedConn,
+    SuppliedConns, TlsSetupError, Via, authority_key,
 };
-use super::pool::{Pool, PoolError, PoolFail};
+use super::pool::{Dial, Pool, PoolError, PoolFail};
 use super::prepare::host_for_connect;
 use super::{BoxError, ReqBody};
 use crate::OpOutcome;
-use crate::net_connect::{ConnectError, DEFAULT_ATTEMPT_TIMEOUT};
+use crate::net_connect::ConnectError;
 
 pub use super::connector::TlsSource;
 use super::connector::{HandshakeFailed, NoProtocolsAvailable};
@@ -59,11 +59,14 @@ pub struct TransportOptions {
     pub user_agent: HeaderValue,
 }
 
-/// A runtime's fetch transport. Cloning shares the pool.
+/// A runtime's fetch transport. Cloning shares the pools.
 #[derive(Clone)]
 pub struct HttpTransport {
     pool: Pool,
     shared: Arc<Shared>,
+    /// The pools of the lookup-hooked undici dispatchers, by the id the
+    /// `undici` shim gave each one (see [`HttpTransport::agent_route`]).
+    agents: Arc<Mutex<HashMap<u64, Pool>>>,
 }
 
 impl Default for HttpTransport {
@@ -94,16 +97,17 @@ impl HttpTransport {
             tls: options.tls,
             proxy,
             user_agent: options.user_agent,
-            attempt_timeout_ms: AtomicU64::new(
-                u64::try_from(DEFAULT_ATTEMPT_TIMEOUT.as_millis()).unwrap_or(250),
-            ),
             tls_range: AtomicU8::new(TlsRange::Both.code()),
         });
         let pool = Pool::pooled(OamConnector {
             shared: shared.clone(),
             via: Via::Pooled,
         });
-        HttpTransport { pool, shared }
+        HttpTransport {
+            pool,
+            shared,
+            agents: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     pub fn user_agent(&self) -> &HeaderValue {
@@ -117,36 +121,70 @@ impl HttpTransport {
         self.pool.destroy();
     }
 
-    /// The route one fetch takes. With `lookup_hook`, the fetch gets its own
-    /// client, whose connector dials a host name only at the addresses
-    /// recorded with [`Route::set_addrs`] and never through the environment
-    /// proxy; its pool is its own and dies with the route. Otherwise the
-    /// fetch shares the process pool.
+    /// The route one fetch takes. With `lookup_hook`, a hooked route on a
+    /// pool of its own, which dies with the route: what
+    /// [`HttpTransport::agent_route`] gives a dispatcher no other fetch
+    /// shares. Otherwise the fetch shares the process pool.
     pub fn route(
         &self,
         lookup_hook: bool,
         attempt_timeout: Duration,
         tls_range: TlsRange,
     ) -> Route {
-        let hooked = lookup_hook.then(|| {
-            let addrs: HostAddrs = Arc::new(Mutex::new(HashMap::new()));
-            let pool = Pool::pooled(OamConnector {
-                shared: self.shared.clone(),
-                via: Via::Hooked {
-                    addrs: addrs.clone(),
-                    attempt_timeout,
-                },
-            });
-            Hooked { addrs, pool }
-        });
-        Route {
-            attempt_timeout,
-            connect_timeout: None,
-            tls_range,
-            alpn: Alpn::default(),
-            hooked,
-            supplied: None,
+        let hooked = lookup_hook.then(|| self.hooked_pool());
+        Route::new(attempt_timeout, tls_range, hooked)
+    }
+
+    /// The route of a fetch whose undici dispatcher -- `agent`, the id the
+    /// `undici` shim gave it -- carries a `connect.lookup` hook: that
+    /// dispatcher's own pool, shared by every fetch through it, as undici's
+    /// Agent pools its connections. A connection it opens to a host name
+    /// dials only the addresses the hook answered for that connection
+    /// ([`Route::set_addrs`]), never through the environment proxy, and the
+    /// hook is asked once per connection: a request that finds an idle
+    /// connection to its origin takes it, and the hook is not called.
+    ///
+    /// A pooled connection is reused only for the origin it was opened to
+    /// (the pool's key is the scheme and authority), so a connection the
+    /// hook's answer for one host opened never carries a request for
+    /// another; and only within `agent`, so another dispatcher's hook never
+    /// sees its connections used. The idle timeout is the shared pool's.
+    /// The pool lives until [`HttpTransport::drop_agent`] -- the
+    /// dispatcher's `close()` or `destroy()`, or its collection.
+    pub fn agent_route(&self, agent: u64, attempt_timeout: Duration, tls_range: TlsRange) -> Route {
+        let pool = self
+            .agents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(agent)
+            .or_insert_with(|| self.hooked_pool())
+            .clone();
+        Route::new(attempt_timeout, tls_range, Some(pool))
+    }
+
+    /// Close every connection the dispatcher `agent` pooled, and forget its
+    /// pool. A request in flight on one of them finishes, and its connection
+    /// then closes rather than going back to a pool. True if it had one.
+    pub fn drop_agent(&self, agent: u64) -> bool {
+        let pool = self
+            .agents
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&agent);
+        match pool {
+            Some(pool) => {
+                pool.destroy();
+                true
+            }
+            None => false,
         }
+    }
+
+    fn hooked_pool(&self) -> Pool {
+        Pool::pooled(OamConnector {
+            shared: self.shared.clone(),
+            via: Via::Hooked,
+        })
     }
 
     /// The route of one fetch whose undici dispatcher carries a `connect`
@@ -201,13 +239,21 @@ impl HttpTransport {
         // Every route's connector handshakes through the shared state, so
         // the request's version range goes there whichever pool sends it.
         self.shared.set_tls_range(route.tls_range);
+        let mut pin = None;
         let pool = match (&route.hooked, &route.supplied) {
-            (Some(hooked), _) => &hooked.pool,
-            (None, Some(supplied)) => &supplied.pool,
-            (None, None) => {
-                self.shared.set_attempt_timeout(route.attempt_timeout);
-                &self.pool
+            (Some(hooked), _) => {
+                // The hook's answer for this request's authority, if the
+                // fetch was resumed with one: spent on the connection it
+                // opens. An answer for another authority stays put.
+                let key = authority_key(request.uri());
+                let mut slot = hooked.pin.lock().unwrap_or_else(|e| e.into_inner());
+                if slot.is_some() && slot.as_ref().map(|pin| &pin.key) == key.as_ref() {
+                    pin = slot.take();
+                }
+                &hooked.pool
             }
+            (None, Some(supplied)) => &supplied.pool,
+            (None, None) => &self.pool,
         };
         // A request that told the server the connection closes after it --
         // node's `Connection: close`, which http.request sends for a socket it
@@ -228,27 +274,26 @@ impl HttpTransport {
                         .any(|token| token.trim().eq_ignore_ascii_case("close"))
                 })
             });
-        match pool
-            .request(
-                request,
-                close_requested,
-                route.connect_timeout,
-                route.alpn,
-                follows,
-            )
-            .await
-        {
+        let dial = Dial {
+            connect_timeout: route.connect_timeout,
+            alpn: route.alpn,
+            attempt_timeout: route.attempt_timeout,
+            pin,
+        };
+        match pool.request(request, close_requested, dial, follows).await {
             Ok(response) => Ok(response),
             Err(PoolFail {
                 error,
                 reused,
                 response_started,
                 conn,
+                returned,
             }) => Err(SendError {
                 error,
                 reused,
                 response_started,
                 conn,
+                returned,
             }),
         }
     }
@@ -299,8 +344,10 @@ pub struct Route {
 }
 
 struct Hooked {
-    addrs: HostAddrs,
     pool: Pool,
+    /// The hook's answer the fetch was last resumed with, until the
+    /// connection it opens is dialled ([`Route::set_addrs`]).
+    pin: Mutex<Option<HookPin>>,
 }
 
 struct Supplied {
@@ -309,6 +356,20 @@ struct Supplied {
 }
 
 impl Route {
+    fn new(attempt_timeout: Duration, tls_range: TlsRange, hooked: Option<Pool>) -> Route {
+        Route {
+            attempt_timeout,
+            connect_timeout: None,
+            tls_range,
+            alpn: Alpn::default(),
+            hooked: hooked.map(|pool| Hooked {
+                pool,
+                pin: Mutex::new(None),
+            }),
+            supplied: None,
+        }
+    }
+
     /// Bound every connection this route opens by undici's connect timeout:
     /// the lookup, the address attempts and an https handshake together have
     /// `timeout` (`OamConnector::connect_within`), and a connect that runs
@@ -336,17 +397,21 @@ impl Route {
         self.hooked.is_some()
     }
 
-    /// On a hooked route, the authority the hook must resolve before `uri`
-    /// can be dialled, as `(key, host)`: `None` for an IP literal (node never
-    /// looks one up), for an authority this fetch already resolved (node
-    /// reuses the connection it opened, and within one fetch its addresses
-    /// stand), and on a pooled route.
+    /// On a hooked route, whether a send to `uri` would have to open a
+    /// connection with a hook answer this route does not hold, as
+    /// `(key, host)`: `None` for an IP literal (node never looks one up),
+    /// when an answer for the authority is waiting to be dialled
+    /// ([`Route::set_addrs`]), when the pool has an idle connection to the
+    /// origin, and on a pooled route. The fetch loop asks before it builds a
+    /// request, so a request that will need the hook waits for it before
+    /// anything is taken from its body. It is a look, not a reservation: a
+    /// send whose idle connection another request took first fails with
+    /// [`SendError::lookup_needed`] and hands the request back.
     ///
     /// The key is the whole authority, not the host. A guard's policy can
     /// turn on the PORT -- allow 443 on an internal name, refuse 22 or 6379 --
-    /// and while the map was keyed on the host alone a 302 to the same name
-    /// on another port was followed without asking it again. node asks per
-    /// connection, so it asks for the new authority too.
+    /// so the same name on another port is asked about again, as node asks
+    /// per connection.
     pub fn lookup_needed(&self, uri: &Uri) -> Option<(String, String)> {
         let hooked = self.hooked.as_ref()?;
         let host = host_for_connect(uri)?;
@@ -354,12 +419,13 @@ impl Route {
             return None;
         }
         let key = authority_key(uri)?;
-        let known = hooked
-            .addrs
+        let held = hooked
+            .pin
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&key);
-        (!known).then_some((key, host))
+            .as_ref()
+            .is_some_and(|pin| pin.key == key);
+        (!held && !hooked.pool.has_idle(uri, self.alpn)).then_some((key, host))
     }
 
     /// On a supplied route, the authority key `uri` needs a connection for:
@@ -393,21 +459,21 @@ impl Route {
         }
     }
 
-    /// Record the hook's addresses under the `key` [`Route::lookup_needed`]
-    /// returned (no-op on a pooled route).
+    /// Hand the route the hook's answer for the authority `key` (from
+    /// [`Route::lookup_needed`] or [`SendError::lookup_needed`]): the next
+    /// send to that authority opens a connection at these addresses, and
+    /// spends them. No-op on a pooled route.
     pub fn set_addrs(&self, key: &str, addrs: Vec<crate::net_connect::PinAddr>) {
         if let Some(hooked) = &self.hooked {
-            hooked
-                .addrs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key.to_string(), addrs);
+            *hooked.pin.lock().unwrap_or_else(|e| e.into_inner()) = Some(HookPin {
+                key: key.to_string(),
+                addrs,
+            });
         }
     }
 }
 
 /// A request that produced no response.
-#[derive(Debug)]
 pub struct SendError {
     error: PoolError,
     /// It went out on a connection an earlier request had already used.
@@ -418,9 +484,40 @@ pub struct SendError {
     /// That connection, for the socket a `SocketError` describes; `None`
     /// when the request never had one.
     conn: Option<ConnInfo>,
+    /// The request, unsent, when it waits for a hook answer
+    /// ([`SendError::lookup_needed`]).
+    returned: Option<http::Request<ReqBody>>,
+}
+
+impl std::fmt::Debug for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SendError")
+            .field("error", &self.error)
+            .field("reused", &self.reused)
+            .field("response_started", &self.response_started)
+            .field("conn", &self.conn)
+            .field("returned", &self.returned.is_some())
+            .finish()
+    }
 }
 
 impl SendError {
+    /// On a hooked route, the request needs a new connection to a host name
+    /// and the route holds no hook answer for it: `(key, host)` as
+    /// [`Route::lookup_needed`] gives them. The request was not sent; take
+    /// it back with [`SendError::take_request`], hand the route the hook's
+    /// answer ([`Route::set_addrs`]) and send it again.
+    pub fn lookup_needed(&self) -> Option<(String, String)> {
+        let needed = find_in_chain::<NeedsLookup>(&self.error)?;
+        Some((needed.key.clone(), needed.host.clone()))
+    }
+
+    /// The unsent request a [`SendError::lookup_needed`] failure hands back
+    /// (once).
+    pub fn take_request(&mut self) -> Option<http::Request<ReqBody>> {
+        self.returned.take()
+    }
+
     /// The connect failure behind this error, if a connect failed: through
     /// hyper-util's error and, for a proxied https request, through the
     /// tunnel's -- a proxy that refused or did not resolve is named in it.

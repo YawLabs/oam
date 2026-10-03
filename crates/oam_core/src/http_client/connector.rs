@@ -1,6 +1,6 @@
-//! The connector hyper-util's legacy client dials through: node's connect
-//! algorithm (`net_connect`), then TLS, with the environment proxy and a
-//! lookup-hooked fetch's own addresses decided here.
+//! The connector oam's pool dials through: node's connect algorithm
+//! (`net_connect`), then TLS, with the environment proxy and the addresses
+//! a `connect.lookup` hook answered for the connection decided here.
 //!
 //! What reqwest's connector did, and this one keeps (reqwest 0.13.4
 //! connect.rs, hyper-util 0.1.20 connect/http.rs):
@@ -530,17 +530,10 @@ pub(crate) struct Shared {
     /// behind the transport's `Arc`.
     pub(crate) proxy: Option<Matcher>,
     pub(crate) user_agent: HeaderValue,
-    /// The pooled connector's attempt timeout in milliseconds. hyper-util
-    /// hands a connector only the `Uri`, so the fetch op stores the value JS
-    /// sent before every pooled send and the connector reads it here. Two
-    /// concurrent requests can only disagree while
-    /// `net.setDefaultAutoSelectFamilyAttemptTimeout()` is changing a value
-    /// that is process-wide in node too.
-    pub(crate) attempt_timeout_ms: AtomicU64,
     /// The TLS version range of the request being sent (`TlsRange::code`):
     /// node's live `tls.DEFAULT_MIN_VERSION` / `DEFAULT_MAX_VERSION`, which
     /// every send stores before its request goes out and the connector reads
-    /// at the handshake, like `attempt_timeout_ms`. Two concurrent requests
+    /// at the handshake. Two concurrent requests
     /// can only disagree while a default is being reassigned, a value that is
     /// process-wide in node too; a pooled connection made under an earlier
     /// value is reused, as node's undici reuses its own.
@@ -548,15 +541,6 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
-    pub(crate) fn attempt_timeout(&self) -> Duration {
-        Duration::from_millis(self.attempt_timeout_ms.load(Ordering::Relaxed))
-    }
-
-    pub(crate) fn set_attempt_timeout(&self, timeout: Duration) {
-        let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
-        self.attempt_timeout_ms.store(ms, Ordering::Relaxed);
-    }
-
     pub(crate) fn tls_range(&self) -> TlsRange {
         TlsRange::from_code(self.tls_range.load(Ordering::Relaxed))
     }
@@ -590,14 +574,57 @@ impl Shared {
     }
 }
 
-/// A lookup-hooked fetch's resolved authorities: [`authority_key`] -> the
-/// addresses its `connect.lookup` hook returned, in the hook's order.
-pub(crate) type HostAddrs = Arc<Mutex<HashMap<String, Vec<net_connect::PinAddr>>>>;
+/// One `connect.lookup` answer, for the one connection it was asked for: the
+/// addresses the hook returned for `key`'s authority, in the hook's order.
+/// undici calls the hook once per connection it opens, so an answer opens
+/// exactly one connection and is gone: the next connection to the same
+/// authority asks the hook again.
+#[derive(Debug, Clone)]
+pub(crate) struct HookPin {
+    /// The [`authority_key`] the hook was asked about. A pin opens a
+    /// connection to that authority and no other.
+    pub(crate) key: String,
+    pub(crate) addrs: Vec<net_connect::PinAddr>,
+}
+
+/// What one dial takes from the request it is made for, rather than from
+/// the connector: a pool is shared by requests that each carry their own.
+#[derive(Debug, Clone)]
+pub(crate) struct DialParams {
+    /// node's happy-eyeballs attempt timeout as the request's caller read
+    /// it (`net.getDefaultAutoSelectFamilyAttemptTimeout()` when the fetch
+    /// started), latched by the dial as node latches it per socket.
+    pub(crate) attempt_timeout: Duration,
+    /// On a lookup-hooked connector, the hook's answer for this dial's host.
+    pub(crate) pin: Option<HookPin>,
+}
+
+/// A lookup-hooked connector was asked to open a connection to a host NAME
+/// with no hook answer for it: the request has to wait for the hook (the
+/// fetch loop parks, and resumes with the answer as a [`HookPin`]). Carries
+/// the authority's [`authority_key`] and the host the hook is asked about.
+#[derive(Debug)]
+pub(crate) struct NeedsLookup {
+    pub(crate) key: String,
+    pub(crate) host: String,
+}
+
+impl std::fmt::Display for NeedsLookup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "a new connection to {} needs a connect.lookup answer",
+            self.key
+        )
+    }
+}
+
+impl std::error::Error for NeedsLookup {}
 
 /// The key one hook answer is filed under: `host:port`, host lowercased and
 /// unbracketed, port defaulted by scheme so `http://h/` and `http://h:80/`
-/// are the same authority. It must agree between `Route::lookup_needed`,
-/// which files the answer, and [`OamConnector::connect`], which reads it.
+/// are the same authority. It must agree between the [`NeedsLookup`] a
+/// dial asks with and the [`HookPin`] it is then given.
 pub(crate) fn authority_key(uri: &Uri) -> Option<String> {
     let host = host_for_connect(uri)?;
     let port = uri
@@ -628,19 +655,15 @@ pub(crate) type SuppliedConns = Arc<Mutex<HashMap<String, Vec<SuppliedConn>>>>;
 /// Which client a connector serves.
 #[derive(Clone)]
 pub(crate) enum Via {
-    /// The shared pool: the environment proxy applies, DNS is getaddrinfo,
-    /// and the attempt timeout comes from [`Shared`].
+    /// The shared pool: the environment proxy applies and DNS is getaddrinfo.
     Pooled,
-    /// One lookup-hooked fetch's own client. A host name is dialled only at
-    /// the addresses its hook returned -- never through getaddrinfo, never
-    /// through the environment proxy (an undici Agent never reads
-    /// HTTP_PROXY, and a proxy would resolve the name itself, defeating the
-    /// hook). An IP literal is dialled as written: node never calls lookup
-    /// for one.
-    Hooked {
-        addrs: HostAddrs,
-        attempt_timeout: Duration,
-    },
+    /// A lookup-hooked dispatcher's pool. A host name is dialled only at
+    /// the addresses the hook answered for that dial ([`DialParams::pin`])
+    /// -- never through getaddrinfo, never through the environment proxy
+    /// (an undici Agent never reads HTTP_PROXY, and a proxy would resolve
+    /// the name itself, defeating the hook). An IP literal is dialled as
+    /// written: node never calls lookup for one.
+    Hooked,
     /// One connector-hooked fetch's own client: every connection is one JS
     /// supplied for the authority, from the socket the dispatcher's
     /// `connect` function returned. Nothing is dialled here -- no DNS, no
@@ -739,9 +762,32 @@ impl OamConnector {
     /// `alpn` to an https origin, the environment proxy / CONNECT tunnel, or
     /// a hooked / supplied connection (whose socket JS made, ALPN and all).
     /// The owned pool calls this directly instead of through the `Service`
-    /// impl hyper-util used.
-    pub(crate) async fn connect(self, dst: Uri, alpn: Alpn) -> Result<OamConn, BoxError> {
-        self.connect_logged(dst, alpn, &AttemptLog::default()).await
+    /// impl hyper-util used. `params` are the requesting request's own: its
+    /// attempt timeout, and on a hooked connector its hook's answer.
+    pub(crate) async fn connect(
+        self,
+        dst: Uri,
+        alpn: Alpn,
+        params: DialParams,
+    ) -> Result<OamConn, BoxError> {
+        self.connect_logged(dst, alpn, params, &AttemptLog::default())
+            .await
+    }
+
+    /// On a lookup-hooked connector, the hook answer a new connection to
+    /// `dst` needs: `None` for an IP literal (node never looks one up), on
+    /// every other connector, and for a URI with no host (which the dial
+    /// itself refuses).
+    pub(crate) fn needs_lookup(&self, dst: &Uri) -> Option<NeedsLookup> {
+        if !matches!(self.via, Via::Hooked) {
+            return None;
+        }
+        let host = host_for_connect(dst)?;
+        if host.parse::<IpAddr>().is_ok() {
+            return None;
+        }
+        let key = authority_key(dst)?;
+        Some(NeedsLookup { key, host })
     }
 
     /// [`OamConnector::connect`] under undici's connect timeout: the whole
@@ -755,9 +801,10 @@ impl OamConnector {
         dst: Uri,
         alpn: Alpn,
         timeout: Option<Duration>,
+        params: DialParams,
     ) -> Result<OamConn, BoxError> {
         let Some(timeout) = timeout else {
-            return self.connect(dst, alpn).await;
+            return self.connect(dst, alpn, params).await;
         };
         // The host undici's message names: the one it handed net.connect --
         // the origin's, or the proxy's when the request goes through one.
@@ -775,7 +822,7 @@ impl OamConnector {
                 80
             });
         let log = AttemptLog::default();
-        match tokio::time::timeout(timeout, self.connect_logged(dst, alpn, &log)).await {
+        match tokio::time::timeout(timeout, self.connect_logged(dst, alpn, params, &log)).await {
             Ok(connected) => connected,
             Err(_elapsed) => Err(Box::new(ConnectTimedOut::new(
                 &host,
@@ -790,6 +837,7 @@ impl OamConnector {
         self,
         dst: Uri,
         alpn: Alpn,
+        params: DialParams,
         log: &AttemptLog,
     ) -> Result<OamConn, BoxError> {
         let https = dst.scheme_str() == Some("https");
@@ -800,41 +848,36 @@ impl OamConnector {
             Via::Pooled => {
                 if let Some(intercept) = self.shared.proxy.as_ref().and_then(|m| m.intercept(&dst))
                 {
-                    return self.through_proxy(dst, &host, intercept, alpn).await;
+                    return self
+                        .through_proxy(dst, &host, intercept, alpn, params.attempt_timeout)
+                        .await;
                 }
                 ConnectOptions {
-                    attempt_timeout: self.shared.attempt_timeout(),
+                    attempt_timeout: params.attempt_timeout,
                     pin: None,
                     local: None,
                 }
             }
-            Via::Hooked {
-                addrs,
-                attempt_timeout,
-            } => {
+            Via::Hooked => {
                 let pin = if host.parse::<IpAddr>().is_ok() {
                     None
                 } else {
-                    // Keyed on the authority the hook was asked about, so a
-                    // hop to the same name on another port cannot be dialled
-                    // on the first port's approved addresses.
-                    let resolved = authority_key(&dst).and_then(|key| {
-                        addrs
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .get(&key)
-                            .cloned()
-                    });
-                    let Some(resolved) = resolved else {
+                    // Only an answer for THIS authority: the hook was asked
+                    // about a host and port, so a hop to the same name on
+                    // another port (or to another name) is never dialled on
+                    // addresses approved for the first.
+                    let key = authority_key(&dst);
+                    let Some(answer) = params.pin.filter(|pin| Some(&pin.key) == key.as_ref())
+                    else {
                         return Err(Box::new(UnresolvedHost(host)));
                     };
                     Some(Pin {
                         host: host.to_ascii_lowercase(),
-                        addrs: resolved,
+                        addrs: answer.addrs,
                     })
                 };
                 ConnectOptions {
-                    attempt_timeout: *attempt_timeout,
+                    attempt_timeout: params.attempt_timeout,
                     pin,
                     local: None,
                 }
@@ -862,6 +905,7 @@ impl OamConnector {
         host: &str,
         intercept: Intercept,
         alpn: Alpn,
+        attempt_timeout: Duration,
     ) -> Result<OamConn, BoxError> {
         if !matches!(intercept.uri().scheme_str(), Some("http" | "https")) {
             return Err(format!(
@@ -872,7 +916,7 @@ impl OamConnector {
         }
         let mut transport = ProxyTransport {
             shared: self.shared.clone(),
-            attempt_timeout: self.shared.attempt_timeout(),
+            attempt_timeout,
         };
         if dst.scheme_str() != Some("https") {
             let mut conn = transport.call(intercept.uri().clone()).await?;
@@ -1293,7 +1337,6 @@ mod tests {
             tls: TlsSource::Unavailable("test".to_string()),
             proxy,
             user_agent: HeaderValue::from_static("oam/test"),
-            attempt_timeout_ms: AtomicU64::new(250),
             tls_range: AtomicU8::new(TlsRange::Both.code()),
         })
     }
@@ -1446,21 +1489,53 @@ mod tests {
         accept.await.unwrap().unwrap();
     }
 
-    /// A hooked connector never resolves a host its hook did not answer for.
+    /// A hooked connector never resolves a host its hook did not answer for:
+    /// not with no answer, and not with an answer for another authority --
+    /// the same name on another port included.
     #[tokio::test]
     async fn hooked_connector_fails_closed_on_an_unresolved_host() {
         let connector = OamConnector {
             shared: shared(None),
-            via: Via::Hooked {
-                addrs: Arc::new(Mutex::new(HashMap::new())),
-                attempt_timeout: Duration::from_millis(250),
-            },
+            via: Via::Hooked,
         };
         let uri: Uri = "http://localhost:1/".parse().unwrap();
-        let err = match connector.connect(uri, Alpn::Http1).await {
-            Ok(_) => panic!("connected without a lookup result"),
-            Err(e) => e,
+        let needed = connector
+            .needs_lookup(&uri)
+            .expect("a name needs an answer");
+        assert_eq!(
+            (needed.key.as_str(), needed.host.as_str()),
+            ("localhost:1", "localhost")
+        );
+        let elsewhere = |key: &str| DialParams {
+            attempt_timeout: Duration::from_millis(250),
+            pin: Some(HookPin {
+                key: key.to_string(),
+                addrs: vec!["127.0.0.1".parse().unwrap()],
+            }),
         };
-        assert!(err.downcast_ref::<UnresolvedHost>().is_some(), "{err}");
+        for dial in [
+            DialParams {
+                attempt_timeout: Duration::from_millis(250),
+                pin: None,
+            },
+            elsewhere("localhost:2"),
+            elsewhere("other.test:1"),
+        ] {
+            let err = match connector
+                .clone()
+                .connect(uri.clone(), Alpn::Http1, dial)
+                .await
+            {
+                Ok(_) => panic!("connected without a lookup result for this authority"),
+                Err(e) => e,
+            };
+            assert!(err.downcast_ref::<UnresolvedHost>().is_some(), "{err}");
+        }
+        assert!(
+            connector
+                .needs_lookup(&"http://127.0.0.1:1/".parse().unwrap())
+                .is_none(),
+            "an IP literal is dialled as written"
+        );
     }
 }
