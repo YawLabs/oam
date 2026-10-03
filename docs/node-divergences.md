@@ -1992,6 +1992,20 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   where Node's `statusMessage` is `café` and its `statusText` `caf�`. Over HTTP/2,
   which has no reason phrase (and which Node's fetch never negotiates), `statusText` is
   the status code's canonical phrase.
+- **A response header value's trailing whitespace is trimmed** (#182), on every client
+  path. Measured against a raw-socket server sending `x-ows:   a<TAB>b   `,
+  `x-trail-tab: v<TAB><TAB>` and `x-inner:  a   b  `: Node's `fetch` (and `undici.request`
+  from npm) read `"a\tb   "`, `"v\t\t"` and `"a   b  "` -- the leading whitespace
+  stripped, the trailing kept -- where oam's `fetch`, `undici.request` and `http.get`
+  read `"a\tb"`, `"v"` and `"a   b"`. Whitespace inside a value is kept, and a leading
+  run (`x-lead:<TAB><TAB>v`) reads `"v"`, in both runtimes. oam's reading is the
+  standard one: RFC 9110 section 5.5 excludes the optional whitespace around a field
+  value from the value, and it is what Node's own `http` module returns too
+  (`res.headers` and `res.rawHeaders` read `"a\tb"`). The trimming is done by the HTTP/1
+  parser under hyper (httparse) before oam sees the value, so matching Node's `fetch`
+  would mean re-reading header bytes the parser has already consumed, to reproduce a
+  reading Node's `http` module does not share. Only code that compares a `fetch`
+  response header value byte for byte can tell.
 - **A response nobody has read holds the request's `'close'`.** The request's `'close'`
   follows the response's `'end'` and `'close'` on a connection that is not kept, and comes
   between them on a kept-alive one, as in Node, on both client paths
