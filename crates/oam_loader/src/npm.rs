@@ -63,7 +63,7 @@ impl ResolveMode {
 }
 
 /// Node builtin module names (bare or node:-prefixed) as of Node 26.
-const NODE_BUILTINS: [&str; 46] = [
+const NODE_BUILTINS: [&str; 56] = [
     "assert",
     "async_hooks",
     "buffer",
@@ -103,6 +103,7 @@ const NODE_BUILTINS: [&str; 46] = [
     "util",
     "v8",
     "vm",
+    "wasi",
     "worker_threads",
     "zlib",
     // Legacy internal stream module aliases: require()able builtins Node keeps
@@ -114,13 +115,31 @@ const NODE_BUILTINS: [&str; 46] = [
     "_stream_duplex",
     "_stream_transform",
     "_stream_passthrough",
+    "_stream_wrap",
+    // Legacy http / tls module names node keeps require()able (and lists in
+    // module.builtinModules): _http_common carries node's HTTPParser, the
+    // rest the public pieces of http / tls (node_compat.js).
+    "_http_agent",
+    "_http_client",
+    "_http_common",
+    "_http_incoming",
+    "_http_outgoing",
+    "_http_server",
+    "_tls_common",
+    "_tls_wrap",
 ];
+
+/// Builtins node has only under the `node:` prefix: the bare name is an
+/// ordinary package. Recognized so `node:sqlite` says it is a builtin oam
+/// does not implement, rather than that node has no such module. `node:test`
+/// is shipped (SUPPORTED_BUILTINS).
+const PREFIX_ONLY_BUILTINS: [&str; 3] = ["sea", "sqlite", "test/reporters"];
 
 /// node: compat wave 1 + wave 2 stubs — builtins that resolve to virtual
 /// node:NAME paths the engine instantiates from the snapshot registry.
 /// Recognized names outside this list gate on OAM-MOD0006 with a precise
 /// pointer.
-const SUPPORTED_BUILTINS: [&str; 58] = [
+const SUPPORTED_BUILTINS: [&str; 66] = [
     "assert",
     "assert/strict",
     "async_hooks",
@@ -181,6 +200,14 @@ const SUPPORTED_BUILTINS: [&str; 58] = [
     "_stream_duplex",
     "_stream_transform",
     "_stream_passthrough",
+    "_http_agent",
+    "_http_client",
+    "_http_common",
+    "_http_incoming",
+    "_http_outgoing",
+    "_http_server",
+    "_tls_common",
+    "_tls_wrap",
 ];
 
 /// Subpath builtins Node recognizes by EXACT name. Anything else with a
@@ -391,14 +418,16 @@ pub(crate) fn resolve_bare(
             // snapshot registry (never touches the filesystem).
             return Ok(PathBuf::from(format!("node:{name}")));
         }
-        if is_node_builtin(specifier) {
-            let preview = SUPPORTED_BUILTINS[..6].join(", ");
+        if is_node_builtin(specifier)
+            || (specifier.starts_with("node:") && PREFIX_ONLY_BUILTINS.contains(&name))
+        {
+            // A name node has (a legacy alias like `_stream_wrap` included)
+            // is never a package to install: say what it is.
             return Err(diag(
                 "OAM-MOD0006",
                 format!(
-                    "'{specifier}' is a Node builtin oam does not implement yet \
-                     (wave 1 ships: {preview}, ..., others -- see docs); \
-                     the rest land with later compat waves",
+                    "'{specifier}' is a Node builtin module that oam does not implement yet \
+                     (docs/node-divergences.md lists what is missing)",
                 ),
             ));
         }
@@ -1398,6 +1427,57 @@ mod tests {
             "message was: {}",
             err.message
         );
+    }
+
+    /// A name node has as a builtin is never a package to go and install:
+    /// the legacy aliases resolve (or, `_stream_wrap`, say they are not
+    /// implemented), and so does a `node:`-only builtin -- while the bare
+    /// `sqlite` stays an ordinary package name, as in node (#207).
+    #[test]
+    fn node_builtin_aliases_resolve_or_say_what_they_are() {
+        let dir = std::env::temp_dir().join(format!("oam-npm-8c-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let entry = dir.join("entry.mjs");
+        std::fs::write(&entry, "").unwrap();
+        for name in [
+            "_http_agent",
+            "_http_client",
+            "_http_common",
+            "_http_incoming",
+            "_http_outgoing",
+            "_http_server",
+            "_tls_common",
+            "_tls_wrap",
+        ] {
+            for spec in [name.to_string(), format!("node:{name}")] {
+                let got = resolve_bare(&spec, &entry, ResolveMode::Require).unwrap();
+                assert_eq!(got, PathBuf::from(format!("node:{name}")), "{spec}");
+            }
+        }
+        for spec in [
+            "_stream_wrap",
+            "wasi",
+            "node:wasi",
+            "node:sqlite",
+            "node:sea",
+            "node:test/reporters",
+        ] {
+            let err = resolve_bare(spec, &entry, ResolveMode::Import).expect_err(spec);
+            assert_eq!(err.code, "OAM-MOD0006", "{spec}");
+            assert!(
+                err.message
+                    .contains("is a Node builtin module that oam does not implement yet"),
+                "{spec}: {}",
+                err.message
+            );
+        }
+        let err = resolve_bare("sqlite", &entry, ResolveMode::Import).expect_err("no package");
+        assert_eq!(
+            err.code, "OAM-MOD0002",
+            "bare sqlite is a package: {}",
+            err.message
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -14822,6 +14822,14 @@
       "_stream_duplex",
       "_stream_transform",
       "_stream_passthrough",
+      "_http_agent",
+      "_http_client",
+      "_http_common",
+      "_http_incoming",
+      "_http_outgoing",
+      "_http_server",
+      "_tls_common",
+      "_tls_wrap",
       "string_decoder",
       "timers",
       "timers/promises",
@@ -19620,6 +19628,23 @@
   // ServerResponse streams: the first write() opens a chunked response,
   // so res.write per SSE event flushes immediately. The http CLIENT
   // (http.request/get) is gated â€” use fetch (documented).
+  // llhttp's method enum (llhttp.h), in order: an index here is what an
+  // HTTPParser's kOnHeadersComplete reports as `method` (node:_http_common).
+  // The RTSP methods and PRI are in the enum but are not HTTP methods; the
+  // 35 HTTP ones, in enum order, are node's `_http_common.methods`, and
+  // sorted, `http.METHODS`.
+  const LLHTTP_METHODS = [
+    "DELETE", "GET", "HEAD", "POST", "PUT", "CONNECT", "OPTIONS", "TRACE", "COPY", "LOCK",
+    "MKCOL", "MOVE", "PROPFIND", "PROPPATCH", "SEARCH", "UNLOCK", "BIND", "REBIND", "UNBIND",
+    "ACL", "REPORT", "MKACTIVITY", "CHECKOUT", "MERGE", "M-SEARCH", "NOTIFY", "SUBSCRIBE",
+    "UNSUBSCRIBE", "PATCH", "PURGE", "MKCALENDAR", "LINK", "UNLINK", "SOURCE", "PRI",
+    "DESCRIBE", "ANNOUNCE", "SETUP", "PLAY", "PAUSE", "TEARDOWN", "GET_PARAMETER",
+    "SET_PARAMETER", "REDIRECT", "RECORD", "FLUSH", "QUERY",
+  ];
+  // DELETE .. SOURCE, and QUERY.
+  const isLlhttpHttpMethod = (index) => index < 34 || index === 46;
+  const HTTP_METHODS = LLHTTP_METHODS.filter((_, index) => isLlhttpHttpMethod(index));
+
   registry.factories.http = (natives) => {
     const EventEmitter = registry.get("events");
     const { Readable } = registry.get("stream");
@@ -19674,10 +19699,19 @@
         // The http layer manages this stream's close lifecycle; opt out of
         // Readable autoDestroy to keep the prior single-close behavior.
         super({ autoDestroy: false });
+        // A socket: node's own constructor, `new IncomingMessage(socket)`
+        // -- a message read off that socket by a parser of the caller's
+        // (the parsers in node:_http_common, or a test double such as
+        // nock's, which builds a ServerResponse over one). Its fields are
+        // node's until the parser fills them in, and its body is what is
+        // pushed into it.
+        if (meta && typeof meta.on === "function" && typeof meta.write === "function") {
+          this._initForSocket(meta);
+          return;
+        }
         // `meta` is the native accept record on the server path. Tolerate a
-        // missing/socket-shaped arg so `new http.IncomingMessage()` and the
-        // old-style `IncomingMessage.call(this, socket)` inheritance pattern
-        // do not throw (Node's IncomingMessage is constructible with no args).
+        // missing arg so `new http.IncomingMessage()` does not throw (Node's
+        // IncomingMessage is constructible with no args).
         meta = meta || {};
         this.method = meta.method;
         this.url = meta.uri;
@@ -19739,6 +19773,63 @@
         this._consuming = false;
         this._dumped = false;
       }
+      // node's IncomingMessage(socket) constructor fields.
+      _initForSocket(socket) {
+        this.socket = socket;
+        this.httpVersionMajor = null;
+        this.httpVersionMinor = null;
+        this.httpVersion = null;
+        this.complete = false;
+        this.headers = {};
+        this.rawHeaders = [];
+        this.trailers = {};
+        this.rawTrailers = [];
+        this.joinDuplicateHeaders = false;
+        this.aborted = false;
+        this.upgrade = null;
+        this.url = "";
+        this.method = null;
+        this.statusCode = null;
+        this.statusMessage = null;
+        this.client = socket;
+        this.connection = socket;
+        this._consuming = false;
+        this._dumped = false;
+        this._bodyDone = true;
+        this._socketBacked = true;
+      }
+      // node's _addHeaderLines: a parser's [name, value, ...] list, the
+      // first `n` entries of it, into the headers -- or, once the message
+      // is complete, into the trailers.
+      _addHeaderLines(headers, n) {
+        if (headers && headers.length) {
+          let dest;
+          if (this.complete) {
+            this.rawTrailers = headers;
+            dest = this.trailers;
+          } else {
+            this.rawHeaders = headers;
+            dest = this.headers;
+          }
+          if (dest) {
+            for (let i = 0; i < n; i += 2) this._addHeaderLine(headers[i], headers[i + 1], dest);
+          }
+        }
+      }
+      // node's _addHeaderLine: set-cookie collects a list, cookie joins
+      // with '; ', a field node keeps one of keeps the first (unless
+      // joinDuplicateHeaders), and any other repeat joins with ', '.
+      _addHeaderLine(field, value, dest) {
+        if (this.joinDuplicateHeaders) {
+          const key = String(field).toLowerCase();
+          if (key !== "set-cookie" && key !== "cookie" && kSingleValueFields.has(key)) {
+            if (dest[key] === undefined) dest[key] = value;
+            else dest[key] += ", " + value;
+            return;
+          }
+        }
+        addHeaderLine(dest, String(field), value);
+      }
       // node: `if (callback) this.on('timeout', callback);
       // this.socket.setTimeout(msecs); return this;` -- the connection's
       // inactivity timeout. 'timeout' reaches the request only while it is
@@ -19758,6 +19849,16 @@
         // dumps only NON-consumed requests, so a handler that responds
         // early and keeps draining the body must not have it cancelled.
         this._consuming = true;
+        // A message over a socket of the caller's has its body pushed in
+        // by their parser; reading asks for more of the socket (node's
+        // readStart).
+        if (this._socketBacked) {
+          const socket = this.socket;
+          if (socket && !socket._paused && socket.readable && typeof socket.resume === "function") {
+            socket.resume();
+          }
+          return;
+        }
         if (this._bodyDone || this._reading) return;
         this._reading = true;
         natives.httpRequestBodyRead(this._requestId).then(
@@ -19920,6 +20021,12 @@
         // integer request id the native hyper layer hands us. In that mode
         // write()/end()/flushHeaders() must NOT touch the native responder.
         this._mock = typeof requestId !== "number";
+        // node's ServerResponse(req): the request it answers, whose method
+        // and version decide the body's framing.
+        if (this._mock && requestId !== null && typeof requestId === "object") this.req = requestId;
+        // node's: a Date field unless this is turned off (or the field
+        // removed). oam's own server leaves the field to the transport.
+        this.sendDate = true;
         this._headers = new Map();
         this._streamId = null;
         this._ended = false;
@@ -20046,6 +20153,7 @@
         if (key === "content-length") this._removedContLen = true;
         else if (key === "transfer-encoding") this._removedTE = true;
         else if (key === "connection") this._removedConnection = true;
+        else if (key === "date") this.sendDate = false;
         this._headers.delete(key);
         if (this._names !== undefined) this._names.delete(key);
       }
@@ -20138,6 +20246,7 @@
         let te = false;
         let trailer = false;
         let connection = false;
+        let date = false;
         this._chunked = false;
         const note = (name, value) => {
           fields.push([name, String(value)]);
@@ -20160,6 +20269,9 @@
             case "trailer":
               trailer = true;
               break;
+            case "date":
+              date = true;
+              break;
           }
         };
         const add = (name, value) => {
@@ -20181,7 +20293,11 @@
         if (this._hasBody === undefined) this._hasBody = !(req && req.method === "HEAD");
         if (code === 204 || code === 304 || (code >= 100 && code <= 199)) this._hasBody = false;
         const hasBody = this._hasBody;
-        const http10 = Boolean(req && req.httpVersion === "1.0");
+        // node's test: an HTTP/1.0 request -- or one whose version no parser
+        // has set yet (null), as for a response built over
+        // `new IncomingMessage(socket)`.
+        const http10 = Boolean(req && (req.httpVersionMajor < 1 ||
+          (req.httpVersionMajor === 1 && req.httpVersionMinor === 0)));
         // node's useChunkedEncodingByDefault: false for an HTTP/1.0 client
         // that did not send `TE: chunked`.
         const chunksByDefault = !http10 || CHUNKED_CODING.test(req.headers && req.headers.te);
@@ -20208,7 +20324,11 @@
         // can carry: node refuses the head (an HTTP/1.0 client's without
         // `TE: chunked`, a 204's, one with a content-length, ...).
         if (trailer && !this._chunked) throw codes.ERR_HTTP_TRAILER_INVALID();
-        if (http10 && !connection && !this._removedConnection) {
+        if (this._mock) {
+          this._mockHead = this._wireHead(fields, {
+            contLen, te, trailer, connection, date, hasBody, http10, chunksByDefault,
+          });
+        } else if (http10 && !connection && !this._removedConnection) {
           // node's keep-alive rule for a head with no connection field: an
           // HTTP/1.0 client's connection is kept when it asked for that
           // (`Connection: keep-alive`) and the body is framed -- by a
@@ -20220,7 +20340,7 @@
             KEEP_ALIVE_TOKEN.test((req.headers && req.headers.connection) || "");
           fields.push(["Connection", keep ? "keep-alive" : "close"]);
         }
-        if (http10) {
+        if (http10 && !this._mock) {
           // node chunks for an HTTP/1.0 client that sent `TE: chunked`;
           // hyper does that only for a response that says so itself.
           if (this._chunked && !te) fields.push(["Transfer-Encoding", "chunked"]);
@@ -20231,6 +20351,63 @@
         // as node's statusLine is: writeHead()'s, or statusMessage.
         this._headMessage = this.statusMessage;
         this._headJson = JSON.stringify(fields);
+      }
+      // The head of a response with no connection of oam's (one built over
+      // a request object and given a socket with assignSocket()), as node's
+      // _storeHeader writes it: the status line, the fields, then the ones
+      // node adds -- Date (unless sendDate is off or one was set),
+      // Connection (unless removed or set: keep-alive while the connection
+      // persists and the body is framed, else close), and the body's
+      // framing (a content-length end() worked out, else chunks, else
+      // nothing: the body runs to the close).
+      _wireHead(fields, s) {
+        let head = "HTTP/1.1 " + this.statusCode + " " + this.statusMessage + "\r\n";
+        for (let i = 0; i < fields.length; i++) head += fields[i][0] + ": " + fields[i][1] + "\r\n";
+        if (this.sendDate !== false && !s.date) head += "Date: " + new Date().toUTCString() + "\r\n";
+        // node's standalone ServerResponse keeps the connection unless the
+        // request is HTTP/1.0 (or of no version yet).
+        const keepAlive = !s.http10;
+        if (!this._removedConnection && !s.connection) {
+          head += keepAlive && (s.contLen || s.chunksByDefault) ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
+        }
+        if (!s.contLen && !s.te && s.hasBody && s.chunksByDefault) {
+          if (!s.trailer && !this._removedContLen && typeof this._contentLength === "number") {
+            head += "Content-Length: " + this._contentLength + "\r\n";
+          } else if (!this._removedTE) {
+            head += "Transfer-Encoding: chunked\r\n";
+          }
+        }
+        return head + "\r\n";
+      }
+      // What a standalone response hands its socket for `bytes`, as node's
+      // _send does: the head ahead of the first bytes, then the bytes framed
+      // as the head says (a chunk, or as they are; nothing for a response
+      // that has no body).
+      _mockParts(bytes, chunk, encoding, fromEnd) {
+        const Buffer = globalThis.Buffer;
+        const parts = [];
+        this.headersSent = true;
+        if (!this._mockHeadSent && this._mockHead !== undefined) {
+          this._mockHeadSent = true;
+          parts.push(Buffer.from(this._mockHead, this._headIsUtf8(chunk, encoding, fromEnd) ? "utf8" : "latin1"));
+        }
+        if (this._hasBody && bytes.length > 0) {
+          if (this._chunked) {
+            parts.push(Buffer.from(bytes.length.toString(16) + "\r\n", "latin1"), bytes, Buffer.from("\r\n", "latin1"));
+          } else {
+            parts.push(bytes);
+          }
+        }
+        return parts;
+      }
+      _mockWrite(parts) {
+        const socket = this.socket;
+        if (parts.length === 0 || !socket || typeof socket.write !== "function") return;
+        try {
+          socket.write(parts.length === 1 ? parts[0] : globalThis.Buffer.concat(parts));
+        } catch {
+          /* a null socket swallows */
+        }
       }
       // node's addTrailers: each name a token ('Trailer name'), each value
       // free of what a header value may not hold ('trailer content'); a
@@ -20366,17 +20543,15 @@
           encoding = undefined;
         }
         if (this._mock) {
-          // Absorb into the assigned (usually null) socket; the mock consumer
-          // captures the real payload through its own write() override.
+          // A response with no connection of oam's writes the HTTP/1.1
+          // message to its assigned socket, as node's does: a test double
+          // reads the response off it (nock's MockHttpSocket), and an
+          // inject consumer that captures the payload through its own
+          // write() override hands it a socket that discards it.
           if (this._ended) return false;
-          this.headersSent = true;
-          if (this.socket && typeof this.socket.write === "function") {
-            try {
-              this.socket.write(this._toBytes(chunk, encoding));
-            } catch {
-              /* null socket swallows */
-            }
-          }
+          const bytes = this._toBytes(chunk, encoding);
+          this._implicitHead();
+          this._mockWrite(this._mockParts(bytes, chunk, encoding, false));
           if (cb) queueMicrotask(cb);
           return true;
         }
@@ -20443,8 +20618,23 @@
           encoding = undefined;
         }
         if (this._mock) {
-          if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
           if (!this._ended) {
+            const hasChunk = chunk !== undefined && chunk !== null;
+            const bytes = hasChunk ? this._toBytes(chunk, encoding) : new Uint8Array(0);
+            // node's end() before any head: the body's length is known, and
+            // the head it builds sends it.
+            if (!this._wroteHead) {
+              this._contentLength = bytes.length;
+              this.writeHead(this.statusCode);
+            }
+            const parts = this._mockParts(bytes, chunk, encoding, true);
+            if (this._chunked && this._hasBody) {
+              let last = "0\r\n";
+              const trailers = this._trailers;
+              if (trailers) for (const [name, value] of trailers) last += name + ": " + value + "\r\n";
+              parts.push(globalThis.Buffer.from(last + "\r\n", "latin1"));
+            }
+            this._mockWrite(parts);
             this._ended = true;
             this.headersSent = true;
             // Node with assignSocket emits 'finish' then runs the end
@@ -20594,7 +20784,12 @@
       // node sends the head joined to an empty string in no encoding: as
       // UTF-8, whatever follows.
       flushHeaders() {
-        if (this._mock) return;
+        if (this._mock) {
+          if (this._ended) return;
+          this._implicitHead();
+          this._mockWrite(this._mockParts(new Uint8Array(0), undefined, undefined, false));
+          return;
+        }
         if (this._streamId === null && !this._ended) {
           this._implicitHead();
           this._startStream(true);
@@ -22025,6 +22220,21 @@
       return socket.listenerCount("connect") > 0 ||
         socket.listenerCount("secureConnect") > 0 ||
         (isIP(host) === 0 && socket.listenerCount("lookup") > 0);
+    }
+
+    // Whether a request written to a socket that is still connecting waits
+    // in the socket's own queue for 'connect' -- oam's net.Socket and
+    // TLSSocket, whose queue the agent path stands in for by starting the
+    // exchange on 'connect' -- or reaches the socket at once. node's
+    // ClientRequest writes the request into its socket as soon as it has
+    // one (onSocketNT's _flush), connected or not, so a socket with a
+    // write() of its own sees the request while it is connecting: a test
+    // double such as nock's MockHttpSocket answers the request it is
+    // written and only then emits 'connect'.
+    function writeWaitsForConnect(socket) {
+      var tls = registry._tlsStock;
+      return socket.write === registry._netStock.socketWrite ||
+        (tls !== undefined && socket.write === tls.socketWrite);
     }
 
     function isSocketLike(socket) {
@@ -24016,7 +24226,7 @@
         var socket = this.socket;
         if (!socket || (socket.destroyed && !this._socketGone) || this._aborted) return;
         var self = this;
-        if (socket.connecting && !this._socketGone) {
+        if (socket.connecting && !this._socketGone && writeWaitsForConnect(socket)) {
           // A dispatched request's head is a write queued behind the
           // socket's handshake, in node's terms (its ClientRequest writes it
           // into the socket's queue): a handshake the server refuses with an
@@ -24056,7 +24266,7 @@
           }
           return;
         }
-        if (!this._socketGone) this._socketConnected = true;
+        if (!this._socketGone && !socket.connecting) this._socketConnected = true;
         this._exchangeQueued = true;
         process.nextTick(function () {
           if ((socket.destroyed && !self._socketGone) || self._aborted || self.destroyed) return;
@@ -24872,6 +25082,18 @@
         // (or one after abort()), or one after the response has ended or
         // the request has failed, is silent.
         if (this._aborted || this.destroyed) return this;
+        // A subclass that built itself with `http.OutgoingMessage.call(this)`
+        // instead of this constructor (nock's OverriddenClientRequest) has
+        // node's OutgoingMessage state and none of the transport state the
+        // teardown below works on (`_writeCallbacks` is the constructor's):
+        // node's own destroy() then, statement for statement.
+        if (this._writeCallbacks === undefined) {
+          this.destroyed = true;
+          if (this.res) this.res._dump();
+          this.errored = err;
+          if (this.socket) this.socket.destroy(err);
+          return this;
+        }
         this._aborted = true;
         this._tearDown(!err, err);
         return this;
@@ -25012,6 +25234,8 @@
     function request(input, options, callback) {
       return new ClientRequest(input, options, callback);
     }
+    // https.request's, whatever has been done to http.request since.
+    registry._httpRequest = request;
 
     function get(input, options, callback) {
       var req = request(input, options, callback);
@@ -25613,9 +25837,27 @@
         this.headersSent = false;
         this.sendDate = true;
         this.finished = false;
-        this.writableEnded = false;
-        this.writableFinished = false;
         this._headers = {};
+      }
+      // node's: accessors over `finished`, so a subclass that keeps its own
+      // state (ClientRequest, ServerResponse) and one that calls
+      // `OutgoingMessage.call(this)` see the same thing.
+      get writableEnded() {
+        return this.finished;
+      }
+      get writableFinished() {
+        return this.finished;
+      }
+      // node's OutgoingMessage#destroy: the message's socket goes with it
+      // (once it has one). A test double that builds a ServerResponse over
+      // its own socket destroys it this way (nock, on a socket error).
+      destroy(error) {
+        if (this.destroyed) return this;
+        this.destroyed = true;
+        this.errored = error;
+        if (this.socket) this.socket.destroy(error);
+        else this.once("socket", (socket) => socket.destroy(error));
+        return this;
       }
       setHeader(name, value) {
         if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("set");
@@ -25652,6 +25894,12 @@
       }
     }
     Object.setPrototypeOf(ServerResponse.prototype, OutgoingMessage.prototype);
+    // node's ClientRequest is an OutgoingMessage too: `req instanceof
+    // http.OutgoingMessage` holds, and a subclass that builds itself with
+    // `http.OutgoingMessage.call(this)` (nock's OverriddenClientRequest)
+    // gets the fields ClientRequest's header methods use. ClientRequest
+    // defines every method it uses, so nothing it does changes.
+    Object.setPrototypeOf(ClientRequest.prototype, OutgoingMessage.prototype);
 
     // Node's http constructors are old-style functions callable via
     // `Super.call(this, ...)` (util.inherits). ES6 classes reject that, so wrap
@@ -25724,7 +25972,8 @@
       },
       validateHeaderName,
       validateHeaderValue,
-      METHODS: ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
+      // node's: every HTTP method its parser takes, sorted.
+      METHODS: HTTP_METHODS.slice().sort(),
       STATUS_CODES: {
         100: "Continue", 101: "Switching Protocols", 102: "Processing", 103: "Early Hints",
         200: "OK", 201: "Created", 202: "Accepted", 203: "Non-Authoritative Information",
@@ -25758,6 +26007,1245 @@
       set(value) { agentState.globalAgent = value; },
     });
     return httpExports;
+  };
+
+  // ------------------------------------------------------ node:_http_common
+  // node's lib/_http_common.js (v22.22.2): the HTTP/1 parser the http
+  // module is built on, and the helpers around it. Programs reach for it to
+  // parse HTTP themselves -- nock 14's interceptors (@mswjs/interceptors)
+  // run every request a ClientRequest writes, and every response, through
+  // `new HTTPParser()` -- so the module is all of node's exports, and
+  // HTTPParser is node's callback protocol over an HTTP/1 parser held to
+  // llhttp's strict rules (lenient flags as node's `insecureHTTPParser`
+  // passes them). oam's own server and client parse in the transport; this
+  // parser serves the programs that use the class, and oam's undici
+  // MockAgent (js/undici.js), which reads the requests it intercepts with it.
+  //
+  // What it does as node's does, measured against node v22.22.2's parser
+  // over the same bytes, split at every point a test splits them: which
+  // callback runs when, with which arguments (kOnMessageBegin at a
+  // message's first byte; kOnHeaders with fields in batches of 31 once a
+  // head has 32 or more, and with a chunked body's trailers;
+  // kOnHeadersComplete's nine arguments -- llhttp's method index, the url,
+  // status and reason, upgrade, keep-alive -- and its return value: 1
+  // skips the body, 2 also upgrades; kOnBody with each slice of the body;
+  // kOnMessageComplete), what execute() returns (the bytes it parsed -- a
+  // head's length on an upgrade, a CONNECT or a 101 -- or the parse
+  // error, with node's code, reason and the offset llhttp reports), and
+  // finish(). Body framing, keep-alive and the head-size limit are llhttp's.
+  // Not modelled: llhttp's HTTP/2 preface handling for a PRI request, and
+  // the stream hooks a native server attaches (consume, pause, timers) --
+  // see docs/node-divergences.md.
+  registry.factories["_http_common"] = (natives) => {
+    const Buffer = globalThis.Buffer;
+    const defaultMaxHeaderSize = () => natives.httpMaxHeaderSize();
+    const ALL_METHODS = LLHTTP_METHODS;
+    const CONNECT = 5;
+    const PRI = 34;
+    const isHttpMethod = isLlhttpHttpMethod;
+    // node's export: the binding's array, the caller's to change.
+    const methods = HTTP_METHODS.slice();
+    // Every proper prefix of a method name, for llhttp's byte-at-a-time match.
+    const METHOD_PREFIXES = new Set();
+    const METHOD_INDEX = new Map();
+    for (let i = 0; i < ALL_METHODS.length; i++) {
+      const name = ALL_METHODS[i];
+      METHOD_INDEX.set(name, i);
+      for (let j = 1; j < name.length; j++) METHOD_PREFIXES.add(name.slice(0, j));
+    }
+
+    // RFC 9110 tchar.
+    const TOKEN = new Uint8Array(256);
+    for (const c of "!#$%&'*+-.^_`|~") TOKEN[c.charCodeAt(0)] = 1;
+    for (let c = 0x30; c <= 0x39; c++) TOKEN[c] = 1;
+    for (let c = 0x41; c <= 0x5a; c++) TOKEN[c] = 1;
+    for (let c = 0x61; c <= 0x7a; c++) TOKEN[c] = 1;
+
+    const REQUEST = 1;
+    const RESPONSE = 2;
+    const kOnMessageBegin = 0;
+    const kOnHeaders = 1;
+    const kOnHeadersComplete = 2;
+    const kOnBody = 3;
+    const kOnMessageComplete = 4;
+    const kOnExecute = 5;
+    const kOnTimeout = 6;
+    // node's kMaxHeaderFieldsCount: fields are handed to kOnHeaders in
+    // batches once a head has more than this many.
+    const MAX_FIELDS = 32;
+
+    const kLenientNone = 0;
+    const kLenientHeaders = 1;
+    const kLenientChunkedLength = 2;
+    const kLenientKeepAlive = 4;
+    const kLenientTransferEncoding = 8;
+    const kLenientVersion = 16;
+    const kLenientDataAfterClose = 32;
+    const kLenientOptionalLFAfterCR = 64;
+    const kLenientOptionalCRLFAfterChunk = 128;
+    const kLenientOptionalCRBeforeLF = 256;
+    const kLenientSpacesAfterChunkSize = 512;
+    const kLenientAll = 1023;
+
+    // Parser states.
+    const S_START = 0;
+    const S_CLOSED = 1;
+    const S_METHOD = 2;
+    const S_URL_START = 3;
+    const S_URL = 4;
+    const S_REQ_PROTO = 5;
+    const S_RES_PROTO = 6;
+    const S_MAJOR = 7;
+    const S_DOT = 8;
+    const S_MINOR = 9;
+    const S_REQ_LINE_END = 10;
+    const S_LINE_LF = 11;
+    const S_STATUS_START = 12;
+    const S_STATUS = 13;
+    const S_STATUS_END = 14;
+    const S_REASON = 15;
+    const S_FIELD_START = 16;
+    const S_FIELD = 17;
+    const S_VALUE_OWS = 18;
+    const S_VALUE = 19;
+    const S_VALUE_LF = 20;
+    const S_HEAD_END_LF = 21;
+    const S_BODY_LENGTH = 22;
+    const S_CHUNK_SIZE_START = 23;
+    const S_CHUNK_SIZE = 24;
+    const S_CHUNK_EXT = 25;
+    const S_CHUNK_SIZE_LF = 26;
+    const S_CHUNK_DATA = 27;
+    const S_CHUNK_DATA_CR = 28;
+    const S_CHUNK_DATA_LF = 29;
+    const S_BODY_EOF = 30;
+    const S_UPGRADED = 31;
+    const S_ERROR = 32;
+
+    const HTTP_SLASH = "HTTP/";
+    const MAX_SAFE = Number.MAX_SAFE_INTEGER;
+    const U64_MAX = 18446744073709551615n;
+
+    function parseError(code, reason, bytesParsed) {
+      const err = new Error("Parse Error");
+      err.bytesParsed = bytesParsed;
+      err.code = code;
+      err.reason = reason;
+      return err;
+    }
+
+    class HTTPParser {
+      // The parse state, out of sight: node's parser has no own properties.
+      #p = null;
+
+      initialize(type, resource, maxHeaderSize, lenient) {
+        if (type !== REQUEST && type !== RESPONSE) {
+          throw new TypeError("The type must be HTTPParser.REQUEST or HTTPParser.RESPONSE");
+        }
+        const max = maxHeaderSize > 0 ? maxHeaderSize : defaultMaxHeaderSize();
+        this.#p = {
+          type,
+          max,
+          lenient: lenient >>> 0,
+          state: S_START,
+          error: null,
+          buffer: null,
+          // The message being parsed.
+          tok: "",
+          method: -1,
+          url: "",
+          urlPart: 0,
+          major: 0,
+          minor: 0,
+          status: 0,
+          reason: "",
+          fields: [],
+          field: "",
+          value: "",
+          valueEnd: 0,
+          flushed: false,
+          nread: 0,
+          trailers: false,
+          // Framing facts, from the head.
+          contentLength: -1,
+          teSeen: false,
+          chunked: false,
+          teBad: false,
+          connClose: false,
+          connKeepAlive: false,
+          connUpgrade: false,
+          upgradeHeader: false,
+          keepAlive: false,
+          remaining: 0,
+          hexDigits: 0,
+        };
+      }
+
+      // The bytes of the current execute() (node: the buffer being parsed,
+      // what prepareError hands on as `rawPacket`).
+      getCurrentBuffer() {
+        const p = this.#p;
+        return p && p.buffer ? Buffer.from(p.buffer) : Buffer.alloc(0);
+      }
+
+      execute(data) {
+        const p = this.#p;
+        if (p === null) throw new TypeError("The parser is not initialized");
+        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+        p.buffer = buf;
+        try {
+          return run(this, p, buf);
+        } finally {
+          p.buffer = null;
+        }
+      }
+
+      finish() {
+        const p = this.#p;
+        if (p === null) return undefined;
+        switch (p.state) {
+          case S_START:
+          case S_CLOSED:
+          case S_UPGRADED:
+          case S_ERROR:
+            return undefined;
+          case S_BODY_EOF:
+            p.state = S_CLOSED;
+            messageComplete(this, p);
+            return undefined;
+          default:
+            return parseError("HPE_INVALID_EOF_STATE", "Invalid EOF state", 0);
+        }
+      }
+
+      // node's stream hooks (a parser consumed by a native stream, its idle
+      // timer, flow control): oam's parser is only ever fed by execute().
+      pause() {}
+      resume() {}
+      consume() {}
+      unconsume() {}
+      remove() {}
+      close() {}
+      free() {}
+    }
+    const statics = {
+      REQUEST, RESPONSE,
+      kOnMessageBegin, kOnHeaders, kOnHeadersComplete, kOnBody, kOnMessageComplete, kOnExecute,
+      kOnTimeout,
+      kLenientNone, kLenientHeaders, kLenientChunkedLength, kLenientKeepAlive,
+      kLenientTransferEncoding, kLenientVersion, kLenientDataAfterClose, kLenientOptionalLFAfterCR,
+      kLenientOptionalCRLFAfterChunk, kLenientOptionalCRBeforeLF, kLenientSpacesAfterChunkSize,
+      kLenientAll,
+    };
+    for (const key of Object.keys(statics)) {
+      Object.defineProperty(HTTPParser, key, { value: statics[key], enumerable: true });
+    }
+
+    // A callback by its index, with exactly the arguments node passes.
+    function call(parser, index, ...args) {
+      const fn = parser[index];
+      if (typeof fn !== "function") return undefined;
+      return Reflect.apply(fn, parser, args);
+    }
+
+    function resetMessage(p) {
+      p.tok = "";
+      p.method = -1;
+      p.url = "";
+      p.urlPart = 0;
+      p.major = 0;
+      p.minor = 0;
+      p.status = 0;
+      p.reason = "";
+      p.fields = [];
+      p.field = "";
+      p.value = "";
+      p.flushed = false;
+      p.nread = 0;
+      p.trailers = false;
+      p.contentLength = -1;
+      p.teSeen = false;
+      p.chunked = false;
+      p.teBad = false;
+      p.connClose = false;
+      p.connKeepAlive = false;
+      p.connUpgrade = false;
+      p.upgradeHeader = false;
+      p.keepAlive = false;
+      p.remaining = 0;
+      p.hexDigits = 0;
+    }
+
+    // node's Flush: the fields gathered so far, and the url the first time.
+    function flush(parser, p) {
+      const fields = p.fields;
+      p.fields = [];
+      const url = p.url;
+      p.url = "";
+      p.flushed = true;
+      call(parser, kOnHeaders, fields, url);
+    }
+
+    // node's header byte count (TrackHeader): the url, the status text and
+    // every field name and value; at or past the limit the head overflows.
+    function track(p, length) {
+      p.nread += length;
+      return p.nread >= p.max;
+    }
+
+    // llhttp_should_keep_alive.
+    function shouldKeepAlive(p) {
+      if (p.major > 0 && p.minor > 0) {
+        if (p.connClose) return false;
+      } else if (!p.connKeepAlive) {
+        return false;
+      }
+      return !needsEof(p);
+    }
+
+    function needsEof(p) {
+      if (p.type === REQUEST) return false;
+      if ((p.status / 100 | 0) === 1 || p.status === 204 || p.status === 304 || p.skipBody) return false;
+      if (p.teSeen && !p.chunked) return true;
+      if (p.chunked || p.contentLength >= 0) return false;
+      return true;
+    }
+
+    function messageComplete(parser, p) {
+      if (p.trailers && p.fields.length > 0) flush(parser, p);
+      call(parser, kOnMessageComplete);
+    }
+
+    // A field's name and value are both in: the framing facts it carries.
+    // Returns an error, or null.
+    function fieldDone(p) {
+      const name = p.field.toLowerCase();
+      const value = p.value;
+      p.fields.push(p.field, value);
+      if (p.trailers) return null;
+      if (name === "connection") {
+        for (const token of value.toLowerCase().split(",")) {
+          const t = token.trim();
+          if (t === "close") p.connClose = true;
+          else if (t === "keep-alive") p.connKeepAlive = true;
+          else if (t === "upgrade") p.connUpgrade = true;
+        }
+      } else if (name === "upgrade") {
+        p.upgradeHeader = true;
+      }
+      return null;
+    }
+
+    // The checks llhttp makes as a value starts (right after the colon):
+    // Content-Length and Transfer-Encoding together.
+    function valueStart(p, i) {
+      p.fieldKind = 0;
+      if (p.trailers) return null;
+      const name = p.field.toLowerCase();
+      p.fieldKind = name === "content-length" ? 1 : name === "transfer-encoding" ? 2 : 0;
+      if (p.fieldKind === 1 && p.teSeen && !(p.lenient & kLenientChunkedLength)) {
+        return parseError("HPE_INVALID_CONTENT_LENGTH", "Content-Length can't be present with Transfer-Encoding", i);
+      }
+      if (p.fieldKind === 2 && p.contentLength >= 0 && !(p.lenient & kLenientChunkedLength)) {
+        return parseError("HPE_INVALID_TRANSFER_ENCODING", "Transfer-Encoding can't be present with Content-Length", i);
+      }
+      return null;
+    }
+
+    // A Content-Length / Transfer-Encoding value, complete. `start` is the
+    // index of its first byte in this buffer (or -1 when it began in an
+    // earlier one), `end` the index of the CR ending it.
+    function framingValue(p, start, end) {
+      const value = p.value;
+      if (p.fieldKind === 1) {
+        if (p.contentLength >= 0) {
+          return parseError("HPE_UNEXPECTED_CONTENT_LENGTH", "Duplicate Content-Length", start < 0 ? 0 : start);
+        }
+        if (value.length === 0) {
+          return parseError("HPE_INVALID_CONTENT_LENGTH", "Empty Content-Length", end + 2);
+        }
+        // Digits only (OWS inside is refused at the byte after it), up to
+        // llhttp's 64-bit limit. `at(k)`: the buffer index of value byte k.
+        const at = (k) => Math.max(0, end - (value.length - k));
+        let n = 0;
+        let big = null;
+        for (let k = 0; k < value.length; k++) {
+          const c = value.charCodeAt(k);
+          if (c < 0x30 || c > 0x39) {
+            let bad = k;
+            while (bad < value.length - 1 && (value.charCodeAt(bad) === 0x20 || value.charCodeAt(bad) === 0x09)) bad++;
+            return parseError("HPE_INVALID_CONTENT_LENGTH", "Invalid character in Content-Length", at(bad));
+          }
+          if (big === null) {
+            n = n * 10 + (c - 0x30);
+            if (n > MAX_SAFE) big = BigInt(value.slice(0, k + 1));
+          } else {
+            big = big * 10n + BigInt(c - 0x30);
+          }
+          if (big !== null && big > U64_MAX) {
+            return parseError("HPE_INVALID_CONTENT_LENGTH", "Content-Length overflow", at(k) + 1);
+          }
+        }
+        p.contentLength = big === null ? n : Number(big);
+      } else if (p.fieldKind === 2) {
+        // Codings, comma-separated; chunked counts only as the last one.
+        // A request's coding after chunked is refused where llhttp refuses
+        // it: just past the comma, or one byte into a later header's value.
+        p.teSeen = true;
+        let offset = 0;
+        const codings = value.split(",");
+        for (let k = 0; k < codings.length; k++) {
+          const raw = codings[k];
+          if (p.chunked && p.type === REQUEST && !(p.lenient & kLenientTransferEncoding)) {
+            const at = start < 0 ? 0 : k === 0 ? start + 1 : start + offset;
+            return parseError("HPE_INVALID_TRANSFER_ENCODING", "Invalid `Transfer-Encoding` header value", at);
+          }
+          p.chunked = raw.trim().toLowerCase() === "chunked";
+          offset += raw.length + 1;
+        }
+      }
+      return null;
+    }
+
+    // The head is in. Returns the index to resume at, or an Error; sets the
+    // body state.
+    function headersComplete(parser, p, i) {
+      const upgrade = (p.upgradeHeader && p.connUpgrade) || (p.type === REQUEST && p.method === CONNECT);
+      p.upgrade = upgrade;
+      p.skipBody = false;
+      p.keepAlive = shouldKeepAlive(p);
+      let headers = p.fields;
+      let url = p.url;
+      if (p.flushed) {
+        flush(parser, p);
+        headers = undefined;
+        url = undefined;
+      } else {
+        p.fields = [];
+      }
+      let ret;
+      if (p.type === REQUEST) {
+        ret = call(parser, kOnHeadersComplete, p.major, p.minor, headers, p.method, url,
+          undefined, undefined, upgrade, p.keepAlive);
+      } else {
+        ret = call(parser, kOnHeadersComplete, p.major, p.minor, headers, undefined, undefined,
+          p.status, p.reason, upgrade, p.keepAlive);
+      }
+      // The url stays for a trailer flush, as node's does (a head that was
+      // flushed already handed it on).
+      if (!p.flushed) p.url = url;
+      p.trailers = true;
+      let stop = upgrade;
+      if (ret === 1 || ret === 2) {
+        p.skipBody = true;
+        if (ret === 2) {
+          stop = true;
+          p.upgrade = true;
+        }
+      }
+      if (p.type === REQUEST && p.teSeen && !p.chunked && !(p.lenient & kLenientTransferEncoding)) {
+        return parseError("HPE_INVALID_TRANSFER_ENCODING", "Request has invalid `Transfer-Encoding`", i);
+      }
+      const informational = p.type === RESPONSE && (p.status / 100 | 0) === 1;
+      if (p.status === 101) stop = true;
+      if (p.skipBody || (stop && !(p.chunked || p.contentLength > 0)) ||
+          (p.type === RESPONSE && (informational || p.status === 204 || p.status === 304))) {
+        return endMessage(parser, p, i, stop);
+      }
+      if (p.chunked) {
+        p.state = S_CHUNK_SIZE_START;
+      } else if (p.contentLength > 0) {
+        p.remaining = p.contentLength;
+        p.state = S_BODY_LENGTH;
+      } else if (p.contentLength === 0 || p.type === REQUEST) {
+        return endMessage(parser, p, i, stop);
+      } else {
+        p.state = S_BODY_EOF;
+      }
+      p.upgradeAfterBody = stop;
+      return i;
+    }
+
+    // A message is over at `i`: what comes next. `stop` ends this execute()
+    // there: an upgrade (llhttp pauses for good) or a 101 without one (the
+    // next execute() goes on with the next message).
+    function endMessage(parser, p, i, stop) {
+      const keepAlive = p.keepAlive;
+      const upgrade = stop && p.upgrade;
+      p.state = upgrade ? S_UPGRADED : keepAlive ? S_START : S_CLOSED;
+      p.resumed = false;
+      messageComplete(parser, p);
+      if (stop) return -1 - i;
+      return i;
+    }
+
+    function lenientLF(p) {
+      return (p.lenient & kLenientOptionalCRBeforeLF) !== 0;
+    }
+
+    // The parse loop over `buf`. Returns the bytes parsed, or an Error.
+    function run(parser, p, buf) {
+      if (p.state === S_ERROR) {
+        return parseError(p.error.code, p.error.reason, 0);
+      }
+      if (p.state === S_UPGRADED) {
+        // llhttp, paused on an upgrade, is resumed by the next execute(): it
+        // starts a message (a kept-alive connection) or takes one byte of a
+        // closed one, and parses nothing more.
+        if (p.resumed) return 0;
+        p.resumed = true;
+        if (p.keepAlive) {
+          call(parser, kOnMessageBegin);
+          return 0;
+        }
+        return Math.min(1, buf.length);
+      }
+      const len = buf.length;
+      let i = 0;
+      let mark = -1; // start of a span (url, reason, field, value) in buf
+      const fail = (err) => {
+        p.state = S_ERROR;
+        p.error = err;
+        return err;
+      };
+      while (i < len) {
+        const c = buf[i];
+        switch (p.state) {
+          case S_START: {
+            if (c === 0x0d || c === 0x0a) {
+              i++;
+              continue;
+            }
+            resetMessage(p);
+            call(parser, kOnMessageBegin);
+            if (p.type === REQUEST) {
+              p.state = S_METHOD;
+            } else {
+              p.state = S_RES_PROTO;
+              p.tok = "";
+            }
+            continue;
+          }
+          case S_CLOSED: {
+            if (c === 0x0d || c === 0x0a) {
+              i++;
+              continue;
+            }
+            if (p.lenient & (kLenientKeepAlive | kLenientDataAfterClose)) {
+              p.state = S_START;
+              continue;
+            }
+            return fail(parseError("HPE_CLOSED_CONNECTION", "Data after `Connection: close`", i + 1));
+          }
+          case S_METHOD: {
+            if (c === 0x20) {
+              const index = METHOD_INDEX.get(p.tok);
+              if (index === undefined) {
+                return fail(parseError("HPE_INVALID_METHOD", "Invalid method encountered", i));
+              }
+              p.method = index;
+              p.state = S_URL_START;
+              i++;
+              continue;
+            }
+            const next = p.tok + String.fromCharCode(c);
+            if (!METHOD_PREFIXES.has(next) && !METHOD_INDEX.has(next)) {
+              return fail(parseError("HPE_INVALID_METHOD", "Invalid method encountered", i));
+            }
+            p.tok = next;
+            i++;
+            continue;
+          }
+          case S_URL_START: {
+            if (c === 0x20) {
+              i++;
+              continue;
+            }
+            p.state = S_URL;
+            p.urlPart = 0;
+            mark = i;
+            continue;
+          }
+          case S_URL: {
+            // Scan the url's bytes in one go.
+            let j = i;
+            while (j < len) {
+              const b = buf[j];
+              if (b === 0x20) break;
+              if (b < 0x21 || b > 0x7e) break;
+              if (b === 0x3f && p.urlPart === 0) p.urlPart = 1;
+              else if (b === 0x23 && p.urlPart < 2) p.urlPart = 2;
+              j++;
+            }
+            if (j > i) {
+              p.url += buf.latin1Slice(i, j);
+              if (track(p, j - i) && j < len) {
+                return fail(parseError("HPE_HEADER_OVERFLOW", "Header overflow", j + 1));
+              }
+            }
+            i = j;
+            if (i >= len) continue;
+            const b = buf[i];
+            if (b === 0x20) {
+              p.state = S_REQ_PROTO;
+              p.tok = "";
+              i++;
+              continue;
+            }
+            if (b === 0x09) return fail(parseError("HPE_INVALID_URL", "Invalid characters in url", i + 1));
+            const part = p.urlPart === 0 ? "path" : p.urlPart === 1 ? "query" : "fragment start";
+            return fail(parseError("HPE_INVALID_URL", "Invalid char in url " + part, i));
+          }
+          case S_REQ_PROTO:
+          case S_RES_PROTO: {
+            if (p.state === S_REQ_PROTO && c === 0x20 && p.tok === "") {
+              i++;
+              continue;
+            }
+            const k = p.tok.length;
+            if (c !== HTTP_SLASH.charCodeAt(k)) {
+              return fail(p.state === S_RES_PROTO
+                ? parseError("HPE_INVALID_CONSTANT", "Expected HTTP/, RTSP/ or ICE/", i)
+                : parseError("HPE_INVALID_CONSTANT", "Expected HTTP/", i));
+            }
+            if (k === 4) {
+              if (p.state === S_REQ_PROTO && !isHttpMethod(p.method) && p.method !== PRI) {
+                return fail(parseError("HPE_INVALID_CONSTANT", "Invalid method for HTTP/x.x request", i));
+              }
+              p.versionNext = p.state === S_REQ_PROTO ? S_REQ_LINE_END : S_STATUS_START;
+              p.state = S_MAJOR;
+            } else {
+              p.tok += String.fromCharCode(c);
+            }
+            i++;
+            continue;
+          }
+          case S_MAJOR: {
+            if (c < 0x30 || c > 0x39) return fail(parseError("HPE_INVALID_VERSION", "Invalid major version", i));
+            p.major = c - 0x30;
+            p.state = S_DOT;
+            i++;
+            continue;
+          }
+          case S_DOT: {
+            if (c !== 0x2e) return fail(parseError("HPE_INVALID_VERSION", "Expected dot", i));
+            p.state = S_MINOR;
+            i++;
+            continue;
+          }
+          case S_MINOR: {
+            if (c < 0x30 || c > 0x39) return fail(parseError("HPE_INVALID_VERSION", "Invalid minor version", i));
+            p.minor = c - 0x30;
+            const v = p.major * 10 + p.minor;
+            if (!(p.lenient & kLenientVersion) && v !== 9 && v !== 10 && v !== 11 && v !== 20) {
+              return fail(parseError("HPE_INVALID_VERSION", "Invalid HTTP version", i + 1));
+            }
+            if (p.method === PRI && p.type === REQUEST) {
+              return fail(parseError("HPE_PAUSED_H2_UPGRADE", "Pause on PRI/Upgrade", i + 1));
+            }
+            p.state = p.versionNext;
+            i++;
+            continue;
+          }
+          case S_REQ_LINE_END: {
+            if (c === 0x0d) {
+              p.state = S_LINE_LF;
+              i++;
+              continue;
+            }
+            if (c === 0x0a && lenientLF(p)) {
+              p.state = S_FIELD_START;
+              i++;
+              continue;
+            }
+            return fail(parseError("HPE_INVALID_VERSION", "Expected CRLF after version", c === 0x0a ? i + 1 : i));
+          }
+          case S_LINE_LF: {
+            if (c !== 0x0a) {
+              if (p.lenient & kLenientOptionalLFAfterCR) {
+                p.state = S_FIELD_START;
+                continue;
+              }
+              return fail(parseError("HPE_STRICT", "Expected LF after CR", i));
+            }
+            p.state = S_FIELD_START;
+            i++;
+            continue;
+          }
+          case S_STATUS_START: {
+            if (c !== 0x20) return fail(parseError("HPE_INVALID_VERSION", "Expected space after version", i));
+            p.state = S_STATUS;
+            p.status = 0;
+            p.statusDigits = 0;
+            i++;
+            continue;
+          }
+          case S_STATUS: {
+            if (c >= 0x30 && c <= 0x39) {
+              if (p.statusDigits === 3) {
+                return fail(parseError("HPE_INVALID_STATUS", "Invalid response status", i));
+              }
+              p.status = p.status * 10 + (c - 0x30);
+              p.statusDigits++;
+              i++;
+              continue;
+            }
+            if (p.statusDigits !== 3) return fail(parseError("HPE_INVALID_STATUS", "Invalid status code", i));
+            p.state = S_STATUS_END;
+            continue;
+          }
+          case S_STATUS_END: {
+            if (c === 0x20) {
+              p.state = S_REASON;
+              mark = i + 1;
+              i++;
+              continue;
+            }
+            if (c === 0x0d) {
+              p.state = S_LINE_LF;
+              i++;
+              continue;
+            }
+            if (c === 0x0a && lenientLF(p)) {
+              p.state = S_FIELD_START;
+              i++;
+              continue;
+            }
+            return fail(parseError("HPE_INVALID_STATUS", "Invalid response status", i));
+          }
+          case S_REASON: {
+            let j = i;
+            while (j < len && buf[j] !== 0x0d && buf[j] !== 0x0a) j++;
+            if (j > i) {
+              p.reason += buf.latin1Slice(i, j);
+              if (track(p, j - i) && j < len) {
+                return fail(parseError("HPE_HEADER_OVERFLOW", "Header overflow", j + 1));
+              }
+            }
+            i = j;
+            if (i >= len) continue;
+            if (buf[i] === 0x0a && !lenientLF(p)) {
+              return fail(parseError("HPE_CR_EXPECTED", "Missing expected CR after response line", i + 1));
+            }
+            p.state = buf[i] === 0x0d ? S_LINE_LF : S_FIELD_START;
+            i++;
+            continue;
+          }
+          case S_FIELD_START: {
+            if (c === 0x0d) {
+              p.state = S_HEAD_END_LF;
+              i++;
+              continue;
+            }
+            if (c === 0x0a && lenientLF(p)) {
+              p.state = S_HEAD_END_LF;
+              continue;
+            }
+            if (c === 0x20 || c === 0x09) {
+              if (p.lenient & kLenientHeaders && p.fields.length > 0) {
+                // obs-fold, accepted leniently: joins the previous value.
+                p.state = S_VALUE_OWS;
+                p.field = p.fields[p.fields.length - 2];
+                p.value = p.fields.pop() + " ";
+                p.fields.pop();
+                i++;
+                continue;
+              }
+              return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Unexpected whitespace after header value", i));
+            }
+            if (!TOKEN[c]) return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header token", i));
+            // A 32nd field: the gathered ones go to kOnHeaders first.
+            if (p.fields.length === (MAX_FIELDS - 1) * 2) flush(parser, p);
+            p.field = "";
+            p.value = "";
+            p.state = S_FIELD;
+            continue;
+          }
+          case S_FIELD: {
+            let j = i;
+            while (j < len && TOKEN[buf[j]]) j++;
+            if (j > i) {
+              p.field += buf.latin1Slice(i, j);
+              if (track(p, j - i) && j < len) {
+                return fail(parseError("HPE_HEADER_OVERFLOW", "Header overflow", j + 1));
+              }
+            }
+            i = j;
+            if (i >= len) continue;
+            if (buf[i] !== 0x3a) return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header token", i));
+            i++;
+            const err = valueStart(p, i);
+            if (err) return fail(err);
+            p.state = S_VALUE_OWS;
+            p.valueStart = -1;
+            continue;
+          }
+          case S_VALUE_OWS: {
+            if (c === 0x20 || c === 0x09) {
+              i++;
+              continue;
+            }
+            if (p.fieldKind === 1 && p.contentLength >= 0 && c !== 0x0d && c !== 0x0a) {
+              return fail(parseError("HPE_UNEXPECTED_CONTENT_LENGTH", "Duplicate Content-Length", i));
+            }
+            p.state = S_VALUE;
+            p.valueStart = i;
+            continue;
+          }
+          case S_VALUE: {
+            let j = i;
+            const lenientHeaders = (p.lenient & kLenientHeaders) !== 0;
+            while (j < len) {
+              const b = buf[j];
+              if (b === 0x0d || b === 0x0a) break;
+              if ((b < 0x20 && b !== 0x09) || b === 0x7f) {
+                if (!lenientHeaders) break;
+              }
+              j++;
+            }
+            if (j > i) p.value += buf.latin1Slice(i, j);
+            i = j;
+            if (i >= len) continue;
+            const b = buf[i];
+            if (b !== 0x0d && b !== 0x0a) {
+              return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header value char", i));
+            }
+            if (b === 0x0a && !lenientLF(p)) {
+              return fail(parseError("HPE_CR_EXPECTED", "Missing expected CR after header value", i));
+            }
+            // OWS after the value is not part of it.
+            let v = p.value;
+            let e = v.length;
+            while (e > 0 && (v.charCodeAt(e - 1) === 0x20 || v.charCodeAt(e - 1) === 0x09)) e--;
+            if (e !== v.length) p.value = v = v.slice(0, e);
+            if (track(p, v.length)) {
+              return fail(parseError("HPE_HEADER_OVERFLOW", "Header overflow", i + 1));
+            }
+            if (p.fieldKind) {
+              const err = framingValue(p, p.valueStart, i);
+              if (err) return fail(err);
+            }
+            const err = fieldDone(p);
+            if (err) return fail(err);
+            if (b === 0x0a) {
+              p.state = S_FIELD_START;
+            } else {
+              p.state = S_VALUE_LF;
+            }
+            i++;
+            continue;
+          }
+          case S_VALUE_LF: {
+            if (c !== 0x0a) {
+              if (p.lenient & kLenientOptionalLFAfterCR) {
+                p.state = S_FIELD_START;
+                continue;
+              }
+              return fail(parseError("HPE_LF_EXPECTED", "Missing expected LF after header value", i));
+            }
+            p.state = S_FIELD_START;
+            i++;
+            continue;
+          }
+          case S_HEAD_END_LF: {
+            if (c !== 0x0a) {
+              if (!(p.lenient & kLenientOptionalLFAfterCR)) {
+                return fail(parseError("HPE_STRICT", "Expected LF after headers", i));
+              }
+            } else {
+              i++;
+            }
+            if (p.trailers) {
+              // The end of a chunked body's trailer section.
+              const r = endMessage(parser, p, i, p.upgradeAfterBody);
+              if (r < 0) return -1 - r;
+              continue;
+            }
+            const r = headersComplete(parser, p, i);
+            if (r instanceof Error) return fail(r);
+            if (r < 0) return -1 - r;
+            continue;
+          }
+          case S_BODY_LENGTH: {
+            const n = Math.min(p.remaining, len - i);
+            p.remaining -= n;
+            const chunk = buf.subarray(i, i + n);
+            i += n;
+            call(parser, kOnBody, chunk);
+            if (p.remaining === 0) {
+              const r = endMessage(parser, p, i, p.upgradeAfterBody);
+              if (r < 0) return -1 - r;
+            }
+            continue;
+          }
+          case S_BODY_EOF: {
+            const chunk = buf.subarray(i, len);
+            i = len;
+            call(parser, kOnBody, chunk);
+            continue;
+          }
+          case S_CHUNK_SIZE_START: {
+            p.remaining = 0;
+            p.hexDigits = 0;
+            p.hexSignificant = 0;
+            p.state = S_CHUNK_SIZE;
+            continue;
+          }
+          case S_CHUNK_SIZE: {
+            const h = c >= 0x30 && c <= 0x39 ? c - 0x30
+              : c >= 0x41 && c <= 0x46 ? c - 0x37
+              : c >= 0x61 && c <= 0x66 ? c - 0x57 : -1;
+            if (h >= 0) {
+              // llhttp's 64-bit limit: a 17th significant hex digit.
+              if (p.remaining > 0 || h > 0) p.hexSignificant++;
+              p.remaining = p.remaining * 16 + h;
+              p.hexDigits++;
+              if (p.hexSignificant > 16) {
+                return fail(parseError("HPE_INVALID_CHUNK_SIZE", "Chunk size overflow", i + 1));
+              }
+              i++;
+              continue;
+            }
+            if (p.hexDigits === 0) {
+              return fail(parseError("HPE_INVALID_CHUNK_SIZE", "Invalid character in chunk size", i));
+            }
+            if (c === 0x3b) {
+              p.state = S_CHUNK_EXT;
+              i++;
+              continue;
+            }
+            if (c === 0x0d) {
+              p.state = S_CHUNK_SIZE_LF;
+              i++;
+              continue;
+            }
+            if (c === 0x0a) {
+              if (lenientLF(p)) {
+                p.state = S_CHUNK_SIZE_LF;
+                continue;
+              }
+              return fail(parseError("HPE_CR_EXPECTED", "Missing expected CR after chunk size", i + 1));
+            }
+            if ((c === 0x20 || c === 0x09) && (p.lenient & kLenientSpacesAfterChunkSize)) {
+              i++;
+              continue;
+            }
+            return fail(parseError("HPE_INVALID_CHUNK_SIZE", "Invalid character in chunk size", i + 1));
+          }
+          case S_CHUNK_EXT: {
+            // Extensions are not reported (node registers no callback for
+            // them); they run to the CR.
+            let j = i;
+            while (j < len && buf[j] !== 0x0d && buf[j] !== 0x0a) j++;
+            i = j;
+            if (i >= len) continue;
+            if (buf[i] === 0x0a && !lenientLF(p)) {
+              return fail(parseError("HPE_CR_EXPECTED", "Missing expected CR after chunk extension name", i + 1));
+            }
+            p.state = S_CHUNK_SIZE_LF;
+            if (buf[i] === 0x0d) i++;
+            continue;
+          }
+          case S_CHUNK_SIZE_LF: {
+            if (c !== 0x0a) {
+              if (!(p.lenient & kLenientOptionalLFAfterCR)) {
+                return fail(parseError("HPE_STRICT", "Expected LF after chunk size", i));
+              }
+            } else {
+              i++;
+            }
+            if (p.remaining === 0) {
+              // The last chunk: the trailer section follows.
+              p.state = S_FIELD_START;
+            } else {
+              p.state = S_CHUNK_DATA;
+            }
+            continue;
+          }
+          case S_CHUNK_DATA: {
+            const n = Math.min(p.remaining, len - i);
+            p.remaining -= n;
+            const chunk = buf.subarray(i, i + n);
+            i += n;
+            call(parser, kOnBody, chunk);
+            if (p.remaining === 0) p.state = S_CHUNK_DATA_CR;
+            continue;
+          }
+          case S_CHUNK_DATA_CR: {
+            if (c === 0x0d) {
+              p.state = S_CHUNK_DATA_LF;
+              i++;
+              continue;
+            }
+            if (c === 0x0a && lenientLF(p)) {
+              p.state = S_CHUNK_SIZE_START;
+              i++;
+              continue;
+            }
+            if (p.lenient & kLenientOptionalCRLFAfterChunk) {
+              p.state = S_CHUNK_SIZE_START;
+              continue;
+            }
+            return fail(parseError("HPE_STRICT", "Expected LF after chunk data", i));
+          }
+          case S_CHUNK_DATA_LF: {
+            if (c !== 0x0a) {
+              if (!(p.lenient & kLenientOptionalLFAfterCR)) {
+                return fail(parseError("HPE_STRICT", "Expected LF after chunk data", i));
+              }
+            } else {
+              i++;
+            }
+            p.state = S_CHUNK_SIZE_START;
+            continue;
+          }
+          default:
+            return len;
+        }
+      }
+      return len;
+    }
+
+    // node's internal/freelist FreeList.
+    class FreeList {
+      constructor(name, max, ctor) {
+        this.name = name;
+        this.ctor = ctor;
+        this.max = max;
+        this.list = [];
+      }
+      hasItems() {
+        return this.list.length > 0;
+      }
+      alloc() {
+        return this.list.length > 0 ? this.list.pop() : Reflect.apply(this.ctor, this, arguments);
+      }
+      free(obj) {
+        if (this.list.length < this.max) {
+          this.list.push(obj);
+          return true;
+        }
+        return false;
+      }
+    }
+
+    const kIncomingMessage = Symbol("IncomingMessage");
+    const kSkipPendingData = Symbol("SkipPendingData");
+    const MAX_HEADER_PAIRS = 2000;
+    const incoming = () => registry.get("_http_incoming");
+
+    // The callbacks node's pooled parsers carry: they build an
+    // http.IncomingMessage for each message and stream its body into it
+    // (node's parserOn* functions, statement for statement).
+    function parserOnHeaders(headers, url) {
+      if (this.maxHeaderPairs <= 0 || this._headers.length < this.maxHeaderPairs) {
+        this._headers.push(...headers);
+      }
+      this._url += url;
+    }
+    function parserOnHeadersComplete(versionMajor, versionMinor, headers, method, url, statusCode,
+      statusMessage, upgrade, shouldKeepAlive) {
+      const parser = this;
+      const { socket } = parser;
+      if (headers === undefined) {
+        headers = parser._headers;
+        parser._headers = [];
+      }
+      if (url === undefined) {
+        url = parser._url;
+        parser._url = "";
+      }
+      const ParserIncomingMessage = (socket && socket.server && socket.server[kIncomingMessage]) ||
+        incoming().IncomingMessage;
+      const message = parser.incoming = new ParserIncomingMessage(socket);
+      message.httpVersionMajor = versionMajor;
+      message.httpVersionMinor = versionMinor;
+      message.httpVersion = `${versionMajor}.${versionMinor}`;
+      message.joinDuplicateHeaders = (socket && socket.server && socket.server.joinDuplicateHeaders) ||
+        parser.joinDuplicateHeaders;
+      message.url = url;
+      message.upgrade = upgrade;
+      let n = headers.length;
+      if (parser.maxHeaderPairs > 0) n = Math.min(n, parser.maxHeaderPairs);
+      message._addHeaderLines(headers, n);
+      if (typeof method === "number") {
+        message.method = ALL_METHODS[method];
+      } else {
+        message.statusCode = statusCode;
+        message.statusMessage = statusMessage;
+      }
+      return parser.onIncoming(message, shouldKeepAlive);
+    }
+    function parserOnBody(b) {
+      const stream = this.incoming;
+      if (stream === null) return;
+      if (!stream._dumped) {
+        const ret = stream.push(b);
+        if (!ret) incoming().readStop(this.socket);
+      }
+    }
+    function parserOnMessageComplete() {
+      const parser = this;
+      const stream = parser.incoming;
+      if (stream !== null) {
+        stream.complete = true;
+        const headers = parser._headers;
+        if (headers.length) {
+          stream._addHeaderLines(headers, headers.length);
+          parser._headers = [];
+          parser._url = "";
+        }
+        stream.push(null);
+      }
+      incoming().readStart(parser.socket);
+    }
+
+    function cleanParser(parser) {
+      parser._headers = [];
+      parser._url = "";
+      parser.socket = null;
+      parser.incoming = null;
+      parser.outgoing = null;
+      parser.maxHeaderPairs = MAX_HEADER_PAIRS;
+      parser[kOnMessageBegin] = null;
+      parser[kOnExecute] = null;
+      parser[kOnTimeout] = null;
+      parser._consumed = false;
+      parser.onIncoming = null;
+      parser.joinDuplicateHeaders = null;
+    }
+
+    const parsers = new FreeList("parsers", 1000, function parsersCb() {
+      const parser = new HTTPParser();
+      cleanParser(parser);
+      parser[kOnHeaders] = parserOnHeaders;
+      parser[kOnHeadersComplete] = parserOnHeadersComplete;
+      parser[kOnBody] = parserOnBody;
+      parser[kOnMessageComplete] = parserOnMessageComplete;
+      return parser;
+    });
+
+    function closeParserInstance(parser) {
+      parser.close();
+    }
+
+    function freeParser(parser, req, socket) {
+      if (parser) {
+        if (parser._consumed) parser.unconsume();
+        cleanParser(parser);
+        parser.remove();
+        if (parsers.free(parser) === false) {
+          setImmediate(closeParserInstance, parser);
+        } else {
+          parser.free();
+        }
+      }
+      if (req) req.parser = null;
+      if (socket) socket.parser = null;
+    }
+
+    // `--insecure-http-parser`, with node's one-time warning.
+    let warnedLenient = false;
+    function isLenient() {
+      const insecure = natives.httpInsecureParser();
+      if (insecure && !warnedLenient) {
+        warnedLenient = true;
+        process.emitWarning("Using insecure HTTP parsing");
+      }
+      return insecure;
+    }
+
+    function prepareError(err, parser, rawPacket) {
+      err.rawPacket = rawPacket || parser.getCurrentBuffer();
+      if (typeof err.reason === "string") err.message = `Parse Error: ${err.reason}`;
+    }
+
+    const tokenRegExp = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
+    function checkIsHttpToken(val) {
+      return tokenRegExp.test(val);
+    }
+    const headerCharRegex = /[^\t\x20-\x7e\x80-\xff]/;
+    function checkInvalidHeaderChar(val) {
+      return headerCharRegex.test(val);
+    }
+
+    return {
+      _checkInvalidHeaderChar: checkInvalidHeaderChar,
+      _checkIsHttpToken: checkIsHttpToken,
+      chunkExpression: /(?:^|\W)chunked(?:$|\W)/i,
+      continueExpression: /(?:^|\W)100-continue(?:$|\W)/i,
+      CRLF: "\r\n",
+      freeParser,
+      methods,
+      parsers,
+      kIncomingMessage,
+      HTTPParser,
+      isLenient,
+      prepareError,
+      kSkipPendingData,
+    };
+  };
+
+  // node's other legacy http / tls module names (lib/_http_*.js,
+  // lib/_tls_*.js): require()able builtins, each carrying the public pieces
+  // of the module oam ships, the same objects. What they also export in
+  // node and is node's own plumbing with nothing behind it on oam (the
+  // server's connection tracking, the outgoing stream's internal symbols,
+  // translatePeerCertificate) is left out and recorded in
+  // conformance/surface-gaps.json. `_stream_wrap` (node's deprecated
+  // JSStreamSocket) is not provided.
+  registry.factories["_http_agent"] = () => {
+    const http = registry.get("http");
+    const mod = { Agent: http.Agent };
+    // node's http.globalAgent reads and writes this module's: one slot.
+    Object.defineProperty(mod, "globalAgent", {
+      configurable: true,
+      enumerable: true,
+      get() { return http.globalAgent; },
+      set(value) { http.globalAgent = value; },
+    });
+    return mod;
+  };
+  registry.factories["_http_client"] = () => ({ ClientRequest: registry.get("http").ClientRequest });
+  registry.factories["_http_incoming"] = () => {
+    // node's readStart / readStop: the flow control its parsers apply to
+    // the socket under a message.
+    function readStart(socket) {
+      if (socket && !socket._paused && socket.readable) socket.resume();
+    }
+    function readStop(socket) {
+      if (socket) socket.pause();
+    }
+    return { IncomingMessage: registry.get("http").IncomingMessage, readStart, readStop };
+  };
+  registry.factories["_http_outgoing"] = () => {
+    const http = registry.get("http");
+    // node's parseUniqueHeadersOption: the `uniqueHeaders` option's names,
+    // lowercased, as a Set (null for anything but an array).
+    function parseUniqueHeadersOption(headers) {
+      if (!Array.isArray(headers)) return null;
+      const unique = new Set();
+      for (let i = 0; i < headers.length; i++) unique.add(String(headers[i]).toLowerCase());
+      return unique;
+    }
+    return {
+      OutgoingMessage: http.OutgoingMessage,
+      parseUniqueHeadersOption,
+      validateHeaderName: http.validateHeaderName,
+      validateHeaderValue: http.validateHeaderValue,
+    };
+  };
+  registry.factories["_http_server"] = () => {
+    const http = registry.get("http");
+    return { STATUS_CODES: http.STATUS_CODES, Server: http.Server, ServerResponse: http.ServerResponse };
+  };
+  registry.factories["_tls_common"] = () => {
+    const tls = registry.get("tls");
+    return { SecureContext: tls.SecureContext, createSecureContext: tls.createSecureContext };
+  };
+  registry.factories["_tls_wrap"] = () => {
+    const tls = registry.get("tls");
+    return { Server: tls.Server, TLSSocket: tls.TLSSocket, connect: tls.connect, createServer: tls.createServer };
   };
 
   // ------------------------------------------------------------- node:net
@@ -27113,6 +28601,10 @@
       async _readLoopBody() {
         while (!this.destroyed) {
           if (this._paused || this._readFull) return;
+          // No handle to read (not connected yet, or a socket fed by hand
+          // through push(), as a test double is): node's _read waits for
+          // 'connect', and resume() only lets buffered data flow.
+          if (this._handle === null) return;
           let chunk;
           try {
             chunk = await natives.tcpRead(this._handle, 65536);
@@ -27775,7 +29267,11 @@
     // What http's agent path needs to tell a patched socket layer (an
     // instrumentation or guard wrapping connect) from the stock one, captured
     // before any caller can patch it.
-    registry._netStock = { createConnection, socketConnect: Socket.prototype.connect };
+    registry._netStock = {
+      createConnection,
+      socketConnect: Socket.prototype.connect,
+      socketWrite: Socket.prototype.write,
+    };
 
     return {
       isIPv4, isIPv6, isIP,
@@ -29510,7 +31006,10 @@
       // checkServerIdentity) sends the request over tls.connect, which
       // honours it (http's carriesTlsPolicy), so no pin is dropped.
       options._defaultAgent = agents.state.httpsGlobalAgent;
-      return http.request(options, callback);
+      // node constructs its own ClientRequest here: a wrapper someone put on
+      // http.request (an interceptor that patches both) does not run twice,
+      // with an https request in its http half.
+      return registry._httpRequest(options, callback);
     }
 
     function get(url, options, callback) {
@@ -36197,7 +37696,11 @@
       return socket;
     }
     var stockTlsSocketConnect = TLSSocket.prototype.connect;
-    registry._tlsStock = { connect, socketConnect: stockTlsSocketConnect };
+    registry._tlsStock = {
+      connect,
+      socketConnect: stockTlsSocketConnect,
+      socketWrite: TLSSocket.prototype.write,
+    };
 
     // ---- tls.SecureContext / tls.createSecureContext (node's
     // lib/_tls_common.js). A context is what a client connection is secured

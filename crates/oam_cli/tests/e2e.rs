@@ -9469,6 +9469,127 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
     }
 }
 
+/// nock 14 intercepts http.request, https.request and fetch as it does under
+/// node, and its disableNetConnect() keeps a request off the network. nock
+/// runs every request through @mswjs/interceptors, which parses it with
+/// node:_http_common's HTTPParser, answers it through a ServerResponse built
+/// over its own socket, and only then lets the socket 'connect' -- up to
+/// 0.17.1 `import nock` failed for want of _http_common (#207). The packages
+/// are vendored under tests/fixtures/nock as published (nock 14.0.17,
+/// @mswjs/interceptors 0.41.9, @open-draft/deferred-promise 2.2.0,
+/// @open-draft/logger 0.3.0, @open-draft/until 2.1.0, is-node-process 1.2.0,
+/// json-stringify-safe 5.0.1, outvariant 1.4.3, propagate 2.0.1,
+/// strict-event-emitter 0.5.1; MIT, json-stringify-safe ISC; each with the
+/// license it ships; the runtime files nock loads only). The expected output
+/// is node v22.22.2's with the same packages, line for line.
+#[test]
+fn nock_intercepts_http_https_and_fetch_as_on_node() {
+    let src = r#"
+import http from 'node:http';
+import https from 'node:https';
+import { createRequire } from 'node:module';
+const nock = createRequire(import.meta.url)('nock');
+
+// A real local server: whatever reaches it is counted.
+let hits = 0;
+const server = http.createServer((req, res) => {
+  hits++;
+  res.end('real ' + req.method + ' ' + req.url);
+});
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const local = 'http://127.0.0.1:' + server.address().port;
+
+function get(mod, url, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const req = mod.request(url, opts, (res) => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', (c) => (body += c));
+      res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body }));
+    });
+    req.on('error', reject);
+    if (opts.body) req.write(opts.body);
+    req.end();
+  });
+}
+
+const scope = nock('http://example.invalid')
+  .get('/x').reply(200, { mocked: true }, { 'X-Mock': 'yes' })
+  .post('/echo', { a: 1 }).reply(201, (uri, body) => ({ uri, body }));
+const r1 = await get(http, 'http://example.invalid/x');
+console.log('http get', r1.status, r1.headers['x-mock'], r1.headers['content-type'], r1.body);
+const r2 = await get(http, 'http://example.invalid/echo', {
+  method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ a: 1 }),
+});
+console.log('http post', r2.status, r2.body);
+console.log('scope done', scope.isDone());
+
+nock('https://secure.invalid').get('/s').query({ q: '1' }).reply(200, 'tls mocked');
+const r3 = await get(https, 'https://secure.invalid/s?q=1');
+console.log('https get', r3.status, r3.body);
+
+nock('http://example.invalid').get('/f').reply(200, 'fetch mocked', { 'content-type': 'text/plain' });
+const r4 = await fetch('http://example.invalid/f');
+console.log('fetch', r4.status, r4.headers.get('content-type'), await r4.text());
+
+nock('http://example.invalid').get('/err').replyWithError('boom');
+try {
+  await get(http, 'http://example.invalid/err');
+} catch (e) {
+  console.log('replyWithError', e.message);
+}
+
+nock('http://example.invalid').get('/nomatch').reply(200);
+try {
+  await get(http, 'http://example.invalid/other');
+} catch (e) {
+  console.log('no match', e.message.split('\n')[0]);
+}
+nock.cleanAll();
+
+nock.disableNetConnect();
+try {
+  await get(http, local + '/blocked');
+} catch (e) {
+  console.log('net connect disabled', e.code, e.name);
+}
+try {
+  await fetch(local + '/blocked');
+} catch (e) {
+  console.log('fetch net connect disabled', e.name);
+}
+console.log('real server hits while disabled', hits);
+
+nock.enableNetConnect();
+const r5 = await get(http, local + '/through');
+console.log('unmocked host goes through', r5.status, r5.body, 'hits', hits);
+nock.restore();
+server.close();
+"#;
+    let main = write_temp("nock-project/main.mjs", src);
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/nock");
+    copy_tree(&fixture, &main.parent().unwrap().join("node_modules"));
+    let out = oam(&["run", main.to_str().unwrap(), "--no-check"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert_eq!(
+        stdout.trim(),
+        "http get 200 yes application/json {\"mocked\":true}\n\
+         http post 201 {\"uri\":\"/echo\",\"body\":{\"a\":1}}\n\
+         scope done true\n\
+         https get 200 tls mocked\n\
+         fetch 200 text/plain fetch mocked\n\
+         replyWithError boom\n\
+         no match Nock: No match for request {\n\
+         net connect disabled ENETUNREACH NetConnectNotAllowedError\n\
+         fetch net connect disabled NetConnectNotAllowedError\n\
+         real server hits while disabled 0\n\
+         unmocked host goes through 200 real GET /through hits 1",
+        "stderr: {stderr}"
+    );
+}
+
 /// The real https-proxy-agent tunnels an https request as it does under node:
 /// a CONNECT to the proxy, then TLS to the target over the proxy's socket
 /// (`tls.connect({ socket })`), checked against the target's own certificate

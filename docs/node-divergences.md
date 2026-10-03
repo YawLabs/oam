@@ -3018,6 +3018,55 @@ the process exits once its continuation has run
   cross-thread `Atomics.notify` / `waitAsync` pair cannot be set up between threads at all.
   Same-thread `waitAsync` works as in Node.
 
+### 49. `node:_http_common` and http over a test double's socket: what still differs
+
+Up to 0.17.1 oam had none of node's legacy `_http_*` / `_tls_*` module names, so a program
+that reached for one failed to load -- nock 14 at `import`, because its interceptors
+(`@mswjs/interceptors`) parse every request and response with `_http_common`'s
+`HTTPParser` (#207). They are builtins now (`require`, `import`, with or without `node:`,
+listed in `module.builtinModules`): `_http_common` with all of node's exports, and
+`_http_agent`, `_http_client`, `_http_incoming`, `_http_outgoing`, `_http_server`,
+`_tls_common` and `_tls_wrap` carrying the very objects `http` and `tls` export
+(`conformance/cases/366-http-common-parser.mjs`, `367-http-legacy-module-aliases.mjs`).
+What a test double needs from http works as in node too: a `ServerResponse` built over
+`new IncomingMessage(socket)` and given a socket with `assignSocket()` writes the whole
+HTTP/1.1 message to it, framed as node's `_storeHeader` frames it (oam wrote only the body);
+a `ClientRequest` whose agent hands back a socket with a `write()` of its own writes the
+request into it while it is still connecting (oam waited for `'connect'`, which such a
+socket emits only once it has the request); `https.request` no longer runs through a
+patched `http.request`; a `ClientRequest` is an `http.OutgoingMessage`
+(`368-http-response-and-request-over-own-sockets.mjs`). nock 14.0.17 intercepts
+`http.request`, `https.request` and `fetch`, `replyWithError()`s, and `disableNetConnect()`
+keeps an unmatched request off the network, line for line as under node (the e2e test
+`nock_intercepts_http_https_and_fetch_as_on_node`, against the vendored packages).
+
+- **`HTTPParser` is JavaScript, not llhttp.** It follows llhttp's strict rules and node's
+  callback protocol, and is held to node's parser by feeding both the same bytes, whole and
+  split (case 366): the same callbacks with the same arguments, the same return values, and
+  the same error codes, reasons and offsets for every malformed input in that battery.
+  Not modelled: llhttp's HTTP/2 preface handling -- a `PRI` request line fails with
+  `HPE_PAUSED_H2_UPGRADE` at its version, where llhttp reads the whole preface first -- and
+  the hooks a native server attaches: `consume()`, `unconsume()`, `pause()` and `resume()` do
+  nothing, and `kOnExecute` / `kOnTimeout` are never called (node calls them only for a
+  parser consumed by a native stream). `execute()` on a parser that has failed returns the
+  same error with `bytesParsed` 0, where node's carries a meaningless (negative) offset;
+  after a `101` without an `Upgrade` field node's `finish()` reports `HPE_INVALID_EOF_STATE`
+  (with an uninitialised offset) and oam's reports nothing.
+- **Names left out.** `_http_outgoing`'s `kHighWaterMark` and `kUniqueHeaders` (symbols
+  node's outgoing stream keys its own state with), `_http_server`'s connection-tracking
+  plumbing (`_connectionListener`, `httpServerPreClose`, `kConnectionsCheckingInterval`,
+  `kServerResponse`, `setupConnectionsTracking`, `storeHTTPOptions`) and `_tls_common`'s
+  `translatePeerCertificate`: nothing on oam is behind them. They are recorded in
+  `conformance/surface-gaps.json`. `_stream_wrap` (node's deprecated `JSStreamSocket`) is
+  not provided (divergence 28) and says so: "is a Node builtin module that oam does not
+  implement yet", where it used to say "cannot find package ... is it installed?".
+  `parseUniqueHeadersOption()` returns a plain `Set`; node's is a primordials `SafeSet`,
+  which is not `instanceof Set`.
+- **A standalone `ServerResponse`'s write callbacks** run on a microtask, not once the
+  assigned socket has taken the bytes, as before.
+- **The request a test double's socket is written** is the agent path's (divergence 43):
+  its header names are lowercase, and a GET or HEAD body is handled as divergence 16 says.
+
 ### `err.syscall` on `fs.opendir`
 
 Node's own sync and async forms disagree here, and oam is self-consistent where
@@ -3230,12 +3279,12 @@ Measured on all three release platforms:
 
 | host | export names present | missing by name | in absent modules | modules absent |
 |---|---|---|---|---|
-| windows-aarch64 (Node v22.22.2) | 1423 / 1874 | 351 | 100 | 13 |
-| linux-x64 (Node v22.23.1) | 1422 / 1888 | 366 | 100 | 13 |
-| darwin-arm64 (Node v22.23.1) | 1422 / 1884 | 362 | 100 | 13 |
+| windows-aarch64 (Node v22.22.2) | 1500 / 1874 | 315 | 59 | 5 |
+| linux-x64 (Node v22.22.2) | 1480 / 1888 | 349 | 59 | 5 |
+| darwin-arm64 (Node v22.22.2) | 1480 / 1884 | 345 | 59 | 5 |
 
-"Present" subtracts both columns: the per-name gaps *and* the 100 export names living
-inside the 13 modules oam does not register at all (`sys` alone accounts for 49). The
+"Present" subtracts both columns: the per-name gaps *and* the 59 export names living
+inside the 5 modules oam does not register at all (`sys` alone accounts for 49). The
 Node versions differ between hosts, which is part of why the totals do — the gate prints
 a note when a section's recorded Node does not match the one it is running against, so a
 version bump does not get read as an oam regression.
@@ -3263,9 +3312,10 @@ gate, and says so loudly. It also refuses to record a section whose gap count ha
 unless you pass `--allow-regression`, since laundering a regression into "known debt" is
 the one thing the ratchet exists to prevent.
 
-Thirteen modules are absent outright rather than partial: the six `_http_*` legacy
-internals, `_stream_wrap`, `_tls_common`, `_tls_wrap`, `inspector/promises`, `sys` (the
-deprecated `util` alias), `wasi`, and `global:fetch.prototype`.
+Five modules are absent outright rather than partial: `_stream_wrap`, `inspector/promises`,
+`sys` (the deprecated `util` alias), `wasi`, and `global:fetch.prototype`. The six `_http_*`
+legacy names, `_tls_common` and `_tls_wrap` landed in 0.17.2 (divergence 49), with the few
+names of node's own plumbing they still lack recorded per name.
 
 The largest per-module gaps (counts from windows-aarch64), all tracked in that file:
 
