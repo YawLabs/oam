@@ -11605,6 +11605,84 @@ console.log(lines.join('\n'));
     );
 }
 
+/// A Pool's `connect.lookup` answer is checked on the port the hop dials --
+/// the Pool's own origin's -- not on the port the request URL names. A Pool
+/// sends every hop to its origin (`a_pool_sends_every_request_to_its_own_
+/// origin_mocked_or_not`), so its hook is asked about the Pool's host and the
+/// connection goes to the answer on the Pool's port; the parked fetch's port,
+/// which the engine checks the answer as `address:port` with, must be that
+/// one. Read from the URL instead, `127.0.0.1:{url port}` granted would admit
+/// a connection to `127.0.0.1:{pool port}`, which is not, and a grant of the
+/// dialled `127.0.0.1:{pool port}` would refuse it.
+#[test]
+fn a_pool_lookup_answer_is_checked_on_the_pools_port_not_the_urls() {
+    let script = write_temp(
+        "pool_lookup_answer_port/main.mjs",
+        r#"import { Pool } from 'undici';
+const poolPort = Number(process.argv[2]);
+const urlPort = Number(process.argv[3]);
+const pool = new Pool(`http://pool.invalid:${poolPort}`, {
+  connect: { lookup: (h, o, cb) => cb(null, [{ address: '127.0.0.1', family: 4 }]) },
+});
+try {
+  const r = await fetch(`http://pool.invalid:${urlPort}/pinned`, { dispatcher: pool });
+  console.log(`${r.status} ${await r.text()}`);
+} catch (e) {
+  console.log(e && e.code === 'ERR_ACCESS_DENIED' ? `DENIED ${JSON.stringify(e.resource)}` : `ERR ${e}`);
+}
+await pool.close();
+"#,
+    );
+    let pool_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let pool_port = pool_listener.local_addr().unwrap().port();
+    let pool_seen = spawn_one_shot_http(pool_listener, |_| {
+        "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok".to_string()
+    });
+    // Never dialled: the Pool's origin is where every hop goes.
+    let url_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url_port = url_listener.local_addr().unwrap().port();
+    let url_seen = spawn_one_shot_http(url_listener, |_| {
+        "HTTP/1.1 200 OK\r\ncontent-length: 3\r\nconnection: close\r\n\r\nurl".to_string()
+    });
+    let path = script.to_str().unwrap().to_string();
+    let run = |grant: String| {
+        let out = oam_without_proxy_env(&[
+            "--permission",
+            &grant,
+            "--",
+            &path,
+            &pool_port.to_string(),
+            &url_port.to_string(),
+        ]);
+        (
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .replace("\r\n", "\n"),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    // `pool.invalid` is granted on every port, so the name passes on both the
+    // URL's port (op_fetch asks about the URL as given) and the Pool's (the
+    // transport asks about the hop it dials): only the answer's grant varies.
+    //
+    // The answer granted on the dialled port: admitted.
+    let (stdout, stderr) = run(format!("--allow-net=pool.invalid,127.0.0.1:{pool_port}"));
+    assert_eq!(stdout, "200 ok", "stderr: {stderr}");
+    // The answer granted only on the URL's port: refused, on the dialled one.
+    let (stdout, stderr) = run(format!("--allow-net=pool.invalid,127.0.0.1:{url_port}"));
+    assert_eq!(
+        stdout,
+        format!(r#"DENIED "127.0.0.1:{pool_port}""#),
+        "stderr: {stderr}"
+    );
+    assert_eq!(*pool_seen.lock().unwrap(), ["GET /pinned"]);
+    assert!(
+        url_seen.lock().unwrap().is_empty(),
+        "the URL's port was dialled: {:?}",
+        url_seen.lock().unwrap()
+    );
+}
+
 /// The request shapes conformance case 114 cannot assert, because node's own
 /// http server cannot parse them or because node never answers at all.
 ///

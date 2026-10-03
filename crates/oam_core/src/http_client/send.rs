@@ -665,8 +665,11 @@ pub async fn fetch_supply(
 }
 
 /// The port the fetch parked under `token` for its lookup hook will dial --
-/// the hop's URL's own, or the scheme's default, the port [`NetTarget`] gave
-/// the net grant before it parked -- or `None` when no such fetch is parked.
+/// the hop's target's own, or its scheme's default, the port [`NetTarget`]
+/// gave the net grant before it parked -- or `None` when no such fetch is
+/// parked. The target is the pinned origin when the fetch has one
+/// ([`FetchRequest::pin_origin`]: a Client or Pool sends every hop to its
+/// own origin, and its hook was asked about that host), else the hop's URL.
 /// The engine checks each address the hook answers as `address:port` with
 /// it, so a port-scoped grant that admitted the hop admits its answer too.
 /// Read from the parked state, never from JS.
@@ -674,7 +677,12 @@ pub fn fetch_parked_port(token: u64, continuations: &FetchContinuations) -> Opti
     let map = lock(continuations);
     let pending = map.get(&token)?;
     (pending.wants == Wants::Addresses)
-        .then(|| pending.state.current.port_or_known_default())
+        .then(|| match &pending.state.pin {
+            // pinned_url takes the pin's scheme and port, so the hop's
+            // target port is the pin's.
+            Some(pin) => pin.port_or_known_default(),
+            None => pending.state.current.port_or_known_default(),
+        })
         .flatten()
 }
 
