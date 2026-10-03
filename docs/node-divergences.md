@@ -3166,10 +3166,14 @@ booting and then failing every browser tool.
   machines (`PIPE_REJECT_REMOTE_CLIENTS`) and its client lets the server identify, not
   impersonate, it (`SECURITY_IDENTIFICATION`); libuv sets neither, so a Node server takes
   `\\host\pipe\x` clients. _(source)_
-- **Windows: one waiting instance.** libuv keeps four pipe instances waiting for clients;
-  oam keeps one and makes the next as soon as a client takes it. A client that finds every
-  instance taken waits for one, as libuv's does, up to 30 s (`ETIMEDOUT` after that). Many
-  clients at once all connect (25 at once measured, as in Node).
+- **Windows: many clients at once.** As libuv, oam keeps four pipe instances waiting for
+  clients, makes the next as soon as a client takes one, and a client that finds every
+  instance taken waits for one with `WaitNamedPipeW`, up to 30 s (`ETIMEDOUT` after that). At
+  most four of a process's dials to one pipe wait in `WaitNamedPipeW` at a time (libuv's
+  four thread-pool threads bound it the same way); the rest wait for a turn. 200 clients
+  dialling at once connect in ~35-55 ms on a debug build, against ~25 ms for Node (connect
+  only) and ~130-200 ms for Node with an echo each (TCP on the same build: ~70-170 ms).
+  _(measured, debug build)_
 - **Windows: read size and bulk throughput.** A pipe read hands at most 4 KiB at a time (the
   named-pipe layer under tokio reads into a 4 KiB buffer), where Node's reads are up to
   64 KiB: `'data'` chunks are smaller, and an 8 MiB echo took ~115-150 ms on a debug build

@@ -2194,4 +2194,98 @@ mod tests {
         tcp_server_close(&registry, server_id);
         assert_eq!(registry.lock().unwrap().bookkeeping(), (0, 0, 0, 0, 0));
     }
+
+    /// Regression guard: a listening named pipe kept ONE instance waiting,
+    /// so a second client found the pipe busy until the server's next
+    /// accept -- a burst of clients was admitted one per accept. libuv keeps
+    /// four waiting; so does oam now, before any accept runs.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_listening_named_pipe_keeps_four_instances_waiting() {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let path = test_pipe_path("four-waiting");
+        let server_id = json(
+            pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await,
+        )["serverId"]
+            .as_u64()
+            .unwrap();
+        let clients: Vec<_> = (0..4)
+            .map(|n| {
+                ClientOptions::new()
+                    .open(&path)
+                    .unwrap_or_else(|e| panic!("client {n} finds a waiting instance: {e}"))
+            })
+            .collect();
+        let busy = ClientOptions::new().open(&path).unwrap_err();
+        assert_eq!(
+            busy.raw_os_error(),
+            Some(windows_sys::Win32::Foundation::ERROR_PIPE_BUSY as i32),
+            "four waiting, all four taken"
+        );
+        // An accept hands one out and puts a fresh instance in its place.
+        let accepted = json(tcp_accept(registry.clone(), server_id, ids.clone()).await);
+        let fifth = ClientOptions::new().open(&path);
+        assert!(fifth.is_ok(), "the accepted instance is replaced");
+        drop((clients, fifth));
+        tcp_close(&registry, accepted["handle"].as_u64().unwrap());
+        tcp_server_close(&registry, server_id);
+    }
+
+    /// Regression guard: a dial that found every instance taken slept in a
+    /// back-off up to 50 ms (each sleep ~15 ms or more on Windows) instead of
+    /// waiting for an instance with WaitNamedPipeW, and with one waiting
+    /// instance 200 clients at once took 3-6 s to connect, where node takes
+    /// tens of ms. The bound is generous; the fixed code takes ~50 ms here.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_burst_of_named_pipe_clients_all_connect_promptly() {
+        const CLIENTS: usize = 200;
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let path = test_pipe_path("burst");
+        let server_id = json(
+            pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await,
+        )["serverId"]
+            .as_u64()
+            .unwrap();
+        let accepting = tokio::spawn({
+            let (registry, ids) = (registry.clone(), ids.clone());
+            async move {
+                let mut handles = Vec::new();
+                for _ in 0..CLIENTS {
+                    let accepted = json(tcp_accept(registry.clone(), server_id, ids.clone()).await);
+                    handles.push(accepted["handle"].as_u64().unwrap());
+                }
+                handles
+            }
+        });
+        let started = std::time::Instant::now();
+        let dials: Vec<_> = (0..CLIENTS)
+            .map(|_| {
+                tokio::spawn(pipe_connect(
+                    registry.clone(),
+                    ids.clone(),
+                    path.clone(),
+                    path.clone(),
+                ))
+            })
+            .collect();
+        let mut clients = Vec::new();
+        for dial in dials {
+            clients.push(json(dial.await.unwrap())["handle"].as_u64().unwrap());
+        }
+        let took = started.elapsed();
+        let servers = accepting.await.unwrap();
+        assert!(
+            took < std::time::Duration::from_secs(2),
+            "{CLIENTS} clients took {took:?} to connect"
+        );
+        for handle in clients.into_iter().chain(servers) {
+            tcp_close(&registry, handle);
+        }
+        tcp_server_close(&registry, server_id);
+        assert_eq!(registry.lock().unwrap().bookkeeping(), (0, 0, 0, 0, 0));
+    }
 }

@@ -81,12 +81,17 @@ mod windows {
     };
     use windows_sys::Win32::Foundation::{
         ERROR_ACCESS_DENIED, ERROR_INVALID_NAME, ERROR_NO_DATA, ERROR_PATH_NOT_FOUND,
-        ERROR_PIPE_BUSY,
+        ERROR_PIPE_BUSY, ERROR_SEM_TIMEOUT,
     };
 
     /// How long a dial waits for a busy pipe (every instance taken) to free
     /// one: libuv's `WaitNamedPipeW(name, 30000)`.
     const BUSY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// How many instances of a listening pipe wait for clients at once:
+    /// libuv's `pending_instances` default (4). With one, a burst of clients
+    /// was admitted one per accept, the rest finding the pipe busy.
+    const PENDING_INSTANCES: usize = 4;
 
     /// One end of a connected named pipe.
     enum End {
@@ -254,24 +259,37 @@ mod windows {
         path: &str,
     ) -> Result<(PipeRead, PipeWrite), Box<crate::NodeSysError>> {
         let deadline = tokio::time::Instant::now() + BUSY_WAIT;
-        let mut pause = std::time::Duration::from_millis(1);
+        // WaitNamedPipeW's timeout: ERROR_SEM_TIMEOUT.
+        let timed_out = || {
+            let e = io::Error::from_raw_os_error(ERROR_SEM_TIMEOUT as i32);
+            super::connect_error(&e, path)
+        };
+        let mut turn = None;
         let client = loop {
             match ClientOptions::new().open(target) {
                 Ok(client) => break client,
                 Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
-                    if tokio::time::Instant::now() >= deadline {
-                        // WaitNamedPipeW's timeout: ERROR_SEM_TIMEOUT.
-                        let timed_out = io::Error::from_raw_os_error(
-                            windows_sys::Win32::Foundation::ERROR_SEM_TIMEOUT as i32,
-                        );
-                        return Err(super::connect_error(&timed_out, path));
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if left.is_zero() {
+                        return Err(timed_out());
                     }
-                    tokio::time::sleep(pause).await;
-                    pause = (pause * 2).min(std::time::Duration::from_millis(50));
+                    if turn.is_none() {
+                        // A turn to wait first, then the open again: the
+                        // pipe may have freed an instance meanwhile.
+                        match tokio::time::timeout(left, BusyTurn::take(target)).await {
+                            Ok(taken) => turn = Some(taken),
+                            Err(_) => return Err(timed_out()),
+                        }
+                        continue;
+                    }
+                    if !wait_for_instance(target, left).await {
+                        return Err(timed_out());
+                    }
                 }
                 Err(e) => return Err(super::connect_error(&e, path)),
             }
         };
+        drop(turn);
         if let Err(e) = client.info() {
             // libuv: SetNamedPipeHandleState on something that is not a
             // pipe fails, and is reported as WSAENOTSOCK.
@@ -280,13 +298,103 @@ mod windows {
         Ok(split(End::Client(client)))
     }
 
-    /// A listening named pipe: the instance the next client will connect
-    /// to. A connected instance is handed out by [`PipeListener::accept`]
-    /// and a fresh one takes its place at once, so the name is never
-    /// without a listening instance while the server is open.
+    /// How many of this process's dials to one pipe name wait for it in
+    /// WaitNamedPipeW at once -- as many as libuv's thread pool runs (4).
+    /// Every instance the server frees wakes every waiter, and only one of
+    /// them gets it: with every dial of a burst waiting, each instance cost
+    /// a wake-up and a failed open per waiter, and 200 clients took seconds.
+    const BUSY_WAITERS: usize = 4;
+
+    /// A dial's turn to wait for a busy pipe ([`BUSY_WAITERS`] per name);
+    /// the dials past those wait for a turn, asleep. Dropped, the turn goes
+    /// to the next, and the name's entry goes with its last user.
+    struct BusyTurn {
+        name: String,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    }
+
+    type BusyGates =
+        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>;
+
+    fn busy_gates() -> &'static BusyGates {
+        static GATES: std::sync::OnceLock<BusyGates> = std::sync::OnceLock::new();
+        GATES.get_or_init(Default::default)
+    }
+
+    impl BusyTurn {
+        async fn take(name: &str) -> BusyTurn {
+            let gate = busy_gates()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(name.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(BUSY_WAITERS)))
+                .clone();
+            // Dropped before the permit is had (the dial abandoned), the
+            // clone is just released: the entry goes with a later turn.
+            let permit = gate
+                .acquire_owned()
+                .await
+                .expect("the gate is never closed");
+            BusyTurn {
+                name: name.to_string(),
+                _permit: permit,
+            }
+        }
+    }
+
+    impl Drop for BusyTurn {
+        fn drop(&mut self) {
+            let mut gates = busy_gates().lock().unwrap_or_else(|e| e.into_inner());
+            // Ours and the map's: nobody else holds or waits for a turn.
+            if gates
+                .get(&self.name)
+                .is_some_and(|gate| Arc::strong_count(gate) == 2)
+            {
+                gates.remove(&self.name);
+            }
+        }
+    }
+
+    /// libuv's wait for a busy pipe: WaitNamedPipeW, which returns the
+    /// moment an instance of the pipe is free to connect to (or the pipe is
+    /// gone), on a blocking thread, for at most `left`. False when it timed
+    /// out. Any other failure -- the pipe went away (the next open reports
+    /// it), a name WaitNamedPipeW does not take -- is followed by a short
+    /// pause, so the dial tries again without spinning.
+    async fn wait_for_instance(name: &str, left: std::time::Duration) -> bool {
+        let wide: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        // Never 0: that is NMPWAIT_USE_DEFAULT_WAIT, the server's default.
+        let ms = u32::try_from(left.as_millis()).unwrap_or(u32::MAX).max(1);
+        let waited = tokio::task::spawn_blocking(move || {
+            // SAFETY: `wide` is a NUL-terminated UTF-16 string, alive for the
+            // whole call; WaitNamedPipeW only reads it.
+            let ok =
+                unsafe { windows_sys::Win32::System::Pipes::WaitNamedPipeW(wide.as_ptr(), ms) };
+            if ok != 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        })
+        .await;
+        match waited {
+            Ok(Ok(())) => true,
+            Ok(Err(e)) if e.raw_os_error() == Some(ERROR_SEM_TIMEOUT as i32) => false,
+            _ => {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                true
+            }
+        }
+    }
+
+    /// A listening named pipe: the instances waiting for the next clients,
+    /// [`PENDING_INSTANCES`] of them as libuv keeps. Each connected instance
+    /// is handed out by [`PipeListener::accept`] and a fresh one takes its
+    /// place at once, so the name is never without a listening instance
+    /// while the server is open.
     pub(crate) struct PipeListener {
         path: String,
-        next: Option<NamedPipeServer>,
+        pending: Vec<NamedPipeServer>,
     }
 
     fn instance(path: &str, first: bool) -> io::Result<NamedPipeServer> {
@@ -300,10 +408,16 @@ mod windows {
     /// error names `path`, the path as the script gave it.
     pub(crate) fn bind(target: &str, path: &str) -> Result<PipeListener, Box<crate::NodeSysError>> {
         match instance(target, true) {
-            Ok(first) => Ok(PipeListener {
-                path: target.to_string(),
-                next: Some(first),
-            }),
+            Ok(first) => {
+                let mut listener = PipeListener {
+                    path: target.to_string(),
+                    pending: Vec::with_capacity(PENDING_INSTANCES),
+                };
+                listener.pending.push(first);
+                // The rest now; any not to be had now, by the next accept.
+                let _ = listener.top_up();
+                Ok(listener)
+            }
             Err(e) => {
                 let code = match e.raw_os_error().and_then(|raw| u32::try_from(raw).ok()) {
                     Some(ERROR_ACCESS_DENIED) => "EADDRINUSE",
@@ -316,19 +430,48 @@ mod windows {
     }
 
     impl PipeListener {
-        /// The next client to connect.
+        /// Create instances until [`PENDING_INSTANCES`] wait.
+        fn top_up(&mut self) -> io::Result<()> {
+            while self.pending.len() < PENDING_INSTANCES {
+                self.pending.push(instance(&self.path, false)?);
+            }
+            Ok(())
+        }
+
+        /// The next client to connect, on whichever waiting instance it took.
         pub(crate) async fn accept(&mut self) -> io::Result<(PipeRead, PipeWrite)> {
             loop {
-                let server = match self.next.take() {
-                    Some(server) => server,
-                    None => instance(&self.path, false)?,
+                // A failure to make one more instance is reported only when
+                // none is left waiting: the ones there still take clients.
+                if let Err(e) = self.top_up()
+                    && self.pending.is_empty()
+                {
+                    return Err(e);
+                }
+                // tokio's connect is cancel safe: the waits not taken here
+                // stay armed for the next accept.
+                let (index, connected) = {
+                    let mut waits: Vec<_> = self
+                        .pending
+                        .iter()
+                        .map(|server| Box::pin(server.connect()))
+                        .collect();
+                    std::future::poll_fn(|cx| {
+                        for (index, wait) in waits.iter_mut().enumerate() {
+                            if let std::task::Poll::Ready(connected) = wait.as_mut().poll(cx) {
+                                return std::task::Poll::Ready((index, connected));
+                            }
+                        }
+                        std::task::Poll::Pending
+                    })
+                    .await
                 };
-                match server.connect().await {
+                let server = self.pending.swap_remove(index);
+                match connected {
                     Ok(()) => {
-                        // The next instance before this one is handed out.
-                        // If it cannot be had now, the next accept tries
-                        // again and reports the failure.
-                        self.next = instance(&self.path, false).ok();
+                        // Its replacement before this one is handed out. If
+                        // it cannot be had now, the next accept tries again.
+                        let _ = self.top_up();
                         return Ok(split(End::Server(server)));
                     }
                     // A client that connected and went before the connect
