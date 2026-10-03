@@ -8209,6 +8209,138 @@ reached the server ["POST /k","GET /l","GET /mocked"]"##;
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// A WebSocket's handshake rides its undici dispatcher, as undici's does in
+/// node: `WebSocketInit.dispatcher`, else the global one. A MockAgent with
+/// net connect disabled -- global, or passed -- fails it with no connection
+/// made, and so does one allowing only another host, a closed Agent and an
+/// Agent whose `connect` refuses; one allowing the host passes it through; a
+/// Pool pins it to its origin; the init object's `protocols` and `headers`
+/// are sent. Up to the review of #206 oam's WebSocket consulted no
+/// dispatcher, so under a MockAgent that had disabled net connect every
+/// handshake reached the real host, and the init object was ignored. Node
+/// v22 fires no 'close' after a failed handshake's 'error' (oam does,
+/// docs/node-divergences.md), so the script stops at the 'error'. Expected
+/// output is node v22.22.2 + undici 6.29.0's, line for line; a hand-rolled
+/// server counts the upgrades that reach it.
+#[test]
+fn a_websocket_rides_its_undici_dispatcher_as_undicis_does() {
+    let script = write_temp(
+        "undici_websocket_dispatcher/main.mjs",
+        r##"import http from 'node:http';
+import crypto from 'node:crypto';
+import { MockAgent, Agent, Pool, setGlobalDispatcher, WebSocket as UndiciWebSocket } from 'undici';
+
+// A WebSocket server by hand: every upgrade is counted, answered with 101,
+// sent one text frame naming its path, then closed.
+const upgrades = [];
+const server = http.createServer((req, res) => res.end('plain'));
+server.on('upgrade', (req, socket) => {
+  const protocol = req.headers['sec-websocket-protocol'];
+  upgrades.push(req.url + ' host=' + req.headers.host.replace(/\d+$/, 'N') + (protocol ? ' protocol=' + protocol : '') +
+    (req.headers['x-extra'] ? ' x-extra=' + req.headers['x-extra'] : ''));
+  const accept = crypto.createHash('sha1').update(req.headers['sec-websocket-key'] + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
+  socket.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept +
+    (protocol ? '\r\nSec-WebSocket-Protocol: ' + protocol.split(',')[0].trim() : '') + '\r\n\r\n');
+  const text = Buffer.from('hello ' + req.url);
+  socket.write(Buffer.concat([Buffer.from([0x81, text.length]), text]));
+  socket.write(Buffer.from([0x88, 0x02, 0x03, 0xe8]));
+  socket.on('data', () => {});
+  socket.on('error', () => {});
+  setTimeout(() => socket.destroy(), 50);
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const base = 'ws://127.0.0.1:' + port;
+
+// One socket's events up to its close, or up to an 'error' (after which
+// node v22 fires no 'close' for a handshake that failed).
+function run(label, make) {
+  return new Promise((resolve) => {
+    const events = [];
+    let ws;
+    try {
+      ws = make();
+    } catch (e) {
+      console.log(label, 'threw', e.name, e.message);
+      resolve();
+      return;
+    }
+    ws.onopen = () => events.push('open' + (ws.protocol ? ' ' + ws.protocol : ''));
+    ws.onmessage = (e) => events.push('message ' + e.data);
+    ws.onerror = (e) => {
+      events.push('error ' + e.message);
+      if (events.length === 1) {
+        console.log(label, events.join(', '));
+        ws.onclose = null;
+        resolve();
+      }
+    };
+    ws.onclose = (e) => {
+      events.push('close ' + e.code);
+      console.log(label, events.join(', '));
+      resolve();
+    };
+  });
+}
+
+const mock = new MockAgent();
+mock.disableNetConnect();
+setGlobalDispatcher(mock);
+await run('global MockAgent, net connect disabled', () => new WebSocket(base + '/a'));
+await run('undici WebSocket, same', () => new UndiciWebSocket(base + '/b'));
+mock.get('http://127.0.0.1:' + port).intercept({ path: '/m' }).reply(200, 'not an upgrade');
+await run('global MockAgent, an interceptor answers 200', () => new WebSocket(base + '/m'));
+const own = new MockAgent();
+own.disableNetConnect();
+setGlobalDispatcher(new Agent());
+await run('dispatcher option: a MockAgent, net connect disabled', () => new WebSocket(base + '/c', { dispatcher: own }));
+const allowing = new MockAgent();
+allowing.enableNetConnect('127.0.0.1:' + port);
+await run('dispatcher option: a MockAgent allowing the host', () => new WebSocket(base + '/d', { dispatcher: allowing }));
+const other = new MockAgent();
+other.enableNetConnect('localhost');
+await run('dispatcher option: a MockAgent allowing another host', () => new WebSocket(base + '/e', { dispatcher: other }));
+setGlobalDispatcher(allowing);
+await run('global MockAgent allowing the host', () => new WebSocket(base + '/f'));
+setGlobalDispatcher(new Agent());
+await run('plain global Agent', () => new WebSocket(base + '/g'));
+await run('init object with protocols', () => new WebSocket(base + '/h', { protocols: ['chat', 'other'] }));
+await run('protocols array', () => new WebSocket(base + '/i', ['chat']));
+await run('init object with headers', () => new WebSocket(base + '/x', { headers: { 'x-extra': 'yes' } }));
+const pool = new Pool('http://127.0.0.1:' + port);
+await run('dispatcher option: a Pool for the origin', () => new WebSocket(base + '/j', { dispatcher: pool }));
+await run('dispatcher option: that Pool, another origin', () => new WebSocket('ws://localhost:' + port + '/l', { dispatcher: pool }));
+const closed = new Agent();
+await closed.close();
+await run('dispatcher option: a closed Agent', () => new WebSocket(base + '/k', { dispatcher: closed }));
+const viaConnect = new Agent({ connect: (opts, cb) => cb(new Error('connect refused by policy')) });
+await run('dispatcher option: an Agent whose connect refuses', () => new WebSocket(base + '/n', { dispatcher: viaConnect }));
+console.log('upgrades', JSON.stringify(upgrades));
+await pool.close();
+server.close();
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = r##"global MockAgent, net connect disabled error Received network error or non-101 status code.
+undici WebSocket, same error Received network error or non-101 status code.
+global MockAgent, an interceptor answers 200 error Received network error or non-101 status code.
+dispatcher option: a MockAgent, net connect disabled error Received network error or non-101 status code.
+dispatcher option: a MockAgent allowing the host open, message hello /d, close 1000
+dispatcher option: a MockAgent allowing another host error Received network error or non-101 status code.
+global MockAgent allowing the host open, message hello /f, close 1000
+plain global Agent open, message hello /g, close 1000
+init object with protocols open chat, message hello /h, close 1000
+protocols array open chat, message hello /i, close 1000
+init object with headers open, message hello /x, close 1000
+dispatcher option: a Pool for the origin open, message hello /j, close 1000
+dispatcher option: that Pool, another origin open, message hello /l, close 1000
+dispatcher option: a closed Agent error Received network error or non-101 status code.
+dispatcher option: an Agent whose connect refuses error Received network error or non-101 status code.
+upgrades ["/d host=127.0.0.1:N","/f host=127.0.0.1:N","/g host=127.0.0.1:N","/h host=127.0.0.1:N protocol=chat, other","/i host=127.0.0.1:N protocol=chat","/x host=127.0.0.1:N x-extra=yes","/j host=127.0.0.1:N","/l host=127.0.0.1:N"]"##;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 /// undici.request sends what undici's request() sends -- the caller's
 /// headers, `host`, `connection: keep-alive` unless the caller set one, and
 /// the framing; no `accept`, `user-agent` or `accept-encoding` -- and hands
@@ -8558,7 +8690,9 @@ wrapper saw 1"##;
 /// the process failed). `getGlobalDispatcher()` returns
 /// the foreign one, as in node, and the shim's setGlobalDispatcher() writes
 /// the slot, so the last one installed wins; a request given its own
-/// dispatcher goes as usual. Up to 0.17.1 oam's fetch ignored the slot, and
+/// dispatcher goes as usual. A WebSocket's handshake is refused the same
+/// way (until the review of #206 it went around every dispatcher and
+/// reached the server). Up to 0.17.1 oam's fetch ignored the slot, and
 /// until the review of #206 it refused only an active MockAgent, so a
 /// wrapped one failed open. (oam-specific: node's fetch would run that
 /// copy's dispatch(). The foreign objects have undici 6.29.0's shapes.)
@@ -8571,6 +8705,7 @@ import { Agent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
 
 const hits = [];
 const server = http.createServer((req, res) => { hits.push(req.url); res.end('real'); });
+server.on('upgrade', (req, socket) => { hits.push('upgrade ' + req.url); socket.destroy(); });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}`;
 const slot = Symbol.for('undici.globalDispatcher.1');
@@ -8629,6 +8764,11 @@ await get('agent-given-another-copys-default-factory');
 const mock = new MockAgent();
 install(mock);
 await get('mock-agent');
+await new Promise((resolve) => {
+  const ws = new WebSocket(base.replace('http:', 'ws:') + '/websocket-under-the-mock');
+  ws.onerror = (e) => { console.log('websocket', e.message); resolve(); };
+  ws.onopen = () => { console.log('websocket open'); resolve(); };
+});
 console.log('getGlobalDispatcher is the mock', getGlobalDispatcher() === mock);
 install(new RetryAgent(mock));
 await get('retry-agent-over-a-mock');
@@ -8660,6 +8800,7 @@ server.close();
              plain-agent-of-a-minified-copy 200 real\n\
              agent-given-another-copys-default-factory {refused}\n\
              mock-agent {refused}\n\
+             websocket Received network error or non-101 status code.\n\
              getGlobalDispatcher is the mock true\n\
              retry-agent-over-a-mock {refused}\n\
              composed-mock {refused}\n\

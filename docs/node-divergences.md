@@ -1557,12 +1557,19 @@ What still differs:
   and the `'error'` event was a plain `Event`). A connect that fails dispatches Node's
   `ErrorEvent` -- `message` and `error` both `Received network error or non-101 status
   code.`, no `ErrorEvent` global, as in Node v22
-  (`conformance/cases/226-websocket-connect-failure-event.mjs`). What is left: oam also
-  fires the `'close'` (1006, `wasClean` false) the WHATWG spec asks for after that
-  `'error'`, where Node v22.22.2 fires none for a connect that failed; the `wss:` handshake
-  verifies the server against the bundled Mozilla roots alone, not `node:tls`'s store
-  (`NODE_EXTRA_CA_CERTS`, `tls.setDefaultCACertificates`); and the dial honours no
-  `connect.lookup` hook or environment proxy.
+  (`conformance/cases/226-websocket-connect-failure-event.mjs`). The handshake rides the
+  undici dispatcher as node's does -- `WebSocketInit.dispatcher`, else the global one: a
+  MockAgent answers or refuses it, a `Pool` or `Client` pins it to its origin, an Agent's
+  `connect` function makes its connection, and a dispatcher oam cannot run (another undici
+  copy's in the global slot, a closed one) fails it with nothing sent; the init object's
+  `protocols` and `headers` are sent (`a_websocket_rides_its_undici_dispatcher_as_undicis_does`,
+  e2e; until the review of #206 every handshake went around the dispatcher and the init
+  object was ignored). What is left: oam also fires the `'close'` (1006, `wasClean` false)
+  the WHATWG spec asks for after that `'error'`, where Node v22.22.2 fires none for a
+  handshake that failed; the `wss:` handshake verifies the server against the bundled
+  Mozilla roots alone, not `node:tls`'s store (`NODE_EXTRA_CA_CERTS`,
+  `tls.setDefaultCACertificates`); and the plain dial honours no `connect.lookup` hook,
+  connect timeout or environment proxy.
 
 **`connect.lookup` on an undici `Agent`**
 
@@ -1707,7 +1714,8 @@ when nothing matches and net connect does not allow the origin. `reply()` (statu
 `deactivate()`, `get(origin)` (a `MockPool`, or a `MockClient` for `connections: 1`),
 `pendingInterceptors()`, `assertNoPendingInterceptors()`, `close()` and `mockErrors` work
 on every entry point a dispatcher has -- `fetch` with `setGlobalDispatcher` or a `dispatcher`
-option, `undici.fetch`, `undici.request`, and a dispatcher's own `request()` -- for http and
+option, `undici.fetch`, `undici.request`, a dispatcher's own `request()`, and a
+`WebSocket`'s handshake (the global one, or `WebSocketInit.dispatcher`) -- for http and
 https origins alike (the in-memory socket is the connection as it is; nothing is wrapped in
 TLS over it), redirect hops included.
 
@@ -1718,9 +1726,12 @@ would make -- to the mock pool's own origin, the one net connect was asked about
 host the request named (a pool passed as the dispatcher of a request to another host, a
 mocked redirect hop), with that origin's `host`, as undici's `MockPool` hands it to its
 `Pool`. Pinned against Node + undici 6.29.0 by `undici_mock_agent_answers_as_undicis_does`,
-`undici_mock_agent_never_reaches_the_network_unless_allowed` and
-`a_pool_sends_every_request_to_its_own_origin_mocked_or_not` (e2e; local servers count
-what reaches them). What differs:
+`undici_mock_agent_never_reaches_the_network_unless_allowed`,
+`a_pool_sends_every_request_to_its_own_origin_mocked_or_not` and
+`a_websocket_rides_its_undici_dispatcher_as_undicis_does` (e2e; local servers count what
+reaches them; until the review of #206 a `WebSocket` consulted no dispatcher, so its
+handshake reached the real host under a MockAgent that had disabled net connect). What
+differs:
 
 - **What the matchers and a reply callback see is the request as sent.** The body is the
   bytes that went out, as a UTF-8 string (`null` with none), where undici's fetch hands them

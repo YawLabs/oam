@@ -3631,6 +3631,75 @@
   brand(ErrorEvent, "ErrorEvent");
 
   // ------------------------------------------------------------ WebSocket
+  // How a WebSocket's handshake goes out, by the undici dispatcher it rides,
+  // as fetch's request does: node's WebSocket (undici's) sends its handshake
+  // through `WebSocketInit.dispatcher`, else the global dispatcher, so a
+  // MockAgent with net connect disabled fails it with no connection made,
+  // one that allows the host passes it through, a Pool pins it to its
+  // origin, and an Agent's `connect` makes its connection (measured on node
+  // v22.22.2 + undici 6.29.0). The same dispatcherPolicy fetch asks:
+  // `{ refuse }` for a dispatcher oam cannot run (another undici copy's in
+  // the global slot, a closed one, a `dispatch()` override); `{ url,
+  // connector, params }` for one whose `connect` function makes the
+  // connection, which the handshake then runs over; `{ url }` for the plain
+  // dial -- `url` being the socket's, or the pinned origin's with its path.
+  // No dispatcher anywhere (undici never imported) is the plain dial, at the
+  // cost of one read.
+  function websocketRoute(url, given) {
+    const holder = globalThis.__oamUndiciDispatcher;
+    if (given == null) {
+      if (foreignGlobalDispatcher() !== null) {
+        return {
+          refuse: new undiciErrors.NotSupportedError(
+            "The global dispatcher was installed by another copy of undici: oam cannot run its dispatch()",
+          ),
+        };
+      }
+      if (holder === undefined || holder.current == null) return { url: url.href };
+    }
+    const dispatcher = given ?? holder.current;
+    const target = new URL(url.href);
+    target.protocol = url.protocol === "wss:" ? "https:" : "http:";
+    const policy = dispatcherPolicy(dispatcher, holder, { url: target.href, headerNames: [] });
+    if (policy.refuse) return { refuse: policy.refuse };
+    if (policy.pinnedOrigin !== undefined) {
+      const pin = new URL(policy.pinnedOrigin);
+      target.protocol = pin.protocol;
+      target.hostname = pin.hostname;
+      target.port = pin.port;
+    }
+    const dial = new URL(target.href);
+    dial.protocol = target.protocol === "https:" ? "wss:" : "ws:";
+    if (!policy.connector) return { url: dial.href };
+    const hostname = target.hostname.startsWith("[") ? target.hostname.slice(1, -1) : target.hostname;
+    return {
+      url: dial.href,
+      connector: policy.connector,
+      params: {
+        host: target.host,
+        hostname,
+        protocol: target.protocol,
+        port: target.port,
+        servername: null,
+        localAddress: null,
+      },
+    };
+  }
+
+  // The handshake over a connector's socket: the connection it hands back
+  // is piped in as a connector-mode fetch's is, and the native handshake
+  // runs over it (no TLS of its own: the connector's is the connection's).
+  async function websocketOverConnector(route, wire) {
+    const socket = await runConnector(route.connector, route.params);
+    const supplied = supplySocket(socket);
+    try {
+      return await globalThis.__oam.wsConnect(JSON.stringify({ ...wire, pipe: supplied.id }));
+    } catch (e) {
+      supplied.close();
+      throw e;
+    }
+  }
+
   const CONNECTING = 0;
   const OPEN = 1;
   const CLOSING = 2;
@@ -3664,11 +3733,26 @@
       this.onclose = null;
       this.onerror = null;
 
+      // undici's WebSocketInit: an object that is not a sequence carries
+      // `protocols`, `dispatcher` and `headers`.
+      let init = null;
+      if (protocols !== null && typeof protocols === "object" && typeof protocols[Symbol.iterator] !== "function") {
+        init = protocols;
+        protocols = init.protocols;
+      }
       const protoList = typeof protocols === "string" ? [protocols]
         : Array.isArray(protocols) ? protocols : [];
+      const headers = [];
+      if (init !== null && init.headers != null) {
+        for (const [name, value] of new Headers(init.headers)) headers.push([name, value]);
+      }
 
-      const wire = JSON.stringify({ url: this._url, protocols: protoList });
-      globalThis.__oam.wsConnect(wire).then(
+      const route = websocketRoute(parsed, init === null ? undefined : init.dispatcher);
+      const wire = { url: route.url, protocols: protoList, headers };
+      const connecting = route.refuse ? Promise.reject(route.refuse)
+        : route.connector ? websocketOverConnector(route, wire)
+        : globalThis.__oam.wsConnect(JSON.stringify(wire));
+      connecting.then(
         (result) => {
           this._handle = result.handle;
           this._protocol = result.protocol || "";
