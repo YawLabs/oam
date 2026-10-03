@@ -74,7 +74,8 @@ type H2Sender = http2::SendRequest<ReqBody>;
 
 /// hyper-util's `pool_idle_timeout`, the reqwest default oam inherited.
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
-/// The reaper never ticks faster than this (hyper-util's `MIN_CHECK`).
+/// The reaper never wakes sooner than this after its last pass (hyper-util's
+/// `MIN_CHECK`): connections parked within it of each other close together.
 const MIN_REAP_TICK: Duration = Duration::from_millis(90);
 /// At most one retry after a reused connection hands a request back unsent; a
 /// fresh connection is never retried, so the loop settles in two.
@@ -435,10 +436,9 @@ impl Pool {
             .is_some_and(|deque| {
                 deque.iter().any(|entry| {
                     !entry.sender.is_closed()
-                        && self
-                            .inner
-                            .idle_timeout
-                            .is_none_or(|timeout| now.duration_since(entry.parked_at) <= timeout)
+                        && self.inner.idle_timeout.is_none_or(|timeout| {
+                            idle_left(timeout, now, entry.parked_at).is_some()
+                        })
                 })
             })
     }
@@ -448,7 +448,7 @@ impl Pool {
         let deque = map.get_mut(key)?;
         while let Some(entry) = deque.pop_front() {
             if let Some(timeout) = self.inner.idle_timeout
-                && Instant::now().duration_since(entry.parked_at) > timeout
+                && idle_left(timeout, Instant::now(), entry.parked_at).is_none()
             {
                 continue; // expired -> drop, close
             }
@@ -631,6 +631,11 @@ impl PoolInner {
     /// Spawn the idle reaper the first time a connection is parked: one task per
     /// pool that drops expired or dead idle entries and self-cancels when the
     /// pool is gone. Lazy skip-on-checkout handles the rest.
+    ///
+    /// It wakes when the oldest idle connection expires, not on a fixed tick:
+    /// a tick of the timeout itself (hyper-util's) closed a connection parked
+    /// just after a tick only at the tick after next, up to twice the timeout
+    /// after it went idle.
     fn ensure_reaper(self: &Arc<Self>) {
         let Some(timeout) = self.idle_timeout else {
             return;
@@ -639,34 +644,49 @@ impl PoolInner {
             return;
         }
         let weak = Arc::downgrade(self);
-        let tick = timeout.max(MIN_REAP_TICK);
         tokio::spawn(async move {
+            let mut wait = timeout;
             loop {
-                tokio::time::sleep(tick).await;
+                tokio::time::sleep(wait.max(MIN_REAP_TICK)).await;
                 match weak.upgrade() {
-                    Some(inner) => inner.clear_expired(),
+                    Some(inner) => wait = inner.clear_expired(timeout),
                     None => break,
                 }
             }
         });
     }
 
-    fn clear_expired(&self) {
-        let Some(timeout) = self.idle_timeout else {
-            return;
-        };
+    /// Drop the idle connections that have been idle for `timeout` and the
+    /// dead ones, and return how long until the next one left expires
+    /// (`timeout` when none is idle: one parked from now on expires no
+    /// sooner).
+    fn clear_expired(&self, timeout: Duration) -> Duration {
         let now = Instant::now();
+        let mut next = timeout;
         let mut idle = self.idle.lock().unwrap_or_else(|e| e.into_inner());
         idle.retain(|_, deque| {
-            deque.retain(|entry| {
-                now.duration_since(entry.parked_at) <= timeout && !entry.sender.is_closed()
+            deque.retain(|entry| match idle_left(timeout, now, entry.parked_at) {
+                Some(left) if !entry.sender.is_closed() => {
+                    next = next.min(left);
+                    true
+                }
+                _ => false,
             });
             !deque.is_empty()
         });
         drop(idle);
         let mut h2 = self.h2.lock().unwrap_or_else(|e| e.into_inner());
         h2.retain(|_, entry| !entry.sender.is_closed());
+        next
     }
+}
+
+/// How long a connection parked at `parked_at` may stay idle after `now`;
+/// `None` once it has been idle for `timeout`.
+fn idle_left(timeout: Duration, now: Instant, parked_at: Instant) -> Option<Duration> {
+    timeout
+        .checked_sub(now.saturating_duration_since(parked_at))
+        .filter(|left| !left.is_zero())
 }
 
 /// Settles once the h1 connection a response came on is done with it: parked
@@ -951,6 +971,123 @@ fn authority_form(uri: &mut Uri) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The reaper closes an idle connection when its timeout is up, wherever
+    /// its park fell between the reaper's passes. With a fixed tick of the
+    /// timeout, a connection parked just after a tick lived to the tick
+    /// after next: here the second connection, parked 0.6 timeouts after
+    /// the first (whose park started the reaper), stayed idle 1.4 timeouts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reaper_closes_an_idle_connection_at_its_timeout() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        const TIMEOUT: Duration = Duration::from_millis(1000);
+        // An origin whose connections answer one request, keep alive, and
+        // report how long after the answer the client closed them.
+        async fn origin(closed: tokio::sync::mpsc::UnboundedSender<Duration>) -> u16 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let closed = closed.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 4096];
+                        let mut head = Vec::new();
+                        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                            let n = stream.read(&mut buf).await.unwrap();
+                            assert!(n > 0, "closed before the request");
+                            head.extend_from_slice(&buf[..n]);
+                        }
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                            .await
+                            .unwrap();
+                        let answered = Instant::now();
+                        while stream.read(&mut buf).await.unwrap_or(0) > 0 {}
+                        let _ = closed.send(answered.elapsed());
+                    });
+                }
+            });
+            port
+        }
+        let (closed_tx, mut closed_rx) = tokio::sync::mpsc::unbounded_channel();
+        // Two origins, so the second request opens a connection of its own.
+        let first = origin(closed_tx.clone()).await;
+        let second = origin(closed_tx).await;
+        let pool = Pool::new(
+            OamConnector {
+                shared: Arc::new(super::super::connector::Shared {
+                    tls: super::super::TlsSource::Unavailable("not used".into()),
+                    proxy: None,
+                    user_agent: http::HeaderValue::from_static("oam-test"),
+                    tls_range: std::sync::atomic::AtomicU8::new(
+                        super::super::TlsRange::Both.code(),
+                    ),
+                }),
+                via: super::super::connector::Via::Pooled,
+            },
+            Some(TIMEOUT),
+        );
+        let get = |port: u16| {
+            let pool = pool.clone();
+            async move {
+                let mut req = Request::new(super::super::transport::empty_body());
+                *req.uri_mut() = format!("http://127.0.0.1:{port}/").parse().unwrap();
+                let dial = Dial {
+                    connect_timeout: None,
+                    alpn: Alpn::default(),
+                    attempt_timeout: Duration::from_millis(250),
+                    pin: None,
+                };
+                let response = pool.request(req, false, dial, None).await.ok().unwrap();
+                let released = response.extensions().get::<Released>().cloned().unwrap();
+                http_body_util::BodyExt::collect(response.into_body())
+                    .await
+                    .unwrap();
+                released.settled().await;
+            }
+        };
+        get(first).await;
+        tokio::time::sleep(TIMEOUT * 6 / 10).await;
+        get(second).await;
+        for _ in 0..2 {
+            let idle = tokio::time::timeout(TIMEOUT * 3, closed_rx.recv())
+                .await
+                .expect("an idle connection was never closed")
+                .unwrap();
+            assert!(
+                idle >= TIMEOUT - Duration::from_millis(50)
+                    && idle < TIMEOUT + Duration::from_millis(350),
+                "an idle connection closed {idle:?} after its answer; the timeout is {TIMEOUT:?}"
+            );
+        }
+    }
+
+    /// The idle rule the reaper and a checkout share: a connection may stay
+    /// idle for the timeout and no longer, and what is left of it is what
+    /// the reaper sleeps for -- so a connection closes at the timeout, not
+    /// up to a whole tick after it.
+    #[test]
+    fn an_idle_connection_expires_at_the_timeout() {
+        let timeout = Duration::from_secs(90);
+        let parked = Instant::now();
+        assert_eq!(idle_left(timeout, parked, parked), Some(timeout));
+        assert_eq!(
+            idle_left(timeout, parked + Duration::from_secs(89), parked),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(idle_left(timeout, parked + timeout, parked), None);
+        assert_eq!(
+            idle_left(timeout, parked + Duration::from_secs(175), parked),
+            None
+        );
+        // A clock read before the park (another thread's `now`) is not idle
+        // time.
+        assert_eq!(
+            idle_left(timeout, parked, parked + Duration::from_secs(1)),
+            Some(timeout)
+        );
+    }
 
     /// A marker error the send path's classifiers look for, to prove
     /// `PoolError::source()` reproduces the chain `find_in_chain` walks. The

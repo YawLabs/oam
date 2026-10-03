@@ -1593,9 +1593,11 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
   answers with the same address, which asks the hook and opens its own, as in Node. An IP
   literal on the same `Agent` never asks the hook and gets its own connection. Each `Agent`
   has its own pool: another `Agent`'s hook never sees its connections used. An answer opens
-  exactly the connection it was asked for. The pool closes its idle connections after 90 s
-  (the shared pool's idle timeout; undici's keep-alive default is 4 s), and all of them when
-  the `Agent` is `close()`d or `destroy()`ed, or garbage-collected without either.
+  exactly the connection it was asked for. The pool closes an HTTP/1.1 connection 90 s after
+  its last response (the shared pool's idle timeout; undici's keep-alive default is 4 s,
+  measured: node closed each at 4.0 s); an `allowH2` session stays open while it is idle, in
+  Node too (neither closed one in 200 s). It closes all of them when the `Agent` is
+  `close()`d or `destroy()`ed, or garbage-collected without either.
 - **A hook that calls back twice** counts, as in Node, while the connection its answer opens
   is still being made (#169): after an answer, a second callback with an error, a second
   answer Node's address rules refuse, or a throw from the hook fails the fetch with that
