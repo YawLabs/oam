@@ -33,10 +33,13 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   and a net server's `listen(path)` need unrestricted `--allow-net` or an absolute entry equal
   to the path -- never a host entry, a prefix or a relative entry -- and a pipe path that is a
   file (every Unix socket path; on Windows every path outside `\\<server>\pipe\`, and every
-  path with a `.` or `..` component, which Win32 folds out of `\\.\pipe\..\C:\x`) needs
-  `--allow-fs-read` and `--allow-fs-write` for it too, so a dial cannot report what the fs
-  grant hides. A relative path is resolved against the cwd of the moment, and that resolved
-  path is what is dialled or bound. Refused with `ERR_ACCESS_DENIED` from the call.
+  path with a component made only of dots and spaces, such as `.` or `..`: Win32 opens
+  `\\.\pipe\..\C:\x` as `\\.\C:\x`) needs `--allow-fs-read` and `--allow-fs-write` for it
+  too, so a dial cannot report what the fs grant hides. A list fs grant in drive form
+  (`C:\x`) never matches such a `\\`-prefixed spelling, so in practice only unrestricted
+  `--allow-fs-read` and `--allow-fs-write` admit one. A relative path is resolved against the
+  cwd of the moment, and that resolved path is what is dialled or bound. Refused with
+  `ERR_ACCESS_DENIED` from the call.
   `http.request({ socketPath })` needs only the pipe's grant; a `fetch`, `undici.request` or
   `WebSocket` through undici's `Agent({ connect: { socketPath } })` (or any custom `connect`)
   is checked against its URL's `host:port` too, so it needs that host's grant as well. Node 22

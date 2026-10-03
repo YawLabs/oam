@@ -3364,9 +3364,13 @@ booting and then failing every browser tool.
   server's close unlinks it), and on Windows every path outside the named-pipe namespace
   (`\\<server>\pipe\...`) is, since the dial opens it read-write -- without that, the dial's
   error (`ENOTSOCK`, `ENOENT`, `EPERM`) would say whether a file the fs grant hides exists.
-  A Windows path with a component made only of dots and spaces (`.`, `..`, `. `) is outside
-  that namespace whatever its prefix, since Win32 folds such components when it normalises
-  the path: `\\.\pipe\..\C:\x` opens `\\.\C:\x`, so it needs the fs grants too.
+  A Windows path with any component made only of dots and spaces (`.`, `..`, `...`, `. `),
+  anywhere and under any prefix, is outside that namespace, since Win32 folds such
+  components when it normalises the path -- Win32 opens `\\.\pipe\..\C:\x` as `\\.\C:\x` --
+  so it is judged as a file, by the fs grants as well as net. A list fs grant written in
+  drive form (`--allow-fs-read=C:\x`) never matches such a `\\`-prefixed spelling (the gate
+  reads it as `/C:/x`), so in practice only unrestricted `--allow-fs-read` and
+  `--allow-fs-write` admit it.
   A relative path is resolved against the cwd of the moment, as an fs path is, and the op
   then dials or binds that resolved path; only an absolute entry grants a pipe, so
   `--allow-net=app.sock` grants none -- a relative grant would name another socket after
