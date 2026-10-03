@@ -32,7 +32,8 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 - **A pipe is a net resource named by its path.** Under `--permission`, `net.connect(path)`
   and a net server's `listen(path)` need unrestricted `--allow-net` or an absolute entry equal
   to the path -- never a host entry, a prefix or a relative entry -- and a pipe path that is a
-  file (every Unix socket path; on Windows every path outside `\\<server>\pipe\`) needs
+  file (every Unix socket path; on Windows every path outside `\\<server>\pipe\`, and every
+  path with a `.` or `..` component, which Win32 folds out of `\\.\pipe\..\C:\x`) needs
   `--allow-fs-read` and `--allow-fs-write` for it too, so a dial cannot report what the fs
   grant hides. A relative path is resolved against the cwd of the moment, and that resolved
   path is what is dialled or bound. Refused with `ERR_ACCESS_DENIED` from the call. Node 22

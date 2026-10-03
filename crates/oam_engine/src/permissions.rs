@@ -123,8 +123,26 @@ fn resolve_against_cwd(raw: &str) -> std::borrow::Cow<'_, str> {
 /// remote `\\host\pipe\x`; `pipe` in any letter case): a name the OS hands
 /// to the named-pipe file system, never a file on disk. Every other path a
 /// pipe op is given is opened as a file. Unix has no such namespace.
+///
+/// A path with a component made only of dots and spaces (`.`, `..`, `...`,
+/// `. `), anywhere and under any prefix, is NOT in the namespace: Win32
+/// folds such components while it normalises a `\\.\` path (`..` drops the
+/// component before it; trailing dots and spaces are trimmed), so
+/// `\\.\pipe\..\C:\x` is opened as `\\.\C:\x`, a file. Such a path is judged
+/// as one, by the fs grants as well as net. (The `.` server of the local
+/// device root `\\.\` itself is the one such component taken as given; it
+/// is never folded.) No pipe name needs such a component, and a path wrongly
+/// judged "not a pipe" only has the fs grants asked as well -- the check
+/// fails closed. Any other component the normaliser could alter (`pipe.`,
+/// `pipe `) already fails the exact `pipe` match below.
 #[cfg(windows)]
 fn is_named_pipe_namespace(path: &str) -> bool {
+    let dots_and_spaces = |c: &str| !c.is_empty() && c.bytes().all(|b| b == b'.' || b == b' ');
+    // The server of the local device root `\\.\` is the one `.` allowed.
+    let mut components = path.split(['\\', '/']).enumerate();
+    if components.any(|(i, c)| dots_and_spaces(c) && !(i == 2 && c == ".")) {
+        return false;
+    }
     let mut parts = path.split(['\\', '/']);
     // `\\` (two empty components), a server, `pipe`, and a non-empty name.
     matches!(
@@ -1062,6 +1080,38 @@ mod tests {
             for name in [r"\\.\C:\x", r"\\?\C:\x", r"\\.\pipe\", r"\\.\pipe"] {
                 assert!(read_only.check_pipe(name).is_err(), "{name}");
             }
+            // Win32 folds a `.`/`..` (or dots-and-spaces) component while it
+            // normalises a `\\.\` path, so `\\.\pipe\..\C:\x` opens
+            // `\\.\C:\x`: such a path is judged as a file, by the fs grants.
+            let in_cwd = format!(r"\\.\pipe\..\..\{}", outside);
+            for name in [
+                r"\\.\pipe\..\C:\x",
+                r"\\.\pipe\x\..\..\C:\x",
+                "//./pipe/../C:/x",
+                r"\\.\pipe/x\..\..\C:\x",
+                r"\\.\pipe\.\x",
+                r"\\.\pipe\x\.",
+                r"\\.\pipe\x\...",
+                r"\\.\pipe\x\.. ",
+                r"\\..\pipe\x",
+                r"\\?\pipe\..\x",
+                in_cwd.as_str(),
+            ] {
+                assert!(!is_named_pipe_namespace(name), "{name}");
+                assert_eq!(
+                    p.check_pipe(name).unwrap_err().permission,
+                    "FileSystemRead",
+                    "{name}"
+                );
+            }
+            // With fs grants covering what it opens, it passes: the gate is
+            // the fs one, not a refusal of the spelling.
+            let fs_all = Permissions {
+                read: PermValue::All,
+                write: PermValue::All,
+                ..p.clone()
+            };
+            assert!(fs_all.check_pipe(r"\\.\pipe\..\C:\x").is_ok());
         } else {
             // Every socket path is a file.
             assert!(read_only.check_pipe(r"\\.\pipe\app").is_err());
