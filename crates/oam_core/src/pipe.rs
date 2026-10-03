@@ -93,6 +93,17 @@ mod windows {
     /// was admitted one per accept, the rest finding the pipe busy.
     const PENDING_INSTANCES: usize = 4;
 
+    /// The most one write hands the pipe at a time: the pipe's buffer
+    /// (tokio's default in and out buffer, as libuv's 64 KiB). tokio's named
+    /// pipe takes a write whole into a buffer of its own and reports every
+    /// byte written while its overlapped WriteFile is still waiting for room,
+    /// so a write handed over whole was "done" before the peer could have
+    /// any of it. In chunks, a chunk is handed over only once the one before
+    /// it has gone into the pipe, so a write is reported done with at most
+    /// its last chunk still waiting for room (see docs/node-divergences.md,
+    /// entry 49).
+    const WRITE_CHUNK: usize = 64 * 1024;
+
     /// One end of a connected named pipe.
     enum End {
         Client(NamedPipeClient),
@@ -198,20 +209,22 @@ mod windows {
     }
 
     impl PipeWrite {
-        /// As much of `data` as the pipe takes now, without waiting.
+        /// As much of `data` as the pipe takes now, without waiting: at most
+        /// [`WRITE_CHUNK`], and nothing while the chunk before is still
+        /// waiting for room in the pipe.
         pub(crate) fn try_write(&self, data: &[u8]) -> io::Result<usize> {
             if data.is_empty() {
                 // No zero-length WriteFile: on a message-mode pipe it would
                 // be an empty message.
                 return Ok(0);
             }
-            self.0.end.try_write(data)
+            self.0.end.try_write(&data[..data.len().min(WRITE_CHUNK)])
         }
 
         pub(crate) async fn write_all(&mut self, mut data: &[u8]) -> io::Result<()> {
             while !data.is_empty() {
                 self.0.end.writable().await?;
-                match self.0.end.try_write(data) {
+                match self.try_write(data) {
                     Ok(n) => data = &data[n..],
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                     Err(e) => return Err(e),

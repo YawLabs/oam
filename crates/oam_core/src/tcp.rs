@@ -2195,6 +2195,29 @@ mod tests {
         assert_eq!(registry.lock().unwrap().bookkeeping(), (0, 0, 0, 0, 0));
     }
 
+    /// A named-pipe server (`tag`) and one connected pair, as (server id,
+    /// client handle, server handle).
+    #[cfg(windows)]
+    async fn named_pipe_pair(
+        registry: &TcpRegistry,
+        ids: &std::sync::Arc<AtomicU64>,
+        tag: &str,
+    ) -> (u64, u64, u64) {
+        let path = test_pipe_path(tag);
+        let server_id = json(
+            pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await,
+        )["serverId"]
+            .as_u64()
+            .unwrap();
+        let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
+        let c =
+            json(pipe_connect(registry.clone(), ids.clone(), path.clone(), path).await)["handle"]
+                .as_u64()
+                .unwrap();
+        let s = json(accepting.await.unwrap())["handle"].as_u64().unwrap();
+        (server_id, c, s)
+    }
+
     /// Regression guard: a listening named pipe kept ONE instance waiting,
     /// so a second client found the pipe busy until the server's next
     /// accept -- a burst of clients was admitted one per accept. libuv keeps
@@ -2285,6 +2308,52 @@ mod tests {
         for handle in clients.into_iter().chain(servers) {
             tcp_close(&registry, handle);
         }
+        tcp_server_close(&registry, server_id);
+        assert_eq!(registry.lock().unwrap().bookkeeping(), (0, 0, 0, 0, 0));
+    }
+
+    /// Regression guard: tokio's named pipe takes a write whole into a
+    /// buffer of its own and reports it written while its WriteFile still
+    /// waits for room, so a 1 MiB write to a peer that reads nothing was
+    /// done at once -- its callback ran where node's never does, and
+    /// `destroy()` could not keep any of it from the peer. Handed over in
+    /// pipe-buffer chunks, it is done only once the peer has made room for
+    /// all but its last chunk; a write that fits is still done in the call.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_named_pipe_write_is_done_only_once_the_pipe_has_taken_it() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let (server_id, c, s) = named_pipe_pair(&registry, &ids, "write-done").await;
+
+        assert!(
+            matches!(
+                tcp_write_start(registry.clone(), c, vec![1u8; 100]),
+                Started::Done(OpOutcome::Done)
+            ),
+            "a write the pipe has room for is done in the call"
+        );
+        const LEN: usize = 1024 * 1024;
+        let writing = match tcp_write_start(registry.clone(), c, vec![2u8; LEN]) {
+            Started::Pending(rest) => tokio::spawn(rest),
+            Started::Done(_) => panic!("1 MiB the peer has not read is not done in the call"),
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            !writing.is_finished(),
+            "nor is it done while the peer reads nothing"
+        );
+        let mut read = 0;
+        while read < LEN + 100 {
+            match tcp_read(registry.clone(), s, 65536).await {
+                OpOutcome::Bytes(b) => read += b.len(),
+                _ => panic!("every byte arrives"),
+            }
+        }
+        let wrote = tokio::time::timeout(std::time::Duration::from_secs(10), writing).await;
+        assert!(matches!(wrote, Ok(Ok(OpOutcome::Done))));
+        tcp_close(&registry, c);
+        tcp_close(&registry, s);
         tcp_server_close(&registry, server_id);
         assert_eq!(registry.lock().unwrap().bookkeeping(), (0, 0, 0, 0, 0));
     }

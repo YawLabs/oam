@@ -3178,6 +3178,16 @@ booting and then failing every browser tool.
   named-pipe layer under tokio reads into a 4 KiB buffer), where Node's reads are up to
   64 KiB: `'data'` chunks are smaller, and an 8 MiB echo took ~115-150 ms on a debug build
   where Node took ~30-40 ms (TCP on the same build: ~35-40 ms). _(measured, debug build)_
+- **Windows: when a write is done.** A write to a peer that does not read stays pending, its
+  callback unrun and its bytes in `writableLength`, as in Node
+  (`conformance/cases/374-net-pipe-write-settling.mjs`). But the named-pipe layer under
+  tokio takes what it is handed into a buffer of its own and calls it written while its
+  WriteFile still waits for room, so oam hands a pipe at most 64 KiB (the pipe's buffer) at
+  a time and a write is done once all but its last 64 KiB are in the pipe; Node's is done
+  once all of it is. That last part is still delivered after a `destroy()` -- Node's close
+  cancels a WriteFile still waiting -- so a peer that reads after the writer was destroyed
+  can get up to 64 KiB more than from Node: a 1 MiB write, `destroy()` 300 ms later, and a
+  peer that starts reading after that got 131072 bytes on oam, 65536 on Node. _(measured)_
 - **Windows: a pipe that is read-only or write-only to the caller.** libuv retries a dial
   that was denied read-write as read-only, then write-only; oam does not, and reports the
   denial (`EPERM`). _(source)_
