@@ -239,6 +239,12 @@ mod windows {
         /// both ways -- the read half reads EOF from here on. The flush's
         /// own failure (the peer gone) is not reported, as node's
         /// afterShutdown reports none.
+        ///
+        /// Abandoned before the flush returns -- the stream closed while the
+        /// peer still had not read it all -- the flush is cancelled
+        /// ([`FlushThread`]): left blocked, its thread and the duplicated
+        /// handle it flushes through, which holds the pipe open, lived until
+        /// the peer read or went.
         pub(crate) async fn shutdown(&mut self) {
             if let Ok(handle) = self.0.end.handle().try_clone_to_owned() {
                 let (done, flushed) = tokio::sync::oneshot::channel();
@@ -252,12 +258,51 @@ mod windows {
                         let _ = std::fs::File::from(handle).sync_all();
                         let _ = done.send(());
                     });
-                if spawned.is_ok() {
+                if let Ok(thread) = spawned {
+                    let flush = FlushThread(Some(thread));
                     let _ = flushed.await;
+                    flush.finished();
                 }
             }
             self.0.shut.store(true, Ordering::Release);
             self.0.shut_wake.notify_waiters();
+        }
+    }
+
+    /// The thread a pipe shutdown flushes on. Dropped before the flush has
+    /// returned, it cancels the flush, so the thread and its handle go.
+    struct FlushThread(Option<std::thread::JoinHandle<()>>);
+
+    impl FlushThread {
+        /// The flush returned: nothing to cancel.
+        fn finished(mut self) {
+            self.0 = None;
+        }
+    }
+
+    impl Drop for FlushThread {
+        fn drop(&mut self) {
+            use std::os::windows::io::AsRawHandle;
+            let Some(thread) = self.0.take() else {
+                return;
+            };
+            // The thread may not be inside the flush yet (it was only just
+            // started): a cancel then finds nothing and is tried again, until
+            // the thread is through -- one try once it is blocked in the
+            // flush. Bounded, so a flush that cannot be cancelled costs what
+            // it cost before, and never a hang here.
+            for _ in 0..1000 {
+                if thread.is_finished() {
+                    return;
+                }
+                // SAFETY: the handle is the thread's own, owned by `thread`,
+                // which is neither joined nor dropped until after the call;
+                // CancelSynchronousIo only reads it.
+                unsafe {
+                    windows_sys::Win32::System::IO::CancelSynchronousIo(thread.as_raw_handle());
+                }
+                std::thread::yield_now();
+            }
         }
     }
 

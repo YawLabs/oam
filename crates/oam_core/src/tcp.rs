@@ -2357,4 +2357,42 @@ mod tests {
         tcp_server_close(&registry, server_id);
         assert_eq!(registry.lock().unwrap().bookkeeping(), (0, 0, 0, 0, 0));
     }
+
+    /// Regression guard: a named pipe's shutdown flushes on a thread of its
+    /// own through a duplicated handle, and a close only abandoned the wait
+    /// for it, so with a peer that never reads, the thread and the handle --
+    /// which holds the pipe open -- outlived the close until the peer read
+    /// or went: one thread per such socket. The close cancels the flush now,
+    /// so the pipe closes and the peer's next write fails.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_close_cancels_the_shutdown_flush_a_peer_never_reads() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let (server_id, c, s) = named_pipe_pair(&registry, &ids, "flush-cancel").await;
+
+        assert!(matches!(
+            tcp_write_start(registry.clone(), c, vec![1u8; 32 * 1024]),
+            Started::Done(OpOutcome::Done)
+        ));
+        let shutting = tokio::spawn(tcp_shutdown(registry.clone(), c));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!shutting.is_finished(), "the flush waits for the peer");
+        tcp_close(&registry, c);
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), shutting).await;
+        assert!(matches!(closed, Ok(Ok(OpOutcome::Done))));
+
+        // The client's pipe is closed for good: the server's write fails.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while let OpOutcome::Done = tcp_write(registry.clone(), s, b"x".to_vec()).await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the client end stays open after its close"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        tcp_close(&registry, s);
+        tcp_server_close(&registry, server_id);
+        assert_eq!(registry.lock().unwrap().bookkeeping(), (0, 0, 0, 0, 0));
+    }
 }
