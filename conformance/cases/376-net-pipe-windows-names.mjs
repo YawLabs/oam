@@ -4,9 +4,9 @@
 // server was given it. A name that is not a pipe's cannot be listened on
 // (`listen EACCES`), and dialling one fails as libuv's CreateFileW does: a
 // regular file is ENOTSOCK, a directory EPERM, a missing name ENOENT.
-// Elsewhere these are Unix domain socket paths, covered by case 371.
+// Elsewhere these are Unix domain socket paths, covered by case 375.
 //
-// Regression guard: oam had no pipe client or server at all (see 371).
+// Regression guard: oam had no pipe client or server at all (see 375).
 import net from "node:net";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
