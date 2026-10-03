@@ -65,6 +65,13 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Fixed
 
+- **`process.loadEnvFile()` with no path named the resolved `.env` on Windows**
+  (`open 'C:\cwd\.env'`); node's binding opens its own `.env` untouched and says `open '.env'`.
+  A path given to it is still checked and named as fs names it: `loadEnvFile(42)` is
+  `ERR_INVALID_ARG_TYPE` instead of a read of descriptor 42, `loadEnvFile("")` fails on `''`
+  instead of reading `.env`, any failure to open is node's `ENOENT`, and a path that opens but
+  cannot be read (a directory) is node's `Contents of '<path>' should be a valid string.`
+  (refs #167)
 - **Over HTTP/2, a `fetch` response header value kept the whitespace around it**; it is trimmed
   as it is over HTTP/1, and the trimming is recorded as a divergence from node's `fetch`, which
   keeps trailing whitespace. (#182)
