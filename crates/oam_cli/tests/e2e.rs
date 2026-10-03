@@ -28228,14 +28228,15 @@ process.exit(0);
 /// A response header value reads without the whitespace around it whichever
 /// protocol carried it (#182). Over HTTP/1 the parser under hyper trims it;
 /// an HTTP/2 value reached fetch as sent, so the same server's
-/// `x-ows:   a<TAB>b   ` read `"   a\tb   "` over h2 (which oam's fetch
-/// negotiates with an https origin) and `"a\tb"` over HTTP/1. Whitespace
-/// inside a value is kept on both.
+/// `x-ows:   a<TAB>b   ` read `"   a\tb   "` over h2 (which a fetch speaks
+/// through a dispatcher with undici's `allowH2`, #176) and `"a\tb"` over
+/// HTTP/1. Whitespace inside a value is kept on both.
 #[test]
 fn fetch_trims_header_value_whitespace_over_h2_as_over_http1() {
     let bundle = write_temp("h2-ows-extra-ca/ca.pem", TLS_TEST_CA_CERT);
     let src = r#"import http2 from 'node:http2';
 import net from 'node:net';
+import { Agent } from 'undici';
 const names = ['x-ows', 'x-lead', 'x-trail-tab', 'x-inner'];
 const read = (r) => JSON.stringify(names.map((n) => r.headers.get(n)));
 const seen = [];
@@ -28248,7 +28249,7 @@ const h2 = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__` }, (req, 
   res.end('ok');
 });
 await new Promise((r) => h2.listen(0, '127.0.0.1', r));
-const a = await fetch(`https://localhost:${h2.address().port}/`);
+const a = await fetch(`https://localhost:${h2.address().port}/`, { dispatcher: new Agent({ allowH2: true }) });
 await a.text();
 console.log(seen.join(','), read(a));
 const h1 = net.createServer((s) => s.once('data', () => s.end(
