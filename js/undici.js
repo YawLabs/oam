@@ -28,11 +28,13 @@
 //    same way: each origin's dispatcher from it decides that origin's
 //    connections. (See the Dispatcher constructor's _oamConnect bridge and
 //    globalThis.fetch's connector mode.)
-//  - `allowH2` (the dispatcher's own option, or `connect.allowH2`, which wins
-//    as in undici) IS honored: the connections the request opens to an https
-//    origin offer ALPN `http/1.1, h2` and speak HTTP/2 when the origin picks
-//    it. Without it they offer `http/1.1` alone, as undici's do by default
-//    -- node's fetch never speaks HTTP/2 unless asked (#176).
+//  - `allowH2` (the dispatcher's own option, a boolean as undici's Client
+//    requires, or `connect.allowH2`, which wins and is tested for
+//    truthiness, as in undici) IS honored: the connections the request
+//    opens to an https origin offer ALPN `http/1.1, h2` and speak HTTP/2
+//    when the origin picks it. Without it they offer `http/1.1` alone, as
+//    undici's do by default -- node's fetch never speaks HTTP/2 unless asked
+//    (#176).
 //  - A Dispatcher/Agent with a `connect.lookup` hook IS honored, as undici
 //    honors it: the hook is called before the fetch connects to a host name
 //    -- the first request AND every redirect hop to another host -- and the
@@ -221,6 +223,7 @@
       }
       const dispatcherHeadersTimeout = dispatcherTimeout("headersTimeout", serving);
       const dispatcherBodyTimeout = dispatcherTimeout("bodyTimeout", serving);
+      checkDispatcherAllowH2(serving);
       const headersTimeout = phaseTimeout("headersTimeout", opts, dispatcherHeadersTimeout);
       const bodyTimeout = phaseTimeout("bodyTimeout", opts, dispatcherBodyTimeout);
       // Both limits end the request the way an abort does, so the fetch runs
@@ -843,6 +846,36 @@
       }
     }
 
+    // undici's Client check of its allowH2 (lib/dispatcher/client.js):
+    // true, false, or none. connect.allowH2 is not checked: it goes to the
+    // connector, which tests it for truthiness.
+    function checkAllowH2(value) {
+      if (value != null && typeof value !== "boolean") {
+        throw new errors.InvalidArgumentError("allowH2 must be a valid boolean value");
+      }
+    }
+
+    // The allowH2 a dispatcher's undici Clients are built with. A Client's
+    // and a Pool's is their own; an Agent (and so a ProxyAgent or an
+    // EnvHttpProxyAgent) or a BalancedPool passes its options through JSON
+    // first (util.deepClone), so NaN or an Infinity reaches the Client as
+    // null and a function or a symbol not at all -- neither refused nor
+    // asking for h2 (measured on undici 6.24.1).
+    function clientAllowH2(dispatcher) {
+      const value = dispatcher._options.allowH2;
+      if (dispatcher instanceof Client) return value;
+      if (typeof value === "number" && !Number.isFinite(value)) return null;
+      if (typeof value === "function" || typeof value === "symbol") return undefined;
+      return value;
+    }
+
+    // A dispatcher's allowH2, refused as its Client refuses it. A Client
+    // checked it when it was built; the others build their Clients when a
+    // request needs one, so undici refuses a bad value there, on the request.
+    function checkDispatcherAllowH2(dispatcher) {
+      if (dispatcher && dispatcher._options) checkAllowH2(clientAllowH2(dispatcher));
+    }
+
     // A dispatcher's own headersTimeout / bodyTimeout, or null. A Client
     // checked it when it was built. An Agent, Pool, BalancedPool, ProxyAgent
     // or EnvHttpProxyAgent builds its Clients when a request needs one, so
@@ -1016,13 +1049,15 @@
         //    Client hands its connector `{ allowH2, ...connect }`, so a
         //    `connect.allowH2` -- false included -- wins over the option, and
         //    the connector tests the value for truthiness (measured on node
-        //    v22.22.2 + undici 6.24.1).
+        //    v22.22.2 + undici 6.24.1). The option itself must be a boolean
+        //    (checkAllowH2): a Client refuses any other when it is built, and
+        //    the rest refuse it on each request.
         this._oamConnect = null;
         this._oamConnectLookup = null;
         this._oamConnectTimeout = null;
         const connectOptions = {
           timeout: this._options.connectTimeout,
-          allowH2: this._options.allowH2,
+          allowH2: clientAllowH2(this),
           ...(typeof connect === "object" ? connect : null),
         };
         this._oamAllowH2 = !!connectOptions.allowH2;
@@ -1418,6 +1453,7 @@
         if (!(new.target === Pool || new.target.prototype instanceof Pool)) {
           checkClientTimeout("headersTimeout", options && options.headersTimeout);
           checkClientTimeout("bodyTimeout", options && options.bodyTimeout);
+          checkAllowH2(options && options.allowH2);
         }
         super(options);
         // undici's Client checks the option; a Pool (and so an Agent) takes
@@ -1486,10 +1522,12 @@
       if (request) {
         // A fetch rides the dispatcher's own headersTimeout / bodyTimeout
         // (null: undici's 300 s), checked as its Client checks them -- a bad
-        // one fails the fetch with that InvalidArgumentError as the cause.
+        // one fails the fetch with that InvalidArgumentError as the cause --
+        // and so is its allowH2.
         try {
           policy.headersTimeout = dispatcherTimeout("headersTimeout", dispatcher);
           policy.bodyTimeout = dispatcherTimeout("bodyTimeout", dispatcher);
+          checkDispatcherAllowH2(dispatcher);
         } catch (err) {
           return { refuse: err };
         }

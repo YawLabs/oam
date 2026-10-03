@@ -27986,6 +27986,77 @@ process.exit(0);
     );
 }
 
+/// A dispatcher's own `allowH2` must be a boolean (or none), as undici's
+/// Client requires: a Client refuses any other value when it is built, and
+/// an Agent or a Pool, which build their Clients when a request needs one,
+/// fail each request with that InvalidArgumentError -- fetch with it as the
+/// cause. An Agent passes its options through JSON first, so NaN reaches
+/// the Client as null and a function not at all: neither is refused, and
+/// neither asks for h2. `connect.allowH2` is not checked; the connector
+/// tests it for truthiness. oam used to test the option for truthiness
+/// too, so `allowH2: 'yes'` turned h2 on. Every line was measured on node
+/// v22.22.2 + undici 6.24.1.
+#[test]
+fn a_dispatcher_allowh2_that_is_not_a_boolean_is_refused_as_undicis_client_refuses_it() {
+    let bundle = write_temp("allowh2-check/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import http2 from 'node:http2';
+import { Agent, Pool, Client, request } from 'undici';
+const server = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__`, allowHTTP1: true }, (req, res) => {
+  res.end(req.httpVersion + ' ' + req.socket.alpnProtocol);
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const origin = `https://localhost:${server.address().port}`;
+const show = async (label, p) => {
+  try {
+    const r = await p;
+    console.log(label + ': ' + (r.text ? await r.text() : await r.body.text()));
+  } catch (e) {
+    const c = e.cause || e;
+    console.log(label + ': ' + e.name + ' ' + e.message + ' / ' + c.name + ' ' + c.code + ' ' + c.message);
+  }
+};
+const build = (label, f) => {
+  try { f(); console.log(label + ': built'); } catch (e) { console.log(label + ': ' + e.name + ' ' + e.code + ' ' + e.message); }
+};
+await show('fetch, Agent allowH2 yes', fetch(origin, { dispatcher: new Agent({ allowH2: 'yes' }) }));
+await show('undici.request, Agent allowH2 1', request(origin, { dispatcher: new Agent({ allowH2: 1 }) }));
+await show('undici.request, Pool allowH2 {}', request(origin, { dispatcher: new Pool(origin, { allowH2: {} }) }));
+build('new Client allowH2 0', () => new Client(origin, { allowH2: 0 }));
+await show('undici.request, Agent allowH2 NaN', request(origin, { dispatcher: new Agent({ allowH2: NaN }) }));
+await show('undici.request, Agent allowH2 function', request(origin, { dispatcher: new Agent({ allowH2: () => true }) }));
+await show('undici.request, Pool allowH2 NaN', request(origin, { dispatcher: new Pool(origin, { allowH2: NaN }) }));
+await show('undici.request, Agent allowH2 null', request(origin, { dispatcher: new Agent({ allowH2: null }) }));
+await show('undici.request, Agent allowH2 yes, connect.allowH2 true', request(origin, { dispatcher: new Agent({ allowH2: 'yes', connect: { allowH2: true } }) }));
+await show('undici.request, Agent connect.allowH2 yes', request(origin, { dispatcher: new Agent({ connect: { allowH2: 'yes' } }) }));
+process.exit(0);
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("allowh2_check/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let refused = "InvalidArgumentError UND_ERR_INVALID_ARG allowH2 must be a valid boolean value";
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        format!(
+            "fetch, Agent allowH2 yes: TypeError fetch failed / {refused}\n\
+             undici.request, Agent allowH2 1: InvalidArgumentError allowH2 must be a valid boolean value / {refused}\n\
+             undici.request, Pool allowH2 {{}}: InvalidArgumentError allowH2 must be a valid boolean value / {refused}\n\
+             new Client allowH2 0: {refused}\n\
+             undici.request, Agent allowH2 NaN: 1.1 http/1.1\n\
+             undici.request, Agent allowH2 function: 1.1 http/1.1\n\
+             undici.request, Pool allowH2 NaN: InvalidArgumentError allowH2 must be a valid boolean value / {refused}\n\
+             undici.request, Agent allowH2 null: 1.1 http/1.1\n\
+             undici.request, Agent allowH2 yes, connect.allowH2 true: InvalidArgumentError allowH2 must be a valid boolean value / {refused}\n\
+             undici.request, Agent connect.allowH2 yes: 2.0 h2"
+        ),
+        "stderr: {stderr}"
+    );
+}
+
 // A throwaway P-256 CA (valid 2025-2125), the localhost leaf it signed, a
 // client leaf it signed (clientAuth), and a self-signed "rogue" client
 // certificate: conformance case 141's fixtures, for the mutual-TLS tests.
