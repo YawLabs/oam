@@ -1675,6 +1675,15 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   where undici's sends the hop to the pool's origin too; pinning every request through a
   `Pool` would give up pooling for all of them. A `MockPool` / `MockClient` pins its hops as
   well (below).
+- **A closed or destroyed dispatcher sends nothing**, as undici's: after `close()` (or
+  `destroy()`) every request through an `Agent`, `Pool`, `Client`, proxy agent or
+  `MockAgent` -- passed, or the global one -- fails with `ClientDestroyedError` (wrapped by
+  `fetch`, as itself from `undici.request` and the dispatcher's `request()`), and
+  `ClientClosedError` between `close()` and its settling; `closed` and `destroyed` read as
+  undici's do. A closed `MockPool` / `MockClient` still answers from its interceptors and
+  fails what it would pass through, as undici's does
+  (`a_closed_dispatcher_refuses_every_request_and_sends_nothing`, e2e, Node + undici 6.29.0
+  output). Up to 0.17.1 a closed dispatcher went on sending to the network.
 **`MockAgent`, `MockPool` and `MockClient`**
 
 They answer requests from their interceptors, as undici's do (#206; up to 0.17.1 they refused

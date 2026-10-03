@@ -8153,6 +8153,122 @@ reached the server ["POST /k","GET /l","GET /mocked"]"##;
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// A dispatcher after close() (or destroy()) sends nothing: undici's dispatch()
+/// refuses every request with ClientDestroyedError -- wrapped by fetch,
+/// as itself from undici.request and the dispatcher's request() -- for an
+/// Agent, a Pool, a Client, a MockAgent (global or passed) and the requests
+/// a closed MockPool / MockClient would pass through, while a mock pool's
+/// interceptors still answer, as undici's do. Up to the review of #206 every
+/// one of them went on sending to the network after close() (a typical
+/// afterAll teardown with a request in flight). Expected output is node
+/// v22.22.2 + undici 6.29.0's, line for line; a local server records what
+/// reaches it (nothing).
+#[test]
+fn a_closed_dispatcher_refuses_every_request_and_sends_nothing() {
+    let script = write_temp(
+        "undici_closed_dispatcher/main.mjs",
+        r##"import http from 'node:http';
+import { Agent, Pool, Client, MockAgent, request, setGlobalDispatcher } from 'undici';
+const hits = [];
+const srv = http.createServer((q, s) => { hits.push(q.url); s.end('REAL'); });
+await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const origin = 'http://127.0.0.1:' + srv.address().port;
+const out = async (p) => {
+  try {
+    const r = await p;
+    return (r.status ?? r.statusCode) + ' ' + await (r.text ? r.text() : r.body.text());
+  } catch (e) {
+    const c = e.cause ?? e;
+    return 'failed ' + e.constructor.name + '/' + c.constructor.name + ' ' + c.code + ' ' + c.message.replace(/:[0-9]+/g, ':N');
+  }
+};
+const all = async (name, d, path) => {
+  console.log(name, 'fetch', await out(fetch(origin + path, { dispatcher: d })));
+  console.log(name, 'request', await out(request(origin + path, { dispatcher: d })));
+  console.log(name, 'own request', await out(d.request({ origin, path, method: 'GET' })));
+};
+for (const [name, d] of [['Agent', new Agent()], ['Pool', new Pool(origin)], ['Client', new Client(origin)]]) {
+  await d.close();
+  await all(name + ' closed', d, '/closed');
+  console.log(name, 'closed/destroyed', d.closed, d.destroyed);
+}
+const destroyed = new Agent();
+await destroyed.destroy();
+await all('Agent destroyed', destroyed, '/destroyed');
+console.log('Agent destroyed closed/destroyed', destroyed.closed, destroyed.destroyed);
+
+const agent = new MockAgent();
+setGlobalDispatcher(agent);
+const kept = agent.get(origin);
+kept.intercept({ path: '/m' }).reply(200, 'MOCK').persist();
+console.log('before close', await out(fetch(origin + '/m')));
+await agent.close();
+console.log('MockAgent closed global fetch', await out(fetch(origin + '/m')));
+console.log('MockAgent closed global request', await out(request(origin + '/x')));
+await all('MockAgent closed', agent, '/x');
+console.log('MockAgent closed/destroyed', agent.closed, agent.destroyed);
+console.log('its pool answers', await out(fetch(origin + '/m', { dispatcher: kept })), kept.closed, kept.destroyed);
+console.log('its pool passes nothing through', await out(fetch(origin + '/x', { dispatcher: kept })));
+
+for (const connections of [undefined, 1]) {
+  const a = new MockAgent({ connections });
+  const pool = a.get(origin);
+  pool.intercept({ path: '/m' }).reply(200, 'MOCK').persist();
+  await pool.close();
+  const name = pool.constructor.name + ' closed';
+  console.log(name, 'matched', await out(fetch(origin + '/m', { dispatcher: pool })));
+  await all(name + ' unmatched', pool, '/x');
+  console.log(name, 'closed/destroyed', pool.closed, pool.destroyed);
+  a.disableNetConnect();
+  console.log(name, 'net connect disabled', await out(fetch(origin + '/x', { dispatcher: pool })));
+}
+console.log('reached', JSON.stringify(hits));
+srv.close();
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = r##"Agent closed fetch failed TypeError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+Agent closed request failed ClientDestroyedError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+Agent closed own request failed ClientDestroyedError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+Agent closed/destroyed true true
+Pool closed fetch failed TypeError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+Pool closed request failed ClientDestroyedError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+Pool closed own request failed ClientDestroyedError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+Pool closed/destroyed true true
+Client closed fetch failed TypeError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+Client closed request failed ClientDestroyedError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+Client closed own request failed ClientDestroyedError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+Client closed/destroyed true true
+Agent destroyed fetch failed TypeError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+Agent destroyed request failed ClientDestroyedError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+Agent destroyed own request failed ClientDestroyedError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+Agent destroyed closed/destroyed false true
+before close 200 MOCK
+MockAgent closed global fetch failed TypeError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+MockAgent closed global request failed ClientDestroyedError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+MockAgent closed fetch failed TypeError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+MockAgent closed request failed ClientDestroyedError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+MockAgent closed own request failed ClientDestroyedError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+MockAgent closed/destroyed undefined undefined
+its pool answers 200 MOCK true true
+its pool passes nothing through failed TypeError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+MockPool closed matched 200 MOCK
+MockPool closed unmatched fetch failed TypeError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+MockPool closed unmatched request failed ClientDestroyedError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+MockPool closed unmatched own request failed ClientDestroyedError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+MockPool closed closed/destroyed true true
+MockPool closed net connect disabled failed TypeError/MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED Mock dispatch not matched for path '/x': subsequent request to origin http://127.0.0.1:N was not allowed (net.connect disabled)
+MockClient closed matched 200 MOCK
+MockClient closed unmatched fetch failed TypeError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+MockClient closed unmatched request failed ClientDestroyedError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+MockClient closed unmatched own request failed ClientDestroyedError/ClientDestroyedError UND_ERR_DESTROYED The client is destroyed
+MockClient closed closed/destroyed true true
+MockClient closed net connect disabled failed TypeError/MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED Mock dispatch not matched for path '/x': subsequent request to origin http://127.0.0.1:N was not allowed (net.connect disabled)
+reached []"##;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 /// A Client or Pool is bound to its origin: undici's sends every request it
 /// dispatches there, with that origin as `host`, whatever origin the URL
 /// names. So a MockPool for an origin net connect allows, passed as the

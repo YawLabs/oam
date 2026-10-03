@@ -1047,14 +1047,22 @@
         }
         return p;
       }
+      // undici's close() marks the dispatcher closed at once and resolves
+      // once it has drained and destroyed itself; destroy() leaves `closed`
+      // as it was. A request through either after that fails with
+      // ClientClosedError / ClientDestroyedError and nothing is sent
+      // (policyOf), as undici's dispatch() refuses it (measured on node
+      // v22.22.2 + undici 6.29.0: an Agent, a Pool, a Client, the global
+      // dispatcher; fetch, undici.request and the dispatcher's request()).
       async close(cb) {
         this.closed = true;
+        await null;
+        this.destroyed = true;
         if (typeof cb === "function") queueMicrotask(cb);
       }
       async destroy(err, cb) {
         if (typeof err === "function") { cb = err; err = null; }
         this.destroyed = true;
-        this.closed = true;
         if (typeof cb === "function") queueMicrotask(cb);
       }
       // Web-fetch dispatch entry undici exposes; not used by oam's fetch
@@ -1467,6 +1475,16 @@
       if (dispatcher._oamInterceptors) {
         return { refuse: notHonored("A dispatcher with interceptors") };
       }
+      // A closed or destroyed dispatcher (Dispatcher#close). A MockPool /
+      // MockClient is the exception undici makes: its interceptors still
+      // answer after close(), and what it would pass through fails
+      // (mockConnection).
+      if (dispatcher[kMockAgent] === undefined) {
+        if (dispatcher.destroyed === true || dispatcher[kAgentClosed] === true) {
+          return { refuse: new errors.ClientDestroyedError() };
+        }
+        if (dispatcher.closed === true) return { refuse: new errors.ClientClosedError() };
+      }
       if (request && typeof dispatcher._oamVet === "function") {
         const refusal = dispatcher._oamVet(request);
         if (refusal) return { refuse: refusal };
@@ -1694,6 +1712,10 @@
     // undici's mock symbols, for the state the pieces share.
     const kDispatches = Symbol("mock dispatches");
     const kMockAgent = Symbol("mock agent");
+    // A MockAgent after close(): undici's has no `closed` / `destroyed` of
+    // its own (they read undefined), but its inner Agent is destroyed, so
+    // every request through it fails with ClientDestroyedError (policyOf).
+    const kAgentClosed = Symbol("mock agent closed");
     const kOrigin = Symbol("origin");
     const kRealConnect = Symbol("real connect");
     const kNetConnect = Symbol("net connect");
@@ -2153,6 +2175,15 @@
       // dials its own origin: a pool for an allowed origin passed as the
       // dispatcher of a request to another host must not reach that host.
       function passThrough() {
+        // A closed pool's Pool refuses it, as undici's does.
+        if (scope.destroyed === true) {
+          fail(new errors.ClientDestroyedError());
+          return;
+        }
+        if (scope.closed === true) {
+          fail(new errors.ClientClosedError());
+          return;
+        }
         const own = originParams(origin);
         if (own === null) {
           fail(new errors.InvalidArgumentError("invalid origin"));
@@ -2226,10 +2257,18 @@
     function mockIntercept(opts) {
       return new MockInterceptor(opts, this[kDispatches]);
     }
+    // undici's MockPool / MockClient close() closes the Pool / Client
+    // underneath (closed and destroyed after it) and leaves the agent: its
+    // interceptors still answer a request made through it directly, and one
+    // it would pass through fails with ClientDestroyedError
+    // (mockConnection), where up to the review of #206 it went to the
+    // network.
     async function mockClose() {
       this.closed = true;
       const agent = this[kMockAgent];
       if (agent && agent[kClients] instanceof Map) agent[kClients].delete(this[kOrigin]);
+      await null;
+      this.destroyed = true;
     }
     class MockPool extends Pool {
       constructor(origin, opts) {
@@ -2252,6 +2291,8 @@
     class MockAgent extends Dispatcher {
       constructor(opts) {
         super(opts);
+        delete this.closed;
+        delete this.destroyed;
         this[kNetConnect] = true;
         this[kIsMockActive] = true;
         if (opts && opts.agent && typeof opts.agent.dispatch !== "function") {
@@ -2284,10 +2325,18 @@
         }
         return dispatcher;
       }
+      // undici's: the inner Agent closed -- and with it every pool the agent
+      // made, whose interceptors still answer a request made through it
+      // directly -- and the agent's own requests failing with
+      // ClientDestroyedError from then on (policyOf), where up to the review
+      // of #206 they went to the network.
       async close() {
-        this.closed = true;
-        await this[kInner].close();
+        this[kAgentClosed] = true;
+        const scopes = Array.from(this[kClients].values());
         this[kClients].clear();
+        for (const scope of scopes) scope.closed = true;
+        await this[kInner].close();
+        for (const scope of scopes) scope.destroyed = true;
       }
       deactivate() {
         this[kIsMockActive] = false;
