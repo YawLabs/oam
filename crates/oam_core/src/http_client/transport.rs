@@ -34,6 +34,7 @@ use crate::net_connect::{ConnectError, DEFAULT_ATTEMPT_TIMEOUT};
 
 pub use super::connector::TlsSource;
 use super::connector::{HandshakeFailed, NoProtocolsAvailable};
+use super::redirect::Rules;
 use super::tls_config::{Alpn, TlsRange};
 use std::sync::atomic::AtomicU8;
 
@@ -177,11 +178,25 @@ impl HttpTransport {
         }
     }
 
-    /// Send one request (one hop) on `route`.
+    /// Send one request (one hop) on `route`, whose 3xx answer is not
+    /// followed.
     pub async fn send(
         &self,
         route: &Route,
         request: http::Request<ReqBody>,
+    ) -> Result<http::Response<Incoming>, SendError> {
+        self.send_following(route, request, None).await
+    }
+
+    /// Send one request (one hop) on `route`. `follows` names the rules its
+    /// 3xx answer is followed by, if it is: the connection such an answer
+    /// came on is not pooled when the next hop's method is not idempotent
+    /// (`pool::retires_for_the_hop`, #155).
+    pub async fn send_following(
+        &self,
+        route: &Route,
+        request: http::Request<ReqBody>,
+        follows: Option<Rules>,
     ) -> Result<http::Response<Incoming>, SendError> {
         // Every route's connector handshakes through the shared state, so
         // the request's version range goes there whichever pool sends it.
@@ -214,7 +229,13 @@ impl HttpTransport {
                 })
             });
         match pool
-            .request(request, close_requested, route.connect_timeout, route.alpn)
+            .request(
+                request,
+                close_requested,
+                route.connect_timeout,
+                route.alpn,
+                follows,
+            )
             .await
         {
             Ok(response) => Ok(response),

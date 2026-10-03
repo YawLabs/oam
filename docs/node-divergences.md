@@ -1930,27 +1930,39 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   with keep-alive and then FINs, the hop can be written before the server's FIN arrives.
   Node's hop goes out later, after its event loop has read the FIN. A FIN that has already
   reached the kernel is read before the write in oam too, and the hop goes to another
-  connection unsent. What differs is the FIN still in flight, measured on Windows arm64
-  against a node server (320 processes of 50 fetches, 8 at a time):
-  - **FIN at once, `GET` + `302`.** No fetch fails in either runtime, but in oam the server
-    receives the hop twice for 7-9% of fetches (1,177 and 1,383 of 16,000): the first copy
-    is written into the closing connection and read unanswered, and oam sends it once more.
-    Node's server receives every hop once. With 64 concurrent chains, oam failed 424 and
-    1,120 of 64,000 fetches (the one resend met another closing connection) where Node
-    failed 15.
-  - **FIN at once, `POST` + `307`.** A `POST` is never sent again -- oam did write it and
-    cannot know the server ignored it -- so it fails, its cause undici's `SocketError`
-    (`other side closed`; it was the uncoded `error sending request for url (...)` when
-    measured): 595 and 1,137 of 16,000 fetches in oam, none in Node.
+  connection unsent. A hop that could not be sent again -- one whose method is not
+  idempotent, a `POST` that a `307` or `308` sends on, a `PATCH` that a `302` does -- never
+  goes out on the connection its 3xx came on, and that connection is not pooled for
+  anything else either (#155): the hop dials a connection of its own, a cost on that path
+  alone. A connection whose response says `Connection: close` is never reused, as before.
+  Measured on Windows arm64 against a node server, one process with 8 concurrent chains of
+  125 fetches, release builds:
+  - **FIN at once, `POST` + `307`.** Node: none of 1,000 fails. oam up to 0.17.1: 29 of 1,000
+    failed (a `POST` is never sent again -- oam did write it and cannot know the server
+    ignored it -- so the fetch fails, its cause undici's `SocketError`, `other side
+    closed`); the issue's earlier measurement, 320 processes of 50 fetches 8 at a time, saw
+    595 and 1,137 of 16,000. oam now: none of 1,000 fails, and the server reads every hop
+    once (e2e guard `a_post_never_goes_out_on_the_connection_a_307_came_on`).
+  - **FIN at once, `GET` + `302`.** The hop may be sent again, so it still takes the pooled
+    connection, and what differs remains: no fetch fails in Node, and in oam the server
+    receives 21-32 of 1,000 hops twice -- the first copy written into the closing connection
+    and read unanswered, then oam's one resend -- and 1-2 of 1,000 fetches fail, the resend
+    meeting another closing connection. Node's server receives every hop once.
+  - **No redirect: `200` + keep-alive, then FIN at once.** The next request takes the
+    pooled connection, as above: 19-29 of 1,000 `POST`s fail in oam and 2-3 `GET`s, where
+    Node fails none, and the server reads 36-37 of 1,000 `GET`s twice. With one request at a
+    time per process (100 processes of 50, 8 at a time), 6-9 of 5,000 `POST`s fail.
   - **FIN 0-5 ms after the 3xx.** Here Node loses the race too, and fails with
-    `UND_ERR_SOCKET`: 2,561 of 16,000 `GET`s and 2,587 `POST`s. oam failed no `GET` (its
-    one resend) and 1,948 `POST`s.
+    `UND_ERR_SOCKET`: 2,561 of 16,000 `GET`s and 2,587 `POST`s, where oam up to 0.17.1 failed
+    no `GET` (its one resend) and 1,948 `POST`s. Not measured since the `POST` hop dials its
+    own connection.
   - **Server in the same process.** With oam as both server and client, the server's
     `socket.end()` sends its FIN only once the write before it has completed and JS has
-    run again, so the hop wins far more often: 45-60% of `POST` + `307` fetches
-    failed, and 60-69 of 6,000 `GET`s with eight concurrent chains, where Node, as both,
-    fails none. Node's client against the same oam server failed none either; oam's client
-    against a Node server failed 579 of 5,000.
+    run again, so the hop wins far more often. Up to 0.17.1 45-60% of `POST` + `307`
+    fetches failed (the hop now dials its own connection; not re-measured), and 60-69 of
+    6,000 `GET`s with eight concurrent chains, where Node, as both, fails none. Node's
+    client against the same oam server failed none either; oam's client against a Node
+    server failed 579 of 5,000.
 
   oam resends an idempotent request (`GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`, `TRACE`) once
   per hop, only when the dead connection had carried an earlier request and not a byte of

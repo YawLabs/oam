@@ -778,6 +778,127 @@ async fn a_pooled_h2_session_is_not_reused_by_a_request_that_did_not_offer_h2() 
     .await;
 }
 
+/// The connection a followed redirect came on is not pooled when the next
+/// hop keeps a method that is not idempotent (#155): such a hop -- a POST a
+/// 307 or 308 sends on, a PATCH a 302 does, a POST a 302 does under
+/// undici.request's rules -- is never written onto the connection a server
+/// may be closing right behind its 3xx, as it could not be sent again. A hop
+/// that may be resent keeps the pooled connection (no cost on that path),
+/// and so does a 3xx nobody follows or one without a Location. The server
+/// keeps every connection open, so whether the 3xx's connection was pooled
+/// is whether the next request needed a second one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_redirect_whose_next_hop_cannot_be_resent_does_not_pool_its_connection() {
+    use oam_core::http_client::redirect::Rules;
+    within(async {
+        let cases: [(&str, &str, bool, Option<Rules>, bool); 11] = [
+            (
+                "POST",
+                "307 Temporary Redirect",
+                true,
+                Some(Rules::Fetch),
+                false,
+            ),
+            (
+                "POST",
+                "308 Permanent Redirect",
+                true,
+                Some(Rules::Fetch),
+                false,
+            ),
+            ("PATCH", "302 Found", true, Some(Rules::Fetch), false),
+            ("POST", "302 Found", true, Some(Rules::Undici), false),
+            // The hop is a GET.
+            ("POST", "302 Found", true, Some(Rules::Fetch), true),
+            ("POST", "303 See Other", true, Some(Rules::Undici), true),
+            // Idempotent hops.
+            (
+                "GET",
+                "307 Temporary Redirect",
+                true,
+                Some(Rules::Fetch),
+                true,
+            ),
+            (
+                "PUT",
+                "308 Permanent Redirect",
+                true,
+                Some(Rules::Fetch),
+                true,
+            ),
+            // Not followed: `redirect: 'manual'`, http.request.
+            ("POST", "307 Temporary Redirect", true, None, true),
+            // No Location: the 3xx is the response.
+            (
+                "POST",
+                "307 Temporary Redirect",
+                false,
+                Some(Rules::Fetch),
+                true,
+            ),
+            // Not a redirect.
+            ("POST", "200 OK", true, Some(Rules::Fetch), true),
+        ];
+        for (method, status, location, follows, pooled) in cases {
+            let server = serve_replies(move |_| {
+                let headers: &[(&str, &str)] = if location {
+                    &[("location", "/next")]
+                } else {
+                    &[]
+                };
+                response(status, headers, b"")
+            })
+            .await;
+            let transport = transport(ProxySource::None);
+            let route = transport.route(false, ATTEMPT, TlsRange::Both);
+            let target = format!("http://127.0.0.1:{}/x", server.port);
+            let first = transport
+                .send_following(&route, request(method, &target, empty_body()), follows)
+                .await
+                .unwrap();
+            body_text(first).await;
+            let_the_pool_settle().await;
+            let second = send(&transport, &route, get(&target)).await.unwrap();
+            body_text(second).await;
+            let label = format!("{method} answered {status} (location {location}, {follows:?})");
+            assert_eq!(server.seen().len(), 2, "{label}");
+            assert_eq!(
+                server.accepts(),
+                if pooled { 1 } else { 2 },
+                "{label}: the next request {} the connection",
+                if pooled { "reuses" } else { "does not reuse" }
+            );
+        }
+        // And a 3xx -- any response -- that says `Connection: close` is the
+        // last on its connection, whatever the hop's method (RFC 9112 s9.6).
+        let server = serve_replies(|_| {
+            response(
+                "302 Found",
+                &[("location", "/next"), ("connection", "close")],
+                b"",
+            )
+        })
+        .await;
+        let transport = transport(ProxySource::None);
+        let route = transport.route(false, ATTEMPT, TlsRange::Both);
+        let target = format!("http://127.0.0.1:{}/x", server.port);
+        for _ in 0..2 {
+            let response = transport
+                .send_following(&route, get(&target), Some(Rules::Fetch))
+                .await
+                .unwrap();
+            body_text(response).await;
+            let_the_pool_settle().await;
+        }
+        assert_eq!(
+            server.accepts(),
+            2,
+            "a connection the server closes is not reused"
+        );
+    })
+    .await;
+}
+
 /// `env_proxied` answers what the pooled route's rules would do with a URI:
 /// http.request asks it to keep a request node would dial directly off the
 /// proxy.

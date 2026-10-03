@@ -201,21 +201,15 @@ pub fn next(
     if body == RedirectBody::StreamedFetch && status != 303 {
         return Next::Fail(STREAMED_BODY);
     }
-    // fetch/index.js:1297-1305: only these two cases turn the request into a
-    // body-less GET. A 303 answering GET or HEAD keeps its method and
-    // headers (content-type included -- reqwest dropped it).
-    // undici's RedirectHandler (`undici.request`): only a 303 does, and for
-    // any method but HEAD (a GET stays a GET).
-    let undici = matches!(
+    let rules = if matches!(
         body,
         RedirectBody::UndiciReplayable | RedirectBody::UndiciIterable
-    );
-    let rewrite = if undici {
-        status == 303 && *method != http::Method::HEAD
+    ) {
+        Rules::Undici
     } else {
-        (matches!(status, 301 | 302) && *method == http::Method::POST)
-            || (status == 303 && *method != http::Method::GET && *method != http::Method::HEAD)
+        Rules::Fetch
     };
+    let rewrite = rewrites_to_get(status, method, rules);
     if !rewrite && body == RedirectBody::StreamedFetch {
         return Next::ReturnResponse;
     }
@@ -236,6 +230,31 @@ pub fn next(
         url: target,
         method: method.clone(),
         drop_body: false,
+    }
+}
+
+/// Whose rules a followed redirect goes by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rules {
+    /// fetch's (`httpRedirectFetch`).
+    Fetch,
+    /// undici's RedirectHandler, which `undici.request` follows with.
+    Undici,
+}
+
+/// The redirect `status` turns the request into a body-less GET.
+/// fetch/index.js:1297-1305: only a 301 or 302 answering a POST, and a 303
+/// answering anything but GET or HEAD (a 303 answering GET or HEAD keeps its
+/// method and headers, content-type included -- reqwest dropped it).
+/// undici's RedirectHandler (`undici.request`): only a 303, for any method
+/// but HEAD (a GET stays a GET).
+pub fn rewrites_to_get(status: u16, method: &http::Method, rules: Rules) -> bool {
+    match rules {
+        Rules::Undici => status == 303 && *method != http::Method::HEAD,
+        Rules::Fetch => {
+            (matches!(status, 301 | 302) && *method == http::Method::POST)
+                || (status == 303 && *method != http::Method::GET && *method != http::Method::HEAD)
+        }
     }
 }
 

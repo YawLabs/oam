@@ -459,7 +459,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// RFC 9110 s9.2.2's idempotent methods: sending the request twice has the
 /// same effect on the server as sending it once, so a request whose response
 /// never started may be sent again.
-fn is_idempotent(method: &http::Method) -> bool {
+pub(super) fn is_idempotent(method: &http::Method) -> bool {
     *method == http::Method::GET
         || *method == http::Method::HEAD
         || *method == http::Method::PUT
@@ -753,6 +753,16 @@ async fn run(
             return OpOutcome::Failed(PrepareError::TooManyHeaders.to_string());
         }
 
+        // The rules a 3xx answer to this hop is followed by, if it is: the
+        // pool then keeps a next hop that could not be sent twice off the
+        // connection the 3xx came on (#155).
+        let follows = (state.redirect == RedirectMode::Follow).then_some(
+            if state.undici_head && !state.fetch_rules {
+                redirect::Rules::Undici
+            } else {
+                redirect::Rules::Fetch
+            },
+        );
         let mut retries = 0;
         let mut stale_resent = false;
         let response = loop {
@@ -788,7 +798,9 @@ async fn run(
             // an h1 connection the request went out on is closed (hyper shuts
             // a connection whose response nobody waits for), an h2 stream is
             // reset -- which is how the server learns the client left.
-            let send = state.transport.send(&state.route, request);
+            let send = state
+                .transport
+                .send_following(&state.route, request, follows);
             let headers_timeout = state.headers_timeout;
             let dispatched = state.dispatched.as_ref();
             let timed = async move {
@@ -858,6 +870,9 @@ async fn run(
                 // into a FIN that is still in flight sooner than node does;
                 // a FIN the kernel already holds is read before the write
                 // (`connector::EagerTcp`), and the request goes back UNSENT.
+                // A redirect hop that may not be resent never meets the FIN
+                // the 3xx's connection is closing with: it never takes that
+                // connection (`pool::retires_for_the_hop`).
                 Err(e)
                     if !stale_resent
                         && state.source.replayable()

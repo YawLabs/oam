@@ -909,6 +909,77 @@ fn a_pooled_connection_whose_fin_has_arrived_is_not_written_to() {
     );
 }
 
+/// #155: a server that answers a POST with a 307 and closes the connection
+/// right behind it. Here the close is held back until something else is
+/// written onto that connection -- the FIN still in flight when oam writes,
+/// for as long as it takes -- and whatever is written there is read and
+/// never answered. A POST that went out there could not be sent again (RFC
+/// 9110 s9.2.2) and failed its fetch; node's, whose event loop has read the
+/// FIN before it writes, succeeds.
+///
+/// So the 307's connection must carry no POST: not the hop the 307 sends on
+/// (it dials its own connection), and not the next fetch's POST either --
+/// the 307's connection is not pooled at all. The hop's own connection is
+/// pooled, and the next POST takes that one. Each POST reaches the server
+/// once. Before the fix the 307's connection went back to the pool once its
+/// empty body was read, and the next POST took it (or the hop did).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_post_never_goes_out_on_the_connection_a_307_came_on() {
+    within(async {
+        let server = serve(|mut conn, _, seen| async move {
+            let mut closing = false;
+            while let Some(request) = conn.request().await {
+                let target = request.head.target.clone();
+                seen.lock().unwrap().push(request);
+                if closing {
+                    // Written into the close: read, never answered.
+                    use tokio::io::AsyncWriteExt as _;
+                    let _ = conn.io.shutdown().await;
+                    return;
+                }
+                if let Some(id) = target.strip_prefix("/redir/") {
+                    let location = format!("/final/{id}");
+                    let answer = response(
+                        "307 Temporary Redirect",
+                        &[("location", location.as_str())],
+                        b"",
+                    );
+                    if !conn.send(&answer).await {
+                        return;
+                    }
+                    closing = true;
+                } else if !conn.send(&response("200 OK", &[], b"ok")).await {
+                    return;
+                }
+            }
+        })
+        .await;
+        let transport = plain();
+        let reg = Reg::new();
+        for id in ["a", "b", "c"] {
+            let url = format!("http://127.0.0.1:{}/redir/{id}", server.port);
+            let post = json!({ "url": url, "method": "POST", "body": "x" });
+            let p = payload(reg.fetch(&transport, post).await);
+            assert_eq!(p["status"], 200, "{id}");
+            assert_eq!(reg.text(handle_of(&p)).await, "ok");
+            let_the_pool_settle().await;
+        }
+        let targets: Vec<String> = server
+            .seen()
+            .iter()
+            .map(|r| r.head.target.clone())
+            .collect();
+        assert_eq!(
+            targets,
+            [
+                "/redir/a", "/final/a", "/redir/b", "/final/b", "/redir/c", "/final/c"
+            ],
+            "every POST reached the server once, and none was written into a close"
+        );
+    })
+    .await;
+}
+
 /// One request head (and its content-length body) off an async stream, or
 /// `None` at EOF.
 async fn read_request_async<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> Option<String> {
