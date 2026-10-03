@@ -328,6 +328,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fetchSentOpen", op_fetch_sent_open),
         ("fetchSentWait", op_fetch_sent_wait),
         ("fetchSentClose", op_fetch_sent_close),
+        ("httpTransportDropAgent", op_http_transport_drop_agent),
         ("httpRequestBodyCancel", op_http_request_body_cancel),
         ("httpAbort", op_http_abort),
         ("httpClose", op_http_close),
@@ -3534,6 +3535,25 @@ fn op_fetch_body_channel_cancel(
             });
         }
     }
+}
+
+/// `__oam.node.httpTransportDropAgent(id)`, synchronous: close every
+/// connection the `undici` dispatcher with pool id `id` has pooled on oam's
+/// transport and forget its pool -- the dispatcher's `close()` / `destroy()`,
+/// or its collection (`HttpTransport::drop_agent`). Returns whether it had
+/// one.
+fn op_http_transport_drop_agent(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    // Pool ids are positive integers; anything else names no pool.
+    let dropped = id >= 1.0
+        && id.fract() == 0.0
+        && id <= u64::MAX as f64
+        && core_runtime!(scope).http_client().drop_agent(id as u64);
+    rv.set(v8::Boolean::new(scope, dropped).into());
 }
 
 /// `__oam.node.fetchSentOpen() -> handle`: a signal for one http.request on
