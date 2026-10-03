@@ -93,6 +93,23 @@
 #   OAM_SKIP_WIN_X64=1      drop the win-x64 asset (emulated build is slow)
 #   OAM_SKIP_MAC=1          drop both mac assets (Air unreachable)
 #   OAM_SKIP_MAC_X64=1      drop only the mac-x64 asset
+#   OAM_SKIP_MAC_SIGN=1     ship the mac assets without the mac leg's codesign
+#                           step (loud; honored even with OAM_SIGN_REQUIRED=1,
+#                           which also refuses an ad-hoc mac build while
+#                           scripts/mac-signing-identity.sha1 holds no SHA-1).
+#                           See scripts/lib/mac-signing.sh.
+#                           The mac signing GATES (sign, verify, JIT smoke)
+#                           run inside the mac leg, AFTER the tag is pushed;
+#                           preflight checks only the signing decision and,
+#                           with a pin, the keychain -- whether a hardened-
+#                           runtime oam can JIT needs a built oam. So the
+#                           FIRST release after the signing code landed must
+#                           be preceded by a run of the out-of-repo mac probe
+#                           (mac-probe.sh) against the build Mac; see
+#                           scripts/macos/README.md. Should a gate still fail,
+#                           nothing is published: fix it and re-run with the
+#                           same tag (the unpublished tag is re-pointed), or
+#                           ship that release with OAM_SKIP_MAC_SIGN=1
 #   OAM_SKIP_LINUX=1        drop the linux asset
 #   OAM_KEEP_VM=1           leave the GCP VM running after the linux leg
 #   OAM_IAP_SSH_MODE=direct|tunnel
@@ -114,8 +131,15 @@
 #                           Required as soon as release-keys/allowed_signers
 #                           holds a key; see release-keys/README.md
 #   OAM_SIGN_REQUIRED=0|1   1 makes missing signing setup fatal. Today that only
-#                           changes the bootstrap case (no key committed yet):
-#                           0 warns and ships no manifest, 1 fails in preflight.
+#                           changes the bootstrap cases: no release key
+#                           committed yet (0 warns and ships no manifest, 1
+#                           fails in preflight), and no SHA-1 yet in
+#                           scripts/mac-signing-identity.sha1 (0 signs the mac
+#                           binaries ad-hoc with a warning, 1 fails the mac
+#                           preflight; see OAM_SKIP_MAC_SIGN). Release key k1
+#                           is committed, so today 1 changes ONLY the mac
+#                           case: every release fails in preflight until the
+#                           mac pin is committed.
 #                           With a key committed, signing is mandatory either
 #                           way -- there is deliberately no knob that skips it.
 #                           For Windows Authenticode, 1 makes an unset
@@ -462,7 +486,7 @@ gh auth status >/dev/null 2>&1 || fail "gh not authenticated -- run 'gh auth sta
 if [ "$SKIP_MAC" != "1" ]; then
   [ -n "${OAM_MAC_HOST:-}" ] || fail "OAM_MAC_HOST not set (or set OAM_SKIP_MAC=1 to drop the mac assets)"
   bash "$SCRIPT_DIR/build-platforms-tailnet.sh" --preflight-only \
-    || fail "the mac build host cannot be used -- see above. Fix that, or set OAM_SKIP_MAC=1 to drop the mac assets"
+    || fail "the mac build host or its signing setup cannot be used -- see above. Fix that, or set OAM_SKIP_MAC=1 to drop the mac assets"
 fi
 [ "$SKIP_LINUX" = "1" ] || command -v gcloud >/dev/null 2>&1 || fail "gcloud CLI not found (or set OAM_SKIP_LINUX=1 to drop the linux asset)"
 
@@ -1024,7 +1048,12 @@ else
   MAC_ART=$(bash "$SCRIPT_DIR/build-platforms-tailnet.sh" --mode=release) \
     || fail "mac leg failed -- see its log output above"
   MAC_ART="${MAC_ART##*$'\n'}"   # contract: artifact dir = LAST stdout line
-  cp "$MAC_ART"/oam-*apple-darwin* "$RELEASE_DIR/"
+  # The two exact asset names, never a glob: whatever else lands in the leg's
+  # artifact dir must not ride into SHA256SUMS and onto the release.
+  cp "$MAC_ART/oam-aarch64-apple-darwin" "$RELEASE_DIR/"
+  if [ "${OAM_SKIP_MAC_X64:-0}" != "1" ]; then
+    cp "$MAC_ART/oam-x86_64-apple-darwin" "$RELEASE_DIR/"
+  fi
 fi
 
 if [ "$SKIP_LINUX" = "1" ]; then

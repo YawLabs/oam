@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for the oam macOS binaries. Signed in by
+  scripts/lib/mac-signing.sh (mac_sign_binary) on every mac release leg, and
+  checked back out of the signature by mac_verify_binary, which requires
+  EXACTLY these three keys, each true.
+
+  - allow-jit, allow-unsigned-executable-memory: V8 compiles JavaScript and
+    WebAssembly to executable memory at runtime. Without them the hardened
+    runtime kills the process at the first JIT, not at startup, which is why
+    scripts/fixtures/jit-smoke.js runs against the signed binary.
+  - disable-library-validation: OAM_ENABLE_NATIVE_ADDONS=1 loads third-party
+    .node addons, which never carry our signature.
+
+  Do not add get-task-allow (notarization rejects it) or copy Node's or Bun's
+  supersets. This set must stay a subset of Yaw Terminal's, which re-signs the
+  oam it bundles.
+
+  Editing this comment: no double hyphen, no angle brackets, no ampersand.
+  codesign reads this file with a stricter parser than plutil, and
+  scripts/test-scripts.sh fails on any of them.
+-->
+<plist version="1.0">
+<dict>
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+  <true/>
+  <key>com.apple.security.cs.disable-library-validation</key>
+  <true/>
+</dict>
+</plist>
