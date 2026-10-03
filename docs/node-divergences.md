@@ -3340,7 +3340,7 @@ another letter case name one pipe; a name that is not a pipe's cannot be listene
 pipe has no half-close, so `end()` behaves as libuv's shutdown does: it waits until the peer
 has read everything written, then the stream ends both ways -- the side that ended reads
 its own `'end'` too, and a peer that writes after it gets `EPIPE`
-(`conformance/cases/371-net-pipe-connect-listen.mjs`, `372-net-pipe-windows-names.mjs`; the
+(`conformance/cases/375-net-pipe-connect-listen.mjs`, `376-net-pipe-windows-names.mjs`; the
 e2e test `net_pipe_server_and_client_interoperate_with_node` runs each side against Node's).
 Up to 0.17.1 every one of these failed with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` (and up
 to 0.16.2 the server bound a TCP port and the client dialled `host:port`), which is what
@@ -3404,7 +3404,7 @@ booting and then failing every browser tool.
   `EINVAL`; Node binds and dials it in the abstract namespace. _(source)_
 - **Unix.** The Unix domain socket half is the same code path as TCP's streams (a real
   half-close, as Node's), compiled and linted for Linux, but its runs so far are Windows
-  only: cases 371 and the interop e2e test have not yet been executed on Linux or macOS.
+  only: cases 375 and the interop e2e test have not yet been executed on Linux or macOS.
   _(source)_
 - **No `ConnectWrap`.** While a pipe connect is in flight `getActiveResourcesInfo()` lists
   the `PipeWrap` but not Node's `ConnectWrap` -- as oam's TCP connect lists no

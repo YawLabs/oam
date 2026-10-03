@@ -20,8 +20,8 @@ import os from "node:os";
 import path from "node:path";
 
 const base = process.platform === "win32"
-  ? String.raw`\\.\pipe\oam-case-371-` + process.pid
-  : path.join(os.tmpdir(), "oam-case-371-" + process.pid);
+  ? String.raw`\\.\pipe\oam-case-375-` + process.pid
+  : path.join(os.tmpdir(), "oam-case-375-" + process.pid);
 let serial = 0;
 const fresh = () => base + "-" + ++serial + (process.platform === "win32" ? "" : ".sock");
 const scrub = (s) => (typeof s === "string" ? s.split(base).join("PIPE") : s);
