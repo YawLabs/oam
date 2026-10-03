@@ -1613,8 +1613,11 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
   its errors dropped the zone. What is left: on macOS and the BSDs oam has the system
   resolver read the zone, which also takes a number (`%1`) as the interface index, where
   libuv looks a number up as an interface NAME and finds none (scope id 0); and under
-  `--permission` a zoned answer is checked as written, so only an exact grant (or
-  `--allow-net` with no list) admits it.
+  `--permission` a zoned answer is checked as written and unbracketed, since no URL can
+  name it, so a grant spells it as the hook does (`--allow-net` with no list admits
+  any). For a fetch, `fe80::1%1` admits that answer on every port and `fe80::1%1:8080`
+  on port 8080 alone; for `net.connect`, which asks about the joined `fe80::1%1:8080`
+  (the raw-socket IPv6 spelling, entry 4), only that port-scoped entry does.
 - **A refusing hook's error** rejects `undici.request` and `agent.request` as itself, as in
   Node, and `fetch` with it as the `cause` of `TypeError: fetch failed`, as in Node. Up to
   0.17.1 `undici.request`, which runs on `fetch` in oam, rejected with the `TypeError` too.
