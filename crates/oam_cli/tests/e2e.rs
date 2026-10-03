@@ -10130,8 +10130,11 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
 /// @mswjs/interceptors 0.41.9, @open-draft/deferred-promise 2.2.0,
 /// @open-draft/logger 0.3.0, @open-draft/until 2.1.0, is-node-process 1.2.0,
 /// json-stringify-safe 5.0.1, outvariant 1.4.3, propagate 2.0.1,
-/// strict-event-emitter 0.5.1; MIT, json-stringify-safe ISC; each with the
-/// license it ships; the runtime files nock loads only). The expected output
+/// strict-event-emitter 0.5.1; MIT, json-stringify-safe ISC; each with its
+/// license -- the one it ships, or, for the three whose tarballs ship none,
+/// @open-draft/deferred-promise's from its repository and the MIT text
+/// is-node-process and strict-event-emitter declare in package.json; the
+/// runtime files nock loads only). The expected output
 /// is node v22.22.2's with the same packages, line for line.
 #[test]
 fn nock_intercepts_http_https_and_fetch_as_on_node() {
