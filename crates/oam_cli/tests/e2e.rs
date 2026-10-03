@@ -28064,6 +28064,59 @@ process.exit(0);
     );
 }
 
+/// A response header value reads without the whitespace around it whichever
+/// protocol carried it (#182). Over HTTP/1 the parser under hyper trims it;
+/// an HTTP/2 value reached fetch as sent, so the same server's
+/// `x-ows:   a<TAB>b   ` read `"   a\tb   "` over h2 (which oam's fetch
+/// negotiates with an https origin) and `"a\tb"` over HTTP/1. Whitespace
+/// inside a value is kept on both.
+#[test]
+fn fetch_trims_header_value_whitespace_over_h2_as_over_http1() {
+    let bundle = write_temp("h2-ows-extra-ca/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import http2 from 'node:http2';
+import net from 'node:net';
+const names = ['x-ows', 'x-lead', 'x-trail-tab', 'x-inner'];
+const read = (r) => JSON.stringify(names.map((n) => r.headers.get(n)));
+const seen = [];
+const h2 = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__` }, (req, res) => {
+  seen.push(req.httpVersion);
+  res.setHeader('x-ows', '   a\tb   ');
+  res.setHeader('x-lead', '\t\tv');
+  res.setHeader('x-trail-tab', 'v\t\t');
+  res.setHeader('x-inner', ' a   b  ');
+  res.end('ok');
+});
+await new Promise((r) => h2.listen(0, '127.0.0.1', r));
+const a = await fetch(`https://localhost:${h2.address().port}/`);
+await a.text();
+console.log(seen.join(','), read(a));
+const h1 = net.createServer((s) => s.once('data', () => s.end(
+  'HTTP/1.1 200 OK\r\nx-ows:   a\tb   \r\nx-lead:\t\tv\r\nx-trail-tab: v\t\t\r\n' +
+  'x-inner:  a   b  \r\ncontent-length: 2\r\nconnection: close\r\n\r\nok')));
+await new Promise((r) => h1.listen(0, '127.0.0.1', r));
+const b = await fetch(`http://127.0.0.1:${h1.address().port}/`);
+await b.text();
+console.log('1.1', read(b));
+h2.close();
+h1.close();
+process.exit(0);
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("h2_ows_fetch/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "2.0 [\"a\\tb\",\"v\",\"v\",\"a   b\"]\n\
+         1.1 [\"a\\tb\",\"v\",\"v\",\"a   b\"]",
+        "stderr: {stderr}"
+    );
+}
+
 // A throwaway P-256 CA (valid 2025-2125), the localhost leaf it signed, a
 // client leaf it signed (clientAuth), and a self-signed "rogue" client
 // certificate: conformance case 141's fixtures, for the mutual-TLS tests.

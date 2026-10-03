@@ -1111,11 +1111,19 @@ fn respond(
     // but asks for no decoding, so it sees both headers and the encoded
     // bytes, as node's does.
     let strip = codings.is_some();
+    // Each value without the whitespace around it (RFC 9110 section 5.5), on
+    // either protocol. Over HTTP/1 the parser under hyper has already trimmed
+    // it, so this finds nothing to cut; an HTTP/2 value arrives as sent, and
+    // without the trim `x-ows:   a<TAB>b   ` read `"   a\tb   "` over h2 and
+    // `"a\tb"` over HTTP/1 from the same server (#182).
     let headers: Vec<(String, String)> = response
         .headers()
         .iter()
         .filter(|(name, _)| !(strip && (*name == CONTENT_ENCODING || *name == CONTENT_LENGTH)))
-        .map(|(name, value)| (name.as_str().to_string(), latin1(value.as_bytes())))
+        .map(|(name, value)| {
+            let value = crate::http_head::trim_ows(value.as_bytes());
+            (name.as_str().to_string(), latin1(value))
+        })
         .collect();
     // node's Response.url never carries the fragment.
     let mut url = state.current;
