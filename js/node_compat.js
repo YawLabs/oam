@@ -14538,11 +14538,42 @@
         reportOnUncaughtException: false,
       },
       loadEnvFile: function loadEnvFile(path) {
-        var fs = registry.get("fs");
-        var envPath = path || ".env";
-        // A missing file throws the plain fs ENOENT system error, not a
-        // wrapped ERR_ENV_FILE_NOT_FOUND (probe-verified against node v22).
-        var text = fs.readFileSync(envPath, "utf8");
+        // node v22.22.2 (lib/internal/process/per_thread.js, src/
+        // node_process_methods.cc LoadEnvFile) is not fs.readFileSync, and
+        // its errors follow the one rule every fs error here does: a failure
+        // names the path node's JS layer handed the binding. A path given
+        // (anything but undefined / null) is getValidatedPath'd -- 42 is
+        // ERR_INVALID_ARG_TYPE, not descriptor 42 -- and namespaced, so on
+        // Windows it fails naming the resolved path (fsErrorPath). With none
+        // the binding opens its own ".env" untouched, and the error says
+        // '.env' as node's does; resolving it too failed node's
+        // test-process-load-env-file. `""` is a path given, not "none".
+        var given = path == null ? null : toPath(path);
+        var text;
+        try {
+          text = registry.get("fs").readFileSync(given === null ? ".env" : given, "utf8");
+        } catch (e) {
+          // The binding reports ANY failure to open as ENOENT `open`
+          // (ThrowUVException(UV_ENOENT, "open")), and a failed read as
+          // ERR_INVALID_ARG_TYPE naming the path it opened, namespace
+          // prefix and all -- measured: loadEnvFile(".") on Windows is
+          // "Contents of '\\?\C:\cwd' should be a valid string." oam's
+          // readFileSync labels the two halves as node's fs does
+          // (oam_core::whole_file_error): only a failed OPEN says `open`,
+          // and any failed read -- a region another process has locked
+          // (EBUSY), EIO, a directory on every platform (node opens it and
+          // fails the read) -- says `read`, so it takes the second branch.
+          if (e && e.syscall === "open") {
+            throw makeSystemError("ENOENT", "open", given === null ? ".env" : fsErrorPath(given));
+          }
+          if (e && typeof e.code === "string" && typeof e.syscall === "string") {
+            var opened = given === null ? ".env" : registry.get("path").toNamespacedPath(given);
+            var bad = new TypeError("Contents of '" + opened + "' should be a valid string.");
+            bad.code = "ERR_INVALID_ARG_TYPE";
+            throw bad;
+          }
+          throw e;
+        }
         // Same dotenv parser as util.parseEnv (Node routes both through
         // node_dotenv.cc). Real env vars win: node v22 loadEnvFile does NOT
         // overwrite keys already present (probe-verified). Presence check

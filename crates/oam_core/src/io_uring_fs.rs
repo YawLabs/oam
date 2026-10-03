@@ -26,7 +26,7 @@ enum UringRequest {
     Write {
         path: String,
         data: Vec<u8>,
-        reply: oneshot::Sender<std::io::Result<()>>,
+        reply: oneshot::Sender<Result<(), crate::WholeFileError>>,
     },
 }
 
@@ -111,11 +111,14 @@ impl UringFs {
     /// (the buffer is already consumed by then) is returned as `Err((err,
     /// Vec::new()))` -- the empty `Vec` is the caller's "this is a real error,
     /// surface it" signal, distinct from the populated `Vec` on a send failure.
+    /// The error says which half failed, the create or the write, as node
+    /// reports them apart (`crate::whole_file_error`); a channel failure is
+    /// reported as the open's.
     pub async fn write_file(
         &self,
         path: String,
         data: Vec<u8>,
-    ) -> Result<(), (std::io::Error, Vec<u8>)> {
+    ) -> Result<(), (crate::WholeFileError, Vec<u8>)> {
         let (reply, rx) = oneshot::channel();
         // Send failure: the worker is gone and `data` rides back inside the
         // returned UringRequest::Write, so we can hand it to the caller for a
@@ -127,7 +130,10 @@ impl UringFs {
                 // buffer rather than panic.
                 _ => Vec::new(),
             };
-            return Err((std::io::Error::other("io_uring worker stopped"), data));
+            return Err((
+                crate::WholeFileError::Open(std::io::Error::other("io_uring worker stopped")),
+                data,
+            ));
         }
         match rx.await {
             // Worker replied: the buffer was consumed by write_all, so a genuine
@@ -138,7 +144,10 @@ impl UringFs {
             // The buffer went with the dropped task, so we can't recover it;
             // signal "real error" with an empty Vec. The caller surfaces this
             // directly (it has no buffer of its own to retry std with).
-            Err(_) => Err((std::io::Error::other("io_uring reply dropped"), Vec::new())),
+            Err(_) => Err((
+                crate::WholeFileError::Open(std::io::Error::other("io_uring reply dropped")),
+                Vec::new(),
+            )),
         }
     }
 }
@@ -196,12 +205,15 @@ async fn read_whole(path: &str) -> std::io::Result<Vec<u8>> {
 
 /// Write a whole file via io_uring: create (truncate) + `write_all_at` + close.
 /// Matches the non-append `fs.writeFile` semantics.
-async fn write_all(path: &str, data: Vec<u8>) -> std::io::Result<()> {
-    let file = tokio_uring::fs::File::create(path).await?;
+/// The create and the write fail apart, as node reports them.
+async fn write_all(path: &str, data: Vec<u8>) -> Result<(), crate::WholeFileError> {
+    let file = tokio_uring::fs::File::create(path)
+        .await
+        .map_err(crate::WholeFileError::Open)?;
     // BufResult<(), Vec<u8>>: data is moved in and handed back; we only need
     // the io::Result.
     let (res, _data) = file.write_all_at(data, 0).await;
-    res?;
+    res.map_err(crate::WholeFileError::Transfer)?;
     let _ = file.close().await;
     Ok(())
 }

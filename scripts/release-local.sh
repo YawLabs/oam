@@ -94,9 +94,10 @@
 #   OAM_SKIP_MAC=1          drop both mac assets (Air unreachable)
 #   OAM_SKIP_MAC_X64=1      drop only the mac-x64 asset
 #   OAM_SKIP_MAC_SIGN=1     ship the mac assets without the mac leg's codesign
-#                           step (loud; honored even with OAM_SIGN_REQUIRED=1,
-#                           which also refuses an ad-hoc mac build while
-#                           scripts/mac-signing-identity.sha1 holds no SHA-1).
+#                           step (loud; honored even with OAM_SIGN_REQUIRED=1).
+#                           Without it, both mac binaries MUST be signed with
+#                           the identity pinned in
+#                           scripts/mac-signing-identity.sha1.
 #                           See scripts/lib/mac-signing.sh.
 #                           The mac signing GATES (sign, verify, JIT smoke)
 #                           run inside the mac leg, AFTER the tag is pushed;
@@ -130,26 +131,31 @@
 #                           ed25519, "<path>.pub" beside it). Never committed.
 #                           Required as soon as release-keys/allowed_signers
 #                           holds a key; see release-keys/README.md
-#   OAM_SIGN_REQUIRED=0|1   1 makes missing signing setup fatal. Today that only
-#                           changes the bootstrap cases: no release key
-#                           committed yet (0 warns and ships no manifest, 1
-#                           fails in preflight), and no SHA-1 yet in
-#                           scripts/mac-signing-identity.sha1 (0 signs the mac
-#                           binaries ad-hoc with a warning, 1 fails the mac
-#                           preflight; see OAM_SKIP_MAC_SIGN). Release key k1
-#                           is committed, so today 1 changes ONLY the mac
-#                           case: every release fails in preflight until the
-#                           mac pin is committed.
-#                           With a key committed, signing is mandatory either
-#                           way -- there is deliberately no knob that skips it.
-#                           For Windows Authenticode, 1 makes an unset
-#                           OAM_WIN_SIGN_METADATA fatal instead of a warning
+#   OAM_SIGN_REQUIRED=0|1   default 1: missing signing setup is fatal in
+#                           preflight. 0 turns that back into a warning, and
+#                           exists only for a box without the Windows setup.
+#                           There are three bootstraps, and two are over:
+#                           - release key: k1 is committed in release-keys/,
+#                             so the manifest is signed either way -- there is
+#                             deliberately no knob that skips it;
+#                           - mac identity: the pin is committed in
+#                             scripts/mac-signing-identity.sha1, so both mac
+#                             binaries are signed with that identity either
+#                             way (only OAM_SKIP_MAC_SIGN=1 skips it);
+#                           - Windows Authenticode: still depends on the box.
+#                             By default an unset OAM_WIN_SIGN_METADATA fails
+#                             the preflight; with 0 it is one warning line and
+#                             both .exe assets ship unsigned. That is the case
+#                             the knob exists for now. An unsigned release is
+#                             therefore always a deliberate choice: =0 here,
+#                             or OAM_SKIP_WIN_SIGN / OAM_SKIP_MAC_SIGN.
 #   OAM_WIN_SIGN_METADATA=<path>
 #                           Azure Artifact Signing metadata.json (Endpoint,
 #                           CodeSigningAccountName, CertificateProfileName),
 #                           kept OUTSIDE the repo. Set: both .exe assets MUST
 #                           be Authenticode-signed and verified. Unset: they
-#                           ship unsigned with a loud warning (bootstrap)
+#                           ship unsigned with a loud warning, or the preflight
+#                           fails under OAM_SIGN_REQUIRED=1
 #   OAM_WIN_SIGN_PUBLISHER=<name>
 #                           the validated publisher name every Windows
 #                           signature must carry as its CN and O. Set with
@@ -171,10 +177,27 @@
 # release wall-time becomes a problem, they are independent and could run as
 # background jobs with per-leg logs -- a future knob, not a v1 need.
 #
-# Signing, two layers. The Windows binaries carry an Authenticode signature
-# from Azure Artifact Signing (scripts/lib/signing.sh, "Windows"), once
-# OAM_WIN_SIGN_METADATA is configured; the mac binaries do not yet carry a
-# Developer ID signature. Placement of the Windows layer:
+# Signing, two layers: the binaries, then the release.
+#
+# The mac binaries are signed with oam's own pinned, self-signed identity
+# (hardened runtime + entitlements; scripts/lib/mac-signing.sh,
+# scripts/macos/README.md) -- not a Developer ID yet, and not notarized, so
+# Gatekeeper still blocks a quarantined browser download. Placement:
+#   - preflight: build-platforms-tailnet.sh --preflight-only checks the signing
+#     decision and, with the pin, that the build Mac's keychain can make a real
+#     signature with exactly that identity;
+#   - the mac leg (build-remote.sh mac-release, on the build Mac): each binary
+#     is signed, verified against the pin and JIT-smoked between its cp into
+#     dist/ and its smoke, and its sha256 recorded there. These gates run after
+#     the tag is pushed; a failure publishes nothing (see OAM_SKIP_MAC_SIGN);
+#   - back on this box: build-platforms-tailnet.sh (mac_handback_check) checks
+#     the pulled bytes against the build Mac's hashes before they land in
+#     $RELEASE_DIR, so SHA256SUMS -- and the manifest -- cover the signed bytes.
+#
+# The Windows binaries carry an Authenticode signature from Azure Artifact
+# Signing (scripts/lib/signing.sh, "Windows"), as the validated publisher,
+# whenever OAM_WIN_SIGN_METADATA is configured (OAM_SIGN_REQUIRED=1 makes
+# that mandatory). Placement of the Windows layer:
 #   - preflight, beside the release key's: the tooling, a live `az` session,
 #     and a real throwaway signature + verify on a generated PE in a temp dir
 #     outside the repo -- never tag what we cannot sign;
@@ -191,10 +214,11 @@
 # SHA256SUMS bytes, and
 # RELEASE-MANIFEST.sig is an ssh ed25519 signature over it (scripts/lib/
 # signing.sh has the why; release-keys/README.md the runbook). Placement:
-#   - preflight, before the dirty-tree check, the bump and the tag: start a
-#     private ssh-agent, add the key (the run's one passphrase prompt), and
-#     prove a throwaway signature verifies against the committed keys and that
-#     the key's range covers $TAG -- never tag what we cannot sign;
+#   - preflight, after its cheap checks and before the second dirty-tree
+#     check, the bump and the tag: start a private ssh-agent, add the key (the
+#     run's one passphrase prompt), and prove a throwaway signature verifies
+#     against the committed keys and that the key's range covers $TAG -- never
+#     tag what we cannot sign;
 #   - right after `sha256sum oam-* > SHA256SUMS`: write, sign and verify the
 #     manifest from disk, then stop the agent. Nothing may change a byte of
 #     SHA256SUMS after that;
@@ -203,9 +227,10 @@
 #   - on any exit before it went live (a dry run, a rejected build, a fail()):
 #     the staged RELEASE-MANIFEST.sig is deleted, so no valid signature for an
 #     unpublished build of $TAG outlives the run (release_on_exit).
-# Mac Developer ID signing will slot in the same way: where each binary lands
-# in $RELEASE_DIR, before the SHA256SUMS step, so the manifest covers the
-# signed bytes.
+# A Developer ID for the mac binaries needs no new placement: it is a new
+# identity in the build Mac's keychain and its SHA-1 in the pin file
+# (scripts/macos/README.md). Notarization is a separate step that has not been
+# added yet.
 # =============================================================================
 
 set -euo pipefail
@@ -261,6 +286,11 @@ SKIP_LINUX="${OAM_SKIP_LINUX:-0}"
 # Handed to win_sign_decision, which validates it (0|1); signing.sh itself
 # reads no skip knob.
 SKIP_WIN_SIGN="${OAM_SKIP_WIN_SIGN:-0}"
+# Required by default (see the header): the docs promise signed assets, so a
+# release that cannot sign must stop rather than ship unsigned on a warning.
+# Exported because the libs and build-platforms-tailnet.sh read it from the
+# environment; an explicit OAM_SIGN_REQUIRED=0 still wins.
+export OAM_SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-1}"
 
 RELEASE_DIR="$(mktemp -d -t oam-release-"$TAG"-XXXXXX)"
 # Separate from RELEASE_DIR on purpose: `gh release create "$RELEASE_DIR"/*`
@@ -362,6 +392,40 @@ assert_tree_clean() {
   [ -n "$dirty" ] || return 0
   printf '%s\n' "$dirty" | sed 's/^/        /' >&2
   fail "$1: the working tree is dirty (paths above) -- the builds would ship them without their being in $TAG. Nothing has been built and no release exists yet; clean the tree and re-run (the tag has no release, so the re-run reconciles it)"
+}
+
+# assert_release_unpublished <context> -- fail unless $TAG has no release on
+# $REPO yet, draft or live.
+#
+# A PUBLISHED tag is immutable: whatever the release assets were built from must
+# keep pointing there forever. So this runs before the auto-bump commits
+# anything or the tag reconciliation moves anything -- twice: once among the
+# cheap checks at the top of the preflight, so a leftover draft fails before
+# the passphrase prompt and the quota-counted signing probe, and again right
+# before the bump, because the slow probes in between leave minutes for a
+# release to appear and that second read is the one the tag move relies on.
+#
+# Fails CLOSED. gh exits 1 both for "no such release" and for every other
+# failure, so the exit code alone cannot tell them apart -- and reading an
+# outage as "absent" would let the re-point below move a PUBLISHED tag. What
+# separates them is stderr: measured with gh 2.87.3 against this repo, a tag
+# with no release prints exactly `release not found`, while an unreachable proxy
+# (HTTPS_PROXY=http://127.0.0.1:9) printed `Get "https://api.github.com/..."` or
+# `Post "https://api.github.com/graphql"` then `: proxyconnect tcp: ...` -- for
+# a release that EXISTS as well as for one that does not -- and a bad token
+# `HTTP 401: Bad credentials (...)`, all with exit 1. So only exit 1 with that
+# exact line reads as absent; anything else stops the run here, and a gh that
+# ever rewords it fails closed too.
+assert_release_unpublished() {
+  local rc=0 err
+  err="$(gh release view "$TAG" --repo "$REPO" 2>&1 >/dev/null)" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    fail "$1: release $TAG already exists on $REPO (possibly a draft left by an interrupted run) -- inspect/delete it: gh release view $TAG --repo $REPO"
+  elif [ "$rc" -ne 1 ] || ! printf '%s\n' "$err" | grep -qxF 'release not found'; then
+    printf '%s\n' "${err:-<no output>}" | sed 's/^/        gh: /' >&2
+    fail "$1: could not tell whether release $TAG exists on $REPO (gh exited $rc, output above) -- moving the tag is safe only while it is unpublished, so this stops rather than guess. Check the network and 'gh auth status', then re-run"
+  fi
+  ok "$1: no release $TAG on $REPO yet"
 }
 
 # A build output cannot be replaced while something is mid-launch from it, and
@@ -473,74 +537,29 @@ step "Preflight $TAG"
 command -v gh >/dev/null 2>&1 || fail "gh CLI not found"
 gh auth status >/dev/null 2>&1 || fail "gh not authenticated -- run 'gh auth status' to inspect"
 
-# The remote legs' prerequisites, checked HERE for the reason the dirty-tree
-# guard below gives: never tag a tree we would refuse to build. They used to
-# sit at the END of the preflight, after the bump was on main and the tag on
-# origin, and the mac one asked only whether OAM_MAC_HOST was SET. The first
-# thing to actually reach the Air was the mac leg itself -- after the local
-# gate, both Windows builds and the console e2e. On 2026-09-30 that is where a
-# release found out this box and the Air were not on the same tailnet, with
-# v0.17.1 already tagged. --preflight-only is the mac leg's own host preflight (key
-# file, name resolves, host answers, key enrolled) and nothing else; the leg
-# still runs it again when it starts, since the Air can drop off in between.
-if [ "$SKIP_MAC" != "1" ]; then
-  [ -n "${OAM_MAC_HOST:-}" ] || fail "OAM_MAC_HOST not set (or set OAM_SKIP_MAC=1 to drop the mac assets)"
-  bash "$SCRIPT_DIR/build-platforms-tailnet.sh" --preflight-only \
-    || fail "the mac build host or its signing setup cannot be used -- see above. Fix that, or set OAM_SKIP_MAC=1 to drop the mac assets"
-fi
-[ "$SKIP_LINUX" = "1" ] || command -v gcloud >/dev/null 2>&1 || fail "gcloud CLI not found (or set OAM_SKIP_LINUX=1 to drop the linux asset)"
-
-# Release signing, proven HERE for the same reason as the host checks above:
-# the manifest is signed after every build, so a key that is missing, wrong,
-# out of range or behind a forgotten passphrase would otherwise surface hours
-# in, with the tag already public. A REAL throwaway signature, verified
-# against the committed release-keys/, is the only check that cannot pass for
-# a key that would then fail. It is also the run's one passphrase prompt --
-# asked while the operator is still at the keyboard. The probe lives in a
-# temp dir outside the repo; the dirty-tree check right below proves it.
+# The preflight runs in two halves, cheapest first. The first half is
+# deterministic and costs a second or two: a clean tree, a CHANGELOG this tag
+# can ship, no release for the tag yet, the tools the legs need. The second
+# half is slow, interactive or spends quota: an ssh probe of the build Mac,
+# the release key's passphrase prompt, a real Artifact Signing signature
+# (counted against the account's monthly quota). Each of the routine misses --
+# a forgotten scripts/changelog-release.sh, a stray file, a draft left by an
+# interrupted run -- must fail before any of that, or every retry repeats the
+# prompt and spends another signature. Both halves run before the bump and the
+# tag; nothing here depends on them.
 #
-# RELEASE_SIGNING is read again at the manifest step, against a fresh
-# decision, rather than trusted from here.
-RELEASE_SIGNING=0
-sign_decision="$(release_signing_decision)"
-case "$sign_decision" in
-  sign)
-    release_agent_start || fail "could not load the release signing key -- see above (OAM_RELEASE_SIGNING_KEY; release-keys/README.md)"
-    release_signing_preflight "$TAG" || fail "release signing preflight failed -- see above; nothing has been bumped or tagged"
-    RELEASE_SIGNING=1
-    ;;
-  skip:*) warn "${sign_decision#skip:}" ;;
-  fail:*) fail "${sign_decision#fail:}" ;;
-  *) fail "release_signing_decision returned '$sign_decision' -- refusing to guess whether to sign" ;;
-esac
-
-# Windows Authenticode, proven here for the same reason: each .exe is signed
-# right after its build, so a lapsed `az login`, a missing x64 .NET runtime, a
-# wrong metadata.json or a TSA outage would otherwise surface after the tag
-# went public. win_sign_preflight makes a REAL signature (Artifact Signing and
-# its TSA, end to end) on a generated PE in a temp dir outside the repo, then
-# verifies it as win_verify will verify the assets. Nothing is skipped
-# silently: the skip knob and the bootstrap case both warn.
-WIN_SIGNING=0
-win_decision="$(win_sign_decision "$SKIP_WIN_SIGN")"
-case "$win_decision" in
-  sign)
-    win_sign_preflight || fail "Windows signing preflight failed -- see above; nothing has been bumped or tagged (OAM_SKIP_WIN_SIGN=1 ships unsigned Windows assets deliberately)"
-    WIN_SIGNING=1
-    ;;
-  skip:*) warn "${win_decision#skip:}" ;;
-  fail:*) fail "${win_decision#fail:}" ;;
-  *) fail "win_sign_decision returned '$win_decision' -- refusing to guess whether to sign" ;;
-esac
-
 # --porcelain, not `git diff --quiet`: untracked files count too -- the
 # remote legs tar the WORKING TREE, so an untracked file ships into builds.
 # Leftover gate-regenerated conformance stamps (e.g. from a failed prior
 # attempt) are auto-restored first; anything else dirty still fails.
-# Checked BEFORE any tag work: never tag a tree we would refuse to build.
+# Checked BEFORE any tag work: never tag a tree we would refuse to build. A
+# second check after the signing probes proves they left nothing behind.
 restore_gate_artifacts "preflight"
 [ -z "$(git status --porcelain)" ] \
   || fail "working tree is dirty (untracked files count -- the remote legs ship the working tree) -- release from a clean tree"
+# The commit the checks below judge. Re-read after the slow half: the
+# CHANGELOG verdict holds only for the commit it read.
+preflight_head="$(git rev-parse HEAD)"
 
 # RELIABILITY.md's semver policy: "every release ships a public behavior-change
 # log". That was a written promise with nothing enforcing it, so a release whose
@@ -617,35 +636,88 @@ if [ -f CHANGELOG.md ]; then
   fi
 fi
 
+# A published tag must never move; see assert_release_unpublished. Read again
+# right before the bump.
+assert_release_unpublished "preflight"
+
+[ "$SKIP_LINUX" = "1" ] || command -v gcloud >/dev/null 2>&1 || fail "gcloud CLI not found (or set OAM_SKIP_LINUX=1 to drop the linux asset)"
+
+# --- preflight, slow half: the build Mac, the release key, Windows signing ----
+# The mac build host, checked HERE for the reason the dirty-tree guard above
+# gives: never tag a tree we would refuse to build. This check (and the gcloud
+# one above) used to sit at the END of the preflight, after the bump was on
+# main and the tag on origin, and asked only whether OAM_MAC_HOST was SET. The first
+# thing to actually reach the Air was the mac leg itself -- after the local
+# gate, both Windows builds and the console e2e. On 2026-09-30 that is where a
+# release found out this box and the Air were not on the same tailnet, with
+# v0.17.1 already tagged. --preflight-only is the mac leg's own host preflight (key
+# file, name resolves, host answers, key enrolled) and nothing else; the leg
+# still runs it again when it starts, since the Air can drop off in between.
+if [ "$SKIP_MAC" != "1" ]; then
+  [ -n "${OAM_MAC_HOST:-}" ] || fail "OAM_MAC_HOST not set (or set OAM_SKIP_MAC=1 to drop the mac assets)"
+  bash "$SCRIPT_DIR/build-platforms-tailnet.sh" --preflight-only \
+    || fail "the mac build host or its signing setup cannot be used -- see above. Fix that, or set OAM_SKIP_MAC=1 to drop the mac assets"
+fi
+
+# Release signing, proven HERE for the same reason as the host checks above:
+# the manifest is signed after every build, so a key that is missing, wrong,
+# out of range or behind a forgotten passphrase would otherwise surface hours
+# in, with the tag already public. A REAL throwaway signature, verified
+# against the committed release-keys/, is the only check that cannot pass for
+# a key that would then fail. It is also the run's one passphrase prompt --
+# asked while the operator is still at the keyboard. The probe lives in a
+# temp dir outside the repo; the second dirty-tree check below proves it.
+#
+# RELEASE_SIGNING is read again at the manifest step, against a fresh
+# decision, rather than trusted from here.
+RELEASE_SIGNING=0
+sign_decision="$(release_signing_decision)"
+case "$sign_decision" in
+  sign)
+    release_agent_start || fail "could not load the release signing key -- see above (OAM_RELEASE_SIGNING_KEY; release-keys/README.md)"
+    release_signing_preflight "$TAG" || fail "release signing preflight failed -- see above; nothing has been bumped or tagged"
+    RELEASE_SIGNING=1
+    ;;
+  skip:*) warn "${sign_decision#skip:}" ;;
+  fail:*) fail "${sign_decision#fail:}" ;;
+  *) fail "release_signing_decision returned '$sign_decision' -- refusing to guess whether to sign" ;;
+esac
+
+# Windows Authenticode, proven here for the same reason: each .exe is signed
+# right after its build, so a lapsed `az login`, a missing x64 .NET runtime, a
+# wrong metadata.json or a TSA outage would otherwise surface after the tag
+# went public. win_sign_preflight makes a REAL signature (Artifact Signing and
+# its TSA, end to end) on a generated PE in a temp dir outside the repo, then
+# verifies it as win_verify will verify the assets. Nothing is skipped
+# silently: the skip knob and the bootstrap case both warn.
+WIN_SIGNING=0
+win_decision="$(win_sign_decision "$SKIP_WIN_SIGN")"
+case "$win_decision" in
+  sign)
+    win_sign_preflight || fail "Windows signing preflight failed -- see above; nothing has been bumped or tagged (OAM_SKIP_WIN_SIGN=1 ships unsigned Windows assets deliberately)"
+    WIN_SIGNING=1
+    ;;
+  skip:*) warn "${win_decision#skip:}" ;;
+  fail:*) fail "${win_decision#fail:}" ;;
+  *) fail "win_sign_decision returned '$win_decision' -- refusing to guess whether to sign" ;;
+esac
+
+# The signing probes work in temp dirs outside the repo; this proves they left
+# nothing in the tree. And the cheap half's verdicts were for
+# $preflight_head: a commit made while the probes ran would be tagged without
+# them, so a moved HEAD stops the run here.
+assert_tree_clean "preflight, after the signing probes"
+[ "$(git rev-parse HEAD)" = "$preflight_head" ] \
+  || fail "HEAD moved during the preflight (was $preflight_head, now $(git rev-parse HEAD)) -- the CHANGELOG and tree checks were for the old commit. Nothing has been bumped or tagged; re-run"
+
 # origin/main is load-bearing for BOTH the auto-bump (which pushes a commit
 # onto it) and the ancestor check further down, so refresh it before either.
 git fetch -q origin main 2>/dev/null || true
 
-# A PUBLISHED tag is immutable: whatever the release assets were built from must
-# keep pointing there forever. So check for the release FIRST -- before the
-# auto-bump commits anything or the tag reconciliation moves anything.
-#
-# Fails CLOSED. gh exits 1 both for "no such release" and for every other
-# failure, so the exit code alone cannot tell them apart -- and reading an
-# outage as "absent" would let the re-point below move a PUBLISHED tag. What
-# separates them is stderr: measured with gh 2.87.3 against this repo, a tag
-# with no release prints exactly `release not found`, while an unreachable proxy
-# (HTTPS_PROXY=http://127.0.0.1:9) printed `Get "https://api.github.com/..."` or
-# `Post "https://api.github.com/graphql"` then `: proxyconnect tcp: ...` -- for
-# a release that EXISTS as well as for one that does not -- and a bad token
-# `HTTP 401: Bad credentials (...)`, all with exit 1. So only exit 1 with that
-# exact line reads as absent; anything else stops the run here, and a gh that
-# ever rewords it fails closed too.
-release_view_rc=0
-release_view_err="$(gh release view "$TAG" --repo "$REPO" 2>&1 >/dev/null)" || release_view_rc=$?
-if [ "$release_view_rc" -eq 0 ]; then
-  fail "release $TAG already exists on $REPO (possibly a draft left by an interrupted run) -- inspect/delete it: gh release view $TAG --repo $REPO"
-elif [ "$release_view_rc" -ne 1 ] \
-     || ! printf '%s\n' "$release_view_err" | grep -qxF 'release not found'; then
-  printf '%s\n' "${release_view_err:-<no output>}" | sed 's/^/        gh: /' >&2
-  fail "could not tell whether release $TAG exists on $REPO (gh exited $release_view_rc, output above) -- moving the tag is safe only while it is unpublished, so this stops rather than guess. Check the network and 'gh auth status', then re-run"
-fi
-ok "no release $TAG on $REPO yet"
+# The read the tag move relies on: the slow half above took minutes, and a
+# release created meanwhile (a second run, a hand-made draft) must still stop
+# this one before anything is committed or moved.
+assert_release_unpublished "before the bump"
 
 # The binaries report the workspace version -- a v0.7.0 tag over a 0.6.1
 # Cargo.toml would ship assets that self-identify wrong. The tag IS the
@@ -1248,6 +1320,48 @@ RELEASE_LIVE=1
 ok "release $TAG published: https://github.com/$REPO/releases/tag/$TAG"
 ok "staged assets kept at $RELEASE_DIR (safe to delete)"
 
+# site_refresh_reason <stderr> -- why refresh-downloads.sh refused, as one line
+# fit for a warn: its last "[fail]" line (the prefix dropped), else its last
+# line that mentions an error, else its last three non-empty lines joined by
+# " | ". Colour codes and control characters are stripped and the result is
+# capped at 300 characters. The text is the site script's, so it is only ever
+# printed, never evaluated; backslashes are doubled because warn prints with
+# echo -e, which would otherwise read the "\c" in a Windows path as "stop
+# here". Every command in it succeeds, so it cannot trip set -e or pipefail.
+site_refresh_reason() {
+  local esc=$'\033' reason
+  reason="$(printf '%s\n' "$1" | tr '\t' ' ' | sed "s/${esc}\[[0-9;]*[A-Za-z]//g" \
+    | tr -d '\000-\010\013-\037\177' | awk '
+      /\[fail\]/ { f = $0 }
+      tolower($0) ~ /error|fail|refus|denied|not found/ { e = $0 }
+      NF { l = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", l); t[n % 3] = l; n++ }
+      END {
+        if (f != "") { r = f; sub(/^[[:space:]]*\[fail\][[:space:]]*/, "", r) }
+        else if (e != "") r = e
+        else for (i = (n > 3 ? n - 3 : 0); i < n; i++) r = r (r == "" ? "" : " | ") t[i % 3]
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", r)
+        if (length(r) > 300) r = substr(r, 1, 297) "..."
+        print (r == "" ? "it printed nothing on stderr" : r)
+      }')"
+  printf '%s\n' "${reason//\\/\\\\}"
+}
+
+# refresh_site_downloads <site-dir> <tag> -- run the site's refresh-downloads.sh
+# for <tag>. Its stdout is discarded; its stderr is captured, so a refusal's
+# reason reaches the warn instead of /dev/null (on success its chatter is
+# dropped, as before). Always returns 0: the release is already live by the
+# time this runs, so a failure here warns and falls through.
+refresh_site_downloads() {
+  local err rc=0
+  err="$("$1/scripts/refresh-downloads.sh" "$2" 2>&1 >/dev/null)" || rc=$?
+  if [ "$rc" = "0" ]; then
+    ok "release pages regenerated for $2 (downloads page + checksums post)"
+  else
+    warn "refresh-downloads.sh failed (exit $rc): $(site_refresh_reason "$err") -- the downloads page and checksums post still advertise the previous release"
+  fi
+  return 0
+}
+
 # --- publish the installers to oamjs.org -----------------------------------------
 # The installers at https://oamjs.org/install.{sh,ps1} are what users pipe into
 # sh / iex, and `oam self-update` in binaries before v0.18.0 does the same
@@ -1277,9 +1391,7 @@ else
   # rest of this step: the release is already out, and the verification below
   # says loudly if the live page is stale.
   if [ -x "$SITE_DIR/scripts/refresh-downloads.sh" ]; then
-    "$SITE_DIR/scripts/refresh-downloads.sh" "$TAG" >/dev/null 2>&1 \
-      && ok "release pages regenerated for $TAG (downloads page + checksums post)" \
-      || warn "refresh-downloads.sh failed -- the downloads page and checksums post still advertise the previous release"
+    refresh_site_downloads "$SITE_DIR" "$TAG"
   else
     warn "no scripts/refresh-downloads.sh in $SITE_DIR -- downloads page NOT regenerated"
   fi

@@ -4,13 +4,16 @@
 //!
 //! A fetch whose dispatcher carries a `connect.lookup` hook runs in hook
 //! mode. undici calls the hook for every connection it opens to a host name
-//! -- the first request and every redirect hop to another host -- so an
-//! SSRF or DNS-rebind guard vets a 302 to an internal name too. The op cannot
-//! call JS while it runs, so before dialling a host name it has no addresses
-//! for, the loop PARKS: it stores its whole state in [`FetchContinuations`]
-//! and resolves with `{"lookup": {token, host, port}}`. JS runs the hook and
-//! resumes the fetch with [`fetch_continue`], or drops it with
-//! [`fetch_abandon`] when the hook failed or the fetch was aborted.
+//! -- the first request, every redirect hop that needs a new connection, and
+//! no request that finds a pooled one -- so an SSRF or DNS-rebind guard vets
+//! a 302 to an internal name too. The dispatcher's connections are pooled
+//! across its fetches (`HttpTransport::agent_pool`). The op cannot call JS
+//! while it runs, so when a send needs a new connection to a host name and
+//! has no answer for it, the loop PARKS: it stores its whole state -- the
+//! unsent request included -- in [`FetchContinuations`] and resolves with
+//! `{"lookup": {token, host, port}}`. JS runs the hook and resumes the fetch
+//! with [`fetch_continue`], whose answer opens that one connection, or drops
+//! it with [`fetch_abandon`] when the hook failed or the fetch was aborted.
 //!
 //! The order of the checks is undici's: the initial bad-port block runs
 //! before the first park (a bad-port URL never reaches the hook), and a
@@ -51,12 +54,13 @@ use hyper::body::Incoming;
 use super::body::{FetchBodies, FetchBody, StreamSlot};
 use super::connector::{ConnInfo, SuppliedConn};
 use super::decode::{self, MAX_CODINGS, Plan};
+use super::pool::Released;
 use super::prepare::{self, PrepareError};
 use super::redirect::{self, Next};
 use super::sent::Dispatched;
 use super::tls_config::{Alpn, TlsRange};
 use super::transport::{channel_body, channel_body_then, empty_body, full_body};
-use super::{HttpTransport, NetCheck, NetTarget, ReqBody, Route};
+use super::{AgentPool, HttpTransport, NetCheck, NetTarget, ReqBody, Route};
 use crate::OpOutcome;
 use crate::OutboundBodies;
 use crate::net_connect::attempt_timeout_from_ms;
@@ -91,6 +95,15 @@ pub struct FetchRequest {
     /// the module docs).
     #[serde(default)]
     pub lookup_hook: bool,
+    /// With `lookup_hook`: the id of the dispatcher whose pool the fetch's
+    /// connections come from (`HttpTransport::agent_pool`). Absent: a pool
+    /// of the fetch's own.
+    #[serde(default)]
+    pub lookup_pool: Option<u64>,
+    /// That pool, claimed by [`FetchRequest::claim_agent_pool`]. Never from
+    /// JS. Without it a hooked fetch has a pool of its own.
+    #[serde(skip)]
+    pub agent_pool: Option<AgentPool>,
     /// The dispatcher carries a `connect` FUNCTION: run in connector mode
     /// (see the module docs). Wins over `lookup_hook`.
     #[serde(default)]
@@ -355,6 +368,29 @@ pub fn fetch_cancel(id: u64, cancels: &FetchCancels) -> bool {
     }
 }
 
+impl FetchRequest {
+    /// Take the dispatcher's pool ([`HttpTransport::agent_pool`]) for a
+    /// fetch in hook mode that names one: its `lookup_pool`. Called by the
+    /// engine's fetch op while JS waits on it, never from the fetch's
+    /// future: the dispatcher's `close()` or `destroy()` drops its pool
+    /// synchronously (`HttpTransport::drop_agent`), and a pool first created
+    /// by the future -- once that future ran on the runtime, after a
+    /// `close()` in the same tick as the `fetch()` -- was created after the
+    /// drop and stayed open, with its connections, until the idle reaper,
+    /// and its entry for the rest of the run. Claimed here, the pool exists
+    /// before any later JS can run, and a `close()` after the call finds and
+    /// drops it; one before the call has JS leave `lookup_pool` out
+    /// (bootstrap.js), and the fetch keeps a pool of its own.
+    pub fn claim_agent_pool(&mut self, transport: &HttpTransport) {
+        if self.lookup_hook
+            && !self.connect_hook
+            && let Some(agent) = self.lookup_pool
+        {
+            self.agent_pool = Some(transport.agent_pool(agent));
+        }
+    }
+}
+
 /// reqwest's h2 retry allowance (retry.rs, `max_retries_per_request`).
 pub const MAX_H2_RETRIES: u32 = 2;
 
@@ -399,6 +435,26 @@ struct LoopState {
     defer_head: Option<DeferHead>,
     /// [`FetchRequest::iterable_body`].
     iterable_body: bool,
+    /// The request a hooked send handed back unsent because it needed a
+    /// new connection the hook had not answered for: carried across the
+    /// park and sent as it is once the answer is in (a streamed body cannot
+    /// be built a second time).
+    unsent: Option<http::Request<ReqBody>>,
+    /// This hop's resends so far. In the state, not the hop's own body: a
+    /// resend that needs a new connection parks for the hook, and the hop
+    /// resumed after that park must not start counting again (an origin
+    /// that answered every connection with GOAWAY then had a hooked fetch
+    /// open connections without end). Reset only by a redirect.
+    resends: Resends,
+}
+
+/// The two resend allowances of a hop (see the send loop in [`run`]).
+#[derive(Default, Clone, Copy)]
+struct Resends {
+    /// h2 retries, at most [`MAX_H2_RETRIES`].
+    h2: u32,
+    /// The one resend after a stale pooled connection.
+    stale: bool,
 }
 
 enum BodySource {
@@ -529,10 +585,12 @@ pub async fn fetch(
     let route = if req.connect_hook {
         transport.supplied_route(attempt_timeout, tls_range)
     } else {
-        transport
-            .route(req.lookup_hook, attempt_timeout, tls_range)
-            .with_connect_timeout(connect_timeout_from_ms(req.connect_timeout_ms))
-            .with_alpn(req.alpn)
+        match (req.lookup_hook, req.agent_pool) {
+            (true, Some(pool)) => pool.route(attempt_timeout, tls_range),
+            (hooked, _) => transport.route(hooked, attempt_timeout, tls_range),
+        }
+        .with_connect_timeout(connect_timeout_from_ms(req.connect_timeout_ms))
+        .with_alpn(req.alpn)
     };
     let headers_timeout = timeout_limit(req.headers_timeout_ms);
     let dispatched = match req.dispatched {
@@ -561,6 +619,8 @@ pub async fn fetch(
         body_timeout: timeout_limit(req.body_timeout_ms),
         defer_head: req.defer_head,
         iterable_body: req.iterable_body,
+        unsent: None,
+        resends: Resends::default(),
     };
     run(state, &bodies, &ids, &continuations).await
 }
@@ -569,24 +629,50 @@ pub async fn fetch(
 /// answer, `{"ips": ["addr", ...]}` in the hook's order (JS has already
 /// applied node's address filtering). Resolves like [`fetch`]. The parked
 /// fetch is consumed whatever happens: a malformed answer fails it.
-pub async fn fetch_continue(
+///
+/// The parked fetch is taken and handed the answer when this is CALLED, not
+/// when the future is first polled, so the answer's [`LookupGate`] is
+/// registered before the op returns to JS: a failure the hook reports right
+/// after (a microtask later) finds the connection still being made, as it
+/// does in node, whose connect cannot complete before the event loop polls.
+///
+/// [`LookupGate`]: super::connector::LookupGate
+pub fn fetch_continue(
     token: u64,
     lookup: String,
     bodies: FetchBodies,
     ids: Arc<AtomicU64>,
     continuations: FetchContinuations,
-) -> OpOutcome {
-    let pending = take_parked(&continuations, token, Wants::Addresses);
+) -> impl std::future::Future<Output = OpOutcome> + Send + 'static {
+    let resumed = resume_with_answer(token, &lookup, &continuations);
+    async move {
+        match resumed {
+            Ok(state) => run(state, &bodies, &ids, &continuations).await,
+            Err(text) => OpOutcome::Failed(text),
+        }
+    }
+}
+
+/// [`fetch_continue`]'s synchronous half: the parked fetch, holding the
+/// hook's answer, or the op's failure.
+fn resume_with_answer(
+    token: u64,
+    lookup: &str,
+    continuations: &FetchContinuations,
+) -> Result<LoopState, String> {
+    let pending = take_parked(continuations, token, Wants::Addresses);
     let Some(PendingFetch { state, key, .. }) = pending else {
-        return OpOutcome::Failed(format!("fetch: lookup continuation {token} is gone"));
+        return Err(format!("fetch: lookup continuation {token} is gone"));
     };
     #[derive(serde::Deserialize)]
     struct Lookup {
         ips: Vec<String>,
     }
-    let lookup: Lookup = match serde_json::from_str(&lookup) {
+    let lookup: Lookup = match serde_json::from_str(lookup) {
         Ok(lookup) => lookup,
-        Err(e) => return OpOutcome::Failed(format!("fetch: malformed lookup result: {e}")),
+        Err(e) => {
+            return Err(format!("fetch: malformed lookup result: {e}"));
+        }
     };
     let mut addrs = Vec::with_capacity(lookup.ips.len());
     for ip in &lookup.ips {
@@ -595,16 +681,23 @@ pub async fn fetch_continue(
         match ip.parse::<crate::net_connect::PinAddr>() {
             Ok(addr) => addrs.push(addr),
             Err(e) => {
-                return OpOutcome::Failed(format!(
+                return Err(format!(
                     "fetch: connect pin failed: pin ip '{ip}' is not an IP: {e}"
                 ));
             }
         }
     }
     // An empty list reaches the connector, which fails it as node's
-    // ERR_INVALID_IP_ADDRESS (JS refuses one before it gets here).
-    state.route.set_addrs(&key, addrs);
-    run(state, &bodies, &ids, &continuations).await
+    // ERR_INVALID_IP_ADDRESS (JS refuses one before it gets here). The
+    // hook's later callbacks can still fail the connection this answer
+    // opens, by this token, until it has connected (#169).
+    let gate = state.transport.lookup_gate(token);
+    state.route.set_pin(super::connector::HookPin {
+        key,
+        addrs,
+        gate: Some(gate),
+    });
+    Ok(state)
 }
 
 /// The fetch parked under `token`, if it waits for `wants`. One that waits
@@ -727,32 +820,16 @@ async fn run(
             );
             return OpOutcome::Json(payload.to_string());
         }
-        if let Some((key, host)) = state.route.lookup_needed(&uri) {
-            // The port as undici's connector hands it to net.connect, which
-            // is what node's ERR_INVALID_ADDRESS_FAMILY carries: the URL's
-            // port STRING when the URL names one, else the number 80 / 443
-            // (`port || 80`, undici core/connect.js; measured: `port` is
-            // "4567" for `:4567` and 80 for no port). A default port never
-            // survives URL parsing, so an explicit one is never 80 on http.
-            let port = match uri.port_u16() {
-                Some(port) => serde_json::Value::from(port.to_string()),
-                None if uri.scheme_str() == Some("https") => serde_json::Value::from(443),
-                None => serde_json::Value::from(80),
-            };
-            let token = ids.fetch_add(1, Ordering::Relaxed);
-            let payload = serde_json::json!({
-                "lookup": { "token": token, "host": host, "port": port },
-            });
-            lock(continuations).insert(
-                token,
-                PendingFetch {
-                    state,
-                    host,
-                    key,
-                    wants: Wants::Addresses,
-                },
-            );
-            return OpOutcome::Json(payload.to_string());
+        // A hooked hop that needs a new connection to a host name parks for
+        // the hook here, before its request is built: nothing is taken from
+        // a streamed body, and an abort that came with the fetch does not
+        // keep the hook from being asked, as undici has begun connecting by
+        // then (the send below is where a cancel lands). One whose idle
+        // connection is taken from under it parks from the send instead.
+        if state.unsent.is_none()
+            && let Some((key, host)) = state.route.lookup_needed(&uri)
+        {
+            return park_for_lookup(state, &uri, key, host, ids, continuations);
         }
         // proxy-authorization is per hop and never carried: it is computed
         // after the cross-origin strip, for this hop's proxy. Only a hop that
@@ -781,33 +858,37 @@ async fn run(
                 redirect::Rules::Fetch
             },
         );
-        let mut retries = 0;
-        let mut stale_resent = false;
         let response = loop {
-            let timed = state.headers_timeout.and(state.dispatched.as_ref());
-            let declared = hop_headers
-                .get(CONTENT_LENGTH)
-                .and_then(|value| value.to_str().ok()?.trim().parse::<u64>().ok());
-            let body = match state.source.build(timed, declared) {
-                Ok(body) => body,
-                Err(text) => return OpOutcome::Failed(text),
+            let request = match state.unsent.take() {
+                Some(request) => request,
+                None => {
+                    let timed = state.headers_timeout.and(state.dispatched.as_ref());
+                    let declared = hop_headers
+                        .get(CONTENT_LENGTH)
+                        .and_then(|value| value.to_str().ok()?.trim().parse::<u64>().ok());
+                    let body = match state.source.build(timed, declared) {
+                        Ok(body) => body,
+                        Err(text) => return OpOutcome::Failed(text),
+                    };
+                    let mut request = http::Request::new(body);
+                    *request.method_mut() = state.method.clone();
+                    *request.uri_mut() = uri.clone();
+                    *request.headers_mut() = hop_headers.clone();
+                    if let Some(dispatched) = &state.dispatched {
+                        request.extensions_mut().insert(dispatched.clone());
+                    }
+                    if matches!(state.source, BodySource::Stream(_))
+                        && let Some(defer) = state.defer_head.take()
+                    {
+                        request
+                            .extensions_mut()
+                            .insert(super::transport::HeadAwaitsBody {
+                                empty_content_length: defer.empty_content_length,
+                            });
+                    }
+                    request
+                }
             };
-            let mut request = http::Request::new(body);
-            *request.method_mut() = state.method.clone();
-            *request.uri_mut() = uri.clone();
-            *request.headers_mut() = hop_headers.clone();
-            if let Some(dispatched) = &state.dispatched {
-                request.extensions_mut().insert(dispatched.clone());
-            }
-            if matches!(state.source, BodySource::Stream(_))
-                && let Some(defer) = state.defer_head.take()
-            {
-                request
-                    .extensions_mut()
-                    .insert(super::transport::HeadAwaitsBody {
-                        empty_content_length: defer.empty_content_length,
-                    });
-            }
             // The one place the loop waits. Each send (a hop, a resend) gets
             // its own headersTimeout, started by its own checkout: a head that
             // is late fails the hop, and dropping the send drops the request
@@ -851,14 +932,25 @@ async fn run(
                 state.source.request_failed();
                 return headers_timed_out();
             };
+            // A hooked send that needs a new connection to a host name the
+            // hook has not answered for: park, with the request it handed
+            // back unsent, until JS has run the hook.
+            if let Err(e) = &sent
+                && let Some((key, host)) = e.lookup_needed()
+            {
+                if let Err(mut e) = sent {
+                    state.unsent = e.take_request();
+                }
+                return park_for_lookup(state, &uri, key, host, ids, continuations);
+            }
             match sent {
                 Ok(response) => break response,
                 Err(e)
-                    if retries < MAX_H2_RETRIES
+                    if state.resends.h2 < MAX_H2_RETRIES
                         && state.source.replayable()
                         && e.is_h2_retryable() =>
                 {
-                    retries += 1;
+                    state.resends.h2 += 1;
                 }
                 // A pooled connection the server had already closed: no part
                 // of a response arrived, so the request may go out again
@@ -892,14 +984,14 @@ async fn run(
                 // the 3xx's connection is closing with: it never takes that
                 // connection (`pool::retires_for_the_hop`).
                 Err(e)
-                    if !stale_resent
+                    if !state.resends.stale
                         && state.source.replayable()
                         && is_idempotent(&state.method)
                         && e.is_incomplete_message()
                         && e.on_reused_connection()
                         && !e.response_started() =>
                 {
-                    stale_resent = true;
+                    state.resends.stale = true;
                 }
                 Err(e) => {
                     state.source.request_failed();
@@ -980,8 +1072,27 @@ async fn run(
                 drop_body,
             } => {
                 // An unread 3xx body: its h1 connection is closed, not
-                // pooled (reqwest did the same).
+                // pooled (reqwest did the same). An empty one leaves it
+                // idle, and the hop waits until the pool has it back
+                // (`pool::Released`), so a same-origin hop reuses it every
+                // time rather than when it wins a race -- on a hooked route,
+                // the hook is then asked for the connections a fetch opens
+                // and no more.
+                let released = response.extensions().get::<Released>().cloned();
                 drop(response);
+                if let Some(released) = released {
+                    match &state.cancel {
+                        Some(cancel) => tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => {
+                                state.source.request_failed();
+                                return OpOutcome::Failed(ABORTED.to_string());
+                            }
+                            () = released.settled() => {}
+                        },
+                        None => released.settled().await,
+                    }
+                }
                 redirect::apply(&mut state.carried, &state.current, &url, drop_body);
                 if drop_body {
                     state.source = BodySource::Empty;
@@ -997,10 +1108,49 @@ async fn run(
                 state.method = method;
                 state.current = url;
                 state.hops += 1;
+                state.resends = Resends::default();
             }
         }
     };
     respond(state, response, bodies, ids)
+}
+
+/// Park the fetch in `state` for its `connect.lookup` hook's answer for the
+/// authority `key` (host `host`) of `uri`, and resolve with the lookup
+/// request JS runs the hook for.
+fn park_for_lookup(
+    state: LoopState,
+    uri: &http::Uri,
+    key: String,
+    host: String,
+    ids: &AtomicU64,
+    continuations: &FetchContinuations,
+) -> OpOutcome {
+    // The port as undici's connector hands it to net.connect, which is what
+    // node's ERR_INVALID_ADDRESS_FAMILY carries: the URL's port STRING when
+    // the URL names one, else the number 80 / 443 (`port || 80`, undici
+    // core/connect.js; measured: `port` is "4567" for `:4567` and 80 for no
+    // port). A default port never survives URL parsing, so an explicit one
+    // is never 80 on http.
+    let port = match uri.port_u16() {
+        Some(port) => serde_json::Value::from(port.to_string()),
+        None if uri.scheme_str() == Some("https") => serde_json::Value::from(443),
+        None => serde_json::Value::from(80),
+    };
+    let token = ids.fetch_add(1, Ordering::Relaxed);
+    let payload = serde_json::json!({
+        "lookup": { "token": token, "host": host, "port": port },
+    });
+    lock(continuations).insert(
+        token,
+        PendingFetch {
+            state,
+            host,
+            key,
+            wants: Wants::Addresses,
+        },
+    );
+    OpOutcome::Json(payload.to_string())
 }
 
 /// node's response-head limit (`maxHeaderSize`, 16 KiB by default): the

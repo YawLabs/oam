@@ -115,8 +115,11 @@ protocol surface ships in the binary instead of being installed from npm.
   the changelog -- 0.9.0 changed `child_process` behavior you may have depended
   on. There is no LTS yet, so this is not the runtime for a service you are
   on-call for.
-- **Binaries are unsigned.** They are checksummed against a published
-  `SHA256SUMS` and the installer verifies that, but there is no code signature.
+- **The macOS binaries are not notarized.** From v0.18.0 every release
+  carries a signed `RELEASE-MANIFEST` that the installers verify, and the
+  Windows binaries are Authenticode-signed. The macOS ones are signed with
+  oam's own self-signed identity, not Apple Developer ID, so Gatekeeper still
+  blocks a browser download; curl and brew installs are unaffected.
 - **Native addons are alpha and off by default**, behind
   `OAM_ENABLE_NATIVE_ADDONS=1`. An addon compiled against `node.exe` can
   deadlock the OS loader inside a different host, before any oam code runs --

@@ -96,7 +96,7 @@ the new identity, and update the pin in a commit that says why.
 The mac gates (signing, the verify gate and the JIT smoke) run on the build
 Mac inside the mac leg, and that leg runs after `release-local.sh` has pushed
 the tag. The preflight checks the signing decision and, with a pin, the
-keychain. It cannot check that an ad-hoc, hardened-runtime binary can still
+keychain. It cannot check that a signed, hardened-runtime binary can still
 JIT, because that needs a built oam.
 
 So, before the first release made after this signing code lands, run the mac
@@ -109,8 +109,14 @@ ship that one release unsigned instead, set `OAM_SKIP_MAC_SIGN=1`.
 
 ## `OAM_SIGN_REQUIRED`
 
-`OAM_SIGN_REQUIRED` is shared with the release-manifest signing in
-`scripts/lib/signing.sh`. A release key is now committed, so for the manifest
-the knob changes nothing. For the mac leg it still matters: with
-`OAM_SIGN_REQUIRED=1` and no SHA-1 in `scripts/mac-signing-identity.sha1`,
-every release fails in preflight. Leave it unset until the pin is committed.
+`OAM_SIGN_REQUIRED` is one knob for every signing bootstrap, shared with
+`scripts/lib/signing.sh`. With `OAM_SIGN_REQUIRED=1`, a missing piece of
+signing setup fails the release in preflight instead of warning. The release
+key and the mac pin are both committed now, so neither of those cases can
+fire: the manifest must be signed and the mac binaries must be signed with
+the pinned identity whatever the knob says. What the knob still changes is
+Windows: with it set, an unset `OAM_WIN_SIGN_METADATA` is fatal, where
+without it both `.exe` assets would ship unsigned behind one warning line.
+`scripts/release-local.sh` sets it to 1 unless you export
+`OAM_SIGN_REQUIRED=0`, so an unsigned release is always a deliberate choice.
+`OAM_SKIP_MAC_SIGN=1` is still honored under it.

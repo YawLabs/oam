@@ -62,14 +62,24 @@ curl -fsSL https://oamjs.org/install.sh | sh       # Linux / macOS
 irm https://oamjs.org/install.ps1 | iex            # Windows
 ```
 
-Both installers pick the binary for your OS/arch, verify it against the published
-`SHA256SUMS`, and install per-user (`~/.oam/bin`, `%LOCALAPPDATA%\oam\bin`) — no sudo, no
-admin. Binaries are unsigned and checksummed. `oam self-update` updates in place and also
-checks the release's signed manifest (`release-keys/`).
+Both installers pick the binary for your OS/arch, verify the release, and install per-user
+(`~/.oam/bin`, `%LOCALAPPDATA%\oam\bin`) — no sudo, no admin. `oam self-update` updates in
+place with the same checks.
+
+From v0.18.0 every release carries a `RELEASE-MANIFEST` signed with oam's release key
+(fingerprints in [SECURITY.md](SECURITY.md#release-integrity)). Both installers and
+`oam self-update` verify that signature and take the binary's checksum from the signed
+manifest. The installers need an `ssh-keygen` with `-Y` (OpenSSH 8.1+) for this. Releases
+before v0.18.0 are checked against pinned `SHA256SUMS` digests. The Windows binaries are
+Authenticode-signed (publisher "Yaw Labs LLC"). The macOS binaries are signed with oam's own
+pinned, self-signed identity, not Apple Developer ID, and are not notarized: Gatekeeper still
+blocks a browser download, while curl and brew installs are unaffected.
+[install/README.md](install/README.md) has the details.
 
 Knobs:
 `OAM_VERSION` pins a tag, `OAM_INSTALL_DIR` moves the target directory, `OAM_GH_API` points
-at a GitHub Enterprise host.
+at a GitHub Enterprise host, `OAM_INSECURE_SKIP_SIGNATURE=1` installs on a host with no
+usable `ssh-keygen`, without checking the signature.
 
 ## Building
 

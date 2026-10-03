@@ -47,9 +47,14 @@ parsing, and the TS stripper. OSS-Fuzz application at public launch. Trophies pu
 
 ## oam's own supply chain
 
-Release binaries are currently unsigned and ship with a `SHA256SUMS` checksum file; see
-SECURITY.md, "Release integrity". Code signing (Windows Authenticode, macOS notarization),
-SLSA provenance and reproducible builds are planned, not yet in place. The installer scripts
-are served from oamjs.org. They download the binary and `SHA256SUMS` from the GitHub release
-and refuse to install on a checksum mismatch. `oam self-update` also verifies the release's
-signed `RELEASE-MANIFEST` against the release keys built into oam (`release-keys/`).
+From v0.18.0 every release carries `RELEASE-MANIFEST` (the tag plus the `SHA256SUMS` lines)
+and `RELEASE-MANIFEST.sig`, signed with release key k1; see SECURITY.md, "Release integrity",
+for the fingerprints. The installer scripts are served from oamjs.org. They, and
+`oam self-update`, verify that signature against the release keys embedded in them
+(`release-keys/`) and refuse to install a binary whose hash does not match the signed
+manifest. The installers need `ssh-keygen` with `-Y` (OpenSSH 8.1+); releases before v0.18.0
+are checked against pinned `SHA256SUMS` digests instead. The Windows binaries are
+Authenticode-signed through Azure Artifact Signing, as "Yaw Labs LLC". The macOS binaries
+are signed with oam's own pinned, self-signed identity and the hardened runtime; Apple
+Developer ID signing and notarization, SLSA provenance and reproducible builds are planned,
+not yet in place.

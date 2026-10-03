@@ -308,7 +308,7 @@ release_signing_decision() {
   if [ -n "$(release_key_lines)" ]; then
     printf 'sign\n'
   elif [ "$req" = "1" ]; then
-    printf 'fail:OAM_SIGN_REQUIRED=1 but release-keys/allowed_signers holds no key yet -- generate and commit one (release-keys/README.md), or unset OAM_SIGN_REQUIRED for a bootstrap release\n'
+    printf 'fail:OAM_SIGN_REQUIRED=1 but release-keys/allowed_signers holds no key yet -- generate and commit one (release-keys/README.md), or set OAM_SIGN_REQUIRED=0 for a bootstrap release (release-local.sh defaults it to 1)\n'
   else
     printf 'skip:release-keys/allowed_signers holds no key yet, so this release ships WITHOUT a signed RELEASE-MANIFEST (bootstrap; see release-keys/README.md). Once a key is committed this step is mandatory\n'
   fi
@@ -643,8 +643,11 @@ release_verify_manifest() {
 # name and lives three days, and signtool reaches the service through a
 # client "dlib" plugin. Everything account-specific (endpoint, account name,
 # certificate profile) sits in a metadata.json OUTSIDE the repo, at
-# $OAM_WIN_SIGN_METADATA; the publisher name the signature must carry is
-# $OAM_WIN_SIGN_PUBLISHER. Neither is ever committed: this is a public repo.
+# $OAM_WIN_SIGN_METADATA, never committed: this is a public repo. The
+# publisher name the signature must carry is $OAM_WIN_SIGN_PUBLISHER; the name
+# itself is public (it is printed on every signed asset, and the docs state
+# it), but the script takes it from the environment so a renamed or
+# re-validated organization is a config change, not a code change.
 # release-keys/README.md ("Windows Authenticode") is the setup runbook.
 #
 # Three-day certificates make the RFC 3161 timestamp the signature's real
@@ -1018,7 +1021,7 @@ win_sign_decision() {
   elif [ -n "$meta" ] || [ -n "$pub" ]; then
     printf 'fail:Windows signing is half configured -- set BOTH OAM_WIN_SIGN_METADATA (the metadata.json path) and OAM_WIN_SIGN_PUBLISHER (the validated publisher name), or neither\n'
   elif [ "$req" = "1" ]; then
-    printf 'fail:OAM_SIGN_REQUIRED=1 but OAM_WIN_SIGN_METADATA is not set -- configure Windows Authenticode signing (release-keys/README.md), or set OAM_SKIP_WIN_SIGN=1 to ship unsigned Windows assets deliberately\n'
+    printf 'fail:signing is required (OAM_SIGN_REQUIRED, default 1 under release-local.sh) but OAM_WIN_SIGN_METADATA is not set -- configure it (release-keys/README.md), set OAM_SKIP_WIN_SIGN=1, or OAM_SIGN_REQUIRED=0 to ship unsigned .exe assets deliberately\n'
   else
     printf 'skip:OAM_WIN_SIGN_METADATA is not set, so the Windows assets ship WITHOUT Authenticode signatures (bootstrap; see release-keys/README.md). OAM_SIGN_REQUIRED=1 makes this fatal\n'
   fi

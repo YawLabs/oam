@@ -214,6 +214,252 @@ async fn a_hooked_route_asks_the_hook_again_for_the_same_host_on_another_port() 
     .await;
 }
 
+/// Send `request` on the hooked `route`, which must first ask for a hook
+/// answer for `host` (`key` its authority): the send hands the request back
+/// unsent, and goes out once the route has `127.0.0.1` for it.
+async fn send_after_lookup(
+    transport: &HttpTransport,
+    route: &Route,
+    request: http::Request<ReqBody>,
+    key: &str,
+    host: &str,
+) -> http::Response<hyper::body::Incoming> {
+    let mut err = send(transport, route, request).await.unwrap_err();
+    assert_eq!(
+        err.lookup_needed(),
+        Some((key.to_string(), host.to_string())),
+        "{err}"
+    );
+    let returned = err.take_request().expect("the request comes back unsent");
+    route.set_addrs(key, vec!["127.0.0.1".parse::<PinAddr>().unwrap()]);
+    send(transport, route, returned).await.unwrap()
+}
+
+/// #179: a lookup-hooked dispatcher's connections are pooled across its
+/// fetches, as undici's Agent pools its sockets, and the hook is asked once
+/// per connection the pool opens -- not once per fetch, which opened (and
+/// closed) a connection for every request.
+///
+/// The security half: a pooled connection is only ever reused for the
+/// authority whose hook answer opened it (another name on the same address
+/// and port asks the hook again and opens its own), and never by another
+/// dispatcher. Dropping the dispatcher's pool (its `close()`, `destroy()`
+/// or collection) closes the idle connection and forgets the pool.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dispatcher_pool_reuses_connections_and_asks_the_hook_once_per_connection() {
+    within(async {
+        let closes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let closes_seen = closes.clone();
+        let server = serve(move |mut conn, _, seen| {
+            let closes = closes_seen.clone();
+            async move {
+                while let Some(request) = conn.request().await {
+                    seen.lock().unwrap().push(request);
+                    if !conn.send(&response("200 OK", &[], b"ok")).await {
+                        break;
+                    }
+                }
+                closes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        })
+        .await;
+        let transport = transport(ProxySource::None);
+        let a = format!("http://a.test:{}/", server.port);
+        let a_key = format!("a.test:{}", server.port);
+
+        // The first fetch through dispatcher 7 asks for an answer, and its
+        // connection goes back to 7's pool.
+        let route = transport.agent_route(7, ATTEMPT, TlsRange::Both);
+        assert_eq!(
+            route.lookup_needed(&a.parse().unwrap()),
+            Some((a_key.clone(), "a.test".to_string()))
+        );
+        let response = send_after_lookup(&transport, &route, get(&a), &a_key, "a.test").await;
+        assert_eq!(body_text(response).await, "ok");
+        let_the_pool_settle().await;
+        // Every later fetch through 7 takes it: no answer asked, no connect.
+        for _ in 0..3 {
+            let route = transport.agent_route(7, ATTEMPT, TlsRange::Both);
+            assert_eq!(route.lookup_needed(&a.parse().unwrap()), None);
+            let response = send(&transport, &route, get(&a)).await.unwrap();
+            assert_eq!(body_text(response).await, "ok");
+            let_the_pool_settle().await;
+        }
+        assert_eq!(server.accepts(), 1);
+
+        // Another name on the same address and port is another authority:
+        // the hook is asked, and the answer opens a connection of its own.
+        let b = format!("http://b.test:{}/", server.port);
+        let route = transport.agent_route(7, ATTEMPT, TlsRange::Both);
+        let b_key = format!("b.test:{}", server.port);
+        let response = send_after_lookup(&transport, &route, get(&b), &b_key, "b.test").await;
+        assert_eq!(body_text(response).await, "ok");
+        assert_eq!(server.accepts(), 2);
+
+        // Another dispatcher never takes 7's connections.
+        let other = transport.agent_route(8, ATTEMPT, TlsRange::Both);
+        let response = send_after_lookup(&transport, &other, get(&a), &a_key, "a.test").await;
+        assert_eq!(body_text(response).await, "ok");
+        assert_eq!(server.accepts(), 3);
+        let_the_pool_settle().await;
+
+        // Dropping 7's pool closes its two idle connections; 8's stays.
+        assert!(transport.drop_agent(7));
+        assert!(!transport.drop_agent(7), "dropped once");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while closes.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dropped pool's connections close");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(closes.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // A fetch through 7 afterwards starts a pool of its own again.
+        let route = transport.agent_route(7, ATTEMPT, TlsRange::Both);
+        let response = send_after_lookup(&transport, &route, get(&a), &a_key, "a.test").await;
+        assert_eq!(body_text(response).await, "ok");
+        assert_eq!(server.accepts(), 4);
+        let hosts: Vec<_> = server
+            .seen()
+            .iter()
+            .map(|r| r.head.get("host").unwrap_or_default().to_string())
+            .collect();
+        let (a_host, b_host) = (
+            format!("a.test:{}", server.port),
+            format!("b.test:{}", server.port),
+        );
+        assert_eq!(
+            hosts,
+            [
+                &a_host, &a_host, &a_host, &a_host, &b_host, &a_host, &a_host
+            ]
+            .map(String::clone)
+        );
+    })
+    .await;
+}
+
+/// #179: the fetch op claims its dispatcher's pool while JS waits on it, so
+/// a `close()` in the same tick as the `fetch()` finds the pool and drops
+/// it. When the fetch's future created the pool, a close() that ran first
+/// found none, and the pool the future then created stayed open, with its
+/// connection, for the rest of the run. Only a hooked fetch that names a
+/// dispatcher claims one: no hook, or a connect function, takes none.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fetch_op_claims_its_dispatchers_pool_before_close_can_run() {
+    let transport = transport(ProxySource::None);
+    let mut hooked = oam_core::ops::parse_fetch_request(
+        r#"{"url":"http://a.test/","lookup_hook":true,"lookup_pool":11}"#,
+    )
+    .unwrap();
+    hooked.claim_agent_pool(&transport);
+    assert!(hooked.agent_pool.is_some());
+    assert!(transport.drop_agent(11), "close() finds the claimed pool");
+    assert!(!transport.drop_agent(11), "dropped once");
+    for json in [
+        r#"{"url":"http://a.test/","lookup_pool":12}"#,
+        r#"{"url":"http://a.test/","lookup_hook":true,"connect_hook":true,"lookup_pool":12}"#,
+        r#"{"url":"http://a.test/","lookup_hook":true}"#,
+    ] {
+        let mut request = oam_core::ops::parse_fetch_request(json).unwrap();
+        request.claim_agent_pool(&transport);
+        assert!(request.agent_pool.is_none(), "{json}");
+        assert!(!transport.drop_agent(12), "{json}");
+    }
+}
+
+/// A hook answer opens the connection it was asked for and is spent there:
+/// the request that carries it never takes an idle connection instead, and
+/// the next connection to the same authority asks again -- the hook's call
+/// count is node's, one per connection. An answer for one authority is
+/// never spent on another.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_hook_answer_opens_one_connection_for_its_own_authority() {
+    within(async {
+        let server = serve_replies(ok_reply).await;
+        let transport = transport(ProxySource::None);
+        let a = format!("http://a.test:{}/", server.port);
+        let a_key = format!("a.test:{}", server.port);
+        let route = transport.agent_route(3, ATTEMPT, TlsRange::Both);
+        let response = send_after_lookup(&transport, &route, get(&a), &a_key, "a.test").await;
+        assert_eq!(body_text(response).await, "ok");
+        let_the_pool_settle().await;
+        // With an idle connection there, nothing needs the hook ...
+        assert_eq!(route.lookup_needed(&a.parse().unwrap()), None);
+        // ... but an answer in hand opens a connection of its own.
+        route.set_addrs(&a_key, vec!["127.0.0.1".parse::<PinAddr>().unwrap()]);
+        let response = send(&transport, &route, get(&a)).await.unwrap();
+        assert_eq!(body_text(response).await, "ok");
+        assert_eq!(server.accepts(), 2);
+        // ... and is spent on it: the next send takes an idle connection.
+        let_the_pool_settle().await;
+        let response = send(&transport, &route, get(&a)).await.unwrap();
+        assert_eq!(body_text(response).await, "ok");
+        assert_eq!(server.accepts(), 2);
+
+        // An answer for b.test is not spent on a.test, which takes an idle
+        // connection.
+        let b_key = format!("b.test:{}", server.port);
+        route.set_addrs(&b_key, vec!["127.0.0.1".parse::<PinAddr>().unwrap()]);
+        let_the_pool_settle().await;
+        let response = send(&transport, &route, get(&a)).await.unwrap();
+        assert_eq!(body_text(response).await, "ok");
+        assert_eq!(server.accepts(), 2);
+        assert_eq!(
+            route.lookup_needed(&format!("http://b.test:{}/", server.port).parse().unwrap()),
+            None,
+            "the b.test answer is still held"
+        );
+        assert!(transport.drop_agent(3));
+    })
+    .await;
+}
+
+/// A send that needs the hook hands its request back as it was built --
+/// its URI not rewritten, a streamed body unread -- and that request, sent
+/// again with the answer, delivers every byte: the fetch loop carries it
+/// across the park when a send's idle connection was taken from under it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_handed_back_for_a_lookup_goes_out_whole() {
+    within(async {
+        let server = serve_replies(ok_reply).await;
+        let transport = transport(ProxySource::None);
+        let route = transport.agent_route(5, ATTEMPT, TlsRange::Both);
+        let target = format!("http://streamed.test:{}/up?q=1", server.port);
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        tx.send(oam_core::outbound_data(b"ab".to_vec()))
+            .await
+            .unwrap();
+        tx.send(oam_core::outbound_data(b"cde".to_vec()))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut err = send(
+            &transport,
+            &route,
+            request("POST", &target, channel_body(rx)),
+        )
+        .await
+        .unwrap_err();
+        let (key, host) = err.lookup_needed().expect("needs the hook");
+        assert_eq!(host, "streamed.test");
+        assert_eq!(server.accepts(), 0);
+        let returned = err.take_request().unwrap();
+        assert!(err.take_request().is_none(), "handed back once");
+        assert_eq!(returned.uri().to_string(), target);
+        route.set_addrs(&key, vec!["127.0.0.1".parse::<PinAddr>().unwrap()]);
+        let response = send(&transport, &route, returned).await.unwrap();
+        assert_eq!(body_text(response).await, "ok");
+        let seen = server.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].head.target, "/up?q=1");
+        assert_eq!(seen[0].body, b"abcde");
+        transport.drop_agent(5);
+    })
+    .await;
+}
+
 /// An http destination goes to the proxy in absolute form; the credentials
 /// are the caller's to add, per hop.
 #[tokio::test(flavor = "multi_thread")]

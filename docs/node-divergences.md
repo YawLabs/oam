@@ -1439,16 +1439,12 @@ What still differs:
   for a leaf sent alone). The verifier is built on the first https request, so a machine
   without a usable certificate store still runs; its https requests then fail with `tls
   configuration error: ...`. _(source)_
-- **The happy-eyeballs attempt timeout is latched at the dial, not at the request.** Both
-  runtimes take it from one process-wide value
-  (`net.setDefaultAutoSelectFamilyAttemptTimeout`), and for the usual case -- every caller
-  reading the same default -- they agree. Node latches it per socket when `net.connect` is
-  called; on a POOLED `fetch` route oam stores it for the shared connector, which reads it
-  when and if hyper decides it needs a new connection. A request that changes the default
-  between another request's start and that request's dial therefore applies its stagger to
-  the other one. The consequence is a wrong 10-250 ms stagger on one multi-address connect,
-  never a wrong address or a wrong error, and a `connect.lookup`-hooked route is unaffected
-  (its connector carries its own value). _(source)_
+- **The happy-eyeballs attempt timeout** (`net.setDefaultAutoSelectFamilyAttemptTimeout`)
+  is read when the request starts and carried by that request to the dial it makes, so a
+  connection is dialled with the value its own request was sent with, as Node latches it per
+  socket. Up to 0.17.1 the pooled `fetch` route stored it in state its shared connector read
+  later, so a request that changed the default between another request's start and that
+  request's dial gave the other one its stagger (#179). _(source)_
 - **`req.socket` on this transport is a stand-in.** It is a real `net.Socket` (a
   `tls.TLSSocket` for https), `null` until `'socket'` as in Node, and by `'response'` it
   carries the connection the transport used: the dialled peer's address, port and family,
@@ -1569,9 +1565,12 @@ What still differs:
 
 **`connect.lookup` on an undici `Agent`**
 
-An `Agent({ connect: { lookup } })` hook is called for the first host and every redirect hop
-to another host name, never for an IP literal and never for
-a URL on a bad port, with `{ family: undefined, hints, all: true }`. All five ways undici
+An `Agent({ connect: { lookup } })` hook is called for every connection the `Agent` opens to
+a host name -- the first request's, and each redirect hop's that needs a new one -- never for
+an IP literal and never for a URL on a bad port, with `{ family: undefined, hints, all: true }`.
+The `Agent`'s connections are pooled across its fetches, as undici's are, so a request that
+finds an idle connection to its origin calls no hook (#179). A replaced `dns.lookup` is called
+the same way for global `fetch`'s connections (`conformance/cases/358-fetch-lookup-once-per-connection.mjs`). All five ways undici
 installs a dispatcher carry the hook, as they do in Node: `fetch`'s `dispatcher` option,
 `setGlobalDispatcher` + global `fetch`, `undici.fetch`, `agent.request()`, and
 `undici.request(url, { dispatcher })`. The connection dials only
@@ -1581,28 +1580,49 @@ that fails -- or throws -- fails the fetch closed with its error as the `cause`,
 kept. A hooked fetch never goes through the environment proxy (below): an undici `Agent`
 does not read it, and a proxy that resolved the name again would undo the pin. What differs:
 
-- **How often it is called.** Node calls the hook once per connection it opens, oam once per
-  AUTHORITY per `fetch`. Within one `fetch` that is usually the same number: the same host
-  on another port parks again in both (measured: a 302 from `localhost:P1` to
-  `localhost:P2` calls the hook twice in each runtime), so a guard whose policy turns on the
-  port is asked about every port the chain reaches. Where they part is reuse: a redirect
-  chain `a -> a -> b` made 3 calls in Node (its pool opened a second connection for the
-  same-host hop) and 2 in oam; a hop to the same authority spelled in another case makes 2
-  calls in Node and 1 in oam; and a second `fetch` on the same `Agent` made 0 calls in Node
-  (a pooled connection) and calls again in oam, whose hooked client is per-`fetch` and so
-  pools within one `fetch` but never across two. Every connection oam opens still dials only
-  addresses the hook returned for that authority.
-- **How many connections it opens.** Because the hooked client and its pool end with the
-  `fetch`, every hooked `fetch` opens a new connection and closes it from the client side,
-  which leaves the client's end in TIME_WAIT. Measured: 5,000 sequential `fetch`es through
-  one hooked `Agent` to a keep-alive server opened 5,000 connections in oam and 2 in Node.
-  Under sustained hooked load that can use up the ephemeral port range (16,384 ports on
-  Windows): back to back with other runs, a hooked loop failed with `fetch failed` <-
-  `EADDRINUSE` on nearly every request. The same loop without the hook opens one
-  connection.
-- **A hook that calls back twice.** One that answers and then calls back again with an
-  error fails the fetch in Node, with that second error as the `cause`; oam keeps the first
-  answer and connects.
+- **How many connections it opens, and so how often it is called.** Both runtimes call the
+  hook exactly once per connection (`fetch_connect_lookup_asks_once_per_connection_and_pools_per_agent`,
+  e2e), and both reuse an `Agent`'s connections: 50 sequential `fetch`es through one hooked
+  `Agent` opened 2 connections and called the hook twice in Node, 1 and once in oam. Up to
+  0.17.1 oam ran every hooked `fetch` on a client of its own, so each one called the hook,
+  opened a connection and closed it again -- 5,000 sequential fetches made 5,000 connections,
+  left that many client ends in TIME_WAIT, and under sustained load could use up the
+  ephemeral port range (`fetch failed` <- `EADDRINUSE`). The counts still differ where undici
+  has not let go of a socket yet: it releases a response's socket after the next request has
+  been dispatched, so sequential fetches alternate between two connections, a redirect chain
+  `a -> a -> b` opens 3 (the same-host hop gets a second connection) and a 5-hop chain on one
+  host 2, while oam hands the response's connection back to the pool first and reuses it (1
+  for the fetches, 2 and 1 for the chains: one call per connection either way). A connection
+  that answered a 302 whose next hop the hook then refused is torn down in Node and kept in
+  oam's pool. The same host on another port is another connection in both (a 302 from
+  `localhost:P1` to `localhost:P2` calls the hook twice in each), so a guard whose policy
+  turns on the port is asked about every port a chain reaches.
+- **Which connections a request may reuse.** A pooled connection carries requests for the
+  origin it was opened to and no other -- the same scheme, host (in any case) and port --
+  so a connection the hook's answer for one name opened is never lent to another name that
+  answers with the same address, which asks the hook and opens its own, as in Node. An IP
+  literal on the same `Agent` never asks the hook and gets its own connection. Each `Agent`
+  has its own pool: another `Agent`'s hook never sees its connections used. An answer opens
+  exactly the connection it was asked for. The pool closes an HTTP/1.1 connection 90 s after
+  its last response (the shared pool's idle timeout; undici's keep-alive default is 4 s,
+  measured: node closed each at 4.0 s); an `allowH2` session stays open while it is idle, in
+  Node too (neither closed one in 200 s). It closes all of them when the `Agent` is
+  `close()`d or `destroy()`ed, or garbage-collected without either.
+- **A hook that calls back twice** counts, as in Node, while the connection its answer opens
+  is still being made (#169): after an answer, a second callback with an error, a second
+  answer Node's address rules refuse, or a throw from the hook fails the fetch with that
+  error as the `cause`, and nothing is dialled when it comes in the same call; with the
+  error first, the first error is the cause; once the connection is made, later callbacks
+  are ignored (`conformance/cases/359-fetch-lookup-second-callback.mjs`, e2e
+  `fetch_connect_lookup_second_callback_fails_a_connection_still_being_made`). Up to 0.17.1
+  oam kept the first callback and connected. Two things differ. A second answer that passes
+  the rules is ignored, where Node starts a second connect on the same socket and fails it
+  with a platform-specific code (`connect EISCONN` on Windows). And "still being made" is
+  each runtime's own connect: oam's runs on a thread of its own and, in a debug build at
+  least, has not connected to a local server by the next `setImmediate` after the answer,
+  so an error the hook reports there fails the fetch in oam and is ignored in Node, which
+  has connected by then. An error in the same call, a microtask or a `process.nextTick`
+  later fails it in both.
 - **A scoped IPv6 address** (`fe80::1%lo0`) is dialled, as in Node, since 0.17.2: the zone
   becomes the scope id libuv's `uv_ip6_addr` gives it (Windows reads it with `atoi`, so a
   name is 0; Linux looks the interface up by name, and a name that is no interface is 0),
@@ -1613,11 +1633,16 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
   its errors dropped the zone. What is left: on macOS and the BSDs oam has the system
   resolver read the zone, which also takes a number (`%1`) as the interface index, where
   libuv looks a number up as an interface NAME and finds none (scope id 0); and under
-  `--permission` a zoned answer is checked as written and unbracketed, since no URL can
-  name it, so a grant spells it as the hook does (`--allow-net` with no list admits
-  any). For a fetch, `fe80::1%1` admits that answer on every port and `fe80::1%1:8080`
-  on port 8080 alone; for `net.connect`, which asks about the joined `fe80::1%1:8080`
-  (the raw-socket IPv6 spelling, entry 4), only that port-scoped entry does.
+  `--permission` a zoned answer or host is checked unbracketed, since no URL can name
+  it, so a grant spells it as the hook does (`--allow-net` with no list admits any). It
+  is matched as an address (any spelling) and a zone (as written), by `fetch`,
+  `net.connect` and `tls.connect` alike, whether the host is named directly or answered
+  by a `lookup` hook: `fe80::1%1` admits that address and zone on every port and
+  `fe80::1%1:8080` on port 8080 alone. The zone is all of the text after `%`, as in Node,
+  whose zone grammar admits `:` (`net.isIP('fe80::1%1:8080')` is 6, and a connect dials
+  it with the zone `1:8080`). So an entry ending in `:` and digits is always
+  port-scoped: `fe80::1%1:8080` grants the zone `1` on port 8080 and never a host whose
+  zone is `1:8080`, which only `--allow-net` with no list admits.
 - **A refusing hook's error** rejects `undici.request` and `agent.request` as itself, as in
   Node, and `fetch` with it as the `cause` of `TypeError: fetch failed`, as in Node. Up to
   0.17.1 `undici.request`, which runs on `fetch` in oam, rejected with the `TypeError` too.
@@ -2091,12 +2116,20 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   `Agent` or a `Pool` fails each request with it (e2e
   `a_dispatcher_allowh2_that_is_not_a_boolean_is_refused_as_undicis_client_refuses_it`);
   `connect.allowH2` is tested for truthiness. Over HTTP/2 the client is hyper's rather
-  than undici's experimental one, and two things differ there: a `POST` (or `PUT`, `PATCH`,
+  than undici's experimental one, and three things differ there: a `POST` (or `PUT`, `PATCH`,
   ...) with no body carries the `content-length: 0` it carries over HTTP/1.1, where
-  undici's h2 client sends none; and the warning comes with the first response that arrived
+  undici's h2 client sends none; the warning comes with the first response that arrived
   over HTTP/2, where undici prints it when it connects -- so a redirect chain whose only h2
-  hop is not the last warns in Node alone. _(probed: Node v22.22.2 + undici 6.24.1 against
-  `http2.createSecureServer({ allowHTTP1: true })`)_
+  hop is not the last warns in Node alone; and a request the server turns away unprocessed
+  -- a GOAWAY (`NO_ERROR`) whose last stream id is below it, or `RST_STREAM`
+  (`REFUSED_STREAM`) -- is sent again, up to twice (hyper's and reqwest's allowance), where
+  undici fails it at once, `UND_ERR_SOCKET`
+  `HTTP/2: "GOAWAY" frame received with code 0` after one connection. A `connect.lookup`
+  dispatcher counts those resends across its waits for the hook: it asks the hook once per
+  connection and gives up where a plain fetch does (e2e
+  `a_hooked_h2_fetch_stops_resending_after_goaway_as_a_plain_one_does`). _(probed: Node
+  v22.22.2 + undici 6.24.1 against `http2.createSecureServer({ allowHTTP1: true })`, and
+  the GOAWAY case against a raw TLS h2 server; `REFUSED_STREAM` not measured on Node)_
 - **Decoding** keeps its own entry: 32.
 
 **What a `fetch` refuses before it dials** (all matching Node, listed because a caller sees
@@ -3389,6 +3422,36 @@ what is left:
   relative, on a machine with `LongPathsEnabled`). oam creates the directory: Rust's
   `create_dir` lengthens such paths itself. Refusing a path the file system accepts was not
   worth reproducing.
+
+### Windows `fs` paths reach the OS as given, not namespaced
+
+node's `fs` hands libuv every path through `path.toNamespacedPath`: resolved against the cwd
+(which normalises `.` / `..` and drops a trailing separator) and prefixed with `\\?\`. That
+prefix turns off Win32 path normalisation, so the OS does not strip trailing dots and spaces
+and does not treat DOS device names as devices. oam passes the path as given to std, which
+goes through that normalisation. Errors already NAME the path as node does (the resolved path,
+prefix removed); which file the OS opens differs. Measured against node v22.22.2 on Windows,
+for `fs.readFileSync`, and so for `process.loadEnvFile`, which reads through it:
+
+| path | node | oam |
+|---|---|---|
+| a directory with a trailing separator, `sub/` or `sub\` | opens `sub`, fails `EISDIR` `read` (`loadEnvFile`: `Contents of '\\?\<cwd>\sub' should be a valid string.`) | the open fails, `ENOENT` `open '<cwd>\sub'` |
+| `NUL` / `nul` | `ENOENT` `open '<cwd>\NUL'` | reads the NUL device: `""` (`loadEnvFile` loads nothing and succeeds) |
+| a trailing dot or space, `.env.`, `.env `, `f.txt...` | `ENOENT` | opens `.env` / `f.txt` |
+
+The same holds beyond reads: `statSync(".env.")` and `existsSync(".env.")` find `.env`
+(node: `ENOENT`, `false`), `openSync("NUL")` opens the device and `statSync("NUL")` fails
+`EISDIR` (node: `ENOENT` for both), and `writeFileSync("g.txt.", ...)` creates `g.txt` where
+node creates a file literally named `g.txt.`. `COM1` agrees (`ENOENT` in both) on a machine
+without that port.
+
+Not fixed yet because there is no single place to change: paths reach the OS through some 66
+`toPath` call sites in `js/node_compat.js` and over 100 path-taking ops in Rust (sync ops in
+`oam_engine`, async ones in `oam_core`), the `--permission` checks resolve the path against
+the cwd themselves and would have to agree with what the OS is handed, and several results
+echo the path back (`mkdtemp`, recursive `mkdir`, `readdir` with `recursive`,
+`Dirent.parentPath`, symlink targets), where a namespaced path must not leak out. It wants
+its own design and a full `fs` conformance pass.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 

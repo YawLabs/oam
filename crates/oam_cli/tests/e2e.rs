@@ -7127,11 +7127,11 @@ fn oam_run_with_proxy_env(script: &std::path::Path, vars: &[(&str, &str)]) -> Ou
 ///
 /// Measured on node v22.22.2 + undici 6.24.1 (Windows, macOS 26 arm64, Debian
 /// 12 x64), same script: the same response, hosts, options and wire hits on
-/// each. The one difference is the call
-/// COUNT: node calls the hook once per connection it opens (3 here: its pool
-/// opens a second connection for the same-host hop), oam once per host per
-/// fetch (2) -- every connection oam opens still dials addresses the hook
-/// returned for that host.
+/// each. The one difference is the call COUNT, which in both runtimes is
+/// one per connection opened (#179): node opens 3 here (undici has not
+/// released the first 302's socket when the same-host hop dispatches, so it
+/// opens a second), oam 2 -- the same-host hop waits for the pool to have
+/// the 302's connection back and reuses it, every time.
 #[test]
 fn fetch_connect_lookup_runs_for_every_host_a_redirect_reaches() {
     let script = write_temp(
@@ -7190,12 +7190,210 @@ await agent.close();
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// #179: a `connect.lookup` Agent pools its connections across fetches, as
+/// undici's does, and the hook is asked once per connection it opens. oam ran
+/// every hooked fetch on a client of its own, so each one asked the hook,
+/// opened a connection and closed it again (leaving the client's end in
+/// TIME_WAIT): 50 sequential fetches made 50 of each, and a sustained hooked
+/// loop could use up the ephemeral port range.
+///
+/// Measured on node v22.22.2 + undici 6.24.1, same script: 50 sequential
+/// fetches 2 connections / 2 calls; a second Agent 1 / 1 of its own; another
+/// name on the same address asked and given its own connection; an IP literal
+/// never asked; `close()` and `destroy()` close every connection the Agent
+/// holds.
+/// node opens 2 where oam opens 1 because undici has not released a response's
+/// socket when the next request dispatches; what both define -- and what the
+/// assertion pins -- is one call per connection. node's Agent is not
+/// collected while its sockets are open; oam's pool closes once the Agent is
+/// collected without a `close()`.
+#[test]
+fn fetch_connect_lookup_asks_once_per_connection_and_pools_per_agent() {
+    let script = write_temp(
+        "fetch_lookup_pools/main.mjs",
+        r#"import http from 'node:http';
+import { Agent } from 'undici';
+let accepts = 0, closes = 0;
+const server = http.createServer((req, res) => res.end('ok'));
+server.on('connection', (socket) => { accepts++; socket.on('close', () => closes++); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const hooked = (calls) => new Agent({ connect: { lookup: (host, opts, cb) => {
+  calls.push(host);
+  cb(null, [{ address: '127.0.0.1', family: 4 }]);
+} } });
+const get = async (url, dispatcher) => (await fetch(url, { dispatcher })).text();
+const until = async (done) => {
+  for (let i = 0; i < 200 && !done(); i++) {
+    globalThis.gc?.();
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  return done();
+};
+
+const calls = [];
+const agent = hooked(calls);
+for (let i = 0; i < 50; i++) await get(`http://pooled.test:${port}/`, agent);
+console.log('sequential', accepts, calls.length);
+
+const otherCalls = [];
+const other = hooked(otherCalls);
+await get(`http://pooled.test:${port}/`, other);
+console.log('second agent', accepts, otherCalls.length);
+
+await get(`http://alias.test:${port}/`, agent);
+await get(`http://POOLED.test:${port}/`, agent);
+await get(`http://127.0.0.1:${port}/`, agent);
+console.log('names', accepts, JSON.stringify(calls.slice(1)));
+
+const open = accepts - closes;
+await agent.close();
+console.log('close', await until(() => accepts - closes === open - 3));
+await other.destroy();
+console.log('destroy', await until(() => accepts - closes === open - 4));
+
+// An Agent dropped without close(): its pool closes once it is collected.
+await (async () => { await get(`http://pooled.test:${port}/`, hooked([])); })();
+console.log('collected', accepts, await until(() => accepts === closes));
+server.close();
+"#,
+    );
+    let out = oam(&["--expose-gc", "run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "sequential 1 1\n\
+         second agent 2 1\n\
+         names 4 [\"alias.test\"]\n\
+         close true\n\
+         destroy true\n\
+         collected 5 true"
+    );
+}
+
+/// #179: `agent.close()` in the same tick as a `fetch()` through it closes
+/// the connection that fetch opens, once its response is read, as node's
+/// does. The fetch's future created the dispatcher's pool when it first ran
+/// -- after that close(), which then found no pool to drop -- and the pool
+/// it made kept the connection open until the 90 s idle reaper (20 of 20
+/// rounds left open on a debug build). The engine's fetch op now claims the
+/// pool before JS runs on. Measured on node v22.22.2 + undici 6.24.1, same
+/// script: every round's connection closes, and every fetch answers 200.
+#[test]
+fn a_dispatcher_closed_in_the_tick_of_its_fetch_closes_that_fetchs_connection() {
+    let script = write_temp(
+        "fetch_lookup_close_race/main.mjs",
+        r#"import http from 'node:http';
+import { Agent } from 'undici';
+let closed = 0;
+const server = http.createServer((req, res) => res.end('ok'));
+// The server never closes a connection: what closes one is the client.
+server.keepAliveTimeout = 0;
+server.on('connection', (s) => s.on('close', () => closed++));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const lookup = (h, o, cb) => cb(null, [{ address: '127.0.0.1', family: 4 }]);
+const rounds = 8;
+let left = 0;
+const statuses = new Set();
+for (let i = 0; i < rounds; i++) {
+  const agent = new Agent({ connect: { lookup } });
+  const before = closed;
+  const pending = fetch(`http://pinned.test:${server.address().port}/`, { dispatcher: agent });
+  agent.close();
+  const res = await pending;
+  statuses.add(res.status + ' ' + await res.text());
+  const deadline = Date.now() + 5000;
+  while (closed === before && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+  if (closed === before) left++;
+}
+console.log([...statuses].join(','), 'left open', left, 'of', rounds);
+server.closeAllConnections();
+server.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(stdout.trim(), "200 ok left open 0 of 8", "stderr: {stderr}");
+}
+
+/// A hooked fetch's h2 resends are counted across the park for the hook: a
+/// resend that needs a new connection parks for the hook's answer, and the
+/// resumed hop used to start counting from zero again, so an origin that
+/// answers every request with GOAWAY(NO_ERROR) had a hooked fetch ask the
+/// hook and open connections without end (the review of #179 counted 40
+/// before its guard stopped it). The hooked fetch now gives up where a plain
+/// one does: after the same connections, with one hook call for each.
+///
+/// node v22.22.2 + undici 6.24.1 sends such a request once (1 connection, 1
+/// hook call) and fails with UND_ERR_SOCKET; oam resends twice, hooked or not
+/// (docs/node-divergences.md). What the assertion pins is that the hook
+/// changes nothing: the counts are a plain fetch's, and they are bounded.
+#[test]
+fn a_hooked_h2_fetch_stops_resending_after_goaway_as_a_plain_one_does() {
+    let bundle = write_temp("fetch-lookup-goaway/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import tls from 'node:tls';
+import { Agent } from 'undici';
+let connections = 0;
+// A raw h2 origin: SETTINGS, then GOAWAY(last stream 0, NO_ERROR) and FIN in
+// answer to the first HEADERS -- the request was never processed.
+const server = tls.createServer({ cert: `__CERT__`, key: `__KEY__`, ALPNProtocols: ['h2'] }, (s) => {
+  connections++;
+  s.on('error', () => {});
+  s.write(Buffer.from([0, 0, 0, 4, 0, 0, 0, 0, 0]));
+  let buf = Buffer.alloc(0), preface = false;
+  s.on('data', (d) => {
+    buf = Buffer.concat([buf, d]);
+    if (!preface) { if (buf.length < 24) return; buf = buf.subarray(24); preface = true; }
+    while (buf.length >= 9) {
+      const len = buf.readUIntBE(0, 3), type = buf[3], flags = buf[4];
+      if (buf.length < 9 + len) break;
+      buf = buf.subarray(9 + len);
+      if (type === 4 && !(flags & 1)) s.write(Buffer.from([0, 0, 0, 4, 1, 0, 0, 0, 0]));
+      if (type === 1) { s.end(Buffer.from([0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])); return; }
+    }
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+let calls = 0;
+const lookup = (host, opts, cb) => {
+  if (++calls > 20) { console.log('runaway: hook calls', calls, 'connections', connections); process.exit(3); }
+  cb(null, [{ address: '127.0.0.1', family: 4 }]);
+};
+for (const label of ['plain', 'hooked']) {
+  connections = 0; calls = 0;
+  const agent = new Agent({ allowH2: true, connect: label === 'hooked' ? { lookup } : {} });
+  try { await fetch(`https://localhost:${server.address().port}/`, { dispatcher: agent }); console.log(label, 'resolved?!'); }
+  catch (e) { console.log(label, e.message, 'connections', connections, 'hook calls', calls); }
+  await agent.close();
+}
+server.close();
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("fetch_lookup_goaway/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "plain fetch failed connections 3 hook calls 0\n\
+         hooked fetch failed connections 3 hook calls 3",
+        "stderr: {stderr}"
+    );
+}
+
 /// The SSRF guard: a hook that refuses a host fails the fetch CLOSED -- a
 /// TypeError "fetch failed" whose `cause` is the hook's error object itself --
 /// and nothing is dialled, neither for the first host nor for a redirect's
 /// target (which oam used to dial through system DNS). A hook that throws
 /// synchronously is the same. All measured identical on node v22.22.2 +
-/// undici 6.24.1.
+/// undici 6.24.1 but one count: the `allowed` fetch after the refused
+/// redirect asks the hook about `public.test` again in node and not in oam.
+/// Both ask once per connection (#179); node tore down the connection the
+/// refused 302 came on when the fetch failed, oam had it back in the
+/// Agent's pool before the hop asked the hook, and reuses it.
 #[test]
 fn fetch_connect_lookup_error_fails_closed_and_never_dials() {
     let script = write_temp(
@@ -7246,9 +7444,63 @@ a.close(); b.close();
     let (stdout, _) = run_script_ok(&script, out);
     let expected = "first true fetch failed true blocked by ssrf guard [\"code\"] [\"guarded.test\"] {\"a\":[],\"b\":[]}\n\
          redirect true fetch failed true blocked by ssrf guard [\"code\"] [\"public.test\",\"internal.test\"] {\"a\":[\"/start\"],\"b\":[]}\n\
-         allowed 200 reached [\"public.test\",\"other.test\"] [[\"/public\",\"other.test:PB\"]]\n\
+         allowed 200 reached [\"other.test\"] [[\"/public\",\"other.test:PB\"]]\n\
          throw true fetch failed true";
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// #169: a `connect.lookup` hook's later callbacks count while the connection
+/// its answer opens is still being made, as node's lookupAndConnectMultiple
+/// acts on them. After an answer, an error -- in the same call or a
+/// microtask later -- or a throw fails the fetch with that error as the
+/// cause; with the error first, the first error is the cause. One once the
+/// connection is made (here, while the server holds the response) is
+/// ignored. oam kept the first callback and dropped the rest, so all but
+/// the error-first case resolved. Measured identical on node v22.22.2 +
+/// undici 6.24.1; conformance case 359 covers the same rules through a
+/// replaced dns.lookup.
+#[test]
+fn fetch_connect_lookup_second_callback_fails_a_connection_still_being_made() {
+    let script = write_temp(
+        "fetch_lookup_second_callback/main.mjs",
+        r#"import http from 'node:http';
+import { Agent } from 'undici';
+let late = null;
+const server = http.createServer((req, res) => {
+  if (req.url === '/late') { late(); setTimeout(() => res.end('ok'), 50); return; }
+  res.end('ok');
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const ADDR = [{ address: '127.0.0.1', family: 4 }];
+async function run(label, lookup, path = '/') {
+  const agent = new Agent({ connect: { lookup } });
+  try {
+    const r = await fetch(`http://${label}.test:${port}${path}`, { dispatcher: agent });
+    console.log(label, 'resolved', r.status, await r.text());
+  } catch (e) {
+    console.log(label, 'rejected', e.message, '|', e.cause?.message);
+  }
+  await agent.close();
+}
+await run('answer-then-error', (h, o, cb) => { cb(null, ADDR); cb(new Error('second')); });
+await run('error-then-answer', (h, o, cb) => { cb(new Error('first')); cb(null, ADDR); });
+await run('answer-then-throw', (h, o, cb) => { cb(null, ADDR); throw new Error('thrown'); });
+await run('error-in-a-microtask', (h, o, cb) => { cb(null, ADDR); queueMicrotask(() => cb(new Error('second'))); });
+await run('error-once-connected', (h, o, cb) => { late = () => cb(new Error('too late')); cb(null, ADDR); }, '/late');
+server.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "answer-then-error rejected fetch failed | second\n\
+         error-then-answer rejected fetch failed | first\n\
+         answer-then-throw rejected fetch failed | thrown\n\
+         error-in-a-microtask rejected fetch failed | second\n\
+         error-once-connected resolved 200 ok"
+    );
 }
 
 /// The guard applies however the dispatcher is installed. undici offers five
@@ -8482,6 +8734,131 @@ try {
     server.join().unwrap();
 }
 
+/// #179's security review, pinned: with a hooked Agent's connections pooled
+/// across fetches, a pooled connection is only ever reused for the authority
+/// whose hook answer opened it, and every hook answer is still checked
+/// against `--allow-net`. Under `--allow-net=a.invalid,c.invalid,127.0.0.1`,
+/// with a connection to the server pooled from `a.invalid`'s answer:
+///
+/// - `d.invalid` (not granted) is refused before its hook is asked, and the
+///   pooled connection to the same server never carries it;
+/// - `c.invalid` (granted) whose hook answers `10.9.9.9` (not granted) is
+///   refused at the answer -- the pooled connection to the server, opened
+///   under another name's answer, is not lent to it;
+/// - `a.invalid`, however it is spelled, reuses its connection without
+///   asking again.
+///
+/// The server sees one connection and only `a.invalid`'s requests.
+#[test]
+fn a_pooled_lookup_connection_serves_only_its_authority_and_every_answer_is_checked() {
+    let script = write_temp(
+        "lookup_permission_pooled/main.mjs",
+        r#"import { Agent } from 'undici';
+const port = Number(process.argv[2]);
+const calls = [];
+const agent = new Agent({ connect: { lookup: (host, opts, cb) => {
+  calls.push(host);
+  cb(null, [{ address: host === 'c.invalid' ? '10.9.9.9' : '127.0.0.1', family: 4 }]);
+} } });
+const go = async (label, host) => {
+  try {
+    const r = await fetch(`http://${host}:${port}/${label}`, { dispatcher: agent });
+    console.log(label, r.status, await r.text());
+  } catch (e) {
+    console.log(label, e.code ?? e.constructor.name, JSON.stringify(e.resource ?? null));
+  }
+};
+await go('first', 'a.invalid');
+await go('ungranted-name', 'd.invalid');
+await go('ungranted-answer', 'c.invalid');
+await go('again', 'a.invalid');
+await go('spelled', 'A.Invalid');
+console.log('calls', JSON.stringify(calls));
+await agent.close();
+"#,
+    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    {
+        let accepts = accepts.clone();
+        let requests = requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                accepts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let requests = requests.clone();
+                // A keep-alive server: every request on the connection gets
+                // a 200, until the client closes it.
+                std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    let mut pending = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        let Ok(n) = stream.read(&mut buf) else { return };
+                        if n == 0 {
+                            return;
+                        }
+                        pending.extend_from_slice(&buf[..n]);
+                        while let Some(end) = pending.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&pending[..end]).into_owned();
+                            pending.drain(..end + 4);
+                            let line = head.lines().next().unwrap_or_default().to_string();
+                            let host = head
+                                .lines()
+                                .find_map(|l| l.strip_prefix("host: "))
+                                .unwrap_or_default()
+                                .replace(&port.to_string(), "P");
+                            requests.lock().unwrap().push(format!("{line} {host}"));
+                            if stream
+                                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+    let path = script.to_str().unwrap().to_string();
+    let out = oam(&[
+        "--permission",
+        "--allow-net=a.invalid,c.invalid,127.0.0.1",
+        "--",
+        &path,
+        &port.to_string(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // A refusal names `host:port`, the resource net.connect's names (#188):
+    // the URL's host for the refused name, the hook's answer for the
+    // refused answer, each on the port the hop dials.
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        format!(
+            "first 200 ok\n\
+         ungranted-name ERR_ACCESS_DENIED \"d.invalid:{port}\"\n\
+         ungranted-answer ERR_ACCESS_DENIED \"10.9.9.9:{port}\"\n\
+         again 200 ok\n\
+         spelled 200 ok\n\
+         calls [\"a.invalid\",\"c.invalid\"]"
+        ),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        *requests.lock().unwrap(),
+        [
+            "GET /first HTTP/1.1 a.invalid:P",
+            "GET /again HTTP/1.1 a.invalid:P",
+            "GET /spelled HTTP/1.1 a.invalid:P",
+        ]
+    );
+}
+
 /// Two properties of the hook-answer gate above.
 ///
 /// An IPv6 answer is checked as a URL naming that address is -- bracketed,
@@ -8578,6 +8955,162 @@ console.log('continued', tokens.length, 'still parked', tokens.some((t) => inter
         );
     }
     server.join().unwrap();
+}
+
+/// A zone-id `connect.lookup` answer is matched against `--allow-net` as an
+/// address and a zone, never as text. node's zone grammar admits `:`
+/// (`net.isIP('::1%1:8080')` is 6, and a connect dials that answer with the
+/// zone `1:8080` on its own port), so the answer `::1%1:<P>` is the address
+/// `::1` with the zone `1:<P>`, and the entry `::1%1:<P>` is the address `::1`,
+/// the zone `1` and the port P: they never match, on P or any other port. The
+/// entry still admits the answer `::1%1` (in any spelling of the address) on
+/// P, and a host-only `::1%1` admits it on any port.
+///
+/// Every client reads the grant the same way: `fetch` through an undici
+/// Agent's `connect.lookup`, `net.connect` to the address named directly,
+/// and `net.connect` and `tls.connect` through a `lookup` hook. Admitted runs
+/// only have to get past the check (the dial's outcome with a scope id
+/// differs by platform); refused ones never arrive.
+#[test]
+fn a_connect_lookup_zone_id_answer_is_matched_as_an_address_and_a_zone() {
+    let script = write_temp(
+        "lookup_permission_zone/main.mjs",
+        r#"import { Agent } from 'undici';
+import net from 'node:net';
+import tls from 'node:tls';
+const port = Number(process.argv[2]);
+const answer = process.argv[3];
+const verdict = (e) =>
+  e && e.code === 'ERR_ACCESS_DENIED' ? `DENIED ${JSON.stringify(e.resource)}` : 'PASSED THE CHECK';
+const lookup = (h, o, cb) =>
+  o && o.all ? cb(null, [{ address: answer, family: 6 }]) : cb(null, answer, 6);
+const socketVerdict = (open) =>
+  new Promise((resolve) => {
+    let socket;
+    try {
+      socket = open();
+    } catch (e) {
+      resolve(verdict(e));
+      return;
+    }
+    const done = (v) => {
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(v);
+    };
+    const timer = setTimeout(() => done('PASSED THE CHECK'), 5000);
+    socket.on('connect', () => done('PASSED THE CHECK'));
+    socket.on('secureConnect', () => done('PASSED THE CHECK'));
+    socket.on('error', (e) => done(verdict(e)));
+  });
+const agent = new Agent({ connect: { lookup } });
+let viaFetch;
+try {
+  const r = await fetch(`http://granted.invalid:${port}/`, { dispatcher: agent, signal: AbortSignal.timeout(5000) });
+  viaFetch = `ALLOWED ${r.status}`;
+} catch (e) {
+  viaFetch = verdict(e.code === 'ERR_ACCESS_DENIED' ? e : e.cause);
+}
+console.log('fetch', viaFetch);
+console.log('net', await socketVerdict(() => net.connect({ host: answer, port })));
+console.log('net-lookup', await socketVerdict(() => net.connect({ host: 'granted.invalid', port, lookup })));
+console.log(
+  'tls-lookup',
+  await socketVerdict(() =>
+    tls.connect({ host: 'granted.invalid', port, lookup, servername: 'granted.invalid', rejectUnauthorized: false }),
+  ),
+);
+"#,
+    );
+    let path = script.to_str().unwrap().to_string();
+    // A [::1] listener the admitted runs may reach; without IPv6 loopback any
+    // port serves, since the refusals happen before a dial.
+    let listener = std::net::TcpListener::bind("[::1]:0").ok();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let port = match listener {
+        Some(listener) => {
+            let port = listener.local_addr().unwrap().port();
+            let counted = hits.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { continue };
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    drop(stream);
+                }
+            });
+            port
+        }
+        None => 18080,
+    };
+    let other = if port == u16::MAX { port - 1 } else { port + 1 };
+    let clients = ["fetch", "net", "net-lookup", "tls-lookup"];
+    let run = |grant: String, answer: String| {
+        let out = oam(&[
+            "--permission",
+            &format!("--allow-net=granted.invalid,{grant}"),
+            "--",
+            &path,
+            &port.to_string(),
+            &answer,
+        ]);
+        let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let lines: Vec<String> = stdout.lines().map(str::to_string).collect();
+        assert_eq!(
+            lines.len(),
+            clients.len(),
+            "{grant} / {answer}: {stdout}; stderr: {stderr}"
+        );
+        for (line, client) in lines.iter().zip(clients) {
+            assert!(
+                line.starts_with(&format!("{client} ")),
+                "{grant} / {answer}: {stdout}; stderr: {stderr}"
+            );
+        }
+        (lines, stderr)
+    };
+    let denied_everywhere = |grant: String, answer: String| {
+        let (lines, stderr) = run(grant.clone(), answer.clone());
+        for (line, client) in lines.iter().zip(clients) {
+            assert_eq!(
+                *line,
+                format!("{client} DENIED \"{answer}:{port}\""),
+                "{grant} / {answer}; stderr: {stderr}"
+            );
+        }
+    };
+
+    // Port-scoped entry (`::1`, zone `1`, port `other`); the answer's zone is
+    // `1:<other>` and the connect's port is `port`.
+    denied_everywhere(format!("::1%1:{other}"), format!("::1%1:{other}"));
+    // The same zone text on the entry's own port is still another zone.
+    denied_everywhere(format!("::1%1:{port}"), format!("::1%1:{port}"));
+    // A host-only entry grants its zone alone.
+    denied_everywhere("::1%1".to_string(), format!("::1%1:{port}"));
+    // A port-scoped entry grants its own port alone, in any spelling.
+    denied_everywhere(format!("::1%1:{other}"), "::1%1".to_string());
+    denied_everywhere(format!("::1%1:{other}"), "0::1%1".to_string());
+    // Another zone is another host.
+    denied_everywhere("::1%1".to_string(), "::1%2".to_string());
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a refused answer must never be dialled"
+    );
+
+    // Admitted by every client: the port-scoped entry on its port, the
+    // host-only one on any, each in any spelling of the address.
+    for grant in [format!("::1%1:{port}"), "::1%1".to_string()] {
+        for answer in ["::1%1", "0::1%1", "0:0:0:0:0:0:0:1%1"] {
+            let (lines, stderr) = run(grant.clone(), answer.to_string());
+            for line in &lines {
+                assert!(
+                    !line.contains("DENIED"),
+                    "{grant} / {answer}: {lines:?}; stderr: {stderr}"
+                );
+            }
+        }
+    }
 }
 
 /// A TCP listener that counts the connections it accepts, for the net / tls

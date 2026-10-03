@@ -2303,8 +2303,16 @@ pub struct FsError {
 /// generic table (src/win/fs.c, v1.51.0), for the operations that have them.
 /// `syscall` is what the site names when no rule applies.
 ///
-/// Every rule is Windows-only, and each is a place where the generic table
-/// alone gives node's code for the wrong operation:
+/// For a whole-file operation (`readFile`, `writeFile`, `appendFile`) this is
+/// the OPEN half only; `whole_file_error` reports the read or write half.
+/// `readFile` of a DIRECTORY fails on the read everywhere in node (`EISDIR:
+/// illegal operation on a directory, read`, no path): on Linux and macOS
+/// open(2) admits the directory and read(2) fails, which is the read half's
+/// own answer; on Windows std cannot open it at all, and the rule below
+/// reports the failed open as node's failed read.
+///
+/// Every rule here is Windows-only, and each is a place where the generic
+/// table alone gives node's code for the wrong operation:
 ///
 /// - libuv opens every path with FILE_FLAG_BACKUP_SEMANTICS, so a DIRECTORY
 ///   opens. `w` then fails with ERROR_FILE_EXISTS, which fs__open turns into
@@ -2384,6 +2392,141 @@ pub fn fs_error_message(failure: FsError, path: &str, error: &std::io::Error) ->
         node_error_message(failure.code, failure.syscall, path, error)
     } else {
         node_error_message_fd(failure.code, failure.syscall, error)
+    }
+}
+
+/// Which half of a whole-file operation failed.
+///
+/// node's `readFile`, `writeFile` and `appendFile` (sync, callback and
+/// promise) open the path and then read or write the descriptor, and report
+/// the two halves differently: a failed open names syscall `open` and the path
+/// (`ENOENT: no such file or directory, open 'p'`), a failed read or write names
+/// syscall `read` / `write` and no path at all (`EBUSY: resource busy or
+/// locked, read` for a region another process has locked, `EISDIR ..., read`
+/// for a directory opened on Linux and macOS, `ENOSPC ..., write`). std's
+/// `fs::read` / `fs::write` return one `io::Error` for both halves, so every
+/// failure got the open's label -- and `process.loadEnvFile`, which reports any
+/// failed open as ENOENT, turned a read failure on an existing file into a
+/// false ENOENT.
+#[derive(Debug)]
+pub enum WholeFileError {
+    /// Opening the path failed.
+    Open(std::io::Error),
+    /// The read or write on the opened file failed.
+    Transfer(std::io::Error),
+}
+
+impl WholeFileError {
+    pub fn io(&self) -> &std::io::Error {
+        match self {
+            WholeFileError::Open(e) | WholeFileError::Transfer(e) => e,
+        }
+    }
+}
+
+/// `fs.readFile` of a path: `std::fs::read`, with the open and the read kept
+/// apart. Same syscalls on success: open, one fstat for the size hint, one
+/// read of the whole file and one short read that finds EOF.
+pub fn read_whole_file(path: &str) -> Result<Vec<u8>, WholeFileError> {
+    let file = std::fs::File::open(path).map_err(WholeFileError::Open)?;
+    let size = file.metadata().ok().map(|m| m.len());
+    read_opened(&file, size)
+}
+
+/// Read everything from an already-open file, `size` being the caller's
+/// fstat answer. Every failure here is the read half's.
+///
+/// This is `std::fs::read`'s hinted read loop: reserve exactly `size`, read
+/// into all of that room in one call, and once it is full make one 32-byte
+/// probe read that finds EOF (or, when the file grew, more bytes, after which
+/// the buffer grows and the loop goes on). A regular file comes in with two
+/// read calls whatever its size. Neither of std's `read_to_end`s gives that
+/// here: the generic one has no size hint, so it caps its first read at 8 KiB
+/// and doubles from there (nine reads for 1 MiB), and `File`'s re-derives the
+/// hint with an fstat and a seek. The one difference from std: the room is
+/// zero-filled once before the read, because std reads into uninitialised
+/// memory with `unsafe` that oam_core does not use.
+fn read_opened(
+    mut reader: impl std::io::Read,
+    size: Option<u64>,
+) -> Result<Vec<u8>, WholeFileError> {
+    const PROBE: usize = 32;
+    const GROW: usize = 8 * 1024;
+    // std::fs::read's own answer when the buffer cannot be had.
+    let out_of_memory = |e: std::collections::TryReserveError| {
+        WholeFileError::Transfer(std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))
+    };
+    let mut bytes = Vec::new();
+    if let Some(size) = size.and_then(|n| usize::try_from(n).ok()) {
+        bytes.try_reserve_exact(size).map_err(out_of_memory)?;
+    }
+    // bytes[..filled] is the file so far; bytes[filled..] is zeroed room.
+    let mut filled = 0;
+    loop {
+        if filled == bytes.capacity() {
+            // Full: the size hint was right (or absent). Probe before growing.
+            let mut probe = [0u8; PROBE];
+            let n = match reader.read(&mut probe) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(WholeFileError::Transfer(e)),
+            };
+            bytes.truncate(filled);
+            bytes.try_reserve(GROW.max(n)).map_err(out_of_memory)?;
+            bytes.extend_from_slice(&probe[..n]);
+            filled += n;
+            continue;
+        }
+        // Zero only room no earlier pass zeroed, so a short read costs nothing.
+        bytes.resize(bytes.capacity(), 0);
+        match reader.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(WholeFileError::Transfer(e)),
+        }
+    }
+    bytes.truncate(filled);
+    Ok(bytes)
+}
+
+/// `fs.writeFile` (`append == false`: `std::fs::write`'s create + truncate)
+/// or `fs.appendFile` (create + append) of a path, with the open and the write
+/// kept apart.
+pub fn write_whole_file(path: &str, data: &[u8], append: bool) -> Result<(), WholeFileError> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(!append)
+        .truncate(!append)
+        .append(append)
+        .open(path)
+        .map_err(WholeFileError::Open)?;
+    write_opened(&file, data)
+}
+
+/// Write all of `data` to an already-open file: the write half.
+fn write_opened(mut writer: impl std::io::Write, data: &[u8]) -> Result<(), WholeFileError> {
+    writer.write_all(data).map_err(WholeFileError::Transfer)
+}
+
+/// What node reports for a failed whole-file operation at `site`
+/// (`FsSite::ReadFile`, `WriteFile` or `AppendFile`): an open failure goes
+/// through `fs_error_at` as syscall `open` with the path; a read or write
+/// failure is the descriptor's, as libuv's fs__read / fs__write report it --
+/// `fd_error_code`, syscall `read` (readFile) or `write`, no path.
+pub fn whole_file_error(site: FsSite<'_>, path: &str, error: &WholeFileError) -> FsError {
+    match error {
+        WholeFileError::Open(e) => fs_error_at(site, "open", path, e),
+        WholeFileError::Transfer(e) => FsError {
+            code: fd_error_code(e),
+            syscall: if site == FsSite::ReadFile {
+                "read"
+            } else {
+                "write"
+            },
+            has_path: false,
+        },
     }
 }
 
@@ -3706,6 +3849,24 @@ pub mod ops {
         )
     }
 
+    /// A failed whole-file operation (see `whole_file_error`): the open half
+    /// names the path, the read or write half does not.
+    fn node_fail_whole_file(
+        site: super::FsSite<'_>,
+        error: super::WholeFileError,
+        path: &str,
+    ) -> OpOutcome {
+        let failure = super::whole_file_error(site, path, &error);
+        let shown = super::fs_error_path(path);
+        OpOutcome::node_failed_at(
+            failure.code,
+            super::fs_error_message(failure, &shown, error.io()),
+            failure.syscall,
+            failure.has_path.then_some(&*shown),
+            super::node_errno(failure.code, error.io()),
+        )
+    }
+
     /// `node_fail` for an operation with call-site error rules (see
     /// `fs_error_at`).
     fn node_fail_at(
@@ -4211,9 +4372,15 @@ pub mod ops {
                 return OpOutcome::Bytes(bytes);
             }
         }
-        match tokio::fs::read(&path).await {
+        // One blocking-pool hop, as tokio::fs::read makes, but with the open
+        // and the read reported apart (super::whole_file_error).
+        let owned = path.clone();
+        let result = tokio::task::spawn_blocking(move || super::read_whole_file(&owned))
+            .await
+            .unwrap_or_else(|e| Err(super::WholeFileError::Open(std::io::Error::other(e))));
+        match result {
             Ok(bytes) => OpOutcome::Bytes(bytes),
-            Err(e) => node_fail_at(super::FsSite::ReadFile, e, "open", &path),
+            Err(e) => node_fail_whole_file(super::FsSite::ReadFile, e, &path),
         }
     }
 
@@ -4238,7 +4405,7 @@ pub mod ops {
                     // Genuine io error (empty buffer), or an unrecoverable
                     // channel failure where the data is gone: surface directly.
                     Err((e, _)) => {
-                        return node_fail_at(super::FsSite::WriteFile, e, "open", &path);
+                        return node_fail_whole_file(super::FsSite::WriteFile, e, &path);
                     }
                 }
             }
@@ -4246,27 +4413,16 @@ pub mod ops {
         fs_write_file_std(path, data, append).await
     }
 
-    /// std write path (blocking-pool append / `tokio::fs::write`). Factored out
-    /// so the io_uring fast path can fall through to it with a recovered buffer
-    /// on a worker-channel failure.
+    /// std write path: one blocking-pool hop, as `tokio::fs::write` makes,
+    /// with the open and the write reported apart (`super::whole_file_error`).
+    /// Factored out so the io_uring fast path can fall through to it with a
+    /// recovered buffer on a worker-channel failure.
     async fn fs_write_file_std(path: String, data: Vec<u8>, append: bool) -> OpOutcome {
-        let result = if append {
-            tokio::task::spawn_blocking({
-                let path = path.clone();
-                move || {
-                    use std::io::Write;
-                    std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&path)
-                        .and_then(|mut f| f.write_all(&data))
-                }
-            })
-            .await
-            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
-        } else {
-            tokio::fs::write(&path, data).await
-        };
+        let owned = path.clone();
+        let result =
+            tokio::task::spawn_blocking(move || super::write_whole_file(&owned, &data, append))
+                .await
+                .unwrap_or_else(|e| Err(super::WholeFileError::Open(std::io::Error::other(e))));
         let site = if append {
             super::FsSite::AppendFile
         } else {
@@ -4274,7 +4430,7 @@ pub mod ops {
         };
         match result {
             Ok(()) => OpOutcome::Done,
-            Err(e) => node_fail_at(site, e, "open", &path),
+            Err(e) => node_fail_whole_file(site, e, &path),
         }
     }
 
@@ -5753,6 +5909,303 @@ mod os_error_code_tests {
         );
         // libuv's fs__read / fs__write turn it into EBADF on a descriptor.
         assert_eq!(fd_error_code(&denied), "EBADF");
+    }
+
+    /// A scratch directory for the whole-file tests, unique per test.
+    fn whole_file_dir(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("oam-whole-file-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The error a locked region gives a read or write: ERROR_LOCK_VIOLATION
+    /// on Windows (node: EBUSY), and EIO standing in for any read failure
+    /// elsewhere.
+    fn transfer_failure() -> (std::io::Error, &'static str, &'static str) {
+        #[cfg(windows)]
+        {
+            (
+                std::io::Error::from_raw_os_error(
+                    windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32,
+                ),
+                "EBUSY",
+                "resource busy or locked",
+            )
+        }
+        #[cfg(unix)]
+        {
+            (
+                std::io::Error::from_raw_os_error(libc::EIO),
+                "EIO",
+                "i/o error",
+            )
+        }
+    }
+
+    /// node's readFile opens, then reads: a failed READ is syscall `read` with
+    /// no path ("EBUSY: resource busy or locked, read"), never the open's
+    /// `open '<path>'`. Injected through the read half, so it holds on every
+    /// host.
+    #[test]
+    fn read_file_read_failure_is_read_without_path() {
+        struct Failing(Option<std::io::Error>);
+        impl std::io::Read for Failing {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(self.0.take().expect("read once"))
+            }
+        }
+        let (error, code, reason) = transfer_failure();
+        let failed = read_opened(Failing(Some(error)), Some(10)).unwrap_err();
+        assert!(matches!(failed, WholeFileError::Transfer(_)), "{failed:?}");
+        let failure = whole_file_error(FsSite::ReadFile, "f.env", &failed);
+        assert_eq!(
+            failure,
+            FsError {
+                code,
+                syscall: "read",
+                has_path: false,
+            }
+        );
+        assert_eq!(
+            fs_error_message(failure, "f.env", failed.io()),
+            format!("{code}: {reason}, read")
+        );
+    }
+
+    /// The same split for writeFile and appendFile: a failed WRITE is syscall
+    /// `write` with no path.
+    #[test]
+    fn write_file_write_failure_is_write_without_path() {
+        struct Failing(Option<std::io::Error>);
+        impl std::io::Write for Failing {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(self.0.take().expect("write once"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        for site in [FsSite::WriteFile, FsSite::AppendFile] {
+            let (error, code, reason) = transfer_failure();
+            let failed = write_opened(Failing(Some(error)), b"x").unwrap_err();
+            let failure = whole_file_error(site, "f", &failed);
+            assert_eq!(
+                failure,
+                FsError {
+                    code,
+                    syscall: "write",
+                    has_path: false,
+                }
+            );
+            assert_eq!(
+                fs_error_message(failure, "f", failed.io()),
+                format!("{code}: {reason}, write")
+            );
+        }
+        // node writes nothing for empty data, so nothing can fail.
+        assert!(write_opened(Failing(None), b"").is_ok());
+    }
+
+    /// A failed OPEN keeps syscall `open` and the path, for all three.
+    #[test]
+    fn whole_file_open_failure_names_the_path() {
+        let dir = whole_file_dir("open");
+        let missing = dir.join("missing").join("f.txt");
+        let missing = missing.to_str().unwrap();
+        let enoent = FsError {
+            code: "ENOENT",
+            syscall: "open",
+            has_path: true,
+        };
+        let failed = read_whole_file(missing).unwrap_err();
+        assert!(matches!(failed, WholeFileError::Open(_)), "{failed:?}");
+        assert_eq!(whole_file_error(FsSite::ReadFile, missing, &failed), enoent);
+        for (site, append) in [(FsSite::WriteFile, false), (FsSite::AppendFile, true)] {
+            let failed = write_whole_file(missing, b"x", append).unwrap_err();
+            assert!(matches!(failed, WholeFileError::Open(_)), "{failed:?}");
+            assert_eq!(whole_file_error(site, missing, &failed), enoent);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The split changes nothing that succeeds: bytes round-trip, writeFile
+    /// truncates, appendFile appends, an empty file reads empty.
+    #[test]
+    fn whole_file_round_trips() {
+        let dir = whole_file_dir("round-trip");
+        let file = dir.join("f.bin");
+        let file = file.to_str().unwrap();
+        let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        write_whole_file(file, &big, false).unwrap();
+        assert_eq!(read_whole_file(file).unwrap(), big);
+        write_whole_file(file, b"ab", false).unwrap();
+        write_whole_file(file, b"cd", true).unwrap();
+        assert_eq!(read_whole_file(file).unwrap(), b"abcd");
+        write_whole_file(file, b"", false).unwrap();
+        assert_eq!(read_whole_file(file).unwrap(), b"");
+        // A stale size hint (the file grew or shrank since the fstat): the
+        // read still returns what is there.
+        let bytes = read_opened(std::io::Cursor::new(b"hello".to_vec()), Some(2)).unwrap();
+        assert_eq!(bytes, b"hello");
+        let bytes = read_opened(std::io::Cursor::new(b"hi".to_vec()), Some(64)).unwrap();
+        assert_eq!(bytes, b"hi");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// readFile's success path makes std::fs::read's read calls, no more: with
+    /// the fstat size hint, one read of the whole file and one EOF probe,
+    /// whatever the size. The generic `read_to_end` (no hint) took nine for
+    /// 1 MiB. Short reads, an interrupted read, a stale hint and no hint at
+    /// all still return every byte.
+    #[test]
+    fn read_opened_reads_a_hinted_file_in_two_calls() {
+        struct Counting<R> {
+            inner: R,
+            reads: usize,
+            /// Cap on each read's length (a short-reading source), if any.
+            chunk: Option<usize>,
+            /// Fail this many reads with Interrupted first.
+            interrupts: usize,
+        }
+        impl<R: std::io::Read> std::io::Read for Counting<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                if self.interrupts > 0 {
+                    self.interrupts -= 1;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let n = self.chunk.map_or(buf.len(), |c| c.min(buf.len()));
+                self.inner.read(&mut buf[..n])
+            }
+        }
+        let counting = |data: &[u8], chunk, interrupts| Counting {
+            inner: std::io::Cursor::new(data.to_vec()),
+            reads: 0,
+            chunk,
+            interrupts,
+        };
+        for size in [0usize, 1, 4096, 100_000, 1 << 20, 64 << 20] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let mut reader = counting(&data, None, 0);
+            let bytes = read_opened(&mut reader, Some(size as u64)).unwrap();
+            assert!(bytes == data, "{size} bytes read back wrong");
+            assert_eq!(reader.reads, if size == 0 { 1 } else { 2 }, "{size} bytes");
+        }
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        for (hint, chunk, interrupts) in [
+            (Some(300_000), Some(7_000), 0),
+            (Some(300_000), None, 3),
+            (Some(10), None, 0),
+            (Some(1 << 20), None, 0),
+            (None, None, 0),
+            (None, Some(4_096), 1),
+        ] {
+            let mut reader = counting(&data, chunk, interrupts);
+            let bytes = read_opened(&mut reader, hint).unwrap();
+            assert!(bytes == data, "{hint:?} {chunk:?} {interrupts}");
+        }
+    }
+
+    /// readFile of a DIRECTORY fails on the read on every platform, as node's
+    /// does: EISDIR, syscall `read`, no path. Linux and macOS open it and the
+    /// read half fails EISDIR; Windows std cannot open it, and fs_error_at
+    /// reports that open as node's failed read.
+    #[test]
+    fn read_file_of_a_directory_fails_on_the_read_everywhere() {
+        let dir = whole_file_dir("dir");
+        let dir_s = dir.to_str().unwrap();
+        let eisdir_read = FsError {
+            code: "EISDIR",
+            syscall: "read",
+            has_path: false,
+        };
+        let failed = read_whole_file(dir_s).unwrap_err();
+        #[cfg(unix)]
+        assert!(matches!(failed, WholeFileError::Transfer(_)), "{failed:?}");
+        let failure = whole_file_error(FsSite::ReadFile, dir_s, &failed);
+        assert_eq!(failure, eisdir_read);
+        assert_eq!(
+            fs_error_message(failure, dir_s, failed.io()),
+            "EISDIR: illegal operation on a directory, read"
+        );
+        // The read half's EISDIR, injected, is the same verdict everywhere.
+        let kind = WholeFileError::Transfer(std::io::Error::from(std::io::ErrorKind::IsADirectory));
+        assert_eq!(whole_file_error(FsSite::ReadFile, "d", &kind), eisdir_read);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The real thing on Windows: another handle holds an exclusive lock over
+    /// the file (LockFileEx, mandatory there). The open succeeds and the read
+    /// or write fails ERROR_LOCK_VIOLATION -- node's "EBUSY: resource busy or
+    /// locked, read" / "..., write", no path.
+    #[cfg(windows)]
+    #[test]
+    fn locked_file_fails_the_read_and_write_not_the_open() {
+        let dir = whole_file_dir("locked");
+        let file = dir.join("locked.env");
+        std::fs::write(&file, "A=1\n").unwrap();
+        let file_s = file.to_str().unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file)
+            .unwrap();
+        holder.lock().unwrap();
+        let busy = |syscall| FsError {
+            code: "EBUSY",
+            syscall,
+            has_path: false,
+        };
+        let failed = read_whole_file(file_s).unwrap_err();
+        assert!(matches!(failed, WholeFileError::Transfer(_)), "{failed:?}");
+        assert_eq!(
+            whole_file_error(FsSite::ReadFile, file_s, &failed),
+            busy("read")
+        );
+        assert_eq!(
+            fs_error_message(busy("read"), file_s, failed.io()),
+            "EBUSY: resource busy or locked, read"
+        );
+        for (site, append) in [(FsSite::AppendFile, true), (FsSite::WriteFile, false)] {
+            let failed = write_whole_file(file_s, b"B=2\n", append).unwrap_err();
+            assert!(matches!(failed, WholeFileError::Transfer(_)), "{failed:?}");
+            assert_eq!(whole_file_error(site, file_s, &failed), busy("write"));
+        }
+        holder.unlock().unwrap();
+        drop(holder);
+        assert!(read_whole_file(file_s).is_ok());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The real thing on Linux: /proc/self/mem opens and fails the read at
+    /// offset 0 with EIO; /dev/full opens and fails every write with ENOSPC.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_read_and_write_failures_are_the_transfer_half() {
+        let failed = read_whole_file("/proc/self/mem").unwrap_err();
+        assert!(matches!(failed, WholeFileError::Transfer(_)), "{failed:?}");
+        assert_eq!(
+            whole_file_error(FsSite::ReadFile, "/proc/self/mem", &failed),
+            FsError {
+                code: "EIO",
+                syscall: "read",
+                has_path: false,
+            }
+        );
+        for (site, append) in [(FsSite::WriteFile, false), (FsSite::AppendFile, true)] {
+            let failed = write_whole_file("/dev/full", b"x", append).unwrap_err();
+            assert!(matches!(failed, WholeFileError::Transfer(_)), "{failed:?}");
+            assert_eq!(
+                whole_file_error(site, "/dev/full", &failed),
+                FsError {
+                    code: "ENOSPC",
+                    syscall: "write",
+                    has_path: false,
+                }
+            );
+        }
     }
 
     #[cfg(windows)]
