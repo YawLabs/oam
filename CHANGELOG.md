@@ -85,6 +85,21 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   one with a NUL byte). `'trailers'` fires whether or not the body ahead of it is read, a
   server stream that has responded stays open for the rest of the request, and a client's
   `'wantTrailers'` / `'finish'` order matches node's.
+- **A `connect.lookup` dispatcher opened and closed a connection for every fetch** (#179),
+  calling the hook each time, so a sustained hooked loop could use up the ephemeral port
+  range (`EADDRINUSE`). Each `Agent` now pools its connections across its fetches, as
+  undici's does: the hook is called once per connection opened, not once per fetch; a
+  pooled connection carries requests only for the origin it was opened to, and never for
+  another `Agent`; an idle HTTP/1.1 connection closes 90 s after its last response, and all
+  of them close on `close()`, `destroy()` (in the same tick as a fetch, too) or the
+  `Agent`'s collection. A redirect to the same origin reuses the 3xx's connection every
+  time, and each request dials with its own happy-eyeballs attempt timeout rather than one
+  another request had set.
+- **A `connect.lookup` hook's second callback was ignored** (#169). An error, a throw or an
+  answer node's address rules refuse, arriving after the hook answered, fails the fetch
+  with that error as the `cause` while the connection is still being made, as node's
+  `net` does; once it is made, later callbacks are ignored. A second answer that passes
+  the rules is still ignored, where node fails the socket with a platform error.
 
 ### Performance
 
