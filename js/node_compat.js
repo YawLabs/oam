@@ -27226,7 +27226,21 @@
             });
           }
         } else if (!this.writable) {
-          this._doClose();
+          const ws = this._writableState;
+          if (ws.ended && !ws.finished) {
+            // allowHalfOpen, and the writable side ended but not finished
+            // -- typically by an 'end' listener's own write() + end(): the
+            // close waits for them, through the write chain as above, so a
+            // write that fails (EPIPE: the peer is gone) gets its callback
+            // and its 'error' before 'close', as node's autoDestroy waits
+            // for 'finish'. Closed here at once, 'close' came first and the
+            // 'error' was lost.
+            this._chain = this._chain.then(() => {
+              if (this._finishPending !== true) this._doClose();
+            });
+          } else {
+            this._doClose();
+          }
         }
       }
 
