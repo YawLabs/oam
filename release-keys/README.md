@@ -135,6 +135,133 @@ You also need to check that the signing key's line in `ranges` covers the tag.
 `release_verify_manifest` in `scripts/lib/signing.sh` does all of these checks
 in one call.
 
+## Windows Authenticode
+
+The release key above signs the release. The two Windows binaries are also
+signed one by one, with Authenticode, through Azure Artifact Signing. The
+signing key stays in Microsoft's HSM, and nothing about it lives in this
+repository. Each certificate is issued to the validated publisher name and is
+valid for three days, so every signature carries an RFC 3161 timestamp from
+`http://timestamp.acs.microsoft.com`.
+
+`scripts/lib/signing.sh` (the "Windows" section) does the signing. Until
+`OAM_WIN_SIGN_METADATA` is set, `scripts/release-local.sh` ships the Windows
+binaries unsigned with a warning (`OAM_SIGN_REQUIRED=1` makes that fatal).
+Once it is set, both `.exe` assets must sign and verify, or the release stops.
+
+### Setting up the release box (once)
+
+You need an Artifact Signing account whose identity validation is complete,
+a Public Trust certificate profile, and the "Artifact Signing Certificate
+Profile Signer" role for the identity you sign in with. On an arm64 box, use
+the x64 builds of every tool. The dlib ships only x86 and x64 builds, so the
+x64 signtool, the x64 dlib and the x64 .NET runtime all run under emulation.
+
+1. Install the client tools (the dlib and its dependencies):
+
+   ```sh
+   winget install -e --id Microsoft.Azure.ArtifactSigningClientTools
+   ```
+
+   The dlib lands in `%LOCALAPPDATA%\Microsoft\MicrosoftArtifactSigningClientTools`.
+2. Check that an x64 `signtool.exe` from Windows SDK 10.0.22621 or newer is
+   under `C:\Program Files (x86)\Windows Kits\10\bin\<version>\x64\`. SDK
+   10.0.20348 does not work with the dlib.
+3. Check for the x64 .NET 8 runtime. On an arm64 box it lives under
+   `C:\Program Files\dotnet\x64\`; `dotnet.exe --list-runtimes` there must
+   list `Microsoft.NETCore.App 8.x` or newer. Without it, signtool reports
+   success and signs nothing. The verify step catches that, but install the
+   runtime anyway: `winget install -e --id Microsoft.DotNet.Runtime.8 --architecture x64`.
+4. Write `metadata.json` **outside any repository**, for example in
+   `~/.oam-release/`:
+
+   ```json
+   {
+     "Endpoint": "https://<region>.codesigning.azure.net",
+     "CodeSigningAccountName": "<account name>",
+     "CertificateProfileName": "<certificate profile name>",
+     "ExcludeCredentials": [
+       "EnvironmentCredential", "ManagedIdentityCredential",
+       "WorkloadIdentityCredential", "SharedTokenCacheCredential",
+       "VisualStudioCredential", "VisualStudioCodeCredential",
+       "AzurePowerShellCredential", "AzureDeveloperCliCredential",
+       "InteractiveBrowserCredential"
+     ]
+   }
+   ```
+
+   The endpoint must be your account's region. A mismatch shows up as a 403 or
+   a `SignerSign()` error. `ExcludeCredentials` is optional. With it, the dlib
+   signs only through your `az login` session and never opens a browser
+   prompt halfway through a release.
+5. Point the release scripts at it, and name the publisher every signature
+   must carry. The publisher is the validated legal name, exactly as it
+   appears in the certificate's CN and O:
+
+   ```sh
+   export OAM_WIN_SIGN_METADATA="$HOME/.oam-release/metadata.json"
+   export OAM_WIN_SIGN_PUBLISHER="<validated publisher name>"
+   ```
+
+### Before each release
+
+Run `az login` as the identity that holds the Signer role. The release
+preflight asks the Azure CLI for a token for `https://codesigning.azure.net`
+and stops with "run 'az login'" if there is none. It then signs a generated
+throwaway executable in a temp directory and verifies it the same way the
+release assets are verified. That one signature exercises the role, the
+metadata, the .NET runtime and the timestamp server, before anything is
+tagged.
+
+The script does not run `az logout` when it finishes, because the az session
+is shared with everything else you use the Azure CLI for. The session stays
+live after the release. Run `az logout` yourself if you want it gone, or limit
+the Signer role on the Entra side (sign-in frequency, or just-in-time
+activation).
+
+### What "verified" means
+
+Each Windows asset is signed after it is copied into the staging directory
+and before it is smoke-tested. It is verified right after signing, and again
+just before `SHA256SUMS` is written. Each verification re-reads the file from
+disk twice, with two independent checks:
+
+1. `signtool verify /pa` must accept the file.
+2. `scripts/lib/verify-authenticode.ps1` must find:
+   - an embedded signature with status `Valid`;
+   - a timestamp;
+   - signer CN and O both equal to `OAM_WIN_SIGN_PUBLISHER`;
+   - "Microsoft ID Verified Code Signing PCA 2021" in the certificate chain.
+
+The second check never calls signtool, so a signtool that reports success
+without signing fails the release.
+
+`OAM_SKIP_WIN_SIGN=1` ships the Windows assets unsigned even when signing is
+configured or required, with a loud warning. Use it only when the service or
+the timestamp server is down and the release cannot wait.
+
+`scripts/release-upload-local-arm64.sh` follows the same rules, with one
+addition. If it will not sign, and the release's current arm64 asset is
+signed, it stops before building, and checks again right before uploading.
+Replacing a signed binary with an unsigned one takes `OAM_SKIP_WIN_SIGN=1`.
+
+Each signtool, verify and `az` call is limited to `OAM_WIN_SIGN_TIMEOUT`
+seconds (default 300, at most 3600), because signtool waits forever on an
+endpoint that does not answer. A call that runs out of time is killed along
+with every process it started.
+
+When a call fails, its output is printed redacted: the metadata values become
+`<redacted>`, and so do email addresses, GUIDs (tenant, subscription, trace
+and correlation IDs) and your user profile path. signtool's verbose output
+repeats `metadata.json`, and `az` names the signed-in account, so this keeps
+both out of anything you paste into an issue.
+
+To check a downloaded binary by hand, in PowerShell:
+
+```powershell
+Get-AuthenticodeSignature .\oam-x86_64-pc-windows-msvc.exe | Format-List Status, SignerCertificate, TimeStamperCertificate
+```
+
 ## Rotation
 
 Rotate when the plan calls for it, or when `k1`'s custody is in doubt:
