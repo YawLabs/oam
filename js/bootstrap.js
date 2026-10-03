@@ -2680,10 +2680,15 @@
   // the connection's facts -- and out of the user's reach: replacing
   // globalThis.fetch must not intercept http.request, which in node never
   // goes near fetch. `Headers` is the class the fetch path builds headers
-  // with.
+  // with. `undiciFetch` is the oam:undici shim's entry for undici.fetch,
+  // undici.request and a dispatcher's request(): fetch itself, out of reach
+  // the same way -- node's undici never calls globalThis.fetch, so a
+  // replacement of it (nock's fetch interception, a test's wrapper) neither
+  // answers, blocks nor sees them there.
   Object.defineProperty(globalThis, "__oamFetchInternal", {
     value: Object.freeze({
       fetch: (input, init) => oamFetch(input, init, true),
+      undiciFetch: (input, init) => oamFetch(input, init, false),
       Headers,
     }),
     writable: false,

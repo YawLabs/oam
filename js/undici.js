@@ -84,6 +84,11 @@
     const EventEmitter = registry.get("events");
 
     const G = globalThis;
+    // oam's own fetch, which every request here is sent with -- never the
+    // live globalThis.fetch: node's undici sends request() and its own
+    // fetch() itself, so replacing globalThis.fetch (nock's fetch
+    // interception, a test's wrapper) must not answer, block or see them.
+    const ownFetch = G.__oamFetchInternal.undiciFetch;
 
     // ---- errors -----------------------------------------------------------
     // The classes globalThis.fetch raises (bootstrap.js undiciErrors, which
@@ -185,7 +190,7 @@
 
     // ---- request() --------------------------------------------------------
     // undici.request(url, opts) -> { statusCode, headers, trailers, body,
-    // opaque, context }. Backed by global fetch.
+    // opaque, context }. Backed by oam's fetch (ownFetch).
     async function request(url, opts) {
       if (typeof url === "object" && url !== null && !(url instanceof G.URL)) {
         // request({ origin, path, method, ... }) form.
@@ -524,7 +529,7 @@
       if (length === 0 && !expectsPayload) length = null;
       if (!NO_CONTENT_LENGTH.has(method) && length > 0 && declared !== null && declared !== length) throw mismatch();
       if (length === 0) headers.push(["content-length", "0"]);
-      return G.fetch(url, { ...init, headers, body: bytes === null ? undefined : bytes });
+      return ownFetch(url, { ...init, headers, body: bytes === null ? undefined : bytes });
     }
 
     // A Readable (`stream`) or an iterable body, written as undici's
@@ -598,7 +603,7 @@
           sentSignal = ops.fetchSentOpen();
           const headers = init.headers.slice();
           if (length !== null) headers.push(["content-length", String(length)]);
-          const sent = G.fetch(url, {
+          const sent = ownFetch(url, {
             ...init,
             headers,
             __oamBodyStream: channel,
@@ -2420,7 +2425,7 @@ ${pendingInterceptorsFormatter.format(pending)}
 
     // ---- web globals undici re-exports -----------------------------------
     const mod = {
-      fetch: (input, init) => G.fetch(input, init),
+      fetch: (input, init) => ownFetch(input, init),
       request,
       stream,
       Dispatcher,

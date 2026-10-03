@@ -8431,6 +8431,62 @@ pool origin not allowed failed UND_MOCK_ERR_MOCK_NOT_MATCHED
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// undici sends request(), a dispatcher's request() and its own fetch()
+/// itself, never through globalThis.fetch: a replaced globalThis.fetch --
+/// nock's fetch interception, a test's wrapper -- neither answers, blocks nor
+/// sees them, only the global fetch. Up to the review of #206 the shim called
+/// the live globalThis.fetch, so a wrapper that throws failed all five and
+/// nock's disableNetConnect() blocked undici.request. Expected output is node
+/// v22.22.2 + undici 6.29.0's, line for line.
+#[test]
+fn undici_requests_never_go_through_a_replaced_global_fetch() {
+    let script = write_temp(
+        "undici_own_fetch/main.mjs",
+        r##"import http from 'node:http';
+import { request, fetch as undiciFetch, Pool, Agent } from 'undici';
+const server = http.createServer((q, s) => s.end('real ' + q.method + ' ' + q.url));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const origin = 'http://127.0.0.1:' + server.address().port;
+let seen = 0;
+const original = globalThis.fetch;
+globalThis.fetch = async () => {
+  seen++;
+  throw new Error('blocked by the wrapper');
+};
+const show = async (label, run) => {
+  try {
+    console.log(label, await run());
+  } catch (e) {
+    console.log(label, 'failed', e.message);
+  }
+};
+await show('undici.request', async () => (await request(origin + '/r')).body.text());
+await show('undici.request POST', async () => (await request(origin + '/p', { method: 'POST', body: 'x' })).body.text());
+await show('undici.fetch', async () => (await undiciFetch(origin + '/f')).text());
+const pool = new Pool(origin);
+await show('pool.request', async () => (await pool.request({ path: '/pool', method: 'GET' })).body.text());
+const agent = new Agent();
+await show('agent.request', async () => (await agent.request({ origin, path: '/agent', method: 'GET' })).body.text());
+await show('global fetch', async () => (await fetch(origin + '/g')).text());
+console.log('wrapper saw', seen);
+globalThis.fetch = original;
+await pool.close();
+await agent.close();
+server.close();
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = r##"undici.request real GET /r
+undici.request POST real POST /p
+undici.fetch real GET /f
+pool.request real GET /pool
+agent.request real GET /agent
+global fetch failed blocked by the wrapper
+wrapper saw 1"##;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 /// A dispatcher another copy of undici -- the npm package loaded by path, or
 /// one bundled into a dependency -- installed as the global dispatcher with
 /// that copy's setGlobalDispatcher(), in the slot every copy shares
