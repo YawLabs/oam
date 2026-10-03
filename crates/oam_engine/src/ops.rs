@@ -368,14 +368,7 @@ fn op_fetch(
             .unwrap_or_default();
         let port = parsed
             .as_ref()
-            .and_then(|u| match u.port() {
-                "" => match u.protocol() {
-                    "https:" => Some(443),
-                    "http:" => Some(80),
-                    _ => None,
-                },
-                explicit => explicit.parse().ok(),
-            })
+            .map(crate::permissions::url_net_port)
             .unwrap_or_default();
         let target = oam_core::http_client::NetTarget { host: &host, port };
         if let Err(denial) = check(&target) {
@@ -437,9 +430,11 @@ fn op_fetch(
 /// link-local metadata address, to an RFC 1918 host -- while the wire still
 /// carried the granted name. An address is checked exactly as a URL naming it
 /// directly would be ([`crate::permissions::lookup_answer_resource`]: an IPv6
-/// answer bracketed and canonical), so `--allow-net=127.0.0.1` still admits a
-/// hook that answers `127.0.0.1`, `--allow-net=[::1]` one that answers `::1`,
-/// and `--allow-net` (all) costs nothing.
+/// answer bracketed and canonical) on the parked hop's port, so
+/// `--allow-net=127.0.0.1` still admits a hook that answers `127.0.0.1`,
+/// `--allow-net=[::1]` one that answers `::1`, `--allow-net=127.0.0.1:8080`
+/// a `127.0.0.1` answer for a hop to port 8080 (and no other port), and
+/// `--allow-net` (all) costs nothing.
 ///
 /// A refused answer drops the parked fetch before the op throws. The op is
 /// what consumes the entry, and bootstrap.js does not abandon after a throw,
@@ -457,23 +452,26 @@ fn op_fetch_continue(
         return;
     };
     let answer = answer.to_rust_string_lossy(scope);
-    {
-        let permissions = scope
-            .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
-            .cloned()
-            .unwrap_or_default();
+    let permissions = scope
+        .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
+        .cloned()
+        .unwrap_or_default();
+    if !matches!(permissions.net, crate::permissions::PermValue::All) {
         #[derive(serde::Deserialize)]
         struct Answer {
             #[serde(default)]
             ips: Vec<String>,
         }
-        // A malformed answer is not this gate's business: the op itself
-        // reports it, with its own message.
-        if let Ok(parsed) = serde_json::from_str::<Answer>(&answer) {
+        // The hop's port comes from the parked fetch, never from JS. A token
+        // that parks nothing has no port and dials nothing: the op fails it.
+        // A malformed answer is not this gate's business either: the op
+        // itself reports it, with its own message.
+        let continuations = core_runtime!(scope).fetch_continuations();
+        let port = oam_core::ops::fetch_parked_port(token, &continuations);
+        if let (Some(port), Ok(parsed)) = (port, serde_json::from_str::<Answer>(&answer)) {
             for ip in &parsed.ips {
                 let resource = crate::permissions::lookup_answer_resource(ip);
-                if let Err(denial) = permissions.check_net(&resource) {
-                    let continuations = core_runtime!(scope).fetch_continuations();
+                if let Err(denial) = permissions.check_net_target(&resource, port) {
                     oam_core::ops::fetch_abandon(token, &continuations);
                     crate::node_ops::throw_permission_denied(scope, &denial);
                     return;
@@ -710,15 +708,22 @@ fn op_ws_connect(
         .unwrap_or_default();
 
     {
-        let host = ada_url::Url::parse(&url, None)
-            .ok()
+        // `host:port`, as fetch and net.connect are checked: a port-scoped
+        // grant admits a socket to its own port (80 for ws:, 443 for wss:).
+        let parsed = ada_url::Url::parse(&url, None).ok();
+        let host = parsed
+            .as_ref()
             .map(|u| u.hostname().to_string())
+            .unwrap_or_default();
+        let port = parsed
+            .as_ref()
+            .map(crate::permissions::url_net_port)
             .unwrap_or_default();
         if let Err(denial) = scope
             .get_slot::<std::sync::Arc<crate::permissions::Permissions>>()
             .cloned()
             .unwrap_or_default()
-            .check_net(&host)
+            .check_net_target(&host, port)
         {
             crate::node_ops::throw_permission_denied(scope, &denial);
             return;

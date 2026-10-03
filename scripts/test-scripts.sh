@@ -36,6 +36,30 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # tree for its entire life.
 cd "$REPO_DIR" || { echo "cannot cd to $REPO_DIR" >&2; exit 1; }
 
+# The operator's release knobs, scrubbed before any fixture runs. This suite is
+# release-local.sh's own local gate (via ci-local.sh), so it runs inside a
+# release's environment, and that environment is exactly where the recovery
+# knobs get exported: a failed mac gate's documented way out is a re-run with
+# OAM_SKIP_MAC_SIGN=1, and before this scrub that knob reached 23 mac-signing
+# verdicts here and killed the re-run at "local CI gate failed". Every case
+# that needs a knob sets it on its own call. The host knobs are here for a
+# second reason: no fixture may ever reach the real build Mac.
+#
+# A guard in the "mac-signing.sh" group fails when a release script starts
+# reading a signing, skip or mac-host knob that this list does not carry.
+OPERATOR_KNOBS="OAM_SIGN_REQUIRED OAM_RELEASE_SIGNING_KEY
+  OAM_SKIP_MAC_SIGN OAM_SKIP_MAC_X64 OAM_SKIP_MAC OAM_SIGNING_DIR
+  OAM_MAC_HOST OAM_MAC_USER OAM_MAC_KEY
+  OAM_WIN_SIGN_METADATA OAM_WIN_SIGN_PUBLISHER OAM_SKIP_WIN_SIGN OAM_WIN_SIGN_TIMEOUT
+  OAM_SKIP_WIN_X64 OAM_SKIP_LINUX OAM_SKIP_LOCAL_GATE
+  OAM_DRY_RUN OAM_NO_AUTO_BUMP OAM_NO_AUTO_ATTRIBUTION
+  OAM_INSECURE_SKIP_SIGNATURE"
+scrub_operator_knobs(){
+  local k
+  for k in $OPERATOR_KNOBS; do unset "$k"; done
+}
+scrub_operator_knobs
+
 # One temp root, removed on exit. Every fixture used to call mktemp and nothing
 # ever cleaned up: a single run leaked 14 directories, and once this became a
 # pre-push gate that grew without bound (149 had piled up on the dev box before
@@ -1463,9 +1487,12 @@ done
 macpf_ssh(){ { echo '#!/bin/bash'; cat; } > "$MACPF_BIN/ssh"; chmod +x "$MACPF_BIN/ssh"; }
 chmod +x "$MACPF_BIN/tailscale" "$MACPF_BIN/scp" "$MACPF_BIN/mktemp"
 # macpf [args...]  -- the preflight against the stubs; stdout to MACPF_OUT,
-# stderr to MACPF_ERR, status to MACPF_RC.
+# stderr to MACPF_ERR, status to MACPF_RC. OAM_SKIP_MAC_SIGN=1 keeps the mac
+# signing preflight (its own group, against a fixture pin) out of these host
+# checks: with a pin committed it would make a second ssh call, which the
+# stubs here treat as the leg going on.
 macpf(){
-  MACPF_OUT="$(PATH="$MACPF_BIN:$PATH" TMPDIR="$MACPF_TMP" OAM_MAC_KEY="$SUITE_TMP/macpf-key" \
+  MACPF_OUT="$(PATH="$MACPF_BIN:$PATH" TMPDIR="$MACPF_TMP" OAM_MAC_KEY="$SUITE_TMP/macpf-key" OAM_SKIP_MAC_SIGN=1 \
     OAM_MAC_HOST=100.90.0.5 OAM_MAC_USER=builder \
     bash scripts/build-platforms-tailnet.sh "$@" 2>"$SUITE_TMP/macpf-err")"
   MACPF_RC=$?
@@ -1984,6 +2011,79 @@ MX_RUN="$(grep -n 'node "\$REPO_DIR/scripts/mcp-sidecar-matrix\.mjs" --json="\$m
 if [ -n "$MX_RM" ] && [ -n "$MX_RUN" ] && [ "$MX_RM" -lt "$MX_RUN" ]; then pass
 else fail "release-local.sh no longer removes \$matrix_report before the gate runs (rm at '${MX_RM}', gate at '${MX_RUN}')"; fi
 
+# The site's refresh-downloads.sh refuses for a reason -- no published release,
+# a manifest that disagrees with SHA256SUMS, a page with no row for an asset --
+# and the release step used to send that reason to /dev/null with the rest of
+# its output, leaving a bare "failed". The two functions run here verbatim,
+# under the release's own set -euo pipefail and with its real ok/warn (warn is
+# echo -e), against a stub site script. The stub's refusal carries a Windows
+# path (echo -e reads "\c" as "stop printing") and command substitutions that
+# would create $RS_PWN if anything evaluated the text.
+RS="$SUITE_TMP/site-refresh"
+RS_STUB="$RS/site/scripts/refresh-downloads.sh"
+mkdir -p "$RS/site/scripts"
+RS_FNS="$(awk '/^site_refresh_reason\(\) \{$/ || /^refresh_site_downloads\(\) \{$/ { f = 1 } f { print } f && /^}$/ { f = 0 }' scripts/release-local.sh)"
+RS_LOG="$(grep -E '^(ok|warn|fail)\(\)' scripts/release-local.sh)"
+rs_run() {
+  rm -f "$RS/pwned"
+  chmod +x "$RS_STUB"
+  RS_OUT="$(cd "$RS" && GRN='' YEL='' RED='' NC='' RS_PWN="$RS/pwned" \
+    bash -c "set -euo pipefail; $RS_LOG; $RS_FNS"'; refresh_site_downloads "$1" v9.9.9; echo "after rc=$?"' rs "$RS/site" 2>&1)"
+}
+
+it "release-local.sh: a refused site refresh puts the script's last [fail] line in the warn, verbatim and unevaluated"
+cat > "$RS_STUB" <<'STUB'
+#!/bin/bash
+echo STDOUT-NOISE
+esc=$'\033'
+echo "${esc}[0;33m  [warn]${esc}[0m $1 predates signing" >&2
+echo "  [fail] an earlier refusal" >&2
+echo "${esc}[0;31m  [fail]${esc}[0m no published release for $1 at C:\cache\oam"' $(touch "$RS_PWN") `touch "$RS_PWN"`' >&2
+exit 3
+STUB
+rs_run
+RS_WANT='  [warn] refresh-downloads.sh failed (exit 3): no published release for v9.9.9 at C:\cache\oam $(touch "$RS_PWN") `touch "$RS_PWN"` -- the downloads page and checksums post still advertise the previous release'
+if [ -z "$RS_FNS" ] || [ "$(grep -c '() {$' <<<"$RS_FNS")" != "2" ]; then fail "site_refresh_reason() / refresh_site_downloads() not found in release-local.sh"
+elif ! grep -qxF -- "$RS_WANT" <<<"$RS_OUT"; then fail "warn did not carry the refusal:$(printf '\n%s' "$RS_OUT")"
+elif [ -e "$RS/pwned" ]; then fail "the captured stderr was evaluated"
+elif grep -q 'STDOUT-NOISE\|earlier refusal' <<<"$RS_OUT"; then fail "stdout or an earlier line leaked:$(printf '\n%s' "$RS_OUT")"
+elif grep -q $'\033' <<<"$RS_OUT"; then fail "colour codes survived into the warn"
+elif ! grep -qx 'after rc=0' <<<"$RS_OUT"; then fail "the step was fatal under set -euo pipefail:$(printf '\n%s' "$RS_OUT")"
+else pass; fi
+
+it "release-local.sh: with no [fail] line the warn carries the last error-ish line, else a short tail, else says stderr was empty"
+cat > "$RS_STUB" <<'STUB'
+#!/bin/bash
+echo "  [ok] resolved $1" >&2
+echo "marker block downloads-table not found in the page" >&2
+echo "Traceback noise that follows" >&2
+exit 1
+STUB
+rs_run; RS_A="$RS_OUT"
+cat > "$RS_STUB" <<'STUB'
+#!/bin/bash
+printf 'one\ntwo\n\nthree\n\tfour\n' >&2
+exit 2
+STUB
+rs_run; RS_B="$RS_OUT"
+printf '#!/bin/bash\necho only-stdout\nexit 1\n' > "$RS_STUB"
+rs_run; RS_C="$RS_OUT"
+if ! grep -qF 'failed (exit 1): marker block downloads-table not found in the page -- ' <<<"$RS_A"; then fail "error line: $RS_A"
+elif ! grep -qF 'failed (exit 2): two | three | four -- ' <<<"$RS_B"; then fail "tail: $RS_B"
+elif ! grep -qF 'failed (exit 1): it printed nothing on stderr -- ' <<<"$RS_C"; then fail "empty: $RS_C"
+elif [ "$(grep -c 'after rc=0' <<<"$RS_A$RS_B$RS_C")" != "3" ]; then fail "a failure was fatal: $RS_A / $RS_B / $RS_C"
+else pass; fi
+
+it "release-local.sh: a successful site refresh says ok, and drops the script's own chatter"
+printf '#!/bin/bash\necho STDOUT-NOISE\necho "  [warn] review git diff" >&2\nexit 0\n' > "$RS_STUB"
+rs_run
+eq "$RS_OUT" $'  [ok] release pages regenerated for v9.9.9 (downloads page + checksums post)\nafter rc=0'
+
+it "release-local.sh: the site step runs refresh-downloads.sh through refresh_site_downloads, never blind"
+if grep -qxF '    refresh_site_downloads "$SITE_DIR" "$TAG"' scripts/release-local.sh \
+   && ! grep -qF '>/dev/null 2>&1' <(grep -v '^[[:space:]]*#' scripts/release-local.sh | grep -F 'refresh-downloads.sh'); then pass
+else fail "release-local.sh runs refresh-downloads.sh outside refresh_site_downloads, or discards its stderr again"; fi
+
 # #90 shipped a whole second build configuration -- oam_engine without `napi`,
 # oam_cli without its passthrough -- that was verified by hand once and then had
 # no coverage anywhere: `no-default-features` appeared in no script, no test and
@@ -2270,9 +2370,9 @@ it "no key committed: the manifest step is skipped, with a loud reason"
 SG_D="$(sg "$SG_BOOT" release_signing_decision)"
 case "$SG_D" in skip:*"WITHOUT a signed RELEASE-MANIFEST"*) pass ;; *) fail "got '$SG_D'" ;; esac
 
-it "no key committed + OAM_SIGN_REQUIRED=1: fatal"
+it "no key committed + OAM_SIGN_REQUIRED=1: fatal, and the way out is an explicit 0 (release-local.sh defaults an unset knob to 1)"
 SG_D="$(OAM_SIGN_REQUIRED=1 sg "$SG_BOOT" release_signing_decision)"
-case "$SG_D" in fail:*"OAM_SIGN_REQUIRED=1"*) pass ;; *) fail "got '$SG_D'" ;; esac
+case "$SG_D" in fail:*"OAM_SIGN_REQUIRED=1"*"set OAM_SIGN_REQUIRED=0"*) pass ;; *) fail "got '$SG_D'" ;; esac
 
 it "OAM_SIGN_REQUIRED takes 0 or 1 and nothing else"
 SG_D="$(OAM_SIGN_REQUIRED=yes sg "$SG_BOOT" release_signing_decision)"
@@ -2284,8 +2384,10 @@ it "a committed key makes signing mandatory, whatever OAM_SIGN_REQUIRED says"
 SG_D="$(OAM_SIGN_REQUIRED=0 sg "$SG_ONE" release_signing_decision) $(OAM_SIGN_REQUIRED=1 sg "$SG_ONE" release_signing_decision)"
 eq "$SG_D" "sign sign"
 
+# A READ of the variable ($X or ${X...}), not the name: the Windows decision's
+# messages name OAM_SKIP_WIN_SIGN, which its caller reads and hands in.
 it "the lib has no knob that skips the manifest"
-if grep -v '^[[:space:]]*#' scripts/lib/signing.sh | grep -qE 'OAM_SKIP|OAM_NO_SIGN|SKIP_SIGN|SKIP_MANIFEST'; then
+if grep -v '^[[:space:]]*#' scripts/lib/signing.sh | grep -qE '\$\{?(OAM_SKIP|OAM_NO_SIGN|[A-Z_]*SKIP_SIGN|SKIP_MANIFEST)|printenv'; then
   fail "scripts/lib/signing.sh reads a skip knob"
 else pass; fi
 
@@ -2699,6 +2801,492 @@ CHILD
 fi
 
 # =============================================================================
+group "signing.sh -- Windows Authenticode: decision, locators, the verify gate"
+# =============================================================================
+# The verify gate is what makes Windows signing fail-closed, so most of this
+# group is about IT: a signtool that exits 0 without signing (Microsoft's own
+# FAQ documents that failure, without the x64 .NET runtime) must still fail
+# the release, and the PowerShell half must accept a real signature only for
+# the publisher and intermediate it was told to pin. No Azure here: the
+# account, the az session and the TSA are the preflight's job, on the box.
+#
+# The operator's own configuration must not leak into the fixtures' verdicts.
+unset OAM_WIN_SIGN_METADATA OAM_WIN_SIGN_PUBLISHER OAM_SKIP_WIN_SIGN OAM_SIGN_REQUIRED
+WS="$SUITE_TMP/winsign"
+mkdir -p "$WS/bin" "$WS/stage"
+# wg <command...> -- the lib sourced in a subshell, with every search root and
+# external program pointed at a fixture (or at nothing) unless the case sets
+# the matching WS_* itself. The box's real signtool, dlib, dotnet and az are
+# never consulted by accident.
+wg(){
+  ( # shellcheck source=lib/signing.sh
+    . scripts/lib/signing.sh
+    WIN_SDK_BIN_ROOT="${WS_SDK:-$WS/no-sdk}"
+    WIN_DLIB_DIRS=("${WS_DLIB_DIR:-$WS/no-dlib}")
+    WIN_DOTNET_CANDIDATES=("${WS_DOTNET:-$WS/no-dotnet}")
+    WIN_AZ="${WS_AZ:-$WS/no-az}"
+    WIN_POWERSHELL="${WS_PS:-$WIN_POWERSHELL}"
+    WIN_SIGNTOOL="${WS_SIGNTOOL:-}"
+    WIN_SIGN_DLIB="${WS_DLIB:-}"
+    WIN_DOTNET_X64="${WS_DOTNET_OK:-}"
+    WIN_SIGN_INTERMEDIATE="${WS_INTER:-$WIN_SIGN_INTERMEDIATE}"
+    "$@" )
+}
+ws_signtool(){ locate_signtool_x64 && printf '%s\n' "$WIN_SIGNTOOL"; }
+ws_dlib(){ locate_artifact_signing_dlib && printf '%s\n' "$WIN_SIGN_DLIB"; }
+WS_HAVE_PS=0
+if command -v powershell.exe >/dev/null 2>&1 && command -v cygpath >/dev/null 2>&1; then WS_HAVE_PS=1; fi
+
+it "nothing configured: skipped, with a loud bootstrap reason"
+WS_D="$(wg win_sign_decision 0)"
+case "$WS_D" in skip:*"WITHOUT Authenticode"*bootstrap*) pass ;; *) fail "got '$WS_D'" ;; esac
+
+it "nothing configured + OAM_SIGN_REQUIRED=1: fatal, naming all three ways forward (an unset knob is not one of them)"
+WS_D="$(OAM_SIGN_REQUIRED=1 wg win_sign_decision 0)"
+case "$WS_D" in
+  fail:"signing is required (OAM_SIGN_REQUIRED, default 1 under release-local.sh)"*"OAM_WIN_SIGN_METADATA is not set"*"OAM_SKIP_WIN_SIGN=1"*"OAM_SIGN_REQUIRED=0"*) pass ;;
+  *) fail "got '$WS_D'" ;;
+esac
+
+it "configured: sign, required or not"
+WS_D="$(OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P wg win_sign_decision 0) $(OAM_SIGN_REQUIRED=1 OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P wg win_sign_decision 0)"
+eq "$WS_D" "sign sign"
+
+it "OAM_SKIP_WIN_SIGN=1 is honored even when configured and required -- loudly"
+WS_D="$(OAM_SIGN_REQUIRED=1 OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P wg win_sign_decision 1)"
+case "$WS_D" in skip:*"OAM_SKIP_WIN_SIGN=1"*"WITHOUT Authenticode"*) pass ;; *) fail "got '$WS_D'" ;; esac
+
+it "half a configuration is fatal, either half"
+WS_D="$(OAM_WIN_SIGN_METADATA=/m wg win_sign_decision 0)|$(OAM_WIN_SIGN_PUBLISHER=P wg win_sign_decision 0)"
+case "$WS_D" in fail:*"half configured"*"|fail:"*"half configured"*) pass ;; *) fail "got '$WS_D'" ;; esac
+
+it "malformed knobs are fatal, not guessed at"
+WS_D="$(wg win_sign_decision yes)|$(OAM_SIGN_REQUIRED=2 wg win_sign_decision 0)"
+case "$WS_D" in fail:*"OAM_SKIP_WIN_SIGN must be 0 or 1"*"|fail:"*"OAM_SIGN_REQUIRED must be 0 or 1"*) pass ;; *) fail "got '$WS_D'" ;; esac
+
+it "the lib ignores OAM_SKIP_WIN_SIGN in its environment -- only the caller's argument counts"
+WS_D="$(OAM_SKIP_WIN_SIGN=1 OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P wg win_sign_decision 0)"
+eq "$WS_D" "sign"
+
+WS_PE="$WS/unsigned.exe"
+it "win_make_unsigned_pe writes a 1024-byte x64 PE image"
+if wg win_make_unsigned_pe "$WS_PE" 2>/dev/null; then
+  eq "$(wg _ws_pe_machine "$WS_PE") $(wc -c <"$WS_PE" | tr -d ' ')" "8664 1024"
+else fail "win_make_unsigned_pe failed"; fi
+
+it "_ws_pe_machine reads nothing from a file that is not a PE"
+eq "$(wg _ws_pe_machine scripts/lib/signing.sh)" ""
+
+# A fake Windows Kits bin/ tree. The generated PE stands in for signtool: the
+# locator reads versions from directory names and the arch from the header.
+WS_SDK_T="$WS/sdk"
+for v in 10.0.17134.0 10.0.20348.0 10.0.22621.0 10.0.26100.0; do
+  mkdir -p "$WS_SDK_T/$v/x64" && cp "$WS_PE" "$WS_SDK_T/$v/x64/signtool.exe"
+done
+it "locate_signtool_x64 takes the newest SDK at or above the floor"
+WS_D="$(WS_SDK="$WS_SDK_T" wg ws_signtool 2>&1)"
+eq "$WS_D" "$WS_SDK_T/10.0.26100.0/x64/signtool.exe"
+
+WS_SDK_OLD="$WS/sdk-old"
+for v in 10.0.17134.0 10.0.20348.0; do
+  mkdir -p "$WS_SDK_OLD/$v/x64" && cp "$WS_PE" "$WS_SDK_OLD/$v/x64/signtool.exe"
+done
+it "locate_signtool_x64 refuses SDKs below the floor and 10.0.20348, naming what it found"
+WS_RC=0; WS_D="$(WS_SDK="$WS_SDK_OLD" wg ws_signtool 2>&1)" || WS_RC=$?
+if [ "$WS_RC" != "0" ] && grep -qF '10.0.22621' <<<"$WS_D" && grep -qF '10.0.20348.0' <<<"$WS_D"; then pass
+else fail "rc=$WS_RC: $WS_D"; fi
+
+WS_SDK_ARM="$WS/sdk-arm"
+mkdir -p "$WS_SDK_ARM/10.0.26100.0/x64" && echo 'not a PE' >"$WS_SDK_ARM/10.0.26100.0/x64/signtool.exe"
+it "locate_signtool_x64 refuses a signtool whose header is not x64"
+WS_RC=0; WS_D="$(WS_SDK="$WS_SDK_ARM" wg ws_signtool 2>&1)" || WS_RC=$?
+if [ "$WS_RC" != "0" ] && grep -qF 'not an x64 binary' <<<"$WS_D"; then pass; else fail "rc=$WS_RC: $WS_D"; fi
+
+mkdir -p "$WS/dlib-ok" "$WS/dlib-bad"
+cp "$WS_PE" "$WS/dlib-ok/Azure.CodeSigning.Dlib.dll"
+echo 'not a PE' >"$WS/dlib-bad/Azure.CodeSigning.Dlib.dll"
+it "locate_artifact_signing_dlib finds the x64 dlib, and refuses one that is not x64"
+WS_D="$(WS_DLIB_DIR="$WS/dlib-ok" wg ws_dlib 2>/dev/null)"
+WS_RC=0; WS_E="$(WS_DLIB_DIR="$WS/dlib-bad" wg ws_dlib 2>&1)" || WS_RC=$?
+if [ "$WS_D" = "$WS/dlib-ok/Azure.CodeSigning.Dlib.dll" ] && [ "$WS_RC" != "0" ] \
+   && grep -qF 'not the x64 build' <<<"$WS_E" && grep -qF 'winget install -e --id Microsoft.Azure.ArtifactSigningClientTools' <<<"$WS_E"; then pass
+else fail "found '$WS_D'; bad dir rc=$WS_RC: $WS_E"; fi
+
+it "probe_dotnet_x64 refuses a host that is not an x64 PE, and names the fix"
+echo 'not a PE' >"$WS/bin/dotnet.exe"
+WS_RC=0; WS_D="$(WS_DOTNET="$WS/bin/dotnet.exe" wg probe_dotnet_x64 2>&1)" || WS_RC=$?
+if [ "$WS_RC" != "0" ] && grep -qF 'sign NOTHING' <<<"$WS_D"; then pass; else fail "rc=$WS_RC: $WS_D"; fi
+
+it "probe_dotnet_x64 accepts this box's x64 .NET >= 8, when it has one"
+if [ -f "/c/Program Files/dotnet/x64/dotnet.exe" ]; then
+  WS_RC=0; WS_D="$(WS_DOTNET="/c/Program Files/dotnet/x64/dotnet.exe" wg probe_dotnet_x64 2>&1)" || WS_RC=$?
+  if [ "$WS_RC" = "0" ]; then pass
+  elif [ "$(wg _ws_pe_machine "/c/Program Files/dotnet/x64/dotnet.exe")" = "8664" ]; then skip "x64 dotnet present but lists no runtime >= 8: $WS_D"
+  else fail "rc=$WS_RC: $WS_D"; fi
+else skip "no /c/Program Files/dotnet/x64/dotnet.exe on this host"; fi
+
+# metadata.json: only the shape is checked, and placeholder values (the
+# sample file's "<...>") do not count as configured.
+printf '{\n  "Endpoint": "https://example.invalid",\n  "CodeSigningAccountName": "example",\n  "CertificateProfileName": "example"\n}\n' >"$WS/metadata.json"
+printf '{\n  "Endpoint": "<Artifact Signing account endpoint>",\n  "CodeSigningAccountName": "example",\n  "CertificateProfileName": "example"\n}\n' >"$WS/metadata-sample.json"
+printf '{\n  "Endpoint": "https://example.invalid",\n  "CodeSigningAccountName": "example"\n}\n' >"$WS/metadata-short.json"
+it "metadata.json needs all three fields, with real values"
+WS_OK=0; OAM_WIN_SIGN_METADATA="$WS/metadata.json" wg _ws_metadata >/dev/null 2>&1 && WS_OK=1
+WS_S="$(OAM_WIN_SIGN_METADATA="$WS/metadata-sample.json" wg _ws_metadata 2>&1)"
+WS_T="$(OAM_WIN_SIGN_METADATA="$WS/metadata-short.json" wg _ws_metadata 2>&1)"
+if [ "$WS_OK" = "1" ] && grep -qF '"Endpoint"' <<<"$WS_S" && grep -qF '"CertificateProfileName"' <<<"$WS_T"; then pass
+else fail "ok=$WS_OK sample='$WS_S' short='$WS_T'"; fi
+
+# The stub: exits 0 for every call and signs nothing -- what signtool + the
+# dlib do without the x64 .NET runtime. It logs its argv for the shape check.
+WS_LOG="$WS/signtool.log"
+{ echo '#!/bin/bash'; echo "printf '%s\\n' \"\$*\" >>'$WS_LOG'"; echo 'exit 0'; } >"$WS/bin/signtool"
+# A stale az session, as one really reads: it names the signed-in account, and
+# Entra's errors carry tenant, trace and correlation IDs.
+cat >"$WS/bin/az-lapsed" <<'AZ'
+#!/bin/bash
+echo "ERROR: User 'op.erator@example.com' does not exist in MSAL token cache. Run \`az login\`." >&2
+echo "AADSTS700082: The refresh token has expired. Trace ID: 0a1b2c3d-4e5f-6789-abcd-ef0123456789 Correlation ID: 11111111-2222-3333-4444-555555555555" >&2
+echo "Authority: https://login.microsoftonline.com/aabbccdd-1111-2222-3333-444455556666 (tenant 'Example Tenant')" >&2
+echo "Cache: C:\\Users\\opname\\.azure\\msal_token_cache.bin" >&2
+exit 1
+AZ
+printf '#!/bin/bash\nexit 0\n' >"$WS/bin/az-live"
+chmod +x "$WS/bin/signtool" "$WS/bin/az-lapsed" "$WS/bin/az-live"
+# ws_stubbed <command...> -- fully configured, with the stub as signtool.
+# A case may still override signtool, powershell or az (WS_SIGNTOOL / WS_PS / WS_AZ).
+ws_stubbed(){
+  WS_SIGNTOOL="${WS_SIGNTOOL:-$WS/bin/signtool}" WS_DLIB="$WS/dlib-ok/Azure.CodeSigning.Dlib.dll" WS_DOTNET_OK=stub \
+    OAM_WIN_SIGN_METADATA="$WS/metadata.json" OAM_WIN_SIGN_PUBLISHER="Example Publisher" wg "$@"
+}
+
+it "win_sign hands signtool the documented command: /fd, the ACS TSA, /td, /dlib, /dmdf, native paths"
+cp "$WS_PE" "$WS/stage/oam-stub.exe"
+: >"$WS_LOG"
+WS_RC=0; WS_D="$(ws_stubbed win_sign "$WS/stage/oam-stub.exe" 2>&1)" || WS_RC=$?
+WS_L="$(head -1 "$WS_LOG")"
+WS_WANT="sign /v /fd SHA256 /tr http://timestamp.acs.microsoft.com /td SHA256 /dlib $(wg _ws_winpath "$WS/dlib-ok/Azure.CodeSigning.Dlib.dll") /dmdf $(wg _ws_winpath "$WS/metadata.json") $(wg _ws_winpath "$WS/stage/oam-stub.exe")"
+if [ "$WS_RC" = "0" ] && [ "$WS_L" = "$WS_WANT" ]; then pass
+else fail "rc=$WS_RC out='$WS_D'"$'\n'"       logged: $WS_L"$'\n'"       wanted: $WS_WANT"; fi
+
+it "a signtool that exits 0 without signing fails the gate: win_verify rejects the file"
+if [ "$WS_HAVE_PS" = "1" ]; then
+  WS_RC=0; WS_D="$(ws_stubbed win_verify "$WS/stage/oam-stub.exe" 2>&1)" || WS_RC=$?
+  if [ "$WS_RC" != "0" ] && grep -qF "'NotSigned'" <<<"$WS_D" && grep -qF 'verify /pa /v' "$WS_LOG"; then pass
+  else fail "rc=$WS_RC: $WS_D"; fi
+else skip "no powershell.exe/cygpath -- the Authenticode reader runs on Windows only"; fi
+
+it "win_sign refuses to sign a build output under target/, and never calls signtool for it"
+mkdir -p "$WS/target/release" && cp "$WS_PE" "$WS/target/release/oam.exe"
+: >"$WS_LOG"
+WS_RC=0; WS_D="$(ws_stubbed win_sign "$WS/target/release/oam.exe" 2>&1)" || WS_RC=$?
+if [ "$WS_RC" != "0" ] && grep -qF 'refusing to sign' <<<"$WS_D" && [ ! -s "$WS_LOG" ]; then pass
+else fail "rc=$WS_RC log='$(cat "$WS_LOG")': $WS_D"; fi
+
+it "win_sign_preflight on a lapsed az session fails, saying to run az login, before signing anything -- and names nobody"
+: >"$WS_LOG"
+WS_RC=0; WS_D="$(WS_AZ="$WS/bin/az-lapsed" ws_stubbed win_sign_preflight 2>&1)" || WS_RC=$?
+if [ "$WS_RC" != "0" ] && grep -qF "run 'az login'" <<<"$WS_D" && [ ! -s "$WS_LOG" ] \
+   && grep -qF "az: ERROR: User '<email>' does not exist in MSAL token cache" <<<"$WS_D" && grep -qF 'AADSTS700082' <<<"$WS_D" \
+   && ! grep -qiE 'op\.erator|example\.com|[0-9a-f]{8}-[0-9a-f]{4}-|Example Tenant|opname' <<<"$WS_D"; then pass
+else fail "rc=$WS_RC log='$(cat "$WS_LOG")': $WS_D"; fi
+
+it "win_sign_preflight with a signtool that signs nothing fails, and leaves no probe behind"
+if [ "$WS_HAVE_PS" = "1" ]; then
+  mkdir -p "$WS/pftmp"
+  WS_RC=0; WS_D="$(TMPDIR="$WS/pftmp" WS_AZ="$WS/bin/az-live" ws_stubbed win_sign_preflight 2>&1)" || WS_RC=$?
+  if [ "$WS_RC" != "0" ] && grep -qF 'throwaway signature did not sign and verify' <<<"$WS_D" \
+     && [ -z "$(ls -A "$WS/pftmp")" ]; then pass
+  else fail "rc=$WS_RC left='$(ls -A "$WS/pftmp")': $WS_D"; fi
+else skip "no powershell.exe/cygpath -- the Authenticode reader runs on Windows only"; fi
+
+# A stalled endpoint: signtool + the dlib print "Submitting digest..." and
+# never return. The stand-ins hang in a CHILD process -- cmd.exe running
+# ping.exe on Windows, sleep elsewhere -- because that is the shape that beat
+# timeout(1): az is a script around python.exe, and killing only the direct
+# child left the grandchild running, holding the output pipe. Each stand-in's
+# child carries its own count as a marker, so ws_orphans can find it.
+# ws_hang_stub <file> <marker>
+ws_hang_stub(){
+  { echo '#!/bin/bash'
+    echo 'echo "Submitting digest for signing..."'
+    echo 'case "$(uname -s)" in'
+    # MSYS_NO_PATHCONV=1 spelled out: win_sign/win_verify run signtool under
+    # it, the stand-in inherits it, and `cmd //c` would then reach cmd.exe
+    # unconverted and exit at once instead of hanging.
+    echo "  MINGW* | MSYS* | CYGWIN*) MSYS_NO_PATHCONV=1 cmd /c \"ping -n $2 127.0.0.1\" >/dev/null ;;"
+    echo "  *) sleep $2 ;;"
+    echo 'esac'
+  } >"$1"
+  chmod +x "$1"
+}
+# ws_orphans <marker> -- how many of that stand-in's children are still
+# running (any it finds are killed, so a failure does not leak them).
+ws_orphans(){
+  if [ "$WS_HAVE_PS" = "1" ]; then
+    powershell.exe -NoProfile -NonInteractive -Command \
+      "\$p = @(Get-CimInstance Win32_Process -Filter \"Name='PING.EXE'\" | Where-Object { \$_.CommandLine -like ('*-n ' + '$1' + ' *') }); \$p | ForEach-Object { Stop-Process -Id \$_.ProcessId -Force -ErrorAction SilentlyContinue }; \$p.Count" \
+      </dev/null 2>/dev/null | tr -d '\r'
+  else
+    local n
+    n="$(ps -A -o args= 2>/dev/null | grep -cx "sleep $1")"
+    pkill -x -f "sleep $1" 2>/dev/null
+    echo "$n"
+  fi
+}
+ws_hang_stub "$WS/bin/signtool-hang" 591
+ws_hang_stub "$WS/bin/verify-hang" 592
+ws_hang_stub "$WS/bin/ps-hang" 594
+ws_hang_stub "$WS/bin/az-hang" 595
+it "win_sign kills a signtool that hangs -- and its children -- after OAM_WIN_SIGN_TIMEOUT, and says the service or TSA stalled"
+cp "$WS_PE" "$WS/stage/oam-hang.exe"
+WS_T0="$(date +%s)"
+WS_RC=0; WS_D="$(OAM_WIN_SIGN_TIMEOUT=2 WS_SIGNTOOL="$WS/bin/signtool-hang" ws_stubbed win_sign "$WS/stage/oam-hang.exe" 2>&1)" || WS_RC=$?
+WS_DT=$(( $(date +%s) - WS_T0 ))
+WS_O="$(ws_orphans 591)"
+if [ "$WS_RC" != "0" ] && grep -qF 'did not finish in 2s' <<<"$WS_D" && grep -qF 'TSA' <<<"$WS_D" && [ "$WS_O" = "0" ]; then pass
+else fail "rc=$WS_RC after ${WS_DT}s, $WS_O orphan(s): $WS_D"; fi
+
+it "win_verify kills a signtool verify that hangs, and its children"
+WS_T0="$(date +%s)"
+WS_RC=0; WS_D="$(OAM_WIN_SIGN_TIMEOUT=2 WS_SIGNTOOL="$WS/bin/verify-hang" ws_stubbed win_verify "$WS/stage/oam-hang.exe" 2>&1)" || WS_RC=$?
+WS_DT=$(( $(date +%s) - WS_T0 ))
+WS_O="$(ws_orphans 592)"
+if [ "$WS_RC" != "0" ] && grep -qF 'signtool verify /pa rejects' <<<"$WS_D" && grep -qF 'killed after 2s' <<<"$WS_D" && [ "$WS_O" = "0" ]; then pass
+else fail "rc=$WS_RC after ${WS_DT}s, $WS_O orphan(s): $WS_D"; fi
+
+it "win_verify kills a verify-authenticode.ps1 run that hangs, and its children"
+WS_T0="$(date +%s)"
+WS_RC=0; WS_D="$(OAM_WIN_SIGN_TIMEOUT=2 WS_PS="$WS/bin/ps-hang" ws_stubbed win_verify "$WS/stage/oam-hang.exe" 2>&1)" || WS_RC=$?
+WS_DT=$(( $(date +%s) - WS_T0 ))
+WS_O="$(ws_orphans 594)"
+if [ "$WS_RC" != "0" ] && grep -qF 'Authenticode verification failed' <<<"$WS_D" && grep -qF 'killed after 2s' <<<"$WS_D" && [ "$WS_O" = "0" ]; then pass
+else fail "rc=$WS_RC after ${WS_DT}s, $WS_O orphan(s): $WS_D"; fi
+
+it "win_sign_preflight kills an az that hangs, and its children, before signing anything"
+: >"$WS_LOG"
+WS_T0="$(date +%s)"
+WS_RC=0; WS_D="$(OAM_WIN_SIGN_TIMEOUT=2 WS_AZ="$WS/bin/az-hang" ws_stubbed win_sign_preflight 2>&1)" || WS_RC=$?
+WS_DT=$(( $(date +%s) - WS_T0 ))
+WS_O="$(ws_orphans 595)"
+if [ "$WS_RC" != "0" ] && grep -qF 'az account get-access-token did not finish in 2s' <<<"$WS_D" && [ ! -s "$WS_LOG" ] && [ "$WS_O" = "0" ]; then pass
+else fail "rc=$WS_RC after ${WS_DT}s, $WS_O orphan(s), log='$(cat "$WS_LOG")': $WS_D"; fi
+
+it "a malformed OAM_WIN_SIGN_TIMEOUT is fatal before signtool runs"
+: >"$WS_LOG"
+WS_RC=0; WS_D="$(OAM_WIN_SIGN_TIMEOUT=5m ws_stubbed win_sign "$WS/stage/oam-stub.exe" 2>&1)" || WS_RC=$?
+if [ "$WS_RC" != "0" ] && grep -qF 'OAM_WIN_SIGN_TIMEOUT must be a whole number of seconds from 1 to 3600' <<<"$WS_D" && [ ! -s "$WS_LOG" ]; then pass
+else fail "rc=$WS_RC log='$(cat "$WS_LOG")': $WS_D"; fi
+
+it "OAM_WIN_SIGN_TIMEOUT is capped: 0, 3601 and a 20-digit value are refused; 1 and 3600 are not"
+WS_D=""
+for t in 0 3601 99999999999999999999 1 3600; do
+  if OAM_WIN_SIGN_TIMEOUT="$t" wg _ws_timeout_ok 2>/dev/null; then WS_D="$WS_D $t:ok"; else WS_D="$WS_D $t:no"; fi
+done
+eq "$WS_D" " 0:no 3601:no 99999999999999999999:no 1:ok 3600:ok"
+
+# signtool /v echoes the dlib's metadata block, and the service's errors name
+# the account in URLs. None of it may reach the failure output.
+printf '{\n  "Endpoint": "https://zz-q7.codesigning.azure.net",\n  "CodeSigningAccountName": "AcctQ7zz",\n  "CertificateProfileName": "ProfQ7zz"\n}\n' >"$WS/metadata-real.json"
+{ echo '#!/bin/bash'
+  echo 'echo "Metadata:"'
+  echo "cat '$WS/metadata-real.json'"
+  echo 'echo "POST https://zz-q7.codesigning.azure.net/codesigningaccounts/acctq7zz/certificateprofiles/ProfQ7zz/sign: 403 Forbidden"'
+  echo 'echo "SignerSign() failed. (-2147024891/0x80070005)"'
+  echo 'exit 1'; } >"$WS/bin/signtool-leaky"
+chmod +x "$WS/bin/signtool-leaky"
+it "win_sign's failure output redacts every metadata.json value, and keeps the rest"
+WS_RC=0; WS_D="$(WS_SIGNTOOL="$WS/bin/signtool-leaky" WS_DLIB="$WS/dlib-ok/Azure.CodeSigning.Dlib.dll" WS_DOTNET_OK=stub \
+  OAM_WIN_SIGN_METADATA="$WS/metadata-real.json" OAM_WIN_SIGN_PUBLISHER="Example Publisher" wg win_sign "$WS/stage/oam-stub.exe" 2>&1)" || WS_RC=$?
+if [ "$WS_RC" != "0" ] && ! grep -qiE 'zz-q7|AcctQ7zz|ProfQ7zz' <<<"$WS_D" \
+   && grep -qF '"CodeSigningAccountName": "<redacted>"' <<<"$WS_D" && grep -qF 'SignerSign() failed' <<<"$WS_D" \
+   && grep -qF 'run '"'"'az login'"'" <<<"$WS_D"; then pass
+else fail "rc=$WS_RC: $WS_D"; fi
+
+it "_ws_redact: metadata values in any case, emails, GUIDs, tenants and the profile path all go"
+WS_D="$(printf '%s\n' \
+  'POST HTTPS://ZZ-Q7.CODESIGNING.AZURE.NET/CodeSigningAccounts/ACCTQ7ZZ/certificateProfiles/profq7zz/sign' \
+  'acct AcCtQ7Zz, profile PROFQ7ZZ' \
+  "User 'someone.x@example-corp.co.uk' does not exist in MSAL token cache. Run \`az login\`." \
+  'Trace ID: 0A1B2C3D-4E5F-6789-ABCD-EF0123456789 at contoso.onmicrosoft.com' \
+  "in tenant 'Some Tenant'" \
+  'C:\Users\Some Body\AppData\Local\Temp\x.exe and C:\Users\jdoe\y and C:/Users/jdoe/z and /c/Users/jdoe/w' \
+  | USERPROFILE='C:\Users\Some Body' wg _ws_redact "$WS/metadata-real.json")"
+if ! grep -qiE 'zz-q7|acctq7zz|profq7zz|someone|example-corp|0a1b2c3d|contoso|Some Tenant|Some Body|jdoe' <<<"$WS_D" \
+   && grep -qF 'Run `az login`' <<<"$WS_D" && [ "$(grep -o '<home>' <<<"$WS_D" | wc -l | tr -d ' ')" = "4" ] \
+   && grep -qF '<home>\AppData\Local\Temp\x.exe' <<<"$WS_D"; then pass
+else fail "$WS_D"; fi
+
+# The Windows section's own [fail] lines name paths too (a metadata.json typo,
+# a probe in TMPDIR), and a path under the user profile names the operator.
+it "the Windows status lines redact a path under the user profile"
+WS_D="$( { HOME=/c/Users/jdoe USERPROFILE='C:\Users\jdoe' OAM_WIN_SIGN_METADATA=/c/Users/jdoe/.oam-signing/typo.json wg _ws_metadata
+           HOME=/c/Users/jdoe USERPROFILE='C:\Users\jdoe' OAM_WIN_SIGN_PUBLISHER="Example Publisher" wg win_verify /c/Users/jdoe/nope.exe; } 2>&1)"
+if ! grep -qF 'jdoe' <<<"$WS_D" && grep -qF '<home>/.oam-signing/typo.json does not exist' <<<"$WS_D" \
+   && grep -qF 'win_verify: <home>/nope.exe does not exist' <<<"$WS_D"; then pass
+else fail "$WS_D"; fi
+
+# A real dlib failure is a .NET exception: ~30 lines, with the HTTP status near
+# the top and a stack trace after it. A bare tail showed only the stack.
+{ echo '#!/bin/bash'
+  echo 'echo "The following certificate was selected:"'
+  echo 'echo "Submitting digest for signing..."'
+  echo 'echo "Azure.RequestFailedException: Service request failed."'
+  echo 'echo "Status: 403 (Forbidden)"'
+  echo 'echo "Content:"'
+  echo 'echo "{\"errorDetail\":{\"code\":\"Forbidden\"}}"'
+  echo 'echo "Headers:"'
+  echo 'for i in $(seq 1 15); do echo "x-ms-header-$i: REDACTED"; done'
+  echo 'for i in $(seq 1 8); do echo "   at Azure.Core.Pipeline.Frame$i()"; done'
+  echo 'echo "SignTool Error: An unexpected internal error has occurred."'
+  echo 'echo "Error information: \"Error: SignerSign() failed.\" (-2146893775/0x80090031)"'
+  echo 'exit 1'; } >"$WS/bin/signtool-dotnet"
+chmod +x "$WS/bin/signtool-dotnet"
+it "win_sign's failure output leads with the lines that say why: the HTTP status survives a 32-line .NET failure"
+WS_RC=0; WS_D="$(WS_SIGNTOOL="$WS/bin/signtool-dotnet" ws_stubbed win_sign "$WS/stage/oam-stub.exe" 2>&1)" || WS_RC=$?
+if [ "$WS_RC" != "0" ] && grep -qF 'signtool: Status: 403 (Forbidden)' <<<"$WS_D" \
+   && grep -qF 'signtool: Azure.RequestFailedException: Service request failed.' <<<"$WS_D" \
+   && grep -qF 'SignerSign() failed' <<<"$WS_D" && grep -qF 'the last 12 of 32 lines' <<<"$WS_D"; then pass
+else fail "rc=$WS_RC: $WS_D"; fi
+
+# win_pe_signature_state reads the certificate table (data directory 4); the
+# fixture gets a non-empty one by patching the directory entry at
+# e_lfanew(0x40) + 24 + 112 + 4*8 = 232: offset 0x400, size 0x10.
+cp "$WS_PE" "$WS/has-cert-table.exe"
+printf '\x00\x04\x00\x00\x10\x00\x00\x00' | dd of="$WS/has-cert-table.exe" bs=1 seek=232 conv=notrunc 2>/dev/null
+it "win_pe_signature_state: an unsigned PE, a PE with a certificate table, and a non-PE"
+eq "$(wg win_pe_signature_state "$WS_PE") $(wg win_pe_signature_state "$WS/has-cert-table.exe") $(wg win_pe_signature_state scripts/lib/signing.sh)" \
+   "unsigned signed unknown"
+
+# NumberOfRvaAndSizes sits just before the directories, at 232 - 4*8 - 4 = 196.
+# Four or fewer means the file has no entry 4 at all: not provably unsigned.
+cp "$WS_PE" "$WS/few-dirs.exe"
+printf '\x04\x00\x00\x00' | dd of="$WS/few-dirs.exe" bs=1 seek=196 conv=notrunc 2>/dev/null
+it "win_pe_signature_state: a PE with too few data directories to hold a certificate table is unknown, not unsigned"
+eq "$(wg win_pe_signature_state "$WS/few-dirs.exe")" "unknown"
+
+# The pins one at a time, on fabricated signatures. The real fixture below is
+# timestamped, embedded, and has CN == O, so it can never take these
+# branches: without these cases, deleting the timestamp pin stays green.
+if [ "$WS_HAVE_PS" = "1" ]; then
+  printf '%s\n' 'param([string]$Ps1, [string]$Case)' \
+    '. $Ps1 -Path x -Publisher x -Intermediate x' \
+    "\$dn = 'CN=Example Publisher, O=Example Publisher'" \
+    "\$pub = 'Example Publisher'" \
+    "\$sig = @{ Status = 'Valid'; StatusMessage = 'ok'; SignatureType = 'Authenticode'; TimeStamperCertificate = 'ts' }" \
+    "switch (\$Case) {" \
+    "  'not-valid' { \$sig.Status = 'HashMismatch' }" \
+    "  'catalog' { \$sig.SignatureType = 'Catalog' }" \
+    "  'no-timestamp' { \$sig.TimeStamperCertificate = \$null }" \
+    "  'o-mismatch' { \$dn = 'CN=Example Publisher, O=Other Org' }" \
+    "  'prefix' { \$dn = 'CN=Yaw Labs LLC, O=Yaw Labs LLC'; \$pub = 'Yaw Labs' }" \
+    "  'o-case' { \$dn = 'CN=Example Publisher, O=example publisher' }" \
+    "  'cn-twice' { \$dn = 'CN=Example Publisher, CN=Example Publisher, O=Example Publisher' }" \
+    "  'o-twice' { \$dn = 'CN=Example Publisher, O=Example Publisher, O=Example Publisher' }" \
+    '}' \
+    '$name = New-Object System.Security.Cryptography.X509Certificates.X500DistinguishedName($dn)' \
+    '$sig.SignerCertificate = [pscustomobject]@{ SubjectName = $name; Subject = $name.Name }' \
+    "\$why = Test-SignaturePins ([pscustomobject]\$sig) 'fake.exe' \$pub 'Some PCA'" \
+    "if (\$null -eq \$why) { 'PASSED' } else { \"FAILED: \$why\" }" >"$WS/pins.ps1"
+  ws_pins(){
+    powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$WS/pins.ps1")" \
+      -Ps1 "$(cygpath -w scripts/lib/verify-authenticode.ps1)" -Case "$1" </dev/null 2>&1 | tr -d '\r'
+  }
+  it "the pins refuse a signature whose status is not Valid"
+  eq "$(ws_pins not-valid)" "FAILED: fake.exe signature status is 'HashMismatch', not Valid (ok)"
+  it "the pins refuse a catalog signature (nothing embedded in the file)"
+  eq "$(ws_pins catalog)" "FAILED: fake.exe is signed by 'Catalog', not an embedded Authenticode signature"
+  it "the pins refuse a signature with no timestamp"
+  eq "$(ws_pins no-timestamp)" "FAILED: fake.exe has no timestamp -- the signature would stop verifying when its certificate expires"
+  it "the pins refuse a signer whose CN matches but whose O does not"
+  eq "$(ws_pins o-mismatch)" "FAILED: fake.exe signer O is 'Other Org', expected 'Example Publisher' (subject: CN=Example Publisher, O=Other Org)"
+  it "the pins refuse a publisher that is only a prefix of the signer's name"
+  eq "$(ws_pins prefix)" "FAILED: fake.exe signer CN is 'Yaw Labs LLC', expected 'Yaw Labs' (subject: CN=Yaw Labs LLC, O=Yaw Labs LLC)"
+  it "the pins refuse an O that differs only in case"
+  eq "$(ws_pins o-case)" "FAILED: fake.exe signer O is 'example publisher', expected 'Example Publisher' (subject: CN=Example Publisher, O=example publisher)"
+  it "the pins refuse a subject that repeats the CN, or the O"
+  eq "$(ws_pins cn-twice)|$(ws_pins o-twice)" \
+    "FAILED: fake.exe signer CN is '', expected 'Example Publisher' (subject: CN=Example Publisher, CN=Example Publisher, O=Example Publisher)|FAILED: fake.exe signer O is '', expected 'Example Publisher' (subject: CN=Example Publisher, O=Example Publisher, O=Example Publisher)"
+else
+  it "verify-authenticode.ps1's pins on fabricated signatures"
+  skip "no powershell.exe/cygpath -- the Authenticode reader runs on Windows only"
+fi
+
+# verify-authenticode.ps1 against a REAL embedded signature: the box's x64
+# signtool.exe, Microsoft-signed. Its intermediate is read separately (by a
+# chain walk that is not the script under test) so the case follows whatever
+# CA Microsoft signs that SDK with.
+WS_MS="$( . scripts/lib/signing.sh; locate_signtool_x64 2>/dev/null && printf '%s' "$WIN_SIGNTOOL" )"
+WS_INTER_MS=""
+if [ "$WS_HAVE_PS" = "1" ] && [ -n "$WS_MS" ]; then
+  printf '%s\n' 'param([string]$p)' \
+    '$s = Get-AuthenticodeSignature -LiteralPath $p' \
+    '$c = New-Object System.Security.Cryptography.X509Certificates.X509Chain' \
+    "\$c.ChainPolicy.RevocationMode = 'NoCheck'" \
+    '[void]$c.Build($s.SignerCertificate)' \
+    "\$c.ChainElements[1].Certificate.GetNameInfo('SimpleName', \$false)" >"$WS/chain1.ps1"
+  WS_INTER_MS="$(powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w "$WS/chain1.ps1")" "$(cygpath -w "$WS_MS")" 2>/dev/null | tr -d '\r')"
+fi
+# ws_ps1 <file> <publisher> <intermediate> -- the script alone, as win_verify calls it.
+ws_ps1(){
+  powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$(cygpath -w scripts/lib/verify-authenticode.ps1)" \
+    -Path "$(cygpath -w "$1")" -Publisher "$2" -Intermediate "$3" </dev/null 2>&1 | tr -d '\r'
+  return "${PIPESTATUS[0]}"
+}
+if [ "$WS_HAVE_PS" = "1" ] && [ -n "$WS_MS" ] && [ -n "$WS_INTER_MS" ]; then
+  it "verify-authenticode.ps1 passes a real signature for its real publisher and intermediate"
+  WS_RC=0; WS_D="$(ws_ps1 "$WS_MS" "Microsoft Corporation" "$WS_INTER_MS")" || WS_RC=$?
+  if [ "$WS_RC" = "0" ]; then pass; else fail "rc=$WS_RC: $WS_D"; fi
+
+  it "verify-authenticode.ps1 fails the same signature for another publisher (exact, case-sensitive)"
+  WS_RC=0; WS_D="$(ws_ps1 "$WS_MS" "Example Publisher" "$WS_INTER_MS")" || WS_RC=$?
+  WS_RC2=0; WS_E="$(ws_ps1 "$WS_MS" "microsoft corporation" "$WS_INTER_MS")" || WS_RC2=$?
+  if [ "$WS_RC" != "0" ] && grep -qF "signer CN is 'Microsoft Corporation', expected 'Example Publisher'" <<<"$WS_D" \
+     && [ "$WS_RC2" != "0" ]; then pass
+  else fail "rc=$WS_RC/$WS_RC2: $WS_D / $WS_E"; fi
+
+  it "verify-authenticode.ps1 fails a valid signature that does not chain through the Artifact Signing intermediate"
+  WS_RC=0; WS_D="$(ws_ps1 "$WS_MS" "Microsoft Corporation" "Microsoft ID Verified Code Signing PCA 2021")" || WS_RC=$?
+  if [ "$WS_RC" != "0" ] && grep -qF "does not pass through 'Microsoft ID Verified Code Signing PCA 2021'" <<<"$WS_D"; then pass
+  else fail "rc=$WS_RC: $WS_D"; fi
+
+  # The leaf is chain element 0; only a CA above it may satisfy -Intermediate.
+  it "verify-authenticode.ps1 fails when -Intermediate names the signer itself"
+  WS_RC=0; WS_D="$(ws_ps1 "$WS_MS" "Microsoft Corporation" "Microsoft Corporation")" || WS_RC=$?
+  if [ "$WS_RC" != "0" ] && grep -qF "does not pass through 'Microsoft Corporation'" <<<"$WS_D"; then pass
+  else fail "rc=$WS_RC: $WS_D"; fi
+
+  it "win_pe_signature_state calls the real Microsoft-signed signtool.exe signed"
+  eq "$(wg win_pe_signature_state "$WS_MS")" "signed"
+
+  it "verify-authenticode.ps1 fails an unsigned file"
+  WS_RC=0; WS_D="$(ws_ps1 "$WS_PE" "Microsoft Corporation" "$WS_INTER_MS")" || WS_RC=$?
+  if [ "$WS_RC" != "0" ] && grep -qF "'NotSigned'" <<<"$WS_D"; then pass; else fail "rc=$WS_RC: $WS_D"; fi
+
+  # A path is an argument, never code: quotes, $ and spaces reach the cmdlet
+  # as data and the copy (signature and all) verifies like the original.
+  it "verify-authenticode.ps1 takes a hostile path as data"
+  WS_ODD="$WS/it's a \$(x) dir"
+  mkdir -p "$WS_ODD" && cp "$WS_MS" "$WS_ODD/sign tool;copy.exe"
+  WS_RC=0; WS_D="$(ws_ps1 "$WS_ODD/sign tool;copy.exe" "Microsoft Corporation" "$WS_INTER_MS")" || WS_RC=$?
+  if [ "$WS_RC" = "0" ]; then pass; else fail "rc=$WS_RC: $WS_D"; fi
+
+  it "win_verify end to end: real signtool verify /pa, then the pins, on the real signature"
+  WS_RC=0; WS_D="$(WS_SIGNTOOL="$WS_MS" WS_INTER="$WS_INTER_MS" OAM_WIN_SIGN_PUBLISHER="Microsoft Corporation" wg win_verify "$WS_ODD/sign tool;copy.exe" 2>&1)" || WS_RC=$?
+  WS_RC2=0; WS_E="$(WS_SIGNTOOL="$WS_MS" OAM_WIN_SIGN_PUBLISHER="Microsoft Corporation" wg win_verify "$WS_MS" 2>&1)" || WS_RC2=$?
+  if [ "$WS_RC" = "0" ] && [ "$WS_RC2" != "0" ] && grep -qF 'PCA 2021' <<<"$WS_E"; then pass
+  else fail "pinned rc=$WS_RC: $WS_D"$'\n'"       default-intermediate rc=$WS_RC2: $WS_E"; fi
+else
+  it "verify-authenticode.ps1 against a real Microsoft signature"
+  skip "needs powershell.exe, cygpath and an x64 signtool >= SDK 10.0.22621 (found: '${WS_MS:-none}', intermediate '${WS_INTER_MS:-?}')"
+fi
+
+it "verify-authenticode.ps1 is ASCII and takes its inputs as parameters"
+if LC_ALL=C grep -q '[^[:print:][:space:]]' scripts/lib/verify-authenticode.ps1; then fail "non-ASCII bytes"
+elif grep -qE '^param\(' scripts/lib/verify-authenticode.ps1 && ! grep -qE 'Invoke-Expression|iex[[:space:]]' scripts/lib/verify-authenticode.ps1; then pass
+else fail "no param() block, or an Invoke-Expression"; fi
+
+# =============================================================================
 group "release scripts -- signing wiring and order"
 # =============================================================================
 # Order is the property: a correct signing block that moved after the tag push
@@ -2719,10 +3307,56 @@ sg_order(){
   if [ "$bad" = "0" ]; then pass; else fail "out of order or missing in $file:"$'\n'"$got"; fi
 }
 
-it "release-local.sh: trap, then the agent and signing preflight, all before the dirty-tree check, the bump and the tag"
+it "release-local.sh: trap, then the agent and signing preflight, all before the second dirty-tree check, the bump and the tag"
 sg_order scripts/release-local.sh 'trap release_on_exit EXIT' 'release_agent_start || fail' \
-  'release_signing_preflight "$TAG" || fail' 'restore_gate_artifacts "preflight"' \
+  'release_signing_preflight "$TAG" || fail' 'assert_tree_clean "preflight, after the signing probes"' \
   'bumping Cargo.toml to' 'git tag -a "$TAG" -m "$TAG"'
+
+# The cheap half of the preflight first: a forgotten changelog-release.sh, a
+# dirty tree or a leftover draft must fail before the ssh probe of the build
+# Mac, the release key's passphrase prompt and the quota-counted Artifact
+# Signing probe -- or every retry repeats all three. Then, after those, the
+# re-reads the bump and the tag move rely on: the tree (the probes must leave
+# nothing), HEAD (the changelog verdict was for it), origin/main and the
+# release's absence.
+it "release-local.sh: the cheap preflight checks precede the mac, release-key and Windows signing probes"
+sg_order scripts/release-local.sh 'step "Preflight $TAG"' 'restore_gate_artifacts "preflight"' \
+  'preflight_head="$(git rev-parse HEAD)"' 'if [ -f CHANGELOG.md ]; then' \
+  'assert_release_unpublished "preflight"' 'command -v gcloud >/dev/null 2>&1 || fail' \
+  'build-platforms-tailnet.sh" --preflight-only' 'release_agent_start || fail' \
+  'win_sign_preflight || fail' 'assert_tree_clean "preflight, after the signing probes"' \
+  '[ "$(git rev-parse HEAD)" = "$preflight_head" ]' 'git fetch -q origin main 2>/dev/null || true' \
+  'assert_release_unpublished "before the bump"' 'bumping Cargo.toml to' 'git tag -a "$TAG" -m "$TAG"'
+
+# Signing is required by default: the docs promise signed assets, so a box
+# without the Windows setup must stop in preflight unless the operator opts
+# out with an explicit OAM_SIGN_REQUIRED=0. The default is exported (the libs
+# and build-platforms-tailnet.sh read the environment) and set before any
+# preflight probe reads it.
+it "release-local.sh: OAM_SIGN_REQUIRED defaults to 1, exported before the preflight"
+if [ "$(grep -cxF 'export OAM_SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-1}"' scripts/release-local.sh)" = "1" ]; then
+  sg_order scripts/release-local.sh 'export OAM_SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-1}"' 'step "Preflight $TAG"' \
+    'build-platforms-tailnet.sh" --preflight-only' 'win_sign_preflight || fail'
+else fail "release-local.sh no longer exports OAM_SIGN_REQUIRED with a default of 1"; fi
+
+it "the default makes an unconfigured Windows box fail, and an explicit 0 still downgrades it to a warning"
+SG_D1="$( ( unset OAM_WIN_SIGN_METADATA OAM_WIN_SIGN_PUBLISHER; export OAM_SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-1}"
+            . scripts/lib/signing.sh; win_sign_decision 0 ) )"
+SG_D0="$( ( unset OAM_WIN_SIGN_METADATA OAM_WIN_SIGN_PUBLISHER; export OAM_SIGN_REQUIRED=0
+            export OAM_SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-1}"; . scripts/lib/signing.sh; win_sign_decision 0 ) )"
+case "$SG_D1|$SG_D0" in fail:*"|skip:"*) pass ;; *) fail "default: $SG_D1 / explicit 0: $SG_D0" ;; esac
+
+# Because of that default, "unset OAM_SIGN_REQUIRED" is no way out: under
+# release-local.sh an unset knob is 1. Every refusal used to advise it.
+it "no operator advice says to unset OAM_SIGN_REQUIRED -- the way out is OAM_SIGN_REQUIRED=0"
+SG_UNSET="$(git -C "$REPO_DIR" grep -nE '(or|then|just) unset OAM_SIGN_REQUIRED|unset OAM_SIGN_REQUIRED (for|to)' -- . ':!scripts/test-scripts.sh' || true)"
+if [ -z "$SG_UNSET" ]; then pass; else fail "stale opt-out advice:"$'\n'"$SG_UNSET"; fi
+
+it "release-local.sh: the release-exists check is one function, and fails closed on anything but gh's exact 'release not found'"
+SG_H="$(awk '$0 == "assert_release_unpublished() {" { p = 1 } p { print } p && /^}$/ { exit }' scripts/release-local.sh)"
+if grep -qF "grep -qxF 'release not found'" <<<"$SG_H" && grep -qF '[ "$rc" -ne 1 ]' <<<"$SG_H" \
+   && [ "$(grep -v '^[[:space:]]*#' scripts/release-local.sh | grep -c 'gh release view "$TAG" --repo "$REPO" 2>&1')" = "1" ]; then pass
+else fail "assert_release_unpublished lost its fail-closed shape, or a second inline copy appeared:"$'\n'"$SG_H"; fi
 
 it "release-local.sh: SHA256SUMS, then write/sign/verify the manifest, then the dry-run exit and the upload"
 sg_order scripts/release-local.sh 'sha256sum oam-* > SHA256SUMS && cat SHA256SUMS' \
@@ -2799,6 +3433,224 @@ for s in scripts/release-local.sh scripts/release-upload-local-arm64.sh scripts/
   grep -qE '(^|[;&|[:space:]])eval[[:space:]]' <<<"$SG_CODE" && SG_BAD="$SG_BAD $s(eval)"
 done
 if [ -z "$SG_BAD" ]; then pass; else fail "violations:$SG_BAD"; fi
+
+it "release-local.sh: the Windows signing preflight follows the release key's, before the second dirty-tree check, the bump and the tag"
+sg_order scripts/release-local.sh 'release_signing_preflight "$TAG" || fail' \
+  'win_decision="$(win_sign_decision "$SKIP_WIN_SIGN")"' 'win_sign_preflight || fail' \
+  'assert_tree_clean "preflight, after the signing probes"' 'bumping Cargo.toml to' 'git tag -a "$TAG" -m "$TAG"'
+
+# Signing between cp and smoke is what makes every later gate (smoke's CRT
+# check, the conpty e2e, the sidecar matrix) run the bytes that ship; the
+# re-verify before SHA256SUMS is what makes the checksums and the manifest
+# cover signed bytes.
+it "release-local.sh: each Windows asset is signed between its cp and its smoke, and re-verified before SHA256SUMS"
+sg_order scripts/release-local.sh \
+  'cp target/release/oam.exe "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"' \
+  'sign_win_asset "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"' \
+  'smoke "$RELEASE_DIR/oam-aarch64-pc-windows-msvc.exe"' \
+  'cp target/x64-host/release/oam.exe "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"' \
+  'sign_win_asset "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"' \
+  'smoke "$RELEASE_DIR/oam-x86_64-pc-windows-msvc.exe"' \
+  'OAM_CONPTY_BIN="$(cygpath -w "$asset")"' \
+  'win_verify "$exe" || fail' 'sha256sum oam-* > SHA256SUMS && cat SHA256SUMS' \
+  'release_write_manifest "$RELEASE_DIR" "$TAG"'
+
+it "release-local.sh: sign_win_asset is a no-op unless preflight decided to sign, and signs before it verifies"
+SG_H="$(awk '$0 == "sign_win_asset() {" { p = 1 } p { print } p && /^}$/ { exit }' scripts/release-local.sh)"
+SG_A="$(grep -nF '[ "$WIN_SIGNING" = "1" ] || return 0' <<<"$SG_H" | cut -d: -f1)"
+SG_S="$(grep -nF 'win_sign "$1" || fail' <<<"$SG_H" | cut -d: -f1)"
+SG_V="$(grep -nF 'win_verify "$1" || fail' <<<"$SG_H" | cut -d: -f1)"
+if [ -n "$SG_A" ] && [ -n "$SG_S" ] && [ -n "$SG_V" ] && [ "$SG_A" -lt "$SG_S" ] && [ "$SG_S" -lt "$SG_V" ]; then pass
+else fail "sign_win_asset body out of shape:"$'\n'"$SG_H"; fi
+
+# The body RUN, with stand-ins: the line order above cannot see an early
+# `return 0` (or a guard that is never true) that skips signing altogether.
+printf '%s\n' "$SG_H" >"$WS/sign-win-asset.sh"
+ws_swa(){ # <WIN_SIGNING> <win_sign rc> <win_verify rc>
+  ( # shellcheck disable=SC2034  # read by the sourced function
+    WIN_SIGNING="$1"; WS_SRC="$2"; WS_VRC="$3"
+    win_sign(){ echo "SIGN ${1##*/}"; return "$WS_SRC"; }
+    win_verify(){ echo "VERIFY ${1##*/}"; return "$WS_VRC"; }
+    fail(){ echo "FAIL: $*"; exit 1; }
+    # shellcheck disable=SC1091
+    . "$WS/sign-win-asset.sh"
+    sign_win_asset "$WS/rel/oam-x86_64-pc-windows-msvc.exe"
+    echo "DONE" ) 2>&1
+}
+it "release-local.sh: sign_win_asset, run: signs then verifies when signing, does nothing when not, and stops on either failure"
+WS_A="$(ws_swa 1 0 0)"; WS_B="$(ws_swa 0 0 0)"; WS_C="$(ws_swa 1 1 0)"; WS_E="$(ws_swa 1 0 1)"
+if [ "$WS_A" = $'SIGN oam-x86_64-pc-windows-msvc.exe\nVERIFY oam-x86_64-pc-windows-msvc.exe\nDONE' ] && [ "$WS_B" = "DONE" ] \
+   && grep -qF 'FAIL: Authenticode signing failed for oam-x86_64-pc-windows-msvc.exe' <<<"$WS_C" && ! grep -qE '^(VERIFY|DONE)' <<<"$WS_C" \
+   && grep -qF 'does not verify after signing' <<<"$WS_E" && ! grep -q '^DONE$' <<<"$WS_E"; then pass
+else fail "signing: '$WS_A'"$'\n'"       off: '$WS_B'"$'\n'"       sign fails: '$WS_C'"$'\n'"       verify fails: '$WS_E'"; fi
+
+it "no script signs a build output under target/ in place"
+SG_BAD="$(grep -nE '(win_sign|sign_win_asset)[[:space:]].*target/' scripts/release-local.sh scripts/release-upload-local-arm64.sh | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#')"
+if [ -z "$SG_BAD" ]; then pass; else fail "signs under target/: $SG_BAD"; fi
+
+# The decision block itself, RUN, with the lib's real decision and stand-ins
+# for fail/warn and the (Azure-bound) preflight: required + unconfigured must
+# die here -- which the order assert above puts before any tag work -- and the
+# skip and bootstrap cases must warn and carry on unsigned.
+SG_BLK="$(awk '/^WIN_SIGNING=0$/ { f = 1 } f { print } f && /^esac$/ { exit }' scripts/release-local.sh)"
+printf '%s\n' "$SG_BLK" >"$WS/decision-block.sh"
+ws_block(){ # <SKIP_WIN_SIGN> <preflight rc>
+  ( # shellcheck source=lib/signing.sh
+    . scripts/lib/signing.sh
+    fail(){ echo "FAIL: $*"; exit 1; }
+    warn(){ echo "WARN: $*"; }
+    # shellcheck disable=SC2034  # read by the sourced block
+    SKIP_WIN_SIGN="$1"; WS_PF_RC="$2"
+    win_sign_preflight(){ echo "PREFLIGHT"; return "$WS_PF_RC"; }
+    # shellcheck disable=SC1091
+    . "$WS/decision-block.sh"
+    echo "WIN_SIGNING=$WIN_SIGNING" ) 2>&1
+}
+it "release-local.sh's Windows decision block: required + unconfigured fails; skip and bootstrap warn and go on unsigned"
+WS_A="$(OAM_SIGN_REQUIRED=1 ws_block 0 0)"; WS_RA=$?
+WS_B="$(ws_block 0 0)"
+WS_C="$(OAM_SIGN_REQUIRED=1 OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P ws_block 1 0)"
+if [ "$WS_RA" != "0" ] && grep -q '^FAIL: signing is required (OAM_SIGN_REQUIRED' <<<"$WS_A" && ! grep -q 'WIN_SIGNING=' <<<"$WS_A" \
+   && grep -q '^WARN: .*bootstrap' <<<"$WS_B" && grep -q '^WIN_SIGNING=0$' <<<"$WS_B" \
+   && grep -q '^WARN: OAM_SKIP_WIN_SIGN=1' <<<"$WS_C" && grep -q '^WIN_SIGNING=0$' <<<"$WS_C" \
+   && ! grep -q PREFLIGHT <<<"$WS_B$WS_C"; then pass
+else fail "required: rc=$WS_RA '$WS_A'"$'\n'"       bootstrap: '$WS_B'"$'\n'"       skip: '$WS_C'"; fi
+
+it "release-local.sh's Windows decision block: configured runs the preflight and signs; a failed preflight is fatal"
+WS_A="$(OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P ws_block 0 0)"
+WS_B="$(OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P ws_block 0 1)"; WS_RB=$?
+if grep -q '^PREFLIGHT$' <<<"$WS_A" && grep -q '^WIN_SIGNING=1$' <<<"$WS_A" \
+   && [ "$WS_RB" != "0" ] && grep -q '^FAIL: Windows signing preflight failed' <<<"$WS_B" && ! grep -q 'WIN_SIGNING=' <<<"$WS_B"; then pass
+else fail "configured: '$WS_A'"$'\n'"       preflight fails: rc=$WS_RB '$WS_B'"; fi
+
+it "arm64 upload: Windows preflight before the build; the staged copy signed and verified before SHA256SUMS is patched"
+sg_order scripts/release-upload-local-arm64.sh 'win_decision="$(win_sign_decision' 'win_sign_preflight ||' \
+  'cargo build --release -p oam_cli' 'cp target/release/oam.exe "${tmp}/${ASSET}"' \
+  'win_sign "${tmp}/${ASSET}"' 'win_verify "${tmp}/${ASSET}"' "if (f != a) print }'" \
+  'sha256sum "$ASSET" >> SHA256SUMS.new' 'gh release upload "$TAG"'
+
+# The WIN_SIGNING guards themselves, RUN: the order asserts above only prove
+# the lines exist, and a guard that can never be true (= "2") would keep
+# every one of them green while the assets ship unsigned.
+# ws_guard <file> <first line of the block> -- the top-level `if` block that
+# starts with that exact line, through its closing `fi`.
+ws_guard(){ awk -v s="$2" '$0 == s { f = 1 } f { print } f && /^fi$/ { exit }' "$1"; }
+# ...and there must be exactly ONE such block per file, or the case below runs
+# the first while a second, different one is what guards the checksums. In
+# release-local.sh it is the block right before SHA256SUMS is written.
+it "each script has exactly one top-level WIN_SIGNING guard; release-local.sh's sits right before sha256sum"
+SG_N="$(grep -cxF 'if [ "$WIN_SIGNING" = "1" ]; then' scripts/release-upload-local-arm64.sh) $(grep -cxF 'if [ "$WIN_SIGNING" = "1" ]; then' scripts/release-local.sh)"
+SG_NEXT="$(awk '$0 == "if [ \"$WIN_SIGNING\" = \"1\" ]; then" { f = 1 } f && /^fi$/ { getline; print; exit }' scripts/release-local.sh)"
+if [ "$SG_N" = "1 1" ] && grep -qF 'sha256sum oam-* > SHA256SUMS' <<<"$SG_NEXT"; then pass
+else fail "guard blocks (upload, local): $SG_N; line after release-local.sh's: $SG_NEXT"; fi
+ws_guard scripts/release-upload-local-arm64.sh 'if [ "$WIN_SIGNING" = "1" ]; then' >"$WS/upload-guard.sh"
+ws_guard scripts/release-local.sh 'if [ "$WIN_SIGNING" = "1" ]; then' >"$WS/local-guard.sh"
+ws_run_guard(){ # <block file> <WIN_SIGNING> <win_verify rc>
+  ( WIN_SIGNING="$2"; WS_VRC="$3"
+    # shellcheck disable=SC2034  # read by the sourced block
+    { tmp="$WS/up"; ASSET="oam-aarch64-pc-windows-msvc.exe"; RELEASE_DIR="$WS/rel"; }
+    win_sign(){ echo "SIGN ${1##*/}"; }
+    win_verify(){ echo "VERIFY ${1##*/}"; return "$WS_VRC"; }
+    fail(){ echo "FAIL: $*"; exit 1; }
+    # shellcheck disable=SC1090
+    . "$1"
+    echo "DONE" ) 2>&1
+}
+mkdir -p "$WS/rel" && : >"$WS/rel/oam-aarch64-pc-windows-msvc.exe" && : >"$WS/rel/oam-x86_64-pc-windows-msvc.exe"
+it "arm64 upload: WIN_SIGNING=1 signs then verifies the staged asset; 0 touches nothing; a failed verify stops the upload"
+WS_A="$(ws_run_guard "$WS/upload-guard.sh" 1 0)"
+WS_B="$(ws_run_guard "$WS/upload-guard.sh" 0 0)"
+WS_C="$(ws_run_guard "$WS/upload-guard.sh" 1 1)"
+if [ "$WS_A" = $'SIGN oam-aarch64-pc-windows-msvc.exe\nVERIFY oam-aarch64-pc-windows-msvc.exe\nDONE' ] \
+   && [ "$WS_B" = "DONE" ] && grep -qF 'does not verify after signing' <<<"$WS_C" && ! grep -q '^DONE$' <<<"$WS_C"; then pass
+else fail "signing: '$WS_A'"$'\n'"       off: '$WS_B'"$'\n'"       verify fails: '$WS_C'"; fi
+
+it "release-local.sh: WIN_SIGNING=1 re-verifies every staged .exe before SHA256SUMS; 0 skips; a failure is fatal"
+WS_A="$(ws_run_guard "$WS/local-guard.sh" 1 0)"
+WS_B="$(ws_run_guard "$WS/local-guard.sh" 0 0)"
+WS_C="$(ws_run_guard "$WS/local-guard.sh" 1 1)"
+if [ "$WS_A" = $'VERIFY oam-aarch64-pc-windows-msvc.exe\nVERIFY oam-x86_64-pc-windows-msvc.exe\nDONE' ] \
+   && [ "$WS_B" = "DONE" ] && grep -qF 'FAIL: oam-aarch64-pc-windows-msvc.exe no longer verifies' <<<"$WS_C" && ! grep -q '^DONE$' <<<"$WS_C"; then pass
+else fail "signing: '$WS_A'"$'\n'"       off: '$WS_B'"$'\n'"       verify fails: '$WS_C'"; fi
+
+# The upload script's decision block, RUN, through its check of the asset it
+# is about to replace: a run that will not sign must not clobber a signed
+# asset unless OAM_SKIP_WIN_SIGN=1 says so. gh is a stand-in that serves a
+# fixture (or fails); the PE reading is the lib's own.
+awk '/^guard_signed_asset\(\) \{$/ { f = 1 } f { print } f && $0 == "guard_signed_asset \"nothing was built or uploaded\"" { exit }' \
+  scripts/release-upload-local-arm64.sh >"$WS/upload-decision.sh"
+# ws_upload_block <prior asset fixture, or "" for a failed download> <published
+# asset list> [the fixture the asset has become by the re-check before upload]
+ws_upload_block(){
+  ( # shellcheck source=lib/signing.sh
+    . scripts/lib/signing.sh
+    WS_PRIOR="$1"; WS_ASSETS="$2"
+    # shellcheck disable=SC2034  # read by the sourced block
+    { TAG=v9.9.9; REPO=example/example; ASSET="oam-aarch64-pc-windows-msvc.exe"; }
+    win_sign_preflight(){ echo "PREFLIGHT"; }
+    gh(){
+      local dir="" a prev=""
+      echo "GH $1 $2" >&2
+      if [ "$2" = "view" ]; then printf '%s\n' "$WS_ASSETS"; return 0; fi
+      for a in "$@"; do if [ "$prev" = "--dir" ]; then dir="$a"; fi; prev="$a"; done
+      [ -n "$WS_PRIOR" ] || return 1
+      cp "$WS_PRIOR" "$dir/$ASSET"
+    }
+    TMPDIR="$WS/dtmp"
+    # shellcheck disable=SC1091
+    . "$WS/upload-decision.sh"
+    echo "WIN_SIGNING=$WIN_SIGNING"
+    if [ -n "${3:-}" ]; then
+      WS_PRIOR="$3"
+      guard_signed_asset "nothing was uploaded"
+      echo "UPLOAD"
+    fi ) 2>&1
+}
+mkdir -p "$WS/dtmp"
+WS_LIST=$'SHA256SUMS\noam-aarch64-pc-windows-msvc.exe'
+it "arm64 upload, not signing: a signed published asset stops the run before the build"
+WS_A="$(ws_upload_block "$WS/has-cert-table.exe" "$WS_LIST")"; WS_RA=$?
+if [ "$WS_RA" != "0" ] && grep -qF 'is Authenticode-signed' <<<"$WS_A" && grep -qF 'nothing was built or uploaded' <<<"$WS_A" \
+   && ! grep -q 'WIN_SIGNING=' <<<"$WS_A" && [ -z "$(ls -A "$WS/dtmp")" ]; then pass
+else fail "rc=$WS_RA left='$(ls -A "$WS/dtmp")': $WS_A"; fi
+
+it "arm64 upload, not signing: an asset that cannot be downloaded counts as signed"
+WS_A="$(ws_upload_block "" "$WS_LIST")"; WS_RA=$?
+if [ "$WS_RA" != "0" ] && grep -qF 'could not be read: unknown' <<<"$WS_A"; then pass; else fail "rc=$WS_RA: $WS_A"; fi
+
+it "arm64 upload, not signing: an unsigned published asset (or none) is replaced, with the bootstrap warning"
+WS_A="$(ws_upload_block "$WS_PE" "$WS_LIST")"; WS_RA=$?
+WS_B="$(ws_upload_block "" "SHA256SUMS")"; WS_RB=$?
+if [ "$WS_RA" = "0" ] && grep -q '^WIN_SIGNING=0$' <<<"$WS_A" && grep -qF 'bootstrap' <<<"$WS_A" \
+   && [ "$WS_RB" = "0" ] && grep -q '^WIN_SIGNING=0$' <<<"$WS_B" && ! grep -q '^GH release download' <<<"$WS_B"; then pass
+else fail "unsigned prior: rc=$WS_RA '$WS_A'"$'\n'"       no prior: rc=$WS_RB '$WS_B'"; fi
+
+it "arm64 upload: OAM_SKIP_WIN_SIGN=1 may replace a signed asset, saying so; a signing run never looks"
+WS_A="$(OAM_SKIP_WIN_SIGN=1 ws_upload_block "$WS/has-cert-table.exe" "$WS_LIST")"; WS_RA=$?
+WS_B="$(OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P ws_upload_block "$WS/has-cert-table.exe" "$WS_LIST")"; WS_RB=$?
+if [ "$WS_RA" = "0" ] && grep -qF 'OAM_SKIP_WIN_SIGN=1 replaces it with an UNSIGNED build' <<<"$WS_A" && grep -q '^WIN_SIGNING=0$' <<<"$WS_A" \
+   && [ "$WS_RB" = "0" ] && grep -q '^PREFLIGHT$' <<<"$WS_B" && grep -q '^WIN_SIGNING=1$' <<<"$WS_B" && ! grep -q '^GH ' <<<"$WS_B"; then pass
+else fail "skip: rc=$WS_RA '$WS_A'"$'\n'"       signing: rc=$WS_RB '$WS_B'"; fi
+
+it "arm64 upload, not signing: an asset that became signed during the build stops the upload"
+WS_A="$(ws_upload_block "$WS_PE" "$WS_LIST" "$WS/has-cert-table.exe")"; WS_RA=$?
+WS_B="$(ws_upload_block "$WS_PE" "$WS_LIST" "$WS_PE")"; WS_RB=$?
+if [ "$WS_RA" != "0" ] && grep -q '^WIN_SIGNING=0$' <<<"$WS_A" && grep -qF 'is Authenticode-signed' <<<"$WS_A" \
+   && grep -qF '; nothing was uploaded' <<<"$WS_A" && ! grep -q '^UPLOAD$' <<<"$WS_A" \
+   && [ "$WS_RB" = "0" ] && grep -q '^UPLOAD$' <<<"$WS_B" && [ -z "$(ls -A "$WS/dtmp")" ]; then pass
+else fail "became signed: rc=$WS_RA '$WS_A'"$'\n'"       still unsigned: rc=$WS_RB '$WS_B'"; fi
+
+it "arm64 upload: the signed-asset check runs after the decision, before the build, and again right before the upload"
+sg_order scripts/release-upload-local-arm64.sh 'win_decision="$(win_sign_decision' \
+  'guard_signed_asset "nothing was built or uploaded"' 'cargo build --release -p oam_cli' \
+  'release_verify_manifest "$tmp" "$TAG" || { echo "error: the re-signed' \
+  'guard_signed_asset "nothing was uploaded"' 'gh release upload "$TAG" --repo "$REPO" "${upload[@]}" --clobber'
+
+it "arm64 upload: the EXIT trap removes the signature check's scratch dir"
+SG_H="$(awk '$0 == "cleanup() {" { p = 1 } p { print } p && /^}$/ { exit }' scripts/release-upload-local-arm64.sh)"
+if grep -qF 'if [ -n "$prior_dir" ]; then rm -rf "$prior_dir"; fi' <<<"$SG_H" \
+   && grep -qxF 'prior_dir=""' scripts/release-upload-local-arm64.sh; then pass
+else fail "cleanup():"$'\n'"$SG_H"; fi
 
 # =============================================================================
 group "install.sh / install.ps1 -- the embedded trust root"
@@ -2903,7 +3755,8 @@ au_git(){ git -C "$AU/work" -c user.name=t -c user.email=t@example.invalid -c co
   au_git tag v0.5.0    # before every range and not pinned: patchable unsigned
   sed 's#^REPO="YawLabs/oam"$#REPO="example-invalid/fixture"#' scripts/release-upload-local-arm64.sh \
     >"$AU/work/scripts/release-upload-local-arm64.sh"
-  cp scripts/lib/build-locks.sh scripts/lib/signing.sh "$AU/work/scripts/lib/"
+  # signing.sh sources iap-helpers.sh (kill_proc_tree).
+  cp scripts/lib/build-locks.sh scripts/lib/signing.sh scripts/lib/iap-helpers.sh "$AU/work/scripts/lib/"
   cp release-keys/allowed_signers release-keys/ranges release-keys/presigning-sums "$AU/work/release-keys/"
   printf 'target/\n' >"$AU/work/.gitignore"
   au_git add . && au_git commit -qm main
@@ -3451,6 +4304,799 @@ if [ -n "${IN_SRV_PID:-}" ]; then
   kill "$IN_SRV_PID" 2>/dev/null
   wait "$IN_SRV_PID" 2>/dev/null
 fi
+
+# =============================================================================
+group "mac-signing.sh -- the mac leg's signing decision, gate and hand-back"
+# =============================================================================
+# The mac release leg signs both binaries (hardened runtime + three
+# entitlements), verifies the signature and runs a JIT smoke against the signed
+# bytes, all between each binary's cp into dist/ and its smoke; the release box
+# then checks the pulled bytes against the Air's own hashes.
+#
+# This box is Windows: there is no real codesign, security or Mac keychain
+# here. So the lib's functions run against STUBS on PATH that log their argv
+# and answer from fixture files with the shapes codesign prints on macOS
+# (`-dv`'s Identifier/CodeDirectory/Signature/Authority lines, `-d -r-`'s
+# designated requirement, `-d --entitlements - --xml`'s plist). What a real
+# codesign does with these arguments is proven on the Air by the leg itself --
+# its verify gate and JIT smoke fail the release, not this suite.
+MS="$SUITE_TMP/macsign"
+mkdir -p "$MS/bin" "$MS/kc"
+MS_LOG="$MS/log"
+MS_ENTS="$REPO_DIR/scripts/macos/oam.entitlements.plist"
+# Two stand-in leaf certificates (DER bytes, as `codesign -d
+# --extract-certificates` writes them) and the pins they hash to: the verify
+# gate compares the extracted leaf's SHA-1 with the pin.
+printf 'leaf certificate A' > "$MS/leaf-a"
+printf 'leaf certificate B' > "$MS/leaf-b"
+MS_PIN_A="$(sha1sum "$MS/leaf-a" | cut -c1-40)"
+MS_PIN_B="$(sha1sum "$MS/leaf-b" | cut -c1-40)"
+: > "$MS/kc/oam-codesign.keychain-db"
+printf 'kcpw' > "$MS/kc/pw"
+echo "probe source" > "$MS/true-src"
+echo "binary" > "$MS/oam-bin"
+
+# MS_LOG joins argv with spaces, which hides argv boundaries; MS_ARGV keeps
+# them: one line per codesign call, each element as <element>. An unquoted
+# expansion that word-split the -r= requirement would show there as many
+# elements.
+MS_ARGV="$MS/argv"
+cat > "$MS/bin/codesign" <<EOF
+#!/bin/bash
+echo "codesign \$*" >> "$MS_LOG"
+{ printf '<%s>' "\$@"; echo; } >> "$MS_ARGV"
+case " \$* " in
+  *" --force "*)
+    if [ -f "$MS/cs-sign-fail" ]; then cat "$MS/cs-sign-fail" >&2; exit 1; fi
+    exit 0 ;;
+  *" --verify "*)
+    if [ -f "$MS/cs-verify-fail" ]; then echo "$MS/oam-bin: invalid signature (code or signature have been modified)" >&2; exit 1; fi
+    exit 0 ;;
+  *" --entitlements - --xml "*) cat "$MS/cs-ents" ;;
+  *" -r- "*) echo "Executable=/x/oam" >&2; cat "$MS/cs-dr" ;;
+  *" -dv "*|*" -dvv "*) cat "$MS/cs-dv" >&2 ;;
+  *" --extract-certificates="*)
+    if [ -f "$MS/cs-extract-fail" ]; then cat "$MS/cs-extract-fail" >&2; exit 1; fi
+    # An interrupt mid-extraction: TERM the shell that ran us.
+    if [ -f "$MS/cs-extract-term" ]; then kill -TERM "\$PPID"; exit 0; fi
+    # The leaf as <prefix>0 -- none for an ad-hoc signature (no cs-leaf).
+    for a in "\$@"; do
+      case "\$a" in --extract-certificates=*) [ ! -f "$MS/cs-leaf" ] || cp "$MS/cs-leaf" "\${a#*=}0" ;; esac
+    done ;;
+esac
+exit 0
+EOF
+cat > "$MS/bin/security" <<EOF
+#!/bin/bash
+echo "security \$*" >> "$MS_LOG"
+[ -f "$MS/sec-fail" ] && exit 51
+exit 0
+EOF
+# The provision script, as the lib sees it: `bash <it> --check`.
+cat > "$MS/provision" <<EOF
+#!/bin/bash
+echo "provision \$*" >> "$MS_LOG"
+cat "$MS/prov-out"
+exit "\$(cat "$MS/prov-rc")"
+EOF
+chmod +x "$MS/bin/codesign" "$MS/bin/security" "$MS/provision"
+
+# ms_pin <line>...  -- the fixture pin file, comments and all.
+ms_pin(){ { echo '# a comment that names deadbeef is not a pin'; printf '%s\n' "$@"; } > "$MS/pin"; }
+# ms_dv <identifier> <flags> <signature-or-authority-lines>...  -- `codesign -dv`.
+ms_dv(){
+  local id="$1" flags="$2"; shift 2
+  { echo "Executable=/x/oam"; echo "Identifier=$id"; echo "Format=Mach-O thin (arm64)"
+    echo "CodeDirectory v=20500 size=1234 flags=$flags hashes=30+7 location=embedded"
+    printf '%s\n' "$@"; echo "TeamIdentifier=not set"; } > "$MS/cs-dv"
+}
+# A codesign-shaped entitlements dump: one line, no comment, as --xml prints.
+ms_ents(){
+  { printf '<?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict>'
+    local k; for k in "$@"; do printf '<key>%s</key><true/>' "$k"; done
+    printf '</dict></plist>'; } > "$MS/cs-ents"
+}
+MS_K1=com.apple.security.cs.allow-jit
+MS_K2=com.apple.security.cs.allow-unsigned-executable-memory
+MS_K3=com.apple.security.cs.disable-library-validation
+ms_good_adhoc(){
+  ms_dv org.oamjs.oam '0x10002(adhoc,runtime)' 'Signature=adhoc'
+  ms_ents "$MS_K1" "$MS_K2" "$MS_K3"
+  echo '# designated => cdhash H"8d3c3e0b1f0a4f0e9b9e1b6b0e0c8f5a2b7c1d00"' > "$MS/cs-dr"
+  rm -f "$MS/cs-leaf"
+}
+ms_good_selfsigned(){  # ms_good_selfsigned <pin as the requirement prints it> -- leaf A signed
+  ms_dv org.oamjs.oam '0x10000(runtime)' 'Signature size=1234' 'Authority=oam Code Signing (self-signed)' 'Signed Time=Oct 2, 2026 at 10:00:00 AM'
+  ms_ents "$MS_K1" "$MS_K2" "$MS_K3"
+  echo "designated => identifier \"org.oamjs.oam\" and certificate leaf = H\"$1\"" > "$MS/cs-dr"
+  cp "$MS/leaf-a" "$MS/cs-leaf"
+}
+ms_good_devid(){  # a timestamped Developer ID signature by leaf A
+  ms_dv org.oamjs.oam '0x10000(runtime)' 'Authority=Developer ID Application: Example LLC (ABCDE12345)' 'Authority=Developer ID Certification Authority' 'Timestamp=Oct 2, 2026 at 10:00:00 AM'
+  ms_ents "$MS_K1" "$MS_K2" "$MS_K3"
+  echo 'designated => identifier "org.oamjs.oam" and anchor apple generic and certificate leaf[subject.OU] = ABCDE12345' > "$MS/cs-dr"
+  cp "$MS/leaf-a" "$MS/cs-leaf"
+}
+ms_reset(){
+  rm -f "$MS/cs-sign-fail" "$MS/cs-verify-fail" "$MS/sec-fail" "$MS/cs-extract-fail" "$MS/cs-extract-term"
+  : > "$MS_LOG"; : > "$MS_ARGV"
+  printf 'keychain=%s\nsha1=%s\n' "$MS/kc/oam-codesign.keychain-db" "$MS_PIN_A" > "$MS/prov-out"
+  echo 0 > "$MS/prov-rc"
+  ms_pin
+  ms_good_adhoc
+}
+# ms <cmd> [args...]  -- a fresh shell with the stubs first on PATH, the lib
+# sourced against the fixtures, then <cmd>. stdout to MS_OUT, stderr to
+# MS_ERR, status to MS_RC. A subshell, so no lib state leaks between tests.
+ms(){
+  # The redirect sits INSIDE the substitution: on a bare assignment it would
+  # not reach the substitution's stderr.
+  MS_OUT="$( {
+    PATH="$MS/bin:$PATH"
+    MAC_SIGNING_PIN_FILE="$MS/pin" MAC_PROVISION_SCRIPT="$MS/provision"
+    MAC_ENTITLEMENTS="$MS_ENTS" MAC_PROBE_SOURCE="$MS/true-src" MAC_SIGN_PW_FILE="$MS/kc/pw"
+    # shellcheck source=lib/mac-signing.sh
+    . scripts/lib/mac-signing.sh
+    "$@"
+  } 2>"$MS/err" )"
+  MS_RC=$?
+  MS_ERR="$(cat "$MS/err")"
+}
+# Setup, then the step under test, in the same shell (MAC_SIGN_MODE is state).
+ms_then(){ mac_signing_setup 2>/dev/null || return 90; : > "$MS_LOG"; : > "$MS_ARGV"; "$@"; }
+
+ms_reset
+
+# The suite-top scrub, proven against the exact leak it exists for: a release
+# re-run with OAM_SKIP_MAC_SIGN=1 (and friends) exported runs this suite as its
+# local gate. The first line is the control -- unscrubbed, the knob really does
+# turn both verdicts into skip, so a scrub that stopped working cannot pass.
+it "an operator's exported OAM_SKIP_MAC_SIGN=1 cannot reach the bootstrap or pin verdicts once scrubbed"
+MS_GOT="$(
+  export OAM_SKIP_MAC_SIGN=1 OAM_SKIP_MAC_X64=1 OAM_SIGN_REQUIRED=0 OAM_SIGNING_DIR="$MS/nowhere"
+  ms_pin; ms mac_sign_decision; echo "leaked=${MS_OUT%%:*}"
+  scrub_operator_knobs
+  ms_pin; ms mac_sign_decision; echo "bootstrap=${MS_OUT%%:*}"
+  ms_pin "$MS_PIN_A"; ms mac_sign_decision; echo "pin=$MS_OUT"
+)"
+eq "$MS_GOT" "leaked=skip"$'\n'"bootstrap=adhoc"$'\n'"pin=identity:$MS_PIN_A"
+ms_reset
+
+it "every signing, skip and mac-host knob a release script reads is scrubbed at the suite's top"
+MS_MISS=""
+for f in scripts/release-local.sh scripts/release-upload-local-arm64.sh scripts/build-platforms-tailnet.sh \
+         scripts/build-remote.sh scripts/provision-mac-signing.sh scripts/lib/signing.sh scripts/lib/mac-signing.sh \
+         install/install.sh; do
+  for k in $(sed 's/#.*//' "$f" | grep -oE '[$][{]?OAM_[A-Z0-9_]+' | tr -d '${' | sort -u); do
+    case "$k" in *SIGN*|*SKIP*|OAM_MAC_*) ;; *) continue ;; esac
+    case " $(echo $OPERATOR_KNOBS) " in *" $k "*) ;; *) MS_MISS="$MS_MISS $f:$k" ;; esac
+  done
+done
+MS_SET=""
+for k in $OPERATOR_KNOBS; do [ -z "${!k+x}" ] || MS_SET="$MS_SET $k"; done
+if [ -z "$MS_MISS$MS_SET" ]; then pass
+else fail "not in OPERATOR_KNOBS:${MS_MISS:- none}; still set here:${MS_SET:- none}"; fi
+
+it "bootstrap: a pin file holding only comments signs ad-hoc, with a warning"
+ms mac_sign_decision
+case "$MS_OUT" in adhoc:*"holds no SHA-1 yet"*) pass ;; *) fail "decision: $MS_OUT" ;; esac
+
+it "bootstrap under OAM_SIGN_REQUIRED=1 is fatal, and the way out is an explicit 0"
+OAM_SIGN_REQUIRED=1 ms mac_sign_decision
+case "$MS_OUT" in fail:"OAM_SIGN_REQUIRED=1 but "*"set OAM_SIGN_REQUIRED=0"*) pass ;; *) fail "decision: $MS_OUT" ;; esac
+
+it "a committed pin makes that identity mandatory, required or not"
+ms_pin "$MS_PIN_A"
+MS_GOT="$(ms mac_sign_decision; echo "$MS_OUT")|$(OAM_SIGN_REQUIRED=1 ms mac_sign_decision; echo "$MS_OUT")"
+eq "$MS_GOT" "identity:$MS_PIN_A|identity:$MS_PIN_A"
+
+it "a pin is read case- and separator-insensitively"
+ms_pin "$(sed 's/../&:/g; s/:$//' <<<"$MS_PIN_A" | tr 'a-f' 'A-F')"
+ms mac_sign_decision
+eq "$MS_OUT" "identity:$MS_PIN_A"
+
+it "a truncated, doubled or non-hex pin is fatal, never read as no pin"
+MS_BAD=""
+for p in "${MS_PIN_A%?}" "$MS_PIN_A $MS_PIN_B" "${MS_PIN_A%?}g"; do
+  ms_pin "$p"; ms mac_sign_decision
+  case "$MS_OUT" in fail:*) ;; *) MS_BAD="$MS_BAD [$p -> $MS_OUT]" ;; esac
+done
+rm -f "$MS/pin"; ms mac_sign_decision
+case "$MS_OUT" in fail:*"no pin file"*) ;; *) MS_BAD="$MS_BAD [missing file -> $MS_OUT]" ;; esac
+if [ -z "$MS_BAD" ]; then pass; else fail "accepted:$MS_BAD"; fi
+
+it "OAM_SKIP_MAC_SIGN=1 is honored even under OAM_SIGN_REQUIRED=1, and says so"
+ms_pin "$MS_PIN_A"
+OAM_SKIP_MAC_SIGN=1 OAM_SIGN_REQUIRED=1 ms mac_sign_decision
+case "$MS_OUT" in skip:*"even though OAM_SIGN_REQUIRED=1"*) pass ;; *) fail "decision: $MS_OUT" ;; esac
+
+it "a knob that is not 0 or 1 is fatal"
+MS_GOT="$(OAM_SIGN_REQUIRED=yes ms mac_sign_decision; echo "$MS_OUT")|$(OAM_SKIP_MAC_SIGN=true ms mac_sign_decision; echo "$MS_OUT")"
+case "$MS_GOT" in "fail:OAM_SIGN_REQUIRED must be 0 or 1, not yes|fail:OAM_SKIP_MAC_SIGN must be 0 or 1, not true") pass ;; *) fail "got: $MS_GOT" ;; esac
+
+it "the committed pin file parses (empty while bootstrapping, or one SHA-1)"
+MS_COMMITTED="$( MAC_SIGNING_PIN_FILE=scripts/mac-signing-identity.sha1; . scripts/lib/mac-signing.sh; mac_sign_decision )"
+case "$MS_COMMITTED" in adhoc:*|identity:*) pass ;; *) fail "scripts/mac-signing-identity.sha1 -> $MS_COMMITTED" ;; esac
+
+# --- setup: the pinned identity, proven before the build -----------------------
+ms_reset; ms_pin "$MS_PIN_A"
+echo 1 > "$MS/prov-rc"; : > "$MS/prov-out"
+ms mac_signing_setup
+it "a pinned identity whose --check fails is fatal, with the keychain remediation"
+if [ "$MS_RC" != "0" ] && grep -qF "the pinned signing identity $MS_PIN_A is not usable" <<<"$MS_ERR" \
+   && grep -qF 'set-key-partition-list' <<<"$MS_ERR" && grep -qF 'OAM_SKIP_MAC_SIGN=1' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC stderr: $MS_ERR"; fi
+
+ms_reset; ms_pin "$MS_PIN_A"
+printf 'keychain=%s\nsha1=%s\n' "$MS/kc/oam-codesign.keychain-db" "$MS_PIN_B" > "$MS/prov-out"
+ms mac_signing_setup
+it "a host whose certificate is not the pinned one is fatal"
+if [ "$MS_RC" != "0" ] && grep -qF "this host's signing certificate is $MS_PIN_B but the repo pins $MS_PIN_A" <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC stderr: $MS_ERR"; fi
+
+ms_reset; ms_pin "$MS_PIN_A"
+echo 'oam-bin: errSecInternalComponent' > "$MS/cs-sign-fail"
+ms mac_signing_setup
+it "a pinned identity the probe signature cannot use is fatal (errSecInternalComponent -> remediation)"
+if [ "$MS_RC" != "0" ] && grep -qF "the pinned identity $MS_PIN_A cannot sign from this session" <<<"$MS_ERR" \
+   && grep -qF 'errSecInternalComponent' <<<"$MS_ERR" && grep -qF 'dedicated build keychain' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC stderr: $MS_ERR"; fi
+
+# --- signing --------------------------------------------------------------------
+ms_reset
+ms ms_then mac_sign_binary "$MS/oam-bin"
+it "ad-hoc (bootstrap) signs with the hardened runtime, the entitlements and the identifier, and warns"
+if [ "$MS_RC" = "0" ] \
+   && grep -qxF "codesign --force --sign - --options runtime --timestamp=none --identifier org.oamjs.oam --entitlements $MS_ENTS $MS/oam-bin" "$MS_LOG" \
+   && ! grep -q '^security' "$MS_LOG" && grep -qF 'signed AD-HOC' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC log: $(cat "$MS_LOG") stderr: $MS_ERR"; fi
+
+ms_reset; ms_pin "$MS_PIN_A"
+ms ms_then mac_sign_binary "$MS/oam-bin"
+# The real signature states the leaf-form designated requirement (-r=): left to
+# derive one, codesign can pick `certificate root = H"..."` for a self-signed
+# certificate, which the verify gate would then reject.
+it "the pinned identity: unlock, a fresh probe, then the real signature, with --keychain, no timestamp and an explicit leaf requirement"
+MS_U="$(grep -n '^security unlock-keychain -p kcpw ' "$MS_LOG" | head -1 | cut -d: -f1)"
+MS_P="$(grep -nF "codesign --force --sign $MS_PIN_A --keychain $MS/kc/oam-codesign.keychain-db --options runtime --timestamp=none " "$MS_LOG" | grep '/probe$' | head -1 | cut -d: -f1)"
+MS_S="$(grep -nxF "codesign --force --sign $MS_PIN_A --keychain $MS/kc/oam-codesign.keychain-db --options runtime --timestamp=none --identifier org.oamjs.oam -r=designated => identifier \"org.oamjs.oam\" and certificate leaf = H\"$MS_PIN_A\" --entitlements $MS_ENTS $MS/oam-bin" "$MS_LOG" | head -1 | cut -d: -f1)"
+if [ "$MS_RC" = "0" ] && [ -n "$MS_U" ] && [ -n "$MS_P" ] && [ -n "$MS_S" ] && [ "$MS_U" -lt "$MS_P" ] && [ "$MS_P" -lt "$MS_S" ]; then pass
+else fail "rc=$MS_RC unlock@${MS_U:-none} probe@${MS_P:-none} sign@${MS_S:-none} log: $(cat "$MS_LOG") stderr: $MS_ERR"; fi
+
+# The joined log above cannot tell `-r=designated => ...` passed as one
+# argument from the same words passed as ten. codesign needs ONE.
+it "the pinned identity's -r= requirement reaches codesign as exactly one argv element"
+MS_WANT_ARGV="<--force><--sign><$MS_PIN_A><--keychain><$MS/kc/oam-codesign.keychain-db><--options><runtime><--timestamp=none><--identifier><org.oamjs.oam><-r=designated => identifier \"org.oamjs.oam\" and certificate leaf = H\"$MS_PIN_A\"><--entitlements><$MS_ENTS><$MS/oam-bin>"
+if grep -qxF -- "$MS_WANT_ARGV" "$MS_ARGV"; then pass
+else fail "want: $MS_WANT_ARGV"$'\n'"argv log: $(cat "$MS_ARGV")"; fi
+
+ms_reset; ms_pin "$MS_PIN_A"
+ms mac_sign_binary "$MS/oam-bin"
+it "signing before setup is refused"
+if [ "$MS_RC" != "0" ] && grep -qF 'run mac_signing_setup first' <<<"$MS_ERR" && ! grep -q '^codesign' "$MS_LOG"; then pass
+else fail "rc=$MS_RC log: $(cat "$MS_LOG") stderr: $MS_ERR"; fi
+
+# A Developer ID certificate in the same slot gets the secure timestamp: the
+# move to it is an identity swap, not an edit here.
+ms_reset; ms_pin "$MS_PIN_A"
+ms_dv org.oamjs.oam '0x10000(runtime)' 'Authority=Developer ID Application: Example LLC (ABCDE12345)' 'Authority=Developer ID Certification Authority' 'Authority=Apple Root CA'
+ms ms_then mac_sign_binary "$MS/oam-bin"
+it "a Developer ID identity signs with --timestamp and keeps codesign's derived requirement (no -r=)"
+if [ "$MS_RC" = "0" ] && grep -qxF "codesign --force --sign $MS_PIN_A --keychain $MS/kc/oam-codesign.keychain-db --options runtime --timestamp --identifier org.oamjs.oam --entitlements $MS_ENTS $MS/oam-bin" "$MS_LOG" \
+   && ! grep -qF -- ' -r=' "$MS_LOG"; then pass
+else fail "rc=$MS_RC log: $(cat "$MS_LOG")"; fi
+
+ms_reset; ms_pin "$MS_PIN_A"
+OAM_SKIP_MAC_SIGN=1 OAM_SIGN_REQUIRED=1 ms ms_then mac_sign_binary "$MS/oam-bin"
+it "OAM_SKIP_MAC_SIGN=1 signs nothing, asks nothing of the keychain, and warns"
+if [ "$MS_RC" = "0" ] && [ ! -s "$MS_LOG" ] && grep -qF 'left as the linker signed it' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC log: $(cat "$MS_LOG") stderr: $MS_ERR"; fi
+
+# --- the verify gate ----------------------------------------------------------
+ms_reset
+ms ms_then mac_verify_binary "$MS/oam-bin"
+it "verify: an ad-hoc signature with runtime + the three entitlements passes while no pin is committed"
+if [ "$MS_RC" = "0" ] && grep -qF 'verifies, AD-HOC' <<<"$MS_ERR"; then pass; else fail "rc=$MS_RC stderr: $MS_ERR"; fi
+
+ms_reset; ms_pin "$MS_PIN_A"
+MS_UPPER="$(tr 'a-f' 'A-F' <<<"$MS_PIN_A")"
+ms_good_selfsigned "$MS_UPPER"
+ms ms_then mac_verify_binary "$MS/oam-bin"
+it "verify: the pinned self-signed certificate in the designated requirement passes (hex case aside)"
+if [ "$MS_RC" = "0" ]; then pass; else fail "rc=$MS_RC stderr: $MS_ERR"; fi
+
+# Each case: one defect on an otherwise passing signature, and the line that
+# must name it.
+MS_BAD=""
+ms_verify_rejects(){  # ms_verify_rejects <label> <expected stderr fragment>
+  ms ms_then mac_verify_binary "$MS/oam-bin"
+  if [ "$MS_RC" = "0" ] || ! grep -qF -- "$2" <<<"$MS_ERR"; then MS_BAD="$MS_BAD [$1: rc=$MS_RC $MS_ERR]"; fi
+}
+ms_reset; touch "$MS/cs-verify-fail"; ms_verify_rejects "broken signature" "does not verify"
+ms_reset; ms_dv org.oamjs.oam '0x2(adhoc)' 'Signature=adhoc'; ms_verify_rejects "no runtime flag" "no hardened runtime flag"
+ms_reset; ms_dv a.out-5555 '0x10002(adhoc,runtime)' 'Signature=adhoc'; ms_verify_rejects "linker identifier" "is not signed as org.oamjs.oam"
+ms_reset; ms_ents "$MS_K1" "$MS_K2"; ms_verify_rejects "missing entitlement" "wrong entitlements"
+ms_reset; ms_ents "$MS_K1" "$MS_K2" "$MS_K3" com.apple.security.get-task-allow; ms_verify_rejects "extra entitlement" "wrong entitlements"
+ms_reset; ms_pin "$MS_PIN_A"; ms_verify_rejects "pinned, but ad-hoc" "is ad-hoc signed (cdhash requirement), but the repo pins $MS_PIN_A"
+ms_reset; ms_pin "$MS_PIN_A"; ms_good_selfsigned "$MS_PIN_B"; ms_verify_rejects "another certificate" "does not name the pinned certificate $MS_PIN_A"
+# The form codesign was measured to DERIVE for a self-signed certificate, and
+# the reason -r= is stated: the pin as the ROOT is not the leaf rule. Leaf A
+# really signed, so only the requirement check can reject this.
+ms_reset; ms_pin "$MS_PIN_A"; ms_good_selfsigned "$MS_PIN_A"
+echo "designated => identifier \"org.oamjs.oam\" and certificate root = H\"$MS_PIN_A\"" > "$MS/cs-dr"
+ms_verify_rejects "the pin as certificate root" "does not name the pinned certificate $MS_PIN_A"
+ms_reset; ms_dv org.oamjs.oam '0x10000(runtime)' 'Authority=oam Code Signing (self-signed)'; ms_verify_rejects "certificate, no pin" "should be signed ad-hoc"
+ms_reset; ms_pin "$MS_PIN_A"; ms_good_devid
+ms_dv org.oamjs.oam '0x10000(runtime)' 'Authority=Developer ID Application: Example LLC (ABCDE12345)' 'Authority=Developer ID Certification Authority'
+ms_verify_rejects "Developer ID without a timestamp" "without a secure timestamp"
+it "verify rejects each defect, by name"
+if [ -z "$MS_BAD" ]; then pass; else fail "not rejected as expected:$MS_BAD"; fi
+
+# The requirement is only a statement; the leaf certificate that actually
+# signed is the proof. A Developer ID requirement names a team, not the pin.
+MS_BAD=""
+ms_reset; ms_pin "$MS_PIN_A"; ms_good_selfsigned "$MS_PIN_A"; cp "$MS/leaf-b" "$MS/cs-leaf"
+ms_verify_rejects "self-signed, requirement names the pin, leaf B signed" "signed by certificate $MS_PIN_B, not the pinned $MS_PIN_A"
+ms_reset; ms_pin "$MS_PIN_A"; ms_good_devid; cp "$MS/leaf-b" "$MS/cs-leaf"
+ms_verify_rejects "Developer ID, another certificate of the team" "signed by certificate $MS_PIN_B, not the pinned $MS_PIN_A"
+ms_reset; ms_pin "$MS_PIN_A"; ms_good_devid; rm -f "$MS/cs-leaf"
+ms_verify_rejects "Developer ID, no certificate extracted" "signed by certificate <none extracted>, not the pinned $MS_PIN_A"
+# When extraction itself fails, codesign's own words must reach the operator.
+ms_reset; ms_pin "$MS_PIN_A"; ms_good_selfsigned "$MS_PIN_A"
+echo "oam-bin: code object is not signed at all (fixture)" > "$MS/cs-extract-fail"
+ms_verify_rejects "extraction failed, codesign's reason shown" "code object is not signed at all (fixture)"
+ms_verify_rejects "extraction failed, its exit status shown" "codesign extracted no certificate from $MS/oam-bin (exit 1)"
+ms_verify_rejects "extraction failed, still rejected" "signed by certificate <none extracted>, not the pinned $MS_PIN_A"
+it "verify: with a pin, a leaf certificate that is not the pinned one is rejected on both paths"
+if [ -z "$MS_BAD" ]; then pass; else fail "not rejected as expected:$MS_BAD"; fi
+
+# mac_leaf_sha1 runs inside build-remote.sh and the mac probe, both of which
+# own their traps: its temp dir must go on every path, its traps must stay its
+# own.
+MS_LT="$MS/leaf-tmp"
+ms_leaf_probe(){ trap 'echo caller-int' INT; mac_leaf_sha1 "$MS/oam-bin"; echo "rc=$?"; trap -p INT; }
+MS_BAD=""
+rm -rf "$MS_LT"; mkdir -p "$MS_LT"
+ms_reset; cp "$MS/leaf-a" "$MS/cs-leaf"
+TMPDIR="$MS_LT" ms ms_leaf_probe
+[ "$MS_OUT" = "$MS_PIN_A"$'\n'"rc=0"$'\n'"trap -- 'echo caller-int' SIGINT" ] || MS_BAD="$MS_BAD [success: out='$MS_OUT' err: $MS_ERR]"
+[ -z "$(ls -A "$MS_LT")" ] || MS_BAD="$MS_BAD [success left: $(ls -A "$MS_LT")]"
+ms_reset; touch "$MS/cs-extract-term"
+TMPDIR="$MS_LT" ms ms_leaf_probe
+[ "$MS_OUT" = "rc=130"$'\n'"trap -- 'echo caller-int' SIGINT" ] || MS_BAD="$MS_BAD [interrupted: out='$MS_OUT' err: $MS_ERR]"
+[ -z "$(ls -A "$MS_LT")" ] || MS_BAD="$MS_BAD [interrupt left: $(ls -A "$MS_LT")]"
+it "mac_leaf_sha1 removes its temp dir on success and on an interrupt, and leaves the caller's traps alone"
+if [ -z "$MS_BAD" ]; then pass; else fail "$MS_BAD"; fi
+
+ms_reset; ms_pin "$MS_PIN_A"; ms_good_devid
+ms ms_then mac_verify_binary "$MS/oam-bin"
+it "verify: a timestamped Developer ID signature by the pinned leaf passes without the self-signed requirement rule"
+if [ "$MS_RC" = "0" ] && grep -qF "(leaf $MS_PIN_A)" <<<"$MS_ERR"; then pass; else fail "rc=$MS_RC stderr: $MS_ERR"; fi
+
+ms_reset
+OAM_SKIP_MAC_SIGN=1 ms ms_then mac_verify_binary "$MS/oam-bin"
+it "verify under OAM_SKIP_MAC_SIGN=1 warns and passes without asking codesign"
+if [ "$MS_RC" = "0" ] && [ ! -s "$MS_LOG" ] && grep -qF 'signature checks skipped' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC log: $(cat "$MS_LOG") stderr: $MS_ERR"; fi
+
+# --- the committed entitlements file ---------------------------------------------
+# plutil is macOS-only, so the plist is read as XML: by the lib's own parser,
+# and independently by line, since the file keeps one element per line.
+it "the entitlements file holds exactly the three keys, each true"
+MS_PAIRS="$( . scripts/lib/mac-signing.sh; mac_entitlement_pairs < scripts/macos/oam.entitlements.plist )"
+MS_WANT="$MS_K1 true"$'\n'"$MS_K2 true"$'\n'"$MS_K3 true"
+MS_LINES="$(grep -cE '^[[:space:]]*<key>' scripts/macos/oam.entitlements.plist)"
+MS_TRUES="$(grep -cE '^[[:space:]]*<true/>[[:space:]]*$' scripts/macos/oam.entitlements.plist)"
+if [ "$MS_PAIRS" = "$MS_WANT" ] && [ "$MS_LINES" = "3" ] && [ "$MS_TRUES" = "3" ]; then pass
+else fail "pairs: '$MS_PAIRS' key lines=$MS_LINES true lines=$MS_TRUES"; fi
+
+# codesign parses --entitlements with a stricter XML parser than plutil: a
+# comment holding "--" (say, quoting `--options runtime`) is reported to fail
+# the real signature while ad-hoc bootstrap signing on another day looked
+# fine. Ban "--" and the markup characters inside every comment body, and any
+# comment opener that is never closed.
+it "the entitlements file's XML comments hold no '--', '<', '>' or '&'"
+MS_CMT_BAD="$(tr '\r\n' '  ' < scripts/macos/oam.entitlements.plist | awk '{
+  s = $0; n = 0
+  while ((i = index(s, "<!--")) > 0) {
+    rest = substr(s, i + 4); j = index(rest, "-->")
+    if (j == 0) { print "unclosed comment"; exit }
+    body = substr(rest, 1, j - 1); n++
+    if (index(body, "--") > 0) print "comment " n " holds --"
+    if (body ~ /[<>&]/) print "comment " n " holds < > or &"
+    if (substr(body, length(body), 1) == "-") print "comment " n " ends in -"
+    s = substr(rest, j + 3)
+  }
+}')"
+if [ -z "$MS_CMT_BAD" ]; then pass; else fail "$MS_CMT_BAD"; fi
+
+it "the entitlements parser ignores a key named inside an XML comment"
+MS_PAIRS="$( . scripts/lib/mac-signing.sh; printf '<dict><!-- <key>com.apple.security.get-task-allow</key><true/> --><key>a</key><true/><key>b</key><string>x</string></dict>' | mac_entitlement_pairs )"
+eq "$MS_PAIRS" "a true"$'\n'"b other"
+
+# --- the JIT smoke fixture ------------------------------------------------------
+# The gate compares its stdout to one exact line. Run under node here (no mac
+# binary on this box): proves the fixture is valid, self-checking and prints
+# exactly that line. The Air runs it under the signed oam.
+it "jit-smoke.js runs to the one line the gate expects"
+if command -v node >/dev/null 2>&1; then
+  eq "$(node scripts/fixtures/jit-smoke.js 2>&1)" "jit smoke ok"
+else
+  skip "no node on this host"
+fi
+
+# --- hash hand-back -------------------------------------------------------------
+MS_HB="$MS/handback"; mkdir -p "$MS_HB/art"
+printf 'arm64 bytes' > "$MS_HB/art/oam-aarch64-apple-darwin"
+printf 'x64 bytes' > "$MS_HB/art/oam-x86_64-apple-darwin"
+( cd "$MS_HB/art" && sha256sum oam-aarch64-apple-darwin oam-x86_64-apple-darwin ) > "$MS_HB/good.txt"
+ms_hb(){ ms mac_handback_check "$@"; }
+ms_hb "$MS_HB/good.txt" "$MS_HB/art" oam-aarch64-apple-darwin oam-x86_64-apple-darwin
+it "hand-back: pulled binaries that match the Air's hashes pass"
+eq "$MS_RC" "0"
+
+MS_BAD=""
+sed 's/  oam-/ *oam-/' "$MS_HB/good.txt" > "$MS_HB/binmode.txt"
+ms_hb "$MS_HB/binmode.txt" "$MS_HB/art" oam-aarch64-apple-darwin oam-x86_64-apple-darwin
+[ "$MS_RC" = "0" ] || MS_BAD="$MS_BAD [binary-mode '*name' rejected: $MS_ERR]"
+grep aarch64 "$MS_HB/good.txt" > "$MS_HB/one.txt"
+ms_hb "$MS_HB/one.txt" "$MS_HB/art" oam-aarch64-apple-darwin oam-x86_64-apple-darwin
+[ "$MS_RC" != "0" ] || MS_BAD="$MS_BAD [an entry missing passed]"
+ms_hb "$MS_HB/good.txt" "$MS_HB/art" oam-aarch64-apple-darwin
+[ "$MS_RC" != "0" ] || MS_BAD="$MS_BAD [an unexpected entry passed]"
+: > "$MS_HB/empty.txt"
+ms_hb "$MS_HB/empty.txt" "$MS_HB/art" oam-aarch64-apple-darwin
+[ "$MS_RC" != "0" ] || MS_BAD="$MS_BAD [an empty hand-back passed]"
+printf 'x64 bytez' > "$MS_HB/art/oam-x86_64-apple-darwin"
+ms_hb "$MS_HB/good.txt" "$MS_HB/art" oam-aarch64-apple-darwin oam-x86_64-apple-darwin
+if [ "$MS_RC" = "0" ] || ! grep -qF 'oam-x86_64-apple-darwin(mac=' <<<"$MS_ERR"; then MS_BAD="$MS_BAD [a changed byte passed or was not named: $MS_ERR]"; fi
+it "hand-back: a changed byte, a missing or extra entry, or an empty file fails; '*name' is accepted"
+if [ -z "$MS_BAD" ]; then pass; else fail "$MS_BAD"; fi
+
+# --- placement: between cp and smoke, darwin only -------------------------------
+# On the code (comments stripped by sg_line), per function: the bytes that
+# ship are signed, then verified, then JIT-smoked, all before the plain smoke
+# -- and on the shared build_host_release only inside the darwin case.
+MS_FN="$MS/fn"
+ms_fn(){ awk -v f="$1() {" '$0 == f { p = 1 } p { print } p && /^}$/ { exit }' scripts/build-remote.sh > "$MS_FN"; }
+
+# "  smoke" with its indent: `jit_smoke "dist/..."` contains `smoke "dist/..."`.
+it "build_host_release: cp < darwin guard < sign < verify < JIT smoke < smoke"
+ms_fn build_host_release
+sg_order "$MS_FN" 'cp "target/release/oam${ext}" "dist/oam-${triple}${ext}"' '*apple-darwin)' 'mac_signing_ready' \
+  'mac_sign_binary "dist/oam-${triple}"' 'mac_verify_binary "dist/oam-${triple}"' 'jit_smoke "dist/oam-${triple}"' \
+  '  smoke "dist/oam-${triple}${ext}"'
+
+# The Linux leg shares build_host_release: every signing call sits inside the
+# darwin arm of the case, and nowhere else in the function.
+it "build_host_release: the signing calls are inside the *apple-darwin) arm only"
+MS_ARM="$(awk '/^[[:space:]]*\*apple-darwin\)$/ { p = 1 } p { print } p && /^[[:space:]]*;;$/ { exit }' "$MS_FN")"
+MS_ALL="$(grep -cE 'mac_signing_ready|mac_sign_binary|mac_verify_binary|jit_smoke' "$MS_FN")"
+MS_IN="$(grep -cE 'mac_signing_ready|mac_sign_binary|mac_verify_binary|jit_smoke' <<<"$MS_ARM")"
+if [ "$MS_IN" = "4" ] && [ "$MS_ALL" = "4" ]; then pass; else fail "in the darwin arm: $MS_IN of 4; in the function: $MS_ALL"$'\n'"$MS_ARM"; fi
+
+it "build_mac_x64: cp < sign < verify < JIT smoke < smoke"
+ms_fn build_mac_x64
+sg_order "$MS_FN" 'cp "target/x64-host/x86_64-apple-darwin/release/oam" "dist/oam-x86_64-apple-darwin"' \
+  'mac_sign_binary "dist/oam-x86_64-apple-darwin"' 'mac_verify_binary "dist/oam-x86_64-apple-darwin"' \
+  'jit_smoke "dist/oam-x86_64-apple-darwin"' '  smoke "dist/oam-x86_64-apple-darwin"'
+
+it "mac-release: drop a stale hand-back, prove signing first, write the hand-back last"
+awk '/^  mac-release\)$/ { p = 1 } p { print } p && /^    ;;$/ { exit }' scripts/build-remote.sh > "$MS_FN"
+sg_order "$MS_FN" 'rm -f dist/mac-sha256.txt' 'mac_signing_ready' 'remote_prep' 'build_host_release' 'build_mac_x64' 'write_mac_hashes'
+
+# The real build-remote.sh `build` dispatch, end to end, against stubs: rustc
+# names the triple, cargo "builds" a stand-in oam (a script that logs and
+# answers), codesign logs. The order on the shared log is the order the leg
+# ran things in. HOME is a fixture so the host's own ~/.cargo/env cannot put a
+# real cargo ahead of the stub.
+MS_BR="$MS/br"
+mkdir -p "$MS_BR/scripts/lib" "$MS_BR/scripts/fixtures" "$MS_BR/scripts/macos" "$MS_BR/home" "$MS_BR/bin"
+cp scripts/build-remote.sh "$MS_BR/scripts/"
+cp scripts/lib/mac-signing.sh "$MS_BR/scripts/lib/"
+cp scripts/fixtures/jit-smoke.js "$MS_BR/scripts/fixtures/"
+cp scripts/macos/oam.entitlements.plist "$MS_BR/scripts/macos/"
+cp "$MS/bin/codesign" "$MS/bin/security" "$MS_BR/bin/"
+cat > "$MS_BR/oam-stub" <<EOF
+#!/bin/bash
+echo "oam \$*" >> "$MS_LOG"
+# jit-mode, when present, makes the JIT smoke fail: "crash" dies the way a
+# binary whose entitlements did not take does, "wrong" prints something else,
+# "okcrash" prints the success line and THEN dies (a late JIT, or teardown).
+case "\$2" in
+  *jit-smoke.js)
+    case "\$(cat "$MS/jit-mode" 2>/dev/null)" in
+      crash) exit 133 ;;
+      okcrash) echo "jit smoke ok"; exit 133 ;;
+      wrong) echo "jit smoke ok?" ;;
+      *) echo "jit smoke ok" ;;
+    esac ;;
+  *) echo "ci smoke 42" ;;
+esac
+EOF
+cat > "$MS_BR/bin/cargo" <<EOF
+#!/bin/bash
+mkdir -p target/release && cp "$MS_BR/oam-stub" target/release/oam && chmod +x target/release/oam
+EOF
+chmod +x "$MS_BR/bin/cargo" "$MS_BR/oam-stub"
+ms_br(){  # ms_br <triple> [env...] -- run the build dispatch; MS_RC, MS_ERR
+  printf '#!/bin/bash\necho "host: %s"\n' "$1" > "$MS_BR/bin/rustc"; chmod +x "$MS_BR/bin/rustc"
+  shift
+  ms_reset
+  ( cd "$MS_BR" && rm -rf dist target
+    echo '# bootstrap: no pin' > scripts/mac-signing-identity.sha1
+    env HOME="$MS_BR/home" PATH="$MS_BR/bin:$PATH" "$@" bash scripts/build-remote.sh build ) >"$MS/br-out" 2>&1
+  MS_RC=$?
+  MS_ERR="$(cat "$MS/br-out")"
+}
+
+ms_br aarch64-apple-darwin
+it "build on a darwin host: signs, verifies and JIT-smokes the staged binary, then smokes it"
+MS_SIGN="$(grep -n '^codesign --force --sign - .*dist/oam-aarch64-apple-darwin$' "$MS_LOG" | head -1 | cut -d: -f1)"
+MS_VER="$(grep -n '^codesign --verify --strict' "$MS_LOG" | head -1 | cut -d: -f1)"
+MS_JIT="$(grep -n '^oam run scripts/fixtures/jit-smoke.js$' "$MS_LOG" | head -1 | cut -d: -f1)"
+MS_SMK="$(grep -n '^oam run .*smoke\.js$' "$MS_LOG" | grep -v jit-smoke | head -1 | cut -d: -f1)"
+if [ "$MS_RC" = "0" ] && [ -n "$MS_SIGN" ] && [ -n "$MS_VER" ] && [ -n "$MS_JIT" ] && [ -n "$MS_SMK" ] \
+   && [ "$MS_SIGN" -lt "$MS_VER" ] && [ "$MS_VER" -lt "$MS_JIT" ] && [ "$MS_JIT" -lt "$MS_SMK" ]; then pass
+else fail "rc=$MS_RC sign@${MS_SIGN:-none} verify@${MS_VER:-none} jit@${MS_JIT:-none} smoke@${MS_SMK:-none} log: $(cat "$MS_LOG") out: $MS_ERR"; fi
+
+ms_br x86_64-unknown-linux-gnu
+it "build on a linux host: no codesign, no JIT smoke -- the Linux leg is untouched"
+if [ "$MS_RC" = "0" ] && ! grep -q '^codesign' "$MS_LOG" && ! grep -q 'jit-smoke' "$MS_LOG" \
+   && grep -q '^oam run .*smoke\.js$' "$MS_LOG"; then pass
+else fail "rc=$MS_RC log: $(cat "$MS_LOG") out: $MS_ERR"; fi
+
+ms_br aarch64-apple-darwin OAM_SIGN_REQUIRED=1
+it "build on a darwin host under OAM_SIGN_REQUIRED=1 with no pin fails, and nothing smokes"
+if [ "$MS_RC" != "0" ] && grep -qF 'OAM_SIGN_REQUIRED=1 but' <<<"$MS_ERR" && ! grep -q '^oam ' "$MS_LOG"; then pass
+else fail "rc=$MS_RC log: $(cat "$MS_LOG") out: $MS_ERR"; fi
+
+# A failing JIT smoke is a hard stop: the signed binary is never smoked, staged
+# for the hand-back or handed on. Every way it fails on a real Mac: a crash at
+# the first JIT, output that is not the one exact line, and the right line
+# followed by a non-zero exit -- the exit status is checked, not just stdout.
+MS_BAD=""
+for MS_MODE in crash wrong okcrash; do
+  echo "$MS_MODE" > "$MS/jit-mode"
+  case "$MS_MODE" in wrong) MS_WHY='JIT smoke output unexpected' ;; *) MS_WHY='JIT smoke failed' ;; esac
+  ms_br aarch64-apple-darwin
+  if [ "$MS_RC" = "0" ] || ! grep -qF "$MS_WHY" <<<"$MS_ERR" \
+     || ! grep -q '^oam run scripts/fixtures/jit-smoke.js$' "$MS_LOG" \
+     || grep -v jit-smoke "$MS_LOG" | grep -q '^oam run .*smoke\.js$' \
+     || [ -e "$MS_BR/dist/mac-sha256.txt" ]; then
+    MS_BAD="$MS_BAD [$MS_MODE: rc=$MS_RC log: $(cat "$MS_LOG") out: $MS_ERR]"
+  fi
+done
+rm -f "$MS/jit-mode"
+it "build on a darwin host: a JIT smoke that crashes, answers wrong, or answers right then crashes fails the leg before the smoke"
+if [ -z "$MS_BAD" ]; then pass; else fail "$MS_BAD"; fi
+
+# --- the release box side ---------------------------------------------------------
+it "the mac-release ssh line forwards OAM_SKIP_MAC_X64, OAM_SIGN_REQUIRED and OAM_SKIP_MAC_SIGN"
+MS_SSH="$(grep -v '^[[:space:]]*#' scripts/build-platforms-tailnet.sh | grep -F 'bash scripts/build-remote.sh mac-release')"
+MS_MISS=""
+for want in 'OAM_SKIP_MAC_X64=$SKIP_MAC_X64' 'OAM_SIGN_REQUIRED=$SIGN_REQUIRED' 'OAM_SKIP_MAC_SIGN=$SKIP_MAC_SIGN'; do
+  grep -qF -- "$want" <<<"$MS_SSH" || MS_MISS="$MS_MISS $want"
+done
+if [ -z "$MS_MISS" ] && [ "$(wc -l <<<"$MS_SSH" | tr -d ' ')" = "1" ]; then pass; else fail "missing:$MS_MISS line: $MS_SSH"; fi
+
+it "the hand-back is pulled beside the artifacts, then checked before the artifact dir is handed out"
+sg_order scripts/build-platforms-tailnet.sh 'HANDBACK_DIR="$STAGE_DIR/handback"' \
+  'pull "$hp" "dist/mac-sha256.txt" "$HANDBACK_DIR/"' 'mac_handback_check "$HANDBACK_DIR/mac-sha256.txt" "$ARTIFACTS_DIR"' \
+  'echo "$ARTIFACTS_DIR"'
+
+it "release-local.sh copies the two exact mac asset names, never a glob"
+MS_RL="$(grep -v '^[[:space:]]*#' scripts/release-local.sh)"
+if grep -qF 'cp "$MAC_ART/oam-aarch64-apple-darwin" "$RELEASE_DIR/"' <<<"$MS_RL" \
+   && grep -qF 'cp "$MAC_ART/oam-x86_64-apple-darwin" "$RELEASE_DIR/"' <<<"$MS_RL" \
+   && ! grep -qF 'apple-darwin*' <<<"$MS_RL"; then pass
+else fail "$(grep -n 'MAC_ART' scripts/release-local.sh)"; fi
+
+# The preflight, run for real from a fixture checkout (its own pin file) with
+# ssh replaced: the host probe (`true`) succeeds, and `bash -s -- --check`
+# answers from fixture files and keeps the stdin it was handed, which must be
+# the checkout's provision script. scp and mktemp record and fail, as above:
+# a preflight that went on to stage or sync is caught.
+MS_TN="$MS/tn"
+mkdir -p "$MS_TN/scripts/lib" "$MS_TN/bin" "$MS_TN/tmp"
+cp scripts/build-platforms-tailnet.sh scripts/provision-mac-signing.sh "$MS_TN/scripts/"
+cp scripts/lib/src-sync.sh scripts/lib/iap-helpers.sh scripts/lib/tailnet-helpers.sh scripts/lib/mac-signing.sh "$MS_TN/scripts/lib/"
+: > "$MS_TN/key"
+cat > "$MS_TN/bin/ssh" <<EOF
+#!/bin/bash
+case " \$* " in
+  *" --check "*)
+    echo check >> "$MS_TN/calls"
+    cat > "$MS_TN/check-stdin"
+    cat "$MS_TN/check-out"
+    exit "\$(cat "$MS_TN/check-rc")" ;;
+  *) echo probe >> "$MS_TN/calls"; exit 0 ;;
+esac
+EOF
+for t in scp mktemp; do printf '#!/bin/bash\necho %s >> "%s/calls"\nexit 98\n' "$t" "$MS_TN" > "$MS_TN/bin/$t"; done
+chmod +x "$MS_TN/bin/ssh" "$MS_TN/bin/scp" "$MS_TN/bin/mktemp"
+ms_tn(){  # ms_tn <pin-line> [env...] -- --preflight-only; MS_OUT, MS_ERR, MS_RC, MS_CALLS
+  { echo '# fixture'; [ -z "$1" ] || echo "$1"; } > "$MS_TN/scripts/mac-signing-identity.sha1"
+  shift
+  : > "$MS_TN/calls"
+  MS_OUT="$(env PATH="$MS_TN/bin:$PATH" TMPDIR="$MS_TN/tmp" OAM_MAC_KEY="$MS_TN/key" \
+    OAM_MAC_HOST=100.90.0.5 OAM_MAC_USER=builder "$@" \
+    bash "$MS_TN/scripts/build-platforms-tailnet.sh" --preflight-only 2>"$MS/tn-err")"
+  MS_RC=$?
+  MS_ERR="$(cat "$MS/tn-err")"
+  MS_CALLS="$(tr '\n' ' ' < "$MS_TN/calls")"
+}
+printf 'keychain=/k\nsha1=%s\n' "$MS_PIN_A" > "$MS_TN/check-out"; echo 0 > "$MS_TN/check-rc"
+
+ms_tn "" OAM_SIGN_REQUIRED=1
+it "preflight: OAM_SIGN_REQUIRED=1 with no pin fails before touching the Air"
+if [ "$MS_RC" != "0" ] && [ -z "$MS_OUT" ] && [ -z "$MS_CALLS" ] && grep -qF 'holds no SHA-1 yet' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC out='$MS_OUT' calls='$MS_CALLS' stderr: $MS_ERR"; fi
+
+ms_tn "" OAM_SKIP_MAC_SIGN=maybe
+it "preflight: a signing knob that is not 0 or 1 fails before touching the Air"
+if [ "$MS_RC" != "0" ] && [ -z "$MS_CALLS" ] && grep -qF "OAM_SKIP_MAC_SIGN must be 0 or 1, not 'maybe'" <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC calls='$MS_CALLS' stderr: $MS_ERR"; fi
+
+# OAM_SKIP_MAC_X64 is checked by nothing else before it reaches the Air's
+# shell on the mac-release ssh line, so this loop is its only guard.
+ms_tn "" OAM_SKIP_MAC_X64=yes
+it "preflight: an OAM_SKIP_MAC_X64 that is not 0 or 1 fails before touching the Air"
+if [ "$MS_RC" != "0" ] && [ -z "$MS_CALLS" ] && grep -qF "OAM_SKIP_MAC_X64 must be 0 or 1" <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC calls='$MS_CALLS' stderr: $MS_ERR"; fi
+
+ms_tn ""
+it "preflight: bootstrap warns ad-hoc and asks the Air nothing about signing"
+if [ "$MS_RC" = "0" ] && [ -z "$MS_OUT" ] && [ "$MS_CALLS" = "probe " ] && grep -qF 'signed AD-HOC' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC out='$MS_OUT' calls='$MS_CALLS' stderr: $MS_ERR"; fi
+
+ms_tn "$MS_PIN_A"
+it "preflight: a pin runs this checkout's provision --check on the Air, stdout stays silent"
+if [ "$MS_RC" = "0" ] && [ -z "$MS_OUT" ] && [ "$MS_CALLS" = "probe check " ] \
+   && cmp -s "$MS_TN/check-stdin" scripts/provision-mac-signing.sh \
+   && grep -qF "mac signing identity $MS_PIN_A is usable" <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC out='$MS_OUT' calls='$MS_CALLS' stderr: $MS_ERR"; fi
+
+# The same leak through the leg's own preflight, which inherits the caller's
+# environment (env, not env -i): exported and then scrubbed, the knobs must not
+# stop a committed pin from being checked on the Air.
+it "preflight: exported skip knobs, once scrubbed, still leave a pin's identity check in place"
+MS_GOT="$(
+  export OAM_SKIP_MAC_SIGN=1 OAM_SKIP_MAC_X64=1
+  scrub_operator_knobs
+  ms_tn "$MS_PIN_A"; echo "rc=$MS_RC calls=$MS_CALLS"
+)"
+eq "$MS_GOT" "rc=0 calls=probe check "
+
+printf 'keychain=/k\nsha1=%s\n' "$MS_PIN_B" > "$MS_TN/check-out"
+ms_tn "$MS_PIN_A"
+it "preflight: an Air holding another certificate fails"
+if [ "$MS_RC" != "0" ] && [ -z "$MS_OUT" ] && grep -qF "the Air signs with certificate '$MS_PIN_B' but this checkout pins $MS_PIN_A" <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC out='$MS_OUT' stderr: $MS_ERR"; fi
+
+echo 1 > "$MS_TN/check-rc"
+ms_tn "$MS_PIN_A"
+it "preflight: an identity --check rejects fails the preflight"
+if [ "$MS_RC" != "0" ] && [ -z "$MS_OUT" ] && grep -qF "the pinned mac signing identity $MS_PIN_A is not usable" <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC out='$MS_OUT' stderr: $MS_ERR"; fi
+
+ms_tn "$MS_PIN_A" OAM_SKIP_MAC_SIGN=1 OAM_SIGN_REQUIRED=1
+it "preflight: OAM_SKIP_MAC_SIGN=1 skips the identity check even under OAM_SIGN_REQUIRED=1, loudly"
+if [ "$MS_RC" = "0" ] && [ "$MS_CALLS" = "probe " ] && grep -qF 'even though OAM_SIGN_REQUIRED=1' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC calls='$MS_CALLS' stderr: $MS_ERR"; fi
+
+# --- provision-mac-signing.sh --check, piped the way the preflight pipes it -----
+# uname says Darwin; security and codesign are stubs, and the security stub
+# DRAINS its stdin, as a command that prompted would. Piped to `bash -s`, a
+# script whose top level ran commands could lose its own remainder that way;
+# this one is functions plus a final `main "$@"`, so it is parsed whole first.
+MS_PV="$MS/pv"
+mkdir -p "$MS_PV/bin" "$MS_PV/home/.oam-signing"
+printf '#!/bin/bash\necho Darwin\n' > "$MS_PV/bin/uname"
+cat > "$MS_PV/bin/security" <<EOF
+#!/bin/bash
+cat > /dev/null
+case "\$1" in
+  # kc-sha lists the keychain's identities, uppercase, as security prints
+  # them. fi-shape picks the listing:
+  #   trusted    (default) each in BOTH sections, no suffix: a Developer ID
+  #   selfsigned the real self-signed shape -- a (CSSMERR_TP_NOT_TRUSTED)
+  #              suffix, under "Matching" only, 0 valid identities
+  #   cutshort   one identity printed, then a non-zero exit
+  find-identity)
+    ids="\$(tr 'a-f' 'A-F' < "$MS_PV/kc-sha")"
+    shape="\$(cat "$MS_PV/fi-shape" 2>/dev/null)"
+    printf 'Policy: Code Signing\n  Matching identities\n'
+    if [ "\$shape" = cutshort ]; then
+      printf '  1) %s "oam Code Signing (self-signed)"\n' "\${ids%% *}"
+      echo 'security: SecKeychainSearchCopyNext: The specified keychain could not be found.' >&2
+      exit 1
+    fi
+    suffix=""; [ "\$shape" = selfsigned ] && suffix=' (CSSMERR_TP_NOT_TRUSTED)'
+    i=0; for h in \$ids; do i=\$((i + 1)); printf '  %s) %s "oam Code Signing (self-signed)"%s\n' "\$i" "\$h" "\$suffix"; done
+    printf '     %s identities found\n\n  Valid identities only\n' "\$i"
+    if [ "\$shape" = selfsigned ]; then
+      printf '     0 valid identities found\n'
+    else
+      i=0; for h in \$ids; do i=\$((i + 1)); printf '  %s) %s "oam Code Signing (self-signed)"\n' "\$i" "\$h"; done
+      printf '     %s valid identities found\n' "\$i"
+    fi ;;
+  # A p12 with its chain: the intermediate CA lists FIRST. Nothing may take
+  # the identity's fingerprint from here.
+  find-certificate) printf 'keychain: "x"\nSHA-1 hash: 1111111111111111111111111111111111111111\n'
+    for h in \$(cat "$MS_PV/kc-sha"); do printf 'SHA-1 hash: %s\n' "\$h"; done ;;
+esac
+exit 0
+EOF
+printf '#!/bin/bash\ncat > /dev/null\nexit 0\n' > "$MS_PV/bin/codesign"
+chmod +x "$MS_PV/bin/uname" "$MS_PV/bin/security" "$MS_PV/bin/codesign"
+: > "$MS_PV/home/.oam-signing/oam-codesign.keychain-db"
+printf 'pw' > "$MS_PV/home/.oam-signing/oam-codesign.keychain-password"
+printf '%s\n' "$MS_PIN_A" > "$MS_PV/home/.oam-signing/oam-codesign.sha1"
+ms_pv(){  # ms_pv <args...> -- the provision script on stdin; MS_OUT, MS_RC, MS_ERR
+  MS_OUT="$(env HOME="$MS_PV/home" PATH="$MS_PV/bin:$PATH" bash -s -- "$@" < scripts/provision-mac-signing.sh 2>"$MS/pv-err")"
+  MS_RC=$?
+  MS_ERR="$(cat "$MS/pv-err")"
+}
+printf '%s' "$MS_PIN_A" > "$MS_PV/kc-sha"
+ms_pv --check
+it "provision --check over stdin: survives a stdin-draining tool, prints keychain= and the lowercase sha1="
+eq "rc=$MS_RC $MS_OUT" "rc=0 keychain=$MS_PV/home/.oam-signing/oam-codesign.keychain-db"$'\n'"sha1=$MS_PIN_A"
+
+# What `security find-identity -p codesigning` really prints for oam's
+# self-signed identity: untrusted, so only under "Matching", with a trust
+# error after the name, and "0 valid identities found".
+echo selfsigned > "$MS_PV/fi-shape"
+ms_pv --check
+it "provision --check: reads the identity from the real self-signed listing (trust-error suffix, 0 valid)"
+eq "rc=$MS_RC $MS_OUT" "rc=0 keychain=$MS_PV/home/.oam-signing/oam-codesign.keychain-db"$'\n'"sha1=$MS_PIN_A"
+
+# A listing that printed the one identity and then failed is not a listing.
+echo cutshort > "$MS_PV/fi-shape"
+ms_pv --check
+it "provision --check: a find-identity that exits non-zero fails, even with one identity printed"
+if [ "$MS_RC" != "0" ] && [ -z "$MS_OUT" ] && grep -qF "security find-identity -p codesigning" <<<"$MS_ERR" \
+   && grep -qF 'SecKeychainSearchCopyNext' <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC out='$MS_OUT' stderr: $MS_ERR"; fi
+rm -f "$MS_PV/fi-shape"
+
+printf '%s' "$MS_PIN_B" > "$MS_PV/kc-sha"
+ms_pv --check
+it "provision --check: a keychain certificate that is not the one recorded fails"
+if [ "$MS_RC" != "0" ] && [ -z "$MS_OUT" ] && grep -qF "keychain identity $MS_PIN_B does not match recorded fingerprint $MS_PIN_A" <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC out='$MS_OUT' stderr: $MS_ERR"; fi
+
+# Two signing identities in the dedicated keychain: which one is "the" identity
+# is ambiguous, so --check refuses rather than picking the first listed.
+printf '%s %s' "$MS_PIN_B" "$MS_PIN_A" > "$MS_PV/kc-sha"
+ms_pv --check
+it "provision --check: a keychain holding two signing identities fails, naming both"
+if [ "$MS_RC" != "0" ] && [ -z "$MS_OUT" ] && grep -qF "holds 2 code-signing identities; exactly one is expected" <<<"$MS_ERR" \
+   && grep -qF "$MS_PIN_A" <<<"$MS_ERR" && grep -qF "$MS_PIN_B" <<<"$MS_ERR"; then pass
+else fail "rc=$MS_RC out='$MS_OUT' stderr: $MS_ERR"; fi
+
+ms_pv --generate
+it "provision --generate refuses an existing identity and deletes nothing"
+if [ "$MS_RC" != "0" ] && grep -qF 'an identity (or part of one) already exists' <<<"$MS_ERR" \
+   && [ -f "$MS_PV/home/.oam-signing/oam-codesign.keychain-db" ] && [ -f "$MS_PV/home/.oam-signing/oam-codesign.keychain-password" ]; then pass
+else fail "rc=$MS_RC stderr: $MS_ERR"; fi
+
+# The failure trap deletes all five identity files, so any ONE left over from
+# an earlier attempt must stop --generate / --import before the trap is armed:
+# otherwise a later failure would delete a file this run never created.
+MS_BAD=""
+for MS_STALE in oam-codesign.keychain-password oam-codesign.sha1 oam-codesign.p12-password; do
+  rm -rf "$MS_PV/stale"; mkdir -p "$MS_PV/stale"
+  printf 'stale' > "$MS_PV/stale/$MS_STALE"
+  OAM_SIGNING_DIR="$MS_PV/stale" ms_pv --generate
+  if [ "$MS_RC" = "0" ] || ! grep -qF "already exists in $MS_PV/stale: $MS_PV/stale/$MS_STALE" <<<"$MS_ERR" \
+     || [ "$(cat "$MS_PV/stale/$MS_STALE" 2>/dev/null)" != "stale" ] || [ "$(ls -A "$MS_PV/stale")" != "$MS_STALE" ]; then
+    MS_BAD="$MS_BAD [$MS_STALE: rc=$MS_RC left: $(ls -A "$MS_PV/stale" | tr '\n' ' ') stderr: $MS_ERR]"
+  fi
+done
+rm -rf "$MS_PV/stale"
+it "provision --generate refuses a lone stale password or fingerprint file and leaves it untouched"
+if [ -z "$MS_BAD" ]; then pass; else fail "$MS_BAD"; fi
 
 # =============================================================================
 group "tap-verify.sh -- what a published tap actually serves"

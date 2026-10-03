@@ -38,7 +38,13 @@
 #                     so no sub-step splitting needed): prep + gate + test +
 #                     build (arm64 native) + x64 build via the
 #                     x86_64-apple-darwin HOST toolchain under Rosetta 2.
-#                     OAM_SKIP_MAC_X64=1 drops the x64 leg.
+#                     OAM_SKIP_MAC_X64=1 drops the x64 leg. Each mac binary
+#                     is codesigned, verified and JIT-smoked between its cp
+#                     into dist/ and its smoke (scripts/lib/mac-signing.sh;
+#                     OAM_SIGN_REQUIRED / OAM_SKIP_MAC_SIGN, forwarded by the
+#                     tailnet orchestrator), and the leg ends by writing
+#                     dist/mac-sha256.txt over the final bytes for the
+#                     release box to compare against what it pulled.
 #     mac-measure  -- one-shot: prep + conformance + node-suite (both
 #                     advisory: a tripped gate warns, scorecards still land)
 #     mac-bench    -- one-shot: prep + bench
@@ -113,6 +119,50 @@ smoke() {
   rm -rf "$d"
   [ "$out" = "ci smoke 42" ] || die "smoke output unexpected from $bin: '$out'"
   note "smoke ok ($bin)"
+}
+
+# jit_smoke <oam-binary>: scripts/fixtures/jit-smoke.js against a SIGNED mac
+# binary. The hardened runtime lets a binary with the wrong entitlements start
+# and pass `smoke`; it dies at the first JIT (an optimizing tier-up, a native
+# RegExp, a WebAssembly module), and run_test / run_conformance only ever run
+# the unsigned build. The x86_64 binary runs under Rosetta, like smoke.
+jit_smoke() {
+  local bin="$1" out
+  if ! out="$(with_timeout 300 "$bin" run scripts/fixtures/jit-smoke.js)"; then
+    die "JIT smoke failed (crash or 5-min hang) for $bin -- a signed binary that cannot JIT usually means the entitlements in scripts/macos/oam.entitlements.plist did not take"
+  fi
+  [ "$out" = "jit smoke ok" ] || die "JIT smoke output unexpected from $bin: '$out'"
+  note "JIT smoke ok ($bin)"
+}
+
+# mac_signing_ready: source scripts/lib/mac-signing.sh and decide how this leg
+# signs, once. mac-release calls it FIRST, so an unusable pinned identity fails
+# in seconds rather than after prep, gate, test and conformance; the darwin
+# blocks below call it again as a no-op, so a hand-run `build` on the Mac signs
+# too. Sourced here, not at the top, for the reason use_pinned_node gives: the
+# gc dispatch must keep working in a tree that carries only this script.
+MAC_SIGNING_READY=0
+mac_signing_ready() {
+  [ "$MAC_SIGNING_READY" = "1" ] && return 0
+  local lib="scripts/lib/mac-signing.sh"
+  [ -f "$lib" ] || die "$lib is missing -- cannot sign the mac binaries (is the cwd the repo root?)"
+  # shellcheck source=lib/mac-signing.sh
+  . "$lib"
+  mac_signing_setup || die "mac signing is not usable -- reason above; nothing has been built"
+  MAC_SIGNING_READY=1
+}
+
+# write_mac_hashes: dist/mac-sha256.txt over the binaries this leg staged, in
+# their FINAL state (signed and gated). The release box pulls it beside, not
+# into, its artifact dir and compares (mac_handback_check). Written last, after
+# every gate, and only by a leg that got that far.
+write_mac_hashes() {
+  local names=(oam-aarch64-apple-darwin)
+  [ "${OAM_SKIP_MAC_X64:-0}" = "1" ] || names+=(oam-x86_64-apple-darwin)
+  ( cd dist && shasum -a 256 "${names[@]}" ) > dist/mac-sha256.txt.part \
+    || die "could not hash the mac binaries in dist/"
+  mv dist/mac-sha256.txt.part dist/mac-sha256.txt
+  note "hand-back hashes: $(tr '\n' ' ' < dist/mac-sha256.txt)"
 }
 
 # use_pinned_node: put the pinned Node (.node-version) first on PATH for the
@@ -258,7 +308,21 @@ build_host_release() {
   case "$triple" in *windows*) ext=".exe" ;; esac
   cargo build --release -p oam_cli
   mkdir -p dist
+  # A new file, never an overwrite: macOS caches a binary's signature per
+  # vnode, and a signed Mach-O rewritten in place is SIGKILLed on its next exec.
+  rm -f "dist/oam-${triple}${ext}"
   cp "target/release/oam${ext}" "dist/oam-${triple}${ext}"
+  # The Linux leg shares this function: only a darwin triple is signed. Sign,
+  # verify and JIT-smoke BEFORE smoke, so every execution gate after this line
+  # runs the bytes that ship.
+  case "$triple" in
+    *apple-darwin)
+      mac_signing_ready
+      mac_sign_binary "dist/oam-${triple}" || die "signing dist/oam-${triple} failed -- reason above"
+      mac_verify_binary "dist/oam-${triple}" || die "dist/oam-${triple} failed the signature gate -- reason above"
+      jit_smoke "dist/oam-${triple}"
+      ;;
+  esac
   smoke "dist/oam-${triple}${ext}"
   note "staged dist/oam-${triple}${ext}"
 }
@@ -302,7 +366,14 @@ build_mac_x64() {
   CARGO_TARGET_DIR=target/x64-host \
     cargo +stable-x86_64-apple-darwin build --release --target x86_64-apple-darwin -p oam_cli
   mkdir -p dist
+  rm -f "dist/oam-x86_64-apple-darwin"
   cp "target/x64-host/x86_64-apple-darwin/release/oam" "dist/oam-x86_64-apple-darwin"
+  # Signed natively (codesign is arm64; signing does not run the binary), then
+  # verified and JIT-smoked under Rosetta like smoke below.
+  mac_signing_ready
+  mac_sign_binary "dist/oam-x86_64-apple-darwin" || die "signing dist/oam-x86_64-apple-darwin failed -- reason above"
+  mac_verify_binary "dist/oam-x86_64-apple-darwin" || die "dist/oam-x86_64-apple-darwin failed the signature gate -- reason above"
+  jit_smoke "dist/oam-x86_64-apple-darwin"
   smoke "dist/oam-x86_64-apple-darwin"
   note "staged dist/oam-x86_64-apple-darwin (built under Rosetta 2)"
 }
@@ -378,6 +449,10 @@ case "$DISPATCH" in
   io-uring-ab)  run_io_uring_ab ;;
   gc)           run_gc ;;
   mac-release)
+    # A hand-back left by an earlier run must never describe this one's bytes.
+    rm -f dist/mac-sha256.txt
+    # Before anything slow: an unusable pinned identity fails here, in seconds.
+    mac_signing_ready
     remote_prep
     run_gate
     run_test
@@ -393,6 +468,7 @@ case "$DISPATCH" in
     else
       build_mac_x64
     fi
+    write_mac_hashes
     ;;
   mac-measure)
     # node-compat.yml measure parity (continue-on-error): a tripped gate must

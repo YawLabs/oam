@@ -78,8 +78,7 @@ the matching tag tells you exactly which V8 you have.
 
 ## Release integrity
 
-Release binaries are not yet code-signed (Authenticode or Apple Developer
-ID). Every release publishes a `SHA256SUMS` file alongside the assets. Verify
+Every release publishes a `SHA256SUMS` file alongside the assets. Verify
 your download against it:
 
 ```
@@ -108,6 +107,18 @@ embedded in the scripts: a `v0.18.0`+ release installs only if its manifest
 signature verifies, names the tag being installed, and comes from a key whose
 range covers that tag. Releases before `v0.18.0` are checked against a pinned
 hash of their published `SHA256SUMS`. `install/README.md` has the details.
+`oam self-update` makes the same checks with the keys compiled into oam.
+
+The binaries are code-signed too, from `v0.18.0` on:
+
+- **Windows**: both `.exe` assets carry an Authenticode signature from Azure
+  Artifact Signing, publisher "Yaw Labs LLC" (a verified publisher).
+  SmartScreen reputation for a new signature still builds up over time.
+- **macOS**: both binaries are signed with oam's own pinned, self-signed
+  identity, "oam Code Signing (self-signed)", with the hardened runtime. That
+  is not an Apple Developer ID signature and the binaries are not notarized,
+  so Gatekeeper still blocks a quarantined (browser-downloaded) binary. curl
+  and brew installs set no quarantine flag and are unaffected.
 
 ## How fixes are disclosed
 

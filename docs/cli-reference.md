@@ -59,7 +59,7 @@ Notable ones:
 |---|---|
 | `--permission` | Denies everything, then grants back with the `--allow-*` flags below. |
 | `--allow-fs-read=<paths>` / `--allow-fs-write=<paths>` | `*` for everything, otherwise a comma-separated allow-list. Both take the list with `=`; neither has a bare form. |
-| `--allow-net[=<hosts>]` / `--allow-env[=<names>]` | Bare grants everything; the `=` form takes a comma-separated allow-list. |
+| `--allow-net[=<hosts>]` / `--allow-env[=<names>]` | Bare grants everything; the `=` form takes a comma-separated allow-list. A net entry without a port (`example.com`) grants the host on every port; one with a port (`example.com:443`) grants that port alone, for raw sockets and HTTP clients alike (`https://example.com/` is port 443). |
 | `--allow-child-process` | Spawning **and** `process.execve`, which replaces the image. |
 | `--allow-worker` | Starting a `worker_threads` Worker or an `oam.fork()` isolate. Does **not** imply `--allow-child-process` — a child isolate inherits the parent's permissions, so it cannot spawn unless the parent could. |
 | `--allow-addons` | Loading native addons. Enforced at `require()` of a `.node` file: without the grant the load throws `ERR_ACCESS_DENIED` carrying `permission: 'Addon'`, and `OAM_ENABLE_NATIVE_ADDONS=1` does **not** override it -- an environment variable cannot widen a permission the caller withheld. The two switches are independent and both must pass: this flag is the sandbox grant, the variable is the alpha opt-in. Requires a binary built with the `napi` cargo feature (the default); a build without it rejects the flag at startup rather than granting a permission it cannot honour. |
