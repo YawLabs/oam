@@ -34372,6 +34372,65 @@ fn a_pipe_is_a_net_resource_granted_by_its_exact_path() {
     assert_eq!(run("--allow-net"), "listen allowed\ndata hi\n");
 }
 
+/// #219: an http request over a pipe is judged by what dials it.
+/// `http.request({ socketPath })` dials the pipe and nothing else, so the
+/// pipe's grant alone admits it. A request through undici's
+/// `Agent({ connect: { socketPath } })` -- `undici.request` and `fetch`
+/// alike -- is checked against the URL's `host:port` as well as the pipe,
+/// as any request through a custom `connect` is: the gate cannot see where
+/// such a function dials, so it fails closed and asks for both grants.
+#[test]
+fn an_undici_request_over_a_pipe_needs_the_url_host_grant_too() {
+    let path = e2e_pipe_path("perm-undici");
+    let script = write_temp(
+        "pipe_permission_undici/main.mjs",
+        "import net from 'node:net';\n\
+         import http from 'node:http';\n\
+         import { Agent, request } from 'undici';\n\
+         const P = process.argv[2];\n\
+         const srv = net.createServer((c) => c.once('data', () => c.end('HTTP/1.1 200 OK\\r\\nContent-Length: 2\\r\\nConnection: close\\r\\n\\r\\nhi')));\n\
+         await new Promise((r) => srv.listen(P, r));\n\
+         const why = (e) => { const c = e && e.code ? e : e && e.cause; return c && c.code ? c.code + ' ' + c.permission + ' ' + c.resource : String(e); };\n\
+         const viaHttp = await new Promise((r) => {\n\
+           try {\n\
+             http.get({ socketPath: P, path: '/' }, (res) => { let b = ''; res.setEncoding('utf8'); res.on('data', (d) => (b += d)); res.on('end', () => r('ok ' + b)); }).on('error', (e) => r(why(e)));\n\
+           } catch (e) { r(why(e)); }\n\
+         });\n\
+         console.log('http.get', viaHttp);\n\
+         const agent = () => new Agent({ connect: { socketPath: P } });\n\
+         try { const res = await request('http://localhost/', { dispatcher: agent() }); console.log('undici.request ok', await res.body.text()); } catch (e) { console.log('undici.request', why(e)); }\n\
+         try { const res = await fetch('http://localhost/', { dispatcher: agent() }); console.log('fetch ok', await res.text()); } catch (e) { console.log('fetch', why(e)); }\n\
+         srv.close();\n",
+    );
+    let socket_dir = std::path::Path::new(&path)
+        .parent()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let fs_read = format!("--allow-fs-read={socket_dir}");
+    let fs_write = format!("--allow-fs-write={socket_dir}");
+    let run = |grant: &str| {
+        let mut args = vec!["--permission", grant];
+        if cfg!(unix) {
+            args.extend([fs_read.as_str(), fs_write.as_str()]);
+        }
+        args.extend(["--", script.to_str().unwrap(), &path]);
+        let out = oam(&args);
+        String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n")
+    };
+    // The pipe's grant alone: http.request reaches it, undici does not.
+    assert_eq!(
+        run(&format!("--allow-net={path}")),
+        "http.get ok hi\n\
+         undici.request ERR_ACCESS_DENIED Net localhost:80\n\
+         fetch ERR_ACCESS_DENIED Net localhost:80\n"
+    );
+    // The pipe and the URL's host: every one does.
+    assert_eq!(
+        run(&format!("--allow-net={path},localhost")),
+        "http.get ok hi\nundici.request ok hi\nfetch ok hi\n"
+    );
+}
+
 /// Regression guard: a pipe op asked only the net grant, but a path outside
 /// the Windows named-pipe namespace is a file -- the Windows dial opens it
 /// read-write, a Unix listen creates it and the close unlinks it -- so under

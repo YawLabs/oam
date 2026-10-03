@@ -3367,7 +3367,14 @@ booting and then failing every browser tool.
   A relative path is resolved against the cwd of the moment, as an fs path is, and the op
   then dials or binds that resolved path; only an absolute entry grants a pipe, so
   `--allow-net=app.sock` grants none -- a relative grant would name another socket after
-  every `process.chdir`. Node 22's permission model has no network category and does not
+  every `process.chdir`. An http request is judged by what dials it:
+  `http.request({ socketPath })` dials the pipe alone and needs only the pipe's grant, but
+  a `fetch`, `undici.request` or `WebSocket` through undici's
+  `Agent({ connect: { socketPath } })` -- as through any custom `connect` function, whose
+  dial the gate cannot see ahead of time -- is checked against its URL's `host:port` too,
+  so it needs that host's grant as well as the pipe's
+  (`--allow-net=\\.\pipe\app,localhost` for `http://localhost/` over the pipe; e2e test
+  `an_undici_request_over_a_pipe_needs_the_url_host_grant_too`). Node 22's permission model has no network category and does not
   gate pipes at all (measured on v22.22.2: under `--permission` with no fs grant it listens
   on a named pipe and dials a file); the choice is oam's, made so that a grant for one
   service cannot reach `\\.\pipe\docker_engine` or `/var/run/docker.sock`, nor a pipe op
