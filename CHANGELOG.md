@@ -82,6 +82,10 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   (or `write`) with no path. Only a failed open now names `open` and the path, as in node -- and
   `process.loadEnvFile()` of such a file is node's `Contents of '<path>' should be a valid
   string.` instead of a false `ENOENT`.
+- **`fs.readFile` (sync, utf8 sync, callback and promise) read a file in growing chunks** after the
+  open / read split above: 9 read calls for 1 MiB, 15 for 64 MiB. It reads into the room
+  reserved from its fstat again, as `std::fs::read` does: one read of the whole file plus one
+  short EOF probe, whatever the size.
 - **Over HTTP/2, a `fetch` response header value kept the whitespace around it**; it is trimmed
   as it is over HTTP/1, and the trimming is recorded as a divergence from node's `fetch`, which
   keeps trailing whitespace. (#182)

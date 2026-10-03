@@ -2421,37 +2421,69 @@ impl WholeFileError {
 }
 
 /// `fs.readFile` of a path: `std::fs::read`, with the open and the read kept
-/// apart. Same syscalls on success: open, one fstat for the size hint, reads.
+/// apart. Same syscalls on success: open, one fstat for the size hint, one
+/// read of the whole file and one short read that finds EOF.
 pub fn read_whole_file(path: &str) -> Result<Vec<u8>, WholeFileError> {
     let file = std::fs::File::open(path).map_err(WholeFileError::Open)?;
     let size = file.metadata().ok().map(|m| m.len());
     read_opened(&file, size)
 }
 
-/// Read everything from an already-open file. Every failure here is the read
-/// half's.
+/// Read everything from an already-open file, `size` being the caller's
+/// fstat answer. Every failure here is the read half's.
 ///
-/// `std::fs::File`'s own `read_to_end` re-derives its size hint with an fstat
-/// AND a seek; `std::fs::read` passes the hint it already has. Reading through
-/// a plain `Read` (no specialised `read_to_end`) into a buffer reserved from
-/// the caller's fstat keeps the syscalls `std::fs::read` makes, no more.
-fn read_opened(reader: impl std::io::Read, size: Option<u64>) -> Result<Vec<u8>, WholeFileError> {
-    struct Plain<R>(R);
-    impl<R: std::io::Read> std::io::Read for Plain<R> {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            self.0.read(buf)
-        }
-    }
+/// This is `std::fs::read`'s hinted read loop: reserve exactly `size`, read
+/// into all of that room in one call, and once it is full make one 32-byte
+/// probe read that finds EOF (or, when the file grew, more bytes, after which
+/// the buffer grows and the loop goes on). A regular file comes in with two
+/// read calls whatever its size. Neither of std's `read_to_end`s gives that
+/// here: the generic one has no size hint, so it caps its first read at 8 KiB
+/// and doubles from there (nine reads for 1 MiB), and `File`'s re-derives the
+/// hint with an fstat and a seek. The one difference from std: the room is
+/// zero-filled once before the read, because std reads into uninitialised
+/// memory with `unsafe` that oam_core does not use.
+fn read_opened(
+    mut reader: impl std::io::Read,
+    size: Option<u64>,
+) -> Result<Vec<u8>, WholeFileError> {
+    const PROBE: usize = 32;
+    const GROW: usize = 8 * 1024;
+    // std::fs::read's own answer when the buffer cannot be had.
+    let out_of_memory = |e: std::collections::TryReserveError| {
+        WholeFileError::Transfer(std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))
+    };
     let mut bytes = Vec::new();
     if let Some(size) = size.and_then(|n| usize::try_from(n).ok()) {
-        bytes
-            .try_reserve_exact(size)
-            // std::fs::read's own answer when the buffer cannot be had.
-            .map_err(|e| {
-                WholeFileError::Transfer(std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))
-            })?;
+        bytes.try_reserve_exact(size).map_err(out_of_memory)?;
     }
-    std::io::Read::read_to_end(&mut Plain(reader), &mut bytes).map_err(WholeFileError::Transfer)?;
+    // bytes[..filled] is the file so far; bytes[filled..] is zeroed room.
+    let mut filled = 0;
+    loop {
+        if filled == bytes.capacity() {
+            // Full: the size hint was right (or absent). Probe before growing.
+            let mut probe = [0u8; PROBE];
+            let n = match reader.read(&mut probe) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(WholeFileError::Transfer(e)),
+            };
+            bytes.truncate(filled);
+            bytes.try_reserve(GROW.max(n)).map_err(out_of_memory)?;
+            bytes.extend_from_slice(&probe[..n]);
+            filled += n;
+            continue;
+        }
+        // Zero only room no earlier pass zeroed, so a short read costs nothing.
+        bytes.resize(bytes.capacity(), 0);
+        match reader.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(WholeFileError::Transfer(e)),
+        }
+    }
+    bytes.truncate(filled);
     Ok(bytes)
 }
 
@@ -6016,6 +6048,60 @@ mod os_error_code_tests {
         let bytes = read_opened(std::io::Cursor::new(b"hi".to_vec()), Some(64)).unwrap();
         assert_eq!(bytes, b"hi");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// readFile's success path makes std::fs::read's read calls, no more: with
+    /// the fstat size hint, one read of the whole file and one EOF probe,
+    /// whatever the size. The generic `read_to_end` (no hint) took nine for
+    /// 1 MiB. Short reads, an interrupted read, a stale hint and no hint at
+    /// all still return every byte.
+    #[test]
+    fn read_opened_reads_a_hinted_file_in_two_calls() {
+        struct Counting<R> {
+            inner: R,
+            reads: usize,
+            /// Cap on each read's length (a short-reading source), if any.
+            chunk: Option<usize>,
+            /// Fail this many reads with Interrupted first.
+            interrupts: usize,
+        }
+        impl<R: std::io::Read> std::io::Read for Counting<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                if self.interrupts > 0 {
+                    self.interrupts -= 1;
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                let n = self.chunk.map_or(buf.len(), |c| c.min(buf.len()));
+                self.inner.read(&mut buf[..n])
+            }
+        }
+        let counting = |data: &[u8], chunk, interrupts| Counting {
+            inner: std::io::Cursor::new(data.to_vec()),
+            reads: 0,
+            chunk,
+            interrupts,
+        };
+        for size in [0usize, 1, 4096, 100_000, 1 << 20, 64 << 20] {
+            let data: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let mut reader = counting(&data, None, 0);
+            let bytes = read_opened(&mut reader, Some(size as u64)).unwrap();
+            assert!(bytes == data, "{size} bytes read back wrong");
+            assert_eq!(reader.reads, if size == 0 { 1 } else { 2 }, "{size} bytes");
+        }
+        let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        for (hint, chunk, interrupts) in [
+            (Some(300_000), Some(7_000), 0),
+            (Some(300_000), None, 3),
+            (Some(10), None, 0),
+            (Some(1 << 20), None, 0),
+            (None, None, 0),
+            (None, Some(4_096), 1),
+        ] {
+            let mut reader = counting(&data, chunk, interrupts);
+            let bytes = read_opened(&mut reader, hint).unwrap();
+            assert!(bytes == data, "{hint:?} {chunk:?} {interrupts}");
+        }
     }
 
     /// readFile of a DIRECTORY fails on the read on every platform, as node's
