@@ -32434,10 +32434,13 @@ show('low', [low.serialNumber, low.toLegacyObject().serialNumber]);
 
 /// node connects a socket given `path` (http.request's `socketPath`) to that
 /// Unix domain socket or named pipe, whatever `host` and `port` say, and
-/// never to host:port. oam has no client for either, so the connect fails
-/// with ERR_FEATURE_UNAVAILABLE_ON_PLATFORM -- and nothing reaches the TCP
-/// listener at host:port. Up to 0.16.2 every one of these connected to it
-/// (http.get sent the whole request there).
+/// never to host:port. Dialling a pipe nobody listens on fails with node's
+/// ENOENT; oam's TLS connect has no pipe transport, so tls.connect({ path })
+/// and an https socketPath fail with ERR_FEATURE_UNAVAILABLE_ON_PLATFORM --
+/// and nothing reaches the TCP listener at host:port. Up to 0.16.2 every one
+/// of these connected to it (http.get sent the whole request there); up to
+/// 0.17.1 the net ones failed with ERR_FEATURE_UNAVAILABLE_ON_PLATFORM too
+/// (#219).
 #[test]
 fn a_pipe_path_never_falls_back_to_host_and_port() {
     let script = write_temp(
@@ -32481,16 +32484,165 @@ tcp.close();
     let (stdout, _) = run_script_ok(&script, out);
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
-        "net.connect({path}) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
-         net.connect(path) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
-         net.createConnection(path, cb) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
+        "net.connect({path}) ENOENT\n\
+         net.connect(path) ENOENT\n\
+         net.createConnection(path, cb) ENOENT\n\
          tls.connect({path}) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
-         http.get({socketPath}) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
+         http.get({socketPath}) ENOENT\n\
          https.get({socketPath}) ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
-         http.get({socketPath}) over a keepAlive agent ERR_FEATURE_UNAVAILABLE_ON_PLATFORM\n\
+         http.get({socketPath}) over a keepAlive agent ENOENT\n\
          net.connect({path: 7}) throws ERR_INVALID_ARG_TYPE\n\
          tcp listener reached 0"
     );
+}
+
+/// A pipe path for one e2e test: a Windows named pipe, a Unix domain socket
+/// in the temp dir elsewhere (short enough for `sun_path`).
+fn e2e_pipe_path(tag: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_nanos();
+    let leaf = format!("oam-e2e-{tag}-{}-{nanos}", std::process::id());
+    if cfg!(windows) {
+        format!(r"\\.\pipe\{leaf}")
+    } else {
+        std::env::temp_dir()
+            .join(format!("{leaf}.sock"))
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+/// #219: oam's pipe server and client speak to node's -- a Windows named
+/// pipe, a Unix domain socket elsewhere -- in both directions: 4 MiB through
+/// a server that echoes as it reads, every byte back intact, then the
+/// client's end() and the server's. The server prints its path once
+/// listening and serves until killed; the client checks the echo and exits.
+#[test]
+fn net_pipe_server_and_client_interoperate_with_node() {
+    use std::io::BufRead;
+    if !node_available() {
+        eprintln!("skipping: node not installed (the other end runs on it)");
+        return;
+    }
+    let server = write_temp(
+        "pipe_interop/server.mjs",
+        "import net from 'node:net';\n\
+         const server = net.createServer((c) => {\n\
+           c.on('error', (e) => console.error('server socket error', e.code));\n\
+           c.pipe(c);\n\
+         });\n\
+         server.listen(process.argv[2], () => console.log(server.address()));\n",
+    );
+    let client = write_temp(
+        "pipe_interop/client.mjs",
+        "import net from 'node:net';\n\
+         import crypto from 'node:crypto';\n\
+         const sent = crypto.randomBytes(4 * 1024 * 1024);\n\
+         const sum = (b) => crypto.createHash('sha256').update(b).digest('hex');\n\
+         const s = net.connect(process.argv[2]);\n\
+         const got = [];\n\
+         let n = 0;\n\
+         s.on('connect', () => s.write(sent));\n\
+         s.on('data', (d) => { got.push(d); n += d.length; if (n === sent.length) s.end(); });\n\
+         s.on('end', () => console.log('end'));\n\
+         s.on('error', (e) => console.log('error', e.code));\n\
+         s.on('close', () => console.log('echoed', n, sum(Buffer.concat(got)) === sum(sent)));\n",
+    );
+    for (server_on_oam, tag) in [(true, "oam-serves"), (false, "node-serves")] {
+        let path = e2e_pipe_path(tag);
+        let mut serving = if server_on_oam {
+            oam_command(&["--", server.to_str().unwrap(), &path])
+        } else {
+            let mut cmd = std::process::Command::new("node");
+            cmd.args([server.to_str().unwrap(), &path]);
+            cmd
+        }
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .expect("the server runs");
+        let mut listening = String::new();
+        std::io::BufReader::new(serving.stdout.take().unwrap())
+            .read_line(&mut listening)
+            .expect("the server prints its address");
+        assert_eq!(listening.trim(), path, "{tag}: address() is the path");
+        let out = if server_on_oam {
+            bounded_output(
+                std::process::Command::new("node").args([client.to_str().unwrap(), &path]),
+            )
+        } else {
+            bounded_output(&mut oam_command(&["--", client.to_str().unwrap(), &path]))
+        };
+        let _ = serving.kill();
+        let _ = serving.wait();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "{tag}: client failed: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            stdout.replace("\r\n", "\n"),
+            "end\nechoed 4194304 true\n",
+            "{tag}: every byte comes back, then the end"
+        );
+    }
+}
+
+/// #219: under `--permission` a pipe is a net resource named by its path,
+/// granted only by unrestricted net or by an entry that is exactly that
+/// path -- never by a host entry, and never by a prefix (`C:\x.sock` is not
+/// the host `C`). Refused, listen() and connect() throw node's
+/// ERR_ACCESS_DENIED with the path as the resource, before anything is
+/// bound or dialled.
+#[test]
+fn a_pipe_is_a_net_resource_granted_by_its_exact_path() {
+    let path = e2e_pipe_path("perm");
+    let script = write_temp(
+        "pipe_permission/main.mjs",
+        "import net from 'node:net';\n\
+         const P = process.argv[2];\n\
+         const refused = (f) => { try { f(); return 'allowed'; } catch (e) { return e.code + ' ' + e.permission + ' ' + (e.resource === P); } };\n\
+         const srv = net.createServer((c) => c.end('hi'));\n\
+         const listen = refused(() => srv.listen(P));\n\
+         console.log('listen', listen);\n\
+         if (listen === 'allowed') {\n\
+           await new Promise((r) => srv.once('listening', r));\n\
+           const s = net.connect(P);\n\
+           s.setEncoding('utf8');\n\
+           console.log('data', await new Promise((r) => s.on('data', r)));\n\
+           srv.close();\n\
+         } else {\n\
+           console.log('connect', refused(() => net.connect({ path: P })));\n\
+         }\n",
+    );
+    let run = |grant: &str| {
+        let out = oam(&["--permission", grant, "--", script.to_str().unwrap(), &path]);
+        String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n")
+    };
+    let refused = "listen ERR_ACCESS_DENIED Net true\nconnect ERR_ACCESS_DENIED Net true\n";
+    // A host grant, the pipe's prefix and its first component grant nothing.
+    let prefix = &path[..path.len() - 3];
+    let first = if cfg!(windows) {
+        r"\\.".to_string()
+    } else {
+        "/tmp".to_string()
+    };
+    for grant in [
+        "--allow-net=127.0.0.1".to_string(),
+        format!("--allow-net={prefix}"),
+        format!("--allow-net={first}"),
+    ] {
+        assert_eq!(run(&grant), refused, "{grant}");
+    }
+    assert_eq!(
+        run(&format!("--allow-net=127.0.0.1,{path}")),
+        "listen allowed\ndata hi\n"
+    );
+    assert_eq!(run("--allow-net"), "listen allowed\ndata hi\n");
 }
 
 /// The proxy agents built on `http.request({ method: 'CONNECT' })` --

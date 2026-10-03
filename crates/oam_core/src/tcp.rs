@@ -1,7 +1,11 @@
-//! TCP client and server ops (node:net).
+//! TCP client and server ops (node:net), and the pipe ones that share them.
 //!
 //! Streams are split into independent read and write halves via
-//! `TcpStream::into_split()`. Each half uses the remove-await-reinsert
+//! `TcpStream::into_split()` -- or, for a Windows named pipe or a Unix domain
+//! socket (`net.connect({ path })`, `server.listen(path)`), the halves
+//! [`crate::pipe`] makes -- and every op below takes either kind, so a pipe
+//! socket reads, writes, ends and closes as a TCP one does. Each half uses
+//! the remove-await-reinsert
 //! pattern with its own map, so reads and writes proceed concurrently
 //! without blocking each other. The closed set prevents handle
 //! resurrection when a close races an in-flight read/write -- and holds
@@ -13,11 +17,147 @@ use std::sync::atomic::Ordering;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 
+/// One stream's read half: a TCP connection's, or a pipe's.
+pub(crate) enum ReadHalf {
+    Tcp(OwnedReadHalf),
+    #[cfg(unix)]
+    Unix(tokio::net::unix::OwnedReadHalf),
+    #[cfg(windows)]
+    Pipe(crate::pipe::PipeRead),
+}
+
+impl ReadHalf {
+    async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            ReadHalf::Tcp(reader) => reader.read(buf).await,
+            #[cfg(unix)]
+            ReadHalf::Unix(reader) => reader.read(buf).await,
+            #[cfg(windows)]
+            ReadHalf::Pipe(reader) => reader.read(buf).await,
+        }
+    }
+
+    /// The TCP socket underneath, for the socket option a reset sets.
+    fn tcp(&self) -> Option<&tokio::net::TcpStream> {
+        match self {
+            ReadHalf::Tcp(reader) => Some(reader.as_ref()),
+            _ => None,
+        }
+    }
+}
+
+/// One stream's write half: a TCP connection's, or a pipe's.
+pub(crate) enum WriteHalf {
+    Tcp(OwnedWriteHalf),
+    #[cfg(unix)]
+    Unix(tokio::net::unix::OwnedWriteHalf),
+    #[cfg(windows)]
+    Pipe(crate::pipe::PipeWrite),
+}
+
+impl WriteHalf {
+    fn try_write(&self, data: &[u8]) -> std::io::Result<usize> {
+        match self {
+            WriteHalf::Tcp(writer) => writer.try_write(data),
+            #[cfg(unix)]
+            WriteHalf::Unix(writer) => writer.try_write(data),
+            #[cfg(windows)]
+            WriteHalf::Pipe(writer) => writer.try_write(data),
+        }
+    }
+
+    async fn write_all(&mut self, data: &[u8]) -> std::io::Result<()> {
+        match self {
+            WriteHalf::Tcp(writer) => writer.write_all(data).await,
+            #[cfg(unix)]
+            WriteHalf::Unix(writer) => writer.write_all(data).await,
+            #[cfg(windows)]
+            WriteHalf::Pipe(writer) => writer.write_all(data).await,
+        }
+    }
+
+    /// Whether dropping the half is its whole shutdown, done in the call: a
+    /// socket's is (tokio shuts the write side down when an owned write half
+    /// goes, and the FIN leaves at once). A Windows named pipe's shutdown
+    /// first waits for the peer to read what was written.
+    fn shuts_down_on_drop(&self) -> bool {
+        #[cfg(windows)]
+        {
+            !matches!(self, WriteHalf::Pipe(_))
+        }
+        #[cfg(not(windows))]
+        {
+            true
+        }
+    }
+
+    /// The shutdown of the write side (see [`tcp_shutdown`]). A failure is
+    /// not reported: node's afterShutdown reports none.
+    async fn shutdown(&mut self) {
+        match self {
+            WriteHalf::Tcp(writer) => {
+                let _ = writer.shutdown().await;
+            }
+            #[cfg(unix)]
+            WriteHalf::Unix(writer) => {
+                let _ = writer.shutdown().await;
+            }
+            #[cfg(windows)]
+            WriteHalf::Pipe(writer) => writer.shutdown().await,
+        }
+    }
+
+    /// The TCP socket underneath, for the socket option a reset sets.
+    fn tcp(&self) -> Option<&tokio::net::TcpStream> {
+        match self {
+            WriteHalf::Tcp(writer) => Some(writer.as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Drop the half WITHOUT the shutdown a socket's owned write half sends
+    /// when it goes (see [`discard_writer_reset`]).
+    fn forget(self) {
+        match self {
+            WriteHalf::Tcp(writer) => writer.forget(),
+            #[cfg(unix)]
+            WriteHalf::Unix(writer) => writer.forget(),
+            #[cfg(windows)]
+            WriteHalf::Pipe(writer) => drop(writer),
+        }
+    }
+}
+
+/// A Windows named pipe's halves as the registry keeps them.
+#[cfg(windows)]
+fn pipe_halves(
+    (reader, writer): (crate::pipe::PipeRead, crate::pipe::PipeWrite),
+) -> (ReadHalf, WriteHalf) {
+    (ReadHalf::Pipe(reader), WriteHalf::Pipe(writer))
+}
+
+/// A Unix domain socket's halves as the registry keeps them.
+#[cfg(unix)]
+fn pipe_halves(
+    (reader, writer): (
+        tokio::net::unix::OwnedReadHalf,
+        tokio::net::unix::OwnedWriteHalf,
+    ),
+) -> (ReadHalf, WriteHalf) {
+    (ReadHalf::Unix(reader), WriteHalf::Unix(writer))
+}
+
+/// A listening server: a TCP listener, or a pipe's ([`crate::pipe`]).
+enum Listener {
+    Tcp(tokio::net::TcpListener),
+    Pipe(crate::pipe::PipeListener),
+}
+
 #[derive(Default)]
 pub struct TcpState {
-    readers: HashMap<u64, OwnedReadHalf>,
-    writers: HashMap<u64, OwnedWriteHalf>,
-    listeners: HashMap<u64, tokio::net::TcpListener>,
+    readers: HashMap<u64, ReadHalf>,
+    writers: HashMap<u64, WriteHalf>,
+    listeners: HashMap<u64, Listener>,
     /// Stream handles closed while a half was checked out for an await
     /// (the last half back removes the marker), plus server ids closed
     /// mid-accept (`reinsert_listener` removes those). A stream id used to
@@ -48,18 +188,32 @@ pub struct TcpState {
 
 impl TcpState {
     pub fn register_stream(&mut self, handle: u64, reader: OwnedReadHalf, writer: OwnedWriteHalf) {
-        self.readers.insert(handle, reader);
-        self.writers.insert(handle, writer);
+        self.readers.insert(handle, ReadHalf::Tcp(reader));
+        self.writers.insert(handle, WriteHalf::Tcp(writer));
     }
 
-    /// Both halves, for a TLS upgrade. Both present means nothing is in
-    /// flight, so there is no await to guard and no marker to leave.
+    /// Both halves of a TCP stream, for a TLS upgrade. Both present means
+    /// nothing is in flight, so there is no await to guard and no marker to
+    /// leave. A pipe stream is left where it is: no TLS server runs over a
+    /// pipe.
     pub fn take_halves(&mut self, handle: u64) -> Option<(OwnedReadHalf, OwnedWriteHalf)> {
-        let reader = self.readers.remove(&handle)?;
-        let writer = self.writers.remove(&handle)?;
-        // The stream leaves the registry: so does its parked ops' wake-up.
-        self.cancel.remove(&handle);
-        Some((reader, writer))
+        match (self.readers.remove(&handle), self.writers.remove(&handle)) {
+            (Some(ReadHalf::Tcp(reader)), Some(WriteHalf::Tcp(writer))) => {
+                // The stream leaves the registry: so does its parked ops'
+                // wake-up.
+                self.cancel.remove(&handle);
+                Some((reader, writer))
+            }
+            (reader, writer) => {
+                if let Some(reader) = reader {
+                    self.readers.insert(handle, reader);
+                }
+                if let Some(writer) = writer {
+                    self.writers.insert(handle, writer);
+                }
+                None
+            }
+        }
     }
 
     /// The wake-up of the ops parked on stream `handle` (see [`tcp_close`],
@@ -73,13 +227,13 @@ impl TcpState {
             .clone()
     }
 
-    fn take_reader(&mut self, handle: u64) -> Option<OwnedReadHalf> {
+    fn take_reader(&mut self, handle: u64) -> Option<ReadHalf> {
         let reader = self.readers.remove(&handle)?;
         *self.in_flight.entry(handle).or_insert(0) += 1;
         Some(reader)
     }
 
-    fn take_writer(&mut self, handle: u64) -> Option<OwnedWriteHalf> {
+    fn take_writer(&mut self, handle: u64) -> Option<WriteHalf> {
         let writer = self.writers.remove(&handle)?;
         *self.in_flight.entry(handle).or_insert(0) += 1;
         Some(writer)
@@ -220,7 +374,7 @@ enum Issued {
     Queued { turn: WriteTurn, written: usize },
 }
 
-fn reinsert_reader(registry: &TcpRegistry, handle: u64, reader: OwnedReadHalf) -> bool {
+fn reinsert_reader(registry: &TcpRegistry, handle: u64, reader: ReadHalf) -> bool {
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     if guard.closed.contains(&handle) {
         if guard.reset.contains(&handle) {
@@ -233,7 +387,7 @@ fn reinsert_reader(registry: &TcpRegistry, handle: u64, reader: OwnedReadHalf) -
     }
 }
 
-fn reinsert_writer(registry: &TcpRegistry, handle: u64, writer: OwnedWriteHalf) -> bool {
+fn reinsert_writer(registry: &TcpRegistry, handle: u64, writer: WriteHalf) -> bool {
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     if guard.closed.contains(&handle) {
         if guard.reset.contains(&handle) {
@@ -269,24 +423,24 @@ pub(crate) fn arm_reset(stream: &tokio::net::TcpStream) {
 /// A read half of a reset stream, out of the registry for good. The socket
 /// closes (with the reset) when the last half goes, so each half re-arms
 /// the linger on its way out: the reset may have found neither in the maps.
-fn discard_reader_reset(reader: OwnedReadHalf) {
-    let _ = set_linger_zero(reader.as_ref());
+fn discard_reader_reset(reader: ReadHalf) {
+    if let Some(stream) = reader.tcp() {
+        let _ = set_linger_zero(stream);
+    }
     drop(reader);
 }
 
 /// The write half of a reset stream: dropped WITHOUT the shutdown an owned
 /// write half sends when it goes, which would put a FIN ahead of the reset.
-fn discard_writer_reset(writer: OwnedWriteHalf) {
-    let _ = set_linger_zero(writer.as_ref());
+fn discard_writer_reset(writer: WriteHalf) {
+    if let Some(stream) = writer.tcp() {
+        let _ = set_linger_zero(stream);
+    }
     writer.forget();
 }
 
-/// Reinsert a TcpListener ONLY if it was not closed mid-flight.
-fn reinsert_listener(
-    registry: &TcpRegistry,
-    server_id: u64,
-    listener: tokio::net::TcpListener,
-) -> bool {
+/// Reinsert a listener ONLY if it was not closed mid-flight.
+fn reinsert_listener(registry: &TcpRegistry, server_id: u64, listener: Listener) -> bool {
     let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
     if guard.closed.remove(&server_id) {
         drop(listener);
@@ -504,11 +658,10 @@ pub async fn tcp_connect_pinned(
     let remote_addr = stream.peer_addr().ok();
     let handle = ids.fetch_add(1, Ordering::Relaxed);
     let (reader, writer) = stream.into_split();
-    {
-        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-        guard.readers.insert(handle, reader);
-        guard.writers.insert(handle, writer);
-    }
+    registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .register_stream(handle, reader, writer);
 
     let mut payload = serde_json::json!({ "handle": handle });
     if let Some(la) = local_addr {
@@ -518,6 +671,28 @@ pub async fn tcp_connect_pinned(
         payload["remoteAddr"] = addr_to_json(ra);
     }
     OpOutcome::Json(payload.to_string())
+}
+
+/// net.connect({ path }): dial the Windows named pipe or Unix domain socket
+/// `path` ([`crate::pipe::connect`]) and register the stream with the TCP
+/// ones, so every stream op takes it. Returns Json {handle}: a pipe has no
+/// addresses. A failure rejects with node's `connect ENOENT <path>` shape.
+pub async fn pipe_connect(
+    registry: TcpRegistry,
+    ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    path: String,
+) -> OpOutcome {
+    let (reader, writer) = match crate::pipe::connect(&path).await {
+        Ok(halves) => pipe_halves(halves),
+        Err(e) => return OpOutcome::sys(*e),
+    };
+    let handle = ids.fetch_add(1, Ordering::Relaxed);
+    {
+        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+        guard.readers.insert(handle, reader);
+        guard.writers.insert(handle, writer);
+    }
+    OpOutcome::Json(serde_json::json!({ "handle": handle }).to_string())
 }
 
 /// Read up to `len` bytes from a TCP stream. Remove-await-reinsert on the
@@ -696,7 +871,13 @@ pub fn tcp_shutdown_start(
 ) -> Started<impl std::future::Future<Output = OpOutcome> + Send + 'static> {
     let issued = {
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.write_tail.contains_key(&handle) {
+        // A named pipe's shutdown cannot finish in the call (it waits for
+        // the peer to read): it is queued like one behind a write.
+        let in_call = guard
+            .writers
+            .get(&handle)
+            .is_none_or(WriteHalf::shuts_down_on_drop);
+        if guard.write_tail.contains_key(&handle) || !in_call {
             Issued::Queued {
                 turn: WriteTurn::take(&mut guard, &registry, handle),
                 written: 0,
@@ -718,23 +899,29 @@ pub fn tcp_shutdown_start(
     };
     Started::Pending(async move {
         turn.wait().await;
-        let writer = {
+        let wake;
+        let (writer, woken) = {
             let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-            let writer = guard.take_writer(handle);
-            if writer.is_some() {
-                // The FIN goes out now: from here on a reset is refused.
-                guard.shut_down.insert(handle);
-            }
-            writer
+            let Some(writer) = guard.take_writer(handle) else {
+                return OpOutcome::Done;
+            };
+            // The FIN goes out now: from here on a reset is refused.
+            guard.shut_down.insert(handle);
+            wake = guard.wake_for(handle);
+            (writer, wake.notified())
         };
-        let Some(mut writer) = writer else {
-            return OpOutcome::Done;
-        };
+        let mut writer = writer;
         let _in_flight = InFlight {
             registry: registry.clone(),
             handle,
         };
-        let _ = writer.shutdown().await;
+        // A named pipe's shutdown waits for the peer to read; a close must
+        // not wait for that (see tcp_close), and drops the half at once.
+        tokio::select! {
+            biased;
+            () = writer.shutdown() => {}
+            () = woken => {}
+        }
         drop(writer);
         OpOutcome::Done
     })
@@ -827,9 +1014,11 @@ pub fn tcp_reset(
     state.shut_down.remove(&handle);
     let reader = state.readers.remove(&handle);
     let writer = state.writers.remove(&handle);
+    // A pipe has no reset (node refuses one in JS, ERR_INVALID_HANDLE_TYPE):
+    // were one asked for, it would just close.
     let here = match (&reader, &writer) {
-        (Some(reader), _) => Some(reader.as_ref()),
-        (None, Some(writer)) => Some(writer.as_ref()),
+        (Some(reader), _) => reader.tcp(),
+        (None, Some(writer)) => writer.tcp(),
         (None, None) => None,
     };
     if let Some(Err(e)) = here.map(set_linger_zero) {
@@ -878,7 +1067,7 @@ pub async fn tcp_listen(
         .lock()
         .expect("tcp registry lock")
         .listeners
-        .insert(server_id, listener);
+        .insert(server_id, Listener::Tcp(listener));
 
     OpOutcome::Json(
         serde_json::json!({
@@ -891,18 +1080,60 @@ pub async fn tcp_listen(
     )
 }
 
-/// Accept one connection from a TCP listener. Remove-await-reinsert on the
-/// LISTENER. Splits and stores the accepted stream's read/write halves.
-/// Returns Json {handle, remoteAddr, localAddr?} or Done if listener was
-/// closed -- the accepted socket's own address too, so `socket.address()`,
-/// `localAddress` and `localPort` on a server-side net.Socket answer as
-/// node's do.
+/// net.createServer + server.listen(path): listen on the Windows named pipe
+/// or Unix domain socket `path` ([`crate::pipe::bind`]). Returns Json
+/// {serverId}; [`tcp_accept`] and [`tcp_server_close`] take the server as
+/// they take a TCP one. A failure rejects with node's `listen EADDRINUSE:
+/// address already in use <path>` shape.
+pub async fn pipe_listen(
+    registry: TcpRegistry,
+    ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    path: String,
+) -> OpOutcome {
+    let listener = match crate::pipe::bind(&path) {
+        Ok(listener) => listener,
+        Err(e) => return OpOutcome::sys(*e),
+    };
+    let server_id = ids.fetch_add(1, Ordering::Relaxed);
+    registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .listeners
+        .insert(server_id, Listener::Pipe(listener));
+    OpOutcome::Json(serde_json::json!({ "serverId": server_id }).to_string())
+}
+
+/// A connection a listener accepted.
+enum Accepted {
+    Tcp(tokio::net::TcpStream, std::net::SocketAddr),
+    Pipe(ReadHalf, WriteHalf),
+}
+
+async fn accept_one(listener: &mut Listener) -> std::io::Result<Accepted> {
+    match listener {
+        Listener::Tcp(listener) => {
+            let (stream, peer) = listener.accept().await?;
+            Ok(Accepted::Tcp(stream, peer))
+        }
+        Listener::Pipe(listener) => {
+            let (reader, writer) = pipe_halves(listener.accept().await?);
+            Ok(Accepted::Pipe(reader, writer))
+        }
+    }
+}
+
+/// Accept one connection from a listener, TCP or pipe. Remove-await-reinsert
+/// on the LISTENER. Splits and stores the accepted stream's read/write
+/// halves. Returns Json {handle, remoteAddr, localAddr?} -- for a pipe just
+/// {handle} -- or Done if the listener was closed. The accepted socket's own
+/// address too, so `socket.address()`, `localAddress` and `localPort` on a
+/// server-side net.Socket answer as node's do.
 pub async fn tcp_accept(
     registry: TcpRegistry,
     server_id: u64,
     stream_ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) -> OpOutcome {
-    let (listener, notify) = {
+    let (mut listener, notify) = {
         let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
         // Closed, or another accept already holds the listener. Checked
         // BEFORE the cancel Notify is created: an accept that lands after
@@ -920,19 +1151,21 @@ pub async fn tcp_accept(
     };
 
     tokio::select! {
-        result = listener.accept() => {
-            match result {
-                Ok((stream, peer_addr)) => {
-                    reinsert_listener(&registry, server_id, listener);
-
+        result = accept_one(&mut listener) => {
+            reinsert_listener(&registry, server_id, listener);
+            let accepted = match result {
+                Ok(accepted) => accepted,
+                Err(e) => return tcp_fail(e, "accept"),
+            };
+            let handle = stream_ids.fetch_add(1, Ordering::Relaxed);
+            match accepted {
+                Accepted::Tcp(stream, peer_addr) => {
                     let local_addr = stream.local_addr().ok();
-                    let handle = stream_ids.fetch_add(1, Ordering::Relaxed);
                     let (reader, writer) = stream.into_split();
-                    {
-                        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
-                        guard.readers.insert(handle, reader);
-                        guard.writers.insert(handle, writer);
-                    }
+                    registry
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .register_stream(handle, reader, writer);
 
                     let mut payload = serde_json::json!({
                         "handle": handle,
@@ -943,9 +1176,13 @@ pub async fn tcp_accept(
                     }
                     OpOutcome::Json(payload.to_string())
                 }
-                Err(e) => {
-                    reinsert_listener(&registry, server_id, listener);
-                    tcp_fail(e, "accept")
+                Accepted::Pipe(reader, writer) => {
+                    {
+                        let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.readers.insert(handle, reader);
+                        guard.writers.insert(handle, writer);
+                    }
+                    OpOutcome::Json(serde_json::json!({ "handle": handle }).to_string())
                 }
             }
         }
@@ -1719,5 +1956,228 @@ mod tests {
         assert_eq!(error.address.as_deref(), Some("::"));
         assert_eq!(error.port, Some(local.port()));
         drop(held);
+    }
+
+    /// A pipe path for one test: a Windows named pipe, a Unix domain socket
+    /// in the temp dir elsewhere.
+    fn test_pipe_path(tag: &str) -> String {
+        let leaf = format!("oam-core-{tag}-{}", std::process::id());
+        if cfg!(windows) {
+            format!(r"\\.\pipe\{leaf}")
+        } else {
+            std::env::temp_dir()
+                .join(format!("{leaf}.sock"))
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+
+    fn json(outcome: OpOutcome) -> serde_json::Value {
+        match outcome {
+            OpOutcome::Json(payload) => serde_json::from_str(&payload).unwrap(),
+            _ => panic!("expected a Json outcome"),
+        }
+    }
+
+    /// #219: a pipe server and client go through the very registry ops a
+    /// TCP stream does -- listen, accept, connect, read, write, close -- the
+    /// accept and connect payloads carry no addresses, a closed server's path
+    /// dials ENOENT again (on Unix the socket file is unlinked), and nothing
+    /// is left behind.
+    #[tokio::test]
+    async fn a_pipe_round_trips_through_the_registry_ops() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let path = test_pipe_path("round-trip");
+
+        let server = json(pipe_listen(registry.clone(), ids.clone(), path.clone()).await);
+        let server_id = server["serverId"].as_u64().unwrap();
+        assert_eq!(server.as_object().unwrap().len(), 1, "{server}");
+        // Taken: node's EADDRINUSE, `listen` shaped.
+        match pipe_listen(registry.clone(), ids.clone(), path.clone()).await {
+            OpOutcome::NodeFailed {
+                code,
+                message,
+                syscall,
+                address,
+                port,
+                ..
+            } => {
+                assert_eq!(code, "EADDRINUSE");
+                assert_eq!(
+                    message,
+                    format!("listen EADDRINUSE: address already in use {path}")
+                );
+                assert_eq!(syscall.as_deref(), Some("listen"));
+                assert_eq!(address.as_deref(), Some(path.as_str()));
+                assert_eq!(port, None);
+            }
+            _ => panic!("a second listen on the path must fail"),
+        }
+
+        let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
+        let client = json(pipe_connect(registry.clone(), ids.clone(), path.clone()).await);
+        let accepted = json(accepting.await.unwrap());
+        assert_eq!(client.as_object().unwrap().len(), 1, "{client}");
+        assert_eq!(accepted.as_object().unwrap().len(), 1, "{accepted}");
+        let (c, s) = (
+            client["handle"].as_u64().unwrap(),
+            accepted["handle"].as_u64().unwrap(),
+        );
+
+        assert!(matches!(
+            tcp_write(registry.clone(), c, b"ping".to_vec()).await,
+            OpOutcome::Done
+        ));
+        assert!(matches!(
+            tcp_read(registry.clone(), s, 64).await,
+            OpOutcome::Bytes(b) if b == b"ping"
+        ));
+        assert!(matches!(
+            tcp_write(registry.clone(), s, b"pong".to_vec()).await,
+            OpOutcome::Done
+        ));
+        assert!(matches!(
+            tcp_read(registry.clone(), c, 64).await,
+            OpOutcome::Bytes(b) if b == b"pong"
+        ));
+        // The client goes: the server reads the end of the stream.
+        tcp_close(&registry, c);
+        assert!(matches!(
+            tcp_read(registry.clone(), s, 64).await,
+            OpOutcome::Done
+        ));
+        tcp_close(&registry, s);
+        tcp_server_close(&registry, server_id);
+
+        match pipe_connect(registry.clone(), ids.clone(), path.clone()).await {
+            OpOutcome::NodeFailed {
+                code,
+                message,
+                syscall,
+                address,
+                ..
+            } => {
+                assert_eq!(code, "ENOENT");
+                assert_eq!(message, format!("connect ENOENT {path}"));
+                assert_eq!(syscall.as_deref(), Some("connect"));
+                assert_eq!(address.as_deref(), Some(path.as_str()));
+            }
+            _ => panic!("a closed server's path must not connect"),
+        }
+        let state = registry.lock().unwrap();
+        assert_eq!(state.bookkeeping(), (0, 0, 0, 0, 0));
+        assert!(state.listeners.is_empty());
+    }
+
+    /// #219: a named pipe has no half-close, so its shutdown is libuv's:
+    /// it waits until the peer has read everything written (FlushFileBuffers)
+    /// -- here a write far larger than the pipe's buffer, which the client
+    /// does not read for a while -- and then ends the stream both ways: the
+    /// side that shut down reads EOF, and once it closes, so does the peer.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_named_pipe_shutdown_waits_for_the_peer_then_ends_both_ways() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let path = test_pipe_path("shutdown");
+        let server_id =
+            json(pipe_listen(registry.clone(), ids.clone(), path.clone()).await)["serverId"]
+                .as_u64()
+                .unwrap();
+        let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
+        let c = json(pipe_connect(registry.clone(), ids.clone(), path.clone()).await)["handle"]
+            .as_u64()
+            .unwrap();
+        let s = json(accepting.await.unwrap())["handle"].as_u64().unwrap();
+
+        const LEN: usize = 1024 * 1024;
+        let writing = tokio::spawn(tcp_write(registry.clone(), s, vec![7u8; LEN]));
+        let shutting = tokio::spawn(tcp_shutdown(registry.clone(), s));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !shutting.is_finished(),
+            "the shutdown waits for the peer to read"
+        );
+
+        let mut read = 0;
+        while read < LEN {
+            match tcp_read(registry.clone(), c, 65536).await {
+                OpOutcome::Bytes(b) => read += b.len(),
+                _ => panic!("the client reads every byte before any end"),
+            }
+        }
+        assert!(matches!(writing.await.unwrap(), OpOutcome::Done));
+        let shut = tokio::time::timeout(std::time::Duration::from_secs(10), shutting).await;
+        assert!(matches!(shut, Ok(Ok(OpOutcome::Done))));
+        // Ended both ways: the side that shut down reads EOF at once.
+        assert!(matches!(
+            tcp_read(registry.clone(), s, 64).await,
+            OpOutcome::Done
+        ));
+        tcp_close(&registry, s);
+        assert!(matches!(
+            tcp_read(registry.clone(), c, 64).await,
+            OpOutcome::Done
+        ));
+        tcp_close(&registry, c);
+        tcp_server_close(&registry, server_id);
+        assert_eq!(registry.lock().unwrap().bookkeeping(), (0, 0, 0, 0, 0));
+    }
+
+    /// #219: a read parked on a named pipe when its own side shuts down ends
+    /// like an EOF, and a close during a shutdown that is still waiting for
+    /// the peer does not wait for it.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn a_named_pipe_shutdown_ends_a_parked_read_and_a_close_does_not_wait_for_it() {
+        let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
+        let ids = std::sync::Arc::new(AtomicU64::new(1));
+        let path = test_pipe_path("parked");
+        let server_id =
+            json(pipe_listen(registry.clone(), ids.clone(), path.clone()).await)["serverId"]
+                .as_u64()
+                .unwrap();
+        let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
+        let c = json(pipe_connect(registry.clone(), ids.clone(), path.clone()).await)["handle"]
+            .as_u64()
+            .unwrap();
+        let s = json(accepting.await.unwrap())["handle"].as_u64().unwrap();
+
+        // Nothing written: the shutdown has nothing to wait for, and the
+        // server's parked read ends.
+        let parked = tokio::spawn(tcp_read(registry.clone(), s, 64));
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(matches!(
+            tcp_shutdown(registry.clone(), s).await,
+            OpOutcome::Done
+        ));
+        let ended = tokio::time::timeout(std::time::Duration::from_secs(5), parked).await;
+        assert!(matches!(ended, Ok(Ok(OpOutcome::Done))));
+        tcp_close(&registry, s);
+
+        // The client writes what the server never reads, shuts down, and is
+        // closed while that shutdown still waits: the close is at once.
+        let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
+        let c2 = json(pipe_connect(registry.clone(), ids.clone(), path.clone()).await)["handle"]
+            .as_u64()
+            .unwrap();
+        let s2 = json(accepting.await.unwrap())["handle"].as_u64().unwrap();
+        // More than the pipe's buffer and the read the server's end keeps
+        // in flight on its own can hold.
+        let writing = tokio::spawn(tcp_write(registry.clone(), c2, vec![1u8; 1024 * 1024]));
+        let shutting = tokio::spawn(tcp_shutdown(registry.clone(), c2));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!shutting.is_finished(), "nobody has read the 1 MiB yet");
+        tcp_close(&registry, c2);
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(5), shutting).await;
+        assert!(matches!(closed, Ok(Ok(OpOutcome::Done))));
+        let written = tokio::time::timeout(std::time::Duration::from_secs(5), writing).await;
+        assert!(written.is_ok(), "the write settles too");
+
+        tcp_close(&registry, c);
+        tcp_close(&registry, s2);
+        tcp_server_close(&registry, server_id);
+        assert_eq!(registry.lock().unwrap().bookkeeping(), (0, 0, 0, 0, 0));
     }
 }

@@ -1220,9 +1220,11 @@
     throw codes.ERR_INVALID_ARG_VALUE("options", options);
   }
   // listen(path): node listens on that Unix domain socket or Windows named
-  // pipe. oam has no pipe server, so the listen fails -- on the next tick,
-  // as a bind that fails does -- instead of binding a TCP port nobody asked
-  // for (up to 0.17.1 the name was read as port 0). True when it refused.
+  // pipe. A net server does (net.Server#listen); oam's tls, http, https and
+  // http2 servers are native and TCP-only, so theirs fails -- on the next
+  // tick, as a bind that fails does -- instead of binding a TCP port nobody
+  // asked for (up to 0.17.1 the name was read as port 0). True when it
+  // refused.
   function refusePipeListen(server, listen) {
     if (listen.path === undefined) return false;
     if (listen.cb !== null) server.once("listening", listen.cb);
@@ -26072,12 +26074,13 @@
       }
     }
 
-    // node connects a socket given `path` to that Unix domain socket or
+    // node connects a TLS socket given `path` over that Unix domain socket or
     // Windows named pipe (lib/net.js: `const pipe = !!path`), whatever host
-    // and port also say -- http.request's `socketPath` arrives this way. oam
-    // has no client for either, so the connect fails, on the next tick as a
-    // refused one does, rather than going to host:port, where something else
-    // may be listening. True when it refused.
+    // and port also say -- https.request's `socketPath` arrives this way.
+    // oam's TLS connect is TCP only (net.Socket's pipe connect is
+    // _connectPipe), so the connect fails, on the next tick as a refused one
+    // does, rather than going to host:port, where something else may be
+    // listening. True when it refused.
     function refusePipeConnect(self, options) {
       const path = options.path;
       if (!path) return false;
@@ -26336,10 +26339,14 @@
           this._handle = options._handle;
           this.connecting = false;
           this._everConnected = true;
+          // A pipe server's connection: a Pipe handle in node, which has no
+          // addresses and no reset.
+          if (options._pipe === true) this._pipeHandle = true;
           // Pre-connected socket (server accept, HTTP/WS upgrade): node has a
-          // live TCPSocketWrap the moment the wrapper exists, so it shows up in
+          // live TCPSocketWrap (a PipeWrap for a pipe's) the moment the
+          // wrapper exists, so it shows up in
           // _getActiveHandles()/getActiveResourcesInfo() immediately.
-          registry._activeHandles.set(this, "TCPSocketWrap");
+          registry._activeHandles.set(this, options._pipe === true ? "PipeWrap" : "TCPSocketWrap");
           if (options._remoteAddr) {
             this.remoteAddress = options._remoteAddr.address;
             this.remotePort = options._remoteAddr.port;
@@ -26385,7 +26392,10 @@
         // -- oam's connect() does not reset `destroyed`, so destroy() and
         // _doClose() both early-return and the entry would be pinned in this
         // strong Map for the process lifetime (one per socket).
-        if (!this.destroyed) registry._activeHandles.set(this, "TCPSocketWrap");
+        // A pipe's is a PipeWrap (node: `pipe ? new Pipe(...) : new TCP(...)`).
+        if (!this.destroyed) {
+          registry._activeHandles.set(this, options.path ? "PipeWrap" : "TCPSocketWrap");
+        }
         // Node queues writes (and the end() FIN) issued before the
         // connection exists: _issue() holds their native halves from here
         // on, and _releaseHeldOps() hands them over once the connect
@@ -26418,14 +26428,33 @@
           }
           this._startConnect(connecting, host, port);
         };
-        if (refusePipeConnect(this, options)) {
-          // node's socket holds a Pipe handle from here: resetAndDestroy()
-          // refuses it.
-          this._pipeConnect = true;
+        // node: `const pipe = !!path` -- a path names a Unix domain socket or
+        // a Windows named pipe, whatever host and port also say
+        // (http.request's `socketPath` arrives this way).
+        if (options.path) {
+          this._connectPipe(options.path);
           return this;
         }
         lookupAndConnect(this, options, host, options.port, dial);
         return this;
+      }
+
+      // node's connect() to a pipe (lib/net.js: validateString(path), then
+      // internalConnect(this, path)): no lookup, no 'lookup' event; a
+      // failure is `connect ENOENT <path>` with the path as `address` and no
+      // port, on a later tick; the connected socket has no addresses
+      // (address() is {}). The stream is then a TCP registry handle like any
+      // other, so reading, writing, end() and destroy() are net.Socket's own.
+      // Throws what node's throws (ERR_INVALID_ARG_TYPE for a non-string
+      // path) and, as a TCP connect does, oam's --allow-net refusal.
+      _connectPipe(path) {
+        if (typeof path !== "string") {
+          throw codes.ERR_INVALID_ARG_TYPE("options.path", "string", path);
+        }
+        // node's socket holds a Pipe handle from here: resetAndDestroy()
+        // refuses it.
+        this._pipeHandle = true;
+        this._startConnect(natives.pipeConnect(path), path, undefined);
       }
 
       // The native connect in flight: its success handler and failure
@@ -27421,10 +27450,11 @@
         if (this._handle !== null) natives.tcpSetRef(this._handle, false);
         return this;
       }
-      // `{}` without a handle -- before connect and again after close --
-      // else the local endpoint in node's key order (probed on v22.22.2).
+      // `{}` without a handle -- before connect and again after close -- and
+      // on a pipe (node's Pipe handle has no getsockname), else the local
+      // endpoint in node's key order (probed on v22.22.2).
       address() {
-        if (this._handle === null) return {};
+        if (this._handle === null || this._pipeHandle === true) return {};
         return {
           address: this.localAddress,
           family: this.localFamily || this.remoteFamily || "IPv4",
@@ -27506,7 +27536,7 @@
       // node's handle exists from connect() until the socket is destroyed.
       // oam's TCP handle appears only once connected; its TLS sockets', and
       // a pipe's, never do.
-      if (this[kNotTcpHandle] === true || this._pipeConnect === true) {
+      if (this[kNotTcpHandle] === true || this._pipeHandle === true) {
         if (!this.destroyed) throw codes.ERR_INVALID_HANDLE_TYPE();
       } else if (this.connecting && this[kNativeConnection] === undefined) {
         // (The fetch path's stand-in reads as connecting until the response
@@ -27579,6 +27609,8 @@
         super();
         if (typeof options === "function") { connectionListener = options; options = {}; }
         if (connectionListener) this.on("connection", connectionListener);
+        // node's Server: every accepted socket is made with it.
+        this.allowHalfOpen = (options && options.allowHalfOpen) || false;
         this[kNetServerLike] = true;
         this[kServerConns] = new Set();
         this._serverId = null;
@@ -27591,24 +27623,33 @@
         // node's reading of the arguments; a port that is not one throws
         // from here (#163).
         const listen = normalizeListenArgs(args);
-        if (refusePipeListen(this, listen)) return this;
-        const { port, host, ipv6Only, cb } = listen;
+        const { port, host, ipv6Only, path, cb } = listen;
+        // A path: a Unix domain socket or a Windows named pipe. node names
+        // the server by it from here on -- address() answers the path once
+        // listening, and still after close() (`this._pipeName`).
+        if (path !== undefined) this._pipeName = path;
+        // Node binds (and so creates the TCPServerWrap -- a PipeWrap for a
+        // pipe) synchronously inside listen(); createServer() alone
+        // registers nothing. Probed: after createServer()
+        // _getActiveHandles() is [], on the line after listen(0) it is
+        // [Server] / ["TCPServerWrap"].
+        const binding = path !== undefined
+          ? natives.pipeListen(path)
+          // No host: node's default, dual-stack `::` (#172).
+          : natives.tcpListen(host || null, port, ipv6Only);
         if (cb !== null) this.once("listening", cb);
-        // Node binds (and so creates the TCPServerWrap) synchronously inside
-        // listen(); createServer() alone registers nothing. Probed: after
-        // createServer() _getActiveHandles() is [], on the line after
-        // listen(0) it is [Server] / ["TCPServerWrap"].
-        registry._activeHandles.set(this, "TCPServerWrap");
+        registry._activeHandles.set(this, path !== undefined ? "PipeWrap" : "TCPServerWrap");
         // Supersede any in-flight accept loop from a previous listen() so
         // its tail cannot unregister this fresh registration.
         this._listenGeneration = (this._listenGeneration || 0) + 1;
-        // No host: node's default, dual-stack `::` (#172).
-        natives.tcpListen(host || null, port, ipv6Only).then(
+        binding.then(
           (bound) => {
             this._serverId = bound.serverId;
-            this._port = bound.port;
-            this._host = bound.hostname;
-            this._family = bound.family;
+            // A pipe has no port, host or family: a null port is what marks
+            // the server as a pipe's while it listens.
+            this._port = path === undefined ? bound.port : null;
+            this._host = path === undefined ? bound.hostname : null;
+            this._family = path === undefined ? bound.family : undefined;
             this.listening = true;
             // unref() before listen(): node remembers it (`this._unref`) and
             // applies it once the handle is bound -- here before the accept
@@ -27620,6 +27661,9 @@
           (err) => {
             // Bind failed -- there is no live handle to introspect.
             registry._activeHandles.delete(this);
+            // node's uvExceptionWithHostPort(err, 'listen', path, -1): a
+            // pipe's listen error carries port -1, last of its keys.
+            if (path !== undefined && err && err.syscall === "listen") err.port = -1;
             this.emit("error", err);
           },
         );
@@ -27647,6 +27691,9 @@
             _handle: accepted.handle,
             _remoteAddr: accepted.remoteAddr,
             _localAddr: accepted.localAddr,
+            // A pipe server's connections are pipes: no addresses.
+            _pipe: this._port === null,
+            allowHalfOpen: this.allowHalfOpen,
           });
           // node's `this._connections`, the number getConnections() answers
           // with: a connection counts from the accept until its socket's own
@@ -27682,9 +27729,12 @@
       }
 
       address() {
-        return this.listening
-          ? { address: this._host, family: this._family, port: this._port }
-          : null;
+        if (this.listening && this._port !== null) {
+          return { address: this._host, family: this._family, port: this._port };
+        }
+        // A pipe server is named by its path from listen(path) on, even
+        // after close() (node's `_pipeName`).
+        return this._pipeName !== undefined ? this._pipeName : null;
       }
 
       close(cb) {

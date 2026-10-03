@@ -2925,15 +2925,12 @@ oam's own client (entry 38). Up to 0.16.2 every request went there, and agents, 
   decides "is this https?" by looking for Node's own `node:https:` frame on the stack; oam's
   `https.request` and `https.get` run in frames named `node:https` for it, so a stack
   trace through them shows that name where it used to show `oam:node_compat.js`.
-- **Pipes.** oam has no client for a Unix domain socket or a Windows named pipe, so
-  `net.connect({ path })`, `net.connect(path)`, `tls.connect({ path })` and an http(s)
-  request's `socketPath` fail with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` where Node connects
-  to the pipe; a non-string `path` throws Node's `ERR_INVALID_ARG_TYPE`. Up to 0.16.2 they
-  connected to `host:port` instead (http.request sent the whole request there). There is
-  no pipe server either: `server.listen(path)` and `listen({ path })` -- on a `net`, `tls`,
-  `http`, `https` or `http2` server -- emit `'error'` with the same code where Node listens
-  on the pipe. Up to 0.17.1 the name was read as port 0 and the server bound a TCP port
-  nobody had asked for.
+- **Pipes.** An http request's `socketPath` goes over `net.connect({ path })` to that Unix
+  domain socket or Windows named pipe, as in Node, and never to `host:port` (entry 49). An
+  https request's `socketPath`, like `tls.connect({ path })`, still fails with
+  `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`: oam has no TLS over a pipe. Up to 0.16.2 they all
+  connected to `host:port` instead (http.request sent the whole request there); up to
+  0.17.1 the http ones failed with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` too.
 - **`--permission`.** The request is a `net.connect` / `tls.connect`, and its grant is
   checked as theirs is: `host:port`, and each address a `lookup` hook answers as `addr:port`
   (entry 4).
@@ -3115,6 +3112,72 @@ the process exits once its continuation has run
   node's worker sees `[object SharedArrayBuffer]` and its writes reach the main thread), so a
   cross-thread `Atomics.notify` / `waitAsync` pair cannot be set up between threads at all.
   Same-thread `waitAsync` works as in Node.
+
+### 49. `net` over a pipe (a Windows named pipe, a Unix domain socket): what differs
+
+Since 0.17.2 a `net` socket connects to a pipe and a `net` server listens on one, as in
+Node (#219): `net.connect({ path })`, `net.connect(path)`, `net.createConnection(path)`,
+`new net.Socket().connect(path)`, and `server.listen(path)` / `listen({ path })` on a
+`net.createServer()` server. The stream is a `net.Socket` like a TCP one -- `write`,
+`'data'`, `end()`, `destroy()`, backpressure, `ref`/`unref` -- and the http client rides on
+it, so `http.request({ socketPath })` works (entry 43). What Node reports is reported:
+`address()` is `{}` on a pipe socket and the path on a pipe server (still after
+`close()`), the socket has no remote or local address, `resetAndDestroy()` throws
+`ERR_INVALID_HANDLE_TYPE`, `getActiveResourcesInfo()` lists a `PipeWrap`, a pipe nobody
+listens on is `connect ENOENT <path>` (errno, code, syscall, address), one already taken is
+`listen EADDRINUSE: address already in use <path>` with `port: -1`, and a closed server's
+path dials `ENOENT` again (on Unix the socket file is unlinked on close, as libuv does). On
+Windows the name goes to the OS as written: `\\.\pipe\x`, `\\?\pipe\x`, `//./pipe/x` and
+another letter case name one pipe; a name that is not a pipe's cannot be listened on
+(`listen EACCES`), and dialling a regular file is `ENOTSOCK`, a directory `EPERM`. A named
+pipe has no half-close, so `end()` behaves as libuv's shutdown does: it waits until the peer
+has read everything written, then the stream ends both ways -- the side that ended reads
+its own `'end'` too, and a peer that writes after it gets `EPIPE`
+(`conformance/cases/371-net-pipe-connect-listen.mjs`, `372-net-pipe-windows-names.mjs`; the
+e2e test `net_pipe_server_and_client_interoperate_with_node` runs each side against Node's).
+Up to 0.17.1 every one of these failed with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` (and up
+to 0.16.2 the server bound a TCP port and the client dialled `host:port`), which is what
+left `@playwright/mcp --isolated` -- a browser server on a pipe, its client dialling it --
+booting and then failing every browser tool.
+
+- **No TLS, http or http2 server over a pipe.** `tls.connect({ path })` and an https
+  request's `socketPath` fail with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`; so does
+  `listen(path)` on a `tls`, `http`, `https` or `http2` server (an `'error'`, on the next
+  tick). oam's TLS connect and those servers are native and TCP-only; `net` is the one
+  carried over to pipes.
+- **`--permission`.** A pipe is a net resource named by its path: granted by unrestricted
+  `--allow-net`, or by an entry that is exactly that path (`--allow-net=\\.\pipe\app`,
+  `--allow-net=/run/app.sock`) -- never by a host entry, a prefix, or a `C` read out of
+  `C:\x.sock` -- for connect and listen alike, refused with `ERR_ACCESS_DENIED` thrown from
+  the call. Node 22's permission model has no network category; the choice is oam's, made so
+  that a grant for one service cannot reach `\\.\pipe\docker_engine` or
+  `/var/run/docker.sock`.
+- **Windows: remote clients and impersonation.** oam's pipe server refuses clients on other
+  machines (`PIPE_REJECT_REMOTE_CLIENTS`) and its client lets the server identify, not
+  impersonate, it (`SECURITY_IDENTIFICATION`); libuv sets neither, so a Node server takes
+  `\\host\pipe\x` clients. _(source)_
+- **Windows: one waiting instance.** libuv keeps four pipe instances waiting for clients;
+  oam keeps one and makes the next as soon as a client takes it. A client that finds every
+  instance taken waits for one, as libuv's does, up to 30 s (`ETIMEDOUT` after that). Many
+  clients at once all connect (25 at once measured, as in Node).
+- **Windows: read size and bulk throughput.** A pipe read hands at most 4 KiB at a time (the
+  named-pipe layer under tokio reads into a 4 KiB buffer), where Node's reads are up to
+  64 KiB: `'data'` chunks are smaller, and an 8 MiB echo took ~115-150 ms on a debug build
+  where Node took ~30-40 ms (TCP on the same build: ~35-40 ms). _(measured, debug build)_
+- **Windows: a pipe that is read-only or write-only to the caller.** libuv retries a dial
+  that was denied read-write as read-only, then write-only; oam does not, and reports the
+  denial (`EPERM`). _(source)_
+- **`readableAll` / `writableAll`** (`listen({ path, readableAll: true })`) are ignored: the
+  pipe keeps the default permissions where Node widens them. _(source)_
+- **Linux abstract sockets.** A path starting with a NUL byte (`'\0name'`) is refused with
+  `EINVAL`; Node binds and dials it in the abstract namespace. _(source)_
+- **Unix.** The Unix domain socket half is the same code path as TCP's streams (a real
+  half-close, as Node's), compiled and linted for Linux, but its runs so far are Windows
+  only: cases 371 and the interop e2e test have not yet been executed on Linux or macOS.
+  _(source)_
+- **No `ConnectWrap`.** While a pipe connect is in flight `getActiveResourcesInfo()` lists
+  the `PipeWrap` but not Node's `ConnectWrap` -- as oam's TCP connect lists no
+  `TCPConnectWrap`.
 
 ### `err.syscall` on `fs.opendir`
 

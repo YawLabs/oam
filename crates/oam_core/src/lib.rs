@@ -39,6 +39,10 @@ pub mod inspector;
 /// The outbound TCP connector net.connect and tls.connect share: node's
 /// lookupAndConnectMultiple algorithm and its error shapes.
 pub mod net_connect;
+/// Windows named pipes and Unix domain sockets for node:net
+/// (`net.connect({ path })`, `server.listen(path)`); their streams live in
+/// the TCP registry.
+mod pipe;
 /// Inbound OS signal delivery (SIGTERM/SIGINT/SIGHUP). Unix uses
 /// tokio::signal::unix; Windows uses SetConsoleCtrlHandler. Both feed the op
 /// channel with an OpCompletion{ id: SIGNAL_OP_ID, .. } that the engine

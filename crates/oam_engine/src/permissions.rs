@@ -205,6 +205,19 @@ impl PermValue {
         }
     }
 
+    /// Exact match on a pipe's path, as written: a Windows named pipe
+    /// (`\\.\pipe\name`) or a Unix domain socket (`/run/app.sock`). No
+    /// host:port reading -- `C:\app.sock` is not host `C` -- and no prefix:
+    /// a grant for one pipe admits no other, so `--allow-net=<one pipe>`
+    /// never reaches `\\.\pipe\docker_engine` or `/var/run/docker.sock`.
+    pub fn allows_net_path(&self, path: &str) -> bool {
+        match self {
+            PermValue::All => true,
+            PermValue::None => false,
+            PermValue::List(list) => list.iter().any(|item| item == path),
+        }
+    }
+
     /// Exact match on a `host[:port]`. An entry carrying a port matches only
     /// that port; a bare-host entry matches the host on any port.
     ///
@@ -367,6 +380,21 @@ impl Permissions {
             Err(PermissionDenial {
                 permission: "Net",
                 resource: host.to_string(),
+            })
+        }
+    }
+
+    /// Returns `Err(denial)` when `net` is denied for the pipe `path` -- a
+    /// Windows named pipe or a Unix domain socket a net socket connects to
+    /// or a net server listens on ([`PermValue::allows_net_path`]: granted
+    /// by unrestricted net, or by an entry that is exactly that path).
+    pub fn check_net_path(&self, path: &str) -> Result<(), PermissionDenial> {
+        if self.net.allows_net_path(path) {
+            Ok(())
+        } else {
+            Err(PermissionDenial {
+                permission: "Net",
+                resource: path.to_string(),
             })
         }
     }
@@ -755,6 +783,36 @@ mod tests {
         );
         assert!(p.check_net("api.github.com.attacker.net").is_err());
         assert!(p.check_net("api.github.com.evil.example").is_err());
+    }
+
+    #[test]
+    fn a_pipe_path_is_granted_only_by_an_entry_that_is_exactly_it() {
+        let p = perms(
+            PermValue::None,
+            PermValue::List(vec![
+                r"\\.\pipe\app".to_string(),
+                "/run/app.sock".to_string(),
+                "C".to_string(),
+            ]),
+            PermValue::None,
+        );
+        assert!(p.check_net_path(r"\\.\pipe\app").is_ok());
+        assert!(p.check_net_path("/run/app.sock").is_ok());
+        // No prefix: another pipe, a longer name, a socket under the path.
+        assert!(p.check_net_path(r"\\.\pipe\app2").is_err());
+        assert!(p.check_net_path(r"\\.\pipe\docker_engine").is_err());
+        assert!(p.check_net_path("/run/app.sock.d/x").is_err());
+        // No host:port reading: `C:\x.sock` is not the host `C`.
+        assert!(p.check_net_path(r"C:\x.sock").is_err());
+        let denial = p.check_net_path(r"\\.\pipe\other").unwrap_err();
+        assert_eq!(
+            (denial.permission, denial.resource.as_str()),
+            ("Net", r"\\.\pipe\other")
+        );
+        let all = perms(PermValue::None, PermValue::All, PermValue::None);
+        assert!(all.check_net_path(r"\\.\pipe\anything").is_ok());
+        let none = perms(PermValue::None, PermValue::None, PermValue::None);
+        assert!(none.check_net_path(r"\\.\pipe\app").is_err());
     }
 
     #[test]
