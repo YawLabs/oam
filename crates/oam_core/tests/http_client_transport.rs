@@ -340,6 +340,35 @@ async fn a_dispatcher_pool_reuses_connections_and_asks_the_hook_once_per_connect
     .await;
 }
 
+/// #179: the fetch op claims its dispatcher's pool while JS waits on it, so
+/// a `close()` in the same tick as the `fetch()` finds the pool and drops
+/// it. When the fetch's future created the pool, a close() that ran first
+/// found none, and the pool the future then created stayed open, with its
+/// connection, for the rest of the run. Only a hooked fetch that names a
+/// dispatcher claims one: no hook, or a connect function, takes none.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fetch_op_claims_its_dispatchers_pool_before_close_can_run() {
+    let transport = transport(ProxySource::None);
+    let mut hooked = oam_core::ops::parse_fetch_request(
+        r#"{"url":"http://a.test/","lookup_hook":true,"lookup_pool":11}"#,
+    )
+    .unwrap();
+    hooked.claim_agent_pool(&transport);
+    assert!(hooked.agent_pool.is_some());
+    assert!(transport.drop_agent(11), "close() finds the claimed pool");
+    assert!(!transport.drop_agent(11), "dropped once");
+    for json in [
+        r#"{"url":"http://a.test/","lookup_pool":12}"#,
+        r#"{"url":"http://a.test/","lookup_hook":true,"connect_hook":true,"lookup_pool":12}"#,
+        r#"{"url":"http://a.test/","lookup_hook":true}"#,
+    ] {
+        let mut request = oam_core::ops::parse_fetch_request(json).unwrap();
+        request.claim_agent_pool(&transport);
+        assert!(request.agent_pool.is_none(), "{json}");
+        assert!(!transport.drop_agent(12), "{json}");
+    }
+}
+
 /// A hook answer opens the connection it was asked for and is spent there:
 /// the request that carries it never takes an idle connection instead, and
 /// the next connection to the same authority asks again -- the hook's call

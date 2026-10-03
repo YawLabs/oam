@@ -404,6 +404,9 @@ fn op_fetch(
     }
     let cancel =
         cancel_id.map(|id| oam_core::ops::FetchCancel::register(&core.fetch_cancels(), id));
+    // A connect.lookup dispatcher's pool, claimed now, while JS waits: its
+    // close() in the same tick as this fetch must find the pool to drop.
+    request.claim_agent_pool(&transport);
     spawn_op(
         scope,
         &mut rv,

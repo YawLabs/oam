@@ -78,6 +78,18 @@ impl Default for HttpTransport {
     }
 }
 
+/// A `connect.lookup` dispatcher's connection pool, claimed for one fetch
+/// ([`HttpTransport::agent_pool`]).
+#[derive(Clone)]
+pub struct AgentPool(Pool);
+
+impl AgentPool {
+    /// The route a fetch takes on this pool.
+    pub fn route(self, attempt_timeout: Duration, tls_range: TlsRange) -> Route {
+        Route::new(attempt_timeout, tls_range, Some(self.0))
+    }
+}
+
 impl HttpTransport {
     /// Platform TLS, the environment proxy, `user-agent: oam/<version>`.
     /// Infallible, and needs no runtime: building the pool spawns nothing.
@@ -177,6 +189,14 @@ impl HttpTransport {
     /// The pool lives until [`HttpTransport::drop_agent`] -- the
     /// dispatcher's `close()` or `destroy()`, or its collection.
     pub fn agent_route(&self, agent: u64, attempt_timeout: Duration, tls_range: TlsRange) -> Route {
+        self.agent_pool(agent).route(attempt_timeout, tls_range)
+    }
+
+    /// The pool of [`HttpTransport::agent_route`], created on first use.
+    /// Synchronous: the fetch op claims it before JS runs again
+    /// ([`super::send::FetchRequest::claim_agent_pool`]), so a dispatcher's
+    /// `close()` right after its `fetch()` finds the pool to drop.
+    pub fn agent_pool(&self, agent: u64) -> AgentPool {
         let pool = self
             .agents
             .lock()
@@ -184,7 +204,7 @@ impl HttpTransport {
             .entry(agent)
             .or_insert_with(|| self.hooked_pool())
             .clone();
-        Route::new(attempt_timeout, tls_range, Some(pool))
+        AgentPool(pool)
     }
 
     /// Close every connection the dispatcher `agent` pooled, and forget its

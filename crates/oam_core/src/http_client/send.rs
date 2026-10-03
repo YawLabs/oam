@@ -7,7 +7,7 @@
 //! -- the first request, every redirect hop that needs a new connection, and
 //! no request that finds a pooled one -- so an SSRF or DNS-rebind guard vets
 //! a 302 to an internal name too. The dispatcher's connections are pooled
-//! across its fetches (`HttpTransport::agent_route`). The op cannot call JS
+//! across its fetches (`HttpTransport::agent_pool`). The op cannot call JS
 //! while it runs, so when a send needs a new connection to a host name and
 //! has no answer for it, the loop PARKS: it stores its whole state -- the
 //! unsent request included -- in [`FetchContinuations`] and resolves with
@@ -60,7 +60,7 @@ use super::redirect::{self, Next};
 use super::sent::Dispatched;
 use super::tls_config::{Alpn, TlsRange};
 use super::transport::{channel_body, channel_body_then, empty_body, full_body};
-use super::{HttpTransport, NetCheck, NetTarget, ReqBody, Route};
+use super::{AgentPool, HttpTransport, NetCheck, NetTarget, ReqBody, Route};
 use crate::OpOutcome;
 use crate::OutboundBodies;
 use crate::net_connect::attempt_timeout_from_ms;
@@ -96,10 +96,14 @@ pub struct FetchRequest {
     #[serde(default)]
     pub lookup_hook: bool,
     /// With `lookup_hook`: the id of the dispatcher whose pool the fetch's
-    /// connections come from (`HttpTransport::agent_route`). Absent: a pool
+    /// connections come from (`HttpTransport::agent_pool`). Absent: a pool
     /// of the fetch's own.
     #[serde(default)]
     pub lookup_pool: Option<u64>,
+    /// That pool, claimed by [`FetchRequest::claim_agent_pool`]. Never from
+    /// JS. Without it a hooked fetch has a pool of its own.
+    #[serde(skip)]
+    pub agent_pool: Option<AgentPool>,
     /// The dispatcher carries a `connect` FUNCTION: run in connector mode
     /// (see the module docs). Wins over `lookup_hook`.
     #[serde(default)]
@@ -364,6 +368,29 @@ pub fn fetch_cancel(id: u64, cancels: &FetchCancels) -> bool {
     }
 }
 
+impl FetchRequest {
+    /// Take the dispatcher's pool ([`HttpTransport::agent_pool`]) for a
+    /// fetch in hook mode that names one: its `lookup_pool`. Called by the
+    /// engine's fetch op while JS waits on it, never from the fetch's
+    /// future: the dispatcher's `close()` or `destroy()` drops its pool
+    /// synchronously (`HttpTransport::drop_agent`), and a pool first created
+    /// by the future -- once that future ran on the runtime, after a
+    /// `close()` in the same tick as the `fetch()` -- was created after the
+    /// drop and stayed open, with its connections, until the idle reaper,
+    /// and its entry for the rest of the run. Claimed here, the pool exists
+    /// before any later JS can run, and a `close()` after the call finds and
+    /// drops it; one before the call has JS leave `lookup_pool` out
+    /// (bootstrap.js), and the fetch keeps a pool of its own.
+    pub fn claim_agent_pool(&mut self, transport: &HttpTransport) {
+        if self.lookup_hook
+            && !self.connect_hook
+            && let Some(agent) = self.lookup_pool
+        {
+            self.agent_pool = Some(transport.agent_pool(agent));
+        }
+    }
+}
+
 /// reqwest's h2 retry allowance (retry.rs, `max_retries_per_request`).
 pub const MAX_H2_RETRIES: u32 = 2;
 
@@ -558,8 +585,8 @@ pub async fn fetch(
     let route = if req.connect_hook {
         transport.supplied_route(attempt_timeout, tls_range)
     } else {
-        match (req.lookup_hook, req.lookup_pool) {
-            (true, Some(agent)) => transport.agent_route(agent, attempt_timeout, tls_range),
+        match (req.lookup_hook, req.agent_pool) {
+            (true, Some(pool)) => pool.route(attempt_timeout, tls_range),
             (hooked, _) => transport.route(hooked, attempt_timeout, tls_range),
         }
         .with_connect_timeout(connect_timeout_from_ms(req.connect_timeout_ms))

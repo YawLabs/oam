@@ -7271,6 +7271,51 @@ server.close();
     );
 }
 
+/// #179: `agent.close()` in the same tick as a `fetch()` through it closes
+/// the connection that fetch opens, once its response is read, as node's
+/// does. The fetch's future created the dispatcher's pool when it first ran
+/// -- after that close(), which then found no pool to drop -- and the pool
+/// it made kept the connection open until the 90 s idle reaper (20 of 20
+/// rounds left open on a debug build). The engine's fetch op now claims the
+/// pool before JS runs on. Measured on node v22.22.2 + undici 6.24.1, same
+/// script: every round's connection closes, and every fetch answers 200.
+#[test]
+fn a_dispatcher_closed_in_the_tick_of_its_fetch_closes_that_fetchs_connection() {
+    let script = write_temp(
+        "fetch_lookup_close_race/main.mjs",
+        r#"import http from 'node:http';
+import { Agent } from 'undici';
+let closed = 0;
+const server = http.createServer((req, res) => res.end('ok'));
+// The server never closes a connection: what closes one is the client.
+server.keepAliveTimeout = 0;
+server.on('connection', (s) => s.on('close', () => closed++));
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const lookup = (h, o, cb) => cb(null, [{ address: '127.0.0.1', family: 4 }]);
+const rounds = 8;
+let left = 0;
+const statuses = new Set();
+for (let i = 0; i < rounds; i++) {
+  const agent = new Agent({ connect: { lookup } });
+  const before = closed;
+  const pending = fetch(`http://pinned.test:${server.address().port}/`, { dispatcher: agent });
+  agent.close();
+  const res = await pending;
+  statuses.add(res.status + ' ' + await res.text());
+  const deadline = Date.now() + 5000;
+  while (closed === before && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+  if (closed === before) left++;
+}
+console.log([...statuses].join(','), 'left open', left, 'of', rounds);
+server.closeAllConnections();
+server.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(stdout.trim(), "200 ok left open 0 of 8", "stderr: {stderr}");
+}
+
 /// A hooked fetch's h2 resends are counted across the park for the hook: a
 /// resend that needs a new connection parks for the hook's answer, and the
 /// resumed hop used to start counting from zero again, so an origin that
