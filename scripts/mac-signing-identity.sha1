@@ -3,14 +3,13 @@
 # lines are ignored, and what remains must be empty or exactly one 40-hex-digit
 # fingerprint (colons, spaces and case do not matter).
 #
-# BOOTSTRAP: no fingerprint below yet. The identity has not been provisioned,
-# so the mac leg signs AD-HOC (hardened runtime + the entitlements, no
-# certificate) and warns loudly; OAM_SIGN_REQUIRED=1 refuses that instead.
-# Once a fingerprint is committed here, signing with exactly that certificate
-# is mandatory: a mac leg that cannot use it fails the release.
+# Pinned: "oam Code Signing (self-signed)", O=Yaw Labs, valid to 2048-08-28,
+# generated on the build Mac with scripts/provision-mac-signing.sh --generate
+# and backed up off that host. Signing with exactly this certificate is
+# mandatory: a mac leg that cannot use it fails the release. (While this file
+# held no fingerprint, the mac leg signed AD-HOC and warned.)
 #
-# To fill it in: on the build Mac run
-#     bash scripts/provision-mac-signing.sh --generate
-# back up oam-codesign.p12 + oam-codesign.p12-password off that host, and put
-# the printed sha1 on its own line below, in the same commit that says so.
-# Rotating it (a new identity, or the Developer ID) is the same edit.
+# Rotating it (a new identity, or the Developer ID) is the same edit: provision
+# the new identity (streamed: ssh <mac> 'bash -s -- --generate' <
+# scripts/provision-mac-signing.sh), back it up, and replace the line below.
+5186628807511f9c1b81fd87bbfe0b2c02b0c647
