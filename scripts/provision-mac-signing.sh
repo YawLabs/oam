@@ -279,7 +279,7 @@ EOF
   # The backup p12 is protected by its own password, stored next to it. Both
   # files are needed to restore. Written BEFORE the keychain is built, so a
   # working keychain can never exist alongside a backup nobody can open.
-  ( umask 077; printf '%s' "$p12_pw" > "$P12_PW_FILE" )
+  ( umask 077; printf '%s' "$p12_pw" > "$P12_PW_FILE" ) || fail "could not write $P12_PW_FILE"
   sha="$(create_keychain_with "$P12_FILE" "$p12_pw")"
   trap - EXIT
   note "generated identity \"$CERT_NAME\""
@@ -297,8 +297,8 @@ do_import() {
   trap cleanup_partial EXIT
   mkdir -p "$SIGN_DIR"; chmod 700 "$SIGN_DIR"
   ( umask 077
-    cp "$src_p12" "$P12_FILE"
-    cp "$src_pw_file" "$P12_PW_FILE" )
+    cp "$src_p12" "$P12_FILE" && cp "$src_pw_file" "$P12_PW_FILE" ) \
+    || fail "could not copy the backup into $SIGN_DIR"
   sha="$(create_keychain_with "$P12_FILE" "$(cat "$src_pw_file")")"
   trap - EXIT
   note "imported identity, sha1 $sha -- this must equal scripts/mac-signing-identity.sha1"

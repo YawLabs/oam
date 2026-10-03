@@ -72,7 +72,6 @@ Other modes are streamed the same way:
 ssh <mac> 'bash -s -- <mode> [args]' < scripts/provision-mac-signing.sh
 ```
 
-
 - `--check` proves the identity can sign from an ssh session. Once a SHA-1 is
   pinned, the release preflight runs it this way before it tags.
 - `--import <oam-codesign.p12> <oam-codesign.p12-password>`, with both paths
