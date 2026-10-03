@@ -135,8 +135,16 @@ fn resolve_against_cwd(raw: &str) -> std::borrow::Cow<'_, str> {
 /// judged "not a pipe" only has the fs grants asked as well -- the check
 /// fails closed. Any other component the normaliser could alter (`pipe.`,
 /// `pipe `) already fails the exact `pipe` match below.
+///
+/// A path with a NUL byte is not in the namespace either: the OS reads it
+/// only up to the NUL, so `\\.\pipe\` + NUL + `x` opens the pipe file
+/// system's root, not a pipe ([`Permissions::check_pipe`] refuses such a
+/// path outright; this keeps the judgement closed on its own).
 #[cfg(windows)]
 fn is_named_pipe_namespace(path: &str) -> bool {
+    if path.contains('\0') {
+        return false;
+    }
     let dots_and_spaces = |c: &str| !c.is_empty() && c.bytes().all(|b| b == b'.' || b == b' ');
     // The server of the local device root `\\.\` is the one `.` allowed.
     let mut components = path.split(['\\', '/']).enumerate();
@@ -550,20 +558,40 @@ impl Permissions {
     /// whatever the name means after a `process.chdir` made before the op
     /// runs. With nothing restricted the path is returned as given, at no
     /// cost. The denial names the path as given, as an fs op's does.
+    ///
+    /// A path with a NUL byte in it is refused whenever anything is
+    /// restricted, before it is judged at all: the OS reads a pipe name only
+    /// up to its first NUL (CreateFileW takes a NUL-terminated string, and a
+    /// `sun_path` is one too), so the path judged would not be the path
+    /// opened -- `<dir>\a.txt\0\..\box\x.sock` names `box\x.sock` to the
+    /// grants and `<dir>\a.txt` to the OS. node's libuv refuses such a name
+    /// with EINVAL (the JS raises that first, and the op refuses it again),
+    /// so no working path is lost. The denial names the first restricted
+    /// permission of net, read and write.
     pub fn check_pipe<'a>(
         &self,
         path: &'a str,
     ) -> Result<std::borrow::Cow<'a, str>, PermissionDenial> {
+        let denied = |permission| PermissionDenial {
+            permission,
+            resource: path.to_string(),
+        };
+        if path.contains('\0') {
+            return match (&self.net, &self.read, &self.write) {
+                (PermValue::All, PermValue::All, PermValue::All) => {
+                    Ok(std::borrow::Cow::Borrowed(path))
+                }
+                (PermValue::All, PermValue::All, _) => Err(denied("FileSystemWrite")),
+                (PermValue::All, _, _) => Err(denied("FileSystemRead")),
+                _ => Err(denied("Net")),
+            };
+        }
         let fs_path = !is_named_pipe_namespace(path);
         let fs_restricted = fs_path
             && !(matches!(self.read, PermValue::All) && matches!(self.write, PermValue::All));
         if matches!(self.net, PermValue::All) && !fs_restricted {
             return Ok(std::borrow::Cow::Borrowed(path));
         }
-        let denied = |permission| PermissionDenial {
-            permission,
-            resource: path.to_string(),
-        };
         let resolved = resolve_against_cwd(path);
         if !self.net.allows_net_path(&resolved) {
             return Err(denied("Net"));
@@ -1066,6 +1094,50 @@ mod tests {
             read_only.check_pipe(&file).unwrap_err().permission,
             "FileSystemWrite"
         );
+        // The OS reads a pipe name only up to a NUL: the first path would be
+        // judged as `box\x.sock` and open `secret.txt`, the second judged a
+        // pipe and open the pipe file system's root. Refused whatever the
+        // rest of it says, whenever anything is restricted.
+        let sep = std::path::MAIN_SEPARATOR;
+        let truncated = format!("{outside}\0{sep}..{sep}box{sep}x.sock");
+        for name in [truncated.as_str(), "\\\\.\\pipe\\\0x"] {
+            assert!(!is_named_pipe_namespace(name), "{name:?}");
+            let denial = p.check_pipe(name).unwrap_err();
+            assert_eq!(
+                (denial.permission, denial.resource.as_str()),
+                ("FileSystemRead", name),
+            );
+            assert_eq!(
+                read_only.check_pipe(name).unwrap_err().permission,
+                "FileSystemRead"
+            );
+            let write_restricted = Permissions {
+                read: PermValue::All,
+                ..p.clone()
+            };
+            assert_eq!(
+                write_restricted.check_pipe(name).unwrap_err().permission,
+                "FileSystemWrite"
+            );
+            let net_listed = Permissions {
+                read: PermValue::All,
+                write: PermValue::All,
+                net: PermValue::List(vec![name.to_string(), file.clone()]),
+                ..p.clone()
+            };
+            assert_eq!(
+                net_listed.check_pipe(name).unwrap_err().permission,
+                "Net",
+                "{name:?}: not even an entry that is exactly it"
+            );
+            // Nothing restricted: nothing to judge, the op refuses it.
+            let all = Permissions {
+                read: PermValue::All,
+                write: PermValue::All,
+                ..p.clone()
+            };
+            assert!(all.check_pipe(name).is_ok(), "{name:?}");
+        }
         if cfg!(windows) {
             // The named-pipe namespace is no file: net alone decides.
             for name in [

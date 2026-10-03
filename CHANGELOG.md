@@ -48,7 +48,7 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   `net.createConnection(path)`, `socket.connect(path)` and a net server's `listen(path)` /
   `listen({ path })` work over a Windows named pipe or a Unix domain socket, with node's
   events, `address()` shapes and errors (`connect ENOENT <path>`, `listen EADDRINUSE` with
-  port -1), and `http.request({ socketPath })` rides on them, so `@playwright/mcp --isolated`
+  port -1, `EINVAL` for a name with a NUL byte in it), and `http.request({ socketPath })` rides on them, so `@playwright/mcp --isolated`
   now works on oam. On Windows a server keeps four instances waiting and a dial to a busy pipe
   waits with `WaitNamedPipeW`, as libuv's do (200 clients at once connect in tens of ms), and
   a write is done once the pipe has taken all but its last 64 KiB. TLS over a pipe, and

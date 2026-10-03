@@ -34558,6 +34558,131 @@ fn a_pipe_path_that_is_a_file_needs_the_fs_grants_and_resolves_against_the_cwd()
     }
 }
 
+/// Regression guard: the OS reads a pipe name only up to its first NUL
+/// (CreateFileW takes a NUL-terminated string), while the pipe gate judged
+/// the whole string -- `<dir>\secret.txt` + NUL + `\..\box\x.sock` was
+/// judged as `box\x.sock` and opened `secret.txt`, and `\\.\pipe\` + NUL +
+/// `x` was judged a pipe and opened the pipe file system's root. node's
+/// libuv refuses such a name with EINVAL before anything is opened, and so
+/// does oam now, in node's shape (measured on v22.22.2), from every pipe
+/// entry point and whatever the grants: `connect EINVAL <path> - Local
+/// (undefined:undefined)` on a later tick, and a listen's `listen EINVAL:
+/// invalid argument <path>` with port -1. (node's own http.request over
+/// such a socketPath dies of an unhandled 'error' on the socket; oam's
+/// request reports it.)
+#[test]
+fn a_pipe_path_with_a_nul_byte_is_einval_as_on_node() {
+    let dir = write_temp("pipe_nul/box/.keep", "")
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let secret = write_temp("pipe_nul/secret.txt", "s");
+    let script = write_temp(
+        "pipe_nul/main.cjs",
+        "const net = require('node:net');\n\
+         const http = require('node:http');\n\
+         const util = require('node:util');\n\
+         const path = require('node:path');\n\
+         const [dir, secret, withHttp] = process.argv.slice(2);\n\
+         const paths = [secret + '\\0' + path.sep + '..' + path.sep + 'box' + path.sep + 'x.sock', '\\\\\\\\.\\\\pipe\\\\\\0x'];\n\
+         const shape = (P, e, msg) => [e.code, util.getSystemErrorName(e.errno), e.syscall, e.address === P, e.port, e.message === msg, Object.keys(e).join(',')].join(' ');\n\
+         const one = (label, P, f) => new Promise((done) => {\n\
+           const connectMsg = 'connect EINVAL ' + P + ' - Local (undefined:undefined)';\n\
+           const listenMsg = 'listen EINVAL: invalid argument ' + P;\n\
+           try {\n\
+             const h = f(P);\n\
+             h.on('error', (e) => { console.log(label, shape(P, e, label.includes(' listen') ? listenMsg : connectMsg)); done(); });\n\
+             h.on('connect', () => { console.log(label, 'connected'); h.destroy(); done(); });\n\
+             h.on('listening', () => { console.log(label, 'listening'); h.close(); done(); });\n\
+           } catch (e) { console.log(label, 'threw', e.code); done(); }\n\
+         });\n\
+         (async () => {\n\
+           for (const [i, P] of paths.entries()) {\n\
+             await one(i + ' net.connect', P, (p) => net.connect(p));\n\
+             await one(i + ' net.createConnection', P, (p) => net.createConnection({ path: p }));\n\
+             await one(i + ' socket.connect', P, (p) => new net.Socket().connect(p));\n\
+             await one(i + ' listen', P, (p) => net.createServer().listen(p));\n\
+             await one(i + ' listen({path})', P, (p) => net.createServer().listen({ path: p }));\n\
+             if (withHttp) await one(i + ' http socketPath', P, (p) => http.get({ socketPath: p, path: '/' }));\n\
+           }\n\
+           console.log('done');\n\
+         })();\n",
+    );
+    let dir_s = dir.to_string_lossy().into_owned();
+    let secret_s = secret.to_string_lossy().into_owned();
+    let box_dir = dir.join("box").to_string_lossy().into_owned();
+    let run = |grants: &[String], with_http: bool| {
+        let mut args: Vec<String> = grants.to_vec();
+        args.extend([
+            "--".to_string(),
+            script.to_string_lossy().into_owned(),
+            dir_s.clone(),
+            secret_s.clone(),
+        ]);
+        if with_http {
+            args.push("1".to_string());
+        }
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = oam(&args);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n")
+    };
+    let connect = "EINVAL EINVAL connect true  true errno,code,syscall,address";
+    let listen = "EINVAL EINVAL listen true -1 true code,errno,syscall,address,port";
+    let mut expected = String::new();
+    for i in 0..2 {
+        for label in ["net.connect", "net.createConnection", "socket.connect"] {
+            expected.push_str(&format!("{i} {label} {connect}\n"));
+        }
+        for label in ["listen", "listen({path})"] {
+            expected.push_str(&format!("{i} {label} {listen}\n"));
+        }
+    }
+    expected.push_str("done\n");
+    if node_available() {
+        let node = std::process::Command::new("node")
+            .args([script.to_str().unwrap(), &dir_s, &secret_s])
+            .output()
+            .expect("node runs");
+        assert_eq!(
+            String::from_utf8_lossy(&node.stdout).replace("\r\n", "\n"),
+            expected,
+            "node's own answer"
+        );
+    }
+    assert_eq!(run(&[], false), expected);
+    // Under --permission, whatever the grants: the same EINVAL, before any
+    // grant is consulted and before anything is opened.
+    for grants in [
+        vec![
+            "--permission".to_string(),
+            "--allow-net".to_string(),
+            format!("--allow-fs-read={box_dir}"),
+            format!("--allow-fs-write={box_dir}"),
+        ],
+        vec![
+            "--permission".to_string(),
+            "--allow-net".to_string(),
+            "--allow-fs-read=*".to_string(),
+            "--allow-fs-write=*".to_string(),
+        ],
+    ] {
+        assert_eq!(run(&grants, false), expected, "{grants:?}");
+    }
+    // http.request's socketPath reaches the pipe through net.connect.
+    let with_http = run(&[], true);
+    for i in 0..2 {
+        let line = format!("{i} http socketPath {connect}\n");
+        assert!(with_http.contains(&line), "{line:?} in {with_http}");
+    }
+}
+
 /// The proxy agents built on `http.request({ method: 'CONNECT' })` --
 /// `tunnel` (behind @actions/http-client, global-tunnel-ng, tunnel-agent) and
 /// `hpagent` -- get their tunnel: node emits 'connect' on the ClientRequest

@@ -686,6 +686,9 @@ pub async fn pipe_connect(
     path: String,
     target: String,
 ) -> OpOutcome {
+    if let Err(e) = crate::pipe::refuse_nul("connect", &target, &path) {
+        return OpOutcome::sys(*e);
+    }
     let (reader, writer) = match crate::pipe::connect(&target, &path).await {
         Ok(halves) => pipe_halves(halves),
         Err(e) => return OpOutcome::sys(*e),
@@ -1096,6 +1099,9 @@ pub async fn pipe_listen(
     path: String,
     target: String,
 ) -> OpOutcome {
+    if let Err(e) = crate::pipe::refuse_nul("listen", &target, &path) {
+        return OpOutcome::sys(*e);
+    }
     let listener = match crate::pipe::bind(&target, &path) {
         Ok(listener) => listener,
         Err(e) => return OpOutcome::sys(*e),

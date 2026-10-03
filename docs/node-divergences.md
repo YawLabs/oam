@@ -3332,14 +3332,17 @@ it, so `http.request({ socketPath })` works (entry 43). What Node reports is rep
 `close()`), the socket has no remote or local address, `resetAndDestroy()` throws
 `ERR_INVALID_HANDLE_TYPE`, `getActiveResourcesInfo()` lists a `PipeWrap`, a pipe nobody
 listens on is `connect ENOENT <path>` (errno, code, syscall, address), one already taken is
-`listen EADDRINUSE: address already in use <path>` with `port: -1`, and a closed server's
-path dials `ENOENT` again (on Unix the socket file is unlinked on close, as libuv does). On
-Windows the name goes to the OS as written: `\\.\pipe\x`, `\\?\pipe\x`, `//./pipe/x` and
-another letter case name one pipe; a name that is not a pipe's cannot be listened on
-(`listen EACCES`), and dialling a regular file is `ENOTSOCK`, a directory `EPERM`. A named
-pipe has no half-close, so `end()` behaves as libuv's shutdown does: it waits until the peer
-has read everything written, then the stream ends both ways -- the side that ended reads
-its own `'end'` too, and a peer that writes after it gets `EPIPE`
+`listen EADDRINUSE: address already in use <path>` with `port: -1`, a name with a NUL byte
+in it is `connect EINVAL <path> - Local (undefined:undefined)` or `listen EINVAL: invalid
+argument <path>` before anything is opened (libuv refuses it, as the OS would read the name
+only up to the NUL; e2e test `a_pipe_path_with_a_nul_byte_is_einval_as_on_node`), and a
+closed server's path dials `ENOENT` again (on Unix the socket file is unlinked on close, as
+libuv does). On Windows the name goes to the OS as written: `\\.\pipe\x`, `\\?\pipe\x`,
+`//./pipe/x` and another letter case name one pipe; a name that is not a pipe's cannot be
+listened on (`listen EACCES`), and dialling a regular file is `ENOTSOCK`, a directory
+`EPERM`. A named pipe has no half-close, so `end()` behaves as libuv's shutdown does: it
+waits until the peer has read everything written, then the stream ends both ways -- the
+side that ended reads its own `'end'` too, and a peer that writes after it gets `EPIPE`
 (`conformance/cases/375-net-pipe-connect-listen.mjs`, `376-net-pipe-windows-names.mjs`; the
 e2e test `net_pipe_server_and_client_interoperate_with_node` runs each side against Node's).
 Up to 0.17.1 every one of these failed with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` (and up

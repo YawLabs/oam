@@ -65,6 +65,30 @@ pub(crate) fn listen_error(
     })
 }
 
+/// libuv's refusal of a pipe name with a NUL byte in it (`includes_nul` in
+/// `uv_pipe_connect2` / `uv_pipe_bind2`): EINVAL, before anything is opened,
+/// as node's `connect EINVAL <path>` / `listen EINVAL: invalid argument
+/// <path>`. The OS reads a name only up to its first NUL (CreateFileW takes
+/// a NUL-terminated string; a `sun_path` is one), so such a name would open
+/// a path other than the one given. node's JS raises this first; the op
+/// refuses again whatever reaches it, `target` (what would be opened) as
+/// well as `path` (what the error names). oam has no Linux abstract sockets
+/// (a leading NUL, which libuv lets through there), so every NUL is refused.
+pub(crate) fn refuse_nul(syscall: &str, target: &str, path: &str) -> Result<(), Box<NodeSysError>> {
+    if !target.contains('\0') && !path.contains('\0') {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    let error = std::io::Error::from_raw_os_error(libc::EINVAL);
+    #[cfg(not(unix))]
+    let error = std::io::Error::from(std::io::ErrorKind::InvalidInput);
+    Err(if syscall == "listen" {
+        listen_error("EINVAL", &error, path)
+    } else {
+        connect_error_coded("EINVAL", &error, path)
+    })
+}
+
 #[cfg(windows)]
 pub(crate) use windows::{PipeListener, PipeRead, PipeWrite, bind, connect};
 
@@ -788,5 +812,31 @@ mod unix {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// A pipe name with a NUL byte is refused before anything is opened,
+    /// with libuv's EINVAL in node's shape (node v22.22.2: `connect EINVAL
+    /// <path>`, `listen EINVAL: invalid argument <path>`), whether the NUL
+    /// is in the name the script gave or in the one the gate resolved.
+    #[test]
+    fn a_pipe_name_with_a_nul_byte_is_einval() {
+        let expected_errno = if cfg!(windows) { -4071 } else { -22 };
+        for (target, path) in [("a\0b", "a\0b"), ("a\0b", "b"), ("b", "a\0b")] {
+            let e = super::refuse_nul("connect", target, path).unwrap_err();
+            assert_eq!(e.code, "EINVAL");
+            assert_eq!(e.message, format!("connect EINVAL {path}"));
+            assert_eq!(e.errno, Some(expected_errno));
+            assert_eq!(e.syscall.as_deref(), Some("connect"));
+            assert_eq!(e.address.as_deref(), Some(path));
+            let e = super::refuse_nul("listen", target, path).unwrap_err();
+            assert_eq!(e.message, format!("listen EINVAL: invalid argument {path}"));
+            assert_eq!(e.errno, Some(expected_errno));
+            assert_eq!(e.syscall.as_deref(), Some("listen"));
+        }
+        assert!(super::refuse_nul("connect", r"\\.\pipe\x", r"\\.\pipe\x").is_ok());
+        assert!(super::refuse_nul("listen", "/tmp/x.sock", "/tmp/x.sock").is_ok());
     }
 }

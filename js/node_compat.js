@@ -27701,6 +27701,42 @@
       self.destroy(err);
     }
 
+    // libuv's `includes_nul` (uv_pipe_connect2 / uv_pipe_bind2): a pipe name
+    // with a NUL byte in it is UV_EINVAL before anything is opened -- on
+    // Linux only after its first byte, which marks an abstract socket. The
+    // OS would read the name only up to the NUL, so it would open a path
+    // other than the one given.
+    function pipeNameHasNul(path) {
+      return path.indexOf("\0", process.platform === "linux" ? 1 : 0) !== -1;
+    }
+
+    // node's error for that EINVAL (measured on v22.22.2), raised where
+    // libuv's synchronous refusal surfaces: connect's
+    // `ExceptionWithHostPort(err, 'connect', path, undefined, details)`,
+    // whose details are the pipe's empty sockname (`connect EINVAL <path> -
+    // Local (undefined:undefined)`; keys errno, code, syscall, address), and
+    // listen's `uvExceptionWithHostPort(err, 'listen', path, -1)` (`listen
+    // EINVAL: invalid argument <path>`; the port is added where every pipe
+    // listen error gets it).
+    function pipeNulError(syscall, path) {
+      const entry = Array.from(uvErrnoTable(natives)).find(([, e]) => e[0] === "EINVAL");
+      const errno = entry === undefined ? undefined : entry[0];
+      if (syscall === "connect") {
+        const e = new Error("connect EINVAL " + path + " - Local (undefined:undefined)");
+        e.errno = errno;
+        e.code = "EINVAL";
+        e.syscall = "connect";
+        e.address = path;
+        return e;
+      }
+      const e = new Error("listen EINVAL: invalid argument " + path);
+      e.code = "EINVAL";
+      e.errno = errno;
+      e.syscall = "listen";
+      e.address = path;
+      return e;
+    }
+
     // destroy()'s two deferred emissions (see Socket.prototype.destroy).
     // The flags flip before the listeners run, as node's emitErrorNT /
     // emitCloseNT flip them, so a listener that throws -- or an 'error' with
@@ -28184,6 +28220,12 @@
         // node's socket holds a Pipe handle from here: resetAndDestroy()
         // refuses it.
         this._pipeHandle = true;
+        if (pipeNameHasNul(path)) {
+          // node: libuv refuses the name synchronously and internalConnect
+          // destroys the socket with it on a later tick.
+          process.nextTick(connectErrorNT, this, pipeNulError("connect", path));
+          return;
+        }
         this._startConnect(natives.pipeConnect(path), path, undefined);
       }
 
@@ -29382,7 +29424,11 @@
         // _getActiveHandles() is [], on the line after listen(0) it is
         // [Server] / ["TCPServerWrap"].
         const binding = path !== undefined
-          ? natives.pipeListen(path)
+          // A name libuv refuses (EINVAL for a NUL byte) fails as a bind
+          // does: 'error' on a later tick, the server never listening.
+          ? (typeof path === "string" && pipeNameHasNul(path)
+            ? Promise.reject(pipeNulError("listen", path))
+            : natives.pipeListen(path))
           // No host: node's default, dual-stack `::` (#172).
           : natives.tcpListen(host || null, port, ipv6Only);
         if (cb !== null) this.once("listening", cb);
