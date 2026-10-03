@@ -34308,9 +34308,17 @@
           try { natives.fetchBodyChannelCancel(this._bodyStream); } catch (_) { /* gone */ }
         }
         if (session) {
-          if (this._id !== undefined) session._streams.delete(this._id);
-          else session._pendingStreams.delete(this);
-          setImmediate(function () { session._maybeDestroy(); });
+          if (this._id !== undefined) {
+            session._streams.delete(this._id);
+            session._streamsClosed++;
+          } else {
+            session._pendingStreams.delete(this);
+          }
+          setImmediate(function () {
+            session._maybeDestroy();
+            // A GOAWAY held for this stream's close (_flushGoaways).
+            session._flushGoaways();
+          });
         }
         // RST code 8 is how a client aborts, and not an error (node).
         if (err == null && code !== NGHTTP2_NO_ERROR && code !== NGHTTP2_CANCEL) {
@@ -34502,6 +34510,9 @@
         this._goawayQueue = [];
         this._goawaysOver = false;
         this._headsSettled = 0;
+        this._streamsClosed = 0;
+        // Closed gracefully before the h2 layer was up (_closeSession).
+        this._closingOnOpen = false;
         this._goawaysDone = null;
         this._goawaysDoneResolve = function () {};
         this._nextStreamId = 1;
@@ -34544,7 +34555,7 @@
         var self = this;
         this._opening = natives.http2SessionOpen(pipe.id).then(function (opened) {
           var sid = opened.session;
-          if (self._state.destroyed) {
+          if (self._state.destroyed && !self._closingOnOpen) {
             natives.http2SessionDestroy(sid);
             throw h2Error("ERR_HTTP2_INVALID_SESSION", "The session has been destroyed");
           }
@@ -34592,15 +34603,24 @@
       // Report the queued GOAWAY frames whose preceding response heads have
       // all been reported, as node reports a head before the GOAWAY that
       // follows it in the bytes; once the connection is over and every
-      // answer it carried has come (goawaysOver), every one.
+      // answer it carried has come (goawaysOver), every one. A closed
+      // session also holds one until the streams that ended before it in
+      // the bytes have closed, the connection over or not: node's goes, and
+      // reads no more, when its last stream closes, so a GOAWAY after that
+      // stream's end -- the one a server sends as it ends the connection --
+      // is not reported.
       // `_goawaysDone` resolves at the first, or at the end without one.
       _flushGoaways() {
         var queue = this._goawayQueue;
-        while (queue.length > 0 && (this._goawaysOver || queue[0].headsBefore <= this._headsSettled)) {
+        while (queue.length > 0 &&
+            (this._goawaysOver || queue[0].headsBefore <= this._headsSettled) &&
+            (!this._state.closed || queue[0].endsBefore <= this._streamsClosed)) {
           this._onGoaway(queue.shift());
           this._goawaysDoneResolve();
         }
-        if (this._goawaysOver && queue.length === 0) this._goawaysDoneResolve();
+        // One still held waits on streams that are themselves waiting for
+        // the connection's end to be reported: it does not hold that up.
+        if (this._goawaysOver) this._goawaysDoneResolve();
       }
 
       // Resolves once every request made on the session has its answer
@@ -34738,7 +34758,33 @@
         if (this._state.closed || this._state.destroyed) return;
         this._state.closed = true;
         if (typeof callback === "function") this.once("close", callback);
+        this._sendGoaway();
         this._maybeDestroy();
+      }
+
+      // node's close() sends its GOAWAY at once, the streams still open
+      // (after 'connect' when it has not connected): nghttp2 sends it
+      // ahead of the requests made in the same tick, which the peer then
+      // refuses. A peer that sent its own GOAWAY first answers with another
+      // and ends the connection once its streams are done; told only once
+      // those are done, node's server no longer reads, and neither side
+      // would close (#185). hyper sends one more when the streams are done,
+      // as node's destroy() does. The session may be destroyed by then --
+      // closed with nothing open -- and its GOAWAY still goes, as node's.
+      _sendGoaway() {
+        var self = this;
+        var send = function () {
+          if (self._sid !== null) natives.http2SessionSendGoaway(self._sid);
+        };
+        if (this._sid !== null) {
+          send();
+        } else if (this.connecting) {
+          this.once("connect", function () {
+            if (self._opening !== null) self._opening.then(send, function () {});
+          });
+        } else if (this._opening !== null) {
+          this._opening.then(send, function () {});
+        }
       }
 
       // node's kMaybeDestroy: a closed session with nothing open goes.
@@ -34783,11 +34829,28 @@
           self._finishSessionClose(socket, error);
         };
         // A graceful close lets hyper write its GOAWAY before the socket is
-        // ended; the pipe's out side ends once it has.
-        if (state.closed && error == null && this._sid !== null && pipe !== null && socket && !socket.destroyed) {
-          natives.http2SessionClose(this._sid);
-          pipe.outDone.then(finish);
-          return;
+        // ended; the pipe's out side ends once it has. A session closed
+        // before its h2 layer was up -- at 'connect', or before it, with
+        // nothing open -- waits for it, so the preface, SETTINGS and the
+        // GOAWAYs still go out, as node's do.
+        var graceful = function () {
+          if (self._sid !== null && !socket.destroyed) {
+            natives.http2SessionClose(self._sid);
+            pipe.outDone.then(finish);
+            return;
+          }
+          finish();
+        };
+        if (state.closed && error == null && pipe !== null && socket && !socket.destroyed) {
+          if (this._sid === null && this._opening !== null) {
+            this._closingOnOpen = true;
+            this._opening.then(graceful, finish);
+            return;
+          }
+          if (this._sid !== null) {
+            graceful();
+            return;
+          }
         }
         finish();
       }

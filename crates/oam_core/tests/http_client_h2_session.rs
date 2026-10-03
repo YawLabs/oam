@@ -767,7 +767,7 @@ async fn a_peer_goaway_is_reported_and_refuses_the_streams_above_it() {
         let goaway = payload(h2_session::goaway(reg.sessions.clone(), session, 0).await);
         assert_eq!(
             goaway,
-            json!({ "goaway": { "code": 0, "lastStreamId": 1, "data": "Ynll", "headsBefore": 1 } })
+            json!({ "goaway": { "code": 0, "lastStreamId": 1, "data": "Ynll", "headsBefore": 1, "endsBefore": 1 } })
         );
         let mut answered = 0;
         let mut refused = 0;
@@ -816,6 +816,91 @@ async fn a_peer_goaway_is_reported_and_refuses_the_streams_above_it() {
             json!({ "goaway": null })
         );
         assert!(h2_session::destroy(&reg.sessions, session));
+    })
+    .await;
+}
+
+/// An h2c origin that answers stream 1's request with a head and holds the
+/// body until the client's GOAWAY arrives, then ends the stream with `ok`
+/// and reports the GOAWAY's payload. It never ends the connection itself.
+async fn goaway_awaiting_origin() -> (u16, tokio::sync::oneshot::Receiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let frame = |kind: u8, flags: u8, id: u32, payload: &[u8]| {
+            let len = payload.len();
+            let mut out = vec![(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags];
+            out.extend_from_slice(&id.to_be_bytes());
+            out.extend_from_slice(payload);
+            out
+        };
+        let _ = stream.write_all(&frame(0x4, 0, 0, &[])).await;
+        let _ = stream.write_all(&frame(0x4, 0x1, 0, &[])).await;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut at = 24;
+        let mut tx = Some(tx);
+        loop {
+            let n = match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&chunk[..n]);
+            while buf.len() >= at + 9 {
+                let len = (usize::from(buf[at]) << 16)
+                    | (usize::from(buf[at + 1]) << 8)
+                    | usize::from(buf[at + 2]);
+                if buf.len() < at + 9 + len {
+                    break;
+                }
+                let kind = buf[at + 3];
+                let payload = buf[at + 9..at + 9 + len].to_vec();
+                at += 9 + len;
+                if kind == 0x1 {
+                    // :status 200, END_HEADERS; the body waits.
+                    let _ = stream.write_all(&frame(0x1, 0x4, 1, &[0x88])).await;
+                } else if kind == 0x7
+                    && let Some(tx) = tx.take()
+                {
+                    let _ = stream.write_all(&frame(0x0, 0x1, 1, b"ok")).await;
+                    let _ = tx.send(payload);
+                }
+            }
+        }
+    });
+    (port, rx)
+}
+
+/// `http2SessionSendGoaway` sends the session's GOAWAY (NO_ERROR, last
+/// stream id 0) at once, between hyper's frames, while a stream is still
+/// open, as nghttp2 sends node's `session.close()` one (#185). hyper sends
+/// its own only once the streams are done, and a server that had sent its
+/// own GOAWAY may no longer be reading by then: node's never saw it, nor
+/// the end of the connection, and neither side closed. This origin ends
+/// the stream only once the GOAWAY has come.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_session_sends_its_goaway_while_a_stream_is_open() {
+    within(async {
+        let reg = Reg::new();
+        let (port, goaway) = goaway_awaiting_origin().await;
+        let socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let session = reg.open(reg.pump(socket)).await;
+        let get = json!({ "method": "GET", "scheme": "http", "authority": "x", "path": "/" });
+        let head = payload(reg.request(session, get).await);
+        assert_eq!(head["status"], 200);
+        assert!(h2_session::send_goaway(&reg.sessions, session));
+        assert_eq!(
+            goaway.await.unwrap(),
+            vec![0u8; 8],
+            "last stream id 0, NO_ERROR"
+        );
+        assert_eq!(reg.text(head["bodyHandle"].as_u64().unwrap()).await, "ok");
+        assert!(h2_session::destroy(&reg.sessions, session));
+        assert!(!h2_session::send_goaway(&reg.sessions, session), "gone");
     })
     .await;
 }

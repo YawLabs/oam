@@ -2954,16 +2954,28 @@ oam's shared client. What differs:
   never processed -- closes with `ERR_HTTP2_STREAM_ERROR` naming `NGHTTP2_REFUSED_STREAM`
   (`rstCode` 7), so the application knows it can send it again; a stream the server
   answered reads to its end; and the session then closes (`NO_ERROR`) or is destroyed with
-  `ERR_HTTP2_SESSION_ERROR` (any other code). Up to 0.17.1 a graceful GOAWAY reached the
+  `ERR_HTTP2_SESSION_ERROR` (any other code). A closed session -- by `close()` or by the
+  server's GOAWAY -- sends its own GOAWAY (`NO_ERROR`, last stream id 0) at once, while its
+  streams are still open, as Node's does, so a server that keeps the connection open answers
+  with one more GOAWAY (reported, as Node reports it) and ends the connection once its
+  streams are done (`conformance/cases/353-http2-connect-goaway-held-open.mjs`); and a GOAWAY
+  that arrives after the closed session's last stream has ended is not reported, as Node's
+  session is gone by then. Up to 0.17.1 a graceful GOAWAY reached the
   session as an EOF: no `'goaway'`, and every stream -- the answered one, its body unread,
   included -- closed silently with `NGHTTP2_CANCEL`; an error GOAWAY's `'goaway'` named last
-  stream id 0 and an empty buffer. Neither runtime sends a refused stream again: Node's
-  client leaves that to the application, and so does oam's. What differs: a request made in
+  stream id 0 and an empty buffer; and the session sent its own GOAWAY only once its streams
+  were done, which a Node server no longer reads then, so against a server that kept the
+  connection open the session never emitted `'close'` and kept the process alive. Neither
+  runtime sends a refused stream again: Node's client leaves that to the application, and so
+  does oam's. What differs: a request made in
   the instant between the GOAWAY reaching oam's HTTP/2 layer and the session hearing of it
   is refused the same way, where Node's session, closed already, throws
   `ERR_HTTP2_GOAWAY_SESSION` from `request()`; and one sent in the narrower instant before
   that layer has read the frame goes past its last stream id, is not answered, and closes
-  with `NGHTTP2_CANCEL` when the connection ends.
+  with `NGHTTP2_CANCEL` when the connection ends. Node sends a second GOAWAY of its own in
+  the same write as the first when a session closes with no stream open; oam's second
+  (hyper's) follows separately, and a Node server that has stopped reading by then reports
+  only the first.
 - **Streams made in one tick may reach the wire in another order.** `session.request()`
   numbers its streams 1, 3, 5, ... in call order, as Node does, but each goes to hyper on an
   operation of its own, and hyper numbers them on the wire in the order those run. Requests

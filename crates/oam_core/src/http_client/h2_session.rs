@@ -20,8 +20,16 @@
 //! are done; [`wait`] resolves when the connection task ends, with how it
 //! ended.
 //!
+//! node's `session.close()` sends its GOAWAY at once, while the streams are
+//! still open, and hyper's client has no way to send one before it is done:
+//! [`send_goaway`] puts one between hyper's frames ([`SessionIo`]). It
+//! matters: a peer that sent its own GOAWAY first may stop reading once its
+//! last stream is done -- node's nghttp2 does -- and then never sees a
+//! GOAWAY that comes later, nor the end of the connection, so it never
+//! closes, and nor did the session (#185).
+//!
 //! The peer's GOAWAY frames are read off the bytes on their way to hyper
-//! ([`GoAwayReader`]), which keeps them to itself: [`goaway`] hands each to
+//! ([`SessionIo`]), which keeps them to itself: [`goaway`] hands each to
 //! JS -- its code, last stream id and debug data, node's `'goaway'`
 //! arguments -- as it arrives, and a stream it refused (one above its last
 //! stream id) fails as nghttp2 closes it, with `NGHTTP2_REFUSED_STREAM`
@@ -32,12 +40,13 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::{Context, Poll};
 
 use base64::Engine as _;
 use bytes::Bytes;
+use futures_util::task::AtomicWaker;
 use http::header::{HeaderName, HeaderValue};
 use hyper::client::conn::http2::SendRequest;
 use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
@@ -61,9 +70,23 @@ pub struct H2Session {
     /// How the connection ended, once it has.
     ended: tokio::sync::watch::Receiver<Option<serde_json::Value>>,
     /// The GOAWAY frames the peer has sent, in order. The sender lives in
-    /// the connection's [`GoAwayReader`], so it is dropped -- and no frame
+    /// the connection's [`SessionIo`], so it is dropped -- and no frame
     /// can follow -- once hyper lets go of the connection.
     goaways: tokio::sync::watch::Receiver<Vec<GoAwayFrame>>,
+    /// Frames of the session's own, to go out between hyper's.
+    outbox: Arc<Outbox>,
+}
+
+/// Frames the session sends itself, hyper knowing nothing of them: what
+/// [`SessionIo`] writes at the next frame boundary of hyper's bytes.
+#[derive(Default)]
+struct Outbox {
+    /// Set while `frames` holds any; read on every write without the lock.
+    queued: AtomicBool,
+    frames: Mutex<Vec<u8>>,
+    /// The connection task, as last seen reading or flushing: woken so the
+    /// queued frames go out though hyper has nothing to write.
+    task: AtomicWaker,
 }
 
 /// One GOAWAY frame the peer sent: node's `'goaway'` arguments.
@@ -81,15 +104,109 @@ pub struct GoAwayFrame {
     /// GOAWAY that follows it; the two reach JS by separate ops, so JS holds
     /// the `'goaway'` until it has seen that many.
     pub heads_before: u32,
+    /// How many streams had ended their response -- END_STREAM, or a
+    /// reset of one begun -- in the bytes before this frame. A session
+    /// already closed goes when its last stream does, and node's then reads
+    /// nothing more: JS holds the `'goaway'` of a closed session until that
+    /// many streams have closed, so one that came after the last stream's
+    /// end is not reported, as node's is not.
+    pub ends_before: u32,
 }
 
 /// Frame types (RFC 9113 6).
 const DATA: u8 = 0x0;
 const HEADERS: u8 = 0x1;
 const RST_STREAM: u8 = 0x3;
+const PUSH_PROMISE: u8 = 0x5;
 const GOAWAY: u8 = 0x7;
+const CONTINUATION: u8 = 0x9;
 /// The END_STREAM flag of DATA and HEADERS.
 const END_STREAM: u8 = 0x1;
+/// The END_HEADERS flag of HEADERS, PUSH_PROMISE and CONTINUATION.
+const END_HEADERS: u8 = 0x4;
+/// The client connection preface (RFC 9113 3.4), before the first frame.
+const PREFACE_LEN: usize = 24;
+
+/// Follows the frames hyper writes, to know when a frame of the session's
+/// own can go between them: after the preface and the SETTINGS frame that
+/// must come first, never inside a frame, and never inside a header block
+/// (a HEADERS or PUSH_PROMISE and the CONTINUATION frames that end it go
+/// out together, RFC 9113 6.10).
+struct WriteScan {
+    /// Preface bytes still to go.
+    preface: usize,
+    head: [u8; 9],
+    /// Bytes of `head` written so far.
+    have: usize,
+    /// Payload bytes of the current frame still to go.
+    left: usize,
+    /// A whole frame header has gone out.
+    framed: bool,
+    /// Inside a header block.
+    in_block: bool,
+}
+
+impl Default for WriteScan {
+    fn default() -> Self {
+        WriteScan {
+            preface: PREFACE_LEN,
+            head: [0; 9],
+            have: 0,
+            left: 0,
+            framed: false,
+            in_block: false,
+        }
+    }
+}
+
+impl WriteScan {
+    /// Between two frames, outside a header block.
+    fn at_boundary(&self) -> bool {
+        self.framed && self.have == 0 && self.left == 0 && !self.in_block
+    }
+
+    /// Follow the bytes written.
+    fn feed(&mut self, mut bytes: &[u8]) {
+        if self.preface > 0 {
+            let n = self.preface.min(bytes.len());
+            self.preface -= n;
+            bytes = &bytes[n..];
+        }
+        while !bytes.is_empty() {
+            if self.left > 0 {
+                let n = self.left.min(bytes.len());
+                self.left -= n;
+                bytes = &bytes[n..];
+                continue;
+            }
+            let n = (self.head.len() - self.have).min(bytes.len());
+            self.head[self.have..self.have + n].copy_from_slice(&bytes[..n]);
+            self.have += n;
+            bytes = &bytes[n..];
+            if self.have == self.head.len() {
+                self.have = 0;
+                self.left = usize::from(self.head[0]) << 16
+                    | usize::from(self.head[1]) << 8
+                    | usize::from(self.head[2]);
+                self.framed = true;
+                if matches!(self.head[3], HEADERS | PUSH_PROMISE | CONTINUATION) {
+                    self.in_block = self.head[4] & END_HEADERS == 0;
+                }
+            }
+        }
+    }
+}
+
+/// A GOAWAY frame with `code`, last stream id 0 (a client takes no streams
+/// the peer opens) and no debug data: what nghttp2 sends for node's
+/// `session.close()`.
+fn goaway_frame(code: u32) -> [u8; 17] {
+    let mut frame = [0u8; 17];
+    frame[2] = 8;
+    frame[3] = GOAWAY;
+    frame[13..17].copy_from_slice(&code.to_be_bytes());
+    frame
+}
 
 /// Reads the frame headers of what the peer sends, and records each GOAWAY
 /// frame, without changing a byte: the bytes are hyper's to parse. The
@@ -110,6 +227,8 @@ struct FrameScan {
     open_heads: std::collections::HashSet<u32>,
     /// Streams whose response has begun, ever.
     heads: u32,
+    /// Streams whose response has ended, ever.
+    ends: u32,
 }
 
 impl FrameScan {
@@ -145,27 +264,30 @@ impl FrameScan {
         }
     }
 
-    /// Count the streams whose response has begun, from the frame header
-    /// just read.
+    /// Count the streams whose response has begun, and ended, from the
+    /// frame header just read.
     fn track_heads(&mut self) {
         let kind = self.head[3];
         let ends = self.head[4] & END_STREAM != 0;
         let stream = u32::from_be_bytes([self.head[5], self.head[6], self.head[7], self.head[8]])
             & 0x7fff_ffff;
-        match kind {
-            HEADERS if !self.open_heads.contains(&stream) => {
-                self.heads = self.heads.wrapping_add(1);
-                if !ends {
-                    self.open_heads.insert(stream);
-                }
+        if kind == HEADERS && !self.open_heads.contains(&stream) {
+            self.heads = self.heads.wrapping_add(1);
+            if ends {
+                self.ends = self.ends.wrapping_add(1);
+            } else {
+                self.open_heads.insert(stream);
             }
-            HEADERS | DATA if ends => {
-                self.open_heads.remove(&stream);
-            }
-            RST_STREAM => {
-                self.open_heads.remove(&stream);
-            }
-            _ => {}
+            return;
+        }
+        // A stream begun ends with END_STREAM, or a reset.
+        let ending = match kind {
+            HEADERS | DATA => ends,
+            RST_STREAM => true,
+            _ => false,
+        };
+        if ending && self.open_heads.remove(&stream) {
+            self.ends = self.ends.wrapping_add(1);
         }
     }
 
@@ -189,26 +311,61 @@ impl FrameScan {
                 code: word(4),
                 debug_data: payload[8..].to_vec(),
                 heads_before: self.heads,
+                ends_before: self.ends,
             });
         }
     }
 }
 
-/// The session's byte stream as hyper reads it, with [`FrameScan`] reading
-/// along.
-struct GoAwayReader<T> {
+/// The session's byte stream as hyper reads and writes it: [`FrameScan`]
+/// reads along with hyper, and [`WriteScan`] follows what hyper writes, so
+/// that the [`Outbox`]'s frames go out between two of its frames.
+struct SessionIo<T> {
     io: T,
     scan: FrameScan,
     goaways: tokio::sync::watch::Sender<Vec<GoAwayFrame>>,
+    written: WriteScan,
+    outbox: Arc<Outbox>,
+    /// Outbox bytes taken and not yet all written: they go out whole
+    /// before anything more of hyper's.
+    sending: Vec<u8>,
+    sent: usize,
 }
 
-impl<T: AsyncRead + Unpin> AsyncRead for GoAwayReader<T> {
+impl<T: AsyncWrite + Unpin> SessionIo<T> {
+    /// Write the outbox's frames, if it holds any and hyper is between
+    /// frames. Pending while they are half written.
+    fn poll_outbox(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        if self.sending.is_empty() {
+            if !self.outbox.queued.load(Ordering::Acquire) || !self.written.at_boundary() {
+                return Poll::Ready(Ok(()));
+            }
+            self.sending = std::mem::take(&mut *lock(&self.outbox.frames));
+            self.outbox.queued.store(false, Ordering::Release);
+            self.sent = 0;
+        }
+        while self.sent < self.sending.len() {
+            let n = std::task::ready!(
+                Pin::new(&mut self.io).poll_write(cx, &self.sending[self.sent..])
+            )?;
+            if n == 0 {
+                return Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
+            }
+            self.sent += n;
+        }
+        self.sending.clear();
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for SessionIo<T> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
+        this.outbox.task.register(cx.waker());
         let before = buf.filled().len();
         let polled = Pin::new(&mut this.io).poll_read(cx, buf);
         if let Poll::Ready(Ok(())) = polled {
@@ -221,21 +378,33 @@ impl<T: AsyncRead + Unpin> AsyncRead for GoAwayReader<T> {
     }
 }
 
-impl<T: AsyncWrite + Unpin> AsyncWrite for GoAwayReader<T> {
+impl<T: AsyncWrite + Unpin> AsyncWrite for SessionIo<T> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().io).poll_write(cx, buf)
+        let this = self.get_mut();
+        std::task::ready!(this.poll_outbox(cx))?;
+        let n = std::task::ready!(Pin::new(&mut this.io).poll_write(cx, buf))?;
+        this.written.feed(&buf[..n]);
+        Poll::Ready(Ok(n))
     }
 
+    // h2 writes every frame it holds before it flushes, so a request made
+    // before the session's GOAWAY was queued goes out ahead of it, as
+    // node's does; the outbox is written here once it has.
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().io).poll_flush(cx)
+        let this = self.get_mut();
+        this.outbox.task.register(cx.waker());
+        std::task::ready!(this.poll_outbox(cx))?;
+        Pin::new(&mut this.io).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().io).poll_shutdown(cx)
+        let this = self.get_mut();
+        std::task::ready!(this.poll_outbox(cx))?;
+        Pin::new(&mut this.io).poll_shutdown(cx)
     }
 
     fn poll_write_vectored(
@@ -243,7 +412,19 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for GoAwayReader<T> {
         cx: &mut Context<'_>,
         bufs: &[std::io::IoSlice<'_>],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.get_mut().io).poll_write_vectored(cx, bufs)
+        let this = self.get_mut();
+        std::task::ready!(this.poll_outbox(cx))?;
+        let n = std::task::ready!(Pin::new(&mut this.io).poll_write_vectored(cx, bufs))?;
+        let mut left = n;
+        for buf in bufs {
+            if left == 0 {
+                break;
+            }
+            let take = left.min(buf.len());
+            this.written.feed(&buf[..take]);
+            left -= take;
+        }
+        Poll::Ready(Ok(n))
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -328,10 +509,15 @@ pub async fn open(
         return OpOutcome::Failed(format!("http2SessionOpen: pipe {pipe_id} is gone"));
     };
     let (goaways_tx, goaways) = tokio::sync::watch::channel(Vec::new());
-    let io = GoAwayReader {
+    let outbox = Arc::new(Outbox::default());
+    let io = SessionIo {
         io,
         scan: FrameScan::default(),
         goaways: goaways_tx,
+        written: WriteScan::default(),
+        outbox: outbox.clone(),
+        sending: Vec::new(),
+        sent: 0,
     };
     let mut builder = hyper::client::conn::http2::Builder::new(TokioExecutor::new());
     builder.timer(TokioTimer::new());
@@ -352,6 +538,7 @@ pub async fn open(
             task: task.abort_handle(),
             ended: ended_rx,
             goaways,
+            outbox,
         },
     );
     OpOutcome::Json(serde_json::json!({ "session": id }).to_string())
@@ -597,9 +784,10 @@ pub async fn wait(sessions: H2Sessions, id: u64) -> OpOutcome {
 
 /// `http2SessionGoaway(session, index)`: resolves with the peer's
 /// `index`-th GOAWAY frame (from 0) once it has arrived, as
-/// `{"goaway": {code, lastStreamId, data, headsBefore}}` (`data` the debug
-/// data in base64, `null` when there is none; `headsBefore`
-/// [`GoAwayFrame::heads_before`]), or `{"goaway": null}` once the
+/// `{"goaway": {code, lastStreamId, data, headsBefore, endsBefore}}` (`data`
+/// the debug data in base64, `null` when there is none; `headsBefore`
+/// [`GoAwayFrame::heads_before`], `endsBefore` [`GoAwayFrame::ends_before`]),
+/// or `{"goaway": null}` once the
 /// connection has ended without one -- and for a session already gone.
 pub async fn goaway(sessions: H2Sessions, id: u64, index: usize) -> OpOutcome {
     let receiver = lock(&sessions)
@@ -620,6 +808,7 @@ pub async fn goaway(sessions: H2Sessions, id: u64, index: usize) -> OpOutcome {
                         "lastStreamId": frame.last_stream_id,
                         "data": data,
                         "headsBefore": frame.heads_before,
+                        "endsBefore": frame.ends_before,
                     }
                 })
                 .to_string(),
@@ -631,6 +820,22 @@ pub async fn goaway(sessions: H2Sessions, id: u64, index: usize) -> OpOutcome {
             return none();
         }
     }
+}
+
+/// `http2SessionSendGoaway(session)`: send a GOAWAY (NO_ERROR) now, after
+/// every frame hyper holds, as nghttp2 sends node's `session.close()` one.
+/// hyper sends its own once the streams are done, as node's `destroy()`
+/// sends a second. False if the session is gone.
+pub fn send_goaway(sessions: &H2Sessions, id: u64) -> bool {
+    let sessions = lock(sessions);
+    let Some(session) = sessions.get(&id) else {
+        return false;
+    };
+    let outbox = &session.outbox;
+    lock(&outbox.frames).extend_from_slice(&goaway_frame(0));
+    outbox.queued.store(true, Ordering::Release);
+    outbox.task.wake();
+    true
 }
 
 /// `http2SessionClose(session)`: open no more streams; hyper ends the
@@ -685,9 +890,10 @@ mod tests {
     }
 
     /// The GOAWAY frames in a server's bytes, however the reads split them,
-    /// with the response heads that came before each: a 1xx and its final
-    /// head are one stream's, trailers are not a head, and a stream that
-    /// ended (END_STREAM, or a reset) is done with.
+    /// with the response heads, and ends, that came before each: a 1xx and
+    /// its final head are one stream's, trailers are not a head but end
+    /// the stream, a stream that ended (END_STREAM, or a reset) is done
+    /// with, and a reset of one done with is not another end.
     #[test]
     fn the_scan_finds_each_goaway_and_the_heads_before_it() {
         let mut bytes = frame(0x4, 0, 0, &[0, 3, 0, 0, 0, 100]); // SETTINGS
@@ -698,6 +904,7 @@ mod tests {
         bytes.extend(frame(HEADERS, 0x4, 3, &[0x88])); // its final head
         bytes.extend(goaway(5, 0, b"")); // two heads before it
         bytes.extend(frame(RST_STREAM, 0, 3, &[0, 0, 0, 8]));
+        bytes.extend(frame(RST_STREAM, 0, 1, &[0, 0, 0, 0])); // after its end: not another
         bytes.extend(frame(HEADERS, 0x5, 5, &[0x88])); // a head that ends its stream
         bytes.extend(frame(0x6, 0, 0, &[0; 8])); // PING
         bytes.extend(goaway(5, 2, b"why")); // INTERNAL_ERROR, three heads before
@@ -707,12 +914,14 @@ mod tests {
                 last_stream_id: 5,
                 debug_data: Vec::new(),
                 heads_before: 2,
+                ends_before: 1,
             },
             GoAwayFrame {
                 code: 2,
                 last_stream_id: 5,
                 debug_data: b"why".to_vec(),
                 heads_before: 3,
+                ends_before: 3,
             },
         ];
         for step in [1, 2, 7, 9, 10, 64, bytes.len()] {
@@ -729,5 +938,55 @@ mod tests {
         assert_eq!(found[0].last_stream_id, 7);
         assert_eq!(found[0].code, 11);
         assert!(scan(&frame(GOAWAY, 0, 0, &[0; 7]), 4).is_empty());
+    }
+
+    /// Where a frame of the session's own can go in what hyper writes: not
+    /// before the preface and the first frame, not inside a frame however
+    /// the writes split it, and not inside a header block.
+    #[test]
+    fn the_write_scan_finds_the_frame_boundaries() {
+        let mut bytes = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        assert_eq!(bytes.len(), PREFACE_LEN);
+        bytes.extend(frame(0x4, 0, 0, &[0, 3, 0, 0, 0, 100])); // SETTINGS
+        let settings_end = bytes.len();
+        bytes.extend(frame(HEADERS, 0, 1, &[0x82])); // a header block, not ended
+        let in_block = bytes.len();
+        bytes.extend(frame(CONTINUATION, END_HEADERS, 1, &[0x84]));
+        let block_end = bytes.len();
+        bytes.extend(frame(DATA, END_STREAM, 1, b"body"));
+        let boundaries = [settings_end, block_end, bytes.len()];
+        assert!(!boundaries.contains(&in_block));
+        // Byte by byte: a boundary exactly where a frame (or block) ends.
+        let mut scan = WriteScan::default();
+        assert!(!scan.at_boundary());
+        for (at, b) in bytes.iter().enumerate() {
+            scan.feed(&[*b]);
+            assert_eq!(
+                scan.at_boundary(),
+                boundaries.contains(&(at + 1)),
+                "after byte {}",
+                at + 1
+            );
+        }
+        // However the writes split it, a write that ends at a boundary
+        // leaves the scan at one, and one that ends elsewhere does not.
+        for step in [2, 7, 9, 10, 64, bytes.len()] {
+            let mut scan = WriteScan::default();
+            let mut at = 0;
+            for piece in bytes.chunks(step) {
+                scan.feed(piece);
+                at += piece.len();
+                assert_eq!(
+                    scan.at_boundary(),
+                    boundaries.contains(&at),
+                    "at {at}, step {step}"
+                );
+            }
+        }
+        assert_eq!(
+            goaway_frame(0).to_vec(),
+            goaway(0, 0, b""),
+            "the session's GOAWAY: NO_ERROR, last stream id 0"
+        );
     }
 }
