@@ -376,6 +376,35 @@ const SIDECARS = [
     },
   },
   {
+    // The same server with --isolated, a path the row above never takes: the
+    // browser runs behind playwright-core's BrowserServer, which listens on a
+    // pipe (a Windows named pipe, a Unix domain socket elsewhere) that the
+    // server's own client then dials. Up to 0.17.1 oam had neither end, so
+    // the server booted, listed its tools and failed every browser call
+    // (#219). No user data dir: --isolated keeps the profile in memory.
+    name: "pw-isolated",
+    pkg: "@playwright/mcp",
+    args: ["--isolated"],
+    envPrefixes: ["PLAYWRIGHT_MCP_"],
+    browser: true,
+    call: {
+      requires: (ctx) => ctx.browser.error ?? ctx.loopback.error ?? null,
+      env: (ctx) => ({
+        PLAYWRIGHT_MCP_BROWSER: "chromium",
+        PLAYWRIGHT_MCP_EXECUTABLE_PATH: ctx.browser.path,
+        PLAYWRIGHT_MCP_HEADLESS: "1",
+        PLAYWRIGHT_MCP_OUTPUT_DIR: `${ctx.profileDir}-out`,
+      }),
+      tool: "browser_navigate",
+      args: (ctx) => ({ url: `${ctx.loopback.url}page` }),
+      deterministic: false,
+      expect: (text) =>
+        text.includes(`Page Title: ${LOOPBACK_MARKER}`)
+          ? null
+          : "browser_navigate did not report the fixture page's title",
+    },
+  },
+  {
     name: "lemonsqueezy",
     pkg: "@yawlabs/lemonsqueezy-mcp",
     envPrefixes: ["LEMONSQUEEZY_"],
@@ -4239,7 +4268,9 @@ const clearProgress = () => {
 
 progress(`  installing ${selected.length} package(s)...`);
 const { installErrors, damaged, rebuilt } = await settleInstall(
-  selected.map((s) => s.pkg),
+  // Two rows can run one package with different arguments (playwright,
+  // pw-isolated): it is installed once.
+  [...new Set(selected.map((s) => s.pkg))],
   {
     note: (line) => {
       clearProgress();
