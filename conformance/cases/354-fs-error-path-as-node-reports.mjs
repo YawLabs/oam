@@ -8,6 +8,10 @@
 // `process.loadEnvFile()` with no path is the exception: its binding opens its
 // own ".env" untouched and the error says '.env' (node's
 // test-process-load-env-file); a path given to it is namespaced like fs's.
+// A DIRECTORY read fails on the read on every platform: readFile is EISDIR
+// `read` with no path, and loadEnvFile is "Contents of '<path>' should be a
+// valid string." (Linux and macOS open a directory for reading, so oam's read
+// failed there and was misreported as `open`).
 // Runs in a fresh temp directory; every absolute path is printed relative to
 // it, as <cwd>.
 import fs from "node:fs";
@@ -100,6 +104,17 @@ try {
   sync("loadEnvFile url", () => process.loadEnvFile(pathToFileURL(abs)));
   sync("loadEnvFile(42)", () => process.loadEnvFile(42));
   sync("loadEnvFile directory", () => process.loadEnvFile("."));
+
+  fs.mkdirSync("a-dir");
+  fs.mkdirSync(".env");
+  sync("readFileSync directory", () => fs.readFileSync("a-dir"));
+  sync("readFileSync directory utf8", () => fs.readFileSync("a-dir", "utf8"));
+  sync("loadEnvFile(dir)", () => process.loadEnvFile("a-dir"));
+  sync("loadEnvFile() .env is a directory", () => process.loadEnvFile());
+  sync("loadEnvFile('.env') directory", () => process.loadEnvFile(".env"));
+  await cb("readFile cb directory", (k) => fs.readFile("a-dir", k));
+  await prom("readFile p directory", () => fsp.readFile("a-dir"));
+  fs.rmdirSync(".env");
 
   await cb("readFile cb", (k) => fs.readFile(rel, k));
   await cb("readFile cb abs", (k) => fs.readFile(abs, k));
