@@ -108,11 +108,14 @@ behavior and is expected of busybox's too, but busybox has not been checked.
 
 ### Not checked yet
 
-The binaries themselves are not code-signed: no Apple Developer ID, no
-Authenticode. Each installer has an inactive, clearly marked hook for that
-check (`macos_signature_check` in `install.sh`: `codesign --verify --strict`
-plus a pinned TeamIdentifier; `Test-OamAuthenticode` in `install.ps1`), turned
-on by setting the first signed tag when that signing goes live.
+The installers do not check the binaries' own code signatures yet; the signed
+manifest is what they verify. From `v0.18.0` the Windows binaries are
+Authenticode-signed and the macOS binaries carry oam's self-signed identity
+(see [Signing](#signing)). Each installer has an inactive, clearly marked hook
+for that check (`macos_signature_check` in `install.sh`: `codesign --verify
+--strict` plus a pinned TeamIdentifier, which needs a Developer ID signature;
+`Test-OamAuthenticode` in `install.ps1`), turned on by setting the first tag it
+applies to once a signed release has shipped and been checked against it.
 
 ## Release assets (the naming contract)
 
@@ -140,11 +143,21 @@ names. If you change a target triple, change it in `scripts/release-local.sh`
 ## Signing
 
 The release is signed (the manifest above, `scripts/lib/signing.sh`;
-`release-keys/README.md` is the runbook). The binaries are not yet: scoop,
-curl and brew fetches bypass Gatekeeper/SmartScreen quarantine, and the signed
-manifest is the integrity check. Apple notarization and Windows Authenticode
-are planned; when they land, their checks turn on in the installers' marked
-hooks (see [Not checked yet](#not-checked-yet)).
+`release-keys/README.md` is the runbook), and from `v0.18.0` so are the
+binaries:
+
+- **Windows**: Authenticode through Azure Artifact Signing, publisher
+  "Yaw Labs LLC". SmartScreen reputation for the signature still builds over
+  time.
+- **macOS**: oam's own pinned, self-signed identity with the hardened runtime
+  (`scripts/macos/README.md`). It is not Apple Developer ID and the binaries
+  are not notarized, so Gatekeeper still blocks a quarantined browser
+  download. curl and brew fetches set no quarantine flag and are
+  unaffected.
+
+The signed manifest stays the installers' integrity check. Developer ID
+signing and notarization are planned; the installers' own signature checks
+turn on in their marked hooks (see [Not checked yet](#not-checked-yet)).
 
 ## Updating
 

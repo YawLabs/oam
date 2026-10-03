@@ -145,9 +145,10 @@ valid for three days, so every signature carries an RFC 3161 timestamp from
 `http://timestamp.acs.microsoft.com`.
 
 `scripts/lib/signing.sh` (the "Windows" section) does the signing. Until
-`OAM_WIN_SIGN_METADATA` is set, `scripts/release-local.sh` ships the Windows
-binaries unsigned with a warning (`OAM_SIGN_REQUIRED=1` makes that fatal).
-Once it is set, both `.exe` assets must sign and verify, or the release stops.
+`OAM_WIN_SIGN_METADATA` is set, `scripts/release-local.sh` stops in preflight
+(`OAM_SIGN_REQUIRED` defaults to 1); exporting `OAM_SIGN_REQUIRED=0` ships the
+Windows binaries unsigned with a warning instead. Once it is set, both `.exe`
+assets must sign and verify, or the release stops.
 
 ### Setting up the release box (once)
 

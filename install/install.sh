@@ -4,8 +4,9 @@
 #   curl -fsSL https://oamjs.org/install.sh | sh
 #
 # Downloads the release binary for this OS/arch from GitHub Releases, verifies
-# it, and installs it to ~/.oam/bin. No sudo. The binaries themselves are not
-# code-signed yet (no Apple Developer ID); what is signed is the release:
+# it, and installs it to ~/.oam/bin. No sudo. From v0.18.0 the macOS binaries
+# carry oam's own self-signed identity (not an Apple Developer ID), which this
+# script does not check; what it verifies is the signed release:
 #
 #   v0.18.0 and later   RELEASE-MANIFEST ("oam-release-manifest v1", "tag
 #                       <tag>", then the SHA256SUMS lines) must carry a
@@ -465,11 +466,12 @@ fi
 expected="$(hash_from_sums "$sums")" || die "the verified checksums for $tag list ${asset} $(awk -v a="$asset" '{ f = $2; sub(/^\*/, "", f); if (f == a) n++ } END { print n + 0 }' "$sums") times, not once"
 
 # --- macOS code-signature hook (INACTIVE) ---------------------------------------
-# Developer ID signing is not live yet (signing plan 4.2 / rollout step 6), and
-# an ad-hoc signature proves nothing about who built a binary, so today this
-# checks nothing. When it goes live: set FIRST_DEVID_TAG to the first tag
-# signed with it and DEVID_TEAM_ID to the pinned TeamIdentifier (public in every
-# signature), and every tag from FIRST_DEVID_TAG on must pass
+# Developer ID signing is not live yet (signing plan 4.2 / rollout step 6). The
+# binaries carry oam's own self-signed identity from v0.18.0, but a self-signed
+# (or ad-hoc) signature proves nothing about who built a binary, so today this
+# checks nothing. When Developer ID goes live: set FIRST_DEVID_TAG to the first
+# tag signed with it and DEVID_TEAM_ID to the pinned TeamIdentifier (public in
+# every signature), and every tag from FIRST_DEVID_TAG on must pass
 # `codesign --verify --strict` and carry that team.
 FIRST_DEVID_TAG=""
 DEVID_TEAM_ID=""

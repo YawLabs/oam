@@ -36,6 +36,30 @@ REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # tree for its entire life.
 cd "$REPO_DIR" || { echo "cannot cd to $REPO_DIR" >&2; exit 1; }
 
+# The operator's release knobs, scrubbed before any fixture runs. This suite is
+# release-local.sh's own local gate (via ci-local.sh), so it runs inside a
+# release's environment, and that environment is exactly where the recovery
+# knobs get exported: a failed mac gate's documented way out is a re-run with
+# OAM_SKIP_MAC_SIGN=1, and before this scrub that knob reached 23 mac-signing
+# verdicts here and killed the re-run at "local CI gate failed". Every case
+# that needs a knob sets it on its own call. The host knobs are here for a
+# second reason: no fixture may ever reach the real build Mac.
+#
+# A guard in the "mac-signing.sh" group fails when a release script starts
+# reading a signing, skip or mac-host knob that this list does not carry.
+OPERATOR_KNOBS="OAM_SIGN_REQUIRED OAM_RELEASE_SIGNING_KEY
+  OAM_SKIP_MAC_SIGN OAM_SKIP_MAC_X64 OAM_SKIP_MAC OAM_SIGNING_DIR
+  OAM_MAC_HOST OAM_MAC_USER OAM_MAC_KEY
+  OAM_WIN_SIGN_METADATA OAM_WIN_SIGN_PUBLISHER OAM_SKIP_WIN_SIGN OAM_WIN_SIGN_TIMEOUT
+  OAM_SKIP_WIN_X64 OAM_SKIP_LINUX OAM_SKIP_LOCAL_GATE
+  OAM_DRY_RUN OAM_NO_AUTO_BUMP OAM_NO_AUTO_ATTRIBUTION
+  OAM_INSECURE_SKIP_SIGNATURE"
+scrub_operator_knobs(){
+  local k
+  for k in $OPERATOR_KNOBS; do unset "$k"; done
+}
+scrub_operator_knobs
+
 # One temp root, removed on exit. Every fixture used to call mktemp and nothing
 # ever cleaned up: a single run leaked 14 directories, and once this became a
 # pre-push gate that grew without bound (149 had piled up on the dev box before
@@ -3207,10 +3231,50 @@ sg_order(){
   if [ "$bad" = "0" ]; then pass; else fail "out of order or missing in $file:"$'\n'"$got"; fi
 }
 
-it "release-local.sh: trap, then the agent and signing preflight, all before the dirty-tree check, the bump and the tag"
+it "release-local.sh: trap, then the agent and signing preflight, all before the second dirty-tree check, the bump and the tag"
 sg_order scripts/release-local.sh 'trap release_on_exit EXIT' 'release_agent_start || fail' \
-  'release_signing_preflight "$TAG" || fail' 'restore_gate_artifacts "preflight"' \
+  'release_signing_preflight "$TAG" || fail' 'assert_tree_clean "preflight, after the signing probes"' \
   'bumping Cargo.toml to' 'git tag -a "$TAG" -m "$TAG"'
+
+# The cheap half of the preflight first: a forgotten changelog-release.sh, a
+# dirty tree or a leftover draft must fail before the ssh probe of the build
+# Mac, the release key's passphrase prompt and the quota-counted Artifact
+# Signing probe -- or every retry repeats all three. Then, after those, the
+# re-reads the bump and the tag move rely on: the tree (the probes must leave
+# nothing), HEAD (the changelog verdict was for it), origin/main and the
+# release's absence.
+it "release-local.sh: the cheap preflight checks precede the mac, release-key and Windows signing probes"
+sg_order scripts/release-local.sh 'step "Preflight $TAG"' 'restore_gate_artifacts "preflight"' \
+  'preflight_head="$(git rev-parse HEAD)"' 'if [ -f CHANGELOG.md ]; then' \
+  'assert_release_unpublished "preflight"' 'command -v gcloud >/dev/null 2>&1 || fail' \
+  'build-platforms-tailnet.sh" --preflight-only' 'release_agent_start || fail' \
+  'win_sign_preflight || fail' 'assert_tree_clean "preflight, after the signing probes"' \
+  '[ "$(git rev-parse HEAD)" = "$preflight_head" ]' 'git fetch -q origin main 2>/dev/null || true' \
+  'assert_release_unpublished "before the bump"' 'bumping Cargo.toml to' 'git tag -a "$TAG" -m "$TAG"'
+
+# Signing is required by default: the docs promise signed assets, so a box
+# without the Windows setup must stop in preflight unless the operator opts
+# out with an explicit OAM_SIGN_REQUIRED=0. The default is exported (the libs
+# and build-platforms-tailnet.sh read the environment) and set before any
+# preflight probe reads it.
+it "release-local.sh: OAM_SIGN_REQUIRED defaults to 1, exported before the preflight"
+if [ "$(grep -cxF 'export OAM_SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-1}"' scripts/release-local.sh)" = "1" ]; then
+  sg_order scripts/release-local.sh 'export OAM_SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-1}"' 'step "Preflight $TAG"' \
+    'build-platforms-tailnet.sh" --preflight-only' 'win_sign_preflight || fail'
+else fail "release-local.sh no longer exports OAM_SIGN_REQUIRED with a default of 1"; fi
+
+it "the default makes an unconfigured Windows box fail, and an explicit 0 still downgrades it to a warning"
+SG_D1="$( ( unset OAM_WIN_SIGN_METADATA OAM_WIN_SIGN_PUBLISHER; export OAM_SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-1}"
+            . scripts/lib/signing.sh; win_sign_decision 0 ) )"
+SG_D0="$( ( unset OAM_WIN_SIGN_METADATA OAM_WIN_SIGN_PUBLISHER; export OAM_SIGN_REQUIRED=0
+            export OAM_SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-1}"; . scripts/lib/signing.sh; win_sign_decision 0 ) )"
+case "$SG_D1|$SG_D0" in fail:*"|skip:"*) pass ;; *) fail "default: $SG_D1 / explicit 0: $SG_D0" ;; esac
+
+it "release-local.sh: the release-exists check is one function, and fails closed on anything but gh's exact 'release not found'"
+SG_H="$(awk '$0 == "assert_release_unpublished() {" { p = 1 } p { print } p && /^}$/ { exit }' scripts/release-local.sh)"
+if grep -qF "grep -qxF 'release not found'" <<<"$SG_H" && grep -qF '[ "$rc" -ne 1 ]' <<<"$SG_H" \
+   && [ "$(grep -v '^[[:space:]]*#' scripts/release-local.sh | grep -c 'gh release view "$TAG" --repo "$REPO" 2>&1')" = "1" ]; then pass
+else fail "assert_release_unpublished lost its fail-closed shape, or a second inline copy appeared:"$'\n'"$SG_H"; fi
 
 it "release-local.sh: SHA256SUMS, then write/sign/verify the manifest, then the dry-run exit and the upload"
 sg_order scripts/release-local.sh 'sha256sum oam-* > SHA256SUMS && cat SHA256SUMS' \
@@ -3288,10 +3352,10 @@ for s in scripts/release-local.sh scripts/release-upload-local-arm64.sh scripts/
 done
 if [ -z "$SG_BAD" ]; then pass; else fail "violations:$SG_BAD"; fi
 
-it "release-local.sh: the Windows signing preflight follows the release key's, before the dirty-tree check, the bump and the tag"
+it "release-local.sh: the Windows signing preflight follows the release key's, before the second dirty-tree check, the bump and the tag"
 sg_order scripts/release-local.sh 'release_signing_preflight "$TAG" || fail' \
   'win_decision="$(win_sign_decision "$SKIP_WIN_SIGN")"' 'win_sign_preflight || fail' \
-  'restore_gate_artifacts "preflight"' 'bumping Cargo.toml to' 'git tag -a "$TAG" -m "$TAG"'
+  'assert_tree_clean "preflight, after the signing probes"' 'bumping Cargo.toml to' 'git tag -a "$TAG" -m "$TAG"'
 
 # Signing between cp and smoke is what makes every later gate (smoke's CRT
 # check, the conpty e2e, the sidecar matrix) run the bytes that ship; the
@@ -4301,6 +4365,36 @@ ms_then(){ mac_signing_setup 2>/dev/null || return 90; : > "$MS_LOG"; : > "$MS_A
 
 ms_reset
 
+# The suite-top scrub, proven against the exact leak it exists for: a release
+# re-run with OAM_SKIP_MAC_SIGN=1 (and friends) exported runs this suite as its
+# local gate. The first line is the control -- unscrubbed, the knob really does
+# turn both verdicts into skip, so a scrub that stopped working cannot pass.
+it "an operator's exported OAM_SKIP_MAC_SIGN=1 cannot reach the bootstrap or pin verdicts once scrubbed"
+MS_GOT="$(
+  export OAM_SKIP_MAC_SIGN=1 OAM_SKIP_MAC_X64=1 OAM_SIGN_REQUIRED=0 OAM_SIGNING_DIR="$MS/nowhere"
+  ms_pin; ms mac_sign_decision; echo "leaked=${MS_OUT%%:*}"
+  scrub_operator_knobs
+  ms_pin; ms mac_sign_decision; echo "bootstrap=${MS_OUT%%:*}"
+  ms_pin "$MS_PIN_A"; ms mac_sign_decision; echo "pin=$MS_OUT"
+)"
+eq "$MS_GOT" "leaked=skip"$'\n'"bootstrap=adhoc"$'\n'"pin=identity:$MS_PIN_A"
+ms_reset
+
+it "every signing, skip and mac-host knob a release script reads is scrubbed at the suite's top"
+MS_MISS=""
+for f in scripts/release-local.sh scripts/release-upload-local-arm64.sh scripts/build-platforms-tailnet.sh \
+         scripts/build-remote.sh scripts/provision-mac-signing.sh scripts/lib/signing.sh scripts/lib/mac-signing.sh \
+         install/install.sh; do
+  for k in $(sed 's/#.*//' "$f" | grep -oE '[$][{]?OAM_[A-Z0-9_]+' | tr -d '${' | sort -u); do
+    case "$k" in *SIGN*|*SKIP*|OAM_MAC_*) ;; *) continue ;; esac
+    case " $(echo $OPERATOR_KNOBS) " in *" $k "*) ;; *) MS_MISS="$MS_MISS $f:$k" ;; esac
+  done
+done
+MS_SET=""
+for k in $OPERATOR_KNOBS; do [ -z "${!k+x}" ] || MS_SET="$MS_SET $k"; done
+if [ -z "$MS_MISS$MS_SET" ]; then pass
+else fail "not in OPERATOR_KNOBS:${MS_MISS:- none}; still set here:${MS_SET:- none}"; fi
+
 it "bootstrap: a pin file holding only comments signs ad-hoc, with a warning"
 ms mac_sign_decision
 case "$MS_OUT" in adhoc:*"holds no SHA-1 yet"*) pass ;; *) fail "decision: $MS_OUT" ;; esac
@@ -4780,6 +4874,17 @@ if [ "$MS_RC" = "0" ] && [ -z "$MS_OUT" ] && [ "$MS_CALLS" = "probe check " ] \
    && cmp -s "$MS_TN/check-stdin" scripts/provision-mac-signing.sh \
    && grep -qF "mac signing identity $MS_PIN_A is usable" <<<"$MS_ERR"; then pass
 else fail "rc=$MS_RC out='$MS_OUT' calls='$MS_CALLS' stderr: $MS_ERR"; fi
+
+# The same leak through the leg's own preflight, which inherits the caller's
+# environment (env, not env -i): exported and then scrubbed, the knobs must not
+# stop a committed pin from being checked on the Air.
+it "preflight: exported skip knobs, once scrubbed, still leave a pin's identity check in place"
+MS_GOT="$(
+  export OAM_SKIP_MAC_SIGN=1 OAM_SKIP_MAC_X64=1
+  scrub_operator_knobs
+  ms_tn "$MS_PIN_A"; echo "rc=$MS_RC calls=$MS_CALLS"
+)"
+eq "$MS_GOT" "rc=0 calls=probe check "
 
 printf 'keychain=/k\nsha1=%s\n' "$MS_PIN_B" > "$MS_TN/check-out"
 ms_tn "$MS_PIN_A"
