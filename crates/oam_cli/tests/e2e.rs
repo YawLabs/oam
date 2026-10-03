@@ -8153,53 +8153,113 @@ reached the server ["POST /k","GET /l","GET /mocked"]"##;
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
-/// A MockAgent from another copy of undici -- the npm package loaded by path,
-/// or one bundled into a dependency -- installed as the global dispatcher
-/// with that copy's setGlobalDispatcher(), in the slot every copy shares
+/// A dispatcher another copy of undici -- the npm package loaded by path, or
+/// one bundled into a dependency -- installed as the global dispatcher with
+/// that copy's setGlobalDispatcher(), in the slot every copy shares
 /// (`Symbol.for('undici.globalDispatcher.1')`, which node's fetch reads):
-/// oam's fetch cannot run its interceptors, so it fails rather than send the
-/// request to the network in their place, and a request given its own
-/// dispatcher, or one after the slot no longer holds a mock, goes as usual.
-/// Up to 0.17.1 oam's fetch ignored the slot, so such a mock failed open.
-/// (oam-specific: node's fetch would run that copy's dispatch().)
+/// oam's fetch cannot run its dispatch(), so it fails rather than send the
+/// request to the network without it. That is any such dispatcher -- a
+/// MockAgent, active or not, and one wrapped in a RetryAgent or composed
+/// (neither carries `isMockActive`), an Agent with options -- except the
+/// plain `new Agent()` a copy installs when it loads, which dispatches as
+/// oam's transport does and is gone around. `getGlobalDispatcher()` returns
+/// the foreign one, as in node, and the shim's setGlobalDispatcher() writes
+/// the slot, so the last one installed wins; a request given its own
+/// dispatcher goes as usual. Up to 0.17.1 oam's fetch ignored the slot, and
+/// until the review of #206 it refused only an active MockAgent, so a
+/// wrapped one failed open. (oam-specific: node's fetch would run that
+/// copy's dispatch(). The foreign objects have undici 6.29.0's shapes.)
 #[test]
-fn a_foreign_global_mock_agent_is_refused_not_bypassed() {
+fn a_foreign_global_dispatcher_is_refused_not_bypassed() {
     let script = write_temp(
-        "undici_foreign_mock/main.mjs",
+        "undici_foreign_global/main.mjs",
         r##"import http from 'node:http';
-import { Agent } from 'undici';
+import { Agent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
 
 const hits = [];
 const server = http.createServer((req, res) => { hits.push(req.url); res.end('real'); });
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const base = `http://127.0.0.1:${server.address().port}`;
 const slot = Symbol.for('undici.globalDispatcher.1');
-// What another copy's setGlobalDispatcher(new MockAgent()) leaves there.
-const foreign = { isMockActive: true, dispatch() { throw new Error('not called'); } };
-Object.defineProperty(globalThis, slot, { value: foreign, writable: true, enumerable: false, configurable: false });
-try {
-  await fetch(base + '/a');
-  console.log('fetch went through');
-} catch (e) {
-  console.log('refused', e.message, e.cause.name, e.cause.code);
+// What another copy's setGlobalDispatcher(d) does.
+const install = (d) => Object.defineProperty(globalThis, slot, { value: d, writable: true, enumerable: false, configurable: false });
+async function get(name) {
+  try {
+    const r = await fetch(base + '/' + name);
+    console.log(name, r.status, await r.text());
+  } catch (e) {
+    console.log(name, 'refused', e.message, e.cause.name, e.cause.code);
+  }
 }
-const own = await fetch(base + '/b', { dispatcher: new Agent() });
-console.log('own dispatcher', own.status, await own.text());
-foreign.isMockActive = false;
-const inactive = await fetch(base + '/c');
-console.log('inactive mock', inactive.status, await inactive.text());
+// undici's Agent (lib/dispatcher/agent.js), by its own symbols.
+const kDispatch = Symbol('dispatch');
+const kOptions = Symbol('options');
+const kFactory = Symbol('factory');
+const kMaxRedirections = Symbol('maxRedirections');
+class DispatcherBase { dispatch() { throw new Error('not called'); } }
+function defaultFactory(origin, opts) {
+  return opts && opts.connections === 1 ? new Client(origin, opts) : new Pool(origin, opts);
+}
+class UndiciAgent extends DispatcherBase {
+  constructor({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
+    super();
+    this[kOptions] = { ...options, connect };
+    this[kOptions].interceptors = options.interceptors ? { ...options.interceptors } : undefined;
+    this[kMaxRedirections] = maxRedirections;
+    this[kFactory] = factory;
+  }
+  [kDispatch]() { throw new Error('not called'); }
+}
+class MockAgent extends DispatcherBase { get isMockActive() { return true; } }
+class RetryAgent extends DispatcherBase { constructor(agent) { super(); this.agent = agent; } }
+class ComposedDispatcher extends DispatcherBase { #dispatcher; constructor(d) { super(); this.#dispatcher = d; } }
+class SubAgent extends UndiciAgent {}
+
+install(new UndiciAgent());
+await get('plain-agent-a-copy-installs-on-load');
+const mock = new MockAgent();
+install(mock);
+await get('mock-agent');
+console.log('getGlobalDispatcher is the mock', getGlobalDispatcher() === mock);
+install(new RetryAgent(mock));
+await get('retry-agent-over-a-mock');
+install(new ComposedDispatcher(mock));
+await get('composed-mock');
+install(new UndiciAgent({ headersTimeout: 5000 }));
+await get('agent-with-options');
+install(new UndiciAgent({ factory: () => mock }));
+await get('agent-with-a-factory');
+install(new SubAgent());
+await get('agent-subclass');
+const own = await fetch(base + '/own-dispatcher', { dispatcher: new Agent() });
+console.log('own-dispatcher', own.status, await own.text());
+const shim = new Agent();
+setGlobalDispatcher(shim);
+console.log('slot holds the shim dispatcher', globalThis[slot] === shim, getGlobalDispatcher() === shim);
+await get('shim-set-last');
 console.log('reached', JSON.stringify(hits));
 server.close();
 "##,
     );
     let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
     let (stdout, _) = run_script_ok(&script, out);
+    let refused = "refused fetch failed NotSupportedError UND_ERR_NOT_SUPPORTED";
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
-        "refused fetch failed NotSupportedError UND_ERR_NOT_SUPPORTED\n\
-         own dispatcher 200 real\n\
-         inactive mock 200 real\n\
-         reached [\"/b\",\"/c\"]"
+        format!(
+            "plain-agent-a-copy-installs-on-load 200 real\n\
+             mock-agent {refused}\n\
+             getGlobalDispatcher is the mock true\n\
+             retry-agent-over-a-mock {refused}\n\
+             composed-mock {refused}\n\
+             agent-with-options {refused}\n\
+             agent-with-a-factory {refused}\n\
+             agent-subclass {refused}\n\
+             own-dispatcher 200 real\n\
+             slot holds the shim dispatcher true true\n\
+             shim-set-last 200 real\n\
+             reached [\"/plain-agent-a-copy-installs-on-load\",\"/own-dispatcher\",\"/shim-set-last\"]"
+        )
     );
 }
 

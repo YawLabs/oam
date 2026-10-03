@@ -1508,14 +1508,35 @@
       });
     }
     holder.current = new Agent();
+    // undici's lib/global.js keeps the global dispatcher in a slot on
+    // globalThis that every copy of undici in the process shares: the npm
+    // package loaded by path, or one bundled into a dependency, reads and
+    // writes the same one. setGlobalDispatcher writes it as undici does, so
+    // the last one installed, by whichever copy, is the global dispatcher
+    // (a copy that dispatches through the shim's then gets its refusal of
+    // dispatch() rather than going around it), and getGlobalDispatcher
+    // reads it: another copy's MockAgent (or any dispatcher of its that
+    // oam's fetch refuses -- bootstrap.js foreignGlobalDispatcher) is what
+    // it returns, as in node, and that dispatcher's own request() runs it.
+    // The plain Agent a copy installs when it loads is left out: oam's
+    // fetch goes around it, so the shim's default is the one in effect.
+    // The shim's own default is not written there: the npm package installs
+    // its own when it loads into an empty slot, and dispatches through it.
+    const kGlobalDispatcher = Symbol.for("undici.globalDispatcher.1");
     function setGlobalDispatcher(d) {
       if (!d || typeof d.request !== "function") {
         throw new errors.InvalidArgumentError("Argument agent must implement Agent");
       }
       holder.current = d;
+      Object.defineProperty(G, kGlobalDispatcher, {
+        value: d,
+        writable: true,
+        enumerable: false,
+        configurable: false,
+      });
     }
     function getGlobalDispatcher() {
-      return holder.current;
+      return G.__oamForeignUndiciGlobal() ?? holder.current;
     }
 
     // ---- interceptors (no-op pass-throughs) -------------------------------

@@ -1716,17 +1716,27 @@ what reaches it). What differs:
   Map or Set *iterator* as a plain object, where node peeks at its entries.
 - **`dispatch()`** on the three refuses with `NotSupportedError`, as on every shim dispatcher:
   undici's mock answers a direct `dispatch(opts, handler)` call.
-- **Another copy's MockAgent.** `import 'undici'` is the shim even when the npm package is
-  installed, so a suite gets this MockAgent. The npm package can still be loaded by path, and
-  its own MockAgent works with its own `fetch` / `request`; installed as the global
-  dispatcher with that copy's `setGlobalDispatcher()` -- the slot every copy of undici
-  shares, which node's `fetch` reads -- an active one makes oam's `fetch` fail with
-  `NotSupportedError` (`a_foreign_global_mock_agent_is_refused_not_bypassed`, e2e): oam's
-  fetch cannot run its interceptors, and does not send the request to the network in their
-  place. The shim's `setGlobalDispatcher()` does not write that slot, so another copy of
-  undici does not see the shim's global dispatcher. (That copy's own fetch delivers a mock's
-  body since 0.17.2: it finalizes a response with `stream.finished()` on a web stream and
-  `performance.markResourceTiming()`, neither of which oam had --
+- **Another copy's global dispatcher.** `import 'undici'` is the shim even when the npm
+  package is installed, so a suite gets this MockAgent. The npm package can still be loaded
+  by path (or come bundled into a dependency), and its own MockAgent works with its own
+  `fetch` / `request`. undici keeps the global dispatcher in a slot every copy shares
+  (`Symbol.for('undici.globalDispatcher.1')`), which node's `fetch` reads and dispatches
+  through. oam's `fetch` (and so `undici.request`) cannot run another copy's `dispatch()`,
+  so while that slot holds one of its dispatchers -- a MockAgent, active or not, one wrapped
+  in a `RetryAgent` or `compose()`d, a proxy, a pool, an Agent with any option -- they fail
+  with `NotSupportedError` and nothing is sent, where node runs it
+  (`a_foreign_global_dispatcher_is_refused_not_bypassed`, e2e; up to 0.17.1 the slot was
+  ignored, so every such mock failed open). The one exception is the plain `new Agent()` a
+  copy installs when it loads into an empty slot (node's own undici fills the slot at
+  startup, oam does not): it dispatches as oam's transport does, so `fetch` goes around it
+  and runs as usual. `getGlobalDispatcher()` returns the other copy's dispatcher, as in node
+  (that one's own `request()` runs its `dispatch()`), and the shim's own otherwise, also
+  while the slot holds that plain Agent, where node returns the Agent. The shim's
+  `setGlobalDispatcher()` writes the slot, so the last dispatcher installed by either copy
+  is the global one; the other copy's `fetch` / `request` through a shim dispatcher fail with
+  the shim's `dispatch()` refusal, where node's run on it. (That copy's own fetch delivers a
+  mock's body since 0.17.2: it finalizes a response with `stream.finished()` on a web stream
+  and `performance.markResourceTiming()`, neither of which oam had --
   `conformance/cases/369-stream-finished-web-streams.mjs`,
   `371-performance-mark-resource-timing.mjs`. oam's `perf_hooks.performance` and global
   `performance` are still two objects; the resource entries are the former's.)

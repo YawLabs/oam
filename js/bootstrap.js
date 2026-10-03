@@ -2298,6 +2298,100 @@
     configurable: false,
   });
 
+  // What another copy of undici put in the global dispatcher slot -- the
+  // npm package loaded by path, or one bundled into a dependency, through
+  // that copy's setGlobalDispatcher -- when oam's fetch must not go around
+  // it: anything but the shim's own global dispatcher and a plain undici
+  // Agent. node's fetch reads the slot and runs that dispatcher's
+  // dispatch(): a MockAgent's interceptors, whether it is installed as it
+  // is, wrapped in a RetryAgent or composed; a proxy; a pool pinned to one
+  // origin; an Agent's connect options. oam sends a request itself and
+  // cannot run that dispatch(), so the request is refused rather than sent
+  // without it. null for no foreign value, and for the plain Agent every
+  // copy of undici installs when it loads (lib/global.js
+  // `setGlobalDispatcher(new Agent())` into an empty slot -- oam does not
+  // fill it at startup, as node's own undici does): that one dispatches as
+  // oam's transport does, so fetch going around it changes nothing, and
+  // refusing it would fail every fetch in a process that merely loads a
+  // bundled undici.
+  //
+  // One read of a registered symbol on a fetch; a foreign value is judged
+  // once per object.
+  const plainAgentVerdicts = new WeakMap();
+  const objectGetPrototypeOf = Object.getPrototypeOf;
+  const objectGetOwnPropertySymbols = Object.getOwnPropertySymbols;
+  const objectHasOwn = Object.hasOwn;
+  const reflectOwnKeys = Reflect.ownKeys;
+  const functionSource = Function.prototype.call.bind(Function.prototype.toString);
+  const regExpTest = Function.prototype.call.bind(RegExp.prototype.test);
+  // The value of `obj`'s own symbol-keyed property whose symbol reads
+  // `description` (undici's private symbols are unregistered, one set per
+  // copy), or `missing`.
+  const missing = Symbol("missing");
+  function ownSymbolValue(obj, description) {
+    for (const sym of objectGetOwnPropertySymbols(obj)) {
+      if (sym.description === description) return obj[sym];
+    }
+    return missing;
+  }
+  // undici's lib/dispatcher/agent.js `new Agent()` with no options, by its
+  // shape (class names do not survive a minifier; symbol descriptions and
+  // property names do): an instance of Agent itself -- its prototype owns
+  // Agent's [kDispatch], so a subclass, which may override anything, is not
+  // one -- with no own `dispatch`, every option undefined (no `connect`,
+  // no `interceptors`, no timeouts or limits), no redirections and the
+  // default factory (a Pool per origin, a Client for `connections: 1`), not
+  // one that hands requests to something else.
+  function judgePlainUndiciAgent(value) {
+    const proto = objectGetPrototypeOf(value);
+    if (proto === null || objectHasOwn(value, "dispatch") || objectHasOwn(proto, "dispatch")) return false;
+    if (ownSymbolValue(proto, "dispatch") === missing) return false;
+    const options = ownSymbolValue(value, "options");
+    if (options === null || typeof options !== "object") return false;
+    for (const key of reflectOwnKeys(options)) {
+      if (options[key] !== undefined) return false;
+    }
+    const redirections = ownSymbolValue(value, "maxRedirections");
+    if (redirections !== missing && redirections !== 0) return false;
+    const factory = ownSymbolValue(value, "factory");
+    if (typeof factory !== "function") return false;
+    let source;
+    try {
+      source = functionSource(factory);
+    } catch {
+      return false;
+    }
+    return regExpTest(/\.connections\s*={2,3}\s*1\b/, source);
+  }
+  function isPlainUndiciAgent(value) {
+    if (value === null || typeof value !== "object") return false;
+    let verdict = plainAgentVerdicts.get(value);
+    if (verdict === undefined) {
+      try {
+        verdict = judgePlainUndiciAgent(value);
+      } catch {
+        // A getter or a Proxy trap that throws: not a plain Agent.
+        verdict = false;
+      }
+      plainAgentVerdicts.set(value, verdict);
+    }
+    return verdict;
+  }
+  function foreignGlobalDispatcher() {
+    const value = globalThis[kUndiciGlobalDispatcher];
+    if (value == null) return null;
+    if (value === globalThis.__oamUndiciDispatcher?.current) return null;
+    return isPlainUndiciAgent(value) ? null : value;
+  }
+  // The shim's getGlobalDispatcher() answers with it too, so every way to
+  // reach "the global dispatcher" agrees on which one it is.
+  Object.defineProperty(globalThis, "__oamForeignUndiciGlobal", {
+    value: foreignGlobalDispatcher,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+
   // The connection policy of the undici dispatcher a fetch rides (the
   // `dispatcher` option, else the global one): `{ connector }` for one whose
   // `connect` is a function (a connect object carrying socket or TLS options,
@@ -3102,24 +3196,21 @@
     // an undici dispatcher.
     let connector = null;
     let policy = null;
-    // The global dispatcher slot every copy of undici shares (node's fetch
-    // reads it): a MockAgent from another copy -- the npm package loaded by
-    // path, or one bundled into a dependency -- put there with that copy's
-    // setGlobalDispatcher. oam's fetch cannot run its interceptors, and
-    // sending the request without them would send what a test meant to keep
-    // in memory to the network, so the fetch fails instead. One read of a
-    // registered symbol: nothing on a fetch with no such thing installed.
-    if (!rawPayload && init.dispatcher == null) {
-      const foreign = globalThis[kUndiciGlobalDispatcher];
-      if (foreign != null && foreign !== holder?.current && foreign.isMockActive === true) {
-        throw new TypeError("fetch failed", {
-          cause: new undiciErrors.NotSupportedError(
-            "A MockAgent from another copy of undici is the global dispatcher: oam's fetch cannot " +
-              "run its interceptors, and does not send the request to the network in their place. " +
-              "Use the MockAgent `import 'undici'` gives on oam",
-          ),
-        });
-      }
+    // The global dispatcher slot every copy of undici shares, which node's
+    // fetch reads: a dispatcher another copy installed there that oam's
+    // fetch cannot run (foreignGlobalDispatcher) fails the fetch, rather
+    // than the request going to the network without it -- a MockAgent's
+    // interceptors, bare or wrapped, would otherwise be skipped and the
+    // request the test meant to keep in memory sent.
+    if (!rawPayload && init.dispatcher == null && foreignGlobalDispatcher() !== null) {
+      throw new TypeError("fetch failed", {
+        cause: new undiciErrors.NotSupportedError(
+          "The global dispatcher was installed by another copy of undici (its setGlobalDispatcher): " +
+            "oam's fetch cannot run its dispatch() -- a MockAgent's interceptors, retries, a proxy, " +
+            "connect options -- and does not send the request without it. Install the dispatcher " +
+            "`import 'undici'` gives on oam",
+        ),
+      });
     }
     if (!rawPayload && dispatcher != null) {
       policy = dispatcherPolicy(dispatcher, holder, {
