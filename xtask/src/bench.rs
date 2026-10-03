@@ -1,16 +1,17 @@
 //! `cargo xtask bench`: micro-benchmark harness for the oam JS runtime.
 //!
-//! Ten benchmark cases measure different layers of the stack:
+//! Eleven benchmark cases measure different layers of the stack:
 //!   1. cold-start             -- process start to exit on a trivial script
 //!   2. url-parse              -- URL constructor throughput (10k parses)
 //!   3. http-throughput        -- node:http + fetch loopback (200 req)
-//!   4. fs-read                -- fs.readFileSync hot-loop (1000 reads of 4KB)
-//!   5. json-parse             -- JSON.parse + JSON.stringify (1000 round-trips)
-//!   6. crypto-hash            -- SHA-256 hash of 64KB (1000 iterations)
-//!   7. mcp-cold-start         -- process spawn to first MCP initialize response
-//!   8. mcp-idle-rss           -- RSS (MB) after initialize, server idle
-//!   9. mcp-first-call-latency -- tools/call round-trip on warm server
-//!  10. ts-cold-start          -- 20-module TypeScript graph load, per cache state
+//!   4. http-keepalive-latency -- per-request ms of small fetches on one pooled connection
+//!   5. fs-read                -- fs.readFileSync hot-loop (1000 reads of 4KB)
+//!   6. json-parse             -- JSON.parse + JSON.stringify (1000 round-trips)
+//!   7. crypto-hash            -- SHA-256 hash of 64KB (1000 iterations)
+//!   8. mcp-cold-start         -- process spawn to first MCP initialize response
+//!   9. mcp-idle-rss           -- RSS (MB) after initialize, server idle
+//!  10. mcp-first-call-latency -- tools/call round-trip on warm server
+//!  11. ts-cold-start          -- 20-module TypeScript graph load, per cache state
 //!
 //! With `--compare`, the same scripts run under every runtime found on
 //! PATH (node, bun, deno) and the harness reports a comparison table.
@@ -59,10 +60,11 @@ const CASE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Every case, in the order the tables print them. `--case` names come from
 /// this list and nowhere else.
-const CASE_NAMES: [&str; 10] = [
+const CASE_NAMES: [&str; 11] = [
     "cold-start",
     "url-parse",
     "http-throughput",
+    "http-keepalive-latency",
     "fs-read",
     "json-parse",
     "crypto-hash",
@@ -785,12 +787,12 @@ const TS_FANOUT_STRIDE: usize = 5;
 ///
 /// The three oam rows bracket the bytecode cache: `NoCache` is the floor with
 /// the cache switched off, `Cold` adds the cost of producing it, `Warm` shows
-/// what consuming it saves. What none of them skips is the `.ts` -> JS
-/// transpile itself: project sources have no transpile cache (only
-/// `node_modules` gets the install-time precompile, `oam_cli/src/main.rs`
-/// `try_precompile_cache`), so `Warm` still pays oxc on every run. That makes
-/// `Warm` the row a transpile cache has to move, and the reason this case
-/// exists: before it, nothing measured the TypeScript path in any state.
+/// what consuming it saves. When this case was written none of them skipped
+/// the `.ts` -> JS transpile itself (only `node_modules` got the install-time
+/// precompile), which made `Warm` the row a transpile cache had to move;
+/// since the transpile cache shipped (`oam_loader::transpile_cache`,
+/// `OAM_TRANSPILE_CACHE`), `Warm` has it warm too. Before this case, nothing
+/// measured the TypeScript path in any state.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TsState {
     /// `OAM_CODE_CACHE=0` and a fresh `OAM_CACHE_DIR` per run: transpile plus
@@ -1437,6 +1439,9 @@ pub fn run(release: bool, compare: bool, only: &[String]) -> Result<()> {
         let timed: Option<(&Path, usize, Vec<String>)> = match *case_name {
             "url-parse" => Some((scripts.url_parse.as_path(), TIMED_ITERS, vec![])),
             "http-throughput" => Some((scripts.http_throughput.as_path(), HTTP_ITERS, vec![])),
+            "http-keepalive-latency" => {
+                Some((scripts.http_keepalive_latency.as_path(), HTTP_ITERS, vec![]))
+            }
             "fs-read" => Some((
                 scripts.fs_read.as_path(),
                 TIMED_ITERS,
@@ -1589,27 +1594,39 @@ fn merge_filtered_run(
                 && measured_runtimes.contains(&field(r, "runtime").as_str()))
         })
         .collect();
+    // A fresh row carries the version of the binary that measured it, beside
+    // its commit stamp: the runtimes list keeps describing the full run
+    // behind every other row.
+    let fresh_runtimes = fresh["runtimes"].as_array().cloned().unwrap_or_default();
     rows.extend(
         fresh["results"]
             .as_array()
             .iter()
-            .flat_map(|a| a.iter().cloned()),
+            .flat_map(|a| a.iter().cloned())
+            .map(|mut row| {
+                if let Some(rt) = fresh_runtimes
+                    .iter()
+                    .find(|rt| rt["name"] == row["runtime"])
+                {
+                    row["version"] = rt["version"].clone();
+                }
+                row
+            }),
     );
 
-    // Runtimes: refresh an entry only when this run put a fresh MAIN-table
-    // row under it. The list describes the binaries behind the main table, so
-    // a ts-cold-start-only run must not relabel acec-era rows with today's
-    // versions -- the TypeScript section stamps its own.
+    // Runtimes: the list names the binaries behind the main table's rows,
+    // and most of them are the last full run's, so an entry is never
+    // replaced -- re-measured rows say their own version. A runtime the
+    // full run did not have joins when this run put a row under it; the
+    // TypeScript section stamps its own.
     let mut runtimes: Vec<serde_json::Value> =
         doc["runtimes"].as_array().cloned().unwrap_or_default();
     let fresh_main_rows = fresh["results"].as_array().cloned().unwrap_or_default();
-    for rt in fresh["runtimes"].as_array().cloned().unwrap_or_default() {
-        if !fresh_main_rows.iter().any(|r| r["runtime"] == rt["name"]) {
-            continue;
-        }
-        match runtimes.iter_mut().find(|r| r["name"] == rt["name"]) {
-            Some(slot) => *slot = rt,
-            None => runtimes.push(rt),
+    for rt in fresh_runtimes {
+        if fresh_main_rows.iter().any(|r| r["runtime"] == rt["name"])
+            && !runtimes.iter().any(|r| r["name"] == rt["name"])
+        {
+            runtimes.push(rt);
         }
     }
 
@@ -1644,6 +1661,7 @@ struct Scripts {
     cold_start: PathBuf,
     url_parse: PathBuf,
     http_throughput: PathBuf,
+    http_keepalive_latency: PathBuf,
     fs_read: PathBuf,
     json_parse: PathBuf,
     crypto_hash: PathBuf,
@@ -1697,6 +1715,44 @@ for (let i = 0; i < N; i++) {
 const elapsed = performance.now() - t0;
 server.close();
 console.log(JSON.stringify({ elapsed_ms: elapsed, requests: N, rps: (N / elapsed) * 1000 }));
+"#,
+    )?;
+
+    // #183's loop: the per-request cost of a small fetch on a warm pooled
+    // connection -- the path every keep-alive client takes, where a
+    // regression in the transport's per-request work shows rather than
+    // drowning in connection setup. 50 warm-up fetches, then 10 batches of
+    // 200 sequential fetches of a 2-byte body; `elapsed_ms` is the median
+    // batch's milliseconds PER REQUEST (min and every batch alongside).
+    let http_keepalive_latency = tmp.join("bench_http_keepalive_latency.mjs");
+    std::fs::write(
+        &http_keepalive_latency,
+        r#"import http from 'node:http';
+const WARMUP = 50;
+const BATCHES = 10;
+const PER_BATCH = 200;
+const server = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('ok');
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `http://127.0.0.1:${server.address().port}/`;
+const get = async () => {
+    const res = await fetch(url);
+    if ((await res.text()) !== 'ok') throw new Error('unexpected body');
+};
+for (let i = 0; i < WARMUP; i++) await get();
+const perRequest = [];
+for (let b = 0; b < BATCHES; b++) {
+    const t0 = performance.now();
+    for (let i = 0; i < PER_BATCH; i++) await get();
+    perRequest.push((performance.now() - t0) / PER_BATCH);
+}
+server.closeAllConnections?.();
+server.close();
+const sorted = [...perRequest].sort((a, b) => a - b);
+const median = (sorted[BATCHES / 2 - 1] + sorted[BATCHES / 2]) / 2;
+console.log(JSON.stringify({ elapsed_ms: median, min_ms: sorted[0], batches_ms: perRequest }));
 "#,
     )?;
 
@@ -1776,6 +1832,7 @@ server.serve({ transport: 'stdio' });
         cold_start,
         url_parse,
         http_throughput,
+        http_keepalive_latency,
         fs_read,
         json_parse,
         crypto_hash,
@@ -2182,7 +2239,11 @@ fn build_markdown(doc: &serde_json::Value) -> String {
         .filter_map(|(case, name)| {
             let row = find(case, name)?;
             let row_commit = row["commit"].as_str()?;
-            (row_commit != commit).then(|| format!("{case}/{name} at `{row_commit}`"))
+            let version = row["version"]
+                .as_str()
+                .map(|v| format!(" ({v})"))
+                .unwrap_or_default();
+            (row_commit != commit).then(|| format!("{case}/{name} at `{row_commit}`{version}"))
         })
         .collect();
     if !remeasured.is_empty() {
@@ -2204,6 +2265,7 @@ fn build_markdown(doc: &serde_json::Value) -> String {
         "- **url-parse** -- 10,000 `new URL()` constructions across 5 representative URLs.\n",
     );
     md.push_str("- **http-throughput** -- node:http server + fetch client, 200 sequential requests on loopback.\n");
+    md.push_str("- **http-keepalive-latency** -- milliseconds PER REQUEST of a small fetch on one warm pooled connection: node:http server on loopback, 50 warm-up fetches, then 10 batches of 200 sequential fetches of a 2-byte body; the median batch per run. The transport's per-request work, without connection setup (#183).\n");
     md.push_str("- **fs-read** -- `fs.readFileSync` of a 4KB file, 1,000 iterations.\n");
     md.push_str("- **json-parse** -- `JSON.parse(JSON.stringify(obj))` round-trip on a 100-user payload, 1,000 iterations.\n");
     md.push_str("- **crypto-hash** -- `crypto.createHash('sha256').update(64KB).digest()`, 1,000 iterations.\n");
@@ -2280,12 +2342,17 @@ fn push_ts_markdown(md: &mut String, ts: &serde_json::Value) {
          also serializes and writes the bytecode. Its gap above no-cache is the price of producing \
          the cache.\n",
     );
+    // The committed BENCHMARKS.md carried this text (edited there when the
+    // transpile cache shipped) while the generator still wrote the
+    // pre-cache one, so a `--case` run reverted it.
     md.push_str(
         "- **oam warm** -- caches on, one `OAM_CACHE_DIR` primed by an untimed run and reused: every \
-         run after the first. Its gap below no-cache is what consuming the cache saves. The \
-         transpile itself is not cached for project files (only `node_modules` gets the \
-         install-time precompile), so this row still pays oxc on every run -- it is the row a \
-         transpile cache has to move.\n",
+         run after the first. Its gap below no-cache is what consuming the cache saves. Both \
+         caches are warm on this row: the V8 bytecode cache and, since the transpile cache \
+         shipped, the oxc output for project files too (`OAM_TRANSPILE_CACHE`, on by default, \
+         content-addressed by source text plus transpile settings). The measurement above \
+         predates the transpile cache and so still describes a row that re-ran oxc every time; \
+         re-measure with `--case ts-cold-start` before quoting this row.\n",
     );
     match node_flag {
         Some(flag) if has_node => {
@@ -2595,6 +2662,7 @@ mod filtered_runs {
         };
         assert_eq!(find("cold-start", "oam")["p50"], 40.0);
         assert_eq!(find("cold-start", "oam")["commit"], "01bee57+wip");
+        assert_eq!(find("cold-start", "oam")["version"], "oam 0.13.0");
         // node was not measured (no --compare), so its row and its lack of a
         // per-row stamp survive untouched.
         assert_eq!(find("cold-start", "node")["p50"], 113.0);
@@ -2602,12 +2670,46 @@ mod filtered_runs {
         assert_eq!(find("url-parse", "oam")["p50"], 6.5);
         assert_eq!(rows.len(), 3);
 
-        // Runtimes: oam refreshed, node kept, so the columns do not shift.
+        // Runtimes: kept as the full run had them -- url-parse/oam is still
+        // that run's oam 0.9.0 -- so the columns do not shift and no old row
+        // is relabelled; the fresh row says its own version.
         let runtimes = merged["runtimes"].as_array().unwrap();
-        assert_eq!(runtimes[0]["version"], "oam 0.13.0");
+        assert_eq!(runtimes[0]["version"], "oam 0.9.0");
         assert_eq!(runtimes[1]["name"], "node");
+        assert!(find("url-parse", "oam")["version"].is_null());
 
         assert_eq!(merged["ts_cold_start"]["commit"], "01bee57+wip");
+    }
+
+    #[test]
+    fn merge_adds_a_runtime_the_full_run_lacked_and_relabels_none() {
+        let mut fresh = fresh(
+            vec![
+                row("cold-start", "oam", 40.0, Some("01bee57")),
+                row("cold-start", "bun", 20.0, Some("01bee57")),
+            ],
+            None,
+        );
+        fresh["runtimes"] = json!([
+            {"name": "oam", "version": "oam 0.13.0", "exe": "oam"},
+            {"name": "bun", "version": "1.2", "exe": "bun"},
+        ]);
+        let merged =
+            merge_filtered_run(existing(), fresh, &["cold-start"], &["oam", "bun"]).unwrap();
+        let names: Vec<&str> = merged["runtimes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|rt| rt["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["oam", "node", "bun"]);
+        assert_eq!(merged["runtimes"][0]["version"], "oam 0.9.0");
+        let md = build_markdown(&merged);
+        assert!(
+            md.contains("cold-start/oam at `01bee57` (oam 0.13.0)"),
+            "{md}"
+        );
+        assert!(md.contains("cold-start/bun at `01bee57` (1.2)"), "{md}");
     }
 
     #[test]
@@ -2674,7 +2776,8 @@ mod filtered_runs {
 
         assert!(md.contains("Commit `acec008` | release | host test-host"));
         assert!(md.contains("| cold-start | 40.00 | 113.00 | 0.35x |"));
-        assert!(md.contains("cold-start/oam at `01bee57+wip`"));
+        assert!(md.contains("cold-start/oam at `01bee57+wip` (oam 0.13.0)"));
+        assert!(md.contains("- **oam** oam 0.9.0"), "{md}");
         assert!(md.contains("## TypeScript load path"));
         assert!(md.contains("Commit `01bee57+wip` | release | host test-host | oam 0.13.0 | v22"));
         assert!(md.contains("| oam no-cache | 70.00 |"));

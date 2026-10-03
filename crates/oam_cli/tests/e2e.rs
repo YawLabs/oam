@@ -9398,9 +9398,10 @@ try {
         &port_arg,
     ]);
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // Named as the hop's `address:port`, as net.connect names a connection.
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
-        "DENIED ERR_ACCESS_DENIED \"127.0.0.1\"",
+        format!("DENIED ERR_ACCESS_DENIED \"127.0.0.1:{port}\""),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -9489,14 +9490,14 @@ console.log('continued', tokens.length, 'still parked', tokens.some((t) => inter
     // Refused (the address is not granted), and released.
     let (stdout, stderr) = run("--allow-net=granted.invalid", 1234, "10.9.9.9");
     assert_eq!(
-        stdout, "DENIED \"10.9.9.9\"\ncontinued 1 still parked false",
+        stdout, "DENIED \"10.9.9.9:1234\"\ncontinued 1 still parked false",
         "stderr: {stderr}"
     );
     // The unbracketed spelling matches no URL, and no longer a hook answer:
     // refused as the URL `http://[::1]/` is, naming the same resource.
     let (stdout, stderr) = run("--allow-net=granted.invalid,::1", 1234, "::1");
     assert_eq!(
-        stdout, "DENIED \"[::1]\"\ncontinued 1 still parked false",
+        stdout, "DENIED \"[::1]:1234\"\ncontinued 1 still parked false",
         "stderr: {stderr}"
     );
 
@@ -9525,6 +9526,162 @@ console.log('continued', tokens.length, 'still parked', tokens.some((t) => inter
         );
     }
     server.join().unwrap();
+}
+
+/// A zone-id `connect.lookup` answer is matched against `--allow-net` as an
+/// address and a zone, never as text. node's zone grammar admits `:`
+/// (`net.isIP('::1%1:8080')` is 6, and a connect dials that answer with the
+/// zone `1:8080` on its own port), so the answer `::1%1:<P>` is the address
+/// `::1` with the zone `1:<P>`, and the entry `::1%1:<P>` is the address `::1`,
+/// the zone `1` and the port P: they never match, on P or any other port. The
+/// entry still admits the answer `::1%1` (in any spelling of the address) on
+/// P, and a host-only `::1%1` admits it on any port.
+///
+/// Every client reads the grant the same way: `fetch` through an undici
+/// Agent's `connect.lookup`, `net.connect` to the address named directly,
+/// and `net.connect` and `tls.connect` through a `lookup` hook. Admitted runs
+/// only have to get past the check (the dial's outcome with a scope id
+/// differs by platform); refused ones never arrive.
+#[test]
+fn a_connect_lookup_zone_id_answer_is_matched_as_an_address_and_a_zone() {
+    let script = write_temp(
+        "lookup_permission_zone/main.mjs",
+        r#"import { Agent } from 'undici';
+import net from 'node:net';
+import tls from 'node:tls';
+const port = Number(process.argv[2]);
+const answer = process.argv[3];
+const verdict = (e) =>
+  e && e.code === 'ERR_ACCESS_DENIED' ? `DENIED ${JSON.stringify(e.resource)}` : 'PASSED THE CHECK';
+const lookup = (h, o, cb) =>
+  o && o.all ? cb(null, [{ address: answer, family: 6 }]) : cb(null, answer, 6);
+const socketVerdict = (open) =>
+  new Promise((resolve) => {
+    let socket;
+    try {
+      socket = open();
+    } catch (e) {
+      resolve(verdict(e));
+      return;
+    }
+    const done = (v) => {
+      clearTimeout(timer);
+      socket.destroy();
+      resolve(v);
+    };
+    const timer = setTimeout(() => done('PASSED THE CHECK'), 5000);
+    socket.on('connect', () => done('PASSED THE CHECK'));
+    socket.on('secureConnect', () => done('PASSED THE CHECK'));
+    socket.on('error', (e) => done(verdict(e)));
+  });
+const agent = new Agent({ connect: { lookup } });
+let viaFetch;
+try {
+  const r = await fetch(`http://granted.invalid:${port}/`, { dispatcher: agent, signal: AbortSignal.timeout(5000) });
+  viaFetch = `ALLOWED ${r.status}`;
+} catch (e) {
+  viaFetch = verdict(e.code === 'ERR_ACCESS_DENIED' ? e : e.cause);
+}
+console.log('fetch', viaFetch);
+console.log('net', await socketVerdict(() => net.connect({ host: answer, port })));
+console.log('net-lookup', await socketVerdict(() => net.connect({ host: 'granted.invalid', port, lookup })));
+console.log(
+  'tls-lookup',
+  await socketVerdict(() =>
+    tls.connect({ host: 'granted.invalid', port, lookup, servername: 'granted.invalid', rejectUnauthorized: false }),
+  ),
+);
+"#,
+    );
+    let path = script.to_str().unwrap().to_string();
+    // A [::1] listener the admitted runs may reach; without IPv6 loopback any
+    // port serves, since the refusals happen before a dial.
+    let listener = std::net::TcpListener::bind("[::1]:0").ok();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let port = match listener {
+        Some(listener) => {
+            let port = listener.local_addr().unwrap().port();
+            let counted = hits.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { continue };
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    drop(stream);
+                }
+            });
+            port
+        }
+        None => 18080,
+    };
+    let other = if port == u16::MAX { port - 1 } else { port + 1 };
+    let clients = ["fetch", "net", "net-lookup", "tls-lookup"];
+    let run = |grant: String, answer: String| {
+        let out = oam(&[
+            "--permission",
+            &format!("--allow-net=granted.invalid,{grant}"),
+            "--",
+            &path,
+            &port.to_string(),
+            &answer,
+        ]);
+        let stdout = String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n");
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let lines: Vec<String> = stdout.lines().map(str::to_string).collect();
+        assert_eq!(
+            lines.len(),
+            clients.len(),
+            "{grant} / {answer}: {stdout}; stderr: {stderr}"
+        );
+        for (line, client) in lines.iter().zip(clients) {
+            assert!(
+                line.starts_with(&format!("{client} ")),
+                "{grant} / {answer}: {stdout}; stderr: {stderr}"
+            );
+        }
+        (lines, stderr)
+    };
+    let denied_everywhere = |grant: String, answer: String| {
+        let (lines, stderr) = run(grant.clone(), answer.clone());
+        for (line, client) in lines.iter().zip(clients) {
+            assert_eq!(
+                *line,
+                format!("{client} DENIED \"{answer}:{port}\""),
+                "{grant} / {answer}; stderr: {stderr}"
+            );
+        }
+    };
+
+    // Port-scoped entry (`::1`, zone `1`, port `other`); the answer's zone is
+    // `1:<other>` and the connect's port is `port`.
+    denied_everywhere(format!("::1%1:{other}"), format!("::1%1:{other}"));
+    // The same zone text on the entry's own port is still another zone.
+    denied_everywhere(format!("::1%1:{port}"), format!("::1%1:{port}"));
+    // A host-only entry grants its zone alone.
+    denied_everywhere("::1%1".to_string(), format!("::1%1:{port}"));
+    // A port-scoped entry grants its own port alone, in any spelling.
+    denied_everywhere(format!("::1%1:{other}"), "::1%1".to_string());
+    denied_everywhere(format!("::1%1:{other}"), "0::1%1".to_string());
+    // Another zone is another host.
+    denied_everywhere("::1%1".to_string(), "::1%2".to_string());
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a refused answer must never be dialled"
+    );
+
+    // Admitted by every client: the port-scoped entry on its port, the
+    // host-only one on any, each in any spelling of the address.
+    for grant in [format!("::1%1:{port}"), "::1%1".to_string()] {
+        for answer in ["::1%1", "0::1%1", "0:0:0:0:0:0:0:1%1"] {
+            let (lines, stderr) = run(grant.clone(), answer.to_string());
+            for line in &lines {
+                assert!(
+                    !line.contains("DENIED"),
+                    "{grant} / {answer}: {lines:?}; stderr: {stderr}"
+                );
+            }
+        }
+    }
 }
 
 /// A TCP listener that counts the connections it accepts, for the net / tls
@@ -11056,8 +11213,8 @@ fn oam_without_proxy_env(args: &[&str]) -> Output {
 /// (127.0.0.1) redirects each request to a target named by the case:
 ///
 ///  - every spelling of an ungranted host is refused with the same
-///    `ERR_ACCESS_DENIED` a direct request gets, naming the host as the URL
-///    parser normalised it (`LOCALHOST` and `%6c%6fcalhost` are `localhost`,
+///    `ERR_ACCESS_DENIED` a direct request gets, naming `host:port` with the
+///    host as the URL parser normalised it (`LOCALHOST` and `%6c%6fcalhost` are `localhost`,
 ///    `[0:0:0:0:0:0:0:1]` is `[::1]`; `localhost.` stays itself, which no
 ///    grant for `localhost` covers), and the target server never sees a
 ///    request -- not even the re-sent body of a 307 POST;
@@ -11215,34 +11372,37 @@ console.log(lines.join('\n'));
         assert!(out.status.success(), "{argv:?}: {stdout}\n{stderr}");
         let inner_seen = inner_seen.lock().unwrap().clone();
         let inner6_seen = inner6_seen.map(|seen| seen.lock().unwrap().clone());
-        (stdout, stderr, inner_seen, inner6_seen)
+        let ports = (inner.parse::<u16>().unwrap(), inner6);
+        (stdout, stderr, inner_seen, inner6_seen, ports)
     };
 
     let granted = "--allow-net=127.0.0.1,granted.invalid";
-    let (stdout, stderr, inner_seen, inner6_seen) = run(&["--permission", granted], "full");
+    let (stdout, stderr, inner_seen, inner6_seen, (inner, inner6)) =
+        run(&["--permission", granted], "full");
     let denied = "Error|Access to this API has been restricted|code,permission,resource";
+    // A refusal names the hop's `host:port`, as net.connect's does.
     assert_eq!(
         stdout,
         [
-            r#"fetch localhost DENIED Net "localhost""#,
-            r#"fetch upper DENIED Net "localhost""#,
-            r#"fetch dot DENIED Net "localhost.""#,
-            r#"fetch pct DENIED Net "localhost""#,
-            r#"fetch v6 DENIED Net "[::1]""#,
-            r#"fetch v6long DENIED Net "[::1]""#,
+            &format!(r#"fetch localhost DENIED Net "localhost:{inner}""#),
+            &format!(r#"fetch upper DENIED Net "localhost:{inner}""#),
+            &format!(r#"fetch dot DENIED Net "localhost.:{inner}""#),
+            &format!(r#"fetch pct DENIED Net "localhost:{inner}""#),
+            &format!(r#"fetch v6 DENIED Net "[::1]:{inner6}""#),
+            &format!(r#"fetch v6long DENIED Net "[::1]:{inner6}""#),
             r#"fetch userinfo ERR TypeError: fetch failed / cross origin not allowed for request mode "cors""#,
             "fetch ip 200 inner /fetch/ip",
             "fetch hex 200 inner /fetch/hex",
-            r#"fetch307 localhost DENIED Net "localhost""#,
+            &format!(r#"fetch307 localhost DENIED Net "localhost:{inner}""#),
             // http.request follows no redirect, as in node: the 3xx is the
             // response, and neither hop is dialled.
             "http localhost 302 ",
             "http ip 302 ",
-            r#"undici localhost DENIED Net "localhost""#,
+            &format!(r#"undici localhost DENIED Net "localhost:{inner}""#),
             "undici ip 200 inner /undici/ip",
-            r#"hook denied DENIED Net "denied.invalid""#,
+            &format!(r#"hook denied DENIED Net "denied.invalid:{inner}""#),
             "hook granted 200 inner /hook/granted",
-            r#"direct DENIED Net "localhost""#,
+            &format!(r#"direct DENIED Net "localhost:{inner}""#),
             // The outer origin twice (the second fetch is a new hooked
             // client), then the granted hop. Never `denied.invalid`.
             r#"hook-calls ["granted.invalid","granted.invalid","granted.invalid"]"#,
@@ -11278,10 +11438,171 @@ console.log(lines.join('\n'));
     ]
     .join("\n");
     for flags in [&[][..], &["--permission", "--allow-net"][..]] {
-        let (stdout, stderr, inner_seen, _) = run(flags, "off");
+        let (stdout, stderr, inner_seen, _, _) = run(flags, "off");
         assert_eq!(stdout, followed, "{flags:?} stderr: {stderr}");
         assert_eq!(inner_seen.len(), 3, "{flags:?}: {inner_seen:?}");
     }
+}
+
+/// A port-scoped `--allow-net` entry admits the HTTP clients to its own port,
+/// as it admits `net.connect` there: `fetch`, `http.request`,
+/// `undici.request` and `WebSocket` are checked on `host:port` -- the URL's
+/// port, or 80 / 443 by scheme -- and a refusal names that resource. Up to
+/// 0.17.1 they were checked on the host alone, so `--allow-net=127.0.0.1:PORT`
+/// connected a raw socket to PORT and refused every HTTP request to it.
+///
+/// The same entry refuses every other port: directly, through a granted
+/// origin's redirect to another port on the same host, and for a
+/// `connect.lookup` hook whose answer is granted only on another port (the
+/// answer is checked on the parked hop's port, read from the parked fetch).
+/// The listener on the other port must never see a request. A scheme's
+/// default port is the one checked: `scoped.invalid:443` admits `https:` and
+/// `wss:` (which then fail at DNS, past the gate) and refuses `http:` and
+/// `ws:` as `scoped.invalid:80`.
+#[test]
+fn allow_net_port_scoped_entry_admits_http_clients_on_its_port_alone() {
+    let script = write_temp(
+        "port_scoped_permission/main.mjs",
+        r#"import http from 'node:http';
+import { Agent, request } from 'undici';
+const granted = Number(process.argv[2]);
+const other = Number(process.argv[3]);
+const fail = (e) =>
+  e && e.code === 'ERR_ACCESS_DENIED' ? `DENIED ${e.permission} ${JSON.stringify(e.resource)}` : 'NOT DENIED';
+const viaFetch = async (url, init) => {
+  try {
+    const r = await fetch(url, init);
+    return `${r.status} ${await r.text()}`;
+  } catch (e) {
+    return fail(e);
+  }
+};
+const viaHttp = (url) =>
+  new Promise((resolve) => {
+    http.get(url, (res) => {
+      res.resume();
+      res.on('end', () => resolve(`${res.statusCode}`));
+    }).on('error', (e) => resolve(fail(e)));
+  });
+const viaUndici = async (url) => {
+  try {
+    const r = await request(url);
+    return `${r.statusCode} ${await r.body.text()}`;
+  } catch (e) {
+    return fail(e);
+  }
+};
+const viaWs = (url) =>
+  new Promise((resolve) => {
+    try {
+      const ws = new WebSocket(url);
+      ws.onerror = () => resolve('NOT DENIED');
+      ws.onopen = () => { ws.close(); resolve('OPEN'); };
+    } catch (e) {
+      resolve(fail(e));
+    }
+  });
+const hook = (answer) => new Agent({ connect: { lookup: (h, o, cb) => cb(null, [{ address: answer, family: 4 }]) } });
+const at = (port, path) => `http://127.0.0.1:${port}${path}`;
+const lines = [
+  `fetch ${await viaFetch(at(granted, '/fetch'))}`,
+  `http ${await viaHttp(at(granted, '/http'))}`,
+  `undici ${await viaUndici(at(granted, '/undici'))}`,
+  `ws ${await viaWs(`ws://127.0.0.1:${granted}/ws`)}`,
+  `hook ${await viaFetch(`http://granted.invalid:${granted}/hook`, { dispatcher: hook('127.0.0.1') })}`,
+  `fetch other ${await viaFetch(at(other, '/fetch'))}`,
+  `http other ${await viaHttp(at(other, '/http'))}`,
+  `undici other ${await viaUndici(at(other, '/undici'))}`,
+  `ws other ${await viaWs(`ws://127.0.0.1:${other}/ws`)}`,
+  `fetch redirect ${await viaFetch(at(granted, '/redirect'))}`,
+  `undici redirect ${await viaUndici(at(granted, '/redirect'))}`,
+  `hook other ${await viaFetch(`http://granted.invalid:${other}/hook`, { dispatcher: hook('127.0.0.1') })}`,
+  `https default ${await viaFetch('https://scoped.invalid/')}`,
+  `http default ${await viaFetch('http://scoped.invalid/')}`,
+  `wss default ${await viaWs('wss://scoped.invalid/')}`,
+  `ws default ${await viaWs('ws://scoped.invalid/')}`,
+];
+console.log(lines.join('\n'));
+"#,
+    );
+    let other_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let other = other_listener.local_addr().unwrap().port();
+    let other_seen = spawn_one_shot_http(other_listener, |_| {
+        "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nother".to_string()
+    });
+    let granted_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let granted = granted_listener.local_addr().unwrap().port();
+    let granted_seen = spawn_one_shot_http(granted_listener, move |target| {
+        if target == "/redirect" {
+            format!(
+                "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{other}/hop\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+        } else {
+            "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok".to_string()
+        }
+    });
+    let path = script.to_str().unwrap().to_string();
+    let grant = format!(
+        "--allow-net=127.0.0.1:{granted},granted.invalid:{granted},granted.invalid:{other},scoped.invalid:443"
+    );
+    let out = oam_without_proxy_env(&[
+        "--permission",
+        &grant,
+        "--",
+        &path,
+        &granted.to_string(),
+        &other.to_string(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .replace("\r\n", "\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let refused = format!(r#"DENIED Net "127.0.0.1:{other}""#);
+    assert_eq!(
+        stdout,
+        [
+            "fetch 200 ok".to_string(),
+            "http 200".to_string(),
+            "undici 200 ok".to_string(),
+            // The listener answers the upgrade with a plain 200: the socket
+            // was admitted and dialled, and the handshake fails after it.
+            "ws NOT DENIED".to_string(),
+            "hook 200 ok".to_string(),
+            format!("fetch other {refused}"),
+            format!("http other {refused}"),
+            format!("undici other {refused}"),
+            format!("ws other {refused}"),
+            format!("fetch redirect {refused}"),
+            format!("undici redirect {refused}"),
+            // The name is granted on `other`, its answer only on `granted`.
+            format!("hook other {refused}"),
+            "https default NOT DENIED".to_string(),
+            r#"http default DENIED Net "scoped.invalid:80""#.to_string(),
+            "wss default NOT DENIED".to_string(),
+            r#"ws default DENIED Net "scoped.invalid:80""#.to_string(),
+        ]
+        .join("\n"),
+        "stderr: {stderr}"
+    );
+    let mut seen = granted_seen.lock().unwrap().clone();
+    seen.sort();
+    assert_eq!(
+        seen,
+        [
+            "GET /fetch",
+            "GET /hook",
+            "GET /http",
+            "GET /redirect",
+            "GET /redirect",
+            "GET /undici",
+            "GET /ws",
+        ]
+    );
+    assert!(
+        other_seen.lock().unwrap().is_empty(),
+        "a refused port was dialled: {:?}",
+        other_seen.lock().unwrap()
+    );
 }
 
 /// The request shapes conformance case 114 cannot assert, because node's own
@@ -12020,27 +12341,35 @@ server.close();
 /// fetch's default request headers over https (#178): undici's
 /// `accept-encoding` there is `br, gzip, deflate` (oam decodes br since
 /// #151), and the rest of its defaults go out as over http. Against an
-/// HTTP/1.1 server, and against an h2 server, which oam's fetch negotiates
-/// (node's does not): there the `connection` default must not break the
-/// request -- HTTP/2 has no such header, and the transport drops it.
+/// HTTP/1.1 server, and against an h2 server with allowHTTP1, which a plain
+/// fetch reaches over HTTP/1.1 as node's does (it offers ALPN `http/1.1`
+/// alone, #176) -- and which a dispatcher with `allowH2` reaches over h2:
+/// there the `connection` default must not break the request -- HTTP/2 has
+/// no such header, and the transport drops it, as undici's h2 client does.
+/// Every line was measured on node v22.22.2 + undici 6.24.1. (An empty
+/// `POST` over h2 is left out: node sends it without the `content-length:
+/// 0` it sends over HTTP/1.1, and oam with it; docs/node-divergences.md.)
 #[test]
 fn fetch_https_sends_undici_default_headers() {
     let bundle = write_temp("fetch-https-defaults/ca.pem", TLS_TEST_CA_CERT);
     let src = r#"import https from 'node:https';
 import http2 from 'node:http2';
+import { Agent } from 'undici';
 const names = ['accept-encoding', 'accept-language', 'sec-fetch-mode', 'connection', 'content-length'];
 const echo = (req, res) => res.end(req.httpVersion + ' ' + names.map((n) => n + '=' + (req.headers[n] ?? '-')).join(' '));
 const h1 = https.createServer({ cert: `__CERT__`, key: `__KEY__` }, echo);
 const h2 = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__`, allowHTTP1: true }, echo);
-// fetch's pool keeps its h2 session open, and an http2 server's close()
-// waits for every session: end them, so the run can exit.
+// An allowH2 fetch's pool keeps its h2 session open, and an http2 server's
+// close() waits for every session: end them, so the run can exit.
 const sessions = new Set();
 h2.on('session', (session) => sessions.add(session));
-for (const [label, server] of [['h1', h1], ['h2', h2]]) {
+const allowH2 = new Agent({ allowH2: true });
+for (const [label, server, dispatcher] of [['h1', h1], ['h2', h2], ['h2 allowH2', h2, allowH2]]) {
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const url = `https://localhost:${server.address().port}/`;
-  console.log(label, 'GET', await (await fetch(url)).text());
-  console.log(label, 'POST', await (await fetch(url, { method: 'POST' })).text());
+  console.log(label, 'GET', await (await fetch(url, { dispatcher })).text());
+  const post = dispatcher ? { method: 'POST', body: 'abc', dispatcher } : { method: 'POST' };
+  console.log(label, 'POST', await (await fetch(url, post)).text());
   server.close();
 }
 for (const session of sessions) session.destroy();
@@ -12057,8 +12386,10 @@ for (const session of sessions) session.destroy();
         stdout.trim().replace("\r\n", "\n"),
         "h1 GET 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=-\n\
          h1 POST 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=0\n\
-         h2 GET 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=-\n\
-         h2 POST 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=0",
+         h2 GET 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=-\n\
+         h2 POST 1.1 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=keep-alive content-length=0\n\
+         h2 allowH2 GET 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=-\n\
+         h2 allowH2 POST 2.0 accept-encoding=br, gzip, deflate accept-language=* sec-fetch-mode=cors connection=- content-length=3",
         "stderr: {stderr}"
     );
 }
@@ -23619,7 +23950,10 @@ setTimeout(() => process.exit(0), 50);
 /// (v22.22.2) prints "fetch=ok slow-done" for both: its socket is the first
 /// request's own, and undici's pool is not the agent's. That oam reused the
 /// connection (one server connection, where node dials two) is what puts
-/// the fetch in harm's way, so it is asserted too.
+/// the fetch in harm's way, so it is asserted too. Over https it no longer
+/// does: since #176 https.get offers no ALPN and fetch offers `http/1.1`, as
+/// node's do, and a connection serves only requests with its own offer, so
+/// the fetch dials its own -- two connections, as node's.
 #[test]
 fn a_kept_req_socket_leaves_a_connection_another_request_took() {
     let src = format!(
@@ -23672,7 +24006,7 @@ setTimeout(() => process.exit(0), 50);
         stdout.lines().collect::<Vec<_>>(),
         [
             "http fetch=ok slow-done connections=1",
-            "https fetch=ok slow-done connections=1",
+            "https fetch=ok slow-done connections=2",
         ],
         "stderr: {stderr}"
     );
@@ -28952,15 +29286,18 @@ for (const allowHTTP1 of [false, true]) {
     );
 }
 
-/// oam's own fetch negotiates h2 by ALPN with http2.createSecureServer and
-/// is served over HTTP/2 through the compatibility API (the server trusts
-/// nothing but its own key; the client trusts the test CA through
-/// NODE_EXTRA_CA_CERTS -- on macOS too, see
-/// fetch_https_trusts_node_extra_ca_certs).
+/// A fetch whose dispatcher has undici's `allowH2` negotiates h2 by ALPN
+/// with http2.createSecureServer and is served over HTTP/2 through the
+/// compatibility API (the server trusts nothing but its own key; the client
+/// trusts the test CA through NODE_EXTRA_CA_CERTS -- on macOS too, see
+/// fetch_https_trusts_node_extra_ca_certs). A plain fetch offers
+/// `http/1.1` alone, which this server (no allowHTTP1) refuses in the
+/// handshake, as node's does (#176; measured on v22.22.2 + undici 6.24.1).
 #[test]
-fn http2_secure_server_serves_fetch_over_h2() {
+fn http2_secure_server_serves_an_allow_h2_fetch_over_h2() {
     let bundle = write_temp("h2-secure-extra-ca/ca.pem", TLS_TEST_CA_CERT);
     let src = r#"import http2 from 'node:http2';
+import { Agent } from 'undici';
 const seen = [];
 const server = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__` }, (req, res) => {
   seen.push(req.httpVersion + ' ' + req.method + ' ' + req.url + ' alpn=' + req.socket.alpnProtocol);
@@ -28974,9 +29311,16 @@ const server = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__` }, (r
 server.on('session', (session) => seen.push('session alpn=' + session.alpnProtocol + ' encrypted=' + session.encrypted));
 await new Promise((r) => server.listen(0, '127.0.0.1', r));
 const port = server.address().port;
-const a = await fetch(`https://localhost:${port}/one`);
+try {
+  await fetch(`https://localhost:${port}/plain`);
+  console.log('plain fetch served');
+} catch (e) {
+  console.log('plain fetch', e.message, e.cause && e.cause.code);
+}
+const dispatcher = new Agent({ allowH2: true });
+const a = await fetch(`https://localhost:${port}/one`, { dispatcher });
 console.log(a.status, a.headers.get('content-type'), await a.text());
-const b = await fetch(`https://localhost:${port}/two`, { method: 'POST', body: 'posted' });
+const b = await fetch(`https://localhost:${port}/two`, { method: 'POST', body: 'posted', dispatcher });
 console.log(b.status, await b.text());
 server.close();
 for (const line of seen) console.log(line);
@@ -28992,11 +29336,203 @@ process.exit(0);
     let (stdout, stderr) = run_script_ok(&script, out);
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
-        "200 text/plain h2 says hi\n\
+        "plain fetch fetch failed ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL\n\
+         200 text/plain h2 says hi\n\
          200 h2 says posted\n\
          session alpn=h2 encrypted=true\n\
          2.0 GET /one alpn=h2\n\
          2.0 POST /two alpn=h2",
+        "stderr: {stderr}"
+    );
+}
+
+/// What each https client offers by ALPN, against an h2-capable origin
+/// (http2.createSecureServer with allowHTTP1): undici -- fetch,
+/// undici.request, undici.fetch -- offers `http/1.1` alone and is served
+/// over HTTP/1.1, unless its dispatcher sets `allowH2` (the option, or
+/// `connect.allowH2`, which wins over it even when false; the global
+/// dispatcher too), which offers `http/1.1, h2` and is served over HTTP/2.
+/// The first HTTP/2 connection prints undici's experimental warning, once.
+/// Every line was measured on node v22.22.2 + undici 6.24.1 (#176). The
+/// node-only clients -- fetch and https.request without undici -- are
+/// conformance case 350.
+#[test]
+fn https_clients_offer_what_nodes_offer_by_alpn() {
+    let bundle = write_temp("alpn-offers/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import http2 from 'node:http2';
+import { Agent, request, fetch as undiciFetch, setGlobalDispatcher } from 'undici';
+const server = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__`, allowHTTP1: true }, (req, res) => {
+  res.end(req.httpVersion + ' ' + req.socket.alpnProtocol);
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const url = `https://localhost:${server.address().port}/`;
+const viaFetch = async (label, init) => console.log(label + ': ' + await (await fetch(url, init)).text());
+const viaRequest = async (label, opts) => console.log(label + ': ' + await (await request(url, opts)).body.text());
+await viaFetch('fetch');
+await viaRequest('undici.request');
+console.log('undici.fetch: ' + await (await undiciFetch(url)).text());
+await viaFetch('fetch, Agent allowH2', { dispatcher: new Agent({ allowH2: true }) });
+await viaFetch('fetch, Agent connect.allowH2', { dispatcher: new Agent({ connect: { allowH2: true } }) });
+await viaFetch('fetch, Agent allowH2 with connect.allowH2 false', { dispatcher: new Agent({ allowH2: true, connect: { allowH2: false } }) });
+await viaRequest('undici.request, Agent allowH2', { dispatcher: new Agent({ allowH2: true }) });
+setGlobalDispatcher(new Agent({ allowH2: true }));
+await viaFetch('fetch, global Agent allowH2');
+console.log('undici.fetch, global Agent allowH2: ' + await (await undiciFetch(url)).text());
+await viaRequest('undici.request, global Agent allowH2');
+process.exit(0);
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("alpn_offers/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "fetch: 1.1 http/1.1\n\
+         undici.request: 1.1 http/1.1\n\
+         undici.fetch: 1.1 http/1.1\n\
+         fetch, Agent allowH2: 2.0 h2\n\
+         fetch, Agent connect.allowH2: 2.0 h2\n\
+         fetch, Agent allowH2 with connect.allowH2 false: 1.1 http/1.1\n\
+         undici.request, Agent allowH2: 2.0 h2\n\
+         fetch, global Agent allowH2: 2.0 h2\n\
+         undici.fetch, global Agent allowH2: 2.0 h2\n\
+         undici.request, global Agent allowH2: 2.0 h2",
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        stderr
+            .matches("[UNDICI-H2] Warning: H2 support is experimental, expect them to change at any time.")
+            .count(),
+        1,
+        "undici's warning, once: {stderr}"
+    );
+}
+
+/// A dispatcher's own `allowH2` must be a boolean (or none), as undici's
+/// Client requires: a Client refuses any other value when it is built, and
+/// an Agent or a Pool, which build their Clients when a request needs one,
+/// fail each request with that InvalidArgumentError -- fetch with it as the
+/// cause. An Agent passes its options through JSON first, so NaN reaches
+/// the Client as null and a function not at all: neither is refused, and
+/// neither asks for h2. `connect.allowH2` is not checked; the connector
+/// tests it for truthiness. oam used to test the option for truthiness
+/// too, so `allowH2: 'yes'` turned h2 on. Every line was measured on node
+/// v22.22.2 + undici 6.24.1.
+#[test]
+fn a_dispatcher_allowh2_that_is_not_a_boolean_is_refused_as_undicis_client_refuses_it() {
+    let bundle = write_temp("allowh2-check/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import http2 from 'node:http2';
+import { Agent, Pool, Client, request } from 'undici';
+const server = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__`, allowHTTP1: true }, (req, res) => {
+  res.end(req.httpVersion + ' ' + req.socket.alpnProtocol);
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const origin = `https://localhost:${server.address().port}`;
+const show = async (label, p) => {
+  try {
+    const r = await p;
+    console.log(label + ': ' + (r.text ? await r.text() : await r.body.text()));
+  } catch (e) {
+    const c = e.cause || e;
+    console.log(label + ': ' + e.name + ' ' + e.message + ' / ' + c.name + ' ' + c.code + ' ' + c.message);
+  }
+};
+const build = (label, f) => {
+  try { f(); console.log(label + ': built'); } catch (e) { console.log(label + ': ' + e.name + ' ' + e.code + ' ' + e.message); }
+};
+await show('fetch, Agent allowH2 yes', fetch(origin, { dispatcher: new Agent({ allowH2: 'yes' }) }));
+await show('undici.request, Agent allowH2 1', request(origin, { dispatcher: new Agent({ allowH2: 1 }) }));
+await show('undici.request, Pool allowH2 {}', request(origin, { dispatcher: new Pool(origin, { allowH2: {} }) }));
+build('new Client allowH2 0', () => new Client(origin, { allowH2: 0 }));
+await show('undici.request, Agent allowH2 NaN', request(origin, { dispatcher: new Agent({ allowH2: NaN }) }));
+await show('undici.request, Agent allowH2 function', request(origin, { dispatcher: new Agent({ allowH2: () => true }) }));
+await show('undici.request, Pool allowH2 NaN', request(origin, { dispatcher: new Pool(origin, { allowH2: NaN }) }));
+await show('undici.request, Agent allowH2 null', request(origin, { dispatcher: new Agent({ allowH2: null }) }));
+await show('undici.request, Agent allowH2 yes, connect.allowH2 true', request(origin, { dispatcher: new Agent({ allowH2: 'yes', connect: { allowH2: true } }) }));
+await show('undici.request, Agent connect.allowH2 yes', request(origin, { dispatcher: new Agent({ connect: { allowH2: 'yes' } }) }));
+process.exit(0);
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("allowh2_check/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    let refused = "InvalidArgumentError UND_ERR_INVALID_ARG allowH2 must be a valid boolean value";
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        format!(
+            "fetch, Agent allowH2 yes: TypeError fetch failed / {refused}\n\
+             undici.request, Agent allowH2 1: InvalidArgumentError allowH2 must be a valid boolean value / {refused}\n\
+             undici.request, Pool allowH2 {{}}: InvalidArgumentError allowH2 must be a valid boolean value / {refused}\n\
+             new Client allowH2 0: {refused}\n\
+             undici.request, Agent allowH2 NaN: 1.1 http/1.1\n\
+             undici.request, Agent allowH2 function: 1.1 http/1.1\n\
+             undici.request, Pool allowH2 NaN: InvalidArgumentError allowH2 must be a valid boolean value / {refused}\n\
+             undici.request, Agent allowH2 null: 1.1 http/1.1\n\
+             undici.request, Agent allowH2 yes, connect.allowH2 true: InvalidArgumentError allowH2 must be a valid boolean value / {refused}\n\
+             undici.request, Agent connect.allowH2 yes: 2.0 h2"
+        ),
+        "stderr: {stderr}"
+    );
+}
+
+/// A response header value reads without the whitespace around it whichever
+/// protocol carried it (#182). Over HTTP/1 the parser under hyper trims it;
+/// an HTTP/2 value reached fetch as sent, so the same server's
+/// `x-ows:   a<TAB>b   ` read `"   a\tb   "` over h2 (which a fetch speaks
+/// through a dispatcher with undici's `allowH2`, #176) and `"a\tb"` over
+/// HTTP/1. Whitespace inside a value is kept on both.
+#[test]
+fn fetch_trims_header_value_whitespace_over_h2_as_over_http1() {
+    let bundle = write_temp("h2-ows-extra-ca/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import http2 from 'node:http2';
+import net from 'node:net';
+import { Agent } from 'undici';
+const names = ['x-ows', 'x-lead', 'x-trail-tab', 'x-inner'];
+const read = (r) => JSON.stringify(names.map((n) => r.headers.get(n)));
+const seen = [];
+const h2 = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__` }, (req, res) => {
+  seen.push(req.httpVersion);
+  res.setHeader('x-ows', '   a\tb   ');
+  res.setHeader('x-lead', '\t\tv');
+  res.setHeader('x-trail-tab', 'v\t\t');
+  res.setHeader('x-inner', ' a   b  ');
+  res.end('ok');
+});
+await new Promise((r) => h2.listen(0, '127.0.0.1', r));
+const a = await fetch(`https://localhost:${h2.address().port}/`, { dispatcher: new Agent({ allowH2: true }) });
+await a.text();
+console.log(seen.join(','), read(a));
+const h1 = net.createServer((s) => s.once('data', () => s.end(
+  'HTTP/1.1 200 OK\r\nx-ows:   a\tb   \r\nx-lead:\t\tv\r\nx-trail-tab: v\t\t\r\n' +
+  'x-inner:  a   b  \r\ncontent-length: 2\r\nconnection: close\r\n\r\nok')));
+await new Promise((r) => h1.listen(0, '127.0.0.1', r));
+const b = await fetch(`http://127.0.0.1:${h1.address().port}/`);
+await b.text();
+console.log('1.1', read(b));
+h2.close();
+h1.close();
+process.exit(0);
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("h2_ows_fetch/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "2.0 [\"a\\tb\",\"v\",\"v\",\"a   b\"]\n\
+         1.1 [\"a\\tb\",\"v\",\"v\",\"a   b\"]",
         "stderr: {stderr}"
     );
 }

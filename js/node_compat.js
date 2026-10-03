@@ -14536,11 +14536,42 @@
         reportOnUncaughtException: false,
       },
       loadEnvFile: function loadEnvFile(path) {
-        var fs = registry.get("fs");
-        var envPath = path || ".env";
-        // A missing file throws the plain fs ENOENT system error, not a
-        // wrapped ERR_ENV_FILE_NOT_FOUND (probe-verified against node v22).
-        var text = fs.readFileSync(envPath, "utf8");
+        // node v22.22.2 (lib/internal/process/per_thread.js, src/
+        // node_process_methods.cc LoadEnvFile) is not fs.readFileSync, and
+        // its errors follow the one rule every fs error here does: a failure
+        // names the path node's JS layer handed the binding. A path given
+        // (anything but undefined / null) is getValidatedPath'd -- 42 is
+        // ERR_INVALID_ARG_TYPE, not descriptor 42 -- and namespaced, so on
+        // Windows it fails naming the resolved path (fsErrorPath). With none
+        // the binding opens its own ".env" untouched, and the error says
+        // '.env' as node's does; resolving it too failed node's
+        // test-process-load-env-file. `""` is a path given, not "none".
+        var given = path == null ? null : toPath(path);
+        var text;
+        try {
+          text = registry.get("fs").readFileSync(given === null ? ".env" : given, "utf8");
+        } catch (e) {
+          // The binding reports ANY failure to open as ENOENT `open`
+          // (ThrowUVException(UV_ENOENT, "open")), and a failed read as
+          // ERR_INVALID_ARG_TYPE naming the path it opened, namespace
+          // prefix and all -- measured: loadEnvFile(".") on Windows is
+          // "Contents of '\\?\C:\cwd' should be a valid string." A
+          // directory is that read failure on every platform: node opens it
+          // (libuv's FILE_FLAG_BACKUP_SEMANTICS on Windows, open(2) on Linux
+          // and macOS) and fails the read, and oam's readFileSync reports it
+          // as EISDIR `read` on all three (oam_core::fs_error_at), so it
+          // never reaches the `open` branch.
+          if (e && e.syscall === "open") {
+            throw makeSystemError("ENOENT", "open", given === null ? ".env" : fsErrorPath(given));
+          }
+          if (e && typeof e.code === "string" && typeof e.syscall === "string") {
+            var opened = given === null ? ".env" : registry.get("path").toNamespacedPath(given);
+            var bad = new TypeError("Contents of '" + opened + "' should be a valid string.");
+            bad.code = "ERR_INVALID_ARG_TYPE";
+            throw bad;
+          }
+          throw e;
+        }
         // Same dotenv parser as util.parseEnv (Node routes both through
         // node_dotenv.cc). Real env vars win: node v22 loadEnvFile does NOT
         // overwrite keys already present (probe-verified). Presence check
@@ -23921,6 +23952,10 @@
           // sent it: no `accept` / `user-agent` / `accept-encoding`, no
           // decoding, `content-encoding` and `content-length` intact.
           __oamRawExchange: true,
+          // ... and, for https, offers no ALPN, as node's https.Agent offers
+          // none: an h2-capable server answers it over HTTP/1.1, which is
+          // what res.httpVersion reports (#176).
+          __oamOfferNoAlpn: true,
           __oamSentSignal: signal,
           // What takes the request off the wire if it is aborted or
           // destroyed before its response (see _cancelBodyStream).
@@ -33866,7 +33901,12 @@
     socket.on("close", stop);
     var pumpOut = function () {
       natives.tlsPipeOut(id).then(function (bytes) {
-        if (bytes === undefined || stopped || socket.destroyed) {
+        // A socket already ended for writing -- the peer's FIN ends it, its
+        // allowHalfOpen being off -- takes nothing more: what the session
+        // still has to say (an h2 GOAWAY in answer to the peer's) has no
+        // one to go to, and writing it would fail the socket, and with it
+        // the session, with ERR_STREAM_WRITE_AFTER_END.
+        if (bytes === undefined || stopped || socket.destroyed || socket.writableEnded) {
           resolveOut();
           return;
         }
@@ -34230,6 +34270,7 @@
       const kSocket = Symbol("kSocket");
       const kServer = Symbol("kServer");
       const kOptions = Symbol("kOptions");
+      const kHttp1Conns = Symbol("kHttp1Conns");
       const kSession = Symbol("kSession");
       const kProxySocket = Symbol("kProxySocket");
       const kRequest = Symbol("kRequest");
@@ -35366,6 +35407,12 @@
           0, ms(server.timeout, 0), ms(server.connectionsCheckingInterval, 30000),
         ));
         takeOver(socket, served.connId);
+        // The server's HTTP/1.1 connections and how many of their requests
+        // are still being answered, for closeIdleConnections().
+        if (!server[kHttp1Conns]) server[kHttp1Conns] = new Map();
+        var conns = server[kHttp1Conns];
+        var conn = { open: 0 };
+        conns.set(socket, conn);
         (async () => {
           for (;;) {
             var meta = await natives.httpAccept(served.sessionId);
@@ -35378,8 +35425,18 @@
             var res = new http.ServerResponse(meta.requestId);
             req.res = res;
             res.req = req;
+            conn.open++;
+            var done = false;
+            var answered = function() {
+              if (done) return;
+              done = true;
+              conn.open--;
+            };
+            res.once("finish", answered);
+            res.once("close", answered);
             server.emit("request", req, res);
           }
+          conns.delete(socket);
           natives.httpClose(served.sessionId);
           if (!socket.destroyed) TLSSocketBase.prototype.destroy.call(socket);
         })();
@@ -35499,6 +35556,23 @@
             throw codes.ERR_INVALID_ARG_TYPE("settings", "Object", settings);
           }
           this[kOptions].settings = Object.assign({}, this[kOptions].settings, settings);
+        }
+        // node's close(): under allowHTTP1, httpServerPreClose first -- the
+        // HTTP/1.1 connections with no request open are closed, as an http
+        // server's close() closes them -- then tls.Server's close. A keep-alive
+        // client (fetch's pool) no longer holds the server, and the process,
+        // open until the client lets go.
+        close() {
+          if (this[kOptions].allowHTTP1 === true) this.closeIdleConnections();
+          return Reflect.apply(TLSServerBase.prototype.close, this, arguments);
+        }
+        // node's: an http server's closeIdleConnections() under allowHTTP1,
+        // over the HTTP/1.1 connections; nothing otherwise.
+        closeIdleConnections() {
+          if (this[kOptions].allowHTTP1 !== true || !this[kHttp1Conns]) return;
+          for (var [socket, conn] of [...this[kHttp1Conns]]) {
+            if (conn.open === 0 && !socket.destroyed) socket.destroy();
+          }
         }
       }
 
@@ -35690,6 +35764,12 @@
         this._outBatch = null;
         this._endedWrite = -1;
         this._bodyHandle = null;
+        // The session's request op answered with a response head, and the
+        // answer, whatever it was, has been dealt with (_requestOnConnect).
+        this._responded = false;
+        this._answered = null;
+        this._requestDone = null;
+        this._requestSettled = false;
         this._reading = false;
         this._readEnded = false;
         // Body bytes past the window, for the next read (pushInWindow).
@@ -35731,28 +35811,66 @@
           headers: p.list,
         };
         if (this._bodyStream !== null) request.body_stream = this._bodyStream;
+        // `_answered` settles once the request's answer has come -- its
+        // response head reported, or why it has none -- and `_requestDone`
+        // once that has been dealt with (a refused stream closes after the
+        // GOAWAY's report): the session waits for them before reporting the
+        // last GOAWAY frames, and the end, of a connection that is over.
+        var answered;
+        var settle;
+        this._answered = new Promise(function (resolve) { answered = resolve; });
+        this._requestDone = new Promise(function (resolve) {
+          settle = function () {
+            self._requestSettled = true;
+            answered();
+            resolve();
+          };
+        });
         // A session that fails to open destroys its streams itself.
         session._opening.then(function (sid) {
-          if (self.destroyed) return;
+          if (self.destroyed) return settle();
           natives.http2SessionRequest(sid, JSON.stringify(request)).then(function (raw) {
+            // Its response has come: a GOAWAY that follows lets it finish.
+            self._responded = true;
             // Out of the promise job, so a throwing 'response' listener is
-            // an uncaught exception, as it is in node.
-            process.nextTick(function () { self._onResponse(raw); });
+            // an uncaught exception, as it is in node; and once the head is
+            // reported, a GOAWAY that followed it can be.
+            process.nextTick(function () {
+              try {
+                self._onResponse(raw);
+              } finally {
+                session._headSettled();
+                settle();
+              }
+            });
           }, function (err) {
-            if (self.destroyed) return;
+            answered();
+            var refused = !!err && err.syscall === "goaway";
+            if (!refused) session._headSettled();
+            if (self.destroyed) return settle();
             // The peer reset this stream: closed with its code (node's
-            // onStreamClose), an error unless NO_ERROR or CANCEL.
+            // onStreamClose), an error unless NO_ERROR or CANCEL. A stream
+            // the peer's GOAWAY refused closes with NGHTTP2_REFUSED_STREAM
+            // once the session has reported that GOAWAY, as node orders it.
             if (err && err.code === "ERR_HTTP2_STREAM_ERROR" && typeof err.errno === "number") {
-              self._closeStream(err.errno);
-              self.destroy();
+              var close = function () {
+                if (!self.destroyed) {
+                  self._closeStream(err.errno);
+                  self.destroy();
+                }
+                settle();
+              };
+              if (refused) session._goawaysDone.then(close);
+              else close();
               return;
             }
+            settle();
             // The connection failed under the stream: the session reports
             // that once and takes its streams with it.
             if (err && err.code === "ERR_HTTP2_SESSION_FAILED") return;
             self.destroy(err);
           });
-        }, function () {});
+        }, function () { settle(); });
       }
 
       _onResponse(raw) {
@@ -35955,9 +36073,17 @@
           try { natives.fetchBodyChannelCancel(this._bodyStream); } catch (_) { /* gone */ }
         }
         if (session) {
-          if (this._id !== undefined) session._streams.delete(this._id);
-          else session._pendingStreams.delete(this);
-          setImmediate(function () { session._maybeDestroy(); });
+          if (this._id !== undefined) {
+            session._streams.delete(this._id);
+            session._streamsClosed++;
+          } else {
+            session._pendingStreams.delete(this);
+          }
+          setImmediate(function () {
+            session._maybeDestroy();
+            // A GOAWAY held for this stream's close (_flushGoaways).
+            session._flushGoaways();
+          });
         }
         // RST code 8 is how a client aborts, and not an error (node).
         if (err == null && code !== NGHTTP2_NO_ERROR && code !== NGHTTP2_CANCEL) {
@@ -36006,7 +36132,11 @@
       // is awaited first (closing the pipe ends the connection at once).
       if (session._pipe !== null && session._ended !== null) {
         session._pipe.stop();
+        // ... and so is every GOAWAY in them, and every answer, reported
+        // before the end.
         session._ended.then(function (ended) {
+          return session._whenSettled().then(function () { return ended; });
+        }).then(function (ended) {
           if (session.destroyed) return;
           if (ended && ended.error && typeof ended.error.code === "number") {
             session._onConnectionEnd(ended);
@@ -36021,10 +36151,51 @@
 
     function closeOnSocketClose(session) {
       var err = session.connecting ? h2Error("ERR_SOCKET_CLOSED", "Socket is closed") : null;
-      session._streams.forEach(function (stream) { stream.close(NGHTTP2_CANCEL); });
+      // After the peer's GOAWAY, a stream whose response has come is one
+      // the GOAWAY let finish, and it is whole when the connection ends
+      // cleanly (h2 ends it only once every stream has): it reads to its
+      // end as node's does, 'end' and then 'close' with rstCode 0, and the
+      // session goes once those have (_maybeDestroy). Every other stream is
+      // closed with NGHTTP2_CANCEL, as node's are when their socket closes.
+      // (Known by the response, not by the GOAWAY's last stream id: a
+      // stream's id here is the one JS gave it, and hyper numbers the
+      // streams in the order it sends them.)
+      var goaway = session._state.goawayLastStreamID !== undefined;
+      var finishing = 0;
+      session._streams.forEach(function (stream) {
+        if (err === null && goaway && stream._responded) {
+          finishing++;
+          return;
+        }
+        stream.close(NGHTTP2_CANCEL);
+      });
       session._pendingStreams.forEach(function (stream) { stream.close(NGHTTP2_CANCEL); });
       session.close();
-      session._closeSession(NGHTTP2_NO_ERROR, err);
+      if (finishing === 0) session._closeSession(NGHTTP2_NO_ERROR, err);
+    }
+
+    // The peer's GOAWAY frames, in order, for as long as the connection
+    // lasts, each queued for the session to report (_flushGoaways).
+    function watchGoaways(session, sid, index) {
+      natives.http2SessionGoaway(sid, index).then(function (raw) {
+        var goaway = raw && raw.goaway;
+        if (!goaway) {
+          goawaysOver(session);
+          return;
+        }
+        session._goawayQueue.push(goaway);
+        session._flushGoaways();
+        watchGoaways(session, sid, index + 1);
+      }, function () { goawaysOver(session); });
+    }
+
+    // The connection can send no more GOAWAY frames: once every request's
+    // answer it carried has come, the ones still held are reported.
+    function goawaysOver(session) {
+      session._answeredAll().then(function () {
+        session._goawaysOver = true;
+        session._flushGoaways();
+      });
     }
 
     function emitClose(session, error) {
@@ -36086,7 +36257,7 @@
         socket[kBoundSession] = this;
         socket.on("error", socketOnError);
         socket.on("close", socketOnClose);
-        this._state = { destroyCode: NGHTTP2_NO_ERROR, goawayCode: null, closed: false, destroyed: false, ready: false, streamsCarryError: false };
+        this._state = { destroyCode: NGHTTP2_NO_ERROR, goawayCode: null, goawayLastStreamID: undefined, closed: false, destroyed: false, ready: false, streamsCarryError: false };
         this._streams = new Map();
         this._pendingStreams = new Set();
         this._pendingRequestCalls = null;
@@ -36098,6 +36269,17 @@
         this._sid = null;
         this._opening = null;
         this._ended = null;
+        // The peer's GOAWAY frames: those not reported yet, whether the
+        // connection can bring more, how many request answers have been
+        // reported (_flushGoaways), and the first one's report.
+        this._goawayQueue = [];
+        this._goawaysOver = false;
+        this._headsSettled = 0;
+        this._streamsClosed = 0;
+        // Closed gracefully before the h2 layer was up (_closeSession).
+        this._closingOnOpen = false;
+        this._goawaysDone = null;
+        this._goawaysDoneResolve = function () {};
         this._nextStreamId = 1;
         this._authority = undefined;
         this._protocol = undefined;
@@ -36138,19 +36320,104 @@
         var self = this;
         this._opening = natives.http2SessionOpen(pipe.id).then(function (opened) {
           var sid = opened.session;
-          if (self._state.destroyed) {
+          if (self._state.destroyed && !self._closingOnOpen) {
             natives.http2SessionDestroy(sid);
             throw h2Error("ERR_HTTP2_INVALID_SESSION", "The session has been destroyed");
           }
           self._sid = sid;
+          self._goawaysDone = new Promise(function (resolve) { self._goawaysDoneResolve = resolve; });
+          watchGoaways(self, sid, 0);
           self._ended = natives.http2SessionWait(sid);
-          self._ended.then(function (ended) { self._onConnectionEnd(ended); });
+          // A GOAWAY, and every answer, is reported before the end.
+          self._ended.then(function (ended) {
+            return self._whenSettled().then(function () { self._onConnectionEnd(ended); });
+          });
           return sid;
         });
         this._opening.then(undefined, function (err) {
           if (!self._state.destroyed) self.destroy(err);
         });
         process.nextTick(emitNT, this, "connect", this, socket);
+      }
+
+      // Resolves once everything the ended connection carried has been
+      // reported: its GOAWAY frames, and the answer to every request made
+      // on it -- one made while the others were awaited included.
+      _whenSettled() {
+        var self = this;
+        var unsettled = function () {
+          var waits = [];
+          self._streams.forEach(function (stream) {
+            if (stream._requestDone !== null && !stream._requestSettled) waits.push(stream._requestDone);
+          });
+          return waits;
+        };
+        return Promise.all([this._goawaysDone].concat(unsettled())).then(function () {
+          if (unsettled().length > 0) return self._whenSettled();
+        });
+      }
+
+      // A request's answer has come (a response head, or a failure other
+      // than a GOAWAY's refusal): a GOAWAY that followed the heads can be
+      // reported.
+      _headSettled() {
+        this._headsSettled++;
+        this._flushGoaways();
+      }
+
+      // Report the queued GOAWAY frames whose preceding response heads have
+      // all been reported, as node reports a head before the GOAWAY that
+      // follows it in the bytes; once the connection is over and every
+      // answer it carried has come (goawaysOver), every one. A closed
+      // session also holds one until the streams that ended before it in
+      // the bytes have closed, the connection over or not: node's goes, and
+      // reads no more, when its last stream closes, so a GOAWAY after that
+      // stream's end -- the one a server sends as it ends the connection --
+      // is not reported.
+      // `_goawaysDone` resolves at the first, or at the end without one.
+      _flushGoaways() {
+        var queue = this._goawayQueue;
+        while (queue.length > 0 &&
+            (this._goawaysOver || queue[0].headsBefore <= this._headsSettled) &&
+            (!this._state.closed || queue[0].endsBefore <= this._streamsClosed)) {
+          this._onGoaway(queue.shift());
+          this._goawaysDoneResolve();
+        }
+        // One still held waits on streams that are themselves waiting for
+        // the connection's end to be reported: it does not hold that up.
+        if (this._goawaysOver) this._goawaysDoneResolve();
+      }
+
+      // Resolves once every request made on the session has its answer
+      // (`_answered`), one made while the others were awaited included.
+      _answeredAll() {
+        var self = this;
+        var waits = [];
+        this._streams.forEach(function (stream) {
+          if (stream._answered !== null) waits.push(stream._answered);
+        });
+        return Promise.all(waits).then(function () {
+          var more = false;
+          self._streams.forEach(function (stream) {
+            if (stream._answered !== null && waits.indexOf(stream._answered) === -1) more = true;
+          });
+          if (more) return self._answeredAll();
+        });
+      }
+
+      // node's onGoawayData: the peer's GOAWAY frame. A NO_ERROR one closes
+      // the session -- no new streams; the ones at or below its last stream
+      // id finish, the rest were refused (NGHTTP2_REFUSED_STREAM) -- and any
+      // other code destroys it.
+      _onGoaway(goaway) {
+        if (this._state.destroyed) return;
+        var code = goaway.code;
+        this._state.goawayCode = code;
+        this._state.goawayLastStreamID = goaway.lastStreamId;
+        var data = goaway.data == null ? undefined : globalThis.Buffer.from(goaway.data, "base64");
+        this.emit("goaway", code, goaway.lastStreamId, data);
+        if (code === NGHTTP2_NO_ERROR) this.close();
+        else this.destroy(sessionCodeError(code), NGHTTP2_NO_ERROR);
       }
 
       // The h2 connection ended under the session: the peer's GOAWAY, a
@@ -36167,9 +36434,8 @@
         }
         if (typeof e.code === "number") {
           if (e.goAway && e.remote) {
-            // node's onGoawayData.
-            this._state.goawayCode = e.code;
-            this.emit("goaway", e.code, 0, globalThis.Buffer.alloc(0));
+            // The peer's GOAWAY, reported as it arrived (_onGoaway); the
+            // end it brought is the session's.
             if (e.code === NGHTTP2_NO_ERROR) this.destroy();
             else this.destroy(sessionCodeError(e.code), NGHTTP2_NO_ERROR);
             return;
@@ -36257,7 +36523,33 @@
         if (this._state.closed || this._state.destroyed) return;
         this._state.closed = true;
         if (typeof callback === "function") this.once("close", callback);
+        this._sendGoaway();
         this._maybeDestroy();
+      }
+
+      // node's close() sends its GOAWAY at once, the streams still open
+      // (after 'connect' when it has not connected): nghttp2 sends it
+      // ahead of the requests made in the same tick, which the peer then
+      // refuses. A peer that sent its own GOAWAY first answers with another
+      // and ends the connection once its streams are done; told only once
+      // those are done, node's server no longer reads, and neither side
+      // would close (#185). hyper sends one more when the streams are done,
+      // as node's destroy() does. The session may be destroyed by then --
+      // closed with nothing open -- and its GOAWAY still goes, as node's.
+      _sendGoaway() {
+        var self = this;
+        var send = function () {
+          if (self._sid !== null) natives.http2SessionSendGoaway(self._sid);
+        };
+        if (this._sid !== null) {
+          send();
+        } else if (this.connecting) {
+          this.once("connect", function () {
+            if (self._opening !== null) self._opening.then(send, function () {});
+          });
+        } else if (this._opening !== null) {
+          this._opening.then(send, function () {});
+        }
       }
 
       // node's kMaybeDestroy: a closed session with nothing open goes.
@@ -36302,11 +36594,28 @@
           self._finishSessionClose(socket, error);
         };
         // A graceful close lets hyper write its GOAWAY before the socket is
-        // ended; the pipe's out side ends once it has.
-        if (state.closed && error == null && this._sid !== null && pipe !== null && socket && !socket.destroyed) {
-          natives.http2SessionClose(this._sid);
-          pipe.outDone.then(finish);
-          return;
+        // ended; the pipe's out side ends once it has. A session closed
+        // before its h2 layer was up -- at 'connect', or before it, with
+        // nothing open -- waits for it, so the preface, SETTINGS and the
+        // GOAWAYs still go out, as node's do.
+        var graceful = function () {
+          if (self._sid !== null && !socket.destroyed) {
+            natives.http2SessionClose(self._sid);
+            pipe.outDone.then(finish);
+            return;
+          }
+          finish();
+        };
+        if (state.closed && error == null && pipe !== null && socket && !socket.destroyed) {
+          if (this._sid === null && this._opening !== null) {
+            this._closingOnOpen = true;
+            this._opening.then(graceful, finish);
+            return;
+          }
+          if (this._sid !== null) {
+            graceful();
+            return;
+          }
         }
         finish();
       }

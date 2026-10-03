@@ -11,9 +11,9 @@
 //! - the TLS server name checked before anything dials, so a host rustls
 //!   cannot name fails without a connection attempt;
 //! - an https destination behind an http(s) proxy goes through a CONNECT
-//!   tunnel carrying the proxy credentials and oam's user-agent, and h2 is
-//!   still negotiated with the origin inside it; an http destination is sent
-//!   to the proxy in absolute form;
+//!   tunnel carrying the proxy credentials and oam's user-agent, and the
+//!   request's ALPN offer ([`Alpn`]) still goes to the origin inside it; an
+//!   http destination is sent to the proxy in absolute form;
 //! - a socks proxy is refused (reqwest had no socks support compiled in).
 //!
 //! What changed: every dial, proxy dials included, is node's algorithm, so a
@@ -46,7 +46,7 @@ use tower_service::Service;
 
 use super::BoxError;
 use super::prepare::host_for_connect;
-use super::tls_config::{self, TlsConfigs, TlsRange};
+use super::tls_config::{self, Alpn, TlsConfigs, TlsRange};
 use crate::net_connect::{self, AttemptLog, ConnectOptions, Pin};
 use std::sync::atomic::AtomicU8;
 
@@ -565,10 +565,10 @@ impl Shared {
         self.tls_range.store(range.code(), Ordering::Relaxed);
     }
 
-    /// The config for an origin handshake, or with `for_proxy` for the
-    /// handshake with an https proxy, in the range the request being sent
-    /// asked for (`set_tls_range`).
-    async fn tls(&self, for_proxy: bool) -> Result<Arc<ClientConfig>, BoxError> {
+    /// The config offering `alpn` -- the request's offer for an origin
+    /// handshake, [`Alpn::None`] for the handshake with an https proxy -- in
+    /// the range the request being sent asked for (`set_tls_range`).
+    async fn tls(&self, alpn: Alpn) -> Result<Arc<ClientConfig>, BoxError> {
         let configs = match &self.tls {
             TlsSource::Platform => {
                 let range = self.tls_range();
@@ -586,11 +586,7 @@ impl Shared {
                 return Err(Box::new(TlsSetupError(message.clone())));
             }
         };
-        Ok(if for_proxy {
-            configs.proxy
-        } else {
-            configs.dst
-        })
+        Ok(configs.offering(alpn).clone())
     }
 }
 
@@ -660,20 +656,6 @@ pub(crate) struct OamConnector {
 }
 
 type ConnFuture = StdPin<Box<dyn Future<Output = Result<OamConn, BoxError>> + Send>>;
-
-impl Service<Uri> for OamConnector {
-    type Response = OamConn;
-    type Error = BoxError;
-    type Future = ConnFuture;
-
-    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, dst: Uri) -> Self::Future {
-        Box::pin(self.clone().connect(dst))
-    }
-}
 
 /// undici's connect timeout expired (lib/core/connect.js `onConnectTimeout`,
 /// 6.24.1): the request fails with its `ConnectTimeoutError`, code
@@ -753,12 +735,13 @@ impl std::fmt::Display for UnsuppliedConnection {
 impl std::error::Error for UnsuppliedConnection {}
 
 impl OamConnector {
-    /// Dial one connection for `dst`: node's connect algorithm, TLS, the
-    /// environment proxy / CONNECT tunnel, or a hooked / supplied connection.
-    /// The owned pool calls this directly (`self.clone().connect(uri)`) instead
-    /// of through the `Service` impl hyper-util used.
-    pub(crate) async fn connect(self, dst: Uri) -> Result<OamConn, BoxError> {
-        self.connect_logged(dst, &AttemptLog::default()).await
+    /// Dial one connection for `dst`: node's connect algorithm, TLS offering
+    /// `alpn` to an https origin, the environment proxy / CONNECT tunnel, or
+    /// a hooked / supplied connection (whose socket JS made, ALPN and all).
+    /// The owned pool calls this directly instead of through the `Service`
+    /// impl hyper-util used.
+    pub(crate) async fn connect(self, dst: Uri, alpn: Alpn) -> Result<OamConn, BoxError> {
+        self.connect_logged(dst, alpn, &AttemptLog::default()).await
     }
 
     /// [`OamConnector::connect`] under undici's connect timeout: the whole
@@ -770,10 +753,11 @@ impl OamConnector {
     pub(crate) async fn connect_within(
         self,
         dst: Uri,
+        alpn: Alpn,
         timeout: Option<Duration>,
     ) -> Result<OamConn, BoxError> {
         let Some(timeout) = timeout else {
-            return self.connect(dst).await;
+            return self.connect(dst, alpn).await;
         };
         // The host undici's message names: the one it handed net.connect --
         // the origin's, or the proxy's when the request goes through one.
@@ -791,7 +775,7 @@ impl OamConnector {
                 80
             });
         let log = AttemptLog::default();
-        match tokio::time::timeout(timeout, self.connect_logged(dst, &log)).await {
+        match tokio::time::timeout(timeout, self.connect_logged(dst, alpn, &log)).await {
             Ok(connected) => connected,
             Err(_elapsed) => Err(Box::new(ConnectTimedOut::new(
                 &host,
@@ -802,7 +786,12 @@ impl OamConnector {
         }
     }
 
-    async fn connect_logged(self, dst: Uri, log: &AttemptLog) -> Result<OamConn, BoxError> {
+    async fn connect_logged(
+        self,
+        dst: Uri,
+        alpn: Alpn,
+        log: &AttemptLog,
+    ) -> Result<OamConn, BoxError> {
         let https = dst.scheme_str() == Some("https");
         let host = host_for_connect(&dst).ok_or("request url has no host")?;
         let port = dst.port_u16().unwrap_or(if https { 443 } else { 80 });
@@ -811,7 +800,7 @@ impl OamConnector {
             Via::Pooled => {
                 if let Some(intercept) = self.shared.proxy.as_ref().and_then(|m| m.intercept(&dst))
                 {
-                    return self.through_proxy(dst, &host, intercept).await;
+                    return self.through_proxy(dst, &host, intercept, alpn).await;
                 }
                 ConnectOptions {
                     attempt_timeout: self.shared.attempt_timeout(),
@@ -861,7 +850,7 @@ impl OamConnector {
         let Some(name) = name else {
             return Ok(OamConn::new(Box::new(tcp), false, false, info));
         };
-        let config = self.shared.tls(false).await?;
+        let config = self.shared.tls(alpn).await?;
         let (tls, h2) = tls_handshake(config, name, tcp).await?;
         let info = info.with_tls(tls.get_ref().1);
         Ok(OamConn::new(Box::new(tls), h2, false, info))
@@ -872,6 +861,7 @@ impl OamConnector {
         dst: Uri,
         host: &str,
         intercept: Intercept,
+        alpn: Alpn,
     ) -> Result<OamConn, BoxError> {
         if !matches!(intercept.uri().scheme_str(), Some("http" | "https")) {
             return Err(format!(
@@ -900,7 +890,7 @@ impl OamConnector {
         let tunneled = tunnel.call(dst).await?;
         // The TCP endpoints are the proxy's; the TLS session is the origin's.
         let endpoints = tunneled.info.clone();
-        let config = self.shared.tls(false).await?;
+        let config = self.shared.tls(alpn).await?;
         let (tls, h2) = tls_handshake(config, name, TokioIo::new(tunneled)).await?;
         let info = endpoints.with_tls(tls.get_ref().1);
         Ok(OamConn::new(Box::new(tls), h2, false, info))
@@ -971,7 +961,7 @@ impl Service<Uri> for ProxyTransport {
             // No ALPN towards the proxy: what goes through it is an
             // http/1.1 CONNECT or an absolute-form request, which h2 cannot
             // carry. (reqwest offered h2 here for an http destination.)
-            let config = this.shared.tls(true).await?;
+            let config = this.shared.tls(Alpn::None).await?;
             let (tls, _) = tls_handshake(config, name, tcp).await?;
             Ok(OamConn::new(Box::new(tls), false, false, info))
         })
@@ -1459,7 +1449,7 @@ mod tests {
     /// A hooked connector never resolves a host its hook did not answer for.
     #[tokio::test]
     async fn hooked_connector_fails_closed_on_an_unresolved_host() {
-        let mut connector = OamConnector {
+        let connector = OamConnector {
             shared: shared(None),
             via: Via::Hooked {
                 addrs: Arc::new(Mutex::new(HashMap::new())),
@@ -1467,7 +1457,7 @@ mod tests {
             },
         };
         let uri: Uri = "http://localhost:1/".parse().unwrap();
-        let err = match connector.call(uri).await {
+        let err = match connector.connect(uri, Alpn::Http1).await {
             Ok(_) => panic!("connected without a lookup result"),
             Err(e) => e,
         };

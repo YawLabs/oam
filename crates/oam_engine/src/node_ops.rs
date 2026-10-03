@@ -366,6 +366,8 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("http2SessionOpen", op_http2_session_open),
         ("http2SessionRequest", op_http2_session_request),
         ("http2SessionWait", op_http2_session_wait),
+        ("http2SessionGoaway", op_http2_session_goaway),
+        ("http2SessionSendGoaway", op_http2_session_send_goaway),
         ("http2SessionClose", op_http2_session_close),
         ("http2SessionDestroy", op_http2_session_destroy),
         ("netCheck", op_net_check),
@@ -4304,6 +4306,40 @@ fn op_http2_session_wait(
         &mut rv,
         oam_core::http_client::h2_session::wait(sessions, id),
     );
+}
+
+/// `__oam.node.http2SessionGoaway(session, index)`: resolves with the peer's
+/// `index`-th GOAWAY frame once it arrives, or with none once the connection
+/// ends without it. Unref'd, as `http2SessionWait` is.
+fn op_http2_session_goaway(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0) as u64;
+    let index = args.get(1).number_value(scope).unwrap_or(0.0).max(0.0) as usize;
+    let sessions = core_runtime!(scope).h2_sessions();
+    crate::ops::spawn_op_unref(
+        scope,
+        &mut rv,
+        oam_core::http_client::h2_session::goaway(sessions, id, index),
+    );
+}
+
+/// `__oam.node.http2SessionSendGoaway(session)`: send a GOAWAY (NO_ERROR)
+/// now, after the frames already made, as node's `session.close()` does.
+fn op_http2_session_send_goaway(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let sent = id >= 0.0
+        && oam_core::http_client::h2_session::send_goaway(
+            &core_runtime!(scope).h2_sessions(),
+            id as u64,
+        );
+    rv.set_bool(sent);
 }
 
 /// `__oam.node.http2SessionClose(session)`: open no more streams; the

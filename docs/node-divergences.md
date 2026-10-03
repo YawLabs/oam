@@ -239,7 +239,7 @@ Differences from Node's model:
   read as the script path.
 - **`--allow-net` is checked on every host an HTTP request reaches**, not only the one
   the script named. `fetch` and `undici.request` run on oam's HTTP client, which follows
-  redirects itself (entry 38), and each hop's host is checked against the grant before it
+  redirects itself (entry 38), and each hop's host and port are checked against the grant before it
   is dialled, before a `connect.lookup` hook is asked to resolve it, and whether or not
   the request goes through an environment proxy (the destination is checked, not the
   proxy). A refused hop is never contacted, and the request fails with the same
@@ -248,16 +248,26 @@ Differences from Node's model:
   was refused. Up to 0.16.1 only the initial URL was checked, and a granted host's
   redirect reached any host. `http.request` and `https.request`, which followed redirects
   on the same client up to 0.16.2, follow none now, as in Node; on oam's own client they
-  are checked like `fetch`, and emit a refusal as `'error'`. What these requests compare
-  is the URL's host as the
-  URL parser normalises it, without the port: `LOCALHOST`, `%6c%6fcalhost` and `0x7f.1`
-  are checked as `localhost`, `localhost` and `127.0.0.1`, and an IPv6 literal as
-  `[::1]` (so a grant names it in brackets). A trailing dot is not dropped, so
-  `localhost.` is refused under `--allow-net=localhost`. Because the port is not part of
-  their resource, a port-scoped entry such as `--allow-net=127.0.0.1:8080` admits
-  `net.connect` and `tls.connect` to that port but none of these requests; grant the
-  bare host to allow them. An `http.request` / `https.request` that goes over an agent's
-  socket (entry 43) is a `net.connect` / `tls.connect` and is checked as one (`host:port`).
+  are checked like `fetch`, and emit a refusal as `'error'`. What these requests -- and
+  `new WebSocket()` -- compare is `host:port`, as `net.connect` does: the URL's host as
+  the URL parser normalises it, and the port the hop is dialled on, the URL's own or the
+  scheme's default (80 for `http:` / `ws:`, 443 for `https:` / `wss:`). `LOCALHOST`,
+  `%6c%6fcalhost` and `0x7f.1` are checked as `localhost`, `localhost` and `127.0.0.1`,
+  and an IPv6 literal as `[::1]` (so a grant names it in brackets, `[::1]` or
+  `[::1]:8080`). A trailing dot is not dropped, so `localhost.` is refused under
+  `--allow-net=localhost`. An entry without a port admits the host on every port; a
+  port-scoped entry admits its own port alone, so `--allow-net=example.com:443` admits
+  `https://example.com/` and refuses `http://example.com/` and a redirect to
+  `example.com:8443`. A refusal's `resource` names `host:port` (`"example.com:80"`).
+  Up to 0.17.1 these requests were checked on the host alone: a port-scoped entry
+  admitted `net.connect` and `tls.connect` to its port but no HTTP request or WebSocket
+  at all, and a refusal named the bare host. An `http.request` / `https.request` that
+  goes over an agent's socket (entry 43) is a `net.connect` / `tls.connect` and is
+  checked as one. One spelling still differs between the two families: a raw socket to
+  an IPv6 address is checked unbracketed (`net.connect(8080, '::1')` asks about
+  `::1:8080`, as the next bullet says), an HTTP request bracketed (`[::1]:8080`). So
+  `[::1]` and `[::1]:8080` admit `fetch('http://[::1]:8080/')` but not that
+  `net.connect`, which only the entry `::1:8080` admits, and that entry admits no fetch.
 - **A `lookup` hook's answers are checked too.** A `lookup` option or a replaced
   `dns.lookup` decides which addresses a granted name is dialled at, so for `net.connect`,
   `tls.connect` and a request over an agent's socket every address it answers is checked
@@ -267,7 +277,7 @@ Differences from Node's model:
   dialled, and `--allow-net=granted.test,127.0.0.1` allows it. oam's own resolver keeps a
   hostname grant working: its answer is handed to the connection as a one-shot ticket,
   never as addresses JS could substitute. A fetch's `connect.lookup` answers follow the
-  fetch rule (entry 38: bracketed, no port). The name itself is checked before it is
+  fetch rule (entry 38: bracketed, on the hop's port). The name itself is checked before it is
   looked up, so a refused name is never resolved.
 - **A relative path is checked where it points, as in Node.** A path with no root is
   resolved against the cwd of the moment before it is matched (so `process.chdir` moves
@@ -1617,20 +1627,30 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
   its errors dropped the zone. What is left: on macOS and the BSDs oam has the system
   resolver read the zone, which also takes a number (`%1`) as the interface index, where
   libuv looks a number up as an interface NAME and finds none (scope id 0); and under
-  `--permission` a zoned answer is checked as written, so only an exact grant (or
-  `--allow-net` with no list) admits it.
+  `--permission` a zoned answer or host is checked unbracketed, since no URL can name
+  it, so a grant spells it as the hook does (`--allow-net` with no list admits any). It
+  is matched as an address (any spelling) and a zone (as written), by `fetch`,
+  `net.connect` and `tls.connect` alike, whether the host is named directly or answered
+  by a `lookup` hook: `fe80::1%1` admits that address and zone on every port and
+  `fe80::1%1:8080` on port 8080 alone. The zone is all of the text after `%`, as in Node,
+  whose zone grammar admits `:` (`net.isIP('fe80::1%1:8080')` is 6, and a connect dials
+  it with the zone `1:8080`). So an entry ending in `:` and digits is always
+  port-scoped: `fe80::1%1:8080` grants the zone `1` on port 8080 and never a host whose
+  zone is `1:8080`, which only `--allow-net` with no list admits.
 - **A refusing hook's error** rejects `undici.request` and `agent.request` as itself, as in
   Node, and `fetch` with it as the `cause` of `TypeError: fetch failed`, as in Node. Up to
   0.17.1 `undici.request`, which runs on `fetch` in oam, rejected with the `TypeError` too.
 - **A hook's addresses ARE a `--permission` boundary** (not a divergence, but the bullet
   that used to say otherwise is worth replacing rather than deleting). `--allow-net=<name>`
   grants the name, and every address the hook answers with is checked against the same
-  grant, exactly as a URL naming that address directly would be -- so
+  grant, exactly as a URL naming that address directly would be, on the port the hop is
+  dialled on (`127.0.0.1:8080` for `http://granted.invalid:8080/`; the port is read from
+  the parked fetch, never from JS, and a refusal names it) -- so
   `--allow-net=granted.invalid` plus a hook answering `127.0.0.1` is refused with
   `ERR_ACCESS_DENIED` and nothing is dialled, while `--allow-net=granted.invalid,127.0.0.1`
   allows it. An IPv6 answer is checked bracketed and canonical, as a URL's host is: a hook
   answering `::1` (or `0:0:0:0:0:0:0:1`) needs the same `[::1]` grant that
-  `http://[::1]/` does. A redirect hop's host is checked against the grant too (entry 4), before the
+  `http://[::1]/` does. A redirect hop's host and port are checked against the grant too (entry 4), before the
   hop's lookup, so the hook is only ever asked about names the grant covers. Node has no
   `--permission` net grant to compare against.
 
@@ -2049,27 +2069,39 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   with keep-alive and then FINs, the hop can be written before the server's FIN arrives.
   Node's hop goes out later, after its event loop has read the FIN. A FIN that has already
   reached the kernel is read before the write in oam too, and the hop goes to another
-  connection unsent. What differs is the FIN still in flight, measured on Windows arm64
-  against a node server (320 processes of 50 fetches, 8 at a time):
-  - **FIN at once, `GET` + `302`.** No fetch fails in either runtime, but in oam the server
-    receives the hop twice for 7-9% of fetches (1,177 and 1,383 of 16,000): the first copy
-    is written into the closing connection and read unanswered, and oam sends it once more.
-    Node's server receives every hop once. With 64 concurrent chains, oam failed 424 and
-    1,120 of 64,000 fetches (the one resend met another closing connection) where Node
-    failed 15.
-  - **FIN at once, `POST` + `307`.** A `POST` is never sent again -- oam did write it and
-    cannot know the server ignored it -- so it fails, its cause undici's `SocketError`
-    (`other side closed`; it was the uncoded `error sending request for url (...)` when
-    measured): 595 and 1,137 of 16,000 fetches in oam, none in Node.
+  connection unsent. A hop that could not be sent again -- one whose method is not
+  idempotent, a `POST` that a `307` or `308` sends on, a `PATCH` that a `302` does -- never
+  goes out on the connection its 3xx came on, and that connection is not pooled for
+  anything else either (#155): the hop dials a connection of its own, a cost on that path
+  alone. A connection whose response says `Connection: close` is never reused, as before.
+  Measured on Windows arm64 against a node server, one process with 8 concurrent chains of
+  125 fetches, release builds:
+  - **FIN at once, `POST` + `307`.** Node: none of 1,000 fails. oam up to 0.17.1: 29 of 1,000
+    failed (a `POST` is never sent again -- oam did write it and cannot know the server
+    ignored it -- so the fetch fails, its cause undici's `SocketError`, `other side
+    closed`); the issue's earlier measurement, 320 processes of 50 fetches 8 at a time, saw
+    595 and 1,137 of 16,000. oam now: none of 1,000 fails, and the server reads every hop
+    once (e2e guard `a_post_never_goes_out_on_the_connection_a_307_came_on`).
+  - **FIN at once, `GET` + `302`.** The hop may be sent again, so it still takes the pooled
+    connection, and what differs remains: no fetch fails in Node, and in oam the server
+    receives 21-32 of 1,000 hops twice -- the first copy written into the closing connection
+    and read unanswered, then oam's one resend -- and 1-2 of 1,000 fetches fail, the resend
+    meeting another closing connection. Node's server receives every hop once.
+  - **No redirect: `200` + keep-alive, then FIN at once.** The next request takes the
+    pooled connection, as above: 19-29 of 1,000 `POST`s fail in oam and 2-3 `GET`s, where
+    Node fails none, and the server reads 36-37 of 1,000 `GET`s twice. With one request at a
+    time per process (100 processes of 50, 8 at a time), 6-9 of 5,000 `POST`s fail.
   - **FIN 0-5 ms after the 3xx.** Here Node loses the race too, and fails with
-    `UND_ERR_SOCKET`: 2,561 of 16,000 `GET`s and 2,587 `POST`s. oam failed no `GET` (its
-    one resend) and 1,948 `POST`s.
+    `UND_ERR_SOCKET`: 2,561 of 16,000 `GET`s and 2,587 `POST`s, where oam up to 0.17.1 failed
+    no `GET` (its one resend) and 1,948 `POST`s. Not measured since the `POST` hop dials its
+    own connection.
   - **Server in the same process.** With oam as both server and client, the server's
     `socket.end()` sends its FIN only once the write before it has completed and JS has
-    run again, so the hop wins far more often: 45-60% of `POST` + `307` fetches
-    failed, and 60-69 of 6,000 `GET`s with eight concurrent chains, where Node, as both,
-    fails none. Node's client against the same oam server failed none either; oam's client
-    against a Node server failed 579 of 5,000.
+    run again, so the hop wins far more often. Up to 0.17.1 45-60% of `POST` + `307`
+    fetches failed (the hop now dials its own connection; not re-measured), and 60-69 of
+    6,000 `GET`s with eight concurrent chains, where Node, as both, fails none. Node's
+    client against the same oam server failed none either; oam's client against a Node
+    server failed 579 of 5,000.
 
   oam resends an idempotent request (`GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`, `TRACE`) once
   per hop, only when the dead connection had carried an earlier request and not a byte of
@@ -2096,9 +2128,27 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   (`conformance/cases/195-status-reason-phrase.mjs`; up to 0.17.1 oam's own transport
   reported the status code's canonical phrase). What differs: the parser under hyper
   drops a phrase carrying obs-text, so `200 caf\xe9` reads `''` on both client paths,
-  where Node's `statusMessage` is `café` and its `statusText` `caf�`. Over HTTP/2,
-  which has no reason phrase (and which Node's fetch never negotiates), `statusText` is
-  the status code's canonical phrase.
+  where Node's `statusMessage` is `café` and its `statusText` `caf�`. Over HTTP/2 (a
+  dispatcher with `allowH2`), which has no reason phrase, `statusText` is `''`, as in Node.
+- **A response header value's trailing whitespace is trimmed** (#182), on every client
+  path and over both protocols. Measured against a raw-socket server sending
+  `x-ows:   a<TAB>b   `, `x-trail-tab: v<TAB><TAB>` and `x-inner:  a   b  `: Node's `fetch`
+  (and `undici.request` from npm) read `"a\tb   "`, `"v\t\t"` and `"a   b  "` -- the
+  leading whitespace stripped, the trailing kept -- where oam's `fetch`, `undici.request`
+  and `http.get` read `"a\tb"`, `"v"` and `"a   b"`. Whitespace inside a value is kept,
+  and a leading run (`x-lead:<TAB><TAB>v`) reads `"v"`, in both runtimes. oam's reading is
+  the standard one: RFC 9110 section 5.5 excludes the optional whitespace around a field
+  value from the value, and it is what Node's own `http` module returns too
+  (`res.headers` and `res.rawHeaders` read `"a\tb"`). Over HTTP/1 the parser under hyper
+  (httparse) trims it before oam sees the value, so matching Node's `fetch` would mean
+  re-reading header bytes the parser has already consumed, to reproduce a reading Node's
+  `http` module does not share. Over HTTP/2, which oam's `fetch` speaks only through a
+  dispatcher with `allowH2` (below), the value arrives as sent and oam trims both ends
+  itself, so a `fetch` reads one value whichever protocol carried it. Up to 0.17.1 it did
+  not: from an `http2.createSecureServer` with `allowHTTP1` sending `   a<TAB>b   `,
+  oam's `fetch` negotiated h2 and read `"   a\tb   "`, leading run included, where Node's
+  negotiated HTTP/1.1 and read `"a\tb   "`. Only code that compares a `fetch` response
+  header value byte for byte can tell.
 - **A response nobody has read holds the request's `'close'`.** The request's `'close'`
   follows the response's `'end'` and `'close'` on a connection that is not kept, and comes
   between them on a kept-alive one, as in Node, on both client paths
@@ -2149,13 +2199,28 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   comma-joined line, and a method is uppercased only when it is one of `DELETE`, `GET`,
   `HEAD`, `OPTIONS`, `POST`, `PUT` -- `{method: 'patch'}` goes out as `patch`, as in Node.
   Over HTTP/2 (below) the transport drops `connection`, which h2 does not have.
-- **`fetch` negotiates HTTP/2 with an https origin; Node's `fetch` does not.** oam's origin
-  TLS handshake offers ALPN `h2, http/1.1` and speaks h2 to a server that selects it.
-  undici's `Client` defaults `allowH2` to `false` and Node's global dispatcher never turns it
-  on, so Node's `fetch` is HTTP/1.1 only. Anything a server does differently per protocol
-  version -- trailers, 1xx handling, per-version rate limits, request logs -- differs with
-  it. `http.request` in Node is h1-only as well. _(source: `tls_config.rs` ALPN list;
-  undici 6.24.1 `allowH2` default)_
+- **`fetch`, `undici.request` and `https.request` speak HTTP/1.1 to an https origin, as
+  Node's do** (#176; `conformance/cases/350-https-clients-alpn-offer.mjs`, e2e
+  `https_clients_offer_what_nodes_offer_by_alpn`). undici's connector -- `fetch`,
+  `undici.fetch`, `undici.request` -- offers ALPN `http/1.1` alone, and `https.request`'s
+  agent offers no ALPN at all, so an h2-capable server answers both over HTTP/1.1 and sees
+  `http/1.1` and `false`. Up to 0.17.1 oam's handshake offered `h2, http/1.1` to every
+  origin, so such a server served `fetch` over HTTP/2 -- and `https.request` too, whose
+  `res.httpVersion` still said `1.1`. Each client keeps to connections opened with its own
+  offer, as Node's separate pools do. A dispatcher with undici's `allowH2` -- the option, or
+  `connect.allowH2`, which wins over it even when `false` -- offers `http/1.1, h2`, as
+  undici's does, speaks HTTP/2 when the origin picks it, and prints undici's `[UNDICI-H2]`
+  experimental warning once. The option must be a boolean, as undici's `Client` requires:
+  a `Client` built with any other value throws undici's `InvalidArgumentError`, and an
+  `Agent` or a `Pool` fails each request with it (e2e
+  `a_dispatcher_allowh2_that_is_not_a_boolean_is_refused_as_undicis_client_refuses_it`);
+  `connect.allowH2` is tested for truthiness. Over HTTP/2 the client is hyper's rather
+  than undici's experimental one, and two things differ there: a `POST` (or `PUT`, `PATCH`,
+  ...) with no body carries the `content-length: 0` it carries over HTTP/1.1, where
+  undici's h2 client sends none; and the warning comes with the first response that arrived
+  over HTTP/2, where undici prints it when it connects -- so a redirect chain whose only h2
+  hop is not the last warns in Node alone. _(probed: Node v22.22.2 + undici 6.24.1 against
+  `http2.createSecureServer({ allowHTTP1: true })`)_
 - **Decoding** keeps its own entry: 32.
 
 **What a `fetch` refuses before it dials** (all matching Node, listed because a caller sees
@@ -2280,8 +2345,8 @@ The variables are read from the OS environment once per run, so assigning
 `REQUEST_METHOD` (a CGI environment) turns them all off for `fetch`. An http
 destination goes to the proxy in absolute form, with `proxy-authorization` from the proxy
 URL's credentials; an https destination goes through a `CONNECT` tunnel carrying those
-credentials and oam's `user-agent`, with h2 still negotiated with the origin inside it. The
-handshake with an `https://` proxy itself offers no ALPN. A refused or unresolvable proxy
+credentials and oam's `user-agent`, with the request's ALPN offer (above) going to the origin
+inside it. The handshake with an `https://` proxy itself offers no ALPN. A refused or unresolvable proxy
 fails with Node's connect error naming the proxy. A `socks` proxy URL is not supported and
 fails every request it applies to: `fetch` with `error sending request for url (...)`,
 `http.request` (under `NODE_USE_ENV_PROXY=1`) with `ECONNRESET` `socket hang up`.
@@ -2786,9 +2851,12 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
 - **`allowHTTP1` serves `http.IncomingMessage` / `http.ServerResponse`** whatever
   `Http1IncomingMessage` / `Http1ServerResponse` name, with the TLS socket as
   `req.socket`, and the HTTP/1 connection is held to the server's `headersTimeout` /
-  `requestTimeout` as they are when it connects. `server.close()` stops the listener and
-  leaves open HTTP/1 connections alone (Node also closes the idle ones), and there is no
-  `closeIdleConnections()`.
+  `requestTimeout` as they are when it connects. `server.close()` closes the idle HTTP/1
+  connections before it stops the listener, and `closeIdleConnections()` closes them on
+  demand, as Node's do (`conformance/cases/351-http2-secure-server-close-idle-http1.mjs`).
+  Up to 0.17.1 `close()` left them open and there was no `closeIdleConnections()`, so a
+  keep-alive client -- `fetch` among them, which reaches such a server over HTTP/1.1 since
+  #176 -- held `close()` until it let go.
 - **Keys rustls cannot sign with** -- DSA among them -- are refused at `createServer()`
   with `ERR_OSSL_UNSUPPORTED`.
 
@@ -3041,6 +3109,41 @@ oam's shared client. What differs:
   request never emits `'wantTrailers'`. oam's client stream is not told of that reset: it
   closes only once its own `end()` (and `'wantTrailers'`) has come. Its `rstCode` is 0
   either way.
+- **A server's GOAWAY is reported as Node reports it** (#185;
+  `conformance/cases/352-http2-connect-goaway.mjs`). The session's `'goaway'` carries the
+  frame's code, last stream id and debug data (`undefined` when it has none), after the
+  response heads that came before it; a stream above the last stream id -- one the server
+  never processed -- closes with `ERR_HTTP2_STREAM_ERROR` naming `NGHTTP2_REFUSED_STREAM`
+  (`rstCode` 7), so the application knows it can send it again; a stream the server
+  answered reads to its end; and the session then closes (`NO_ERROR`) or is destroyed with
+  `ERR_HTTP2_SESSION_ERROR` (any other code). A closed session -- by `close()` or by the
+  server's GOAWAY -- sends its own GOAWAY (`NO_ERROR`, last stream id 0) at once, while its
+  streams are still open, as Node's does, so a server that keeps the connection open answers
+  with one more GOAWAY (reported, as Node reports it) and ends the connection once its
+  streams are done (`conformance/cases/353-http2-connect-goaway-held-open.mjs`); and a GOAWAY
+  that arrives after the closed session's last stream has ended is not reported, as Node's
+  session is gone by then. Up to 0.17.1 a graceful GOAWAY reached the
+  session as an EOF: no `'goaway'`, and every stream -- the answered one, its body unread,
+  included -- closed silently with `NGHTTP2_CANCEL`; an error GOAWAY's `'goaway'` named last
+  stream id 0 and an empty buffer; and the session sent its own GOAWAY only once its streams
+  were done, which a Node server no longer reads then, so against a server that kept the
+  connection open the session never emitted `'close'` and kept the process alive. Neither
+  runtime sends a refused stream again: Node's client leaves that to the application, and so
+  does oam's. What differs: a request made in
+  the instant between the GOAWAY reaching oam's HTTP/2 layer and the session hearing of it
+  is refused the same way, where Node's session, closed already, throws
+  `ERR_HTTP2_GOAWAY_SESSION` from `request()`; and one sent in the narrower instant before
+  that layer has read the frame goes past its last stream id, is not answered, and closes
+  with `NGHTTP2_CANCEL` when the connection ends. Node sends a second GOAWAY of its own in
+  the same write as the first when a session closes with no stream open; oam's second
+  (hyper's) follows separately, and a Node server that has stopped reading by then reports
+  only the first.
+- **Streams made in one tick may reach the wire in another order.** `session.request()`
+  numbers its streams 1, 3, 5, ... in call order, as Node does, but each goes to hyper on an
+  operation of its own, and hyper numbers them on the wire in the order those run. Requests
+  made together can therefore reach the server in another order than Node's, and a stream's
+  `id` need not be the one the server saw. _(observed: of three requests made together, the
+  one a server answered first was not always the first one made; not yet fixed)_
 - **A plain `Duplex` from `createConnection` is used as it is.** Node wraps a stream that is
   not a socket in its `JSStreamSocket` and hands that wrapper to `'connect'`; oam runs the
   session over the stream itself and hands it on.
@@ -3378,6 +3481,36 @@ what is left:
   relative, on a machine with `LongPathsEnabled`). oam creates the directory: Rust's
   `create_dir` lengthens such paths itself. Refusing a path the file system accepts was not
   worth reproducing.
+
+### Windows `fs` paths reach the OS as given, not namespaced
+
+node's `fs` hands libuv every path through `path.toNamespacedPath`: resolved against the cwd
+(which normalises `.` / `..` and drops a trailing separator) and prefixed with `\\?\`. That
+prefix turns off Win32 path normalisation, so the OS does not strip trailing dots and spaces
+and does not treat DOS device names as devices. oam passes the path as given to std, which
+goes through that normalisation. Errors already NAME the path as node does (the resolved path,
+prefix removed); which file the OS opens differs. Measured against node v22.22.2 on Windows,
+for `fs.readFileSync`, and so for `process.loadEnvFile`, which reads through it:
+
+| path | node | oam |
+|---|---|---|
+| a directory with a trailing separator, `sub/` or `sub\` | opens `sub`, fails `EISDIR` `read` (`loadEnvFile`: `Contents of '\\?\<cwd>\sub' should be a valid string.`) | the open fails, `ENOENT` `open '<cwd>\sub'` |
+| `NUL` / `nul` | `ENOENT` `open '<cwd>\NUL'` | reads the NUL device: `""` (`loadEnvFile` loads nothing and succeeds) |
+| a trailing dot or space, `.env.`, `.env `, `f.txt...` | `ENOENT` | opens `.env` / `f.txt` |
+
+The same holds beyond reads: `statSync(".env.")` and `existsSync(".env.")` find `.env`
+(node: `ENOENT`, `false`), `openSync("NUL")` opens the device and `statSync("NUL")` fails
+`EISDIR` (node: `ENOENT` for both), and `writeFileSync("g.txt.", ...)` creates `g.txt` where
+node creates a file literally named `g.txt.`. `COM1` agrees (`ENOENT` in both) on a machine
+without that port.
+
+Not fixed yet because there is no single place to change: paths reach the OS through some 66
+`toPath` call sites in `js/node_compat.js` and over 100 path-taking ops in Rust (sync ops in
+`oam_engine`, async ones in `oam_core`), the `--permission` checks resolve the path against
+the cwd themselves and would have to agree with what the OS is handed, and several results
+echo the path back (`mkdtemp`, recursive `mkdir`, `readdir` with `recursive`,
+`Dirent.parentPath`, symlink targets), where a namespaced path must not leak out. It wants
+its own design and a full `fs` conformance pass.
 
 ### `fs.realpath` under `--permission` — oam is stricter
 

@@ -8,7 +8,8 @@
 // fetchCancel):
 //   request:  JSON string {url, method, headers: [[k,v]],
 //             body | body_base64 | body_stream, attempt_timeout_ms,
-//             fetch_semantics, dispatch_semantics, lookup_hook?, connect_timeout_ms?}
+//             fetch_semantics, dispatch_semantics, lookup_hook?, connect_timeout_ms?,
+//             alpn? ("http1" when absent | "allow_h2" | "none")}
 //   response: {status, statusText, url, redirected, headers: [[k,v]],
 //             bodyHandle} -- or, for a lookup_hook request,
 //             {lookup: {token, host, port}}: run the hook, then
@@ -1273,6 +1274,17 @@
   const REQUEST_FORBIDDEN_METHODS = new Set(["CONNECT", "TRACE", "TRACK"]);
   const HTTP_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
   let patchMethodWarned = false;
+  // undici's one-time warning for its first HTTP/2 connection
+  // (client-h2.js connectH2, 6.24.1, the version node v22.22.2 bundles),
+  // which only a dispatcher with `allowH2` can open.
+  let h2ExperimentalWarned = false;
+  function warnH2Experimental() {
+    if (h2ExperimentalWarned) return;
+    h2ExperimentalWarned = true;
+    globalThis.process?.emitWarning?.("H2 support is experimental, expect them to change at any time.", {
+      code: "UNDICI-H2",
+    });
+  }
 
   // webidl's ByteString: a code unit above 0xFF is refused.
   function toByteString(value) {
@@ -2603,6 +2615,7 @@
         }
         resumed = true;
         const supplied = supplySocket(socket);
+        if (socket.alpnProtocol === "h2") warnH2Experimental();
         try {
           raw = await internal.fetchSupply(token, supplied.id, socket.alpnProtocol === "h2");
         } catch (e) {
@@ -2669,6 +2682,9 @@
       cause.base = raw.invalidLocation.base;
       throw new TypeError("fetch failed", { cause });
     }
+    // An answer over HTTP/2: only an `allowH2` dispatcher's connection can
+    // have negotiated it.
+    if (raw?.tls?.alpnProtocol === "h2") warnH2Experimental();
     return raw;
   }
 
@@ -3262,6 +3278,19 @@
     const dispatcher = init.dispatcher ?? holder?.current;
     const lookup = (dispatcher && dispatcher._oamConnectLookup) || replacedDnsLookup();
     if (typeof lookup === "function") request.lookup_hook = true;
+    // What the handshake with an https origin offers by ALPN, as each of
+    // node's clients offers it (measured on v22.22.2 against an allowHTTP1
+    // http2 server, #176): undici -- fetch() and undici.request -- offers
+    // `http/1.1` alone (the transport's default) and so never speaks HTTP/2,
+    // unless the dispatcher has `allowH2`, which adds `h2`; http.request's
+    // https.Agent offers nothing at all. oam used to offer `h2, http/1.1` for
+    // every one of them, so an h2-capable origin served fetch -- and
+    // https.request, whose response still said HTTP/1.1 -- over HTTP/2.
+    if (rawPayload) {
+      if (init.__oamOfferNoAlpn === true) request.alpn = "none";
+    } else if (dispatcher?._oamAllowH2 === true) {
+      request.alpn = "allow_h2";
+    }
     // undici gives a connection 10 s to be connected (for https, handshaken)
     // and then fails the request with its ConnectTimeoutError, where the
     // operating system would keep trying for 21 s (Windows) to two minutes
