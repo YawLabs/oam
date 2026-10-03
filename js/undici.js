@@ -36,10 +36,13 @@
 //    undici's do by default -- node's fetch never speaks HTTP/2 unless asked
 //    (#176).
 //  - A Dispatcher/Agent with a `connect.lookup` hook IS honored, as undici
-//    honors it: the hook is called before the fetch connects to a host name
-//    -- the first request AND every redirect hop to another host -- and the
-//    connection is pinned to the addresses it returns (Host header + TLS SNI
-//    preserved; node's address filtering; never the environment proxy). A hook
+//    honors it: the hook is called for every connection the dispatcher opens
+//    to a host name -- the first request AND every redirect hop that needs
+//    a new connection -- and that connection is pinned to the addresses it
+//    returns (Host header + TLS SNI preserved; node's address filtering;
+//    never the environment proxy). The connections are pooled per
+//    dispatcher and reused across its fetches, so a request that finds an
+//    idle one to its origin does not call the hook. A hook
 //    error fails the fetch closed with that error as `cause`, never falling
 //    back to system DNS. This makes the DNS-rebind / SSRF pin used by e.g.
 //    @yawlabs/fetch-mcp a real control, not a no-op. (See the Dispatcher
@@ -76,7 +79,10 @@
   function globalDispatcherHolder() {
     var existing = globalThis.__oamUndiciDispatcher;
     if (existing !== undefined) return existing;
-    var holder = { current: null };
+    // `lastPoolId`: the last connection-pool id a dispatcher was given (see
+    // the Dispatcher constructor). Here rather than in the module so that
+    // every copy of the shim an isolate evaluates numbers from one counter.
+    var holder = { current: null, lastPoolId: 0 };
     Object.defineProperty(globalThis, "__oamUndiciDispatcher", {
       value: holder,
       writable: false,
@@ -1042,6 +1048,18 @@
       "lookup", "timeout", "keepAlive", "keepAliveInitialDelay", "maxCachedSessions", "allowH2",
     ]);
 
+    // A dispatcher's connection pool on oam's transport -- the pool its
+    // fetches share when a lookup hook routes them there -- is closed when
+    // the dispatcher is closed or destroyed, and when it is collected
+    // without either: nothing else would ever close it.
+    const dropPool = (id) => {
+      const ops = G.__oam && G.__oam.node;
+      if (ops && typeof ops.httpTransportDropAgent === "function") ops.httpTransportDropAgent(id);
+    };
+    const collectedPools = typeof FinalizationRegistry === "function"
+      ? new FinalizationRegistry(dropPool)
+      : null;
+
     // ---- dispatchers ------------------------------------------------------
     // All dispatchers delegate to request() -- oam's fetch owns the transport,
     // so pooling options are accepted and stored but NOT applied; the
@@ -1085,6 +1103,16 @@
         this._oamConnect = null;
         this._oamConnectLookup = null;
         this._oamConnectTimeout = null;
+        // `_oamPoolId`, the id of this dispatcher's connection pool on oam's
+        // transport. A fetch through a dispatcher with a lookup hook (its
+        // own, or a replaced dns.lookup) takes its connections from that
+        // pool, so they are reused across the dispatcher's fetches -- and
+        // the hook is asked once per connection -- as undici's Agent pools
+        // its own. Ids start at 1: 0 is the pool of a fetch with no
+        // dispatcher.
+        const holder = globalDispatcherHolder();
+        this._oamPoolId = ++holder.lastPoolId;
+        if (collectedPools !== null) collectedPools.register(this, this._oamPoolId, this);
         const connectOptions = {
           timeout: this._options.connectTimeout,
           allowH2: clientAllowH2(this),
@@ -1131,6 +1159,7 @@
       // dispatcher; fetch, undici.request and the dispatcher's request()).
       async close(cb) {
         this.closed = true;
+        this._oamDropPool();
         await null;
         this.destroyed = true;
         if (typeof cb === "function") queueMicrotask(cb);
@@ -1138,7 +1167,15 @@
       async destroy(err, cb) {
         if (typeof err === "function") { cb = err; err = null; }
         this.destroyed = true;
+        this._oamDropPool();
         if (typeof cb === "function") queueMicrotask(cb);
+      }
+      // Close the connections this dispatcher's pool holds, as undici's
+      // close() and destroy() close its sockets. A request in flight keeps
+      // its connection to the end, and that connection then closes.
+      _oamDropPool() {
+        if (collectedPools !== null) collectedPools.unregister(this);
+        dropPool(this._oamPoolId);
       }
       // Web-fetch dispatch entry undici exposes; not used by oam's fetch
       // (which dispatches itself), but present so feature-detection passes.

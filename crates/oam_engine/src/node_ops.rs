@@ -328,6 +328,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         ("fetchSentOpen", op_fetch_sent_open),
         ("fetchSentWait", op_fetch_sent_wait),
         ("fetchSentClose", op_fetch_sent_close),
+        ("httpTransportDropAgent", op_http_transport_drop_agent),
         ("httpRequestBodyCancel", op_http_request_body_cancel),
         ("httpAbort", op_http_abort),
         ("httpClose", op_http_close),
@@ -712,6 +713,28 @@ fn throw_fs_error(
         failure.syscall,
         failure.has_path.then_some(&*shown),
         error,
+    );
+}
+
+/// Throw a failed whole-file operation (readFile / writeFile / appendFile) as
+/// node does: the open half names syscall `open` and the path, the read or
+/// write half names `read` / `write` and no path (`oam_core::whole_file_error`).
+fn throw_whole_file_error(
+    scope: &mut v8::PinScope<'_, '_>,
+    site: oam_core::FsSite<'_>,
+    path: &str,
+    error: &oam_core::WholeFileError,
+) {
+    let failure = oam_core::whole_file_error(site, path, error);
+    let shown = oam_core::fs_error_path(path);
+    let message = oam_core::fs_error_message(failure, &shown, error.io());
+    throw_system_error(
+        scope,
+        failure.code,
+        &message,
+        failure.syscall,
+        failure.has_path.then_some(&*shown),
+        error.io(),
     );
 }
 
@@ -3514,6 +3537,25 @@ fn op_fetch_body_channel_cancel(
     }
 }
 
+/// `__oam.node.httpTransportDropAgent(id)`, synchronous: close every
+/// connection the `undici` dispatcher with pool id `id` has pooled on oam's
+/// transport and forget its pool -- the dispatcher's `close()` / `destroy()`,
+/// or its collection (`HttpTransport::drop_agent`). Returns whether it had
+/// one.
+fn op_http_transport_drop_agent(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let id = args.get(0).number_value(scope).unwrap_or(-1.0);
+    // Pool ids are positive integers; anything else names no pool.
+    let dropped = id >= 1.0
+        && id.fract() == 0.0
+        && id <= u64::MAX as f64
+        && core_runtime!(scope).http_client().drop_agent(id as u64);
+    rv.set(v8::Boolean::new(scope, dropped).into());
+}
+
 /// `__oam.node.fetchSentOpen() -> handle`: a signal for one http.request on
 /// oam's own transport, named in its fetch request as `sent_signal`
 /// (`oam_core::http_client::sent`).
@@ -6083,13 +6125,13 @@ fn op_fs_read_file_sync(
     }
     // Always raw bytes: encodings decode JS-side via Buffer#toString, so
     // 'base64'/'hex'/'latin1' behave instead of utf8-lossy garbage.
-    match std::fs::read(&path) {
+    match oam_core::read_whole_file(&path) {
         Ok(bytes) => {
             if let Some(value) = bytes_to_uint8array(scope, bytes) {
                 rv.set(value);
             }
         }
-        Err(e) => throw_fs_error(scope, oam_core::FsSite::ReadFile, "open", &path, &e),
+        Err(e) => throw_whole_file_error(scope, oam_core::FsSite::ReadFile, &path, &e),
     }
 }
 
@@ -6105,13 +6147,13 @@ fn op_fs_read_file_utf8_sync(
     if !check_read_perm(scope, &path) {
         return;
     }
-    match std::fs::read(&path) {
+    match oam_core::read_whole_file(&path) {
         Ok(bytes) => {
             if let Some(s) = v8::String::new_from_utf8(scope, &bytes, v8::NewStringType::Normal) {
                 rv.set(s.into());
             }
         }
-        Err(e) => throw_fs_error(scope, oam_core::FsSite::ReadFile, "open", &path, &e),
+        Err(e) => throw_whole_file_error(scope, oam_core::FsSite::ReadFile, &path, &e),
     }
 }
 
@@ -6132,23 +6174,13 @@ fn op_fs_write_file_sync(
         return;
     };
     let append = args.get(2).is_true();
-    let result = if append {
-        use std::io::Write;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .and_then(|mut f| f.write_all(&bytes))
-    } else {
-        std::fs::write(&path, &bytes)
-    };
-    if let Err(e) = result {
+    if let Err(e) = oam_core::write_whole_file(&path, &bytes, append) {
         let site = if append {
             oam_core::FsSite::AppendFile
         } else {
             oam_core::FsSite::WriteFile
         };
-        throw_fs_error(scope, site, "open", &path, &e);
+        throw_whole_file_error(scope, site, &path, &e);
     }
 }
 

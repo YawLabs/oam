@@ -84,6 +84,16 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   failed `EISDIR: ..., open '<path>'`**; open(2) admits a directory there, so the failure is the
   read's, and it is node's `EISDIR: illegal operation on a directory, read` with no path, as it
   already was on Windows.
+- **`fs.readFile` / `writeFile` / `appendFile` (sync, callback and promise) reported a failed
+  read or write as a failed open**: `EBUSY: resource busy or locked, open '<path>'` for a file
+  another process has a region of locked, where node says `EBUSY: resource busy or locked, read`
+  (or `write`) with no path. Only a failed open now names `open` and the path, as in node -- and
+  `process.loadEnvFile()` of such a file is node's `Contents of '<path>' should be a valid
+  string.` instead of a false `ENOENT`.
+- **`fs.readFile` (sync, utf8 sync, callback and promise) read a file in growing chunks** after the
+  open / read split above: 9 read calls for 1 MiB, 15 for 64 MiB. It reads into the room
+  reserved from its fstat again, as `std::fs::read` does: one read of the whole file plus one
+  short EOF probe, whatever the size.
 - **Over HTTP/2, a `fetch` response header value kept the whitespace around it**; it is trimmed
   as it is over HTTP/1, and the trimming is recorded as a divergence from node's `fetch`, which
   keeps trailing whitespace. (#182)
@@ -144,6 +154,21 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   one with a NUL byte). `'trailers'` fires whether or not the body ahead of it is read, a
   server stream that has responded stays open for the rest of the request, and a client's
   `'wantTrailers'` / `'finish'` order matches node's.
+- **A `connect.lookup` dispatcher opened and closed a connection for every fetch** (#179),
+  calling the hook each time, so a sustained hooked loop could use up the ephemeral port
+  range (`EADDRINUSE`). Each `Agent` now pools its connections across its fetches, as
+  undici's does: the hook is called once per connection opened, not once per fetch; a
+  pooled connection carries requests only for the origin it was opened to, and never for
+  another `Agent`; an idle HTTP/1.1 connection closes 90 s after its last response, and all
+  of them close on `close()`, `destroy()` (in the same tick as a fetch, too) or the
+  `Agent`'s collection. A redirect to the same origin reuses the 3xx's connection every
+  time, and each request dials with its own happy-eyeballs attempt timeout rather than one
+  another request had set.
+- **A `connect.lookup` hook's second callback was ignored** (#169). An error, a throw or an
+  answer node's address rules refuse, arriving after the hook answered, fails the fetch
+  with that error as the `cause` while the connection is still being made, as node's
+  `net` does; once it is made, later callbacks are ignored. A second answer that passes
+  the rules is still ignored, where node fails the socket with a platform error.
 
 ### Performance
 
