@@ -688,11 +688,14 @@ WIN_SIGN_INTERMEDIATE="Microsoft ID Verified Code Signing PCA 2021"
 # digit. 10.0.20348.* (Server 2022's SDK) is called out as unsupported by the
 # dlib and is skipped whatever its number.
 WIN_SIGNTOOL_FLOOR="10.0.22621"
-# Seconds any one signtool or verify call may take. signtool + the dlib do not
-# time out on their own: against an unreachable endpoint they print
-# "Submitting digest for signing..." and wait forever (measured, dlib 1.0.119).
-# A stalled service mid-release must be a clean failure, not a hang.
+# Seconds any one signtool, verify or az call may take (1..3600). signtool +
+# the dlib do not time out on their own: against an unreachable endpoint they
+# print "Submitting digest for signing..." and wait forever (measured, dlib
+# 1.0.119). A stalled service mid-release must be a clean failure, not a hang.
 WIN_SIGN_TIMEOUT="${OAM_WIN_SIGN_TIMEOUT:-300}"
+WIN_SIGN_TIMEOUT_MAX=3600
+# Seconds `dotnet --list-runtimes` may take: a local probe, no network.
+WIN_DOTNET_PROBE_TIMEOUT=60
 # Search roots and the external programs, reassigned by the test suite.
 WIN_SDK_BIN_ROOT="/c/Program Files (x86)/Windows Kits/10/bin"
 WIN_DOTNET_CANDIDATES=("/c/Program Files/dotnet/x64/dotnet.exe" "/c/Program Files/dotnet/dotnet.exe")
@@ -714,6 +717,11 @@ WIN_SIGNTOOL=""
 WIN_SIGN_DLIB=""
 WIN_DOTNET_X64=""
 
+# kill_proc_tree <pid>: the repo's one process-tree reaper, tested where it
+# lives. iap-helpers.sh defines functions and two OAM_DISK_* defaults only.
+# shellcheck source=iap-helpers.sh
+. "$(dirname "${BASH_SOURCE[0]}")/iap-helpers.sh"
+
 # _ws_winpath <path> -- the native Windows spelling, for arguments a Windows
 # program reads (signtool, powershell). $RELEASE_DIR is an MSYS /tmp path that
 # no Windows program can open as written.
@@ -721,35 +729,167 @@ _ws_winpath() {
   if command -v cygpath >/dev/null 2>&1; then cygpath -w "$1"; else printf '%s\n' "$1"; fi
 }
 
-# _ws_run <command...> -- run under WIN_SIGN_TIMEOUT, stdout and stderr both on
-# stdout; returns the command's rc (124 or 137: killed for taking too long).
-_ws_run() {
-  timeout "$WIN_SIGN_TIMEOUT" "$@" </dev/null 2>&1
+# _ws_run_for <seconds> <command...> -- run with stdin from /dev/null and
+# stdout + stderr captured, then printed on stdout; returns the command's rc,
+# or 124 when it ran out of time and was killed WITH everything it started (a
+# command's OWN 124 comes back as 1, so it is never read as a timeout).
+#
+# Not timeout(1): on Windows it kills only its direct child. `az` is a bash
+# script around python.exe, a stand-in may be cmd.exe around ping.exe, and the
+# grandchild lives on holding the output pipe, so the caller blocks anyway
+# (measured: `timeout 3` on a script running `cmd //c ping -n 593` returned
+# only when ping did). So kill_proc_tree (lib/iap-helpers.sh: taskkill /T on
+# Windows, the ps-snapshot tree elsewhere) does the killing, and the output
+# goes through a file, not a pipe, so nothing that escaped could hold the
+# caller's $(...) open either.
+#
+# The command is the background job itself, never wrapped: Cygwin's exec
+# starts a NEW Windows process, so a wrapper subshell's children hang off a
+# process that is already gone, and taskkill /T from the wrapper misses them
+# (measured: the ping survived). The wait spawns nothing per tick (a spawn
+# costs ~0.5s on the Windows release box): the watchdog is one `sleep` whose
+# stdout this shell reads with `read -t`, a builtin pause that ends early, at
+# EOF, when the sleep does; bash reaps its children as they exit, so
+# `kill -0` turns false the moment the command is done. Not `wait -n`: a job
+# that exits before `wait -n` is entered can already be marked notified, and
+# then `wait -n` waits out the watchdog instead (measured: a stub that exited
+# at once was reported as timed out after the full 300s).
+_ws_run_for() {
+  local secs="$1" log pid wfd wpid r rc=0 late=0
+  shift
+  log="$(mktemp "${TMPDIR:-/tmp}/oam-ws-run.XXXXXX")" || { echo "could not create a temp file for the output of $1"; return 1; }
+  "$@" </dev/null >"$log" 2>&1 &
+  pid=$!
+  exec {wfd}< <(exec sleep "$secs")
+  wpid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    r=0
+    read -r -t 0.2 -u "$wfd" _ || r=$?
+    # 0 or 1 (data, or EOF): the watchdog's sleep ended. > 128: just a tick.
+    if [ "$r" -le 128 ]; then
+      if kill -0 "$pid" 2>/dev/null; then late=1; fi
+      break
+    fi
+  done
+  exec {wfd}<&-
+  if [ "$late" = "1" ]; then
+    kill_proc_tree "$pid"
+    rc=124
+  else
+    kill "$wpid" 2>/dev/null
+    wait "$pid"
+    rc=$?
+    if [ "$rc" = "124" ]; then rc=1; fi
+  fi
+  cat "$log"
+  rm -f "$log"
+  return "$rc"
 }
 
-# _ws_timed_out <rc> -- whether rc is timeout(1) killing the command.
-_ws_timed_out() { [ "$1" = "124" ] || [ "$1" = "137" ]; }
+# _ws_run <command...> -- _ws_run_for WIN_SIGN_TIMEOUT.
+_ws_run() { _ws_run_for "$WIN_SIGN_TIMEOUT" "$@"; }
 
-# _ws_redact <metadata.json> -- stdin to stdout with every value metadata.json
-# holds (and the endpoint / account / profile shapes the service echoes back)
-# replaced by <redacted>. signtool /v prints the dlib's whole metadata block,
-# and failure output is exactly what an operator pastes into a public issue.
+# _ws_timed_out <rc> -- whether rc is _ws_run killing the command for time.
+_ws_timed_out() { [ "$1" = "124" ]; }
+
+# _ws_ci <var> <word> -- set <var> to <word> as a case-insensitive ERE
+# ("ab" -> "[Aa][Bb]"): sed's I flag is GNU-only.
+_ws_ci() {
+  local _w="$2" _i _c _o=""
+  for ((_i = 0; _i < ${#_w}; _i++)); do
+    _c="${_w:_i:1}"
+    if [[ "$_c" == [A-Za-z] ]]; then _o="${_o}[${_c^^}${_c,,}]"; else _o="$_o$_c"; fi
+  done
+  printf -v "$1" '%s' "$_o"
+}
+
+# _ws_redact [metadata.json] -- stdin to stdout (CRs dropped) with everything
+# that identifies the account or the operator replaced: every value
+# metadata.json holds, in any case; the endpoint / account / profile shapes
+# the service echoes back; email-shaped tokens (az names the signed-in UPN:
+# "User '...' does not exist in MSAL token cache"); GUIDs (tenant and
+# subscription IDs, AADSTS trace and correlation IDs); *.onmicrosoft.com
+# tenants and quoted tenant / subscription / directory names; and the user
+# profile directory in every spelling ($HOME, $USERPROFILE, C:\Users\<name>,
+# C:/Users/<name>, /c/Users/<name>) -> <home>. Every path that prints an
+# external tool's output goes through here: that output is exactly what an
+# operator pastes into a public issue.
 _ws_redact() {
-  local m="$1" k v line
-  local -a vals=()
-  if [ -f "$m" ]; then
+  local m="${1:-}" k v vals="" homes="" acct prof q="'"
+  if [ -n "$m" ] && [ -f "$m" ]; then
     for k in Endpoint CodeSigningAccountName CertificateProfileName; do
       v="$(sed -nE "s/.*\"$k\"[[:space:]]*:[[:space:]]*\"([^\"]*)\".*/\1/p" "$m" | head -1)"
-      if [ -n "$v" ]; then vals+=("$v" "${v,,}"); fi
+      if [ -n "$v" ]; then vals="$vals$v"$'\n'; fi
     done
   fi
-  while IFS= read -r line || [ -n "$line" ]; do
-    for v in "${vals[@]}"; do line="${line//"$v"/<redacted>}"; done
-    printf '%s\n' "$line"
-  done | sed -E \
+  for v in "${HOME:-}" "${USERPROFILE:-}"; do
+    [ "${#v}" -ge 4 ] || continue
+    homes="$homes$v"$'\n'"${v//\\//}"$'\n'
+  done
+  _ws_ci acct codesigningaccounts
+  _ws_ci prof certificateprofiles
+  # In this order: the profile directory as spelled in this environment (a
+  # literal: it may hold spaces), then the shapes -- any other profile path,
+  # emails, GUIDs, tenants, Artifact Signing hosts -- and only then the
+  # metadata values, case-insensitively and as data, never as a regex (after
+  # the shapes, so a value like "example" cannot break up an email first).
+  # mawk has no [[:classes:]] or {n} intervals, hence the spelled-out forms.
+  # The three rules that need a back-reference follow in sed.
+  WS_REDACT_VALS="$vals" WS_REDACT_HOMES="$homes" awk '
+    function swap(line, needle, with,   low, out, p, n) {
+      n = length(needle); out = ""; low = tolower(line)
+      while ((p = index(low, needle)) > 0) {
+        out = out substr(line, 1, p - 1) with
+        line = substr(line, p + n); low = substr(low, p + n)
+      }
+      return out line
+    }
+    BEGIN {
+      nv = split(ENVIRON["WS_REDACT_VALS"], raw, "\n")
+      for (i = 1; i <= nv; i++) if (length(raw[i]) >= 3) val[++kv] = tolower(raw[i])
+      nh = split(ENVIRON["WS_REDACT_HOMES"], raw, "\n")
+      for (i = 1; i <= nh; i++) if (length(raw[i]) >= 4) home[++kh] = tolower(raw[i])
+      h = "[0-9A-Fa-f]"; h4 = h h h h
+      guid = h4 h4 "-" h4 "-" h4 "-" h4 "-" h4 h4 h4
+    }
+    {
+      sub(/\r$/, "")
+      for (i = 1; i <= kh; i++) $0 = swap($0, home[i], "<home>")
+      gsub(/[A-Za-z]:(\\\\|\\|\/)[Uu][Ss][Ee][Rr][Ss](\\\\|\\|\/)[^\\\/ \t"\047<>|:*?]+/, "<home>")
+      gsub(/\/[A-Za-z]\/[Uu][Ss][Ee][Rr][Ss]\/[^\/ \t"\047<>|:*?]+/, "<home>")
+      gsub(/[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z][A-Za-z]+/, "<email>")
+      gsub(guid, "<guid>")
+      gsub(/[A-Za-z0-9-]+\.[Oo][Nn][Mm][Ii][Cc][Rr][Oo][Ss][Oo][Ff][Tt]\.[Cc][Oo][Mm]/, "<tenant>.onmicrosoft.com")
+      gsub(/[A-Za-z0-9-]+\.[Cc][Oo][Dd][Ee][Ss][Ii][Gg][Nn][Ii][Nn][Gg]\.[Aa][Zz][Uu][Rr][Ee]\.[Nn][Ee][Tt]/, "<redacted>.codesigning.azure.net")
+      for (i = 1; i <= kv; i++) $0 = swap($0, val[i], "<redacted>")
+      print
+    }' | sed -E \
     -e 's/("(Endpoint|CodeSigningAccountName|CertificateProfileName)"[[:space:]]*:[[:space:]]*)"[^"]*"/\1"<redacted>"/g' \
-    -e 's#[A-Za-z0-9-]+\.codesigning\.azure\.net#<redacted>.codesigning.azure.net#g' \
-    -e 's#(codesigningaccounts|certificateprofiles)/[^/[:space:]"]+#\1/<redacted>#Ig'
+    -e "s#($acct|$prof)/[^/[:space:]\"]+#\\1/<redacted>#g" \
+    -e "s#([Tt]enant|[Ss]ubscription|[Dd]irectory)([[:space:]]+[Ii][Dd])?([[:space:]]*:?[[:space:]]*)${q}[^${q}]*${q}#\\1\\2\\3$q<redacted>$q#g"
+}
+
+# _ws_show <label> [metadata.json] -- a failed tool's output (stdin), redacted,
+# onto stderr: first the lines that say WHY (HTTP status, error codes,
+# SignerSign(), exception messages, AADSTS codes; stack frames skipped), then
+# the last 12 lines. A .NET failure from the dlib runs to 30+ lines, and its
+# "Status: 403 (Forbidden)" sits near the top, where a bare tail drops it.
+_ws_show() {
+  local label="$1" m="${2:-}"
+  _ws_redact "$m" | awk -v p="        $label: " -v n=12 '
+    { l[NR] = $0 }
+    END {
+      start = NR - n + 1
+      if (start < 1) start = 1
+      k = 0
+      for (i = 1; i < start && k < 12; i++) {
+        lo = tolower(l[i])
+        if (lo ~ /^[ \t]*at /) continue
+        if (lo ~ /status:|error|fail|exception|denied|forbidden|unauthori|aadsts|signersign|0x[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]/) { print p l[i]; k++ }
+      }
+      if (start > 1) print p "... (the last " n " of " NR " lines:)"
+      for (i = start; i <= NR; i++) print p l[i]
+    }' >&2
 }
 
 # _ws_pe_machine <file> -- the COFF Machine field as 4 lowercase hex digits
@@ -837,7 +977,8 @@ probe_dotnet_x64() {
   for c in "${WIN_DOTNET_CANDIDATES[@]}"; do
     [ -f "$c" ] || continue
     [ "$(_ws_pe_machine "$c")" = "8664" ] || continue
-    out="$("$c" --list-runtimes 2>/dev/null)" || continue
+    # Bounded and tree-killed like every other external call here.
+    out="$(_ws_run_for "$WIN_DOTNET_PROBE_TIMEOUT" "$c" --list-runtimes)" || continue
     if grep -qE '^Microsoft\.NETCore\.App ([89]|[1-9][0-9])\.' <<<"$out"; then
       WIN_DOTNET_X64="$c"
       return 0
@@ -876,6 +1017,14 @@ win_sign_decision() {
   return 0
 }
 
+# _ws_meta_path -- $OAM_WIN_SIGN_METADATA in Unix spelling, unchecked (empty
+# when unset): for redaction, which must work on a half-broken config too.
+_ws_meta_path() {
+  local m="${OAM_WIN_SIGN_METADATA:-}"
+  if [ -n "$m" ] && command -v cygpath >/dev/null 2>&1; then m="$(cygpath -u "$m")"; fi
+  printf '%s\n' "$m"
+}
+
 # _ws_metadata -- the metadata.json path, Unix spelling, checked for the three
 # fields the dlib needs. Values are never printed: they identify the account.
 _ws_metadata() {
@@ -890,22 +1039,24 @@ _ws_metadata() {
   printf '%s\n' "$m"
 }
 
-# _ws_timeout_ok -- WIN_SIGN_TIMEOUT is a positive number of seconds, and
-# timeout(1) is there to enforce it.
+# _ws_timeout_ok -- WIN_SIGN_TIMEOUT is a whole number of seconds in
+# 1..WIN_SIGN_TIMEOUT_MAX. Capped, not merely positive: a 20-digit value
+# overflows sleep's arithmetic (GNU timeout, measured, reported 124 -- "timed
+# out" -- for a command that exited normally), and no call here should get
+# anywhere near an hour.
 _ws_timeout_ok() {
-  [[ "$WIN_SIGN_TIMEOUT" =~ ^[1-9][0-9]*$ ]] \
-    || { _rs_fail "OAM_WIN_SIGN_TIMEOUT must be a positive number of seconds, not '$WIN_SIGN_TIMEOUT'"; return 1; }
-  command -v timeout >/dev/null 2>&1 \
-    || { _rs_fail "timeout(1) is not on PATH -- it bounds every signtool call"; return 1; }
+  if [[ "$WIN_SIGN_TIMEOUT" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$WIN_SIGN_TIMEOUT" -le "$WIN_SIGN_TIMEOUT_MAX" ]; then return 0; fi
+  _rs_fail "OAM_WIN_SIGN_TIMEOUT must be a whole number of seconds from 1 to $WIN_SIGN_TIMEOUT_MAX, not '$WIN_SIGN_TIMEOUT'"
+  return 1
 }
 
 # win_sign_tools -- every local prerequisite, none of them network.
 win_sign_tools() {
+  _ws_timeout_ok || return 1
   locate_signtool_x64 || return 1
   locate_artifact_signing_dlib || return 1
   probe_dotnet_x64 || return 1
   [ -f "$WIN_VERIFY_PS1" ] || { _rs_fail "$WIN_VERIFY_PS1 is missing"; return 1; }
-  _ws_timeout_ok || return 1
   [ -n "${OAM_WIN_SIGN_PUBLISHER:-}" ] || { _rs_fail "OAM_WIN_SIGN_PUBLISHER is not set -- the CN/O every signature must carry"; return 1; }
   _ws_metadata >/dev/null || return 1
   return 0
@@ -931,7 +1082,7 @@ win_sign() {
            "$(_ws_winpath "$file")")" || rc=$?
   [ "$rc" = "0" ] && return 0
   # Redacted: /v echoes metadata.json, and metadata.json names the account.
-  printf '%s\n' "$out" | tr -d '\r' | tail -n 15 | _ws_redact "$meta" | sed 's/^/        signtool: /' >&2
+  printf '%s\n' "$out" | _ws_show signtool "$meta"
   if _ws_timed_out "$rc"; then
     _rs_fail "signtool sign for $file did not finish in ${WIN_SIGN_TIMEOUT}s and was killed (output above) -- the Artifact Signing endpoint or the TSA ($WIN_SIGN_TSA) is unreachable or stalled; OAM_WIN_SIGN_TIMEOUT sets the limit"
   else
@@ -958,7 +1109,7 @@ win_verify() {
   out="$(MSYS_NO_PATHCONV=1 _ws_run "$WIN_SIGNTOOL" verify /pa /v "$(_ws_winpath "$file")")" || rc=$?
   if [ "$rc" != "0" ]; then
     if _ws_timed_out "$rc"; then late=" -- killed after ${WIN_SIGN_TIMEOUT}s"; fi
-    printf '%s\n' "$out" | tr -d '\r' | tail -n 15 | sed 's/^/        signtool: /' >&2
+    printf '%s\n' "$out" | _ws_show signtool "$(_ws_meta_path)"
     _rs_fail "signtool verify /pa rejects $file (output above)$late"
     return 1
   fi
@@ -968,7 +1119,7 @@ win_verify() {
            -Path "$(_ws_winpath "$file")" -Publisher "$pub" -Intermediate "$WIN_SIGN_INTERMEDIATE")" || rc=$?
   if [ "$rc" != "0" ]; then
     if _ws_timed_out "$rc"; then late=" -- killed after ${WIN_SIGN_TIMEOUT}s"; fi
-    printf '%s\n' "$out" | tr -d '\r' | sed 's/^/        /' >&2
+    printf '%s\n' "$out" | _ws_show verify "$(_ws_meta_path)"
     _rs_fail "Authenticode verification failed for $file (above)$late -- whatever signtool reported, the file on disk does not carry the required signature"
     return 1
   fi
@@ -996,7 +1147,9 @@ win_pe_signature_state() {
   esac
   ndirs="$(od -An -tu4 -j"$((dd - 4))" -N4 "$f" 2>/dev/null | tr -d ' \n')"
   [[ "$ndirs" =~ ^[0-9]+$ ]] || { echo unknown; return 0; }
-  if [ "$ndirs" -le 4 ]; then echo unsigned; return 0; fi
+  # Too few directories to HAVE entry 4 is not "unsigned": a real linker
+  # writes 16, so this is a file the check does not understand. Fail closed.
+  if [ "$ndirs" -le 4 ]; then echo unknown; return 0; fi
   size="$(od -An -tu4 -j"$((dd + 4 * 8 + 4))" -N4 "$f" 2>/dev/null | tr -d ' \n')"
   [[ "$size" =~ ^[0-9]+$ ]] || { echo unknown; return 0; }
   if [ "$size" -gt 0 ]; then echo signed; else echo unsigned; fi
@@ -1055,13 +1208,21 @@ win_make_unsigned_pe() {
 # runtime and the TSA -- each of which would otherwise fail on the first
 # release asset, after the tag is public.
 win_sign_preflight() {
-  local d out
+  local d out rc
   win_sign_tools || return 1
   command -v "$WIN_AZ" >/dev/null 2>&1 \
     || { _rs_fail "the Azure CLI ($WIN_AZ) is not on PATH -- install it, then run 'az login'"; return 1; }
-  if ! out="$("$WIN_AZ" account get-access-token --resource "$WIN_SIGN_RESOURCE" -o none </dev/null 2>&1)"; then
-    printf '%s\n' "$out" | tr -d '\r' | tail -n 5 | sed 's/^/        az: /' >&2
-    _rs_fail "no Azure token for $WIN_SIGN_RESOURCE -- run 'az login' as the identity holding the Artifact Signing Certificate Profile Signer role, then re-run"
+  # Bounded and tree-killed (az is a script around python.exe), and its
+  # output redacted: a stale session names the signed-in account.
+  rc=0
+  out="$(_ws_run "$WIN_AZ" account get-access-token --resource "$WIN_SIGN_RESOURCE" -o none)" || rc=$?
+  if [ "$rc" != "0" ]; then
+    printf '%s\n' "$out" | _ws_show az "$(_ws_meta_path)"
+    if _ws_timed_out "$rc"; then
+      _rs_fail "az account get-access-token did not finish in ${WIN_SIGN_TIMEOUT}s and was killed (output above) -- Entra ID is unreachable or az is stuck; if it persists, run 'az login' again. OAM_WIN_SIGN_TIMEOUT sets the limit"
+    else
+      _rs_fail "no Azure token for $WIN_SIGN_RESOURCE -- run 'az login' as the identity holding the Artifact Signing Certificate Profile Signer role, then re-run"
+    fi
     return 1
   fi
   d="$(mktemp -d "${TMPDIR:-/tmp}/oam-winsign-probe.XXXXXX")" || { _rs_fail "could not create a temp dir"; return 1; }

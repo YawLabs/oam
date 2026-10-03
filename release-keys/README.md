@@ -242,14 +242,19 @@ the timestamp server is down and the release cannot wait.
 
 `scripts/release-upload-local-arm64.sh` follows the same rules, with one
 addition. If it will not sign, and the release's current arm64 asset is
-signed, it stops before building. Replacing a signed binary with an unsigned
-one takes `OAM_SKIP_WIN_SIGN=1`.
+signed, it stops before building, and checks again right before uploading.
+Replacing a signed binary with an unsigned one takes `OAM_SKIP_WIN_SIGN=1`.
 
-Each signtool call is limited to `OAM_WIN_SIGN_TIMEOUT` seconds (default
-300), because signtool waits forever on an endpoint that does not answer.
-When signing fails, the output is printed with the metadata values replaced
-by `<redacted>`. signtool's verbose output repeats `metadata.json`, so this
-keeps the account names out of anything you paste into an issue.
+Each signtool, verify and `az` call is limited to `OAM_WIN_SIGN_TIMEOUT`
+seconds (default 300, at most 3600), because signtool waits forever on an
+endpoint that does not answer. A call that runs out of time is killed along
+with every process it started.
+
+When a call fails, its output is printed redacted: the metadata values become
+`<redacted>`, and so do email addresses, GUIDs (tenant, subscription, trace
+and correlation IDs) and your user profile path. signtool's verbose output
+repeats `metadata.json`, and `az` names the signed-in account, so this keeps
+both out of anything you paste into an issue.
 
 To check a downloaded binary by hand, in PowerShell:
 
