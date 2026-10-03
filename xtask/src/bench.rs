@@ -1604,7 +1604,10 @@ fn merge_filtered_run(
             .iter()
             .flat_map(|a| a.iter().cloned())
             .map(|mut row| {
-                if let Some(rt) = fresh_runtimes.iter().find(|rt| rt["name"] == row["runtime"]) {
+                if let Some(rt) = fresh_runtimes
+                    .iter()
+                    .find(|rt| rt["name"] == row["runtime"])
+                {
                     row["version"] = rt["version"].clone();
                 }
                 row
@@ -2702,7 +2705,10 @@ mod filtered_runs {
         assert_eq!(names, ["oam", "node", "bun"]);
         assert_eq!(merged["runtimes"][0]["version"], "oam 0.9.0");
         let md = build_markdown(&merged);
-        assert!(md.contains("cold-start/oam at `01bee57` (oam 0.13.0)"), "{md}");
+        assert!(
+            md.contains("cold-start/oam at `01bee57` (oam 0.13.0)"),
+            "{md}"
+        );
         assert!(md.contains("cold-start/bun at `01bee57` (1.2)"), "{md}");
     }
 
