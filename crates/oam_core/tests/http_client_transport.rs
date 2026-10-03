@@ -6,7 +6,9 @@
 mod common;
 
 use oam_core::net_connect::PinAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::AsyncWriteExt as _;
 
 use bytes::Bytes;
 use common::*;
@@ -15,7 +17,9 @@ use http_body_util::BodyExt;
 use hyper_util::client::proxy::matcher::Matcher;
 use oam_core::OpOutcome;
 use oam_core::http_client::transport::{channel_body, empty_body, full_body};
-use oam_core::http_client::{HttpTransport, ProxySource, ReqBody, Route, SendError, TlsSource};
+use oam_core::http_client::{
+    Alpn, HttpTransport, ProxySource, ReqBody, Route, SendError, TlsRange, TlsSource,
+};
 
 const ATTEMPT: Duration = Duration::from_millis(250);
 
@@ -292,7 +296,8 @@ async fn https_via_proxy_sends_connect_with_user_agent_and_auth() {
     .await;
 }
 
-/// h2 is negotiated with the origin inside a CONNECT tunnel.
+/// h2 is negotiated with the origin inside a CONNECT tunnel, for a route that
+/// offers it (`allowH2`).
 #[tokio::test(flavor = "multi_thread")]
 async fn https_through_connect_tunnel_negotiates_h2() {
     within(async {
@@ -302,7 +307,9 @@ async fn https_through_connect_tunnel_negotiates_h2() {
             .https(format!("http://127.0.0.1:{}", proxy.port))
             .build();
         let transport = transport(ProxySource::Fixed(Box::new(rules)));
-        let route = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
+        let route = transport
+            .route(false, ATTEMPT, TlsRange::Both)
+            .with_alpn(Alpn::AllowH2);
         let target = format!("https://localhost:{}/x", origin.port);
         let response = send(&transport, &route, get(&target)).await.unwrap();
         assert_eq!(response.status(), 200);
@@ -327,7 +334,9 @@ async fn an_h2_request_sends_the_authority_without_a_host_field() {
     within(async {
         let origin = serve_h2_tls("h2 ok").await;
         let transport = transport(ProxySource::None);
-        let route = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
+        let route = transport
+            .route(false, ATTEMPT, TlsRange::Both)
+            .with_alpn(Alpn::AllowH2);
         let target = format!("https://localhost:{}/x", origin.port);
         let mut request = get(&target);
         // What ClientRequest writes: the host, and the port unless it is the
@@ -361,7 +370,9 @@ async fn an_h2_host_header_that_overrides_the_authority_becomes_it() {
     within(async {
         let origin = serve_h2_tls("h2 ok").await;
         let transport = transport(ProxySource::None);
-        let route = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
+        let route = transport
+            .route(false, ATTEMPT, TlsRange::Both)
+            .with_alpn(Alpn::AllowH2);
         let target = format!("https://localhost:{}/x", origin.port);
         let mut request = get(&target);
         request
@@ -387,7 +398,9 @@ async fn an_authored_h2_request_keeps_the_authority_it_wrote() {
     within(async {
         let origin = serve_h2_tls("h2 ok").await;
         let transport = transport(ProxySource::None);
-        let route = transport.route(false, ATTEMPT, oam_core::http_client::TlsRange::Both);
+        let route = transport
+            .route(false, ATTEMPT, TlsRange::Both)
+            .with_alpn(Alpn::AllowH2);
         let target = format!("https://localhost:{}/x", origin.port);
         let mut request = request("GET", &target, empty_body());
         *request.version_mut() = http::Version::HTTP_2;
@@ -633,6 +646,255 @@ async fn request_body_shapes_match_today() {
         assert_eq!(seen[3].head.get("transfer-encoding"), Some("chunked"));
         assert!(!seen[3].head.has("content-length"));
         assert_eq!(seen[3].body, b"abcde");
+    })
+    .await;
+}
+
+/// An https origin that records the ALPN list each client hello offers
+/// (`None`: no ALPN extension), selects none, and answers one HTTP/1.1
+/// request per connection.
+async fn alpn_recording_origin() -> (Server, Arc<Mutex<Vec<Option<Vec<String>>>>>) {
+    let offers = Arc::new(Mutex::new(Vec::new()));
+    let certs = rustls_pemfile::certs(&mut TLS_TEST_LEAF_CERT.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let key = rustls_pemfile::private_key(&mut TLS_TEST_LEAF_KEY.as_bytes())
+        .unwrap()
+        .unwrap();
+    let config = Arc::new(
+        rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(rustls::ALL_VERSIONS)
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .unwrap(),
+    );
+    let recorded = offers.clone();
+    let server = serve(move |conn, _, _| {
+        let config = config.clone();
+        let offers = recorded.clone();
+        async move {
+            let lazy =
+                tokio_rustls::LazyConfigAcceptor::new(rustls::server::Acceptor::default(), conn.io);
+            let Ok(start) = lazy.await else {
+                return;
+            };
+            let offered = start.client_hello().alpn().map(|names| {
+                names
+                    .map(|name| String::from_utf8_lossy(name).into_owned())
+                    .collect()
+            });
+            offers.lock().unwrap().push(offered);
+            let Ok(tls) = start.into_stream(config).await else {
+                return;
+            };
+            let mut conn = Conn::new(tls);
+            if conn.head().await.is_some() {
+                let _ = conn
+                    .io
+                    .write_all(&response("200 OK", &[("connection", "close")], b"ok"))
+                    .await;
+            }
+        }
+    })
+    .await;
+    (server, offers)
+}
+
+/// What a route offers an https origin by ALPN (#176): `http/1.1` alone
+/// until told -- node's fetch, whose undici connector offers that unless a
+/// dispatcher sets `allowH2` -- `http/1.1, h2` with `Alpn::AllowH2`, in
+/// undici's order, and no ALPN extension at all with `Alpn::None`, as
+/// node's https.request offers none. The transport used to offer
+/// `h2, http/1.1` to every origin, whichever client asked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_offers_the_alpn_list_it_was_given() {
+    within(async {
+        let (origin, offers) = alpn_recording_origin().await;
+        let transport = transport(ProxySource::None);
+        let target = format!("https://localhost:{}/", origin.port);
+        for alpn in [
+            None,
+            Some(Alpn::Http1),
+            Some(Alpn::AllowH2),
+            Some(Alpn::None),
+        ] {
+            let route = transport.route(false, ATTEMPT, TlsRange::Both);
+            let route = match alpn {
+                Some(alpn) => route.with_alpn(alpn),
+                None => route,
+            };
+            let response = send(&transport, &route, get(&target)).await.unwrap();
+            assert_eq!(response.version(), http::Version::HTTP_11);
+            assert_eq!(body_text(response).await, "ok");
+        }
+        let h1 = Some(vec!["http/1.1".to_string()]);
+        assert_eq!(
+            *offers.lock().unwrap(),
+            vec![
+                h1.clone(),
+                h1,
+                Some(vec!["http/1.1".to_string(), "h2".to_string()]),
+                None,
+            ]
+        );
+    })
+    .await;
+}
+
+/// A pooled connection is reused only by a request that offers what it was
+/// opened with: after an `allowH2` request leaves its h2 session to an
+/// h2-only origin in the pool, a request offering `http/1.1` alone dials
+/// its own connection -- which that origin refuses, as it refuses node's
+/// fetch -- rather than riding the h2 session.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pooled_h2_session_is_not_reused_by_a_request_that_did_not_offer_h2() {
+    within(async {
+        let origin = serve_h2_tls("h2 ok").await;
+        let transport = transport(ProxySource::None);
+        let target = format!("https://localhost:{}/x", origin.port);
+        let allow_h2 = transport
+            .route(false, ATTEMPT, TlsRange::Both)
+            .with_alpn(Alpn::AllowH2);
+        let response = send(&transport, &allow_h2, get(&target)).await.unwrap();
+        assert_eq!(response.version(), http::Version::HTTP_2);
+        assert_eq!(body_text(response).await, "h2 ok");
+        let plain = transport.route(false, ATTEMPT, TlsRange::Both);
+        let err = send(&transport, &plain, get(&target)).await.unwrap_err();
+        match err.to_outcome(&url(&target)) {
+            OpOutcome::NodeFailed { code, .. } => {
+                assert_eq!(code, "ERR_SSL_TLSV1_ALERT_NO_APPLICATION_PROTOCOL", "{err}");
+            }
+            other => panic!("{other:?} ({err})"),
+        }
+        assert_eq!(origin.accepts(), 2, "the h1-only request dialled its own");
+        // The h2 session is still there for the next allowH2 request.
+        let response = send(&transport, &allow_h2, get(&target)).await.unwrap();
+        assert_eq!(response.version(), http::Version::HTTP_2);
+        assert_eq!(origin.accepts(), 2);
+    })
+    .await;
+}
+
+/// The connection a followed redirect came on is not pooled when the next
+/// hop keeps a method that is not idempotent (#155): such a hop -- a POST a
+/// 307 or 308 sends on, a PATCH a 302 does, a POST a 302 does under
+/// undici.request's rules -- is never written onto the connection a server
+/// may be closing right behind its 3xx, as it could not be sent again. A hop
+/// that may be resent keeps the pooled connection (no cost on that path),
+/// and so does a 3xx nobody follows or one without a Location. The server
+/// keeps every connection open, so whether the 3xx's connection was pooled
+/// is whether the next request needed a second one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_redirect_whose_next_hop_cannot_be_resent_does_not_pool_its_connection() {
+    use oam_core::http_client::redirect::Rules;
+    within(async {
+        let cases: [(&str, &str, bool, Option<Rules>, bool); 11] = [
+            (
+                "POST",
+                "307 Temporary Redirect",
+                true,
+                Some(Rules::Fetch),
+                false,
+            ),
+            (
+                "POST",
+                "308 Permanent Redirect",
+                true,
+                Some(Rules::Fetch),
+                false,
+            ),
+            ("PATCH", "302 Found", true, Some(Rules::Fetch), false),
+            ("POST", "302 Found", true, Some(Rules::Undici), false),
+            // The hop is a GET.
+            ("POST", "302 Found", true, Some(Rules::Fetch), true),
+            ("POST", "303 See Other", true, Some(Rules::Undici), true),
+            // Idempotent hops.
+            (
+                "GET",
+                "307 Temporary Redirect",
+                true,
+                Some(Rules::Fetch),
+                true,
+            ),
+            (
+                "PUT",
+                "308 Permanent Redirect",
+                true,
+                Some(Rules::Fetch),
+                true,
+            ),
+            // Not followed: `redirect: 'manual'`, http.request.
+            ("POST", "307 Temporary Redirect", true, None, true),
+            // No Location: the 3xx is the response.
+            (
+                "POST",
+                "307 Temporary Redirect",
+                false,
+                Some(Rules::Fetch),
+                true,
+            ),
+            // Not a redirect.
+            ("POST", "200 OK", true, Some(Rules::Fetch), true),
+        ];
+        for (method, status, location, follows, pooled) in cases {
+            let server = serve_replies(move |_| {
+                let headers: &[(&str, &str)] = if location {
+                    &[("location", "/next")]
+                } else {
+                    &[]
+                };
+                response(status, headers, b"")
+            })
+            .await;
+            let transport = transport(ProxySource::None);
+            let route = transport.route(false, ATTEMPT, TlsRange::Both);
+            let target = format!("http://127.0.0.1:{}/x", server.port);
+            let first = transport
+                .send_following(&route, request(method, &target, empty_body()), follows)
+                .await
+                .unwrap();
+            body_text(first).await;
+            let_the_pool_settle().await;
+            let second = send(&transport, &route, get(&target)).await.unwrap();
+            body_text(second).await;
+            let label = format!("{method} answered {status} (location {location}, {follows:?})");
+            assert_eq!(server.seen().len(), 2, "{label}");
+            assert_eq!(
+                server.accepts(),
+                if pooled { 1 } else { 2 },
+                "{label}: the next request {} the connection",
+                if pooled { "reuses" } else { "does not reuse" }
+            );
+        }
+        // And a 3xx -- any response -- that says `Connection: close` is the
+        // last on its connection, whatever the hop's method (RFC 9112 s9.6).
+        let server = serve_replies(|_| {
+            response(
+                "302 Found",
+                &[("location", "/next"), ("connection", "close")],
+                b"",
+            )
+        })
+        .await;
+        let transport = transport(ProxySource::None);
+        let route = transport.route(false, ATTEMPT, TlsRange::Both);
+        let target = format!("http://127.0.0.1:{}/x", server.port);
+        for _ in 0..2 {
+            let response = transport
+                .send_following(&route, get(&target), Some(Rules::Fetch))
+                .await
+                .unwrap();
+            body_text(response).await;
+            let_the_pool_settle().await;
+        }
+        assert_eq!(
+            server.accepts(),
+            2,
+            "a connection the server closes is not reused"
+        );
     })
     .await;
 }

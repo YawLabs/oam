@@ -17,6 +17,10 @@
 #                              see build-remote.sh header).
 #       pulls:  $ART/oam-aarch64-apple-darwin
 #               $ART/oam-x86_64-apple-darwin      (unless OAM_SKIP_MAC_X64=1)
+#               both codesigned, verified and JIT-smoked on the Air
+#               (scripts/lib/mac-signing.sh), then checked here against the
+#               Air's dist/mac-sha256.txt, which is pulled into a sibling of
+#               $ART and never shipped
 #   --mode=measure             mac-measure: prep + conformance + node-suite
 #       pulls:  $ART/mac-arm64/{scorecard.json,CONFORMANCE.md,
 #                               node-suite-scorecard.json,CONFORMANCE-NODE.md}
@@ -28,6 +32,10 @@
 #                              stop there. Syncs nothing, builds nothing, prints
 #                              nothing on stdout; exit 0 means a build could
 #                              start. release-local.sh runs it before it tags.
+#                              For --mode=release it also checks the mac
+#                              signing decision, and with a pinned identity
+#                              runs provision-mac-signing.sh --check on the
+#                              Air (piped over ssh; nothing is synced).
 #
 # Usage (FAIL-CLOSED -- capture first, check the exit, THEN consume):
 #   ART=$(./scripts/build-platforms-tailnet.sh) || { echo "mac leg failed"; exit 1; }
@@ -41,6 +49,13 @@
 #                                            enrolled on the Air)
 #   OAM_REMOTE_DIR    remote checkout path  (default: oam-build, under $HOME)
 #   OAM_SKIP_MAC_X64=1  drop the x86_64-apple-darwin asset (release mode)
+#   OAM_SIGN_REQUIRED=1 refuse an ad-hoc (bootstrap) mac build: with no SHA-1
+#                       in scripts/mac-signing-identity.sha1, fail instead
+#   OAM_SKIP_MAC_SIGN=1 ship the mac binaries without the codesign step (loud;
+#                       honored even with OAM_SIGN_REQUIRED=1)
+#   Env does not cross ssh: these three are forwarded on the mac-release ssh
+#   line, each validated as 0 or 1 first. The keychain password stays on the
+#   Air (~/.oam-signing, see scripts/provision-mac-signing.sh).
 #
 # Prereqs:
 #   - Tailscale up on this box + the Air; ACLs allow SSH (22).
@@ -73,12 +88,23 @@ MAC_USER="${OAM_MAC_USER:?set OAM_MAC_USER to the account on the MacBook Air (NO
 MAC_KEY="${OAM_MAC_KEY:-$HOME/.ssh/yaw_mac_air}"
 REMOTE_DIR="${OAM_REMOTE_DIR:-oam-build}"
 SKIP_MAC_X64="${OAM_SKIP_MAC_X64:-0}"
+SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-0}"
+SKIP_MAC_SIGN="${OAM_SKIP_MAC_SIGN:-0}"
 
 RED='\033[0;31m'; GRN='\033[0;32m'; YEL='\033[1;33m'; CYA='\033[1;36m'; NC='\033[0m'
 ok()  { echo -e "${GRN}  [ok]${NC} $*" >&2; }
 warn(){ echo -e "${YEL}  [warn]${NC} $*" >&2; }
 fail(){ echo -e "${RED}  [fail]${NC} $*" >&2; exit 1; }
 step(){ echo -e "\n${CYA}=== $* ===${NC}" >&2; }
+
+# These go into the remote shell's command line verbatim (the mac-release ssh
+# call below), so nothing but 0 or 1 may reach it.
+for knob in "OAM_SKIP_MAC_X64=$SKIP_MAC_X64" "OAM_SIGN_REQUIRED=$SIGN_REQUIRED" "OAM_SKIP_MAC_SIGN=$SKIP_MAC_SIGN"; do
+  case "${knob#*=}" in
+    0|1) ;;
+    *) fail "${knob%%=*} must be 0 or 1, not '${knob#*=}' -- it is forwarded to the Mac's shell" ;;
+  esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -91,6 +117,14 @@ REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # operator when the Air cannot be used.
 # shellcheck source=lib/tailnet-helpers.sh
 . "$SCRIPT_DIR/lib/tailnet-helpers.sh"
+# mac_sign_decision for the preflight, mac_handback_check for the pulled
+# binaries. The pin is THIS checkout's: it is what the sync ships to the Air.
+# Read by the sourced lib (mac_pinned_sha1), which shellcheck does not follow
+# when run from the repo root, so it reports the variable as unused.
+# shellcheck disable=SC2034
+MAC_SIGNING_PIN_FILE="$REPO_DIR/scripts/mac-signing-identity.sha1"
+# shellcheck source=lib/mac-signing.sh
+. "$SCRIPT_DIR/lib/mac-signing.sh"
 
 RUNID="$(date +%Y%m%d-%H%M%S)"
 # $STAGE_DIR and $ARTIFACTS_DIR are created after the preflight, which needs
@@ -172,6 +206,22 @@ if [ "$PREFLIGHT_ONLY" != "1" ]; then
 fi
 ok "target: mac=$MAC_USER@$MAC_HOST (key: $MAC_KEY)"
 
+# How the release leg will sign, decided from the knobs and the committed pin
+# BEFORE anything touches the network: a bootstrap release under
+# OAM_SIGN_REQUIRED=1, or a malformed pin, is this checkout's problem, not the
+# Air's. The Air reaches the same decision from the same inputs.
+MAC_SIGN_DECISION=""
+if [ "$MODE" = "release" ]; then
+  MAC_SIGN_DECISION="$(mac_sign_decision)"
+  case "$MAC_SIGN_DECISION" in
+    skip:*)     warn "${MAC_SIGN_DECISION#skip:}" ;;
+    adhoc:*)    warn "${MAC_SIGN_DECISION#adhoc:}" ;;
+    identity:*) ok "mac signing: the pinned identity ${MAC_SIGN_DECISION#identity:}" ;;
+    fail:*)     fail "mac signing: ${MAC_SIGN_DECISION#fail:}" ;;
+    *)          fail "mac_sign_decision returned '$MAC_SIGN_DECISION' -- refusing to guess how the mac leg signs" ;;
+  esac
+fi
+
 # mac_tailnet_note  -- what this box's tailnet says about $MAC_HOST, as a
 # "\n  ..." continuation for a failure message. Prints nothing when that adds
 # nothing: no tailscale CLI here, or the Air is listed and not marked offline.
@@ -240,12 +290,34 @@ probe_out=$(ssh "${SSH_OPTS[@]}" "$MAC_USER@$MAC_HOST" true 2>&1) || {
 }
 ok "key auth OK on $MAC_USER@$MAC_HOST"
 
+# A pinned identity must be usable from an ssh session on the Air NOW, before
+# release-local.sh tags. Preflight syncs nothing, so the Air's copy of the
+# provision script may be a release old: THIS checkout's copy is piped to
+# `bash -s` instead (the script is written to survive that -- see its header).
+# `--check` unlocks the dedicated keychain, matches the certificate to the one
+# the Air recorded and makes a real probe signature; its stdout (keychain= and
+# sha1=) is captured, never passed through, so the stdout-silent contract holds.
+# Ad-hoc needs no keychain and skip needs nothing, so neither asks the Air.
+case "$MAC_SIGN_DECISION" in
+  identity:*)
+    mac_pin="${MAC_SIGN_DECISION#identity:}"
+    mac_check_out="$(ssh "${SSH_OPTS[@]}" "$MAC_USER@$MAC_HOST" 'bash -s -- --check' \
+      < "$SCRIPT_DIR/provision-mac-signing.sh")" \
+      || fail "the pinned mac signing identity $mac_pin is not usable on $MAC_USER@$MAC_HOST -- provision-mac-signing.sh --check said why, above.\n  First-time setup:  ssh <air> 'bash -s -- --generate' < scripts/provision-mac-signing.sh\n  Replacement Air:   ssh <air> 'bash -s -- --import <p12> <password-file>' < scripts/provision-mac-signing.sh\n  To ship without signing on purpose: OAM_SKIP_MAC_SIGN=1"
+    mac_have="$(printf '%s\n' "$mac_check_out" | sed -n 's/^sha1=//p' | head -n 1)"
+    [ "$mac_have" = "$mac_pin" ] \
+      || fail "the Air signs with certificate '${mac_have:-<none reported>}' but this checkout pins $mac_pin (scripts/mac-signing-identity.sha1). Restore the pinned identity on the Air (provision-mac-signing.sh --import), or update the pin in a change that says why"
+    ok "mac signing identity $mac_pin is usable on $MAC_USER@$MAC_HOST"
+    ;;
+esac
+
 if [ "$PREFLIGHT_ONLY" = "1" ]; then
   exit 0
 fi
 
 STAGE_DIR="$(mktemp -d -t oam-tailnet-build-$RUNID-XXXXXX)"
 ARTIFACTS_DIR="$STAGE_DIR/artifacts"
+HANDBACK_DIR="$STAGE_DIR/handback"
 mkdir -p "$STAGE_DIR/logs" "$ARTIFACTS_DIR"
 
 # --- build --------------------------------------------------------------------
@@ -272,11 +344,17 @@ build_mac(){
   else warn "could not read free disk on the Air -- headroom check skipped"; fi
   case "$MODE" in
     release)
-      ssh "${SSH_OPTS[@]}" "$hp" "cd $REMOTE_DIR && OAM_SKIP_MAC_X64=$SKIP_MAC_X64 bash scripts/build-remote.sh mac-release" || return 1
+      # The knobs were validated as 0|1 at the top: nothing else reaches this
+      # remote command line.
+      ssh "${SSH_OPTS[@]}" "$hp" "cd $REMOTE_DIR && OAM_SKIP_MAC_X64=$SKIP_MAC_X64 OAM_SIGN_REQUIRED=$SIGN_REQUIRED OAM_SKIP_MAC_SIGN=$SKIP_MAC_SIGN bash scripts/build-remote.sh mac-release" || return 1
       pull "$hp" "dist/oam-aarch64-apple-darwin" "$ARTIFACTS_DIR/" || return 1
       if [ "$SKIP_MAC_X64" != "1" ]; then
         pull "$hp" "dist/oam-x86_64-apple-darwin" "$ARTIFACTS_DIR/" || return 1
       fi
+      # Beside ARTIFACTS_DIR, never in it: release-local.sh copies binaries out
+      # of there, and the hand-back is not an asset.
+      mkdir -p "$HANDBACK_DIR" || return 1
+      pull "$hp" "dist/mac-sha256.txt" "$HANDBACK_DIR/" || return 1
       ;;
     measure)
       ssh "${SSH_OPTS[@]}" "$hp" "cd $REMOTE_DIR && bash scripts/build-remote.sh mac-measure" || return 1
@@ -323,6 +401,12 @@ case "$MODE" in
     if [ "$SKIP_MAC_X64" != "1" ]; then
       [ -f "$ARTIFACTS_DIR/oam-x86_64-apple-darwin" ] || fail "no mac-x64 binary staged"
     fi
+    # The pulled bytes must be the ones the Air signed, verified and JIT-smoked.
+    mac_names=(oam-aarch64-apple-darwin)
+    [ "$SKIP_MAC_X64" = "1" ] || mac_names+=(oam-x86_64-apple-darwin)
+    mac_handback_check "$HANDBACK_DIR/mac-sha256.txt" "$ARTIFACTS_DIR" "${mac_names[@]}" \
+      || fail "the pulled mac binaries do not match the Air's hand-back hashes -- see above"
+    ok "pulled mac binaries match the Air's hand-back hashes"
     ;;
   measure) [ -f "$ARTIFACTS_DIR/mac-arm64/node-suite-scorecard.json" ] || fail "no scorecard staged" ;;
   bench)   [ -f "$ARTIFACTS_DIR/mac-arm64/results.json" ] || fail "no bench results staged" ;;

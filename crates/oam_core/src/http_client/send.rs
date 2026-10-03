@@ -54,7 +54,7 @@ use super::decode::{self, MAX_CODINGS, Plan};
 use super::prepare::{self, PrepareError};
 use super::redirect::{self, Next};
 use super::sent::Dispatched;
-use super::tls_config::TlsRange;
+use super::tls_config::{Alpn, TlsRange};
 use super::transport::{channel_body, channel_body_then, empty_body, full_body};
 use super::{HttpTransport, NetCheck, NetTarget, ReqBody, Route};
 use crate::OpOutcome;
@@ -148,6 +148,12 @@ pub struct FetchRequest {
     pub tls_min_version: Option<String>,
     #[serde(default)]
     pub tls_max_version: Option<String>,
+    /// For an https URL, what the handshake offers by ALPN: `"http1"`
+    /// (absent: undici's `http/1.1`, for `fetch` and `undici.request`),
+    /// `"allow_h2"` (a dispatcher with undici's `allowH2`) or `"none"`
+    /// (`https.request`, which offers nothing in node). See [`Alpn`].
+    #[serde(default)]
+    pub alpn: Alpn,
     /// Handle of a [`super::sent`] signal to fire once the request has a
     /// connection: `http.request`'s, for node's `'finish'` (#193).
     #[serde(default)]
@@ -453,7 +459,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// RFC 9110 s9.2.2's idempotent methods: sending the request twice has the
 /// same effect on the server as sending it once, so a request whose response
 /// never started may be sent again.
-fn is_idempotent(method: &http::Method) -> bool {
+pub(super) fn is_idempotent(method: &http::Method) -> bool {
     *method == http::Method::GET
         || *method == http::Method::HEAD
         || *method == http::Method::PUT
@@ -526,6 +532,7 @@ pub async fn fetch(
         transport
             .route(req.lookup_hook, attempt_timeout, tls_range)
             .with_connect_timeout(connect_timeout_from_ms(req.connect_timeout_ms))
+            .with_alpn(req.alpn)
     };
     let headers_timeout = timeout_limit(req.headers_timeout_ms);
     let dispatched = match req.dispatched {
@@ -747,19 +754,33 @@ async fn run(
             );
             return OpOutcome::Json(payload.to_string());
         }
-        let mut hop_url = state.current.clone();
-        hop_url.set_fragment(None);
-
         // proxy-authorization is per hop and never carried: it is computed
-        // after the cross-origin strip, for this hop's proxy.
-        let mut hop_headers = state.carried.clone();
-        if let Some(auth) = state.transport.proxy_authorization(&state.route, &uri)
-            && !hop_headers.contains_key(PROXY_AUTHORIZATION)
-            && hop_headers.try_insert(PROXY_AUTHORIZATION, auth).is_err()
-        {
-            return OpOutcome::Failed(PrepareError::TooManyHeaders.to_string());
-        }
+        // after the cross-origin strip, for this hop's proxy. Only a hop that
+        // adds it gets a header map of its own; every other hop sends the
+        // carried map, copied once per attempt below and not once more here
+        // (#183: a plain request copied its headers twice).
+        let with_proxy_auth = match state.transport.proxy_authorization(&state.route, &uri) {
+            Some(auth) if !state.carried.contains_key(PROXY_AUTHORIZATION) => {
+                let mut headers = state.carried.clone();
+                if headers.try_insert(PROXY_AUTHORIZATION, auth).is_err() {
+                    return OpOutcome::Failed(PrepareError::TooManyHeaders.to_string());
+                }
+                Some(headers)
+            }
+            _ => None,
+        };
+        let hop_headers = with_proxy_auth.as_ref().unwrap_or(&state.carried);
 
+        // The rules a 3xx answer to this hop is followed by, if it is: the
+        // pool then keeps a next hop that could not be sent twice off the
+        // connection the 3xx came on (#155).
+        let follows = (state.redirect == RedirectMode::Follow).then_some(
+            if state.undici_head && !state.fetch_rules {
+                redirect::Rules::Undici
+            } else {
+                redirect::Rules::Fetch
+            },
+        );
         let mut retries = 0;
         let mut stale_resent = false;
         let response = loop {
@@ -795,7 +816,9 @@ async fn run(
             // an h1 connection the request went out on is closed (hyper shuts
             // a connection whose response nobody waits for), an h2 stream is
             // reset -- which is how the server learns the client left.
-            let send = state.transport.send(&state.route, request);
+            let send = state
+                .transport
+                .send_following(&state.route, request, follows);
             let headers_timeout = state.headers_timeout;
             let dispatched = state.dispatched.as_ref();
             let timed = async move {
@@ -865,6 +888,9 @@ async fn run(
                 // into a FIN that is still in flight sooner than node does;
                 // a FIN the kernel already holds is read before the write
                 // (`connector::EagerTcp`), and the request goes back UNSENT.
+                // A redirect hop that may not be resent never meets the FIN
+                // the 3xx's connection is closing with: it never takes that
+                // connection (`pool::retires_for_the_hop`).
                 Err(e)
                     if !stale_resent
                         && state.source.replayable()
@@ -882,6 +908,10 @@ async fn run(
                     if let Some(parse) = e.head_parse_outcome(state.undici_head) {
                         return parse;
                     }
+                    // The URL a failure names, without the fragment. Built
+                    // here, on the failure, rather than for every hop (#183).
+                    let mut hop_url = state.current.clone();
+                    hop_url.set_fragment(None);
                     return e.to_outcome(&hop_url);
                 }
             }
@@ -1062,10 +1092,13 @@ fn latin1(bytes: &[u8]) -> String {
 /// `statusText` / `statusMessage`: the one the server sent, an empty one
 /// included (#160). hyper keeps a phrase that is not the status code's
 /// canonical one as an extension, so without the extension the canonical
-/// phrase IS what was on the wire. HTTP/2 has no reason phrase, and node has
-/// no answer to copy (its fetch never negotiates h2): the canonical phrase
-/// stands in there.
+/// phrase IS what was on the wire. HTTP/2 has no reason phrase, and node's
+/// fetch over it -- a dispatcher with `allowH2` -- reports `''` (measured on
+/// v22.22.2 + undici 6.24.1).
 pub(super) fn reason_phrase<B>(response: &http::Response<B>) -> String {
+    if response.version() == http::Version::HTTP_2 {
+        return String::new();
+    }
     match response.extensions().get::<hyper::ext::ReasonPhrase>() {
         Some(reason) => latin1(reason.as_bytes()),
         None => response

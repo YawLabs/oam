@@ -16,7 +16,7 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 
 ## [Unreleased]
 
-Follow-ups to the 0.17.2 batch, across fs, undici and Buffer, web streams, zlib and http2:
+Follow-ups to the 0.17.2 batch, across fs, fetch, undici and Buffer, web streams, zlib and http2:
 each change below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Permissions
@@ -43,9 +43,22 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   `utf8Write` corrected to node's defaults and errors.
 - **zlib streams have `params()`**, which changes a deflate or deflateRaw stream's level
   after a sync flush, and a one-shot given `info: true` returns `{ buffer, engine }`.
+- **undici's `allowH2` opts a dispatcher into HTTP/2**: an `Agent`, `Pool` or `Client` with
+  `allowH2` (or `connect.allowH2`, which wins over it) offers ALPN `http/1.1, h2` and speaks
+  HTTP/2 to an origin that picks it, printing undici's `[UNDICI-H2]` warning once. (#176)
+- **`http2.createSecureServer` with `allowHTTP1` has `closeIdleConnections()`**, and its
+  `close()` closes idle HTTP/1.1 connections before it stops listening, as node's does, so a
+  keep-alive client no longer holds `close()` open. (#176)
+- **A `http-keepalive-latency` benchmark case**, sequential requests over one kept-alive
+  connection. (#183)
 
 ### Changed
 
+- **`fetch`, `undici.request` and `https.request` speak HTTP/1.1 to an https origin, as
+  node's do.** undici's connector offers ALPN `http/1.1` alone and `https.request` offers no
+  ALPN, so an h2-capable server answers them over HTTP/1.1; up to 0.17.1 every origin was
+  offered `h2, http/1.1`, and `fetch` (and `https.request`, whose `res.httpVersion` still said
+  `1.1`) was served over HTTP/2. A dispatcher with `allowH2` opts back in. (#176)
 - **`http2.createServer` serves through the same stream implementation as
   `createSecureServer`**, so it sends and receives trailers and an h2c request body streams
   as a secure one does. Its streams still have no `session`.
@@ -60,9 +73,33 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   any spelling of that address) on port 8080. A host-only entry (`fe80::1%1`) admits its
   zone on any port, for a raw socket as for a fetch, and text with a `%` that is not a
   zone-id address matches no entry.
+- **`process.loadEnvFile()` with no path named the resolved `.env` on Windows**
+  (`open 'C:\cwd\.env'`); node's binding opens its own `.env` untouched and says `open '.env'`.
+  A path given to it is still checked and named as fs names it: `loadEnvFile(42)` is
+  `ERR_INVALID_ARG_TYPE` instead of a read of descriptor 42, `loadEnvFile("")` fails on `''`
+  instead of reading `.env`, any failure to open is node's `ENOENT`, and a directory -- given,
+  or a `.env` that is one -- is node's `Contents of '<path>' should be a valid string.` on
+  Windows, Linux and macOS alike (refs #167)
+- **On Linux and macOS, `fs.readFile` / `readFileSync` / `fs.promises.readFile` of a directory
+  failed `EISDIR: ..., open '<path>'`**; open(2) admits a directory there, so the failure is the
+  read's, and it is node's `EISDIR: illegal operation on a directory, read` with no path, as it
+  already was on Windows.
 - **Over HTTP/2, a `fetch` response header value kept the whitespace around it**; it is trimmed
   as it is over HTTP/1, and the trimming is recorded as a divergence from node's `fetch`, which
   keeps trailing whitespace. (#182)
+- **`http2.connect` reported a server's GOAWAY as an EOF.** The session emits `'goaway'` with
+  the frame's code, last stream id and debug data, as node does; a stream above the last
+  stream id closes with `NGHTTP2_REFUSED_STREAM`, and a stream the server answered reads to
+  its end. (#185)
+- **A closed `http2.connect` session sent its GOAWAY only once its streams were done.** It
+  sends it as soon as it is closed, as node's does, so a session closed by a server's GOAWAY
+  now closes, and lets the process exit, when the server keeps the connection open. (#185)
+- **A `fetch` redirect hop that cannot be resent went out on the connection its 3xx came
+  on.** A `POST` after a `307` / `308` (or any non-idempotent hop) dials a connection of its
+  own, so it no longer fails when the server closes the connection behind the redirect. (#155)
+- **undici accepted a non-boolean `allowH2`.** A dispatcher refuses one with
+  `InvalidArgumentError` (`allowH2 must be a valid boolean value`), as undici's `Client`
+  does; `allowH2: 'yes'` used to turn HTTP/2 on. (#176)
 - **undici from npm hung** on `await WebAssembly.compile()`. V8's foreground tasks (async
   WebAssembly compile and instantiate, `Atomics.waitAsync`, `FinalizationRegistry` cleanup,
   GC idle tasks) now run on the isolate's event loop, on the main thread and in workers, so

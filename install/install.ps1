@@ -4,8 +4,9 @@
 #
 # Downloads the release binary for this arch from GitHub Releases, verifies it,
 # installs it to %LOCALAPPDATA%\oam\bin, and adds that dir to the user PATH. No
-# admin. The binaries themselves are not Authenticode-signed yet; what is
-# signed is the release, exactly as install.sh checks it:
+# admin. From v0.18.0 the binaries are also Authenticode-signed, which this
+# script does not check yet (see the hook below); what it verifies is the
+# signed release, exactly as install.sh checks it:
 #
 #   v0.18.0 and later   RELEASE-MANIFEST must carry a RELEASE-MANIFEST.sig that
 #                       `ssh-keygen -Y verify` accepts against the release keys
@@ -438,8 +439,10 @@ try {
   }
 
   # --- Authenticode hook (INACTIVE) ---------------------------------------------
-  # Authenticode signing is not live yet (signing plan 4.1 / rollout step 5),
-  # so today this checks nothing. When it goes live: set
+  # The release signs both .exe assets with Authenticode from v0.18.0 (signing
+  # plan 4.1 / rollout step 5), but this check stays off until a signed release
+  # has shipped and its publisher and intermediate have been confirmed against
+  # it, so today this checks nothing. Then: set
   # $firstAuthenticodeTag to the first tag signed with it, and every tag from
   # there on must be Valid, signed by oam's publisher, under the "Microsoft ID
   # Verified Code Signing PCA 2021" intermediate. Never pin the leaf
