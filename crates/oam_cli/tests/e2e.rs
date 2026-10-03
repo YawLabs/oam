@@ -8496,7 +8496,10 @@ wrapper saw 1"##;
 /// MockAgent, active or not, and one wrapped in a RetryAgent or composed
 /// (neither carries `isMockActive`), an Agent with options -- except the
 /// plain `new Agent()` a copy installs when it loads, which dispatches as
-/// oam's transport does and is gone around. `getGlobalDispatcher()` returns
+/// oam's transport does and is gone around -- whatever a minifier made of
+/// its default factory (until the review of #206 a terser-minified copy's,
+/// `1===n.connections`, was taken for a foreign factory and every fetch in
+/// the process failed). `getGlobalDispatcher()` returns
 /// the foreign one, as in node, and the shim's setGlobalDispatcher() writes
 /// the slot, so the last one installed wins; a request given its own
 /// dispatcher goes as usual. Up to 0.17.1 oam's fetch ignored the slot, and
@@ -8548,9 +8551,25 @@ class MockAgent extends DispatcherBase { get isMockActive() { return true; } }
 class RetryAgent extends DispatcherBase { constructor(agent) { super(); this.agent = agent; } }
 class ComposedDispatcher extends DispatcherBase { #dispatcher; constructor(d) { super(); this.#dispatcher = d; } }
 class SubAgent extends UndiciAgent {}
+// A copy minified by terser: its default factory reads `1===n.connections`.
+function minifiedDefaultFactory(e, n) { return n && 1 === n.connections ? new Client(e, n) : new Pool(e, n); }
+class MinifiedAgent extends DispatcherBase {
+  constructor({ factory = minifiedDefaultFactory, maxRedirections = 0, connect, ...options } = {}) {
+    super();
+    this[kOptions] = { ...options, connect };
+    this[kOptions].interceptors = options.interceptors ? { ...options.interceptors } : undefined;
+    this[kMaxRedirections] = maxRedirections;
+    this[kFactory] = factory;
+  }
+  [kDispatch]() { throw new Error('not called'); }
+}
 
 install(new UndiciAgent());
 await get('plain-agent-a-copy-installs-on-load');
+install(new MinifiedAgent());
+await get('plain-agent-of-a-minified-copy');
+install(new UndiciAgent({ factory: minifiedDefaultFactory }));
+await get('agent-given-another-copys-default-factory');
 const mock = new MockAgent();
 install(mock);
 await get('mock-agent');
@@ -8582,6 +8601,8 @@ server.close();
         stdout.trim().replace("\r\n", "\n"),
         format!(
             "plain-agent-a-copy-installs-on-load 200 real\n\
+             plain-agent-of-a-minified-copy 200 real\n\
+             agent-given-another-copys-default-factory {refused}\n\
              mock-agent {refused}\n\
              getGlobalDispatcher is the mock true\n\
              retry-agent-over-a-mock {refused}\n\
@@ -8592,7 +8613,7 @@ server.close();
              own-dispatcher 200 real\n\
              slot holds the shim dispatcher true true\n\
              shim-set-last 200 real\n\
-             reached [\"/plain-agent-a-copy-installs-on-load\",\"/own-dispatcher\",\"/shim-set-last\"]"
+             reached [\"/plain-agent-a-copy-installs-on-load\",\"/plain-agent-of-a-minified-copy\",\"/own-dispatcher\",\"/shim-set-last\"]"
         )
     );
 }

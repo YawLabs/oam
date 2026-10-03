@@ -2322,8 +2322,6 @@
   const objectGetOwnPropertySymbols = Object.getOwnPropertySymbols;
   const objectHasOwn = Object.hasOwn;
   const reflectOwnKeys = Reflect.ownKeys;
-  const functionSource = Function.prototype.call.bind(Function.prototype.toString);
-  const regExpTest = Function.prototype.call.bind(RegExp.prototype.test);
   // The value of `obj`'s own symbol-keyed property whose symbol reads
   // `description` (undici's private symbols are unregistered, one set per
   // copy), or `missing`.
@@ -2342,6 +2340,15 @@
   // no `interceptors`, no timeouts or limits), no redirections and the
   // default factory (a Pool per origin, a Client for `connections: 1`), not
   // one that hands requests to something else.
+  //
+  // The default factory is told by identity, not by its source: it is the
+  // one that copy's `new Agent()` gets (`factory = defaultFactory`), so a
+  // fresh Agent of the same class -- which opens nothing until it
+  // dispatches -- carries the very function. Its source depends on the
+  // minifier (esbuild keeps `e.connections===1`, terser writes
+  // `1===n.connections`), and a source test that missed one form took a
+  // minified bundle's own startup Agent for a foreign dispatcher and failed
+  // every fetch in the process.
   function judgePlainUndiciAgent(value) {
     const proto = objectGetPrototypeOf(value);
     if (proto === null || objectHasOwn(value, "dispatch") || objectHasOwn(proto, "dispatch")) return false;
@@ -2355,13 +2362,10 @@
     if (redirections !== missing && redirections !== 0) return false;
     const factory = ownSymbolValue(value, "factory");
     if (typeof factory !== "function") return false;
-    let source;
-    try {
-      source = functionSource(factory);
-    } catch {
-      return false;
-    }
-    return regExpTest(/\.connections\s*={2,3}\s*1\b/, source);
+    const Agent = proto.constructor;
+    if (typeof Agent !== "function" || Agent.prototype !== proto) return false;
+    const fresh = new Agent();
+    return objectGetPrototypeOf(fresh) === proto && ownSymbolValue(fresh, "factory") === factory;
   }
   function isPlainUndiciAgent(value) {
     if (value === null || typeof value !== "object") return false;

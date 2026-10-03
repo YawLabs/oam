@@ -1764,7 +1764,10 @@ what reaches them). What differs:
   ignored, so every such mock failed open). The one exception is the plain `new Agent()` a
   copy installs when it loads into an empty slot (node's own undici fills the slot at
   startup, oam does not): it dispatches as oam's transport does, so `fetch` goes around it
-  and runs as usual. `getGlobalDispatcher()` returns the other copy's dispatcher, as in node
+  and runs as usual. It is told by its shape and by its factory being the very one a fresh
+  `new Agent()` of that copy gets, however a minifier wrote it (until the review of #206 a
+  source test missed terser's form, and a terser-minified bundle's startup Agent failed
+  every `fetch`); an Agent given any `factory` of its own is refused. `getGlobalDispatcher()` returns the other copy's dispatcher, as in node
   (that one's own `request()` runs its `dispatch()`), and the shim's own otherwise, also
   while the slot holds that plain Agent, where node returns the Agent. The shim's
   `setGlobalDispatcher()` writes the slot, so the last dispatcher installed by either copy
