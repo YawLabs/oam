@@ -76,6 +76,12 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   failed `EISDIR: ..., open '<path>'`**; open(2) admits a directory there, so the failure is the
   read's, and it is node's `EISDIR: illegal operation on a directory, read` with no path, as it
   already was on Windows.
+- **`fs.readFile` / `writeFile` / `appendFile` (sync, callback and promise) reported a failed
+  read or write as a failed open**: `EBUSY: resource busy or locked, open '<path>'` for a file
+  another process has a region of locked, where node says `EBUSY: resource busy or locked, read`
+  (or `write`) with no path. Only a failed open now names `open` and the path, as in node -- and
+  `process.loadEnvFile()` of such a file is node's `Contents of '<path>' should be a valid
+  string.` instead of a false `ENOENT`.
 - **Over HTTP/2, a `fetch` response header value kept the whitespace around it**; it is trimmed
   as it is over HTTP/1, and the trimming is recorded as a divergence from node's `fetch`, which
   keeps trailing whitespace. (#182)

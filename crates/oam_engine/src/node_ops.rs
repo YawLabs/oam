@@ -715,6 +715,28 @@ fn throw_fs_error(
     );
 }
 
+/// Throw a failed whole-file operation (readFile / writeFile / appendFile) as
+/// node does: the open half names syscall `open` and the path, the read or
+/// write half names `read` / `write` and no path (`oam_core::whole_file_error`).
+fn throw_whole_file_error(
+    scope: &mut v8::PinScope<'_, '_>,
+    site: oam_core::FsSite<'_>,
+    path: &str,
+    error: &oam_core::WholeFileError,
+) {
+    let failure = oam_core::whole_file_error(site, path, error);
+    let shown = oam_core::fs_error_path(path);
+    let message = oam_core::fs_error_message(failure, &shown, error.io());
+    throw_system_error(
+        scope,
+        failure.code,
+        &message,
+        failure.syscall,
+        failure.has_path.then_some(&*shown),
+        error.io(),
+    );
+}
+
 /// Throw node's system-error shape for an operation on an ALREADY-OPEN
 /// descriptor: no `path` property, no path segment in the message, and a
 /// wrong-mode denial reported as EBADF rather than EACCES (see
@@ -6083,13 +6105,13 @@ fn op_fs_read_file_sync(
     }
     // Always raw bytes: encodings decode JS-side via Buffer#toString, so
     // 'base64'/'hex'/'latin1' behave instead of utf8-lossy garbage.
-    match std::fs::read(&path) {
+    match oam_core::read_whole_file(&path) {
         Ok(bytes) => {
             if let Some(value) = bytes_to_uint8array(scope, bytes) {
                 rv.set(value);
             }
         }
-        Err(e) => throw_fs_error(scope, oam_core::FsSite::ReadFile, "open", &path, &e),
+        Err(e) => throw_whole_file_error(scope, oam_core::FsSite::ReadFile, &path, &e),
     }
 }
 
@@ -6105,13 +6127,13 @@ fn op_fs_read_file_utf8_sync(
     if !check_read_perm(scope, &path) {
         return;
     }
-    match std::fs::read(&path) {
+    match oam_core::read_whole_file(&path) {
         Ok(bytes) => {
             if let Some(s) = v8::String::new_from_utf8(scope, &bytes, v8::NewStringType::Normal) {
                 rv.set(s.into());
             }
         }
-        Err(e) => throw_fs_error(scope, oam_core::FsSite::ReadFile, "open", &path, &e),
+        Err(e) => throw_whole_file_error(scope, oam_core::FsSite::ReadFile, &path, &e),
     }
 }
 
@@ -6132,23 +6154,13 @@ fn op_fs_write_file_sync(
         return;
     };
     let append = args.get(2).is_true();
-    let result = if append {
-        use std::io::Write;
-        std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .and_then(|mut f| f.write_all(&bytes))
-    } else {
-        std::fs::write(&path, &bytes)
-    };
-    if let Err(e) = result {
+    if let Err(e) = oam_core::write_whole_file(&path, &bytes, append) {
         let site = if append {
             oam_core::FsSite::AppendFile
         } else {
             oam_core::FsSite::WriteFile
         };
-        throw_fs_error(scope, site, "open", &path, &e);
+        throw_whole_file_error(scope, site, &path, &e);
     }
 }
 
