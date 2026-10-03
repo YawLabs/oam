@@ -8832,14 +8832,19 @@ await agent.close();
         &port.to_string(),
     ]);
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // A refusal names `host:port`, the resource net.connect's names (#188):
+    // the URL's host for the refused name, the hook's answer for the
+    // refused answer, each on the port the hop dials.
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
-        "first 200 ok\n\
-         ungranted-name ERR_ACCESS_DENIED \"d.invalid\"\n\
-         ungranted-answer ERR_ACCESS_DENIED \"10.9.9.9\"\n\
+        format!(
+            "first 200 ok\n\
+         ungranted-name ERR_ACCESS_DENIED \"d.invalid:{port}\"\n\
+         ungranted-answer ERR_ACCESS_DENIED \"10.9.9.9:{port}\"\n\
          again 200 ok\n\
          spelled 200 ok\n\
-         calls [\"a.invalid\",\"c.invalid\"]",
+         calls [\"a.invalid\",\"c.invalid\"]"
+        ),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
