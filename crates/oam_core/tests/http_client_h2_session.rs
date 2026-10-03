@@ -677,3 +677,145 @@ fn alpn_names_are_bytes_of_one_to_255() {
     assert!(parse_alpn_protocols("[\"\u{100}\"]").is_err());
     assert!(parse_alpn_protocols("{}").is_err());
 }
+
+/// An h2c origin written frame by frame, so the GOAWAY is exactly node's
+/// (one frame, after the answer): it waits for `streams` request heads,
+/// answers stream 1 with `200` and `ok`, then sends GOAWAY(NO_ERROR, last
+/// stream 1, debug data `bye`) and, a moment later, closes. node's
+/// `http2.createSecureServer` does the same when a handler calls
+/// `session.close()` after answering the first of several streams.
+async fn goaway_origin(streams: usize) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        let frame = |kind: u8, flags: u8, id: u32, payload: &[u8]| {
+            let len = payload.len();
+            let mut out = vec![(len >> 16) as u8, (len >> 8) as u8, len as u8, kind, flags];
+            out.extend_from_slice(&id.to_be_bytes());
+            out.extend_from_slice(payload);
+            out
+        };
+        // Our SETTINGS (none), and an ACK of the client's.
+        let _ = stream.write_all(&frame(0x4, 0, 0, &[])).await;
+        let _ = stream.write_all(&frame(0x4, 0x1, 0, &[])).await;
+        // The client's preface, then its frames until `streams` HEADERS.
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let mut heads = 0;
+        let mut at = 24;
+        while heads < streams {
+            let n = match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            };
+            buf.extend_from_slice(&chunk[..n]);
+            while buf.len() >= at + 9 {
+                let len = (usize::from(buf[at]) << 16)
+                    | (usize::from(buf[at + 1]) << 8)
+                    | usize::from(buf[at + 2]);
+                if buf.len() < at + 9 + len {
+                    break;
+                }
+                if buf[at + 3] == 0x1 {
+                    heads += 1;
+                }
+                at += 9 + len;
+            }
+        }
+        // :status 200 (HPACK static index 8), END_HEADERS; then the body,
+        // END_STREAM; then the GOAWAY.
+        let mut answer = frame(0x1, 0x4, 1, &[0x88]);
+        answer.extend(frame(0x0, 0x1, 1, b"ok"));
+        let mut goaway = 1u32.to_be_bytes().to_vec();
+        goaway.extend_from_slice(&0u32.to_be_bytes());
+        goaway.extend_from_slice(b"bye");
+        answer.extend(frame(0x7, 0, 0, &goaway));
+        let _ = stream.write_all(&answer).await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    });
+    port
+}
+
+/// The peer's GOAWAY (#185): `http2SessionGoaway` hands it over as node's
+/// `'goaway'` reports it -- code, last stream id, debug data -- with the
+/// count of response heads before it; the stream it let finish is
+/// answered; the ones above its last stream id fail as nghttp2 closes them,
+/// `NGHTTP2_REFUSED_STREAM`, marked as the GOAWAY's; a request made after it
+/// is refused the same way without going out; and once the connection is
+/// over there is no next GOAWAY. hyper reported the refused streams as the
+/// connection failing, and the graceful end as an EOF, so the session heard
+/// nothing of the GOAWAY.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_goaway_is_reported_and_refuses_the_streams_above_it() {
+    within(async {
+        let reg = Arc::new(Reg::new());
+        let port = goaway_origin(3).await;
+        let socket = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let session = reg.open(reg.pump(socket)).await;
+        let get = json!({ "method": "GET", "scheme": "http", "authority": "x", "path": "/" });
+        let mut requests = Vec::new();
+        for _ in 0..3 {
+            let reg = reg.clone();
+            let get = get.clone();
+            requests.push(tokio::spawn(async move { reg.request(session, get).await }));
+            // One at a time, so the first is stream 1.
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let goaway = payload(h2_session::goaway(reg.sessions.clone(), session, 0).await);
+        assert_eq!(
+            goaway,
+            json!({ "goaway": { "code": 0, "lastStreamId": 1, "data": "Ynll", "headsBefore": 1 } })
+        );
+        let mut answered = 0;
+        let mut refused = 0;
+        for request in requests {
+            match request.await.unwrap() {
+                OpOutcome::Json(text) => {
+                    let p: Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(p["status"], 200);
+                    assert_eq!(reg.text(p["bodyHandle"].as_u64().unwrap()).await, "ok");
+                    answered += 1;
+                }
+                OpOutcome::NodeFailed {
+                    code,
+                    message,
+                    errno,
+                    syscall,
+                    ..
+                } => {
+                    assert_eq!(code, "ERR_HTTP2_STREAM_ERROR");
+                    assert_eq!(
+                        message,
+                        "Stream closed with error code NGHTTP2_REFUSED_STREAM"
+                    );
+                    assert_eq!(errno, Some(7));
+                    assert_eq!(syscall.as_deref(), Some("goaway"));
+                    refused += 1;
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!((answered, refused), (1, 2));
+        // Made after the GOAWAY: refused without going out.
+        match reg.request(session, get).await {
+            OpOutcome::NodeFailed { errno, syscall, .. } => {
+                assert_eq!(errno, Some(7));
+                assert_eq!(syscall.as_deref(), Some("goaway"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            payload(h2_session::wait(reg.sessions.clone(), session).await),
+            json!({ "error": null })
+        );
+        assert_eq!(
+            payload(h2_session::goaway(reg.sessions.clone(), session, 1).await),
+            json!({ "goaway": null })
+        );
+        assert!(h2_session::destroy(&reg.sessions, session));
+    })
+    .await;
+}

@@ -2935,6 +2935,29 @@ oam's shared client. What differs:
   request never emits `'wantTrailers'`. oam's client stream is not told of that reset: it
   closes only once its own `end()` (and `'wantTrailers'`) has come. Its `rstCode` is 0
   either way.
+- **A server's GOAWAY is reported as Node reports it** (#185;
+  `conformance/cases/352-http2-connect-goaway.mjs`). The session's `'goaway'` carries the
+  frame's code, last stream id and debug data (`undefined` when it has none), after the
+  response heads that came before it; a stream above the last stream id -- one the server
+  never processed -- closes with `ERR_HTTP2_STREAM_ERROR` naming `NGHTTP2_REFUSED_STREAM`
+  (`rstCode` 7), so the application knows it can send it again; a stream the server
+  answered reads to its end; and the session then closes (`NO_ERROR`) or is destroyed with
+  `ERR_HTTP2_SESSION_ERROR` (any other code). Up to 0.17.1 a graceful GOAWAY reached the
+  session as an EOF: no `'goaway'`, and every stream -- the answered one, its body unread,
+  included -- closed silently with `NGHTTP2_CANCEL`; an error GOAWAY's `'goaway'` named last
+  stream id 0 and an empty buffer. Neither runtime sends a refused stream again: Node's
+  client leaves that to the application, and so does oam's. What differs: a request made in
+  the instant between the GOAWAY reaching oam's HTTP/2 layer and the session hearing of it
+  is refused the same way, where Node's session, closed already, throws
+  `ERR_HTTP2_GOAWAY_SESSION` from `request()`; and one sent in the narrower instant before
+  that layer has read the frame goes past its last stream id, is not answered, and closes
+  with `NGHTTP2_CANCEL` when the connection ends.
+- **Streams made in one tick may reach the wire in another order.** `session.request()`
+  numbers its streams 1, 3, 5, ... in call order, as Node does, but each goes to hyper on an
+  operation of its own, and hyper numbers them on the wire in the order those run. Requests
+  made together can therefore reach the server in another order than Node's, and a stream's
+  `id` need not be the one the server saw. _(observed: of three requests made together, the
+  one a server answered first was not always the first one made; not yet fixed)_
 - **A plain `Duplex` from `createConnection` is used as it is.** Node wraps a stream that is
   not a socket in its `JSStreamSocket` and hands that wrapper to `'connect'`; oam runs the
   session over the stream itself and hands it on.
