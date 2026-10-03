@@ -3014,6 +3014,15 @@ if ! grep -qiE 'zz-q7|acctq7zz|profq7zz|someone|example-corp|0a1b2c3d|contoso|So
    && grep -qF '<home>\AppData\Local\Temp\x.exe' <<<"$WS_D"; then pass
 else fail "$WS_D"; fi
 
+# The Windows section's own [fail] lines name paths too (a metadata.json typo,
+# a probe in TMPDIR), and a path under the user profile names the operator.
+it "the Windows status lines redact a path under the user profile"
+WS_D="$( { HOME=/c/Users/jdoe USERPROFILE='C:\Users\jdoe' OAM_WIN_SIGN_METADATA=/c/Users/jdoe/.oam-signing/typo.json wg _ws_metadata
+           HOME=/c/Users/jdoe USERPROFILE='C:\Users\jdoe' OAM_WIN_SIGN_PUBLISHER="Example Publisher" wg win_verify /c/Users/jdoe/nope.exe; } 2>&1)"
+if ! grep -qF 'jdoe' <<<"$WS_D" && grep -qF '<home>/.oam-signing/typo.json does not exist' <<<"$WS_D" \
+   && grep -qF 'win_verify: <home>/nope.exe does not exist' <<<"$WS_D"; then pass
+else fail "$WS_D"; fi
+
 # A real dlib failure is a .NET exception: ~30 lines, with the HTTP status near
 # the top and a stack trace after it. A bare tail showed only the stack.
 { echo '#!/bin/bash'

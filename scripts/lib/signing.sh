@@ -869,6 +869,14 @@ _ws_redact() {
     -e "s#([Tt]enant|[Ss]ubscription|[Dd]irectory)([[:space:]]+[Ii][Dd])?([[:space:]]*:?[[:space:]]*)${q}[^${q}]*${q}#\\1\\2\\3$q<redacted>$q#g"
 }
 
+# _ws_fail / _ws_warn / _ws_ok -- the Windows section's own status lines, run
+# through _ws_redact like every tool output: a message that names a path
+# (metadata.json, a probe in TMPDIR) would otherwise print the user profile
+# directory, and with it the operator's Windows account name.
+_ws_fail(){ printf '  [fail] %s\n' "$*" | _ws_redact >&2; return 1; }
+_ws_warn(){ printf '  [warn] %s\n' "$*" | _ws_redact >&2; return 0; }
+_ws_ok(){   printf '  [ok] %s\n' "$*" | _ws_redact >&2; return 0; }
+
 # _ws_show <label> [metadata.json] -- a failed tool's output (stdin), redacted,
 # onto stderr: first the lines that say WHY (HTTP status, error codes,
 # SignerSign(), exception messages, AADSTS codes; stack frames skipped), then
@@ -940,9 +948,9 @@ locate_signtool_x64() {
     if [ -z "$bestv" ] || ! _ws_ver_ge "$bestv" "$v"; then best="$d/x64/signtool.exe"; bestv="$v"; fi
   done
   [ -n "$best" ] \
-    || { _rs_fail "no x64 signtool.exe from a Windows SDK >= $WIN_SIGNTOOL_FLOOR (and not 10.0.20348) under $WIN_SDK_BIN_ROOT (found:${seen:- none}) -- install the Windows SDK signing tools"; return 1; }
+    || { _ws_fail "no x64 signtool.exe from a Windows SDK >= $WIN_SIGNTOOL_FLOOR (and not 10.0.20348) under $WIN_SDK_BIN_ROOT (found:${seen:- none}) -- install the Windows SDK signing tools"; return 1; }
   [ "$(_ws_pe_machine "$best")" = "8664" ] \
-    || { _rs_fail "$best is not an x64 binary -- the Artifact Signing dlib ships x86/x64 builds only, and this lib pairs it with the x64 signtool"; return 1; }
+    || { _ws_fail "$best is not an x64 binary -- the Artifact Signing dlib ships x86/x64 builds only, and this lib pairs it with the x64 signtool"; return 1; }
   WIN_SIGNTOOL="$best"
   return 0
 }
@@ -956,13 +964,13 @@ locate_artifact_signing_dlib() {
     f="$d/Azure.CodeSigning.Dlib.dll"
     [ -f "$f" ] || continue
     if [ "$(_ws_pe_machine "$f")" != "8664" ]; then
-      _rs_warn "$f is not the x64 build of the dlib -- skipped"
+      _ws_warn "$f is not the x64 build of the dlib -- skipped"
       continue
     fi
     WIN_SIGN_DLIB="$f"
     return 0
   done
-  _rs_fail "no x64 Azure.CodeSigning.Dlib.dll in: ${WIN_DLIB_DIRS[*]:-<no LOCALAPPDATA>} -- install it: winget install -e --id Microsoft.Azure.ArtifactSigningClientTools"
+  _ws_fail "no x64 Azure.CodeSigning.Dlib.dll in: ${WIN_DLIB_DIRS[*]:-<no LOCALAPPDATA>} -- install it: winget install -e --id Microsoft.Azure.ArtifactSigningClientTools"
   return 1
 }
 
@@ -984,7 +992,7 @@ probe_dotnet_x64() {
       return 0
     fi
   done
-  _rs_fail "no x64 .NET runtime >= 8 (checked: ${WIN_DOTNET_CANDIDATES[*]}) -- without it signtool + the dlib can exit 0 and sign NOTHING. Install the x64 .NET 8 runtime (winget install -e --id Microsoft.DotNet.Runtime.8 --architecture x64)"
+  _ws_fail "no x64 .NET runtime >= 8 (checked: ${WIN_DOTNET_CANDIDATES[*]}) -- without it signtool + the dlib can exit 0 and sign NOTHING. Install the x64 .NET 8 runtime (winget install -e --id Microsoft.DotNet.Runtime.8 --architecture x64)"
   return 1
 }
 
@@ -1029,12 +1037,12 @@ _ws_meta_path() {
 # fields the dlib needs. Values are never printed: they identify the account.
 _ws_metadata() {
   local m="${OAM_WIN_SIGN_METADATA:-}" k
-  [ -n "$m" ] || { _rs_fail "OAM_WIN_SIGN_METADATA is not set"; return 1; }
+  [ -n "$m" ] || { _ws_fail "OAM_WIN_SIGN_METADATA is not set"; return 1; }
   if command -v cygpath >/dev/null 2>&1; then m="$(cygpath -u "$m")"; fi
-  [ -f "$m" ] || { _rs_fail "OAM_WIN_SIGN_METADATA=$m does not exist"; return 1; }
+  [ -f "$m" ] || { _ws_fail "OAM_WIN_SIGN_METADATA=$m does not exist"; return 1; }
   for k in Endpoint CodeSigningAccountName CertificateProfileName; do
     grep -qE "\"$k\"[[:space:]]*:[[:space:]]*\"[^\"<]+\"" "$m" \
-      || { _rs_fail "$m has no \"$k\" value (shape: {\"Endpoint\": ..., \"CodeSigningAccountName\": ..., \"CertificateProfileName\": ...})"; return 1; }
+      || { _ws_fail "$m has no \"$k\" value (shape: {\"Endpoint\": ..., \"CodeSigningAccountName\": ..., \"CertificateProfileName\": ...})"; return 1; }
   done
   printf '%s\n' "$m"
 }
@@ -1046,7 +1054,7 @@ _ws_metadata() {
 # anywhere near an hour.
 _ws_timeout_ok() {
   if [[ "$WIN_SIGN_TIMEOUT" =~ ^[1-9][0-9]{0,3}$ ]] && [ "$WIN_SIGN_TIMEOUT" -le "$WIN_SIGN_TIMEOUT_MAX" ]; then return 0; fi
-  _rs_fail "OAM_WIN_SIGN_TIMEOUT must be a whole number of seconds from 1 to $WIN_SIGN_TIMEOUT_MAX, not '$WIN_SIGN_TIMEOUT'"
+  _ws_fail "OAM_WIN_SIGN_TIMEOUT must be a whole number of seconds from 1 to $WIN_SIGN_TIMEOUT_MAX, not '$WIN_SIGN_TIMEOUT'"
   return 1
 }
 
@@ -1056,8 +1064,8 @@ win_sign_tools() {
   locate_signtool_x64 || return 1
   locate_artifact_signing_dlib || return 1
   probe_dotnet_x64 || return 1
-  [ -f "$WIN_VERIFY_PS1" ] || { _rs_fail "$WIN_VERIFY_PS1 is missing"; return 1; }
-  [ -n "${OAM_WIN_SIGN_PUBLISHER:-}" ] || { _rs_fail "OAM_WIN_SIGN_PUBLISHER is not set -- the CN/O every signature must carry"; return 1; }
+  [ -f "$WIN_VERIFY_PS1" ] || { _ws_fail "$WIN_VERIFY_PS1 is missing"; return 1; }
+  [ -n "${OAM_WIN_SIGN_PUBLISHER:-}" ] || { _ws_fail "OAM_WIN_SIGN_PUBLISHER is not set -- the CN/O every signature must carry"; return 1; }
   _ws_metadata >/dev/null || return 1
   return 0
 }
@@ -1069,9 +1077,9 @@ win_sign_tools() {
 # Success here means signtool SAID so; win_verify is what proves it.
 win_sign() {
   local file="$1" meta out rc
-  [ -f "$file" ] || { _rs_fail "win_sign: $file does not exist"; return 1; }
+  [ -f "$file" ] || { _ws_fail "win_sign: $file does not exist"; return 1; }
   case "$file" in
-    */target/* | target/*) _rs_fail "win_sign: refusing to sign $file in place -- sign the staged copy, never a build output under target/"; return 1 ;;
+    */target/* | target/*) _ws_fail "win_sign: refusing to sign $file in place -- sign the staged copy, never a build output under target/"; return 1 ;;
   esac
   win_sign_tools || return 1
   meta="$(_ws_metadata)" || return 1
@@ -1084,9 +1092,9 @@ win_sign() {
   # Redacted: /v echoes metadata.json, and metadata.json names the account.
   printf '%s\n' "$out" | _ws_show signtool "$meta"
   if _ws_timed_out "$rc"; then
-    _rs_fail "signtool sign for $file did not finish in ${WIN_SIGN_TIMEOUT}s and was killed (output above) -- the Artifact Signing endpoint or the TSA ($WIN_SIGN_TSA) is unreachable or stalled; OAM_WIN_SIGN_TIMEOUT sets the limit"
+    _ws_fail "signtool sign for $file did not finish in ${WIN_SIGN_TIMEOUT}s and was killed (output above) -- the Artifact Signing endpoint or the TSA ($WIN_SIGN_TSA) is unreachable or stalled; OAM_WIN_SIGN_TIMEOUT sets the limit"
   else
-    _rs_fail "signtool sign failed for $file (output above). 401/403: run 'az login' and check the Certificate Profile Signer role; a SignerSign() error: metadata.json's Endpoint must be the account's region"
+    _ws_fail "signtool sign failed for $file (output above). 401/403: run 'az login' and check the Certificate Profile Signer role; a SignerSign() error: metadata.json's Endpoint must be the account's region"
   fi
   return 1
 }
@@ -1101,8 +1109,8 @@ win_sign() {
 # into a command string: a path is data, and so is a publisher with a comma.
 win_verify() {
   local file="$1" out rc late="" pub="${OAM_WIN_SIGN_PUBLISHER:-}"
-  [ -f "$file" ] || { _rs_fail "win_verify: $file does not exist"; return 1; }
-  [ -n "$pub" ] || { _rs_fail "win_verify: OAM_WIN_SIGN_PUBLISHER is not set -- nothing to pin the signer to"; return 1; }
+  [ -f "$file" ] || { _ws_fail "win_verify: $file does not exist"; return 1; }
+  [ -n "$pub" ] || { _ws_fail "win_verify: OAM_WIN_SIGN_PUBLISHER is not set -- nothing to pin the signer to"; return 1; }
   locate_signtool_x64 || return 1
   _ws_timeout_ok || return 1
   rc=0
@@ -1110,7 +1118,7 @@ win_verify() {
   if [ "$rc" != "0" ]; then
     if _ws_timed_out "$rc"; then late=" -- killed after ${WIN_SIGN_TIMEOUT}s"; fi
     printf '%s\n' "$out" | _ws_show signtool "$(_ws_meta_path)"
-    _rs_fail "signtool verify /pa rejects $file (output above)$late"
+    _ws_fail "signtool verify /pa rejects $file (output above)$late"
     return 1
   fi
   rc=0
@@ -1120,10 +1128,10 @@ win_verify() {
   if [ "$rc" != "0" ]; then
     if _ws_timed_out "$rc"; then late=" -- killed after ${WIN_SIGN_TIMEOUT}s"; fi
     printf '%s\n' "$out" | _ws_show verify "$(_ws_meta_path)"
-    _rs_fail "Authenticode verification failed for $file (above)$late -- whatever signtool reported, the file on disk does not carry the required signature"
+    _ws_fail "Authenticode verification failed for $file (above)$late -- whatever signtool reported, the file on disk does not carry the required signature"
     return 1
   fi
-  _rs_ok "Authenticode: $(basename "$file") signed by '$pub', timestamped, chained via $WIN_SIGN_INTERMEDIATE"
+  _ws_ok "Authenticode: $(basename "$file") signed by '$pub', timestamped, chained via $WIN_SIGN_INTERMEDIATE"
   return 0
 }
 
@@ -1195,8 +1203,8 @@ win_make_unsigned_pe() {
   _ws_zero $((0x200 - 0x170))
   h="$h"'\xc3'; _ws_zero 511
   unset -f _ws_le _ws_zero
-  printf '%b' "$h" >"$out" || { _rs_fail "could not write $out"; return 1; }
-  [ "$(wc -c <"$out" | tr -d ' ')" = "1024" ] || { _rs_fail "$out came out $(wc -c <"$out" | tr -d ' ') bytes, not 1024"; return 1; }
+  printf '%b' "$h" >"$out" || { _ws_fail "could not write $out"; return 1; }
+  [ "$(wc -c <"$out" | tr -d ' ')" = "1024" ] || { _ws_fail "$out came out $(wc -c <"$out" | tr -d ' ') bytes, not 1024"; return 1; }
   return 0
 }
 
@@ -1211,7 +1219,7 @@ win_sign_preflight() {
   local d out rc
   win_sign_tools || return 1
   command -v "$WIN_AZ" >/dev/null 2>&1 \
-    || { _rs_fail "the Azure CLI ($WIN_AZ) is not on PATH -- install it, then run 'az login'"; return 1; }
+    || { _ws_fail "the Azure CLI ($WIN_AZ) is not on PATH -- install it, then run 'az login'"; return 1; }
   # Bounded and tree-killed (az is a script around python.exe), and its
   # output redacted: a stale session names the signed-in account.
   rc=0
@@ -1219,21 +1227,21 @@ win_sign_preflight() {
   if [ "$rc" != "0" ]; then
     printf '%s\n' "$out" | _ws_show az "$(_ws_meta_path)"
     if _ws_timed_out "$rc"; then
-      _rs_fail "az account get-access-token did not finish in ${WIN_SIGN_TIMEOUT}s and was killed (output above) -- Entra ID is unreachable or az is stuck; if it persists, run 'az login' again. OAM_WIN_SIGN_TIMEOUT sets the limit"
+      _ws_fail "az account get-access-token did not finish in ${WIN_SIGN_TIMEOUT}s and was killed (output above) -- Entra ID is unreachable or az is stuck; if it persists, run 'az login' again. OAM_WIN_SIGN_TIMEOUT sets the limit"
     else
-      _rs_fail "no Azure token for $WIN_SIGN_RESOURCE -- run 'az login' as the identity holding the Artifact Signing Certificate Profile Signer role, then re-run"
+      _ws_fail "no Azure token for $WIN_SIGN_RESOURCE -- run 'az login' as the identity holding the Artifact Signing Certificate Profile Signer role, then re-run"
     fi
     return 1
   fi
-  d="$(mktemp -d "${TMPDIR:-/tmp}/oam-winsign-probe.XXXXXX")" || { _rs_fail "could not create a temp dir"; return 1; }
+  d="$(mktemp -d "${TMPDIR:-/tmp}/oam-winsign-probe.XXXXXX")" || { _ws_fail "could not create a temp dir"; return 1; }
   if ! win_make_unsigned_pe "$d/oam-sign-probe.exe" \
      || ! win_sign "$d/oam-sign-probe.exe" \
      || ! win_verify "$d/oam-sign-probe.exe"; then
     rm -rf "$d"
-    _rs_fail "Windows signing preflight: a throwaway signature did not sign and verify -- see above"
+    _ws_fail "Windows signing preflight: a throwaway signature did not sign and verify -- see above"
     return 1
   fi
   rm -rf "$d"
-  _rs_ok "Windows signing preflight: signtool (SDK $(basename "$(dirname "$(dirname "$WIN_SIGNTOOL")")")), the dlib and x64 .NET sign, timestamp and verify as '$OAM_WIN_SIGN_PUBLISHER'"
+  _ws_ok "Windows signing preflight: signtool (SDK $(basename "$(dirname "$(dirname "$WIN_SIGNTOOL")")")), the dlib and x64 .NET sign, timestamp and verify as '$OAM_WIN_SIGN_PUBLISHER'"
   return 0
 }
