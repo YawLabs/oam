@@ -280,29 +280,73 @@ mod windows {
         }
     }
 
+    /// How long an abandoned flush is retried for when its thread has not
+    /// reached the flush yet: ample for a thread that was just started to
+    /// get there on a loaded box. Past it the flush is left to finish when
+    /// the peer reads or goes, as it was before any cancel.
+    const FLUSH_CANCEL_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
     impl Drop for FlushThread {
         fn drop(&mut self) {
-            use std::os::windows::io::AsRawHandle;
             let Some(thread) = self.0.take() else {
                 return;
             };
-            // The thread may not be inside the flush yet (it was only just
-            // started): a cancel then finds nothing and is tried again, until
-            // the thread is through -- one try once it is blocked in the
-            // flush. Bounded, so a flush that cannot be cancelled costs what
-            // it cost before, and never a hang here.
-            for _ in 0..1000 {
-                if thread.is_finished() {
-                    return;
-                }
-                // SAFETY: the handle is the thread's own, owned by `thread`,
-                // which is neither joined nor dropped until after the call;
-                // CancelSynchronousIo only reads it.
-                unsafe {
-                    windows_sys::Win32::System::IO::CancelSynchronousIo(thread.as_raw_handle());
-                }
-                std::thread::yield_now();
+            if thread.is_finished() {
+                return;
             }
+            // This runs where the shutdown future is dropped -- a runtime
+            // worker -- so it tries once here and no more: a thread already
+            // blocked in the flush (the usual case) is cancelled by it.
+            cancel_flush(&thread);
+            if thread.is_finished() {
+                return;
+            }
+            // Not through yet: the thread may not have reached the flush (it
+            // was only just started), or the cancel met the flush as it was
+            // being entered and was lost. Keep trying from a thread of its
+            // own, until the thread is through, bounded by time -- a count of
+            // tries could run out before a busy box scheduled the flush. If
+            // even that thread cannot start, the flush is left as before.
+            let deadline = std::time::Instant::now() + FLUSH_CANCEL_WINDOW;
+            let _ = std::thread::Builder::new()
+                .name("oam-pipe-flush-cancel".to_string())
+                .spawn(move || cancel_flush_until(&thread, deadline));
+        }
+    }
+
+    /// Cancel `thread`'s flush, if it is in one.
+    fn cancel_flush(thread: &std::thread::JoinHandle<()>) {
+        use std::os::windows::io::AsRawHandle;
+        // SAFETY: the handle is the thread's own, owned by `thread`, which
+        // is neither joined nor dropped until after the call;
+        // CancelSynchronousIo only reads it.
+        unsafe {
+            windows_sys::Win32::System::IO::CancelSynchronousIo(thread.as_raw_handle());
+        }
+    }
+
+    /// Retry [`cancel_flush`] until the thread is through or `deadline`
+    /// passes: yielding at first, then sleeping a millisecond between tries.
+    /// True when the thread ended.
+    fn cancel_flush_until(
+        thread: &std::thread::JoinHandle<()>,
+        deadline: std::time::Instant,
+    ) -> bool {
+        let mut tries = 0u32;
+        loop {
+            if thread.is_finished() {
+                return true;
+            }
+            cancel_flush(thread);
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            if tries < 64 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            tries += 1;
         }
     }
 
@@ -538,6 +582,62 @@ mod windows {
                     Err(e) => return Err(e),
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::time::Duration;
+
+        fn pipe_name(tag: &str) -> String {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos();
+            format!(
+                r"\\.\pipe\oam-core-test-{tag}-{}-{nanos}",
+                std::process::id()
+            )
+        }
+
+        /// Regression guard: an abandoned flush whose thread had not reached
+        /// FlushFileBuffers yet was retried a fixed number of times (1000
+        /// yields), which a busy box could use up before the thread got
+        /// there; the flush then blocked, and its thread and the handle that
+        /// holds the pipe open lived until the peer read or went. Here the
+        /// thread reaches the flush 150 ms late, past any count of yields,
+        /// and is still cancelled.
+        #[tokio::test]
+        async fn an_abandoned_flush_is_cancelled_when_its_thread_reaches_it_late() {
+            let name = pipe_name("flush");
+            let server = ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&name)
+                .unwrap();
+            let client = ClientOptions::new().open(&name).unwrap();
+            server.connect().await.unwrap();
+            // Bytes the server never reads: a flush of the client's end
+            // blocks until they are read or the server goes. More than the
+            // 4 KiB the server's own end reads ahead into its buffer.
+            client.writable().await.unwrap();
+            let unread = vec![7u8; 32 * 1024];
+            assert_eq!(client.try_write(&unread).unwrap(), unread.len());
+            let handle = std::os::windows::io::AsHandle::as_handle(&client)
+                .try_clone_to_owned()
+                .unwrap();
+            let (flushed, done) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                let _ = std::fs::File::from(handle).sync_all();
+                let _ = flushed.send(());
+            });
+            drop(FlushThread(Some(thread)));
+            assert!(
+                done.recv_timeout(Duration::from_secs(5)).is_ok(),
+                "the late flush was not cancelled"
+            );
+            drop(server);
         }
     }
 }
