@@ -14555,12 +14555,12 @@
           // (ThrowUVException(UV_ENOENT, "open")), and a failed read as
           // ERR_INVALID_ARG_TYPE naming the path it opened, namespace
           // prefix and all -- measured: loadEnvFile(".") on Windows is
-          // "Contents of '\\?\C:\cwd' should be a valid string." A
-          // directory is that read failure on every platform: node opens it
-          // (libuv's FILE_FLAG_BACKUP_SEMANTICS on Windows, open(2) on Linux
-          // and macOS) and fails the read, and oam's readFileSync reports it
-          // as EISDIR `read` on all three (oam_core::fs_error_at), so it
-          // never reaches the `open` branch.
+          // "Contents of '\\?\C:\cwd' should be a valid string." oam's
+          // readFileSync labels the two halves as node's fs does
+          // (oam_core::whole_file_error): only a failed OPEN says `open`,
+          // and any failed read -- a region another process has locked
+          // (EBUSY), EIO, a directory on every platform (node opens it and
+          // fails the read) -- says `read`, so it takes the second branch.
           if (e && e.syscall === "open") {
             throw makeSystemError("ENOENT", "open", given === null ? ".env" : fsErrorPath(given));
           }
