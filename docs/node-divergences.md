@@ -3303,6 +3303,36 @@ what is left:
   `create_dir` lengthens such paths itself. Refusing a path the file system accepts was not
   worth reproducing.
 
+### Windows `fs` paths reach the OS as given, not namespaced
+
+node's `fs` hands libuv every path through `path.toNamespacedPath`: resolved against the cwd
+(which normalises `.` / `..` and drops a trailing separator) and prefixed with `\\?\`. That
+prefix turns off Win32 path normalisation, so the OS does not strip trailing dots and spaces
+and does not treat DOS device names as devices. oam passes the path as given to std, which
+goes through that normalisation. Errors already NAME the path as node does (the resolved path,
+prefix removed); which file the OS opens differs. Measured against node v22.22.2 on Windows,
+for `fs.readFileSync`, and so for `process.loadEnvFile`, which reads through it:
+
+| path | node | oam |
+|---|---|---|
+| a directory with a trailing separator, `sub/` or `sub\` | opens `sub`, fails `EISDIR` `read` (`loadEnvFile`: `Contents of '\\?\<cwd>\sub' should be a valid string.`) | the open fails, `ENOENT` `open '<cwd>\sub'` |
+| `NUL` / `nul` | `ENOENT` `open '<cwd>\NUL'` | reads the NUL device: `""` (`loadEnvFile` loads nothing and succeeds) |
+| a trailing dot or space, `.env.`, `.env `, `f.txt...` | `ENOENT` | opens `.env` / `f.txt` |
+
+The same holds beyond reads: `statSync(".env.")` and `existsSync(".env.")` find `.env`
+(node: `ENOENT`, `false`), `openSync("NUL")` opens the device and `statSync("NUL")` fails
+`EISDIR` (node: `ENOENT` for both), and `writeFileSync("g.txt.", ...)` creates `g.txt` where
+node creates a file literally named `g.txt.`. `COM1` agrees (`ENOENT` in both) on a machine
+without that port.
+
+Not fixed yet because there is no single place to change: paths reach the OS through some 66
+`toPath` call sites in `js/node_compat.js` and over 100 path-taking ops in Rust (sync ops in
+`oam_engine`, async ones in `oam_core`), the `--permission` checks resolve the path against
+the cwd themselves and would have to agree with what the OS is handed, and several results
+echo the path back (`mkdtemp`, recursive `mkdir`, `readdir` with `recursive`,
+`Dirent.parentPath`, symlink targets), where a namespaced path must not leak out. It wants
+its own design and a full `fs` conformance pass.
+
 ### `fs.realpath` under `--permission` — oam is stricter
 
 Measured against Node v22.22.2: with `--permission` and no grants, node allows
