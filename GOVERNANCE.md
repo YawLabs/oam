@@ -38,5 +38,7 @@ successors. This file is the authoritative statement.
 ## Releases
 
 Release cadence, semver policy, and the behavior-change log are specified in RELIABILITY.md.
-Release binaries are currently unsigned and ship with a `SHA256SUMS` checksum file. Code
-signing and SLSA provenance are planned, not yet shipped; see SECURITY.md, "Release integrity".
+From v0.18.0 every release carries a `RELEASE-MANIFEST` signed with the release key, which the
+installers and `oam self-update` verify. Windows binaries are Authenticode-signed; macOS
+binaries are signed with oam's own self-signed identity, with Apple Developer ID signing and
+notarization still planned, as is SLSA provenance. See SECURITY.md, "Release integrity".

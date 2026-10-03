@@ -117,6 +117,11 @@ prints how many of the advertised tools that is.
 - **The conformance number has a denominator.** 99.3% is *pass over tests that
   ran*; the corpus is a subset of Node's suite, and
   [node-divergences.md](node-divergences.md) explains what is excluded and why.
-- **Binaries are unsigned**, and checksummed against a published `SHA256SUMS`.
+- **macOS binaries are not notarized.** From v0.18.0 every release carries a
+  signed `RELEASE-MANIFEST` that the installers and `oam self-update` verify,
+  and the Windows binaries are Authenticode-signed. The macOS binaries are
+  signed with oam's own self-signed identity, not Apple Developer ID, so
+  Gatekeeper still blocks a browser download; curl and brew installs are
+  unaffected.
 - **No linux-arm64 release yet** — it builds, but the V8 snapshot forbids
   cross-compiling, so it needs a native ARM builder.

@@ -57,14 +57,16 @@
 #                                    quiet fallback to the weaker thing.
 #   The pin lives in scripts/mac-signing-identity.sha1.
 #
-# OAM_SIGN_REQUIRED is ONE knob for two bootstraps. It is the same variable
-# scripts/lib/signing.sh reads for the release manifest, and it gates the mac
-# pin bootstrap too: with it set to 1, an empty pin file fails the mac
-# preflight, before anything is tagged. Release key k1 is committed, so the
-# manifest half no longer depends on it; an operator who keeps exporting
-# OAM_SIGN_REQUIRED=1 out of habit is therefore asking for exactly one thing
-# today, a pinned mac identity, and every release fails in preflight until a
-# SHA-1 is committed (or OAM_SKIP_MAC_SIGN=1 is set for that release).
+# OAM_SIGN_REQUIRED is ONE knob for every signing bootstrap. It is the same
+# variable scripts/lib/signing.sh reads for the release manifest and for
+# Windows Authenticode, and here it gates the mac pin bootstrap: with it set to
+# 1, an empty pin file fails the mac preflight, before anything is tagged. The
+# pin is committed now (as is release key k1), so for the mac leg the knob
+# changes nothing: the pinned identity is mandatory either way, and only
+# OAM_SKIP_MAC_SIGN=1 skips it. The knob still matters for Windows, where it
+# makes an unset OAM_WIN_SIGN_METADATA fatal, so release-local.sh's header
+# says to set it on every release. The bootstrap branch stays for a checkout
+# whose pin file holds no SHA-1, such as a fork's.
 #
 # The verify gate (mac_verify_binary) re-reads the pin from the file rather
 # than trusting what setup chose, so a selection step that was skipped or lost

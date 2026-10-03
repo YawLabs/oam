@@ -66,10 +66,10 @@ HELPER_SRC="scripts/changelog-release.sh"
 group "the gate block, as release-local.sh runs it"
 # =============================================================================
 # Sliced by its two anchors: the `if [ -f CHANGELOG.md ]; then` that opens it
-# and the `# origin/main is load-bearing` comment that follows its `fi`.
+# and the `# A published tag must never move` comment that follows its `fi`.
 GATE="$SUITE_TMP/gate.sh"
 GATE_START="$(grep -nF 'if [ -f CHANGELOG.md ]; then' "$RELEASE" | head -1 | cut -d: -f1)"
-GATE_END="$(grep -n '^# origin/main is load-bearing' "$RELEASE" | head -1 | cut -d: -f1)"
+GATE_END="$(grep -n '^# A published tag must never move' "$RELEASE" | head -1 | cut -d: -f1)"
 if [ -n "$GATE_START" ] && [ -n "$GATE_END" ] && [ "$GATE_START" -lt "$GATE_END" ]; then
   sed -n "${GATE_START},$((GATE_END - 1))p" "$RELEASE" > "$GATE"
 else
