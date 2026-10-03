@@ -2299,8 +2299,15 @@ pub struct FsError {
 /// generic table (src/win/fs.c, v1.51.0), for the operations that have them.
 /// `syscall` is what the site names when no rule applies.
 ///
-/// Every rule is Windows-only, and each is a place where the generic table
-/// alone gives node's code for the wrong operation:
+/// One rule holds on every platform: `readFile` of a DIRECTORY fails on the
+/// read, as `EISDIR`, syscall `read`, no path -- node's message is
+/// `EISDIR: illegal operation on a directory, read`. On Linux and macOS
+/// open(2) admits a directory for reading, so std's `fs::read` fails in its
+/// read(2) with EISDIR (`ErrorKind::IsADirectory`), but every call site hands
+/// in the syscall "open"; the rule is keyed on that kind, not on a platform.
+///
+/// Every other rule is Windows-only, and each is a place where the generic
+/// table alone gives node's code for the wrong operation:
 ///
 /// - libuv opens every path with FILE_FLAG_BACKUP_SEMANTICS, so a DIRECTORY
 ///   opens. `w` then fails with ERROR_FILE_EXISTS, which fs__open turns into
@@ -2330,6 +2337,13 @@ pub fn fs_error_at(
         syscall,
         has_path: true,
     };
+    if site == FsSite::ReadFile && error.kind() == std::io::ErrorKind::IsADirectory {
+        return FsError {
+            code: "EISDIR",
+            syscall: "read",
+            has_path: false,
+        };
+    }
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::{
@@ -5749,6 +5763,43 @@ mod os_error_code_tests {
         );
         // libuv's fs__read / fs__write turn it into EBADF on a descriptor.
         assert_eq!(fd_error_code(&denied), "EBADF");
+    }
+
+    /// A directory read fails in read(2) with EISDIR on Linux and macOS, where
+    /// open(2) admits it; every readFile site names "open", and node says
+    /// `EISDIR ..., read` with no path. Keyed on the io::Error kind, so it is
+    /// checked here on every host; the unix assertion feeds the real errno.
+    #[test]
+    fn read_file_of_a_directory_fails_on_the_read_everywhere() {
+        let eisdir_read = FsError {
+            code: "EISDIR",
+            syscall: "read",
+            has_path: false,
+        };
+        let kind = std::io::Error::from(std::io::ErrorKind::IsADirectory);
+        assert_eq!(
+            fs_error_at(FsSite::ReadFile, "open", "d", &kind),
+            eisdir_read
+        );
+        assert_eq!(
+            fs_error_message(eisdir_read, "d", &kind),
+            "EISDIR: illegal operation on a directory, read"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs_error_at(
+                FsSite::ReadFile,
+                "open",
+                "d",
+                &std::io::Error::from_raw_os_error(libc::EISDIR)
+            ),
+            eisdir_read
+        );
+        // Only readFile: other sites keep the syscall they name.
+        assert_eq!(
+            fs_error_at(FsSite::Open("r"), "open", "d", &kind).syscall,
+            "open"
+        );
     }
 
     #[cfg(windows)]
