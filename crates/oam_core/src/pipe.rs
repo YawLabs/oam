@@ -653,8 +653,10 @@ mod windows {
         /// yields), which a busy box could use up before the thread got
         /// there; the flush then blocked, and its thread and the handle that
         /// holds the pipe open lived until the peer read or went. Here the
-        /// thread reaches the flush 150 ms late, past any count of yields,
-        /// and is still cancelled.
+        /// thread reaches the flush 50 ms late -- far past 1000 yields, which
+        /// take well under a millisecond on an idle box, yet a tenth of
+        /// FLUSH_CANCEL_WINDOW, so a loaded box that oversleeps it still
+        /// reaches the flush inside the window -- and is still cancelled.
         #[tokio::test]
         async fn an_abandoned_flush_is_cancelled_when_its_thread_reaches_it_late() {
             let name = pipe_name("flush");
@@ -675,7 +677,7 @@ mod windows {
                 .unwrap();
             let (flushed, done) = std::sync::mpsc::channel();
             let thread = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(150));
+                std::thread::sleep(Duration::from_millis(50));
                 let _ = std::fs::File::from(handle).sync_all();
                 let _ = flushed.send(());
             });
