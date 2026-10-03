@@ -2446,7 +2446,10 @@ fn read_opened(reader: impl std::io::Read, size: Option<u64>) -> Result<Vec<u8>,
     if let Some(size) = size.and_then(|n| usize::try_from(n).ok()) {
         bytes
             .try_reserve_exact(size)
-            .map_err(|e| WholeFileError::Transfer(std::io::Error::other(e)))?;
+            // std::fs::read's own answer when the buffer cannot be had.
+            .map_err(|e| {
+                WholeFileError::Transfer(std::io::Error::new(std::io::ErrorKind::OutOfMemory, e))
+            })?;
     }
     std::io::Read::read_to_end(&mut Plain(reader), &mut bytes).map_err(WholeFileError::Transfer)?;
     Ok(bytes)
