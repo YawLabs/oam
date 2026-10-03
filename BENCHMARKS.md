@@ -41,7 +41,7 @@ All times in milliseconds. Lower is better.
 | cold-start | 59.58 | 113.42 | 307.97 | 0.53x |
 | url-parse | 6.53 | 9.30 | 5.43 | 0.70x |
 | http-throughput | 47.78 | 107.75 | 33.98 | 0.44x |
-| http-keepalive-latency | 0.22 | 0.21 | 0.07 | 1.04x |
+| http-keepalive-latency | 0.25 | 0.25 | 0.07 | 1.01x |
 | fs-read | 30.05 | 28.91 | 38.73 | 1.04x |
 | json-parse | 74.50 | 115.99 | 91.15 | 0.64x |
 | crypto-hash | 223.89 | 292.29 | 38.99 | 0.77x |
@@ -49,7 +49,7 @@ All times in milliseconds. Lower is better.
 | mcp-idle-rss | 25.23 | 61.34 | 98.43 | 0.41x |
 | mcp-first-call-latency | 0.34 | 2.40 | 5.04 | 0.14x |
 
-Re-measured by a filtered run (`--case`), so from a different tree than the `Commit` line above: http-keepalive-latency/oam at `697595d+wip` (oam 0.17.1), http-keepalive-latency/node at `697595d+wip` (v22.22.2), http-keepalive-latency/bun at `697595d+wip` (1.3.14).
+Re-measured by a filtered run (`--case`), so from a different tree than the `Commit` line above: http-keepalive-latency/oam at `031e7e8` (oam 0.17.1), http-keepalive-latency/node at `031e7e8` (v22.22.2), http-keepalive-latency/bun at `031e7e8` (1.3.14).
 
 ## TypeScript load path
 
