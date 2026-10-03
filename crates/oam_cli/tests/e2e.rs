@@ -10225,7 +10225,12 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
 /// runs every request through @mswjs/interceptors, which parses it with
 /// node:_http_common's HTTPParser, answers it through a ServerResponse built
 /// over its own socket, and only then lets the socket 'connect' -- up to
-/// 0.17.1 `import nock` failed for want of _http_common (#207). The packages
+/// 0.17.1 `import nock` failed for want of _http_common (#207). A
+/// `new http.ClientRequest()` nock passes through runs node's constructor on
+/// nock's own object (`ClientRequest.apply(this, args)`), and one nock
+/// refuses is ended as a bare OutgoingMessage: until the review of #207 the
+/// first was never sent and never settled, and the second's end() threw. The
+/// packages
 /// are vendored under tests/fixtures/nock as published (nock 14.0.17,
 /// @mswjs/interceptors 0.41.9, @open-draft/deferred-promise 2.2.0,
 /// @open-draft/logger 0.3.0, @open-draft/until 2.1.0, is-node-process 1.2.0,
@@ -10312,11 +10317,32 @@ try {
 } catch (e) {
   console.log('fetch net connect disabled', e.name);
 }
+await new Promise((resolve) => {
+  const req = new http.ClientRequest(local + '/class-blocked');
+  req.on('error', (e) => {
+    console.log('new ClientRequest net connect disabled', e.name);
+    resolve();
+  });
+  console.log('its end() returns it', req.end() === req);
+});
 console.log('real server hits while disabled', hits);
 
 nock.enableNetConnect();
 const r5 = await get(http, local + '/through');
 console.log('unmocked host goes through', r5.status, r5.body, 'hits', hits);
+const viaClass = await new Promise((resolve, reject) => {
+  const req = new http.ClientRequest(local + '/class', (res) => {
+    let body = '';
+    res.setEncoding('utf8');
+    res.on('data', (c) => (body += c));
+    res.on('end', () => resolve(res.statusCode + ' ' + body));
+  });
+  req.on('error', reject);
+  req.end();
+});
+console.log('new ClientRequest goes through', viaClass, 'hits', hits);
+const legacy = createRequire(import.meta.url)('_http_client').ClientRequest;
+console.log('_http_client keeps the original ClientRequest', legacy !== http.ClientRequest);
 nock.restore();
 server.close();
 "#;
@@ -10338,8 +10364,12 @@ server.close();
          no match Nock: No match for request {\n\
          net connect disabled ENETUNREACH NetConnectNotAllowedError\n\
          fetch net connect disabled NetConnectNotAllowedError\n\
+         its end() returns it true\n\
+         new ClientRequest net connect disabled NetConnectNotAllowedError\n\
          real server hits while disabled 0\n\
-         unmocked host goes through 200 real GET /through hits 1",
+         unmocked host goes through 200 real GET /through hits 1\n\
+         new ClientRequest goes through 200 real GET /class hits 2\n\
+         _http_client keeps the original ClientRequest true",
         "stderr: {stderr}"
     );
 }

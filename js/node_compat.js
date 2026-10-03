@@ -22744,6 +22744,38 @@
       return socket;
     }
 
+    // node's OutgoingMessage#write / #end on a message that has no socket and
+    // never gets one -- one built by `http.OutgoingMessage.call(this)` alone,
+    // as nock's OverriddenClientRequest is when it refuses a request (net
+    // connect disabled) and its caller ends it anyway: the head and the
+    // bytes are buffered for a socket that never comes, `headersSent` and
+    // `finished` turn true, write() returns true, and 'finish' (with an
+    // end() callback waiting on it) never fires (measured on node v22.22.2).
+    function socketlessWrite(msg, chunk, encoding, callback) {
+      if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+      checkWriteChunk(chunk);
+      if (msg.finished) {
+        requestWriteAfterEnd(msg, callback);
+        return true;
+      }
+      msg.headersSent = true;
+      return true;
+    }
+    function socketlessEnd(msg, data, encoding, callback) {
+      if (typeof data === "function") { callback = data; data = undefined; }
+      if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+      if (msg.finished) {
+        if (data !== undefined && data !== null) requestWriteAfterEnd(msg, callback);
+        else if (typeof callback === "function") msg.once("finish", callback);
+        return msg;
+      }
+      if (data !== undefined && data !== null) socketlessWrite(msg, data, encoding);
+      msg.headersSent = true;
+      msg.finished = true;
+      if (typeof callback === "function") msg.once("finish", callback);
+      return msg;
+    }
+
     // responseWriteAfterEnd for a ClientRequest, whose destroyed state is
     // its own `destroyed`.
     function requestWriteAfterEnd(req, cb) {
@@ -22758,395 +22790,404 @@
       });
     }
 
+    // ClientRequest's constructor, run on `this`: node's ClientRequest is a
+    // function, so `ClientRequest.apply(this, args)` -- what nock's
+    // OverriddenClientRequest does to pass a request through -- builds the
+    // caller's object in place, and the socket, the exchange and every
+    // closure belong to it (callableHttp).
+    function initClientRequest(input, options, callback) {
+      var normalized = normalizeClientArgs(input, options, callback);
+      var opts = normalized.options || {};
+      callback = normalized.callback;
+      // node lib/_http_client.js: the agent comes first. `false` is a fresh
+      // one of the default kind, none is the default (unless a
+      // createConnection option replaces it), and anything without
+      // addRequest is refused.
+      var agent = opts.agent;
+      var defaultAgent = opts._defaultAgent || agentState.globalAgent;
+      if (agent === false) {
+        agent = new defaultAgent.constructor();
+      } else if (agent === null || agent === undefined) {
+        if (typeof opts.createConnection !== "function") agent = defaultAgent;
+      } else if (typeof agent.addRequest !== "function") {
+        throw codes.ERR_INVALID_ARG_TYPE(
+          "options.agent",
+          ["Agent-like Object", "undefined", "false"],
+          agent,
+        );
+      }
+      this.agent = agent;
+      var protocol = opts.protocol || defaultAgent.protocol || "http:";
+      var expectedProtocol = defaultAgent.protocol || "http:";
+      if (this.agent && this.agent.protocol) expectedProtocol = this.agent.protocol;
+      this.method = (opts.method || "GET").toUpperCase();
+      // Node's order: the path is validated before the port (measured with
+      // both bad -- ERR_UNESCAPED_CHARACTERS wins).
+      var reqPath = opts.path || "/";
+      if (opts.path) {
+        reqPath = String(opts.path);
+        if (INVALID_PATH_REGEX.test(reqPath)) {
+          throw codes.ERR_UNESCAPED_CHARACTERS("Request path");
+        }
+      }
+      if (protocol !== expectedProtocol) {
+        throw codes.ERR_INVALID_PROTOCOL(protocol, expectedProtocol);
+      }
+      var host =
+        validateHost(opts.hostname, "hostname") ||
+        validateHost(opts.host, "host") ||
+        "localhost";
+      var defaultPort = opts.defaultPort || (this.agent && this.agent.defaultPort);
+      var port = validateClientPort(
+        opts.port || defaultPort || (protocol === "https:" ? 443 : 80),
+      );
+      // An IPv6 literal host (`{host: '::1'}`) is bracketed in the URL, or
+      // `http://::1:80/` would not parse and the request would fail with
+      // "fetch failed" where node connects to ::1. A URL's hostname already
+      // carries its brackets (net.isIP('[::1]') is 0).
+      var urlHost = isIP(host) === 6 ? "[" + host + "]" : host;
+      // The connect target must not be movable by the caller's `path` or
+      // `host`. Node cannot be: it dials `hostname`:`port` and writes `path`
+      // as an OPAQUE request target. oam's fetch path carries the request as
+      // a URL string, and plain concatenation let both escape -- measured
+      // before this guard, `{hostname: SAFE, port: GOOD, path:
+      // '@127.0.0.1:EVIL/x'}` and `{hostname: 'u:p@127.0.0.1', ...}` both
+      // reached the OTHER origin, and take_userinfo then sent the intended
+      // origin to it as `Authorization: Basic base64(SAFE:GOOD)`.
+      //
+      // node writes `path` verbatim as the request target, in whichever
+      // form the caller chose: origin form (`/p?q`), absolute form for a
+      // forward proxy (`http://host/p` -- axios's `proxy` option,
+      // http-proxy-agent), authority form for CONNECT (`host:port` --
+      // tunnel, hpagent) or `*` for OPTIONS. So `this.path` stays as
+      // written and only the URL the fetch path DIALS is built from a copy
+      // forced into origin form. A target that is not origin form is sent
+      // over a socket this request dialled itself (`_agentPath` below),
+      // where the target is just bytes on a connection that already went
+      // to `hostname`:`port` and cannot move it.
+      var urlPath = reqPath.charAt(0) === "/" ? reqPath : "/" + reqPath;
+      var authority = null;
+      try {
+        var probe = new URL(protocol + "//" + urlHost + "/");
+        if (
+          probe.username === "" &&
+          probe.password === "" &&
+          probe.port === "" &&
+          probe.pathname === "/" &&
+          probe.search === "" &&
+          probe.hash === ""
+        ) {
+          authority = probe;
+        }
+      } catch {
+        authority = null;
+      }
+      // node hands `host` to the resolver as written. The URL parser
+      // rewrites spellings the resolver refuses -- percent-escapes, octal or
+      // zero-padded IPv4, a trailing dot on an address, a tab, IDNA,
+      // fullwidth digits -- and a transport dialling its hostname would
+      // reach an address node never dials. So a name the parser cannot
+      // hold, or holds only rewritten (or bracketed, which only some
+      // resolvers accept), goes over net.connect with the string as given:
+      // the platform's resolver answers, as it does node's.
+      this._rawHost = authority === null ||
+        (isIP(host) === 0 &&
+          (authority.hostname !== host.toLowerCase() || host.charAt(0) === "["));
+      this._url = protocol + "//" + urlHost + ":" + port + urlPath;
+      this._headers = {};
+      if (opts.headers) {
+        var keys = Object.keys(opts.headers);
+        for (var i = 0; i < keys.length; i++) {
+          // node's constructor sets each through setHeader(), so a bad
+          // name or value throws from http.request itself (#174).
+          checkOutgoingHeader(keys[i], opts.headers[keys[i]]);
+          this._headers[keys[i].toLowerCase()] = opts.headers[keys[i]];
+        }
+      }
+      // node sets the Host header with setHeader() here, before the auth
+      // one and after the caller's (measured order: the caller's, Host,
+      // Authorization, Connection). It is an ORDINARY header from then on:
+      // getHeader('host') reads it back -- http-proxy-agent builds the
+      // absolute-form target it rewrites `path` to out of it, and without
+      // it aims every request at `localhost` -- and removeHeader('host')
+      // really drops it.
+      this._setHost = opts.setHost !== undefined
+        ? Boolean(opts.setHost)
+        : opts.setDefaultHeaders !== false;
+      var hostHeader = host;
+      var firstColon = hostHeader.indexOf(":");
+      if (
+        firstColon !== -1 &&
+        hostHeader.indexOf(":", firstColon + 1) !== -1 &&
+        hostHeader.charAt(0) !== "["
+      ) {
+        hostHeader = "[" + hostHeader + "]";
+      }
+      if (port && +port !== defaultPort) hostHeader += ":" + port;
+      this._hostHeader = hostHeader;
+      if (this._setHost && this._headers.host === undefined) {
+        // node's setHeader() value check throws for a character no header
+        // may carry -- a host spelled with fullwidth digits, say -- before
+        // anything is resolved.
+        if (INVALID_HEADER_CHAR.test(hostHeader)) throw invalidHeaderChar("Host");
+        this._headers.host = hostHeader;
+      }
+      // node lib/_http_client.js: `if (options.auth && !this.getHeader(
+      // 'Authorization')) this.setHeader('Authorization', 'Basic ' +
+      // Buffer.from(options.auth).toString('base64'))`. The bytes are the
+      // string's UTF-8 (measured: `auth: 'café:p'` sends
+      // `Basic Y2Fmw6k6cA==`), no colon is required, an empty `auth` sends
+      // nothing, and an explicit authorization header wins in either case.
+      // oam dropped the documented option entirely, so every caller using it
+      // -- and every `http.request('http://u:p@host/')`, whose userinfo IS
+      // this option -- talked to the server unauthenticated and got a 401.
+      if (opts.auth && this._headers["authorization"] === undefined) {
+        this._headers["authorization"] =
+          "Basic " + globalThis.Buffer.from(String(opts.auth), "utf8").toString("base64");
+      }
+      // node: the response head limit for this request (0 or absent: the
+      // process-wide --max-http-header-size, http.maxHeaderSize), and
+      // insecureHTTPParser, which does not lift it. Validated as node's
+      // constructor validates them; an agent's options are not consulted.
+      var maxHeaderSize = opts.maxHeaderSize;
+      if (maxHeaderSize !== undefined) {
+        if (typeof maxHeaderSize !== "number") {
+          throw codes.ERR_INVALID_ARG_TYPE("maxHeaderSize", "number", maxHeaderSize);
+        }
+        if (!Number.isInteger(maxHeaderSize)) {
+          throw codes.ERR_OUT_OF_RANGE("maxHeaderSize", "an integer", maxHeaderSize);
+        }
+        if (maxHeaderSize < 0 || maxHeaderSize > Number.MAX_SAFE_INTEGER) {
+          throw codes.ERR_OUT_OF_RANGE(
+            "maxHeaderSize",
+            ">= 0 && <= " + Number.MAX_SAFE_INTEGER,
+            maxHeaderSize,
+          );
+        }
+      }
+      this.maxHeaderSize = maxHeaderSize;
+      var insecureHTTPParser = opts.insecureHTTPParser;
+      if (insecureHTTPParser !== undefined && typeof insecureHTTPParser !== "boolean") {
+        throw codes.ERR_INVALID_ARG_TYPE(
+          "options.insecureHTTPParser",
+          "boolean",
+          insecureHTTPParser,
+        );
+      }
+      this.insecureHTTPParser = insecureHTTPParser;
+      this._body = [];
+      this._ended = false;
+      this._aborted = false;
+      this.headersSent = false;
+      // node's OutgoingMessage internals a proxy agent reaches for. node
+      // renders the request head into `_header` when the message is sent
+      // and queues what follows in `outputData`; http-proxy-agent (v7-v9,
+      // under proxy-agent) nulls `_header`, rewrites `path` to absolute
+      // form, calls `_implicitHeader()` to re-render, and -- only if there
+      // is one -- patches the head at the front of `outputData`. oam
+      // renders the head when it actually sends, from the live `path` and
+      // headers, so nothing is ever queued ahead of it and `outputData`
+      // stays empty.
+      this._header = null;
+      this.outputData = [];
+      // Node's ClientRequest is an OutgoingMessage: a LEGACY writable
+      // stream -- no _writableState, lifecycle duck-read off plain
+      // properties. The vendored end-of-stream keys on exactly these, so
+      // without them `pipeline(src, req)` / `stream.finished(req)` wait
+      // forever on a 'finish' that never comes (test-stream-pipeline).
+      this.writable = true;
+      this.finished = false;
+      this.destroyed = false;
+      this.closed = false;
+      this.aborted = false;
+      this.res = null;
+      this.errored = null;
+      this._bodyLength = 0;
+      this._bodyStream = null;
+      // Cancels the transport's request while it has no response (set by
+      // _doFetchRequest; see _cancelBodyStream).
+      this._fetchCancel = null;
+      // Every operation on the outbound body channel queues behind the one
+      // before it (see _channelWrite). Unordered calls race: the write op is
+      // ASYNC and the end op is SYNCHRONOUS, so end() drops the channel's
+      // sender before a spawned write has cloned it, that write fails as an
+      // unknown stream, and the chunk is LOST -- the server sees a
+      // well-formed, complete chunked body missing its tail and neither side
+      // reports an error. Measured on node v22.22.2: write('aa') write('bb')
+      // write('cc') end() echoes "aabbcc" every time; oam echoed "aabb" on
+      // most runs before this chain existed. Two writes in flight at once
+      // could also reach the mpsc channel out of order (multi-thread tokio).
+      this._channelTail = null;
+      this._streamArmed = false;
+      this._sent = false;
+      this._droppedWrites = false;
+      this._finished = false;
+      // node: null until the 'socket' event.
+      this.socket = null;
+      this.path = reqPath;
+      this.host = host;
+      this.protocol = protocol;
+      this.reusedSocket = false;
+      // node: with an agent the socket is kept alive unless the agent could
+      // never reuse it (no keepAlive and no maxSockets cap); without one
+      // (a createConnection option) it is closed.
+      this.shouldKeepAlive = !!this.agent &&
+        !(!this.agent.keepAlive && !Number.isFinite(this.agent.maxSockets));
+      this._removedConnection = false;
+      // node's req._ended: the response has ended (the socket may be freed
+      // once the request has finished too).
+      this._responseEnd = false;
+      // An agent-path request between addRequest and its socket.
+      this._awaitingSocket = false;
+      if (opts.timeout !== undefined) this.timeout = requestTimerDuration(opts.timeout, "timeout");
+      // node's req.timeoutCb: 0 not listening for the socket's 'timeout',
+      // 1 listening (it is re-emitted on the request once), 2 done.
+      this._timeoutListen = 0;
+      this._timeoutAfterResponse = false;
+      // A response teardown held until the socket's 'timeout' listeners
+      // have all run (_onSocketTimeout).
+      this._inSocketTimeout = false;
+      this._resTeardown = null;
+      this._pendingDispatch = null;
+      this._socketEmitted = false;
+      this._responded = false;
+      this._responseDone = false;
+      this._errorEmitted = false;
+      this._bridge = null;
+      this._bridgeIn = null;
+      this._bridgeEnded = false;
+      // Bytes the socket delivered before the exchange started, and those
+      // held back until hyper has written the request (_pumpBridge).
+      this._earlyData = null;
+      this._bridgeGate = null;
+      // The socket closed after delivering a response the exchange still
+      // has to read; the request let go of a kept-alive socket.
+      this._socketGone = false;
+      this._keptAlive = false;
+      // The socket's EOF, held back while the response head is due.
+      this._eofHold = null;
+      // node's 'finish' over a socket: once end() has been called
+      // (_finishOnWrite) and the socket has written the whole request --
+      // `_requestBytes` (the bridge's count, once hyper has written it all)
+      // of the `_requestOut` bytes written so far (_requestFlushed).
+      // `_finishAwaitsPath`: end() came while the way to send was still
+      // being decided (_emitFetchSocket).
+      // `_requestAccepted`: of those, the bytes the socket has TAKEN --
+      // ahead of `_requestOut`, which waits for the write to come back
+      // (_requestWritableFinished).
+      this._finishOnWrite = false;
+      this._finishAwaitsPath = false;
+      this._requestBytes = null;
+      this._requestOut = 0;
+      this._requestAccepted = 0;
+      this._requestWritten = false;
+      // write() callbacks, called as node calls them: once the socket has
+      // written the chunk, so never before it connected. Each waits for
+      // its place in the request body (`at`, as `_bodyQueued` counts it)
+      // to be covered by `_bodyWritten`, the body bytes the socket has
+      // written -- read off the bridge's progress (`_marks`: [request
+      // bytes, the body bytes they cover] pairs `_requestOut` has yet to
+      // reach, oldest first; `_markSeen` the newest of them).
+      // `_onSocket`: the request's writes are its socket's, in node's
+      // terms -- from the tick 'socket' is emitted in, when node flushes
+      // what the request queued. A request destroyed before that never has
+      // a callback called; one that fails after it has them called with
+      // the socket's reason once it has closed (_failWriteCallbacks).
+      // `_socketConnected`: that socket connected. `_socketFailure`: the
+      // error it failed with.
+      this._writeCallbacks = [];
+      this._bodyQueued = 0;
+      this._bodyWritten = -1;
+      this._marks = [];
+      this._markSeen = 0;
+      this._onSocket = false;
+      this._socketConnected = false;
+      this._socketFailure = null;
+      // oam's own transport. `_fetchDispatched`: it has been handed the
+      // request. `_fetchSent`: it has a connection for it (the sent
+      // signal, `_sentSignal` while open) -- from then on the request is
+      // being written, a write() callback is called as the transport takes
+      // its chunk, and 'finish' follows the last of them (`_finishOnSent`:
+      // end() has asked for it; `_channelPending`: chunks the transport
+      // has yet to take). A request that never gets a connection has
+      // neither, as in node.
+      this._fetchDispatched = false;
+      this._fetchSent = false;
+      this._sentSignal = null;
+      this._finishOnSent = false;
+      this._channelPending = 0;
+      // The response leaves the transport's connection open: the request
+      // closes from the response's 'end' rather than behind its 'close'.
+      this._fetchKeptAlive = false;
+      // Inside the socket's 'connect' / 'secureConnect' emit, ahead of the
+      // request's own listener; and what a listener there closed the
+      // socket with (true: no error), held for that listener to report.
+      this._inConnectEvent = false;
+      this._closedOnConnect = null;
+      this._exchangeQueued = false;
+      this._waitingConnect = false;
+      this._earlySocketEvents = null;
+      if (callback) this.once("response", callback);
+
+      // Which way it goes. The agent's options win over the request's, as
+      // node's createSocket merges them (`{...options, ...agent.options}`).
+      var merged = Object.assign({}, opts, agent ? agent.options : undefined);
+      var literal = isIP(host) !== 0;
+      this._agentPath =
+        (agent && !agentIsStock(agent)) ||
+        (!agent && typeof opts.createConnection === "function") ||
+        (!literal && merged.lookup != null) ||
+        (!literal && dnsLookupReplaced()) ||
+        socketLayerPatched(protocol === "https:") ||
+        (protocol === "https:" && carriesTlsPolicy(merged)) ||
+        // A socket an earlier request over this (stock) agent left in its
+        // pool is reused, as node's addRequest reuses it.
+        (!!agent && agentHasFreeSocket(agent, this, opts, host, port)) ||
+        // node sends it to the Unix socket or named pipe, never host:port;
+        // the agent's socket goes where net.connect({path}) goes.
+        !!merged.socketPath ||
+        // node binds the socket it connects to these; so does net.connect.
+        !!merged.localAddress || !!merged.localPort ||
+        // A request target that is not origin form is written verbatim
+        // onto a socket of this request's own (see `urlPath` above), and
+        // CONNECT hands that socket to the caller -- neither is something
+        // oam's own transport, which carries a request as a URL, can do.
+        urlPath !== reqPath ||
+        this.method === "CONNECT" ||
+        this._rawHost;
+      // node dials the target itself unless its own global agent carries
+      // the environment proxy (NODE_USE_ENV_PROXY=1): a request oam's
+      // transport would send through a proxy that node would not goes
+      // over the agent's socket, which dials directly.
+      if (!this._agentPath && !(ENV_PROXY_AGENTS.has(agent) && useEnvProxy()) &&
+          natives.httpEnvProxied(this._url)) {
+        this._agentPath = true;
+      }
+      this._options = opts;
+      this._port = port;
+      this._fetchSocket = null;
+      if (this._agentPath) {
+        // node starts connecting here, in the constructor: a lookup hook
+        // runs inside http.request(), and what it throws is thrown there.
+        this._connectByAgent();
+      } else {
+        this._fetchSocket = makeFetchSocket(protocol === "https:");
+        var self = this;
+        process.nextTick(function () {
+          self._emitFetchSocket();
+        });
+      }
+    }
+
     class ClientRequest extends EventEmitter {
       constructor(input, options, callback) {
         super();
-        var normalized = normalizeClientArgs(input, options, callback);
-        var opts = normalized.options || {};
-        callback = normalized.callback;
-        // node lib/_http_client.js: the agent comes first. `false` is a fresh
-        // one of the default kind, none is the default (unless a
-        // createConnection option replaces it), and anything without
-        // addRequest is refused.
-        var agent = opts.agent;
-        var defaultAgent = opts._defaultAgent || agentState.globalAgent;
-        if (agent === false) {
-          agent = new defaultAgent.constructor();
-        } else if (agent === null || agent === undefined) {
-          if (typeof opts.createConnection !== "function") agent = defaultAgent;
-        } else if (typeof agent.addRequest !== "function") {
-          throw codes.ERR_INVALID_ARG_TYPE(
-            "options.agent",
-            ["Agent-like Object", "undefined", "false"],
-            agent,
-          );
-        }
-        this.agent = agent;
-        var protocol = opts.protocol || defaultAgent.protocol || "http:";
-        var expectedProtocol = defaultAgent.protocol || "http:";
-        if (this.agent && this.agent.protocol) expectedProtocol = this.agent.protocol;
-        this.method = (opts.method || "GET").toUpperCase();
-        // Node's order: the path is validated before the port (measured with
-        // both bad -- ERR_UNESCAPED_CHARACTERS wins).
-        var reqPath = opts.path || "/";
-        if (opts.path) {
-          reqPath = String(opts.path);
-          if (INVALID_PATH_REGEX.test(reqPath)) {
-            throw codes.ERR_UNESCAPED_CHARACTERS("Request path");
-          }
-        }
-        if (protocol !== expectedProtocol) {
-          throw codes.ERR_INVALID_PROTOCOL(protocol, expectedProtocol);
-        }
-        var host =
-          validateHost(opts.hostname, "hostname") ||
-          validateHost(opts.host, "host") ||
-          "localhost";
-        var defaultPort = opts.defaultPort || (this.agent && this.agent.defaultPort);
-        var port = validateClientPort(
-          opts.port || defaultPort || (protocol === "https:" ? 443 : 80),
-        );
-        // An IPv6 literal host (`{host: '::1'}`) is bracketed in the URL, or
-        // `http://::1:80/` would not parse and the request would fail with
-        // "fetch failed" where node connects to ::1. A URL's hostname already
-        // carries its brackets (net.isIP('[::1]') is 0).
-        var urlHost = isIP(host) === 6 ? "[" + host + "]" : host;
-        // The connect target must not be movable by the caller's `path` or
-        // `host`. Node cannot be: it dials `hostname`:`port` and writes `path`
-        // as an OPAQUE request target. oam's fetch path carries the request as
-        // a URL string, and plain concatenation let both escape -- measured
-        // before this guard, `{hostname: SAFE, port: GOOD, path:
-        // '@127.0.0.1:EVIL/x'}` and `{hostname: 'u:p@127.0.0.1', ...}` both
-        // reached the OTHER origin, and take_userinfo then sent the intended
-        // origin to it as `Authorization: Basic base64(SAFE:GOOD)`.
-        //
-        // node writes `path` verbatim as the request target, in whichever
-        // form the caller chose: origin form (`/p?q`), absolute form for a
-        // forward proxy (`http://host/p` -- axios's `proxy` option,
-        // http-proxy-agent), authority form for CONNECT (`host:port` --
-        // tunnel, hpagent) or `*` for OPTIONS. So `this.path` stays as
-        // written and only the URL the fetch path DIALS is built from a copy
-        // forced into origin form. A target that is not origin form is sent
-        // over a socket this request dialled itself (`_agentPath` below),
-        // where the target is just bytes on a connection that already went
-        // to `hostname`:`port` and cannot move it.
-        var urlPath = reqPath.charAt(0) === "/" ? reqPath : "/" + reqPath;
-        var authority = null;
-        try {
-          var probe = new URL(protocol + "//" + urlHost + "/");
-          if (
-            probe.username === "" &&
-            probe.password === "" &&
-            probe.port === "" &&
-            probe.pathname === "/" &&
-            probe.search === "" &&
-            probe.hash === ""
-          ) {
-            authority = probe;
-          }
-        } catch {
-          authority = null;
-        }
-        // node hands `host` to the resolver as written. The URL parser
-        // rewrites spellings the resolver refuses -- percent-escapes, octal or
-        // zero-padded IPv4, a trailing dot on an address, a tab, IDNA,
-        // fullwidth digits -- and a transport dialling its hostname would
-        // reach an address node never dials. So a name the parser cannot
-        // hold, or holds only rewritten (or bracketed, which only some
-        // resolvers accept), goes over net.connect with the string as given:
-        // the platform's resolver answers, as it does node's.
-        this._rawHost = authority === null ||
-          (isIP(host) === 0 &&
-            (authority.hostname !== host.toLowerCase() || host.charAt(0) === "["));
-        this._url = protocol + "//" + urlHost + ":" + port + urlPath;
-        this._headers = {};
-        if (opts.headers) {
-          var keys = Object.keys(opts.headers);
-          for (var i = 0; i < keys.length; i++) {
-            // node's constructor sets each through setHeader(), so a bad
-            // name or value throws from http.request itself (#174).
-            checkOutgoingHeader(keys[i], opts.headers[keys[i]]);
-            this._headers[keys[i].toLowerCase()] = opts.headers[keys[i]];
-          }
-        }
-        // node sets the Host header with setHeader() here, before the auth
-        // one and after the caller's (measured order: the caller's, Host,
-        // Authorization, Connection). It is an ORDINARY header from then on:
-        // getHeader('host') reads it back -- http-proxy-agent builds the
-        // absolute-form target it rewrites `path` to out of it, and without
-        // it aims every request at `localhost` -- and removeHeader('host')
-        // really drops it.
-        this._setHost = opts.setHost !== undefined
-          ? Boolean(opts.setHost)
-          : opts.setDefaultHeaders !== false;
-        var hostHeader = host;
-        var firstColon = hostHeader.indexOf(":");
-        if (
-          firstColon !== -1 &&
-          hostHeader.indexOf(":", firstColon + 1) !== -1 &&
-          hostHeader.charAt(0) !== "["
-        ) {
-          hostHeader = "[" + hostHeader + "]";
-        }
-        if (port && +port !== defaultPort) hostHeader += ":" + port;
-        this._hostHeader = hostHeader;
-        if (this._setHost && this._headers.host === undefined) {
-          // node's setHeader() value check throws for a character no header
-          // may carry -- a host spelled with fullwidth digits, say -- before
-          // anything is resolved.
-          if (INVALID_HEADER_CHAR.test(hostHeader)) throw invalidHeaderChar("Host");
-          this._headers.host = hostHeader;
-        }
-        // node lib/_http_client.js: `if (options.auth && !this.getHeader(
-        // 'Authorization')) this.setHeader('Authorization', 'Basic ' +
-        // Buffer.from(options.auth).toString('base64'))`. The bytes are the
-        // string's UTF-8 (measured: `auth: 'café:p'` sends
-        // `Basic Y2Fmw6k6cA==`), no colon is required, an empty `auth` sends
-        // nothing, and an explicit authorization header wins in either case.
-        // oam dropped the documented option entirely, so every caller using it
-        // -- and every `http.request('http://u:p@host/')`, whose userinfo IS
-        // this option -- talked to the server unauthenticated and got a 401.
-        if (opts.auth && this._headers["authorization"] === undefined) {
-          this._headers["authorization"] =
-            "Basic " + globalThis.Buffer.from(String(opts.auth), "utf8").toString("base64");
-        }
-        // node: the response head limit for this request (0 or absent: the
-        // process-wide --max-http-header-size, http.maxHeaderSize), and
-        // insecureHTTPParser, which does not lift it. Validated as node's
-        // constructor validates them; an agent's options are not consulted.
-        var maxHeaderSize = opts.maxHeaderSize;
-        if (maxHeaderSize !== undefined) {
-          if (typeof maxHeaderSize !== "number") {
-            throw codes.ERR_INVALID_ARG_TYPE("maxHeaderSize", "number", maxHeaderSize);
-          }
-          if (!Number.isInteger(maxHeaderSize)) {
-            throw codes.ERR_OUT_OF_RANGE("maxHeaderSize", "an integer", maxHeaderSize);
-          }
-          if (maxHeaderSize < 0 || maxHeaderSize > Number.MAX_SAFE_INTEGER) {
-            throw codes.ERR_OUT_OF_RANGE(
-              "maxHeaderSize",
-              ">= 0 && <= " + Number.MAX_SAFE_INTEGER,
-              maxHeaderSize,
-            );
-          }
-        }
-        this.maxHeaderSize = maxHeaderSize;
-        var insecureHTTPParser = opts.insecureHTTPParser;
-        if (insecureHTTPParser !== undefined && typeof insecureHTTPParser !== "boolean") {
-          throw codes.ERR_INVALID_ARG_TYPE(
-            "options.insecureHTTPParser",
-            "boolean",
-            insecureHTTPParser,
-          );
-        }
-        this.insecureHTTPParser = insecureHTTPParser;
-        this._body = [];
-        this._ended = false;
-        this._aborted = false;
-        this.headersSent = false;
-        // node's OutgoingMessage internals a proxy agent reaches for. node
-        // renders the request head into `_header` when the message is sent
-        // and queues what follows in `outputData`; http-proxy-agent (v7-v9,
-        // under proxy-agent) nulls `_header`, rewrites `path` to absolute
-        // form, calls `_implicitHeader()` to re-render, and -- only if there
-        // is one -- patches the head at the front of `outputData`. oam
-        // renders the head when it actually sends, from the live `path` and
-        // headers, so nothing is ever queued ahead of it and `outputData`
-        // stays empty.
-        this._header = null;
-        this.outputData = [];
-        // Node's ClientRequest is an OutgoingMessage: a LEGACY writable
-        // stream -- no _writableState, lifecycle duck-read off plain
-        // properties. The vendored end-of-stream keys on exactly these, so
-        // without them `pipeline(src, req)` / `stream.finished(req)` wait
-        // forever on a 'finish' that never comes (test-stream-pipeline).
-        this.writable = true;
-        this.finished = false;
-        this.destroyed = false;
-        this.closed = false;
-        this.aborted = false;
-        this.res = null;
-        this.errored = null;
-        this._bodyLength = 0;
-        this._bodyStream = null;
-        // Cancels the transport's request while it has no response (set by
-        // _doFetchRequest; see _cancelBodyStream).
-        this._fetchCancel = null;
-        // Every operation on the outbound body channel queues behind the one
-        // before it (see _channelWrite). Unordered calls race: the write op is
-        // ASYNC and the end op is SYNCHRONOUS, so end() drops the channel's
-        // sender before a spawned write has cloned it, that write fails as an
-        // unknown stream, and the chunk is LOST -- the server sees a
-        // well-formed, complete chunked body missing its tail and neither side
-        // reports an error. Measured on node v22.22.2: write('aa') write('bb')
-        // write('cc') end() echoes "aabbcc" every time; oam echoed "aabb" on
-        // most runs before this chain existed. Two writes in flight at once
-        // could also reach the mpsc channel out of order (multi-thread tokio).
-        this._channelTail = null;
-        this._streamArmed = false;
-        this._sent = false;
-        this._droppedWrites = false;
-        this._finished = false;
-        // node: null until the 'socket' event.
-        this.socket = null;
-        this.path = reqPath;
-        this.host = host;
-        this.protocol = protocol;
-        this.reusedSocket = false;
-        // node: with an agent the socket is kept alive unless the agent could
-        // never reuse it (no keepAlive and no maxSockets cap); without one
-        // (a createConnection option) it is closed.
-        this.shouldKeepAlive = !!this.agent &&
-          !(!this.agent.keepAlive && !Number.isFinite(this.agent.maxSockets));
-        this._removedConnection = false;
-        // node's req._ended: the response has ended (the socket may be freed
-        // once the request has finished too).
-        this._responseEnd = false;
-        // An agent-path request between addRequest and its socket.
-        this._awaitingSocket = false;
-        if (opts.timeout !== undefined) this.timeout = requestTimerDuration(opts.timeout, "timeout");
-        // node's req.timeoutCb: 0 not listening for the socket's 'timeout',
-        // 1 listening (it is re-emitted on the request once), 2 done.
-        this._timeoutListen = 0;
-        this._timeoutAfterResponse = false;
-        // A response teardown held until the socket's 'timeout' listeners
-        // have all run (_onSocketTimeout).
-        this._inSocketTimeout = false;
-        this._resTeardown = null;
-        this._pendingDispatch = null;
-        this._socketEmitted = false;
-        this._responded = false;
-        this._responseDone = false;
-        this._errorEmitted = false;
-        this._bridge = null;
-        this._bridgeIn = null;
-        this._bridgeEnded = false;
-        // Bytes the socket delivered before the exchange started, and those
-        // held back until hyper has written the request (_pumpBridge).
-        this._earlyData = null;
-        this._bridgeGate = null;
-        // The socket closed after delivering a response the exchange still
-        // has to read; the request let go of a kept-alive socket.
-        this._socketGone = false;
-        this._keptAlive = false;
-        // The socket's EOF, held back while the response head is due.
-        this._eofHold = null;
-        // node's 'finish' over a socket: once end() has been called
-        // (_finishOnWrite) and the socket has written the whole request --
-        // `_requestBytes` (the bridge's count, once hyper has written it all)
-        // of the `_requestOut` bytes written so far (_requestFlushed).
-        // `_finishAwaitsPath`: end() came while the way to send was still
-        // being decided (_emitFetchSocket).
-        // `_requestAccepted`: of those, the bytes the socket has TAKEN --
-        // ahead of `_requestOut`, which waits for the write to come back
-        // (_requestWritableFinished).
-        this._finishOnWrite = false;
-        this._finishAwaitsPath = false;
-        this._requestBytes = null;
-        this._requestOut = 0;
-        this._requestAccepted = 0;
-        this._requestWritten = false;
-        // write() callbacks, called as node calls them: once the socket has
-        // written the chunk, so never before it connected. Each waits for
-        // its place in the request body (`at`, as `_bodyQueued` counts it)
-        // to be covered by `_bodyWritten`, the body bytes the socket has
-        // written -- read off the bridge's progress (`_marks`: [request
-        // bytes, the body bytes they cover] pairs `_requestOut` has yet to
-        // reach, oldest first; `_markSeen` the newest of them).
-        // `_onSocket`: the request's writes are its socket's, in node's
-        // terms -- from the tick 'socket' is emitted in, when node flushes
-        // what the request queued. A request destroyed before that never has
-        // a callback called; one that fails after it has them called with
-        // the socket's reason once it has closed (_failWriteCallbacks).
-        // `_socketConnected`: that socket connected. `_socketFailure`: the
-        // error it failed with.
-        this._writeCallbacks = [];
-        this._bodyQueued = 0;
-        this._bodyWritten = -1;
-        this._marks = [];
-        this._markSeen = 0;
-        this._onSocket = false;
-        this._socketConnected = false;
-        this._socketFailure = null;
-        // oam's own transport. `_fetchDispatched`: it has been handed the
-        // request. `_fetchSent`: it has a connection for it (the sent
-        // signal, `_sentSignal` while open) -- from then on the request is
-        // being written, a write() callback is called as the transport takes
-        // its chunk, and 'finish' follows the last of them (`_finishOnSent`:
-        // end() has asked for it; `_channelPending`: chunks the transport
-        // has yet to take). A request that never gets a connection has
-        // neither, as in node.
-        this._fetchDispatched = false;
-        this._fetchSent = false;
-        this._sentSignal = null;
-        this._finishOnSent = false;
-        this._channelPending = 0;
-        // The response leaves the transport's connection open: the request
-        // closes from the response's 'end' rather than behind its 'close'.
-        this._fetchKeptAlive = false;
-        // Inside the socket's 'connect' / 'secureConnect' emit, ahead of the
-        // request's own listener; and what a listener there closed the
-        // socket with (true: no error), held for that listener to report.
-        this._inConnectEvent = false;
-        this._closedOnConnect = null;
-        this._exchangeQueued = false;
-        this._waitingConnect = false;
-        this._earlySocketEvents = null;
-        if (callback) this.once("response", callback);
-
-        // Which way it goes. The agent's options win over the request's, as
-        // node's createSocket merges them (`{...options, ...agent.options}`).
-        var merged = Object.assign({}, opts, agent ? agent.options : undefined);
-        var literal = isIP(host) !== 0;
-        this._agentPath =
-          (agent && !agentIsStock(agent)) ||
-          (!agent && typeof opts.createConnection === "function") ||
-          (!literal && merged.lookup != null) ||
-          (!literal && dnsLookupReplaced()) ||
-          socketLayerPatched(protocol === "https:") ||
-          (protocol === "https:" && carriesTlsPolicy(merged)) ||
-          // A socket an earlier request over this (stock) agent left in its
-          // pool is reused, as node's addRequest reuses it.
-          (!!agent && agentHasFreeSocket(agent, this, opts, host, port)) ||
-          // node sends it to the Unix socket or named pipe, never host:port;
-          // the agent's socket goes where net.connect({path}) goes.
-          !!merged.socketPath ||
-          // node binds the socket it connects to these; so does net.connect.
-          !!merged.localAddress || !!merged.localPort ||
-          // A request target that is not origin form is written verbatim
-          // onto a socket of this request's own (see `urlPath` above), and
-          // CONNECT hands that socket to the caller -- neither is something
-          // oam's own transport, which carries a request as a URL, can do.
-          urlPath !== reqPath ||
-          this.method === "CONNECT" ||
-          this._rawHost;
-        // node dials the target itself unless its own global agent carries
-        // the environment proxy (NODE_USE_ENV_PROXY=1): a request oam's
-        // transport would send through a proxy that node would not goes
-        // over the agent's socket, which dials directly.
-        if (!this._agentPath && !(ENV_PROXY_AGENTS.has(agent) && useEnvProxy()) &&
-            natives.httpEnvProxied(this._url)) {
-          this._agentPath = true;
-        }
-        this._options = opts;
-        this._port = port;
-        this._fetchSocket = null;
-        if (this._agentPath) {
-          // node starts connecting here, in the constructor: a lookup hook
-          // runs inside http.request(), and what it throws is thrown there.
-          this._connectByAgent();
-        } else {
-          this._fetchSocket = makeFetchSocket(protocol === "https:");
-          var self = this;
-          process.nextTick(function () {
-            self._emitFetchSocket();
-          });
-        }
+        initClientRequest.call(this, input, options, callback);
       }
       // Node OutgoingMessage writable-shape getters. Computed, not stored:
       // end-of-stream reads writableFinished/writableEnded directly.
       get writableEnded() { return this.finished; }
-      get writableFinished() { return this._finished; }
+      get writableFinished() { return this._finished === true; }
       get writableLength() { return this._bodyLength; }
       get writableHighWaterMark() { return 16384; }
       get writableObjectMode() { return false; }
@@ -23277,6 +23318,9 @@
         return globalThis.Buffer.from(value, "utf8").toString("latin1");
       }
       write(chunk, encoding, callback) {
+        // Built by OutgoingMessage alone (nock's refused request): node's
+        // OutgoingMessage#write, as node's ClientRequest inherits it.
+        if (this._body === undefined) return socketlessWrite(this, chunk, encoding, callback);
         if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
         // node's write_: the chunk is checked first; then a write after
         // end() is ERR_STREAM_WRITE_AFTER_END -- the callback's and, while
@@ -23549,6 +23593,7 @@
         }
       }
       end(data, encoding, callback) {
+        if (this._body === undefined) return socketlessEnd(this, data, encoding, callback);
         if (typeof data === "function") { callback = data; data = undefined; }
         if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
         // Node's end() is idempotent. Without the guard a second end() --
@@ -26055,10 +26100,20 @@
     // `http.ServerResponse.call(this, req)`), while `construct` normalises
     // new.target for a direct `new http.X()`. Internal server code references
     // the raw lexical classes, so the native request/response path is unaffected.
-    const callableHttp = (Cls) => {
+    //
+    // `init`, for a class whose constructor body can run on any object, runs
+    // it on the caller's `this`; without one, an instance is built and its
+    // own properties copied over -- which leaves anything the constructor
+    // bound to that instance (a closure, a socket, an exchange) bound to it,
+    // so a ClientRequest built that way was never sent.
+    const callableHttp = (Cls, init) => {
       const proxy = new Proxy(Cls, {
         apply: (_t, thisArg, args) => {
           if (thisArg != null && thisArg !== globalThis && thisArg instanceof Cls) {
+            if (init !== undefined) {
+              init.apply(thisArg, args);
+              return thisArg;
+            }
             const tmp = Reflect.construct(Cls, args, Cls);
             for (const key of Reflect.ownKeys(tmp)) {
               Object.defineProperty(thisArg, key, Object.getOwnPropertyDescriptor(tmp, key));
@@ -26108,7 +26163,10 @@
       Server: callableHttp(Server),
       IncomingMessage: callableHttp(IncomingMessage),
       ServerResponse: callableHttp(ServerResponse),
-      ClientRequest: callableHttp(ClientRequest),
+      ClientRequest: callableHttp(ClientRequest, function (input, options, callback) {
+        EventEmitter.call(this);
+        initClientRequest.call(this, input, options, callback);
+      }),
       OutgoingMessage: callableHttp(OutgoingMessage),
       request,
       get,
@@ -26153,6 +26211,9 @@
       get() { return agentState.globalAgent; },
       set(value) { agentState.globalAgent = value; },
     });
+    // `_http_client`'s ClientRequest: the class itself, whatever later
+    // replaces http.ClientRequest (nock does), as node's module exports it.
+    registry._httpClientRequest = httpExports.ClientRequest;
     return httpExports;
   };
 
@@ -27353,7 +27414,10 @@
     });
     return mod;
   };
-  registry.factories["_http_client"] = () => ({ ClientRequest: registry.get("http").ClientRequest });
+  registry.factories["_http_client"] = () => {
+    registry.get("http");
+    return { ClientRequest: registry._httpClientRequest };
+  };
   registry.factories["_http_incoming"] = () => {
     // node's readStart / readStop: the flow control its parsers apply to
     // the socket under a message.

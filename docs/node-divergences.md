@@ -3139,7 +3139,13 @@ patched `http.request`; a `ClientRequest` is an `http.OutgoingMessage`
 (`368-http-response-and-request-over-own-sockets.mjs`). nock 14.0.17 intercepts
 `http.request`, `https.request` and `fetch`, `replyWithError()`s, and `disableNetConnect()`
 keeps an unmatched request off the network, line for line as under node (the e2e test
-`nock_intercepts_http_https_and_fetch_as_on_node`, against the vendored packages).
+`nock_intercepts_http_https_and_fetch_as_on_node`, against the vendored packages) -- a
+`new http.ClientRequest()` too: `http.ClientRequest.apply(this, args)`, which nock uses to
+pass one through, runs the constructor on the caller's object as node's function
+constructor does (oam built a separate request and copied its fields over, so the one
+nock held was never sent), one nock refuses ends as node's socketless `OutgoingMessage`
+does (`372-http-outgoing-message-without-socket.mjs`), and `require('_http_client')`
+keeps the original class while nock has replaced `http.ClientRequest`, as in node.
 
 - **`HTTPParser` is JavaScript, not llhttp.** It follows llhttp's strict rules and node's
   callback protocol, and is held to node's parser by feeding both the same bytes, whole and
