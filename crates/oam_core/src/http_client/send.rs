@@ -740,18 +740,22 @@ async fn run(
             );
             return OpOutcome::Json(payload.to_string());
         }
-        let mut hop_url = state.current.clone();
-        hop_url.set_fragment(None);
-
         // proxy-authorization is per hop and never carried: it is computed
-        // after the cross-origin strip, for this hop's proxy.
-        let mut hop_headers = state.carried.clone();
-        if let Some(auth) = state.transport.proxy_authorization(&state.route, &uri)
-            && !hop_headers.contains_key(PROXY_AUTHORIZATION)
-            && hop_headers.try_insert(PROXY_AUTHORIZATION, auth).is_err()
-        {
-            return OpOutcome::Failed(PrepareError::TooManyHeaders.to_string());
-        }
+        // after the cross-origin strip, for this hop's proxy. Only a hop that
+        // adds it gets a header map of its own; every other hop sends the
+        // carried map, copied once per attempt below and not once more here
+        // (#183: a plain request copied its headers twice).
+        let with_proxy_auth = match state.transport.proxy_authorization(&state.route, &uri) {
+            Some(auth) if !state.carried.contains_key(PROXY_AUTHORIZATION) => {
+                let mut headers = state.carried.clone();
+                if headers.try_insert(PROXY_AUTHORIZATION, auth).is_err() {
+                    return OpOutcome::Failed(PrepareError::TooManyHeaders.to_string());
+                }
+                Some(headers)
+            }
+            _ => None,
+        };
+        let hop_headers = with_proxy_auth.as_ref().unwrap_or(&state.carried);
 
         // The rules a 3xx answer to this hop is followed by, if it is: the
         // pool then keeps a next hop that could not be sent twice off the
@@ -890,6 +894,10 @@ async fn run(
                     if let Some(parse) = e.head_parse_outcome(state.undici_head) {
                         return parse;
                     }
+                    // The URL a failure names, without the fragment. Built
+                    // here, on the failure, rather than for every hop (#183).
+                    let mut hop_url = state.current.clone();
+                    hop_url.set_fragment(None);
                     return e.to_outcome(&hop_url);
                 }
             }
