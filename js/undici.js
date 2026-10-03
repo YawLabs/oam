@@ -1978,15 +1978,24 @@
       const { HTTPParser } = registry.get("_http_common");
       const origin = scope[kOrigin];
       const raw = [];
-      let rawText = "";
+      // The request line's method, as written; null until its first space
+      // has arrived, while `lead` holds the bytes before it.
+      let method = null;
+      let lead = null;
       let headers = [];
       let url = "";
       const body = [];
       let hasBody = false;
       let decided = false;
       let real = null;
+      // The parser frames the request and splits its head; undici's mock
+      // reads the dispatch options, not a wire, so neither llhttp limit
+      // applies to what it matches: the head may be any size (this is the
+      // client's own request, not untrusted input), and the method any token
+      // -- the parser is fed one it knows in its place (`feed` below), the
+      // body being framed the same whatever the method.
       const parser = new HTTPParser();
-      parser.initialize(HTTPParser.REQUEST, {});
+      parser.initialize(HTTPParser.REQUEST, {}, Infinity);
       const socket = new Duplex({
         read() {},
         write(chunk, encoding, callback) {
@@ -1999,8 +2008,19 @@
             return;
           }
           raw.push(chunk);
-          if (rawText.indexOf(" ") === -1) rawText += chunk.toString("latin1", 0, Math.min(chunk.length, 64));
-          const parsed = parser.execute(chunk);
+          let feed = chunk;
+          if (method === null) {
+            lead = lead === null ? chunk : G.Buffer.concat([lead, chunk]);
+            const space = lead.indexOf(0x20);
+            if (space === -1) {
+              callback();
+              return;
+            }
+            method = lead.toString("latin1", 0, space);
+            feed = G.Buffer.concat([G.Buffer.from("POST", "latin1"), lead.subarray(space)]);
+            lead = null;
+          }
+          const parsed = parser.execute(feed);
           if (parsed instanceof Error) {
             callback();
             fail(parsed);
@@ -2054,7 +2074,6 @@
       // the fields a client adds on the wire (host, connection, framing)
       // left out, as they are not in a dispatch's options.
       function requestOptions() {
-        const method = rawText.slice(0, rawText.indexOf(" "));
         const seen = {};
         for (let i = 0; i < headers.length; i += 2) {
           const name = headers[i].toLowerCase();

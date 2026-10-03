@@ -7854,7 +7854,9 @@ server.close();
 /// callback, replyWithError(), times(), persist(), delay(), the path / method /
 /// body / headers / query matchers, defaultReplyHeaders() and
 /// replyContentLength(), an https origin, an origin matcher, a redirect
-/// between mocked origins, a gzip body, pendingInterceptors() and
+/// between mocked origins, a gzip body, a request head over llhttp's size
+/// limit and a method llhttp does not know (both failed with the parser's
+/// error until the review of #206), pendingInterceptors() and
 /// assertNoPendingInterceptors(), and undici's argument checks. Up to 0.17.1
 /// the three refused at construction. The expected lines are node v22.22.2's
 /// with undici 6.29.0 installed, running the same script.
@@ -7966,6 +7968,12 @@ console.log('https', await (await fetch('https://secure.invalid/s')).text());
 
 agent.get(/\.wild\.invalid$/).intercept({ path: '/w' }).reply(200, 'wildcard').times(2);
 console.log('origin matcher', await (await fetch('http://a.wild.invalid/w')).text(), await (await fetch('http://b.wild.invalid/w')).text());
+pool.intercept({ path: '/big' }).reply(200, 'big head');
+console.log('20000-byte header', await (await fetch('http://example.invalid/big', { headers: { 'x-big': 'a'.repeat(20000) } })).text());
+pool.intercept({ path: '/foo', method: 'FOO' }).reply(200, 'foo fetch');
+console.log('method FOO fetch', await (await fetch('http://example.invalid/foo', { method: 'FOO' })).text());
+pool.intercept({ path: '/foo', method: 'FOO', body: 'up' }).reply(200, 'foo request');
+console.log('method FOO request', await (await request('http://example.invalid/foo', { method: 'FOO', body: 'up' })).body.text());
 
 pool.intercept({ path: '/never' }).reply(200, 'never');
 console.log('pending', agent.pendingInterceptors().map((i) => `${i.origin} ${i.method} ${i.path} ${i.timesInvoked}/${i.times}`).join('; '));
@@ -8020,6 +8028,9 @@ gzip zipped
 defaults [["content-length","4"],["x-def","d"]] abcd
 https secure
 origin matcher wildcard wildcard
+20000-byte header big head
+method FOO fetch foo fetch
+method FOO request foo request
 pending http://example.invalid POST /m 0/1; http://example.invalid GET /never 0/1
 UndiciError UND_ERR
 2 interceptors are pending:
