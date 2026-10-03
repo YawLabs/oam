@@ -366,7 +366,9 @@ fn trim_leading_ows(v: &[u8]) -> &[u8] {
     &v[start..]
 }
 
-fn trim_ows(v: &[u8]) -> &[u8] {
+/// `v` without the optional whitespace (SP / HTAB) around it, which RFC 9110
+/// section 5.5 excludes from a field value.
+pub(crate) fn trim_ows(v: &[u8]) -> &[u8] {
     let v = trim_leading_ows(v);
     let end = v
         .iter()

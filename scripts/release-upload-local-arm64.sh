@@ -46,14 +46,17 @@ cd "$SCRIPT_DIR/.."
 # shellcheck source=lib/signing.sh
 . "$SCRIPT_DIR/lib/signing.sh"
 
-# ONE EXIT trap: the scratch dir (created after the build) and the private
-# signing agent (started before it) both go on every exit, Ctrl-C included.
+# ONE EXIT trap: the scratch dirs (the published asset's signature check, the
+# staging dir created after the build) and the private signing agent (started
+# before it) all go on every exit, Ctrl-C included.
 tmp=""
 trust_dir=""
 wt=""
+prior_dir=""
 cleanup() {
   release_agent_stop
   if [ -n "$tmp" ]; then rm -rf "$tmp"; fi
+  if [ -n "$prior_dir" ]; then rm -rf "$prior_dir"; fi
   if [ -n "$trust_dir" ]; then rm -rf "$trust_dir"; fi
   if [ -n "$wt" ]; then
     git worktree remove --force "$wt" >/dev/null 2>&1 || true
@@ -174,6 +177,54 @@ else
   echo "  [warn] ${TAG} has no RELEASE-MANIFEST (a pre-signing release) -- SHA256SUMS is patched unsigned, as before" >&2
 fi
 
+# Windows Authenticode for the patched-in binary: same decision, knobs and
+# preflight as release-local.sh (OAM_WIN_SIGN_METADATA / _PUBLISHER,
+# OAM_SKIP_WIN_SIGN, OAM_SIGN_REQUIRED), proven before the build so a lapsed
+# az session costs seconds. Signed whatever the release's other assets carry:
+# a signed binary is never worse than the unsigned one it replaces.
+#
+# The other direction is not symmetric. A run that will NOT sign (bootstrap:
+# a shell without the knobs) must not --clobber a published asset that IS
+# signed -- SmartScreen and Smart App Control would start blocking a binary
+# they trusted, under a freshly re-signed manifest. So the current asset is
+# fetched and its PE certificate table read; a signed one is replaced unsigned
+# only on an explicit OAM_SKIP_WIN_SIGN=1, and "cannot tell" counts as signed.
+# Asked twice: before the build (so a refusal costs seconds), and again right
+# before the --clobber upload, from a fresh asset list -- a signed asset
+# published by another run during the build must not be overwritten either.
+#
+# guard_signed_asset <what was not done> -- exit 1 when this run would replace
+# a signed (or unreadable) published asset with an unsigned one.
+guard_signed_asset() {
+  local assets state=unknown
+  [ "$WIN_SIGNING" = "0" ] || return 0
+  assets="$(gh release view "$TAG" --repo "$REPO" --json assets -q '.assets[].name')" \
+    || { echo "error: could not list ${TAG}'s assets to check whether ${ASSET} is Authenticode-signed; $1" >&2; exit 1; }
+  grep -qxF "$ASSET" <<<"$assets" || return 0
+  prior_dir="$(mktemp -d)"
+  if gh release download "$TAG" --repo "$REPO" --dir "$prior_dir" --pattern "$ASSET"; then
+    state="$(win_pe_signature_state "${prior_dir}/${ASSET}")"
+  fi
+  rm -rf "$prior_dir"
+  prior_dir=""
+  [ "$state" != "unsigned" ] || return 0
+  if [ "${OAM_SKIP_WIN_SIGN:-0}" = "1" ]; then
+    echo "  [warn] ${TAG}'s published ${ASSET} is Authenticode-signed (${state}); OAM_SKIP_WIN_SIGN=1 replaces it with an UNSIGNED build" >&2
+    return 0
+  fi
+  echo "error: ${TAG}'s published ${ASSET} is Authenticode-signed (or could not be read: ${state}), and this run would replace it with an UNSIGNED build -- set OAM_WIN_SIGN_METADATA and OAM_WIN_SIGN_PUBLISHER (release-keys/README.md), or OAM_SKIP_WIN_SIGN=1 to downgrade it deliberately; $1" >&2
+  exit 1
+}
+WIN_SIGNING=0
+win_decision="$(win_sign_decision "${OAM_SKIP_WIN_SIGN:-0}")"
+case "$win_decision" in
+  sign) win_sign_preflight || { echo "error: Windows signing preflight failed -- see above; nothing was built or uploaded" >&2; exit 1; }
+        WIN_SIGNING=1 ;;
+  skip:*) echo "  [warn] ${win_decision#skip:}" >&2 ;;
+  *) echo "error: ${win_decision#fail:}" >&2; exit 1 ;;
+esac
+guard_signed_asset "nothing was built or uploaded"
+
 # Live typed-cli sessions run this exact file. `taskkill //F //IM oam.exe`
 # (what this used to do) killed the operator's other agent panes AND made the
 # failure MORE likely: every killed session restarts on --resume, and a process
@@ -207,6 +258,12 @@ git worktree add -q --detach "$wt" "$tag_sha" \
 
 tmp="$(mktemp -d)"
 cp target/release/oam.exe "${tmp}/${ASSET}"
+# Sign the staged copy (never target/release/oam.exe), and prove it from disk,
+# before anything below hashes it into SHA256SUMS.
+if [ "$WIN_SIGNING" = "1" ]; then
+  win_sign "${tmp}/${ASSET}" || { echo "error: Authenticode signing failed for ${ASSET} -- nothing was uploaded" >&2; exit 1; }
+  win_verify "${tmp}/${ASSET}" || { echo "error: ${ASSET} does not verify after signing -- nothing was uploaded" >&2; exit 1; }
+fi
 
 # Re-read SHA256SUMS -- and the manifest pair, when there is one -- from the
 # release at this step boundary, never cached. All three patterns in one call,
@@ -280,7 +337,10 @@ fi
 # assets are new and some old remains -- but in one call it is as short as gh
 # makes it, and with a signed manifest a mismatched set fails verification
 # rather than verifying wrong: installers re-fetch the pair once, and a re-run
-# converges (every asset is --clobber-idempotent).
+# converges (every asset is --clobber-idempotent). Immediately before it, the
+# signed-asset check once more, on the release as it is NOW, not as it was
+# before the build.
+guard_signed_asset "nothing was uploaded"
 gh release upload "$TAG" --repo "$REPO" "${upload[@]}" --clobber \
   || { echo "error: upload failed part-way -- the release may now mix new and old assets for ${ASSET}; re-run to converge" >&2; exit 1; }
 if [ "$SIGNED" = "1" ]; then

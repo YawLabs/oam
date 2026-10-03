@@ -4950,7 +4950,7 @@ pub mod ops {
     /// body reader is [`fetch_body_read`].
     pub use crate::http_client::send::{
         FetchCancel, FetchCancels, FetchContinuations, FetchRequest, RedirectMode, fetch,
-        fetch_abandon, fetch_cancel, fetch_continue, fetch_supply,
+        fetch_abandon, fetch_cancel, fetch_continue, fetch_parked_port, fetch_supply,
     };
 
     /// zlibStreamCreate: allocate an incremental compressor or decompressor.
