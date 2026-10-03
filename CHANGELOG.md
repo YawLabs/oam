@@ -65,6 +65,14 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Fixed
 
+- **A zone-id host or `lookup` answer is matched against `--allow-net` as an address and a
+  zone, never as text,** by `fetch`, `http.request`, `net.connect` and `tls.connect` alike.
+  The zone is all of the host's text after `%`, as node's `net.isIP` reads it
+  (`fe80::1%1:8080` is the address `fe80::1` with the zone `1:8080`), and an entry ending in
+  `:` and digits is always port-scoped: `--allow-net=fe80::1%1:8080` admits `fe80::1%1` (or
+  any spelling of that address) on port 8080. A host-only entry (`fe80::1%1`) admits its
+  zone on any port, for a raw socket as for a fetch, and text with a `%` that is not a
+  zone-id address matches no entry.
 - **`process.loadEnvFile()` with no path named the resolved `.env` on Windows**
   (`open 'C:\cwd\.env'`); node's binding opens its own `.env` untouched and says `open '.env'`.
   A path given to it is still checked and named as fs names it: `loadEnvFile(42)` is
