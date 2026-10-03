@@ -1926,7 +1926,7 @@
       return out;
     }
 
-    return {
+    const response = {
       // node's fetch never produces a filtered response other than "basic":
       // it is the type under every `redirect` mode, a 3xx returned by
       // "manual" included (measured on v22.22.2; browsers answer
@@ -1956,6 +1956,12 @@
         return new globalThis.Blob([await drainBytes()], { type });
       },
     };
+    // A connect function's reply trailers (kConnectorReply), for
+    // undici.request; fetch has nowhere to show them, as in node.
+    if (raw.trailers !== undefined && raw.trailers.length > 0) {
+      Object.defineProperty(response, kConnectorReply, { value: { trailers: raw.trailers } });
+    }
+    return response;
   }
 
   // Lone surrogates would survive JSON.stringify (escaped) but be rejected
@@ -2185,6 +2191,11 @@
   //
   // Built from intrinsics captured here, as __oamMakeSysError is: a script
   // that replaces globalThis.Error changes nothing.
+  // undici's global dispatcher slot (lib/global.js): a registered symbol on
+  // globalThis, so every copy of undici in a process -- node's own and the
+  // npm package's -- reads and writes the same one.
+  const kUndiciGlobalDispatcher = Symbol.for("undici.globalDispatcher.1");
+
   const undiciErrors = (() => {
     const ErrorCtor = Error;
     const mark = (code) => Symbol.for(`undici.error.${code}`);
@@ -2358,6 +2369,104 @@
     configurable: false,
   });
 
+  // What another copy of undici put in the global dispatcher slot -- the
+  // npm package loaded by path, or one bundled into a dependency, through
+  // that copy's setGlobalDispatcher -- when oam's fetch must not go around
+  // it: anything but the shim's own global dispatcher and a plain undici
+  // Agent. node's fetch reads the slot and runs that dispatcher's
+  // dispatch(): a MockAgent's interceptors, whether it is installed as it
+  // is, wrapped in a RetryAgent or composed; a proxy; a pool pinned to one
+  // origin; an Agent's connect options. oam sends a request itself and
+  // cannot run that dispatch(), so the request is refused rather than sent
+  // without it. null for no foreign value, and for the plain Agent every
+  // copy of undici installs when it loads (lib/global.js
+  // `setGlobalDispatcher(new Agent())` into an empty slot -- oam does not
+  // fill it at startup, as node's own undici does): that one dispatches as
+  // oam's transport does, so fetch going around it changes nothing, and
+  // refusing it would fail every fetch in a process that merely loads a
+  // bundled undici.
+  //
+  // One read of a registered symbol on a fetch; a foreign value is judged
+  // once per object.
+  const plainAgentVerdicts = new WeakMap();
+  const objectGetPrototypeOf = Object.getPrototypeOf;
+  const objectGetOwnPropertySymbols = Object.getOwnPropertySymbols;
+  const objectHasOwn = Object.hasOwn;
+  const reflectOwnKeys = Reflect.ownKeys;
+  // The value of `obj`'s own symbol-keyed property whose symbol reads
+  // `description` (undici's private symbols are unregistered, one set per
+  // copy), or `missing`.
+  const missing = Symbol("missing");
+  function ownSymbolValue(obj, description) {
+    for (const sym of objectGetOwnPropertySymbols(obj)) {
+      if (sym.description === description) return obj[sym];
+    }
+    return missing;
+  }
+  // undici's lib/dispatcher/agent.js `new Agent()` with no options, by its
+  // shape (class names do not survive a minifier; symbol descriptions and
+  // property names do): an instance of Agent itself -- its prototype owns
+  // Agent's [kDispatch], so a subclass, which may override anything, is not
+  // one -- with no own `dispatch`, every option undefined (no `connect`,
+  // no `interceptors`, no timeouts or limits), no redirections and the
+  // default factory (a Pool per origin, a Client for `connections: 1`), not
+  // one that hands requests to something else.
+  //
+  // The default factory is told by identity, not by its source: it is the
+  // one that copy's `new Agent()` gets (`factory = defaultFactory`), so a
+  // fresh Agent of the same class -- which opens nothing until it
+  // dispatches -- carries the very function. Its source depends on the
+  // minifier (esbuild keeps `e.connections===1`, terser writes
+  // `1===n.connections`), and a source test that missed one form took a
+  // minified bundle's own startup Agent for a foreign dispatcher and failed
+  // every fetch in the process.
+  function judgePlainUndiciAgent(value) {
+    const proto = objectGetPrototypeOf(value);
+    if (proto === null || objectHasOwn(value, "dispatch") || objectHasOwn(proto, "dispatch")) return false;
+    if (ownSymbolValue(proto, "dispatch") === missing) return false;
+    const options = ownSymbolValue(value, "options");
+    if (options === null || typeof options !== "object") return false;
+    for (const key of reflectOwnKeys(options)) {
+      if (options[key] !== undefined) return false;
+    }
+    const redirections = ownSymbolValue(value, "maxRedirections");
+    if (redirections !== missing && redirections !== 0) return false;
+    const factory = ownSymbolValue(value, "factory");
+    if (typeof factory !== "function") return false;
+    const Agent = proto.constructor;
+    if (typeof Agent !== "function" || Agent.prototype !== proto) return false;
+    const fresh = new Agent();
+    return objectGetPrototypeOf(fresh) === proto && ownSymbolValue(fresh, "factory") === factory;
+  }
+  function isPlainUndiciAgent(value) {
+    if (value === null || typeof value !== "object") return false;
+    let verdict = plainAgentVerdicts.get(value);
+    if (verdict === undefined) {
+      try {
+        verdict = judgePlainUndiciAgent(value);
+      } catch {
+        // A getter or a Proxy trap that throws: not a plain Agent.
+        verdict = false;
+      }
+      plainAgentVerdicts.set(value, verdict);
+    }
+    return verdict;
+  }
+  function foreignGlobalDispatcher() {
+    const value = globalThis[kUndiciGlobalDispatcher];
+    if (value == null) return null;
+    if (value === globalThis.__oamUndiciDispatcher?.current) return null;
+    return isPlainUndiciAgent(value) ? null : value;
+  }
+  // The shim's getGlobalDispatcher() answers with it too, so every way to
+  // reach "the global dispatcher" agrees on which one it is.
+  Object.defineProperty(globalThis, "__oamForeignUndiciGlobal", {
+    value: foreignGlobalDispatcher,
+    writable: false,
+    enumerable: false,
+    configurable: false,
+  });
+
   // The connection policy of the undici dispatcher a fetch rides (the
   // `dispatcher` option, else the global one): `{ connector }` for one whose
   // `connect` is a function (a connect object carrying socket or TLS options,
@@ -2454,6 +2563,55 @@
     return makeResponse(await settleRaw(pending, lookup, signal, connector), signal, fetchSemantics, onBodyOver);
   }
 
+  // A socket a connect function hands back may carry, under this key, the
+  // reply it is about to write as the header lines its author meant -- the
+  // oam:undici shim's MockAgent connection does, as undici's mock hands its
+  // handler a reply's headers and body apart: `{ headers, trailers }`, flat
+  // lists of names and values, the `content-length` / `transfer-encoding`
+  // it set among the headers, which it kept off the wire so they could not
+  // frame (or cut short) the body. They are the response's headers then
+  // (connectorReplyHeaders), and the trailers ride the response under the
+  // same key for undici.request, which reports them.
+  const kConnectorReply = Symbol("oam connector reply");
+
+  // The response's headers for a reply left under kConnectorReply: the
+  // reply's names in its order, each with the values the transport parsed
+  // off the wire -- or, for the two framing fields, the reply's own. A
+  // decoded body drops `content-length` as the transport drops it from
+  // every decoded response (entry 32), which it did here if the reply's
+  // `content-encoding` is gone from the wire.
+  function connectorReplyHeaders(wire, lines) {
+    const parsed = new Map();
+    for (const [name, value] of wire) {
+      const list = parsed.get(name);
+      if (list === undefined) parsed.set(name, [value]);
+      else list.push(value);
+    }
+    let decoded = false;
+    for (let i = 0; i < lines.length; i += 2) {
+      if (String(lines[i]).toLowerCase() === "content-encoding" && !parsed.has("content-encoding")) decoded = true;
+    }
+    const out = [];
+    const done = new Set();
+    for (let i = 0; i < lines.length; i += 2) {
+      const name = String(lines[i]).toLowerCase();
+      if (done.has(name)) continue;
+      done.add(name);
+      if (name === "content-length" || name === "transfer-encoding") {
+        if (decoded && name === "content-length") continue;
+        for (let j = i; j < lines.length; j += 2) {
+          if (String(lines[j]).toLowerCase() === name) out.push([name, String(lines[j + 1])]);
+        }
+      } else {
+        for (const value of parsed.get(name) ?? []) out.push([name, value]);
+      }
+    }
+    for (const [name, values] of parsed) {
+      if (!done.has(name)) for (const value of values) out.push([name, value]);
+    }
+    return out;
+  }
+
   // settleFetch's loop, ending at the op's raw payload (the response head
   // with its `bodyHandle`, and the `socket` / `tls` facts of the connection
   // it arrived on) instead of a Response.
@@ -2468,6 +2626,8 @@
       throw fetchFailed(e);
     }
     let resumed = false;
+    // What the socket the response came over left under kConnectorReply.
+    let reply;
     while (raw && (raw.lookup || raw.connect)) {
       if (raw.connect) {
         // Connector mode: the dispatcher's `connect` function is asked for
@@ -2515,6 +2675,7 @@
           supplied.close();
           throw fetchFailed(supplied.error() ?? e);
         }
+        reply = socket[kConnectorReply];
         continue;
       }
       const { token, host, port } = raw.lookup;
@@ -2580,6 +2741,10 @@
     // hands both strings up so it can be built here. Not through `new URL`:
     // the op has already decided the Location does not parse, by the parser
     // it follows redirects with.
+    if (reply !== undefined && raw && Array.isArray(raw.headers)) {
+      raw.headers = connectorReplyHeaders(raw.headers, reply.headers);
+      raw.trailers = reply.trailers;
+    }
     if (raw && raw.invalidLocation) {
       const cause = new TypeError("Invalid URL");
       cause.code = "ERR_INVALID_URL";
@@ -2667,11 +2832,17 @@
   // the connection's facts -- and out of the user's reach: replacing
   // globalThis.fetch must not intercept http.request, which in node never
   // goes near fetch. `Headers` is the class the fetch path builds headers
-  // with.
+  // with. `undiciFetch` is the oam:undici shim's entry for undici.fetch,
+  // undici.request and a dispatcher's request(): fetch itself, out of reach
+  // the same way -- node's undici never calls globalThis.fetch, so a
+  // replacement of it (nock's fetch interception, a test's wrapper) neither
+  // answers, blocks nor sees them there.
   Object.defineProperty(globalThis, "__oamFetchInternal", {
     value: Object.freeze({
       fetch: (input, init) => oamFetch(input, init, true),
+      undiciFetch: (input, init) => oamFetch(input, init, false),
       Headers,
+      connectorReply: kConnectorReply,
     }),
     writable: false,
     enumerable: false,
@@ -3121,11 +3292,24 @@
     // `accept-encoding` to a request and decodes no response body -- a
     // `content-encoding: gzip` response is the gzip bytes, with its
     // `content-encoding` and `content-length`, for the program to decode.
-    // The Fetch client's negotiation is fetch()'s alone (and, for now,
-    // undici.request's, which shares its entry).
+    // The Fetch client's negotiation is fetch()'s alone.
     if (rawPayload && init.__oamRawExchange === true) {
       request.decode = false;
       request.default_headers = false;
+    }
+    // undici.request is the same: its Client writes the caller's headers
+    // and its own `host`, `connection: keep-alive` (unless the caller set
+    // a `connection`) and framing, with no `accept`, `user-agent` or
+    // `accept-encoding`, and hands back the body as it came -- a
+    // `content-encoding: gzip` response is the gzip bytes, its
+    // `content-encoding` and `content-length` kept (measured on node
+    // v22.22.2 + undici 6.29.0). Only fetch negotiates and decodes.
+    if (!fetchSemantics && dispatchSemantics && !rawPayload) {
+      request.decode = false;
+      request.default_headers = false;
+      if (!request.headers.some((h) => String(h[0]).toLowerCase() === "connection")) {
+        headers.unshift(["connection", "keep-alive"]);
+      }
     }
     // fetch's own `redirect: "manual"` returns the 3xx (its status, headers
     // and body; `redirected` false, `url` the request's) and `"error"` fails
@@ -3171,9 +3355,10 @@
       // global fetch's default dispatcher would have. http.request never
       // gets here with a hook (a replaced dns.lookup sends it over an
       // agent's socket), and keeps a pool of its own if it ever does; so
-      // does a fetch through a dispatcher already closed, whose pool is gone
-      // and would never be closed again.
-      if (!rawPayload && dispatcher?.closed !== true) {
+      // does a fetch through a dispatcher already closed or destroyed, whose
+      // pool is gone and would never be closed again (destroy() leaves
+      // `closed` as it was, as undici's does, so both are asked).
+      if (!rawPayload && dispatcher?.closed !== true && dispatcher?.destroyed !== true) {
         const id = dispatcher?._oamPoolId;
         request.lookup_pool = typeof id === "number" ? id : 0;
       }
@@ -3210,12 +3395,32 @@
     // an undici dispatcher.
     let connector = null;
     let policy = null;
+    // The global dispatcher slot every copy of undici shares, which node's
+    // fetch reads: a dispatcher another copy installed there that oam's
+    // fetch cannot run (foreignGlobalDispatcher) fails the fetch, rather
+    // than the request going to the network without it -- a MockAgent's
+    // interceptors, bare or wrapped, would otherwise be skipped and the
+    // request the test meant to keep in memory sent.
+    if (!rawPayload && init.dispatcher == null && foreignGlobalDispatcher() !== null) {
+      throw new TypeError("fetch failed", {
+        cause: new undiciErrors.NotSupportedError(
+          "The global dispatcher was installed by another copy of undici (its setGlobalDispatcher): " +
+            "oam's fetch cannot run its dispatch() -- a MockAgent's interceptors, retries, a proxy, " +
+            "connect options -- and does not send the request without it. Install the dispatcher " +
+            "`import 'undici'` gives on oam",
+        ),
+      });
+    }
     if (!rawPayload && dispatcher != null) {
       policy = dispatcherPolicy(dispatcher, holder, {
         url: rawUrl,
         headerNames: headers.map((h) => h[0]),
       });
       if (policy.refuse) throw new TypeError("fetch failed", { cause: policy.refuse });
+      // A Client or Pool: every hop goes to its origin, which is the `host`
+      // the transport writes, as undici's Client writes it -- unless the
+      // caller set one, which undici.request sends (fetch has dropped any).
+      if (policy.pinnedOrigin !== undefined) request.pin_origin = policy.pinnedOrigin;
       if (policy.connector) {
         connector = policy.connector;
         request.connect_hook = true;
@@ -3540,6 +3745,75 @@
   brand(ErrorEvent, "ErrorEvent");
 
   // ------------------------------------------------------------ WebSocket
+  // How a WebSocket's handshake goes out, by the undici dispatcher it rides,
+  // as fetch's request does: node's WebSocket (undici's) sends its handshake
+  // through `WebSocketInit.dispatcher`, else the global dispatcher, so a
+  // MockAgent with net connect disabled fails it with no connection made,
+  // one that allows the host passes it through, a Pool pins it to its
+  // origin, and an Agent's `connect` makes its connection (measured on node
+  // v22.22.2 + undici 6.29.0). The same dispatcherPolicy fetch asks:
+  // `{ refuse }` for a dispatcher oam cannot run (another undici copy's in
+  // the global slot, a closed one, a `dispatch()` override); `{ url,
+  // connector, params }` for one whose `connect` function makes the
+  // connection, which the handshake then runs over; `{ url }` for the plain
+  // dial -- `url` being the socket's, or the pinned origin's with its path.
+  // No dispatcher anywhere (undici never imported) is the plain dial, at the
+  // cost of one read.
+  function websocketRoute(url, given) {
+    const holder = globalThis.__oamUndiciDispatcher;
+    if (given == null) {
+      if (foreignGlobalDispatcher() !== null) {
+        return {
+          refuse: new undiciErrors.NotSupportedError(
+            "The global dispatcher was installed by another copy of undici: oam cannot run its dispatch()",
+          ),
+        };
+      }
+      if (holder === undefined || holder.current == null) return { url: url.href };
+    }
+    const dispatcher = given ?? holder.current;
+    const target = new URL(url.href);
+    target.protocol = url.protocol === "wss:" ? "https:" : "http:";
+    const policy = dispatcherPolicy(dispatcher, holder, { url: target.href, headerNames: [] });
+    if (policy.refuse) return { refuse: policy.refuse };
+    if (policy.pinnedOrigin !== undefined) {
+      const pin = new URL(policy.pinnedOrigin);
+      target.protocol = pin.protocol;
+      target.hostname = pin.hostname;
+      target.port = pin.port;
+    }
+    const dial = new URL(target.href);
+    dial.protocol = target.protocol === "https:" ? "wss:" : "ws:";
+    if (!policy.connector) return { url: dial.href };
+    const hostname = target.hostname.startsWith("[") ? target.hostname.slice(1, -1) : target.hostname;
+    return {
+      url: dial.href,
+      connector: policy.connector,
+      params: {
+        host: target.host,
+        hostname,
+        protocol: target.protocol,
+        port: target.port,
+        servername: null,
+        localAddress: null,
+      },
+    };
+  }
+
+  // The handshake over a connector's socket: the connection it hands back
+  // is piped in as a connector-mode fetch's is, and the native handshake
+  // runs over it (no TLS of its own: the connector's is the connection's).
+  async function websocketOverConnector(route, wire) {
+    const socket = await runConnector(route.connector, route.params);
+    const supplied = supplySocket(socket);
+    try {
+      return await globalThis.__oam.wsConnect(JSON.stringify({ ...wire, pipe: supplied.id }));
+    } catch (e) {
+      supplied.close();
+      throw e;
+    }
+  }
+
   const CONNECTING = 0;
   const OPEN = 1;
   const CLOSING = 2;
@@ -3573,11 +3847,26 @@
       this.onclose = null;
       this.onerror = null;
 
+      // undici's WebSocketInit: an object that is not a sequence carries
+      // `protocols`, `dispatcher` and `headers`.
+      let init = null;
+      if (protocols !== null && typeof protocols === "object" && typeof protocols[Symbol.iterator] !== "function") {
+        init = protocols;
+        protocols = init.protocols;
+      }
       const protoList = typeof protocols === "string" ? [protocols]
         : Array.isArray(protocols) ? protocols : [];
+      const headers = [];
+      if (init !== null && init.headers != null) {
+        for (const [name, value] of new Headers(init.headers)) headers.push([name, value]);
+      }
 
-      const wire = JSON.stringify({ url: this._url, protocols: protoList });
-      globalThis.__oam.wsConnect(wire).then(
+      const route = websocketRoute(parsed, init === null ? undefined : init.dispatcher);
+      const wire = { url: route.url, protocols: protoList, headers };
+      const connecting = route.refuse ? Promise.reject(route.refuse)
+        : route.connector ? websocketOverConnector(route, wire)
+        : globalThis.__oam.wsConnect(JSON.stringify(wire));
+      connecting.then(
         (result) => {
           this._handle = result.handle;
           this._protocol = result.protocol || "";

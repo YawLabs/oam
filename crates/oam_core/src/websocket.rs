@@ -1,7 +1,10 @@
 //! WebSocket client: the browser-standard WebSocket global.
 //!
 //! Architecture: `ws_connect` dials with the connector net, tls, fetch and
-//! http share (`net_connect`) and runs the handshake over that stream, then
+//! http share (`net_connect`) and runs the handshake over that stream -- or
+//! over the connection an undici dispatcher's `connect` function handed JS
+//! (a MockAgent's in-memory socket, an Agent's own connector), piped in as
+//! a `byte_pipe` the way a connector-mode fetch gets its connection -- then
 //! a bridge task runs on the tokio runtime pumping frames between two mpsc
 //! channels and the underlying stream. The JS side sends/receives through
 //! the channels via ops; the bridge task owns all async I/O.
@@ -87,14 +90,35 @@ fn dial_target(uri: &tokio_tungstenite::tungstenite::http::Uri) -> Option<(Strin
     Some((host.to_string(), port))
 }
 
+/// One `wsConnect`: where the handshake goes, and what it carries.
+pub struct WsConnect {
+    /// The URL the handshake is for: its host (and port) is the connection's
+    /// and the `host` the request carries. JS sends the socket's own URL, or
+    /// the origin a Client or Pool dispatcher pins it to (with the URL's
+    /// path).
+    pub url: String,
+    pub protocols: Vec<String>,
+    /// `WebSocketInit.headers`, added to the handshake request.
+    pub headers: Vec<(String, String)>,
+    /// The connection a dispatcher's `connect` function made, already
+    /// through any TLS it does: the handshake runs over it as it is, and
+    /// nothing is dialled.
+    pub supplied: Option<tokio::io::DuplexStream>,
+}
+
 pub async fn ws_connect(
     registry: WsRegistry,
     ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    url: String,
-    protocols: Vec<String>,
+    connect: WsConnect,
 ) -> OpOutcome {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http;
+    let WsConnect {
+        url,
+        protocols,
+        headers,
+        supplied,
+    } = connect;
     let mut request = match url.as_str().into_client_request() {
         Ok(request) => request,
         Err(e) => return OpOutcome::Failed(format!("WebSocket: invalid request: {e}")),
@@ -108,6 +132,22 @@ pub async fn ws_connect(
             }
             Err(e) => return OpOutcome::Failed(format!("WebSocket: invalid request: {e}")),
         }
+    }
+    for (name, value) in &headers {
+        let name = match http::HeaderName::from_bytes(name.as_bytes()) {
+            Ok(name) => name,
+            Err(e) => return OpOutcome::Failed(format!("WebSocket: invalid request: {e}")),
+        };
+        match http::HeaderValue::from_str(value) {
+            Ok(value) => {
+                request.headers_mut().append(name, value);
+            }
+            Err(e) => return OpOutcome::Failed(format!("WebSocket: invalid request: {e}")),
+        }
+    }
+    if let Some(io) = supplied {
+        let result = tokio_tungstenite::client_async_with_config(request, io, None).await;
+        return established(registry, ids, result);
     }
     // The dial is oam's own (#161), the one net, tls, fetch and http share:
     // node's per-address connect algorithm, and on Windows no SYN retransmit
@@ -123,6 +163,25 @@ pub async fn ws_connect(
         Err(e) => return OpOutcome::Failed(format!("WebSocket connection failed: {e}")),
     };
     let result = tokio_tungstenite::client_async_tls_with_config(request, stream, None, None).await;
+    established(registry, ids, result)
+}
+
+/// A handshake's outcome: the socket registered and its bridge running, or
+/// the failure.
+fn established<S>(
+    registry: WsRegistry,
+    ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    result: Result<
+        (
+            tokio_tungstenite::WebSocketStream<S>,
+            tokio_tungstenite::tungstenite::handshake::client::Response,
+        ),
+        tokio_tungstenite::tungstenite::Error,
+    >,
+) -> OpOutcome
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (ws_stream, response) = match result {
         Ok(pair) => pair,
         Err(e) => return OpOutcome::Failed(format!("WebSocket connection failed: {e}")),
@@ -260,6 +319,51 @@ mod tests {
         assert_eq!(target("/no-host"), None);
     }
 
+    /// A supplied connection -- what a dispatcher's `connect` function made,
+    /// piped in -- carries the handshake as it is: nothing is dialled (the
+    /// URL's host does not exist), no TLS is added for `wss:` (the
+    /// connector's is the connection's), and the init headers go out.
+    // The accept callback's Err type is tungstenite's own error response.
+    #[allow(clippy::result_large_err)]
+    #[tokio::test]
+    async fn a_supplied_connection_carries_the_handshake_as_it_is() {
+        let registry: WsRegistry = std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let ids = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let (near, far) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let mut seen = None;
+            let callback =
+                |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
+                    seen = request
+                        .headers()
+                        .get("x-extra")
+                        .map(|v| v.to_str().unwrap().to_string());
+                    Ok(response)
+                };
+            let ws = tokio_tungstenite::accept_hdr_async(far, callback).await;
+            (ws.is_ok(), seen)
+        });
+        let outcome = ws_connect(
+            registry.clone(),
+            ids,
+            WsConnect {
+                url: "wss://no-such-host.invalid/chat".into(),
+                protocols: Vec::new(),
+                headers: vec![("x-extra".into(), "yes".into())],
+                supplied: Some(near),
+            },
+        )
+        .await;
+        assert!(
+            matches!(outcome, OpOutcome::Json(_)),
+            "the handshake must succeed"
+        );
+        let (accepted, seen) = server.await.unwrap();
+        assert!(accepted);
+        assert_eq!(seen.as_deref(), Some("yes"));
+        assert_eq!(registry.lock().unwrap().len(), 1);
+    }
+
     /// #161: a refused loopback connect fails at once. Through tokio's own
     /// connect it took ~2 s per address on Windows (the SYN is retransmitted
     /// to a loopback peer that already refused it); the shared connector
@@ -279,8 +383,12 @@ mod tests {
             let outcome = ws_connect(
                 registry.clone(),
                 ids.clone(),
-                format!("ws://{host}:{port}/"),
-                Vec::new(),
+                WsConnect {
+                    url: format!("ws://{host}:{port}/"),
+                    protocols: Vec::new(),
+                    headers: Vec::new(),
+                    supplied: None,
+                },
             )
             .await;
             let elapsed = started.elapsed();

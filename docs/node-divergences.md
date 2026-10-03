@@ -935,7 +935,14 @@ This is `fetch` only. `http.request` goes through the same native op but asks it
 raw exchange (#148): the body arrives as the server sent it with both headers intact, as
 in Node, so its callers decode for themselves (`res.pipe(zlib.createGunzip())` when
 `content-encoding` says gzip) -- `conformance/cases/192-http-request-raw-body-and-headers.mjs`.
-Up to 0.17.1 it got the decoded body too, which is why the headers had to go: keeping
+`undici.request` (and a dispatcher's `request()`) asks for it too, as undici's request()
+decodes nothing and adds no `accept`, `user-agent` or `accept-encoding`: it sends the
+caller's headers with `host`, `connection: keep-alive` and the framing, and a
+`content-encoding: gzip` response is the gzip bytes with both headers
+(`undici_request_sends_the_callers_headers_and_decodes_nothing`, e2e, Node + undici 6.29.0
+output; up to 0.17.1 it negotiated and decoded as `fetch` does). The header names go out
+lowercased and in another order than undici writes them, as `fetch`'s (entry 38).
+Up to 0.17.1 `http.request` got the decoded body too, which is why the headers had to go: keeping
 `content-encoding` on a body oam had already decoded sent that code into a second, failing
 decode. Nothing shares the decoded payload with `http.request` any more, so `fetch` can
 now keep Node's headers; it does not yet.
@@ -1556,12 +1563,19 @@ What still differs:
   and the `'error'` event was a plain `Event`). A connect that fails dispatches Node's
   `ErrorEvent` -- `message` and `error` both `Received network error or non-101 status
   code.`, no `ErrorEvent` global, as in Node v22
-  (`conformance/cases/226-websocket-connect-failure-event.mjs`). What is left: oam also
-  fires the `'close'` (1006, `wasClean` false) the WHATWG spec asks for after that
-  `'error'`, where Node v22.22.2 fires none for a connect that failed; the `wss:` handshake
-  verifies the server against the bundled Mozilla roots alone, not `node:tls`'s store
-  (`NODE_EXTRA_CA_CERTS`, `tls.setDefaultCACertificates`); and the dial honours no
-  `connect.lookup` hook or environment proxy.
+  (`conformance/cases/226-websocket-connect-failure-event.mjs`). The handshake rides the
+  undici dispatcher as node's does -- `WebSocketInit.dispatcher`, else the global one: a
+  MockAgent answers or refuses it, a `Pool` or `Client` pins it to its origin, an Agent's
+  `connect` function makes its connection, and a dispatcher oam cannot run (another undici
+  copy's in the global slot, a closed one) fails it with nothing sent; the init object's
+  `protocols` and `headers` are sent (`a_websocket_rides_its_undici_dispatcher_as_undicis_does`,
+  e2e; until the review of #206 every handshake went around the dispatcher and the init
+  object was ignored). What is left: oam also fires the `'close'` (1006, `wasClean` false)
+  the WHATWG spec asks for after that `'error'`, where Node v22.22.2 fires none for a
+  handshake that failed; the `wss:` handshake verifies the server against the bundled
+  Mozilla roots alone, not `node:tls`'s store (`NODE_EXTRA_CA_CERTS`,
+  `tls.setDefaultCACertificates`); and the plain dial honours no `connect.lookup` hook,
+  connect timeout or environment proxy.
 
 **`connect.lookup` on an undici `Agent`**
 
@@ -1704,18 +1718,124 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   destination check, for one -- could not run; up to 0.16.2 the request was sent without it.
   The same policy written as a `connect` function works. `http.request` is not affected: it
   never goes through an undici dispatcher, in Node or here. `compose()` is not provided.
-- **`MockAgent`, `MockPool` and `MockClient` refuse at construction**, with the same
-  `NotSupportedError`, and so does everything they carry (`disableNetConnect()`,
-  `get(origin).intercept(...).reply(...)`, `assertNoPendingInterceptors()`). undici's mocks
-  INTERCEPT: a request that matches an interceptor is answered from memory and never
-  dialled, and `disableNetConnect()` turns an unmatched one into an error instead of a real
-  connection. oam's `fetch` owns its transport and cannot be intercepted from JS, so up to
-  0.16.2 the three were constructible stubs that intercepted nothing: a suite that installed
-  a `MockAgent`, called `disableNetConnect()` and expected canned answers sent REAL requests
-  to whatever host it named, and read the real answers as its mocks. The classes stay
-  exported, so `import { MockAgent } from 'undici'` still resolves and the failure names
-  itself; point the code under test at a local server instead. Pinned by
-  `undici_mock_dispatchers_refuse_instead_of_reaching_the_network` (e2e).
+- **A `Pool` or `Client` is bound to its origin**, as undici's: `fetch(url, { dispatcher:
+  pool })` and `undici.request(url, { dispatcher: pool })` go to the pool's own origin, with
+  its `host`, whatever origin the URL names -- every redirect hop included, wherever its
+  Location points (a caller's own `host` on `undici.request` is sent, as in undici) -- the URL
+  staying the response's `url` (`a_pool_sends_every_request_to_its_own_origin_mocked_or_not`,
+  e2e, Node + undici 6.29.0 output; up to 0.17.1 they went to the URL's host). The transport
+  pins each hop to that origin, so its connections are pooled as any other; a pool with a
+  `connect` function makes them with it (above). A `MockPool` / `MockClient` pins its hops
+  as well (below).
+- **A closed or destroyed dispatcher sends nothing**, as undici's: after `close()` (or
+  `destroy()`) every request through an `Agent`, `Pool`, `Client`, proxy agent or
+  `MockAgent` -- passed, or the global one -- fails with `ClientDestroyedError` (wrapped by
+  `fetch`, as itself from `undici.request` and the dispatcher's `request()`), and
+  `ClientClosedError` between `close()` and its settling; `closed` and `destroyed` read as
+  undici's do. A closed `MockPool` / `MockClient` still answers from its interceptors and
+  fails what it would pass through, as undici's does
+  (`a_closed_dispatcher_refuses_every_request_and_sends_nothing`, e2e, Node + undici 6.29.0
+  output). Up to 0.17.1 a closed dispatcher went on sending to the network.
+**`MockAgent`, `MockPool` and `MockClient`**
+
+They answer requests from their interceptors, as undici's do (#206; up to 0.17.1 they refused
+at construction, and up to 0.16.2 they were stubs that intercepted nothing and let every
+request through to the real host). undici runs a mock inside `dispatch()`; oam's transport
+sends a request itself, so a mock dispatcher is a connect function (above): every connection
+a request through it asks for is an in-memory socket that reads the HTTP/1.1 request the
+transport writes, matches it as undici matches a dispatch -- path (query order ignored),
+method, body and headers, by string, `RegExp` or function, and an origin by string or
+matcher -- and writes the reply back as an HTTP/1.1 response, or fails the request with
+the error undici would: `replyWithError()`'s, or `MockNotMatchedError` with undici's message
+when nothing matches and net connect does not allow the origin. `reply()` (status, data,
+`{ headers, trailers }`; a callback; a data callback), `replyWithError()`, `times()`,
+`persist()`, `delay()`, `defaultReplyHeaders()`, `defaultReplyTrailers()`,
+`replyContentLength()`, `enableNetConnect()` / `disableNetConnect()`, `activate()` /
+`deactivate()`, `get(origin)` (a `MockPool`, or a `MockClient` for `connections: 1`),
+`pendingInterceptors()`, `assertNoPendingInterceptors()`, `close()` and `mockErrors` work
+on every entry point a dispatcher has -- `fetch` with `setGlobalDispatcher` or a `dispatcher`
+option, `undici.fetch`, `undici.request`, a dispatcher's own `request()`, and a
+`WebSocket`'s handshake (the global one, or `WebSocketInit.dispatcher`) -- for http and
+https origins alike (the in-memory socket is the connection as it is; nothing is wrapped in
+TLS over it), redirect hops included.
+
+It fails **closed**: every byte of a request goes to the in-memory socket first, and only a
+request no interceptor matches, while `enableNetConnect()` allows its origin (or with the
+agent deactivated), is then sent to the network, over the connection the agent it wraps
+would make -- to the mock pool's own origin, the one net connect was asked about, whatever
+host the request named (a pool passed as the dispatcher of a request to another host, a
+mocked redirect hop), with that origin's `host`, as undici's `MockPool` hands it to its
+`Pool`. Pinned against Node + undici 6.29.0 by `undici_mock_agent_answers_as_undicis_does`,
+`undici_mock_agent_never_reaches_the_network_unless_allowed`,
+`a_pool_sends_every_request_to_its_own_origin_mocked_or_not` and
+`a_websocket_rides_its_undici_dispatcher_as_undicis_does` (e2e; local servers count what
+reaches them; until the review of #206 a `WebSocket` consulted no dispatcher, so its
+handshake reached the real host under a MockAgent that had disabled net connect). What
+differs:
+
+- **What the matchers and a reply callback see is the request as sent.** The body is the
+  bytes that went out, as a UTF-8 string (`null` with none), where undici's fetch hands them
+  the body as given -- so a body sent as bytes or as a stream matches a string matcher here,
+  and does not under undici (which sees a `Uint8Array`, or `[object ReadableStream]`). The
+  headers are the ones sent, names lowercased, without `host`, `connection` and
+  `transfer-encoding`. For `fetch` that includes everything fetch adds (`accept`,
+  `accept-language`, `sec-fetch-mode`, `accept-encoding`, `user-agent`, ...), as undici's
+  fetch also hands its mock the headers it built; for `undici.request` it is the caller's
+  headers plus the `content-length` the body is framed with -- `{ 'x-up': 'A',
+  'content-length': '3' }` for a POST of `'raw'` with `{ 'X-Up': 'A' }`, where undici's
+  request() shows the caller's object as given, `{ 'X-Up': 'A' }`. (Up to the review of #206
+  `undici.request` also sent, and its matchers saw, `accept`, `user-agent` and
+  `accept-encoding`, which undici's request() does not send; entry 32.) A reply
+  callback's `opts` carry `origin`, `path`, `method`, `body` and `headers`; undici's fetch also
+  passes `maxRedirections` and `upgrade`.
+- **Trailers** set with `reply(..., { trailers })` or `defaultReplyTrailers()` are
+  `undici.request()`'s `trailers` -- names lowercased, a repeated one an array -- there as
+  soon as the request resolves, as undici's mock fills them (until the review of #206 they
+  were always `{}`). A real server's trailer section is still not reported: there
+  `trailers` stays `{}`, where undici's holds the fields once the body has ended.
+- **A reply's body runs to the end of the connection**, so a response carries no framing
+  field the reply did not set, as with undici, and the whole body arrives whatever the
+  reply's own `content-length` or `transfer-encoding` say -- one short of the body's bytes
+  (`replyContentLength()` counts a string's UTF-16 units, as undici does, so `'café'` gets
+  4), one past them, or `chunked` -- with those headers reading as the reply set them, as
+  undici's mock delivers it (until the review of #206 they framed the body here, cutting it
+  short or failing it with `terminated`). For a gzip reply that fetch decodes, its
+  `content-length` is dropped with `content-encoding`, as for any decoded response (entry
+  32). A 1xx reply fails the request on both, with different causes.
+- **`assertNoPendingInterceptors()`'s table** is drawn by `console.table` on a
+  `new Console()`, which oam draws as node does since 0.17.2 (box, columns, inspected cells,
+  display widths; `conformance/cases/370-console-table.mjs`). A `new Console()` still has
+  only `log`, `info`, `debug`, `warn`, `error` and `table`, and `console.table` tabulates a
+  Map or Set *iterator* as a plain object, where node peeks at its entries.
+- **`dispatch()`** on the three refuses with `NotSupportedError`, as on every shim dispatcher:
+  undici's mock answers a direct `dispatch(opts, handler)` call.
+- **Another copy's global dispatcher.** `import 'undici'` is the shim even when the npm
+  package is installed, so a suite gets this MockAgent. The npm package can still be loaded
+  by path (or come bundled into a dependency), and its own MockAgent works with its own
+  `fetch` / `request`. undici keeps the global dispatcher in a slot every copy shares
+  (`Symbol.for('undici.globalDispatcher.1')`), which node's `fetch` reads and dispatches
+  through. oam's `fetch` (and so `undici.request`) cannot run another copy's `dispatch()`,
+  so while that slot holds one of its dispatchers -- a MockAgent, active or not, one wrapped
+  in a `RetryAgent` or `compose()`d, a proxy, a pool, an Agent with any option -- they fail
+  with `NotSupportedError` and nothing is sent, where node runs it
+  (`a_foreign_global_dispatcher_is_refused_not_bypassed`, e2e; up to 0.17.1 the slot was
+  ignored, so every such mock failed open). The one exception is the plain `new Agent()` a
+  copy installs when it loads into an empty slot (node's own undici fills the slot at
+  startup, oam does not): it dispatches as oam's transport does, so `fetch` goes around it
+  and runs as usual. It is told by its shape and by its factory being the very one a fresh
+  `new Agent()` of that copy gets, however a minifier wrote it (until the review of #206 a
+  source test missed terser's form, and a terser-minified bundle's startup Agent failed
+  every `fetch`); an Agent given any `factory` of its own is refused. `getGlobalDispatcher()` returns the other copy's dispatcher, as in node
+  (that one's own `request()` runs its `dispatch()`), and the shim's own otherwise, also
+  while the slot holds that plain Agent, where node returns the Agent. The shim's
+  `setGlobalDispatcher()` writes the slot, so the last dispatcher installed by either copy
+  is the global one; the other copy's `fetch` / `request` through a shim dispatcher fail with
+  the shim's `dispatch()` refusal, where node's run on it. (That copy's own fetch delivers a
+  mock's body since 0.17.2: it finalizes a response with `stream.finished()` on a web stream
+  and `performance.markResourceTiming()`, neither of which oam had --
+  `conformance/cases/369-stream-finished-web-streams.mjs`,
+  `371-performance-mark-resource-timing.mjs`. oam's `perf_hooks.performance` and global
+  `performance` are still two objects; the resource entries are the former's.)
 
 **`ProxyAgent`, `EnvHttpProxyAgent`, and the undici names oam exports to refuse**
 
@@ -1752,8 +1872,7 @@ since a name missing from an ES module is a link-time error, a package that mere
   `DecoratorHandler`, `createRedirectInterceptor`, `connect()`, `upgrade()` and
   `pipeline()` all work through `dispatch()`. Each is exported so an `import` of it links,
   and fails with `NotSupportedError` when constructed or called (`connect` / `upgrade`
-  through their callback or promise). `mockErrors.MockNotMatchedError` is exported as a
-  class; nothing raises it, since the Mock* classes refuse. Pinned, with the shim's whole
+  through their callback or promise). Pinned, with the shim's whole
   export list, by `undici_exports_link_and_refuse_what_oam_cannot_run` (e2e).
 - **Not exported at all** (an `import` of one is still a link-time `SyntaxError`):
   `getCookies`, `getSetCookies`, `setCookie`, `deleteCookie`, `parseMIMEType`,
@@ -3149,6 +3268,61 @@ the process exits once its continuation has run
   cross-thread `Atomics.notify` / `waitAsync` pair cannot be set up between threads at all.
   Same-thread `waitAsync` works as in Node.
 
+### 49. `node:_http_common` and http over a test double's socket: what still differs
+
+Up to 0.17.1 oam had none of node's legacy `_http_*` / `_tls_*` module names, so a program
+that reached for one failed to load -- nock 14 at `import`, because its interceptors
+(`@mswjs/interceptors`) parse every request and response with `_http_common`'s
+`HTTPParser` (#207). They are builtins now (`require`, `import`, with or without `node:`,
+listed in `module.builtinModules`): `_http_common` with all of node's exports, and
+`_http_agent`, `_http_client`, `_http_incoming`, `_http_outgoing`, `_http_server`,
+`_tls_common` and `_tls_wrap` carrying the very objects `http` and `tls` export
+(`conformance/cases/366-http-common-parser.mjs`, `367-http-legacy-module-aliases.mjs`).
+What a test double needs from http works as in node too: a `ServerResponse` built over
+`new IncomingMessage(socket)` and given a socket with `assignSocket()` writes the whole
+HTTP/1.1 message to it, framed as node's `_storeHeader` frames it (oam wrote only the body);
+a `ClientRequest` whose agent hands back a socket with a `write()` of its own writes the
+request into it while it is still connecting (oam waited for `'connect'`, which such a
+socket emits only once it has the request); `https.request` no longer runs through a
+patched `http.request`; a `ClientRequest` is an `http.OutgoingMessage`
+(`368-http-response-and-request-over-own-sockets.mjs`). nock 14.0.17 intercepts
+`http.request`, `https.request` and `fetch`, `replyWithError()`s, and `disableNetConnect()`
+keeps an unmatched request off the network, line for line as under node (the e2e test
+`nock_intercepts_http_https_and_fetch_as_on_node`, against the vendored packages) -- a
+`new http.ClientRequest()` too: `http.ClientRequest.apply(this, args)`, which nock uses to
+pass one through, runs the constructor on the caller's object as node's function
+constructor does (oam built a separate request and copied its fields over, so the one
+nock held was never sent), one nock refuses ends as node's socketless `OutgoingMessage`
+does (`372-http-outgoing-message-without-socket.mjs`), and `require('_http_client')`
+keeps the original class while nock has replaced `http.ClientRequest`, as in node.
+
+- **`HTTPParser` is JavaScript, not llhttp.** It follows llhttp's strict rules and node's
+  callback protocol, and is held to node's parser by feeding both the same bytes, whole and
+  split (case 366): the same callbacks with the same arguments, the same return values, and
+  the same error codes, reasons and offsets for every malformed input in that battery.
+  Not modelled: llhttp's HTTP/2 preface handling -- a `PRI` request line fails with
+  `HPE_PAUSED_H2_UPGRADE` at its version, where llhttp reads the whole preface first -- and
+  the hooks a native server attaches: `consume()`, `unconsume()`, `pause()` and `resume()` do
+  nothing, and `kOnExecute` / `kOnTimeout` are never called (node calls them only for a
+  parser consumed by a native stream). `execute()` on a parser that has failed returns the
+  same error with `bytesParsed` 0, where node's carries a meaningless (negative) offset;
+  after a `101` without an `Upgrade` field node's `finish()` reports `HPE_INVALID_EOF_STATE`
+  (with an uninitialised offset) and oam's reports nothing.
+- **Names left out.** `_http_outgoing`'s `kHighWaterMark` and `kUniqueHeaders` (symbols
+  node's outgoing stream keys its own state with), `_http_server`'s connection-tracking
+  plumbing (`_connectionListener`, `httpServerPreClose`, `kConnectionsCheckingInterval`,
+  `kServerResponse`, `setupConnectionsTracking`, `storeHTTPOptions`) and `_tls_common`'s
+  `translatePeerCertificate`: nothing on oam is behind them. They are recorded in
+  `conformance/surface-gaps.json`. `_stream_wrap` (node's deprecated `JSStreamSocket`) is
+  not provided (divergence 28) and says so: "is a Node builtin module that oam does not
+  implement yet", where it used to say "cannot find package ... is it installed?".
+  `parseUniqueHeadersOption()` returns a plain `Set`; node's is a primordials `SafeSet`,
+  which is not `instanceof Set`.
+- **A standalone `ServerResponse`'s write callbacks** run on a microtask, not once the
+  assigned socket has taken the bytes, as before.
+- **The request a test double's socket is written** is the agent path's (divergence 43):
+  its header names are lowercase, and a GET or HEAD body is handled as divergence 16 says.
+
 ### `err.syscall` on `fs.opendir`
 
 Node's own sync and async forms disagree here, and oam is self-consistent where
@@ -3391,12 +3565,12 @@ Measured on all three release platforms:
 
 | host | export names present | missing by name | in absent modules | modules absent |
 |---|---|---|---|---|
-| windows-aarch64 (Node v22.22.2) | 1423 / 1874 | 351 | 100 | 13 |
-| linux-x64 (Node v22.23.1) | 1422 / 1888 | 366 | 100 | 13 |
-| darwin-arm64 (Node v22.23.1) | 1422 / 1884 | 362 | 100 | 13 |
+| windows-aarch64 (Node v22.22.2) | 1500 / 1874 | 315 | 59 | 5 |
+| linux-x64 (Node v22.22.2) | 1480 / 1888 | 349 | 59 | 5 |
+| darwin-arm64 (Node v22.22.2) | 1480 / 1884 | 345 | 59 | 5 |
 
-"Present" subtracts both columns: the per-name gaps *and* the 100 export names living
-inside the 13 modules oam does not register at all (`sys` alone accounts for 49). The
+"Present" subtracts both columns: the per-name gaps *and* the 59 export names living
+inside the 5 modules oam does not register at all (`sys` alone accounts for 49). The
 Node versions differ between hosts, which is part of why the totals do — the gate prints
 a note when a section's recorded Node does not match the one it is running against, so a
 version bump does not get read as an oam regression.
@@ -3424,9 +3598,10 @@ gate, and says so loudly. It also refuses to record a section whose gap count ha
 unless you pass `--allow-regression`, since laundering a regression into "known debt" is
 the one thing the ratchet exists to prevent.
 
-Thirteen modules are absent outright rather than partial: the six `_http_*` legacy
-internals, `_stream_wrap`, `_tls_common`, `_tls_wrap`, `inspector/promises`, `sys` (the
-deprecated `util` alias), `wasi`, and `global:fetch.prototype`.
+Five modules are absent outright rather than partial: `_stream_wrap`, `inspector/promises`,
+`sys` (the deprecated `util` alias), `wasi`, and `global:fetch.prototype`. The six `_http_*`
+legacy names, `_tls_common` and `_tls_wrap` landed in 0.17.2 (divergence 49), with the few
+names of node's own plumbing they still lack recorded per name.
 
 The largest per-module gaps (counts from windows-aarch64), all tracked in that file:
 

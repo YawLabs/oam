@@ -51,6 +51,17 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   keep-alive client no longer holds `close()` open. (#176)
 - **A `http-keepalive-latency` benchmark case**, sequential requests over one kept-alive
   connection. (#183)
+- **undici's `MockAgent`, `MockPool` and `MockClient` work** (#206): interceptors answer
+  `fetch`, `undici.fetch`, `undici.request`, a dispatcher's `request()` and `WebSocket` from
+  memory -- `reply()` (object, callback, data callback, trailers), `replyWithError()`,
+  `times()`, `persist()`, `delay()`, the path / method / body / header / query matchers,
+  `enableNetConnect()` / `disableNetConnect()`, `pendingInterceptors()`,
+  `assertNoPendingInterceptors()` and `mockErrors` -- for http and https origins and across
+  redirect hops, as undici 6.29.0 does. They fail closed: nothing reaches the network unless no
+  interceptor matches and net connect allows the origin.
+- **`node:_http_common` and node's other legacy `_http_*` / `_tls_*` modules** (#207), with
+  node's `HTTPParser`, so nock 14 loads and intercepts `http.request`, `https.request`,
+  `new http.ClientRequest()` and `fetch` as under node.
 
 ### Changed
 
@@ -62,6 +73,16 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 - **`http2.createServer` serves through the same stream implementation as
   `createSecureServer`**, so it sends and receives trailers and an h2c request body streams
   as a secure one does. Its streams still have no `session`.
+- **`undici.request` sends the caller's headers and returns the body undecoded**, as undici's
+  `request()` does: no `accept`, `user-agent` or `accept-encoding` is added, and a gzip
+  response comes back as gzip bytes with its `content-encoding` and `content-length`. (#206)
+- **`undici.request` and `undici.fetch` never go through a replaced `globalThis.fetch`**, as
+  node's undici sends its requests itself. (#206)
+- **A `Pool` or `Client`, mocked or not, sends every request and every redirect hop to its own
+  origin**, with that origin as `host`, as undici's do. (#206)
+- **`WebSocket` sends its handshake through the undici dispatcher** (`WebSocketInit.dispatcher`,
+  else the global one), so a MockAgent, an Agent's connector or a Pool's origin applies to it, and
+  the init's `protocols` and `headers` are honoured. (#206)
 
 ### Fixed
 
@@ -169,6 +190,28 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   with that error as the `cause` while the connection is still being made, as node's
   `net` does; once it is made, later callbacks are ignored. A second answer that passes
   the rules is still ignored, where node fails the socket with a platform error.
+- **A closed or destroyed undici dispatcher refuses every request** with
+  `ClientDestroyedError` instead of sending it. (#206)
+- **Any dispatcher another undici copy put in the global slot fails oam's `fetch`** with
+  `NotSupportedError` instead of being bypassed; the plain `Agent` every copy installs at load is
+  recognised by identity, so a terser-minified undici no longer fails every fetch. (#206)
+- **A mock reply's own `content-length` or `transfer-encoding` no longer frames its body**, and a
+  request with a large head or a method llhttp does not know is matched, as undici's mock does. (#206)
+- **A builtin oam does not implement** (`_stream_wrap`, `wasi`, `node:sqlite`) says so, instead
+  of "cannot find package ... is it installed?". (#207)
+- **A standalone `ServerResponse`** (built over a request object, given a socket with
+  `assignSocket()`) writes the whole HTTP/1.1 message to its socket, as node's does;
+  `new IncomingMessage(socket)` keeps that socket. (#207)
+- **An `http.request` whose agent hands back a socket with its own `write()`** is written while
+  that socket is still connecting, as in node; a handle-less `net.Socket`'s `resume()` no longer
+  fails with "read handle 0 is gone". (#207)
+- **A `ClientRequest` is an `http.OutgoingMessage`**, `ClientRequest.apply(this, args)` builds
+  the caller's object, and `http.METHODS` lists every method node's parser takes. (#207)
+- **A fetch over a `connect` function's socket destroyed before it answered hung**; it fails with
+  the socket's error. (#206)
+- **The npm undici's `fetch` never delivered a MockAgent reply's body**: `stream.finished()` on a
+  web stream threw and `performance.markResourceTiming()` was missing. (#206)
+- **`console.table`** draws node's table, and a `new Console()` has `table()`.
 
 ### Performance
 

@@ -121,8 +121,23 @@ pub async fn input_end(pipes: Pipes, id: u64) -> OpOutcome {
 }
 
 /// Drop the pipe. True if it was there.
+///
+/// The near end reads it as the peer closing. Dropping JS's write half is
+/// not enough for that while an [`out`] read is parked: that read holds the
+/// other half, which keeps JS's end of the pipe alive, so the near end would
+/// wait for bytes forever -- a fetch over a connector's socket that was
+/// destroyed before it answered hung. The write half is shut down here
+/// instead, which the near end reads as EOF whatever is parked.
 pub fn close(pipes: &Pipes, id: u64) -> bool {
-    lock(pipes).remove(&id).is_some()
+    use futures_util::FutureExt;
+    let Some(pipe) = lock(pipes).remove(&id) else {
+        return false;
+    };
+    if let Some(mut input) = pipe.input {
+        // A DuplexStream's shutdown completes at once.
+        let _ = input.shutdown().now_or_never();
+    }
+    true
 }
 
 /// How many pipes are open.
@@ -204,6 +219,27 @@ mod tests {
         assert!(rest.is_empty());
         // Nothing to pump any more.
         assert!(matches!(out(pipes.clone(), id).await, OpOutcome::Done));
+    }
+
+    #[tokio::test]
+    async fn closing_ends_the_near_ends_read_while_an_out_read_is_parked() {
+        let (pipes, ids) = pipes();
+        let id = open(&pipes, &ids);
+        let mut near = take_near(&pipes, id).unwrap();
+        let parked = tokio::spawn(out(pipes.clone(), id));
+        tokio::task::yield_now().await;
+        assert!(close(&pipes, id));
+        let mut rest = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            near.read_to_end(&mut rest),
+        )
+        .await
+        .expect("the near end reads the close as EOF")
+        .unwrap();
+        assert!(rest.is_empty());
+        drop(near);
+        assert!(matches!(parked.await.unwrap(), OpOutcome::Done));
     }
 
     #[tokio::test]

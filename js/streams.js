@@ -79,6 +79,40 @@
   }
   const settled = (promise) => ({ promise, resolve: undefined, reject: undefined, pending: false });
 
+  // node's kIsClosedPromise (`Symbol.for('nodejs.webstream.isClosedPromise')`):
+  // a promise every ReadableStream and WritableStream carries, settled when
+  // the stream closes (resolved) or errors (rejected, and marked handled).
+  // stream.finished() / eos() on a web stream waits on it -- undici's fetch
+  // does, to finalize a response -- so a stream without it made finished()
+  // throw. Made on first use rather than per stream, so the streams nobody
+  // asks about (every fetch body) pay nothing: settled at once for a stream
+  // already closed or errored, and settled by the stream otherwise.
+  const kIsClosedPromise = Symbol.for("nodejs.webstream.isClosedPromise");
+  function isClosedPromise(stream, closed, errored, error) {
+    let d = stream._isClosed;
+    if (d !== undefined) return d;
+    if (closed) {
+      d = settled(Promise.resolve());
+    } else if (errored) {
+      d = settled(Promise.reject(error));
+      markHandled(d.promise);
+    } else {
+      d = deferred();
+    }
+    stream._isClosed = d;
+    return d;
+  }
+  function settleIsClosed(stream, error, failed) {
+    const d = stream._isClosed;
+    if (d === undefined || !d.pending) return;
+    if (failed) {
+      markHandled(d.promise);
+      d.reject(error);
+    } else {
+      d.resolve();
+    }
+  }
+
   // node's coded errors come from node_compat.js's registry
   // (lib/internal/errors.js), looked up on first use: the registry is not
   // there yet while this file is evaluated.
@@ -392,6 +426,7 @@
   // then the pending reads are done (node's order).
   function readableClose(stream) {
     stream._state = "closed";
+    settleIsClosed(stream);
     stream._resolveClosed?.();
     while (stream._waiters.length > 0) {
       stream._waiters.shift().resolve({ value: undefined, done: true });
@@ -404,6 +439,7 @@
     readableClearAlgorithms(stream);
     stream._state = "errored";
     stream._error = reason;
+    settleIsClosed(stream, reason, true);
     stream._rejectClosed?.(reason);
     while (stream._waiters.length > 0) {
       stream._waiters.shift().reject(reason);
@@ -1049,6 +1085,7 @@
       stream._closeRequest.reject(stream._storedError);
       stream._closeRequest = undefined;
     }
+    settleIsClosed(stream, stream._storedError, true);
     const writer = stream._writer;
     if (writer !== undefined) {
       markHandled(writer._closed.promise);
@@ -1120,6 +1157,7 @@
     }
     stream._state = "closed";
     stream._writer?._closed.resolve?.();
+    settleIsClosed(stream);
   }
 
   function writableFinishInFlightCloseWithError(stream, error) {
@@ -1758,6 +1796,19 @@
   });
   Object.defineProperty(TransformStream.prototype, Symbol.toStringTag, {
     value: "TransformStream",
+    configurable: true,
+  });
+  // node's kIsClosedPromise (see isClosedPromise).
+  Object.defineProperty(ReadableStream.prototype, kIsClosedPromise, {
+    get() {
+      return isClosedPromise(this, this._state === "closed", this._state === "errored", this._error);
+    },
+    configurable: true,
+  });
+  Object.defineProperty(WritableStream.prototype, kIsClosedPromise, {
+    get() {
+      return isClosedPromise(this, this._state === "closed", this._state === "errored", this._storedError);
+    },
     configurable: true,
   });
   Object.defineProperty(CountQueuingStrategy.prototype, Symbol.toStringTag, {

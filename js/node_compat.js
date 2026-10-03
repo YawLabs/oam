@@ -14853,6 +14853,14 @@
       "_stream_duplex",
       "_stream_transform",
       "_stream_passthrough",
+      "_http_agent",
+      "_http_client",
+      "_http_common",
+      "_http_incoming",
+      "_http_outgoing",
+      "_http_server",
+      "_tls_common",
+      "_tls_wrap",
       "string_decoder",
       "timers",
       "timers/promises",
@@ -19591,6 +19599,147 @@
   // ----------------------------------------------------------- node:console
   // require('console') is the global console plus a Console class bound to
   // caller-provided writables.
+  // node's console.table (lib/internal/console/constructor.js table() and
+  // lib/internal/cli_table.js, v22.22.2): the rows and columns node builds
+  // from the data -- an `(index)` column of the keys, a column per property
+  // (or per `properties`), a `Values` column for primitives; Map and Set as
+  // `(iteration index)` / `Key` / `Values` -- each cell util.inspect()ed as
+  // node does, drawn in node's box characters and padded to node's display
+  // widths. One renderer for the global console and every Console instance.
+  // Returns the text to log, or null when node logs the data as it is.
+  // Not modelled: Map and Set ITERATORS (node peeks at them without
+  // consuming them; here they are tabulated as plain objects).
+  const isFullWidthCodePoint = (code) =>
+    code >= 0x1100 && (
+      code <= 0x115f || code === 0x2329 || code === 0x232a ||
+      (code >= 0x2e80 && code <= 0x3247 && code !== 0x303f) ||
+      (code >= 0x3250 && code <= 0x4dbf) || (code >= 0x4e00 && code <= 0xa4c6) ||
+      (code >= 0xa960 && code <= 0xa97c) || (code >= 0xac00 && code <= 0xd7a3) ||
+      (code >= 0xf900 && code <= 0xfaff) || (code >= 0xfe10 && code <= 0xfe19) ||
+      (code >= 0xfe30 && code <= 0xfe6b) || (code >= 0xff01 && code <= 0xff60) ||
+      (code >= 0xffe0 && code <= 0xffe6) || (code >= 0x1b000 && code <= 0x1b001) ||
+      (code >= 0x1f200 && code <= 0x1f251) || (code >= 0x1f300 && code <= 0x1f64f) ||
+      (code >= 0x20000 && code <= 0x3fffd)
+    );
+  const isZeroWidthCodePoint = (code) =>
+    code <= 0x1f || (code >= 0x7f && code <= 0x9f) || (code >= 0x300 && code <= 0x36f) ||
+    (code >= 0x200b && code <= 0x200f) || (code >= 0x20d0 && code <= 0x20ff) ||
+    (code >= 0xfe00 && code <= 0xfe0f) || (code >= 0xfe20 && code <= 0xfe2f) ||
+    (code >= 0xe0100 && code <= 0xe01ef);
+  // node's getStringWidth with ICU, per code point: 0 for a control, a
+  // combining mark or a format character, 2 for an East Asian wide one --
+  // the CJK ranges, and an emoji shown as one (`\p{Emoji_Presentation}`, so
+  // '❌' is 2 and '❤' 1, a skin-toned emoji 4) -- and 1 for the rest.
+  const ZERO_WIDTH = /^[\p{Mn}\p{Me}\p{Cf}]$/u;
+  const WIDE_EMOJI = /^\p{Emoji_Presentation}$/u;
+  function stringWidth(str) {
+    str = registry.get("util").stripVTControlCharacters(str).normalize("NFC");
+    let width = 0;
+    for (const char of str) {
+      const code = char.codePointAt(0);
+      if (code < 0x7f) {
+        if (code >= 0x20) width++;
+      } else if (isZeroWidthCodePoint(code) || ZERO_WIDTH.test(char)) {
+        // nothing
+      } else if (isFullWidthCodePoint(code) || WIDE_EMOJI.test(char)) {
+        width += 2;
+      } else {
+        width++;
+      }
+    }
+    return width;
+  }
+  function renderCliTable(head, columns) {
+    const renderRow = (row, widths) => {
+      let out = "│ ";
+      for (let i = 0; i < row.length; i++) {
+        out += row[i] + " ".repeat(widths[i] - stringWidth(row[i]));
+        if (i !== row.length - 1) out += " │ ";
+      }
+      return out + " │";
+    };
+    const rows = [];
+    const widths = head.map((h) => stringWidth(h));
+    const longest = Math.max(...columns.map((a) => a.length));
+    for (let i = 0; i < head.length; i++) {
+      const column = columns[i];
+      for (let j = 0; j < longest; j++) {
+        if (rows[j] === undefined) rows[j] = [];
+        const value = (rows[j][i] = Object.prototype.hasOwnProperty.call(column, j) ? column[j] : "");
+        widths[i] = Math.max(widths[i] || 0, stringWidth(value));
+      }
+    }
+    const divider = widths.map((w) => "─".repeat(w + 2));
+    let result = "┌" + divider.join("┬") + "┐\n" + renderRow(head, widths) + "\n" +
+      "├" + divider.join("┼") + "┤\n";
+    for (const row of rows) result += renderRow(row, widths) + "\n";
+    return result + "└" + divider.join("┴") + "┘";
+  }
+  function consoleTable(tabularData, properties, inspectOptions) {
+    if (properties !== undefined && !Array.isArray(properties)) {
+      throw new codes.ERR_INVALID_ARG_TYPE("properties", "Array", properties);
+    }
+    if (tabularData === null || typeof tabularData !== "object") return null;
+    const { inspect } = registry.get("util");
+    const _inspect = (v) => {
+      const depth = v !== null && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length > 2 ? -1 : 0;
+      return inspect(v, { depth, maxArrayLength: 3, breakLength: Infinity, ...inspectOptions });
+    };
+    const getIndexArray = (length) => Array.from({ length }, (_, i) => _inspect(i));
+    if (tabularData instanceof Map) {
+      const keys = [];
+      const values = [];
+      let length = 0;
+      for (const { 0: k, 1: v } of tabularData) {
+        keys.push(_inspect(k));
+        values.push(_inspect(v));
+        length++;
+      }
+      return renderCliTable(["(iteration index)", "Key", "Values"], [getIndexArray(length), keys, values]);
+    }
+    if (tabularData instanceof Set) {
+      const values = [];
+      let length = 0;
+      for (const v of tabularData) {
+        values.push(_inspect(v));
+        length++;
+      }
+      return renderCliTable(["(iteration index)", "Values"], [getIndexArray(length), values]);
+    }
+    const map = { __proto__: null };
+    let hasPrimitives = false;
+    const valuesKeyArray = [];
+    const indexKeyArray = Object.keys(tabularData);
+    for (let i = 0; i < indexKeyArray.length; i++) {
+      const item = tabularData[indexKeyArray[i]];
+      const primitive = item === null || (typeof item !== "function" && typeof item !== "object");
+      if (properties === undefined && primitive) {
+        hasPrimitives = true;
+        valuesKeyArray[i] = _inspect(item);
+      } else {
+        const keys = properties || Object.keys(item);
+        for (const key of keys) {
+          map[key] ??= [];
+          if ((primitive && properties) || !Object.prototype.hasOwnProperty.call(item, key)) {
+            map[key][i] = "";
+          } else {
+            map[key][i] = _inspect(item[key]);
+          }
+        }
+      }
+    }
+    const keys = Object.keys(map);
+    const values = Object.values(map);
+    if (hasPrimitives) {
+      keys.push("Values");
+      values.push(valuesKeyArray);
+    }
+    keys.unshift("(index)");
+    values.unshift(indexKeyArray);
+    return renderCliTable(keys, values);
+  }
+  registry._consoleTable = consoleTable;
+
   registry.factories.console = () => {
     const util = registry.get("util");
     class Console {
@@ -19621,6 +19770,12 @@
         this.debug = this.log;
         this.warn = writeTo(this._err);
         this.error = this.warn;
+        // node's `inspectOptions`, which its table() inspects cells with.
+        const inspectOptions = options.inspectOptions;
+        this.table = (data, properties) => {
+          const text = consoleTable(data, properties, inspectOptions);
+          this.log(text === null ? data : text);
+        };
       }
     }
     // node's `require("node:console")` IS globalThis.console (identity holds),
@@ -19651,6 +19806,23 @@
   // ServerResponse streams: the first write() opens a chunked response,
   // so res.write per SSE event flushes immediately. The http CLIENT
   // (http.request/get) is gated â€” use fetch (documented).
+  // llhttp's method enum (llhttp.h), in order: an index here is what an
+  // HTTPParser's kOnHeadersComplete reports as `method` (node:_http_common).
+  // The RTSP methods and PRI are in the enum but are not HTTP methods; the
+  // 35 HTTP ones, in enum order, are node's `_http_common.methods`, and
+  // sorted, `http.METHODS`.
+  const LLHTTP_METHODS = [
+    "DELETE", "GET", "HEAD", "POST", "PUT", "CONNECT", "OPTIONS", "TRACE", "COPY", "LOCK",
+    "MKCOL", "MOVE", "PROPFIND", "PROPPATCH", "SEARCH", "UNLOCK", "BIND", "REBIND", "UNBIND",
+    "ACL", "REPORT", "MKACTIVITY", "CHECKOUT", "MERGE", "M-SEARCH", "NOTIFY", "SUBSCRIBE",
+    "UNSUBSCRIBE", "PATCH", "PURGE", "MKCALENDAR", "LINK", "UNLINK", "SOURCE", "PRI",
+    "DESCRIBE", "ANNOUNCE", "SETUP", "PLAY", "PAUSE", "TEARDOWN", "GET_PARAMETER",
+    "SET_PARAMETER", "REDIRECT", "RECORD", "FLUSH", "QUERY",
+  ];
+  // DELETE .. SOURCE, and QUERY.
+  const isLlhttpHttpMethod = (index) => index < 34 || index === 46;
+  const HTTP_METHODS = LLHTTP_METHODS.filter((_, index) => isLlhttpHttpMethod(index));
+
   registry.factories.http = (natives) => {
     const EventEmitter = registry.get("events");
     const { Readable } = registry.get("stream");
@@ -19705,10 +19877,19 @@
         // The http layer manages this stream's close lifecycle; opt out of
         // Readable autoDestroy to keep the prior single-close behavior.
         super({ autoDestroy: false });
+        // A socket: node's own constructor, `new IncomingMessage(socket)`
+        // -- a message read off that socket by a parser of the caller's
+        // (the parsers in node:_http_common, or a test double such as
+        // nock's, which builds a ServerResponse over one). Its fields are
+        // node's until the parser fills them in, and its body is what is
+        // pushed into it.
+        if (meta && typeof meta.on === "function" && typeof meta.write === "function") {
+          this._initForSocket(meta);
+          return;
+        }
         // `meta` is the native accept record on the server path. Tolerate a
-        // missing/socket-shaped arg so `new http.IncomingMessage()` and the
-        // old-style `IncomingMessage.call(this, socket)` inheritance pattern
-        // do not throw (Node's IncomingMessage is constructible with no args).
+        // missing arg so `new http.IncomingMessage()` does not throw (Node's
+        // IncomingMessage is constructible with no args).
         meta = meta || {};
         this.method = meta.method;
         this.url = meta.uri;
@@ -19770,6 +19951,63 @@
         this._consuming = false;
         this._dumped = false;
       }
+      // node's IncomingMessage(socket) constructor fields.
+      _initForSocket(socket) {
+        this.socket = socket;
+        this.httpVersionMajor = null;
+        this.httpVersionMinor = null;
+        this.httpVersion = null;
+        this.complete = false;
+        this.headers = {};
+        this.rawHeaders = [];
+        this.trailers = {};
+        this.rawTrailers = [];
+        this.joinDuplicateHeaders = false;
+        this.aborted = false;
+        this.upgrade = null;
+        this.url = "";
+        this.method = null;
+        this.statusCode = null;
+        this.statusMessage = null;
+        this.client = socket;
+        this.connection = socket;
+        this._consuming = false;
+        this._dumped = false;
+        this._bodyDone = true;
+        this._socketBacked = true;
+      }
+      // node's _addHeaderLines: a parser's [name, value, ...] list, the
+      // first `n` entries of it, into the headers -- or, once the message
+      // is complete, into the trailers.
+      _addHeaderLines(headers, n) {
+        if (headers && headers.length) {
+          let dest;
+          if (this.complete) {
+            this.rawTrailers = headers;
+            dest = this.trailers;
+          } else {
+            this.rawHeaders = headers;
+            dest = this.headers;
+          }
+          if (dest) {
+            for (let i = 0; i < n; i += 2) this._addHeaderLine(headers[i], headers[i + 1], dest);
+          }
+        }
+      }
+      // node's _addHeaderLine: set-cookie collects a list, cookie joins
+      // with '; ', a field node keeps one of keeps the first (unless
+      // joinDuplicateHeaders), and any other repeat joins with ', '.
+      _addHeaderLine(field, value, dest) {
+        if (this.joinDuplicateHeaders) {
+          const key = String(field).toLowerCase();
+          if (key !== "set-cookie" && key !== "cookie" && kSingleValueFields.has(key)) {
+            if (dest[key] === undefined) dest[key] = value;
+            else dest[key] += ", " + value;
+            return;
+          }
+        }
+        addHeaderLine(dest, String(field), value);
+      }
       // node: `if (callback) this.on('timeout', callback);
       // this.socket.setTimeout(msecs); return this;` -- the connection's
       // inactivity timeout. 'timeout' reaches the request only while it is
@@ -19789,6 +20027,16 @@
         // dumps only NON-consumed requests, so a handler that responds
         // early and keeps draining the body must not have it cancelled.
         this._consuming = true;
+        // A message over a socket of the caller's has its body pushed in
+        // by their parser; reading asks for more of the socket (node's
+        // readStart).
+        if (this._socketBacked) {
+          const socket = this.socket;
+          if (socket && !socket._paused && socket.readable && typeof socket.resume === "function") {
+            socket.resume();
+          }
+          return;
+        }
         if (this._bodyDone || this._reading) return;
         this._reading = true;
         natives.httpRequestBodyRead(this._requestId).then(
@@ -19951,6 +20199,12 @@
         // integer request id the native hyper layer hands us. In that mode
         // write()/end()/flushHeaders() must NOT touch the native responder.
         this._mock = typeof requestId !== "number";
+        // node's ServerResponse(req): the request it answers, whose method
+        // and version decide the body's framing.
+        if (this._mock && requestId !== null && typeof requestId === "object") this.req = requestId;
+        // node's: a Date field unless this is turned off (or the field
+        // removed). oam's own server leaves the field to the transport.
+        this.sendDate = true;
         this._headers = new Map();
         this._streamId = null;
         this._ended = false;
@@ -20077,6 +20331,7 @@
         if (key === "content-length") this._removedContLen = true;
         else if (key === "transfer-encoding") this._removedTE = true;
         else if (key === "connection") this._removedConnection = true;
+        else if (key === "date") this.sendDate = false;
         this._headers.delete(key);
         if (this._names !== undefined) this._names.delete(key);
       }
@@ -20169,6 +20424,7 @@
         let te = false;
         let trailer = false;
         let connection = false;
+        let date = false;
         this._chunked = false;
         const note = (name, value) => {
           fields.push([name, String(value)]);
@@ -20191,6 +20447,9 @@
             case "trailer":
               trailer = true;
               break;
+            case "date":
+              date = true;
+              break;
           }
         };
         const add = (name, value) => {
@@ -20212,7 +20471,11 @@
         if (this._hasBody === undefined) this._hasBody = !(req && req.method === "HEAD");
         if (code === 204 || code === 304 || (code >= 100 && code <= 199)) this._hasBody = false;
         const hasBody = this._hasBody;
-        const http10 = Boolean(req && req.httpVersion === "1.0");
+        // node's test: an HTTP/1.0 request -- or one whose version no parser
+        // has set yet (null), as for a response built over
+        // `new IncomingMessage(socket)`.
+        const http10 = Boolean(req && (req.httpVersionMajor < 1 ||
+          (req.httpVersionMajor === 1 && req.httpVersionMinor === 0)));
         // node's useChunkedEncodingByDefault: false for an HTTP/1.0 client
         // that did not send `TE: chunked`.
         const chunksByDefault = !http10 || CHUNKED_CODING.test(req.headers && req.headers.te);
@@ -20239,7 +20502,11 @@
         // can carry: node refuses the head (an HTTP/1.0 client's without
         // `TE: chunked`, a 204's, one with a content-length, ...).
         if (trailer && !this._chunked) throw codes.ERR_HTTP_TRAILER_INVALID();
-        if (http10 && !connection && !this._removedConnection) {
+        if (this._mock) {
+          this._mockHead = this._wireHead(fields, {
+            contLen, te, trailer, connection, date, hasBody, http10, chunksByDefault,
+          });
+        } else if (http10 && !connection && !this._removedConnection) {
           // node's keep-alive rule for a head with no connection field: an
           // HTTP/1.0 client's connection is kept when it asked for that
           // (`Connection: keep-alive`) and the body is framed -- by a
@@ -20251,7 +20518,7 @@
             KEEP_ALIVE_TOKEN.test((req.headers && req.headers.connection) || "");
           fields.push(["Connection", keep ? "keep-alive" : "close"]);
         }
-        if (http10) {
+        if (http10 && !this._mock) {
           // node chunks for an HTTP/1.0 client that sent `TE: chunked`;
           // hyper does that only for a response that says so itself.
           if (this._chunked && !te) fields.push(["Transfer-Encoding", "chunked"]);
@@ -20262,6 +20529,63 @@
         // as node's statusLine is: writeHead()'s, or statusMessage.
         this._headMessage = this.statusMessage;
         this._headJson = JSON.stringify(fields);
+      }
+      // The head of a response with no connection of oam's (one built over
+      // a request object and given a socket with assignSocket()), as node's
+      // _storeHeader writes it: the status line, the fields, then the ones
+      // node adds -- Date (unless sendDate is off or one was set),
+      // Connection (unless removed or set: keep-alive while the connection
+      // persists and the body is framed, else close), and the body's
+      // framing (a content-length end() worked out, else chunks, else
+      // nothing: the body runs to the close).
+      _wireHead(fields, s) {
+        let head = "HTTP/1.1 " + this.statusCode + " " + this.statusMessage + "\r\n";
+        for (let i = 0; i < fields.length; i++) head += fields[i][0] + ": " + fields[i][1] + "\r\n";
+        if (this.sendDate !== false && !s.date) head += "Date: " + new Date().toUTCString() + "\r\n";
+        // node's standalone ServerResponse keeps the connection unless the
+        // request is HTTP/1.0 (or of no version yet).
+        const keepAlive = !s.http10;
+        if (!this._removedConnection && !s.connection) {
+          head += keepAlive && (s.contLen || s.chunksByDefault) ? "Connection: keep-alive\r\n" : "Connection: close\r\n";
+        }
+        if (!s.contLen && !s.te && s.hasBody && s.chunksByDefault) {
+          if (!s.trailer && !this._removedContLen && typeof this._contentLength === "number") {
+            head += "Content-Length: " + this._contentLength + "\r\n";
+          } else if (!this._removedTE) {
+            head += "Transfer-Encoding: chunked\r\n";
+          }
+        }
+        return head + "\r\n";
+      }
+      // What a standalone response hands its socket for `bytes`, as node's
+      // _send does: the head ahead of the first bytes, then the bytes framed
+      // as the head says (a chunk, or as they are; nothing for a response
+      // that has no body).
+      _mockParts(bytes, chunk, encoding, fromEnd) {
+        const Buffer = globalThis.Buffer;
+        const parts = [];
+        this.headersSent = true;
+        if (!this._mockHeadSent && this._mockHead !== undefined) {
+          this._mockHeadSent = true;
+          parts.push(Buffer.from(this._mockHead, this._headIsUtf8(chunk, encoding, fromEnd) ? "utf8" : "latin1"));
+        }
+        if (this._hasBody && bytes.length > 0) {
+          if (this._chunked) {
+            parts.push(Buffer.from(bytes.length.toString(16) + "\r\n", "latin1"), bytes, Buffer.from("\r\n", "latin1"));
+          } else {
+            parts.push(bytes);
+          }
+        }
+        return parts;
+      }
+      _mockWrite(parts) {
+        const socket = this.socket;
+        if (parts.length === 0 || !socket || typeof socket.write !== "function") return;
+        try {
+          socket.write(parts.length === 1 ? parts[0] : globalThis.Buffer.concat(parts));
+        } catch {
+          /* a null socket swallows */
+        }
       }
       // node's addTrailers: each name a token ('Trailer name'), each value
       // free of what a header value may not hold ('trailer content'); a
@@ -20397,17 +20721,15 @@
           encoding = undefined;
         }
         if (this._mock) {
-          // Absorb into the assigned (usually null) socket; the mock consumer
-          // captures the real payload through its own write() override.
+          // A response with no connection of oam's writes the HTTP/1.1
+          // message to its assigned socket, as node's does: a test double
+          // reads the response off it (nock's MockHttpSocket), and an
+          // inject consumer that captures the payload through its own
+          // write() override hands it a socket that discards it.
           if (this._ended) return false;
-          this.headersSent = true;
-          if (this.socket && typeof this.socket.write === "function") {
-            try {
-              this.socket.write(this._toBytes(chunk, encoding));
-            } catch {
-              /* null socket swallows */
-            }
-          }
+          const bytes = this._toBytes(chunk, encoding);
+          this._implicitHead();
+          this._mockWrite(this._mockParts(bytes, chunk, encoding, false));
           if (cb) queueMicrotask(cb);
           return true;
         }
@@ -20474,8 +20796,23 @@
           encoding = undefined;
         }
         if (this._mock) {
-          if (chunk !== undefined && chunk !== null) this.write(chunk, encoding);
           if (!this._ended) {
+            const hasChunk = chunk !== undefined && chunk !== null;
+            const bytes = hasChunk ? this._toBytes(chunk, encoding) : new Uint8Array(0);
+            // node's end() before any head: the body's length is known, and
+            // the head it builds sends it.
+            if (!this._wroteHead) {
+              this._contentLength = bytes.length;
+              this.writeHead(this.statusCode);
+            }
+            const parts = this._mockParts(bytes, chunk, encoding, true);
+            if (this._chunked && this._hasBody) {
+              let last = "0\r\n";
+              const trailers = this._trailers;
+              if (trailers) for (const [name, value] of trailers) last += name + ": " + value + "\r\n";
+              parts.push(globalThis.Buffer.from(last + "\r\n", "latin1"));
+            }
+            this._mockWrite(parts);
             this._ended = true;
             this.headersSent = true;
             // Node with assignSocket emits 'finish' then runs the end
@@ -20625,7 +20962,12 @@
       // node sends the head joined to an empty string in no encoding: as
       // UTF-8, whatever follows.
       flushHeaders() {
-        if (this._mock) return;
+        if (this._mock) {
+          if (this._ended) return;
+          this._implicitHead();
+          this._mockWrite(this._mockParts(new Uint8Array(0), undefined, undefined, false));
+          return;
+        }
         if (this._streamId === null && !this._ended) {
           this._implicitHead();
           this._startStream(true);
@@ -22058,6 +22400,21 @@
         (isIP(host) === 0 && socket.listenerCount("lookup") > 0);
     }
 
+    // Whether a request written to a socket that is still connecting waits
+    // in the socket's own queue for 'connect' -- oam's net.Socket and
+    // TLSSocket, whose queue the agent path stands in for by starting the
+    // exchange on 'connect' -- or reaches the socket at once. node's
+    // ClientRequest writes the request into its socket as soon as it has
+    // one (onSocketNT's _flush), connected or not, so a socket with a
+    // write() of its own sees the request while it is connecting: a test
+    // double such as nock's MockHttpSocket answers the request it is
+    // written and only then emits 'connect'.
+    function writeWaitsForConnect(socket) {
+      var tls = registry._tlsStock;
+      return socket.write === registry._netStock.socketWrite ||
+        (tls !== undefined && socket.write === tls.socketWrite);
+    }
+
     function isSocketLike(socket) {
       return socket !== null && typeof socket === "object" &&
         typeof socket.on === "function" && typeof socket.write === "function" &&
@@ -22418,6 +22775,38 @@
       return socket;
     }
 
+    // node's OutgoingMessage#write / #end on a message that has no socket and
+    // never gets one -- one built by `http.OutgoingMessage.call(this)` alone,
+    // as nock's OverriddenClientRequest is when it refuses a request (net
+    // connect disabled) and its caller ends it anyway: the head and the
+    // bytes are buffered for a socket that never comes, `headersSent` and
+    // `finished` turn true, write() returns true, and 'finish' (with an
+    // end() callback waiting on it) never fires (measured on node v22.22.2).
+    function socketlessWrite(msg, chunk, encoding, callback) {
+      if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+      checkWriteChunk(chunk);
+      if (msg.finished) {
+        requestWriteAfterEnd(msg, callback);
+        return true;
+      }
+      msg.headersSent = true;
+      return true;
+    }
+    function socketlessEnd(msg, data, encoding, callback) {
+      if (typeof data === "function") { callback = data; data = undefined; }
+      if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
+      if (msg.finished) {
+        if (data !== undefined && data !== null) requestWriteAfterEnd(msg, callback);
+        else if (typeof callback === "function") msg.once("finish", callback);
+        return msg;
+      }
+      if (data !== undefined && data !== null) socketlessWrite(msg, data, encoding);
+      msg.headersSent = true;
+      msg.finished = true;
+      if (typeof callback === "function") msg.once("finish", callback);
+      return msg;
+    }
+
     // responseWriteAfterEnd for a ClientRequest, whose destroyed state is
     // its own `destroyed`.
     function requestWriteAfterEnd(req, cb) {
@@ -22432,395 +22821,404 @@
       });
     }
 
+    // ClientRequest's constructor, run on `this`: node's ClientRequest is a
+    // function, so `ClientRequest.apply(this, args)` -- what nock's
+    // OverriddenClientRequest does to pass a request through -- builds the
+    // caller's object in place, and the socket, the exchange and every
+    // closure belong to it (callableHttp).
+    function initClientRequest(input, options, callback) {
+      var normalized = normalizeClientArgs(input, options, callback);
+      var opts = normalized.options || {};
+      callback = normalized.callback;
+      // node lib/_http_client.js: the agent comes first. `false` is a fresh
+      // one of the default kind, none is the default (unless a
+      // createConnection option replaces it), and anything without
+      // addRequest is refused.
+      var agent = opts.agent;
+      var defaultAgent = opts._defaultAgent || agentState.globalAgent;
+      if (agent === false) {
+        agent = new defaultAgent.constructor();
+      } else if (agent === null || agent === undefined) {
+        if (typeof opts.createConnection !== "function") agent = defaultAgent;
+      } else if (typeof agent.addRequest !== "function") {
+        throw codes.ERR_INVALID_ARG_TYPE(
+          "options.agent",
+          ["Agent-like Object", "undefined", "false"],
+          agent,
+        );
+      }
+      this.agent = agent;
+      var protocol = opts.protocol || defaultAgent.protocol || "http:";
+      var expectedProtocol = defaultAgent.protocol || "http:";
+      if (this.agent && this.agent.protocol) expectedProtocol = this.agent.protocol;
+      this.method = (opts.method || "GET").toUpperCase();
+      // Node's order: the path is validated before the port (measured with
+      // both bad -- ERR_UNESCAPED_CHARACTERS wins).
+      var reqPath = opts.path || "/";
+      if (opts.path) {
+        reqPath = String(opts.path);
+        if (INVALID_PATH_REGEX.test(reqPath)) {
+          throw codes.ERR_UNESCAPED_CHARACTERS("Request path");
+        }
+      }
+      if (protocol !== expectedProtocol) {
+        throw codes.ERR_INVALID_PROTOCOL(protocol, expectedProtocol);
+      }
+      var host =
+        validateHost(opts.hostname, "hostname") ||
+        validateHost(opts.host, "host") ||
+        "localhost";
+      var defaultPort = opts.defaultPort || (this.agent && this.agent.defaultPort);
+      var port = validateClientPort(
+        opts.port || defaultPort || (protocol === "https:" ? 443 : 80),
+      );
+      // An IPv6 literal host (`{host: '::1'}`) is bracketed in the URL, or
+      // `http://::1:80/` would not parse and the request would fail with
+      // "fetch failed" where node connects to ::1. A URL's hostname already
+      // carries its brackets (net.isIP('[::1]') is 0).
+      var urlHost = isIP(host) === 6 ? "[" + host + "]" : host;
+      // The connect target must not be movable by the caller's `path` or
+      // `host`. Node cannot be: it dials `hostname`:`port` and writes `path`
+      // as an OPAQUE request target. oam's fetch path carries the request as
+      // a URL string, and plain concatenation let both escape -- measured
+      // before this guard, `{hostname: SAFE, port: GOOD, path:
+      // '@127.0.0.1:EVIL/x'}` and `{hostname: 'u:p@127.0.0.1', ...}` both
+      // reached the OTHER origin, and take_userinfo then sent the intended
+      // origin to it as `Authorization: Basic base64(SAFE:GOOD)`.
+      //
+      // node writes `path` verbatim as the request target, in whichever
+      // form the caller chose: origin form (`/p?q`), absolute form for a
+      // forward proxy (`http://host/p` -- axios's `proxy` option,
+      // http-proxy-agent), authority form for CONNECT (`host:port` --
+      // tunnel, hpagent) or `*` for OPTIONS. So `this.path` stays as
+      // written and only the URL the fetch path DIALS is built from a copy
+      // forced into origin form. A target that is not origin form is sent
+      // over a socket this request dialled itself (`_agentPath` below),
+      // where the target is just bytes on a connection that already went
+      // to `hostname`:`port` and cannot move it.
+      var urlPath = reqPath.charAt(0) === "/" ? reqPath : "/" + reqPath;
+      var authority = null;
+      try {
+        var probe = new URL(protocol + "//" + urlHost + "/");
+        if (
+          probe.username === "" &&
+          probe.password === "" &&
+          probe.port === "" &&
+          probe.pathname === "/" &&
+          probe.search === "" &&
+          probe.hash === ""
+        ) {
+          authority = probe;
+        }
+      } catch {
+        authority = null;
+      }
+      // node hands `host` to the resolver as written. The URL parser
+      // rewrites spellings the resolver refuses -- percent-escapes, octal or
+      // zero-padded IPv4, a trailing dot on an address, a tab, IDNA,
+      // fullwidth digits -- and a transport dialling its hostname would
+      // reach an address node never dials. So a name the parser cannot
+      // hold, or holds only rewritten (or bracketed, which only some
+      // resolvers accept), goes over net.connect with the string as given:
+      // the platform's resolver answers, as it does node's.
+      this._rawHost = authority === null ||
+        (isIP(host) === 0 &&
+          (authority.hostname !== host.toLowerCase() || host.charAt(0) === "["));
+      this._url = protocol + "//" + urlHost + ":" + port + urlPath;
+      this._headers = {};
+      if (opts.headers) {
+        var keys = Object.keys(opts.headers);
+        for (var i = 0; i < keys.length; i++) {
+          // node's constructor sets each through setHeader(), so a bad
+          // name or value throws from http.request itself (#174).
+          checkOutgoingHeader(keys[i], opts.headers[keys[i]]);
+          this._headers[keys[i].toLowerCase()] = opts.headers[keys[i]];
+        }
+      }
+      // node sets the Host header with setHeader() here, before the auth
+      // one and after the caller's (measured order: the caller's, Host,
+      // Authorization, Connection). It is an ORDINARY header from then on:
+      // getHeader('host') reads it back -- http-proxy-agent builds the
+      // absolute-form target it rewrites `path` to out of it, and without
+      // it aims every request at `localhost` -- and removeHeader('host')
+      // really drops it.
+      this._setHost = opts.setHost !== undefined
+        ? Boolean(opts.setHost)
+        : opts.setDefaultHeaders !== false;
+      var hostHeader = host;
+      var firstColon = hostHeader.indexOf(":");
+      if (
+        firstColon !== -1 &&
+        hostHeader.indexOf(":", firstColon + 1) !== -1 &&
+        hostHeader.charAt(0) !== "["
+      ) {
+        hostHeader = "[" + hostHeader + "]";
+      }
+      if (port && +port !== defaultPort) hostHeader += ":" + port;
+      this._hostHeader = hostHeader;
+      if (this._setHost && this._headers.host === undefined) {
+        // node's setHeader() value check throws for a character no header
+        // may carry -- a host spelled with fullwidth digits, say -- before
+        // anything is resolved.
+        if (INVALID_HEADER_CHAR.test(hostHeader)) throw invalidHeaderChar("Host");
+        this._headers.host = hostHeader;
+      }
+      // node lib/_http_client.js: `if (options.auth && !this.getHeader(
+      // 'Authorization')) this.setHeader('Authorization', 'Basic ' +
+      // Buffer.from(options.auth).toString('base64'))`. The bytes are the
+      // string's UTF-8 (measured: `auth: 'café:p'` sends
+      // `Basic Y2Fmw6k6cA==`), no colon is required, an empty `auth` sends
+      // nothing, and an explicit authorization header wins in either case.
+      // oam dropped the documented option entirely, so every caller using it
+      // -- and every `http.request('http://u:p@host/')`, whose userinfo IS
+      // this option -- talked to the server unauthenticated and got a 401.
+      if (opts.auth && this._headers["authorization"] === undefined) {
+        this._headers["authorization"] =
+          "Basic " + globalThis.Buffer.from(String(opts.auth), "utf8").toString("base64");
+      }
+      // node: the response head limit for this request (0 or absent: the
+      // process-wide --max-http-header-size, http.maxHeaderSize), and
+      // insecureHTTPParser, which does not lift it. Validated as node's
+      // constructor validates them; an agent's options are not consulted.
+      var maxHeaderSize = opts.maxHeaderSize;
+      if (maxHeaderSize !== undefined) {
+        if (typeof maxHeaderSize !== "number") {
+          throw codes.ERR_INVALID_ARG_TYPE("maxHeaderSize", "number", maxHeaderSize);
+        }
+        if (!Number.isInteger(maxHeaderSize)) {
+          throw codes.ERR_OUT_OF_RANGE("maxHeaderSize", "an integer", maxHeaderSize);
+        }
+        if (maxHeaderSize < 0 || maxHeaderSize > Number.MAX_SAFE_INTEGER) {
+          throw codes.ERR_OUT_OF_RANGE(
+            "maxHeaderSize",
+            ">= 0 && <= " + Number.MAX_SAFE_INTEGER,
+            maxHeaderSize,
+          );
+        }
+      }
+      this.maxHeaderSize = maxHeaderSize;
+      var insecureHTTPParser = opts.insecureHTTPParser;
+      if (insecureHTTPParser !== undefined && typeof insecureHTTPParser !== "boolean") {
+        throw codes.ERR_INVALID_ARG_TYPE(
+          "options.insecureHTTPParser",
+          "boolean",
+          insecureHTTPParser,
+        );
+      }
+      this.insecureHTTPParser = insecureHTTPParser;
+      this._body = [];
+      this._ended = false;
+      this._aborted = false;
+      this.headersSent = false;
+      // node's OutgoingMessage internals a proxy agent reaches for. node
+      // renders the request head into `_header` when the message is sent
+      // and queues what follows in `outputData`; http-proxy-agent (v7-v9,
+      // under proxy-agent) nulls `_header`, rewrites `path` to absolute
+      // form, calls `_implicitHeader()` to re-render, and -- only if there
+      // is one -- patches the head at the front of `outputData`. oam
+      // renders the head when it actually sends, from the live `path` and
+      // headers, so nothing is ever queued ahead of it and `outputData`
+      // stays empty.
+      this._header = null;
+      this.outputData = [];
+      // Node's ClientRequest is an OutgoingMessage: a LEGACY writable
+      // stream -- no _writableState, lifecycle duck-read off plain
+      // properties. The vendored end-of-stream keys on exactly these, so
+      // without them `pipeline(src, req)` / `stream.finished(req)` wait
+      // forever on a 'finish' that never comes (test-stream-pipeline).
+      this.writable = true;
+      this.finished = false;
+      this.destroyed = false;
+      this.closed = false;
+      this.aborted = false;
+      this.res = null;
+      this.errored = null;
+      this._bodyLength = 0;
+      this._bodyStream = null;
+      // Cancels the transport's request while it has no response (set by
+      // _doFetchRequest; see _cancelBodyStream).
+      this._fetchCancel = null;
+      // Every operation on the outbound body channel queues behind the one
+      // before it (see _channelWrite). Unordered calls race: the write op is
+      // ASYNC and the end op is SYNCHRONOUS, so end() drops the channel's
+      // sender before a spawned write has cloned it, that write fails as an
+      // unknown stream, and the chunk is LOST -- the server sees a
+      // well-formed, complete chunked body missing its tail and neither side
+      // reports an error. Measured on node v22.22.2: write('aa') write('bb')
+      // write('cc') end() echoes "aabbcc" every time; oam echoed "aabb" on
+      // most runs before this chain existed. Two writes in flight at once
+      // could also reach the mpsc channel out of order (multi-thread tokio).
+      this._channelTail = null;
+      this._streamArmed = false;
+      this._sent = false;
+      this._droppedWrites = false;
+      this._finished = false;
+      // node: null until the 'socket' event.
+      this.socket = null;
+      this.path = reqPath;
+      this.host = host;
+      this.protocol = protocol;
+      this.reusedSocket = false;
+      // node: with an agent the socket is kept alive unless the agent could
+      // never reuse it (no keepAlive and no maxSockets cap); without one
+      // (a createConnection option) it is closed.
+      this.shouldKeepAlive = !!this.agent &&
+        !(!this.agent.keepAlive && !Number.isFinite(this.agent.maxSockets));
+      this._removedConnection = false;
+      // node's req._ended: the response has ended (the socket may be freed
+      // once the request has finished too).
+      this._responseEnd = false;
+      // An agent-path request between addRequest and its socket.
+      this._awaitingSocket = false;
+      if (opts.timeout !== undefined) this.timeout = requestTimerDuration(opts.timeout, "timeout");
+      // node's req.timeoutCb: 0 not listening for the socket's 'timeout',
+      // 1 listening (it is re-emitted on the request once), 2 done.
+      this._timeoutListen = 0;
+      this._timeoutAfterResponse = false;
+      // A response teardown held until the socket's 'timeout' listeners
+      // have all run (_onSocketTimeout).
+      this._inSocketTimeout = false;
+      this._resTeardown = null;
+      this._pendingDispatch = null;
+      this._socketEmitted = false;
+      this._responded = false;
+      this._responseDone = false;
+      this._errorEmitted = false;
+      this._bridge = null;
+      this._bridgeIn = null;
+      this._bridgeEnded = false;
+      // Bytes the socket delivered before the exchange started, and those
+      // held back until hyper has written the request (_pumpBridge).
+      this._earlyData = null;
+      this._bridgeGate = null;
+      // The socket closed after delivering a response the exchange still
+      // has to read; the request let go of a kept-alive socket.
+      this._socketGone = false;
+      this._keptAlive = false;
+      // The socket's EOF, held back while the response head is due.
+      this._eofHold = null;
+      // node's 'finish' over a socket: once end() has been called
+      // (_finishOnWrite) and the socket has written the whole request --
+      // `_requestBytes` (the bridge's count, once hyper has written it all)
+      // of the `_requestOut` bytes written so far (_requestFlushed).
+      // `_finishAwaitsPath`: end() came while the way to send was still
+      // being decided (_emitFetchSocket).
+      // `_requestAccepted`: of those, the bytes the socket has TAKEN --
+      // ahead of `_requestOut`, which waits for the write to come back
+      // (_requestWritableFinished).
+      this._finishOnWrite = false;
+      this._finishAwaitsPath = false;
+      this._requestBytes = null;
+      this._requestOut = 0;
+      this._requestAccepted = 0;
+      this._requestWritten = false;
+      // write() callbacks, called as node calls them: once the socket has
+      // written the chunk, so never before it connected. Each waits for
+      // its place in the request body (`at`, as `_bodyQueued` counts it)
+      // to be covered by `_bodyWritten`, the body bytes the socket has
+      // written -- read off the bridge's progress (`_marks`: [request
+      // bytes, the body bytes they cover] pairs `_requestOut` has yet to
+      // reach, oldest first; `_markSeen` the newest of them).
+      // `_onSocket`: the request's writes are its socket's, in node's
+      // terms -- from the tick 'socket' is emitted in, when node flushes
+      // what the request queued. A request destroyed before that never has
+      // a callback called; one that fails after it has them called with
+      // the socket's reason once it has closed (_failWriteCallbacks).
+      // `_socketConnected`: that socket connected. `_socketFailure`: the
+      // error it failed with.
+      this._writeCallbacks = [];
+      this._bodyQueued = 0;
+      this._bodyWritten = -1;
+      this._marks = [];
+      this._markSeen = 0;
+      this._onSocket = false;
+      this._socketConnected = false;
+      this._socketFailure = null;
+      // oam's own transport. `_fetchDispatched`: it has been handed the
+      // request. `_fetchSent`: it has a connection for it (the sent
+      // signal, `_sentSignal` while open) -- from then on the request is
+      // being written, a write() callback is called as the transport takes
+      // its chunk, and 'finish' follows the last of them (`_finishOnSent`:
+      // end() has asked for it; `_channelPending`: chunks the transport
+      // has yet to take). A request that never gets a connection has
+      // neither, as in node.
+      this._fetchDispatched = false;
+      this._fetchSent = false;
+      this._sentSignal = null;
+      this._finishOnSent = false;
+      this._channelPending = 0;
+      // The response leaves the transport's connection open: the request
+      // closes from the response's 'end' rather than behind its 'close'.
+      this._fetchKeptAlive = false;
+      // Inside the socket's 'connect' / 'secureConnect' emit, ahead of the
+      // request's own listener; and what a listener there closed the
+      // socket with (true: no error), held for that listener to report.
+      this._inConnectEvent = false;
+      this._closedOnConnect = null;
+      this._exchangeQueued = false;
+      this._waitingConnect = false;
+      this._earlySocketEvents = null;
+      if (callback) this.once("response", callback);
+
+      // Which way it goes. The agent's options win over the request's, as
+      // node's createSocket merges them (`{...options, ...agent.options}`).
+      var merged = Object.assign({}, opts, agent ? agent.options : undefined);
+      var literal = isIP(host) !== 0;
+      this._agentPath =
+        (agent && !agentIsStock(agent)) ||
+        (!agent && typeof opts.createConnection === "function") ||
+        (!literal && merged.lookup != null) ||
+        (!literal && dnsLookupReplaced()) ||
+        socketLayerPatched(protocol === "https:") ||
+        (protocol === "https:" && carriesTlsPolicy(merged)) ||
+        // A socket an earlier request over this (stock) agent left in its
+        // pool is reused, as node's addRequest reuses it.
+        (!!agent && agentHasFreeSocket(agent, this, opts, host, port)) ||
+        // node sends it to the Unix socket or named pipe, never host:port;
+        // the agent's socket goes where net.connect({path}) goes.
+        !!merged.socketPath ||
+        // node binds the socket it connects to these; so does net.connect.
+        !!merged.localAddress || !!merged.localPort ||
+        // A request target that is not origin form is written verbatim
+        // onto a socket of this request's own (see `urlPath` above), and
+        // CONNECT hands that socket to the caller -- neither is something
+        // oam's own transport, which carries a request as a URL, can do.
+        urlPath !== reqPath ||
+        this.method === "CONNECT" ||
+        this._rawHost;
+      // node dials the target itself unless its own global agent carries
+      // the environment proxy (NODE_USE_ENV_PROXY=1): a request oam's
+      // transport would send through a proxy that node would not goes
+      // over the agent's socket, which dials directly.
+      if (!this._agentPath && !(ENV_PROXY_AGENTS.has(agent) && useEnvProxy()) &&
+          natives.httpEnvProxied(this._url)) {
+        this._agentPath = true;
+      }
+      this._options = opts;
+      this._port = port;
+      this._fetchSocket = null;
+      if (this._agentPath) {
+        // node starts connecting here, in the constructor: a lookup hook
+        // runs inside http.request(), and what it throws is thrown there.
+        this._connectByAgent();
+      } else {
+        this._fetchSocket = makeFetchSocket(protocol === "https:");
+        var self = this;
+        process.nextTick(function () {
+          self._emitFetchSocket();
+        });
+      }
+    }
+
     class ClientRequest extends EventEmitter {
       constructor(input, options, callback) {
         super();
-        var normalized = normalizeClientArgs(input, options, callback);
-        var opts = normalized.options || {};
-        callback = normalized.callback;
-        // node lib/_http_client.js: the agent comes first. `false` is a fresh
-        // one of the default kind, none is the default (unless a
-        // createConnection option replaces it), and anything without
-        // addRequest is refused.
-        var agent = opts.agent;
-        var defaultAgent = opts._defaultAgent || agentState.globalAgent;
-        if (agent === false) {
-          agent = new defaultAgent.constructor();
-        } else if (agent === null || agent === undefined) {
-          if (typeof opts.createConnection !== "function") agent = defaultAgent;
-        } else if (typeof agent.addRequest !== "function") {
-          throw codes.ERR_INVALID_ARG_TYPE(
-            "options.agent",
-            ["Agent-like Object", "undefined", "false"],
-            agent,
-          );
-        }
-        this.agent = agent;
-        var protocol = opts.protocol || defaultAgent.protocol || "http:";
-        var expectedProtocol = defaultAgent.protocol || "http:";
-        if (this.agent && this.agent.protocol) expectedProtocol = this.agent.protocol;
-        this.method = (opts.method || "GET").toUpperCase();
-        // Node's order: the path is validated before the port (measured with
-        // both bad -- ERR_UNESCAPED_CHARACTERS wins).
-        var reqPath = opts.path || "/";
-        if (opts.path) {
-          reqPath = String(opts.path);
-          if (INVALID_PATH_REGEX.test(reqPath)) {
-            throw codes.ERR_UNESCAPED_CHARACTERS("Request path");
-          }
-        }
-        if (protocol !== expectedProtocol) {
-          throw codes.ERR_INVALID_PROTOCOL(protocol, expectedProtocol);
-        }
-        var host =
-          validateHost(opts.hostname, "hostname") ||
-          validateHost(opts.host, "host") ||
-          "localhost";
-        var defaultPort = opts.defaultPort || (this.agent && this.agent.defaultPort);
-        var port = validateClientPort(
-          opts.port || defaultPort || (protocol === "https:" ? 443 : 80),
-        );
-        // An IPv6 literal host (`{host: '::1'}`) is bracketed in the URL, or
-        // `http://::1:80/` would not parse and the request would fail with
-        // "fetch failed" where node connects to ::1. A URL's hostname already
-        // carries its brackets (net.isIP('[::1]') is 0).
-        var urlHost = isIP(host) === 6 ? "[" + host + "]" : host;
-        // The connect target must not be movable by the caller's `path` or
-        // `host`. Node cannot be: it dials `hostname`:`port` and writes `path`
-        // as an OPAQUE request target. oam's fetch path carries the request as
-        // a URL string, and plain concatenation let both escape -- measured
-        // before this guard, `{hostname: SAFE, port: GOOD, path:
-        // '@127.0.0.1:EVIL/x'}` and `{hostname: 'u:p@127.0.0.1', ...}` both
-        // reached the OTHER origin, and take_userinfo then sent the intended
-        // origin to it as `Authorization: Basic base64(SAFE:GOOD)`.
-        //
-        // node writes `path` verbatim as the request target, in whichever
-        // form the caller chose: origin form (`/p?q`), absolute form for a
-        // forward proxy (`http://host/p` -- axios's `proxy` option,
-        // http-proxy-agent), authority form for CONNECT (`host:port` --
-        // tunnel, hpagent) or `*` for OPTIONS. So `this.path` stays as
-        // written and only the URL the fetch path DIALS is built from a copy
-        // forced into origin form. A target that is not origin form is sent
-        // over a socket this request dialled itself (`_agentPath` below),
-        // where the target is just bytes on a connection that already went
-        // to `hostname`:`port` and cannot move it.
-        var urlPath = reqPath.charAt(0) === "/" ? reqPath : "/" + reqPath;
-        var authority = null;
-        try {
-          var probe = new URL(protocol + "//" + urlHost + "/");
-          if (
-            probe.username === "" &&
-            probe.password === "" &&
-            probe.port === "" &&
-            probe.pathname === "/" &&
-            probe.search === "" &&
-            probe.hash === ""
-          ) {
-            authority = probe;
-          }
-        } catch {
-          authority = null;
-        }
-        // node hands `host` to the resolver as written. The URL parser
-        // rewrites spellings the resolver refuses -- percent-escapes, octal or
-        // zero-padded IPv4, a trailing dot on an address, a tab, IDNA,
-        // fullwidth digits -- and a transport dialling its hostname would
-        // reach an address node never dials. So a name the parser cannot
-        // hold, or holds only rewritten (or bracketed, which only some
-        // resolvers accept), goes over net.connect with the string as given:
-        // the platform's resolver answers, as it does node's.
-        this._rawHost = authority === null ||
-          (isIP(host) === 0 &&
-            (authority.hostname !== host.toLowerCase() || host.charAt(0) === "["));
-        this._url = protocol + "//" + urlHost + ":" + port + urlPath;
-        this._headers = {};
-        if (opts.headers) {
-          var keys = Object.keys(opts.headers);
-          for (var i = 0; i < keys.length; i++) {
-            // node's constructor sets each through setHeader(), so a bad
-            // name or value throws from http.request itself (#174).
-            checkOutgoingHeader(keys[i], opts.headers[keys[i]]);
-            this._headers[keys[i].toLowerCase()] = opts.headers[keys[i]];
-          }
-        }
-        // node sets the Host header with setHeader() here, before the auth
-        // one and after the caller's (measured order: the caller's, Host,
-        // Authorization, Connection). It is an ORDINARY header from then on:
-        // getHeader('host') reads it back -- http-proxy-agent builds the
-        // absolute-form target it rewrites `path` to out of it, and without
-        // it aims every request at `localhost` -- and removeHeader('host')
-        // really drops it.
-        this._setHost = opts.setHost !== undefined
-          ? Boolean(opts.setHost)
-          : opts.setDefaultHeaders !== false;
-        var hostHeader = host;
-        var firstColon = hostHeader.indexOf(":");
-        if (
-          firstColon !== -1 &&
-          hostHeader.indexOf(":", firstColon + 1) !== -1 &&
-          hostHeader.charAt(0) !== "["
-        ) {
-          hostHeader = "[" + hostHeader + "]";
-        }
-        if (port && +port !== defaultPort) hostHeader += ":" + port;
-        this._hostHeader = hostHeader;
-        if (this._setHost && this._headers.host === undefined) {
-          // node's setHeader() value check throws for a character no header
-          // may carry -- a host spelled with fullwidth digits, say -- before
-          // anything is resolved.
-          if (INVALID_HEADER_CHAR.test(hostHeader)) throw invalidHeaderChar("Host");
-          this._headers.host = hostHeader;
-        }
-        // node lib/_http_client.js: `if (options.auth && !this.getHeader(
-        // 'Authorization')) this.setHeader('Authorization', 'Basic ' +
-        // Buffer.from(options.auth).toString('base64'))`. The bytes are the
-        // string's UTF-8 (measured: `auth: 'café:p'` sends
-        // `Basic Y2Fmw6k6cA==`), no colon is required, an empty `auth` sends
-        // nothing, and an explicit authorization header wins in either case.
-        // oam dropped the documented option entirely, so every caller using it
-        // -- and every `http.request('http://u:p@host/')`, whose userinfo IS
-        // this option -- talked to the server unauthenticated and got a 401.
-        if (opts.auth && this._headers["authorization"] === undefined) {
-          this._headers["authorization"] =
-            "Basic " + globalThis.Buffer.from(String(opts.auth), "utf8").toString("base64");
-        }
-        // node: the response head limit for this request (0 or absent: the
-        // process-wide --max-http-header-size, http.maxHeaderSize), and
-        // insecureHTTPParser, which does not lift it. Validated as node's
-        // constructor validates them; an agent's options are not consulted.
-        var maxHeaderSize = opts.maxHeaderSize;
-        if (maxHeaderSize !== undefined) {
-          if (typeof maxHeaderSize !== "number") {
-            throw codes.ERR_INVALID_ARG_TYPE("maxHeaderSize", "number", maxHeaderSize);
-          }
-          if (!Number.isInteger(maxHeaderSize)) {
-            throw codes.ERR_OUT_OF_RANGE("maxHeaderSize", "an integer", maxHeaderSize);
-          }
-          if (maxHeaderSize < 0 || maxHeaderSize > Number.MAX_SAFE_INTEGER) {
-            throw codes.ERR_OUT_OF_RANGE(
-              "maxHeaderSize",
-              ">= 0 && <= " + Number.MAX_SAFE_INTEGER,
-              maxHeaderSize,
-            );
-          }
-        }
-        this.maxHeaderSize = maxHeaderSize;
-        var insecureHTTPParser = opts.insecureHTTPParser;
-        if (insecureHTTPParser !== undefined && typeof insecureHTTPParser !== "boolean") {
-          throw codes.ERR_INVALID_ARG_TYPE(
-            "options.insecureHTTPParser",
-            "boolean",
-            insecureHTTPParser,
-          );
-        }
-        this.insecureHTTPParser = insecureHTTPParser;
-        this._body = [];
-        this._ended = false;
-        this._aborted = false;
-        this.headersSent = false;
-        // node's OutgoingMessage internals a proxy agent reaches for. node
-        // renders the request head into `_header` when the message is sent
-        // and queues what follows in `outputData`; http-proxy-agent (v7-v9,
-        // under proxy-agent) nulls `_header`, rewrites `path` to absolute
-        // form, calls `_implicitHeader()` to re-render, and -- only if there
-        // is one -- patches the head at the front of `outputData`. oam
-        // renders the head when it actually sends, from the live `path` and
-        // headers, so nothing is ever queued ahead of it and `outputData`
-        // stays empty.
-        this._header = null;
-        this.outputData = [];
-        // Node's ClientRequest is an OutgoingMessage: a LEGACY writable
-        // stream -- no _writableState, lifecycle duck-read off plain
-        // properties. The vendored end-of-stream keys on exactly these, so
-        // without them `pipeline(src, req)` / `stream.finished(req)` wait
-        // forever on a 'finish' that never comes (test-stream-pipeline).
-        this.writable = true;
-        this.finished = false;
-        this.destroyed = false;
-        this.closed = false;
-        this.aborted = false;
-        this.res = null;
-        this.errored = null;
-        this._bodyLength = 0;
-        this._bodyStream = null;
-        // Cancels the transport's request while it has no response (set by
-        // _doFetchRequest; see _cancelBodyStream).
-        this._fetchCancel = null;
-        // Every operation on the outbound body channel queues behind the one
-        // before it (see _channelWrite). Unordered calls race: the write op is
-        // ASYNC and the end op is SYNCHRONOUS, so end() drops the channel's
-        // sender before a spawned write has cloned it, that write fails as an
-        // unknown stream, and the chunk is LOST -- the server sees a
-        // well-formed, complete chunked body missing its tail and neither side
-        // reports an error. Measured on node v22.22.2: write('aa') write('bb')
-        // write('cc') end() echoes "aabbcc" every time; oam echoed "aabb" on
-        // most runs before this chain existed. Two writes in flight at once
-        // could also reach the mpsc channel out of order (multi-thread tokio).
-        this._channelTail = null;
-        this._streamArmed = false;
-        this._sent = false;
-        this._droppedWrites = false;
-        this._finished = false;
-        // node: null until the 'socket' event.
-        this.socket = null;
-        this.path = reqPath;
-        this.host = host;
-        this.protocol = protocol;
-        this.reusedSocket = false;
-        // node: with an agent the socket is kept alive unless the agent could
-        // never reuse it (no keepAlive and no maxSockets cap); without one
-        // (a createConnection option) it is closed.
-        this.shouldKeepAlive = !!this.agent &&
-          !(!this.agent.keepAlive && !Number.isFinite(this.agent.maxSockets));
-        this._removedConnection = false;
-        // node's req._ended: the response has ended (the socket may be freed
-        // once the request has finished too).
-        this._responseEnd = false;
-        // An agent-path request between addRequest and its socket.
-        this._awaitingSocket = false;
-        if (opts.timeout !== undefined) this.timeout = requestTimerDuration(opts.timeout, "timeout");
-        // node's req.timeoutCb: 0 not listening for the socket's 'timeout',
-        // 1 listening (it is re-emitted on the request once), 2 done.
-        this._timeoutListen = 0;
-        this._timeoutAfterResponse = false;
-        // A response teardown held until the socket's 'timeout' listeners
-        // have all run (_onSocketTimeout).
-        this._inSocketTimeout = false;
-        this._resTeardown = null;
-        this._pendingDispatch = null;
-        this._socketEmitted = false;
-        this._responded = false;
-        this._responseDone = false;
-        this._errorEmitted = false;
-        this._bridge = null;
-        this._bridgeIn = null;
-        this._bridgeEnded = false;
-        // Bytes the socket delivered before the exchange started, and those
-        // held back until hyper has written the request (_pumpBridge).
-        this._earlyData = null;
-        this._bridgeGate = null;
-        // The socket closed after delivering a response the exchange still
-        // has to read; the request let go of a kept-alive socket.
-        this._socketGone = false;
-        this._keptAlive = false;
-        // The socket's EOF, held back while the response head is due.
-        this._eofHold = null;
-        // node's 'finish' over a socket: once end() has been called
-        // (_finishOnWrite) and the socket has written the whole request --
-        // `_requestBytes` (the bridge's count, once hyper has written it all)
-        // of the `_requestOut` bytes written so far (_requestFlushed).
-        // `_finishAwaitsPath`: end() came while the way to send was still
-        // being decided (_emitFetchSocket).
-        // `_requestAccepted`: of those, the bytes the socket has TAKEN --
-        // ahead of `_requestOut`, which waits for the write to come back
-        // (_requestWritableFinished).
-        this._finishOnWrite = false;
-        this._finishAwaitsPath = false;
-        this._requestBytes = null;
-        this._requestOut = 0;
-        this._requestAccepted = 0;
-        this._requestWritten = false;
-        // write() callbacks, called as node calls them: once the socket has
-        // written the chunk, so never before it connected. Each waits for
-        // its place in the request body (`at`, as `_bodyQueued` counts it)
-        // to be covered by `_bodyWritten`, the body bytes the socket has
-        // written -- read off the bridge's progress (`_marks`: [request
-        // bytes, the body bytes they cover] pairs `_requestOut` has yet to
-        // reach, oldest first; `_markSeen` the newest of them).
-        // `_onSocket`: the request's writes are its socket's, in node's
-        // terms -- from the tick 'socket' is emitted in, when node flushes
-        // what the request queued. A request destroyed before that never has
-        // a callback called; one that fails after it has them called with
-        // the socket's reason once it has closed (_failWriteCallbacks).
-        // `_socketConnected`: that socket connected. `_socketFailure`: the
-        // error it failed with.
-        this._writeCallbacks = [];
-        this._bodyQueued = 0;
-        this._bodyWritten = -1;
-        this._marks = [];
-        this._markSeen = 0;
-        this._onSocket = false;
-        this._socketConnected = false;
-        this._socketFailure = null;
-        // oam's own transport. `_fetchDispatched`: it has been handed the
-        // request. `_fetchSent`: it has a connection for it (the sent
-        // signal, `_sentSignal` while open) -- from then on the request is
-        // being written, a write() callback is called as the transport takes
-        // its chunk, and 'finish' follows the last of them (`_finishOnSent`:
-        // end() has asked for it; `_channelPending`: chunks the transport
-        // has yet to take). A request that never gets a connection has
-        // neither, as in node.
-        this._fetchDispatched = false;
-        this._fetchSent = false;
-        this._sentSignal = null;
-        this._finishOnSent = false;
-        this._channelPending = 0;
-        // The response leaves the transport's connection open: the request
-        // closes from the response's 'end' rather than behind its 'close'.
-        this._fetchKeptAlive = false;
-        // Inside the socket's 'connect' / 'secureConnect' emit, ahead of the
-        // request's own listener; and what a listener there closed the
-        // socket with (true: no error), held for that listener to report.
-        this._inConnectEvent = false;
-        this._closedOnConnect = null;
-        this._exchangeQueued = false;
-        this._waitingConnect = false;
-        this._earlySocketEvents = null;
-        if (callback) this.once("response", callback);
-
-        // Which way it goes. The agent's options win over the request's, as
-        // node's createSocket merges them (`{...options, ...agent.options}`).
-        var merged = Object.assign({}, opts, agent ? agent.options : undefined);
-        var literal = isIP(host) !== 0;
-        this._agentPath =
-          (agent && !agentIsStock(agent)) ||
-          (!agent && typeof opts.createConnection === "function") ||
-          (!literal && merged.lookup != null) ||
-          (!literal && dnsLookupReplaced()) ||
-          socketLayerPatched(protocol === "https:") ||
-          (protocol === "https:" && carriesTlsPolicy(merged)) ||
-          // A socket an earlier request over this (stock) agent left in its
-          // pool is reused, as node's addRequest reuses it.
-          (!!agent && agentHasFreeSocket(agent, this, opts, host, port)) ||
-          // node sends it to the Unix socket or named pipe, never host:port;
-          // the agent's socket goes where net.connect({path}) goes.
-          !!merged.socketPath ||
-          // node binds the socket it connects to these; so does net.connect.
-          !!merged.localAddress || !!merged.localPort ||
-          // A request target that is not origin form is written verbatim
-          // onto a socket of this request's own (see `urlPath` above), and
-          // CONNECT hands that socket to the caller -- neither is something
-          // oam's own transport, which carries a request as a URL, can do.
-          urlPath !== reqPath ||
-          this.method === "CONNECT" ||
-          this._rawHost;
-        // node dials the target itself unless its own global agent carries
-        // the environment proxy (NODE_USE_ENV_PROXY=1): a request oam's
-        // transport would send through a proxy that node would not goes
-        // over the agent's socket, which dials directly.
-        if (!this._agentPath && !(ENV_PROXY_AGENTS.has(agent) && useEnvProxy()) &&
-            natives.httpEnvProxied(this._url)) {
-          this._agentPath = true;
-        }
-        this._options = opts;
-        this._port = port;
-        this._fetchSocket = null;
-        if (this._agentPath) {
-          // node starts connecting here, in the constructor: a lookup hook
-          // runs inside http.request(), and what it throws is thrown there.
-          this._connectByAgent();
-        } else {
-          this._fetchSocket = makeFetchSocket(protocol === "https:");
-          var self = this;
-          process.nextTick(function () {
-            self._emitFetchSocket();
-          });
-        }
+        initClientRequest.call(this, input, options, callback);
       }
       // Node OutgoingMessage writable-shape getters. Computed, not stored:
       // end-of-stream reads writableFinished/writableEnded directly.
       get writableEnded() { return this.finished; }
-      get writableFinished() { return this._finished; }
+      get writableFinished() { return this._finished === true; }
       get writableLength() { return this._bodyLength; }
       get writableHighWaterMark() { return 16384; }
       get writableObjectMode() { return false; }
@@ -22951,6 +23349,9 @@
         return globalThis.Buffer.from(value, "utf8").toString("latin1");
       }
       write(chunk, encoding, callback) {
+        // Built by OutgoingMessage alone (nock's refused request): node's
+        // OutgoingMessage#write, as node's ClientRequest inherits it.
+        if (this._body === undefined) return socketlessWrite(this, chunk, encoding, callback);
         if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
         // node's write_: the chunk is checked first; then a write after
         // end() is ERR_STREAM_WRITE_AFTER_END -- the callback's and, while
@@ -23223,6 +23624,7 @@
         }
       }
       end(data, encoding, callback) {
+        if (this._body === undefined) return socketlessEnd(this, data, encoding, callback);
         if (typeof data === "function") { callback = data; data = undefined; }
         if (typeof encoding === "function") { callback = encoding; encoding = undefined; }
         // Node's end() is idempotent. Without the guard a second end() --
@@ -24051,7 +24453,7 @@
         var socket = this.socket;
         if (!socket || (socket.destroyed && !this._socketGone) || this._aborted) return;
         var self = this;
-        if (socket.connecting && !this._socketGone) {
+        if (socket.connecting && !this._socketGone && writeWaitsForConnect(socket)) {
           // A dispatched request's head is a write queued behind the
           // socket's handshake, in node's terms (its ClientRequest writes it
           // into the socket's queue): a handshake the server refuses with an
@@ -24091,7 +24493,7 @@
           }
           return;
         }
-        if (!this._socketGone) this._socketConnected = true;
+        if (!this._socketGone && !socket.connecting) this._socketConnected = true;
         this._exchangeQueued = true;
         process.nextTick(function () {
           if ((socket.destroyed && !self._socketGone) || self._aborted || self.destroyed) return;
@@ -24907,6 +25309,18 @@
         // (or one after abort()), or one after the response has ended or
         // the request has failed, is silent.
         if (this._aborted || this.destroyed) return this;
+        // A subclass that built itself with `http.OutgoingMessage.call(this)`
+        // instead of this constructor (nock's OverriddenClientRequest) has
+        // node's OutgoingMessage state and none of the transport state the
+        // teardown below works on (`_writeCallbacks` is the constructor's):
+        // node's own destroy() then, statement for statement.
+        if (this._writeCallbacks === undefined) {
+          this.destroyed = true;
+          if (this.res) this.res._dump();
+          this.errored = err;
+          if (this.socket) this.socket.destroy(err);
+          return this;
+        }
         this._aborted = true;
         this._tearDown(!err, err);
         return this;
@@ -25047,6 +25461,8 @@
     function request(input, options, callback) {
       return new ClientRequest(input, options, callback);
     }
+    // https.request's, whatever has been done to http.request since.
+    registry._httpRequest = request;
 
     function get(input, options, callback) {
       var req = request(input, options, callback);
@@ -25648,9 +26064,27 @@
         this.headersSent = false;
         this.sendDate = true;
         this.finished = false;
-        this.writableEnded = false;
-        this.writableFinished = false;
         this._headers = {};
+      }
+      // node's: accessors over `finished`, so a subclass that keeps its own
+      // state (ClientRequest, ServerResponse) and one that calls
+      // `OutgoingMessage.call(this)` see the same thing.
+      get writableEnded() {
+        return this.finished;
+      }
+      get writableFinished() {
+        return this.finished;
+      }
+      // node's OutgoingMessage#destroy: the message's socket goes with it
+      // (once it has one). A test double that builds a ServerResponse over
+      // its own socket destroys it this way (nock, on a socket error).
+      destroy(error) {
+        if (this.destroyed) return this;
+        this.destroyed = true;
+        this.errored = error;
+        if (this.socket) this.socket.destroy(error);
+        else this.once("socket", (socket) => socket.destroy(error));
+        return this;
       }
       setHeader(name, value) {
         if (this.headersSent) throw codes.ERR_HTTP_HEADERS_SENT("set");
@@ -25687,6 +26121,12 @@
       }
     }
     Object.setPrototypeOf(ServerResponse.prototype, OutgoingMessage.prototype);
+    // node's ClientRequest is an OutgoingMessage too: `req instanceof
+    // http.OutgoingMessage` holds, and a subclass that builds itself with
+    // `http.OutgoingMessage.call(this)` (nock's OverriddenClientRequest)
+    // gets the fields ClientRequest's header methods use. ClientRequest
+    // defines every method it uses, so nothing it does changes.
+    Object.setPrototypeOf(ClientRequest.prototype, OutgoingMessage.prototype);
 
     // Node's http constructors are old-style functions callable via
     // `Super.call(this, ...)` (util.inherits). ES6 classes reject that, so wrap
@@ -25695,10 +26135,20 @@
     // `http.ServerResponse.call(this, req)`), while `construct` normalises
     // new.target for a direct `new http.X()`. Internal server code references
     // the raw lexical classes, so the native request/response path is unaffected.
-    const callableHttp = (Cls) => {
+    //
+    // `init`, for a class whose constructor body can run on any object, runs
+    // it on the caller's `this`; without one, an instance is built and its
+    // own properties copied over -- which leaves anything the constructor
+    // bound to that instance (a closure, a socket, an exchange) bound to it,
+    // so a ClientRequest built that way was never sent.
+    const callableHttp = (Cls, init) => {
       const proxy = new Proxy(Cls, {
         apply: (_t, thisArg, args) => {
           if (thisArg != null && thisArg !== globalThis && thisArg instanceof Cls) {
+            if (init !== undefined) {
+              init.apply(thisArg, args);
+              return thisArg;
+            }
             const tmp = Reflect.construct(Cls, args, Cls);
             for (const key of Reflect.ownKeys(tmp)) {
               Object.defineProperty(thisArg, key, Object.getOwnPropertyDescriptor(tmp, key));
@@ -25748,7 +26198,10 @@
       Server: callableHttp(Server),
       IncomingMessage: callableHttp(IncomingMessage),
       ServerResponse: callableHttp(ServerResponse),
-      ClientRequest: callableHttp(ClientRequest),
+      ClientRequest: callableHttp(ClientRequest, function (input, options, callback) {
+        EventEmitter.call(this);
+        initClientRequest.call(this, input, options, callback);
+      }),
       OutgoingMessage: callableHttp(OutgoingMessage),
       request,
       get,
@@ -25759,7 +26212,8 @@
       },
       validateHeaderName,
       validateHeaderValue,
-      METHODS: ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"],
+      // node's: every HTTP method its parser takes, sorted.
+      METHODS: HTTP_METHODS.slice().sort(),
       STATUS_CODES: {
         100: "Continue", 101: "Switching Protocols", 102: "Processing", 103: "Early Hints",
         200: "OK", 201: "Created", 202: "Accepted", 203: "Non-Authoritative Information",
@@ -25792,7 +26246,1252 @@
       get() { return agentState.globalAgent; },
       set(value) { agentState.globalAgent = value; },
     });
+    // `_http_client`'s ClientRequest: the class itself, whatever later
+    // replaces http.ClientRequest (nock does), as node's module exports it.
+    registry._httpClientRequest = httpExports.ClientRequest;
     return httpExports;
+  };
+
+  // ------------------------------------------------------ node:_http_common
+  // node's lib/_http_common.js (v22.22.2): the HTTP/1 parser the http
+  // module is built on, and the helpers around it. Programs reach for it to
+  // parse HTTP themselves -- nock 14's interceptors (@mswjs/interceptors)
+  // run every request a ClientRequest writes, and every response, through
+  // `new HTTPParser()` -- so the module is all of node's exports, and
+  // HTTPParser is node's callback protocol over an HTTP/1 parser held to
+  // llhttp's strict rules (lenient flags as node's `insecureHTTPParser`
+  // passes them). oam's own server and client parse in the transport; this
+  // parser serves the programs that use the class, and oam's undici
+  // MockAgent (js/undici.js), which reads the requests it intercepts with it.
+  //
+  // What it does as node's does, measured against node v22.22.2's parser
+  // over the same bytes, split at every point a test splits them: which
+  // callback runs when, with which arguments (kOnMessageBegin at a
+  // message's first byte; kOnHeaders with fields in batches of 31 once a
+  // head has 32 or more, and with a chunked body's trailers;
+  // kOnHeadersComplete's nine arguments -- llhttp's method index, the url,
+  // status and reason, upgrade, keep-alive -- and its return value: 1
+  // skips the body, 2 also upgrades; kOnBody with each slice of the body;
+  // kOnMessageComplete), what execute() returns (the bytes it parsed -- a
+  // head's length on an upgrade, a CONNECT or a 101 -- or the parse
+  // error, with node's code, reason and the offset llhttp reports), and
+  // finish(). Body framing, keep-alive and the head-size limit are llhttp's.
+  // Not modelled: llhttp's HTTP/2 preface handling for a PRI request, and
+  // the stream hooks a native server attaches (consume, pause, timers) --
+  // see docs/node-divergences.md.
+  registry.factories["_http_common"] = (natives) => {
+    const Buffer = globalThis.Buffer;
+    const defaultMaxHeaderSize = () => natives.httpMaxHeaderSize();
+    const ALL_METHODS = LLHTTP_METHODS;
+    const CONNECT = 5;
+    const PRI = 34;
+    const isHttpMethod = isLlhttpHttpMethod;
+    // node's export: the binding's array, the caller's to change.
+    const methods = HTTP_METHODS.slice();
+    // Every proper prefix of a method name, for llhttp's byte-at-a-time match.
+    const METHOD_PREFIXES = new Set();
+    const METHOD_INDEX = new Map();
+    for (let i = 0; i < ALL_METHODS.length; i++) {
+      const name = ALL_METHODS[i];
+      METHOD_INDEX.set(name, i);
+      for (let j = 1; j < name.length; j++) METHOD_PREFIXES.add(name.slice(0, j));
+    }
+
+    // RFC 9110 tchar.
+    const TOKEN = new Uint8Array(256);
+    for (const c of "!#$%&'*+-.^_`|~") TOKEN[c.charCodeAt(0)] = 1;
+    for (let c = 0x30; c <= 0x39; c++) TOKEN[c] = 1;
+    for (let c = 0x41; c <= 0x5a; c++) TOKEN[c] = 1;
+    for (let c = 0x61; c <= 0x7a; c++) TOKEN[c] = 1;
+
+    const REQUEST = 1;
+    const RESPONSE = 2;
+    const kOnMessageBegin = 0;
+    const kOnHeaders = 1;
+    const kOnHeadersComplete = 2;
+    const kOnBody = 3;
+    const kOnMessageComplete = 4;
+    const kOnExecute = 5;
+    const kOnTimeout = 6;
+    // node's kMaxHeaderFieldsCount: fields are handed to kOnHeaders in
+    // batches once a head has more than this many.
+    const MAX_FIELDS = 32;
+
+    const kLenientNone = 0;
+    const kLenientHeaders = 1;
+    const kLenientChunkedLength = 2;
+    const kLenientKeepAlive = 4;
+    const kLenientTransferEncoding = 8;
+    const kLenientVersion = 16;
+    const kLenientDataAfterClose = 32;
+    const kLenientOptionalLFAfterCR = 64;
+    const kLenientOptionalCRLFAfterChunk = 128;
+    const kLenientOptionalCRBeforeLF = 256;
+    const kLenientSpacesAfterChunkSize = 512;
+    const kLenientAll = 1023;
+
+    // Parser states.
+    const S_START = 0;
+    const S_CLOSED = 1;
+    const S_METHOD = 2;
+    const S_URL_START = 3;
+    const S_URL = 4;
+    const S_REQ_PROTO = 5;
+    const S_RES_PROTO = 6;
+    const S_MAJOR = 7;
+    const S_DOT = 8;
+    const S_MINOR = 9;
+    const S_REQ_LINE_END = 10;
+    const S_LINE_LF = 11;
+    const S_STATUS_START = 12;
+    const S_STATUS = 13;
+    const S_STATUS_END = 14;
+    const S_REASON = 15;
+    const S_FIELD_START = 16;
+    const S_FIELD = 17;
+    const S_VALUE_OWS = 18;
+    const S_VALUE = 19;
+    const S_VALUE_LF = 20;
+    const S_HEAD_END_LF = 21;
+    const S_BODY_LENGTH = 22;
+    const S_CHUNK_SIZE_START = 23;
+    const S_CHUNK_SIZE = 24;
+    const S_CHUNK_EXT = 25;
+    const S_CHUNK_SIZE_LF = 26;
+    const S_CHUNK_DATA = 27;
+    const S_CHUNK_DATA_CR = 28;
+    const S_CHUNK_DATA_LF = 29;
+    const S_BODY_EOF = 30;
+    const S_UPGRADED = 31;
+    const S_ERROR = 32;
+
+    const HTTP_SLASH = "HTTP/";
+    const MAX_SAFE = Number.MAX_SAFE_INTEGER;
+    const U64_MAX = 18446744073709551615n;
+
+    function parseError(code, reason, bytesParsed) {
+      const err = new Error("Parse Error");
+      err.bytesParsed = bytesParsed;
+      err.code = code;
+      err.reason = reason;
+      return err;
+    }
+
+    class HTTPParser {
+      // The parse state, out of sight: node's parser has no own properties.
+      #p = null;
+
+      initialize(type, resource, maxHeaderSize, lenient) {
+        if (type !== REQUEST && type !== RESPONSE) {
+          throw new TypeError("The type must be HTTPParser.REQUEST or HTTPParser.RESPONSE");
+        }
+        const max = maxHeaderSize > 0 ? maxHeaderSize : defaultMaxHeaderSize();
+        this.#p = {
+          type,
+          max,
+          lenient: lenient >>> 0,
+          state: S_START,
+          error: null,
+          buffer: null,
+          // The message being parsed.
+          tok: "",
+          method: -1,
+          url: "",
+          urlPart: 0,
+          major: 0,
+          minor: 0,
+          status: 0,
+          reason: "",
+          fields: [],
+          field: "",
+          value: "",
+          valueEnd: 0,
+          flushed: false,
+          nread: 0,
+          trailers: false,
+          // Framing facts, from the head.
+          contentLength: -1,
+          teSeen: false,
+          chunked: false,
+          teBad: false,
+          connClose: false,
+          connKeepAlive: false,
+          connUpgrade: false,
+          upgradeHeader: false,
+          keepAlive: false,
+          remaining: 0,
+          hexDigits: 0,
+        };
+      }
+
+      // The bytes of the current execute() (node: the buffer being parsed,
+      // what prepareError hands on as `rawPacket`).
+      getCurrentBuffer() {
+        const p = this.#p;
+        return p && p.buffer ? Buffer.from(p.buffer) : Buffer.alloc(0);
+      }
+
+      execute(data) {
+        const p = this.#p;
+        if (p === null) throw new TypeError("The parser is not initialized");
+        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+        p.buffer = buf;
+        try {
+          return run(this, p, buf);
+        } finally {
+          p.buffer = null;
+        }
+      }
+
+      finish() {
+        const p = this.#p;
+        if (p === null) return undefined;
+        switch (p.state) {
+          case S_START:
+          case S_CLOSED:
+          case S_UPGRADED:
+          case S_ERROR:
+            return undefined;
+          case S_BODY_EOF:
+            p.state = S_CLOSED;
+            messageComplete(this, p);
+            return undefined;
+          default:
+            return parseError("HPE_INVALID_EOF_STATE", "Invalid EOF state", 0);
+        }
+      }
+
+      // node's stream hooks (a parser consumed by a native stream, its idle
+      // timer, flow control): oam's parser is only ever fed by execute().
+      pause() {}
+      resume() {}
+      consume() {}
+      unconsume() {}
+      remove() {}
+      close() {}
+      free() {}
+    }
+    const statics = {
+      REQUEST, RESPONSE,
+      kOnMessageBegin, kOnHeaders, kOnHeadersComplete, kOnBody, kOnMessageComplete, kOnExecute,
+      kOnTimeout,
+      kLenientNone, kLenientHeaders, kLenientChunkedLength, kLenientKeepAlive,
+      kLenientTransferEncoding, kLenientVersion, kLenientDataAfterClose, kLenientOptionalLFAfterCR,
+      kLenientOptionalCRLFAfterChunk, kLenientOptionalCRBeforeLF, kLenientSpacesAfterChunkSize,
+      kLenientAll,
+    };
+    for (const key of Object.keys(statics)) {
+      Object.defineProperty(HTTPParser, key, { value: statics[key], enumerable: true });
+    }
+
+    // A callback by its index, with exactly the arguments node passes.
+    function call(parser, index, ...args) {
+      const fn = parser[index];
+      if (typeof fn !== "function") return undefined;
+      return Reflect.apply(fn, parser, args);
+    }
+
+    function resetMessage(p) {
+      p.tok = "";
+      p.method = -1;
+      p.url = "";
+      p.urlPart = 0;
+      p.major = 0;
+      p.minor = 0;
+      p.status = 0;
+      p.reason = "";
+      p.fields = [];
+      p.field = "";
+      p.value = "";
+      p.flushed = false;
+      p.nread = 0;
+      p.trailers = false;
+      p.contentLength = -1;
+      p.teSeen = false;
+      p.chunked = false;
+      p.teBad = false;
+      p.connClose = false;
+      p.connKeepAlive = false;
+      p.connUpgrade = false;
+      p.upgradeHeader = false;
+      p.keepAlive = false;
+      p.remaining = 0;
+      p.hexDigits = 0;
+    }
+
+    // node's Flush: the fields gathered so far, and the url the first time.
+    function flush(parser, p) {
+      const fields = p.fields;
+      p.fields = [];
+      const url = p.url;
+      p.url = "";
+      p.flushed = true;
+      call(parser, kOnHeaders, fields, url);
+    }
+
+    // node's header byte count (TrackHeader): the url, the status text and
+    // every field name and value; at or past the limit the head overflows.
+    function track(p, length) {
+      p.nread += length;
+      return p.nread >= p.max;
+    }
+
+    // llhttp_should_keep_alive.
+    function shouldKeepAlive(p) {
+      if (p.major > 0 && p.minor > 0) {
+        if (p.connClose) return false;
+      } else if (!p.connKeepAlive) {
+        return false;
+      }
+      return !needsEof(p);
+    }
+
+    function needsEof(p) {
+      if (p.type === REQUEST) return false;
+      if ((p.status / 100 | 0) === 1 || p.status === 204 || p.status === 304 || p.skipBody) return false;
+      if (p.teSeen && !p.chunked) return true;
+      if (p.chunked || p.contentLength >= 0) return false;
+      return true;
+    }
+
+    function messageComplete(parser, p) {
+      if (p.trailers && p.fields.length > 0) flush(parser, p);
+      call(parser, kOnMessageComplete);
+    }
+
+    // A field's name and value are both in: the framing facts it carries.
+    // Returns an error, or null.
+    function fieldDone(p) {
+      const name = p.field.toLowerCase();
+      const value = p.value;
+      p.fields.push(p.field, value);
+      if (p.trailers) return null;
+      if (name === "connection") {
+        for (const token of value.toLowerCase().split(",")) {
+          const t = token.trim();
+          if (t === "close") p.connClose = true;
+          else if (t === "keep-alive") p.connKeepAlive = true;
+          else if (t === "upgrade") p.connUpgrade = true;
+        }
+      } else if (name === "upgrade") {
+        p.upgradeHeader = true;
+      }
+      return null;
+    }
+
+    // The checks llhttp makes as a value starts (right after the colon):
+    // Content-Length and Transfer-Encoding together.
+    function valueStart(p, i) {
+      p.fieldKind = 0;
+      if (p.trailers) return null;
+      const name = p.field.toLowerCase();
+      p.fieldKind = name === "content-length" ? 1 : name === "transfer-encoding" ? 2 : 0;
+      if (p.fieldKind === 1 && p.teSeen && !(p.lenient & kLenientChunkedLength)) {
+        return parseError("HPE_INVALID_CONTENT_LENGTH", "Content-Length can't be present with Transfer-Encoding", i);
+      }
+      if (p.fieldKind === 2 && p.contentLength >= 0 && !(p.lenient & kLenientChunkedLength)) {
+        return parseError("HPE_INVALID_TRANSFER_ENCODING", "Transfer-Encoding can't be present with Content-Length", i);
+      }
+      return null;
+    }
+
+    // A Content-Length / Transfer-Encoding value, complete. `start` is the
+    // index of its first byte in this buffer (or -1 when it began in an
+    // earlier one), `end` the index of the CR ending it.
+    function framingValue(p, start, end) {
+      const value = p.value;
+      if (p.fieldKind === 1) {
+        if (p.contentLength >= 0) {
+          return parseError("HPE_UNEXPECTED_CONTENT_LENGTH", "Duplicate Content-Length", start < 0 ? 0 : start);
+        }
+        if (value.length === 0) {
+          return parseError("HPE_INVALID_CONTENT_LENGTH", "Empty Content-Length", end + 2);
+        }
+        // Digits only (OWS inside is refused at the byte after it), up to
+        // llhttp's 64-bit limit. `at(k)`: the buffer index of value byte k.
+        const at = (k) => Math.max(0, end - (value.length - k));
+        let n = 0;
+        let big = null;
+        for (let k = 0; k < value.length; k++) {
+          const c = value.charCodeAt(k);
+          if (c < 0x30 || c > 0x39) {
+            let bad = k;
+            while (bad < value.length - 1 && (value.charCodeAt(bad) === 0x20 || value.charCodeAt(bad) === 0x09)) bad++;
+            return parseError("HPE_INVALID_CONTENT_LENGTH", "Invalid character in Content-Length", at(bad));
+          }
+          if (big === null) {
+            n = n * 10 + (c - 0x30);
+            if (n > MAX_SAFE) big = BigInt(value.slice(0, k + 1));
+          } else {
+            big = big * 10n + BigInt(c - 0x30);
+          }
+          if (big !== null && big > U64_MAX) {
+            return parseError("HPE_INVALID_CONTENT_LENGTH", "Content-Length overflow", at(k) + 1);
+          }
+        }
+        p.contentLength = big === null ? n : Number(big);
+      } else if (p.fieldKind === 2) {
+        // Codings, comma-separated; chunked counts only as the last one.
+        // A request's coding after chunked is refused where llhttp refuses
+        // it: just past the comma, or one byte into a later header's value.
+        p.teSeen = true;
+        let offset = 0;
+        const codings = value.split(",");
+        for (let k = 0; k < codings.length; k++) {
+          const raw = codings[k];
+          if (p.chunked && p.type === REQUEST && !(p.lenient & kLenientTransferEncoding)) {
+            const at = start < 0 ? 0 : k === 0 ? start + 1 : start + offset;
+            return parseError("HPE_INVALID_TRANSFER_ENCODING", "Invalid `Transfer-Encoding` header value", at);
+          }
+          p.chunked = raw.trim().toLowerCase() === "chunked";
+          offset += raw.length + 1;
+        }
+      }
+      return null;
+    }
+
+    // The head is in. Returns the index to resume at, or an Error; sets the
+    // body state.
+    function headersComplete(parser, p, i) {
+      const upgrade = (p.upgradeHeader && p.connUpgrade) || (p.type === REQUEST && p.method === CONNECT);
+      p.upgrade = upgrade;
+      p.skipBody = false;
+      p.keepAlive = shouldKeepAlive(p);
+      let headers = p.fields;
+      let url = p.url;
+      if (p.flushed) {
+        flush(parser, p);
+        headers = undefined;
+        url = undefined;
+      } else {
+        p.fields = [];
+      }
+      let ret;
+      if (p.type === REQUEST) {
+        ret = call(parser, kOnHeadersComplete, p.major, p.minor, headers, p.method, url,
+          undefined, undefined, upgrade, p.keepAlive);
+      } else {
+        ret = call(parser, kOnHeadersComplete, p.major, p.minor, headers, undefined, undefined,
+          p.status, p.reason, upgrade, p.keepAlive);
+      }
+      // The url stays for a trailer flush, as node's does (a head that was
+      // flushed already handed it on).
+      if (!p.flushed) p.url = url;
+      p.trailers = true;
+      let stop = upgrade;
+      if (ret === 1 || ret === 2) {
+        p.skipBody = true;
+        if (ret === 2) {
+          stop = true;
+          p.upgrade = true;
+        }
+      }
+      if (p.type === REQUEST && p.teSeen && !p.chunked && !(p.lenient & kLenientTransferEncoding)) {
+        return parseError("HPE_INVALID_TRANSFER_ENCODING", "Request has invalid `Transfer-Encoding`", i);
+      }
+      const informational = p.type === RESPONSE && (p.status / 100 | 0) === 1;
+      if (p.status === 101) stop = true;
+      if (p.skipBody || (stop && !(p.chunked || p.contentLength > 0)) ||
+          (p.type === RESPONSE && (informational || p.status === 204 || p.status === 304))) {
+        return endMessage(parser, p, i, stop);
+      }
+      if (p.chunked) {
+        p.state = S_CHUNK_SIZE_START;
+      } else if (p.contentLength > 0) {
+        p.remaining = p.contentLength;
+        p.state = S_BODY_LENGTH;
+      } else if (p.contentLength === 0 || p.type === REQUEST) {
+        return endMessage(parser, p, i, stop);
+      } else {
+        p.state = S_BODY_EOF;
+      }
+      p.upgradeAfterBody = stop;
+      return i;
+    }
+
+    // A message is over at `i`: what comes next. `stop` ends this execute()
+    // there: an upgrade (llhttp pauses for good) or a 101 without one (the
+    // next execute() goes on with the next message).
+    function endMessage(parser, p, i, stop) {
+      const keepAlive = p.keepAlive;
+      const upgrade = stop && p.upgrade;
+      p.state = upgrade ? S_UPGRADED : keepAlive ? S_START : S_CLOSED;
+      p.resumed = false;
+      messageComplete(parser, p);
+      if (stop) return -1 - i;
+      return i;
+    }
+
+    function lenientLF(p) {
+      return (p.lenient & kLenientOptionalCRBeforeLF) !== 0;
+    }
+
+    // The parse loop over `buf`. Returns the bytes parsed, or an Error.
+    function run(parser, p, buf) {
+      if (p.state === S_ERROR) {
+        return parseError(p.error.code, p.error.reason, 0);
+      }
+      if (p.state === S_UPGRADED) {
+        // llhttp, paused on an upgrade, is resumed by the next execute(): it
+        // starts a message (a kept-alive connection) or takes one byte of a
+        // closed one, and parses nothing more.
+        if (p.resumed) return 0;
+        p.resumed = true;
+        if (p.keepAlive) {
+          call(parser, kOnMessageBegin);
+          return 0;
+        }
+        return Math.min(1, buf.length);
+      }
+      const len = buf.length;
+      let i = 0;
+      let mark = -1; // start of a span (url, reason, field, value) in buf
+      const fail = (err) => {
+        p.state = S_ERROR;
+        p.error = err;
+        return err;
+      };
+      while (i < len) {
+        const c = buf[i];
+        switch (p.state) {
+          case S_START: {
+            if (c === 0x0d || c === 0x0a) {
+              i++;
+              continue;
+            }
+            resetMessage(p);
+            call(parser, kOnMessageBegin);
+            if (p.type === REQUEST) {
+              p.state = S_METHOD;
+            } else {
+              p.state = S_RES_PROTO;
+              p.tok = "";
+            }
+            continue;
+          }
+          case S_CLOSED: {
+            if (c === 0x0d || c === 0x0a) {
+              i++;
+              continue;
+            }
+            if (p.lenient & (kLenientKeepAlive | kLenientDataAfterClose)) {
+              p.state = S_START;
+              continue;
+            }
+            return fail(parseError("HPE_CLOSED_CONNECTION", "Data after `Connection: close`", i + 1));
+          }
+          case S_METHOD: {
+            if (c === 0x20) {
+              const index = METHOD_INDEX.get(p.tok);
+              if (index === undefined) {
+                return fail(parseError("HPE_INVALID_METHOD", "Invalid method encountered", i));
+              }
+              p.method = index;
+              p.state = S_URL_START;
+              i++;
+              continue;
+            }
+            const next = p.tok + String.fromCharCode(c);
+            if (!METHOD_PREFIXES.has(next) && !METHOD_INDEX.has(next)) {
+              return fail(parseError("HPE_INVALID_METHOD", "Invalid method encountered", i));
+            }
+            p.tok = next;
+            i++;
+            continue;
+          }
+          case S_URL_START: {
+            if (c === 0x20) {
+              i++;
+              continue;
+            }
+            p.state = S_URL;
+            p.urlPart = 0;
+            mark = i;
+            continue;
+          }
+          case S_URL: {
+            // Scan the url's bytes in one go.
+            let j = i;
+            while (j < len) {
+              const b = buf[j];
+              if (b === 0x20) break;
+              if (b < 0x21 || b > 0x7e) break;
+              if (b === 0x3f && p.urlPart === 0) p.urlPart = 1;
+              else if (b === 0x23 && p.urlPart < 2) p.urlPart = 2;
+              j++;
+            }
+            if (j > i) {
+              p.url += buf.latin1Slice(i, j);
+              if (track(p, j - i) && j < len) {
+                return fail(parseError("HPE_HEADER_OVERFLOW", "Header overflow", j + 1));
+              }
+            }
+            i = j;
+            if (i >= len) continue;
+            const b = buf[i];
+            if (b === 0x20) {
+              p.state = S_REQ_PROTO;
+              p.tok = "";
+              i++;
+              continue;
+            }
+            if (b === 0x09) return fail(parseError("HPE_INVALID_URL", "Invalid characters in url", i + 1));
+            const part = p.urlPart === 0 ? "path" : p.urlPart === 1 ? "query" : "fragment start";
+            return fail(parseError("HPE_INVALID_URL", "Invalid char in url " + part, i));
+          }
+          case S_REQ_PROTO:
+          case S_RES_PROTO: {
+            if (p.state === S_REQ_PROTO && c === 0x20 && p.tok === "") {
+              i++;
+              continue;
+            }
+            const k = p.tok.length;
+            if (c !== HTTP_SLASH.charCodeAt(k)) {
+              return fail(p.state === S_RES_PROTO
+                ? parseError("HPE_INVALID_CONSTANT", "Expected HTTP/, RTSP/ or ICE/", i)
+                : parseError("HPE_INVALID_CONSTANT", "Expected HTTP/", i));
+            }
+            if (k === 4) {
+              if (p.state === S_REQ_PROTO && !isHttpMethod(p.method) && p.method !== PRI) {
+                return fail(parseError("HPE_INVALID_CONSTANT", "Invalid method for HTTP/x.x request", i));
+              }
+              p.versionNext = p.state === S_REQ_PROTO ? S_REQ_LINE_END : S_STATUS_START;
+              p.state = S_MAJOR;
+            } else {
+              p.tok += String.fromCharCode(c);
+            }
+            i++;
+            continue;
+          }
+          case S_MAJOR: {
+            if (c < 0x30 || c > 0x39) return fail(parseError("HPE_INVALID_VERSION", "Invalid major version", i));
+            p.major = c - 0x30;
+            p.state = S_DOT;
+            i++;
+            continue;
+          }
+          case S_DOT: {
+            if (c !== 0x2e) return fail(parseError("HPE_INVALID_VERSION", "Expected dot", i));
+            p.state = S_MINOR;
+            i++;
+            continue;
+          }
+          case S_MINOR: {
+            if (c < 0x30 || c > 0x39) return fail(parseError("HPE_INVALID_VERSION", "Invalid minor version", i));
+            p.minor = c - 0x30;
+            const v = p.major * 10 + p.minor;
+            if (!(p.lenient & kLenientVersion) && v !== 9 && v !== 10 && v !== 11 && v !== 20) {
+              return fail(parseError("HPE_INVALID_VERSION", "Invalid HTTP version", i + 1));
+            }
+            if (p.method === PRI && p.type === REQUEST) {
+              return fail(parseError("HPE_PAUSED_H2_UPGRADE", "Pause on PRI/Upgrade", i + 1));
+            }
+            p.state = p.versionNext;
+            i++;
+            continue;
+          }
+          case S_REQ_LINE_END: {
+            if (c === 0x0d) {
+              p.state = S_LINE_LF;
+              i++;
+              continue;
+            }
+            if (c === 0x0a && lenientLF(p)) {
+              p.state = S_FIELD_START;
+              i++;
+              continue;
+            }
+            return fail(parseError("HPE_INVALID_VERSION", "Expected CRLF after version", c === 0x0a ? i + 1 : i));
+          }
+          case S_LINE_LF: {
+            if (c !== 0x0a) {
+              if (p.lenient & kLenientOptionalLFAfterCR) {
+                p.state = S_FIELD_START;
+                continue;
+              }
+              return fail(parseError("HPE_STRICT", "Expected LF after CR", i));
+            }
+            p.state = S_FIELD_START;
+            i++;
+            continue;
+          }
+          case S_STATUS_START: {
+            if (c !== 0x20) return fail(parseError("HPE_INVALID_VERSION", "Expected space after version", i));
+            p.state = S_STATUS;
+            p.status = 0;
+            p.statusDigits = 0;
+            i++;
+            continue;
+          }
+          case S_STATUS: {
+            if (c >= 0x30 && c <= 0x39) {
+              if (p.statusDigits === 3) {
+                return fail(parseError("HPE_INVALID_STATUS", "Invalid response status", i));
+              }
+              p.status = p.status * 10 + (c - 0x30);
+              p.statusDigits++;
+              i++;
+              continue;
+            }
+            if (p.statusDigits !== 3) return fail(parseError("HPE_INVALID_STATUS", "Invalid status code", i));
+            p.state = S_STATUS_END;
+            continue;
+          }
+          case S_STATUS_END: {
+            if (c === 0x20) {
+              p.state = S_REASON;
+              mark = i + 1;
+              i++;
+              continue;
+            }
+            if (c === 0x0d) {
+              p.state = S_LINE_LF;
+              i++;
+              continue;
+            }
+            if (c === 0x0a && lenientLF(p)) {
+              p.state = S_FIELD_START;
+              i++;
+              continue;
+            }
+            return fail(parseError("HPE_INVALID_STATUS", "Invalid response status", i));
+          }
+          case S_REASON: {
+            let j = i;
+            while (j < len && buf[j] !== 0x0d && buf[j] !== 0x0a) j++;
+            if (j > i) {
+              p.reason += buf.latin1Slice(i, j);
+              if (track(p, j - i) && j < len) {
+                return fail(parseError("HPE_HEADER_OVERFLOW", "Header overflow", j + 1));
+              }
+            }
+            i = j;
+            if (i >= len) continue;
+            if (buf[i] === 0x0a && !lenientLF(p)) {
+              return fail(parseError("HPE_CR_EXPECTED", "Missing expected CR after response line", i + 1));
+            }
+            p.state = buf[i] === 0x0d ? S_LINE_LF : S_FIELD_START;
+            i++;
+            continue;
+          }
+          case S_FIELD_START: {
+            if (c === 0x0d) {
+              p.state = S_HEAD_END_LF;
+              i++;
+              continue;
+            }
+            if (c === 0x0a && lenientLF(p)) {
+              p.state = S_HEAD_END_LF;
+              continue;
+            }
+            if (c === 0x20 || c === 0x09) {
+              if (p.lenient & kLenientHeaders && p.fields.length > 0) {
+                // obs-fold, accepted leniently: joins the previous value.
+                p.state = S_VALUE_OWS;
+                p.field = p.fields[p.fields.length - 2];
+                p.value = p.fields.pop() + " ";
+                p.fields.pop();
+                i++;
+                continue;
+              }
+              return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Unexpected whitespace after header value", i));
+            }
+            if (!TOKEN[c]) return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header token", i));
+            // A 32nd field: the gathered ones go to kOnHeaders first.
+            if (p.fields.length === (MAX_FIELDS - 1) * 2) flush(parser, p);
+            p.field = "";
+            p.value = "";
+            p.state = S_FIELD;
+            continue;
+          }
+          case S_FIELD: {
+            let j = i;
+            while (j < len && TOKEN[buf[j]]) j++;
+            if (j > i) {
+              p.field += buf.latin1Slice(i, j);
+              if (track(p, j - i) && j < len) {
+                return fail(parseError("HPE_HEADER_OVERFLOW", "Header overflow", j + 1));
+              }
+            }
+            i = j;
+            if (i >= len) continue;
+            if (buf[i] !== 0x3a) return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header token", i));
+            i++;
+            const err = valueStart(p, i);
+            if (err) return fail(err);
+            p.state = S_VALUE_OWS;
+            p.valueStart = -1;
+            continue;
+          }
+          case S_VALUE_OWS: {
+            if (c === 0x20 || c === 0x09) {
+              i++;
+              continue;
+            }
+            if (p.fieldKind === 1 && p.contentLength >= 0 && c !== 0x0d && c !== 0x0a) {
+              return fail(parseError("HPE_UNEXPECTED_CONTENT_LENGTH", "Duplicate Content-Length", i));
+            }
+            p.state = S_VALUE;
+            p.valueStart = i;
+            continue;
+          }
+          case S_VALUE: {
+            let j = i;
+            const lenientHeaders = (p.lenient & kLenientHeaders) !== 0;
+            while (j < len) {
+              const b = buf[j];
+              if (b === 0x0d || b === 0x0a) break;
+              if ((b < 0x20 && b !== 0x09) || b === 0x7f) {
+                if (!lenientHeaders) break;
+              }
+              j++;
+            }
+            if (j > i) p.value += buf.latin1Slice(i, j);
+            i = j;
+            if (i >= len) continue;
+            const b = buf[i];
+            if (b !== 0x0d && b !== 0x0a) {
+              return fail(parseError("HPE_INVALID_HEADER_TOKEN", "Invalid header value char", i));
+            }
+            if (b === 0x0a && !lenientLF(p)) {
+              return fail(parseError("HPE_CR_EXPECTED", "Missing expected CR after header value", i));
+            }
+            // OWS after the value is not part of it.
+            let v = p.value;
+            let e = v.length;
+            while (e > 0 && (v.charCodeAt(e - 1) === 0x20 || v.charCodeAt(e - 1) === 0x09)) e--;
+            if (e !== v.length) p.value = v = v.slice(0, e);
+            if (track(p, v.length)) {
+              return fail(parseError("HPE_HEADER_OVERFLOW", "Header overflow", i + 1));
+            }
+            if (p.fieldKind) {
+              const err = framingValue(p, p.valueStart, i);
+              if (err) return fail(err);
+            }
+            const err = fieldDone(p);
+            if (err) return fail(err);
+            if (b === 0x0a) {
+              p.state = S_FIELD_START;
+            } else {
+              p.state = S_VALUE_LF;
+            }
+            i++;
+            continue;
+          }
+          case S_VALUE_LF: {
+            if (c !== 0x0a) {
+              if (p.lenient & kLenientOptionalLFAfterCR) {
+                p.state = S_FIELD_START;
+                continue;
+              }
+              return fail(parseError("HPE_LF_EXPECTED", "Missing expected LF after header value", i));
+            }
+            p.state = S_FIELD_START;
+            i++;
+            continue;
+          }
+          case S_HEAD_END_LF: {
+            if (c !== 0x0a) {
+              if (!(p.lenient & kLenientOptionalLFAfterCR)) {
+                return fail(parseError("HPE_STRICT", "Expected LF after headers", i));
+              }
+            } else {
+              i++;
+            }
+            if (p.trailers) {
+              // The end of a chunked body's trailer section.
+              const r = endMessage(parser, p, i, p.upgradeAfterBody);
+              if (r < 0) return -1 - r;
+              continue;
+            }
+            const r = headersComplete(parser, p, i);
+            if (r instanceof Error) return fail(r);
+            if (r < 0) return -1 - r;
+            continue;
+          }
+          case S_BODY_LENGTH: {
+            const n = Math.min(p.remaining, len - i);
+            p.remaining -= n;
+            const chunk = buf.subarray(i, i + n);
+            i += n;
+            call(parser, kOnBody, chunk);
+            if (p.remaining === 0) {
+              const r = endMessage(parser, p, i, p.upgradeAfterBody);
+              if (r < 0) return -1 - r;
+            }
+            continue;
+          }
+          case S_BODY_EOF: {
+            const chunk = buf.subarray(i, len);
+            i = len;
+            call(parser, kOnBody, chunk);
+            continue;
+          }
+          case S_CHUNK_SIZE_START: {
+            p.remaining = 0;
+            p.hexDigits = 0;
+            p.hexSignificant = 0;
+            p.state = S_CHUNK_SIZE;
+            continue;
+          }
+          case S_CHUNK_SIZE: {
+            const h = c >= 0x30 && c <= 0x39 ? c - 0x30
+              : c >= 0x41 && c <= 0x46 ? c - 0x37
+              : c >= 0x61 && c <= 0x66 ? c - 0x57 : -1;
+            if (h >= 0) {
+              // llhttp's 64-bit limit: a 17th significant hex digit.
+              if (p.remaining > 0 || h > 0) p.hexSignificant++;
+              p.remaining = p.remaining * 16 + h;
+              p.hexDigits++;
+              if (p.hexSignificant > 16) {
+                return fail(parseError("HPE_INVALID_CHUNK_SIZE", "Chunk size overflow", i + 1));
+              }
+              i++;
+              continue;
+            }
+            if (p.hexDigits === 0) {
+              return fail(parseError("HPE_INVALID_CHUNK_SIZE", "Invalid character in chunk size", i));
+            }
+            if (c === 0x3b) {
+              p.state = S_CHUNK_EXT;
+              i++;
+              continue;
+            }
+            if (c === 0x0d) {
+              p.state = S_CHUNK_SIZE_LF;
+              i++;
+              continue;
+            }
+            if (c === 0x0a) {
+              if (lenientLF(p)) {
+                p.state = S_CHUNK_SIZE_LF;
+                continue;
+              }
+              return fail(parseError("HPE_CR_EXPECTED", "Missing expected CR after chunk size", i + 1));
+            }
+            if ((c === 0x20 || c === 0x09) && (p.lenient & kLenientSpacesAfterChunkSize)) {
+              i++;
+              continue;
+            }
+            return fail(parseError("HPE_INVALID_CHUNK_SIZE", "Invalid character in chunk size", i + 1));
+          }
+          case S_CHUNK_EXT: {
+            // Extensions are not reported (node registers no callback for
+            // them); they run to the CR.
+            let j = i;
+            while (j < len && buf[j] !== 0x0d && buf[j] !== 0x0a) j++;
+            i = j;
+            if (i >= len) continue;
+            if (buf[i] === 0x0a && !lenientLF(p)) {
+              return fail(parseError("HPE_CR_EXPECTED", "Missing expected CR after chunk extension name", i + 1));
+            }
+            p.state = S_CHUNK_SIZE_LF;
+            if (buf[i] === 0x0d) i++;
+            continue;
+          }
+          case S_CHUNK_SIZE_LF: {
+            if (c !== 0x0a) {
+              if (!(p.lenient & kLenientOptionalLFAfterCR)) {
+                return fail(parseError("HPE_STRICT", "Expected LF after chunk size", i));
+              }
+            } else {
+              i++;
+            }
+            if (p.remaining === 0) {
+              // The last chunk: the trailer section follows.
+              p.state = S_FIELD_START;
+            } else {
+              p.state = S_CHUNK_DATA;
+            }
+            continue;
+          }
+          case S_CHUNK_DATA: {
+            const n = Math.min(p.remaining, len - i);
+            p.remaining -= n;
+            const chunk = buf.subarray(i, i + n);
+            i += n;
+            call(parser, kOnBody, chunk);
+            if (p.remaining === 0) p.state = S_CHUNK_DATA_CR;
+            continue;
+          }
+          case S_CHUNK_DATA_CR: {
+            if (c === 0x0d) {
+              p.state = S_CHUNK_DATA_LF;
+              i++;
+              continue;
+            }
+            if (c === 0x0a && lenientLF(p)) {
+              p.state = S_CHUNK_SIZE_START;
+              i++;
+              continue;
+            }
+            if (p.lenient & kLenientOptionalCRLFAfterChunk) {
+              p.state = S_CHUNK_SIZE_START;
+              continue;
+            }
+            return fail(parseError("HPE_STRICT", "Expected LF after chunk data", i));
+          }
+          case S_CHUNK_DATA_LF: {
+            if (c !== 0x0a) {
+              if (!(p.lenient & kLenientOptionalLFAfterCR)) {
+                return fail(parseError("HPE_STRICT", "Expected LF after chunk data", i));
+              }
+            } else {
+              i++;
+            }
+            p.state = S_CHUNK_SIZE_START;
+            continue;
+          }
+          default:
+            return len;
+        }
+      }
+      return len;
+    }
+
+    // node's internal/freelist FreeList.
+    class FreeList {
+      constructor(name, max, ctor) {
+        this.name = name;
+        this.ctor = ctor;
+        this.max = max;
+        this.list = [];
+      }
+      hasItems() {
+        return this.list.length > 0;
+      }
+      alloc() {
+        return this.list.length > 0 ? this.list.pop() : Reflect.apply(this.ctor, this, arguments);
+      }
+      free(obj) {
+        if (this.list.length < this.max) {
+          this.list.push(obj);
+          return true;
+        }
+        return false;
+      }
+    }
+
+    const kIncomingMessage = Symbol("IncomingMessage");
+    const kSkipPendingData = Symbol("SkipPendingData");
+    const MAX_HEADER_PAIRS = 2000;
+    const incoming = () => registry.get("_http_incoming");
+
+    // The callbacks node's pooled parsers carry: they build an
+    // http.IncomingMessage for each message and stream its body into it
+    // (node's parserOn* functions, statement for statement).
+    function parserOnHeaders(headers, url) {
+      if (this.maxHeaderPairs <= 0 || this._headers.length < this.maxHeaderPairs) {
+        this._headers.push(...headers);
+      }
+      this._url += url;
+    }
+    function parserOnHeadersComplete(versionMajor, versionMinor, headers, method, url, statusCode,
+      statusMessage, upgrade, shouldKeepAlive) {
+      const parser = this;
+      const { socket } = parser;
+      if (headers === undefined) {
+        headers = parser._headers;
+        parser._headers = [];
+      }
+      if (url === undefined) {
+        url = parser._url;
+        parser._url = "";
+      }
+      const ParserIncomingMessage = (socket && socket.server && socket.server[kIncomingMessage]) ||
+        incoming().IncomingMessage;
+      const message = parser.incoming = new ParserIncomingMessage(socket);
+      message.httpVersionMajor = versionMajor;
+      message.httpVersionMinor = versionMinor;
+      message.httpVersion = `${versionMajor}.${versionMinor}`;
+      message.joinDuplicateHeaders = (socket && socket.server && socket.server.joinDuplicateHeaders) ||
+        parser.joinDuplicateHeaders;
+      message.url = url;
+      message.upgrade = upgrade;
+      let n = headers.length;
+      if (parser.maxHeaderPairs > 0) n = Math.min(n, parser.maxHeaderPairs);
+      message._addHeaderLines(headers, n);
+      if (typeof method === "number") {
+        message.method = ALL_METHODS[method];
+      } else {
+        message.statusCode = statusCode;
+        message.statusMessage = statusMessage;
+      }
+      return parser.onIncoming(message, shouldKeepAlive);
+    }
+    function parserOnBody(b) {
+      const stream = this.incoming;
+      if (stream === null) return;
+      if (!stream._dumped) {
+        const ret = stream.push(b);
+        if (!ret) incoming().readStop(this.socket);
+      }
+    }
+    function parserOnMessageComplete() {
+      const parser = this;
+      const stream = parser.incoming;
+      if (stream !== null) {
+        stream.complete = true;
+        const headers = parser._headers;
+        if (headers.length) {
+          stream._addHeaderLines(headers, headers.length);
+          parser._headers = [];
+          parser._url = "";
+        }
+        stream.push(null);
+      }
+      incoming().readStart(parser.socket);
+    }
+
+    function cleanParser(parser) {
+      parser._headers = [];
+      parser._url = "";
+      parser.socket = null;
+      parser.incoming = null;
+      parser.outgoing = null;
+      parser.maxHeaderPairs = MAX_HEADER_PAIRS;
+      parser[kOnMessageBegin] = null;
+      parser[kOnExecute] = null;
+      parser[kOnTimeout] = null;
+      parser._consumed = false;
+      parser.onIncoming = null;
+      parser.joinDuplicateHeaders = null;
+    }
+
+    const parsers = new FreeList("parsers", 1000, function parsersCb() {
+      const parser = new HTTPParser();
+      cleanParser(parser);
+      parser[kOnHeaders] = parserOnHeaders;
+      parser[kOnHeadersComplete] = parserOnHeadersComplete;
+      parser[kOnBody] = parserOnBody;
+      parser[kOnMessageComplete] = parserOnMessageComplete;
+      return parser;
+    });
+
+    function closeParserInstance(parser) {
+      parser.close();
+    }
+
+    function freeParser(parser, req, socket) {
+      if (parser) {
+        if (parser._consumed) parser.unconsume();
+        cleanParser(parser);
+        parser.remove();
+        if (parsers.free(parser) === false) {
+          setImmediate(closeParserInstance, parser);
+        } else {
+          parser.free();
+        }
+      }
+      if (req) req.parser = null;
+      if (socket) socket.parser = null;
+    }
+
+    // `--insecure-http-parser`, with node's one-time warning.
+    let warnedLenient = false;
+    function isLenient() {
+      const insecure = natives.httpInsecureParser();
+      if (insecure && !warnedLenient) {
+        warnedLenient = true;
+        process.emitWarning("Using insecure HTTP parsing");
+      }
+      return insecure;
+    }
+
+    function prepareError(err, parser, rawPacket) {
+      err.rawPacket = rawPacket || parser.getCurrentBuffer();
+      if (typeof err.reason === "string") err.message = `Parse Error: ${err.reason}`;
+    }
+
+    const tokenRegExp = /^[\^_`a-zA-Z\-0-9!#$%&'*+.|~]+$/;
+    function checkIsHttpToken(val) {
+      return tokenRegExp.test(val);
+    }
+    const headerCharRegex = /[^\t\x20-\x7e\x80-\xff]/;
+    function checkInvalidHeaderChar(val) {
+      return headerCharRegex.test(val);
+    }
+
+    return {
+      _checkInvalidHeaderChar: checkInvalidHeaderChar,
+      _checkIsHttpToken: checkIsHttpToken,
+      chunkExpression: /(?:^|\W)chunked(?:$|\W)/i,
+      continueExpression: /(?:^|\W)100-continue(?:$|\W)/i,
+      CRLF: "\r\n",
+      freeParser,
+      methods,
+      parsers,
+      kIncomingMessage,
+      HTTPParser,
+      isLenient,
+      prepareError,
+      kSkipPendingData,
+    };
+  };
+
+  // node's other legacy http / tls module names (lib/_http_*.js,
+  // lib/_tls_*.js): require()able builtins, each carrying the public pieces
+  // of the module oam ships, the same objects. What they also export in
+  // node and is node's own plumbing with nothing behind it on oam (the
+  // server's connection tracking, the outgoing stream's internal symbols,
+  // translatePeerCertificate) is left out and recorded in
+  // conformance/surface-gaps.json. `_stream_wrap` (node's deprecated
+  // JSStreamSocket) is not provided.
+  registry.factories["_http_agent"] = () => {
+    const http = registry.get("http");
+    const mod = { Agent: http.Agent };
+    // node's http.globalAgent reads and writes this module's: one slot.
+    Object.defineProperty(mod, "globalAgent", {
+      configurable: true,
+      enumerable: true,
+      get() { return http.globalAgent; },
+      set(value) { http.globalAgent = value; },
+    });
+    return mod;
+  };
+  registry.factories["_http_client"] = () => {
+    registry.get("http");
+    return { ClientRequest: registry._httpClientRequest };
+  };
+  registry.factories["_http_incoming"] = () => {
+    // node's readStart / readStop: the flow control its parsers apply to
+    // the socket under a message.
+    function readStart(socket) {
+      if (socket && !socket._paused && socket.readable) socket.resume();
+    }
+    function readStop(socket) {
+      if (socket) socket.pause();
+    }
+    return { IncomingMessage: registry.get("http").IncomingMessage, readStart, readStop };
+  };
+  registry.factories["_http_outgoing"] = () => {
+    const http = registry.get("http");
+    // node's parseUniqueHeadersOption: the `uniqueHeaders` option's names,
+    // lowercased, as a Set (null for anything but an array).
+    function parseUniqueHeadersOption(headers) {
+      if (!Array.isArray(headers)) return null;
+      const unique = new Set();
+      for (let i = 0; i < headers.length; i++) unique.add(String(headers[i]).toLowerCase());
+      return unique;
+    }
+    return {
+      OutgoingMessage: http.OutgoingMessage,
+      parseUniqueHeadersOption,
+      validateHeaderName: http.validateHeaderName,
+      validateHeaderValue: http.validateHeaderValue,
+    };
+  };
+  registry.factories["_http_server"] = () => {
+    const http = registry.get("http");
+    return { STATUS_CODES: http.STATUS_CODES, Server: http.Server, ServerResponse: http.ServerResponse };
+  };
+  registry.factories["_tls_common"] = () => {
+    const tls = registry.get("tls");
+    return { SecureContext: tls.SecureContext, createSecureContext: tls.createSecureContext };
+  };
+  registry.factories["_tls_wrap"] = () => {
+    const tls = registry.get("tls");
+    return { Server: tls.Server, TLSSocket: tls.TLSSocket, connect: tls.connect, createServer: tls.createServer };
   };
 
   // ------------------------------------------------------------- node:net
@@ -27148,6 +28847,10 @@
       async _readLoopBody() {
         while (!this.destroyed) {
           if (this._paused || this._readFull) return;
+          // No handle to read (not connected yet, or a socket fed by hand
+          // through push(), as a test double is): node's _read waits for
+          // 'connect', and resume() only lets buffered data flow.
+          if (this._handle === null) return;
           let chunk;
           try {
             chunk = await natives.tcpRead(this._handle, 65536);
@@ -27810,7 +29513,11 @@
     // What http's agent path needs to tell a patched socket layer (an
     // instrumentation or guard wrapping connect) from the stock one, captured
     // before any caller can patch it.
-    registry._netStock = { createConnection, socketConnect: Socket.prototype.connect };
+    registry._netStock = {
+      createConnection,
+      socketConnect: Socket.prototype.connect,
+      socketWrite: Socket.prototype.write,
+    };
 
     return {
       isIPv4, isIPv6, isIP,
@@ -28197,6 +29904,9 @@
   registry.factories.perf_hooks = () => {
     const _marks = [];
     const _measures = [];
+    // 'resource' entries (markResourceTiming), up to node's default
+    // resource buffer size.
+    const _resources = [];
     const _observers = [];
 
     class PerformanceEntry {
@@ -28359,16 +30069,37 @@
         return entry;
       },
 
-      getEntries: function() { return _marks.concat(_measures).sort(function(a,b){return a.startTime-b.startTime;}); },
+      getEntries: function() { return _marks.concat(_measures, _resources).sort(function(a,b){return a.startTime-b.startTime;}); },
       getEntriesByName: function(name, type) {
-        return _marks.concat(_measures).sort(function(a,b){return a.startTime-b.startTime;}).filter(function(e) {
+        return _marks.concat(_measures, _resources).sort(function(a,b){return a.startTime-b.startTime;}).filter(function(e) {
           return e.name === name && (type === undefined || e.entryType === type);
         });
       },
       getEntriesByType: function(type) {
         if (type === "mark") return _marks.slice();
         if (type === "measure") return _measures.slice();
+        if (type === "resource") return _resources.slice();
         return [];
+      },
+
+      // node's markResourceTiming: how a fetch implementation reports a
+      // fetch -- the npm undici's fetch calls it for every response, and a
+      // missing one threw out of that fetch once its body was read. A
+      // 'resource' entry named for the URL and spanning the fetch, observed
+      // and buffered (up to 250) as node's are.
+      markResourceTiming: function(timingInfo, requestedUrl, initiatorType, global, cacheMode, bodyInfo,
+        responseStatus) {
+        var start = timingInfo && typeof timingInfo.startTime === "number" ? timingInfo.startTime : 0;
+        var end = timingInfo && typeof timingInfo.endTime === "number" ? timingInfo.endTime : start;
+        var entry = new PerformanceEntry(String(requestedUrl), "resource", start, end - start);
+        entry.initiatorType = initiatorType;
+        entry.responseStatus = responseStatus === undefined ? 0 : responseStatus;
+        if (_resources.length < 250) _resources.push(entry);
+        _notifyObservers(entry);
+        return entry;
+      },
+      clearResourceTimings: function() {
+        _resources.length = 0;
       },
 
       clearMarks: function(name) {
@@ -29545,7 +31276,10 @@
       // checkServerIdentity) sends the request over tls.connect, which
       // honours it (http's carriesTlsPolicy), so no pin is dropped.
       options._defaultAgent = agents.state.httpsGlobalAgent;
-      return http.request(options, callback);
+      // node constructs its own ClientRequest here: a wrapper someone put on
+      // http.request (an interceptor that patches both) does not run twice,
+      // with an https request in its http half.
+      return registry._httpRequest(options, callback);
     }
 
     function get(url, options, callback) {
@@ -36506,7 +38240,11 @@
       return socket;
     }
     var stockTlsSocketConnect = TLSSocket.prototype.connect;
-    registry._tlsStock = { connect, socketConnect: stockTlsSocketConnect };
+    registry._tlsStock = {
+      connect,
+      socketConnect: stockTlsSocketConnect,
+      socketWrite: TLSSocket.prototype.write,
+    };
 
     // ---- tls.SecureContext / tls.createSecureContext (node's
     // lib/_tls_common.js). A context is what a client connection is secured
@@ -38084,7 +39822,17 @@
           _perfEntries = _perfEntries.filter(function(e) { return !(e.entryType === "measure" && e.name === name); });
         }
       },
-      clearResourceTimings: function clearResourceTimings() {},
+      // node's markResourceTiming, which the npm undici's fetch calls (on
+      // the global `performance`) for every response: perf_hooks' (one
+      // implementation; its entries are perf_hooks.performance's).
+      markResourceTiming: function markResourceTiming(timingInfo, requestedUrl, initiatorType, global,
+        cacheMode, bodyInfo, responseStatus) {
+        var perf = registry.get("perf_hooks").performance;
+        return perf.markResourceTiming.apply(perf, arguments);
+      },
+      clearResourceTimings: function clearResourceTimings() {
+        registry.get("perf_hooks").performance.clearResourceTimings();
+      },
       toJSON: function toJSON() {
         return { timeOrigin: this.timeOrigin };
       },
@@ -38503,32 +40251,10 @@
         if (args.length) writeOut(args);
       },
       groupEnd: () => {},
-      table: (data, columns) => {
-        if (data === null || data === undefined || typeof data !== "object") {
-          writeOut([String(data)]);
-          return;
-        }
-        if (Array.isArray(data)) {
-          if (data.length === 0) { writeOut(["[]"]); return; }
-          if (typeof data[0] === "object" && data[0] !== null) {
-            const cols = columns || Object.keys(data[0]);
-            writeOut(["(index) | " + cols.join(" | ")]);
-            for (let ri = 0; ri < data.length; ri++) {
-              const vals = cols.map(c => String(data[ri][c] === undefined ? "" : data[ri][c]));
-              writeOut([ri + "       | " + vals.join(" | ")]);
-            }
-          } else {
-            writeOut(["(index) | Values"]);
-            for (let vi = 0; vi < data.length; vi++) {
-              writeOut([vi + "       | " + String(data[vi])]);
-            }
-          }
-        } else {
-          const keys = Object.keys(data);
-          if (keys.length === 0) { writeOut(["{}"]); return; }
-          writeOut(["(index) | Values"]);
-          for (const k of keys) writeOut([k + " | " + String(data[k])]);
-        }
+      table: (data, properties) => {
+        const text = registry._consoleTable(data, properties, undefined);
+        if (text === null) writeOut([data]);
+        else writeOut([text]);
       },
       clear: () => {},
       // node's dirxml is a DISTINCT function that forwards to log (it is not

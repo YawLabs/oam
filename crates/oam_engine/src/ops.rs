@@ -706,6 +706,20 @@ fn op_ws_connect(
                 .collect()
         })
         .unwrap_or_default();
+    // `WebSocketInit.headers`, as [name, value] pairs.
+    let headers: Vec<(String, String)> = parsed["headers"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|pair| {
+                    Some((
+                        pair.get(0)?.as_str()?.to_string(),
+                        pair.get(1)?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     {
         // `host:port`, as fetch and net.connect are checked: a port-scoped
@@ -730,12 +744,33 @@ fn op_ws_connect(
         }
     }
     let core = core_runtime!(scope);
+    // The near end of the pipe JS pumps a dispatcher's connection through
+    // (`pipe`, a `tlsPipeOpen` pipe), when a `connect` function made it.
+    let supplied = match parsed["pipe"].as_u64() {
+        Some(pipe) => match oam_core::byte_pipe::take_near(&core.tls_pipes(), pipe) {
+            Some(io) => Some(io),
+            None => {
+                let message = format!("WebSocket: connection pipe {pipe} is gone");
+                spawn_op(scope, &mut rv, async move {
+                    oam_core::OpOutcome::Failed(message)
+                });
+                return;
+            }
+        },
+        None => None,
+    };
     let registry = core.ws();
     let ids = core.body_ids();
+    let connect = oam_core::websocket::WsConnect {
+        url,
+        protocols,
+        headers,
+        supplied,
+    };
     spawn_op(
         scope,
         &mut rv,
-        oam_core::websocket::ws_connect(registry, ids, url, protocols),
+        oam_core::websocket::ws_connect(registry, ids, connect),
     );
 }
 

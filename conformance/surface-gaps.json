@@ -5,27 +5,34 @@
       "generatedAgainst": "v22.22.2 on darwin-arm64",
       "counts": {
         "nodeExportNames": 1884,
-        "present": 1448,
-        "missing": 336,
-        "absentModules": 13,
-        "absentModuleExportNames": 100
+        "present": 1480,
+        "missing": 345,
+        "absentModules": 5,
+        "absentModuleExportNames": 59
       },
       "absentModules": [
-        "_http_agent",
-        "_http_client",
-        "_http_common",
-        "_http_incoming",
-        "_http_outgoing",
-        "_http_server",
         "_stream_wrap",
-        "_tls_common",
-        "_tls_wrap",
         "global:fetch.prototype",
         "inspector/promises",
         "sys",
         "wasi"
       ],
       "missingExports": {
+        "_http_outgoing": [
+          "kHighWaterMark",
+          "kUniqueHeaders"
+        ],
+        "_http_server": [
+          "_connectionListener",
+          "httpServerPreClose",
+          "kConnectionsCheckingInterval",
+          "kServerResponse",
+          "setupConnectionsTracking",
+          "storeHTTPOptions"
+        ],
+        "_tls_common": [
+          "translatePeerCertificate"
+        ],
         "async_hooks": [
           "asyncWrapProviders"
         ],
@@ -455,27 +462,34 @@
       "generatedAgainst": "v22.22.2 on linux-x64",
       "counts": {
         "nodeExportNames": 1888,
-        "present": 1448,
-        "missing": 340,
-        "absentModules": 13,
-        "absentModuleExportNames": 100
+        "present": 1480,
+        "missing": 349,
+        "absentModules": 5,
+        "absentModuleExportNames": 59
       },
       "absentModules": [
-        "_http_agent",
-        "_http_client",
-        "_http_common",
-        "_http_incoming",
-        "_http_outgoing",
-        "_http_server",
         "_stream_wrap",
-        "_tls_common",
-        "_tls_wrap",
         "global:fetch.prototype",
         "inspector/promises",
         "sys",
         "wasi"
       ],
       "missingExports": {
+        "_http_outgoing": [
+          "kHighWaterMark",
+          "kUniqueHeaders"
+        ],
+        "_http_server": [
+          "_connectionListener",
+          "httpServerPreClose",
+          "kConnectionsCheckingInterval",
+          "kServerResponse",
+          "setupConnectionsTracking",
+          "storeHTTPOptions"
+        ],
+        "_tls_common": [
+          "translatePeerCertificate"
+        ],
         "async_hooks": [
           "asyncWrapProviders"
         ],
@@ -909,27 +923,34 @@
       "generatedAgainst": "v22.22.2 on win32-arm64",
       "counts": {
         "nodeExportNames": 1874,
-        "present": 1448,
-        "missing": 326,
-        "absentModules": 13,
-        "absentModuleExportNames": 100
+        "present": 1500,
+        "missing": 315,
+        "absentModules": 5,
+        "absentModuleExportNames": 59
       },
       "absentModules": [
-        "_http_agent",
-        "_http_client",
-        "_http_common",
-        "_http_incoming",
-        "_http_outgoing",
-        "_http_server",
         "_stream_wrap",
-        "_tls_common",
-        "_tls_wrap",
         "global:fetch.prototype",
         "inspector/promises",
         "sys",
         "wasi"
       ],
       "missingExports": {
+        "_http_outgoing": [
+          "kHighWaterMark",
+          "kUniqueHeaders"
+        ],
+        "_http_server": [
+          "_connectionListener",
+          "httpServerPreClose",
+          "kConnectionsCheckingInterval",
+          "kServerResponse",
+          "setupConnectionsTracking",
+          "storeHTTPOptions"
+        ],
+        "_tls_common": [
+          "translatePeerCertificate"
+        ],
         "async_hooks": [
           "asyncWrapProviders"
         ],
