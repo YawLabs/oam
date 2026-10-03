@@ -2492,6 +2492,54 @@
     return makeResponse(await settleRaw(pending, lookup, signal, connector), signal, fetchSemantics, onBodyOver);
   }
 
+  // A socket a connect function hands back may carry, under this key, the
+  // reply it is about to write as the header lines its author meant -- the
+  // oam:undici shim's MockAgent connection does, as undici's mock hands its
+  // handler a reply's headers and body apart: `{ headers }`, a flat list of
+  // names and values, the `content-length` / `transfer-encoding` it set
+  // among them, which it kept off the wire so they could not frame (or cut
+  // short) the body. They are the response's headers then
+  // (connectorReplyHeaders).
+  const kConnectorReply = Symbol("oam connector reply");
+
+  // The response's headers for a reply left under kConnectorReply: the
+  // reply's names in its order, each with the values the transport parsed
+  // off the wire -- or, for the two framing fields, the reply's own. A
+  // decoded body drops `content-length` as the transport drops it from
+  // every decoded response (entry 32), which it did here if the reply's
+  // `content-encoding` is gone from the wire.
+  function connectorReplyHeaders(wire, lines) {
+    const parsed = new Map();
+    for (const [name, value] of wire) {
+      const list = parsed.get(name);
+      if (list === undefined) parsed.set(name, [value]);
+      else list.push(value);
+    }
+    let decoded = false;
+    for (let i = 0; i < lines.length; i += 2) {
+      if (String(lines[i]).toLowerCase() === "content-encoding" && !parsed.has("content-encoding")) decoded = true;
+    }
+    const out = [];
+    const done = new Set();
+    for (let i = 0; i < lines.length; i += 2) {
+      const name = String(lines[i]).toLowerCase();
+      if (done.has(name)) continue;
+      done.add(name);
+      if (name === "content-length" || name === "transfer-encoding") {
+        if (decoded && name === "content-length") continue;
+        for (let j = i; j < lines.length; j += 2) {
+          if (String(lines[j]).toLowerCase() === name) out.push([name, String(lines[j + 1])]);
+        }
+      } else {
+        for (const value of parsed.get(name) ?? []) out.push([name, value]);
+      }
+    }
+    for (const [name, values] of parsed) {
+      if (!done.has(name)) for (const value of values) out.push([name, value]);
+    }
+    return out;
+  }
+
   // settleFetch's loop, ending at the op's raw payload (the response head
   // with its `bodyHandle`, and the `socket` / `tls` facts of the connection
   // it arrived on) instead of a Response.
@@ -2506,6 +2554,8 @@
       throw fetchFailed(e);
     }
     let resumed = false;
+    // What the socket the response came over left under kConnectorReply.
+    let reply;
     while (raw && (raw.lookup || raw.connect)) {
       if (raw.connect) {
         // Connector mode: the dispatcher's `connect` function is asked for
@@ -2552,6 +2602,7 @@
           supplied.close();
           throw fetchFailed(supplied.error() ?? e);
         }
+        reply = socket[kConnectorReply];
         continue;
       }
       const { token, host, port } = raw.lookup;
@@ -2600,6 +2651,9 @@
     // hands both strings up so it can be built here. Not through `new URL`:
     // the op has already decided the Location does not parse, by the parser
     // it follows redirects with.
+    if (reply !== undefined && raw && Array.isArray(raw.headers)) {
+      raw.headers = connectorReplyHeaders(raw.headers, reply.headers);
+    }
     if (raw && raw.invalidLocation) {
       const cause = new TypeError("Invalid URL");
       cause.code = "ERR_INVALID_URL";
@@ -2694,6 +2748,7 @@
       fetch: (input, init) => oamFetch(input, init, true),
       undiciFetch: (input, init) => oamFetch(input, init, false),
       Headers,
+      connectorReply: kConnectorReply,
     }),
     writable: false,
     enumerable: false,

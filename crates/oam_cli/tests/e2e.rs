@@ -7856,7 +7856,11 @@ server.close();
 /// replyContentLength(), an https origin, an origin matcher, a redirect
 /// between mocked origins, a gzip body, a request head over llhttp's size
 /// limit and a method llhttp does not know (both failed with the parser's
-/// error until the review of #206), pendingInterceptors() and
+/// error until the review of #206), a reply whose `content-length` or
+/// `transfer-encoding` disagrees with its body -- the whole body arrives and
+/// the headers read as the reply set them (until the review of #206 they
+/// framed the body: cut short, or failed with "terminated") --
+/// pendingInterceptors() and
 /// assertNoPendingInterceptors(), and undici's argument checks. Up to 0.17.1
 /// the three refused at construction. The expected lines are node v22.22.2's
 /// with undici 6.29.0 installed, running the same script.
@@ -7968,6 +7972,27 @@ console.log('https', await (await fetch('https://secure.invalid/s')).text());
 
 agent.get(/\.wild\.invalid$/).intercept({ path: '/w' }).reply(200, 'wildcard').times(2);
 console.log('origin matcher', await (await fetch('http://a.wild.invalid/w')).text(), await (await fetch('http://b.wild.invalid/w')).text());
+const framed = async (label, path, init) => {
+  try {
+    const res = await fetch('http://example.invalid' + path, init);
+    console.log(label, JSON.stringify([...res.headers]), JSON.stringify(await res.text()));
+  } catch (e) {
+    console.log(label, 'failed', e.message, e.cause?.code);
+  }
+};
+pool.intercept({ path: '/u' }).replyContentLength().reply(200, 'héllo wörld');
+await framed('replyContentLength, non-ASCII', '/u');
+pool.intercept({ path: '/short' }).reply(200, 'abcdef', { headers: { 'content-length': '3' } });
+await framed('content-length short of the body', '/short');
+pool.intercept({ path: '/long' }).reply(200, 'abc', { headers: { 'Content-Length': '10', 'x-after': 'z' } });
+await framed('content-length past the body', '/long');
+pool.intercept({ path: '/te' }).reply(200, 'chunky', { headers: { 'x-first': '1', 'transfer-encoding': 'chunked' } });
+await framed('transfer-encoding set by the reply', '/te');
+pool.intercept({ path: '/hcl', method: 'HEAD' }).reply(200, 'dropped', { headers: { 'content-length': '7' } });
+await framed('HEAD with content-length', '/hcl', { method: 'HEAD' });
+pool.intercept({ path: '/rq' }).reply(200, 'abcdef', { headers: { 'content-length': '2', 'x-r': 'r' } });
+const shortRequest = await request('http://example.invalid/rq');
+console.log('request, content-length short of the body', JSON.stringify(shortRequest.headers), await shortRequest.body.text());
 pool.intercept({ path: '/big' }).reply(200, 'big head');
 console.log('20000-byte header', await (await fetch('http://example.invalid/big', { headers: { 'x-big': 'a'.repeat(20000) } })).text());
 pool.intercept({ path: '/foo', method: 'FOO' }).reply(200, 'foo fetch');
@@ -8028,6 +8053,12 @@ gzip zipped
 defaults [["content-length","4"],["x-def","d"]] abcd
 https secure
 origin matcher wildcard wildcard
+replyContentLength, non-ASCII [["content-length","11"]] "héllo wörld"
+content-length short of the body [["content-length","3"]] "abcdef"
+content-length past the body [["content-length","10"],["x-after","z"]] "abc"
+transfer-encoding set by the reply [["transfer-encoding","chunked"],["x-first","1"]] "chunky"
+HEAD with content-length [["content-length","7"]] ""
+request, content-length short of the body {"content-length":"2","x-r":"r"} abcdef
 20000-byte header big head
 method FOO fetch foo fetch
 method FOO request foo request

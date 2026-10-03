@@ -89,6 +89,10 @@
     // fetch() itself, so replacing globalThis.fetch (nock's fetch
     // interception, a test's wrapper) must not answer, block or see them.
     const ownFetch = G.__oamFetchInternal.undiciFetch;
+    // Where a mock connection leaves its reply's header lines for fetch,
+    // which reports them in place of the ones that framed the wire
+    // (bootstrap.js connectorReplyHeaders).
+    const kConnectorReply = G.__oamFetchInternal.connectorReply;
 
     // ---- errors -----------------------------------------------------------
     // The classes globalThis.fetch raises (bootstrap.js undiciErrors, which
@@ -2154,32 +2158,32 @@
         }
       }
 
-      // The reply on the wire: its status line, its header lines as given,
-      // and its body running to the end of the connection, so the response
-      // carries no field the reply did not (as undici's mock adds none). A
-      // body is not sent where HTTP has none (HEAD, 1xx, 204, 304), and is
-      // sent as one chunk under a transfer-encoding the reply set itself.
+      // The reply on the wire: its status line, its header lines but the
+      // two that frame a body, and its body running to the end of the
+      // connection, so the response carries no field the reply did not (as
+      // undici's mock adds none) and the whole body arrives whatever the
+      // reply's `content-length` or `transfer-encoding` say -- undici's mock
+      // hands its handler the body and the headers apart, so neither frames
+      // the other (measured on undici 6.29.0: `content-length: 3` on
+      // 'abcdef' delivers 'abcdef'; replyContentLength() counts a string's
+      // UTF-16 units, short of a non-ASCII body's bytes). The reply's lines,
+      // those two included, are left on the socket for fetch to report as
+      // the response's headers. A body is not sent where HTTP has none
+      // (HEAD, 1xx, 204, 304).
       function respond(method, statusCode, lines, data) {
         let head = `HTTP/1.1 ${statusCode} ${getStatusText(statusCode)}\r\n`;
-        let chunked = false;
         for (let i = 0; i < lines.length; i += 2) {
+          const name = lines[i].toLowerCase();
+          if (name === "content-length" || name === "transfer-encoding") continue;
           head += lines[i] + ": " + lines[i + 1] + "\r\n";
-          if (lines[i].toLowerCase() === "transfer-encoding" && /(?:^|,)\s*chunked\s*$/i.test(lines[i + 1])) {
-            chunked = true;
-          }
         }
+        socket[kConnectorReply] = { headers: lines };
         socket.push(G.Buffer.from(head + "\r\n", "utf8"));
         const noBody = method === "HEAD" || statusCode === 204 || statusCode === 304 ||
           (statusCode >= 100 && statusCode < 200);
         if (!noBody) {
           const bytes = G.Buffer.from(data);
-          if (chunked) {
-            if (bytes.length > 0) socket.push(G.Buffer.from(bytes.length.toString(16) + "\r\n", "latin1"));
-            if (bytes.length > 0) socket.push(G.Buffer.concat([bytes, G.Buffer.from("\r\n", "latin1")]));
-            socket.push(G.Buffer.from("0\r\n\r\n", "latin1"));
-          } else if (bytes.length > 0) {
-            socket.push(bytes);
-          }
+          if (bytes.length > 0) socket.push(bytes);
         }
         socket.push(null);
       }

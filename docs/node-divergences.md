@@ -1740,10 +1740,14 @@ what reaches them). What differs:
 - **Trailers** set with `reply(..., { trailers })` or `defaultReplyTrailers()` are not sent:
   `undici.request()`'s `trailers` is `{}` on oam whatever the response (above).
 - **A reply's body runs to the end of the connection**, so a response carries no framing
-  field the reply did not set, as with undici. A `content-length` the reply sets frames the
-  body here: one shorter than the body's bytes (`replyContentLength()` counts a string's
-  UTF-16 units, as undici does, so `'café'` gets 4) cuts the body there, where undici's mock
-  delivers all of it. A 1xx reply fails the request on both, with different causes.
+  field the reply did not set, as with undici, and the whole body arrives whatever the
+  reply's own `content-length` or `transfer-encoding` say -- one short of the body's bytes
+  (`replyContentLength()` counts a string's UTF-16 units, as undici does, so `'café'` gets
+  4), one past them, or `chunked` -- with those headers reading as the reply set them, as
+  undici's mock delivers it (until the review of #206 they framed the body here, cutting it
+  short or failing it with `terminated`). For a gzip reply that fetch decodes, its
+  `content-length` is dropped with `content-encoding`, as for any decoded response (entry
+  32). A 1xx reply fails the request on both, with different causes.
 - **`assertNoPendingInterceptors()`'s table** is drawn by `console.table` on a
   `new Console()`, which oam draws as node does since 0.17.2 (box, columns, inspected cells,
   display widths; `conformance/cases/370-console-table.mjs`). A `new Console()` still has
