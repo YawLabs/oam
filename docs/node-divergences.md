@@ -3381,11 +3381,11 @@ booting and then failing every browser tool.
   dial the gate cannot see ahead of time -- is checked against its URL's `host:port` too,
   so it needs that host's grant as well as the pipe's
   (`--allow-net=\\.\pipe\app,localhost` for `http://localhost/` over the pipe; e2e test
-  `an_undici_request_over_a_pipe_needs_the_url_host_grant_too`). Node 22's permission model has no network category and does not
-  gate pipes at all (measured on v22.22.2: under `--permission` with no fs grant it listens
-  on a named pipe and dials a file); the choice is oam's, made so that a grant for one
-  service cannot reach `\\.\pipe\docker_engine` or `/var/run/docker.sock`, nor a pipe op
-  reach past the fs grant.
+  `an_undici_request_over_a_pipe_needs_the_url_host_grant_too`). Node 22's permission
+  model has no network category and does not gate pipes at all (measured on v22.22.2:
+  under `--permission` with no fs grant it listens on a named pipe and dials a file); the
+  choice is oam's, made so that a grant for one service cannot reach
+  `\\.\pipe\docker_engine` or `/var/run/docker.sock`, nor a pipe op reach past the fs grant.
 - **Windows: remote clients and impersonation.** oam's pipe server refuses clients on other
   machines (`PIPE_REJECT_REMOTE_CLIENTS`) and its client lets the server identify, not
   impersonate, it (`SECURITY_IDENTIFICATION`); libuv sets neither, so a Node server takes
