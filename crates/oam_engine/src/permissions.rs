@@ -227,6 +227,41 @@ impl PermValue {
         }
     }
 
+    /// [`Self::allows_net`] for a connection to `host` on `port`, judged on
+    /// the two halves as given rather than on `host:port` re-split: a
+    /// bare-host entry matches when it IS `host`, a port-scoped entry when it
+    /// is `host` followed by `:<port>`, spelled as the port's decimal digits.
+    ///
+    /// The halves are never joined and split again because a host may itself
+    /// contain colons. A `connect.lookup` answer with an IPv6 zone id
+    /// (`fe80::1%1`) is not a URL host and stays unbracketed
+    /// ([`lookup_answer_resource`]); joined, `fe80::1%1:8080` re-splits as one
+    /// multi-colon host with no port, so no bare-host entry could match it,
+    /// and only one port-scoped entry per port could grant the address.
+    pub fn allows_net_target(&self, host: &str, port: u16) -> bool {
+        match self {
+            PermValue::All => true,
+            PermValue::None => false,
+            // The empty host (a URL that did not parse) is never granted, not
+            // even by a blank list item (`--allow-net=a.example,`).
+            PermValue::List(_) if host.is_empty() => false,
+            PermValue::List(list) => list.iter().any(|item| {
+                if item == host {
+                    return true;
+                }
+                item.strip_prefix(host)
+                    .and_then(|rest| rest.strip_prefix(':'))
+                    .is_some_and(|p| {
+                        // `8080` only: not `08080`, `+8080` or `8080 `, which
+                        // the joined `host:port` string never equalled either.
+                        p.bytes().all(|b| b.is_ascii_digit())
+                            && (p == "0" || !p.starts_with('0'))
+                            && p.parse::<u16>() == Ok(port)
+                    })
+            }),
+        }
+    }
+
     /// Exact match. Used by env, where a prefix turns `--allow-env=API` into a
     /// grant over `API_SECRET`.
     pub fn allows_exact(&self, target: &str) -> bool {
@@ -332,6 +367,31 @@ impl Permissions {
             Err(PermissionDenial {
                 permission: "Net",
                 resource: host.to_string(),
+            })
+        }
+    }
+
+    /// Returns `Err(denial)` when `net` is denied for a connection to `host`
+    /// on `port`: [`Self::check_net`] on the resource `host:port`, the one
+    /// `net.connect` asks about, so the HTTP clients -- `fetch` (each redirect
+    /// hop and `connect.lookup` answer too), `http.request`, `undici.request`
+    /// -- and `WebSocket` are judged by the raw socket's rule. A bare-host
+    /// entry admits the host on any port; a port-scoped entry
+    /// (`127.0.0.1:8080`) admits exactly that port. `host` is a URL host,
+    /// IPv6 bracketed, so `[::1]` on 8080 is matched by a `[::1]` or a
+    /// `[::1]:8080` entry.
+    ///
+    /// The two halves are matched apart ([`PermValue::allows_net_target`]),
+    /// so a host with colons of its own (a zone-id lookup answer such as
+    /// `fe80::1%1`) is matched by its bare-host entry too. The empty host (a
+    /// URL that did not parse) matches no list entry.
+    pub fn check_net_target(&self, host: &str, port: u16) -> Result<(), PermissionDenial> {
+        if self.net.allows_net_target(host, port) {
+            Ok(())
+        } else {
+            Err(PermissionDenial {
+                permission: "Net",
+                resource: format!("{host}:{port}"),
             })
         }
     }
@@ -469,8 +529,8 @@ impl From<PermissionDenial> for oam_core::AccessDenial {
 ///
 /// Both call sites go through this one closure, so the initial URL and a
 /// redirect cannot be judged by different rules. The rule is
-/// [`Permissions::check_net`] on the URL's HOST ALONE, as the fetch gate has
-/// always applied it:
+/// [`Permissions::check_net_target`]: the URL's host and the port the hop
+/// will be dialled on, as the `host:port` resource `net.connect` checks:
 ///
 /// - The host is the WHATWG serialization (see `oam_core::http_client::
 ///   NetTarget`): case, percent-encoding and non-canonical IP spellings are
@@ -481,10 +541,12 @@ impl From<PermissionDenial> for oam_core::AccessDenial {
 ///   `localhost` grant, so it is refused. That fails closed; granting it takes
 ///   an entry spelled with the dot.
 /// - An IPv6 literal is checked in brackets, so a grant names it `[::1]`.
-/// - The port is not part of the resource. A bare-host entry admits the host
-///   on any port, and a port-scoped entry (`127.0.0.1:8080`) never matches a
-///   fetch -- it grants `net.connect` to that port, not `fetch`. Fail-closed,
-///   and unchanged from the initial-URL gate's behaviour.
+/// - The port is the URL's own, or the scheme's default (80 / 443). A
+///   bare-host entry admits the host on any port; a port-scoped entry
+///   (`example.com:443`) admits that port alone -- `https://example.com/`,
+///   but not `http://example.com/` or a redirect to `example.com:8443`. A
+///   denial names `host:port`. Up to 0.17.1 the port was not part of the
+///   resource, so a port-scoped entry admitted no fetch at all.
 pub fn fetch_net_check(
     permissions: &std::sync::Arc<Permissions>,
 ) -> Option<oam_core::http_client::NetCheck> {
@@ -495,10 +557,28 @@ pub fn fetch_net_check(
     Some(std::sync::Arc::new(
         move |target: &oam_core::http_client::NetTarget<'_>| {
             permissions
-                .check_net(target.host)
+                .check_net_target(target.host, target.port)
                 .map_err(oam_core::AccessDenial::from)
         },
     ))
+}
+
+/// The port a request to `url` is dialled on, as the net grant is asked about
+/// it: the URL's own, or the scheme's default -- 80 for `http:` and `ws:`,
+/// 443 for `https:` and `wss:` (the WHATWG parser drops a default port, so
+/// `port()` is empty for those) -- and 0 for any other scheme, which no
+/// port-scoped entry names. The synchronous gates (`op_fetch`,
+/// `op_ws_connect`) read it here; the transport's loop gets the same answer
+/// from the `url` crate's `port_or_known_default`.
+pub fn url_net_port(url: &ada_url::Url) -> u16 {
+    match url.port() {
+        "" => match url.protocol() {
+            "http:" | "ws:" => 80,
+            "https:" | "wss:" => 443,
+            _ => 0,
+        },
+        explicit => explicit.parse().unwrap_or_default(),
+    }
 }
 
 /// The net resource a `connect.lookup` hook's answer is checked as: the host
@@ -512,7 +592,12 @@ pub fn fetch_net_check(
 /// the raw answer, so `--allow-net=[::1]` (what `http://[::1]/` needs) refused
 /// a hook answering `::1`, and only the unbracketed `::1`, which no URL check
 /// ever matches, admitted it. An answer that is not an address is checked
-/// as given; the transport refuses to dial it anyway.
+/// as given; the transport refuses to dial it anyway. So is an IPv6 answer
+/// with a zone id (`fe80::1%1`), which the transport does dial: a URL cannot
+/// name one, so there is no URL spelling to match, and its grant stays the
+/// spelling it always was (`--allow-net=fe80::1%1`, or `fe80::1%1:8080`). `op_fetch_continue`
+/// checks it with the parked hop's port
+/// ([`Permissions::check_net_target`]), as the hop's host was.
 pub fn lookup_answer_resource(answer: &str) -> String {
     match answer.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(v4)) => v4.to_string(),
@@ -779,12 +864,14 @@ mod tests {
     }
 
     #[test]
-    fn fetch_net_check_is_check_net_on_the_host_alone() {
+    fn fetch_net_check_is_check_net_on_host_and_port() {
         let p = std::sync::Arc::new(Permissions::from_opts(Some(opts_net_only(vec![
             "127.0.0.1",
             "[::1]",
             "granted.test",
             "10.0.0.1:5432",
+            "[::2]:8443",
+            "scoped.test:443",
         ]))));
         let check = fetch_net_check(&p).unwrap();
         // A bare-host entry admits the host on any port.
@@ -792,13 +879,13 @@ mod tests {
         assert!(check(&target("127.0.0.1", 65535)).is_ok());
         assert!(check(&target("[::1]", 8080)).is_ok());
         assert!(check(&target("granted.test", 443)).is_ok());
-        // The refusal is the synchronous gate's, naming the host.
+        // The refusal names `host:port`, the resource net.connect's names.
         let denial = check(&target("localhost", 80)).unwrap_err();
         assert_eq!(
             denial,
             oam_core::AccessDenial {
                 permission: "Net".to_string(),
-                resource: "localhost".to_string(),
+                resource: "localhost:80".to_string(),
             }
         );
         // A trailing dot is its own name, and a suffix is not the grant.
@@ -806,12 +893,58 @@ mod tests {
         assert!(check(&target("granted.test.evil.example", 80)).is_err());
         // An unbracketed IPv6 host never matches the bracketed entry.
         assert!(check(&target("::1", 80)).is_err());
-        // A port-scoped entry grants net.connect to that port, never a fetch:
-        // the port is not part of a fetch's resource. Fail-closed.
-        assert!(p.check_net("10.0.0.1:5432").is_ok());
-        assert!(check(&target("10.0.0.1", 5432)).is_err());
-        // The empty host (a URL that did not parse) is never granted.
+        // A port-scoped entry admits a fetch to its own port, as it admits
+        // net.connect there -- one rule -- and no other port.
+        for (host, port) in [("10.0.0.1", 5432), ("[::2]", 8443), ("scoped.test", 443)] {
+            assert!(p.check_net_target(host, port).is_ok(), "{host}:{port}");
+            assert!(check(&target(host, port)).is_ok(), "{host}:{port}");
+        }
+        for (host, port) in [("10.0.0.1", 5433), ("[::2]", 443), ("scoped.test", 80)] {
+            let denial = check(&target(host, port)).unwrap_err();
+            assert_eq!(denial.resource, format!("{host}:{port}"));
+        }
+        // The empty host (a URL that did not parse) is never granted, not
+        // even by a blank list item.
         assert!(check(&target("", 80)).is_err());
+        let blank = Permissions::from_opts(Some(opts_net_only(vec!["", ":80", "a.test"])));
+        assert!(blank.check_net_target("", 80).is_err());
+        // A port-scoped entry is its port's decimal digits, exactly.
+        let spelled = Permissions::from_opts(Some(opts_net_only(vec![
+            "p.test:08080",
+            "q.test:+80",
+            "r.test:0",
+            "s.test:",
+        ])));
+        assert!(spelled.check_net_target("p.test", 8080).is_err());
+        assert!(spelled.check_net_target("q.test", 80).is_err());
+        assert!(spelled.check_net_target("r.test", 0).is_ok());
+        assert!(spelled.check_net_target("s.test", 0).is_err());
+    }
+
+    /// The synchronous gates' port matches the transport loop's
+    /// (`url::Url::port_or_known_default`) for every scheme they see, so the
+    /// initial URL and a redirect hop name the same `host:port`.
+    #[test]
+    fn url_net_port_is_the_port_the_transport_dials() {
+        for (raw, port) in [
+            ("http://example.com/", 80),
+            ("http://example.com:80/", 80),
+            ("https://example.com/", 443),
+            ("https://example.com:443/", 443),
+            ("http://example.com:8443/", 8443),
+            ("https://example.com:80/", 80),
+            ("ws://example.com/", 80),
+            ("wss://example.com/", 443),
+            ("wss://example.com:9001/", 9001),
+            ("http://127.0.0.1:65535/", 65535),
+        ] {
+            let by_ada = ada_url::Url::parse(raw, None).unwrap();
+            assert_eq!(url_net_port(&by_ada), port, "{raw}");
+            let by_url = url::Url::parse(raw).unwrap();
+            assert_eq!(by_url.port_or_known_default(), Some(port), "{raw}");
+        }
+        let other = ada_url::Url::parse("data:text/plain,x", None).unwrap();
+        assert_eq!(url_net_port(&other), 0);
     }
 
     /// The initial URL's host is read by ada (`op_fetch`), a redirect hop's
@@ -891,6 +1024,31 @@ mod tests {
         assert!(p.check_net(&lookup_answer_resource("::1")).is_ok());
         assert!(p.check_net(&lookup_answer_resource("0::1")).is_ok());
         assert!(p.check_net(&lookup_answer_resource("::2")).is_err());
+        // A zone-id answer is not a URL host, so it is checked as given, on
+        // the hop's port. Its bare-host entry admits it on any port and its
+        // port-scoped entry on that port alone. Joined into one string
+        // (`fe80::1%1:8080`) and split again it read as a portless host, so
+        // only the port-scoped entry could grant it.
+        assert_eq!(lookup_answer_resource("fe80::1%1"), "fe80::1%1");
+        let zoned = std::sync::Arc::new(Permissions::from_opts(Some(opts_net_only(vec![
+            "fe80::1%1",
+            "fe80::2%1:8080",
+        ]))));
+        for port in [80, 8080, 65535] {
+            let r = zoned.check_net_target(&lookup_answer_resource("fe80::1%1"), port);
+            assert!(r.is_ok(), "bare zone-id entry, port {port}");
+        }
+        let scoped = lookup_answer_resource("fe80::2%1");
+        assert!(zoned.check_net_target(&scoped, 8080).is_ok());
+        let denial = zoned.check_net_target(&scoped, 8081).unwrap_err();
+        assert_eq!(denial.resource, "fe80::2%1:8081");
+        // Another zone, or the address without its zone, is another host.
+        assert!(zoned.check_net_target("fe80::1%2", 80).is_err());
+        assert!(
+            zoned
+                .check_net_target(&lookup_answer_resource("fe80::1"), 80)
+                .is_err()
+        );
         let unbracketed =
             std::sync::Arc::new(Permissions::from_opts(Some(opts_net_only(vec!["::1"]))));
         assert!(

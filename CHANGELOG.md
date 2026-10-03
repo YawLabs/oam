@@ -19,6 +19,17 @@ one, so `install.sh`, which resolves the latest Release, never handed them out.
 Follow-ups to the 0.17.2 batch, across fs, undici and Buffer, web streams, zlib and http2:
 each change below is held to node v22.22.2 by a conformance case or an e2e test.
 
+### Permissions
+
+- **A port-scoped `--allow-net` entry now admits `fetch`, `http.request` / `https.request`,
+  `undici.request` and `WebSocket` to that port**, as it already admitted `net.connect` /
+  `tls.connect`: `--allow-net=example.com:443` admits `https://example.com/` and refuses
+  `http://example.com/` and a redirect to `example.com:8443`. Up to 0.17.1 a port-scoped entry
+  admitted no HTTP request at all. Bare-host entries are unchanged (any port). The
+  `ERR_ACCESS_DENIED` `resource` for these requests -- including a refused redirect hop or
+  `connect.lookup` answer -- now reads `host:port` (`"example.com:80"`) instead of the bare
+  host, the same resource `net.connect` reports. (#188)
+
 ### Added
 
 - **http2 trailers work both ways, as in node.** A client stream emits `'trailers'` and
@@ -41,6 +52,9 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Fixed
 
+- **Over HTTP/2, a `fetch` response header value kept the whitespace around it**; it is trimmed
+  as it is over HTTP/1, and the trimming is recorded as a divergence from node's `fetch`, which
+  keeps trailing whitespace. (#182)
 - **undici from npm hung** on `await WebAssembly.compile()`. V8's foreground tasks (async
   WebAssembly compile and instantiate, `Atomics.waitAsync`, `FinalizationRegistry` cleanup,
   GC idle tasks) now run on the isolate's event loop, on the main thread and in workers, so

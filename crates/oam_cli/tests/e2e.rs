@@ -8450,9 +8450,10 @@ try {
         &port_arg,
     ]);
     let stdout = String::from_utf8_lossy(&out.stdout);
+    // Named as the hop's `address:port`, as net.connect names a connection.
     assert_eq!(
         stdout.trim().replace("\r\n", "\n"),
-        "DENIED ERR_ACCESS_DENIED \"127.0.0.1\"",
+        format!("DENIED ERR_ACCESS_DENIED \"127.0.0.1:{port}\""),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -8541,14 +8542,14 @@ console.log('continued', tokens.length, 'still parked', tokens.some((t) => inter
     // Refused (the address is not granted), and released.
     let (stdout, stderr) = run("--allow-net=granted.invalid", 1234, "10.9.9.9");
     assert_eq!(
-        stdout, "DENIED \"10.9.9.9\"\ncontinued 1 still parked false",
+        stdout, "DENIED \"10.9.9.9:1234\"\ncontinued 1 still parked false",
         "stderr: {stderr}"
     );
     // The unbracketed spelling matches no URL, and no longer a hook answer:
     // refused as the URL `http://[::1]/` is, naming the same resource.
     let (stdout, stderr) = run("--allow-net=granted.invalid,::1", 1234, "::1");
     assert_eq!(
-        stdout, "DENIED \"[::1]\"\ncontinued 1 still parked false",
+        stdout, "DENIED \"[::1]:1234\"\ncontinued 1 still parked false",
         "stderr: {stderr}"
     );
 
@@ -9954,8 +9955,8 @@ fn oam_without_proxy_env(args: &[&str]) -> Output {
 /// (127.0.0.1) redirects each request to a target named by the case:
 ///
 ///  - every spelling of an ungranted host is refused with the same
-///    `ERR_ACCESS_DENIED` a direct request gets, naming the host as the URL
-///    parser normalised it (`LOCALHOST` and `%6c%6fcalhost` are `localhost`,
+///    `ERR_ACCESS_DENIED` a direct request gets, naming `host:port` with the
+///    host as the URL parser normalised it (`LOCALHOST` and `%6c%6fcalhost` are `localhost`,
 ///    `[0:0:0:0:0:0:0:1]` is `[::1]`; `localhost.` stays itself, which no
 ///    grant for `localhost` covers), and the target server never sees a
 ///    request -- not even the re-sent body of a 307 POST;
@@ -10113,34 +10114,37 @@ console.log(lines.join('\n'));
         assert!(out.status.success(), "{argv:?}: {stdout}\n{stderr}");
         let inner_seen = inner_seen.lock().unwrap().clone();
         let inner6_seen = inner6_seen.map(|seen| seen.lock().unwrap().clone());
-        (stdout, stderr, inner_seen, inner6_seen)
+        let ports = (inner.parse::<u16>().unwrap(), inner6);
+        (stdout, stderr, inner_seen, inner6_seen, ports)
     };
 
     let granted = "--allow-net=127.0.0.1,granted.invalid";
-    let (stdout, stderr, inner_seen, inner6_seen) = run(&["--permission", granted], "full");
+    let (stdout, stderr, inner_seen, inner6_seen, (inner, inner6)) =
+        run(&["--permission", granted], "full");
     let denied = "Error|Access to this API has been restricted|code,permission,resource";
+    // A refusal names the hop's `host:port`, as net.connect's does.
     assert_eq!(
         stdout,
         [
-            r#"fetch localhost DENIED Net "localhost""#,
-            r#"fetch upper DENIED Net "localhost""#,
-            r#"fetch dot DENIED Net "localhost.""#,
-            r#"fetch pct DENIED Net "localhost""#,
-            r#"fetch v6 DENIED Net "[::1]""#,
-            r#"fetch v6long DENIED Net "[::1]""#,
+            &format!(r#"fetch localhost DENIED Net "localhost:{inner}""#),
+            &format!(r#"fetch upper DENIED Net "localhost:{inner}""#),
+            &format!(r#"fetch dot DENIED Net "localhost.:{inner}""#),
+            &format!(r#"fetch pct DENIED Net "localhost:{inner}""#),
+            &format!(r#"fetch v6 DENIED Net "[::1]:{inner6}""#),
+            &format!(r#"fetch v6long DENIED Net "[::1]:{inner6}""#),
             r#"fetch userinfo ERR TypeError: fetch failed / cross origin not allowed for request mode "cors""#,
             "fetch ip 200 inner /fetch/ip",
             "fetch hex 200 inner /fetch/hex",
-            r#"fetch307 localhost DENIED Net "localhost""#,
+            &format!(r#"fetch307 localhost DENIED Net "localhost:{inner}""#),
             // http.request follows no redirect, as in node: the 3xx is the
             // response, and neither hop is dialled.
             "http localhost 302 ",
             "http ip 302 ",
-            r#"undici localhost DENIED Net "localhost""#,
+            &format!(r#"undici localhost DENIED Net "localhost:{inner}""#),
             "undici ip 200 inner /undici/ip",
-            r#"hook denied DENIED Net "denied.invalid""#,
+            &format!(r#"hook denied DENIED Net "denied.invalid:{inner}""#),
             "hook granted 200 inner /hook/granted",
-            r#"direct DENIED Net "localhost""#,
+            &format!(r#"direct DENIED Net "localhost:{inner}""#),
             // The outer origin twice (the second fetch is a new hooked
             // client), then the granted hop. Never `denied.invalid`.
             r#"hook-calls ["granted.invalid","granted.invalid","granted.invalid"]"#,
@@ -10176,10 +10180,171 @@ console.log(lines.join('\n'));
     ]
     .join("\n");
     for flags in [&[][..], &["--permission", "--allow-net"][..]] {
-        let (stdout, stderr, inner_seen, _) = run(flags, "off");
+        let (stdout, stderr, inner_seen, _, _) = run(flags, "off");
         assert_eq!(stdout, followed, "{flags:?} stderr: {stderr}");
         assert_eq!(inner_seen.len(), 3, "{flags:?}: {inner_seen:?}");
     }
+}
+
+/// A port-scoped `--allow-net` entry admits the HTTP clients to its own port,
+/// as it admits `net.connect` there: `fetch`, `http.request`,
+/// `undici.request` and `WebSocket` are checked on `host:port` -- the URL's
+/// port, or 80 / 443 by scheme -- and a refusal names that resource. Up to
+/// 0.17.1 they were checked on the host alone, so `--allow-net=127.0.0.1:PORT`
+/// connected a raw socket to PORT and refused every HTTP request to it.
+///
+/// The same entry refuses every other port: directly, through a granted
+/// origin's redirect to another port on the same host, and for a
+/// `connect.lookup` hook whose answer is granted only on another port (the
+/// answer is checked on the parked hop's port, read from the parked fetch).
+/// The listener on the other port must never see a request. A scheme's
+/// default port is the one checked: `scoped.invalid:443` admits `https:` and
+/// `wss:` (which then fail at DNS, past the gate) and refuses `http:` and
+/// `ws:` as `scoped.invalid:80`.
+#[test]
+fn allow_net_port_scoped_entry_admits_http_clients_on_its_port_alone() {
+    let script = write_temp(
+        "port_scoped_permission/main.mjs",
+        r#"import http from 'node:http';
+import { Agent, request } from 'undici';
+const granted = Number(process.argv[2]);
+const other = Number(process.argv[3]);
+const fail = (e) =>
+  e && e.code === 'ERR_ACCESS_DENIED' ? `DENIED ${e.permission} ${JSON.stringify(e.resource)}` : 'NOT DENIED';
+const viaFetch = async (url, init) => {
+  try {
+    const r = await fetch(url, init);
+    return `${r.status} ${await r.text()}`;
+  } catch (e) {
+    return fail(e);
+  }
+};
+const viaHttp = (url) =>
+  new Promise((resolve) => {
+    http.get(url, (res) => {
+      res.resume();
+      res.on('end', () => resolve(`${res.statusCode}`));
+    }).on('error', (e) => resolve(fail(e)));
+  });
+const viaUndici = async (url) => {
+  try {
+    const r = await request(url);
+    return `${r.statusCode} ${await r.body.text()}`;
+  } catch (e) {
+    return fail(e);
+  }
+};
+const viaWs = (url) =>
+  new Promise((resolve) => {
+    try {
+      const ws = new WebSocket(url);
+      ws.onerror = () => resolve('NOT DENIED');
+      ws.onopen = () => { ws.close(); resolve('OPEN'); };
+    } catch (e) {
+      resolve(fail(e));
+    }
+  });
+const hook = (answer) => new Agent({ connect: { lookup: (h, o, cb) => cb(null, [{ address: answer, family: 4 }]) } });
+const at = (port, path) => `http://127.0.0.1:${port}${path}`;
+const lines = [
+  `fetch ${await viaFetch(at(granted, '/fetch'))}`,
+  `http ${await viaHttp(at(granted, '/http'))}`,
+  `undici ${await viaUndici(at(granted, '/undici'))}`,
+  `ws ${await viaWs(`ws://127.0.0.1:${granted}/ws`)}`,
+  `hook ${await viaFetch(`http://granted.invalid:${granted}/hook`, { dispatcher: hook('127.0.0.1') })}`,
+  `fetch other ${await viaFetch(at(other, '/fetch'))}`,
+  `http other ${await viaHttp(at(other, '/http'))}`,
+  `undici other ${await viaUndici(at(other, '/undici'))}`,
+  `ws other ${await viaWs(`ws://127.0.0.1:${other}/ws`)}`,
+  `fetch redirect ${await viaFetch(at(granted, '/redirect'))}`,
+  `undici redirect ${await viaUndici(at(granted, '/redirect'))}`,
+  `hook other ${await viaFetch(`http://granted.invalid:${other}/hook`, { dispatcher: hook('127.0.0.1') })}`,
+  `https default ${await viaFetch('https://scoped.invalid/')}`,
+  `http default ${await viaFetch('http://scoped.invalid/')}`,
+  `wss default ${await viaWs('wss://scoped.invalid/')}`,
+  `ws default ${await viaWs('ws://scoped.invalid/')}`,
+];
+console.log(lines.join('\n'));
+"#,
+    );
+    let other_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let other = other_listener.local_addr().unwrap().port();
+    let other_seen = spawn_one_shot_http(other_listener, |_| {
+        "HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nother".to_string()
+    });
+    let granted_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let granted = granted_listener.local_addr().unwrap().port();
+    let granted_seen = spawn_one_shot_http(granted_listener, move |target| {
+        if target == "/redirect" {
+            format!(
+                "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{other}/hop\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            )
+        } else {
+            "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok".to_string()
+        }
+    });
+    let path = script.to_str().unwrap().to_string();
+    let grant = format!(
+        "--allow-net=127.0.0.1:{granted},granted.invalid:{granted},granted.invalid:{other},scoped.invalid:443"
+    );
+    let out = oam_without_proxy_env(&[
+        "--permission",
+        &grant,
+        "--",
+        &path,
+        &granted.to_string(),
+        &other.to_string(),
+    ]);
+    let stdout = String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .replace("\r\n", "\n");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let refused = format!(r#"DENIED Net "127.0.0.1:{other}""#);
+    assert_eq!(
+        stdout,
+        [
+            "fetch 200 ok".to_string(),
+            "http 200".to_string(),
+            "undici 200 ok".to_string(),
+            // The listener answers the upgrade with a plain 200: the socket
+            // was admitted and dialled, and the handshake fails after it.
+            "ws NOT DENIED".to_string(),
+            "hook 200 ok".to_string(),
+            format!("fetch other {refused}"),
+            format!("http other {refused}"),
+            format!("undici other {refused}"),
+            format!("ws other {refused}"),
+            format!("fetch redirect {refused}"),
+            format!("undici redirect {refused}"),
+            // The name is granted on `other`, its answer only on `granted`.
+            format!("hook other {refused}"),
+            "https default NOT DENIED".to_string(),
+            r#"http default DENIED Net "scoped.invalid:80""#.to_string(),
+            "wss default NOT DENIED".to_string(),
+            r#"ws default DENIED Net "scoped.invalid:80""#.to_string(),
+        ]
+        .join("\n"),
+        "stderr: {stderr}"
+    );
+    let mut seen = granted_seen.lock().unwrap().clone();
+    seen.sort();
+    assert_eq!(
+        seen,
+        [
+            "GET /fetch",
+            "GET /hook",
+            "GET /http",
+            "GET /redirect",
+            "GET /redirect",
+            "GET /undici",
+            "GET /ws",
+        ]
+    );
+    assert!(
+        other_seen.lock().unwrap().is_empty(),
+        "a refused port was dialled: {:?}",
+        other_seen.lock().unwrap()
+    );
 }
 
 /// The request shapes conformance case 114 cannot assert, because node's own
@@ -27895,6 +28060,59 @@ process.exit(0);
          session alpn=h2 encrypted=true\n\
          2.0 GET /one alpn=h2\n\
          2.0 POST /two alpn=h2",
+        "stderr: {stderr}"
+    );
+}
+
+/// A response header value reads without the whitespace around it whichever
+/// protocol carried it (#182). Over HTTP/1 the parser under hyper trims it;
+/// an HTTP/2 value reached fetch as sent, so the same server's
+/// `x-ows:   a<TAB>b   ` read `"   a\tb   "` over h2 (which oam's fetch
+/// negotiates with an https origin) and `"a\tb"` over HTTP/1. Whitespace
+/// inside a value is kept on both.
+#[test]
+fn fetch_trims_header_value_whitespace_over_h2_as_over_http1() {
+    let bundle = write_temp("h2-ows-extra-ca/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import http2 from 'node:http2';
+import net from 'node:net';
+const names = ['x-ows', 'x-lead', 'x-trail-tab', 'x-inner'];
+const read = (r) => JSON.stringify(names.map((n) => r.headers.get(n)));
+const seen = [];
+const h2 = http2.createSecureServer({ cert: `__CERT__`, key: `__KEY__` }, (req, res) => {
+  seen.push(req.httpVersion);
+  res.setHeader('x-ows', '   a\tb   ');
+  res.setHeader('x-lead', '\t\tv');
+  res.setHeader('x-trail-tab', 'v\t\t');
+  res.setHeader('x-inner', ' a   b  ');
+  res.end('ok');
+});
+await new Promise((r) => h2.listen(0, '127.0.0.1', r));
+const a = await fetch(`https://localhost:${h2.address().port}/`);
+await a.text();
+console.log(seen.join(','), read(a));
+const h1 = net.createServer((s) => s.once('data', () => s.end(
+  'HTTP/1.1 200 OK\r\nx-ows:   a\tb   \r\nx-lead:\t\tv\r\nx-trail-tab: v\t\t\r\n' +
+  'x-inner:  a   b  \r\ncontent-length: 2\r\nconnection: close\r\n\r\nok')));
+await new Promise((r) => h1.listen(0, '127.0.0.1', r));
+const b = await fetch(`http://127.0.0.1:${h1.address().port}/`);
+await b.text();
+console.log('1.1', read(b));
+h2.close();
+h1.close();
+process.exit(0);
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("h2_ows_fetch/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "2.0 [\"a\\tb\",\"v\",\"v\",\"a   b\"]\n\
+         1.1 [\"a\\tb\",\"v\",\"v\",\"a   b\"]",
         "stderr: {stderr}"
     );
 }
