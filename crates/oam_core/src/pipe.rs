@@ -101,7 +101,7 @@ mod windows {
     /// any of it. In chunks, a chunk is handed over only once the one before
     /// it has gone into the pipe, so a write is reported done with at most
     /// its last chunk still waiting for room (see docs/node-divergences.md,
-    /// entry 49).
+    /// entry 50).
     const WRITE_CHUNK: usize = 64 * 1024;
 
     /// One end of a connected named pipe.

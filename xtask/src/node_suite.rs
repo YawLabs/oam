@@ -629,8 +629,13 @@ fn skip_marker_reason(stdout: &str) -> Option<String> {
 /// denominator isn't unfairly depressed (e.g. node:test). Returns the builtin.
 fn missing_builtin(out: &Captured) -> Option<String> {
     let hay = format!("{}\n{}", out.stderr, out.stdout);
-    if let Some(idx) = hay.find("is not a known node: builtin module") {
-        // oam: "'node:test' is not a known node: builtin module"
+    let found = hay
+        .find("is not a known node: builtin module")
+        .or_else(|| hay.find("is a Node builtin module that oam does not implement"));
+    if let Some(idx) = found {
+        // oam: "'node:test' is not a known node: builtin module", or
+        // "'node:sqlite' is a Node builtin module that oam does not
+        // implement yet (...)"
         let head = &hay[..idx];
         if let Some(q) = head.rfind('\'') {
             let pre = &head[..q];
@@ -1593,6 +1598,15 @@ mod tests {
     fn missing_builtin_extracts_unknown_node_builtin() {
         let c = cap("error[OAM-MOD0006]: 'node:test' is not a known node: builtin module");
         assert_eq!(missing_builtin(&c).as_deref(), Some("node:test"));
+    }
+
+    #[test]
+    fn missing_builtin_extracts_unimplemented_node_builtin() {
+        let c = cap(
+            "error[OAM-MOD0006]: 'node:sqlite' is a Node builtin module that oam does not \
+             implement yet (docs/node-divergences.md lists what is missing)",
+        );
+        assert_eq!(missing_builtin(&c).as_deref(), Some("node:sqlite"));
     }
 
     #[test]
