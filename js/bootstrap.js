@@ -3134,11 +3134,24 @@
     // `accept-encoding` to a request and decodes no response body -- a
     // `content-encoding: gzip` response is the gzip bytes, with its
     // `content-encoding` and `content-length`, for the program to decode.
-    // The Fetch client's negotiation is fetch()'s alone (and, for now,
-    // undici.request's, which shares its entry).
+    // The Fetch client's negotiation is fetch()'s alone.
     if (rawPayload && init.__oamRawExchange === true) {
       request.decode = false;
       request.default_headers = false;
+    }
+    // undici.request is the same: its Client writes the caller's headers
+    // and its own `host`, `connection: keep-alive` (unless the caller set
+    // a `connection`) and framing, with no `accept`, `user-agent` or
+    // `accept-encoding`, and hands back the body as it came -- a
+    // `content-encoding: gzip` response is the gzip bytes, its
+    // `content-encoding` and `content-length` kept (measured on node
+    // v22.22.2 + undici 6.29.0). Only fetch negotiates and decodes.
+    if (!fetchSemantics && dispatchSemantics && !rawPayload) {
+      request.decode = false;
+      request.default_headers = false;
+      if (!request.headers.some((h) => String(h[0]).toLowerCase() === "connection")) {
+        headers.unshift(["connection", "keep-alive"]);
+      }
     }
     // fetch's own `redirect: "manual"` returns the 3xx (its status, headers
     // and body; `redirected` false, `url` the request's) and `"error"` fails
@@ -3223,7 +3236,7 @@
       // origin as `host`, as undici's Client writes it -- unless the caller
       // set one, which undici.request sends (fetch has dropped any).
       if (policy.pinnedHost !== undefined && !request.headers.some((h) => String(h[0]).toLowerCase() === "host")) {
-        request.headers = [...request.headers, ["host", policy.pinnedHost]];
+        headers.push(["host", policy.pinnedHost]);
       }
       if (policy.connector) {
         connector = policy.connector;

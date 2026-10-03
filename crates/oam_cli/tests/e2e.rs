@@ -8153,6 +8153,78 @@ reached the server ["POST /k","GET /l","GET /mocked"]"##;
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// undici.request sends what undici's request() sends -- the caller's
+/// headers, `host`, `connection: keep-alive` unless the caller set one, and
+/// the framing; no `accept`, `user-agent` or `accept-encoding` -- and hands
+/// back the body as it came: a gzip response is the gzip bytes with its
+/// `content-encoding` and `content-length`. fetch still negotiates and
+/// decodes; a streamed body goes out chunked, a GET's too, also through a
+/// Pool bound to another origin. Up to the review of #206 undici.request
+/// shared fetch's negotiation, so it sent all three, decoded, and its mock
+/// matchers saw them. Expected output is node v22.22.2 + undici 6.29.0's line for line,
+/// bar the last: a reply callback sees the headers as sent, lowercased and
+/// with the framing `content-length`, where undici's shows the caller's
+/// object (`{"X-Up":"A"}`) -- docs/node-divergences.md.
+#[test]
+fn undici_request_sends_the_callers_headers_and_decodes_nothing() {
+    let script = write_temp(
+        "undici_request_wire/main.mjs",
+        r##"import http from 'node:http';
+import zlib from 'node:zlib';
+import { Readable } from 'node:stream';
+import { request, MockAgent, Pool } from 'undici';
+const seen = [];
+const srv = http.createServer((q, s) => {
+  const names = Object.keys(q.headers).sort();
+  seen.push(q.url + ' ' + names.map((n) => n + '=' + (n === 'host' ? 'H' : q.headers[n])).join(' '));
+  const z = zlib.gzipSync('hello');
+  s.writeHead(200, { 'content-encoding': 'gzip', 'content-length': z.length });
+  s.end(z);
+});
+await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+const origin = 'http://127.0.0.1:' + srv.address().port;
+const show = async (name, p) => {
+  const r = await p;
+  const b = Buffer.from(await r.body.arrayBuffer());
+  console.log(name, r.statusCode, r.headers['content-encoding'], r.headers['content-length'], b.length, b.subarray(0, 2).toString('hex'));
+};
+await show('post', request(origin + '/post', { method: 'POST', body: 'raw', headers: { 'X-Up': 'A' } }));
+await show('get', request(origin + '/get'));
+await show('own accept-encoding', request(origin + '/ae', { headers: { 'accept-encoding': 'gzip' } }));
+await show('own connection', request(origin + '/close', { headers: { connection: 'close' } }));
+await show('streamed GET', request(origin + '/stream', { method: 'GET', body: Readable.from(['g']) }));
+const other = 'http://localhost:' + srv.address().port;
+await show('streamed via a pool for another origin', request(other + '/pinned', { method: 'PUT', body: Readable.from(['p']), dispatcher: new Pool(origin) }));
+const r = await fetch(origin + '/fetch');
+console.log('fetch still decodes', await r.text());
+console.log(seen.filter((l) => !l.startsWith('/fetch')).join('\n'));
+const agent = new MockAgent();
+agent.disableNetConnect();
+agent.get(origin).intercept({ path: '/cb', method: 'POST' }).reply(200, (o) => JSON.stringify(o.headers));
+const m = await request(origin + '/cb', { method: 'POST', body: 'raw', headers: { 'X-Up': 'A' }, dispatcher: agent });
+console.log('mock sees', await m.body.text());
+srv.close();
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = r##"post 200 gzip 25 25 1f8b
+get 200 gzip 25 25 1f8b
+own accept-encoding 200 gzip 25 25 1f8b
+own connection 200 gzip 25 25 1f8b
+streamed GET 200 gzip 25 25 1f8b
+streamed via a pool for another origin 200 gzip 25 25 1f8b
+fetch still decodes hello
+/post connection=keep-alive content-length=3 host=H x-up=A
+/get connection=keep-alive host=H
+/ae accept-encoding=gzip connection=keep-alive host=H
+/close connection=close host=H
+/stream connection=keep-alive host=H transfer-encoding=chunked
+/pinned connection=keep-alive host=H transfer-encoding=chunked
+mock sees {"x-up":"A","content-length":"3"}"##;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
 /// A dispatcher after close() (or destroy()) sends nothing: undici's dispatch()
 /// refuses every request with ClientDestroyedError -- wrapped by fetch,
 /// as itself from undici.request and the dispatcher's request() -- for an

@@ -925,7 +925,14 @@ This is `fetch` only. `http.request` goes through the same native op but asks it
 raw exchange (#148): the body arrives as the server sent it with both headers intact, as
 in Node, so its callers decode for themselves (`res.pipe(zlib.createGunzip())` when
 `content-encoding` says gzip) -- `conformance/cases/192-http-request-raw-body-and-headers.mjs`.
-Up to 0.17.1 it got the decoded body too, which is why the headers had to go: keeping
+`undici.request` (and a dispatcher's `request()`) asks for it too, as undici's request()
+decodes nothing and adds no `accept`, `user-agent` or `accept-encoding`: it sends the
+caller's headers with `host`, `connection: keep-alive` and the framing, and a
+`content-encoding: gzip` response is the gzip bytes with both headers
+(`undici_request_sends_the_callers_headers_and_decodes_nothing`, e2e, Node + undici 6.29.0
+output; up to 0.17.1 it negotiated and decoded as `fetch` does). The header names go out
+lowercased and in another order than undici writes them, as `fetch`'s (entry 38).
+Up to 0.17.1 `http.request` got the decoded body too, which is why the headers had to go: keeping
 `content-encoding` on a body oam had already decoded sent that code into a second, failing
 decode. Nothing shares the decoded payload with `http.request` any more, so `fetch` can
 now keep Node's headers; it does not yet.
@@ -1722,8 +1729,14 @@ what reaches them). What differs:
   the body as given -- so a body sent as bytes or as a stream matches a string matcher here,
   and does not under undici (which sees a `Uint8Array`, or `[object ReadableStream]`). The
   headers are the ones sent, names lowercased, without `host`, `connection` and
-  `transfer-encoding`: for `undici.request` that includes what the transport adds (a
-  `content-length`), where undici's request() shows the caller's object as given. A reply
+  `transfer-encoding`. For `fetch` that includes everything fetch adds (`accept`,
+  `accept-language`, `sec-fetch-mode`, `accept-encoding`, `user-agent`, ...), as undici's
+  fetch also hands its mock the headers it built; for `undici.request` it is the caller's
+  headers plus the `content-length` the body is framed with -- `{ 'x-up': 'A',
+  'content-length': '3' }` for a POST of `'raw'` with `{ 'X-Up': 'A' }`, where undici's
+  request() shows the caller's object as given, `{ 'X-Up': 'A' }`. (Up to the review of #206
+  `undici.request` also sent, and its matchers saw, `accept`, `user-agent` and
+  `accept-encoding`, which undici's request() does not send; entry 32.) A reply
   callback's `opts` carry `origin`, `path`, `method`, `body` and `headers`; undici's fetch also
   passes `maxRedirections` and `upgrade`.
 - **Trailers** set with `reply(..., { trailers })` or `defaultReplyTrailers()` are not sent:
