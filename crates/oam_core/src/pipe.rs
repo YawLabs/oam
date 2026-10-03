@@ -411,48 +411,71 @@ mod windows {
     /// the dials past those wait for a turn, asleep. Dropped, the turn goes
     /// to the next, and the name's entry goes with its last user.
     struct BusyTurn {
-        name: String,
+        // Declared first, so the permit is back before the use is counted
+        // out.
         _permit: tokio::sync::OwnedSemaphorePermit,
+        _user: GateUser,
     }
 
-    type BusyGates =
-        std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Semaphore>>>;
+    /// A name's gate and how many dials use it: those holding a turn and
+    /// those waiting for one.
+    struct Gate {
+        semaphore: Arc<tokio::sync::Semaphore>,
+        users: usize,
+    }
+
+    type BusyGates = std::sync::Mutex<std::collections::HashMap<String, Gate>>;
 
     fn busy_gates() -> &'static BusyGates {
         static GATES: std::sync::OnceLock<BusyGates> = std::sync::OnceLock::new();
         GATES.get_or_init(Default::default)
     }
 
-    impl BusyTurn {
-        async fn take(name: &str) -> BusyTurn {
-            let gate = busy_gates()
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .entry(name.to_string())
-                .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(BUSY_WAITERS)))
-                .clone();
-            // Dropped before the permit is had (the dial abandoned), the
-            // clone is just released: the entry goes with a later turn.
-            let permit = gate
-                .acquire_owned()
-                .await
-                .expect("the gate is never closed");
-            BusyTurn {
-                name: name.to_string(),
-                _permit: permit,
+    /// One dial's use of a name's gate, from before it waits for a turn
+    /// until it gives the turn back or stops waiting. The last use to go
+    /// removes the name's entry. Counted, not read off the semaphore's
+    /// `Arc` count: a waiter that was handed a permit and abandoned before
+    /// it was polled never made a turn, and the entry outlived it.
+    struct GateUser {
+        name: String,
+    }
+
+    impl Drop for GateUser {
+        fn drop(&mut self) {
+            let mut gates = busy_gates().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(gate) = gates.get_mut(&self.name) {
+                gate.users -= 1;
+                if gate.users == 0 {
+                    gates.remove(&self.name);
+                }
             }
         }
     }
 
-    impl Drop for BusyTurn {
-        fn drop(&mut self) {
-            let mut gates = busy_gates().lock().unwrap_or_else(|e| e.into_inner());
-            // Ours and the map's: nobody else holds or waits for a turn.
-            if gates
-                .get(&self.name)
-                .is_some_and(|gate| Arc::strong_count(gate) == 2)
-            {
-                gates.remove(&self.name);
+    impl BusyTurn {
+        async fn take(name: &str) -> BusyTurn {
+            let (semaphore, user) = {
+                let mut gates = busy_gates().lock().unwrap_or_else(|e| e.into_inner());
+                let gate = gates.entry(name.to_string()).or_insert_with(|| Gate {
+                    semaphore: Arc::new(tokio::sync::Semaphore::new(BUSY_WAITERS)),
+                    users: 0,
+                });
+                gate.users += 1;
+                let user = GateUser {
+                    name: name.to_string(),
+                };
+                (gate.semaphore.clone(), user)
+            };
+            // Dropped before the permit is had (the dial abandoned), `user`
+            // counts this use out, and a permit already handed to it goes
+            // back to the semaphore.
+            let permit = semaphore
+                .acquire_owned()
+                .await
+                .expect("the gate is never closed");
+            BusyTurn {
+                _permit: permit,
+                _user: user,
             }
         }
     }
@@ -638,6 +661,75 @@ mod windows {
                 "the late flush was not cancelled"
             );
             drop(server);
+        }
+
+        fn has_gate(name: &str) -> bool {
+            busy_gates()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(name)
+        }
+
+        /// Every turn at once, and a dial queued behind them.
+        async fn every_turn_and_a_waiter(
+            name: &str,
+        ) -> (
+            Vec<BusyTurn>,
+            std::pin::Pin<Box<impl std::future::Future<Output = BusyTurn>>>,
+        ) {
+            let mut turns = Vec::new();
+            for _ in 0..BUSY_WAITERS {
+                turns.push(BusyTurn::take(name).await);
+            }
+            let mut waiter = Box::pin(BusyTurn::take(name));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut waiter)
+                    .await
+                    .is_err(),
+                "the fifth dial waits for a turn"
+            );
+            (turns, waiter)
+        }
+
+        /// Regression guard: a turn's drop removed the name's entry only
+        /// when the semaphore's `Arc` count said nobody else used it, read
+        /// before its own permit went back. A queued dial that was handed
+        /// that permit and abandoned before it was polled made no turn, so
+        /// nothing removed the entry: one left in the map for good per pipe
+        /// name.
+        #[tokio::test]
+        async fn a_pipe_names_busy_gate_goes_with_its_last_user() {
+            // A turn taken and given back.
+            let name = pipe_name("gate-one");
+            drop(BusyTurn::take(&name).await);
+            assert!(!has_gate(&name));
+
+            // The last turn goes while a dial waits, the waiter is handed
+            // its permit, and is abandoned before it is polled again.
+            let name = pipe_name("gate-handed");
+            let (turns, waiter) = every_turn_and_a_waiter(&name).await;
+            drop(turns);
+            assert!(has_gate(&name), "the waiter still uses the gate");
+            drop(waiter);
+            assert!(!has_gate(&name), "the abandoned waiter left the gate");
+
+            // A waiter abandoned while still queued, then the turns go.
+            let name = pipe_name("gate-queued");
+            let (turns, waiter) = every_turn_and_a_waiter(&name).await;
+            drop(waiter);
+            assert!(has_gate(&name));
+            drop(turns);
+            assert!(!has_gate(&name));
+
+            // A waiter that gets its turn and gives it back.
+            let name = pipe_name("gate-served");
+            let (mut turns, waiter) = every_turn_and_a_waiter(&name).await;
+            drop(turns.pop());
+            let turn = waiter.await;
+            drop(turns);
+            assert!(has_gate(&name));
+            drop(turn);
+            assert!(!has_gate(&name));
         }
     }
 }
