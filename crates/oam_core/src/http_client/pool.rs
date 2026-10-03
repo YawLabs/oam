@@ -52,14 +52,21 @@ use hyper::client::conn::{http1, http2};
 use hyper_util::rt::TokioExecutor;
 
 use super::connector::{ConnCloser, ConnInfo, ConnStats, OamConnector};
+use super::redirect::{self, Rules};
 use super::sent::Dispatched;
+use super::tls_config::Alpn;
 use super::transport::HeadAwaitsBody;
 use super::{BoxError, ReqBody};
 
 /// The pool is keyed on scheme + authority exactly as hyper-util was, so a
 /// pooled connection is only ever reused for the origin it was opened to and
-/// `host` and `host:443` stay distinct.
-type PoolKey = (Scheme, Authority);
+/// `host` and `host:443` stay distinct -- and, for https, on the ALPN offer
+/// it was opened with: a request that offers `http/1.1` alone never rides
+/// an h2 connection an `allowH2` request opened to the same origin, and
+/// fetch and `https.request` keep to their own connections, as undici's pool
+/// and an https.Agent do in node. (An http origin offers nothing; its key
+/// carries [`Alpn::None`] whoever asks.)
+type PoolKey = (Scheme, Authority, Alpn);
 type H1Sender = http1::SendRequest<ReqBody>;
 type H2Sender = http2::SendRequest<ReqBody>;
 
@@ -152,13 +159,20 @@ impl Pool {
     /// `connect_timeout` bounds a connection this request has to open
     /// (`OamConnector::connect_within`); it is the request's own, so a fetch
     /// and an `http.request` sharing the pool each connect under theirs.
+    /// `alpn` is what a connection this request opens to an https origin
+    /// offers, and which pooled connections it may take. `follows` names the
+    /// rules a 3xx answer to it is followed by, if it is: a redirect whose
+    /// next hop keeps a method that is not idempotent never sends that hop
+    /// on this connection ([`retires_for_the_hop`]).
     pub(crate) async fn request(
         &self,
         mut req: Request<ReqBody>,
         close_requested: bool,
         connect_timeout: Option<Duration>,
+        alpn: Alpn,
+        follows: Option<Rules>,
     ) -> Result<Response<Incoming>, PoolFail> {
-        let Some(key) = pool_key(req.uri()) else {
+        let Some(key) = pool_key(req.uri(), alpn) else {
             return Err(PoolFail {
                 error: PoolError::connect(Box::<dyn std::error::Error + Send + Sync>::from(
                     "request url has no scheme or authority",
@@ -169,6 +183,11 @@ impl Pool {
             });
         };
         let is_connect = req.method() == Method::CONNECT;
+        // Only a request that could not be sent again needs its method after
+        // the send (a standard method's clone allocates nothing).
+        let unresendable = follows
+            .filter(|_| !super::send::is_idempotent(req.method()))
+            .map(|rules| (rules, req.method().clone()));
         // hyper-util saves the request's absolute URI and restores it before
         // each attempt's origin/absolute rewrite, so a retry does not rewrite an
         // already-rewritten URI.
@@ -229,7 +248,17 @@ impl Pool {
                     // as reused (the result is only needed on a failure).
                     attempt_stats.count_one();
                     response.extensions_mut().insert(info.clone());
-                    self.on_success(proto, conn_key, info, proxied, &response, close_requested);
+                    let retire = unresendable.as_ref().is_some_and(|(rules, method)| {
+                        retires_for_the_hop(&response, method, *rules)
+                    });
+                    self.on_success(
+                        proto,
+                        conn_key,
+                        info,
+                        proxied,
+                        &response,
+                        close_requested || retire,
+                    );
                     return Ok(response);
                 }
                 SendResult::Unsent(returned, error, proto) => {
@@ -357,7 +386,7 @@ impl Pool {
         let conn = self
             .connector
             .clone()
-            .connect_within(uri, connect_timeout)
+            .connect_within(uri, key.2, connect_timeout)
             .await?;
         let is_h2 = conn.negotiated_h2();
         let proxied = conn.is_proxied();
@@ -658,20 +687,45 @@ impl std::error::Error for PoolError {
     }
 }
 
-/// The pool key for a request URI: `(scheme, authority)`, as written.
-fn pool_key(uri: &Uri) -> Option<PoolKey> {
-    Some((uri.scheme()?.clone(), uri.authority()?.clone()))
+/// The pool key for a request URI: `(scheme, authority)`, as written, and the
+/// ALPN offer for an https one.
+fn pool_key(uri: &Uri, alpn: Alpn) -> Option<PoolKey> {
+    let scheme = uri.scheme()?;
+    let alpn = if *scheme == Scheme::HTTPS {
+        alpn
+    } else {
+        Alpn::None
+    };
+    Some((scheme.clone(), uri.authority()?.clone(), alpn))
 }
 
 /// `scheme://authority/` -- the dst the connector dials for `key` (hyper-util's
 /// `domain_as_uri`).
-fn domain_as_uri((scheme, authority): &PoolKey) -> Uri {
+fn domain_as_uri((scheme, authority, _): &PoolKey) -> Uri {
     Uri::builder()
         .scheme(scheme.clone())
         .authority(authority.clone())
         .path_and_query("/")
         .build()
         .expect("scheme and authority make a valid uri")
+}
+
+/// `response` is a redirect the fetch loop follows with a hop whose method
+/// -- `method`, kept under `rules` -- is not idempotent (#155): a POST that a
+/// 307 or 308 sends on, say. Such a hop never goes out on the connection the
+/// 3xx came on, which is then not pooled. A server that answers with a 3xx
+/// often closes the connection right behind it, and the hop, sent at once,
+/// could be written into that close before its FIN arrived: a request oam
+/// may not send twice (RFC 9110 s9.2.2), so the fetch failed where node's,
+/// whose event loop reads the FIN before it writes, succeeds. The hop dials
+/// a connection of its own instead -- a cost on this path alone; a hop that
+/// may be resent (a GET, or the GET a 302 turns a POST into) still takes
+/// the pooled connection, and the one resend covers it.
+fn retires_for_the_hop(response: &Response<Incoming>, method: &Method, rules: Rules) -> bool {
+    let status = response.status().as_u16();
+    redirect::is_redirect_status(status)
+        && response.headers().contains_key(http::header::LOCATION)
+        && !redirect::rewrites_to_get(status, method, rules)
 }
 
 /// Does the header map carry `Connection: close`?

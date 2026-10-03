@@ -34,7 +34,8 @@ use crate::net_connect::{ConnectError, DEFAULT_ATTEMPT_TIMEOUT};
 
 pub use super::connector::TlsSource;
 use super::connector::{HandshakeFailed, NoProtocolsAvailable};
-use super::tls_config::TlsRange;
+use super::redirect::Rules;
+use super::tls_config::{Alpn, TlsRange};
 use std::sync::atomic::AtomicU8;
 
 /// The proxy rules a transport applies to its pooled requests.
@@ -142,6 +143,7 @@ impl HttpTransport {
             attempt_timeout,
             connect_timeout: None,
             tls_range,
+            alpn: Alpn::default(),
             hooked,
             supplied: None,
         }
@@ -170,16 +172,31 @@ impl HttpTransport {
             attempt_timeout,
             connect_timeout: None,
             tls_range,
+            alpn: Alpn::default(),
             hooked: None,
             supplied: Some(Supplied { conns, pool }),
         }
     }
 
-    /// Send one request (one hop) on `route`.
+    /// Send one request (one hop) on `route`, whose 3xx answer is not
+    /// followed.
     pub async fn send(
         &self,
         route: &Route,
         request: http::Request<ReqBody>,
+    ) -> Result<http::Response<Incoming>, SendError> {
+        self.send_following(route, request, None).await
+    }
+
+    /// Send one request (one hop) on `route`. `follows` names the rules its
+    /// 3xx answer is followed by, if it is: the connection such an answer
+    /// came on is not pooled when the next hop's method is not idempotent
+    /// (`pool::retires_for_the_hop`, #155).
+    pub async fn send_following(
+        &self,
+        route: &Route,
+        request: http::Request<ReqBody>,
+        follows: Option<Rules>,
     ) -> Result<http::Response<Incoming>, SendError> {
         // Every route's connector handshakes through the shared state, so
         // the request's version range goes there whichever pool sends it.
@@ -212,7 +229,13 @@ impl HttpTransport {
                 })
             });
         match pool
-            .request(request, close_requested, route.connect_timeout)
+            .request(
+                request,
+                close_requested,
+                route.connect_timeout,
+                route.alpn,
+                follows,
+            )
             .await
         {
             Ok(response) => Ok(response),
@@ -269,6 +292,8 @@ pub struct Route {
     /// The TLS version range its https handshakes run in: node's live
     /// defaults as JS resolved them for this request.
     tls_range: TlsRange,
+    /// What its https handshakes offer by ALPN (see [`Route::with_alpn`]).
+    alpn: Alpn,
     hooked: Option<Hooked>,
     supplied: Option<Supplied>,
 }
@@ -293,6 +318,16 @@ impl Route {
     /// function made the connection (and applied its own timeout).
     pub fn with_connect_timeout(mut self, timeout: Option<Duration>) -> Route {
         self.connect_timeout = timeout;
+        self
+    }
+
+    /// Offer `alpn` to every https origin this route connects to, and reuse
+    /// only connections opened with the same offer. A route offers
+    /// `http/1.1` alone until told ([`Alpn::Http1`], node's fetch); on a
+    /// supplied route the dispatcher's own `connect` function made the
+    /// socket, ALPN included, and this changes nothing.
+    pub fn with_alpn(mut self, alpn: Alpn) -> Route {
+        self.alpn = alpn;
         self
     }
 

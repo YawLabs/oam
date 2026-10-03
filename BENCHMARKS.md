@@ -41,12 +41,15 @@ All times in milliseconds. Lower is better.
 | cold-start | 59.58 | 113.42 | 307.97 | 0.53x |
 | url-parse | 6.53 | 9.30 | 5.43 | 0.70x |
 | http-throughput | 47.78 | 107.75 | 33.98 | 0.44x |
+| http-keepalive-latency | 0.25 | 0.25 | 0.07 | 1.01x |
 | fs-read | 30.05 | 28.91 | 38.73 | 1.04x |
 | json-parse | 74.50 | 115.99 | 91.15 | 0.64x |
 | crypto-hash | 223.89 | 292.29 | 38.99 | 0.77x |
 | mcp-cold-start | 35.00 | 250.87 | 483.19 | 0.14x |
 | mcp-idle-rss | 25.23 | 61.34 | 98.43 | 0.41x |
 | mcp-first-call-latency | 0.34 | 2.40 | 5.04 | 0.14x |
+
+Re-measured by a filtered run (`--case`), so from a different tree than the `Commit` line above: http-keepalive-latency/oam at `031e7e8` (oam 0.17.1), http-keepalive-latency/node at `031e7e8` (v22.22.2), http-keepalive-latency/bun at `031e7e8` (1.3.14).
 
 ## TypeScript load path
 
@@ -71,6 +74,7 @@ Commit `e9358cd` | release | host windows-aarch64 | oam 0.13.0 | v22.22.2
 - **cold-start** -- wall-clock time from process spawn to exit (`console.log('ok')`). Measured by the harness, not JS.
 - **url-parse** -- 10,000 `new URL()` constructions across 5 representative URLs.
 - **http-throughput** -- node:http server + fetch client, 200 sequential requests on loopback.
+- **http-keepalive-latency** -- milliseconds PER REQUEST of a small fetch on one warm pooled connection: node:http server on loopback, 50 warm-up fetches, then 10 batches of 200 sequential fetches of a 2-byte body; the median batch per run. The transport's per-request work, without connection setup (#183).
 - **fs-read** -- `fs.readFileSync` of a 4KB file, 1,000 iterations.
 - **json-parse** -- `JSON.parse(JSON.stringify(obj))` round-trip on a 100-user payload, 1,000 iterations.
 - **crypto-hash** -- `crypto.createHash('sha256').update(64KB).digest()`, 1,000 iterations.

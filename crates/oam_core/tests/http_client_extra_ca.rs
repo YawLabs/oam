@@ -20,7 +20,7 @@ use http_body_util::BodyExt;
 use oam_core::OpOutcome;
 use oam_core::http_client::tls_config::platform_with_extra_roots;
 use oam_core::http_client::transport::empty_body;
-use oam_core::http_client::{HttpTransport, ProxySource, SendError, TlsRange, TlsSource};
+use oam_core::http_client::{Alpn, HttpTransport, ProxySource, SendError, TlsRange, TlsSource};
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
 
@@ -60,11 +60,15 @@ fn transport_trusting(extra: &[CertificateDer<'static>]) -> HttpTransport {
     transport_with_tls(TlsSource::Fixed(configs), ProxySource::None)
 }
 
+/// GET `target` on a route that offers `h2` (`allowH2`): the origins here
+/// are h2-only servers, and what is under test is the trust, not the ALPN.
 async fn get(
     transport: &HttpTransport,
     target: &str,
 ) -> Result<http::Response<hyper::body::Incoming>, SendError> {
-    let route = transport.route(false, ATTEMPT, TlsRange::Both);
+    let route = transport
+        .route(false, ATTEMPT, TlsRange::Both)
+        .with_alpn(Alpn::AllowH2);
     let request = http::Request::builder()
         .method("GET")
         .uri(target)
@@ -149,7 +153,9 @@ async fn an_anchored_chain_under_the_wrong_name_is_refused_in_node_s_terms() {
         // The leaf names localhost and 127.0.0.1; a lookup-hooked route
         // dials 127.0.0.1 for a host the leaf does not name.
         let target = format!("https://localhost.test:{}/", origin.port);
-        let route = transport.route(true, ATTEMPT, TlsRange::Both);
+        let route = transport
+            .route(true, ATTEMPT, TlsRange::Both)
+            .with_alpn(Alpn::AllowH2);
         route.set_addrs(
             &format!("localhost.test:{}", origin.port),
             vec!["127.0.0.1".parse().unwrap()],

@@ -3,12 +3,19 @@
 //! reqwest 0.13.4 built this from oam's builder (async_impl/client.rs
 //! 686-842): every protocol version the provider offers, the platform
 //! verifier (or the platform verifier plus the added roots when
-//! NODE_EXTRA_CA_CERTS supplied some), SNI on, ALPN `h2, http/1.1` towards
-//! the origin, and a copy with ALPN cleared for the handshake with an
-//! `https://` proxy (connect.rs:383-390). Node's undici and https share one
-//! root store with tls.connect, so the extra CAs apply here as they do there.
+//! NODE_EXTRA_CA_CERTS supplied some), SNI on, and a copy with ALPN cleared
+//! for the handshake with an `https://` proxy (connect.rs:383-390). Node's
+//! undici and https share one root store with tls.connect, so the extra CAs
+//! apply here as they do there.
 //!
-//! Two differences from reqwest, both deliberate:
+//! The ALPN list towards the origin is the request's ([`Alpn`]), as node's
+//! clients each offer their own: undici (`fetch`, `undici.request`) offers
+//! `http/1.1` alone, or `http/1.1, h2` for a dispatcher with `allowH2`, and
+//! `https.request` offers none. reqwest offered `h2, http/1.1` to every
+//! origin, so oam's fetch and https.request spoke HTTP/2 to a server that
+//! picked it, where node's never do (#176).
+//!
+//! Two more differences from reqwest, both deliberate:
 //!
 //! - The platform configs are built on the FIRST https request, not at boot.
 //!   Building the verifier reads the system store (rustls-native-certs on
@@ -37,28 +44,63 @@ use rustls::{CertificateError, ClientConfig, DigitallySignedStruct, SignatureSch
 
 use crate::tls::{ExtraCaVerdict, ExtraCaVerifier, NodeCertRefusal, VerifyFailure};
 
-/// The two client configs a transport uses.
+/// The ALPN protocols one request offers its origin: what the node client
+/// it stands for offers (measured on node v22.22.2, undici 6.24.1, against
+/// an `http2.createSecureServer({ allowHTTP1: true })` reporting what it
+/// negotiated). The serde names are what JS sends (`FetchRequest::alpn`).
+#[derive(serde::Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum Alpn {
+    /// No ALPN extension at all: node's `https.request`, whose server sees
+    /// `alpnProtocol === false`. Also every handshake with an `https://`
+    /// proxy, whose CONNECT or absolute-form request h2 cannot carry.
+    None,
+    /// `http/1.1` alone: undici's connector (`fetch`, `undici.request`) with
+    /// `allowH2` off, its default and the global dispatcher's.
+    #[default]
+    Http1,
+    /// `http/1.1, h2`, in undici's order: a dispatcher with `allowH2: true`.
+    /// The origin picks, and an `h2` pick makes the connection HTTP/2.
+    AllowH2,
+}
+
+/// The client configs a transport uses: one trust, one config per ALPN
+/// offer ([`Alpn`]), SNI on in each.
 #[derive(Clone)]
 pub struct TlsConfigs {
-    /// Origin handshakes: ALPN `h2, http/1.1`, SNI on.
-    pub dst: Arc<ClientConfig>,
-    /// The handshake with an `https://` proxy: the same trust with ALPN
-    /// cleared, so an http/1.1 CONNECT or absolute-form request is never
-    /// negotiated onto h2.
-    pub proxy: Arc<ClientConfig>,
+    /// [`Alpn::Http1`]: `http/1.1`.
+    pub http1: Arc<ClientConfig>,
+    /// [`Alpn::AllowH2`]: `http/1.1, h2`.
+    pub allow_h2: Arc<ClientConfig>,
+    /// [`Alpn::None`]: no ALPN; also the handshake with an `https://` proxy,
+    /// so an http/1.1 CONNECT or absolute-form request is never negotiated
+    /// onto h2.
+    pub none: Arc<ClientConfig>,
 }
 
 impl TlsConfigs {
-    /// The pair derived from one base config: `dst` gets SNI and the ALPN
-    /// list, `proxy` is the same config with no ALPN.
+    /// The three derived from one base config: SNI on, and each with its
+    /// ALPN list.
     pub fn from_client_config(mut config: ClientConfig) -> TlsConfigs {
         config.enable_sni = true;
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-        let mut proxy = config.clone();
-        proxy.alpn_protocols.clear();
+        let with = |alpn: &[&[u8]]| {
+            let mut config = config.clone();
+            config.alpn_protocols = alpn.iter().map(|name| name.to_vec()).collect();
+            Arc::new(config)
+        };
         TlsConfigs {
-            dst: Arc::new(config),
-            proxy: Arc::new(proxy),
+            http1: with(&[b"http/1.1"]),
+            allow_h2: with(&[b"http/1.1", b"h2"]),
+            none: with(&[]),
+        }
+    }
+
+    /// The config that offers `alpn`.
+    pub fn offering(&self, alpn: Alpn) -> &Arc<ClientConfig> {
+        match alpn {
+            Alpn::None => &self.none,
+            Alpn::Http1 => &self.http1,
+            Alpn::AllowH2 => &self.allow_h2,
         }
     }
 }
@@ -141,7 +183,7 @@ static PLATFORM: [OnceLock<Result<TlsConfigs, String>>; 3] =
 /// The platform-verifier configs (plus NODE_EXTRA_CA_CERTS) for `range`,
 /// built once per process on first use. The build runs under
 /// `spawn_blocking` (it may read the system store from disk); later calls
-/// clone two `Arc`s. Two first requests racing may both build; the first
+/// clone three `Arc`s. Two first requests racing may both build; the first
 /// result stored wins. `TlsRange::None` has no config: the connector refuses
 /// the handshake before asking.
 pub async fn platform(range: TlsRange) -> Result<TlsConfigs, String> {

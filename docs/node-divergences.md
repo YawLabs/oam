@@ -1945,27 +1945,39 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   with keep-alive and then FINs, the hop can be written before the server's FIN arrives.
   Node's hop goes out later, after its event loop has read the FIN. A FIN that has already
   reached the kernel is read before the write in oam too, and the hop goes to another
-  connection unsent. What differs is the FIN still in flight, measured on Windows arm64
-  against a node server (320 processes of 50 fetches, 8 at a time):
-  - **FIN at once, `GET` + `302`.** No fetch fails in either runtime, but in oam the server
-    receives the hop twice for 7-9% of fetches (1,177 and 1,383 of 16,000): the first copy
-    is written into the closing connection and read unanswered, and oam sends it once more.
-    Node's server receives every hop once. With 64 concurrent chains, oam failed 424 and
-    1,120 of 64,000 fetches (the one resend met another closing connection) where Node
-    failed 15.
-  - **FIN at once, `POST` + `307`.** A `POST` is never sent again -- oam did write it and
-    cannot know the server ignored it -- so it fails, its cause undici's `SocketError`
-    (`other side closed`; it was the uncoded `error sending request for url (...)` when
-    measured): 595 and 1,137 of 16,000 fetches in oam, none in Node.
+  connection unsent. A hop that could not be sent again -- one whose method is not
+  idempotent, a `POST` that a `307` or `308` sends on, a `PATCH` that a `302` does -- never
+  goes out on the connection its 3xx came on, and that connection is not pooled for
+  anything else either (#155): the hop dials a connection of its own, a cost on that path
+  alone. A connection whose response says `Connection: close` is never reused, as before.
+  Measured on Windows arm64 against a node server, one process with 8 concurrent chains of
+  125 fetches, release builds:
+  - **FIN at once, `POST` + `307`.** Node: none of 1,000 fails. oam up to 0.17.1: 29 of 1,000
+    failed (a `POST` is never sent again -- oam did write it and cannot know the server
+    ignored it -- so the fetch fails, its cause undici's `SocketError`, `other side
+    closed`); the issue's earlier measurement, 320 processes of 50 fetches 8 at a time, saw
+    595 and 1,137 of 16,000. oam now: none of 1,000 fails, and the server reads every hop
+    once (e2e guard `a_post_never_goes_out_on_the_connection_a_307_came_on`).
+  - **FIN at once, `GET` + `302`.** The hop may be sent again, so it still takes the pooled
+    connection, and what differs remains: no fetch fails in Node, and in oam the server
+    receives 21-32 of 1,000 hops twice -- the first copy written into the closing connection
+    and read unanswered, then oam's one resend -- and 1-2 of 1,000 fetches fail, the resend
+    meeting another closing connection. Node's server receives every hop once.
+  - **No redirect: `200` + keep-alive, then FIN at once.** The next request takes the
+    pooled connection, as above: 19-29 of 1,000 `POST`s fail in oam and 2-3 `GET`s, where
+    Node fails none, and the server reads 36-37 of 1,000 `GET`s twice. With one request at a
+    time per process (100 processes of 50, 8 at a time), 6-9 of 5,000 `POST`s fail.
   - **FIN 0-5 ms after the 3xx.** Here Node loses the race too, and fails with
-    `UND_ERR_SOCKET`: 2,561 of 16,000 `GET`s and 2,587 `POST`s. oam failed no `GET` (its
-    one resend) and 1,948 `POST`s.
+    `UND_ERR_SOCKET`: 2,561 of 16,000 `GET`s and 2,587 `POST`s, where oam up to 0.17.1 failed
+    no `GET` (its one resend) and 1,948 `POST`s. Not measured since the `POST` hop dials its
+    own connection.
   - **Server in the same process.** With oam as both server and client, the server's
     `socket.end()` sends its FIN only once the write before it has completed and JS has
-    run again, so the hop wins far more often: 45-60% of `POST` + `307` fetches
-    failed, and 60-69 of 6,000 `GET`s with eight concurrent chains, where Node, as both,
-    fails none. Node's client against the same oam server failed none either; oam's client
-    against a Node server failed 579 of 5,000.
+    run again, so the hop wins far more often. Up to 0.17.1 45-60% of `POST` + `307`
+    fetches failed (the hop now dials its own connection; not re-measured), and 60-69 of
+    6,000 `GET`s with eight concurrent chains, where Node, as both, fails none. Node's
+    client against the same oam server failed none either; oam's client against a Node
+    server failed 579 of 5,000.
 
   oam resends an idempotent request (`GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`, `TRACE`) once
   per hop, only when the dead connection had carried an earlier request and not a byte of
@@ -1992,9 +2004,8 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   (`conformance/cases/195-status-reason-phrase.mjs`; up to 0.17.1 oam's own transport
   reported the status code's canonical phrase). What differs: the parser under hyper
   drops a phrase carrying obs-text, so `200 caf\xe9` reads `''` on both client paths,
-  where Node's `statusMessage` is `café` and its `statusText` `caf�`. Over HTTP/2,
-  which has no reason phrase (and which Node's fetch never negotiates), `statusText` is
-  the status code's canonical phrase.
+  where Node's `statusMessage` is `café` and its `statusText` `caf�`. Over HTTP/2 (a
+  dispatcher with `allowH2`), which has no reason phrase, `statusText` is `''`, as in Node.
 - **A response header value's trailing whitespace is trimmed** (#182), on every client
   path and over both protocols. Measured against a raw-socket server sending
   `x-ows:   a<TAB>b   `, `x-trail-tab: v<TAB><TAB>` and `x-inner:  a   b  `: Node's `fetch`
@@ -2007,8 +2018,8 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   (`res.headers` and `res.rawHeaders` read `"a\tb"`). Over HTTP/1 the parser under hyper
   (httparse) trims it before oam sees the value, so matching Node's `fetch` would mean
   re-reading header bytes the parser has already consumed, to reproduce a reading Node's
-  `http` module does not share. Over HTTP/2, which oam's `fetch` negotiates with an https
-  origin (below) and Node's never does, the value arrives as sent and oam trims both ends
+  `http` module does not share. Over HTTP/2, which oam's `fetch` speaks only through a
+  dispatcher with `allowH2` (below), the value arrives as sent and oam trims both ends
   itself, so a `fetch` reads one value whichever protocol carried it. Up to 0.17.1 it did
   not: from an `http2.createSecureServer` with `allowHTTP1` sending `   a<TAB>b   `,
   oam's `fetch` negotiated h2 and read `"   a\tb   "`, leading run included, where Node's
@@ -2064,13 +2075,28 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   comma-joined line, and a method is uppercased only when it is one of `DELETE`, `GET`,
   `HEAD`, `OPTIONS`, `POST`, `PUT` -- `{method: 'patch'}` goes out as `patch`, as in Node.
   Over HTTP/2 (below) the transport drops `connection`, which h2 does not have.
-- **`fetch` negotiates HTTP/2 with an https origin; Node's `fetch` does not.** oam's origin
-  TLS handshake offers ALPN `h2, http/1.1` and speaks h2 to a server that selects it.
-  undici's `Client` defaults `allowH2` to `false` and Node's global dispatcher never turns it
-  on, so Node's `fetch` is HTTP/1.1 only. Anything a server does differently per protocol
-  version -- trailers, 1xx handling, per-version rate limits, request logs -- differs with
-  it. `http.request` in Node is h1-only as well. _(source: `tls_config.rs` ALPN list;
-  undici 6.24.1 `allowH2` default)_
+- **`fetch`, `undici.request` and `https.request` speak HTTP/1.1 to an https origin, as
+  Node's do** (#176; `conformance/cases/350-https-clients-alpn-offer.mjs`, e2e
+  `https_clients_offer_what_nodes_offer_by_alpn`). undici's connector -- `fetch`,
+  `undici.fetch`, `undici.request` -- offers ALPN `http/1.1` alone, and `https.request`'s
+  agent offers no ALPN at all, so an h2-capable server answers both over HTTP/1.1 and sees
+  `http/1.1` and `false`. Up to 0.17.1 oam's handshake offered `h2, http/1.1` to every
+  origin, so such a server served `fetch` over HTTP/2 -- and `https.request` too, whose
+  `res.httpVersion` still said `1.1`. Each client keeps to connections opened with its own
+  offer, as Node's separate pools do. A dispatcher with undici's `allowH2` -- the option, or
+  `connect.allowH2`, which wins over it even when `false` -- offers `http/1.1, h2`, as
+  undici's does, speaks HTTP/2 when the origin picks it, and prints undici's `[UNDICI-H2]`
+  experimental warning once. The option must be a boolean, as undici's `Client` requires:
+  a `Client` built with any other value throws undici's `InvalidArgumentError`, and an
+  `Agent` or a `Pool` fails each request with it (e2e
+  `a_dispatcher_allowh2_that_is_not_a_boolean_is_refused_as_undicis_client_refuses_it`);
+  `connect.allowH2` is tested for truthiness. Over HTTP/2 the client is hyper's rather
+  than undici's experimental one, and two things differ there: a `POST` (or `PUT`, `PATCH`,
+  ...) with no body carries the `content-length: 0` it carries over HTTP/1.1, where
+  undici's h2 client sends none; and the warning comes with the first response that arrived
+  over HTTP/2, where undici prints it when it connects -- so a redirect chain whose only h2
+  hop is not the last warns in Node alone. _(probed: Node v22.22.2 + undici 6.24.1 against
+  `http2.createSecureServer({ allowHTTP1: true })`)_
 - **Decoding** keeps its own entry: 32.
 
 **What a `fetch` refuses before it dials** (all matching Node, listed because a caller sees
@@ -2195,8 +2221,8 @@ The variables are read from the OS environment once per run, so assigning
 `REQUEST_METHOD` (a CGI environment) turns them all off for `fetch`. An http
 destination goes to the proxy in absolute form, with `proxy-authorization` from the proxy
 URL's credentials; an https destination goes through a `CONNECT` tunnel carrying those
-credentials and oam's `user-agent`, with h2 still negotiated with the origin inside it. The
-handshake with an `https://` proxy itself offers no ALPN. A refused or unresolvable proxy
+credentials and oam's `user-agent`, with the request's ALPN offer (above) going to the origin
+inside it. The handshake with an `https://` proxy itself offers no ALPN. A refused or unresolvable proxy
 fails with Node's connect error naming the proxy. A `socks` proxy URL is not supported and
 fails every request it applies to: `fetch` with `error sending request for url (...)`,
 `http.request` (under `NODE_USE_ENV_PROXY=1`) with `ECONNRESET` `socket hang up`.
@@ -2701,9 +2727,12 @@ the connection reaches `'secureConnection'` before anything on it is parsed as H
 - **`allowHTTP1` serves `http.IncomingMessage` / `http.ServerResponse`** whatever
   `Http1IncomingMessage` / `Http1ServerResponse` name, with the TLS socket as
   `req.socket`, and the HTTP/1 connection is held to the server's `headersTimeout` /
-  `requestTimeout` as they are when it connects. `server.close()` stops the listener and
-  leaves open HTTP/1 connections alone (Node also closes the idle ones), and there is no
-  `closeIdleConnections()`.
+  `requestTimeout` as they are when it connects. `server.close()` closes the idle HTTP/1
+  connections before it stops the listener, and `closeIdleConnections()` closes them on
+  demand, as Node's do (`conformance/cases/351-http2-secure-server-close-idle-http1.mjs`).
+  Up to 0.17.1 `close()` left them open and there was no `closeIdleConnections()`, so a
+  keep-alive client -- `fetch` among them, which reaches such a server over HTTP/1.1 since
+  #176 -- held `close()` until it let go.
 - **Keys rustls cannot sign with** -- DSA among them -- are refused at `createServer()`
   with `ERR_OSSL_UNSUPPORTED`.
 
@@ -2956,6 +2985,41 @@ oam's shared client. What differs:
   request never emits `'wantTrailers'`. oam's client stream is not told of that reset: it
   closes only once its own `end()` (and `'wantTrailers'`) has come. Its `rstCode` is 0
   either way.
+- **A server's GOAWAY is reported as Node reports it** (#185;
+  `conformance/cases/352-http2-connect-goaway.mjs`). The session's `'goaway'` carries the
+  frame's code, last stream id and debug data (`undefined` when it has none), after the
+  response heads that came before it; a stream above the last stream id -- one the server
+  never processed -- closes with `ERR_HTTP2_STREAM_ERROR` naming `NGHTTP2_REFUSED_STREAM`
+  (`rstCode` 7), so the application knows it can send it again; a stream the server
+  answered reads to its end; and the session then closes (`NO_ERROR`) or is destroyed with
+  `ERR_HTTP2_SESSION_ERROR` (any other code). A closed session -- by `close()` or by the
+  server's GOAWAY -- sends its own GOAWAY (`NO_ERROR`, last stream id 0) at once, while its
+  streams are still open, as Node's does, so a server that keeps the connection open answers
+  with one more GOAWAY (reported, as Node reports it) and ends the connection once its
+  streams are done (`conformance/cases/353-http2-connect-goaway-held-open.mjs`); and a GOAWAY
+  that arrives after the closed session's last stream has ended is not reported, as Node's
+  session is gone by then. Up to 0.17.1 a graceful GOAWAY reached the
+  session as an EOF: no `'goaway'`, and every stream -- the answered one, its body unread,
+  included -- closed silently with `NGHTTP2_CANCEL`; an error GOAWAY's `'goaway'` named last
+  stream id 0 and an empty buffer; and the session sent its own GOAWAY only once its streams
+  were done, which a Node server no longer reads then, so against a server that kept the
+  connection open the session never emitted `'close'` and kept the process alive. Neither
+  runtime sends a refused stream again: Node's client leaves that to the application, and so
+  does oam's. What differs: a request made in
+  the instant between the GOAWAY reaching oam's HTTP/2 layer and the session hearing of it
+  is refused the same way, where Node's session, closed already, throws
+  `ERR_HTTP2_GOAWAY_SESSION` from `request()`; and one sent in the narrower instant before
+  that layer has read the frame goes past its last stream id, is not answered, and closes
+  with `NGHTTP2_CANCEL` when the connection ends. Node sends a second GOAWAY of its own in
+  the same write as the first when a session closes with no stream open; oam's second
+  (hyper's) follows separately, and a Node server that has stopped reading by then reports
+  only the first.
+- **Streams made in one tick may reach the wire in another order.** `session.request()`
+  numbers its streams 1, 3, 5, ... in call order, as Node does, but each goes to hyper on an
+  operation of its own, and hyper numbers them on the wire in the order those run. Requests
+  made together can therefore reach the server in another order than Node's, and a stream's
+  `id` need not be the one the server saw. _(observed: of three requests made together, the
+  one a server answered first was not always the first one made; not yet fixed)_
 - **A plain `Duplex` from `createConnection` is used as it is.** Node wraps a stream that is
   not a socket in its `JSStreamSocket` and hands that wrapper to `'connect'`; oam runs the
   session over the stream itself and hands it on.
