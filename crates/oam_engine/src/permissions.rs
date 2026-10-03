@@ -162,6 +162,56 @@ fn host_of(hostport: &str) -> &str {
     }
 }
 
+/// A port as an entry spells it: its decimal digits exactly -- `8080`, not
+/// `08080`, `+8080` or `8080 `, which the joined `host:port` string a connect
+/// is checked as never equals either.
+fn canonical_port(text: &str) -> Option<u16> {
+    let digits = !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    if digits && (text == "0" || !text.starts_with('0')) {
+        text.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// An IPv6 address with a zone id, as node's `net.isIP` and oam's transport
+/// read one ([`oam_core::net_connect::PinAddr`]): the address, then the whole
+/// zone after `%`, `:` included. `None` for text that is not one.
+fn parse_zoned(text: &str) -> Option<(std::net::Ipv6Addr, &str)> {
+    let (_, zone) = text.split_once('%')?;
+    match text.parse::<oam_core::net_connect::PinAddr>().ok()? {
+        oam_core::net_connect::PinAddr {
+            ip: std::net::IpAddr::V6(ip),
+            zone: Some(_),
+        } => Some((ip, zone)),
+        _ => None,
+    }
+}
+
+/// Whether the `--allow-net` entry `item` admits the zone-id address `ip`
+/// `%` `zone` on `port`. The entry is matched by its parts: `<ipv6>%<zone>`
+/// is host-only and admits that address and zone on any port, and
+/// `<ipv6>%<zone>:<digits>` is port-scoped and admits them on that port
+/// alone. The address is compared parsed (any spelling of it), the zone as
+/// written. An entry whose zone ends in `:` and digits is always the
+/// port-scoped form -- a port that is not its canonical digits grants
+/// nothing -- so a host-only entry never names a zone ending that way, and
+/// such a zone is granted only by `--allow-net` with no list.
+fn zoned_entry_admits(item: &str, ip: std::net::Ipv6Addr, zone: &str, port: u16) -> bool {
+    let Some((entry_ip, entry_zone)) = parse_zoned(item) else {
+        return false;
+    };
+    if entry_ip != ip {
+        return false;
+    }
+    match entry_zone.rsplit_once(':') {
+        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => {
+            head == zone && canonical_port(tail) == Some(port)
+        }
+        _ => entry_zone == zone,
+    }
+}
+
 impl PermValue {
     /// Path-prefix match, anchored at a separator, over lexically resolved
     /// paths. Used by fs read/write ONLY -- see the module doc.
@@ -238,6 +288,15 @@ impl PermValue {
     /// ([`lookup_answer_resource`]); joined, `fe80::1%1:8080` re-splits as one
     /// multi-colon host with no port, so no bare-host entry could match it,
     /// and only one port-scoped entry per port could grant the address.
+    ///
+    /// A zone-id host is matched as an address and a zone, never as text
+    /// ([`zoned_entry_admits`]). node's zone grammar admits `:`
+    /// (`net.isIP('fe80::1%1:8080')` is 6, and that answer dials the zone
+    /// `1:8080` on the connect's own port), so the host's zone is all of its
+    /// text after `%`, and an entry `fe80::1%1:8080` is always the address
+    /// `fe80::1`, the zone `1` and the port 8080. A host with a `%` that is
+    /// not such an address (which the transport would not dial) matches no
+    /// entry.
     pub fn allows_net_target(&self, host: &str, port: u16) -> bool {
         match self {
             PermValue::All => true,
@@ -245,19 +304,19 @@ impl PermValue {
             // The empty host (a URL that did not parse) is never granted, not
             // even by a blank list item (`--allow-net=a.example,`).
             PermValue::List(_) if host.is_empty() => false,
+            PermValue::List(list) if host.contains('%') => match parse_zoned(host) {
+                Some((ip, zone)) => list
+                    .iter()
+                    .any(|item| zoned_entry_admits(item, ip, zone, port)),
+                None => false,
+            },
             PermValue::List(list) => list.iter().any(|item| {
                 if item == host {
                     return true;
                 }
                 item.strip_prefix(host)
                     .and_then(|rest| rest.strip_prefix(':'))
-                    .is_some_and(|p| {
-                        // `8080` only: not `08080`, `+8080` or `8080 `, which
-                        // the joined `host:port` string never equalled either.
-                        p.bytes().all(|b| b.is_ascii_digit())
-                            && (p == "0" || !p.starts_with('0'))
-                            && p.parse::<u16>() == Ok(port)
-                    })
+                    .is_some_and(|p| canonical_port(p) == Some(port))
             }),
         }
     }
@@ -383,7 +442,8 @@ impl Permissions {
     ///
     /// The two halves are matched apart ([`PermValue::allows_net_target`]),
     /// so a host with colons of its own (a zone-id lookup answer such as
-    /// `fe80::1%1`) is matched by its bare-host entry too. The empty host (a
+    /// `fe80::1%1`) is matched by its bare-host entry too -- by its address
+    /// and zone, the zone being all of its text after `%`. The empty host (a
     /// URL that did not parse) matches no list entry.
     pub fn check_net_target(&self, host: &str, port: u16) -> Result<(), PermissionDenial> {
         if self.net.allows_net_target(host, port) {
@@ -597,7 +657,8 @@ pub fn url_net_port(url: &ada_url::Url) -> u16 {
 /// name one, so there is no URL spelling to match, and its grant stays the
 /// spelling it always was (`--allow-net=fe80::1%1`, or `fe80::1%1:8080`). `op_fetch_continue`
 /// checks it with the parked hop's port
-/// ([`Permissions::check_net_target`]), as the hop's host was.
+/// ([`Permissions::check_net_target`]), as the hop's host was, which matches
+/// it as an address and a zone ([`PermValue::allows_net_target`]).
 pub fn lookup_answer_resource(answer: &str) -> String {
     match answer.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V4(v4)) => v4.to_string(),
@@ -1056,6 +1117,90 @@ mod tests {
                 .check_net(&lookup_answer_resource("::1"))
                 .is_err()
         );
+    }
+
+    /// A zone-id answer is matched as an address and a zone, never as text.
+    /// node's grammar lets a zone hold `:` (`net.isIP('fe80::2%1:8080')` is
+    /// 6, and `net.connect` dials it with the zone `1:8080` on its own port),
+    /// so an entry `<zone-id IPv6>:<digits>` reads only as a port-scoped
+    /// grant -- address, zone, port -- and an answer's zone is its whole text
+    /// after `%`, never split into a port.
+    #[test]
+    fn a_zone_id_answer_is_matched_as_an_address_and_a_zone() {
+        let net = |entries: Vec<&str>| Permissions::from_opts(Some(opts_net_only(entries)));
+        let check = |p: &Permissions, answer: &str, port: u16| {
+            p.check_net_target(&lookup_answer_resource(answer), port)
+                .is_ok()
+        };
+
+        // Port-scoped: address fe80::2, zone 1, port 8080.
+        let scoped = net(vec!["fe80::2%1:8080"]);
+        assert!(check(&scoped, "fe80::2%1", 8080));
+        assert!(!check(&scoped, "fe80::2%1", 80));
+        // The answer's zone is `1:8080`, not the entry's `1`, on any port.
+        for port in [80, 8080, 443] {
+            assert!(!check(&scoped, "fe80::2%1:8080", port), "port {port}");
+        }
+        let denial = scoped
+            .check_net_target(&lookup_answer_resource("fe80::2%1:8080"), 80)
+            .unwrap_err();
+        assert_eq!(denial.resource, "fe80::2%1:8080:80");
+        // The address is compared parsed, so any spelling of it matches; the
+        // zone is compared as written.
+        assert!(check(&scoped, "FE80:0::2%1", 8080));
+        assert!(!check(&scoped, "fe80::2%01", 8080));
+        assert!(!check(&scoped, "fe80::3%1", 8080));
+        assert!(!check(&scoped, "fe80::2", 8080));
+
+        // Host-only: any port, and only that zone.
+        let host_only = net(vec!["fe80::2%1"]);
+        for port in [0, 80, 8080, 65535] {
+            assert!(check(&host_only, "fe80::2%1", port), "port {port}");
+            assert!(!check(&host_only, "fe80::2%1:8080", port), "port {port}");
+            assert!(!check(&host_only, "fe80::2%2", port), "port {port}");
+        }
+        // A zone whose text after its last `:` is not digits stays one zone,
+        // host-only; one whose tail is digits is a zone and a port.
+        let colon_zone = net(vec!["fe80::2%a:b", "fe80::2%eth0:1"]);
+        assert!(check(&colon_zone, "fe80::2%a:b", 80));
+        assert!(check(&colon_zone, "fe80::2%eth0", 1));
+        assert!(!check(&colon_zone, "fe80::2%eth0", 2));
+        assert!(!check(&colon_zone, "fe80::2%eth0:1", 1));
+        // A port that is not its canonical decimal digits grants nothing.
+        let spelled = net(vec!["fe80::2%1:08080", "fe80::2%2:99999"]);
+        for (answer, port) in [
+            ("fe80::2%1", 8080),
+            ("fe80::2%1:08080", 8080),
+            ("fe80::2%2", 99),
+            ("fe80::2%2:99999", 80),
+        ] {
+            assert!(!check(&spelled, answer, port), "{answer} on {port}");
+        }
+        // Text with a `%` that is not a zone-id address is never granted, not
+        // even by an entry spelled the same.
+        let malformed = net(vec!["fe80::2%", "fe80::2%1%2", "127.0.0.1%1", "x%1"]);
+        for answer in ["fe80::2%", "fe80::2%1%2", "127.0.0.1%1", "x%1"] {
+            assert!(!check(&malformed, answer, 80), "{answer}");
+        }
+
+        // Bare hosts and URL hosts are unchanged.
+        let plain = net(vec!["a.test", "b.test:8080", "[::1]", "10.0.0.1:5432"]);
+        assert!(plain.check_net_target("a.test", 1).is_ok());
+        assert!(plain.check_net_target("b.test", 8080).is_ok());
+        assert!(plain.check_net_target("b.test", 80).is_err());
+        assert!(plain.check_net_target("[::1]", 9).is_ok());
+        assert!(plain.check_net_target("10.0.0.1", 5432).is_ok());
+        assert!(plain.check_net_target("10.0.0.1", 5433).is_err());
+        assert!(plain.check_net_target("", 80).is_err());
+        // A zoned entry grants no zoneless host, and a plain entry no zone.
+        assert!(scoped.check_net_target("[fe80::2]", 8080).is_err());
+        assert!(!check(&net(vec!["[fe80::2]"]), "fe80::2%1", 80));
+
+        // net.connect's joined `host:port` agrees: its host is a zone-id
+        // address and its port the connect's own.
+        assert!(scoped.check_net("fe80::2%1:8080").is_ok());
+        assert!(scoped.check_net("fe80::2%1:8080:80").is_err());
+        assert!(scoped.check_net("fe80::2%1:8080:8080").is_err());
     }
 
     #[test]

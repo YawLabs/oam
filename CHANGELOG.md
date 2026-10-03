@@ -52,6 +52,13 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Fixed
 
+- **A zone-id `connect.lookup` answer is matched against `--allow-net` as an address and a
+  zone, never as text.** The zone is all of the answer's text after `%`, as node's `net.isIP`
+  reads it (`fe80::1%1:8080` is the address `fe80::1` with the zone `1:8080`), and an entry
+  ending in `:` and digits is always port-scoped: `--allow-net=fe80::1%1:8080` admits the
+  answer `fe80::1%1` (or any spelling of that address) on port 8080. A host-only entry
+  (`fe80::1%1`) admits its zone on any port, and text with a `%` that is not a zone-id
+  address matches no entry.
 - **Over HTTP/2, a `fetch` response header value kept the whitespace around it**; it is trimmed
   as it is over HTTP/1, and the trimming is recorded as a divergence from node's `fetch`, which
   keeps trailing whitespace. (#182)

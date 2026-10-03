@@ -8580,6 +8580,107 @@ console.log('continued', tokens.length, 'still parked', tokens.some((t) => inter
     server.join().unwrap();
 }
 
+/// A zone-id `connect.lookup` answer is matched against `--allow-net` as an
+/// address and a zone, never as text. node's zone grammar admits `:`
+/// (`net.isIP('::1%1:8080')` is 6, and a connect dials that answer with the
+/// zone `1:8080` on its own port), so the answer `::1%1:<P>` is the address
+/// `::1` with the zone `1:<P>`, and the entry `::1%1:<P>` is the address `::1`,
+/// the zone `1` and the port P: they never match, on P or any other port. The
+/// entry still admits the answer `::1%1` on P, and a host-only `::1%1` admits
+/// it on any port. Admitted runs only have to get past the check (the dial's
+/// outcome with a scope id differs by platform); refused ones never arrive.
+#[test]
+fn a_connect_lookup_zone_id_answer_is_matched_as_an_address_and_a_zone() {
+    let script = write_temp(
+        "lookup_permission_zone/main.mjs",
+        r#"import { Agent } from 'undici';
+const port = Number(process.argv[2]);
+const answer = process.argv[3];
+const agent = new Agent({ connect: { lookup: (h, o, cb) => cb(null, [{ address: answer, family: 6 }]) } });
+try {
+  const r = await fetch(`http://granted.invalid:${port}/`, { dispatcher: agent, signal: AbortSignal.timeout(5000) });
+  console.log('ALLOWED', r.status);
+} catch (e) {
+  console.log(e.code === 'ERR_ACCESS_DENIED' ? `DENIED ${JSON.stringify(e.resource)}` : 'PASSED THE CHECK');
+}
+"#,
+    );
+    let path = script.to_str().unwrap().to_string();
+    // A [::1] listener the admitted runs may reach; without IPv6 loopback any
+    // port serves, since the refusals happen before a dial.
+    let listener = std::net::TcpListener::bind("[::1]:0").ok();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let port = match listener {
+        Some(listener) => {
+            let port = listener.local_addr().unwrap().port();
+            let counted = hits.clone();
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { continue };
+                    counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    drop(stream);
+                }
+            });
+            port
+        }
+        None => 18080,
+    };
+    let other = if port == u16::MAX { port - 1 } else { port + 1 };
+    let run = |grant: String, answer: String| {
+        let out = oam(&[
+            "--permission",
+            &format!("--allow-net=granted.invalid,{grant}"),
+            "--",
+            &path,
+            &port.to_string(),
+            &answer,
+        ]);
+        (
+            String::from_utf8_lossy(&out.stdout)
+                .trim()
+                .replace("\r\n", "\n"),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        )
+    };
+
+    // Port-scoped entry (`::1`, zone `1`, port `other`); the answer's zone is
+    // `1:<other>` and the hop's port is `port`.
+    let (stdout, stderr) = run(format!("::1%1:{other}"), format!("::1%1:{other}"));
+    assert_eq!(
+        stdout,
+        format!("DENIED \"::1%1:{other}:{port}\""),
+        "stderr: {stderr}"
+    );
+    // The same zone text on the entry's own port is still another zone.
+    let (stdout, stderr) = run(format!("::1%1:{port}"), format!("::1%1:{port}"));
+    assert_eq!(
+        stdout,
+        format!("DENIED \"::1%1:{port}:{port}\""),
+        "stderr: {stderr}"
+    );
+    // A host-only entry grants its zone alone.
+    let (stdout, stderr) = run("::1%1".to_string(), format!("::1%1:{port}"));
+    assert_eq!(
+        stdout,
+        format!("DENIED \"::1%1:{port}:{port}\""),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "a refused answer must never be dialled"
+    );
+
+    // Admitted: the port-scoped entry on its port, the host-only one on any.
+    for grant in [format!("::1%1:{port}"), "::1%1".to_string()] {
+        let (stdout, stderr) = run(grant.clone(), "::1%1".to_string());
+        assert!(
+            !stdout.starts_with("DENIED"),
+            "{grant}: {stdout}; stderr: {stderr}"
+        );
+    }
+}
+
 /// A TCP listener that counts the connections it accepts, for the net / tls
 /// lookup-permission tests: the refused runs must never arrive.
 fn counting_listener() -> (u16, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
