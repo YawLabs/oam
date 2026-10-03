@@ -2011,6 +2011,79 @@ MX_RUN="$(grep -n 'node "\$REPO_DIR/scripts/mcp-sidecar-matrix\.mjs" --json="\$m
 if [ -n "$MX_RM" ] && [ -n "$MX_RUN" ] && [ "$MX_RM" -lt "$MX_RUN" ]; then pass
 else fail "release-local.sh no longer removes \$matrix_report before the gate runs (rm at '${MX_RM}', gate at '${MX_RUN}')"; fi
 
+# The site's refresh-downloads.sh refuses for a reason -- no published release,
+# a manifest that disagrees with SHA256SUMS, a page with no row for an asset --
+# and the release step used to send that reason to /dev/null with the rest of
+# its output, leaving a bare "failed". The two functions run here verbatim,
+# under the release's own set -euo pipefail and with its real ok/warn (warn is
+# echo -e), against a stub site script. The stub's refusal carries a Windows
+# path (echo -e reads "\c" as "stop printing") and command substitutions that
+# would create $RS_PWN if anything evaluated the text.
+RS="$SUITE_TMP/site-refresh"
+RS_STUB="$RS/site/scripts/refresh-downloads.sh"
+mkdir -p "$RS/site/scripts"
+RS_FNS="$(awk '/^site_refresh_reason\(\) \{$/ || /^refresh_site_downloads\(\) \{$/ { f = 1 } f { print } f && /^}$/ { f = 0 }' scripts/release-local.sh)"
+RS_LOG="$(grep -E '^(ok|warn|fail)\(\)' scripts/release-local.sh)"
+rs_run() {
+  rm -f "$RS/pwned"
+  chmod +x "$RS_STUB"
+  RS_OUT="$(cd "$RS" && GRN='' YEL='' RED='' NC='' RS_PWN="$RS/pwned" \
+    bash -c "set -euo pipefail; $RS_LOG; $RS_FNS"'; refresh_site_downloads "$1" v9.9.9; echo "after rc=$?"' rs "$RS/site" 2>&1)"
+}
+
+it "release-local.sh: a refused site refresh puts the script's last [fail] line in the warn, verbatim and unevaluated"
+cat > "$RS_STUB" <<'STUB'
+#!/bin/bash
+echo STDOUT-NOISE
+esc=$'\033'
+echo "${esc}[0;33m  [warn]${esc}[0m $1 predates signing" >&2
+echo "  [fail] an earlier refusal" >&2
+echo "${esc}[0;31m  [fail]${esc}[0m no published release for $1 at C:\cache\oam"' $(touch "$RS_PWN") `touch "$RS_PWN"`' >&2
+exit 3
+STUB
+rs_run
+RS_WANT='  [warn] refresh-downloads.sh failed (exit 3): no published release for v9.9.9 at C:\cache\oam $(touch "$RS_PWN") `touch "$RS_PWN"` -- the downloads page and checksums post still advertise the previous release'
+if [ -z "$RS_FNS" ] || [ "$(grep -c '() {$' <<<"$RS_FNS")" != "2" ]; then fail "site_refresh_reason() / refresh_site_downloads() not found in release-local.sh"
+elif ! grep -qxF -- "$RS_WANT" <<<"$RS_OUT"; then fail "warn did not carry the refusal:$(printf '\n%s' "$RS_OUT")"
+elif [ -e "$RS/pwned" ]; then fail "the captured stderr was evaluated"
+elif grep -q 'STDOUT-NOISE\|earlier refusal' <<<"$RS_OUT"; then fail "stdout or an earlier line leaked:$(printf '\n%s' "$RS_OUT")"
+elif grep -q $'\033' <<<"$RS_OUT"; then fail "colour codes survived into the warn"
+elif ! grep -qx 'after rc=0' <<<"$RS_OUT"; then fail "the step was fatal under set -euo pipefail:$(printf '\n%s' "$RS_OUT")"
+else pass; fi
+
+it "release-local.sh: with no [fail] line the warn carries the last error-ish line, else a short tail, else says stderr was empty"
+cat > "$RS_STUB" <<'STUB'
+#!/bin/bash
+echo "  [ok] resolved $1" >&2
+echo "marker block downloads-table not found in the page" >&2
+echo "Traceback noise that follows" >&2
+exit 1
+STUB
+rs_run; RS_A="$RS_OUT"
+cat > "$RS_STUB" <<'STUB'
+#!/bin/bash
+printf 'one\ntwo\n\nthree\n\tfour\n' >&2
+exit 2
+STUB
+rs_run; RS_B="$RS_OUT"
+printf '#!/bin/bash\necho only-stdout\nexit 1\n' > "$RS_STUB"
+rs_run; RS_C="$RS_OUT"
+if ! grep -qF 'failed (exit 1): marker block downloads-table not found in the page -- ' <<<"$RS_A"; then fail "error line: $RS_A"
+elif ! grep -qF 'failed (exit 2): two | three | four -- ' <<<"$RS_B"; then fail "tail: $RS_B"
+elif ! grep -qF 'failed (exit 1): it printed nothing on stderr -- ' <<<"$RS_C"; then fail "empty: $RS_C"
+elif [ "$(grep -c 'after rc=0' <<<"$RS_A$RS_B$RS_C")" != "3" ]; then fail "a failure was fatal: $RS_A / $RS_B / $RS_C"
+else pass; fi
+
+it "release-local.sh: a successful site refresh says ok, and drops the script's own chatter"
+printf '#!/bin/bash\necho STDOUT-NOISE\necho "  [warn] review git diff" >&2\nexit 0\n' > "$RS_STUB"
+rs_run
+eq "$RS_OUT" $'  [ok] release pages regenerated for v9.9.9 (downloads page + checksums post)\nafter rc=0'
+
+it "release-local.sh: the site step runs refresh-downloads.sh through refresh_site_downloads, never blind"
+if grep -qxF '    refresh_site_downloads "$SITE_DIR" "$TAG"' scripts/release-local.sh \
+   && ! grep -qF '>/dev/null 2>&1' <(grep -v '^[[:space:]]*#' scripts/release-local.sh | grep -F 'refresh-downloads.sh'); then pass
+else fail "release-local.sh runs refresh-downloads.sh outside refresh_site_downloads, or discards its stderr again"; fi
+
 # #90 shipped a whole second build configuration -- oam_engine without `napi`,
 # oam_cli without its passthrough -- that was verified by hand once and then had
 # no coverage anywhere: `no-default-features` appeared in no script, no test and
@@ -2297,9 +2370,9 @@ it "no key committed: the manifest step is skipped, with a loud reason"
 SG_D="$(sg "$SG_BOOT" release_signing_decision)"
 case "$SG_D" in skip:*"WITHOUT a signed RELEASE-MANIFEST"*) pass ;; *) fail "got '$SG_D'" ;; esac
 
-it "no key committed + OAM_SIGN_REQUIRED=1: fatal"
+it "no key committed + OAM_SIGN_REQUIRED=1: fatal, and the way out is an explicit 0 (release-local.sh defaults an unset knob to 1)"
 SG_D="$(OAM_SIGN_REQUIRED=1 sg "$SG_BOOT" release_signing_decision)"
-case "$SG_D" in fail:*"OAM_SIGN_REQUIRED=1"*) pass ;; *) fail "got '$SG_D'" ;; esac
+case "$SG_D" in fail:*"OAM_SIGN_REQUIRED=1"*"set OAM_SIGN_REQUIRED=0"*) pass ;; *) fail "got '$SG_D'" ;; esac
 
 it "OAM_SIGN_REQUIRED takes 0 or 1 and nothing else"
 SG_D="$(OAM_SIGN_REQUIRED=yes sg "$SG_BOOT" release_signing_decision)"
@@ -2768,9 +2841,12 @@ it "nothing configured: skipped, with a loud bootstrap reason"
 WS_D="$(wg win_sign_decision 0)"
 case "$WS_D" in skip:*"WITHOUT Authenticode"*bootstrap*) pass ;; *) fail "got '$WS_D'" ;; esac
 
-it "nothing configured + OAM_SIGN_REQUIRED=1: fatal"
+it "nothing configured + OAM_SIGN_REQUIRED=1: fatal, naming all three ways forward (an unset knob is not one of them)"
 WS_D="$(OAM_SIGN_REQUIRED=1 wg win_sign_decision 0)"
-case "$WS_D" in fail:*"OAM_SIGN_REQUIRED=1"*) pass ;; *) fail "got '$WS_D'" ;; esac
+case "$WS_D" in
+  fail:"signing is required (OAM_SIGN_REQUIRED, default 1 under release-local.sh)"*"OAM_WIN_SIGN_METADATA is not set"*"OAM_SKIP_WIN_SIGN=1"*"OAM_SIGN_REQUIRED=0"*) pass ;;
+  *) fail "got '$WS_D'" ;;
+esac
 
 it "configured: sign, required or not"
 WS_D="$(OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P wg win_sign_decision 0) $(OAM_SIGN_REQUIRED=1 OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P wg win_sign_decision 0)"
@@ -3270,6 +3346,12 @@ SG_D0="$( ( unset OAM_WIN_SIGN_METADATA OAM_WIN_SIGN_PUBLISHER; export OAM_SIGN_
             export OAM_SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-1}"; . scripts/lib/signing.sh; win_sign_decision 0 ) )"
 case "$SG_D1|$SG_D0" in fail:*"|skip:"*) pass ;; *) fail "default: $SG_D1 / explicit 0: $SG_D0" ;; esac
 
+# Because of that default, "unset OAM_SIGN_REQUIRED" is no way out: under
+# release-local.sh an unset knob is 1. Every refusal used to advise it.
+it "no operator advice says to unset OAM_SIGN_REQUIRED -- the way out is OAM_SIGN_REQUIRED=0"
+SG_UNSET="$(git -C "$REPO_DIR" grep -nE '(or|then|just) unset OAM_SIGN_REQUIRED|unset OAM_SIGN_REQUIRED (for|to)' -- . ':!scripts/test-scripts.sh' || true)"
+if [ -z "$SG_UNSET" ]; then pass; else fail "stale opt-out advice:"$'\n'"$SG_UNSET"; fi
+
 it "release-local.sh: the release-exists check is one function, and fails closed on anything but gh's exact 'release not found'"
 SG_H="$(awk '$0 == "assert_release_unpublished() {" { p = 1 } p { print } p && /^}$/ { exit }' scripts/release-local.sh)"
 if grep -qF "grep -qxF 'release not found'" <<<"$SG_H" && grep -qF '[ "$rc" -ne 1 ]' <<<"$SG_H" \
@@ -3428,7 +3510,7 @@ it "release-local.sh's Windows decision block: required + unconfigured fails; sk
 WS_A="$(OAM_SIGN_REQUIRED=1 ws_block 0 0)"; WS_RA=$?
 WS_B="$(ws_block 0 0)"
 WS_C="$(OAM_SIGN_REQUIRED=1 OAM_WIN_SIGN_METADATA=/m OAM_WIN_SIGN_PUBLISHER=P ws_block 1 0)"
-if [ "$WS_RA" != "0" ] && grep -q '^FAIL: OAM_SIGN_REQUIRED=1' <<<"$WS_A" && ! grep -q 'WIN_SIGNING=' <<<"$WS_A" \
+if [ "$WS_RA" != "0" ] && grep -q '^FAIL: signing is required (OAM_SIGN_REQUIRED' <<<"$WS_A" && ! grep -q 'WIN_SIGNING=' <<<"$WS_A" \
    && grep -q '^WARN: .*bootstrap' <<<"$WS_B" && grep -q '^WIN_SIGNING=0$' <<<"$WS_B" \
    && grep -q '^WARN: OAM_SKIP_WIN_SIGN=1' <<<"$WS_C" && grep -q '^WIN_SIGNING=0$' <<<"$WS_C" \
    && ! grep -q PREFLIGHT <<<"$WS_B$WS_C"; then pass
@@ -4399,9 +4481,9 @@ it "bootstrap: a pin file holding only comments signs ad-hoc, with a warning"
 ms mac_sign_decision
 case "$MS_OUT" in adhoc:*"holds no SHA-1 yet"*) pass ;; *) fail "decision: $MS_OUT" ;; esac
 
-it "bootstrap under OAM_SIGN_REQUIRED=1 is fatal"
+it "bootstrap under OAM_SIGN_REQUIRED=1 is fatal, and the way out is an explicit 0"
 OAM_SIGN_REQUIRED=1 ms mac_sign_decision
-case "$MS_OUT" in fail:"OAM_SIGN_REQUIRED=1 but "*) pass ;; *) fail "decision: $MS_OUT" ;; esac
+case "$MS_OUT" in fail:"OAM_SIGN_REQUIRED=1 but "*"set OAM_SIGN_REQUIRED=0"*) pass ;; *) fail "decision: $MS_OUT" ;; esac
 
 it "a committed pin makes that identity mandatory, required or not"
 ms_pin "$MS_PIN_A"
