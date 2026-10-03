@@ -1596,9 +1596,21 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
   exactly the connection it was asked for. The pool closes its idle connections after 90 s
   (the shared pool's idle timeout; undici's keep-alive default is 4 s), and all of them when
   the `Agent` is `close()`d or `destroy()`ed, or garbage-collected without either.
-- **A hook that calls back twice.** One that answers and then calls back again with an
-  error fails the fetch in Node, with that second error as the `cause`; oam keeps the first
-  answer and connects.
+- **A hook that calls back twice** counts, as in Node, while the connection its answer opens
+  is still being made (#169): after an answer, a second callback with an error, a second
+  answer Node's address rules refuse, or a throw from the hook fails the fetch with that
+  error as the `cause`, and nothing is dialled when it comes in the same call; with the
+  error first, the first error is the cause; once the connection is made, later callbacks
+  are ignored (`conformance/cases/359-fetch-lookup-second-callback.mjs`, e2e
+  `fetch_connect_lookup_second_callback_fails_a_connection_still_being_made`). Up to 0.17.1
+  oam kept the first callback and connected. Two things differ. A second answer that passes
+  the rules is ignored, where Node starts a second connect on the same socket and fails it
+  with a platform-specific code (`connect EISCONN` on Windows). And "still being made" is
+  each runtime's own connect: oam's runs on a thread of its own and, in a debug build at
+  least, has not connected to a local server by the next `setImmediate` after the answer,
+  so an error the hook reports there fails the fetch in oam and is ignored in Node, which
+  has connected by then. An error in the same call, a microtask or a `process.nextTick`
+  later fails it in both.
 - **A scoped IPv6 address** (`fe80::1%lo0`) is dialled, as in Node, since 0.17.2: the zone
   becomes the scope id libuv's `uv_ip6_addr` gives it (Windows reads it with `atoi`, so a
   name is 0; Linux looks the interface up by name, and a name that is no interface is 0),

@@ -585,7 +585,130 @@ pub(crate) struct HookPin {
     /// connection to that authority and no other.
     pub(crate) key: String,
     pub(crate) addrs: Vec<net_connect::PinAddr>,
+    /// Whether the hook has failed the connection since it answered
+    /// (`None` for an answer no later callback can reach).
+    pub(crate) gate: Option<Arc<LookupGate>>,
 }
+
+/// The connection one hook answer opens, as the hook's later callbacks see
+/// it (#169). node's `lookupAndConnectMultiple` (lib/net.js) acts on every
+/// callback the hook makes while the socket is still connecting: an error
+/// -- or an answer node's address rules refuse, or a throw -- fails the
+/// connect, as the first answer would have. Once the socket has connected
+/// it ignores them. The gate is that window: open from the answer until the
+/// dial's TCP connect completes (or fails on its own), when it settles; a
+/// [`LookupGate::fail`] while it is open abandons the dial, which fails with
+/// [`LookupFailed`].
+///
+/// Gates are registered by the lookup's continuation token, so JS can fail
+/// one by token (`fetchLookupFail`); the registry holds them weakly, and a
+/// gate leaves it when its pin is gone.
+#[derive(Debug)]
+pub(crate) struct LookupGate {
+    state: std::sync::atomic::AtomicU8,
+    failed: tokio::sync::Notify,
+    token: u64,
+    registry: std::sync::Weak<Mutex<LookupGates>>,
+}
+
+/// Open lookup gates by continuation token.
+pub(crate) type LookupGates = HashMap<u64, std::sync::Weak<LookupGate>>;
+
+const GATE_OPEN: u8 = 0;
+const GATE_SETTLED: u8 = 1;
+const GATE_FAILED: u8 = 2;
+
+impl LookupGate {
+    /// A gate for the answer to lookup `token`, registered in `registry`.
+    pub(crate) fn open(registry: &Arc<Mutex<LookupGates>>, token: u64) -> Arc<LookupGate> {
+        let gate = Arc::new(LookupGate {
+            state: std::sync::atomic::AtomicU8::new(GATE_OPEN),
+            failed: tokio::sync::Notify::new(),
+            token,
+            registry: Arc::downgrade(registry),
+        });
+        registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(token, Arc::downgrade(&gate));
+        gate
+    }
+
+    /// The hook failed the connection: true if it was still connecting (the
+    /// dial is abandoned), false once it had connected or failed already.
+    pub(crate) fn fail(&self) -> bool {
+        let failed = self
+            .state
+            .compare_exchange(GATE_OPEN, GATE_FAILED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if failed {
+            self.failed.notify_waiters();
+        }
+        failed
+    }
+
+    /// Run the TCP connect `connect` inside the window: abandoned when the
+    /// hook fails the connection first, and the window closed when it ends.
+    async fn guard<T>(
+        &self,
+        connect: impl Future<Output = Result<T, BoxError>>,
+    ) -> Result<T, BoxError> {
+        let abandoned = async {
+            let notified = self.failed.notified();
+            let mut notified = std::pin::pin!(notified);
+            notified.as_mut().enable();
+            if self.state.load(Ordering::Acquire) != GATE_FAILED {
+                notified.await;
+            }
+        };
+        let result = tokio::select! {
+            biased;
+            () = abandoned => return Err(Box::new(LookupFailed)),
+            result = connect => result,
+        };
+        // Connected, or refused on its own: from here a callback is too
+        // late. A failure that won the race to the state still wins.
+        match self.state.compare_exchange(
+            GATE_OPEN,
+            GATE_SETTLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => result,
+            Err(_) => Err(Box::new(LookupFailed)),
+        }
+    }
+}
+
+impl Drop for LookupGate {
+    fn drop(&mut self) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let mut gates = registry.lock().unwrap_or_else(|e| e.into_inner());
+        // Only its own entry (a dead weak): a token is never reused, but a
+        // live entry under it is not this gate's to remove.
+        if gates
+            .get(&self.token)
+            .is_some_and(|weak| weak.strong_count() == 0)
+        {
+            gates.remove(&self.token);
+        }
+    }
+}
+
+/// The hook failed the connection its answer was opening ([`LookupGate`]):
+/// the fetch fails with the hook's error, which JS holds.
+#[derive(Debug)]
+pub(crate) struct LookupFailed;
+
+impl std::fmt::Display for LookupFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the connect.lookup hook failed the connection")
+    }
+}
+
+impl std::error::Error for LookupFailed {}
 
 /// What one dial takes from the request it is made for, rather than from
 /// the connector: a pool is shared by requests that each carry their own.
@@ -843,6 +966,7 @@ impl OamConnector {
         let https = dst.scheme_str() == Some("https");
         let host = host_for_connect(&dst).ok_or("request url has no host")?;
         let port = dst.port_u16().unwrap_or(if https { 443 } else { 80 });
+        let mut gate = None;
         let opts = match &self.via {
             Via::Supplied { conns } => return supplied(conns, &dst),
             Via::Pooled => {
@@ -871,6 +995,7 @@ impl OamConnector {
                     else {
                         return Err(Box::new(UnresolvedHost(host)));
                     };
+                    gate = answer.gate;
                     Some(Pin {
                         host: host.to_ascii_lowercase(),
                         addrs: answer.addrs,
@@ -888,7 +1013,10 @@ impl OamConnector {
         } else {
             None
         };
-        let tcp = dial(&host, port, &opts, log).await?;
+        let tcp = match gate {
+            Some(gate) => gate.guard(dial(&host, port, &opts, log)).await?,
+            None => dial(&host, port, &opts, log).await?,
+        };
         let info = ConnInfo::of(&tcp);
         let Some(name) = name else {
             return Ok(OamConn::new(Box::new(tcp), false, false, info));
@@ -1511,6 +1639,7 @@ mod tests {
             pin: Some(HookPin {
                 key: key.to_string(),
                 addrs: vec!["127.0.0.1".parse().unwrap()],
+                gate: None,
             }),
         };
         for dial in [
@@ -1537,5 +1666,69 @@ mod tests {
                 .is_none(),
             "an IP literal is dialled as written"
         );
+    }
+
+    /// #169: a hook that fails the connection while its answer's connect
+    /// is still being made abandons that connect -- whether it fails first
+    /// or in the middle -- and fails it with `LookupFailed`; once the
+    /// connect is made (or failed on its own), a failure is too late and
+    /// changes nothing. The registry finds a gate by its token while its
+    /// pin lives, and forgets it after.
+    #[tokio::test]
+    async fn a_lookup_gate_fails_only_a_connect_still_being_made() {
+        let registry = Arc::new(Mutex::new(LookupGates::new()));
+        let find = |token: u64| {
+            registry
+                .lock()
+                .unwrap()
+                .get(&token)
+                .and_then(std::sync::Weak::upgrade)
+        };
+
+        // Failed before the connect starts: it never runs.
+        let gate = LookupGate::open(&registry, 1);
+        assert!(find(1).is_some_and(|found| found.fail()));
+        let err = gate
+            .guard(async { Ok::<_, BoxError>(()) })
+            .await
+            .unwrap_err();
+        assert!(err.downcast_ref::<LookupFailed>().is_some(), "{err}");
+        assert!(!gate.fail(), "failed once");
+
+        // Failed while the connect is pending: abandoned.
+        let gate = LookupGate::open(&registry, 2);
+        let failing = gate.clone();
+        let connect = tokio::spawn(async move {
+            failing
+                .guard(std::future::pending::<Result<(), BoxError>>())
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert!(gate.fail());
+        let err = tokio::time::timeout(Duration::from_secs(5), connect)
+            .await
+            .expect("the pending connect was abandoned")
+            .unwrap()
+            .unwrap_err();
+        assert!(err.downcast_ref::<LookupFailed>().is_some(), "{err}");
+
+        // Connected: a failure after is ignored, and the connection stands.
+        let gate = LookupGate::open(&registry, 3);
+        gate.guard(async { Ok::<_, BoxError>(()) }).await.unwrap();
+        assert!(!gate.fail());
+
+        // A connect that failed on its own keeps its own error.
+        let gate = LookupGate::open(&registry, 4);
+        let err = gate
+            .guard(async { Err::<(), BoxError>("refused".into()) })
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), "refused");
+        assert!(!gate.fail());
+
+        // The registry holds no gate whose pin is gone.
+        drop(gate);
+        assert!(find(4).is_none());
+        assert!(!registry.lock().unwrap().contains_key(&4));
     }
 }

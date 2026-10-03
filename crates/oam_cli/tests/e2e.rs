@@ -7336,6 +7336,60 @@ a.close(); b.close();
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
+/// #169: a `connect.lookup` hook's later callbacks count while the connection
+/// its answer opens is still being made, as node's lookupAndConnectMultiple
+/// acts on them. After an answer, an error -- in the same call or a
+/// microtask later -- or a throw fails the fetch with that error as the
+/// cause; with the error first, the first error is the cause. One once the
+/// connection is made (here, while the server holds the response) is
+/// ignored. oam kept the first callback and dropped the rest, so all but
+/// the error-first case resolved. Measured identical on node v22.22.2 +
+/// undici 6.24.1; conformance case 359 covers the same rules through a
+/// replaced dns.lookup.
+#[test]
+fn fetch_connect_lookup_second_callback_fails_a_connection_still_being_made() {
+    let script = write_temp(
+        "fetch_lookup_second_callback/main.mjs",
+        r#"import http from 'node:http';
+import { Agent } from 'undici';
+let late = null;
+const server = http.createServer((req, res) => {
+  if (req.url === '/late') { late(); setTimeout(() => res.end('ok'), 50); return; }
+  res.end('ok');
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const port = server.address().port;
+const ADDR = [{ address: '127.0.0.1', family: 4 }];
+async function run(label, lookup, path = '/') {
+  const agent = new Agent({ connect: { lookup } });
+  try {
+    const r = await fetch(`http://${label}.test:${port}${path}`, { dispatcher: agent });
+    console.log(label, 'resolved', r.status, await r.text());
+  } catch (e) {
+    console.log(label, 'rejected', e.message, '|', e.cause?.message);
+  }
+  await agent.close();
+}
+await run('answer-then-error', (h, o, cb) => { cb(null, ADDR); cb(new Error('second')); });
+await run('error-then-answer', (h, o, cb) => { cb(new Error('first')); cb(null, ADDR); });
+await run('answer-then-throw', (h, o, cb) => { cb(null, ADDR); throw new Error('thrown'); });
+await run('error-in-a-microtask', (h, o, cb) => { cb(null, ADDR); queueMicrotask(() => cb(new Error('second'))); });
+await run('error-once-connected', (h, o, cb) => { late = () => cb(new Error('too late')); cb(null, ADDR); }, '/late');
+server.close();
+"#,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "answer-then-error rejected fetch failed | second\n\
+         error-then-answer rejected fetch failed | first\n\
+         answer-then-throw rejected fetch failed | thrown\n\
+         error-in-a-microtask rejected fetch failed | second\n\
+         error-once-connected resolved 200 ok"
+    );
+}
+
 /// The guard applies however the dispatcher is installed. undici offers five
 /// ways and node enforces the hook in all five (measured, node v22.22.2 +
 /// undici 6.24.1); oam honoured only `fetch`'s `dispatcher` option and the

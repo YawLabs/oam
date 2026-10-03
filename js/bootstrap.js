@@ -2038,25 +2038,77 @@
   }
 
   // One connect.lookup call, as net.connect makes it for a fetch: the host,
-  // `{ family, hints, all: true }`, a callback. The first callback wins; an
-  // error (or a synchronous throw) rejects with that value unchanged.
+  // `{ family, hints, all: true }`, a callback. `answer` settles with the
+  // first callback: the addresses, or the error (or a synchronous throw)
+  // unchanged.
+  //
+  // The callback stays live after that (#169). node's lookupAndConnectMultiple
+  // acts on every callback that arrives while the socket is still
+  // connecting, so a later error fails the connection its answer was
+  // opening -- as does a later answer node's address rules refuse, or the
+  // hook throwing after it answered -- and one after the socket connected is
+  // ignored. The first such failure is `late.error`, handed to
+  // `late.onFail` once the fetch has resumed with the answer; onFail says
+  // whether the connection was still being made, and when it was not the
+  // failure is forgotten. A later answer that passes the rules is ignored:
+  // node starts a second connect on the same socket there, which fails with
+  // a platform-specific code (EISCONN on Windows), and oam does not.
   function runConnectLookup(lookup, host, port) {
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      lookup(host, { family: undefined, hints: lookupHints(), all: true }, (err, addresses) => {
-        if (settled) return;
+    const late = { failed: false, error: undefined, onFail: null, over: false };
+    let settled = false;
+    let resolveAnswer, rejectAnswer;
+    const answer = new Promise((resolve, reject) => {
+      resolveAnswer = resolve;
+      rejectAnswer = reject;
+    });
+    const lateFailure = (e) => {
+      if (late.over || late.failed) return;
+      late.failed = true;
+      late.error = e;
+      if (late.onFail !== null && !late.onFail()) {
+        late.failed = false;
+        late.error = undefined;
+        late.over = true;
+      }
+    };
+    const callback = (err, addresses) => {
+      if (!settled) {
         settled = true;
         if (err) {
-          reject(err);
+          late.over = true;
+          rejectAnswer(err);
           return;
         }
         try {
-          resolve(pinAddresses(addresses, host, port));
+          resolveAnswer(pinAddresses(addresses, host, port));
         } catch (e) {
-          reject(e);
+          late.over = true;
+          rejectAnswer(e);
         }
-      });
-    });
+        return;
+      }
+      if (err) {
+        lateFailure(err);
+        return;
+      }
+      try {
+        pinAddresses(addresses, host, port);
+      } catch (e) {
+        lateFailure(e);
+      }
+    };
+    try {
+      lookup(host, { family: undefined, hints: lookupHints(), all: true }, callback);
+    } catch (e) {
+      if (!settled) {
+        settled = true;
+        late.over = true;
+        rejectAnswer(e);
+      } else {
+        lateFailure(e);
+      }
+    }
+    return { answer, late };
   }
 
   // One call of an undici dispatcher's `connect` function, as undici's
@@ -2484,9 +2536,11 @@
       // -- for as long as the hook takes to answer, forever if it never
       // does. The hook is still asked, as node asks it.
       if (signal?.aborted) abandon();
+      const lookupRun = runConnectLookup(lookup, host, port);
+      const { late } = lookupRun;
       let ips;
       try {
-        ips = await runConnectLookup(lookup, host, port);
+        ips = await lookupRun.answer;
       } catch (err) {
         abandon();
         throw new TypeError("fetch failed", { cause: err });
@@ -2494,15 +2548,30 @@
         signal?.removeEventListener("abort", abandon);
       }
       if (signal?.aborted) {
+        late.over = true;
         abandon();
         // The abort race already rejected the fetch with the reason.
         throw aborted();
       }
+      // The hook failed the connection before anything was dialled (a
+      // second callback in the same call, or a throw after answering): node
+      // never connects.
+      if (late.failed) {
+        late.over = true;
+        abandon();
+        throw new TypeError("fetch failed", { cause: late.error });
+      }
       resumed = true;
+      // From here a failure reaches the dial the answer opens: it is
+      // abandoned if it has not connected yet.
+      late.onFail = () => internal.fetchLookupFail(token);
       try {
         raw = await internal.fetchContinue(token, JSON.stringify({ ips }));
       } catch (e) {
+        if (late.failed) throw new TypeError("fetch failed", { cause: late.error });
         throw fetchFailed(e);
+      } finally {
+        late.over = true;
       }
     }
     // A redirect whose Location does not parse: node's cause is the error

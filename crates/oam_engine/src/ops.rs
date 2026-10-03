@@ -90,7 +90,7 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
     // __oam: the internal op table consumed by js/bootstrap.js. Not public
     // API; the bootstrap wraps these in web-shaped surfaces (fetch, ...).
     let internal = v8::Object::new(scope);
-    let internal_bindings: [(&str, v8::Local<v8::Function>); 24] = [
+    let internal_bindings: [(&str, v8::Local<v8::Function>); 25] = [
         ("fetch", v8::Function::new(scope, op_fetch).unwrap()),
         // A fetch whose dispatcher has a `connect.lookup` hook parks before
         // dialling a host name; JS runs the hook and resumes or drops it.
@@ -107,6 +107,12 @@ pub(crate) fn install(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::C
         (
             "fetchAbandon",
             v8::Function::new(scope, op_fetch_abandon).unwrap(),
+        ),
+        // A lookup hook that answered called back again with a failure:
+        // abandon the connection its answer is opening, if not connected.
+        (
+            "fetchLookupFail",
+            v8::Function::new(scope, op_fetch_lookup_fail).unwrap(),
         ),
         // An aborted fetch (or a destroyed http.request) with no response
         // head yet: take its request off the wire.
@@ -534,6 +540,25 @@ fn op_fetch_abandon(
     let continuations = core_runtime!(scope).fetch_continuations();
     let dropped = oam_core::ops::fetch_abandon(token, &continuations);
     rv.set(v8::Boolean::new(scope, dropped).into());
+}
+
+/// `__oam.fetchLookupFail(token)`, synchronous: the `connect.lookup` hook
+/// that answered lookup `token` called back again with a failure (#169).
+/// Abandons the connection that answer is opening if it has not connected
+/// yet, and returns whether it did; JS then fails the fetch with the hook's
+/// failure as the cause. Once connected, the hook's later callbacks are
+/// ignored, as node ignores them (`HttpTransport::fail_lookup`).
+fn op_fetch_lookup_fail(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let token = args.get(0).number_value(scope).unwrap_or(-1.0);
+    let failed = token >= 0.0
+        && token.fract() == 0.0
+        && token <= u64::MAX as f64
+        && core_runtime!(scope).http_client().fail_lookup(token as u64);
+    rv.set(v8::Boolean::new(scope, failed).into());
 }
 
 /// `__oam.fetchCancel(id)`, synchronous: cancel the fetch started as

@@ -23,8 +23,8 @@ use hyper::body::{Frame, Incoming};
 use hyper_util::client::proxy::matcher::Matcher;
 
 use super::connector::{
-    ConnInfo, ConnectTimedOut, HookPin, NeedsLookup, OamConnector, Shared, SuppliedConn,
-    SuppliedConns, TlsSetupError, Via, authority_key,
+    ConnInfo, ConnectTimedOut, HookPin, LookupGate, LookupGates, NeedsLookup, OamConnector, Shared,
+    SuppliedConn, SuppliedConns, TlsSetupError, Via, authority_key,
 };
 use super::pool::{Dial, Pool, PoolError, PoolFail};
 use super::prepare::host_for_connect;
@@ -67,6 +67,9 @@ pub struct HttpTransport {
     /// The pools of the lookup-hooked undici dispatchers, by the id the
     /// `undici` shim gave each one (see [`HttpTransport::agent_route`]).
     agents: Arc<Mutex<HashMap<u64, Pool>>>,
+    /// The hook answers whose connection is being made, by lookup token
+    /// ([`HttpTransport::fail_lookup`]).
+    gates: Arc<Mutex<LookupGates>>,
 }
 
 impl Default for HttpTransport {
@@ -107,7 +110,29 @@ impl HttpTransport {
             pool,
             shared,
             agents: Arc::new(Mutex::new(HashMap::new())),
+            gates: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// A `connect.lookup` hook that already answered lookup `token` called
+    /// back again with a failure (#169): abandon the connection its answer
+    /// is opening, if that connection has not connected yet -- node fails a
+    /// socket that is still connecting and ignores the hook once it is not.
+    /// True if it was abandoned (the fetch then fails, and JS reports the
+    /// hook's failure as its cause).
+    pub fn fail_lookup(&self, token: u64) -> bool {
+        let gate = self
+            .gates
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&token)
+            .and_then(std::sync::Weak::upgrade);
+        gate.is_some_and(|gate| gate.fail())
+    }
+
+    /// The gate a hook answer for lookup `token` dials through.
+    pub(crate) fn lookup_gate(&self, token: u64) -> Arc<LookupGate> {
+        LookupGate::open(&self.gates, token)
     }
 
     pub fn user_agent(&self) -> &HeaderValue {
@@ -464,11 +489,17 @@ impl Route {
     /// send to that authority opens a connection at these addresses, and
     /// spends them. No-op on a pooled route.
     pub fn set_addrs(&self, key: &str, addrs: Vec<crate::net_connect::PinAddr>) {
+        self.set_pin(HookPin {
+            key: key.to_string(),
+            addrs,
+            gate: None,
+        });
+    }
+
+    /// [`Route::set_addrs`] with the answer's [`LookupGate`].
+    pub(crate) fn set_pin(&self, pin: HookPin) {
         if let Some(hooked) = &self.hooked {
-            *hooked.pin.lock().unwrap_or_else(|e| e.into_inner()) = Some(HookPin {
-                key: key.to_string(),
-                addrs,
-            });
+            *hooked.pin.lock().unwrap_or_else(|e| e.into_inner()) = Some(pin);
         }
     }
 }

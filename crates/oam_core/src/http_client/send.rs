@@ -586,24 +586,50 @@ pub async fn fetch(
 /// answer, `{"ips": ["addr", ...]}` in the hook's order (JS has already
 /// applied node's address filtering). Resolves like [`fetch`]. The parked
 /// fetch is consumed whatever happens: a malformed answer fails it.
-pub async fn fetch_continue(
+///
+/// The parked fetch is taken and handed the answer when this is CALLED, not
+/// when the future is first polled, so the answer's [`LookupGate`] is
+/// registered before the op returns to JS: a failure the hook reports right
+/// after (a microtask later) finds the connection still being made, as it
+/// does in node, whose connect cannot complete before the event loop polls.
+///
+/// [`LookupGate`]: super::connector::LookupGate
+pub fn fetch_continue(
     token: u64,
     lookup: String,
     bodies: FetchBodies,
     ids: Arc<AtomicU64>,
     continuations: FetchContinuations,
-) -> OpOutcome {
-    let pending = take_parked(&continuations, token, Wants::Addresses);
+) -> impl std::future::Future<Output = OpOutcome> + Send + 'static {
+    let resumed = resume_with_answer(token, &lookup, &continuations);
+    async move {
+        match resumed {
+            Ok(state) => run(state, &bodies, &ids, &continuations).await,
+            Err(text) => OpOutcome::Failed(text),
+        }
+    }
+}
+
+/// [`fetch_continue`]'s synchronous half: the parked fetch, holding the
+/// hook's answer, or the op's failure.
+fn resume_with_answer(
+    token: u64,
+    lookup: &str,
+    continuations: &FetchContinuations,
+) -> Result<LoopState, String> {
+    let pending = take_parked(continuations, token, Wants::Addresses);
     let Some(PendingFetch { state, key, .. }) = pending else {
-        return OpOutcome::Failed(format!("fetch: lookup continuation {token} is gone"));
+        return Err(format!("fetch: lookup continuation {token} is gone"));
     };
     #[derive(serde::Deserialize)]
     struct Lookup {
         ips: Vec<String>,
     }
-    let lookup: Lookup = match serde_json::from_str(&lookup) {
+    let lookup: Lookup = match serde_json::from_str(lookup) {
         Ok(lookup) => lookup,
-        Err(e) => return OpOutcome::Failed(format!("fetch: malformed lookup result: {e}")),
+        Err(e) => {
+            return Err(format!("fetch: malformed lookup result: {e}"));
+        }
     };
     let mut addrs = Vec::with_capacity(lookup.ips.len());
     for ip in &lookup.ips {
@@ -612,16 +638,23 @@ pub async fn fetch_continue(
         match ip.parse::<crate::net_connect::PinAddr>() {
             Ok(addr) => addrs.push(addr),
             Err(e) => {
-                return OpOutcome::Failed(format!(
+                return Err(format!(
                     "fetch: connect pin failed: pin ip '{ip}' is not an IP: {e}"
                 ));
             }
         }
     }
     // An empty list reaches the connector, which fails it as node's
-    // ERR_INVALID_IP_ADDRESS (JS refuses one before it gets here).
-    state.route.set_addrs(&key, addrs);
-    run(state, &bodies, &ids, &continuations).await
+    // ERR_INVALID_IP_ADDRESS (JS refuses one before it gets here). The
+    // hook's later callbacks can still fail the connection this answer
+    // opens, by this token, until it has connected (#169).
+    let gate = state.transport.lookup_gate(token);
+    state.route.set_pin(super::connector::HookPin {
+        key,
+        addrs,
+        gate: Some(gate),
+    });
+    Ok(state)
 }
 
 /// The fetch parked under `token`, if it waits for `wants`. One that waits
