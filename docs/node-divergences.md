@@ -1664,18 +1664,72 @@ TLS options and the factory were ignored and oam connected by itself. What diffe
   destination check, for one -- could not run; up to 0.16.2 the request was sent without it.
   The same policy written as a `connect` function works. `http.request` is not affected: it
   never goes through an undici dispatcher, in Node or here. `compose()` is not provided.
-- **`MockAgent`, `MockPool` and `MockClient` refuse at construction**, with the same
-  `NotSupportedError`, and so does everything they carry (`disableNetConnect()`,
-  `get(origin).intercept(...).reply(...)`, `assertNoPendingInterceptors()`). undici's mocks
-  INTERCEPT: a request that matches an interceptor is answered from memory and never
-  dialled, and `disableNetConnect()` turns an unmatched one into an error instead of a real
-  connection. oam's `fetch` owns its transport and cannot be intercepted from JS, so up to
-  0.16.2 the three were constructible stubs that intercepted nothing: a suite that installed
-  a `MockAgent`, called `disableNetConnect()` and expected canned answers sent REAL requests
-  to whatever host it named, and read the real answers as its mocks. The classes stay
-  exported, so `import { MockAgent } from 'undici'` still resolves and the failure names
-  itself; point the code under test at a local server instead. Pinned by
-  `undici_mock_dispatchers_refuse_instead_of_reaching_the_network` (e2e).
+**`MockAgent`, `MockPool` and `MockClient`**
+
+They answer requests from their interceptors, as undici's do (#206; up to 0.17.1 they refused
+at construction, and up to 0.16.2 they were stubs that intercepted nothing and let every
+request through to the real host). undici runs a mock inside `dispatch()`; oam's transport
+sends a request itself, so a mock dispatcher is a connect function (above): every connection
+a request through it asks for is an in-memory socket that reads the HTTP/1.1 request the
+transport writes, matches it as undici matches a dispatch -- path (query order ignored),
+method, body and headers, by string, `RegExp` or function, and an origin by string or
+matcher -- and writes the reply back as an HTTP/1.1 response, or fails the request with
+the error undici would: `replyWithError()`'s, or `MockNotMatchedError` with undici's message
+when nothing matches and net connect does not allow the origin. `reply()` (status, data,
+`{ headers, trailers }`; a callback; a data callback), `replyWithError()`, `times()`,
+`persist()`, `delay()`, `defaultReplyHeaders()`, `defaultReplyTrailers()`,
+`replyContentLength()`, `enableNetConnect()` / `disableNetConnect()`, `activate()` /
+`deactivate()`, `get(origin)` (a `MockPool`, or a `MockClient` for `connections: 1`),
+`pendingInterceptors()`, `assertNoPendingInterceptors()`, `close()` and `mockErrors` work
+on every entry point a dispatcher has -- `fetch` with `setGlobalDispatcher` or a `dispatcher`
+option, `undici.fetch`, `undici.request`, and a dispatcher's own `request()` -- for http and
+https origins alike (the in-memory socket is the connection as it is; nothing is wrapped in
+TLS over it), redirect hops included.
+
+It fails **closed**: every byte of a request goes to the in-memory socket first, and only a
+request no interceptor matches, while `enableNetConnect()` allows its origin (or with the
+agent deactivated), is then sent to the network, over the connection the agent it wraps
+would make. Pinned against Node + undici 6.29.0 by `undici_mock_agent_answers_as_undicis_does`
+and `undici_mock_agent_never_reaches_the_network_unless_allowed` (e2e; a local server counts
+what reaches it). What differs:
+
+- **What the matchers and a reply callback see is the request as sent.** The body is the
+  bytes that went out, as a UTF-8 string (`null` with none), where undici's fetch hands them
+  the body as given -- so a body sent as bytes or as a stream matches a string matcher here,
+  and does not under undici (which sees a `Uint8Array`, or `[object ReadableStream]`). The
+  headers are the ones sent, names lowercased, without `host`, `connection` and
+  `transfer-encoding`: for `undici.request` that includes what the transport adds (a
+  `content-length`), where undici's request() shows the caller's object as given. A reply
+  callback's `opts` carry `origin`, `path`, `method`, `body` and `headers`; undici's fetch also
+  passes `maxRedirections` and `upgrade`.
+- **Trailers** set with `reply(..., { trailers })` or `defaultReplyTrailers()` are not sent:
+  `undici.request()`'s `trailers` is `{}` on oam whatever the response (above).
+- **A reply's body runs to the end of the connection**, so a response carries no framing
+  field the reply did not set, as with undici. A `content-length` the reply sets frames the
+  body here: one shorter than the body's bytes (`replyContentLength()` counts a string's
+  UTF-16 units, as undici does, so `'café'` gets 4) cuts the body there, where undici's mock
+  delivers all of it. A 1xx reply fails the request on both, with different causes.
+- **`assertNoPendingInterceptors()`'s table** is drawn by `console.table` on a
+  `new Console()`, which oam draws as node does since 0.17.2 (box, columns, inspected cells,
+  display widths; `conformance/cases/370-console-table.mjs`). A `new Console()` still has
+  only `log`, `info`, `debug`, `warn`, `error` and `table`, and `console.table` tabulates a
+  Map or Set *iterator* as a plain object, where node peeks at its entries.
+- **`dispatch()`** on the three refuses with `NotSupportedError`, as on every shim dispatcher:
+  undici's mock answers a direct `dispatch(opts, handler)` call.
+- **Another copy's MockAgent.** `import 'undici'` is the shim even when the npm package is
+  installed, so a suite gets this MockAgent. The npm package can still be loaded by path, and
+  its own MockAgent works with its own `fetch` / `request`; installed as the global
+  dispatcher with that copy's `setGlobalDispatcher()` -- the slot every copy of undici
+  shares, which node's `fetch` reads -- an active one makes oam's `fetch` fail with
+  `NotSupportedError` (`a_foreign_global_mock_agent_is_refused_not_bypassed`, e2e): oam's
+  fetch cannot run its interceptors, and does not send the request to the network in their
+  place. The shim's `setGlobalDispatcher()` does not write that slot, so another copy of
+  undici does not see the shim's global dispatcher. (That copy's own fetch delivers a mock's
+  body since 0.17.2: it finalizes a response with `stream.finished()` on a web stream and
+  `performance.markResourceTiming()`, neither of which oam had --
+  `conformance/cases/369-stream-finished-web-streams.mjs`,
+  `371-performance-mark-resource-timing.mjs`. oam's `perf_hooks.performance` and global
+  `performance` are still two objects; the resource entries are the former's.)
 
 **`ProxyAgent`, `EnvHttpProxyAgent`, and the undici names oam exports to refuse**
 
@@ -1712,8 +1766,7 @@ since a name missing from an ES module is a link-time error, a package that mere
   `DecoratorHandler`, `createRedirectInterceptor`, `connect()`, `upgrade()` and
   `pipeline()` all work through `dispatch()`. Each is exported so an `import` of it links,
   and fails with `NotSupportedError` when constructed or called (`connect` / `upgrade`
-  through their callback or promise). `mockErrors.MockNotMatchedError` is exported as a
-  class; nothing raises it, since the Mock* classes refuse. Pinned, with the shim's whole
+  through their callback or promise). Pinned, with the shim's whole
   export list, by `undici_exports_link_and_refuse_what_oam_cannot_run` (e2e).
 - **Not exported at all** (an `import` of one is still a link-time `SyntaxError`):
   `getCookies`, `getSetCookies`, `setCookie`, `deleteCookie`, `parseMIMEType`,

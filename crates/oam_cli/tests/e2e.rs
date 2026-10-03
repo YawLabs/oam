@@ -7683,7 +7683,7 @@ env-request 200 plain /e12 ["CONNECT 127.0.0.1:P HTTP/1.1 | host: 127.0.0.1:P | 
 }
 
 /// The undici names that work through `dispatch()` -- which oam does not run
-/// -- are exported and refuse when used, as the Mock* classes do (#208): a
+/// -- are exported and refuse when used (#208): a
 /// name missing from an ES module stops the whole program at import with a
 /// SyntaxError, whether or not the importer ever uses it, so
 /// `@actions/http-client` 4 and `@upstash/context7-mcp` (both `import {
@@ -7848,70 +7848,406 @@ server.close();
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
 }
 
-/// undici's MockAgent / MockPool / MockClient INTERCEPT: a request that
-/// matches an interceptor is answered from memory and never dialled, and
-/// disableNetConnect() turns an unmatched one into an error instead of a real
-/// connection. oam's fetch owns its transport and cannot be intercepted from
-/// JS. Up to 0.16.2 the three were constructible stubs that intercepted
-/// nothing, so a suite that installed a MockAgent, called disableNetConnect()
-/// and expected canned answers made REAL requests to whatever host it named
-/// and read the real answers as its mocks. They now refuse at construction,
-/// the way a dispatcher oam cannot run does, and stay exported so the import
-/// resolves and the failure names itself.
+/// undici's MockAgent / MockPool / MockClient answer fetch, undici.fetch,
+/// undici.request and a dispatcher's own request() from their interceptors,
+/// as undici's do (#206): reply() with an object, a callback or a data
+/// callback, replyWithError(), times(), persist(), delay(), the path / method /
+/// body / headers / query matchers, defaultReplyHeaders() and
+/// replyContentLength(), an https origin, an origin matcher, a redirect
+/// between mocked origins, a gzip body, pendingInterceptors() and
+/// assertNoPendingInterceptors(), and undici's argument checks. Up to 0.17.1
+/// the three refused at construction. The expected lines are node v22.22.2's
+/// with undici 6.29.0 installed, running the same script.
 #[test]
-fn undici_mock_dispatchers_refuse_instead_of_reaching_the_network() {
+fn undici_mock_agent_answers_as_undicis_does() {
     let script = write_temp(
-        "undici_mock_refused/main.mjs",
+        "undici_mock_agent/main.mjs",
+        r##"import { MockAgent, MockPool, MockClient, setGlobalDispatcher, request, fetch as undiciFetch, mockErrors, errors } from 'undici';
+import zlib from 'node:zlib';
+
+process.env.CI = 'true';
+const agent = new MockAgent();
+agent.disableNetConnect();
+setGlobalDispatcher(agent);
+const pool = agent.get('http://example.invalid');
+console.log('pool', pool instanceof MockPool, agent.isMockActive);
+
+pool.intercept({ path: '/x', method: 'GET' }).reply(200, { mocked: true }, { headers: { 'x-a': '1' } });
+let r = await fetch('http://example.invalid/x');
+console.log('object reply', r.status, JSON.stringify(r.statusText), JSON.stringify([...r.headers]), await r.text());
+
+pool.intercept({ path: '/cb?b=2&a=1', method: 'POST' }).reply((opts) => {
+  console.log('callback sees', opts.origin, opts.path, opts.method, JSON.stringify(opts.body), opts.headers['x-req'], opts.headers['content-type']);
+  return { statusCode: 201, data: 'made', responseOptions: { headers: { 'x-cb': 'y' } } };
+});
+r = await fetch('http://example.invalid/cb?a=1&b=2', { method: 'POST', body: 'payload', headers: { 'x-req': 'v' } });
+console.log('callback reply', r.status, JSON.stringify([...r.headers]), await r.text());
+
+pool.intercept({ path: '/dcb' }).reply(200, (opts) => 'data for ' + opts.path);
+console.log('data callback', await (await fetch('http://example.invalid/dcb')).text());
+
+pool.intercept({ path: '/err' }).replyWithError(new Error('kaboom'));
+try { await fetch('http://example.invalid/err'); } catch (e) { console.log('replyWithError fetch', e.name, e.message, e.cause.message); }
+pool.intercept({ path: '/err' }).replyWithError(new Error('kaboom2'));
+try { await request('http://example.invalid/err'); } catch (e) { console.log('replyWithError request', e.name, e.message); }
+
+pool.intercept({ path: '/t' }).reply(200, 't').times(2);
+console.log('times', await (await fetch('http://example.invalid/t')).text(), await (await fetch('http://example.invalid/t')).text());
+try { await fetch('http://example.invalid/t'); } catch (e) { console.log('times used up', e.message, e.cause.name, e.cause.code, '|', e.cause.message); }
+pool.intercept({ path: '/p' }).reply(200, 'p').persist();
+const persisted = [];
+for (let i = 0; i < 3; i++) persisted.push(await (await fetch('http://example.invalid/p')).text());
+console.log('persist', persisted.join(','));
+
+pool.intercept({ path: '/m', method: 'POST' }).reply(200, 'm');
+for (const [label, url] of [['path', 'http://example.invalid/nope'], ['method', 'http://example.invalid/m'], ['origin', 'http://other.invalid/m']]) {
+  try { await fetch(url); console.log('unmatched', label, 'NO ERROR'); } catch (e) { console.log('unmatched', label, e.cause.name, '|', e.cause.message); }
+}
+try { await request('http://example.invalid/nope'); } catch (e) {
+  console.log('unmatched request', e.name, e.code, e instanceof mockErrors.MockNotMatchedError, e instanceof errors.UndiciError);
+}
+
+pool.intercept({ path: '/b', method: 'POST', body: 'exact' }).reply(200, 'body exact');
+pool.intercept({ path: '/b', method: 'POST', body: /^re/ }).reply(200, 'body regex');
+pool.intercept({ path: '/b', method: 'POST', body: (b) => b === 'fn' }).reply(200, 'body fn');
+for (const b of ['exact', 'regexp', 'fn', 'none']) {
+  try { console.log('body', b, await (await fetch('http://example.invalid/b', { method: 'POST', body: b })).text()); } catch (e) { console.log('body', b, e.cause.message); }
+}
+pool.intercept({ path: '/h', headers: { 'x-k': 'v' } }).reply(200, 'hdr');
+pool.intercept({ path: '/h', headers: (h) => h['x-fn'] === '1' }).reply(200, 'hdr fn');
+console.log('headers', await (await fetch('http://example.invalid/h', { headers: { 'X-K': 'v' } })).text(),
+  await (await fetch('http://example.invalid/h', { headers: { 'x-fn': '1' } })).text());
+pool.intercept({ path: '/q', query: { b: '2', a: '1' } }).reply(200, 'query');
+pool.intercept({ path: (p) => p.startsWith('/fnpath') }).reply(200, 'fnpath');
+pool.intercept({ path: /^\/rx/ }).reply(200, 'rxpath');
+console.log('paths', await (await fetch('http://example.invalid/q?a=1&b=2')).text(),
+  await (await fetch('http://example.invalid/fnpath/x')).text(), await (await fetch('http://example.invalid/rx1')).text());
+
+pool.intercept({ path: '/d' }).reply(200, 'late').delay(50);
+const t0 = Date.now();
+await (await fetch('http://example.invalid/d')).text();
+console.log('delay held the reply', Date.now() - t0 >= 45);
+
+pool.intercept({ path: '/r', method: 'PUT', body: 'up' }).reply(202, 'req ok', { headers: { 'x-r': '1' } });
+const rr = await request('http://example.invalid/r', { method: 'PUT', body: 'up' });
+console.log('request', rr.statusCode, JSON.stringify(rr.headers), await rr.body.text());
+pool.intercept({ path: '/own' }).reply(200, 'own request');
+console.log('pool.request', await (await pool.request({ path: '/own', method: 'GET' })).body.text());
+pool.intercept({ path: '/uf' }).reply(200, 'undici.fetch');
+console.log('undici.fetch', await (await undiciFetch('http://example.invalid/uf')).text());
+
+pool.intercept({ path: '/s' }).reply(299, 'odd');
+r = await fetch('http://example.invalid/s');
+console.log('unknown status', r.status, JSON.stringify(r.statusText), await r.text());
+pool.intercept({ path: '/n' }).reply(204, 'dropped');
+console.log('204', JSON.stringify(await (await fetch('http://example.invalid/n')).text()));
+pool.intercept({ path: '/hd', method: 'HEAD' }).reply(200, 'dropped', { headers: { 'x-h': '1' } });
+r = await fetch('http://example.invalid/hd', { method: 'HEAD' });
+console.log('HEAD', r.status, JSON.stringify([...r.headers]), JSON.stringify(await r.text()));
+pool.intercept({ path: '/arr' }).reply(200, 'x', { headers: { 'x-multi': ['a', 'b'], 'set-cookie': ['c=1', 'd=2'] } });
+r = await fetch('http://example.invalid/arr');
+console.log('array headers', JSON.stringify([...r.headers]), JSON.stringify(r.headers.getSetCookie()));
+pool.intercept({ path: '/buf' }).reply(200, Buffer.from('buf'));
+pool.intercept({ path: '/num' }).reply(200, 42);
+console.log('data kinds', await (await fetch('http://example.invalid/buf')).text(), await (await fetch('http://example.invalid/num')).text());
+pool.intercept({ path: '/redir' }).reply(302, '', { headers: { location: 'http://two.invalid/dest' } });
+agent.get('http://two.invalid').intercept({ path: '/dest' }).reply(200, 'landed');
+r = await fetch('http://example.invalid/redir');
+console.log('redirect', r.status, r.url, r.redirected, await r.text());
+pool.intercept({ path: '/gz' }).reply(200, zlib.gzipSync('zipped'), { headers: { 'content-encoding': 'gzip' } });
+console.log('gzip', await (await fetch('http://example.invalid/gz')).text());
+const two = agent.get('http://three.invalid');
+two.intercept({ path: '/cl' }).defaultReplyHeaders({ 'x-def': 'd' }).replyContentLength().reply(200, 'abcd');
+r = await fetch('http://three.invalid/cl');
+console.log('defaults', JSON.stringify([...r.headers]), await r.text());
+
+agent.get('https://secure.invalid').intercept({ path: '/s' }).reply(200, 'secure');
+console.log('https', await (await fetch('https://secure.invalid/s')).text());
+
+agent.get(/\.wild\.invalid$/).intercept({ path: '/w' }).reply(200, 'wildcard').times(2);
+console.log('origin matcher', await (await fetch('http://a.wild.invalid/w')).text(), await (await fetch('http://b.wild.invalid/w')).text());
+
+pool.intercept({ path: '/never' }).reply(200, 'never');
+console.log('pending', agent.pendingInterceptors().map((i) => `${i.origin} ${i.method} ${i.path} ${i.timesInvoked}/${i.times}`).join('; '));
+try { agent.assertNoPendingInterceptors(); } catch (e) { console.log(e.name, e.code); console.log(e.message); }
+
+const single = new MockAgent({ connections: 1 });
+console.log('connections 1', single.get('http://c.invalid') instanceof MockClient, single.get('http://c.invalid') === single.get('http://c.invalid'));
+try { new MockPool('http://x.invalid', {}); } catch (e) { console.log('MockPool needs an agent', e.name, e.message); }
+try { pool.intercept({ path: '/z' }).reply(200, 'z').times(0); } catch (e) { console.log('times(0)', e.name, e.message); }
+try { pool.intercept({ path: '/z' }).reply(200, 'z').delay(-1); } catch (e) { console.log('delay(-1)', e.name, e.message); }
+try { pool.intercept({}); } catch (e) { console.log('no path', e.name, e.message); }
+try { agent.enableNetConnect(42); } catch (e) { console.log('bad matcher', e.name, e.message); }
+const e = new mockErrors.MockNotMatchedError();
+console.log('MockNotMatchedError', e.name, e.code, e.message, e instanceof errors.UndiciError);
+await agent.close();
+console.log('closed', agent.pendingInterceptors().length);
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    let expected = r##"pool true true
+object reply 200 "OK" [["x-a","1"]] {"mocked":true}
+callback sees http://example.invalid /cb?a=1&b=2 POST "payload" v text/plain;charset=UTF-8
+callback reply 201 [["x-cb","y"]] made
+data callback data for /dcb
+replyWithError fetch TypeError fetch failed kaboom
+replyWithError request Error kaboom2
+times t t
+times used up fetch failed MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED | Mock dispatch not matched for path '/t': subsequent request to origin http://example.invalid was not allowed (net.connect disabled)
+persist p,p,p
+unmatched path MockNotMatchedError | Mock dispatch not matched for path '/nope': subsequent request to origin http://example.invalid was not allowed (net.connect disabled)
+unmatched method MockNotMatchedError | Mock dispatch not matched for method 'GET' on path '/m': subsequent request to origin http://example.invalid was not allowed (net.connect disabled)
+unmatched origin MockNotMatchedError | Mock dispatch not matched for path '/m': subsequent request to origin http://other.invalid was not allowed (net.connect disabled)
+unmatched request MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED true true
+body exact body exact
+body regexp body regex
+body fn body fn
+body none Mock dispatch not matched for path '/b': subsequent request to origin http://example.invalid was not allowed (net.connect disabled)
+headers hdr hdr fn
+paths query fnpath rxpath
+delay held the reply true
+request 202 {"x-r":"1"} req ok
+pool.request own request
+undici.fetch undici.fetch
+unknown status 299 "unknown" odd
+204 ""
+HEAD 200 [["x-h","1"]] ""
+array headers [["set-cookie","c=1"],["set-cookie","d=2"],["x-multi","a, b"]] ["c=1","d=2"]
+data kinds buf 42
+redirect 200 http://two.invalid/dest true landed
+gzip zipped
+defaults [["content-length","4"],["x-def","d"]] abcd
+https secure
+origin matcher wildcard wildcard
+pending http://example.invalid POST /m 0/1; http://example.invalid GET /never 0/1
+UndiciError UND_ERR
+2 interceptors are pending:
+
+┌─────────┬────────┬──────────────────────────┬──────────┬─────────────┬────────────┬─────────────┬───────────┐
+│ (index) │ Method │ Origin                   │ Path     │ Status code │ Persistent │ Invocations │ Remaining │
+├─────────┼────────┼──────────────────────────┼──────────┼─────────────┼────────────┼─────────────┼───────────┤
+│ 0       │ 'POST' │ 'http://example.invalid' │ '/m'     │ 200         │ '❌'       │ 0           │ 1         │
+│ 1       │ 'GET'  │ 'http://example.invalid' │ '/never' │ 200         │ '❌'       │ 0           │ 1         │
+└─────────┴────────┴──────────────────────────┴──────────┴─────────────┴────────────┴─────────────┴───────────┘
+connections 1 true true
+MockPool needs an agent InvalidArgumentError Argument opts.agent must implement Agent
+times(0) InvalidArgumentError repeatTimes must be a valid integer > 0
+delay(-1) InvalidArgumentError waitInMs must be a valid integer > 0
+no path InvalidArgumentError opts.path must be defined
+bad matcher InvalidArgumentError Unsupported matcher. Must be one of String|Function|RegExp.
+MockNotMatchedError MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED The request does not match any registered mock dispatches true
+closed 0"##;
+    assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// A MockAgent fails CLOSED (#206; the 0.16.3 advisory was a mock that
+/// failed open): with net connect disabled, a request no interceptor matches
+/// fails with MockNotMatchedError and not a byte of it reaches the network --
+/// on every entry point a dispatcher has, for a POST with a body, for an
+/// https origin, and for a redirect from a mocked origin to an unmocked one.
+/// Net connect enabled for another host changes nothing; enabled for this
+/// host, an unmatched request goes through while a matched one is still
+/// answered from memory; a deactivated agent sends everything through. A
+/// real local server counts what reaches it. The expected lines are node
+/// v22.22.2's with undici 6.29.0 installed, running the same script.
+#[test]
+fn undici_mock_agent_never_reaches_the_network_unless_allowed() {
+    let script = write_temp(
+        "undici_mock_fail_closed/main.mjs",
         r##"import http from 'node:http';
-import * as undici from 'undici';
+import { MockAgent, setGlobalDispatcher, request, fetch as undiciFetch } from 'undici';
 
+// A real local server: whatever reaches it is counted.
 const hits = [];
-const server = http.createServer((req, res) => { hits.push(req.url); res.end('direct ' + req.url); });
-await new Promise((r) => server.listen(0, '127.0.0.1', r));
-const base = `http://127.0.0.1:${server.address().port}`;
+const server = http.createServer((req, res) => {
+  hits.push(req.method + ' ' + req.url);
+  res.end('real ' + req.url);
+});
+await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+const host = '127.0.0.1:' + server.address().port;
+const local = 'http://' + host;
 
-function attempt(name, run) {
+const agent = new MockAgent();
+agent.disableNetConnect();
+setGlobalDispatcher(agent);
+const pool = agent.get(local);
+pool.intercept({ path: '/mocked' }).reply(200, 'from the mock').persist();
+agent.get('http://mocked.invalid').intercept({ path: '/hop' }).reply(302, '', { headers: { location: local + '/redirected' } }).persist();
+
+async function attempt(label, run) {
   try {
-    run();
-    console.log(name, 'NO THROW');
+    const out = await run();
+    console.log(label, 'answered', out);
   } catch (e) {
-    console.log(name, e.name, e.code);
+    const cause = e.cause ?? e;
+    console.log(label, 'failed', cause.name, cause.code);
   }
 }
-attempt('MockAgent', () => new undici.MockAgent());
-attempt('MockPool', () => new undici.MockPool(base, {}));
-attempt('MockClient', () => new undici.MockClient(base, {}));
-// The test-double shape a suite writes, in one go.
-attempt('mock-suite', () => {
-  const agent = new undici.MockAgent();
-  agent.disableNetConnect();
-  undici.setGlobalDispatcher(agent);
-  agent.get(base).intercept({ path: '/m' }).reply(200, 'mocked');
-});
-console.log('exported', typeof undici.MockAgent, typeof undici.MockPool, typeof undici.MockClient);
-try {
-  new undici.MockAgent();
-} catch (e) {
-  console.log('names itself', e.message.startsWith("undici's MockAgent is not supported on oam"));
-}
-// Nothing was sent while all that was refused, and the global dispatcher is
-// untouched, so an honest request still works.
-const res = await fetch(base + '/live');
-await res.text();
-console.log('still serves', res.status, JSON.stringify(hits));
+const text = async (r) => r.status + ' ' + (await r.text());
+const body = async (r) => r.statusCode + ' ' + (await r.body.text());
+
+// Net connect disabled: a matched request is answered from memory, and an
+// unmatched one fails without a byte reaching the server, on every entry point.
+await attempt('matched global fetch', async () => text(await fetch(local + '/mocked')));
+await attempt('unmatched global fetch', async () => text(await fetch(local + '/a')));
+await attempt('unmatched fetch dispatcher option', async () => text(await fetch(local + '/b', { dispatcher: agent })));
+await attempt('unmatched undici.fetch', async () => text(await undiciFetch(local + '/c')));
+await attempt('unmatched undici.request', async () => body(await request(local + '/d')));
+await attempt('unmatched request dispatcher option', async () => body(await request(local + '/e', { dispatcher: agent })));
+await attempt('unmatched agent.request', async () => body(await agent.request({ origin: local, path: '/f', method: 'GET' })));
+await attempt('unmatched pool.request', async () => body(await pool.request({ path: '/g', method: 'GET' })));
+await attempt('unmatched POST with a body', async () => text(await fetch(local + '/h', { method: 'POST', body: 'secret' })));
+await attempt('redirect to an unmatched origin', async () => text(await fetch('http://mocked.invalid/hop')));
+await attempt('https unmatched', async () => text(await fetch('https://secure.invalid/i')));
+console.log('reached the server while disabled', JSON.stringify(hits));
+
+// Net connect for another host only: still refused here.
+agent.enableNetConnect('elsewhere.invalid');
+await attempt('net connect for another host', async () => text(await fetch(local + '/j')));
+try { await fetch(local + '/j2'); } catch (e) { console.log(e.cause.message.replace(host, 'HOST')); }
+console.log('reached the server', JSON.stringify(hits));
+
+// Net connect for this host: an unmatched request goes through, a matched one
+// is still answered from memory.
+agent.enableNetConnect(host);
+await attempt('net connect for this host', async () => text(await fetch(local + '/k', { method: 'POST', body: 'payload' })));
+await attempt('matched with net connect', async () => text(await fetch(local + '/mocked')));
+await attempt('request through', async () => body(await request(local + '/l')));
+console.log('reached the server', JSON.stringify(hits));
+
+// Deactivated: everything goes through, as with no mock at all.
+agent.disableNetConnect();
+agent.deactivate();
+await attempt('deactivated', async () => text(await fetch(local + '/mocked')));
+agent.activate();
+await attempt('activated again', async () => text(await fetch(local + '/mocked')));
+console.log('reached the server', JSON.stringify(hits));
 server.close();
 "##,
     );
     let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
     let (stdout, _) = run_script_ok(&script, out);
-    let expected = "MockAgent NotSupportedError UND_ERR_NOT_SUPPORTED\n\
-         MockPool NotSupportedError UND_ERR_NOT_SUPPORTED\n\
-         MockClient NotSupportedError UND_ERR_NOT_SUPPORTED\n\
-         mock-suite NotSupportedError UND_ERR_NOT_SUPPORTED\n\
-         exported function function function\n\
-         names itself true\n\
-         still serves 200 [\"/live\"]";
+    let expected = r##"matched global fetch answered 200 from the mock
+unmatched global fetch failed MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED
+unmatched fetch dispatcher option failed MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED
+unmatched undici.fetch failed MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED
+unmatched undici.request failed MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED
+unmatched request dispatcher option failed MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED
+unmatched agent.request failed MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED
+unmatched pool.request failed MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED
+unmatched POST with a body failed MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED
+redirect to an unmatched origin failed MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED
+https unmatched failed MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED
+reached the server while disabled []
+net connect for another host failed MockNotMatchedError UND_MOCK_ERR_MOCK_NOT_MATCHED
+Mock dispatch not matched for path '/j2': subsequent request to origin http://HOST was not allowed (net.connect is not enabled for this origin)
+reached the server []
+net connect for this host answered 200 real /k
+matched with net connect answered 200 from the mock
+request through answered 200 real /l
+reached the server ["POST /k","GET /l"]
+deactivated answered 200 real /mocked
+activated again answered 200 from the mock
+reached the server ["POST /k","GET /l","GET /mocked"]"##;
     assert_eq!(stdout.trim().replace("\r\n", "\n"), expected);
+}
+
+/// A MockAgent from another copy of undici -- the npm package loaded by path,
+/// or one bundled into a dependency -- installed as the global dispatcher
+/// with that copy's setGlobalDispatcher(), in the slot every copy shares
+/// (`Symbol.for('undici.globalDispatcher.1')`, which node's fetch reads):
+/// oam's fetch cannot run its interceptors, so it fails rather than send the
+/// request to the network in their place, and a request given its own
+/// dispatcher, or one after the slot no longer holds a mock, goes as usual.
+/// Up to 0.17.1 oam's fetch ignored the slot, so such a mock failed open.
+/// (oam-specific: node's fetch would run that copy's dispatch().)
+#[test]
+fn a_foreign_global_mock_agent_is_refused_not_bypassed() {
+    let script = write_temp(
+        "undici_foreign_mock/main.mjs",
+        r##"import http from 'node:http';
+import { Agent } from 'undici';
+
+const hits = [];
+const server = http.createServer((req, res) => { hits.push(req.url); res.end('real'); });
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+const base = `http://127.0.0.1:${server.address().port}`;
+const slot = Symbol.for('undici.globalDispatcher.1');
+// What another copy's setGlobalDispatcher(new MockAgent()) leaves there.
+const foreign = { isMockActive: true, dispatch() { throw new Error('not called'); } };
+Object.defineProperty(globalThis, slot, { value: foreign, writable: true, enumerable: false, configurable: false });
+try {
+  await fetch(base + '/a');
+  console.log('fetch went through');
+} catch (e) {
+  console.log('refused', e.message, e.cause.name, e.cause.code);
+}
+const own = await fetch(base + '/b', { dispatcher: new Agent() });
+console.log('own dispatcher', own.status, await own.text());
+foreign.isMockActive = false;
+const inactive = await fetch(base + '/c');
+console.log('inactive mock', inactive.status, await inactive.text());
+console.log('reached', JSON.stringify(hits));
+server.close();
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "refused fetch failed NotSupportedError UND_ERR_NOT_SUPPORTED\n\
+         own dispatcher 200 real\n\
+         inactive mock 200 real\n\
+         reached [\"/b\",\"/c\"]"
+    );
+}
+
+/// A connect function's socket destroyed with an error after it took the
+/// request -- before any answer -- fails the fetch with that error as its
+/// cause, as in node; one that ends instead fails it with undici's "other
+/// side closed". Up to 0.17.1 the destroyed one hung the fetch forever: the
+/// pipe the transport reads a supplied socket through did not read its close
+/// as the peer closing while a read of the request was parked (the MockAgent's
+/// replyWithError() and every MockNotMatchedError go this way). Measured on
+/// node v22.22.2 with undici 6.29.0.
+#[test]
+fn a_connector_socket_destroyed_before_answering_fails_the_fetch() {
+    let script = write_temp(
+        "undici_connector_destroyed/main.mjs",
+        r##"import { Agent } from 'undici';
+import { Duplex } from 'node:stream';
+async function run(mode) {
+  const agent = new Agent({ connect(params, cb) {
+    const s = new Duplex({
+      read() {},
+      write(chunk, enc, done) {
+        done();
+        queueMicrotask(() => {
+          if (mode === 'destroy') s.destroy(new Error('boom'));
+          else s.push(null);
+        });
+      },
+    });
+    cb(null, s);
+  } });
+  try {
+    const r = await fetch('http://example.invalid/x', { dispatcher: agent });
+    console.log(mode, r.status);
+  } catch (e) {
+    console.log(mode, e.message, e.cause && e.cause.message);
+  }
+}
+await run('destroy');
+await run('end');
+"##,
+    );
+    let out = oam(&["run", "--no-check", script.to_str().unwrap()]);
+    let (stdout, _) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "destroy fetch failed boom\nend fetch failed other side closed"
+    );
 }
 
 /// `import 'undici'`'s error classes are undici's, and fetch's causes are

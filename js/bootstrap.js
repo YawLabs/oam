@@ -2120,6 +2120,11 @@
   //
   // Built from intrinsics captured here, as __oamMakeSysError is: a script
   // that replaces globalThis.Error changes nothing.
+  // undici's global dispatcher slot (lib/global.js): a registered symbol on
+  // globalThis, so every copy of undici in a process -- node's own and the
+  // npm package's -- reads and writes the same one.
+  const kUndiciGlobalDispatcher = Symbol.for("undici.globalDispatcher.1");
+
   const undiciErrors = (() => {
     const ErrorCtor = Error;
     const mark = (code) => Symbol.for(`undici.error.${code}`);
@@ -3097,6 +3102,25 @@
     // an undici dispatcher.
     let connector = null;
     let policy = null;
+    // The global dispatcher slot every copy of undici shares (node's fetch
+    // reads it): a MockAgent from another copy -- the npm package loaded by
+    // path, or one bundled into a dependency -- put there with that copy's
+    // setGlobalDispatcher. oam's fetch cannot run its interceptors, and
+    // sending the request without them would send what a test meant to keep
+    // in memory to the network, so the fetch fails instead. One read of a
+    // registered symbol: nothing on a fetch with no such thing installed.
+    if (!rawPayload && init.dispatcher == null) {
+      const foreign = globalThis[kUndiciGlobalDispatcher];
+      if (foreign != null && foreign !== holder?.current && foreign.isMockActive === true) {
+        throw new TypeError("fetch failed", {
+          cause: new undiciErrors.NotSupportedError(
+            "A MockAgent from another copy of undici is the global dispatcher: oam's fetch cannot " +
+              "run its interceptors, and does not send the request to the network in their place. " +
+              "Use the MockAgent `import 'undici'` gives on oam",
+          ),
+        });
+      }
+    }
     if (!rawPayload && dispatcher != null) {
       policy = dispatcherPolicy(dispatcher, holder, {
         url: rawUrl,

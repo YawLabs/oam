@@ -19568,6 +19568,147 @@
   // ----------------------------------------------------------- node:console
   // require('console') is the global console plus a Console class bound to
   // caller-provided writables.
+  // node's console.table (lib/internal/console/constructor.js table() and
+  // lib/internal/cli_table.js, v22.22.2): the rows and columns node builds
+  // from the data -- an `(index)` column of the keys, a column per property
+  // (or per `properties`), a `Values` column for primitives; Map and Set as
+  // `(iteration index)` / `Key` / `Values` -- each cell util.inspect()ed as
+  // node does, drawn in node's box characters and padded to node's display
+  // widths. One renderer for the global console and every Console instance.
+  // Returns the text to log, or null when node logs the data as it is.
+  // Not modelled: Map and Set ITERATORS (node peeks at them without
+  // consuming them; here they are tabulated as plain objects).
+  const isFullWidthCodePoint = (code) =>
+    code >= 0x1100 && (
+      code <= 0x115f || code === 0x2329 || code === 0x232a ||
+      (code >= 0x2e80 && code <= 0x3247 && code !== 0x303f) ||
+      (code >= 0x3250 && code <= 0x4dbf) || (code >= 0x4e00 && code <= 0xa4c6) ||
+      (code >= 0xa960 && code <= 0xa97c) || (code >= 0xac00 && code <= 0xd7a3) ||
+      (code >= 0xf900 && code <= 0xfaff) || (code >= 0xfe10 && code <= 0xfe19) ||
+      (code >= 0xfe30 && code <= 0xfe6b) || (code >= 0xff01 && code <= 0xff60) ||
+      (code >= 0xffe0 && code <= 0xffe6) || (code >= 0x1b000 && code <= 0x1b001) ||
+      (code >= 0x1f200 && code <= 0x1f251) || (code >= 0x1f300 && code <= 0x1f64f) ||
+      (code >= 0x20000 && code <= 0x3fffd)
+    );
+  const isZeroWidthCodePoint = (code) =>
+    code <= 0x1f || (code >= 0x7f && code <= 0x9f) || (code >= 0x300 && code <= 0x36f) ||
+    (code >= 0x200b && code <= 0x200f) || (code >= 0x20d0 && code <= 0x20ff) ||
+    (code >= 0xfe00 && code <= 0xfe0f) || (code >= 0xfe20 && code <= 0xfe2f) ||
+    (code >= 0xe0100 && code <= 0xe01ef);
+  // node's getStringWidth with ICU, per code point: 0 for a control, a
+  // combining mark or a format character, 2 for an East Asian wide one --
+  // the CJK ranges, and an emoji shown as one (`\p{Emoji_Presentation}`, so
+  // '❌' is 2 and '❤' 1, a skin-toned emoji 4) -- and 1 for the rest.
+  const ZERO_WIDTH = /^[\p{Mn}\p{Me}\p{Cf}]$/u;
+  const WIDE_EMOJI = /^\p{Emoji_Presentation}$/u;
+  function stringWidth(str) {
+    str = registry.get("util").stripVTControlCharacters(str).normalize("NFC");
+    let width = 0;
+    for (const char of str) {
+      const code = char.codePointAt(0);
+      if (code < 0x7f) {
+        if (code >= 0x20) width++;
+      } else if (isZeroWidthCodePoint(code) || ZERO_WIDTH.test(char)) {
+        // nothing
+      } else if (isFullWidthCodePoint(code) || WIDE_EMOJI.test(char)) {
+        width += 2;
+      } else {
+        width++;
+      }
+    }
+    return width;
+  }
+  function renderCliTable(head, columns) {
+    const renderRow = (row, widths) => {
+      let out = "│ ";
+      for (let i = 0; i < row.length; i++) {
+        out += row[i] + " ".repeat(widths[i] - stringWidth(row[i]));
+        if (i !== row.length - 1) out += " │ ";
+      }
+      return out + " │";
+    };
+    const rows = [];
+    const widths = head.map((h) => stringWidth(h));
+    const longest = Math.max(...columns.map((a) => a.length));
+    for (let i = 0; i < head.length; i++) {
+      const column = columns[i];
+      for (let j = 0; j < longest; j++) {
+        if (rows[j] === undefined) rows[j] = [];
+        const value = (rows[j][i] = Object.prototype.hasOwnProperty.call(column, j) ? column[j] : "");
+        widths[i] = Math.max(widths[i] || 0, stringWidth(value));
+      }
+    }
+    const divider = widths.map((w) => "─".repeat(w + 2));
+    let result = "┌" + divider.join("┬") + "┐\n" + renderRow(head, widths) + "\n" +
+      "├" + divider.join("┼") + "┤\n";
+    for (const row of rows) result += renderRow(row, widths) + "\n";
+    return result + "└" + divider.join("┴") + "┘";
+  }
+  function consoleTable(tabularData, properties, inspectOptions) {
+    if (properties !== undefined && !Array.isArray(properties)) {
+      throw new codes.ERR_INVALID_ARG_TYPE("properties", "Array", properties);
+    }
+    if (tabularData === null || typeof tabularData !== "object") return null;
+    const { inspect } = registry.get("util");
+    const _inspect = (v) => {
+      const depth = v !== null && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length > 2 ? -1 : 0;
+      return inspect(v, { depth, maxArrayLength: 3, breakLength: Infinity, ...inspectOptions });
+    };
+    const getIndexArray = (length) => Array.from({ length }, (_, i) => _inspect(i));
+    if (tabularData instanceof Map) {
+      const keys = [];
+      const values = [];
+      let length = 0;
+      for (const { 0: k, 1: v } of tabularData) {
+        keys.push(_inspect(k));
+        values.push(_inspect(v));
+        length++;
+      }
+      return renderCliTable(["(iteration index)", "Key", "Values"], [getIndexArray(length), keys, values]);
+    }
+    if (tabularData instanceof Set) {
+      const values = [];
+      let length = 0;
+      for (const v of tabularData) {
+        values.push(_inspect(v));
+        length++;
+      }
+      return renderCliTable(["(iteration index)", "Values"], [getIndexArray(length), values]);
+    }
+    const map = { __proto__: null };
+    let hasPrimitives = false;
+    const valuesKeyArray = [];
+    const indexKeyArray = Object.keys(tabularData);
+    for (let i = 0; i < indexKeyArray.length; i++) {
+      const item = tabularData[indexKeyArray[i]];
+      const primitive = item === null || (typeof item !== "function" && typeof item !== "object");
+      if (properties === undefined && primitive) {
+        hasPrimitives = true;
+        valuesKeyArray[i] = _inspect(item);
+      } else {
+        const keys = properties || Object.keys(item);
+        for (const key of keys) {
+          map[key] ??= [];
+          if ((primitive && properties) || !Object.prototype.hasOwnProperty.call(item, key)) {
+            map[key][i] = "";
+          } else {
+            map[key][i] = _inspect(item[key]);
+          }
+        }
+      }
+    }
+    const keys = Object.keys(map);
+    const values = Object.values(map);
+    if (hasPrimitives) {
+      keys.push("Values");
+      values.push(valuesKeyArray);
+    }
+    keys.unshift("(index)");
+    values.unshift(indexKeyArray);
+    return renderCliTable(keys, values);
+  }
+  registry._consoleTable = consoleTable;
+
   registry.factories.console = () => {
     const util = registry.get("util");
     class Console {
@@ -19598,6 +19739,12 @@
         this.debug = this.log;
         this.warn = writeTo(this._err);
         this.error = this.warn;
+        // node's `inspectOptions`, which its table() inspects cells with.
+        const inspectOptions = options.inspectOptions;
+        this.table = (data, properties) => {
+          const text = consoleTable(data, properties, inspectOptions);
+          this.log(text === null ? data : text);
+        };
       }
     }
     // node's `require("node:console")` IS globalThis.console (identity holds),
@@ -29658,6 +29805,9 @@
   registry.factories.perf_hooks = () => {
     const _marks = [];
     const _measures = [];
+    // 'resource' entries (markResourceTiming), up to node's default
+    // resource buffer size.
+    const _resources = [];
     const _observers = [];
 
     class PerformanceEntry {
@@ -29820,16 +29970,37 @@
         return entry;
       },
 
-      getEntries: function() { return _marks.concat(_measures).sort(function(a,b){return a.startTime-b.startTime;}); },
+      getEntries: function() { return _marks.concat(_measures, _resources).sort(function(a,b){return a.startTime-b.startTime;}); },
       getEntriesByName: function(name, type) {
-        return _marks.concat(_measures).sort(function(a,b){return a.startTime-b.startTime;}).filter(function(e) {
+        return _marks.concat(_measures, _resources).sort(function(a,b){return a.startTime-b.startTime;}).filter(function(e) {
           return e.name === name && (type === undefined || e.entryType === type);
         });
       },
       getEntriesByType: function(type) {
         if (type === "mark") return _marks.slice();
         if (type === "measure") return _measures.slice();
+        if (type === "resource") return _resources.slice();
         return [];
+      },
+
+      // node's markResourceTiming: how a fetch implementation reports a
+      // fetch -- the npm undici's fetch calls it for every response, and a
+      // missing one threw out of that fetch once its body was read. A
+      // 'resource' entry named for the URL and spanning the fetch, observed
+      // and buffered (up to 250) as node's are.
+      markResourceTiming: function(timingInfo, requestedUrl, initiatorType, global, cacheMode, bodyInfo,
+        responseStatus) {
+        var start = timingInfo && typeof timingInfo.startTime === "number" ? timingInfo.startTime : 0;
+        var end = timingInfo && typeof timingInfo.endTime === "number" ? timingInfo.endTime : start;
+        var entry = new PerformanceEntry(String(requestedUrl), "resource", start, end - start);
+        entry.initiatorType = initiatorType;
+        entry.responseStatus = responseStatus === undefined ? 0 : responseStatus;
+        if (_resources.length < 250) _resources.push(entry);
+        _notifyObservers(entry);
+        return entry;
+      },
+      clearResourceTimings: function() {
+        _resources.length = 0;
       },
 
       clearMarks: function(name) {
@@ -39278,7 +39449,17 @@
           _perfEntries = _perfEntries.filter(function(e) { return !(e.entryType === "measure" && e.name === name); });
         }
       },
-      clearResourceTimings: function clearResourceTimings() {},
+      // node's markResourceTiming, which the npm undici's fetch calls (on
+      // the global `performance`) for every response: perf_hooks' (one
+      // implementation; its entries are perf_hooks.performance's).
+      markResourceTiming: function markResourceTiming(timingInfo, requestedUrl, initiatorType, global,
+        cacheMode, bodyInfo, responseStatus) {
+        var perf = registry.get("perf_hooks").performance;
+        return perf.markResourceTiming.apply(perf, arguments);
+      },
+      clearResourceTimings: function clearResourceTimings() {
+        registry.get("perf_hooks").performance.clearResourceTimings();
+      },
       toJSON: function toJSON() {
         return { timeOrigin: this.timeOrigin };
       },
@@ -39697,32 +39878,10 @@
         if (args.length) writeOut(args);
       },
       groupEnd: () => {},
-      table: (data, columns) => {
-        if (data === null || data === undefined || typeof data !== "object") {
-          writeOut([String(data)]);
-          return;
-        }
-        if (Array.isArray(data)) {
-          if (data.length === 0) { writeOut(["[]"]); return; }
-          if (typeof data[0] === "object" && data[0] !== null) {
-            const cols = columns || Object.keys(data[0]);
-            writeOut(["(index) | " + cols.join(" | ")]);
-            for (let ri = 0; ri < data.length; ri++) {
-              const vals = cols.map(c => String(data[ri][c] === undefined ? "" : data[ri][c]));
-              writeOut([ri + "       | " + vals.join(" | ")]);
-            }
-          } else {
-            writeOut(["(index) | Values"]);
-            for (let vi = 0; vi < data.length; vi++) {
-              writeOut([vi + "       | " + String(data[vi])]);
-            }
-          }
-        } else {
-          const keys = Object.keys(data);
-          if (keys.length === 0) { writeOut(["{}"]); return; }
-          writeOut(["(index) | Values"]);
-          for (const k of keys) writeOut([k + " | " + String(data[k])]);
-        }
+      table: (data, properties) => {
+        const text = registry._consoleTable(data, properties, undefined);
+        if (text === null) writeOut([data]);
+        else writeOut([text]);
       },
       clear: () => {},
       // node's dirxml is a DISTINCT function that forwards to log (it is not

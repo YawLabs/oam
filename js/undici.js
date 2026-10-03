@@ -42,14 +42,17 @@
 //    global fetch, undici.fetch, agent.request(), and
 //    undici.request(url, { dispatcher }).
 //
+// MockAgent / MockPool / MockClient are connect functions too: every
+// connection a request through one asks for is an in-memory socket that
+// answers the request from the interceptors, so nothing reaches the network
+// unless net connect allows it (see the Mock section below).
+//
 // Refused, never ignored: a dispatcher whose dispatch() is overridden (a
-// subclass or a patched instance), one built with `interceptors`, an object
-// that is not one of this shim's dispatchers, and MockAgent / MockPool /
-// MockClient fail with NotSupportedError. oam runs a request itself rather
-// than through dispatch(), so honouring anything that lives there is
-// impossible, and dropping it could skip a policy the application put there
-// -- or, for the Mock* classes, send a request the test meant to stay in
-// memory (they refuse at construction; see below).
+// subclass or a patched instance), one built with `interceptors`, and an
+// object that is not one of this shim's dispatchers fail with
+// NotSupportedError. oam runs a request itself rather than through
+// dispatch(), so honouring anything that lives there is impossible, and
+// dropping it could skip a policy the application put there.
 //
 // Documented divergences (a shim over fetch cannot honor everything):
 //  - Other connection-level dispatcher options (connection pooling,
@@ -1526,43 +1529,6 @@
       responseError: passThrough,
     };
 
-    // ---- Mock*: refused, never a silent no-op ----------------------------
-    // undici's MockAgent / MockPool / MockClient INTERCEPT: a request that
-    // matches an interceptor is answered from memory and never dialled, and
-    // disableNetConnect() turns an unmatched one into a MockNotMatchedError
-    // instead of a real connection. oam's fetch owns its transport and
-    // cannot be intercepted from JS, so these were constructible stubs that
-    // intercepted nothing: a suite that installed a MockAgent, called
-    // disableNetConnect() and expected canned answers made REAL requests to
-    // whatever host it named, and read the real answers as its mocks. A test
-    // double that fails open is worse than one that is missing, so -- as
-    // with a dispatcher whose dispatch() oam cannot run (policyOf) -- they
-    // refuse instead. The classes stay exported so the import still
-    // resolves and the failure names itself.
-    function mockNotSupported(what) {
-      return new errors.NotSupportedError(
-        what + " is not supported on oam: oam sends the request itself, so the interceptors " +
-          "would not run and disableNetConnect() would not hold -- every request meant for the " +
-          "mock would go to the real host and its answer would be read as the mock's. Point the " +
-          "code under test at a local server instead",
-      );
-    }
-    class MockAgent extends Dispatcher {
-      constructor() {
-        throw mockNotSupported("undici's MockAgent");
-      }
-    }
-    class MockPool extends Dispatcher {
-      constructor() {
-        throw mockNotSupported("undici's MockPool");
-      }
-    }
-    class MockClient extends Dispatcher {
-      constructor() {
-        throw mockNotSupported("undici's MockClient");
-      }
-    }
-
     // ---- dispatch-level API: exported, refused at use ----------------------
     // RetryAgent, the Retry / Redirect / Decorator handlers,
     // createRedirectInterceptor, and connect() / upgrade() / pipeline() all
@@ -1617,27 +1583,719 @@
     function pipeline() {
       throw dispatchOnly("pipeline()");
     }
-    // undici's mockErrors, for code that names the class (an `instanceof` in
-    // a catch); nothing on oam raises it, since the Mock* classes refuse.
-    // Built on the shared UndiciError (bootstrap.js undiciErrors) in the shape
-    // of the others there: name, message and code set after super(), and
-    // undici's registered brand checked by its own Symbol.hasInstance -- the
-    // inherited one would take any UndiciError for this class.
+    // ---- MockAgent / MockPool / MockClient -------------------------------
+    // undici's mock dispatchers (lib/mock, 6.29.0): interceptors registered
+    // per origin answer the requests they match from memory, and one that
+    // matches nothing fails with MockNotMatchedError -- or, while net connect
+    // is enabled for its origin, goes to the network.
+    //
+    // undici runs them inside dispatch(); oam's transport sends a request
+    // itself, over a connection a dispatcher's `connect` function hands it
+    // (policyOf). So a mock dispatcher is a connect function: every
+    // connection a request through it asks for is an in-memory socket
+    // (MockConnection) that reads the HTTP/1.1 request the transport writes,
+    // matches it as undici matches the dispatch -- path (query order
+    // ignored), method, body, headers, by string, RegExp or function -- and
+    // writes the reply back as an HTTP/1.1 response, or fails the connection
+    // with the error the request fails with. Only a request no interceptor
+    // matches, while net connect allows its origin, ever reaches the
+    // network, and only then is a connection made: disableNetConnect() holds
+    // by construction, because every byte of a request goes to that
+    // in-memory socket first. An https origin is answered the same way (a
+    // connect function's socket is the connection as it is; nothing is
+    // wrapped in TLS over it). Every entry point a dispatcher has carries it,
+    // as for any connect function: fetch's `dispatcher` option,
+    // setGlobalDispatcher + fetch, undici.fetch, undici.request, and a
+    // dispatcher's own request(). See docs/node-divergences.md for what the
+    // matchers see that undici's do not.
     const kMockNotMatchedError = Symbol.for("undici.error.UND_MOCK_ERR_MOCK_NOT_MATCHED");
-    const mockErrors = {
-      MockNotMatchedError: class MockNotMatchedError extends errors.UndiciError {
-        constructor(message) {
-          super(message);
-          this.name = "MockNotMatchedError";
-          this.message = message || "The request does not match any registered mock dispatches";
-          this.code = "UND_MOCK_ERR_MOCK_NOT_MATCHED";
+    class MockNotMatchedError extends errors.UndiciError {
+      constructor(message) {
+        super(message);
+        this.name = "MockNotMatchedError";
+        this.message = message || "The request does not match any registered mock dispatches";
+        this.code = "UND_MOCK_ERR_MOCK_NOT_MATCHED";
+      }
+      static [Symbol.hasInstance](instance) {
+        return instance && instance[kMockNotMatchedError] === true;
+      }
+      [kMockNotMatchedError] = true;
+    }
+    // undici's mockErrors: MockNotMatchedError on the shared UndiciError
+    // (bootstrap.js undiciErrors), branded with undici's registered symbol,
+    // so an error from either copy of undici is an instance of the other's.
+    const mockErrors = { MockNotMatchedError };
+
+    // undici's mock symbols, for the state the pieces share.
+    const kDispatches = Symbol("mock dispatches");
+    const kMockAgent = Symbol("mock agent");
+    const kOrigin = Symbol("origin");
+    const kRealConnect = Symbol("real connect");
+    const kNetConnect = Symbol("net connect");
+    const kIsMockActive = Symbol("is mock active");
+    const kClients = Symbol("clients");
+    const kMockOptions = Symbol("mock options");
+    const kInner = Symbol("agent");
+    const kFactory = Symbol("factory");
+    const kMockAgentGet = Symbol("mock agent get");
+
+    // mock-utils.js, statement for statement where the semantics live.
+    function matchValue(match, value) {
+      if (typeof match === "string") return match === value;
+      if (match instanceof RegExp) return match.test(value);
+      if (typeof match === "function") return match(value) === true;
+      return false;
+    }
+    function lowerCaseEntries(headers) {
+      return Object.fromEntries(
+        Object.entries(headers).map(([name, value]) => [name.toLocaleLowerCase(), value]),
+      );
+    }
+    function getHeaderByName(headers, key) {
+      if (Array.isArray(headers)) {
+        for (let i = 0; i < headers.length; i += 2) {
+          if (headers[i].toLocaleLowerCase() === key.toLocaleLowerCase()) return headers[i + 1];
         }
-        static [Symbol.hasInstance](instance) {
-          return instance && instance[kMockNotMatchedError] === true;
+        return undefined;
+      } else if (typeof headers.get === "function") {
+        return headers.get(key);
+      }
+      return lowerCaseEntries(headers)[key.toLocaleLowerCase()];
+    }
+    function buildHeadersFromArray(headers) {
+      const entries = [];
+      for (let i = 0; i < headers.length; i += 2) entries.push([headers[i], headers[i + 1]]);
+      return Object.fromEntries(entries);
+    }
+    function matchHeaders(mockDispatch, headers) {
+      if (typeof mockDispatch.headers === "function") {
+        if (Array.isArray(headers)) headers = buildHeadersFromArray(headers);
+        return mockDispatch.headers(headers ? lowerCaseEntries(headers) : {});
+      }
+      if (typeof mockDispatch.headers === "undefined") return true;
+      if (typeof headers !== "object" || typeof mockDispatch.headers !== "object") return false;
+      for (const [name, value] of Object.entries(mockDispatch.headers)) {
+        if (!matchValue(value, getHeaderByName(headers, name))) return false;
+      }
+      return true;
+    }
+    // A path's query, sorted: `?b=2&a=1` matches `?a=1&b=2`.
+    function safeUrl(path) {
+      if (typeof path !== "string") return path;
+      const segments = path.split("?");
+      if (segments.length !== 2) return path;
+      const query = new G.URLSearchParams(segments.pop());
+      query.sort();
+      return [...segments, query.toString()].join("?");
+    }
+    function matchKey(mockDispatch, { path, method, body, headers }) {
+      const pathMatch = matchValue(mockDispatch.path, path);
+      const methodMatch = matchValue(mockDispatch.method, method);
+      const bodyMatch = typeof mockDispatch.body !== "undefined" ? matchValue(mockDispatch.body, body) : true;
+      return pathMatch && methodMatch && bodyMatch && matchHeaders(mockDispatch, headers);
+    }
+    function getResponseData(data) {
+      if (G.Buffer.isBuffer(data)) return data;
+      if (data instanceof Uint8Array) return data;
+      if (data instanceof ArrayBuffer) return data;
+      if (typeof data === "object") return JSON.stringify(data);
+      return data.toString();
+    }
+    // undici's util.buildURL: a `query` object onto a path that has none.
+    function buildURL(url, queryParams) {
+      if (url.includes("?") || url.includes("#")) {
+        throw new Error('Query params cannot be passed when url already contains "?" or "#".');
+      }
+      const stringified = registry.get("querystring").stringify(queryParams);
+      if (stringified) url += "?" + stringified;
+      return url;
+    }
+    function getMockDispatch(mockDispatches, key) {
+      const basePath = key.query ? buildURL(key.path, key.query) : key.path;
+      const resolvedPath = typeof basePath === "string" ? safeUrl(basePath) : basePath;
+      let matched = mockDispatches.filter(({ consumed }) => !consumed)
+        .filter(({ path }) => matchValue(safeUrl(path), resolvedPath));
+      if (matched.length === 0) {
+        throw new MockNotMatchedError(`Mock dispatch not matched for path '${resolvedPath}'`);
+      }
+      matched = matched.filter(({ method }) => matchValue(method, key.method));
+      if (matched.length === 0) {
+        throw new MockNotMatchedError(`Mock dispatch not matched for method '${key.method}' on path '${resolvedPath}'`);
+      }
+      matched = matched.filter(({ body }) => (typeof body !== "undefined" ? matchValue(body, key.body) : true));
+      if (matched.length === 0) {
+        throw new MockNotMatchedError(`Mock dispatch not matched for body '${key.body}' on path '${resolvedPath}'`);
+      }
+      matched = matched.filter((mockDispatch) => matchHeaders(mockDispatch, key.headers));
+      if (matched.length === 0) {
+        const headers = typeof key.headers === "object" ? JSON.stringify(key.headers) : key.headers;
+        throw new MockNotMatchedError(`Mock dispatch not matched for headers '${headers}' on path '${resolvedPath}'`);
+      }
+      return matched[0];
+    }
+    function addMockDispatch(mockDispatches, key, data) {
+      const baseData = { timesInvoked: 0, times: 1, persist: false, consumed: false };
+      const replyData = typeof data === "function" ? { callback: data } : { ...data };
+      const newMockDispatch = { ...baseData, ...key, pending: true, data: { error: null, ...replyData } };
+      mockDispatches.push(newMockDispatch);
+      return newMockDispatch;
+    }
+    function deleteMockDispatch(mockDispatches, key) {
+      const index = mockDispatches.findIndex((dispatch) => dispatch.consumed && matchKey(dispatch, key));
+      if (index !== -1) mockDispatches.splice(index, 1);
+    }
+    function buildKey(opts) {
+      const { path, method, body, headers, query } = opts;
+      return { path, method, body, headers, query };
+    }
+    // A reply's header (or trailer) object as name, value lines: an array
+    // value is a line per element.
+    function generateKeyValues(data) {
+      const result = [];
+      for (const key of Object.keys(data)) {
+        const value = data[key];
+        if (Array.isArray(value)) {
+          for (let j = 0; j < value.length; ++j) result.push(`${key}`, `${value[j]}`);
+        } else {
+          result.push(`${key}`, `${value}`);
         }
-        [kMockNotMatchedError] = true;
-      },
-    };
+      }
+      return result;
+    }
+    function getStatusText(statusCode) {
+      return registry.get("http").STATUS_CODES[statusCode] || "unknown";
+    }
+    function checkNetConnect(netConnect, origin) {
+      const url = new G.URL(origin);
+      if (netConnect === true) return true;
+      return Array.isArray(netConnect) && netConnect.some((matcher) => matchValue(matcher, url.host));
+    }
+
+    // mock-interceptor.js: what intercept() returns, and what reply() and
+    // replyWithError() return.
+    const kMockDispatch = Symbol("mock dispatch");
+    class MockScope {
+      constructor(mockDispatch) {
+        this[kMockDispatch] = mockDispatch;
+      }
+      delay(waitInMs) {
+        if (typeof waitInMs !== "number" || !Number.isInteger(waitInMs) || waitInMs <= 0) {
+          throw new errors.InvalidArgumentError("waitInMs must be a valid integer > 0");
+        }
+        this[kMockDispatch].delay = waitInMs;
+        return this;
+      }
+      persist() {
+        this[kMockDispatch].persist = true;
+        return this;
+      }
+      times(repeatTimes) {
+        if (typeof repeatTimes !== "number" || !Number.isInteger(repeatTimes) || repeatTimes <= 0) {
+          throw new errors.InvalidArgumentError("repeatTimes must be a valid integer > 0");
+        }
+        this[kMockDispatch].times = repeatTimes;
+        return this;
+      }
+    }
+    const kDispatchKey = Symbol("dispatch key");
+    const kDispatchList = Symbol("dispatches");
+    const kDefaultHeaders = Symbol("default headers");
+    const kDefaultTrailers = Symbol("default trailers");
+    const kContentLength = Symbol("content length");
+    class MockInterceptor {
+      constructor(opts, mockDispatches) {
+        if (typeof opts !== "object") throw new errors.InvalidArgumentError("opts must be an object");
+        if (typeof opts.path === "undefined") throw new errors.InvalidArgumentError("opts.path must be defined");
+        if (typeof opts.method === "undefined") opts.method = "GET";
+        if (typeof opts.path === "string") {
+          if (opts.query) {
+            opts.path = buildURL(opts.path, opts.query);
+          } else {
+            const parsed = new G.URL(opts.path, "data://");
+            opts.path = parsed.pathname + parsed.search;
+          }
+        }
+        if (typeof opts.method === "string") opts.method = opts.method.toUpperCase();
+        this[kDispatchKey] = buildKey(opts);
+        this[kDispatchList] = mockDispatches;
+        this[kDefaultHeaders] = {};
+        this[kDefaultTrailers] = {};
+        this[kContentLength] = false;
+      }
+      createMockScopeDispatchData({ statusCode, data, responseOptions }) {
+        const responseData = getResponseData(data);
+        const contentLength = this[kContentLength] ? { "content-length": responseData.length } : {};
+        const headers = { ...this[kDefaultHeaders], ...contentLength, ...responseOptions.headers };
+        const trailers = { ...this[kDefaultTrailers], ...responseOptions.trailers };
+        return { statusCode, data, headers, trailers };
+      }
+      validateReplyParameters(replyParameters) {
+        if (typeof replyParameters.statusCode === "undefined") {
+          throw new errors.InvalidArgumentError("statusCode must be defined");
+        }
+        if (typeof replyParameters.responseOptions !== "object" || replyParameters.responseOptions === null) {
+          throw new errors.InvalidArgumentError("responseOptions must be an object");
+        }
+      }
+      reply(replyOptionsCallbackOrStatusCode) {
+        if (typeof replyOptionsCallbackOrStatusCode === "function") {
+          const wrappedDefaultsCallback = (opts) => {
+            const resolvedData = replyOptionsCallbackOrStatusCode(opts);
+            if (typeof resolvedData !== "object" || resolvedData === null) {
+              throw new errors.InvalidArgumentError("reply options callback must return an object");
+            }
+            const replyParameters = { data: "", responseOptions: {}, ...resolvedData };
+            this.validateReplyParameters(replyParameters);
+            return { ...this.createMockScopeDispatchData(replyParameters) };
+          };
+          return new MockScope(addMockDispatch(this[kDispatchList], this[kDispatchKey], wrappedDefaultsCallback));
+        }
+        const replyParameters = {
+          statusCode: replyOptionsCallbackOrStatusCode,
+          data: arguments[1] === undefined ? "" : arguments[1],
+          responseOptions: arguments[2] === undefined ? {} : arguments[2],
+        };
+        this.validateReplyParameters(replyParameters);
+        const dispatchData = this.createMockScopeDispatchData(replyParameters);
+        return new MockScope(addMockDispatch(this[kDispatchList], this[kDispatchKey], dispatchData));
+      }
+      replyWithError(error) {
+        if (typeof error === "undefined") throw new errors.InvalidArgumentError("error must be defined");
+        return new MockScope(addMockDispatch(this[kDispatchList], this[kDispatchKey], { error }));
+      }
+      defaultReplyHeaders(headers) {
+        if (typeof headers === "undefined") throw new errors.InvalidArgumentError("headers must be defined");
+        this[kDefaultHeaders] = headers;
+        return this;
+      }
+      defaultReplyTrailers(trailers) {
+        if (typeof trailers === "undefined") throw new errors.InvalidArgumentError("trailers must be defined");
+        this[kDefaultTrailers] = trailers;
+        return this;
+      }
+      replyContentLength() {
+        this[kContentLength] = true;
+        return this;
+      }
+    }
+
+    // The connection one request through a mock dispatcher gets: the
+    // transport writes the request into it, and reads the reply (or the
+    // passed-through origin's answer) off it. `scope` is the MockPool /
+    // MockClient whose interceptors answer, `params` undici's connector
+    // parameters for the connection. Failures are the connection's: the
+    // request fails with the error the socket is destroyed with, which the
+    // transport reports as its cause -- fetch's `TypeError: fetch failed`
+    // with it as `cause`, request()'s rejection with it.
+    function mockConnection(scope, params) {
+      const { Duplex } = registry.get("stream");
+      const { HTTPParser } = registry.get("_http_common");
+      const origin = scope[kOrigin];
+      const raw = [];
+      let rawText = "";
+      let headers = [];
+      let url = "";
+      const body = [];
+      let hasBody = false;
+      let decided = false;
+      let real = null;
+      const parser = new HTTPParser();
+      parser.initialize(HTTPParser.REQUEST, {});
+      const socket = new Duplex({
+        read() {},
+        write(chunk, encoding, callback) {
+          if (real !== null) {
+            real.write(chunk, callback);
+            return;
+          }
+          if (decided) {
+            callback();
+            return;
+          }
+          raw.push(chunk);
+          if (rawText.indexOf(" ") === -1) rawText += chunk.toString("latin1", 0, Math.min(chunk.length, 64));
+          const parsed = parser.execute(chunk);
+          if (parsed instanceof Error) {
+            callback();
+            fail(parsed);
+            return;
+          }
+          callback();
+        },
+        final(callback) {
+          if (real !== null) real.end();
+          callback();
+        },
+        destroy(err, callback) {
+          if (real !== null && !real.destroyed) real.destroy();
+          callback(err);
+        },
+      });
+      // The request fails with `err`: the socket is destroyed with it, and
+      // the transport reports it as the cause.
+      function fail(err) {
+        if (socket.destroyed) return;
+        socket.destroy(err);
+      }
+      parser[HTTPParser.kOnHeaders] = (more, target) => {
+        headers.push(...more);
+        url += target;
+      };
+      parser[HTTPParser.kOnHeadersComplete] = (major, minor, list, method, target) => {
+        if (list !== undefined) headers.push(...list);
+        if (target !== undefined) url = target;
+        for (let i = 0; i < headers.length; i += 2) {
+          const name = headers[i].toLowerCase();
+          if (name === "content-length" || name === "transfer-encoding") hasBody = true;
+        }
+      };
+      parser[HTTPParser.kOnBody] = (chunk) => {
+        body.push(G.Buffer.from(chunk));
+      };
+      parser[HTTPParser.kOnMessageComplete] = () => {
+        decided = true;
+        // Answered after the transport's write returns, as a server would.
+        queueMicrotask(() => {
+          try {
+            answer();
+          } catch (err) {
+            fail(err);
+          }
+        });
+      };
+
+      // The request as undici's mock dispatch sees it: what was sent, with
+      // the fields a client adds on the wire (host, connection, framing)
+      // left out, as they are not in a dispatch's options.
+      function requestOptions() {
+        const method = rawText.slice(0, rawText.indexOf(" "));
+        const seen = {};
+        for (let i = 0; i < headers.length; i += 2) {
+          const name = headers[i].toLowerCase();
+          if (name === "host" || name === "connection" || name === "transfer-encoding") continue;
+          seen[name] = headers[i + 1];
+        }
+        const text = hasBody ? G.Buffer.concat(body).toString("utf8") : null;
+        return { origin, path: url, method, body: text, headers: seen };
+      }
+
+      function answer() {
+        const opts = requestOptions();
+        const agent = scope[kMockAgent];
+        // undici's buildMockDispatch: an inactive agent dispatches for real.
+        if (!agent.isMockActive) {
+          passThrough();
+          return;
+        }
+        const key = buildKey(opts);
+        let mockDispatch;
+        try {
+          mockDispatch = getMockDispatch(scope[kDispatches], key);
+        } catch (error) {
+          if (!(error instanceof MockNotMatchedError)) throw error;
+          const netConnect = agent[kNetConnect];
+          if (netConnect === false) {
+            throw new MockNotMatchedError(
+              `${error.message}: subsequent request to origin ${origin} was not allowed (net.connect disabled)`,
+            );
+          }
+          if (checkNetConnect(netConnect, origin)) {
+            passThrough();
+            return;
+          }
+          throw new MockNotMatchedError(
+            `${error.message}: subsequent request to origin ${origin} was not allowed (net.connect is not enabled for this origin)`,
+          );
+        }
+        // undici's mockDispatch.
+        mockDispatch.timesInvoked++;
+        if (mockDispatch.data.callback) {
+          mockDispatch.data = { ...mockDispatch.data, ...mockDispatch.data.callback(opts) };
+        }
+        const { data: { statusCode, data, headers: replyHeaders, error }, delay, persist } = mockDispatch;
+        const { timesInvoked, times } = mockDispatch;
+        mockDispatch.consumed = !persist && timesInvoked >= times;
+        mockDispatch.pending = timesInvoked < times;
+        if (error !== null) {
+          deleteMockDispatch(scope[kDispatches], key);
+          fail(error);
+          return;
+        }
+        const handleReply = (replyData) => {
+          const replyBody = typeof replyData === "function" ? replyData(opts) : replyData;
+          if (replyBody !== null && typeof replyBody === "object" && typeof replyBody.then === "function") {
+            replyBody.then((resolved) => {
+              try {
+                handleReply(resolved);
+              } catch (err) {
+                fail(err);
+              }
+            }, (err) => fail(err));
+            return;
+          }
+          respond(opts.method, statusCode, generateKeyValues(replyHeaders), getResponseData(replyBody));
+          deleteMockDispatch(scope[kDispatches], key);
+        };
+        if (typeof delay === "number" && delay > 0) {
+          setTimeout(() => {
+            try {
+              handleReply(data);
+            } catch (err) {
+              fail(err);
+            }
+          }, delay);
+        } else {
+          handleReply(data);
+        }
+      }
+
+      // The reply on the wire: its status line, its header lines as given,
+      // and its body running to the end of the connection, so the response
+      // carries no field the reply did not (as undici's mock adds none). A
+      // body is not sent where HTTP has none (HEAD, 1xx, 204, 304), and is
+      // sent as one chunk under a transfer-encoding the reply set itself.
+      function respond(method, statusCode, lines, data) {
+        let head = `HTTP/1.1 ${statusCode} ${getStatusText(statusCode)}\r\n`;
+        let chunked = false;
+        for (let i = 0; i < lines.length; i += 2) {
+          head += lines[i] + ": " + lines[i + 1] + "\r\n";
+          if (lines[i].toLowerCase() === "transfer-encoding" && /(?:^|,)\s*chunked\s*$/i.test(lines[i + 1])) {
+            chunked = true;
+          }
+        }
+        socket.push(G.Buffer.from(head + "\r\n", "utf8"));
+        const noBody = method === "HEAD" || statusCode === 204 || statusCode === 304 ||
+          (statusCode >= 100 && statusCode < 200);
+        if (!noBody) {
+          const bytes = G.Buffer.from(data);
+          if (chunked) {
+            if (bytes.length > 0) socket.push(G.Buffer.from(bytes.length.toString(16) + "\r\n", "latin1"));
+            if (bytes.length > 0) socket.push(G.Buffer.concat([bytes, G.Buffer.from("\r\n", "latin1")]));
+            socket.push(G.Buffer.from("0\r\n\r\n", "latin1"));
+          } else if (bytes.length > 0) {
+            socket.push(bytes);
+          }
+        }
+        socket.push(null);
+      }
+
+      // Net connect allows the origin (or the agent is inactive): the
+      // request goes to it as it was written, over the connection the
+      // dispatcher would have made, and its answer comes back as it is.
+      function passThrough() {
+        scope[kRealConnect](params, (err, connection) => {
+          if (err) {
+            fail(err);
+            return;
+          }
+          if (socket.destroyed) {
+            connection.destroy();
+            return;
+          }
+          real = connection;
+          connection.on("data", (chunk) => socket.push(chunk));
+          connection.on("end", () => socket.push(null));
+          connection.on("error", (e) => fail(e));
+          connection.on("close", () => {
+            if (!socket.destroyed) socket.push(null);
+          });
+          for (const chunk of raw) connection.write(chunk);
+          raw.length = 0;
+        });
+      }
+      return socket;
+    }
+
+
+    // A dispatcher's own connection policy, before a mock connect function
+    // replaces it: what a request it lets through goes over.
+    function plainConnector(dispatcher) {
+      const policy = policyOf(dispatcher);
+      if (policy.refuse) return (params, cb) => cb(policy.refuse);
+      if (policy.connector) return (params, cb) => policy.connector.fn.call(policy.connector.self, params, cb);
+      const lookup = typeof dispatcher._oamConnectLookup === "function" ? dispatcher._oamConnectLookup : undefined;
+      const timeout = dispatcher._oamConnectTimeout ?? undefined;
+      return buildConnector(lookup ? { lookup, timeout } : { timeout });
+    }
+
+    // mock-pool.js / mock-client.js: a Pool / Client for one origin whose
+    // requests its interceptors answer, under the agent's net connect rules.
+    function initMockDispatcher(dispatcher, origin, opts) {
+      if (!opts || !opts.agent || typeof opts.agent.dispatch !== "function") {
+        throw new errors.InvalidArgumentError("Argument opts.agent must implement Agent");
+      }
+      dispatcher[kMockAgent] = opts.agent;
+      dispatcher[kOrigin] = origin;
+      dispatcher[kDispatches] = [];
+      dispatcher[kRealConnect] = plainConnector(dispatcher);
+      dispatcher._oamConnectLookup = null;
+      dispatcher._oamConnect = function mockConnect(params, cb) {
+        cb(null, mockConnection(dispatcher, params));
+      };
+    }
+    function mockIntercept(opts) {
+      return new MockInterceptor(opts, this[kDispatches]);
+    }
+    async function mockClose() {
+      this.closed = true;
+      const agent = this[kMockAgent];
+      if (agent && agent[kClients] instanceof Map) agent[kClients].delete(this[kOrigin]);
+    }
+    class MockPool extends Pool {
+      constructor(origin, opts) {
+        super(origin, opts);
+        initMockDispatcher(this, origin, opts);
+      }
+    }
+    class MockClient extends Client {
+      constructor(origin, opts) {
+        super(origin, opts);
+        initMockDispatcher(this, origin, opts);
+      }
+    }
+    for (const Mock of [MockPool, MockClient]) {
+      Mock.prototype.intercept = mockIntercept;
+      Mock.prototype.close = mockClose;
+    }
+
+    // mock-agent.js.
+    class MockAgent extends Dispatcher {
+      constructor(opts) {
+        super(opts);
+        this[kNetConnect] = true;
+        this[kIsMockActive] = true;
+        if (opts && opts.agent && typeof opts.agent.dispatch !== "function") {
+          throw new errors.InvalidArgumentError("Argument opts.agent must implement Agent");
+        }
+        this[kInner] = opts && opts.agent ? opts.agent : new Agent(opts);
+        this[kClients] = new Map();
+        if (opts) {
+          const { agent: _agent, ...mockOptions } = opts;
+          this[kMockOptions] = mockOptions;
+        }
+        const self = this;
+        this._oamConnectLookup = null;
+        this._oamConnect = function mockAgentConnect(params, cb) {
+          // An inactive agent dispatches for real, through the agent it
+          // wraps, as undici's does.
+          if (!self[kIsMockActive]) {
+            connectVia(self[kInner], params, cb);
+            return;
+          }
+          const scope = self.get(params.protocol + "//" + params.host);
+          cb(null, mockConnection(scope, params));
+        };
+      }
+      get(origin) {
+        let dispatcher = this[kMockAgentGet](origin);
+        if (!dispatcher) {
+          dispatcher = this[kFactory](origin);
+          this[kClients].set(origin, dispatcher);
+        }
+        return dispatcher;
+      }
+      async close() {
+        this.closed = true;
+        await this[kInner].close();
+        this[kClients].clear();
+      }
+      deactivate() {
+        this[kIsMockActive] = false;
+      }
+      activate() {
+        this[kIsMockActive] = true;
+      }
+      enableNetConnect(matcher) {
+        if (typeof matcher === "string" || typeof matcher === "function" || matcher instanceof RegExp) {
+          if (Array.isArray(this[kNetConnect])) this[kNetConnect].push(matcher);
+          else this[kNetConnect] = [matcher];
+        } else if (typeof matcher === "undefined") {
+          this[kNetConnect] = true;
+        } else {
+          throw new errors.InvalidArgumentError("Unsupported matcher. Must be one of String|Function|RegExp.");
+        }
+      }
+      disableNetConnect() {
+        this[kNetConnect] = false;
+      }
+      get isMockActive() {
+        return this[kIsMockActive];
+      }
+      [kFactory](origin) {
+        const mockOptions = Object.assign({ agent: this }, this[kMockOptions]);
+        return this[kMockOptions] && this[kMockOptions].connections === 1
+          ? new MockClient(origin, mockOptions)
+          : new MockPool(origin, mockOptions);
+      }
+      [kMockAgentGet](origin) {
+        const client = this[kClients].get(origin);
+        if (client) return client;
+        // A matcher for an origin: a dummy pool holds its interceptors, and
+        // each origin it matches gets a pool sharing them.
+        if (typeof origin !== "string") {
+          const dispatcher = this[kFactory]("http://localhost:9999");
+          this[kClients].set(origin, dispatcher);
+          return dispatcher;
+        }
+        for (const [keyMatcher, nonExplicit] of Array.from(this[kClients])) {
+          if (nonExplicit && typeof keyMatcher !== "string" && matchValue(keyMatcher, origin)) {
+            const dispatcher = this[kFactory](origin);
+            this[kClients].set(origin, dispatcher);
+            dispatcher[kDispatches] = nonExplicit[kDispatches];
+            return dispatcher;
+          }
+        }
+        return undefined;
+      }
+      pendingInterceptors() {
+        return Array.from(this[kClients].entries())
+          .flatMap(([origin, scope]) => scope[kDispatches].map((dispatch) => ({ ...dispatch, origin })))
+          .filter(({ pending }) => pending);
+      }
+      assertNoPendingInterceptors({ pendingInterceptorsFormatter = new PendingInterceptorsFormatter() } = {}) {
+        const pending = this.pendingInterceptors();
+        if (pending.length === 0) return;
+        const one = pending.length === 1;
+        throw new errors.UndiciError(`
+${pending.length} ${one ? "interceptor" : "interceptors"} ${one ? "is" : "are"} pending:
+
+${pendingInterceptorsFormatter.format(pending)}
+`.trim());
+      }
+    }
+
+    // pending-interceptors-formatter.js: the pending interceptors as
+    // console.table() draws them.
+    class PendingInterceptorsFormatter {
+      constructor({ disableColors } = {}) {
+        const { Transform } = registry.get("stream");
+        this.transform = new Transform({
+          transform(chunk, _enc, cb) {
+            cb(null, chunk);
+          },
+        });
+        this.logger = new (registry.get("console").Console)({
+          stdout: this.transform,
+          inspectOptions: { colors: !disableColors && !G.process.env.CI },
+        });
+      }
+      format(pendingInterceptors) {
+        const icu = G.process.versions.icu;
+        const withPrettyHeaders = pendingInterceptors.map(
+          ({ method, path, data: { statusCode }, persist, times, timesInvoked, origin }) => ({
+            Method: method,
+            Origin: origin,
+            Path: path,
+            "Status code": statusCode,
+            Persistent: persist ? (icu ? "✅" : "Y ") : (icu ? "❌" : "N "),
+            Invocations: timesInvoked,
+            Remaining: persist ? Infinity : times - timesInvoked,
+          }),
+        );
+        this.logger.table(withPrettyHeaders);
+        return this.transform.read().toString();
+      }
+    }
 
     // ---- web globals undici re-exports -----------------------------------
     const mod = {
