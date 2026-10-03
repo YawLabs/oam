@@ -29,9 +29,28 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
   `ERR_ACCESS_DENIED` `resource` for these requests -- including a refused redirect hop or
   `connect.lookup` answer -- now reads `host:port` (`"example.com:80"`) instead of the bare
   host, the same resource `net.connect` reports. (#188)
+- **A pipe is a net resource named by its path.** Under `--permission`, `net.connect(path)`
+  and a net server's `listen(path)` need unrestricted `--allow-net` or an absolute entry equal
+  to the path -- never a host entry, a prefix or a relative entry -- and a pipe path that is a
+  file (every Unix socket path; on Windows every path outside `\\<server>\pipe\`) needs
+  `--allow-fs-read` and `--allow-fs-write` for it too, so a dial cannot report what the fs
+  grant hides. A relative path is resolved against the cwd of the moment, and that resolved
+  path is what is dialled or bound. Refused with `ERR_ACCESS_DENIED` from the call. Node 22
+  does not gate pipes; see docs/node-divergences.md, entry 49. (#219)
 
 ### Added
 
+- **`net` over a pipe.** `net.connect({ path })`, `net.connect(path)`,
+  `net.createConnection(path)`, `socket.connect(path)` and a net server's `listen(path)` /
+  `listen({ path })` work over a Windows named pipe or a Unix domain socket, with node's
+  events, `address()` shapes and errors (`connect ENOENT <path>`, `listen EADDRINUSE` with
+  port -1), and `http.request({ socketPath })` rides on them, so `@playwright/mcp --isolated`
+  now works on oam. On Windows a server keeps four instances waiting and a dial to a busy pipe
+  waits with `WaitNamedPipeW`, as libuv's do (200 clients at once connect in tens of ms), and
+  a write is done once the pipe has taken all but its last 64 KiB. TLS over a pipe, and
+  `tls`, `http`, `https` and `http2` servers on one, are still refused with
+  `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`; what else differs is in docs/node-divergences.md,
+  entry 49. (#219)
 - **http2 trailers work both ways, as in node.** A client stream emits `'trailers'` and
   supports `waitForTrailers`, `'wantTrailers'`, `sendTrailers()` and `sentTrailers`. Server
   streams, secure and cleartext, send trailers and receive a request's trailer section as
@@ -54,6 +73,11 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Changed
 
+- **`net.createServer({ allowHalfOpen: true })` hands the option to the sockets it accepts**,
+  as node's does, and such a socket whose `'end'` listener writes and ends emits that write's
+  callback and `'error'` before `'close'`. (#219)
+- **A server's listen error has node's key order** (`code`, `errno`, `syscall`, `address`,
+  `port`); it was built `errno` first, like a connect error. (#219)
 - **`fetch`, `undici.request` and `https.request` speak HTTP/1.1 to an https origin, as
   node's do.** undici's connector offers ALPN `http/1.1` alone and `https.request` offers no
   ALPN, so an h2-capable server answers them over HTTP/1.1; up to 0.17.1 every origin was
