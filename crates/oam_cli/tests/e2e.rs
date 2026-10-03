@@ -32619,8 +32619,22 @@ fn a_pipe_is_a_net_resource_granted_by_its_exact_path() {
            console.log('connect', refused(() => net.connect({ path: P })));\n\
          }\n",
     );
+    // A Unix domain socket is a file too: its directory is granted for read
+    // and write, so only the net grant decides here (on Windows the pipe
+    // namespace needs no fs grant).
+    let socket_dir = std::path::Path::new(&path)
+        .parent()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let fs_read = format!("--allow-fs-read={socket_dir}");
+    let fs_write = format!("--allow-fs-write={socket_dir}");
     let run = |grant: &str| {
-        let out = oam(&["--permission", grant, "--", script.to_str().unwrap(), &path]);
+        let mut args = vec!["--permission", grant];
+        if cfg!(unix) {
+            args.extend([fs_read.as_str(), fs_write.as_str()]);
+        }
+        args.extend(["--", script.to_str().unwrap(), &path]);
+        let out = oam(&args);
         String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n")
     };
     let refused = "listen ERR_ACCESS_DENIED Net true\nconnect ERR_ACCESS_DENIED Net true\n";
@@ -32643,6 +32657,133 @@ fn a_pipe_is_a_net_resource_granted_by_its_exact_path() {
         "listen allowed\ndata hi\n"
     );
     assert_eq!(run("--allow-net"), "listen allowed\ndata hi\n");
+}
+
+/// Regression guard: a pipe op asked only the net grant, but a path outside
+/// the Windows named-pipe namespace is a file -- the Windows dial opens it
+/// read-write, a Unix listen creates it and the close unlinks it -- so under
+/// a bare `--allow-net` the dial's error (ENOTSOCK, ENOENT, EPERM) told a
+/// script whether a file the fs grant hid exists, and what it is. Such a
+/// path needs the fs read and write grants as well, refused with
+/// ERR_ACCESS_DENIED before anything is opened. And a relative path is
+/// resolved against the cwd of the moment, where the grant used to compare
+/// the raw string: `--allow-net=<name>` admitted that name in whatever
+/// directory a `process.chdir` had moved to. A relative entry grants no
+/// pipe; an absolute one admits exactly the socket it names.
+#[test]
+fn a_pipe_path_that_is_a_file_needs_the_fs_grants_and_resolves_against_the_cwd() {
+    let dir = write_temp("pipe_fs_gate/box/.keep", "")
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let secret = write_temp("pipe_fs_gate/secret.txt", "s");
+    let script = write_temp(
+        "pipe_fs_gate/main.mjs",
+        "import net from 'node:net';\n\
+         import path from 'node:path';\n\
+         const [dir, secret] = process.argv.slice(2);\n\
+         const box = path.join(dir, 'box');\n\
+         const tryIt = (label, f) => new Promise((done) => {\n\
+           try {\n\
+             const h = f();\n\
+             h.on('error', () => { console.log(label, 'reached the OS'); done(); });\n\
+             h.on('connect', () => { console.log(label, 'connected'); h.destroy(); done(); });\n\
+             h.on('listening', () => { console.log(label, 'listening'); h.close(); done(); });\n\
+           } catch (e) { console.log(label, e.code, e.permission); done(); }\n\
+         });\n\
+         await tryIt('connect secret', () => net.connect(secret));\n\
+         await tryIt('listen box', () => net.createServer().listen(path.join(box, 'x.sock')));\n\
+         process.chdir(dir);\n\
+         await tryIt('connect rel', () => net.connect('rel.sock'));\n\
+         process.chdir(box);\n\
+         await tryIt('connect rel after chdir', () => net.connect('rel.sock'));\n",
+    );
+    let dir_s = dir.to_string_lossy().into_owned();
+    let rel_abs = dir.join("rel.sock").to_string_lossy().into_owned();
+    let run = |grants: &[String]| {
+        let mut args = vec!["--permission".to_string()];
+        args.extend(grants.iter().cloned());
+        args.extend([
+            "--".to_string(),
+            script.to_string_lossy().into_owned(),
+            dir_s.clone(),
+            secret.to_string_lossy().into_owned(),
+        ]);
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = oam(&args);
+        String::from_utf8_lossy(&out.stdout).replace("\r\n", "\n")
+    };
+    let box_dir = dir.join("box").to_string_lossy().into_owned();
+    // Net for everything, the fs grants for the box only (read-only).
+    assert_eq!(
+        run(&[
+            "--allow-net".to_string(),
+            format!("--allow-fs-read={box_dir}"),
+        ]),
+        "connect secret ERR_ACCESS_DENIED FileSystemRead\n\
+         listen box ERR_ACCESS_DENIED FileSystemWrite\n\
+         connect rel ERR_ACCESS_DENIED FileSystemRead\n\
+         connect rel after chdir ERR_ACCESS_DENIED FileSystemWrite\n"
+    );
+    // The fs grants for the whole dir; the net grant for one socket in it,
+    // named relatively (no pipe) or absolutely (that socket only).
+    let fs = [
+        format!("--allow-fs-read={dir_s}"),
+        format!("--allow-fs-write={dir_s}"),
+    ];
+    let with = |net: String| {
+        let mut grants = fs.to_vec();
+        grants.push(net);
+        run(&grants)
+    };
+    assert_eq!(
+        with("--allow-net=rel.sock".to_string()),
+        "connect secret ERR_ACCESS_DENIED Net\n\
+         listen box ERR_ACCESS_DENIED Net\n\
+         connect rel ERR_ACCESS_DENIED Net\n\
+         connect rel after chdir ERR_ACCESS_DENIED Net\n"
+    );
+    assert_eq!(
+        with(format!("--allow-net={rel_abs}")),
+        "connect secret ERR_ACCESS_DENIED Net\n\
+         listen box ERR_ACCESS_DENIED Net\n\
+         connect rel reached the OS\n\
+         connect rel after chdir ERR_ACCESS_DENIED Net\n"
+    );
+    // Every grant: the paths reach the OS (and the box's socket listens on
+    // Unix; on Windows a file path is no pipe name, `listen EACCES`).
+    let listen_box = if cfg!(windows) {
+        "listen box reached the OS"
+    } else {
+        "listen box listening"
+    };
+    assert_eq!(
+        with("--allow-net".to_string()),
+        format!(
+            "connect secret reached the OS\n{listen_box}\nconnect rel reached the OS\n\
+             connect rel after chdir reached the OS\n"
+        )
+    );
+    if cfg!(windows) {
+        // The named-pipe namespace is no file: net alone admits it.
+        let pipe = write_temp(
+            "pipe_fs_gate/pipe.mjs",
+            "import net from 'node:net';\n\
+             const c = net.connect(process.argv[2]);\n\
+             c.on('error', (e) => console.log(e.code));\n",
+        );
+        let path = e2e_pipe_path("fs-gate");
+        let out = oam(&[
+            "--permission",
+            "--allow-net",
+            "--",
+            pipe.to_str().unwrap(),
+            &path,
+        ]);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "ENOENT");
+    }
 }
 
 /// The proxy agents built on `http.request({ method: 'CONNECT' })` --

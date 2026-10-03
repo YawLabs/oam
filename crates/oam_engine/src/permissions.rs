@@ -118,6 +118,26 @@ fn resolve_against_cwd(raw: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Whether `path` is in the Windows named-pipe namespace,
+/// `\\<server>\pipe\<name>` (`\\.\pipe\x`, `\\?\pipe\x`, `//./pipe/x`, a
+/// remote `\\host\pipe\x`; `pipe` in any letter case): a name the OS hands
+/// to the named-pipe file system, never a file on disk. Every other path a
+/// pipe op is given is opened as a file. Unix has no such namespace.
+#[cfg(windows)]
+fn is_named_pipe_namespace(path: &str) -> bool {
+    let mut parts = path.split(['\\', '/']);
+    // `\\` (two empty components), a server, `pipe`, and a non-empty name.
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(""), Some(""), Some(server), Some(pipe), Some(name))
+            if !server.is_empty() && pipe.eq_ignore_ascii_case("pipe") && !name.is_empty()
+    )
+}
+#[cfg(not(windows))]
+fn is_named_pipe_namespace(_path: &str) -> bool {
+    false
+}
+
 /// Windows path comparison is case-insensitive; POSIX is not.
 #[cfg(windows)]
 fn path_eq_fold(a: &str) -> String {
@@ -205,16 +225,28 @@ impl PermValue {
         }
     }
 
-    /// Exact match on a pipe's path, as written: a Windows named pipe
-    /// (`\\.\pipe\name`) or a Unix domain socket (`/run/app.sock`). No
-    /// host:port reading -- `C:\app.sock` is not host `C` -- and no prefix:
-    /// a grant for one pipe admits no other, so `--allow-net=<one pipe>`
-    /// never reaches `\\.\pipe\docker_engine` or `/var/run/docker.sock`.
+    /// Exact match on a pipe's path: a Windows named pipe (`\\.\pipe\name`)
+    /// or a Unix domain socket (`/run/app.sock`). `path` is rooted -- the
+    /// caller has resolved a relative one against the cwd of the moment
+    /// ([`Permissions::check_pipe`]) -- and only a ROOTED entry can match it,
+    /// component by component (`C:/a/x.sock` is `C:\a\x.sock`; `/a//x` is
+    /// `/a/x`). No host:port reading -- `C:\app.sock` is not host `C` -- no
+    /// prefix, and no relative entry: a relative name would name a different
+    /// socket after every `process.chdir`, so `--allow-net=docker.sock`
+    /// grants no pipe at all, and a grant for one pipe admits no other --
+    /// never `\\.\pipe\docker_engine` or `/var/run/docker.sock`.
     pub fn allows_net_path(&self, path: &str) -> bool {
         match self {
             PermValue::All => true,
             PermValue::None => false,
-            PermValue::List(list) => list.iter().any(|item| item == path),
+            PermValue::List(list) => {
+                let target = std::path::Path::new(path);
+                target.has_root()
+                    && list.iter().any(|item| {
+                        let entry = std::path::Path::new(item);
+                        entry.has_root() && entry == target
+                    })
+            }
         }
     }
 
@@ -384,19 +416,55 @@ impl Permissions {
         }
     }
 
-    /// Returns `Err(denial)` when `net` is denied for the pipe `path` -- a
-    /// Windows named pipe or a Unix domain socket a net socket connects to
-    /// or a net server listens on ([`PermValue::allows_net_path`]: granted
-    /// by unrestricted net, or by an entry that is exactly that path).
-    pub fn check_net_path(&self, path: &str) -> Result<(), PermissionDenial> {
-        if self.net.allows_net_path(path) {
-            Ok(())
-        } else {
-            Err(PermissionDenial {
-                permission: "Net",
-                resource: path.to_string(),
-            })
+    /// The gate of a pipe a net socket connects to or a net server listens
+    /// on (`net.connect(path)`, `server.listen(path)`): a Windows named pipe
+    /// or a Unix domain socket. Returns the path the op must then use, or
+    /// `Err(denial)`.
+    ///
+    /// - `net`: unrestricted, or an entry that is exactly this pipe
+    ///   ([`PermValue::allows_net_path`]).
+    /// - `read` AND `write` too when the path is a filesystem path: on Unix
+    ///   every socket path is one (a connect opens the socket file, a listen
+    ///   creates it and the server's close unlinks it), and on Windows every
+    ///   path outside the named-pipe namespace (`\\<server>\pipe\...`) is,
+    ///   since the dial opens it with CreateFileW read-write -- were that
+    ///   left to the net grant alone, the error of a dial to a file outside
+    ///   the fs grant (ENOTSOCK, ENOENT, EPERM) would tell the script what
+    ///   the fs gate refuses to: whether it exists, and what it is.
+    ///
+    /// A relative path is resolved against the cwd of the moment, as the fs
+    /// checks resolve one, and when any check depended on that the RESOLVED
+    /// path is returned: the op dials or binds exactly what was checked, not
+    /// whatever the name means after a `process.chdir` made before the op
+    /// runs. With nothing restricted the path is returned as given, at no
+    /// cost. The denial names the path as given, as an fs op's does.
+    pub fn check_pipe<'a>(
+        &self,
+        path: &'a str,
+    ) -> Result<std::borrow::Cow<'a, str>, PermissionDenial> {
+        let fs_path = !is_named_pipe_namespace(path);
+        let fs_restricted = fs_path
+            && !(matches!(self.read, PermValue::All) && matches!(self.write, PermValue::All));
+        if matches!(self.net, PermValue::All) && !fs_restricted {
+            return Ok(std::borrow::Cow::Borrowed(path));
         }
+        let denied = |permission| PermissionDenial {
+            permission,
+            resource: path.to_string(),
+        };
+        let resolved = resolve_against_cwd(path);
+        if !self.net.allows_net_path(&resolved) {
+            return Err(denied("Net"));
+        }
+        if fs_path {
+            if !self.read.allows_fs_path(&resolved) {
+                return Err(denied("FileSystemRead"));
+            }
+            if !self.write.allows_fs_path(&resolved) {
+                return Err(denied("FileSystemWrite"));
+            }
+        }
+        Ok(resolved)
     }
 
     /// Returns `Err(denial)` when `net` is denied for a connection to `host`
@@ -785,34 +853,123 @@ mod tests {
         assert!(p.check_net("api.github.com.evil.example").is_err());
     }
 
+    /// A pipe gate with unrestricted fs, so only the net half decides.
+    fn pipe_perms(net: PermValue) -> Permissions {
+        Permissions {
+            read: PermValue::All,
+            write: PermValue::All,
+            ..perms(PermValue::None, net, PermValue::None)
+        }
+    }
+
     #[test]
     fn a_pipe_path_is_granted_only_by_an_entry_that_is_exactly_it() {
-        let p = perms(
-            PermValue::None,
-            PermValue::List(vec![
-                r"\\.\pipe\app".to_string(),
-                "/run/app.sock".to_string(),
-                "C".to_string(),
-            ]),
-            PermValue::None,
-        );
-        assert!(p.check_net_path(r"\\.\pipe\app").is_ok());
-        assert!(p.check_net_path("/run/app.sock").is_ok());
+        let p = pipe_perms(PermValue::List(vec![
+            r"\\.\pipe\app".to_string(),
+            "/run/app.sock".to_string(),
+            "C".to_string(),
+        ]));
+        assert!(p.check_pipe(r"\\.\pipe\app").is_ok());
+        assert!(p.check_pipe("/run/app.sock").is_ok());
+        // The same path spelt with other separators, or a doubled one.
+        assert!(p.check_pipe("/run//app.sock").is_ok());
         // No prefix: another pipe, a longer name, a socket under the path.
-        assert!(p.check_net_path(r"\\.\pipe\app2").is_err());
-        assert!(p.check_net_path(r"\\.\pipe\docker_engine").is_err());
-        assert!(p.check_net_path("/run/app.sock.d/x").is_err());
+        assert!(p.check_pipe(r"\\.\pipe\app2").is_err());
+        assert!(p.check_pipe(r"\\.\pipe\docker_engine").is_err());
+        assert!(p.check_pipe("/run/app.sock.d/x").is_err());
         // No host:port reading: `C:\x.sock` is not the host `C`.
-        assert!(p.check_net_path(r"C:\x.sock").is_err());
-        let denial = p.check_net_path(r"\\.\pipe\other").unwrap_err();
+        assert!(p.check_pipe(r"C:\x.sock").is_err());
+        let denial = p.check_pipe(r"\\.\pipe\other").unwrap_err();
         assert_eq!(
             (denial.permission, denial.resource.as_str()),
             ("Net", r"\\.\pipe\other")
         );
-        let all = perms(PermValue::None, PermValue::All, PermValue::None);
-        assert!(all.check_net_path(r"\\.\pipe\anything").is_ok());
-        let none = perms(PermValue::None, PermValue::None, PermValue::None);
-        assert!(none.check_net_path(r"\\.\pipe\app").is_err());
+        let all = pipe_perms(PermValue::All);
+        assert!(all.check_pipe(r"\\.\pipe\anything").is_ok());
+        let none = pipe_perms(PermValue::None);
+        assert!(none.check_pipe(r"\\.\pipe\app").is_err());
+    }
+
+    /// Regression guard: the pipe grant compared the raw string while the
+    /// OS resolves a relative socket path against the cwd at connect time,
+    /// so `--allow-net=docker.sock` plus `process.chdir('/var/run')` dialled
+    /// /var/run/docker.sock. A relative entry grants no pipe; a relative
+    /// target is resolved against the cwd of the moment, and that resolved
+    /// path is what the op is handed to use.
+    #[test]
+    fn a_relative_pipe_path_is_resolved_and_a_relative_entry_grants_nothing() {
+        let cwd = std::env::current_dir().unwrap();
+        let here = cwd.join("app.sock").to_string_lossy().into_owned();
+        let p = pipe_perms(PermValue::List(vec![
+            "docker.sock".to_string(),
+            here.clone(),
+        ]));
+        assert_eq!(
+            p.check_pipe("docker.sock").unwrap_err().permission,
+            "Net",
+            "a relative entry grants no pipe"
+        );
+        assert_eq!(p.check_pipe("app.sock").unwrap(), here.as_str());
+        assert_eq!(p.check_pipe(&here).unwrap(), here.as_str());
+        // Nothing restricted: the path as given, untouched.
+        let all = pipe_perms(PermValue::All);
+        assert!(matches!(
+            all.check_pipe("app.sock"),
+            Ok(std::borrow::Cow::Borrowed("app.sock"))
+        ));
+    }
+
+    /// Regression guard: a pipe op asked the net grant only, but a path
+    /// outside the Windows pipe namespace is a file the dial opens
+    /// read-write (and on Unix a socket file that listen creates and close
+    /// unlinks), so under `--allow-net` alone the dial's error code
+    /// (ENOTSOCK, ENOENT, EPERM) answered "does this exist, and is it a
+    /// file?" for paths the fs grant refused. Such a path needs the fs read
+    /// and write grants too; a named pipe needs only net.
+    #[test]
+    fn a_pipe_path_that_is_a_file_needs_the_fs_grants_too() {
+        let cwd = std::env::current_dir().unwrap();
+        let inside = cwd.join("box");
+        let file = inside.join("x.sock").to_string_lossy().into_owned();
+        let outside = cwd.join("secret.txt").to_string_lossy().into_owned();
+        let grant = PermValue::List(vec![inside.to_string_lossy().into_owned()]);
+        let p = Permissions {
+            read: grant.clone(),
+            write: grant.clone(),
+            ..perms(PermValue::None, PermValue::All, PermValue::None)
+        };
+        assert!(p.check_pipe(&file).is_ok());
+        let denial = p.check_pipe(&outside).unwrap_err();
+        assert_eq!(
+            (denial.permission, denial.resource.as_str()),
+            ("FileSystemRead", outside.as_str())
+        );
+        let read_only = Permissions {
+            write: PermValue::None,
+            ..p.clone()
+        };
+        assert_eq!(
+            read_only.check_pipe(&file).unwrap_err().permission,
+            "FileSystemWrite"
+        );
+        if cfg!(windows) {
+            // The named-pipe namespace is no file: net alone decides.
+            for name in [
+                r"\\.\pipe\app",
+                r"\\?\pipe\app",
+                "//./pipe/app",
+                r"\\.\PIPE\app",
+            ] {
+                assert!(read_only.check_pipe(name).is_ok(), "{name}");
+            }
+            // A device or drive path is not the pipe namespace.
+            for name in [r"\\.\C:\x", r"\\?\C:\x", r"\\.\pipe\", r"\\.\pipe"] {
+                assert!(read_only.check_pipe(name).is_err(), "{name}");
+            }
+        } else {
+            // Every socket path is a file.
+            assert!(read_only.check_pipe(r"\\.\pipe\app").is_err());
+        }
     }
 
     #[test]

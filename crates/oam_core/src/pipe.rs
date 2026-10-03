@@ -243,18 +243,20 @@ mod windows {
         }
     }
 
-    /// Dial the named pipe `path` as libuv's `uv_pipe_connect` does:
+    /// Dial the named pipe `target` as libuv's `uv_pipe_connect` does:
     /// CreateFileW read-write; while every instance of the pipe is taken
     /// (ERROR_PIPE_BUSY) wait for one, up to libuv's 30 s; and refuse a
     /// handle that is not a pipe (a regular file opens fine) with node's
-    /// `ENOTSOCK`. The error is node's `connect` shape.
+    /// `ENOTSOCK`. The error is node's `connect` shape, naming `path`, the
+    /// path as the script gave it.
     pub(crate) async fn connect(
+        target: &str,
         path: &str,
     ) -> Result<(PipeRead, PipeWrite), Box<crate::NodeSysError>> {
         let deadline = tokio::time::Instant::now() + BUSY_WAIT;
         let mut pause = std::time::Duration::from_millis(1);
         let client = loop {
-            match ClientOptions::new().open(path) {
+            match ClientOptions::new().open(target) {
                 Ok(client) => break client,
                 Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
                     if tokio::time::Instant::now() >= deadline {
@@ -291,14 +293,15 @@ mod windows {
         ServerOptions::new().first_pipe_instance(first).create(path)
     }
 
-    /// Listen on the named pipe `path`, as libuv's `uv_pipe_bind`: the first
-    /// instance is created with FILE_FLAG_FIRST_PIPE_INSTANCE, so a name
-    /// another server holds is refused -- node's EADDRINUSE -- and a name
-    /// that is not a pipe's (`C:\x.sock`, a bare `x`) is EACCES.
-    pub(crate) fn bind(path: &str) -> Result<PipeListener, Box<crate::NodeSysError>> {
-        match instance(path, true) {
+    /// Listen on the named pipe `target`, as libuv's `uv_pipe_bind`: the
+    /// first instance is created with FILE_FLAG_FIRST_PIPE_INSTANCE, so a
+    /// name another server holds is refused -- node's EADDRINUSE -- and a
+    /// name that is not a pipe's (`C:\x.sock`, a bare `x`) is EACCES. The
+    /// error names `path`, the path as the script gave it.
+    pub(crate) fn bind(target: &str, path: &str) -> Result<PipeListener, Box<crate::NodeSysError>> {
+        match instance(target, true) {
             Ok(first) => Ok(PipeListener {
-                path: path.to_string(),
+                path: target.to_string(),
                 next: Some(first),
             }),
             Err(e) => {
@@ -342,13 +345,15 @@ mod windows {
 mod unix {
     use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
-    /// Dial the Unix domain socket `path`. The error is node's `connect`
+    /// Dial the Unix domain socket `target`. The error is node's `connect`
     /// shape (ENOENT: no such file; ECONNREFUSED: nothing listening on it;
-    /// EACCES: not permitted).
+    /// EACCES: not permitted), naming `path`, the path as the script gave
+    /// it.
     pub(crate) async fn connect(
+        target: &str,
         path: &str,
     ) -> Result<(OwnedReadHalf, OwnedWriteHalf), Box<crate::NodeSysError>> {
-        match tokio::net::UnixStream::connect(path).await {
+        match tokio::net::UnixStream::connect(target).await {
             Ok(stream) => Ok(stream.into_split()),
             Err(e) => Err(super::connect_error(&e, path)),
         }
@@ -360,13 +365,15 @@ mod unix {
         path: String,
     }
 
-    /// Listen on the Unix domain socket `path`. As node's, an existing file
-    /// at `path` is not removed first: the bind fails with EADDRINUSE.
-    pub(crate) fn bind(path: &str) -> Result<PipeListener, Box<crate::NodeSysError>> {
-        match tokio::net::UnixListener::bind(path) {
+    /// Listen on the Unix domain socket `target`. As node's, an existing
+    /// file there is not removed first: the bind fails with EADDRINUSE. The
+    /// error names `path`, the path as the script gave it; the file the
+    /// close unlinks is `target`, the one bound.
+    pub(crate) fn bind(target: &str, path: &str) -> Result<PipeListener, Box<crate::NodeSysError>> {
+        match tokio::net::UnixListener::bind(target) {
             Ok(listener) => Ok(PipeListener {
                 listener,
-                path: path.to_string(),
+                path: target.to_string(),
             }),
             Err(e) => Err(super::listen_error(crate::node_error_code(&e), &e, path)),
         }

@@ -3149,9 +3149,19 @@ booting and then failing every browser tool.
   `--allow-net`, or by an entry that is exactly that path (`--allow-net=\\.\pipe\app`,
   `--allow-net=/run/app.sock`) -- never by a host entry, a prefix, or a `C` read out of
   `C:\x.sock` -- for connect and listen alike, refused with `ERR_ACCESS_DENIED` thrown from
-  the call. Node 22's permission model has no network category; the choice is oam's, made so
-  that a grant for one service cannot reach `\\.\pipe\docker_engine` or
-  `/var/run/docker.sock`.
+  the call. A pipe path that is a file needs `--allow-fs-read` and `--allow-fs-write` for it
+  too: on Unix every socket path is one (a dial opens it, a listen creates it and the
+  server's close unlinks it), and on Windows every path outside the named-pipe namespace
+  (`\\<server>\pipe\...`) is, since the dial opens it read-write -- without that, the dial's
+  error (`ENOTSOCK`, `ENOENT`, `EPERM`) would say whether a file the fs grant hides exists.
+  A relative path is resolved against the cwd of the moment, as an fs path is, and the op
+  then dials or binds that resolved path; only an absolute entry grants a pipe, so
+  `--allow-net=app.sock` grants none -- a relative grant would name another socket after
+  every `process.chdir`. Node 22's permission model has no network category and does not
+  gate pipes at all (measured on v22.22.2: under `--permission` with no fs grant it listens
+  on a named pipe and dials a file); the choice is oam's, made so that a grant for one
+  service cannot reach `\\.\pipe\docker_engine` or `/var/run/docker.sock`, nor a pipe op
+  reach past the fs grant.
 - **Windows: remote clients and impersonation.** oam's pipe server refuses clients on other
   machines (`PIPE_REJECT_REMOTE_CLIENTS`) and its client lets the server identify, not
   impersonate, it (`SECURITY_IDENTIFICATION`); libuv sets neither, so a Node server takes

@@ -674,15 +674,19 @@ pub async fn tcp_connect_pinned(
 }
 
 /// net.connect({ path }): dial the Windows named pipe or Unix domain socket
-/// `path` ([`crate::pipe::connect`]) and register the stream with the TCP
-/// ones, so every stream op takes it. Returns Json {handle}: a pipe has no
-/// addresses. A failure rejects with node's `connect ENOENT <path>` shape.
+/// `target` ([`crate::pipe::connect`]) and register the stream with the TCP
+/// ones, so every stream op takes it. `target` is `path` as the permission
+/// gate resolved it (the same string unless a relative path had to be
+/// resolved against the cwd); `path`, as the script gave it, is what an
+/// error names. Returns Json {handle}: a pipe has no addresses. A failure
+/// rejects with node's `connect ENOENT <path>` shape.
 pub async fn pipe_connect(
     registry: TcpRegistry,
     ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
     path: String,
+    target: String,
 ) -> OpOutcome {
-    let (reader, writer) = match crate::pipe::connect(&path).await {
+    let (reader, writer) = match crate::pipe::connect(&target, &path).await {
         Ok(halves) => pipe_halves(halves),
         Err(e) => return OpOutcome::sys(*e),
     };
@@ -1083,14 +1087,16 @@ pub async fn tcp_listen(
 /// net.createServer + server.listen(path): listen on the Windows named pipe
 /// or Unix domain socket `path` ([`crate::pipe::bind`]). Returns Json
 /// {serverId}; [`tcp_accept`] and [`tcp_server_close`] take the server as
-/// they take a TCP one. A failure rejects with node's `listen EADDRINUSE:
-/// address already in use <path>` shape.
+/// they take a TCP one. `target` and `path` as for [`pipe_connect`]. A
+/// failure rejects with node's `listen EADDRINUSE: address already in use
+/// <path>` shape.
 pub async fn pipe_listen(
     registry: TcpRegistry,
     ids: std::sync::Arc<std::sync::atomic::AtomicU64>,
     path: String,
+    target: String,
 ) -> OpOutcome {
-    let listener = match crate::pipe::bind(&path) {
+    let listener = match crate::pipe::bind(&target, &path) {
         Ok(listener) => listener,
         Err(e) => return OpOutcome::sys(*e),
     };
@@ -1990,11 +1996,12 @@ mod tests {
         let ids = std::sync::Arc::new(AtomicU64::new(1));
         let path = test_pipe_path("round-trip");
 
-        let server = json(pipe_listen(registry.clone(), ids.clone(), path.clone()).await);
+        let server =
+            json(pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await);
         let server_id = server["serverId"].as_u64().unwrap();
         assert_eq!(server.as_object().unwrap().len(), 1, "{server}");
         // Taken: node's EADDRINUSE, `listen` shaped.
-        match pipe_listen(registry.clone(), ids.clone(), path.clone()).await {
+        match pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await {
             OpOutcome::NodeFailed {
                 code,
                 message,
@@ -2016,7 +2023,8 @@ mod tests {
         }
 
         let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
-        let client = json(pipe_connect(registry.clone(), ids.clone(), path.clone()).await);
+        let client =
+            json(pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone()).await);
         let accepted = json(accepting.await.unwrap());
         assert_eq!(client.as_object().unwrap().len(), 1, "{client}");
         assert_eq!(accepted.as_object().unwrap().len(), 1, "{accepted}");
@@ -2050,7 +2058,7 @@ mod tests {
         tcp_close(&registry, s);
         tcp_server_close(&registry, server_id);
 
-        match pipe_connect(registry.clone(), ids.clone(), path.clone()).await {
+        match pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone()).await {
             OpOutcome::NodeFailed {
                 code,
                 message,
@@ -2081,12 +2089,14 @@ mod tests {
         let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
         let ids = std::sync::Arc::new(AtomicU64::new(1));
         let path = test_pipe_path("shutdown");
-        let server_id =
-            json(pipe_listen(registry.clone(), ids.clone(), path.clone()).await)["serverId"]
-                .as_u64()
-                .unwrap();
+        let server_id = json(
+            pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await,
+        )["serverId"]
+            .as_u64()
+            .unwrap();
         let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
-        let c = json(pipe_connect(registry.clone(), ids.clone(), path.clone()).await)["handle"]
+        let c = json(pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone()).await)
+            ["handle"]
             .as_u64()
             .unwrap();
         let s = json(accepting.await.unwrap())["handle"].as_u64().unwrap();
@@ -2134,12 +2144,14 @@ mod tests {
         let registry: TcpRegistry = std::sync::Arc::new(std::sync::Mutex::new(TcpState::default()));
         let ids = std::sync::Arc::new(AtomicU64::new(1));
         let path = test_pipe_path("parked");
-        let server_id =
-            json(pipe_listen(registry.clone(), ids.clone(), path.clone()).await)["serverId"]
-                .as_u64()
-                .unwrap();
+        let server_id = json(
+            pipe_listen(registry.clone(), ids.clone(), path.clone(), path.clone()).await,
+        )["serverId"]
+            .as_u64()
+            .unwrap();
         let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
-        let c = json(pipe_connect(registry.clone(), ids.clone(), path.clone()).await)["handle"]
+        let c = json(pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone()).await)
+            ["handle"]
             .as_u64()
             .unwrap();
         let s = json(accepting.await.unwrap())["handle"].as_u64().unwrap();
@@ -2159,7 +2171,9 @@ mod tests {
         // The client writes what the server never reads, shuts down, and is
         // closed while that shutdown still waits: the close is at once.
         let accepting = tokio::spawn(tcp_accept(registry.clone(), server_id, ids.clone()));
-        let c2 = json(pipe_connect(registry.clone(), ids.clone(), path.clone()).await)["handle"]
+        let c2 = json(
+            pipe_connect(registry.clone(), ids.clone(), path.clone(), path.clone()).await,
+        )["handle"]
             .as_u64()
             .unwrap();
         let s2 = json(accepting.await.unwrap())["handle"].as_u64().unwrap();
