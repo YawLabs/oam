@@ -1320,6 +1320,48 @@ RELEASE_LIVE=1
 ok "release $TAG published: https://github.com/$REPO/releases/tag/$TAG"
 ok "staged assets kept at $RELEASE_DIR (safe to delete)"
 
+# site_refresh_reason <stderr> -- why refresh-downloads.sh refused, as one line
+# fit for a warn: its last "[fail]" line (the prefix dropped), else its last
+# line that mentions an error, else its last three non-empty lines joined by
+# " | ". Colour codes and control characters are stripped and the result is
+# capped at 300 characters. The text is the site script's, so it is only ever
+# printed, never evaluated; backslashes are doubled because warn prints with
+# echo -e, which would otherwise read the "\c" in a Windows path as "stop
+# here". Every command in it succeeds, so it cannot trip set -e or pipefail.
+site_refresh_reason() {
+  local esc=$'\033' reason
+  reason="$(printf '%s\n' "$1" | tr '\t' ' ' | sed "s/${esc}\[[0-9;]*[A-Za-z]//g" \
+    | tr -d '\000-\010\013-\037\177' | awk '
+      /\[fail\]/ { f = $0 }
+      tolower($0) ~ /error|fail|refus|denied|not found/ { e = $0 }
+      NF { l = $0; gsub(/^[[:space:]]+|[[:space:]]+$/, "", l); t[n % 3] = l; n++ }
+      END {
+        if (f != "") { r = f; sub(/^[[:space:]]*\[fail\][[:space:]]*/, "", r) }
+        else if (e != "") r = e
+        else for (i = (n > 3 ? n - 3 : 0); i < n; i++) r = r (r == "" ? "" : " | ") t[i % 3]
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", r)
+        if (length(r) > 300) r = substr(r, 1, 297) "..."
+        print (r == "" ? "it printed nothing on stderr" : r)
+      }')"
+  printf '%s\n' "${reason//\\/\\\\}"
+}
+
+# refresh_site_downloads <site-dir> <tag> -- run the site's refresh-downloads.sh
+# for <tag>. Its stdout is discarded; its stderr is captured, so a refusal's
+# reason reaches the warn instead of /dev/null (on success its chatter is
+# dropped, as before). Always returns 0: the release is already live by the
+# time this runs, so a failure here warns and falls through.
+refresh_site_downloads() {
+  local err rc=0
+  err="$("$1/scripts/refresh-downloads.sh" "$2" 2>&1 >/dev/null)" || rc=$?
+  if [ "$rc" = "0" ]; then
+    ok "release pages regenerated for $2 (downloads page + checksums post)"
+  else
+    warn "refresh-downloads.sh failed (exit $rc): $(site_refresh_reason "$err") -- the downloads page and checksums post still advertise the previous release"
+  fi
+  return 0
+}
+
 # --- publish the installers to oamjs.org -----------------------------------------
 # The installers at https://oamjs.org/install.{sh,ps1} are what users pipe into
 # sh / iex, and `oam self-update` in binaries before v0.18.0 does the same
@@ -1349,9 +1391,7 @@ else
   # rest of this step: the release is already out, and the verification below
   # says loudly if the live page is stale.
   if [ -x "$SITE_DIR/scripts/refresh-downloads.sh" ]; then
-    "$SITE_DIR/scripts/refresh-downloads.sh" "$TAG" >/dev/null 2>&1 \
-      && ok "release pages regenerated for $TAG (downloads page + checksums post)" \
-      || warn "refresh-downloads.sh failed -- the downloads page and checksums post still advertise the previous release"
+    refresh_site_downloads "$SITE_DIR" "$TAG"
   else
     warn "no scripts/refresh-downloads.sh in $SITE_DIR -- downloads page NOT regenerated"
   fi

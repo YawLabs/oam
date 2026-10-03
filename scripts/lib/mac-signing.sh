@@ -164,7 +164,7 @@ mac_sign_decision(){
   elif [ -n "$pin" ]; then
     printf 'identity:%s\n' "$pin"
   elif [ "$req" = "1" ]; then
-    printf 'fail:OAM_SIGN_REQUIRED=1 but %s holds no SHA-1 yet -- provision the identity (ssh <mac> '\''bash -s -- --generate'\'' < scripts/provision-mac-signing.sh) and commit its sha1, or unset OAM_SIGN_REQUIRED for a bootstrap release\n' "$MAC_SIGNING_PIN_FILE"
+    printf 'fail:OAM_SIGN_REQUIRED=1 but %s holds no SHA-1 yet -- provision the identity (ssh <mac> '\''bash -s -- --generate'\'' < scripts/provision-mac-signing.sh) and commit its sha1, or set OAM_SIGN_REQUIRED=0 for a bootstrap release (release-local.sh defaults it to 1)\n' "$MAC_SIGNING_PIN_FILE"
   else
     printf 'adhoc:%s holds no SHA-1 yet, so the mac binaries are signed AD-HOC (hardened runtime + entitlements, no certificate). Bootstrap only: once a SHA-1 is committed the pinned identity is mandatory\n' "$MAC_SIGNING_PIN_FILE"
   fi
