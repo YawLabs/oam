@@ -205,11 +205,19 @@ fn zoned_entry_admits(item: &str, ip: std::net::Ipv6Addr, zone: &str, port: u16)
         return false;
     }
     match entry_zone.rsplit_once(':') {
-        Some((head, tail)) if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) => {
+        Some((head, tail)) if is_port_scoped_zone(entry_zone) => {
             head == zone && canonical_port(tail) == Some(port)
         }
         _ => entry_zone == zone,
     }
+}
+
+/// Whether an entry's zone text is the port-scoped form: it ends in `:` and
+/// decimal digits, which [`zoned_entry_admits`] always reads as a port.
+fn is_port_scoped_zone(entry_zone: &str) -> bool {
+    entry_zone
+        .rsplit_once(':')
+        .is_some_and(|(_, tail)| !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()))
 }
 
 impl PermValue {
@@ -259,10 +267,37 @@ impl PermValue {
     /// that port; a bare-host entry matches the host on any port.
     ///
     /// Used by net ONLY. `--allow-net=127.0.0.1:5432` must not admit `:54321`.
+    ///
+    /// A target with a `%` is a zone-id address, and is matched as an address
+    /// and a zone by the rule [`Self::allows_net_target`] applies, never as
+    /// text: the connect ops build their resource as `host:port` with the
+    /// op's own port in decimal, so the text after the target's last `:` is
+    /// that port and everything before it the host. So `net.connect`,
+    /// `tls.connect`, their lookup-hook answers and `fetch` read one grant
+    /// the same way -- a host-only `fe80::1%1` admits that address and zone
+    /// on any port, `fe80::1%1:8080` on port 8080 alone, and the address is
+    /// compared parsed (any spelling of it). A zoned target with no port (a
+    /// `permissions.query` target) is admitted by a host-only entry alone.
     pub fn allows_net(&self, target: &str) -> bool {
         match self {
             PermValue::All => true,
             PermValue::None => false,
+            PermValue::List(list) if target.contains('%') => {
+                if let Some((host, port)) = target
+                    .rsplit_once(':')
+                    .and_then(|(host, tail)| Some((host, canonical_port(tail)?)))
+                {
+                    return self.allows_net_target(host, port);
+                }
+                let Some((ip, zone)) = parse_zoned(target) else {
+                    return false;
+                };
+                list.iter().any(|item| {
+                    parse_zoned(item).is_some_and(|(entry_ip, entry_zone)| {
+                        entry_ip == ip && entry_zone == zone && !is_port_scoped_zone(entry_zone)
+                    })
+                })
+            }
             PermValue::List(list) => list.iter().any(|item| {
                 if item == target {
                     return true;
@@ -1201,6 +1236,94 @@ mod tests {
         assert!(scoped.check_net("fe80::2%1:8080").is_ok());
         assert!(scoped.check_net("fe80::2%1:8080:80").is_err());
         assert!(scoped.check_net("fe80::2%1:8080:8080").is_err());
+    }
+
+    #[test]
+    fn net_connect_resource_matches_a_zone_id_host_as_fetch_does() {
+        // net.connect, tls.connect and their lookup-hook answers ask about
+        // `host:port` (check_net); fetch asks about the two halves
+        // (check_net_target). For a zone-id host both read one grant the same
+        // way: the address parsed, the zone as written, the port the op's own.
+        let net = |list: Vec<&str>| {
+            perms(
+                PermValue::None,
+                PermValue::List(list.into_iter().map(String::from).collect()),
+                PermValue::None,
+            )
+        };
+        let grants = [
+            net(vec!["fe80::2%1:8080"]),
+            net(vec!["fe80::2%1"]),
+            net(vec!["::1%1"]),
+            net(vec!["fe80::2%a:b", "fe80::2%eth0:1"]),
+            net(vec!["fe80::2%1:08080", "fe80::2%2:99999"]),
+            net(vec!["fe80::2%", "fe80::2%1%2", "127.0.0.1%1", "x%1"]),
+            net(vec!["granted.invalid", "[fe80::2]", "fe80::2"]),
+        ];
+        let hosts = [
+            "fe80::2%1",
+            "FE80:0::2%1",
+            "fe80:0:0:0:0:0:0:2%1",
+            "fe80::2%01",
+            "fe80::2%2",
+            "fe80::3%1",
+            "fe80::2%1:8080",
+            "fe80::2%a:b",
+            "fe80::2%eth0",
+            "fe80::2%eth0:1",
+            "::1%1",
+            "0::1%1",
+            "fe80::2%",
+            "fe80::2%1%2",
+            "127.0.0.1%1",
+            "x%1",
+        ];
+        for grant in &grants {
+            for host in hosts {
+                for port in [0u16, 1, 80, 8080, 65535] {
+                    assert_eq!(
+                        grant.check_net(&format!("{host}:{port}")).is_ok(),
+                        grant.check_net_target(host, port).is_ok(),
+                        "{:?}: {host} on {port}",
+                        grant.net
+                    );
+                }
+            }
+        }
+
+        // A host-only zone entry admits its address, in any spelling, on any
+        // port; a port-scoped one on its port alone.
+        let host_only = net(vec!["::1%1", "fe80::2%a:b"]);
+        for port in [80, 8080] {
+            assert!(host_only.check_net(&format!("::1%1:{port}")).is_ok());
+            assert!(host_only.check_net(&format!("0:0::1%1:{port}")).is_ok());
+            assert!(host_only.check_net(&format!("fe80::2%a:b:{port}")).is_ok());
+            assert!(host_only.check_net(&format!("::1%2:{port}")).is_err());
+        }
+        let scoped = net(vec!["fe80::2%1:8080"]);
+        assert!(scoped.check_net("FE80:0::2%1:8080").is_ok());
+        assert!(scoped.check_net("FE80:0::2%1:8081").is_err());
+
+        // A zoned query target with no port is admitted by a host-only entry
+        // alone, and query() answers as the gate does.
+        assert!(host_only.check_net("::1%1").is_ok());
+        assert!(host_only.check_net("0::1%1").is_ok());
+        assert!(host_only.check_net("fe80::2%a:b").is_ok());
+        assert!(scoped.check_net("fe80::2%1").is_err());
+        assert!(scoped.check_net("fe80::2%1:08080").is_err());
+        assert!(host_only.check_net("x%1").is_err());
+        for target in ["::1%1:80", "0::1%1", "::1%2:80", "x%1:80"] {
+            let expected = if host_only.check_net(target).is_ok() {
+                "granted"
+            } else {
+                "denied"
+            };
+            assert_eq!(
+                host_only.query_state("net", Some(target)),
+                expected,
+                "{target}"
+            );
+        }
     }
 
     #[test]

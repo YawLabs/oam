@@ -1613,17 +1613,16 @@ does not read it, and a proxy that resolved the name again would undo the pin. W
   its errors dropped the zone. What is left: on macOS and the BSDs oam has the system
   resolver read the zone, which also takes a number (`%1`) as the interface index, where
   libuv looks a number up as an interface NAME and finds none (scope id 0); and under
-  `--permission` a zoned answer is checked as written and unbracketed, since no URL can
-  name it, so a grant spells it as the hook does (`--allow-net` with no list admits
-  any). For a fetch, `fe80::1%1` admits that answer on every port and `fe80::1%1:8080`
-  on port 8080 alone; for `net.connect`, which asks about the joined `fe80::1%1:8080`
-  (the raw-socket IPv6 spelling, entry 4), only that port-scoped entry does. A fetch's
-  zoned answer is matched as an address (any spelling) and a zone (as written), and its
-  zone is all of its text after `%`, as in Node, whose zone grammar admits `:`
-  (`net.isIP('fe80::1%1:8080')` is 6, and a connect dials it with the zone `1:8080`). So an
-  entry ending in `:` and digits is always port-scoped: `fe80::1%1:8080` grants the zone `1`
-  on port 8080 and never an answer whose zone is `1:8080`, which only `--allow-net` with no
-  list admits.
+  `--permission` a zoned answer or host is checked unbracketed, since no URL can name
+  it, so a grant spells it as the hook does (`--allow-net` with no list admits any). It
+  is matched as an address (any spelling) and a zone (as written), by `fetch`,
+  `net.connect` and `tls.connect` alike, whether the host is named directly or answered
+  by a `lookup` hook: `fe80::1%1` admits that address and zone on every port and
+  `fe80::1%1:8080` on port 8080 alone. The zone is all of the text after `%`, as in Node,
+  whose zone grammar admits `:` (`net.isIP('fe80::1%1:8080')` is 6, and a connect dials
+  it with the zone `1:8080`). So an entry ending in `:` and digits is always
+  port-scoped: `fe80::1%1:8080` grants the zone `1` on port 8080 and never a host whose
+  zone is `1:8080`, which only `--allow-net` with no list admits.
 - **A refusing hook's error** rejects `undici.request` and `agent.request` as itself, as in
   Node, and `fetch` with it as the `cause` of `TypeError: fetch failed`, as in Node. Up to
   0.17.1 `undici.request`, which runs on `fetch` in oam, rejected with the `TypeError` too.
