@@ -7271,6 +7271,74 @@ server.close();
     );
 }
 
+/// A hooked fetch's h2 resends are counted across the park for the hook: a
+/// resend that needs a new connection parks for the hook's answer, and the
+/// resumed hop used to start counting from zero again, so an origin that
+/// answers every request with GOAWAY(NO_ERROR) had a hooked fetch ask the
+/// hook and open connections without end (the review of #179 counted 40
+/// before its guard stopped it). The hooked fetch now gives up where a plain
+/// one does: after the same connections, with one hook call for each.
+///
+/// node v22.22.2 + undici 6.24.1 sends such a request once (1 connection, 1
+/// hook call) and fails with UND_ERR_SOCKET; oam resends twice, hooked or not
+/// (docs/node-divergences.md). What the assertion pins is that the hook
+/// changes nothing: the counts are a plain fetch's, and they are bounded.
+#[test]
+fn a_hooked_h2_fetch_stops_resending_after_goaway_as_a_plain_one_does() {
+    let bundle = write_temp("fetch-lookup-goaway/ca.pem", TLS_TEST_CA_CERT);
+    let src = r#"import tls from 'node:tls';
+import { Agent } from 'undici';
+let connections = 0;
+// A raw h2 origin: SETTINGS, then GOAWAY(last stream 0, NO_ERROR) and FIN in
+// answer to the first HEADERS -- the request was never processed.
+const server = tls.createServer({ cert: `__CERT__`, key: `__KEY__`, ALPNProtocols: ['h2'] }, (s) => {
+  connections++;
+  s.on('error', () => {});
+  s.write(Buffer.from([0, 0, 0, 4, 0, 0, 0, 0, 0]));
+  let buf = Buffer.alloc(0), preface = false;
+  s.on('data', (d) => {
+    buf = Buffer.concat([buf, d]);
+    if (!preface) { if (buf.length < 24) return; buf = buf.subarray(24); preface = true; }
+    while (buf.length >= 9) {
+      const len = buf.readUIntBE(0, 3), type = buf[3], flags = buf[4];
+      if (buf.length < 9 + len) break;
+      buf = buf.subarray(9 + len);
+      if (type === 4 && !(flags & 1)) s.write(Buffer.from([0, 0, 0, 4, 1, 0, 0, 0, 0]));
+      if (type === 1) { s.end(Buffer.from([0, 0, 8, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])); return; }
+    }
+  });
+});
+await new Promise((r) => server.listen(0, '127.0.0.1', r));
+let calls = 0;
+const lookup = (host, opts, cb) => {
+  if (++calls > 20) { console.log('runaway: hook calls', calls, 'connections', connections); process.exit(3); }
+  cb(null, [{ address: '127.0.0.1', family: 4 }]);
+};
+for (const label of ['plain', 'hooked']) {
+  connections = 0; calls = 0;
+  const agent = new Agent({ allowH2: true, connect: label === 'hooked' ? { lookup } : {} });
+  try { await fetch(`https://localhost:${server.address().port}/`, { dispatcher: agent }); console.log(label, 'resolved?!'); }
+  catch (e) { console.log(label, e.message, 'connections', connections, 'hook calls', calls); }
+  await agent.close();
+}
+server.close();
+"#
+    .replace("__CERT__", TLS_TEST_LEAF_CERT)
+    .replace("__KEY__", TLS_TEST_LEAF_KEY);
+    let script = write_temp("fetch_lookup_goaway/main.mjs", &src);
+    let out = oam_run_with_proxy_env(
+        &script,
+        &[("NODE_EXTRA_CA_CERTS", bundle.to_str().unwrap())],
+    );
+    let (stdout, stderr) = run_script_ok(&script, out);
+    assert_eq!(
+        stdout.trim().replace("\r\n", "\n"),
+        "plain fetch failed connections 3 hook calls 0\n\
+         hooked fetch failed connections 3 hook calls 3",
+        "stderr: {stderr}"
+    );
+}
+
 /// The SSRF guard: a hook that refuses a host fails the fetch CLOSED -- a
 /// TypeError "fetch failed" whose `cause` is the hook's error object itself --
 /// and nothing is dialled, neither for the first host nor for a redirect's

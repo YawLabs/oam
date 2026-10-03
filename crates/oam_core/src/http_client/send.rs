@@ -413,6 +413,21 @@ struct LoopState {
     /// park and sent as it is once the answer is in (a streamed body cannot
     /// be built a second time).
     unsent: Option<http::Request<ReqBody>>,
+    /// This hop's resends so far. In the state, not the hop's own body: a
+    /// resend that needs a new connection parks for the hook, and the hop
+    /// resumed after that park must not start counting again (an origin
+    /// that answered every connection with GOAWAY then had a hooked fetch
+    /// open connections without end). Reset only by a redirect.
+    resends: Resends,
+}
+
+/// The two resend allowances of a hop (see the send loop in [`run`]).
+#[derive(Default, Clone, Copy)]
+struct Resends {
+    /// h2 retries, at most [`MAX_H2_RETRIES`].
+    h2: u32,
+    /// The one resend after a stale pooled connection.
+    stale: bool,
 }
 
 enum BodySource {
@@ -578,6 +593,7 @@ pub async fn fetch(
         defer_head: req.defer_head,
         iterable_body: req.iterable_body,
         unsent: None,
+        resends: Resends::default(),
     };
     run(state, &bodies, &ids, &continuations).await
 }
@@ -801,8 +817,6 @@ async fn run(
                 redirect::Rules::Fetch
             },
         );
-        let mut retries = 0;
-        let mut stale_resent = false;
         let response = loop {
             let request = match state.unsent.take() {
                 Some(request) => request,
@@ -891,11 +905,11 @@ async fn run(
             match sent {
                 Ok(response) => break response,
                 Err(e)
-                    if retries < MAX_H2_RETRIES
+                    if state.resends.h2 < MAX_H2_RETRIES
                         && state.source.replayable()
                         && e.is_h2_retryable() =>
                 {
-                    retries += 1;
+                    state.resends.h2 += 1;
                 }
                 // A pooled connection the server had already closed: no part
                 // of a response arrived, so the request may go out again
@@ -929,14 +943,14 @@ async fn run(
                 // the 3xx's connection is closing with: it never takes that
                 // connection (`pool::retires_for_the_hop`).
                 Err(e)
-                    if !stale_resent
+                    if !state.resends.stale
                         && state.source.replayable()
                         && is_idempotent(&state.method)
                         && e.is_incomplete_message()
                         && e.on_reused_connection()
                         && !e.response_started() =>
                 {
-                    stale_resent = true;
+                    state.resends.stale = true;
                 }
                 Err(e) => {
                     state.source.request_failed();
@@ -1053,6 +1067,7 @@ async fn run(
                 state.method = method;
                 state.current = url;
                 state.hops += 1;
+                state.resends = Resends::default();
             }
         }
     };

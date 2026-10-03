@@ -2075,12 +2075,20 @@ not streamed. Pinned against Node by `fetch_streams_a_readable_stream_or_async_i
   `Agent` or a `Pool` fails each request with it (e2e
   `a_dispatcher_allowh2_that_is_not_a_boolean_is_refused_as_undicis_client_refuses_it`);
   `connect.allowH2` is tested for truthiness. Over HTTP/2 the client is hyper's rather
-  than undici's experimental one, and two things differ there: a `POST` (or `PUT`, `PATCH`,
+  than undici's experimental one, and three things differ there: a `POST` (or `PUT`, `PATCH`,
   ...) with no body carries the `content-length: 0` it carries over HTTP/1.1, where
-  undici's h2 client sends none; and the warning comes with the first response that arrived
+  undici's h2 client sends none; the warning comes with the first response that arrived
   over HTTP/2, where undici prints it when it connects -- so a redirect chain whose only h2
-  hop is not the last warns in Node alone. _(probed: Node v22.22.2 + undici 6.24.1 against
-  `http2.createSecureServer({ allowHTTP1: true })`)_
+  hop is not the last warns in Node alone; and a request the server turns away unprocessed
+  -- a GOAWAY (`NO_ERROR`) whose last stream id is below it, or `RST_STREAM`
+  (`REFUSED_STREAM`) -- is sent again, up to twice (hyper's and reqwest's allowance), where
+  undici fails it at once, `UND_ERR_SOCKET`
+  `HTTP/2: "GOAWAY" frame received with code 0` after one connection. A `connect.lookup`
+  dispatcher counts those resends across its waits for the hook: it asks the hook once per
+  connection and gives up where a plain fetch does (e2e
+  `a_hooked_h2_fetch_stops_resending_after_goaway_as_a_plain_one_does`). _(probed: Node
+  v22.22.2 + undici 6.24.1 against `http2.createSecureServer({ allowHTTP1: true })`, and
+  the GOAWAY case against a raw TLS h2 server; `REFUSED_STREAM` not measured on Node)_
 - **Decoding** keeps its own entry: 32.
 
 **What a `fetch` refuses before it dials** (all matching Node, listed because a caller sees
