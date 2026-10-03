@@ -3252,6 +3252,24 @@ sg_order scripts/release-local.sh 'step "Preflight $TAG"' 'restore_gate_artifact
   '[ "$(git rev-parse HEAD)" = "$preflight_head" ]' 'git fetch -q origin main 2>/dev/null || true' \
   'assert_release_unpublished "before the bump"' 'bumping Cargo.toml to' 'git tag -a "$TAG" -m "$TAG"'
 
+# Signing is required by default: the docs promise signed assets, so a box
+# without the Windows setup must stop in preflight unless the operator opts
+# out with an explicit OAM_SIGN_REQUIRED=0. The default is exported (the libs
+# and build-platforms-tailnet.sh read the environment) and set before any
+# preflight probe reads it.
+it "release-local.sh: OAM_SIGN_REQUIRED defaults to 1, exported before the preflight"
+if [ "$(grep -cxF 'export OAM_SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-1}"' scripts/release-local.sh)" = "1" ]; then
+  sg_order scripts/release-local.sh 'export OAM_SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-1}"' 'step "Preflight $TAG"' \
+    'build-platforms-tailnet.sh" --preflight-only' 'win_sign_preflight || fail'
+else fail "release-local.sh no longer exports OAM_SIGN_REQUIRED with a default of 1"; fi
+
+it "the default makes an unconfigured Windows box fail, and an explicit 0 still downgrades it to a warning"
+SG_D1="$( ( unset OAM_WIN_SIGN_METADATA OAM_WIN_SIGN_PUBLISHER; export OAM_SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-1}"
+            . scripts/lib/signing.sh; win_sign_decision 0 ) )"
+SG_D0="$( ( unset OAM_WIN_SIGN_METADATA OAM_WIN_SIGN_PUBLISHER; export OAM_SIGN_REQUIRED=0
+            export OAM_SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-1}"; . scripts/lib/signing.sh; win_sign_decision 0 ) )"
+case "$SG_D1|$SG_D0" in fail:*"|skip:"*) pass ;; *) fail "default: $SG_D1 / explicit 0: $SG_D0" ;; esac
+
 it "release-local.sh: the release-exists check is one function, and fails closed on anything but gh's exact 'release not found'"
 SG_H="$(awk '$0 == "assert_release_unpublished() {" { p = 1 } p { print } p && /^}$/ { exit }' scripts/release-local.sh)"
 if grep -qF "grep -qxF 'release not found'" <<<"$SG_H" && grep -qF '[ "$rc" -ne 1 ]' <<<"$SG_H" \

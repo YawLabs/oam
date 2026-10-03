@@ -64,8 +64,8 @@
 # pin is committed now (as is release key k1), so for the mac leg the knob
 # changes nothing: the pinned identity is mandatory either way, and only
 # OAM_SKIP_MAC_SIGN=1 skips it. The knob still matters for Windows, where it
-# makes an unset OAM_WIN_SIGN_METADATA fatal, so release-local.sh's header
-# says to set it on every release. The bootstrap branch stays for a checkout
+# makes an unset OAM_WIN_SIGN_METADATA fatal, so release-local.sh defaults it
+# to 1 (an explicit 0 still wins). The bootstrap branch stays for a checkout
 # whose pin file holds no SHA-1, such as a fork's.
 #
 # The verify gate (mac_verify_binary) re-reads the pin from the file rather

@@ -643,8 +643,11 @@ release_verify_manifest() {
 # name and lives three days, and signtool reaches the service through a
 # client "dlib" plugin. Everything account-specific (endpoint, account name,
 # certificate profile) sits in a metadata.json OUTSIDE the repo, at
-# $OAM_WIN_SIGN_METADATA; the publisher name the signature must carry is
-# $OAM_WIN_SIGN_PUBLISHER. Neither is ever committed: this is a public repo.
+# $OAM_WIN_SIGN_METADATA, never committed: this is a public repo. The
+# publisher name the signature must carry is $OAM_WIN_SIGN_PUBLISHER; the name
+# itself is public (it is printed on every signed asset, and the docs state
+# it), but the script takes it from the environment so a renamed or
+# re-validated organization is a config change, not a code change.
 # release-keys/README.md ("Windows Authenticode") is the setup runbook.
 #
 # Three-day certificates make the RFC 3161 timestamp the signature's real

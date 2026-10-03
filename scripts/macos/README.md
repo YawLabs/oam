@@ -117,5 +117,6 @@ fire: the manifest must be signed and the mac binaries must be signed with
 the pinned identity whatever the knob says. What the knob still changes is
 Windows: with it set, an unset `OAM_WIN_SIGN_METADATA` is fatal, where
 without it both `.exe` assets would ship unsigned behind one warning line.
-Export `OAM_SIGN_REQUIRED=1` for every release. `OAM_SKIP_MAC_SIGN=1` is
-still honored under it.
+`scripts/release-local.sh` sets it to 1 unless you export
+`OAM_SIGN_REQUIRED=0`, so an unsigned release is always a deliberate choice.
+`OAM_SKIP_MAC_SIGN=1` is still honored under it.

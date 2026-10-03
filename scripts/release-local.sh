@@ -131,8 +131,9 @@
 #                           ed25519, "<path>.pub" beside it). Never committed.
 #                           Required as soon as release-keys/allowed_signers
 #                           holds a key; see release-keys/README.md
-#   OAM_SIGN_REQUIRED=0|1   1 makes missing signing setup fatal in preflight
-#                           instead of a warning. SET IT ON EVERY RELEASE.
+#   OAM_SIGN_REQUIRED=0|1   default 1: missing signing setup is fatal in
+#                           preflight. 0 turns that back into a warning, and
+#                           exists only for a box without the Windows setup.
 #                           There are three bootstraps, and two are over:
 #                           - release key: k1 is committed in release-keys/,
 #                             so the manifest is signed either way -- there is
@@ -142,10 +143,12 @@
 #                             binaries are signed with that identity either
 #                             way (only OAM_SKIP_MAC_SIGN=1 skips it);
 #                           - Windows Authenticode: still depends on the box.
-#                             With 1, an unset OAM_WIN_SIGN_METADATA fails the
-#                             preflight; with 0 it is one warning line and
+#                             By default an unset OAM_WIN_SIGN_METADATA fails
+#                             the preflight; with 0 it is one warning line and
 #                             both .exe assets ship unsigned. That is the case
-#                             the knob exists for now.
+#                             the knob exists for now. An unsigned release is
+#                             therefore always a deliberate choice: =0 here,
+#                             or OAM_SKIP_WIN_SIGN / OAM_SKIP_MAC_SIGN.
 #   OAM_WIN_SIGN_METADATA=<path>
 #                           Azure Artifact Signing metadata.json (Endpoint,
 #                           CodeSigningAccountName, CertificateProfileName),
@@ -283,6 +286,11 @@ SKIP_LINUX="${OAM_SKIP_LINUX:-0}"
 # Handed to win_sign_decision, which validates it (0|1); signing.sh itself
 # reads no skip knob.
 SKIP_WIN_SIGN="${OAM_SKIP_WIN_SIGN:-0}"
+# Required by default (see the header): the docs promise signed assets, so a
+# release that cannot sign must stop rather than ship unsigned on a warning.
+# Exported because the libs and build-platforms-tailnet.sh read it from the
+# environment; an explicit OAM_SIGN_REQUIRED=0 still wins.
+export OAM_SIGN_REQUIRED="${OAM_SIGN_REQUIRED:-1}"
 
 RELEASE_DIR="$(mktemp -d -t oam-release-"$TAG"-XXXXXX)"
 # Separate from RELEASE_DIR on purpose: `gh release create "$RELEASE_DIR"/*`
