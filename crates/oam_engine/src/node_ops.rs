@@ -7137,11 +7137,32 @@ fn op_fs_symlink(
         throw_type_error(scope, "symlink requires a target");
         return;
     };
-    let Some(path) = fs_path_arg(scope, &args, 1, FsAccess::Write, "symlink requires a path")
-    else {
+    let Some(link) = arg_string(scope, &args, 1) else {
+        throw_type_error(scope, "symlink requires a path");
         return;
     };
-    crate::ops::spawn_op(scope, &mut rv, oam_core::ops::fs_symlink(target, path));
+    // node's callback and promise forms stat the probe and fall back to a
+    // file link on any failure, a refused read included: no error, and
+    // nothing learnt about a path the read grant refuses.
+    #[cfg(windows)]
+    let probe = {
+        let probe = oam_core::FsPath::new(oam_core::symlink_probe_path(&link, &target));
+        get_permissions(scope)
+            .check_read_path(&probe)
+            .is_ok()
+            .then_some(probe)
+    };
+    #[cfg(not(windows))]
+    let probe = None;
+    let Some(path) = fs_path_of(scope, link, FsAccess::Write) else {
+        return;
+    };
+    let target = oam_core::symlink_target_os(&target).into_owned();
+    crate::ops::spawn_op(
+        scope,
+        &mut rv,
+        oam_core::ops::fs_symlink(target, probe, path),
+    );
 }
 
 fn op_fs_readlink(
@@ -7199,32 +7220,46 @@ fn op_fs_symlink_sync(
         throw_type_error(scope, "symlinkSync requires a target");
         return;
     };
-    let Some(path) = fs_path_arg(
-        scope,
-        &args,
-        1,
-        FsAccess::Write,
-        "symlinkSync requires a path",
-    ) else {
+    let Some(link) = arg_string(scope, &args, 1) else {
+        throw_type_error(scope, "symlinkSync requires a path");
         return;
     };
+    // node's symlinkSync picks a directory or a file link with
+    // `statSync(path.resolve(link, '..', target), { throwIfNoEntry: false })`
+    // before anything else: the target is taken relative to the link's
+    // parent, the read grant is checked on it, and a failure other than
+    // ENOENT or ENOTDIR is thrown as that stat's error.
     #[cfg(windows)]
-    let result = {
-        let is_dir = std::fs::metadata(&target)
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
-        if is_dir {
-            std::os::windows::fs::symlink_dir(&target, &path)
-        } else {
-            std::os::windows::fs::symlink_file(&target, &path)
+    let is_dir = {
+        let probe = oam_core::symlink_probe_path(&link, &target);
+        let Some(probe) = fs_path_of(scope, probe, FsAccess::Read) else {
+            return;
+        };
+        match std::fs::metadata(&probe) {
+            Ok(meta) => meta.is_dir(),
+            Err(e) if matches!(oam_core::node_error_code(&e), "ENOENT" | "ENOTDIR") => false,
+            Err(e) => {
+                throw_node_error(scope, "stat", &probe, &e);
+                return;
+            }
         }
     };
+    let Some(path) = fs_path_of(scope, link, FsAccess::Write) else {
+        return;
+    };
+    let target = oam_core::symlink_target_os(&target);
+    #[cfg(windows)]
+    let result = if is_dir {
+        std::os::windows::fs::symlink_dir(&*target, &path)
+    } else {
+        std::os::windows::fs::symlink_file(&*target, &path)
+    };
     #[cfg(not(windows))]
-    let result = std::os::unix::fs::symlink(&target, &path);
+    let result = std::os::unix::fs::symlink(&*target, &path);
     if let Err(e) = result {
-        // The target is stored as written, so node reports it so; the link's
-        // own path is resolved like any other.
-        throw_node_error_dest(scope, "symlink", &target, &path.shown(), &e);
+        // The target as stored, strip-only, and the link's own path.
+        let shown = oam_core::fs_shown_path(&target);
+        throw_node_error_dest(scope, "symlink", &shown, &path.shown(), &e);
     }
 }
 

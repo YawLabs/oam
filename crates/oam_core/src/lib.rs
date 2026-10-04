@@ -2599,16 +2599,7 @@ pub fn fs_error_path(path: &str) -> std::borrow::Cow<'_, str> {
 pub fn fs_os_path(path: &str) -> std::borrow::Cow<'_, str> {
     #[cfg(windows)]
     {
-        fs_os_path_with(
-            path,
-            || {
-                std::env::current_dir()
-                    .map(|dir| dir.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            },
-            |device| std::env::var(format!("={device}")).ok(),
-            Win32ResolveMode::Cpp,
-        )
+        fs_os_path_with(path, real_cwd, real_drive_cwd, Win32ResolveMode::Cpp)
     }
     #[cfg(not(windows))]
     std::borrow::Cow::Borrowed(path)
@@ -2725,6 +2716,76 @@ impl AsRef<std::path::Path> for FsPath {
     fn as_ref(&self) -> &std::path::Path {
         std::path::Path::new(&self.os)
     }
+}
+
+/// The process's real current directory as node's C++ reads it, for the
+/// Windows resolves (`fs_os_path`): never a patched `process.cwd`.
+#[cfg(windows)]
+fn real_cwd() -> String {
+    std::env::current_dir()
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// The per-drive current directory Windows keeps in `=X:`.
+#[cfg(windows)]
+fn real_drive_cwd(device: &str) -> Option<String> {
+    std::env::var(format!("={device}")).ok()
+}
+
+/// The target string a symlink stores, as node's fs hands it to the binding
+/// for a file or directory link (`preprocessSymlinkDestination` in
+/// lib/internal/fs/utils.js, v22.22.2): on Windows an absolute target
+/// (`path.win32.isAbsolute`: a separator first, or `X:` and a separator) is
+/// namespaced as `path.toNamespacedPath` does (`\\?\C:\x`, `\\?\UNC\srv\sh\x`;
+/// a rooted `\x` lands on the cwd's drive), and a relative one, which stays
+/// relative to the link, only has `/` turned into `\` -- `..` and `.` are
+/// kept. Elsewhere the target as given. A symlink error shows this string
+/// strip-only (`fs_shown_path`), as node's does.
+pub fn symlink_target_os(target: &str) -> std::borrow::Cow<'_, str> {
+    #[cfg(windows)]
+    {
+        win32_symlink_target(target, real_cwd, real_drive_cwd)
+    }
+    #[cfg(not(windows))]
+    std::borrow::Cow::Borrowed(target)
+}
+
+/// `symlink_target_os` on Windows, with the cwd and `=X:` lookups given.
+pub fn win32_symlink_target(
+    target: &str,
+    cwd: impl Fn() -> String,
+    drive_cwd: impl Fn(&str) -> Option<String>,
+) -> std::borrow::Cow<'_, str> {
+    let b = target.as_bytes();
+    let sep = |c: u8| c == b'/' || c == b'\\';
+    let absolute = !b.is_empty()
+        && (sep(b[0]) || (b.len() > 2 && b[0].is_ascii_alphabetic() && b[1] == b':' && sep(b[2])));
+    if absolute {
+        fs_os_path_with(target, cwd, drive_cwd, Win32ResolveMode::Js)
+    } else if target.contains('/') {
+        std::borrow::Cow::Owned(target.replace('/', "\\"))
+    } else {
+        std::borrow::Cow::Borrowed(target)
+    }
+}
+
+/// The path node's Windows `fs.symlink` stats to choose a directory or a
+/// file link when no type is given: `path.resolve(link, '..', target)`, the
+/// target taken relative to the link's parent directory, not the cwd.
+#[cfg(windows)]
+pub fn symlink_probe_path(link: &str, target: &str) -> String {
+    win32_symlink_probe(link, target, real_cwd, real_drive_cwd)
+}
+
+/// `symlink_probe_path` with the cwd and `=X:` lookups given.
+pub fn win32_symlink_probe(
+    link: &str,
+    target: &str,
+    cwd: impl Fn() -> String,
+    drive_cwd: impl Fn(&str) -> Option<String>,
+) -> String {
+    win32_resolve_all_mode(&[link, "..", target], cwd, drive_cwd, Win32ResolveMode::Js)
 }
 
 /// The template node's binding hands libuv for `mkdtemp(prefix)` (src/
@@ -2933,15 +2994,27 @@ pub fn win32_resolve_mode(
     drive_cwd: impl Fn(&str) -> Option<String>,
     mode: Win32ResolveMode,
 ) -> String {
+    win32_resolve_all_mode(&[path], cwd, drive_cwd, mode)
+}
+
+/// `path.win32.resolve(...paths)` with several arguments, as
+/// `win32_resolve_mode` resolves one: the arguments are taken right to left
+/// until one is absolute with a device, then (`i === -1`) the cwd.
+pub fn win32_resolve_all_mode(
+    paths: &[&str],
+    cwd: impl Fn() -> String,
+    drive_cwd: impl Fn(&str) -> Option<String>,
+    mode: Win32ResolveMode,
+) -> String {
     let is_sep = |b: u8| b == b'/' || b == b'\\';
     let mut resolved_device = String::new();
     let mut resolved_tail = String::new();
     let mut resolved_absolute = false;
-    // resolve's loop over one argument: the path, then (`i === -1`) the cwd --
-    // or, once a device is known, that drive's own current directory.
-    for step in 0..2 {
-        let candidate = if step == 0 {
-            path.to_string()
+    // resolve's loop over its arguments, last first, then (`i === -1`) the
+    // cwd -- or, once a device is known, that drive's own current directory.
+    for step in 0..=paths.len() {
+        let candidate = if step < paths.len() {
+            paths[paths.len() - 1 - step].to_string()
         } else if resolved_device.is_empty() {
             cwd()
         } else {
@@ -3200,7 +3273,8 @@ mod win32_resolve_tests {
 mod fs_os_path_tests {
     use super::{
         FsPath, Win32ResolveMode, fs_error_path, fs_os_path, fs_os_path_with, fs_shown_path,
-        strip_unc_prefix, win32_resolve_mode, win32_shown_path,
+        strip_unc_prefix, win32_resolve_all_mode, win32_resolve_mode, win32_shown_path,
+        win32_symlink_probe, win32_symlink_target,
     };
     use std::borrow::Cow;
 
@@ -3466,6 +3540,74 @@ mod fs_os_path_tests {
             win32_resolve_mode("Z:a", none, |_| None, Win32ResolveMode::Js),
             "Z:a"
         );
+    }
+
+    /// node v22.22.2's `symlinkSync(target, existing)` fails EEXIST naming
+    /// the target as its binding stored it, strip-only (stage2-sym.cjs, cwd
+    /// `W`'s parent): an absolute target namespaced, a relative one with `/`
+    /// turned into `\` and nothing else done to it.
+    #[test]
+    fn a_symlink_target_is_stored_as_node_preprocesses_it() {
+        for (target, stored, shown) in [
+            (
+                "C:/w/sub/file.txt",
+                r"\\?\C:\w\sub\file.txt",
+                r"C:\w\sub\file.txt",
+            ),
+            (
+                r"C:\w\sub\file.txt",
+                r"\\?\C:\w\sub\file.txt",
+                r"C:\w\sub\file.txt",
+            ),
+            ("sub/file.txt", r"sub\file.txt", r"sub\file.txt"),
+            (r"\w\sub", r"\\?\C:\w\sub", r"C:\w\sub"),
+            (r"\\?\C:\w\sub", r"\\?\C:\w\sub", r"C:\w\sub"),
+            (r"C:\", r"\\?\C:\", r"C:\"),
+            ("../x/./y", r"..\x\.\y", r"..\x\.\y"),
+            (r"\\srv\sh\x", r"\\?\UNC\srv\sh\x", r"\\srv\sh\x"),
+            ("C:x", "C:x", "C:x"),
+            ("plain", "plain", "plain"),
+            ("", "", ""),
+        ] {
+            let got = win32_symlink_target(target, || CWD.to_string(), |_| None);
+            assert_eq!(got, stored, "{target:?}");
+            assert_eq!(win32_shown_path(&got), shown, "{target:?}");
+        }
+        // A relative target with no `/` is not copied.
+        assert!(matches!(
+            win32_symlink_target(r"a\b", || unreachable!(), |_| None),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    /// node's Windows symlink stats `path.resolve(link, '..', target)` to
+    /// choose a directory or a file link: the target relative to the link's
+    /// parent. stage2-sym.cjs: `symlinkSync('dir', 'W/sub/l1')` with
+    /// `W/sub/dir` a directory makes a directory link even though the cwd has
+    /// no `dir`.
+    #[test]
+    fn the_symlink_probe_is_relative_to_the_links_parent() {
+        let probe = |link: &str, target: &str| {
+            win32_symlink_probe(link, target, || CWD.to_string(), |_| None)
+        };
+        assert_eq!(probe(r"C:\w\sub\l1", "dir"), r"C:\w\sub\dir");
+        assert_eq!(probe(r"C:\w\l2", "sub/dir"), r"C:\w\sub\dir");
+        assert_eq!(probe(r"C:\w\l3", r"C:\abs\dir"), r"C:\abs\dir");
+        assert_eq!(probe(r"C:\w\l4", r"\rooted"), r"C:\rooted");
+        assert_eq!(probe(r"C:\w\l5", r"..\up"), r"C:\up");
+        assert_eq!(probe("rel-link", "t"), r"C:\Windows\t");
+        assert_eq!(probe(r"\\srv\sh\l", "t"), r"\\srv\sh\t");
+        // A drive-relative target on another drive: the `..` still applies,
+        // to that drive's directory (here its root, `=D:` being unset).
+        assert_eq!(probe(r"C:\w\l", "D:x"), r"D:\x");
+        // With one argument the resolve is `win32_resolve_mode`'s.
+        for path in ["x", r"C:\a\..\b", r"\\srv\sh", "D:y", ""] {
+            assert_eq!(
+                win32_resolve_all_mode(&[path], || CWD.to_string(), |_| None, Win32ResolveMode::Js),
+                win32_resolve_mode(path, || CWD.to_string(), |_| None, Win32ResolveMode::Js),
+                "{path:?}"
+            );
+        }
     }
 
     #[test]
@@ -5124,13 +5266,26 @@ pub mod ops {
         }
     }
 
-    pub async fn fs_symlink(target: String, path: super::FsPath) -> OpOutcome {
+    /// node's async `symlink`: `target` is the string the link stores
+    /// (`symlink_target_os`). On Windows `probe` is the path statted to pick
+    /// a directory or a file link (`symlink_probe_path`), `None` when the
+    /// read grant refuses it; as in node's callback and promise forms, a
+    /// probe that cannot be statted makes a file link. Elsewhere there is no
+    /// probe.
+    pub async fn fs_symlink(
+        target: String,
+        probe: Option<super::FsPath>,
+        path: super::FsPath,
+    ) -> OpOutcome {
         #[cfg(windows)]
         let result = {
-            let is_dir = tokio::fs::metadata(&target)
-                .await
-                .map(|m| m.is_dir())
-                .unwrap_or(false);
+            let is_dir = match &probe {
+                Some(probe) => tokio::fs::metadata(probe)
+                    .await
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false),
+                None => false,
+            };
             if is_dir {
                 tokio::fs::symlink_dir(&target, &path).await
             } else {
@@ -5138,12 +5293,14 @@ pub mod ops {
             }
         };
         #[cfg(not(windows))]
-        let result = tokio::fs::symlink(&target, &path).await;
+        let result = {
+            let _ = probe;
+            tokio::fs::symlink(&target, &path).await
+        };
         match result {
             Ok(()) => OpOutcome::Done,
-            // The target is stored as written, so node reports it so; the
-            // link's own path is resolved like any other.
-            Err(e) => node_fail_dest(e, "symlink", &target, &path.shown()),
+            // The target as stored, strip-only, and the link's own path.
+            Err(e) => node_fail_dest(e, "symlink", &super::fs_shown_path(&target), &path.shown()),
         }
     }
 
