@@ -124,23 +124,12 @@ pub fn stdio_pipe_all() -> StdioSpec {
 /// registers the child with the signal-driver reactor. Callers on the V8
 /// thread must hold a `Handle::enter()` guard; see `CoreRuntime::enter`.
 ///
-/// The hidden Windows variables of this process -- names that start with '='
-/// (`=C:` holds drive C's cwd) -- which a child given an explicit `env` must
-/// not inherit. node builds the child's block from that `env` alone, and its
-/// process.env never enumerates these names, so a node child has no `=C:`
-/// unless the caller's object named one; oam lays the given pairs over its own
-/// environment, so it drops these from the base. Empty on POSIX, where no name
-/// starts with '='.
-pub fn hidden_env_names() -> Vec<std::ffi::OsString> {
-    if !cfg!(windows) {
-        return Vec::new();
-    }
-    std::env::vars_os()
-        .map(|(name, _)| name)
-        .filter(|name| name.as_encoded_bytes().first() == Some(&b'='))
-        .collect()
-}
-
+/// `env`, when given, is the child's WHOLE environment: nothing of this
+/// process's own is added, as node hands libuv its envPairs and libuv hands
+/// them to execve / CreateProcessW. The JS layer builds the pairs (process.env
+/// when the script passed none, and libuv's Windows additions). `None` leaves
+/// the child this process's environment, for callers that are not node APIs.
+///
 /// `detached` is node's option: on Windows it adds libuv's
 /// `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` and keeps the child OUT of
 /// the kill-on-close job (job_win.rs) every other child is placed in. It is
@@ -152,7 +141,6 @@ pub fn spawn_child(
     cwd: Option<String>,
     env: Option<Vec<(String, String)>>,
     shell: bool,
-    clear_env: bool,
     stdio: StdioSpec,
     detached: bool,
 ) -> Result<(tokio::process::Child, u32), String> {
@@ -227,16 +215,12 @@ pub fn spawn_child(
     cmd.stdout(slot1.into_stdio());
     cmd.stderr(slot2.into_stdio());
 
-    if clear_env {
-        cmd.env_clear();
-    }
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
     if let Some(env) = env {
-        for name in hidden_env_names() {
-            cmd.env_remove(name);
-        }
+        // The child's whole environment (see spawn_child).
+        cmd.env_clear();
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -447,7 +431,6 @@ pub fn spawn_sync(
     env: Option<&[(String, String)]>,
     input: Option<&[u8]>,
     shell: bool,
-    clear_env: bool,
     timeout_ms: u64,
     max_buffer: usize,
     stdio: StdioSpec,
@@ -545,16 +528,12 @@ pub fn spawn_sync(
     #[cfg(not(windows))]
     let _ = detached;
 
-    if clear_env {
-        cmd.env_clear();
-    }
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
     if let Some(env) = env {
-        for name in hidden_env_names() {
-            cmd.env_remove(name);
-        }
+        // The child's whole environment (see spawn_child).
+        cmd.env_clear();
         for (k, v) in env {
             cmd.env(k, v);
         }

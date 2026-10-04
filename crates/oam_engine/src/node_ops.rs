@@ -8225,6 +8225,38 @@ fn opt_detached(scope: &mut v8::PinScope<'_, '_>, opts: Option<v8::Local<'_, v8:
     .is_some_and(|v| v.is_true())
 }
 
+/// The `env` spawn option: the child's whole environment, as the JS layer
+/// built it (child_process's childEnv -- the caller's env or process.env, with
+/// node's and libuv's adjustments). Absent only for a caller that wants this
+/// process's environment inherited.
+fn opt_env_pairs(
+    scope: &mut v8::PinScope<'_, '_>,
+    opts: Option<v8::Local<'_, v8::Object>>,
+) -> Option<Vec<(String, String)>> {
+    opts.and_then(|o| {
+        let key = v8::String::new(scope, "env")?;
+        let val = o.get(scope, key.into())?;
+        if val.is_null_or_undefined() {
+            return None;
+        }
+        let env_obj = v8::Local::<v8::Object>::try_from(val).ok()?;
+        let names = env_obj.get_own_property_names(scope, Default::default())?;
+        let mut pairs = Vec::new();
+        for i in 0..names.length() {
+            if let Some(name) = names.get_index(scope, i)
+                && let Some(val) = env_obj.get(scope, name)
+                && let (Some(k), Some(v)) = (
+                    name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                    val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
+                )
+            {
+                pairs.push((k, v));
+            }
+        }
+        Some(pairs)
+    })
+}
+
 fn op_spawn_sync(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -8274,12 +8306,6 @@ fn op_spawn_sync(
             o.get(scope, key.into())
         })
         .is_some_and(|v| v.is_true());
-    let clear_env = opts
-        .and_then(|o| {
-            let key = v8::String::new(scope, "clearEnv")?;
-            o.get(scope, key.into())
-        })
-        .is_some_and(|v| v.is_true());
     let timeout_ms = opts
         .and_then(|o| {
             let key = v8::String::new(scope, "timeout")?;
@@ -8313,28 +8339,7 @@ fn op_spawn_sync(
         Some(text.into_bytes())
     });
 
-    let env_pairs = opts.and_then(|o| {
-        let key = v8::String::new(scope, "env")?;
-        let val = o.get(scope, key.into())?;
-        if val.is_null_or_undefined() {
-            return None;
-        }
-        let env_obj = v8::Local::<v8::Object>::try_from(val).ok()?;
-        let names = env_obj.get_own_property_names(scope, Default::default())?;
-        let mut pairs = Vec::new();
-        for i in 0..names.length() {
-            if let Some(name) = names.get_index(scope, i)
-                && let Some(val) = env_obj.get(scope, name)
-                && let (Some(k), Some(v)) = (
-                    name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                    val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                )
-            {
-                pairs.push((k, v));
-            }
-        }
-        Some(pairs)
-    });
+    let env_pairs = opt_env_pairs(scope, opts);
 
     let stdio = arg_stdio_spec(scope, opts, &core_runtime!(scope).sync_files());
 
@@ -8345,7 +8350,6 @@ fn op_spawn_sync(
         env_pairs.as_deref(),
         input.as_deref(),
         shell,
-        clear_env,
         timeout_ms,
         max_buffer,
         stdio,
@@ -8456,35 +8460,8 @@ fn op_spawn_async(
             o.get(scope, key.into())
         })
         .is_some_and(|v| v.is_true());
-    let clear_env = opts
-        .and_then(|o| {
-            let key = v8::String::new(scope, "clearEnv")?;
-            o.get(scope, key.into())
-        })
-        .is_some_and(|v| v.is_true());
 
-    let env_pairs: Option<Vec<(String, String)>> = opts.and_then(|o| {
-        let key = v8::String::new(scope, "env")?;
-        let val = o.get(scope, key.into())?;
-        if val.is_null_or_undefined() {
-            return None;
-        }
-        let env_obj = v8::Local::<v8::Object>::try_from(val).ok()?;
-        let names = env_obj.get_own_property_names(scope, Default::default())?;
-        let mut pairs = Vec::new();
-        for i in 0..names.length() {
-            if let Some(name) = names.get_index(scope, i)
-                && let Some(val) = env_obj.get(scope, name)
-                && let (Some(k), Some(v)) = (
-                    name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                    val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                )
-            {
-                pairs.push((k, v));
-            }
-        }
-        Some(pairs)
-    });
+    let env_pairs = opt_env_pairs(scope, opts);
 
     let stdio = arg_stdio_spec(scope, opts, &core_runtime!(scope).sync_files());
     let detached = opt_detached(scope, opts);
@@ -8500,9 +8477,7 @@ fn op_spawn_async(
     let spawned = {
         let core = core_runtime!(scope);
         let _guard = core.enter();
-        oam_core::child::spawn_child(
-            command, child_args, cwd, env_pairs, shell, clear_env, stdio, detached,
-        )
+        oam_core::child::spawn_child(command, child_args, cwd, env_pairs, shell, stdio, detached)
     };
     match spawned {
         Ok((child, pid)) => {
@@ -8766,34 +8741,7 @@ fn op_spawn_extra(
         }
         val.to_string(scope).map(|s| s.to_rust_string_lossy(scope))
     });
-    let clear_env = opts
-        .and_then(|o| {
-            let key = v8::String::new(scope, "clearEnv")?;
-            o.get(scope, key.into())
-        })
-        .is_some_and(|v| v.is_true());
-    let env_pairs: Option<Vec<(String, String)>> = opts.and_then(|o| {
-        let key = v8::String::new(scope, "env")?;
-        let val = o.get(scope, key.into())?;
-        if val.is_null_or_undefined() {
-            return None;
-        }
-        let env_obj = v8::Local::<v8::Object>::try_from(val).ok()?;
-        let names = env_obj.get_own_property_names(scope, Default::default())?;
-        let mut pairs = Vec::new();
-        for i in 0..names.length() {
-            if let Some(name) = names.get_index(scope, i)
-                && let Some(val) = env_obj.get(scope, name)
-                && let (Some(k), Some(v)) = (
-                    name.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                    val.to_string(scope).map(|s| s.to_rust_string_lossy(scope)),
-                )
-            {
-                pairs.push((k, v));
-            }
-        }
-        Some(pairs)
-    });
+    let env_pairs = opt_env_pairs(scope, opts);
 
     // stdio codes (arg 3): one number per fd. 0-3 are dispositions; anything
     // at or above DESCRIPTOR_CODE_BASE is `base + <descriptor number>`, the
@@ -8863,7 +8811,6 @@ fn op_spawn_extra(
         &child_args,
         cwd.as_deref(),
         env_pairs.as_deref(),
-        clear_env,
         &stdio,
         detached,
     ) {

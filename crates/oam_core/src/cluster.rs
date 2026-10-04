@@ -20,15 +20,14 @@ pub async fn cluster_fork(
     let mut cmd = tokio::process::Command::new(&exe);
     cmd.arg("run");
     cmd.arg(&script_path);
-    // node's cluster.fork hands the worker {...process.env, ...env}, which
-    // never holds a hidden `=C:` (child::hidden_env_names).
-    for name in super::child::hidden_env_names() {
-        cmd.env_remove(name);
-    }
-    cmd.env("OAM_CLUSTER_WORKER", &worker_id);
+    // node's cluster.fork hands the worker {...process.env, ...env}, and that
+    // is its whole environment: the JS layer builds it (childProcessEnv), so
+    // nothing of this process's own environment is added here.
+    cmd.env_clear();
     for (k, v) in &env_pairs {
         cmd.env(k, v);
     }
+    cmd.env("OAM_CLUSTER_WORKER", &worker_id);
     cmd.stdout(std::process::Stdio::inherit());
     cmd.stderr(std::process::Stdio::inherit());
     // Reap workers if the primary's runtime drops -- Node leaves orphans, but

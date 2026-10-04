@@ -48,17 +48,7 @@ fn spawn_echoer(marker: &str) -> (tokio::process::Child, u32) {
             format!("cat >/dev/null; printf '%s' '{marker}'"),
         ],
     );
-    spawn_child(
-        command,
-        args,
-        None,
-        None,
-        false,
-        false,
-        stdio_pipe_all(),
-        false,
-    )
-    .expect("spawn echoer")
+    spawn_child(command, args, None, None, false, stdio_pipe_all(), false).expect("spawn echoer")
 }
 
 /// Insert a spawned child into a fresh registry and return (registry, handle).
@@ -208,7 +198,6 @@ async fn deliver_kill_does_not_signal_exited_child() {
         None,
         None,
         false,
-        false,
         stdio_pipe_all(),
         false,
     )
@@ -252,7 +241,6 @@ async fn raw_kill_after_exit_reports_real_exit() {
         &["-c".to_string(), "exit 0".to_string()],
         None,
         None,
-        false,
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
         false,
     )
@@ -297,7 +285,6 @@ async fn raw_kill_during_wait_delivers_signal() {
         &["-c".to_string(), "sleep 30".to_string()],
         None,
         None,
-        false,
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
         false,
     )
@@ -344,7 +331,6 @@ async fn raw_kill_during_wait_delivers_signal_win() {
         &["-n".to_string(), "30".to_string(), "127.0.0.1".to_string()],
         None,
         None,
-        false,
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
         false,
     )
@@ -387,7 +373,6 @@ async fn raw_kill_before_wait_delivers_signal() {
         &["-c".to_string(), "sleep 30".to_string()],
         None,
         None,
-        false,
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
         false,
     )
@@ -434,7 +419,6 @@ async fn raw_kill_trapped_signal_reports_clean_exit() {
         ],
         None,
         None,
-        false,
         &[StdioFd::Ignore, StdioFd::Ignore, StdioFd::Ignore],
         false,
     )

@@ -32089,6 +32089,73 @@ fn process_env_respects_the_env_permission() {
     );
 }
 
+/// A child's environment is built from process.env, so what `--allow-env`
+/// leaves out of process.env is not in a child's environment either.
+///
+/// Without an `env` option a child gets process.env as it stands (node's
+/// `options.env || process.env`), never the environment oam started with; an
+/// explicit `env` is the child's whole environment, passed as given. Both
+/// held before only in name: the pairs were laid over oam's own start-up
+/// environment, so a child saw every variable, granted or not.
+///
+/// The children run without `--permission`, so they see all they were given.
+#[test]
+fn a_child_gets_only_the_variables_process_env_shows() {
+    let reporter = write_temp(
+        "child_env_perm_reporter.cjs",
+        "const v = (k) => process.env[k] ?? 'ABSENT';\n\
+         process.stdout.write(['CE_GRANTED', 'CE_HIDDEN', 'CE_GIVEN']\n\
+         \x20 .map((k) => k + '=' + v(k)).join(' '));\n",
+    );
+    let script = write_temp(
+        "child_env_perm.mjs",
+        "import { execFileSync, spawn, spawnSync } from 'node:child_process';\n\
+         const reporter = process.argv[2];\n\
+         console.log('parent: CE_HIDDEN=' + (process.env.CE_HIDDEN ?? 'ABSENT'));\n\
+         const sync = (opts) => spawnSync(process.execPath, [reporter], { encoding: 'utf8', ...opts });\n\
+         console.log('spawnSync default: ' + sync({}).stdout);\n\
+         console.log('spawnSync explicit: ' + sync({ env: { CE_GIVEN: 'given' } }).stdout);\n\
+         console.log('execFileSync default: ' + execFileSync(process.execPath, [reporter], { encoding: 'utf8' }));\n\
+         const out = await new Promise((resolve) => {\n\
+         \x20 const cp = spawn(process.execPath, [reporter]);\n\
+         \x20 let s = '';\n\
+         \x20 cp.stdout.on('data', (d) => (s += d));\n\
+         \x20 cp.on('close', () => resolve(s));\n\
+         });\n\
+         console.log('spawn default: ' + out);\n",
+    );
+    let out = oam_with_env(
+        &[
+            "--permission",
+            "--allow-env=CE_GRANTED",
+            "--allow-child-process",
+            "--allow-fs-read=*",
+            script.to_str().unwrap(),
+            reporter.to_str().unwrap(),
+        ],
+        &[("CE_GRANTED", "granted"), ("CE_HIDDEN", "hidden")],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("parent: CE_HIDDEN=ABSENT"),
+        "the grant hides CE_HIDDEN from the parent: {stdout}"
+    );
+    for entry in ["spawnSync default", "execFileSync default", "spawn default"] {
+        assert!(
+            stdout.contains(&format!(
+                "{entry}: CE_GRANTED=granted CE_HIDDEN=ABSENT CE_GIVEN=ABSENT"
+            )),
+            "{entry}: a child gets process.env, which has no CE_HIDDEN: {stdout}"
+        );
+    }
+    assert!(
+        stdout.contains("spawnSync explicit: CE_GRANTED=ABSENT CE_HIDDEN=ABSENT CE_GIVEN=given"),
+        "an explicit env is the child's whole environment: {stdout}"
+    );
+}
+
 /// `--allow-net` must scope by host, not merely toggle networking on.
 #[test]
 fn allow_net_list_is_scoped_to_the_listed_host() {

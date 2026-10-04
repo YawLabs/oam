@@ -31942,6 +31942,74 @@
     return { Session, open, close, url, waitForDebugger, console: globalThis.console || {} };
   };
 
+  // libuv's required_vars (src/win/process.c): on Windows, make_program_env
+  // adds each of these to a child's environment when the block it was given
+  // has no variable of that name (compared case-insensitively), taking the
+  // value from the parent's environment and skipping a name the parent does
+  // not have either. Sorted, upper case, as libuv spells them.
+  const WINDOWS_REQUIRED_ENV = [
+    "HOMEDRIVE", "HOMEPATH", "LOGONSERVER", "PATH", "SYSTEMDRIVE", "SYSTEMROOT",
+    "TEMP", "USERDOMAIN", "USERNAME", "USERPROFILE", "WINDIR",
+  ];
+
+  /** The complete environment a child is started with: the caller's `env`
+   *  or, without one, a copy of process.env as it stands now (assignments
+   *  and deletions included), never the environment oam itself started
+   *  with. The native spawn ops start the child with exactly these pairs.
+   *  Node's normalizeSpawnArguments: NODE_V8_COVERAGE is carried over unless
+   *  the caller's object names it; every enumerable key counts, inherited
+   *  ones included (`for...in`); an undefined value is left out and any
+   *  other is stringified; and on Windows, where names are
+   *  case-insensitive, the first of a set of names differing only in case
+   *  (in default sort order) wins. Then libuv's Windows additions above.
+   *  The parent environment libuv reads those from is process.env here,
+   *  which is the same set node's live environment is, less what the
+   *  --allow-env grant leaves out (docs/node-divergences.md). `extra` is
+   *  oam's own channel variables, laid over the result. */
+  function childProcessEnv(platform, optionsEnv, extra) {
+    const procEnv = globalThis.process.env;
+    const source = optionsEnv || { ...procEnv };
+    // node's copyProcessEnvToEnv writes this into the caller's object; it is
+    // read through here instead, so that object is left as it was.
+    const coverage =
+      procEnv.NODE_V8_COVERAGE &&
+      !(optionsEnv && Object.prototype.hasOwnProperty.call(optionsEnv, "NODE_V8_COVERAGE"))
+        ? procEnv.NODE_V8_COVERAGE
+        : undefined;
+    let keys = [];
+    for (const key in source) keys.push(key);
+    if (coverage !== undefined && !keys.includes("NODE_V8_COVERAGE")) keys.push("NODE_V8_COVERAGE");
+    const valueOf = (key) =>
+      key === "NODE_V8_COVERAGE" && coverage !== undefined ? coverage : source[key];
+    const windows = platform === "win32";
+    if (windows) {
+      const seen = new Set();
+      keys = keys.sort().filter((key) => {
+        const upper = key.toUpperCase();
+        if (seen.has(upper)) return false;
+        seen.add(upper);
+        return true;
+      });
+    }
+    const out = Object.create(null);
+    const present = new Set();
+    for (const key of keys) {
+      const value = valueOf(key);
+      if (value === undefined) continue;
+      out[key] = `${value}`;
+      present.add(key.toUpperCase());
+    }
+    if (windows) {
+      for (const name of WINDOWS_REQUIRED_ENV) {
+        if (present.has(name)) continue;
+        const value = procEnv[name];
+        if (value !== undefined) out[name] = value;
+      }
+    }
+    if (extra) Object.assign(out, extra);
+    return out;
+  }
+
   // ------------------------------------------------------ child_process
   registry.factories.child_process = (natives) => {
     const EventEmitter = registry.get("events");
@@ -31997,6 +32065,10 @@
         options: opts,
       };
     }
+
+    // The environment a child is started with; see childProcessEnv.
+    const childEnv = (optionsEnv, extra) =>
+      childProcessEnv(natives.platform, optionsEnv, extra);
 
     /** The program and argv node's error for a failed spawn names -- its
      *  `options.file` and `options.args` (normalizeSpawnArguments): the SHELL
@@ -32165,13 +32237,10 @@
       const opts = norm.options;
       const nativeOpts = {
         cwd: opts.cwd || undefined,
-        // No explicit env: hand the child the LIVE process.env view, not the
-        // pristine OS environment. node's process.env writes through to the
-        // real environment, so a runtime `process.env.X = v` is inherited by
-        // children; oam's proxy mutates a JS-side cache, so pass that.
-        env: opts.env || globalThis.process.env,
+        // Exactly the child's environment, which replaces oam's own as node's
+        // envPairs do: see childEnv.
+        env: childEnv(opts.env),
         shell: !!opts.shell,
-        clearEnv: false,
         // node's spawnSync honors `detached` too (spawn_sync.cc sets
         // UV_PROCESS_DETACHED), so a detached sync child is kept out of the
         // Windows kill-on-close job like an async one.
@@ -32419,12 +32488,9 @@
       const codes = stdioArr.map((e, i) => stdioCode(e, i));
       const nativeOpts = {
         cwd: opts.cwd || undefined,
-        // No explicit env: hand the child the LIVE process.env view, not the
-        // pristine OS environment. node's process.env writes through to the
-        // real environment, so a runtime `process.env.X = v` is inherited by
-        // children; oam's proxy mutates a JS-side cache, so pass that.
-        env: opts.env || globalThis.process.env,
-        clearEnv: false,
+        // Exactly the child's environment, which replaces oam's own as node's
+        // envPairs do: see childEnv.
+        env: childEnv(opts.env),
         detached: !!opts.detached,
       };
 
@@ -32436,11 +32502,7 @@
       // returns (node parity, and what the CDP callers rely on).
       const launch = (extraEnv) => {
       if (extraEnv) {
-        nativeOpts.env = Object.assign(
-          {},
-          opts.env || globalThis.process.env,
-          extraEnv,
-        );
+        nativeOpts.env = Object.assign(Object.create(null), nativeOpts.env, extraEnv);
       }
       let info;
       try {
@@ -32789,13 +32851,10 @@
       const nativeOpts = {
         stdio: modes,
         cwd: opts.cwd || undefined,
-        // No explicit env: hand the child the LIVE process.env view, not the
-        // pristine OS environment. node's process.env writes through to the
-        // real environment, so a runtime `process.env.X = v` is inherited by
-        // children; oam's proxy mutates a JS-side cache, so pass that.
-        env: opts.env || globalThis.process.env,
+        // Exactly the child's environment, which replaces oam's own as node's
+        // envPairs do: see childEnv.
+        env: childEnv(opts.env),
         shell: !!opts.shell,
-        clearEnv: false,
         // Windows: a non-detached child joins the kill-on-close job and dies
         // with this process, as under node; a detached one is left out.
         detached: !!opts.detached,
@@ -32834,11 +32893,7 @@
       // tick later (fork() has the same property today).
       const launch = (extraEnv) => {
       if (extraEnv) {
-        nativeOpts.env = Object.assign(
-          {},
-          opts.env || globalThis.process.env,
-          extraEnv,
-        );
+        nativeOpts.env = Object.assign(Object.create(null), nativeOpts.env, extraEnv);
       }
       let info;
       try {
@@ -33209,24 +33264,24 @@
         }
       };
 
+      // Taken now, as node's fork() takes it, not when the channel is bound.
+      const baseEnv = childEnv(opts.env);
       const net = registry.get("net");
       const ipcServer = net.createServer();
 
       ipcServer.listen(0, "127.0.0.1", () => {
         const ipcPort = ipcServer.address().port;
 
-        const childEnv = Object.assign({},
-          opts.env || globalThis.process.env,
-          { OAM_FORK_IPC_PORT: String(ipcPort) },
-        );
+        const forkEnv = Object.assign(Object.create(null), baseEnv, {
+          OAM_FORK_IPC_PORT: String(ipcPort),
+        });
 
         const spawnArgs = execArgv.concat(["run", String(modulePath), "--no-check", "--"]).concat(args);
         const nativeOpts = {
           stdio: modes,
           cwd: opts.cwd || undefined,
-          env: childEnv,
+          env: forkEnv,
           shell: false,
-          clearEnv: false,
           // node's fork() forwards its options to spawn(), detached included.
           detached: !!opts.detached,
         };
@@ -33445,7 +33500,12 @@
         if (!scriptPath) {
           throw new Error("cluster.fork: no entry script (process.argv[1] is empty)");
         }
-        const envObj = env || {};
+        // node's createWorkerProcess hands fork() `{...process.env, ...env}`,
+        // and that is the worker's whole environment (childProcessEnv).
+        const envObj = childProcessEnv(natives.platform, {
+          ...globalThis.process.env,
+          ...env,
+        });
         const worker = new Worker(id, -1, 0);
         this.workers[id] = worker;
         natives.clusterFork(scriptPath, String(id), envObj).then(

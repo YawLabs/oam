@@ -164,6 +164,9 @@ pub(crate) fn signal_name(num: i32) -> String {
 /// `stdio` spec; the child inherits the appropriate ends as numbered fds, and
 /// the parent keeps the other ends for I/O.
 ///
+/// `env`, when given, is the child's whole environment, as in
+/// `child::spawn_child`; with none the child inherits this process's.
+///
 /// `_detached` keeps the signature shared with child_win.rs, where it decides
 /// kill-on-close job membership. It is not yet honored here (node would
 /// `setsid()` the child); a POSIX child outlives its parent either way.
@@ -172,7 +175,6 @@ pub fn spawn_extra(
     args: &[String],
     cwd: Option<&str>,
     env: Option<&[(String, String)]>,
-    clear_env: bool,
     stdio: &[StdioFd],
     _detached: bool,
 ) -> Result<RawChild, String> {
@@ -281,10 +283,8 @@ pub fn spawn_extra(
     if let Some(d) = cwd {
         cmd.current_dir(d);
     }
-    if clear_env {
-        cmd.env_clear();
-    }
     if let Some(pairs) = env {
+        cmd.env_clear();
         for (k, v) in pairs {
             cmd.env(k, v);
         }

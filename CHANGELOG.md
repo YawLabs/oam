@@ -103,6 +103,18 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Changed
 
+- **An explicit `env` replaces the child's environment, as node's does.** `spawn`,
+  `spawnSync`, `exec`, `execSync`, `execFile`, `execFileSync` and `fork` start the child with
+  exactly the given pairs; on Windows, as libuv does, `HOMEDRIVE`, `HOMEPATH`, `LOGONSERVER`,
+  `PATH`, `SYSTEMDRIVE`, `SYSTEMROOT`, `TEMP`, `USERDOMAIN`, `USERNAME`, `USERPROFILE` and
+  `WINDIR` are added from the parent when the given env has no variable of that name in any
+  case. Without `env` the child gets `process.env` as it stands at the call, so a variable
+  deleted from `process.env` is no longer inherited, and `cluster.fork(env)` gives the worker
+  `{ ...process.env, ...env }`. Previously the pairs were laid over the environment oam
+  started with. The pairs are built as node builds them: inherited keys count, an `undefined`
+  value is left out, of names differing only in case on Windows the first in sort order is
+  kept, and `NODE_V8_COVERAGE` is carried over. Under `--permission`, a child's environment
+  holds only what `--allow-env` shows in `process.env` (docs/node-divergences.md).
 - **`net.createServer({ allowHalfOpen: true })` hands the option to the sockets it accepts**,
   as node's does, and such a socket whose `'end'` listener writes and ends emits that write's
   callback and `'error'` before `'close'`. (#219)

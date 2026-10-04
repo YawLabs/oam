@@ -161,31 +161,57 @@ fn append_quoted(arg: &str, out: &mut String) {
     out.push('"');
 }
 
-/// Build a double-null-terminated UTF-16 environment block (sorted, as Windows
-/// expects). Merges the inherited environment with overrides unless cleared;
-/// the inherited hidden `=X:` names are left out, as `child::hidden_env_names`
-/// explains (only the overrides can carry one).
-fn build_env_block(env: &[(String, String)], clear: bool) -> Vec<u16> {
-    let mut map: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    if !clear {
-        for (k, v) in std::env::vars() {
-            if !k.starts_with('=') {
-                map.insert(k, v);
-            }
-        }
-    }
+/// Build the double-null-terminated UTF-16 environment block a child is
+/// created with, from `env` ALONE: nothing of this process's environment is
+/// added (see `child::spawn_child`), so a hidden `=C:` reaches the child only
+/// when `env` names one, as under node.
+///
+/// Sorted case-insensitively, the order CreateProcessW documents and libuv's
+/// make_program_env produces. Names are case-insensitive on Windows, so of
+/// two pairs whose names differ only in case the first one given is kept
+/// (the JS layer has already reduced such a set to node's pick). An empty
+/// block is the lone terminator pair.
+fn build_env_block(env: &[(String, String)]) -> Vec<u16> {
+    let mut pairs: Vec<(Vec<u16>, &str, &str)> = Vec::with_capacity(env.len());
     for (k, v) in env {
-        map.insert(k.clone(), v.clone());
-    }
-    let mut block: Vec<u16> = Vec::new();
-    for (k, v) in map {
-        for u in OsStr::new(&format!("{k}={v}")).encode_wide() {
-            block.push(u);
+        let folded = env_name_fold(k);
+        if pairs.iter().any(|(seen, _, _)| *seen == folded) {
+            continue;
         }
+        pairs.push((folded, k, v));
+    }
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut block: Vec<u16> = Vec::new();
+    for (_, k, v) in pairs {
+        block.extend(OsStr::new(k).encode_wide());
+        block.push(u16::from(b'='));
+        block.extend(OsStr::new(v).encode_wide());
+        block.push(0);
+    }
+    if block.is_empty() {
         block.push(0);
     }
     block.push(0); // final terminator (block is "k=v\0k=v\0\0")
     block
+}
+
+/// An environment name as Windows compares it: UTF-16, upper-cased code unit
+/// by code unit, as CompareStringOrdinal(.., TRUE) -- libuv's comparison --
+/// does.
+fn env_name_fold(name: &str) -> Vec<u16> {
+    OsStr::new(name)
+        .encode_wide()
+        .map(|u| {
+            let Some(c) = char::from_u32(u32::from(u)) else {
+                return u;
+            };
+            let mut upper = c.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(single), None) => u16::try_from(u32::from(single)).unwrap_or(u),
+                _ => u,
+            }
+        })
+        .collect()
 }
 
 fn open_nul() -> HANDLE {
@@ -226,7 +252,6 @@ pub fn spawn_extra(
     args: &[String],
     cwd: Option<&str>,
     env: Option<&[(String, String)]>,
-    clear_env: bool,
     stdio: &[StdioFd],
     detached: bool,
 ) -> Result<RawChild, String> {
@@ -482,19 +507,13 @@ pub fn spawn_extra(
         }
         let mut cmd_w = to_wide(&cmdline);
 
-        // Environment block (optional).
+        // Environment block: `env` is the child's whole environment; with
+        // none the child inherits this process's.
         let base_flags = super::child::windows_creation_flags(detached);
         let mut env_block;
         let (env_ptr, creation_flags) = match env {
             Some(env) => {
-                env_block = build_env_block(env, clear_env);
-                (
-                    env_block.as_mut_ptr() as *const std::ffi::c_void,
-                    base_flags | CREATE_UNICODE_ENVIRONMENT,
-                )
-            }
-            None if clear_env => {
-                env_block = build_env_block(&[], true);
+                env_block = build_env_block(env);
                 (
                     env_block.as_mut_ptr() as *const std::ffi::c_void,
                     base_flags | CREATE_UNICODE_ENVIRONMENT,
@@ -859,6 +878,87 @@ pub async fn raw_wait(reg: RawChildRegistry, id: u64) -> OpOutcome {
 }
 
 #[cfg(test)]
+mod env_block_tests {
+    use super::build_env_block;
+
+    fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+        list.iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The block decoded back into its "k=v" entries, checking the shape
+    /// CreateProcessW requires on the way: every entry NUL-terminated, then
+    /// one more NUL.
+    fn entries(block: &[u16]) -> Vec<String> {
+        assert!(block.len() >= 2, "a block is at least the terminator pair");
+        assert_eq!(&block[block.len() - 2..], &[0, 0], "double-NUL end");
+        let body = &block[..block.len() - 1];
+        if body == [0] {
+            return Vec::new();
+        }
+        body.split(|&u| u == 0)
+            .filter(|s| !s.is_empty())
+            .map(String::from_utf16_lossy)
+            .collect()
+    }
+
+    #[test]
+    fn holds_exactly_the_given_pairs() {
+        // A variable this process certainly has (the test runner sets PATH,
+        // and Windows always has SystemRoot) must not appear unless given.
+        let block = build_env_block(&pairs(&[("ONLY_ME", "1")]));
+        assert_eq!(entries(&block), vec!["ONLY_ME=1"]);
+    }
+
+    #[test]
+    fn an_empty_env_is_the_terminator_pair() {
+        assert_eq!(build_env_block(&[]), vec![0, 0]);
+    }
+
+    #[test]
+    fn a_hidden_drive_cwd_is_carried_only_when_given() {
+        let block = build_env_block(&pairs(&[("A", "1")]));
+        assert!(entries(&block).iter().all(|e| !e.starts_with('=')));
+        let block = build_env_block(&pairs(&[("=C:", "C:\\work"), ("A", "1")]));
+        assert_eq!(entries(&block), vec!["=C:=C:\\work", "A=1"]);
+    }
+
+    #[test]
+    fn sorted_case_insensitively() {
+        // Byte order would put "PATHEXT" and "Zeta" ahead of "Path" and
+        // "alpha"; Windows wants the names compared as upper case.
+        let block = build_env_block(&pairs(&[
+            ("Zeta", "z"),
+            ("PATHEXT", ".EXE"),
+            ("alpha", "a"),
+            ("Path", "C:\\bin"),
+            ("_U", "u"),
+        ]));
+        assert_eq!(
+            entries(&block),
+            vec!["alpha=a", "Path=C:\\bin", "PATHEXT=.EXE", "Zeta=z", "_U=u"]
+        );
+    }
+
+    #[test]
+    fn of_names_differing_in_case_the_first_given_wins() {
+        let block = build_env_block(&pairs(&[
+            ("Foo", "first"),
+            ("FOO", "second"),
+            ("foo", "third"),
+        ]));
+        assert_eq!(entries(&block), vec!["Foo=first"]);
+    }
+
+    #[test]
+    fn values_keep_equals_signs_and_non_ascii_text() {
+        let block = build_env_block(&pairs(&[("K", "a=b=c"), ("NAME", "Zoë ✓")]));
+        assert_eq!(entries(&block), vec!["K=a=b=c", "NAME=Zoë ✓"]);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{RawChildRegistry, StdioFd, raw_kill, spawn_extra};
     use std::collections::HashMap;
@@ -911,7 +1011,6 @@ mod tests {
                 &["/c".to_string(), "more > nul".to_string()],
                 None,
                 None,
-                false,
                 &[StdioFd::ChildRead, StdioFd::Ignore, StdioFd::Ignore],
                 false,
             )
