@@ -21,7 +21,16 @@
 //!   boundary) and `/box/allowed/../../secret` (resolved out of the subtree).
 //!   As in node, a target with no root is resolved against the cwd of the
 //!   moment, and a grant entry with no root against the cwd at startup
-//!   (`resolve_against_cwd`, `fs_grant`).
+//!   (`resolve_against_cwd`, `fs_grant`). Components compare case-sensitively,
+//!   as node's do (`FsKey`).
+//!
+//!   On Windows permission matching follows node's resolve: an fs op is
+//!   judged on the namespaced path its binding hands the OS
+//!   (`oam_core::FsPath`, `\\?\C:\work\x`), with the prefix stripped only;
+//!   a grant entry is resolved as node resolves it, so `\` is the root of
+//!   the cwd's drive; a UNC path (`\\srv\sh\x`) is never the rooted path
+//!   `\srv\sh\x`; and a device spelling (`\\.\C:\x`, `\\?\GLOBALROOT\x`)
+//!   matches no grant (`win_target_key`, `win_entry_key`).
 //! - net and env are EXACT matches. A prefix there grants names an ATTACKER
 //!   CAN REGISTER: `--allow-net=api.github.com` must not admit
 //!   `api.github.com.attacker.net`, and `--allow-env=API` must not admit
@@ -60,6 +69,10 @@ pub enum PermValue {
 /// A leading `..` that would escape the root is DROPPED rather than kept, so a
 /// target can never resolve to something above its own root and then re-enter
 /// an allowed subtree by coincidence.
+///
+/// POSIX only: on Windows node's resolve does this work (`win_resolve`,
+/// `win_target_key`), which keeps a UNC root apart from a rooted path.
+#[cfg(not(windows))]
 fn normalize_path(raw: &str) -> String {
     let unified = raw.replace('\\', "/");
     let absolute = unified.starts_with('/');
@@ -94,10 +107,9 @@ fn normalize_path(raw: &str) -> String {
 /// `mkdirSync("d")` and `mkdtempSync("tmp-")` where node allows all three.
 ///
 /// "No root" rather than "not absolute": on Windows `\x` is rooted but not
-/// absolute, and node resolves it onto the cwd's drive; keeping it lexical
-/// (`/x`) can never match a drive-qualified grant, so it is denied either
-/// way, and a rooted grant entry still matches a rooted target the same way
-/// it always has. A drive-relative `C:x` has no root and resolves through
+/// absolute. The fs matcher no longer reads this on Windows (`win_target_key`
+/// resolves every path as Win32 opens it); a pipe's dial does, and dials what
+/// this returns. A drive-relative `C:x` has no root and resolves through
 /// `GetFullPathNameW`, which is what the OS opens. The empty path names the
 /// cwd itself, as node's `path.resolve("")` does. If the cwd cannot be read
 /// (deleted under the process), the path stays as given and so matches only
@@ -164,14 +176,199 @@ fn is_named_pipe_namespace(_path: &str) -> bool {
     false
 }
 
-/// Windows path comparison is case-insensitive; POSIX is not.
-#[cfg(windows)]
-fn path_eq_fold(a: &str) -> String {
-    a.to_ascii_lowercase()
+/// A filesystem path as the fs grants compare it: its root and then its
+/// components, each compared exactly. An entry admits a target when the roots
+/// are equal and the entry's components are the first components of the
+/// target's, so the match is anchored at a separator (`/box/allowed` does not
+/// admit `/box/allowed-evil`) and a root entry admits its whole tree.
+///
+/// The comparison is case-sensitive on every platform, as node's is: on
+/// Windows node v22.22.2 refuses `c:\box\f` and `C:\BOX\f` under a grant of
+/// `C:\box` (and admits `c:\box\f` only under a grant spelled `c:\box`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FsKey {
+    /// `/` for an absolute POSIX path, `C:` for a Windows drive path,
+    /// `\\server\share` for a UNC path, and empty for a POSIX path that stayed
+    /// relative (the cwd could not be read).
+    root: String,
+    parts: Vec<String>,
 }
+
+impl FsKey {
+    /// Whether this entry key admits `target`. A key with no root and no
+    /// components (a relative entry that names the cwd's own spelling, such
+    /// as `.`) admits nothing, as an empty entry admits nothing.
+    fn admits(&self, target: &FsKey) -> bool {
+        if self.root.is_empty() && self.parts.is_empty() {
+            return false;
+        }
+        self.root == target.root && target.parts.starts_with(&self.parts)
+    }
+}
+
+/// The POSIX key of a path `normalize_path` has resolved.
 #[cfg(not(windows))]
-fn path_eq_fold(a: &str) -> String {
-    a.to_string()
+fn posix_key(normalized: &str) -> FsKey {
+    let (root, rest) = match normalized.strip_prefix('/') {
+        Some(rest) => ("/", rest),
+        None => ("", normalized),
+    };
+    FsKey {
+        root: root.to_string(),
+        parts: rest
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(str::to_string)
+            .collect(),
+    }
+}
+
+/// Whether `path` is spelt as a Windows device or verbatim path: two
+/// separators, `.` or `?`, then a separator or the end (`\\.\C:\x`,
+/// `\\?\C:\x`, `//./pipe/x`, `\\?`). node's resolve keeps such a path's
+/// prefix (`path.win32.resolve('\\\\?\\C:\\x')` is `\\?\C:\x`).
+#[cfg(windows)]
+fn is_device_spelling(path: &str) -> bool {
+    let b = path.as_bytes();
+    let sep = |c: u8| c == b'\\' || c == b'/';
+    b.len() >= 3
+        && sep(b[0])
+        && sep(b[1])
+        && matches!(b[2], b'.' | b'?')
+        && b.get(3).is_none_or(|&c| sep(c))
+}
+
+/// The key of a fully resolved Windows path in its plain form, `X:\...` or
+/// `\\server\share\...` with `\` separators: `None` for anything else.
+///
+/// A `.` or `..` component, or a component with a `/` in it, is `None` too.
+/// The resolves this is fed from leave none, so one can come only from the
+/// rest of a `\\?\` path, where the OS takes each component as written:
+/// such a path matches no grant.
+#[cfg(windows)]
+fn win_plain_key(path: &str) -> Option<FsKey> {
+    let b = path.as_bytes();
+    let (root, rest) =
+        if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\' {
+            (path[..2].to_string(), &path[3..])
+        } else if let Some(unc) = path.strip_prefix(r"\\") {
+            let mut it = unc.splitn(3, '\\');
+            let server = it.next().unwrap_or("");
+            let share = it.next().unwrap_or("");
+            if server.is_empty() || share.is_empty() || matches!(server, "." | "?") {
+                return None;
+            }
+            (format!(r"\\{server}\{share}"), it.next().unwrap_or(""))
+        } else {
+            return None;
+        };
+    let mut parts = Vec::new();
+    for part in rest.split('\\').filter(|part| !part.is_empty()) {
+        if part == "." || part == ".." || part.contains('/') {
+            return None;
+        }
+        parts.push(part.to_string());
+    }
+    Some(FsKey { root, parts })
+}
+
+/// The key of a Windows path exactly as it is handed to the OS, which is how
+/// the target of a check is matched. `None` (no grant matches it) when the
+/// path names no drive or UNC location the grants can describe.
+///
+/// - A `\\?\` path is taken by the OS as written, so its prefix is stripped
+///   and nothing else is done to it, as node's `StringFromPath` strips it:
+///   `\\?\C:\x` is `C:\x` and `\\?\UNC\srv\sh\x` is `\\srv\sh\x`. Any other
+///   `\\?\` path (`\\?\GLOBALROOT\...`, the volume `\\?\C:`, `\\?\Volume{..}`)
+///   matches nothing.
+/// - Any other device spelling (`\\.\C:\x`, `//?/C:/x`) matches nothing:
+///   Win32 hands such a path to the object manager after its own rewriting,
+///   and node v22.22.2 refuses `\\.\C:\x` under a grant of `C:\`.
+/// - Any other path is resolved as Win32 itself will resolve it when it is
+///   opened (`std::path::absolute`, which is `GetFullPathNameW`), so what is
+///   judged is what the OS opens: `C:\a.\x` is `C:\a\x` there, `NUL` is the
+///   device `\\.\NUL` and matches nothing, and the empty path, which no call
+///   can open, matches nothing.
+///
+/// The ops hand the OS the namespaced path node's fs binding computes
+/// (`oam_core::FsPath`), so for them only the first rule applies, and a
+/// trailing dot or space, which `GetFullPathNameW` drops, stays in the name.
+#[cfg(windows)]
+fn win_target_key(os: &str) -> Option<FsKey> {
+    if let Some(rest) = os.strip_prefix(r"\\?\") {
+        return match rest.strip_prefix(r"UNC\") {
+            Some(unc) => win_plain_key(&format!(r"\\{unc}")),
+            None => win_plain_key(rest),
+        };
+    }
+    if os.is_empty() || is_device_spelling(os) {
+        return None;
+    }
+    let absolute = std::path::absolute(os).ok()?;
+    let absolute = absolute.to_str()?;
+    if is_device_spelling(absolute) {
+        return None;
+    }
+    win_plain_key(absolute)
+}
+
+/// node's resolve of a Windows path as its C++ runs it before a check or an
+/// fs call (`oam_core::win32_resolve_mode`, `Cpp`), against the process's
+/// real cwd and per-drive `=X:` directories. Lexical: unlike
+/// `GetFullPathNameW` it keeps a trailing dot or space.
+#[cfg(windows)]
+fn win_resolve(path: &str) -> String {
+    oam_core::win32_resolve_mode(
+        path,
+        || {
+            std::env::current_dir()
+                .map(|dir| dir.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        },
+        |device| std::env::var(format!("={device}")).ok(),
+        oam_core::Win32ResolveMode::Cpp,
+    )
+}
+
+/// The key of a Windows grant entry: the entry resolved as node resolves a
+/// grant (`win_resolve`), as a drive or UNC path. A device or verbatim
+/// spelling (`\\?\C:\x`, `\\.\C:\x`) grants nothing -- node v22.22.2 admits
+/// nothing at all under `--allow-fs-read=\\?\C:\x`, not even `\\?\C:\x\f` --
+/// and neither does an empty entry.
+#[cfg(windows)]
+fn win_entry_key(entry: &str) -> Option<FsKey> {
+    if entry.is_empty() || is_device_spelling(entry) {
+        return None;
+    }
+    win_plain_key(&win_resolve(entry))
+}
+
+/// The key of a grant entry on this platform. `None` grants nothing.
+fn fs_entry_key(entry: &str) -> Option<FsKey> {
+    #[cfg(windows)]
+    {
+        win_entry_key(entry)
+    }
+    #[cfg(not(windows))]
+    {
+        let normalized = normalize_path(entry);
+        (!normalized.is_empty()).then(|| posix_key(&normalized))
+    }
+}
+
+/// The key of a check's target, a path exactly as the OS is handed it, on
+/// this platform. `None` matches no grant. On POSIX a relative path is
+/// resolved against the cwd of the moment (`resolve_against_cwd`), as the
+/// OS resolves it.
+fn fs_target_key(path: &str) -> Option<FsKey> {
+    #[cfg(windows)]
+    {
+        win_target_key(path)
+    }
+    #[cfg(not(windows))]
+    {
+        Some(posix_key(&normalize_path(&resolve_against_cwd(path))))
+    }
 }
 
 /// Split `host[:port]` into its host part, tolerating a bracketed IPv6
@@ -267,45 +464,40 @@ fn is_port_scoped_zone(entry_zone: &str) -> bool {
 }
 
 impl PermValue {
-    /// Path-prefix match, anchored at a separator, over lexically resolved
-    /// paths. Used by fs read/write ONLY -- see the module doc.
+    /// Path-prefix match, anchored at a separator ([`FsKey::admits`]), with
+    /// the target read as a grant entry is (`fs_entry_key`: lexically, and on
+    /// Windows through node's resolve). For the worker, child-process and
+    /// addon lists; an fs target is matched by [`Self::allows_fs_path`].
     pub fn allows_path(&self, target: &str) -> bool {
         match self {
             PermValue::All => true,
             PermValue::None => false,
-            PermValue::List(list) => {
-                let t = path_eq_fold(&normalize_path(target));
-                list.iter().any(|item| {
-                    let entry = path_eq_fold(&normalize_path(item));
-                    if entry.is_empty() {
-                        return false;
-                    }
-                    if t == entry {
-                        return true;
-                    }
-                    // The separator is what makes this a SUBTREE test rather
-                    // than a string test: without it `/box/allowed` matches
-                    // the unrelated sibling `/box/allowed-evil`.
-                    let with_sep = if entry.ends_with('/') {
-                        entry.clone()
-                    } else {
-                        format!("{entry}/")
-                    };
-                    t.starts_with(&with_sep)
-                })
-            }
+            PermValue::List(_) => fs_entry_key(target).is_some_and(|t| self.admits_key(&t)),
         }
     }
 
-    /// `allows_path` for a filesystem target as an fs op passes it: a target
-    /// with no root is first resolved against the current cwd (see
-    /// `resolve_against_cwd`). The cwd is read only for a `List` grant and a
-    /// relative target, so an unrestricted run (`All`) pays nothing.
+    /// Whether a list entry admits the target key `target`.
+    fn admits_key(&self, target: &FsKey) -> bool {
+        match self {
+            PermValue::All => true,
+            PermValue::None => false,
+            PermValue::List(list) => list
+                .iter()
+                .any(|item| fs_entry_key(item).is_some_and(|entry| entry.admits(target))),
+        }
+    }
+
+    /// The fs match for a target exactly as the OS is handed it
+    /// (`fs_target_key`): on POSIX a target with no root is first resolved
+    /// against the current cwd; on Windows a `\\?\` path is stripped only and
+    /// any other path is judged as Win32 resolves it when opened. The target
+    /// is read only for a `List` grant, so an unrestricted run (`All`) pays
+    /// nothing.
     pub fn allows_fs_path(&self, target: &str) -> bool {
         match self {
             PermValue::All => true,
             PermValue::None => false,
-            PermValue::List(_) => self.allows_path(&resolve_against_cwd(target)),
+            PermValue::List(_) => fs_target_key(target).is_some_and(|t| self.admits_key(&t)),
         }
     }
 
@@ -500,7 +692,10 @@ impl Permissions {
         }
     }
 
-    /// Returns `Err(denial)` when `read` is denied for `path`.
+    /// Returns `Err(denial)` when `read` is denied for `path`, a path handed
+    /// to the OS exactly as given ([`PermValue::allows_fs_path`]); the denial
+    /// names it as given. For a path whose op hands the OS something else --
+    /// every fs op that takes a path does -- use [`Self::check_read_path`].
     pub fn check_read(&self, path: &str) -> Result<(), PermissionDenial> {
         if self.read.allows_fs_path(path) {
             Ok(())
@@ -512,7 +707,8 @@ impl Permissions {
         }
     }
 
-    /// Returns `Err(denial)` when `write` is denied for `path`.
+    /// Returns `Err(denial)` when `write` is denied for `path`, a path handed
+    /// to the OS exactly as given (see [`Self::check_read`]).
     pub fn check_write(&self, path: &str) -> Result<(), PermissionDenial> {
         if self.write.allows_fs_path(path) {
             Ok(())
@@ -522,6 +718,20 @@ impl Permissions {
                 resource: path.to_string(),
             })
         }
+    }
+
+    /// Returns `Err(denial)` when `read` is denied for an fs op's path: the
+    /// OS path it opens (`path.os()`) is what is judged, and what the denial
+    /// names, as node's `ERR_ACCESS_DENIED` names the namespaced path its
+    /// binding checked (`\\?\C:\work\x` on Windows for `readFileSync("x")`).
+    pub fn check_read_path(&self, path: &oam_core::FsPath) -> Result<(), PermissionDenial> {
+        self.check_read(path.os())
+    }
+
+    /// Returns `Err(denial)` when `write` is denied for an fs op's path (see
+    /// [`Self::check_read_path`]).
+    pub fn check_write_path(&self, path: &oam_core::FsPath) -> Result<(), PermissionDenial> {
+        self.check_write(path.os())
     }
 
     /// Returns `Err(denial)` when `net` is denied for `host`.
@@ -716,7 +926,9 @@ impl Permissions {
             // or query() and the op disagree about the same argument.
             Some(t) => {
                 let granted = match name {
-                    "read" | "write" => perm.allows_fs_path(t),
+                    // Judged as an fs op on `t` would be: on the OS path it
+                    // would open (see `check_read_path`).
+                    "read" | "write" => perm.allows_fs_path(&oam_core::fs_os_path(t)),
                     "net" => perm.allows_net(t),
                     _ => perm.allows_exact(t),
                 };
@@ -901,16 +1113,32 @@ fn from_bool_or_list(v: BoolOrList) -> PermValue {
 /// node resolves `--allow-fs-write=.` or `=../out` at startup, so a later
 /// `process.chdir` does not move the grant (it moves only relative targets).
 /// A worker inherits the already-resolved set. An EMPTY entry stays empty
-/// (and so grants nothing, see `allows_path`): resolving it would turn a
+/// (and so grants nothing, see `fs_entry_key`): resolving it would turn a
 /// blank list item into a grant over the whole cwd.
+///
+/// On Windows every entry is resolved as node resolves it (`win_resolve`),
+/// rooted ones too: `--allow-fs-read=\` is the root of the cwd's drive, as it
+/// is in node, not a grant over every drive. The resolve is lexical, so an
+/// entry `allowed.` keeps its dot and grants `allowed.\x`, not `allowed\x`.
+/// A device or verbatim spelling is kept as given, and grants nothing.
 fn fs_grant(v: BoolOrList) -> PermValue {
     match from_bool_or_list(v) {
         PermValue::List(list) => PermValue::List(
             list.into_iter()
                 .map(|entry| {
                     if entry.is_empty() {
-                        entry
-                    } else {
+                        return entry;
+                    }
+                    #[cfg(windows)]
+                    {
+                        if is_device_spelling(&entry) {
+                            entry
+                        } else {
+                            win_resolve(&entry)
+                        }
+                    }
+                    #[cfg(not(windows))]
+                    {
                         resolve_against_cwd(&entry).into_owned()
                     }
                 })
@@ -1891,7 +2119,10 @@ mod tests {
         assert!(p.check_write("out.txt").is_ok());
         assert!(p.check_write("tmp-XXXXXX").is_ok());
         assert!(p.check_write("./sub/tmp-XXXXXX").is_ok());
-        assert!(p.check_write("").is_ok(), "the empty path names the cwd");
+        // The empty path names the cwd on POSIX. On Windows no call can open
+        // it, and node v22.22.2 refuses `statSync('')` under a grant of the
+        // cwd (resource '').
+        assert_eq!(p.check_write("").is_ok(), !cfg!(windows));
         // Resolution does not widen the grant: up and out is still out.
         assert!(p.check_write("../outside").is_err());
         assert!(p.check_write("sub/../../outside").is_err());
@@ -1946,5 +2177,319 @@ mod tests {
         assert_eq!(denial.permission, "FileSystemRead");
         assert_eq!(denial.resource, "/etc/passwd");
         assert_eq!(denial.to_string(), "Access to this API has been restricted");
+    }
+
+    // ------------------------------------------- fs keys: case, anchoring
+
+    #[test]
+    fn fs_keys_compare_components_exactly_and_case_sensitively() {
+        let key = |root: &str, parts: &[&str]| FsKey {
+            root: root.to_string(),
+            parts: parts.iter().map(|p| p.to_string()).collect(),
+        };
+        let entry = key("C:", &["box"]);
+        assert!(entry.admits(&key("C:", &["box"])));
+        assert!(entry.admits(&key("C:", &["box", "f"])));
+        assert!(!entry.admits(&key("C:", &["box-evil"])));
+        assert!(!entry.admits(&key("C:", &["Box", "f"])), "case-sensitive");
+        assert!(!entry.admits(&key("c:", &["box", "f"])), "drive case too");
+        assert!(!entry.admits(&key(r"\\srv\sh", &["box"])));
+        // A root admits its whole tree, and only its own.
+        assert!(key("C:", &[]).admits(&key("C:", &["a", "b"])));
+        assert!(!key("C:", &[]).admits(&key("D:", &["a"])));
+        // An entry with no root and no components admits nothing.
+        assert!(!key("", &[]).admits(&key("", &["x"])));
+        assert!(!key("", &[]).admits(&key("", &[])));
+    }
+
+    #[test]
+    fn fs_grants_compare_case_sensitively_as_node_does() {
+        // node v22.22.2 on Windows refuses `c:\box\f` and `C:\BOX\F` under a
+        // grant of `C:\box`, and admits `c:\box\f` only under a grant spelled
+        // `c:\box`. POSIX names were always compared exactly.
+        let base = std::path::PathBuf::from(cwd()).join("box");
+        let grant = base.to_string_lossy().into_owned();
+        let p = Permissions::from_opts(Some(opts_read_only(vec![grant.as_str()])));
+        let inside = base.join("f").to_string_lossy().into_owned();
+        assert!(p.check_read(&inside).is_ok());
+        // Only the grant's own components are compared; below it any name.
+        let upper = base.join("F").to_string_lossy().into_owned();
+        assert!(p.check_read(&upper).is_ok());
+        let shouted = std::path::PathBuf::from(cwd())
+            .join("BOX")
+            .join("f")
+            .to_string_lossy()
+            .into_owned();
+        assert!(p.check_read(&shouted).is_err());
+        assert_eq!(p.query_state("read", Some(&shouted)), "denied");
+    }
+
+    // ------------------------------------------- Windows: node's resolve
+    //
+    // Every rule here was measured against node v22.22.2 with
+    // `--permission --allow-fs-read=<grant>` (stage2-perm.cjs in the #275
+    // notes): `has` and a `statSync` agree except where noted.
+
+    #[cfg(windows)]
+    fn os(path: &str) -> oam_core::FsPath {
+        oam_core::FsPath::new(path.to_string())
+    }
+
+    /// The cwd's drive (`C:`), and a drive letter that is not it.
+    #[cfg(windows)]
+    fn drives() -> (String, String) {
+        let here = cwd()[..2].to_string();
+        let other = if here.eq_ignore_ascii_case("Q:") {
+            "R:"
+        } else {
+            "Q:"
+        };
+        (here, other.to_string())
+    }
+
+    #[cfg(windows)]
+    fn read_grant(entries: &[&str]) -> Permissions {
+        Permissions::from_opts(Some(opts_read_only(entries.to_vec())))
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_drive_root_grant_admits_the_namespaced_root_and_its_tree() {
+        let (drive, _) = drives();
+        let p = read_grant(&[&format!(r"{drive}\")]);
+        // `statSync('C:\\')` hands the OS `\\?\C:\`, which is stripped to
+        // `C:\`, never resolved again (that would be the volume `\\?\C:`).
+        let root = os(&format!(r"{drive}\"));
+        assert_eq!(root.os(), format!(r"\\?\{drive}\"));
+        assert!(p.check_read_path(&root).is_ok());
+        assert!(
+            p.check_read_path(&os(&format!(r"{drive}\Windows\x")))
+                .is_ok()
+        );
+        assert!(p.check_read(&format!(r"\\?\{drive}\Windows\x")).is_ok());
+        assert!(p.check_read_path(&os(r"\Windows\x")).is_ok(), "rooted");
+        assert!(p.check_read_path(&os("relative")).is_ok());
+        // The volume itself (`\\?\C:\` as passed resolves to `\\?\C:`) is not
+        // a path under the root. node admits it; oam refuses it.
+        let volume = os(&format!(r"\\?\{drive}\"));
+        assert_eq!(volume.os(), format!(r"\\?\{drive}"));
+        assert!(p.check_read_path(&volume).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_trailing_dot_or_space_names_its_own_directory() {
+        // The OS opens `\\?\C:\work\allowed.\x` inside `allowed.`, a
+        // directory other than `allowed`, so a grant of `allowed` must not
+        // admit it -- node refuses it, resource `\\?\C:\work\allowed.\x`.
+        let base = std::path::PathBuf::from(cwd()).join("allowed");
+        let grant = base.to_string_lossy().into_owned();
+        let p = read_grant(&[&grant]);
+        assert!(p.check_read_path(&os(&format!(r"{grant}\x"))).is_ok());
+        for spelling in [r".\x", r" \x", r"..\x", ".", " ", ". "] {
+            let target = os(&format!("{grant}{spelling}"));
+            let denial = p.check_read_path(&target).unwrap_err();
+            assert_eq!(denial.resource, target.os(), "{spelling:?}");
+            assert_eq!(
+                p.query_state("read", Some(&format!("{grant}{spelling}"))),
+                "denied",
+                "{spelling:?}"
+            );
+        }
+        // A path handed to the OS as given is resolved by Win32 when opened,
+        // which drops the dot: there `allowed.\x` IS `allowed\x`.
+        assert!(p.check_read(&format!(r"{grant}.\x")).is_ok());
+        // A grant spelled with the dot names `allowed.` and nothing else.
+        let dotted = read_grant(&[&format!("{grant}.")]);
+        assert!(dotted.check_read_path(&os(&format!(r"{grant}.\x"))).is_ok());
+        assert!(dotted.check_read_path(&os(&format!("{grant}."))).is_ok());
+        assert!(dotted.check_read_path(&os(&format!(r"{grant}\x"))).is_err());
+        assert!(dotted.check_read_path(&os(&grant)).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_unc_path_and_a_rooted_path_never_match_each_other() {
+        let (drive, _) = drives();
+        let unc = read_grant(&[r"\\srv\sh"]);
+        assert!(unc.check_read_path(&os(r"\\srv\sh\x")).is_ok());
+        assert!(unc.check_read_path(&os(r"\\srv\sh")).is_ok());
+        assert!(unc.check_read(r"\\?\UNC\srv\sh\x").is_ok());
+        assert!(unc.check_read_path(&os(r"\srv\sh\x")).is_err());
+        assert!(unc.check_read_path(&os("/srv/sh/x")).is_err());
+        assert!(unc.check_read(r"\srv\sh\x").is_err());
+        assert!(unc.check_read_path(&os(r"\\srv\other\x")).is_err());
+        assert!(unc.check_read_path(&os(r"\\srv2\sh\x")).is_err());
+        let rooted = read_grant(&[r"\srv\sh"]);
+        assert!(rooted.check_read_path(&os(r"\srv\sh\x")).is_ok());
+        assert!(
+            rooted
+                .check_read_path(&os(&format!(r"{drive}\srv\sh\x")))
+                .is_ok()
+        );
+        assert!(rooted.check_read_path(&os(r"\\srv\sh\x")).is_err());
+        assert!(rooted.check_read(r"\\?\UNC\srv\sh\x").is_err());
+        assert!(rooted.check_read(r"\\srv\sh\x").is_err());
+        let denial = rooted.check_read_path(&os(r"\\srv\sh\x")).unwrap_err();
+        assert_eq!(denial.resource, r"\\?\UNC\srv\sh\x");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn device_paths_and_other_verbatim_paths_match_no_grant() {
+        let (drive, other) = drives();
+        let p = read_grant(&[&format!(r"{drive}\"), &format!(r"{other}\"), r"\\srv\sh"]);
+        for target in [
+            format!(r"\\.\{drive}\x"),
+            format!("//./{drive}/x"),
+            format!(r"\\?\GLOBALROOT\??\{drive}\x"),
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\x".to_string(),
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\x".to_string(),
+            format!(r"\\?\{drive}"),
+            format!(r"\\?\{drive}\a\..\..\x"),
+            r"\\?\unc\srv\sh\x".to_string(),
+            r"\\.\NUL".to_string(),
+            String::new(),
+        ] {
+            assert!(p.check_read(&target).is_err(), "{target:?} as given");
+            let path = os(&target);
+            let denial = p.check_read_path(&path).unwrap_err();
+            assert_eq!(denial.permission, "FileSystemRead");
+            assert_eq!(denial.resource, path.os(), "{target:?}");
+            assert_eq!(p.query_state("read", Some(&target)), "denied", "{target:?}");
+        }
+        // Handed to the OS as given these are device paths too. An fs op
+        // hands the OS what node's binding computes instead -- `\\?\C:\x`
+        // for `//?/C:/x`, `\\?\C:\work\NUL` for `NUL` -- and that is judged.
+        for target in [
+            format!("//?/{drive}/x"),
+            "NUL".to_string(),
+            r"\\?\".to_string(),
+            r"\\?\UNC\.\sh\x".to_string(),
+        ] {
+            assert!(p.check_read(&target).is_err(), "{target:?} as given");
+        }
+        assert!(p.check_read_path(&os(&format!("//?/{drive}/x"))).is_ok());
+        // `NUL` inside a granted directory is a name there to node's binding
+        // (`\\?\C:\work\NUL`), and so it is here.
+        assert!(
+            p.check_read_path(&os(&format!(r"{drive}\work\NUL")))
+                .is_ok()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_device_or_verbatim_grant_entry_grants_nothing() {
+        let base = std::path::PathBuf::from(cwd()).join("box");
+        let plain = base.to_string_lossy().into_owned();
+        for entry in [
+            format!(r"\\?\{plain}"),
+            format!(r"\\.\{plain}"),
+            format!("//?/{plain}"),
+            r"\\?\UNC\srv\sh".to_string(),
+        ] {
+            let p = read_grant(&[&entry]);
+            for target in [
+                format!(r"{plain}\x"),
+                format!(r"\\?\{plain}\x"),
+                format!(r"\\.\{plain}\x"),
+                r"\\srv\sh\x".to_string(),
+            ] {
+                assert!(p.check_read(&target).is_err(), "{entry} -> {target}");
+                assert!(
+                    p.check_read_path(&os(&target)).is_err(),
+                    "{entry} -> {target}"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_driveless_root_grant_is_the_root_of_the_cwds_drive() {
+        // node resolves `--allow-fs-read=\` (and `/`) to `C:\` at startup:
+        // every path on that drive, and nothing on another drive or behind a
+        // device spelling of any drive.
+        let (drive, other) = drives();
+        for entry in [r"\", "/"] {
+            let p = read_grant(&[entry]);
+            for ok in [
+                format!(r"{drive}\Windows\x"),
+                format!(r"\\?\{drive}\Windows\x"),
+                r"\Windows\x".to_string(),
+                format!(r"{drive}\"),
+            ] {
+                assert!(p.check_read_path(&os(&ok)).is_ok(), "{entry}: {ok}");
+                assert_eq!(p.query_state("read", Some(&ok)), "granted");
+            }
+            for denied in [
+                format!(r"{other}\x"),
+                format!(r"\\?\{other}\x"),
+                format!(r"\\.\{other}\x"),
+                format!(r"\\.\{drive}\x"),
+                format!(r"\\?\GLOBALROOT\??\{other}\x"),
+                r"\\srv\sh\x".to_string(),
+                r"\\?\UNC\srv\sh\x".to_string(),
+            ] {
+                assert!(
+                    p.check_read_path(&os(&denied)).is_err(),
+                    "{entry}: {denied}"
+                );
+                assert!(p.check_read(&denied).is_err(), "{entry}: {denied}");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn query_state_agrees_with_the_op_gate() {
+        let (drive, other) = drives();
+        let base = std::path::PathBuf::from(cwd()).join("box");
+        let plain = base.to_string_lossy().into_owned();
+        let p = read_grant(&[&plain, r"\\srv\sh"]);
+        for target in [
+            plain.clone(),
+            format!(r"{plain}\x"),
+            format!(r"{plain}.\x"),
+            format!(r"{plain}-evil"),
+            format!(r"\\?\{plain}\x"),
+            format!(r"\\.\{plain}\x"),
+            plain.to_uppercase(),
+            r"box\x".to_string(),
+            r"box.\x".to_string(),
+            r"\\srv\sh\x".to_string(),
+            r"\srv\sh\x".to_string(),
+            format!(r"{other}\x"),
+            format!(r"{drive}\"),
+            String::new(),
+        ] {
+            let gate = p.check_read_path(&os(&target)).is_ok();
+            let expected = if gate { "granted" } else { "denied" };
+            assert_eq!(p.query_state("read", Some(&target)), expected, "{target:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_denial_names_the_os_path_as_node_reports_it() {
+        // node: `readFileSync('secret/s.txt')` is refused with resource
+        // `\\?\C:\work\secret\s.txt`; a UNC path with `\\?\UNC\srv\sh\x`;
+        // a drive root with `\\?\C:\`.
+        let (drive, _) = drives();
+        let here = cwd();
+        let p = read_grant(&[&format!(r"{here}\box")]);
+        for (target, resource) in [
+            (
+                "secret/s.txt".to_string(),
+                format!(r"\\?\{here}\secret\s.txt"),
+            ),
+            (r"\\srv\sh\x".to_string(), r"\\?\UNC\srv\sh\x".to_string()),
+            (format!(r"{drive}\"), format!(r"\\?\{drive}\")),
+            (format!(r"\\.\{drive}\x"), format!(r"\\.\{drive}\x")),
+        ] {
+            let denial = p.check_read_path(&os(&target)).unwrap_err();
+            assert_eq!(denial.resource, resource, "{target}");
+        }
     }
 }

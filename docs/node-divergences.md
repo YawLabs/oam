@@ -288,6 +288,16 @@ Differences from Node's model:
   where Node's spelling varies by op -- `mkdtempSync` names the template as passed, but
   `writeFileSync("wf-y")` on Windows names the resolved, `\\?\`-prefixed path
   (`\\?\C:\work\wf-y`), and a rooted `\x` names `\\?\C:\x` (measured against v22.22.2).
+- **On Windows an fs path is matched as node's resolve leaves it.** Names compare
+  case-sensitively, as in Node (`c:\box\f` and `C:\BOX\f` are outside a grant of
+  `C:\box`); a trailing dot or space is part of the name (`allowed.\x` is not inside
+  `allowed`); a grant of `\` or `/` is the root of the cwd's drive; and a UNC path
+  `\\srv\sh\x` is never the rooted `\srv\sh\x`. oam is stricter than Node in two
+  corners, each refused where Node v22.22.2 admits it: a `\\.\` path is matched by no
+  grant (Node matches it, prefix and all, against a grant spelled `\\.\...`), and the
+  volume `\\?\C:` (what `\\?\C:\` resolves to) is not inside a grant of `C:\`. One
+  corner is the other way: a grant of a UNC path (`--allow-fs-read=\\srv\sh`) admits ops
+  on `\\srv\sh\x`, which `process.permission.has` reports granted but Node's ops refuse.
 - **A denied environment read is silent; every other denial throws.** Filesystem,
   network and child-process denials throw `ERR_ACCESS_DENIED` as described above. A
   variable denied by `--allow-env` is instead simply absent from `process.env` and reads
