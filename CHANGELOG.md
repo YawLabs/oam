@@ -141,6 +141,11 @@ each change below is held to node v22.22.2 by a conformance case or an e2e test.
 
 ### Fixed
 
+- **A NUL in a child's `env` throws `ERR_INVALID_ARG_VALUE` synchronously**, as node's
+  does: a name, or a string value, holding one is refused by every `child_process` entry
+  point before anything starts ("The property 'options.env['FOO']' must be a string without
+  null bytes"); it reached the spawn and failed `EINVAL`. A value that is not a string is
+  stringified and cut at its first NUL, as the C string node hands libuv is.
 - **`process.execve(file)` defaults `args` to `[]` and `env` to `process.env`**, as node's
   does (`process.execve.length` is 1); it threw `ERR_INVALID_ARG_TYPE` for the missing `args`.
 - **A zone-id host or `lookup` answer is matched against `--allow-net` as an address and a

@@ -31996,7 +31996,16 @@
     for (const key of keys) {
       const value = valueOf(key);
       if (value === undefined) continue;
-      out[key] = `${value}`;
+      // node's validateArgumentNullCheck, on the name and on a STRING value
+      // only: either one holding a NUL is refused before anything starts.
+      if (key.includes("\u0000")) throw envNulError(key, key);
+      if (typeof value === "string" && value.includes("\u0000")) throw envNulError(key, value);
+      // Any other value is stringified, and the pair reaches the child as a
+      // C string, which ends at the first NUL (node: `{toString() { return
+      // 'a\0b' }}` gives the child 'a').
+      const text = `${value}`;
+      const nul = text.indexOf("\u0000");
+      out[key] = nul === -1 ? text : text.slice(0, nul);
       present.add(key.toUpperCase());
     }
     if (windows) {
@@ -32008,6 +32017,12 @@
     }
     if (extra) Object.assign(out, extra);
     return out;
+  }
+
+  function envNulError(key, value) {
+    return codes.ERR_INVALID_ARG_VALUE(
+      `options.env['${key}']`, value, "must be a string without null bytes",
+    );
   }
 
   // ------------------------------------------------------ child_process
